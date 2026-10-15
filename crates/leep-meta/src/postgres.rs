@@ -104,6 +104,25 @@ impl MetaStore for PostgresMetaStore {
             .transpose()
     }
 
+    /// An empty `after` sorts below every 32-byte id, so `None` needs no
+    /// separate query.
+    async fn list_changesets(
+        &self,
+        after: Option<ChangesetId>,
+        limit: usize,
+    ) -> Result<Vec<ChangesetId>> {
+        let after = after.map_or_else(Vec::new, |i| i.0 .0.to_vec());
+        let rows = sqlx::query("SELECT id FROM changesets WHERE id > $1 ORDER BY id LIMIT $2")
+            .bind(after)
+            .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(storage)?;
+        rows.into_iter()
+            .map(|r| to_id(&r.get::<Vec<u8>, _>(0)))
+            .collect()
+    }
+
     async fn get_ref(&self, name: &str) -> Result<Option<ChangesetId>> {
         let row = sqlx::query("SELECT target FROM refs WHERE name = $1")
             .bind(name)
