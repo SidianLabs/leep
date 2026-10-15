@@ -150,7 +150,7 @@ Nothing mutable has changed yet; the changeset is just an addressable object.
 loop (≤16 attempts):
   head ← get_ref(target)
   if head is None:                 CAS(None → cs)
-  elif cs.parents[0] == head:      CAS(head → cs)
+  elif head is an ancestor of cs:  CAS(head → cs)   # fast-forward, keeps stacks intact
   else: r ← rebase(cs onto head)   # 3-way, base = cs.parents[0]
         conflicts?  → return Conflicts (never auto-resolved on the server)
         CAS(head → r)
