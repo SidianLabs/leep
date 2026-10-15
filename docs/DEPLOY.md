@@ -157,9 +157,14 @@ looked up once per write token, so removing a token drops its reviews.
 | `LEEP_SIGNING_KEY` | none | CLI only: private key file for `leep commit --sign`. |
 | `LEEP_TOKEN` | none | CLI only: bearer token. |
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | none | S3 credentials (standard AWS variables). |
+| `LEEP_REQUEST_TIMEOUT` | `5m` | Abort any request that runs longer (`90s`, `5m`; `0` disables). `leep-server gc --fence` must exceed it; see [OPERATIONS.md](OPERATIONS.md#blob-garbage-collection). |
 | `LEEP_METRICS_LISTEN` | off | Address for a separate, unauthenticated `GET /metrics` listener; keep it private. See [OPERATIONS.md](OPERATIONS.md). |
 | `LEEP_LOG_FORMAT` | `text` | `text` or `json` (one object per line). |
 | `RUST_LOG` | `info` | Log filter. |
+
+`leep-server gc` takes `--meta`/`--blobs` (or their variables) plus `--grace`,
+`--fence`, `--dry-run` and `--unsafe-no-fence`, all flags only; see
+[OPERATIONS.md](OPERATIONS.md#blob-garbage-collection).
 
 `--cache-bytes` and `--max-body-bytes` are flags only; pass them after the
 image name, e.g. `docker run leep:dev --cache-bytes 0`.

@@ -79,3 +79,52 @@ groups:
     expr: sum(rate(leep_http_requests_total{status=~"5.."}[5m])) / sum(rate(leep_http_requests_total[5m])) > 0.01
     for: 5m
 ```
+
+## Blob garbage collection
+
+Abandoned uploads and failed commits leave unreferenced blobs. `leep-server
+gc` reclaims them while servers keep running (ADR 0008, ADR 0012). It uses the
+same `--meta` and `--blobs` as the server, talks to the stores directly, and
+needs no downtime.
+
+```sh
+leep-server gc --dry-run                     # what would be condemned; writes nothing
+leep-server gc                               # condemn, wait --fence, collect
+leep-server gc condemn                       # phase one only
+leep-server gc collect --fence 10m           # phase two only
+```
+
+How it works: **condemn** marks every unreferenced blob older than `--grace`
+(default 24h); a condemned blob is reported missing to clients, which upload it
+again if they need it. After `--fence` (default 10m) **collect** marks again and
+deletes the blobs that are still condemned. Collect acts only on condemnations
+at least `--fence` old, so the two phases can run as separate cron jobs or
+processes. A crashed run is safe: rerun it.
+
+Choosing durations:
+
+| Setting | Must exceed | Default |
+|---|---|---|
+| `--fence` (gc) | the servers' `--request-timeout` plus clock skew between hosts plus a margin | 10m |
+| `--request-timeout` (server, `LEEP_REQUEST_TIMEOUT`) | the longest legitimate request, for example a large blob upload on a slow link | 5m |
+| `--grace` (gc) | the time a client takes from upload to commit, and the request timeout | 24h |
+
+If you raise `--request-timeout`, raise `--fence` with it. `--request-timeout
+0` removes the bound the fence relies on; GC is then not safe beside servers.
+`gc` refuses `--fence 0` unless `--unsafe-no-fence` is given, which is only
+valid with every server stopped.
+
+Run one GC at a time. A cron job such as `17 3 * * *  leep-server gc` works; to
+avoid a long-lived process use `17 3 * * *  leep-server gc condemn` and `47 3 *
+* *  leep-server gc collect`. The report counts blobs condemned, rescued (by an
+upload, by a changeset that referenced them during the fence, or by a newer
+write) and deleted. After a collect, a clients' dedup check on a deleted blob
+answers "missing" and the client uploads it.
+
+Signals: a burst of 400 "missing blob" right after a condemn is normal (clients
+retry by re-uploading); 409 on `PUT /v1/blobs/{hash}` means a collect was
+killed mid-delete of that blob, so run `leep-server gc collect` again; 408
+means a request exceeded `--request-timeout`.
+
+Upgrade note: servers built before ADR 0012 ignore condemnations. Upgrade every
+server before the first `condemn`.
