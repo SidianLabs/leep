@@ -17,6 +17,10 @@ cargo fmt --all
 CI runs fmt check, clippy with `-D warnings`, and tests against Postgres 16.
 A change isn't done until all three pass locally.
 
+End-to-end tests drive the real binaries and need them built first:
+`cargo build --workspace && cargo test -p leep-e2e`
+(Postgres variant runs when `LEEP_TEST_POSTGRES_URL` is set).
+
 ## Never
 
 - Change the field order, variant order or serde attributes of `Changeset`,

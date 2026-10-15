@@ -2128,6 +2128,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "leep-e2e"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "leep-git"
 version = "0.1.0"
 dependencies = [

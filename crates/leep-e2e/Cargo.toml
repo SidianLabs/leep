@@ -1,0 +1,13 @@
+[package]
+name = "leep-e2e"
+description = "End-to-end tests that drive the real leep binaries"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile = "3"
+tokio.workspace = true
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres"] }
