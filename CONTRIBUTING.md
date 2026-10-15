@@ -13,4 +13,8 @@
 AI agents working on this repo: follow [CLAUDE.md](CLAUDE.md) and the skills
 in `.claude/skills/`.
 
+Outside contributors sign the [Contributor License Agreement](CLA.md)
+before their first PR is merged. The maintainer reviews and merges every
+PR.
+
 Licensed under Apache-2.0.
