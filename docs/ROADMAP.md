@@ -9,7 +9,7 @@ Milestones are ordered. Each one should leave `main` releasable.
 - [x] Derived data and operations: tree, generation, skiplist, diff, log, blame, merge, rebase, land (`leep-derive`)
 - [ ] HTTP server (`leep-server`)
 - [x] CLI with lazy sparse checkouts (`leep-cli`)
-- [ ] Git import and export (`leep-git`)
+- [x] Git import and export (`leep-git`)
 - [ ] End-to-end test: import a git repo, run 50 concurrent agent lands, export back to git
 
 ## v0.2: Operable
