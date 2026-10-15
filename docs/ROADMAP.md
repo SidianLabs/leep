@@ -14,7 +14,8 @@ Milestones are ordered. Each one should leave `main` releasable.
 
 ## v0.2: Operable
 - [x] Token auth (static bearer tokens, read/write roles; ADR 0007)
-- [ ] Structured logs; Prometheus metrics (cache hit rates, land retries, derive latency)
+- [x] Structured logs (`--log-format json`, one line per request)
+- [x] Prometheus metrics (cache hit rates, land retries, derive latency; `--metrics-listen`)
 - Docker images and a docker-compose file (server + Postgres + MinIO)
 - Blob garbage collection (mark from refs plus a retention window)
 - Benchmarks: commit and land latency versus repository size

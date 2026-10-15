@@ -193,7 +193,8 @@ client ~/.cache/leep/objects   (per machine, shared by all jobs on it)
 All three tiers are safe without invalidation, because keys are content
 hashes. Planned: a regional cache tier, the same server binary in a
 read-through mode against an upstream server. Strict tiering means a cold
-regional cache cannot stampede the origin.
+regional cache cannot stampede the origin. The server's cache reports hits,
+misses and occupancy as Prometheus metrics (see [OPERATIONS.md](OPERATIONS.md)).
 
 ## 8. Concurrency and consistency
 
@@ -213,6 +214,11 @@ regional cache cannot stampede the origin.
 | MetaStore unavailable | Writes and uncached reads fail | Fail fast with 500; no local fallback |
 | BlobStore slow | Cache tiers absorb repeated reads | — |
 | Land CAS contention | Bounded retries, then an error | Client retries `land` |
+
+Observability: libraries emit `tracing` events and `metrics` facade calls
+(no-ops without a recorder); only `leep-server` installs a recorder and
+serves `/metrics` on a separate listener. Land retries, exhaustion and cache
+hit ratio are the signals to watch; see [OPERATIONS.md](OPERATIONS.md).
 
 ## 10. Security
 

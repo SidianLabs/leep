@@ -12,6 +12,7 @@ Status: early development (v0.1).
 - [Decision records](docs/adr/)
 - [Roadmap](docs/ROADMAP.md)
 - [Deploying with Docker](docs/DEPLOY.md)
+- [Operating: logs and metrics](docs/OPERATIONS.md)
 - [Contributing](CONTRIBUTING.md) and the [agent guide](CLAUDE.md)
 
 ## Layout
