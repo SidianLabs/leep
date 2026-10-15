@@ -193,6 +193,23 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   `--require-signatures` or the review policy's `refs` name an invalid ref
   (such as `release` with a leading space from a comma-separated variable),
   which protected nothing, and warns about protected refs that do not exist.
+- Soak test (`leep-soak`, ADR 0022): an agent swarm (HTTP agents plus real
+  `leep` processes) lands, branches, merges, tags, signs and gets reviewed
+  against a real server on Postgres for a set time, while GC, index warmups
+  and optional server restarts (`--chaos`) run beside it. It checks every
+  acknowledged land, history, the ref log, search, path history, blame and
+  GC reachability as it goes, and writes a JSON report and summary with
+  throughput, latency, RSS and database growth trends. It fails on any
+  invariant break, unattributed 5xx, hang, land p99 or RSS slope over its
+  bound (`docs/OPERATIONS.md`). A ten-second run is part of `cargo test`;
+  `.github/workflows/soak.yml` runs 30 minutes weekly and on demand.
+- Fixed: `blame` read every first-parent ancestor down to the last change of
+  the file, so a file untouched for a long time cost the whole history (1.4 s
+  at 4400 changesets, over the request timeout at some tens of thousands),
+  and a swarm's blame requests took enough CPU to queue every land behind
+  them. It now jumps between changes with the path-history index and the
+  first-parent skip list (the answer is unchanged), and checks its cache before
+  walking.
 
 ### Project
 - Workspace version set to 0.0.1, with a CI check that keeps it below

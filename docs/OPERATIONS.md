@@ -246,6 +246,117 @@ nothing removes them; delete those older than the request timeout if the
 space matters:
 `find /var/lib/leep/blobs -name '.tmp-*' -mmin +60 -delete`.
 
+## Soak tests
+
+`leep-soak` (ADR 0022) runs a swarm of simulated agents against a real
+`leep-server` for as long as you ask, checks invariants all the way through,
+and records performance and resource trends. Run it before a release, after
+changing `land`, GC, derived data, a store backend or the request limits, and
+for a long time when hardening. CI runs it weekly for 30 minutes
+(`.github/workflows/soak.yml`, also on demand from the Actions tab), and
+`cargo test` runs a ten-second version (`leep-e2e`, `soak_smoke`) so it keeps
+working.
+
+```sh
+cargo build --release --workspace    # leep-soak starts leep-server and leep from its own directory
+export LEEP_SOAK_POSTGRES_URL=postgres://postgres:leep@127.0.0.1:5432/postgres
+target/release/leep-soak                                    # smoke: 2 minutes, 50 agents
+target/release/leep-soak --duration 1h --out soak-1h        # one hour
+target/release/leep-soak --duration 8h --chaos --chaos-restarts 12 --gc-interval 10m --out soak-8h
+target/release/leep-soak --duration 30m --rate-limit 5 --rate-burst 10 --max-concurrent 8   # limits pressure
+target/release/leep-soak --duration 10m --seed 0x2a --out replay   # the plan of an earlier failure
+```
+
+It creates a throwaway Postgres database in the admin URL (`--postgres-url`,
+`LEEP_SOAK_POSTGRES_URL`, else `LEEP_TEST_POSTGRES_URL`; `--sqlite` or no URL
+means SQLite), puts blobs in a directory, starts `leep-server` with
+metrics, tokens (one per agent), trusted signing keys and a review policy on
+`release`, and drops the database and the directory when the run passes.
+After a failure it keeps both (the report names them) so you can start a
+server on them and look; its `work` directory is cleared when the same `--out`
+is used again. Use `--server URL --token T` to soak a server you
+run yourself; give it `--metrics-url`, `--pid`, `--meta` and `--blobs` to get
+resource trends and GC, otherwise those parts are skipped (chaos and the
+release flow need a server the harness started).
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--duration` | 2m | How long the swarm runs; setup (about ten seconds) and the final checks come on top |
+| `--agents`, `--cli-agents` | 50, 2 | Agents using the HTTP API; agents driving real `leep` processes |
+| `--think` | 6s | Mean think time of an agent between iterations (heavy-tailed) |
+| `--seed` | 1 | Seed of the workload plan; the report shows it |
+| `--files` | 3000 | Files in the synthetic repository |
+| `--request-timeout` | 8s | The server's `--request-timeout`; the GC fence is derived from it (1.5 times it plus 2 s) |
+| `--gc-interval`, `--derive-interval` | duration/3 (60 s to 30 min), duration/8 (30 s to 10 min) | Pause between fenced GCs, and between `derive-search main` warmups; 0 disables |
+| `--chaos`, `--chaos-restarts` | off, 4 | Restart the server, SIGTERM for two in three and SIGKILL for the others |
+| `--rate-limit`, `--rate-burst`, `--max-concurrent` | off | Passed to the server per token. The `leep` agents' tokens are exempt: a checkout is thousands of reads (see Request limits above) |
+| `--cache-mib` | 32 | The server's blob cache. Keep it small: a cache still filling looks like a leak |
+| `--no-policy` | off | No tokens, signatures or review (then limits apply per address) |
+| `--check-interval`, `--sample-interval` | 20s, 10s | Invariant rounds; metric and resource samples |
+| `--stall-timeout` | 120s | An agent with no progress for this long is a deadlock |
+| `--max-land-p99` | 5s | Client-side p99 of land requests |
+| `--max-rss-slope-mib-h`, `--rss-min-window-secs` | 64, 300 | Leak bound and the shortest window it is judged over |
+| `--baseline`, `--max-regression` | none, 1.5 | Compare p99 and throughput with an earlier `report.json` |
+| `--no-fail-fast` | off | Keep running after the first violation |
+
+**Size `--think` to the machine.** Lands to one ref are serialized in the
+server, so a ref takes only as many lands per second as one land costs. On the
+4 vCPU machine of `docs/PERFORMANCE.md` that is about 6 per second with p99 near a
+second, which 50 agents with the default 6 s think time offer. Agents that offer
+more only queue: land latency becomes about the number of agents times the
+service time and the p99 bound fails, which says the offered load was wrong,
+not that Leep regressed. Watch `land_lock_wait_mean_ms` against
+`land_duration_mean_ms` in `server_metrics`; if the wait is most of the
+latency, lengthen `--think` (or drop agents; the workflow uses 10 s). Shorten it,
+on purpose, to measure saturation. A land also costs more the further behind
+main its stack is (ADR 0022), so the workload keeps a branch for only a few
+iterations; an agent that sits on work for minutes will see slower lands than
+the report.
+
+### Reading the report
+
+`summary.txt` is printed at the end and has the lines to read first:
+throughput (lands per second), client land latency (p50, p95, p99, max),
+the server's own view (attempts per land, CAS losses), the workload mix, the
+error counters, server RSS and its slope, database and blob growth, GC
+results, and the invariant counters. `report.json` has everything:
+
+| Section | Contents |
+|---|---|
+| `violations`, `violation_kinds` | What broke, with the time into the run. The first one stops the run unless `--no-fail-fast` |
+| `thresholds`, `baseline`, `warnings` | Each bound with its value; warnings never fail the run (408s, GC that deleted nothing, no conflicts) |
+| `throughput`, `latency` | Lands per second; latency of every route, of lands per minute (a creeping p99 shows here), and land end to end including conflict redo |
+| `errors`, `status_counts`, `workload` | 5xx, those attributed to restarts, transport errors, 429, 408; every counter the agents keep |
+| `invariants` | How many times each check ran, and how long each phase of a round took (`ms_*`) |
+| `server_metrics` | The server's Prometheus metrics merged across restarts: land outcomes and attempts, CAS losses, derive latency by kind, cache hit ratio, requests limited |
+| `resources`, `samples` | RSS slope fit, CPU, database, table and blob sizes, harness RSS; the raw time series every sample interval |
+| `gc`, `derive_search`, `restarts` | Each GC with its counts and whether the reachability check after it passed, each warmup, each restart |
+
+What fails a run, and what to do:
+
+| Kind | Meaning |
+|---|---|
+| `ack_lost`, `history_duplicate`, `ack_content`, `ref_vanished`, `conflict_resolved_silently` | A land the server acknowledged is missing, doubled or wrong, or a conflicted stack landed anyway. The most serious findings: keep the database, find the key (`soak <run>:<agent>:<n>` in the message) in the ref log and history |
+| `blob_lost`, `blob_corrupt`, `deep_read`, `changeset_integrity`, `generation` | Something stored no longer reads back as it was written (GC, a store, or derived data) |
+| `reflog`, `path_log`, `last_change`, `blame`, `search_token`, `search`, `read_integrity`, `rename_detection` | A derived answer disagrees with the history it is derived from |
+| `server_error`, `transport_error`, `stall`, `deadlock`, `postgres_deadlock`, `unexpected_status`, `cli_server_error` | A 5xx, a dropped connection or a hang outside a restart, a request that gave no answer in 90 s, an agent with no progress, an answer nobody expected |
+| `threshold_land_p99`, `threshold_rss_slope`, `baseline_regression` | A bound on latency, memory growth or a baseline was exceeded |
+| `policy`, `land_rejected`, `release` | Signing and review did not behave: an unsigned or unreviewed land was accepted, or a good one refused |
+
+A seed replays the workload plan, not the interleaving of threads and
+processes, so a failure usually, but not always, reproduces. Server logs are
+in `server.log` (filter `warn`: request lines are off) and each GC's output
+in `gc.log`.
+
+What it costs: the database grows by about 70 KiB per acknowledged land with
+the default 100-file directories (derived rows dominate: the search index and
+the path-history index rewrite a changed directory whole; `PERFORMANCE.md` has
+the breakdown), blobs by about 26 KiB, and the harness itself keeps about 100 bytes per changeset and per
+acknowledged land (its RSS is in the report), so an eight-hour run at full
+speed needs a few hundred MiB for it. GC and each round of checks take longer as
+history deepens (a GC marks from every changeset), which is why the
+interval is measured from the end of one run to the start of the next.
+
 ## Code search index
 
 `GET /v1/search/{rev}` (`leep search`, the `leep_search` MCP tool) uses two

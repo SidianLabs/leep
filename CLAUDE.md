@@ -29,6 +29,8 @@ After touching `land`, GC, a store backend or the ref log, also run the fault
 sweeps and the SIGKILL crash test (`docs/OPERATIONS.md`, "Crash and fault
 tests"): `LEEP_FAULT_SEEDS=300 cargo test -p leep-derive fault_tests` and
 `cargo test -p leep-e2e --test crash`.
+For leaks, slow drift and long-history bugs, run a soak (`docs/OPERATIONS.md`,
+"Soak tests"): `cargo build --release --workspace && target/release/leep-soak`.
 
 ## Never
 

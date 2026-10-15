@@ -76,7 +76,8 @@ operator action, and their benchmarks are in `docs/PERFORMANCE.md`.
 - [x] Crash-consistency tests: kill the server and GC at random points and
   check that no ref, changeset or blob reachable from a ref is lost (ADR 0021)
 - [x] Fault injection in the storage traits: timeouts, partial writes, errors (ADR 0021)
-- [ ] Long-running soak test: many agents landing for hours against Postgres
+- [x] Long-running soak test: many agents landing for hours against Postgres
+  (`leep-soak`, ADR 0022; scheduled weekly in `.github/workflows/soak.yml`)
 - [x] Security review of auth, signing, review policies and GC, with findings
   fixed or written down in the relevant ADR (`docs/SECURITY-REVIEW.md`)
 - [x] Request size, rate and concurrency limits per token (ADR 0020)

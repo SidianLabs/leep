@@ -121,6 +121,88 @@ What the numbers say:
   rows, with 16 blob fetches in flight). It is paid once per distinct blob and
   directory, by the first search that needs it or by `leep-server derive-search`.
 
+## Soak run
+
+`leep-soak` (ADR 0022, `docs/OPERATIONS.md`) runs a swarm against a real
+`leep-server`, so these numbers include Postgres, the filesystem blob store,
+HTTP and 52 competing clients, which the benchmarks above leave out.
+
+Machine: the 4 vCPU Intel Xeon @ 2.80GHz with 15 GB RAM used above, a virtual
+machine that was not otherwise idle (load average 1 to 3 before each run).
+Postgres 16.15 on the same host with its default settings (`shared_buffers`
+128MB, `fsync` on), `leep-server` release build with `--cache-bytes` 32 MiB and
+`--request-timeout 8s`, blobs on the root disk, and the harness and every agent
+on the same four cores. Workload: `leep-soak --duration 16m` (defaults: 50 HTTP
+agents and 2 `leep` CLI agents, mean think time 6 s, a 3025-file repository,
+signatures and review enforced on `release`, GC every 5.3 minutes and
+`derive-search main` every two). The chaos column is `--duration 6m --chaos
+--chaos-restarts 4`. One run each, not a statistical sample; expect the same
+shape and noise of tens of percent.
+
+| | 16 minutes | 6 minutes with restarts |
+|---|---|---|
+| Lands acknowledged (lands per second) | 5691 (5.9) | 2164 (6.0) |
+| HTTP requests per second | 132 | 139 |
+| `land` request p50 / p95 / p99 / max | 4.9 / 551 / 1270 / 2753 ms | 6.1 / 777 / 1373 / 1752 ms |
+| Whole land including conflict redo, p50 / p99 | 52 / 1260 ms | 54 / 1413 ms |
+| Server view: attempts per land, CAS losses | 1.00, 0 | 1.00, 0 |
+| Server view: land mean, of which waiting for the ref lock | 85 ms, 52 ms | |
+| Fast-forward / replayed lands | 3562 / 1808 | 1286 / 758 |
+| Conflicts answered (stacks redone) | 5 | 1 |
+| 5xx | 0 | 0 |
+| Restarts (graceful, SIGKILL); requests attributed to them | | 3, 1; 153 (151 refused or dropped connections) |
+| Server RSS first, last, max | 38.8, 120.5, 122.0 MiB | |
+| RSS slope over the second half (limit 64 MiB/h) | 14.2 MiB/h over 475 s | not judged (restarts) |
+| Server CPU, mean; blob cache hit ratio | 0.61 cores; 98% | 0.60 cores; 96% |
+| Database size | 8.5 to 418 MiB | 8.4 to 147 MiB |
+| Blob directory | 6.8 to 153 MiB | 6.8 to 62 MiB |
+| GC runs (changesets scanned), time each | 2 (3746, 8091), 46 s and 78 s | 2 |
+| Blobs condemned and deleted by GC | 272 | 97 |
+
+The land p99 is flat across the sixteen per-minute windows (0.5 to 1.6 s, with
+a median of 4 to 11 ms in each), so latency did not creep as history grew to
+8000 changesets. The p95 and p99 are mostly lands that replayed: a land that
+lost a race replays its stack under the ref's lock (mean 52 ms of waiting), and
+a handful a minute are stacks some dozens of changesets behind.
+
+Per route (same run; p50 / p99): `changeset.create` 18 / 74 ms, `blobs.put` 2.3 /
+9.6 ms, `file` 0.7 / 3.8 ms, `tree` 0.7 / 3.7 ms, `ref.get` 0.7 / 3.8 ms,
+`last-change` 12 / 272 ms, `log` by path 19 / 260 ms, `blame` 27 / 328 ms, `search`
+(token or identifier at a recent head) 142 / 590 ms. Deriving the path-history
+index takes 15.6 ms per changeset and the skip list 3.9 ms; generation,
+last-merge and trigram rows are under a millisecond. `derive-search main` takes
+0.03 to 0.5 s each time. A `leep` checkout (`init`) of the repository takes about
+5 s, a `sync` 0.3 s, a `commit` 55 ms.
+
+**Capacity of one ref.** A fast-forward land is 5 ms, but lands to one ref are
+serialized and a replay costs more, so this machine sustains about 6 lands per
+second to one ref at the latencies above; 50 agents with a mean think time of 6 s
+offer that. The same swarm with a first version of the workload (branches that
+lived for dozens of iterations, so merging one landed a stack hundreds of
+changesets behind) queued: the land lock was held for seconds per stale land,
+p99 reached the 8 s request timeout and an agent's land stalled for 90 s.
+ADR 0022 has the breakdown. The cost of a stale land is a few reads per
+changeset of distance, so it grows with how long work stays unlanded, not with
+the size of the tree.
+
+**Growth.** The database grew 72 KiB per acknowledged land (418 MiB over 5691
+lands), the blob directory 26 KiB. In the 6-minute run's 4389 changesets the
+`derived` rows were: `tree-trigrams-v1` 74 MB (7832 rows of 9.9 KB, the search
+index of each changed directory, built by searches and warmups), `history-node-v1`
+41 MB (15 978 rows of 2.7 KB, the path-history nodes of every changed
+directory), blame cache 5.9 MB, `blob-trigrams-v1` 5.7 MB, skip lists 1.8 MB;
+everything else is under 150 KB. A hundred-file directory that changes in every
+land is rewritten as a whole in both indexes, which is where the bytes come from.
+Plan for roughly 70 KiB of database per land at this directory width (about
+70 GB per million lands); `docs/OPERATIONS.md` has the same figure.
+
+**Before the `blame` fix.** The first 16-minute run, same configuration,
+failed after seven minutes: `blame` walked every ancestor, took 3.4 s on average
+at 4400 changesets (1.4 s for a file untouched since the import, cached or not),
+and land p50 rose from 5 ms to 6 s with 54 requests hitting the request timeout.
+After the fix a blame is 12 ms cold and 3 ms cached on the same history, and
+the run above is flat.
+
 ## Analysis
 
 Principle 5 (cost scales with the change, not the repository) holds for the
@@ -185,6 +267,3 @@ children only.
   the full parent, including all its changes. An `exists`-style `MetaStore`
   method (or a generation lookup) would make the check O(1) regardless of
   parent size. This needs a trait addition, so it is an ADR-sized change.
-- Blame could start from the index's last change of the file instead of
-  walking first parents from the tip, but the index follows all parents and
-  blame follows first parents, so it would need its own first-parent entries.
