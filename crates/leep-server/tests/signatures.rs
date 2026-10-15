@@ -441,6 +441,7 @@ async fn require_signatures_end_to_end() {
     let cas = |new| CasRefRequest {
         expected: None,
         new: Some(new),
+        ..Default::default()
     };
     let r = api.post("/v1/refs/main", &cas(c)).await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST);
@@ -449,6 +450,14 @@ async fn require_signatures_end_to_end() {
     assert_eq!(
         api.post("/v1/refs/scratch2", &cas(c)).await.status,
         StatusCode::OK
+    );
+    // Only the two moves that happened are in the ref log.
+    let log = api.repo.meta().ref_log(None, None, 10).await.unwrap();
+    let names: Vec<_> = log.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(
+        names,
+        ["scratch2", "scratch"],
+        "refused moves are not logged"
     );
 
     // A signature by an untrusted key leaves it unsigned.
@@ -477,6 +486,7 @@ async fn a_protected_ref_cannot_be_deleted_over_the_api() {
     let delete = CasRefRequest {
         expected: Some(c),
         new: None,
+        ..Default::default()
     };
     let r = api.post("/v1/refs/main", &delete).await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST);
@@ -489,6 +499,7 @@ async fn a_protected_ref_cannot_be_deleted_over_the_api() {
         &CasRefRequest {
             expected: None,
             new: Some(c),
+            ..Default::default()
         },
     )
     .await;
@@ -498,6 +509,7 @@ async fn a_protected_ref_cannot_be_deleted_over_the_api() {
             &CasRefRequest {
                 expected: Some(c),
                 new: None,
+                ..Default::default()
             },
         )
         .await;

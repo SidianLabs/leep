@@ -5,7 +5,9 @@ use bytes::Bytes;
 use gix::bstr::ByteSlice;
 use gix::objs::tree::EntryKind;
 use gix::ObjectId;
-use leep_core::{Changeset, ChangesetId, Error, FileChange, FileKind, Hash, RepoPath, Result};
+use leep_core::{
+    Changeset, ChangesetId, Error, FileChange, FileKind, Hash, RefUpdateContext, RepoPath, Result,
+};
 use leep_derive::Repo;
 
 use crate::{
@@ -374,7 +376,8 @@ pub async fn import(
                     )));
                 }
             }
-            if !meta.cas_ref(name, cur, Some(head_id)).await? {
+            let ctx = RefUpdateContext::new("import").message(format!("git {head}"));
+            if !meta.cas_ref_logged(name, cur, Some(head_id), &ctx).await? {
                 return Err(Error::Other(format!("ref {name} changed concurrently")));
             }
         }

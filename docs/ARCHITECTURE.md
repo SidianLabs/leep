@@ -94,6 +94,7 @@ Rules:
 | `TreeNode` (one directory) | `Hash::of_object("tree-v1", postcard)` | `BlobStore::put_with_hash` |
 | `Changeset` | `Hash::of_object("changeset-v1", postcard)` | `MetaStore::put_changeset` |
 | Ref | name → `ChangesetId` | `MetaStore`, CAS only |
+| Ref log entry | `seq` → (ref, old, new, time, actor, operation, message) | `MetaStore`, appended by `cas_ref_logged` in the CAS's own transaction |
 | Derived value | `(kind, key)` → bytes | `MetaStore::put_derived` |
 
 `Changeset { parents, author, timestamp, message, changes, extra }`:
@@ -249,6 +250,24 @@ are compare-and-swap calls on `/v1/refs/{name}`. `branch -d` deletes only if
 working copy, sets `target_ref` in `.leep/config.json` and materializes the
 branch head the way `sync` does.
 
+**Ref log and undo** ([ADR 0018](adr/0018-ref-log.md)). Every successful ref
+create, move or delete appends a row to `ref_log` in the same transaction (or
+under the same lock, in memory) as the conditional update, so a ref never
+moves unrecorded and a lost CAS writes nothing. Callers pass a
+`RefUpdateContext` (actor, operation, message) to `MetaStore::cas_ref_logged`:
+`land` records `land`, the git bridge `import`, and the server passes the
+token's name and the request's operation for `POST /v1/refs/{name}` (`land`
+and `import` are reserved so clients cannot forge them). `GET /v1/reflog` and
+`/v1/reflog/{name}` page the log newest first. `leep undo` is a client of
+existing endpoints: it reads a ref's latest log entry and compare-and-swaps the
+ref from its current value to that entry's old value, with operation `undo`,
+through `cas_ref_checked`, so name rules, immutable tags, protected deletes and
+signature or review policies still apply and a concurrent move is a 409. It
+never touches the working copy. Undoing a delete recreates the ref, undoing a
+create deletes it, and the redo of an undo is another undo. The log is
+unbounded; entries name changesets, which are never deleted, so GC is
+unaffected.
+
 **Checkout** (`leep checkout`): the client resolves a rev to an id and lists
 files under the requested prefixes (`GET /v1/files`). It then fetches the
 missing blobs through its local content-addressed cache and writes them. Only
@@ -276,7 +295,8 @@ misses and occupancy as Prometheus metrics (see [OPERATIONS.md](OPERATIONS.md)).
 
 - Only refs need coordination. `cas_ref` is a single conditional SQL statement
   (an `UPDATE … WHERE target = expected` or an `INSERT … ON CONFLICT DO
-  NOTHING`), never a read followed by a write.
+  NOTHING`), never a read followed by a write. Its ref log row is inserted in
+  the same transaction, only when the statement changed a row.
 - Changesets, blobs and derived values are written idempotently. Duplicate
   writes from racing servers are harmless.
 - A blob may be orphaned if a client uploads it and never commits, and tree

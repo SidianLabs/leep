@@ -7,14 +7,12 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use bytes::Bytes;
 
-use crate::store::BlobMeta;
+use crate::store::{unix_now, BlobMeta, RefLogEntry, RefUpdateContext};
 use crate::{BlobStore, Changeset, ChangesetId, Hash, MetaStore, Result};
 
 /// Unix seconds now, for blob modification times.
 fn now_secs() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64)
+    unix_now()
 }
 
 struct Entry {
@@ -98,8 +96,16 @@ impl BlobStore for MemoryBlobStore {
 #[derive(Default)]
 pub struct MemoryMetaStore {
     changesets: Mutex<BTreeMap<ChangesetId, Changeset>>,
-    refs: Mutex<BTreeMap<String, ChangesetId>>,
+    refs: Mutex<Refs>,
     derived: Mutex<HashMap<(String, Hash), Bytes>>,
+}
+
+/// Refs and their log share one lock, so a move and its entry are one step.
+#[derive(Default)]
+struct Refs {
+    heads: BTreeMap<String, ChangesetId>,
+    /// Ascending by `seq`, which is the index plus one.
+    log: Vec<RefLogEntry>,
 }
 
 impl MemoryMetaStore {
@@ -141,28 +147,61 @@ impl MetaStore for MemoryMetaStore {
     }
 
     async fn get_ref(&self, name: &str) -> Result<Option<ChangesetId>> {
-        Ok(self.refs.lock().unwrap().get(name).copied())
+        Ok(self.refs.lock().unwrap().heads.get(name).copied())
     }
 
-    async fn cas_ref(
+    async fn cas_ref_logged(
         &self,
         name: &str,
         expected: Option<ChangesetId>,
         new: Option<ChangesetId>,
+        ctx: &RefUpdateContext,
     ) -> Result<bool> {
         let mut refs = self.refs.lock().unwrap();
-        if refs.get(name).copied() != expected {
+        if refs.heads.get(name).copied() != expected {
             return Ok(false);
         }
+        if expected == new {
+            return Ok(true);
+        }
         match new {
-            Some(id) => refs.insert(name.to_string(), id),
-            None => refs.remove(name),
+            Some(id) => refs.heads.insert(name.to_string(), id),
+            None => refs.heads.remove(name),
         };
+        let seq = refs.log.len() as u64 + 1;
+        refs.log.push(RefLogEntry {
+            seq,
+            name: name.to_string(),
+            old: expected,
+            new,
+            time: unix_now(),
+            actor: ctx.actor.clone(),
+            operation: ctx.operation.clone(),
+            message: ctx.message.clone(),
+        });
         Ok(true)
     }
 
+    async fn ref_log(
+        &self,
+        name: Option<&str>,
+        before_seq: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<RefLogEntry>> {
+        let refs = self.refs.lock().unwrap();
+        Ok(refs
+            .log
+            .iter()
+            .rev()
+            .filter(|e| before_seq.is_none_or(|b| e.seq < b))
+            .filter(|e| name.is_none_or(|n| e.name == n))
+            .take(limit)
+            .cloned()
+            .collect())
+    }
+
     async fn list_refs(&self) -> Result<BTreeMap<String, ChangesetId>> {
-        Ok(self.refs.lock().unwrap().clone())
+        Ok(self.refs.lock().unwrap().heads.clone())
     }
 
     async fn get_derived(&self, kind: &str, key: &Hash) -> Result<Option<Bytes>> {
@@ -235,6 +274,7 @@ pub async fn check_meta_store_contract(store: &dyn MetaStore) {
     assert!(store.get_ref("main").await.unwrap().is_none());
 
     check_list_changesets(store).await;
+    check_ref_log(store).await;
 
     let key = Hash::of_blob(b"k");
     assert!(store.get_derived("kind", &key).await.unwrap().is_none());
@@ -251,6 +291,143 @@ pub async fn check_meta_store_contract(store: &dyn MetaStore) {
         &b"v"[..]
     );
     assert!(store.get_derived("other", &key).await.unwrap().is_none());
+}
+
+/// The ref log: one entry per change that happened, none for a lost or empty
+/// swap, newest first, filterable by ref and pageable by `seq`.
+async fn check_ref_log(store: &dyn MetaStore) {
+    let mut ids = Vec::new();
+    for n in 0..4 {
+        let cs = Changeset {
+            parents: vec![],
+            author: "t".into(),
+            timestamp: 2000 + n,
+            message: format!("reflog {n}"),
+            changes: BTreeMap::new(),
+            extra: BTreeMap::new(),
+        };
+        ids.push(store.put_changeset(&cs).await.unwrap());
+    }
+    let (a, b, c, d) = (ids[0], ids[1], ids[2], ids[3]);
+    let log =
+        |name: &'static str| async move { store.ref_log(Some(name), None, 1000).await.unwrap() };
+
+    assert!(log("rl/x").await.is_empty());
+    let land = RefUpdateContext::new("land")
+        .actor(Some("alice"))
+        .message("landed a");
+    let before = now_secs();
+    assert!(store
+        .cas_ref_logged("rl/x", None, Some(a), &land)
+        .await
+        .unwrap());
+    let entries = log("rl/x").await;
+    assert_eq!(entries.len(), 1, "create is logged");
+    let e = &entries[0];
+    assert_eq!((e.name.as_str(), e.old, e.new), ("rl/x", None, Some(a)));
+    assert_eq!(e.actor.as_deref(), Some("alice"));
+    assert_eq!(e.operation, "land");
+    assert_eq!(e.message.as_deref(), Some("landed a"));
+    assert!(
+        (before - 5..=now_secs() + 5).contains(&e.time),
+        "server clock time"
+    );
+
+    // Lost swaps and swaps that change nothing write nothing.
+    assert!(!store.cas_ref("rl/x", None, Some(b)).await.unwrap());
+    assert!(!store.cas_ref("rl/x", Some(b), Some(c)).await.unwrap());
+    assert!(!store.cas_ref("rl/x", Some(b), None).await.unwrap());
+    assert!(store.cas_ref("rl/x", Some(a), Some(a)).await.unwrap());
+    assert!(store.cas_ref("rl/absent", None, None).await.unwrap());
+    assert_eq!(log("rl/x").await.len(), 1, "no entry without a change");
+    assert!(log("rl/absent").await.is_empty());
+
+    // `cas_ref` logs with the default context.
+    assert!(store.cas_ref("rl/x", Some(a), Some(b)).await.unwrap());
+    assert!(store.cas_ref("rl/y", None, Some(c)).await.unwrap());
+    let undo = RefUpdateContext::new("undo").actor(None::<String>);
+    assert!(store
+        .cas_ref_logged("rl/x", Some(b), None, &undo)
+        .await
+        .unwrap());
+    assert!(store
+        .cas_ref_logged("rl/x", None, Some(d), &RefUpdateContext::new("import"))
+        .await
+        .unwrap());
+    // A name that merely starts with another is a different ref.
+    assert!(store.cas_ref("rl/xy", None, Some(a)).await.unwrap());
+
+    let entries = log("rl/x").await;
+    assert_eq!(entries.len(), 4);
+    assert!(
+        entries.windows(2).all(|w| w[0].seq > w[1].seq),
+        "newest first"
+    );
+    assert!(entries.iter().all(|e| e.name == "rl/x"), "per-ref filter");
+    let steps: Vec<_> = entries.iter().rev().map(|e| (e.old, e.new)).collect();
+    assert_eq!(
+        steps,
+        [
+            (None, Some(a)),
+            (Some(a), Some(b)),
+            (Some(b), None),
+            (None, Some(d))
+        ],
+        "create, move, delete and recreate replay to the head"
+    );
+    let ops: Vec<_> = entries.iter().rev().map(|e| e.operation.as_str()).collect();
+    assert_eq!(ops, ["land", "cas", "undo", "import"]);
+    assert_eq!(entries[0].actor, None);
+    assert_eq!(entries[0].message, None);
+    assert_eq!(store.get_ref("rl/x").await.unwrap(), Some(d));
+
+    // Across refs: one sequence, in the order the moves happened.
+    let all = store.ref_log(None, None, 1000).await.unwrap();
+    assert!(all.windows(2).all(|w| w[0].seq > w[1].seq));
+    let pos = |name: &str, new: Option<ChangesetId>| {
+        all.iter()
+            .position(|e| e.name == name && e.new == new)
+            .unwrap()
+    };
+    assert!(pos("rl/xy", Some(a)) < pos("rl/x", Some(d)), "newest first");
+    assert!(pos("rl/x", Some(d)) < pos("rl/y", Some(c)));
+    assert!(pos("rl/y", Some(c)) < pos("rl/x", Some(b)));
+    let ys = log("rl/y").await;
+    assert_eq!((ys.len(), ys[0].old, ys[0].new), (1, None, Some(c)));
+
+    // Paging by `before_seq` is complete, ordered and respects `limit`.
+    let mut paged = Vec::new();
+    let mut before = None;
+    loop {
+        let page = store.ref_log(Some("rl/x"), before, 3).await.unwrap();
+        assert!(page.len() <= 3, "page exceeds limit");
+        let Some(last) = page.last().map(|e| e.seq) else {
+            break;
+        };
+        paged.extend(page);
+        before = Some(last);
+    }
+    assert_eq!(paged, entries, "paging does not change the log");
+    let mut paged_all = Vec::new();
+    let mut before = None;
+    loop {
+        let page = store.ref_log(None, before, 2).await.unwrap();
+        let Some(last) = page.last().map(|e| e.seq) else {
+            break;
+        };
+        paged_all.extend(page);
+        before = Some(last);
+    }
+    assert_eq!(paged_all, all);
+    assert!(store.ref_log(None, None, 0).await.unwrap().is_empty());
+    let first = store.ref_log(None, None, 1).await.unwrap();
+    assert_eq!(first, all[..1]);
+    let oldest = entries.last().unwrap().seq;
+    assert!(store
+        .ref_log(Some("rl/x"), Some(oldest), 10)
+        .await
+        .unwrap()
+        .is_empty());
 }
 
 /// Paging over changesets: ascending, exclusive cursor, complete, no overlap.

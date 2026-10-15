@@ -82,6 +82,25 @@ groups:
     for: 5m
 ```
 
+## Ref log
+
+Every ref create, move and delete is recorded in the `ref_log` table of the
+metadata store (ADR 0018), by the same transaction that changes the ref. Read
+it with `leep reflog [REF]` or `GET /v1/reflog` (a read token is enough). The
+table is created when a server first opens an existing database, with no
+manual migration, and starts empty: refs that moved before the upgrade have no
+history. Upgrade every server before relying on it; an older server still
+running moves refs without writing entries.
+
+The log is never pruned, and it needs no maintenance: a row is about 150 bytes
+and is written only when a ref moves, so even a swarm landing every second
+adds a few tens of MB a year. Include `ref_log` in metadata backups, since it
+is the only record of how refs moved. Entries name changesets, which are never
+deleted, so `leep-server gc` is unaffected and a ref restored with `leep undo`
+always points at an existing changeset. Postgres serializes the final insert of
+each ref move with an advisory lock (key 7164738) so `seq` follows commit order;
+it is held for the length of one insert.
+
 ## Blob garbage collection
 
 Abandoned uploads and failed commits leave unreferenced blobs. `leep-server

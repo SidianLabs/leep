@@ -65,7 +65,7 @@ operator action, and their benchmarks are in `docs/PERFORMANCE.md`.
 - [ ] `sync` that rebases uncommitted work, and `leep stash`
 - [ ] `leep restore`, `leep amend` and `leep reset` for unlanded work
 - [ ] `leep merge`, `leep rebase`, `leep revert` and `leep cherry-pick`
-- [ ] Ref log (history of every ref move) and `leep undo`
+- [x] Ref log (history of every ref move) and `leep undo` (ADR 0018)
 
 ### Hardening
 - Self-host Leep's own development on a Leep server, mirrored to GitHub,

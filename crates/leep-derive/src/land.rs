@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use leep_core::api::{LandResponse, RebaseResponse};
 use leep_core::refname;
-use leep_core::{ChangesetId, Error, Result};
+use leep_core::{ChangesetId, Error, RefUpdateContext, Result};
 
 use crate::Repo;
 
@@ -65,9 +65,23 @@ impl Repo {
     /// the CAS to a sibling request. The CAS still guards against other
     /// processes, with jittered backoff between losses.
     pub async fn land(&self, cs: ChangesetId, target_ref: &str) -> Result<LandResponse> {
+        self.land_as(cs, target_ref, None).await
+    }
+
+    /// [`land`](Self::land) recording `actor` (the caller's token name) in the
+    /// ref log entry of the move.
+    pub async fn land_as(
+        &self,
+        cs: ChangesetId,
+        target_ref: &str,
+        actor: Option<&str>,
+    ) -> Result<LandResponse> {
         let started = Instant::now();
         let mut stats = LandStats::default();
-        let result = self.land_inner(cs, target_ref, &mut stats).await;
+        let ctx = RefUpdateContext::new("land")
+            .actor(actor)
+            .message(format!("landed {cs}"));
+        let result = self.land_inner(cs, target_ref, &ctx, &mut stats).await;
         stats.record(&result, started.elapsed());
         result
     }
@@ -76,6 +90,7 @@ impl Repo {
         &self,
         cs: ChangesetId,
         target_ref: &str,
+        ctx: &RefUpdateContext,
         stats: &mut LandStats,
     ) -> Result<LandResponse> {
         refname::validate(target_ref)?;
@@ -117,7 +132,11 @@ impl Repo {
                     Err(resp) => return Ok(resp),
                 },
             };
-            if self.meta().cas_ref(target_ref, head, Some(new)).await? {
+            if self
+                .meta()
+                .cas_ref_logged(target_ref, head, Some(new), ctx)
+                .await?
+            {
                 return Ok(LandResponse::Landed {
                     landed: new,
                     rebased: new != cs,
@@ -137,12 +156,15 @@ impl Repo {
     /// land policy applied, so a raw ref update cannot skip them: names must
     /// be valid, a tag can be created or deleted but never moved, a ref a
     /// policy protects cannot be deleted, and the policy checks what the ref
-    /// would gain. Rewinds of branches add nothing and are not checked.
+    /// would gain. Rewinds of branches add nothing and are not checked. A
+    /// refused move records nothing in the ref log; `ctx` is stored with the
+    /// entry of one that happens.
     pub async fn cas_ref_checked(
         &self,
         name: &str,
         expected: Option<ChangesetId>,
         new: Option<ChangesetId>,
+        ctx: &RefUpdateContext,
     ) -> Result<bool> {
         // Deletes skip the name check so a ref that predates the validator
         // can still be removed.
@@ -171,7 +193,7 @@ impl Repo {
                 }
             }
         }
-        self.meta().cas_ref(name, expected, new).await
+        self.meta().cas_ref_logged(name, expected, new, ctx).await
     }
 
     /// Ask the policy about the submitted changesets this land would add to

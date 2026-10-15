@@ -12,6 +12,8 @@
 //! | GET  | `/v1/refs` | – | [`RefsResponse`] |
 //! | GET  | `/v1/refs/{name}` | – | [`RefResponse`] |
 //! | POST | `/v1/refs/{name}` | [`CasRefRequest`] | [`CasRefResponse`] (409 if it lost) |
+//! | GET  | `/v1/reflog?before=seq&limit=n` | – | [`RefLogResponse`] (every ref move, newest first; `limit` defaults to 50, capped at 1000; `before` returns entries with a smaller `seq`) |
+//! | GET  | `/v1/reflog/{name}?before=seq&limit=n` | – | [`RefLogResponse`] (the moves of one ref; an unknown or never-moved ref is an empty list) |
 //! | GET  | `/v1/resolve/{rev}` | – | [`ResolveResponse`] (`rev` = ref name, full 64-hex id or short tag name) |
 //! | GET  | `/v1/tree/{id}?path=dir` | – | [`TreeResponse`] (one directory level) |
 //! | GET  | `/v1/files/{id}?prefix=dir` | – | [`FilesResponse`] (recursive listing) |
@@ -45,6 +47,17 @@
 //! `Error::NotFound` → 404, CAS loss and `Error::Conflict` (e.g. a land that
 //! kept losing to concurrent lands) → 409, anything else → 500.
 //! Hashes and ids are lowercase hex in JSON.
+//!
+//! # Ref log
+//!
+//! Every successful ref change (create, move, delete) appends a
+//! [`RefLogEntry`] in the same atomic step as the change (ADR 0018). `land`
+//! records `land`, `POST /v1/refs/{name}` records the request's `operation`
+//! (default `cas`), and the entry's `actor` is the token's name, never a name
+//! from the body, or null when authentication is off. A client may label its
+//! own moves with `operation` and `message` (`leep undo` sends `undo`); the
+//! server-owned labels `land` and `import` are 400. Refused and lost moves
+//! write nothing. Entries are never removed.
 //!
 //! # Authentication
 //!
@@ -83,6 +96,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::review::{Review, Verdict};
+pub use crate::store::RefLogEntry;
 use crate::{Changeset, ChangesetId, FileChange, FileKind, Hash, RepoPath, TreeEntry};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -220,10 +234,19 @@ pub struct RefResponse {
     pub target: Option<ChangesetId>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CasRefRequest {
     pub expected: Option<ChangesetId>,
     pub new: Option<ChangesetId>,
+    /// Short label stored in the ref log entry: lowercase letters, digits and
+    /// `-_.`, up to 32 bytes. Defaults to `cas`; `land` and `import` are
+    /// reserved for the server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation: Option<String>,
+    /// Free text stored in the ref log entry, up to 256 bytes, no control
+    /// characters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -231,6 +254,12 @@ pub struct CasRefResponse {
     pub ok: bool,
     /// Value of the ref after the call.
     pub current: Option<ChangesetId>,
+}
+
+/// Ref log entries, newest first.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefLogResponse {
+    pub entries: Vec<RefLogEntry>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -572,6 +601,48 @@ mod tests {
         assert!(m.ranges.is_empty());
         let v = serde_json::to_value(SearchRange { start: 1, end: 2 }).unwrap();
         assert_eq!(v, serde_json::json!({ "start": 1, "end": 2 }));
+    }
+
+    #[test]
+    fn ref_log_shapes_are_stable_and_old_cas_bodies_parse() {
+        let id = ChangesetId(Hash::of_blob(b"x"));
+        let r: CasRefRequest = serde_json::from_value(serde_json::json!({
+            "expected": null, "new": id.to_string()
+        }))
+        .unwrap();
+        assert_eq!((r.operation, r.message), (None, None));
+        let v = serde_json::to_value(CasRefRequest {
+            expected: None,
+            new: Some(id),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(v.as_object().unwrap().len(), 2, "unset fields are omitted");
+
+        let e = RefLogEntry {
+            seq: 4,
+            name: "main".into(),
+            old: Some(id),
+            new: None,
+            time: 1_760_000_000,
+            actor: None,
+            operation: "undo".into(),
+            message: Some("undo of 3".into()),
+        };
+        let v = serde_json::to_value(RefLogResponse {
+            entries: vec![e.clone()],
+        })
+        .unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({ "entries": [{
+                "seq": 4, "name": "main", "old": id.to_string(), "new": null,
+                "time": 1_760_000_000, "actor": null, "operation": "undo",
+                "message": "undo of 3"
+            }]})
+        );
+        let back: RefLogResponse = serde_json::from_value(v).unwrap();
+        assert_eq!(back.entries, [e]);
     }
 
     #[test]

@@ -21,5 +21,5 @@ pub use changeset::{Changeset, ChangesetId, FileChange, FileKind};
 pub use error::{Error, Result};
 pub use hash::Hash;
 pub use path::RepoPath;
-pub use store::{BlobMeta, BlobStore, MetaStore};
+pub use store::{BlobMeta, BlobStore, MetaStore, RefLogEntry, RefUpdateContext};
 pub use tree::{TreeEntry, TreeNode};

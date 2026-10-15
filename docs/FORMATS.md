@@ -231,7 +231,35 @@ branch or id always wins over a tag of the same short name.
 changesets(id BYTEA PRIMARY KEY, data BYTEA NOT NULL)          -- data = Changeset::encode()
 refs(name TEXT PRIMARY KEY, target BYTEA NOT NULL)
 derived(kind TEXT, key BYTEA, value BYTEA, PRIMARY KEY(kind, key))
+ref_log(seq BIGSERIAL PRIMARY KEY,                             -- SQLite: INTEGER PRIMARY KEY AUTOINCREMENT
+        name TEXT NOT NULL, old_target BYTEA, new_target BYTEA, -- 32-byte ids; NULL = no ref
+        time BIGINT NOT NULL, actor TEXT, operation TEXT NOT NULL, message TEXT)
+ref_log_name: INDEX ON ref_log(name, seq)
 ```
+
+`ref_log` (ADR 0018) is appended in the transaction of every ref create, move
+or delete and never updated or deleted. `old_target` is NULL for a create,
+`new_target` for a delete; `time` is unix seconds by the writing server;
+`actor` is the token name or NULL; `operation` is a short label (`land`,
+`cas`, `undo`, `import`, or a client's own, see "Ref log" below). Tables and
+index are created with `IF NOT EXISTS` on open, so databases made by earlier
+versions upgrade in place; refs that moved before then simply have no rows.
+
+## Ref log (new table and API fields, no change to stored objects)
+
+ADR 0018 adds the `ref_log` table above, `MetaStore::cas_ref_logged` and
+`ref_log`, `GET /v1/reflog` and `GET /v1/reflog/{name}`, and the optional
+`operation` and `message` fields of `POST /v1/refs/{name}`. No changeset, tree,
+hash or derived encoding changed. Rules:
+
+- `seq` increases with every entry in the store; entries of one ref replay, oldest
+  first, to its current value (each `old` is the previous `new`).
+- A swap that loses, and a swap with `expected == new`, write no entry.
+- `operation` from a client is 1 to 32 bytes of `a-z 0-9 - _ .`, defaults to
+  `cas`, and may not be `land` or `import`; `message` is up to 256 bytes with
+  no control characters. `actor` is never taken from a request.
+- Entries are never removed. They name changesets, which are never deleted, so
+  blob garbage collection is unaffected.
 
 ## Blob storage layout (leep-store)
 

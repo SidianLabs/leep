@@ -17,6 +17,10 @@ fn repo() -> Repo {
     )
 }
 
+fn cas_ctx() -> leep_core::RefUpdateContext {
+    leep_core::RefUpdateContext::new("cas")
+}
+
 fn rp(s: &str) -> RepoPath {
     RepoPath::new(s).unwrap()
 }
@@ -1109,14 +1113,23 @@ impl leep_core::MetaStore for SlowRefs {
         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         self.0.get_ref(name).await
     }
-    async fn cas_ref(
+    async fn cas_ref_logged(
         &self,
         name: &str,
         expected: Option<ChangesetId>,
         new: Option<ChangesetId>,
+        ctx: &leep_core::RefUpdateContext,
     ) -> leep_core::Result<bool> {
         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-        self.0.cas_ref(name, expected, new).await
+        self.0.cas_ref_logged(name, expected, new, ctx).await
+    }
+    async fn ref_log(
+        &self,
+        name: Option<&str>,
+        before_seq: Option<u64>,
+        limit: usize,
+    ) -> leep_core::Result<Vec<leep_core::RefLogEntry>> {
+        self.0.ref_log(name, before_seq, limit).await
     }
     async fn list_refs(
         &self,
@@ -1597,15 +1610,58 @@ mod land_policy {
         let c = commit(&r, &[], &[("a", Some("1\n"))], "c").await;
         sign(&r, c).await;
         r.land(c, "main").await.unwrap();
-        match r.cas_ref_checked("main", Some(c), None).await {
+        match r.cas_ref_checked("main", Some(c), None, &cas_ctx()).await {
             Err(Error::Invalid(m)) => assert!(m.contains("protected"), "{m}"),
             other => panic!("{other:?}"),
         }
         assert_eq!(r.meta().get_ref("main").await.unwrap(), Some(c));
         // Refs the policy does not cover can still be deleted.
-        assert!(r.cas_ref_checked("scratch", None, Some(c)).await.unwrap());
-        assert!(r.cas_ref_checked("scratch", Some(c), None).await.unwrap());
+        assert!(r
+            .cas_ref_checked("scratch", None, Some(c), &cas_ctx())
+            .await
+            .unwrap());
+        assert!(r
+            .cas_ref_checked("scratch", Some(c), None, &cas_ctx())
+            .await
+            .unwrap());
         assert_eq!(r.meta().get_ref("scratch").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn refused_moves_record_nothing() {
+        let r = guarded();
+        let a = commit(&r, &[], &[("a", Some("1\n"))], "a").await;
+        let b = commit(&r, &[a], &[("a", Some("2\n"))], "b").await;
+        let entries = |r: &Repo| {
+            let meta = r.meta().clone();
+            async move { meta.ref_log(None, None, 100).await.unwrap().len() }
+        };
+        assert!(r.land(a, "main").await.is_err());
+        assert!(r
+            .cas_ref_checked("main", None, Some(a), &cas_ctx())
+            .await
+            .is_err());
+        assert_eq!(entries(&r).await, 0, "unsigned history is refused");
+        sign(&r, a).await;
+        r.land_as(a, "main", Some("ci")).await.unwrap();
+        assert_eq!(entries(&r).await, 1);
+
+        assert!(r.land(b, "main").await.is_err());
+        assert!(r
+            .cas_ref_checked("main", Some(a), Some(b), &cas_ctx())
+            .await
+            .is_err());
+        assert!(r
+            .cas_ref_checked("main", Some(a), None, &cas_ctx())
+            .await
+            .is_err());
+        assert_eq!(entries(&r).await, 1, "refused move and protected delete");
+        // A lost CAS is not an error and not an entry either.
+        assert!(!r
+            .cas_ref_checked("main", None, Some(a), &cas_ctx())
+            .await
+            .unwrap());
+        assert_eq!(entries(&r).await, 1);
     }
 
     #[tokio::test]
@@ -2255,8 +2311,14 @@ mod review {
         assert_eq!(*log.lock().unwrap(), ["two head=false n=2"]);
         // And raw CAS goes through the set too.
         *one.deny.lock().unwrap() = Some(b);
-        assert!(r.cas_ref_checked("main", Some(a), Some(b)).await.is_err());
-        assert!(r.cas_ref_checked("other", None, Some(b)).await.unwrap());
+        assert!(r
+            .cas_ref_checked("main", Some(a), Some(b), &cas_ctx())
+            .await
+            .is_err());
+        assert!(r
+            .cas_ref_checked("other", None, Some(b), &cas_ctx())
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
@@ -2967,7 +3029,7 @@ mod ref_rules {
         for bad in ["", "a b", "x..y", "/x", "x.lock", "-x", "a\\b"] {
             assert!(
                 matches!(
-                    r.cas_ref_checked(bad, None, Some(a)).await,
+                    r.cas_ref_checked(bad, None, Some(a), &cas_ctx()).await,
                     Err(Error::Invalid(_))
                 ),
                 "cas {bad:?}"
@@ -2979,7 +3041,7 @@ mod ref_rules {
         }
         assert!(r.meta().list_refs().await.unwrap().is_empty());
         assert!(r
-            .cas_ref_checked("team/ok-1.0", None, Some(a))
+            .cas_ref_checked("team/ok-1.0", None, Some(a), &cas_ctx())
             .await
             .unwrap());
         r.land(a, "release/1.0").await.unwrap();
@@ -2991,7 +3053,10 @@ mod ref_rules {
         let a = commit(&r, &[], &[("a", Some("1\n"))], "a").await;
         // Written behind the checked path, as an older server could have.
         assert!(r.meta().cas_ref("odd name", None, Some(a)).await.unwrap());
-        assert!(r.cas_ref_checked("odd name", Some(a), None).await.unwrap());
+        assert!(r
+            .cas_ref_checked("odd name", Some(a), None, &cas_ctx())
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
@@ -2999,20 +3064,65 @@ mod ref_rules {
         let r = repo();
         let a = commit(&r, &[], &[("a", Some("1\n"))], "a").await;
         let b = commit(&r, &[a], &[("a", Some("2\n"))], "b").await;
-        assert!(r.cas_ref_checked("tags/v1", None, Some(a)).await.unwrap());
+        assert!(r
+            .cas_ref_checked("tags/v1", None, Some(a), &cas_ctx())
+            .await
+            .unwrap());
         // Creating over an existing tag loses the CAS, like any ref.
-        assert!(!r.cas_ref_checked("tags/v1", None, Some(b)).await.unwrap());
-        match r.cas_ref_checked("tags/v1", Some(a), Some(b)).await {
+        assert!(!r
+            .cas_ref_checked("tags/v1", None, Some(b), &cas_ctx())
+            .await
+            .unwrap());
+        match r
+            .cas_ref_checked("tags/v1", Some(a), Some(b), &cas_ctx())
+            .await
+        {
             Err(Error::Invalid(m)) => assert!(m.contains("immutable"), "{m}"),
             other => panic!("{other:?}"),
         }
         assert_eq!(r.meta().get_ref("tags/v1").await.unwrap(), Some(a));
-        assert!(r.cas_ref_checked("tags/v1", Some(a), None).await.unwrap());
-        assert!(r.cas_ref_checked("tags/v1", None, Some(b)).await.unwrap());
+        assert!(r
+            .cas_ref_checked("tags/v1", Some(a), None, &cas_ctx())
+            .await
+            .unwrap());
+        assert!(r
+            .cas_ref_checked("tags/v1", None, Some(b), &cas_ctx())
+            .await
+            .unwrap());
         assert_eq!(r.meta().get_ref("tags/v1").await.unwrap(), Some(b));
         // Branches still move.
-        assert!(r.cas_ref_checked("main", None, Some(a)).await.unwrap());
-        assert!(r.cas_ref_checked("main", Some(a), Some(b)).await.unwrap());
+        assert!(r
+            .cas_ref_checked("main", None, Some(a), &cas_ctx())
+            .await
+            .unwrap());
+        assert!(r
+            .cas_ref_checked("main", Some(a), Some(b), &cas_ctx())
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn rule_violations_record_nothing() {
+        let r = repo();
+        let a = commit(&r, &[], &[("a", Some("1\n"))], "a").await;
+        let b = commit(&r, &[a], &[("a", Some("2\n"))], "b").await;
+        assert!(r
+            .cas_ref_checked("tags/v1", None, Some(a), &cas_ctx())
+            .await
+            .unwrap());
+        assert!(r
+            .cas_ref_checked("tags/v1", Some(a), Some(b), &cas_ctx())
+            .await
+            .is_err());
+        assert!(r
+            .cas_ref_checked("bad name", None, Some(a), &cas_ctx())
+            .await
+            .is_err());
+        assert!(r.land(a, "tags/v1").await.is_err());
+        assert!(r.land(a, "bad name").await.is_err());
+        let log = r.meta().ref_log(None, None, 100).await.unwrap();
+        assert_eq!(log.len(), 1, "only the tag creation: {log:?}");
+        assert_eq!(log[0].name, "tags/v1");
     }
 
     #[tokio::test]
@@ -3031,13 +3141,121 @@ mod ref_rules {
         let r = repo();
         let a = commit(&r, &[], &[("a", Some("1\n"))], "a").await;
         let b = commit(&r, &[a], &[("a", Some("2\n"))], "b").await;
-        r.cas_ref_checked("tags/v1", None, Some(a)).await.unwrap();
+        r.cas_ref_checked("tags/v1", None, Some(a), &cas_ctx())
+            .await
+            .unwrap();
         assert_eq!(r.resolve("tags/v1").await.unwrap(), a);
         assert_eq!(r.resolve("v1").await.unwrap(), a);
         // A branch of the same name wins over the tag.
-        r.cas_ref_checked("v1", None, Some(b)).await.unwrap();
+        r.cas_ref_checked("v1", None, Some(b), &cas_ctx())
+            .await
+            .unwrap();
         assert_eq!(r.resolve("v1").await.unwrap(), b);
         assert_eq!(r.resolve("tags/v1").await.unwrap(), a);
         assert!(matches!(r.resolve("nope").await, Err(Error::NotFound(_))));
+    }
+}
+
+mod ref_log {
+    use leep_core::RefUpdateContext;
+
+    use super::*;
+
+    async fn log(r: &Repo) -> Vec<leep_core::RefLogEntry> {
+        r.meta().ref_log(None, None, 100).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn land_records_actor_operation_and_the_landed_changeset() {
+        let r = repo();
+        let a = commit(&r, &[], &[("a", Some("1\n"))], "a").await;
+        let b = commit(&r, &[a], &[("a", Some("2\n"))], "b").await;
+        r.land_as(a, "main", Some("alice")).await.unwrap();
+        r.land(b, "main").await.unwrap();
+        // Landing what the ref already has is not a move.
+        r.land_as(a, "main", Some("alice")).await.unwrap();
+        let entries = log(&r).await;
+        assert_eq!(entries.len(), 2);
+        let (newer, older) = (&entries[0], &entries[1]);
+        assert_eq!((older.old, older.new), (None, Some(a)));
+        assert_eq!((newer.old, newer.new), (Some(a), Some(b)));
+        assert_eq!(older.actor.as_deref(), Some("alice"));
+        assert_eq!(newer.actor, None);
+        assert_eq!(older.operation, "land");
+        assert_eq!(
+            newer.message.as_deref(),
+            Some(format!("landed {b}").as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rebasing_land_records_the_submitted_id_and_the_new_head() {
+        let r = repo();
+        let base = commit(&r, &[], &[("a", Some("1\n"))], "base").await;
+        let left = commit(&r, &[base], &[("l", Some("l\n"))], "left").await;
+        let right = commit(&r, &[base], &[("r", Some("r\n"))], "right").await;
+        r.land(left, "main").await.unwrap();
+        let LandResponse::Landed {
+            landed, rebased, ..
+        } = r.land(right, "main").await.unwrap()
+        else {
+            panic!("expected a clean land");
+        };
+        assert!(rebased);
+        let entries = log(&r).await;
+        assert_eq!(entries[0].new, Some(landed));
+        assert_eq!(entries[0].old, Some(left));
+        assert_eq!(
+            entries[0].message.as_deref(),
+            Some(format!("landed {right}").as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn checked_cas_records_the_context_it_is_given() {
+        let r = repo();
+        let a = commit(&r, &[], &[("a", Some("1\n"))], "a").await;
+        let ctx = RefUpdateContext::new("undo")
+            .actor(Some("bob"))
+            .message("undo of seq 3");
+        assert!(r.cas_ref_checked("dev", None, Some(a), &ctx).await.unwrap());
+        assert!(r
+            .cas_ref_checked("dev", Some(a), None, &cas_ctx())
+            .await
+            .unwrap());
+        let entries = log(&r).await;
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].operation, "cas");
+        assert_eq!((entries[0].old, entries[0].new), (Some(a), None));
+        assert_eq!(entries[1].operation, "undo");
+        assert_eq!(entries[1].actor.as_deref(), Some("bob"));
+        assert_eq!(entries[1].message.as_deref(), Some("undo of seq 3"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_lands_log_one_entry_each_and_replay_to_the_head() {
+        let r = Arc::new(repo());
+        let base = commit(&r, &[], &[("base", Some("b\n"))], "base").await;
+        r.land(base, "main").await.unwrap();
+        let mut tasks = Vec::new();
+        for i in 0..16 {
+            let r = r.clone();
+            tasks.push(tokio::spawn(async move {
+                let name = format!("f{i}");
+                let c = commit(&r, &[base], &[(&name, Some("x\n"))], &name).await;
+                r.land_as(c, "main", Some("w")).await.unwrap();
+            }));
+        }
+        for t in tasks {
+            t.await.unwrap();
+        }
+        let entries = log(&r).await;
+        assert_eq!(entries.len(), 17, "base plus one per land");
+        let mut head = None;
+        for e in entries.iter().rev() {
+            assert_eq!(e.old, head);
+            head = e.new;
+        }
+        assert_eq!(head, r.meta().get_ref("main").await.unwrap());
     }
 }
