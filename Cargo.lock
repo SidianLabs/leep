@@ -2380,6 +2380,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "leep-fuzz-targets"
+version = "0.0.1"
+dependencies = [
+ "axum",
+ "bytes",
+ "leep-core",
+ "leep-derive",
+ "leep-server",
+ "postcard",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower",
+]
+
+[[package]]
 name = "leep-git"
 version = "0.0.1"
 dependencies = [

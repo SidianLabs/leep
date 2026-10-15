@@ -1,0 +1,171 @@
+[package]
+name = "leep-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "libFuzzer binaries for Leep; see docs/FUZZING.md"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+leep-fuzz-targets = { path = "../crates/leep-fuzz-targets" }
+
+# Not part of the main workspace: it needs nightly and libFuzzer.
+[workspace]
+
+[[bin]]
+name = "changeset"
+path = "fuzz_targets/changeset.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tree_node"
+path = "fuzz_targets/tree_node.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "history_node"
+path = "fuzz_targets/history_node.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "signature"
+path = "fuzz_targets/signature.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "review"
+path = "fuzz_targets/review.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "blob_trigrams_row"
+path = "fuzz_targets/blob_trigrams_row.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tree_trigrams_row"
+path = "fuzz_targets/tree_trigrams_row.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "trigram_codec"
+path = "fuzz_targets/trigram_codec.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "gc_rows"
+path = "fuzz_targets/gc_rows.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "skiplist_row"
+path = "fuzz_targets/skiplist_row.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "api_json"
+path = "fuzz_targets/api_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "server_router"
+path = "fuzz_targets/server_router.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "owners"
+path = "fuzz_targets/owners.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "review_policy"
+path = "fuzz_targets/review_policy.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "signing_keys"
+path = "fuzz_targets/signing_keys.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "auth_tokens"
+path = "fuzz_targets/auth_tokens.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "comment_lexer"
+path = "fuzz_targets/comment_lexer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rename_detection"
+path = "fuzz_targets/rename_detection.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ref_name"
+path = "fuzz_targets/ref_name.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "repo_path"
+path = "fuzz_targets/repo_path.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "search_plan"
+path = "fuzz_targets/search_plan.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "arg_parsers"
+path = "fuzz_targets/arg_parsers.rs"
+test = false
+doc = false
+bench = false
+

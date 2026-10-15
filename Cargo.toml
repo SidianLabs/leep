@@ -1,6 +1,9 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
+# A separate cargo-fuzz crate: it needs nightly and libFuzzer, so the normal
+# build never sees it. See docs/FUZZING.md.
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.0.1"

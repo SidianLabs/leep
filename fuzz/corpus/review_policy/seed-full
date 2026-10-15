@@ -1,0 +1,1 @@
+{ "refs": ["main"], "auto_approve": ["comment_only", "whitespace_only", "docs_only"], "docs_globs": ["**/*.md", "docs/**"] }
