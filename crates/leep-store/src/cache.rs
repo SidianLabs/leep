@@ -93,6 +93,13 @@ impl<S: BlobStore> CachedBlobStore<S> {
         &self.inner
     }
 
+    /// Mirror occupancy into the gauges. Called with the lock held so the
+    /// two values are consistent. Hits and misses are counted at the source.
+    fn publish(lru: &Lru) {
+        metrics::gauge!("leep_blob_cache_entries").set(lru.map.len() as f64);
+        metrics::gauge!("leep_blob_cache_bytes").set(lru.bytes as f64);
+    }
+
     pub fn stats(&self) -> CacheStats {
         let lru = self.lru.lock().unwrap();
         CacheStats {
@@ -108,22 +115,25 @@ impl<S: BlobStore> CachedBlobStore<S> {
 impl<S: BlobStore> BlobStore for CachedBlobStore<S> {
     async fn put_with_hash(&self, hash: Hash, data: Bytes) -> Result<()> {
         self.inner.put_with_hash(hash, data.clone()).await?;
-        self.lru.lock().unwrap().insert(hash, data, self.capacity);
+        let mut lru = self.lru.lock().unwrap();
+        lru.insert(hash, data, self.capacity);
+        Self::publish(&lru);
         Ok(())
     }
 
     async fn get(&self, hash: &Hash) -> Result<Option<Bytes>> {
         if let Some(d) = self.lru.lock().unwrap().get(hash) {
             self.hits.fetch_add(1, Ordering::Relaxed);
+            metrics::counter!("leep_blob_cache_hits_total").increment(1);
             return Ok(Some(d));
         }
         self.misses.fetch_add(1, Ordering::Relaxed);
+        metrics::counter!("leep_blob_cache_misses_total").increment(1);
         let found = self.inner.get(hash).await?;
         if let Some(d) = &found {
-            self.lru
-                .lock()
-                .unwrap()
-                .insert(*hash, d.clone(), self.capacity);
+            let mut lru = self.lru.lock().unwrap();
+            lru.insert(*hash, d.clone(), self.capacity);
+            Self::publish(&lru);
         }
         Ok(found)
     }

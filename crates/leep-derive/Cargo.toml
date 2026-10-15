@@ -12,8 +12,14 @@ bytes.workspace = true
 postcard.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+metrics.workspace = true
 diffy = "0.4"
 similar = "2"
 
 [dev-dependencies]
 tokio.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "repo_ops"
+harness = false
