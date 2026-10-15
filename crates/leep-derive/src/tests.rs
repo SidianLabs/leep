@@ -1216,3 +1216,45 @@ async fn land_swarm_across_two_servers_all_succeed() {
     }
     assert_all_landed(&servers[0], 40).await;
 }
+
+/// The skiplist fast path in `merge_base` must agree with the reference walk
+/// on arbitrary DAGs: branches, merges, criss-crosses and unrelated roots.
+#[tokio::test]
+async fn merge_base_fast_path_matches_reference_walk() {
+    let mut seed: u64 = 0x5eed;
+    let mut rand = move |n: usize| {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((seed >> 33) as usize) % n
+    };
+    for round in 0..4 {
+        let r = repo();
+        let mut ids: Vec<ChangesetId> = Vec::new();
+        for i in 0..300 {
+            let name = format!("r{round}/f{i}");
+            let parents: Vec<ChangesetId> = match (ids.len(), rand(10)) {
+                (0, _) => vec![],
+                // A second root now and then: unrelated histories.
+                (_, 0) if i % 97 == 0 => vec![],
+                (n, 0..=1) if n >= 2 => {
+                    let a = ids[n - 1 - rand(n.min(20))];
+                    let b = ids[rand(n)];
+                    if a == b {
+                        vec![a]
+                    } else {
+                        vec![a, b]
+                    }
+                }
+                (n, _) => vec![ids[n - 1 - rand(n.min(8))]],
+            };
+            ids.push(commit(&r, &parents, &[(&name, Some("x"))], &name).await);
+        }
+        for _ in 0..1500 {
+            let (a, b) = (ids[rand(ids.len())], ids[rand(ids.len())]);
+            let fast = r.merge_base(a, b).await.unwrap();
+            let walk = r.merge_base_walk(a, b).await.unwrap();
+            assert_eq!(fast, walk, "merge_base({a}, {b}) in round {round}");
+        }
+    }
+}
