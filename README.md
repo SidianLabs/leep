@@ -28,6 +28,7 @@ Status: early development (v0.1).
 - `crates/leep-cli`: the `leep` command-line client
 - `crates/leep-mcp`: the `leep-mcp` MCP server for AI agents ([docs/MCP.md](docs/MCP.md))
 - `crates/leep-git`: git import/export
+- `crates/leep-fuzz-targets` and `fuzz/`: fuzz targets ([docs/FUZZING.md](docs/FUZZING.md))
 
 ## Build
 

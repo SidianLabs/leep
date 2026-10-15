@@ -9,7 +9,8 @@
 //! subtree and blob it did not touch.
 
 mod index;
-mod plan;
+#[doc(hidden)]
+pub mod plan;
 pub mod trigram;
 
 #[cfg(test)]

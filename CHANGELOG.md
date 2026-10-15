@@ -117,6 +117,19 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 - `leep commit -m` may be left out while a merge, cherry-pick or revert is
   waiting for its commit.
 
+### Hardening
+- Fuzz targets for every decoder and parser: persisted objects, derived
+  rows, API bodies, the router, `OWNERS` and the server's config files, the
+  comment lexer, rename detection, ref names, paths and the search planner.
+  They run as seeded smoke tests inside `cargo test`, and nightly under
+  libFuzzer in CI (`docs/FUZZING.md`).
+- The `comment_only` auto-approval rule no longer treats a vertical tab or form
+  feed as a blank in shell and YAML files, where `a<FF>b` is one word and
+  `a<FF># x` has no comment. It also reads a Rust or C character literal
+  only if its escape is well formed, so `//` after a stray `'\` is a comment
+  again. Both made the lexer disagree with the language; it now gives up
+  (so a human reviews) or reads the text as the language does.
+
 ### Project
 - Workspace version set to 0.0.1, with a CI check that keeps it below
   0.1.0.

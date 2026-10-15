@@ -142,6 +142,18 @@ fn decode_doom(v: &[u8]) -> Result<(i64, Doom)> {
     Ok((decode_time(BLOB_DOOM, t)?, doom))
 }
 
+/// Decode a GC row of `kind` into its time and, for `blob-doom-v1`, its state
+/// byte. Public only so the fuzz harness can reach the private decoders.
+#[doc(hidden)]
+pub fn decode_row(kind: &str, v: &[u8]) -> Result<(i64, Option<u8>)> {
+    if kind == BLOB_DOOM {
+        let (t, d) = decode_doom(v)?;
+        Ok((t, Some(d as u8)))
+    } else {
+        Ok((decode_time(kind, v)?, None))
+    }
+}
+
 fn doom_value(epoch: i64, state: Doom) -> Bytes {
     let mut v = epoch.to_be_bytes().to_vec();
     v.push(state as u8);
