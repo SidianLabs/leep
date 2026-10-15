@@ -8,7 +8,7 @@ Milestones are ordered. Each one should leave `main` releasable.
 - [x] Metadata backends: SQLite, Postgres (`leep-meta`)
 - [x] Derived data and operations: tree, generation, skiplist, diff, log, blame, merge, rebase, land (`leep-derive`)
 - [ ] HTTP server (`leep-server`)
-- [ ] CLI with lazy sparse checkouts (`leep-cli`)
+- [x] CLI with lazy sparse checkouts (`leep-cli`)
 - [ ] Git import and export (`leep-git`)
 - [ ] End-to-end test: import a git repo, run 50 concurrent agent lands, export back to git
 
