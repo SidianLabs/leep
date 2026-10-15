@@ -7,8 +7,8 @@ use clap::{Parser, Subcommand};
 use crate::cache::Cache;
 use crate::client::Client;
 use crate::commands::{
-    branch, checkout, commit, diff, history, init, keygen, land, review, search, status, Ctx,
-    Remote,
+    amend, branch, checkout, commit, diff, history, init, keygen, land, reset, resolve, restore,
+    review, search, stash, status, Ctx, Remote,
 };
 use crate::error::{CliError, Result};
 use crate::state::{resolve_token, WorkCopy};
@@ -49,10 +49,20 @@ pub enum Command {
     Keygen(keygen::KeygenArgs),
     /// Record local changes as a changeset.
     Commit(commit::CommitArgs),
+    /// Fold uncommitted changes and a new message into an unlanded base.
+    Amend(amend::AmendArgs),
+    /// Shelve uncommitted changes and bring them back later.
+    Stash(stash::StashArgs),
+    /// Discard uncommitted changes to files, or restore them from a revision.
+    Restore(restore::RestoreArgs),
+    /// Mark conflicted files as resolved so they can be committed.
+    Resolve(resolve::ResolveArgs),
+    /// Move the base (default: undo the last commit, keeping its changes).
+    Reset(reset::ResetArgs),
     /// Land the current changeset on the target ref.
     Land(land::LandArgs),
-    /// Move to the head of the target ref.
-    Sync,
+    /// Move to the head of the target ref, keeping uncommitted work.
+    Sync(checkout::SyncArgs),
     /// List, create or delete branches.
     Branch(branch::BranchArgs),
     /// Switch the working copy to another branch.
@@ -165,8 +175,13 @@ pub fn run(cli: Cli) -> Result<i32> {
         Command::Status => status::run(&ctx),
         Command::Diff(a) => diff::run(&ctx, a),
         Command::Commit(a) => commit::run(&mut ctx, a),
+        Command::Amend(a) => amend::run(&mut ctx, a),
+        Command::Stash(a) => stash::run(&mut ctx, a),
+        Command::Restore(a) => restore::run(&mut ctx, a),
+        Command::Resolve(a) => resolve::run(&mut ctx, a),
+        Command::Reset(a) => reset::run(&mut ctx, a),
         Command::Land(a) => land::run(&mut ctx, a),
-        Command::Sync => checkout::sync(&mut ctx),
+        Command::Sync(a) => checkout::sync(&mut ctx, a),
         Command::Branch(a) => branch::branch(&ctx, a),
         Command::Switch(a) => branch::switch(&mut ctx, a),
         Command::Tag(a) => branch::tag(&ctx, a),

@@ -30,14 +30,10 @@ pub fn run(ctx: &mut Ctx, args: &LandArgs) -> Result<i32> {
         .ok_or_else(|| CliError::user("nothing to land: no commits yet"))?;
     let st = status(&ctx.wc)?;
     if !st.is_clean() {
-        let what = if st.has_conflicts() {
-            "unresolved conflicts"
-        } else {
-            "uncommitted changes"
-        };
-        return Err(CliError::user(format!(
-            "working copy has {what}; commit before landing"
-        )));
+        st.refuse_conflicts()?;
+        return Err(CliError::user(
+            "working copy has uncommitted changes; commit before landing",
+        ));
     }
     let target_ref = args
         .target_ref
@@ -87,15 +83,19 @@ pub fn run(ctx: &mut Ctx, args: &LandArgs) -> Result<i32> {
                 );
                 for c in &conflicts {
                     let note = if unmerged.contains(&c.path.to_string()) {
-                        "kept your version; no text merge available, review it"
+                        format!(
+                            "no text merge: kept your version; `leep cat {} {}` shows the other side",
+                            short(onto),
+                            c.path
+                        )
                     } else {
-                        "markers written"
+                        "markers written".to_string()
                     };
                     println!("  C {} ({note})", c.path);
                 }
                 println!(
                     "Your working copy is now on {} with your changes applied.\n\
-                     Resolve the conflicts, then run `leep commit` and `leep land`.",
+                     Resolve the conflicts (`leep resolve PATH` once chosen), then run `leep commit` and `leep land`.",
                     short(onto)
                 );
             }
@@ -168,6 +168,9 @@ fn rebase_locally(
                     None => FileChange::Delete,
                 };
                 apply(ctx, &path, &change)?;
+                if !ctx.wc.state.unresolved.contains(&path) {
+                    ctx.wc.state.unresolved.push(path.clone());
+                }
                 unmerged.push(path);
             }
         }

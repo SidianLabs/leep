@@ -103,11 +103,12 @@ fn run(ctx: &mut Ctx, target: ChangesetId, force: bool) -> Result<Stats> {
     }
 
     ctx.wc.state.conflicts.clear();
+    ctx.wc.state.unresolved.clear();
     ctx.wc.state.base = Some(target);
     Ok(stats)
 }
 
-fn check_not_in_the_way(abs: &Path, path: &str, content: &Hash) -> Result<()> {
+pub(crate) fn check_not_in_the_way(abs: &Path, path: &str, content: &Hash) -> Result<()> {
     let Ok(md) = fs::symlink_metadata(abs) else {
         return Ok(());
     };
@@ -129,25 +130,41 @@ fn prune_empty_dirs(root: &Path, file: &Path) {
     }
 }
 
-/// Write one file with the right type and mode.
+/// Write one file with the right type and mode. The bytes go to a sibling
+/// temp file that is renamed into place, so a crash or full disk never leaves
+/// a half-written file where the user's content was.
 pub fn write_file(abs: &Path, data: &[u8], kind: FileKind) -> Result<()> {
     if let Some(parent) = abs.parent() {
         fs::create_dir_all(parent)?;
     }
-    if fs::symlink_metadata(abs).is_ok_and(|m| m.file_type().is_symlink()) {
-        fs::remove_file(abs)?;
-    }
-    match kind {
-        FileKind::Symlink => {
-            let _ = fs::remove_file(abs);
-            make_symlink(data, abs)?;
-        }
-        FileKind::Regular | FileKind::Executable => {
-            fs::write(abs, data)?;
-            set_exec(abs, kind == FileKind::Executable)?;
-        }
-    }
-    Ok(())
+    let name = abs
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let tmp = abs.with_file_name(format!(".{name}.leep-tmp-{}", std::process::id()));
+    let _ = fs::remove_file(&tmp);
+    let staged = match kind {
+        FileKind::Symlink => make_symlink(data, &tmp),
+        FileKind::Regular | FileKind::Executable => fs::write(&tmp, data)
+            .map_err(Into::into)
+            .and_then(|()| set_exec(&tmp, kind == FileKind::Executable)),
+    };
+    staged
+        .and_then(|()| fs::rename(&tmp, abs).map_err(Into::into))
+        .inspect_err(|_| {
+            let _ = fs::remove_file(&tmp);
+        })
+}
+
+/// Remove a file (a missing one is fine) and any directories it leaves empty.
+pub fn remove_file(root: &Path, abs: &Path) -> Result<bool> {
+    let removed = match fs::remove_file(abs) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => return Err(e.into()),
+    };
+    prune_empty_dirs(root, abs);
+    Ok(removed)
 }
 
 #[cfg(unix)]
@@ -176,4 +193,67 @@ fn set_exec(abs: &Path, exec: bool) -> Result<()> {
 #[cfg(not(unix))]
 fn set_exec(_: &Path, _: bool) -> Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_file_replaces_atomically_and_leaves_no_temp() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("sub/f.txt");
+        write_file(&f, b"one", FileKind::Regular).unwrap();
+        write_file(&f, b"two", FileKind::Executable).unwrap();
+        assert_eq!(fs::read(&f).unwrap(), b"two");
+        let names: Vec<_> = fs::read_dir(d.path().join("sub"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["f.txt"], "no temp file left behind");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&f).unwrap().permissions().mode() & 0o777,
+                0o755
+            );
+            // A symlink is replaced, not written through.
+            let target = d.path().join("target.txt");
+            fs::write(&target, "keep").unwrap();
+            let link = d.path().join("link");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            write_file(&link, b"new", FileKind::Regular).unwrap();
+            assert_eq!(fs::read(&target).unwrap(), b"keep");
+            assert_eq!(fs::read(&link).unwrap(), b"new");
+            assert!(!fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+        }
+    }
+
+    #[test]
+    fn write_file_failure_leaves_the_old_content() {
+        let d = tempfile::tempdir().unwrap();
+        // A directory where the file should go: the rename fails.
+        let f = d.path().join("f");
+        fs::create_dir(&f).unwrap();
+        assert!(write_file(&f, b"x", FileKind::Regular).is_err());
+        assert!(f.is_dir());
+        assert_eq!(fs::read_dir(d.path()).unwrap().count(), 1, "temp removed");
+    }
+
+    #[test]
+    fn remove_file_prunes_empty_directories_only() {
+        let d = tempfile::tempdir().unwrap();
+        let a = d.path().join("x/y/a.txt");
+        let b = d.path().join("x/b.txt");
+        write_file(&a, b"a", FileKind::Regular).unwrap();
+        write_file(&b, b"b", FileKind::Regular).unwrap();
+        assert!(remove_file(d.path(), &a).unwrap());
+        assert!(!d.path().join("x/y").exists());
+        assert!(b.exists());
+        assert!(!remove_file(d.path(), &a).unwrap(), "already gone");
+    }
 }

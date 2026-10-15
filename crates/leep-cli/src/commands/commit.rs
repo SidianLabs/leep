@@ -1,21 +1,20 @@
 //! `leep commit`: upload new blobs, then create a changeset.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::Args;
 use leep_core::changeset::{
     EXTRA_AGENT_MODEL, EXTRA_AGENT_PROMPT, EXTRA_AGENT_SESSION, EXTRA_AGENT_TESTS,
 };
-use leep_core::{Changeset, FileChange, Hash, RepoPath};
+use leep_core::Changeset;
 
 use super::{print_json, Ctx};
 use crate::error::{CliError, Result};
 use crate::fmt::{plural, short};
 use crate::sign::AuthorKey;
-use crate::status::{read_content, status, Change};
+use crate::snapshot;
+use crate::status::status;
 
 #[derive(Args, Debug, Default, Clone)]
 pub struct CommitArgs {
@@ -43,21 +42,31 @@ pub struct CommitArgs {
 }
 
 fn author(args: &CommitArgs) -> String {
-    let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
-    args.author
-        .clone()
-        .or_else(|| env("LEEP_AUTHOR"))
-        .or_else(|| env("USER"))
-        .unwrap_or_else(|| "unknown".into())
+    snapshot::author(args.author.as_deref())
 }
 
 fn extra(args: &CommitArgs) -> BTreeMap<String, String> {
+    agent_extra(
+        &args.agent_model,
+        &args.agent_session,
+        &args.agent_prompt,
+        &args.agent_tests,
+    )
+}
+
+/// The `agent.*` keys that were given and are not empty.
+pub fn agent_extra(
+    model: &Option<String>,
+    session: &Option<String>,
+    prompt: &Option<String>,
+    tests: &Option<String>,
+) -> BTreeMap<String, String> {
     let mut m = BTreeMap::new();
     for (k, v) in [
-        (EXTRA_AGENT_MODEL, &args.agent_model),
-        (EXTRA_AGENT_SESSION, &args.agent_session),
-        (EXTRA_AGENT_PROMPT, &args.agent_prompt),
-        (EXTRA_AGENT_TESTS, &args.agent_tests),
+        (EXTRA_AGENT_MODEL, model),
+        (EXTRA_AGENT_SESSION, session),
+        (EXTRA_AGENT_PROMPT, prompt),
+        (EXTRA_AGENT_TESTS, tests),
     ] {
         if let Some(v) = v.as_ref().filter(|v| !v.is_empty()) {
             m.insert(k.to_string(), v.clone());
@@ -75,66 +84,17 @@ pub fn run(ctx: &mut Ctx, args: &CommitArgs) -> Result<i32> {
         .map(AuthorKey::load)
         .transpose()?;
     let st = status(&ctx.wc)?;
-    if st.has_conflicts() {
-        return Err(CliError::user(
-            "unresolved conflict markers remain; resolve them first (see `leep status`)",
-        ));
-    }
+    st.refuse_conflicts()?;
     if st.is_clean() {
         return Err(CliError::user("nothing to commit, working copy clean"));
     }
 
-    let mut changes = BTreeMap::new();
-    // hash -> repo path, to re-read bytes for upload.
-    let mut sources: BTreeMap<Hash, String> = BTreeMap::new();
-    for e in &st.entries {
-        let path = RepoPath::new(e.path.as_str())?;
-        match (&e.now, e.change) {
-            (Some(now), Change::Added | Change::Modified) => {
-                sources.entry(now.content).or_insert_with(|| e.path.clone());
-                changes.insert(
-                    path,
-                    FileChange::Modify {
-                        content: now.content,
-                        kind: now.kind,
-                        size: now.size,
-                    },
-                );
-            }
-            (None, Change::Deleted) => {
-                changes.insert(path, FileChange::Delete);
-            }
-            _ => {}
-        }
-    }
-
-    let hashes: Vec<Hash> = sources.keys().copied().collect();
-    let missing: BTreeSet<Hash> = if hashes.is_empty() {
-        BTreeSet::new()
-    } else {
-        ctx.client.missing_blobs(hashes)?.into_iter().collect()
-    };
-    for (hash, path) in &sources {
-        let abs = ctx.wc.abs(path);
-        let data = read_content(&abs, &fs::symlink_metadata(&abs)?)?;
-        if Hash::of_blob(&data) != *hash {
-            return Err(CliError::user(format!(
-                "{path} changed while committing; retry"
-            )));
-        }
-        ctx.cache.put(hash, &data)?;
-        if missing.contains(hash) {
-            ctx.client.put_blob(hash, data)?;
-        }
-    }
+    let changes = snapshot::upload_changes(ctx, &st)?;
 
     let cs = Changeset {
         parents: ctx.wc.state.base.into_iter().collect(),
         author: author(args),
-        timestamp: SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0),
+        timestamp: snapshot::now_secs(),
         message: args.message.clone(),
         changes,
         extra: extra(args),
@@ -163,6 +123,7 @@ pub fn run(ctx: &mut Ctx, args: &CommitArgs) -> Result<i32> {
         }
     }
     ctx.wc.state.conflicts.clear();
+    ctx.wc.state.unresolved.clear();
     ctx.wc.state.base = Some(id);
     ctx.wc.save_state()?;
 

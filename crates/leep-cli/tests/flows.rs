@@ -9,7 +9,7 @@ use common::Mock;
 use leep_cli::cache::Cache;
 use leep_cli::client::LogQuery;
 use leep_cli::commands::branch::{self, BranchArgs, SwitchArgs, TagArgs};
-use leep_cli::commands::checkout::{checkout, sync, CheckoutArgs};
+use leep_cli::commands::checkout::{checkout, sync, CheckoutArgs, SyncArgs};
 use leep_cli::commands::commit::{self, CommitArgs};
 use leep_cli::commands::history::{self, BlameArgs, LastChangeArgs, LogArgs, ProvenanceArgs};
 use leep_cli::commands::init::{self, InitArgs};
@@ -161,15 +161,16 @@ fn checkout_materializes_prefixes_modes_and_prunes() {
         &[("sub/x.txt", "x2\n", FileKind::Regular)],
         &["a.txt", "other/y.txt"],
     );
-    sync(&mut ctx).unwrap();
+    sync(&mut ctx, &SyncArgs::default()).unwrap();
     assert_eq!(ctx.wc.state.base, Some(cs2));
     assert!(!ctx.wc.abs("a.txt").exists());
     assert!(!ctx.wc.abs("other").exists(), "emptied directory pruned");
     assert_eq!(read(&ctx, "sub/x.txt"), "x2\n");
 
-    // Dirty working copies are refused unless forced.
+    // `--no-rebase` keeps the old rule: a dirty working copy is refused.
     write(&ctx, "sub/x.txt", "local edit\n");
-    assert!(sync(&mut ctx).is_err());
+    let strict = SyncArgs { no_rebase: true };
+    assert!(sync(&mut ctx, &strict).is_err());
     let back = CheckoutArgs {
         rev: "@".into(),
         prefixes: vec![],
