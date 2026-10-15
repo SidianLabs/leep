@@ -85,6 +85,55 @@ In compose, add the same volume and `LEEP_TOKENS_FILE` to `leep-server`.
 Clients pass the token with `LEEP_TOKEN`, `leep --token` or
 `leep init --token`. `GET /v1/health` stays public for probes.
 
+## Request limits
+
+Optional, and off unless set (ADR 0020). One runaway agent should not starve
+the others, so the server can limit each token's request rate, requests in
+flight and body size. Server-wide defaults apply to every token:
+
+```sh
+docker run -d -p 127.0.0.1:7070:7070 -v leep-data:/var/lib/leep \
+  -v "$PWD/tokens.json:/etc/leep/tokens.json:ro" \
+  -e LEEP_TOKENS_FILE=/etc/leep/tokens.json \
+  -e LEEP_RATE_LIMIT=20 -e LEEP_RATE_BURST=40 \
+  -e LEEP_MAX_CONCURRENT_PER_TOKEN=8 \
+  -e LEEP_READ_MAX_BODY_BYTES=1048576 leep:dev
+```
+
+and any entry in the tokens file can override them, or opt out with
+`"unlimited"`:
+
+```json
+{ "tokens": [
+  { "name": "agent-7", "role": "write", "hash": "blake3:...", "rate": 5, "burst": 10 },
+  { "name": "lander",  "role": "write", "hash": "blake3:...", "rate": "unlimited", "concurrency": 32 },
+  { "name": "viewer",  "role": "read",  "hash": "blake3:...", "max_body": 4096 }
+] }
+```
+
+| Setting | Flag / variable | Token field | Meaning |
+|---|---|---|---|
+| Rate | `--rate-limit` / `LEEP_RATE_LIMIT` | `rate` | Requests per second, as a decimal (`0.5` is one per two seconds). Reads and writes have separate buckets with these parameters. |
+| Burst | `--rate-burst` / `LEEP_RATE_BURST` | `burst` | Requests allowed at once; default is the rate rounded up. Needs a rate. |
+| Concurrency | `--max-concurrent-per-token` / `LEEP_MAX_CONCURRENT_PER_TOKEN` | `concurrency` | Requests in flight, reads and writes together. More are refused, not queued. |
+| Body size | `--read-max-body-bytes` / `LEEP_READ_MAX_BODY_BYTES` (read tokens only) | `max_body` | Largest request body in bytes. `--max-body-bytes` still caps everyone. |
+
+A token that sets `rate` but not `burst` uses `--rate-burst` if given, else its
+rate rounded up. Bad values (zero, negative, a burst without a rate, a read body
+limit without a tokens file) stop the server at startup with a message naming
+the token or flag. A request over the rate or concurrency limit gets `429` with
+`Retry-After`; a body over the size limit gets `413`; both have a JSON error
+body. `GET /v1/health` is never limited. The `leep` CLI retries a throttled
+`GET` a few times and then prints the server's message. Tuning and metrics are
+in [OPERATIONS.md](OPERATIONS.md#request-limits).
+
+Without a tokens file the rate and concurrency defaults apply per client IP
+address (IPv6 per /64). Behind a reverse proxy every request arrives from the
+proxy's address, so those limits become one bucket shared by everybody; use
+tokens when you need fairness between agents, and keep the proxy's own limits
+as the first line against anonymous floods. Limit state is per server process,
+so with N servers behind a balancer a token can use up to N times its rate.
+
 ## Signed changesets
 
 Optional. Authors sign changesets with Ed25519 keys; the server trusts only the
@@ -157,6 +206,9 @@ looked up once per write token, so removing a token drops its reviews.
 | `LEEP_SIGNING_KEY` | none | CLI only: private key file for `leep commit --sign`. |
 | `LEEP_TOKEN` | none | CLI only: bearer token. |
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | none | S3 credentials (standard AWS variables). |
+| `LEEP_RATE_LIMIT`, `LEEP_RATE_BURST` | none | Per-token request rate and burst; see [Request limits](#request-limits). |
+| `LEEP_MAX_CONCURRENT_PER_TOKEN` | none | Requests in flight per token. |
+| `LEEP_READ_MAX_BODY_BYTES` | none | Body size cap for read tokens; needs the tokens file. |
 | `LEEP_REQUEST_TIMEOUT` | `5m` | Abort any request that runs longer (`90s`, `5m`; `0` disables). `leep-server gc --fence` must exceed it; see [OPERATIONS.md](OPERATIONS.md#blob-garbage-collection). |
 | `LEEP_METRICS_LISTEN` | off | Address for a separate, unauthenticated `GET /metrics` listener; keep it private. See [OPERATIONS.md](OPERATIONS.md). |
 | `LEEP_LOG_FORMAT` | `text` | `text` or `json` (one object per line). |

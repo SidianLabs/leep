@@ -79,7 +79,7 @@ operator action, and their benchmarks are in `docs/PERFORMANCE.md`.
 - [ ] Long-running soak test: many agents landing for hours against Postgres
 - [ ] Security review of auth, signing, review policies and GC, with findings
   fixed or written down in the relevant ADR
-- [ ] Request size, rate and concurrency limits per token
+- [x] Request size, rate and concurrency limits per token (ADR 0020)
 
 Exit: a full soak run and the fuzzers find nothing new for two weeks.
 

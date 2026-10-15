@@ -381,6 +381,7 @@ compared in constant time, and only the token name is logged. Use
 front of the server; bearer tokens are otherwise visible on the wire.
 
 The CLI reads the token from `--token`, `LEEP_TOKEN`, or `.leep/config.json`.
+The CLI retries a rate-limited `GET` (429) a few times, honoring `Retry-After`.
 
 **Signed changesets** ([ADR 0010](adr/0010-signed-changesets.md)). A changeset's
 id covers its whole encoding, so a signature cannot live inside it. Ed25519
@@ -422,6 +423,19 @@ originals the client submitted, as for signatures. It is a second
 `GET .../review-status?ref=` shows the per-path state, `GET .../reviews`
 lists verdicts (with `via` for rebased copies), and `leep review ...` and the
 `leep_review_status` MCP tool are the clients.
+
+**Request path and limits** ([ADR 0020](adr/0020-request-limits.md)). A
+request passes, outermost first, through metrics, tracing, the request timeout,
+the global body cap, authentication (which names the `Principal`), the
+per-principal limiter and then the handler. The limiter is an axum middleware
+(`leep_server::limits`) that exists only when something is configured. For a
+principal with limits it checks the declared body size, takes a token from the
+read or write bucket, and `try_acquire`s a concurrency permit, refusing with
+413 or 429 (never queueing). The permit lives in a guard attached to the
+response body, so it is released when the body ends, the client goes away or
+the timeout drops the request. Token names bound the state; in anonymous mode
+state is keyed by client address in a size-capped table. State is per
+process.
 
 Planned: OIDC or mTLS, per-path signing policy and key rotation, team groups
 and self-approval rules for reviews. See the roadmap.
