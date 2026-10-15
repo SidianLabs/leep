@@ -1,0 +1,10 @@
+target/
+target-*/
+.git/
+leep-data/
+.claude/
+docs/
+deploy/
+*.md
+Dockerfile
+.dockerignore

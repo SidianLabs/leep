@@ -40,6 +40,18 @@ leep log && leep cat main a.txt
 ```
 Again, run `leep --help` for the current subcommands.
 
+## With Docker
+
+```sh
+docker build -t leep:dev .
+docker run -d --name leep -p 127.0.0.1:7070:7070 -v leep-data:/var/lib/leep leep:dev
+# or the Postgres stack (blobs on a volume):
+docker compose -f deploy/docker-compose.yml up -d --build
+```
+Then use the client smoke test above against `http://127.0.0.1:7070`. Tear down
+with `docker rm -f leep` or `docker compose -f deploy/docker-compose.yml down -v`.
+See `docs/DEPLOY.md`.
+
 ## Clean up
 
 Stop the server, run `pg_ctl stop` if you started Postgres, and `rm -rf /tmp/leep`.
