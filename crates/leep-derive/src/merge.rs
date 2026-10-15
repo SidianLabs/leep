@@ -245,6 +245,7 @@ impl Repo {
         if !m.conflicts.is_empty() {
             return Ok(MergeResponse::Conflicts {
                 conflicts: m.conflicts,
+                clean: m.changes,
             });
         }
         let id = self
