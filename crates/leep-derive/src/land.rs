@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use leep_core::api::{LandResponse, RebaseResponse};
+use leep_core::refname;
 use leep_core::{ChangesetId, Error, Result};
 
 use crate::Repo;
@@ -77,6 +78,12 @@ impl Repo {
         target_ref: &str,
         stats: &mut LandStats,
     ) -> Result<LandResponse> {
+        refname::validate(target_ref)?;
+        if refname::is_tag(target_ref) {
+            return Err(Error::Invalid(format!(
+                "cannot land onto {target_ref:?}: tags are immutable"
+            )));
+        }
         self.get_changeset(cs).await?;
         let lock = {
             let mut locks = self.land_locks.lock().expect("land lock map poisoned");
@@ -126,18 +133,43 @@ impl Repo {
         )))
     }
 
-    /// `MetaStore::cas_ref` for callers outside `land`, with the land policy
-    /// applied to what the ref would gain, so a raw ref update cannot skip
-    /// it. Rewinds and deletes add nothing and are not checked.
+    /// `MetaStore::cas_ref` for callers outside `land`, with the ref rules and
+    /// land policy applied, so a raw ref update cannot skip them: names must
+    /// be valid, a tag can be created or deleted but never moved, a ref a
+    /// policy protects cannot be deleted, and the policy checks what the ref
+    /// would gain. Rewinds of branches add nothing and are not checked.
     pub async fn cas_ref_checked(
         &self,
         name: &str,
         expected: Option<ChangesetId>,
         new: Option<ChangesetId>,
     ) -> Result<bool> {
-        if let Some(new) = new {
-            self.enforce_land_policy(new, expected, name, &mut Checked::default())
-                .await?;
+        // Deletes skip the name check so a ref that predates the validator
+        // can still be removed.
+        if new.is_some() {
+            refname::validate(name)?;
+        }
+        if refname::is_tag(name) && expected.is_some() && new.is_some() {
+            return Err(Error::Invalid(format!(
+                "tag {name:?} is immutable and cannot be moved; delete it and create it again"
+            )));
+        }
+        match new {
+            Some(new) => {
+                self.enforce_land_policy(new, expected, name, &mut Checked::default())
+                    .await?;
+            }
+            None => {
+                if self
+                    .land_policy
+                    .as_ref()
+                    .is_some_and(|p| p.applies_to(name))
+                {
+                    return Err(Error::Invalid(format!(
+                        "cannot delete {name:?}: it is protected by a land policy"
+                    )));
+                }
+            }
         }
         self.meta().cas_ref(name, expected, new).await
     }

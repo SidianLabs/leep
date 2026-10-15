@@ -468,6 +468,43 @@ async fn require_signatures_end_to_end() {
 }
 
 #[tokio::test]
+async fn a_protected_ref_cannot_be_deleted_over_the_api() {
+    let api = policy_api();
+    let c = api.commit(&[], "a", "1\n").await;
+    api.sign(c, &alice()).await;
+    assert_eq!(api.land(c, "main").await.status, StatusCode::OK);
+
+    let delete = CasRefRequest {
+        expected: Some(c),
+        new: None,
+    };
+    let r = api.post("/v1/refs/main", &delete).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert!(r.error().contains("protected"), "{}", r.error());
+    assert_eq!(api.repo.meta().get_ref("main").await.unwrap(), Some(c));
+
+    // An unprotected ref deletes fine.
+    api.post(
+        "/v1/refs/scratch",
+        &CasRefRequest {
+            expected: None,
+            new: Some(c),
+        },
+    )
+    .await;
+    let r = api
+        .post(
+            "/v1/refs/scratch",
+            &CasRefRequest {
+                expected: Some(c),
+                new: None,
+            },
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK);
+}
+
+#[tokio::test]
 async fn require_signatures_checks_every_stack_entry_and_rebased_copies_report_via() {
     let api = policy_api();
     let base = api.commit(&[], "a", "1\n").await;

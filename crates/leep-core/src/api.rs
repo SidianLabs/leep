@@ -12,7 +12,7 @@
 //! | GET  | `/v1/refs` | – | [`RefsResponse`] |
 //! | GET  | `/v1/refs/{name}` | – | [`RefResponse`] |
 //! | POST | `/v1/refs/{name}` | [`CasRefRequest`] | [`CasRefResponse`] (409 if it lost) |
-//! | GET  | `/v1/resolve/{rev}` | – | [`ResolveResponse`] (`rev` = ref name or full 64-hex id) |
+//! | GET  | `/v1/resolve/{rev}` | – | [`ResolveResponse`] (`rev` = ref name, full 64-hex id or short tag name) |
 //! | GET  | `/v1/tree/{id}?path=dir` | – | [`TreeResponse`] (one directory level) |
 //! | GET  | `/v1/files/{id}?prefix=dir` | – | [`FilesResponse`] (recursive listing) |
 //! | GET  | `/v1/file/{id}?path=p` | – | raw bytes + `x-leep-kind` header, or 404 |
@@ -33,7 +33,13 @@
 //! | POST | `/v1/land` | [`LandRequest`] | [`LandResponse`] |
 //!
 //! Ref names may contain `/` (e.g. `release/1.0`); `{name}` and `{rev}` match
-//! the rest of the path.
+//! the rest of the path. Every ref write (`POST /v1/refs/{name}` and the
+//! `target_ref` of `land`) checks the name with [`crate::refname::validate`]
+//! and answers 400 if it is invalid. Refs under `tags/` are tags: they can be
+//! created (`expected: null`) or deleted (`new: null`) but a move from one
+//! changeset to another is 400, and `land` onto one is 400. Deleting a ref
+//! that a land policy protects is 400. `{rev}` tries a ref, then a full id,
+//! then `tags/{rev}`.
 //!
 //! Errors are `{"error": "..."}` ([`ErrorResponse`]): `Error::Invalid` → 400,
 //! `Error::NotFound` → 404, CAS loss and `Error::Conflict` (e.g. a land that

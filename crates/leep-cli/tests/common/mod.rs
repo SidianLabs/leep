@@ -132,8 +132,10 @@ impl Mock {
                 "/v1/changesets/{id}/signatures",
                 post(add_signature).get(list_signatures),
             )
-            .route("/v1/refs/{*name}", get(get_ref))
+            .route("/v1/refs", get(list_refs))
+            .route("/v1/refs/{*name}", get(get_ref).post(cas_ref))
             .route("/v1/resolve/{*rev}", get(resolve))
+            .route("/v1/merge-base", get(merge_base))
             .route("/v1/files/{id}", get(files))
             .route("/v1/log/{id}", get(log))
             .route("/v1/last-change/{id}", get(last_change))
@@ -327,12 +329,88 @@ async fn get_ref(State(s): State<Shared>, Path(name): Path<String>) -> Json<RefR
     Json(RefResponse { name, target })
 }
 
+async fn list_refs(State(s): State<Shared>) -> Json<RefsResponse> {
+    Json(RefsResponse {
+        refs: s.lock().unwrap().refs.clone(),
+    })
+}
+
+/// Mirrors the server's ref rules: valid names, and tags never move.
+async fn cas_ref(
+    State(s): State<Shared>,
+    Path(name): Path<String>,
+    Json(r): Json<CasRefRequest>,
+) -> Result<(StatusCode, Json<CasRefResponse>), (StatusCode, Json<ErrorResponse>)> {
+    if r.new.is_some() {
+        leep_core::refname::validate(&name)
+            .map_err(|e| err(StatusCode::BAD_REQUEST, &e.to_string()))?;
+    }
+    if leep_core::refname::is_tag(&name) && r.expected.is_some() && r.new.is_some() {
+        return Err(err(StatusCode::BAD_REQUEST, "tag is immutable"));
+    }
+    let mut d = s.lock().unwrap();
+    let current = d.refs.get(&name).copied();
+    if current != r.expected {
+        return Ok((
+            StatusCode::CONFLICT,
+            Json(CasRefResponse { ok: false, current }),
+        ));
+    }
+    match r.new {
+        Some(id) => d.refs.insert(name, id),
+        None => d.refs.remove(&name),
+    };
+    Ok((
+        StatusCode::OK,
+        Json(CasRefResponse {
+            ok: true,
+            current: r.new,
+        }),
+    ))
+}
+
 async fn resolve(State(s): State<Shared>, Path(rev): Path<String>) -> Resp<ResolveResponse> {
     let d = s.lock().unwrap();
     match d.refs.get(&rev) {
         Some(id) => Ok(Json(ResolveResponse { id: *id })),
         None => Err(err(StatusCode::NOT_FOUND, "unknown revision")),
     }
+}
+
+fn ancestors(d: &Data, from: ChangesetId) -> Vec<ChangesetId> {
+    let mut seen = vec![from];
+    let mut i = 0;
+    while i < seen.len() {
+        for p in &d.changesets[&seen[i]].parents {
+            if !seen.contains(p) {
+                seen.push(*p);
+            }
+        }
+        i += 1;
+    }
+    seen
+}
+
+#[derive(serde::Deserialize)]
+struct BaseQuery {
+    a: ChangesetId,
+    b: ChangesetId,
+}
+
+/// The first of `a`'s ancestors (nearest first) that `b` also has.
+async fn merge_base(
+    State(s): State<Shared>,
+    Query(q): Query<BaseQuery>,
+) -> Resp<MergeBaseResponse> {
+    let d = s.lock().unwrap();
+    for id in [q.a, q.b] {
+        if !d.changesets.contains_key(&id) {
+            return Err(err(StatusCode::NOT_FOUND, "no such changeset"));
+        }
+    }
+    let theirs = ancestors(&d, q.b);
+    let base = ancestors(&d, q.a).into_iter().find(|c| theirs.contains(c));
+    Ok(Json(MergeBaseResponse { base }))
 }
 
 async fn files(

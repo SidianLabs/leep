@@ -1592,6 +1592,23 @@ mod land_policy {
     }
 
     #[tokio::test]
+    async fn protected_ref_cannot_be_deleted() {
+        let r = guarded();
+        let c = commit(&r, &[], &[("a", Some("1\n"))], "c").await;
+        sign(&r, c).await;
+        r.land(c, "main").await.unwrap();
+        match r.cas_ref_checked("main", Some(c), None).await {
+            Err(Error::Invalid(m)) => assert!(m.contains("protected"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(r.meta().get_ref("main").await.unwrap(), Some(c));
+        // Refs the policy does not cover can still be deleted.
+        assert!(r.cas_ref_checked("scratch", None, Some(c)).await.unwrap());
+        assert!(r.cas_ref_checked("scratch", Some(c), None).await.unwrap());
+        assert_eq!(r.meta().get_ref("scratch").await.unwrap(), None);
+    }
+
+    #[tokio::test]
     async fn unsigned_land_is_rejected_and_ref_untouched() {
         let r = guarded();
         let c = commit(&r, &[], &[("a", Some("1\n"))], "c").await;
@@ -2582,5 +2599,90 @@ mod path_history {
                 }
             }
         }
+    }
+}
+
+mod ref_rules {
+    use super::*;
+
+    #[tokio::test]
+    async fn invalid_names_are_rejected_on_raw_updates_and_land() {
+        let r = repo();
+        let a = commit(&r, &[], &[("a", Some("1\n"))], "a").await;
+        for bad in ["", "a b", "x..y", "/x", "x.lock", "-x", "a\\b"] {
+            assert!(
+                matches!(
+                    r.cas_ref_checked(bad, None, Some(a)).await,
+                    Err(Error::Invalid(_))
+                ),
+                "cas {bad:?}"
+            );
+            assert!(
+                matches!(r.land(a, bad).await, Err(Error::Invalid(_))),
+                "land {bad:?}"
+            );
+        }
+        assert!(r.meta().list_refs().await.unwrap().is_empty());
+        assert!(r
+            .cas_ref_checked("team/ok-1.0", None, Some(a))
+            .await
+            .unwrap());
+        r.land(a, "release/1.0").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_legacy_invalid_ref_can_still_be_deleted() {
+        let r = repo();
+        let a = commit(&r, &[], &[("a", Some("1\n"))], "a").await;
+        // Written behind the checked path, as an older server could have.
+        assert!(r.meta().cas_ref("odd name", None, Some(a)).await.unwrap());
+        assert!(r.cas_ref_checked("odd name", Some(a), None).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn tags_can_be_created_and_deleted_but_never_moved() {
+        let r = repo();
+        let a = commit(&r, &[], &[("a", Some("1\n"))], "a").await;
+        let b = commit(&r, &[a], &[("a", Some("2\n"))], "b").await;
+        assert!(r.cas_ref_checked("tags/v1", None, Some(a)).await.unwrap());
+        // Creating over an existing tag loses the CAS, like any ref.
+        assert!(!r.cas_ref_checked("tags/v1", None, Some(b)).await.unwrap());
+        match r.cas_ref_checked("tags/v1", Some(a), Some(b)).await {
+            Err(Error::Invalid(m)) => assert!(m.contains("immutable"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(r.meta().get_ref("tags/v1").await.unwrap(), Some(a));
+        assert!(r.cas_ref_checked("tags/v1", Some(a), None).await.unwrap());
+        assert!(r.cas_ref_checked("tags/v1", None, Some(b)).await.unwrap());
+        assert_eq!(r.meta().get_ref("tags/v1").await.unwrap(), Some(b));
+        // Branches still move.
+        assert!(r.cas_ref_checked("main", None, Some(a)).await.unwrap());
+        assert!(r.cas_ref_checked("main", Some(a), Some(b)).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn land_onto_a_tag_is_refused() {
+        let r = repo();
+        let a = commit(&r, &[], &[("a", Some("1\n"))], "a").await;
+        match r.land(a, "tags/v1").await {
+            Err(Error::Invalid(m)) => assert!(m.contains("tags are immutable"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(r.meta().get_ref("tags/v1").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn resolve_finds_tags_by_short_name_after_branches_and_ids() {
+        let r = repo();
+        let a = commit(&r, &[], &[("a", Some("1\n"))], "a").await;
+        let b = commit(&r, &[a], &[("a", Some("2\n"))], "b").await;
+        r.cas_ref_checked("tags/v1", None, Some(a)).await.unwrap();
+        assert_eq!(r.resolve("tags/v1").await.unwrap(), a);
+        assert_eq!(r.resolve("v1").await.unwrap(), a);
+        // A branch of the same name wins over the tag.
+        r.cas_ref_checked("v1", None, Some(b)).await.unwrap();
+        assert_eq!(r.resolve("v1").await.unwrap(), b);
+        assert_eq!(r.resolve("tags/v1").await.unwrap(), a);
+        assert!(matches!(r.resolve("nope").await, Err(Error::NotFound(_))));
     }
 }

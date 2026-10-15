@@ -1,5 +1,6 @@
 //! One module per command family. Commands return the process exit code.
 
+pub mod branch;
 pub mod checkout;
 pub mod commit;
 pub mod diff;

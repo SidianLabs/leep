@@ -906,7 +906,7 @@ async fn raw_ref_cas_cannot_skip_review() {
         StatusCode::OK
     );
     assert_eq!(api.main_ref().await, Some(c));
-    // A rewind adds nothing and is not checked.
+    // Deleting a protected ref is refused, whatever the review state.
     let r = api
         .post(
             "/v1/refs/main",
@@ -917,7 +917,9 @@ async fn raw_ref_cas_cannot_skip_review() {
             },
         )
         .await;
-    assert_eq!(r.status, StatusCode::OK);
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert!(r.error().contains("protected"), "{}", r.error());
+    assert_eq!(api.main_ref().await, Some(c));
 }
 
 #[tokio::test]

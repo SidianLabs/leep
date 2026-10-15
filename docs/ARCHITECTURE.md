@@ -224,6 +224,18 @@ changes of unlanded changesets below it. On conflict the client applies
 `clean`, resolves `conflicts` on top of `onto`, commits once and lands again,
 which is then a fast-forward. Stacks containing merges are rejected.
 
+**Branches and tags** ([ADR 0015](adr/0015-branches-and-tags.md)). Refs are
+branches, except those under `tags/`, which are tags. `cas_ref_checked` and
+`land` in `leep-derive` apply the rules for every caller: valid names
+(`leep_core::refname`), tags are created or deleted but never moved, `land`
+refuses `tags/`, and a ref a land policy covers cannot be deleted. The CLI has
+no special server API for this: `leep branch`, `leep switch` and `leep tag`
+are compare-and-swap calls on `/v1/refs/{name}`. `branch -d` deletes only if
+`merge_base(head, target) == head`, reading the head once and passing it as
+`expected` so a concurrent move fails with 409. `leep switch` needs a clean
+working copy, sets `target_ref` in `.leep/config.json` and materializes the
+branch head the way `sync` does.
+
 **Checkout** (`leep checkout`): the client resolves a rev to an id and lists
 files under the requested prefixes (`GET /v1/files`). It then fetches the
 missing blobs through its local content-addressed cache and writes them. Only
