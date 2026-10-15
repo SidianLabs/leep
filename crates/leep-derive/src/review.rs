@@ -17,7 +17,8 @@
 use std::collections::BTreeSet;
 
 use globset::{Glob, GlobBuilder, GlobSet, GlobSetBuilder};
-use leep_core::review::{Review, Verdict};
+use leep_core::api::FileInfo;
+use leep_core::review::{Review, Verdict, OWNERS_FILE};
 use leep_core::{ChangesetId, Error, FileChange, FileKind, RepoPath, Result};
 
 use crate::comments::strip_comments;
@@ -263,23 +264,44 @@ impl Repo {
         Ok(ChangesetReview { id, paths })
     }
 
-    /// On a merge, `change` equals the path as it is in a side parent.
+    /// On a merge, `change` takes the path as it is in a side parent, and
+    /// taking it is what a clean three-way merge would do: the first parent
+    /// left the path as it was at the merge base. Otherwise the merge
+    /// discards a change already on the first parent (for example puts back
+    /// an old version from a side that is in the ref's history), and that is
+    /// a change nobody has reviewed.
     async fn covered_by_merge_parent(
         &self,
         parents: &[ChangesetId],
         path: &RepoPath,
         change: &FileChange,
     ) -> Result<bool> {
-        for side in parents.iter().skip(1) {
+        let Some((&ours, sides)) = parents.split_first() else {
+            return Ok(false);
+        };
+        let key = |f: Option<FileInfo>| f.map(|f| (f.content, f.kind));
+        let mut ours_now = None;
+        for side in sides {
             let there = self.lookup_file(*side, path).await?;
-            let same = match (change, there) {
+            let same = match (change, &there) {
                 (FileChange::Delete, None) => true,
                 (FileChange::Modify { content, kind, .. }, Some(f)) => {
                     f.content == *content && f.kind == *kind
                 }
                 _ => false,
             };
-            if same {
+            if !same {
+                continue;
+            }
+            let ours_now = match ours_now {
+                Some(v) => v,
+                None => *ours_now.insert(key(self.lookup_file(ours, path).await?)),
+            };
+            let at_base = match self.merge_base(ours, *side).await? {
+                Some(b) => key(self.lookup_file(b, path).await?),
+                None => None,
+            };
+            if at_base == ours_now {
                 return Ok(true);
             }
         }
@@ -294,6 +316,11 @@ impl Repo {
         parent: Option<ChangesetId>,
         change: &FileChange,
     ) -> Result<Option<AutoRule>> {
+        // Who owns a directory is never a docs or formatting question, even
+        // when a docs glob such as `docs/**` matches the file.
+        if path.file_name() == OWNERS_FILE {
+            return Ok(None);
+        }
         if rules.enabled(AutoRule::DocsOnly) && rules.is_docs(path.as_str()) {
             return Ok(Some(AutoRule::DocsOnly));
         }
