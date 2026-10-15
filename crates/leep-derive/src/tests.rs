@@ -1085,3 +1085,127 @@ async fn land_refuses_a_stack_containing_a_merge() {
     r.land(other, "main").await.unwrap();
     assert!(is_invalid(r.land(top, "main").await));
 }
+
+/// A metadata store with database-like latency on ref operations, which
+/// widens the window between reading the head and swapping it.
+struct SlowRefs(MemoryMetaStore);
+
+#[async_trait::async_trait]
+impl leep_core::MetaStore for SlowRefs {
+    async fn put_changeset(&self, cs: &Changeset) -> leep_core::Result<ChangesetId> {
+        self.0.put_changeset(cs).await
+    }
+    async fn get_changeset(&self, id: &ChangesetId) -> leep_core::Result<Option<Changeset>> {
+        self.0.get_changeset(id).await
+    }
+    async fn get_ref(&self, name: &str) -> leep_core::Result<Option<ChangesetId>> {
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        self.0.get_ref(name).await
+    }
+    async fn cas_ref(
+        &self,
+        name: &str,
+        expected: Option<ChangesetId>,
+        new: Option<ChangesetId>,
+    ) -> leep_core::Result<bool> {
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        self.0.cas_ref(name, expected, new).await
+    }
+    async fn list_refs(
+        &self,
+    ) -> leep_core::Result<std::collections::BTreeMap<String, ChangesetId>> {
+        self.0.list_refs().await
+    }
+    async fn get_derived(
+        &self,
+        kind: &str,
+        key: &leep_core::Hash,
+    ) -> leep_core::Result<Option<Bytes>> {
+        self.0.get_derived(kind, key).await
+    }
+    async fn put_derived(
+        &self,
+        kind: &str,
+        key: &leep_core::Hash,
+        value: Bytes,
+    ) -> leep_core::Result<()> {
+        self.0.put_derived(kind, key, value).await
+    }
+}
+
+/// `n` changesets from one base, each adding its own file.
+async fn fan_out(r: &Repo, n: usize) -> (ChangesetId, Vec<ChangesetId>) {
+    let base = commit(r, &[], &[("base.txt", Some("base\n"))], "base").await;
+    r.land(base, "main").await.unwrap();
+    let mut ids = Vec::new();
+    for i in 0..n {
+        let name = format!("agents/a{i}.txt");
+        ids.push(
+            commit(
+                r,
+                &[base],
+                &[(&name, Some(&format!("{i}\n")))],
+                &format!("a{i}"),
+            )
+            .await,
+        );
+    }
+    (base, ids)
+}
+
+async fn assert_all_landed(r: &Repo, n: usize) {
+    let head = r.resolve("main").await.unwrap();
+    assert_eq!(r.list_files(head, "").await.unwrap().len(), n + 1);
+    let log = r.log(head, None, 10_000).await.unwrap();
+    assert_eq!(log.len(), n + 1);
+    assert!(log.iter().all(|i| i.changeset.parents.len() <= 1));
+}
+
+/// Many agents landing at once through one server must all succeed: lands on
+/// a ref are serialized in-process instead of racing each other to the CAS.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn land_swarm_on_one_server_all_succeed() {
+    let r = Repo::new(
+        Arc::new(MemoryBlobStore::new()),
+        Arc::new(SlowRefs(MemoryMetaStore::new())),
+    );
+    let (_, ids) = fan_out(&r, 60).await;
+    let tasks: Vec<_> = ids
+        .into_iter()
+        .map(|id| {
+            let r = r.clone();
+            tokio::spawn(async move { r.land(id, "main").await })
+        })
+        .collect();
+    for t in tasks {
+        let resp = t.await.unwrap().unwrap();
+        assert!(matches!(resp, LandResponse::Landed { .. }), "{resp:?}");
+    }
+    assert_all_landed(&r, 60).await;
+}
+
+/// Two server processes sharing a store only coordinate through the CAS;
+/// jittered backoff keeps them from losing in lockstep.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn land_swarm_across_two_servers_all_succeed() {
+    let blobs: Arc<dyn leep_core::BlobStore> = Arc::new(MemoryBlobStore::new());
+    let meta: Arc<dyn leep_core::MetaStore> = Arc::new(SlowRefs(MemoryMetaStore::new()));
+    let servers = [
+        Repo::new(blobs.clone(), meta.clone()),
+        Repo::new(blobs.clone(), meta.clone()),
+    ];
+    let (_, ids) = fan_out(&servers[0], 40).await;
+    let tasks: Vec<_> = ids
+        .into_iter()
+        .enumerate()
+        .map(|(i, id)| {
+            let r = servers[i % 2].clone();
+            tokio::spawn(async move { r.land(id, "main").await })
+        })
+        .collect();
+    for t in tasks {
+        let resp = t.await.unwrap().unwrap();
+        assert!(matches!(resp, LandResponse::Landed { .. }), "{resp:?}");
+    }
+    assert_all_landed(&servers[0], 40).await;
+}

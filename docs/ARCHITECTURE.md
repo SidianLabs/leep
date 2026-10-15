@@ -147,7 +147,8 @@ Nothing mutable has changed yet; the changeset is just an addressable object.
 
 **Land** (`leep land`, the no-merge-queue path):
 ```
-loop (≤16 attempts):
+lock(target)                      # per ref, within this server process
+loop (≤32 attempts):
   head ← get_ref(target)
   if head is None:                 CAS(None → cs)
   elif cs is an ancestor of head:  already landed
@@ -159,8 +160,14 @@ loop (≤16 attempts):
                 (the whole stack squashed into one 3-way merge vs head;
                  never auto-resolved on the server)
     CAS(head → replayed top)
-  CAS won → Landed;  CAS lost → retry
+  CAS won → Landed;  CAS lost → jittered backoff, retry
+attempts exhausted → 409 Conflict (client retries)
 ```
+Lands on one ref are serialized within each server process. Without that,
+concurrent lands each redo the replay only to lose the CAS to a sibling
+request, so under a swarm most of them exhaust their attempts. The CAS still
+coordinates separate server processes; jittered backoff keeps them from
+colliding in lockstep.
 Replaying the whole stack matters: rebasing only `cs` would silently drop the
 changes of unlanded changesets below it. On conflict the client applies
 `clean`, resolves `conflicts` on top of `onto`, commits once and lands again,
