@@ -9,6 +9,10 @@ use crate::error::{Error, Result};
 /// Namespace of tags. A tag named `v1` is the ref `tags/v1`.
 pub const TAGS_PREFIX: &str = "tags/";
 
+/// Stable text in the error for a move of a protected ref that is not a
+/// fast-forward; the CLI matches it to suggest a revert.
+pub const NOT_FORWARD_MARKER: &str = "only moves forward";
+
 /// Longest accepted ref name, in bytes.
 pub const MAX_LEN: usize = 255;
 
