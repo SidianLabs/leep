@@ -18,3 +18,8 @@ similar = "2"
 
 [dev-dependencies]
 tokio.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "repo_ops"
+harness = false
