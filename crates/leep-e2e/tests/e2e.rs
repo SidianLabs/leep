@@ -1784,3 +1784,276 @@ fn reflog_and_undo_postgres() {
     let stores = Stores::with_meta(&tmp.path().join("data"), db.url.clone());
     run_reflog_and_undo_workflow(&stores, tmp.path());
 }
+
+/// Twelve numbered lines, with some replaced. Edits far enough apart merge
+/// as separate hunks.
+fn numbered(edits: &[(usize, &str)]) -> String {
+    (1..=12)
+        .map(|n| match edits.iter().find(|(i, _)| *i == n) {
+            Some((_, text)) => format!("{text}\n"),
+            None => format!("line {n}\n"),
+        })
+        .collect()
+}
+
+fn run_merge_rebase_revert_workflow(stores: &Stores, work: &Path) {
+    let server = Server::start(stores, work);
+    let client = Client::new(&server.url, &work.join("cache"));
+    let (a, b) = (work.join("a"), work.join("b"));
+    let head = |name: &str| {
+        client.json(&a, &["refs"])["refs"][name]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let base = |dir: &Path| {
+        client.json(dir, &["status"])["base"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    // The newest `n` first-parent changesets of `rev`, as JSON.
+    let log = |dir: &Path, rev: &str| client.json(dir, &["log", rev, "-n", "6"])["entries"].clone();
+    let read = |dir: &Path, rel: &str| fs::read_to_string(dir.join(rel)).unwrap();
+    let commit_land = |dir: &Path, msg: &str| {
+        client.ok(dir, &["commit", "-m", msg]);
+        client.ok(dir, &["land"]);
+    };
+
+    client.ok(work, &["init", a.to_str().unwrap()]);
+    write(&a, "hunk.txt", &numbered(&[]));
+    write(&a, "a.txt", "a\n");
+    write(&a, "b.txt", "b\n");
+    commit_land(&a, "start");
+    client.ok(&a, &["branch", "feature"]);
+    client.ok(work, &["init", b.to_str().unwrap()]);
+    client.ok(&b, &["switch", "feature"]);
+
+    // ---- merge: clean, as a local commit that lands ----
+    write(&b, "feature.txt", "feature\n");
+    write(&b, "hunk.txt", &numbered(&[(12, "line 12 feature")]));
+    commit_land(&b, "feature work");
+    write(&a, "a.txt", "a main\n");
+    write(&a, "hunk.txt", &numbered(&[(1, "line 1 main")]));
+    commit_land(&a, "main work");
+    let main_before = head("main");
+    let feature_head = head("feature");
+
+    let out = client.ok(&a, &["merge", "feature"]);
+    assert!(out.contains("Merged"), "{out}");
+    assert_eq!(
+        read(&a, "hunk.txt"),
+        numbered(&[(1, "line 1 main"), (12, "line 12 feature")]),
+        "both hunks"
+    );
+    assert_eq!(read(&a, "feature.txt"), "feature\n");
+    assert_eq!(read(&a, "a.txt"), "a main\n");
+    assert_eq!(head("main"), main_before, "merge moves no ref");
+    assert!(client.ok(&a, &["status"]).contains("working copy clean"));
+    let top = &log(&a, "@")[0]["changeset"];
+    assert_eq!(
+        top["parents"],
+        serde_json::json!([main_before, feature_head])
+    );
+    assert_eq!(top["message"], "Merge feature into main");
+    client.ok(&a, &["land"]);
+    assert_eq!(head("main"), base(&a));
+    let out = client.ok(&a, &["merge", "feature"]);
+    assert!(out.contains("Already up to date"), "{out}");
+
+    // ---- merge: a conflict, abort, then resolve and commit ----
+    write(&b, "a.txt", "a feature\n");
+    commit_land(&b, "feature edits a");
+    let feature_head = head("feature");
+    let out = client.run(&a, &["merge", "feature"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(stdout(&out).contains("C a.txt"), "{}", stdout(&out));
+    let text = read(&a, "a.txt");
+    assert!(text.contains("<<<<<<<") && text.contains("a main") && text.contains("a feature"));
+    assert!(client.ok(&a, &["status"]).contains("merging"));
+    assert_eq!(
+        client.json(&a, &["status"])["merging"],
+        feature_head.as_str()
+    );
+    let out = client.run(&a, &["commit", "-m", "too soon"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stderr(&out).contains("conflict"), "{}", stderr(&out));
+    let out = client.run(&a, &["land"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stderr(&out).contains("in progress"), "{}", stderr(&out));
+    client.ok(&a, &["merge", "--abort"]);
+    assert_eq!(read(&a, "a.txt"), "a main\n");
+    assert!(client.ok(&a, &["status"]).contains("working copy clean"));
+    assert!(client.json(&a, &["status"])["merging"].is_null());
+
+    let out = client.run(&a, &["merge", "feature"]);
+    assert_eq!(out.status.code(), Some(1));
+    write(&a, "a.txt", "a resolved\n");
+    client.ok(&a, &["commit"]);
+    let top = &log(&a, "@")[0]["changeset"];
+    assert_eq!(top["message"], "Merge feature into main");
+    assert_eq!(top["parents"].as_array().unwrap().len(), 2);
+    assert_eq!(top["parents"][1], feature_head.as_str());
+    client.ok(&a, &["land"]);
+    assert_eq!(head("main"), base(&a));
+    assert_eq!(client.ok(&a, &["cat", "main", "a.txt"]), "a resolved\n");
+
+    // ---- cherry-pick one commit from a branch ----
+    write(&b, "pick.txt", "picked\n");
+    commit_land(&b, "pick me");
+    write(&b, "skip.txt", "skipped\n");
+    commit_land(&b, "not me");
+    let pick_id = log(&b, "feature")[1]["id"].as_str().unwrap().to_string();
+    let out = client.ok(&a, &["cherry-pick", &pick_id]);
+    assert!(out.contains("Cherry-picked"), "{out}");
+    assert_eq!(read(&a, "pick.txt"), "picked\n");
+    assert!(!a.join("skip.txt").exists(), "only the picked commit");
+    let top = &log(&a, "@")[0]["changeset"];
+    assert_eq!(top["message"], "pick me");
+    assert_eq!(top["extra"]["leep.rebased_from"], pick_id.as_str());
+    client.ok(&a, &["land"]);
+    assert_eq!(client.ok(&a, &["cat", "main", "pick.txt"]), "picked\n");
+
+    // A conflicting pick: markers, then a resolution that commits with the
+    // picked message.
+    write(&b, "pick.txt", "picked twice\n");
+    commit_land(&b, "edit pick");
+    let edit_id = log(&b, "feature")[0]["id"].as_str().unwrap().to_string();
+    write(&a, "pick.txt", "picked on main\n");
+    commit_land(&a, "main edits pick");
+    let out = client.run(&a, &["cherry-pick", &edit_id]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(read(&a, "pick.txt").contains("<<<<<<<"));
+    assert!(client.ok(&a, &["status"]).contains("cherry-picking"));
+    client.ok(&a, &["cherry-pick", "--abort"]);
+    assert_eq!(read(&a, "pick.txt"), "picked on main\n");
+    client.run(&a, &["cherry-pick", &edit_id]);
+    write(&a, "pick.txt", "picked both\n");
+    client.ok(&a, &["commit"]);
+    assert_eq!(log(&a, "@")[0]["changeset"]["message"], "edit pick");
+    client.ok(&a, &["land"]);
+
+    // ---- revert a landed commit, and land the revert ----
+    write(&a, "r.txt", "r\n");
+    commit_land(&a, "add r");
+    let added = base(&a);
+    let out = client.ok(&a, &["revert", "@"]);
+    assert!(out.contains("Reverted"), "{out}");
+    assert!(!a.join("r.txt").exists());
+    let top = &log(&a, "@")[0]["changeset"];
+    assert_eq!(
+        top["message"],
+        format!("Revert \"add r\"\n\nThis reverts {added}.")
+    );
+    assert_eq!(top["extra"]["leep.revert_of"], added.as_str());
+    client.ok(&a, &["land"]);
+    assert_eq!(
+        client.run(&a, &["cat", "main", "r.txt"]).status.code(),
+        Some(1)
+    );
+    let reverts = client.json(&a, &["log", "main", "--extra", "leep.revert_of"]);
+    assert_eq!(reverts["entries"].as_array().unwrap().len(), 1);
+
+    // ---- a revert that needs a real three-way merge ----
+    write(&a, "hunk2.txt", &numbered(&[]));
+    commit_land(&a, "add hunk2");
+    write(&a, "hunk2.txt", &numbered(&[(2, "line 2 CHANGED")]));
+    commit_land(&a, "change line 2");
+    let change2 = base(&a);
+    write(
+        &a,
+        "hunk2.txt",
+        &numbered(&[(2, "line 2 CHANGED"), (11, "line 11 LATER")]),
+    );
+    commit_land(&a, "change line 11");
+    client.ok(&a, &["revert", &change2]);
+    assert_eq!(
+        read(&a, "hunk2.txt"),
+        numbered(&[(11, "line 11 LATER")]),
+        "only the reverted hunk went back"
+    );
+    client.ok(&a, &["land"]);
+    assert_eq!(
+        client.ok(&a, &["cat", "main", "hunk2.txt"]),
+        numbered(&[(11, "line 11 LATER")])
+    );
+
+    // The same revert conflicts when the later edit touches the same lines.
+    write(&a, "hunk2.txt", &numbered(&[(5, "line 5 A")]));
+    commit_land(&a, "change line 5");
+    let change5 = base(&a);
+    write(&a, "hunk2.txt", &numbered(&[(5, "line 5 B")]));
+    commit_land(&a, "change line 5 again");
+    let out = client.run(&a, &["revert", &change5]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(stdout(&out).contains("C hunk2.txt"), "{}", stdout(&out));
+    assert!(read(&a, "hunk2.txt").contains("<<<<<<<"));
+    client.ok(&a, &["revert", "--abort"]);
+    assert_eq!(read(&a, "hunk2.txt"), numbered(&[(5, "line 5 B")]));
+    assert!(client.ok(&a, &["status"]).contains("working copy clean"));
+
+    // ---- a dirty working copy refuses all four ----
+    write(&a, "scratch.txt", "x\n");
+    for args in [
+        ["merge", "feature"],
+        ["rebase", "main"],
+        ["cherry-pick", "feature"],
+        ["revert", "@"],
+    ] {
+        let out = client.run(&a, &args);
+        assert_eq!(out.status.code(), Some(1), "{args:?}");
+        assert!(
+            stderr(&out).contains("uncommitted"),
+            "{args:?}: {}",
+            stderr(&out)
+        );
+    }
+    client.ok(&a, &["restore", "--force", "scratch.txt"]);
+
+    // ---- rebase a two-commit stack onto an updated branch ----
+    client.ok(&b, &["switch", "main"]);
+    write(&b, "e.txt", "e\n");
+    commit_land(&b, "main moves on");
+    write(&a, "x1.txt", "x1\n");
+    client.ok(&a, &["commit", "-m", "L1"]);
+    write(&a, "x2.txt", "x2\n");
+    client.ok(&a, &["commit", "-m", "L2"]);
+    let old = base(&a);
+    let out = client.ok(&a, &["rebase"]);
+    assert!(out.contains("Rebased 2 local commits"), "{out}");
+    assert_ne!(base(&a), old);
+    assert_eq!(read(&a, "e.txt"), "e\n");
+    assert_eq!(read(&a, "x1.txt"), "x1\n");
+    assert_eq!(read(&a, "x2.txt"), "x2\n");
+    assert_eq!(client.json(&a, &["status"])["ahead"], 2);
+    assert_eq!(head("main"), log(&b, "main")[0]["id"].as_str().unwrap());
+    client.ok(&a, &["land"]);
+    assert_eq!(head("main"), base(&a));
+    let msgs: Vec<String> = log(&a, "main")
+        .as_array()
+        .unwrap()
+        .iter()
+        .take(3)
+        .map(|e| e["changeset"]["message"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(msgs, ["L2", "L1", "main moves on"]);
+}
+
+#[test]
+fn merge_rebase_cherry_pick_and_revert() {
+    let _g = serial();
+    let tmp = tempfile::tempdir().unwrap();
+    let stores = Stores::sqlite(&tmp.path().join("data"));
+    run_merge_rebase_revert_workflow(&stores, tmp.path());
+}
+
+#[test]
+fn merge_rebase_cherry_pick_and_revert_postgres() {
+    let _g = serial();
+    let Some(db) = PgDb::create() else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let stores = Stores::with_meta(&tmp.path().join("data"), db.url.clone());
+    run_merge_rebase_revert_workflow(&stores, tmp.path());
+}
