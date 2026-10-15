@@ -2,7 +2,7 @@ name: Rust
 
 on:
   push:
-    branches: ["main", "ccr-*"]
+    branches: ["main"]
   pull_request:
 
 env:

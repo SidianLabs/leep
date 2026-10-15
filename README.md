@@ -30,5 +30,6 @@ cargo build --release
 cargo test
 ```
 
-The repository also still contains the earlier ELEVATE static website files at
-the top level; they are unrelated to Leep.
+## License
+
+Apache-2.0
