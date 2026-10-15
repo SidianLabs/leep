@@ -225,6 +225,26 @@ to delete a ref that a land policy (signatures, review) protects. A revision
 is looked up as a ref, then a full changeset id, then `tags/<rev>`, so a
 branch or id always wins over a tag of the same short name.
 
+## Merge conflicts report clean changes (additive API field, ADR 0019)
+
+`POST /v1/merge` answered a conflict with only the list of conflicts, so a
+client could not rebuild the merged tree. `MergeResponse::Conflicts` now also
+carries `clean`: for every path that merged cleanly and differs from
+`parents[0]`, the `FileChange` relative to `parents[0]`. It is the same field
+`RebaseResponse::Conflicts` and `LandResponse::Conflicts` have. It is optional
+on the wire (`#[serde(default)]`), so old clients ignore it and a client reading
+an older server's answer sees an empty map. No changeset, tree, hash or derived
+encoding changed.
+
+The client adds two optional fields to `.leep/state.json`, which is not an
+API: `merge_in_progress` (`other`, `message`, `added`) and `pick_in_progress`
+(`from`, `message`, `revert`, `added`). Absent means none. The changesets they
+lead to use existing fields: a merge has `parents = [base, other]`, a
+cherry-pick keeps the original's author, message and `extra` plus
+`leep.rebased_from`, and a revert carries `leep.revert_of` (an `extra` key,
+the id of the reverted changeset) and the message `Revert "<first line>"`,
+a blank line and `This reverts <id>.`.
+
 ## SQL schema (leep-meta)
 
 ```

@@ -272,6 +272,21 @@ way, and `reset` and `amend` only move the base, never a ref. `amend` is
 refused for a base in the target ref's history (`merge_base(base, head) ==
 base`). Snapshots are ordinary changesets, so blob GC keeps what they reference.
 
+**Merge, rebase, cherry-pick and revert** ([ADR 0019](adr/0019-merge-rebase-revert.md)).
+These build local, unlanded commits from existing endpoints; `land` moves the
+ref. `merge` calls `POST /v1/merge` with parents `[base, REV]`; `cherry-pick`
+and `rebase` call `POST /v1/rebase` (a rebase uses the changeset's first parent
+as the merge base, so only its own change is replayed). `revert` stores the
+inverse of REV's change as a changeset whose parent is REV and rebases that
+onto the base, which makes REV the base of the three-way merge. A clean answer
+becomes the base through `overlay::apply`. A conflicted one is written like a
+`sync` conflict (`overlay::plan_conflicts`, keeping the working copy's file where
+there is no text merge), the base stays put, and `state.json` records
+`merge_in_progress` or `pick_in_progress`. `commit` then supplies the message
+and, for a merge, the second parent; `--abort` removes what the operation
+added and resets hard. `MergeResponse::Conflicts` carries `clean` so the client
+has the cleanly merged paths; the CLI checks that a server reported them.
+
 **Ref log and undo** ([ADR 0018](adr/0018-ref-log.md)). Every successful ref
 create, move or delete appends a row to `ref_log` in the same transaction (or
 under the same lock, in memory) as the conditional update, so a ref never
