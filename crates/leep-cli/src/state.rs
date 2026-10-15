@@ -12,7 +12,7 @@ use crate::error::{CliError, Result};
 
 pub const DIR: &str = ".leep";
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
     pub server: String,
     #[serde(default = "default_ref")]
@@ -20,6 +20,36 @@ pub struct Config {
     /// Sparse-checkout roots; empty means the whole repository.
     #[serde(default)]
     pub prefixes: Vec<String>,
+    /// Bearer token; lowest precedence after `--token` and `LEEP_TOKEN`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+}
+
+// Manual so the token can never reach logs through `{:?}`.
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("server", &self.server)
+            .field("target_ref", &self.target_ref)
+            .field("prefixes", &self.prefixes)
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+/// Pick the token: `--token` flag, then `LEEP_TOKEN`, then the config file.
+/// Empty values count as unset.
+pub fn resolve_token(
+    flag: Option<&str>,
+    env: Option<&str>,
+    config: Option<&str>,
+) -> Option<String> {
+    [flag, env, config]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|t| !t.is_empty())
+        .map(str::to_string)
 }
 
 fn default_ref() -> String {
@@ -64,8 +94,23 @@ pub fn normalize_prefix(p: &str) -> Result<String> {
 
 /// Write `bytes` to `path` via a temp file and rename.
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    atomic_write_mode(path, bytes, false)
+}
+
+/// Like [`atomic_write`]; `private` creates the file owner-only (0600 on unix)
+/// before any bytes are written, so a secret is never briefly world-readable.
+pub fn atomic_write_mode(path: &Path, bytes: &[u8], private: bool) -> Result<()> {
     let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
-    fs::write(&tmp, bytes)?;
+    if private {
+        use std::io::Write;
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+        opts.open(&tmp)?.write_all(bytes)?;
+    } else {
+        fs::write(&tmp, bytes)?;
+    }
     fs::rename(&tmp, path).inspect_err(|_| {
         let _ = fs::remove_file(&tmp);
     })?;
@@ -124,7 +169,11 @@ impl WorkCopy {
 
     pub fn save_config(&self) -> Result<()> {
         let b = serde_json::to_vec_pretty(&self.config)?;
-        atomic_write(&self.root.join(DIR).join("config.json"), &b)
+        atomic_write_mode(
+            &self.root.join(DIR).join("config.json"),
+            &b,
+            self.config.token.is_some(),
+        )
     }
 
     pub fn save_state(&self) -> Result<()> {
@@ -165,6 +214,7 @@ mod tests {
                 server: "http://x".into(),
                 target_ref: "main".into(),
                 prefixes: vec!["src".into()],
+                token: None,
             },
         )
         .unwrap();
@@ -184,6 +234,57 @@ mod tests {
         assert_eq!(back.state, wc.state);
         assert_eq!(back.config, wc.config);
         assert!(WorkCopy::init(dir.path(), wc.config.clone()).is_err());
+    }
+
+    #[test]
+    fn token_precedence() {
+        let r = resolve_token;
+        assert_eq!(r(Some("f"), Some("e"), Some("c")).as_deref(), Some("f"));
+        assert_eq!(r(None, Some("e"), Some("c")).as_deref(), Some("e"));
+        assert_eq!(r(None, None, Some("c")).as_deref(), Some("c"));
+        assert_eq!(r(None, None, None), None);
+        // Empty or blank values fall through.
+        assert_eq!(r(Some(""), Some(" "), Some("c")).as_deref(), Some("c"));
+        assert_eq!(r(Some(" f \n"), None, None).as_deref(), Some("f"));
+    }
+
+    #[test]
+    fn token_in_config_is_private_and_redacted() {
+        let dir = tempfile::tempdir().unwrap();
+        let wc = WorkCopy::init(
+            dir.path(),
+            Config {
+                server: "http://x".into(),
+                target_ref: "main".into(),
+                prefixes: vec![],
+                token: Some("s3cret".into()),
+            },
+        )
+        .unwrap();
+        let cfg = dir.path().join(DIR).join("config.json");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&cfg).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+            // Re-saving keeps it private.
+            wc.save_config().unwrap();
+            let mode = fs::metadata(&cfg).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        assert!(!format!("{wc:?}").contains("s3cret"));
+        assert_eq!(
+            WorkCopy::open(dir.path()).unwrap().config.token.as_deref(),
+            Some("s3cret")
+        );
+    }
+
+    #[test]
+    fn old_config_without_token_loads() {
+        let c: Config = serde_json::from_str(r#"{"server":"http://x"}"#).unwrap();
+        assert_eq!(c.token, None);
+        let out = serde_json::to_string(&c).unwrap();
+        assert!(!out.contains("token"));
     }
 
     #[test]

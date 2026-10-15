@@ -74,18 +74,62 @@ impl Data {
     }
 }
 
+/// Bearer tokens the mock accepts; `None` leaves it open.
+#[derive(Clone)]
+pub struct Tokens {
+    pub write: &'static str,
+    pub read: &'static str,
+}
+
+/// Mirrors the real server: 401 without a valid token, 403 for a read token
+/// on anything but GET and `POST /v1/blobs/missing`.
+async fn gate(
+    State(t): State<Tokens>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let got = req
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    let mutating =
+        req.method() != axum::http::Method::GET && req.uri().path() != "/v1/blobs/missing";
+    match got {
+        Some(g) if g == t.write => next.run(req).await,
+        Some(g) if g == t.read && !mutating => next.run(req).await,
+        Some(g) if g == t.read => {
+            err(StatusCode::FORBIDDEN, "token lacks write access").into_response()
+        }
+        _ => err(StatusCode::UNAUTHORIZED, "missing or invalid bearer token").into_response(),
+    }
+}
+
 impl Mock {
     pub fn start() -> Mock {
+        Self::start_with(None)
+    }
+
+    pub fn start_with_auth(tokens: Tokens) -> Mock {
+        Self::start_with(Some(tokens))
+    }
+
+    fn start_with(tokens: Option<Tokens>) -> Mock {
         let data: Shared = Arc::default();
-        let app = Router::new()
+        let router = Router::new()
             .route("/v1/blobs/missing", post(missing))
             .route("/v1/blobs/{hash}", put(put_blob).get(get_blob))
             .route("/v1/changesets", post(create))
             .route("/v1/refs/{*name}", get(get_ref))
             .route("/v1/resolve/{*rev}", get(resolve))
             .route("/v1/files/{id}", get(files))
-            .route("/v1/land", post(land))
-            .with_state(data.clone());
+            .route("/v1/land", post(land));
+        let app = match tokens {
+            Some(t) => router.layer(axum::middleware::from_fn_with_state(t, gate)),
+            None => router,
+        }
+        .with_state(data.clone());
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let addr = listener.local_addr().unwrap();

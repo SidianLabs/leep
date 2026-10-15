@@ -52,6 +52,29 @@ Then use the client smoke test above against `http://127.0.0.1:7070`. Tear down
 with `docker rm -f leep` or `docker compose -f deploy/docker-compose.yml down -v`.
 See `docs/DEPLOY.md`.
 
+<!-- BEGIN with-authentication -->
+## With authentication
+
+Auth is off unless the server gets a tokens file. Create tokens and a file:
+
+```sh
+cargo run -q -p leep-server -- gen-token --name dev --role write   # prints token: ... and entry: {...}
+cargo run -q -p leep-server -- gen-token --name viewer --role read
+echo '{"tokens":[ <entry lines, comma separated> ]}' > /tmp/leep/tokens.json
+cargo run -p leep-server -- --tokens-file /tmp/leep/tokens.json ...   # same flags as above
+```
+The file holds `blake3:` digests only; the plaintext token is shown once, so
+keep it. `GET /v1/health` stays public. Then, for the client:
+
+```sh
+export LEEP_TOKEN=<write token>            # or: leep --token ... / leep init --token ...
+leep init                                   # `leep init --token T` also saves it to .leep/config.json (0600)
+```
+Precedence is `--token`, then `LEEP_TOKEN`, then `.leep/config.json`. With a read
+token, `leep land` fails with `token lacks write access`; with none, commands
+fail with `authentication required: set LEEP_TOKEN`.
+<!-- END with-authentication -->
+
 ## Clean up
 
 Stop the server, run `pg_ctl stop` if you started Postgres, and `rm -rf /tmp/leep`.

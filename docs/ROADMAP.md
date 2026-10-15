@@ -13,7 +13,8 @@ Milestones are ordered. Each one should leave `main` releasable.
 - [x] End-to-end test: import a git repo, run 50 concurrent agent lands, export back to git
 
 ## v0.2: Operable
-- Token auth; structured logs; Prometheus metrics (cache hit rates, land retries, derive latency)
+- [x] Token auth (static bearer tokens, read/write roles; ADR 0007)
+- [ ] Structured logs; Prometheus metrics (cache hit rates, land retries, derive latency)
 - Docker images and a docker-compose file (server + Postgres + MinIO)
 - Blob garbage collection (mark from refs plus a retention window)
 - Benchmarks: commit and land latency versus repository size

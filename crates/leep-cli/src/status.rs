@@ -261,6 +261,7 @@ mod tests {
                 server: "http://x".into(),
                 target_ref: "main".into(),
                 prefixes: vec![],
+                token: None,
             },
         )
         .unwrap()

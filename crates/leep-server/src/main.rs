@@ -4,9 +4,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::Context;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use leep_core::BlobStore;
 use leep_derive::Repo;
+use leep_server::auth::{self, Auth, Role};
 use leep_store::CachedBlobStore;
 use tracing_subscriber::EnvFilter;
 
@@ -32,6 +33,47 @@ struct Args {
     /// Maximum request body size in bytes.
     #[arg(long, default_value_t = leep_server::DEFAULT_MAX_BODY_BYTES)]
     max_body_bytes: usize,
+    /// JSON file of `blake3:` token digests; enables authentication. Read once
+    /// at startup.
+    #[arg(long, env = "LEEP_TOKENS_FILE")]
+    tokens_file: Option<std::path::PathBuf>,
+    #[command(subcommand)]
+    command: Option<Cmd>,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Read a token from stdin and print its `blake3:` digest.
+    HashToken,
+    /// Print a fresh random token (once) and its tokens-file entry.
+    GenToken {
+        /// Name recorded in the file and in logs.
+        #[arg(long)]
+        name: String,
+        /// `read` or `write`.
+        #[arg(long)]
+        role: Role,
+    },
+}
+
+fn run_command(cmd: Cmd) -> anyhow::Result<()> {
+    match cmd {
+        Cmd::HashToken => {
+            let mut token = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut token)?;
+            if token.trim().is_empty() {
+                anyhow::bail!("no token on stdin");
+            }
+            println!("{}", auth::hash_token(&token));
+        }
+        Cmd::GenToken { name, role } => {
+            let (token, entry) = auth::generate(&name, role).map_err(anyhow::Error::msg)?;
+            println!("token: {token}");
+            println!("entry: {}", serde_json::to_string(&entry)?);
+            eprintln!("Store the token now; it cannot be recovered. Add the entry to the `tokens` array of your tokens file.");
+        }
+    }
+    Ok(())
 }
 
 /// Create the parent directory a local `sqlite:` or `file://` URL points into.
@@ -79,6 +121,20 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
     let args = Args::parse();
+    if let Some(cmd) = args.command {
+        return run_command(cmd);
+    }
+    let auth = match &args.tokens_file {
+        Some(path) => {
+            let a = Auth::from_file(path).map_err(anyhow::Error::msg)?;
+            tracing::info!(tokens = a.len(), "authentication enabled");
+            Some(a)
+        }
+        None => {
+            tracing::warn!("authentication disabled: no --tokens-file; anyone who can reach this server can read and write");
+            None
+        }
+    };
     ensure_local_dirs(&args.meta, &args.blobs)?;
 
     let mut blobs = leep_store::open_blob_store(&args.blobs).context("opening blob store")?;
@@ -89,7 +145,7 @@ async fn main() -> anyhow::Result<()> {
     let meta = leep_meta::open_meta_store(&args.meta)
         .await
         .context("opening meta store")?;
-    let app = leep_server::router_with_limit(Repo::new(blobs, meta), args.max_body_bytes);
+    let app = leep_server::router_with_auth(Repo::new(blobs, meta), args.max_body_bytes, auth);
 
     let listener = tokio::net::TcpListener::bind(args.listen)
         .await

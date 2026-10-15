@@ -31,6 +31,17 @@
 //! `Error::NotFound` → 404, CAS loss and `Error::Conflict` (e.g. a land that
 //! kept losing to concurrent lands) → 409, anything else → 500.
 //! Hashes and ids are lowercase hex in JSON.
+//!
+//! # Authentication
+//!
+//! A server started with a tokens file requires `Authorization: Bearer
+//! <token>` on every endpoint except `GET /v1/health`, which stays public for
+//! load balancers. A missing or unknown token is 401 with
+//! `WWW-Authenticate: Bearer`. A `read` token may call every `GET` endpoint and
+//! `POST /v1/blobs/missing` (a query); any other request with it is 403. A
+//! `write` token may call everything. A server without a tokens file accepts
+//! all requests and ignores the header. Both failures use [`ErrorResponse`].
+//! This adds behavior only; no type or path changed (FORMATS.md, rule 4).
 
 use std::collections::BTreeMap;
 

@@ -1,8 +1,9 @@
 # Deploying Leep
 
-Leep v0.1 has **no authentication or TLS**. Bind it to localhost or a trusted
-network, or put an authenticating reverse proxy in front. Never expose port
-7070 to the internet.
+Authentication is **off unless you give the server a tokens file**, and
+`leep-server` never terminates TLS. For anything beyond localhost, enable
+tokens (below) and put a TLS-terminating reverse proxy in front: bearer
+tokens must not cross untrusted networks in cleartext.
 
 The repo `Dockerfile` builds `leep-server`, `leep` and `leep-git` into one
 `debian:bookworm-slim` image. The entrypoint is `leep-server`; it runs as the
@@ -66,6 +67,24 @@ so it depends only on the `postgres` image.
 The image has no `curl`, so it declares no `HEALTHCHECK`. Probe
 `GET /v1/health` from your orchestrator instead.
 
+## Authentication
+
+Generate tokens with the server binary and mount a tokens file holding only
+their digests (see ADR 0007):
+
+```sh
+docker run --rm --entrypoint leep-server leep:dev gen-token --name ci --role write
+# token: <shown once>          entry: {"name":"ci","role":"write","hash":"blake3:..."}
+echo '{"tokens":[<entries, comma separated>]}' > tokens.json
+docker run -d -p 127.0.0.1:7070:7070 -v leep-data:/var/lib/leep \
+  -v "$PWD/tokens.json:/etc/leep/tokens.json:ro" \
+  -e LEEP_TOKENS_FILE=/etc/leep/tokens.json leep:dev
+```
+
+In compose, add the same volume and `LEEP_TOKENS_FILE` to `leep-server`.
+Clients pass the token with `LEEP_TOKEN`, `leep --token` or
+`leep init --token`. `GET /v1/health` stays public for probes.
+
 ## Environment variables
 
 | Variable | Default in image | Meaning |
@@ -73,7 +92,9 @@ The image has no `curl`, so it declares no `HEALTHCHECK`. Probe
 | `LEEP_LISTEN` | `0.0.0.0:7070` | Listen address. |
 | `LEEP_META` | `sqlite:///var/lib/leep/meta.db?mode=rwc` | Metadata store: `sqlite:`, `postgres://`, `mem://`. |
 | `LEEP_BLOBS` | `file:///var/lib/leep/blobs` | Blob store: `file://`, `s3://bucket?endpoint=URL&region=R&allow_http=true`, `mem://`. |
+| `LEEP_TOKENS_FILE` | none | Tokens file; enables authentication. |
 | `LEEP_SERVER` | none | CLI only: server URL. |
+| `LEEP_TOKEN` | none | CLI only: bearer token. |
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | none | S3 credentials (standard AWS variables). |
 | `RUST_LOG` | `info` | Log filter. |
 
