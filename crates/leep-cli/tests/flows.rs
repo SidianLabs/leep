@@ -13,6 +13,7 @@ use leep_cli::commands::commit::{self, CommitArgs};
 use leep_cli::commands::history::{self, BlameArgs, LastChangeArgs, LogArgs, ProvenanceArgs};
 use leep_cli::commands::init::{self, InitArgs};
 use leep_cli::commands::land::{self, LandArgs};
+use leep_cli::commands::search::{self, SearchArgs};
 use leep_cli::commands::Ctx;
 use leep_cli::status::{status, Change};
 use leep_core::changeset::EXTRA_AGENT_MODEL;
@@ -474,6 +475,101 @@ fn provenance_queries_reach_the_server_and_decode() {
     assert_eq!(b.changesets[&agent_cs].agent["agent.model"], "m1");
     let rows = history::blame_lines(&b, true);
     assert!(rows[0].contains("robot m1"), "{}", rows[0]);
+}
+
+#[test]
+fn search_sends_flags_and_decodes_matches() {
+    let mock = Mock::start();
+    let (wc_dir, cache) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    mock.seed(
+        None,
+        &[
+            (
+                "src/a.rs",
+                "fn main() {}\n// Needle here\n",
+                FileKind::Regular,
+            ),
+            ("docs/b.md", "a needle\nsecond needle\n", FileKind::Regular),
+        ],
+        &[],
+    );
+    let ctx = init_wc(&mock, wc_dir.path(), cache.path(), &[]).unwrap();
+    let tip = ctx.wc.state.base.unwrap();
+    let last_query = || {
+        mock.data
+            .lock()
+            .unwrap()
+            .queries
+            .iter()
+            .rev()
+            .find(|(k, _)| k == "search")
+            .unwrap()
+            .1
+            .clone()
+    };
+    let args = |f: &dyn Fn(&mut SearchArgs)| {
+        let mut a = SearchArgs {
+            query: "needle".into(),
+            rev: None,
+            ignore_case: false,
+            regex: false,
+            path: None,
+            glob: None,
+            limit: None,
+        };
+        f(&mut a);
+        a
+    };
+    let r = ctx.remote();
+
+    // Matches exit 0 and the request carries only what was asked for.
+    assert_eq!(search::run(&r, &args(&|_| {})).unwrap(), 0);
+    assert_eq!(last_query(), "q=needle");
+    let resp = ctx.client.search(&tip, &args(&|_| {}).query()).unwrap();
+    assert_eq!(
+        search::search_lines(&resp),
+        ["docs/b.md:1:a needle", "docs/b.md:2:second needle"]
+    );
+    assert_eq!(resp.matches[0].ranges[0].start, 2);
+
+    let a = args(&|a| {
+        a.ignore_case = true;
+        a.regex = true;
+        a.path = Some("src".into());
+        a.glob = Some("**/*.rs".into());
+        a.limit = Some(5);
+    });
+    assert_eq!(search::run(&r, &a).unwrap(), 0);
+    let q = last_query();
+    for part in [
+        "q=needle",
+        "regex=true",
+        "i=true",
+        "path=src",
+        "glob=",
+        "limit=5",
+    ] {
+        assert!(q.contains(part), "{part} in {q}");
+    }
+    let resp = ctx.client.search(&tip, &a.query()).unwrap();
+    assert_eq!(search::search_lines(&resp), ["src/a.rs:2:// Needle here"]);
+
+    // Truncation is reported by the server and survives decoding.
+    let one = ctx
+        .client
+        .search(&tip, &args(&|a| a.limit = Some(1)).query())
+        .unwrap();
+    assert!(one.truncated && one.matches.len() == 1);
+
+    // No match is exit 1, like grep; an explicit revision works too.
+    assert_eq!(
+        search::run(&r, &args(&|a| a.query = "absent".into())).unwrap(),
+        1
+    );
+    assert_eq!(
+        search::run(&r, &args(&|a| a.rev = Some(tip.to_string()))).unwrap(),
+        0
+    );
 }
 
 mod signing {

@@ -49,6 +49,40 @@ impl LogQuery {
     }
 }
 
+/// Parameters of `GET /v1/search/{rev}`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SearchQuery {
+    pub query: String,
+    pub regex: bool,
+    pub ignore_case: bool,
+    pub path: Option<String>,
+    pub glob: Option<String>,
+    pub limit: Option<u32>,
+}
+
+impl SearchQuery {
+    /// Query-string pairs; flags are sent only when set.
+    pub fn params(&self) -> Vec<(&'static str, String)> {
+        let mut out = vec![("q", self.query.clone())];
+        if self.regex {
+            out.push(("regex", "true".into()));
+        }
+        if self.ignore_case {
+            out.push(("i", "true".into()));
+        }
+        if let Some(p) = &self.path {
+            out.push(("path", p.clone()));
+        }
+        if let Some(g) = &self.glob {
+            out.push(("glob", g.clone()));
+        }
+        if let Some(n) = self.limit {
+            out.push(("limit", n.to_string()));
+        }
+        out
+    }
+}
+
 /// Percent-encode a URL path, keeping `/` so ref names like `team/x` work.
 fn enc(s: &str) -> String {
     let mut out = String::new();
@@ -303,6 +337,14 @@ impl Client {
         self.json(req)
     }
 
+    pub fn search(&self, id: &ChangesetId, q: &SearchQuery) -> Result<SearchResponse> {
+        self.json(
+            self.http
+                .get(self.url(&format!("/v1/search/{id}")))
+                .query(&q.params()),
+        )
+    }
+
     pub fn diff(
         &self,
         from: Option<&ChangesetId>,
@@ -384,6 +426,34 @@ fn error_from(resp: Response, has_token: bool) -> CliError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn search_flags_become_params() {
+        let q = SearchQuery {
+            query: "a b".into(),
+            ..Default::default()
+        };
+        assert_eq!(q.params(), [("q", "a b".to_string())]);
+        let q = SearchQuery {
+            query: "x".into(),
+            regex: true,
+            ignore_case: true,
+            path: Some("src".into()),
+            glob: Some("**/*.rs".into()),
+            limit: Some(7),
+        };
+        assert_eq!(
+            q.params(),
+            [
+                ("q", "x".to_string()),
+                ("regex", "true".to_string()),
+                ("i", "true".to_string()),
+                ("path", "src".to_string()),
+                ("glob", "**/*.rs".to_string()),
+                ("limit", "7".to_string()),
+            ]
+        );
+    }
 
     #[test]
     fn encodes_paths() {
