@@ -1763,6 +1763,36 @@ fn run_reflog_and_undo_workflow(stores: &Stores, work: &Path) {
     assert!(stderr(&out).contains("protected"), "{}", stderr(&out));
     assert_eq!(head(&wc, "main").as_deref(), Some(one.as_str()));
     assert_eq!(entries(&wc, &[]), before, "refused undos log nothing");
+
+    // A protected ref only moves forward (security review 2026-10, S-09):
+    // undoing a signed land would drop it without review, so undo refuses
+    // and points at revert, which lands like any other change.
+    client.ok(&wc, &["reset", "--hard", &one]);
+    write(&wc, "a.txt", "signed\n");
+    client.ok(
+        &wc,
+        &[
+            "commit",
+            "-m",
+            "signed",
+            "--sign",
+            keyfile.to_str().unwrap(),
+        ],
+    );
+    client.ok(&wc, &["land"]);
+    let signed = head(&wc, "main").unwrap();
+    assert_ne!(signed, one);
+    let before = entries(&wc, &[]);
+    let out = client.run(&wc, &["undo"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("only moves forward")
+            && stderr(&out).contains(&format!("leep revert {signed}")),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(head(&wc, "main").as_deref(), Some(signed.as_str()));
+    assert_eq!(entries(&wc, &[]), before, "a refused rewind logs nothing");
     drop(server);
 }
 
