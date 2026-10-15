@@ -27,7 +27,8 @@ table below. Use `cargo bench -- --save-baseline <name>` and
 ## Results
 
 Machine: 4 vCPU (`nproc` = 4), Intel Xeon @ 2.80GHz, 15 GB RAM, release
-profile, in-memory stores. Median of 20 samples (10 for `log`). Numbers are
+profile, in-memory stores. Median of 20 samples (10 for `log`).
+Path-history rows (`cargo bench -p leep-derive -- 'log_path|last_change|derive_history'`) use a 10k-changeset linear history in which `d0/f` changes every 10th changeset and `rare/f` every 1000th. Numbers are
 indicative; expect roughly +/-15% run to run.
 
 | Benchmark | 1k | 10k | 100k |
@@ -40,9 +41,16 @@ indicative; expect roughly +/-15% run to run.
 | `diff` one changed file (files in repo) | | 1.05 ms | 1.02 ms |
 | `is_ancestor` root of tip (changesets) | 1.5 us | 1.6 us | 2.2 us |
 | `merge_base` tip vs. branch from midpoint (changesets) | 5.0 us | 5.5 us | 6.7 us |
-| `log` path filter, limit 10 (10k changesets) | | 480 us | |
-| `log` path filter, limit 1000 (scans all 10k) | | 57 ms | |
-| `log` path filter, no match (scans all 10k) | | 58 ms | |
+| `log` path filter, limit 10, old scan (10k changesets) | | 489 us | |
+| `log` path filter, limit 10, path-history index | | 67 us | |
+| `log` path filter, limit 1000, old scan (reads all 10k) | | 79 ms | |
+| `log` path filter, limit 1000, path-history index (1000 matches) | | 9.3 ms | |
+| `log` of a path changed 10 times, old scan | | 95 ms | |
+| `log` of a path changed 10 times, path-history index | | 45 us | |
+| `log` path filter, no match, old scan | | 75 ms | |
+| `log` path filter, no match, path-history index | | 3.1 us | |
+| `last_change` of a file, a rarely changed file, a directory | | 4.0 / 4.2 / 3.7 us | |
+| derive the history index (per changeset, one file each) | | 36 us | |
 
 ## Analysis
 
@@ -69,12 +77,27 @@ commit path.
   merges in between still take the generation-ordered walk, which is linear
   in the distance.
 
+- Path `log` and `last_change`: the path-history index (ADR 0013) turns the
+  scan into lookups. The old walk read every ancestor (about 7.5 us per
+  changeset here: 75-95 ms for 10k changesets whatever the number of matches).
+  The index costs one lookup per *match*: 4 us for the newest change, 45 us for
+  a path changed 10 times in 10k changesets, 9 us per entry when listing 1000
+  matches (each entry reads its changeset and its parents' lookups). A path
+  with no match is answered in 3 us, 20,000 times faster. Cost no longer depends
+  on history length. The first query on a history derives the index, about
+  36 us per changeset (0.4 s for 10k, oldest first, iteratively); later
+  queries and new changesets pay only the new changesets. `author` and `extra`
+  filters still apply to every changeset the path walk yields, and `log`
+  without a path still scans.
+
 What does not scale with the change:
 
-- `log` with a path filter is linear in changesets scanned (about 5.7 us per
-  changeset), a known limitation: each step reads the changeset and two tree
-  paths. Scanning 10k changesets costs about 57 ms regardless of how many
-  match.
+- Merges: deriving the index for a merge diffs the first parent's history tree
+  against each other parent's, so a merge of a branch that changed many paths
+  derives in time proportional to those paths. The benchmarks use linear
+  histories and do not measure this.
+- `log` without `path` and the `author` or `extra` filters alone scan
+  changesets linearly.
 
 ### Fixture note
 
@@ -93,5 +116,6 @@ children only.
   the full parent, including all its changes. An `exists`-style `MetaStore`
   method (or a generation lookup) would make the check O(1) regardless of
   parent size. This needs a trait addition, so it is an ADR-sized change.
-- `log` with a path: a derived "path history" index (see
-  `add-derived-data-kind`) would turn the scan into a lookup.
+- Blame could start from the index's last change of the file instead of
+  walking first parents from the tip, but the index follows all parents and
+  blame follows first parents, so it would need its own first-parent entries.

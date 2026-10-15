@@ -37,6 +37,8 @@ skill.
 | derived `blob-condemned-v1` | — | `MetaStore.derived`, key = blob hash, value = condemnation time, unix seconds as 8-byte big-endian `i64`, from the GC host's clock |
 | derived `blob-rescue-v1` | — | `MetaStore.derived`, key = blob hash, value = the condemnation time the writer observed, 8-byte big-endian `i64` |
 | derived `blob-doom-v1` | — | `MetaStore.derived`, key = blob hash, value = condemnation time (8-byte big-endian `i64`) then one state byte: 0 deleting, 1 abandoned, 2 deleted |
+| derived `history-tree-v1` | — | `MetaStore.derived`, key = changeset id, value = 32 raw bytes (hash of that changeset's root `HistoryNode`) |
+| `HistoryNode` | `history-node-v1` | `MetaStore.derived` (kind `history-node-v1`), key = `Hash::of_object("history-node-v1", postcard(node))`, value = the postcard bytes |
 | other derived kinds | — | owned and versioned by `leep-derive` |
 
 ## Versioning rules
@@ -108,6 +110,32 @@ rejected, every field optional):
 `docs_globs` (required by `docs_only`, rejected without it) are `globset`
 patterns with `*` limited to one path level. The comment languages are
 selected by file extension (case-insensitive).
+
+## Path-history index (new derived kinds, no change to `Changeset`)
+
+ADR 0013. `leep_derive::derived::HistoryNode { entries: BTreeMap<String,
+HistoryEntry> }`, keyed by single path components, postcard-encoded.
+`HistoryEntry` is an externally tagged enum, **variant order is format**:
+`Leaf { changed: Vec<ChangesetId> }` (variant 0) and
+`Tree { changed: Vec<ChangesetId>, node: Hash }` (variant 1). `changed` is a
+sorted (by id bytes), deduplicated set of changeset ids, serialized as a
+varint length and 32 raw bytes per id; `node` is 32 raw bytes, the hash of the
+children's `HistoryNode`. The empty node is the single byte `0` (zero entries)
+and is never stored: readers treat its hash as present. Example, a root node
+with `a` (Leaf, one id) and `d` (Tree, two ids):
+
+```
+02 | 01 61 00 01 <32 bytes id1> | 01 64 01 02 <32 bytes id1> <32 bytes id2> <32 bytes node>
+```
+
+The golden bytes are asserted in `leep-derive` (`node_encoding_is_stable`).
+Node rows are content-addressed and idempotent. The meaning of `changed` (the
+maximal changesets whose entry at the path differs from their first parent's;
+merges take the union of parents' sets for paths they leave as in `parents[0]`)
+is part of the format: changing it, the field or variant order, or the key
+derivation requires `history-tree-v2` and `history-node-v2`. Entries of deleted
+paths are kept. The API addition (`GET /v1/last-change/{id}`) adds one endpoint
+and one response type; `/v1/log` is unchanged.
 
 ## SQL schema (leep-meta)
 
