@@ -155,8 +155,11 @@ pub fn atomic_write_mode(path: &Path, bytes: &[u8], private: bool) -> Result<()>
     let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
     if private {
         use std::io::Write;
+        // A leftover temp file would keep its old, possibly wider mode:
+        // `mode` applies only to a file this call creates.
+        let _ = fs::remove_file(&tmp);
         let mut opts = fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
+        opts.write(true).create_new(true);
         #[cfg(unix)]
         std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
         opts.open(&tmp)?.write_all(bytes)?;
@@ -166,6 +169,69 @@ pub fn atomic_write_mode(path: &Path, bytes: &[u8], private: bool) -> Result<()>
     fs::rename(&tmp, path).inspect_err(|_| {
         let _ = fs::remove_file(&tmp);
     })?;
+    Ok(())
+}
+
+/// Whether a path component names a control directory once the filesystem
+/// has normalized it: case-insensitively, ignoring the code points HFS+
+/// drops and the trailing dots and spaces Windows drops, and including the
+/// 8.3 short names Windows gives such directories.
+fn reserved_name(component: &str) -> bool {
+    let ignorable = |c: &char| {
+        matches!(
+            c,
+            '\u{200b}'..='\u{200f}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{206a}'..='\u{206f}'
+                | '\u{feff}'
+        )
+    };
+    let folded: String = component
+        .chars()
+        .filter(|c| !ignorable(c))
+        .collect::<String>()
+        .trim_end_matches(['.', ' '])
+        .to_lowercase();
+    matches!(folded.as_str(), ".leep" | ".git" | "leep~1" | "git~1")
+}
+
+/// Names Windows maps to devices whatever the extension.
+fn windows_device(component: &str) -> bool {
+    let stem = component.split('.').next().unwrap_or("").trim_end();
+    let stem = stem.to_ascii_lowercase();
+    matches!(
+        stem.as_str(),
+        "con" | "prn" | "aux" | "nul" | "conin$" | "conout$"
+    ) || ((stem.starts_with("com") || stem.starts_with("lpt"))
+        && stem.len() == 4
+        && stem.as_bytes()[3].is_ascii_digit()
+        && stem.as_bytes()[3] != b'0')
+}
+
+/// Refuse a repository path the CLI must never write: one with a component
+/// that names `.leep` (whose `config.json` holds the server URL and token)
+/// or `.git` (whose hooks run as the user), in any spelling the filesystem
+/// treats as the same name. With `windows`, also components that Windows
+/// reads as a path separator, a drive or a device. The server allows these
+/// names, so the check is here, where files are written.
+pub fn check_repo_path(path: &str, windows: bool) -> Result<()> {
+    for c in path.split('/') {
+        let bad = if reserved_name(c) {
+            Some("names a control directory")
+        } else if windows && c.contains(['\\', ':']) {
+            Some("contains a character Windows reads as a separator or drive")
+        } else if windows && windows_device(c) {
+            Some("is a Windows device name")
+        } else {
+            None
+        };
+        if let Some(why) = bad {
+            return Err(CliError::server(format!(
+                "refusing to write repository path {path:?}: component {c:?} {why}"
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -237,6 +303,36 @@ impl WorkCopy {
         self.root.join(path)
     }
 
+    /// Where to write or remove the repository file `path`, refusing what a
+    /// malicious server or repository could use to reach outside the working
+    /// copy or into control directories: a reserved name (see
+    /// [`check_repo_path`]) or a directory on the way that is a symbolic
+    /// link, such as one an earlier write of the same checkout created. Check
+    /// right before each write, since earlier writes change the answer.
+    pub fn abs_for_write(&self, path: &str) -> Result<PathBuf> {
+        check_repo_path(path, cfg!(windows))?;
+        let mut dir = self.root.clone();
+        let mut parts = path.split('/').peekable();
+        while let Some(part) = parts.next() {
+            if parts.peek().is_none() {
+                break;
+            }
+            dir.push(part);
+            match fs::symlink_metadata(&dir) {
+                Ok(md) if md.file_type().is_symlink() => {
+                    return Err(CliError::server(format!(
+                        "refusing to write {path}: {} is a symbolic link, so the file \
+                         would land outside the working copy",
+                        dir.strip_prefix(&self.root).unwrap_or(&dir).display()
+                    )));
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        Ok(self.root.join(path))
+    }
+
     /// Sparse prefixes, with `[""]` (whole repo) when none are configured.
     pub fn prefixes(&self) -> Vec<String> {
         if self.config.prefixes.is_empty() {
@@ -304,6 +400,78 @@ mod tests {
         assert_eq!(back.state, wc.state);
         assert_eq!(back.config, wc.config);
         assert!(WorkCopy::init(dir.path(), wc.config.clone()).is_err());
+    }
+
+    /// Security review 2026-10, S-02.
+    #[test]
+    fn control_directories_are_never_written_in_any_spelling() {
+        for bad in [
+            ".leep/config.json",
+            "sub/.leep/state.json",
+            ".LEEP/config.json",
+            ".git/hooks/post-checkout",
+            "a/.Git/config",
+            ".git./hooks/x",
+            ".leep /x",
+            ".g\u{200c}it/hooks/x",
+            "\u{feff}.leep/x",
+            "GIT~1/hooks/x",
+        ] {
+            assert!(check_repo_path(bad, false).is_err(), "{bad:?}");
+            assert!(check_repo_path(bad, true).is_err(), "{bad:?}");
+        }
+        for ok in [
+            ".leepignore",
+            ".gitignore",
+            "a/.github/x",
+            "leep/x",
+            "x.git",
+        ] {
+            check_repo_path(ok, false).unwrap();
+            check_repo_path(ok, true).unwrap();
+        }
+        // Only Windows reads these as separators, drives or devices.
+        for win in [
+            "a\\..\\..\\x",
+            "C:",
+            "a/c:evil",
+            "CON",
+            "dir/nul.txt",
+            "com1.c",
+            "LPT9",
+        ] {
+            check_repo_path(win, false).unwrap();
+            assert!(check_repo_path(win, true).is_err(), "{win:?}");
+        }
+        for ok in ["com0", "console.c", "nullable.rs", "com10"] {
+            check_repo_path(ok, true).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writes_never_go_through_a_symlinked_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let wc = WorkCopy::init(
+            dir.path(),
+            Config {
+                server: "http://x".into(),
+                target_ref: "main".into(),
+                prefixes: vec![],
+                token: None,
+            },
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("a")).unwrap();
+        let e = wc.abs_for_write("a/pwned").unwrap_err().to_string();
+        assert!(e.contains("symbolic link"), "{e}");
+        assert!(wc.abs_for_write("a/b/c").is_err());
+        // The link itself may be replaced, and real directories are fine.
+        assert_eq!(wc.abs_for_write("a").unwrap(), dir.path().join("a"));
+        fs::create_dir_all(dir.path().join("d/e")).unwrap();
+        assert_eq!(wc.abs_for_write("d/e/f").unwrap(), dir.path().join("d/e/f"));
+        assert!(wc.abs_for_write("new/dir/f").is_ok());
     }
 
     #[test]

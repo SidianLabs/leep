@@ -154,7 +154,11 @@ fn rebase_locally(
         let path = c.path.to_string();
         match (&c.merged_with_markers, &c.theirs) {
             (Some(text), _) => {
-                write_file(&ctx.wc.abs(&path), text.as_bytes(), FileKind::Regular)?;
+                write_file(
+                    &ctx.wc.abs_for_write(&path)?,
+                    text.as_bytes(),
+                    FileKind::Regular,
+                )?;
                 if !ctx.wc.state.conflicts.contains(&path) {
                     ctx.wc.state.conflicts.push(path);
                 }
@@ -183,7 +187,7 @@ fn rebase_locally(
 /// Write one change to disk without recording it in state, so it shows up as
 /// a local modification.
 fn apply(ctx: &Ctx, path: &str, change: &FileChange) -> Result<()> {
-    let abs = ctx.wc.abs(path);
+    let abs = ctx.wc.abs_for_write(path)?;
     match change {
         FileChange::Modify { content, kind, .. } => {
             let data = ctx.cache.fetch(&ctx.client, content)?;

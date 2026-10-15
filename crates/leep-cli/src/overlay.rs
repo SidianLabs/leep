@@ -251,7 +251,7 @@ pub fn apply(ctx: &mut Ctx, plan: &Plan) -> Result<Stats> {
 
     // Everything that can fail without touching the disk happens first.
     for p in &todo {
-        let abs = ctx.wc.abs(p);
+        let abs = ctx.wc.abs_for_write(p)?;
         match plan.want.get(*p) {
             Some(Want::File { content, .. }) => {
                 ctx.cache.fetch(&ctx.client, content)?;
@@ -272,7 +272,7 @@ pub fn apply(ctx: &mut Ctx, plan: &Plan) -> Result<Stats> {
     let mut written: HashSet<&str> = HashSet::new();
     let outcome = (|| -> Result<()> {
         for p in &todo {
-            let abs = ctx.wc.abs(p);
+            let abs = ctx.wc.abs_for_write(p)?;
             let prev = match fs::symlink_metadata(&abs) {
                 Ok(md) => {
                     let kind = scan_file(&abs, &md, None)?.kind;
@@ -372,10 +372,10 @@ pub fn apply(ctx: &mut Ctx, plan: &Plan) -> Result<Stats> {
 fn rollback(ctx: &Ctx, journal: Vec<Undo>) -> Vec<String> {
     let mut failed = Vec::new();
     for u in journal.into_iter().rev() {
-        let abs = ctx.wc.abs(&u.path);
-        let ok = match &u.prev {
-            Some((data, kind)) => write_file(&abs, data, *kind).is_ok(),
-            None => remove_file(&ctx.wc.root, &abs).is_ok(),
+        let ok = match (ctx.wc.abs_for_write(&u.path), &u.prev) {
+            (Err(_), _) => false,
+            (Ok(abs), Some((data, kind))) => write_file(&abs, data, *kind).is_ok(),
+            (Ok(abs), None) => remove_file(&ctx.wc.root, &abs).is_ok(),
         };
         if !ok {
             failed.push(u.path);

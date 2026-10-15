@@ -137,7 +137,7 @@ pub fn discard(ctx: &mut Ctx, entries: &[StatusEntry], remove_new: bool) -> Resu
     }
     let result = (|| -> Result<()> {
         for e in entries {
-            let abs = ctx.wc.abs(&e.path);
+            let abs = ctx.wc.abs_for_write(&e.path)?;
             match ctx.wc.state.files.get(&e.path).cloned() {
                 Some(f) => {
                     let data = ctx.cache.get(&f.content).ok_or_else(|| {
@@ -255,7 +255,7 @@ fn from_source(
     let mut done = Discarded::default();
     let result = (|| -> Result<()> {
         for (p, want) in &plan {
-            let abs = ctx.wc.abs(p);
+            let abs = ctx.wc.abs_for_write(p)?;
             match want {
                 Some(w) => {
                     let data = ctx.cache.get(&w.content).ok_or_else(|| {
