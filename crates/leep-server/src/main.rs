@@ -38,6 +38,10 @@ struct Args {
     /// In-memory blob cache size in bytes; 0 disables it.
     #[arg(long, default_value_t = 256 * 1024 * 1024)]
     cache_bytes: usize,
+    /// Abort requests that run longer than this (0, 90s, 5m); 0 disables the
+    /// bound. `gc --fence` must exceed it.
+    #[arg(long, env = "LEEP_REQUEST_TIMEOUT", default_value = "5m", value_parser = parse_grace)]
+    request_timeout: std::time::Duration,
     /// Maximum request body size in bytes.
     #[arg(long, default_value_t = leep_server::DEFAULT_MAX_BODY_BYTES)]
     max_body_bytes: usize,
@@ -96,37 +100,86 @@ enum Cmd {
         role: Role,
     },
     /// Delete blobs no changeset references (uses --meta and --blobs; safe
-    /// beside running servers because of --grace).
+    /// beside running servers). Without a phase: condemn, wait --fence, then
+    /// collect.
     Gc {
-        /// Report what would be deleted without deleting.
-        #[arg(long)]
+        #[command(subcommand)]
+        phase: Option<GcPhase>,
+        /// Report what would be condemned or deleted without writing anything.
+        #[arg(long, global = true)]
         dry_run: bool,
-        /// Keep unreferenced blobs written within this long (0, 30m, 24h, 7d).
-        /// Must exceed the time clients take from upload to commit.
-        #[arg(long, default_value = "24h", value_parser = parse_grace)]
+        /// Do not condemn unreferenced blobs written or claimed within this
+        /// long (0, 30m, 24h, 7d). Must exceed the time clients take from
+        /// upload to commit.
+        #[arg(long, global = true, default_value = "24h", value_parser = parse_grace)]
         grace: std::time::Duration,
+        /// Delete only blobs condemned at least this long ago. Must exceed
+        /// the servers' --request-timeout plus clock skew.
+        #[arg(long, global = true, default_value = "10m", value_parser = parse_grace)]
+        fence: std::time::Duration,
+        /// Allow --fence 0. Only safe while no server is running.
+        #[arg(long, global = true)]
+        unsafe_no_fence: bool,
     },
+}
+
+#[derive(Subcommand, Clone, Copy)]
+enum GcPhase {
+    /// Mark unreferenced blobs condemned; deletes nothing.
+    Condemn,
+    /// Delete blobs whose condemnation is at least --fence old and unrescued.
+    Collect,
 }
 
 fn parse_grace(s: &str) -> Result<std::time::Duration, String> {
     leep_derive::gc::parse_duration(s).map_err(|e| e.to_string())
 }
 
-async fn run_gc(meta: &str, blobs: &str, opts: leep_derive::gc::GcOptions) -> anyhow::Result<()> {
+async fn run_gc(
+    meta: &str,
+    blobs: &str,
+    phase: Option<GcPhase>,
+    opts: leep_derive::gc::GcOptions,
+) -> anyhow::Result<()> {
+    use leep_derive::gc;
     let blobs = leep_store::open_blob_store(blobs).context("opening blob store")?;
     let meta = leep_meta::open_meta_store(meta)
         .await
         .context("opening meta store")?;
+    let repo = Repo::new(blobs, meta);
+    let clock = gc::SystemClock;
     let dry = opts.dry_run;
-    let r = leep_derive::gc::run(&Repo::new(blobs, meta), &opts).await?;
-    let verb = if dry { "would delete" } else { "deleted" };
-    println!("changesets scanned: {}", r.changesets_scanned);
-    println!("referenced blobs and trees: {}", r.marked);
-    println!("blobs scanned: {}", r.blobs_scanned);
-    println!("{verb}: {} blobs, {} bytes", r.deleted, r.deleted_bytes);
-    println!("kept (within grace): {}", r.kept_by_grace);
-    println!("kept (unknown age): {}", r.kept_unknown_mtime);
-    println!("kept (recently claimed): {}", r.kept_by_claim);
+    let (condemn, collect) = match phase {
+        Some(GcPhase::Condemn) => (Some(gc::condemn(&repo, &opts, &clock).await?), None),
+        Some(GcPhase::Collect) => (None, Some(gc::collect(&repo, &opts, &clock).await?)),
+        None => {
+            if !dry {
+                tracing::info!(fence = ?opts.fence, "condemning, then waiting out the fence");
+            }
+            let r = gc::run(&repo, &opts, &clock).await?;
+            (Some(r.condemn), (!dry).then_some(r.collect))
+        }
+    };
+    if let Some(r) = condemn {
+        let verb = if dry { "would condemn" } else { "condemned" };
+        println!("changesets scanned: {}", r.changesets_scanned);
+        println!("referenced blobs and trees: {}", r.marked);
+        println!("blobs scanned: {}", r.blobs_scanned);
+        println!("{verb}: {} blobs, {} bytes", r.condemned, r.condemned_bytes);
+        println!("already condemned: {}", r.already_condemned);
+        println!("kept (within grace): {}", r.kept_by_grace);
+        println!("kept (unknown age): {}", r.kept_unknown_mtime);
+        println!("kept (recently claimed): {}", r.kept_by_claim);
+    }
+    if let Some(r) = collect {
+        let verb = if dry { "would delete" } else { "deleted" };
+        println!("collect: condemnations examined: {}", r.condemned);
+        println!("collect: newer than fence, left alone: {}", r.fence_pending);
+        println!("collect: rescued by upload claim: {}", r.rescued_by_claim);
+        println!("collect: rescued by reference: {}", r.rescued_by_reference);
+        println!("collect: rescued by newer write: {}", r.rescued_by_upload);
+        println!("{verb}: {} blobs, {} bytes", r.deleted, r.deleted_bytes);
+    }
     Ok(())
 }
 
@@ -226,11 +279,23 @@ async fn main() -> anyhow::Result<()> {
             .init(),
     }
     match args.command {
-        Some(Cmd::Gc { dry_run, grace }) => {
+        Some(Cmd::Gc {
+            phase,
+            dry_run,
+            grace,
+            fence,
+            unsafe_no_fence,
+        }) => {
             return run_gc(
                 &args.meta,
                 &args.blobs,
-                leep_derive::gc::GcOptions { grace, dry_run },
+                phase,
+                leep_derive::gc::GcOptions {
+                    grace,
+                    fence,
+                    unsafe_no_fence,
+                    dry_run,
+                },
             )
             .await
         }
@@ -299,7 +364,17 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!(refs = ?review_refs, "review required to land");
         repo = repo.with_land_policy(Arc::new(RequireReview::new(service.clone(), review_refs)));
     }
-    let app = leep_server::router_with_review(repo, args.max_body_bytes, auth, signing, review);
+    if args.request_timeout.is_zero() {
+        tracing::warn!("request timeout disabled: gc --fence cannot be guaranteed safe");
+    }
+    let app = leep_server::router_with_timeout(
+        repo,
+        args.max_body_bytes,
+        auth,
+        signing,
+        review,
+        args.request_timeout,
+    );
 
     let listener = tokio::net::TcpListener::bind(args.listen)
         .await

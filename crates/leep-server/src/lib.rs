@@ -8,6 +8,7 @@ pub mod signing;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
@@ -22,9 +23,15 @@ use leep_derive::{ExtraMatch, LogFilter, Repo};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use tower_http::limit::RequestBodyLimitLayer;
+use tower_http::timeout::TimeoutLayer;
 
 /// Default cap on request bodies (blob uploads), in bytes.
 pub const DEFAULT_MAX_BODY_BYTES: usize = 512 * 1024 * 1024;
+
+/// Default cap on how long one request may run. Garbage collection's fence
+/// must exceed it (ADR 0012): a request that checked a blob before it was
+/// condemned has stored its changeset or been aborted by then.
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 const DEFAULT_LOG_LIMIT: usize = 100;
 /// Upper bound on `limit` so one request can't walk unbounded history.
@@ -70,6 +77,27 @@ pub fn router_with_review(
     auth: Option<auth::Auth>,
     signing: Option<Arc<signing::SigningKeys>>,
     review: Option<Arc<review::ReviewService>>,
+) -> Router {
+    router_with_timeout(
+        repo,
+        max_body_bytes,
+        auth,
+        signing,
+        review,
+        DEFAULT_REQUEST_TIMEOUT,
+    )
+}
+
+/// Like [`router_with_review`], aborting any request that runs longer than
+/// `request_timeout` with 408. Zero disables the bound, which also disables
+/// the guarantee garbage collection's fence relies on.
+pub fn router_with_timeout(
+    repo: Repo,
+    max_body_bytes: usize,
+    auth: Option<auth::Auth>,
+    signing: Option<Arc<signing::SigningKeys>>,
+    review: Option<Arc<review::ReviewService>>,
+    request_timeout: Duration,
 ) -> Router {
     let review = review.or_else(|| {
         auth.as_ref().map(|a| {
@@ -118,9 +146,18 @@ pub fn router_with_review(
         )),
         None => router,
     };
-    router
+    let router = router
         .layer(DefaultBodyLimit::disable())
-        .layer(RequestBodyLimitLayer::new(max_body_bytes))
+        .layer(RequestBodyLimitLayer::new(max_body_bytes));
+    let router = if request_timeout.is_zero() {
+        router
+    } else {
+        router.layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            request_timeout,
+        ))
+    };
+    router
         .layer(observe::trace_layer())
         .layer(middleware::from_fn(observe::track_metrics))
         .with_state(Arc::new(repo))
@@ -255,7 +292,7 @@ async fn put_blob(State(repo): S, Path(h): Path<String>, body: Bytes) -> ApiResu
     if Hash::of_blob(&body) != h {
         return Err(Error::Invalid(format!("body does not hash to {h}")).into());
     }
-    repo.blobs().put(body).await?;
+    repo.put_blob(body).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
