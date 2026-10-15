@@ -176,15 +176,19 @@ pub fn definitions() -> Vec<Value> {
         tool(
             "leep_log",
             "Show history",
-            "Show history newest first, optionally only changes that touched one path. Each entry has \
-             id, author, message and `agent` metadata (model, session, prompt, tests) when an agent \
-             made the change.",
+            "Show history newest first. Filters (all optional, combined with AND): a path the \
+             change touched, author text, agent model, agent session. Each entry has id, author, \
+             message and `agent` metadata (model, session, prompt, tests) when an agent made the \
+             change.",
             json!({
                 "type": "object",
                 "properties": {
                     "rev": { "type": "string", "description": REV_DOC },
                     "path": { "type": "string", "description": "Only changesets that touched this file path." },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 200, "description": "Max entries (default 20)." }
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 200, "description": "Max matching entries (default 20)." },
+                    "author": { "type": "string", "description": "Only changesets whose author contains this text (case-insensitive)." },
+                    "agent_model": { "type": "string", "description": "Only changesets made by this agent model (exact match on agent.model)." },
+                    "agent_session": { "type": "string", "description": "Only changesets from this agent session (exact match on agent.session)." }
                 },
                 "additionalProperties": false
             }),
