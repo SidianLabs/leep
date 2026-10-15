@@ -3,6 +3,7 @@
 
 pub mod auth;
 pub mod observe;
+pub mod review;
 pub mod signing;
 
 use std::collections::BTreeMap;
@@ -56,6 +57,28 @@ pub fn router_with_signing(
     auth: Option<auth::Auth>,
     signing: Option<Arc<signing::SigningKeys>>,
 ) -> Router {
+    router_with_review(repo, max_body_bytes, auth, signing, None)
+}
+
+/// Like [`router_with_signing`], plus the review service behind the review
+/// endpoints. Reviews need authentication: without `auth` all three endpoints
+/// are a 400. With `auth` and no service, a default one (no auto rules) is
+/// built from the tokens. The land policy is set on `repo`, not here.
+pub fn router_with_review(
+    repo: Repo,
+    max_body_bytes: usize,
+    auth: Option<auth::Auth>,
+    signing: Option<Arc<signing::SigningKeys>>,
+    review: Option<Arc<review::ReviewService>>,
+) -> Router {
+    let review = review.or_else(|| {
+        auth.as_ref().map(|a| {
+            Arc::new(review::ReviewService::new(
+                a.reviewers(),
+                leep_derive::review::ReviewRules::default(),
+            ))
+        })
+    });
     let router = Router::new()
         .route("/v1/health", get(health))
         .route("/v1/blobs/missing", post(missing_blobs))
@@ -66,6 +89,11 @@ pub fn router_with_signing(
             "/v1/changesets/{id}/signatures",
             get(get_signatures).post(add_signature),
         )
+        .route(
+            "/v1/changesets/{id}/reviews",
+            get(get_reviews).post(add_review),
+        )
+        .route("/v1/changesets/{id}/review-status", get(review_status))
         .route("/v1/refs", get(list_refs))
         .route("/v1/refs/{*name}", get(get_ref).post(cas_ref))
         .route("/v1/resolve/{*rev}", get(resolve))
@@ -80,7 +108,8 @@ pub fn router_with_signing(
         .route("/v1/merge", post(merge))
         .route("/v1/rebase", post(rebase))
         .route("/v1/land", post(land))
-        .layer(Extension(signing));
+        .layer(Extension(signing))
+        .layer(Extension(review));
     // Innermost, so a rejected request never has its body read.
     let router = match auth {
         Some(a) => router.layer(middleware::from_fn_with_state(
@@ -315,6 +344,69 @@ async fn get_signatures(
         },
     };
     Ok(Json(resp))
+}
+
+type Reviews = Extension<Option<Arc<review::ReviewService>>>;
+
+const NEEDS_AUTH: &str = "reviews need authentication (start the server with --tokens-file)";
+
+#[derive(Deserialize)]
+struct StatusQuery {
+    #[serde(rename = "ref")]
+    target_ref: Option<String>,
+}
+
+async fn add_review(
+    State(repo): S,
+    auth::MaybePrincipal(who): auth::MaybePrincipal,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> ApiResult<Json<AddReviewResponse>> {
+    let id = cid(&id)?;
+    let req: AddReviewRequest = parse_json(&body)?;
+    repo.get_changeset(id).await?;
+    let who = who.ok_or_else(|| Error::Invalid(NEEDS_AUTH.into()))?;
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    repo.put_review(
+        id,
+        &leep_core::review::Review {
+            reviewer: who.name.clone(),
+            verdict: req.verdict,
+            comment: req.comment,
+            timestamp,
+        },
+    )
+    .await?;
+    Ok(Json(AddReviewResponse {
+        reviewer: who.name,
+        verdict: req.verdict,
+    }))
+}
+
+async fn get_reviews(
+    State(repo): S,
+    Extension(service): Reviews,
+    Path(id): Path<String>,
+) -> ApiResult<Json<ReviewsResponse>> {
+    let id = cid(&id)?;
+    repo.get_changeset(id).await?;
+    let service = service.ok_or_else(|| Error::Invalid(NEEDS_AUTH.into()))?;
+    Ok(Json(service.describe(&repo, id).await?))
+}
+
+async fn review_status(
+    State(repo): S,
+    Extension(service): Reviews,
+    Path(id): Path<String>,
+    Query(q): Query<StatusQuery>,
+) -> ApiResult<Json<ReviewStatusResponse>> {
+    let id = cid(&id)?;
+    repo.get_changeset(id).await?;
+    let service = service.ok_or_else(|| Error::Invalid(NEEDS_AUTH.into()))?;
+    let target = q.target_ref.unwrap_or_else(|| "main".into());
+    Ok(Json(service.status(&repo, id, &target).await?))
 }
 
 async fn list_refs(State(repo): S) -> ApiResult<Json<RefsResponse>> {
