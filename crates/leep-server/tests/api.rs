@@ -934,3 +934,99 @@ async fn search_sees_each_revision() {
     assert_eq!(old.matches.len(), 1);
     assert!(new.matches.is_empty());
 }
+
+fn cas(expected: Option<ChangesetId>, new: Option<ChangesetId>) -> CasRefRequest {
+    CasRefRequest { expected, new }
+}
+
+#[tokio::test]
+async fn ref_writes_validate_names() {
+    let c = Client::new();
+    let a = c.commit(&[], &[("a", Some("1"))], "a").await;
+    for bad in ["a..b", "x.lock", "-x", "a%20b", "a%3Ab", "a//b", "a%5Eb"] {
+        let r = c
+            .post(&format!("/v1/refs/{bad}"), &cas(None, Some(a)))
+            .await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{bad}");
+        let r = c
+            .post(
+                "/v1/land",
+                &LandRequest {
+                    changeset: a,
+                    target_ref: bad
+                        .replace("%20", " ")
+                        .replace("%3A", ":")
+                        .replace("%5E", "^"),
+                },
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "land {bad}");
+    }
+    let r = c.post("/v1/refs/a..b", &cas(None, Some(a))).await;
+    let msg = r.json::<ErrorResponse>().error;
+    assert!(msg.contains("invalid ref name"), "{msg}");
+    assert!(c
+        .get("/v1/refs")
+        .await
+        .json::<RefsResponse>()
+        .refs
+        .is_empty());
+    // Valid names, including nested ones, keep working.
+    c.set_ref("release/1.0", a).await;
+    c.set_ref("feature/x-1", a).await;
+}
+
+#[tokio::test]
+async fn tags_are_created_and_deleted_but_never_moved() {
+    let c = Client::new();
+    let a = c.commit(&[], &[("a", Some("1"))], "a").await;
+    let b = c.commit(&[a], &[("a", Some("2"))], "b").await;
+    c.set_ref("tags/v1", a).await;
+
+    let r = c.post("/v1/refs/tags/v1", &cas(Some(a), Some(b))).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert!(r.json::<ErrorResponse>().error.contains("immutable"));
+    let r = c.post("/v1/refs/tags/v1", &cas(None, Some(b))).await;
+    assert_eq!(r.status, StatusCode::CONFLICT);
+    let t: RefResponse = c.get("/v1/refs/tags/v1").await.json();
+    assert_eq!(t.target, Some(a));
+
+    // Land refuses tags, even when the ref does not exist yet.
+    for name in ["tags/v1", "tags/v2"] {
+        let r = c
+            .post(
+                "/v1/land",
+                &LandRequest {
+                    changeset: b,
+                    target_ref: name.into(),
+                },
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{name}");
+    }
+
+    // A tag resolves by full ref and by short name; a branch of that name wins.
+    assert_eq!(
+        c.get("/v1/resolve/tags/v1")
+            .await
+            .json::<ResolveResponse>()
+            .id,
+        a
+    );
+    assert_eq!(
+        c.get("/v1/resolve/v1").await.json::<ResolveResponse>().id,
+        a
+    );
+    c.set_ref("v1", b).await;
+    assert_eq!(
+        c.get("/v1/resolve/v1").await.json::<ResolveResponse>().id,
+        b
+    );
+
+    // Deleting and recreating is how a tag changes.
+    let r = c.post("/v1/refs/tags/v1", &cas(Some(a), None)).await;
+    assert_eq!(r.status, StatusCode::OK);
+    c.set_ref("tags/v1", b).await;
+    let refs: RefsResponse = c.get("/v1/refs").await.json();
+    assert_eq!(refs.refs["tags/v1"], b);
+}
