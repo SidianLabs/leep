@@ -71,6 +71,9 @@ names or tool-generated names.
   plan (see docs/FORMATS.md).
   ```
 - Keep PRs small and single-purpose. Split refactors from behavior changes.
+- Add a line under `[Unreleased]` in `CHANGELOG.md` for any change a user or
+  operator would notice. Never move entries into a version section: that
+  happens only when the maintainer cuts a release.
 - CI (fmt, clippy `-D warnings`, tests) must be green before review.
 - Merge with **squash merge**. Delete the branch after merging.
 - No AI attribution in the title, body or comments (see the top of this skill).

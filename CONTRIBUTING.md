@@ -13,4 +13,8 @@
 AI agents working on this repo: follow [CLAUDE.md](CLAUDE.md) and the skills
 in `.claude/skills/`.
 
-Licensed under Apache-2.0.
+Notable changes go under `[Unreleased]` in [CHANGELOG.md](CHANGELOG.md)
+in the same PR. Report security problems privately as described in
+[SECURITY.md](SECURITY.md).
+
+Licensed under Apache-2.0; see [LICENSE](LICENSE).

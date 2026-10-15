@@ -47,4 +47,6 @@ See [docs/DEPLOY.md](docs/DEPLOY.md) for the Postgres compose stack and S3 stora
 
 ## License
 
-Apache-2.0
+Apache-2.0; see [LICENSE](LICENSE). To report a security problem, see
+[SECURITY.md](SECURITY.md). Changes are recorded in
+[CHANGELOG.md](CHANGELOG.md).
