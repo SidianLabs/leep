@@ -162,6 +162,27 @@ fn health_ok(addr: SocketAddr) -> bool {
     body.starts_with("HTTP/1.1 200") && body.contains("ok")
 }
 
+/// POST a JSON body straight to the server, for requests the CLI never
+/// makes. Returns the status code and the response body.
+pub fn post_json(addr: SocketAddr, path: &str, body: &str) -> (u16, String) {
+    let mut s = TcpStream::connect(addr).expect("connect");
+    let req = format!(
+        "POST {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    s.write_all(req.as_bytes()).unwrap();
+    let mut resp = String::new();
+    s.read_to_string(&mut resp).unwrap();
+    let status = resp.split_whitespace().nth(1).unwrap().parse().unwrap();
+    let body = resp
+        .split("\r\n\r\n")
+        .nth(1)
+        .unwrap_or_default()
+        .to_string();
+    (status, body)
+}
+
 /// Settings for the `leep` client shared by every working copy of a test.
 #[derive(Clone)]
 pub struct Client {

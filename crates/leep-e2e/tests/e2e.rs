@@ -1152,3 +1152,117 @@ fn code_search_over_the_real_binaries() {
     let v = client.json(&wc, &["search", "--rev", &first_id, "// run"]);
     assert!(v["matches"].as_array().unwrap().is_empty());
 }
+
+fn run_branch_and_tag_workflow(stores: &Stores, work: &Path) {
+    let server = Server::start(stores, work);
+    let client = Client::new(&server.url, &work.join("cache"));
+    let wc = work.join("wc");
+    client.ok(work, &["init", wc.to_str().unwrap()]);
+    let refs = |dir: &Path| client.json(dir, &["refs"])["refs"].clone();
+
+    write(&wc, "a.txt", "one\n");
+    client.ok(&wc, &["commit", "-m", "one"]);
+    client.ok(&wc, &["land"]);
+    let main_head = refs(&wc)["main"].as_str().unwrap().to_string();
+
+    // Create a branch at the base and switch to it.
+    client.ok(&wc, &["branch", "feature"]);
+    let again = client.run(&wc, &["branch", "feature"]);
+    assert_eq!(again.status.code(), Some(1));
+    assert!(stderr(&again).contains("branch feature already exists"));
+    let listing = client.ok(&wc, &["branch"]);
+    assert!(listing.contains("* main "), "{listing}");
+    assert!(listing.contains("  feature "), "{listing}");
+    client.ok(&wc, &["switch", "feature"]);
+    assert!(client.ok(&wc, &["status"]).contains("target feature"));
+    assert!(client.ok(&wc, &["branch"]).contains("* feature "));
+
+    // A dirty working copy cannot switch.
+    write(&wc, "scratch.txt", "x\n");
+    let dirty = client.run(&wc, &["switch", "main"]);
+    assert_eq!(dirty.status.code(), Some(1));
+    assert!(stderr(&dirty).contains("uncommitted"), "{}", stderr(&dirty));
+    fs::remove_file(wc.join("scratch.txt")).unwrap();
+
+    // Commit and land go to the branch; main does not move.
+    write(&wc, "b.txt", "on feature\n");
+    client.ok(&wc, &["commit", "-m", "feature work"]);
+    client.ok(&wc, &["land"]);
+    let now = refs(&wc);
+    assert_eq!(now["main"], main_head.as_str());
+    assert_ne!(now["feature"], main_head.as_str());
+
+    // Back on main, the unmerged branch is protected from `-d`.
+    client.ok(&wc, &["switch", "main"]);
+    assert!(!wc.join("b.txt").exists());
+    let out = client.run(&wc, &["branch", "-d", "feature"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        stderr(&out).contains("not fully merged"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(stderr(&out).contains("-D"));
+    assert!(refs(&wc).get("feature").is_some());
+    // A branch already in main's history deletes normally.
+    client.ok(&wc, &["branch", "merged"]);
+    client.ok(&wc, &["branch", "-d", "merged"]);
+    assert!(refs(&wc).get("merged").is_none());
+    // The target branch itself is never deleted.
+    let out = client.run(&wc, &["branch", "-D", "main"]);
+    assert_eq!(out.status.code(), Some(1));
+    // `switch -c` creates and switches in one step.
+    client.ok(&wc, &["switch", "-c", "topic"]);
+    assert!(client.ok(&wc, &["status"]).contains("target topic"));
+    client.ok(&wc, &["switch", "main"]);
+    client.ok(&wc, &["branch", "-D", "topic"]);
+    client.ok(&wc, &["branch", "-D", "feature"]);
+    assert!(refs(&wc).get("feature").is_none());
+
+    // Tags: created once, listed by short name, resolvable, never moved.
+    client.ok(&wc, &["tag", "v1"]);
+    assert_eq!(refs(&wc)["tags/v1"], main_head.as_str());
+    assert!(client.ok(&wc, &["tag"]).starts_with("v1 "));
+    assert!(!client.ok(&wc, &["branch"]).contains("v1"));
+    assert!(client.ok(&wc, &["log", "tags/v1"]).contains("one"));
+    assert!(client.ok(&wc, &["log", "v1"]).contains("one"));
+    let out = client.run(&wc, &["tag", "v1"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stderr(&out).contains("already exists"), "{}", stderr(&out));
+
+    // The server enforces it for raw API callers too.
+    let other = "00".repeat(32);
+    let body = format!(r#"{{"expected":"{main_head}","new":"{other}"}}"#);
+    let (status, text) = post_json(server.addr, "/v1/refs/tags/v1", &body);
+    assert_eq!(status, 400, "{text}");
+    assert!(text.contains("immutable"), "{text}");
+    let body = format!(r#"{{"changeset":"{main_head}","target_ref":"tags/v1"}}"#);
+    assert_eq!(post_json(server.addr, "/v1/land", &body).0, 400);
+    assert_eq!(refs(&wc)["tags/v1"], main_head.as_str());
+
+    // Delete, and the name is free again.
+    client.ok(&wc, &["tag", "-d", "v1"]);
+    assert!(refs(&wc).get("tags/v1").is_none());
+    assert_eq!(client.ok(&wc, &["tag"]), "");
+    let out = client.run(&wc, &["tag", "-d", "v1"]);
+    assert_eq!(out.status.code(), Some(1));
+}
+
+#[test]
+fn branches_switching_and_immutable_tags() {
+    let _g = serial();
+    let tmp = tempfile::tempdir().unwrap();
+    let stores = Stores::sqlite(&tmp.path().join("data"));
+    run_branch_and_tag_workflow(&stores, tmp.path());
+}
+
+#[test]
+fn branches_switching_and_immutable_tags_postgres() {
+    let _g = serial();
+    let Some(db) = PgDb::create() else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let stores = Stores::with_meta(&tmp.path().join("data"), db.url.clone());
+    run_branch_and_tag_workflow(&stores, tmp.path());
+}
