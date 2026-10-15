@@ -170,6 +170,40 @@ async fn empty_root_changeset_stores_empty_tree() {
     assert!(r.blobs().contains(&TreeNode::empty_hash()).await.unwrap());
 }
 
+/// Security review 2026-10, S-04: tree building is quadratic in path depth,
+/// so client paths are bounded before anything is built.
+#[tokio::test]
+async fn create_changeset_bounds_path_length_and_directories() {
+    let r = repo();
+    // Deep is fine as long as the path fits.
+    let deepest = vec!["d"; crate::repo::MAX_PATH_BYTES / 2].join("/");
+    let c = commit(&r, &[], &[(deepest.as_str(), Some("ok"))], "deep").await;
+    assert_eq!(text(&r, c, &deepest).await.as_deref(), Some("ok"));
+
+    let too_long = format!("a/{}", "b".repeat(crate::repo::MAX_PATH_BYTES));
+    let e = try_commit(&r, &[], &[(too_long.as_str(), Some("x"))], "m").await;
+    assert!(is_invalid(e), "longer than the limit");
+
+    // Paths that each stay within the limits but together name too much
+    // directory text: about 520 KiB of prefixes per path.
+    let blob = modify(&r, b"x").await;
+    let deep_dirs = |n: usize| -> BTreeMap<RepoPath, FileChange> {
+        (0..n)
+            .map(|i| {
+                let p = format!("{i:04}/{}/f", vec!["c".repeat(15); 250].join("/"));
+                (rp(&p), blob.clone())
+            })
+            .collect()
+    };
+    r.create_changeset(changeset(&[], deep_dirs(8), "fine"))
+        .await
+        .unwrap();
+    let e = r
+        .create_changeset(changeset(&[], deep_dirs(600), "m"))
+        .await;
+    assert!(is_invalid(e), "too much directory text in one changeset");
+}
+
 #[tokio::test]
 async fn create_changeset_validation() {
     let r = repo();
@@ -958,6 +992,27 @@ async fn land_race_twenty_tasks() {
     assert_eq!(log[0].generation, 21);
 }
 
+/// Security review 2026-10, S-05: a rewrite of a large file used to make one
+/// blame request spend minutes in a quadratic diff that no timeout could stop.
+#[tokio::test]
+async fn blame_of_a_pathological_rewrite_is_bounded() {
+    let r = repo();
+    let n = 40_000;
+    let old: String = (0..n).map(|i| format!("old {i}\n")).collect();
+    let new: String = (0..n).map(|i| format!("new {i}\n")).collect();
+    let c1 = commit(&r, &[], &[("big.txt", Some(&old))], "c1").await;
+    let c2 = commit(&r, &[c1], &[("big.txt", Some(&new))], "c2").await;
+    let started = std::time::Instant::now();
+    let b = r.blame(c2, &rp("big.txt")).await.unwrap();
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(30),
+        "blame took {:?}",
+        started.elapsed()
+    );
+    assert_eq!(b.lines.len(), n);
+    assert!(b.lines.iter().all(|l| l.text.starts_with("new ")));
+}
+
 #[tokio::test]
 async fn blame_attributes_lines() {
     let r = repo();
@@ -1741,6 +1796,55 @@ mod land_policy {
         assert_eq!(r.meta().get_ref("scratch").await.unwrap(), None);
     }
 
+    /// Security review 2026-10, S-09: a protected ref only moves forward, so
+    /// no raw swap or undo can drop signed or reviewed history.
+    #[tokio::test]
+    async fn protected_refs_only_move_forward() {
+        let r = guarded();
+        let a = commit(&r, &[], &[("a", Some("1\n"))], "a").await;
+        let b = commit(&r, &[a], &[("a", Some("2\n"))], "b").await;
+        let side = commit(&r, &[a], &[("a", Some("3\n"))], "side").await;
+        for id in [a, b, side] {
+            sign(&r, id).await;
+        }
+        // Creating and fast-forwarding are fine.
+        assert!(r
+            .cas_ref_checked("main", None, Some(a), &cas_ctx())
+            .await
+            .unwrap());
+        assert!(r
+            .cas_ref_checked("main", Some(a), Some(b), &cas_ctx())
+            .await
+            .unwrap());
+        // Back to an ancestor, or across to a sibling, is refused.
+        for to in [a, side] {
+            match r
+                .cas_ref_checked("main", Some(b), Some(to), &cas_ctx())
+                .await
+            {
+                Err(Error::Invalid(m)) => {
+                    assert!(m.contains(leep_core::refname::NOT_FORWARD_MARKER), "{m}")
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        assert_eq!(r.meta().get_ref("main").await.unwrap(), Some(b));
+        assert_eq!(r.meta().ref_log(None, None, 10).await.unwrap().len(), 2);
+        // Unprotected refs still move anywhere.
+        assert!(r
+            .cas_ref_checked("scratch", None, Some(b), &cas_ctx())
+            .await
+            .unwrap());
+        assert!(r
+            .cas_ref_checked("scratch", Some(b), Some(a), &cas_ctx())
+            .await
+            .unwrap());
+        assert!(r
+            .cas_ref_checked("scratch", Some(a), Some(side), &cas_ctx())
+            .await
+            .unwrap());
+    }
+
     #[tokio::test]
     async fn refused_moves_record_nothing() {
         let r = guarded();
@@ -2284,6 +2388,100 @@ mod review {
             .unwrap();
         let s = status(&r, Some(base), &none, m2, &[]).await;
         assert_eq!(rule_of(&s, "b.rs"), PathRule::Pending);
+    }
+
+    /// Security review 2026-10, S-07: `docs/**` must not auto-approve
+    /// `docs/OWNERS`, and no content rule applies to an `OWNERS` file.
+    #[tokio::test]
+    async fn owners_files_are_never_auto_approved() {
+        let r = repo();
+        let head = commit(
+            &r,
+            &[],
+            &[("docs/OWNERS", Some("alice\n")), ("docs/a.md", Some("a\n"))],
+            "h",
+        )
+        .await;
+        let rules = ReviewRules::new(
+            [
+                AutoRule::DocsOnly,
+                AutoRule::WhitespaceOnly,
+                AutoRule::CommentOnly,
+            ],
+            &["docs/**".into()],
+        )
+        .unwrap();
+        let c = commit(
+            &r,
+            &[head],
+            &[
+                ("docs/OWNERS", Some("alice\nmallory\n")),
+                ("docs/a.md", Some("b\n")),
+            ],
+            "c",
+        )
+        .await;
+        let s = status(&r, Some(head), &rules, c, &[]).await;
+        assert_eq!(rule_of(&s, "docs/OWNERS"), PathRule::Pending);
+        assert_eq!(rule_of(&s, "docs/a.md"), PathRule::Auto(AutoRule::DocsOnly));
+        let ws = commit(&r, &[head], &[("docs/OWNERS", Some("alice  \n"))], "w").await;
+        let s = status(&r, Some(head), &rules, ws, &[]).await;
+        assert_eq!(rule_of(&s, "docs/OWNERS"), PathRule::Pending);
+    }
+
+    /// Taking a side's version is covered only where the first parent left
+    /// the path as it was at the merge base (security review 2026-10, S-01).
+    #[tokio::test]
+    async fn merge_parent_does_not_cover_discarding_the_first_parents_change() {
+        let r = repo();
+        let base = commit(
+            &r,
+            &[],
+            &[("a.rs", Some("old\n")), ("b.rs", Some("1\n"))],
+            "base",
+        )
+        .await;
+        let ours = commit(&r, &[base], &[("a.rs", Some("fixed\n"))], "ours").await;
+        let theirs = commit(&r, &[base], &[("b.rs", Some("2\n"))], "theirs").await;
+        let none = ReviewRules::default();
+        // Their a.rs is the base's: taking it undoes ours.
+        let m = commit(
+            &r,
+            &[ours, theirs],
+            &[("a.rs", Some("old\n")), ("b.rs", Some("2\n"))],
+            "m",
+        )
+        .await;
+        let s = status(&r, Some(ours), &none, m, &[]).await;
+        assert_eq!(rule_of(&s, "a.rs"), PathRule::Pending);
+        assert_eq!(rule_of(&s, "b.rs"), PathRule::MergeParent);
+        // The side is an ancestor of the first parent.
+        let m = commit(&r, &[ours, base], &[("a.rs", Some("old\n"))], "m").await;
+        let s = status(&r, Some(ours), &none, m, &[]).await;
+        assert_eq!(rule_of(&s, "a.rs"), PathRule::Pending);
+        // Deleting a file ours added since the base is not covered either.
+        let added = commit(&r, &[base], &[("n.rs", Some("n\n"))], "added").await;
+        let m = commit(&r, &[added, theirs], &[("n.rs", None)], "m").await;
+        let s = status(&r, Some(added), &none, m, &[]).await;
+        assert_eq!(rule_of(&s, "n.rs"), PathRule::Pending);
+        // Unrelated histories: a side's new file is covered, replacing ours is not.
+        let other = commit(
+            &r,
+            &[],
+            &[("x.rs", Some("x\n")), ("a.rs", Some("other\n"))],
+            "o",
+        )
+        .await;
+        let m = commit(
+            &r,
+            &[ours, other],
+            &[("x.rs", Some("x\n")), ("a.rs", Some("other\n"))],
+            "m",
+        )
+        .await;
+        let s = status(&r, Some(ours), &none, m, &[]).await;
+        assert_eq!(rule_of(&s, "x.rs"), PathRule::MergeParent);
+        assert_eq!(rule_of(&s, "a.rs"), PathRule::Pending);
     }
 
     #[tokio::test]

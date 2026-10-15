@@ -182,3 +182,12 @@ steps back.
   must be upgraded before the first condemn.
 - Operators run `gc` from cron as before; the command now takes at least
   `--fence` to finish, or run `condemn` and `collect` as two scheduled jobs.
+
+## Security review 2026-10
+See [SECURITY-REVIEW.md](../SECURITY-REVIEW.md). No request can make GC
+delete a reachable blob: claims only keep blobs, rescues are written only by
+uploads of the exact bytes, condemned blobs are refused in changesets, and
+derived indexes live in metadata, not the blob store. No client can block a
+collect; an upload waits at most 30 s and then gets 409. Read tokens can
+write claims through `POST /v1/blobs/missing` and so keep known orphans for
+as long as they keep asking (S-11, accepted; see ADR 0007's note).

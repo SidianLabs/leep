@@ -158,6 +158,41 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 - Fixed: a `gc collect` killed after deleting a blob but before recording it
   could leave that blob hash answering 409 to uploads until it was
   re-condemned; the next collect now closes the stale delete announcement.
+- Security review (`docs/SECURITY-REVIEW.md`). The fixes below each have a
+  regression test; accepted and deferred findings are noted in their ADRs.
+- Review: a merge path counts as `merge_parent` only where the first parent
+  left it as it was at the merge base. Before, a hand-made merge with an old
+  commit as its side parent could restore an owned file's old content (undo a
+  fix) without owner approval.
+- Review: `comment_only` now gives up on string interpolation that can nest
+  quotes (Python f-strings, C#, Kotlin, Scala, Swift, Ruby, shell), C line
+  splices and trigraphs, Java and Scala `\u` escapes, shell `#` after an
+  operator, Ruby and Perl `#` without a blank before it, Ruby `=begin`, Perl
+  POD, JavaScript HTML-like comments, cgo preambles and more; each let a code
+  change pass as a comment change. Rust doc comments count as code, since
+  their examples run as doctests. No auto rule applies to an `OWNERS` file,
+  even under a docs glob.
+- CLI: checkout, sync, restore, merge and land refuse to write a repository
+  path with a `.leep` or `.git` component (in any case or spelling the
+  filesystem treats as the same) or through a directory that is a symbolic
+  link, so a crafted tree or a malicious server cannot write outside the
+  working copy, plant git hooks or replace `.leep/config.json`.
+- Behavior change: a ref that `--require-signatures` or `--require-review`
+  protects now only moves forward. `POST /v1/refs/{name}` refuses (400, `only
+  moves forward`) a move to a changeset that does not descend from the
+  current value, so `leep undo` of a land on a protected ref is refused and
+  suggests `leep revert` and landing the revert instead. Before, any writer
+  could rewind a protected ref and drop reviewed or signed commits, such as a
+  security fix, without review. Unprotected refs are unaffected.
+- `POST /v1/changesets` refuses (400) a path over 4096 bytes, or paths that
+  together name over a million directories or 256 MiB of directory names;
+  one request with a very deep path could exhaust the server's memory.
+- `blame` bounds each line diff to 500 ms, so blaming a file whose versions
+  share nothing no longer occupies a server worker for minutes.
+- The server refuses to start when `--require-review`,
+  `--require-signatures` or the review policy's `refs` name an invalid ref
+  (such as `release` with a leading space from a comma-separated variable),
+  which protected nothing, and warns about protected refs that do not exist.
 
 ### Project
 - Workspace version set to 0.0.1, with a CI check that keeps it below

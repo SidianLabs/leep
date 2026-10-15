@@ -113,3 +113,17 @@ list asks for size, rate and concurrency limits per token.
   authentication cheaply); use the proxy.
 - Retries add up to about 30 seconds of waiting to a throttled `leep` read
   before it fails.
+
+## Security review 2026-10
+See [SECURITY-REVIEW.md](../SECURITY-REVIEW.md).
+- The request timeout drops a request's future, so it stops work only at an
+  await point. Synchronous CPU work runs to the end on its async worker.
+  `blame`'s line diff now has a 500 ms deadline (S-05, fixed); the
+  server-side text merge does not yet (S-10, deferred; ADR 0019).
+- A `log` filtered by `author` or `extra` walks history until it finds
+  `limit` matches, so a filter that matches nothing walks all of it. It awaits
+  storage between steps, so the timeout stops it, and these limits bound
+  repeats (S-13, accepted).
+- `POST /v1/changesets` refuses a path over 4096 bytes, or paths naming over
+  a million directories or 256 MiB of directory names, because building the
+  tree needs memory quadratic in path depth (S-04, fixed).

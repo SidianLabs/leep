@@ -43,3 +43,19 @@ write, without committing to an identity system yet.
 - Future work builds on the middleware seam: OIDC or JWT validation, mTLS,
   and per-directory ACLs evaluated against changeset paths (v0.3 review and
   ownership), plus signed changesets for provenance.
+
+## Security review 2026-10
+See [SECURITY-REVIEW.md](../SECURITY-REVIEW.md).
+- No change to authentication. Comparison is constant time over every entry;
+  only `GET`, `HEAD` and exactly `POST /v1/blobs/missing` count as reads, so
+  every newer mutating route (reviews, signatures, ref CAS, merge, rebase,
+  land) needs `write`, and an unusual path spelling can only be classified as
+  a write.
+- `POST /v1/blobs/missing` does not "only query": it records a claim per
+  present blob (ADR 0008), and a read token may call it. A read token holder
+  can therefore keep known orphan blobs from being condemned for as long as
+  they keep asking, at one metadata write per hash. This costs storage, never
+  data, and is accepted (S-11). `--read-max-body-bytes` bounds the writes per
+  request.
+- The metrics listener is unauthenticated, and per-token limit metrics carry
+  token names (not tokens). Keep it on a private address.

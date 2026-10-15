@@ -124,3 +124,16 @@ git user does in a normal day can be built from those pieces and the existing
 - With a sparse checkout the snapshot contains only in-scope paths, and
   results that touch paths outside the checkout are refused rather than
   half-applied.
+
+## Security review 2026-10
+See [SECURITY-REVIEW.md](../SECURITY-REVIEW.md), S-02 (fixed). Every write
+and delete of a repository path now goes through `WorkCopy::abs_for_write`.
+It refuses a path with a `.leep` or `.git` component in any spelling the
+filesystem folds together (case, HFS+ ignorable code points, Windows trailing
+dots and spaces, 8.3 short names), on Windows also `\`, `:` and device names,
+and a path whose directory on disk is a symbolic link, checked right before
+each write. Before, a crafted tree on a case-insensitive filesystem, or any
+malicious server, could make a checkout write outside the working copy (for
+example through a symlink `A` and a file `a/...`), plant `.git/hooks`, or
+overwrite `.leep/config.json` with `--force`. The server still accepts these
+paths; the client is where files are written, so the check lives there.

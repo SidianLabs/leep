@@ -109,3 +109,17 @@ would rewrite every hash (FORMATS.md).
   invent attestations.
 - SIGHUP reload of the keys file (as for tokens).
 - Gate `leep-git` import by the same policy.
+
+## Security review 2026-10
+See [SECURITY-REVIEW.md](../SECURITY-REVIEW.md). No finding against signing
+itself: the message is domain-separated and bound to the changeset id,
+verification is strict, small-order keys fail startup, rows are re-verified
+on every read and land, and `rebased-origin-v1` never satisfies the policy.
+- The policy judges only what a move adds, so a rewind of a protected ref
+  needed no signature. Protected refs now only move forward (S-09, fixed;
+  see ADR 0011's note), which also overrides "Rewinds ... are not checked"
+  above: a rewind is refused outright.
+- Protected names are now checked at startup with the ref name rules, so a
+  typo or a stray space from `LEEP_REQUIRE_SIGNATURES` stops the server
+  instead of protecting nothing, and a protected name with no ref yet is
+  logged as a warning (S-06).

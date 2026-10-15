@@ -8,6 +8,7 @@
 
 use clap::Args;
 use leep_core::api::CasRefRequest;
+use leep_core::refname::NOT_FORWARD_MARKER;
 use leep_core::{ChangesetId, RefLogEntry};
 
 use super::{print_json, Remote};
@@ -130,15 +131,30 @@ pub fn undo(r: &Remote, args: &UndoArgs) -> Result<i32> {
             side(entry.old)
         )));
     }
-    let resp = r.client.cas_ref(
-        name,
-        &CasRefRequest {
-            expected: current,
-            new: entry.old,
-            operation: Some("undo".into()),
-            message: Some(format!("undo of {}", entry.seq)),
-        },
-    )?;
+    let resp = r
+        .client
+        .cas_ref(
+            name,
+            &CasRefRequest {
+                expected: current,
+                new: entry.old,
+                operation: Some("undo".into()),
+                message: Some(format!("undo of {}", entry.seq)),
+            },
+        )
+        .map_err(|e| match e {
+            // A protected ref never moves back, so the change has to be undone
+            // by a new change that goes through review and signing.
+            CliError::User(m) if m.contains(NOT_FORWARD_MARKER) => {
+                let undone = entry.new.map_or_else(|| "<id>".into(), |id| id.to_string());
+                CliError::User(format!(
+                    "{m}\n{name} is protected, so undo cannot move it back. Revert the change \
+                 instead: `leep revert {undone}` (once per changeset the move brought in), \
+                 then `leep land`, which goes through review and signing."
+                ))
+            }
+            e => e,
+        })?;
     if !resp.ok {
         return Err(CliError::user(format!(
             "{name} changed while undoing it (409 conflict, now {}); run `leep reflog {name}` \

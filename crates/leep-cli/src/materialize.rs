@@ -66,7 +66,7 @@ fn run(ctx: &mut Ctx, target: ChangesetId, force: bool) -> Result<Stats> {
         .cloned()
         .collect();
     for path in stale {
-        let abs = ctx.wc.abs(&path);
+        let abs = ctx.wc.abs_for_write(&path)?;
         match fs::remove_file(&abs) {
             Ok(()) => stats.removed += 1,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -82,7 +82,7 @@ fn run(ctx: &mut Ctx, target: ChangesetId, force: bool) -> Result<Stats> {
         if up_to_date && !dirty.contains(path) {
             continue;
         }
-        let abs = ctx.wc.abs(path);
+        let abs = ctx.wc.abs_for_write(path)?;
         let data = ctx.cache.fetch(&ctx.client, &info.content)?;
         if current.is_none() && !force {
             check_not_in_the_way(&abs, path, &info.content)?;

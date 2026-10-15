@@ -877,6 +877,113 @@ async fn merges_are_covered_by_their_side_parents() {
     assert_eq!(rules(&api.status(n).await), [("c", "pending")]);
 }
 
+/// Security review 2026-10, S-01: a hand-made merge whose side parent is an
+/// old commit could put back that commit's version of an owned file (say,
+/// undo a fix) as `merge_parent`, with no owner approval.
+#[tokio::test]
+async fn a_merge_cannot_launder_an_old_version_back_without_review() {
+    let api = Api::with(POLICY);
+    let old = api
+        .seed_main(&[
+            ("OWNERS", Some("alice\n")),
+            ("auth.rs", Some("fn check() -> bool { true }\n")),
+        ])
+        .await;
+    let fix = api
+        .commit(
+            &[old],
+            &[("auth.rs", Some("fn check() -> bool { verify() }\n"))],
+        )
+        .await;
+    api.approve(fix, "alice").await;
+    assert_eq!(api.land(fix, "bob").await.status, StatusCode::OK);
+
+    // Side parent already in main's history.
+    let undo = api
+        .commit(
+            &[fix, old],
+            &[("auth.rs", Some("fn check() -> bool { true }\n"))],
+        )
+        .await;
+    assert_eq!(rules(&api.status(undo).await), [("auth.rs", "pending")]);
+    let r = api.land(undo, "mallory").await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        r.error(),
+        needs_review(undo, "auth.rs", "needs approval from one of [alice]")
+    );
+
+    // Side parent built on the old commit, touching nothing owned by others.
+    let side = api.commit(&[old], &[("notes.txt", Some("hi\n"))]).await;
+    api.approve(side, "alice").await;
+    let undo = api
+        .commit(
+            &[fix, side],
+            &[
+                ("auth.rs", Some("fn check() -> bool { true }\n")),
+                ("notes.txt", Some("hi\n")),
+            ],
+        )
+        .await;
+    assert_eq!(
+        rules(&api.status(undo).await),
+        [("auth.rs", "pending"), ("notes.txt", "merge_parent")]
+    );
+    assert_eq!(
+        api.land(undo, "mallory").await.status,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(api.main_ref().await, Some(fix));
+}
+
+/// Security review 2026-10, S-09: rewinding a protected ref would drop a
+/// reviewed fix without review, so the server refuses any move that is not
+/// a fast-forward.
+#[tokio::test]
+async fn raw_ref_cas_cannot_rewind_a_protected_ref() {
+    let api = Api::with(POLICY);
+    let old = api
+        .seed_main(&[("OWNERS", Some("alice\n")), ("auth.rs", Some("weak\n"))])
+        .await;
+    let fix = api.commit(&[old], &[("auth.rs", Some("strong\n"))]).await;
+    api.approve(fix, "alice").await;
+    let cas = |expected, new| CasRefRequest {
+        expected: Some(expected),
+        new: Some(new),
+        operation: Some("undo".into()),
+        ..Default::default()
+    };
+    // A fast-forward through the raw endpoint is allowed.
+    let r = api.post("/v1/refs/main", "bob", &cas(old, fix)).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.error());
+    // Moving back is refused, by anyone.
+    for who in ["mallory", "alice"] {
+        let r = api.post("/v1/refs/main", who, &cas(fix, old)).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST);
+        assert!(
+            r.error().contains(leep_core::refname::NOT_FORWARD_MARKER),
+            "{}",
+            r.error()
+        );
+    }
+    assert_eq!(api.main_ref().await, Some(fix));
+    // Unprotected refs can still be rewound.
+    let r = api
+        .post(
+            "/v1/refs/scratch",
+            "bob",
+            &CasRefRequest {
+                expected: None,
+                new: Some(fix),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK);
+    let r = api.post("/v1/refs/scratch", "bob", &cas(fix, old)).await;
+    assert_eq!(r.status, StatusCode::OK);
+}
+
 #[tokio::test]
 async fn raw_ref_cas_cannot_skip_review() {
     let api = Api::with(POLICY);
@@ -1043,4 +1150,25 @@ fn server_refuses_to_start_with_bad_review_config() {
 
     let out = run(&["--review-policy-file", "/nonexistent/policy.json"]);
     assert!(!out.status.success());
+
+    // Security review 2026-10, S-06: a protected name no ref can have would
+    // protect nothing, so it stops startup.
+    let spaced = dir.path().join("spaced.json");
+    std::fs::write(&spaced, r#"{"refs":["main "]}"#).unwrap();
+    let out = run(&[
+        "--tokens-file",
+        tokens.to_str().unwrap(),
+        "--review-policy-file",
+        spaced.to_str().unwrap(),
+    ]);
+    assert!(!out.status.success());
+    assert!(msg(&out).contains("invalid ref name"), "{}", msg(&out));
+    let out = run(&[
+        "--tokens-file",
+        tokens.to_str().unwrap(),
+        "--require-review",
+        "refs//main",
+    ]);
+    assert!(!out.status.success());
+    assert!(msg(&out).contains("--require-review"), "{}", msg(&out));
 }

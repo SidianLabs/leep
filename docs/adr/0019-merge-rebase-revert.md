@@ -128,3 +128,12 @@ merge that stopped on conflicts, and an inverse of a change.
 - Limitations: no mainline revert, no merge in a rebased stack, no
   `--continue` for a rebase, and sparse checkouts refuse results that touch
   paths outside their prefixes rather than half-apply them.
+
+## Security review 2026-10
+See [SECURITY-REVIEW.md](../SECURITY-REVIEW.md). Deferred (S-10): the
+server's three-way text merge (`diffy`) is quadratic in differing lines (about
+25 s for two unrelated 40,000-line versions) and synchronous, so a write
+token can tie up a worker in `merge`, `rebase` or `land` for longer than the
+request timeout. Bounding it needs a deterministic cost limit; a wall-clock
+deadline would make merge results depend on server load. Per-token
+concurrency limits (ADR 0020) bound how many workers one token can hold.

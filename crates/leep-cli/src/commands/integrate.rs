@@ -77,7 +77,7 @@ pub fn abort(ctx: &mut Ctx, what: &str, added: &[String]) -> Result<i32> {
         .ok_or_else(|| CliError::user("the working copy has no base"))?;
     let discarded = status(&ctx.wc)?.entries.len();
     for p in added {
-        remove_file(&ctx.wc.root, &ctx.wc.abs(p))?;
+        remove_file(&ctx.wc.root, &ctx.wc.abs_for_write(p)?)?;
     }
     // Forced: edits made while resolving are what an abort throws away.
     materialize(ctx, base, true)?;

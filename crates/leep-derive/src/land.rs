@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use leep_core::api::{LandResponse, RebaseResponse};
-use leep_core::refname;
+use leep_core::refname::{self, NOT_FORWARD_MARKER};
 use leep_core::{ChangesetId, Error, RefUpdateContext, Result};
 
 use crate::Repo;
@@ -223,10 +223,11 @@ impl Repo {
     /// `MetaStore::cas_ref` for callers outside `land`, with the ref rules and
     /// land policy applied, so a raw ref update cannot skip them: names must
     /// be valid, a tag can be created or deleted but never moved, a ref a
-    /// policy protects cannot be deleted, and the policy checks what the ref
-    /// would gain. Rewinds of branches add nothing and are not checked. A
-    /// refused move records nothing in the ref log; `ctx` is stored with the
-    /// entry of one that happens.
+    /// policy protects cannot be deleted or moved anywhere but forward (a
+    /// rewind would drop reviewed or signed history without any review), and
+    /// the policy checks what the ref would gain. A refused move records
+    /// nothing in the ref log; `ctx` is stored with the entry of one that
+    /// happens.
     pub async fn cas_ref_checked(
         &self,
         name: &str,
@@ -244,17 +245,27 @@ impl Repo {
                 "tag {name:?} is immutable and cannot be moved; delete it and create it again"
             )));
         }
+        let protected = self
+            .land_policy
+            .as_ref()
+            .is_some_and(|p| p.applies_to(name));
         match new {
             Some(new) => {
+                // `expected` is the current value whenever the swap can win.
+                if let Some(old) = expected.filter(|_| protected) {
+                    if !self.is_ancestor(old, new).await? {
+                        return Err(Error::Invalid(format!(
+                            "cannot move {name:?} from {old} to {new}: it is protected by a \
+                             land policy and {NOT_FORWARD_MARKER}; to undo a change, revert \
+                             it and land the revert"
+                        )));
+                    }
+                }
                 self.enforce_land_policy(new, expected, name, &mut Checked::default())
                     .await?;
             }
             None => {
-                if self
-                    .land_policy
-                    .as_ref()
-                    .is_some_and(|p| p.applies_to(name))
-                {
+                if protected {
                     return Err(Error::Invalid(format!(
                         "cannot delete {name:?}: it is protected by a land policy"
                     )));

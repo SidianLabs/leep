@@ -398,6 +398,10 @@ async fn main() -> anyhow::Result<()> {
             review_refs.push(r.clone());
         }
     }
+    leep_server::check_protected_refs("--require-signatures", &args.require_signatures)
+        .map_err(anyhow::Error::msg)?;
+    leep_server::check_protected_refs("--require-review or the review policy", &review_refs)
+        .map_err(anyhow::Error::msg)?;
     let review = match &auth {
         Some(a) => Some(Arc::new(ReviewService::new(a.reviewers(), policy.rules))),
         None if !review_refs.is_empty() || args.review_policy_file.is_some() => {
@@ -425,7 +429,18 @@ async fn main() -> anyhow::Result<()> {
     }
     if let (Some(service), false) = (&review, review_refs.is_empty()) {
         tracing::info!(refs = ?review_refs, "review required to land");
-        repo = repo.with_land_policy(Arc::new(RequireReview::new(service.clone(), review_refs)));
+        repo = repo.with_land_policy(Arc::new(RequireReview::new(
+            service.clone(),
+            review_refs.clone(),
+        )));
+    }
+    for name in args.require_signatures.iter().chain(&review_refs) {
+        if repo.meta().get_ref(name).await?.is_none() {
+            tracing::warn!(
+                name = %name,
+                "protected ref does not exist yet; check the name if it should"
+            );
+        }
     }
     if args.request_timeout.is_zero() {
         tracing::warn!("request timeout disabled: gc --fence cannot be guaranteed safe");
