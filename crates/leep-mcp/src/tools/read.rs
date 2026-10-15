@@ -96,8 +96,12 @@ impl Server {
         let a: LogArgs = parse_args(args)?;
         let id = self.resolve_rev(a.rev.as_deref())?;
         let limit = a.limit.unwrap_or(DEFAULT_LOG_LIMIT).clamp(1, MAX_LOG_LIMIT);
-        let path = a.path.as_deref().filter(|p| !p.is_empty());
-        let log = self.client.log(&id, path, Some(limit))?;
+        let query = leep_cli::client::LogQuery {
+            path: a.path.filter(|p| !p.is_empty()),
+            limit: Some(limit),
+            ..Default::default()
+        };
+        let log = self.client.log(&id, &query)?;
         let entries: Vec<Value> = log.entries.iter().map(summary).collect();
         Ok(ToolOutput::json(
             json!({ "from": id.to_string(), "entries": entries }),
