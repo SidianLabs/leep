@@ -7,7 +7,9 @@ use std::path::Path;
 use std::time::UNIX_EPOCH;
 
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
-use leep_core::{FileKind, Hash};
+use leep_core::api::FileInfo;
+use leep_core::rename::{Detected, Fingerprint, RenameDetector, RenameOptions};
+use leep_core::{FileKind, Hash, RepoPath};
 use serde::Serialize;
 
 use crate::error::Result;
@@ -243,6 +245,54 @@ pub fn status(wc: &WorkCopy) -> Result<Status> {
     Ok(Status { entries })
 }
 
+/// Renames among the files `st` reports deleted and added. Exact renames
+/// read nothing. For similarity, a deleted file's content comes from
+/// `fetch_old` (the blob cache) and an added file's from disk; a file whose
+/// content cannot be read is left unpaired.
+pub fn working_renames(
+    wc: &WorkCopy,
+    st: &Status,
+    opts: RenameOptions,
+    mut fetch_old: impl FnMut(&Hash) -> Option<Vec<u8>>,
+) -> Detected {
+    let info = |path: &str, s: &FileState| -> Option<FileInfo> {
+        Some(FileInfo {
+            path: RepoPath::new(path).ok()?,
+            content: s.content,
+            kind: s.kind,
+            size: s.size,
+        })
+    };
+    let mut deleted = Vec::new();
+    let mut added = Vec::new();
+    let mut on_disk: BTreeMap<Hash, &str> = BTreeMap::new();
+    for e in &st.entries {
+        match (e.change, &e.now) {
+            (Change::Deleted, _) => {
+                deleted.extend(wc.state.files.get(&e.path).and_then(|s| info(&e.path, s)))
+            }
+            (Change::Added, Some(now)) => {
+                added.extend(info(&e.path, now));
+                on_disk.entry(now.content).or_insert(&e.path);
+            }
+            _ => {}
+        }
+    }
+    let det = RenameDetector::new(deleted, added, opts);
+    let fingerprints = det
+        .wanted()
+        .into_iter()
+        .filter_map(|h| {
+            let bytes = match on_disk.get(&h) {
+                Some(p) => fs::read(wc.abs(p)).ok(),
+                None => fetch_old(&h),
+            }?;
+            Some((h, Fingerprint::of(&bytes)?))
+        })
+        .collect();
+    det.finish(&fingerprints)
+}
+
 fn still_conflicted(wc: &WorkCopy, path: &str) -> bool {
     fs::read_to_string(wc.abs(path))
         .map(|s| s.lines().any(|l| l.starts_with(CONFLICT_MARKER)))
@@ -368,6 +418,50 @@ mod tests {
         let s = status(&wc).unwrap();
         assert_eq!(change_of(&s, "run.sh"), Some(Change::Modified));
         assert_eq!(change_of(&s, "link"), Some(Change::Modified));
+    }
+
+    fn renames_of(wc: &WorkCopy, old: &BTreeMap<Hash, Vec<u8>>) -> Vec<(String, String, u8)> {
+        let st = status(wc).unwrap();
+        working_renames(wc, &st, RenameOptions::default(), |h| old.get(h).cloned())
+            .renames
+            .into_iter()
+            .map(|r| (r.from.to_string(), r.to.to_string(), r.similarity))
+            .collect()
+    }
+
+    #[test]
+    fn working_copy_renames_exact_and_similar() {
+        let d = tempfile::tempdir().unwrap();
+        let mut wc = wc(d.path());
+        let long: String = (0..10).map(|i| format!("line {i}\n")).collect();
+        write(d.path(), "same.txt", "unchanged body\n");
+        write(d.path(), "edit.txt", &long);
+        write(d.path(), "gone.txt", "only deleted\n");
+        track_all(&mut wc);
+        let old: BTreeMap<Hash, Vec<u8>> = [
+            ("unchanged body\n".to_string()),
+            long.clone(),
+            "only deleted\n".to_string(),
+        ]
+        .into_iter()
+        .map(|b| (Hash::of_blob(b.as_bytes()), b.into_bytes()))
+        .collect();
+        assert!(renames_of(&wc, &old).is_empty());
+
+        fs::remove_file(d.path().join("same.txt")).unwrap();
+        fs::remove_file(d.path().join("edit.txt")).unwrap();
+        fs::remove_file(d.path().join("gone.txt")).unwrap();
+        write(d.path(), "dir/same.txt", "unchanged body\n");
+        write(d.path(), "dir/edit.txt", &format!("{long}more\n"));
+        write(d.path(), "fresh.txt", "brand new\n");
+        let got = renames_of(&wc, &old);
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert_eq!(got[0], ("edit.txt".into(), "dir/edit.txt".into(), 96));
+        assert_eq!(got[1], ("same.txt".into(), "dir/same.txt".into(), 100));
+        // Without the old blobs only the exact rename is found.
+        let st = status(&wc).unwrap();
+        let exact = working_renames(&wc, &st, RenameOptions::default(), |_| None);
+        assert_eq!(exact.renames.len(), 1);
     }
 
     #[test]

@@ -29,6 +29,8 @@ pub struct LogQuery {
     pub limit: Option<u32>,
     pub author: Option<String>,
     pub extra: Vec<String>,
+    /// Continue a file's history across renames (needs a file `path`).
+    pub follow: bool,
 }
 
 impl LogQuery {
@@ -45,6 +47,9 @@ impl LogQuery {
             out.push(("author", a.clone()));
         }
         out.extend(self.extra.iter().map(|e| ("extra", e.clone())));
+        if self.follow {
+            out.push(("follow", "true".into()));
+        }
         out
     }
 }
@@ -360,6 +365,31 @@ impl Client {
         }
         if let Some(p) = prefix {
             req = req.query(&[("prefix", p)]);
+        }
+        self.json(req)
+    }
+
+    /// [`Client::diff`] asking the server to detect renames. `threshold` is
+    /// 0 to 100; `None` leaves the server's default of 50.
+    pub fn diff_renames(
+        &self,
+        from: Option<&ChangesetId>,
+        to: &ChangesetId,
+        prefix: Option<&str>,
+        threshold: Option<u8>,
+    ) -> Result<DiffResponse> {
+        let mut req = self
+            .http
+            .get(self.url("/v1/diff"))
+            .query(&[("to", to.to_string()), ("renames", "true".into())]);
+        if let Some(f) = from {
+            req = req.query(&[("from", f.to_string())]);
+        }
+        if let Some(p) = prefix {
+            req = req.query(&[("prefix", p)]);
+        }
+        if let Some(t) = threshold {
+            req = req.query(&[("rename_threshold", t.to_string())]);
         }
         self.json(req)
     }

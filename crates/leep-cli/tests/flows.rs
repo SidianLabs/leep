@@ -396,6 +396,7 @@ fn provenance_queries_reach_the_server_and_decode() {
         let mut a = LogArgs {
             rev: None,
             path: None,
+            follow: None,
             limit: 20,
             author: None,
             agent: false,
@@ -716,6 +717,189 @@ mod signing {
         assert!(lines[2].contains(&via.to_string()), "{lines:?}");
         assert!(lines[3].contains("failed to verify"), "{lines:?}");
     }
+}
+
+fn long_text(tag: &str) -> String {
+    (0..10).map(|i| format!("{tag} line {i}\n")).collect()
+}
+
+fn queries(mock: &Mock, kind: &str) -> Vec<String> {
+    mock.data
+        .lock()
+        .unwrap()
+        .queries
+        .iter()
+        .filter(|(k, _)| k == kind)
+        .map(|(_, q)| q.clone())
+        .collect()
+}
+
+#[test]
+fn working_copy_status_and_diff_fold_renames() {
+    use leep_cli::commands::diff::{working_diff, DiffArgs};
+    use leep_cli::commands::status::{change_lines, renames};
+
+    let mock = Mock::start();
+    let (wc_dir, cache) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let mut ctx = init_wc(&mock, wc_dir.path(), cache.path(), &[]).unwrap();
+    let (a, b) = (long_text("a"), long_text("b"));
+    write(&ctx, "a.txt", &a);
+    write(&ctx, "b.txt", &b);
+    write(&ctx, "keep.txt", "k\n");
+    commit::run(&mut ctx, &commit_args("base")).unwrap();
+
+    fs::remove_file(ctx.wc.abs("a.txt")).unwrap();
+    fs::remove_file(ctx.wc.abs("b.txt")).unwrap();
+    write(&ctx, "dir/a.txt", &format!("{a}extra\n"));
+    write(&ctx, "c.txt", &b);
+    write(&ctx, "new.txt", "unrelated\n");
+
+    // The raw status is unchanged: renames are a display layer.
+    let st = status(&ctx.wc).unwrap();
+    assert_eq!(st.entries.len(), 5);
+    let found = renames(&ctx, &st);
+    let lines = change_lines(&st, &found);
+    assert_eq!(
+        lines,
+        [
+            "renamed: b.txt -> c.txt (100%)",
+            "renamed: a.txt -> dir/a.txt (96%)",
+            "A new.txt"
+        ]
+    );
+
+    let (text, found) = working_diff(&ctx, DiffArgs::default().threshold()).unwrap();
+    assert_eq!(found.len(), 2);
+    assert!(
+        text.contains("renamed: a.txt -> dir/a.txt (96%)\n"),
+        "{text}"
+    );
+    assert!(text.contains("--- a/a.txt\n+++ b/dir/a.txt\n") && text.contains("+extra"));
+    assert!(text.contains("renamed: b.txt -> c.txt (100%)\n"));
+    assert!(
+        !text.contains("--- a/b.txt"),
+        "an exact rename has no content diff"
+    );
+    assert!(text.contains("+unrelated"));
+
+    // With renames off the delete and add are shown in full.
+    let off = DiffArgs {
+        no_renames: true,
+        ..Default::default()
+    };
+    assert_eq!(off.threshold(), None);
+    let (text, found) = working_diff(&ctx, off.threshold()).unwrap();
+    assert!(found.is_empty() && !text.contains("renamed:"));
+    assert!(text.contains("+++ /dev/null") && text.contains("--- /dev/null"));
+
+    // A stricter threshold drops the edited one.
+    let strict = DiffArgs {
+        find_renames: Some(99),
+        ..Default::default()
+    };
+    let (_, found) = working_diff(&ctx, strict.threshold()).unwrap();
+    assert_eq!(found.len(), 1);
+}
+
+#[test]
+fn diff_between_revisions_sends_rename_params() {
+    use leep_cli::commands::diff::{diff_text, revisions_diff};
+
+    let mock = Mock::start();
+    let (wc_dir, cache) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let ctx = init_wc(&mock, wc_dir.path(), cache.path(), &[]).unwrap();
+    let a = long_text("a");
+    let first = mock.seed(None, &[("a.txt", &a, FileKind::Regular)], &[]);
+    let edited = format!("{a}tail\n");
+    let second = mock.seed(
+        Some(first),
+        &[("b.txt", &edited, FileKind::Regular)],
+        &["a.txt"],
+    );
+    let (f, s) = (first.to_string(), second.to_string());
+    let r = ctx.remote();
+
+    let resp = revisions_diff(&r, &f, &s, Some(50)).unwrap();
+    assert_eq!(resp.renames.len(), 1);
+    let text = diff_text(&r, &resp).unwrap();
+    assert!(text.starts_with("renamed: a.txt -> b.txt ("), "{text}");
+    assert!(text.contains("+tail"));
+    let q = queries(&mock, "diff").pop().unwrap();
+    assert!(
+        q.contains("renames=true") && q.contains("rename_threshold=50"),
+        "{q}"
+    );
+
+    let resp = revisions_diff(&r, &f, &s, Some(70)).unwrap();
+    assert!(queries(&mock, "diff")
+        .pop()
+        .unwrap()
+        .contains("rename_threshold=70"));
+    assert_eq!(resp.renames.len(), 1);
+
+    // --no-renames: the request is the old one and the output the old one.
+    let resp = revisions_diff(&r, &f, &s, None).unwrap();
+    assert!(resp.renames.is_empty());
+    assert!(!queries(&mock, "diff").pop().unwrap().contains("renames"));
+    let text = diff_text(&r, &resp).unwrap();
+    assert!(!text.contains("renamed:") && text.contains("+++ /dev/null"));
+}
+
+#[test]
+fn diff_and_log_flags_parse() {
+    use clap::Parser;
+    use leep_cli::cli::{Cli, Command};
+
+    let diff = |args: &[&str]| {
+        let mut v = vec!["leep", "diff"];
+        v.extend(args);
+        Cli::try_parse_from(v).map(|c| match c.command {
+            Command::Diff(d) => d.threshold(),
+            _ => unreachable!(),
+        })
+    };
+    assert_eq!(diff(&[]).unwrap(), Some(50));
+    assert_eq!(diff(&["--no-renames"]).unwrap(), None);
+    assert_eq!(diff(&["-M"]).unwrap(), Some(50));
+    assert_eq!(diff(&["-M=70"]).unwrap(), Some(70));
+    assert_eq!(diff(&["--find-renames=0"]).unwrap(), Some(0));
+    assert_eq!(diff(&["--find-renames", "a", "b"]).unwrap(), Some(50));
+    assert!(diff(&["-M=101"]).is_err());
+    assert!(diff(&["-M=x"]).is_err());
+    assert!(diff(&["--no-renames", "-M"]).is_err());
+
+    let log = |args: &[&str]| {
+        let mut v = vec!["leep", "log"];
+        v.extend(args);
+        Cli::try_parse_from(v)
+    };
+    assert!(log(&["--follow", "a.rs"]).is_ok());
+    assert!(log(&["--follow", "a.rs", "--path", "b"]).is_err());
+}
+
+#[test]
+fn log_follow_sends_the_flag_and_decodes_path_at() {
+    let mock = Mock::start();
+    let (wc_dir, cache) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let ctx = init_wc(&mock, wc_dir.path(), cache.path(), &[]).unwrap();
+    mock.seed(None, &[("a.txt", "1\n", FileKind::Regular)], &[]);
+    let r = ctx.remote();
+    let id = r.resolve("main").unwrap();
+    let args = LogArgs {
+        rev: None,
+        path: None,
+        follow: Some("a.txt".into()),
+        limit: 20,
+        author: None,
+        agent: false,
+        agent_model: None,
+        agent_session: None,
+        extra: vec![],
+    };
+    let resp = r.client.log(&id, &args.query().unwrap()).unwrap();
+    let q = queries(&mock, "log").pop().unwrap();
+    assert!(q.contains("path=a.txt") && q.contains("follow=true"), "{q}");
+    assert_eq!(resp.entries[0].path_at.as_ref().unwrap().as_str(), "a.txt");
 }
 
 fn branch_args(name: &str, rev: Option<&str>) -> BranchArgs {

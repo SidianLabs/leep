@@ -47,13 +47,25 @@ pub type Side<'a> = Option<(&'a [u8], FileKind)>;
 
 /// Unified diff for one path; "Binary files differ" for non-UTF-8 or NUL data.
 pub fn file_diff(path: &str, old: Side, new: Side) -> String {
+    renamed_diff(path, path, old, new)
+}
+
+/// `renamed: old -> new (97%)`, the line `leep diff` and `leep status` print
+/// for a detected rename.
+pub fn rename_line(from: &str, to: &str, similarity: u8) -> String {
+    format!("renamed: {from} -> {to} ({similarity}%)")
+}
+
+/// [`file_diff`] for a file that moved from `from` to `to`. An unchanged
+/// content prints nothing, so an exact rename is just its `renamed:` line.
+pub fn renamed_diff(from: &str, to: &str, old: Side, new: Side) -> String {
     let mut out = String::new();
-    let a = old.map_or("/dev/null".to_string(), |_| format!("a/{path}"));
-    let b = new.map_or("/dev/null".to_string(), |_| format!("b/{path}"));
+    let a = old.map_or("/dev/null".to_string(), |_| format!("a/{from}"));
+    let b = new.map_or("/dev/null".to_string(), |_| format!("b/{to}"));
     if let (Some((_, ok)), Some((_, nk))) = (old, new) {
         if ok != nk {
             out.push_str(&format!(
-                "mode change {path}: {} -> {}\n",
+                "mode change {to}: {} -> {}\n",
                 kind_name(ok),
                 kind_name(nk)
             ));
@@ -113,5 +125,24 @@ mod tests {
         assert!(b.contains("Binary files"));
         let add = file_diff("n", None, Some((b"x\n", FileKind::Regular)));
         assert!(add.contains("--- /dev/null") && add.contains("+x"));
+    }
+
+    #[test]
+    fn renamed_diffs_name_both_paths() {
+        assert_eq!(rename_line("a", "d/b", 97), "renamed: a -> d/b (97%)");
+        let same = Some((&b"one\n"[..], FileKind::Regular));
+        assert_eq!(renamed_diff("a", "b", same, same), "");
+        let d = renamed_diff("a", "b", same, Some((b"one\ntwo\n", FileKind::Regular)));
+        assert!(
+            d.contains("--- a/a\n+++ b/b\n") && d.contains("+two"),
+            "{d}"
+        );
+        let m = renamed_diff(
+            "run",
+            "bin/run",
+            same,
+            Some((b"one\n", FileKind::Executable)),
+        );
+        assert_eq!(m, "mode change bin/run: regular -> executable\n");
     }
 }
