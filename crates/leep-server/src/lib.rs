@@ -202,12 +202,7 @@ fn octet_stream<const N: usize>(data: Bytes, extra: [(&'static str, &'static str
 
 async fn missing_blobs(State(repo): S, body: Bytes) -> ApiResult<Json<MissingBlobsResponse>> {
     let req: MissingBlobsRequest = parse_json(&body)?;
-    let mut missing = Vec::new();
-    for h in req.hashes {
-        if !repo.blobs().contains(&h).await? {
-            missing.push(h);
-        }
-    }
+    let missing = repo.missing_blobs(&req.hashes).await?;
     Ok(Json(MissingBlobsResponse { missing }))
 }
 

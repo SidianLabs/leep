@@ -60,3 +60,13 @@ derived(kind TEXT, key BYTEA, value BYTEA, PRIMARY KEY(kind, key))
 
 - Filesystem: `<root>/<hex[0..2]>/<hex[2..]>`
 - Object store: `blobs/<hex[0..2]>/<hex[2..]>`
+
+## Garbage collection (no format change)
+
+ADR 0008 adds `BlobStore::list_page` and `delete` and `MetaStore::list_changesets`.
+These are trait additions only: no encoding, hash, SQL schema or blob layout
+changed. Listings walk the existing layouts: filesystem shard directories and
+object-store `blobs/<hex[0..2]>/` prefixes in hash order, and
+`SELECT id FROM changesets ORDER BY id` (byte order) for metadata. Blob
+modification time is the file mtime or object `LastModified`; a repeated `put`
+refreshes it.
