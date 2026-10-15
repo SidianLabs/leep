@@ -146,6 +146,7 @@ impl Server {
             "leep_read_file" => self.read_file(args),
             "leep_diff" => self.diff(args),
             "leep_blame" => self.blame(args),
+            "leep_search" => self.search(args),
             "leep_review_status" => self.review_status(args),
             "leep_commit_and_land" => self.commit_and_land(args),
             _ => return None,
@@ -267,6 +268,34 @@ pub fn definitions() -> Vec<Value> {
                     "path": { "type": "string", "description": "File path." }
                 },
                 "required": ["path"],
+                "additionalProperties": false
+            }),
+            true,
+        ),
+        tool(
+            "leep_search",
+            "Search file contents",
+            "Search the text files of a revision, like grep, without reading them one by one. \
+             Matching is per line. By default `query` is a literal; set `regex` for a regular \
+             expression (Rust syntax) and `case_insensitive` to ignore case. Narrow with `path` \
+             (a directory or file) and `glob` (`*` stays within one directory, `**` crosses \
+             them, e.g. `**/*.rs`). Results are ordered by path then line, each with the file, \
+             line number, the line (cut at 1024 bytes) and the byte ranges that matched. \
+             Binary, non-UTF-8 and files over 1 MiB are skipped (`stats.files_skipped`). \
+             `truncated` means more matches exist or the server's scan budget ran out. The first \
+             search of a large revision can be slow while the server builds its index.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Text or regular expression to find (required)." },
+                    "rev": { "type": "string", "description": REV_DOC },
+                    "regex": { "type": "boolean", "description": "Treat `query` as a regular expression (default false)." },
+                    "case_insensitive": { "type": "boolean", "description": "Ignore case (default false)." },
+                    "path": { "type": "string", "description": "Only files at or below this directory or file path." },
+                    "glob": { "type": "string", "description": "Only paths matching this glob, e.g. `**/*.rs` or `src/*.toml`." },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 200, "description": "Max matching lines (default 50)." }
+                },
+                "required": ["query"],
                 "additionalProperties": false
             }),
             true,

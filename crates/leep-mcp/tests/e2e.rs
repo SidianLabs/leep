@@ -488,3 +488,84 @@ fn review_status_needs_an_authenticated_server() {
         text(&r)
     );
 }
+
+#[test]
+fn search_finds_lines_and_reports_errors() {
+    let s = Server::new(config(&start_server()));
+    let r = commit(
+        &s,
+        json!({
+            "message": "initial",
+            "changes": [
+                { "path": "src/lib.rs", "content": "pub fn parse() {}\n// TODO: handle Errors\n" },
+                { "path": "src/main.rs", "content": "fn main() { parse(); }\n" },
+                { "path": "docs/todo.md", "content": "todo list\n" },
+            ],
+        }),
+    );
+    assert_eq!(data(&r)["status"], "landed");
+
+    let found = data(&call(&s, "leep_search", json!({ "query": "parse" })));
+    let hits: Vec<(String, u64)> = found["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| {
+            (
+                m["path"].as_str().unwrap().to_string(),
+                m["line_number"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(hits, [("src/lib.rs".into(), 1), ("src/main.rs".into(), 1)]);
+    assert_eq!(found["matches"][1]["line"], "fn main() { parse(); }");
+    assert_eq!(
+        found["matches"][1]["ranges"],
+        json!([{ "start": 12, "end": 17 }])
+    );
+    assert_eq!(found["truncated"], false);
+    assert_eq!(found["stats"]["files_scanned"], 2);
+    assert_eq!(found["rev"].as_str().unwrap().len(), 64);
+
+    // Case, regex, path and glob options.
+    let ci = data(&call(
+        &s,
+        "leep_search",
+        json!({ "query": "todo", "case_insensitive": true }),
+    ));
+    assert_eq!(ci["matches"].as_array().unwrap().len(), 2);
+    let re = data(&call(
+        &s,
+        "leep_search",
+        json!({ "query": "fn\\s+\\w+\\(\\)", "regex": true, "glob": "**/*.rs" }),
+    ));
+    assert_eq!(re["matches"].as_array().unwrap().len(), 2);
+    let scoped = data(&call(
+        &s,
+        "leep_search",
+        json!({ "query": "o", "path": "docs", "rev": "main" }),
+    ));
+    assert_eq!(scoped["matches"][0]["path"], "docs/todo.md");
+
+    let cut = data(&call(
+        &s,
+        "leep_search",
+        json!({ "query": "r", "limit": 1 }),
+    ));
+    assert_eq!(cut["truncated"], true);
+    assert_eq!(cut["matches"].as_array().unwrap().len(), 1);
+    assert!(cut["note"].as_str().unwrap().contains("Narrow"));
+
+    // Failures are tool errors the agent can read.
+    for args in [
+        json!({ "query": "(", "regex": true }),
+        json!({ "query": "" }),
+        json!({ "query": "x", "rev": "nosuchref" }),
+        json!({}),
+    ] {
+        let r = call(&s, "leep_search", args.clone());
+        assert_eq!(r["isError"], true, "{args}");
+    }
+    let r = call(&s, "leep_search", json!({ "query": "(", "regex": true }));
+    assert!(text(&r).contains("bad regex"), "{}", text(&r));
+}
