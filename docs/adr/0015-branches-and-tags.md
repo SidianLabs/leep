@@ -34,3 +34,15 @@ stored and later break URLs, shells and the git bridge.
   it was allowed.
 - Tags are not signed or annotated. That can be added later as a new object
   without changing this rule.
+
+## Security review 2026-10
+See [SECURITY-REVIEW.md](../SECURITY-REVIEW.md). Name validation, tag
+immutability (CAS, land and undo) and the protected-delete rule hold on every
+write path. Accepted (S-12): any writer can delete an unprotected tag and
+create it again elsewhere, so a release tag can be repointed at unreviewed
+code. Policies take exact names, so protecting tags means listing each one,
+which also makes them undeletable. Pattern-based protection (`tags/*`,
+`release/*`) is future work.
+A ref a land policy covers now also only moves forward through
+`POST /v1/refs/{name}` (S-09): besides the delete-and-recreate rule above, a
+rewind or sideways move would have dropped reviewed or signed history.

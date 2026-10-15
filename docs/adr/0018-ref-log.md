@@ -76,3 +76,16 @@ only if someone remembered its id.
   choose the actor.
 - Undo of a protected ref can refuse for a reason the user did not cause (a
   policy added after the move). That is the intended behavior, not a bug.
+
+## Security review 2026-10
+See [SECURITY-REVIEW.md](../SECURITY-REVIEW.md). Actors come from the token
+and clients cannot use the reserved labels, as intended.
+
+This changes what `undo` can do on a protected ref (S-09). Because the land
+policy judged only what a move adds, `leep undo` of a land on a protected ref
+(or any raw rewind) removed reviewed or signed commits without a review. A
+ref any land policy covers now only moves forward, so such an undo is refused
+with 400 and the CLI says to `leep revert` the change and land the revert.
+On a protected ref, `undo` still works for moves that go forward, such as
+redoing an undo made before the policy was added, subject to the policy.
+Unprotected refs are unaffected.

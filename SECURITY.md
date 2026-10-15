@@ -29,3 +29,9 @@ the checks it should pass, or lose data.
 
 Out of scope: deployments that run without authentication on an untrusted
 network, which the docs warn against.
+
+## Reviews
+
+- [October 2026](docs/SECURITY-REVIEW.md): authentication, signing, review
+  policies, garbage collection, ref operations, resource use and the working
+  copy, with every finding and what was done about it.

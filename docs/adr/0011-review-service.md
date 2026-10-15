@@ -204,3 +204,40 @@ only on `leep-core`; the types live in `leep_core::api` and `leep_core::review`.
 - Approval carried across server rebases when the replayed diff is identical.
 - Gate `leep-git` import by the same policies.
 - SIGHUP reload of the policy file, as for tokens.
+
+## Security review 2026-10
+See [SECURITY-REVIEW.md](../SECURITY-REVIEW.md).
+- **`merge_parent` narrowed (S-01, fixed).** "That side's history is reviewed
+  on its own" did not hold for a side already in the ref's history: a
+  hand-made `merge(head, old)` could put back `old`'s version of an owned
+  file, undoing a reviewed fix with no owner asked. A path is now covered only
+  if it equals a side parent's *and* the first parent left it as it was at the
+  two parents' merge base, which is when a clean three-way merge takes the
+  side's version. Server-made clean merges are unaffected.
+- **`comment_only` (S-03, fixed).** The lexer now also gives up on string
+  interpolation that can nest quotes (Python f- and t-strings, C#, Kotlin,
+  Scala, Swift, Ruby, shell) unless every interpolated expression closes and
+  holds no quote, escape or comment marker; C line splices and the `??/`
+  trigraph; Java and Scala `\u` escapes of ASCII characters anywhere; shell
+  `#` after an operator and Ruby or Perl `#` without a blank before it; Ruby
+  `=begin`, Perl POD, Ruby `% x ` literals, JavaScript HTML-like comments and
+  a regex after `if (...)`; and Go files that use cgo. Rust doc comments
+  (`///`, `//!`, `/** */`, `/*! */`) are now code, because their code blocks
+  run as doctests.
+- **No auto rule for `OWNERS` (S-07, fixed).** A docs glob such as `docs/**`
+  matched `docs/OWNERS`; no rule now applies to a file named `OWNERS`.
+- **Protected refs only move forward (S-09, fixed).** The policy checks what
+  a move adds, so moving a protected ref back to an ancestor or across to a
+  sibling (raw CAS or `leep undo`) dropped reviewed commits without any
+  review. `cas_ref_checked` now refuses (400, `only moves forward`) any move
+  of a ref a land policy covers whose new value does not descend from the
+  current one, as branch protection refuses a force-push. Creating the ref is
+  unaffected and `land` was already forward-only. To take a change back,
+  revert it and land the revert, which is reviewed like any change.
+- **Exact path matching (S-14, accepted).** Owners match paths byte for byte,
+  as trees do, so `SRC/` or a decomposed-Unicode spelling of `src/` is not
+  under `src/OWNERS`, though a case- or normalization-insensitive build may
+  treat it as the same directory. Put an `OWNERS` file at the root of a
+  protected tree so such variants still need an owner.
+- Unowned paths still take any approval, including the pusher's own
+  (S-15, as documented above); a root `OWNERS` file avoids that too.

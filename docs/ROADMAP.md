@@ -77,8 +77,8 @@ operator action, and their benchmarks are in `docs/PERFORMANCE.md`.
   check that no ref, changeset or blob reachable from a ref is lost (ADR 0021)
 - [x] Fault injection in the storage traits: timeouts, partial writes, errors (ADR 0021)
 - [ ] Long-running soak test: many agents landing for hours against Postgres
-- [ ] Security review of auth, signing, review policies and GC, with findings
-  fixed or written down in the relevant ADR
+- [x] Security review of auth, signing, review policies and GC, with findings
+  fixed or written down in the relevant ADR (`docs/SECURITY-REVIEW.md`)
 - [x] Request size, rate and concurrency limits per token (ADR 0020)
 
 Exit: a full soak run and the fuzzers find nothing new for two weeks.

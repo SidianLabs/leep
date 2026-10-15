@@ -112,7 +112,10 @@ with `Error::Invalid`:
 - every parent exists;
 - every `Modify` blob exists, and its length equals `size`;
 - `Delete` targets a file that exists in `parents[0]`'s tree;
-- the resulting tree never has a path that is both a file and a directory.
+- the resulting tree never has a path that is both a file and a directory;
+- every path is at most 4096 bytes, and all paths together name at most a
+  million directories (256 MiB of directory names), since building the tree
+  holds each changed directory and its full path in memory.
 
 `RepoPath` is validated on construction and on deserialization, so invalid
 paths cannot enter the system through any route.
@@ -255,9 +258,10 @@ which is then a fast-forward. Stacks containing merges are rejected.
 branches, except those under `tags/`, which are tags. `cas_ref_checked` and
 `land` in `leep-derive` apply the rules for every caller: valid names
 (`leep_core::refname`), tags are created or deleted but never moved, `land`
-refuses `tags/`, and a ref a land policy covers cannot be deleted. The CLI has
-no special server API for this: `leep branch`, `leep switch` and `leep tag`
-are compare-and-swap calls on `/v1/refs/{name}`. `branch -d` deletes only if
+refuses `tags/`, and a ref a land policy covers cannot be deleted and only
+moves forward (a swap to a value that does not descend from the current one
+is a 400). The CLI has no special server API for this: `leep branch`,
+`leep switch` and `leep tag` are compare-and-swap calls on `/v1/refs/{name}`. `branch -d` deletes only if
 `merge_base(head, target) == head`, reading the head once and passing it as
 `expected` so a concurrent move fails with 409. `leep switch` needs a clean
 working copy, sets `target_ref` in `.leep/config.json` and materializes the
@@ -281,9 +285,15 @@ version and are recorded in `state.unresolved`; they block the same way until
 base is not in the target's history, `sync` first rebases the unlanded
 first-parent stack onto the head, one changeset at a time; a conflict there
 stops with nothing changed. `restore`, `reset` and `stash` write files the same
-way, and `reset` and `amend` only move the base, never a ref. `amend` is
-refused for a base in the target ref's history (`merge_base(base, head) ==
-base`). Snapshots are ordinary changesets, so blob GC keeps what they reference.
+way. Every write or delete of a repository path goes through
+`WorkCopy::abs_for_write`, which refuses a path with a `.leep` or `.git`
+component (in any spelling the filesystem folds together) and a path whose
+directory on disk is a symbolic link, checked right before each write, so
+neither a malicious server nor a crafted tree can make the CLI write outside
+the working copy or into its control directories. `reset` and `amend` only
+move the base, never a ref. `amend` is refused for a base in the target ref's
+history (`merge_base(base, head) == base`). Snapshots are ordinary changesets,
+so blob GC keeps what they reference.
 
 **Merge, rebase, cherry-pick and revert** ([ADR 0019](adr/0019-merge-rebase-revert.md)).
 These build local, unlanded commits from existing endpoints; `land` moves the
@@ -311,9 +321,10 @@ and `import` are reserved so clients cannot forge them). `GET /v1/reflog` and
 `/v1/reflog/{name}` page the log newest first. `leep undo` is a client of
 existing endpoints: it reads a ref's latest log entry and compare-and-swaps the
 ref from its current value to that entry's old value, with operation `undo`,
-through `cas_ref_checked`, so name rules, immutable tags, protected deletes and
-signature or review policies still apply and a concurrent move is a 409. It
-never touches the working copy. Undoing a delete recreates the ref, undoing a
+through `cas_ref_checked`, so name rules, immutable tags, protected deletes,
+forward-only protected refs and signature or review policies still apply and a
+concurrent move is a 409. Undoing a land on a protected ref is therefore
+refused; the CLI points at `leep revert`. It never touches the working copy. Undoing a delete recreates the ref, undoing a
 create deletes it, and the redo of an undo is another undo. The log is
 unbounded; entries name changesets, which are never deleted, so GC is
 unaffected.
@@ -446,9 +457,12 @@ Ownership is per directory: `OWNERS` files (one name per line, `#` comments,
 `noparent`) in the tree, read from the **target ref's head** at check time so a
 change cannot grant itself ownership; a path no file covers has no owners and
 any one approval satisfies it. Per changed path, an owner's reject blocks,
-then a merge-side match (`merge_parent`), an enabled auto rule from the
+then a merge-side match (`merge_parent`: the path equals a side parent's and
+the first parent left it as it was at their merge base, so taking the side is
+what a clean merge does), an enabled auto rule from the
 `--review-policy-file` (`comment_only`, `whitespace_only`, `docs_only`; pure
-functions in `leep-derive`) or an owner's approval satisfies it.
+functions in `leep-derive`; never for an `OWNERS` file) or an owner's
+approval satisfies it.
 `--require-review <REF>` (repeatable, `LEEP_REQUIRE_REVIEW`) and the policy
 file's `refs` make `land` onto a ref fail with 400 `changeset X needs review:
 path P ...` unless every changeset it adds is approved, checked on the
