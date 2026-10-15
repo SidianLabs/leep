@@ -1531,3 +1531,191 @@ async fn merge_base_fast_path_matches_reference_walk() {
         }
     }
 }
+
+mod land_policy {
+    use async_trait::async_trait;
+    use leep_core::signature::{key_id, Signature, NOT_SIGNED_MARKER};
+
+    use super::*;
+    use crate::LandPolicy;
+
+    const KEY: [u8; 32] = [9; 32];
+
+    /// Requires a stored signature by one fixed key on `protected`; checks no
+    /// cryptography, which belongs to the server.
+    struct NeedsKey {
+        protected: &'static str,
+    }
+
+    #[async_trait]
+    impl LandPolicy for NeedsKey {
+        fn applies_to(&self, target_ref: &str) -> bool {
+            target_ref == self.protected
+        }
+
+        async fn check_land(
+            &self,
+            repo: &Repo,
+            _target_ref: &str,
+            new_history: &[ChangesetId],
+        ) -> leep_core::Result<()> {
+            for id in new_history {
+                if repo.get_signature(*id, &key_id(&KEY)).await?.is_none() {
+                    return Err(Error::Invalid(format!(
+                        "changeset {id} {NOT_SIGNED_MARKER}"
+                    )));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    fn guarded() -> Repo {
+        repo().with_land_policy(Arc::new(NeedsKey { protected: "main" }))
+    }
+
+    async fn sign(r: &Repo, id: ChangesetId) {
+        let sig = Signature {
+            key_id: key_id(&KEY),
+            public_key: KEY,
+            sig: [1; 64],
+        };
+        r.put_signature(id, &sig).await.unwrap();
+    }
+
+    fn assert_unsigned(err: Error, id: ChangesetId) {
+        match err {
+            Error::Invalid(m) => assert_eq!(m, format!("changeset {id} {NOT_SIGNED_MARKER}")),
+            e => panic!("expected Invalid, got {e:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn unsigned_land_is_rejected_and_ref_untouched() {
+        let r = guarded();
+        let c = commit(&r, &[], &[("a", Some("1\n"))], "c").await;
+        assert_unsigned(r.land(c, "main").await.unwrap_err(), c);
+        assert_eq!(r.meta().get_ref("main").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn signed_land_is_accepted() {
+        let r = guarded();
+        let c = commit(&r, &[], &[("a", Some("1\n"))], "c").await;
+        sign(&r, c).await;
+        assert!(matches!(
+            r.land(c, "main").await.unwrap(),
+            LandResponse::Landed { landed, .. } if landed == c
+        ));
+        // Landing it again adds nothing, so it needs no check and still works.
+        assert!(r.land(c, "main").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn one_unsigned_entry_in_a_fast_forward_stack_is_rejected() {
+        let r = guarded();
+        let base = commit(&r, &[], &[("a", Some("1\n"))], "base").await;
+        sign(&r, base).await;
+        r.land(base, "main").await.unwrap();
+        let s1 = commit(&r, &[base], &[("b", Some("2\n"))], "s1").await;
+        let s2 = commit(&r, &[s1], &[("c", Some("3\n"))], "s2").await;
+        sign(&r, s2).await;
+        assert_unsigned(r.land(s2, "main").await.unwrap_err(), s1);
+        sign(&r, s1).await;
+        r.land(s2, "main").await.unwrap();
+        assert_eq!(r.resolve("main").await.unwrap(), s2);
+    }
+
+    #[tokio::test]
+    async fn replayed_stack_checks_originals_and_records_origin() {
+        let r = guarded();
+        let base = commit(&r, &[], &[("a", Some("1\n"))], "base").await;
+        sign(&r, base).await;
+        r.land(base, "main").await.unwrap();
+        let head = commit(&r, &[base], &[("h", Some("h\n"))], "head").await;
+        sign(&r, head).await;
+        r.land(head, "main").await.unwrap();
+
+        let s1 = commit(&r, &[base], &[("b", Some("2\n"))], "s1").await;
+        let s2 = commit(&r, &[s1], &[("c", Some("3\n"))], "s2").await;
+        sign(&r, s2).await;
+        assert_unsigned(r.land(s2, "main").await.unwrap_err(), s1);
+        assert_eq!(r.resolve("main").await.unwrap(), head);
+
+        sign(&r, s1).await;
+        let LandResponse::Landed {
+            landed, rebased, ..
+        } = r.land(s2, "main").await.unwrap()
+        else {
+            panic!("expected land");
+        };
+        assert!(rebased);
+        // The copies carry no signature of their own; the server recorded
+        // where they came from.
+        assert!(r
+            .get_signature(landed, &key_id(&KEY))
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(r.rebased_origin(landed).await.unwrap(), Some(s2));
+        assert_eq!(r.rebase_chain(landed).await.unwrap(), vec![s2]);
+        assert_eq!(r.rebased_origin(s2).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn forged_rebased_from_extra_does_not_pass_the_policy() {
+        let r = guarded();
+        let signed = commit(&r, &[], &[("a", Some("1\n"))], "signed").await;
+        sign(&r, signed).await;
+        let mut forged = changeset(&[], BTreeMap::new(), "forged");
+        forged.extra.insert(
+            leep_core::changeset::EXTRA_REBASED_FROM.into(),
+            signed.to_string(),
+        );
+        let forged = r.create_changeset(forged).await.unwrap();
+        assert_unsigned(r.land(forged, "main").await.unwrap_err(), forged);
+        assert_eq!(r.rebased_origin(forged).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn unprotected_refs_are_unaffected() {
+        let r = guarded();
+        let c = commit(&r, &[], &[("a", Some("1\n"))], "c").await;
+        r.land(c, "dev").await.unwrap();
+        assert_eq!(r.resolve("dev").await.unwrap(), c);
+    }
+
+    #[tokio::test]
+    async fn merge_side_branches_are_checked_too() {
+        let r = guarded();
+        let base = commit(&r, &[], &[("a", Some("1\n"))], "base").await;
+        sign(&r, base).await;
+        r.land(base, "main").await.unwrap();
+        let side = commit(&r, &[base], &[("s", Some("s\n"))], "side").await;
+        let mine = commit(&r, &[base], &[("m", Some("m\n"))], "mine").await;
+        let merge = commit(&r, &[mine, side], &[], "merge").await;
+        sign(&r, merge).await;
+        sign(&r, mine).await;
+        assert_unsigned(r.land(merge, "main").await.unwrap_err(), side);
+    }
+
+    #[tokio::test]
+    async fn signing_an_unknown_changeset_is_not_found() {
+        let r = repo();
+        let sig = Signature {
+            key_id: key_id(&KEY),
+            public_key: KEY,
+            sig: [1; 64],
+        };
+        let missing = ChangesetId(Hash::of_blob(b"nope"));
+        assert!(matches!(
+            r.put_signature(missing, &sig).await,
+            Err(Error::NotFound(_))
+        ));
+        let c = commit(&r, &[], &[("a", Some("1\n"))], "c").await;
+        r.put_signature(c, &sig).await.unwrap();
+        r.put_signature(c, &sig).await.unwrap();
+        assert_eq!(r.get_signature(c, &sig.key_id).await.unwrap(), Some(sig));
+        assert_eq!(r.get_signature(c, "other").await.unwrap(), None);
+    }
+}

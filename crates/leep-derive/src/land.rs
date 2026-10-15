@@ -2,6 +2,7 @@
 //! no merge queue.
 
 use std::collections::hash_map::RandomState;
+use std::collections::HashSet;
 use std::hash::BuildHasher;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -77,9 +78,14 @@ impl Repo {
         let waited = Instant::now();
         let _guard = lock.lock().await;
         metrics::histogram!("leep_land_lock_wait_seconds").record(waited.elapsed().as_secs_f64());
+        // Signatures are never removed, so a changeset that passed the policy
+        // need not be checked again when a lost CAS retries.
+        let mut checked = HashSet::new();
         for attempt in 1..=MAX_LAND_ATTEMPTS {
             stats.attempts = attempt;
             let head = self.meta().get_ref(target_ref).await?;
+            self.enforce_land_policy(cs, head, target_ref, &mut checked)
+                .await?;
             let new = match head {
                 None => cs,
                 Some(h) if h == cs || self.is_ancestor(cs, h).await? => {
@@ -111,6 +117,52 @@ impl Repo {
         Err(Error::Conflict(format!(
             "land onto {target_ref:?} lost the race {MAX_LAND_ATTEMPTS} times; retry"
         )))
+    }
+
+    /// `MetaStore::cas_ref` for callers outside `land`, with the land policy
+    /// applied to what the ref would gain, so a raw ref update cannot skip
+    /// it. Rewinds and deletes add nothing and are not checked.
+    pub async fn cas_ref_checked(
+        &self,
+        name: &str,
+        expected: Option<ChangesetId>,
+        new: Option<ChangesetId>,
+    ) -> Result<bool> {
+        if let Some(new) = new {
+            self.enforce_land_policy(new, expected, name, &mut HashSet::new())
+                .await?;
+        }
+        self.meta().cas_ref(name, expected, new).await
+    }
+
+    /// Ask the policy about the submitted changesets this land would add to
+    /// the ref. Skipped when the ref already contains `cs`.
+    async fn enforce_land_policy(
+        &self,
+        cs: ChangesetId,
+        head: Option<ChangesetId>,
+        target_ref: &str,
+        checked: &mut HashSet<ChangesetId>,
+    ) -> Result<()> {
+        let Some(policy) = self
+            .land_policy
+            .as_ref()
+            .filter(|p| p.applies_to(target_ref))
+        else {
+            return Ok(());
+        };
+        let fresh: Vec<_> = self
+            .new_history(cs, head)
+            .await?
+            .into_iter()
+            .filter(|id| !checked.contains(id))
+            .collect();
+        if fresh.is_empty() {
+            return Ok(());
+        }
+        policy.check_land(self, target_ref, &fresh).await?;
+        checked.extend(fresh);
+        Ok(())
     }
 
     /// Rebase every changeset of the stack under `cs` onto `head`, oldest

@@ -10,6 +10,7 @@ use leep_core::{
 };
 
 use crate::derived::{self, Generation, RootTree, Skiplist};
+use crate::signatures::LandPolicy;
 use crate::tree_ops::apply_changes;
 
 /// A repository: content-addressed blobs plus changeset metadata.
@@ -19,6 +20,7 @@ pub struct Repo {
     meta: Arc<dyn MetaStore>,
     /// Per-ref locks serializing lands within this process (see `land`).
     pub(crate) land_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    pub(crate) land_policy: Option<Arc<dyn LandPolicy>>,
 }
 
 impl Repo {
@@ -27,7 +29,14 @@ impl Repo {
             blobs,
             meta,
             land_locks: Arc::default(),
+            land_policy: None,
         }
+    }
+
+    /// Consult `policy` before every `land`.
+    pub fn with_land_policy(mut self, policy: Arc<dyn LandPolicy>) -> Self {
+        self.land_policy = Some(policy);
+        self
     }
 
     pub fn blobs(&self) -> &Arc<dyn BlobStore> {
