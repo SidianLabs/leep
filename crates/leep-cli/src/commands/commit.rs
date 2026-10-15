@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use clap::Args;
 use leep_core::changeset::{
     EXTRA_AGENT_MODEL, EXTRA_AGENT_PROMPT, EXTRA_AGENT_SESSION, EXTRA_AGENT_TESTS,
+    EXTRA_REBASED_FROM, EXTRA_REVERT_OF,
 };
 use leep_core::Changeset;
 
@@ -18,9 +19,10 @@ use crate::status::status;
 
 #[derive(Args, Debug, Default, Clone)]
 pub struct CommitArgs {
-    /// Commit message.
+    /// Commit message. Optional only when finishing a merge, cherry-pick or
+    /// revert, which supply their own.
     #[arg(short, long)]
-    pub message: String,
+    pub message: Option<String>,
     /// Author (default: $LEEP_AUTHOR, else $USER).
     #[arg(long)]
     pub author: Option<String>,
@@ -85,19 +87,49 @@ pub fn run(ctx: &mut Ctx, args: &CommitArgs) -> Result<i32> {
         .transpose()?;
     let st = status(&ctx.wc)?;
     st.refuse_conflicts()?;
-    if st.is_clean() {
-        return Err(CliError::user("nothing to commit, working copy clean"));
+    let merge = ctx.wc.state.merge_in_progress.clone();
+    let pick = ctx.wc.state.pick_in_progress.clone();
+    // A merge may resolve every conflict in favour of the base and still has
+    // a second parent to record.
+    if st.is_clean() && merge.is_none() {
+        return Err(CliError::user(match &pick {
+            Some(p) => format!(
+                "nothing to commit: resolving the conflicts left the working copy unchanged; \
+                 `leep {} --abort` ends it",
+                if p.revert { "revert" } else { "cherry-pick" }
+            ),
+            None => "nothing to commit, working copy clean".to_string(),
+        }));
     }
+    let message = args
+        .message
+        .clone()
+        .or_else(|| merge.as_ref().map(|m| m.message.clone()))
+        .or_else(|| pick.as_ref().map(|p| p.message.clone()))
+        .ok_or_else(|| CliError::user("a commit message is required (-m)"))?;
 
     let changes = snapshot::upload_changes(ctx, &st)?;
 
+    let mut parents: Vec<_> = ctx.wc.state.base.into_iter().collect();
+    parents.extend(merge.as_ref().map(|m| m.other));
+    let mut extra = extra(args);
+    if let Some(p) = &pick {
+        // Same provenance a clean run records (the server's rebase for a
+        // cherry-pick, the inverse changeset for a revert).
+        let key = if p.revert {
+            EXTRA_REVERT_OF
+        } else {
+            EXTRA_REBASED_FROM
+        };
+        extra.insert(key.to_string(), p.from.to_string());
+    }
     let cs = Changeset {
-        parents: ctx.wc.state.base.into_iter().collect(),
+        parents,
         author: author(args),
         timestamp: snapshot::now_secs(),
-        message: args.message.clone(),
+        message,
         changes,
-        extra: extra(args),
+        extra,
     };
     let id = ctx.client.create_changeset(&cs)?;
     // Before the working copy moves: if signing fails, nothing local changed
@@ -124,6 +156,8 @@ pub fn run(ctx: &mut Ctx, args: &CommitArgs) -> Result<i32> {
     }
     ctx.wc.state.conflicts.clear();
     ctx.wc.state.unresolved.clear();
+    ctx.wc.state.merge_in_progress = None;
+    ctx.wc.state.pick_in_progress = None;
     ctx.wc.state.base = Some(id);
     ctx.wc.save_state()?;
 
@@ -132,9 +166,13 @@ pub fn run(ctx: &mut Ctx, args: &CommitArgs) -> Result<i32> {
     } else {
         println!("{id}");
         eprintln!(
-            "committed {} ({})",
+            "committed {} ({}{})",
             short(id),
-            plural(cs.changes.len(), "file")
+            plural(cs.changes.len(), "file"),
+            match cs.parents.get(1) {
+                Some(other) => format!(", merge of {}", short(other)),
+                None => String::new(),
+            }
         );
         if let Some(s) = signed_by {
             eprintln!("signed as {} (key {})", s.name, s.key_id);

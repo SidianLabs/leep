@@ -104,6 +104,8 @@ fn run(ctx: &mut Ctx, target: ChangesetId, force: bool) -> Result<Stats> {
 
     ctx.wc.state.conflicts.clear();
     ctx.wc.state.unresolved.clear();
+    ctx.wc.state.merge_in_progress = None;
+    ctx.wc.state.pick_in_progress = None;
     ctx.wc.state.base = Some(target);
     Ok(stats)
 }

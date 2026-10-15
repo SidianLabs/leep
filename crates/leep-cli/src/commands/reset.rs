@@ -27,6 +27,11 @@ pub struct ResetArgs {
 }
 
 pub fn run(ctx: &mut Ctx, args: &ResetArgs) -> Result<i32> {
+    // A hard reset is the way out of an unfinished merge, so only the soft
+    // one, which would keep its files, is refused.
+    if !args.hard {
+        ctx.refuse_in_progress()?;
+    }
     let old = ctx
         .wc
         .state

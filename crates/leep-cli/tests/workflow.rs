@@ -90,7 +90,7 @@ fn exists(ctx: &Ctx, rel: &str) -> bool {
 
 fn commit_args(msg: &str) -> CommitArgs {
     CommitArgs {
-        message: msg.into(),
+        message: Some(msg.into()),
         author: Some("tester".into()),
         ..Default::default()
     }

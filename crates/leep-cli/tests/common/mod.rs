@@ -39,6 +39,11 @@ pub struct Data {
     pub rebases: Vec<(ChangesetId, ChangesetId)>,
     /// Ref log, oldest first; `seq` is the index plus one.
     pub reflog: Vec<RefLogEntry>,
+    /// Answer merge conflicts without the `clean` map, like a server that
+    /// predates it.
+    pub omit_merge_clean: bool,
+    /// Every merge request received.
+    pub merges: Vec<MergeRequest>,
 }
 
 pub type Shared = Arc<Mutex<Data>>;
@@ -180,6 +185,7 @@ impl Mock {
             .route("/v1/changesets", post(create))
             .route("/v1/changesets/{id}", get(get_changeset))
             .route("/v1/rebase", post(rebase))
+            .route("/v1/merge", post(merge))
             .route(
                 "/v1/changesets/{id}/signatures",
                 post(add_signature).get(list_signatures),
@@ -230,6 +236,29 @@ impl Mock {
         files: &[(&str, &str, FileKind)],
         deletes: &[&str],
     ) -> ChangesetId {
+        self.seed_on("main", parent, files, deletes)
+    }
+
+    /// [`Mock::seed`] for another ref, leaving `main` where it is.
+    pub fn seed_on(
+        &self,
+        name: &str,
+        parent: Option<ChangesetId>,
+        files: &[(&str, &str, FileKind)],
+        deletes: &[&str],
+    ) -> ChangesetId {
+        self.seed_as(name, "seed", parent, files, deletes)
+    }
+
+    /// [`Mock::seed_on`] with a commit message.
+    pub fn seed_as(
+        &self,
+        name: &str,
+        message: &str,
+        parent: Option<ChangesetId>,
+        files: &[(&str, &str, FileKind)],
+        deletes: &[&str],
+    ) -> ChangesetId {
         let mut d = self.data.lock().unwrap();
         let mut changes = BTreeMap::new();
         for (p, body, kind) in files {
@@ -251,11 +280,11 @@ impl Mock {
             parents: parent.into_iter().collect(),
             author: "seed".into(),
             timestamp: 1,
-            message: "seed".into(),
+            message: message.into(),
             changes,
             extra: BTreeMap::new(),
         });
-        d.refs.insert("main".into(), id);
+        d.refs.insert(name.into(), id);
         id
     }
 }
@@ -645,6 +674,85 @@ async fn rebase(State(s): State<Shared>, Json(r): Json<RebaseRequest>) -> Resp<R
         ..orig
     });
     Ok(Json(RebaseResponse::Rebased { id }))
+}
+
+/// File-level three-way merge with the nearest common ancestor as the base:
+/// a path both sides changed differently conflicts, with markers when both
+/// are text. `clean` is relative to the first parent, like the real server's.
+async fn merge(State(s): State<Shared>, Json(r): Json<MergeRequest>) -> Resp<MergeResponse> {
+    let mut d = s.lock().unwrap();
+    d.merges.push(r.clone());
+    let [ours_id, theirs_id] = r.parents;
+    for id in r.parents {
+        if !d.changesets.contains_key(&id) {
+            return Err(err(StatusCode::NOT_FOUND, "no such changeset"));
+        }
+    }
+    let theirs_anc = ancestors(&d, theirs_id);
+    let fork = ancestors(&d, ours_id)
+        .into_iter()
+        .find(|c| theirs_anc.contains(c));
+    let base_files = fork.map(|f| d.files[&f].clone()).unwrap_or_default();
+    let ours_files = d.files[&ours_id].clone();
+    let theirs_files = d.files[&theirs_id].clone();
+    let same = |a: Option<&FileInfo>, b: Option<&FileInfo>| {
+        a.map(|f| (f.content, f.kind)) == b.map(|f| (f.content, f.kind))
+    };
+    let mut conflicts = vec![];
+    let mut clean = BTreeMap::new();
+    for path in base_files
+        .keys()
+        .chain(theirs_files.keys())
+        .collect::<std::collections::BTreeSet<_>>()
+    {
+        let (b, o, t) = (
+            base_files.get(path),
+            ours_files.get(path),
+            theirs_files.get(path),
+        );
+        if same(t, b) || same(t, o) {
+            continue;
+        }
+        let rp = RepoPath::new(path.as_str()).unwrap();
+        if same(b, o) {
+            clean.insert(
+                rp,
+                match t {
+                    Some(f) => FileChange::Modify {
+                        content: f.content,
+                        kind: f.kind,
+                        size: f.size,
+                    },
+                    None => FileChange::Delete,
+                },
+            );
+            continue;
+        }
+        let (ours, theirs) = (o.cloned(), t.cloned());
+        let merged = d.markers(&ours, &theirs);
+        conflicts.push(Conflict {
+            path: rp,
+            base: b.cloned(),
+            ours,
+            theirs,
+            merged_with_markers: merged,
+        });
+    }
+    if !conflicts.is_empty() {
+        if d.omit_merge_clean {
+            clean.clear();
+        }
+        return Ok(Json(MergeResponse::Conflicts { conflicts, clean }));
+    }
+    let id = d.insert(Changeset {
+        parents: vec![ours_id, theirs_id],
+        author: r.authorship.author,
+        timestamp: r.authorship.timestamp.unwrap_or(0),
+        message: r.message,
+        changes: clean,
+        extra: r.extra,
+    });
+    Ok(Json(MergeResponse::Merged { id }))
 }
 
 /// Fast-forward when possible; otherwise replay the changes on the head,

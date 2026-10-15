@@ -52,6 +52,7 @@ pub struct SyncArgs {
 /// Move to the current head of the target ref, carrying uncommitted changes
 /// and unlanded local commits along (see ADR 0017).
 pub fn sync(ctx: &mut Ctx, args: &SyncArgs) -> Result<i32> {
+    ctx.refuse_in_progress()?;
     let name = ctx.wc.config.target_ref.clone();
     if args.no_rebase {
         ctx.require_clean()?;

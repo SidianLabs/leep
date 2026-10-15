@@ -91,6 +91,7 @@ fn nth(ctx: &Ctx, index: usize) -> Result<Stash> {
 }
 
 fn push(ctx: &mut Ctx, args: &PushArgs) -> Result<i32> {
+    ctx.refuse_in_progress()?;
     let st = status(&ctx.wc)?;
     st.refuse_conflicts()?;
     if st.is_clean() {
@@ -190,6 +191,7 @@ fn show(ctx: &Ctx, index: usize) -> Result<i32> {
 
 /// `target` is a stash position or a snapshot id. Conflicts keep the stash.
 fn apply(ctx: &mut Ctx, target: Option<&str>, pop: bool) -> Result<i32> {
+    ctx.refuse_in_progress()?;
     let (index, id) = match target {
         None => (Some(0), nth(ctx, 0)?.id),
         Some(t) => match t.parse::<usize>() {

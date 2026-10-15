@@ -78,6 +78,33 @@ pub struct Stash {
     pub timestamp: i64,
 }
 
+/// A merge that stopped on conflicts. The base is still the first parent;
+/// the next `leep commit` adds `other` as the second.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MergeState {
+    pub other: ChangesetId,
+    /// Default message for the merge commit.
+    pub message: String,
+    /// Paths the merge created that the base lacks, so `--abort` can remove
+    /// them (they would otherwise look like the user's new files).
+    #[serde(default)]
+    pub added: Vec<String>,
+}
+
+/// A cherry-pick or revert that stopped on conflicts. The next `leep commit`
+/// records the resolved change with `message` as its default.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PickState {
+    /// The changeset being picked or reverted.
+    pub from: ChangesetId,
+    pub message: String,
+    #[serde(default)]
+    pub revert: bool,
+    /// See [`MergeState::added`].
+    #[serde(default)]
+    pub added: Vec<String>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct State {
     pub base: Option<ChangesetId>,
@@ -94,6 +121,10 @@ pub struct State {
     /// refers to.
     #[serde(default)]
     pub stashes: Vec<Stash>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_in_progress: Option<MergeState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pick_in_progress: Option<PickState>,
 }
 
 #[derive(Debug)]
@@ -257,6 +288,17 @@ mod tests {
             message: "wip".into(),
             timestamp: 5,
         });
+        wc.state.merge_in_progress = Some(MergeState {
+            other: ChangesetId(Hash::of_blob(b"other")),
+            message: "Merge x".into(),
+            added: vec!["src/new.rs".into()],
+        });
+        wc.state.pick_in_progress = Some(PickState {
+            from: ChangesetId(Hash::of_blob(b"from")),
+            message: "Revert \"x\"".into(),
+            revert: true,
+            added: vec![],
+        });
         wc.save_state().unwrap();
         let back = WorkCopy::open(dir.path()).unwrap();
         assert_eq!(back.state, wc.state);
@@ -320,6 +362,9 @@ mod tests {
         let old = r#"{"base":null,"files":{},"conflicts":[]}"#;
         let st: State = serde_json::from_str(old).unwrap();
         assert!(st.stashes.is_empty());
+        assert!(st.merge_in_progress.is_none() && st.pick_in_progress.is_none());
+        let out = serde_json::to_string(&st).unwrap();
+        assert!(!out.contains("in_progress"), "unset fields are not written");
     }
 
     #[test]
