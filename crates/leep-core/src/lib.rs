@@ -10,6 +10,7 @@ pub mod error;
 pub mod hash;
 pub mod memory;
 pub mod path;
+pub mod signature;
 pub mod store;
 pub mod tree;
 
