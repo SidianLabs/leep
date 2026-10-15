@@ -13,6 +13,7 @@ cargo test --workspace                       # Postgres tests skip unless LEEP_T
 cargo test -p <crate>                        # one crate
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
+cargo bench -p leep-derive                   # criterion; LEEP_BENCH_LARGE=1 adds 100k cases; see docs/PERFORMANCE.md
 ```
 CI runs fmt check, clippy with `-D warnings`, and tests against Postgres 16.
 A change isn't done until all three pass locally.

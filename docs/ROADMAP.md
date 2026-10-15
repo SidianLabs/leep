@@ -17,7 +17,7 @@ Milestones are ordered. Each one should leave `main` releasable.
 - [ ] Structured logs; Prometheus metrics (cache hit rates, land retries, derive latency)
 - Docker images and a docker-compose file (server + Postgres + MinIO)
 - Blob garbage collection (mark from refs plus a retention window)
-- Benchmarks: commit and land latency versus repository size
+- [x] Benchmarks: commit and land latency versus repository size (`docs/PERFORMANCE.md`)
 
 ## v0.3: Agent-native
 - Provenance: `leep log --agent`, and queries over `agent.*` metadata

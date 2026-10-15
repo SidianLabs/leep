@@ -29,6 +29,8 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      # Compile only, so the benches do not rot.
+      - run: cargo bench --no-run -p leep-derive
 
   docker:
     runs-on: ubuntu-latest
