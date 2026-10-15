@@ -18,6 +18,7 @@ leep-meta = { path = "crates/leep-meta" }
 leep-derive = { path = "crates/leep-derive" }
 leep-git = { path = "crates/leep-git" }
 leep-server = { path = "crates/leep-server" }
+leep-testkit = { path = "crates/leep-testkit" }
 
 anyhow = "1"
 async-trait = "0.1"
