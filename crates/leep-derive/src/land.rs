@@ -4,7 +4,7 @@
 use std::collections::hash_map::RandomState;
 use std::hash::BuildHasher;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use leep_core::api::{LandResponse, RebaseResponse};
 use leep_core::{ChangesetId, Error, Result};
@@ -23,6 +23,29 @@ fn backoff(attempt: u32) -> Duration {
     Duration::from_millis(RandomState::new().hash_one(attempt) % (cap + 1))
 }
 
+/// What one land call saw, for metrics only.
+#[derive(Default)]
+struct LandStats {
+    attempts: u32,
+    exhausted: bool,
+}
+
+impl LandStats {
+    fn record(&self, result: &Result<LandResponse>, elapsed: Duration) {
+        let outcome = match result {
+            Ok(LandResponse::Landed { .. }) => "landed",
+            Ok(LandResponse::Conflicts { .. }) => "conflicts",
+            Err(_) if self.exhausted => "exhausted",
+            Err(_) => "error",
+        };
+        metrics::counter!("leep_land_total", "outcome" => outcome).increment(1);
+        metrics::histogram!("leep_land_duration_seconds").record(elapsed.as_secs_f64());
+        if self.attempts > 0 {
+            metrics::histogram!("leep_land_attempts").record(f64::from(self.attempts));
+        }
+    }
+}
+
 impl Repo {
     /// Land `cs` on `target_ref`. Fast-forwards when the head is an ancestor;
     /// otherwise replays the unlanded stack under `cs` onto the head. Retries
@@ -33,13 +56,29 @@ impl Repo {
     /// the CAS to a sibling request. The CAS still guards against other
     /// processes, with jittered backoff between losses.
     pub async fn land(&self, cs: ChangesetId, target_ref: &str) -> Result<LandResponse> {
+        let started = Instant::now();
+        let mut stats = LandStats::default();
+        let result = self.land_inner(cs, target_ref, &mut stats).await;
+        stats.record(&result, started.elapsed());
+        result
+    }
+
+    async fn land_inner(
+        &self,
+        cs: ChangesetId,
+        target_ref: &str,
+        stats: &mut LandStats,
+    ) -> Result<LandResponse> {
         self.get_changeset(cs).await?;
         let lock = {
             let mut locks = self.land_locks.lock().expect("land lock map poisoned");
             Arc::clone(locks.entry(target_ref.to_string()).or_default())
         };
+        let waited = Instant::now();
         let _guard = lock.lock().await;
+        metrics::histogram!("leep_land_lock_wait_seconds").record(waited.elapsed().as_secs_f64());
         for attempt in 1..=MAX_LAND_ATTEMPTS {
+            stats.attempts = attempt;
             let head = self.meta().get_ref(target_ref).await?;
             let new = match head {
                 None => cs,
@@ -65,8 +104,10 @@ impl Repo {
                     attempts: attempt,
                 });
             }
+            metrics::counter!("leep_land_cas_losses_total").increment(1);
             tokio::time::sleep(backoff(attempt)).await;
         }
+        stats.exhausted = true;
         Err(Error::Conflict(format!(
             "land onto {target_ref:?} lost the race {MAX_LAND_ATTEMPTS} times; retry"
         )))

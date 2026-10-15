@@ -82,7 +82,11 @@ pub async fn derive<K: DerivedKind>(repo: &Repo, id: ChangesetId) -> Result<Byte
             };
             pv.push(v);
         }
+        let started = std::time::Instant::now();
         let v = K::derive(repo, cid, &cs, &pv).await?;
+        metrics::counter!("leep_derive_total", "kind" => K::NAME).increment(1);
+        metrics::histogram!("leep_derive_duration_seconds", "kind" => K::NAME)
+            .record(started.elapsed().as_secs_f64());
         meta.put_derived(K::NAME, &cid.0, v.clone()).await?;
         computed.insert(cid, v.clone());
         last = Some(v);
