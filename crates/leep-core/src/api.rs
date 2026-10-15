@@ -16,7 +16,8 @@
 //! | GET  | `/v1/tree/{id}?path=dir` | – | [`TreeResponse`] (one directory level) |
 //! | GET  | `/v1/files/{id}?prefix=dir` | – | [`FilesResponse`] (recursive listing) |
 //! | GET  | `/v1/file/{id}?path=p` | – | raw bytes + `x-leep-kind` header, or 404 |
-//! | GET  | `/v1/log/{id}?path=p&limit=n&author=a&extra=k:v` | – | [`LogResponse`] (newest first; `limit` defaults to 100, capped at 10000). `author` is a case-insensitive substring; `extra` repeats, is ANDed, and is `key:value` (exact) or `key` (present). `limit` counts matches, so a selective filter scans history linearly |
+//! | GET  | `/v1/log/{id}?path=p&limit=n&author=a&extra=k:v` | – | [`LogResponse`] (newest first; `limit` defaults to 100, capped at 10000). `author` is a case-insensitive substring; `extra` repeats, is ANDed, and is `key:value` (exact) or `key` (present). `limit` counts matches. With `path` the walk follows the path-history index; without it, or for `author` and `extra`, a selective filter scans changesets linearly |
+//! | GET  | `/v1/last-change/{id}?path=p` | – | [`LastChangeResponse`] (the newest changeset reachable from `id` that changed file or directory `p`, answered from the path-history index; a deleted path answers with the deleting changeset; 404 if `p` never existed) |
 //! | GET  | `/v1/diff?from=a&to=b&prefix=dir` | – | [`DiffResponse`] (`from` omitted = empty tree) |
 //! | GET  | `/v1/blame/{id}?path=p` | – | [`BlameResponse`] (with per-changeset [`ChangesetSummary`]) |
 //! | GET  | `/v1/provenance/{id}?path=prefix&limit=n` | – | [`ProvenanceResponse`] (who and what made the changesets reachable from `id`; `limit` defaults to 10000, capped at 10000) |
@@ -244,6 +245,18 @@ pub struct FilesResponse {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogResponse {
     pub entries: Vec<ChangesetInfo>,
+}
+
+/// Newest change to a path, from the path-history index.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LastChangeResponse {
+    pub path: String,
+    pub changeset: ChangesetInfo,
+    /// Other newest changes that are not ancestors of `changeset`: two merged
+    /// branches that both changed the path and kept it as it was in the first
+    /// parent. Usually empty.
+    #[serde(default)]
+    pub concurrent: Vec<ChangesetId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -476,6 +489,32 @@ mod tests {
             serde_json::from_value(serde_json::json!({ "signatures": [], "verified": true }))
                 .unwrap();
         assert_eq!(v.via, None);
+    }
+
+    #[test]
+    fn last_change_response_without_concurrent_parses() {
+        let id = ChangesetId(Hash::of_blob(b"z"));
+        let cs = Changeset {
+            parents: vec![],
+            author: "a".into(),
+            timestamp: 1,
+            message: "m".into(),
+            changes: BTreeMap::new(),
+            extra: BTreeMap::new(),
+        };
+        let info = ChangesetInfo {
+            id,
+            changeset: cs,
+            generation: 1,
+            root_tree: Hash::of_blob(b"t"),
+        };
+        let mut v = serde_json::json!({ "path": "src", "changeset": info });
+        let r: LastChangeResponse = serde_json::from_value(v.clone()).unwrap();
+        assert!(r.concurrent.is_empty());
+        assert_eq!(r.changeset.id, id);
+        v["concurrent"] = serde_json::json!([id]);
+        let r: LastChangeResponse = serde_json::from_value(v).unwrap();
+        assert_eq!(r.concurrent, [id]);
     }
 
     #[test]
