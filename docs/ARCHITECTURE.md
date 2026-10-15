@@ -75,7 +75,7 @@ content-addressing and (b) the atomicity of `MetaStore::cas_ref`.
 | `leep-derive` | `Repo`: derived data framework and kinds, plus all operations | core (traits only, never a concrete backend) |
 | `leep-server` | HTTP server binary `leep-server` | core, store, meta, derive |
 | `leep-cli` | Client binary `leep` | core only |
-| `leep-git` | Git bridge, library plus admin commands | core, derive |
+| `leep-git` | Git bridge: library plus the `leep-git` admin binary | core, derive; store and meta only to open stores by URL in the binary |
 
 Rules:
 - Dependencies point toward `leep-core`. Nothing depends on `leep-server` or
