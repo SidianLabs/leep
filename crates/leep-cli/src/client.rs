@@ -3,17 +3,27 @@
 //! Network failures and 5xx answers are [`CliError::Server`] (exit 2); 4xx
 //! answers are [`CliError::User`] (exit 1). `ErrorResponse` bodies become the
 //! error message. 401 and 403 get fixed, token-free messages instead.
+//!
+//! A 429 from the server's request limits (ADR 0020) is retried for GET
+//! requests only, honoring `Retry-After`; anything else fails at once, since a
+//! blind retry of a write could repeat it.
 
 use std::time::Duration;
 
 use leep_core::api::*;
 use leep_core::{Changeset, ChangesetId, FileKind, Hash};
 use reqwest::blocking::{Client as Http, RequestBuilder, Response};
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
+use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, RETRY_AFTER};
 use reqwest::StatusCode;
 use serde::de::DeserializeOwned;
 
 use crate::error::{CliError, Result};
+
+/// Tries per GET before a 429 is reported.
+const MAX_ATTEMPTS: u32 = 4;
+/// Longest pause between tries. A longer `Retry-After` means the server wants
+/// the caller gone for a while, so fail with that advice instead of hanging.
+const MAX_RETRY_WAIT: Duration = Duration::from_secs(10);
 
 #[derive(Clone)]
 pub struct Client {
@@ -135,14 +145,36 @@ impl Client {
     }
 
     fn send(&self, req: RequestBuilder) -> Result<Response> {
-        let resp = req
-            .send()
-            .map_err(|e| CliError::server(format!("cannot reach {}: {e}", self.base)))?;
-        let status = resp.status();
-        if status.is_success() {
-            return Ok(resp);
+        let (http, built) = req.build_split();
+        let built = built.map_err(|e| CliError::server(format!("bad request: {e}")))?;
+        let idempotent = built.method() == reqwest::Method::GET;
+        let mut current = built;
+        let mut attempt = 1;
+        loop {
+            let spare = if idempotent {
+                current.try_clone()
+            } else {
+                None
+            };
+            let resp = http
+                .execute(current)
+                .map_err(|e| CliError::server(format!("cannot reach {}: {e}", self.base)))?;
+            let status = resp.status();
+            if status.is_success() {
+                return Ok(resp);
+            }
+            if let (StatusCode::TOO_MANY_REQUESTS, Some(next), true) =
+                (status, spare, attempt < MAX_ATTEMPTS)
+            {
+                if let Some(wait) = retry_after(&resp).filter(|w| *w <= MAX_RETRY_WAIT) {
+                    std::thread::sleep(wait);
+                    attempt += 1;
+                    current = next;
+                    continue;
+                }
+            }
+            return Err(error_from(resp, self.has_token));
         }
-        Err(error_from(resp, self.has_token))
     }
 
     fn json<T: DeserializeOwned>(&self, req: RequestBuilder) -> Result<T> {
@@ -442,6 +474,16 @@ impl Client {
     }
 }
 
+/// The pause the server asked for. A missing or unparsable header counts as
+/// one second, so a bare 429 is still retried gently.
+fn retry_after(resp: &Response) -> Option<Duration> {
+    let secs = match resp.headers().get(RETRY_AFTER) {
+        Some(v) => v.to_str().ok()?.trim().parse::<u64>().ok()?,
+        None => 1,
+    };
+    Some(Duration::from_secs(secs))
+}
+
 fn error_from(resp: Response, has_token: bool) -> CliError {
     let status = resp.status();
     match status {
@@ -475,6 +517,82 @@ fn error_from(resp: Response, has_token: bool) -> CliError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// Answers each connection with the next canned response (the last one
+    /// repeats) and counts the requests it saw.
+    fn stub(responses: &[&'static str]) -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let seen = Arc::new(AtomicUsize::new(0));
+        let count = seen.clone();
+        let responses = responses.to_vec();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let mut conn = conn.unwrap();
+                let mut buf = [0u8; 4096];
+                let mut got = Vec::new();
+                while !got.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let n = conn.read(&mut buf).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    got.extend_from_slice(&buf[..n]);
+                }
+                let i = count
+                    .fetch_add(1, Ordering::SeqCst)
+                    .min(responses.len() - 1);
+                conn.write_all(responses[i].as_bytes()).unwrap();
+            }
+        });
+        (url, seen)
+    }
+
+    const LIMITED_NOW: &str = "HTTP/1.1 429 Too Many Requests\r\nretry-after: 0\r\n\
+        content-type: application/json\r\ncontent-length: 52\r\nconnection: close\r\n\r\n\
+        {\"error\":\"rate limit exceeded; retry after 1s     \"}";
+    const LIMITED_LONG: &str = "HTTP/1.1 429 Too Many Requests\r\nretry-after: 60\r\n\
+        content-type: application/json\r\ncontent-length: 52\r\nconnection: close\r\n\r\n\
+        {\"error\":\"rate limit exceeded; retry after 60s    \"}";
+    const OK: &str = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+        content-length: 17\r\nconnection: close\r\n\r\n{\"refs\":{}}      ";
+
+    #[test]
+    fn a_limited_get_is_retried_after_the_pause_the_server_asks_for() {
+        let (url, seen) = stub(&[LIMITED_NOW, LIMITED_NOW, OK]);
+        let refs = Client::new(&url).refs().unwrap();
+        assert!(refs.refs.is_empty());
+        assert_eq!(seen.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn a_get_gives_up_after_a_bounded_number_of_tries() {
+        let (url, seen) = stub(&[LIMITED_NOW]);
+        let e = Client::new(&url).refs().unwrap_err();
+        assert!(e.to_string().contains("rate limit exceeded"), "{e}");
+        assert_eq!(seen.load(Ordering::SeqCst), MAX_ATTEMPTS as usize);
+        assert_eq!(e.exit_code(), 1);
+    }
+
+    #[test]
+    fn a_long_retry_after_is_reported_instead_of_waited_out() {
+        let (url, seen) = stub(&[LIMITED_LONG, OK]);
+        let e = Client::new(&url).refs().unwrap_err();
+        assert!(e.to_string().contains("retry after 60s"), "{e}");
+        assert_eq!(seen.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn writes_are_never_retried() {
+        let (url, seen) = stub(&[LIMITED_NOW, OK]);
+        let h = Hash::of_blob(b"x");
+        let e = Client::new(&url).put_blob(&h, b"x".to_vec()).unwrap_err();
+        assert!(e.to_string().contains("rate limit exceeded"), "{e}");
+        assert_eq!(seen.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn search_flags_become_params() {
