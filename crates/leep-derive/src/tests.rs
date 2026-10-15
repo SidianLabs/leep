@@ -1105,6 +1105,143 @@ async fn blame_after_delete_and_recreate() {
     assert!(b.lines.iter().all(|l| l.changeset == c3));
 }
 
+/// Blame must not read every ancestor of a file nobody has touched for a
+/// long time (the soak test found blame taking seconds on a deep history).
+#[tokio::test]
+async fn blame_of_an_untouched_file_does_not_walk_the_whole_history() {
+    let r = repo();
+    let mut tip = commit(
+        &r,
+        &[],
+        &[("old", Some("one\ntwo\n")), ("other", Some("0\n"))],
+        "root",
+    )
+    .await;
+    tip = commit(&r, &[tip], &[("old", Some("one\ntwo\nthree\n"))], "touch").await;
+    for i in 1..=300 {
+        tip = commit(
+            &r,
+            &[tip],
+            &[("other", Some(&format!("{i}\n")))],
+            "edit other",
+        )
+        .await;
+    }
+    let (full, walked) = r.blame_walk(tip, &rp("old"), false, false).await.unwrap();
+    let (fast, skipped) = r.blame_walk(tip, &rp("old"), true, false).await.unwrap();
+    assert_eq!(fast, full);
+    assert!(
+        walked > 300,
+        "the reference walk reads every ancestor: {walked}"
+    );
+    assert!(skipped <= 3, "skipping examined {skipped} changesets");
+    // A repeated call is answered from the cache without any walk.
+    let b = r.blame(tip, &rp("old")).await.unwrap();
+    let (_, again) = r.blame_walk(tip, &rp("old"), true, true).await.unwrap();
+    assert_eq!(again, 0);
+    assert_eq!(b.lines.len(), 3);
+}
+
+/// Skipping is an optimisation: over histories with edits, reverts, deletes,
+/// re-creations and merges it must give the answer of the full walk.
+#[tokio::test]
+async fn blame_skipping_agrees_with_a_full_walk() {
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> usize {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (self.0 >> 33) as usize
+        }
+    }
+    let text = |tag: usize| -> String { (0..6).map(|i| format!("line {i} v{tag}\n")).collect() };
+    for seed in 1..=6u64 {
+        let r = repo();
+        let mut rng = Lcg(seed);
+        let names = ["a", "b", "c", "d"];
+        let mut state: BTreeMap<&str, Vec<Option<String>>> = BTreeMap::new();
+        let mut root_files = Vec::new();
+        for n in names {
+            state.insert(n, vec![Some(text(0))]);
+            root_files.push((n, Some(text(0))));
+        }
+        let files: Vec<(&str, Option<&str>)> =
+            root_files.iter().map(|(n, t)| (*n, t.as_deref())).collect();
+        let mut main = commit(&r, &[], &files, "root").await;
+        let mut all = vec![main];
+        for step in 1..=90usize {
+            let n = names[rng.next() % names.len()];
+            let history = state.get_mut(n).unwrap();
+            match rng.next() % 10 {
+                0..=4 => {
+                    // Edit (or create again) the file.
+                    let new = text(step);
+                    history.push(Some(new.clone()));
+                    main = commit(&r, &[main], &[(n, Some(&new))], "edit").await;
+                }
+                5 | 6 if history.len() > 1 => {
+                    // Back to an earlier version.
+                    let old = history[history.len() - 2].clone();
+                    history.push(old.clone());
+                    main = commit(&r, &[main], &[(n, old.as_deref())], "revert").await;
+                }
+                7 => {
+                    let gone = history.last().is_some_and(|t| t.is_none());
+                    let new = (!gone).then(|| text(step));
+                    history.push(new.clone());
+                    main = commit(&r, &[main], &[(n, new.as_deref())], "toggle").await;
+                }
+                8 => {
+                    // A side branch from an earlier changeset, merged back.
+                    let base = all[rng.next() % all.len()];
+                    let mut side = base;
+                    for k in 0..1 + rng.next() % 3 {
+                        let m = names[rng.next() % names.len()];
+                        side = commit(
+                            &r,
+                            &[side],
+                            &[(m, Some(&text(1000 + step * 10 + k)))],
+                            "side",
+                        )
+                        .await;
+                        all.push(side);
+                    }
+                    let m = names[rng.next() % names.len()];
+                    let new = text(2000 + step);
+                    state.get_mut(m).unwrap().push(Some(new.clone()));
+                    main = commit(&r, &[main, side], &[(m, Some(&new))], "merge").await;
+                }
+                _ => {
+                    let other = format!("e{step}");
+                    main = commit(&r, &[main], &[(&other, Some("x\n"))], "unrelated").await;
+                }
+            }
+            all.push(main);
+        }
+        let mut compared = 0;
+        for (i, tip) in all.iter().enumerate() {
+            if i % 3 != 0 && *tip != main {
+                continue;
+            }
+            for n in names {
+                let full = r.blame_walk(*tip, &rp(n), false, false).await;
+                let fast = r.blame_walk(*tip, &rp(n), true, false).await;
+                match (full, fast) {
+                    (Ok(a), Ok(b)) => {
+                        assert_eq!(a.0, b.0, "seed {seed}, {n} at {tip}");
+                        compared += 1;
+                    }
+                    (Err(Error::NotFound(_)), Err(Error::NotFound(_))) => {}
+                    (a, b) => panic!("seed {seed}, {n} at {tip}: {a:?} vs {b:?}"),
+                }
+            }
+        }
+        assert!(compared > 40, "seed {seed} compared only {compared}");
+    }
+}
+
 #[tokio::test]
 async fn deep_linear_chain_via_create() {
     let r = repo();
