@@ -10,7 +10,7 @@ use leep_cli::cache::Cache;
 use leep_cli::client::LogQuery;
 use leep_cli::commands::checkout::{checkout, sync, CheckoutArgs};
 use leep_cli::commands::commit::{self, CommitArgs};
-use leep_cli::commands::history::{self, BlameArgs, LogArgs, ProvenanceArgs};
+use leep_cli::commands::history::{self, BlameArgs, LastChangeArgs, LogArgs, ProvenanceArgs};
 use leep_cli::commands::init::{self, InitArgs};
 use leep_cli::commands::land::{self, LandArgs};
 use leep_cli::commands::Ctx;
@@ -455,6 +455,16 @@ fn provenance_queries_reach_the_server_and_decode() {
     let p = ctx.client.provenance(&tip, None, None).unwrap();
     assert_eq!(p.scanned, 3);
     assert!(p.humans.iter().any(|h| h.author == "robot"));
+    let lc = LastChangeArgs {
+        path: "src".into(),
+        rev: None,
+    };
+    assert_eq!(history::last_change(&r, &lc).unwrap(), 0);
+    let q = last_query("last-change");
+    assert!(q.contains("path=src"), "{q}");
+    let resp = ctx.client.last_change(&tip, "src/a.rs").unwrap();
+    assert_eq!((resp.path.as_str(), resp.changeset.id), ("src/a.rs", tip));
+    assert!(resp.concurrent.is_empty());
     let blame = BlameArgs {
         args: vec!["a.txt".into()],
         who: true,

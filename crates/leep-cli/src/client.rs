@@ -278,6 +278,15 @@ impl Client {
         )
     }
 
+    /// Newest change to a file or directory, from the server's path index.
+    pub fn last_change(&self, id: &ChangesetId, path: &str) -> Result<LastChangeResponse> {
+        self.json(
+            self.http
+                .get(self.url(&format!("/v1/last-change/{id}")))
+                .query(&[("path", path)]),
+        )
+    }
+
     pub fn provenance(
         &self,
         id: &ChangesetId,

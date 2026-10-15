@@ -54,6 +54,8 @@ pub enum Command {
     Sync,
     /// Show history.
     Log(history::LogArgs),
+    /// Show the newest changeset that changed a file or directory.
+    LastChange(history::LastChangeArgs),
     /// Show one changeset.
     Show(history::ShowArgs),
     /// Print a file at a revision.
@@ -112,6 +114,7 @@ pub fn run(cli: Cli) -> Result<i32> {
     let read_only = matches!(
         cli.command,
         Command::Log(_)
+            | Command::LastChange(_)
             | Command::Show(_)
             | Command::Cat(_)
             | Command::Blame(_)
@@ -161,6 +164,7 @@ pub fn run(cli: Cli) -> Result<i32> {
 fn read_only_cmd(cmd: &Command, r: &Remote) -> Result<i32> {
     match cmd {
         Command::Log(a) => history::log(r, a),
+        Command::LastChange(a) => history::last_change(r, a),
         Command::Show(a) => history::show(r, a),
         Command::Cat(a) => history::cat(r, a),
         Command::Blame(a) => history::blame(r, a),
