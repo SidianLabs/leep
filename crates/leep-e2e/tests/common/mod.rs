@@ -86,7 +86,12 @@ impl Server {
     pub fn start_with(port: u16, stores: &Stores, log_dir: &Path, extra: &[&str]) -> Server {
         let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
         let log = log_dir.join(format!("server-{port}-{}.log", std::process::id()));
-        let out = fs::File::create(&log).unwrap();
+        // Appended, so a restarted server keeps the log of the one before it.
+        let out = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log)
+            .unwrap();
         let err = out.try_clone().unwrap();
         let child = Command::new(bin("leep-server"))
             .args(["--listen", &addr.to_string()])
@@ -181,6 +186,69 @@ pub fn post_json(addr: SocketAddr, path: &str, body: &str) -> (u16, String) {
         .unwrap_or_default()
         .to_string();
     (status, body)
+}
+
+/// One HTTP request with a binary body, for clients that must see exactly
+/// what the server answered (or that it did not). Returns the status and the
+/// response body; any transport failure is an `Err`, as it is for a client
+/// whose server was just killed.
+pub fn http(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    body: &[u8],
+) -> std::io::Result<(u16, Vec<u8>)> {
+    let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(2))?;
+    s.set_read_timeout(Some(Duration::from_secs(30)))?;
+    s.set_write_timeout(Some(Duration::from_secs(30)))?;
+    let head = format!(
+        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
+    s.write_all(head.as_bytes())?;
+    s.write_all(body)?;
+    let mut resp = Vec::new();
+    s.read_to_end(&mut resp)?;
+    let bad = |what: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, what.to_string());
+    let split = resp
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .ok_or_else(|| bad("truncated response"))?;
+    let head = String::from_utf8_lossy(&resp[..split]).into_owned();
+    let status = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| bad("no status"))?;
+    let body = resp[split + 4..].to_vec();
+    let declared = head.lines().find_map(|l| {
+        let (k, v) = l.split_once(':')?;
+        k.eq_ignore_ascii_case("content-length")
+            .then(|| v.trim().parse::<usize>().ok())?
+    });
+    if declared.is_some_and(|n| n != body.len()) {
+        return Err(bad("response cut short"));
+    }
+    Ok((status, body))
+}
+
+/// Send a request and hang up `after` later without reading the answer, as a
+/// client does when it times out: the server may be anywhere in the request,
+/// including just past its commit.
+pub fn http_abandon(addr: SocketAddr, method: &str, path: &str, body: &[u8], after: Duration) {
+    let Ok(mut s) = TcpStream::connect_timeout(&addr, Duration::from_secs(2)) else {
+        return;
+    };
+    let head = format!(
+        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
+    if s.write_all(head.as_bytes()).is_ok() && s.write_all(body).is_ok() {
+        std::thread::sleep(after);
+    }
+    let _ = s.shutdown(std::net::Shutdown::Both);
 }
 
 /// GET straight from the server, for requests the CLI would retry or never
