@@ -29,6 +29,9 @@ mod tree_ops;
 #[cfg(test)]
 mod tests;
 
+/// The comment lexer, public only so the fuzz harness can check it directly.
+#[doc(hidden)]
+pub use comments::strip_comments;
 pub use history::{ExtraMatch, LogFilter};
 pub use repo::Repo;
 pub use search::{SearchIndexReport, SearchQuery};
