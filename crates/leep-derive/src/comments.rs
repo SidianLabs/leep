@@ -41,6 +41,26 @@ enum Triple {
     Toml,
 }
 
+/// How a language interpolates code into string literals. The expression
+/// inside may contain quotes in all of these (`f"{d["k"]}"`, `"${m["k"]}"`,
+/// `"$(echo "x")"`), so a string ends later than its first unescaped quote.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Interp {
+    None,
+    /// Python f- and t-strings: `{expr}`, `{{` and `}}` are literal.
+    Python,
+    /// C# `$"..."`: `{expr}`, `{{` and `}}` are literal.
+    CSharp,
+    /// Kotlin and Scala: `${expr}`.
+    Dollar,
+    /// Swift: `\(expr)`.
+    Swift,
+    /// Ruby: `#{expr}`.
+    Ruby,
+    /// Shell double quotes: `$(cmd)`, `$[expr]` and `${param}`.
+    Shell,
+}
+
 #[derive(Clone, Copy)]
 struct Lang {
     /// `#` line comments instead of `//`.
@@ -63,6 +83,13 @@ struct Lang {
     cpp: bool,
     csharp: bool,
     swift: bool,
+    interp: Interp,
+    /// Rust: doc comments are attributes, and their code blocks are tests.
+    rust_doc: bool,
+    /// C preprocessor line splices (`\` + newline) and trigraphs.
+    splices: bool,
+    /// Go: a comment before `import "C"` is C source for cgo.
+    cgo: bool,
 }
 
 const BASE: Lang = Lang {
@@ -84,6 +111,10 @@ const BASE: Lang = Lang {
     cpp: false,
     csharp: false,
     swift: false,
+    interp: Interp::None,
+    rust_doc: false,
+    splices: false,
+    cgo: false,
 };
 
 const C_LIKE: Lang = Lang {
@@ -110,6 +141,7 @@ const SCRIPT_HASH: Lang = Lang {
 fn language(ext: &str) -> Option<Lang> {
     Some(match ext {
         "rs" => Lang {
+            rust_doc: true,
             block: Block::Nested,
             single: Single::RustChar,
             raw_rust: true,
@@ -118,6 +150,7 @@ fn language(ext: &str) -> Option<Lang> {
         },
         "c" | "h" | "cc" | "cpp" | "hpp" => Lang {
             cpp: true,
+            splices: true,
             ..C_LIKE
         },
         "java" => Lang {
@@ -126,26 +159,34 @@ fn language(ext: &str) -> Option<Lang> {
         },
         "js" | "ts" => JS,
         "jsx" | "tsx" => Lang { jsx: true, ..JS },
-        "go" => C_LIKE,
+        "go" => Lang {
+            cgo: true,
+            ..C_LIKE
+        },
         "swift" => Lang {
+            interp: Interp::Swift,
             block: Block::Nested,
             swift: true,
             ..BASE
         },
         "kt" => Lang {
+            interp: Interp::Dollar,
             block: Block::Nested,
             ..BASE
         },
         "scala" => Lang {
+            interp: Interp::Dollar,
             block: Block::Nested,
             unicode_escapes: true,
             ..BASE
         },
         "cs" => Lang {
+            interp: Interp::CSharp,
             csharp: true,
             ..C_LIKE
         },
         "py" => Lang {
+            interp: Interp::Python,
             hash: true,
             single: Single::Str {
                 escapes: true,
@@ -160,6 +201,7 @@ fn language(ext: &str) -> Option<Lang> {
                 multiline: true,
             },
             heredoc: true,
+            interp: Interp::Shell,
             shell: true,
             ..SCRIPT_HASH
         },
@@ -169,6 +211,7 @@ fn language(ext: &str) -> Option<Lang> {
                 multiline: true,
             },
             heredoc: true,
+            interp: Interp::Ruby,
             ruby: true,
             ..SCRIPT_HASH
         },
@@ -241,6 +284,7 @@ fn is_directive(body: &str, hash: bool) -> bool {
         "yaml-language-server",
         "webpack",
         "sourceMappingURL",
+        "swift-tools-version",
         "license",
         "License",
         "SPDX",
@@ -335,7 +379,7 @@ impl Lexer<'_> {
             if c == '\n' || (c == '\r' && self.at(j + 1) == Some('\n')) {
                 break;
             }
-            if suspicious_in_comment(c, self.at(j + 1), self.lang) {
+            if suspicious_in_comment(c, self.at(j + 1), self.lang) || self.splice_at(j) {
                 return None;
             }
             j += 1;
@@ -349,7 +393,7 @@ impl Lexer<'_> {
         let (mut j, mut depth, mut nl) = (i + 2, 1, false);
         loop {
             let c = self.at(j)?;
-            if suspicious_in_comment(c, self.at(j + 1), self.lang) {
+            if suspicious_in_comment(c, self.at(j + 1), self.lang) || self.splice_at(j) {
                 return None;
             }
             if nested && c == '/' && self.at(j + 1) == Some('*') {
@@ -366,6 +410,154 @@ impl Lexer<'_> {
                 j += 1;
             }
         }
+    }
+
+    /// A C line splice starts at `i`: a backslash, optional blanks (GCC
+    /// accepts them), then a newline. The preprocessor deletes it before
+    /// anything else, so it can join `*` and `/` into the end of a comment,
+    /// or carry a line comment onto the next line.
+    fn splice_at(&self, i: usize) -> bool {
+        if !self.lang.splices || self.at(i) != Some('\\') {
+            return false;
+        }
+        let mut j = i + 1;
+        while matches!(self.at(j), Some(' ' | '\t')) {
+            j += 1;
+        }
+        matches!(self.at(j), Some('\n')) || self.starts(j, "\r\n")
+    }
+
+    /// Whether the `)` just emitted may close the head of `if`, `while`,
+    /// `for` or `with`, after which a `/` starts a regex. A quote between
+    /// the parentheses makes the count untrustworthy, so it answers yes.
+    fn paren_closes_statement_head(&self) -> bool {
+        let out: Vec<char> = self.out.chars().collect();
+        let mut depth = 0usize;
+        for k in (0..out.len()).rev() {
+            match out[k] {
+                '"' | '\'' | '`' => return true,
+                ')' => depth += 1,
+                '(' => {
+                    let Some(d) = depth.checked_sub(1) else {
+                        return true;
+                    };
+                    depth = d;
+                    if depth == 0 {
+                        let mut word: Vec<char> = out[..k]
+                            .iter()
+                            .rev()
+                            .skip_while(|c| is_ws(**c))
+                            .take_while(|c| is_ident(**c))
+                            .copied()
+                            .collect();
+                        word.reverse();
+                        let word: String = word.into_iter().collect();
+                        return matches!(word.as_str(), "if" | "while" | "for" | "with");
+                    }
+                }
+                _ => {}
+            }
+        }
+        true
+    }
+
+    fn rest_of_line_has(&self, from: usize, c: char) -> bool {
+        self.chars[from.min(self.chars.len())..]
+            .iter()
+            .take_while(|&&x| x != '\n')
+            .any(|&x| x == c)
+    }
+
+    /// Whether the string literal `chars[start..end]`, with `q` quote
+    /// characters at each end, really ends where the lexer ended it. With
+    /// interpolation the expression inside may hold quotes, so the language
+    /// keeps reading past what looks like the closing quote. Accept only
+    /// literals whose interpolated expressions all close and contain no
+    /// quote, escape or comment marker, so the bracket count can be trusted.
+    fn interp_ok(&self, start: usize, end: usize, q: usize) -> bool {
+        let quote = self.chars[start];
+        let kind = self.lang.interp;
+        let mut braces_escape = false;
+        match kind {
+            Interp::None => return true,
+            Interp::Python => {
+                let mut k = start;
+                while k > 0 && self.chars[k - 1].is_ascii_alphabetic() {
+                    k -= 1;
+                }
+                let prefix = &self.chars[k..start];
+                let fstring = !prefix.is_empty()
+                    && (k == 0 || !is_ident(self.chars[k - 1]))
+                    && prefix.iter().all(|c| "rRbBuUfFtT".contains(*c))
+                    && prefix.iter().any(|c| "fFtT".contains(*c));
+                if !fstring {
+                    return true;
+                }
+                braces_escape = true;
+            }
+            Interp::CSharp => {
+                let mut k = start;
+                while k > 0 && self.chars[k - 1] == '$' {
+                    k -= 1;
+                }
+                if k == start {
+                    return true;
+                }
+                if k > 0 && self.chars[k - 1] == '@' {
+                    return false;
+                }
+                braces_escape = true;
+            }
+            _ if quote != '"' => return true,
+            _ => {}
+        }
+        let body = &self.chars[start + q..end - q];
+        let at = |i: usize| body.get(i).copied();
+        let (mut i, mut depth, mut extra): (usize, usize, &[char]) = (0, 0, &[]);
+        while i < body.len() {
+            let c = body[i];
+            if depth == 0 {
+                let opener = match (kind, c, at(i + 1)) {
+                    (Interp::Python | Interp::CSharp, '{' | '}', n) if n == Some(c) => {
+                        i += 2;
+                        continue;
+                    }
+                    (Interp::Python | Interp::CSharp, '}', _) => return false,
+                    (Interp::Python, '{', _) => Some((1, &['#'][..])),
+                    (Interp::CSharp, '{', _) => Some((1, &['/'][..])),
+                    (Interp::Dollar, '$', Some('{')) => Some((2, &['/'][..])),
+                    (Interp::Swift, '\\', Some('(')) => Some((2, &['/'][..])),
+                    (Interp::Ruby, '#', Some('{')) => Some((2, &['#', '/'][..])),
+                    (Interp::Shell, '$', Some('(' | '[')) => Some((2, &['#'][..])),
+                    (Interp::Shell, '$', Some('{')) => Some((2, &[][..])),
+                    _ => None,
+                };
+                if let Some((len, forbid)) = opener {
+                    depth = 1;
+                    extra = forbid;
+                    i += len;
+                } else if c == '\\' {
+                    i += if braces_escape && matches!(at(i + 1), Some('{' | '}')) {
+                        1
+                    } else {
+                        2
+                    };
+                } else {
+                    i += 1;
+                }
+                continue;
+            }
+            if matches!(c, '"' | '\'' | '`' | '\\') || extra.contains(&c) {
+                return false;
+            }
+            match c {
+                '{' | '(' | '[' => depth += 1,
+                '}' | ')' | ']' => depth -= 1,
+                _ => {}
+            }
+            i += 1;
+        }
+        depth == 0
     }
 
     /// End (exclusive) of a quoted string whose opening quote is at `i`.
@@ -529,6 +721,33 @@ impl Lexer<'_> {
                 continue;
             }
 
+            if lang.splices
+                && self.splice_at(i)
+                && !(i > 0 && matches!(self.chars[i - 1], ' ' | '\t'))
+            {
+                return None;
+            }
+            // Ruby `=begin` and Perl POD blocks are comments the lexer does
+            // not model; a quote inside one would desynchronize it.
+            if (lang.ruby || lang.perl)
+                && c == '='
+                && (i == 0 || self.chars[i - 1] == '\n')
+                && next.is_some_and(|n| n.is_ascii_alphabetic())
+            {
+                return None;
+            }
+            if c == '#' && lang.hash_after_space && !self.line_start_or_space_before(i) {
+                let prev = self.chars[i - 1];
+                // A shell word starts after an operator too (`a;#c` is a
+                // comment); Ruby and Perl start a comment at any `#` outside
+                // a literal, except Perl's `$#array`.
+                if (lang.shell && ";&|()<>".contains(prev))
+                    || lang.ruby
+                    || (lang.perl && prev != '$')
+                {
+                    return None;
+                }
+            }
             let line_start = if lang.hash {
                 c == '#' && (!lang.hash_after_space || self.line_start_or_space_before(i))
             } else {
@@ -539,7 +758,13 @@ impl Lexer<'_> {
                 let body = self.slice(i + if lang.hash { 1 } else { 2 }, end);
                 let magic_head =
                     lang.hash && self.chars[..i].iter().filter(|c| **c == '\n').count() < 2;
-                if is_directive(&body, lang.hash) || (magic_head && body.contains("coding")) {
+                let rust_doc = lang.rust_doc
+                    && ((body.starts_with('/') && !body.starts_with("//"))
+                        || body.starts_with('!'));
+                if rust_doc
+                    || is_directive(&body, lang.hash)
+                    || (magic_head && body.contains("coding"))
+                {
                     let s = self.slice(i, end);
                     self.token(&s);
                 } else {
@@ -551,7 +776,10 @@ impl Lexer<'_> {
             if lang.block != Block::None && c == '/' && next == Some('*') {
                 let (end, nl) = self.block_end(i)?;
                 let body = self.slice(i + 2, end - 2);
-                if is_directive(&body, false) {
+                let rust_doc = lang.rust_doc
+                    && ((body.starts_with('*') && !body.starts_with("**") && body != "*")
+                        || body.starts_with('!'));
+                if rust_doc || is_directive(&body, false) {
                     let s = self.slice(i, end);
                     self.token(&s);
                 } else {
@@ -568,6 +796,9 @@ impl Lexer<'_> {
                             Triple::None => return None,
                             _ => self.triple_end(i, '"', true)?,
                         };
+                        if !self.interp_ok(i, end, 3) {
+                            return None;
+                        }
                         let s = self.slice(i, end);
                         self.token(&s);
                         i = end;
@@ -584,6 +815,9 @@ impl Lexer<'_> {
                         continue;
                     }
                     let end = self.quoted_end(i, '"', true, lang.dq_multiline)?;
+                    if !self.interp_ok(i, end, 1) {
+                        return None;
+                    }
                     let s = self.slice(i, end);
                     self.token(&s);
                     i = end;
@@ -609,11 +843,15 @@ impl Lexer<'_> {
                             None => return None,
                         },
                         Single::Str { escapes, multiline } => {
-                            let end = if self.starts(i, "'''") && lang.triple != Triple::None {
+                            let triple = self.starts(i, "'''") && lang.triple != Triple::None;
+                            let end = if triple {
                                 self.triple_end(i, '\'', lang.triple == Triple::Escaped)?
                             } else {
                                 self.quoted_end(i, '\'', escapes, multiline)?
                             };
+                            if !self.interp_ok(i, end, if triple { 3 } else { 1 }) {
+                                return None;
+                            }
                             let s = self.slice(i, end);
                             self.token(&s);
                             i = end;
@@ -645,6 +883,10 @@ impl Lexer<'_> {
             // Constructs the lexer does not model: refuse instead of guessing.
             let unmodeled = match c {
                 '<' if lang.heredoc => next == Some('<'),
+                // HTML-like comments in classic scripts (`<!--` anywhere,
+                // `-->` at a line start).
+                '<' if lang.js && self.starts(i, "<!--") => true,
+                '-' if lang.js => self.starts(i, "-->"),
                 '<' if lang.jsx => {
                     matches!(next, Some(n) if n.is_ascii_alphabetic() || n == '/' || n == '>')
                 }
@@ -658,13 +900,18 @@ impl Lexer<'_> {
                 }
                 '=' if lang.ruby || lang.perl => next == Some('~'),
                 '/' if lang.ruby || lang.perl => true,
-                '%' if lang.ruby => matches!(next, Some(n) if !is_ws(n) && n != '='),
+                // `%` then a blank or `=` is a literal (`% x `, `%=x=`) where an
+                // operand may start; only `x% 1` is surely modulo.
+                '%' if lang.ruby => match next {
+                    Some(n) if !is_ws(n) && n != '=' => true,
+                    _ => i == 0 || is_ws(self.chars[i - 1]),
+                },
                 '?' if lang.ruby => matches!(next, Some('"' | '\'' | '#')),
                 '|' | '>' if lang.yaml => self.yaml_block_scalar(i),
                 '_' if (lang.ruby || lang.perl) && self.starts(i, "__END__") => true,
                 '_' if lang.perl && self.starts(i, "__DATA__") => true,
                 'q' | 'm' | 's' | 't' | 'y' if lang.perl => self.perl_quote_like(i),
-                '/' if lang.js => self.js_regex_possible(),
+                '/' if lang.js => self.js_regex_possible(i),
                 _ => false,
             };
             if unmodeled {
@@ -707,9 +954,11 @@ impl Lexer<'_> {
 
     /// In JavaScript a `/` is division or the start of a regex literal, which
     /// can contain `//` and quotes. Refuse where a regex is possible.
-    fn js_regex_possible(&self) -> bool {
+    fn js_regex_possible(&self, i: usize) -> bool {
         match self.prev_code() {
             None => true,
+            // `if (x) /re/` is a regex, `(a) / b` a division.
+            Some(')') => self.paren_closes_statement_head() && self.rest_of_line_has(i + 1, '/'),
             Some(c) if "(,=:[!&|?{};+-*%<>~^".contains(c) => true,
             Some(c) if is_ident(c) => matches!(
                 self.prev_word().as_str(),
@@ -733,12 +982,51 @@ impl Lexer<'_> {
     }
 }
 
+/// A `\\u` escape (any number of `u`s) for an ASCII character: anything
+/// that can be syntax. Escapes of other characters cannot change structure.
+fn has_ascii_unicode_escape(text: &str) -> bool {
+    let b = text.as_bytes();
+    (0..b.len()).any(|i| {
+        if b[i] != b'\\' {
+            return false;
+        }
+        let mut j = i + 1;
+        while b.get(j) == Some(&b'u') {
+            j += 1;
+        }
+        j > i + 1
+            && b.get(j..j + 4)
+                .and_then(|h| std::str::from_utf8(h).ok())
+                .and_then(|h| u32::from_str_radix(h, 16).ok())
+                .is_some_and(|v| v < 0x80)
+    })
+}
+
+/// Whether a Go file uses cgo, whose preamble comment is compiled as C.
+fn imports_c(text: &str) -> bool {
+    text.lines().any(|l| {
+        let t = l.trim();
+        t.starts_with("import \"C\"") || t == "\"C\""
+    })
+}
+
 /// `text` with comments removed and whitespace normalized, for language
 /// `ext` (file extension without the dot). `None` when the extension is not
 /// supported or the text is ambiguous.
 pub fn strip_comments(ext: &str, text: &str) -> Option<String> {
     let lang = language(&ext.to_ascii_lowercase())?;
     if text.contains('\0') {
+        return None;
+    }
+    // A trigraph `??/` is a backslash to C compilers that honor trigraphs.
+    if lang.splices && text.contains("??/") {
+        return None;
+    }
+    // Java turns `\u0022` into a quote before it reads strings and comments.
+    if lang.unicode_escapes && has_ascii_unicode_escape(text) {
+        return None;
+    }
+    if lang.cgo && imports_c(text) {
         return None;
     }
     Lexer {
@@ -1061,5 +1349,216 @@ mod tests {
             "fn a(){}"
         );
         assert_eq!(s("c", "/* only */"), "");
+    }
+
+    /// Security review 2026-10, S-03: each pair differs only inside a string
+    /// or in code the language reads where the lexer saw a comment, so the
+    /// edit must never count as comment-only.
+    #[test]
+    fn constructs_that_desynchronize_the_lexer_are_refused() {
+        let cases: &[(&str, &str, &str)] = &[
+            // C splices and trigraphs.
+            (
+                "c",
+                "/* x *\\\n/ evil(); /* */\n",
+                "/* x *\\\n/ worse(); /* */\n",
+            ),
+            (
+                "c",
+                "/\\\n* \" */ char *s = \"// a\";\n",
+                "/\\\n* \" */ char *s = \"// b\";\n",
+            ),
+            (
+                "c",
+                "// a \\\n\" x\nchar *s = \"// a\";\n",
+                "// a \\\n\" x\nchar *s = \"// b\";\n",
+            ),
+            (
+                "c",
+                "char *s = \"??/\" // a\";\n",
+                "char *s = \"??/\" // b\";\n",
+            ),
+            // Java unicode escapes outside comments.
+            ("java", "s = \\u0022 // a \";\n", "s = \\u0022 // b \";\n"),
+            (
+                "java",
+                "s = \"\\u0022\" // a \";\n",
+                "s = \"\\u0022\" // b \";\n",
+            ),
+            ("scala", "s = \\uu0022 // a \"\n", "s = \\uu0022 // b \"\n"),
+            // Shell comments after operators, and quotes inside `$(...)`.
+            (
+                "sh",
+                "true;# don't\necho 'a # b'\n",
+                "true;# don't\necho 'a # c'\n",
+            ),
+            (
+                "sh",
+                "x=\"$(echo \"a # b\")\"\n",
+                "x=\"$(echo \"a # c\")\"\n",
+            ),
+            ("sh", "x=\"${y:-\"a # b\"}\"\n", "x=\"${y:-\"a # c\"}\"\n"),
+            // Ruby and Perl comments without a blank before them, POD,
+            // `=begin`, interpolation and `%` literals.
+            ("rb", "x=1#it's\ny = 'a # b'\n", "x=1#it's\ny = 'a # c'\n"),
+            (
+                "rb",
+                "x = \"#{h[\"a # b\"]}\"\n",
+                "x = \"#{h[\"a # c\"]}\"\n",
+            ),
+            (
+                "rb",
+                "=begin\n\"\n=end\ns = \"a # b\"\n",
+                "=begin\n\"\n=end\ns = \"a # c\"\n",
+            ),
+            (
+                "rb",
+                "x = % # ; system(\"a\")\n",
+                "x = % # ; system(\"b\")\n",
+            ),
+            (
+                "pl",
+                "print 1;# it's\nmy $y = 'a # b';\n",
+                "print 1;# it's\nmy $y = 'a # c';\n",
+            ),
+            (
+                "pl",
+                "=pod\n\"\n=cut\nmy $s = \"a # b\";\n",
+                "=pod\n\"\n=cut\nmy $s = \"a # c\";\n",
+            ),
+            // Interpolated expressions that hold quotes.
+            (
+                "py",
+                "x = f\"{d[\"a # b\"]}\"\n",
+                "x = f\"{d[\"a # c\"]}\"\n",
+            ),
+            (
+                "py",
+                "x = f\"{d['}'] + d[\"a # b\"]}\"\n",
+                "x = f\"{d['}'] + d[\"a # c\"]}\"\n",
+            ),
+            ("py", "x = rf'{d['a # b']}'\n", "x = rf'{d['a # c']}'\n"),
+            (
+                "py",
+                "x = f\"\\{d[\"a # b\"]}\"\n",
+                "x = f\"\\{d[\"a # c\"]}\"\n",
+            ),
+            (
+                "cs",
+                "var s = $\"{d[\"a // b\"]}\";\n",
+                "var s = $\"{d[\"a // c\"]}\";\n",
+            ),
+            (
+                "kt",
+                "val s = \"${m[\"a // b\"]}\"\n",
+                "val s = \"${m[\"a // c\"]}\"\n",
+            ),
+            (
+                "swift",
+                "let s = \"\\(d[\"a // b\"]!)\"\n",
+                "let s = \"\\(d[\"a // c\"]!)\"\n",
+            ),
+            (
+                "scala",
+                "val s = s\"${m(\"a // b\")}\"\n",
+                "val s = s\"${m(\"a // c\")}\"\n",
+            ),
+            // JavaScript HTML-like comments and a regex after `if (...)`.
+            (
+                "js",
+                "x = 1 <!-- \"\\\ns = \"// a\";\n",
+                "x = 1 <!-- \"\\\ns = \"// b\";\n",
+            ),
+            (
+                "js",
+                "if (a) /\"/.test(s); t = \"// a\";\n",
+                "if (a) /\"/.test(s); t = \"// b\";\n",
+            ),
+            // Comments that are code: cgo preambles and Rust doctests.
+            (
+                "go",
+                "/*\nint f() { return 1; }\n*/\nimport \"C\"\n",
+                "/*\nint f() { return 2; }\n*/\nimport \"C\"\n",
+            ),
+            (
+                "rs",
+                "/// ```\n/// a();\n/// ```\nfn f(){}\n",
+                "/// ```\n/// b();\n/// ```\nfn f(){}\n",
+            ),
+            ("rs", "//! a\nfn f(){}\n", "//! b\nfn f(){}\n"),
+            ("rs", "/** a */\nfn f(){}\n", "/** b */\nfn f(){}\n"),
+        ];
+        for (ext, a, b) in cases {
+            assert!(!same(ext, a, b), "{ext}: {a:?} vs {b:?}");
+        }
+    }
+
+    /// The refusals above stay narrow: ordinary uses of the same features
+    /// still allow comment-only edits.
+    #[test]
+    fn ordinary_interpolation_splices_and_operators_still_work() {
+        let cases: &[(&str, &str, &str)] = &[
+            (
+                "c",
+                "#define X(a) \\\n  f(a) // a\n",
+                "#define X(a) \\\n  f(a) // b\n",
+            ),
+            (
+                "java",
+                "s = \"caf\\u00e9\"; // a\n",
+                "s = \"caf\\u00e9\"; // b\n",
+            ),
+            (
+                "sh",
+                "echo \"${HOME}/x\" \"$(date)\" \"${v#*/}\" # a\n",
+                "echo \"${HOME}/x\" \"$(date)\" \"${v#*/}\" # b\n",
+            ),
+            ("sh", "echo $# ${#x} # a\n", "echo $# ${#x} # b\n"),
+            (
+                "rb",
+                "puts \"#{a}\" # a\nx = y% 2\n",
+                "puts \"#{a}\" # b\nx = y% 2\n",
+            ),
+            ("pl", "my $n = $#a; # a\n", "my $n = $#a; # b\n"),
+            (
+                "py",
+                "x = f\"{a} {b!r:>{w}} {{lit}}\"  # a\n",
+                "x = f\"{a} {b!r:>{w}} {{lit}}\"  # b\n",
+            ),
+            (
+                "py",
+                "x = rb\"{not a field\" # a\n",
+                "x = rb\"{not a field\" # b\n",
+            ),
+            (
+                "cs",
+                "var s = $\"{a} {{x}}\"; // a\n",
+                "var s = $\"{a} {{x}}\"; // b\n",
+            ),
+            (
+                "kt",
+                "val s = \"${a.b} $c\" // a\n",
+                "val s = \"${a.b} $c\" // b\n",
+            ),
+            (
+                "swift",
+                "let s = \"\\(a + 1)\" // a\n",
+                "let s = \"\\(a + 1)\" // b\n",
+            ),
+            (
+                "js",
+                "y = (a + b) / 2; // a\nz = f(x) / g(y); // a\n",
+                "y = (a + b) / 2; // b\nz = f(x) / g(y); // b\n",
+            ),
+            ("go", "// a\npackage main\n", "// b\npackage main\n"),
+            (
+                "rs",
+                "// a\n//// not doc\nfn f(){}\n",
+                "// b\n//// not doc either\nfn f(){}\n",
+            ),
+        ];
+        for (ext, a, b) in cases {
+            assert!(same(ext, a, b), "{ext}: {a:?} vs {b:?}");
+        }
     }
 }
