@@ -87,6 +87,9 @@ pub const EXTRA_REBASED_FROM: &str = "leep.rebased_from";
 /// Set by the CLI on a changeset that only carries uncommitted work (`sync`,
 /// `stash`); the value says which command made it. Never landed.
 pub const EXTRA_SNAPSHOT: &str = "leep.snapshot";
+/// Set by `leep revert` on the changeset that holds the inverse of another;
+/// the value is the id of the changeset being reverted.
+pub const EXTRA_REVERT_OF: &str = "leep.revert_of";
 
 impl Changeset {
     pub const KIND: &'static str = "changeset-v1";
