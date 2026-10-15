@@ -139,6 +139,7 @@ impl Mock {
             .route("/v1/last-change/{id}", get(last_change))
             .route("/v1/blame/{id}", get(blame))
             .route("/v1/provenance/{id}", get(provenance))
+            .route("/v1/search/{id}", get(search))
             .route("/v1/land", post(land));
         let app = match tokens {
             Some(t) => router.layer(axum::middleware::from_fn_with_state(t, gate)),
@@ -575,6 +576,61 @@ async fn blame(
 
 /// Counts first-parent changesets by author; just enough to see the client
 /// decode the response.
+/// Literal substring search over a revision's text files: just enough to
+/// check what the client asks for and how it decodes the answer.
+async fn search(
+    State(s): State<Shared>,
+    Path(id): Path<String>,
+    RawQuery(raw): RawQuery,
+) -> Resp<SearchResponse> {
+    let mut d = s.lock().unwrap();
+    record(&mut d, "search", &raw);
+    let id: ChangesetId = id
+        .parse()
+        .map_err(|_| err(StatusCode::BAD_REQUEST, "bad id"))?;
+    let q: HashMap<String, String> = pairs(&raw).into_iter().collect();
+    let needle = q.get("q").cloned().unwrap_or_default();
+    let ci = q.get("i").is_some_and(|v| v == "true");
+    let limit: usize = q.get("limit").map_or(100, |l| l.parse().unwrap());
+    let prefix = q.get("path").cloned().unwrap_or_default();
+    let files = d
+        .files
+        .get(&id)
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "no such changeset"))?;
+    let mut matches = Vec::new();
+    for (path, f) in files {
+        if !f.path.is_within(&prefix) {
+            continue;
+        }
+        let text = String::from_utf8_lossy(&d.blobs[&f.content]).into_owned();
+        for (i, line) in text.lines().enumerate() {
+            let hit = if ci {
+                line.to_lowercase().find(&needle.to_lowercase())
+            } else {
+                line.find(&needle)
+            };
+            if let Some(start) = hit {
+                matches.push(SearchMatch {
+                    path: RepoPath::new(path.as_str()).unwrap(),
+                    line_number: i as u64 + 1,
+                    line: line.to_string(),
+                    ranges: vec![SearchRange {
+                        start: start as u32,
+                        end: (start + needle.len()) as u32,
+                    }],
+                });
+            }
+        }
+    }
+    let truncated = matches.len() > limit;
+    matches.truncate(limit);
+    Ok(Json(SearchResponse {
+        matches,
+        truncated,
+        stats: SearchStats::default(),
+    }))
+}
+
 async fn provenance(
     State(s): State<Shared>,
     Path(id): Path<String>,

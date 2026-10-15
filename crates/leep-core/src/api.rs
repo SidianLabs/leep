@@ -21,6 +21,7 @@
 //! | GET  | `/v1/diff?from=a&to=b&prefix=dir` | – | [`DiffResponse`] (`from` omitted = empty tree) |
 //! | GET  | `/v1/blame/{id}?path=p` | – | [`BlameResponse`] (with per-changeset [`ChangesetSummary`]) |
 //! | GET  | `/v1/provenance/{id}?path=prefix&limit=n` | – | [`ProvenanceResponse`] (who and what made the changesets reachable from `id`; `limit` defaults to 10000, capped at 10000) |
+//! | GET  | `/v1/search/{rev}?q=text&regex=bool&i=bool&path=dir&glob=g&limit=n` | – | [`SearchResponse`] (`rev` = ref name or full id; `limit` defaults to 100, capped at 1000; booleans are `true` or `false`; a bad regex is 400, an unknown `rev` 404) |
 //! | GET  | `/v1/merge-base?a=x&b=y` | – | [`MergeBaseResponse`] |
 //! | POST | `/v1/changesets/{id}/signatures` | [`AddSignatureRequest`] | [`AddSignatureResponse`] (400 if the signature is bad or the key is not trusted; 404 if the changeset is unknown) |
 //! | GET  | `/v1/changesets/{id}/signatures` | – | [`SignaturesResponse`] (trusted signatures, re-verified on read) |
@@ -444,9 +445,90 @@ pub enum LandResponse {
     },
 }
 
+/// A byte range within [`SearchMatch::line`] (`end` is exclusive).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchRange {
+    pub start: u32,
+    pub end: u32,
+}
+
+/// One matching line. Files are searched line by line, so a match never spans
+/// lines.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchMatch {
+    pub path: RepoPath,
+    /// 1-based.
+    pub line_number: u64,
+    /// The line without its terminator, cut to 1024 bytes on a character
+    /// boundary.
+    pub line: String,
+    /// Non-empty matches within `line`, in order.
+    #[serde(default)]
+    pub ranges: Vec<SearchRange>,
+}
+
+/// What a search looked at. Every count is a number of files unless named
+/// otherwise; `files_considered` counts files in directories the index did not
+/// rule out, so a pruned directory contributes only to `dirs_pruned`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchStats {
+    #[serde(default)]
+    pub files_considered: u64,
+    /// Directories skipped because their summary lacks a required trigram.
+    #[serde(default)]
+    pub dirs_pruned: u64,
+    /// Files skipped because their trigram set lacks a required trigram.
+    #[serde(default)]
+    pub files_pruned: u64,
+    /// Files fetched and matched.
+    #[serde(default)]
+    pub files_scanned: u64,
+    /// Files that are not searched: binary, not UTF-8, over 1 MiB, or symlinks.
+    #[serde(default)]
+    pub files_skipped: u64,
+    #[serde(default)]
+    pub bytes_scanned: u64,
+    /// Index rows this request had to compute (a cold revision is slow once).
+    #[serde(default)]
+    pub blob_rows_derived: u64,
+    #[serde(default)]
+    pub tree_rows_derived: u64,
+    /// False when the query yields no required trigram, so the files were
+    /// scanned without the index.
+    #[serde(default)]
+    pub indexed: bool,
+}
+
+/// Matches ordered by path, then line. `truncated` is set when more matches
+/// exist than were returned, or when the server's scan budget ran out first
+/// (then `stats.bytes_scanned` is near the cap and the list is a prefix).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchResponse {
+    #[serde(default)]
+    pub matches: Vec<SearchMatch>,
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default)]
+    pub stats: SearchStats,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn search_response_tolerates_missing_fields() {
+        let r: SearchResponse = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(r.matches.is_empty() && !r.truncated);
+        assert_eq!(r.stats, SearchStats::default());
+        let m: SearchMatch = serde_json::from_value(serde_json::json!({
+            "path": "a/b", "line_number": 3, "line": "x"
+        }))
+        .unwrap();
+        assert!(m.ranges.is_empty());
+        let v = serde_json::to_value(SearchRange { start: 1, end: 2 }).unwrap();
+        assert_eq!(v, serde_json::json!({ "start": 1, "end": 2 }));
+    }
 
     #[test]
     fn tagged_enums_serialize_with_status() {

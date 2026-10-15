@@ -56,12 +56,26 @@ Logs go to stderr; stdout carries protocol messages only.
 | `leep_read_file` | `rev?`, `path` | text content; capped at 256 KiB; binary is reported, not returned |
 | `leep_diff` | `from?`, `to`, `prefix?` | unified diff; `from` defaults to the first parent of `to` |
 | `leep_blame` | `rev?`, `path` | per-line changeset and author |
+| `leep_search` | `query`, `rev?`, `regex?`, `case_insensitive?`, `path?`, `glob?`, `limit?` (default 50, max 200) | matching lines `{path, line_number, line, ranges}` ordered by path then line, `truncated`, `stats`; per line, UTF-8 text files up to 1 MiB (others counted in `stats.files_skipped`) |
 | `leep_review_status` | `rev`, `ref?` (default `main`) | per changed path: the rule that satisfies it (`auto:*`, `owner`, `merge_parent`) or `pending` / `rejected`, with owners and who approved or rejected, plus `approved`, `blocked_paths` and `next_step`; needs a server with authentication |
 | `leep_commit_and_land` | `message`, `changes[]`, `base?`, `target_ref?`, `prompt?`, `tests?` | landed id, or a conflict report |
 
 Data tools return JSON as text and as `structuredContent`; file and diff
 tools return plain text. Failures (bad arguments, 401, 403, 404, unreachable
 server) come back as results with `isError: true`.
+
+### Search
+
+`leep_search` greps a revision on the server, so an agent need not list and read
+every file. `query` is a literal by default; `regex: true` uses Rust regex syntax
+and `case_insensitive: true` ignores case. `path` limits it to a directory or
+file and `glob` filters paths (`*` stays within one directory, `**` crosses
+them, so use `**/*.rs` for every Rust file). Matches are per line and carry the
+byte `ranges` that matched. When `truncated` is true there are more matches, or
+the server stopped after scanning its byte budget: narrow with `path`/`glob`.
+The first search of a revision that was never indexed can take a while (the
+operator can run `leep-server derive-search <rev>` ahead of time); later ones
+are fast. `leep_search` is read-only and works with a `read` token.
 
 ### Review
 

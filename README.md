@@ -4,7 +4,8 @@ An open-source, server-centric version control system built for repositories
 where most commits come from AI agents and CI. Inspired by Anthropic's Scion,
 Meta's Mononoke and Zed's DeltaDB. Git-compatible through an import/export
 bridge. Agent provenance (`agent.model`, `agent.session`) is queryable:
-`leep log --agent-model M`, `leep blame --who`, `leep provenance`.
+`leep log --agent-model M`, `leep blame --who`, `leep provenance`. Code is
+searchable on the server without a checkout: `leep search -i -E 'fn\s+main'`.
 
 Status: early development (v0.1).
 

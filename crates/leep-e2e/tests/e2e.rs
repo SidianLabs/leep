@@ -1033,3 +1033,122 @@ fn review_owners_and_auto_approval_gate_landing_on_a_protected_ref() {
         .ok(&wc_b, &["land", "--ref", "release"])
         .contains("Landed"));
 }
+
+/// Run `leep-server derive-search REV` against `stores` and return its stdout.
+fn server_derive_search(stores: &Stores, rev: &str) -> String {
+    let out = std::process::Command::new(bin("leep-server"))
+        .args(["--meta", &stores.meta, "--blobs", &stores.blobs])
+        .args(["derive-search", rev])
+        .env("RUST_LOG", "warn")
+        .output()
+        .expect("spawn leep-server derive-search");
+    assert_ok(&out, &format!("leep-server derive-search {rev}"));
+    stdout(&out)
+}
+
+#[test]
+fn code_search_over_the_real_binaries() {
+    let _g = serial();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let stores = Stores::sqlite(&root.join("data"));
+    let server = Server::start(&stores, root);
+    let client = Client::new(&server.url, &root.join("cache"));
+
+    let wc = root.join("wc");
+    client.ok(root, &["init", wc.to_str().unwrap()]);
+    write(
+        &wc,
+        "src/lib.rs",
+        "pub fn parse_config() {}\n// TODO: handle Errors\n",
+    );
+    write(&wc, "src/main.rs", "fn main() {\n    parse_config();\n}\n");
+    write(
+        &wc,
+        "docs/guide.md",
+        "Run parse_config first.\nthen TODO later\n",
+    );
+    write(&wc, "data.bin", "parse_config\0binary");
+    client.ok(&wc, &["commit", "-m", "seed"]);
+    client.ok(&wc, &["land"]);
+
+    // A literal, grep-style output.
+    assert_eq!(
+        client.ok(&wc, &["search", "parse_config"]),
+        "docs/guide.md:1:Run parse_config first.\n\
+         src/lib.rs:1:pub fn parse_config() {}\n\
+         src/main.rs:2:    parse_config();\n"
+    );
+    // Works outside a working copy too, against a named revision.
+    assert_eq!(
+        client.ok(
+            root,
+            &["search", "--rev", "main", "-n", "1", "parse_config"]
+        ),
+        "docs/guide.md:1:Run parse_config first.\n"
+    );
+
+    // Options.
+    assert_eq!(
+        client.ok(&wc, &["search", "-i", "todo", "--path", "src"]),
+        "src/lib.rs:2:// TODO: handle Errors\n"
+    );
+    assert_eq!(
+        client.ok(&wc, &["search", "-E", r"fn\s+\w+\(", "--glob", "**/*.rs"]),
+        "src/lib.rs:1:pub fn parse_config() {}\nsrc/main.rs:1:fn main() {\n"
+    );
+    assert_eq!(
+        client.ok(&wc, &["search", "TODO", "--glob", "docs/*.md"]),
+        "docs/guide.md:2:then TODO later\n"
+    );
+
+    // Truncation is reported on stderr, not in the rows.
+    let out = client.run(&wc, &["search", "-n", "2", "parse_config"]);
+    assert_ok(&out, "truncated search");
+    assert_eq!(stdout(&out).lines().count(), 2);
+    assert!(stderr(&out).contains("truncated"), "{}", stderr(&out));
+
+    // Nothing found is exit 1 with no output; a bad regex is a user error.
+    let out = client.run(&wc, &["search", "no such text"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stdout(&out).is_empty() && stderr(&out).is_empty());
+    let out = client.run(&wc, &["search", "-E", "("]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stderr(&out).contains("bad regex"), "{}", stderr(&out));
+
+    // JSON carries the matches, ranges and what the index did.
+    let v = client.json(&wc, &["search", "TODO"]);
+    assert_eq!(v["matches"].as_array().unwrap().len(), 2);
+    assert_eq!(v["matches"][0]["ranges"][0]["start"], 5);
+    assert_eq!(v["truncated"], false);
+    assert_eq!(v["stats"]["indexed"], true);
+    assert_eq!(v["stats"]["files_skipped"], 1);
+    assert_eq!(v["stats"]["blob_rows_derived"], 0, "already derived above");
+
+    // The server can precompute the index; a new revision then only derives
+    // the rows on the paths it changed.
+    let first = server_derive_search(&stores, "main");
+    assert!(first.contains("blob rows derived: 0"), "{first}");
+    write(
+        &wc,
+        "src/main.rs",
+        "fn main() {\n    parse_config(); // run\n}\n",
+    );
+    client.ok(&wc, &["commit", "-m", "edit"]);
+    client.ok(&wc, &["land"]);
+    let second = server_derive_search(&stores, "main");
+    assert!(second.contains("blob rows derived: 1"), "{second}");
+    assert!(
+        second.contains("tree rows derived: 2"),
+        "root and src: {second}"
+    );
+    assert!(server_derive_search(&stores, "main").contains("tree rows derived: 0"));
+    let v = client.json(&wc, &["search", "// run"]);
+    assert_eq!(v["matches"].as_array().unwrap().len(), 1);
+    assert_eq!(v["stats"]["tree_rows_derived"], 0);
+    // The earlier revision still answers as it did.
+    let log = client.json(&wc, &["log", "main"]);
+    let first_id = log["entries"][1]["id"].as_str().unwrap().to_string();
+    let v = client.json(&wc, &["search", "--rev", &first_id, "// run"]);
+    assert!(v["matches"].as_array().unwrap().is_empty());
+}

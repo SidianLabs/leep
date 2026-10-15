@@ -8,6 +8,7 @@ pub mod init;
 pub mod keygen;
 pub mod land;
 pub mod review;
+pub mod search;
 pub mod status;
 
 use leep_core::ChangesetId;

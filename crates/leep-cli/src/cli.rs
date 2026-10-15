@@ -7,7 +7,7 @@ use clap::{Parser, Subcommand};
 use crate::cache::Cache;
 use crate::client::Client;
 use crate::commands::{
-    checkout, commit, diff, history, init, keygen, land, review, status, Ctx, Remote,
+    checkout, commit, diff, history, init, keygen, land, review, search, status, Ctx, Remote,
 };
 use crate::error::{CliError, Result};
 use crate::state::{resolve_token, WorkCopy};
@@ -60,6 +60,8 @@ pub enum Command {
     Show(history::ShowArgs),
     /// Print a file at a revision.
     Cat(history::CatArgs),
+    /// Search file contents at a revision on the server, like grep.
+    Search(search::SearchArgs),
     /// Show who last changed each line.
     Blame(history::BlameArgs),
     /// Summarize which agents and authors made the changesets.
@@ -118,6 +120,7 @@ pub fn run(cli: Cli) -> Result<i32> {
             | Command::Show(_)
             | Command::Cat(_)
             | Command::Blame(_)
+            | Command::Search(_)
             | Command::Provenance(_)
             | Command::Refs
             | Command::Review(_)
@@ -168,6 +171,7 @@ fn read_only_cmd(cmd: &Command, r: &Remote) -> Result<i32> {
         Command::Show(a) => history::show(r, a),
         Command::Cat(a) => history::cat(r, a),
         Command::Blame(a) => history::blame(r, a),
+        Command::Search(a) => search::run(r, a),
         Command::Provenance(a) => history::provenance(r, a),
         Command::Refs => history::refs(r),
         Command::Review(c) => review::run(r, c),

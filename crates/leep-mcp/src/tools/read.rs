@@ -21,6 +21,8 @@ const DEFAULT_LOG_LIMIT: u32 = 20;
 const MAX_LOG_LIMIT: u32 = 200;
 const MAX_LISTED: usize = 5000;
 const MAX_BLAME_LINES: usize = 5000;
+const DEFAULT_SEARCH_LIMIT: u32 = 50;
+const MAX_SEARCH_LIMIT: u32 = 200;
 
 #[derive(Deserialize)]
 struct LogArgs {
@@ -47,6 +49,17 @@ struct ListArgs {
 struct PathArgs {
     rev: Option<String>,
     path: String,
+}
+
+#[derive(Deserialize)]
+struct SearchArgs {
+    query: String,
+    rev: Option<String>,
+    regex: Option<bool>,
+    case_insensitive: Option<bool>,
+    path: Option<String>,
+    glob: Option<String>,
+    limit: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -274,6 +287,41 @@ impl Server {
         };
         let bytes = self.blob(&f.content)?;
         Ok(as_text(&bytes).map(str::to_string))
+    }
+
+    pub(super) fn search(&self, args: Value) -> ToolResult {
+        let a: SearchArgs = parse_args(args)?;
+        if a.query.is_empty() {
+            return Err(ToolError::new("query must not be empty"));
+        }
+        let id = self.resolve_rev(a.rev.as_deref())?;
+        let non_empty = |v: Option<String>| v.filter(|v| !v.is_empty());
+        let query = leep_cli::client::SearchQuery {
+            query: a.query,
+            regex: a.regex.unwrap_or(false),
+            ignore_case: a.case_insensitive.unwrap_or(false),
+            path: non_empty(a.path),
+            glob: non_empty(a.glob),
+            limit: Some(
+                a.limit
+                    .unwrap_or(DEFAULT_SEARCH_LIMIT)
+                    .clamp(1, MAX_SEARCH_LIMIT),
+            ),
+        };
+        let resp = self.client.search(&id, &query)?;
+        let mut v = json!({
+            "rev": id.to_string(),
+            "matches": resp.matches,
+            "truncated": resp.truncated,
+            "stats": resp.stats,
+        });
+        if resp.truncated {
+            v["note"] = json!(
+                "More matches exist, or the server stopped scanning. Narrow the query with \
+                 `path` or `glob`, or raise `limit`."
+            );
+        }
+        Ok(ToolOutput::json(v))
     }
 
     pub(super) fn review_status(&self, args: Value) -> ToolResult {

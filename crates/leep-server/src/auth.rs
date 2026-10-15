@@ -291,6 +291,7 @@ mod tests {
     #[test]
     fn write_classification() {
         assert!(!needs_write(&Method::GET, "/v1/refs"));
+        assert!(!needs_write(&Method::GET, "/v1/search/main"));
         assert!(!needs_write(&Method::POST, "/v1/blobs/missing"));
         assert!(needs_write(&Method::POST, "/v1/land"));
         assert!(needs_write(&Method::POST, "/v1/changesets/abc/signatures"));

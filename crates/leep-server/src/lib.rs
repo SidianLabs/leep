@@ -19,7 +19,7 @@ use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use leep_core::api::*;
 use leep_core::{Changeset, ChangesetId, Error, FileKind, Hash, RepoPath};
-use leep_derive::{ExtraMatch, LogFilter, Repo};
+use leep_derive::{search, ExtraMatch, LogFilter, Repo, SearchQuery};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use tower_http::limit::RequestBodyLimitLayer;
@@ -133,6 +133,7 @@ pub fn router_with_timeout(
         .route("/v1/diff", get(diff))
         .route("/v1/blame/{id}", get(blame))
         .route("/v1/provenance/{id}", get(provenance))
+        .route("/v1/search/{*rev}", get(search_rev))
         .route("/v1/merge-base", get(merge_base))
         .route("/v1/merge", post(merge))
         .route("/v1/rebase", post(rebase))
@@ -268,6 +269,16 @@ impl LogQuery {
 #[derive(Deserialize)]
 struct ProvenanceQuery {
     path: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct SearchParams {
+    q: String,
+    regex: Option<bool>,
+    i: Option<bool>,
+    path: Option<String>,
+    glob: Option<String>,
     limit: Option<usize>,
 }
 
@@ -551,6 +562,26 @@ async fn provenance(
     Ok(Json(
         repo.provenance(cid(&id)?, q.path.as_deref(), limit).await?,
     ))
+}
+
+async fn search_rev(
+    State(repo): S,
+    Path(rev): Path<String>,
+    Query(p): Query<SearchParams>,
+) -> ApiResult<Json<SearchResponse>> {
+    let id = repo.resolve(&rev).await?;
+    let q = SearchQuery {
+        regex: p.regex.unwrap_or(false),
+        case_insensitive: p.i.unwrap_or(false),
+        path: p.path.unwrap_or_default(),
+        glob: p.glob.filter(|g| !g.is_empty()),
+        limit: p
+            .limit
+            .unwrap_or(search::DEFAULT_LIMIT)
+            .clamp(1, search::MAX_LIMIT),
+        ..SearchQuery::new(p.q)
+    };
+    Ok(Json(repo.search(id, &q).await?))
 }
 
 async fn diff(State(repo): S, Query(q): Query<DiffQuery>) -> ApiResult<Json<DiffResponse>> {
