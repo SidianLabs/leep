@@ -17,6 +17,11 @@ use crate::Repo;
 /// other server instances sharing the store; this bounds those retries.
 const MAX_LAND_ATTEMPTS: u32 = 32;
 const BACKOFF_CAP_MS: u64 = 200;
+/// Consecutive failed commits tolerated before the error is returned. Each is
+/// re-driven from a fresh read, which resolves an ambiguous commit.
+const MAX_COMMIT_ERRORS: u32 = 3;
+/// Changesets examined when looking for an earlier landing of the same stack.
+const LANDED_COPY_SCAN: usize = 1024;
 
 /// Full-jitter exponential backoff, so racing servers spread out instead of
 /// colliding again in lockstep.
@@ -110,14 +115,14 @@ impl Repo {
         // A changeset that passed the policy need not be checked again when a
         // lost CAS retries, unless the policy reads the head (see `Checked`).
         let mut checked = Checked::default();
+        let mut commit_errors = 0;
+        let mut last_error = None;
         for attempt in 1..=MAX_LAND_ATTEMPTS {
             stats.attempts = attempt;
             let head = self.meta().get_ref(target_ref).await?;
-            self.enforce_land_policy(cs, head, target_ref, &mut checked)
-                .await?;
-            let new = match head {
-                None => cs,
-                Some(h) if h == cs || self.is_ancestor(cs, h).await? => {
+            let mut fast_forward = false;
+            if let Some(h) = head {
+                if h == cs || self.is_ancestor(cs, h).await? {
                     return Ok(LandResponse::Landed {
                         landed: cs,
                         rebased: false,
@@ -126,30 +131,93 @@ impl Repo {
                 }
                 // Head is an ancestor (directly or through a stack of
                 // unlanded changesets): fast-forward.
-                Some(h) if self.is_ancestor(h, cs).await? => cs,
-                Some(h) => match self.replay_stack(cs, h).await? {
+                fast_forward = self.is_ancestor(h, cs).await?;
+                // An earlier call may have landed this stack and lost its
+                // answer; replaying it would add the stack a second time.
+                if !fast_forward {
+                    if let Some(copy) = self.landed_copy(cs, h).await? {
+                        return Ok(LandResponse::Landed {
+                            landed: copy,
+                            rebased: true,
+                            attempts: attempt,
+                        });
+                    }
+                }
+            }
+            self.enforce_land_policy(cs, head, target_ref, &mut checked)
+                .await?;
+            let new = match head {
+                Some(h) if !fast_forward => match self.replay_stack(cs, h).await? {
                     Ok(id) => id,
                     Err(resp) => return Ok(resp),
                 },
+                _ => cs,
             };
-            if self
+            match self
                 .meta()
                 .cas_ref_logged(target_ref, head, Some(new), ctx)
-                .await?
+                .await
             {
-                return Ok(LandResponse::Landed {
-                    landed: new,
-                    rebased: new != cs,
-                    attempts: attempt,
-                });
+                Ok(true) => {
+                    return Ok(LandResponse::Landed {
+                        landed: new,
+                        rebased: new != cs,
+                        attempts: attempt,
+                    });
+                }
+                Ok(false) => {
+                    commit_errors = 0;
+                    metrics::counter!("leep_land_cas_losses_total").increment(1);
+                }
+                // The commit may or may not have applied. Another pass reads
+                // the head again and either finds the stack in it or retries.
+                Err(e) => {
+                    commit_errors += 1;
+                    if commit_errors >= MAX_COMMIT_ERRORS {
+                        return Err(e);
+                    }
+                    last_error = Some(e);
+                }
             }
-            metrics::counter!("leep_land_cas_losses_total").increment(1);
             tokio::time::sleep(backoff(attempt)).await;
+        }
+        if let Some(e) = last_error {
+            return Err(e);
         }
         stats.exhausted = true;
         Err(Error::Conflict(format!(
             "land onto {target_ref:?} lost the race {MAX_LAND_ATTEMPTS} times; retry"
         )))
+    }
+
+    /// The server's rebased copy of `cs` among `head`'s ancestors, if an
+    /// earlier land of `cs` already put one there. Only rows written by
+    /// `rebase` count, so a changeset that merely claims `leep.rebased_from`
+    /// cannot make a land look done.
+    ///
+    /// A copy sits on a head that was not below `cs`, so its generation is
+    /// above `cs`'s; the walk stops at that bound, and after
+    /// [`LANDED_COPY_SCAN`] changesets, past which a retry may land twice.
+    async fn landed_copy(&self, cs: ChangesetId, head: ChangesetId) -> Result<Option<ChangesetId>> {
+        let floor = self.generation(cs).await?;
+        let mut seen = HashSet::from([head]);
+        let mut stack = vec![head];
+        let mut scanned = 0;
+        while let Some(id) = stack.pop() {
+            if self.rebased_origin(id).await? == Some(cs) {
+                return Ok(Some(id));
+            }
+            scanned += 1;
+            if scanned >= LANDED_COPY_SCAN {
+                break;
+            }
+            for p in self.get_changeset(id).await?.parents {
+                if seen.insert(p) && self.generation(p).await? > floor {
+                    stack.push(p);
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// `MetaStore::cas_ref` for callers outside `land`, with the ref rules and

@@ -267,6 +267,20 @@ impl Repo {
         })
     }
 
+    /// Close a "deleting" announcement left by a collect that died after
+    /// deleting the blob (or before). The blob is listed, so a later upload
+    /// stored it again and rescued it; the announcement would otherwise block
+    /// the hash for good, because only listed blobs are revisited. Only
+    /// called for blobs this run will not delete, and runs never overlap.
+    async fn settle_doom(&self, hash: &Hash, state: &BlobFence) -> Result<()> {
+        if let (Some(c), Some(Doom::Deleting)) = (state.condemned, state.doom_state()) {
+            self.meta()
+                .put_derived(BLOB_DOOM, hash, doom_value(c, Doom::Abandoned))
+                .await?;
+        }
+        Ok(())
+    }
+
     async fn claimed_since(&self, hash: &Hash, cutoff: i64) -> Result<bool> {
         Ok(match self.meta().get_derived(BLOB_CLAIM, hash).await? {
             Some(v) => <[u8; 8]>::try_from(v.as_ref())
@@ -519,6 +533,9 @@ pub async fn collect(repo: &Repo, opts: &GcOptions, clock: &dyn Clock) -> Result
                 if !is_marked {
                     report.rescued_by_claim += 1;
                 }
+                if !opts.dry_run {
+                    repo.settle_doom(&blob.hash, &state).await?;
+                }
                 continue;
             }
             if is_marked {
@@ -528,12 +545,16 @@ pub async fn collect(repo: &Repo, opts: &GcOptions, clock: &dyn Clock) -> Result
                     repo.meta()
                         .put_derived(BLOB_RESCUE, &blob.hash, time_value(c))
                         .await?;
+                    repo.settle_doom(&blob.hash, &state).await?;
                 }
                 report.rescued_by_reference += 1;
                 continue;
             }
             if blob.modified.is_some_and(|t| t > c) {
                 report.rescued_by_upload += 1;
+                if !opts.dry_run {
+                    repo.settle_doom(&blob.hash, &state).await?;
+                }
                 continue;
             }
             if opts.dry_run {

@@ -43,6 +43,14 @@ skill.
 | `HistoryNode` | `history-node-v1` | `MetaStore.derived` (kind `history-node-v1`), key = `Hash::of_object("history-node-v1", postcard(node))`, value = the postcard bytes |
 | other derived kinds | — | owned and versioned by `leep-derive` |
 
+## Integrity on read
+
+Content-addressed data is verified when read: `Repo::read_tree` and
+`read_history_node` hash the stored bytes and compare them with the key, and
+the SQL backends decode a changeset and compare its id with its row key. A
+mismatch is `Error::Storage`. File blobs and the other derived kinds are not
+verified (ADR 0021 lists which).
+
 ## Versioning rules
 
 1. **Never change v1 types in place.** That includes field order, variant

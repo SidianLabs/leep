@@ -228,4 +228,31 @@ mod tests {
         cache.get(&h).await.unwrap();
         assert_eq!((cache.stats().hits, cache.stats().misses), (1, 0));
     }
+
+    /// A failed read or write through the cache leaves nothing behind that
+    /// could be served as if it had succeeded.
+    #[tokio::test]
+    async fn failed_calls_leave_no_cache_entry() {
+        use leep_testkit::{is_injected, Fault, FaultPlan, FaultyBlobStore, Op};
+        let plan = FaultPlan::new(1);
+        plan.script(Op::Put, 1, Fault::Fail)
+            .script(Op::Put, 2, Fault::FailAfter)
+            .script(Op::Get, 1, Fault::Fail);
+        let mem = std::sync::Arc::new(MemoryBlobStore::new());
+        let cache = CachedBlobStore::new(FaultyBlobStore::new(mem.clone(), plan.clone()), 1024);
+        let (a, b) = (Bytes::from_static(b"a"), Bytes::from_static(b"b"));
+        assert!(is_injected(&cache.put(a.clone()).await.unwrap_err()));
+        assert!(is_injected(&cache.put(b.clone()).await.unwrap_err()));
+        assert_eq!(cache.stats().entries, 0, "nothing cached for a failed put");
+        // The second put did apply underneath; the first never did.
+        assert!(!mem.contains(&Hash::of_blob(&a)).await.unwrap());
+        assert!(mem.contains(&Hash::of_blob(&b)).await.unwrap());
+        assert!(is_injected(
+            &cache.get(&Hash::of_blob(&b)).await.unwrap_err()
+        ));
+        assert_eq!(cache.stats().entries, 0);
+        assert_eq!(cache.get(&Hash::of_blob(&b)).await.unwrap().unwrap(), b);
+        assert_eq!(cache.put(a.clone()).await.unwrap(), Hash::of_blob(&a));
+        assert_eq!(cache.stats().entries, 2);
+    }
 }

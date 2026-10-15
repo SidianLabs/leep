@@ -78,6 +78,7 @@ content-addressing and (b) the atomicity of `MetaStore::cas_ref`.
 | `leep-mcp` | MCP server binary `leep-mcp` for AI agents (stdio JSON-RPC; talks to `leep-server` over HTTP) | core and the `leep-cli` library (its HTTP client); never derive, store, meta or server outside dev-dependencies |
 | `leep-git` | Git bridge: library plus the `leep-git` admin binary | core, derive; store and meta only to open stores by URL in the binary |
 | `leep-fuzz-targets` | Test-only (`publish = false`): fuzz harness functions and the seed corpus loader for every decoder and parser (`docs/FUZZING.md`) | core, derive, server (to drive the real router and config parsers); nothing depends on it except the `fuzz/` crate |
+| `leep-testkit` | Fault-injecting `BlobStore`/`MetaStore` wrappers and a seeded fault plan, for tests (ADR 0021) | core; a dev-dependency only, never a normal dependency of any crate |
 
 Rules:
 - Dependencies point toward `leep-core`. Nothing depends on `leep-server`
@@ -86,7 +87,8 @@ Rules:
 - `leep-derive` must stay backend-agnostic. It is tested against
   `leep_core::memory`.
 - Every `BlobStore`/`MetaStore` backend must pass
-  `leep_core::memory::check_*_contract`.
+  `leep_core::memory::check_*_contract`, also through a quiet
+  `leep-testkit` wrapper.
 
 ## 4. Data model
 
@@ -220,6 +222,7 @@ loop (≤32 attempts):
   if head is None:                 CAS(None → cs)
   elif cs is an ancestor of head:  already landed
   elif head is an ancestor of cs:  CAS(head → cs)          # fast-forward
+  elif head's history holds a server-made copy of cs:  already landed
   else:
     stack ← first-parent chain from cs down to where it joins head's history
     replay each stack entry onto head, oldest first        # 3-way per entry
@@ -228,6 +231,8 @@ loop (≤32 attempts):
                  never auto-resolved on the server)
     CAS(head → replayed top)
   CAS won → Landed;  CAS lost → jittered backoff, retry
+  CAS errored → it may have applied: the next pass re-reads the head and
+                finds the copy, or tries again (3 errors in a row → the error)
 attempts exhausted → 409 Conflict (client retries)
 ```
 Lands on one ref are serialized within each server process. Without that,
@@ -235,6 +240,12 @@ concurrent lands each redo the replay only to lose the CAS to a sibling
 request, so under a swarm most of them exhaust their attempts. The CAS still
 coordinates separate server processes; jittered backoff keeps them from
 colliding in lockstep.
+The copy test makes `land` idempotent: a client that never saw the answer to
+a land that applied (a timeout, a killed server, an error after commit) can
+send it again and gets the copy back instead of a second one. It looks for a
+rebased copy that `Repo::rebase` recorded (`rebased-origin-v1`), not for the
+forgeable `leep.rebased_from` extra, among the head's ancestors above `cs`'s
+generation, and gives up after 1024 changesets (ADR 0021).
 Replaying the whole stack matters: rebasing only `cs` would silently drop the
 changes of unlanded changesets below it. On conflict the client applies
 `clean`, resolves `conflicts` on top of `onto`, commits once and lands again,
@@ -356,10 +367,34 @@ misses and occupancy as Prometheus metrics (see [OPERATIONS.md](OPERATIONS.md)).
 
 | Failure | Effect | Recovery |
 |---|---|---|
-| Server instance dies mid-request | No partial mutable state (only refs are mutable, by CAS) | Client retries; every write is idempotent |
+| Server instance dies mid-request (SIGKILL included) | No partial mutable state: refs move by one transaction, everything else is written idempotently, so a request leaves at most unreferenced blobs, tree nodes and derived rows | Client retries; every write is idempotent and a repeated `land` finds its earlier result |
+| Store call errors | The request fails with 500 (or 409 when the swap lost); nothing it did is rolled back, and nothing needs to be | Client retries |
+| Store call applies, then reports an error (lost commit acknowledgement, timeout after commit) | The write may exist. For a blob, changeset or derived row that is harmless. For `cas_ref` the caller cannot tell | `land` reads the ref again and recognises its own result; other ref callers must read the ref before repeating |
+| Request cancelled by `--request-timeout` or a client disconnect | Same as a dead server for the work it had done; it performs no further writes | Client retries |
 | MetaStore unavailable | Writes and uncached reads fail | Fail fast with 500; no local fallback |
 | BlobStore slow | Cache tiers absorb repeated reads | — |
 | Land CAS contention | Bounded retries, then an error | Client retries `land` |
+| `gc` killed at any point | Rows it wrote are harmless (a condemned blob is re-uploaded on demand, an announced delete is closed by the next collect); no reachable blob was deleted | Run `gc collect` again |
+
+**What each backend guarantees.** "Applied" means durable against a process
+kill; the SQL backends and the filesystem store also survive power loss
+except where noted.
+
+| Backend | Atomic unit | Killed or cancelled mid-call | Error after the call applied |
+|---|---|---|---|
+| `MemoryMetaStore`, `MemoryBlobStore` | One call, under a lock; a ref and its log entry share the lock | Not durable | Cannot happen |
+| SQLite (WAL, synchronous FULL) | One transaction per call; `cas_ref_logged` changes the ref and appends its log entry in one | The open transaction rolls back (the next writer sees nothing of it); a committed one is durable | Only when the error is raised while `COMMIT` is in flight; the caller must treat any `cas_ref` error as unknown |
+| Postgres | Same, one transaction per call, plus an advisory lock for log order | The server drops the connection, Postgres rolls the transaction back; committed work stays | Connection lost after `COMMIT` was sent: the commit may have applied |
+| Filesystem blobs | Write a temp file, fsync it, rename it into place | A blob is never visible partly written; a crash before the rename leaves a `.tmp-*` file that is never listed, read or counted as the blob and never removed (safe to delete when older than the request timeout). The shard directory is not fsynced, so power loss (not a kill) can lose the rename of a put that was acknowledged | A put that errors after the rename leaves a whole blob; repeating it is a no-op |
+| Object store (S3) | One PUT | No partial objects | Same as above |
+| `CachedBlobStore` | None (memory) | Gone with the process | A failed put or read caches nothing; a deleted blob can be served from the cache until evicted, which is harmless because only unreferenced blobs are deleted |
+
+Derived data is only ever missing after a failure, never wrong: a row is
+written after the values it is computed from exist, and derivation retries
+from whatever rows are present. What the stores do not protect is a row or
+blob that is damaged at rest. Tree nodes and history nodes are content
+addressed and checked on read; most other derived rows are not (ADR 0021
+lists them). The tests that establish all of this are in ADR 0021.
 
 Observability: libraries emit `tracing` events and `metrics` facade calls
 (no-ops without a recorder); only `leep-server` installs a recorder and

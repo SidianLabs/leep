@@ -78,4 +78,20 @@ mod tests {
         assert!(open_blob_store("ftp://x").is_err());
         assert!(open_blob_store("s3://b?bogus=1").is_err());
     }
+
+    /// With nothing scheduled the fault injector is transparent: every
+    /// backend still passes the contract through it.
+    #[tokio::test]
+    async fn quiet_fault_wrappers_pass_contract() {
+        use leep_testkit::{FaultPlan, FaultyBlobStore};
+        let dir = tempfile::tempdir().unwrap();
+        let backends: Vec<Arc<dyn BlobStore>> = vec![
+            Arc::new(FsBlobStore::new(dir.path())),
+            Arc::new(ObjectBlobStore::in_memory()),
+        ];
+        for inner in backends {
+            let store = FaultyBlobStore::new(inner, FaultPlan::new(1));
+            check_blob_store_contract(&store).await;
+        }
+    }
 }

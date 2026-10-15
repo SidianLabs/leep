@@ -2358,6 +2358,7 @@ dependencies = [
  "futures-util",
  "globset",
  "leep-core",
+ "leep-testkit",
  "metrics",
  "postcard",
  "regex",
@@ -2373,6 +2374,10 @@ name = "leep-e2e"
 version = "0.0.1"
 dependencies = [
  "leep-core",
+ "leep-derive",
+ "leep-meta",
+ "leep-store",
+ "leep-testkit",
  "serde_json",
  "sqlx",
  "tempfile",
@@ -2436,6 +2441,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "leep-core",
+ "leep-testkit",
  "sqlx",
  "tokio",
  "tracing",
@@ -2482,12 +2488,23 @@ dependencies = [
  "bytes",
  "futures",
  "leep-core",
+ "leep-testkit",
  "metrics",
  "object_store",
  "tempfile",
  "tokio",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "leep-testkit"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "leep-core",
+ "tokio",
 ]
 
 [[package]]

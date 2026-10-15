@@ -22,7 +22,8 @@ diffy = "0.4"
 similar = "2"
 
 [dev-dependencies]
-tokio.workspace = true
+leep-testkit.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 criterion.workspace = true
 
 [[bench]]

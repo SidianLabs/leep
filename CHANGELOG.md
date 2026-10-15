@@ -140,6 +140,24 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 - The CLI retries a rate-limited `GET` (up to 4 tries, honoring
   `Retry-After`) and reports a wait over 10 seconds instead of sitting
   through it.
+- Fault injection for the storage traits (ADR 0021): the dev-only
+  `leep-testkit` crate wraps any blob or meta store and injects seeded
+  errors, applied-then-failed writes, delays, stalls and damaged reads, and
+  can cancel a call at a chosen suspension point. Fault-tolerance tests cover
+  `land`, derived data, GC, the ref log, the filesystem store and the cache.
+- Crash-consistency test (`cargo test -p leep-e2e --test crash`): SIGKILLs
+  the real server and `gc collect` at seeded points under concurrent HTTP and
+  CLI traffic on SQLite and Postgres, then checks refs, history, the ref log
+  and every landed commit from outside. `LEEP_CRASH_ROUNDS` runs it longer
+  (`docs/OPERATIONS.md`).
+- Fixed: a `land` whose commit applied but whose answer was lost, repeated by
+  the client, landed its stack a second time. `land` now recognises its own
+  earlier result and re-drives a failed commit from a fresh read.
+- Fixed: a damaged tree node or path-history node is now an error instead of
+  being read as valid (it could leave live blobs unmarked by GC).
+- Fixed: a `gc collect` killed after deleting a blob but before recording it
+  could leave that blob hash answering 409 to uploads until it was
+  re-condemned; the next collect now closes the stale delete announcement.
 
 ### Project
 - Workspace version set to 0.0.1, with a CI check that keeps it below
