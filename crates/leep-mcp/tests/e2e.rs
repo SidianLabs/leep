@@ -329,3 +329,50 @@ fn edits_keep_the_executable_bit_unless_told_otherwise() {
     let files = data(&call(&s, "leep_list_files", json!({ "prefix": "new.txt" })));
     assert_eq!(files["files"][0]["kind"], "regular");
 }
+
+/// Agents can ask which changes a given model, session or author made.
+#[test]
+fn log_filters_by_agent_and_author() {
+    let url = start_server();
+    let mut a_cfg = config(&url);
+    a_cfg.agent_model = Some("model-a".into());
+    a_cfg.agent_session = Some("s-a".into());
+    let mut b_cfg = config(&url);
+    b_cfg.agent_model = Some("model-b".into());
+    b_cfg.agent_session = Some("s-b".into());
+    b_cfg.author = "Bea <bea@example.com>".into();
+    let (a, b) = (Server::new(a_cfg), Server::new(b_cfg));
+    commit(
+        &a,
+        json!({ "message": "from a", "changes": [{ "path": "a.txt", "content": "a\n" }] }),
+    );
+    commit(
+        &b,
+        json!({ "message": "from b", "changes": [{ "path": "b.txt", "content": "b\n" }] }),
+    );
+    commit(
+        &a,
+        json!({ "message": "a again", "changes": [{ "path": "a.txt", "content": "aa\n" }] }),
+    );
+
+    let messages = |args: Value| -> Vec<String> {
+        let log = data(&call(&a, "leep_log", args));
+        log["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["message"].as_str().unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(
+        messages(json!({ "agent_model": "model-a" })),
+        ["a again", "from a"]
+    );
+    assert_eq!(messages(json!({ "agent_session": "s-b" })), ["from b"]);
+    assert_eq!(messages(json!({ "author": "bea" })), ["from b"]);
+    assert_eq!(
+        messages(json!({ "agent_model": "model-a", "path": "b.txt" })),
+        Vec::<String>::new()
+    );
+    assert_eq!(messages(json!({})).len(), 3);
+}

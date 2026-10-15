@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write;
 
 use leep_core::api::{ChangesetInfo, FileInfo};
+use leep_core::changeset::{EXTRA_AGENT_MODEL, EXTRA_AGENT_SESSION};
 use leep_core::{ChangesetId, FileKind};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -26,6 +27,9 @@ struct LogArgs {
     rev: Option<String>,
     path: Option<String>,
     limit: Option<u32>,
+    author: Option<String>,
+    agent_model: Option<String>,
+    agent_session: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -96,10 +100,19 @@ impl Server {
         let a: LogArgs = parse_args(args)?;
         let id = self.resolve_rev(a.rev.as_deref())?;
         let limit = a.limit.unwrap_or(DEFAULT_LOG_LIMIT).clamp(1, MAX_LOG_LIMIT);
+        let non_empty = |v: Option<String>| v.filter(|v| !v.is_empty());
+        let mut extra = Vec::new();
+        if let Some(m) = non_empty(a.agent_model) {
+            extra.push(format!("{EXTRA_AGENT_MODEL}:{m}"));
+        }
+        if let Some(sess) = non_empty(a.agent_session) {
+            extra.push(format!("{EXTRA_AGENT_SESSION}:{sess}"));
+        }
         let query = leep_cli::client::LogQuery {
-            path: a.path.filter(|p| !p.is_empty()),
+            path: non_empty(a.path),
             limit: Some(limit),
-            ..Default::default()
+            author: non_empty(a.author),
+            extra,
         };
         let log = self.client.log(&id, &query)?;
         let entries: Vec<Value> = log.entries.iter().map(summary).collect();

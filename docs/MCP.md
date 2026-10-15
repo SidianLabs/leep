@@ -50,7 +50,7 @@ Logs go to stderr; stdout carries protocol messages only.
 | Tool | Arguments | Result |
 |---|---|---|
 | `leep_refs` | none | refs and their changeset ids |
-| `leep_log` | `rev?`, `path?`, `limit?` (default 20, max 200) | entries with author, message, `agent` metadata |
+| `leep_log` | `rev?`, `path?`, `limit?` (default 20, max 200), `author?`, `agent_model?`, `agent_session?` (filters combine with AND) | entries with author, message, `agent` metadata |
 | `leep_show` | `rev` | one changeset and its changed paths (A/M/D) |
 | `leep_list_files` | `rev?`, `prefix?` | recursive file list with sizes |
 | `leep_read_file` | `rev?`, `path` | text content; capped at 256 KiB; binary is reported, not returned |
