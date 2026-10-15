@@ -16,9 +16,10 @@
 //! | GET  | `/v1/tree/{id}?path=dir` | – | [`TreeResponse`] (one directory level) |
 //! | GET  | `/v1/files/{id}?prefix=dir` | – | [`FilesResponse`] (recursive listing) |
 //! | GET  | `/v1/file/{id}?path=p` | – | raw bytes + `x-leep-kind` header, or 404 |
-//! | GET  | `/v1/log/{id}?path=p&limit=n` | – | [`LogResponse`] (newest first; `limit` defaults to 100, capped at 10000) |
+//! | GET  | `/v1/log/{id}?path=p&limit=n&author=a&extra=k:v` | – | [`LogResponse`] (newest first; `limit` defaults to 100, capped at 10000). `author` is a case-insensitive substring; `extra` repeats, is ANDed, and is `key:value` (exact) or `key` (present). `limit` counts matches, so a selective filter scans history linearly |
 //! | GET  | `/v1/diff?from=a&to=b&prefix=dir` | – | [`DiffResponse`] (`from` omitted = empty tree) |
-//! | GET  | `/v1/blame/{id}?path=p` | – | [`BlameResponse`] |
+//! | GET  | `/v1/blame/{id}?path=p` | – | [`BlameResponse`] (with per-changeset [`ChangesetSummary`]) |
+//! | GET  | `/v1/provenance/{id}?path=prefix&limit=n` | – | [`ProvenanceResponse`] (who and what made the changesets reachable from `id`; `limit` defaults to 10000, capped at 10000) |
 //! | GET  | `/v1/merge-base?a=x&b=y` | – | [`MergeBaseResponse`] |
 //! | POST | `/v1/merge` | [`MergeRequest`] | [`MergeResponse`] |
 //! | POST | `/v1/rebase` | [`RebaseRequest`] | [`RebaseResponse`] |
@@ -154,10 +155,63 @@ pub struct BlameLine {
     pub text: String,
 }
 
+/// Who made a changeset, kept small enough to ship once per changeset.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangesetSummary {
+    pub author: String,
+    pub timestamp: i64,
+    pub message_first_line: String,
+    /// Only the `agent.*` keys of the changeset's `extra`.
+    #[serde(default)]
+    pub agent: BTreeMap<String, String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlameResponse {
     pub path: RepoPath,
     pub lines: Vec<BlameLine>,
+    /// One entry per distinct changeset in `lines`, so a line stays small
+    /// and a changeset that owns many lines is described once. Absent from
+    /// responses of servers older than provenance support.
+    #[serde(default)]
+    pub changesets: BTreeMap<ChangesetId, ChangesetSummary>,
+}
+
+/// Changesets made by one agent model, optionally narrowed to one session.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentStat {
+    pub model: String,
+    #[serde(default)]
+    pub session: Option<String>,
+    pub changesets: u64,
+    /// Distinct paths changed (within the requested prefix, if any).
+    pub files_touched: u64,
+    /// Oldest and newest changeset timestamps (unix seconds).
+    pub first: i64,
+    pub last: i64,
+}
+
+/// Changesets by one author that carry no `agent.*` provenance.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HumanStat {
+    pub author: String,
+    pub changesets: u64,
+    pub files_touched: u64,
+    pub first: i64,
+    pub last: i64,
+}
+
+/// A changeset counts as an agent's if its `extra` has `agent.model` or
+/// `agent.session` (a missing model is reported as `unknown`). Counts are over
+/// the first `limit` changesets of the walk from the starting changeset, newest
+/// first; `truncated` says more history was left unscanned.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProvenanceResponse {
+    pub agents: Vec<AgentStat>,
+    pub humans: Vec<HumanStat>,
+    /// Changesets scanned.
+    pub scanned: u64,
+    pub truncated: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -282,5 +336,36 @@ mod tests {
         let req: LandRequest =
             serde_json::from_value(serde_json::json!({ "changeset": id.to_string() })).unwrap();
         assert_eq!(req.target_ref, "main");
+    }
+
+    #[test]
+    fn blame_response_without_changesets_still_parses() {
+        let v: BlameResponse =
+            serde_json::from_value(serde_json::json!({ "path": "a", "lines": [] })).unwrap();
+        assert!(v.changesets.is_empty());
+    }
+
+    #[test]
+    fn blame_summaries_round_trip_keyed_by_id() {
+        let id = ChangesetId(Hash::of_blob(b"y"));
+        let r = BlameResponse {
+            path: RepoPath::new("a").unwrap(),
+            lines: vec![],
+            changesets: BTreeMap::from([(
+                id,
+                ChangesetSummary {
+                    author: "x".into(),
+                    timestamp: 3,
+                    message_first_line: "m".into(),
+                    agent: BTreeMap::from([("agent.model".into(), "m1".into())]),
+                },
+            )]),
+        };
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(
+            v["changesets"][id.to_string()]["agent"]["agent.model"],
+            "m1"
+        );
+        assert_eq!(serde_json::from_value::<BlameResponse>(v).unwrap(), r);
     }
 }

@@ -20,4 +20,5 @@ mod tree_ops;
 #[cfg(test)]
 mod tests;
 
+pub use history::{ExtraMatch, LogFilter};
 pub use repo::Repo;
