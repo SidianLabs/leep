@@ -9,6 +9,8 @@
 4. Keep PRs to one logical change. Follow the commit, branch and PR
    conventions in [`.claude/skills/commit-and-pr/SKILL.md`](.claude/skills/commit-and-pr/SKILL.md).
    Commits and PRs credit human authors only, never AI tools.
+5. Anything that decodes bytes from outside (a stored row, a request body, a
+   config file) gets a fuzz target; see [docs/FUZZING.md](docs/FUZZING.md).
 
 AI agents working on this repo: follow [CLAUDE.md](CLAUDE.md) and the skills
 in `.claude/skills/`.

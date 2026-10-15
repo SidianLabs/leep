@@ -77,10 +77,12 @@ content-addressing and (b) the atomicity of `MetaStore::cas_ref`.
 | `leep-cli` | Client binary `leep` | core only |
 | `leep-mcp` | MCP server binary `leep-mcp` for AI agents (stdio JSON-RPC; talks to `leep-server` over HTTP) | core and the `leep-cli` library (its HTTP client); never derive, store, meta or server outside dev-dependencies |
 | `leep-git` | Git bridge: library plus the `leep-git` admin binary | core, derive; store and meta only to open stores by URL in the binary |
+| `leep-fuzz-targets` | Test-only (`publish = false`): fuzz harness functions and the seed corpus loader for every decoder and parser (`docs/FUZZING.md`) | core, derive, server (to drive the real router and config parsers); nothing depends on it except the `fuzz/` crate |
 
 Rules:
-- Dependencies point toward `leep-core`. Nothing depends on `leep-server`, and
-  only `leep-mcp` depends on `leep-cli` (for its client library).
+- Dependencies point toward `leep-core`. Nothing depends on `leep-server`
+  except the test-only `leep-fuzz-targets`, and only `leep-mcp` depends on
+  `leep-cli` (for its client library).
 - `leep-derive` must stay backend-agnostic. It is tested against
   `leep_core::memory`.
 - Every `BlobStore`/`MetaStore` backend must pass

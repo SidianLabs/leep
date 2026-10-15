@@ -68,17 +68,18 @@ operator action, and their benchmarks are in `docs/PERFORMANCE.md`.
 - [x] Ref log (history of every ref move) and `leep undo` (ADR 0018)
 
 ### Hardening
-- Self-host Leep's own development on a Leep server, mirrored to GitHub,
+- [ ] Self-host Leep's own development on a Leep server, mirrored to GitHub,
   with the git bridge keeping the mirror in sync
-- Fuzz every decoder (postcard objects, derived rows, API request bodies,
+- [x] Fuzz every decoder (postcard objects, derived rows, API request bodies,
   OWNERS and policy files) and the comment lexer; run the fuzzers in CI
-- Crash-consistency tests: kill the server and GC at random points and check
+  (`docs/FUZZING.md`)
+- [ ] Crash-consistency tests: kill the server and GC at random points and check
   that no ref, changeset or blob reachable from a ref is lost
-- Fault injection in the storage traits (timeouts, partial writes, errors)
-- Long-running soak test: many agents landing for hours against Postgres
-- Security review of auth, signing, review policies and GC, with findings
+- [ ] Fault injection in the storage traits (timeouts, partial writes, errors)
+- [ ] Long-running soak test: many agents landing for hours against Postgres
+- [ ] Security review of auth, signing, review policies and GC, with findings
   fixed or written down in the relevant ADR
-- Request size, rate and concurrency limits per token
+- [ ] Request size, rate and concurrency limits per token
 
 Exit: a full soak run and the fuzzers find nothing new for two weeks.
 
