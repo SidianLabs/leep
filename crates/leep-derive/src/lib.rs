@@ -1,14 +1,21 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+//! Leep derived data and repository operations.
+//!
+//! [`Repo`] wraps a `BlobStore` and a `MetaStore` and implements everything the
+//! server exposes: changeset creation, trees, history, diff, blame, merge,
+//! rebase and land. Full trees, generation numbers, ancestry indexes and blame
+//! are derived data (see [`derived`]) computed iteratively from parents and
+//! cached in the `MetaStore`. See `docs/ARCHITECTURE.md`.
+
+mod ancestry;
+mod blame;
+pub mod derived;
+mod history;
+mod land;
+mod merge;
+mod repo;
+mod tree_ops;
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+mod tests;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub use repo::Repo;

@@ -1,6 +1,19 @@
 [package]
 name = "leep-derive"
-version = "0.1.0"
-edition = "2024"
+description = "Derived data and repository operations for Leep"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [dependencies]
+leep-core.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+postcard.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+diffy = "0.4"
+similar = "2"
+
+[dev-dependencies]
+tokio.workspace = true
