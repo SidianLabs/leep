@@ -2270,3 +2270,317 @@ mod review {
         assert!(!PolicySet::new(vec![]).applies_to("main"));
     }
 }
+
+mod path_history {
+    use leep_core::api::ChangesetInfo;
+
+    use super::*;
+    use crate::derived::{self, HistoryTree};
+    use crate::LogFilter;
+
+    fn ids(v: Vec<ChangesetInfo>) -> Vec<ChangesetId> {
+        v.into_iter().map(|i| i.id).collect()
+    }
+
+    async fn indexed(r: &Repo, tip: ChangesetId, path: &str) -> Vec<ChangesetId> {
+        ids(r.log(tip, Some(path), usize::MAX).await.unwrap())
+    }
+
+    #[tokio::test]
+    async fn follows_changes_through_deletes_and_recreation() {
+        let r = repo();
+        let c1 = commit(&r, &[], &[("d/a", Some("1")), ("d/b", Some("1"))], "c1").await;
+        let c2 = commit(&r, &[c1], &[("d/a", Some("2"))], "c2").await;
+        let c3 = commit(&r, &[c2], &[("d/a", None)], "c3").await;
+        let c4 = commit(&r, &[c3], &[("other", Some("1"))], "c4").await;
+        let c5 = commit(&r, &[c4], &[("d/a", Some("3"))], "c5").await;
+        let c6 = commit(&r, &[c5], &[("d/b", None), ("d/a", None)], "c6").await;
+
+        assert_eq!(indexed(&r, c5, "d/a").await, [c5, c3, c2, c1]);
+        // Deleting everything prunes `d` from the tree, but its log remains.
+        assert_eq!(indexed(&r, c6, "d").await, [c6, c5, c3, c2, c1]);
+        assert_eq!(indexed(&r, c6, "d/a").await, [c6, c5, c3, c2, c1]);
+        assert_eq!(indexed(&r, c4, "d/a").await, [c3, c2, c1]);
+        assert_eq!(indexed(&r, c6, "d/b").await, [c6, c1]);
+        assert_eq!(indexed(&r, c6, "other").await, [c4]);
+        assert!(indexed(&r, c6, "never").await.is_empty());
+        assert!(indexed(&r, c6, "d/a/x").await.is_empty());
+        // Slashes and limits behave like the scan.
+        assert_eq!(indexed(&r, c6, "/d//a/").await, [c6, c5, c3, c2, c1]);
+        assert_eq!(ids(r.log(c6, Some("d"), 2).await.unwrap()), [c6, c5]);
+    }
+
+    #[tokio::test]
+    async fn file_and_directory_kind_changes_keep_both_lineages() {
+        let r = repo();
+        let c1 = commit(&r, &[], &[("p", Some("file"))], "c1").await;
+        let c2 = commit(&r, &[c1], &[("p", None), ("p/x", Some("1"))], "c2").await;
+        let c3 = commit(&r, &[c2], &[("p/y", Some("1"))], "c3").await;
+        let c4 = commit(
+            &r,
+            &[c3],
+            &[("p/x", None), ("p/y", None), ("p", Some("f"))],
+            "c4",
+        )
+        .await;
+        assert_eq!(indexed(&r, c3, "p").await, [c3, c2, c1]);
+        assert_eq!(indexed(&r, c3, "p/x").await, [c2]);
+        assert_eq!(indexed(&r, c4, "p").await, [c4, c3, c2, c1]);
+        assert_eq!(indexed(&r, c4, "p/x").await, [c4, c2]);
+    }
+
+    #[tokio::test]
+    async fn merge_keeps_both_sides_when_it_inherits_one() {
+        let r = repo();
+        let base = commit(&r, &[], &[("f", Some("0")), ("g", Some("0"))], "base").await;
+        let a = commit(&r, &[base], &[("f", Some("same"))], "a").await;
+        let b = commit(&r, &[base], &[("f", Some("same"))], "b").await;
+        let c = commit(&r, &[base], &[("g", Some("1"))], "c").await;
+        // Both sides made the same edit, so the merge changes nothing relative
+        // to its first parent, yet `b` is still an ancestor that changed `f`.
+        let m = commit(&r, &[a, b], &[], "m").await;
+        assert_eq!(
+            indexed(&r, m, "f").await,
+            ids(r
+                .log_scan(m, Some("f"), 99, &LogFilter::default())
+                .await
+                .unwrap())
+        );
+        let log = indexed(&r, m, "f").await;
+        assert!(log.contains(&a) && log.contains(&b) && !log.contains(&m));
+        assert_eq!(log.len(), 3);
+        let (last, concurrent) = r.last_change(m, "f").await.unwrap();
+        let mut both = vec![last.id];
+        both.extend(concurrent);
+        both.sort();
+        let mut want = vec![a, b];
+        want.sort();
+        assert_eq!(both, want);
+
+        // A merge that changes the path is itself the last change, and its
+        // parents' histories stay reachable.
+        let m2 = commit(
+            &r,
+            &[a, c],
+            &[("g", Some("1")), ("f", Some("merged"))],
+            "m2",
+        )
+        .await;
+        assert_eq!(indexed(&r, m2, "f").await, [m2, a, base]);
+        assert_eq!(indexed(&r, m2, "g").await, [m2, c, base]);
+        let (last, concurrent) = r.last_change(m2, "f").await.unwrap();
+        assert_eq!((last.id, concurrent), (m2, vec![]));
+    }
+
+    #[tokio::test]
+    async fn last_change_of_files_directories_and_deleted_paths() {
+        let r = repo();
+        let c1 = commit(&r, &[], &[("src/a", Some("1")), ("src/b", Some("1"))], "c1").await;
+        let c2 = commit(&r, &[c1], &[("src/a", Some("2"))], "c2").await;
+        let c3 = commit(&r, &[c2], &[("src/b", None)], "c3").await;
+        let id = |p: &str| {
+            let r = r.clone();
+            let p = p.to_string();
+            async move { r.last_change(c3, &p).await.unwrap().0.id }
+        };
+        assert_eq!(id("src/a").await, c2);
+        assert_eq!(id("src/b").await, c3);
+        assert_eq!(id("src").await, c3);
+        assert_eq!(r.last_change(c2, "src/b").await.unwrap().0.id, c1);
+        assert_eq!(r.last_change(c3, "src/a/").await.unwrap().0.generation, 2);
+        assert!(matches!(
+            r.last_change(c3, "nope").await,
+            Err(Error::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn derivation_is_deterministic_and_idempotent() {
+        let a = repo();
+        let b = repo();
+        let mut tips = Vec::new();
+        for r in [&a, &b] {
+            let c1 = commit(r, &[], &[("x/1", Some("1"))], "c1").await;
+            let c2 = commit(r, &[c1], &[("x/2", Some("1"))], "c2").await;
+            let c3 = commit(r, &[c1], &[("x/1", Some("3"))], "c3").await;
+            let m = commit(r, &[c2, c3], &[], "m").await;
+            tips.push(m);
+        }
+        assert_eq!(tips[0], tips[1]);
+        let first = derived::derive::<HistoryTree>(&a, tips[0]).await.unwrap();
+        assert_eq!(
+            first,
+            derived::derive::<HistoryTree>(&a, tips[0]).await.unwrap()
+        );
+        assert_eq!(
+            first,
+            derived::derive::<HistoryTree>(&b, tips[1]).await.unwrap()
+        );
+        // A second derivation after the row is gone writes the same value.
+        let again = derived::derive::<HistoryTree>(&b, tips[1]).await.unwrap();
+        assert_eq!(first, again);
+    }
+
+    #[tokio::test]
+    async fn deriving_a_deep_history_is_iterative() {
+        let r = repo();
+        let meta = r.meta().clone();
+        let mut parents = vec![];
+        let mut tip = None;
+        for i in 0..12_000u32 {
+            let mut cs = changeset(&parents, BTreeMap::new(), &format!("c{i}"));
+            cs.changes.insert(
+                rp(&format!("d{}/f{}", i % 3, i % 10)),
+                FileChange::Modify {
+                    content: Hash::of_blob(format!("{i}").as_bytes()),
+                    kind: FileKind::Regular,
+                    size: 1,
+                },
+            );
+            let id = meta.put_changeset(&cs).await.unwrap();
+            parents = vec![id];
+            tip = Some(id);
+        }
+        let tip = tip.unwrap();
+        let log = r.log(tip, Some("d0/f0"), 3).await.unwrap();
+        // i % 3 == 0 and i % 10 == 0, newest first.
+        let gens: Vec<u64> = log.iter().map(|i| i.generation).collect();
+        assert_eq!(gens, [11_971, 11_941, 11_911]);
+    }
+
+    /// Deterministic generator for the property test below.
+    struct Rng(u64);
+
+    impl Rng {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((self.0 >> 33) as usize) % n
+        }
+    }
+
+    const POOL: &[&str] = &[
+        "a", "a/b", "a/c", "d/x", "d/y/z", "d/y/w", "d/y", "e", "e/f/g", "e/f", "h",
+    ];
+
+    /// A random changeset on `parents[0]`: edits of pool paths (sometimes to
+    /// content already there, so no-ops happen), and deletes of existing files.
+    /// Retries when the result would clash a file with a directory.
+    async fn random_commit(
+        r: &Repo,
+        rng: &mut Rng,
+        parents: &[ChangesetId],
+        n: usize,
+    ) -> ChangesetId {
+        loop {
+            let existing: Vec<String> = match parents.first() {
+                Some(p) => r
+                    .list_files(*p, "")
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|f| f.path.as_str().to_string())
+                    .collect(),
+                None => vec![],
+            };
+            let mut changes = BTreeMap::new();
+            let ops = if parents.len() > 1 {
+                rng.below(3)
+            } else {
+                1 + rng.below(3)
+            };
+            for _ in 0..ops {
+                let path = rp(POOL[rng.below(POOL.len())]);
+                let change = if rng.below(4) == 0 && !existing.is_empty() {
+                    let victim = rp(&existing[rng.below(existing.len())]);
+                    changes.insert(victim, FileChange::Delete);
+                    continue;
+                } else {
+                    // Few distinct contents, so edits often repeat.
+                    modify(r, format!("v{}", rng.below(3)).as_bytes()).await
+                };
+                changes.insert(path, change);
+            }
+            let mut cs = changeset(parents, changes, &format!("c{n}"));
+            cs.author = ["alice", "bob"][rng.below(2)].into();
+            if let Ok(id) = r.create_changeset(cs).await {
+                return id;
+            }
+        }
+    }
+
+    /// The index must agree with the scan of all ancestors on random DAGs with
+    /// merges (including empty ones), deletes, no-op edits, re-creation and
+    /// file/directory kind changes.
+    #[tokio::test]
+    async fn indexed_log_matches_the_scan_on_random_histories() {
+        let mut rng = Rng(0xfa57109);
+        let mut dirs = vec!["", "a", "d", "d/y", "e", "e/f", "never"];
+        dirs.extend(POOL);
+        for round in 0..6 {
+            let r = repo();
+            let mut all: Vec<ChangesetId> = Vec::new();
+            for n in 0..90 {
+                let parents: Vec<ChangesetId> = match (all.len(), rng.below(10)) {
+                    (0, _) => vec![],
+                    (len, 0..=2) if len >= 2 => {
+                        let a = all[len - 1 - rng.below(len.min(10))];
+                        let b = all[rng.below(len)];
+                        let mut p = vec![a];
+                        if b != a {
+                            p.push(b);
+                        }
+                        if rng.below(8) == 0 {
+                            let c = all[rng.below(len)];
+                            if !p.contains(&c) {
+                                p.push(c);
+                            }
+                        }
+                        p
+                    }
+                    (len, _) => vec![all[len - 1 - rng.below(len.min(6))]],
+                };
+                all.push(random_commit(&r, &mut rng, &parents, n).await);
+            }
+            let alice = LogFilter {
+                author: Some("alice".into()),
+                ..Default::default()
+            };
+            for _ in 0..12 {
+                let tip = all[all.len() - 1 - rng.below(all.len().min(30))];
+                for path in &dirs {
+                    for (limit, filter) in [
+                        (usize::MAX, &LogFilter::default()),
+                        (3, &LogFilter::default()),
+                        (usize::MAX, &alice),
+                    ] {
+                        let want = r.log_scan(tip, Some(path), limit, filter).await.unwrap();
+                        let got = r
+                            .log_filtered(tip, Some(path), limit, filter)
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            ids(got),
+                            ids(want),
+                            "round {round}, tip {tip}, path {path:?}"
+                        );
+                    }
+                    if path.is_empty() {
+                        continue;
+                    }
+                    let want = r
+                        .log_scan(tip, Some(path), 1, &LogFilter::default())
+                        .await
+                        .unwrap();
+                    match r.last_change(tip, path).await {
+                        Ok((last, _)) => assert_eq!(vec![last.id], ids(want)),
+                        Err(Error::NotFound(_)) => assert!(want.is_empty()),
+                        Err(e) => panic!("{e}"),
+                    }
+                }
+            }
+        }
+    }
+}

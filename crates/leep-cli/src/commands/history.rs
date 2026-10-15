@@ -1,4 +1,4 @@
-//! Read-only queries: log, show, cat, blame, provenance, refs.
+//! Read-only queries: log, last-change, show, cat, blame, provenance, refs.
 
 use std::io::Write;
 
@@ -15,7 +15,8 @@ use crate::fmt::{short, utc_time};
 pub struct LogArgs {
     /// Starting revision (default: working copy base, else target ref).
     pub rev: Option<String>,
-    /// Only changesets touching this path.
+    /// Only changesets touching this file or directory (answered from the
+    /// server's path-history index, so cost does not grow with history).
     #[arg(long)]
     pub path: Option<String>,
     /// Maximum number of entries.
@@ -40,8 +41,8 @@ pub struct LogArgs {
 }
 
 impl LogArgs {
-    /// The server query these flags stand for. All filters are ANDed, and
-    /// filtering scans history linearly on the server.
+    /// The server query these flags stand for. All filters are ANDed. Without
+    /// `--path`, filtering scans history linearly on the server.
     pub fn query(&self) -> Result<LogQuery> {
         let mut extra = Vec::new();
         if self.agent {
@@ -82,6 +83,15 @@ pub struct ProvenanceArgs {
     /// Maximum number of changesets to scan (server default and cap: 10000).
     #[arg(short = 'n', long)]
     pub limit: Option<u32>,
+}
+
+#[derive(Args, Debug)]
+pub struct LastChangeArgs {
+    /// File or directory, repository-relative.
+    pub path: String,
+    /// Revision to look from (default: working copy base, else target ref).
+    #[arg(long)]
+    pub rev: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -130,6 +140,20 @@ pub fn log(r: &Remote, args: &LogArgs) -> Result<i32> {
     for info in &resp.entries {
         header(info);
         println!();
+    }
+    Ok(0)
+}
+
+pub fn last_change(r: &Remote, args: &LastChangeArgs) -> Result<i32> {
+    let id = r.resolve_default(args.rev.as_deref())?;
+    let resp = r.client.last_change(&id, &args.path)?;
+    if r.json {
+        print_json(&resp)?;
+        return Ok(0);
+    }
+    header(&resp.changeset);
+    for c in &resp.concurrent {
+        println!("also changed concurrently in {c}");
     }
     Ok(0)
 }

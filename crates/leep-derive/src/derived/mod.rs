@@ -4,6 +4,7 @@
 //! oldest-first and caches each under `(kind, changeset id)` in the `MetaStore`.
 
 mod generation;
+mod history_tree;
 mod last_merge;
 mod root_tree;
 mod skiplist;
@@ -17,6 +18,7 @@ use leep_core::{Changeset, ChangesetId, Error, Hash, Result};
 use crate::Repo;
 
 pub use generation::Generation;
+pub use history_tree::{HistoryEntry, HistoryNode, HistoryTree, NODE_KIND as HISTORY_NODE_KIND};
 pub use last_merge::LastMerge;
 pub use root_tree::RootTree;
 pub use skiplist::{SkipEntry, Skiplist};

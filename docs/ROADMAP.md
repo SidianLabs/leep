@@ -30,7 +30,8 @@ Milestones are ordered. Each one should leave `main` releasable.
 ## v0.4: Scale
 - Regional read-through cache tier
 - FUSE virtual filesystem (`leep mount`)
-- Path-history index and server-side code search as derived data
+- [x] Path-history index as derived data (`history-tree-v1`, `leep last-change`; ADR 0013)
+- [ ] Server-side code search as derived data
 - Distributed SQL `MetaStore` backend
 
 ## Later / research

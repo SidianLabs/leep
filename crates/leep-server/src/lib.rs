@@ -129,6 +129,7 @@ pub fn router_with_timeout(
         .route("/v1/files/{id}", get(files))
         .route("/v1/file/{id}", get(file))
         .route("/v1/log/{id}", get(log))
+        .route("/v1/last-change/{id}", get(last_change))
         .route("/v1/diff", get(diff))
         .route("/v1/blame/{id}", get(blame))
         .route("/v1/provenance/{id}", get(provenance))
@@ -522,6 +523,20 @@ async fn log(
         .log_filtered(cid(&id)?, q.path.as_deref(), limit, &q.filter)
         .await?;
     Ok(Json(LogResponse { entries }))
+}
+
+async fn last_change(
+    State(repo): S,
+    Path(id): Path<String>,
+    Query(q): Query<PathQuery>,
+) -> ApiResult<Json<LastChangeResponse>> {
+    let path = RepoPath::new(q.path.trim_matches('/'))?;
+    let (changeset, concurrent) = repo.last_change(cid(&id)?, path.as_str()).await?;
+    Ok(Json(LastChangeResponse {
+        path: path.as_str().to_string(),
+        changeset,
+        concurrent,
+    }))
 }
 
 async fn provenance(

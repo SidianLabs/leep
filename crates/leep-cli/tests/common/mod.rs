@@ -136,6 +136,7 @@ impl Mock {
             .route("/v1/resolve/{*rev}", get(resolve))
             .route("/v1/files/{id}", get(files))
             .route("/v1/log/{id}", get(log))
+            .route("/v1/last-change/{id}", get(last_change))
             .route("/v1/blame/{id}", get(blame))
             .route("/v1/provenance/{id}", get(provenance))
             .route("/v1/land", post(land));
@@ -498,6 +499,40 @@ async fn log(
         }
     }
     Ok(Json(LogResponse { entries }))
+}
+
+/// Answers with the requested changeset itself, which is all the CLI tests
+/// need to see the client build the request and decode the response.
+async fn last_change(
+    State(s): State<Shared>,
+    Path(id): Path<String>,
+    RawQuery(raw): RawQuery,
+) -> Resp<LastChangeResponse> {
+    let mut d = s.lock().unwrap();
+    record(&mut d, "last-change", &raw);
+    let id: ChangesetId = id
+        .parse()
+        .map_err(|_| err(StatusCode::BAD_REQUEST, "bad id"))?;
+    let cs = d
+        .changesets
+        .get(&id)
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "no such changeset"))?
+        .clone();
+    let path = pairs(&raw)
+        .into_iter()
+        .find(|(k, _)| k == "path")
+        .map(|(_, v)| v.replace("%2F", "/"))
+        .ok_or_else(|| err(StatusCode::BAD_REQUEST, "missing path"))?;
+    Ok(Json(LastChangeResponse {
+        path,
+        changeset: ChangesetInfo {
+            id,
+            generation: 0,
+            root_tree: Hash::of_blob(b""),
+            changeset: cs,
+        },
+        concurrent: vec![],
+    }))
 }
 
 /// One summary per line owner; every line is attributed to the requested

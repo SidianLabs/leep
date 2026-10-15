@@ -8,7 +8,7 @@ use leep_core::{ChangesetId, Error, FileChange, Hash, RepoPath, Result, TreeEntr
 
 use crate::Repo;
 
-fn join(dir: &str, name: &str) -> String {
+pub(crate) fn join(dir: &str, name: &str) -> String {
     if dir.is_empty() {
         name.to_string()
     } else {
