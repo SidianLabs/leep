@@ -17,8 +17,9 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 cargo bench -p leep-derive                   # criterion; LEEP_BENCH_LARGE=1 adds 100k cases; see docs/PERFORMANCE.md
 ```
-CI runs fmt check, clippy with `-D warnings`, and tests against Postgres 16.
-A change isn't done until all three pass locally.
+CI runs fmt check, `scripts/check-version.sh` (versions stay below 0.1.0),
+clippy with `-D warnings`, and tests against Postgres 16.
+A change isn't done until all of them pass locally.
 
 End-to-end tests drive the real binaries and need them built first:
 `cargo build --workspace && cargo test -p leep-e2e`

@@ -27,6 +27,8 @@ jobs:
       - run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
+      # Versions move only when the maintainer decides; see docs/ROADMAP.md.
+      - run: ./scripts/check-version.sh
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       # Compile only, so the benches do not rot.

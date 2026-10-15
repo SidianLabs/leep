@@ -14,6 +14,8 @@ call M1 to M3 "v0.1" to "v0.3".
 
 - A milestone closes only when every item is done **and** its exit criteria
   hold. Ticking the last box is not enough.
+- CI runs `scripts/check-version.sh`, which fails if any crate reaches
+  `0.1.0`. Raising that ceiling is part of the maintainer's version change.
 - Changing the version, tagging, or publishing artifacts is a
   maintainer decision. Agents never do it on their own.
 - Most of the road to 1.0 is hardening, operating and using Leep for real,
