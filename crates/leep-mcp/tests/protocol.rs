@@ -51,6 +51,7 @@ fn tools_list_schemas_are_sane() {
         "leep_read_file",
         "leep_diff",
         "leep_blame",
+        "leep_review_status",
         "leep_commit_and_land",
     ] {
         assert!(names.contains(&expected), "missing {expected}");

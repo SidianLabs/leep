@@ -146,6 +146,7 @@ impl Server {
             "leep_read_file" => self.read_file(args),
             "leep_diff" => self.diff(args),
             "leep_blame" => self.blame(args),
+            "leep_review_status" => self.review_status(args),
             "leep_commit_and_land" => self.commit_and_land(args),
             _ => return None,
         })
@@ -266,6 +267,25 @@ pub fn definitions() -> Vec<Value> {
                     "path": { "type": "string", "description": "File path." }
                 },
                 "required": ["path"],
+                "additionalProperties": false
+            }),
+            true,
+        ),
+        tool(
+            "leep_review_status",
+            "Review status",
+            "Whether a changeset could land on a ref that requires review, per changed path: the \
+             rule that satisfies it (`auto:comment_only`, `auto:whitespace_only`, `auto:docs_only`, \
+             `owner`, `merge_parent`), or `pending` / `rejected`, with the path's owners and who \
+             approved or rejected. Owners are read from the ref's current head. Needs a server \
+             with authentication.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "rev": { "type": "string", "description": "Changeset id or ref name (required)." },
+                    "ref": { "type": "string", "description": "Ref whose owners and head to judge against (default `main`)." }
+                },
+                "required": ["rev"],
                 "additionalProperties": false
             }),
             true,
