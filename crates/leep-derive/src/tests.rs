@@ -1217,6 +1217,279 @@ async fn land_swarm_across_two_servers_all_succeed() {
     assert_all_landed(&servers[0], 40).await;
 }
 
+/// Commit one file with a chosen author, timestamp and `extra`.
+async fn commit_meta(
+    r: &Repo,
+    parents: &[ChangesetId],
+    file: (&str, &str),
+    author: &str,
+    ts: i64,
+    extra: &[(&str, &str)],
+) -> ChangesetId {
+    let mut cs = changeset(
+        parents,
+        BTreeMap::from([(rp(file.0), modify(r, file.1.as_bytes()).await)]),
+        &format!("edit {}\nmore", file.0),
+    );
+    cs.author = author.into();
+    cs.timestamp = ts;
+    cs.extra = extra
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    r.create_changeset(cs).await.unwrap()
+}
+
+struct Prov {
+    r: Repo,
+    ids: Vec<ChangesetId>,
+}
+
+/// c0 human ann (a), c1 m1/s1 (a), c2 m1/s2 (b), c3 m2/s1 (src/b), c4 human
+/// Bob (a), c5 m1/s1 (src/b), c6 session-only (b).
+async fn prov_repo() -> Prov {
+    let r = repo();
+    type Spec<'a> = (&'a str, &'a str, &'a str, &'a [(&'a str, &'a str)]);
+    let spec: [Spec; 7] = [
+        ("a", "ann", "x0", &[]),
+        (
+            "a",
+            "bot",
+            "x1",
+            &[("agent.model", "m1"), ("agent.session", "s1")],
+        ),
+        (
+            "b",
+            "bot",
+            "x2",
+            &[("agent.model", "m1"), ("agent.session", "s2")],
+        ),
+        (
+            "src/b",
+            "bot",
+            "x3",
+            &[("agent.model", "m2"), ("agent.session", "s1")],
+        ),
+        ("a", "Bob", "x4", &[("leep.rebased_from", "z")]),
+        (
+            "src/b",
+            "bot",
+            "x5",
+            &[("agent.model", "m1"), ("agent.session", "s1")],
+        ),
+        ("b", "bot", "x6", &[("agent.session", "s9")]),
+    ];
+    let mut ids: Vec<ChangesetId> = Vec::new();
+    for (i, (path, author, body, extra)) in spec.iter().enumerate() {
+        let parents: Vec<_> = ids.last().copied().into_iter().collect();
+        let id = commit_meta(&r, &parents, (path, body), author, 100 + i as i64, extra).await;
+        ids.push(id);
+    }
+    Prov { r, ids }
+}
+
+fn extra(s: &str) -> crate::ExtraMatch {
+    crate::ExtraMatch::parse(s).unwrap()
+}
+
+#[tokio::test]
+async fn log_filter_by_extra_author_and_path() {
+    let Prov { r, ids } = prov_repo().await;
+    let tip = ids[6];
+    let run = |path: Option<&'static str>, limit: usize, f: crate::LogFilter| {
+        let r = &r;
+        async move {
+            r.log_filtered(tip, path, limit, &f)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|i| i.id)
+                .collect::<Vec<_>>()
+        }
+    };
+    let f = |author: Option<&str>, e: &[&str]| crate::LogFilter {
+        author: author.map(Into::into),
+        extra: e.iter().map(|s| extra(s)).collect(),
+    };
+
+    assert_eq!(run(None, 100, f(None, &[])).await.len(), 7);
+    assert_eq!(
+        run(None, 100, f(None, &["agent.model:m1"])).await,
+        [ids[5], ids[2], ids[1]]
+    );
+    assert_eq!(
+        run(None, 100, f(None, &["agent.model:m1", "agent.session:s1"])).await,
+        [ids[5], ids[1]]
+    );
+    assert_eq!(
+        run(None, 100, f(None, &["agent.session:s2"])).await,
+        [ids[2]]
+    );
+    // Presence: any value, including a session without a model.
+    assert_eq!(
+        run(None, 100, f(None, &["agent.session"])).await,
+        [ids[6], ids[5], ids[3], ids[2], ids[1]]
+    );
+    assert!(run(None, 100, f(None, &["agent.model:nope"]))
+        .await
+        .is_empty());
+    assert!(run(None, 100, f(None, &["agent.prompt"])).await.is_empty());
+    // Author is a case-insensitive substring.
+    assert_eq!(run(None, 100, f(Some("BOB"), &[])).await, [ids[4]]);
+    assert_eq!(run(None, 100, f(Some("an"), &[])).await, [ids[0]]);
+    // Combined with a path and a limit that counts matches.
+    assert_eq!(
+        run(Some("src"), 100, f(None, &["agent.model:m1"])).await,
+        [ids[5]]
+    );
+    assert_eq!(
+        run(Some("a"), 100, f(None, &["agent.model"])).await,
+        [ids[1]]
+    );
+    assert_eq!(
+        run(None, 2, f(None, &["agent.model:m1"])).await,
+        [ids[5], ids[2]]
+    );
+    assert!(run(Some("src"), 100, f(Some("ann"), &[])).await.is_empty());
+}
+
+#[test]
+fn extra_match_parsing() {
+    assert_eq!(
+        extra("k:v:w"),
+        crate::ExtraMatch {
+            key: "k".into(),
+            value: Some("v:w".into())
+        }
+    );
+    assert_eq!(extra("k").value, None);
+    assert_eq!(extra("k:").value, Some(String::new()));
+    assert!(crate::ExtraMatch::parse(":x").is_err());
+    assert!(crate::ExtraMatch::parse("").is_err());
+}
+
+#[tokio::test]
+async fn blame_has_deduplicated_changeset_summaries() {
+    let r = repo();
+    let c1 = commit_meta(&r, &[], ("f", "a\nb\n"), "ann", 5, &[]).await;
+    let c2 = commit_meta(
+        &r,
+        &[c1],
+        ("f", "a\nb\nc\nd\n"),
+        "bot",
+        6,
+        &[
+            ("agent.model", "m1"),
+            ("agent.session", "s1"),
+            ("leep.rebased_from", "zz"),
+        ],
+    )
+    .await;
+    let b = r.blame(c2, &rp("f")).await.unwrap();
+    assert_eq!(b.lines.len(), 4);
+    assert_eq!(b.changesets.len(), 2, "two lines of c2 share one summary");
+    assert_eq!(b.changesets[&c1].author, "ann");
+    assert!(b.changesets[&c1].agent.is_empty());
+    let s = &b.changesets[&c2];
+    assert_eq!((s.author.as_str(), s.timestamp), ("bot", 6));
+    assert_eq!(s.message_first_line, "edit f");
+    assert_eq!(
+        s.agent.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["agent.model", "agent.session"],
+        "only agent.* keys"
+    );
+    // A second call is served from the cache and still carries summaries.
+    assert_eq!(r.blame(c2, &rp("f")).await.unwrap(), b);
+}
+
+#[tokio::test]
+async fn blame_cache_written_before_summaries_still_decodes() {
+    let r = repo();
+    let c1 = commit_meta(&r, &[], ("f", "a\n"), "ann", 5, &[]).await;
+    // The pre-summary encoding was a struct of (path, lines).
+    let legacy = (
+        rp("f"),
+        vec![leep_core::api::BlameLine {
+            changeset: c1,
+            origin_line: 1,
+            text: "a".into(),
+        }],
+    );
+    let mut key = c1.0.as_bytes().to_vec();
+    key.extend_from_slice(b"f");
+    r.meta()
+        .put_derived(
+            "blame",
+            &Hash::of_object("blame", &key),
+            Bytes::from(postcard::to_stdvec(&legacy).unwrap()),
+        )
+        .await
+        .unwrap();
+    let b = r.blame(c1, &rp("f")).await.unwrap();
+    assert_eq!(b.lines.len(), 1);
+    assert_eq!(b.changesets[&c1].author, "ann");
+}
+
+#[tokio::test]
+async fn provenance_aggregates_agents_and_humans() {
+    let Prov { r, ids } = prov_repo().await;
+    let p = r.provenance(ids[6], None, 100).await.unwrap();
+    assert_eq!((p.scanned, p.truncated), (7, false));
+    let agents: Vec<_> = p
+        .agents
+        .iter()
+        .map(|a| (a.model.as_str(), a.session.as_deref(), a.changesets))
+        .collect();
+    assert_eq!(
+        agents,
+        [
+            ("m1", Some("s1"), 2),
+            ("m1", Some("s2"), 1),
+            ("m2", Some("s1"), 1),
+            ("unknown", Some("s9"), 1),
+        ]
+    );
+    let m1s1 = &p.agents[0];
+    assert_eq!((m1s1.first, m1s1.last), (101, 105));
+    assert_eq!(m1s1.files_touched, 2, "a and src/b");
+    let humans: Vec<_> = p
+        .humans
+        .iter()
+        .map(|h| (h.author.as_str(), h.changesets))
+        .collect();
+    assert_eq!(humans, [("Bob", 1), ("ann", 1)]);
+    assert_eq!((p.humans[0].first, p.humans[0].last), (104, 104));
+
+    // Path prefix narrows to changesets touching it.
+    let p = r.provenance(ids[6], Some("/src/"), 100).await.unwrap();
+    assert_eq!(p.scanned, 7);
+    assert_eq!(p.agents.len(), 2);
+    assert!(p.humans.is_empty());
+    assert_eq!(p.agents[0].files_touched, 1);
+    // A prefix that merely shares leading characters does not match.
+    assert!(r
+        .provenance(ids[6], Some("sr"), 100)
+        .await
+        .unwrap()
+        .agents
+        .is_empty());
+}
+
+#[tokio::test]
+async fn provenance_truncates_at_limit() {
+    let Prov { r, ids } = prov_repo().await;
+    let p = r.provenance(ids[6], None, 3).await.unwrap();
+    assert_eq!((p.scanned, p.truncated), (3, true));
+    let total: u64 = p.agents.iter().map(|a| a.changesets).sum::<u64>()
+        + p.humans.iter().map(|h| h.changesets).sum::<u64>();
+    assert_eq!(total, 3);
+    // Exactly the history length is not truncated.
+    let p = r.provenance(ids[6], None, 7).await.unwrap();
+    assert_eq!((p.scanned, p.truncated), (7, false));
+    let p = r.provenance(ids[6], None, 0).await.unwrap();
+    assert_eq!((p.scanned, p.truncated), (0, true));
+}
+
 /// The skiplist fast path in `merge_base` must agree with the reference walk
 /// on arbitrary DAGs: branches, merges, criss-crosses and unrelated roots.
 #[tokio::test]

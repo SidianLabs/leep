@@ -1,11 +1,21 @@
 //! Line-level blame over first-parent history, cached as derived data.
 
+use std::collections::BTreeMap;
+
 use bytes::Bytes;
-use leep_core::api::{BlameLine, BlameResponse, FileInfo};
+use leep_core::api::{BlameLine, BlameResponse, ChangesetSummary, FileInfo};
 use leep_core::{ChangesetId, Error, Hash, RepoPath, Result};
 use similar::{ChangeTag, TextDiff};
 
+use crate::history::agent_keys;
 use crate::Repo;
+
+/// What is cached under `blame`. Kept at the original `{path, lines}` shape so
+/// entries written before changeset summaries existed still decode; summaries
+/// are attached on every read.
+/// A tuple, because postcard encodes it identically to the old struct and
+/// this crate has no serde dependency of its own.
+type CachedBlame = (RepoPath, Vec<BlameLine>);
 
 fn cache_key(id: ChangesetId, path: &RepoPath) -> Hash {
     let mut b = id.0.as_bytes().to_vec();
@@ -30,8 +40,33 @@ impl Repo {
     }
 
     /// Attribute each line of `path` at `id` to the changeset that introduced
-    /// it, following first parents.
+    /// it, following first parents, and describe each distinct changeset.
     pub async fn blame(&self, id: ChangesetId, path: &RepoPath) -> Result<BlameResponse> {
+        let (path, lines) = self.blame_lines(id, path).await?;
+        let mut changesets = BTreeMap::new();
+        for l in &lines {
+            if changesets.contains_key(&l.changeset) {
+                continue;
+            }
+            let cs = self.get_changeset(l.changeset).await?;
+            changesets.insert(
+                l.changeset,
+                ChangesetSummary {
+                    author: cs.author,
+                    timestamp: cs.timestamp,
+                    message_first_line: cs.message.lines().next().unwrap_or("").to_string(),
+                    agent: agent_keys(&cs.extra),
+                },
+            );
+        }
+        Ok(BlameResponse {
+            path,
+            lines,
+            changesets,
+        })
+    }
+
+    async fn blame_lines(&self, id: ChangesetId, path: &RepoPath) -> Result<CachedBlame> {
         let tip = self
             .lookup_file(id, path)
             .await?
@@ -39,7 +74,7 @@ impl Repo {
         // Walk first parents collecting the changesets that changed the file,
         // stopping at its creation or at a cached blame.
         let mut chain: Vec<(ChangesetId, FileInfo)> = Vec::new();
-        let mut cached: Option<(BlameResponse, FileInfo)> = None;
+        let mut cached: Option<(CachedBlame, FileInfo)> = None;
         let (mut cur, mut cur_info) = (id, tip);
         loop {
             let cs = self.get_changeset(cur).await?;
@@ -73,7 +108,7 @@ impl Repo {
                 if chain.is_empty() {
                     return Ok(resp);
                 }
-                (resp.lines, self.utf8_content(&info).await?)
+                (resp.1, self.utf8_content(&info).await?)
             }
             None => (Vec::new(), String::new()),
         };
@@ -97,10 +132,7 @@ impl Repo {
             lines = next;
             old_text = new_text;
         }
-        let resp = BlameResponse {
-            path: path.clone(),
-            lines,
-        };
+        let resp: CachedBlame = (path.clone(), lines);
         let value = Bytes::from(postcard::to_stdvec(&resp)?);
         for key_id in latest.into_iter().chain([id]) {
             self.meta()

@@ -22,6 +22,33 @@ pub struct Client {
     has_token: bool,
 }
 
+/// Parameters of `GET /v1/log/{id}`; `extra` entries are `key:value` or `key`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LogQuery {
+    pub path: Option<String>,
+    pub limit: Option<u32>,
+    pub author: Option<String>,
+    pub extra: Vec<String>,
+}
+
+impl LogQuery {
+    /// Query-string pairs in request order; `extra` repeats.
+    pub fn params(&self) -> Vec<(&'static str, String)> {
+        let mut out = Vec::new();
+        if let Some(p) = &self.path {
+            out.push(("path", p.clone()));
+        }
+        if let Some(n) = self.limit {
+            out.push(("limit", n.to_string()));
+        }
+        if let Some(a) = &self.author {
+            out.push(("author", a.clone()));
+        }
+        out.extend(self.extra.iter().map(|e| ("extra", e.clone())));
+        out
+    }
+}
+
 /// Percent-encode a URL path, keeping `/` so ref names like `team/x` work.
 fn enc(s: &str) -> String {
     let mut out = String::new();
@@ -191,13 +218,21 @@ impl Client {
         Ok((bytes.to_vec(), kind))
     }
 
-    pub fn log(
+    pub fn log(&self, id: &ChangesetId, q: &LogQuery) -> Result<LogResponse> {
+        self.json(
+            self.http
+                .get(self.url(&format!("/v1/log/{id}")))
+                .query(&q.params()),
+        )
+    }
+
+    pub fn provenance(
         &self,
         id: &ChangesetId,
         path: Option<&str>,
         limit: Option<u32>,
-    ) -> Result<LogResponse> {
-        let mut req = self.http.get(self.url(&format!("/v1/log/{id}")));
+    ) -> Result<ProvenanceResponse> {
+        let mut req = self.http.get(self.url(&format!("/v1/provenance/{id}")));
         if let Some(p) = path {
             req = req.query(&[("path", p)]);
         }
