@@ -26,8 +26,9 @@ Wrap at 72 columns.>
 ```
 
 - **area** is one of: `core`, `store`, `meta`, `derive`, `server`, `cli`, `git`,
-  `docs`, `ci`, `build`. Use the area of the main change. A change spanning
-  areas should usually be split; if it can't be, use the dominant one.
+  `test` (the end-to-end suite), `docs`, `ci`, `build`. Use the area of the
+  main change. A change spanning areas should usually be split; if it can't
+  be, use the dominant one.
 - **Subject:** 72 characters at most, imperative mood ("add", "fix", "rename",
   not "added" or "adds"), and specific.
   - Good: `derive: walk ancestry iteratively to avoid stack overflow`
