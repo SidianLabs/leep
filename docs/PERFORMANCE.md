@@ -39,7 +39,7 @@ indicative; expect roughly +/-15% run to run.
 | `land` replay, head moved by 100 | | 3.0 ms | 3.5 ms |
 | `diff` one changed file (files in repo) | | 1.05 ms | 1.02 ms |
 | `is_ancestor` root of tip (changesets) | 1.5 us | 1.6 us | 2.2 us |
-| `merge_base` tip vs. branch from midpoint (changesets) | 376 us | 12.1 ms | 112 ms |
+| `merge_base` tip vs. branch from midpoint (changesets) | 5.0 us | 5.5 us | 6.7 us |
 | `log` path filter, limit 10 (10k changesets) | | 480 us | |
 | `log` path filter, limit 1000 (scans all 10k) | | 57 ms | |
 | `log` path filter, no match (scans all 10k) | | 58 ms | |
@@ -61,14 +61,16 @@ commit path.
   subtrees by hash. The ~1 ms is again the 1000-entry leaf.
 - `is_ancestor`: effectively constant (1.5-2 us) on linear histories up to
   100k; the skiplist works.
+- `merge_base`: effectively constant (5-7 us) up to 100k. It was linear in
+  the distance to the fork point (376 us, 12 ms, 112 ms) until it learned to
+  find the deepest common changeset of the two first-parent chains with
+  skiplist jumps. That answer is used whenever neither chain has a merge
+  above it (tracked by the `last_merge-v1` derived kind); histories with
+  merges in between still take the generation-ordered walk, which is linear
+  in the distance.
 
 What does not scale with the change:
 
-- `merge_base` is linear in the distance from the tips to the fork point
-  (376 us, 12 ms, 112 ms for 500, 5k and 50k steps, about 2.2 us each). The
-  generation-ordered walk visits every changeset between the tips and the
-  common ancestor. `land` does not call it (it uses `is_ancestor`), but
-  `merge` and anything built on it will pay this on long-lived branches.
 - `log` with a path filter is linear in changesets scanned (about 5.7 us per
   changeset), a known limitation: each step reads the changeset and two tree
   paths. Scanning 10k changesets costs about 57 ms regardless of how many
@@ -91,8 +93,5 @@ children only.
   the full parent, including all its changes. An `exists`-style `MetaStore`
   method (or a generation lookup) would make the check O(1) regardless of
   parent size. This needs a trait addition, so it is an ADR-sized change.
-- `merge_base`: try `is_ancestor(a, b)` and `is_ancestor(b, a)` first (both
-  are O(log n) via the skiplist) and return early. This covers the common
-  fast-forward-shaped merges. A full fix would walk with skiplist jumps.
 - `log` with a path: a derived "path history" index (see
   `add-derived-data-kind`) would turn the scan into a lookup.
