@@ -10,9 +10,9 @@ COPY crates crates
 # baking them into layers.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release --locked -p leep-server -p leep-cli -p leep-git \
+    cargo build --release --locked -p leep-server -p leep-cli -p leep-git -p leep-mcp \
  && mkdir -p /out \
- && cp target/release/leep-server target/release/leep target/release/leep-git /out/
+ && cp target/release/leep-server target/release/leep target/release/leep-git target/release/leep-mcp /out/
 
 FROM debian:bookworm-slim
 # No HEALTHCHECK: the slim image has no curl/wget and the server has no

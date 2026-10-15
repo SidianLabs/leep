@@ -25,7 +25,7 @@ Milestones are ordered. Each one should leave `main` releasable.
 - [x] Provenance: `leep log --agent`, and queries over `agent.*` metadata (`leep provenance`, `leep blame --who`)
 - Signed changesets (author keys)
 - Review service with semantic approval rules (for example, comment-only changes auto-approve) and per-directory owners
-- MCP server exposing Leep operations to agents
+- [x] MCP server exposing Leep operations to agents (`leep-mcp`; ADR 0009)
 
 ## v0.4: Scale
 - Regional read-through cache tier

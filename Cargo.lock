@@ -2310,6 +2310,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "leep-mcp"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "leep-cli",
+ "leep-core",
+ "leep-derive",
+ "leep-server",
+ "serde",
+ "serde_json",
+ "similar",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "leep-meta"
 version = "0.1.0"
 dependencies = [

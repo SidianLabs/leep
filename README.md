@@ -14,6 +14,7 @@ Status: early development (v0.1).
 - [Roadmap](docs/ROADMAP.md)
 - [Deploying with Docker](docs/DEPLOY.md)
 - [Operating: logs and metrics](docs/OPERATIONS.md)
+- [Using Leep from AI agents (MCP)](docs/MCP.md)
 - [Contributing](CONTRIBUTING.md) and the [agent guide](CLAUDE.md)
 
 ## Layout
@@ -24,6 +25,7 @@ Status: early development (v0.1).
 - `crates/leep-derive`: derived data and repository operations
 - `crates/leep-server`: the `leep-server` HTTP server
 - `crates/leep-cli`: the `leep` command-line client
+- `crates/leep-mcp`: the `leep-mcp` MCP server for AI agents ([docs/MCP.md](docs/MCP.md))
 - `crates/leep-git`: git import/export
 
 ## Build
