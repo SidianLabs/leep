@@ -8,6 +8,7 @@ use clap::{Parser, Subcommand};
 use leep_core::BlobStore;
 use leep_derive::Repo;
 use leep_server::auth::{self, Auth, Role};
+use leep_server::review::{RequireReview, ReviewPolicy, ReviewService};
 use leep_server::signing::{RequireSignatures, SigningKeys};
 use leep_store::CachedBlobStore;
 use tracing_subscriber::EnvFilter;
@@ -53,6 +54,17 @@ struct Args {
     /// comma-separated list. Needs --signing-keys-file.
     #[arg(long, env = "LEEP_REQUIRE_SIGNATURES", value_delimiter = ',')]
     require_signatures: Vec<String>,
+    /// JSON review policy: refs that require review and the auto-approval
+    /// rules (`comment_only`, `whitespace_only`, `docs_only`). Its `refs` are
+    /// protected as if listed in --require-review. Needs --tokens-file. Read
+    /// once at startup.
+    #[arg(long, env = "LEEP_REVIEW_POLICY_FILE")]
+    review_policy_file: Option<std::path::PathBuf>,
+    /// Refuse to land onto this ref unless every changeset it would add is
+    /// approved by the owners of the paths it changes. Repeatable; the
+    /// environment variable takes a comma-separated list. Needs --tokens-file.
+    #[arg(long, env = "LEEP_REQUIRE_REVIEW", value_delimiter = ',')]
+    require_review: Vec<String>,
     /// Serve Prometheus metrics on this address (`GET /metrics`, no auth, keep
     /// it private). Off when unset.
     #[arg(long, env = "LEEP_METRICS_LISTEN")]
@@ -248,6 +260,23 @@ async fn main() -> anyhow::Result<()> {
         }
         None => None,
     };
+    let policy = match &args.review_policy_file {
+        Some(path) => ReviewPolicy::from_file(path).map_err(anyhow::Error::msg)?,
+        None => ReviewPolicy::parse("{}").map_err(anyhow::Error::msg)?,
+    };
+    let mut review_refs = args.require_review.clone();
+    for r in &policy.refs {
+        if !review_refs.contains(r) {
+            review_refs.push(r.clone());
+        }
+    }
+    let review = match &auth {
+        Some(a) => Some(Arc::new(ReviewService::new(a.reviewers(), policy.rules))),
+        None if !review_refs.is_empty() || args.review_policy_file.is_some() => {
+            anyhow::bail!("--require-review and --review-policy-file need --tokens-file")
+        }
+        None => None,
+    };
     ensure_local_dirs(&args.meta, &args.blobs)?;
 
     let mut blobs = leep_store::open_blob_store(&args.blobs).context("opening blob store")?;
@@ -266,7 +295,11 @@ async fn main() -> anyhow::Result<()> {
             args.require_signatures.clone(),
         )));
     }
-    let app = leep_server::router_with_signing(repo, args.max_body_bytes, auth, signing);
+    if let (Some(service), false) = (&review, review_refs.is_empty()) {
+        tracing::info!(refs = ?review_refs, "review required to land");
+        repo = repo.with_land_policy(Arc::new(RequireReview::new(service.clone(), review_refs)));
+    }
+    let app = leep_server::router_with_review(repo, args.max_body_bytes, auth, signing, review);
 
     let listener = tokio::net::TcpListener::bind(args.listen)
         .await

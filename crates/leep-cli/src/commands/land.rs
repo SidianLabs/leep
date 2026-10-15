@@ -5,6 +5,7 @@ use std::fs;
 
 use clap::Args;
 use leep_core::api::{Conflict, LandRequest, LandResponse};
+use leep_core::review::NEEDS_REVIEW_MARKER;
 use leep_core::signature::NOT_SIGNED_MARKER;
 use leep_core::{ChangesetId, FileChange, FileKind, RepoPath};
 
@@ -48,7 +49,7 @@ pub fn run(ctx: &mut Ctx, args: &LandArgs) -> Result<i32> {
             changeset: base,
             target_ref: target_ref.clone(),
         })
-        .map_err(|e| hint_unsigned(e, &target_ref))?;
+        .map_err(|e| hint_policy(e, &target_ref))?;
     if ctx.json {
         print_json(&resp)?;
     }
@@ -103,9 +104,13 @@ pub fn run(ctx: &mut Ctx, args: &LandArgs) -> Result<i32> {
     }
 }
 
-/// The server names the unsigned changeset; add what to do about it.
-fn hint_unsigned(e: CliError, target_ref: &str) -> CliError {
+/// The server names the changeset a policy refused; add what to do about it.
+fn hint_policy(e: CliError, target_ref: &str) -> CliError {
     match e {
+        CliError::User(m) if m.contains(NEEDS_REVIEW_MARKER) => CliError::User(format!(
+            "{m}\n{target_ref} needs approval from the owners of the paths a changeset changes: \
+             ask one to run `leep review approve <changeset>`; `leep review status <changeset> --ref {target_ref}` shows what is missing."
+        )),
         CliError::User(m) if m.contains(NOT_SIGNED_MARKER) => CliError::User(format!(
             "{m}\n{target_ref} only accepts signed changesets: every changeset being landed needs a signature. \
              Commit with `leep commit --sign KEYFILE` (or set LEEP_SIGNING_KEY); create a key with `leep keygen`."

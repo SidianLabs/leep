@@ -88,6 +88,24 @@ works (`LEEP_SIGNING_KEY=/tmp/leep/alice.key` is the same as `--sign`). `leep
 show main` lists `Signed-by:`. The whole unlanded stack must be signed, so
 sign every commit you land. See ADR 0010.
 
+## With review and owners
+
+Reviews need auth, and reviewers are the write tokens' names (ADR 0011).
+```sh
+echo '{"refs":["main"],"auto_approve":["comment_only","docs_only"],"docs_globs":["docs/**"]}' > /tmp/leep/review.json
+cargo run -p leep-server -- --tokens-file /tmp/leep/tokens.json --review-policy-file /tmp/leep/review.json   # plus the flags above
+# or protect refs without a file: --require-review main  (LEEP_REQUIRE_REVIEW=main,release)
+```
+Commit an `OWNERS` file (`alice`, one name per line) so a path has owners.
+Then `leep land` fails with `changeset ... needs review: path ... needs
+approval from one of [alice]`. Another user runs `leep review approve <id>`
+(`--token` or `LEEP_TOKEN` of a write token; `-m` adds a comment; `leep review
+reject <id> -m why` blocks), `leep review status <id>` lists each path's rule,
+owners and approvers (exit 1 when not approved), and `leep reviews <id>` lists
+verdicts. Owners are read from main's head, so a change that edits `OWNERS`
+needs the existing owners. Comment-only, whitespace-only and docs-only changes
+land without review when enabled. See ADR 0011.
+
 ## Clean up
 
 Stop the server, run `pg_ctl stop` if you started Postgres, and `rm -rf /tmp/leep`.

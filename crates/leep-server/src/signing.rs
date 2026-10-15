@@ -229,6 +229,7 @@ impl LandPolicy for RequireSignatures {
         &self,
         repo: &Repo,
         target_ref: &str,
+        _head: Option<ChangesetId>,
         new_history: &[ChangesetId],
     ) -> Result<()> {
         for id in new_history {

@@ -56,11 +56,22 @@ Logs go to stderr; stdout carries protocol messages only.
 | `leep_read_file` | `rev?`, `path` | text content; capped at 256 KiB; binary is reported, not returned |
 | `leep_diff` | `from?`, `to`, `prefix?` | unified diff; `from` defaults to the first parent of `to` |
 | `leep_blame` | `rev?`, `path` | per-line changeset and author |
+| `leep_review_status` | `rev`, `ref?` (default `main`) | per changed path: the rule that satisfies it (`auto:*`, `owner`, `merge_parent`) or `pending` / `rejected`, with owners and who approved or rejected, plus `approved`, `blocked_paths` and `next_step`; needs a server with authentication |
 | `leep_commit_and_land` | `message`, `changes[]`, `base?`, `target_ref?`, `prompt?`, `tests?` | landed id, or a conflict report |
 
 Data tools return JSON as text and as `structuredContent`; file and diff
 tools return plain text. Failures (bad arguments, 401, 403, 404, unreachable
 server) come back as results with `isError: true`.
+
+### Review
+
+On a ref that requires review (ADR 0011), `leep_commit_and_land` fails with
+`changeset X needs review: path P needs approval from one of [...]` unless
+every path is approved by its owners or by an auto rule. Land on another ref
+(`target_ref`), then use `leep_review_status` with `rev` set to the landed id
+and `ref` set to the protected ref to see which paths are blocked and who can
+approve them. Approving needs a human or CI token: an agent with a `read`
+token cannot review, and an agent should not approve its own change.
 
 ### Writing: `leep_commit_and_land`
 

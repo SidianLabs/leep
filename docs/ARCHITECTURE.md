@@ -131,6 +131,7 @@ changeset, and concurrent servers that race produce identical bytes.
 | `generation` | `1 + max(parents)`; roots = 1 | log ordering, ancestry |
 | `skiplist` | power-of-two first-parent ancestors | `is_ancestor`, `merge_base` |
 | `signature-v1` / `rebased-origin-v1` | attestations and server rebase links, keyed per (changeset, key) and per copy; not pure functions of the changeset, so written by `put_signature` and `rebase` rather than derived | signed-changeset listing and the land policy |
+| `review-v1` | review verdicts, keyed per (changeset, reviewer name) (`Hash::of_object("review", id‖name)`); attestations written by `put_review`, last write wins, listed with one lookup per principal | review listing and the review land policy |
 | `last_merge-v1` | generation of the nearest merge on the first-parent chain (0 if none) | lets `merge_base` answer from skiplists when no merge sits above the first-parent common ancestor |
 | `blame` | per (changeset, path), keyed `Hash::of_object("blame", id‖path)` | blame |
 
@@ -273,8 +274,30 @@ no signature of their own and are linked to their originals by a server-written
 keygen` and `leep commit --sign` are the client side. Raw ref CAS over HTTP is
 gated the same way; the offline git bridge is not.
 
-Planned: OIDC or mTLS, per-directory ACLs evaluated against changeset paths,
-per-path signing policy and key rotation. See the roadmap.
+**Review service** ([ADR 0011](adr/0011-review-service.md)). Approvals are
+attestations too (derived kind `review-v1`, one row per changeset and reviewer,
+`Changeset` unchanged). The auth middleware hands handlers the token's
+`Principal`; `POST /v1/changesets/{id}/reviews` records `approve` or `reject`
+under the token's name, never a name from the body, and needs authentication.
+Ownership is per directory: `OWNERS` files (one name per line, `#` comments,
+`noparent`) in the tree, read from the **target ref's head** at check time so a
+change cannot grant itself ownership; a path no file covers has no owners and
+any one approval satisfies it. Per changed path, an owner's reject blocks,
+then a merge-side match (`merge_parent`), an enabled auto rule from the
+`--review-policy-file` (`comment_only`, `whitespace_only`, `docs_only`; pure
+functions in `leep-derive`) or an owner's approval satisfies it.
+`--require-review <REF>` (repeatable, `LEEP_REQUIRE_REVIEW`) and the policy
+file's `refs` make `land` onto a ref fail with 400 `changeset X needs review:
+path P ...` unless every changeset it adds is approved, checked on the
+originals the client submitted, as for signatures. It is a second
+`LandPolicy`: `Repo::with_land_policy` composes policies (all must pass), and
+`check_land` now receives the head so owners and new history agree.
+`GET .../review-status?ref=` shows the per-path state, `GET .../reviews`
+lists verdicts (with `via` for rebased copies), and `leep review ...` and the
+`leep_review_status` MCP tool are the clients.
+
+Planned: OIDC or mTLS, per-path signing policy and key rotation, team groups
+and self-approval rules for reviews. See the roadmap.
 
 ## 11. Scaling path
 

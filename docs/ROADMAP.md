@@ -24,7 +24,7 @@ Milestones are ordered. Each one should leave `main` releasable.
 - Fenced two-phase blob GC that closes the last claim/delete race (ADR 0008)
 - [x] Provenance: `leep log --agent`, and queries over `agent.*` metadata (`leep provenance`, `leep blame --who`)
 - [x] Signed changesets (author keys; Ed25519 attestations, `--require-signatures` land policy; ADR 0010)
-- Review service with semantic approval rules (for example, comment-only changes auto-approve) and per-directory owners
+- [x] Review service with semantic approval rules (comment-only, whitespace-only and docs-only changes auto-approve) and per-directory owners (`OWNERS` files, `--require-review`, `leep review`; ADR 0011)
 - [x] MCP server exposing Leep operations to agents (`leep-mcp`; ADR 0009)
 
 ## v0.4: Scale

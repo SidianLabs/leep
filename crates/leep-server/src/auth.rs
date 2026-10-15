@@ -13,7 +13,8 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use axum::extract::{Request, State};
+use axum::extract::{FromRequestParts, Request, State};
+use axum::http::request::Parts;
 use axum::http::{header, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -53,6 +54,26 @@ impl Role {
             Role::Read => "read",
             Role::Write => "write",
         }
+    }
+}
+
+/// Who made a request, set by [`require_token`] for the handlers behind it.
+/// Handlers that record or filter by identity read it; the name is always the
+/// token's, never anything the request says.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Principal {
+    pub name: String,
+    pub role: Role,
+}
+
+/// The request's [`Principal`], or `None` when authentication is off.
+pub struct MaybePrincipal(pub Option<Principal>);
+
+impl<S: Send + Sync> FromRequestParts<S> for MaybePrincipal {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Self::Rejection> {
+        Ok(MaybePrincipal(parts.extensions.get::<Principal>().cloned()))
     }
 }
 
@@ -157,6 +178,16 @@ impl Auth {
         self.tokens.is_empty()
     }
 
+    /// Names of the tokens that may write, in file order: the principals whose
+    /// reviews count.
+    pub fn reviewers(&self) -> Vec<String> {
+        self.tokens
+            .iter()
+            .filter(|k| k.role == Role::Write)
+            .map(|k| k.name.clone())
+            .collect()
+    }
+
     /// Match a presented token. Compares against every entry without early
     /// exit so timing does not reveal which digest matched.
     fn lookup(&self, token: &str) -> Option<(&str, Role)> {
@@ -208,7 +239,7 @@ fn bearer(req: &Request) -> Option<&str> {
 /// Axum middleware enforcing [`Auth`]; `GET /v1/health` stays public.
 pub async fn require_token(
     State(auth): State<std::sync::Arc<Auth>>,
-    req: Request,
+    mut req: Request,
     next: Next,
 ) -> Response {
     if req.method() == Method::GET && req.uri().path() == "/v1/health" {
@@ -225,6 +256,10 @@ pub async fn require_token(
         return reject(StatusCode::FORBIDDEN, "token lacks write access");
     }
     let span = tracing::debug_span!("auth", token = name, role = role.as_str());
+    req.extensions_mut().insert(Principal {
+        name: name.to_string(),
+        role,
+    });
     next.run(req).instrument(span).await
 }
 
@@ -243,11 +278,28 @@ mod tests {
     }
 
     #[test]
+    fn reviewers_are_the_write_tokens() {
+        let text = serde_json::json!({ "tokens": [
+            { "name": "ci", "role": "write", "hash": hash_token("a") },
+            { "name": "viewer", "role": "read", "hash": hash_token("b") },
+            { "name": "alice", "role": "write", "hash": hash_token("c") },
+        ]})
+        .to_string();
+        assert_eq!(Auth::parse(&text).unwrap().reviewers(), ["ci", "alice"]);
+    }
+
+    #[test]
     fn write_classification() {
         assert!(!needs_write(&Method::GET, "/v1/refs"));
         assert!(!needs_write(&Method::POST, "/v1/blobs/missing"));
         assert!(needs_write(&Method::POST, "/v1/land"));
         assert!(needs_write(&Method::POST, "/v1/changesets/abc/signatures"));
+        assert!(needs_write(&Method::POST, "/v1/changesets/abc/reviews"));
+        assert!(!needs_write(&Method::GET, "/v1/changesets/abc/reviews"));
+        assert!(!needs_write(
+            &Method::GET,
+            "/v1/changesets/abc/review-status"
+        ));
         assert!(!needs_write(&Method::GET, "/v1/changesets/abc/signatures"));
         assert!(needs_write(&Method::PUT, "/v1/blobs/x"));
         assert!(needs_write(&Method::DELETE, "/v1/refs/main"));

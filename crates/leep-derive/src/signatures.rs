@@ -7,6 +7,7 @@
 //! signatures by looking up one row per trusted key.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -30,16 +31,58 @@ pub trait LandPolicy: Send + Sync + 'static {
     /// walking history for refs that are not.
     fn applies_to(&self, target_ref: &str) -> bool;
 
-    /// Called before `land` moves `target_ref`. `new_history` lists the
-    /// changesets the ref would gain that the caller submitted (never the
-    /// server-made rebased copies), nearest to the tip first. Return an error
-    /// (normally `Error::Invalid`) to refuse the land.
+    /// Whether a decision can change when the ref's head moves. `land` reuses
+    /// a passed decision across CAS retries only for policies that say no;
+    /// signatures never go away, but owners come from the head's tree.
+    fn depends_on_head(&self) -> bool {
+        false
+    }
+
+    /// Called before `land` moves `target_ref`, which is at `head`.
+    /// `new_history` lists the changesets the ref would gain that the caller
+    /// submitted (never the server-made rebased copies), nearest to the tip
+    /// first. Return an error (normally `Error::Invalid`) to refuse the land.
     async fn check_land(
         &self,
         repo: &Repo,
         target_ref: &str,
+        head: Option<ChangesetId>,
         new_history: &[ChangesetId],
     ) -> Result<()>;
+}
+
+/// Several policies that must all pass, in order. `Repo::with_land_policy`
+/// builds one when called twice.
+pub struct PolicySet(Vec<Arc<dyn LandPolicy>>);
+
+impl PolicySet {
+    pub fn new(policies: Vec<Arc<dyn LandPolicy>>) -> Self {
+        PolicySet(policies)
+    }
+}
+
+#[async_trait]
+impl LandPolicy for PolicySet {
+    fn applies_to(&self, target_ref: &str) -> bool {
+        self.0.iter().any(|p| p.applies_to(target_ref))
+    }
+
+    fn depends_on_head(&self) -> bool {
+        self.0.iter().any(|p| p.depends_on_head())
+    }
+
+    async fn check_land(
+        &self,
+        repo: &Repo,
+        target_ref: &str,
+        head: Option<ChangesetId>,
+        new_history: &[ChangesetId],
+    ) -> Result<()> {
+        for p in self.0.iter().filter(|p| p.applies_to(target_ref)) {
+            p.check_land(repo, target_ref, head, new_history).await?;
+        }
+        Ok(())
+    }
 }
 
 fn storage_key(id: ChangesetId, key_id: &str) -> Hash {

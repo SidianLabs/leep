@@ -2355,6 +2355,7 @@ dependencies = [
  "bytes",
  "criterion",
  "diffy",
+ "globset",
  "leep-core",
  "metrics",
  "postcard",

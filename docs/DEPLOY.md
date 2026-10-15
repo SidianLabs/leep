@@ -109,6 +109,38 @@ file must be mode 0600. Raw ref updates (`POST /v1/refs/{name}`) are checked
 the same way. `leep-git` import writes to the stores directly and is not
 covered, so run it only as an operator.
 
+## Review and owners
+
+Optional, and it needs authentication: reviewers are the write-role tokens, so
+`OWNERS` files name token names (ADR 0011). Put `OWNERS` files in the tree
+(`alice`, one name per line, `#` comments, `noparent`), then protect refs:
+
+```sh
+cat > review-policy.json <<'JSON'
+{ "refs": ["main"],
+  "auto_approve": ["comment_only", "whitespace_only", "docs_only"],
+  "docs_globs": ["**/*.md", "docs/**"] }
+JSON
+docker run -d -p 127.0.0.1:7070:7070 -v leep-data:/var/lib/leep \
+  -v "$PWD/tokens.json:/etc/leep/tokens.json:ro" \
+  -v "$PWD/review-policy.json:/etc/leep/review-policy.json:ro" \
+  -e LEEP_TOKENS_FILE=/etc/leep/tokens.json \
+  -e LEEP_REVIEW_POLICY_FILE=/etc/leep/review-policy.json leep:dev
+```
+
+`--review-policy-file` sets the auto-approval rules and lists `refs` that
+require review; `--require-review REF` (repeatable; the environment variable is
+comma-separated) adds more refs with the same rules. Both need the tokens file
+and are read at startup. `land` onto a protected ref fails with 400 unless
+every changeset it adds is approved: each changed path needs an approval from
+an owner of that path as listed in the ref's current head (any one approval
+from anyone where no `OWNERS` file applies), or an enabled auto rule, and no
+owner may have rejected it. Reviewers use `leep review approve|reject REV`;
+`leep review status REV` shows what is missing. It composes with
+`--require-signatures` (both must pass), and raw ref updates are checked too.
+Review endpoints answer 400 on a server without a tokens file. Reviews are
+looked up once per write token, so removing a token drops its reviews.
+
 ## Environment variables
 
 | Variable | Default in image | Meaning |
@@ -119,6 +151,8 @@ covered, so run it only as an operator.
 | `LEEP_TOKENS_FILE` | none | Tokens file; enables authentication. |
 | `LEEP_SIGNING_KEYS_FILE` | none | Trusted author keys file; enables signature submission. |
 | `LEEP_REQUIRE_SIGNATURES` | none | Comma-separated refs that only accept signed lands; needs the keys file. |
+| `LEEP_REVIEW_POLICY_FILE` | none | Review policy JSON (auto-approval rules, refs that require review); needs the tokens file. |
+| `LEEP_REQUIRE_REVIEW` | none | Comma-separated refs that only accept reviewed lands; needs the tokens file. |
 | `LEEP_SERVER` | none | CLI only: server URL. |
 | `LEEP_SIGNING_KEY` | none | CLI only: private key file for `leep commit --sign`. |
 | `LEEP_TOKEN` | none | CLI only: bearer token. |

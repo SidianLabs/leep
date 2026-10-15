@@ -664,3 +664,262 @@ fn signed_changesets_gate_landing_on_a_protected_ref() {
         1
     );
 }
+
+/// A user of the `leep` CLI: a token on top of the shared client settings.
+struct User<'a> {
+    client: &'a Client,
+    token: String,
+}
+
+impl User<'_> {
+    fn run(&self, cwd: &Path, args: &[&str]) -> std::process::Output {
+        self.client
+            .cmd(cwd)
+            .env("LEEP_TOKEN", &self.token)
+            .args(args)
+            .output()
+            .unwrap_or_else(|e| panic!("spawn leep {args:?}: {e}"))
+    }
+
+    fn ok(&self, cwd: &Path, args: &[&str]) -> String {
+        let out = self.run(cwd, args);
+        assert_ok(&out, &format!("leep {args:?}"));
+        stdout(&out)
+    }
+
+    fn json(&self, cwd: &Path, args: &[&str]) -> serde_json::Value {
+        let mut full = vec!["--json"];
+        full.extend_from_slice(args);
+        let out = self.ok(cwd, &full);
+        serde_json::from_str(&out).unwrap_or_else(|e| panic!("bad json from {args:?}: {e}\n{out}"))
+    }
+
+    /// The changeset the working copy is on.
+    fn tip(&self, wc: &Path) -> String {
+        self.json(wc, &["log", "-n", "1"])["entries"][0]["id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+}
+
+/// A real token and its tokens-file entry, from `leep-server gen-token`.
+fn gen_token(name: &str, role: &str) -> (String, serde_json::Value) {
+    let out = std::process::Command::new(bin("leep-server"))
+        .args(["gen-token", "--name", name, "--role", role])
+        .output()
+        .unwrap();
+    assert_ok(&out, "leep-server gen-token");
+    let text = stdout(&out);
+    let field = |key: &str| {
+        text.lines()
+            .find_map(|l| l.strip_prefix(key))
+            .unwrap_or_else(|| panic!("no {key} in {text}"))
+            .trim()
+            .to_string()
+    };
+    (
+        field("token:"),
+        serde_json::from_str(&field("entry:")).unwrap(),
+    )
+}
+
+#[test]
+fn review_owners_and_auto_approval_gate_landing_on_a_protected_ref() {
+    let _g = serial();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+
+    let mut entries = Vec::new();
+    let mut token = |name: &str, role: &str| {
+        let (t, e) = gen_token(name, role);
+        entries.push(e);
+        t
+    };
+    let (alice_t, bob_t, viewer_t) = (
+        token("alice", "write"),
+        token("bob", "write"),
+        token("viewer", "read"),
+    );
+    let tokens = root.join("tokens.json");
+    fs::write(
+        &tokens,
+        serde_json::json!({ "tokens": entries }).to_string(),
+    )
+    .unwrap();
+    let policy = root.join("review.json");
+    fs::write(
+        &policy,
+        r#"{ "refs": ["main"], "auto_approve": ["comment_only"] }"#,
+    )
+    .unwrap();
+
+    let stores = Stores::sqlite(&root.join("data"));
+    let server = Server::start_with(
+        free_port(),
+        &stores,
+        root,
+        &[
+            "--tokens-file",
+            tokens.to_str().unwrap(),
+            "--review-policy-file",
+            policy.to_str().unwrap(),
+            "--require-review",
+            "release",
+        ],
+    );
+    let client = Client::new(&server.url, &root.join("cache"));
+    let alice = User {
+        client: &client,
+        token: alice_t,
+    };
+    let bob = User {
+        client: &client,
+        token: bob_t,
+    };
+    let viewer = User {
+        client: &client,
+        token: viewer_t,
+    };
+
+    // Alice seeds main. Nothing is owned yet, so one approval from anyone
+    // is enough, and she is told how to get it.
+    let wc_a = root.join("wc-alice");
+    alice.ok(root, &["init", wc_a.to_str().unwrap()]);
+    write(&wc_a, "OWNERS", "# alice owns everything\nalice\n");
+    write(&wc_a, "src/lib.rs", "fn a() {}\n");
+    alice.ok(&wc_a, &["commit", "-m", "seed"]);
+    let seed = alice.tip(&wc_a);
+    let out = alice.run(&wc_a, &["land"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    let err = stderr(&out);
+    assert!(err.contains("needs review"), "{err}");
+    assert!(err.contains("leep review approve"), "{err}");
+    assert_eq!(alice.json(&wc_a, &["refs"])["refs"], serde_json::json!({}));
+
+    let out = alice.run(&wc_a, &["review", "status", "@"]);
+    assert_eq!(out.status.code(), Some(1));
+    let text = stdout(&out);
+    assert!(
+        text.contains("not approved") && text.contains("PENDING"),
+        "{text}"
+    );
+
+    // A read token cannot review; reading is fine.
+    let out = viewer.run(root, &["review", "approve", &seed]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        stderr(&out).contains("token lacks write access"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(
+        viewer.run(root, &["review", "status", &seed]).status.code(),
+        Some(1)
+    );
+
+    // Bob approves from outside any working copy; the reviewer is his token.
+    let out = bob.ok(root, &["review", "approve", &seed, "-m", "fine"]);
+    assert!(out.contains("as bob"), "{out}");
+    let list = alice.ok(&wc_a, &["reviews", &seed]);
+    assert!(
+        list.contains("bob approve") && list.contains("\"fine\""),
+        "{list}"
+    );
+    assert_eq!(alice.ok(&wc_a, &["review", "list", &seed]), list);
+    let json = alice.json(&wc_a, &["review", "status", "@"]);
+    assert_eq!(json["approved"], true);
+    let landed = alice.ok(&wc_a, &["land"]);
+    assert!(landed.contains("Landed"), "{landed}");
+
+    // Now alice owns everything. A comment-only change lands without review.
+    let wc_b = root.join("wc-bob");
+    bob.ok(root, &["init", wc_b.to_str().unwrap()]);
+    write(
+        &wc_b,
+        "src/lib.rs",
+        "// the entry point\nfn a() {} // trailing\n",
+    );
+    bob.ok(&wc_b, &["commit", "-m", "comment"]);
+    let status = bob.ok(&wc_b, &["review", "status", "@"]);
+    assert!(status.contains("auto:comment_only"), "{status}");
+    assert!(bob.ok(&wc_b, &["land"]).contains("Landed"));
+
+    // A code change needs alice. Bob's own approval does not count.
+    write(
+        &wc_b,
+        "src/lib.rs",
+        "// the entry point\nfn a() { 1 } // trailing\n",
+    );
+    bob.ok(&wc_b, &["commit", "-m", "code"]);
+    let code = bob.tip(&wc_b);
+    bob.ok(&wc_b, &["review", "approve", "@"]);
+    let out = bob.run(&wc_b, &["land"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        stderr(&out).contains("needs approval from one of [alice]"),
+        "{}",
+        stderr(&out)
+    );
+
+    // An owner's rejection blocks it; a reject needs a reason.
+    let out = alice.run(root, &["review", "reject", &code]);
+    assert_eq!(out.status.code(), Some(2), "clap usage error");
+    alice.ok(root, &["review", "reject", &code, "-m", "not yet"]);
+    let out = bob.run(&wc_b, &["land"]);
+    assert!(
+        stderr(&out).contains("rejected by alice"),
+        "{}",
+        stderr(&out)
+    );
+    // Not approved is exit 1, so read the JSON from the raw output.
+    let out = bob.run(&wc_b, &["--json", "review", "status", &code]);
+    assert_eq!(out.status.code(), Some(1));
+    let status: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(status["approved"], false);
+    assert_eq!(status["paths"][0]["rule"], "rejected");
+    assert_eq!(
+        status["paths"][0]["rejected_by"],
+        serde_json::json!(["alice"])
+    );
+
+    // She changes her mind.
+    alice.ok(root, &["review", "approve", &code, "-m", "ok now"]);
+    assert!(bob.ok(&wc_b, &["land"]).contains("Landed"));
+    let refs = alice.json(&wc_a, &["refs"]);
+    assert_eq!(refs["refs"]["main"], code);
+
+    // Bob cannot make himself an owner: OWNERS is judged by the head's owners.
+    write(&wc_b, "OWNERS", "alice\nbob\n");
+    bob.ok(&wc_b, &["commit", "-m", "add bob"]);
+    let own = bob.tip(&wc_b);
+    bob.ok(&wc_b, &["review", "approve", "@"]);
+    let out = bob.run(&wc_b, &["land"]);
+    assert!(
+        stderr(&out).contains("path OWNERS needs approval from one of [alice]"),
+        "{}",
+        stderr(&out)
+    );
+    alice.ok(root, &["review", "approve", &own]);
+    assert!(bob.ok(&wc_b, &["land"]).contains("Landed"));
+
+    // `release` is protected by --require-review alone. It has no head yet,
+    // so nothing is owned there, and a new change needs some approval.
+    write(
+        &wc_b,
+        "src/lib.rs",
+        "// the entry point\nfn a() { 2 } // trailing\n",
+    );
+    bob.ok(&wc_b, &["commit", "-m", "more code"]);
+    let out = bob.run(&wc_b, &["land", "--ref", "release"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("path src/lib.rs needs approval from any reviewer"),
+        "{}",
+        stderr(&out)
+    );
+    alice.ok(root, &["review", "approve", &bob.tip(&wc_b)]);
+    assert!(bob
+        .ok(&wc_b, &["land", "--ref", "release"])
+        .contains("Landed"));
+}

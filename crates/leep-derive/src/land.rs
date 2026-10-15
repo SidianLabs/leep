@@ -24,6 +24,13 @@ fn backoff(attempt: u32) -> Duration {
     Duration::from_millis(RandomState::new().hash_one(attempt) % (cap + 1))
 }
 
+/// Changesets that passed the land policy, and the head they passed at.
+#[derive(Default)]
+struct Checked {
+    head: Option<Option<ChangesetId>>,
+    ids: HashSet<ChangesetId>,
+}
+
 /// What one land call saw, for metrics only.
 #[derive(Default)]
 struct LandStats {
@@ -78,9 +85,9 @@ impl Repo {
         let waited = Instant::now();
         let _guard = lock.lock().await;
         metrics::histogram!("leep_land_lock_wait_seconds").record(waited.elapsed().as_secs_f64());
-        // Signatures are never removed, so a changeset that passed the policy
-        // need not be checked again when a lost CAS retries.
-        let mut checked = HashSet::new();
+        // A changeset that passed the policy need not be checked again when a
+        // lost CAS retries, unless the policy reads the head (see `Checked`).
+        let mut checked = Checked::default();
         for attempt in 1..=MAX_LAND_ATTEMPTS {
             stats.attempts = attempt;
             let head = self.meta().get_ref(target_ref).await?;
@@ -129,7 +136,7 @@ impl Repo {
         new: Option<ChangesetId>,
     ) -> Result<bool> {
         if let Some(new) = new {
-            self.enforce_land_policy(new, expected, name, &mut HashSet::new())
+            self.enforce_land_policy(new, expected, name, &mut Checked::default())
                 .await?;
         }
         self.meta().cas_ref(name, expected, new).await
@@ -142,7 +149,7 @@ impl Repo {
         cs: ChangesetId,
         head: Option<ChangesetId>,
         target_ref: &str,
-        checked: &mut HashSet<ChangesetId>,
+        checked: &mut Checked,
     ) -> Result<()> {
         let Some(policy) = self
             .land_policy
@@ -151,17 +158,21 @@ impl Repo {
         else {
             return Ok(());
         };
+        if policy.depends_on_head() && checked.head != Some(head) {
+            checked.ids.clear();
+        }
+        checked.head = Some(head);
         let fresh: Vec<_> = self
             .new_history(cs, head)
             .await?
             .into_iter()
-            .filter(|id| !checked.contains(id))
+            .filter(|id| !checked.ids.contains(id))
             .collect();
         if fresh.is_empty() {
             return Ok(());
         }
-        policy.check_land(self, target_ref, &fresh).await?;
-        checked.extend(fresh);
+        policy.check_land(self, target_ref, head, &fresh).await?;
+        checked.ids.extend(fresh);
         Ok(())
     }
 

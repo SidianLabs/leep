@@ -31,6 +31,7 @@ skill.
 | derived `root_tree` | — | `MetaStore.derived`, value = 32 raw bytes |
 | derived `generation` | — | `MetaStore.derived`, value = u64 (owned by leep-derive) |
 | derived `signature-v1` | — | `MetaStore.derived`, key = `Hash::of_object("signature", changeset_id ‖ key_id)`, value = postcard `Signature { key_id: String, public_key: [u8; 32], sig: [u8; 64] }` (`leep_core::signature`) |
+| derived `review-v1` | — | `MetaStore.derived`, key = `Hash::of_object("review", changeset_id ‖ reviewer name utf-8)`, value = postcard `Review { reviewer: String, verdict: Verdict, comment: String, timestamp: i64 }` (`leep_core::review`); `Verdict` is `Approve` (variant 0) or `Reject` (variant 1) |
 | derived `rebased-origin-v1` | — | `MetaStore.derived`, key = rebased copy id, value = 32 raw bytes (id it was rebased from); written by `Repo::rebase` |
 | other derived kinds | — | owned and versioned by `leep-derive` |
 
@@ -66,6 +67,43 @@ a `-v2` kind, because stored rows would stop verifying. The API additions
 
 The server's signing keys file is `{"keys":[{"name","public_key"}]}`; unknown
 fields are rejected.
+
+## Reviews and owners (no change to `Changeset`)
+
+ADR 0011. A review is an attestation stored beside the changeset it is about,
+so `Changeset` and the changeset id are unchanged. The `review-v1` row is
+overwritten by the same reviewer, so a verdict can change; the reviewer in the
+value is the token name of the authenticated caller. Changing the `Review`
+field order, the `Verdict` variant order or the key derivation requires a
+`-v2` kind. JSON uses `"approve"` / `"reject"`. The API additions
+(`/v1/changesets/{id}/reviews`, `/v1/changesets/{id}/review-status`) only add
+endpoints and types.
+
+**`OWNERS` file** (any directory of the tree; a regular or executable file,
+symlinks are ignored; at most 1 MiB): one owner name per line, where a name is
+a token name from the server's tokens file; `#` starts a comment (so names
+cannot contain `#`); blank lines are ignored; a line that is exactly
+`noparent` stops inheritance from ancestor directories. Names keep inner
+spaces and are trimmed at both ends. The owners of a path are the union of
+the files in its directory and every ancestor up to the first `noparent`
+(that file's own names included) or the root. Invalid UTF-8 is read lossily.
+Owners are always read from the head of the ref being landed on. No file
+covering a path (or no names in the covering files) means no owners: any one
+approval from any principal satisfies the path.
+
+**Review policy file** (`--review-policy-file`, JSON, unknown fields are
+rejected, every field optional):
+
+```json
+{ "refs": ["main"],
+  "auto_approve": ["comment_only", "whitespace_only", "docs_only"],
+  "docs_globs": ["**/*.md", "docs/**"] }
+```
+`refs` are refs that require review (added to `--require-review`);
+`auto_approve` names the rules that approve a path without a human;
+`docs_globs` (required by `docs_only`, rejected without it) are `globset`
+patterns with `*` limited to one path level. The comment languages are
+selected by file extension (case-insensitive).
 
 ## SQL schema (leep-meta)
 

@@ -12,8 +12,8 @@ use serde_json::{json, Map, Value};
 use similar::TextDiff;
 
 use super::{
-    as_text, parse_args, short, truncate, ToolError, ToolOutput, ToolResult, MAX_DIFF_FILE_BYTES,
-    MAX_TEXT_BYTES,
+    as_text, parse_args, short, truncate, ToolError, ToolOutput, ToolResult, DEFAULT_REF,
+    MAX_DIFF_FILE_BYTES, MAX_TEXT_BYTES,
 };
 use crate::Server;
 
@@ -47,6 +47,13 @@ struct ListArgs {
 struct PathArgs {
     rev: Option<String>,
     path: String,
+}
+
+#[derive(Deserialize)]
+struct ReviewStatusArgs {
+    rev: String,
+    #[serde(rename = "ref")]
+    target_ref: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -267,6 +274,34 @@ impl Server {
         };
         let bytes = self.blob(&f.content)?;
         Ok(as_text(&bytes).map(str::to_string))
+    }
+
+    pub(super) fn review_status(&self, args: Value) -> ToolResult {
+        let a: ReviewStatusArgs = parse_args(args)?;
+        let id = self.resolve_rev(Some(&a.rev))?;
+        let target = a
+            .target_ref
+            .as_deref()
+            .map(str::trim)
+            .filter(|r| !r.is_empty())
+            .unwrap_or(DEFAULT_REF);
+        let status = self.client.review_status(&id, target)?;
+        let blocked: Vec<&str> = status
+            .paths
+            .iter()
+            .filter(|p| p.rule == "pending" || p.rule == "rejected")
+            .map(|p| p.path.as_str())
+            .collect();
+        let mut v = serde_json::to_value(&status).map_err(|e| ToolError(e.to_string()))?;
+        v["blocked_paths"] = json!(blocked);
+        if !status.approved {
+            v["next_step"] = json!(format!(
+                "It cannot land on {target} yet. Owners of the blocked paths must approve it \
+                 (`leep review approve {}`); a path's owners are listed per path.",
+                short(&id)
+            ));
+        }
+        Ok(ToolOutput::json(v))
     }
 
     pub(super) fn blame(&self, args: Value) -> ToolResult {

@@ -376,3 +376,115 @@ fn log_filters_by_agent_and_author() {
     );
     assert_eq!(messages(json!({})).len(), 3);
 }
+
+#[test]
+fn review_status_reports_owners_and_blocked_paths() {
+    use leep_cli::client::Client;
+    use leep_core::api::AddReviewRequest;
+    use leep_core::review::Verdict;
+    use leep_server::review::{RequireReview, ReviewPolicy, ReviewService};
+
+    let tokens = json!({ "tokens": [
+        { "name": "agent", "role": "write", "hash": auth::hash_token("agent-t") },
+        { "name": "alice", "role": "write", "hash": auth::hash_token("alice-t") },
+        { "name": "viewer", "role": "read", "hash": auth::hash_token("viewer-t") } ] });
+    let auth = Auth::parse(&tokens.to_string()).unwrap();
+    let policy =
+        ReviewPolicy::parse(r#"{"refs":["main"],"auto_approve":["comment_only"]}"#).unwrap();
+    let service = std::sync::Arc::new(ReviewService::new(auth.reviewers(), policy.rules));
+    let repo = common::repo().with_land_policy(std::sync::Arc::new(RequireReview::new(
+        service.clone(),
+        policy.refs,
+    )));
+    let url = serve(leep_server::router_with_review(
+        repo,
+        leep_server::DEFAULT_MAX_BODY_BYTES,
+        Some(auth),
+        None,
+        Some(service),
+    ));
+    let with = |t: &str| {
+        let mut c = config(&url);
+        c.token = Some(t.to_string());
+        Server::new(c)
+    };
+    let agent = with("agent-t");
+
+    // main requires review, so the agent lands on a topic ref and asks.
+    let r = commit(
+        &agent,
+        json!({ "message": "seed", "target_ref": "topic",
+                "changes": [{ "path": "OWNERS", "content": "alice\n" },
+                            { "path": "a.rs", "content": "fn a() {}\n" }] }),
+    );
+    let seed = data(&r)["landed"].as_str().unwrap().to_string();
+    let r = commit(
+        &agent,
+        json!({ "message": "seed main", "changes": [{ "path": "a.rs", "content": "x" }] }),
+    );
+    assert_eq!(r["isError"], true);
+    assert!(text(&r).contains("needs review"), "{}", text(&r));
+
+    let r = commit(
+        &agent,
+        json!({ "message": "edit", "target_ref": "topic", "base": seed,
+                "changes": [{ "path": "a.rs", "content": "// why\nfn a() {}\n" },
+                            { "path": "b.rs", "content": "fn b() {}\n" }] }),
+    );
+    let id = data(&r)["landed"].as_str().unwrap().to_string();
+
+    // No head on main yet, so nothing is owned: b.rs wants any reviewer.
+    let st = data(&call(&agent, "leep_review_status", json!({ "rev": id })));
+    assert_eq!(st["approved"], false);
+    assert_eq!(st["target_ref"], "main");
+    assert_eq!(st["blocked_paths"], json!(["b.rs"]));
+    assert_eq!(st["paths"][0]["rule"], "auto:comment_only");
+    assert_eq!(st["paths"][1]["rule"], "pending");
+    assert!(st["next_step"].as_str().unwrap().contains("approve"));
+
+    // Judged against `topic`, whose head has the OWNERS file, alice is needed.
+    let st = data(&call(
+        &agent,
+        "leep_review_status",
+        json!({ "rev": id, "ref": "topic" }),
+    ));
+    assert_eq!(st["paths"][1]["owners"], json!(["alice"]));
+
+    // A read token may look; an approval flips the answer.
+    let viewer = with("viewer-t");
+    let alice = Client::with_token(&url, Some("alice-t"));
+    alice
+        .add_review(
+            &id.parse().unwrap(),
+            &AddReviewRequest {
+                verdict: Verdict::Approve,
+                comment: String::new(),
+            },
+        )
+        .unwrap();
+    let st = data(&call(&viewer, "leep_review_status", json!({ "rev": id })));
+    assert_eq!(st["approved"], true);
+    assert_eq!(st["blocked_paths"], json!([]));
+    assert!(st.get("next_step").is_none());
+
+    let r = call(&agent, "leep_review_status", json!({ "rev": "nope-ref" }));
+    assert_eq!(r["isError"], true);
+    let r = call(&agent, "leep_review_status", json!({}));
+    assert_eq!(r["isError"], true);
+}
+
+#[test]
+fn review_status_needs_an_authenticated_server() {
+    let s = Server::new(config(&start_server()));
+    data(&commit(
+        &s,
+        json!({ "message": "m", "changes": [{ "path": "a", "content": "x" }] }),
+    ));
+    let r = call(&s, "leep_review_status", json!({ "rev": "main" }));
+    assert_eq!(r["isError"], true);
+    assert!(
+        text(&r).contains("reviews need authentication"),
+        "{}",
+        text(&r)
+    );
+}

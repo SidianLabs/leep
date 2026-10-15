@@ -9,12 +9,16 @@
 
 mod ancestry;
 mod blame;
+mod comments;
 pub mod derived;
 pub mod gc;
 mod history;
 mod land;
 mod merge;
+pub mod owners;
 mod repo;
+pub mod review;
+mod reviews;
 mod signatures;
 mod tree_ops;
 
@@ -23,4 +27,4 @@ mod tests;
 
 pub use history::{ExtraMatch, LogFilter};
 pub use repo::Repo;
-pub use signatures::{LandPolicy, REBASED_ORIGIN_KIND};
+pub use signatures::{LandPolicy, PolicySet, REBASED_ORIGIN_KIND};
