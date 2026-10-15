@@ -199,6 +199,23 @@ pub fn router_with_limits(
         .with_state(Arc::new(repo))
 }
 
+/// Check the ref names a land policy protects (`--require-signatures`,
+/// `--require-review`, a review policy's `refs`). Protection matches names
+/// exactly, so a name no ref can have, such as one with a stray space from a
+/// comma-separated environment variable, would leave the intended ref
+/// unprotected without a word.
+pub fn check_protected_refs(what: &str, refs: &[String]) -> Result<(), String> {
+    for r in refs {
+        leep_core::refname::validate(r).map_err(|e| {
+            format!(
+                "{what}: {}",
+                e.to_string().trim_start_matches("invalid input: ")
+            )
+        })?;
+    }
+    Ok(())
+}
+
 /// Serve `app` on `listener` until `shutdown` resolves.
 pub async fn serve(
     listener: tokio::net::TcpListener,
