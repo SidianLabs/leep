@@ -1,14 +1,81 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
+//! `BlobStore` backends for Leep: local filesystem, S3-compatible object
+//! storage, and a bounded LRU cache that can sit in front of any of them.
+
+mod cache;
+mod fs;
+mod object;
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use leep_core::memory::MemoryBlobStore;
+use leep_core::{BlobStore, Error, Result};
+
+pub use cache::{CacheStats, CachedBlobStore};
+pub use fs::FsBlobStore;
+pub use object::{ObjectBlobStore, S3Config};
+
+fn storage_err(e: impl std::fmt::Display) -> Error {
+    Error::Storage(e.to_string())
+}
+
+/// Open a blob store from a URL: `mem://`, `file:///abs/path` (or a bare
+/// path), or `s3://bucket?endpoint=..&region=..&allow_http=true`. S3
+/// credentials come from the standard AWS environment variables.
+pub fn open_blob_store(url: &str) -> Result<Arc<dyn BlobStore>> {
+    if url == "mem://" || url == "mem:" {
+        return Ok(Arc::new(MemoryBlobStore::new()));
+    }
+    if let Some(rest) = url.strip_prefix("file://") {
+        return Ok(Arc::new(FsBlobStore::new(PathBuf::from(rest))));
+    }
+    if url.starts_with("s3://") {
+        let u =
+            url::Url::parse(url).map_err(|e| Error::Invalid(format!("bad url {url:?}: {e}")))?;
+        let bucket = u
+            .host_str()
+            .filter(|b| !b.is_empty())
+            .ok_or_else(|| Error::Invalid(format!("missing bucket in {url:?}")))?;
+        let mut cfg = S3Config {
+            bucket: bucket.to_string(),
+            ..S3Config::default()
+        };
+        for (k, v) in u.query_pairs() {
+            match &*k {
+                "endpoint" => cfg.endpoint = Some(v.into_owned()),
+                "region" => cfg.region = Some(v.into_owned()),
+                "allow_http" => cfg.allow_http = matches!(&*v, "true" | "1"),
+                other => return Err(Error::Invalid(format!("unknown s3 option {other:?}"))),
+            }
+        }
+        return Ok(Arc::new(ObjectBlobStore::s3(cfg)?));
+    }
+    if url.contains("://") {
+        return Err(Error::Invalid(format!(
+            "unsupported blob store url {url:?}"
+        )));
+    }
+    Ok(Arc::new(FsBlobStore::new(PathBuf::from(url))))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use leep_core::memory::check_blob_store_contract;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
+    #[tokio::test]
+    async fn open_urls() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().to_str().unwrap();
+        for url in ["mem://".to_string(), format!("file://{p}"), p.to_string()] {
+            check_blob_store_contract(&*open_blob_store(&url).unwrap()).await;
+        }
+        let s3 = open_blob_store(
+            "s3://bucket?endpoint=http://localhost:9000&region=us-east-1&allow_http=true",
+        );
+        assert!(s3.is_ok());
+        assert!(open_blob_store("s3://").is_err());
+        assert!(open_blob_store("ftp://x").is_err());
+        assert!(open_blob_store("s3://b?bogus=1").is_err());
     }
 }
