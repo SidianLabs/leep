@@ -42,6 +42,6 @@ Each subagent prompt must be self-contained and include:
    `cargo tree -p leep-cli` to confirm the CLI pulls in no other leep crate.
 3. Run the full workspace fmt, clippy and tests in the shared target dir.
 4. Commit each crate separately (`store: ...`, `meta: ...`) so history stays
-   bisectable.
+   bisectable, following the `commit-and-pr` skill (no AI attribution).
 5. Fold any proposed contract changes into `leep-core` yourself before the
    next wave starts.

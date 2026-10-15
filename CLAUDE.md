@@ -42,6 +42,7 @@ A change isn't done until all three pass locally.
 | Change to anything persisted | `leep-core` + ADR | `change-persistent-format` |
 | Run the stack by hand | — | `run-leep-locally` |
 | Split a large task across subagents | — | `coordinate-agents` |
+| Commit, branch or open a PR | — | `commit-and-pr` |
 
 ## Conventions
 
@@ -55,5 +56,10 @@ A change isn't done until all three pass locally.
 - Shared dependency versions go in the root `[workspace.dependencies]`.
 - Architectural decisions get an ADR in `docs/adr/`. Update
   `docs/ARCHITECTURE.md` in the same change.
-- Commits: imperative subject prefixed with the area (`derive: ...`,
-  `server: ...`, `docs: ...`). One logical change per commit.
+- Commits, branches and PRs follow the `commit-and-pr` skill:
+  `<area>: <imperative summary>` subjects, `<area>/<kebab-desc>` branches,
+  and squash-merged PRs with Summary / Why / Changes / Testing /
+  Compatibility sections.
+- **Never credit AI tools.** No `Co-Authored-By` for Claude or any AI, no
+  session links, no "Generated with ..." footers, and no model names, in
+  commits, PRs, code or docs.
