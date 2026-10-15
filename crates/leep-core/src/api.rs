@@ -16,13 +16,16 @@
 //! | GET  | `/v1/tree/{id}?path=dir` | – | [`TreeResponse`] (one directory level) |
 //! | GET  | `/v1/files/{id}?prefix=dir` | – | [`FilesResponse`] (recursive listing) |
 //! | GET  | `/v1/file/{id}?path=p` | – | raw bytes + `x-leep-kind` header, or 404 |
-//! | GET  | `/v1/log/{id}?path=p&limit=n` | – | [`LogResponse`] (newest first) |
+//! | GET  | `/v1/log/{id}?path=p&limit=n` | – | [`LogResponse`] (newest first; `limit` defaults to 100, capped at 10000) |
 //! | GET  | `/v1/diff?from=a&to=b&prefix=dir` | – | [`DiffResponse`] (`from` omitted = empty tree) |
 //! | GET  | `/v1/blame/{id}?path=p` | – | [`BlameResponse`] |
 //! | GET  | `/v1/merge-base?a=x&b=y` | – | [`MergeBaseResponse`] |
 //! | POST | `/v1/merge` | [`MergeRequest`] | [`MergeResponse`] |
 //! | POST | `/v1/rebase` | [`RebaseRequest`] | [`RebaseResponse`] |
 //! | POST | `/v1/land` | [`LandRequest`] | [`LandResponse`] |
+//!
+//! Ref names may contain `/` (e.g. `release/1.0`); `{name}` and `{rev}` match
+//! the rest of the path.
 //!
 //! Errors are `{"error": "..."}` ([`ErrorResponse`]): `Error::Invalid` → 400,
 //! `Error::NotFound` → 404, CAS loss → 409, anything else → 500.
@@ -32,7 +35,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Changeset, ChangesetId, FileKind, Hash, RepoPath, TreeEntry};
+use crate::{Changeset, ChangesetId, FileChange, FileKind, Hash, RepoPath, TreeEntry};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ErrorResponse {
@@ -200,17 +203,22 @@ pub struct RebaseRequest {
 pub enum RebaseResponse {
     /// New changeset with parent `onto`, same author/message/extra, plus
     /// `extra["leep.rebased_from"]`. If already based on `onto`, returns it.
-    Rebased {
-        id: ChangesetId,
-    },
+    Rebased { id: ChangesetId },
     Conflicts {
         conflicts: Vec<Conflict>,
+        /// Changes relative to `onto` for every path that merged cleanly.
+        /// Applying these plus a resolution of each conflict on top of `onto`
+        /// gives the rebased result.
+        #[serde(default)]
+        clean: BTreeMap<RepoPath, FileChange>,
     },
 }
 
-/// Land a changeset on a ref with no merge queue: if the ref moved since the
-/// changeset's parent, the server rebases it onto the current head and retries
-/// the compare-and-swap until it wins or hits a conflict.
+/// Land a changeset on a ref with no merge queue. If the ref head is an
+/// ancestor, the ref fast-forwards. Otherwise the server replays the stack of
+/// unlanded changesets (the first-parent chain from `changeset` down to where
+/// it joins the head's history) onto the current head, one by one, and
+/// retries the compare-and-swap until it wins or hits a conflict.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LandRequest {
     pub changeset: ChangesetId,
@@ -232,9 +240,16 @@ pub enum LandResponse {
         rebased: bool,
         attempts: u32,
     },
+    /// The changeset (and any unlanded changesets below it) could not be
+    /// replayed onto `onto`. `conflicts` and `clean` describe the whole stack
+    /// squashed into one change relative to `onto`: a client resolves the
+    /// conflicts on top of `onto`, commits once, and lands again.
     Conflicts {
         onto: ChangesetId,
         conflicts: Vec<Conflict>,
+        /// Changes relative to `onto` for every path that merged cleanly.
+        #[serde(default)]
+        clean: BTreeMap<RepoPath, FileChange>,
     },
 }
 
