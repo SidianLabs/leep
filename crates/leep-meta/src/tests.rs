@@ -320,3 +320,100 @@ async fn postgres_old_schema_upgrades() {
         .unwrap();
     check_upgraded(&s, old_head).await;
 }
+
+/// Tasks start ref moves and abandon them after a seeded number of
+/// suspensions (a request timeout, a dropped connection), over a few refs
+/// including deletes. However far each got, a ref and its log agree: every
+/// move has exactly one entry, no entry lacks its move, and the log replays
+/// to the refs.
+async fn check_cancelled_cas_keeps_ref_and_log_together(store: Arc<dyn MetaStore>) {
+    use leep_testkit::{cancel_after_polls, Rng};
+
+    let mut ids = Vec::new();
+    for n in 0..40 {
+        ids.push(store.put_changeset(&cs(7000 + n)).await.unwrap());
+    }
+    let refs = ["cx/a", "cx/b", "cx/c"];
+    let mut tasks = Vec::new();
+    for t in 0..12u64 {
+        let (store, ids) = (store.clone(), ids.clone());
+        tasks.push(tokio::spawn(async move {
+            let mut rng = Rng::new(t + 1);
+            let ctx = RefUpdateContext::new("cancel");
+            for _ in 0..30 {
+                let name = refs[rng.below(refs.len())];
+                let cur = store.get_ref(name).await.unwrap();
+                let new = (rng.below(8) != 0).then(|| ids[rng.below(ids.len())]);
+                let call = store.cas_ref_logged(name, cur, new, &ctx);
+                // 0 cancels before the first await; large lets it finish.
+                let _ = cancel_after_polls(call, rng.below(14)).await;
+            }
+        }));
+    }
+    for t in tasks {
+        t.await.unwrap();
+    }
+    let mut log = store.ref_log(None, None, usize::MAX >> 1).await.unwrap();
+    assert!(!log.is_empty(), "some moves completed");
+    log.reverse();
+    let mut replay: BTreeMap<String, leep_core::ChangesetId> = BTreeMap::new();
+    for e in &log {
+        assert_eq!(
+            replay.get(&e.name).copied(),
+            e.old,
+            "entry {} of {}",
+            e.seq,
+            e.name
+        );
+        match e.new {
+            Some(n) => replay.insert(e.name.clone(), n),
+            None => replay.remove(&e.name),
+        };
+    }
+    let heads = store.list_refs().await.unwrap();
+    let ours = |m: &BTreeMap<String, leep_core::ChangesetId>| {
+        m.iter()
+            .filter(|(k, _)| k.starts_with("cx/"))
+            .map(|(k, v)| (k.clone(), *v))
+            .collect::<BTreeMap<_, _>>()
+    };
+    assert_eq!(ours(&replay), ours(&heads), "log replays to the refs");
+    assert!(
+        log.windows(2).all(|w| w[0].seq < w[1].seq),
+        "seq increases with every entry"
+    );
+    // The store still works after all the abandoned requests.
+    let cur = store.get_ref("cx/a").await.unwrap();
+    assert!(
+        store
+            .cas_ref("cx/a", cur, Some(ids[0]))
+            .await
+            .unwrap_or(false)
+            || cur == Some(ids[0])
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelled_ref_moves_never_split_ref_and_log() {
+    check_cancelled_cas_keeps_ref_and_log_together(open_meta_store("mem://").await.unwrap()).await;
+    // Not `sqlite::memory:`: sqlx discards a connection cancelled mid-query,
+    // and a database that lives in that one connection goes with it.
+    let dir = std::env::temp_dir().join(format!("leep-meta-cancel-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let url = format!("sqlite://{}?mode=rwc", dir.join("meta.db").display());
+    let s = SqliteMetaStore::connect(&url).await.unwrap();
+    check_cancelled_cas_keeps_ref_and_log_together(Arc::new(s)).await;
+    std::fs::remove_dir_all(&dir).ok();
+    if let Some((s, _)) = pg_store("cancel").await {
+        check_cancelled_cas_keeps_ref_and_log_together(Arc::new(s)).await;
+    }
+}
+
+#[tokio::test]
+async fn quiet_fault_wrapper_passes_contract() {
+    use leep_testkit::{FaultPlan, FaultyMetaStore};
+    for url in ["mem://", "sqlite::memory:"] {
+        let store = FaultyMetaStore::new(open_meta_store(url).await.unwrap(), FaultPlan::new(1));
+        check_meta_store_contract(&store).await;
+    }
+}

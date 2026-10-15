@@ -220,4 +220,115 @@ mod tests {
             }
         }
     }
+
+    /// Every file under a shard directory, as (name, bytes).
+    fn files(root: &Path) -> Vec<(String, Vec<u8>)> {
+        let mut out = Vec::new();
+        for shard in std::fs::read_dir(root).into_iter().flatten().flatten() {
+            for f in std::fs::read_dir(shard.path())
+                .into_iter()
+                .flatten()
+                .flatten()
+            {
+                out.push((
+                    format!(
+                        "{}{}",
+                        shard.file_name().to_string_lossy(),
+                        f.file_name().to_string_lossy()
+                    ),
+                    std::fs::read(f.path()).unwrap(),
+                ));
+            }
+        }
+        out
+    }
+
+    /// A blob is published whole or not at all: a put abandoned at any
+    /// suspension point (a timeout, a killed request) leaves either no file at
+    /// the blob's address or the complete bytes, and never a blob that does
+    /// not hash to its name. Leftover temp files are not blobs.
+    #[tokio::test]
+    async fn abandoned_puts_never_publish_a_partial_blob() {
+        use leep_testkit::cancel_after_polls;
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsBlobStore::new(dir.path());
+        let data = Bytes::from(vec![0x5a; 3 << 20]);
+        let hash = Hash::of_blob(&data);
+        let mut finished = 0;
+        for polls in 0..40 {
+            if cancel_after_polls(store.put(data.clone()), polls)
+                .await
+                .is_some()
+            {
+                finished += 1;
+            }
+            // Let in-flight blocking file operations land before looking.
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            match store.get(&hash).await.unwrap() {
+                None => assert!(!store.contains(&hash).await.unwrap()),
+                Some(b) => assert_eq!(b, data, "published bytes are whole"),
+            }
+            for (name, bytes) in files(dir.path()) {
+                if !name.contains(".tmp-") {
+                    assert_eq!(Hash::of_blob(&bytes).to_hex(), name, "a file at an address");
+                }
+            }
+            for m in store.list_page(None, 100).await.unwrap() {
+                assert_eq!(m.hash, hash, "only real blobs are listed");
+            }
+        }
+        assert!(finished > 0, "the later attempts ran to the end");
+        // Whatever was left behind, a full put works and reads back.
+        store.put(data.clone()).await.unwrap();
+        assert_eq!(store.get(&hash).await.unwrap().unwrap(), data);
+    }
+
+    /// What a crash between writing the temp file and renaming it leaves.
+    #[tokio::test]
+    async fn crash_leftovers_are_not_blobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsBlobStore::new(dir.path());
+        let data = Bytes::from("whole blob");
+        let hash = Hash::of_blob(&data);
+        let hex = hash.to_hex();
+        let shard = dir.path().join(&hex[..2]);
+        std::fs::create_dir_all(&shard).unwrap();
+        // Full and torn temp files, one of them named like another process's.
+        std::fs::write(shard.join(".tmp-4242-0"), &data).unwrap();
+        std::fs::write(shard.join(".tmp-4242-1"), &data[..4]).unwrap();
+        assert!(store.get(&hash).await.unwrap().is_none());
+        assert!(!store.contains(&hash).await.unwrap());
+        assert!(store.list_page(None, 10).await.unwrap().is_empty());
+        // A put does not mistake them for the blob, and a delete leaves them.
+        store.put(data.clone()).await.unwrap();
+        assert_eq!(store.get(&hash).await.unwrap().unwrap(), data);
+        assert_eq!(store.list_page(None, 10).await.unwrap().len(), 1);
+        store.delete(&hash).await.unwrap();
+        assert!(store.get(&hash).await.unwrap().is_none());
+        assert!(shard.join(".tmp-4242-1").exists());
+    }
+
+    /// Errors injected around a real filesystem store: a put that fails after
+    /// applying leaves a complete blob, and retrying is harmless.
+    #[tokio::test]
+    async fn put_failing_after_it_applied_leaves_a_whole_blob() {
+        use leep_testkit::{is_injected, Fault, FaultPlan, FaultyBlobStore, Op};
+        let dir = tempfile::tempdir().unwrap();
+        let plan = FaultPlan::new(3);
+        plan.script(Op::Put, 1, Fault::FailAfter)
+            .script(Op::Put, 2, Fault::Fail);
+        let inner = std::sync::Arc::new(FsBlobStore::new(dir.path()));
+        let store = FaultyBlobStore::new(inner.clone(), plan);
+        let data = Bytes::from("ambiguous");
+        let hash = Hash::of_blob(&data);
+        assert!(is_injected(&store.put(data.clone()).await.unwrap_err()));
+        assert_eq!(
+            inner.get(&hash).await.unwrap().unwrap(),
+            data,
+            "it was applied"
+        );
+        assert!(is_injected(&store.put(data.clone()).await.unwrap_err()));
+        assert_eq!(store.put(data.clone()).await.unwrap(), hash);
+        assert_eq!(files(dir.path()).len(), 1, "no duplicate and no temp file");
+    }
 }

@@ -27,6 +27,8 @@ mod signatures;
 mod tree_ops;
 
 #[cfg(test)]
+mod fault_tests;
+#[cfg(test)]
 mod tests;
 
 /// The comment lexer, public only so the fuzz harness can check it directly.
