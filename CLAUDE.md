@@ -36,6 +36,9 @@ End-to-end tests drive the real binaries and need them built first:
 - Remove or rename a `/v1` API field or endpoint. Only add, using
   `#[serde(default)]` for new fields.
 - Silently resolve merge conflicts on the server.
+- Bump the workspace version, tag a release, or mark a roadmap milestone
+  closed. Those are maintainer decisions; see "How versions move" in
+  [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Where things go
 

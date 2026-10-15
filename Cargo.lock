@@ -2315,7 +2315,7 @@ checksum = "20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb"
 
 [[package]]
 name = "leep-cli"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "axum",
  "clap",
@@ -2334,7 +2334,7 @@ dependencies = [
 
 [[package]]
 name = "leep-core"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "blake3",
@@ -2349,7 +2349,7 @@ dependencies = [
 
 [[package]]
 name = "leep-derive"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2370,7 +2370,7 @@ dependencies = [
 
 [[package]]
 name = "leep-e2e"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "leep-core",
  "serde_json",
@@ -2381,7 +2381,7 @@ dependencies = [
 
 [[package]]
 name = "leep-git"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "bytes",
@@ -2399,7 +2399,7 @@ dependencies = [
 
 [[package]]
 name = "leep-mcp"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "axum",
  "leep-cli",
@@ -2415,7 +2415,7 @@ dependencies = [
 
 [[package]]
 name = "leep-meta"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2427,7 +2427,7 @@ dependencies = [
 
 [[package]]
 name = "leep-server"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2459,7 +2459,7 @@ dependencies = [
 
 [[package]]
 name = "leep-store"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "bytes",
