@@ -223,7 +223,7 @@ impl Repo {
         Ok(TreeMerge { changes, conflicts })
     }
 
-    async fn tree_or_empty(&self, id: Option<ChangesetId>) -> Result<Hash> {
+    pub(crate) async fn tree_or_empty(&self, id: Option<ChangesetId>) -> Result<Hash> {
         match id {
             Some(id) => self.root_tree(id).await,
             None => Ok(TreeNode::empty_hash()),
@@ -280,6 +280,7 @@ impl Repo {
         if !m.conflicts.is_empty() {
             return Ok(RebaseResponse::Conflicts {
                 conflicts: m.conflicts,
+                clean: m.changes,
             });
         }
         let mut extra = orig.extra;

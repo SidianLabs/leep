@@ -710,7 +710,7 @@ async fn rebase_replays_changes() {
 
     // Conflict.
     let clash = commit(&r, &[base], &[("a", Some("mine\n"))], "clash").await;
-    let RebaseResponse::Conflicts { conflicts } = r.rebase(clash, onto).await.unwrap() else {
+    let RebaseResponse::Conflicts { conflicts, .. } = r.rebase(clash, onto).await.unwrap() else {
         panic!()
     };
     assert_eq!(conflicts[0].path.as_str(), "a");
@@ -773,7 +773,10 @@ async fn land_basic_flow() {
     let bad = commit(&r, &[c1], &[("a", Some("other\n"))], "bad").await;
     let c3 = commit(&r, &[landed], &[("a", Some("changed\n"))], "c3").await;
     r.land(c3, "main").await.unwrap();
-    let LandResponse::Conflicts { onto, conflicts } = r.land(bad, "main").await.unwrap() else {
+    let LandResponse::Conflicts {
+        onto, conflicts, ..
+    } = r.land(bad, "main").await.unwrap()
+    else {
         panic!()
     };
     assert_eq!(onto, c3);
@@ -973,4 +976,112 @@ async fn deriving_a_deep_history_is_iterative() {
     let tree = r.root_tree(tip).await.unwrap();
     assert_ne!(tree, TreeNode::empty_hash());
     assert_eq!(r.list_files(tip, "").await.unwrap().len(), 10);
+}
+
+#[tokio::test]
+async fn land_replays_the_whole_unlanded_stack() {
+    let r = repo();
+    let c1 = commit(&r, &[], &[("a", Some("1\n"))], "c1").await;
+    r.land(c1, "main").await.unwrap();
+    let s1 = commit(&r, &[c1], &[("b", Some("2\n"))], "s1").await;
+    let s2 = commit(&r, &[s1], &[("c", Some("3\n"))], "s2").await;
+    // Someone else lands first, so main is no longer an ancestor of s2.
+    let other = commit(&r, &[c1], &[("d", Some("4\n"))], "other").await;
+    r.land(other, "main").await.unwrap();
+
+    let LandResponse::Landed {
+        landed, rebased, ..
+    } = r.land(s2, "main").await.unwrap()
+    else {
+        panic!("expected land");
+    };
+    assert!(rebased);
+    for (path, want) in [("a", "1\n"), ("b", "2\n"), ("c", "3\n"), ("d", "4\n")] {
+        assert_eq!(
+            text(&r, landed, path).await.as_deref(),
+            Some(want),
+            "{path}"
+        );
+    }
+    // Both stack entries were replayed, keeping their messages, on top of `other`.
+    let top = r.get_changeset(landed).await.unwrap();
+    assert_eq!(top.message, "s2");
+    let below = r.get_changeset(top.parents[0]).await.unwrap();
+    assert_eq!(below.message, "s1");
+    assert_eq!(below.parents, [other]);
+}
+
+#[tokio::test]
+async fn land_conflict_on_a_stack_reports_clean_changes_and_resolves_in_one_commit() {
+    let r = repo();
+    let c1 = commit(&r, &[], &[("a", Some("base\n"))], "c1").await;
+    r.land(c1, "main").await.unwrap();
+    let theirs = commit(&r, &[c1], &[("a", Some("main\n"))], "theirs").await;
+    r.land(theirs, "main").await.unwrap();
+    let s1 = commit(
+        &r,
+        &[c1],
+        &[("a", Some("mine\n")), ("b", Some("b\n"))],
+        "s1",
+    )
+    .await;
+    let s2 = commit(&r, &[s1], &[("c", Some("c\n"))], "s2").await;
+
+    let LandResponse::Conflicts {
+        onto,
+        conflicts,
+        clean,
+    } = r.land(s2, "main").await.unwrap()
+    else {
+        panic!("expected conflicts");
+    };
+    assert_eq!(onto, theirs);
+    let paths: Vec<_> = conflicts.iter().map(|c| c.path.as_str()).collect();
+    assert_eq!(paths, ["a"]);
+    // Clean changes cover the whole stack, not just its top.
+    let clean_paths: Vec<_> = clean.keys().map(|p| p.as_str()).collect();
+    assert_eq!(clean_paths, ["b", "c"]);
+    assert_eq!(
+        r.resolve("main").await.unwrap(),
+        theirs,
+        "main must not move"
+    );
+
+    // Client resolves on top of `onto` and commits once: lands as a fast-forward.
+    let mut changes = clean.clone();
+    changes.insert(rp("a"), modify(&r, b"resolved\n").await);
+    let fixed = r
+        .create_changeset(changeset(&[onto], changes, "resolve"))
+        .await
+        .unwrap();
+    let LandResponse::Landed {
+        landed, rebased, ..
+    } = r.land(fixed, "main").await.unwrap()
+    else {
+        panic!("expected land");
+    };
+    assert_eq!((landed, rebased), (fixed, false));
+    for (path, want) in [("a", "resolved\n"), ("b", "b\n"), ("c", "c\n")] {
+        assert_eq!(
+            text(&r, landed, path).await.as_deref(),
+            Some(want),
+            "{path}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn land_refuses_a_stack_containing_a_merge() {
+    let r = repo();
+    let c1 = commit(&r, &[], &[("a", Some("1\n"))], "c1").await;
+    r.land(c1, "main").await.unwrap();
+    let x = commit(&r, &[c1], &[("x", Some("x\n"))], "x").await;
+    let y = commit(&r, &[c1], &[("y", Some("y\n"))], "y").await;
+    let MergeResponse::Merged { id: m } = r.merge(merge_req(x, y)).await.unwrap() else {
+        panic!("expected merge");
+    };
+    let top = commit(&r, &[m], &[("z", Some("z\n"))], "top").await;
+    let other = commit(&r, &[c1], &[("o", Some("o\n"))], "other").await;
+    r.land(other, "main").await.unwrap();
+    assert!(is_invalid(r.land(top, "main").await));
 }
