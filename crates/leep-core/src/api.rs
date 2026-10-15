@@ -16,13 +16,16 @@
 //! | GET  | `/v1/tree/{id}?path=dir` | – | [`TreeResponse`] (one directory level) |
 //! | GET  | `/v1/files/{id}?prefix=dir` | – | [`FilesResponse`] (recursive listing) |
 //! | GET  | `/v1/file/{id}?path=p` | – | raw bytes + `x-leep-kind` header, or 404 |
-//! | GET  | `/v1/log/{id}?path=p&limit=n` | – | [`LogResponse`] (newest first) |
+//! | GET  | `/v1/log/{id}?path=p&limit=n` | – | [`LogResponse`] (newest first; `limit` defaults to 100, capped at 10000) |
 //! | GET  | `/v1/diff?from=a&to=b&prefix=dir` | – | [`DiffResponse`] (`from` omitted = empty tree) |
 //! | GET  | `/v1/blame/{id}?path=p` | – | [`BlameResponse`] |
 //! | GET  | `/v1/merge-base?a=x&b=y` | – | [`MergeBaseResponse`] |
 //! | POST | `/v1/merge` | [`MergeRequest`] | [`MergeResponse`] |
 //! | POST | `/v1/rebase` | [`RebaseRequest`] | [`RebaseResponse`] |
 //! | POST | `/v1/land` | [`LandRequest`] | [`LandResponse`] |
+//!
+//! Ref names may contain `/` (e.g. `release/1.0`); `{name}` and `{rev}` match
+//! the rest of the path.
 //!
 //! Errors are `{"error": "..."}` ([`ErrorResponse`]): `Error::Invalid` → 400,
 //! `Error::NotFound` → 404, CAS loss → 409, anything else → 500.

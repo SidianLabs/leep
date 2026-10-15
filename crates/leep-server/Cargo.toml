@@ -1,6 +1,33 @@
 [package]
 name = "leep-server"
-version = "0.1.0"
-edition = "2024"
+description = "HTTP server for Leep"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "leep-server"
+path = "src/main.rs"
 
 [dependencies]
+leep-core.workspace = true
+leep-derive.workspace = true
+leep-meta.workspace = true
+leep-store.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+axum = "0.8"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "limit"] }
+clap = { version = "4", features = ["derive", "env"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+http-body-util = "0.1"
+reqwest = { version = "0.12", default-features = false }
