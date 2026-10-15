@@ -183,6 +183,20 @@ pub fn post_json(addr: SocketAddr, path: &str, body: &str) -> (u16, String) {
     (status, body)
 }
 
+/// GET straight from the server, for requests the CLI would retry or never
+/// make. Returns the status, the raw response head (lower-cased) and the body.
+pub fn http_get(addr: SocketAddr, path: &str, token: Option<&str>) -> (u16, String, String) {
+    let mut s = TcpStream::connect(addr).expect("connect");
+    let auth = token.map_or(String::new(), |t| format!("Authorization: Bearer {t}\r\n"));
+    let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n{auth}\r\n");
+    s.write_all(req.as_bytes()).unwrap();
+    let mut resp = String::new();
+    s.read_to_string(&mut resp).unwrap();
+    let status = resp.split_whitespace().nth(1).unwrap().parse().unwrap();
+    let (head, body) = resp.split_once("\r\n\r\n").unwrap_or((&resp, ""));
+    (status, head.to_lowercase(), body.to_string())
+}
+
 /// Settings for the `leep` client shared by every working copy of a test.
 #[derive(Clone)]
 pub struct Client {
