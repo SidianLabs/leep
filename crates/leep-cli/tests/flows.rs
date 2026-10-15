@@ -27,7 +27,7 @@ fn init_wc(
         prefixes: prefixes.iter().map(|s| s.to_string()).collect(),
         dir: Some(dir.to_path_buf()),
     };
-    init::run(&args, &mock.url, Cache::new(cache), false).map(|(c, _)| c)
+    init::run(&args, &mock.url, None, false, Cache::new(cache), false).map(|(c, _)| c)
 }
 
 fn write(ctx: &Ctx, rel: &str, body: &str) {
@@ -265,4 +265,106 @@ fn corrupt_download_is_rejected_and_not_cached() {
     let h = Hash::of_blob(b"precious\n").to_hex();
     assert!(!cache.path().join(&h[..2]).join(&h[2..]).exists());
     assert!(!wc_dir.path().join("a.txt").exists());
+}
+
+mod auth {
+    use super::*;
+    use common::Tokens;
+    use leep_cli::state::WorkCopy;
+
+    const TOKENS: Tokens = Tokens {
+        write: "write-secret",
+        read: "read-secret",
+    };
+
+    fn init_with(
+        mock: &Mock,
+        dir: &Path,
+        cache: &Path,
+        token: Option<&str>,
+        store: bool,
+    ) -> Result<Ctx, leep_cli::error::CliError> {
+        let args = InitArgs {
+            target_ref: "main".into(),
+            prefixes: vec![],
+            dir: Some(dir.to_path_buf()),
+        };
+        init::run(
+            &args,
+            &mock.url,
+            token.map(String::from),
+            store,
+            Cache::new(cache),
+            false,
+        )
+        .map(|(c, _)| c)
+    }
+
+    #[test]
+    fn missing_or_bad_token_is_a_clean_401() {
+        let mock = Mock::start_with_auth(TOKENS);
+        mock.seed(None, &[("a.txt", "hi\n", FileKind::Regular)], &[]);
+        let (wc, cache) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let e = init_with(&mock, wc.path(), cache.path(), None, false)
+            .err()
+            .unwrap();
+        assert_eq!(e.exit_code(), 1);
+        assert_eq!(
+            e.to_string(),
+            "authentication required: set LEEP_TOKEN (or pass --token)"
+        );
+        assert!(
+            !wc.path().join(".leep").exists(),
+            "no half-made working copy"
+        );
+
+        let e = init_with(&mock, wc.path(), cache.path(), Some("wrong-secret"), false)
+            .err()
+            .unwrap();
+        assert_eq!(e.exit_code(), 1);
+        assert!(e.to_string().starts_with("authentication required"));
+        assert!(!e.to_string().contains("wrong-secret"));
+    }
+
+    #[test]
+    fn write_token_runs_the_full_flow_and_is_stored_privately() {
+        let mock = Mock::start_with_auth(TOKENS);
+        mock.seed(None, &[("a.txt", "hi\n", FileKind::Regular)], &[]);
+        let (dir, cache) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let mut ctx = init_with(&mock, dir.path(), cache.path(), Some(TOKENS.write), true).unwrap();
+        assert_eq!(read(&ctx, "a.txt"), "hi\n");
+        write(&ctx, "b.txt", "new\n");
+        assert_eq!(commit::run(&mut ctx, &commit_args("add b")).unwrap(), 0);
+        assert_eq!(
+            land::run(&mut ctx, &LandArgs { target_ref: None }).unwrap(),
+            0
+        );
+
+        // Later commands pick the token up from the config alone.
+        let wc = WorkCopy::open(dir.path()).unwrap();
+        assert_eq!(wc.config.token.as_deref(), Some(TOKENS.write));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let m = fs::metadata(dir.path().join(".leep/config.json"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(m & 0o777, 0o600);
+        }
+    }
+
+    #[test]
+    fn read_token_gets_the_403_message_on_writes() {
+        let mock = Mock::start_with_auth(TOKENS);
+        mock.seed(None, &[("a.txt", "hi\n", FileKind::Regular)], &[]);
+        let (dir, cache) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let mut ctx = init_with(&mock, dir.path(), cache.path(), Some(TOKENS.read), false).unwrap();
+        assert_eq!(read(&ctx, "a.txt"), "hi\n", "reads work");
+        assert!(WorkCopy::open(dir.path()).unwrap().config.token.is_none());
+        write(&ctx, "b.txt", "new\n");
+        let e = commit::run(&mut ctx, &commit_args("add b")).unwrap_err();
+        assert_eq!(e.exit_code(), 1);
+        assert_eq!(e.to_string(), "token lacks write access");
+    }
 }

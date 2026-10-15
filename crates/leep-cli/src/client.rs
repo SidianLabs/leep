@@ -2,13 +2,14 @@
 //!
 //! Network failures and 5xx answers are [`CliError::Server`] (exit 2); 4xx
 //! answers are [`CliError::User`] (exit 1). `ErrorResponse` bodies become the
-//! error message.
+//! error message. 401 and 403 get fixed, token-free messages instead.
 
 use std::time::Duration;
 
 use leep_core::api::*;
 use leep_core::{Changeset, ChangesetId, FileKind, Hash};
 use reqwest::blocking::{Client as Http, RequestBuilder, Response};
+use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use reqwest::StatusCode;
 use serde::de::DeserializeOwned;
 
@@ -18,6 +19,7 @@ use crate::error::{CliError, Result};
 pub struct Client {
     base: String,
     http: Http,
+    has_token: bool,
 }
 
 /// Percent-encode a URL path, keeping `/` so ref names like `team/x` work.
@@ -36,13 +38,25 @@ fn enc(s: &str) -> String {
 
 impl Client {
     pub fn new(server: &str) -> Self {
-        let http = Http::builder()
-            .timeout(Duration::from_secs(300))
-            .build()
-            .expect("http client builds");
+        Self::with_token(server, None)
+    }
+
+    /// Send `Authorization: Bearer <token>` on every request. The header is
+    /// marked sensitive so it is redacted from debug output.
+    pub fn with_token(server: &str, token: Option<&str>) -> Self {
+        let mut builder = Http::builder().timeout(Duration::from_secs(300));
+        if let Some(t) = token {
+            if let Ok(mut v) = HeaderValue::from_str(&format!("Bearer {t}")) {
+                v.set_sensitive(true);
+                let mut h = HeaderMap::new();
+                h.insert(AUTHORIZATION, v);
+                builder = builder.default_headers(h);
+            }
+        }
         Client {
             base: server.trim_end_matches('/').to_string(),
-            http,
+            http: builder.build().expect("http client builds"),
+            has_token: token.is_some(),
         }
     }
 
@@ -62,7 +76,7 @@ impl Client {
         if status.is_success() {
             return Ok(resp);
         }
-        Err(error_from(resp))
+        Err(error_from(resp, self.has_token))
     }
 
     fn json<T: DeserializeOwned>(&self, req: RequestBuilder) -> Result<T> {
@@ -131,7 +145,7 @@ impl Client {
                 .json()
                 .map_err(|e| CliError::server(format!("bad response from server: {e}")));
         }
-        Err(error_from(resp))
+        Err(error_from(resp, self.has_token))
     }
 
     pub fn resolve(&self, rev: &str) -> Result<ChangesetId> {
@@ -241,8 +255,20 @@ impl Client {
     }
 }
 
-fn error_from(resp: Response) -> CliError {
+fn error_from(resp: Response, has_token: bool) -> CliError {
     let status = resp.status();
+    match status {
+        StatusCode::UNAUTHORIZED if has_token => {
+            return CliError::user(
+                "authentication required: the server rejected the token; check LEEP_TOKEN",
+            )
+        }
+        StatusCode::UNAUTHORIZED => {
+            return CliError::user("authentication required: set LEEP_TOKEN (or pass --token)")
+        }
+        StatusCode::FORBIDDEN => return CliError::user("token lacks write access"),
+        _ => {}
+    }
     let body = resp.text().unwrap_or_default();
     let msg = serde_json::from_str::<ErrorResponse>(&body)
         .map(|e| e.error)

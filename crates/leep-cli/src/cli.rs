@@ -8,7 +8,7 @@ use crate::cache::Cache;
 use crate::client::Client;
 use crate::commands::{checkout, commit, diff, history, init, land, status, Ctx, Remote};
 use crate::error::{CliError, Result};
-use crate::state::WorkCopy;
+use crate::state::{resolve_token, WorkCopy};
 
 const DEFAULT_SERVER: &str = "http://127.0.0.1:8080";
 
@@ -22,6 +22,9 @@ pub struct Cli {
     /// Server URL (overrides the working copy config).
     #[arg(long, global = true, env = "LEEP_SERVER")]
     pub server: Option<String>,
+    /// Bearer token (or set LEEP_TOKEN; falls back to `.leep/config.json`).
+    #[arg(long, global = true, hide_env_values = true)]
+    pub token: Option<String>,
     /// Print the raw API response as JSON.
     #[arg(long, global = true)]
     pub json: bool,
@@ -68,11 +71,18 @@ pub fn main() -> ExitCode {
     }
 }
 
+fn env_token() -> Option<String> {
+    std::env::var("LEEP_TOKEN").ok()
+}
+
 pub fn run(cli: Cli) -> Result<i32> {
     let cache = Cache::from_env()?;
     if let Command::Init(args) = &cli.command {
         let server = cli.server.as_deref().unwrap_or(DEFAULT_SERVER);
-        return init::run(args, server, cache, cli.json).map(|(_, code)| code);
+        let token = resolve_token(cli.token.as_deref(), env_token().as_deref(), None);
+        // Only an explicit `--token` is persisted, never an ambient env var.
+        let store = cli.token.as_deref().is_some_and(|t| !t.trim().is_empty());
+        return init::run(args, server, token, store, cache, cli.json).map(|(_, code)| code);
     }
 
     let wc = WorkCopy::discover(&std::env::current_dir()?);
@@ -89,7 +99,8 @@ pub fn run(cli: Cli) -> Result<i32> {
         Command::Log(_) | Command::Show(_) | Command::Cat(_) | Command::Blame(_) | Command::Refs
     );
     if read_only && wc.is_err() {
-        let client = Client::new(&server_for(None)?);
+        let token = resolve_token(cli.token.as_deref(), env_token().as_deref(), None);
+        let client = Client::with_token(&server_for(None)?, token.as_deref());
         let remote = Remote {
             client: &client,
             cache: &cache,
@@ -101,7 +112,12 @@ pub fn run(cli: Cli) -> Result<i32> {
     }
 
     let wc = wc?;
-    let client = Client::new(&server_for(Some(&wc))?);
+    let token = resolve_token(
+        cli.token.as_deref(),
+        env_token().as_deref(),
+        wc.config.token.as_deref(),
+    );
+    let client = Client::with_token(&server_for(Some(&wc))?, token.as_deref());
     let mut ctx = Ctx {
         wc,
         client,

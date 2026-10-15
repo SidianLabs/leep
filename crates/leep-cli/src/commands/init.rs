@@ -26,8 +26,18 @@ pub struct InitArgs {
 }
 
 /// Create `.leep` in the directory and check out the ref if it exists.
-pub fn run(args: &InitArgs, server: &str, cache: Cache, json: bool) -> Result<(Ctx, i32)> {
-    let client = Client::new(server);
+///
+/// `token` authenticates the requests; `store_token` also writes it to
+/// `.leep/config.json` (mode 0600).
+pub fn run(
+    args: &InitArgs,
+    server: &str,
+    token: Option<String>,
+    store_token: bool,
+    cache: Cache,
+    json: bool,
+) -> Result<(Ctx, i32)> {
+    let client = Client::with_token(server, token.as_deref());
     // Ask first so an unreachable server does not leave a half-made `.leep`.
     let head = client.get_ref(&args.target_ref)?.target;
     let dir = args.dir.clone().unwrap_or_else(|| PathBuf::from("."));
@@ -44,6 +54,7 @@ pub fn run(args: &InitArgs, server: &str, cache: Cache, json: bool) -> Result<(C
             server: server.to_string(),
             target_ref: args.target_ref.clone(),
             prefixes,
+            token: token.filter(|_| store_token),
         },
     )?;
     let mut ctx = Ctx {
