@@ -3,17 +3,23 @@ use std::str::FromStr;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use leep_core::{Changeset, ChangesetId, Hash, MetaStore, Result};
+use leep_core::store::unix_now;
+use leep_core::{Changeset, ChangesetId, Hash, MetaStore, RefLogEntry, RefUpdateContext, Result};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 
-use crate::{decode_checked, storage, to_id};
+use crate::{decode_checked, log_entry, storage, to_id, LogRow};
 
 const SCHEMA: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS changesets (id BLOB PRIMARY KEY, data BLOB NOT NULL)",
     "CREATE TABLE IF NOT EXISTS refs (name TEXT PRIMARY KEY, target BLOB NOT NULL)",
     "CREATE TABLE IF NOT EXISTS derived (kind TEXT NOT NULL, key BLOB NOT NULL, \
      value BLOB NOT NULL, PRIMARY KEY (kind, key))",
+    // AUTOINCREMENT so a seq is never reused, even after rows are pruned.
+    "CREATE TABLE IF NOT EXISTS ref_log (seq INTEGER PRIMARY KEY AUTOINCREMENT, \
+     name TEXT NOT NULL, old_target BLOB, new_target BLOB, time INTEGER NOT NULL, \
+     actor TEXT, operation TEXT NOT NULL, message TEXT)",
+    "CREATE INDEX IF NOT EXISTS ref_log_name ON ref_log (name, seq)",
 ];
 
 pub struct SqliteMetaStore {
@@ -102,16 +108,22 @@ impl MetaStore for SqliteMetaStore {
         row.map(|r| to_id(&r.get::<Vec<u8>, _>(0))).transpose()
     }
 
-    async fn cas_ref(
+    async fn cas_ref_logged(
         &self,
         name: &str,
         expected: Option<ChangesetId>,
         new: Option<ChangesetId>,
+        ctx: &RefUpdateContext,
     ) -> Result<bool> {
+        if expected == new {
+            return Ok(self.get_ref(name).await? == expected);
+        }
         let exp = expected.map(|i| i.0 .0.to_vec());
         let new = new.map(|i| i.0 .0.to_vec());
-        let q = match (exp, new) {
-            (None, None) => return Ok(self.get_ref(name).await?.is_none()),
+        // The ref update is the transaction's first statement, so SQLite takes
+        // the write lock up front and never has to upgrade a read lock.
+        let mut tx = self.pool.begin().await.map_err(storage)?;
+        let q = match (&exp, &new) {
             (None, Some(n)) => {
                 sqlx::query("INSERT INTO refs (name, target) VALUES (?, ?) ON CONFLICT DO NOTHING")
                     .bind(name)
@@ -126,9 +138,51 @@ impl MetaStore for SqliteMetaStore {
             (Some(e), None) => sqlx::query("DELETE FROM refs WHERE name = ? AND target = ?")
                 .bind(name)
                 .bind(e),
+            (None, None) => unreachable!("expected == new returned above"),
         };
-        let res = q.execute(&self.pool).await.map_err(storage)?;
-        Ok(res.rows_affected() == 1)
+        if q.execute(&mut *tx).await.map_err(storage)?.rows_affected() != 1 {
+            tx.rollback().await.map_err(storage)?;
+            return Ok(false);
+        }
+        sqlx::query(
+            "INSERT INTO ref_log (name, old_target, new_target, time, actor, operation, message) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(name)
+        .bind(exp)
+        .bind(new)
+        .bind(unix_now())
+        .bind(ctx.actor.as_deref())
+        .bind(&ctx.operation)
+        .bind(ctx.message.as_deref())
+        .execute(&mut *tx)
+        .await
+        .map_err(storage)?;
+        tx.commit().await.map_err(storage)?;
+        Ok(true)
+    }
+
+    async fn ref_log(
+        &self,
+        name: Option<&str>,
+        before_seq: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<RefLogEntry>> {
+        let before = before_seq.map(|s| i64::try_from(s).unwrap_or(i64::MAX));
+        let rows: Vec<LogRow> = sqlx::query_as(
+            "SELECT seq, name, old_target, new_target, time, actor, operation, message \
+             FROM ref_log WHERE (? IS NULL OR name = ?) AND (? IS NULL OR seq < ?) \
+             ORDER BY seq DESC LIMIT ?",
+        )
+        .bind(name)
+        .bind(name)
+        .bind(before)
+        .bind(before)
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(storage)?;
+        rows.into_iter().map(log_entry).collect()
     }
 
     async fn list_refs(&self) -> Result<BTreeMap<String, ChangesetId>> {

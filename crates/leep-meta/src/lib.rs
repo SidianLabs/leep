@@ -1,6 +1,7 @@
 //! `MetaStore` backends: SQLite (single node, tests) and Postgres
 //! (production). Both keep changesets, refs and derived data in three tables
-//! and implement `cas_ref` as a single conditional SQL statement.
+//! and implement `cas_ref` as a single conditional SQL statement. A fourth
+//! table, `ref_log`, records every ref move in the same transaction.
 
 use std::sync::Arc;
 
@@ -47,6 +48,32 @@ fn to_id(bytes: &[u8]) -> Result<leep_core::ChangesetId> {
         .try_into()
         .map_err(|_| storage("bad id length in db"))?;
     Ok(leep_core::ChangesetId(leep_core::Hash(arr)))
+}
+
+/// The row layout both backends select from `ref_log`.
+type LogRow = (
+    i64,
+    String,
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+    i64,
+    Option<String>,
+    String,
+    Option<String>,
+);
+
+fn log_entry(row: LogRow) -> Result<leep_core::RefLogEntry> {
+    let (seq, name, old, new, time, actor, operation, message) = row;
+    Ok(leep_core::RefLogEntry {
+        seq: u64::try_from(seq).map_err(|_| storage("negative ref log seq in db"))?,
+        name,
+        old: old.map(|b| to_id(&b)).transpose()?,
+        new: new.map(|b| to_id(&b)).transpose()?,
+        time,
+        actor,
+        operation,
+        message,
+    })
 }
 
 #[cfg(test)]
