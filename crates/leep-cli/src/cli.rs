@@ -7,7 +7,8 @@ use clap::{Parser, Subcommand};
 use crate::cache::Cache;
 use crate::client::Client;
 use crate::commands::{
-    checkout, commit, diff, history, init, keygen, land, review, search, status, Ctx, Remote,
+    branch, checkout, commit, diff, history, init, keygen, land, review, search, status, Ctx,
+    Remote,
 };
 use crate::error::{CliError, Result};
 use crate::state::{resolve_token, WorkCopy};
@@ -52,6 +53,12 @@ pub enum Command {
     Land(land::LandArgs),
     /// Move to the head of the target ref.
     Sync,
+    /// List, create or delete branches.
+    Branch(branch::BranchArgs),
+    /// Switch the working copy to another branch.
+    Switch(branch::SwitchArgs),
+    /// List, create or delete tags (immutable named revisions).
+    Tag(branch::TagArgs),
     /// Show history.
     Log(history::LogArgs),
     /// Show the newest changeset that changed a file or directory.
@@ -160,6 +167,9 @@ pub fn run(cli: Cli) -> Result<i32> {
         Command::Commit(a) => commit::run(&mut ctx, a),
         Command::Land(a) => land::run(&mut ctx, a),
         Command::Sync => checkout::sync(&mut ctx),
+        Command::Branch(a) => branch::branch(&ctx, a),
+        Command::Switch(a) => branch::switch(&mut ctx, a),
+        Command::Tag(a) => branch::tag(&ctx, a),
         other => read_only_cmd(other, &ctx.remote()),
     }
 }

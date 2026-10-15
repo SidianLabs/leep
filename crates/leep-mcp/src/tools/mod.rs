@@ -164,14 +164,15 @@ fn tool(name: &str, title: &str, description: &str, schema: Value, read_only: bo
     })
 }
 
-const REV_DOC: &str = "Ref name (default `main`) or full 64-hex changeset id.";
+const REV_DOC: &str =
+    "Branch name (default `main`), `tags/<name>` or a tag's short name, or full 64-hex changeset id.";
 
 pub fn definitions() -> Vec<Value> {
     vec![
         tool(
             "leep_refs",
             "List refs",
-            "List all refs (branches) and the changeset id each points to.",
+            "List all refs and the changeset id each points to. Tags are the refs under `tags/` and never move.",
             json!({ "type": "object", "properties": {}, "additionalProperties": false }),
             true,
         ),

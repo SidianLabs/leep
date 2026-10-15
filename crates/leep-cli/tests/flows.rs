@@ -8,6 +8,7 @@ use std::path::Path;
 use common::Mock;
 use leep_cli::cache::Cache;
 use leep_cli::client::LogQuery;
+use leep_cli::commands::branch::{self, BranchArgs, SwitchArgs, TagArgs};
 use leep_cli::commands::checkout::{checkout, sync, CheckoutArgs};
 use leep_cli::commands::commit::{self, CommitArgs};
 use leep_cli::commands::history::{self, BlameArgs, LastChangeArgs, LogArgs, ProvenanceArgs};
@@ -15,6 +16,7 @@ use leep_cli::commands::init::{self, InitArgs};
 use leep_cli::commands::land::{self, LandArgs};
 use leep_cli::commands::search::{self, SearchArgs};
 use leep_cli::commands::Ctx;
+use leep_cli::state::WorkCopy;
 use leep_cli::status::{status, Change};
 use leep_core::changeset::EXTRA_AGENT_MODEL;
 use leep_core::{FileChange, FileKind, Hash};
@@ -714,4 +716,240 @@ mod signing {
         assert!(lines[2].contains(&via.to_string()), "{lines:?}");
         assert!(lines[3].contains("failed to verify"), "{lines:?}");
     }
+}
+
+fn branch_args(name: &str, rev: Option<&str>) -> BranchArgs {
+    BranchArgs {
+        name: Some(name.into()),
+        rev: rev.map(Into::into),
+        delete: false,
+        force_delete: false,
+    }
+}
+
+fn delete_args(name: &str, force: bool) -> BranchArgs {
+    BranchArgs {
+        name: Some(name.into()),
+        rev: None,
+        delete: !force,
+        force_delete: force,
+    }
+}
+
+fn switch_args(name: &str, create: bool, rev: Option<&str>) -> SwitchArgs {
+    SwitchArgs {
+        name: name.into(),
+        rev: rev.map(Into::into),
+        create,
+    }
+}
+
+fn tag_args(name: &str, rev: Option<&str>, delete: bool) -> TagArgs {
+    TagArgs {
+        name: Some(name.into()),
+        rev: rev.map(Into::into),
+        delete,
+    }
+}
+
+fn ref_of(mock: &Mock, name: &str) -> Option<leep_core::ChangesetId> {
+    mock.data.lock().unwrap().refs.get(name).copied()
+}
+
+fn msg(e: leep_cli::error::CliError) -> String {
+    assert_eq!(e.exit_code(), 1, "{e}");
+    e.to_string()
+}
+
+#[test]
+fn branch_create_switch_land_and_delete() {
+    let mock = Mock::start();
+    let (wc_dir, cache) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let base = mock.seed(None, &[("a.txt", "a\n", FileKind::Regular)], &[]);
+    let mut ctx = init_wc(&mock, wc_dir.path(), cache.path(), &[]).unwrap();
+    assert_eq!(ctx.wc.state.base, Some(base));
+
+    // Create at the base; a second create and bad names are refused.
+    assert_eq!(
+        branch::branch(&ctx, &branch_args("feature", None)).unwrap(),
+        0
+    );
+    assert_eq!(ref_of(&mock, "feature"), Some(base));
+    let e = msg(branch::branch(&ctx, &branch_args("feature", None)).unwrap_err());
+    assert_eq!(e, "branch feature already exists");
+    for bad in ["a..b", "x.lock", "with space"] {
+        assert!(
+            branch::branch(&ctx, &branch_args(bad, None)).is_err(),
+            "{bad}"
+        );
+        assert_eq!(ref_of(&mock, bad), None);
+    }
+    let e = msg(branch::branch(&ctx, &branch_args("tags/x", None)).unwrap_err());
+    assert!(e.contains("leep tag"), "{e}");
+    let e = msg(branch::branch(&ctx, &branch_args("x", Some("nope"))).unwrap_err());
+    assert!(e.contains("unknown revision"), "{e}");
+    assert_eq!(
+        branch::branch(
+            &ctx,
+            &BranchArgs {
+                name: None,
+                ..branch_args("", None)
+            }
+        )
+        .unwrap(),
+        0
+    );
+
+    // Switching needs a clean working copy and an existing branch.
+    write(&ctx, "dirty.txt", "x\n");
+    let e = msg(branch::switch(&mut ctx, &switch_args("feature", false, None)).unwrap_err());
+    assert!(e.contains("uncommitted"), "{e}");
+    fs::remove_file(ctx.wc.abs("dirty.txt")).unwrap();
+    let e = msg(branch::switch(&mut ctx, &switch_args("nope", false, None)).unwrap_err());
+    assert!(e.contains("does not exist"), "{e}");
+    assert_eq!(ctx.wc.config.target_ref, "main");
+
+    branch::switch(&mut ctx, &switch_args("feature", false, None)).unwrap();
+    assert_eq!(ctx.wc.config.target_ref, "feature");
+    assert_eq!(
+        WorkCopy::open(wc_dir.path()).unwrap().config.target_ref,
+        "feature",
+        "persisted"
+    );
+
+    // Commit and land go to the branch; main stays put.
+    write(&ctx, "a.txt", "on feature\n");
+    commit::run(&mut ctx, &commit_args("work")).unwrap();
+    let work = ctx.wc.state.base.unwrap();
+    assert_eq!(
+        land::run(&mut ctx, &LandArgs { target_ref: None }).unwrap(),
+        0
+    );
+    assert_eq!(ref_of(&mock, "feature"), Some(work));
+    assert_eq!(ref_of(&mock, "main"), Some(base));
+
+    // Merged into the target: `-d` works. The target itself never deletes.
+    branch::branch(&ctx, &branch_args("old", Some(&base.to_string()))).unwrap();
+    assert_eq!(branch::branch(&ctx, &delete_args("old", false)).unwrap(), 0);
+    assert_eq!(ref_of(&mock, "old"), None);
+    let e = msg(branch::branch(&ctx, &delete_args("feature", true)).unwrap_err());
+    assert!(e.contains("target"), "{e}");
+    let e = msg(branch::branch(&ctx, &delete_args("gone", false)).unwrap_err());
+    assert!(e.contains("does not exist"), "{e}");
+
+    // Back on main, `feature` holds unmerged work: `-d` refuses, `-D` deletes.
+    branch::switch(&mut ctx, &switch_args("main", false, None)).unwrap();
+    assert_eq!(read(&ctx, "a.txt"), "a\n");
+    let e = msg(branch::branch(&ctx, &delete_args("feature", false)).unwrap_err());
+    assert!(e.contains("not fully merged") && e.contains("-D"), "{e}");
+    assert_eq!(ref_of(&mock, "feature"), Some(work));
+    assert_eq!(
+        branch::branch(&ctx, &delete_args("feature", true)).unwrap(),
+        0
+    );
+    assert_eq!(ref_of(&mock, "feature"), None);
+    let e = msg(branch::branch(&ctx, &delete_args("main", true)).unwrap_err());
+    assert!(e.contains("target"), "{e}");
+}
+
+#[test]
+fn switch_create_starts_at_the_base_or_a_given_rev() {
+    let mock = Mock::start();
+    let (wc_dir, cache) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let first = mock.seed(None, &[("a.txt", "1\n", FileKind::Regular)], &[]);
+    let mut ctx = init_wc(&mock, wc_dir.path(), cache.path(), &[]).unwrap();
+    write(&ctx, "a.txt", "2\n");
+    commit::run(&mut ctx, &commit_args("two")).unwrap();
+    let second = ctx.wc.state.base.unwrap();
+
+    // Default: at the current base, even though it is not landed anywhere.
+    branch::switch(&mut ctx, &switch_args("topic", true, None)).unwrap();
+    assert_eq!(ref_of(&mock, "topic"), Some(second));
+    assert_eq!(ctx.wc.config.target_ref, "topic");
+    assert_eq!(read(&ctx, "a.txt"), "2\n");
+
+    // An explicit rev, here the head of main.
+    branch::switch(&mut ctx, &switch_args("old", true, Some("main"))).unwrap();
+    assert_eq!(ref_of(&mock, "old"), Some(first));
+    assert_eq!(ctx.wc.state.base, Some(first));
+    assert_eq!(read(&ctx, "a.txt"), "1\n");
+
+    // Creating an existing branch fails before anything changes.
+    let e = msg(branch::switch(&mut ctx, &switch_args("topic", true, None)).unwrap_err());
+    assert_eq!(e, "branch topic already exists");
+    assert_eq!(ctx.wc.config.target_ref, "old");
+}
+
+#[test]
+fn tags_are_created_listed_resolved_and_deleted() {
+    let mock = Mock::start();
+    let (wc_dir, cache) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let first = mock.seed(None, &[("a.txt", "1\n", FileKind::Regular)], &[]);
+    let mut ctx = init_wc(&mock, wc_dir.path(), cache.path(), &[]).unwrap();
+
+    // The CLI adds the namespace; the default is the base.
+    assert_eq!(branch::tag(&ctx, &tag_args("v1", None, false)).unwrap(), 0);
+    assert_eq!(ref_of(&mock, "tags/v1"), Some(first));
+    assert_eq!(ref_of(&mock, "v1"), None);
+    let e = msg(branch::tag(&ctx, &tag_args("v1", None, false)).unwrap_err());
+    assert!(e.contains("already exists") && e.contains("tag -d"), "{e}");
+    assert!(branch::tag(&ctx, &tag_args("bad..name", None, false)).is_err());
+    assert_eq!(
+        branch::tag(
+            &ctx,
+            &TagArgs {
+                name: None,
+                rev: None,
+                delete: false
+            }
+        )
+        .unwrap(),
+        0
+    );
+
+    // Tags show up under their full ref in `refs` but not as branches, and
+    // resolve wherever a REV is accepted.
+    write(&ctx, "a.txt", "2\n");
+    commit::run(&mut ctx, &commit_args("two")).unwrap();
+    assert_eq!(ctx.remote().resolve("tags/v1").unwrap(), first);
+    branch::tag(&ctx, &tag_args("v2", Some("@"), false)).unwrap();
+    assert_eq!(ref_of(&mock, "tags/v2"), ctx.wc.state.base);
+    checkout(
+        &mut ctx,
+        &CheckoutArgs {
+            rev: "tags/v1".into(),
+            prefixes: vec![],
+            force: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(ctx.wc.state.base, Some(first));
+    assert_eq!(read(&ctx, "a.txt"), "1\n");
+
+    // Delete, then it can be created again somewhere else.
+    assert_eq!(branch::tag(&ctx, &tag_args("v1", None, true)).unwrap(), 0);
+    assert_eq!(ref_of(&mock, "tags/v1"), None);
+    let e = msg(branch::tag(&ctx, &tag_args("v1", None, true)).unwrap_err());
+    assert!(e.contains("does not exist"), "{e}");
+    branch::tag(&ctx, &tag_args("v1", Some("tags/v2"), false)).unwrap();
+    assert_eq!(ref_of(&mock, "tags/v1"), ref_of(&mock, "tags/v2"));
+
+    // A tag is not a branch.
+    let e = msg(branch::branch(&ctx, &delete_args("tags/v1", true)).unwrap_err());
+    assert!(e.contains("leep tag -d v1"), "{e}");
+    let e = msg(branch::switch(&mut ctx, &switch_args("tags/v1", false, None)).unwrap_err());
+    assert!(e.contains("is a tag"), "{e}");
+}
+
+#[test]
+fn branch_and_tag_need_a_base_or_a_rev() {
+    let mock = Mock::start();
+    let (wc_dir, cache) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let ctx = init_wc(&mock, wc_dir.path(), cache.path(), &[]).unwrap();
+    assert!(ctx.wc.state.base.is_none());
+    let e = msg(branch::branch(&ctx, &branch_args("x", None)).unwrap_err());
+    assert!(e.contains("no base"), "{e}");
+    let e = msg(branch::tag(&ctx, &tag_args("x", None, false)).unwrap_err());
+    assert!(e.contains("no base"), "{e}");
+    assert!(mock.data.lock().unwrap().refs.is_empty());
 }
