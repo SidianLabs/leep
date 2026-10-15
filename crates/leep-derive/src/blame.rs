@@ -1,6 +1,7 @@
 //! Line-level blame over first-parent history, cached as derived data.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use bytes::Bytes;
 use leep_core::api::{BlameLine, BlameResponse, ChangesetSummary, FileInfo};
@@ -9,6 +10,13 @@ use similar::{ChangeTag, TextDiff};
 
 use crate::history::agent_keys;
 use crate::Repo;
+
+/// Longest one line diff of a blame may run. Myers' diff is quadratic in the
+/// worst case (two unrelated 40k-line versions take seconds) and runs on an
+/// async worker the request timeout cannot interrupt; past this the diff
+/// settles for a correct but less minimal answer, which only blurs which
+/// changeset gets credit for a line.
+const DIFF_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// What is cached under `blame`. Kept at the original `{path, lines}` shape so
 /// entries written before changeset summaries existed still decode; summaries
@@ -114,7 +122,9 @@ impl Repo {
         };
         for (cid, info) in chain.into_iter().rev() {
             let new_text = self.utf8_content(&info).await?;
-            let diff = TextDiff::from_lines(&old_text, &new_text);
+            let diff = TextDiff::configure()
+                .timeout(DIFF_TIMEOUT)
+                .diff_lines(&old_text, &new_text);
             let mut next = Vec::new();
             for ch in diff.iter_all_changes() {
                 match ch.tag() {

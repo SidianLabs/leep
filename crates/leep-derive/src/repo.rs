@@ -7,12 +7,49 @@ use bytes::Bytes;
 use leep_core::api::ChangesetInfo;
 use leep_core::refname;
 use leep_core::{
-    BlobStore, Changeset, ChangesetId, Error, FileChange, Hash, MetaStore, Result, TreeNode,
+    BlobStore, Changeset, ChangesetId, Error, FileChange, Hash, MetaStore, RepoPath, Result,
+    TreeNode,
 };
 
 use crate::derived::{self, Generation, RootTree, Skiplist};
 use crate::signatures::{LandPolicy, PolicySet};
 use crate::tree_ops::apply_changes;
+
+/// Longest path, in bytes, a client changeset may name (Linux's `PATH_MAX`).
+pub const MAX_PATH_BYTES: usize = 4096;
+/// Most distinct directories a client changeset's paths may name, and their
+/// total length. Building the new tree keeps every changed directory and its
+/// full path in memory, so unbounded paths cost quadratic memory: one request
+/// with a few megabytes of `a/a/a/...` could exhaust the server.
+const MAX_CHANGED_DIRS: usize = 1_000_000;
+const MAX_CHANGED_DIR_BYTES: usize = 256 << 20;
+
+/// Refuse paths that would make tree building blow up (see the constants).
+fn check_path_bounds<'a>(paths: impl Iterator<Item = &'a RepoPath>) -> Result<()> {
+    let mut dirs = HashSet::new();
+    let mut bytes = 0usize;
+    for path in paths {
+        let s = path.as_str();
+        if s.len() > MAX_PATH_BYTES {
+            return Err(Error::Invalid(format!(
+                "path of {} bytes; the limit is {MAX_PATH_BYTES}",
+                s.len()
+            )));
+        }
+        for (i, _) in s.match_indices('/') {
+            if dirs.insert(&s[..i]) {
+                bytes += i;
+                if dirs.len() > MAX_CHANGED_DIRS || bytes > MAX_CHANGED_DIR_BYTES {
+                    return Err(Error::Invalid(format!(
+                        "changeset touches too many directories (limit {MAX_CHANGED_DIRS} \
+                         directories or {MAX_CHANGED_DIR_BYTES} bytes of directory names)"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
 
 /// A repository: content-addressed blobs plus changeset metadata.
 #[derive(Clone)]
@@ -69,6 +106,9 @@ impl Repo {
 
     async fn store_changeset(&self, cs: Changeset, client_blobs: bool) -> Result<ChangesetId> {
         let id = cs.id();
+        if client_blobs {
+            check_path_bounds(cs.changes.keys())?;
+        }
         for p in &cs.parents {
             if self.meta.get_changeset(p).await?.is_none() {
                 return Err(Error::Invalid(format!("unknown parent {p}")));
