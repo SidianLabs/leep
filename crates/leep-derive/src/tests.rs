@@ -1098,6 +1098,13 @@ impl leep_core::MetaStore for SlowRefs {
     async fn get_changeset(&self, id: &ChangesetId) -> leep_core::Result<Option<Changeset>> {
         self.0.get_changeset(id).await
     }
+    async fn list_changesets(
+        &self,
+        after: Option<ChangesetId>,
+        limit: usize,
+    ) -> leep_core::Result<Vec<ChangesetId>> {
+        self.0.list_changesets(after, limit).await
+    }
     async fn get_ref(&self, name: &str) -> leep_core::Result<Option<ChangesetId>> {
         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         self.0.get_ref(name).await

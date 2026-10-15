@@ -69,10 +69,10 @@ content-addressing and (b) the atomicity of `MetaStore::cas_ref`.
 
 | Crate | Role | May depend on |
 |---|---|---|
-| `leep-core` | Types, hashing, encoding, `BlobStore`/`MetaStore` traits, in-memory stores, conformance tests, API types | no other leep crate; no I/O, no async runtime |
+| `leep-core` | Types, hashing, encoding, `BlobStore`/`MetaStore` traits (including listing and blob deletion for GC), in-memory stores, conformance tests, API types | no other leep crate; no I/O, no async runtime |
 | `leep-store` | `BlobStore` backends: filesystem, `object_store` (S3/MinIO), `CachedBlobStore`, `open_blob_store(url)` | core |
 | `leep-meta` | `MetaStore` backends: SQLite, Postgres, `open_meta_store(url)` | core |
-| `leep-derive` | `Repo`: derived data framework and kinds, plus all operations | core (traits only, never a concrete backend) |
+| `leep-derive` | `Repo`: derived data framework and kinds, plus all operations and blob garbage collection (`gc`) | core (traits only, never a concrete backend) |
 | `leep-server` | HTTP server binary `leep-server` | core, store, meta, derive |
 | `leep-cli` | Client binary `leep` | core only |
 | `leep-git` | Git bridge: library plus the `leep-git` admin binary | core, derive; store and meta only to open stores by URL in the binary |
@@ -202,8 +202,13 @@ regional cache cannot stampede the origin.
   NOTHING`), never a read followed by a write.
 - Changesets, blobs and derived values are written idempotently. Duplicate
   writes from racing servers are harmless.
-- A blob may be orphaned if a client uploads it and never commits. Garbage
-  collection is out of scope for v0.1 (see roadmap).
+- A blob may be orphaned if a client uploads it and never commits, and tree
+  nodes or merge blobs may be orphaned if the changeset that would reference
+  them fails to store. `leep-server gc` reclaims them: it marks everything
+  reachable from every stored changeset (not only refs, so unlanded changesets
+  survive) and deletes unmarked blobs older than a grace window (default 24h).
+  A client must create its changeset within the grace window of uploading, and
+  that window is what makes GC safe beside running servers. See ADR 0008.
 
 ## 9. Failure model
 

@@ -16,10 +16,11 @@ Milestones are ordered. Each one should leave `main` releasable.
 - [x] Token auth (static bearer tokens, read/write roles; ADR 0007)
 - [ ] Structured logs; Prometheus metrics (cache hit rates, land retries, derive latency)
 - Docker images and a docker-compose file (server + Postgres + MinIO)
-- Blob garbage collection (mark from refs plus a retention window)
+- [x] Blob garbage collection (mark from all stored changesets plus a retention window; ADR 0008)
 - Benchmarks: commit and land latency versus repository size
 
 ## v0.3: Agent-native
+- Fenced two-phase blob GC that closes the last claim/delete race (ADR 0008)
 - Provenance: `leep log --agent`, and queries over `agent.*` metadata
 - Signed changesets (author keys)
 - Review service with semantic approval rules (for example, comment-only changes auto-approve) and per-directory owners
