@@ -4,9 +4,9 @@ Milestones are ordered. Each one should leave `main` releasable.
 
 ## v0.1: Core loop (in progress)
 - [x] Core data model, storage traits, API types (`leep-core`)
-- [ ] Blob backends: filesystem, S3/MinIO, LRU cache (`leep-store`)
-- [ ] Metadata backends: SQLite, Postgres (`leep-meta`)
-- [ ] Derived data and operations: tree, generation, skiplist, diff, log, blame, merge, rebase, land (`leep-derive`)
+- [x] Blob backends: filesystem, S3/MinIO, LRU cache (`leep-store`)
+- [x] Metadata backends: SQLite, Postgres (`leep-meta`)
+- [x] Derived data and operations: tree, generation, skiplist, diff, log, blame, merge, rebase, land (`leep-derive`)
 - [ ] HTTP server (`leep-server`)
 - [ ] CLI with lazy sparse checkouts (`leep-cli`)
 - [ ] Git import and export (`leep-git`)
