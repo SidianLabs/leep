@@ -247,6 +247,8 @@ mod tests {
         assert!(!needs_write(&Method::GET, "/v1/refs"));
         assert!(!needs_write(&Method::POST, "/v1/blobs/missing"));
         assert!(needs_write(&Method::POST, "/v1/land"));
+        assert!(needs_write(&Method::POST, "/v1/changesets/abc/signatures"));
+        assert!(!needs_write(&Method::GET, "/v1/changesets/abc/signatures"));
         assert!(needs_write(&Method::PUT, "/v1/blobs/x"));
         assert!(needs_write(&Method::DELETE, "/v1/refs/main"));
     }

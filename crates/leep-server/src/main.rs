@@ -8,6 +8,7 @@ use clap::{Parser, Subcommand};
 use leep_core::BlobStore;
 use leep_derive::Repo;
 use leep_server::auth::{self, Auth, Role};
+use leep_server::signing::{RequireSignatures, SigningKeys};
 use leep_store::CachedBlobStore;
 use tracing_subscriber::EnvFilter;
 
@@ -43,6 +44,15 @@ struct Args {
     /// at startup.
     #[arg(long, env = "LEEP_TOKENS_FILE")]
     tokens_file: Option<std::path::PathBuf>,
+    /// JSON file of trusted Ed25519 author keys (`ed25519:<hex>`); enables
+    /// `POST /v1/changesets/{id}/signatures`. Read once at startup.
+    #[arg(long, env = "LEEP_SIGNING_KEYS_FILE")]
+    signing_keys_file: Option<std::path::PathBuf>,
+    /// Refuse to land onto this ref unless every changeset it would add is
+    /// signed by a trusted key. Repeatable; the environment variable takes a
+    /// comma-separated list. Needs --signing-keys-file.
+    #[arg(long, env = "LEEP_REQUIRE_SIGNATURES", value_delimiter = ',')]
+    require_signatures: Vec<String>,
     /// Serve Prometheus metrics on this address (`GET /metrics`, no auth, keep
     /// it private). Off when unset.
     #[arg(long, env = "LEEP_METRICS_LISTEN")]
@@ -227,6 +237,17 @@ async fn main() -> anyhow::Result<()> {
             None
         }
     };
+    let signing = match &args.signing_keys_file {
+        Some(path) => {
+            let k = SigningKeys::from_file(path).map_err(anyhow::Error::msg)?;
+            tracing::info!(keys = k.len(), "signature verification enabled");
+            Some(Arc::new(k))
+        }
+        None if !args.require_signatures.is_empty() => {
+            anyhow::bail!("--require-signatures needs --signing-keys-file")
+        }
+        None => None,
+    };
     ensure_local_dirs(&args.meta, &args.blobs)?;
 
     let mut blobs = leep_store::open_blob_store(&args.blobs).context("opening blob store")?;
@@ -237,7 +258,15 @@ async fn main() -> anyhow::Result<()> {
     let meta = leep_meta::open_meta_store(&args.meta)
         .await
         .context("opening meta store")?;
-    let app = leep_server::router_with_auth(Repo::new(blobs, meta), args.max_body_bytes, auth);
+    let mut repo = Repo::new(blobs, meta);
+    if let (Some(keys), false) = (&signing, args.require_signatures.is_empty()) {
+        tracing::info!(refs = ?args.require_signatures, "signatures required to land");
+        repo = repo.with_land_policy(Arc::new(RequireSignatures::new(
+            keys.clone(),
+            args.require_signatures.clone(),
+        )));
+    }
+    let app = leep_server::router_with_signing(repo, args.max_body_bytes, auth, signing);
 
     let listener = tokio::net::TcpListener::bind(args.listen)
         .await
