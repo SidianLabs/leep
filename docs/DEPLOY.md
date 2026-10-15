@@ -96,6 +96,8 @@ Clients pass the token with `LEEP_TOKEN`, `leep --token` or
 | `LEEP_SERVER` | none | CLI only: server URL. |
 | `LEEP_TOKEN` | none | CLI only: bearer token. |
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | none | S3 credentials (standard AWS variables). |
+| `LEEP_METRICS_LISTEN` | off | Address for a separate, unauthenticated `GET /metrics` listener; keep it private. See [OPERATIONS.md](OPERATIONS.md). |
+| `LEEP_LOG_FORMAT` | `text` | `text` or `json` (one object per line). |
 | `RUST_LOG` | `info` | Log filter. |
 
 `--cache-bytes` and `--max-body-bytes` are flags only; pass them after the

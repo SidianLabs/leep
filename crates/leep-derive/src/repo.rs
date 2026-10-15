@@ -65,6 +65,11 @@ impl Repo {
                 }
                 Some(_) => {}
             }
+            // `get` may be served from a cache tier; existence must come from
+            // durable storage, which GC can change from another process.
+            if !self.blobs.contains(content).await? {
+                return Err(Error::Invalid(format!("missing blob {content} for {path}")));
+            }
         }
         let base = match cs.parents.first() {
             Some(p) => self.root_tree(*p).await?,

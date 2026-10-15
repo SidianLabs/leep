@@ -20,12 +20,18 @@ struct Args {
     /// Metadata store URL (sqlite:, postgres://, mem://).
     #[arg(
         long,
+        global = true,
         env = "LEEP_META",
         default_value = "sqlite://./leep-data/meta.db?mode=rwc"
     )]
     meta: String,
     /// Blob store URL (file://, s3://, mem://).
-    #[arg(long, env = "LEEP_BLOBS", default_value = "file://./leep-data/blobs")]
+    #[arg(
+        long,
+        global = true,
+        env = "LEEP_BLOBS",
+        default_value = "file://./leep-data/blobs"
+    )]
     blobs: String,
     /// In-memory blob cache size in bytes; 0 disables it.
     #[arg(long, default_value_t = 256 * 1024 * 1024)]
@@ -37,8 +43,21 @@ struct Args {
     /// at startup.
     #[arg(long, env = "LEEP_TOKENS_FILE")]
     tokens_file: Option<std::path::PathBuf>,
+    /// Serve Prometheus metrics on this address (`GET /metrics`, no auth, keep
+    /// it private). Off when unset.
+    #[arg(long, env = "LEEP_METRICS_LISTEN")]
+    metrics_listen: Option<SocketAddr>,
+    /// Log output format.
+    #[arg(long, env = "LEEP_LOG_FORMAT", value_enum, default_value_t = LogFormat::Text)]
+    log_format: LogFormat,
     #[command(subcommand)]
     command: Option<Cmd>,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum LogFormat {
+    Text,
+    Json,
 }
 
 #[derive(Subcommand)]
@@ -54,6 +73,39 @@ enum Cmd {
         #[arg(long)]
         role: Role,
     },
+    /// Delete blobs no changeset references (uses --meta and --blobs; safe
+    /// beside running servers because of --grace).
+    Gc {
+        /// Report what would be deleted without deleting.
+        #[arg(long)]
+        dry_run: bool,
+        /// Keep unreferenced blobs written within this long (0, 30m, 24h, 7d).
+        /// Must exceed the time clients take from upload to commit.
+        #[arg(long, default_value = "24h", value_parser = parse_grace)]
+        grace: std::time::Duration,
+    },
+}
+
+fn parse_grace(s: &str) -> Result<std::time::Duration, String> {
+    leep_derive::gc::parse_duration(s).map_err(|e| e.to_string())
+}
+
+async fn run_gc(meta: &str, blobs: &str, opts: leep_derive::gc::GcOptions) -> anyhow::Result<()> {
+    let blobs = leep_store::open_blob_store(blobs).context("opening blob store")?;
+    let meta = leep_meta::open_meta_store(meta)
+        .await
+        .context("opening meta store")?;
+    let dry = opts.dry_run;
+    let r = leep_derive::gc::run(&Repo::new(blobs, meta), &opts).await?;
+    let verb = if dry { "would delete" } else { "deleted" };
+    println!("changesets scanned: {}", r.changesets_scanned);
+    println!("referenced blobs and trees: {}", r.marked);
+    println!("blobs scanned: {}", r.blobs_scanned);
+    println!("{verb}: {} blobs, {} bytes", r.deleted, r.deleted_bytes);
+    println!("kept (within grace): {}", r.kept_by_grace);
+    println!("kept (unknown age): {}", r.kept_unknown_mtime);
+    println!("kept (recently claimed): {}", r.kept_by_claim);
+    Ok(())
 }
 
 fn run_command(cmd: Cmd) -> anyhow::Result<()> {
@@ -66,6 +118,7 @@ fn run_command(cmd: Cmd) -> anyhow::Result<()> {
             }
             println!("{}", auth::hash_token(&token));
         }
+        Cmd::Gc { .. } => unreachable!("handled in main"),
         Cmd::GenToken { name, role } => {
             let (token, entry) = auth::generate(&name, role).map_err(anyhow::Error::msg)?;
             println!("token: {token}");
@@ -93,6 +146,30 @@ fn ensure_local_dirs(meta: &str, blobs: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Install the global Prometheus recorder; returns the `/metrics` app.
+fn install_metrics() -> anyhow::Result<axum::Router> {
+    use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
+    let handle = PrometheusBuilder::new()
+        .set_buckets_for_metric(Matcher::Suffix("_seconds".into()), SECONDS_BUCKETS)?
+        .set_buckets_for_metric(Matcher::Full("leep_land_attempts".into()), ATTEMPT_BUCKETS)?
+        .install_recorder()
+        .context("installing metrics recorder")?;
+    leep_server::observe::record_build_info();
+    let upkeep = handle.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            upkeep.run_upkeep();
+        }
+    });
+    Ok(leep_server::observe::metrics_app(move || handle.render()))
+}
+
+const SECONDS_BUCKETS: &[f64] = &[
+    0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+];
+const ATTEMPT_BUCKETS: &[f64] = &[1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 24.0, 32.0];
+
 async fn shutdown_signal() {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
@@ -117,13 +194,28 @@ async fn shutdown_signal() {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
-        .init();
     let args = Args::parse();
-    if let Some(cmd) = args.command {
-        return run_command(cmd);
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
+    match args.log_format {
+        LogFormat::Text => tracing_subscriber::fmt().with_env_filter(filter).init(),
+        LogFormat::Json => tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(filter)
+            .init(),
     }
+    match args.command {
+        Some(Cmd::Gc { dry_run, grace }) => {
+            return run_gc(
+                &args.meta,
+                &args.blobs,
+                leep_derive::gc::GcOptions { grace, dry_run },
+            )
+            .await
+        }
+        Some(cmd) => return run_command(cmd),
+        None => {}
+    }
+    let metrics_app = args.metrics_listen.map(|_| install_metrics()).transpose()?;
     let auth = match &args.tokens_file {
         Some(path) => {
             let a = Auth::from_file(path).map_err(anyhow::Error::msg)?;
@@ -151,6 +243,17 @@ async fn main() -> anyhow::Result<()> {
         .await
         .with_context(|| format!("binding {}", args.listen))?;
     tracing::info!(addr = %listener.local_addr()?, "leep-server listening");
+    if let (Some(addr), Some(metrics_app)) = (args.metrics_listen, metrics_app) {
+        let l = tokio::net::TcpListener::bind(addr)
+            .await
+            .with_context(|| format!("binding metrics {addr}"))?;
+        tracing::info!(addr = %l.local_addr()?, "metrics listening on /metrics");
+        tokio::spawn(async move {
+            if let Err(e) = leep_server::serve(l, metrics_app, std::future::pending()).await {
+                tracing::error!(error = %e, "metrics listener stopped");
+            }
+        });
+    }
     leep_server::serve(listener, app, shutdown_signal()).await?;
     Ok(())
 }
@@ -172,5 +275,15 @@ impl BlobStore for ArcBlobs {
     }
     async fn contains(&self, hash: &leep_core::Hash) -> leep_core::Result<bool> {
         self.0.contains(hash).await
+    }
+    async fn list_page(
+        &self,
+        after: Option<leep_core::Hash>,
+        limit: usize,
+    ) -> leep_core::Result<Vec<leep_core::BlobMeta>> {
+        self.0.list_page(after, limit).await
+    }
+    async fn delete(&self, hash: &leep_core::Hash) -> leep_core::Result<()> {
+        self.0.delete(hash).await
     }
 }

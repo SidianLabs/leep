@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use leep_core::{BlobStore, Hash, Result};
+use futures::TryStreamExt;
+use leep_core::{BlobMeta, BlobStore, Hash, Result};
 use object_store::aws::AmazonS3Builder;
 use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
@@ -84,6 +85,54 @@ impl BlobStore for ObjectBlobStore {
         match self.store.head(&Self::key(hash)).await {
             Ok(_) => Ok(true),
             Err(object_store::Error::NotFound { .. }) => Ok(false),
+            Err(e) => Err(storage_err(e)),
+        }
+    }
+
+    /// Lists one shard prefix at a time and sorts it, because `object_store`
+    /// does not promise listing order across backends.
+    async fn list_page(&self, after: Option<Hash>, limit: usize) -> Result<Vec<BlobMeta>> {
+        let mut out = Vec::new();
+        let first_shard = after.map_or(0, |h| h.0[0]);
+        for shard in first_shard..=255u8 {
+            if out.len() >= limit {
+                break;
+            }
+            let prefix = format!("{shard:02x}");
+            let dir = Path::from(format!("blobs/{prefix}"));
+            let objects: Vec<_> = self
+                .store
+                .list(Some(&dir))
+                .try_collect()
+                .await
+                .map_err(storage_err)?;
+            let mut found = Vec::new();
+            for o in objects {
+                let Some(name) = o.location.filename() else {
+                    continue;
+                };
+                let Ok(hash) = format!("{prefix}{name}").parse::<Hash>() else {
+                    continue;
+                };
+                if after.is_some_and(|a| hash <= a) {
+                    continue;
+                }
+                found.push(BlobMeta {
+                    hash,
+                    size: o.size,
+                    modified: Some(o.last_modified.timestamp()),
+                });
+            }
+            found.sort_by_key(|m| m.hash);
+            out.extend(found);
+        }
+        out.truncate(limit);
+        Ok(out)
+    }
+
+    async fn delete(&self, hash: &Hash) -> Result<()> {
+        match self.store.delete(&Self::key(hash)).await {
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
             Err(e) => Err(storage_err(e)),
         }
     }
