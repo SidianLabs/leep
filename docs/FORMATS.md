@@ -312,3 +312,20 @@ means a new kind name (`-v2`).
 "missing blob" for it, exactly as for an absent blob. `PUT /v1/blobs/{hash}`
 may answer 408 (request timeout) or 409 (blob being collected, retry). New
 server flag `--request-timeout` / `LEEP_REQUEST_TIMEOUT`.
+
+## Request limits (additive, ADR 0020)
+
+Nothing persisted changed. On the wire, any endpoint may now answer `429` with
+a `Retry-After` header (whole seconds) and the usual `{"error": ...}` body when
+a token is over its rate or concurrency limit, and `413` with the same JSON
+body when a request body exceeds a token's `max_body` (the global limit's 413
+is unchanged). Clients should treat 429 as retryable after the delay for reads.
+The tokens file gains optional entry fields `rate` (requests per second,
+fractions allowed), `burst`, `concurrency` and `max_body` (bytes). Each is a
+number, except `rate`, `concurrency` and `max_body` also accept `"unlimited"`
+to override a server-wide default; `burst` is a whole number of at least 1 and
+needs a rate. A file without them parses as before, and unknown fields are
+still refused. New flags and variables: `--rate-limit`/`LEEP_RATE_LIMIT`,
+`--rate-burst`/`LEEP_RATE_BURST`,
+`--max-concurrent-per-token`/`LEEP_MAX_CONCURRENT_PER_TOKEN`,
+`--read-max-body-bytes`/`LEEP_READ_MAX_BODY_BYTES`.

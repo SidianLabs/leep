@@ -2,6 +2,7 @@
 //! The endpoint contract is the table in `leep_core::api`.
 
 pub mod auth;
+pub mod limits;
 pub mod observe;
 pub mod review;
 pub mod signing;
@@ -102,6 +103,28 @@ pub fn router_with_timeout(
     review: Option<Arc<review::ReviewService>>,
     request_timeout: Duration,
 ) -> Router {
+    router_with_limits(
+        repo,
+        max_body_bytes,
+        auth,
+        signing,
+        review,
+        request_timeout,
+        None,
+    )
+}
+
+/// Like [`router_with_timeout`], plus per-principal request limits (ADR 0020).
+/// Build the [`limits::Limiter`] from the same `auth` so token names match.
+pub fn router_with_limits(
+    repo: Repo,
+    max_body_bytes: usize,
+    auth: Option<auth::Auth>,
+    signing: Option<Arc<signing::SigningKeys>>,
+    review: Option<Arc<review::ReviewService>>,
+    request_timeout: Duration,
+    limits: Option<Arc<limits::Limiter>>,
+) -> Router {
     let review = review.or_else(|| {
         auth.as_ref().map(|a| {
             Arc::new(review::ReviewService::new(
@@ -145,7 +168,13 @@ pub fn router_with_timeout(
         .route("/v1/land", post(land))
         .layer(Extension(signing))
         .layer(Extension(review));
-    // Innermost, so a rejected request never has its body read.
+    // Just inside authentication, which names the principal, and still before
+    // any body is read.
+    let router = match limits {
+        Some(l) => router.layer(middleware::from_fn_with_state(l, limits::enforce)),
+        None => router,
+    };
+    // Next in, so a rejected request never has its body read.
     let router = match auth {
         Some(a) => router.layer(middleware::from_fn_with_state(
             Arc::new(a),
@@ -176,9 +205,13 @@ pub async fn serve(
     app: Router,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown)
-        .await
+    // The peer address keys anonymous request limits (ADR 0020).
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await
 }
 
 type S = State<Arc<Repo>>;

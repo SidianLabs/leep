@@ -2057,3 +2057,133 @@ fn merge_rebase_cherry_pick_and_revert_postgres() {
     let stores = Stores::with_meta(&tmp.path().join("data"), db.url.clone());
     run_merge_rebase_revert_workflow(&stores, tmp.path());
 }
+
+/// Tokens-file entry from `gen-token`, with extra limit fields merged in.
+fn limited_token(name: &str, role: &str, limits: serde_json::Value) -> (String, serde_json::Value) {
+    let (token, mut entry) = gen_token(name, role);
+    entry
+        .as_object_mut()
+        .unwrap()
+        .extend(limits.as_object().unwrap().clone());
+    (token, entry)
+}
+
+#[test]
+fn request_limits_throttle_one_token_and_the_cli_reports_it() {
+    let _g = serial();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+
+    let (hammer_t, hammer) = limited_token(
+        "hammer",
+        "write",
+        serde_json::json!({ "rate": 1, "burst": 5 }),
+    );
+    let (calm_t, calm) = limited_token("calm", "write", serde_json::json!({}));
+    let (patient_t, patient) = limited_token(
+        "patient",
+        "read",
+        serde_json::json!({ "rate": 20, "burst": 1 }),
+    );
+    let (stingy_t, stingy) = limited_token(
+        "stingy",
+        "read",
+        serde_json::json!({ "rate": 0.01, "burst": 1 }),
+    );
+    let tokens = root.join("tokens.json");
+    fs::write(
+        &tokens,
+        serde_json::json!({ "tokens": [hammer, calm, patient, stingy] }).to_string(),
+    )
+    .unwrap();
+
+    let metrics_port = free_port();
+    let metrics_listen = format!("127.0.0.1:{metrics_port}");
+    let stores = Stores::sqlite(&root.join("data"));
+    let server = Server::start_with(
+        free_port(),
+        &stores,
+        root,
+        &[
+            "--tokens-file",
+            tokens.to_str().unwrap(),
+            "--metrics-listen",
+            &metrics_listen,
+        ],
+    );
+
+    // One token hammers the server: the burst gets through, then 429s that
+    // say when to come back, in the usual JSON error shape.
+    let hammer_replies: Vec<_> = (0..40)
+        .map(|_| http_get(server.addr, "/v1/refs", Some(&hammer_t)))
+        .collect();
+    let limited: Vec<_> = hammer_replies.iter().filter(|r| r.0 == 429).collect();
+    assert!(
+        hammer_replies[..5].iter().all(|r| r.0 == 200),
+        "{hammer_replies:?}"
+    );
+    assert!(limited.len() >= 20, "only {} of 40 limited", limited.len());
+    for (_, head, body) in &limited {
+        assert!(head.contains("retry-after: 1"), "{head}");
+        let v: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert!(
+            v["error"].as_str().unwrap().contains("rate limit"),
+            "{body}"
+        );
+    }
+    // Meanwhile another token sees nothing, and neither does the health probe.
+    for _ in 0..40 {
+        assert_eq!(http_get(server.addr, "/v1/refs", Some(&calm_t)).0, 200);
+        assert_eq!(http_get(server.addr, "/v1/health", None).0, 200);
+    }
+
+    // The limits are visible in metrics, by token name and never the secret.
+    let (status, _, metrics) = http_get(metrics_listen.parse().unwrap(), "/metrics", None);
+    assert_eq!(status, 200);
+    assert!(
+        metrics
+            .lines()
+            .any(|l| l.starts_with("leep_requests_limited_total")
+                && l.contains("reason=\"rate\"")
+                && l.contains("token=\"hammer\"")),
+        "{metrics}"
+    );
+    assert!(!metrics.contains("token=\"calm\""), "{metrics}");
+    assert!(!metrics.contains(&hammer_t));
+
+    // The CLI waits out a short Retry-After on reads...
+    let client = Client::new(&server.url, &root.join("cache"));
+    let calm_user = User {
+        client: &client,
+        token: calm_t,
+    };
+    let wc = root.join("wc");
+    calm_user.ok(root, &["init", wc.to_str().unwrap()]);
+    write(&wc, "a.txt", "a\n");
+    calm_user.ok(&wc, &["commit", "-m", "seed"]);
+    calm_user.ok(&wc, &["land"]);
+    let patient_user = User {
+        client: &client,
+        token: patient_t,
+    };
+    for _ in 0..3 {
+        let out = patient_user.run(&wc, &["log"]);
+        assert_ok(&out, "log through a rate limit");
+    }
+
+    // ...and reports a long one instead of hanging.
+    let stingy_user = User {
+        client: &client,
+        token: stingy_t,
+    };
+    stingy_user.ok(&wc, &["log"]);
+    let started = std::time::Instant::now();
+    let out = stingy_user.run(&wc, &["log"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    let err = stderr(&out);
+    assert!(
+        err.contains("rate limit exceeded") && err.contains("retry after 100s"),
+        "{err}"
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+}

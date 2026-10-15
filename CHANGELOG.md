@@ -129,6 +129,17 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   only if its escape is well formed, so `//` after a stray `'\` is a comment
   again. Both made the lexer disagree with the language; it now gives up
   (so a human reviews) or reads the text as the language does.
+- Per-token request limits (ADR 0020): a token-bucket rate (`--rate-limit`,
+  `--rate-burst`), a cap on requests in flight (`--max-concurrent-per-token`)
+  and a body size cap for read tokens (`--read-max-body-bytes`), each
+  overridable per token with `rate`, `burst`, `concurrency` and `max_body` in
+  the tokens file (`"unlimited"` opts a token out). Without a tokens file the
+  limits apply per client address. Refusals are 429 with `Retry-After`, or a
+  JSON 413 for a body over a token's cap. Off unless configured. New metrics
+  `leep_requests_limited_total` and `leep_requests_in_flight`.
+- The CLI retries a rate-limited `GET` (up to 4 tries, honoring
+  `Retry-After`) and reports a wait over 10 seconds instead of sitting
+  through it.
 
 ### Project
 - Workspace version set to 0.0.1, with a CI check that keeps it below

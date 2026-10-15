@@ -49,6 +49,8 @@ measured until the response head is ready, not until the body is streamed.
 | `leep_blob_cache_misses_total` | counter | none | Blob reads that went to the durable store. |
 | `leep_blob_cache_bytes` | gauge | none | Bytes held in the cache. |
 | `leep_blob_cache_entries` | gauge | none | Blobs held in the cache. |
+| `leep_requests_limited_total` | counter | `reason` = `rate`, `concurrency`, `size`; `token` | Requests refused by a request limit (ADR 0020). `token` is the token's name, or `anonymous` for every client address when there is no tokens file. |
+| `leep_requests_in_flight` | gauge | `token` | Requests in progress, until their response body has been sent. Only tokens that have a limit are tracked. |
 | `leep_build_info` | gauge | `version` | Always 1; carries the server version. |
 
 Seconds histograms use buckets from 1 ms to 10 s; `leep_land_attempts` uses
@@ -80,7 +82,56 @@ groups:
   - alert: LeepServerErrors
     expr: sum(rate(leep_http_requests_total{status=~"5.."}[5m])) / sum(rate(leep_http_requests_total[5m])) > 0.01
     for: 5m
+  - alert: LeepTokenThrottled
+    expr: sum by (token, reason) (rate(leep_requests_limited_total[10m])) > 0.5
+    for: 15m
+    annotations: {summary: "A token is being limited steadily: a runaway agent, or a limit set too low."}
 ```
+
+## Request limits
+
+Limits are per token (ADR 0020; settings in [DEPLOY.md](DEPLOY.md#request-limits)).
+A refused request is a `429` (rate or concurrency) or `413` (size), counted in
+`leep_requests_limited_total{reason,token}` and `leep_http_requests_total`, and
+logged at DEBUG only (`RUST_LOG=leep_server=debug`), so a runaway client cannot
+flood the log. The client sees `Retry-After`, and `leep` retries a throttled
+read a few times.
+
+Tuning:
+
+- Start generous and tighten. `leep_requests_limited_total` shows who hits a
+  limit; set `--rate-limit` at about twice a token's steady rate and
+  `--rate-burst` at the largest legitimate burst. A checkout or `leep sync` of
+  a large tree makes tens to hundreds of reads in a second, so too small a
+  burst throttles ordinary use; agents making many small commits are better
+  served by a high burst than a high rate.
+- `rate` counts requests, not cost. A search or blame request costs far more
+  than a ref read; the concurrency cap, which bounds how many run at once, is
+  what protects the server from those. Pick it near the number of cores you are
+  willing to give one token. A slow upload holds its slot for the whole
+  request, up to `--request-timeout`.
+- Give a token that legitimately lands for many agents (a CI or merge bot)
+  its own entry with higher limits or `"unlimited"`, rather than raising the
+  default for everyone. `land` retries lost races itself; throttling it
+  stretches that loop.
+- Read tokens rarely need bodies above a few KiB (`POST /v1/blobs/missing` takes
+  about 70 bytes per hash), so `--read-max-body-bytes 1048576` is a safe
+  default.
+- A sustained rate of `reason="rate"` means the limit is too low or an agent is
+  in a retry loop: check the token's name against the agent. `reason="concurrency"`
+  with a low request rate means slow requests are piling up (a cold search index,
+  a slow blob store); look at `leep_http_request_duration_seconds` before raising
+  the cap. `reason="size"` is almost always a client bug.
+- State is per process and resets on restart. With several servers behind a
+  balancer each applies the whole limit, so divide the target by the number of
+  servers, and balance by token if you can.
+- Anonymous mode keys by peer address; behind a proxy that is one bucket for
+  all clients (see DEPLOY.md). The table holds 4096 addresses, idle ones are
+  evicted, and extra active clients share one entry, so memory does not grow
+  under a flood of spoofed or rotating sources.
+- Limits do not apply to `GET /v1/health` or to unauthenticated requests
+  (which fail with 401 without costing a token anything); rate-limit those at
+  the proxy.
 
 ## Ref log
 

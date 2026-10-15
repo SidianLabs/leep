@@ -2452,6 +2452,7 @@ dependencies = [
  "bytes",
  "clap",
  "ed25519-dalek",
+ "futures-util",
  "getrandom 0.3.4",
  "hex",
  "http-body-util",
