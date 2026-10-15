@@ -302,14 +302,23 @@ pub async fn export(
             .await?
             .ok_or_else(|| Error::Other("head has no git commit".into()))?,
     };
-    ts.to_thread_local()
-        .reference(
-            format!("refs/heads/{branch}"),
-            head,
-            gix::refs::transaction::PreviousValue::Any,
-            "leep-git export",
-        )
-        .map_err(gerr)?;
+    let mut g = ts.to_thread_local();
+    // Updating a ref writes a reflog entry, which needs a committer. Machines
+    // without a git identity (CI runners, containers) have none.
+    if g.committer().is_none() {
+        let mut cfg = g.config_snapshot_mut();
+        cfg.set_raw_value(gix::config::tree::Committer::NAME, "leep-git")
+            .map_err(gerr)?;
+        cfg.set_raw_value(gix::config::tree::Committer::EMAIL, "leep-git@localhost")
+            .map_err(gerr)?;
+    }
+    g.reference(
+        format!("refs/heads/{branch}"),
+        head,
+        gix::refs::transaction::PreviousValue::Any,
+        "leep-git export",
+    )
+    .map_err(gerr)?;
     report.head = Some(head);
     Ok(report)
 }
