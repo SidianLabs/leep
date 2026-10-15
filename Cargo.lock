@@ -2481,6 +2481,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "leep-soak"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "clap",
+ "ed25519-dalek",
+ "hex",
+ "leep-core",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tokio",
+]
+
+[[package]]
 name = "leep-store"
 version = "0.0.1"
 dependencies = [
