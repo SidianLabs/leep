@@ -15,6 +15,7 @@ mod history;
 mod land;
 mod merge;
 mod repo;
+mod signatures;
 mod tree_ops;
 
 #[cfg(test)]
@@ -22,3 +23,4 @@ mod tests;
 
 pub use history::{ExtraMatch, LogFilter};
 pub use repo::Repo;
+pub use signatures::{LandPolicy, REBASED_ORIGIN_KIND};

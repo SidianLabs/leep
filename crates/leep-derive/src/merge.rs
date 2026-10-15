@@ -295,6 +295,7 @@ impl Repo {
                 extra,
             })
             .await?;
+        self.record_rebase(id, cs).await?;
         Ok(RebaseResponse::Rebased { id })
     }
 }

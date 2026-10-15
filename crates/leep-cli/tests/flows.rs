@@ -465,3 +465,147 @@ fn provenance_queries_reach_the_server_and_decode() {
     let rows = history::blame_lines(&b, true);
     assert!(rows[0].contains("robot m1"), "{}", rows[0]);
 }
+
+mod signing {
+    use std::os::unix::fs::PermissionsExt;
+
+    use ed25519_dalek::{Signature, VerifyingKey};
+    use leep_cli::sign::AuthorKey;
+    use leep_core::api::SignaturesResponse;
+    use leep_core::signature::{parse_public_key, parse_signature_hex, signing_message};
+
+    use super::*;
+
+    fn make_key(dir: &Path) -> (std::path::PathBuf, AuthorKey) {
+        let path = dir.join("author.key");
+        let key = AuthorKey::generate().unwrap();
+        key.save(&path).unwrap();
+        (path, key)
+    }
+
+    fn assert_valid(req: &leep_core::api::AddSignatureRequest, id: leep_core::ChangesetId) {
+        let vk = VerifyingKey::from_bytes(&parse_public_key(&req.public_key).unwrap()).unwrap();
+        let sig = Signature::from_bytes(&parse_signature_hex(&req.signature).unwrap());
+        vk.verify_strict(&signing_message(&id), &sig)
+            .expect("server-side verification of the posted signature");
+    }
+
+    #[test]
+    fn commit_sign_posts_a_signature_the_server_can_verify() {
+        let mock = Mock::start();
+        let (wc_dir, cache, keys) = (
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+        );
+        let (keyfile, key) = make_key(keys.path());
+        let mut ctx = init_wc(&mock, wc_dir.path(), cache.path(), &[]).unwrap();
+
+        write(&ctx, "a.txt", "one\n");
+        let mut args = commit_args("unsigned");
+        assert_eq!(commit::run(&mut ctx, &args).unwrap(), 0);
+        assert!(mock.data.lock().unwrap().signatures.is_empty());
+
+        write(&ctx, "a.txt", "two\n");
+        args = commit_args("signed");
+        args.sign = Some(keyfile);
+        assert_eq!(commit::run(&mut ctx, &args).unwrap(), 0);
+        let id = ctx.wc.state.base.unwrap();
+        let d = mock.data.lock().unwrap();
+        assert_eq!(d.signatures.len(), 1);
+        let (signed_id, req) = &d.signatures[0];
+        assert_eq!(*signed_id, id);
+        assert_eq!(req.public_key, key.public_key());
+        assert_valid(req, id);
+    }
+
+    #[test]
+    fn unusable_key_fails_before_anything_is_uploaded() {
+        let mock = Mock::start();
+        let (wc_dir, cache, keys) = (
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+        );
+        let (keyfile, _) = make_key(keys.path());
+        std::fs::set_permissions(&keyfile, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let mut ctx = init_wc(&mock, wc_dir.path(), cache.path(), &[]).unwrap();
+        write(&ctx, "a.txt", "one\n");
+        let mut args = commit_args("x");
+        args.sign = Some(keyfile);
+        let e = commit::run(&mut ctx, &args).unwrap_err();
+        assert!(e.to_string().contains("too open"), "{e}");
+        let d = mock.data.lock().unwrap();
+        assert!(d.puts.is_empty() && d.changesets.is_empty());
+        assert!(ctx.wc.state.base.is_none());
+    }
+
+    #[test]
+    fn land_onto_a_signature_required_ref_explains_what_to_do() {
+        let mock = Mock::start();
+        mock.data
+            .lock()
+            .unwrap()
+            .require_signed
+            .insert("main".into());
+        let (wc_dir, cache, keys) = (
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+        );
+        let (keyfile, _) = make_key(keys.path());
+        let mut ctx = init_wc(&mock, wc_dir.path(), cache.path(), &[]).unwrap();
+
+        write(&ctx, "a.txt", "one\n");
+        commit::run(&mut ctx, &commit_args("unsigned")).unwrap();
+        let e = land::run(&mut ctx, &LandArgs { target_ref: None }).unwrap_err();
+        let msg = e.to_string();
+        assert!(msg.contains("is not signed by a trusted key"), "{msg}");
+        assert!(msg.contains("leep commit --sign"), "{msg}");
+        assert_eq!(e.exit_code(), 1);
+        assert!(!mock.data.lock().unwrap().refs.contains_key("main"));
+
+        write(&ctx, "a.txt", "two\n");
+        let mut args = commit_args("signed");
+        args.sign = Some(keyfile);
+        commit::run(&mut ctx, &args).unwrap();
+        assert_eq!(
+            land::run(&mut ctx, &LandArgs { target_ref: None }).unwrap(),
+            0
+        );
+        assert_eq!(
+            mock.data.lock().unwrap().refs["main"],
+            ctx.wc.state.base.unwrap()
+        );
+    }
+
+    #[test]
+    fn show_lines_name_signers_and_flag_problems() {
+        use leep_core::api::SignatureInfo;
+        let info = |n: &str| SignatureInfo {
+            key_id: "0123456789abcdef".into(),
+            name: n.into(),
+            public_key: "ed25519:00".into(),
+        };
+        let mut r = SignaturesResponse {
+            signatures: vec![],
+            verified: true,
+            via: None,
+        };
+        assert!(history::signature_lines(&r).is_empty());
+        r.signatures = vec![info("alice"), info("bob")];
+        assert_eq!(
+            history::signature_lines(&r),
+            [
+                "Signed-by: alice (key 0123456789abcdef)",
+                "Signed-by: bob (key 0123456789abcdef)"
+            ]
+        );
+        let via = leep_core::ChangesetId(Hash::of_blob(b"orig"));
+        r.via = Some(via);
+        r.verified = false;
+        let lines = history::signature_lines(&r);
+        assert!(lines[2].contains(&via.to_string()), "{lines:?}");
+        assert!(lines[3].contains("failed to verify"), "{lines:?}");
+    }
+}

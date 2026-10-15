@@ -3,7 +3,7 @@
 use std::io::Write;
 
 use clap::Args;
-use leep_core::api::{BlameResponse, ChangesetInfo, ProvenanceResponse};
+use leep_core::api::{BlameResponse, ChangesetInfo, ProvenanceResponse, SignaturesResponse};
 use leep_core::changeset::{EXTRA_AGENT_MODEL, EXTRA_AGENT_SESSION};
 
 use super::{print_json, Remote};
@@ -145,6 +145,12 @@ pub fn show(r: &Remote, args: &ShowArgs) -> Result<i32> {
         println!("parent {p}");
     }
     header(&info);
+    // Older servers lack the endpoint; a changeset is still worth showing.
+    if let Ok(sigs) = r.client.signatures(&id) {
+        for line in signature_lines(&sigs) {
+            println!("{line}");
+        }
+    }
     println!();
     // Ask the server so additions and modifications are told apart.
     let parent = info.changeset.parents.first().copied();
@@ -157,6 +163,22 @@ pub fn show(r: &Remote, args: &ShowArgs) -> Result<i32> {
         println!("{letter} {}", e.path);
     }
     Ok(0)
+}
+
+/// `Signed-by` lines for `leep show`, one per trusted signer.
+pub fn signature_lines(resp: &SignaturesResponse) -> Vec<String> {
+    let mut out: Vec<String> = resp
+        .signatures
+        .iter()
+        .map(|s| format!("Signed-by: {} (key {})", s.name, s.key_id))
+        .collect();
+    if let (Some(via), false) = (resp.via, out.is_empty()) {
+        out.push(format!("Signed-via: rebased from {via}"));
+    }
+    if !resp.verified {
+        out.push("Signed-warning: a stored signature failed to verify".into());
+    }
+    out
 }
 
 pub fn cat(r: &Remote, args: &CatArgs) -> Result<i32> {

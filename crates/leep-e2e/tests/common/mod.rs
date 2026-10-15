@@ -79,6 +79,11 @@ impl Server {
     }
 
     pub fn start_on(port: u16, stores: &Stores, log_dir: &Path) -> Server {
+        Self::start_with(port, stores, log_dir, &[])
+    }
+
+    /// Start with extra `leep-server` arguments (for example signing flags).
+    pub fn start_with(port: u16, stores: &Stores, log_dir: &Path, extra: &[&str]) -> Server {
         let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
         let log = log_dir.join(format!("server-{port}-{}.log", std::process::id()));
         let out = fs::File::create(&log).unwrap();
@@ -86,6 +91,7 @@ impl Server {
         let child = Command::new(bin("leep-server"))
             .args(["--listen", &addr.to_string()])
             .args(["--meta", &stores.meta, "--blobs", &stores.blobs])
+            .args(extra)
             .env("RUST_LOG", "warn")
             .stdin(Stdio::null())
             .stdout(out)
@@ -180,7 +186,8 @@ impl Client {
             .env_remove("LEEP_AGENT_MODEL")
             .env_remove("LEEP_AGENT_SESSION")
             .env_remove("LEEP_AGENT_PROMPT")
-            .env_remove("LEEP_AGENT_TESTS");
+            .env_remove("LEEP_AGENT_TESTS")
+            .env_remove("LEEP_SIGNING_KEY");
         c
     }
 

@@ -21,6 +21,8 @@
 //! | GET  | `/v1/blame/{id}?path=p` | – | [`BlameResponse`] (with per-changeset [`ChangesetSummary`]) |
 //! | GET  | `/v1/provenance/{id}?path=prefix&limit=n` | – | [`ProvenanceResponse`] (who and what made the changesets reachable from `id`; `limit` defaults to 10000, capped at 10000) |
 //! | GET  | `/v1/merge-base?a=x&b=y` | – | [`MergeBaseResponse`] |
+//! | POST | `/v1/changesets/{id}/signatures` | [`AddSignatureRequest`] | [`AddSignatureResponse`] (400 if the signature is bad or the key is not trusted; 404 if the changeset is unknown) |
+//! | GET  | `/v1/changesets/{id}/signatures` | – | [`SignaturesResponse`] (trusted signatures, re-verified on read) |
 //! | POST | `/v1/merge` | [`MergeRequest`] | [`MergeResponse`] |
 //! | POST | `/v1/rebase` | [`RebaseRequest`] | [`RebaseResponse`] |
 //! | POST | `/v1/land` | [`LandRequest`] | [`LandResponse`] |
@@ -43,6 +45,17 @@
 //! `write` token may call everything. A server without a tokens file accepts
 //! all requests and ignores the header. Both failures use [`ErrorResponse`].
 //! This adds behavior only; no type or path changed (FORMATS.md, rule 4).
+//! Adding a signature is a `POST`, so it needs a `write` token; listing is a
+//! `GET`.
+//!
+//! # Signatures
+//!
+//! A signature attests to a changeset id and is stored beside the changeset
+//! (ADR 0010). The signed bytes are [`crate::signature::signing_message`]. The
+//! server accepts only keys listed in its signing keys file. Servers started
+//! with `--require-signatures REF` answer `POST /v1/land` onto `REF` with 400
+//! (`changeset X is not signed by a trusted key`) unless every changeset the
+//! land would add to the ref is signed.
 
 use std::collections::BTreeMap;
 
@@ -78,6 +91,43 @@ pub struct ChangesetInfo {
     /// Length of the longest parent chain to a root; roots are 1.
     pub generation: u64,
     pub root_tree: Hash,
+}
+
+/// Attest to a changeset. Both fields are text so the body is easy to build
+/// with any tool: the key as `ed25519:<64 hex>`, the signature as 128 hex.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AddSignatureRequest {
+    pub public_key: String,
+    pub signature: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AddSignatureResponse {
+    pub key_id: String,
+    /// The name the key has in the server's signing keys file.
+    pub name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignatureInfo {
+    pub key_id: String,
+    pub name: String,
+    /// `ed25519:<64 hex>`.
+    pub public_key: String,
+}
+
+/// Trusted signatures of one changeset.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignaturesResponse {
+    pub signatures: Vec<SignatureInfo>,
+    /// True when every stored signature verified on this read. One that does
+    /// not (a corrupted row) is left out of `signatures` and clears this.
+    pub verified: bool,
+    /// Set when the changeset has no signature of its own but is a server-made
+    /// rebased copy of this one, whose `signatures` are reported instead.
+    /// Informational: `land` policy never accepts a copy on this basis.
+    #[serde(default)]
+    pub via: Option<ChangesetId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -336,6 +386,14 @@ mod tests {
         let req: LandRequest =
             serde_json::from_value(serde_json::json!({ "changeset": id.to_string() })).unwrap();
         assert_eq!(req.target_ref, "main");
+    }
+
+    #[test]
+    fn signatures_response_without_via_parses() {
+        let v: SignaturesResponse =
+            serde_json::from_value(serde_json::json!({ "signatures": [], "verified": true }))
+                .unwrap();
+        assert_eq!(v.via, None);
     }
 
     #[test]

@@ -75,6 +75,19 @@ token, `leep land` fails with `token lacks write access`; with none, commands
 fail with `authentication required: set LEEP_TOKEN`.
 <!-- END with-authentication -->
 
+## With signed changesets
+
+```sh
+leep keygen --out /tmp/leep/alice.key --name alice     # prints {"name":..,"public_key":"ed25519:.."}
+echo '{"keys":[ <that line> ]}' > /tmp/leep/keys.json
+cargo run -p leep-server -- --signing-keys-file /tmp/leep/keys.json --require-signatures main ...
+```
+Then `leep commit -m x && leep land` fails with `changeset ... is not signed by a
+trusted key`, while `leep commit -m x --sign /tmp/leep/alice.key && leep land`
+works (`LEEP_SIGNING_KEY=/tmp/leep/alice.key` is the same as `--sign`). `leep
+show main` lists `Signed-by:`. The whole unlanded stack must be signed, so
+sign every commit you land. See ADR 0010.
+
 ## Clean up
 
 Stop the server, run `pg_ctl stop` if you started Postgres, and `rm -rf /tmp/leep`.

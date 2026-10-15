@@ -563,3 +563,104 @@ fn server_restart_preserves_state() {
     assert_eq!(log["entries"].as_array().unwrap().len(), 2);
     drop(server);
 }
+
+#[test]
+fn signed_changesets_gate_landing_on_a_protected_ref() {
+    let _g = serial();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let client = Client::new("http://127.0.0.1:1", &root.join("cache"));
+
+    // `leep keygen` needs no server: it writes a 0600 key and prints the
+    // entry for the server's keys file.
+    let keyfile = root.join("alice.key");
+    let out = client.ok(
+        root,
+        &[
+            "keygen",
+            "--out",
+            keyfile.to_str().unwrap(),
+            "--name",
+            "alice",
+        ],
+    );
+    assert_eq!(
+        fs::metadata(&keyfile).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let entry: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(entry["name"], "alice");
+    assert!(entry["public_key"]
+        .as_str()
+        .unwrap()
+        .starts_with("ed25519:"));
+    let keys = root.join("keys.json");
+    fs::write(&keys, serde_json::json!({ "keys": [entry] }).to_string()).unwrap();
+
+    let stores = Stores::sqlite(&root.join("data"));
+    let server = Server::start_with(
+        free_port(),
+        &stores,
+        root,
+        &[
+            "--signing-keys-file",
+            keys.to_str().unwrap(),
+            "--require-signatures",
+            "main",
+        ],
+    );
+    let client = Client::new(&server.url, &root.join("cache"));
+
+    let wc = root.join("wc");
+    client.ok(root, &["init", wc.to_str().unwrap()]);
+    write(&wc, "a.txt", "unsigned\n");
+    client.ok(&wc, &["commit", "-m", "unsigned"]);
+    let out = client.run(&wc, &["land"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    let err = stderr(&out);
+    assert!(err.contains("is not signed by a trusted key"), "{err}");
+    assert!(err.contains("leep commit --sign"), "{err}");
+    assert_eq!(client.json(&wc, &["refs"])["refs"], serde_json::json!({}));
+
+    // A signed tip does not launder an unsigned changeset beneath it.
+    write(&wc, "b.txt", "signed on top\n");
+    client.ok(
+        &wc,
+        &[
+            "commit",
+            "-m",
+            "signed tip",
+            "--sign",
+            keyfile.to_str().unwrap(),
+        ],
+    );
+    let out = client.run(&wc, &["land"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stderr(&out).contains("is not signed by a trusted key"));
+
+    // A fresh working copy where every changeset is signed lands.
+    let wc2 = root.join("wc2");
+    client.ok(root, &["init", wc2.to_str().unwrap()]);
+    write(&wc2, "c.txt", "all signed\n");
+    let mut cmd = client.cmd(&wc2);
+    cmd.args(["commit", "-m", "signed"])
+        .env("LEEP_SIGNING_KEY", &keyfile);
+    let out = cmd.output().unwrap();
+    assert_ok(&out, "leep commit with LEEP_SIGNING_KEY");
+    assert!(stderr(&out).contains("signed as alice"), "{}", stderr(&out));
+    let landed = client.ok(&wc2, &["land"]);
+    assert!(landed.contains("Landed"), "{landed}");
+
+    let shown = client.ok(&wc2, &["show", "main"]);
+    assert!(shown.contains("Signed-by: alice (key "), "{shown}");
+    // The unsigned history never reached main.
+    let log = client.ok(&wc2, &["log", "main"]);
+    assert!(!log.contains("unsigned"), "{log}");
+    assert_eq!(
+        client.json(&wc2, &["log", "main"])["entries"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}

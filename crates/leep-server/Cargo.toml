@@ -18,6 +18,8 @@ leep-store.workspace = true
 anyhow.workspace = true
 blake3.workspace = true
 hex.workspace = true
+ed25519-dalek.workspace = true
+getrandom.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 serde.workspace = true
@@ -27,7 +29,6 @@ tracing.workspace = true
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
 axum = "0.8"
-getrandom = "0.3"
 subtle = "2"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "limit"] }
@@ -38,3 +39,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 http-body-util = "0.1"
 reqwest = { version = "0.12", default-features = false }
 tempfile = "3"
+bytes.workspace = true

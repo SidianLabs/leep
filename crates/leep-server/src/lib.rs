@@ -3,6 +3,7 @@
 
 pub mod auth;
 pub mod observe;
+pub mod signing;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -13,7 +14,7 @@ use axum::http::{header, HeaderValue, StatusCode};
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use leep_core::api::*;
 use leep_core::{Changeset, ChangesetId, Error, FileKind, Hash, RepoPath};
 use leep_derive::{ExtraMatch, LogFilter, Repo};
@@ -43,12 +44,28 @@ pub fn router_with_limit(repo: Repo, max_body_bytes: usize) -> Router {
 /// Build the router; with `Some(auth)` every endpoint except `GET /v1/health`
 /// requires a bearer token. `None` leaves the API open.
 pub fn router_with_auth(repo: Repo, max_body_bytes: usize, auth: Option<auth::Auth>) -> Router {
+    router_with_signing(repo, max_body_bytes, auth, None)
+}
+
+/// Like [`router_with_auth`], plus the trusted keys that
+/// `POST /v1/changesets/{id}/signatures` accepts. Without keys, adding a
+/// signature is a 400. The land policy is set on `repo`, not here.
+pub fn router_with_signing(
+    repo: Repo,
+    max_body_bytes: usize,
+    auth: Option<auth::Auth>,
+    signing: Option<Arc<signing::SigningKeys>>,
+) -> Router {
     let router = Router::new()
         .route("/v1/health", get(health))
         .route("/v1/blobs/missing", post(missing_blobs))
         .route("/v1/blobs/{hash}", get(get_blob).put(put_blob))
         .route("/v1/changesets", post(create_changeset))
         .route("/v1/changesets/{id}", get(get_changeset))
+        .route(
+            "/v1/changesets/{id}/signatures",
+            get(get_signatures).post(add_signature),
+        )
         .route("/v1/refs", get(list_refs))
         .route("/v1/refs/{*name}", get(get_ref).post(cas_ref))
         .route("/v1/resolve/{*rev}", get(resolve))
@@ -62,7 +79,8 @@ pub fn router_with_auth(repo: Repo, max_body_bytes: usize, auth: Option<auth::Au
         .route("/v1/merge-base", get(merge_base))
         .route("/v1/merge", post(merge))
         .route("/v1/rebase", post(rebase))
-        .route("/v1/land", post(land));
+        .route("/v1/land", post(land))
+        .layer(Extension(signing));
     // Innermost, so a rejected request never has its body read.
     let router = match auth {
         Some(a) => router.layer(middleware::from_fn_with_state(
@@ -251,6 +269,54 @@ async fn get_changeset(State(repo): S, Path(id): Path<String>) -> ApiResult<Json
     Ok(Json(repo.info(cid(&id)?).await?))
 }
 
+type Keys = Extension<Option<Arc<signing::SigningKeys>>>;
+
+async fn add_signature(
+    State(repo): S,
+    Extension(keys): Keys,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> ApiResult<Json<AddSignatureResponse>> {
+    let id = cid(&id)?;
+    let req: AddSignatureRequest = parse_json(&body)?;
+    repo.get_changeset(id).await?;
+    let keys = keys.ok_or_else(|| {
+        Error::Invalid("this server has no signing keys configured (--signing-keys-file)".into())
+    })?;
+    let public_key = leep_core::signature::parse_public_key(&req.public_key)?;
+    let sig = leep_core::signature::parse_signature_hex(&req.signature)?;
+    let key = keys.find(&public_key).ok_or_else(|| {
+        Error::Invalid(format!(
+            "key {} is not trusted by this server",
+            leep_core::signature::key_id(&public_key)
+        ))
+    })?;
+    signing::SigningKeys::verify(key, &id, &sig)?;
+    repo.put_signature(id, &signing::stored(key, sig)).await?;
+    Ok(Json(AddSignatureResponse {
+        key_id: key.key_id.clone(),
+        name: key.name.clone(),
+    }))
+}
+
+async fn get_signatures(
+    State(repo): S,
+    Extension(keys): Keys,
+    Path(id): Path<String>,
+) -> ApiResult<Json<SignaturesResponse>> {
+    let id = cid(&id)?;
+    repo.get_changeset(id).await?;
+    let resp = match keys {
+        Some(k) => k.describe(&repo, id).await?,
+        None => SignaturesResponse {
+            signatures: vec![],
+            verified: true,
+            via: None,
+        },
+    };
+    Ok(Json(resp))
+}
+
 async fn list_refs(State(repo): S) -> ApiResult<Json<RefsResponse>> {
     let refs: BTreeMap<_, _> = repo.meta().list_refs().await?;
     Ok(Json(RefsResponse { refs }))
@@ -263,7 +329,7 @@ async fn get_ref(State(repo): S, Path(name): Path<String>) -> ApiResult<Json<Ref
 
 async fn cas_ref(State(repo): S, Path(name): Path<String>, body: Bytes) -> ApiResult<Response> {
     let req: CasRefRequest = parse_json(&body)?;
-    let won = repo.meta().cas_ref(&name, req.expected, req.new).await?;
+    let won = repo.cas_ref_checked(&name, req.expected, req.new).await?;
     let current = repo.meta().get_ref(&name).await?;
     let status = if won {
         StatusCode::OK

@@ -151,6 +151,26 @@ impl Client {
         self.json(self.http.get(self.url(&format!("/v1/changesets/{id}"))))
     }
 
+    /// Attest to a changeset with an already-signed request.
+    pub fn add_signature(
+        &self,
+        id: &ChangesetId,
+        req: &AddSignatureRequest,
+    ) -> Result<AddSignatureResponse> {
+        self.json(
+            self.http
+                .post(self.url(&format!("/v1/changesets/{id}/signatures")))
+                .json(req),
+        )
+    }
+
+    pub fn signatures(&self, id: &ChangesetId) -> Result<SignaturesResponse> {
+        self.json(
+            self.http
+                .get(self.url(&format!("/v1/changesets/{id}/signatures"))),
+        )
+    }
+
     pub fn refs(&self) -> Result<RefsResponse> {
         self.json(self.http.get(self.url("/v1/refs")))
     }

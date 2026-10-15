@@ -130,6 +130,7 @@ changeset, and concurrent servers that race produce identical bytes.
 | `root_tree` | 32-byte tree hash. Applies `changes` to `parents[0]`'s tree, rewriting only the directories on changed paths and pruning empty ones | everything |
 | `generation` | `1 + max(parents)`; roots = 1 | log ordering, ancestry |
 | `skiplist` | power-of-two first-parent ancestors | `is_ancestor`, `merge_base` |
+| `signature-v1` / `rebased-origin-v1` | attestations and server rebase links, keyed per (changeset, key) and per copy; not pure functions of the changeset, so written by `put_signature` and `rebase` rather than derived | signed-changeset listing and the land policy |
 | `last_merge-v1` | generation of the nearest merge on the first-parent chain (0 if none) | lets `merge_base` answer from skiplists when no merge sits above the first-parent common ancestor |
 | `blame` | per (changeset, path), keyed `Hash::of_object("blame", id‖path)` | blame |
 
@@ -253,9 +254,27 @@ front of the server; bearer tokens are otherwise visible on the wire.
 
 The CLI reads the token from `--token`, `LEEP_TOKEN`, or `.leep/config.json`.
 
+**Signed changesets** ([ADR 0010](adr/0010-signed-changesets.md)). A changeset's
+id covers its whole encoding, so a signature cannot live inside it. Ed25519
+signatures over `b"leep-changeset-signature-v1\0" ‖ id` are stored as
+attestations beside the changeset (derived kind `signature-v1`, one row per
+changeset and key), and `Changeset` is unchanged. `leep-server
+--signing-keys-file <PATH>` (or `LEEP_SIGNING_KEYS_FILE`) lists trusted keys as
+`{name, public_key: "ed25519:<hex>"}`, read at startup only; signatures by
+other keys are refused at `POST /v1/changesets/{id}/signatures` (write token),
+and `GET` re-verifies what it lists. `--require-signatures <REF>` (repeatable,
+`LEEP_REQUIRE_SIGNATURES`) makes `land` onto that ref fail with 400 unless every
+changeset the land adds to the ref, including each unlanded stack entry and
+merged side branch, is signed by a trusted key. The policy checks the
+originals the client submitted; the rebased copies the server creates carry
+no signature of their own and are linked to their originals by a server-written
+`rebased-origin-v1` row, which `GET` reports as `via`. The hook is
+`leep-derive`'s `LandPolicy`; the key handling lives in `leep-server`. `leep
+keygen` and `leep commit --sign` are the client side. Raw ref CAS over HTTP is
+gated the same way; the offline git bridge is not.
+
 Planned: OIDC or mTLS, per-directory ACLs evaluated against changeset paths,
-and signed changesets (author key in `extra`) for agent provenance. See the
-roadmap.
+per-path signing policy and key rotation. See the roadmap.
 
 ## 11. Scaling path
 

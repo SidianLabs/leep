@@ -10,5 +10,6 @@ pub mod commands;
 pub mod error;
 pub mod fmt;
 pub mod materialize;
+pub mod sign;
 pub mod state;
 pub mod status;

@@ -25,6 +25,11 @@ pub struct Data {
     pub puts: Vec<Hash>,
     /// `(path, raw query string)` of every log, blame and provenance request.
     pub queries: Vec<(String, String)>,
+    /// Every signature request received, with the changeset it was posted to.
+    pub signatures: Vec<(ChangesetId, AddSignatureRequest)>,
+    /// Refs that refuse to land a changeset without a recorded signature,
+    /// like a server started with `--require-signatures`.
+    pub require_signed: HashSet<String>,
 }
 
 pub type Shared = Arc<Mutex<Data>>;
@@ -123,6 +128,10 @@ impl Mock {
             .route("/v1/blobs/missing", post(missing))
             .route("/v1/blobs/{hash}", put(put_blob).get(get_blob))
             .route("/v1/changesets", post(create))
+            .route(
+                "/v1/changesets/{id}/signatures",
+                post(add_signature).get(list_signatures),
+            )
             .route("/v1/refs/{*name}", get(get_ref))
             .route("/v1/resolve/{*rev}", get(resolve))
             .route("/v1/files/{id}", get(files))
@@ -267,6 +276,50 @@ async fn create(
     Ok(Json(CreateChangesetResponse { id }))
 }
 
+/// Records the request; the tests verify the signature themselves.
+async fn add_signature(
+    State(s): State<Shared>,
+    Path(id): Path<String>,
+    Json(req): Json<AddSignatureRequest>,
+) -> Resp<AddSignatureResponse> {
+    let id: ChangesetId = id
+        .parse()
+        .map_err(|_| err(StatusCode::BAD_REQUEST, "bad id"))?;
+    let mut d = s.lock().unwrap();
+    if !d.changesets.contains_key(&id) {
+        return Err(err(StatusCode::NOT_FOUND, "no such changeset"));
+    }
+    d.signatures.push((id, req));
+    Ok(Json(AddSignatureResponse {
+        key_id: "mockkey".into(),
+        name: "mock".into(),
+    }))
+}
+
+async fn list_signatures(
+    State(s): State<Shared>,
+    Path(id): Path<String>,
+) -> Resp<SignaturesResponse> {
+    let id: ChangesetId = id
+        .parse()
+        .map_err(|_| err(StatusCode::BAD_REQUEST, "bad id"))?;
+    let d = s.lock().unwrap();
+    Ok(Json(SignaturesResponse {
+        signatures: d
+            .signatures
+            .iter()
+            .filter(|(c, _)| *c == id)
+            .map(|(_, r)| SignatureInfo {
+                key_id: "mockkey".into(),
+                name: "mock".into(),
+                public_key: r.public_key.clone(),
+            })
+            .collect(),
+        verified: true,
+        via: None,
+    }))
+}
+
 async fn get_ref(State(s): State<Shared>, Path(name): Path<String>) -> Json<RefResponse> {
     let target = s.lock().unwrap().refs.get(&name).copied();
     Json(RefResponse { name, target })
@@ -312,6 +365,14 @@ async fn land(State(s): State<Shared>, Json(r): Json<LandRequest>) -> Resp<LandR
         .get(&r.changeset)
         .cloned()
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "no such changeset"))?;
+    if d.require_signed.contains(&r.target_ref)
+        && !d.signatures.iter().any(|(c, _)| *c == r.changeset)
+    {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            &format!("changeset {} is not signed by a trusted key", r.changeset),
+        ));
+    }
     let head = d.refs.get(&r.target_ref).copied();
     let parent = cs.parents.first().copied();
     let Some(head) = head.filter(|h| Some(*h) != parent) else {
