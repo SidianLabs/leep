@@ -121,6 +121,13 @@ enum Cmd {
         #[arg(long, global = true)]
         unsafe_no_fence: bool,
     },
+    /// Compute the code search index (trigram rows) for a revision, so the
+    /// first `leep search` on it is fast. Uses --meta and --blobs; safe beside
+    /// running servers, and cheap to repeat: only missing rows are computed.
+    DeriveSearch {
+        /// Ref name or full changeset id.
+        rev: String,
+    },
 }
 
 #[derive(Subcommand, Clone, Copy)]
@@ -183,6 +190,22 @@ async fn run_gc(
     Ok(())
 }
 
+async fn run_derive_search(meta: &str, blobs: &str, rev: &str) -> anyhow::Result<()> {
+    let blobs = leep_store::open_blob_store(blobs).context("opening blob store")?;
+    let meta = leep_meta::open_meta_store(meta)
+        .await
+        .context("opening meta store")?;
+    let repo = Repo::new(blobs, meta);
+    let id = repo.resolve(rev).await?;
+    let started = std::time::Instant::now();
+    let r = repo.derive_search(id).await?;
+    println!("changeset: {id}");
+    println!("blob rows derived: {}", r.blob_rows);
+    println!("tree rows derived: {}", r.tree_rows);
+    println!("elapsed: {:.1}s", started.elapsed().as_secs_f64());
+    Ok(())
+}
+
 fn run_command(cmd: Cmd) -> anyhow::Result<()> {
     match cmd {
         Cmd::HashToken => {
@@ -193,7 +216,7 @@ fn run_command(cmd: Cmd) -> anyhow::Result<()> {
             }
             println!("{}", auth::hash_token(&token));
         }
-        Cmd::Gc { .. } => unreachable!("handled in main"),
+        Cmd::Gc { .. } | Cmd::DeriveSearch { .. } => unreachable!("handled in main"),
         Cmd::GenToken { name, role } => {
             let (token, entry) = auth::generate(&name, role).map_err(anyhow::Error::msg)?;
             println!("token: {token}");
@@ -298,6 +321,9 @@ async fn main() -> anyhow::Result<()> {
                 },
             )
             .await
+        }
+        Some(Cmd::DeriveSearch { rev }) => {
+            return run_derive_search(&args.meta, &args.blobs, &rev).await
         }
         Some(cmd) => return run_command(cmd),
         None => {}

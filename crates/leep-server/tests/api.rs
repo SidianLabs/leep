@@ -818,3 +818,119 @@ async fn log_filters_provenance_and_blame_summaries() {
     assert_eq!(bl.changesets[&b].agent["agent.model"], "m1");
     assert_eq!(bl.changesets[&b].message_first_line, "edit f");
 }
+
+#[tokio::test]
+async fn search_endpoint() {
+    let c = Client::new();
+    let a = c
+        .commit(
+            &[],
+            &[
+                (
+                    "src/a.rs",
+                    Some("fn main() {\n    println!(\"Needle\");\n}\n"),
+                ),
+                ("src/b.rs", Some("// needle needle\nlet x = 1;\n")),
+                ("docs/n.md", Some("a needle in docs\n")),
+                ("img.bin", Some("needle\0")),
+            ],
+            "a",
+        )
+        .await;
+    c.set_ref("main", a).await;
+    c.set_ref("release/1.0", a).await;
+
+    let r = c.get("/v1/search/main?q=needle").await;
+    assert_eq!(r.status, StatusCode::OK);
+    let s: SearchResponse = r.json();
+    let hits: Vec<(String, u64)> = s
+        .matches
+        .iter()
+        .map(|m| (m.path.to_string(), m.line_number))
+        .collect();
+    assert_eq!(hits, [("docs/n.md".into(), 1), ("src/b.rs".into(), 1)]);
+    assert_eq!(s.matches[1].line, "// needle needle");
+    assert_eq!(
+        s.matches[1].ranges,
+        [
+            SearchRange { start: 3, end: 9 },
+            SearchRange { start: 10, end: 16 }
+        ]
+    );
+    assert!(!s.truncated && s.stats.indexed);
+    assert_eq!(s.stats.files_skipped, 1);
+    assert_eq!(s.stats.files_scanned, 2);
+
+    // Revisions: a ref with a slash, and a full id.
+    let by_slash: SearchResponse = c.get("/v1/search/release/1.0?q=needle").await.json();
+    assert_eq!(by_slash.matches, s.matches);
+    let by_id: SearchResponse = c.get(&format!("/v1/search/{a}?q=needle")).await.json();
+    assert_eq!(by_id.matches, s.matches);
+
+    // Options.
+    let ci: SearchResponse = c.get("/v1/search/main?q=needle&i=true").await.json();
+    assert_eq!(ci.matches.len(), 3);
+    let re: SearchResponse = c
+        .get("/v1/search/main?q=n%5Ba-z%5D%2Bdle%20in&regex=true")
+        .await
+        .json();
+    assert_eq!(re.matches.len(), 1);
+    assert_eq!(re.matches[0].path.as_str(), "docs/n.md");
+    let scoped: SearchResponse = c.get("/v1/search/main?q=needle&path=src").await.json();
+    assert_eq!(scoped.matches.len(), 1);
+    let globbed: SearchResponse = c
+        .get("/v1/search/main?q=needle&glob=**/*.md&i=true")
+        .await
+        .json();
+    assert_eq!(globbed.matches.len(), 1);
+    assert_eq!(globbed.matches[0].path.as_str(), "docs/n.md");
+    let unindexed: SearchResponse = c
+        .get("/v1/search/main?q=.*&regex=true&path=docs")
+        .await
+        .json();
+    assert!(!unindexed.stats.indexed);
+    assert_eq!(unindexed.matches.len(), 1);
+
+    // Limits: truncated when more exist, clamped into 1..=1000.
+    let one: SearchResponse = c.get("/v1/search/main?q=needle&limit=1").await.json();
+    assert_eq!(one.matches.len(), 1);
+    assert!(one.truncated);
+    let zero: SearchResponse = c.get("/v1/search/main?q=needle&limit=0").await.json();
+    assert_eq!(zero.matches.len(), 1);
+    let huge: SearchResponse = c.get("/v1/search/main?q=needle&limit=999999").await.json();
+    assert_eq!(huge.matches.len(), 2);
+    assert!(!huge.truncated);
+    let none: SearchResponse = c.get("/v1/search/main?q=absent").await.json();
+    assert!(none.matches.is_empty() && !none.truncated);
+
+    // Errors.
+    for (uri, status) in [
+        ("/v1/search/main?q=%28&regex=true", StatusCode::BAD_REQUEST),
+        ("/v1/search/main?q=", StatusCode::BAD_REQUEST),
+        ("/v1/search/main", StatusCode::BAD_REQUEST),
+        ("/v1/search/main?q=x&i=maybe", StatusCode::BAD_REQUEST),
+        ("/v1/search/main?q=x&limit=many", StatusCode::BAD_REQUEST),
+        ("/v1/search/main?q=x&glob=%5B", StatusCode::BAD_REQUEST),
+        ("/v1/search/nosuchref?q=x", StatusCode::NOT_FOUND),
+        (
+            "/v1/search/0000000000000000000000000000000000000000000000000000000000000000?q=x",
+            StatusCode::NOT_FOUND,
+        ),
+    ] {
+        let r = c.get(uri).await;
+        assert_eq!(r.status, status, "{uri}");
+    }
+    let r = c.get("/v1/search/main?q=%28&regex=true").await;
+    assert!(r.json::<ErrorResponse>().error.contains("bad regex"));
+}
+
+#[tokio::test]
+async fn search_sees_each_revision() {
+    let c = Client::new();
+    let a = c.commit(&[], &[("f", Some("old token\n"))], "a").await;
+    let b = c.commit(&[a], &[("f", Some("new token\n"))], "b").await;
+    let old: SearchResponse = c.get(&format!("/v1/search/{a}?q=old")).await.json();
+    let new: SearchResponse = c.get(&format!("/v1/search/{b}?q=old")).await.json();
+    assert_eq!(old.matches.len(), 1);
+    assert!(new.matches.is_empty());
+}

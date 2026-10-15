@@ -238,6 +238,17 @@ async fn write_token_does_everything() {
     assert_eq!(r.status, StatusCode::OK);
 }
 
+#[tokio::test]
+async fn search_needs_a_token_but_only_a_read_one() {
+    let app = app(true);
+    let uri = "/v1/search/main?q=x";
+    let r = call(&app, Method::GET, uri, None, vec![]).await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+    // Authorized; the ref does not exist, which is a 404 and not a 403.
+    let r = call(&app, Method::GET, uri, Some(READ), vec![]).await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
+}
+
 fn digest(c: char) -> String {
     format!("blake3:{}", c.to_string().repeat(64))
 }
