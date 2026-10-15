@@ -390,8 +390,56 @@ fn derive_history_index(c: &mut Criterion) {
     g.finish();
 }
 
+/// Pure pairing of n deleted and n added text files of about 30 lines. In the
+/// similar case every added file is an edit of one deleted file, so all n x n
+/// pairs are scored (the worst case for the default 1000 x 1000 limit).
+fn detect_renames(c: &mut Criterion) {
+    use leep_core::api::FileInfo;
+    use leep_core::rename::{detect_renames, RenameOptions};
+    use leep_core::Hash;
+    use std::collections::HashMap;
+
+    let body = |i: usize, edit: bool| -> Vec<u8> {
+        let mut t: String = (0..30).map(|l| format!("file {i} line {l}\n")).collect();
+        if edit {
+            t.push_str("added line\n");
+        }
+        t.into_bytes()
+    };
+    let info = |path: String, b: &[u8]| FileInfo {
+        path: RepoPath::new(path).unwrap(),
+        content: Hash::of_blob(b),
+        kind: FileKind::Regular,
+        size: b.len() as u64,
+    };
+    let mut g = c.benchmark_group("detect_renames");
+    g.sample_size(10);
+    for (name, edit) in [("exact", false), ("similar", true)] {
+        let n = 1000;
+        let mut bodies = HashMap::new();
+        let (mut del, mut add) = (Vec::new(), Vec::new());
+        for i in 0..n {
+            let (old, new) = (body(i, false), body(i, edit));
+            del.push(info(format!("old/f{i}"), &old));
+            add.push(info(format!("new/f{i}"), &new));
+            bodies.insert(Hash::of_blob(&old), old);
+            bodies.insert(Hash::of_blob(&new), new);
+        }
+        g.bench_function(BenchmarkId::new(name, "1000x1000"), |b| {
+            b.iter(|| {
+                let d = detect_renames(del.clone(), add.clone(), RenameOptions::default(), |h| {
+                    bodies.get(h).cloned()
+                });
+                assert_eq!(d.renames.len(), n);
+            })
+        });
+    }
+    g.finish();
+}
+
 criterion_group!(
     benches,
+    detect_renames,
     create_changeset,
     land,
     diff,

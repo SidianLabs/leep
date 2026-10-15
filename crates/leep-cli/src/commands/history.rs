@@ -9,7 +9,7 @@ use leep_core::changeset::{EXTRA_AGENT_MODEL, EXTRA_AGENT_SESSION};
 use super::{print_json, Remote};
 use crate::client::LogQuery;
 use crate::error::{CliError, Result};
-use crate::fmt::{short, utc_time};
+use crate::fmt::{rename_line, short, utc_time};
 
 #[derive(Args, Debug)]
 pub struct LogArgs {
@@ -19,6 +19,10 @@ pub struct LogArgs {
     /// server's path-history index, so cost does not grow with history).
     #[arg(long)]
     pub path: Option<String>,
+    /// Like `--path` for one file, but keep going under the file's old name
+    /// when it was renamed (found by similarity, as in `leep diff`).
+    #[arg(long, value_name = "FILE", conflicts_with = "path")]
+    pub follow: Option<String>,
     /// Maximum number of entries.
     #[arg(short = 'n', long, default_value_t = 20)]
     pub limit: u32,
@@ -65,10 +69,11 @@ impl LogArgs {
             });
         }
         Ok(LogQuery {
-            path: self.path.clone(),
+            path: self.follow.clone().or_else(|| self.path.clone()),
             limit: Some(self.limit),
             author: self.author.clone(),
             extra,
+            follow: self.follow.is_some(),
         })
     }
 }
@@ -124,10 +129,26 @@ fn header(info: &ChangesetInfo) {
     for (k, v) in &info.changeset.extra {
         println!("{k}: {v}");
     }
+    for line in follow_lines(info) {
+        println!("{line}");
+    }
     println!();
     for line in info.changeset.message.lines() {
         println!("    {line}");
     }
+}
+
+/// What `log --follow` adds to an entry: the file's name there, and the
+/// rename that gave it that name.
+fn follow_lines(info: &ChangesetInfo) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(p) = &info.path_at {
+        out.push(format!("File:   {p}"));
+    }
+    if let Some(r) = &info.renamed {
+        out.push(rename_line(r.from.as_str(), r.to.as_str(), r.similarity));
+    }
+    out
 }
 
 pub fn log(r: &Remote, args: &LogArgs) -> Result<i32> {
@@ -408,6 +429,7 @@ mod tests {
         LogArgs {
             rev: None,
             path: None,
+            follow: None,
             limit: 20,
             author: None,
             agent: false,
@@ -454,6 +476,59 @@ mod tests {
         assert!(p.contains(&("path", "src".into())));
         assert!(p.contains(&("author", "ann".into())));
         assert!(p.contains(&("limit", "20".into())));
+    }
+
+    #[test]
+    fn follow_asks_for_one_file_with_the_follow_flag() {
+        let q = LogArgs {
+            follow: Some("src/a.rs".into()),
+            ..log_args()
+        }
+        .query()
+        .unwrap();
+        assert!(q.follow);
+        let p = q.params();
+        assert!(p.contains(&("path", "src/a.rs".into())));
+        assert!(p.contains(&("follow", "true".into())));
+        // Plain log never sends it.
+        assert!(!log_args()
+            .query()
+            .unwrap()
+            .params()
+            .iter()
+            .any(|(k, _)| *k == "follow"));
+    }
+
+    #[test]
+    fn follow_entries_show_the_name_and_the_rename() {
+        let id = cid(1);
+        let mut info = ChangesetInfo {
+            id,
+            changeset: leep_core::Changeset {
+                parents: vec![],
+                author: "a".into(),
+                timestamp: 0,
+                message: "m".into(),
+                changes: BTreeMap::new(),
+                extra: BTreeMap::new(),
+            },
+            generation: 1,
+            root_tree: Hash::of_blob(b""),
+            path_at: None,
+            renamed: None,
+        };
+        assert!(follow_lines(&info).is_empty());
+        info.path_at = Some(RepoPath::new("b.txt").unwrap());
+        info.renamed = Some(leep_core::api::RenameEntry {
+            from: RepoPath::new("a.txt").unwrap(),
+            to: RepoPath::new("b.txt").unwrap(),
+            similarity: 91,
+            exact: false,
+        });
+        assert_eq!(
+            follow_lines(&info),
+            ["File:   b.txt", "renamed: a.txt -> b.txt (91%)"]
+        );
     }
 
     #[test]

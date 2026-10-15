@@ -182,12 +182,15 @@ pub fn definitions() -> Vec<Value> {
             "Show history newest first. Filters (all optional, combined with AND): a path the \
              change touched, author text, agent model, agent session. Each entry has id, author, \
              message and `agent` metadata (model, session, prompt, tests) when an agent made the \
-             change.",
+             change. With `follow` and a file `path`, history continues under the file's old name \
+             when it was renamed (each entry then has `path_at`, and `renamed` where the rename \
+             happened).",
             json!({
                 "type": "object",
                 "properties": {
                     "rev": { "type": "string", "description": REV_DOC },
                     "path": { "type": "string", "description": "Only changesets that touched this file path." },
+                    "follow": { "type": "boolean", "description": "Follow renames of the file `path` (default false; `path` must be a file)." },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 200, "description": "Max matching entries (default 20)." },
                     "author": { "type": "string", "description": "Only changesets whose author contains this text (case-insensitive)." },
                     "agent_model": { "type": "string", "description": "Only changesets made by this agent model (exact match on agent.model)." },
@@ -245,13 +248,17 @@ pub fn definitions() -> Vec<Value> {
             "leep_diff",
             "Diff revisions",
             "Unified diff between two revisions for text files; binary files are listed only. If \
-             `from` is omitted, `to` is compared with its first parent (the changes `to` made).",
+             `from` is omitted, `to` is compared with its first parent (the changes `to` made). \
+             With `renames`, a deleted and an added file that are mostly the same show as one \
+             rename (git-style headers, then the content diff).",
             json!({
                 "type": "object",
                 "properties": {
                     "from": { "type": "string", "description": "Older rev; default is the first parent of `to`." },
                     "to": { "type": "string", "description": "Newer rev (required)." },
-                    "prefix": { "type": "string", "description": "Only paths under this directory." }
+                    "prefix": { "type": "string", "description": "Only paths under this directory." },
+                    "renames": { "type": "boolean", "description": "Detect renames (default false)." },
+                    "rename_threshold": { "type": "integer", "minimum": 0, "maximum": 100, "description": "Minimum similarity percent for a rename (default 50)." }
                 },
                 "required": ["to"],
                 "additionalProperties": false

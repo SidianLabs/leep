@@ -569,3 +569,72 @@ fn search_finds_lines_and_reports_errors() {
     let r = call(&s, "leep_search", json!({ "query": "(", "regex": true }));
     assert!(text(&r).contains("bad regex"), "{}", text(&r));
 }
+
+#[test]
+fn renames_in_diff_and_follow_in_log() {
+    let s = Server::new(config(&start_server()));
+    let body: String = (0..10).map(|i| format!("line {i}\n")).collect();
+    let land = |args: Value| {
+        data(&commit(&s, args))["landed"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let first =
+        land(json!({ "message": "add", "changes": [{ "path": "old.txt", "content": body }] }));
+    let second = land(json!({
+        "message": "move and edit",
+        "changes": [
+            { "path": "old.txt", "delete": true },
+            { "path": "dir/new.txt", "content": format!("{body}more\n") },
+        ],
+    }));
+
+    // Off by default: the delete and the add, as before.
+    let d = text(&call(&s, "leep_diff", json!({ "to": second })));
+    assert!(d.contains("diff --leep a/old.txt b/old.txt"), "{d}");
+    assert!(!d.contains("rename from"), "{d}");
+
+    let d = text(&call(
+        &s,
+        "leep_diff",
+        json!({ "to": second, "renames": true }),
+    ));
+    assert!(d.contains("diff --leep a/old.txt b/dir/new.txt\n"), "{d}");
+    assert!(
+        d.contains("rename from old.txt\nrename to dir/new.txt\nsimilarity index 9"),
+        "{d}"
+    );
+    assert!(d.contains("+more\n") && !d.contains("b/old.txt"), "{d}");
+    let d = text(&call(
+        &s,
+        "leep_diff",
+        json!({ "to": second, "renames": true, "rename_threshold": 100 }),
+    ));
+    assert!(d.contains("b/old.txt") && !d.contains("rename from"), "{d}");
+
+    // Log: plain path log stops at the move; follow continues.
+    let plain = data(&call(&s, "leep_log", json!({ "path": "dir/new.txt" })));
+    assert_eq!(plain["entries"].as_array().unwrap().len(), 1);
+    assert!(plain["entries"][0].get("path_at").is_none());
+    let log = data(&call(
+        &s,
+        "leep_log",
+        json!({ "path": "dir/new.txt", "follow": true }),
+    ));
+    let entries = log["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0]["id"], second);
+    assert_eq!(entries[0]["path_at"], "dir/new.txt");
+    assert_eq!(entries[0]["renamed"]["from"], "old.txt");
+    assert_eq!(entries[1]["id"], first);
+    assert_eq!(entries[1]["path_at"], "old.txt");
+
+    for args in [
+        json!({ "follow": true }),
+        json!({ "follow": true, "path": "dir" }),
+    ] {
+        let r = call(&s, "leep_log", args);
+        assert_eq!(r["isError"], true);
+    }
+}

@@ -18,6 +18,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use leep_core::api::*;
+use leep_core::rename::RenameOptions;
 use leep_core::{Changeset, ChangesetId, Error, FileKind, Hash, RepoPath};
 use leep_derive::{search, ExtraMatch, LogFilter, Repo, SearchQuery};
 use serde::de::DeserializeOwned;
@@ -242,6 +243,7 @@ struct PrefixQuery {
 struct LogQuery {
     path: Option<String>,
     limit: Option<usize>,
+    follow: bool,
     filter: LogFilter,
 }
 
@@ -257,12 +259,21 @@ impl LogQuery {
                             .map_err(|_| Error::Invalid(format!("bad limit {v:?}")))?,
                     )
                 }
+                "follow" => q.follow = parse_bool("follow", &v)?,
                 "author" => q.filter.author = Some(v),
                 "extra" => q.filter.extra.push(ExtraMatch::parse(&v)?),
                 _ => {}
             }
         }
         Ok(q)
+    }
+}
+
+fn parse_bool(name: &str, v: &str) -> ApiResult<bool> {
+    match v {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(Error::Invalid(format!("bad {name} {v:?}: expected true or false")).into()),
     }
 }
 
@@ -287,6 +298,21 @@ struct DiffQuery {
     from: Option<String>,
     to: String,
     prefix: Option<String>,
+    renames: Option<bool>,
+    /// Text, so a bad value is our 400 and not the extractor's.
+    rename_threshold: Option<String>,
+}
+
+impl DiffQuery {
+    fn rename_options(&self) -> ApiResult<RenameOptions> {
+        let mut opts = RenameOptions::default();
+        if let Some(t) = &self.rename_threshold {
+            opts.threshold = t.parse::<u8>().ok().filter(|t| *t <= 100).ok_or_else(|| {
+                Error::Invalid(format!("bad rename_threshold {t:?}: expected 0 to 100"))
+            })?;
+        }
+        Ok(opts)
+    }
 }
 
 #[derive(Deserialize)]
@@ -530,9 +556,17 @@ async fn log(
 ) -> ApiResult<Json<LogResponse>> {
     let q = LogQuery::parse(pairs)?;
     let limit = q.limit.unwrap_or(DEFAULT_LOG_LIMIT).min(MAX_LOG_LIMIT);
-    let entries = repo
-        .log_filtered(cid(&id)?, q.path.as_deref(), limit, &q.filter)
-        .await?;
+    let entries = if q.follow {
+        let path = q
+            .path
+            .as_deref()
+            .filter(|p| !p.trim_matches('/').is_empty());
+        let path = path.ok_or_else(|| Error::Invalid("follow needs a file path".into()))?;
+        repo.log_follow(cid(&id)?, path, limit, &q.filter).await?
+    } else {
+        repo.log_filtered(cid(&id)?, q.path.as_deref(), limit, &q.filter)
+            .await?
+    };
     Ok(Json(LogResponse { entries }))
 }
 
@@ -586,10 +620,19 @@ async fn search_rev(
 
 async fn diff(State(repo): S, Query(q): Query<DiffQuery>) -> ApiResult<Json<DiffResponse>> {
     let from = q.from.as_deref().map(cid).transpose()?;
+    let opts = q.rename_options()?;
     let entries = repo
-        .diff(from, cid(&q.to)?, &q.prefix.unwrap_or_default())
+        .diff(from, cid(&q.to)?, q.prefix.as_deref().unwrap_or_default())
         .await?;
-    Ok(Json(DiffResponse { entries }))
+    let found = match q.renames {
+        Some(true) => repo.detect_renames(&entries, &opts).await?,
+        _ => Default::default(),
+    };
+    Ok(Json(DiffResponse {
+        entries,
+        renames: found.renames,
+        renames_truncated: found.truncated,
+    }))
 }
 
 async fn blame(
@@ -665,5 +708,35 @@ mod tests {
         assert!(LogQuery::parse(pairs(&[("extra", ":x")])).is_err());
         assert!(LogQuery::parse(pairs(&[("extra", "")])).is_err());
         assert!(LogQuery::parse(pairs(&[("limit", "many")])).is_err());
+        assert!(LogQuery::parse(pairs(&[("follow", "yes")])).is_err());
+    }
+
+    #[test]
+    fn log_query_follow_defaults_to_false() {
+        assert!(!LogQuery::parse(pairs(&[("path", "a")])).unwrap().follow);
+        let q = LogQuery::parse(pairs(&[("path", "a"), ("follow", "true")])).unwrap();
+        assert!(q.follow);
+    }
+
+    fn diff_query(threshold: Option<&str>) -> DiffQuery {
+        DiffQuery {
+            from: None,
+            to: String::new(),
+            prefix: None,
+            renames: None,
+            rename_threshold: threshold.map(String::from),
+        }
+    }
+
+    #[test]
+    fn rename_threshold_is_validated() {
+        assert_eq!(diff_query(None).rename_options().unwrap().threshold, 50);
+        for (t, want) in [("0", 0), ("50", 50), ("100", 100)] {
+            let o = diff_query(Some(t)).rename_options().unwrap();
+            assert_eq!(o.threshold, want);
+        }
+        for bad in ["101", "-1", "", "50.5", "fifty", "256", "1000"] {
+            assert!(diff_query(Some(bad)).rename_options().is_err(), "{bad:?}");
+        }
     }
 }

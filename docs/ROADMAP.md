@@ -61,7 +61,7 @@ operator action, and their benchmarks are in `docs/PERFORMANCE.md`.
 
 ### Everyday workflow (a git user can do a normal day's work without the API)
 - [x] `leep branch`, `leep switch` and immutable tags
-- [ ] Rename detection in `diff` and `log --follow`
+- [x] Rename detection in `diff` and `log --follow` (ADR 0016)
 - [ ] `sync` that rebases uncommitted work, and `leep stash`
 - [ ] `leep restore`, `leep amend` and `leep reset` for unlanded work
 - [ ] `leep merge`, `leep rebase`, `leep revert` and `leep cherry-pick`

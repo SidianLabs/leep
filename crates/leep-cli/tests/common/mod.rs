@@ -138,6 +138,7 @@ impl Mock {
             .route("/v1/merge-base", get(merge_base))
             .route("/v1/files/{id}", get(files))
             .route("/v1/log/{id}", get(log))
+            .route("/v1/diff", get(diff))
             .route("/v1/last-change/{id}", get(last_change))
             .route("/v1/blame/{id}", get(blame))
             .route("/v1/provenance/{id}", get(provenance))
@@ -569,15 +570,78 @@ async fn log(
         });
         cur = cs.parents.first().copied();
         if ok {
+            let follow = q.iter().any(|(k, v)| k == "follow" && v == "true");
             entries.push(ChangesetInfo {
                 id: c,
                 generation: 0,
                 root_tree: Hash::of_blob(b""),
                 changeset: cs,
+                path_at: follow
+                    .then(|| q.iter().find(|(k, _)| k == "path"))
+                    .flatten()
+                    .and_then(|(_, p)| RepoPath::new(p.as_str()).ok()),
+                renamed: None,
             });
         }
     }
     Ok(Json(LogResponse { entries }))
+}
+
+/// File-level diff between two changesets, with rename detection when asked,
+/// like the real server (`renames=true`, `rename_threshold`).
+async fn diff(State(s): State<Shared>, RawQuery(raw): RawQuery) -> Resp<DiffResponse> {
+    let mut d = s.lock().unwrap();
+    record(&mut d, "diff", &raw);
+    let q: HashMap<String, String> = pairs(&raw).into_iter().collect();
+    let id = |k: &str| -> Result<Option<ChangesetId>, (StatusCode, Json<ErrorResponse>)> {
+        q.get(k)
+            .map(|v| {
+                v.parse()
+                    .map_err(|_| err(StatusCode::BAD_REQUEST, "bad id"))
+            })
+            .transpose()
+    };
+    let from = id("from")?;
+    let to = id("to")?.ok_or_else(|| err(StatusCode::BAD_REQUEST, "missing to"))?;
+    let none = BTreeMap::new();
+    let old = from.map_or(&none, |f| &d.files[&f]);
+    let new = d
+        .files
+        .get(&to)
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "no such changeset"))?;
+    let mut entries = Vec::new();
+    for path in old
+        .keys()
+        .chain(new.keys())
+        .collect::<std::collections::BTreeSet<_>>()
+    {
+        let (o, n) = (old.get(path), new.get(path));
+        if o.map(|f| (f.content, f.kind)) != n.map(|f| (f.content, f.kind)) {
+            entries.push(DiffEntry {
+                path: RepoPath::new(path.as_str()).unwrap(),
+                old: o.cloned(),
+                new: n.cloned(),
+            });
+        }
+    }
+    let mut resp = DiffResponse {
+        entries,
+        ..Default::default()
+    };
+    if q.get("renames").is_some_and(|v| v == "true") {
+        let mut opts = leep_core::rename::RenameOptions::default();
+        if let Some(t) = q.get("rename_threshold") {
+            opts.threshold = t
+                .parse()
+                .map_err(|_| err(StatusCode::BAD_REQUEST, "bad rename_threshold"))?;
+        }
+        let (deleted, added) = leep_core::rename::split_entries(&resp.entries);
+        let found =
+            leep_core::rename::detect_renames(deleted, added, opts, |h| d.blobs.get(h).cloned());
+        resp.renames = found.renames;
+        resp.renames_truncated = found.truncated;
+    }
+    Ok(Json(resp))
 }
 
 /// Answers with the requested changeset itself, which is all the CLI tests
@@ -609,6 +673,8 @@ async fn last_change(
             generation: 0,
             root_tree: Hash::of_blob(b""),
             changeset: cs,
+            path_at: None,
+            renamed: None,
         },
         concurrent: vec![],
     }))

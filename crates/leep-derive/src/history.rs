@@ -197,6 +197,8 @@ impl Repo {
                 changeset: cs,
                 generation,
                 root_tree,
+                path_at: None,
+                renamed: None,
             });
         }
         Ok(out)

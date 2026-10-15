@@ -1153,6 +1153,123 @@ fn code_search_over_the_real_binaries() {
     assert!(v["matches"].as_array().unwrap().is_empty());
 }
 
+#[test]
+fn renames_in_diff_status_and_log_follow() {
+    let _g = serial();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let stores = Stores::sqlite(&root.join("data"));
+    let server = Server::start(&stores, root);
+    let client = Client::new(&server.url, &root.join("cache"));
+
+    let wc = root.join("wc");
+    client.ok(root, &["init", wc.to_str().unwrap()]);
+    let body: String = (1..=12).map(|i| format!("fn step_{i}() {{}}\n")).collect();
+    write(&wc, "src/old_name.rs", &body);
+    write(&wc, "src/other.rs", "fn other() {}\n");
+    client.ok(&wc, &["commit", "-m", "add old_name"]);
+    client.ok(&wc, &["land"]);
+    write(
+        &wc,
+        "src/old_name.rs",
+        &format!("{body}fn step_13() {{}}\n"),
+    );
+    client.ok(&wc, &["commit", "-m", "extend old_name"]);
+    client.ok(&wc, &["land"]);
+
+    // Rename with a small edit, uncommitted: status and diff say renamed.
+    fs::remove_file(wc.join("src/old_name.rs")).unwrap();
+    let renamed = format!("{body}fn step_13() {{}}\nfn step_14() {{}}\n");
+    write(&wc, "lib/new_name.rs", &renamed);
+    let status = client.ok(&wc, &["status"]);
+    assert!(
+        status.contains("renamed: src/old_name.rs -> lib/new_name.rs ("),
+        "{status}"
+    );
+    assert!(!status.contains("D src/old_name.rs") && !status.contains("A lib/new_name.rs"));
+    let diff = client.ok(&wc, &["diff"]);
+    assert!(
+        diff.contains("renamed: src/old_name.rs -> lib/new_name.rs ("),
+        "{diff}"
+    );
+    assert!(
+        diff.contains("--- a/src/old_name.rs\n+++ b/lib/new_name.rs\n"),
+        "{diff}"
+    );
+    assert!(diff.contains("+fn step_14() {}"), "{diff}");
+    let off = client.ok(&wc, &["diff", "--no-renames"]);
+    assert!(
+        !off.contains("renamed:") && off.contains("+++ /dev/null"),
+        "{off}"
+    );
+    let j = client.json(&wc, &["status"]);
+    assert_eq!(
+        j["changes"].as_array().unwrap().len(),
+        2,
+        "raw changes stay"
+    );
+    assert_eq!(j["renames"][0]["from"], "src/old_name.rs");
+
+    client.ok(&wc, &["commit", "-m", "rename to new_name"]);
+    client.ok(&wc, &["land"]);
+    write(
+        &wc,
+        "lib/new_name.rs",
+        &format!("{renamed}fn step_15() {{}}\n"),
+    );
+    client.ok(&wc, &["commit", "-m", "edit new_name"]);
+    client.ok(&wc, &["land"]);
+
+    // Between revisions, from the server.
+    let log = client.json(&wc, &["log", "main"]);
+    let rename_cs = log["entries"][1]["id"].as_str().unwrap().to_string();
+    let before = log["entries"][2]["id"].as_str().unwrap().to_string();
+    let diff = client.ok(&wc, &["diff", &before, &rename_cs]);
+    assert!(
+        diff.contains("renamed: src/old_name.rs -> lib/new_name.rs ("),
+        "{diff}"
+    );
+    let v = client.json(&wc, &["diff", &before, &rename_cs]);
+    assert_eq!(v["entries"].as_array().unwrap().len(), 2);
+    assert_eq!(v["renames"][0]["to"], "lib/new_name.rs");
+    assert_eq!(v["renames"][0]["exact"], false);
+    let strict = client.ok(&wc, &["diff", "-M=99", &before, &rename_cs]);
+    assert!(!strict.contains("renamed:"), "{strict}");
+
+    // History: the plain path log stops at the rename, --follow does not.
+    let plain = client.json(&wc, &["log", "--path", "lib/new_name.rs"]);
+    assert_eq!(plain["entries"].as_array().unwrap().len(), 2);
+    let followed = client.json(&wc, &["log", "--follow", "lib/new_name.rs"]);
+    let msgs: Vec<_> = followed["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["changeset"]["message"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        msgs,
+        [
+            "edit new_name",
+            "rename to new_name",
+            "extend old_name",
+            "add old_name"
+        ]
+    );
+    assert_eq!(followed["entries"][3]["path_at"], "src/old_name.rs");
+    assert_eq!(followed["entries"][1]["renamed"]["from"], "src/old_name.rs");
+    let text = client.ok(&wc, &["log", "--follow", "lib/new_name.rs"]);
+    assert!(text.contains("File:   src/old_name.rs"), "{text}");
+    assert!(
+        text.contains("renamed: src/old_name.rs -> lib/new_name.rs ("),
+        "{text}"
+    );
+
+    // One file only.
+    let out = client.run(&wc, &["log", "--follow", "lib"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stderr(&out).contains("directory"), "{}", stderr(&out));
+}
+
 fn run_branch_and_tag_workflow(stores: &Stores, work: &Path) {
     let server = Server::start(stores, work);
     let client = Client::new(&server.url, &work.join("cache"));

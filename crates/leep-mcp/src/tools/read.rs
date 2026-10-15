@@ -28,6 +28,7 @@ const MAX_SEARCH_LIMIT: u32 = 200;
 struct LogArgs {
     rev: Option<String>,
     path: Option<String>,
+    follow: Option<bool>,
     limit: Option<u32>,
     author: Option<String>,
     agent_model: Option<String>,
@@ -74,6 +75,8 @@ struct DiffArgs {
     from: Option<String>,
     to: String,
     prefix: Option<String>,
+    renames: Option<bool>,
+    rename_threshold: Option<u8>,
 }
 
 /// Changeset summary with provenance split out of `extra`.
@@ -100,6 +103,17 @@ fn summary(info: &ChangesetInfo) -> Value {
     }
     if !extra.is_empty() {
         v["extra"] = Value::Object(extra);
+    }
+    if let Some(p) = &info.path_at {
+        v["path_at"] = json!(p.as_str());
+    }
+    if let Some(r) = &info.renamed {
+        v["renamed"] = json!({
+            "from": r.from.as_str(),
+            "to": r.to.as_str(),
+            "similarity": r.similarity,
+            "exact": r.exact,
+        });
     }
     v
 }
@@ -128,11 +142,17 @@ impl Server {
         if let Some(sess) = non_empty(a.agent_session) {
             extra.push(format!("{EXTRA_AGENT_SESSION}:{sess}"));
         }
+        let path = non_empty(a.path);
+        let follow = a.follow.unwrap_or(false);
+        if follow && path.is_none() {
+            return Err(ToolError::new("follow needs `path`, the file to follow"));
+        }
         let query = leep_cli::client::LogQuery {
-            path: non_empty(a.path),
+            path,
             limit: Some(limit),
             author: non_empty(a.author),
             extra,
+            follow,
         };
         let log = self.client.log(&id, &query)?;
         let entries: Vec<Value> = log.entries.iter().map(summary).collect();
@@ -227,7 +247,13 @@ impl Server {
             .as_deref()
             .map(|p| p.trim_matches('/'))
             .filter(|p| !p.is_empty());
-        let entries = self.client.diff(from.as_ref(), &to, prefix)?.entries;
+        let resp = if a.renames.unwrap_or(false) || a.rename_threshold.is_some() {
+            self.client
+                .diff_renames(from.as_ref(), &to, prefix, a.rename_threshold)?
+        } else {
+            self.client.diff(from.as_ref(), &to, prefix)?
+        };
+        let entries = resp.entries;
         if entries.is_empty() {
             return Ok(ToolOutput::text("No differences."));
         }
@@ -239,8 +265,34 @@ impl Server {
                 break;
             }
             let path = e.path.as_str();
-            let _ = writeln!(out, "diff --leep a/{path} b/{path}");
-            let too_big = [&e.old, &e.new]
+            // A rename replaces its delete and add, shown at the new path.
+            if e.new.is_none() && resp.renames.iter().any(|r| r.from == e.path) {
+                continue;
+            }
+            let moved = resp
+                .renames
+                .iter()
+                .find(|r| r.to == e.path && e.old.is_none());
+            let old_file = match moved {
+                Some(r) => entries
+                    .iter()
+                    .find(|d| d.path == r.from)
+                    .and_then(|d| d.old.clone()),
+                None => e.old.clone(),
+            };
+            let old_path = moved.map_or(path, |r| r.from.as_str());
+            let _ = writeln!(out, "diff --leep a/{old_path} b/{path}");
+            if let Some(r) = moved {
+                let _ = writeln!(
+                    out,
+                    "rename from {}\nrename to {path}\nsimilarity index {}%",
+                    r.from, r.similarity
+                );
+            }
+            if moved.is_some_and(|r| r.exact) {
+                continue;
+            }
+            let too_big = [&old_file, &e.new]
                 .into_iter()
                 .flatten()
                 .any(|f| f.size > MAX_DIFF_FILE_BYTES);
@@ -248,15 +300,15 @@ impl Server {
                 out.push_str("(file too large to diff)\n");
                 continue;
             }
-            let old = self.side(e.old.as_ref())?;
+            let old = self.side(old_file.as_ref())?;
             let new = self.side(e.new.as_ref())?;
             let (Some(old), Some(new)) = (old, new) else {
                 out.push_str("Binary files differ\n");
                 continue;
             };
             let (from_name, to_name) = (
-                if e.old.is_some() {
-                    format!("a/{path}")
+                if old_file.is_some() {
+                    format!("a/{old_path}")
                 } else {
                     "/dev/null".into()
                 },

@@ -16,9 +16,9 @@
 //! | GET  | `/v1/tree/{id}?path=dir` | – | [`TreeResponse`] (one directory level) |
 //! | GET  | `/v1/files/{id}?prefix=dir` | – | [`FilesResponse`] (recursive listing) |
 //! | GET  | `/v1/file/{id}?path=p` | – | raw bytes + `x-leep-kind` header, or 404 |
-//! | GET  | `/v1/log/{id}?path=p&limit=n&author=a&extra=k:v` | – | [`LogResponse`] (newest first; `limit` defaults to 100, capped at 10000). `author` is a case-insensitive substring; `extra` repeats, is ANDed, and is `key:value` (exact) or `key` (present). `limit` counts matches. With `path` the walk follows the path-history index; without it, or for `author` and `extra`, a selective filter scans changesets linearly |
+//! | GET  | `/v1/log/{id}?path=p&limit=n&author=a&extra=k:v` | – | [`LogResponse`] (newest first; `limit` defaults to 100, capped at 10000). `author` is a case-insensitive substring; `extra` repeats, is ANDed, and is `key:value` (exact) or `key` (present). `limit` counts matches. With `path` the walk follows the path-history index; without it, or for `author` and `extra`, a selective filter scans changesets linearly. `follow=true` (needs a file `path`; 400 otherwise) continues the history of a renamed file under its old name and marks entries with `path_at` and `renamed` (ADR 0016) |
 //! | GET  | `/v1/last-change/{id}?path=p` | – | [`LastChangeResponse`] (the newest changeset reachable from `id` that changed file or directory `p`, answered from the path-history index; a deleted path answers with the deleting changeset; 404 if `p` never existed) |
-//! | GET  | `/v1/diff?from=a&to=b&prefix=dir` | – | [`DiffResponse`] (`from` omitted = empty tree) |
+//! | GET  | `/v1/diff?from=a&to=b&prefix=dir&renames=bool&rename_threshold=n` | – | [`DiffResponse`] (`from` omitted = empty tree; `renames=true` adds detected renames, `rename_threshold` is 0 to 100 and defaults to 50, anything else is 400; ADR 0016) |
 //! | GET  | `/v1/blame/{id}?path=p` | – | [`BlameResponse`] (with per-changeset [`ChangesetSummary`]) |
 //! | GET  | `/v1/provenance/{id}?path=prefix&limit=n` | – | [`ProvenanceResponse`] (who and what made the changesets reachable from `id`; `limit` defaults to 10000, capped at 10000) |
 //! | GET  | `/v1/search/{rev}?q=text&regex=bool&i=bool&path=dir&glob=g&limit=n` | – | [`SearchResponse`] (`rev` = ref name or full id; `limit` defaults to 100, capped at 1000; booleans are `true` or `false`; a bad regex is 400, an unknown `rev` 404) |
@@ -113,6 +113,15 @@ pub struct ChangesetInfo {
     /// Length of the longest parent chain to a root; roots are 1.
     pub generation: u64,
     pub root_tree: Hash,
+    /// Name of the followed file in this changeset. Only set by a `follow`
+    /// log (ADR 0016), where it differs from the requested path before a
+    /// rename.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_at: Option<RepoPath>,
+    /// Set on the entry of a `follow` log where the file got its name by
+    /// renaming `from`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub renamed: Option<RenameEntry>,
 }
 
 /// Attest to a changeset. Both fields are text so the body is easy to build
@@ -273,9 +282,38 @@ pub struct DiffEntry {
     pub new: Option<FileInfo>,
 }
 
+/// A deleted and an added file that are probably the same file moved.
+/// Changesets store renames as delete plus add, so these are detected when
+/// displaying (ADR 0016).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RenameEntry {
+    pub from: RepoPath,
+    pub to: RepoPath,
+    /// 0 to 100; see `leep_core::rename` for the definition.
+    pub similarity: u8,
+    /// Same content and same kind, so `similarity` is 100 and nothing else
+    /// changed.
+    pub exact: bool,
+}
+
+/// `entries` is unchanged by rename detection: a rename still appears as a
+/// deleted and an added entry, so clients that ignore `renames` see what they
+/// always saw.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiffResponse {
     pub entries: Vec<DiffEntry>,
+    /// Only with `renames=true`; sorted by `to`. Each path of `entries`
+    /// appears in at most one rename.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub renames: Vec<RenameEntry>,
+    /// Similarity matching was skipped because there were too many candidate
+    /// pairs; exact renames are still reported.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub renames_truncated: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -595,6 +633,8 @@ mod tests {
             changeset: cs,
             generation: 1,
             root_tree: Hash::of_blob(b"t"),
+            path_at: None,
+            renamed: None,
         };
         let mut v = serde_json::json!({ "path": "src", "changeset": info });
         let r: LastChangeResponse = serde_json::from_value(v.clone()).unwrap();
@@ -634,5 +674,31 @@ mod tests {
             "m1"
         );
         assert_eq!(serde_json::from_value::<BlameResponse>(v).unwrap(), r);
+    }
+
+    #[test]
+    fn diff_response_without_renames_keeps_its_old_shape() {
+        let old: DiffResponse =
+            serde_json::from_value(serde_json::json!({ "entries": [] })).unwrap();
+        assert!(old.renames.is_empty() && !old.renames_truncated);
+        assert_eq!(
+            serde_json::to_value(&old).unwrap(),
+            serde_json::json!({ "entries": [] })
+        );
+        let r = RenameEntry {
+            from: RepoPath::new("a").unwrap(),
+            to: RepoPath::new("b").unwrap(),
+            similarity: 90,
+            exact: false,
+        };
+        let new = DiffResponse {
+            renames: vec![r],
+            renames_truncated: true,
+            ..old
+        };
+        let v = serde_json::to_value(&new).unwrap();
+        assert_eq!(v["renames"][0]["to"], "b");
+        assert_eq!(v["renames_truncated"], true);
+        assert_eq!(serde_json::from_value::<DiffResponse>(v).unwrap(), new);
     }
 }

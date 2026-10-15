@@ -11,6 +11,7 @@ pub mod hash;
 pub mod memory;
 pub mod path;
 pub mod refname;
+pub mod rename;
 pub mod review;
 pub mod signature;
 pub mod store;
