@@ -5,7 +5,13 @@ where most commits come from AI agents and CI. Inspired by Anthropic's Scion,
 Meta's Mononoke and Zed's DeltaDB. Git-compatible through an import/export
 bridge.
 
-Status: early development (v0.1). See [docs/DESIGN.md](docs/DESIGN.md).
+Status: early development (v0.1).
+
+- [Architecture](docs/ARCHITECTURE.md)
+- [Formats and compatibility](docs/FORMATS.md)
+- [Decision records](docs/adr/)
+- [Roadmap](docs/ROADMAP.md)
+- [Contributing](CONTRIBUTING.md) and the [agent guide](CLAUDE.md)
 
 ## Layout
 
