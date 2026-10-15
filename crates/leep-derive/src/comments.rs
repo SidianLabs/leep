@@ -409,9 +409,18 @@ impl Lexer<'_> {
     fn char_literal_end(&self, i: usize) -> Option<usize> {
         let first = self.at(i + 1)?;
         if first == '\\' {
-            // Skip the escaped character, then find the closing quote soon.
-            let close = (i + 3..i + 14).find(|&j| self.at(j) == Some('\''))?;
-            return Some(close + 1);
+            // An escape is one character, or after `x`, `u`, `U` or an octal
+            // digit a short run of digits and braces. Nothing else may sit
+            // between the backslash and the closing quote: scanning for a
+            // quote anywhere nearby would hide `//` or `"` inside a "literal".
+            let mut j = i + 3;
+            if matches!(self.at(i + 2)?, 'x' | 'u' | 'U' | '0'..='7') {
+                let run = |c: char| c.is_ascii_hexdigit() || matches!(c, '{' | '}' | '_');
+                while j < i + 14 && self.at(j).is_some_and(run) {
+                    j += 1;
+                }
+            }
+            return (self.at(j) == Some('\'')).then_some(j + 1);
         }
         if first == '\n' || first == '\'' {
             return None;
@@ -487,6 +496,13 @@ impl Lexer<'_> {
             let next = self.at(i + 1);
             if is_ws(c) {
                 if c == '\r' && next != Some('\n') {
+                    return None;
+                }
+                // Neither the shell nor YAML counts these as blanks: they are
+                // ordinary word and scalar characters, and a `#` after one is
+                // not a comment. Normalizing them to a space would equate
+                // `a<FF>b` with `a b`.
+                if matches!(c, '\u{b}' | '\u{c}') && (lang.shell || lang.yaml) {
                     return None;
                 }
                 if c == '\n' {
@@ -871,6 +887,13 @@ mod tests {
             "let u = '\\u{1F600}';"
         );
         assert_eq!(s("rs", "let q = '\\''; // c\n"), "let q = '\\'';");
+        assert_eq!(s("rs", "let x = '\\x41'; // c\n"), "let x = '\\x41';");
+        assert_eq!(s("c", "char z = '\\012'; // c\n"), "char z = '\\012';");
+        // Found by fuzzing: a backslash followed by junk was accepted as a char
+        // literal if a quote came within a few characters, which swallowed the
+        // `//` and made the text lex differently once its comments were gone.
+        assert_eq!(s("rs", "f('\\r# n//b'); // c\n"), "f('\\r# n");
+        assert_eq!(strip_comments("c", "f('\\q// b');\n"), None);
     }
 
     #[test]
@@ -972,6 +995,22 @@ mod tests {
         assert_eq!(strip_comments("yaml", "run: |\n  # kept\n  ls\n"), None);
         assert_eq!(strip_comments("yaml", "run: >-\n  a\n"), None);
         assert_eq!(strip_comments("txt", "a"), None);
+    }
+
+    #[test]
+    fn vertical_tab_and_form_feed_are_not_blanks_in_shell_and_yaml() {
+        // Found by fuzzing. They were treated as whitespace, so `a<FF># x`
+        // lost its tail as a comment although `#` only starts one after a
+        // blank, and `a<FF>b` equalled `a b`: a value change passed as a
+        // comment change.
+        for ext in ["sh", "bash", "yaml", "yml"] {
+            assert_eq!(strip_comments(ext, "k=a\u{c}# x\n"), None, "{ext}");
+            assert_eq!(strip_comments(ext, "k: a\u{b}b\n"), None, "{ext}");
+            assert!(!same(ext, "k a\u{c}b\n", "k a b\n"), "{ext}");
+        }
+        // Languages where they do separate tokens are unchanged.
+        assert!(same("c", "int\u{c}a;\n", "int a;\n"));
+        assert!(same("rb", "x\u{c}# c\ny\n", "x\ny\n"));
     }
 
     #[test]
