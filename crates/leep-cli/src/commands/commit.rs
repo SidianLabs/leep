@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::Args;
@@ -13,6 +14,7 @@ use leep_core::{Changeset, FileChange, Hash, RepoPath};
 use super::{print_json, Ctx};
 use crate::error::{CliError, Result};
 use crate::fmt::{plural, short};
+use crate::sign::AuthorKey;
 use crate::status::{read_content, status, Change};
 
 #[derive(Args, Debug, Default, Clone)]
@@ -35,6 +37,9 @@ pub struct CommitArgs {
     /// Test results or commands the agent ran.
     #[arg(long, env = "LEEP_AGENT_TESTS")]
     pub agent_tests: Option<String>,
+    /// Sign the changeset with this private key file (from `leep keygen`).
+    #[arg(long, env = "LEEP_SIGNING_KEY", value_name = "KEYFILE")]
+    pub sign: Option<PathBuf>,
 }
 
 fn author(args: &CommitArgs) -> String {
@@ -62,6 +67,13 @@ fn extra(args: &CommitArgs) -> BTreeMap<String, String> {
 }
 
 pub fn run(ctx: &mut Ctx, args: &CommitArgs) -> Result<i32> {
+    // Fail before uploading anything if the key cannot be used.
+    let key = args
+        .sign
+        .as_deref()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(AuthorKey::load)
+        .transpose()?;
     let st = status(&ctx.wc)?;
     if st.has_conflicts() {
         return Err(CliError::user(
@@ -128,6 +140,17 @@ pub fn run(ctx: &mut Ctx, args: &CommitArgs) -> Result<i32> {
         extra: extra(args),
     };
     let id = ctx.client.create_changeset(&cs)?;
+    // Before the working copy moves: if signing fails, nothing local changed
+    // and a retry just makes a new changeset.
+    let signed_by = match &key {
+        Some(k) => Some(ctx.client.add_signature(&id, &k.sign(&id)).map_err(|e| {
+            CliError::user(format!(
+                "created {} but could not sign it: {e}; nothing was committed locally, retry",
+                short(id)
+            ))
+        })?),
+        None => None,
+    };
 
     for e in st.entries {
         match e.now {
@@ -152,6 +175,9 @@ pub fn run(ctx: &mut Ctx, args: &CommitArgs) -> Result<i32> {
             short(id),
             plural(cs.changes.len(), "file")
         );
+        if let Some(s) = signed_by {
+            eprintln!("signed as {} (key {})", s.name, s.key_id);
+        }
     }
     Ok(0)
 }

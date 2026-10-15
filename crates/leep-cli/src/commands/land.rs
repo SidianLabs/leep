@@ -5,6 +5,7 @@ use std::fs;
 
 use clap::Args;
 use leep_core::api::{Conflict, LandRequest, LandResponse};
+use leep_core::signature::NOT_SIGNED_MARKER;
 use leep_core::{ChangesetId, FileChange, FileKind, RepoPath};
 
 use super::{print_json, Ctx};
@@ -41,10 +42,13 @@ pub fn run(ctx: &mut Ctx, args: &LandArgs) -> Result<i32> {
         .target_ref
         .clone()
         .unwrap_or_else(|| ctx.wc.config.target_ref.clone());
-    let resp = ctx.client.land(&LandRequest {
-        changeset: base,
-        target_ref: target_ref.clone(),
-    })?;
+    let resp = ctx
+        .client
+        .land(&LandRequest {
+            changeset: base,
+            target_ref: target_ref.clone(),
+        })
+        .map_err(|e| hint_unsigned(e, &target_ref))?;
     if ctx.json {
         print_json(&resp)?;
     }
@@ -96,6 +100,17 @@ pub fn run(ctx: &mut Ctx, args: &LandArgs) -> Result<i32> {
             }
             Ok(1)
         }
+    }
+}
+
+/// The server names the unsigned changeset; add what to do about it.
+fn hint_unsigned(e: CliError, target_ref: &str) -> CliError {
+    match e {
+        CliError::User(m) if m.contains(NOT_SIGNED_MARKER) => CliError::User(format!(
+            "{m}\n{target_ref} only accepts signed changesets: every changeset being landed needs a signature. \
+             Commit with `leep commit --sign KEYFILE` (or set LEEP_SIGNING_KEY); create a key with `leep keygen`."
+        )),
+        e => e,
     }
 }
 

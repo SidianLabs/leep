@@ -6,7 +6,7 @@ use clap::{Parser, Subcommand};
 
 use crate::cache::Cache;
 use crate::client::Client;
-use crate::commands::{checkout, commit, diff, history, init, land, status, Ctx, Remote};
+use crate::commands::{checkout, commit, diff, history, init, keygen, land, status, Ctx, Remote};
 use crate::error::{CliError, Result};
 use crate::state::{resolve_token, WorkCopy};
 
@@ -42,6 +42,8 @@ pub enum Command {
     Status,
     /// Show changes (working copy vs base, or `FROM TO` on the server).
     Diff(diff::DiffArgs),
+    /// Create an author signing key for `leep commit --sign`.
+    Keygen(keygen::KeygenArgs),
     /// Record local changes as a changeset.
     Commit(commit::CommitArgs),
     /// Land the current changeset on the target ref.
@@ -78,6 +80,9 @@ fn env_token() -> Option<String> {
 }
 
 pub fn run(cli: Cli) -> Result<i32> {
+    if let Command::Keygen(args) = &cli.command {
+        return keygen::run(args);
+    }
     let cache = Cache::from_env()?;
     if let Command::Init(args) = &cli.command {
         let server = cli.server.as_deref().unwrap_or(DEFAULT_SERVER);
@@ -132,7 +137,7 @@ pub fn run(cli: Cli) -> Result<i32> {
         json: cli.json,
     };
     match &cli.command {
-        Command::Init(_) => unreachable!("handled above"),
+        Command::Init(_) | Command::Keygen(_) => unreachable!("handled above"),
         Command::Checkout(a) => checkout::checkout(&mut ctx, a),
         Command::Status => status::run(&ctx),
         Command::Diff(a) => diff::run(&ctx, a),
