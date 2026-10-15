@@ -9,6 +9,10 @@ pub enum Error {
     /// Caller error: malformed or inconsistent input. Maps to HTTP 400.
     #[error("invalid input: {0}")]
     Invalid(String),
+    /// A concurrent update won repeatedly; retrying later can succeed. Maps
+    /// to HTTP 409.
+    #[error("conflict: {0}")]
+    Conflict(String),
     #[error("not found: {0}")]
     NotFound(String),
     #[error("encoding error: {0}")]

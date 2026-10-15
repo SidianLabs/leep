@@ -105,6 +105,7 @@ impl IntoResponse for ApiError {
                 StatusCode::BAD_REQUEST
             }
             Error::NotFound(_) => StatusCode::NOT_FOUND,
+            Error::Conflict(_) => StatusCode::CONFLICT,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         if status.is_server_error() {
