@@ -2,6 +2,7 @@
 //! The endpoint contract is the table in `leep_core::api`.
 
 pub mod auth;
+pub mod observe;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -19,7 +20,6 @@ use leep_derive::Repo;
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use tower_http::limit::RequestBodyLimitLayer;
-use tower_http::trace::TraceLayer;
 
 /// Default cap on request bodies (blob uploads), in bytes.
 pub const DEFAULT_MAX_BODY_BYTES: usize = 512 * 1024 * 1024;
@@ -71,7 +71,8 @@ pub fn router_with_auth(repo: Repo, max_body_bytes: usize, auth: Option<auth::Au
     router
         .layer(DefaultBodyLimit::disable())
         .layer(RequestBodyLimitLayer::new(max_body_bytes))
-        .layer(TraceLayer::new_for_http())
+        .layer(observe::trace_layer())
+        .layer(middleware::from_fn(observe::track_metrics))
         .with_state(Arc::new(repo))
 }
 

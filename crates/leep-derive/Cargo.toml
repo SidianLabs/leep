@@ -12,6 +12,7 @@ bytes.workspace = true
 postcard.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+metrics.workspace = true
 diffy = "0.4"
 similar = "2"
 
