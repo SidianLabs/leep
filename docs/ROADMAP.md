@@ -16,9 +16,9 @@ Milestones are ordered. Each one should leave `main` releasable.
 - [x] Token auth (static bearer tokens, read/write roles; ADR 0007)
 - [x] Structured logs (`--log-format json`, one line per request)
 - [x] Prometheus metrics (cache hit rates, land retries, derive latency; `--metrics-listen`)
-- Docker images and a docker-compose file (server + Postgres + MinIO)
+- [x] Docker image and a docker-compose file (server + Postgres; `docs/DEPLOY.md`)
 - [x] Blob garbage collection (mark from all stored changesets plus a retention window; ADR 0008)
-- Benchmarks: commit and land latency versus repository size
+- [x] Benchmarks: commit and land latency versus repository size (`docs/PERFORMANCE.md`)
 
 ## v0.3: Agent-native
 - Fenced two-phase blob GC that closes the last claim/delete race (ADR 0008)

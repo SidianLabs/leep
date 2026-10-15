@@ -130,6 +130,7 @@ changeset, and concurrent servers that race produce identical bytes.
 | `root_tree` | 32-byte tree hash. Applies `changes` to `parents[0]`'s tree, rewriting only the directories on changed paths and pruning empty ones | everything |
 | `generation` | `1 + max(parents)`; roots = 1 | log ordering, ancestry |
 | `skiplist` | power-of-two first-parent ancestors | `is_ancestor`, `merge_base` |
+| `last_merge-v1` | generation of the nearest merge on the first-parent chain (0 if none) | lets `merge_base` answer from skiplists when no merge sits above the first-parent common ancestor |
 | `blame` | per (changeset, path), keyed `Hash::of_object("blame", id‖path)` | blame |
 
 `root_tree` and `generation` are derived eagerly when a changeset is created.

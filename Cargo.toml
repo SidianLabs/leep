@@ -19,6 +19,7 @@ leep-server = { path = "crates/leep-server" }
 anyhow = "1"
 async-trait = "0.1"
 blake3 = "1"
+criterion = { version = "0.5", features = ["async_tokio"] }
 bytes = { version = "1", features = ["serde"] }
 hex = "0.4"
 postcard = { version = "1", features = ["use-std"] }

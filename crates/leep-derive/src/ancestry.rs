@@ -4,7 +4,7 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use leep_core::{ChangesetId, Result};
 
-use crate::derived::{self, Skiplist};
+use crate::derived::{self, LastMerge, Skiplist};
 use crate::Repo;
 
 const P1: u8 = 1;
@@ -59,6 +59,69 @@ impl Repo {
         if a == b {
             return Ok(Some(a));
         }
+        // Fast path: the deepest common node of the two first-parent chains,
+        // found with skiplist jumps. If neither chain has a merge above it,
+        // every ancestor of `a` or `b` above it lies on those chains, so it
+        // is the unique best common ancestor and the walk below would return
+        // the same answer.
+        if let Some(c) = self.first_parent_lca(a, b).await? {
+            let gc = self.generation(c).await?;
+            if self.last_merge(a).await? <= gc && self.last_merge(b).await? <= gc {
+                return Ok(Some(c));
+            }
+        }
+        self.merge_base_walk(a, b).await
+    }
+
+    async fn last_merge(&self, id: ChangesetId) -> Result<u64> {
+        derived::decode_u64(&derived::derive::<LastMerge>(self, id).await?)
+    }
+
+    /// Deepest changeset on both first-parent chains, or `None` if they share
+    /// no root. Jumps the chain with the higher generation down to the other's
+    /// generation via the skiplist; equal generations step one at a time, so
+    /// cost is logarithmic in history plus the length of genuinely parallel
+    /// stretches.
+    async fn first_parent_lca(
+        &self,
+        a: ChangesetId,
+        b: ChangesetId,
+    ) -> Result<Option<ChangesetId>> {
+        let (mut x, mut y) = (a, b);
+        loop {
+            if x == y {
+                return Ok(Some(x));
+            }
+            let (mut gx, gy) = (self.generation(x).await?, self.generation(y).await?);
+            if gx < gy {
+                std::mem::swap(&mut x, &mut y);
+                gx = gy;
+            }
+            let target = self.generation(y).await?;
+            let list = Skiplist::decode(&derived::derive::<Skiplist>(self, x).await?)?;
+            let Some(parent) = list.first() else {
+                return Ok(None);
+            };
+            x = if gx > target {
+                // Farthest jump that stays at or above `y`'s generation; if
+                // even the parent is below it, step to the parent anyway.
+                list.iter()
+                    .rev()
+                    .find(|e| e.generation >= target)
+                    .map_or(parent.id, |e| e.id)
+            } else {
+                parent.id
+            };
+        }
+    }
+
+    /// Reference algorithm: walk both histories by generation. Linear in the
+    /// distance from the tips to the merge base.
+    pub(crate) async fn merge_base_walk(
+        &self,
+        a: ChangesetId,
+        b: ChangesetId,
+    ) -> Result<Option<ChangesetId>> {
         let mut flags: HashMap<ChangesetId, u8> = HashMap::new();
         let mut gens: HashMap<ChangesetId, u64> = HashMap::new();
         let mut heap: BinaryHeap<(u64, ChangesetId, bool)> = BinaryHeap::new();
