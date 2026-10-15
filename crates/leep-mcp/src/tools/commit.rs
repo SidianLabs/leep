@@ -1,0 +1,263 @@
+//! `leep_commit_and_land`: the agent write path, with no working copy.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use leep_core::api::{Conflict, FileInfo, LandRequest, LandResponse};
+use leep_core::changeset::{
+    EXTRA_AGENT_MODEL, EXTRA_AGENT_PROMPT, EXTRA_AGENT_SESSION, EXTRA_AGENT_TESTS,
+};
+use leep_core::{Changeset, ChangesetId, FileChange, FileKind, Hash, RepoPath};
+use serde::Deserialize;
+use serde_json::{json, Value};
+
+use super::{as_text, parse_args, truncate, ToolError, ToolOutput, ToolResult};
+use crate::Server;
+
+/// Per-side cap for text shown in a conflict report.
+const MAX_CONFLICT_TEXT: usize = 64 * 1024;
+
+#[derive(Deserialize)]
+struct Args {
+    message: String,
+    changes: Vec<Edit>,
+    base: Option<String>,
+    target_ref: Option<String>,
+    prompt: Option<String>,
+    tests: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct Edit {
+    path: String,
+    content: Option<String>,
+    #[serde(default)]
+    delete: bool,
+    /// `None` keeps the file's existing kind (executable bit, symlink), so an
+    /// agent editing a script doesn't silently strip `+x`.
+    executable: Option<bool>,
+}
+
+impl Server {
+    pub(super) fn commit_and_land(&self, args: Value) -> ToolResult {
+        let a: Args = parse_args(args)?;
+        if a.message.trim().is_empty() {
+            return Err(ToolError::new("message must not be empty"));
+        }
+        if a.changes.is_empty() {
+            return Err(ToolError::new("changes must contain at least one entry"));
+        }
+        let target_ref = a
+            .target_ref
+            .as_deref()
+            .map(str::trim)
+            .filter(|r| !r.is_empty())
+            .unwrap_or("main")
+            .to_string();
+
+        // Validate everything before touching the server.
+        let mut inherit_kind: Vec<RepoPath> = Vec::new();
+        let mut changes: BTreeMap<RepoPath, FileChange> = BTreeMap::new();
+        let mut blobs: BTreeMap<Hash, Vec<u8>> = BTreeMap::new();
+        for e in &a.changes {
+            let path = RepoPath::new(e.path.as_str())
+                .map_err(|err| ToolError(format!("bad path `{}`: {err}", e.path)))?;
+            let change = match (&e.content, e.delete) {
+                (Some(_), true) => {
+                    return Err(ToolError(format!(
+                        "{}: give either content or delete:true, not both",
+                        e.path
+                    )))
+                }
+                (None, false) => {
+                    return Err(ToolError(format!(
+                        "{}: give content (new file text) or delete:true",
+                        e.path
+                    )))
+                }
+                (None, true) => FileChange::Delete,
+                (Some(text), false) => {
+                    let data = text.as_bytes().to_vec();
+                    let hash = Hash::of_blob(&data);
+                    let size = data.len() as u64;
+                    blobs.insert(hash, data);
+                    let kind = match e.executable {
+                        Some(true) => FileKind::Executable,
+                        Some(false) => FileKind::Regular,
+                        None => {
+                            inherit_kind.push(path.clone());
+                            FileKind::Regular
+                        }
+                    };
+                    FileChange::Modify {
+                        content: hash,
+                        kind,
+                        size,
+                    }
+                }
+            };
+            if changes.insert(path, change).is_some() {
+                return Err(ToolError(format!("{}: listed more than once", e.path)));
+            }
+        }
+
+        let parent: Option<ChangesetId> = match a.base.as_deref().filter(|b| !b.trim().is_empty()) {
+            Some(b) => Some(self.resolve_rev(Some(b))?),
+            // An absent target ref is an empty repository: this becomes a root.
+            None => self.client.get_ref(&target_ref)?.target,
+        };
+        for path in inherit_kind {
+            if let Some(kind) = self.existing_kind(parent, &path)? {
+                if let Some(FileChange::Modify { kind: k, .. }) = changes.get_mut(&path) {
+                    *k = kind;
+                }
+            }
+        }
+        let hashes: Vec<Hash> = blobs.keys().copied().collect();
+        let missing: BTreeSet<Hash> = if hashes.is_empty() {
+            BTreeSet::new()
+        } else {
+            self.client.missing_blobs(hashes)?.into_iter().collect()
+        };
+        for (hash, data) in blobs {
+            if missing.contains(&hash) {
+                self.client.put_blob(&hash, data)?;
+            }
+        }
+
+        let mut extra = BTreeMap::new();
+        for (k, arg, default) in [
+            (EXTRA_AGENT_MODEL, None, &self.cfg.agent_model),
+            (EXTRA_AGENT_SESSION, None, &self.cfg.agent_session),
+            (
+                EXTRA_AGENT_PROMPT,
+                a.prompt.as_ref(),
+                &self.cfg.agent_prompt,
+            ),
+            (EXTRA_AGENT_TESTS, a.tests.as_ref(), &self.cfg.agent_tests),
+        ] {
+            if let Some(v) = arg.or(default.as_ref()).filter(|v| !v.is_empty()) {
+                extra.insert(k.to_string(), v.clone());
+            }
+        }
+        let cs = Changeset {
+            parents: parent.into_iter().collect(),
+            author: self.cfg.author.clone(),
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0),
+            message: a.message,
+            changes,
+            extra,
+        };
+        let created = self.client.create_changeset(&cs)?;
+        let resp = self.client.land(&LandRequest {
+            changeset: created,
+            target_ref: target_ref.clone(),
+        })?;
+        match resp {
+            LandResponse::Landed {
+                landed,
+                rebased,
+                attempts,
+            } => Ok(ToolOutput::json(json!({
+                "status": "landed",
+                "landed": landed.to_string(),
+                "changeset": created.to_string(),
+                "target_ref": target_ref,
+                "rebased": rebased,
+                "attempts": attempts,
+                "files_changed": cs.changes.len(),
+            }))),
+            LandResponse::Conflicts {
+                onto,
+                conflicts,
+                clean,
+            } => self.conflict_report(&target_ref, created, onto, &conflicts, &clean),
+        }
+    }
+
+    /// Kind of `path` at `parent`, if the file exists there.
+    fn existing_kind(
+        &self,
+        parent: Option<ChangesetId>,
+        path: &RepoPath,
+    ) -> Result<Option<FileKind>, ToolError> {
+        let Some(parent) = parent else {
+            return Ok(None);
+        };
+        Ok(self
+            .client
+            .files(&parent, path.as_str())?
+            .files
+            .into_iter()
+            .find(|f| &f.path == path)
+            .map(|f| f.kind))
+    }
+
+    fn conflict_report(
+        &self,
+        target_ref: &str,
+        created: ChangesetId,
+        onto: ChangesetId,
+        conflicts: &[Conflict],
+        clean: &BTreeMap<RepoPath, FileChange>,
+    ) -> ToolResult {
+        let mut items = Vec::new();
+        for c in conflicts {
+            items.push(json!({
+                "path": c.path.to_string(),
+                "base": self.side_view(c.base.as_ref())?,
+                "ours": self.side_view(c.ours.as_ref())?,
+                "theirs": self.side_view(c.theirs.as_ref())?,
+                "merged_with_markers": c.merged_with_markers,
+            }));
+        }
+        let clean_paths: Vec<Value> = clean
+            .iter()
+            .map(|(p, ch)| {
+                json!({
+                    "path": p.to_string(),
+                    "change": if matches!(ch, FileChange::Delete) { "delete" } else { "modify" },
+                })
+            })
+            .collect();
+        let guidance = format!(
+            "Nothing was landed: {target_ref} is unchanged. `ours` is what {target_ref} now has \
+             (at {onto}), `theirs` is your change, `base` is the common ancestor. Decide the \
+             correct final content for each conflicting path, then call leep_commit_and_land again \
+             with base set to {onto} and include ALL files you meant to change: the resolved \
+             content for the conflicting paths, and your original content (or delete:true) for the \
+             clean paths listed in `clean_paths`."
+        );
+        let v = json!({
+            "status": "conflict",
+            "target_ref": target_ref,
+            "onto": onto.to_string(),
+            "changeset": created.to_string(),
+            "conflicts": items,
+            "clean_paths": clean_paths,
+            "guidance": guidance,
+        });
+        let mut out = ToolOutput::json(v);
+        out.is_error = true;
+        out.text = format!("NOT LANDED: conflicts with {target_ref}.\n{}", out.text);
+        Ok(out)
+    }
+
+    /// One side of a conflict as text (capped) or a binary marker.
+    fn side_view(&self, f: Option<&FileInfo>) -> Result<Value, ToolError> {
+        let Some(f) = f else {
+            return Ok(Value::Null);
+        };
+        let bytes = self.blob(&f.content)?;
+        Ok(match as_text(&bytes) {
+            None => json!({ "binary": true, "size": f.size }),
+            Some(t) => {
+                let (shown, cut) = truncate(t, MAX_CONFLICT_TEXT);
+                json!({ "text": shown, "size": f.size, "truncated": cut })
+            }
+        })
+    }
+}
