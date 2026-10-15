@@ -41,5 +41,12 @@ Backends implement `leep_core::BlobStore` (in `leep-store`) or
    - if the backend needs a service, gate the tests on an env var
      (`LEEP_TEST_<NAME>_URL`), skip with a printed note when it's unset, and
      add the service to `.github/workflows/rust.yml`.
-5. Add the schema or key layout to FORMATS.md and a row to the scaling table in
+5. Fault tolerance (ADR 0021): run the contract through a quiet
+   `leep_testkit::FaultyBlobStore` / `FaultyMetaStore` (it must still pass),
+   and write down in `docs/ARCHITECTURE.md` §9 what the backend guarantees
+   when a call is killed or cancelled mid-flight and what an error after the
+   call applied means for it. For a MetaStore, abandon `cas_ref_logged` at
+   random suspension points (`leep_testkit::cancel_after_polls`) and check
+   the ref log still replays to the refs.
+6. Add the schema or key layout to FORMATS.md and a row to the scaling table in
    ARCHITECTURE.md §11 if relevant.

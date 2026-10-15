@@ -73,9 +73,9 @@ operator action, and their benchmarks are in `docs/PERFORMANCE.md`.
 - [x] Fuzz every decoder (postcard objects, derived rows, API request bodies,
   OWNERS and policy files) and the comment lexer; run the fuzzers in CI
   (`docs/FUZZING.md`)
-- [ ] Crash-consistency tests: kill the server and GC at random points and check
-  that no ref, changeset or blob reachable from a ref is lost
-- [ ] Fault injection in the storage traits (timeouts, partial writes, errors)
+- [x] Crash-consistency tests: kill the server and GC at random points and
+  check that no ref, changeset or blob reachable from a ref is lost (ADR 0021)
+- [x] Fault injection in the storage traits: timeouts, partial writes, errors (ADR 0021)
 - [ ] Long-running soak test: many agents landing for hours against Postgres
 - [ ] Security review of auth, signing, review policies and GC, with findings
   fixed or written down in the relevant ADR

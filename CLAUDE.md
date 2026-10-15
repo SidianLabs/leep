@@ -25,6 +25,11 @@ End-to-end tests drive the real binaries and need them built first:
 `cargo build --workspace && cargo test -p leep-e2e`
 (Postgres variant runs when `LEEP_TEST_POSTGRES_URL` is set).
 
+After touching `land`, GC, a store backend or the ref log, also run the fault
+sweeps and the SIGKILL crash test (`docs/OPERATIONS.md`, "Crash and fault
+tests"): `LEEP_FAULT_SEEDS=300 cargo test -p leep-derive fault_tests` and
+`cargo test -p leep-e2e --test crash`.
+
 ## Never
 
 - Change the field order, variant order or serde attributes of `Changeset`,

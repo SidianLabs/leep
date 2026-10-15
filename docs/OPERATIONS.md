@@ -201,6 +201,51 @@ means a request exceeded `--request-timeout`.
 Upgrade note: servers built before ADR 0012 ignore condemnations. Upgrade every
 server before the first `condemn`.
 
+## Crash and fault tests
+
+Two suites check what happens when stores fail and processes die (ADR 0021).
+Neither is needed to run Leep; run them after changing `land`, GC, a store
+backend or the ref log, and for longer when hardening a release.
+
+**Fault sweeps** (in-memory stores, a few seconds). Seeded; a failure prints
+its seed.
+
+```sh
+cargo test -p leep-derive fault_tests                      # 25 seeds
+LEEP_FAULT_SEEDS=500 cargo test -p leep-derive fault_tests # seeds 1..=500
+LEEP_FAULT_SEED=137 cargo test -p leep-derive fault_tests  # replay one seed
+```
+
+**Crash test** (real `leep-server` and `leep` binaries, SIGKILL). It needs
+the binaries built first, and runs the Postgres variant when
+`LEEP_TEST_POSTGRES_URL` is set:
+
+```sh
+cargo build --workspace
+cargo test -p leep-e2e --test crash -- --nocapture                    # about a minute
+LEEP_CRASH_ROUNDS=40 cargo test -p leep-e2e --test crash -- --nocapture   # long run
+LEEP_CRASH_SEED=12345 LEEP_CRASH_ROUNDS=9 cargo test -p leep-e2e --test crash
+```
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `LEEP_CRASH_ROUNDS` | 3 | SIGKILLs of the server per backend. Rounds cycle through three scenarios (offline GC, `gc collect` killed mid-run, a fenced GC beside live traffic), so use a multiple of 3. Roughly 7 to 10 seconds per round, longer as history grows. |
+| `LEEP_CRASH_SEED` | fixed | Seeds the kill delays, each agent's workload and which requests hang up. |
+| `LEEP_CRASH_AGENTS` | 6 | HTTP agents; two `leep` CLI agents always run too. |
+
+The seed fixes the plan, not the interleaving of threads and processes, so a
+failure usually, but not always, reproduces from its seed. A failure message
+names the backend, the seed and the round, then the invariant that broke
+(`[postgres seed 0x7 round 4, after killed collect] ...`); the server's log is
+in the test's temporary directory (`server-*.log`), which is removed when the
+test ends, so rerun with the seed and read the output of the failing round.
+
+**Leftovers after a real crash.** A killed filesystem blob store can leave
+`.tmp-*` files in its shard directories. Nothing reads or lists them, and
+nothing removes them; delete those older than the request timeout if the
+space matters:
+`find /var/lib/leep/blobs -name '.tmp-*' -mmin +60 -delete`.
+
 ## Code search index
 
 `GET /v1/search/{rev}` (`leep search`, the `leep_search` MCP tool) uses two
