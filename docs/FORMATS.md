@@ -37,6 +37,8 @@ skill.
 | derived `blob-condemned-v1` | — | `MetaStore.derived`, key = blob hash, value = condemnation time, unix seconds as 8-byte big-endian `i64`, from the GC host's clock |
 | derived `blob-rescue-v1` | — | `MetaStore.derived`, key = blob hash, value = the condemnation time the writer observed, 8-byte big-endian `i64` |
 | derived `blob-doom-v1` | — | `MetaStore.derived`, key = blob hash, value = condemnation time (8-byte big-endian `i64`) then one state byte: 0 deleting, 1 abandoned, 2 deleted |
+| derived `blob-trigrams-v1` | — | `MetaStore.derived`, key = blob hash, value = see "Code search index" below |
+| derived `tree-trigrams-v1` | — | `MetaStore.derived`, key = tree node hash (`TreeNode::hash()`), value = see "Code search index" below |
 | derived `history-tree-v1` | — | `MetaStore.derived`, key = changeset id, value = 32 raw bytes (hash of that changeset's root `HistoryNode`) |
 | `HistoryNode` | `history-node-v1` | `MetaStore.derived` (kind `history-node-v1`), key = `Hash::of_object("history-node-v1", postcard(node))`, value = the postcard bytes |
 | other derived kinds | — | owned and versioned by `leep-derive` |
@@ -111,6 +113,45 @@ rejected, every field optional):
 patterns with `*` limited to one path level. The comment languages are
 selected by file extension (case-insensitive).
 
+## Code search index (new derived kinds, no other format change)
+
+ADR 0014. Two kinds, both pure functions of content-addressed input and never
+deleted. Golden bytes are asserted in `leep-derive` (`blob_row_golden_bytes`,
+`bloom_positions_are_frozen`); any change to an encoding, a constant below or the
+definition of "text" is a new kind name (`-v2`).
+
+A *trigram* is three consecutive bytes `b0 b1 b2`, coded `b0<<16 | b1<<8 | b2`
+(24 bits). A blob is *indexed* iff it is at most 1 048 576 bytes, contains no
+NUL byte and is valid UTF-8. The empty blob is indexed with an empty set. Symlink
+entries are never indexed or searched.
+
+**`blob-trigrams-v1`** value, by first byte:
+- `0x00 0x01`: not indexed, binary (NUL or invalid UTF-8);
+- `0x00 0x02`: not indexed, over the size cap (recorded without reading the blob);
+- `0x01` then the sorted, deduplicated trigram codes of the blob as LEB128 varints
+  of the deltas, the first relative to zero. Delta 0 after the first value, a
+  non-minimal varint, a value of 2^24 or more, and a trailing partial varint are
+  invalid.
+
+**`tree-trigrams-v1`** value: a bloom filter of 2^19 bits with 3 hash functions
+over the trigram codes of all indexed blobs below the directory (recursively;
+filters of subdirectories are OR-ed in). Bit positions of a code `c`: let `z` be
+splitmix64 of `c` (`z = c + 0x9E3779B97F4A7C15; z = (z ^ z>>30) * 0xBF58476D1CE4E5B9;
+z = (z ^ z>>27) * 0x94D049BB133111EB; z ^= z>>31`, wrapping 64-bit),
+`h1 = z mod 2^32`, `h2 = (z >> 32) | 1`, and position `i` (0, 1, 2) is
+`(h1 + i*h2 mod 2^32) mod 2^19`. The row is either
+- `0x01` then exactly 65 536 bytes, bit `p` at byte `p/8`, bit `p%8`
+  (least significant first); or
+- `0x02` then the sorted set bit positions as delta varints as above (the first
+  relative to zero, each below 2^19), used when it is shorter than the dense form.
+The encoder is canonical (sparse iff strictly shorter), but readers accept either
+form for any filter. An empty directory is `0x02`.
+
+The rows are lazily derived. A search over `path` derives only the subtree.
+
+The `/v1/search/{rev}` endpoint only adds an endpoint and types (`SearchResponse`,
+`SearchMatch`, `SearchRange`, `SearchStats`), all with `#[serde(default)]` fields.
+Ranges are byte offsets into the returned (possibly cut) `line`.
 ## Path-history index (new derived kinds, no change to `Changeset`)
 
 ADR 0013. `leep_derive::derived::HistoryNode { entries: BTreeMap<String,

@@ -52,6 +52,58 @@ indicative; expect roughly +/-15% run to run.
 | `last_change` of a file, a rarely changed file, a directory | | 4.0 / 4.2 / 3.7 us | |
 | derive the history index (per changeset, one file each) | | 36 us | |
 
+## Code search
+
+`crates/leep-derive/benches/search.rs` compares an indexed search with a full
+scan of the same revision (`use_index: false`, which also checks that both
+return identical matches before timing). Same machine and profile as above.
+`cargo bench -p leep-derive --bench search` takes about 5 minutes;
+`LEEP_BENCH_SEARCH_FILES=4000` shrinks the repository.
+
+Repository: 20 000 files (34.8 MiB) in 400 leaf directories of 50 files, each
+directory drawing its identifiers from its own 300-word vocabulary, imported as
+one changeset, in-memory stores. Median of 10 samples, limit 100 unless the
+matches are fewer.
+
+| Query | Matches | Indexed | Full scan | Speedup |
+|---|---|---|---|---|
+| word in no file | 0 | 7.2 ms | 86 ms | 12x |
+| token in 3 files | 3 | 6.8 ms | 83 ms | 12x |
+| word of one directory (100 matches, truncated) | 100 | 8.3 ms | 45 ms | 5x |
+| same, ignore case | 100 | 9.4 ms | 57 ms | 6x |
+| regex `word_[a-z]+\(\d+\)` | 44 | 17 ms | 102 ms | 6x |
+| regex `(word\|quux_needle)` | 100 | 10.5 ms | 55 ms | 5x |
+| common word in every file, limit 100 | 100 | 0.66 ms | 0.10 ms | 0.15x |
+| regex whose trigrams are in every file, no match | 0 | 155 ms | 94 ms | 0.6x |
+| regex with no required trigram | 0 | 92 ms | 91 ms | 1x (same path) |
+| cold index derivation | | 1.0 s | | |
+
+Index size for this repository: blob rows 36 MiB (1.9 KB per file, about 1.05x
+the text, because the synthetic text is random letters), 521 tree rows 7.6 MiB
+(all sparse). On source code the rows are about 30% of the text (measured on
+this repository's own text files).
+
+What the numbers say:
+
+- A selective query reads only the files that can match: the 3-file token scans
+  3 of 20 000 files (38 directories pruned, 147 files pruned by their sets). The
+  remaining 7 ms is walking 521 directories (a tree node and a filter probe
+  each) and probing the rows of the files in surviving directories. A scan of the
+  same tree costs 83 ms of CPU here only because the data is in memory; against
+  object storage the scan also pays one fetch per file, so the gap grows with
+  fetch latency, while the indexed search pays for fetches only on candidates.
+- The two cases where the index loses are the cost of consulting it when it
+  cannot help. A common word with a small limit is slower (0.66 ms against
+  0.10 ms; both are negligible) because the indexed path reads the root filter
+  first. A query whose trigrams occur in every file reads a row for each of the
+  20 000 files and then scans them all, 1.7x a plain scan. A later optimization
+  could stop consulting rows once nothing has been pruned for a while.
+- The walk is lazy: with enough matches it stops reading directories, which is
+  why the "common word" case is sub-millisecond for both modes.
+- Cold derivation is 1.0 s for this repository (20 000 blob rows and 521 tree
+  rows, with 16 blob fetches in flight). It is paid once per distinct blob and
+  directory, by the first search that needs it or by `leep-server derive-search`.
+
 ## Analysis
 
 Principle 5 (cost scales with the change, not the repository) holds for the

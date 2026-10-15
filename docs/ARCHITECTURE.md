@@ -136,9 +136,12 @@ changeset, and concurrent servers that race produce identical bytes.
 | `blob-claim-v1` / `blob-condemned-v1` / `blob-rescue-v1` / `blob-doom-v1` | per blob hash, 8-byte big-endian unix seconds (doom adds a state byte); GC bookkeeping, not derived from changesets: claims by uploads and dedup checks, condemnation by `gc condemn`, rescue by uploads of a condemned blob, doom by `gc collect` (ADR 0012) | blob garbage collection and the server's missing-blob checks |
 | `history-tree-v1` | 32-byte hash of the root `HistoryNode`, a tree parallel to `root_tree` recording for each path (including deleted ones) the newest changesets that changed it; nodes are `history-node-v1` rows keyed by content hash. Built from the first parent's tree plus the spines of changed paths, and at merges the paths where another parent's history differs (ADR 0013) | path log, `last-change` |
 | `blame` | per (changeset, path), keyed `Hash::of_object("blame", id‖path)` | blame |
+| `blob-trigrams-v1` | per blob hash: sorted trigram set of a UTF-8 text blob up to 1 MiB (delta varints), or a "not indexed" marker (ADR 0014) | code search |
+| `tree-trigrams-v1` | per tree node hash: fixed-size bloom filter (2^19 bits) over every trigram below the directory, the OR of its children's filters; shared by every revision with the same subtree (ADR 0014) | code search directory pruning |
 
 `root_tree` and `generation` are derived eagerly when a changeset is created.
-Other kinds are derived on first read. Add new kinds with the
+Other kinds are derived on first read (the search kinds on the first search
+that needs them; see "Code search"). Add new kinds with the
 [`add-derived-data-kind`](../.claude/skills/add-derived-data-kind/SKILL.md)
 skill. A new kind never requires a client change.
 
@@ -165,6 +168,24 @@ message line, `agent.*` keys). The summaries are attached on read, so the
 cached `blame` value keeps its original encoding. All of these walk history
 linearly (provenance is capped at 10 000 changesets and reports `truncated`);
 an index over `agent.*` keys is future work.
+
+**Code search** ([ADR 0014](adr/0014-code-search.md)). `GET /v1/search/{rev}`
+greps a revision on the server: a literal or regex (`regex` crate), optionally
+case-insensitive, restricted by path prefix and glob, matched per line. The
+planner turns the query into trigrams every matching file must contain
+(literal trigrams, case variants, or literals extracted from the regex syntax
+tree; none means a plain scan). Execution walks the tree depth first with an
+explicit stack, skipping directories whose `tree-trigrams-v1` filter lacks a
+required trigram and files whose `blob-trigrams-v1` set does, then fetches the
+survivors (16 at a time, order preserved) and runs the matcher. Output is ordered
+by path then line and is identical with or without the index, which a property
+test checks; the walk is lazy, so a search that has enough matches stops early.
+Limits: 100 matches by default, 1000 at most, 256 MiB of blob content scanned,
+`truncated` when either is hit. Only UTF-8 text blobs up to 1 MiB are searched;
+others count as `files_skipped`. The index rows are derived lazily by the first
+search that needs them and are keyed by content, so a new revision derives only
+what it changed; `leep-server derive-search <rev>` warms a revision ahead of
+time. Clients are `leep search` and the `leep_search` MCP tool.
 
 ## 6. Request flows
 

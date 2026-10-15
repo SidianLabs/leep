@@ -43,6 +43,8 @@ measured until the response head is ready, not until the body is streamed.
 | `leep_land_lock_wait_seconds` | histogram | none | Time waiting on the per-ref in-process land lock. |
 | `leep_derive_total` | counter | `kind` | Derived values computed (cache hits in the meta store are not counted). |
 | `leep_derive_duration_seconds` | histogram | `kind` | Time to compute one derived value. |
+| `leep_search_total` | counter | `indexed` = `true`, `false` | Searches served; `false` means the query had no required trigram and scanned files directly. |
+| `leep_search_duration_seconds` | histogram | none | Whole search call, including any index rows it derived. |
 | `leep_blob_cache_hits_total` | counter | none | Blob reads served from the in-memory cache. |
 | `leep_blob_cache_misses_total` | counter | none | Blob reads that went to the durable store. |
 | `leep_blob_cache_bytes` | gauge | none | Bytes held in the cache. |
@@ -128,3 +130,27 @@ means a request exceeded `--request-timeout`.
 
 Upgrade note: servers built before ADR 0012 ignore condemnations. Upgrade every
 server before the first `condemn`.
+
+## Code search index
+
+`GET /v1/search/{rev}` (`leep search`, the `leep_search` MCP tool) uses two
+derived kinds, `blob-trigrams-v1` and `tree-trigrams-v1` (ADR 0014). They are
+built on demand: the first search of a tree that was never indexed derives all
+of it before it can prune anything, which takes about a second per 20 000 files
+(35 MiB) on in-memory stores and longer against real stores. After an import,
+or before an agent swarm starts, warm a revision:
+
+```sh
+leep-server derive-search main               # uses --meta and --blobs; prints rows derived
+```
+
+It is idempotent and safe beside running servers (rows are written
+idempotently; the server reads them as it goes). A later revision derives only
+what changed, so run it again after large lands if you want searches to stay
+fast. A search limited by `path` derives only that subtree, and a query with no
+required trigram (`.*`, a pattern shorter than three bytes) derives nothing and
+scans. Rows are never deleted and take about 30% of the size of the indexed text
+for source code (up to about 100% for random text) plus at most 64 KiB per
+directory; they live in the `derived` table, so size the metadata store for them.
+Searches are bounded by the 1000-match cap and a 256 MiB scan budget per request
+and by `--request-timeout`.
