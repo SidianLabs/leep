@@ -415,6 +415,50 @@ async fn file_kind_header() {
 }
 
 #[tokio::test]
+async fn last_change_and_indexed_path_log() {
+    let c = Client::new();
+    let a = c
+        .commit(&[], &[("src/f", Some("1")), ("doc/g", Some("1"))], "a")
+        .await;
+    let b = c.commit(&[a], &[("src/f", Some("2"))], "b").await;
+    let d = c.commit(&[b], &[("doc/g", None)], "d").await;
+
+    let get = |c: &Client, p: &str| {
+        let url = format!("/v1/last-change/{d}?path={p}");
+        let c = Client(c.0.clone());
+        async move { c.get(&url).await }
+    };
+    let r: LastChangeResponse = get(&c, "src/f").await.json();
+    assert_eq!((r.path.as_str(), r.changeset.id), ("src/f", b));
+    assert_eq!(r.changeset.generation, 2);
+    assert!(r.concurrent.is_empty());
+    let r: LastChangeResponse = get(&c, "doc").await.json();
+    assert_eq!(r.changeset.id, d);
+    let r: LastChangeResponse = get(&c, "doc/g/").await.json();
+    assert_eq!((r.path.as_str(), r.changeset.id), ("doc/g", d));
+    assert_eq!(get(&c, "nope").await.status, StatusCode::NOT_FOUND);
+    assert_eq!(get(&c, "").await.status, StatusCode::BAD_REQUEST);
+    assert_eq!(get(&c, "a/../b").await.status, StatusCode::BAD_REQUEST);
+    let missing = ChangesetId(Hash::of_blob(b"nope"));
+    assert_eq!(
+        c.get(&format!("/v1/last-change/{missing}?path=src"))
+            .await
+            .status,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        c.get("/v1/last-change/zz?path=src").await.status,
+        StatusCode::BAD_REQUEST
+    );
+
+    // A deleted path still has a log, and filters apply to what it yields.
+    let l: LogResponse = c.get(&format!("/v1/log/{d}?path=doc/g")).await.json();
+    assert_eq!(l.entries.iter().map(|e| e.id).collect::<Vec<_>>(), [d, a]);
+    let l: LogResponse = c.get(&format!("/v1/log/{d}?path=src&limit=1")).await.json();
+    assert_eq!(l.entries.iter().map(|e| e.id).collect::<Vec<_>>(), [b]);
+}
+
+#[tokio::test]
 async fn log_diff_blame_merge_base() {
     let c = Client::new();
     let a = c
