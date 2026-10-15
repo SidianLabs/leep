@@ -1,6 +1,16 @@
 [package]
 name = "leep-meta"
-version = "0.1.0"
-edition = "2024"
+description = "SQLite and Postgres MetaStore backends for Leep"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+leep-core.workspace = true
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "postgres"] }
+tracing.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
