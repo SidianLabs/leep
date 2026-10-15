@@ -40,6 +40,11 @@ leep log && leep cat main a.txt
 leep branch topic && leep switch topic   # branches; `leep switch -c NAME` creates too
 leep tag v1                              # tags are immutable; `leep tag -d v1` deletes
 leep branch                              # `*` marks the working copy's target
+leep sync                                # moves to main's head, keeping uncommitted edits
+leep stash -m wip && leep stash pop      # shelve and restore uncommitted work
+leep restore a.txt                       # discard edits to a file (--source REV for another revision)
+leep amend -m "better message"           # fold edits into an unlanded base commit
+leep reset                               # undo the last unlanded commit, keeping its changes
 ```
 Again, run `leep --help` for the current subcommands.
 
