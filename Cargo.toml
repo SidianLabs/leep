@@ -23,6 +23,7 @@ criterion = { version = "0.5", features = ["async_tokio"] }
 bytes = { version = "1", features = ["serde"] }
 ed25519-dalek = "2"
 getrandom = "0.3"
+globset = "0.4"
 hex = "0.4"
 postcard = { version = "1", features = ["use-std"] }
 serde = { version = "1", features = ["derive"] }

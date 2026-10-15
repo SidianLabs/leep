@@ -9,6 +9,7 @@ license.workspace = true
 leep-core.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
+globset.workspace = true
 postcard.workspace = true
 tokio.workspace = true
 tracing.workspace = true

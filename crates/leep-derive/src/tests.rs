@@ -1557,6 +1557,7 @@ mod land_policy {
             &self,
             repo: &Repo,
             _target_ref: &str,
+            _head: Option<ChangesetId>,
             new_history: &[ChangesetId],
         ) -> leep_core::Result<()> {
             for id in new_history {
@@ -1717,5 +1718,555 @@ mod land_policy {
         r.put_signature(c, &sig).await.unwrap();
         assert_eq!(r.get_signature(c, &sig.key_id).await.unwrap(), Some(sig));
         assert_eq!(r.get_signature(c, "other").await.unwrap(), None);
+    }
+}
+
+mod review {
+    use std::sync::Mutex;
+
+    use async_trait::async_trait;
+    use leep_core::review::{Review, Verdict};
+
+    use super::*;
+    use crate::owners::OwnersResolver;
+    use crate::review::{AutoRule, PathRule, ReviewRules};
+    use crate::{LandPolicy, PolicySet};
+
+    fn rev(who: &str, v: Verdict) -> Review {
+        Review {
+            reviewer: who.into(),
+            verdict: v,
+            comment: String::new(),
+            timestamp: 1,
+        }
+    }
+
+    async fn owners(r: &Repo, head: Option<ChangesetId>, path: &str) -> Vec<String> {
+        OwnersResolver::new(r, head)
+            .await
+            .unwrap()
+            .owners_of(&rp(path))
+            .await
+            .unwrap()
+            .into_iter()
+            .collect()
+    }
+
+    /// A head with OWNERS files at several depths.
+    async fn owned_head(r: &Repo) -> ChangesetId {
+        commit(
+            r,
+            &[],
+            &[
+                ("OWNERS", Some("root\n")),
+                ("a/OWNERS", Some("# team\nalice\n")),
+                ("a/b/OWNERS", Some("bob\nnoparent\n")),
+                ("a/b/f.rs", Some("fn f() {}\n")),
+                ("a/g.rs", Some("fn g() {}\n")),
+                ("c/h.rs", Some("fn h() {}\n")),
+                ("top.rs", Some("fn t() {}\n")),
+            ],
+            "head",
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn owners_accumulate_upward_until_noparent() {
+        let r = repo();
+        let head = owned_head(&r).await;
+        assert_eq!(owners(&r, Some(head), "a/g.rs").await, ["alice", "root"]);
+        assert_eq!(
+            owners(&r, Some(head), "a/new/deeper/x").await,
+            ["alice", "root"]
+        );
+        assert_eq!(owners(&r, Some(head), "a/b/f.rs").await, ["bob"]);
+        assert_eq!(owners(&r, Some(head), "c/h.rs").await, ["root"]);
+        assert_eq!(owners(&r, Some(head), "top.rs").await, ["root"]);
+        // The OWNERS file itself is owned from its directory.
+        assert_eq!(owners(&r, Some(head), "a/OWNERS").await, ["alice", "root"]);
+        assert_eq!(owners(&r, Some(head), "a/b/OWNERS").await, ["bob"]);
+        assert_eq!(owners(&r, Some(head), "OWNERS").await, ["root"]);
+    }
+
+    #[tokio::test]
+    async fn no_head_or_no_owners_file_means_no_owners() {
+        let r = repo();
+        assert!(owners(&r, None, "a.rs").await.is_empty());
+        let plain = commit(&r, &[], &[("a.rs", Some("x\n"))], "plain").await;
+        assert!(owners(&r, Some(plain), "a.rs").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn owners_come_from_the_given_head_not_the_change() {
+        let r = repo();
+        let head = owned_head(&r).await;
+        // A change that adds an OWNERS file naming itself is invisible when
+        // owners are read from `head`.
+        let evil = commit(&r, &[head], &[("c/OWNERS", Some("mallory\n"))], "evil").await;
+        assert_eq!(owners(&r, Some(head), "c/h.rs").await, ["root"]);
+        assert_eq!(owners(&r, Some(evil), "c/h.rs").await, ["mallory", "root"]);
+    }
+
+    #[tokio::test]
+    async fn a_symlink_named_owners_is_ignored() {
+        let r = repo();
+        let target = r.blobs().put(Bytes::from_static(b"mallory")).await.unwrap();
+        let mut changes = BTreeMap::new();
+        changes.insert(
+            rp("d/OWNERS"),
+            FileChange::Modify {
+                content: target,
+                kind: FileKind::Symlink,
+                size: 7,
+            },
+        );
+        changes.insert(rp("d/x"), modify(&r, b"x").await);
+        let head = r
+            .create_changeset(changeset(&[], changes, "l"))
+            .await
+            .unwrap();
+        assert!(owners(&r, Some(head), "d/x").await.is_empty());
+    }
+
+    async fn status(
+        r: &Repo,
+        head: Option<ChangesetId>,
+        rules: &ReviewRules,
+        id: ChangesetId,
+        reviews: &[Review],
+    ) -> crate::review::ChangesetReview {
+        let mut o = OwnersResolver::new(r, head).await.unwrap();
+        r.review_changeset(id, rules, reviews, &mut o)
+            .await
+            .unwrap()
+    }
+
+    fn rule_of(s: &crate::review::ChangesetReview, path: &str) -> PathRule {
+        s.paths
+            .iter()
+            .find(|p| p.path.as_str() == path)
+            .unwrap()
+            .rule
+    }
+
+    #[tokio::test]
+    async fn owner_approval_and_rejection_per_path() {
+        let r = repo();
+        let head = owned_head(&r).await;
+        let c = commit(
+            &r,
+            &[head],
+            &[
+                ("a/g.rs", Some("fn g2() {}\n")),
+                ("a/b/f.rs", Some("fn f2() {}\n")),
+            ],
+            "c",
+        )
+        .await;
+        let none = ReviewRules::default();
+
+        let s = status(&r, Some(head), &none, c, &[]).await;
+        assert!(!s.approved());
+        assert_eq!(s.paths.len(), 2);
+        // Path order: a/b/f.rs sorts before a/g.rs.
+        assert_eq!(s.first_blocker().unwrap().path.as_str(), "a/b/f.rs");
+        assert_eq!(s.paths[0].owners, ["bob"]);
+
+        // carol is not an owner of anything here.
+        let s = status(&r, Some(head), &none, c, &[rev("carol", Verdict::Approve)]).await;
+        assert!(!s.approved());
+
+        // alice owns a/g.rs but not a/b/f.rs (noparent).
+        let s = status(&r, Some(head), &none, c, &[rev("alice", Verdict::Approve)]).await;
+        assert_eq!(rule_of(&s, "a/g.rs"), PathRule::Owner);
+        assert_eq!(rule_of(&s, "a/b/f.rs"), PathRule::Pending);
+
+        let both = [rev("alice", Verdict::Approve), rev("bob", Verdict::Approve)];
+        let s = status(&r, Some(head), &none, c, &both).await;
+        assert!(s.approved());
+        assert_eq!(s.paths[1].approved_by, ["alice"]);
+
+        // An owner's reject blocks that path even beside other approvals.
+        let mixed = [rev("alice", Verdict::Approve), rev("bob", Verdict::Reject)];
+        let s = status(&r, Some(head), &none, c, &mixed).await;
+        assert!(!s.approved());
+        assert_eq!(rule_of(&s, "a/b/f.rs"), PathRule::Rejected);
+        assert_eq!(s.paths[0].rejected_by, ["bob"]);
+        assert_eq!(rule_of(&s, "a/g.rs"), PathRule::Owner);
+
+        // A reject by a non-owner of the path is not a veto there.
+        let s = status(
+            &r,
+            Some(head),
+            &none,
+            c,
+            &[rev("alice", Verdict::Reject), rev("bob", Verdict::Approve)],
+        )
+        .await;
+        assert_eq!(rule_of(&s, "a/b/f.rs"), PathRule::Owner);
+        assert_eq!(rule_of(&s, "a/g.rs"), PathRule::Rejected);
+    }
+
+    #[tokio::test]
+    async fn unowned_paths_take_any_approval_and_any_reject() {
+        let r = repo();
+        let head = commit(&r, &[], &[("x.rs", Some("1\n"))], "h").await;
+        let c = commit(&r, &[head], &[("x.rs", Some("2\n"))], "c").await;
+        let none = ReviewRules::default();
+        assert!(!status(&r, Some(head), &none, c, &[]).await.approved());
+        let s = status(&r, Some(head), &none, c, &[rev("zed", Verdict::Approve)]).await;
+        assert!(s.approved());
+        assert!(s.paths[0].owners.is_empty());
+        let s = status(
+            &r,
+            Some(head),
+            &none,
+            c,
+            &[rev("zed", Verdict::Approve), rev("yan", Verdict::Reject)],
+        )
+        .await;
+        assert_eq!(rule_of(&s, "x.rs"), PathRule::Rejected);
+        // No head at all: nothing is owned.
+        let s = status(&r, None, &none, c, &[rev("zed", Verdict::Approve)]).await;
+        assert!(s.approved());
+    }
+
+    #[tokio::test]
+    async fn auto_rules_approve_by_content_and_a_reject_still_blocks() {
+        let r = repo();
+        let head = owned_head(&r).await;
+        let rules = ReviewRules::new(
+            [
+                AutoRule::CommentOnly,
+                AutoRule::WhitespaceOnly,
+                AutoRule::DocsOnly,
+            ],
+            &["docs/**".into()],
+        )
+        .unwrap();
+        let c = commit(
+            &r,
+            &[head],
+            &[
+                ("a/g.rs", Some("// why\nfn g() {}\n")),
+                ("c/h.rs", Some("fn h() {}\t \r\n\n")),
+                ("docs/new.md", Some("# hi\n")),
+                ("top.rs", Some("fn t() { 1 }\n")),
+                ("a/b/new.rs", Some("fn n() {}\n")),
+            ],
+            "c",
+        )
+        .await;
+        let s = status(&r, Some(head), &rules, c, &[]).await;
+        assert_eq!(rule_of(&s, "a/g.rs"), PathRule::Auto(AutoRule::CommentOnly));
+        assert_eq!(
+            rule_of(&s, "c/h.rs"),
+            PathRule::Auto(AutoRule::WhitespaceOnly)
+        );
+        assert_eq!(
+            rule_of(&s, "docs/new.md"),
+            PathRule::Auto(AutoRule::DocsOnly)
+        );
+        // A real code change and an added file are not auto-approved.
+        assert_eq!(rule_of(&s, "top.rs"), PathRule::Pending);
+        assert_eq!(rule_of(&s, "a/b/new.rs"), PathRule::Pending);
+
+        // alice owns a/ only: her reject blocks the comment-only change there.
+        let s = status(&r, Some(head), &rules, c, &[rev("alice", Verdict::Reject)]).await;
+        assert_eq!(rule_of(&s, "a/g.rs"), PathRule::Rejected);
+        assert_eq!(
+            rule_of(&s, "docs/new.md"),
+            PathRule::Auto(AutoRule::DocsOnly)
+        );
+        assert_eq!(
+            rule_of(&s, "c/h.rs"),
+            PathRule::Auto(AutoRule::WhitespaceOnly)
+        );
+        // root owns everything not behind a noparent, so it vetoes docs too.
+        let s = status(&r, Some(head), &rules, c, &[rev("root", Verdict::Reject)]).await;
+        assert_eq!(rule_of(&s, "docs/new.md"), PathRule::Rejected);
+        assert_eq!(rule_of(&s, "c/h.rs"), PathRule::Rejected);
+    }
+
+    #[tokio::test]
+    async fn auto_rules_are_conservative_about_kinds_deletes_and_binary() {
+        let r = repo();
+        let head = commit(
+            &r,
+            &[],
+            &[("a.rs", Some("fn a() {}\n")), ("b.rs", Some("fn b() {}\n"))],
+            "h",
+        )
+        .await;
+        let rules =
+            ReviewRules::new([AutoRule::CommentOnly, AutoRule::WhitespaceOnly], &[]).unwrap();
+        // Executable bit flip, delete, and a binary replacement.
+        let bin = r
+            .blobs()
+            .put(Bytes::from_static(&[0xff, 0xfe]))
+            .await
+            .unwrap();
+        let exec = r
+            .blobs()
+            .put(Bytes::from_static(b"fn a() {}\n"))
+            .await
+            .unwrap();
+        let mut changes = BTreeMap::new();
+        changes.insert(
+            rp("a.rs"),
+            FileChange::Modify {
+                content: exec,
+                kind: FileKind::Executable,
+                size: 10,
+            },
+        );
+        changes.insert(rp("b.rs"), FileChange::Delete);
+        changes.insert(
+            rp("c.rs"),
+            FileChange::Modify {
+                content: bin,
+                kind: FileKind::Regular,
+                size: 2,
+            },
+        );
+        let c = r
+            .create_changeset(changeset(&[head], changes, "c"))
+            .await
+            .unwrap();
+        let s = status(&r, Some(head), &rules, c, &[]).await;
+        assert!(s.paths.iter().all(|p| p.rule == PathRule::Pending), "{s:?}");
+        // docs_only does cover deletes.
+        let docs = ReviewRules::new([AutoRule::DocsOnly], &["**/*.rs".into()]).unwrap();
+        assert!(status(&r, Some(head), &docs, c, &[]).await.approved());
+    }
+
+    #[tokio::test]
+    async fn merge_paths_equal_to_a_side_parent_are_covered() {
+        let r = repo();
+        let base = commit(
+            &r,
+            &[],
+            &[("a.rs", Some("1\n")), ("b.rs", Some("1\n"))],
+            "base",
+        )
+        .await;
+        let ours = commit(&r, &[base], &[("a.rs", Some("ours\n"))], "ours").await;
+        let theirs = commit(
+            &r,
+            &[base],
+            &[("b.rs", Some("theirs\n")), ("c.rs", Some("new\n"))],
+            "theirs",
+        )
+        .await;
+        // The merge takes their b.rs and c.rs and makes a fresh d.rs.
+        let m = commit(
+            &r,
+            &[ours, theirs],
+            &[
+                ("b.rs", Some("theirs\n")),
+                ("c.rs", Some("new\n")),
+                ("d.rs", Some("fresh\n")),
+            ],
+            "merge",
+        )
+        .await;
+        let none = ReviewRules::default();
+        let s = status(&r, Some(base), &none, m, &[]).await;
+        assert_eq!(rule_of(&s, "b.rs"), PathRule::MergeParent);
+        assert_eq!(rule_of(&s, "c.rs"), PathRule::MergeParent);
+        assert_eq!(rule_of(&s, "d.rs"), PathRule::Pending);
+        // Same content, different kind is not covered.
+        let exec = r
+            .blobs()
+            .put(Bytes::from_static(b"theirs\n"))
+            .await
+            .unwrap();
+        let mut changes = BTreeMap::new();
+        changes.insert(
+            rp("b.rs"),
+            FileChange::Modify {
+                content: exec,
+                kind: FileKind::Executable,
+                size: 7,
+            },
+        );
+        let m2 = r
+            .create_changeset(changeset(&[ours, theirs], changes, "m2"))
+            .await
+            .unwrap();
+        let s = status(&r, Some(base), &none, m2, &[]).await;
+        assert_eq!(rule_of(&s, "b.rs"), PathRule::Pending);
+    }
+
+    #[tokio::test]
+    async fn review_rows_overwrite_per_reviewer_and_are_validated() {
+        let r = repo();
+        let c = commit(&r, &[], &[("a", Some("1\n"))], "c").await;
+        let d = commit(&r, &[c], &[("a", Some("2\n"))], "d").await;
+        assert_eq!(r.get_review(c, "alice").await.unwrap(), None);
+        r.put_review(c, &rev("alice", Verdict::Reject))
+            .await
+            .unwrap();
+        r.put_review(c, &rev("bob", Verdict::Approve))
+            .await
+            .unwrap();
+        r.put_review(c, &rev("alice", Verdict::Approve))
+            .await
+            .unwrap();
+        assert_eq!(
+            r.get_review(c, "alice").await.unwrap().unwrap().verdict,
+            Verdict::Approve
+        );
+        assert_eq!(
+            r.get_review(c, "bob").await.unwrap().unwrap().verdict,
+            Verdict::Approve
+        );
+        // Another changeset and another reviewer are untouched.
+        assert_eq!(r.get_review(d, "alice").await.unwrap(), None);
+        assert_eq!(r.get_review(c, "carol").await.unwrap(), None);
+        // Names that are prefixes of each other do not collide.
+        r.put_review(c, &rev("al", Verdict::Reject)).await.unwrap();
+        assert_eq!(
+            r.get_review(c, "alice").await.unwrap().unwrap().verdict,
+            Verdict::Approve
+        );
+
+        let missing = ChangesetId(Hash::of_blob(b"nope"));
+        assert!(matches!(
+            r.put_review(missing, &rev("alice", Verdict::Approve)).await,
+            Err(Error::NotFound(_))
+        ));
+        let mut big = rev("alice", Verdict::Approve);
+        big.comment = "x".repeat(leep_core::review::MAX_COMMENT_BYTES + 1);
+        assert!(is_invalid(r.put_review(c, &big).await));
+    }
+
+    /// Records what it was asked and refuses ids in `deny`.
+    struct Recorder {
+        name: &'static str,
+        log: Arc<Mutex<Vec<String>>>,
+        deny: Mutex<Option<ChangesetId>>,
+        refs: &'static [&'static str],
+    }
+
+    #[async_trait]
+    impl LandPolicy for Recorder {
+        fn applies_to(&self, target_ref: &str) -> bool {
+            self.refs.contains(&target_ref)
+        }
+
+        async fn check_land(
+            &self,
+            _repo: &Repo,
+            _target_ref: &str,
+            head: Option<ChangesetId>,
+            new_history: &[ChangesetId],
+        ) -> leep_core::Result<()> {
+            self.log.lock().unwrap().push(format!(
+                "{} head={} n={}",
+                self.name,
+                head.is_some(),
+                new_history.len()
+            ));
+            if let Some(d) = *self.deny.lock().unwrap() {
+                if new_history.contains(&d) {
+                    return Err(Error::Invalid(format!("{} refuses", self.name)));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    fn recorder(
+        name: &'static str,
+        log: &Arc<Mutex<Vec<String>>>,
+        refs: &'static [&'static str],
+    ) -> Arc<Recorder> {
+        Arc::new(Recorder {
+            name,
+            log: log.clone(),
+            deny: Mutex::new(None),
+            refs,
+        })
+    }
+
+    #[tokio::test]
+    async fn policies_compose_and_all_must_pass() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let (one, two) = (
+            recorder("one", &log, &["main"]),
+            recorder("two", &log, &["main", "rel"]),
+        );
+        let r = repo()
+            .with_land_policy(one.clone())
+            .with_land_policy(two.clone());
+        let a = commit(&r, &[], &[("a", Some("1\n"))], "a").await;
+        r.land(a, "main").await.unwrap();
+        assert_eq!(
+            *log.lock().unwrap(),
+            ["one head=false n=1", "two head=false n=1"]
+        );
+
+        // The second policy vetoes: the first still ran, the ref is untouched.
+        let b = commit(&r, &[a], &[("b", Some("1\n"))], "b").await;
+        *two.deny.lock().unwrap() = Some(b);
+        log.lock().unwrap().clear();
+        match r.land(b, "main").await {
+            Err(Error::Invalid(m)) => assert_eq!(m, "two refuses"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            *log.lock().unwrap(),
+            ["one head=true n=1", "two head=true n=1"]
+        );
+        assert_eq!(r.meta().get_ref("main").await.unwrap(), Some(a));
+
+        // The first vetoes: the second is never asked.
+        *two.deny.lock().unwrap() = None;
+        *one.deny.lock().unwrap() = Some(b);
+        log.lock().unwrap().clear();
+        match r.land(b, "main").await {
+            Err(Error::Invalid(m)) => assert_eq!(m, "one refuses"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(*log.lock().unwrap(), ["one head=true n=1"]);
+
+        // A ref only one policy covers is checked by that one alone.
+        log.lock().unwrap().clear();
+        r.land(b, "rel").await.unwrap();
+        assert_eq!(*log.lock().unwrap(), ["two head=false n=2"]);
+        // And raw CAS goes through the set too.
+        *one.deny.lock().unwrap() = Some(b);
+        assert!(r.cas_ref_checked("main", Some(a), Some(b)).await.is_err());
+        assert!(r.cas_ref_checked("other", None, Some(b)).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn policy_sets_nest_and_report_head_dependence() {
+        struct Head;
+        #[async_trait]
+        impl LandPolicy for Head {
+            fn applies_to(&self, _: &str) -> bool {
+                true
+            }
+            fn depends_on_head(&self) -> bool {
+                true
+            }
+            async fn check_land(
+                &self,
+                _: &Repo,
+                _: &str,
+                _: Option<ChangesetId>,
+                _: &[ChangesetId],
+            ) -> leep_core::Result<()> {
+                Ok(())
+            }
+        }
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let plain = recorder("p", &log, &["main"]);
+        assert!(!PolicySet::new(vec![plain.clone()]).depends_on_head());
+        assert!(PolicySet::new(vec![plain, Arc::new(Head)]).depends_on_head());
+        assert!(!PolicySet::new(vec![]).applies_to("main"));
     }
 }

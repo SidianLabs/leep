@@ -10,7 +10,7 @@ use leep_core::{
 };
 
 use crate::derived::{self, Generation, RootTree, Skiplist};
-use crate::signatures::LandPolicy;
+use crate::signatures::{LandPolicy, PolicySet};
 use crate::tree_ops::apply_changes;
 
 /// A repository: content-addressed blobs plus changeset metadata.
@@ -33,9 +33,13 @@ impl Repo {
         }
     }
 
-    /// Consult `policy` before every `land`.
+    /// Consult `policy` before every `land`. Called again, it adds to the
+    /// policies already set; all must pass.
     pub fn with_land_policy(mut self, policy: Arc<dyn LandPolicy>) -> Self {
-        self.land_policy = Some(policy);
+        self.land_policy = Some(match self.land_policy.take() {
+            None => policy,
+            Some(prev) => Arc::new(PolicySet::new(vec![prev, policy])),
+        });
         self
     }
 
