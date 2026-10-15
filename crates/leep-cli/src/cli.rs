@@ -6,7 +6,9 @@ use clap::{Parser, Subcommand};
 
 use crate::cache::Cache;
 use crate::client::Client;
-use crate::commands::{checkout, commit, diff, history, init, keygen, land, status, Ctx, Remote};
+use crate::commands::{
+    checkout, commit, diff, history, init, keygen, land, review, status, Ctx, Remote,
+};
 use crate::error::{CliError, Result};
 use crate::state::{resolve_token, WorkCopy};
 
@@ -62,6 +64,11 @@ pub enum Command {
     Provenance(history::ProvenanceArgs),
     /// List refs.
     Refs,
+    /// Approve or reject changesets, and see what a changeset needs to land.
+    #[command(subcommand)]
+    Review(review::ReviewCmd),
+    /// List the reviews a changeset has (same as `review list`).
+    Reviews(review::ListArgs),
 }
 
 pub fn main() -> ExitCode {
@@ -100,7 +107,8 @@ pub fn run(cli: Cli) -> Result<i32> {
             .ok_or_else(|| CliError::user("no server configured; use --server or LEEP_SERVER"))
     };
 
-    // Read-only queries work outside a working copy when a server is given.
+    // Server-only commands work outside a working copy when a server is
+    // given. Reviews write to the server but touch no local state.
     let read_only = matches!(
         cli.command,
         Command::Log(_)
@@ -109,6 +117,8 @@ pub fn run(cli: Cli) -> Result<i32> {
             | Command::Blame(_)
             | Command::Provenance(_)
             | Command::Refs
+            | Command::Review(_)
+            | Command::Reviews(_)
     );
     if read_only && wc.is_err() {
         let token = resolve_token(cli.token.as_deref(), env_token().as_deref(), None);
@@ -156,6 +166,8 @@ fn read_only_cmd(cmd: &Command, r: &Remote) -> Result<i32> {
         Command::Blame(a) => history::blame(r, a),
         Command::Provenance(a) => history::provenance(r, a),
         Command::Refs => history::refs(r),
+        Command::Review(c) => review::run(r, c),
+        Command::Reviews(a) => review::list(r, a),
         _ => unreachable!("not a read-only command"),
     }
 }

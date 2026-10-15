@@ -171,6 +171,38 @@ impl Client {
         )
     }
 
+    /// Record the caller's verdict; the server names the reviewer from the token.
+    pub fn add_review(
+        &self,
+        id: &ChangesetId,
+        req: &AddReviewRequest,
+    ) -> Result<AddReviewResponse> {
+        self.json(
+            self.http
+                .post(self.url(&format!("/v1/changesets/{id}/reviews")))
+                .json(req),
+        )
+    }
+
+    pub fn reviews(&self, id: &ChangesetId) -> Result<ReviewsResponse> {
+        self.json(
+            self.http
+                .get(self.url(&format!("/v1/changesets/{id}/reviews"))),
+        )
+    }
+
+    pub fn review_status(
+        &self,
+        id: &ChangesetId,
+        target_ref: &str,
+    ) -> Result<ReviewStatusResponse> {
+        self.json(
+            self.http
+                .get(self.url(&format!("/v1/changesets/{id}/review-status")))
+                .query(&[("ref", target_ref)]),
+        )
+    }
+
     pub fn refs(&self) -> Result<RefsResponse> {
         self.json(self.http.get(self.url("/v1/refs")))
     }
