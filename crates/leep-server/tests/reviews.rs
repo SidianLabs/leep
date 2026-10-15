@@ -884,6 +884,7 @@ async fn raw_ref_cas_cannot_skip_review() {
     let cas = |new| CasRefRequest {
         expected: None,
         new: Some(new),
+        ..Default::default()
     };
     let r = api.post("/v1/refs/main", "bob", &cas(c)).await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST);
@@ -914,6 +915,7 @@ async fn raw_ref_cas_cannot_skip_review() {
             &CasRefRequest {
                 expected: Some(c),
                 new: None,
+                ..Default::default()
             },
         )
         .await;
