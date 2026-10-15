@@ -7,8 +7,10 @@ use std::path::Path;
 
 use common::Mock;
 use leep_cli::cache::Cache;
+use leep_cli::client::LogQuery;
 use leep_cli::commands::checkout::{checkout, sync, CheckoutArgs};
 use leep_cli::commands::commit::{self, CommitArgs};
+use leep_cli::commands::history::{self, BlameArgs, LogArgs, ProvenanceArgs};
 use leep_cli::commands::init::{self, InitArgs};
 use leep_cli::commands::land::{self, LandArgs};
 use leep_cli::commands::Ctx;
@@ -367,4 +369,99 @@ mod auth {
         assert_eq!(e.exit_code(), 1);
         assert_eq!(e.to_string(), "token lacks write access");
     }
+}
+
+#[test]
+fn provenance_queries_reach_the_server_and_decode() {
+    let mock = Mock::start();
+    let (wc_dir, cache) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    mock.seed(None, &[("a.txt", "a\n", FileKind::Regular)], &[]);
+    let mut ctx = init_wc(&mock, wc_dir.path(), cache.path(), &[]).unwrap();
+
+    write(&ctx, "a.txt", "by agent\n");
+    let mut args = commit_args("agent work");
+    args.author = Some("robot".into());
+    args.agent_model = Some("m1".into());
+    args.agent_session = Some("42".into());
+    commit::run(&mut ctx, &args).unwrap();
+    let agent_cs = ctx.wc.state.base.unwrap();
+    write(&ctx, "a.txt", "by human\n");
+    commit::run(&mut ctx, &commit_args("human work")).unwrap();
+    let tip = ctx.wc.state.base.unwrap();
+
+    let log_args = |f: &dyn Fn(&mut LogArgs)| {
+        let mut a = LogArgs {
+            rev: None,
+            path: None,
+            limit: 20,
+            author: None,
+            agent: false,
+            agent_model: None,
+            agent_session: None,
+            extra: vec![],
+        };
+        f(&mut a);
+        a
+    };
+    let r = ctx.remote();
+    let last_query = |kind: &str| {
+        mock.data
+            .lock()
+            .unwrap()
+            .queries
+            .iter()
+            .rev()
+            .find(|(k, _)| k == kind)
+            .unwrap()
+            .1
+            .clone()
+    };
+
+    // Flags become repeated `extra` params and the filtered answer comes back.
+    let a = log_args(&|a| {
+        a.agent_model = Some("m1".into());
+        a.agent_session = Some("42".into());
+        a.extra = vec!["agent.session".into()];
+    });
+    assert_eq!(history::log(&r, &a).unwrap(), 0);
+    let q = last_query("log");
+    assert_eq!(q.matches("extra=").count(), 3, "{q}");
+    let resp = ctx.client.log(&tip, &a.query().unwrap()).unwrap();
+    assert_eq!(resp.entries.len(), 1);
+    assert_eq!(resp.entries[0].id, agent_cs);
+
+    let by_author = LogQuery {
+        author: Some("TESTER".into()),
+        ..Default::default()
+    };
+    let resp = ctx.client.log(&tip, &by_author).unwrap();
+    assert_eq!(resp.entries.len(), 1);
+    assert_eq!(resp.entries[0].id, tip);
+    let none = LogQuery {
+        extra: vec!["agent.model:other".into()],
+        ..Default::default()
+    };
+    assert!(ctx.client.log(&tip, &none).unwrap().entries.is_empty());
+
+    // Provenance and blame decode the new response shapes.
+    let pa = ProvenanceArgs {
+        rev: None,
+        path: Some("a.txt".into()),
+        limit: Some(50),
+    };
+    assert_eq!(history::provenance(&r, &pa).unwrap(), 0);
+    let q = last_query("provenance");
+    assert!(q.contains("path=a.txt") && q.contains("limit=50"), "{q}");
+    let p = ctx.client.provenance(&tip, None, None).unwrap();
+    assert_eq!(p.scanned, 3);
+    assert!(p.humans.iter().any(|h| h.author == "robot"));
+    let blame = BlameArgs {
+        args: vec!["a.txt".into()],
+        who: true,
+    };
+    assert_eq!(history::blame(&r, &blame).unwrap(), 0);
+    let b = ctx.client.blame(&agent_cs, "a.txt").unwrap();
+    assert_eq!(b.changesets[&agent_cs].agent["agent.model"], "m1");
+    let rows = history::blame_lines(&b, true);
+    assert!(rows[0].contains("robot m1"), "{}", rows[0]);
 }

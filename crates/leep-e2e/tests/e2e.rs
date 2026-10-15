@@ -315,6 +315,43 @@ fn run_import_swarm_export(stores: &Stores, work: &Path) {
             Some("e2e")
         );
     }
+
+    // Provenance queries: one agent's session, all of the model, and the totals.
+    let one = client.json(&verify, &["log", "main", "--agent-session", "7"]);
+    let one = one["entries"].as_array().unwrap();
+    assert_eq!(one.len(), 1, "exactly agent 7's changeset");
+    assert_eq!(
+        json_str(&one[0], &["changeset", "extra", "agent.session"]),
+        Some("7")
+    );
+    let by_model = client.json(
+        &verify,
+        &["log", "main", "--agent-model", "e2e", "-n", "200"],
+    );
+    assert_eq!(by_model["entries"].as_array().unwrap().len(), AGENTS);
+    let other = client.json(&verify, &["log", "main", "--agent-model", "nope"]);
+    assert!(other["entries"].as_array().unwrap().is_empty());
+    let prov = client.json(&verify, &["provenance", "main"]);
+    let agents = prov["agents"].as_array().unwrap();
+    assert!(agents.iter().all(|a| a["model"] == "e2e"));
+    assert_eq!(
+        agents
+            .iter()
+            .map(|a| a["changesets"].as_u64().unwrap())
+            .sum::<u64>(),
+        AGENTS as u64,
+        "provenance counts every agent changeset"
+    );
+    assert_eq!(prov["truncated"], false);
+    assert_eq!(
+        prov["scanned"].as_u64().unwrap() as usize,
+        AGENTS + fx.commits.len()
+    );
+    let table = client.ok(&verify, &["provenance", "main", "--path", "agents"]);
+    assert!(
+        table.contains("AGENT MODEL") && table.contains("e2e"),
+        "{table}"
+    );
     let imported_shas: Vec<&str> = entries[AGENTS..]
         .iter()
         .rev()

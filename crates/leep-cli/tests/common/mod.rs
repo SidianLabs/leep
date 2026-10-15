@@ -6,7 +6,7 @@ use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
 
 use axum::body::Bytes;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query, RawQuery, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
@@ -23,6 +23,8 @@ pub struct Data {
     pub corrupt: HashSet<Hash>,
     /// Every hash received by `PUT /v1/blobs/{hash}`, in order.
     pub puts: Vec<Hash>,
+    /// `(path, raw query string)` of every log, blame and provenance request.
+    pub queries: Vec<(String, String)>,
 }
 
 pub type Shared = Arc<Mutex<Data>>;
@@ -124,6 +126,9 @@ impl Mock {
             .route("/v1/refs/{*name}", get(get_ref))
             .route("/v1/resolve/{*rev}", get(resolve))
             .route("/v1/files/{id}", get(files))
+            .route("/v1/log/{id}", get(log))
+            .route("/v1/blame/{id}", get(blame))
+            .route("/v1/provenance/{id}", get(provenance))
             .route("/v1/land", post(land));
         let app = match tokens {
             Some(t) => router.layer(axum::middleware::from_fn_with_state(t, gate)),
@@ -373,5 +378,139 @@ async fn land(State(s): State<Shared>, Json(r): Json<LandRequest>) -> Resp<LandR
         landed: id,
         rebased: true,
         attempts: 1,
+    }))
+}
+
+fn pairs(raw: &Option<String>) -> Vec<(String, String)> {
+    let raw = raw.as_deref().unwrap_or("");
+    let mut out = Vec::new();
+    for kv in raw.split('&').filter(|s| !s.is_empty()) {
+        let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
+        // Enough decoding for the `:` the client escapes.
+        out.push((k.to_string(), v.replace("%3A", ":").replace("%3a", ":")));
+    }
+    out
+}
+
+fn record(d: &mut Data, path: &str, raw: &Option<String>) {
+    d.queries
+        .push((path.to_string(), raw.clone().unwrap_or_default()));
+}
+
+/// Newest-first first-parent log honoring repeated `extra` (`k:v` or `k`)
+/// and `author`, like the real server.
+async fn log(
+    State(s): State<Shared>,
+    Path(id): Path<String>,
+    RawQuery(raw): RawQuery,
+) -> Resp<LogResponse> {
+    let mut d = s.lock().unwrap();
+    record(&mut d, "log", &raw);
+    let mut cur: Option<ChangesetId> = Some(
+        id.parse()
+            .map_err(|_| err(StatusCode::BAD_REQUEST, "bad id"))?,
+    );
+    let q = pairs(&raw);
+    let mut entries = Vec::new();
+    while let Some(c) = cur {
+        let cs = d
+            .changesets
+            .get(&c)
+            .ok_or_else(|| err(StatusCode::NOT_FOUND, "no such changeset"))?
+            .clone();
+        let ok = q.iter().all(|(k, v)| match k.as_str() {
+            "author" => cs.author.to_lowercase().contains(&v.to_lowercase()),
+            "extra" => match v.split_once(':') {
+                Some((k, want)) => cs.extra.get(k).is_some_and(|h| h == want),
+                None => cs.extra.contains_key(v),
+            },
+            _ => true,
+        });
+        cur = cs.parents.first().copied();
+        if ok {
+            entries.push(ChangesetInfo {
+                id: c,
+                generation: 0,
+                root_tree: Hash::of_blob(b""),
+                changeset: cs,
+            });
+        }
+    }
+    Ok(Json(LogResponse { entries }))
+}
+
+/// One summary per line owner; every line is attributed to the requested
+/// changeset, which is all the CLI tests need.
+async fn blame(
+    State(s): State<Shared>,
+    Path(id): Path<String>,
+    RawQuery(raw): RawQuery,
+) -> Resp<BlameResponse> {
+    let mut d = s.lock().unwrap();
+    record(&mut d, "blame", &raw);
+    let id: ChangesetId = id
+        .parse()
+        .map_err(|_| err(StatusCode::BAD_REQUEST, "bad id"))?;
+    let cs = d
+        .changesets
+        .get(&id)
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "no such changeset"))?;
+    let summary = ChangesetSummary {
+        author: cs.author.clone(),
+        timestamp: cs.timestamp,
+        message_first_line: cs.message.lines().next().unwrap_or("").into(),
+        agent: cs
+            .extra
+            .iter()
+            .filter(|(k, _)| k.starts_with("agent."))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+    };
+    Ok(Json(BlameResponse {
+        path: RepoPath::new("a.txt").unwrap(),
+        lines: vec![BlameLine {
+            changeset: id,
+            origin_line: 1,
+            text: "hello".into(),
+        }],
+        changesets: BTreeMap::from([(id, summary)]),
+    }))
+}
+
+/// Counts first-parent changesets by author; just enough to see the client
+/// decode the response.
+async fn provenance(
+    State(s): State<Shared>,
+    Path(id): Path<String>,
+    RawQuery(raw): RawQuery,
+) -> Resp<ProvenanceResponse> {
+    let mut d = s.lock().unwrap();
+    record(&mut d, "provenance", &raw);
+    let mut cur: Option<ChangesetId> = Some(
+        id.parse()
+            .map_err(|_| err(StatusCode::BAD_REQUEST, "bad id"))?,
+    );
+    let mut by_author: BTreeMap<String, u64> = BTreeMap::new();
+    let mut scanned = 0;
+    while let Some(c) = cur {
+        let cs = &d.changesets[&c];
+        *by_author.entry(cs.author.clone()).or_default() += 1;
+        scanned += 1;
+        cur = cs.parents.first().copied();
+    }
+    Ok(Json(ProvenanceResponse {
+        agents: vec![],
+        humans: by_author
+            .into_iter()
+            .map(|(author, changesets)| HumanStat {
+                author,
+                changesets,
+                files_touched: 0,
+                first: 0,
+                last: 0,
+            })
+            .collect(),
+        scanned,
+        truncated: false,
     }))
 }

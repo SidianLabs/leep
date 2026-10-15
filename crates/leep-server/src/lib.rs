@@ -16,7 +16,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use leep_core::api::*;
 use leep_core::{Changeset, ChangesetId, Error, FileKind, Hash, RepoPath};
-use leep_derive::Repo;
+use leep_derive::{ExtraMatch, LogFilter, Repo};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use tower_http::limit::RequestBodyLimitLayer;
@@ -27,6 +27,8 @@ pub const DEFAULT_MAX_BODY_BYTES: usize = 512 * 1024 * 1024;
 const DEFAULT_LOG_LIMIT: usize = 100;
 /// Upper bound on `limit` so one request can't walk unbounded history.
 const MAX_LOG_LIMIT: usize = 10_000;
+/// Default and maximum number of changesets a provenance request scans.
+const MAX_PROVENANCE_LIMIT: usize = 10_000;
 
 /// Build the router with the default body limit.
 pub fn router(repo: Repo) -> Router {
@@ -56,6 +58,7 @@ pub fn router_with_auth(repo: Repo, max_body_bytes: usize, auth: Option<auth::Au
         .route("/v1/log/{id}", get(log))
         .route("/v1/diff", get(diff))
         .route("/v1/blame/{id}", get(blame))
+        .route("/v1/provenance/{id}", get(provenance))
         .route("/v1/merge-base", get(merge_base))
         .route("/v1/merge", post(merge))
         .route("/v1/rebase", post(rebase))
@@ -91,6 +94,7 @@ type S = State<Arc<Repo>>;
 type ApiResult<T> = Result<T, ApiError>;
 
 /// The single place `leep_core::Error` becomes an HTTP status.
+#[derive(Debug)]
 pub struct ApiError(Error);
 
 impl From<Error> for ApiError {
@@ -146,8 +150,38 @@ struct PrefixQuery {
     prefix: Option<String>,
 }
 
-#[derive(Deserialize)]
+/// `extra` may repeat, which a plain struct can't express, so the log query is
+/// read as raw pairs.
+#[derive(Debug, Default, PartialEq, Eq)]
 struct LogQuery {
+    path: Option<String>,
+    limit: Option<usize>,
+    filter: LogFilter,
+}
+
+impl LogQuery {
+    fn parse(pairs: Vec<(String, String)>) -> ApiResult<Self> {
+        let mut q = LogQuery::default();
+        for (k, v) in pairs {
+            match k.as_str() {
+                "path" => q.path = Some(v),
+                "limit" => {
+                    q.limit = Some(
+                        v.parse()
+                            .map_err(|_| Error::Invalid(format!("bad limit {v:?}")))?,
+                    )
+                }
+                "author" => q.filter.author = Some(v),
+                "extra" => q.filter.extra.push(ExtraMatch::parse(&v)?),
+                _ => {}
+            }
+        }
+        Ok(q)
+    }
+}
+
+#[derive(Deserialize)]
+struct ProvenanceQuery {
     path: Option<String>,
     limit: Option<usize>,
 }
@@ -285,11 +319,28 @@ async fn file(
 async fn log(
     State(repo): S,
     Path(id): Path<String>,
-    Query(q): Query<LogQuery>,
+    Query(pairs): Query<Vec<(String, String)>>,
 ) -> ApiResult<Json<LogResponse>> {
+    let q = LogQuery::parse(pairs)?;
     let limit = q.limit.unwrap_or(DEFAULT_LOG_LIMIT).min(MAX_LOG_LIMIT);
-    let entries = repo.log(cid(&id)?, q.path.as_deref(), limit).await?;
+    let entries = repo
+        .log_filtered(cid(&id)?, q.path.as_deref(), limit, &q.filter)
+        .await?;
     Ok(Json(LogResponse { entries }))
+}
+
+async fn provenance(
+    State(repo): S,
+    Path(id): Path<String>,
+    Query(q): Query<ProvenanceQuery>,
+) -> ApiResult<Json<ProvenanceResponse>> {
+    let limit = q
+        .limit
+        .unwrap_or(MAX_PROVENANCE_LIMIT)
+        .min(MAX_PROVENANCE_LIMIT);
+    Ok(Json(
+        repo.provenance(cid(&id)?, q.path.as_deref(), limit).await?,
+    ))
 }
 
 async fn diff(State(repo): S, Query(q): Query<DiffQuery>) -> ApiResult<Json<DiffResponse>> {
@@ -329,4 +380,49 @@ async fn rebase(State(repo): S, body: Bytes) -> ApiResult<Json<RebaseResponse>> 
 async fn land(State(repo): S, body: Bytes) -> ApiResult<Json<LandResponse>> {
     let req: LandRequest = parse_json(&body)?;
     Ok(Json(repo.land(req.changeset, &req.target_ref).await?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pairs(q: &[(&str, &str)]) -> Vec<(String, String)> {
+        q.iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn log_query_collects_repeated_extra() {
+        let q = LogQuery::parse(pairs(&[
+            ("extra", "agent.model:m"),
+            ("limit", "5"),
+            ("extra", "agent.session"),
+            ("author", "Ann"),
+            ("unknown", "ignored"),
+        ]))
+        .unwrap();
+        assert_eq!(q.limit, Some(5));
+        assert_eq!(q.filter.author.as_deref(), Some("Ann"));
+        assert_eq!(
+            q.filter.extra,
+            [
+                ExtraMatch {
+                    key: "agent.model".into(),
+                    value: Some("m".into())
+                },
+                ExtraMatch {
+                    key: "agent.session".into(),
+                    value: None
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn log_query_rejects_malformed_values() {
+        assert!(LogQuery::parse(pairs(&[("extra", ":x")])).is_err());
+        assert!(LogQuery::parse(pairs(&[("extra", "")])).is_err());
+        assert!(LogQuery::parse(pairs(&[("limit", "many")])).is_err());
+    }
 }

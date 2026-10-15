@@ -56,6 +56,8 @@ pub enum Command {
     Cat(history::CatArgs),
     /// Show who last changed each line.
     Blame(history::BlameArgs),
+    /// Summarize which agents and authors made the changesets.
+    Provenance(history::ProvenanceArgs),
     /// List refs.
     Refs,
 }
@@ -96,7 +98,12 @@ pub fn run(cli: Cli) -> Result<i32> {
     // Read-only queries work outside a working copy when a server is given.
     let read_only = matches!(
         cli.command,
-        Command::Log(_) | Command::Show(_) | Command::Cat(_) | Command::Blame(_) | Command::Refs
+        Command::Log(_)
+            | Command::Show(_)
+            | Command::Cat(_)
+            | Command::Blame(_)
+            | Command::Provenance(_)
+            | Command::Refs
     );
     if read_only && wc.is_err() {
         let token = resolve_token(cli.token.as_deref(), env_token().as_deref(), None);
@@ -142,6 +149,7 @@ fn read_only_cmd(cmd: &Command, r: &Remote) -> Result<i32> {
         Command::Show(a) => history::show(r, a),
         Command::Cat(a) => history::cat(r, a),
         Command::Blame(a) => history::blame(r, a),
+        Command::Provenance(a) => history::provenance(r, a),
         Command::Refs => history::refs(r),
         _ => unreachable!("not a read-only command"),
     }

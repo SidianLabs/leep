@@ -665,3 +665,112 @@ async fn real_tcp_listener() {
     tx.send(()).unwrap();
     server.await.unwrap().unwrap();
 }
+
+impl Client {
+    /// Commit one file with an explicit author and `extra`.
+    async fn commit_as(
+        &self,
+        parents: &[ChangesetId],
+        file: (&str, &str),
+        author: &str,
+        extra: &[(&str, &str)],
+        ts: i64,
+    ) -> ChangesetId {
+        let cs = Changeset {
+            parents: parents.to_vec(),
+            author: author.into(),
+            timestamp: ts,
+            message: format!("edit {}\nbody", file.0),
+            changes: BTreeMap::from([(
+                leep_core::RepoPath::new(file.0).unwrap(),
+                FileChange::Modify {
+                    content: self.put_blob(file.1.as_bytes()).await,
+                    kind: FileKind::Regular,
+                    size: file.1.len() as u64,
+                },
+            )]),
+            extra: extra
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        };
+        let r = self.post("/v1/changesets", &cs).await;
+        assert_eq!(r.status, StatusCode::OK);
+        r.json::<CreateChangesetResponse>().id
+    }
+}
+
+#[tokio::test]
+async fn log_filters_provenance_and_blame_summaries() {
+    let c = Client::new();
+    let a = c.commit_as(&[], ("f", "l1\n"), "alice", &[], 10).await;
+    let b = c
+        .commit_as(
+            &[a],
+            ("f", "l1\nl2\n"),
+            "bot",
+            &[("agent.model", "m1"), ("agent.session", "7")],
+            20,
+        )
+        .await;
+    let d = c
+        .commit_as(&[b], ("g", "g\n"), "bot", &[("agent.model", "m2")], 30)
+        .await;
+
+    let ids = |l: LogResponse| l.entries.iter().map(|e| e.id).collect::<Vec<_>>();
+    let get = |q: String| {
+        let c = &c;
+        async move { c.get(&format!("/v1/log/{d}?{q}")).await }
+    };
+    let l: LogResponse = get("extra=agent.model:m1&extra=agent.session:7".into())
+        .await
+        .json();
+    assert_eq!(ids(l), [b]);
+    let l: LogResponse = get("extra=agent.model:m1&extra=agent.session:8".into())
+        .await
+        .json();
+    assert!(l.entries.is_empty());
+    let l: LogResponse = get("extra=agent.model".into()).await.json();
+    assert_eq!(ids(l), [d, b]);
+    let l: LogResponse = get("author=ALI".into()).await.json();
+    assert_eq!(ids(l), [a]);
+    let l: LogResponse = get("extra=agent.model&path=f".into()).await.json();
+    assert_eq!(ids(l), [b]);
+
+    for bad in ["extra=:x", "extra=", "limit=x"] {
+        assert_eq!(
+            get(bad.into()).await.status,
+            StatusCode::BAD_REQUEST,
+            "{bad}"
+        );
+    }
+
+    let p: ProvenanceResponse = c.get(&format!("/v1/provenance/{d}")).await.json();
+    assert_eq!(p.scanned, 3);
+    assert!(!p.truncated);
+    assert_eq!(p.agents.len(), 2);
+    assert_eq!(p.humans.len(), 1);
+    assert_eq!(p.humans[0].author, "alice");
+    let p: ProvenanceResponse = c
+        .get(&format!("/v1/provenance/{d}?path=g&limit=2"))
+        .await
+        .json();
+    assert_eq!(p.agents.len(), 1);
+    assert_eq!(p.agents[0].model, "m2");
+    assert!(p.humans.is_empty());
+    assert!(p.truncated);
+    assert_eq!(
+        c.get(&format!("/v1/provenance/{d}?limit=x")).await.status,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        c.get("/v1/provenance/zz").await.status,
+        StatusCode::BAD_REQUEST
+    );
+
+    let bl: BlameResponse = c.get(&format!("/v1/blame/{d}?path=f")).await.json();
+    assert_eq!(bl.changesets.len(), 2);
+    assert_eq!(bl.changesets[&a].author, "alice");
+    assert_eq!(bl.changesets[&b].agent["agent.model"], "m1");
+    assert_eq!(bl.changesets[&b].message_first_line, "edit f");
+}
