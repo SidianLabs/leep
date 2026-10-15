@@ -72,5 +72,7 @@ names or tool-generated names.
   ```
 - Keep PRs small and single-purpose. Split refactors from behavior changes.
 - CI (fmt, clippy `-D warnings`, tests) must be green before review.
-- Merge with **squash merge**. Delete the branch after merging.
+- Only the maintainer merges, with **squash merge**, and deletes the
+  branch. Agents open the PR, keep CI green and answer review comments, but
+  never merge.
 - No AI attribution in the title, body or comments (see the top of this skill).
