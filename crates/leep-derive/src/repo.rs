@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use leep_core::api::ChangesetInfo;
+use leep_core::refname;
 use leep_core::{
     BlobStore, Changeset, ChangesetId, Error, FileChange, Hash, MetaStore, Result, TreeNode,
 };
@@ -156,13 +157,20 @@ impl Repo {
         }
     }
 
-    /// Resolve a ref name or full 64-hex changeset id.
+    /// Resolve a ref name or full 64-hex changeset id. As a last resort a
+    /// short name is looked up as a tag (`v1` for `tags/v1`), so a branch or
+    /// id of the same name always wins.
     pub async fn resolve(&self, rev: &str) -> Result<ChangesetId> {
         if let Some(id) = self.meta.get_ref(rev).await? {
             return Ok(id);
         }
         if let Ok(id) = rev.parse::<ChangesetId>() {
             if rev.len() == 64 && self.meta.get_changeset(&id).await?.is_some() {
+                return Ok(id);
+            }
+        }
+        if !refname::is_tag(rev) && refname::validate(rev).is_ok() {
+            if let Some(id) = self.meta.get_ref(&refname::tag_ref(rev)).await? {
                 return Ok(id);
             }
         }
