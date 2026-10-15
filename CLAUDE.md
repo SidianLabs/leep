@@ -47,7 +47,7 @@ A change isn't done until all three pass locally.
 ## Conventions
 
 - Errors: `leep_core::Error`. `Invalid` → 400, `NotFound` → 404,
-  `Storage`/`Other` → 500. Ref CAS loss → 409.
+  `Conflict` and ref CAS loss → 409, `Storage`/`Other` → 500.
 - Async traits use `async-trait`; stores are passed around as
   `Arc<dyn BlobStore>` / `Arc<dyn MetaStore>`.
 - Test logic against `leep_core::memory` stores. Every backend must call the

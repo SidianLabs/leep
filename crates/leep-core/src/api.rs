@@ -28,7 +28,8 @@
 //! the rest of the path.
 //!
 //! Errors are `{"error": "..."}` ([`ErrorResponse`]): `Error::Invalid` → 400,
-//! `Error::NotFound` → 404, CAS loss → 409, anything else → 500.
+//! `Error::NotFound` → 404, CAS loss and `Error::Conflict` (e.g. a land that
+//! kept losing to concurrent lands) → 409, anything else → 500.
 //! Hashes and ids are lowercase hex in JSON.
 
 use std::collections::BTreeMap;

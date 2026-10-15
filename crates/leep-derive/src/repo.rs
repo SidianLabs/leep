@@ -1,7 +1,7 @@
 //! The [`Repo`] handle and changeset creation.
 
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use leep_core::api::ChangesetInfo;
@@ -17,11 +17,17 @@ use crate::tree_ops::apply_changes;
 pub struct Repo {
     blobs: Arc<dyn BlobStore>,
     meta: Arc<dyn MetaStore>,
+    /// Per-ref locks serializing lands within this process (see `land`).
+    pub(crate) land_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 impl Repo {
     pub fn new(blobs: Arc<dyn BlobStore>, meta: Arc<dyn MetaStore>) -> Self {
-        Repo { blobs, meta }
+        Repo {
+            blobs,
+            meta,
+            land_locks: Arc::default(),
+        }
     }
 
     pub fn blobs(&self) -> &Arc<dyn BlobStore> {

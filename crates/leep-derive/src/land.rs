@@ -1,19 +1,44 @@
 //! `land`: replay unlanded changesets onto the ref head and compare-and-swap,
 //! no merge queue.
 
+use std::collections::hash_map::RandomState;
+use std::hash::BuildHasher;
+use std::sync::Arc;
+use std::time::Duration;
+
 use leep_core::api::{LandResponse, RebaseResponse};
 use leep_core::{ChangesetId, Error, Result};
 
 use crate::Repo;
 
-const MAX_LAND_ATTEMPTS: u32 = 16;
+/// Lands within one process are serialized per ref, so losses only come from
+/// other server instances sharing the store; this bounds those retries.
+const MAX_LAND_ATTEMPTS: u32 = 32;
+const BACKOFF_CAP_MS: u64 = 200;
+
+/// Full-jitter exponential backoff, so racing servers spread out instead of
+/// colliding again in lockstep.
+fn backoff(attempt: u32) -> Duration {
+    let cap = (1u64 << attempt.min(8)).min(BACKOFF_CAP_MS);
+    Duration::from_millis(RandomState::new().hash_one(attempt) % (cap + 1))
+}
 
 impl Repo {
     /// Land `cs` on `target_ref`. Fast-forwards when the head is an ancestor;
     /// otherwise replays the unlanded stack under `cs` onto the head. Retries
     /// when the CAS loses; conflicts are returned, never resolved here.
+    ///
+    /// Lands on the same ref are serialized within this process: under
+    /// contention every attempt would otherwise redo the replay only to lose
+    /// the CAS to a sibling request. The CAS still guards against other
+    /// processes, with jittered backoff between losses.
     pub async fn land(&self, cs: ChangesetId, target_ref: &str) -> Result<LandResponse> {
         self.get_changeset(cs).await?;
+        let lock = {
+            let mut locks = self.land_locks.lock().expect("land lock map poisoned");
+            Arc::clone(locks.entry(target_ref.to_string()).or_default())
+        };
+        let _guard = lock.lock().await;
         for attempt in 1..=MAX_LAND_ATTEMPTS {
             let head = self.meta().get_ref(target_ref).await?;
             let new = match head {
@@ -40,10 +65,10 @@ impl Repo {
                     attempts: attempt,
                 });
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(backoff(attempt)).await;
         }
-        Err(Error::Other(format!(
-            "land onto {target_ref:?} lost the race {MAX_LAND_ATTEMPTS} times"
+        Err(Error::Conflict(format!(
+            "land onto {target_ref:?} lost the race {MAX_LAND_ATTEMPTS} times; retry"
         )))
     }
 
