@@ -79,6 +79,7 @@ content-addressing and (b) the atomicity of `MetaStore::cas_ref`.
 | `leep-git` | Git bridge: library plus the `leep-git` admin binary | core, derive; store and meta only to open stores by URL in the binary |
 | `leep-fuzz-targets` | Test-only (`publish = false`): fuzz harness functions and the seed corpus loader for every decoder and parser (`docs/FUZZING.md`) | core, derive, server (to drive the real router and config parsers); nothing depends on it except the `fuzz/` crate |
 | `leep-testkit` | Fault-injecting `BlobStore`/`MetaStore` wrappers and a seeded fault plan, for tests (ADR 0021) | core; a dev-dependency only, never a normal dependency of any crate |
+| `leep-soak` | Soak test binary (`publish = false`): an agent swarm against a real `leep-server`, invariant checks, GC and restarts beside it, a trend report (ADR 0022). Starts the `leep` and `leep-server` binaries; talks to the server over HTTP only | core only (types); nothing depends on it |
 
 Rules:
 - Dependencies point toward `leep-core`. Nothing depends on `leep-server`
@@ -405,7 +406,9 @@ written after the values it is computed from exist, and derivation retries
 from whatever rows are present. What the stores do not protect is a row or
 blob that is damaged at rest. Tree nodes and history nodes are content
 addressed and checked on read; most other derived rows are not (ADR 0021
-lists them). The tests that establish all of this are in ADR 0021.
+lists them). The tests that establish all of this are in ADR 0021; the soak test
+(ADR 0022) checks the same properties over hours and a deep history, with
+GC and restarts running beside a swarm of agents.
 
 Observability: libraries emit `tracing` events and `metrics` facade calls
 (no-ops without a recorder); only `leep-server` installs a recorder and

@@ -1,0 +1,78 @@
+name: Soak
+
+# Too slow for pull requests (and deliberately not in the `test` job of
+# rust.yml): an agent swarm against a real server on Postgres for a while.
+# `cargo test` runs a 10-second smoke of the same harness on every PR. See
+# docs/OPERATIONS.md, "Soak tests", for how to read the report.
+on:
+  schedule:
+    - cron: "41 4 * * 1"
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: "How long the swarm runs (30m, 2h, 8h)"
+        default: "30m"
+      agents:
+        description: "Simulated agents using the HTTP API"
+        default: "50"
+      think:
+        description: "Mean think time per agent; lands to one ref are serialized, so keep agents * (land cost) well under it"
+        default: "10s"
+      chaos:
+        description: "Restart the server during the run (SIGTERM and SIGKILL)"
+        type: boolean
+        default: false
+      seed:
+        description: "Workload seed (empty: a fresh one from the run number)"
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  soak:
+    runs-on: ubuntu-latest
+    # The run, plus the build, setup and final checks.
+    timeout-minutes: 600
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: leep
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      LEEP_SOAK_POSTGRES_URL: postgres://postgres:leep@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p leep-soak -p leep-server -p leep-cli
+      - name: Soak
+        env:
+          DURATION: ${{ inputs.duration || '30m' }}
+          AGENTS: ${{ inputs.agents || '50' }}
+          THINK: ${{ inputs.think || '10s' }}
+          CHAOS: ${{ inputs.chaos && '--chaos' || '' }}
+          SEED: ${{ inputs.seed || github.run_number }}
+        run: |
+          # The seed is in the report, so a failure can be replayed.
+          ./target/release/leep-soak \
+            --duration "$DURATION" --agents "$AGENTS" --think "$THINK" --seed "$SEED" $CHAOS \
+            --out soak-out
+      # The report and the server's log are what a failure is diagnosed from.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: soak-${{ github.run_number }}
+          path: |
+            soak-out/report.json
+            soak-out/summary.txt
+            soak-out/server.log
+            soak-out/gc.log
+          if-no-files-found: warn
+          retention-days: 30
