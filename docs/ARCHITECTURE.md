@@ -137,6 +137,16 @@ Other kinds are derived on first read. Add new kinds with the
 [`add-derived-data-kind`](../.claude/skills/add-derived-data-kind/SKILL.md)
 skill. A new kind never requires a client change.
 
+**Provenance queries.** `agent.*` keys in `extra` (see `EXTRA_AGENT_*`) are
+queryable without any new persisted data. `GET /v1/log` takes `author` and
+repeated `extra=key:value` / `extra=key` filters (ANDed), `GET /v1/provenance`
+counts changesets per agent model and session and per human author, and blame
+responses carry a deduplicated per-changeset summary (author, time, first
+message line, `agent.*` keys). The summaries are attached on read, so the
+cached `blame` value keeps its original encoding. All of these walk history
+linearly (provenance is capped at 10 000 changesets and reports `truncated`);
+an index over `agent.*` keys is future work.
+
 ## 6. Request flows
 
 **Commit** (`leep commit`):

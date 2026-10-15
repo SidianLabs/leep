@@ -22,7 +22,7 @@ Milestones are ordered. Each one should leave `main` releasable.
 
 ## v0.3: Agent-native
 - Fenced two-phase blob GC that closes the last claim/delete race (ADR 0008)
-- Provenance: `leep log --agent`, and queries over `agent.*` metadata
+- [x] Provenance: `leep log --agent`, and queries over `agent.*` metadata (`leep provenance`, `leep blame --who`)
 - Signed changesets (author keys)
 - Review service with semantic approval rules (for example, comment-only changes auto-approve) and per-directory owners
 - MCP server exposing Leep operations to agents
