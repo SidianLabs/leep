@@ -150,12 +150,21 @@ Nothing mutable has changed yet; the changeset is just an addressable object.
 loop (≤16 attempts):
   head ← get_ref(target)
   if head is None:                 CAS(None → cs)
-  elif head is an ancestor of cs:  CAS(head → cs)   # fast-forward, keeps stacks intact
-  else: r ← rebase(cs onto head)   # 3-way, base = cs.parents[0]
-        conflicts?  → return Conflicts (never auto-resolved on the server)
-        CAS(head → r)
+  elif cs is an ancestor of head:  already landed
+  elif head is an ancestor of cs:  CAS(head → cs)          # fast-forward
+  else:
+    stack ← first-parent chain from cs down to where it joins head's history
+    replay each stack entry onto head, oldest first        # 3-way per entry
+    conflict? → return Conflicts{onto: head, conflicts, clean}
+                (the whole stack squashed into one 3-way merge vs head;
+                 never auto-resolved on the server)
+    CAS(head → replayed top)
   CAS won → Landed;  CAS lost → retry
 ```
+Replaying the whole stack matters: rebasing only `cs` would silently drop the
+changes of unlanded changesets below it. On conflict the client applies
+`clean`, resolves `conflicts` on top of `onto`, commits once and lands again,
+which is then a fast-forward. Stacks containing merges are rejected.
 
 **Checkout** (`leep checkout`): the client resolves a rev to an id and lists
 files under the requested prefixes (`GET /v1/files`). It then fetches the
