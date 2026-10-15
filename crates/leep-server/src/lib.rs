@@ -1,12 +1,15 @@
 //! The Leep HTTP server: a thin axum layer over [`leep_derive::Repo`].
 //! The endpoint contract is the table in `leep_core::api`.
 
+pub mod auth;
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{header, HeaderValue, StatusCode};
+use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -32,7 +35,13 @@ pub fn router(repo: Repo) -> Router {
 
 /// Build the router, rejecting request bodies over `max_body_bytes` with 413.
 pub fn router_with_limit(repo: Repo, max_body_bytes: usize) -> Router {
-    Router::new()
+    router_with_auth(repo, max_body_bytes, None)
+}
+
+/// Build the router; with `Some(auth)` every endpoint except `GET /v1/health`
+/// requires a bearer token. `None` leaves the API open.
+pub fn router_with_auth(repo: Repo, max_body_bytes: usize, auth: Option<auth::Auth>) -> Router {
+    let router = Router::new()
         .route("/v1/health", get(health))
         .route("/v1/blobs/missing", post(missing_blobs))
         .route("/v1/blobs/{hash}", get(get_blob).put(put_blob))
@@ -50,7 +59,16 @@ pub fn router_with_limit(repo: Repo, max_body_bytes: usize) -> Router {
         .route("/v1/merge-base", get(merge_base))
         .route("/v1/merge", post(merge))
         .route("/v1/rebase", post(rebase))
-        .route("/v1/land", post(land))
+        .route("/v1/land", post(land));
+    // Innermost, so a rejected request never has its body read.
+    let router = match auth {
+        Some(a) => router.layer(middleware::from_fn_with_state(
+            Arc::new(a),
+            auth::require_token,
+        )),
+        None => router,
+    };
+    router
         .layer(DefaultBodyLimit::disable())
         .layer(RequestBodyLimitLayer::new(max_body_bytes))
         .layer(TraceLayer::new_for_http())
