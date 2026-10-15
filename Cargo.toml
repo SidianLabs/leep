@@ -1,0 +1,29 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/bhaweshbhaskar/leep"
+
+[workspace.dependencies]
+leep-core = { path = "crates/leep-core" }
+leep-store = { path = "crates/leep-store" }
+leep-meta = { path = "crates/leep-meta" }
+leep-derive = { path = "crates/leep-derive" }
+leep-git = { path = "crates/leep-git" }
+leep-server = { path = "crates/leep-server" }
+
+anyhow = "1"
+async-trait = "0.1"
+blake3 = "1"
+bytes = { version = "1", features = ["serde"] }
+hex = "0.4"
+postcard = { version = "1", features = ["use-std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
