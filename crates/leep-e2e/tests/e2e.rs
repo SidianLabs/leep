@@ -1383,3 +1383,236 @@ fn branches_switching_and_immutable_tags_postgres() {
     let stores = Stores::with_meta(&tmp.path().join("data"), db.url.clone());
     run_branch_and_tag_workflow(&stores, tmp.path());
 }
+
+fn run_everyday_workflow(stores: &Stores, work: &Path) {
+    let server = Server::start(stores, work);
+    let client = Client::new(&server.url, &work.join("cache"));
+    let (a, b) = (work.join("a"), work.join("b"));
+    let main_head = |dir: &Path| {
+        client.json(dir, &["refs"])["refs"]["main"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+
+    client.ok(work, &["init", a.to_str().unwrap()]);
+    write(&a, "doc.txt", "one\ntwo\nthree\n");
+    write(&a, "b.txt", "b\n");
+    write(&a, "c.txt", "c\n");
+    client.ok(&a, &["commit", "-m", "start"]);
+    client.ok(&a, &["land"]);
+    client.ok(work, &["init", b.to_str().unwrap()]);
+    assert_eq!(fs::read_to_string(b.join("c.txt")).unwrap(), "c\n");
+
+    // A lands while B has uncommitted edits; B syncs and keeps them.
+    write(&a, "c.txt", "c from A\n");
+    client.ok(&a, &["commit", "-m", "A edits c"]);
+    client.ok(&a, &["land"]);
+    write(&b, "b.txt", "b from B\n");
+    write(&b, "new.txt", "new in B\n");
+    let out = client.run(&b, &["sync", "--no-rebase"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stderr(&out).contains("uncommitted"), "{}", stderr(&out));
+    client.ok(&b, &["sync"]);
+    assert_eq!(fs::read_to_string(b.join("c.txt")).unwrap(), "c from A\n");
+    assert_eq!(fs::read_to_string(b.join("b.txt")).unwrap(), "b from B\n");
+    assert_eq!(fs::read_to_string(b.join("new.txt")).unwrap(), "new in B\n");
+    let st = client.json(&b, &["status"]);
+    let changed: Vec<(&str, &str)> = st["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| (c["path"].as_str().unwrap(), c["status"].as_str().unwrap()))
+        .collect();
+    assert_eq!(changed, [("b.txt", "modified"), ("new.txt", "added")]);
+    assert_eq!(st["base"], main_head(&b).as_str());
+    assert_eq!(st["on_target"], true);
+    client.ok(&b, &["commit", "-m", "B work"]);
+    client.ok(&b, &["land"]);
+
+    // A conflicting edit: markers, and commit refuses until they are gone.
+    write(&a, "doc.txt", "one from A\ntwo\nthree\n");
+    client.ok(&a, &["commit", "-m", "A edits doc"]);
+    client.ok(&a, &["land"]);
+    write(&b, "doc.txt", "one from B\ntwo\nthree\n");
+    write(&b, "extra.txt", "extra\n");
+    let out = client.run(&b, &["sync"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(stdout(&out).contains("C doc.txt"), "{}", stdout(&out));
+    let doc = fs::read_to_string(b.join("doc.txt")).unwrap();
+    assert!(doc.contains("<<<<<<<") && doc.contains("one from A") && doc.contains("one from B"));
+    assert!(client.ok(&b, &["status"]).contains("C doc.txt"));
+    let out = client.run(&b, &["commit", "-m", "too soon"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stderr(&out).contains("conflict"), "{}", stderr(&out));
+    let out = client.run(&b, &["land"]);
+    assert_eq!(out.status.code(), Some(1));
+    write(&b, "doc.txt", "one merged\ntwo\nthree\n");
+    client.ok(&b, &["commit", "-m", "merged doc"]);
+    client.ok(&b, &["land"]);
+    assert_eq!(
+        client.ok(&b, &["cat", "main", "doc.txt"]),
+        "one merged\ntwo\nthree\n"
+    );
+    assert_eq!(client.ok(&b, &["cat", "main", "extra.txt"]), "extra\n");
+
+    // Stash: push, list, show, pop.
+    write(&b, "b.txt", "stashed edit\n");
+    write(&b, "scratch.txt", "scratch\n");
+    fs::remove_file(b.join("c.txt")).unwrap();
+    let out = client.ok(&b, &["stash", "-m", "half done"]);
+    assert!(out.contains("Saved stash 0"), "{out}");
+    assert_eq!(fs::read_to_string(b.join("b.txt")).unwrap(), "b from B\n");
+    assert_eq!(fs::read_to_string(b.join("c.txt")).unwrap(), "c from A\n");
+    assert!(!b.join("scratch.txt").exists());
+    assert!(client.ok(&b, &["status"]).contains("1 stash"));
+    assert_eq!(client.json(&b, &["status"])["stashes"], 1);
+    assert!(client.ok(&b, &["stash", "list"]).contains("half done"));
+    let shown = client.ok(&b, &["stash", "show"]);
+    assert!(
+        shown.contains("M b.txt") && shown.contains("A scratch.txt") && shown.contains("D c.txt"),
+        "{shown}"
+    );
+    let out = client.run(&b, &["stash", "drop", "7"]);
+    assert_eq!(out.status.code(), Some(1));
+    // Another change lands first; the stash still applies on top of it.
+    write(&a, "c.txt", "c again from A\n");
+    client.ok(&a, &["commit", "-m", "A edits c again"]);
+    client.ok(&a, &["land"]);
+    client.ok(&b, &["sync"]);
+    // The stash deletes c.txt, which the head changed: no text merge, so the
+    // pop keeps the stash and flags the path until it is resolved.
+    let out = client.run(&b, &["stash", "pop"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(stdout(&out).contains("no text merge"), "{}", stdout(&out));
+    assert!(client.ok(&b, &["status"]).contains("C c.txt"));
+    client.ok(&b, &["resolve", "c.txt"]);
+    client.ok(&b, &["stash", "drop"]);
+    assert_eq!(
+        fs::read_to_string(b.join("b.txt")).unwrap(),
+        "stashed edit\n"
+    );
+    assert_eq!(
+        fs::read_to_string(b.join("scratch.txt")).unwrap(),
+        "scratch\n"
+    );
+    assert!(!b.join("c.txt").exists(), "stashed delete came back");
+    assert_eq!(client.ok(&b, &["stash", "list"]), "");
+    let out = client.run(&b, &["stash", "pop"]);
+    assert_eq!(out.status.code(), Some(1));
+
+    // Restore: one file back, the new one is left unless --force.
+    client.ok(&b, &["restore", "b.txt", "c.txt"]);
+    assert_eq!(fs::read_to_string(b.join("b.txt")).unwrap(), "b from B\n");
+    assert_eq!(
+        fs::read_to_string(b.join("c.txt")).unwrap(),
+        "c again from A\n"
+    );
+    client.ok(&b, &["restore", "scratch.txt"]);
+    assert!(b.join("scratch.txt").exists());
+    client.ok(&b, &["restore", "--force", "scratch.txt"]);
+    assert!(!b.join("scratch.txt").exists());
+    assert!(client.ok(&b, &["status"]).contains("working copy clean"));
+    let first = client.json(&b, &["log", "main"])["entries"][1]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    client.ok(&b, &["restore", "--source", &first, "c.txt"]);
+    assert_eq!(fs::read_to_string(b.join("c.txt")).unwrap(), "c from A\n");
+    client.ok(&b, &["restore", "c.txt"]);
+
+    // Amend: fold an edit and a new message into an unlanded commit.
+    write(&b, "f.txt", "f one\n");
+    client.ok(&b, &["commit", "-m", "first words"]);
+    let before = client.json(&b, &["status"])["base"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    write(&b, "f.txt", "f two\n");
+    client.ok(&b, &["amend", "-m", "better words"]);
+    let st = client.json(&b, &["status"]);
+    assert_ne!(st["base"], before.as_str());
+    assert_eq!(st["ahead"], 1);
+    assert!(client
+        .ok(&b, &["status"])
+        .contains("base is 1 commit ahead of main"));
+    let log = client.json(&b, &["log", "@"]);
+    assert_eq!(log["entries"][0]["changeset"]["message"], "better words");
+    assert_eq!(client.ok(&b, &["cat", "@", "f.txt"]), "f two\n");
+    // A landed base cannot be amended.
+    client.ok(&b, &["land"]);
+    write(&b, "f.txt", "f three\n");
+    let out = client.run(&b, &["amend"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stderr(&out).contains("already landed"), "{}", stderr(&out));
+    client.ok(&b, &["restore", "f.txt"]);
+
+    // Reset: soft undoes a commit and keeps its changes; hard discards.
+    write(&b, "g.txt", "g\n");
+    client.ok(&b, &["commit", "-m", "to undo"]);
+    let committed = client.json(&b, &["status"])["base"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    client.ok(&b, &["reset"]);
+    assert_eq!(fs::read_to_string(b.join("g.txt")).unwrap(), "g\n");
+    let st = client.json(&b, &["status"]);
+    assert_eq!(st["base"], main_head(&b).as_str());
+    assert_eq!(st["changes"][0]["path"], "g.txt");
+    assert_eq!(st["changes"][0]["status"], "added");
+    // The undone commit is still on the server.
+    assert!(client.ok(&b, &["show", &committed]).contains("to undo"));
+    client.ok(&b, &["commit", "-m", "to undo"]);
+    write(&b, "b.txt", "scrap\n");
+    let out = client.run(&b, &["reset", "--hard", "main"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stderr(&out).contains("--force"), "{}", stderr(&out));
+    assert_eq!(fs::read_to_string(b.join("b.txt")).unwrap(), "scrap\n");
+    client.ok(&b, &["reset", "--hard", "--force", "main"]);
+    assert_eq!(fs::read_to_string(b.join("b.txt")).unwrap(), "b from B\n");
+    assert!(!b.join("g.txt").exists());
+    assert_eq!(client.json(&b, &["status"])["base"], main_head(&b).as_str());
+    // Reset never moves a ref.
+    assert_eq!(main_head(&a), main_head(&b));
+
+    // A binary conflict has no markers: it still blocks commit until resolved.
+    fs::write(a.join("img.bin"), b"base\xff").unwrap();
+    client.ok(&a, &["commit", "-m", "image"]);
+    client.ok(&a, &["land"]);
+    client.ok(&b, &["sync"]);
+    fs::write(a.join("img.bin"), b"from A\xff").unwrap();
+    client.ok(&a, &["commit", "-m", "A image"]);
+    client.ok(&a, &["land"]);
+    fs::write(b.join("img.bin"), b"from B\xff").unwrap();
+    let out = client.run(&b, &["sync"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(stdout(&out).contains("no text merge"), "{}", stdout(&out));
+    assert_eq!(fs::read(b.join("img.bin")).unwrap(), b"from B\xff");
+    let st = client.json(&b, &["status"]);
+    assert_eq!(st["changes"][0]["status"], "conflicted");
+    let out = client.run(&b, &["commit", "-m", "x"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stderr(&out).contains("img.bin"), "{}", stderr(&out));
+    client.ok(&b, &["resolve", "img.bin"]);
+    client.ok(&b, &["commit", "-m", "keep B image"]);
+    client.ok(&b, &["land"]);
+}
+
+#[test]
+fn everyday_workflow_sync_stash_restore_amend_reset() {
+    let _g = serial();
+    let tmp = tempfile::tempdir().unwrap();
+    let stores = Stores::sqlite(&tmp.path().join("data"));
+    run_everyday_workflow(&stores, tmp.path());
+}
+
+#[test]
+fn everyday_workflow_sync_stash_restore_amend_reset_postgres() {
+    let _g = serial();
+    let Some(db) = PgDb::create() else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let stores = Stores::with_meta(&tmp.path().join("data"), db.url.clone());
+    run_everyday_workflow(&stores, tmp.path());
+}
