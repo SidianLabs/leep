@@ -223,6 +223,12 @@ async fn incremental_import_and_set_ref() {
     assert_eq!(repo.resolve("main").await.unwrap(), r3.head.unwrap());
     assert_eq!(repo.generation(r3.head.unwrap()).await.unwrap(), 4);
     assert_matches_git(&repo, r3.head.unwrap(), p, "HEAD").await;
+    // Only the two moves are logged; the no-op re-import is not.
+    let log = repo.meta().ref_log(Some("main"), None, 10).await.unwrap();
+    assert_eq!(log.len(), 2);
+    assert!(log.iter().all(|e| e.operation == "import"));
+    assert_eq!(log[0].new, r3.head);
+    assert_eq!(log[1].old, None);
 
     // A divergent history must not move the ref.
     git(p, &["checkout", "-q", "-b", "other", "HEAD~3"]);

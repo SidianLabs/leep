@@ -285,7 +285,14 @@ fn swap(
     new: Option<ChangesetId>,
     lost: impl FnOnce() -> String,
 ) -> Result<()> {
-    let resp = ctx.client.cas_ref(name, &CasRefRequest { expected, new })?;
+    let resp = ctx.client.cas_ref(
+        name,
+        &CasRefRequest {
+            expected,
+            new,
+            ..CasRefRequest::default()
+        },
+    )?;
     if resp.ok {
         Ok(())
     } else {

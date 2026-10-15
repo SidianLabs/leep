@@ -3,18 +3,27 @@ use std::str::FromStr;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use leep_core::{Changeset, ChangesetId, Hash, MetaStore, Result};
+use leep_core::store::unix_now;
+use leep_core::{Changeset, ChangesetId, Hash, MetaStore, RefLogEntry, RefUpdateContext, Result};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{PgPool, Row};
 
-use crate::{decode_checked, storage, to_id};
+use crate::{decode_checked, log_entry, storage, to_id, LogRow};
 
 const SCHEMA: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS changesets (id BYTEA PRIMARY KEY, data BYTEA NOT NULL)",
     "CREATE TABLE IF NOT EXISTS refs (name TEXT PRIMARY KEY, target BYTEA NOT NULL)",
     "CREATE TABLE IF NOT EXISTS derived (kind TEXT NOT NULL, key BYTEA NOT NULL, \
      value BYTEA NOT NULL, PRIMARY KEY (kind, key))",
+    "CREATE TABLE IF NOT EXISTS ref_log (seq BIGSERIAL PRIMARY KEY, name TEXT NOT NULL, \
+     old_target BYTEA, new_target BYTEA, time BIGINT NOT NULL, actor TEXT, \
+     operation TEXT NOT NULL, message TEXT)",
+    "CREATE INDEX IF NOT EXISTS ref_log_name ON ref_log (name, seq)",
 ];
+
+/// Taken after a ref changes and before its log row is inserted, so `seq`
+/// order is commit order. Nothing waits on a row lock while holding it.
+const LOG_LOCK: i64 = 7164738;
 
 pub struct PostgresMetaStore {
     pool: PgPool,
@@ -132,16 +141,20 @@ impl MetaStore for PostgresMetaStore {
         row.map(|r| to_id(&r.get::<Vec<u8>, _>(0))).transpose()
     }
 
-    async fn cas_ref(
+    async fn cas_ref_logged(
         &self,
         name: &str,
         expected: Option<ChangesetId>,
         new: Option<ChangesetId>,
+        ctx: &RefUpdateContext,
     ) -> Result<bool> {
+        if expected == new {
+            return Ok(self.get_ref(name).await? == expected);
+        }
         let exp = expected.map(|i| i.0 .0.to_vec());
         let new = new.map(|i| i.0 .0.to_vec());
-        let q = match (exp, new) {
-            (None, None) => return Ok(self.get_ref(name).await?.is_none()),
+        let mut tx = self.pool.begin().await.map_err(storage)?;
+        let q = match (&exp, &new) {
             (None, Some(n)) => sqlx::query(
                 "INSERT INTO refs (name, target) VALUES ($1, $2) ON CONFLICT DO NOTHING",
             )
@@ -156,9 +169,54 @@ impl MetaStore for PostgresMetaStore {
             (Some(e), None) => sqlx::query("DELETE FROM refs WHERE name = $1 AND target = $2")
                 .bind(name)
                 .bind(e),
+            (None, None) => unreachable!("expected == new returned above"),
         };
-        let res = q.execute(&self.pool).await.map_err(storage)?;
-        Ok(res.rows_affected() == 1)
+        if q.execute(&mut *tx).await.map_err(storage)?.rows_affected() != 1 {
+            tx.rollback().await.map_err(storage)?;
+            return Ok(false);
+        }
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(LOG_LOCK)
+            .execute(&mut *tx)
+            .await
+            .map_err(storage)?;
+        sqlx::query(
+            "INSERT INTO ref_log (name, old_target, new_target, time, actor, operation, message) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(name)
+        .bind(exp)
+        .bind(new)
+        .bind(unix_now())
+        .bind(ctx.actor.as_deref())
+        .bind(&ctx.operation)
+        .bind(ctx.message.as_deref())
+        .execute(&mut *tx)
+        .await
+        .map_err(storage)?;
+        tx.commit().await.map_err(storage)?;
+        Ok(true)
+    }
+
+    async fn ref_log(
+        &self,
+        name: Option<&str>,
+        before_seq: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<RefLogEntry>> {
+        let before = before_seq.map(|s| i64::try_from(s).unwrap_or(i64::MAX));
+        let rows: Vec<LogRow> = sqlx::query_as(
+            "SELECT seq, name, old_target, new_target, time, actor, operation, message \
+             FROM ref_log WHERE ($1::text IS NULL OR name = $1) \
+             AND ($2::bigint IS NULL OR seq < $2) ORDER BY seq DESC LIMIT $3",
+        )
+        .bind(name)
+        .bind(before)
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(storage)?;
+        rows.into_iter().map(log_entry).collect()
     }
 
     async fn list_refs(&self) -> Result<BTreeMap<String, ChangesetId>> {

@@ -62,6 +62,15 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   tool takes `renames`.
 - `leep log --follow FILE` continues a file's history under its old names;
   `GET /v1/log` takes `follow`, and the MCP `leep_log` tool takes `follow`.
+- Ref log (ADR 0018): every ref create, move and delete is recorded with the
+  actor, operation and time, in the same transaction as the change. `leep
+  reflog [REF] [-n N]` shows it, `GET /v1/reflog[/{name}]` serves it to read
+  tokens, and `POST /v1/refs/{name}` accepts optional `operation` and
+  `message` labels. `leep undo [REF] [--to SEQ]` moves a ref back to its
+  previous value through the normal policy checks; the redo is another undo.
+  `MetaStore` gains `cas_ref_logged` and `ref_log` (`cas_ref` keeps working).
+  The `ref_log` table is created when the server first opens an existing
+  database, so upgrade every server before relying on the log.
 
 - `leep sync` no longer needs a clean working copy. It saves uncommitted
   changes as a snapshot changeset, has the server rebase it onto the new head

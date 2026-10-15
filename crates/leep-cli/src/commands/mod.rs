@@ -9,6 +9,7 @@ pub mod history;
 pub mod init;
 pub mod keygen;
 pub mod land;
+pub mod reflog;
 pub mod reset;
 pub mod resolve;
 pub mod restore;

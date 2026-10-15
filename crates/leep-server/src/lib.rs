@@ -19,7 +19,7 @@ use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use leep_core::api::*;
 use leep_core::rename::RenameOptions;
-use leep_core::{Changeset, ChangesetId, Error, FileKind, Hash, RepoPath};
+use leep_core::{Changeset, ChangesetId, Error, FileKind, Hash, RefUpdateContext, RepoPath};
 use leep_derive::{search, ExtraMatch, LogFilter, Repo, SearchQuery};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
@@ -34,6 +34,8 @@ pub const DEFAULT_MAX_BODY_BYTES: usize = 512 * 1024 * 1024;
 /// condemned has stored its changeset or been aborted by then.
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
+const DEFAULT_REFLOG_LIMIT: usize = 50;
+const MAX_REFLOG_LIMIT: usize = 1000;
 const DEFAULT_LOG_LIMIT: usize = 100;
 /// Upper bound on `limit` so one request can't walk unbounded history.
 const MAX_LOG_LIMIT: usize = 10_000;
@@ -125,6 +127,8 @@ pub fn router_with_timeout(
         .route("/v1/changesets/{id}/review-status", get(review_status))
         .route("/v1/refs", get(list_refs))
         .route("/v1/refs/{*name}", get(get_ref).post(cas_ref))
+        .route("/v1/reflog", get(ref_log_all))
+        .route("/v1/reflog/{*name}", get(ref_log_one))
         .route("/v1/resolve/{*rev}", get(resolve))
         .route("/v1/tree/{id}", get(tree))
         .route("/v1/files/{id}", get(files))
@@ -494,9 +498,50 @@ async fn get_ref(State(repo): S, Path(name): Path<String>) -> ApiResult<Json<Ref
     Ok(Json(RefResponse { name, target }))
 }
 
-async fn cas_ref(State(repo): S, Path(name): Path<String>, body: Bytes) -> ApiResult<Response> {
+/// Operations only the server itself may record.
+const RESERVED_OPERATIONS: [&str; 2] = ["land", "import"];
+
+/// The ref log context of a client-driven ref move. The actor is the token's
+/// name; the label and message are the client's, within limits, so entries
+/// stay one readable line and a client cannot pose as a land or an import.
+fn ref_context(who: Option<&auth::Principal>, req: &CasRefRequest) -> ApiResult<RefUpdateContext> {
+    let op = req.operation.as_deref().unwrap_or("cas");
+    let ok = !op.is_empty()
+        && op.len() <= 32
+        && op
+            .bytes()
+            .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.'));
+    if !ok || RESERVED_OPERATIONS.contains(&op) {
+        return Err(Error::Invalid(format!(
+            "bad operation {op:?}: expected up to 32 of a-z 0-9 - _ . and not {}",
+            RESERVED_OPERATIONS.join(" or ")
+        ))
+        .into());
+    }
+    let mut ctx = RefUpdateContext::new(op).actor(who.map(|p| p.name.as_str()));
+    if let Some(m) = &req.message {
+        if m.len() > 256 || m.chars().any(char::is_control) {
+            return Err(Error::Invalid(
+                "bad message: expected up to 256 bytes without control characters".into(),
+            )
+            .into());
+        }
+        ctx = ctx.message(m.as_str());
+    }
+    Ok(ctx)
+}
+
+async fn cas_ref(
+    State(repo): S,
+    auth::MaybePrincipal(who): auth::MaybePrincipal,
+    Path(name): Path<String>,
+    body: Bytes,
+) -> ApiResult<Response> {
     let req: CasRefRequest = parse_json(&body)?;
-    let won = repo.cas_ref_checked(&name, req.expected, req.new).await?;
+    let ctx = ref_context(who.as_ref(), &req)?;
+    let won = repo
+        .cas_ref_checked(&name, req.expected, req.new, &ctx)
+        .await?;
     let current = repo.meta().get_ref(&name).await?;
     let status = if won {
         StatusCode::OK
@@ -504,6 +549,48 @@ async fn cas_ref(State(repo): S, Path(name): Path<String>, body: Bytes) -> ApiRe
         StatusCode::CONFLICT
     };
     Ok((status, Json(CasRefResponse { ok: won, current })).into_response())
+}
+
+#[derive(Deserialize)]
+struct RefLogQuery {
+    /// Text, so a bad value is our 400 and not the extractor's.
+    before: Option<String>,
+    limit: Option<String>,
+}
+
+async fn ref_log(
+    repo: &Repo,
+    name: Option<&str>,
+    q: RefLogQuery,
+) -> ApiResult<Json<RefLogResponse>> {
+    fn num<T: std::str::FromStr>(what: &str, v: Option<String>) -> ApiResult<Option<T>> {
+        v.map(|v| {
+            v.parse()
+                .map_err(|_| Error::Invalid(format!("bad {what} {v:?}: expected a number")).into())
+        })
+        .transpose()
+    }
+    let before = num::<u64>("before", q.before)?;
+    let limit = num::<usize>("limit", q.limit)?
+        .unwrap_or(DEFAULT_REFLOG_LIMIT)
+        .min(MAX_REFLOG_LIMIT);
+    let entries = repo.meta().ref_log(name, before, limit).await?;
+    Ok(Json(RefLogResponse { entries }))
+}
+
+async fn ref_log_all(
+    State(repo): S,
+    Query(q): Query<RefLogQuery>,
+) -> ApiResult<Json<RefLogResponse>> {
+    ref_log(&repo, None, q).await
+}
+
+async fn ref_log_one(
+    State(repo): S,
+    Path(name): Path<String>,
+    Query(q): Query<RefLogQuery>,
+) -> ApiResult<Json<RefLogResponse>> {
+    ref_log(&repo, Some(&name), q).await
 }
 
 async fn resolve(State(repo): S, Path(rev): Path<String>) -> ApiResult<Json<ResolveResponse>> {
@@ -661,9 +748,16 @@ async fn rebase(State(repo): S, body: Bytes) -> ApiResult<Json<RebaseResponse>> 
     Ok(Json(repo.rebase(req.changeset, req.onto).await?))
 }
 
-async fn land(State(repo): S, body: Bytes) -> ApiResult<Json<LandResponse>> {
+async fn land(
+    State(repo): S,
+    auth::MaybePrincipal(who): auth::MaybePrincipal,
+    body: Bytes,
+) -> ApiResult<Json<LandResponse>> {
     let req: LandRequest = parse_json(&body)?;
-    Ok(Json(repo.land(req.changeset, &req.target_ref).await?))
+    let actor = who.as_ref().map(|p| p.name.as_str());
+    Ok(Json(
+        repo.land_as(req.changeset, &req.target_ref, actor).await?,
+    ))
 }
 
 #[cfg(test)]

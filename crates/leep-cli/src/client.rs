@@ -250,6 +250,25 @@ impl Client {
         self.json(self.http.get(self.url(&format!("/v1/refs/{}", enc(name)))))
     }
 
+    /// Ref log entries, newest first; `name = None` covers every ref and
+    /// `before` returns entries with a smaller `seq`.
+    pub fn ref_log(
+        &self,
+        name: Option<&str>,
+        before: Option<u64>,
+        limit: usize,
+    ) -> Result<RefLogResponse> {
+        let url = match name {
+            Some(n) => self.url(&format!("/v1/reflog/{}", enc(n))),
+            None => self.url("/v1/reflog"),
+        };
+        let mut query = vec![("limit", limit.to_string())];
+        if let Some(b) = before {
+            query.push(("before", b.to_string()));
+        }
+        self.json(self.http.get(url).query(&query))
+    }
+
     /// Compare-and-swap a ref. A lost race (409) is `ok: false`, not an error.
     pub fn cas_ref(&self, name: &str, req: &CasRefRequest) -> Result<CasRefResponse> {
         let resp = self

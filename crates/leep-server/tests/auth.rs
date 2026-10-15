@@ -172,6 +172,7 @@ async fn read_token_reads_but_cannot_mutate() {
     let cas = CasRefRequest {
         expected: None,
         new: None,
+        ..Default::default()
     };
     let mutating = [
         (Method::PUT, format!("/v1/blobs/{h}"), b"x".to_vec()),
@@ -230,6 +231,7 @@ async fn write_token_does_everything() {
     let cas = CasRefRequest {
         expected: Some(id),
         new: None,
+        ..Default::default()
     };
     let r = call(&app, Method::POST, "/v1/refs/main", t, json(&cas)).await;
     assert_eq!(r.status, StatusCode::OK);
@@ -397,4 +399,64 @@ fn startup_fails_on_bad_tokens_file() {
             "must not echo file contents"
         );
     }
+}
+
+#[tokio::test]
+async fn read_token_reads_the_reflog_and_the_actor_is_the_token_name() {
+    let app = app(true);
+    let h = Hash::of_blob(b"x");
+    call(
+        &app,
+        Method::PUT,
+        &format!("/v1/blobs/{h}"),
+        Some(WRITE),
+        b"x".to_vec(),
+    )
+    .await;
+    let r = call(
+        &app,
+        Method::POST,
+        "/v1/changesets",
+        Some(WRITE),
+        json(&changeset()),
+    )
+    .await;
+    let CreateChangesetResponse { id } = serde_json::from_slice(&r.body).unwrap();
+
+    for uri in ["/v1/reflog", "/v1/reflog/main"] {
+        let r = call(&app, Method::GET, uri, None, vec![]).await;
+        assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{uri}");
+        let r = call(&app, Method::GET, uri, Some(READ), vec![]).await;
+        assert_eq!(r.status, StatusCode::OK, "{uri}");
+    }
+
+    let land = LandRequest {
+        changeset: id,
+        target_ref: "main".into(),
+    };
+    let r = call(&app, Method::POST, "/v1/land", Some(WRITE), json(&land)).await;
+    assert_eq!(r.status, StatusCode::OK);
+    let cas = CasRefRequest {
+        expected: None,
+        new: Some(id),
+        operation: Some("cas".into()),
+        message: None,
+    };
+    let r = call(&app, Method::POST, "/v1/refs/dev", Some(WRITE), json(&cas)).await;
+    assert_eq!(r.status, StatusCode::OK);
+    // A read token cannot write, so it leaves no entry either.
+    let r = call(&app, Method::POST, "/v1/refs/dev2", Some(READ), json(&cas)).await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+
+    let r = call(&app, Method::GET, "/v1/reflog", Some(READ), vec![]).await;
+    let log: RefLogResponse = serde_json::from_slice(&r.body).unwrap();
+    let seen: Vec<_> = log
+        .entries
+        .iter()
+        .map(|e| (e.name.as_str(), e.operation.as_str(), e.actor.as_deref()))
+        .collect();
+    assert_eq!(
+        seen,
+        [("dev", "cas", Some("ci")), ("main", "land", Some("ci"))]
+    );
 }

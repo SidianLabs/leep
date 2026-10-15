@@ -1616,3 +1616,171 @@ fn everyday_workflow_sync_stash_restore_amend_reset_postgres() {
     let stores = Stores::with_meta(&tmp.path().join("data"), db.url.clone());
     run_everyday_workflow(&stores, tmp.path());
 }
+
+fn run_reflog_and_undo_workflow(stores: &Stores, work: &Path) {
+    let mut server = Server::start(stores, work);
+    let port = server.addr.port();
+    let client = Client::new(&server.url, &work.join("cache"));
+    let wc = work.join("wc");
+    client.ok(work, &["init", wc.to_str().unwrap()]);
+    let head = |dir: &Path, name: &str| -> Option<String> {
+        client.json(dir, &["refs"])["refs"][name]
+            .as_str()
+            .map(String::from)
+    };
+    let entries = |dir: &Path, args: &[&str]| -> Vec<serde_json::Value> {
+        let mut full = vec!["reflog"];
+        full.extend_from_slice(args);
+        client.json(dir, &full)["entries"]
+            .as_array()
+            .unwrap()
+            .clone()
+    };
+
+    write(&wc, "a.txt", "one\n");
+    client.ok(&wc, &["commit", "-m", "one"]);
+    client.ok(&wc, &["land"]);
+    let one = head(&wc, "main").unwrap();
+    write(&wc, "a.txt", "two\n");
+    client.ok(&wc, &["commit", "-m", "two"]);
+    client.ok(&wc, &["land"]);
+    let two = head(&wc, "main").unwrap();
+    assert_ne!(one, two);
+
+    // Both lands are logged, newest first, with their operation and ids.
+    let text = client.ok(&wc, &["reflog"]);
+    let lines: Vec<_> = text.lines().collect();
+    assert_eq!(lines.len(), 2, "{text}");
+    assert!(
+        lines[0].starts_with("2  ") && lines[0].contains("  land  main  "),
+        "{text}"
+    );
+    assert!(
+        lines[0].contains(&format!("{} -> {}", &one[..12], &two[..12])),
+        "{text}"
+    );
+    assert!(lines[1].contains(&format!("- -> {}", &one[..12])), "{text}");
+    let e = entries(&wc, &["main"]);
+    assert_eq!(
+        (e[0]["old"].as_str(), e[0]["new"].as_str()),
+        (Some(one.as_str()), Some(two.as_str()))
+    );
+    assert_eq!(e[0]["operation"], "land");
+    assert!(e[0]["actor"].is_null(), "auth is off");
+    assert!(e[0]["time"].as_i64().unwrap() > 1_700_000_000);
+    assert_eq!(
+        client
+            .ok(&wc, &["reflog", "main", "-n", "1"])
+            .lines()
+            .count(),
+        1
+    );
+    assert_eq!(client.ok(&wc, &["reflog", "nothing"]), "");
+
+    // Undo moves the ref back; the working copy stays where it was.
+    let out = client.ok(&wc, &["undo"]);
+    assert!(
+        out.contains(&format!(
+            "Moved main back: {} -> {}",
+            &two[..12],
+            &one[..12]
+        )),
+        "{out}"
+    );
+    assert!(out.contains("To redo: leep undo main --to 3"), "{out}");
+    assert!(out.contains("leep sync"), "{out}");
+    assert_eq!(head(&wc, "main").as_deref(), Some(one.as_str()));
+    assert_eq!(fs::read_to_string(wc.join("a.txt")).unwrap(), "two\n");
+    let e = entries(&wc, &["main"]);
+    assert_eq!(e[0]["operation"], "undo");
+    assert_eq!(e[0]["message"], "undo of 2");
+    // A second undo redoes it, and `sync` follows the ref.
+    client.ok(&wc, &["undo"]);
+    assert_eq!(head(&wc, "main").as_deref(), Some(two.as_str()));
+    client.ok(&wc, &["sync"]);
+
+    // A deleted branch comes back; undoing again deletes it once more.
+    client.ok(&wc, &["branch", "feature"]);
+    client.ok(&wc, &["branch", "-D", "feature"]);
+    assert_eq!(head(&wc, "feature"), None);
+    let out = client.ok(&wc, &["undo", "feature"]);
+    assert!(out.contains("Recreated feature"), "{out}");
+    assert_eq!(head(&wc, "feature").as_deref(), Some(two.as_str()));
+    let out = client.ok(&wc, &["undo", "feature"]);
+    assert!(out.contains("Deleted feature"), "{out}");
+    assert_eq!(head(&wc, "feature"), None);
+    let out = client.run(&wc, &["undo", "never-existed"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stderr(&out).contains("no log entries"), "{}", stderr(&out));
+
+    // The server owns the `land` label, so a client cannot forge one.
+    let body = format!(r#"{{"expected":null,"new":"{one}","operation":"land"}}"#);
+    assert_eq!(post_json(server.addr, "/v1/refs/forged", &body).0, 400);
+
+    // Rewind main, then protect it. Undoing again would put unsigned history
+    // back on a protected ref, which the server refuses like any other move.
+    client.ok(&wc, &["undo"]);
+    assert_eq!(head(&wc, "main").as_deref(), Some(one.as_str()));
+    let before = entries(&wc, &[]);
+    server.kill();
+    let keyfile = work.join("alice.key");
+    let out = client.ok(
+        work,
+        &[
+            "keygen",
+            "--out",
+            keyfile.to_str().unwrap(),
+            "--name",
+            "alice",
+        ],
+    );
+    let entry: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    let keys = work.join("keys.json");
+    fs::write(&keys, serde_json::json!({ "keys": [entry] }).to_string()).unwrap();
+    let server = Server::start_with(
+        port,
+        stores,
+        work,
+        &[
+            "--signing-keys-file",
+            keys.to_str().unwrap(),
+            "--require-signatures",
+            "main",
+        ],
+    );
+    assert_eq!(entries(&wc, &[]), before, "the log survives a restart");
+    let out = client.run(&wc, &["undo"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("is not signed by a trusted key"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(head(&wc, "main").as_deref(), Some(one.as_str()));
+    // Neither can a protected ref be deleted by undoing its creation.
+    let out = client.run(&wc, &["undo", "main", "--to", "1"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stderr(&out).contains("protected"), "{}", stderr(&out));
+    assert_eq!(head(&wc, "main").as_deref(), Some(one.as_str()));
+    assert_eq!(entries(&wc, &[]), before, "refused undos log nothing");
+    drop(server);
+}
+
+#[test]
+fn reflog_and_undo() {
+    let _g = serial();
+    let tmp = tempfile::tempdir().unwrap();
+    let stores = Stores::sqlite(&tmp.path().join("data"));
+    run_reflog_and_undo_workflow(&stores, tmp.path());
+}
+
+#[test]
+fn reflog_and_undo_postgres() {
+    let _g = serial();
+    let Some(db) = PgDb::create() else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let stores = Stores::with_meta(&tmp.path().join("data"), db.url.clone());
+    run_reflog_and_undo_workflow(&stores, tmp.path());
+}

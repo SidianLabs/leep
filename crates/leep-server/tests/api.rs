@@ -123,6 +123,7 @@ impl Client {
                 &CasRefRequest {
                     expected: None,
                     new: Some(id),
+                    ..Default::default()
                 },
             )
             .await;
@@ -285,6 +286,7 @@ async fn refs_cas_and_resolve() {
             &CasRefRequest {
                 expected: None,
                 new: Some(a),
+                ..Default::default()
             },
         )
         .await;
@@ -303,6 +305,7 @@ async fn refs_cas_and_resolve() {
             &CasRefRequest {
                 expected: None,
                 new: Some(b),
+                ..Default::default()
             },
         )
         .await;
@@ -1124,7 +1127,11 @@ async fn log_follow_needs_one_file_path() {
 }
 
 fn cas(expected: Option<ChangesetId>, new: Option<ChangesetId>) -> CasRefRequest {
-    CasRefRequest { expected, new }
+    CasRefRequest {
+        expected,
+        new,
+        ..Default::default()
+    }
 }
 
 #[tokio::test]
@@ -1217,4 +1224,133 @@ async fn tags_are_created_and_deleted_but_never_moved() {
     c.set_ref("tags/v1", b).await;
     let refs: RefsResponse = c.get("/v1/refs").await.json();
     assert_eq!(refs.refs["tags/v1"], b);
+}
+
+fn labeled(
+    op: &str,
+    message: Option<&str>,
+    expected: Option<ChangesetId>,
+    new: Option<ChangesetId>,
+) -> CasRefRequest {
+    CasRefRequest {
+        expected,
+        new,
+        operation: Some(op.into()),
+        message: message.map(Into::into),
+    }
+}
+
+#[tokio::test]
+async fn reflog_records_lands_and_ref_writes_newest_first() {
+    let c = Client::new();
+    let a = c.commit(&[], &[("a", Some("1"))], "a").await;
+    let b = c.commit(&[a], &[("a", Some("2"))], "b").await;
+    let land = |id| LandRequest {
+        changeset: id,
+        target_ref: "main".into(),
+    };
+    assert_eq!(c.post("/v1/land", &land(a)).await.status, StatusCode::OK);
+    assert_eq!(c.post("/v1/land", &land(b)).await.status, StatusCode::OK);
+    assert_eq!(c.post("/v1/land", &land(b)).await.status, StatusCode::OK);
+    c.set_ref("dev", a).await;
+    let r = c
+        .post(
+            "/v1/refs/main",
+            &labeled("undo", Some("undo of seq 2"), Some(b), Some(a)),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK);
+    // A lost CAS records nothing.
+    let r = c.post("/v1/refs/main", &cas(Some(b), None)).await;
+    assert_eq!(r.status, StatusCode::CONFLICT);
+
+    let all: RefLogResponse = c.get("/v1/reflog").await.json();
+    let ops: Vec<_> = all.entries.iter().map(|e| e.operation.as_str()).collect();
+    assert_eq!(ops, ["undo", "cas", "land", "land"]);
+    assert!(all.entries.windows(2).all(|w| w[0].seq > w[1].seq));
+    let undo = &all.entries[0];
+    assert_eq!((undo.old, undo.new), (Some(b), Some(a)));
+    assert_eq!(undo.message.as_deref(), Some("undo of seq 2"));
+    assert_eq!(undo.actor, None, "auth is off");
+
+    let main: RefLogResponse = c.get("/v1/reflog/main").await.json();
+    assert_eq!(main.entries.len(), 3);
+    assert!(main.entries.iter().all(|e| e.name == "main"));
+    let none: RefLogResponse = c.get("/v1/reflog/nope").await.json();
+    assert!(none.entries.is_empty());
+    // Nested names work in the path.
+    c.set_ref("release/1.0", a).await;
+    let nested: RefLogResponse = c.get("/v1/reflog/release/1.0").await.json();
+    assert_eq!(nested.entries.len(), 1);
+
+    // Paging.
+    let page: RefLogResponse = c.get("/v1/reflog/main?limit=2").await.json();
+    assert_eq!(page.entries, main.entries[..2]);
+    let before = page.entries[1].seq;
+    let rest: RefLogResponse = c
+        .get(&format!("/v1/reflog/main?limit=2&before={before}"))
+        .await
+        .json();
+    assert_eq!(rest.entries, main.entries[2..]);
+    let none: RefLogResponse = c.get("/v1/reflog?limit=0").await.json();
+    assert!(none.entries.is_empty());
+}
+
+#[tokio::test]
+async fn reflog_limits_and_bad_queries() {
+    let c = Client::new();
+    let a = c.commit(&[], &[("a", Some("1"))], "a").await;
+    for i in 0..60 {
+        c.set_ref(&format!("r{i}"), a).await;
+    }
+    let r: RefLogResponse = c.get("/v1/reflog").await.json();
+    assert_eq!(r.entries.len(), 50, "default limit");
+    let r: RefLogResponse = c.get("/v1/reflog?limit=5000").await.json();
+    assert_eq!(r.entries.len(), 60, "capped at 1000, so all 60");
+    for q in ["limit=x", "before=-1", "before=", "limit=1.5"] {
+        let r = c.get(&format!("/v1/reflog?{q}")).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{q}");
+        let _: ErrorResponse = r.json();
+    }
+}
+
+#[tokio::test]
+async fn clients_cannot_forge_server_operations_or_unreadable_entries() {
+    let c = Client::new();
+    let a = c.commit(&[], &[("a", Some("1"))], "a").await;
+    let long = "x".repeat(33);
+    for op in ["land", "import", "", "Undo", "a b", long.as_str()] {
+        let r = c
+            .post("/v1/refs/x", &labeled(op, None, None, Some(a)))
+            .await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "operation {op:?}");
+    }
+    let too_long = "m".repeat(257);
+    for m in ["two\nlines", too_long.as_str()] {
+        let r = c
+            .post("/v1/refs/x", &labeled("cas", Some(m), None, Some(a)))
+            .await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "message {m:?}");
+    }
+    let r = c
+        .post(
+            "/v1/refs/x",
+            &labeled("my-tool.v2", Some("ok"), None, Some(a)),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK);
+    let log: RefLogResponse = c.get("/v1/reflog").await.json();
+    assert_eq!(log.entries.len(), 1, "refused requests wrote nothing");
+    assert_eq!(log.entries[0].operation, "my-tool.v2");
+}
+
+#[tokio::test]
+async fn old_cas_bodies_without_log_fields_still_work() {
+    let c = Client::new();
+    let a = c.commit(&[], &[("a", Some("1"))], "a").await;
+    let body = format!(r#"{{"expected":null,"new":"{a}"}}"#);
+    let r = c.raw(Method::POST, "/v1/refs/old", body.into_bytes()).await;
+    assert_eq!(r.status, StatusCode::OK);
+    let log: RefLogResponse = c.get("/v1/reflog/old").await.json();
+    assert_eq!(log.entries[0].operation, "cas");
 }

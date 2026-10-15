@@ -7,8 +7,8 @@ use clap::{Parser, Subcommand};
 use crate::cache::Cache;
 use crate::client::Client;
 use crate::commands::{
-    amend, branch, checkout, commit, diff, history, init, keygen, land, reset, resolve, restore,
-    review, search, stash, status, Ctx, Remote,
+    amend, branch, checkout, commit, diff, history, init, keygen, land, reflog, reset, resolve,
+    restore, review, search, stash, status, Ctx, Remote,
 };
 use crate::error::{CliError, Result};
 use crate::state::{resolve_token, WorkCopy};
@@ -85,6 +85,10 @@ pub enum Command {
     Provenance(history::ProvenanceArgs),
     /// List refs.
     Refs,
+    /// Show how refs moved: who, when, and from where to where.
+    Reflog(reflog::ReflogArgs),
+    /// Move a ref back to where it was before its last (or a chosen) move.
+    Undo(reflog::UndoArgs),
     /// Approve or reject changesets, and see what a changeset needs to land.
     #[command(subcommand)]
     Review(review::ReviewCmd),
@@ -129,7 +133,7 @@ pub fn run(cli: Cli) -> Result<i32> {
     };
 
     // Server-only commands work outside a working copy when a server is
-    // given. Reviews write to the server but touch no local state.
+    // given. Reviews and undo write to the server but touch no local state.
     let read_only = matches!(
         cli.command,
         Command::Log(_)
@@ -140,6 +144,8 @@ pub fn run(cli: Cli) -> Result<i32> {
             | Command::Search(_)
             | Command::Provenance(_)
             | Command::Refs
+            | Command::Reflog(_)
+            | Command::Undo(_)
             | Command::Review(_)
             | Command::Reviews(_)
     );
@@ -199,6 +205,8 @@ fn read_only_cmd(cmd: &Command, r: &Remote) -> Result<i32> {
         Command::Search(a) => search::run(r, a),
         Command::Provenance(a) => history::provenance(r, a),
         Command::Refs => history::refs(r),
+        Command::Reflog(a) => reflog::reflog(r, a),
+        Command::Undo(a) => reflog::undo(r, a),
         Command::Review(c) => review::run(r, c),
         Command::Reviews(a) => review::list(r, a),
         _ => unreachable!("not a read-only command"),
