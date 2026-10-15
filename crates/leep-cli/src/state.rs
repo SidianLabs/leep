@@ -66,6 +66,18 @@ pub struct FileState {
     pub mtime_ns: i64,
 }
 
+/// A stash entry. The content lives on the server as an ordinary changeset
+/// (`leep.snapshot = "stash"`); only this list is local.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Stash {
+    pub id: ChangesetId,
+    /// Base the stashed changes were made against.
+    pub base: Option<ChangesetId>,
+    pub message: String,
+    /// Unix seconds.
+    pub timestamp: i64,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct State {
     pub base: Option<ChangesetId>,
@@ -73,6 +85,15 @@ pub struct State {
     /// Paths where `leep land` wrote conflict markers.
     #[serde(default)]
     pub conflicts: Vec<String>,
+    /// Paths whose conflict had no text merge: the local version was kept,
+    /// without markers. They block `commit` and `land` until `leep resolve`
+    /// or `leep restore` clears them.
+    #[serde(default)]
+    pub unresolved: Vec<String>,
+    /// Newest first. Kept in `state.json` so it is saved with the base it
+    /// refers to.
+    #[serde(default)]
+    pub stashes: Vec<Stash>,
 }
 
 #[derive(Debug)]
@@ -229,6 +250,13 @@ mod tests {
             },
         );
         wc.state.conflicts.push("src/a.rs".into());
+        wc.state.unresolved.push("src/b.bin".into());
+        wc.state.stashes.push(Stash {
+            id: ChangesetId(Hash::of_blob(b"stash")),
+            base: wc.state.base,
+            message: "wip".into(),
+            timestamp: 5,
+        });
         wc.save_state().unwrap();
         let back = WorkCopy::open(dir.path()).unwrap();
         assert_eq!(back.state, wc.state);
@@ -285,6 +313,13 @@ mod tests {
         assert_eq!(c.token, None);
         let out = serde_json::to_string(&c).unwrap();
         assert!(!out.contains("token"));
+    }
+
+    #[test]
+    fn state_without_stashes_loads() {
+        let old = r#"{"base":null,"files":{},"conflicts":[]}"#;
+        let st: State = serde_json::from_str(old).unwrap();
+        assert!(st.stashes.is_empty());
     }
 
     #[test]

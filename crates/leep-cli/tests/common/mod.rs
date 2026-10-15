@@ -1,6 +1,8 @@
 //! In-memory mock of the Leep HTTP API: just the endpoints the CLI flows
 //! need, enough to exercise commit, checkout and land without a real server.
 
+#![allow(dead_code)]
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
@@ -30,6 +32,11 @@ pub struct Data {
     /// Refs that refuse to land a changeset without a recorded signature,
     /// like a server started with `--require-signatures`.
     pub require_signed: HashSet<String>,
+    /// Make `POST /v1/rebase` answer 500, to test that a failed sync leaves
+    /// the working copy alone.
+    pub fail_rebase: bool,
+    /// `(changeset, onto)` of every rebase request received.
+    pub rebases: Vec<(ChangesetId, ChangesetId)>,
     /// Ref log, oldest first; `seq` is the index plus one.
     pub reflog: Vec<RefLogEntry>,
 }
@@ -74,6 +81,22 @@ impl Data {
         self.files.insert(id, files);
         self.changesets.insert(id, cs);
         id
+    }
+
+    /// Conflict markers for text, `None` (no text merge) if a side has a NUL.
+    pub fn markers(&self, ours: &Option<FileInfo>, theirs: &Option<FileInfo>) -> Option<String> {
+        let binary = |f: &Option<FileInfo>| {
+            f.as_ref()
+                .is_some_and(|f| self.blobs[&f.content].contains(&0))
+        };
+        if binary(ours) || binary(theirs) {
+            return None;
+        }
+        Some(format!(
+            "<<<<<<< ours\n{}=======\n{}>>>>>>> theirs\n",
+            self.text(ours),
+            self.text(theirs)
+        ))
     }
 
     /// Move a ref and log it, like the real server does in one step.
@@ -155,6 +178,8 @@ impl Mock {
             .route("/v1/blobs/missing", post(missing))
             .route("/v1/blobs/{hash}", put(put_blob).get(get_blob))
             .route("/v1/changesets", post(create))
+            .route("/v1/changesets/{id}", get(get_changeset))
+            .route("/v1/rebase", post(rebase))
             .route(
                 "/v1/changesets/{id}/signatures",
                 post(add_signature).get(list_signatures),
@@ -508,6 +533,120 @@ async fn files(
     }))
 }
 
+fn generation(d: &Data, id: ChangesetId) -> u64 {
+    // Longest parent chain; fine for the tiny histories the tests build.
+    let mut best = 0;
+    let mut stack = vec![(id, 1u64)];
+    while let Some((c, g)) = stack.pop() {
+        best = best.max(g);
+        for p in &d.changesets[&c].parents {
+            stack.push((*p, g + 1));
+        }
+    }
+    best
+}
+
+async fn get_changeset(State(s): State<Shared>, Path(id): Path<String>) -> Resp<ChangesetInfo> {
+    let id: ChangesetId = id
+        .parse()
+        .map_err(|_| err(StatusCode::BAD_REQUEST, "bad id"))?;
+    let d = s.lock().unwrap();
+    let cs = d
+        .changesets
+        .get(&id)
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "no such changeset"))?
+        .clone();
+    Ok(Json(ChangesetInfo {
+        id,
+        generation: generation(&d, id),
+        root_tree: Hash::of_blob(b""),
+        changeset: cs,
+        path_at: None,
+        renamed: None,
+    }))
+}
+
+/// File-level three-way rebase: the same answers as the real server for
+/// whole-file changes, with markers whenever both sides edited a path.
+async fn rebase(State(s): State<Shared>, Json(r): Json<RebaseRequest>) -> Resp<RebaseResponse> {
+    let mut d = s.lock().unwrap();
+    d.rebases.push((r.changeset, r.onto));
+    if d.fail_rebase {
+        return Err(err(StatusCode::INTERNAL_SERVER_ERROR, "rebase failed"));
+    }
+    let orig = d
+        .changesets
+        .get(&r.changeset)
+        .cloned()
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "no such changeset"))?;
+    if orig.parents.first() == Some(&r.onto) {
+        return Ok(Json(RebaseResponse::Rebased { id: r.changeset }));
+    }
+    let ours_files = d
+        .files
+        .get(&r.onto)
+        .cloned()
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "no such changeset"))?;
+    let base_files = orig
+        .parents
+        .first()
+        .map(|p| d.files[p].clone())
+        .unwrap_or_default();
+    let mut conflicts = vec![];
+    let mut clean = BTreeMap::new();
+    for (path, ch) in &orig.changes {
+        let key = path.to_string();
+        let (b, o) = (base_files.get(&key), ours_files.get(&key));
+        let same = |a: Option<&FileInfo>, b: Option<&FileInfo>| {
+            a.map(|f| (f.content, f.kind)) == b.map(|f| (f.content, f.kind))
+        };
+        let theirs = match ch {
+            FileChange::Modify {
+                content,
+                kind,
+                size,
+            } => Some(FileInfo {
+                path: path.clone(),
+                content: *content,
+                kind: *kind,
+                size: *size,
+            }),
+            FileChange::Delete => None,
+        };
+        if same(theirs.as_ref(), o) {
+            continue;
+        }
+        if same(b, o) {
+            clean.insert(path.clone(), ch.clone());
+            continue;
+        }
+        let ours = o.cloned();
+        let merged = d.markers(&ours, &theirs);
+        conflicts.push(Conflict {
+            path: path.clone(),
+            base: b.cloned(),
+            ours,
+            theirs,
+            merged_with_markers: merged,
+        });
+    }
+    if !conflicts.is_empty() {
+        return Ok(Json(RebaseResponse::Conflicts { conflicts, clean }));
+    }
+    let mut extra = orig.extra.clone();
+    extra.insert(
+        leep_core::changeset::EXTRA_REBASED_FROM.into(),
+        r.changeset.to_string(),
+    );
+    let id = d.insert(Changeset {
+        parents: vec![r.onto],
+        changes: clean,
+        extra,
+        ..orig
+    });
+    Ok(Json(RebaseResponse::Rebased { id }))
+}
+
 /// Fast-forward when possible; otherwise replay the changes on the head,
 /// reporting a conflict when both sides touched the same path differently.
 async fn land(State(s): State<Shared>, Json(r): Json<LandRequest>) -> Resp<LandResponse> {
@@ -564,17 +703,13 @@ async fn land(State(s): State<Shared>, Json(r): Json<LandRequest>) -> Resp<LandR
             continue;
         }
         let ours = h.cloned();
-        let merged = format!(
-            "<<<<<<< ours\n{}=======\n{}>>>>>>> theirs\n",
-            d.text(&ours),
-            d.text(&theirs)
-        );
+        let merged = d.markers(&ours, &theirs);
         conflicts.push(Conflict {
             path: path.clone(),
             base: b.cloned(),
             ours,
             theirs,
-            merged_with_markers: Some(merged),
+            merged_with_markers: merged,
         });
     }
     if !conflicts.is_empty() {

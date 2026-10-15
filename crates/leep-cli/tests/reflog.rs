@@ -1,6 +1,5 @@
 //! `leep reflog` and `leep undo` against the in-memory mock server.
 
-#[allow(dead_code)]
 mod common;
 
 use std::fs;

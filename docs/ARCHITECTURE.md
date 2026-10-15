@@ -250,6 +250,28 @@ are compare-and-swap calls on `/v1/refs/{name}`. `branch -d` deletes only if
 working copy, sets `target_ref` in `.leep/config.json` and materializes the
 branch head the way `sync` does.
 
+**Working copy** ([ADR 0017](adr/0017-working-copy-workflow.md)).
+`.leep/state.json` records the base, the files as materialized (content, kind,
+size, mtime) so `status` rehashes only files whose size or mtime changed, the
+paths where conflict markers were written, and the local stash list. Uncommitted
+work is whatever differs from that record. `sync` with local changes and
+`stash` store the work as a *snapshot changeset* (parent = base,
+`extra["leep.snapshot"]` = `sync` or `stash`, no ref). `sync` and `stash apply`
+call `POST /v1/rebase` for the snapshot onto the new base and write the result
+back as uncommitted changes (`overlay.rs`): everything is fetched first, each
+file is written through a temp file and renamed, writes are journalled and
+undone if anything fails, and the state is saved last. Conflicts become marker
+files like in `land`, and `commit` and `land` refuse while any remain.
+Conflicts with no text merge (binary, delete versus modify) keep the local
+version and are recorded in `state.unresolved`; they block the same way until
+`leep resolve PATH` or `leep restore PATH` clears them. If the
+base is not in the target's history, `sync` first rebases the unlanded
+first-parent stack onto the head, one changeset at a time; a conflict there
+stops with nothing changed. `restore`, `reset` and `stash` write files the same
+way, and `reset` and `amend` only move the base, never a ref. `amend` is
+refused for a base in the target ref's history (`merge_base(base, head) ==
+base`). Snapshots are ordinary changesets, so blob GC keeps what they reference.
+
 **Ref log and undo** ([ADR 0018](adr/0018-ref-log.md)). Every successful ref
 create, move or delete appends a row to `ref_log` in the same transaction (or
 under the same lock, in memory) as the conditional update, so a ref never

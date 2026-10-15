@@ -72,6 +72,35 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   The `ref_log` table is created when the server first opens an existing
   database, so upgrade every server before relying on the log.
 
+- `leep sync` no longer needs a clean working copy. It saves uncommitted
+  changes as a snapshot changeset, has the server rebase it onto the new head
+  and puts the result back as uncommitted changes, with conflict markers
+  (and `commit`/`land` refusing) where both sides edited the same text. Local
+  unlanded commits are rebased onto the head too, and a failed sync leaves
+  the working copy as it was and prints the snapshot id. `sync --no-rebase`
+  keeps the old rule (ADR 0017).
+- Conflicts with no text merge (binary files, delete versus modify), from
+  `sync`, `stash apply` and `land`, keep your version but are marked
+  conflicted: `status` shows them, `commit` and `land` refuse, and
+  `leep resolve PATH...` (or `leep restore`) clears the mark. `resolve` also
+  refuses files that still contain conflict markers unless `--force`.
+- `leep stash` (`push`, `list`, `show`, `apply`, `pop`, `drop`). A stash is a
+  changeset on the server marked `leep.snapshot = "stash"` with a local list;
+  `apply` and `pop` rebase it onto the current base and also accept a
+  snapshot id.
+- `leep restore PATH...` discards uncommitted changes to files or
+  directories, or with `--source REV` takes their content from another
+  revision. New files are left alone unless `--force`.
+- `leep amend` folds uncommitted changes and a new message into an unlanded
+  base changeset, and refuses a landed one. Old signatures do not carry over.
+- `leep reset [REV]` moves the working copy's base without touching refs:
+  soft by default (keeps the files as uncommitted changes, so no REV
+  undoes the last commit), `--hard` also discards local changes.
+- `leep status` shows the number of stashes and how many commits the base is
+  ahead of the target ref.
+- Files are now written through a temp file and renamed, so an interrupted
+  checkout, land or sync cannot leave a half-written file.
+
 ### Project
 - Workspace version set to 0.0.1, with a CI check that keeps it below
   0.1.0.

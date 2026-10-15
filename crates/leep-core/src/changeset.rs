@@ -84,6 +84,9 @@ pub const EXTRA_AGENT_PROMPT: &str = "agent.prompt";
 pub const EXTRA_AGENT_TESTS: &str = "agent.tests";
 /// Set by the server when it rebases a changeset; value is the original id.
 pub const EXTRA_REBASED_FROM: &str = "leep.rebased_from";
+/// Set by the CLI on a changeset that only carries uncommitted work (`sync`,
+/// `stash`); the value says which command made it. Never landed.
+pub const EXTRA_SNAPSHOT: &str = "leep.snapshot";
 
 impl Changeset {
     pub const KIND: &'static str = "changeset-v1";

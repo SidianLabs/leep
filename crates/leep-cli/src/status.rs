@@ -59,6 +59,24 @@ impl Status {
     pub fn has_conflicts(&self) -> bool {
         self.entries.iter().any(|e| e.change == Change::Conflicted)
     }
+
+    /// Refuse to go on while any path is conflicted, naming them.
+    pub fn refuse_conflicts(&self) -> Result<()> {
+        let paths: Vec<&str> = self
+            .entries
+            .iter()
+            .filter(|e| e.change == Change::Conflicted)
+            .map(|e| e.path.as_str())
+            .collect();
+        if paths.is_empty() {
+            return Ok(());
+        }
+        Err(crate::error::CliError::user(format!(
+            "unresolved conflicts in {}; fix the markers, or `leep resolve PATH` once \
+             you have chosen (`leep restore PATH` takes the base version); see `leep status`",
+            paths.join(", ")
+        )))
+    }
 }
 
 fn load_ignore(root: &Path) -> Gitignore {
@@ -138,7 +156,7 @@ pub fn walk(
     Ok(out)
 }
 
-fn mtime_ns(md: &Metadata) -> i64 {
+pub fn mtime_ns(md: &Metadata) -> i64 {
     md.modified()
         .ok()
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
@@ -226,6 +244,16 @@ pub fn status(wc: &WorkCopy) -> Result<Status> {
             });
         }
     }
+    for path in &wc.state.unresolved {
+        match entries.iter_mut().find(|e| &e.path == path) {
+            Some(e) => e.change = Change::Conflicted,
+            None => entries.push(StatusEntry {
+                path: path.clone(),
+                change: Change::Conflicted,
+                now: None,
+            }),
+        }
+    }
     for path in &wc.state.conflicts {
         if still_conflicted(wc, path) {
             match entries.iter_mut().find(|e| &e.path == path) {
@@ -293,7 +321,7 @@ pub fn working_renames(
     det.finish(&fingerprints)
 }
 
-fn still_conflicted(wc: &WorkCopy, path: &str) -> bool {
+pub fn still_conflicted(wc: &WorkCopy, path: &str) -> bool {
     fs::read_to_string(wc.abs(path))
         .map(|s| s.lines().any(|l| l.starts_with(CONFLICT_MARKER)))
         .unwrap_or(false)

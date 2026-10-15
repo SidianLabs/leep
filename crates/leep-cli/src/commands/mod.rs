@@ -1,5 +1,6 @@
 //! One module per command family. Commands return the process exit code.
 
+pub mod amend;
 pub mod branch;
 pub mod checkout;
 pub mod commit;
@@ -9,8 +10,12 @@ pub mod init;
 pub mod keygen;
 pub mod land;
 pub mod reflog;
+pub mod reset;
+pub mod resolve;
+pub mod restore;
 pub mod review;
 pub mod search;
+pub mod stash;
 pub mod status;
 
 use leep_core::ChangesetId;
