@@ -30,6 +30,8 @@ pub struct Data {
     /// Refs that refuse to land a changeset without a recorded signature,
     /// like a server started with `--require-signatures`.
     pub require_signed: HashSet<String>,
+    /// Ref log, oldest first; `seq` is the index plus one.
+    pub reflog: Vec<RefLogEntry>,
 }
 
 pub type Shared = Arc<Mutex<Data>>;
@@ -72,6 +74,31 @@ impl Data {
         self.files.insert(id, files);
         self.changesets.insert(id, cs);
         id
+    }
+
+    /// Move a ref and log it, like the real server does in one step.
+    pub fn set_ref(
+        &mut self,
+        name: &str,
+        new: Option<ChangesetId>,
+        op: &str,
+        message: Option<String>,
+    ) {
+        let old = match new {
+            Some(id) => self.refs.insert(name.to_string(), id),
+            None => self.refs.remove(name),
+        };
+        let seq = self.reflog.len() as u64 + 1;
+        self.reflog.push(RefLogEntry {
+            seq,
+            name: name.to_string(),
+            old,
+            new,
+            time: 1_760_000_000 + seq as i64,
+            actor: Some("mock".into()),
+            operation: op.to_string(),
+            message,
+        });
     }
 
     pub fn text(&self, f: &Option<FileInfo>) -> String {
@@ -134,6 +161,8 @@ impl Mock {
             )
             .route("/v1/refs", get(list_refs))
             .route("/v1/refs/{*name}", get(get_ref).post(cas_ref))
+            .route("/v1/reflog", get(reflog_all))
+            .route("/v1/reflog/{*name}", get(reflog_one))
             .route("/v1/resolve/{*rev}", get(resolve))
             .route("/v1/merge-base", get(merge_base))
             .route("/v1/files/{id}", get(files))
@@ -357,10 +386,20 @@ async fn cas_ref(
             Json(CasRefResponse { ok: false, current }),
         ));
     }
-    match r.new {
-        Some(id) => d.refs.insert(name, id),
-        None => d.refs.remove(&name),
-    };
+    if let Some(new) = r.new {
+        if d.require_signed.contains(&name) && !d.signatures.iter().any(|(c, _)| *c == new) {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                &format!("changeset {new} is not signed by a trusted key"),
+            ));
+        }
+    }
+    d.set_ref(
+        &name,
+        r.new,
+        r.operation.as_deref().unwrap_or("cas"),
+        r.message,
+    );
     Ok((
         StatusCode::OK,
         Json(CasRefResponse {
@@ -368,6 +407,38 @@ async fn cas_ref(
             current: r.new,
         }),
     ))
+}
+
+#[derive(serde::Deserialize)]
+struct LogParams {
+    before: Option<u64>,
+    limit: Option<usize>,
+}
+
+fn reflog_page(d: &Data, name: Option<&str>, q: LogParams) -> Json<RefLogResponse> {
+    Json(RefLogResponse {
+        entries: d
+            .reflog
+            .iter()
+            .rev()
+            .filter(|e| q.before.is_none_or(|b| e.seq < b))
+            .filter(|e| name.is_none_or(|n| e.name == n))
+            .take(q.limit.unwrap_or(50))
+            .cloned()
+            .collect(),
+    })
+}
+
+async fn reflog_all(State(s): State<Shared>, Query(q): Query<LogParams>) -> Json<RefLogResponse> {
+    reflog_page(&s.lock().unwrap(), None, q)
+}
+
+async fn reflog_one(
+    State(s): State<Shared>,
+    Path(name): Path<String>,
+    Query(q): Query<LogParams>,
+) -> Json<RefLogResponse> {
+    reflog_page(&s.lock().unwrap(), Some(&name), q)
 }
 
 async fn resolve(State(s): State<Shared>, Path(rev): Path<String>) -> Resp<ResolveResponse> {
@@ -457,7 +528,8 @@ async fn land(State(s): State<Shared>, Json(r): Json<LandRequest>) -> Resp<LandR
     let head = d.refs.get(&r.target_ref).copied();
     let parent = cs.parents.first().copied();
     let Some(head) = head.filter(|h| Some(*h) != parent) else {
-        d.refs.insert(r.target_ref, r.changeset);
+        let msg = format!("landed {}", r.changeset);
+        d.set_ref(&r.target_ref, Some(r.changeset), "land", Some(msg));
         return Ok(Json(LandResponse::Landed {
             landed: r.changeset,
             rebased: false,
@@ -515,7 +587,8 @@ async fn land(State(s): State<Shared>, Json(r): Json<LandRequest>) -> Resp<LandR
     let mut rebased = cs;
     rebased.parents = vec![head];
     let id = d.insert(rebased);
-    d.refs.insert(r.target_ref, id);
+    let msg = format!("landed {}", r.changeset);
+    d.set_ref(&r.target_ref, Some(id), "land", Some(msg));
     Ok(Json(LandResponse::Landed {
         landed: id,
         rebased: true,

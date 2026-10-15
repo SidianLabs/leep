@@ -8,6 +8,7 @@ pub mod history;
 pub mod init;
 pub mod keygen;
 pub mod land;
+pub mod reflog;
 pub mod review;
 pub mod search;
 pub mod status;
