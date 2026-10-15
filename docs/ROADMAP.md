@@ -7,10 +7,10 @@ Milestones are ordered. Each one should leave `main` releasable.
 - [x] Blob backends: filesystem, S3/MinIO, LRU cache (`leep-store`)
 - [x] Metadata backends: SQLite, Postgres (`leep-meta`)
 - [x] Derived data and operations: tree, generation, skiplist, diff, log, blame, merge, rebase, land (`leep-derive`)
-- [ ] HTTP server (`leep-server`)
+- [x] HTTP server (`leep-server`)
 - [x] CLI with lazy sparse checkouts (`leep-cli`)
 - [x] Git import and export (`leep-git`)
-- [ ] End-to-end test: import a git repo, run 50 concurrent agent lands, export back to git
+- [x] End-to-end test: import a git repo, run 50 concurrent agent lands, export back to git
 
 ## v0.2: Operable
 - [x] Token auth (static bearer tokens, read/write roles; ADR 0007)
