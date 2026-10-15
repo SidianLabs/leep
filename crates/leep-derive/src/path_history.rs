@@ -115,6 +115,9 @@ impl Repo {
             return Ok(HistoryNode::default());
         }
         match self.meta().get_derived(NODE_KIND, &node).await? {
+            Some(b) if Hash::of_object(NODE_KIND, &b) != node => {
+                Err(Error::Storage(format!("corrupt history node {node}")))
+            }
             Some(b) => HistoryNode::decode(&b),
             None => Err(Error::Storage(format!("history node {node} missing"))),
         }

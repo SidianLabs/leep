@@ -153,6 +153,12 @@ impl Repo {
     /// Read one tree node. The empty tree always exists.
     pub async fn read_tree(&self, tree: Hash) -> Result<TreeNode> {
         match self.blobs.get(&tree).await? {
+            // A node's address is the hash of its bytes, so damage is
+            // detectable. GC marks from these nodes: reading a damaged one as
+            // valid would leave live blobs unmarked.
+            Some(b) if Hash::of_object(TreeNode::KIND, &b) != tree => {
+                Err(Error::Storage(format!("corrupt tree node {tree}")))
+            }
             Some(b) => TreeNode::decode(&b),
             None if tree == TreeNode::empty_hash() => Ok(TreeNode::default()),
             None => Err(Error::NotFound(format!("tree {tree}"))),
