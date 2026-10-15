@@ -303,7 +303,7 @@ pub async fn import(
                         None => {
                             let data = read_blob(&ts, blob)?;
                             let size = data.len() as u64;
-                            let h = repo.blobs().put(Bytes::from(data)).await?;
+                            let h = repo.put_blob(Bytes::from(data)).await?;
                             report.blobs_uploaded += 1;
                             blob_cache.insert(blob, (h, size));
                             (h, size)

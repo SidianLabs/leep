@@ -82,9 +82,7 @@ pub(crate) async fn apply_changes(
     if changes.is_empty() {
         if base == TreeNode::empty_hash() {
             let empty = TreeNode::default();
-            repo.blobs()
-                .put_with_hash(base, Bytes::from(empty.encode()))
-                .await?;
+            repo.put_rescuing(base, Bytes::from(empty.encode())).await?;
         }
         return Ok(base);
     }
@@ -148,9 +146,7 @@ pub(crate) async fn apply_changes(
             parent.entries.remove(name);
         } else {
             let h = node.hash();
-            repo.blobs()
-                .put_with_hash(h, Bytes::from(node.encode()))
-                .await?;
+            repo.put_rescuing(h, Bytes::from(node.encode())).await?;
             parent
                 .entries
                 .insert(name.to_string(), TreeEntry::Dir { tree: h });
@@ -158,9 +154,7 @@ pub(crate) async fn apply_changes(
     }
     let root = nodes.remove("").expect("root");
     let h = root.hash();
-    repo.blobs()
-        .put_with_hash(h, Bytes::from(root.encode()))
-        .await?;
+    repo.put_rescuing(h, Bytes::from(root.encode())).await?;
     Ok(h)
 }
 
