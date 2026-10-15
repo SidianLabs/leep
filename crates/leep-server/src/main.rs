@@ -20,12 +20,18 @@ struct Args {
     /// Metadata store URL (sqlite:, postgres://, mem://).
     #[arg(
         long,
+        global = true,
         env = "LEEP_META",
         default_value = "sqlite://./leep-data/meta.db?mode=rwc"
     )]
     meta: String,
     /// Blob store URL (file://, s3://, mem://).
-    #[arg(long, env = "LEEP_BLOBS", default_value = "file://./leep-data/blobs")]
+    #[arg(
+        long,
+        global = true,
+        env = "LEEP_BLOBS",
+        default_value = "file://./leep-data/blobs"
+    )]
     blobs: String,
     /// In-memory blob cache size in bytes; 0 disables it.
     #[arg(long, default_value_t = 256 * 1024 * 1024)]
@@ -67,6 +73,39 @@ enum Cmd {
         #[arg(long)]
         role: Role,
     },
+    /// Delete blobs no changeset references (uses --meta and --blobs; safe
+    /// beside running servers because of --grace).
+    Gc {
+        /// Report what would be deleted without deleting.
+        #[arg(long)]
+        dry_run: bool,
+        /// Keep unreferenced blobs written within this long (0, 30m, 24h, 7d).
+        /// Must exceed the time clients take from upload to commit.
+        #[arg(long, default_value = "24h", value_parser = parse_grace)]
+        grace: std::time::Duration,
+    },
+}
+
+fn parse_grace(s: &str) -> Result<std::time::Duration, String> {
+    leep_derive::gc::parse_duration(s).map_err(|e| e.to_string())
+}
+
+async fn run_gc(meta: &str, blobs: &str, opts: leep_derive::gc::GcOptions) -> anyhow::Result<()> {
+    let blobs = leep_store::open_blob_store(blobs).context("opening blob store")?;
+    let meta = leep_meta::open_meta_store(meta)
+        .await
+        .context("opening meta store")?;
+    let dry = opts.dry_run;
+    let r = leep_derive::gc::run(&Repo::new(blobs, meta), &opts).await?;
+    let verb = if dry { "would delete" } else { "deleted" };
+    println!("changesets scanned: {}", r.changesets_scanned);
+    println!("referenced blobs and trees: {}", r.marked);
+    println!("blobs scanned: {}", r.blobs_scanned);
+    println!("{verb}: {} blobs, {} bytes", r.deleted, r.deleted_bytes);
+    println!("kept (within grace): {}", r.kept_by_grace);
+    println!("kept (unknown age): {}", r.kept_unknown_mtime);
+    println!("kept (recently claimed): {}", r.kept_by_claim);
+    Ok(())
 }
 
 fn run_command(cmd: Cmd) -> anyhow::Result<()> {
@@ -79,6 +118,7 @@ fn run_command(cmd: Cmd) -> anyhow::Result<()> {
             }
             println!("{}", auth::hash_token(&token));
         }
+        Cmd::Gc { .. } => unreachable!("handled in main"),
         Cmd::GenToken { name, role } => {
             let (token, entry) = auth::generate(&name, role).map_err(anyhow::Error::msg)?;
             println!("token: {token}");
@@ -163,8 +203,17 @@ async fn main() -> anyhow::Result<()> {
             .with_env_filter(filter)
             .init(),
     }
-    if let Some(cmd) = args.command {
-        return run_command(cmd);
+    match args.command {
+        Some(Cmd::Gc { dry_run, grace }) => {
+            return run_gc(
+                &args.meta,
+                &args.blobs,
+                leep_derive::gc::GcOptions { grace, dry_run },
+            )
+            .await
+        }
+        Some(cmd) => return run_command(cmd),
+        None => {}
     }
     let metrics_app = args.metrics_listen.map(|_| install_metrics()).transpose()?;
     let auth = match &args.tokens_file {
@@ -226,5 +275,15 @@ impl BlobStore for ArcBlobs {
     }
     async fn contains(&self, hash: &leep_core::Hash) -> leep_core::Result<bool> {
         self.0.contains(hash).await
+    }
+    async fn list_page(
+        &self,
+        after: Option<leep_core::Hash>,
+        limit: usize,
+    ) -> leep_core::Result<Vec<leep_core::BlobMeta>> {
+        self.0.list_page(after, limit).await
+    }
+    async fn delete(&self, hash: &leep_core::Hash) -> leep_core::Result<()> {
+        self.0.delete(hash).await
     }
 }

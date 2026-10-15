@@ -4,7 +4,7 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use leep_core::{BlobStore, Hash, Result};
+use leep_core::{BlobMeta, BlobStore, Hash, Result};
 
 /// Cache counters since construction.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -45,6 +45,17 @@ impl Lru {
         self.bytes += data.len();
         self.order.insert(self.tick, hash);
         self.map.insert(hash, (data, self.tick));
+        self.evict_over(capacity);
+    }
+
+    fn remove(&mut self, hash: &Hash) {
+        if let Some((d, tick)) = self.map.remove(hash) {
+            self.order.remove(&tick);
+            self.bytes -= d.len();
+        }
+    }
+
+    fn evict_over(&mut self, capacity: usize) {
         while self.bytes > capacity {
             let Some((_, victim)) = self.order.pop_first() else {
                 break;
@@ -127,10 +138,23 @@ impl<S: BlobStore> BlobStore for CachedBlobStore<S> {
         Ok(found)
     }
 
+    async fn list_page(&self, after: Option<Hash>, limit: usize) -> Result<Vec<BlobMeta>> {
+        self.inner.list_page(after, limit).await
+    }
+
+    /// Evicts after the inner delete. A `get` racing with a delete can
+    /// re-cache the blob; only garbage collection deletes, and it never reads
+    /// the blobs it deletes.
+    async fn delete(&self, hash: &Hash) -> Result<()> {
+        self.inner.delete(hash).await?;
+        self.lru.lock().unwrap().remove(hash);
+        Ok(())
+    }
+
+    /// Always asks the inner store. GC may delete a blob from another process
+    /// while it is still cached here; answering from the cache would let a
+    /// client skip re-uploading a blob that is gone from durable storage.
     async fn contains(&self, hash: &Hash) -> Result<bool> {
-        if self.lru.lock().unwrap().map.contains_key(hash) {
-            return Ok(true);
-        }
         self.inner.contains(hash).await
     }
 }
@@ -171,6 +195,29 @@ mod tests {
         cache.get(&big).await.unwrap();
         assert!(cache.stats().bytes <= 100);
         assert!(cache.get(&Hash::of_blob(b"nope")).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_evicts_from_cache() {
+        let cache = CachedBlobStore::new(MemoryBlobStore::new(), 1024);
+        let h = cache.put(Bytes::from_static(b"gone")).await.unwrap();
+        let keep = cache.put(Bytes::from_static(b"kept")).await.unwrap();
+        cache.delete(&h).await.unwrap();
+        assert!(cache.get(&h).await.unwrap().is_none());
+        assert!(!cache.contains(&h).await.unwrap());
+        assert_eq!(cache.stats().entries, 1);
+        assert_eq!(cache.stats().bytes, 4);
+        assert!(cache.contains(&keep).await.unwrap());
+    }
+
+    /// Another process (GC) deleting from the durable store must be visible
+    /// to `contains` even while the blob is still cached.
+    #[tokio::test]
+    async fn contains_reflects_external_deletes() {
+        let cache = CachedBlobStore::new(MemoryBlobStore::new(), 1024);
+        let h = cache.put(Bytes::from_static(b"cached")).await.unwrap();
+        cache.inner().delete(&h).await.unwrap();
+        assert!(!cache.contains(&h).await.unwrap());
     }
 
     #[tokio::test]

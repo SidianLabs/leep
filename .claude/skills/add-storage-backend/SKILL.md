@@ -17,6 +17,16 @@ Backends implement `leep_core::BlobStore` (in `leep-store`) or
    - "Not found" is `Ok(None)`, not an error.
    - Writes are idempotent. A blob or changeset that already exists is
      success.
+   - Garbage collection (ADR 0008) needs three more methods on every backend:
+     - `BlobStore::list_page(after, limit)`: at most `limit` blobs with hash
+       strictly greater than `after`, in ascending hash order, with `size` and
+       `modified` (unix seconds, or `None` if unknown; GC keeps those). Skip
+       temp files and foreign keys. Do not return an unordered listing.
+     - `BlobStore::delete(hash)`: idempotent, absent is success.
+     - A repeated `put` of an existing blob must refresh `modified`, or the
+       grace window will not protect re-uploaded orphans.
+     - `MetaStore::list_changesets(after, limit)`: ids strictly greater than
+       `after` in ascending byte order. Never skip or repeat across pages.
    - **MetaStore `cas_ref` must be one atomic conditional operation.** That
      means a conditional update/insert/delete, or a transaction at
      serializable isolation. Never read then write.
