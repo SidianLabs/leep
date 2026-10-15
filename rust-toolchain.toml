@@ -1,0 +1,6 @@
+# Pinned so local checks and CI run the same rustc and clippy. Bump
+# deliberately in its own PR and fix any new lints in the same change.
+[toolchain]
+channel = "1.97.0"
+components = ["clippy", "rustfmt"]
+profile = "minimal"
