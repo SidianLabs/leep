@@ -18,10 +18,12 @@ pub struct Skiplist;
 
 impl Skiplist {
     pub fn decode(b: &[u8]) -> Result<Vec<SkipEntry>> {
-        if !b.len().is_multiple_of(40) {
+        let (chunks, rest) = b.as_chunks::<40>();
+        if !rest.is_empty() {
             return Err(Error::Encoding("bad skiplist value".into()));
         }
-        Ok(b.chunks_exact(40)
+        Ok(chunks
+            .iter()
             .map(|c| SkipEntry {
                 id: ChangesetId(Hash(c[..32].try_into().expect("32 bytes"))),
                 generation: u64::from_be_bytes(c[32..].try_into().expect("8 bytes")),
