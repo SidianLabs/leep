@@ -9,6 +9,9 @@
 //!   { "name": "viewer", "role": "read",  "hash": "blake3:<64 hex>" }
 //! ] }
 //! ```
+//!
+//! An entry may also carry request limits (`rate`, `burst`, `concurrency`,
+//! `max_body`; ADR 0020), see [`crate::limits`].
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -23,6 +26,8 @@ use leep_core::api::ErrorResponse;
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 use tracing::Instrument;
+
+use crate::limits::{Quota, TokenLimits};
 
 const DIGEST_PREFIX: &str = "blake3:";
 const TOKEN_BYTES: usize = 32;
@@ -78,12 +83,24 @@ impl<S: Send + Sync> FromRequestParts<S> for MaybePrincipal {
 }
 
 /// One line of the tokens file.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TokenEntry {
     pub name: String,
     pub role: Role,
     pub hash: String,
+    /// Requests per second, for reads and writes separately.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate: Option<Quota>,
+    /// Requests allowed at once before the rate applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub burst: Option<f64>,
+    /// Requests in flight at once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrency: Option<Quota>,
+    /// Largest request body, in bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_body: Option<Quota>,
 }
 
 #[derive(Deserialize)]
@@ -96,6 +113,7 @@ struct Known {
     name: String,
     role: Role,
     digest: [u8; 32],
+    limits: TokenLimits,
 }
 
 /// The loaded token table.
@@ -121,6 +139,10 @@ pub fn generate(name: &str, role: Role) -> Result<(String, TokenEntry), String> 
         name: name.to_string(),
         role,
         hash: hash_token(&token),
+        rate: None,
+        burst: None,
+        concurrency: None,
+        max_body: None,
     };
     Ok((token, entry))
 }
@@ -155,10 +177,20 @@ impl Auth {
                 return Err(format!("duplicate token name {:?}", t.name));
             }
             let digest = parse_digest(&t.hash).map_err(|e| format!("token {:?}: {e}", t.name))?;
+            let limits = TokenLimits {
+                rate: t.rate,
+                burst: t.burst,
+                concurrency: t.concurrency,
+                max_body: t.max_body,
+            };
+            limits
+                .validate()
+                .map_err(|e| format!("token {:?}: {e}", t.name))?;
             tokens.push(Known {
                 name: t.name,
                 role: t.role,
                 digest,
+                limits,
             });
         }
         Ok(Auth { tokens })
@@ -188,6 +220,14 @@ impl Auth {
             .collect()
     }
 
+    /// Each token's own limit fields, in file order; unset ones fall back to
+    /// the server-wide defaults.
+    pub fn token_limits(&self) -> impl Iterator<Item = (&str, Role, &TokenLimits)> {
+        self.tokens
+            .iter()
+            .map(|k| (k.name.as_str(), k.role, &k.limits))
+    }
+
     /// Match a presented token. Compares against every entry without early
     /// exit so timing does not reveal which digest matched.
     fn lookup(&self, token: &str) -> Option<(&str, Role)> {
@@ -204,7 +244,7 @@ impl Auth {
 
 /// Mutating requests need `write`. `POST /v1/blobs/missing` is a query, so a
 /// read token may call it.
-fn needs_write(method: &Method, path: &str) -> bool {
+pub(crate) fn needs_write(method: &Method, path: &str) -> bool {
     match *method {
         Method::GET | Method::HEAD => false,
         Method::POST => path != "/v1/blobs/missing",
@@ -212,7 +252,7 @@ fn needs_write(method: &Method, path: &str) -> bool {
     }
 }
 
-fn reject(status: StatusCode, msg: &str) -> Response {
+pub(crate) fn reject(status: StatusCode, msg: &str) -> Response {
     let mut resp = (
         status,
         Json(ErrorResponse {

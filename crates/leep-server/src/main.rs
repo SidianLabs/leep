@@ -8,6 +8,7 @@ use clap::{Parser, Subcommand};
 use leep_core::BlobStore;
 use leep_derive::Repo;
 use leep_server::auth::{self, Auth, Role};
+use leep_server::limits::{Defaults as LimitDefaults, Limiter};
 use leep_server::review::{RequireReview, ReviewPolicy, ReviewService};
 use leep_server::signing::{RequireSignatures, SigningKeys};
 use leep_store::CachedBlobStore;
@@ -45,6 +46,23 @@ struct Args {
     /// Maximum request body size in bytes.
     #[arg(long, default_value_t = leep_server::DEFAULT_MAX_BODY_BYTES)]
     max_body_bytes: usize,
+    /// Requests per second each token may make, counted separately for reads
+    /// and writes (anonymous mode: per client address). Off when unset; a
+    /// token entry's `rate` overrides it.
+    #[arg(long, env = "LEEP_RATE_LIMIT")]
+    rate_limit: Option<f64>,
+    /// Requests a token may make at once before --rate-limit applies.
+    /// Defaults to the rate rounded up. Needs --rate-limit.
+    #[arg(long, env = "LEEP_RATE_BURST")]
+    rate_burst: Option<u32>,
+    /// Requests each token may have in flight; more get 429. Off when unset;
+    /// a token entry's `concurrency` overrides it.
+    #[arg(long, env = "LEEP_MAX_CONCURRENT_PER_TOKEN")]
+    max_concurrent_per_token: Option<usize>,
+    /// Maximum request body size in bytes for `read` tokens, which should not
+    /// upload; a token entry's `max_body` overrides it. Needs --tokens-file.
+    #[arg(long, env = "LEEP_READ_MAX_BODY_BYTES")]
+    read_max_body_bytes: Option<usize>,
     /// JSON file of `blake3:` token digests; enables authentication. Read once
     /// at startup.
     #[arg(long, env = "LEEP_TOKENS_FILE")]
@@ -340,6 +358,25 @@ async fn main() -> anyhow::Result<()> {
             None
         }
     };
+    let limiter = Limiter::build(
+        auth.as_ref(),
+        &LimitDefaults {
+            rate: args.rate_limit,
+            burst: args.rate_burst,
+            concurrency: args.max_concurrent_per_token,
+            read_max_body: args.read_max_body_bytes,
+        },
+    )
+    .map_err(anyhow::Error::msg)
+    .context("request limits")?
+    .map(Arc::new);
+    if let Some(l) = &limiter {
+        tracing::info!(
+            limited_tokens = l.limited_tokens(),
+            anonymous = l.limits_anonymous(),
+            "request limits enabled"
+        );
+    }
     let signing = match &args.signing_keys_file {
         Some(path) => {
             let k = SigningKeys::from_file(path).map_err(anyhow::Error::msg)?;
@@ -393,13 +430,14 @@ async fn main() -> anyhow::Result<()> {
     if args.request_timeout.is_zero() {
         tracing::warn!("request timeout disabled: gc --fence cannot be guaranteed safe");
     }
-    let app = leep_server::router_with_timeout(
+    let app = leep_server::router_with_limits(
         repo,
         args.max_body_bytes,
         auth,
         signing,
         review,
         args.request_timeout,
+        limiter,
     );
 
     let listener = tokio::net::TcpListener::bind(args.listen)
