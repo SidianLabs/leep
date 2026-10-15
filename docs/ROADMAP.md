@@ -1,6 +1,8 @@
 # Leep roadmap
 
-Milestones are ordered. Each one should leave `main` releasable.
+Milestones are ordered. Each one should leave `main` releasable. Who Leep is
+for, and why the milestones are in this order, is in
+[PRODUCT.md](PRODUCT.md).
 
 ## How versions move
 
@@ -56,6 +58,8 @@ Exit: both indexes derive lazily on a 100k-changeset repository without
 operator action, and their benchmarks are in `docs/PERFORMANCE.md`.
 
 ## M5: Hardening
+- Self-host Leep's own development on a Leep server, mirrored to GitHub,
+  with the git bridge keeping the mirror in sync
 - Fuzz every decoder (postcard objects, derived rows, API request bodies,
   OWNERS and policy files) and the comment lexer; run the fuzzers in CI
 - Crash-consistency tests: kill the server and GC at random points and check
@@ -75,6 +79,8 @@ Exit: a full soak run and the fuzzers find nothing new for two weeks.
 - Repair tools: verify reachability, re-derive or drop derived data by kind
 - Runbook for every alert in `docs/OPERATIONS.md`
 - Config reload without restart (tokens, keys, policies)
+- Two or three design partners from the first market (see
+  [PRODUCT.md](PRODUCT.md)) running Leep for real work
 
 Exit: an operator who has never seen Leep can deploy, back up, restore and
 upgrade it from the docs alone.
@@ -89,8 +95,8 @@ upgrade it from the docs alone.
   `cargo install`
 - A read-only web view of history, diffs and reviews
 
-Exit: Leep's own development moves onto a Leep server (mirrored to GitHub)
-and stays there for at least one milestone.
+Exit: the design partners' top requests for this milestone are shipped,
+and Leep's own development has run on a Leep server since M5.
 
 ## M8: Scale out
 - Regional read-through cache tier

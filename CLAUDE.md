@@ -1,9 +1,11 @@
 # Leep: guide for agents
 
 Leep is a server-centric, content-addressed version control system written
-in Rust. Read [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) before
-non-trivial work, and [docs/FORMATS.md](docs/FORMATS.md) before touching
-anything that is persisted or sent over the wire.
+in Rust, built first for teams running many coding agents on one codebase
+([docs/PRODUCT.md](docs/PRODUCT.md)). Read
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) before non-trivial work, and
+[docs/FORMATS.md](docs/FORMATS.md) before touching anything that is
+persisted or sent over the wire.
 
 ## Commands
 
@@ -37,6 +39,8 @@ End-to-end tests drive the real binaries and need them built first:
 - Remove or rename a `/v1` API field or endpoint. Only add, using
   `#[serde(default)]` for new fields.
 - Silently resolve merge conflicts on the server.
+- Merge a pull request. The maintainer reviews and merges every PR; open it,
+  drive it to green CI and answer review comments, then stop.
 - Bump the workspace version, tag a release, or mark a roadmap milestone
   closed. Those are maintainer decisions; see "How versions move" in
   [docs/ROADMAP.md](docs/ROADMAP.md).

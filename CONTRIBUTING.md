@@ -17,4 +17,8 @@ Notable changes go under `[Unreleased]` in [CHANGELOG.md](CHANGELOG.md)
 in the same PR. Report security problems privately as described in
 [SECURITY.md](SECURITY.md).
 
+Outside contributors sign the [Contributor License Agreement](CLA.md)
+before their first PR is merged. The maintainer reviews and merges every
+PR.
+
 Licensed under Apache-2.0; see [LICENSE](LICENSE).

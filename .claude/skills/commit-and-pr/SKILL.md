@@ -75,5 +75,7 @@ names or tool-generated names.
   operator would notice. Never move entries into a version section: that
   happens only when the maintainer cuts a release.
 - CI (fmt, clippy `-D warnings`, tests) must be green before review.
-- Merge with **squash merge**. Delete the branch after merging.
+- Only the maintainer merges, with **squash merge**, and deletes the
+  branch. Agents open the PR, keep CI green and answer review comments, but
+  never merge.
 - No AI attribution in the title, body or comments (see the top of this skill).
