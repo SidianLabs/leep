@@ -207,12 +207,25 @@ regional cache cannot stampede the origin.
 | BlobStore slow | Cache tiers absorb repeated reads | — |
 | Land CAS contention | Bounded retries, then an error | Client retries `land` |
 
-## 10. Security (v0.1 and planned)
+## 10. Security
 
-v0.1 has no authentication and is meant for trusted networks. Planned work:
-token auth at the server, per-directory ACLs evaluated against changeset
-paths, and signed changesets (author key in `extra`) for agent provenance.
-See the roadmap.
+Authentication is static bearer tokens ([ADR 0007](adr/0007-token-authentication.md)).
+`leep-server --tokens-file <PATH>` (or `LEEP_TOKENS_FILE`) loads a JSON file of
+`{name, role, hash}` entries, where `hash` is `blake3:<hex>` of the token; the
+file is read at startup only. Without it, auth is off and the server warns.
+With it, an axum middleware requires `Authorization: Bearer <token>` on every
+endpoint except `GET /v1/health`: 401 (with `WWW-Authenticate: Bearer`) when the
+token is missing or unknown, 403 when a `read` token makes a mutating request.
+`POST /v1/blobs/missing` counts as read because it only queries. Digests are
+compared in constant time, and only the token name is logged. Use
+`leep-server gen-token` and `hash-token` to create entries. Terminate TLS in
+front of the server; bearer tokens are otherwise visible on the wire.
+
+The CLI reads the token from `--token`, `LEEP_TOKEN`, or `.leep/config.json`.
+
+Planned: OIDC or mTLS, per-directory ACLs evaluated against changeset paths,
+and signed changesets (author key in `extra`) for agent provenance. See the
+roadmap.
 
 ## 11. Scaling path
 
