@@ -12,7 +12,7 @@
 //! | GET  | `/v1/refs` | – | [`RefsResponse`] |
 //! | GET  | `/v1/refs/{name}` | – | [`RefResponse`] |
 //! | POST | `/v1/refs/{name}` | [`CasRefRequest`] | [`CasRefResponse`] (409 if it lost) |
-//! | GET  | `/v1/resolve/{rev}` | – | [`ResolveResponse`] (`rev` = ref name or id/unique prefix ≥ 8 hex) |
+//! | GET  | `/v1/resolve/{rev}` | – | [`ResolveResponse`] (`rev` = ref name or full 64-hex id) |
 //! | GET  | `/v1/tree/{id}?path=dir` | – | [`TreeResponse`] (one directory level) |
 //! | GET  | `/v1/files/{id}?prefix=dir` | – | [`FilesResponse`] (recursive listing) |
 //! | GET  | `/v1/file/{id}?path=p` | – | raw bytes + `x-leep-kind` header, or 404 |
@@ -24,7 +24,8 @@
 //! | POST | `/v1/rebase` | [`RebaseRequest`] | [`RebaseResponse`] |
 //! | POST | `/v1/land` | [`LandRequest`] | [`LandResponse`] |
 //!
-//! Errors are `{"error": "..."}` with a 4xx/5xx status ([`ErrorResponse`]).
+//! Errors are `{"error": "..."}` ([`ErrorResponse`]): `Error::Invalid` → 400,
+//! `Error::NotFound` → 404, CAS loss → 409, anything else → 500.
 //! Hashes and ids are lowercase hex in JSON.
 
 use std::collections::BTreeMap;

@@ -6,6 +6,9 @@ pub enum Error {
     InvalidPath(String, &'static str),
     #[error("invalid hash: {0}")]
     InvalidHash(String),
+    /// Caller error: malformed or inconsistent input. Maps to HTTP 400.
+    #[error("invalid input: {0}")]
+    Invalid(String),
     #[error("not found: {0}")]
     NotFound(String),
     #[error("encoding error: {0}")]
