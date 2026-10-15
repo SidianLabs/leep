@@ -2,7 +2,7 @@
 //!
 //! Everything a changeset refers to is immutable and content-addressed, so any
 //! layer may cache it forever. The only mutable state is refs, which change by
-//! compare-and-swap. See `docs/DESIGN.md`.
+//! compare-and-swap. See `docs/ARCHITECTURE.md`.
 
 pub mod api;
 pub mod changeset;

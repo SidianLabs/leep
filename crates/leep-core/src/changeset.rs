@@ -46,7 +46,11 @@ pub enum FileKind {
 #[serde(rename_all = "snake_case")]
 pub enum FileChange {
     /// Create or replace the file at this path.
-    Modify { content: Hash, kind: FileKind, size: u64 },
+    Modify {
+        content: Hash,
+        kind: FileKind,
+        size: u64,
+    },
     Delete,
 }
 
@@ -106,7 +110,11 @@ mod tests {
         let mut changes = BTreeMap::new();
         changes.insert(
             RepoPath::new("a.txt").unwrap(),
-            FileChange::Modify { content: Hash::of_blob(b"hi\n"), kind: FileKind::Regular, size: 3 },
+            FileChange::Modify {
+                content: Hash::of_blob(b"hi\n"),
+                kind: FileKind::Regular,
+                size: 3,
+            },
         );
         changes.insert(RepoPath::new("old.txt").unwrap(), FileChange::Delete);
         Changeset {

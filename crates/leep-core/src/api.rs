@@ -200,8 +200,12 @@ pub struct RebaseRequest {
 pub enum RebaseResponse {
     /// New changeset with parent `onto`, same author/message/extra, plus
     /// `extra["leep.rebased_from"]`. If already based on `onto`, returns it.
-    Rebased { id: ChangesetId },
-    Conflicts { conflicts: Vec<Conflict> },
+    Rebased {
+        id: ChangesetId,
+    },
+    Conflicts {
+        conflicts: Vec<Conflict>,
+    },
 }
 
 /// Land a changeset on a ref with no merge queue: if the ref moved since the
@@ -223,8 +227,15 @@ fn default_ref() -> String {
 pub enum LandResponse {
     /// `landed` is the changeset now at the ref head (a rebased copy if the
     /// ref had moved).
-    Landed { landed: ChangesetId, rebased: bool, attempts: u32 },
-    Conflicts { onto: ChangesetId, conflicts: Vec<Conflict> },
+    Landed {
+        landed: ChangesetId,
+        rebased: bool,
+        attempts: u32,
+    },
+    Conflicts {
+        onto: ChangesetId,
+        conflicts: Vec<Conflict>,
+    },
 }
 
 #[cfg(test)]
@@ -234,8 +245,12 @@ mod tests {
     #[test]
     fn tagged_enums_serialize_with_status() {
         let id = ChangesetId(Hash::of_blob(b"x"));
-        let v = serde_json::to_value(LandResponse::Landed { landed: id, rebased: false, attempts: 1 })
-            .unwrap();
+        let v = serde_json::to_value(LandResponse::Landed {
+            landed: id,
+            rebased: false,
+            attempts: 1,
+        })
+        .unwrap();
         assert_eq!(v["status"], "landed");
         let req: LandRequest =
             serde_json::from_value(serde_json::json!({ "changeset": id.to_string() })).unwrap();

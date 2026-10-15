@@ -56,7 +56,11 @@ impl MemoryMetaStore {
 impl MetaStore for MemoryMetaStore {
     async fn put_changeset(&self, cs: &Changeset) -> Result<ChangesetId> {
         let id = cs.id();
-        self.changesets.lock().unwrap().entry(id).or_insert_with(|| cs.clone());
+        self.changesets
+            .lock()
+            .unwrap()
+            .entry(id)
+            .or_insert_with(|| cs.clone());
         Ok(id)
     }
 
@@ -90,11 +94,19 @@ impl MetaStore for MemoryMetaStore {
     }
 
     async fn get_derived(&self, kind: &str, key: &Hash) -> Result<Option<Bytes>> {
-        Ok(self.derived.lock().unwrap().get(&(kind.to_string(), *key)).cloned())
+        Ok(self
+            .derived
+            .lock()
+            .unwrap()
+            .get(&(kind.to_string(), *key))
+            .cloned())
     }
 
     async fn put_derived(&self, kind: &str, key: &Hash, value: Bytes) -> Result<()> {
-        self.derived.lock().unwrap().insert((kind.to_string(), *key), value);
+        self.derived
+            .lock()
+            .unwrap()
+            .insert((kind.to_string(), *key), value);
         Ok(())
     }
 }
@@ -107,7 +119,11 @@ pub async fn check_meta_store_contract(store: &dyn MetaStore) {
     let mut changes = BTreeMap::new();
     changes.insert(
         RepoPath::new("x").unwrap(),
-        FileChange::Modify { content: Hash::of_blob(b"x"), kind: FileKind::Regular, size: 1 },
+        FileChange::Modify {
+            content: Hash::of_blob(b"x"),
+            kind: FileKind::Regular,
+            size: 1,
+        },
     );
     let cs = Changeset {
         parents: vec![],
@@ -119,25 +135,47 @@ pub async fn check_meta_store_contract(store: &dyn MetaStore) {
     };
     let id = store.put_changeset(&cs).await.unwrap();
     assert_eq!(id, cs.id());
-    assert_eq!(store.put_changeset(&cs).await.unwrap(), id, "put is idempotent");
+    assert_eq!(
+        store.put_changeset(&cs).await.unwrap(),
+        id,
+        "put is idempotent"
+    );
     assert_eq!(store.get_changeset(&id).await.unwrap().as_ref(), Some(&cs));
     let missing = ChangesetId(Hash::of_blob(b"missing"));
     assert!(store.get_changeset(&missing).await.unwrap().is_none());
 
     assert!(store.get_ref("main").await.unwrap().is_none());
-    assert!(!store.cas_ref("main", Some(id), Some(id)).await.unwrap(), "wrong expected");
+    assert!(
+        !store.cas_ref("main", Some(id), Some(id)).await.unwrap(),
+        "wrong expected"
+    );
     assert!(store.cas_ref("main", None, Some(id)).await.unwrap());
-    assert!(!store.cas_ref("main", None, Some(id)).await.unwrap(), "already exists");
+    assert!(
+        !store.cas_ref("main", None, Some(id)).await.unwrap(),
+        "already exists"
+    );
     assert_eq!(store.get_ref("main").await.unwrap(), Some(id));
     assert_eq!(store.list_refs().await.unwrap().get("main"), Some(&id));
-    assert!(store.cas_ref("main", Some(id), None).await.unwrap(), "delete");
+    assert!(
+        store.cas_ref("main", Some(id), None).await.unwrap(),
+        "delete"
+    );
     assert!(store.get_ref("main").await.unwrap().is_none());
 
     let key = Hash::of_blob(b"k");
     assert!(store.get_derived("kind", &key).await.unwrap().is_none());
-    store.put_derived("kind", &key, Bytes::from_static(b"v")).await.unwrap();
-    store.put_derived("kind", &key, Bytes::from_static(b"v")).await.unwrap();
-    assert_eq!(store.get_derived("kind", &key).await.unwrap().unwrap(), &b"v"[..]);
+    store
+        .put_derived("kind", &key, Bytes::from_static(b"v"))
+        .await
+        .unwrap();
+    store
+        .put_derived("kind", &key, Bytes::from_static(b"v"))
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get_derived("kind", &key).await.unwrap().unwrap(),
+        &b"v"[..]
+    );
     assert!(store.get_derived("other", &key).await.unwrap().is_none());
 }
 
@@ -146,7 +184,11 @@ pub async fn check_blob_store_contract(store: &dyn BlobStore) {
     let data = Bytes::from_static(b"hello world");
     let h = store.put(data.clone()).await.unwrap();
     assert_eq!(h, Hash::of_blob(&data));
-    assert_eq!(store.put(data.clone()).await.unwrap(), h, "put is idempotent");
+    assert_eq!(
+        store.put(data.clone()).await.unwrap(),
+        h,
+        "put is idempotent"
+    );
     assert_eq!(store.get(&h).await.unwrap().unwrap(), data);
     assert!(store.contains(&h).await.unwrap());
     let other = Hash::of_blob(b"absent");
@@ -154,7 +196,10 @@ pub async fn check_blob_store_contract(store: &dyn BlobStore) {
     assert!(!store.contains(&other).await.unwrap());
 
     let custom = Hash::of_object("tree-v1", b"node");
-    store.put_with_hash(custom, Bytes::from_static(b"node")).await.unwrap();
+    store
+        .put_with_hash(custom, Bytes::from_static(b"node"))
+        .await
+        .unwrap();
     assert_eq!(store.get(&custom).await.unwrap().unwrap(), &b"node"[..]);
 
     let empty = store.put(Bytes::new()).await.unwrap();

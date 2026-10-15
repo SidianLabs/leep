@@ -16,8 +16,14 @@ pub struct TreeNode {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TreeEntry {
-    File { content: Hash, kind: FileKind, size: u64 },
-    Dir { tree: Hash },
+    File {
+        content: Hash,
+        kind: FileKind,
+        size: u64,
+    },
+    Dir {
+        tree: Hash,
+    },
 }
 
 impl TreeNode {
@@ -50,10 +56,19 @@ mod tests {
     #[test]
     fn roundtrip() {
         let mut t = TreeNode::default();
-        t.entries.insert("a".into(), TreeEntry::Dir { tree: TreeNode::empty_hash() });
+        t.entries.insert(
+            "a".into(),
+            TreeEntry::Dir {
+                tree: TreeNode::empty_hash(),
+            },
+        );
         t.entries.insert(
             "b".into(),
-            TreeEntry::File { content: Hash::of_blob(b"b"), kind: FileKind::Executable, size: 1 },
+            TreeEntry::File {
+                content: Hash::of_blob(b"b"),
+                kind: FileKind::Executable,
+                size: 1,
+            },
         );
         assert_eq!(TreeNode::decode(&t.encode()).unwrap(), t);
         assert_ne!(t.hash(), TreeNode::empty_hash());
