@@ -178,6 +178,31 @@ derivation requires `history-tree-v2` and `history-node-v2`. Entries of deleted
 paths are kept. The API addition (`GET /v1/last-change/{id}`) adds one endpoint
 and one response type; `/v1/log` is unchanged.
 
+## Rename detection (no persisted change)
+
+ADR 0016. Renames are computed when displaying; no stored data, derived kind or
+hash changed. The API additions are all optional, and absent fields mean the old
+behavior:
+
+- `GET /v1/diff` query: `renames=true|false` (default false) and
+  `rename_threshold=0..100` (default 50; anything else is 400, also when
+  `renames` is false).
+- `DiffResponse`: `renames: [RenameEntry]` and `renames_truncated: bool`, both
+  `#[serde(default)]` and omitted from the JSON when empty or false. `entries` is
+  unchanged: a rename is still a delete entry and an add entry.
+  `RenameEntry { from, to, similarity: 0..100, exact }`, sorted by `to`; a path
+  is in at most one rename; `exact` means same content hash and same kind.
+- `GET /v1/log/{id}` query: `follow=true|false` (default false). It needs a file
+  `path` (400 for none, or a directory).
+- `ChangesetInfo`: `path_at` (the followed file's name in that changeset) and
+  `renamed` (a `RenameEntry`, on the entry where the file got its name). Both are
+  `#[serde(default)]`, omitted when absent, and set only by a follow log.
+
+The similarity score is part of what clients see, not of what is stored: lines
+keep their `\n`, compare by FNV-1a 64, and weigh by byte length;
+`score = floor(200 * common_bytes / (bytes_a + bytes_b))`. Changing it is a
+behavior change recorded in the ADR, not a format change.
+
 ## Ref names (no change to stored data)
 
 Every ref write is checked by `leep_core::refname::validate`; reads and

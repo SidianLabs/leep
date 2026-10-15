@@ -56,6 +56,12 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   invalid one. Existing valid names keep working.
 - Deleting a ref that a land policy (signatures, review) covers is now
   refused with 400.
+- Rename detection when displaying (ADR 0016): `leep diff` and `leep status`
+  show `renamed: old -> new (NN%)`, with `--no-renames` and `-M[=N]`;
+  `GET /v1/diff` takes `renames` and `rename_threshold`; the MCP `leep_diff`
+  tool takes `renames`.
+- `leep log --follow FILE` continues a file's history under its old names;
+  `GET /v1/log` takes `follow`, and the MCP `leep_log` tool takes `follow`.
 
 ### Project
 - Workspace version set to 0.0.1, with a CI check that keeps it below

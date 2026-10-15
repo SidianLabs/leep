@@ -69,7 +69,7 @@ content-addressing and (b) the atomicity of `MetaStore::cas_ref`.
 
 | Crate | Role | May depend on |
 |---|---|---|
-| `leep-core` | Types, hashing, encoding, `BlobStore`/`MetaStore` traits (including listing and blob deletion for GC), in-memory stores, conformance tests, API types | no other leep crate; no I/O, no async runtime |
+| `leep-core` | Types, hashing, encoding, `BlobStore`/`MetaStore` traits (including listing and blob deletion for GC), in-memory stores, conformance tests, API types, pure rename detection | no other leep crate; no I/O, no async runtime |
 | `leep-store` | `BlobStore` backends: filesystem, `object_store` (S3/MinIO), `CachedBlobStore`, `open_blob_store(url)` | core |
 | `leep-meta` | `MetaStore` backends: SQLite, Postgres, `open_meta_store(url)` | core |
 | `leep-derive` | `Repo`: derived data framework and kinds, plus all operations and blob garbage collection (`gc`) | core (traits only, never a concrete backend) |
@@ -158,6 +158,19 @@ of its parents' entries, so a side branch's changes are never lost. The index
 is derived on the first path query for a history, oldest first. `author` and
 `extra` filters apply to the changesets the walk yields, so a selective filter
 on a frequently changed path still reads each of them.
+
+**Rename detection** ([ADR 0016](adr/0016-rename-detection.md)). Changesets
+store a rename as a delete plus an add, and renames are detected when
+displaying, with nothing persisted. `leep_core::rename` pairs the deleted and
+added files of a diff: exact (same hash and kind, always, linear), then
+same-bytes-with-a-mode-change, then line-multiset similarity for text files up
+to 1 MiB (`2 * common / total` by bytes, threshold 50 by default, greedy by
+score then path), symlinks exact only. Similarity is skipped, and reported as
+`renames_truncated`, past 1000 x 1000 candidate pairs. `GET /v1/diff` returns
+the pairs beside the unchanged `entries` when asked (`renames=true`), the CLI's
+working-copy `diff` and `status` run the same code, and `GET /v1/log` with
+`follow=true` continues a file's path log under its old name by detecting the
+rename at the changeset that created the file.
 
 **Provenance queries.** `agent.*` keys in `extra` (see `EXTRA_AGENT_*`) are
 queryable without any new persisted data. `GET /v1/log` takes `author` and

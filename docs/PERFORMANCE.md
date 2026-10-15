@@ -52,6 +52,23 @@ indicative; expect roughly +/-15% run to run.
 | `last_change` of a file, a rarely changed file, a directory | | 4.0 / 4.2 / 3.7 us | |
 | derive the history index (per changeset, one file each) | | 36 us | |
 
+## Rename detection
+
+`cargo bench -p leep-derive --bench repo_ops -- detect_renames` times the pure
+pairing of 1000 deleted and 1000 added files of about 30 lines (ADR 0016), the
+default limit's worst case. Contents are in memory, so blob reads are not
+included. Same machine and profile as above, median of 10 samples.
+
+| Benchmark | Time |
+|---|---|
+| exact: every added file is an unchanged deleted file | 0.4 ms |
+| similar: every added file is an edit of one deleted file (1 000 000 pairs scored) | 122 ms |
+
+Exact detection is a hash map pass, so it stays linear however many files move.
+Similarity is quadratic in the candidates, which is why it stops at 1000 x 1000
+pairs; a followed `log` pays it once per changeset that created the file, over
+that changeset's own deleted and added files only.
+
 ## Code search
 
 `crates/leep-derive/benches/search.rs` compares an indexed search with a full
