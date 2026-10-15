@@ -9,8 +9,11 @@ license.workspace = true
 leep-core.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
+futures-util.workspace = true
 globset.workspace = true
 postcard.workspace = true
+regex.workspace = true
+regex-syntax.workspace = true
 serde.workspace = true
 tokio.workspace = true
 tracing.workspace = true
@@ -24,4 +27,8 @@ criterion.workspace = true
 
 [[bench]]
 name = "repo_ops"
+harness = false
+
+[[bench]]
+name = "search"
 harness = false
