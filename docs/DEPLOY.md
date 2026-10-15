@@ -85,6 +85,30 @@ In compose, add the same volume and `LEEP_TOKENS_FILE` to `leep-server`.
 Clients pass the token with `LEEP_TOKEN`, `leep --token` or
 `leep init --token`. `GET /v1/health` stays public for probes.
 
+## Signed changesets
+
+Optional. Authors sign changesets with Ed25519 keys; the server trusts only the
+keys you list, and can refuse to land unsigned work on chosen refs (ADR 0010).
+
+```sh
+leep keygen --out ~/.config/leep/alice.key --name alice   # prints the keys-file entry
+echo '{"keys":[<entries, comma separated>]}' > signing-keys.json
+docker run -d -p 127.0.0.1:7070:7070 -v leep-data:/var/lib/leep \
+  -v "$PWD/signing-keys.json:/etc/leep/signing-keys.json:ro" \
+  -e LEEP_SIGNING_KEYS_FILE=/etc/leep/signing-keys.json \
+  -e LEEP_REQUIRE_SIGNATURES=main leep:dev
+```
+
+`--signing-keys-file` enables `POST /v1/changesets/{id}/signatures`, which
+needs a write token when auth is on. `--require-signatures REF` (repeatable;
+the environment variable is comma-separated) makes `land` onto `REF` fail
+with 400 unless every changeset it adds is signed by a listed key, and needs
+the keys file. Both are read at startup; restart to change them. Authors
+commit with `leep commit --sign KEYFILE` or `LEEP_SIGNING_KEY=KEYFILE`; the key
+file must be mode 0600. Raw ref updates (`POST /v1/refs/{name}`) are checked
+the same way. `leep-git` import writes to the stores directly and is not
+covered, so run it only as an operator.
+
 ## Environment variables
 
 | Variable | Default in image | Meaning |
@@ -93,7 +117,10 @@ Clients pass the token with `LEEP_TOKEN`, `leep --token` or
 | `LEEP_META` | `sqlite:///var/lib/leep/meta.db?mode=rwc` | Metadata store: `sqlite:`, `postgres://`, `mem://`. |
 | `LEEP_BLOBS` | `file:///var/lib/leep/blobs` | Blob store: `file://`, `s3://bucket?endpoint=URL&region=R&allow_http=true`, `mem://`. |
 | `LEEP_TOKENS_FILE` | none | Tokens file; enables authentication. |
+| `LEEP_SIGNING_KEYS_FILE` | none | Trusted author keys file; enables signature submission. |
+| `LEEP_REQUIRE_SIGNATURES` | none | Comma-separated refs that only accept signed lands; needs the keys file. |
 | `LEEP_SERVER` | none | CLI only: server URL. |
+| `LEEP_SIGNING_KEY` | none | CLI only: private key file for `leep commit --sign`. |
 | `LEEP_TOKEN` | none | CLI only: bearer token. |
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | none | S3 credentials (standard AWS variables). |
 | `LEEP_METRICS_LISTEN` | off | Address for a separate, unauthenticated `GET /metrics` listener; keep it private. See [OPERATIONS.md](OPERATIONS.md). |

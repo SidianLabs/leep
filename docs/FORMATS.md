@@ -30,6 +30,8 @@ skill.
 | `TreeNode` | `tree-v1` | `BlobStore`, keyed by `TreeNode::hash()` |
 | derived `root_tree` | — | `MetaStore.derived`, value = 32 raw bytes |
 | derived `generation` | — | `MetaStore.derived`, value = u64 (owned by leep-derive) |
+| derived `signature-v1` | — | `MetaStore.derived`, key = `Hash::of_object("signature", changeset_id ‖ key_id)`, value = postcard `Signature { key_id: String, public_key: [u8; 32], sig: [u8; 64] }` (`leep_core::signature`) |
+| derived `rebased-origin-v1` | — | `MetaStore.derived`, key = rebased copy id, value = 32 raw bytes (id it was rebased from); written by `Repo::rebase` |
 | other derived kinds | — | owned and versioned by `leep-derive` |
 
 ## Versioning rules
@@ -47,6 +49,23 @@ skill.
    `/v2`, served alongside v1.
 5. SQL schemas migrate forward only. Migrations are idempotent and live in
    `leep-meta`.
+
+## Signatures (no change to `Changeset`)
+
+ADR 0010. A signature cannot be stored in the changeset it signs, so
+`Changeset` and the changeset id are unchanged. The signed message is
+`b"leep-changeset-signature-v1\0" ‖ changeset_id` (28 + 32 bytes, the id as
+raw bytes), Ed25519. The key id is the first 16 hex characters of
+`BLAKE3(public key bytes)`; a public key is written `ed25519:<64 hex>` and a
+signature as 128 hex digits in the API. Two derived kinds hold the data (see
+the table above); the `signature-v1` key hashes the changeset id bytes
+followed by the ASCII key id, with object kind `signature`. Changing the
+message prefix, the key id derivation or the `Signature` field order requires
+a `-v2` kind, because stored rows would stop verifying. The API additions
+(`/v1/changesets/{id}/signatures`) only add endpoints and types.
+
+The server's signing keys file is `{"keys":[{"name","public_key"}]}`; unknown
+fields are rejected.
 
 ## SQL schema (leep-meta)
 
