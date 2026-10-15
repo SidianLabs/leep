@@ -23,6 +23,9 @@
 //! | GET  | `/v1/merge-base?a=x&b=y` | – | [`MergeBaseResponse`] |
 //! | POST | `/v1/changesets/{id}/signatures` | [`AddSignatureRequest`] | [`AddSignatureResponse`] (400 if the signature is bad or the key is not trusted; 404 if the changeset is unknown) |
 //! | GET  | `/v1/changesets/{id}/signatures` | – | [`SignaturesResponse`] (trusted signatures, re-verified on read) |
+//! | POST | `/v1/changesets/{id}/reviews` | [`AddReviewRequest`] | [`AddReviewResponse`] (the reviewer is the token's name; 400 without authentication; 404 if the changeset is unknown) |
+//! | GET  | `/v1/changesets/{id}/reviews` | – | [`ReviewsResponse`] |
+//! | GET  | `/v1/changesets/{id}/review-status?ref=main` | – | [`ReviewStatusResponse`] (`ref` defaults to `main`) |
 //! | POST | `/v1/merge` | [`MergeRequest`] | [`MergeResponse`] |
 //! | POST | `/v1/rebase` | [`RebaseRequest`] | [`RebaseResponse`] |
 //! | POST | `/v1/land` | [`LandRequest`] | [`LandResponse`] |
@@ -48,6 +51,16 @@
 //! Adding a signature is a `POST`, so it needs a `write` token; listing is a
 //! `GET`.
 //!
+//! # Reviews
+//!
+//! Reviews are attestations stored beside changesets (ADR 0011). They need
+//! authentication: the reviewer is the token's name, and `GET` lists reviews
+//! by looking up each known principal, so a server without a tokens file
+//! answers all three review endpoints with 400. Servers started with
+//! `--require-review REF` or a review policy file answer `POST /v1/land`
+//! onto a protected ref with 400 (`changeset X needs review: ...`) unless
+//! every changeset the land would add is approved.
+//!
 //! # Signatures
 //!
 //! A signature attests to a changeset id and is stored beside the changeset
@@ -61,6 +74,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::review::{Review, Verdict};
 use crate::{Changeset, ChangesetId, FileChange, FileKind, Hash, RepoPath, TreeEntry};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -128,6 +142,54 @@ pub struct SignaturesResponse {
     /// Informational: `land` policy never accepts a copy on this basis.
     #[serde(default)]
     pub via: Option<ChangesetId>,
+}
+
+/// Record the caller's verdict on a changeset. The reviewer is the
+/// authenticated token's name; the body cannot name one.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AddReviewRequest {
+    pub verdict: Verdict,
+    #[serde(default)]
+    pub comment: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AddReviewResponse {
+    pub reviewer: String,
+    pub verdict: Verdict,
+}
+
+/// Reviews of one changeset by the server's known principals.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewsResponse {
+    pub reviews: Vec<Review>,
+    /// Set when the changeset has no review of its own but is a server-made
+    /// rebased copy of this one, whose `reviews` are reported instead.
+    /// Informational: the land policy never accepts a copy on this basis.
+    #[serde(default)]
+    pub via: Option<ChangesetId>,
+}
+
+/// Review state of one changed path. `rule` is `auto:<rule>` (for example
+/// `auto:comment_only`), `owner`, `merge_parent`, `pending` or `rejected`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PathReview {
+    pub path: RepoPath,
+    pub rule: String,
+    /// Owners from the target ref's head; empty when none cover the path.
+    pub owners: Vec<String>,
+    pub approved_by: Vec<String>,
+    #[serde(default)]
+    pub rejected_by: Vec<String>,
+}
+
+/// Whether a changeset could land on `target_ref` now, per path.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewStatusResponse {
+    pub changeset: ChangesetId,
+    pub target_ref: String,
+    pub approved: bool,
+    pub paths: Vec<PathReview>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -386,6 +448,26 @@ mod tests {
         let req: LandRequest =
             serde_json::from_value(serde_json::json!({ "changeset": id.to_string() })).unwrap();
         assert_eq!(req.target_ref, "main");
+    }
+
+    #[test]
+    fn review_shapes() {
+        let req: AddReviewRequest =
+            serde_json::from_value(serde_json::json!({ "verdict": "approve" })).unwrap();
+        assert_eq!(req.verdict, Verdict::Approve);
+        assert_eq!(req.comment, "");
+        assert!(serde_json::from_value::<AddReviewRequest>(
+            serde_json::json!({ "verdict": "shrug" })
+        )
+        .is_err());
+        let v: ReviewsResponse =
+            serde_json::from_value(serde_json::json!({ "reviews": [] })).unwrap();
+        assert_eq!(v.via, None);
+        let p: PathReview = serde_json::from_value(serde_json::json!({
+            "path": "a", "rule": "owner", "owners": [], "approved_by": []
+        }))
+        .unwrap();
+        assert!(p.rejected_by.is_empty());
     }
 
     #[test]
