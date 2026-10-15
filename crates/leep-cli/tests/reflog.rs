@@ -30,7 +30,7 @@ fn init_wc(mock: &Mock, dir: &Path, cache: &Path) -> Ctx {
 fn land_file(ctx: &mut Ctx, body: &str) -> ChangesetId {
     fs::write(ctx.wc.abs("f.txt"), body).unwrap();
     let args = CommitArgs {
-        message: body.trim().into(),
+        message: Some(body.trim().into()),
         author: Some("tester".into()),
         ..Default::default()
     };

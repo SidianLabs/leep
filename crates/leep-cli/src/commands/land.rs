@@ -23,6 +23,7 @@ pub struct LandArgs {
 }
 
 pub fn run(ctx: &mut Ctx, args: &LandArgs) -> Result<i32> {
+    ctx.refuse_in_progress()?;
     let base = ctx
         .wc
         .state

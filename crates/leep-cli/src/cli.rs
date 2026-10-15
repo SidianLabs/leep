@@ -7,8 +7,8 @@ use clap::{Parser, Subcommand};
 use crate::cache::Cache;
 use crate::client::Client;
 use crate::commands::{
-    amend, branch, checkout, commit, diff, history, init, keygen, land, reflog, reset, resolve,
-    restore, review, search, stash, status, Ctx, Remote,
+    amend, branch, checkout, commit, diff, history, init, keygen, land, merge, pick, rebase,
+    reflog, reset, resolve, restore, review, search, stash, status, Ctx, Remote,
 };
 use crate::error::{CliError, Result};
 use crate::state::{resolve_token, WorkCopy};
@@ -59,6 +59,14 @@ pub enum Command {
     Resolve(resolve::ResolveArgs),
     /// Move the base (default: undo the last commit, keeping its changes).
     Reset(reset::ResetArgs),
+    /// Merge another revision into the working copy (a local commit).
+    Merge(merge::MergeArgs),
+    /// Move local commits onto another revision.
+    Rebase(rebase::RebaseArgs),
+    /// Copy one changeset onto the working copy's base.
+    CherryPick(pick::CherryPickArgs),
+    /// Undo one changeset with a new local commit.
+    Revert(pick::RevertArgs),
     /// Land the current changeset on the target ref.
     Land(land::LandArgs),
     /// Move to the head of the target ref, keeping uncommitted work.
@@ -186,6 +194,10 @@ pub fn run(cli: Cli) -> Result<i32> {
         Command::Restore(a) => restore::run(&mut ctx, a),
         Command::Resolve(a) => resolve::run(&mut ctx, a),
         Command::Reset(a) => reset::run(&mut ctx, a),
+        Command::Merge(a) => merge::run(&mut ctx, a),
+        Command::Rebase(a) => rebase::run(&mut ctx, a),
+        Command::CherryPick(a) => pick::cherry_pick(&mut ctx, a),
+        Command::Revert(a) => pick::revert(&mut ctx, a),
         Command::Land(a) => land::run(&mut ctx, a),
         Command::Sync(a) => checkout::sync(&mut ctx, a),
         Command::Branch(a) => branch::branch(&ctx, a),

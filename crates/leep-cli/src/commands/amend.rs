@@ -54,6 +54,7 @@ pub fn run(ctx: &mut Ctx, args: &AmendArgs) -> Result<i32> {
         .state
         .base
         .ok_or_else(|| CliError::user("nothing to amend: no commits yet"))?;
+    ctx.refuse_in_progress()?;
     let st = status(&ctx.wc)?;
     st.refuse_conflicts()?;
     let target = ctx.wc.config.target_ref.clone();

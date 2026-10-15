@@ -64,7 +64,7 @@ operator action, and their benchmarks are in `docs/PERFORMANCE.md`.
 - [x] Rename detection in `diff` and `log --follow` (ADR 0016)
 - [x] `sync` that rebases uncommitted work, and `leep stash`
 - [x] `leep restore`, `leep amend` and `leep reset` for unlanded work
-- [ ] `leep merge`, `leep rebase`, `leep revert` and `leep cherry-pick`
+- [x] `leep merge`, `leep rebase`, `leep revert` and `leep cherry-pick` (ADR 0019)
 - [x] Ref log (history of every ref move) and `leep undo` (ADR 0018)
 
 ### Hardening

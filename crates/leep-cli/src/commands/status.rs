@@ -18,6 +18,13 @@ struct Report {
     target_ref: String,
     changes: Vec<Entry>,
     stashes: usize,
+    /// A merge waiting for its commit: the changeset being merged in.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    merging: Option<String>,
+    /// A cherry-pick or revert waiting for its commit: the changeset it is
+    /// about, and which of the two it is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    picking: Option<Picking>,
     /// Whether the base is in the target ref's history; `None` when the
     /// server could not be asked or the ref does not exist.
     on_target: Option<bool>,
@@ -27,6 +34,12 @@ struct Report {
     /// lists both paths, so readers that ignore this see what they always did.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     renames: Vec<RenameEntry>,
+}
+
+#[derive(Serialize)]
+struct Picking {
+    from: String,
+    operation: &'static str,
 }
 
 #[derive(Serialize)]
@@ -84,6 +97,16 @@ pub fn run(ctx: &Ctx) -> Result<i32> {
                 })
                 .collect(),
             stashes,
+            merging: ctx
+                .wc
+                .state
+                .merge_in_progress
+                .as_ref()
+                .map(|m| m.other.to_string()),
+            picking: ctx.wc.state.pick_in_progress.as_ref().map(|p| Picking {
+                from: p.from.to_string(),
+                operation: if p.revert { "revert" } else { "cherry-pick" },
+            }),
             on_target: rel.as_ref().map(|r| matches!(r, Relation::OnTarget)),
             ahead: match rel {
                 Some(Relation::Ahead(n)) => Some(n),
@@ -104,6 +127,23 @@ pub fn run(ctx: &Ctx) -> Result<i32> {
         }
         Some(Relation::Diverged) => println!("base is not on {target}"),
         _ => {}
+    }
+    if let Some(m) = &ctx.wc.state.merge_in_progress {
+        println!(
+            "merging {} (fix the conflicts, then `leep commit`; `leep merge --abort` cancels)",
+            short(m.other)
+        );
+    }
+    if let Some(p) = &ctx.wc.state.pick_in_progress {
+        let (what, ing) = if p.revert {
+            ("revert", "reverting")
+        } else {
+            ("cherry-pick", "cherry-picking")
+        };
+        println!(
+            "{ing} {} (fix the conflicts, then `leep commit`; `leep {what} --abort` cancels)",
+            short(p.from)
+        );
     }
     if stashes > 0 {
         println!(

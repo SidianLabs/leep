@@ -452,8 +452,17 @@ pub struct Conflict {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum MergeResponse {
-    Merged { id: ChangesetId },
-    Conflicts { conflicts: Vec<Conflict> },
+    Merged {
+        id: ChangesetId,
+    },
+    Conflicts {
+        conflicts: Vec<Conflict>,
+        /// Changes relative to `parents[0]` for every path that merged
+        /// cleanly. Applying these plus a resolution of each conflict on top
+        /// of `parents[0]` gives the merge result. Older servers omit it.
+        #[serde(default)]
+        clean: BTreeMap<RepoPath, FileChange>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

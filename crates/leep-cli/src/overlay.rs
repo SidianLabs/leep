@@ -10,13 +10,13 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 
-use leep_core::api::{FileInfo, RebaseRequest, RebaseResponse};
-use leep_core::{ChangesetId, FileChange, FileKind, Hash};
+use leep_core::api::{Conflict, FileInfo, RebaseRequest, RebaseResponse};
+use leep_core::{ChangesetId, FileChange, FileKind, Hash, RepoPath};
 
 use crate::commands::Ctx;
 use crate::error::{CliError, Result};
 use crate::materialize::{check_not_in_the_way, list_files, remove_file, write_file, Stats};
-use crate::state::FileState;
+use crate::state::{FileState, MergeState, PickState};
 use crate::status::{self, mtime_ns, read_content, scan_file, Change};
 
 /// What a path should contain once the overlay is applied.
@@ -54,6 +54,23 @@ impl Want {
     }
 }
 
+/// Which side of a conflict with no text merge stays on disk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Keep {
+    /// The rebased changeset's side: local edits being carried (`sync`, `stash`).
+    Theirs,
+    /// The working copy's side: the base already on disk (`merge`,
+    /// `cherry-pick`, `revert`).
+    Ours,
+}
+
+/// What the plan leaves waiting for a `leep commit`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Pending {
+    Merge(MergeState),
+    Pick(PickState),
+}
+
 #[derive(Debug)]
 pub struct Plan {
     pub new_base: ChangesetId,
@@ -63,8 +80,11 @@ pub struct Plan {
     pub want: BTreeMap<String, Want>,
     /// Paths that got conflict markers.
     pub conflicts: Vec<String>,
-    /// Conflicting paths with no text merge: the local version was kept.
+    /// Conflicting paths with no text merge: one side was kept (see [`Keep`]).
     pub unmerged: Vec<String>,
+    /// Recorded in the state with the rest, so a half-done merge, pick or
+    /// revert is never saved without its files.
+    pub pending: Option<Pending>,
 }
 
 /// Ask the server to rebase `change` (a snapshot) onto `onto` and turn the
@@ -76,81 +96,115 @@ pub fn plan(ctx: &Ctx, change: ChangesetId, onto: ChangesetId) -> Result<Plan> {
         changeset: change,
         onto,
     })?;
-    let mut conflicts = Vec::new();
-    let mut unmerged = Vec::new();
-    let want = match resp {
-        RebaseResponse::Rebased { id } => list_files(ctx, &id)?
-            .into_iter()
-            .map(|(p, f)| (p, Want::from_info(&f)))
-            .collect(),
+    match resp {
+        RebaseResponse::Rebased { id } => {
+            let want = list_files(ctx, &id)?
+                .into_iter()
+                .map(|(p, f)| (p, Want::from_info(&f)))
+                .collect();
+            Ok(Plan {
+                new_base: onto,
+                base_files,
+                want,
+                conflicts: Vec::new(),
+                unmerged: Vec::new(),
+                pending: None,
+            })
+        }
         RebaseResponse::Conflicts {
             conflicts: found,
             clean,
-        } => {
-            let outside: Vec<String> = clean
-                .keys()
-                .chain(found.iter().map(|c| &c.path))
-                .map(|p| p.to_string())
-                .filter(|p| !ctx.wc.in_scope(p))
-                .collect();
-            if !outside.is_empty() {
-                return Err(CliError::user(format!(
-                    "cannot apply here: the changes touch paths outside this sparse \
-                     checkout ({}); widen it with `leep checkout @ --prefix ...`",
-                    outside.join(", ")
-                )));
-            }
-            let mut want: BTreeMap<String, Want> = base_files
-                .iter()
-                .map(|(p, f)| (p.clone(), Want::from_info(f)))
-                .collect();
-            for (path, change) in clean {
-                match change {
-                    FileChange::Modify {
-                        content,
+        } => plan_conflicts(ctx, onto, base_files, found, clean, Keep::Theirs),
+    }
+}
+
+/// The disk state for a conflicted server answer: `clean` changes on top of
+/// `onto`'s files, marker text where the server has one, and for a conflict
+/// with no text merge the side `keep` names. `sync` and `stash apply` use it,
+/// and so do `merge`, `cherry-pick` and `revert`; they differ only in whose
+/// edits are on disk.
+pub fn plan_conflicts(
+    ctx: &Ctx,
+    onto: ChangesetId,
+    base_files: BTreeMap<String, FileInfo>,
+    found: Vec<Conflict>,
+    clean: BTreeMap<RepoPath, FileChange>,
+    keep: Keep,
+) -> Result<Plan> {
+    let outside: Vec<String> = clean
+        .keys()
+        .chain(found.iter().map(|c| &c.path))
+        .map(|p| p.to_string())
+        .filter(|p| !ctx.wc.in_scope(p))
+        .collect();
+    if !outside.is_empty() {
+        return Err(CliError::user(format!(
+            "cannot apply here: the changes touch paths outside this sparse \
+             checkout ({}); widen it with `leep checkout @ --prefix ...`",
+            outside.join(", ")
+        )));
+    }
+    let mut want: BTreeMap<String, Want> = base_files
+        .iter()
+        .map(|(p, f)| (p.clone(), Want::from_info(f)))
+        .collect();
+    for (path, change) in clean {
+        match change {
+            FileChange::Modify {
+                content,
+                kind,
+                size,
+            } => want.insert(
+                path.to_string(),
+                Want::File {
+                    content,
+                    kind,
+                    size,
+                },
+            ),
+            FileChange::Delete => want.remove(path.as_str()),
+        };
+    }
+    let mut conflicts = Vec::new();
+    let mut unmerged = Vec::new();
+    for c in found {
+        let path = c.path.to_string();
+        let (mine, other) = match keep {
+            Keep::Theirs => (&c.theirs, &c.ours),
+            Keep::Ours => (&c.ours, &c.theirs),
+        };
+        match (&c.merged_with_markers, mine) {
+            (Some(text), mine) => {
+                let kind = mine
+                    .as_ref()
+                    .or(other.as_ref())
+                    .map_or(FileKind::Regular, |i| i.kind);
+                want.insert(
+                    path.clone(),
+                    Want::Text {
+                        text: text.clone(),
                         kind,
-                        size,
-                    } => want.insert(
-                        path.to_string(),
-                        Want::File {
-                            content,
-                            kind,
-                            size,
-                        },
-                    ),
-                    FileChange::Delete => want.remove(path.as_str()),
-                };
+                    },
+                );
+                conflicts.push(path);
             }
-            for c in found {
-                let path = c.path.to_string();
-                match (c.merged_with_markers, &c.theirs) {
-                    (Some(text), theirs) => {
-                        let kind = theirs
-                            .as_ref()
-                            .or(c.ours.as_ref())
-                            .map_or(FileKind::Regular, |i| i.kind);
-                        want.insert(path.clone(), Want::Text { text, kind });
-                        conflicts.push(path);
-                    }
-                    (None, Some(t)) => {
-                        want.insert(path.clone(), Want::from_info(t));
-                        unmerged.push(path);
-                    }
-                    (None, None) => {
-                        want.remove(&path);
-                        unmerged.push(path);
-                    }
-                }
+            (None, Some(m)) => {
+                want.insert(path.clone(), Want::from_info(m));
+                unmerged.push(path);
             }
-            want
+            (None, None) => {
+                want.remove(&path);
+                unmerged.push(path);
+            }
         }
-    };
+    }
     Ok(Plan {
         new_base: onto,
         base_files,
         want,
         conflicts,
         unmerged,
+        pending: None,
     })
 }
 
@@ -292,6 +346,11 @@ pub fn apply(ctx: &mut Ctx, plan: &Plan) -> Result<Stats> {
         ctx.wc.state.base = Some(plan.new_base);
         ctx.wc.state.conflicts = plan.conflicts.clone();
         ctx.wc.state.unresolved = plan.unmerged.clone();
+        match &plan.pending {
+            Some(Pending::Merge(m)) => ctx.wc.state.merge_in_progress = Some(m.clone()),
+            Some(Pending::Pick(p)) => ctx.wc.state.pick_in_progress = Some(p.clone()),
+            None => {}
+        }
         ctx.wc.save_state()
     });
     if let Err(e) = outcome {
@@ -330,20 +389,30 @@ pub fn contained_in(ctx: &Ctx, a: ChangesetId, b: ChangesetId) -> Result<bool> {
     Ok(ctx.client.merge_base(&a, &b)?.base == Some(a))
 }
 
+/// What moving a stack of local commits did.
+pub enum Moved {
+    /// `base` is already in the target's history: nothing local to move.
+    Contained,
+    Moved {
+        tip: ChangesetId,
+        count: usize,
+    },
+    /// A commit does not apply; nothing was changed.
+    Conflict {
+        commit: ChangesetId,
+        conflicts: Vec<Conflict>,
+    },
+}
+
 /// Move the unlanded commits ending at `base` onto `head`, oldest first, with
-/// the server's single-changeset rebase. Returns the new tip and how many
-/// commits moved, or `None` when `base` is already in `head`'s history.
+/// the server's single-changeset rebase.
 ///
-/// A conflict inside the stack is an error rather than markers: `land` is
-/// the command that squashes a stack and reports conflicts for it.
-pub fn rebase_stack(
-    ctx: &Ctx,
-    base: ChangesetId,
-    head: ChangesetId,
-) -> Result<Option<(ChangesetId, usize)>> {
+/// The rebased copies are new changesets; nothing local changes until the
+/// caller moves the base to the returned tip.
+pub fn move_stack(ctx: &Ctx, base: ChangesetId, head: ChangesetId) -> Result<Moved> {
     let fork = ctx.client.merge_base(&base, &head)?.base;
     if fork == Some(base) {
-        return Ok(None);
+        return Ok(Moved::Contained);
     }
     let Some(fork) = fork else {
         return Err(CliError::user(
@@ -374,16 +443,63 @@ pub fn rebase_stack(
         })? {
             RebaseResponse::Rebased { id } => onto = id,
             RebaseResponse::Conflicts { conflicts, .. } => {
-                return Err(CliError::user(format!(
-                    "local commit {} conflicts with the target ref in {} file{}; \
-                     nothing changed. Run `leep land` to bring it up to date and \
-                     resolve the conflicts",
-                    crate::fmt::short(c),
-                    conflicts.len(),
-                    if conflicts.len() == 1 { "" } else { "s" }
-                )));
+                return Ok(Moved::Conflict {
+                    commit: *c,
+                    conflicts,
+                });
             }
         }
     }
-    Ok(Some((onto, stack.len())))
+    Ok(Moved::Moved {
+        tip: onto,
+        count: stack.len(),
+    })
+}
+
+/// [`move_stack`] for `sync`: a conflict inside the stack is an error rather
+/// than markers, because `land` is the command that squashes a stack and
+/// reports conflicts for it. Returns the new tip and how many commits moved,
+/// or `None` when `base` is already in `head`'s history.
+pub fn rebase_stack(
+    ctx: &Ctx,
+    base: ChangesetId,
+    head: ChangesetId,
+) -> Result<Option<(ChangesetId, usize)>> {
+    match move_stack(ctx, base, head)? {
+        Moved::Contained => Ok(None),
+        Moved::Moved { tip, count } => Ok(Some((tip, count))),
+        Moved::Conflict { commit, conflicts } => Err(CliError::user(format!(
+            "local commit {} conflicts with the target ref in {} file{}; \
+             nothing changed. Run `leep land` to bring it up to date and \
+             resolve the conflicts",
+            crate::fmt::short(commit),
+            conflicts.len(),
+            if conflicts.len() == 1 { "" } else { "s" }
+        ))),
+    }
+}
+
+/// Put `id`'s files on a clean working copy and make it the base.
+///
+/// Goes through [`apply`], so everything is fetched before the first write,
+/// writes are journalled and undone on failure, and the state is saved last.
+/// `merge`, `rebase`, `cherry-pick` and `revert` use it instead of
+/// `materialize`, which saves partial progress.
+pub fn move_to(ctx: &mut Ctx, id: ChangesetId) -> Result<Stats> {
+    let base_files = list_files(ctx, &id)?;
+    let want = base_files
+        .iter()
+        .map(|(p, f)| (p.clone(), Want::from_info(f)))
+        .collect();
+    apply(
+        ctx,
+        &Plan {
+            new_base: id,
+            base_files,
+            want,
+            conflicts: Vec::new(),
+            unmerged: Vec::new(),
+            pending: None,
+        },
+    )
 }

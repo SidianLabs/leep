@@ -100,6 +100,22 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   ahead of the target ref.
 - Files are now written through a temp file and renamed, so an interrupted
   checkout, land or sync cannot leave a half-written file.
+- `leep merge REV`, `leep rebase [ONTO]`, `leep cherry-pick REV` and
+  `leep revert REV` build local, unlanded commits; `land` moves the ref as
+  usual. A clean merge fast-forwards when it can (`--no-ff` always makes a
+  merge commit). A conflicted merge, cherry-pick or revert leaves markers (or
+  `unresolved` paths) on top of the unchanged base; `status` shows it, `commit`
+  finishes it (message and, for a merge, second parent default from the
+  operation), and `--abort` undoes it. `rebase` moves the unlanded stack, like
+  `sync`, and stops with nothing changed on a conflict. A revert is the inverse
+  change stored as a temporary changeset and rebased onto the base, so edits
+  made since to other lines survive; merges cannot be reverted yet (ADR 0019).
+- `POST /v1/merge` returns `clean` (the cleanly merged changes relative to
+  `parents[0]`) with its conflicts, like `rebase` and `land` already did. The
+  field is additive; `leep merge` refuses a server that omits it rather than
+  drop the other side's changes.
+- `leep commit -m` may be left out while a merge, cherry-pick or revert is
+  waiting for its commit.
 
 ### Project
 - Workspace version set to 0.0.1, with a CI check that keeps it below

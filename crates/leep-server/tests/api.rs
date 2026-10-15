@@ -533,15 +533,23 @@ async fn merge_clean_and_conflicts() {
     let files: FilesResponse = c.get(&format!("/v1/files/{id}")).await.json();
     assert_eq!(files.files.len(), 3);
 
-    let x = c.commit(&[base], &[("g", Some("g-x\n"))], "x").await;
+    let x = c
+        .commit(&[base], &[("g", Some("g-x\n")), ("n", Some("n\n"))], "x")
+        .await;
     let r = c.post("/v1/merge", &merge_req(ours, x)).await;
     assert_eq!(r.status, StatusCode::OK);
     let body: serde_json::Value = r.json();
     assert_eq!(body["status"], "conflicts");
-    let MergeResponse::Conflicts { conflicts } = serde_json::from_value(body).unwrap() else {
+    let MergeResponse::Conflicts { conflicts, clean } = serde_json::from_value(body).unwrap()
+    else {
         panic!()
     };
     assert_eq!(conflicts[0].path.as_str(), "g");
+    assert_eq!(
+        clean.keys().map(|p| p.as_str()).collect::<Vec<_>>(),
+        ["n"],
+        "the cleanly merged paths come back with the conflicts"
+    );
 
     let unknown = ChangesetId(Hash::of_blob(b"nope"));
     let r = c.post("/v1/merge", &merge_req(ours, unknown)).await;

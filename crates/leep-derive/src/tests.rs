@@ -580,13 +580,22 @@ async fn merge_text_merges_and_conflicts() {
         "theirs",
     )
     .await;
-    let MergeResponse::Conflicts { conflicts } = r.merge(merge_req(ours, theirs)).await.unwrap()
+    let MergeResponse::Conflicts { conflicts, clean } =
+        r.merge(merge_req(ours, theirs)).await.unwrap()
     else {
         panic!()
     };
     // f merged cleanly, so only the two clashing files conflict.
     let paths: Vec<_> = conflicts.iter().map(|c| c.path.as_str()).collect();
     assert_eq!(paths, ["bin", "clash"]);
+    // The clean part is relative to ours and holds f's merged content.
+    assert_eq!(clean.keys().map(|p| p.as_str()).collect::<Vec<_>>(), ["f"]);
+    let FileChange::Modify { content, .. } = clean[&rp("f")] else {
+        panic!("f should be modified")
+    };
+    let merged =
+        String::from_utf8(r.blobs().get(&content).await.unwrap().unwrap().to_vec()).unwrap();
+    assert!(merged.starts_with("ONE\n") && merged.ends_with("EIGHT\n"));
     let clash = &conflicts[1];
     let marked = clash.merged_with_markers.as_deref().unwrap();
     assert!(marked.contains("<<<<<<<") && marked.contains("=======") && marked.contains(">>>>>>>"));
@@ -650,7 +659,8 @@ async fn merge_binary_and_delete_conflicts() {
         ))
         .await
         .unwrap();
-    let MergeResponse::Conflicts { conflicts } = r.merge(merge_req(ours, theirs)).await.unwrap()
+    let MergeResponse::Conflicts { conflicts, .. } =
+        r.merge(merge_req(ours, theirs)).await.unwrap()
     else {
         panic!()
     };
@@ -667,11 +677,115 @@ async fn merge_file_dir_clash_is_a_conflict() {
     let base = commit(&r, &[], &[("keep", Some("k"))], "base").await;
     let ours = commit(&r, &[base], &[("a", Some("file"))], "ours").await;
     let theirs = commit(&r, &[base], &[("a/b", Some("nested"))], "theirs").await;
-    let MergeResponse::Conflicts { conflicts } = r.merge(merge_req(ours, theirs)).await.unwrap()
+    let MergeResponse::Conflicts { conflicts, .. } =
+        r.merge(merge_req(ours, theirs)).await.unwrap()
     else {
         panic!()
     };
     assert_eq!(conflicts[0].path.as_str(), "a/b");
+}
+
+#[tokio::test]
+async fn merge_conflicts_carry_added_and_deleted_paths_in_clean() {
+    let r = repo();
+    let base = commit(
+        &r,
+        &[],
+        &[
+            ("clash", Some("x\n")),
+            ("gone", Some("g\n")),
+            ("same", Some("s\n")),
+        ],
+        "base",
+    )
+    .await;
+    let ours = commit(
+        &r,
+        &[base],
+        &[("clash", Some("ours\n")), ("only-ours", Some("o\n"))],
+        "ours",
+    )
+    .await;
+    let theirs = commit(
+        &r,
+        &[base],
+        &[
+            ("clash", Some("theirs\n")),
+            ("gone", None),
+            ("added", Some("a\n")),
+        ],
+        "theirs",
+    )
+    .await;
+    let MergeResponse::Conflicts { conflicts, clean } =
+        r.merge(merge_req(ours, theirs)).await.unwrap()
+    else {
+        panic!("expected conflicts")
+    };
+    assert_eq!(conflicts.len(), 1);
+    let keys: Vec<_> = clean.keys().map(|p| p.as_str()).collect();
+    // Only what theirs changes and ours lacks: nothing for ours' own edits.
+    assert_eq!(keys, ["added", "gone"]);
+    assert_eq!(clean[&rp("gone")], FileChange::Delete);
+    assert!(matches!(clean[&rp("added")], FileChange::Modify { .. }));
+}
+
+/// `leep revert` stores the inverse of a change as a changeset on top of the
+/// reverted one and rebases it onto the base. The first parent is the merge
+/// base, so edits made since to other lines of the file survive.
+#[tokio::test]
+async fn rebasing_an_inverse_changeset_reverts_only_its_hunk() {
+    let r = repo();
+    let lines = |edits: &[(usize, &str)]| -> String {
+        (1..=12)
+            .map(|n| match edits.iter().find(|(i, _)| *i == n) {
+                Some((_, t)) => format!("{t}\n"),
+                None => format!("line {n}\n"),
+            })
+            .collect()
+    };
+    let c0 = commit(
+        &r,
+        &[],
+        &[("f", Some(&lines(&[]))), ("g", Some("g\n"))],
+        "c0",
+    )
+    .await;
+    let reverted = commit(&r, &[c0], &[("f", Some(&lines(&[(2, "TWO")])))], "edit 2").await;
+    let later = commit(
+        &r,
+        &[reverted],
+        &[("f", Some(&lines(&[(2, "TWO"), (11, "ELEVEN")])))],
+        "edit 11",
+    )
+    .await;
+    // The inverse: what `f` was in the reverted changeset's parent.
+    let inverse = commit(&r, &[reverted], &[("f", Some(&lines(&[])))], "revert").await;
+    let RebaseResponse::Rebased { id } = r.rebase(inverse, later).await.unwrap() else {
+        panic!("expected a clean rebase")
+    };
+    assert_eq!(
+        text(&r, id, "f").await.unwrap(),
+        lines(&[(11, "ELEVEN")]),
+        "line 2 is back, line 11 keeps its later edit"
+    );
+    assert_eq!(text(&r, id, "g").await.as_deref(), Some("g\n"));
+
+    // An edit of the same line since is a conflict, never a silent pick.
+    let clash = commit(
+        &r,
+        &[reverted],
+        &[("f", Some(&lines(&[(2, "TWO AGAIN")])))],
+        "edit 2 again",
+    )
+    .await;
+    let RebaseResponse::Conflicts { conflicts, clean } = r.rebase(inverse, clash).await.unwrap()
+    else {
+        panic!("expected a conflict")
+    };
+    assert_eq!(conflicts.len(), 1);
+    assert!(clean.is_empty());
+    assert!(conflicts[0].merged_with_markers.is_some());
 }
 
 #[tokio::test]

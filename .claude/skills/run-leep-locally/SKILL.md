@@ -45,6 +45,11 @@ leep stash -m wip && leep stash pop      # shelve and restore uncommitted work
 leep restore a.txt                       # discard edits to a file (--source REV for another revision)
 leep amend -m "better message"           # fold edits into an unlanded base commit
 leep reset                               # undo the last unlanded commit, keeping its changes
+leep merge feature                       # local merge commit; conflicts leave markers, then `leep commit`
+leep merge --abort                       # (also `cherry-pick --abort`, `revert --abort`)
+leep cherry-pick <changeset>             # copy one change onto the base
+leep revert <changeset>                  # undo one landed change with a new local commit
+leep rebase [main]                       # move unlanded commits onto another revision
 ```
 Again, run `leep --help` for the current subcommands.
 

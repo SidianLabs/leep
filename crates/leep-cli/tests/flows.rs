@@ -47,7 +47,7 @@ fn read(ctx: &Ctx, rel: &str) -> String {
 
 fn commit_args(msg: &str) -> CommitArgs {
     CommitArgs {
-        message: msg.into(),
+        message: Some(msg.into()),
         author: Some("tester".into()),
         ..Default::default()
     }
