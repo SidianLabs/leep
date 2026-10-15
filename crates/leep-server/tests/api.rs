@@ -935,6 +935,194 @@ async fn search_sees_each_revision() {
     assert!(new.matches.is_empty());
 }
 
+fn lines(n: usize, tag: &str) -> String {
+    (0..n).map(|i| format!("{tag} line {i}\n")).collect()
+}
+
+/// `a.txt` renamed exactly to `dir/b.txt`, and `c.txt` renamed with a small
+/// edit to `d.txt`.
+async fn rename_repo(c: &Client) -> (ChangesetId, ChangesetId) {
+    let (a, ctext) = (lines(10, "a"), lines(10, "c"));
+    let base = c
+        .commit(
+            &[],
+            &[
+                ("a.txt", Some(&a)),
+                ("c.txt", Some(&ctext)),
+                ("keep", Some("k\n")),
+            ],
+            "base",
+        )
+        .await;
+    let edited = format!("{ctext}tail\n");
+    let moved = c
+        .commit(
+            &[base],
+            &[
+                ("a.txt", None),
+                ("dir/b.txt", Some(&a)),
+                ("c.txt", None),
+                ("d.txt", Some(&edited)),
+            ],
+            "moved",
+        )
+        .await;
+    (base, moved)
+}
+
+#[tokio::test]
+async fn diff_renames_are_opt_in_and_additive() {
+    let c = Client::new();
+    let (base, moved) = rename_repo(&c).await;
+    let uri = format!("/v1/diff?from={base}&to={moved}");
+
+    // Absent or false: the response has exactly the old shape.
+    let plain = c.get(&uri).await;
+    assert_eq!(plain.status, StatusCode::OK);
+    let raw: serde_json::Value = plain.json();
+    assert_eq!(
+        raw.as_object().unwrap().keys().collect::<Vec<_>>(),
+        ["entries"]
+    );
+    let off: serde_json::Value = c.get(&format!("{uri}&renames=false")).await.json();
+    assert_eq!(off, raw);
+    let df: DiffResponse = plain.json();
+    assert!(df.renames.is_empty() && !df.renames_truncated);
+    assert_eq!(df.entries.len(), 4);
+
+    // Enabled: the entries are unchanged and the renames ride beside them.
+    let on: DiffResponse = c.get(&format!("{uri}&renames=true")).await.json();
+    assert_eq!(on.entries, df.entries);
+    let got: Vec<_> = on
+        .renames
+        .iter()
+        .map(|r| (r.from.as_str(), r.to.as_str(), r.exact))
+        .collect();
+    assert_eq!(
+        got,
+        [("c.txt", "d.txt", false), ("a.txt", "dir/b.txt", true)]
+    );
+    assert_eq!(on.renames[1].similarity, 100);
+    assert!((50..100).contains(&on.renames[0].similarity));
+    assert!(!on.renames_truncated);
+
+    // A higher threshold drops the inexact one; exact stays at 100.
+    let hi: DiffResponse = c
+        .get(&format!("{uri}&renames=true&rename_threshold=100"))
+        .await
+        .json();
+    assert_eq!(hi.renames.len(), 1);
+    assert!(hi.renames[0].exact);
+    let lo: DiffResponse = c
+        .get(&format!("{uri}&renames=true&rename_threshold=0"))
+        .await
+        .json();
+    assert_eq!(lo.renames.len(), 2);
+
+    // The prefix limits what is paired: the other side is out of view.
+    let part: DiffResponse = c
+        .get(&format!("{uri}&renames=true&prefix=dir"))
+        .await
+        .json();
+    assert!(part.renames.is_empty());
+}
+
+#[tokio::test]
+async fn diff_rejects_a_bad_rename_threshold() {
+    let c = Client::new();
+    let (base, moved) = rename_repo(&c).await;
+    for bad in ["101", "-1", "abc", "", "50.5", "300"] {
+        let r = c
+            .get(&format!(
+                "/v1/diff?from={base}&to={moved}&renames=true&rename_threshold={bad}"
+            ))
+            .await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{bad:?}");
+        let e: ErrorResponse = r.json();
+        assert!(e.error.contains("rename_threshold"), "{}", e.error);
+    }
+    // It is validated even when renames are off, so a typo is not silent.
+    let r = c
+        .get(&format!(
+            "/v1/diff?from={base}&to={moved}&rename_threshold=999"
+        ))
+        .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    for ok in ["0", "1", "100"] {
+        let r = c
+            .get(&format!(
+                "/v1/diff?from={base}&to={moved}&renames=true&rename_threshold={ok}"
+            ))
+            .await;
+        assert_eq!(r.status, StatusCode::OK, "{ok}");
+    }
+}
+
+#[tokio::test]
+async fn log_follow_crosses_renames() {
+    let c = Client::new();
+    let (base, moved) = rename_repo(&c).await;
+    let tip = c
+        .commit(&[moved], &[("dir/b.txt", Some("changed\n"))], "edit")
+        .await;
+    let ids = |l: &LogResponse| l.entries.iter().map(|e| e.id).collect::<Vec<_>>();
+
+    // Without follow the log is as before, with no new keys in its entries.
+    let plain = c.get(&format!("/v1/log/{tip}?path=d.txt")).await;
+    let raw: serde_json::Value = plain.json();
+    assert!(raw["entries"][0].get("path_at").is_none());
+    assert!(raw["entries"][0].get("renamed").is_none());
+    assert_eq!(ids(&plain.json()), [moved]);
+    let off: LogResponse = c
+        .get(&format!("/v1/log/{tip}?path=dir/b.txt&follow=false"))
+        .await
+        .json();
+    assert_eq!(ids(&off), [tip, moved]);
+
+    // With it the history continues under the old name.
+    let l: LogResponse = c
+        .get(&format!("/v1/log/{tip}?path=dir/b.txt&follow=true"))
+        .await
+        .json();
+    assert_eq!(ids(&l), [tip, moved, base]);
+    let at: Vec<_> = l
+        .entries
+        .iter()
+        .map(|e| e.path_at.as_ref().unwrap().as_str())
+        .collect();
+    assert_eq!(at, ["dir/b.txt", "dir/b.txt", "a.txt"]);
+    let r = l.entries[1].renamed.as_ref().unwrap();
+    assert_eq!(
+        (r.from.as_str(), r.to.as_str(), r.exact),
+        ("a.txt", "dir/b.txt", true)
+    );
+    let limited: LogResponse = c
+        .get(&format!("/v1/log/{tip}?path=dir/b.txt&follow=true&limit=2"))
+        .await
+        .json();
+    assert_eq!(ids(&limited), [tip, moved]);
+}
+
+#[tokio::test]
+async fn log_follow_needs_one_file_path() {
+    let c = Client::new();
+    let (_, moved) = rename_repo(&c).await;
+    for q in [
+        "follow=true",
+        "follow=true&path=",
+        "follow=true&path=dir",
+        "follow=maybe&path=keep",
+    ] {
+        let r = c.get(&format!("/v1/log/{moved}?{q}")).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{q}");
+        let _: ErrorResponse = r.json();
+    }
+    let r = c
+        .get(&format!("/v1/log/{moved}?follow=true&path=keep"))
+        .await;
+    assert_eq!(r.status, StatusCode::OK);
+}
+
 fn cas(expected: Option<ChangesetId>, new: Option<ChangesetId>) -> CasRefRequest {
     CasRefRequest { expected, new }
 }
