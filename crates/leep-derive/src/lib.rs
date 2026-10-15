@@ -18,6 +18,7 @@ mod land;
 mod merge;
 pub mod owners;
 mod path_history;
+mod renames;
 mod repo;
 pub mod review;
 mod reviews;

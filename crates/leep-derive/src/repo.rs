@@ -133,6 +133,8 @@ impl Repo {
             changeset: self.get_changeset(id).await?,
             generation: self.generation(id).await?,
             root_tree: self.root_tree(id).await?,
+            path_at: None,
+            renamed: None,
         })
     }
 

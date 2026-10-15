@@ -2602,6 +2602,361 @@ mod path_history {
     }
 }
 
+mod rename_follow {
+    use leep_core::api::{ChangesetInfo, DiffEntry};
+    use leep_core::rename::RenameOptions;
+
+    use super::*;
+
+    fn lines(n: usize, tag: &str) -> String {
+        (0..n).map(|i| format!("{tag} line {i}\n")).collect()
+    }
+
+    fn ids(v: &[ChangesetInfo]) -> Vec<ChangesetId> {
+        v.iter().map(|i| i.id).collect()
+    }
+
+    fn names(v: &[ChangesetInfo]) -> Vec<&str> {
+        v.iter()
+            .map(|i| i.path_at.as_ref().expect("path_at").as_str())
+            .collect()
+    }
+
+    async fn follow(r: &Repo, tip: ChangesetId, path: &str) -> Vec<ChangesetInfo> {
+        r.log_follow(tip, path, 100, &crate::LogFilter::default())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn detect_renames_over_a_diff() {
+        let r = repo();
+        let body = lines(10, "x");
+        let c1 = commit(
+            &r,
+            &[],
+            &[("a.txt", Some(&body)), ("b.txt", Some(&lines(10, "y")))],
+            "c1",
+        )
+        .await;
+        let edited = format!("{body}extra\n");
+        let c2 = commit(
+            &r,
+            &[c1],
+            &[
+                ("a.txt", None),
+                ("moved/a.txt", Some(&edited)),
+                ("b.txt", None),
+                ("moved/b.txt", Some(&lines(10, "y"))),
+            ],
+            "c2",
+        )
+        .await;
+        let entries: Vec<DiffEntry> = r.diff(Some(c1), c2, "").await.unwrap();
+        assert_eq!(
+            entries.len(),
+            4,
+            "the entries keep their delete + add shape"
+        );
+        let d = r
+            .detect_renames(&entries, &RenameOptions::default())
+            .await
+            .unwrap();
+        let got: Vec<_> = d
+            .renames
+            .iter()
+            .map(|r| (r.from.as_str(), r.to.as_str(), r.exact))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("a.txt", "moved/a.txt", false),
+                ("b.txt", "moved/b.txt", true)
+            ]
+        );
+        assert!(d.renames[0].similarity >= 90 && d.renames[1].similarity == 100);
+    }
+
+    #[tokio::test]
+    async fn follow_one_rename() {
+        let r = repo();
+        let body = lines(10, "x");
+        let c1 = commit(&r, &[], &[("a.txt", Some(&body))], "add").await;
+        let c2 = commit(&r, &[c1], &[("a.txt", Some(&format!("{body}2\n")))], "edit").await;
+        let c3 = commit(
+            &r,
+            &[c2],
+            &[("a.txt", None), ("b.txt", Some(&format!("{body}2\n")))],
+            "rename",
+        )
+        .await;
+        let c4 = commit(&r, &[c3], &[("b.txt", Some(&format!("{body}3\n")))], "edit").await;
+        let c5 = commit(&r, &[c4], &[("other", Some("o"))], "unrelated").await;
+
+        // Without follow the history stops at the rename.
+        let plain = r.log(c5, Some("b.txt"), 100).await.unwrap();
+        assert_eq!(ids(&plain), [c4, c3]);
+        assert!(plain
+            .iter()
+            .all(|i| i.path_at.is_none() && i.renamed.is_none()));
+
+        let log = follow(&r, c5, "b.txt").await;
+        assert_eq!(ids(&log), [c4, c3, c2, c1]);
+        assert_eq!(names(&log), ["b.txt", "b.txt", "a.txt", "a.txt"]);
+        let ren = log[1].renamed.as_ref().expect("c3 renamed the file");
+        assert_eq!((ren.from.as_str(), ren.to.as_str()), ("a.txt", "b.txt"));
+        assert!(ren.exact && ren.similarity == 100);
+        assert!(log[0].renamed.is_none() && log[2].renamed.is_none());
+        // Entries are the same changesets the old name's own log has.
+        assert_eq!(
+            ids(&log[2..]),
+            ids(&r.log(c2, Some("a.txt"), 100).await.unwrap())
+        );
+
+        // limit and filters count yielded entries, not walked ones.
+        let two = r
+            .log_follow(c5, "b.txt", 2, &crate::LogFilter::default())
+            .await
+            .unwrap();
+        assert_eq!(ids(&two), [c4, c3]);
+        let only_edits = crate::LogFilter {
+            author: Some("nobody".into()),
+            ..Default::default()
+        };
+        assert!(r
+            .log_follow(c5, "b.txt", 100, &only_edits)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn follow_several_renames_and_moves_between_directories() {
+        let r = repo();
+        let body = lines(12, "x");
+        let c1 = commit(&r, &[], &[("src/a.rs", Some(&body))], "c1").await;
+        let c2 = commit(
+            &r,
+            &[c1],
+            &[("src/a.rs", None), ("src/b.rs", Some(&body))],
+            "a to b",
+        )
+        .await;
+        let c3 = commit(
+            &r,
+            &[c2],
+            &[("src/b.rs", Some(&format!("{body}1\n")))],
+            "c3",
+        )
+        .await;
+        let c4 = commit(
+            &r,
+            &[c3],
+            &[
+                ("src/b.rs", None),
+                ("lib/c.rs", Some(&format!("{body}1\n"))),
+            ],
+            "b to c",
+        )
+        .await;
+        let c5 = commit(
+            &r,
+            &[c4],
+            &[
+                ("lib/c.rs", None),
+                ("lib/d.rs", Some(&format!("{body}1\n"))),
+            ],
+            "c to d",
+        )
+        .await;
+        let log = follow(&r, c5, "lib/d.rs").await;
+        assert_eq!(ids(&log), [c5, c4, c3, c2, c1]);
+        assert_eq!(
+            names(&log),
+            ["lib/d.rs", "lib/c.rs", "src/b.rs", "src/b.rs", "src/a.rs"]
+        );
+        let renamed: Vec<_> = log
+            .iter()
+            .map(|i| i.renamed.as_ref().map(|r| (r.from.as_str(), r.to.as_str())))
+            .collect();
+        assert_eq!(
+            renamed,
+            [
+                Some(("lib/c.rs", "lib/d.rs")),
+                Some(("src/b.rs", "lib/c.rs")),
+                None,
+                Some(("src/a.rs", "src/b.rs")),
+                None
+            ]
+        );
+        // Following from the middle starts at that name.
+        let mid = follow(&r, c3, "src/b.rs").await;
+        assert_eq!(ids(&mid), [c3, c2, c1]);
+    }
+
+    #[tokio::test]
+    async fn follow_rename_with_an_edit_in_the_same_changeset() {
+        let r = repo();
+        let body = lines(10, "x");
+        let c1 = commit(&r, &[], &[("a", Some(&body))], "c1").await;
+        let mut edited: Vec<String> = body.lines().map(|l| format!("{l}\n")).collect();
+        edited[0] = "changed\n".into();
+        edited[1] = "changed too\n".into();
+        let c2 = commit(
+            &r,
+            &[c1],
+            &[("a", None), ("b", Some(&edited.concat()))],
+            "rename and edit",
+        )
+        .await;
+        let log = follow(&r, c2, "b").await;
+        assert_eq!(ids(&log), [c2, c1]);
+        let ren = log[0].renamed.as_ref().unwrap();
+        assert!(!ren.exact && (50..100).contains(&ren.similarity), "{ren:?}");
+
+        // Rewriting most of the file is a new file, not a rename.
+        let c3 = commit(
+            &r,
+            &[c2],
+            &[("b", None), ("c", Some(&lines(10, "wholly different")))],
+            "replace",
+        )
+        .await;
+        let log = follow(&r, c3, "c").await;
+        assert_eq!(ids(&log), [c3]);
+        assert!(log[0].renamed.is_none());
+    }
+
+    #[tokio::test]
+    async fn follow_without_renames_matches_the_plain_path_log() {
+        let r = repo();
+        let c1 = commit(&r, &[], &[("a", Some("1\n")), ("d/b", Some("1\n"))], "c1").await;
+        let c2 = commit(&r, &[c1], &[("a", Some("2\n"))], "c2").await;
+        let c3 = commit(&r, &[c2], &[("d/b", Some("2\n"))], "c3").await;
+        let c4 = commit(&r, &[c3], &[("a", None)], "delete a").await;
+        for path in ["a", "d/b", "missing"] {
+            let plain = ids(&r.log(c4, Some(path), 100).await.unwrap());
+            let followed = follow(&r, c4, path).await;
+            assert_eq!(ids(&followed), plain, "{path}");
+            assert!(followed
+                .iter()
+                .all(|i| i.path_at.as_ref().unwrap().as_str() == path));
+        }
+        // A deleted file's log starts at the deletion.
+        assert_eq!(ids(&follow(&r, c4, "a").await), [c4, c2, c1]);
+    }
+
+    #[tokio::test]
+    async fn follow_rejects_directories() {
+        let r = repo();
+        let c1 = commit(&r, &[], &[("d/a", Some("1\n"))], "c1").await;
+        for dir in ["d", "d/"] {
+            let e = r
+                .log_follow(c1, dir, 10, &crate::LogFilter::default())
+                .await;
+            assert!(is_invalid(e), "{dir}");
+        }
+        let e = r.log_follow(c1, "", 10, &crate::LogFilter::default()).await;
+        assert!(matches!(e, Err(Error::InvalidPath(..))));
+    }
+
+    #[tokio::test]
+    async fn follow_across_merges() {
+        let r = repo();
+        let body = lines(10, "x");
+        let base = commit(
+            &r,
+            &[],
+            &[("a.txt", Some(&body)), ("side", Some("s0\n"))],
+            "base",
+        )
+        .await;
+        let renamed = commit(
+            &r,
+            &[base],
+            &[("a.txt", None), ("b.txt", Some(&body))],
+            "rename on one branch",
+        )
+        .await;
+        let other = commit(&r, &[base], &[("side", Some("s1\n"))], "other branch").await;
+
+        // Rename on the first-parent side: the merge leaves b.txt alone.
+        let MergeResponse::Merged { id: m1 } = r.merge(merge_req(renamed, other)).await.unwrap()
+        else {
+            panic!("clean merge")
+        };
+        assert_eq!(ids(&follow(&r, m1, "b.txt").await), [renamed, base]);
+
+        // Rename on the merged-in side: relative to the first parent the
+        // merge itself deletes a.txt and adds b.txt.
+        let MergeResponse::Merged { id: m2 } = r.merge(merge_req(other, renamed)).await.unwrap()
+        else {
+            panic!("clean merge")
+        };
+        let log = follow(&r, m2, "b.txt").await;
+        assert_eq!(ids(&log), [m2, renamed, base]);
+        assert_eq!(
+            log[0].renamed.as_ref().map(|r| r.from.as_str()),
+            Some("a.txt")
+        );
+        // The side branch's own commit is listed once, with its rename.
+        assert_eq!(
+            log[1].renamed.as_ref().map(|r| r.from.as_str()),
+            Some("a.txt")
+        );
+        assert_eq!(names(&log), ["b.txt", "b.txt", "a.txt"]);
+
+        // An edit made after the merge extends the same history.
+        let c = commit(&r, &[m2], &[("b.txt", Some(&format!("{body}!\n")))], "edit").await;
+        assert_eq!(ids(&follow(&r, c, "b.txt").await), [c, m2, renamed, base]);
+    }
+
+    #[tokio::test]
+    async fn follow_keeps_both_lines_of_history_through_a_merge() {
+        // Both branches edit the file before one of them renames it.
+        let r = repo();
+        let body = lines(10, "x");
+        let base = commit(&r, &[], &[("a.txt", Some(&body)), ("o", Some("0"))], "base").await;
+        let left = commit(&r, &[base], &[("o", Some("1"))], "left").await;
+        let right = commit(
+            &r,
+            &[base],
+            &[("a.txt", None), ("b.txt", Some(&body))],
+            "right renames",
+        )
+        .await;
+        let after = commit(
+            &r,
+            &[right],
+            &[("b.txt", Some(&format!("{body}x\n")))],
+            "after",
+        )
+        .await;
+        let MergeResponse::Merged { id: m } = r.merge(merge_req(after, left)).await.unwrap() else {
+            panic!("clean merge")
+        };
+        let log = follow(&r, m, "b.txt").await;
+        assert_eq!(ids(&log), [after, right, base]);
+    }
+
+    #[tokio::test]
+    async fn follow_a_deep_history_is_iterative() {
+        let r = repo();
+        let body = lines(10, "x");
+        let mut tip = commit(&r, &[], &[("a", Some(&body))], "add").await;
+        tip = commit(&r, &[tip], &[("a", None), ("b", Some(&body))], "rename").await;
+        for i in 0..2000 {
+            tip = commit(&r, &[tip], &[("b", Some(&format!("{body}{i}\n")))], "edit").await;
+        }
+        let log = r
+            .log_follow(tip, "b", 5000, &crate::LogFilter::default())
+            .await
+            .unwrap();
+        assert_eq!(log.len(), 2002);
+        assert_eq!(log[2001].path_at.as_ref().unwrap().as_str(), "a");
+    }
+}
+
 mod ref_rules {
     use super::*;
 
