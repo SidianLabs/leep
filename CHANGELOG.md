@@ -39,6 +39,24 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 - Server-side code search: `leep search`, `GET /v1/search` and the MCP
   `leep_search` tool (ADR 0014).
 
+### Everyday workflow
+- `leep branch` lists, creates and deletes branches. `branch -d` deletes
+  only a branch already merged into the working copy's target ref; `-D`
+  deletes it anyway. Both are compare-and-swap, so a concurrent move fails
+  with a 409 instead of being overwritten.
+- `leep switch BRANCH` (and `switch -c NAME [REV]`) moves a clean working
+  copy to another branch.
+- `leep tag` lists, creates (`tag NAME [REV]`) and deletes (`tag -d NAME`)
+  tags, stored as the refs `tags/NAME`. The server never lets a tag move,
+  and `land` onto `tags/` is refused.
+- Revisions accept `tags/NAME`, and a short tag name when no branch has that
+  name.
+- The server checks every ref name written through `POST /v1/refs/{name}`
+  and `land` (git-like rules, `docs/FORMATS.md`) and answers 400 for an
+  invalid one. Existing valid names keep working.
+- Deleting a ref that a land policy (signatures, review) covers is now
+  refused with 400.
+
 ### Project
 - Workspace version set to 0.0.1, with a CI check that keeps it below
   0.1.0.

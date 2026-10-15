@@ -178,6 +178,28 @@ derivation requires `history-tree-v2` and `history-node-v2`. Entries of deleted
 paths are kept. The API addition (`GET /v1/last-change/{id}`) adds one endpoint
 and one response type; `/v1/log` is unchanged.
 
+## Ref names (no change to stored data)
+
+Every ref write is checked by `leep_core::refname::validate`; reads and
+deletes of names that already exist are never refused for their spelling. A
+name is valid when it:
+
+- is 1 to 255 bytes of printable ASCII, with no space and none of
+  `~ ^ : ? * [ \`;
+- has no `..`, no `@{`, no leading, trailing or doubled `/`;
+- has no `/`-separated component that starts with `.` or `-` or ends with
+  `.lock`;
+- is not `@` (the working copy's base) or 64 hex digits (a changeset id), so
+  resolving a revision is never ambiguous.
+
+Namespaces: a branch is any valid name outside `tags/`. A tag named `v1` is the
+ref `tags/v1`. Tags are write-once: the server accepts creating one
+(`expected: null`) or deleting one (`new: null`) and refuses to move it to
+another changeset or to `land` onto it, both with 400. The server also refuses
+to delete a ref that a land policy (signatures, review) protects. A revision
+is looked up as a ref, then a full changeset id, then `tags/<rev>`, so a
+branch or id always wins over a tag of the same short name.
+
 ## SQL schema (leep-meta)
 
 ```

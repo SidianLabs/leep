@@ -58,6 +58,16 @@ Exit: both indexes derive lazily on a 100k-changeset repository without
 operator action, and their benchmarks are in `docs/PERFORMANCE.md`.
 
 ## M5: Hardening
+
+### Everyday workflow (a git user can do a normal day's work without the API)
+- [x] `leep branch`, `leep switch` and immutable tags
+- [ ] Rename detection in `diff` and `log --follow`
+- [ ] `sync` that rebases uncommitted work, and `leep stash`
+- [ ] `leep restore`, `leep amend` and `leep reset` for unlanded work
+- [ ] `leep merge`, `leep rebase`, `leep revert` and `leep cherry-pick`
+- [ ] Ref log (history of every ref move) and `leep undo`
+
+### Hardening
 - Self-host Leep's own development on a Leep server, mirrored to GitHub,
   with the git bridge keeping the mirror in sync
 - Fuzz every decoder (postcard objects, derived rows, API request bodies,

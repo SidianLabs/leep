@@ -45,11 +45,11 @@ Logs go to stderr; stdout carries protocol messages only.
 
 ## Tools
 
-`rev` is a ref name (default `main`) or a full 64-hex changeset id.
+`rev` is a branch name (default `main`), a tag (`tags/v1`, or `v1` when no branch has that name) or a full 64-hex changeset id.
 
 | Tool | Arguments | Result |
 |---|---|---|
-| `leep_refs` | none | refs and their changeset ids |
+| `leep_refs` | none | refs and their changeset ids; tags are the names under `tags/` |
 | `leep_log` | `rev?`, `path?`, `limit?` (default 20, max 200), `author?`, `agent_model?`, `agent_session?` (filters combine with AND) | entries with author, message, `agent` metadata |
 | `leep_show` | `rev` | one changeset and its changed paths (A/M/D) |
 | `leep_list_files` | `rev?`, `prefix?` | recursive file list with sizes |

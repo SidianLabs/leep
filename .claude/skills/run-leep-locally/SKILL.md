@@ -37,6 +37,9 @@ echo hello > a.txt
 leep commit -m "first"          # uploads missing blobs, creates the changeset
 leep land                       # rebase + CAS onto main
 leep log && leep cat main a.txt
+leep branch topic && leep switch topic   # branches; `leep switch -c NAME` creates too
+leep tag v1                              # tags are immutable; `leep tag -d v1` deletes
+leep branch                              # `*` marks the working copy's target
 ```
 Again, run `leep --help` for the current subcommands.
 
