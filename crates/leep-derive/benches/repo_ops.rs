@@ -13,7 +13,7 @@ use bytes::Bytes;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use leep_core::memory::{MemoryBlobStore, MemoryMetaStore};
 use leep_core::{Changeset, ChangesetId, FileChange, FileKind, RepoPath};
-use leep_derive::Repo;
+use leep_derive::{LogFilter, Repo};
 use tokio::runtime::Runtime;
 
 const FILES_PER_DIR: usize = 1000;
@@ -104,18 +104,31 @@ async fn big_repo(n: usize) -> (Repo, ChangesetId) {
     (repo, tip.expect("n > 0"))
 }
 
-/// A linear history of `n` changesets, each touching `d{i % 10}/f`.
-async fn chain(n: usize) -> (Repo, Vec<ChangesetId>) {
+/// A linear history of `n` changesets, each touching `d{i % 10}/f`, and every
+/// `rare_every`-th one also touching `rare/f`.
+async fn chain_with(n: usize, rare_every: Option<usize>) -> (Repo, Vec<ChangesetId>) {
     let repo = new_repo();
     let mut ids = Vec::with_capacity(n);
     for i in 0..n {
         let change = blob(&repo, format!("v{i}").as_bytes()).await;
         let path = RepoPath::new(format!("d{}/f", i % 10)).unwrap();
+        let mut changes = BTreeMap::from([(path, change.clone())]);
+        if rare_every.is_some_and(|k| i % k == 0) {
+            changes.insert(RepoPath::new("rare/f").unwrap(), change);
+        }
         let parents: Vec<_> = ids.last().copied().into_iter().collect();
-        let cs = changeset(&parents, BTreeMap::from([(path, change)]));
-        ids.push(repo.create_changeset(cs).await.unwrap());
+        ids.push(
+            repo.create_changeset(changeset(&parents, changes))
+                .await
+                .unwrap(),
+        );
     }
     (repo, ids)
+}
+
+/// A linear history of `n` changesets, each touching `d{i % 10}/f`.
+async fn chain(n: usize) -> (Repo, Vec<ChangesetId>) {
+    chain_with(n, None).await
 }
 
 /// Runs `prepare` untimed before each iteration and times only `run`.
@@ -302,24 +315,89 @@ fn ancestry(c: &mut Criterion) {
 
 fn log(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
-    let (repo, ids) = rt.block_on(chain(10_000));
+    // `rare/f` changes in 10 of the 10k changesets, `d0/f` in every 10th.
+    let (repo, ids) = rt.block_on(chain_with(10_000, Some(1_000)));
     let tip = *ids.last().unwrap();
+    // The first indexed query derives the index for all of history; time it
+    // once, then keep it out of the per-query numbers.
+    let started = Instant::now();
+    rt.block_on(repo.log(tip, Some("d0/f"), 1)).unwrap();
+    eprintln!(
+        "history index: derived for 10k changesets in {:?}",
+        started.elapsed()
+    );
     let mut g = c.benchmark_group("log_path_filter_10k_history");
     g.sample_size(10).measurement_time(Duration::from_secs(3));
-    // `d0/f` changes every 10th changeset: limit 10 scans ~100 changesets,
-    // limit 1000 scans all 10k; `nope` never matches and scans everything.
+    // Limit 10 on `d0/f` needs ~100 changesets of history; limit 1000 wants
+    // 1000 matches, so the scan reads all 10k. `rare/f` matches 10 and `nope`
+    // none, which also makes the scan read everything. `index` answers from
+    // the path-history index, `scan` is the old walk over every ancestor.
     for (name, path, limit) in [
         ("limit_10", "d0/f", 10),
         ("limit_1000", "d0/f", 1000),
-        ("no_match_full_scan", "nope", 1000),
+        ("rare_path", "rare/f", 1000),
+        ("no_match", "nope", 1000),
     ] {
-        g.bench_function(name, |b| {
+        g.bench_function(format!("index/{name}"), |b| {
             b.to_async(&rt)
                 .iter(|| async { repo.log(tip, Some(path), limit).await.unwrap() })
+        });
+        g.bench_function(format!("scan/{name}"), |b| {
+            b.to_async(&rt).iter(|| async {
+                repo.log_scan(tip, Some(path), limit, &LogFilter::default())
+                    .await
+                    .unwrap()
+            })
         });
     }
     g.finish();
 }
 
-criterion_group!(benches, create_changeset, land, diff, ancestry, log);
+fn last_change(c: &mut Criterion) {
+    let rt = Runtime::new().unwrap();
+    let (repo, ids) = rt.block_on(chain_with(10_000, Some(1_000)));
+    let tip = *ids.last().unwrap();
+    rt.block_on(repo.last_change(tip, "d0/f")).unwrap();
+    let mut g = c.benchmark_group("last_change_10k_history");
+    g.sample_size(20).measurement_time(Duration::from_secs(3));
+    for path in ["d0/f", "rare/f", "rare"] {
+        g.bench_function(path, |b| {
+            b.to_async(&rt)
+                .iter(|| async { repo.last_change(tip, path).await.unwrap() })
+        });
+    }
+    g.finish();
+}
+
+/// Cost of deriving the index for a fresh history, per changeset.
+fn derive_history_index(c: &mut Criterion) {
+    let rt = Runtime::new().unwrap();
+    let mut g = c.benchmark_group("derive_history_index");
+    g.sample_size(10).measurement_time(Duration::from_secs(3));
+    g.bench_function("1000_changesets", |b| {
+        timed(
+            &rt,
+            b,
+            || async {
+                let (repo, ids) = chain_with(1_000, Some(100)).await;
+                (repo, *ids.last().unwrap())
+            },
+            |(repo, tip)| async move {
+                repo.log(tip, Some("d0/f"), 1).await.unwrap();
+            },
+        )
+    });
+    g.finish();
+}
+
+criterion_group!(
+    benches,
+    create_changeset,
+    land,
+    diff,
+    ancestry,
+    log,
+    last_change,
+    derive_history_index
+);
 criterion_main!(benches);

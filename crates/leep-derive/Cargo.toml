@@ -11,6 +11,7 @@ async-trait.workspace = true
 bytes.workspace = true
 globset.workspace = true
 postcard.workspace = true
+serde.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 metrics.workspace = true

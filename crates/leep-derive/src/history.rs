@@ -1,8 +1,10 @@
 //! Log with optional path and metadata filtering, and provenance summaries.
 //!
-//! Filters on `extra` and `author` are evaluated by a linear walk over
-//! history; there is no index yet, so a selective filter on a deep history
-//! scans all of it. An index over `agent.*` keys is future work.
+//! Path queries use the path-history index (`path_history`). Filters on
+//! `extra` and `author` are applied to the changesets that walk yields, and
+//! without a path they are evaluated by a linear walk over history, so a
+//! selective filter on a deep history scans all of it. An index over
+//! `agent.*` keys is future work.
 
 use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 
@@ -142,6 +144,24 @@ impl Repo {
     /// [`Repo::log`] keeping only changesets that satisfy `filter`. `limit`
     /// counts matches, not changesets scanned.
     pub async fn log_filtered(
+        &self,
+        id: ChangesetId,
+        path: Option<&str>,
+        limit: usize,
+        filter: &LogFilter,
+    ) -> Result<Vec<ChangesetInfo>> {
+        match norm(path) {
+            Some(path) => self.log_indexed(id, path, limit, filter).await,
+            None => self.log_scan(id, None, limit, filter).await,
+        }
+    }
+
+    /// Reference implementation of [`Repo::log_filtered`]: scans every
+    /// ancestor and compares its entry at `path` with its first parent's.
+    /// Linear in history, so it only serves as the oracle for the index in
+    /// tests and as the baseline in benchmarks.
+    #[doc(hidden)]
+    pub async fn log_scan(
         &self,
         id: ChangesetId,
         path: Option<&str>,
