@@ -316,6 +316,28 @@ fn run_import_swarm_export(stores: &Stores, work: &Path) {
         );
     }
 
+    // Path history: the index answers the same as the changes it was built
+    // from (history is linear, so each entry's own changes name the path).
+    let shared_log = client.json(
+        &verify,
+        &["log", "main", "--path", "shared.txt", "-n", "200"],
+    );
+    let shared_log = shared_log["entries"].as_array().unwrap();
+    assert!(shared_log.len() > CONFLICTING.len(), "shared.txt history");
+    for e in shared_log {
+        assert!(
+            e["changeset"]["changes"].get("shared.txt").is_some(),
+            "path log yielded a changeset that did not touch shared.txt"
+        );
+    }
+    let touching = entries
+        .iter()
+        .filter(|e| e["changeset"]["changes"].get("shared.txt").is_some())
+        .count();
+    assert_eq!(shared_log.len(), touching, "path log versus full scan");
+    let last = client.json(&verify, &["last-change", "shared.txt", "--rev", "main"]);
+    assert_eq!(last["changeset"]["id"], shared_log[0]["id"]);
+
     // Provenance queries: one agent's session, all of the model, and the totals.
     let one = client.json(&verify, &["log", "main", "--agent-session", "7"]);
     let one = one["entries"].as_array().unwrap();
