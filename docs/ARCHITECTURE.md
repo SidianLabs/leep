@@ -133,6 +133,7 @@ changeset, and concurrent servers that race produce identical bytes.
 | `signature-v1` / `rebased-origin-v1` | attestations and server rebase links, keyed per (changeset, key) and per copy; not pure functions of the changeset, so written by `put_signature` and `rebase` rather than derived | signed-changeset listing and the land policy |
 | `review-v1` | review verdicts, keyed per (changeset, reviewer name) (`Hash::of_object("review", id‖name)`); attestations written by `put_review`, last write wins, listed with one lookup per principal | review listing and the review land policy |
 | `last_merge-v1` | generation of the nearest merge on the first-parent chain (0 if none) | lets `merge_base` answer from skiplists when no merge sits above the first-parent common ancestor |
+| `blob-claim-v1` / `blob-condemned-v1` / `blob-rescue-v1` / `blob-doom-v1` | per blob hash, 8-byte big-endian unix seconds (doom adds a state byte); GC bookkeeping, not derived from changesets: claims by uploads and dedup checks, condemnation by `gc condemn`, rescue by uploads of a condemned blob, doom by `gc collect` (ADR 0012) | blob garbage collection and the server's missing-blob checks |
 | `blame` | per (changeset, path), keyed `Hash::of_object("blame", id‖path)` | blame |
 
 `root_tree` and `generation` are derived eagerly when a changeset is created.
@@ -219,11 +220,17 @@ misses and occupancy as Prometheus metrics (see [OPERATIONS.md](OPERATIONS.md)).
   writes from racing servers are harmless.
 - A blob may be orphaned if a client uploads it and never commits, and tree
   nodes or merge blobs may be orphaned if the changeset that would reference
-  them fails to store. `leep-server gc` reclaims them: it marks everything
-  reachable from every stored changeset (not only refs, so unlanded changesets
-  survive) and deletes unmarked blobs older than a grace window (default 24h).
-  A client must create its changeset within the grace window of uploading, and
-  that window is what makes GC safe beside running servers. See ADR 0008.
+  them fails to store. `leep-server gc` reclaims them in two fenced phases:
+  it marks everything reachable from every stored changeset (not only refs, so
+  unlanded changesets survive), *condemns* unmarked blobs older than a grace
+  window (default 24h) by writing `blob-condemned-v1`, waits a fence (default
+  10m, longer than the server's `--request-timeout`), re-marks, and deletes the
+  blobs still condemned. A condemned blob is reported missing by
+  `POST /v1/blobs/missing` and rejected by `POST /v1/changesets`, so clients
+  re-upload it, and an upload rescues it; collect orders its delete against
+  uploads with a two-flag handshake in meta. Grace and fence together make GC
+  safe beside running servers, with no residual race. See ADR 0008 and
+  ADR 0012.
 
 ## 9. Failure model
 

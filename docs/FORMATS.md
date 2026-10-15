@@ -33,6 +33,10 @@ skill.
 | derived `signature-v1` | — | `MetaStore.derived`, key = `Hash::of_object("signature", changeset_id ‖ key_id)`, value = postcard `Signature { key_id: String, public_key: [u8; 32], sig: [u8; 64] }` (`leep_core::signature`) |
 | derived `review-v1` | — | `MetaStore.derived`, key = `Hash::of_object("review", changeset_id ‖ reviewer name utf-8)`, value = postcard `Review { reviewer: String, verdict: Verdict, comment: String, timestamp: i64 }` (`leep_core::review`); `Verdict` is `Approve` (variant 0) or `Reject` (variant 1) |
 | derived `rebased-origin-v1` | — | `MetaStore.derived`, key = rebased copy id, value = 32 raw bytes (id it was rebased from); written by `Repo::rebase` |
+| derived `blob-claim-v1` | — | `MetaStore.derived`, key = blob hash, value = unix seconds as 8-byte big-endian `i64` |
+| derived `blob-condemned-v1` | — | `MetaStore.derived`, key = blob hash, value = condemnation time, unix seconds as 8-byte big-endian `i64`, from the GC host's clock |
+| derived `blob-rescue-v1` | — | `MetaStore.derived`, key = blob hash, value = the condemnation time the writer observed, 8-byte big-endian `i64` |
+| derived `blob-doom-v1` | — | `MetaStore.derived`, key = blob hash, value = condemnation time (8-byte big-endian `i64`) then one state byte: 0 deleting, 1 abandoned, 2 deleted |
 | other derived kinds | — | owned and versioned by `leep-derive` |
 
 ## Versioning rules
@@ -127,3 +131,20 @@ object-store `blobs/<hex[0..2]>/` prefixes in hash order, and
 `SELECT id FROM changesets ORDER BY id` (byte order) for metadata. Blob
 modification time is the file mtime or object `LastModified`; a repeated `put`
 refreshes it.
+
+## Fenced garbage collection (new derived kinds, no other format change)
+
+ADR 0012 adds the three GC kinds in the table above (`blob-claim-v1` already
+existed under ADR 0008 with the same encoding). All use the blob hash as the
+key and fixed-width big-endian integers, so rows are readable without postcard.
+A blob is condemned iff `condemned > rescue` (a missing rescue row counts as
+less than any condemnation); rows are never deleted, and a new condemnation of
+the same blob is written strictly later than the previous one. Golden bytes are
+asserted in `leep-derive` (`row_encodings_are_stable`); changing an encoding
+means a new kind name (`-v2`).
+
+`/v1` wire shapes are unchanged: a condemned blob is reported by
+`POST /v1/blobs/missing` as missing, and `POST /v1/changesets` answers 400
+"missing blob" for it, exactly as for an absent blob. `PUT /v1/blobs/{hash}`
+may answer 408 (request timeout) or 409 (blob being collected, retry). New
+server flag `--request-timeout` / `LEEP_REQUEST_TIMEOUT`.

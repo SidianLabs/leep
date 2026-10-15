@@ -564,6 +564,94 @@ fn server_restart_preserves_state() {
     drop(server);
 }
 
+/// Run `leep-server gc ...` against `stores` and return its stdout.
+fn server_gc(stores: &Stores, args: &[&str]) -> String {
+    let out = std::process::Command::new(bin("leep-server"))
+        .args(["--meta", &stores.meta, "--blobs", &stores.blobs, "gc"])
+        .args(args)
+        .env("RUST_LOG", "warn")
+        .output()
+        .expect("spawn leep-server gc");
+    assert_ok(&out, &format!("leep-server gc {args:?}"));
+    stdout(&out)
+}
+
+/// Write `data` straight into a filesystem blob store, as an upload whose
+/// commit never came (and that nothing has claimed).
+fn plant_orphan(blobs_dir: &Path, data: &[u8]) -> PathBuf {
+    let hex = leep_core::Hash::of_blob(data).to_hex();
+    let path = blobs_dir.join(&hex[..2]).join(&hex[2..]);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, data).unwrap();
+    path
+}
+
+#[test]
+fn fenced_gc_removes_orphans_and_keeps_live_data() {
+    let _g = serial();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let stores = Stores::sqlite(&root.join("data"));
+    let server = Server::start(&stores, root);
+    let client = Client::new(&server.url, &root.join("cache"));
+
+    let wc = root.join("wc");
+    client.ok(root, &["init", wc.to_str().unwrap()]);
+    write(&wc, "dir/live.txt", "live data\n");
+    client.ok(&wc, &["commit", "-m", "live"]);
+    client.ok(&wc, &["land"]);
+
+    let blobs_dir = root.join("data/blobs");
+    let live_files = count_files(&blobs_dir);
+    let orphan_a = plant_orphan(&blobs_dir, b"orphan a");
+    let orphan_b = plant_orphan(&blobs_dir, b"orphan b");
+    assert_eq!(count_files(&blobs_dir), live_files + 2);
+
+    // Dry run reports and writes nothing; condemn deletes nothing.
+    let dry = server_gc(&stores, &["--dry-run", "--grace", "0"]);
+    assert!(dry.contains("would condemn: 2 blobs"), "{dry}");
+    let condemned = server_gc(&stores, &["condemn", "--grace", "0"]);
+    assert!(condemned.contains("condemned: 2 blobs"), "{condemned}");
+    assert!(orphan_a.exists() && orphan_b.exists());
+
+    // Collect honors the fence: nothing is old enough yet.
+    let early = server_gc(&stores, &["collect", "--fence", "10m"]);
+    assert!(early.contains("deleted: 0 blobs"), "{early}");
+    assert!(orphan_a.exists() && orphan_b.exists());
+
+    // Separate processes: the condemnation time comes from the stored rows.
+    let done = server_gc(&stores, &["collect", "--fence", "0s", "--unsafe-no-fence"]);
+    assert!(done.contains("deleted: 2 blobs"), "{done}");
+    assert!(!orphan_a.exists() && !orphan_b.exists());
+    assert_eq!(count_files(&blobs_dir), live_files);
+
+    // The combined command (condemn, wait, collect) and a refused zero fence.
+    let orphan_c = plant_orphan(&blobs_dir, b"orphan c");
+    let refused = std::process::Command::new(bin("leep-server"))
+        .args(["--meta", &stores.meta, "--blobs", &stores.blobs])
+        .args(["gc", "--grace", "0", "--fence", "0s"])
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    assert!(orphan_c.exists());
+    let both = server_gc(&stores, &["--grace", "0", "--fence", "1s"]);
+    assert!(both.contains("deleted: 1 blobs"), "{both}");
+    assert!(!orphan_c.exists());
+
+    // Live data survives, for a fresh checkout and for new work.
+    let fresh = root.join("fresh");
+    client.ok(root, &["init", fresh.to_str().unwrap()]);
+    client.ok(&fresh, &["sync"]);
+    assert_eq!(
+        fs::read_to_string(fresh.join("dir/live.txt")).unwrap(),
+        "live data\n"
+    );
+    write(&wc, "dir/more.txt", "more\n");
+    client.ok(&wc, &["commit", "-m", "more"]);
+    client.ok(&wc, &["land"]);
+    drop(server);
+}
+
 #[test]
 fn signed_changesets_gate_landing_on_a_protected_ref() {
     let _g = serial();

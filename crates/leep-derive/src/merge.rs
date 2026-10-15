@@ -110,7 +110,7 @@ impl Repo {
                 Ok(merged) => {
                     let bytes = Bytes::from(merged.into_bytes());
                     let size = bytes.len() as u64;
-                    let content = self.blobs().put(bytes).await?;
+                    let content = self.put_blob(bytes).await?;
                     return Ok(Resolved::Set(FileChange::Modify {
                         content,
                         kind,
@@ -248,7 +248,7 @@ impl Repo {
             });
         }
         let id = self
-            .create_changeset(Changeset {
+            .store_server_changeset(Changeset {
                 parents: vec![ours, theirs],
                 author: req.authorship.author,
                 timestamp: req.authorship.timestamp.unwrap_or_else(now),
@@ -286,7 +286,7 @@ impl Repo {
         let mut extra = orig.extra;
         extra.insert(EXTRA_REBASED_FROM.into(), cs.to_string());
         let id = self
-            .create_changeset(Changeset {
+            .store_server_changeset(Changeset {
                 parents: vec![onto],
                 author: orig.author,
                 timestamp: orig.timestamp,

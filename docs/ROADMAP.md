@@ -21,7 +21,7 @@ Milestones are ordered. Each one should leave `main` releasable.
 - [x] Benchmarks: commit and land latency versus repository size (`docs/PERFORMANCE.md`)
 
 ## v0.3: Agent-native
-- Fenced two-phase blob GC that closes the last claim/delete race (ADR 0008)
+- [x] Fenced two-phase blob GC that closes the last claim/delete race (ADR 0012)
 - [x] Provenance: `leep log --agent`, and queries over `agent.*` metadata (`leep provenance`, `leep blame --who`)
 - [x] Signed changesets (author keys; Ed25519 attestations, `--require-signatures` land policy; ADR 0010)
 - [x] Review service with semantic approval rules (comment-only, whitespace-only and docs-only changes auto-approve) and per-directory owners (`OWNERS` files, `--require-review`, `leep review`; ADR 0011)

@@ -52,8 +52,21 @@ impl Repo {
     }
 
     /// Validate and store a changeset, deriving its tree and generation.
-    /// Idempotent.
+    /// Idempotent. A blob that garbage collection has condemned counts as
+    /// missing, so the client uploads it again (ADR 0012).
     pub async fn create_changeset(&self, cs: Changeset) -> Result<ChangesetId> {
+        self.store_changeset(cs, true).await
+    }
+
+    /// Like [`Repo::create_changeset`] for changesets the server builds from
+    /// stored changesets (merge, rebase): their blobs are referenced by a
+    /// stored changeset, so GC keeps them, or were just written through
+    /// [`Repo::put_blob`], so a condemnation is already answered.
+    pub(crate) async fn store_server_changeset(&self, cs: Changeset) -> Result<ChangesetId> {
+        self.store_changeset(cs, false).await
+    }
+
+    async fn store_changeset(&self, cs: Changeset, client_blobs: bool) -> Result<ChangesetId> {
         let id = cs.id();
         for p in &cs.parents {
             if self.meta.get_changeset(p).await?.is_none() {
@@ -67,6 +80,9 @@ impl Repo {
             };
             if !seen.insert(*content) {
                 continue;
+            }
+            if client_blobs {
+                self.check_reusable(content, path.as_str()).await?;
             }
             match self.blobs.get(content).await? {
                 None => return Err(Error::Invalid(format!("missing blob {content} for {path}"))),

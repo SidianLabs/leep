@@ -1,5 +1,5 @@
 # 0008. Blob garbage collection
-Status: Accepted
+Status: Accepted; the residual race is closed by ADR 0012
 Date: 2026-10-15
 
 ## Context
@@ -86,6 +86,10 @@ treats a claim like an upload: a blob claimed at or after `started_at - grace`
 is kept (`kept_by_claim` in the report), and the claim is checked immediately
 before each delete. Claims older than the grace window no longer protect
 anything, so abandoned claims don't pin garbage forever.
+
+Superseded in part by [ADR 0012](0012-fenced-gc.md): the sweep now condemns,
+waits out a fence and collects, and the race below no longer exists. The text
+is kept as the record of the original design.
 
 Residual race: a claim written between the sweep's claim check and its
 delete of that same blob (microseconds), for a blob that has been an

@@ -2368,6 +2368,7 @@ dependencies = [
 name = "leep-e2e"
 version = "0.1.0"
 dependencies = [
+ "leep-core",
  "serde_json",
  "sqlx",
  "tempfile",
@@ -3937,6 +3938,7 @@ dependencies = [
  "http-body",
  "http-body-util",
  "pin-project-lite",
+ "tokio",
  "tower",
  "tower-layer",
  "tower-service",
