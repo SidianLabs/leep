@@ -469,6 +469,9 @@ impl MetaStore for PostgresMetaStore {
     }
 
     /// One `INSERT ... SELECT FROM UNNEST` statement, so the batch is atomic.
+    /// Rows go in `(kind, key)` order: every batched write then locks rows in
+    /// one global order, so two batches sharing keys (claims for the same
+    /// blob, say) wait for each other instead of deadlocking.
     async fn put_derived_many(&self, rows: &[DerivedRow]) -> Result<()> {
         if rows.is_empty() {
             return Ok(());
@@ -476,7 +479,7 @@ impl MetaStore for PostgresMetaStore {
         let (kinds, keys, values) = derived_columns(rows);
         sqlx::query(
             "INSERT INTO derived (kind, key, value) \
-             SELECT * FROM UNNEST($1::text[], $2::bytea[], $3::bytea[]) \
+             SELECT * FROM UNNEST($1::text[], $2::bytea[], $3::bytea[]) ORDER BY 1, 2 \
              ON CONFLICT (kind, key) DO UPDATE SET value = excluded.value",
         )
         .bind(kinds)
@@ -490,7 +493,9 @@ impl MetaStore for PostgresMetaStore {
 
     /// One statement: the changeset insert is a data-modifying `WITH`, which
     /// Postgres runs to completion even though nothing reads it, so the
-    /// changeset and its rows commit together or not at all.
+    /// changeset and its rows commit together or not at all. Rows are ordered
+    /// as in [`put_derived_many`](Self::put_derived_many); the changeset row
+    /// is a key no other statement locks along with derived rows.
     async fn put_changeset_with_derived(
         &self,
         cs: &Changeset,
@@ -501,7 +506,7 @@ impl MetaStore for PostgresMetaStore {
         sqlx::query(
             "WITH c AS (INSERT INTO changesets (id, data) VALUES ($1, $2) ON CONFLICT DO NOTHING) \
              INSERT INTO derived (kind, key, value) \
-             SELECT * FROM UNNEST($3::text[], $4::bytea[], $5::bytea[]) \
+             SELECT * FROM UNNEST($3::text[], $4::bytea[], $5::bytea[]) ORDER BY 1, 2 \
              ON CONFLICT (kind, key) DO UPDATE SET value = excluded.value",
         )
         .bind(id.0.as_bytes().as_slice())

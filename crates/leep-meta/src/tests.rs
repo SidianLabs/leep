@@ -251,6 +251,67 @@ async fn check_batched_writes_are_atomic(store: &dyn MetaStore) {
     );
 }
 
+/// Batches that share keys, written at once in opposite orders, all
+/// succeed: a backend must not deadlock on its own row locks.
+async fn check_overlapping_batches_do_not_deadlock(store: Arc<dyn MetaStore>) {
+    use bytes::Bytes;
+    use leep_core::{DerivedRow, Hash};
+
+    let rows: Vec<DerivedRow> = (0..64u32)
+        .map(|n| {
+            DerivedRow::new(
+                "overlap",
+                Hash::of_blob(&n.to_be_bytes()),
+                Bytes::from_static(b"v"),
+            )
+        })
+        .collect();
+    let mut tasks = Vec::new();
+    for t in 0..16usize {
+        let (store, mut mine) = (store.clone(), rows.clone());
+        if t % 2 == 1 {
+            mine.reverse();
+        }
+        mine.rotate_left(t * 4);
+        tasks.push(tokio::spawn(async move {
+            for round in 0..20 {
+                if round % 2 == 0 {
+                    store.put_derived_many(&mine).await.unwrap();
+                } else {
+                    store
+                        .put_changeset_with_derived(&cs(9_000 + round), &mine)
+                        .await
+                        .unwrap();
+                }
+            }
+        }));
+    }
+    for t in tasks {
+        t.await.unwrap();
+    }
+    assert_eq!(
+        store
+            .list_derived("overlap", None, 100)
+            .await
+            .unwrap()
+            .len(),
+        64
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn overlapping_batches_do_not_deadlock() {
+    check_overlapping_batches_do_not_deadlock(open_meta_store("mem://").await.unwrap()).await;
+    let dir = std::env::temp_dir().join(format!("leep-meta-overlap-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let url = format!("sqlite://{}?mode=rwc", dir.join("meta.db").display());
+    check_overlapping_batches_do_not_deadlock(open_meta_store(&url).await.unwrap()).await;
+    std::fs::remove_dir_all(&dir).ok();
+    if let Some((s, _)) = pg_store("overlap").await {
+        check_overlapping_batches_do_not_deadlock(Arc::new(s)).await;
+    }
+}
+
 #[tokio::test]
 async fn sqlite_batched_writes_are_atomic() {
     let s = SqliteMetaStore::connect("sqlite::memory:").await.unwrap();
