@@ -16,7 +16,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 FROM debian:bookworm-slim
 # No HEALTHCHECK: the slim image has no curl/wget and the server has no
-# self-check flag. Probe GET /v1/health from outside.
+# self-check flag. Probe from outside: GET /v1/health (liveness) and
+# GET /v1/ready (readiness: both stores answer).
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates \
  && rm -rf /var/lib/apt/lists/* \

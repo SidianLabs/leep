@@ -3,7 +3,8 @@
 //!
 //! | Method | Path | Request | Response |
 //! |---|---|---|---|
-//! | GET  | `/v1/health` | – | `"ok"` |
+//! | GET  | `/v1/health` | – | `"ok"` (liveness: the process is up and serving HTTP; checks nothing else) |
+//! | GET  | `/v1/ready` | – | [`ReadyResponse`] (readiness: 200 `{"status":"ready"}` when the metadata and blob stores each answered a cheap read within the server's ready timeout, else 503 with `failed` naming the stores) |
 //! | PUT  | `/v1/blobs/{hash}` | raw bytes | 204; 400 if `Hash::of_blob(body) != hash` |
 //! | GET  | `/v1/blobs/{hash}` | – | raw bytes, or 404 |
 //! | POST | `/v1/blobs/missing` | [`MissingBlobsRequest`] | [`MissingBlobsResponse`] |
@@ -62,8 +63,8 @@
 //! # Authentication
 //!
 //! A server started with a tokens file requires `Authorization: Bearer
-//! <token>` on every endpoint except `GET /v1/health`, which stays public for
-//! load balancers. A missing or unknown token is 401 with
+//! <token>` on every endpoint except `GET /v1/health` and `GET /v1/ready`,
+//! which stay public for load balancers and orchestrator probes. A missing or unknown token is 401 with
 //! `WWW-Authenticate: Bearer`. A `read` token may call every `GET` endpoint and
 //! `POST /v1/blobs/missing` (a query); any other request with it is 403. A
 //! `write` token may call everything. A server without a tokens file accepts
@@ -102,6 +103,25 @@ use crate::{Changeset, ChangesetId, FileChange, FileKind, Hash, RepoPath, TreeEn
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ErrorResponse {
     pub error: String,
+}
+
+/// Body of `GET /v1/ready`. `status` is `ready` (HTTP 200) or `not ready`
+/// (HTTP 503, with `failed` non-empty).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadyResponse {
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failed: Vec<ReadyFailure>,
+}
+
+/// One store that failed its readiness check.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadyFailure {
+    /// `meta` or `blobs`.
+    pub store: String,
+    /// `timed out after <n>ms` or `unavailable`. Never an error message, which
+    /// could carry a connection string; the server logs the detail.
+    pub reason: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

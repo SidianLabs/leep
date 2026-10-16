@@ -3,6 +3,7 @@
 
 pub mod auth;
 pub mod backup;
+pub mod fingerprint;
 pub mod limits;
 pub mod observe;
 pub mod reload;
@@ -31,6 +32,14 @@ use tower_http::timeout::TimeoutLayer;
 
 /// Default cap on request bodies (blob uploads), in bytes.
 pub const DEFAULT_MAX_BODY_BYTES: usize = 512 * 1024 * 1024;
+
+/// Default bound on each store check behind `GET /v1/ready`. Short, so a
+/// probe fails fast instead of piling up behind a hung database.
+pub const DEFAULT_READY_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// A ref name no client is expected to write; `get_ref` on it is one indexed
+/// read that proves the metadata store answers.
+const READY_PROBE_REF: &str = "leep-ready-probe";
 
 /// Default cap on how long one request may run. Garbage collection's fence
 /// must exceed it (ADR 0012): a request that checked a blob before it was
@@ -147,8 +156,30 @@ pub fn router_with_config(
     request_timeout: Duration,
     config: Arc<reload::ConfigHandle>,
 ) -> Router {
+    router_with_ready_timeout(
+        repo,
+        max_body_bytes,
+        request_timeout,
+        config,
+        DEFAULT_READY_TIMEOUT,
+    )
+}
+
+/// Like [`router_with_config`], with the bound on each store check behind
+/// `GET /v1/ready` (default [`DEFAULT_READY_TIMEOUT`]).
+pub fn router_with_ready_timeout(
+    repo: Repo,
+    max_body_bytes: usize,
+    request_timeout: Duration,
+    config: Arc<reload::ConfigHandle>,
+    ready_timeout: Duration,
+) -> Router {
+    register_ready_metrics();
+    let repo = Arc::new(repo);
+    let ready_state = (repo.clone(), ready_timeout);
     let router = Router::new()
         .route("/v1/health", get(health))
+        .route("/v1/ready", get(ready).with_state(ready_state))
         .route("/v1/blobs/missing", post(missing_blobs))
         .route("/v1/blobs/{hash}", get(get_blob).put(put_blob))
         .route("/v1/changesets", post(create_changeset))
@@ -201,7 +232,7 @@ pub fn router_with_config(
     router
         .layer(observe::trace_layer())
         .layer(middleware::from_fn(observe::track_metrics))
-        .with_state(Arc::new(repo))
+        .with_state(repo)
 }
 
 /// Check the ref names a land policy protects (`--require-signatures`,
@@ -380,9 +411,100 @@ struct MergeBaseQuery {
     b: String,
 }
 
+/// Liveness: the process is up and answering HTTP. Checks nothing else, so an
+/// orchestrator that restarts on this does not restart a healthy server just
+/// because a database is down; `/v1/ready` is for that.
 async fn health() -> Json<&'static str> {
     Json("ok")
 }
+
+/// Whether a request is a public probe: no token, no per-token limits.
+pub(crate) fn is_probe(method: &axum::http::Method, path: &str) -> bool {
+    method == axum::http::Method::GET && matches!(path, "/v1/health" | "/v1/ready")
+}
+
+fn register_ready_metrics() {
+    for store in ["meta", "blobs"] {
+        for result in ["ok", "error", "timeout"] {
+            metrics::counter!("leep_ready_checks_total", "store" => store, "result" => result)
+                .increment(0);
+        }
+    }
+}
+
+/// One store's check under `limit`: `None` when it passed, else the reason to
+/// report. The error itself is only logged, since it may name a host or carry
+/// a connection string.
+async fn check_store<F>(store: &'static str, limit: Duration, probe: F) -> Option<ReadyFailure>
+where
+    F: std::future::Future<Output = leep_core::Result<()>>,
+{
+    let (result, failure) = match tokio::time::timeout(limit, probe).await {
+        Ok(Ok(())) => ("ok", None),
+        Ok(Err(e)) => {
+            tracing::warn!(store, error = %e, "readiness check failed");
+            ("error", Some("unavailable".to_string()))
+        }
+        Err(_) => {
+            tracing::warn!(
+                store,
+                timeout_ms = limit.as_millis() as u64,
+                "readiness check timed out"
+            );
+            (
+                "timeout",
+                Some(format!("timed out after {}ms", limit.as_millis())),
+            )
+        }
+    };
+    metrics::counter!("leep_ready_checks_total", "store" => store, "result" => result).increment(1);
+    failure.map(|reason| ReadyFailure {
+        store: store.to_string(),
+        reason,
+    })
+}
+
+/// Readiness: both stores answer a cheap real read, concurrently, each within
+/// the ready timeout. 200 `{"status":"ready"}`, or 503 naming the failed
+/// stores. Public and unlimited like `/v1/health` (see [`is_probe`]).
+async fn ready(State((repo, limit)): State<(Arc<Repo>, Duration)>) -> Response {
+    let meta = repo.meta().clone();
+    let blobs = repo.blobs().clone();
+    let (m, b) = tokio::join!(
+        check_store("meta", limit, async move {
+            meta.get_ref(READY_PROBE_REF).await.map(|_| ())
+        }),
+        check_store("blobs", limit, async move {
+            blobs
+                .contains(&Hash::of_blob(READY_PROBE_BLOB))
+                .await
+                .map(|_| ())
+        }),
+    );
+    let failed: Vec<ReadyFailure> = [m, b].into_iter().flatten().collect();
+    let (status, body) = if failed.is_empty() {
+        (
+            StatusCode::OK,
+            ReadyResponse {
+                status: "ready".into(),
+                failed,
+            },
+        )
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            ReadyResponse {
+                status: "not ready".into(),
+                failed,
+            },
+        )
+    };
+    (status, Json(body)).into_response()
+}
+
+/// Content whose hash the blob check asks about; whether the store holds it
+/// does not matter, only that it answers.
+const READY_PROBE_BLOB: &[u8] = b"leep ready probe";
 
 async fn put_blob(State(repo): S, Path(h): Path<String>, body: Bytes) -> ApiResult<StatusCode> {
     let h = hash(&h)?;

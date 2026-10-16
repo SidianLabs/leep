@@ -52,7 +52,9 @@ measured until the response head is ready, not until the body is streamed.
 | `leep_requests_limited_total` | counter | `reason` = `rate`, `concurrency`, `size`; `token` | Requests refused by a request limit (ADR 0020). `token` is the token's name, or `anonymous` for every client address when there is no tokens file. |
 | `leep_requests_in_flight` | gauge | `token` | Requests in progress, until their response body has been sent. Only tokens that have a limit are tracked. |
 | `leep_config_reload_total` | counter | `result` = `ok`, `error` | Config reloads (SIGHUP) by result; both series exist from startup (ADR 0024). |
-| `leep_config_generation` | gauge | none | 1 at startup, plus one per successful reload. Differs between servers that have not all been signalled. |
+| `leep_config_generation` | gauge | none | **Per process:** 1 at startup, plus one per successful reload, even when nothing changed. It resets on restart, so it differs between healthy servers that run identical config; do not alert on it. Use `leep_config_info` to compare servers. |
+| `leep_config_info` | gauge | `fingerprint` | 1 for the fingerprint of the config in force, 0 for the ones this process ran before, so `leep_config_info == 1` has exactly one series per server. The fingerprint is 16 hex characters of a BLAKE3 over the parsed config (tokens and their limits, trusted keys, review policy, `--require-signatures` and review refs, and the server-wide limit defaults), so it is the same on every server that runs the same config, across restarts, and does not change when a file is only reformatted or reordered. It holds no secret: tokens are already digests, keys are public, and the hash is truncated. It is also logged at startup and on every reload. |
+| `leep_ready_checks_total` | counter | `store` = `meta`, `blobs`; `result` = `ok`, `error`, `timeout` | Checks made by `GET /v1/ready`, one per store per call; all six series exist from startup. |
 | `leep_config_last_reload_timestamp_seconds` | gauge | none | Unix time of the last successful load, including startup. |
 | `leep_build_info` | gauge | `version` | Always 1; carries the server version. |
 | `leep_schema_version` | gauge | none | Newest metadata schema migration applied (ADR 0023), read when the server opened the store. Servers sharing a database report the same value once all are upgraded. |
@@ -161,19 +163,29 @@ groups:
     annotations:
       summary: "Cache hit ratio below 50%; consider a larger --cache-bytes."
       runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepblobcachecoldhitratio
+  - alert: LeepNotReady
+    # GET /v1/ready checks run only when something probes the server; with no
+    # prober (or a prober that stopped) no series moves and this stays quiet.
+    expr: sum by (instance, store) (increase(leep_ready_checks_total{result!="ok"}[5m])) > 0
+    for: 5m
+    labels: {severity: page}
+    annotations:
+      summary: "GET /v1/ready is failing for a store: that server cannot reach its metadata or blob store and its orchestrator should be taking it out of rotation."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepnotready
   - alert: LeepConfigReloadFailed
     expr: increase(leep_config_reload_total{result="error"}[10m]) > 0
     labels: {severity: page}
     annotations:
       summary: "A SIGHUP reload was refused; the server runs the previous config. This alert clears after 10 minutes even if the file is still bad: read the ERROR log line, fix the file, signal again, and confirm."
       runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepconfigreloadfailed
-  - alert: LeepConfigGenerationSkew
-    expr: max(leep_config_generation) != min(leep_config_generation)
+  - alert: LeepConfigSkew
+    # One series per server is 1; two different fingerprints means two different configs.
+    expr: count(count by (fingerprint) (leep_config_info == 1)) > 1
     for: 15m
     labels: {severity: ticket}
     annotations:
-      summary: "Servers report different config generations: a reload missed one, or one restarted (a restart resets the counter). Compare the files, not the numbers."
-      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepconfiggenerationskew
+      summary: "Servers run different config (different leep_config_info fingerprints): a reload missed one, or the files differ between hosts. A restart alone does not trigger this."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepconfigskew
   - alert: LeepSchemaVersionSkew
     expr: max(leep_schema_version) != min(leep_schema_version)
     for: 1h
@@ -311,7 +323,7 @@ Tuning:
   all clients (see DEPLOY.md). The table holds 4096 addresses, idle ones are
   evicted, and extra active clients share one entry, so memory does not grow
   under a flood of spoofed or rotating sources.
-- Limits do not apply to `GET /v1/health` or to unauthenticated requests
+- Limits do not apply to `GET /v1/health`, `GET /v1/ready` or to unauthenticated requests
   (which fail with 401 without costing a token anything); rate-limit those at
   the proxy.
 
@@ -324,16 +336,21 @@ Watch it with:
 - Logs: `SIGHUP: reloading config`, then `INFO` lines per change (`tokens
   changed`, `request limit state updated`, `trusted signing keys changed`,
   `protected refs changed`, `review rules changed`) listing names and counts,
-  then `config reloaded` with the new `generation`. On failure a single `ERROR`
+  then `config reloaded` with the new `generation` and the `fingerprint` (and
+  `previous_fingerprint`) of the config now in force; the fingerprint is also
+  logged at startup (`config loaded`). On failure a single `ERROR`
   `config reload failed; keeping the previous config` carries the file and the
   reason. Tokens and digests are never logged.
-- Metrics: `leep_config_reload_total{result}`, `leep_config_generation` and
-  `leep_config_last_reload_timestamp_seconds`. Alert on any `error`, and on
-  generations that differ between servers for longer than a rollout takes
-  (the generation is per process, so one restarted server differs until the
-  others restart too; compare the files, not only the numbers). Runbooks:
+- Metrics: `leep_config_reload_total{result}`, `leep_config_info{fingerprint}`,
+  `leep_config_generation` and `leep_config_last_reload_timestamp_seconds`.
+  Alert on any `error`, and on servers whose `leep_config_info` fingerprints
+  differ for longer than a rollout takes. The fingerprint depends only on what
+  the config contains, so a restart, or a reload that changed nothing, never
+  causes a difference. `leep_config_generation` is a per-process count that
+  resets on restart; read it to see whether *this* server reloaded, not to
+  compare servers. Runbooks:
   [LeepConfigReloadFailed](RUNBOOKS.md#leepconfigreloadfailed),
-  [LeepConfigGenerationSkew](RUNBOOKS.md#leepconfiggenerationskew).
+  [LeepConfigSkew](RUNBOOKS.md#leepconfigskew).
 - A reload that logs `changed=false` found the files identical to what was
   running. Check that the file you edited is the file the server was started
   with (`LEEP_TOKENS_FILE` and friends), and, in a container, that you mounted

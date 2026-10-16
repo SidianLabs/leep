@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Request};
-use axum::http::{header, HeaderValue, Method, StatusCode};
+use axum::http::{header, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::Response;
 use http_body_util::{BodyExt, Limited};
@@ -620,10 +620,10 @@ fn too_large(slot: &Slot, max: usize) -> Response {
 
 /// Axum middleware enforcing the [`Limiter`] of the request's config snapshot.
 /// Layer it inside authentication, which supplies the [`Principal`], and inside
-/// the timeout and global body limit. `GET /v1/health` is never limited, so
+/// the timeout and global body limit. `GET /v1/health` and `GET /v1/ready` are never limited, so
 /// probes keep working.
 pub async fn enforce(req: Request, next: Next) -> Response {
-    if req.method() == Method::GET && req.uri().path() == "/v1/health" {
+    if crate::is_probe(req.method(), req.uri().path()) {
         return next.run(req).await;
     }
     let config = req.extensions().get::<Arc<RuntimeConfig>>().cloned();

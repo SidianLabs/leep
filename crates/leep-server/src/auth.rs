@@ -249,6 +249,23 @@ impl Auth {
             .map(|k| (k.name.as_str(), k.role, &k.limits))
     }
 
+    /// Feed the table into a config fingerprint, sorted by name. Holds the
+    /// digests the file already holds, never a token.
+    pub(crate) fn fingerprint_into(&self, c: &mut crate::fingerprint::Canon) {
+        let mut all: Vec<&Known> = self.tokens.iter().collect();
+        all.sort_by(|a, b| a.name.cmp(&b.name));
+        c.section("tokens", all.len());
+        for k in all {
+            c.str(&k.name)
+                .str(k.role.as_str())
+                .bytes(&k.digest)
+                .opt_quota(k.limits.rate)
+                .opt_f64(k.limits.burst)
+                .opt_quota(k.limits.concurrency)
+                .opt_quota(k.limits.max_body);
+        }
+    }
+
     /// What `newer` changes relative to `self`, each list sorted by name.
     pub fn diff(&self, newer: &Auth) -> AuthChange {
         let old: HashMap<&str, &Known> = self.tokens.iter().map(|k| (k.name.as_str(), k)).collect();
@@ -335,11 +352,11 @@ fn bearer(req: &Request) -> Option<&str> {
         .filter(|t| !t.is_empty())
 }
 
-/// Axum middleware enforcing [`Auth`]; `GET /v1/health` stays public. Uses the
+/// Axum middleware enforcing [`Auth`]; `GET /v1/health` and `GET /v1/ready` stay public. Uses the
 /// config snapshot the request started with, so a token revoked mid-request
 /// does not change that request's answer, and the next request sees it.
 pub async fn require_token(mut req: Request, next: Next) -> Response {
-    if req.method() == Method::GET && req.uri().path() == "/v1/health" {
+    if crate::is_probe(req.method(), req.uri().path()) {
         return next.run(req).await;
     }
     let Some(config) = req.extensions().get::<Arc<RuntimeConfig>>().cloned() else {

@@ -297,6 +297,25 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   first event of a counter or a backup that never succeeded.
   `scripts/check-runbooks.sh`, run in CI, fails when an alert and its runbook
   do not match.
+- `leep_config_info{fingerprint}` exports a 16-character BLAKE3 fingerprint of
+  the loaded config (tokens and limits, trusted keys, review policy, protected
+  ref sets, server-wide limit defaults), hashed from the parsed content so file
+  formatting and entry order do not change it, and holding no secret. It is
+  logged at startup and on each reload; after a reload the previous
+  fingerprint's series drops to 0, so `leep_config_info == 1` has one series per
+  server. `leep_config_generation` stays but is documented as per process.
+  The `LeepConfigGenerationSkew` alert, which fired after any single restart,
+  is replaced by `LeepConfigSkew` (`count(count by (fingerprint)
+  (leep_config_info == 1)) > 1`); its runbook keeps the old anchor.
+- `GET /v1/ready` is a readiness probe: it reads one ref and asks the blob
+  store about one fixed hash, concurrently under `--ready-timeout`
+  (`LEEP_READY_TIMEOUT`, default 2 s), and answers 200 `{"status":"ready"}` or
+  503 naming the failed store (`meta` or `blobs`) with a short reason and no
+  connection details. Like `/v1/health` it needs no token and is never
+  limited. `/v1/health` is unchanged and stays liveness. New metric
+  `leep_ready_checks_total{store,result}`, alert `LeepNotReady` with a runbook,
+  and a Probes section in DEPLOY.md with Kubernetes liveness and readiness
+  examples.
 
 ### Fixes
 - Processes opening a new SQLite metadata file at the same moment (servers
