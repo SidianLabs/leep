@@ -70,10 +70,10 @@ content-addressing and (b) the atomicity of `MetaStore::cas_ref`.
 | Crate | Role | May depend on |
 |---|---|---|
 | `leep-core` | Types, hashing, encoding, `BlobStore`/`MetaStore` traits (including listing and blob deletion for GC, and listing and dropping derived rows by kind for repair), in-memory stores, conformance tests, API types, pure rename detection | no other leep crate; no I/O, no async runtime |
-| `leep-store` | `BlobStore` backends: filesystem, `object_store` (S3/MinIO), `CachedBlobStore`, `open_blob_store(url)` | core |
-| `leep-meta` | `MetaStore` backends: SQLite, Postgres, `open_meta_store(url)`, and the versioned schema migrator (`migrate`, ADR 0023) | core |
+| `leep-store` | `BlobStore` backends: filesystem, `object_store` (S3/MinIO), `CachedBlobStore`, `open_blob_store(url)`, and the incremental blob copy backup and restore use (`sync`, ADR 0026) | core |
+| `leep-meta` | `MetaStore` backends: SQLite, Postgres, `open_meta_store(url)`, the versioned schema migrator (`migrate`, ADR 0023), and metadata snapshots and their import (`snapshot`, ADR 0026) | core |
 | `leep-derive` | `Repo`: derived data framework and kinds, plus all operations, blob garbage collection (`gc`) and store verification and repair (`integrity`) | core (traits only, never a concrete backend) |
-| `leep-server` | HTTP server binary `leep-server` | core, store, meta, derive |
+| `leep-server` | HTTP server binary `leep-server`, and its offline subcommands (`gc`, `migrate`, `verify`, `repair`, `backup`, `restore`, `backup-verify`) | core, store, meta, derive |
 | `leep-cli` | Client binary `leep` | core only |
 | `leep-mcp` | MCP server binary `leep-mcp` for AI agents (stdio JSON-RPC; talks to `leep-server` over HTTP) | core and the `leep-cli` library (its HTTP client); never derive, store, meta or server outside dev-dependencies |
 | `leep-git` | Git bridge: library plus the `leep-git` admin binary | core, derive; store and meta only to open stores by URL in the binary |
@@ -227,6 +227,24 @@ missing ones); `repair drop` deletes a kind so it derives again on demand.
 Only kinds that history can regenerate are rederived or dropped; signatures,
 reviews, rebase links, GC fence rows and the ref log are refused. The table of
 kinds is `leep_derive::integrity::kinds`, mirrored in the ADR.
+
+**Backup and restore** ([ADR 0026](adr/0026-backup-and-restore.md)).
+`leep-server backup` takes a consistent copy of both stores while servers and
+GC run. It reads the metadata first, in one read transaction
+(`leep_meta::snapshot`: `REPEATABLE READ` on Postgres, a WAL read transaction
+on SQLite), and writes it as a SQLite file with the normal schema, whichever
+backend it came from. It then copies the blobs the backup pool lacks
+(`leep_store::sync`: a merge of two ascending listings; content addressing
+makes "present" mean "correct"), and finally walks every changeset of the
+snapshot against the pool and seals the result in `manifest.json`. The order
+is the consistency argument: a blob a stored changeset needs is never deleted
+(ADR 0012), so everything the snapshot needs is in the store when the copy
+looks, however GC interleaves; the walk enforces it on every run, so no lock
+against GC is needed. `restore` loads blobs, then metadata in one transaction,
+into empty stores only, refusing a newer schema and a damaged file, and the
+restored stores pass `verify`. `backup-verify` checks a backup without
+restoring it. The format is in FORMATS.md; the drill and the runbook are in
+OPERATIONS.md.
 
 ## 6. Request flows
 
@@ -408,6 +426,8 @@ misses and occupancy as Prometheus metrics (see [OPERATIONS.md](OPERATIONS.md)).
 | Server started on a database from a newer release, or whose applied migration was edited | The store refuses to open (`database schema vN is newer than this server`), before any write | Upgrade the server; never edit an applied migration (ADR 0023) |
 | Migration fails or the migrating process dies mid-run | Every pending migration and its `schema_migrations` row run in one transaction: the database stays at the version it started at | Fix the cause and start again; concurrent starters wait on the lock and find the work done |
 | Data damaged at rest (bit rot, a bad restore, a hand-edited table) | Content-addressed objects fail their hash check on read; derived rows without one can answer wrongly and silently (ADR 0021) | `leep-server verify` names every damaged object and row; `repair rederive` rewrites derived rows, and blobs and changesets are restored from backup (OPERATIONS.md, "Verify and repair") |
+| Backup taken while servers and GC run | The metadata snapshot is one instant; blobs are copied after it, and a blob the snapshot needs cannot have been deleted (ADR 0012), so the backup restores. A backup whose check finds a missing blob is sealed as failed, exits 1, and `restore` refuses it | Alert on `leep_backup_last_run_ok` and the last-success age; take another backup (ADR 0026) |
+| Disk, volume or database lost | Everything since the last backup's snapshot instant | `leep-server restore` into fresh stores, `verify --full --rehash`, start servers (OPERATIONS.md, "Backup and restore") |
 | `gc` killed at any point | Rows it wrote are harmless (a condemned blob is re-uploaded on demand, an announced delete is closed by the next collect); no reachable blob was deleted | Run `gc collect` again |
 
 **What each backend guarantees.** "Applied" means durable against a process

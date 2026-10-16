@@ -85,7 +85,9 @@ operator action, and their benchmarks are in `docs/PERFORMANCE.md`.
 Exit: a full soak run and the fuzzers find nothing new for two weeks.
 
 ## M6: Operations
-- [ ] Backup and restore for metadata and blobs, with a tested restore drill
+- [x] Backup and restore for metadata and blobs, with a tested restore drill
+  (`leep-server backup`, `restore` and `backup-verify`; the drill is
+  `crates/leep-e2e/tests/backup.rs`; ADR 0026)
 - [x] Upgrade path: versioned schema migrations for SQLite and Postgres, and a
   test that upgrades a populated store from every earlier tagged version
   (ADR 0023; until a release is tagged, from the pre-ref-log and un-versioned

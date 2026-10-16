@@ -144,6 +144,41 @@ derived row, which costs about what deriving them did (the warm-up above took
 44 s). The files here are small, so `--rehash` adds little; it is bound by
 reading the blob store.
 
+## Backup and restore
+
+`leep-server backup`, `backup-verify` and `restore` (ADR 0026,
+`docs/OPERATIONS.md`) over a store of 5 000 changesets built by the ignored test
+`backup_and_restore_timing` (`cargo test --release -p leep-e2e --test backup --
+--ignored --nocapture`): a linear history, three small files changed per
+changeset, 32 441 derived rows (the search index for the tip is warmed), 50 000
+blobs and tree nodes (21.4 MiB) on a filesystem blob store, and a 8.3 MiB
+metadata snapshot. The server is not running and nothing else is writing;
+backup, restore and the stores share one disk. Same 4 vCPU shared machine as
+above, Postgres 16 on the same host, release build. One run each.
+
+| Step | SQLite metadata | Postgres metadata |
+|---|---|---|
+| `backup`, first (empty pool: all 50 000 blobs copied, then the check) | 15.7 s | 15.2 s |
+| `backup` again, nothing new (two listings, the snapshot, the check) | 8.8 s | 8.0 s |
+| `backup-verify` | 3.9 s | 3.8 s |
+| `backup-verify --rehash` | 3.8 s | 3.8 s |
+| `restore` (copy 50 000 blobs, load metadata, check) | 15.3 s | 16.6 s |
+| `verify --full --rehash` on the restored stores | 20.3 s | 33.1 s |
+
+Reading the numbers: the blob copy is bound by per-object cost (50 000 files of
+about 450 bytes), so expect time to follow blob count on a filesystem, and
+bytes and round trips on S3, rather than repository size in MiB. The second
+backup shows the fixed cost of a run when nothing changed: listing both blob
+stores, streaming the metadata into the snapshot file, and the closure check,
+which is the same history walk as `backup-verify` and scales with changesets and
+tree nodes. `--rehash` adds little here because the files are tiny. For a
+restore drill, plan on `restore` plus `verify --full --rehash`: about 36 s on
+SQLite and 50 s on Postgres for this store. The metadata load is one transaction
+of batched inserts (500 rows per statement). `verify --full` is slower on
+Postgres than on SQLite here because it reads every row over a connection
+rather than from a local file; that is `verify`'s cost (see above), not the
+restore's.
+
 ## Soak run
 
 `leep-soak` (ADR 0022, `docs/OPERATIONS.md`) runs a swarm against a real
