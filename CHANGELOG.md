@@ -335,6 +335,14 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   without packs behaves as before. GC deletes packed blobs through
   `packs/tombstones`, and the next repack drops them. Only filesystem stores
   can be packed so far; backups copy packed blobs as loose ones.
+- `log` without a path, `log` filtered by author or `extra`, and
+  provenance read history in batches instead of a changeset at a time
+  (ADR 0030): on the first 3,795 commits of git/git on Postgres, a log of the
+  whole slice takes 0.10 s instead of 0.93 s and a 100-entry log 7 ms instead
+  of 27 ms, with the same entries in the same order. `MetaStore` gains
+  `get_changesets` and `get_derived_many` (provided methods that loop over
+  the single reads, so other implementations keep compiling); Postgres and
+  SQLite answer each with one query.
 
 ### Fixes
 - Processes opening a new SQLite metadata file at the same moment (servers

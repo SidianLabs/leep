@@ -28,7 +28,7 @@ table below. Use `cargo bench -- --save-baseline <name>` and
 
 Machine: 4 vCPU (`nproc` = 4), Intel Xeon @ 2.80GHz, 15 GB RAM, release
 profile, in-memory stores. Median of 20 samples (10 for `log`).
-Path-history rows (`cargo bench -p leep-derive -- 'log_path|last_change|derive_history'`) use a 10k-changeset linear history in which `d0/f` changes every 10th changeset and `rare/f` every 1000th. Numbers are
+Path-history rows (`cargo bench -p leep-derive -- 'log_path|last_change|derive_history'`) use a 10k-changeset linear history in which `d0/f` changes every 10th changeset and `rare/f` every 1000th; the `log` rows without a path (`-- log_10k_history`) use the same history and were measured before and after in one session on a shared 4 vCPU Xeon @ 2.10GHz, so compare them with each other rather than with the other rows. Numbers are
 indicative; expect roughly +/-15% run to run.
 
 | Benchmark | 1k | 10k | 100k |
@@ -51,6 +51,9 @@ indicative; expect roughly +/-15% run to run.
 | `log` path filter, no match, path-history index | | 3.1 us | |
 | `last_change` of a file, a rarely changed file, a directory | | 4.0 / 4.2 / 3.7 us | |
 | derive the history index (per changeset, one file each) | | 36 us | |
+| `log` without a path, limit 100 (before / after ADR 0030) | | 95 us / 214 us | |
+| `log` without a path, limit 10,000 (before / after ADR 0030) | | 22.7 ms / 59.7 ms | |
+| `log` with an author filter matching nothing, all 10k (before / after ADR 0030) | | 8.6 ms / 35.5 ms | |
 
 ## Rename detection
 
@@ -341,6 +344,43 @@ a blame of a rarely changed file in 9 ms. On the full git/git history the same
 first query took 69 minutes inside one request; with warming that work happens
 after an import or restart without anyone waiting on it.
 
+### Log without a path
+
+`log` without a path walks every ancestor. It used to read one changeset, then
+each new parent's generation, then the root tree, one round trip each. ADR 0030
+reads ahead in batches of up to 256 (changesets, generations, root trees and
+skiplists, four queries issued together), guessing the next changesets from
+parents and skiplist entries, so a long chain is read a window per round trip.
+Same 3,795-commit slice on a scratch copy of the database, local Postgres 16
+over a Unix socket, release builds, `--warm-interval 0`, each limit on a freshly
+started server (so the first request also fills the ancestry cache), then the
+median of five more; statements counted with `log_statement = all`:
+
+| `GET /v1/log/{head}` | Before: first / median | After: first / median | Statements, first request |
+|---|---|---|---|
+| `limit=100` | 38 ms / 27 ms | 21 ms / 7.3 ms | 307 -> 27 |
+| `limit=3795` (whole slice, 4.7 MB of JSON) | 1.42 s / 0.93 s | 0.15 s / 0.10 s | 11,385 -> 84 |
+| `author=nobody&limit=10` (scans all) | 0.89 s / 0.46 s | 0.09 s / 0.07 s | |
+| `author=Junio&limit=1000` | 0.34 s / 0.33 s | 0.08 s / 0.08 s | |
+
+Before, the first request made exactly three statements per entry (changeset,
+parent generation, root tree) and later ones two; after, the whole slice takes
+84 batched statements and 100 entries take 27, most of them in the first rounds
+while the skiplists double the known window. The full git/git history was not re-measured
+here; its `log limit 10000` took 3.6 s before.
+
+Path logs (`log --path`) are unchanged: each changeset the path walk yields is
+found in the index at the previous one's parents, so batches would hold one
+changeset. Reading those with the batched calls was tried and was slower
+(`path=Documentation`, 711 entries: 0.27 s before, 0.35 s with batches of one).
+
+The in-memory benchmark rows above go the other way: there a read costs well
+under a microsecond, so the read-ahead's bookkeeping (a map of known ids, a
+heap of guesses, decoding a skiplist per changeset) and its extra skiplist
+reads make the walk 2 to 4 times slower, 3 to 4 us per changeset. Against about
+0.1 ms per Postgres round trip saved per changeset, that is the right trade
+for any real backend.
+
 ## Packed blobs
 
 `leep-server repack` (ADR 0029) on a copy of the first 3,795 commits of
@@ -444,7 +484,9 @@ What does not scale with the change:
   derives in time proportional to those paths. The benchmarks use linear
   histories and do not measure this.
 - `log` without `path` and the `author` or `extra` filters alone scan
-  changesets linearly.
+  changesets linearly. Since ADR 0030 the scan reads them in batches, so on a
+  database it costs a round trip per window of up to 256 changesets rather
+  than two or three per changeset (see "Log without a path").
 
 ### Fixture note
 
