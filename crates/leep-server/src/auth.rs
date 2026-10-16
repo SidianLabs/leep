@@ -1,7 +1,8 @@
 //! Static bearer-token authentication (ADR 0007).
 //!
 //! Tokens live in a JSON file as `blake3:<hex>` digests, never plaintext, so a
-//! leaked file does not leak credentials. The file is read once at startup.
+//! leaked file does not leak credentials. The file is read at startup and
+//! again on SIGHUP (ADR 0024).
 //!
 //! ```json
 //! { "tokens": [
@@ -13,10 +14,11 @@
 //! An entry may also carry request limits (`rate`, `burst`, `concurrency`,
 //! `max_body`; ADR 0020), see [`crate::limits`].
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 
-use axum::extract::{FromRequestParts, Request, State};
+use axum::extract::{FromRequestParts, Request};
 use axum::http::request::Parts;
 use axum::http::{header, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
@@ -28,6 +30,7 @@ use subtle::ConstantTimeEq;
 use tracing::Instrument;
 
 use crate::limits::{Quota, TokenLimits};
+use crate::reload::RuntimeConfig;
 
 const DIGEST_PREFIX: &str = "blake3:";
 const TOKEN_BYTES: usize = 32;
@@ -114,6 +117,24 @@ struct Known {
     role: Role,
     digest: [u8; 32],
     limits: TokenLimits,
+}
+
+/// What a reload changed in the token table, by token name. Never holds
+/// digests, so it is safe to log.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct AuthChange {
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+    /// Same name, new digest.
+    pub rotated: Vec<String>,
+    pub role_changed: Vec<String>,
+    pub limits_changed: Vec<String>,
+}
+
+impl AuthChange {
+    pub fn is_empty(&self) -> bool {
+        *self == AuthChange::default()
+    }
 }
 
 /// The loaded token table.
@@ -228,6 +249,44 @@ impl Auth {
             .map(|k| (k.name.as_str(), k.role, &k.limits))
     }
 
+    /// What `newer` changes relative to `self`, each list sorted by name.
+    pub fn diff(&self, newer: &Auth) -> AuthChange {
+        let old: HashMap<&str, &Known> = self.tokens.iter().map(|k| (k.name.as_str(), k)).collect();
+        let new: HashMap<&str, &Known> =
+            newer.tokens.iter().map(|k| (k.name.as_str(), k)).collect();
+        let mut c = AuthChange::default();
+        for (name, k) in &new {
+            let Some(o) = old.get(name) else {
+                c.added.push(name.to_string());
+                continue;
+            };
+            if o.digest != k.digest {
+                c.rotated.push(name.to_string());
+            }
+            if o.role != k.role {
+                c.role_changed.push(name.to_string());
+            }
+            if o.limits != k.limits {
+                c.limits_changed.push(name.to_string());
+            }
+        }
+        c.removed = old
+            .keys()
+            .filter(|n| !new.contains_key(*n))
+            .map(|n| n.to_string())
+            .collect();
+        for list in [
+            &mut c.added,
+            &mut c.removed,
+            &mut c.rotated,
+            &mut c.role_changed,
+            &mut c.limits_changed,
+        ] {
+            list.sort();
+        }
+        c
+    }
+
     /// Match a presented token. Compares against every entry without early
     /// exit so timing does not reveal which digest matched.
     fn lookup(&self, token: &str) -> Option<(&str, Role)> {
@@ -276,15 +335,20 @@ fn bearer(req: &Request) -> Option<&str> {
         .filter(|t| !t.is_empty())
 }
 
-/// Axum middleware enforcing [`Auth`]; `GET /v1/health` stays public.
-pub async fn require_token(
-    State(auth): State<std::sync::Arc<Auth>>,
-    mut req: Request,
-    next: Next,
-) -> Response {
+/// Axum middleware enforcing [`Auth`]; `GET /v1/health` stays public. Uses the
+/// config snapshot the request started with, so a token revoked mid-request
+/// does not change that request's answer, and the next request sees it.
+pub async fn require_token(mut req: Request, next: Next) -> Response {
     if req.method() == Method::GET && req.uri().path() == "/v1/health" {
         return next.run(req).await;
     }
+    let Some(config) = req.extensions().get::<Arc<RuntimeConfig>>().cloned() else {
+        // Layered without the snapshot middleware: refuse rather than serve open.
+        return reject(StatusCode::INTERNAL_SERVER_ERROR, "server misconfigured");
+    };
+    let Some(auth) = &config.auth else {
+        return next.run(req).await;
+    };
     let Some((name, role)) = bearer(&req).and_then(|t| auth.lookup(t)) else {
         return reject(
             StatusCode::UNAUTHORIZED,
@@ -344,5 +408,33 @@ mod tests {
         assert!(!needs_write(&Method::GET, "/v1/changesets/abc/signatures"));
         assert!(needs_write(&Method::PUT, "/v1/blobs/x"));
         assert!(needs_write(&Method::DELETE, "/v1/refs/main"));
+    }
+
+    #[test]
+    fn diff_names_what_changed_and_nothing_else() {
+        let parse = |entries: serde_json::Value| {
+            Auth::parse(&serde_json::json!({ "tokens": entries }).to_string()).unwrap()
+        };
+        let old = parse(serde_json::json!([
+            { "name": "same", "role": "write", "hash": hash_token("1") },
+            { "name": "rotated", "role": "write", "hash": hash_token("2") },
+            { "name": "promoted", "role": "read", "hash": hash_token("3") },
+            { "name": "throttled", "role": "write", "hash": hash_token("4") },
+            { "name": "gone", "role": "write", "hash": hash_token("5") },
+        ]));
+        let new = parse(serde_json::json!([
+            { "name": "same", "role": "write", "hash": hash_token("1") },
+            { "name": "rotated", "role": "write", "hash": hash_token("2b") },
+            { "name": "promoted", "role": "write", "hash": hash_token("3") },
+            { "name": "throttled", "role": "write", "hash": hash_token("4"), "rate": 2 },
+            { "name": "fresh", "role": "read", "hash": hash_token("6") },
+        ]));
+        assert!(old.diff(&old).is_empty());
+        let c = old.diff(&new);
+        assert_eq!(c.added, ["fresh"]);
+        assert_eq!(c.removed, ["gone"]);
+        assert_eq!(c.rotated, ["rotated"]);
+        assert_eq!(c.role_changed, ["promoted"]);
+        assert_eq!(c.limits_changed, ["throttled"]);
     }
 }

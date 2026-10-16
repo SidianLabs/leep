@@ -93,7 +93,7 @@ Exit: a full soak run and the fuzzers find nothing new for two weeks.
 - [x] Repair tools: verify reachability, re-derive or drop derived data by kind
   (`leep-server verify` and `repair`; ADR 0025)
 - [ ] Runbook for every alert in `docs/OPERATIONS.md`
-- [ ] Config reload without restart (tokens, keys, policies)
+- [x] Config reload without restart (tokens, keys, policies; SIGHUP, ADR 0024)
 - [ ] Two or three design partners from the first market (see
   [PRODUCT.md](PRODUCT.md)) running Leep for real work
 

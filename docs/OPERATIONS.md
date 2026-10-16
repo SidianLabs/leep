@@ -51,6 +51,9 @@ measured until the response head is ready, not until the body is streamed.
 | `leep_blob_cache_entries` | gauge | none | Blobs held in the cache. |
 | `leep_requests_limited_total` | counter | `reason` = `rate`, `concurrency`, `size`; `token` | Requests refused by a request limit (ADR 0020). `token` is the token's name, or `anonymous` for every client address when there is no tokens file. |
 | `leep_requests_in_flight` | gauge | `token` | Requests in progress, until their response body has been sent. Only tokens that have a limit are tracked. |
+| `leep_config_reload_total` | counter | `result` = `ok`, `error` | Config reloads (SIGHUP) by result; both series exist from startup (ADR 0024). |
+| `leep_config_generation` | gauge | none | 1 at startup, plus one per successful reload. Differs between servers that have not all been signalled. |
+| `leep_config_last_reload_timestamp_seconds` | gauge | none | Unix time of the last successful load, including startup. |
 | `leep_build_info` | gauge | `version` | Always 1; carries the server version. |
 | `leep_schema_version` | gauge | none | Newest metadata schema migration applied (ADR 0023), read when the server opened the store. Servers sharing a database report the same value once all are upgraded. |
 
@@ -87,6 +90,13 @@ groups:
     expr: sum by (token, reason) (rate(leep_requests_limited_total[10m])) > 0.5
     for: 15m
     annotations: {summary: "A token is being limited steadily: a runaway agent, or a limit set too low."}
+  - alert: LeepConfigReloadFailed
+    expr: increase(leep_config_reload_total{result="error"}[10m]) > 0
+    annotations: {summary: "A SIGHUP reload was refused; the server runs the previous config. Read the ERROR log line, fix the file and signal again."}
+  - alert: LeepConfigGenerationSkew
+    expr: max(leep_config_generation) != min(leep_config_generation)
+    for: 15m
+    annotations: {summary: "Servers run different config generations; a reload did not reach all of them."}
 ```
 
 ## Request limits
@@ -133,6 +143,36 @@ Tuning:
 - Limits do not apply to `GET /v1/health` or to unauthenticated requests
   (which fail with 401 without costing a token anything); rate-limit those at
   the proxy.
+
+## Config reload
+
+`kill -HUP` re-reads the tokens, signing keys and review policy files (ADR 0024;
+procedure and what is covered in [DEPLOY.md](DEPLOY.md#reloading-config)).
+Watch it with:
+
+- Logs: `SIGHUP: reloading config`, then `INFO` lines per change (`tokens
+  changed`, `request limit state updated`, `trusted signing keys changed`,
+  `protected refs changed`, `review rules changed`) listing names and counts,
+  then `config reloaded` with the new `generation`. On failure a single `ERROR`
+  `config reload failed; keeping the previous config` carries the file and the
+  reason. Tokens and digests are never logged.
+- Metrics: `leep_config_reload_total{result}`, `leep_config_generation` and
+  `leep_config_last_reload_timestamp_seconds`. Alert on any `error`, and on
+  generations that differ between servers for longer than a rollout takes.
+- A reload that logs `changed=false` found the files identical to what was
+  running. Check that the file you edited is the file the server was started
+  with (`LEEP_TOKENS_FILE` and friends), and, in a container, that you mounted
+  the directory.
+
+After a failed reload the server is healthy but its config is stale: a token
+you meant to revoke still works. Treat `LeepConfigReloadFailed` as urgent when
+the edit was a revocation. A failed reload never leaves a half-applied config;
+fix the file and send SIGHUP again, or restart (which applies the same checks
+and refuses to start on a bad file). A restart is needed only for flags and
+listeners.
+
+Revocation is immediate for new requests. A request admitted before the swap
+finishes, at most `--request-timeout`; to cut one off sooner, restart.
 
 ## Ref log
 

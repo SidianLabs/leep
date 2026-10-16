@@ -230,6 +230,19 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   on start by default. See `docs/OPERATIONS.md`, "Upgrading".
 - `leep_schema_version` gauge, and `MetaStore::schema_version()` (a provided
   method, so existing implementations keep compiling).
+- Config reload without restart (ADR 0024): SIGHUP re-reads the tokens file
+  (including per-token limits), the signing keys file and the review policy
+  file, so tokens and keys rotate, tokens are revoked and protected refs and
+  review rules change with no downtime. Every file is read and validated first
+  with the startup checks; if any is invalid the old config stays in force and
+  an error is logged, otherwise everything swaps at once. A request finishes
+  under the config it started with, and a `land` uses one policy for its whole
+  duration. Limiter state is kept for tokens whose limits did not change.
+  Flags, listeners and stores still need a restart. New metrics:
+  `leep_config_reload_total{result}`, `leep_config_generation` and
+  `leep_config_last_reload_timestamp_seconds`, with alert examples in
+  `docs/OPERATIONS.md`. There is no reload endpoint and no file watcher.
+- A SIGHUP no longer terminates the server.
 - `leep-server verify` checks a store without writing to it (ADR 0025): every
   ref's history, tree nodes and blobs exist and match their addresses
   (`--rehash` also re-reads blob bytes), the ref log replays to the refs, and
@@ -250,9 +263,25 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   the git import e2e test verify it at the end (`--full --rehash`).
 
 ### Fixes
+- Processes opening a new SQLite metadata file at the same moment (servers
+  starting together, or `migrate` beside a server) no longer fail with
+  "database is locked": switching the file to WAL can report a busy database
+  at once instead of waiting, so opening retries for up to the 30 s busy
+  timeout.
+- `memory_ref_log_race` no longer fails about 1 run in 20: its tasks could
+  create the same changeset and win a CAS that moved nothing, which correctly
+  writes no ref log entry.
 - A `leep init` whose checkout fails part way (server restarting, a bad
   blob) now removes the files it wrote and its `.leep`, so retrying works.
   It used to leave a half-made working copy that refused the retry.
+- The CLI treats a 408 (the server's request timeout) like a lost connection:
+  exit status 2 with advice to run the command again, instead of 1, which
+  means the request was refused. The timeout can cancel a `land` after it
+  moved the ref, so a 408 does not mean it failed; running `leep land` again
+  sends the same changeset, and the server reports the earlier success.
+- The crash test's HTTP agents land the same changeset again after an
+  unanswered land, as a real client does, instead of rebuilding the stack on
+  the new head, which landed it twice when the first land had applied.
 
 ### Project
 - Workspace version set to 0.0.1, with a CI check that keeps it below

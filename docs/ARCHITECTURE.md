@@ -442,7 +442,8 @@ hit ratio are the signals to watch; see [OPERATIONS.md](OPERATIONS.md).
 Authentication is static bearer tokens ([ADR 0007](adr/0007-token-authentication.md)).
 `leep-server --tokens-file <PATH>` (or `LEEP_TOKENS_FILE`) loads a JSON file of
 `{name, role, hash}` entries, where `hash` is `blake3:<hex>` of the token; the
-file is read at startup only. Without it, auth is off and the server warns.
+file is read at startup and on SIGHUP (see Config reload below). Without it,
+auth is off and the server warns.
 With it, an axum middleware requires `Authorization: Bearer <token>` on every
 endpoint except `GET /v1/health`: 401 (with `WWW-Authenticate: Bearer`) when the
 token is missing or unknown, 403 when a `read` token makes a mutating request.
@@ -460,7 +461,7 @@ signatures over `b"leep-changeset-signature-v1\0" ‖ id` are stored as
 attestations beside the changeset (derived kind `signature-v1`, one row per
 changeset and key), and `Changeset` is unchanged. `leep-server
 --signing-keys-file <PATH>` (or `LEEP_SIGNING_KEYS_FILE`) lists trusted keys as
-`{name, public_key: "ed25519:<hex>"}`, read at startup only; signatures by
+`{name, public_key: "ed25519:<hex>"}`, read at startup and on SIGHUP; signatures by
 other keys are refused at `POST /v1/changesets/{id}/signatures` (write token),
 and `GET` re-verifies what it lists. `--require-signatures <REF>` (repeatable,
 `LEEP_REQUIRE_SIGNATURES`) makes `land` onto that ref fail with 400 unless every
@@ -500,18 +501,33 @@ lists verdicts (with `via` for rebased copies), and `leep review ...` and the
 
 **Request path and limits** ([ADR 0020](adr/0020-request-limits.md)). A
 request passes, outermost first, through metrics, tracing, the request timeout,
-the global body cap, authentication (which names the `Principal`), the
-per-principal limiter and then the handler. The limiter is an axum middleware
-(`leep_server::limits`) that exists only when something is configured. For a
-principal with limits it checks the declared body size, takes a token from the
-read or write bucket, and `try_acquire`s a concurrency permit, refusing with
-413 or 429 (never queueing). The permit lives in a guard attached to the
-response body, so it is released when the body ends, the client goes away or
-the timeout drops the request. Token names bound the state; in anonymous mode
-state is keyed by client address in a size-capped table. State is per
-process.
+the global body cap, the config snapshot, authentication (which names the
+`Principal`), the per-principal limiter and then the handler. The limiter is an
+axum middleware (`leep_server::limits`) that does nothing unless the request's
+config has limits. For a principal with limits it checks the declared body
+size, takes a token from the read or write bucket, and `try_acquire`s a
+concurrency permit, refusing with 413 or 429 (never queueing). The permit
+lives in a guard attached to the response body, so it is released when the body
+ends, the client goes away or the timeout drops the request. Token names bound
+the state; in anonymous mode state is keyed by client address in a size-capped
+table. State is per process.
 
-Planned: OIDC or mTLS, per-path signing policy and key rotation, team groups
+**Config reload** ([ADR 0024](adr/0024-config-reload.md)). The tokens, their
+limits, the trusted signing keys, the review service and the composed land
+policy form one immutable `RuntimeConfig` (`leep_server::reload`), held in an
+`ArcSwap`. SIGHUP re-reads the tokens, signing keys and review policy files,
+validates all of them with the startup checks, and swaps in the new config
+only if every file is good; otherwise the old config stays, an error is logged
+and `leep_config_reload_total{result="error"}` counts it. A middleware pins each
+request to the config current on arrival, so authentication, limits and
+handlers agree and a request in flight finishes under the config it started
+with. The land policy is not stored in `Repo`: `land` and raw ref updates run on
+a copy of the repo (`Repo::with_land_policy_replaced`) carrying the request's
+policy, so one land uses one policy throughout. A new limiter keeps the slot of
+every token whose limits did not change. Flags, listeners and stores are not
+reloaded.
+
+Planned: OIDC or mTLS, per-path signing policy, team groups
 and self-approval rules for reviews. See the roadmap.
 
 ## 11. Scaling path

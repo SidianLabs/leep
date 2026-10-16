@@ -9,8 +9,8 @@ write, without committing to an identity system yet.
 
 ## Decision
 - The server loads static bearer tokens from a JSON file given by
-  `--tokens-file` or `LEEP_TOKENS_FILE`. It is read once at startup; changing
-  tokens means restarting (SIGHUP reload is future work).
+  `--tokens-file` or `LEEP_TOKENS_FILE`. It is read at startup and again on
+  SIGHUP (ADR 0024); an invalid file on reload keeps the old tokens.
 - The file holds `blake3:<hex>` digests, never plaintext. Each entry has a
   `name` (unique, logged) and a `role`: `read` or `write`. A file with plaintext
   tokens, bad digests, duplicate names or no tokens fails startup. Tokens are
@@ -35,8 +35,8 @@ write, without committing to an identity system yet.
 
 ## Consequences
 - Simple to operate and audit; no database or external service.
-- Tokens are coarse: two roles, no expiry, no revocation without a restart,
-  and no per-user identity beyond the name.
+- Tokens are coarse: two roles, no expiry, revocation by editing the file and
+  sending SIGHUP (ADR 0024), and no per-user identity beyond the name.
 - Tokens in `.leep/config.json` are plaintext on the client; 0600 limits
   exposure. Without TLS, bearer tokens are visible on the wire, so terminate
   TLS in front of the server.

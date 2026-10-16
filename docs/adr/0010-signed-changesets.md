@@ -40,10 +40,11 @@ would rewrite every hash (FORMATS.md).
   signatures with one lookup per trusted key and re-verifies each on read. No
   per-changeset index is needed. The cost is O(trusted keys) per query.
 - Trusted keys: `--signing-keys-file` / `LEEP_SIGNING_KEYS_FILE`, JSON
-  `{"keys":[{"name","public_key"}]}`, read once at startup like the tokens file
-  (ADR 0007). Unknown fields, malformed or invalid keys, small-order keys,
-  duplicate names or keys, and an empty list fail startup. Changing keys means
-  restarting. A signature by an unlisted key is rejected at submission (400),
+  `{"keys":[{"name","public_key"}]}`, read at startup and on SIGHUP like the
+  tokens file (ADR 0007, ADR 0024). Unknown fields, malformed or invalid keys,
+  small-order keys, duplicate names or keys, and an empty list fail startup
+  and reload (a failed reload keeps the old keys). Changing keys takes effect
+  for the next request. A signature by an unlisted key is rejected at submission (400),
   so only trusted signatures are stored.
 - API (additive, `/v1`): `POST /v1/changesets/{id}/signatures`
   `{public_key, signature}` returns `{key_id, name}` (400 bad signature or
