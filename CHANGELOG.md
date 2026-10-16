@@ -324,6 +324,17 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   derives again on the first path query after the upgrade (or with
   `repair rederive --kind history-tree-v2`), and `repair drop --kind
   history-tree-v1` removes the old rows once no older server is running.
+- `leep-server repack` packs a filesystem blob store (ADR 0029): every live
+  blob and tree node goes into one pack, each file version a zstd delta
+  against the previous version at its path and each tree node against the
+  same directory in the first parent, then after `--fence` (default 10m) the
+  loose copies and old packs are deleted. Safe beside running servers and
+  when killed. The first 3,795 commits of git/git go from 91.2 MB of loose
+  objects to a 3.1 MB pack and a 1.1 MB index. The store reads loose files
+  first, then packs (new `packs/` directory, layout in FORMATS.md); a store
+  without packs behaves as before. GC deletes packed blobs through
+  `packs/tombstones`, and the next repack drops them. Only filesystem stores
+  can be packed so far; backups copy packed blobs as loose ones.
 
 ### Fixes
 - Processes opening a new SQLite metadata file at the same moment (servers

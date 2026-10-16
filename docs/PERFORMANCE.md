@@ -341,6 +341,63 @@ a blame of a rarely changed file in 9 ms. On the full git/git history the same
 first query took 69 minutes inside one request; with warming that work happens
 after an import or restart without anyone waiting on it.
 
+## Packed blobs
+
+`leep-server repack` (ADR 0029) on a copy of the first 3,795 commits of
+git/git (a local Postgres 16, filesystem blobs; 4 vCPU Intel Xeon @ 2.10GHz,
+15 GB RAM, release build), zstd level 9:
+
+| | Bytes |
+|---|---|
+| Loose objects (11,735: 6,791 file versions, 4,944 tree nodes) | 91,168,650 |
+| Pack | 3,100,053 |
+| Index (96 bytes per object) | 1,126,648 |
+| Prototype's pack (ADR 0029), no index | 3.2 MB |
+| `git pack-objects` of the same commits | 4.4 MB |
+
+10,795 objects were stored as deltas and 940 whole; the mean delta chain is 12
+entries (cap 32). The run took 8.4 s: 3.6 s walking history for bases, 4.6 s
+compressing and writing (single-threaded, two compressions per object to pick
+the smaller), 0.2 s deleting the loose copies. `verify --full --rehash`
+reports the packed copy clean in the same 47 s as the loose one (it is
+dominated by checking derived rows).
+
+`get` of 1,000 random objects, one at a time, page cache dropped first
+(`cargo run --release -p leep-store --example blob_read_latency -- <dir> 1000
+<seed>`; two seeds, which agreed within 5%). "First read" is a fresh store;
+"again" reads the same objects from the same store:
+
+| | First read, mean | p50 | p99 | Again, mean |
+|---|---|---|---|---|
+| Loose | 88 us | 76 us | 240-290 us | 44-55 us |
+| Packed | 190 us | 100 us | 0.96-1.1 ms | 35 us |
+| Packed, decoded-object cache off | 230 us | 178 us | 0.8 ms | 187 us |
+
+A first read of a packed object decodes its chain (13 frames on average) and
+checks each against its hash. The store keeps 64 MiB of decoded objects, so
+reading neighbouring versions, or the same object again, skips the chain: with
+the cache off, repeated reads cost as much as first ones. The p99 of first
+reads is the deepest chains plus loading the 1.1 MB index on the first call.
+Two implementation choices mattered: one zstd decoder per thread instead of
+one per frame (first-read mean 340 us before), and reading the loose file and
+the pack in one blocking task (one thread-pool hop per `get`, as for a loose
+store).
+
+Queries through a server over each store (`--warm-interval 0`, derived rows
+already present, server started fresh with the page cache dropped; first
+request, then the median of five more):
+
+| Query | Loose, first / again | Packed, first / again |
+|---|---|---|
+| `GET /v1/log/<head>?limit=1000` | 390-393 / 223-264 ms | 396-470 / 245-268 ms |
+| `GET /v1/blame/<head>?path=Makefile` | 17-21 / 18-19 ms | 26-35 / 14-15 ms |
+| `GET /v1/search/main?q=strbuf_addf` | 35-42 / 20-22 ms | 37 / 17-20 ms |
+
+With indexes derived, these read few blobs, so packing changes them by less
+than the run-to-run noise, except a first blame (about +10 ms; it reads
+file contents, which now come through delta chains).Deriving indexes from
+scratch over a packed store was not measured.
+
 ## Analysis
 
 Principle 5 (cost scales with the change, not the repository) holds for the

@@ -355,8 +355,90 @@ hash or derived encoding changed. Rules:
 
 ## Blob storage layout (leep-store)
 
-- Filesystem: `<root>/<hex[0..2]>/<hex[2..]>`
+- Filesystem: loose objects at `<root>/<hex[0..2]>/<hex[2..]>`, and packs in
+  `<root>/packs/` (below)
 - Object store: `blobs/<hex[0..2]>/<hex[2..]>`
+
+### Packs (filesystem store, ADR 0029)
+
+A pack holds many objects in one immutable file. A store with no `packs/`
+directory reads exactly as before; a store with packs reads loose objects
+first, then packs. Hashes, `TreeNode`, the API and clients do not change.
+
+| Path | Contents |
+|---|---|
+| `packs/<id>.pack` | the entries |
+| `packs/<id>.idx` | the index; its presence publishes the pack |
+| `packs/tombstones` | packed objects deleted by GC |
+| `packs/tombstones.lock`, `packs/repack.lock` | empty files, locked with `flock` |
+| `packs/.tmp-*` | a write in progress, or garbage of a killed repack |
+| `<shard>/.repack-<rest of hex>` | a loose copy a repack moved aside; a whole object |
+
+`<id>` is the lowercase hex BLAKE3 of the whole `.idx` file. All integers are
+big-endian.
+
+**`.pack`**: the 8 bytes `LEEPPAK1`, then the entries back to back with no
+separators or padding. Each entry is one standard zstd frame (with its
+content size, without zstd's checksum), either:
+- *whole*: the object compressed alone; or
+- *delta*: the object compressed with its base object's bytes as a raw-content
+  reference prefix (`zstd --patch-from=<base>`). The base is another entry of
+  the same pack, at a lower offset.
+
+**`.idx`**:
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 8 | magic `LEEPIDX1` |
+| 8 | 8 | record count `n` |
+| 16 | 8 | length of the `.pack` file in bytes |
+| 24 | 32 | BLAKE3 of the whole `.pack` file |
+| 56 | 96 × `n` | records, strictly ascending by hash |
+| 56 + 96`n` | 32 | BLAKE3 of all bytes before it |
+
+Each 96-byte record:
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 32 | object hash (its address in the store) |
+| 32 | 8 | offset of the entry's frame in the `.pack` |
+| 40 | 8 | length of the frame |
+| 48 | 8 | logical (decoded) length of the object |
+| 56 | 32 | base object hash, or 32 zero bytes for a whole entry |
+| 88 | 8 | the object's modification time before it was packed (signed unix seconds) |
+
+A reader checks the magic, the trailing checksum, the order, that every frame
+lies inside the pack, that every base is an earlier entry of the same pack
+(so chains end), and that the `.pack` has the recorded length and magic. It
+decodes a delta chain iteratively (the writer caps chains at 32; readers
+refuse more than 64) and checks every decoded object against its address:
+`BLAKE3(bytes)` for a file blob, `Hash::of_object("tree-v1", bytes)` for a
+tree node. Any failure is `Error::Storage`.
+
+Listings report a packed object with its logical size and the recorded
+modification time, so a packed and an unpacked store list identically (the
+backup copy compares sizes, ADR 0026) and GC's grace window is not reset by a
+repack.
+
+**`tombstones`**: append-only text, one line per deleted packed copy:
+`<pack id hex> <object hash hex>\n`. A final line without its newline (a
+torn append) is ignored, as is any malformed line. A tombstone hides only the
+copy in the pack it names; a loose copy of the same hash is always served.
+Appends and rewrites hold an exclusive lock on `tombstones.lock`; a full
+repack rewrites the file (temp file, fsync, rename) keeping only lines whose
+pack still exists, and removes it when none remain.
+
+**Publishing.** A repack writes `.tmp-*.pack`, fsyncs it, renames it to
+`<id>.pack`, then does the same for `<id>.idx` and fsyncs the directory after
+each rename. The index rename publishes. A `.pack` with no `.idx` is garbage.
+Replaced packs are removed index first.
+
+Golden bytes: `leep-store` asserts a fixed index's bytes and id
+(`pack::tests::index_golden_bytes`), decodes fixed whole and delta frames
+(`frame_golden_bytes_decode`), and reads a pack written by hand from this
+layout (`pack_tests::hand_written_pack_reads`). A new layout needs a new
+magic (`LEEPPAK2`/`LEEPIDX2`) that old readers refuse, and readers must keep
+reading version 1.
 
 ## Garbage collection (no format change)
 

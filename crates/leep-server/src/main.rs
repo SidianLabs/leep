@@ -15,6 +15,7 @@ use tracing_subscriber::fmt::writer::BoxMakeWriter;
 use tracing_subscriber::EnvFilter;
 
 mod backup_cli;
+mod repack_cli;
 mod repair;
 
 #[derive(Parser)]
@@ -174,6 +175,11 @@ enum Cmd {
         #[arg(long, global = true)]
         unsafe_no_fence: bool,
     },
+    /// Pack every live blob and tree node of a filesystem blob store into one
+    /// delta-compressed pack (ADR 0029; uses --meta and --blobs; safe beside
+    /// running servers): write and publish the pack, wait --fence, then
+    /// delete the loose copies and old packs it replaces.
+    Repack(repack_cli::RepackArgs),
     /// Apply pending metadata schema migrations (uses --meta). Safe beside
     /// running servers of the same version; take a backup first.
     Migrate {
@@ -372,6 +378,7 @@ fn run_command(cmd: Cmd) -> anyhow::Result<()> {
             println!("{}", auth::hash_token(&token));
         }
         Cmd::Gc { .. }
+        | Cmd::Repack(_)
         | Cmd::DeriveSearch { .. }
         | Cmd::Migrate { .. }
         | Cmd::Verify(_)
@@ -510,6 +517,7 @@ async fn main() -> anyhow::Result<()> {
             )
             .await
         }
+        Some(Cmd::Repack(r)) => return repack_cli::run_repack(&args.meta, &args.blobs, r).await,
         Some(Cmd::DeriveSearch { rev }) => {
             return run_derive_search(&args.meta, &args.blobs, &rev).await
         }

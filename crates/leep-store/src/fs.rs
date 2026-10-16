@@ -1,102 +1,69 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use leep_core::{BlobMeta, BlobStore, Hash, Result};
+use leep_core::{BlobMeta, BlobStore, Error, Hash, Result};
 use tokio::io::AsyncWriteExt;
 
+use crate::packset::{PackSet, DEFAULT_DECODED_CACHE};
 use crate::storage_err;
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Blobs on the local filesystem at `<root>/<2 hex>/<62 hex>`.
-#[derive(Debug, Clone)]
+/// Blobs on the local filesystem: loose at `<root>/<2 hex>/<62 hex>`, and
+/// packed in `<root>/packs/` once `repack` has run (ADR 0029). New writes are
+/// always loose; reads try the loose file first, then the packs.
+#[derive(Clone)]
 pub struct FsBlobStore {
     root: PathBuf,
+    pub(crate) packs: Arc<PackSet>,
+}
+
+impl std::fmt::Debug for FsBlobStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FsBlobStore")
+            .field("root", &self.root)
+            .finish_non_exhaustive()
+    }
 }
 
 impl FsBlobStore {
+    /// Packs are found on first use, not here, so opening never fails.
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self::with_decoded_cache(root, DEFAULT_DECODED_CACHE)
+    }
+
+    /// Like [`new`](Self::new), with the byte budget for decoded packed
+    /// objects kept to speed up delta chains (0 disables it).
+    pub fn with_decoded_cache(root: impl Into<PathBuf>, bytes: usize) -> Self {
+        let root = root.into();
+        let packs = Arc::new(PackSet::new(&root, bytes));
+        Self { root, packs }
     }
 
     pub fn root(&self) -> &Path {
         &self.root
     }
 
-    fn path_for(&self, hash: &Hash) -> PathBuf {
+    pub(crate) fn path_for(&self, hash: &Hash) -> PathBuf {
         let hex = hash.to_hex();
         self.root.join(&hex[..2]).join(&hex[2..])
     }
-}
 
-/// Refresh the mtime of an existing blob so garbage collection's grace window
-/// counts from the latest upload. Returns false if the blob is absent.
-fn touch(path: &Path) -> std::io::Result<bool> {
-    match std::fs::OpenOptions::new().write(true).open(path) {
-        Ok(f) => {
-            f.set_modified(std::time::SystemTime::now())?;
-            Ok(true)
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(e) => Err(e),
-    }
-}
-
-fn unix_secs(t: std::time::SystemTime) -> Option<i64> {
-    match t.duration_since(std::time::UNIX_EPOCH) {
-        Ok(d) => Some(d.as_secs() as i64),
-        Err(_) => None,
-    }
-}
-
-#[async_trait]
-impl BlobStore for FsBlobStore {
-    async fn put_with_hash(&self, hash: Hash, data: Bytes) -> Result<()> {
-        let path = self.path_for(&hash);
-        if touch(&path).map_err(storage_err)? {
-            return Ok(());
-        }
-        let dir = path.parent().expect("blob path has a parent");
-        tokio::fs::create_dir_all(dir).await.map_err(storage_err)?;
-        let tmp = dir.join(format!(
-            ".tmp-{}-{}",
-            std::process::id(),
-            TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        let res = async {
-            let mut f = tokio::fs::File::create(&tmp).await?;
-            f.write_all(&data).await?;
-            f.sync_all().await?;
-            drop(f);
-            tokio::fs::rename(&tmp, &path).await
-        }
-        .await;
-        if let Err(e) = res {
-            let _ = tokio::fs::remove_file(&tmp).await;
-            return Err(storage_err(e));
-        }
-        Ok(())
-    }
-
-    async fn get(&self, hash: &Hash) -> Result<Option<Bytes>> {
-        match tokio::fs::read(self.path_for(hash)).await {
-            Ok(v) => Ok(Some(v.into())),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(storage_err(e)),
-        }
-    }
-
-    async fn contains(&self, hash: &Hash) -> Result<bool> {
-        tokio::fs::try_exists(self.path_for(hash))
+    async fn blocking<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&PackSet) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let packs = self.packs.clone();
+        tokio::task::spawn_blocking(move || f(&packs))
             .await
-            .map_err(storage_err)
+            .map_err(|e| Error::Storage(format!("pack task failed: {e}")))?
     }
 
-    /// Walks shard directories in order, so a page reads at most the shards
-    /// it needs (each holds about 1/256 of the blobs).
-    async fn list_page(&self, after: Option<Hash>, limit: usize) -> Result<Vec<BlobMeta>> {
+    /// Loose blobs with hash strictly above `after`, at most `limit`.
+    async fn list_loose(&self, after: Option<Hash>, limit: usize) -> Result<Vec<BlobMeta>> {
         let mut out = Vec::new();
         let first_shard = after.map_or(0, |h| h.0[0]);
         for shard in first_shard..=255u8 {
@@ -137,8 +104,127 @@ impl BlobStore for FsBlobStore {
         out.truncate(limit);
         Ok(out)
     }
+}
 
+/// Refresh the mtime of an existing blob so garbage collection's grace window
+/// counts from the latest upload. Returns false if the blob is absent.
+fn touch(path: &Path) -> std::io::Result<bool> {
+    match std::fs::OpenOptions::new().write(true).open(path) {
+        Ok(f) => {
+            f.set_modified(std::time::SystemTime::now())?;
+            Ok(true)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+pub(crate) fn unix_secs(t: std::time::SystemTime) -> Option<i64> {
+    match t.duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => Some(d.as_secs() as i64),
+        Err(_) => None,
+    }
+}
+
+#[async_trait]
+impl BlobStore for FsBlobStore {
+    /// A packed copy does not count: the loose write refreshes `modified`,
+    /// which GC's grace window needs (ADR 0012), and a loose copy also
+    /// outlives a tombstone on the packed one.
+    async fn put_with_hash(&self, hash: Hash, data: Bytes) -> Result<()> {
+        let path = self.path_for(&hash);
+        if touch(&path).map_err(storage_err)? {
+            return Ok(());
+        }
+        let dir = path.parent().expect("blob path has a parent");
+        tokio::fs::create_dir_all(dir).await.map_err(storage_err)?;
+        let tmp = dir.join(format!(
+            ".tmp-{}-{}",
+            std::process::id(),
+            TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let res = async {
+            let mut f = tokio::fs::File::create(&tmp).await?;
+            f.write_all(&data).await?;
+            f.sync_all().await?;
+            drop(f);
+            tokio::fs::rename(&tmp, &path).await
+        }
+        .await;
+        if let Err(e) = res {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(storage_err(e));
+        }
+        Ok(())
+    }
+
+    /// The loose file and the packs are read in one blocking task, so a
+    /// packed read costs one hop to the blocking pool like a loose one.
+    async fn get(&self, hash: &Hash) -> Result<Option<Bytes>> {
+        let path = self.path_for(hash);
+        let hash = *hash;
+        self.blocking(move |p| match std::fs::read(&path) {
+            Ok(v) => Ok(Some(v.into())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => p.get(&hash),
+            Err(e) => Err(storage_err(e)),
+        })
+        .await
+    }
+
+    /// Rereads the tombstones if they changed, so a blob GC deleted from a
+    /// pack in another process is not reported present.
+    async fn contains(&self, hash: &Hash) -> Result<bool> {
+        let path = self.path_for(hash);
+        let hash = *hash;
+        self.blocking(move |p| match path.try_exists() {
+            Ok(true) => Ok(true),
+            Ok(false) => p.contains(&hash),
+            Err(e) => Err(storage_err(e)),
+        })
+        .await
+    }
+
+    /// Loose and packed blobs merged in hash order. Sizes are logical, so a
+    /// packed store lists like an unpacked one (the backup copy compares
+    /// sizes, ADR 0026); `modified` of a packed blob is the time it was last
+    /// written before it was packed.
+    async fn list_page(&self, after: Option<Hash>, limit: usize) -> Result<Vec<BlobMeta>> {
+        let view = self.blocking(|p| p.refresh()).await?;
+        let loose = self.list_loose(after, limit).await?;
+        if view.is_empty() {
+            return Ok(loose);
+        }
+        let mut merged = std::collections::BTreeMap::new();
+        for (pack, dead) in &view.packs {
+            let entries = &pack.index.entries;
+            let from = after.map_or(0, |a| entries.partition_point(|e| e.hash <= a));
+            for e in entries[from..]
+                .iter()
+                .filter(|e| !dead.contains(&e.hash))
+                .take(limit)
+            {
+                let m = BlobMeta {
+                    hash: e.hash,
+                    size: e.len,
+                    modified: Some(e.modified),
+                };
+                merged
+                    .entry(e.hash)
+                    .and_modify(|old: &mut BlobMeta| old.modified = old.modified.max(m.modified))
+                    .or_insert(m);
+            }
+        }
+        for m in loose {
+            merged.insert(m.hash, m);
+        }
+        Ok(merged.into_values().take(limit).collect())
+    }
+
+    /// Tombstones packed copies first, then removes the loose file, so a
+    /// repack that finds the tombstone keeps the loose copy (see `repack`).
     async fn delete(&self, hash: &Hash) -> Result<()> {
+        let h = *hash;
+        self.blocking(move |p| p.tombstone(&h)).await?;
         match tokio::fs::remove_file(self.path_for(hash)).await {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),

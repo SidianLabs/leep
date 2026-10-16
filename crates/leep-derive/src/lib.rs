@@ -18,6 +18,7 @@ pub mod integrity;
 mod land;
 mod merge;
 pub mod owners;
+pub mod pack_order;
 mod path_history;
 mod renames;
 mod repo;

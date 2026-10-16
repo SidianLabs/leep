@@ -1288,13 +1288,19 @@ Postgres cannot write, backups fail (see [LeepBackupStale](#leepbackupstale)).
 3. What GC could reclaim: `leep-server gc --dry-run` (`would condemn: N blobs, B
    bytes`). Only blobs older than `--grace` (24h default) and unreferenced qualify,
    and deletion follows the fence.
-4. Leftover temp files in a filesystem blob store: `find /var/lib/leep/blobs -name
-   '.tmp-*' -mmin +60 -delete` is documented as safe for files older than the request
-   timeout; count them first without `-delete`.
+4. Leftover temp files in a filesystem blob store: `find /var/lib/leep/blobs
+   -path '*/packs' -prune -o -name '.tmp-*' -mmin +60 -print` lists shard temp files
+   older than the request timeout, which are safe to delete (replace `-print` with
+   `-delete` once counted). Leave `packs/` and any `.repack-*` file alone: the
+   next `leep-server repack` cleans those up, and a `.repack-*` file is a whole
+   object it puts back.
 5. Backups: the pool only grows; old snapshot directories are the thing to expire.
 6. Metadata: derived rows dominate (the search index is about 30% of the indexed text
    for source code, up to about 100% for random text); the ref log is never pruned
    but small (tens of MB a year).
+7. Is the store packed? A filesystem store with no `packs/*.pack` keeps one file
+   per object, uncompressed; `leep-server repack` usually shrinks a long history
+   ten to thirty times (OPERATIONS.md, "Packing blobs").
 
 **Likely causes.**
 
@@ -1307,6 +1313,7 @@ Postgres cannot write, backups fail (see [LeepBackupStale](#leepbackupstale)).
    Confirm: growth starts at an event.
 5. Postgres WAL retained by a stuck slot or failing archive. Confirm: step 2.
 6. Leftover `.tmp-*` after crashes. Confirm: step 4.
+7. A filesystem blob store that is never repacked. Confirm: step 7.
 
 **Mitigate / fix**, in this order:
 
@@ -1314,7 +1321,9 @@ Postgres cannot write, backups fail (see [LeepBackupStale](#leepbackupstale)).
    your retention (delete whole directories under `snapshots/`; the pool is shared
    and stays), old logs, and `.tmp-*` older than the request timeout.
 2. Run `leep-server gc`. Space returns after the grace window and the fence, not at
-   once.
+   once. On a filesystem blob store, then run `leep-server repack`: it needs room
+   for the new pack (a fraction of the loose size) before it frees the loose copies,
+   after its fence.
 3. Grow the volume: that is the fix for steady growth. On SQLite, freed pages are
    reused inside the file but the file does not shrink by itself.
 4. Last resort for metadata: `leep-server repair drop --kind blob-trigrams-v1

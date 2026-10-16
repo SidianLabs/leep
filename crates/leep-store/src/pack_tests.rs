@@ -1,0 +1,605 @@
+//! Packed filesystem stores: reads, listings, deletes and repacks, including
+//! repacks killed at every step.
+
+use std::collections::BTreeMap;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+
+use bytes::Bytes;
+use leep_core::memory::check_blob_store_contract;
+use leep_core::{BlobStore, Error, Hash, TreeNode};
+
+use crate::pack::{self, IdxEntry, PackIndex};
+use crate::{FsBlobStore, RepackOptions, RepackReport, RepackStep};
+
+/// Versions of a growing file: each a small edit of the one before.
+fn versions(n: usize) -> Vec<Bytes> {
+    let mut text = String::new();
+    (0..n)
+        .map(|i| {
+            text.push_str(&format!(
+                "line {i}: the quick brown fox jumps over the lazy dog\n"
+            ));
+            Bytes::from(text.clone())
+        })
+        .collect()
+}
+
+/// Each version based on the one before it, as the history walk would say.
+fn chain_hints(hashes: &[Hash]) -> Vec<(Hash, Option<Hash>)> {
+    hashes
+        .iter()
+        .enumerate()
+        .map(|(i, h)| (*h, i.checked_sub(1).map(|p| hashes[p])))
+        .collect()
+}
+
+async fn repack(store: &FsBlobStore, hints: Vec<(Hash, Option<Hash>)>) -> RepackReport {
+    store
+        .repack_publish(hints, RepackOptions::default())
+        .await
+        .unwrap()
+        .finish()
+        .await
+        .unwrap()
+}
+
+fn files_named(root: &Path, pred: impl Fn(&str) -> bool) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if pred(&e.file_name().to_string_lossy()) {
+                out.push(p.display().to_string());
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+fn loose_count(root: &Path) -> usize {
+    files_named(root, |n| {
+        n.len() == 62 && n.bytes().all(|c| c.is_ascii_hexdigit())
+    })
+    .len()
+}
+
+fn pack_ids(root: &Path) -> Vec<String> {
+    crate::packset::published_ids(&root.join("packs")).unwrap()
+}
+
+fn index_of(root: &Path) -> PackIndex {
+    let ids = pack_ids(root);
+    assert_eq!(ids.len(), 1, "one pack");
+    let bytes = std::fs::read(root.join("packs").join(format!("{}.idx", ids[0]))).unwrap();
+    PackIndex::decode(&bytes).unwrap()
+}
+
+async fn list_all(store: &dyn BlobStore, page: usize) -> Vec<leep_core::BlobMeta> {
+    let mut out = Vec::new();
+    let mut after = None;
+    loop {
+        let batch = store.list_page(after, page).await.unwrap();
+        let Some(last) = batch.last() else {
+            return out;
+        };
+        after = Some(last.hash);
+        out.extend(batch);
+    }
+}
+
+#[tokio::test]
+async fn packed_store_passes_the_contract() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FsBlobStore::new(dir.path());
+    check_blob_store_contract(&store).await;
+    let report = repack(&store, Vec::new()).await;
+    assert!(report.objects > 10, "{report:?}");
+    assert_eq!(loose_count(dir.path()), 0, "every loose copy went");
+    // Again on the packed store (its objects are now packed, deletes become
+    // tombstones), and from a second handle as another process would see it.
+    check_blob_store_contract(&store).await;
+    check_blob_store_contract(&FsBlobStore::new(dir.path())).await;
+    repack(&store, Vec::new()).await;
+    check_blob_store_contract(&FsBlobStore::with_decoded_cache(dir.path(), 0)).await;
+}
+
+#[tokio::test]
+async fn quiet_fault_wrapper_passes_the_contract_on_a_packed_store() {
+    use leep_testkit::{FaultPlan, FaultyBlobStore};
+    let dir = tempfile::tempdir().unwrap();
+    let store = FsBlobStore::new(dir.path());
+    check_blob_store_contract(&store).await;
+    repack(&store, Vec::new()).await;
+    let faulty = FaultyBlobStore::new(Arc::new(store), FaultPlan::new(1));
+    check_blob_store_contract(&faulty).await;
+}
+
+#[tokio::test]
+async fn reads_after_repack_equal_the_originals_and_deltas_are_used() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FsBlobStore::new(dir.path());
+    let mut originals: BTreeMap<Hash, Bytes> = BTreeMap::new();
+    let vs = versions(80);
+    let mut chain = Vec::new();
+    for v in &vs {
+        let h = store.put(v.clone()).await.unwrap();
+        originals.insert(h, v.clone());
+        chain.push(h);
+    }
+    // A tree node, an empty blob, a large incompressible-ish blob.
+    let node = TreeNode::default();
+    let node_bytes = Bytes::from(node.encode());
+    store
+        .put_with_hash(node.hash(), node_bytes.clone())
+        .await
+        .unwrap();
+    originals.insert(node.hash(), node_bytes);
+    let empty = store.put(Bytes::new()).await.unwrap();
+    originals.insert(empty, Bytes::new());
+    let big: Vec<u8> = (0..3_000_000u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    let big = Bytes::from(big);
+    originals.insert(store.put(big.clone()).await.unwrap(), big);
+
+    let loose_bytes: u64 = originals.values().map(|b| b.len() as u64).sum();
+    let report = repack(&store, chain_hints(&chain)).await;
+    assert_eq!(report.objects, originals.len() as u64);
+    assert_eq!(report.loose_before, originals.len() as u64);
+    assert_eq!(report.loose_removed, originals.len() as u64);
+    assert_eq!((report.loose_after, report.loose_kept), (0, 0));
+    assert_eq!(report.logical_bytes, loose_bytes);
+    assert!(
+        report.deltas >= 70,
+        "similar versions are deltas: {report:?}"
+    );
+    let versions_bytes: u64 = vs.iter().map(|v| v.len() as u64).sum();
+    assert!(
+        report.pack_bytes < 3_100_000 + versions_bytes / 20,
+        "the versions shrink: {report:?}"
+    );
+    assert_eq!(loose_count(dir.path()), 0);
+
+    // Fresh handle (nothing cached), byte for byte.
+    for s in [
+        FsBlobStore::new(dir.path()),
+        FsBlobStore::with_decoded_cache(dir.path(), 0),
+    ] {
+        for (h, b) in &originals {
+            assert_eq!(s.get(h).await.unwrap().as_ref(), Some(b), "{h}");
+            assert!(s.contains(h).await.unwrap());
+        }
+    }
+    // Chains are capped, and every base precedes its delta.
+    let idx = index_of(dir.path());
+    for e in &idx.entries {
+        let mut depth = 0;
+        let mut cur = *e;
+        while let Some(b) = cur.base {
+            let base = *idx.find(&b).unwrap();
+            assert!(base.offset < cur.offset);
+            cur = base;
+            depth += 1;
+        }
+        assert!(depth <= pack::MAX_CHAIN, "depth {depth}");
+    }
+    assert!(idx.entries.iter().any(|e| e.base.is_some()));
+}
+
+#[tokio::test]
+async fn listing_merges_loose_and_packed_with_logical_sizes() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FsBlobStore::new(dir.path());
+    let mut sizes = BTreeMap::new();
+    for i in 0..30u32 {
+        let b = Bytes::from(format!("packed {i} ").repeat(50 + i as usize));
+        sizes.insert(store.put(b.clone()).await.unwrap(), b.len() as u64);
+    }
+    repack(&store, Vec::new()).await;
+    for i in 0..30u32 {
+        let b = Bytes::from(format!("loose {i}"));
+        sizes.insert(store.put(b.clone()).await.unwrap(), b.len() as u64);
+    }
+    // Packed and loose at once: listed once.
+    store
+        .put(Bytes::from("packed 3 ".repeat(53)))
+        .await
+        .unwrap();
+    let all = list_all(&store, 1000).await;
+    assert!(
+        all.windows(2).all(|w| w[0].hash < w[1].hash),
+        "ascending, no repeats"
+    );
+    let listed: BTreeMap<Hash, u64> = all.iter().map(|m| (m.hash, m.size)).collect();
+    assert_eq!(listed, sizes, "complete, with logical sizes");
+    for page in [1, 3, 7] {
+        assert_eq!(list_all(&store, page).await, all, "page {page}");
+    }
+    let mid = all[29].hash;
+    assert_eq!(store.list_page(Some(mid), 5).await.unwrap(), all[30..35]);
+}
+
+#[tokio::test]
+async fn packed_objects_keep_their_age_and_a_reput_refreshes_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FsBlobStore::new(dir.path());
+    let h = store.put(Bytes::from("old orphan")).await.unwrap();
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(72 * 3600);
+    std::fs::File::options()
+        .write(true)
+        .open(store.path_for(&h))
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+    let want = crate::fs::unix_secs(old);
+    repack(&store, Vec::new()).await;
+    assert_eq!(store.list_page(None, 10).await.unwrap()[0].modified, want);
+    repack(&store, Vec::new()).await;
+    assert_eq!(
+        store.list_page(None, 10).await.unwrap()[0].modified,
+        want,
+        "a second repack does not make it young"
+    );
+    store.put(Bytes::from("old orphan")).await.unwrap();
+    let now = crate::fs::unix_secs(std::time::SystemTime::now()).unwrap();
+    assert!(
+        store.list_page(None, 10).await.unwrap()[0]
+            .modified
+            .unwrap()
+            >= now - 5
+    );
+}
+
+#[tokio::test]
+async fn tombstones_hide_packed_objects_and_a_full_repack_drops_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FsBlobStore::new(dir.path());
+    let vs = versions(10);
+    let mut hashes = Vec::new();
+    for v in &vs {
+        hashes.push(store.put(v.clone()).await.unwrap());
+    }
+    repack(&store, chain_hints(&hashes)).await;
+    // Delete bases of later deltas: the deltas still read.
+    let doomed = [hashes[0], hashes[4], hashes[5]];
+    let other = FsBlobStore::new(dir.path());
+    assert!(other.contains(&hashes[4]).await.unwrap());
+    for h in &doomed {
+        store.delete(h).await.unwrap();
+        store.delete(h).await.unwrap();
+    }
+    for s in [&store, &other] {
+        for (i, h) in hashes.iter().enumerate() {
+            let gone = doomed.contains(h);
+            assert_eq!(s.contains(h).await.unwrap(), !gone, "contains {i}");
+            assert_eq!(s.get(h).await.unwrap().is_none(), gone, "get {i}");
+            if !gone {
+                assert_eq!(s.get(h).await.unwrap().unwrap(), vs[i]);
+            }
+        }
+        let listed: Vec<Hash> = list_all(s, 3).await.iter().map(|m| m.hash).collect();
+        assert_eq!(listed.len(), hashes.len() - doomed.len());
+        assert!(doomed.iter().all(|h| !listed.contains(h)));
+    }
+    // An upload rescuing a deleted blob wins over the tombstone.
+    store.put(vs[5].clone()).await.unwrap();
+    assert_eq!(other.get(&hashes[5]).await.unwrap().unwrap(), vs[5]);
+    assert!(other.contains(&hashes[5]).await.unwrap());
+
+    let report = repack(&store, chain_hints(&hashes)).await;
+    assert_eq!(report.dropped_tombstoned, 2, "{report:?}");
+    assert_eq!(report.objects, 8);
+    assert!(
+        !dir.path().join("packs/tombstones").exists(),
+        "no tombstones refer to the new pack"
+    );
+    for s in [&store, &other, &FsBlobStore::new(dir.path())] {
+        for (i, h) in hashes.iter().enumerate() {
+            let gone = doomed.contains(h) && *h != hashes[5];
+            assert_eq!(s.get(h).await.unwrap().is_none(), gone, "after repack {i}");
+        }
+    }
+    assert_eq!(index_of(dir.path()).entries.len(), 8);
+}
+
+#[tokio::test]
+async fn a_corrupt_pack_entry_is_a_storage_error_not_wrong_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FsBlobStore::new(dir.path());
+    let vs = versions(4);
+    let mut hashes = Vec::new();
+    for v in &vs {
+        hashes.push(store.put(v.clone()).await.unwrap());
+    }
+    repack(&store, chain_hints(&hashes)).await;
+    let idx = index_of(dir.path());
+    let id = &pack_ids(dir.path())[0];
+    let path = dir.path().join("packs").join(format!("{id}.pack"));
+    let mut bytes = std::fs::read(&path).unwrap();
+    // Damage the payload of the first version, the base of all others.
+    let e = idx.find(&hashes[0]).unwrap();
+    let at = (e.offset + e.stored_len - 2) as usize;
+    bytes[at] ^= 0x40;
+    std::fs::write(&path, &bytes).unwrap();
+    let fresh = FsBlobStore::with_decoded_cache(dir.path(), 0);
+    for h in &hashes {
+        match fresh.get(h).await {
+            Err(Error::Storage(msg)) => assert!(msg.contains("corrupt"), "{msg}"),
+            other => panic!("expected a storage error, got {other:?}"),
+        }
+    }
+    // A damaged index is refused too.
+    let idx_path = dir.path().join("packs").join(format!("{id}.idx"));
+    let mut ib = std::fs::read(&idx_path).unwrap();
+    ib[60] ^= 1;
+    std::fs::write(&idx_path, &ib).unwrap();
+    assert!(matches!(
+        FsBlobStore::new(dir.path()).get(&hashes[1]).await,
+        Err(Error::Storage(_))
+    ));
+}
+
+/// A pack written by hand from the layout in docs/FORMATS.md: a raw-block
+/// zstd frame and a delta frame against it. Readers must keep reading it.
+#[tokio::test]
+async fn hand_written_pack_reads() {
+    let base = b"the quick brown fox jumps over the lazy dog".repeat(4);
+    let mut data = base.clone();
+    data.extend_from_slice(b" and again");
+    let mut whole = vec![0x28, 0xb5, 0x2f, 0xfd, 0x20, 0xac, 0x61, 0x05, 0x00];
+    whole.extend_from_slice(&base);
+    let delta: &[u8] = &[
+        0x28, 0xb5, 0x2f, 0xfd, 0x20, 0xb6, 0x8d, 0x00, 0x00, 0x50, 0x20, 0x61, 0x6e, 0x64, 0x20,
+        0x61, 0x67, 0x61, 0x69, 0x6e, 0x01, 0x00, 0x29, 0x47, 0x29, 0x20,
+    ];
+    let mut packfile = b"LEEPPAK1".to_vec();
+    packfile.extend_from_slice(&whole);
+    packfile.extend_from_slice(delta);
+    let (hb, hd) = (Hash::of_blob(&base), Hash::of_blob(&data));
+    let mut entries = vec![
+        IdxEntry {
+            hash: hb,
+            offset: 8,
+            stored_len: whole.len() as u64,
+            len: base.len() as u64,
+            base: None,
+            modified: 1_000,
+        },
+        IdxEntry {
+            hash: hd,
+            offset: 8 + whole.len() as u64,
+            stored_len: delta.len() as u64,
+            len: data.len() as u64,
+            base: Some(hb),
+            modified: 2_000,
+        },
+    ];
+    entries.sort_by_key(|e| e.hash);
+    let idx = PackIndex {
+        pack_len: packfile.len() as u64,
+        pack_hash: *blake3::hash(&packfile).as_bytes(),
+        entries,
+    }
+    .encode();
+    let id = pack::pack_id(&idx);
+    let dir = tempfile::tempdir().unwrap();
+    let packs = dir.path().join("packs");
+    std::fs::create_dir_all(&packs).unwrap();
+    std::fs::write(packs.join(format!("{id}.pack")), &packfile).unwrap();
+    std::fs::write(packs.join(format!("{id}.idx")), &idx).unwrap();
+    let store = FsBlobStore::new(dir.path());
+    assert_eq!(store.get(&hd).await.unwrap().unwrap(), data);
+    assert_eq!(store.get(&hb).await.unwrap().unwrap(), base);
+    let listed = store.list_page(None, 10).await.unwrap();
+    assert_eq!(listed.len(), 2);
+    assert!(listed.iter().all(|m| m.modified.is_some()));
+    // The writer produces the same layout.
+    let report = repack(&store, vec![(hb, None), (hd, Some(hb))]).await;
+    assert_eq!((report.objects, report.deltas), (2, 1));
+    let written =
+        std::fs::read(packs.join(format!("{}.pack", report.pack_id.as_ref().unwrap()))).unwrap();
+    assert_eq!(&written[..8], b"LEEPPAK1");
+    assert_eq!(index_of(dir.path()).find(&hd).unwrap().modified, 2_000);
+}
+
+#[tokio::test]
+async fn a_second_repack_waits_for_the_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FsBlobStore::new(dir.path());
+    store.put(Bytes::from("x")).await.unwrap();
+    let first = store
+        .repack_publish(Vec::new(), RepackOptions::default())
+        .await
+        .unwrap();
+    let second = store
+        .repack_publish(Vec::new(), RepackOptions::default())
+        .await;
+    assert!(
+        matches!(second, Err(Error::Conflict(_))),
+        "{:?}",
+        second.err()
+    );
+    first.finish().await.unwrap();
+    repack(&store, Vec::new()).await;
+}
+
+/// A world with a pack, newer loose objects, a deleted packed object and one
+/// rescued by a later upload, so every kind of source is in play.
+struct World {
+    live: BTreeMap<Hash, Bytes>,
+    gone: Vec<Hash>,
+    hints: Vec<(Hash, Option<Hash>)>,
+}
+
+async fn build_world(store: &FsBlobStore) -> World {
+    let vs = versions(24);
+    let mut hashes = Vec::new();
+    let mut live = BTreeMap::new();
+    for v in &vs[..16] {
+        let h = store.put(v.clone()).await.unwrap();
+        hashes.push(h);
+        live.insert(h, v.clone());
+    }
+    repack(store, chain_hints(&hashes)).await;
+    for v in &vs[16..] {
+        let h = store.put(v.clone()).await.unwrap();
+        hashes.push(h);
+        live.insert(h, v.clone());
+    }
+    let gone = vec![hashes[2], hashes[3]];
+    for h in &gone {
+        store.delete(h).await.unwrap();
+        live.remove(h);
+    }
+    store.delete(&hashes[7]).await.unwrap();
+    store.put(vs[7].clone()).await.unwrap();
+    World {
+        live,
+        gone,
+        hints: chain_hints(&hashes),
+    }
+}
+
+async fn check_world(root: &Path, w: &World, what: &str) {
+    let store = FsBlobStore::with_decoded_cache(root, 0);
+    for (h, b) in &w.live {
+        assert_eq!(store.get(h).await.unwrap().as_ref(), Some(b), "{what}: {h}");
+        assert!(store.contains(h).await.unwrap(), "{what}");
+    }
+    for h in &w.gone {
+        assert!(
+            store.get(h).await.unwrap().is_none(),
+            "{what}: {h} stays gone"
+        );
+    }
+    let listed: Vec<Hash> = list_all(&store, 5).await.iter().map(|m| m.hash).collect();
+    assert_eq!(listed, w.live.keys().copied().collect::<Vec<_>>(), "{what}");
+}
+
+/// Abort a repack at each step, as a kill there would leave it, then check
+/// every object reads, and that the next repack cleans up and succeeds.
+#[tokio::test]
+async fn a_repack_killed_at_any_step_leaves_a_readable_store() {
+    let steps = [
+        RepackStep::Started,
+        RepackStep::Wrote(1),
+        RepackStep::Wrote(10),
+        RepackStep::PackSynced,
+        RepackStep::PackRenamed,
+        RepackStep::IndexSynced,
+        RepackStep::Published,
+        RepackStep::RemovingLoose(1),
+        RepackStep::LooseMovedAside(1),
+        RepackStep::LooseMovedAside(5),
+        RepackStep::OldPacksRemoved,
+        RepackStep::TombstonesRewritten,
+    ];
+    for kill_at in steps {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsBlobStore::new(dir.path());
+        let w = build_world(&store).await;
+        check_world(dir.path(), &w, "before").await;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let opts = RepackOptions {
+            hook: Some(Arc::new(move |s| {
+                log.lock().unwrap().push(s);
+                if s == kill_at {
+                    Err(Error::Storage(format!("killed at {s:?}")))
+                } else {
+                    Ok(())
+                }
+            })),
+            ..RepackOptions::default()
+        };
+        let res = match store.repack_publish(w.hints.clone(), opts).await {
+            Ok(p) => p.finish().await.map(|_| ()),
+            Err(e) => Err(e),
+        };
+        assert!(res.is_err(), "{kill_at:?} was reached");
+        assert!(seen.lock().unwrap().contains(&kill_at));
+        let what = format!("killed at {kill_at:?}");
+        check_world(dir.path(), &w, &what).await;
+
+        let report = repack(&store, w.hints.clone()).await;
+        check_world(dir.path(), &w, &format!("{what}, repacked")).await;
+        assert_eq!(pack_ids(dir.path()).len(), 1, "{what}");
+        assert_eq!(report.objects, w.live.len() as u64, "{what}");
+        let junk = files_named(dir.path(), |n| {
+            n.starts_with(".tmp-") || n.starts_with(".repack-")
+        });
+        assert!(junk.is_empty(), "{what}: {junk:?}");
+        assert_eq!(loose_count(dir.path()), 0, "{what}");
+        assert!(!dir.path().join("packs/tombstones").exists(), "{what}");
+    }
+}
+
+/// GC deleting objects while a repack runs: what it deleted stays deleted,
+/// and an upload that rescues a deleted blob keeps its loose copy.
+#[tokio::test]
+async fn deletes_during_a_repack_stay_deleted() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FsBlobStore::new(dir.path());
+    let w = build_world(&store).await;
+    let victims: Vec<Hash> = w.live.keys().take(3).copied().collect();
+    let gc = FsBlobStore::new(dir.path());
+    let published = store
+        .repack_publish(w.hints.clone(), RepackOptions::default())
+        .await
+        .unwrap();
+    // After publish, before the fence ends: GC deletes, and one victim is
+    // uploaded again.
+    for h in &victims {
+        gc.delete(h).await.unwrap();
+    }
+    gc.put(w.live[&victims[0]].clone()).await.unwrap();
+    published.finish().await.unwrap();
+    let fresh = FsBlobStore::new(dir.path());
+    assert_eq!(
+        fresh.get(&victims[0]).await.unwrap().unwrap(),
+        w.live[&victims[0]]
+    );
+    for h in &victims[1..] {
+        assert!(fresh.get(h).await.unwrap().is_none());
+        assert!(!fresh.contains(h).await.unwrap());
+    }
+    // A delete while the pack was being written (simulated by deleting from
+    // the hook just before publish).
+    let gc2 = gc.clone();
+    let victim = *w.live.keys().nth(5).unwrap();
+    let opts = RepackOptions {
+        hook: Some(Arc::new(move |s| {
+            if s == RepackStep::IndexSynced {
+                let gc = gc2.clone();
+                std::thread::spawn(move || {
+                    tokio::runtime::Builder::new_current_thread()
+                        .build()
+                        .unwrap()
+                        .block_on(gc.delete(&victim))
+                })
+                .join()
+                .unwrap()?;
+            }
+            Ok(())
+        })),
+        ..RepackOptions::default()
+    };
+    let r = store
+        .repack_publish(w.hints.clone(), opts)
+        .await
+        .unwrap()
+        .finish()
+        .await
+        .unwrap();
+    assert_eq!(r.late_tombstones, 1, "{r:?}");
+    assert!(FsBlobStore::new(dir.path())
+        .get(&victim)
+        .await
+        .unwrap()
+        .is_none());
+}

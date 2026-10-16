@@ -70,9 +70,9 @@ content-addressing and (b) the atomicity of `MetaStore::cas_ref`.
 | Crate | Role | May depend on |
 |---|---|---|
 | `leep-core` | Types, hashing, encoding, `BlobStore`/`MetaStore` traits (including listing and blob deletion for GC, and listing and dropping derived rows by kind for repair), in-memory stores, conformance tests, API types, pure rename detection | no other leep crate; no I/O, no async runtime |
-| `leep-store` | `BlobStore` backends: filesystem, `object_store` (S3/MinIO), `CachedBlobStore`, `open_blob_store(url)`, and the incremental blob copy backup and restore use (`sync`, ADR 0026) | core |
+| `leep-store` | `BlobStore` backends: filesystem (loose objects plus delta-compressed packs and the repack writer, ADR 0029), `object_store` (S3/MinIO), `CachedBlobStore`, `open_blob_store(url)`, and the incremental blob copy backup and restore use (`sync`, ADR 0026) | core |
 | `leep-meta` | `MetaStore` backends: SQLite, Postgres, `open_meta_store(url)`, the versioned schema migrator (`migrate`, ADR 0023), and metadata snapshots and their import (`snapshot`, ADR 0026) | core |
-| `leep-derive` | `Repo`: derived data framework and kinds, plus all operations, blob garbage collection (`gc`) and store verification and repair (`integrity`) | core (traits only, never a concrete backend) |
+| `leep-derive` | `Repo`: derived data framework and kinds, plus all operations, blob garbage collection (`gc`), the delta-base walk for `repack` (`pack_order`) and store verification and repair (`integrity`) | core (traits only, never a concrete backend) |
 | `leep-server` | HTTP server binary `leep-server`, and its offline subcommands (`gc`, `migrate`, `verify`, `repair`, `backup`, `restore`, `backup-verify`) | core, store, meta, derive |
 | `leep-cli` | Client binary `leep` | core only |
 | `leep-mcp` | MCP server binary `leep-mcp` for AI agents (stdio JSON-RPC; talks to `leep-server` over HTTP) | core and the `leep-cli` library (its HTTP client); never derive, store, meta or server outside dev-dependencies |
@@ -398,7 +398,23 @@ client ~/.cache/leep/objects   (per machine, shared by all jobs on it)
       → durable BlobStore      (S3 / MinIO / filesystem)
 ```
 All three tiers are safe without invalidation, because keys are content
-hashes. Planned: a regional cache tier, the same server binary in a
+hashes.
+
+The filesystem store has two layers of its own (ADR 0029):
+
+```
+FsBlobStore.get(hash)
+   → loose file <root>/<2 hex>/<62 hex>          (every new write lands here)
+   → packs/*.idx  (in memory: hash → pack, offset, base; minus tombstones)
+        → decoded-object cache (64 MiB, per store) → delta chain in the .pack
+```
+`leep-server repack` moves loose objects into a pack: a file version is
+stored as a zstd delta against the previous version at its path, a tree node
+against the same directory in the first parent, chains capped at 32. A read
+decodes the chain iteratively and checks the result against its hash. GC
+deletes a packed object by appending a tombstone; the next full repack leaves
+it out. A store reads a pack published by another process on its next miss
+(it rescans `packs/` before answering "absent"). Planned: a regional cache tier, the same server binary in a
 read-through mode against an upstream server. Strict tiering means a cold
 regional cache cannot stampede the origin. The server's cache reports hits,
 misses and occupancy as Prometheus metrics (see [OPERATIONS.md](OPERATIONS.md)).
@@ -442,6 +458,7 @@ misses and occupancy as Prometheus metrics (see [OPERATIONS.md](OPERATIONS.md)).
 | Backup taken while servers and GC run | The metadata snapshot is one instant; blobs are copied after it, and a blob the snapshot needs cannot have been deleted (ADR 0012), so the backup restores. A backup whose check finds a missing blob is sealed as failed, exits 1, and `restore` refuses it | Alert on `leep_backup_last_run_ok` and the last-success age; take another backup (ADR 0026) |
 | Disk, volume or database lost | Everything since the last backup's snapshot instant | `leep-server restore` into fresh stores, `verify --full --rehash`, start servers (OPERATIONS.md, "Backup and restore") |
 | `gc` killed at any point | Rows it wrote are harmless (a condemned blob is re-uploaded on demand, an announced delete is closed by the next collect); no reachable blob was deleted | Run `gc collect` again |
+| `repack` killed at any point | Before the index rename nothing is published (temp files and an index-less pack are garbage); after it every object is in the new pack and perhaps also loose, moved aside, or in an old pack. Every object reads throughout | Run `repack` again: it deletes the garbage, puts moved-aside copies back and finishes |
 
 **What each backend guarantees.** "Applied" means durable against a process
 kill; the SQL backends and the filesystem store also survive power loss
@@ -453,6 +470,7 @@ except where noted.
 | SQLite (WAL, synchronous FULL) | One transaction per call; `cas_ref_logged` changes the ref and appends its log entry in one | The open transaction rolls back (the next writer sees nothing of it); a committed one is durable | Only when the error is raised while `COMMIT` is in flight; the caller must treat any `cas_ref` error as unknown |
 | Postgres | Same, one transaction per call, plus an advisory lock for log order | The server drops the connection, Postgres rolls the transaction back; committed work stays | Connection lost after `COMMIT` was sent: the commit may have applied |
 | Filesystem blobs | Write a temp file, fsync it, rename it into place | A blob is never visible partly written; a crash before the rename leaves a `.tmp-*` file that is never listed, read or counted as the blob and never removed (safe to delete when older than the request timeout). The shard directory is not fsynced, so power loss (not a kill) can lose the rename of a put that was acknowledged | A put that errors after the rename leaves a whole blob; repeating it is a no-op |
+| Filesystem packs | A pack is published by renaming its fsynced index into place after its fsynced pack file, fsyncing `packs/` after each; a delete of a packed object is one fsynced tombstone line | Nothing partial is ever read: an unpublished pack has no index, and a torn tombstone line is ignored. Loose copies and replaced packs are deleted only after the fence, so a reader that listed the old layout still finds every object | A delete that errors after its tombstone was written has deleted; repeating it is a no-op |
 | Object store (S3) | One PUT | No partial objects | Same as above |
 | `CachedBlobStore` | None (memory) | Gone with the process | A failed put or read caches nothing; a deleted blob can be served from the cache until evicted, which is harmless because only unreferenced blobs are deleted |
 
@@ -578,7 +596,9 @@ implementation. Nothing above the traits changes.
 
 Storage is the cost that grows fastest with history: every blob and tree
 node is stored whole, so imported git/git takes 8.7 GB of objects against a
-0.33 GB git pack. ADR 0029 adds packs below `BlobStore`: a
-`repack` job stores objects as zstd deltas against the previous version of
-the same path, with no change to hashes, the API or clients (a prototype
-packed the first 3,795 commits into 3.2 MB against git's 4.4 MB).
+0.33 GB git pack. ADR 0029 adds packs below `BlobStore`: `leep-server
+repack` stores objects as zstd deltas against the previous version of the
+same path, with no change to hashes, the API or clients. The filesystem
+store has them (the first 3,795 commits of git/git: 91.2 MB loose, a 3.1 MB
+pack plus a 1.1 MB index, against git's 4.4 MB pack); the object store
+backend and incremental repacks are next.
