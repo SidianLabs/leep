@@ -24,6 +24,7 @@ every runbook.
 | Alert | Severity | Fires when |
 |---|---|---|
 | [LeepServerDown](#leepserverdown) | page | a server's metrics endpoint has not been scrapable for 2 minutes |
+| [LeepNotReady](#leepnotready) | page | `GET /v1/ready` reported a store down for 5 minutes |
 | [LeepServerErrors](#leepservererrors) | page | more than 1% of requests answer 5xx for 5 minutes |
 | [LeepLandErrors](#leeplanderrors) | page | `POST /v1/land` answered 5xx in the last 10 minutes |
 | [LeepLandExhausted](#leeplandexhausted) | ticket | a land lost the ref compare-and-swap on all 32 attempts |
@@ -34,7 +35,7 @@ every runbook.
 | [LeepBroadThrottling](#leepbroadthrottling) | ticket | more than 5% of all requests are 429 for 15 minutes |
 | [LeepBlobCacheColdHitRatio](#leepblobcachecoldhitratio) | ticket | blob cache hit ratio below 50% for 30 minutes |
 | [LeepConfigReloadFailed](#leepconfigreloadfailed) | page | a SIGHUP reload was refused |
-| [LeepConfigGenerationSkew](#leepconfiggenerationskew) | ticket | servers report different config generations for 15 minutes |
+| [LeepConfigSkew](#leepconfigskew) | ticket | servers report different config fingerprints for 15 minutes |
 | [LeepSchemaVersionSkew](#leepschemaversionskew) | ticket | servers report different schema versions for 1 hour |
 | [LeepMixedVersions](#leepmixedversions) | ticket | servers report different `version` for 2 hours |
 | [LeepBackupStale](#leepbackupstale) | ticket | no backup has passed its check for 2 days (or ever) |
@@ -113,9 +114,17 @@ compose stack does not enable it). To look at one server by hand:
 `curl -s http://127.0.0.1:9187/metrics | grep '^leep_'`. Queries below use
 Prometheus syntax; add `by (instance)` to see one server.
 
-**Health check.** `GET /v1/health` answers `"ok"` whenever the process is
-serving HTTP. It does not touch the metadata or blob store, so an `"ok"` with
-failing requests means a store problem, not a dead server.
+**Liveness and readiness.** `GET /v1/health` is liveness: it answers `"ok"`
+whenever the process is serving HTTP and touches no store, so an `"ok"` with
+failing requests means a store problem, not a dead server. `GET /v1/ready` is
+readiness: it reads one ref from the metadata store and asks the blob store
+about one fixed hash, concurrently, each under `--ready-timeout` (default 2 s).
+It answers 200 `{"status":"ready"}`, or 503 with the failed store named:
+`{"status":"not ready","failed":[{"store":"meta","reason":"timed out after
+2000ms"}]}` (`reason` is `unavailable` or a timeout, never the driver's
+message; that is in the server log as `readiness check failed`). Neither needs
+a token or counts against limits. Restart on liveness, take out of rotation on
+readiness.
 
 ## Collecting a bug report
 
@@ -160,7 +169,9 @@ corrupted: servers keep no durable state of their own.
 
 1. Is the API up? `curl -fsS http://HOST:7070/v1/health` should print `"ok"`.
    API up and metrics down points at the metrics listener or the network path
-   to it (step 4); API down points at the process (steps 2 and 3).
+   to it (step 4); API down points at the process (steps 2 and 3). `curl -s
+   http://HOST:7070/v1/ready` says whether it can also reach its stores; a 503
+   there is [LeepNotReady](#leepnotready), not a dead process.
 2. Is the process running, and why did it stop? `docker compose -f
    deploy/docker-compose.yml ps`, `docker inspect -f '{{.State.OOMKilled}}
    {{.State.ExitCode}}' CONTAINER`, `systemctl status leep`. A container that
@@ -219,13 +230,79 @@ corrupted: servers keep no durable state of their own.
 the failed restart, `dmesg` lines, the `leep-server --version`, and the
 [standard bundle](#collecting-a-bug-report).
 
+
+## LeepNotReady
+
+**Meaning.** `GET /v1/ready` has reported a store as failing or too slow for 5
+minutes (`leep_ready_checks_total{result!="ok"}` rose, labelled with the `store`:
+`meta` or `blobs`). **Page.** The server is running (liveness, `/v1/health`, is
+fine) but cannot reach its metadata store (the readiness check reads one ref) or
+its blob store (it asks about one fixed hash), within `--ready-timeout` (default
+2 s). The counter only moves when something probes the endpoint, so this alert
+needs an orchestrator or load balancer that calls `/v1/ready` (see
+[DEPLOY.md](DEPLOY.md#probes)); without one it never fires, and
+[LeepServerErrors](#leepservererrors) is the signal.
+
+**Impact.** Requests to that server that need the failing store return 500 (see
+[LeepServerErrors](#leepservererrors)), or hang until `--request-timeout`. A
+readiness probe takes the server out of rotation, so with every server affected
+there is nothing left to serve. Nothing is corrupted: the check only reads.
+
+**Diagnose.**
+
+1. Ask the server: `curl -si http://HOST:7070/v1/ready`. 200 means it recovered; a
+   503 body names the store and says `unavailable` (the call failed) or `timed
+   out after Nms` (it hung). The driver's own message is in the log as `WARN
+   readiness check failed` with `store=` and `error=` (or `readiness check timed
+   out`); it can name a host, so read it there, not in the response.
+2. Which store, and how many servers: `sum by (instance, store, result)
+   (increase(leep_ready_checks_total{result!="ok"}[5m]))`. One server only points
+   at that host's network path or its local disk; all servers point at the shared
+   store.
+3. `meta`: Postgres up and accepting connections (`pg_isready`), connection slots
+   (`SELECT count(*) FROM pg_stat_activity` against `max_connections`; each server
+   holds a pool of 16), locks and long transactions, disk full. SQLite: the file
+   is on local disk with space and not locked by a long job (`database is locked`).
+4. `blobs`: filesystem mounted and not read-only (`df -h`, `touch` as the server's
+   user), or for S3, the bucket, endpoint, credentials and clock skew.
+5. `timeout` rather than `error`: the store is up but slow or saturated. Look at
+   `leep_http_request_duration_seconds` and the store's own load. If the store
+   is merely slow under load and the 2 s default is too tight, raise
+   `--ready-timeout` (`LEEP_READY_TIMEOUT`); do not raise it to hide a stall.
+
+**Likely causes.**
+
+1. The metadata store is down, restarting or out of connections. Confirm: `meta`
+   in the 503 body, step 3.
+2. The blob volume or bucket is unavailable, unmounted or has bad credentials.
+   Confirm: `blobs` in the 503 body, step 4.
+3. A network partition between this server and a store. Confirm: only some
+   servers fail; the store is fine from elsewhere.
+4. A saturated store answering slowly. Confirm: `timeout` results and high
+   latencies on every route.
+
+**Mitigate / fix.**
+
+- Fix the store; the server needs no restart. The next probe after the store
+  answers returns 200 and the orchestrator puts it back.
+- Do not restart the Leep servers for this: they hold no durable state and the
+  problem is not in them. Do not point liveness at `/v1/ready`: a database blip
+  would then restart every server at once.
+- With several servers and only one failing, leave it out of rotation and fix its
+  path to the store.
+
+**Escalate / collect.** The 503 body, the `readiness check failed` log lines, the
+store's own logs for the same minutes, and the
+[standard bundle](#collecting-a-bug-report).
+
 ## LeepServerErrors
 
 **Meaning.** More than 1% of HTTP requests answered 5xx for 5 minutes. **Page.**
 Leep returns 500 only when a store call or an internal step fails
 (`Storage`, `Encoding` and `Other` errors); user mistakes are 400, 404 and 409,
-and neither those nor 408 and 429 count here. `GET /v1/health` is in the
-denominator, so a busy probe dilutes the ratio.
+and neither those nor 408 and 429 count here. `GET /v1/health` and
+`GET /v1/ready` are in the denominator, so busy probes dilute the ratio, and a
+failing `/v1/ready` (503) counts as a 5xx.
 
 **Impact.** Agents see failed commits, lands and reads; the CLI prints the
 server's message and exits 2. Writes are idempotent, so retrying is safe, but
@@ -245,7 +322,8 @@ retries will keep failing until the cause is fixed.
    connection` (Postgres pool of 16 connections per server exhausted),
    `database is locked` (SQLite, after its 30 s busy timeout), `database or disk is
    full`, `No space left on device`, connection refused or reset, S3 errors.
-3. Are the stores healthy? Postgres: `pg_isready`, `SELECT count(*) FROM
+3. Are the stores healthy? `curl -s http://HOST:7070/v1/ready` names the store
+   that does not answer. Postgres: `pg_isready`, `SELECT count(*) FROM
    pg_stat_activity` against `max_connections`, locks and long transactions.
    SQLite: the file is on local disk (WAL needs it), disk has space. Blobs:
    `df -h` and permissions on the directory, bucket reachability and
@@ -713,9 +791,9 @@ refuses to start on the bad file.
    it (step 4), then `kill -HUP "$(pidof leep-server)"` (or `docker kill
    --signal=HUP leep`, or `docker compose kill -s HUP leep-server`) on every
    instance.
-3. Confirm per instance: `config reloaded` with a higher `generation`,
-   `leep_config_generation` increased, and `leep_config_last_reload_timestamp_seconds`
-   is recent. Try the revoked token (`LEEP_TOKEN=... leep refs`) and expect an authentication
+3. Confirm per instance: `config reloaded` with a higher `generation` and, if
+   you changed the file, a new `fingerprint` (also `leep_config_info == 1` for
+   that fingerprint), and `leep_config_last_reload_timestamp_seconds` is recent. Try the revoked token (`LEEP_TOKEN=... leep refs`) and expect an authentication
    error (401).
 4. Do not restart the server to "pick up" a bad file; do not edit flags expecting
    SIGHUP to apply them (listeners, stores, cache size, request timeout, size and
@@ -724,52 +802,80 @@ refuses to start on the bad file.
 **Escalate / collect.** The full `config reload failed` line, the file with
 digests and keys removed, and the [standard bundle](#collecting-a-bug-report).
 
-## LeepConfigGenerationSkew
+<a id="leepconfiggenerationskew"></a>
 
-**Meaning.** The servers report different `leep_config_generation` values for 15
-minutes. **Ticket.** The generation is a per-process counter: 1 at startup, plus one
-for every successful reload, **even when the files did not change**
-(`config reloaded ... changed=false` still advances it). So it detects "a SIGHUP did
-not reach everyone", but it also differs after any single restart (the restarted
-server is back at 1) and it can never prove that two servers run the same files.
+## LeepConfigSkew
 
-**Impact.** If a reload really missed a server, it still serves old tokens, keys or
-review rules: a revoked token may still work there, and the same land can be
-accepted by one server and refused by another.
+Replaces `LeepConfigGenerationSkew`, which compared `leep_config_generation`. That
+counter is per process (1 at startup, +1 per reload even with no change), so the
+old alert fired after any single restart although every server ran the same
+config. If your rules still use the old name, replace the rule with
+`LeepConfigSkew` from [OPERATIONS.md](OPERATIONS.md#suggested-alerts).
+
+**Meaning.** For 15 minutes the servers have exported more than one
+`leep_config_info` fingerprint set to 1, so they are not all running the same
+config. **Ticket.** The fingerprint is a hash of the parsed config (tokens and
+their limits, trusted signing keys, the review policy, the
+`--require-signatures` and review ref sets, and the server-wide limit defaults).
+It is the same on servers with the same content, whatever their uptime, file
+formatting or entry order, and it changes when any of that content changes. A
+restart, or a reload that finds nothing new, does not move it.
+
+**Impact.** One or more servers are enforcing different tokens, keys, limits or
+protected refs than the rest: a revoked token may still work on one, and the
+same land can be accepted by one server and refused by another.
 
 **Diagnose.**
 
-1. `leep_config_generation` and `leep_config_last_reload_timestamp_seconds` per
-   instance.
-2. Per instance log: `SIGHUP: reloading config` followed by `config reloaded
-   generation=N changed=...`, or an ERROR (then it is also
-   [LeepConfigReloadFailed](#leepconfigreloadfailed)). Look for a start-up line
-   (`leep-server listening`) after the last reload: a restart.
-3. The files themselves: `sha256sum` of the tokens, keys and policy files on every
-   host or mount. This is the real comparison.
+1. Which servers disagree: `count by (fingerprint) (leep_config_info == 1)` and,
+   per server, `leep_config_info == 1` (the `fingerprint` label; add `by
+   (instance)`). The fingerprints are also in each server's log: `config loaded`
+   at startup and `config reloaded ... fingerprint=... previous_fingerprint=...`
+   after each SIGHUP. The odd one out is usually the lone server or the minority.
+2. Per instance, did it reload? `leep_config_last_reload_timestamp_seconds`, and
+   the log: `SIGHUP: reloading config` then `config reloaded`, or an ERROR (then
+   it is also [LeepConfigReloadFailed](#leepconfigreloadfailed)).
+3. Do the files differ? `sha256sum` of the tokens, keys and policy files on every
+   host or mount (byte-identical files give equal fingerprints; files that only
+   differ in whitespace or order do too, so a checksum difference alone is not
+   proof). A flag difference counts as well: `--require-signatures`,
+   `--require-review` and the limit defaults (`--rate-limit`, `--rate-burst`,
+   `--max-concurrent-per-token`, `--read-max-body-bytes`) are part of the
+   fingerprint and only change on restart.
 
 **Likely causes.**
 
-1. One server restarted or crashed since the last reload, so its counter reset.
-   Confirm: step 2, and its generation is lowest.
-2. SIGHUP was not delivered to every instance (a missed host, a container that was
-   not signalled). Confirm: no `SIGHUP: reloading config` line on the lagging one.
-3. A reload failed on one instance only. Confirm: ERROR line there.
-4. The files differ between hosts. Confirm: step 3.
+1. A reload was not delivered to every instance (a missed host, a container that
+   was not signalled), so some still run the previous files. Confirm: no `SIGHUP:
+   reloading config` line, and an older `leep_config_last_reload_timestamp_seconds`,
+   on the odd server.
+2. A reload failed on one instance only. Confirm: ERROR line there.
+3. The files differ between hosts (configuration management lag, a bind mount
+   that still points at the old inode, see
+   [DEPLOY.md](DEPLOY.md#reloading-config)). Confirm: step 3.
+4. The flags differ between hosts (a rollout that changed `--require-*` or a limit
+   default is only half done). Confirm: step 3, and the flags each server runs
+   with.
+5. A rollout in progress. Confirm: the skew clears when the last server is
+   signalled or restarted; the alert waits 15 minutes.
 
 **Mitigate / fix.**
 
-- If the files are identical and every instance logged its reload, the skew is
-  cosmetic. To clear it, restart the instances with the higher generation in a
-  rolling restart so all counters return to 1 (or silence the alert until the next
-  deploy, which restarts everything).
 - If an instance missed the reload, send it SIGHUP, or restart it.
-- If the files differ, make them identical (configuration management), validate,
-  and reload everywhere.
-- Do not treat equal generations as proof of equal config.
+- If the files differ, make them identical (configuration management), validate
+  them, and reload everywhere. If a flag differs, finish the rollout by
+  restarting the stragglers.
+- Confirm by looking for a single series at 1 again:
+  `count(count by (fingerprint) (leep_config_info == 1))` is 1.
+- The old fingerprint stays exported at 0 until the process restarts; that is
+  expected, which is why the rule selects `== 1`.
+- Do not "fix" it by restarting servers to reset a counter: restarts do not
+  change the fingerprint, only the content does.
 
-**Escalate / collect.** Generation and timestamp per instance, each instance's
-reload log lines, and file checksums.
+**Escalate / collect.** The `leep_config_info` series from every instance, the
+`config loaded` and `config reloaded` log lines, the checksums of the config
+files on each host, the flags each server runs with, and the
+[standard bundle](#collecting-a-bug-report).
 
 ## LeepSchemaVersionSkew
 

@@ -108,6 +108,17 @@ impl SigningKeys {
         self.keys.is_empty()
     }
 
+    /// Feed the keys into a config fingerprint, sorted by key id. Public
+    /// keys and their names only.
+    pub(crate) fn fingerprint_into(&self, c: &mut crate::fingerprint::Canon) {
+        let mut all: Vec<&TrustedKey> = self.keys.iter().collect();
+        all.sort_by(|a, b| a.key_id.cmp(&b.key_id));
+        c.section("keys", all.len());
+        for k in all {
+            c.str(&k.key_id).str(&k.name);
+        }
+    }
+
     /// Names of the keys `newer` adds and drops, by key id, sorted. A key
     /// that only changed its name is neither.
     pub fn diff(&self, newer: &SigningKeys) -> (Vec<String>, Vec<String>) {

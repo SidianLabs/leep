@@ -2468,6 +2468,7 @@ dependencies = [
  "leep-derive",
  "leep-meta",
  "leep-store",
+ "leep-testkit",
  "metrics",
  "metrics-exporter-prometheus",
  "reqwest",

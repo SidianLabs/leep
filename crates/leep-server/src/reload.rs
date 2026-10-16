@@ -23,6 +23,7 @@ use leep_core::MetaStore;
 use leep_derive::{LandPolicy, PolicySet};
 
 use crate::auth::{Auth, AuthChange};
+use crate::fingerprint::Canon;
 use crate::limits::{Defaults, Limiter, LimiterChange};
 use crate::review::{RequireReview, ReviewPolicy, ReviewService};
 use crate::signing::{RequireSignatures, SigningKeys};
@@ -44,8 +45,13 @@ pub struct ReloadSources {
 
 /// One consistent configuration. Never mutated after it is built.
 pub struct RuntimeConfig {
-    /// 1 at startup, plus one per successful reload.
+    /// 1 at startup, plus one per successful reload. Per process: it says
+    /// nothing about whether two servers run the same config; compare
+    /// [`fingerprint`](Self::fingerprint) for that.
     pub generation: u64,
+    /// What the config contains, as 16 hex characters (see
+    /// [`crate::fingerprint`]). Safe to log and export: it holds no secret.
+    pub fingerprint: String,
     pub auth: Option<Auth>,
     pub limiter: Option<Arc<Limiter>>,
     pub signing: Option<Arc<SigningKeys>>,
@@ -76,8 +82,18 @@ impl RuntimeConfig {
                 ))
             })
         });
+        // A fixed config knows only the parts it was handed, so its fingerprint
+        // covers the tokens and keys; limits and protected refs are opaque here.
+        let mut canon = Canon::new();
+        fingerprint_parts(
+            &mut canon,
+            auth.as_ref(),
+            &Defaults::default(),
+            signing.as_deref(),
+        );
         RuntimeConfig {
             generation: 1,
+            fingerprint: canon.finish(),
             auth,
             limiter,
             signing,
@@ -98,6 +114,40 @@ impl RuntimeConfig {
 struct Loaded {
     config: RuntimeConfig,
     limiter: LimiterChange,
+}
+
+/// The tokens, server-wide limit defaults and trusted keys. The rest of the
+/// fingerprint (review policy, protected refs) is added by the caller that
+/// has it.
+fn fingerprint_parts(
+    c: &mut Canon,
+    auth: Option<&Auth>,
+    defaults: &Defaults,
+    signing: Option<&SigningKeys>,
+) {
+    match auth {
+        Some(a) => {
+            c.u64(1);
+            a.fingerprint_into(c);
+        }
+        None => {
+            c.u64(0);
+        }
+    }
+    c.str("limit-defaults")
+        .opt_f64(defaults.rate)
+        .opt_u64(defaults.burst.map(u64::from))
+        .opt_u64(defaults.concurrency.map(|n| n as u64))
+        .opt_u64(defaults.read_max_body.map(|n| n as u64));
+    match signing {
+        Some(k) => {
+            c.u64(1);
+            k.fingerprint_into(c);
+        }
+        None => {
+            c.u64(0);
+        }
+    }
 }
 
 fn sorted_union(a: &[String], b: &[String]) -> Vec<String> {
@@ -171,9 +221,22 @@ impl ReloadSources {
             _ => Some(Arc::new(PolicySet::new(policies))),
         };
 
+        let mut canon = Canon::new();
+        fingerprint_parts(
+            &mut canon,
+            auth.as_ref(),
+            &self.limit_defaults,
+            signing.as_deref(),
+        );
+        canon
+            .set("auto_approve", &policy.auto_approve)
+            .set("docs_globs", &policy.docs_globs)
+            .set("require_review", &review_refs)
+            .set("require_signatures", &self.require_signatures);
         Ok(Loaded {
             config: RuntimeConfig {
                 generation: prev.map_or(1, |p| p.generation + 1),
+                fingerprint: canon.finish(),
                 auth,
                 limiter: limiter.map(Arc::new),
                 signing,
@@ -191,6 +254,9 @@ impl ReloadSources {
 #[derive(Debug, Default)]
 pub struct ReloadReport {
     pub generation: u64,
+    pub fingerprint: String,
+    /// The fingerprint before this reload.
+    pub previous_fingerprint: String,
     pub tokens: AuthChange,
     pub limits: LimiterChange,
     pub keys_added: Vec<String>,
@@ -220,6 +286,8 @@ impl ReloadReport {
             removed_and_added(&old.protected_refs, &new.protected_refs);
         ReloadReport {
             generation: new.generation,
+            fingerprint: new.fingerprint.clone(),
+            previous_fingerprint: old.fingerprint.clone(),
             tokens,
             limits,
             keys_added,
@@ -283,6 +351,8 @@ impl ReloadReport {
         }
         tracing::info!(
             generation = self.generation,
+            fingerprint = %self.fingerprint,
+            previous_fingerprint = %self.previous_fingerprint,
             changed = !self.is_empty(),
             "config reloaded"
         );
@@ -304,8 +374,16 @@ fn now_secs() -> f64 {
         .map_or(0.0, |d| d.as_secs_f64())
 }
 
-fn record_loaded(generation: u64) {
-    metrics::gauge!("leep_config_generation").set(generation as f64);
+/// Publish a loaded config. `leep_config_info` has one series per
+/// fingerprint the process has run; the previous one is zeroed (the metrics
+/// crate cannot remove a series) so `leep_config_info == 1` selects exactly
+/// the config in force.
+fn record_loaded(config: &RuntimeConfig, previous: Option<&str>) {
+    if let Some(old) = previous.filter(|old| *old != config.fingerprint) {
+        metrics::gauge!("leep_config_info", "fingerprint" => old.to_string()).set(0.0);
+    }
+    metrics::gauge!("leep_config_info", "fingerprint" => config.fingerprint.clone()).set(1.0);
+    metrics::gauge!("leep_config_generation").set(config.generation as f64);
     metrics::gauge!("leep_config_last_reload_timestamp_seconds").set(now_secs());
 }
 
@@ -317,7 +395,7 @@ impl ConfigHandle {
         metrics::counter!("leep_config_reload_total", "result" => "ok").increment(0);
         metrics::counter!("leep_config_reload_total", "result" => "error").increment(0);
         let loaded = sources.load(None)?;
-        record_loaded(loaded.config.generation);
+        record_loaded(&loaded.config, None);
         Ok(Arc::new(ConfigHandle {
             current: ArcSwap::from_pointee(loaded.config),
             sources: Some(sources),
@@ -356,7 +434,7 @@ impl ConfigHandle {
         match sources.load(Some(&prev)) {
             Ok(loaded) => {
                 let report = ReloadReport::between(&prev, &loaded.config, loaded.limiter);
-                record_loaded(loaded.config.generation);
+                record_loaded(&loaded.config, Some(&prev.fingerprint));
                 self.current.store(Arc::new(loaded.config));
                 metrics::counter!("leep_config_reload_total", "result" => "ok").increment(1);
                 Ok(report)
@@ -597,6 +675,264 @@ mod tests {
         let r = h.reload().unwrap();
         assert!(r.is_empty(), "{r:?}");
         assert_eq!(r.generation, 2);
+    }
+
+    fn fp(f: &Files) -> String {
+        f.handle().current().fingerprint.clone()
+    }
+
+    #[test]
+    fn the_fingerprint_is_sixteen_hex_characters_and_stable() {
+        let f = files();
+        let a = fp(&f);
+        assert_eq!(a.len(), 16);
+        assert!(a
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+        assert_eq!(a, fp(&f));
+        // A second set of files with the same content, elsewhere on disk.
+        assert_eq!(a, fp(&files()));
+    }
+
+    #[test]
+    fn order_and_formatting_do_not_change_the_fingerprint() {
+        let f = files();
+        let base = fp(&f);
+        // Tokens reversed and pretty-printed with extra whitespace.
+        let reordered = serde_json::to_string_pretty(&serde_json::json!({ "tokens": [
+            { "role": "read", "hash": hash_token("t2"), "name": "viewer" },
+            { "name": "ci", "hash": hash_token("t1"), "role": "write" },
+        ] }))
+        .unwrap();
+        f.put("tokens.json", &format!("\n\n{reordered}\n"));
+        f.put(
+            "policy.json",
+            "{\n  \"refs\": [ \"main\" ],\n  \"auto_approve\": []\n}\n",
+        );
+        assert_eq!(fp(&f), base);
+
+        // Sets given in a different order or with repeats.
+        let mut a = files();
+        let mut b = files();
+        a.sources.require_signatures = vec!["release".into(), "stable".into()];
+        b.sources.require_signatures = vec!["stable".into(), "release".into(), "stable".into()];
+        a.put("policy.json", r#"{ "refs": ["main", "dev"] }"#);
+        b.put("policy.json", r#"{ "refs": ["dev", "main"] }"#);
+        assert_eq!(fp(&a), fp(&b));
+    }
+
+    #[test]
+    fn every_semantic_change_changes_the_fingerprint() {
+        let base = fp(&files());
+        let mut seen = vec![base.clone()];
+        let mut check = |what: &str, f: Files| {
+            let got = fp(&f);
+            assert!(
+                !seen.contains(&got),
+                "{what} did not change the fingerprint"
+            );
+            seen.push(got);
+        };
+
+        let f = files();
+        f.put(
+            "tokens.json",
+            &tokens(&[
+                ("ci", "write", "t1"),
+                ("viewer", "read", "t2"),
+                ("bot", "write", "t3"),
+            ]),
+        );
+        check("a token added", f);
+
+        let f = files();
+        f.put("tokens.json", &tokens(&[("ci", "write", "t1")]));
+        check("a token removed", f);
+
+        let f = files();
+        f.put(
+            "tokens.json",
+            &tokens(&[("ci", "read", "t1"), ("viewer", "read", "t2")]),
+        );
+        check("a role changed", f);
+
+        let f = files();
+        f.put(
+            "tokens.json",
+            &tokens(&[("ci", "write", "new"), ("viewer", "read", "t2")]),
+        );
+        check("a token rotated", f);
+
+        let f = files();
+        f.put(
+            "tokens.json",
+            &serde_json::json!({ "tokens": [
+                { "name": "ci", "role": "write", "hash": hash_token("t1"), "rate": 5 },
+                { "name": "viewer", "role": "read", "hash": hash_token("t2") },
+            ] })
+            .to_string(),
+        );
+        check("a token limit added", f);
+
+        let f = files();
+        f.put(
+            "tokens.json",
+            &serde_json::json!({ "tokens": [
+                { "name": "ci", "role": "write", "hash": hash_token("t1"), "rate": 6 },
+                { "name": "viewer", "role": "read", "hash": hash_token("t2") },
+            ] })
+            .to_string(),
+        );
+        check("a token limit changed", f);
+
+        let mut f = files();
+        f.sources.limit_defaults.rate = Some(10.0);
+        check("a default limit set", f);
+
+        let f = files();
+        f.put("keys.json", &keys(&[("alice", &key(1)), ("bob", &key(2))]));
+        check("a key added", f);
+
+        let f = files();
+        f.put("keys.json", &keys(&[("alice", &key(2))]));
+        check("a key replaced", f);
+
+        let f = files();
+        f.put("keys.json", &keys(&[("alice-laptop", &key(1))]));
+        check("a key renamed", f);
+
+        let f = files();
+        f.put("policy.json", r#"{ "refs": ["main", "stable"] }"#);
+        check("a review ref added", f);
+
+        let mut f = files();
+        f.sources.require_signatures.push("stable".into());
+        check("a signature ref added", f);
+
+        let mut f = files();
+        f.sources.require_review.push("dev".into());
+        check("a --require-review ref added", f);
+
+        let f = files();
+        f.put(
+            "policy.json",
+            r#"{ "refs": ["main"], "auto_approve": ["comment_only"] }"#,
+        );
+        check("an auto rule added", f);
+
+        let f = files();
+        f.put(
+            "policy.json",
+            r#"{ "refs": ["main"], "auto_approve": ["docs_only"], "docs_globs": ["docs/**"] }"#,
+        );
+        check("docs rules added", f);
+
+        let mut f = files();
+        f.sources.signing_keys_file = None;
+        f.sources.require_signatures.clear();
+        check("signing turned off", f);
+    }
+
+    #[test]
+    fn a_reload_without_changes_keeps_the_fingerprint() {
+        let f = files();
+        let h = f.handle();
+        let before = h.current().fingerprint.clone();
+        // Rewritten with different formatting but the same meaning.
+        f.put("policy.json", "{ \"refs\":\n [\"main\"] }");
+        let r = h.reload().unwrap();
+        assert_eq!(r.fingerprint, before);
+        assert_eq!(r.previous_fingerprint, before);
+        assert_eq!(h.current().fingerprint, before);
+        assert_eq!(h.current().generation, 2);
+    }
+
+    #[test]
+    fn a_changing_reload_reports_both_fingerprints() {
+        let f = files();
+        let h = f.handle();
+        let before = h.current().fingerprint.clone();
+        f.put("tokens.json", &tokens(&[("ci", "write", "t1")]));
+        let r = h.reload().unwrap();
+        assert_eq!(r.previous_fingerprint, before);
+        assert_ne!(r.fingerprint, before);
+        assert_eq!(h.current().fingerprint, r.fingerprint);
+    }
+
+    #[test]
+    fn a_failed_reload_keeps_the_fingerprint() {
+        let f = files();
+        let h = f.handle();
+        let before = h.current().fingerprint.clone();
+        f.put("tokens.json", "{ not json");
+        assert!(h.reload().is_err());
+        assert_eq!(h.current().fingerprint, before);
+    }
+
+    /// Lines of `leep_config_info` in the Prometheus text, as (fingerprint, value).
+    fn info_series(text: &str) -> Vec<(String, f64)> {
+        text.lines()
+            .filter(|l| l.starts_with("leep_config_info{"))
+            .map(|l| {
+                let fp = l
+                    .split("fingerprint=\"")
+                    .nth(1)
+                    .unwrap()
+                    .split('"')
+                    .next()
+                    .unwrap();
+                (
+                    fp.to_string(),
+                    l.rsplit(' ').next().unwrap().parse().unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn exactly_one_info_series_is_one_after_a_changing_reload() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let prom = recorder.handle();
+        let f = files();
+        let (first, second, third) = metrics::with_local_recorder(&recorder, || {
+            let h = f.handle();
+            let first = h.current().fingerprint.clone();
+            let only_one = |want: &str| {
+                let series = info_series(&prom.render());
+                let ones: Vec<_> = series.iter().filter(|(_, v)| *v == 1.0).collect();
+                assert_eq!(ones.len(), 1, "{series:?}");
+                assert_eq!(ones[0].0, want, "{series:?}");
+                series.len()
+            };
+            assert_eq!(only_one(&first), 1);
+
+            // No change: still one series.
+            h.reload().unwrap();
+            assert_eq!(only_one(&first), 1);
+
+            // A change: the old series drops to 0, the new one is the one at 1.
+            f.put("tokens.json", &tokens(&[("ci", "write", "t1")]));
+            h.reload().unwrap();
+            let second = h.current().fingerprint.clone();
+            assert_ne!(first, second);
+            assert_eq!(only_one(&second), 2);
+            let series = info_series(&prom.render());
+            assert!(series.contains(&(first.clone(), 0.0)), "{series:?}");
+
+            // Back to the original: it is 1 again and the other is 0.
+            f.put(
+                "tokens.json",
+                &tokens(&[("ci", "write", "t1"), ("viewer", "read", "t2")]),
+            );
+            h.reload().unwrap();
+            let third = h.current().fingerprint.clone();
+            assert_eq!(only_one(&third), 2);
+            (first, second, third)
+        });
+        assert_eq!(first, third);
+        assert_ne!(first, second);
+        // The generation is a per-process count and moved on every reload.
+        assert!(prom.render().contains("leep_config_generation 4"));
     }
 
     #[test]

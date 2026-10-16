@@ -18,7 +18,8 @@ docker build -t leep:dev .
 ```sh
 docker run -d --name leep -p 127.0.0.1:7070:7070 \
   -v leep-data:/var/lib/leep leep:dev
-curl -s localhost:7070/v1/health      # "ok"
+curl -s localhost:7070/v1/health      # "ok": the process is up
+curl -s localhost:7070/v1/ready       # {"status":"ready"}: it can reach its stores
 ```
 
 Drive it with the CLI from the host or from the same image:
@@ -64,8 +65,52 @@ services:
 The bucket must already exist. The stack does not bundle an object store,
 so it depends only on the `postgres` image.
 
-The image has no `curl`, so it declares no `HEALTHCHECK`. Probe
-`GET /v1/health` from your orchestrator instead.
+The image has no `curl`, so it declares no `HEALTHCHECK`, and the compose
+file has no healthcheck for `leep-server`. Probe it from outside instead
+(see [Probes](#probes)).
+
+## Probes
+
+Two endpoints, both public (no token, never rate-limited, whatever the tokens
+file says):
+
+| Endpoint | Question | Checks | Answer |
+|---|---|---|---|
+| `GET /v1/health` | Is the process alive? (liveness) | nothing but that HTTP is served | 200 `"ok"` |
+| `GET /v1/ready` | Can it serve right now? (readiness) | reads one ref from the metadata store and asks the blob store about one fixed hash, concurrently, each under `--ready-timeout` (default 2 s) | 200 `{"status":"ready"}`, or 503 `{"status":"not ready","failed":[{"store":"meta","reason":"unavailable"}]}` |
+
+`store` is `meta` or `blobs`; `reason` is `unavailable` or `timed out after
+2000ms`, never the driver's message (it can carry a host name; the server logs
+it as `readiness check failed`). Restart on liveness, and take a server out of
+rotation on readiness. Do not use `/v1/ready` as a liveness probe: when a
+shared database blips, every server would be restarted at once for no gain.
+Each readiness call does two small store reads, so probe it every few seconds,
+not every few milliseconds. The checks are counted in
+`leep_ready_checks_total{store,result}`, and the
+[LeepNotReady](RUNBOOKS.md#leepnotready) alert fires on failures.
+
+Kubernetes:
+
+```yaml
+livenessProbe:
+  httpGet: {path: /v1/health, port: 7070}
+  periodSeconds: 10
+  failureThreshold: 3
+readinessProbe:
+  httpGet: {path: /v1/ready, port: 7070}
+  periodSeconds: 5
+  timeoutSeconds: 3        # above --ready-timeout, so the 503 body arrives
+  failureThreshold: 2
+startupProbe:              # optional: allow a slow first migration
+  httpGet: {path: /v1/ready, port: 7070}
+  periodSeconds: 5
+  failureThreshold: 60
+```
+
+Docker or compose: the image has no `curl` or `wget`, so a `healthcheck:` needs
+a command that exists in it or one you add (for example `curl -fsS
+http://127.0.0.1:7070/v1/ready` after installing curl in a derived image).
+Without one, probe from the host, a sidecar or your load balancer.
 
 ## Authentication
 
@@ -83,7 +128,7 @@ docker run -d -p 127.0.0.1:7070:7070 -v leep-data:/var/lib/leep \
 
 In compose, add the same volume and `LEEP_TOKENS_FILE` to `leep-server`.
 Clients pass the token with `LEEP_TOKEN`, `leep --token` or
-`leep init --token`. `GET /v1/health` stays public for probes. The file is
+`leep init --token`. `GET /v1/health` and `GET /v1/ready` stay public for probes. The file is
 re-read on SIGHUP, so tokens can be rotated and revoked without a restart
 ([Reloading config](#reloading-config)).
 
@@ -126,7 +171,7 @@ limit without a tokens file) stop the server at startup with a message naming
 the token or flag, and make a reload fail. Per-token fields reload on SIGHUP; the
 flags need a restart. A request over the rate or concurrency limit gets `429` with
 `Retry-After`; a body over the size limit gets `413`; both have a JSON error
-body. `GET /v1/health` is never limited. The `leep` CLI retries a throttled
+body. `GET /v1/health` and `GET /v1/ready` are never limited. The `leep` CLI retries a throttled
 `GET` a few times and then prints the server's message. Tuning and metrics are
 in [OPERATIONS.md](OPERATIONS.md#request-limits).
 
@@ -245,7 +290,10 @@ then remove the old one. Removing a key makes changesets signed only by it
 unsigned again, including for `land`.
 
 With several servers behind a balancer, signal every instance and compare
-`leep_config_generation` across them. See
+`leep_config_info{fingerprint}` across them (the fingerprint hashes the loaded
+config, so identical config gives the same value on every server whatever its
+uptime; `leep_config_generation` is a per-process counter and is not
+comparable between servers). See
 [OPERATIONS.md](OPERATIONS.md#config-reload) for metrics and alerts, and
 [LeepConfigReloadFailed](RUNBOOKS.md#leepconfigreloadfailed) for what to do when
 a reload is refused.
@@ -271,6 +319,7 @@ a reload is refused.
 | `LEEP_READ_MAX_BODY_BYTES` | none | Body size cap for read tokens; needs the tokens file. |
 | `LEEP_NO_MIGRATE` | off | `1` makes the server (and `gc`, `derive-search`) refuse to start while metadata schema migrations are pending instead of applying them; see [Upgrades](#upgrades). |
 | `LEEP_REQUEST_TIMEOUT` | `5m` | Abort any request that runs longer (`90s`, `5m`; `0` disables). `leep-server gc --fence` must exceed it; see [OPERATIONS.md](OPERATIONS.md#blob-garbage-collection). |
+| `LEEP_READY_TIMEOUT` | `2s` | Bound on each store check behind `GET /v1/ready` (`500ms`, `2s`; not zero). See [Probes](#probes). |
 | `LEEP_METRICS_LISTEN` | off | Address for a separate, unauthenticated `GET /metrics` listener; keep it private. See [OPERATIONS.md](OPERATIONS.md). |
 | `LEEP_LOG_FORMAT` | `text` | `text` or `json` (one object per line). |
 | `RUST_LOG` | `info` | Log filter. |
@@ -369,4 +418,5 @@ Prometheus. Every rule has a `runbook_url` pointing at its section of
 [RUNBOOKS.md](RUNBOOKS.md): what fired, the impact, how to diagnose, the likely
 causes and the safe fix. Set the base URL in the rules to wherever you publish
 that file. `GET /v1/health` only says the process is serving HTTP; it does not
-check the stores, so alert on the metrics, not on the probe alone.
+check the stores. `GET /v1/ready` does (see [Probes](#probes)). Alert on the
+metrics, not on a probe alone.

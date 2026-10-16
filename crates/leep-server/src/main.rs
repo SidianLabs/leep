@@ -56,6 +56,10 @@ struct Args {
     /// bound. `gc --fence` must exceed it.
     #[arg(long, env = "LEEP_REQUEST_TIMEOUT", default_value = "5m", value_parser = parse_grace)]
     request_timeout: std::time::Duration,
+    /// How long `GET /v1/ready` waits for each store (metadata and blobs,
+    /// checked concurrently) before reporting it down (500ms, 2s).
+    #[arg(long, env = "LEEP_READY_TIMEOUT", default_value = "2s", value_parser = parse_ready_timeout)]
+    ready_timeout: std::time::Duration,
     /// Maximum request body size in bytes.
     #[arg(long, default_value_t = leep_server::DEFAULT_MAX_BODY_BYTES)]
     max_body_bytes: usize,
@@ -258,6 +262,21 @@ async fn run_migrate(meta: &str, dry_run: bool, status: bool) -> anyhow::Result<
         );
     }
     Ok(())
+}
+
+/// `500ms`, `2s`, `1m`; a bare number is seconds. Zero would fail every probe.
+fn parse_ready_timeout(s: &str) -> Result<std::time::Duration, String> {
+    let d = match s.trim().strip_suffix("ms") {
+        Some(n) => std::time::Duration::from_millis(
+            n.parse()
+                .map_err(|_| format!("bad duration {s:?}; use e.g. 500ms, 2s"))?,
+        ),
+        None => parse_grace(s)?,
+    };
+    if d.is_zero() {
+        return Err("must be greater than zero".into());
+    }
+    Ok(d)
 }
 
 fn parse_grace(s: &str) -> Result<std::time::Duration, String> {
@@ -527,8 +546,13 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(unix)]
     leep_server::reload::spawn_sighup_reload(config.clone(), repo.meta().clone())
         .context("installing the SIGHUP handler")?;
-    let app =
-        leep_server::router_with_config(repo, args.max_body_bytes, args.request_timeout, config);
+    let app = leep_server::router_with_ready_timeout(
+        repo,
+        args.max_body_bytes,
+        args.request_timeout,
+        config,
+        args.ready_timeout,
+    );
 
     let listener = tokio::net::TcpListener::bind(args.listen)
         .await
@@ -551,6 +575,10 @@ async fn main() -> anyhow::Result<()> {
 
 /// The startup summary of what the files configured. Counts only.
 fn log_config(c: &RuntimeConfig) {
+    tracing::info!(
+        fingerprint = %c.fingerprint,
+        "config loaded (servers that run the same config print the same fingerprint)"
+    );
     match &c.auth {
         Some(a) => tracing::info!(tokens = a.len(), "authentication enabled"),
         None => tracing::warn!("authentication disabled: no --tokens-file; anyone who can reach this server can read and write"),

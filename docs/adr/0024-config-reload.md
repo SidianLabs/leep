@@ -84,8 +84,12 @@ reload without restart.
   exist from startup), `leep_config_generation` (1 at startup, +1 per
   successful reload; failed reloads do not advance it) and
   `leep_config_last_reload_timestamp_seconds` (the last successful load,
-  including startup). Servers behind a balancer can be compared by generation
-  to see that a rotation reached all of them.
+  including startup). The generation is per process: it resets on restart and
+  advances on reloads that change nothing, so it cannot say whether two servers
+  agree. *Amended:* `leep_config_info{fingerprint}` is 1 for a BLAKE3
+  fingerprint of the parsed config (0 for earlier ones this process ran), and
+  servers behind a balancer are compared by it. The fingerprint holds no secret
+  (digests, public keys, names, numbers, truncated to 8 bytes).
 - No `leep-core` type, `/v1` endpoint or file format changed. The router gains
   `router_with_config`; the older constructors build a fixed config, so
   embedders and tests are unaffected.
@@ -122,5 +126,5 @@ reload without restart.
   middleware is always installed (it does nothing when the config has no
   limits).
 - Limits and keys apply per server process, as before; in a fleet, send SIGHUP
-  to every instance and compare `leep_config_generation`.
+  to every instance and compare `leep_config_info` fingerprints.
 - Changing flags still needs a restart.
