@@ -434,6 +434,26 @@ fn check_store(tag: &str, stores: &Stores, shared: &Shared, live: bool) {
     });
 }
 
+/// `leep-server verify` finds the store sound (ADR 0025): everything
+/// reachable is intact, the ref log replays to the refs and, with `--full`,
+/// every derived row equals its recomputation. A kill or a collect at any
+/// point must leave it so.
+fn verify_clean(tag: &str, stores: &Stores, extra: &[&str]) {
+    let out = Command::new(bin("leep-server"))
+        .args(["--meta", &stores.meta, "--blobs", &stores.blobs, "verify"])
+        .args(extra)
+        .env("RUST_LOG", "warn")
+        .output()
+        .expect("spawn leep-server verify");
+    assert!(
+        out.status.success(),
+        "[{tag}] verify {extra:?} exited {}\n--- stdout\n{}\n--- stderr\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 fn gc_output(stores: &Stores, args: &[&str]) -> std::process::Output {
     Command::new(bin("leep-server"))
         .args(["--meta", &stores.meta, "--blobs", &stores.blobs, "gc"])
@@ -589,6 +609,7 @@ fn crash_rounds(
             }
             server.kill();
             check_store(&format!("{tag}, after SIGKILL"), stores, &shared, false);
+            verify_clean(&format!("{tag}, after SIGKILL"), stores, &[]);
 
             // The server is down, so a zero fence is safe here: collect
             // everything unreferenced and prove nothing else went.
@@ -611,6 +632,11 @@ fn crash_rounds(
                         stores,
                         &shared,
                         false,
+                    );
+                    verify_clean(
+                        &format!("{tag}, after killed collect"),
+                        stores,
+                        &["--rehash"],
                     );
                 }
                 _ => {}
@@ -659,6 +685,7 @@ fn crash_rounds(
     drop(odd);
     verify_exact(&tag, stores, &shared);
     verify_through_server(&tag, root, &client, &shared);
+    verify_clean(&tag, stores, &["--full", "--rehash"]);
     drop(server);
 }
 

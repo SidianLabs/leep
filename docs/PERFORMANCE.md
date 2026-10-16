@@ -121,6 +121,29 @@ What the numbers say:
   rows, with 16 blob fetches in flight). It is paid once per distinct blob and
   directory, by the first search that needs it or by `leep-server derive-search`.
 
+## Verify
+
+`leep-server verify` (ADR 0025, `docs/OPERATIONS.md`) over a store of 10 000
+changesets built by the ignored test `verify_ten_thousand_changesets`
+(`cargo test --release -p leep-e2e --test verify -- --ignored --nocapture`):
+two files changed per changeset across 40 x 25 x 60 directories and files,
+a merge of two side branches every 200 changesets, SQLite metadata and a
+filesystem blob store, with the path-history index, last-merge rows, the search
+index for the tip and two blame rows already derived. 4 vCPU Intel Xeon
+@ 2.10GHz, 15 GB RAM, a machine shared with other builds, release build.
+
+| Mode | Time | Peak RSS |
+|---|---|---|
+| `verify` (sample of 256) | 7.0 s | 36 MiB |
+| `verify --full` | 51 s | not measured |
+| `verify --full --rehash` | 52 s (59 s on a busier run) | 104 MiB |
+
+Reachability is the part that scales with history: every changeset is read
+twice and every new tree node once. `--full` adds a recomputation of every
+derived row, which costs about what deriving them did (the warm-up above took
+44 s). The files here are small, so `--rehash` adds little; it is bound by
+reading the blob store.
+
 ## Soak run
 
 `leep-soak` (ADR 0022, `docs/OPERATIONS.md`) runs a swarm against a real

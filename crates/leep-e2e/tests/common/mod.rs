@@ -345,6 +345,17 @@ pub fn assert_ok(out: &Output, what: &str) {
     );
 }
 
+/// Run `leep-server --meta M --blobs B <args>` (a subcommand such as `verify`)
+/// against `stores` and return its output, whatever the exit code.
+pub fn server_cmd(stores: &Stores, args: &[&str]) -> Output {
+    Command::new(bin("leep-server"))
+        .args(["--meta", &stores.meta, "--blobs", &stores.blobs])
+        .args(args)
+        .env("RUST_LOG", "warn")
+        .output()
+        .expect("spawn leep-server")
+}
+
 /// Run `leep-git` with the given arguments, panicking unless it succeeds.
 pub fn leep_git(args: &[&str]) -> String {
     let out = Command::new(bin("leep-git"))

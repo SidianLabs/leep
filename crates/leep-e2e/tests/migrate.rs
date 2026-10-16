@@ -78,9 +78,19 @@ fn migrate_adopts_an_unversioned_database() {
     assert_ok(&out, "migrate --dry-run");
 
     // --no-migrate (flag or variable) refuses to run anything on it.
-    let out = server(&stores, &["--no-migrate", "gc", "--dry-run"]);
-    assert!(!out.status.success());
-    assert!(stderr(&out).contains("pending"), "{}", stderr(&out));
+    for cmd in [
+        &["gc", "--dry-run"][..],
+        &["verify"],
+        &["repair", "drop", "--kind", "generation", "--dry-run"],
+    ] {
+        let out = server(&stores, &[&["--no-migrate"][..], cmd].concat());
+        assert!(!out.status.success(), "{cmd:?}");
+        assert!(
+            stderr(&out).contains("pending"),
+            "{cmd:?}: {}",
+            stderr(&out)
+        );
+    }
     let out = Command::new(bin("leep-server"))
         .args(["--meta", &stores.meta, "--blobs", &stores.blobs])
         .args(["gc", "--dry-run"])

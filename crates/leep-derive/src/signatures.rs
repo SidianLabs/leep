@@ -85,7 +85,7 @@ impl LandPolicy for PolicySet {
     }
 }
 
-fn storage_key(id: ChangesetId, key_id: &str) -> Hash {
+pub(crate) fn storage_key(id: ChangesetId, key_id: &str) -> Hash {
     let mut bytes = Vec::with_capacity(32 + key_id.len());
     bytes.extend_from_slice(id.0.as_bytes());
     bytes.extend_from_slice(key_id.as_bytes());

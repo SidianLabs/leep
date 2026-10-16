@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
-use crate::{Changeset, ChangesetId, Hash, Result};
+use crate::{Changeset, ChangesetId, Error, Hash, Result};
 
 /// Unix seconds now, the server clock every ref log entry is stamped with.
 pub fn unix_now() -> i64 {
@@ -161,6 +161,37 @@ pub trait MetaStore: Send + Sync + 'static {
     ) -> Result<Vec<RefLogEntry>>;
 
     async fn list_refs(&self) -> Result<BTreeMap<String, ChangesetId>>;
+
+    /// Up to `limit` derived rows of `kind` with key strictly greater than
+    /// `after`, in ascending key (byte) order. Paged so verification and
+    /// repair can scan a kind too large to hold in memory.
+    ///
+    /// Every backend must implement this; the default exists only so test
+    /// doubles that never list rows need not.
+    async fn list_derived(
+        &self,
+        kind: &str,
+        after: Option<Hash>,
+        limit: usize,
+    ) -> Result<Vec<(Hash, Bytes)>> {
+        let _ = (kind, after, limit);
+        Err(Error::Invalid(
+            "this metadata store cannot list derived rows".into(),
+        ))
+    }
+
+    /// Delete every row of `kind` and return how many were removed. Idempotent,
+    /// and rows of other kinds are untouched. Only the repair tools call it,
+    /// and only for kinds that derive again from history (ADR 0025); in
+    /// bounded batches, so an interrupted call leaves the kind partly dropped.
+    ///
+    /// Every backend must implement this (see [`list_derived`](Self::list_derived)).
+    async fn delete_derived_kind(&self, kind: &str) -> Result<u64> {
+        let _ = kind;
+        Err(Error::Invalid(
+            "this metadata store cannot delete derived rows".into(),
+        ))
+    }
 
     /// Derived data is keyed by (kind, key), e.g. ("root_tree", changeset id).
     /// Values are opaque bytes owned by `leep-derive`. Writing the same key

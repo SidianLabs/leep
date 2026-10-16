@@ -452,6 +452,12 @@ fn run_import_swarm_export(stores: &Stores, work: &Path) {
         fs::read_link(verify.join("docs/readme-link")).unwrap(),
         Path::new("../README.md")
     );
+
+    // What the import, the swarm's rebases and the export left behind is
+    // sound all the way down (ADR 0025).
+    let out = server_cmd(stores, &["verify", "--full", "--rehash"]);
+    assert_ok(&out, "leep-server verify --full --rehash");
+    assert!(stdout(&out).contains("result: clean"), "{}", stdout(&out));
 }
 
 #[test]

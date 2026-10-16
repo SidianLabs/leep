@@ -229,7 +229,8 @@ server applies pending migrations itself, as it always created its tables.
 This is what a single-container deployment wants, and the same transaction and
 lock apply, so a fleet that starts together migrates once. Use `--no-migrate`
 whenever you want a change window or the server's database account may not
-alter the schema. `gc` and `derive-search` follow the same flag.
+alter the schema. `gc`, `derive-search`, `verify` and `repair` follow the same
+flag.
 
 **First start after the versioning release.** A database made by an older
 Leep has no `schema_migrations` table. The first server or `migrate` to open it
@@ -248,8 +249,8 @@ understand:
 
 - A database **newer** than the server (`database schema v3 is newer than this
   server (max v2); upgrade the server`) is refused at startup by the server,
-  `migrate`, `gc` and `derive-search`, in every mode. Finish the rollout rather
-  than restarting an old server onto the migrated database; to go back, restore
+  `migrate`, `gc`, `derive-search`, `verify` and `repair`, in every mode.
+  Finish the rollout rather than restarting an old server onto the migrated database; to go back, restore
   the backup taken in step 1.
 - A migration whose checksum differs from the recorded one (someone edited an
   applied migration, or a build is from a different branch) is refused, naming
@@ -308,6 +309,135 @@ means a request exceeded `--request-timeout`.
 Upgrade note: servers built before ADR 0012 ignore condemnations. Upgrade every
 server before the first `condemn`.
 
+## Verify and repair
+
+`leep-server verify` checks a store against itself and `leep-server repair`
+fixes the part of it that can be fixed (ADR 0025). Both work offline on the
+stores, with the same `--meta` and `--blobs` as the server and no server
+needed, and both are safe beside running servers: `verify` writes nothing, and
+`repair` writes only derived rows, which are pure functions of content. They
+never create a database or a blob directory that does not exist.
+
+Run `verify`:
+
+- after restoring a backup, before pointing servers at it;
+- after upgrading, and after a crash, a disk or volume problem, or a bad
+  migration;
+- when an answer looks wrong (a log, a blame, a search, an `is_ancestor` that
+  disagrees with another), because a damaged derived row changes answers
+  silently;
+- on a schedule: the default mode is cheap enough for a daily cron job, and
+  `--full --rehash` for a weekly one from a replica or in a quiet window.
+
+```sh
+leep-server verify                             # sample: complete reachability and ref log, sampled derived rows
+leep-server verify --full                      # recompute every derived row; also changesets no ref reaches
+leep-server verify --full --rehash             # also re-hash the bytes of every reachable blob
+leep-server verify --ref main --derived generation skiplist   # one ref, some kinds
+leep-server verify --json > report.json        # the same report as one JSON object
+```
+
+Exit status is `0` for a clean store, `1` when it found problems and `2` when
+it could not run (an unknown ref or kind, a database that does not exist, a
+store that could not be reached). Progress goes to stderr every few seconds
+and the report to stdout. `--rehash` is the flag that re-reads blob bytes;
+`--blobs` is the blob store URL.
+
+What each mode costs, for a store of N changesets and F distinct files:
+
+| Mode | Reads | Notes |
+|---|---|---|
+| default | every changeset twice, every new tree node once, one existence check per distinct blob, the ref log, and about 256 rows of each kind | memory about 100 bytes per changeset plus 50 per tree node and blob |
+| `--full` | the above, plus a recomputation of every derived row: tree nodes along every changeset's changes, history nodes, every trigram row against its blob | the cost of deriving everything again; read-only |
+| `--rehash` | additionally every reachable blob's bytes, eight at a time | I/O bound: the size of the repository |
+
+See [PERFORMANCE.md](PERFORMANCE.md#verify) for measured times.
+
+### Reading the report
+
+The report lists what it looked at (refs, changesets, tree nodes, blobs, ref
+log entries), then per derived kind how many rows it compared (`checked`),
+how many changesets had no row (`missing`, not a problem: rows derive on
+demand and a crash leaves some missing), how many were wrong (`mismatched`),
+how many it could not recompute because an input is damaged (`unverifiable`)
+and how many it had to skip because the row's subject is gone (`skipped`: a
+trigram row whose blob GC collected). Then each problem, with the kind, row
+key, changeset, path or ref that locates it, and `result: clean` or the number
+found. `notes` explain what sampling did, and mention blame rows that differ
+from a recomputation but agree with the file (blame diffs run under a time
+limit, so two answers can both be right).
+
+In sample mode a derived mismatch at a changeset may come from a damaged row
+at one of its parents that was not sampled; `--full` finds the row that is
+actually damaged and reports only it, because it compares each row with what
+its parents' true rows imply.
+
+### Runbook: verify found X
+
+Fix problems in this order, because later checks assume the earlier ones:
+history, trees and blobs first, derived rows after.
+
+| Finding | What it means | What to do |
+|---|---|---|
+| `missing_changeset`, `corrupt_changeset` | A changeset row is gone or does not hash to its id; the report names the child that needs it | Not repairable: changesets are source data. Restore the `changesets` row from a backup (`verify` then checks everything again). Do not delete the referencing ref; `leep undo` and the ref log can show where it pointed before |
+| `missing_tree`, `corrupt_tree` | A tree node is absent or its bytes do not hash to its address. The report gives the oldest changeset that reaches it and the directory | `leep-server repair rederive --kind root_tree` rewrites every node from the changes that introduced it, for the changesets in scope, and `verify` confirms. If it reports `rederive_failed`, an input blob is missing; restore it first |
+| `missing_blob` | A file blob a changeset names is gone (a bad restore, a deleted file, a GC bug). The report names the changeset and path | Not recomputable. Restore the blob from the blob store's backup; its address is in the report, `blobs/<hex[0..2]>/<hex[2..]>`. Once you have the bytes (a client's `~/.cache/leep/objects` may still hold them) `PUT /v1/blobs/{hash}` stores them again |
+| `corrupt_blob`, `blob_size_mismatch` (`--rehash`) | The bytes under a blob's address do not hash to it, or are not the declared length | Delete the file and restore from backup, as for a missing blob. Until then reads of it return the damaged bytes |
+| `derived_mismatch` | A derived row differs from its recomputation. The report gives kind, row key and changeset | `leep-server repair rederive --kind <kind>` and run `verify --full` again. Find out why (disk, restore, an old version): derived rows are only ever wrong through damage |
+| `derived_unverifiable` | A row could not be recomputed because something it reads is damaged | Fix the damaged tree node, blob or parent, then verify again |
+| `corrupt_history_node`, `missing_history_node` | A history index node does not match its address, or a `history-tree-v1` row points at none | `repair rederive --kind history-tree-v1` rewrites the nodes. Or `repair drop --kind history-tree-v1` and let the index rebuild on the next path query (slow on a long history: it derives the whole index at once) |
+| `bad_attestation`, `invalid_signature` | A signature or review row does not decode, does not belong to any changeset, or a signature does not verify | These are not derived from history and are never rewritten by `repair`. Restore the row from a backup, or delete it with SQL if it is junk, and have the author sign again |
+| `bad_rebased_origin`, `bad_gc_row` | Bookkeeping rows that are malformed or name changesets that do not exist | Restore from a backup. A bad GC row can be deleted with SQL while no `gc` runs; `repair` refuses to touch them |
+| `reflog_divergence` | A ref's newest ref log entry does not say where the ref is now | Someone changed the `refs` table or the log directly, or a restore mixed two points in time. Decide which is right: if the ref is right, the log is merely incomplete and nothing breaks; if the log is right, `leep undo`-style recovery is `POST /v1/refs/{name}` to the logged value. `repair` never edits either |
+| `reflog_chain_break` | An entry's `new` does not equal the next entry's `old`: an entry was removed or edited | The log is the record of what happened; restore it from a backup if you need it complete. Refs are unaffected |
+
+After a repair, run `verify --full` again. A store that is clean under
+`--full --rehash` has every reachable object intact and every derived row
+equal to what the history implies.
+
+### Repair
+
+```sh
+leep-server repair rederive --kind generation --dry-run   # what would change; exit 1 if anything would
+leep-server repair rederive --kind skiplist               # also checks generation, which it reads
+leep-server repair rederive --kind root_tree --ref main   # only the history of one ref
+leep-server repair rederive --kind all                    # every kind that can be recomputed
+leep-server repair drop --kind blame blob-trigrams-v1     # delete rows; they derive again when asked for
+leep-server repair drop --kind history-tree-v1 --dry-run  # also removes history-node-v1; counts only
+```
+
+`rederive` walks the chosen changesets oldest first, recomputes each selected
+kind and every kind it depends on (so a skiplist is never rebuilt from a
+damaged generation), and writes rows that are missing or wrong. It reports per
+kind how many it examined, how many were already right, how many it wrote, and
+how many it could not recompute. Rows no query ever asked for are written too:
+for the lazily derived kinds that is eager derivation, which is also how to
+warm an index after a restore. It is safe to repeat and to run beside servers;
+the servers write the same bytes. `root_tree` and `history-tree-v1` also
+rewrite the tree and history nodes they derive, which is what restores a
+missing or damaged one. The search kinds (`blob-trigrams-v1`,
+`tree-trigrams-v1`) are rewritten for the rows that exist; use
+`derive-search REV` to build rows that do not.
+
+`drop` removes every row of a kind in batches and the kind then derives again
+on demand. It changes no answer, only latency: the next query that needs a row
+derives it, and for `generation`, `skiplist`, `root_tree` and `history-tree-v1` on a
+long history the first query derives the whole history. Warm them with
+`repair rederive` instead of waiting for a user. Dropping `history-tree-v1` also
+drops `history-node-v1`, because only it refers to those rows.
+
+Kinds that cannot be rederived (and so are refused by `drop` with an
+explanation and exit status 2): `signature-v1` and `review-v1` (clients wrote
+them), `rebased-origin-v1` (written by rebase; `land`'s retry detection depends
+on it), `blob-claim-v1`, `blob-condemned-v1`, `blob-rescue-v1`, `blob-doom-v1` (the GC
+fence, ADR 0012), `history-node-v1` on its own, and the ref log. The full table
+with reasons is in ADR 0025. `blame` can be dropped but not rederived: its rows
+are keyed by a hash of (changeset, path) and cannot be listed.
+
+Everything `repair` changes is derived data. If a repair makes things worse
+(it cannot, short of a bug), `repair drop` of the same kind returns the store
+to "derives on demand".
+
 ## Crash and fault tests
 
 Two suites check what happens when stores fail and processes die (ADR 0021).
@@ -339,6 +469,8 @@ LEEP_CRASH_SEED=12345 LEEP_CRASH_ROUNDS=9 cargo test -p leep-e2e --test crash
 | `LEEP_CRASH_ROUNDS` | 3 | SIGKILLs of the server per backend. Rounds cycle through three scenarios (offline GC, `gc collect` killed mid-run, a fenced GC beside live traffic), so use a multiple of 3. Roughly 7 to 10 seconds per round, longer as history grows. |
 | `LEEP_CRASH_SEED` | fixed | Seeds the kill delays, each agent's workload and which requests hang up. |
 | `LEEP_CRASH_AGENTS` | 6 | HTTP agents; two `leep` CLI agents always run too. |
+
+After every kill the test also runs `leep-server verify` against the store, and at the end `verify --full --rehash` (see "Verify and repair"), so a kill that left a derived row wrong, or a ref log that no longer replays, fails the run.
 
 The seed fixes the plan, not the interleaving of threads and processes, so a
 failure usually, but not always, reproduces from its seed. A failure message
@@ -449,6 +581,7 @@ What fails a run, and what to do:
 | `server_error`, `transport_error`, `stall`, `deadlock`, `postgres_deadlock`, `unexpected_status`, `cli_server_error` | A 5xx, a dropped connection or a hang outside a restart, a request that gave no answer in 90 s, an agent with no progress, an answer nobody expected |
 | `threshold_land_p99`, `threshold_rss_slope`, `baseline_regression` | A bound on latency, memory growth or a baseline was exceeded |
 | `policy`, `land_rejected`, `release` | Signing and review did not behave: an unsigned or unreviewed land was accepted, or a good one refused |
+| `verify` | `leep-server verify --full --rehash` over the stores after the swarm stopped found a problem: the message names the first ones. Run it by hand on the kept data (see Verify and repair) |
 
 A seed replays the workload plan, not the interleaving of threads and
 processes, so a failure usually, but not always, reproduces. Server logs are

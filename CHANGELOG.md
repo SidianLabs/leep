@@ -225,8 +225,8 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   (`database schema vN is newer than this server`) or whose applied migration
   was edited, before it writes anything.
 - `leep-server migrate [--dry-run|--status]` applies or previews migrations,
-  and `--no-migrate` (`LEEP_NO_MIGRATE=1`) makes the server, `gc` and
-  `derive-search` refuse to run while any are pending. Servers still migrate
+  and `--no-migrate` (`LEEP_NO_MIGRATE=1`) makes the server, `gc`,
+  `derive-search`, `verify` and `repair` refuse to run while any are pending. Servers still migrate
   on start by default. See `docs/OPERATIONS.md`, "Upgrading".
 - `leep_schema_version` gauge, and `MetaStore::schema_version()` (a provided
   method, so existing implementations keep compiling).
@@ -243,6 +243,24 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   `leep_config_last_reload_timestamp_seconds`, with alert examples in
   `docs/OPERATIONS.md`. There is no reload endpoint and no file watcher.
 - A SIGHUP no longer terminates the server.
+- `leep-server verify` checks a store without writing to it (ADR 0025): every
+  ref's history, tree nodes and blobs exist and match their addresses
+  (`--rehash` also re-reads blob bytes), the ref log replays to the refs, and
+  derived rows (generation, skiplist, last merge, root tree, path history,
+  search, blame, signatures, reviews, GC and rebase bookkeeping) equal a
+  recomputation, for a sample or with `--full`. Problems name the kind, key,
+  changeset and path. Exit status 0 clean, 1 problems, 2 could not run;
+  `--json` for scripts.
+- `leep-server repair rederive --kind K` recomputes derived rows and writes the
+  missing or wrong ones (`--dry-run`, `--ref`), including the tree and history
+  nodes it derives, and `repair drop --kind K` deletes a kind so it derives
+  again on demand. Kinds history cannot regenerate (signatures, reviews,
+  rebase links, GC fence state, the ref log) are refused.
+- `MetaStore` gains `list_derived` and `delete_derived_kind` (data operations,
+  no schema change); every backend implements them and the contract tests
+  cover them.
+- The crash test verifies the store after every kill, and the soak test and
+  the git import e2e test verify it at the end (`--full --rehash`).
 
 ### Fixes
 - Processes opening a new SQLite metadata file at the same moment (servers

@@ -83,6 +83,17 @@ fn to_id(bytes: &[u8]) -> Result<leep_core::ChangesetId> {
     Ok(leep_core::ChangesetId(leep_core::Hash(arr)))
 }
 
+fn to_hash(bytes: &[u8]) -> Result<leep_core::Hash> {
+    let arr: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| storage("bad key length in db"))?;
+    Ok(leep_core::Hash(arr))
+}
+
+/// Rows `delete_derived_kind` removes per statement, so dropping a large kind
+/// is many short transactions, not one that holds locks for minutes.
+const DELETE_BATCH: i64 = 10_000;
+
 /// The row layout both backends select from `ref_log`.
 type LogRow = (
     i64,

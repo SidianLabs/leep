@@ -69,10 +69,10 @@ content-addressing and (b) the atomicity of `MetaStore::cas_ref`.
 
 | Crate | Role | May depend on |
 |---|---|---|
-| `leep-core` | Types, hashing, encoding, `BlobStore`/`MetaStore` traits (including listing and blob deletion for GC), in-memory stores, conformance tests, API types, pure rename detection | no other leep crate; no I/O, no async runtime |
+| `leep-core` | Types, hashing, encoding, `BlobStore`/`MetaStore` traits (including listing and blob deletion for GC, and listing and dropping derived rows by kind for repair), in-memory stores, conformance tests, API types, pure rename detection | no other leep crate; no I/O, no async runtime |
 | `leep-store` | `BlobStore` backends: filesystem, `object_store` (S3/MinIO), `CachedBlobStore`, `open_blob_store(url)` | core |
 | `leep-meta` | `MetaStore` backends: SQLite, Postgres, `open_meta_store(url)`, and the versioned schema migrator (`migrate`, ADR 0023) | core |
-| `leep-derive` | `Repo`: derived data framework and kinds, plus all operations and blob garbage collection (`gc`) | core (traits only, never a concrete backend) |
+| `leep-derive` | `Repo`: derived data framework and kinds, plus all operations, blob garbage collection (`gc`) and store verification and repair (`integrity`) | core (traits only, never a concrete backend) |
 | `leep-server` | HTTP server binary `leep-server` | core, store, meta, derive |
 | `leep-cli` | Client binary `leep` | core only |
 | `leep-mcp` | MCP server binary `leep-mcp` for AI agents (stdio JSON-RPC; talks to `leep-server` over HTTP) | core and the `leep-cli` library (its HTTP client); never derive, store, meta or server outside dev-dependencies |
@@ -208,6 +208,25 @@ others count as `files_skipped`. The index rows are derived lazily by the first
 search that needs them and are keyed by content, so a new revision derives only
 what it changed; `leep-server derive-search <rev>` warms a revision ahead of
 time. Clients are `leep search` and the `leep_search` MCP tool.
+
+**Verification and repair** ([ADR 0025](adr/0025-repair-tools.md)).
+`leep-server verify` and `leep-server repair` run offline against the stores
+(`leep_derive::integrity`) and are the answer to data damaged at rest, which
+the failure model below does not cover. `verify` walks history oldest first
+from the refs (or every stored changeset with `--full`), checks that every
+changeset, tree node and blob a changeset names exists and hashes to its
+address (`--rehash` reads blob bytes), replays the ref log against the refs,
+and compares each derived row with what the code that derives it computes from
+the changeset and its parents' rows. Because parents are checked first, a
+damaged row is reported where it is and later rows are judged against the true
+value, so one flipped bit is one finding. The recomputation runs on in-memory
+shadows of the stores, so `verify` cannot write. `repair rederive` runs the
+same recomputation against the real stores and writes the rows that differ
+(derivation also rewrites the tree and history nodes it derives, which restores
+missing ones); `repair drop` deletes a kind so it derives again on demand.
+Only kinds that history can regenerate are rederived or dropped; signatures,
+reviews, rebase links, GC fence rows and the ref log are refused. The table of
+kinds is `leep_derive::integrity::kinds`, mirrored in the ADR.
 
 ## 6. Request flows
 
@@ -388,6 +407,7 @@ misses and occupancy as Prometheus metrics (see [OPERATIONS.md](OPERATIONS.md)).
 | Land CAS contention | Bounded retries, then an error | Client retries `land` |
 | Server started on a database from a newer release, or whose applied migration was edited | The store refuses to open (`database schema vN is newer than this server`), before any write | Upgrade the server; never edit an applied migration (ADR 0023) |
 | Migration fails or the migrating process dies mid-run | Every pending migration and its `schema_migrations` row run in one transaction: the database stays at the version it started at | Fix the cause and start again; concurrent starters wait on the lock and find the work done |
+| Data damaged at rest (bit rot, a bad restore, a hand-edited table) | Content-addressed objects fail their hash check on read; derived rows without one can answer wrongly and silently (ADR 0021) | `leep-server verify` names every damaged object and row; `repair rederive` rewrites derived rows, and blobs and changesets are restored from backup (OPERATIONS.md, "Verify and repair") |
 | `gc` killed at any point | Rows it wrote are harmless (a condemned blob is re-uploaded on demand, an announced delete is closed by the next collect); no reachable blob was deleted | Run `gc collect` again |
 
 **What each backend guarantees.** "Applied" means durable against a process
@@ -408,7 +428,7 @@ written after the values it is computed from exist, and derivation retries
 from whatever rows are present. What the stores do not protect is a row or
 blob that is damaged at rest. Tree nodes and history nodes are content
 addressed and checked on read; most other derived rows are not (ADR 0021
-lists them). The tests that establish all of this are in ADR 0021; the soak test
+lists them). `leep-server verify` closes that gap offline by recomputation (ADR 0025). The tests that establish all of this are in ADR 0021; the soak test
 (ADR 0022) checks the same properties over hours and a deep history, with
 GC and restarts running beside a swarm of agents.
 

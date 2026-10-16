@@ -14,6 +14,7 @@ mod comments;
 pub mod derived;
 pub mod gc;
 mod history;
+pub mod integrity;
 mod land;
 mod merge;
 pub mod owners;

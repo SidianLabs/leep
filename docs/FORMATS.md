@@ -334,6 +334,19 @@ object-store `blobs/<hex[0..2]>/` prefixes in hash order, and
 modification time is the file mtime or object `LastModified`; a repeated `put`
 refreshes it.
 
+## Verify and repair (new `MetaStore` methods, no format change)
+
+ADR 0025 adds `MetaStore::list_derived` and `delete_derived_kind`. They are data
+operations on the existing `derived` table, not a schema change: `list_derived`
+is `SELECT key, value FROM derived WHERE kind = ? AND key > ? ORDER BY key LIMIT ?`
+(a range scan of the primary key `(kind, key)`, an empty `after` sorting below
+every 32-byte key), and `delete_derived_kind` is
+`DELETE FROM derived WHERE kind = ? AND key IN (SELECT key FROM derived WHERE kind = ? LIMIT 10000)`
+repeated until it removes nothing. No encoding, hash, index, table or `/v1`
+shape changed, and `verify` and `repair` are not part of the HTTP API.
+`verify` lists every kind to check it; `repair` rewrites or drops only the kinds
+that history can regenerate, and refuses the rest (ADR 0025).
+
 ## Fenced garbage collection (new derived kinds, no other format change)
 
 ADR 0012 adds the three GC kinds in the table above (`blob-claim-v1` already

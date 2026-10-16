@@ -90,7 +90,8 @@ Exit: a full soak run and the fuzzers find nothing new for two weeks.
   test that upgrades a populated store from every earlier tagged version
   (ADR 0023; until a release is tagged, from the pre-ref-log and un-versioned
   schemas, with a fixture added for every new migration)
-- [ ] Repair tools: verify reachability, re-derive or drop derived data by kind
+- [x] Repair tools: verify reachability, re-derive or drop derived data by kind
+  (`leep-server verify` and `repair`; ADR 0025)
 - [ ] Runbook for every alert in `docs/OPERATIONS.md`
 - [x] Config reload without restart (tokens, keys, policies; SIGHUP, ADR 0024)
 - [ ] Two or three design partners from the first market (see
