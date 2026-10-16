@@ -135,9 +135,11 @@ pub(crate) async fn apply_changes(
         );
     }
 
-    // Rebuild bottom-up, storing each rewritten node.
+    // Rebuild bottom-up, then store every rewritten node in one batch (the
+    // changeset that will reference them is written after all of them).
     let mut dirs: Vec<String> = nodes.keys().filter(|d| !d.is_empty()).cloned().collect();
     dirs.sort_by_key(|d| std::cmp::Reverse(depth(d)));
+    let mut rewritten = Vec::with_capacity(dirs.len() + 1);
     for d in dirs {
         let node = nodes.remove(&d).expect("present");
         let parent = nodes.get_mut(parent_dir(&d)).expect("parent loaded");
@@ -146,7 +148,7 @@ pub(crate) async fn apply_changes(
             parent.entries.remove(name);
         } else {
             let h = node.hash();
-            repo.put_rescuing(h, Bytes::from(node.encode())).await?;
+            rewritten.push((h, Bytes::from(node.encode())));
             parent
                 .entries
                 .insert(name.to_string(), TreeEntry::Dir { tree: h });
@@ -154,7 +156,8 @@ pub(crate) async fn apply_changes(
     }
     let root = nodes.remove("").expect("root");
     let h = root.hash();
-    repo.put_rescuing(h, Bytes::from(root.encode())).await?;
+    rewritten.push((h, Bytes::from(root.encode())));
+    repo.put_rescuing_many(rewritten).await?;
     Ok(h)
 }
 

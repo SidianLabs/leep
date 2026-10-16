@@ -69,7 +69,7 @@ content-addressing and (b) the atomicity of `MetaStore::cas_ref`.
 
 | Crate | Role | May depend on |
 |---|---|---|
-| `leep-core` | Types, hashing, encoding, `BlobStore`/`MetaStore` traits (including listing and blob deletion for GC, listing and dropping derived rows by kind for repair, and batched changeset and derived reads for history walks), in-memory stores, conformance tests, API types, pure rename detection | no other leep crate; no I/O, no async runtime |
+| `leep-core` | Types, hashing, encoding, `BlobStore`/`MetaStore` traits (including listing and blob deletion for GC, listing and dropping derived rows by kind for repair, batched changeset and derived reads for history walks, and batched derived writes and changeset-with-rows writes for changeset creation), in-memory stores, conformance tests, API types, pure rename detection | no other leep crate; no I/O, no async runtime |
 | `leep-store` | `BlobStore` backends: filesystem (loose objects plus delta-compressed packs and the repack writer, ADR 0029), `object_store` (S3/MinIO), `CachedBlobStore`, `open_blob_store(url)`, and the incremental blob copy backup and restore use (`sync`, ADR 0026) | core |
 | `leep-meta` | `MetaStore` backends: SQLite, Postgres, `open_meta_store(url)`, the versioned schema migrator (`migrate`, ADR 0023), and metadata snapshots and their import (`snapshot`, ADR 0026) | core |
 | `leep-derive` | `Repo`: derived data framework and kinds, plus all operations, blob garbage collection (`gc`), the delta-base walk for `repack` (`pack_order`) and store verification and repair (`integrity`) | core (traits only, never a concrete backend) |
@@ -148,7 +148,8 @@ changeset, and concurrent servers that race produce identical bytes.
 | `blob-trigrams-v1` | per blob hash: sorted trigram set of a UTF-8 text blob up to 1 MiB (delta varints), or a "not indexed" marker (ADR 0014) | code search |
 | `tree-trigrams-v1` | per tree node hash: fixed-size bloom filter (2^19 bits) over every trigram below the directory, the OR of its children's filters; shared by every revision with the same subtree (ADR 0014) | code search directory pruning |
 
-`root_tree` and `generation` are derived eagerly when a changeset is created.
+`root_tree`, `generation` and `skiplist` are computed eagerly when a changeset
+is created and written with it in one call (ADR 0031, see "Commit" below).
 Other kinds are derived on first read (the search kinds on the first search
 that needs them; see "Code search"), and every server also warms them in the
 background for each ref head that moved, every `--warm-interval` (ADR 0028), so
@@ -280,6 +281,22 @@ OPERATIONS.md.
 3. It sends `POST /v1/changesets`. The server validates the changeset, derives
    its tree and returns the id.
 Nothing mutable has changed yet; the changeset is just an addressable object.
+
+Storing a changeset (ADR 0031) costs one round of reads and one write. The
+server reads, concurrently and in batches, whether the parents exist, their
+generations, the first parent's root tree and skiplist, and the contents'
+`blob-condemned-v1` rows. It checks parents and blobs, writes the rewritten
+tree nodes (then reads their condemnation rows in one batch), computes the
+generation and skiplist with the derived kinds' own code, and stores the
+changeset with its `root_tree`, `generation` and `skiplist` rows through
+`MetaStore::put_changeset_with_derived`: one statement on Postgres, one
+transaction on SQLite, so the changeset never appears without them. A rebase
+adds its `rebased-origin-v1` link and the git importer its commit mapping to
+that write. Building a skiplist needs the lists of the first-parent ancestors
+1, 2, 4, ... steps up, one after another; `Repo` caches the lists it computes
+and those it reads while creating changesets (never rows read by `verify` or
+`repair`, which substitute recomputed rows as they go). Whatever the batched
+round does not supply is read or derived singly, as before.
 
 **Land** (`leep land`, the no-merge-queue path):
 ```
@@ -439,7 +456,10 @@ misses and occupancy as Prometheus metrics (see [OPERATIONS.md](OPERATIONS.md)).
   NOTHING`), never a read followed by a write. Its ref log row is inserted in
   the same transaction, only when the statement changed a row.
 - Changesets, blobs and derived values are written idempotently. Duplicate
-  writes from racing servers are harmless.
+  writes from racing servers are harmless. Batched derived writes insert in
+  `(kind, key)` order, so two batches that share rows (claims for the same
+  blob from two uploads) queue on each other's row locks instead of
+  deadlocking (ADR 0031).
 - A blob may be orphaned if a client uploads it and never commits, and tree
   nodes or merge blobs may be orphaned if the changeset that would reference
   them fails to store. `leep-server gc` reclaims them in two fenced phases:
@@ -489,7 +509,12 @@ except where noted.
 
 Derived data is only ever missing after a failure, never wrong: a row is
 written after the values it is computed from exist, and derivation retries
-from whatever rows are present. What the stores do not protect is a row or
+from whatever rows are present. On Postgres, SQLite and memory a new
+changeset's `root_tree`, `generation` and `skiplist` rows, a rebased copy's
+link and an imported commit's mapping are written in the changeset's own
+atomic call, so a crash never leaves a stored changeset without them; a
+backend without that call writes the changeset first and the rows after, and
+nothing depends on the difference (ADR 0031). What the stores do not protect is a row or
 blob that is damaged at rest. Tree nodes and history nodes are content
 addressed and checked on read; most other derived rows are not (ADR 0021
 lists them). `leep-server verify` closes that gap offline by recomputation (ADR 0025). The tests that establish all of this are in ADR 0021; the soak test

@@ -127,14 +127,21 @@ async fn derive_missing<K: DerivedKind>(repo: &Repo, id: ChangesetId) -> Result<
         repo.derive_calls
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let v = K::derive(repo, cid, &cs, &pv).await?;
-        metrics::counter!("leep_derive_total", "kind" => K::NAME).increment(1);
-        metrics::histogram!("leep_derive_duration_seconds", "kind" => K::NAME)
-            .record(started.elapsed().as_secs_f64());
+        record_derivation(K::NAME, started);
         meta.put_derived(K::NAME, &cid.0, v.clone()).await?;
         computed.insert(cid, v.clone());
         last = Some(v);
     }
     last.ok_or_else(|| Error::Storage("derivation produced no value".into()))
+}
+
+/// Count one computed value of `kind` and its time. Also used where a value
+/// is computed outside [`derive`], as changeset creation does for the rows it
+/// writes with the changeset, so the metrics keep counting every derivation.
+pub(crate) fn record_derivation(kind: &'static str, started: std::time::Instant) {
+    metrics::counter!("leep_derive_total", "kind" => kind).increment(1);
+    metrics::histogram!("leep_derive_duration_seconds", "kind" => kind)
+        .record(started.elapsed().as_secs_f64());
 }
 
 pub(crate) fn decode_hash(b: &[u8]) -> Result<Hash> {

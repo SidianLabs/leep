@@ -7,7 +7,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use bytes::Bytes;
 
-use crate::store::{unix_now, BlobMeta, RefLogEntry, RefUpdateContext};
+use crate::store::{unix_now, BlobMeta, DerivedRow, RefLogEntry, RefUpdateContext};
 use crate::{BlobStore, Changeset, ChangesetId, Hash, MetaStore, Result};
 
 /// Unix seconds now, for blob modification times.
@@ -293,6 +293,31 @@ impl MetaStore for MemoryMetaStore {
             .insert((kind.to_string(), *key), value);
         Ok(())
     }
+
+    async fn put_derived_many(&self, rows: &[DerivedRow]) -> Result<()> {
+        let mut all = self.derived.lock().unwrap();
+        for r in rows {
+            all.insert((r.kind.clone(), r.key), r.value.clone());
+        }
+        Ok(())
+    }
+
+    /// Both maps are locked together, so no reader sees the changeset
+    /// without its rows.
+    async fn put_changeset_with_derived(
+        &self,
+        cs: &Changeset,
+        rows: &[DerivedRow],
+    ) -> Result<ChangesetId> {
+        let id = cs.id();
+        let mut changesets = self.changesets.lock().unwrap();
+        let mut all = self.derived.lock().unwrap();
+        changesets.entry(id).or_insert_with(|| cs.clone());
+        for r in rows {
+            all.insert((r.kind.clone(), r.key), r.value.clone());
+        }
+        Ok(id)
+    }
 }
 
 /// Conformance checks every `MetaStore` implementation should pass. Backend
@@ -367,6 +392,100 @@ pub async fn check_meta_store_contract(store: &dyn MetaStore) {
 
     check_list_derived(store).await;
     check_batched_reads(store).await;
+    check_batched_writes(store).await;
+}
+
+/// The batched writes store what the single writes would, applied in order:
+/// a key given twice keeps its last value, an empty batch writes nothing,
+/// repeating a write is harmless, and rows reach exactly their kind. A
+/// changeset written with its rows is readable with all of them, and writing
+/// it again still writes the rows it comes with.
+async fn check_batched_writes(store: &dyn MetaStore) {
+    let key = |n: u32| Hash::of_blob(format!("batch write {n}").as_bytes());
+    let row =
+        |kind: &str, n: u32, v: &str| DerivedRow::new(kind, key(n), Bytes::from(v.to_string()));
+    let get =
+        |kind: &'static str, n: u32| async move { store.get_derived(kind, &key(n)).await.unwrap() };
+
+    store.put_derived_many(&[]).await.unwrap();
+    store
+        .put_derived("bw-a", &key(0), Bytes::from_static(b"old"))
+        .await
+        .unwrap();
+    let rows = [
+        row("bw-a", 0, "new"),
+        row("bw-a", 1, "first"),
+        row("bw-b", 1, "other kind"),
+        row("bw-a", 1, "last"),
+        row("bw-a", 2, "two"),
+    ];
+    store.put_derived_many(&rows).await.unwrap();
+    store.put_derived_many(&rows).await.unwrap();
+    assert_eq!(get("bw-a", 0).await.unwrap(), &b"new"[..], "overwrites");
+    assert_eq!(get("bw-a", 1).await.unwrap(), &b"last"[..], "last wins");
+    assert_eq!(get("bw-b", 1).await.unwrap(), &b"other kind"[..]);
+    assert_eq!(get("bw-a", 2).await.unwrap(), &b"two"[..]);
+    assert!(get("bw-b", 0).await.is_none(), "kinds stay apart");
+    assert_eq!(
+        store.list_derived("bw-a", None, 10).await.unwrap().len(),
+        3,
+        "no stray rows"
+    );
+    // Larger than any reasonable statement parameter limit per batch.
+    let many: Vec<DerivedRow> = (0..2500)
+        .map(|n| row("bw-many", n % 2000, &format!("v{n}")))
+        .collect();
+    store.put_derived_many(&many).await.unwrap();
+    let listed = store.list_derived("bw-many", None, 5000).await.unwrap();
+    assert_eq!(listed.len(), 2000);
+    for (k, v) in [(5, "v2005"), (1999, "v1999"), (0, "v2000")] {
+        assert_eq!(get("bw-many", k).await.unwrap(), v.as_bytes(), "row {k}");
+    }
+
+    let cs = |n: i64| Changeset {
+        parents: vec![],
+        author: "t".into(),
+        timestamp: 4000 + n,
+        message: format!("with rows {n}"),
+        changes: BTreeMap::new(),
+        extra: BTreeMap::new(),
+    };
+    let one = cs(1);
+    let rows = [row("bw-cs", 10, "ten"), row("bw-cs", 11, "eleven")];
+    let id = store.put_changeset_with_derived(&one, &rows).await.unwrap();
+    assert_eq!(id, one.id());
+    assert_eq!(store.get_changeset(&id).await.unwrap().as_ref(), Some(&one));
+    assert_eq!(get("bw-cs", 10).await.unwrap(), &b"ten"[..]);
+    assert_eq!(get("bw-cs", 11).await.unwrap(), &b"eleven"[..]);
+    assert_eq!(
+        store.put_changeset_with_derived(&one, &rows).await.unwrap(),
+        id,
+        "idempotent"
+    );
+    // A stored changeset still gets the rows it comes with.
+    store
+        .put_changeset_with_derived(&one, &[row("bw-cs", 12, "twelve")])
+        .await
+        .unwrap();
+    assert_eq!(get("bw-cs", 12).await.unwrap(), &b"twelve"[..]);
+    let two = cs(2);
+    let id2 = store.put_changeset_with_derived(&two, &[]).await.unwrap();
+    assert_eq!(
+        store.get_changeset(&id2).await.unwrap().as_ref(),
+        Some(&two)
+    );
+    let three = cs(3);
+    let id3 = store
+        .put_changeset_with_derived(&three, &many)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get_changeset(&id3).await.unwrap().as_ref(),
+        Some(&three)
+    );
+    for kind in ["bw-a", "bw-b", "bw-many", "bw-cs"] {
+        store.delete_derived_kind(kind).await.unwrap();
+    }
 }
 
 /// The batched reads answer exactly what the single reads do: one slot per

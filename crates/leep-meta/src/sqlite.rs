@@ -4,7 +4,9 @@ use std::str::FromStr;
 use async_trait::async_trait;
 use bytes::Bytes;
 use leep_core::store::unix_now;
-use leep_core::{Changeset, ChangesetId, Hash, MetaStore, RefLogEntry, RefUpdateContext, Result};
+use leep_core::{
+    Changeset, ChangesetId, DerivedRow, Hash, MetaStore, RefLogEntry, RefUpdateContext, Result,
+};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Row, SqliteConnection, SqlitePool};
 
@@ -463,6 +465,36 @@ impl MetaStore for SqliteMetaStore {
         Ok(())
     }
 
+    /// One transaction, so one commit (and one sync) for the whole batch.
+    async fn put_derived_many(&self, rows: &[DerivedRow]) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self.pool.begin().await.map_err(storage)?;
+        put_rows(&mut tx, rows).await?;
+        tx.commit().await.map_err(storage)
+    }
+
+    /// One transaction whose first statement is a write, so SQLite takes the
+    /// write lock up front.
+    async fn put_changeset_with_derived(
+        &self,
+        cs: &Changeset,
+        rows: &[DerivedRow],
+    ) -> Result<ChangesetId> {
+        let id = cs.id();
+        let mut tx = self.pool.begin().await.map_err(storage)?;
+        sqlx::query("INSERT INTO changesets (id, data) VALUES (?, ?) ON CONFLICT DO NOTHING")
+            .bind(id.0.as_bytes().as_slice())
+            .bind(cs.encode())
+            .execute(&mut *tx)
+            .await
+            .map_err(storage)?;
+        put_rows(&mut tx, rows).await?;
+        tx.commit().await.map_err(storage)?;
+        Ok(id)
+    }
+
     async fn schema_version(&self) -> Result<Option<u64>> {
         let v: Option<i64> = sqlx::query_scalar("SELECT MAX(version) FROM schema_migrations")
             .fetch_one(&self.pool)
@@ -470,4 +502,22 @@ impl MetaStore for SqliteMetaStore {
             .map_err(storage)?;
         Ok(Some(v.unwrap_or(0) as u64))
     }
+}
+
+/// Statements on one connection are local calls in SQLite, so the rows go one
+/// statement each; the transaction around them is what costs.
+async fn put_rows(conn: &mut SqliteConnection, rows: &[DerivedRow]) -> Result<()> {
+    for r in rows {
+        sqlx::query(
+            "INSERT INTO derived (kind, key, value) VALUES (?, ?, ?) \
+             ON CONFLICT (kind, key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(&r.kind)
+        .bind(r.key.as_bytes().as_slice())
+        .bind(r.value.as_ref())
+        .execute(&mut *conn)
+        .await
+        .map_err(storage)?;
+    }
+    Ok(())
 }

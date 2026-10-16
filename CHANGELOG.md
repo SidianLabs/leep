@@ -343,6 +343,18 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   `get_changesets` and `get_derived_many` (provided methods that loop over
   the single reads, so other implementations keep compiling); Postgres and
   SQLite answer each with one query.
+- Storing a changeset takes one round of batched reads and one write
+  (ADR 0031): the changeset with its root tree, generation and skiplist rows,
+  and a rebase's link or the git importer's mapping, in one statement on
+  Postgres and one transaction on SQLite, so a changeset never appears
+  without them. Tree node and blob uploads check GC condemnation in batches,
+  and skiplists are cached. On the first 3,795 commits of git/git on Postgres,
+  `leep-git import` takes 14 s instead of 39 to 43 s (7.8 statements per
+  commit instead of 38.3), `POST /v1/changesets` 4 to 5 ms instead of 9 to 13
+  ms, and a land that replays a changeset 7.5 to 9 ms instead of 13 to 17 ms;
+  the data written is byte-identical. `MetaStore` gains `put_derived_many`
+  and `put_changeset_with_derived` (provided methods; batched rows are
+  written in `(kind, key)` order so concurrent batches cannot deadlock).
 
 ### Fixes
 - Processes opening a new SQLite metadata file at the same moment (servers
