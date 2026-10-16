@@ -212,7 +212,9 @@ compiling; every real backend implements both.
   the record of what happened, and which side is right is the operator's call
   (OPERATIONS.md, "Verify and repair").
 - Opening a store applies whatever schema migration the binary carries (ADR
-  0023), as `gc` does. Run `verify` with the version the servers run.
+  0023), as `gc` does, unless `--no-migrate` is set, in which case `verify`
+  and `repair` refuse to run while migrations are pending. Run them with the
+  version the servers run.
 
 ## Future work: checksums for the unverified kinds
 Recomputation finds every wrong derived row but costs a changeset walk, and it

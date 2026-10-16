@@ -18,7 +18,7 @@ existing history. Read docs/FORMATS.md first.
 | Add an API field | `Option`/`#[serde(default)]` on the `/v1` type. |
 | Remove or rename an API field | Add `/v2` alongside `/v1`. |
 | Change `Changeset`/`TreeNode` shape or hashing | Continue below. Needs an ADR. |
-| Change the SQL schema | Add a forward-only, idempotent migration in leep-meta. |
+| Change the SQL schema | Add a numbered migration for both backends and a fixture (see below). |
 
 ## New object version (`changeset-v2`, `tree-v2`)
 
@@ -31,3 +31,28 @@ existing history. Read docs/FORMATS.md first.
 5. Add golden tests: fixed v1 bytes and their expected hash, checked into
    the tests, so an accidental change fails CI.
 6. Update FORMATS.md and ARCHITECTURE.md §4.
+
+## SQL schema change (ADR 0023)
+
+Migrations are forward-only and numbered; a released one is never edited
+(its checksum is recorded in every database that ran it).
+
+1. Write an ADR (or extend the one for your feature) saying what changes and
+   what an old server does against the new schema. A migration that drops or
+   rewrites data needs its own ADR and must not be the first thing a server
+   start does silently; say how the operator runs it deliberately.
+2. Add `crates/leep-meta/migrations/sqlite/NNNN_name.sql` and
+   `.../postgres/NNNN_name.sql` (next number, no gaps, same name), plain
+   `CREATE`/`ALTER` (not `IF NOT EXISTS`), and append them to
+   `MIGRATIONS` in `sqlite.rs` and `postgres.rs` with `satisfied_by: &[]`.
+   The statements run in one transaction.
+3. Never edit an earlier migration, including 0001.
+4. Fixture: in `crates/leep-meta/src/migrate_tests.rs` add a `Stage` for the
+   schema you are upgrading from (the previous latest) and populate it with
+   SQL that version used (`Data`/`load`), then check the data reads back in
+   `verify`, and that the new column or table works. The template at the top
+   of the file lists the steps.
+5. Run `LEEP_TEST_POSTGRES_URL=... cargo test -p leep-meta` (both backends)
+   and `cargo test -p leep-e2e --test migrate`.
+6. Update docs/FORMATS.md (schema section), the CHANGELOG and, if operators
+   must do something, docs/OPERATIONS.md "Upgrading".

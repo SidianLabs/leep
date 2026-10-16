@@ -212,6 +212,24 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   walking.
 
 ### Operations
+- Versioned schema migrations for SQLite and Postgres (ADR 0023). The
+  metadata schema is now an ordered list of migrations compiled into the
+  binary, recorded in a `schema_migrations` table with checksums, and applied
+  in one transaction under a lock, so servers starting together migrate once
+  and a failed migration leaves the database untouched. Existing databases are
+  adopted without any change to their data: the first server to open one
+  records version 1 (a database from before the ref log also gains that table).
+  Applied migrations are immutable, and every schema change now needs a new
+  migration plus a fixture of the schema it upgrades from.
+- A server refuses to start on a database that a newer release migrated
+  (`database schema vN is newer than this server`) or whose applied migration
+  was edited, before it writes anything.
+- `leep-server migrate [--dry-run|--status]` applies or previews migrations,
+  and `--no-migrate` (`LEEP_NO_MIGRATE=1`) makes the server, `gc`,
+  `derive-search`, `verify` and `repair` refuse to run while any are pending. Servers still migrate
+  on start by default. See `docs/OPERATIONS.md`, "Upgrading".
+- `leep_schema_version` gauge, and `MetaStore::schema_version()` (a provided
+  method, so existing implementations keep compiling).
 - `leep-server verify` checks a store without writing to it (ADR 0025): every
   ref's history, tree nodes and blobs exist and match their addresses
   (`--rehash` also re-reads blob bytes), the ref log replays to the refs, and
@@ -230,6 +248,11 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   cover them.
 - The crash test verifies the store after every kill, and the soak test and
   the git import e2e test verify it at the end (`--full --rehash`).
+
+### Fixes
+- A `leep init` whose checkout fails part way (server restarting, a bad
+  blob) now removes the files it wrote and its `.leep`, so retrying works.
+  It used to leave a half-made working copy that refused the retry.
 
 ### Project
 - Workspace version set to 0.0.1, with a CI check that keeps it below

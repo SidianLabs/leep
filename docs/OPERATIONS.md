@@ -52,6 +52,7 @@ measured until the response head is ready, not until the body is streamed.
 | `leep_requests_limited_total` | counter | `reason` = `rate`, `concurrency`, `size`; `token` | Requests refused by a request limit (ADR 0020). `token` is the token's name, or `anonymous` for every client address when there is no tokens file. |
 | `leep_requests_in_flight` | gauge | `token` | Requests in progress, until their response body has been sent. Only tokens that have a limit are tracked. |
 | `leep_build_info` | gauge | `version` | Always 1; carries the server version. |
+| `leep_schema_version` | gauge | none | Newest metadata schema migration applied (ADR 0023), read when the server opened the store. Servers sharing a database report the same value once all are upgraded. |
 
 Seconds histograms use buckets from 1 ms to 10 s; `leep_land_attempts` uses
 1 to 32. The cache metrics are recorded by `CachedBlobStore` itself as it
@@ -138,9 +139,9 @@ Tuning:
 Every ref create, move and delete is recorded in the `ref_log` table of the
 metadata store (ADR 0018), by the same transaction that changes the ref. Read
 it with `leep reflog [REF]` or `GET /v1/reflog` (a read token is enough). The
-table is created when a server first opens an existing database, with no
-manual migration, and starts empty: refs that moved before the upgrade have no
-history. Upgrade every server before relying on it; an older server still
+table is created by the schema migrations (see [Upgrading](#upgrading)) when a
+server first opens an existing database, and starts empty: refs that moved
+before the upgrade have no history. Upgrade every server before relying on it; an older server still
 running moves refs without writing entries.
 
 The log is never pruned, and it needs no maintenance: a row is about 150 bytes
@@ -151,6 +152,73 @@ deleted, so `leep-server gc` is unaffected and a ref restored with `leep undo`
 always points at an existing changeset. Postgres serializes the final insert of
 each ref move with an advisory lock (key 7164738) so `seq` follows commit order;
 it is held for the length of one insert.
+
+## Upgrading
+
+The metadata schema is versioned (ADR 0023). Each database records the
+migrations applied to it in the `schema_migrations` table; the server knows
+the list that was compiled into it. The newest applied version is the
+`leep_schema_version` gauge, and `leep-server migrate --status` prints it.
+
+**Procedure.** For every upgrade, whether or not it changes the schema:
+
+1. **Back up** metadata and blobs ([DEPLOY.md](DEPLOY.md#persistence-and-backup)).
+   There is no downgrade: going back means restoring the backup.
+2. Look at what the new version would do. With the new binary (for example
+   `docker compose run --rm leep-server migrate --status`, or `docker run --rm leep:new migrate --status` with the same `LEEP_META`):
+   ```sh
+   leep-server migrate --status      # version, history, and what is pending
+   leep-server migrate --dry-run     # the SQL of every pending migration
+   ```
+   Both change nothing. Read the CHANGELOG for anything that needs the old
+   servers stopped first.
+3. Apply it, deliberately:
+   ```sh
+   leep-server migrate
+   ```
+   It runs all pending migrations in one transaction under a lock, so it is
+   all or nothing, and may run beside servers of the previous version when the
+   release notes say they can coexist. Run it from one place; if two run at
+   once the second waits and finds nothing to do.
+4. Start the new servers. With `--no-migrate` (`LEEP_NO_MIGRATE=1`) a server
+   refuses to start while a migration is pending, which is how to make steps
+   2 and 3 mandatory in a deployment.
+
+**Default: servers migrate on start.** Without `--no-migrate`, a starting
+server applies pending migrations itself, as it always created its tables.
+This is what a single-container deployment wants, and the same transaction and
+lock apply, so a fleet that starts together migrates once. Use `--no-migrate`
+whenever you want a change window or the server's database account may not
+alter the schema. `gc`, `derive-search`, `verify` and `repair` follow the same
+flag.
+
+**First start after the versioning release.** A database made by an older
+Leep has no `schema_migrations` table. The first server or `migrate` to open it
+inspects the tables, records the migrations they already satisfy (version 1 for
+every database that has the ref log) without changing any data, and applies any
+that are missing (a database from before the ref log gains its table). With
+`--no-migrate` this counts as pending: run `migrate` once.
+
+**Rolling upgrades.** Servers share only the two stores, so old and new
+servers can run side by side while a release's migrations are compatible with
+both. Servers from before ADR 0023 do not read the version, so they will not
+notice a newer schema: do not apply a migration after version 1 while one is
+still running, and read each release's notes for whether its migration
+tolerates old servers. A server never writes to a schema it does not
+understand:
+
+- A database **newer** than the server (`database schema v3 is newer than this
+  server (max v2); upgrade the server`) is refused at startup by the server,
+  `migrate`, `gc`, `derive-search`, `verify` and `repair`, in every mode.
+  Finish the rollout rather than restarting an old server onto the migrated database; to go back, restore
+  the backup taken in step 1.
+- A migration whose checksum differs from the recorded one (someone edited an
+  applied migration, or a build is from a different branch) is refused, naming
+  the migration.
+
+A failed migration rolls back completely and leaves the database as it was;
+fix the cause and run `migrate` again. Fresh SQLite and Postgres databases
+need no setup: the first server creates them at the current version.
 
 ## Blob garbage collection
 

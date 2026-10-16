@@ -1,27 +1,60 @@
 //! `MetaStore` backends: SQLite (single node, tests) and Postgres
 //! (production). Both keep changesets, refs and derived data in three tables
 //! and implement `cas_ref` as a single conditional SQL statement. A fourth
-//! table, `ref_log`, records every ref move in the same transaction.
+//! table, `ref_log`, records every ref move in the same transaction. The
+//! schema is versioned by forward-only migrations ([`migrate`], ADR 0023).
 
 use std::sync::Arc;
 
 use leep_core::{Error, MetaStore, Result};
 
+pub mod migrate;
 mod postgres;
 mod sqlite;
 
-pub use postgres::PostgresMetaStore;
-pub use sqlite::SqliteMetaStore;
+pub use migrate::{AppliedMigration, Migration, MigrationRef, MigrationReport};
+pub use postgres::{PostgresMetaStore, MIGRATIONS as POSTGRES_MIGRATIONS};
+pub use sqlite::{SqliteMetaStore, MIGRATIONS as SQLITE_MIGRATIONS};
+
+/// What opening a store does about pending schema migrations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemaMode {
+    /// Apply them (the default).
+    Migrate,
+    /// Refuse to open unless there are none (`--no-migrate`). Writes nothing.
+    RequireCurrent,
+}
 
 /// Open a meta store from a URL: `sqlite:...`, `postgres://...`,
-/// `postgresql://...` or `mem://` (in-memory, not persistent).
+/// `postgresql://...` or `mem://` (in-memory, not persistent). Pending schema
+/// migrations are applied.
 pub async fn open_meta_store(url: &str) -> Result<Arc<dyn MetaStore>> {
+    open_meta_store_with(url, SchemaMode::Migrate).await
+}
+
+/// [`open_meta_store`] with a choice of what to do about pending migrations.
+/// Either way, a database newer than this binary is refused.
+pub async fn open_meta_store_with(url: &str, mode: SchemaMode) -> Result<Arc<dyn MetaStore>> {
     if url.starts_with("sqlite:") {
-        Ok(Arc::new(SqliteMetaStore::connect(url).await?))
+        Ok(Arc::new(SqliteMetaStore::connect_with(url, mode).await?))
     } else if url.starts_with("postgres://") || url.starts_with("postgresql://") {
-        Ok(Arc::new(PostgresMetaStore::connect(url).await?))
+        Ok(Arc::new(PostgresMetaStore::connect_with(url, mode).await?))
     } else if url.starts_with("mem://") {
         Ok(Arc::new(leep_core::memory::MemoryMetaStore::new()))
+    } else {
+        Err(Error::Invalid(format!("unsupported meta store url: {url}")))
+    }
+}
+
+/// Apply pending migrations to the database at `url`, or with `dry_run` only
+/// report what would happen. Safe beside running servers of this version.
+pub async fn migrate_meta_store(url: &str, dry_run: bool) -> Result<MigrationReport> {
+    if url.starts_with("sqlite:") {
+        SqliteMetaStore::migrate(url, dry_run).await
+    } else if url.starts_with("postgres://") || url.starts_with("postgresql://") {
+        PostgresMetaStore::migrate(url, dry_run).await
+    } else if url.starts_with("mem://") {
+        Err(Error::Invalid("mem:// has no schema to migrate".into()))
     } else {
         Err(Error::Invalid(format!("unsupported meta store url: {url}")))
     }
@@ -87,5 +120,7 @@ fn log_entry(row: LogRow) -> Result<leep_core::RefLogEntry> {
     })
 }
 
+#[cfg(test)]
+mod migrate_tests;
 #[cfg(test)]
 mod tests;

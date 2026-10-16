@@ -1,5 +1,6 @@
 //! `leep init`.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
 
@@ -10,7 +11,7 @@ use crate::cache::Cache;
 use crate::client::Client;
 use crate::error::Result;
 use crate::fmt::{plural, short};
-use crate::materialize::materialize;
+use crate::materialize::{list_files, materialize, prune_empty_dirs};
 use crate::state::{normalize_prefix, Config, WorkCopy};
 
 #[derive(Args, Debug)]
@@ -65,7 +66,19 @@ pub fn run(
     };
     match head {
         Some(id) => {
-            let stats = materialize(&mut ctx, id, false)?;
+            // Files already present before init, which a failed checkout must
+            // leave alone even when it rewrote them with the same content.
+            let existed: HashSet<String> = list_files(&ctx, &id)?
+                .into_keys()
+                .filter(|p| fs::symlink_metadata(root.join(p)).is_ok())
+                .collect();
+            let stats = match materialize(&mut ctx, id, false) {
+                Ok(stats) => stats,
+                Err(e) => {
+                    undo_checkout(&ctx, &root, &existed);
+                    return Err(e);
+                }
+            };
             if json {
                 print_json(&serde_json::json!({ "base": id, "written": stats.written }))?;
             } else {
@@ -85,4 +98,18 @@ pub fn run(
         ),
     }
     Ok((ctx, 0))
+}
+
+/// Put the directory back as `init` found it after a failed checkout: remove
+/// the files it wrote and the `.leep` it made. Otherwise a retry is refused,
+/// because the ref may have moved and those files now look untracked.
+fn undo_checkout(ctx: &Ctx, root: &std::path::Path, existed: &HashSet<String>) {
+    for path in ctx.wc.state.files.keys().filter(|p| !existed.contains(*p)) {
+        if let Ok(abs) = ctx.wc.abs_for_write(path) {
+            if fs::remove_file(&abs).is_ok() {
+                prune_empty_dirs(root, &abs);
+            }
+        }
+    }
+    let _ = fs::remove_dir_all(root.join(crate::state::DIR));
 }

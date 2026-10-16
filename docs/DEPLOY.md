@@ -209,6 +209,7 @@ looked up once per write token, so removing a token drops its reviews.
 | `LEEP_RATE_LIMIT`, `LEEP_RATE_BURST` | none | Per-token request rate and burst; see [Request limits](#request-limits). |
 | `LEEP_MAX_CONCURRENT_PER_TOKEN` | none | Requests in flight per token. |
 | `LEEP_READ_MAX_BODY_BYTES` | none | Body size cap for read tokens; needs the tokens file. |
+| `LEEP_NO_MIGRATE` | off | `1` makes the server (and `gc`, `derive-search`) refuse to start while metadata schema migrations are pending instead of applying them; see [Upgrades](#upgrades). |
 | `LEEP_REQUEST_TIMEOUT` | `5m` | Abort any request that runs longer (`90s`, `5m`; `0` disables). `leep-server gc --fence` must exceed it; see [OPERATIONS.md](OPERATIONS.md#blob-garbage-collection). |
 | `LEEP_METRICS_LISTEN` | off | Address for a separate, unauthenticated `GET /metrics` listener; keep it private. See [OPERATIONS.md](OPERATIONS.md). |
 | `LEEP_LOG_FORMAT` | `text` | `text` or `json` (one object per line). |
@@ -217,6 +218,9 @@ looked up once per write token, so removing a token drops its reviews.
 `leep-server gc` takes `--meta`/`--blobs` (or their variables) plus `--grace`,
 `--fence`, `--dry-run` and `--unsafe-no-fence`, all flags only; see
 [OPERATIONS.md](OPERATIONS.md#blob-garbage-collection).
+
+`leep-server migrate [--dry-run|--status]` applies or previews metadata schema
+migrations (`--meta` or `LEEP_META`); see [Upgrades](#upgrades).
 
 `--cache-bytes` and `--max-body-bytes` are flags only; pass them after the
 image name, e.g. `docker run leep:dev --cache-bytes 0`.
@@ -238,8 +242,22 @@ image name, e.g. `docker run leep:dev --cache-bytes 0`.
 
 ## Upgrades
 
-Schema migrations run automatically when the server connects to the
-metadata store. Rebuild the image, then recreate the container
-(`docker compose up -d --build`). Take a backup first: there is no
-automatic downgrade. Servers are stateless, so several can share one
-Postgres and bucket.
+Metadata schema migrations (ADR 0023) run automatically when the server
+connects to the metadata store, in one transaction under a lock, so several
+servers starting together migrate once. Rebuild the image, then recreate the
+container (`docker compose up -d --build`). Take a backup first: there is no
+automatic downgrade, and a server refuses a database that a newer release has
+migrated. Servers are stateless, so several can share one Postgres and bucket.
+
+To migrate on your own schedule instead, set `LEEP_NO_MIGRATE=1` on the
+servers (they refuse to start while anything is pending), then run, with the
+new image and the same `LEEP_META`:
+
+```sh
+docker compose -f deploy/docker-compose.yml run --rm leep-server migrate --status   # what is pending
+docker compose -f deploy/docker-compose.yml run --rm leep-server migrate --dry-run  # the SQL
+docker compose -f deploy/docker-compose.yml run --rm leep-server migrate            # apply it, then start the servers
+```
+
+The full procedure, rolling upgrades and the newer-schema refusal are in
+[OPERATIONS.md](OPERATIONS.md#upgrading).
