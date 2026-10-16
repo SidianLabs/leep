@@ -7,7 +7,9 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use bytes::Bytes;
 
-use crate::store::{unix_now, BlobMeta, DerivedRow, RefLogEntry, RefUpdateContext};
+use crate::store::{
+    check_ref_chain, unix_now, BlobMeta, DerivedRow, RefLogEntry, RefStep, RefUpdateContext,
+};
 use crate::{BlobStore, Changeset, ChangesetId, Hash, MetaStore, Result};
 
 /// Unix seconds now, for blob modification times.
@@ -215,6 +217,39 @@ impl MetaStore for MemoryMetaStore {
         Ok(true)
     }
 
+    async fn cas_ref_logged_chain(
+        &self,
+        name: &str,
+        expected: Option<ChangesetId>,
+        steps: &[RefStep],
+    ) -> Result<usize> {
+        check_ref_chain(expected, steps)?;
+        let mut refs = self.refs.lock().unwrap();
+        if refs.heads.get(name).copied() != expected {
+            return Ok(0);
+        }
+        let mut old = expected;
+        for step in steps {
+            let seq = refs.log.last().map_or(0, |e| e.seq) + 1;
+            refs.log.push(RefLogEntry {
+                seq,
+                name: name.to_string(),
+                old,
+                new: step.new,
+                time: unix_now(),
+                actor: step.ctx.actor.clone(),
+                operation: step.ctx.operation.clone(),
+                message: step.ctx.message.clone(),
+            });
+            old = step.new;
+        }
+        match old {
+            Some(id) => refs.heads.insert(name.to_string(), id),
+            None => refs.heads.remove(name),
+        };
+        Ok(steps.len())
+    }
+
     async fn ref_log(
         &self,
         name: Option<&str>,
@@ -373,6 +408,7 @@ pub async fn check_meta_store_contract(store: &dyn MetaStore) {
 
     check_list_changesets(store).await;
     check_ref_log(store).await;
+    check_ref_chain_log(store).await;
 
     let key = Hash::of_blob(b"k");
     assert!(store.get_derived("kind", &key).await.unwrap().is_none());
@@ -785,6 +821,137 @@ async fn check_ref_log(store: &dyn MetaStore) {
         .is_empty());
 }
 
+/// A chained swap logs one entry per step, oldest first and replaying to the
+/// head, or nothing when the ref is not where the caller expects.
+async fn check_ref_chain_log(store: &dyn MetaStore) {
+    let mut ids = Vec::new();
+    for n in 0..4 {
+        let cs = Changeset {
+            parents: vec![],
+            author: "t".into(),
+            timestamp: 3000 + n,
+            message: format!("chain {n}"),
+            changes: BTreeMap::new(),
+            extra: BTreeMap::new(),
+        };
+        ids.push(store.put_changeset(&cs).await.unwrap());
+    }
+    let (a, b, c, d) = (ids[0], ids[1], ids[2], ids[3]);
+    let step = |new: ChangesetId, who: &str| RefStep {
+        new: Some(new),
+        ctx: RefUpdateContext::new("land")
+            .actor(Some(who))
+            .message(format!("landed by {who}")),
+    };
+    assert!(store.cas_ref("ch/x", None, Some(a)).await.unwrap());
+    let chain = [step(b, "w1"), step(c, "w2"), step(d, "w3")];
+
+    // Not where the caller expects: nothing moves, nothing is logged.
+    assert_eq!(
+        store
+            .cas_ref_logged_chain("ch/x", Some(c), &chain)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        store
+            .cas_ref_logged_chain("ch/x", None, &chain)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(store.get_ref("ch/x").await.unwrap(), Some(a));
+    assert_eq!(
+        store.ref_log(Some("ch/x"), None, 100).await.unwrap().len(),
+        1
+    );
+
+    // Steps that do not move, or a chain back to the start, are refused.
+    for bad in [
+        vec![],
+        vec![step(a, "w")],
+        vec![step(b, "w"), step(b, "w")],
+        vec![step(b, "w"), step(a, "w")],
+    ] {
+        assert!(matches!(
+            store.cas_ref_logged_chain("ch/x", Some(a), &bad).await,
+            Err(crate::Error::Invalid(_))
+        ));
+    }
+    assert_eq!(store.get_ref("ch/x").await.unwrap(), Some(a));
+
+    assert_eq!(
+        store
+            .cas_ref_logged_chain("ch/x", Some(a), &chain)
+            .await
+            .unwrap(),
+        3
+    );
+    assert_eq!(store.get_ref("ch/x").await.unwrap(), Some(d));
+    let entries = store.ref_log(Some("ch/x"), None, 100).await.unwrap();
+    let got: Vec<_> = entries
+        .iter()
+        .rev()
+        .map(|e| (e.old, e.new, e.actor.clone().unwrap_or_default()))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            (None, Some(a), String::new()),
+            (Some(a), Some(b), "w1".into()),
+            (Some(b), Some(c), "w2".into()),
+            (Some(c), Some(d), "w3".into()),
+        ],
+        "one entry per step, in order"
+    );
+    assert_eq!(entries[0].message.as_deref(), Some("landed by w3"));
+    assert_eq!(entries[0].operation, "land");
+
+    // A chain may create the ref and may end by deleting it.
+    let create = [step(a, "w1"), step(b, "w2")];
+    assert_eq!(
+        store
+            .cas_ref_logged_chain("ch/new", None, &create)
+            .await
+            .unwrap(),
+        2
+    );
+    assert_eq!(store.get_ref("ch/new").await.unwrap(), Some(b));
+    let delete = [
+        step(c, "w1"),
+        RefStep {
+            new: None,
+            ctx: RefUpdateContext::new("cas"),
+        },
+    ];
+    assert_eq!(
+        store
+            .cas_ref_logged_chain("ch/new", Some(b), &delete)
+            .await
+            .unwrap(),
+        2
+    );
+    assert_eq!(store.get_ref("ch/new").await.unwrap(), None);
+    let steps: Vec<_> = store
+        .ref_log(Some("ch/new"), None, 100)
+        .await
+        .unwrap()
+        .iter()
+        .rev()
+        .map(|e| (e.old, e.new))
+        .collect();
+    assert_eq!(
+        steps,
+        [
+            (None, Some(a)),
+            (Some(a), Some(b)),
+            (Some(b), Some(c)),
+            (Some(c), None)
+        ]
+    );
+}
+
 /// Paging over changesets: ascending, exclusive cursor, complete, no overlap.
 async fn check_list_changesets(store: &dyn MetaStore) {
     let mut added = Vec::new();
@@ -934,5 +1101,60 @@ mod tests {
     async fn memory_stores_pass_contract() {
         check_meta_store_contract(&MemoryMetaStore::new()).await;
         check_blob_store_contract(&MemoryBlobStore::new()).await;
+    }
+
+    /// Forwards everything but `cas_ref_logged_chain`, so the trait's
+    /// default (consecutive swaps) is what runs.
+    struct DefaultChain(MemoryMetaStore);
+
+    #[async_trait]
+    impl MetaStore for DefaultChain {
+        async fn put_changeset(&self, cs: &Changeset) -> Result<ChangesetId> {
+            self.0.put_changeset(cs).await
+        }
+        async fn get_changeset(&self, id: &ChangesetId) -> Result<Option<Changeset>> {
+            self.0.get_changeset(id).await
+        }
+        async fn list_changesets(
+            &self,
+            after: Option<ChangesetId>,
+            limit: usize,
+        ) -> Result<Vec<ChangesetId>> {
+            self.0.list_changesets(after, limit).await
+        }
+        async fn get_ref(&self, name: &str) -> Result<Option<ChangesetId>> {
+            self.0.get_ref(name).await
+        }
+        async fn cas_ref_logged(
+            &self,
+            name: &str,
+            expected: Option<ChangesetId>,
+            new: Option<ChangesetId>,
+            ctx: &RefUpdateContext,
+        ) -> Result<bool> {
+            self.0.cas_ref_logged(name, expected, new, ctx).await
+        }
+        async fn ref_log(
+            &self,
+            name: Option<&str>,
+            before_seq: Option<u64>,
+            limit: usize,
+        ) -> Result<Vec<RefLogEntry>> {
+            self.0.ref_log(name, before_seq, limit).await
+        }
+        async fn list_refs(&self) -> Result<BTreeMap<String, ChangesetId>> {
+            self.0.list_refs().await
+        }
+        async fn get_derived(&self, kind: &str, key: &Hash) -> Result<Option<Bytes>> {
+            self.0.get_derived(kind, key).await
+        }
+        async fn put_derived(&self, kind: &str, key: &Hash, value: Bytes) -> Result<()> {
+            self.0.put_derived(kind, key, value).await
+        }
+    }
+
+    #[tokio::test]
+    async fn the_default_ref_chain_meets_the_contract() {
+        check_ref_chain_log(&DefaultChain(MemoryMetaStore::new())).await;
     }
 }

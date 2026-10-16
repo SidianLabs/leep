@@ -1,19 +1,21 @@
 //! `land`: replay unlanded changesets onto the ref head and compare-and-swap,
-//! no merge queue.
+//! no merge queue. Concurrent lands of one ref in one process are grouped
+//! into batches that move the ref once (ADR 0032).
 
 use std::collections::hash_map::RandomState;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::BuildHasher;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use leep_core::api::{LandResponse, RebaseResponse};
 use leep_core::refname::{self, NOT_FORWARD_MARKER};
-use leep_core::{ChangesetId, Error, RefUpdateContext, Result};
+use leep_core::{ChangesetId, Error, RefStep, RefUpdateContext, Result};
+use tokio::sync::oneshot;
 
 use crate::Repo;
 
-/// Lands within one process are serialized per ref, so losses only come from
+/// Lands within one process are batched per ref, so losses only come from
 /// other server instances sharing the store; this bounds those retries.
 const MAX_LAND_ATTEMPTS: u32 = 32;
 const BACKOFF_CAP_MS: u64 = 200;
@@ -22,6 +24,10 @@ const BACKOFF_CAP_MS: u64 = 200;
 const MAX_COMMIT_ERRORS: u32 = 3;
 /// Changesets examined when looking for an earlier landing of the same stack.
 const LANDED_COPY_SCAN: usize = 1024;
+/// Lands one batch takes at most. It bounds the commit (one ref log row per
+/// land) and how long a land waits behind replays of the lands queued before
+/// it; the next batch starts as soon as this one commits.
+pub(crate) const MAX_BATCH: usize = 64;
 
 /// Full-jitter exponential backoff, so racing servers spread out instead of
 /// colliding again in lockstep.
@@ -60,15 +66,157 @@ impl LandStats {
     }
 }
 
+/// The land queues of one process, one per target ref.
+#[derive(Default)]
+pub(crate) struct LandQueues {
+    queues: Mutex<HashMap<String, Arc<Mutex<RefQueue>>>>,
+    /// The lands each batch took, in order, for tests to replay one by one.
+    #[cfg(test)]
+    pub(crate) batches: Mutex<Vec<Vec<ChangesetId>>>,
+}
+
+impl LandQueues {
+    fn queue(&self, target_ref: &str) -> Arc<Mutex<RefQueue>> {
+        let mut queues = self.queues.lock().unwrap_or_else(|e| e.into_inner());
+        Arc::clone(queues.entry(target_ref.to_string()).or_default())
+    }
+
+    /// Lands waiting for a batch on `target_ref`.
+    #[cfg(test)]
+    pub(crate) fn pending(&self, target_ref: &str) -> usize {
+        lock(&self.queue(target_ref)).pending.len()
+    }
+}
+
+#[derive(Default)]
+struct RefQueue {
+    pending: VecDeque<Queued>,
+    /// A leader task is draining `pending`; whoever finds none starts one.
+    leading: bool,
+}
+
+fn lock(queue: &Mutex<RefQueue>) -> MutexGuard<'_, RefQueue> {
+    queue.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A land waiting for its batch.
+struct Queued {
+    /// The caller's handle: same stores, and the land policy the request
+    /// arrived under.
+    repo: Repo,
+    cs: ChangesetId,
+    ctx: RefUpdateContext,
+    queued: Instant,
+    reply: oneshot::Sender<Answer>,
+}
+
+struct Answer {
+    result: Result<LandResponse>,
+    attempts: u32,
+    exhausted: bool,
+}
+
+/// A land in a batch, kept across the batch's attempts.
+struct InFlight {
+    q: Queued,
+    /// A changeset that passed the policy need not be checked again when a
+    /// lost CAS redoes the batch, unless the policy reads the head.
+    checked: Checked,
+}
+
+impl InFlight {
+    fn answer(self, result: Result<LandResponse>, attempts: u32, exhausted: bool) {
+        // A caller that went away no longer wants the answer.
+        let _ = self.q.reply.send(Answer {
+            result,
+            attempts,
+            exhausted,
+        });
+    }
+}
+
+/// One land's part of a batch attempt, computed on the head left by the
+/// lands before it.
+enum Step {
+    /// Answered without moving the ref: already landed, or conflicts.
+    Done(LandResponse),
+    /// The ref moves to this changeset.
+    Move(ChangesetId),
+}
+
+fn is_move(step: &Result<Step>) -> bool {
+    matches!(step, Ok(Step::Move(_)))
+}
+
+/// The same error for another caller (`Error` is not `Clone`).
+fn duplicate(e: &Error) -> Error {
+    match e {
+        Error::InvalidPath(p, why) => Error::InvalidPath(p.clone(), why),
+        Error::InvalidHash(m) => Error::InvalidHash(m.clone()),
+        Error::Invalid(m) => Error::Invalid(m.clone()),
+        Error::Conflict(m) => Error::Conflict(m.clone()),
+        Error::NotFound(m) => Error::NotFound(m.clone()),
+        Error::Encoding(m) => Error::Encoding(m.clone()),
+        Error::Storage(m) => Error::Storage(m.clone()),
+        Error::Other(m) => Error::Other(m.clone()),
+    }
+}
+
+/// Clears the queue if the leader stops without draining it (a panic), so
+/// waiting lands get an error instead of waiting forever and the next land
+/// starts a new leader.
+struct Leading {
+    queue: Arc<Mutex<RefQueue>>,
+    done: bool,
+}
+
+impl Drop for Leading {
+    fn drop(&mut self) {
+        if !self.done {
+            let mut q = lock(&self.queue);
+            q.leading = false;
+            q.pending.clear();
+        }
+    }
+}
+
+/// Run batches until the queue is empty. Spawned, so a cancelled request
+/// never cancels the batch the other requests wait on.
+async fn lead(repo: Repo, target_ref: String, queue: Arc<Mutex<RefQueue>>) {
+    let mut leading = Leading {
+        queue: Arc::clone(&queue),
+        done: false,
+    };
+    loop {
+        let batch: Vec<Queued> = {
+            let mut q = lock(&queue);
+            if q.pending.is_empty() {
+                q.leading = false;
+                leading.done = true;
+                return;
+            }
+            let n = q.pending.len().min(MAX_BATCH);
+            q.pending.drain(..n).collect()
+        };
+        repo.land_batch(&target_ref, batch).await;
+    }
+}
+
 impl Repo {
     /// Land `cs` on `target_ref`. Fast-forwards when the head is an ancestor;
     /// otherwise replays the unlanded stack under `cs` onto the head. Retries
     /// when the CAS loses; conflicts are returned, never resolved here.
     ///
-    /// Lands on the same ref are serialized within this process: under
-    /// contention every attempt would otherwise redo the replay only to lose
-    /// the CAS to a sibling request. The CAS still guards against other
-    /// processes, with jittered backoff between losses.
+    /// Concurrent lands on the same ref in this process are group committed:
+    /// they queue, and one leader replays a batch of them in arrival order,
+    /// each onto the result of the one before, then moves the ref once with a
+    /// log entry per land. Each land's answer is the one it would get if the
+    /// lands ran one after another in that order. The CAS still guards
+    /// against other processes: a lost one redoes the batch from the new
+    /// head, with jittered backoff between losses.
+    ///
+    /// A land cancelled while queued is dropped from its batch; once the
+    /// batch has replayed it, it stays in the batch and lands.
     pub async fn land(&self, cs: ChangesetId, target_ref: &str) -> Result<LandResponse> {
         self.land_as(cs, target_ref, None).await
     }
@@ -86,7 +234,7 @@ impl Repo {
         let ctx = RefUpdateContext::new("land")
             .actor(actor)
             .message(format!("landed {cs}"));
-        let result = self.land_inner(cs, target_ref, &ctx, &mut stats).await;
+        let result = self.land_inner(cs, target_ref, ctx, &mut stats).await;
         stats.record(&result, started.elapsed());
         result
     }
@@ -95,7 +243,7 @@ impl Repo {
         &self,
         cs: ChangesetId,
         target_ref: &str,
-        ctx: &RefUpdateContext,
+        ctx: RefUpdateContext,
         stats: &mut LandStats,
     ) -> Result<LandResponse> {
         refname::validate(target_ref)?;
@@ -105,89 +253,220 @@ impl Repo {
             )));
         }
         self.get_changeset(cs).await?;
-        let lock = {
-            let mut locks = self.land_locks.lock().expect("land lock map poisoned");
-            Arc::clone(locks.entry(target_ref.to_string()).or_default())
+        let (reply, answer) = oneshot::channel();
+        let queue = self.land_queues.queue(target_ref);
+        let start_leader = {
+            let mut q = lock(&queue);
+            q.pending.push_back(Queued {
+                repo: self.clone(),
+                cs,
+                ctx,
+                queued: Instant::now(),
+                reply,
+            });
+            !std::mem::replace(&mut q.leading, true)
         };
-        let waited = Instant::now();
-        let _guard = lock.lock().await;
-        metrics::histogram!("leep_land_lock_wait_seconds").record(waited.elapsed().as_secs_f64());
-        // A changeset that passed the policy need not be checked again when a
-        // lost CAS retries, unless the policy reads the head (see `Checked`).
-        let mut checked = Checked::default();
+        if start_leader {
+            tokio::spawn(lead(self.clone(), target_ref.to_string(), queue));
+        }
+        let answer = answer.await.map_err(|_| {
+            Error::Other(format!(
+                "land onto {target_ref:?} was abandoned before it finished; retry"
+            ))
+        })?;
+        stats.attempts = answer.attempts;
+        stats.exhausted = answer.exhausted;
+        answer.result
+    }
+
+    /// Land a batch: replay each land onto the head the previous one left,
+    /// then move the ref once. Lands answered before anything in the batch
+    /// moved the ref are answered at once, as a lone land would be.
+    async fn land_batch(&self, target_ref: &str, batch: Vec<Queued>) {
+        let mut lands: Vec<InFlight> = batch
+            .into_iter()
+            .map(|q| {
+                metrics::histogram!("leep_land_lock_wait_seconds")
+                    .record(q.queued.elapsed().as_secs_f64());
+                InFlight {
+                    q,
+                    checked: Checked::default(),
+                }
+            })
+            .collect();
         let mut commit_errors = 0;
         let mut last_error = None;
         for attempt in 1..=MAX_LAND_ATTEMPTS {
-            stats.attempts = attempt;
-            let head = self.meta().get_ref(target_ref).await?;
-            let mut fast_forward = false;
-            if let Some(h) = head {
-                if h == cs || self.is_ancestor(cs, h).await? {
-                    return Ok(LandResponse::Landed {
-                        landed: cs,
-                        rebased: false,
-                        attempts: attempt,
-                    });
-                }
-                // Head is an ancestor (directly or through a stack of
-                // unlanded changesets): fast-forward.
-                fast_forward = self.is_ancestor(h, cs).await?;
-                // An earlier call may have landed this stack and lost its
-                // answer; replaying it would add the stack a second time.
-                if !fast_forward {
-                    if let Some(copy) = self.landed_copy(cs, h).await? {
-                        return Ok(LandResponse::Landed {
-                            landed: copy,
-                            rebased: true,
-                            attempts: attempt,
-                        });
+            let start = match self.meta().get_ref(target_ref).await {
+                Ok(h) => h,
+                Err(e) => {
+                    for l in lands {
+                        l.answer(Err(duplicate(&e)), attempt, false);
                     }
+                    return;
+                }
+            };
+            let mut head = start;
+            // Origins read by this attempt's landed-copy scans: the lands
+            // of a batch walk the same stretch of history.
+            let mut origins = HashMap::new();
+            let mut steps: Vec<RefStep> = Vec::new();
+            let mut waiting: Vec<(InFlight, Result<Step>)> = Vec::new();
+            let mut taken = Vec::new();
+            for mut l in std::mem::take(&mut lands) {
+                if attempt == 1 && l.q.reply.is_closed() {
+                    metrics::counter!("leep_land_cancelled_total").increment(1);
+                    continue;
+                }
+                taken.push(l.q.cs);
+                let repo = l.q.repo.clone();
+                let step = repo
+                    .land_step(
+                        l.q.cs,
+                        head,
+                        target_ref,
+                        attempt,
+                        &mut l.checked,
+                        &mut origins,
+                    )
+                    .await;
+                match step {
+                    Ok(Step::Move(new)) => {
+                        steps.push(RefStep {
+                            new: Some(new),
+                            ctx: l.q.ctx.clone(),
+                        });
+                        head = Some(new);
+                        waiting.push((l, Ok(Step::Move(new))));
+                    }
+                    Ok(Step::Done(resp)) if steps.is_empty() => l.answer(Ok(resp), attempt, false),
+                    Err(e) if steps.is_empty() => l.answer(Err(e), attempt, false),
+                    other => waiting.push((l, other)),
                 }
             }
-            self.enforce_land_policy(cs, head, target_ref, &mut checked)
-                .await?;
-            let new = match head {
-                Some(h) if !fast_forward => match self.replay_stack(cs, h).await? {
-                    Ok(id) => id,
-                    Err(resp) => return Ok(resp),
-                },
-                _ => cs,
+            if attempt == 1 && !taken.is_empty() {
+                metrics::histogram!("leep_land_batch_size").record(taken.len() as f64);
+                #[cfg(test)]
+                self.land_queues.batches.lock().unwrap().push(taken);
+            }
+            if steps.is_empty() {
+                return;
+            }
+            let applied = if let [step] = &steps[..] {
+                self.meta()
+                    .cas_ref_logged(target_ref, start, step.new, &step.ctx)
+                    .await
+                    .map(usize::from)
+            } else {
+                self.meta()
+                    .cas_ref_logged_chain(target_ref, start, &steps)
+                    .await
             };
-            match self
-                .meta()
-                .cas_ref_logged(target_ref, head, Some(new), ctx)
-                .await
-            {
-                Ok(true) => {
-                    return Ok(LandResponse::Landed {
-                        landed: new,
-                        rebased: new != cs,
-                        attempts: attempt,
-                    });
-                }
-                Ok(false) => {
-                    commit_errors = 0;
-                    metrics::counter!("leep_land_cas_losses_total").increment(1);
+            match applied {
+                Ok(n) => {
+                    if n < steps.len() {
+                        commit_errors = 0;
+                        metrics::counter!("leep_land_cas_losses_total").increment(1);
+                    }
+                    // Settle every land whose result sits on applied moves:
+                    // all of them, unless a store without an atomic chain
+                    // stopped part way.
+                    let mut moves = 0;
+                    for (l, step) in waiting {
+                        moves += usize::from(is_move(&step));
+                        if moves > n {
+                            lands.push(l);
+                            continue;
+                        }
+                        let cs = l.q.cs;
+                        let result = step.map(|s| match s {
+                            Step::Done(resp) => resp,
+                            Step::Move(new) => LandResponse::Landed {
+                                landed: new,
+                                rebased: new != cs,
+                                attempts: attempt,
+                            },
+                        });
+                        l.answer(result, attempt, false);
+                    }
                 }
                 // The commit may or may not have applied. Another pass reads
-                // the head again and either finds the stack in it or retries.
+                // the head again and either finds each stack in it or replays.
                 Err(e) => {
                     commit_errors += 1;
                     if commit_errors >= MAX_COMMIT_ERRORS {
-                        return Err(e);
+                        for (l, _) in waiting {
+                            l.answer(Err(duplicate(&e)), attempt, false);
+                        }
+                        return;
                     }
                     last_error = Some(e);
+                    lands.extend(waiting.into_iter().map(|(l, _)| l));
                 }
+            }
+            if lands.is_empty() {
+                return;
             }
             tokio::time::sleep(backoff(attempt)).await;
         }
-        if let Some(e) = last_error {
-            return Err(e);
+        for l in lands {
+            match &last_error {
+                Some(e) => l.answer(Err(duplicate(e)), MAX_LAND_ATTEMPTS, false),
+                None => l.answer(
+                    Err(Error::Conflict(format!(
+                        "land onto {target_ref:?} lost the race {MAX_LAND_ATTEMPTS} times; retry"
+                    ))),
+                    MAX_LAND_ATTEMPTS,
+                    true,
+                ),
+            }
         }
-        stats.exhausted = true;
-        Err(Error::Conflict(format!(
-            "land onto {target_ref:?} lost the race {MAX_LAND_ATTEMPTS} times; retry"
-        )))
+    }
+
+    /// What landing `cs` does on top of `head`: what one attempt of a lone
+    /// land did between reading the head and swapping it.
+    async fn land_step(
+        &self,
+        cs: ChangesetId,
+        head: Option<ChangesetId>,
+        target_ref: &str,
+        attempt: u32,
+        checked: &mut Checked,
+        origins: &mut HashMap<ChangesetId, Option<ChangesetId>>,
+    ) -> Result<Step> {
+        let mut fast_forward = false;
+        if let Some(h) = head {
+            if h == cs || self.is_ancestor(cs, h).await? {
+                return Ok(Step::Done(LandResponse::Landed {
+                    landed: cs,
+                    rebased: false,
+                    attempts: attempt,
+                }));
+            }
+            // Head is an ancestor (directly or through a stack of unlanded
+            // changesets): fast-forward.
+            fast_forward = self.is_ancestor(h, cs).await?;
+            // An earlier call may have landed this stack and lost its answer;
+            // replaying it would add the stack a second time.
+            if !fast_forward {
+                if let Some(copy) = self.landed_copy(cs, h, origins).await? {
+                    return Ok(Step::Done(LandResponse::Landed {
+                        landed: copy,
+                        rebased: true,
+                        attempts: attempt,
+                    }));
+                }
+            }
+        }
+        self.enforce_land_policy(cs, head, target_ref, checked)
+            .await?;
+        match head {
+            Some(h) if !fast_forward => match self.replay_stack(cs, h).await? {
+                Ok(id) => Ok(Step::Move(id)),
+                Err(resp) => Ok(Step::Done(resp)),
+            },
+            _ => Ok(Step::Move(cs)),
+        }
     }
 
     /// The server's rebased copy of `cs` among `head`'s ancestors, if an
@@ -198,20 +477,35 @@ impl Repo {
     /// A copy sits on a head that was not below `cs`, so its generation is
     /// above `cs`'s; the walk stops at that bound, and after
     /// [`LANDED_COPY_SCAN`] changesets, past which a retry may land twice.
-    async fn landed_copy(&self, cs: ChangesetId, head: ChangesetId) -> Result<Option<ChangesetId>> {
+    ///
+    /// `origins` remembers the rows read, for the other lands of a batch.
+    async fn landed_copy(
+        &self,
+        cs: ChangesetId,
+        head: ChangesetId,
+        origins: &mut HashMap<ChangesetId, Option<ChangesetId>>,
+    ) -> Result<Option<ChangesetId>> {
         let floor = self.generation(cs).await?;
         let mut seen = HashSet::from([head]);
         let mut stack = vec![head];
         let mut scanned = 0;
         while let Some(id) = stack.pop() {
-            if self.rebased_origin(id).await? == Some(cs) {
+            let origin = match origins.get(&id) {
+                Some(o) => *o,
+                None => {
+                    let o = self.rebased_origin(id).await?;
+                    origins.insert(id, o);
+                    o
+                }
+            };
+            if origin == Some(cs) {
                 return Ok(Some(id));
             }
             scanned += 1;
             if scanned >= LANDED_COPY_SCAN {
                 break;
             }
-            for p in self.get_changeset(id).await?.parents {
+            for &p in self.parents(id).await?.iter() {
                 if seen.insert(p) && self.generation(p).await? > floor {
                     stack.push(p);
                 }

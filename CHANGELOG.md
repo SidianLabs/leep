@@ -362,6 +362,20 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   On git/git, `main` against `master~1000` took 70 s cold; on the first
   3,795 commits it takes 6 ms instead of 0.92 s and 8 statements instead of
   7,385. `is_ancestor`'s fallback search reads in batches too.
+- Concurrent lands on one ref are group committed (ADR 0032): a server queues
+  them per ref, and one leader replays a batch of up to 64 in arrival order,
+  each onto the previous one's result, then moves the ref once while logging
+  one ref log entry per land. Every land gets the answer, and the log the
+  entries, it would get if the lands ran one after another; a conflicting or
+  refused land is answered alone and the rest still land. With 64 agents
+  landing on one ref, Postgres takes 154 lands/s instead of 41 (p99 0.4 s
+  instead of 1.7 s); a lone land is unchanged. The slowdown under contention
+  was each land's search for an earlier copy of its stack, which the lands of
+  a batch now share. `MetaStore` gains `cas_ref_logged_chain` (a provided
+  method of consecutive swaps; memory, SQLite and Postgres apply the chain in
+  one transaction). New metrics `leep_land_batch_size` and
+  `leep_land_cancelled_total`; `leep_land_lock_wait_seconds` now measures the
+  time queued. `leep-land-bench` measures land throughput by number of agents.
 
 ### Fixes
 - Processes opening a new SQLite metadata file at the same moment (servers

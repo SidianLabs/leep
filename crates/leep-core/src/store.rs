@@ -47,6 +47,14 @@ impl RefUpdateContext {
     }
 }
 
+/// One move of [`MetaStore::cas_ref_logged_chain`]: where the ref goes next
+/// and the context its log entry records.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RefStep {
+    pub new: Option<ChangesetId>,
+    pub ctx: RefUpdateContext,
+}
+
 /// One recorded ref move. `old = None` is a create, `new = None` a delete.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RefLogEntry {
@@ -184,6 +192,38 @@ pub trait MetaStore: Send + Sync + 'static {
         ctx: &RefUpdateContext,
     ) -> Result<bool>;
 
+    /// Move `name` from `expected` through every step in order, logging one
+    /// entry per step whose `old` is the previous step's `new` (the first's is
+    /// `expected`), as if each step were its own swap. Group commit of lands
+    /// uses it so that each land keeps its own entry, actor and message while
+    /// the ref moves once.
+    ///
+    /// Returns how many steps applied, always a prefix: `0` when `name` is not
+    /// `expected`. Every step must change the ref, and the last must not
+    /// return it to `expected`; anything else is `Invalid`.
+    ///
+    /// Backends override this to apply every step in one atomic step, so the
+    /// answer is `0` or `steps.len()`. The default applies the steps as
+    /// consecutive [`cas_ref_logged`](Self::cas_ref_logged) calls, which stays
+    /// correct but lets readers see the intermediate values and can stop part
+    /// way if another writer moves the ref in between.
+    async fn cas_ref_logged_chain(
+        &self,
+        name: &str,
+        expected: Option<ChangesetId>,
+        steps: &[RefStep],
+    ) -> Result<usize> {
+        check_ref_chain(expected, steps)?;
+        let mut old = expected;
+        for (done, step) in steps.iter().enumerate() {
+            if !self.cas_ref_logged(name, old, step.new, &step.ctx).await? {
+                return Ok(done);
+            }
+            old = step.new;
+        }
+        Ok(steps.len())
+    }
+
     /// Ref log entries, newest first: those of `name` or of every ref, with
     /// `seq` below `before_seq` when given, at most `limit`.
     async fn ref_log(
@@ -284,5 +324,25 @@ pub trait MetaStore: Send + Sync + 'static {
     /// diagnostics. `None` for a store without a versioned schema.
     async fn schema_version(&self) -> Result<Option<u64>> {
         Ok(None)
+    }
+}
+
+/// The rules every [`MetaStore::cas_ref_logged_chain`] applies before moving
+/// anything: steps exist, each changes the ref, and the chain does not end
+/// where it started.
+pub fn check_ref_chain(expected: Option<ChangesetId>, steps: &[RefStep]) -> Result<()> {
+    let mut old = expected;
+    for step in steps {
+        if step.new == old {
+            return Err(Error::Invalid("a ref chain step must move the ref".into()));
+        }
+        old = step.new;
+    }
+    match steps.last() {
+        None => Err(Error::Invalid("a ref chain needs at least one step".into())),
+        Some(last) if last.new == expected => Err(Error::Invalid(
+            "a ref chain must not end where it started".into(),
+        )),
+        Some(_) => Ok(()),
     }
 }

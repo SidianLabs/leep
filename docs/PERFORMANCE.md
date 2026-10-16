@@ -235,9 +235,10 @@ last-merge and trigram rows are under a millisecond. `derive-search main` takes
 0.03 to 0.5 s each time. A `leep` checkout (`init`) of the repository takes about
 5 s, a `sync` 0.3 s, a `commit` 55 ms.
 
-**Capacity of one ref.** A fast-forward land is 5 ms, but lands to one ref are
-serialized and a replay costs more, so this machine sustains about 6 lands per
-second to one ref at the latencies above; 50 agents with a mean think time of 6 s
+**Capacity of one ref.** A fast-forward land is 5 ms, but lands to one ref were
+serialized and a replay costs more, so this machine sustained about 6 lands per
+second to one ref at the latencies above (measured before group commit; see
+"Concurrent lands on one ref" for the swarm without think time); 50 agents with a mean think time of 6 s
 offer that. The same swarm with a first version of the workload (branches that
 lived for dozens of iterations, so merging one landed a stack hundreds of
 changesets behind) queued: the land lock was held for seconds per stale land,
@@ -263,6 +264,70 @@ at 4400 changesets (1.4 s for a file untouched since the import, cached or not),
 and land p50 rose from 5 ms to 6 s with 54 requests hitting the request timeout.
 After the fix a blame is 12 ms cold and 3 ms cached on the same history, and
 the run above is flat.
+
+## Concurrent lands on one ref
+
+`leep-land-bench` (in `crates/leep-soak`) runs N agents against a running
+server. Each agent loops: read `main`, upload one blob, create a changeset on
+that head writing its own file (`agents/a<i>/f`, so nothing conflicts), and
+land it onto `main`. Every land except the first of a round is a replay, since
+the other agents moved the head meanwhile. The table reports lands per second
+over 10 s per N (after a one-second warm-up), the land request's latency, and
+from the server's metrics the CAS losses and the mean batch size:
+
+```sh
+cargo build --release -p leep-server -p leep-soak
+target/release/leep-server --meta <url> --blobs file:///tmp/b --listen 127.0.0.1:7391 \
+  --metrics-listen 127.0.0.1:7392 --warm-interval 0 --request-timeout 0 &
+target/release/leep-land-bench --server http://127.0.0.1:7391 \
+  --metrics http://127.0.0.1:7392 --agents 1,4,16,64 --duration 10
+```
+
+Same 4 vCPU Xeon @ 2.80GHz as above, shared with another agent's builds (load
+average 2 to 6), harness and server on the same cores; a fresh database per
+run, Postgres 16 on a Unix socket or SQLite in WAL mode. Before and after were
+run alternately, two rounds each; the table shows the second round (the first
+agreed within the noise except a cold N = 1 start). Before is the per-ref land
+lock, after is group commit (ADR 0032):
+
+| Store, agents | Lands/s before / after | p50 ms before / after | p99 ms before / after | Batch mean |
+|---|---|---|---|---|
+| Postgres, 1 | 128 / 130 | 1.6 / 1.6 | 3.8 / 4.1 | 1.0 |
+| Postgres, 4 | 146 / 185 | 20 / 14 | 35 / 24 | 2.0 |
+| Postgres, 16 | 78 / 181 | 197 / 76 | 265 / 105 | 8.0 |
+| Postgres, 64 | 41 / 154 | 1565 / 350 | 1680 / 403 | 32 |
+| SQLite, 1 | 135 / 128 | 1.3 / 1.4 | 4.1 / 4.4 | 1.0 |
+| SQLite, 4 | 130 / 147 | 20 / 16 | 48 / 35 | 1.7 |
+| SQLite, 16 | 67 / 121 | 230 / 97 | 323 / 189 | 7.6 |
+| SQLite, 64 | 35 / 122 | 1824 / 422 | 2052 / 614 | 32 |
+
+No run, before or after, lost a CAS or answered 409: lands in one process
+never raced each other, before or after. Throughput fell with N because each
+land's work grew with N. A land whose changeset is behind the head looks for a
+copy an earlier attempt may already have landed (the idempotency scan of ADR
+0021): it walks the head's ancestors down to the changeset's generation,
+reading each one's `rebased-origin-v1` row and parents, two reads per
+changeset of distance. With N agents a changeset is about N lands behind, so
+under the lock each land cost about 5 ms plus 0.35 ms per agent on Postgres. A
+build with the scan switched off held SQLite at 131 lands/s at N = 64 (51 with
+it, in the same session), which located the cost.
+
+A batch replays its lands one after another on the head the previous one
+left, so the scans of one batch walk the same stretch of history: they share
+the `rebased-origin-v1` rows already read (parents come from the process-wide
+ancestry cache), the first land of a batch pays the walk and the others only
+the few changesets the batch added. One ref read and one commit serve the
+batch. What remains per land is the replay itself (merge, write the copy), so
+throughput stays near the single-agent rate as N grows, and latency at N = 64
+is about two batches of replays instead of 64 lands. A lone land does the same
+work as before plus a task spawn and a channel send, within the noise.
+
+**Linger.** Waiting 0.5 or 2 ms before taking a batch, so more lands join it,
+did not raise throughput at N = 64 beyond the noise (152 and 158 lands/s against
+142 in the same session on SQLite) and cost a lone land its whole wait (p50 3.2
+and 5.3 ms against 1.3, 99 and 63 lands/s at N = 1 against 138). Batches fill on
+their own: lands arriving while a batch replays form the next one. The server
+does not linger.
 
 ## Real history: git/git
 

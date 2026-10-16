@@ -68,8 +68,8 @@ struct CreateInputs {
 pub struct Repo {
     blobs: Arc<dyn BlobStore>,
     meta: Arc<dyn MetaStore>,
-    /// Per-ref locks serializing lands within this process (see `land`).
-    pub(crate) land_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Per-ref queues that group concurrent lands into batches (see `land`).
+    pub(crate) land_queues: Arc<crate::land::LandQueues>,
     pub(crate) land_policy: Option<Arc<dyn LandPolicy>>,
     /// Parents and generations of changesets seen by history walks.
     pub(crate) ancestry: Arc<AncestryCache>,
@@ -258,7 +258,7 @@ impl Repo {
         Repo {
             blobs,
             meta,
-            land_locks: Arc::default(),
+            land_queues: Arc::default(),
             land_policy: None,
             ancestry: Arc::default(),
             history_rows: Arc::default(),

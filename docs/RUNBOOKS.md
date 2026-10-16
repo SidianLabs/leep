@@ -427,8 +427,9 @@ nothing is half done. Retrying is safe.
 
 **Diagnose.**
 
-1. Lands within one server process are serialized per ref, so CAS losses come
-   from other processes writing the same ref: other `leep-server` instances,
+1. Lands within one server process are group committed per ref (ADR 0032)
+   and never race each other, so CAS losses come from other processes writing
+   the same ref: other `leep-server` instances,
    `leep-git import`, or clients using raw `POST /v1/refs/{name}`. Check how many
    instances take land traffic.
 2. Who moves the ref: `leep reflog main -n 100`. The actor is the token name and
@@ -437,7 +438,9 @@ nothing is half done. Retrying is safe.
 3. Contention: `sum(rate(leep_land_cas_losses_total[10m]))` per instance,
    `histogram_quantile(0.99, sum by (le) (rate(leep_land_attempts_bucket[10m])))`,
    and `sum(rate(leep_land_attempts_sum[10m])) / sum(rate(leep_land_attempts_count[10m]))`
-   (mean attempts per land).
+   (mean attempts per land). A loss redoes a whole batch, so one loss can show
+   as several lands with 2 attempts; `leep_land_batch_size` shows how big the
+   batches are.
 4. Slowness that widens the race window: land p99 and
    [store health](#leepservererrors). Each loss waits a random backoff of at most
    200 ms.
@@ -445,7 +448,7 @@ nothing is half done. Retrying is safe.
 **Likely causes.**
 
 1. Many instances landing on one hot ref at once under heavy agent load. Confirm:
-   losses on several instances, lock wait small compared with land duration
+   losses on several instances, queue wait small compared with land duration
    (`leep_land_lock_wait_seconds`).
 2. A raw-CAS writer or importer in a loop. Confirm: step 2.
 3. A slow metadata store, so the head moves between a land's read and its swap.
@@ -457,7 +460,7 @@ nothing is half done. Retrying is safe.
 
 - Agents repeat the land (`leep sync`, then `leep land`).
 - Send `POST /v1/land` to a single instance (route by path at the balancer): one
-  process serializes per ref, which removes cross-process losses.
+  process batches the lands of a ref, which removes cross-process losses.
 - Find the looping writer by actor name; stop the agent, or revoke its token (edit
   the tokens file, then SIGHUP, see [DEPLOY.md](DEPLOY.md#reloading-config)).
 - Ask agents to land smaller stacks and sync more often.
@@ -499,21 +502,23 @@ losses.
 
 ## LeepLandSlowP99
 
-**Meaning.** The 99th percentile of the whole land call, including the wait for
-the per-ref lock, has been above 5 seconds for 10 minutes. **Ticket.** The
+**Meaning.** The 99th percentile of the whole land call, including the time
+queued for the ref's next batch, has been above 5 seconds for 10 minutes. **Ticket.** The
 histogram tops out at 10 s, so very slow lands read as 10 s.
 
-**Impact.** Agents wait; lands to one ref queue behind each other in the server,
-so the latency of the busiest ref grows with the number of agents landing on it.
+**Impact.** Agents wait; lands to one ref queue in the server and are landed in
+batches (ADR 0032), each land replayed after the ones ahead of it, so the
+latency of the busiest ref grows with the number of agents landing on it.
 
 **Diagnose.**
 
-1. Queueing or work? Mean lock wait against mean duration:
+1. Queueing or work? Mean queue wait against mean duration:
    `sum(rate(leep_land_lock_wait_seconds_sum[10m])) / sum(rate(leep_land_lock_wait_seconds_count[10m]))`
    and the same for `leep_land_duration_seconds`. If the wait is most of the
-   latency, the offered load exceeds what one ref can serialize (about 6 lands per
-   second on the 4 vCPU machine in [PERFORMANCE.md](PERFORMANCE.md), see the soak
-   notes in [OPERATIONS.md](OPERATIONS.md#soak-tests)).
+   latency, the offered load exceeds what one ref can replay (see the soak notes
+   in [OPERATIONS.md](OPERATIONS.md#soak-tests) and "Concurrent lands on one
+   ref" in [PERFORMANCE.md](PERFORMANCE.md)). `leep_land_batch_size` near 64
+   means every batch is full.
 2. Offered load: `sum(rate(leep_land_total[5m]))`.
 3. Retries: mean attempts per land (see
    [LeepLandExhausted](#leeplandexhausted)); above 1 means CAS contention.
@@ -525,7 +530,7 @@ so the latency of the busiest ref grows with the number of agents landing on it.
 
 **Likely causes.**
 
-1. More landing agents than one ref can serialize. Confirm: step 1.
+1. More landing agents than one ref can replay. Confirm: step 1.
 2. Agents landing stacks that are far behind main: a land costs more the further
    behind its stack is (replay). Confirm: durations grow with stack age, not with
    count.
@@ -542,9 +547,10 @@ so the latency of the busiest ref grows with the number of agents landing on it.
   think time or reduce how many land on one ref.
 - Scale or tune the metadata store.
 - Do not add server instances to parallelize lands on one ref: lands are only
-  serialized within a process, so more instances mean more lost swaps.
+  batched within a process, so more instances mean more lost swaps, and each
+  loss redoes a whole batch.
 
-**Escalate / collect.** Land duration and lock-wait histograms, derive rates by
+**Escalate / collect.** Land duration, queue-wait and batch-size histograms, derive rates by
 kind, lands per second, and the [standard bundle](#collecting-a-bug-report).
 
 ## LeepRequestTimeouts

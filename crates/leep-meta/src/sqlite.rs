@@ -5,7 +5,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use leep_core::store::unix_now;
 use leep_core::{
-    Changeset, ChangesetId, DerivedRow, Hash, MetaStore, RefLogEntry, RefUpdateContext, Result,
+    check_ref_chain, Changeset, ChangesetId, DerivedRow, Hash, MetaStore, RefLogEntry, RefStep,
+    RefUpdateContext, Result,
 };
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Row, SqliteConnection, SqlitePool};
@@ -338,6 +339,60 @@ impl MetaStore for SqliteMetaStore {
         .map_err(storage)?;
         tx.commit().await.map_err(storage)?;
         Ok(true)
+    }
+
+    async fn cas_ref_logged_chain(
+        &self,
+        name: &str,
+        expected: Option<ChangesetId>,
+        steps: &[RefStep],
+    ) -> Result<usize> {
+        check_ref_chain(expected, steps)?;
+        let exp = expected.map(|i| i.0 .0.to_vec());
+        let last = steps.last().and_then(|s| s.new).map(|i| i.0 .0.to_vec());
+        // The ref update is the transaction's first statement, as in
+        // `cas_ref_logged`.
+        let mut tx = self.pool.begin().await.map_err(storage)?;
+        let q = match (&exp, &last) {
+            (None, Some(n)) => {
+                sqlx::query("INSERT INTO refs (name, target) VALUES (?, ?) ON CONFLICT DO NOTHING")
+                    .bind(name)
+                    .bind(n)
+            }
+            (Some(e), Some(n)) => {
+                sqlx::query("UPDATE refs SET target = ? WHERE name = ? AND target = ?")
+                    .bind(n)
+                    .bind(name)
+                    .bind(e)
+            }
+            (Some(e), None) => sqlx::query("DELETE FROM refs WHERE name = ? AND target = ?")
+                .bind(name)
+                .bind(e),
+            (None, None) => unreachable!("check_ref_chain refuses a chain back to the start"),
+        };
+        if q.execute(&mut *tx).await.map_err(storage)?.rows_affected() != 1 {
+            tx.rollback().await.map_err(storage)?;
+            return Ok(0);
+        }
+        // One statement; rows take increasing `seq` in the order given.
+        let time = unix_now();
+        let mut old = exp;
+        let mut insert = sqlx::QueryBuilder::new(
+            "INSERT INTO ref_log (name, old_target, new_target, time, actor, operation, message) ",
+        );
+        insert.push_values(steps, |mut row, step| {
+            let new = step.new.map(|i| i.0 .0.to_vec());
+            row.push_bind(name)
+                .push_bind(std::mem::replace(&mut old, new.clone()))
+                .push_bind(new)
+                .push_bind(time)
+                .push_bind(step.ctx.actor.as_deref())
+                .push_bind(step.ctx.operation.as_str())
+                .push_bind(step.ctx.message.as_deref());
+        });
+        insert.build().execute(&mut *tx).await.map_err(storage)?;
+        tx.commit().await.map_err(storage)?;
+        Ok(steps.len())
     }
 
     async fn ref_log(
