@@ -60,6 +60,20 @@ struct Args {
     /// checked concurrently) before reporting it down (500ms, 2s).
     #[arg(long, env = "LEEP_READY_TIMEOUT", default_value = "2s", value_parser = parse_ready_timeout)]
     ready_timeout: std::time::Duration,
+    /// How often to look for moved refs and derive their indexes in the
+    /// background (ADR 0028), so queries find them ready; 0 turns warming off
+    /// and indexes are derived by the first query that needs them.
+    #[arg(long, env = "LEEP_WARM_INTERVAL", default_value = "30s", value_parser = parse_grace)]
+    warm_interval: std::time::Duration,
+    /// Also warm the code-search index of each ref head.
+    #[arg(
+        long,
+        env = "LEEP_WARM_SEARCH",
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+        value_parser = clap::builder::BoolishValueParser::new(),
+    )]
+    warm_search: bool,
     /// Maximum request body size in bytes.
     #[arg(long, default_value_t = leep_server::DEFAULT_MAX_BODY_BYTES)]
     max_body_bytes: usize,
@@ -551,6 +565,16 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(unix)]
     leep_server::reload::spawn_sighup_reload(config.clone(), repo.meta().clone())
         .context("installing the SIGHUP handler")?;
+    if args.warm_interval.is_zero() {
+        tracing::info!("index warming off: the first query on new history derives its indexes");
+    } else {
+        tracing::info!(
+            interval_s = args.warm_interval.as_secs_f64(),
+            search = args.warm_search,
+            "warming indexes of moved refs in the background"
+        );
+        leep_derive::warm::Warmer::new(repo.clone(), args.warm_search).spawn(args.warm_interval);
+    }
     let app = leep_server::router_with_ready_timeout(
         repo,
         args.max_body_bytes,
