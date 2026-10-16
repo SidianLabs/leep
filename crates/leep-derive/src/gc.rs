@@ -17,12 +17,18 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use leep_core::{ChangesetId, Error, FileChange, Hash, Result, TreeEntry};
+use futures_util::future::try_join_all;
+use leep_core::{ChangesetId, DerivedRow, Error, FileChange, Hash, Result, TreeEntry};
 
 use crate::Repo;
 
 /// Page size for changeset and blob listings.
 const PAGE: usize = 1000;
+
+/// Blob writes in flight when several are stored together. Each is
+/// independent and content addressed, so order does not matter, and a store
+/// that syncs every write gets them done together.
+const BLOB_WRITES_IN_FLIGHT: usize = 4;
 
 /// Derived-data kind recording when a client was last told a blob already
 /// exists, or uploaded it (value: unix seconds, big-endian). A client that
@@ -165,17 +171,31 @@ impl Repo {
     /// as missing and is not claimed. Every other stored hash is claimed
     /// first (see [`BLOB_CLAIM`]), so a concurrent GC cannot delete a blob a
     /// client was just told it may reuse.
+    ///
+    /// The condemnation rows are read in one batch and the claims written in
+    /// another; each hash's fence is still read before its existence and
+    /// both before its claim.
     pub async fn missing_blobs(&self, hashes: &[Hash]) -> Result<Vec<Hash>> {
         let now = time_value(unix_now());
+        // A failed batch reads every fence singly.
+        let condemned = self
+            .meta()
+            .get_derived_many(BLOB_CONDEMNED, hashes)
+            .await
+            .ok();
         let mut missing = Vec::new();
-        for h in hashes {
+        let mut claims = Vec::new();
+        for (i, h) in hashes.iter().enumerate() {
+            let maybe = condemned.as_ref().is_none_or(|c| c[i].is_some());
             // Fence first, then existence: see `check_reusable`.
-            if self.fence_state(h).await?.blocked() || !self.blobs().contains(h).await? {
+            let blocked = maybe && self.fence_state(h).await?.blocked();
+            if blocked || !self.blobs().contains(h).await? {
                 missing.push(*h);
             } else {
-                self.meta().put_derived(BLOB_CLAIM, h, now.clone()).await?;
+                claims.push(DerivedRow::new(BLOB_CLAIM, *h, now.clone()));
             }
         }
+        self.meta().put_derived_many(&claims).await?;
         Ok(missing)
     }
 
@@ -189,9 +209,26 @@ impl Repo {
         Ok(h)
     }
 
+    /// [`Repo::put_blob`] for several blobs: their condemnations are read in
+    /// one batch after all of them are written, and their claims written in
+    /// one batch after that. Returns their hashes in order.
+    pub async fn put_blobs(&self, data: Vec<Bytes>) -> Result<Vec<Hash>> {
+        let items: Vec<(Hash, Bytes)> = data.into_iter().map(|d| (Hash::of_blob(&d), d)).collect();
+        let hashes: Vec<Hash> = items.iter().map(|(h, _)| *h).collect();
+        self.put_rescuing_many(items).await?;
+        let now = time_value(unix_now());
+        let claims: Vec<DerivedRow> = hashes
+            .iter()
+            .map(|h| DerivedRow::new(BLOB_CLAIM, *h, now.clone()))
+            .collect();
+        self.meta().put_derived_many(&claims).await?;
+        Ok(hashes)
+    }
+
     /// Store `data` under `hash` such that GC cannot delete it afterwards
     /// without the caller noticing. Every server-side write of a blob that a
-    /// changeset may reference goes through here (or [`Repo::put_blob`]).
+    /// changeset may reference goes through here, [`Repo::put_rescuing_many`]
+    /// or [`Repo::put_blob`].
     ///
     /// If the blob is condemned, write the rescue, then read the delete
     /// handshake: collect writes the handshake and then reads the rescue, so
@@ -201,6 +238,42 @@ impl Repo {
         let Some(c) = self.condemned_row(&hash).await? else {
             return Ok(());
         };
+        self.rescue(hash, data, c).await
+    }
+
+    /// [`Repo::put_rescuing`] for many blobs. Every blob is written before
+    /// the condemnation rows are read, in one batch, so each blob's write
+    /// still precedes its own check; the rare condemned one is then rescued
+    /// as `put_rescuing` would.
+    pub(crate) async fn put_rescuing_many(&self, items: Vec<(Hash, Bytes)>) -> Result<()> {
+        for chunk in items.chunks(BLOB_WRITES_IN_FLIGHT) {
+            let writes: Vec<_> = chunk
+                .iter()
+                .map(|(h, d)| self.blobs().put_with_hash(*h, d.clone()))
+                .collect();
+            try_join_all(writes).await?;
+        }
+        let hashes: Vec<Hash> = items.iter().map(|(h, _)| *h).collect();
+        let batch = self.meta().get_derived_many(BLOB_CONDEMNED, &hashes).await;
+        for (i, (hash, data)) in items.into_iter().enumerate() {
+            let row = match &batch {
+                Ok(rows) => rows[i]
+                    .as_ref()
+                    .map(|v| decode_time(BLOB_CONDEMNED, v))
+                    .transpose()?,
+                // As with every batched read, a failed batch is read singly.
+                Err(_) => self.condemned_row(&hash).await?,
+            };
+            if let Some(c) = row {
+                self.rescue(hash, data, c).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The part of [`Repo::put_rescuing`] after the blob is written and found
+    /// condemned at `c`.
+    async fn rescue(&self, hash: Hash, data: Bytes, c: i64) -> Result<()> {
         self.meta()
             .put_derived(BLOB_RESCUE, &hash, time_value(c))
             .await?;
