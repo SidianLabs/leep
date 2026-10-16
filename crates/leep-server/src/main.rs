@@ -36,6 +36,16 @@ struct Args {
         default_value = "file://./leep-data/blobs"
     )]
     blobs: String,
+    /// Refuse to start (or run gc, derive-search) when schema migrations are
+    /// pending, instead of applying them; run `leep-server migrate` first. A
+    /// database newer than this binary is refused either way.
+    #[arg(
+        long,
+        global = true,
+        env = "LEEP_NO_MIGRATE",
+        value_parser = clap::builder::BoolishValueParser::new(),
+    )]
+    no_migrate: bool,
     /// In-memory blob cache size in bytes; 0 disables it.
     #[arg(long, default_value_t = 256 * 1024 * 1024)]
     cache_bytes: usize,
@@ -139,6 +149,16 @@ enum Cmd {
         #[arg(long, global = true)]
         unsafe_no_fence: bool,
     },
+    /// Apply pending metadata schema migrations (uses --meta). Safe beside
+    /// running servers of the same version; take a backup first.
+    Migrate {
+        /// Print the SQL that would run, and change nothing.
+        #[arg(long, conflicts_with = "status")]
+        dry_run: bool,
+        /// Print the schema version and migration history, and change nothing.
+        #[arg(long)]
+        status: bool,
+    },
     /// Compute the code search index (trigram rows) for a revision, so the
     /// first `leep search` on it is fast. Uses --meta and --blobs; safe beside
     /// running servers, and cheap to repeat: only missing rows are computed.
@@ -156,6 +176,63 @@ enum GcPhase {
     Collect,
 }
 
+/// Set once from `--no-migrate`; read by [`open_meta`].
+static NO_MIGRATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Open the metadata store, applying pending migrations unless `--no-migrate`.
+async fn open_meta(url: &str) -> leep_core::Result<Arc<dyn leep_core::MetaStore>> {
+    let mode = if NO_MIGRATE.load(std::sync::atomic::Ordering::Relaxed) {
+        leep_meta::SchemaMode::RequireCurrent
+    } else {
+        leep_meta::SchemaMode::Migrate
+    };
+    leep_meta::open_meta_store_with(url, mode).await
+}
+
+async fn run_migrate(meta: &str, dry_run: bool, status: bool) -> anyhow::Result<()> {
+    if !dry_run && !status {
+        ensure_local_dirs(meta, "")?;
+    }
+    let r = leep_meta::migrate_meta_store(meta, dry_run || status)
+        .await
+        .context("migrating meta store")?;
+    if status {
+        println!("schema version: {} (this server: {})", r.from, r.latest);
+        for a in &r.applied {
+            println!(
+                "applied  v{:04} {} (unix {}, checksum {})",
+                a.version,
+                a.name,
+                a.applied_at,
+                &a.checksum[..12]
+            );
+        }
+    }
+    let verb = if r.performed { "applied" } else { "pending" };
+    for m in &r.adopted {
+        let verb = if r.performed { "adopted" } else { "to adopt" };
+        println!("{verb:<8} v{:04} {} (already in place)", m.version, m.name);
+    }
+    for m in &r.pending {
+        println!("{verb:<8} v{:04} {}", m.version, m.name);
+        if dry_run {
+            println!("{}", m.sql.trim_end());
+        }
+    }
+    if r.is_current() && !r.performed {
+        println!("schema is up to date at v{}", r.from);
+    } else if r.performed {
+        println!("schema migrated from v{} to v{}", r.from, r.to);
+    } else {
+        println!(
+            "{} change(s) to apply to reach v{}; run `leep-server migrate`",
+            r.adopted.len() + r.pending.len(),
+            r.latest
+        );
+    }
+    Ok(())
+}
+
 fn parse_grace(s: &str) -> Result<std::time::Duration, String> {
     leep_derive::gc::parse_duration(s).map_err(|e| e.to_string())
 }
@@ -168,9 +245,7 @@ async fn run_gc(
 ) -> anyhow::Result<()> {
     use leep_derive::gc;
     let blobs = leep_store::open_blob_store(blobs).context("opening blob store")?;
-    let meta = leep_meta::open_meta_store(meta)
-        .await
-        .context("opening meta store")?;
+    let meta = open_meta(meta).await.context("opening meta store")?;
     let repo = Repo::new(blobs, meta);
     let clock = gc::SystemClock;
     let dry = opts.dry_run;
@@ -210,9 +285,7 @@ async fn run_gc(
 
 async fn run_derive_search(meta: &str, blobs: &str, rev: &str) -> anyhow::Result<()> {
     let blobs = leep_store::open_blob_store(blobs).context("opening blob store")?;
-    let meta = leep_meta::open_meta_store(meta)
-        .await
-        .context("opening meta store")?;
+    let meta = open_meta(meta).await.context("opening meta store")?;
     let repo = Repo::new(blobs, meta);
     let id = repo.resolve(rev).await?;
     let started = std::time::Instant::now();
@@ -234,7 +307,9 @@ fn run_command(cmd: Cmd) -> anyhow::Result<()> {
             }
             println!("{}", auth::hash_token(&token));
         }
-        Cmd::Gc { .. } | Cmd::DeriveSearch { .. } => unreachable!("handled in main"),
+        Cmd::Gc { .. } | Cmd::DeriveSearch { .. } | Cmd::Migrate { .. } => {
+            unreachable!("handled in main")
+        }
         Cmd::GenToken { name, role } => {
             let (token, entry) = auth::generate(&name, role).map_err(anyhow::Error::msg)?;
             println!("token: {token}");
@@ -319,7 +394,11 @@ async fn main() -> anyhow::Result<()> {
             .with_env_filter(filter)
             .init(),
     }
+    NO_MIGRATE.store(args.no_migrate, std::sync::atomic::Ordering::Relaxed);
     match args.command {
+        Some(Cmd::Migrate { dry_run, status }) => {
+            return run_migrate(&args.meta, dry_run, status).await
+        }
         Some(Cmd::Gc {
             phase,
             dry_run,
@@ -416,9 +495,10 @@ async fn main() -> anyhow::Result<()> {
         blobs =
             Arc::new(CachedBlobStore::new(ArcBlobs(blobs), args.cache_bytes)) as Arc<dyn BlobStore>;
     }
-    let meta = leep_meta::open_meta_store(&args.meta)
-        .await
-        .context("opening meta store")?;
+    let meta = open_meta(&args.meta).await.context("opening meta store")?;
+    if let Some(v) = meta.schema_version().await? {
+        metrics::gauge!("leep_schema_version").set(v as f64);
+    }
     let mut repo = Repo::new(blobs, meta);
     if let (Some(keys), false) = (&signing, args.require_signatures.is_empty()) {
         tracing::info!(refs = ?args.require_signatures, "signatures required to land");
