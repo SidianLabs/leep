@@ -275,6 +275,10 @@ impl Client {
         )
     }
 
+    pub fn whoami(&self) -> Result<WhoAmIResponse> {
+        self.json(self.http.get(self.url("/v1/whoami")))
+    }
+
     pub fn refs(&self) -> Result<RefsResponse> {
         self.json(self.http.get(self.url("/v1/refs")))
     }

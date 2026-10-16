@@ -460,3 +460,28 @@ async fn read_token_reads_the_reflog_and_the_actor_is_the_token_name() {
         [("dev", "cas", Some("ci")), ("main", "land", Some("ci"))]
     );
 }
+
+#[tokio::test]
+async fn whoami_names_the_token_and_is_null_without_auth() {
+    let app = app(true);
+    let r = call(&app, Method::GET, "/v1/whoami", Some(WRITE), vec![]).await;
+    assert_eq!(r.status, StatusCode::OK);
+    let w: WhoAmIResponse = serde_json::from_slice(&r.body).unwrap();
+    assert_eq!(
+        (w.name.as_deref(), w.role.as_deref()),
+        (Some("ci"), Some("write"))
+    );
+    let r = call(&app, Method::GET, "/v1/whoami", Some(READ), vec![]).await;
+    let w: WhoAmIResponse = serde_json::from_slice(&r.body).unwrap();
+    assert_eq!(
+        (w.name.as_deref(), w.role.as_deref()),
+        (Some("viewer"), Some("read"))
+    );
+    let r = call(&app, Method::GET, "/v1/whoami", None, vec![]).await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+
+    let r = call(&self::app(false), Method::GET, "/v1/whoami", None, vec![]).await;
+    assert_eq!(r.status, StatusCode::OK);
+    let w: WhoAmIResponse = serde_json::from_slice(&r.body).unwrap();
+    assert_eq!(w, WhoAmIResponse::default());
+}

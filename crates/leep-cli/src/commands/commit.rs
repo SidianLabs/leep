@@ -23,7 +23,8 @@ pub struct CommitArgs {
     /// revert, which supply their own.
     #[arg(short, long)]
     pub message: Option<String>,
-    /// Author (default: $LEEP_AUTHOR, else $USER).
+    /// Author (default: $LEEP_AUTHOR, else the login name, else the token's
+    /// name on the server).
     #[arg(long)]
     pub author: Option<String>,
     /// Model that produced the change.
@@ -43,8 +44,8 @@ pub struct CommitArgs {
     pub sign: Option<PathBuf>,
 }
 
-fn author(args: &CommitArgs) -> String {
-    snapshot::author(args.author.as_deref())
+fn author(ctx: &Ctx, args: &CommitArgs) -> String {
+    snapshot::author(ctx, args.author.as_deref())
 }
 
 fn extra(args: &CommitArgs) -> BTreeMap<String, String> {
@@ -125,7 +126,7 @@ pub fn run(ctx: &mut Ctx, args: &CommitArgs) -> Result<i32> {
     }
     let cs = Changeset {
         parents,
-        author: author(args),
+        author: author(ctx, args),
         timestamp: snapshot::now_secs(),
         message,
         changes,
