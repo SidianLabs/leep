@@ -211,6 +211,26 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   first-parent skip list (the answer is unchanged), and checks its cache before
   walking.
 
+### Operations
+- `leep-server verify` checks a store without writing to it (ADR 0025): every
+  ref's history, tree nodes and blobs exist and match their addresses
+  (`--rehash` also re-reads blob bytes), the ref log replays to the refs, and
+  derived rows (generation, skiplist, last merge, root tree, path history,
+  search, blame, signatures, reviews, GC and rebase bookkeeping) equal a
+  recomputation, for a sample or with `--full`. Problems name the kind, key,
+  changeset and path. Exit status 0 clean, 1 problems, 2 could not run;
+  `--json` for scripts.
+- `leep-server repair rederive --kind K` recomputes derived rows and writes the
+  missing or wrong ones (`--dry-run`, `--ref`), including the tree and history
+  nodes it derives, and `repair drop --kind K` deletes a kind so it derives
+  again on demand. Kinds history cannot regenerate (signatures, reviews,
+  rebase links, GC fence state, the ref log) are refused.
+- `MetaStore` gains `list_derived` and `delete_derived_kind` (data operations,
+  no schema change); every backend implements them and the contract tests
+  cover them.
+- The crash test verifies the store after every kill, and the soak test and
+  the git import e2e test verify it at the end (`--full --rehash`).
+
 ### Project
 - Workspace version set to 0.0.1, with a CI check that keeps it below
   0.1.0.

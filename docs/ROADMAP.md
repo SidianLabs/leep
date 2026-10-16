@@ -85,13 +85,14 @@ operator action, and their benchmarks are in `docs/PERFORMANCE.md`.
 Exit: a full soak run and the fuzzers find nothing new for two weeks.
 
 ## M6: Operations
-- Backup and restore for metadata and blobs, with a tested restore drill
-- Upgrade path: versioned schema migrations for SQLite and Postgres, and a
+- [ ] Backup and restore for metadata and blobs, with a tested restore drill
+- [ ] Upgrade path: versioned schema migrations for SQLite and Postgres, and a
   test that upgrades a populated store from every earlier tagged version
-- Repair tools: verify reachability, re-derive or drop derived data by kind
-- Runbook for every alert in `docs/OPERATIONS.md`
-- Config reload without restart (tokens, keys, policies)
-- Two or three design partners from the first market (see
+- [x] Repair tools: verify reachability, re-derive or drop derived data by kind
+  (`leep-server verify` and `repair`; ADR 0025)
+- [ ] Runbook for every alert in `docs/OPERATIONS.md`
+- [ ] Config reload without restart (tokens, keys, policies)
+- [ ] Two or three design partners from the first market (see
   [PRODUCT.md](PRODUCT.md)) running Leep for real work
 
 Exit: an operator who has never seen Leep can deploy, back up, restore and
