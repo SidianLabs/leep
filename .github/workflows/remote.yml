@@ -1,0 +1,57 @@
+name: Remote
+
+# Runs one shell command on the self-hosted Leep server over SSH, for deploys
+# and operations. Manual only, from main, by people with write access; pull
+# requests (including from forks) can never trigger it or read its secrets.
+#
+# Secrets (Settings > Secrets and variables > Actions):
+#   DEPLOY_HOST, DEPLOY_USER  where to connect
+#   DEPLOY_SSH_KEY            a key used only for this, in the user's
+#                             authorized_keys; remove that line to revoke
+#   DEPLOY_KNOWN_HOSTS        the server's host key line, so a changed host
+#                             key fails the run instead of being trusted
+
+on:
+  workflow_dispatch:
+    inputs:
+      command:
+        description: Shell command to run on the server (bash, as DEPLOY_USER)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: remote
+  cancel-in-progress: false
+
+jobs:
+  run:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Configure SSH
+        env:
+          KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/deploy
+          chmod 600 ~/.ssh/deploy
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+      - name: Run
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          USER_NAME: ${{ secrets.DEPLOY_USER }}
+          # Passed through the environment, never interpolated into the script.
+          COMMAND: ${{ inputs.command }}
+        run: |
+          printf '%s\n' "$COMMAND" | ssh -i ~/.ssh/deploy \
+            -o StrictHostKeyChecking=yes -o BatchMode=yes \
+            -o ServerAliveInterval=30 -o ServerAliveCountMax=6 \
+            "$USER_NAME@$HOST" 'bash -s'
+      - name: Remove key
+        if: always()
+        run: rm -f ~/.ssh/deploy
