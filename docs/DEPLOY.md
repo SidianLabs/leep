@@ -127,6 +127,11 @@ docker run -d -p 127.0.0.1:7070:7070 -v leep-data:/var/lib/leep \
 ```
 
 In compose, add the same volume and `LEEP_TOKENS_FILE` to `leep-server`.
+An entry may also carry `"author": "Name <email>"` (or `gen-token --author`).
+When a client names no author itself (no `--author`, `LEEP_AUTHOR` or login
+name, as in most containers), `leep` stamps that on its changesets, falling
+back to the token's `name`. It is a default, not enforcement: a client that
+sets `LEEP_AUTHOR` still wins.
 Clients pass the token with `LEEP_TOKEN`, `leep --token` or
 `leep init --token`. `GET /v1/health` and `GET /v1/ready` stay public for probes. The file is
 re-read on SIGHUP, so tokens can be rotated and revoked without a restart

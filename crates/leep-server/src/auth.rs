@@ -72,6 +72,8 @@ impl Role {
 pub struct Principal {
     pub name: String,
     pub role: Role,
+    /// The token entry's `author`, for clients to stamp on changesets.
+    pub author: Option<String>,
 }
 
 /// The request's [`Principal`], or `None` when authentication is off.
@@ -92,6 +94,10 @@ pub struct TokenEntry {
     pub name: String,
     pub role: Role,
     pub hash: String,
+    /// Who changesets made with this token are by, e.g. `Name <email>`.
+    /// Clients use it when nothing local names an author.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
     /// Requests per second, for reads and writes separately.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate: Option<Quota>,
@@ -115,6 +121,7 @@ struct TokenFile {
 struct Known {
     name: String,
     role: Role,
+    author: Option<String>,
     digest: [u8; 32],
     limits: TokenLimits,
 }
@@ -160,6 +167,7 @@ pub fn generate(name: &str, role: Role) -> Result<(String, TokenEntry), String> 
         name: name.to_string(),
         role,
         hash: hash_token(&token),
+        author: None,
         rate: None,
         burst: None,
         concurrency: None,
@@ -198,6 +206,14 @@ impl Auth {
                 return Err(format!("duplicate token name {:?}", t.name));
             }
             let digest = parse_digest(&t.hash).map_err(|e| format!("token {:?}: {e}", t.name))?;
+            if let Some(a) = &t.author {
+                if a.trim().is_empty() || a.contains(['\n', '\r']) {
+                    return Err(format!(
+                        "token {:?}: author must be one non-empty line",
+                        t.name
+                    ));
+                }
+            }
             let limits = TokenLimits {
                 rate: t.rate,
                 burst: t.burst,
@@ -210,6 +226,7 @@ impl Auth {
             tokens.push(Known {
                 name: t.name,
                 role: t.role,
+                author: t.author,
                 digest,
                 limits,
             });
@@ -259,6 +276,7 @@ impl Auth {
             c.str(&k.name)
                 .str(k.role.as_str())
                 .bytes(&k.digest)
+                .opt_str(k.author.as_deref())
                 .opt_quota(k.limits.rate)
                 .opt_f64(k.limits.burst)
                 .opt_quota(k.limits.concurrency)
@@ -306,12 +324,12 @@ impl Auth {
 
     /// Match a presented token. Compares against every entry without early
     /// exit so timing does not reveal which digest matched.
-    fn lookup(&self, token: &str) -> Option<(&str, Role)> {
+    fn lookup(&self, token: &str) -> Option<&Known> {
         let presented = *blake3::hash(token.as_bytes()).as_bytes();
         let mut found = None;
         for k in &self.tokens {
             if bool::from(k.digest.ct_eq(&presented)) {
-                found = Some((k.name.as_str(), k.role));
+                found = Some(k);
             }
         }
         found
@@ -366,12 +384,16 @@ pub async fn require_token(mut req: Request, next: Next) -> Response {
     let Some(auth) = &config.auth else {
         return next.run(req).await;
     };
-    let Some((name, role)) = bearer(&req).and_then(|t| auth.lookup(t)) else {
+    let Some(Known {
+        name, role, author, ..
+    }) = bearer(&req).and_then(|t| auth.lookup(t))
+    else {
         return reject(
             StatusCode::UNAUTHORIZED,
             "authentication required: missing or invalid bearer token",
         );
     };
+    let role = *role;
     if role == Role::Read && needs_write(req.method(), req.uri().path()) {
         tracing::debug!(token = name, "read token refused on a mutating request");
         return reject(StatusCode::FORBIDDEN, "token lacks write access");
@@ -380,6 +402,7 @@ pub async fn require_token(mut req: Request, next: Next) -> Response {
     req.extensions_mut().insert(Principal {
         name: name.to_string(),
         role,
+        author: author.clone(),
     });
     next.run(req).instrument(span).await
 }
@@ -394,8 +417,9 @@ mod tests {
         assert_eq!(token.len(), 64);
         let text = serde_json::json!({ "tokens": [entry] }).to_string();
         let auth = Auth::parse(&text).unwrap();
-        assert_eq!(auth.lookup(&token), Some(("ci", Role::Write)));
-        assert_eq!(auth.lookup("nope"), None);
+        let k = auth.lookup(&token).unwrap();
+        assert_eq!((k.name.as_str(), k.role), ("ci", Role::Write));
+        assert!(auth.lookup("nope").is_none());
     }
 
     #[test]

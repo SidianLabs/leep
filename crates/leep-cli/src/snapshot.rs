@@ -20,12 +20,15 @@ pub fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
-/// `--author`, else `$LEEP_AUTHOR`, else the login name, else the server's
-/// name for our token. Containers and CI often set no login name, and the
-/// token's name is still a real identity there.
+/// `--author`, else `$LEEP_AUTHOR`, else the login name, else what the server
+/// says for our token (its `author`, else its name). Containers and CI often
+/// set no login name, and the token is still a real identity there.
 pub fn author(ctx: &Ctx, flag: Option<&str>) -> String {
     local_author(flag)
-        .or_else(|| ctx.client.whoami().ok().and_then(|w| w.name))
+        .or_else(|| {
+            let w = ctx.client.whoami().ok()?;
+            w.author.or(w.name)
+        })
         .unwrap_or_else(|| "unknown".into())
 }
 

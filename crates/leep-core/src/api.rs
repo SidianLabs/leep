@@ -4,7 +4,7 @@
 //! | Method | Path | Request | Response |
 //! |---|---|---|---|
 //! | GET  | `/v1/health` | – | `"ok"` (liveness: the process is up and serving HTTP; checks nothing else) |
-//! | GET  | `/v1/whoami` | – | [`WhoAmIResponse`] (the calling token's name and role; both null when authentication is off) |
+//! | GET  | `/v1/whoami` | – | [`WhoAmIResponse`] (the calling token's name, role and optional `author`; null when authentication is off) |
 //! | GET  | `/v1/ready` | – | [`ReadyResponse`] (readiness: 200 `{"status":"ready"}` when the metadata and blob stores each answered a cheap read within the server's ready timeout, else 503 with `failed` naming the stores) |
 //! | PUT  | `/v1/blobs/{hash}` | raw bytes | 204; 400 if `Hash::of_blob(body) != hash` |
 //! | GET  | `/v1/blobs/{hash}` | – | raw bytes, or 404 |
@@ -114,6 +114,10 @@ pub struct WhoAmIResponse {
     pub name: Option<String>,
     /// `read` or `write`, or null when authentication is off.
     pub role: Option<String>,
+    /// The token entry's `author` (e.g. `Name <email>`), if the tokens file
+    /// sets one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
 }
 
 /// Body of `GET /v1/ready`. `status` is `ready` (HTTP 200) or `not ready`
@@ -634,9 +638,17 @@ mod tests {
         let v = serde_json::to_value(WhoAmIResponse {
             name: Some("ci".into()),
             role: Some("write".into()),
+            author: None,
         })
         .unwrap();
         assert_eq!(v, serde_json::json!({ "name": "ci", "role": "write" }));
+        let v = serde_json::to_value(WhoAmIResponse {
+            name: Some("bo".into()),
+            role: Some("write".into()),
+            author: Some("Bo <bo@example.com>".into()),
+        })
+        .unwrap();
+        assert_eq!(v["author"], "Bo <bo@example.com>");
         let open: WhoAmIResponse =
             serde_json::from_value(serde_json::json!({ "name": null, "role": null })).unwrap();
         assert_eq!(open, WhoAmIResponse::default());

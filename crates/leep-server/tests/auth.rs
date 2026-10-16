@@ -19,7 +19,8 @@ const WRITE: &str = "write-token-for-tests";
 fn auth() -> Auth {
     let text = serde_json::json!({ "tokens": [
         { "name": "viewer", "role": "read", "hash": hash_token(READ) },
-        { "name": "ci", "role": "write", "hash": hash_token(WRITE) },
+        { "name": "ci", "role": "write", "hash": hash_token(WRITE),
+          "author": "CI Bot <ci@example.com>" },
     ]})
     .to_string();
     Auth::parse(&text).unwrap()
@@ -471,12 +472,14 @@ async fn whoami_names_the_token_and_is_null_without_auth() {
         (w.name.as_deref(), w.role.as_deref()),
         (Some("ci"), Some("write"))
     );
+    assert_eq!(w.author.as_deref(), Some("CI Bot <ci@example.com>"));
     let r = call(&app, Method::GET, "/v1/whoami", Some(READ), vec![]).await;
     let w: WhoAmIResponse = serde_json::from_slice(&r.body).unwrap();
     assert_eq!(
         (w.name.as_deref(), w.role.as_deref()),
         (Some("viewer"), Some("read"))
     );
+    assert_eq!(w.author, None);
     let r = call(&app, Method::GET, "/v1/whoami", None, vec![]).await;
     assert_eq!(r.status, StatusCode::UNAUTHORIZED);
 
@@ -484,4 +487,17 @@ async fn whoami_names_the_token_and_is_null_without_auth() {
     assert_eq!(r.status, StatusCode::OK);
     let w: WhoAmIResponse = serde_json::from_slice(&r.body).unwrap();
     assert_eq!(w, WhoAmIResponse::default());
+}
+
+#[test]
+fn token_author_must_be_one_non_empty_line() {
+    let entry = |author: &str| {
+        serde_json::json!({ "tokens": [
+            { "name": "a", "role": "write", "hash": hash_token(WRITE), "author": author },
+        ]})
+        .to_string()
+    };
+    assert!(Auth::parse(&entry("A <a@example.com>")).is_ok());
+    assert!(Auth::parse(&entry(" ")).is_err());
+    assert!(Auth::parse(&entry("A\nB")).is_err());
 }

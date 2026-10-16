@@ -420,9 +420,13 @@ async fn health() -> Json<&'static str> {
 }
 
 async fn whoami(auth::MaybePrincipal(who): auth::MaybePrincipal) -> Json<WhoAmIResponse> {
-    Json(WhoAmIResponse {
-        role: who.as_ref().map(|p| p.role.as_str().to_string()),
-        name: who.map(|p| p.name),
+    Json(match who {
+        Some(p) => WhoAmIResponse {
+            role: Some(p.role.as_str().to_string()),
+            name: Some(p.name),
+            author: p.author,
+        },
+        None => WhoAmIResponse::default(),
     })
 }
 
