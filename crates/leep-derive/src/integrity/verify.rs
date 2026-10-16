@@ -29,8 +29,9 @@ use super::rows::{describe, expected_blob_row, recompute, RowScan, PAGE};
 use super::shadow::{ShadowBlobs, ShadowMeta};
 use super::walk::{HistoryWalk, Visitor};
 use crate::blame::{cache_key, CachedBlame};
-use crate::derived::{DerivedKind, HistoryNode, HistoryTree};
+use crate::derived::{DerivedKind, HistoryTree, StoredHistoryNode};
 use crate::gc;
+use crate::path_history::{bad_chunk, chunk_fits, load_history_row};
 use crate::search::index::TreeRowMemo;
 use crate::search::{BLOB_KIND as BLOB_TRIGRAMS, TREE_KIND as TREE_TRIGRAMS};
 use crate::signatures::{storage_key as signature_storage_key, REBASED_ORIGIN_KIND};
@@ -630,9 +631,9 @@ impl Verifier<'_> {
         Ok(())
     }
 
-    /// The history nodes a stored `history-tree-v1` row leads to exist and
-    /// match their addresses: the root only when sampling, all of them when
-    /// `deep`.
+    /// The history nodes a stored `history-tree-v2` row leads to, and the
+    /// chunks of split ones, exist and match their addresses: the root only
+    /// when sampling, all of them when `deep`.
     async fn check_history_nodes(
         &mut self,
         id: ChangesetId,
@@ -642,34 +643,74 @@ impl Verifier<'_> {
         let Ok(root) = <[u8; 32]>::try_from(stored) else {
             return Ok(());
         };
+        // Read the real store without the repo's cache: a cached or
+        // shadow-recomputed row would hide damage on disk.
+        let meta = self.repo.meta().clone();
         let mut stack = vec![Hash(root)];
         while let Some(node) = stack.pop() {
             if !self.visited_hnodes.insert(node) {
                 continue;
             }
-            match self.shadow.read_history_node(node).await {
-                Ok(n) if deep => stack.extend(n.entries.values().filter_map(|e| e.node())),
-                Ok(_) => {}
-                Err(e) => match damage_of(&e) {
-                    Some(d) => self.log.push(
-                        Problem::new(
-                            "derived",
-                            match d {
-                                Damage::Corrupt => "corrupt_history_node",
-                                Damage::Missing => "missing_history_node",
-                            },
-                            format!(
-                                "history node {node} (reached from the history-tree-v1 row of {id}): {e}"
-                            ),
-                        )
-                        .kind(kinds::HISTORY_NODE)
-                        .key(&node)
-                        .changeset(id),
-                    ),
-                    None => return Err(e),
-                },
+            let row = match load_history_row(&*meta, node).await {
+                Ok((row, _)) => row,
+                Err(e) => {
+                    self.history_damage(id, node, e)?;
+                    continue;
+                }
+            };
+            let mut children = Vec::new();
+            match &row {
+                StoredHistoryNode::Flat(n) => {
+                    children.extend(n.entries.values().filter_map(|e| e.node()))
+                }
+                StoredHistoryNode::Split(refs) => {
+                    for (i, r) in refs.iter().enumerate() {
+                        // A damaged chunk is named by its own address, once.
+                        let first_visit = self.visited_hnodes.insert(r.node);
+                        let chunk = match load_history_row(&*meta, r.node).await {
+                            Ok((chunk, _)) => chunk,
+                            Err(e) if first_visit => {
+                                self.history_damage(id, r.node, e)?;
+                                continue;
+                            }
+                            Err(_) => continue,
+                        };
+                        match chunk_fits(refs, i, &chunk) {
+                            Some(n) => children.extend(n.entries.values().filter_map(|e| e.node())),
+                            None => self.history_damage(id, node, bad_chunk(node, i))?,
+                        }
+                    }
+                }
+            }
+            if deep {
+                stack.extend(children);
             }
         }
+        Ok(())
+    }
+
+    /// Report a damaged history node or chunk, or pass on an error that is
+    /// not damage.
+    fn history_damage(&mut self, id: ChangesetId, node: Hash, e: Error) -> Result<()> {
+        let Some(d) = damage_of(&e) else {
+            return Err(e);
+        };
+        self.log.push(
+            Problem::new(
+                "derived",
+                match d {
+                    Damage::Corrupt => "corrupt_history_node",
+                    Damage::Missing => "missing_history_node",
+                },
+                format!(
+                    "history node {node} (reached from the {} row of {id}): {e}",
+                    HistoryTree::NAME
+                ),
+            )
+            .kind(kinds::HISTORY_NODE)
+            .key(&node)
+            .changeset(id),
+        );
         Ok(())
     }
 
@@ -757,7 +798,7 @@ impl Verifier<'_> {
                 let why = if actual != key {
                     Some(format!("holds bytes that hash to {actual}"))
                 } else {
-                    HistoryNode::decode(&value)
+                    StoredHistoryNode::decode(&value)
                         .err()
                         .map(|e| format!("does not decode: {e}"))
                 };

@@ -39,14 +39,15 @@ skill.
 | derived `blob-doom-v1` | — | `MetaStore.derived`, key = blob hash, value = condemnation time (8-byte big-endian `i64`) then one state byte: 0 deleting, 1 abandoned, 2 deleted |
 | derived `blob-trigrams-v1` | — | `MetaStore.derived`, key = blob hash, value = see "Code search index" below |
 | derived `tree-trigrams-v1` | — | `MetaStore.derived`, key = tree node hash (`TreeNode::hash()`), value = see "Code search index" below |
-| derived `history-tree-v1` | — | `MetaStore.derived`, key = changeset id, value = 32 raw bytes (hash of that changeset's root `HistoryNode`) |
-| `HistoryNode` | `history-node-v1` | `MetaStore.derived` (kind `history-node-v1`), key = `Hash::of_object("history-node-v1", postcard(node))`, value = the postcard bytes |
+| derived `history-tree-v2` | — | `MetaStore.derived`, key = changeset id, value = 32 raw bytes (address of that changeset's root history node) |
+| `StoredHistoryNode` | `history-node-v2` | `MetaStore.derived` (kind `history-node-v2`), key = `Hash::of_object("history-node-v2", postcard(row))`, value = the postcard bytes; a whole node, a chunk of one, or a split node's chunk list (ADR 0027) |
+| retired `history-tree-v1`, `history-node-v1` | — | written by servers before ADR 0027; never read by current servers; removed with `repair drop --kind history-tree-v1` |
 | other derived kinds | — | owned and versioned by `leep-derive` |
 
 ## Integrity on read
 
 Content-addressed data is verified when read: `Repo::read_tree` and
-`read_history_node` hash the stored bytes and compare them with the key, and
+`read_history_row` hash the stored bytes and compare them with the key, and
 the SQL backends decode a changeset and compare its id with its row key. A
 mismatch is `Error::Storage`. File blobs and the other derived kinds are not
 verified (ADR 0021 lists which).
@@ -164,29 +165,62 @@ The `/v1/search/{rev}` endpoint only adds an endpoint and types (`SearchResponse
 Ranges are byte offsets into the returned (possibly cut) `line`.
 ## Path-history index (new derived kinds, no change to `Changeset`)
 
-ADR 0013. `leep_derive::derived::HistoryNode { entries: BTreeMap<String,
-HistoryEntry> }`, keyed by single path components, postcard-encoded.
-`HistoryEntry` is an externally tagged enum, **variant order is format**:
+ADR 0013, stored in chunks since ADR 0027. The logical node is
+`leep_derive::derived::HistoryNode { entries: BTreeMap<String, HistoryEntry> }`,
+keyed by single path components, postcard-encoded. `HistoryEntry` is an
+externally tagged enum, **variant order is format**:
 `Leaf { changed: Vec<ChangesetId> }` (variant 0) and
 `Tree { changed: Vec<ChangesetId>, node: Hash }` (variant 1). `changed` is a
 sorted (by id bytes), deduplicated set of changeset ids, serialized as a
-varint length and 32 raw bytes per id; `node` is 32 raw bytes, the hash of the
-children's `HistoryNode`. The empty node is the single byte `0` (zero entries)
-and is never stored: readers treat its hash as present. Example, a root node
-with `a` (Leaf, one id) and `d` (Tree, two ids):
+varint length and 32 raw bytes per id; `node` is 32 raw bytes, the address of
+the children's node. Example, a node with `a` (Leaf, one id) and `d` (Tree,
+two ids):
 
 ```
 02 | 01 61 00 01 <32 bytes id1> | 01 64 01 02 <32 bytes id1> <32 bytes id2> <32 bytes node>
 ```
 
-The golden bytes are asserted in `leep-derive` (`node_encoding_is_stable`).
-Node rows are content-addressed and idempotent. The meaning of `changed` (the
-maximal changesets whose entry at the path differs from their first parent's;
-merges take the union of parents' sets for paths they leave as in `parents[0]`)
-is part of the format: changing it, the field or variant order, or the key
-derivation requires `history-tree-v2` and `history-node-v2`. Entries of deleted
-paths are kept. The API addition (`GET /v1/last-change/{id}`) adds one endpoint
-and one response type; `/v1/log` is unchanged.
+A node is stored as one or more `history-node-v2` rows, each a postcard
+`StoredHistoryNode`, an externally tagged enum (**variant order is format**):
+
+- `Flat(HistoryNode)` (variant 0): the whole node. Used for nodes of at most
+  64 entries, and for every chunk. The example above is stored as
+  `00 02 01 61 00 01 ...`. The empty node is `00 00`; it is never stored, and
+  readers treat its address as present.
+- `Split(Vec<ChunkRef>)` (variant 1), `ChunkRef { first: String, node: Hash }`:
+  a node of more than 64 entries, cut into runs of entries in name order. Each
+  chunk is a `Flat` row; `first` is its first name and `node` its address. A
+  chunk ends after an entry whose name `n` has
+  `Hash::of_object("history-chunk-boundary", n)` with its first byte's low 5
+  bits zero (about one name in 32), or when it reaches 128 entries, or at the
+  last entry. Boundaries depend only on names, so an edit rewrites one chunk
+  and an insert at most two. Example, a directory of 1,000 names
+  `f0000`..`f0999` (the first boundary is after `f0029`), 33 chunks:
+
+```
+01 21 | 05 66 30 30 30 30 <32 bytes chunk 0> | 05 66 30 30 33 30 <32 bytes chunk 1> | ...
+```
+
+A node's address (the `history-tree-v2` value, and `Tree.node` in its parent)
+is the hash of its top row, `Flat` or `Split`. Splitting is deterministic, so a
+logical node has one address. Readers check that each chunk is `Flat`, starts
+with its `first` and ends before the next chunk's `first`; a split node of
+`n` entries needs about `n / 32` refs, one level deep.
+
+The golden bytes and boundary choice are asserted in `leep-derive`
+(`node_encoding_is_stable`, `chunk_boundaries_are_stable`). Rows are
+content-addressed and idempotent. The meaning of `changed` (the maximal
+changesets whose entry at the path differs from their first parent's; merges
+take the union of parents' sets for paths they leave as in `parents[0]`) is
+part of the format: changing it, the field or variant order, the split rule or
+the key derivation requires `history-tree-v3` and `history-node-v3`. Entries
+of deleted paths are kept. The API addition (`GET /v1/last-change/{id}`) adds
+one endpoint and one response type; `/v1/log` is unchanged.
+
+`history-tree-v1` and `history-node-v1` (ADR 0013 as first written) stored each
+node as one row of the bare `HistoryNode` postcard, keyed by
+`Hash::of_object("history-node-v1", bytes)`. Current servers neither read nor
+write them.
 
 ## Rename detection (no persisted change)
 

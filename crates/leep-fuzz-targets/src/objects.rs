@@ -5,7 +5,7 @@
 use leep_core::review::{Review, Verdict};
 use leep_core::signature::Signature;
 use leep_core::{Changeset, Hash, TreeNode};
-use leep_derive::derived::HistoryNode;
+use leep_derive::derived::{HistoryNode, StoredHistoryNode};
 
 pub fn changeset(data: &[u8]) {
     let Ok(cs) = Changeset::decode(data) else {
@@ -35,10 +35,40 @@ pub fn tree_node(data: &[u8]) {
     assert_eq!(node.hash(), Hash::of_object(TreeNode::KIND, &enc));
 }
 
+/// A stored `history-node-v2` row: a whole node, or a split node's chunk list.
 pub fn history_node(data: &[u8]) {
-    let Ok(node) = HistoryNode::decode(data) else {
+    let Ok(stored) = StoredHistoryNode::decode(data) else {
         return;
     };
+    let enc = stored.encode();
+    let again = StoredHistoryNode::decode(&enc).expect("re-encoded history row must decode");
+    assert_eq!(again, stored);
+    assert_eq!(again.encode(), enc);
+    let StoredHistoryNode::Flat(node) = stored else {
+        return;
+    };
+    // Storing the node again must give rows that hold the same entries.
+    let rows = node.rows();
+    let (top, chunks) = rows.split_last().expect("a node has a top row");
+    assert_eq!(top.hash, node.hash());
+    let joined = match &top.node {
+        StoredHistoryNode::Flat(n) => {
+            assert!(chunks.is_empty());
+            n.clone()
+        }
+        StoredHistoryNode::Split(refs) => {
+            assert_eq!(refs.len(), chunks.len());
+            let mut joined = HistoryNode::default();
+            for c in chunks {
+                let StoredHistoryNode::Flat(n) = &c.node else {
+                    panic!("chunks are stored whole");
+                };
+                joined.entries.extend(n.entries.clone());
+            }
+            joined
+        }
+    };
+    assert_eq!(joined, node);
     let enc = node.encode();
     let again = HistoryNode::decode(&enc).expect("re-encoded history node must decode");
     assert_eq!(again, node);

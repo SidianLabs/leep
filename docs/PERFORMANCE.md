@@ -306,6 +306,28 @@ Two changes fixed it, with byte-identical index rows (same checksum of every
 What remains is about 4.6 ms per changeset of node reads and writes, one
 metadata round trip each, plus octopus merges, which still take `maximal`.
 
+**Index size.** On the full history the v1 index was 174,978 node rows
+averaging 36 KB (largest 139 KB): 6.1 GB of node bytes and 3.5 GB in Postgres,
+against 328 MB for the git repository. Directory nodes keep deleted entries,
+and the root of git/git holds hundreds, so almost every commit wrote another
+36 KB root node. ADR 0027 stores nodes of more than 64 entries as chunks of
+about 32 entries, so a change rewrites one chunk and a short chunk list. On the
+first 3,795 commits (local Postgres 16, release builds, a shared 4-core machine
+under load from other jobs, the index derived from scratch three times each):
+
+| Index for the first 3,795 commits | Node rows | Node bytes | Cold `last-change` | Server CPU |
+|---|---|---|---|---|
+| `history-node-v1` (whole nodes) | 5,224 | 45.2 MB | 58.7 / 30.7 / 35.0 s | 14.6 / 13.5 / 14.9 s |
+| `history-node-v2` (chunked) | 11,725 | 13.0 MB | 34.1 / 34.2 / 38.3 s | 13.4 / 13.7 / 14.6 s |
+
+Derivation costs the same; wall times vary with the machine's load. The 4,160
+chunk lists average 496 bytes and the 7,565 whole nodes and chunks 1.4 KB.
+Answers are byte-identical: `/v1/log` and `/v1/last-change` bodies from a v1
+and a v2 server on one database agreed for 51 paths (files, directories,
+deleted and re-created paths, and paths that never existed). The prefix's
+directories are narrow compared with later git/git, so the full history
+should shrink by more than this factor of 3.5.
+
 ## Analysis
 
 Principle 5 (cost scales with the change, not the repository) holds for the

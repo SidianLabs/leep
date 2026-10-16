@@ -143,7 +143,7 @@ changeset, and concurrent servers that race produce identical bytes.
 | `review-v1` | review verdicts, keyed per (changeset, reviewer name) (`Hash::of_object("review", id‖name)`); attestations written by `put_review`, last write wins, listed with one lookup per principal | review listing and the review land policy |
 | `last_merge-v1` | generation of the nearest merge on the first-parent chain (0 if none) | lets `merge_base` answer from skiplists when no merge sits above the first-parent common ancestor |
 | `blob-claim-v1` / `blob-condemned-v1` / `blob-rescue-v1` / `blob-doom-v1` | per blob hash, 8-byte big-endian unix seconds (doom adds a state byte); GC bookkeeping, not derived from changesets: claims by uploads and dedup checks, condemnation by `gc condemn`, rescue by uploads of a condemned blob, doom by `gc collect` (ADR 0012) | blob garbage collection and the server's missing-blob checks |
-| `history-tree-v1` | 32-byte hash of the root `HistoryNode`, a tree parallel to `root_tree` recording for each path (including deleted ones) the newest changesets that changed it; nodes are `history-node-v1` rows keyed by content hash. Built from the first parent's tree plus the spines of changed paths, and at merges the paths where another parent's history differs (ADR 0013) | path log, `last-change` |
+| `history-tree-v2` | 32-byte address of the root history node, a tree parallel to `root_tree` recording for each path (including deleted ones) the newest changesets that changed it; nodes are `history-node-v2` rows keyed by content hash, and nodes of more than 64 entries are stored as content-defined chunks so an edit rewrites one chunk (ADR 0027). Built from the first parent's tree plus the spines of changed paths, and at merges the paths where another parent's history differs (ADR 0013) | path log, `last-change` |
 | `blame` | per (changeset, path), keyed `Hash::of_object("blame", id‖path)` | blame |
 | `blob-trigrams-v1` | per blob hash: sorted trigram set of a UTF-8 text blob up to 1 MiB (delta varints), or a "not indexed" marker (ADR 0014) | code search |
 | `tree-trigrams-v1` | per tree node hash: fixed-size bloom filter (2^19 bits) over every trigram below the directory, the OR of its children's filters; shared by every revision with the same subtree (ADR 0014) | code search directory pruning |
@@ -155,8 +155,9 @@ that needs them; see "Code search"). Add new kinds with the
 skill. A new kind never requires a client change.
 
 **Path history.** `log --path P` and `GET /v1/last-change/{id}?path=P` read
-the `history-tree-v1` index instead of scanning ancestors (ADR 0013). A lookup
-walks `P`'s components through the changeset's history tree and yields the
+the `history-tree-v2` index instead of scanning ancestors (ADR 0013). A lookup
+walks `P`'s components through the changeset's history tree, reading only the
+chunk that holds each component in a large directory, and yields the
 newest changesets that changed `P` (for a directory, anything under it). The
 log pushes those on a heap ordered by generation and id, yields the newest,
 looks `P` up in that changeset's parents to find the next ones, and repeats. It
@@ -167,6 +168,13 @@ of its parents' entries, so a side branch's changes are never lost. The index
 is derived on the first path query for a history, oldest first. `author` and
 `extra` filters apply to the changesets the walk yields, so a selective filter
 on a frequently changed path still reads each of them.
+Directory nodes keep deleted entries, so a busy directory's node grows with
+every name it ever held. Nodes of more than 64 entries are therefore stored as
+chunks of about 32 entries whose boundaries depend only on the names (ADR
+0027): a changeset rewrites the chunk holding each changed entry and a short
+chunk list, and shares the rest with its parent. Each `Repo` keeps a 64 MiB
+cache of decoded node rows, so derivation does not re-read the chunks of the
+root and other hot directories for every changeset.
 
 **Rename detection** ([ADR 0016](adr/0016-rename-detection.md)). Changesets
 store a rename as a delete plus an add, and renames are detected when

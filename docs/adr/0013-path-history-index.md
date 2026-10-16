@@ -88,3 +88,5 @@ New endpoint `GET /v1/last-change/{id}?path=p` and CLI `leep last-change`.
   not follow first-parent semantics, so it was left alone.
 - Changing the entry encoding or the meaning of `changed` needs
   `history-tree-v2` and `history-node-v2`; old rows are ignored.
+- ADR 0027 did exactly that to store large nodes in chunks; the logical nodes
+  and `changed` are as described here.

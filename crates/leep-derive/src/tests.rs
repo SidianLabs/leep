@@ -2999,6 +2999,8 @@ mod path_history {
     async fn random_commit(
         r: &Repo,
         rng: &mut Rng,
+        pool: &[&str],
+        max_ops: usize,
         parents: &[ChangesetId],
         n: usize,
     ) -> ChangesetId {
@@ -3015,12 +3017,12 @@ mod path_history {
             };
             let mut changes = BTreeMap::new();
             let ops = if parents.len() > 1 {
-                rng.below(3)
+                rng.below(max_ops)
             } else {
-                1 + rng.below(3)
+                1 + rng.below(max_ops)
             };
             for _ in 0..ops {
-                let path = rp(POOL[rng.below(POOL.len())]);
+                let path = rp(pool[rng.below(pool.len())]);
                 let change = if rng.below(4) == 0 && !existing.is_empty() {
                     let victim = rp(&existing[rng.below(existing.len())]);
                     changes.insert(victim, FileChange::Delete);
@@ -3044,9 +3046,39 @@ mod path_history {
     /// file/directory kind changes.
     #[tokio::test]
     async fn indexed_log_matches_the_scan_on_random_histories() {
-        let mut rng = Rng(0xfa57109);
-        let mut dirs = vec!["", "a", "d", "d/y", "e", "e/f", "never"];
-        dirs.extend(POOL);
+        let mut queries = vec!["", "a", "d", "d/y", "e", "e/f", "never"];
+        queries.extend(POOL);
+        check_index_against_scan(0xfa57109, POOL, 3, &queries).await;
+    }
+
+    /// The same with a directory of about 150 names, so its history node is
+    /// split into chunks (ADR 0027) and edits, merges and deletes go through
+    /// chunk rewrites and chunk lookups.
+    #[tokio::test]
+    async fn indexed_log_matches_the_scan_with_wide_directories() {
+        let wide: Vec<String> = (0..150)
+            .map(|i| format!("w/f{i:03}"))
+            .chain(["w/k".into(), "w/k/x".into(), "w/m/n".into()])
+            .collect();
+        let mut pool: Vec<&str> = POOL.to_vec();
+        pool.extend(wide.iter().map(|s| s.as_str()));
+        let mut queries = vec!["", "w", "w/m", "w/f", "w/f1500", "a", "d/y"];
+        queries.extend(wide.iter().step_by(25).map(|s| s.as_str()));
+        queries.extend(["w/f149", "w/k", "w/k/x", "w/m/n"]);
+        let split = check_index_against_scan(0x5eed_c4a7, &pool, 12, &queries).await;
+        assert!(split, "no history node was split");
+    }
+
+    /// Build random histories over `pool` and compare indexed answers for
+    /// `queries` with the scan. Says whether any history node was split.
+    async fn check_index_against_scan(
+        seed: u64,
+        pool: &[&str],
+        max_ops: usize,
+        queries: &[&str],
+    ) -> bool {
+        let mut rng = Rng(seed);
+        let mut split = false;
         for round in 0..6 {
             let r = repo();
             let mut all: Vec<ChangesetId> = Vec::new();
@@ -3070,7 +3102,7 @@ mod path_history {
                     }
                     (len, _) => vec![all[len - 1 - rng.below(len.min(6))]],
                 };
-                all.push(random_commit(&r, &mut rng, &parents, n).await);
+                all.push(random_commit(&r, &mut rng, pool, max_ops, &parents, n).await);
             }
             let alice = LogFilter {
                 author: Some("alice".into()),
@@ -3078,7 +3110,7 @@ mod path_history {
             };
             for _ in 0..12 {
                 let tip = all[all.len() - 1 - rng.below(all.len().min(30))];
-                for path in &dirs {
+                for path in queries {
                     for (limit, filter) in [
                         (usize::MAX, &LogFilter::default()),
                         (3, &LogFilter::default()),
@@ -3109,7 +3141,19 @@ mod path_history {
                     }
                 }
             }
+            let rows = r
+                .meta()
+                .list_derived(crate::derived::HISTORY_NODE_KIND, None, usize::MAX)
+                .await
+                .unwrap();
+            split |= rows.iter().any(|(_, v)| {
+                matches!(
+                    crate::derived::StoredHistoryNode::decode(v),
+                    Ok(crate::derived::StoredHistoryNode::Split(_))
+                )
+            });
         }
+        split
     }
 }
 

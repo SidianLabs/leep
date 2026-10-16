@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use leep_core::review::{Review, Verdict};
 use leep_core::signature::{format_public_key, key_id, Signature};
 use leep_core::{Changeset, FileChange, FileKind, Hash, RepoPath, TreeEntry, TreeNode};
-use leep_derive::derived::{HistoryEntry, HistoryNode};
+use leep_derive::derived::{ChunkRef, HistoryEntry, HistoryNode, StoredHistoryNode};
 use leep_derive::search::trigram::{extract, BlobRow, Bloom};
 use serde_json::json;
 
@@ -155,8 +155,27 @@ fn objects(out: &mut Out) {
             node: HistoryNode::empty_hash(),
         },
     );
-    out.add("history_node", "leaf-and-tree", hist.encode());
-    out.add("history_node", "empty", HistoryNode::default().encode());
+    out.add(
+        "history_node",
+        "leaf-and-tree",
+        StoredHistoryNode::Flat(hist).encode(),
+    );
+    out.add(
+        "history_node",
+        "empty",
+        StoredHistoryNode::Flat(HistoryNode::default()).encode(),
+    );
+    let split = StoredHistoryNode::Split(vec![
+        ChunkRef {
+            first: "a".into(),
+            node: HistoryNode::empty_hash(),
+        },
+        ChunkRef {
+            first: "m".into(),
+            node: HistoryNode::empty_hash(),
+        },
+    ]);
+    out.add("history_node", "split", split.encode());
 
     let pk = [7u8; 32];
     let sig = Signature {

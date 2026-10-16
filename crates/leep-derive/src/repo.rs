@@ -11,7 +11,7 @@ use leep_core::{
     TreeNode,
 };
 
-use crate::derived::{self, Generation, RootTree, Skiplist};
+use crate::derived::{self, Generation, RootTree, Skiplist, StoredHistoryNode};
 use crate::signatures::{LandPolicy, PolicySet};
 use crate::tree_ops::apply_changes;
 
@@ -61,6 +61,8 @@ pub struct Repo {
     pub(crate) land_policy: Option<Arc<dyn LandPolicy>>,
     /// Parents and generations of changesets seen by history walks.
     pub(crate) ancestry: Arc<AncestryCache>,
+    /// Decoded path-history rows (see `read_history_row`).
+    pub(crate) history_rows: Arc<HistoryRowCache>,
 }
 
 /// Parents and generation of changesets, kept in memory because history
@@ -125,6 +127,59 @@ impl AncestryMaps {
     }
 }
 
+/// Decoded `history-node-v2` rows by hash. A split node is read one row per
+/// chunk, and derivation reads the same root and directory nodes for every
+/// changeset, so without this each changeset would re-read and re-decode
+/// dozens of rows. Rows are content addressed and checked against their hash
+/// before they are cached, so entries never go stale. Bounded like
+/// [`AncestryCache`], by bytes: each map holds up to half the budget.
+#[derive(Default)]
+pub(crate) struct HistoryRowCache {
+    inner: Mutex<HistoryRowMaps>,
+}
+
+#[derive(Default)]
+struct HistoryRowMaps {
+    new: HashMap<Hash, (Arc<StoredHistoryNode>, usize)>,
+    new_bytes: usize,
+    old: HashMap<Hash, (Arc<StoredHistoryNode>, usize)>,
+}
+
+/// Bytes both maps together may hold, counting each row at twice its encoded
+/// size (about its decoded size).
+const HISTORY_CACHE_BYTES: usize = 64 << 20;
+
+impl HistoryRowCache {
+    pub(crate) fn get(&self, hash: &Hash) -> Option<Arc<StoredHistoryNode>> {
+        let mut m = self.inner.lock().unwrap();
+        if let Some((n, _)) = m.new.get(hash) {
+            return Some(n.clone());
+        }
+        let (n, size) = m.old.remove(hash)?;
+        m.insert(*hash, n.clone(), size);
+        Some(n)
+    }
+
+    pub(crate) fn insert(&self, hash: Hash, node: Arc<StoredHistoryNode>, encoded_len: usize) {
+        self.inner
+            .lock()
+            .unwrap()
+            .insert(hash, node, 2 * encoded_len);
+    }
+}
+
+impl HistoryRowMaps {
+    fn insert(&mut self, hash: Hash, node: Arc<StoredHistoryNode>, size: usize) {
+        if self.new_bytes + size > HISTORY_CACHE_BYTES / 2 {
+            self.old = std::mem::take(&mut self.new);
+            self.new_bytes = 0;
+        }
+        if self.new.insert(hash, (node, size)).is_none() {
+            self.new_bytes += size;
+        }
+    }
+}
+
 impl Repo {
     pub fn new(blobs: Arc<dyn BlobStore>, meta: Arc<dyn MetaStore>) -> Self {
         Repo {
@@ -133,6 +188,7 @@ impl Repo {
             land_locks: Arc::default(),
             land_policy: None,
             ancestry: Arc::default(),
+            history_rows: Arc::default(),
         }
     }
 
