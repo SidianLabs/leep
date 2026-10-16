@@ -113,6 +113,20 @@ pub trait MetaStore: Send + Sync + 'static {
 
     async fn get_changeset(&self, id: &ChangesetId) -> Result<Option<Changeset>>;
 
+    /// [`get_changeset`](Self::get_changeset) for many ids in one round trip,
+    /// so history walks pay one call per batch instead of one per changeset
+    /// (ADR 0030). The answer has one slot per id, in order: `None` for an
+    /// absent id, and a repeated id is answered at every position.
+    ///
+    /// The default makes one call per id; database backends override it.
+    async fn get_changesets(&self, ids: &[ChangesetId]) -> Result<Vec<Option<Changeset>>> {
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            out.push(self.get_changeset(id).await?);
+        }
+        Ok(out)
+    }
+
     /// Up to `limit` changeset ids strictly greater than `after`, in
     /// ascending byte order. Paged for garbage collection and other full
     /// scans.
@@ -197,6 +211,19 @@ pub trait MetaStore: Send + Sync + 'static {
     /// Values are opaque bytes owned by `leep-derive`. Writing the same key
     /// twice must store the same value, so last-writer-wins is fine.
     async fn get_derived(&self, kind: &str, key: &Hash) -> Result<Option<Bytes>>;
+
+    /// [`get_derived`](Self::get_derived) of one kind for many keys in one
+    /// round trip (ADR 0030). One slot per key, in order, as in
+    /// [`get_changesets`](Self::get_changesets).
+    ///
+    /// The default makes one call per key; database backends override it.
+    async fn get_derived_many(&self, kind: &str, keys: &[Hash]) -> Result<Vec<Option<Bytes>>> {
+        let mut out = Vec::with_capacity(keys.len());
+        for key in keys {
+            out.push(self.get_derived(kind, key).await?);
+        }
+        Ok(out)
+    }
 
     async fn put_derived(&self, kind: &str, key: &Hash, value: Bytes) -> Result<()>;
 

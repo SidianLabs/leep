@@ -9,7 +9,10 @@ use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{PgConnection, PgPool, Row};
 
 use crate::migrate::{self, AppliedMigration, Migration, MigrationReport, Session};
-use crate::{decode_checked, log_entry, storage, to_hash, to_id, LogRow, SchemaMode, DELETE_BATCH};
+use crate::{
+    changesets_in_order, decode_checked, log_entry, storage, to_hash, to_id, unique,
+    values_in_order, LogRow, SchemaMode, DELETE_BATCH,
+};
 
 /// The compiled migration list (ADR 0023). Append only.
 pub const MIGRATIONS: &[Migration] = &[Migration {
@@ -243,6 +246,20 @@ impl MetaStore for PostgresMetaStore {
             .transpose()
     }
 
+    /// One `= ANY($1)` query whatever the number of ids.
+    async fn get_changesets(&self, ids: &[ChangesetId]) -> Result<Vec<Option<Changeset>>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let keys: Vec<&[u8]> = unique(ids.iter().map(|i| i.0.as_bytes().as_slice()));
+        let rows = sqlx::query("SELECT id, data FROM changesets WHERE id = ANY($1)")
+            .bind(keys)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(storage)?;
+        changesets_in_order(ids, rows.iter().map(|r| (r.get(0), r.get(1))))
+    }
+
     /// An empty `after` sorts below every 32-byte id, so `None` needs no
     /// separate query.
     async fn list_changesets(
@@ -367,6 +384,24 @@ impl MetaStore for PostgresMetaStore {
             .await
             .map_err(storage)?;
         Ok(row.map(|r| Bytes::from(r.get::<Vec<u8>, _>(0))))
+    }
+
+    /// One `= ANY($2)` query whatever the number of keys.
+    async fn get_derived_many(&self, kind: &str, keys: &[Hash]) -> Result<Vec<Option<Bytes>>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let wanted: Vec<&[u8]> = unique(keys.iter().map(|k| k.as_bytes().as_slice()));
+        let rows = sqlx::query("SELECT key, value FROM derived WHERE kind = $1 AND key = ANY($2)")
+            .bind(kind)
+            .bind(wanted)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(storage)?;
+        Ok(values_in_order(
+            keys,
+            rows.iter().map(|r| (r.get(0), r.get(1))),
+        ))
     }
 
     /// An empty `after` sorts below every 32-byte key, so `None` needs no

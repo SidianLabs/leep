@@ -351,6 +351,29 @@ fn log(c: &mut Criterion) {
         });
     }
     g.finish();
+
+    // Without a path the walk reads every changeset it yields; an author
+    // filter that matches nothing reads all 10k.
+    let mut g = c.benchmark_group("log_10k_history");
+    g.sample_size(10).measurement_time(Duration::from_secs(3));
+    for limit in [100, 10_000] {
+        g.bench_function(format!("all/limit_{limit}"), |b| {
+            b.to_async(&rt).iter(|| async {
+                assert_eq!(repo.log(tip, None, limit).await.unwrap().len(), limit)
+            })
+        });
+    }
+    let nobody = LogFilter {
+        author: Some("nobody".into()),
+        extra: Vec::new(),
+    };
+    g.bench_function("author_no_match", |b| {
+        b.to_async(&rt).iter(|| async {
+            let found = repo.log_filtered(tip, None, 10, &nobody).await.unwrap();
+            assert!(found.is_empty())
+        })
+    });
+    g.finish();
 }
 
 fn last_change(c: &mut Criterion) {

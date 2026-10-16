@@ -463,6 +463,15 @@ shape changed, and `verify` and `repair` are not part of the HTTP API.
 `verify` lists every kind to check it; `repair` rewrites or drops only the kinds
 that history can regenerate, and refuses the rest (ADR 0025).
 
+## Batched reads (new `MetaStore` methods, no format change)
+
+ADR 0030 adds `MetaStore::get_changesets` and `get_derived_many`. They read the
+existing tables: Postgres runs `SELECT id, data FROM changesets WHERE id = ANY($1)`
+and `SELECT key, value FROM derived WHERE kind = $1 AND key = ANY($2)`, SQLite
+the same with `IN (...)` of at most 500 distinct keys per statement. Changeset
+rows are decoded and checked against their id as in `get_changeset`. No
+encoding, hash, index, table or `/v1` shape changed.
+
 ## Fenced garbage collection (new derived kinds, no other format change)
 
 ADR 0012 adds the three GC kinds in the table above (`blob-claim-v1` already

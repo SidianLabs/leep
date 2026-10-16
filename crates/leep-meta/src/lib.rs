@@ -91,6 +91,50 @@ fn to_hash(bytes: &[u8]) -> Result<leep_core::Hash> {
     Ok(leep_core::Hash(arr))
 }
 
+/// Distinct keys per SQLite batched read: well below its bound-parameter
+/// limit (32,766 since 3.32, 999 before), with room for the other binds.
+const BATCH_PARAMS: usize = 500;
+
+/// `?, ?, ...` for `n` SQLite parameters.
+fn placeholders(n: usize) -> String {
+    let mut s = "?,".repeat(n);
+    s.pop();
+    s
+}
+
+/// Distinct keys in first-seen order, so a batched read sends each once.
+fn unique<'a>(keys: impl Iterator<Item = &'a [u8]>) -> Vec<&'a [u8]> {
+    let mut seen = std::collections::HashSet::new();
+    keys.filter(|k| seen.insert(*k)).collect()
+}
+
+/// Answer a batched changeset read in request order from `(id, data)` rows,
+/// decoding and checking each stored row once.
+fn changesets_in_order(
+    ids: &[leep_core::ChangesetId],
+    rows: impl Iterator<Item = (Vec<u8>, Vec<u8>)>,
+) -> Result<Vec<Option<leep_core::Changeset>>> {
+    let mut found = std::collections::HashMap::new();
+    for (id, data) in rows {
+        let id = to_id(&id)?;
+        let cs = decode_checked(&id, &data)?;
+        found.insert(id, cs);
+    }
+    Ok(ids.iter().map(|id| found.get(id).cloned()).collect())
+}
+
+/// Answer a batched derived read in request order from `(key, value)` rows.
+fn values_in_order(
+    keys: &[leep_core::Hash],
+    rows: impl Iterator<Item = (Vec<u8>, Vec<u8>)>,
+) -> Vec<Option<bytes::Bytes>> {
+    let found: std::collections::HashMap<Vec<u8>, bytes::Bytes> =
+        rows.map(|(k, v)| (k, bytes::Bytes::from(v))).collect();
+    keys.iter()
+        .map(|k| found.get(k.as_bytes().as_slice()).cloned())
+        .collect()
+}
+
 /// Rows `delete_derived_kind` removes per statement, so dropping a large kind
 /// is many short transactions, not one that holds locks for minutes.
 const DELETE_BATCH: i64 = 10_000;

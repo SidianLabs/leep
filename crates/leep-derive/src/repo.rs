@@ -344,6 +344,11 @@ impl Repo {
         Ok(g)
     }
 
+    /// Generation of `id` if this process has seen it, without a read.
+    pub(crate) fn cached_generation(&self, id: ChangesetId) -> Option<u64> {
+        self.ancestry.get(&id).generation
+    }
+
     pub(crate) fn derive_lock(&self, kind: &'static str) -> DeriveLock {
         self.derive_locks
             .lock()

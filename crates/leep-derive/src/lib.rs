@@ -20,6 +20,7 @@ mod merge;
 pub mod owners;
 pub mod pack_order;
 mod path_history;
+mod prefetch;
 mod renames;
 mod repo;
 pub mod review;

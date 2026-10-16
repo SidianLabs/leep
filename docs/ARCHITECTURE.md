@@ -69,7 +69,7 @@ content-addressing and (b) the atomicity of `MetaStore::cas_ref`.
 
 | Crate | Role | May depend on |
 |---|---|---|
-| `leep-core` | Types, hashing, encoding, `BlobStore`/`MetaStore` traits (including listing and blob deletion for GC, and listing and dropping derived rows by kind for repair), in-memory stores, conformance tests, API types, pure rename detection | no other leep crate; no I/O, no async runtime |
+| `leep-core` | Types, hashing, encoding, `BlobStore`/`MetaStore` traits (including listing and blob deletion for GC, listing and dropping derived rows by kind for repair, and batched changeset and derived reads for history walks), in-memory stores, conformance tests, API types, pure rename detection | no other leep crate; no I/O, no async runtime |
 | `leep-store` | `BlobStore` backends: filesystem (loose objects plus delta-compressed packs and the repack writer, ADR 0029), `object_store` (S3/MinIO), `CachedBlobStore`, `open_blob_store(url)`, and the incremental blob copy backup and restore use (`sync`, ADR 0026) | core |
 | `leep-meta` | `MetaStore` backends: SQLite, Postgres, `open_meta_store(url)`, the versioned schema migrator (`migrate`, ADR 0023), and metadata snapshots and their import (`snapshot`, ADR 0026) | core |
 | `leep-derive` | `Repo`: derived data framework and kinds, plus all operations, blob garbage collection (`gc`), the delta-base walk for `repack` (`pack_order`) and store verification and repair (`integrity`) | core (traits only, never a concrete backend) |
@@ -157,6 +157,19 @@ queries on an imported or restarted history do not pay for the whole history.
 and the warmer never derive the same range twice. Add new kinds with the
 [`add-derived-data-kind`](../.claude/skills/add-derived-data-kind/SKILL.md)
 skill. A new kind never requires a client change.
+
+**Log without a path.** `log` with no path (alone or with `author` and
+`extra` filters) and `provenance` walk all ancestors on a heap ordered by
+generation and id. The walk reads ahead in batches (ADR 0030): when it needs a
+changeset it has not read, it reads up to 256 that it expects to reach next,
+with their generations, root trees and skiplists, through
+`MetaStore::get_changesets` and `get_derived_many`, issued together. Its
+guesses are the parents of what it has read and the skiplist entries within
+the batch size, so a long first-parent chain is read a window per round trip
+rather than one changeset. An unfiltered log reads no further than its limit.
+The read-ahead never changes the answer: the heap, the `seen` set and the
+order are those of the plain walk, and whatever a batch did not return is read
+singly at the point the plain walk would read it.
 
 **Path history.** `log --path P` and `GET /v1/last-change/{id}?path=P` read
 the `history-tree-v2` index instead of scanning ancestors (ADR 0013). A lookup
