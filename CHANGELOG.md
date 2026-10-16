@@ -250,6 +250,9 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   "database is locked": switching the file to WAL can report a busy database
   at once instead of waiting, so opening retries for up to the 30 s busy
   timeout.
+- `memory_ref_log_race` no longer fails about 1 run in 20: its tasks could
+  create the same changeset and win a CAS that moved nothing, which correctly
+  writes no ref log entry.
 - A `leep init` whose checkout fails part way (server restarting, a bad
   blob) now removes the files it wrote and its `.leep`, so retrying works.
   It used to leave a half-made working copy that refused the retry.
