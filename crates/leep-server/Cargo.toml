@@ -16,6 +16,7 @@ leep-derive.workspace = true
 leep-meta.workspace = true
 leep-store.workspace = true
 anyhow.workspace = true
+arc-swap.workspace = true
 blake3.workspace = true
 hex.workspace = true
 ed25519-dalek.workspace = true

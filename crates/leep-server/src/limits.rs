@@ -4,7 +4,8 @@
 //!
 //! A principal is a token name, or in anonymous mode (no tokens file) the
 //! client address. State lives in memory per server instance, so with several
-//! instances behind a balancer each one enforces its own limits.
+//! instances behind a balancer each one enforces its own limits. A config
+//! reload keeps the state of every token whose limits did not change.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -12,7 +13,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
-use axum::extract::{ConnectInfo, Request, State};
+use axum::extract::{ConnectInfo, Request};
 use axum::http::{header, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::Response;
@@ -22,6 +23,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::auth::{self, Auth, Principal, Role};
+use crate::reload::RuntimeConfig;
 
 /// Metrics label for every client address in anonymous mode: addresses are
 /// unbounded, so they never become label values.
@@ -425,11 +427,22 @@ struct Table {
     overflow: Arc<Slot>,
 }
 
+/// What a reload did to limiter state, by token name.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct LimiterChange {
+    /// Tokens whose limits are unchanged and whose state carried over.
+    pub kept: usize,
+    /// Tokens whose state started fresh: new limits, or newly limited.
+    pub reset: Vec<String>,
+    /// Tokens that were limited and no longer are, or are gone.
+    pub dropped: Vec<String>,
+}
+
 /// The limits in force for one server.
 pub struct Limiter {
     clock: Arc<dyn Clock>,
     tokens: HashMap<String, Arc<Slot>>,
-    anonymous: Option<Anonymous>,
+    anonymous: Option<Arc<Anonymous>>,
 }
 
 impl Limiter {
@@ -443,8 +456,35 @@ impl Limiter {
         defaults: &Defaults,
         clock: Arc<dyn Clock>,
     ) -> Result<Option<Limiter>, String> {
+        Ok(Self::assemble(None, auth, defaults, clock)?.0)
+    }
+
+    /// Build the limiter for a reloaded config. A token whose resolved limits
+    /// equal `prev`'s keeps its slot, so its buckets and in-flight count carry
+    /// over; a changed or new one starts fresh; a removed one is dropped (its
+    /// in-flight requests finish against the slot they hold). The clock is
+    /// `prev`'s, so refill times stay comparable.
+    pub fn reload(
+        prev: Option<&Limiter>,
+        auth: Option<&Auth>,
+        defaults: &Defaults,
+    ) -> Result<(Option<Limiter>, LimiterChange), String> {
+        let clock = prev.map_or_else(
+            || Arc::new(SystemClock::new()) as Arc<dyn Clock>,
+            |p| p.clock.clone(),
+        );
+        Self::assemble(prev, auth, defaults, clock)
+    }
+
+    fn assemble(
+        prev: Option<&Limiter>,
+        auth: Option<&Auth>,
+        defaults: &Defaults,
+        clock: Arc<dyn Clock>,
+    ) -> Result<(Option<Limiter>, LimiterChange), String> {
         defaults.validate(auth.is_some())?;
         let now = clock.now();
+        let mut change = LimiterChange::default();
         let mut tokens = HashMap::new();
         let mut anonymous = None;
         match auth {
@@ -452,33 +492,58 @@ impl Limiter {
                 for (name, role, tl) in a.token_limits() {
                     let limits = resolve(Some(role), tl, defaults)
                         .map_err(|e| format!("token {name:?}: {e}"))?;
-                    if !limits.is_empty() {
-                        tokens.insert(name.to_string(), Arc::new(Slot::new(name, limits, now)));
+                    if limits.is_empty() {
+                        continue;
                     }
+                    let slot = match prev.and_then(|p| p.tokens.get(name)) {
+                        Some(old) if old.limits == limits => {
+                            change.kept += 1;
+                            old.clone()
+                        }
+                        _ => {
+                            change.reset.push(name.to_string());
+                            Arc::new(Slot::new(name, limits, now))
+                        }
+                    };
+                    tokens.insert(name.to_string(), slot);
                 }
+                change.dropped = prev
+                    .into_iter()
+                    .flat_map(|p| p.tokens.keys())
+                    .filter(|n| !tokens.contains_key(*n))
+                    .cloned()
+                    .collect();
+                change.dropped.sort();
             }
             None => {
                 let limits = resolve(None, &TokenLimits::default(), defaults)?;
                 if !limits.is_empty() {
-                    anonymous = Some(Anonymous {
-                        limits,
-                        table: Mutex::new(Table {
-                            by_client: HashMap::new(),
-                            last_sweep: now,
-                            overflow: Arc::new(Slot::new(ANONYMOUS, limits, now)),
-                        }),
-                    });
+                    anonymous = match prev.and_then(|p| p.anonymous.as_ref()) {
+                        Some(old) if old.limits == limits => Some(old.clone()),
+                        _ => Some(Arc::new(Anonymous {
+                            limits,
+                            table: Mutex::new(Table {
+                                by_client: HashMap::new(),
+                                last_sweep: now,
+                                overflow: Arc::new(Slot::new(ANONYMOUS, limits, now)),
+                            }),
+                        })),
+                    };
                 }
             }
         }
+        change.reset.sort();
         if tokens.is_empty() && anonymous.is_none() {
-            return Ok(None);
+            return Ok((None, change));
         }
-        Ok(Some(Limiter {
-            clock,
-            tokens,
-            anonymous,
-        }))
+        Ok((
+            Some(Limiter {
+                clock,
+                tokens,
+                anonymous,
+            }),
+            change,
+        ))
     }
 
     /// Tokens that have any limit, for the startup log.
@@ -553,13 +618,18 @@ fn too_large(slot: &Slot, max: usize) -> Response {
     )
 }
 
-/// Axum middleware enforcing a [`Limiter`]. Layer it inside authentication,
-/// which supplies the [`Principal`], and inside the timeout and global body
-/// limit. `GET /v1/health` is never limited, so probes keep working.
-pub async fn enforce(State(limiter): State<Arc<Limiter>>, req: Request, next: Next) -> Response {
+/// Axum middleware enforcing the [`Limiter`] of the request's config snapshot.
+/// Layer it inside authentication, which supplies the [`Principal`], and inside
+/// the timeout and global body limit. `GET /v1/health` is never limited, so
+/// probes keep working.
+pub async fn enforce(req: Request, next: Next) -> Response {
     if req.method() == Method::GET && req.uri().path() == "/v1/health" {
         return next.run(req).await;
     }
+    let config = req.extensions().get::<Arc<RuntimeConfig>>().cloned();
+    let Some(limiter) = config.as_ref().and_then(|c| c.limiter.as_ref()) else {
+        return next.run(req).await;
+    };
     let Some(slot) = limiter.slot_for(&req) else {
         return next.run(req).await;
     };
@@ -894,5 +964,113 @@ mod tests {
         let fresh = l.client_slot(client(100_002)).unwrap();
         assert!(!Arc::ptr_eq(&fresh, &o1));
         assert_eq!(tracked(&l), 2);
+    }
+
+    fn auth_with(entries: serde_json::Value) -> Auth {
+        Auth::parse(&serde_json::json!({ "tokens": entries }).to_string()).unwrap()
+    }
+
+    fn entry(name: &str, role: &str, token: &str, extra: serde_json::Value) -> serde_json::Value {
+        let mut e = serde_json::json!({
+            "name": name, "role": role, "hash": auth::hash_token(token)
+        });
+        e.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().cloned().unwrap_or_default());
+        e
+    }
+
+    #[test]
+    fn reload_keeps_state_of_unchanged_tokens_and_resets_the_rest() {
+        let clock = Arc::new(ManualClock::new());
+        let slow = serde_json::json!({ "rate": 1.0, "burst": 1 });
+        let before = auth_with(serde_json::json!([
+            entry("keep", "write", "k", slow.clone()),
+            entry("change", "write", "c", slow.clone()),
+            entry("gone", "write", "g", slow.clone()),
+            entry("free", "write", "f", serde_json::json!({})),
+        ]));
+        let l = Limiter::with_clock(Some(&before), &Defaults::default(), clock.clone())
+            .unwrap()
+            .unwrap();
+        for name in ["keep", "change", "gone"] {
+            assert!(l.tokens[name].take(false, clock.now()).is_ok(), "{name}");
+        }
+        let kept_slot = l.tokens["keep"].clone();
+
+        let after = auth_with(serde_json::json!([
+            // A new digest alone does not reset the bucket.
+            entry("keep", "write", "k2", slow.clone()),
+            entry(
+                "change",
+                "write",
+                "c",
+                serde_json::json!({ "rate": 1.0, "burst": 5 })
+            ),
+            entry("free", "write", "f", slow.clone()),
+        ]));
+        let (next, change) = Limiter::reload(Some(&l), Some(&after), &Defaults::default()).unwrap();
+        let next = next.unwrap();
+        assert_eq!(change.kept, 1);
+        assert_eq!(change.reset, ["change", "free"]);
+        assert_eq!(change.dropped, ["gone"]);
+        assert!(Arc::ptr_eq(&kept_slot, &next.tokens["keep"]));
+        assert!(next.tokens["keep"].take(false, clock.now()).is_err());
+        assert!(next.tokens["change"].take(false, clock.now()).is_ok());
+        assert!(next.tokens["free"].take(false, clock.now()).is_ok());
+        assert!(!next.tokens.contains_key("gone"));
+        // The old limiter, still held by in-flight requests, is untouched.
+        assert!(l.tokens.contains_key("gone"));
+    }
+
+    #[test]
+    fn a_role_change_resets_a_token_that_inherits_a_role_default() {
+        let d = Defaults {
+            read_max_body: Some(10),
+            ..Default::default()
+        };
+        let read = auth_with(serde_json::json!([entry(
+            "t",
+            "read",
+            "x",
+            serde_json::json!({})
+        )]));
+        let l = Limiter::build(Some(&read), &d).unwrap().unwrap();
+        let write = auth_with(serde_json::json!([entry(
+            "t",
+            "write",
+            "x",
+            serde_json::json!({})
+        )]));
+        let (next, change) = Limiter::reload(Some(&l), Some(&write), &d).unwrap();
+        assert!(next.is_none());
+        assert_eq!(change.dropped, ["t"]);
+    }
+
+    #[test]
+    fn reload_with_bad_limits_is_an_error() {
+        let bad = auth_with(serde_json::json!([entry(
+            "t",
+            "write",
+            "x",
+            serde_json::json!({ "burst": 3 })
+        )]));
+        assert!(Limiter::reload(None, Some(&bad), &Defaults::default()).is_err());
+    }
+
+    #[test]
+    fn anonymous_state_survives_a_reload() {
+        let clock = Arc::new(ManualClock::new());
+        let l = anonymous(clock);
+        let slot = l.client_slot(client(1)).unwrap();
+        let d = Defaults {
+            rate: Some(1.0),
+            ..Default::default()
+        };
+        let (next, _) = Limiter::reload(Some(&l), None, &d).unwrap();
+        assert!(Arc::ptr_eq(
+            &slot,
+            &next.unwrap().client_slot(client(1)).unwrap()
+        ));
     }
 }

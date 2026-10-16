@@ -84,6 +84,7 @@ impl Shared {
         .iter()
         .any(|w| why.contains(w))
             || why.starts_with("408")
+            || why.contains("408 Request Timeout")
             || why.starts_with("409")
             || why.contains("missing blob");
         if !expected {
@@ -113,14 +114,19 @@ fn expect(what: &str, got: (u16, Vec<u8>), ok: &[u16]) -> Result<Vec<u8>, String
     }
 }
 
-/// Upload, commit a stack on today's head and land it. Every step is
-/// idempotent, so any failure is answered by running the whole thing again.
+/// Upload, commit a stack on today's head and land it. Uploads and commits
+/// are idempotent, so a failure before the land is answered by doing them
+/// again. Once a land is sent, `pending` holds its changeset and later
+/// attempts land that same changeset: a land whose answer was lost (a hang-up,
+/// a restart, a 408) may have applied, and only the same changeset lets the
+/// server see that it did. Rebuilding on the new head would land it twice.
 /// With `hang_up` set, the numbered request is abandoned a few microseconds
 /// after it is sent, like a client timing out, and the attempt reports failure.
 fn http_attempt(
     addr: SocketAddr,
     steps: &[Step],
     hang_up: Option<(usize, Duration)>,
+    pending: &mut Option<ChangesetId>,
 ) -> Result<ChangesetId, String> {
     let sent = std::cell::Cell::new(0);
     let req = |m: &str, p: &str, b: &[u8]| {
@@ -132,6 +138,9 @@ fn http_attempt(
         }
         http(addr, m, p, b).map_err(|e| format!("{p}: {e}"))
     };
+    if let Some(tip) = *pending {
+        return land_once(&req, tip, pending);
+    }
     let head: RefResponse = serde_json::from_slice(&expect(
         "get ref",
         req("GET", "/v1/refs/main", b"")?,
@@ -169,16 +178,29 @@ fn http_attempt(
         .map_err(|e| e.to_string())?;
         parent = Some(made.id);
     }
+    let tip = parent.expect("a stack has a step");
+    *pending = Some(tip);
+    land_once(&req, tip, pending)
+}
+
+fn land_once(
+    req: &impl Fn(&str, &str, &[u8]) -> Result<(u16, Vec<u8>), String>,
+    tip: ChangesetId,
+    pending: &mut Option<ChangesetId>,
+) -> Result<ChangesetId, String> {
     let land = LandRequest {
-        changeset: parent.expect("a stack has a step"),
+        changeset: tip,
         target_ref: "main".into(),
     };
-    let resp: LandResponse = serde_json::from_slice(&expect(
-        "land",
-        req("POST", "/v1/land", &serde_json::to_vec(&land).unwrap())?,
-        &[200],
-    )?)
-    .map_err(|e| e.to_string())?;
+    let got = req("POST", "/v1/land", &serde_json::to_vec(&land).unwrap())?;
+    let body = expect("land", got, &[200]).inspect_err(|why| {
+        // The stack never landed (a landed copy keeps its blobs alive), so
+        // its blobs may be collected: upload and commit it again.
+        if why.contains("missing blob") {
+            *pending = None;
+        }
+    })?;
+    let resp: LandResponse = serde_json::from_slice(&body).map_err(|e| e.to_string())?;
     match resp {
         LandResponse::Landed { landed, .. } => Ok(landed),
         LandResponse::Conflicts { .. } => panic!("agents write disjoint files, yet: {resp:?}"),
@@ -197,13 +219,14 @@ fn http_agent(n: usize, seed: u64, addr: SocketAddr, shared: &Shared) {
             })
             .collect();
         let deadline = Instant::now() + Duration::from_secs(120);
+        let mut pending = None;
         let landed = loop {
             // One attempt in four hangs up on a request of its own.
             let hang_up = (rng.below(4) == 0).then(|| {
                 let at = 1 + rng.below(1 + 2 * steps.len() + 1);
                 (at, Duration::from_micros(rng.below(8000) as u64))
             });
-            match http_attempt(addr, &steps, hang_up) {
+            match http_attempt(addr, &steps, hang_up, &mut pending) {
                 Ok(id) => break id,
                 Err(why) => {
                     shared.note_retry(&why);

@@ -83,7 +83,9 @@ docker run -d -p 127.0.0.1:7070:7070 -v leep-data:/var/lib/leep \
 
 In compose, add the same volume and `LEEP_TOKENS_FILE` to `leep-server`.
 Clients pass the token with `LEEP_TOKEN`, `leep --token` or
-`leep init --token`. `GET /v1/health` stays public for probes.
+`leep init --token`. `GET /v1/health` stays public for probes. The file is
+re-read on SIGHUP, so tokens can be rotated and revoked without a restart
+([Reloading config](#reloading-config)).
 
 ## Request limits
 
@@ -121,7 +123,8 @@ and any entry in the tokens file can override them, or opt out with
 A token that sets `rate` but not `burst` uses `--rate-burst` if given, else its
 rate rounded up. Bad values (zero, negative, a burst without a rate, a read body
 limit without a tokens file) stop the server at startup with a message naming
-the token or flag. A request over the rate or concurrency limit gets `429` with
+the token or flag, and make a reload fail. Per-token fields reload on SIGHUP; the
+flags need a restart. A request over the rate or concurrency limit gets `429` with
 `Retry-After`; a body over the size limit gets `413`; both have a JSON error
 body. `GET /v1/health` is never limited. The `leep` CLI retries a throttled
 `GET` a few times and then prints the server's message. Tuning and metrics are
@@ -152,7 +155,8 @@ docker run -d -p 127.0.0.1:7070:7070 -v leep-data:/var/lib/leep \
 needs a write token when auth is on. `--require-signatures REF` (repeatable;
 the environment variable is comma-separated) makes `land` onto `REF` fail
 with 400 unless every changeset it adds is signed by a listed key, and needs
-the keys file. Both are read at startup; restart to change them. Authors
+the keys file. The keys file is re-read on SIGHUP; the `--require-signatures`
+refs are flags and need a restart ([Reloading config](#reloading-config)). Authors
 commit with `leep commit --sign KEYFILE` or `LEEP_SIGNING_KEY=KEYFILE`; the key
 file must be mode 0600. Raw ref updates (`POST /v1/refs/{name}`) are checked
 the same way. `leep-git` import writes to the stores directly and is not
@@ -179,8 +183,9 @@ docker run -d -p 127.0.0.1:7070:7070 -v leep-data:/var/lib/leep \
 
 `--review-policy-file` sets the auto-approval rules and lists `refs` that
 require review; `--require-review REF` (repeatable; the environment variable is
-comma-separated) adds more refs with the same rules. Both need the tokens file
-and are read at startup. `land` onto a protected ref fails with 400 unless
+comma-separated) adds more refs with the same rules. Both need the tokens file.
+The policy file is re-read on SIGHUP, so its `refs` and rules change without a
+restart; `--require-review` refs are flags and need one. `land` onto a protected ref fails with 400 unless
 every changeset it adds is approved: each changed path needs an approval from
 an owner of that path as listed in the ref's current head (any one approval
 from anyone where no `OWNERS` file applies), or an enabled auto rule, and no
@@ -189,6 +194,59 @@ owner may have rejected it. Reviewers use `leep review approve|reject REV`;
 `--require-signatures` (both must pass), and raw ref updates are checked too.
 Review endpoints answer 400 on a server without a tokens file. Reviews are
 looked up once per write token, so removing a token drops its reviews.
+
+## Reloading config
+
+Send SIGHUP to the server to re-read the tokens file, the signing keys file and
+the review policy file without a restart (ADR 0024):
+
+```sh
+kill -HUP "$(pidof leep-server)"        # a host
+docker kill --signal=HUP leep           # a container
+docker compose kill -s HUP leep-server  # compose
+```
+
+In the image the server is PID 1, so any way of delivering SIGHUP to the
+container works. The slim image has no shell tooling you can rely on, so under
+Kubernetes signal the container from the node (or with a tool your cluster
+provides) rather than `kubectl exec ... kill`. Without SIGHUP, restart.
+
+All configured files are read and validated first. If any is invalid, the whole
+reload is refused, the server keeps its previous config and logs an `ERROR`
+naming the file and the reason; otherwise the new config takes effect for the
+next request and the log says what changed (counts and names, never tokens or
+digests). A request already running finishes under the config it started with.
+SIGHUP is the only trigger: there is no reload endpoint and no file watcher.
+
+What a reload covers:
+
+| Reloaded | Not reloaded (restart) |
+|---|---|
+| Tokens: added, revoked, rotated, role changes | Listen and metrics addresses, stores, cache size |
+| Per-token limits (`rate`, `burst`, `concurrency`, `max_body`) | `--request-timeout`, `--max-body-bytes`, and the server-wide limit defaults |
+| Trusted signing keys | `--require-signatures` and `--require-review` refs |
+| Review policy: `refs`, auto-approval rules, docs globs | Which files are configured at all (a server started without `--tokens-file` stays open) |
+
+Write each file atomically (save beside it, then `mv` over it) so a reload never
+reads half a file; a half-written file fails safely, but nothing changes until
+the next SIGHUP. In containers, mount the *directory* holding the files: a
+single-file bind mount keeps pointing at the old file after a rename. A
+Kubernetes ConfigMap volume updates the files by itself after a short delay;
+send SIGHUP after the change shows up.
+
+Rotating a token without downtime: `gen-token`, add the new entry (or replace
+the digest of the existing name), SIGHUP, roll the new token out to the agent,
+then remove the old entry and SIGHUP again. To revoke at once, remove the entry
+and SIGHUP; requests that were already admitted finish, up to
+`--request-timeout`. Limiter state is kept for tokens whose limits did not
+change, so a rotation does not give anyone a fresh rate-limit bucket. Rotating
+signing keys works the same way: add the new key, SIGHUP, switch authors over,
+then remove the old one. Removing a key makes changesets signed only by it
+unsigned again, including for `land`.
+
+With several servers behind a balancer, signal every instance and compare
+`leep_config_generation` across them. See
+[OPERATIONS.md](OPERATIONS.md#config-reload) for metrics and alerts.
 
 ## Environment variables
 
