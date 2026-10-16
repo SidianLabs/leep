@@ -168,4 +168,10 @@ pub trait MetaStore: Send + Sync + 'static {
     async fn get_derived(&self, kind: &str, key: &Hash) -> Result<Option<Bytes>>;
 
     async fn put_derived(&self, kind: &str, key: &Hash, value: Bytes) -> Result<()>;
+
+    /// Version of the newest schema migration applied (ADR 0023), for
+    /// diagnostics. `None` for a store without a versioned schema.
+    async fn schema_version(&self) -> Result<Option<u64>> {
+        Ok(None)
+    }
 }

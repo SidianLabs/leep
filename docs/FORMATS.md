@@ -64,8 +64,10 @@ verified (ADR 0021 lists which).
 4. HTTP API: `/v1` endpoints only grow, by adding endpoints or optional
    fields with `#[serde(default)]`. Removing or renaming anything requires
    `/v2`, served alongside v1.
-5. SQL schemas migrate forward only. Migrations are idempotent and live in
-   `leep-meta`.
+5. SQL schemas migrate forward only, by numbered migrations in
+   `leep-meta/migrations/` (ADR 0023). A schema change is a new migration for
+   both backends plus a test fixture of the previous schema; an applied
+   migration is never edited (its checksum is checked at startup).
 
 ## Signatures (no change to `Changeset`)
 
@@ -270,8 +272,36 @@ or delete and never updated or deleted. `old_target` is NULL for a create,
 `new_target` for a delete; `time` is unix seconds by the writing server;
 `actor` is the token name or NULL; `operation` is a short label (`land`,
 `cas`, `undo`, `import`, or a client's own, see "Ref log" below). Tables and
-index are created with `IF NOT EXISTS` on open, so databases made by earlier
-versions upgrade in place; refs that moved before then simply have no rows.
+index come from migration 0001; databases made before the ref log existed
+gain them on upgrade, and refs that moved before then simply have no rows.
+
+### Schema versioning (ADR 0023)
+
+```
+schema_migrations(version BIGINT PRIMARY KEY,   -- SQLite: INTEGER
+                  name TEXT NOT NULL,
+                  applied_at BIGINT NOT NULL,   -- unix seconds
+                  checksum TEXT NOT NULL)       -- hex BLAKE3 of the migration SQL, CRLF as LF
+```
+
+Migrations live in `crates/leep-meta/migrations/{sqlite,postgres}/NNNN_name.sql`
+and are compiled into the binary. Rules:
+
+- Versions are 1, 2, 3... with no gaps, the same in both backends. A database
+  at version N has every migration up to N and no other.
+- **An applied migration is immutable.** Never edit, reorder, renumber or
+  delete a migration that has been merged: its checksum is recorded in every
+  database that ran it, and a mismatch stops the server. Fix mistakes with a
+  new migration.
+- Every schema change is a new numbered migration in both backends, plus a
+  fixture of the schema it upgrades from in `migrate_tests.rs`.
+- Only 0001 is idempotent (`IF NOT EXISTS`); it must be, to finish databases
+  that predate the ref log. Later migrations run exactly once.
+- A migration runs in a transaction together with all the others pending in
+  that run, so it must not contain statements that cannot (`CREATE INDEX
+  CONCURRENTLY`, `VACUUM`).
+- A server refuses a database whose newest version is above its own. The
+  newest version is exported as `leep_schema_version`.
 
 ## Ref log (new table and API fields, no change to stored objects)
 

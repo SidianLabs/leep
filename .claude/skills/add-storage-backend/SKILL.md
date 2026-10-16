@@ -32,7 +32,15 @@ Backends implement `leep_core::BlobStore` (in `leep-store`) or
      serializable isolation. Never read then write.
    - Values returned from `get_changeset` must decode, and their id must
      match the key. Otherwise return `Error::Storage`.
-3. Register a URL scheme in `open_blob_store` / `open_meta_store`.
+3. Register a URL scheme in `open_blob_store` / `open_meta_store`. A
+   MetaStore with a schema must version it like the SQL backends (ADR 0023):
+   an ordered, append-only migration list driven by `leep_meta::migrate`
+   (`Session` over one transaction, an exclusive lock so concurrent starts
+   apply each step once, a `schema_migrations` record with checksums, refusal
+   of a newer or edited history), `migrate_meta_store` and `SchemaMode`
+   support, and `schema_version()`. Add `migrate_tests.rs`-style tests: a
+   fixture per earlier schema, newer-version and checksum refusal, concurrent
+   migrators, and a failing migration that rolls back fully.
 4. Tests:
    - call `leep_core::memory::check_blob_store_contract` /
      `check_meta_store_contract`;
