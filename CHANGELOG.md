@@ -316,6 +316,14 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   `leep_ready_checks_total{store,result}`, alert `LeepNotReady` with a runbook,
   and a Probes section in DEPLOY.md with Kubernetes liveness and readiness
   examples.
+- The path-history index stores directory nodes of more than 64 entries as
+  content-defined chunks of about 32 entries (ADR 0027), so a change rewrites
+  one chunk instead of the whole node. On the first 3,795 commits of git/git
+  its node bytes fell from 45 MB to 13 MB at the same derivation cost. The
+  derived kinds are now `history-tree-v2` and `history-node-v2`: the index
+  derives again on the first path query after the upgrade (or with
+  `repair rederive --kind history-tree-v2`), and `repair drop --kind
+  history-tree-v1` removes the old rows once no older server is running.
 
 ### Fixes
 - Processes opening a new SQLite metadata file at the same moment (servers

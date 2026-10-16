@@ -127,9 +127,9 @@ static KINDS: &[KindInfo] = &[
         name: HISTORY_NODE_KIND,
         class: KindClass::Content,
         summary: "content-addressed node of the path-history index",
-        rederive: Rederive::No("rewritten by `rederive --kind history-tree-v1`"),
+        rederive: Rederive::No("rewritten by `rederive --kind history-tree-v2`"),
         drop: DropPolicy::Refused(
-            "history-tree-v1 rows point at these nodes; drop history-tree-v1, which removes both",
+            "history-tree-v2 rows point at these nodes; drop history-tree-v2, which removes both",
         ),
     },
     KindInfo {
@@ -202,6 +202,32 @@ static KINDS: &[KindInfo] = &[
     },
 ];
 
+/// Kinds an older version wrote and this one neither reads nor writes. Their
+/// rows are garbage here but an older server sharing the store still uses
+/// them, so they stay until an operator runs `repair drop` on them, the only
+/// command that accepts these names.
+static RETIRED: &[KindInfo] = &[
+    KindInfo {
+        name: "history-tree-v1",
+        class: KindClass::PerChangeset,
+        summary: "path-history roots of the whole-node encoding, replaced by history-tree-v2 \
+                  (ADR 0027)",
+        rederive: Rederive::No("retired; this version derives history-tree-v2 instead"),
+        drop: DropPolicy::Allowed {
+            also: &["history-node-v1"],
+        },
+    },
+    KindInfo {
+        name: "history-node-v1",
+        class: KindClass::Content,
+        summary: "whole path-history nodes, replaced by history-node-v2 (ADR 0027)",
+        rederive: Rederive::No("retired; this version derives history-tree-v2 instead"),
+        drop: DropPolicy::Refused(
+            "history-tree-v1 rows point at these nodes; drop history-tree-v1, which removes both",
+        ),
+    },
+];
+
 /// Every kind, in dependency order.
 pub fn kinds() -> &'static [KindInfo] {
     KINDS
@@ -253,9 +279,11 @@ pub fn check_droppable(name: &str) -> Result<&'static KindInfo, Error> {
                 .into(),
         ));
     }
-    let info = lookup(name).ok_or_else(|| {
-        Error::Invalid(format!("unknown kind {name:?}; known kinds: {}", names()))
-    })?;
+    let info = lookup(name)
+        .or_else(|| RETIRED.iter().find(|k| k.name == name))
+        .ok_or_else(|| {
+            Error::Invalid(format!("unknown kind {name:?}; known kinds: {}", names()))
+        })?;
     match info.drop {
         DropPolicy::Allowed { .. } => Ok(info),
         DropPolicy::Refused(why) => Err(Error::Invalid(format!("refusing to drop {name}: {why}"))),
@@ -315,5 +343,16 @@ mod tests {
         }
         assert!(check_droppable("ref_log").is_err());
         assert!(check_droppable("no-such-kind").is_err());
+        // Retired kinds can only be dropped, and only together.
+        let old = check_droppable("history-tree-v1").unwrap();
+        assert_eq!(
+            old.drop,
+            DropPolicy::Allowed {
+                also: &["history-node-v1"]
+            }
+        );
+        assert!(check_droppable("history-node-v1").is_err());
+        assert!(check_rederivable("history-tree-v1").is_err());
+        assert!(lookup("history-tree-v1").is_none());
     }
 }
