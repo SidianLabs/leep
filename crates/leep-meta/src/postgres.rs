@@ -28,7 +28,7 @@ const MIGRATE_LOCK: i64 = 7164737;
 const LOG_LOCK: i64 = 7164738;
 
 pub struct PostgresMetaStore {
-    pool: PgPool,
+    pub(crate) pool: PgPool,
 }
 
 impl PostgresMetaStore {
