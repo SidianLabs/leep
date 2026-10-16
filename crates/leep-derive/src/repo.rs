@@ -406,6 +406,7 @@ impl Repo {
         };
         let tree = apply_changes(self, base, &cs.changes).await?;
 
+        let started = std::time::Instant::now();
         let mut parent_generations = Vec::with_capacity(cs.parents.len());
         for (p, g) in cs.parents.iter().zip(&pre.parent_generations) {
             parent_generations.push(match g {
@@ -414,6 +415,8 @@ impl Repo {
             });
         }
         let generation = parent_generations.iter().max().map_or(1, |g| g + 1);
+        derived::record_derivation(Generation::NAME, started);
+        let started = std::time::Instant::now();
         let skiplist: Arc<[SkipEntry]> = match cs.parents.first() {
             Some(&p) => {
                 let parent = SkipEntry {
@@ -427,6 +430,7 @@ impl Repo {
             }
             None => Arc::from([]),
         };
+        derived::record_derivation(Skiplist::NAME, started);
         let mut rows = vec![
             DerivedRow::new(
                 RootTree::NAME_STR,
