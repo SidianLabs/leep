@@ -43,6 +43,8 @@ measured until the response head is ready, not until the body is streamed.
 | `leep_land_lock_wait_seconds` | histogram | none | Time waiting on the per-ref in-process land lock. |
 | `leep_derive_total` | counter | `kind` | Derived values computed (cache hits in the meta store are not counted). |
 | `leep_derive_duration_seconds` | histogram | `kind` | Time to compute one derived value. |
+| `leep_warm_refs_total` | counter | `result` = `ok`, `error` | Ref heads the background warmer derived indexes for (ADR 0028). Errors are retried on the next pass. |
+| `leep_warm_duration_seconds` | histogram | none | Time to warm one ref head. Seconds to hours after an import or a restart onto a large history; milliseconds once warm. |
 | `leep_search_total` | counter | `indexed` = `true`, `false` | Searches served; `false` means the query had no required trigram and scanned files directly. |
 | `leep_search_duration_seconds` | histogram | none | Whole search call, including any index rows it derived. |
 | `leep_blob_cache_hits_total` | counter | none | Blob reads served from the in-memory cache. |

@@ -306,6 +306,19 @@ Two changes fixed it, with byte-identical index rows (same checksum of every
 What remains is about 4.6 ms per changeset of node reads and writes, one
 metadata round trip each, plus octopus merges, which still take `maximal`.
 
+### Warming instead of deriving on first query
+
+With ADR 0028 every server derives the path-history and search indexes of
+moved ref heads in the background. On the same 3,795-commit slice, with all
+history and search rows removed first, a server started with the default
+`--warm-interval 30s` had the path-history index for every changeset and the
+search index of `main` after 22 s, starting at launch. A `last-change` sent 3 s
+after launch waited 19 s for the warmer's lock instead of deriving the range a
+second time. Afterwards `last-change` answered in 3 ms, a search in 0.18 s and
+a blame of a rarely changed file in 9 ms. On the full git/git history the same
+first query took 69 minutes inside one request; with warming that work happens
+after an import or restart without anyone waiting on it.
+
 ## Analysis
 
 Principle 5 (cost scales with the change, not the repository) holds for the

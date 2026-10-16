@@ -3708,3 +3708,134 @@ mod ref_log {
         assert_eq!(head, r.meta().get_ref("main").await.unwrap());
     }
 }
+
+mod warm {
+    use std::sync::atomic::Ordering;
+
+    use leep_testkit::{FaultPlan, FaultyMetaStore};
+
+    use super::*;
+    use crate::derived::{self, HistoryTree};
+    use crate::warm::{WarmReport, Warmer};
+
+    async fn has_history(r: &Repo, id: ChangesetId) -> bool {
+        r.meta()
+            .get_derived("history-tree-v1", &id.0)
+            .await
+            .unwrap()
+            .is_some()
+    }
+
+    #[tokio::test]
+    async fn a_pass_warms_moved_heads_once() {
+        let r = repo();
+        let mut tips = Vec::new();
+        let mut prev = None;
+        for i in 0..20 {
+            let parents: Vec<_> = prev.into_iter().collect();
+            let id = commit(&r, &parents, &[("f", Some(&i.to_string()))], "c").await;
+            tips.push(id);
+            prev = Some(id);
+        }
+        r.meta()
+            .cas_ref("main", None, Some(tips[19]))
+            .await
+            .unwrap();
+        r.meta().cas_ref("old", None, Some(tips[5])).await.unwrap();
+        assert!(!has_history(&r, tips[19]).await);
+
+        let mut w = Warmer::new(r.clone(), true);
+        let report = w.pass().await.unwrap();
+        assert_eq!(
+            report,
+            WarmReport {
+                refs: 2,
+                warmed: 2,
+                failed: 0
+            }
+        );
+        for &id in &tips {
+            assert!(has_history(&r, id).await, "every ancestor is indexed");
+        }
+        let calls = r.derive_calls.load(Ordering::Relaxed);
+
+        // Nothing moved: nothing to do.
+        assert_eq!(w.pass().await.unwrap().warmed, 0);
+        assert_eq!(r.derive_calls.load(Ordering::Relaxed), calls);
+
+        // A new head costs only its own changeset.
+        let next = commit(&r, &[tips[19]], &[("g", Some("1"))], "next").await;
+        r.meta()
+            .cas_ref("main", Some(tips[19]), Some(next))
+            .await
+            .unwrap();
+        r.meta().cas_ref("old", Some(tips[5]), None).await.unwrap();
+        let report = w.pass().await.unwrap();
+        assert_eq!(
+            report,
+            WarmReport {
+                refs: 1,
+                warmed: 1,
+                failed: 0
+            }
+        );
+        assert!(has_history(&r, next).await);
+        // History, generation, skiplist, last-merge and root tree: a few per kind.
+        assert!(r.derive_calls.load(Ordering::Relaxed) - calls <= 8);
+    }
+
+    /// A query and the warmer deriving the same history at once derive each
+    /// changeset once: the second waits on the kind's lock, then finds the rows.
+    #[tokio::test]
+    async fn concurrent_derivations_do_not_repeat_work() {
+        let plan = FaultPlan::new(7);
+        plan.jitter(4);
+        let r = Repo::new(
+            Arc::new(MemoryBlobStore::new()),
+            Arc::new(FaultyMetaStore::new(
+                Arc::new(MemoryMetaStore::new()),
+                plan.clone(),
+            )),
+        );
+        let base = commit(&r, &[], &[("a", Some("0"))], "base").await;
+        let (mut left, mut right) = (base, base);
+        for i in 0..30 {
+            left = commit(&r, &[left], &[("l", Some(&i.to_string()))], "l").await;
+            right = commit(&r, &[right], &[("r", Some(&i.to_string()))], "r").await;
+        }
+        let tip = commit(&r, &[left, right], &[], "merge").await;
+        let before = r.derive_calls.load(Ordering::Relaxed);
+        let (a, b) = tokio::join!(
+            derived::derive::<HistoryTree>(&r, tip),
+            derived::derive::<HistoryTree>(&r, tip)
+        );
+        assert_eq!(a.unwrap(), b.unwrap());
+        let history_values = r
+            .meta()
+            .list_derived("history-tree-v1", None, usize::MAX)
+            .await
+            .unwrap()
+            .len();
+        assert_eq!(history_values, 62);
+        // Each changeset's history value was computed once; the other calls
+        // are the kinds it needs (generation, skiplist, last-merge) once each.
+        let calls = r.derive_calls.load(Ordering::Relaxed) - before;
+        let alone = {
+            let r2 = repo();
+            let base = commit(&r2, &[], &[("a", Some("0"))], "base").await;
+            let (mut left, mut right) = (base, base);
+            for i in 0..30 {
+                left = commit(&r2, &[left], &[("l", Some(&i.to_string()))], "l").await;
+                right = commit(&r2, &[right], &[("r", Some(&i.to_string()))], "r").await;
+            }
+            let tip = commit(&r2, &[left, right], &[], "merge").await;
+            let before = r2.derive_calls.load(Ordering::Relaxed);
+            derived::derive::<HistoryTree>(&r2, tip).await.unwrap();
+            r2.derive_calls.load(Ordering::Relaxed) - before
+        };
+        assert_eq!(
+            calls, alone,
+            "two concurrent derivations did the work of one"
+        );
+    }
+}

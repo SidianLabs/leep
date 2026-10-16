@@ -281,12 +281,22 @@ fn tree(dir: &Path) -> BTreeMap<String, Vec<u8>> {
 
 /// What a user can ask about `id`, from `client`'s server.
 fn answers(client: &Client, wc: &Path, id: &str) -> Value {
+    // How many index rows a search had to derive depends on what the server
+    // (or its warmer) derived before, not on the repository.
+    let search = |args: &[&str]| {
+        let mut v = client.json(wc, args);
+        if let Some(stats) = v["stats"].as_object_mut() {
+            stats.remove("blob_rows_derived");
+            stats.remove("tree_rows_derived");
+        }
+        v
+    };
     serde_json::json!({
         "log": client.json(wc, &["log", id, "-n", "5000"]),
         "log_alpha": client.json(wc, &["log", id, "--path", "alpha", "-n", "100"]),
         "blame": client.json(wc, &["blame", id, "alpha/one.rs"]),
-        "search": client.json(wc, &["search", "needle", "--rev", id]),
-        "search_agents": client.json(wc, &["search", "step", "--rev", id, "-n", "1000"]),
+        "search": search(&["search", "needle", "--rev", id]),
+        "search_agents": search(&["search", "step", "--rev", id, "-n", "1000"]),
         "last_change": client.json(wc, &["last-change", "alpha/deep/two.txt", "--rev", id]),
         "show": client.ok(wc, &["show", id]),
     })
