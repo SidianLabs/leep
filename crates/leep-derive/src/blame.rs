@@ -24,9 +24,9 @@ const DIFF_TIMEOUT: Duration = Duration::from_millis(500);
 /// are attached on every read.
 /// A tuple, because postcard encodes it identically to the old struct and
 /// this crate has no serde dependency of its own.
-type CachedBlame = (RepoPath, Vec<BlameLine>);
+pub(crate) type CachedBlame = (RepoPath, Vec<BlameLine>);
 
-fn cache_key(id: ChangesetId, path: &RepoPath) -> Hash {
+pub(crate) fn cache_key(id: ChangesetId, path: &RepoPath) -> Hash {
     let mut b = id.0.as_bytes().to_vec();
     b.extend_from_slice(path.as_str().as_bytes());
     Hash::of_object("blame", &b)

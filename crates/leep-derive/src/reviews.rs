@@ -13,7 +13,7 @@ use leep_core::{ChangesetId, Hash, Result};
 
 use crate::Repo;
 
-fn storage_key(id: ChangesetId, reviewer: &str) -> Hash {
+pub(crate) fn storage_key(id: ChangesetId, reviewer: &str) -> Hash {
     let mut bytes = Vec::with_capacity(32 + reviewer.len());
     bytes.extend_from_slice(id.0.as_bytes());
     bytes.extend_from_slice(reviewer.as_bytes());

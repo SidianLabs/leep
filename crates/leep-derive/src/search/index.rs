@@ -162,3 +162,96 @@ impl Repo {
         }
     }
 }
+
+/// Rows `recompute_tree_row` has computed, so a scan over many directories
+/// computes each one once. Cleared when it outgrows its budget; a row is then
+/// computed again, which costs time and not correctness.
+pub(crate) struct TreeRowMemo {
+    rows: std::collections::HashMap<Hash, Bytes>,
+    bytes: usize,
+}
+
+/// Bytes of memoized filters to hold: a few hundred dense 64 KiB filters.
+const MEMO_BUDGET: usize = 32 << 20;
+
+impl TreeRowMemo {
+    pub fn new() -> Self {
+        TreeRowMemo {
+            rows: Default::default(),
+            bytes: 0,
+        }
+    }
+
+    fn insert(&mut self, tree: Hash, row: Bytes) {
+        if self.bytes + row.len() > MEMO_BUDGET {
+            self.rows.clear();
+            self.bytes = 0;
+        }
+        self.bytes += row.len();
+        self.rows.insert(tree, row);
+    }
+}
+
+impl Repo {
+    /// The row `tree_row` stores for `root`, recomputed from the tree itself:
+    /// the filter over every searchable blob below it, taken from the blobs'
+    /// own rows and the filters recomputed for the directories below, never
+    /// from a stored directory filter, so damage in one cannot make another
+    /// look wrong. For verification and repair; like derivation it writes only
+    /// the blob rows it finds missing.
+    pub(crate) async fn recompute_tree_row(
+        &self,
+        root: Hash,
+        memo: &mut TreeRowMemo,
+    ) -> Result<Bytes> {
+        if let Some(row) = memo.rows.get(&root) {
+            return Ok(row.clone());
+        }
+        let c = Counters::default();
+        let mut stack = vec![self.frame(root).await?];
+        loop {
+            let top = stack.last_mut().expect("stack is non-empty");
+            let mut missing = None;
+            for (_, entry) in top.entries.by_ref() {
+                match entry {
+                    TreeEntry::Dir { tree } => match memo.rows.get(&tree) {
+                        Some(row) => top.bloom.or_encoded(row)?,
+                        None => {
+                            missing = Some(tree);
+                            break;
+                        }
+                    },
+                    TreeEntry::File {
+                        content,
+                        kind,
+                        size,
+                    } if kind != FileKind::Symlink => top.files.push((content, size)),
+                    TreeEntry::File { .. } => {}
+                }
+            }
+            if let Some(tree) = missing {
+                stack.push(self.frame(tree).await?);
+                continue;
+            }
+            let mut done = stack.pop().expect("stack is non-empty");
+            let files = std::mem::take(&mut done.files);
+            let mut rows = stream::iter(files)
+                .map(|(h, size)| self.blob_row(h, size, &c))
+                .buffered(CONCURRENCY);
+            while let Some(row) = rows.next().await {
+                if let BlobRow::Trigrams(set) = row? {
+                    for t in set {
+                        done.bloom.insert(t);
+                    }
+                }
+            }
+            drop(rows);
+            let row = Bytes::from(done.bloom.encode());
+            memo.insert(done.hash, row.clone());
+            match stack.last_mut() {
+                Some(parent) => parent.bloom.or_encoded(&row)?,
+                None => return Ok(row),
+            }
+        }
+    }
+}

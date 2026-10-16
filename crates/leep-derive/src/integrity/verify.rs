@@ -1,0 +1,1320 @@
+//! `verify`: read-only checks of a whole store (ADR 0025).
+//!
+//! One walk over history, oldest changeset first, checks everything a
+//! changeset owns: that it reads back as stored, that its tree nodes and the
+//! blobs they name exist and match their addresses, and that each derived row
+//! it owns equals a recomputation from its inputs. Rows keyed by content are
+//! scanned afterwards, then attestations, bookkeeping, blame and the ref log.
+//! Nothing is written: recomputation runs against in-memory shadows of the
+//! stores (see `shadow`).
+
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use async_trait::async_trait;
+use bytes::Bytes;
+use futures_util::{stream, StreamExt};
+use leep_core::review::{check_comment, Review, REVIEW_KIND};
+use leep_core::signature::{key_id as signature_key_id, Signature, SIGNATURE_KIND};
+use leep_core::{
+    BlobStore, Changeset, ChangesetId, Error, FileChange, Hash, MetaStore, RepoPath, Result,
+    TreeEntry, TreeNode,
+};
+use serde::Serialize;
+
+use super::kinds::{self, KindClass, BLAME_KIND};
+use super::problems::{damage_of, recoverable, Damage, Problem, ProblemLog, Progress, Ticker};
+use super::rows::{describe, expected_blob_row, recompute, RowScan, PAGE};
+use super::shadow::{ShadowBlobs, ShadowMeta};
+use super::walk::{HistoryWalk, Visitor};
+use crate::blame::{cache_key, CachedBlame};
+use crate::derived::{DerivedKind, HistoryNode, HistoryTree};
+use crate::gc;
+use crate::search::index::TreeRowMemo;
+use crate::search::{BLOB_KIND as BLOB_TRIGRAMS, TREE_KIND as TREE_TRIGRAMS};
+use crate::signatures::{storage_key as signature_storage_key, REBASED_ORIGIN_KIND};
+use crate::{reviews, Repo};
+
+/// Blobs read at once while checking them.
+const BLOB_CONCURRENCY: usize = 8;
+/// Blob references gathered before they are checked together.
+const BLOB_BATCH: usize = 256;
+
+/// Checks one signature: `Err` says why it is not valid. Supplied by the
+/// caller because the cryptography lives outside this crate.
+pub type SignatureCheck =
+    Arc<dyn Fn(&Signature, &ChangesetId) -> std::result::Result<(), String> + Send + Sync>;
+
+#[derive(Clone)]
+pub struct VerifyOptions {
+    /// Refs whose history is checked; empty means every ref.
+    pub refs: Vec<String>,
+    /// Check every stored changeset (not only those reachable from the refs)
+    /// and recompute every derived row, instead of a sample.
+    pub full: bool,
+    /// Re-hash the bytes of every reachable blob, not just check it exists.
+    pub rehash: bool,
+    /// Derived kinds to check. Kinds they depend on are checked too.
+    pub derived: Vec<&'static str>,
+    /// Rows per kind recomputed when not `full`, and changesets for the
+    /// per-changeset kinds: about this many, chosen by hash, plus the ref
+    /// tips and root changesets.
+    pub sample: usize,
+    /// Problems kept in the report; the rest are only counted.
+    pub max_problems: usize,
+    /// Verifies stored signatures cryptographically (`full` only). Without
+    /// it signature rows are checked for structure.
+    pub signature_check: Option<SignatureCheck>,
+}
+
+impl Default for VerifyOptions {
+    fn default() -> Self {
+        VerifyOptions {
+            refs: Vec::new(),
+            full: false,
+            rehash: false,
+            derived: kinds::kinds().iter().map(|k| k.name).collect(),
+            sample: 256,
+            max_problems: 1000,
+            signature_check: None,
+        }
+    }
+}
+
+/// What was looked at.
+#[derive(Debug, Default, Serialize)]
+pub struct Stats {
+    pub refs: u64,
+    pub changesets_reachable: u64,
+    /// Changesets no ref reaches, checked only by `--full`.
+    pub changesets_other: u64,
+    pub tree_nodes: u64,
+    pub blobs_checked: u64,
+    pub blobs_rehashed: u64,
+    pub bytes_rehashed: u64,
+    pub reflog_entries: u64,
+    pub reflog_refs_without_entries: u64,
+}
+
+/// What was found for one derived kind.
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct KindStats {
+    /// Rows compared with a recomputation.
+    pub checked: u64,
+    /// Changesets in the checked set that have no row. Not a problem: rows
+    /// derive on demand.
+    pub missing: u64,
+    pub mismatched: u64,
+    /// Rows that could not be recomputed because an input is damaged.
+    pub unverifiable: u64,
+    /// Rows whose subject is gone or could not be checked (a collected blob,
+    /// a changeset with an unreadable parent).
+    pub skipped: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct VerifyReport {
+    pub mode: &'static str,
+    pub refs: Vec<String>,
+    pub stats: Stats,
+    pub derived: BTreeMap<String, KindStats>,
+    pub problems: Vec<Problem>,
+    pub problems_total: u64,
+    pub notes: Vec<String>,
+    pub elapsed_secs: f64,
+}
+
+impl VerifyReport {
+    pub fn ok(&self) -> bool {
+        self.problems_total == 0
+    }
+}
+
+struct BlobRef {
+    hash: Hash,
+    size: u64,
+    changeset: ChangesetId,
+    path: String,
+}
+
+enum BlobCheck {
+    Fine { rehashed: Option<u64> },
+    Bad(Problem),
+}
+
+async fn check_blob(
+    blobs: &dyn leep_core::BlobStore,
+    b: BlobRef,
+    rehash: bool,
+) -> Result<BlobCheck> {
+    let missing = |b: &BlobRef| {
+        BlobCheck::Bad(
+            Problem::new(
+                "blob",
+                "missing_blob",
+                format!(
+                    "blob {} is missing; changeset {} has it at {}",
+                    b.hash, b.changeset, b.path
+                ),
+            )
+            .key(&b.hash)
+            .changeset(b.changeset)
+            .path(b.path.clone()),
+        )
+    };
+    if !rehash {
+        return Ok(if blobs.contains(&b.hash).await? {
+            BlobCheck::Fine { rehashed: None }
+        } else {
+            missing(&b)
+        });
+    }
+    let Some(data) = blobs.get(&b.hash).await? else {
+        return Ok(missing(&b));
+    };
+    let len = data.len() as u64;
+    let actual = Hash::of_blob(&data);
+    if actual != b.hash {
+        return Ok(BlobCheck::Bad(
+            Problem::new(
+                "blob",
+                "corrupt_blob",
+                format!(
+                    "blob {} holds bytes that hash to {actual}; changeset {} has it at {}",
+                    b.hash, b.changeset, b.path
+                ),
+            )
+            .key(&b.hash)
+            .changeset(b.changeset)
+            .path(b.path),
+        ));
+    }
+    if len != b.size {
+        return Ok(BlobCheck::Bad(
+            Problem::new(
+                "blob",
+                "blob_size_mismatch",
+                format!(
+                    "blob {} is {len} bytes but its tree entry says {}; changeset {} has it at {}",
+                    b.hash, b.size, b.changeset, b.path
+                ),
+            )
+            .key(&b.hash)
+            .changeset(b.changeset)
+            .path(b.path),
+        ));
+    }
+    Ok(BlobCheck::Fine {
+        rehashed: Some(len),
+    })
+}
+
+fn join(dir: &str, name: &str) -> String {
+    if dir.is_empty() {
+        name.to_string()
+    } else {
+        format!("{dir}/{name}")
+    }
+}
+
+fn id_prefix(h: &Hash) -> u64 {
+    u64::from_be_bytes(h.0[..8].try_into().expect("8 bytes"))
+}
+
+/// Check a store. `Err` means the run could not be completed (a store was
+/// unreachable, a named ref does not exist); damage is in the report.
+pub async fn verify(
+    repo: &Repo,
+    opts: &VerifyOptions,
+    progress: &dyn Progress,
+) -> Result<VerifyReport> {
+    let started = Instant::now();
+    let kinds = kinds::with_dependencies(&opts.derived);
+    let shadow_meta = ShadowMeta::new(repo.meta().clone());
+    let shadow_blobs = ShadowBlobs::new(repo.blobs().clone());
+    let shadow = Repo::new(shadow_blobs.clone(), shadow_meta.clone());
+    let mut v = Verifier {
+        repo,
+        opts,
+        progress,
+        kinds,
+        shadow,
+        shadow_meta,
+        shadow_blobs,
+        log: ProblemLog::new(opts.max_problems),
+        stats: Stats::default(),
+        kind_stats: BTreeMap::new(),
+        notes: Vec::new(),
+        tips: HashSet::new(),
+        sample_cut: u64::MAX,
+        in_ref_phase: true,
+        current_ref: None,
+        visited_trees: HashSet::new(),
+        visited_blobs: HashSet::new(),
+        visited_hnodes: HashSet::new(),
+        pending: Vec::new(),
+        ticker: Ticker::new(Duration::from_secs(5)),
+        phase: "starting",
+    };
+    let refs = v.run().await?;
+    let (problems, problems_total) = v.log.into_parts();
+    Ok(VerifyReport {
+        mode: if opts.full { "full" } else { "sample" },
+        refs,
+        stats: v.stats,
+        derived: v
+            .kind_stats
+            .into_iter()
+            .map(|(k, s)| (k.to_string(), s))
+            .collect(),
+        problems,
+        problems_total,
+        notes: v.notes,
+        elapsed_secs: started.elapsed().as_secs_f64(),
+    })
+}
+
+struct Verifier<'a> {
+    repo: &'a Repo,
+    opts: &'a VerifyOptions,
+    progress: &'a dyn Progress,
+    /// Kinds to check, dependencies included, in dependency order.
+    kinds: Vec<&'static str>,
+    /// Derivation runs here: reads see the stores plus substitutes for rows
+    /// found damaged, writes stay in memory.
+    shadow: Repo,
+    shadow_meta: Arc<ShadowMeta>,
+    shadow_blobs: Arc<ShadowBlobs>,
+    log: ProblemLog,
+    stats: Stats,
+    kind_stats: BTreeMap<&'static str, KindStats>,
+    notes: Vec<String>,
+    tips: HashSet<ChangesetId>,
+    sample_cut: u64,
+    in_ref_phase: bool,
+    current_ref: Option<String>,
+    visited_trees: HashSet<Hash>,
+    visited_blobs: HashSet<Hash>,
+    visited_hnodes: HashSet<Hash>,
+    pending: Vec<BlobRef>,
+    ticker: Ticker,
+    phase: &'static str,
+}
+
+impl Verifier<'_> {
+    fn has(&self, kind: &str) -> bool {
+        self.kinds.contains(&kind)
+    }
+
+    fn kstats(&mut self, kind: &'static str) -> &mut KindStats {
+        self.kind_stats.entry(kind).or_default()
+    }
+
+    fn per_changeset_kinds(&self) -> Vec<&'static str> {
+        self.kinds
+            .iter()
+            .copied()
+            .filter(|k| kinds::lookup(k).is_some_and(|i| i.class == KindClass::PerChangeset))
+            .collect()
+    }
+
+    fn phase(&mut self, name: &'static str) {
+        self.phase = name;
+        self.progress.info(&format!("verify: {name}"));
+    }
+
+    fn tick(&mut self) {
+        if self.ticker.due() {
+            self.progress.info(&format!(
+                "verify: {}: {} changesets, {} tree nodes, {} blobs, {} problems so far",
+                self.phase,
+                self.stats.changesets_reachable + self.stats.changesets_other,
+                self.stats.tree_nodes,
+                self.stats.blobs_checked,
+                self.log.total(),
+            ));
+        }
+    }
+
+    async fn run(&mut self) -> Result<Vec<String>> {
+        let meta = self.repo.meta().clone();
+        let all_refs = meta.list_refs().await?;
+        let mut selected = BTreeMap::new();
+        if self.opts.refs.is_empty() {
+            selected = all_refs.clone();
+        } else {
+            for name in &self.opts.refs {
+                let id = all_refs
+                    .get(name)
+                    .ok_or_else(|| Error::NotFound(format!("ref {name:?}")))?;
+                selected.insert(name.clone(), *id);
+            }
+        }
+        self.stats.refs = selected.len() as u64;
+        self.tips = selected.values().copied().collect();
+        self.progress.info(&format!(
+            "verify: {} mode, {} ref(s), derived kinds: {}",
+            if self.opts.full { "full" } else { "sample" },
+            selected.len(),
+            self.kinds.join(" "),
+        ));
+
+        let sampling = !self.opts.full && !self.per_changeset_kinds().is_empty();
+        if sampling {
+            self.sample_cut = self.sample_cut_for(&meta).await?;
+        }
+
+        self.phase("history, trees and blobs");
+        let mut walk = HistoryWalk::new();
+        for (name, tip) in &selected {
+            self.current_ref = Some(name.clone());
+            walk.run_from(&*meta, *tip, self).await?;
+        }
+        self.current_ref = None;
+        // Named refs scope the run; without any, --full also covers the
+        // changesets no ref reaches.
+        if self.opts.full && self.opts.refs.is_empty() {
+            self.in_ref_phase = false;
+            let mut after = None;
+            loop {
+                let page = meta.list_changesets(after, PAGE).await?;
+                let Some(last) = page.last().copied() else {
+                    break;
+                };
+                after = Some(last);
+                for id in page {
+                    walk.run_from(&*meta, id, self).await?;
+                }
+            }
+        }
+        self.flush_blobs().await?;
+        drop(walk);
+        self.visited_trees = HashSet::new();
+        self.visited_blobs = HashSet::new();
+
+        self.phase("derived rows keyed by content");
+        if self.has(BLOB_TRIGRAMS) {
+            self.scan_blob_trigrams().await?;
+        }
+        if self.has(TREE_TRIGRAMS) {
+            self.scan_tree_trigrams().await?;
+        }
+        if self.has(kinds::HISTORY_NODE) {
+            self.scan_history_nodes().await?;
+        }
+        self.phase("attestations and bookkeeping rows");
+        self.scan_attestations().await?;
+        self.scan_rebased_origins().await?;
+        self.scan_gc_rows().await?;
+        if self.has(BLAME_KIND) {
+            self.phase("blame");
+            self.check_blame(&selected).await?;
+        }
+        self.phase("ref log");
+        self.check_reflog(&all_refs).await?;
+        if sampling {
+            self.notes.push(format!(
+                "sample mode: about {} changesets and {} rows per kind were recomputed; \
+                 use --full to recompute them all",
+                self.opts.sample, self.opts.sample
+            ));
+        }
+        Ok(selected.into_keys().collect())
+    }
+
+    /// The largest id prefix a changeset may have to be sampled, so about
+    /// `sample` of the stored changesets are.
+    async fn sample_cut_for(&mut self, meta: &Arc<dyn MetaStore>) -> Result<u64> {
+        let mut total = 0u64;
+        let mut after = None;
+        loop {
+            let page = meta.list_changesets(after, 5000).await?;
+            let Some(last) = page.last().copied() else {
+                break;
+            };
+            after = Some(last);
+            total += page.len() as u64;
+        }
+        let sample = self.opts.sample as u64;
+        Ok(if total <= sample {
+            u64::MAX
+        } else {
+            ((sample as u128 * u64::MAX as u128) / total as u128) as u64
+        })
+    }
+
+    fn sampled(&self, id: &ChangesetId, cs: &Changeset) -> bool {
+        self.opts.full
+            || self.tips.contains(id)
+            || cs.parents.is_empty()
+            || id_prefix(&id.0) <= self.sample_cut
+    }
+
+    // --- blobs and trees -------------------------------------------------
+
+    fn blob_ref(&mut self, hash: Hash, size: u64, changeset: ChangesetId, path: &str) {
+        if self.visited_blobs.insert(hash) {
+            self.pending.push(BlobRef {
+                hash,
+                size,
+                changeset,
+                path: path.to_string(),
+            });
+        }
+    }
+
+    async fn flush_blobs(&mut self) -> Result<()> {
+        let pending = std::mem::take(&mut self.pending);
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let blobs = self.repo.blobs().clone();
+        let rehash = self.opts.rehash;
+        let results: Vec<Result<BlobCheck>> = stream::iter(pending)
+            .map(|b| {
+                let blobs = blobs.clone();
+                async move { check_blob(&*blobs, b, rehash).await }
+            })
+            .buffer_unordered(BLOB_CONCURRENCY)
+            .collect()
+            .await;
+        for r in results {
+            self.stats.blobs_checked += 1;
+            match r? {
+                BlobCheck::Fine { rehashed } => {
+                    if let Some(n) = rehashed {
+                        self.stats.blobs_rehashed += 1;
+                        self.stats.bytes_rehashed += n;
+                    }
+                }
+                BlobCheck::Bad(p) => self.log.push(p),
+            }
+        }
+        Ok(())
+    }
+
+    async fn check_tree(&mut self, id: ChangesetId) -> Result<()> {
+        let root = match self.shadow.root_tree(id).await {
+            Ok(h) => h,
+            Err(e) if recoverable(&e) => {
+                self.log.push(
+                    Problem::new(
+                        "tree",
+                        "unreadable_root_tree",
+                        format!("the root tree of changeset {id} cannot be determined: {e}"),
+                    )
+                    .changeset(id),
+                );
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
+        let mut stack = vec![(root, String::new())];
+        while let Some((tree, dir)) = stack.pop() {
+            if !self.visited_trees.insert(tree) {
+                continue;
+            }
+            self.stats.tree_nodes += 1;
+            let shown = if dir.is_empty() { "/" } else { dir.as_str() };
+            let bytes = match self.shadow_blobs.get(&tree).await? {
+                Some(b) => b,
+                None if tree == TreeNode::empty_hash() => continue,
+                None => {
+                    self.log.push(
+                        Problem::new(
+                            "tree",
+                            "missing_tree",
+                            format!(
+                                "tree node {tree} is missing; changeset {id} has it at {shown}"
+                            ),
+                        )
+                        .key(&tree)
+                        .changeset(id)
+                        .path(dir),
+                    );
+                    continue;
+                }
+            };
+            let actual = Hash::of_object(TreeNode::KIND, &bytes);
+            let node = if actual != tree {
+                Err(format!("holds bytes that hash to {actual}"))
+            } else {
+                TreeNode::decode(&bytes).map_err(|e| format!("does not decode: {e}"))
+            };
+            let node = match node {
+                Ok(n) => n,
+                Err(why) => {
+                    self.log.push(
+                        Problem::new(
+                            "tree",
+                            "corrupt_tree",
+                            format!("tree node {tree} {why}; changeset {id} has it at {shown}"),
+                        )
+                        .key(&tree)
+                        .changeset(id)
+                        .path(dir),
+                    );
+                    continue;
+                }
+            };
+            for (name, entry) in node.entries {
+                let path = join(&dir, &name);
+                match entry {
+                    TreeEntry::Dir { tree } => {
+                        if !self.visited_trees.contains(&tree) {
+                            stack.push((tree, path));
+                        }
+                    }
+                    TreeEntry::File { content, size, .. } => {
+                        self.blob_ref(content, size, id, &path)
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // --- derived rows owned by a changeset ---------------------------------
+
+    async fn check_changeset_kind(
+        &mut self,
+        kind: &'static str,
+        id: ChangesetId,
+        cs: &Changeset,
+    ) -> Result<()> {
+        let Some(stored) = self.repo.meta().get_derived(kind, &id.0).await? else {
+            self.kstats(kind).missing += 1;
+            return Ok(());
+        };
+        let expected = match recompute(kind, &self.shadow, id, cs).await {
+            Ok(v) => v,
+            Err(e) if recoverable(&e) => {
+                self.kstats(kind).unverifiable += 1;
+                self.log.push(
+                    Problem::new(
+                        "derived",
+                        "derived_unverifiable",
+                        format!("the {kind} row of {id} cannot be recomputed: {e}"),
+                    )
+                    .kind(kind)
+                    .key(&id.0)
+                    .changeset(id),
+                );
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
+        self.kstats(kind).checked += 1;
+        if kind == HistoryTree::NAME {
+            let deep = self.opts.full;
+            self.check_history_nodes(id, &stored, deep).await?;
+        }
+        if expected != stored {
+            self.kstats(kind).mismatched += 1;
+            self.log.push(
+                Problem::new(
+                    "derived",
+                    "derived_mismatch",
+                    format!(
+                        "the {kind} row of {id} is wrong: {}",
+                        describe(kind, &stored, &expected)
+                    ),
+                )
+                .kind(kind)
+                .key(&id.0)
+                .changeset(id),
+            );
+            self.shadow_meta.set(kind, &id.0, expected);
+        }
+        Ok(())
+    }
+
+    /// The history nodes a stored `history-tree-v1` row leads to exist and
+    /// match their addresses: the root only when sampling, all of them when
+    /// `deep`.
+    async fn check_history_nodes(
+        &mut self,
+        id: ChangesetId,
+        stored: &[u8],
+        deep: bool,
+    ) -> Result<()> {
+        let Ok(root) = <[u8; 32]>::try_from(stored) else {
+            return Ok(());
+        };
+        let mut stack = vec![Hash(root)];
+        while let Some(node) = stack.pop() {
+            if !self.visited_hnodes.insert(node) {
+                continue;
+            }
+            match self.shadow.read_history_node(node).await {
+                Ok(n) if deep => stack.extend(n.entries.values().filter_map(|e| e.node())),
+                Ok(_) => {}
+                Err(e) => match damage_of(&e) {
+                    Some(d) => self.log.push(
+                        Problem::new(
+                            "derived",
+                            match d {
+                                Damage::Corrupt => "corrupt_history_node",
+                                Damage::Missing => "missing_history_node",
+                            },
+                            format!(
+                                "history node {node} (reached from the history-tree-v1 row of {id}): {e}"
+                            ),
+                        )
+                        .kind(kinds::HISTORY_NODE)
+                        .key(&node)
+                        .changeset(id),
+                    ),
+                    None => return Err(e),
+                },
+            }
+        }
+        Ok(())
+    }
+
+    // --- rows keyed by content ----------------------------------------------
+
+    async fn scan_blob_trigrams(&mut self) -> Result<()> {
+        let kind = BLOB_TRIGRAMS;
+        let meta = self.repo.meta().clone();
+        let mut scan = RowScan::new(kind, self.opts.full, self.opts.sample);
+        while let Some(page) = scan.next(&*meta).await? {
+            for (key, value) in page {
+                let Some(data) = self.repo.blobs().get(&key).await? else {
+                    self.kstats(kind).skipped += 1;
+                    continue;
+                };
+                if Hash::of_blob(&data) != key {
+                    self.kstats(kind).unverifiable += 1;
+                    continue;
+                }
+                self.kstats(kind).checked += 1;
+                let expected = expected_blob_row(&data);
+                if expected != value {
+                    self.row_mismatch(kind, &key, &value, &expected);
+                    self.shadow_meta.set(kind, &key, expected);
+                }
+            }
+            self.tick();
+        }
+        Ok(())
+    }
+
+    async fn scan_tree_trigrams(&mut self) -> Result<()> {
+        let kind = TREE_TRIGRAMS;
+        let meta = self.repo.meta().clone();
+        let mut scan = RowScan::new(kind, self.opts.full, self.opts.sample);
+        let mut memo = TreeRowMemo::new();
+        while let Some(page) = scan.next(&*meta).await? {
+            for (key, value) in page {
+                let expected = match self.shadow.recompute_tree_row(key, &mut memo).await {
+                    Ok(v) => v,
+                    Err(e) if recoverable(&e) => {
+                        // The node may have been collected, or is damaged and
+                        // reported by the tree check if any changeset reaches it.
+                        self.kstats(kind).skipped += 1;
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                };
+                self.shadow_blobs.clear();
+                self.kstats(kind).checked += 1;
+                if expected != value {
+                    self.row_mismatch(kind, &key, &value, &expected);
+                    self.shadow_meta.set(kind, &key, expected);
+                }
+            }
+            self.tick();
+        }
+        Ok(())
+    }
+
+    fn row_mismatch(&mut self, kind: &'static str, key: &Hash, stored: &Bytes, expected: &Bytes) {
+        self.kstats(kind).mismatched += 1;
+        self.log.push(
+            Problem::new(
+                "derived",
+                "derived_mismatch",
+                format!(
+                    "the {kind} row {key} is wrong: {}",
+                    describe(kind, stored, expected)
+                ),
+            )
+            .kind(kind)
+            .key(key),
+        );
+    }
+
+    async fn scan_history_nodes(&mut self) -> Result<()> {
+        let kind = kinds::HISTORY_NODE;
+        let meta = self.repo.meta().clone();
+        let mut scan = RowScan::new(kind, self.opts.full, self.opts.sample);
+        while let Some(page) = scan.next(&*meta).await? {
+            for (key, value) in page {
+                self.kstats(kind).checked += 1;
+                let actual = Hash::of_object(kind, &value);
+                let why = if actual != key {
+                    Some(format!("holds bytes that hash to {actual}"))
+                } else {
+                    HistoryNode::decode(&value)
+                        .err()
+                        .map(|e| format!("does not decode: {e}"))
+                };
+                if let Some(why) = why {
+                    self.kstats(kind).mismatched += 1;
+                    self.log.push(
+                        Problem::new(
+                            "derived",
+                            "corrupt_history_node",
+                            format!("history node {key} {why}"),
+                        )
+                        .kind(kind)
+                        .key(&key),
+                    );
+                }
+            }
+            self.tick();
+        }
+        Ok(())
+    }
+
+    // --- attestations and bookkeeping ----------------------------------------
+
+    async fn scan_attestations(&mut self) -> Result<()> {
+        let want_sigs = self.has(SIGNATURE_KIND);
+        let want_reviews = self.has(REVIEW_KIND);
+        let meta = self.repo.meta().clone();
+        let full = self.opts.full;
+        // Rows that decode, to be matched with their changesets in a full run.
+        let mut sig_rows: HashSet<Hash> = HashSet::new();
+        let mut key_ids: HashSet<String> = HashSet::new();
+        let mut review_rows: HashSet<Hash> = HashSet::new();
+        let mut reviewers: HashSet<String> = HashSet::new();
+
+        if want_sigs {
+            let mut scan = RowScan::new(SIGNATURE_KIND, full, self.opts.sample);
+            while let Some(page) = scan.next(&*meta).await? {
+                for (key, value) in page {
+                    self.kstats(SIGNATURE_KIND).checked += 1;
+                    let bad = match Signature::decode(&value) {
+                        Err(e) => Some(format!("does not decode: {e}")),
+                        Ok(s) if s.key_id != signature_key_id(&s.public_key) => Some(format!(
+                            "names key id {} but its public key has id {}",
+                            s.key_id,
+                            signature_key_id(&s.public_key)
+                        )),
+                        Ok(s) => {
+                            if full {
+                                key_ids.insert(s.key_id);
+                                sig_rows.insert(key);
+                            }
+                            None
+                        }
+                    };
+                    if let Some(why) = bad {
+                        self.attestation_problem(
+                            SIGNATURE_KIND,
+                            &key,
+                            format!("signature row {key} {why}"),
+                        );
+                    }
+                }
+                self.tick();
+            }
+        }
+        if want_reviews {
+            let mut scan = RowScan::new(REVIEW_KIND, full, self.opts.sample);
+            while let Some(page) = scan.next(&*meta).await? {
+                for (key, value) in page {
+                    self.kstats(REVIEW_KIND).checked += 1;
+                    let bad = match Review::decode(&value) {
+                        Err(e) => Some(format!("does not decode: {e}")),
+                        Ok(r) => match check_comment(&r.comment) {
+                            Err(e) => Some(format!("is not a valid review: {e}")),
+                            Ok(()) => {
+                                if full {
+                                    reviewers.insert(r.reviewer);
+                                    review_rows.insert(key);
+                                }
+                                None
+                            }
+                        },
+                    };
+                    if let Some(why) = bad {
+                        self.attestation_problem(
+                            REVIEW_KIND,
+                            &key,
+                            format!("review row {key} {why}"),
+                        );
+                    }
+                }
+                self.tick();
+            }
+        }
+        if !full || (sig_rows.is_empty() && review_rows.is_empty()) {
+            return Ok(());
+        }
+
+        // A row's key is a hash of (changeset, who), so the changeset is found
+        // by hashing every stored changeset with every key id and reviewer
+        // that appears in a row.
+        self.progress
+            .info("verify: matching attestations with their changesets");
+        let mut after = None;
+        loop {
+            let page = meta.list_changesets(after, PAGE).await?;
+            let Some(last) = page.last().copied() else {
+                break;
+            };
+            after = Some(last);
+            for id in page {
+                for kid in &key_ids {
+                    let key = signature_storage_key(id, kid);
+                    if sig_rows.remove(&key) {
+                        self.check_signature(id, &key).await?;
+                    }
+                }
+                for who in &reviewers {
+                    review_rows.remove(&reviews::storage_key(id, who));
+                }
+            }
+            self.tick();
+        }
+        for key in sig_rows {
+            self.attestation_problem(
+                SIGNATURE_KIND,
+                &key,
+                format!("signature row {key} belongs to no stored changeset"),
+            );
+        }
+        for key in review_rows {
+            self.attestation_problem(
+                REVIEW_KIND,
+                &key,
+                format!("review row {key} belongs to no stored changeset"),
+            );
+        }
+        Ok(())
+    }
+
+    fn attestation_problem(&mut self, kind: &'static str, key: &Hash, message: String) {
+        self.kstats(kind).mismatched += 1;
+        self.log.push(
+            Problem::new("attestation", "bad_attestation", message)
+                .kind(kind)
+                .key(key),
+        );
+    }
+
+    async fn check_signature(&mut self, id: ChangesetId, key: &Hash) -> Result<()> {
+        let Some(check) = self.opts.signature_check.clone() else {
+            return Ok(());
+        };
+        let Some(value) = self.repo.meta().get_derived(SIGNATURE_KIND, key).await? else {
+            return Ok(());
+        };
+        let Ok(sig) = Signature::decode(&value) else {
+            return Ok(());
+        };
+        if let Err(why) = check(&sig, &id) {
+            self.kstats(SIGNATURE_KIND).mismatched += 1;
+            self.log.push(
+                Problem::new(
+                    "attestation",
+                    "invalid_signature",
+                    format!(
+                        "the signature by key {} on {id} does not verify: {why}",
+                        sig.key_id
+                    ),
+                )
+                .kind(SIGNATURE_KIND)
+                .key(key)
+                .changeset(id),
+            );
+        }
+        Ok(())
+    }
+
+    async fn scan_rebased_origins(&mut self) -> Result<()> {
+        if !self.has(REBASED_ORIGIN_KIND) {
+            return Ok(());
+        }
+        let kind = REBASED_ORIGIN_KIND;
+        let meta = self.repo.meta().clone();
+        let mut scan = RowScan::new(kind, self.opts.full, self.opts.sample);
+        while let Some(page) = scan.next(&*meta).await? {
+            for (key, value) in page {
+                self.kstats(kind).checked += 1;
+                let copy = ChangesetId(key);
+                let origin = <[u8; 32]>::try_from(value.as_ref())
+                    .ok()
+                    .map(|b| ChangesetId(Hash(b)));
+                let mut why = None;
+                match origin {
+                    None => why = Some(format!("is {} bytes, not a changeset id", value.len())),
+                    Some(o) => {
+                        for (what, id) in [("copy", copy), ("original", o)] {
+                            match meta.get_changeset(&id).await {
+                                Ok(Some(_)) => {}
+                                Ok(None) => {
+                                    why =
+                                        Some(format!("names the {what} {id}, which does not exist"))
+                                }
+                                Err(e) if damage_of(&e).is_some() => {
+                                    why = Some(format!(
+                                        "names the {what} {id}, which is unreadable: {e}"
+                                    ))
+                                }
+                                Err(e) => return Err(e),
+                            }
+                        }
+                    }
+                }
+                if let Some(why) = why {
+                    self.kstats(kind).mismatched += 1;
+                    self.log.push(
+                        Problem::new(
+                            "attestation",
+                            "bad_rebased_origin",
+                            format!("rebased-origin row {key} {why}"),
+                        )
+                        .kind(kind)
+                        .key(&key),
+                    );
+                }
+            }
+            self.tick();
+        }
+        Ok(())
+    }
+
+    async fn scan_gc_rows(&mut self) -> Result<()> {
+        let meta = self.repo.meta().clone();
+        for kind in [
+            gc::BLOB_CLAIM,
+            gc::BLOB_CONDEMNED,
+            gc::BLOB_RESCUE,
+            gc::BLOB_DOOM,
+        ] {
+            if !self.has(kind) {
+                continue;
+            }
+            let mut scan = RowScan::new(kind, self.opts.full, self.opts.sample);
+            while let Some(page) = scan.next(&*meta).await? {
+                for (key, value) in page {
+                    self.kstats(kind).checked += 1;
+                    if let Err(e) = gc::decode_row(kind, &value) {
+                        self.kstats(kind).mismatched += 1;
+                        self.log.push(
+                            Problem::new(
+                                "attestation",
+                                "bad_gc_row",
+                                format!("{kind} row {key} does not decode: {e}"),
+                            )
+                            .kind(kind)
+                            .key(&key),
+                        );
+                    }
+                }
+                self.tick();
+            }
+        }
+        Ok(())
+    }
+
+    // --- blame --------------------------------------------------------------
+
+    async fn check_blame(&mut self, refs: &BTreeMap<String, ChangesetId>) -> Result<()> {
+        let tips: HashSet<ChangesetId> = refs.values().copied().collect();
+        let mut tips: Vec<_> = tips.into_iter().collect();
+        tips.sort();
+        let budget = (self.opts.sample / 8).max(1);
+        for tip in tips {
+            let files = match self.shadow.list_files(tip, "").await {
+                Ok(f) => f,
+                Err(e) if recoverable(&e) => {
+                    self.kstats(BLAME_KIND).skipped += 1;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            let cut = if self.opts.full || files.len() <= budget {
+                u64::MAX
+            } else {
+                ((budget as u128 * u64::MAX as u128) / files.len() as u128) as u64
+            };
+            for f in files {
+                if id_prefix(&Hash::of_blob(f.path.as_str().as_bytes())) > cut {
+                    continue;
+                }
+                self.check_blame_row(tip, &f.path).await?;
+            }
+            self.shadow_blobs.clear();
+            self.tick();
+        }
+        Ok(())
+    }
+
+    async fn check_blame_row(&mut self, tip: ChangesetId, path: &RepoPath) -> Result<()> {
+        let kind = BLAME_KIND;
+        let key = cache_key(tip, path);
+        let Some(stored) = self.repo.meta().get_derived(kind, &key).await? else {
+            self.kstats(kind).missing += 1;
+            return Ok(());
+        };
+        self.kstats(kind).checked += 1;
+        let problem = |why: String| {
+            Problem::new(
+                "derived",
+                "derived_mismatch",
+                format!("the blame row for {path} at {tip} is wrong: {why}"),
+            )
+            .kind(kind)
+            .key(&key)
+            .changeset(tip)
+            .path(path.as_str())
+        };
+        let cached: CachedBlame = match postcard::from_bytes(&stored) {
+            Ok(c) => c,
+            Err(e) => {
+                self.kstats(kind).mismatched += 1;
+                self.log.push(problem(format!("it does not decode: {e}")));
+                return Ok(());
+            }
+        };
+        // What blame must be whatever the diff chose: one entry per line of
+        // the file, carrying that line's text, credited to a stored changeset.
+        let text = match self.shadow.read_file(tip, path).await {
+            Ok(Some((_, data))) => String::from_utf8(data.to_vec()).ok(),
+            Ok(None) => None,
+            Err(e) if recoverable(&e) => None,
+            Err(e) => return Err(e),
+        };
+        let mut why = None;
+        if let Some(text) = &text {
+            let lines: Vec<&str> = text
+                .split_inclusive('\n')
+                .map(|l| {
+                    let l = l.strip_suffix('\n').unwrap_or(l);
+                    l.strip_suffix('\r').unwrap_or(l)
+                })
+                .collect();
+            if lines.len() != cached.1.len() {
+                why = Some(format!(
+                    "it has {} lines, the file has {}",
+                    cached.1.len(),
+                    lines.len()
+                ));
+            } else if let Some(i) = (0..lines.len()).find(|&i| cached.1[i].text != lines[i]) {
+                why = Some(format!("line {} holds different text than the file", i + 1));
+            }
+        }
+        if why.is_none() {
+            let mut seen = HashSet::new();
+            for l in &cached.1 {
+                if seen.insert(l.changeset)
+                    && self
+                        .repo
+                        .meta()
+                        .get_changeset(&l.changeset)
+                        .await
+                        .ok()
+                        .flatten()
+                        .is_none()
+                {
+                    why = Some(format!(
+                        "it credits {}, which is not a readable changeset",
+                        l.changeset
+                    ));
+                    break;
+                }
+            }
+        }
+        if let Some(why) = why {
+            self.kstats(kind).mismatched += 1;
+            self.log.push(problem(why));
+            return Ok(());
+        }
+        // Blame diffs under a time limit, so a recomputation of a huge file
+        // may legitimately credit lines differently; note it, do not fail.
+        match self.shadow.blame_walk(tip, path, false, false).await {
+            Ok((fresh, _)) => {
+                let fresh = postcard::to_stdvec(&fresh)?;
+                if fresh != stored.as_ref() {
+                    self.notes.push(format!(
+                        "blame row for {path} at {tip} differs from a recomputation but is \
+                         consistent with the file; blame diffs are time-limited, and \
+                         `repair drop --kind blame` refreshes the cache"
+                    ));
+                }
+            }
+            Err(e) if recoverable(&e) => self.kstats(kind).unverifiable += 1,
+            Err(e) => return Err(e),
+        }
+        Ok(())
+    }
+
+    // --- ref log ------------------------------------------------------------
+
+    async fn check_reflog(&mut self, refs_now: &BTreeMap<String, ChangesetId>) -> Result<()> {
+        let meta = self.repo.meta().clone();
+        let only: Option<HashSet<&String>> =
+            (!self.opts.refs.is_empty()).then(|| self.opts.refs.iter().collect());
+        let wanted = |name: &String| only.as_ref().is_none_or(|o| o.contains(name));
+        // What the next older entry of a ref must have set it to.
+        let mut expect: HashMap<String, Option<ChangesetId>> = HashMap::new();
+        // The newest entry of each ref: where the ref should be now.
+        let mut newest: HashMap<String, Option<ChangesetId>> = HashMap::new();
+        let mut before: Option<u64> = None;
+        loop {
+            let page = meta.ref_log(None, before, PAGE).await?;
+            let Some(last) = page.last() else {
+                break;
+            };
+            before = Some(last.seq);
+            for e in &page {
+                self.stats.reflog_entries += 1;
+                if !wanted(&e.name) {
+                    continue;
+                }
+                match expect.get(&e.name) {
+                    None => {
+                        newest.insert(e.name.clone(), e.new);
+                    }
+                    Some(want) if *want != e.new => {
+                        self.log.push(
+                            Problem::new(
+                                "reflog",
+                                "reflog_chain_break",
+                                format!(
+                                    "ref log entry {} of {} set it to {}, but the next entry says it was {}",
+                                    e.seq,
+                                    e.name,
+                                    show(e.new),
+                                    show(*want)
+                                ),
+                            )
+                            .name(&e.name),
+                        );
+                    }
+                    Some(_) => {}
+                }
+                expect.insert(e.name.clone(), e.old);
+            }
+            self.tick();
+        }
+        for name in refs_now.keys() {
+            if wanted(name) && !newest.contains_key(name) {
+                self.stats.reflog_refs_without_entries += 1;
+            }
+        }
+        // A ref that moved while this ran looks diverged; look again.
+        let mut suspects: Vec<(String, Option<ChangesetId>)> = newest
+            .into_iter()
+            .filter(|(name, logged)| refs_now.get(name).copied() != *logged)
+            .collect();
+        suspects.sort();
+        for (name, _) in suspects {
+            let mut state = None;
+            for attempt in 0..3 {
+                let current = meta.get_ref(&name).await?;
+                let logged = meta
+                    .ref_log(Some(&name), None, 1)
+                    .await?
+                    .first()
+                    .map(|e| e.new);
+                state = Some((current, logged));
+                if logged == Some(current) {
+                    break;
+                }
+                if attempt < 2 {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+            let (current, logged) = state.expect("looked at least once");
+            match logged {
+                Some(l) if l == current => {}
+                Some(l) => self.log.push(
+                    Problem::new(
+                        "reflog",
+                        "reflog_divergence",
+                        format!(
+                            "ref {name} is {} but the ref log says its last move set it to {}",
+                            show(current),
+                            show(l)
+                        ),
+                    )
+                    .name(&name),
+                ),
+                None => {}
+            }
+        }
+        Ok(())
+    }
+}
+
+fn show(id: Option<ChangesetId>) -> String {
+    id.map_or("absent".to_string(), |i| i.to_string())
+}
+
+#[async_trait]
+impl Visitor for Verifier<'_> {
+    async fn visit(&mut self, id: ChangesetId, cs: &Changeset, parent_broken: bool) -> Result<()> {
+        if self.in_ref_phase {
+            self.stats.changesets_reachable += 1;
+        } else {
+            self.stats.changesets_other += 1;
+        }
+        for (path, change) in &cs.changes {
+            if let FileChange::Modify { content, size, .. } = change {
+                self.blob_ref(*content, *size, id, path.as_str());
+            }
+        }
+        self.check_tree(id).await?;
+        let per_changeset = self.per_changeset_kinds();
+        if !per_changeset.is_empty() && self.sampled(&id, cs) {
+            for kind in per_changeset {
+                if parent_broken {
+                    self.kstats(kind).skipped += 1;
+                } else {
+                    self.check_changeset_kind(kind, id, cs).await?;
+                }
+            }
+        }
+        if self.pending.len() >= BLOB_BATCH {
+            self.flush_blobs().await?;
+        }
+        self.shadow_blobs.clear();
+        self.tick();
+        Ok(())
+    }
+
+    async fn broken(
+        &mut self,
+        id: ChangesetId,
+        referenced_by: Option<ChangesetId>,
+        damage: Damage,
+        detail: String,
+    ) -> Result<()> {
+        let (code, what) = match damage {
+            Damage::Corrupt => ("corrupt_changeset", "is corrupt"),
+            Damage::Missing => ("missing_changeset", "is missing"),
+        };
+        let mut p = match referenced_by {
+            Some(child) => Problem::new(
+                "history",
+                code,
+                format!("changeset {id} {what} ({detail}); it is a parent of {child}"),
+            )
+            .changeset(child),
+            None => Problem::new("history", code, format!("changeset {id} {what} ({detail})")),
+        }
+        .key(&id.0);
+        if let Some(name) = &self.current_ref {
+            p = p.name(name);
+        }
+        self.log.push(p);
+        Ok(())
+    }
+}

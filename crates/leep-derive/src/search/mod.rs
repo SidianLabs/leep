@@ -8,7 +8,7 @@
 //! keyed by content hash, so a revision shares rows with its parent for every
 //! subtree and blob it did not touch.
 
-mod index;
+pub(crate) mod index;
 #[doc(hidden)]
 pub mod plan;
 pub mod trigram;
