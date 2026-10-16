@@ -7,11 +7,13 @@ use bytes::Bytes;
 use leep_core::api::ChangesetInfo;
 use leep_core::refname;
 use leep_core::{
-    BlobStore, Changeset, ChangesetId, Error, FileChange, Hash, MetaStore, RepoPath, Result,
-    TreeNode,
+    BlobStore, Changeset, ChangesetId, DerivedRow, Error, FileChange, Hash, MetaStore, RepoPath,
+    Result, TreeNode,
 };
 
-use crate::derived::{self, Generation, RootTree, Skiplist, StoredHistoryNode};
+use crate::derived::{
+    self, DerivedKind, Generation, RootTree, SkipEntry, Skiplist, StoredHistoryNode,
+};
 use crate::signatures::{LandPolicy, PolicySet};
 use crate::tree_ops::apply_changes;
 
@@ -51,6 +53,16 @@ fn check_path_bounds<'a>(paths: impl Iterator<Item = &'a RepoPath>) -> Result<()
     Ok(())
 }
 
+/// What [`Repo::read_create_inputs`] found, one slot per parent or content.
+/// `None` means not supplied: the caller reads or derives it singly.
+struct CreateInputs {
+    parents_stored: Option<Vec<bool>>,
+    condemned: Option<Vec<Option<Bytes>>>,
+    parent_generations: Vec<Option<u64>>,
+    base_tree: Option<Hash>,
+    parent_skiplist: Option<Arc<[SkipEntry]>>,
+}
+
 /// A repository: content-addressed blobs plus changeset metadata.
 #[derive(Clone)]
 pub struct Repo {
@@ -63,6 +75,8 @@ pub struct Repo {
     pub(crate) ancestry: Arc<AncestryCache>,
     /// Decoded path-history rows (see `read_history_row`).
     pub(crate) history_rows: Arc<HistoryRowCache>,
+    /// Skiplists this process computed (see `Repo::skiplist`).
+    pub(crate) skiplists: Arc<SkiplistCache>,
     /// One lock per derived kind, held while a missing range is derived (see
     /// `derived::derive`).
     pub(crate) derive_locks: Arc<Mutex<HashMap<&'static str, DeriveLock>>>,
@@ -136,6 +150,53 @@ impl AncestryMaps {
     }
 }
 
+/// Skiplists this process computed, by changeset. A new changeset's list is
+/// built from the lists of its first-parent ancestors 1, 2, 4, ... steps up,
+/// one after another, so without this every commit would make about
+/// log2(history) sequential reads. Only computed lists are kept, never rows
+/// read from the store: verification substitutes recomputed rows for damaged
+/// ones, and a cached damaged row would outlive the substitution. Bounded
+/// like [`AncestryCache`]; a list is 40 bytes per entry.
+#[derive(Default)]
+pub(crate) struct SkiplistCache {
+    inner: Mutex<SkiplistMaps>,
+}
+
+#[derive(Default)]
+struct SkiplistMaps {
+    new: HashMap<ChangesetId, Arc<[SkipEntry]>>,
+    old: HashMap<ChangesetId, Arc<[SkipEntry]>>,
+}
+
+/// Lists per map, so at most 2 * this many changesets: about 25 MiB at a
+/// depth of 100,000 (17 entries a list).
+const SKIPLIST_CACHE_ENTRIES: usize = 1 << 14;
+
+impl SkiplistCache {
+    pub(crate) fn get(&self, id: &ChangesetId) -> Option<Arc<[SkipEntry]>> {
+        let mut m = self.inner.lock().unwrap();
+        if let Some(l) = m.new.get(id) {
+            return Some(l.clone());
+        }
+        let l = m.old.remove(id)?;
+        m.insert(*id, l.clone());
+        Some(l)
+    }
+
+    pub(crate) fn insert(&self, id: ChangesetId, list: Arc<[SkipEntry]>) {
+        self.inner.lock().unwrap().insert(id, list);
+    }
+}
+
+impl SkiplistMaps {
+    fn insert(&mut self, id: ChangesetId, list: Arc<[SkipEntry]>) {
+        if self.new.len() >= SKIPLIST_CACHE_ENTRIES {
+            self.old = std::mem::take(&mut self.new);
+        }
+        self.new.insert(id, list);
+    }
+}
+
 /// Decoded `history-node-v2` rows by hash. A split node is read one row per
 /// chunk, and derivation reads the same root and directory nodes for every
 /// changeset, so without this each changeset would re-read and re-decode
@@ -198,6 +259,7 @@ impl Repo {
             land_policy: None,
             ancestry: Arc::default(),
             history_rows: Arc::default(),
+            skiplists: Arc::default(),
             derive_locks: Arc::default(),
             #[cfg(test)]
             derive_calls: Arc::default(),
@@ -242,7 +304,19 @@ impl Repo {
     /// Idempotent. A blob that garbage collection has condemned counts as
     /// missing, so the client uploads it again (ADR 0012).
     pub async fn create_changeset(&self, cs: Changeset) -> Result<ChangesetId> {
-        self.store_changeset(cs, true).await
+        self.store_changeset(cs, true, Vec::new()).await
+    }
+
+    /// [`Repo::create_changeset`], also writing `rows` together with the
+    /// changeset (in the same atomic write on stores that have one, after it
+    /// otherwise), only if the changeset is valid. For rows that must never
+    /// exist without it, such as the git bridge's commit mapping.
+    pub async fn create_changeset_with_rows(
+        &self,
+        cs: Changeset,
+        rows: Vec<DerivedRow>,
+    ) -> Result<ChangesetId> {
+        self.store_changeset(cs, true, rows).await
     }
 
     /// Like [`Repo::create_changeset`] for changesets the server builds from
@@ -250,28 +324,60 @@ impl Repo {
     /// stored changeset, so GC keeps them, or were just written through
     /// [`Repo::put_blob`], so a condemnation is already answered.
     pub(crate) async fn store_server_changeset(&self, cs: Changeset) -> Result<ChangesetId> {
-        self.store_changeset(cs, false).await
+        self.store_changeset(cs, false, Vec::new()).await
     }
 
-    async fn store_changeset(&self, cs: Changeset, client_blobs: bool) -> Result<ChangesetId> {
+    /// [`Repo::store_server_changeset`] writing `rows` with the changeset, as
+    /// in [`Repo::create_changeset_with_rows`].
+    pub(crate) async fn store_server_changeset_with_rows(
+        &self,
+        cs: Changeset,
+        rows: Vec<DerivedRow>,
+    ) -> Result<ChangesetId> {
+        self.store_changeset(cs, false, rows).await
+    }
+
+    /// Validate `cs`, build its tree, and store it with its root tree,
+    /// generation and skiplist rows and `extra` in one write (ADR 0031). What
+    /// it reads first (parents, their rows, blob condemnations) is read in one
+    /// round of batched queries; anything those miss is derived as before.
+    async fn store_changeset(
+        &self,
+        cs: Changeset,
+        client_blobs: bool,
+        extra: Vec<DerivedRow>,
+    ) -> Result<ChangesetId> {
         let id = cs.id();
         if client_blobs {
             check_path_bounds(cs.changes.keys())?;
         }
-        for p in &cs.parents {
-            if self.meta.get_changeset(p).await?.is_none() {
+        let mut seen = HashSet::new();
+        let contents: Vec<(&RepoPath, Hash, u64)> = cs
+            .changes
+            .iter()
+            .filter_map(|(path, change)| match change {
+                FileChange::Modify { content, size, .. } if seen.insert(*content) => {
+                    Some((path, *content, *size))
+                }
+                _ => None,
+            })
+            .collect();
+        let pre = self.read_create_inputs(&cs, &contents, client_blobs).await;
+        for (i, p) in cs.parents.iter().enumerate() {
+            let stored = match &pre.parents_stored {
+                Some(s) => s[i],
+                None => self.meta.get_changeset(p).await?.is_some(),
+            };
+            if !stored {
                 return Err(Error::Invalid(format!("unknown parent {p}")));
             }
         }
-        let mut seen = HashSet::new();
-        for (path, change) in &cs.changes {
-            let FileChange::Modify { content, size, .. } = change else {
-                continue;
+        for (i, (path, content, size)) in contents.iter().enumerate() {
+            let maybe_condemned = match &pre.condemned {
+                Some(c) => c[i].is_some(),
+                None => true,
             };
-            if !seen.insert(*content) {
-                continue;
-            }
-            if client_blobs {
+            if client_blobs && maybe_condemned {
                 self.check_reusable(content, path.as_str()).await?;
             }
             match self.blobs.get(content).await? {
@@ -290,22 +396,147 @@ impl Repo {
                 return Err(Error::Invalid(format!("missing blob {content} for {path}")));
             }
         }
-        let base = match cs.parents.first() {
-            Some(p) => self.root_tree(*p).await?,
-            None => TreeNode::empty_hash(),
+        let base = match (cs.parents.first(), pre.base_tree) {
+            (Some(_), Some(t)) => t,
+            (Some(p), None) => self.root_tree(*p).await?,
+            (None, _) => TreeNode::empty_hash(),
         };
         let tree = apply_changes(self, base, &cs.changes).await?;
-        self.meta.put_changeset(&cs).await?;
-        self.meta
-            .put_derived(
+
+        let mut parent_generations = Vec::with_capacity(cs.parents.len());
+        for (p, g) in cs.parents.iter().zip(&pre.parent_generations) {
+            parent_generations.push(match g {
+                Some(g) => *g,
+                None => self.generation(*p).await?,
+            });
+        }
+        let generation = parent_generations.iter().max().map_or(1, |g| g + 1);
+        let skiplist: Arc<[SkipEntry]> = match cs.parents.first() {
+            Some(&p) => {
+                let parent = SkipEntry {
+                    id: p,
+                    generation: parent_generations[0],
+                };
+                Skiplist::compute(self, parent, pre.parent_skiplist).await?
+            }
+            None => Arc::from([]),
+        };
+        let mut rows = vec![
+            DerivedRow::new(
                 RootTree::NAME_STR,
-                &id.0,
+                id.0,
                 Bytes::copy_from_slice(tree.as_bytes()),
-            )
-            .await?;
-        derived::derive::<Generation>(self, id).await?;
-        derived::derive::<Skiplist>(self, id).await?;
+            ),
+            DerivedRow::new(
+                Generation::NAME,
+                id.0,
+                Bytes::copy_from_slice(&generation.to_be_bytes()),
+            ),
+            DerivedRow::new(Skiplist::NAME, id.0, Skiplist::encode(&skiplist)),
+        ];
+        rows.extend(extra);
+        self.meta.put_changeset_with_derived(&cs, &rows).await?;
+        self.skiplists.insert(id, skiplist);
+        let parents: Arc<[ChangesetId]> = cs.parents.into();
+        self.ancestry.update(id, |e| {
+            e.parents = Some(parents);
+            e.generation = Some(generation);
+        });
         Ok(id)
+    }
+
+    /// The stored state `store_changeset` starts from, read in one round:
+    /// whether each parent exists, the parents' generations (from the
+    /// ancestry cache where known), the first parent's root tree and skiplist,
+    /// and the condemnation rows of the contents (client changesets only;
+    /// read before the blobs are checked, as `check_reusable` requires).
+    ///
+    /// Like the log's read-ahead (ADR 0030), whatever this does not supply (a
+    /// failed batch, an absent or undecodable row) the caller reads or derives
+    /// singly, at the point it did before, so errors stay where they were.
+    async fn read_create_inputs(
+        &self,
+        cs: &Changeset,
+        contents: &[(&RepoPath, Hash, u64)],
+        client_blobs: bool,
+    ) -> CreateInputs {
+        let meta = &self.meta;
+        let first = cs.parents.first().copied();
+        let cached: Vec<Option<u64>> = cs
+            .parents
+            .iter()
+            .map(|p| self.cached_generation(*p))
+            .collect();
+        let uncached: Vec<Hash> = cs
+            .parents
+            .iter()
+            .zip(&cached)
+            .filter(|(_, g)| g.is_none())
+            .map(|(p, _)| p.0)
+            .collect();
+        let cached_list = first.and_then(|p| self.skiplists.get(&p));
+        let content_keys: Vec<Hash> = contents.iter().map(|(_, h, _)| *h).collect();
+        let (stored, condemned, gens, tree, list) = tokio::join!(
+            async {
+                if cs.parents.is_empty() {
+                    return Ok(Vec::new());
+                }
+                meta.get_changesets(&cs.parents).await
+            },
+            async {
+                if !client_blobs || content_keys.is_empty() {
+                    return Ok(vec![None; content_keys.len()]);
+                }
+                meta.get_derived_many(crate::gc::BLOB_CONDEMNED, &content_keys)
+                    .await
+            },
+            async {
+                if uncached.is_empty() {
+                    return Ok(Vec::new());
+                }
+                meta.get_derived_many(Generation::NAME, &uncached).await
+            },
+            async {
+                match first {
+                    Some(p) => meta.get_derived(RootTree::NAME_STR, &p.0).await,
+                    None => Ok(None),
+                }
+            },
+            async {
+                match first {
+                    Some(p) if cached_list.is_none() => {
+                        meta.get_derived(Skiplist::NAME, &p.0).await
+                    }
+                    _ => Ok(None),
+                }
+            },
+        );
+        let mut gens = gens.ok().into_iter().flatten();
+        let parent_generations = cached
+            .into_iter()
+            .map(|g| {
+                g.or_else(|| {
+                    gens.next()
+                        .flatten()
+                        .and_then(|v| derived::decode_u64(&v).ok())
+                })
+            })
+            .collect();
+        CreateInputs {
+            parents_stored: stored.ok().map(|s| s.iter().map(Option::is_some).collect()),
+            condemned: condemned.ok(),
+            parent_generations,
+            base_tree: tree
+                .ok()
+                .flatten()
+                .and_then(|v| derived::decode_hash(&v).ok()),
+            parent_skiplist: cached_list.or_else(|| {
+                list.ok()
+                    .flatten()
+                    .and_then(|v| Skiplist::decode(&v).ok())
+                    .map(Arc::from)
+            }),
+        }
     }
 
     /// Fetch a changeset; `NotFound` if absent.

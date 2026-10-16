@@ -3883,3 +3883,245 @@ mod warm {
         );
     }
 }
+
+/// Changeset creation reads its inputs in batches and writes the changeset
+/// with its rows in one call (ADR 0031). The rows must be exactly what
+/// deriving them one by one computes, with or without working batched reads.
+mod create_rows {
+    use std::collections::BTreeMap;
+
+    use async_trait::async_trait;
+    use leep_core::{DerivedRow, MetaStore, RefLogEntry, RefUpdateContext, Result};
+
+    use super::*;
+    use crate::derived::{self, DerivedKind, Generation, RootTree, SkipEntry, Skiplist};
+    use crate::REBASED_ORIGIN_KIND;
+
+    /// Refuses every batched read, so creation must fall back to single
+    /// reads; batched writes take the trait's default (one call per item).
+    struct NoBatchedReads(Arc<dyn MetaStore>);
+
+    #[async_trait]
+    impl MetaStore for NoBatchedReads {
+        async fn put_changeset(&self, cs: &Changeset) -> Result<ChangesetId> {
+            self.0.put_changeset(cs).await
+        }
+        async fn get_changeset(&self, id: &ChangesetId) -> Result<Option<Changeset>> {
+            self.0.get_changeset(id).await
+        }
+        async fn get_changesets(&self, _: &[ChangesetId]) -> Result<Vec<Option<Changeset>>> {
+            Err(Error::Storage("no batches".into()))
+        }
+        async fn list_changesets(
+            &self,
+            after: Option<ChangesetId>,
+            limit: usize,
+        ) -> Result<Vec<ChangesetId>> {
+            self.0.list_changesets(after, limit).await
+        }
+        async fn get_ref(&self, name: &str) -> Result<Option<ChangesetId>> {
+            self.0.get_ref(name).await
+        }
+        async fn cas_ref_logged(
+            &self,
+            name: &str,
+            expected: Option<ChangesetId>,
+            new: Option<ChangesetId>,
+            ctx: &RefUpdateContext,
+        ) -> Result<bool> {
+            self.0.cas_ref_logged(name, expected, new, ctx).await
+        }
+        async fn ref_log(
+            &self,
+            name: Option<&str>,
+            before_seq: Option<u64>,
+            limit: usize,
+        ) -> Result<Vec<RefLogEntry>> {
+            self.0.ref_log(name, before_seq, limit).await
+        }
+        async fn list_refs(&self) -> Result<BTreeMap<String, ChangesetId>> {
+            self.0.list_refs().await
+        }
+        async fn list_derived(
+            &self,
+            kind: &str,
+            after: Option<Hash>,
+            limit: usize,
+        ) -> Result<Vec<(Hash, Bytes)>> {
+            self.0.list_derived(kind, after, limit).await
+        }
+        async fn get_derived(&self, kind: &str, key: &Hash) -> Result<Option<Bytes>> {
+            self.0.get_derived(kind, key).await
+        }
+        async fn get_derived_many(&self, _: &str, _: &[Hash]) -> Result<Vec<Option<Bytes>>> {
+            Err(Error::Storage("no batches".into()))
+        }
+        async fn put_derived(&self, kind: &str, key: &Hash, value: Bytes) -> Result<()> {
+            self.0.put_derived(kind, key, value).await
+        }
+    }
+
+    /// A history with every shape creation handles: roots, nested and
+    /// replaced directories, deletes, two- and three-parent merges, and
+    /// server rebases (which write a link row with the copy).
+    async fn build(r: &Repo) -> Vec<ChangesetId> {
+        let mut ids =
+            vec![commit(r, &[], &[("a/b/c", Some("0")), ("top", Some("t"))], "root").await];
+        let mut main = ids[0];
+        let mut side = ids[0];
+        for i in 0..60usize {
+            let v = i.to_string();
+            let path = format!("d{}/e{}/f{}", i % 3, i % 5, i % 7);
+            main = commit(r, &[main], &[(&path, Some(&v))], "main").await;
+            ids.push(main);
+            if i % 4 == 0 {
+                let p = format!("side/{}", i % 6);
+                side = commit(r, &[side], &[(&p, Some(&v))], "side").await;
+                ids.push(side);
+            }
+            if i % 9 == 8 {
+                let m = commit(r, &[main, side], &[("merged", Some(&v))], "merge").await;
+                ids.push(m);
+                main = m;
+            }
+            if i == 30 {
+                // A file replaced by a directory, and a three-parent merge.
+                main = commit(r, &[main], &[("top", None), ("top/x", Some("x"))], "dir").await;
+                ids.push(main);
+                let other = commit(r, &[ids[0]], &[("other", Some("o"))], "other").await;
+                ids.push(other);
+                main = commit(r, &[main, side, other], &[], "octopus").await;
+                ids.push(main);
+            }
+            if i % 15 == 14 {
+                let topic = commit(r, &[ids[ids.len() - 5]], &[("topic", Some(&v))], "topic").await;
+                ids.push(topic);
+                match r.rebase(topic, main).await.unwrap() {
+                    RebaseResponse::Rebased { id } => {
+                        ids.push(id);
+                        main = id;
+                    }
+                    other => panic!("{other:?}"),
+                }
+            }
+        }
+        // A second root, and creating a changeset that already exists.
+        ids.push(commit(r, &[], &[("z", Some("z"))], "root 2").await);
+        let again = r.get_changeset(main).await.unwrap();
+        assert_eq!(r.create_changeset(again).await.unwrap(), main);
+        ids
+    }
+
+    async fn rows(r: &Repo, kind: &str) -> Vec<(Hash, Bytes)> {
+        r.meta().list_derived(kind, None, usize::MAX).await.unwrap()
+    }
+
+    /// First-parent ancestors 1, 2, 4, ... steps up, by walking the chain:
+    /// what a skiplist means, computed without any skiplist.
+    async fn walked_skiplist(r: &Repo, id: ChangesetId) -> Vec<SkipEntry> {
+        let mut out = Vec::new();
+        let (mut cur, mut steps, mut next) = (id, 0u64, 1u64);
+        while let Some(&p) = r.get_changeset(cur).await.unwrap().parents.first() {
+            steps += 1;
+            cur = p;
+            if steps == next {
+                out.push(SkipEntry {
+                    id: p,
+                    generation: r.generation(p).await.unwrap(),
+                });
+                next *= 2;
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn created_rows_match_derivation_with_and_without_batches() {
+        let a = repo();
+        let ids = build(&a).await;
+        let b = Repo::new(
+            Arc::new(MemoryBlobStore::new()),
+            Arc::new(NoBatchedReads(Arc::new(MemoryMetaStore::new()))),
+        );
+        assert_eq!(build(&b).await, ids, "same changesets");
+
+        // The same changesets, stored bare, with every row derived lazily.
+        let c = Repo::new(a.blobs().clone(), Arc::new(MemoryMetaStore::new()));
+        for &id in &ids {
+            c.meta()
+                .put_changeset(&a.get_changeset(id).await.unwrap())
+                .await
+                .unwrap();
+        }
+        for &id in &ids {
+            derived::derive::<RootTree>(&c, id).await.unwrap();
+            derived::derive::<Generation>(&c, id).await.unwrap();
+            derived::derive::<Skiplist>(&c, id).await.unwrap();
+        }
+        for kind in [RootTree::NAME, Generation::NAME, Skiplist::NAME] {
+            let want = rows(&c, kind).await;
+            assert_eq!(want.len(), ids.len(), "{kind}: one row per changeset");
+            assert_eq!(rows(&a, kind).await, want, "{kind} with batches");
+            assert_eq!(rows(&b, kind).await, want, "{kind} without batches");
+        }
+        let links = rows(&a, REBASED_ORIGIN_KIND).await;
+        assert_eq!(links.len(), 4, "one link per rebase");
+        assert_eq!(rows(&b, REBASED_ORIGIN_KIND).await, links);
+        let blobs = |r: &Repo| {
+            let r = r.clone();
+            async move { r.blobs().list_page(None, usize::MAX).await.unwrap() }
+        };
+        let hashes =
+            |v: Vec<leep_core::BlobMeta>| v.into_iter().map(|m| m.hash).collect::<Vec<_>>();
+        assert_eq!(
+            hashes(blobs(&a).await),
+            hashes(blobs(&b).await),
+            "same tree nodes"
+        );
+        for &id in &ids {
+            let stored = Skiplist::decode(
+                &a.meta()
+                    .get_derived("skiplist", &id.0)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(stored, walked_skiplist(&a, id).await, "skiplist of {id}");
+        }
+    }
+
+    #[tokio::test]
+    async fn rows_given_to_create_are_written_only_with_a_valid_changeset() {
+        let r = repo();
+        let base = commit(&r, &[], &[("f", Some("1"))], "base").await;
+        let key = Hash::of_blob(b"mapping");
+        let row = DerivedRow::new("test-mapping", key, Bytes::from_static(b"m"));
+        let bad = changeset(
+            &[ChangesetId(Hash::of_blob(b"nope"))],
+            BTreeMap::new(),
+            "bad",
+        );
+        assert!(matches!(
+            r.create_changeset_with_rows(bad, vec![row.clone()]).await,
+            Err(Error::Invalid(_))
+        ));
+        assert!(r
+            .meta()
+            .get_derived("test-mapping", &key)
+            .await
+            .unwrap()
+            .is_none());
+        let good = changeset(&[base], BTreeMap::new(), "good");
+        let id = r.create_changeset_with_rows(good, vec![row]).await.unwrap();
+        assert_eq!(
+            r.meta()
+                .get_derived("test-mapping", &key)
+                .await
+                .unwrap()
+                .unwrap(),
+            &b"m"[..]
+        );
+        assert_eq!(r.generation(id).await.unwrap(), 2);
+    }
+}

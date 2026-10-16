@@ -12,7 +12,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
 use leep_core::signature::{Signature, SIGNATURE_KIND};
-use leep_core::{ChangesetId, Error, Hash, Result};
+use leep_core::{ChangesetId, DerivedRow, Error, Hash, Result};
 
 use crate::Repo;
 
@@ -149,18 +149,13 @@ impl Repo {
         Ok(out)
     }
 
-    pub(crate) async fn record_rebase(
-        &self,
-        copy: ChangesetId,
-        original: ChangesetId,
-    ) -> Result<()> {
-        self.meta()
-            .put_derived(
-                REBASED_ORIGIN_KIND,
-                &copy.0,
-                Bytes::copy_from_slice(original.0.as_bytes()),
-            )
-            .await
+    /// The row recording that the server made `copy` by rebasing `original`.
+    pub(crate) fn rebase_link(copy: ChangesetId, original: ChangesetId) -> DerivedRow {
+        DerivedRow::new(
+            REBASED_ORIGIN_KIND,
+            copy.0,
+            Bytes::copy_from_slice(original.0.as_bytes()),
+        )
     }
 
     /// Changesets landing `cs` onto a ref at `head` would add to it: every

@@ -286,17 +286,21 @@ impl Repo {
         }
         let mut extra = orig.extra;
         extra.insert(EXTRA_REBASED_FROM.into(), cs.to_string());
+        let copy = Changeset {
+            parents: vec![onto],
+            author: orig.author,
+            timestamp: orig.timestamp,
+            message: orig.message,
+            changes: m.changes,
+            extra,
+        };
+        // The link is written with the copy, so a copy never exists without
+        // it (on stores with atomic writes) and is never linked before it
+        // exists (on any store).
+        let link = Self::rebase_link(copy.id(), cs);
         let id = self
-            .store_server_changeset(Changeset {
-                parents: vec![onto],
-                author: orig.author,
-                timestamp: orig.timestamp,
-                message: orig.message,
-                changes: m.changes,
-                extra,
-            })
+            .store_server_changeset_with_rows(copy, vec![link])
             .await?;
-        self.record_rebase(id, cs).await?;
         Ok(RebaseResponse::Rebased { id })
     }
 }
