@@ -47,11 +47,13 @@ impl Skiplist {
     /// The skiplist of a changeset whose first parent is `parent`. Entry `k`
     /// comes from the skiplist of entry `k - 1`, so the chain is read one
     /// list at a time; `parent_list` is the parent's own list if the caller
-    /// has it already.
+    /// has it already. With `remember`, lists read on the way are cached too
+    /// (see `SkiplistCache` for who may do that).
     pub(crate) async fn compute(
         repo: &Repo,
         parent: SkipEntry,
         parent_list: Option<Arc<[SkipEntry]>>,
+        remember: bool,
     ) -> Result<Arc<[SkipEntry]>> {
         let mut list = vec![parent];
         let mut known = parent_list;
@@ -60,7 +62,13 @@ impl Skiplist {
             let k = list.len() - 1;
             let anc = match known.take() {
                 Some(l) => l,
-                None => repo.skiplist(last.id).await?,
+                None => {
+                    let l = repo.skiplist(last.id).await?;
+                    if remember {
+                        repo.skiplists.insert(last.id, l.clone());
+                    }
+                    l
+                }
             };
             match anc.get(k) {
                 Some(e) => list.push(*e),
@@ -83,15 +91,15 @@ impl DerivedKind for Skiplist {
             id: p,
             generation: repo.generation(p).await?,
         };
-        let list = Skiplist::compute(repo, parent, None).await?;
+        let list = Skiplist::compute(repo, parent, None, false).await?;
         repo.skiplists.insert(id, list.clone());
         Ok(Skiplist::encode(&list))
     }
 }
 
 impl Repo {
-    /// The skiplist of a stored changeset: from the cache of lists this
-    /// process computed, or derived (read, or computed and stored).
+    /// The skiplist of a stored changeset: from the cache (see
+    /// `SkiplistCache`), or derived (read, or computed and stored).
     pub(crate) async fn skiplist(&self, id: ChangesetId) -> Result<Arc<[SkipEntry]>> {
         if let Some(l) = self.skiplists.get(&id) {
             return Ok(l);

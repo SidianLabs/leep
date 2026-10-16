@@ -75,7 +75,8 @@ pub struct Repo {
     pub(crate) ancestry: Arc<AncestryCache>,
     /// Decoded path-history rows (see `read_history_row`).
     pub(crate) history_rows: Arc<HistoryRowCache>,
-    /// Skiplists this process computed (see `Repo::skiplist`).
+    /// Skiplists computed, or read while creating changesets (see
+    /// `SkiplistCache`).
     pub(crate) skiplists: Arc<SkiplistCache>,
     /// One lock per derived kind, held while a missing range is derived (see
     /// `derived::derive`).
@@ -150,13 +151,15 @@ impl AncestryMaps {
     }
 }
 
-/// Skiplists this process computed, by changeset. A new changeset's list is
-/// built from the lists of its first-parent ancestors 1, 2, 4, ... steps up,
-/// one after another, so without this every commit would make about
-/// log2(history) sequential reads. Only computed lists are kept, never rows
-/// read from the store: verification substitutes recomputed rows for damaged
-/// ones, and a cached damaged row would outlive the substitution. Bounded
-/// like [`AncestryCache`]; a list is 40 bytes per entry.
+/// Skiplists by changeset. A new changeset's list is built from the lists of
+/// its first-parent ancestors 1, 2, 4, ... steps up, one after another, so
+/// without this every commit would make about log2(history) sequential reads.
+/// The cache holds lists this process computed, and rows read while creating
+/// a changeset. Verification and repair never create changesets, and they
+/// substitute recomputed rows for damaged ones as they go, so their caches
+/// hold only computed lists and never a damaged row read before its
+/// substitution. Bounded like [`AncestryCache`]; a list is 40 bytes per
+/// entry.
 #[derive(Default)]
 pub(crate) struct SkiplistCache {
     inner: Mutex<SkiplistMaps>,
@@ -417,7 +420,10 @@ impl Repo {
                     id: p,
                     generation: parent_generations[0],
                 };
-                Skiplist::compute(self, parent, pre.parent_skiplist).await?
+                if let Some(l) = &pre.parent_skiplist {
+                    self.skiplists.insert(p, l.clone());
+                }
+                Skiplist::compute(self, parent, pre.parent_skiplist, true).await?
             }
             None => Arc::from([]),
         };
