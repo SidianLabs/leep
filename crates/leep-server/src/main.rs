@@ -15,6 +15,7 @@ use leep_store::CachedBlobStore;
 use tracing_subscriber::fmt::writer::BoxMakeWriter;
 use tracing_subscriber::EnvFilter;
 
+mod backup_cli;
 mod repair;
 
 #[derive(Parser)]
@@ -178,6 +179,21 @@ enum Cmd {
     /// running servers): `rederive` recomputes rows of a kind and writes the
     /// wrong ones, `drop` deletes a kind so it derives again on demand.
     Repair(repair::RepairArgs),
+    /// Back up metadata and blobs consistently while servers run: a metadata
+    /// snapshot first, then the blobs the backup lacks, then a check that
+    /// every blob the snapshot needs was copied (ADR 0026). Uses --meta and
+    /// --blobs as the source. Exit status 0 sealed and clean, 1 sealed but
+    /// the check found problems, 2 could not run.
+    Backup(backup_cli::BackupArgs),
+    /// Restore a backup into empty stores (--meta and --blobs); refuses a
+    /// non-empty target unless --force, and a backup from a newer schema.
+    /// Exit status 0 restored and clean, 1 restored but the check found
+    /// problems, 2 could not run.
+    Restore(backup_cli::RestoreArgs),
+    /// Check a backup without restoring it: its metadata file matches the
+    /// manifest and every blob it references is present. Exit status 0 clean,
+    /// 1 problems, 2 could not run.
+    BackupVerify(backup_cli::VerifyBackupArgs),
 }
 
 #[derive(Subcommand, Clone, Copy)]
@@ -323,7 +339,10 @@ fn run_command(cmd: Cmd) -> anyhow::Result<()> {
         | Cmd::DeriveSearch { .. }
         | Cmd::Migrate { .. }
         | Cmd::Verify(_)
-        | Cmd::Repair(_) => {
+        | Cmd::Repair(_)
+        | Cmd::Backup(_)
+        | Cmd::Restore(_)
+        | Cmd::BackupVerify(_) => {
             unreachable!("handled in main")
         }
         Cmd::GenToken { name, role } => {
@@ -403,8 +422,17 @@ async fn shutdown_signal() {
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
-    // `verify` and `repair` print their report on stdout, so logs go to stderr.
-    let writer = if matches!(args.command, Some(Cmd::Verify(_) | Cmd::Repair(_))) {
+    // These print their report on stdout, so logs go to stderr.
+    let writer = if matches!(
+        args.command,
+        Some(
+            Cmd::Verify(_)
+                | Cmd::Repair(_)
+                | Cmd::Backup(_)
+                | Cmd::Restore(_)
+                | Cmd::BackupVerify(_)
+        )
+    ) {
         BoxMakeWriter::new(std::io::stderr)
     } else {
         BoxMakeWriter::new(std::io::stdout)
@@ -454,6 +482,13 @@ async fn main() -> anyhow::Result<()> {
         Some(Cmd::Repair(r)) => {
             std::process::exit(repair::run_repair(&args.meta, &args.blobs, r).await)
         }
+        Some(Cmd::Backup(b)) => {
+            std::process::exit(backup_cli::run_backup(&args.meta, &args.blobs, b).await)
+        }
+        Some(Cmd::Restore(r)) => std::process::exit(
+            backup_cli::run_restore(&args.meta, &args.blobs, args.no_migrate, r).await,
+        ),
+        Some(Cmd::BackupVerify(v)) => std::process::exit(backup_cli::run_verify_backup(v).await),
         Some(cmd) => return run_command(cmd),
         None => {}
     }

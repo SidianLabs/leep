@@ -103,6 +103,11 @@ pub struct Args {
     /// Interval between `derive-search main` warmups (0 disables).
     #[arg(long, value_parser = dur)]
     pub derive_interval: Option<Duration>,
+    /// Interval between `leep-server backup` runs beside the swarm (0 or
+    /// unset: none). With any backups, the run ends with a quiet backup that is
+    /// restored into scratch SQLite and file stores and verified (ADR 0026).
+    #[arg(long, value_parser = dur)]
+    pub backup_interval: Option<Duration>,
     /// Restart the server during the run: graceful SIGTERM, and now and then
     /// SIGKILL. 5xx and dropped connections inside a restart are attributed.
     #[arg(long)]
@@ -160,6 +165,11 @@ pub struct Args {
 impl Args {
     pub fn gc_every(&self) -> Option<Duration> {
         interval(self.gc_interval, self.duration, 3, 60, 1800)
+    }
+
+    /// Off unless asked for: a backup copies the whole store each time.
+    pub fn backup_every(&self) -> Option<Duration> {
+        self.backup_interval.filter(|d| !d.is_zero())
     }
 
     pub fn derive_every(&self) -> Option<Duration> {

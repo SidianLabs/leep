@@ -36,6 +36,9 @@ fn soak_smoke() {
         "2s",
         "--derive-interval",
         "4s",
+        // Backups beside the swarm, and the final backup, restore and verify.
+        "--backup-interval",
+        "3s",
         "--check-interval",
         "3s",
         "--sample-interval",
@@ -76,6 +79,16 @@ fn soak_smoke() {
     assert!(
         v["throughput"]["lands_acked"].as_u64().unwrap_or(0) > 0,
         "no land was acknowledged"
+    );
+    assert!(
+        v["workload"]["backup_runs"].as_u64().unwrap_or(0) >= 2,
+        "backups did not run: {}",
+        v["workload"]
+    );
+    assert!(
+        v["workload"]["restore_changesets"].as_u64().unwrap_or(0) > 0,
+        "the final restore drill did not run: {}",
+        v["workload"]
     );
     assert!(
         v["invariants"]["checks"]["ticks"].as_u64().unwrap_or(0) >= 2,
