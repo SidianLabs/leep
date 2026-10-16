@@ -134,9 +134,7 @@ fn check_exists(meta: &str, blobs: Option<&str>) -> anyhow::Result<()> {
 async fn open(meta: &str, blobs: &str) -> anyhow::Result<Repo> {
     check_exists(meta, Some(blobs))?;
     let blobs = leep_store::open_blob_store(blobs).context("opening blob store")?;
-    let meta = crate::open_meta(meta)
-        .await
-        .context("opening meta store")?;
+    let meta = crate::open_meta(meta).await.context("opening meta store")?;
     Ok(Repo::new(blobs, meta))
 }
 
@@ -420,9 +418,7 @@ async fn repair_inner(meta: &str, blobs: &str, args: RepairArgs) -> anyhow::Resu
         } => {
             // Dropping needs only metadata; the blob store is never read.
             check_exists(meta, None)?;
-            let meta = crate::open_meta(meta)
-                .await
-                .context("opening meta store")?;
+            let meta = crate::open_meta(meta).await.context("opening meta store")?;
             let repo = Repo::new(Arc::new(leep_core::memory::MemoryBlobStore::new()), meta);
             let names: Vec<&str> = names.iter().map(String::as_str).collect();
             let report = integrity::drop_kinds(&repo, &names, dry_run, &Stderr).await?;

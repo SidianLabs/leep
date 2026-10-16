@@ -9,9 +9,7 @@ use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{PgConnection, PgPool, Row};
 
 use crate::migrate::{self, AppliedMigration, Migration, MigrationReport, Session};
-use crate::{
-    decode_checked, log_entry, storage, to_hash, to_id, LogRow, SchemaMode, DELETE_BATCH,
-};
+use crate::{decode_checked, log_entry, storage, to_hash, to_id, LogRow, SchemaMode, DELETE_BATCH};
 
 /// The compiled migration list (ADR 0023). Append only.
 pub const MIGRATIONS: &[Migration] = &[Migration {

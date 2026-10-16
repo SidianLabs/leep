@@ -85,7 +85,11 @@ fn migrate_adopts_an_unversioned_database() {
     ] {
         let out = server(&stores, &[&["--no-migrate"][..], cmd].concat());
         assert!(!out.status.success(), "{cmd:?}");
-        assert!(stderr(&out).contains("pending"), "{cmd:?}: {}", stderr(&out));
+        assert!(
+            stderr(&out).contains("pending"),
+            "{cmd:?}: {}",
+            stderr(&out)
+        );
     }
     let out = Command::new(bin("leep-server"))
         .args(["--meta", &stores.meta, "--blobs", &stores.blobs])
