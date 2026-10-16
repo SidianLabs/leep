@@ -81,6 +81,22 @@ impl Repo {
         self
     }
 
+    /// The land policy in force, if any.
+    pub fn land_policy(&self) -> Option<&Arc<dyn LandPolicy>> {
+        self.land_policy.as_ref()
+    }
+
+    /// A handle on the same stores with `policy` instead of whatever was set.
+    /// A server that reloads its policy gives each request a handle with the
+    /// snapshot the request started under, so one `land` or ref move never
+    /// sees two policies. Land locks stay shared with `self`.
+    pub fn with_land_policy_replaced(&self, policy: Option<Arc<dyn LandPolicy>>) -> Self {
+        Repo {
+            land_policy: policy,
+            ..self.clone()
+        }
+    }
+
     pub fn blobs(&self) -> &Arc<dyn BlobStore> {
         &self.blobs
     }
