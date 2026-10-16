@@ -235,6 +235,14 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 - A `leep init` whose checkout fails part way (server restarting, a bad
   blob) now removes the files it wrote and its `.leep`, so retrying works.
   It used to leave a half-made working copy that refused the retry.
+- The CLI treats a 408 (the server's request timeout) like a lost connection:
+  exit status 2 with advice to run the command again, instead of 1, which
+  means the request was refused. The timeout can cancel a `land` after it
+  moved the ref, so a 408 does not mean it failed; running `leep land` again
+  sends the same changeset, and the server reports the earlier success.
+- The crash test's HTTP agents land the same changeset again after an
+  unanswered land, as a real client does, instead of rebuilding the stack on
+  the new head, which landed it twice when the first land had applied.
 
 ### Project
 - Workspace version set to 0.0.1, with a CI check that keeps it below
