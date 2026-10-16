@@ -4,6 +4,7 @@
 mod cache;
 mod fs;
 mod object;
+pub mod sync;
 
 use std::path::PathBuf;
 use std::sync::Arc;

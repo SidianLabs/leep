@@ -69,6 +69,23 @@ impl SqliteMetaStore {
         r
     }
 
+    /// A new database file at the current schema, through one connection in
+    /// rollback-journal mode: a snapshot is written once, by one writer, and
+    /// ends as a single file with no write-ahead log to carry along.
+    pub(crate) async fn create_single(url: &str) -> Result<Self> {
+        let opts = SqliteConnectOptions::from_str(url)
+            .map_err(storage)?
+            .journal_mode(SqliteJournalMode::Delete)
+            .busy_timeout(std::time::Duration::from_secs(30));
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts)
+            .await
+            .map_err(storage)?;
+        Self::run(&pool, MIGRATIONS, true).await?;
+        Ok(Self { pool })
+    }
+
     async fn pool(url: &str) -> Result<SqlitePool> {
         let opts = SqliteConnectOptions::from_str(url).map_err(storage)?;
         let memory = url.contains(":memory:") || url.contains("mode=memory");

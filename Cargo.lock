@@ -2443,6 +2443,7 @@ dependencies = [
  "leep-core",
  "leep-testkit",
  "sqlx",
+ "tempfile",
  "tokio",
  "tracing",
 ]

@@ -364,6 +364,49 @@ means a new kind name (`-v2`).
 may answer 408 (request timeout) or 409 (blob being collected, retry). New
 server flag `--request-timeout` / `LEEP_REQUEST_TIMEOUT`.
 
+## Backup directory (new, ADR 0026; no change to stored objects)
+Written and read by `leep-server backup`, `restore` and `backup-verify`.
+Nothing persisted by the server or sent over `/v1` changes.
+
+```
+<dir>/blobs/<2 hex>/<62 hex>              blob pool: the filesystem layout above (or any blob store via --blobs-to)
+<dir>/snapshots/<name>/meta.db            metadata snapshot
+<dir>/snapshots/<name>/manifest.json      written last, atomically; a snapshot without one does not exist
+```
+`name` is the UTC time the run started, `YYYYMMDDTHHMMSSZ` (or `--name`).
+
+`meta.db` is a SQLite database with the schema of `schema_migrations` (ADR
+0023) at the version in the manifest, whatever backend the metadata came from:
+tables `changesets`, `refs`, `derived`, `ref_log` hold the rows of one read
+transaction, byte for byte, including every `derived` kind (signatures,
+reviews and GC rows too). It is a single file (journal mode `DELETE`, no `-wal`).
+The highest ref log `seq` ever issued is preserved (`sqlite_sequence`), so a
+restore continues the numbering. It is never opened in place by a reader: tools
+work on a scratch copy.
+
+`manifest.json` (UTF-8 JSON; unknown fields are ignored and readers refuse a
+`format` above the one they know):
+
+| Field | Meaning |
+|---|---|
+| `format` | `1` |
+| `leep_version`, `name`, `created_at` | writer version, directory name, unix seconds when sealed |
+| `snapshot_taken_at` | unix seconds of the metadata read transaction: the recovery point |
+| `source_backend` | `sqlite` or `postgres` |
+| `schema_version` | newest migration applied to `meta.db`; a reader older than this refuses |
+| `meta_file`, `meta_blake3`, `meta_bytes` | the file, its BLAKE3 (hex) and size; checked before any read |
+| `counts` | `changesets`, `refs`, `derived`, `ref_log` row counts; a restore must load exactly these |
+| `ref_log_last_seq` | highest ref log `seq` ever issued |
+| `refs` | ref name to changeset id (hex) at the snapshot |
+| `blobs` | `included`, `location`, `listed`, `already_present`, `copied`, `bytes_copied`, `replaced`, `vanished`, `only_in_backup`, `corrupt` (hashes the source held with wrong bytes) |
+| `check` | `mode` (`closure`, `closure+rehash`, `skipped`), `ok`, `changesets`, `tree_nodes`, `blobs_checked`, `blobs_rehashed`, `problems`, `first_problems` |
+| `elapsed_secs` | wall time of the run |
+
+A snapshot restores when `check.ok` is true (or `--accept-failed-check`), its
+`meta.db` matches `meta_blake3`, and the blob pool holds every blob its
+changesets need. Adding a manifest field is additive; changing the meaning of
+an existing one needs a new `format`.
+
 ## Request limits (additive, ADR 0020)
 
 Nothing persisted changed. On the wire, any endpoint may now answer `429` with

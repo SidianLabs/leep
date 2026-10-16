@@ -285,25 +285,63 @@ image name, e.g. `docker run leep:dev --cache-bytes 0`.
 
 ## Persistence and backup
 
-- SQLite + files: everything is in the `/var/lib/leep` volume. Stop the
-  container (or use `sqlite3 .backup`) before copying `meta.db`.
-- Postgres: `pg_dump` is the backup of record for refs, changesets and
-  derived data.
-  ```sh
-  docker compose -f deploy/docker-compose.yml exec postgres \
-    pg_dump -U leep -Fc leep > leep.dump
-  ```
-- Blobs: objects are content-addressed and immutable, so a plain copy or
-  incremental sync is safe at any time, even while the server runs (for
-  S3, `aws s3 sync` or your store's equivalent). Keep both backups: metadata that
-  references a missing blob is unusable.
+State lives in two places, plus your configuration:
+
+- SQLite + files: metadata is `meta.db` and blobs are files, both under the
+  `/var/lib/leep` volume.
+- Postgres + blobs: metadata is the database, blobs are a volume or an S3
+  bucket.
+- Configuration the stores do not hold: the tokens file, the signing keys file
+  and the review policy. Keep them with your other deployment configuration.
+
+`leep-server backup` copies metadata and blobs consistently **while the server
+runs**, and `leep-server restore` puts them back into empty stores (ADR 0026).
+It reads the metadata in one transaction first, copies the blobs the backup
+lacks second, then checks that every blob the snapshot needs was copied; no
+downtime, no pause of GC. It uses the same `--meta`/`--blobs` (or
+`LEEP_META`/`LEEP_BLOBS`) as the server.
+
+```sh
+# Single container: run it beside the server, mounting the same volume and a backup volume.
+docker run --rm -v leep-data:/var/lib/leep -v /backups/leep:/backups leep:dev \
+  backup --out /backups
+
+# Compose stack (Postgres + blob volume): the compose file's leep-server service has the right LEEP_META and LEEP_BLOBS.
+docker compose -f deploy/docker-compose.yml run --rm -v /backups/leep:/backups leep-server backup --out /backups
+```
+
+The image's `LEEP_META` and `LEEP_BLOBS` point at the volume in the single
+container; in the compose stack they point at Postgres and the blob volume. The
+container runs as the unprivileged user `leep`, so the backup directory must be
+writable by it (or pass `--user`). A backup directory holds one shared blob pool and one snapshot per run
+(`snapshots/<UTC time>/`), so repeating it is incremental.
+
+Restore into fresh stores, then start the server on them:
+
+```sh
+docker run --rm -v leep-data-new:/var/lib/leep -v /backups/leep:/backups leep:dev \
+  restore --from /backups
+```
+
+Postgres native tooling is still supported for the metadata half when it is
+too large to stream: take `pg_dump -Fc` or base backups with WAL archiving, run
+`leep-server backup --no-blobs` for the manifest, and prove the pair with
+`leep-server backup-verify`. Blobs in S3 can be protected by bucket versioning
+or replication instead of copying (`--no-blobs`); `backup-verify --blobs-from
+URL` checks the copy.
+
+Take a backup before every upgrade, schedule one daily, check it with
+`backup-verify`, and run the restore drill on a schedule: an untested backup is
+not a backup. The procedure, retention, RPO and RTO, the drill and the alerts
+are in [OPERATIONS.md](OPERATIONS.md#backup-and-restore).
 
 ## Upgrades
 
 Metadata schema migrations (ADR 0023) run automatically when the server
 connects to the metadata store, in one transaction under a lock, so several
 servers starting together migrate once. Rebuild the image, then recreate the
-container (`docker compose up -d --build`). Take a backup first: there is no
+container (`docker compose up -d --build`). Take a backup first
+(`leep-server backup`, above): there is no
 automatic downgrade, and a server refuses a database that a newer release has
 migrated. Servers are stateless, so several can share one Postgres and bucket.
 

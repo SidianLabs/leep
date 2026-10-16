@@ -492,6 +492,15 @@ async fn drive(
                 out.join("gc.log"),
             )));
         }
+        if let Some(every) = args.backup_every() {
+            ops_tasks.push(tokio::spawn(ops::backup_loop(
+                bins.to_path_buf(),
+                st.clone(),
+                sh.clone(),
+                out.join("backup"),
+                every,
+            )));
+        }
         if let Some(every) = args.derive_every() {
             ops_tasks.push(tokio::spawn(ops::derive_loop(
                 bins.to_path_buf(),
@@ -615,6 +624,10 @@ async fn drive(
     if let (Some(st), Some(bins)) = (stores.as_ref(), bin_dir) {
         eprintln!("final verify ...");
         ops::final_verify(bins, st, sh).await;
+        if args.backup_every().is_some() {
+            eprintln!("final backup and restore drill ...");
+            ops::final_restore_drill(bins, st, sh, &out.join("backup")).await;
+        }
     }
     sh.stop.store(true, std::sync::atomic::Ordering::Relaxed);
     finish(

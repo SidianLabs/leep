@@ -2,6 +2,7 @@
 //! The endpoint contract is the table in `leep_core::api`.
 
 pub mod auth;
+pub mod backup;
 pub mod limits;
 pub mod observe;
 pub mod reload;

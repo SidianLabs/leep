@@ -498,6 +498,205 @@ pub async fn derive_loop(
     }
 }
 
+/// One `leep-server backup` (ADR 0026) into `dir`; returns the manifest, or
+/// says why not. A backup that exits 1 sealed a snapshot whose check found
+/// problems, which is the violation this exists to catch.
+async fn run_backup(
+    bin_dir: &Path,
+    stores: &Stores,
+    dir: &Path,
+) -> Result<(std::process::Output, Option<serde_json::Value>)> {
+    let out = Command::new(bin_dir.join("leep-server"))
+        .args(["--meta", &stores.meta, "--blobs", &stores.blobs])
+        .args(["backup", "--out"])
+        .arg(dir)
+        .arg("--json")
+        .env("RUST_LOG", "warn")
+        .stdin(Stdio::null())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .context("running leep-server backup")?;
+    let manifest = serde_json::from_slice(&out.stdout).ok();
+    Ok((out, manifest))
+}
+
+fn backup_problem_text(out: &std::process::Output, m: &Option<serde_json::Value>) -> String {
+    let problems: Vec<String> = m
+        .as_ref()
+        .and_then(|r| r["problems"].as_array())
+        .map(|ps| {
+            ps.iter()
+                .take(5)
+                .map(|p| {
+                    format!(
+                        "[{}] {}",
+                        p["code"].as_str().unwrap_or("?"),
+                        p["message"].as_str().unwrap_or("?")
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    format!(
+        "exit {}; {}; stderr: {}",
+        out.status,
+        problems.join("; "),
+        String::from_utf8_lossy(&out.stderr)
+            .chars()
+            .rev()
+            .take(400)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<String>()
+    )
+}
+
+/// Back up beside the swarm, every `every`: each snapshot must seal with a
+/// clean check however much lands and however GC runs meanwhile.
+pub async fn backup_loop(
+    bin_dir: PathBuf,
+    stores: Stores,
+    sh: Arc<Shared>,
+    dir: PathBuf,
+    every: Duration,
+) {
+    let mut next = Instant::now() + every;
+    while !sh.stopped() {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        if Instant::now() < next {
+            continue;
+        }
+        let t0 = Instant::now();
+        let (out, manifest) = match run_backup(&bin_dir, &stores, &dir).await {
+            Ok(r) => r,
+            Err(e) => {
+                sh.violate("backup", format!("could not run backup: {e:#}"));
+                return;
+            }
+        };
+        sh.stats
+            .add("backup_millis", t0.elapsed().as_millis() as u64);
+        next = Instant::now() + every;
+        if out.status.success() {
+            sh.stats.inc("backup_runs");
+            let n = |path: &[&str]| {
+                path.iter()
+                    .try_fold(manifest.as_ref()?.get("manifest")?, |v, k| v.get(*k))?
+                    .as_u64()
+            };
+            sh.stats
+                .add("backup_blobs_copied", n(&["blobs", "copied"]).unwrap_or(0));
+            continue;
+        }
+        // A backup that races a restart may lose its database connection and
+        // seals nothing (exit 2); the next one repeats it. Exit 1 never excuses.
+        if out.status.code() == Some(2) && sh.in_chaos(sh.now_secs()) {
+            sh.stats.inc("backup_failed_during_restart");
+            continue;
+        }
+        sh.violate(
+            "backup",
+            format!("backup failed: {}", backup_problem_text(&out, &manifest)),
+        );
+        return;
+    }
+}
+
+/// With the swarm stopped: take a last backup, restore it into scratch SQLite
+/// and file stores (whatever the source backend is: a snapshot restores into
+/// either), and verify what came back. Violations are reported under `backup`
+/// and `restore`.
+pub async fn final_restore_drill(bin_dir: &Path, stores: &Stores, sh: &Shared, dir: &Path) {
+    let t0 = Instant::now();
+    let (out, manifest) = match run_backup(bin_dir, stores, dir).await {
+        Ok(r) => r,
+        Err(e) => {
+            sh.violate("backup", format!("could not run the final backup: {e:#}"));
+            return;
+        }
+    };
+    sh.stats
+        .add("backup_millis", t0.elapsed().as_millis() as u64);
+    let manifest = match manifest {
+        Some(m) if out.status.success() => m,
+        other => {
+            sh.violate(
+                "backup",
+                format!(
+                    "the final backup failed: {}",
+                    backup_problem_text(&out, &other)
+                ),
+            );
+            return;
+        }
+    };
+    sh.stats.inc("backup_runs");
+    let changesets = manifest["manifest"]["counts"]["changesets"]
+        .as_u64()
+        .unwrap_or(0);
+    let scratch = dir.join("restore-drill");
+    let _ = std::fs::remove_dir_all(&scratch);
+    if let Err(e) = std::fs::create_dir_all(&scratch) {
+        sh.violate(
+            "restore",
+            format!("cannot create {}: {e}", scratch.display()),
+        );
+        return;
+    }
+    let meta = format!("sqlite://{}?mode=rwc", scratch.join("meta.db").display());
+    let blobs = format!("file://{}", scratch.join("blobs").display());
+    let t1 = Instant::now();
+    let restored = Command::new(bin_dir.join("leep-server"))
+        .args(["--meta", &meta, "--blobs", &blobs])
+        .args(["restore", "--from"])
+        .arg(dir)
+        .args(["--rehash", "--json"])
+        .env("RUST_LOG", "warn")
+        .stdin(Stdio::null())
+        .kill_on_drop(true)
+        .output()
+        .await;
+    let restored = match restored {
+        Ok(o) => o,
+        Err(e) => {
+            sh.violate("restore", format!("could not run restore: {e}"));
+            return;
+        }
+    };
+    sh.stats
+        .add("restore_millis", t1.elapsed().as_millis() as u64);
+    let report: Option<serde_json::Value> = serde_json::from_slice(&restored.stdout).ok();
+    if !restored.status.success()
+        || report.as_ref().and_then(|r| r["changesets"].as_u64()) != Some(changesets)
+    {
+        sh.violate(
+            "restore",
+            format!(
+                "restoring the final backup: {}",
+                backup_problem_text(&restored, &report)
+            ),
+        );
+        return;
+    }
+    sh.stats.add("restore_changesets", changesets);
+    final_verify(
+        bin_dir,
+        &Stores {
+            meta,
+            blobs,
+            blob_dir: Some(scratch.join("blobs")),
+        },
+        sh,
+    )
+    .await;
+    // The scratch stores are as large as the soak's; keep them only for --keep-data.
+    if !sh.args.keep_data {
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+}
+
 /// `leep-server verify --full --rehash` over the stores once the swarm has
 /// stopped (ADR 0025): everything the run wrote must be reachable, intact and
 /// derived correctly, however many restarts, collects and rebases it took.

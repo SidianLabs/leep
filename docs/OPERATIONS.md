@@ -202,8 +202,10 @@ the list that was compiled into it. The newest applied version is the
 
 **Procedure.** For every upgrade, whether or not it changes the schema:
 
-1. **Back up** metadata and blobs ([DEPLOY.md](DEPLOY.md#persistence-and-backup)).
-   There is no downgrade: going back means restoring the backup.
+1. **Back up** metadata and blobs (`leep-server backup`, [Backup and
+   restore](#backup-and-restore)) and check it (`backup-verify`). There is no
+   downgrade: going back means restoring the backup, which needs a binary at
+   least as new as the schema in the backup.
 2. Look at what the new version would do. With the new binary (for example
    `docker compose run --rm leep-server migrate --status`, or `docker run --rm leep:new migrate --status` with the same `LEEP_META`):
    ```sh
@@ -320,7 +322,8 @@ never create a database or a blob directory that does not exist.
 
 Run `verify`:
 
-- after restoring a backup, before pointing servers at it;
+- after restoring a backup, before pointing servers at it (`restore` already
+  runs the cheap closure check; `--full --rehash` is the thorough one);
 - after upgrading, and after a crash, a disk or volume problem, or a bad
   migration;
 - when an answer looks wrong (a log, a blame, a search, an `is_ancestor` that
@@ -438,6 +441,238 @@ Everything `repair` changes is derived data. If a repair makes things worse
 (it cannot, short of a bug), `repair drop` of the same kind returns the store
 to "derives on demand".
 
+## Backup and restore
+
+`leep-server backup` takes a consistent copy of both stores while servers and
+GC keep running, and `leep-server restore` puts it back (ADR 0026). A backup
+is only worth having if it has been restored: the drill below is part of the
+procedure, not an extra.
+
+### What to back up
+
+| What | Where it lives | How |
+|---|---|---|
+| Metadata: changesets, refs, ref log, signatures, reviews, derived data | SQLite file or Postgres database (`--meta`) | `leep-server backup` |
+| Blobs: file contents and tree nodes | filesystem directory or S3 bucket (`--blobs`) | `leep-server backup` |
+| Configuration: tokens file, signing keys file, review policy file, TLS/proxy config | wherever you keep it | your configuration management; **not in the stores and not in the backup** |
+
+Back up the configuration files with the deployment's other configuration. A
+restored store with lost tokens still works, but nobody can authenticate to it
+until tokens are issued again (`leep-server gen-token`).
+
+### Taking a backup
+
+```sh
+leep-server backup --out /backups/leep                 # uses LEEP_META and LEEP_BLOBS as the source
+leep-server backup --out /backups/leep --rehash        # also re-hash every referenced blob (slow, thorough)
+leep-server backup --out /backups/leep --blobs-to s3://my-backups?region=us-east-1   # blobs go to a bucket
+leep-server backup --out /backups/leep --metrics-file /var/lib/node_exporter/textfile/leep_backup.prom
+```
+
+`--out` becomes a directory with one blob pool shared by every snapshot and one
+directory per run:
+
+```
+/backups/leep/blobs/ab/cdef...                       the pool, only ever added to
+/backups/leep/snapshots/20261016T031500Z/meta.db     metadata as of one instant
+/backups/leep/snapshots/20261016T031500Z/manifest.json   written last: the snapshot exists once this does
+```
+
+What a run does, in order, and why the order matters:
+
+1. **Metadata first**, in one read transaction (`REPEATABLE READ` on Postgres),
+   written to `meta.db`. Its instant is the backup's recovery point.
+2. **Blobs second**: every blob the pool lacks is copied. Blobs are immutable and
+   named by their content, so "already there" is proof it is right and the
+   second backup copies only what is new (a store with nothing new costs two
+   directory or bucket listings).
+3. **Check**: every changeset in the snapshot is walked against the pool, and
+   every tree node and blob it names must be there. This is what proves the two
+   halves match; the result is stored in the manifest.
+
+Metadata before blobs is the whole consistency argument. A blob that a stored
+changeset needs is never deleted (ADR 0012), so everything the snapshot needs
+is in the blob store when step 2 looks, no matter what lands or what GC deletes
+meanwhile; copying blobs first would miss blobs of changesets landed between
+the two. So there is **no need to stop servers or pause GC**, and no `gc
+collect` schedule has to avoid the backup window. If a backup's check ever
+finds a missing blob (a GC bug, `gc --unsafe-no-fence` run under live servers, a
+store that was already damaged) the backup is sealed as failed, prints the
+problems, exits 1 and `restore` refuses it.
+
+Exit status: `0` sealed and the check clean, `1` sealed but the check found
+problems (do not rely on that snapshot), `2` could not run (nothing sealed).
+`--json` prints the manifest and problems as one object. Progress goes to
+stderr.
+
+Things to know:
+
+- **Source of truth.** `backup` only reads the source. It refuses a source that
+  does not exist (it never creates one), one with pending migrations (run
+  `leep-server migrate`, ADR 0023) and one newer than the binary.
+- **Where to put it.** On a different disk, host and failure domain from the
+  stores. The pool holds all repository content and the snapshots hold review
+  and signature history: put it on encrypted storage.
+- **Memory.** Each blob is read whole while it is copied, so memory is about
+  `--concurrency` (default 8) times your largest blob. Lower it for very large
+  blobs.
+- **Long snapshots.** The metadata read transaction lasts as long as the
+  metadata takes to stream. On Postgres it holds back vacuum for that time; on
+  SQLite it delays WAL checkpoints. Metadata is small next to blobs (a
+  million changesets is a few GB), so this is minutes, not hours. For metadata
+  too large for that, use Postgres base backups and WAL archiving for the
+  metadata half (and see "Blobs protected by the platform" for the blobs).
+- **Blobs protected by the platform.** If the bucket already has versioning or
+  cross-region replication, take `backup --no-blobs`: only the snapshot and the
+  manifest are written, and the check runs against the source blobs. Once the
+  platform's copy has caught up, run `backup-verify --blobs-from URL` against
+  it: that is the proof the two match.
+- **Scratch space.** Tools never open `meta.db` in place (the medium may be
+  read-only, and opening would change the file the manifest hashed). The check,
+  `backup-verify` and `restore` work on a temporary copy of it under
+  `$TMPDIR`, so point `TMPDIR` at a disk with room for the metadata.
+- **Two runs at once** write separate snapshots and share the pool safely. A
+  directory under `snapshots/` without a `manifest.json` is an interrupted
+  run: it is ignored and can be deleted.
+
+### Schedule, retention, RPO and RTO
+
+A daily run is a reasonable start; run it from cron on a host that can reach
+both stores:
+
+```cron
+# 02:10 daily: take a backup; Sundays 05:20: re-read the pool and check it against the newest snapshot
+10 2 * * *  leep-server backup --out /backups/leep --metrics-file /var/lib/node_exporter/textfile/leep_backup.prom
+20 5 * * 0  leep-server backup-verify --from /backups/leep --rehash
+```
+
+- **RPO** (data you can lose): everything landed after the newest sealed
+  snapshot's instant (`snapshot_taken_at` in the manifest), so the backup
+  interval plus the duration of the run is the worst case. The ref log shows
+  what was landed after the instant if the source survives. For an RPO of
+  minutes, back up more often (an incremental run on a store with little new
+  content is cheap), or use Postgres WAL archiving for the metadata and the
+  bucket's versioning for blobs.
+- **RTO** (time to restore): the time to copy the pool to the target plus the
+  time to load the metadata (one transaction), plus `verify` if you run it. The
+  drill measures both on your data; figures from a modest store are in
+  [PERFORMANCE.md](PERFORMANCE.md). Blob bytes over your network dominate on
+  large stores.
+- **Retention.** A snapshot directory is self-contained apart from the pool, so
+  deleting old directories under `snapshots/` is safe. The pool is shared and
+  only grows: to reclaim space, start a new pool (`--out` a new directory) every
+  few months and delete the old directory once its newest snapshot is older than
+  your retention. Keep at least the last few snapshots and one that is a few
+  weeks old: a corruption noticed late is only recoverable from a snapshot from
+  before it.
+
+### Restoring
+
+```sh
+leep-server restore --from /backups/leep                     # the newest sealed snapshot
+leep-server restore --from /backups/leep --snapshot 20261016T021000Z
+leep-server restore --from /backups/leep --blobs-from s3://my-backups?region=us-east-1
+```
+
+`restore` writes to `--meta` and `--blobs`: the new, empty stores. Procedure
+after losing the stores:
+
+1. Provision empty stores: a new Postgres database (any name; the server
+   creates the tables) or an empty path for SQLite, and an empty directory or
+   bucket for blobs.
+2. Restore the configuration files (tokens, signing keys, policy).
+3. Run `leep-server restore --from DIR` against them, with the same
+   `LEEP_META`/`LEEP_BLOBS` the servers will use. It checks the manifest, the
+   file's BLAKE3 and the schema version, copies the missing blobs, loads the
+   metadata in one transaction, and runs the closure check on the result. Exit
+   `0` means done and clean.
+4. Run `leep-server verify --full --rehash` (optional but recommended; it also
+   recomputes derived data).
+5. Start the servers. Clients with work that landed after the snapshot find
+   their refs behind: they `leep sync` and land again; nothing else changes.
+   The ref log continues from the snapshot's last entry.
+
+Refusals, which are the point:
+
+| Message | Meaning | What to do |
+|---|---|---|
+| `destination metadata store is not empty` | The target database has data | Restore into a fresh database; `--force` deletes what is there, in the same transaction, only after you have stopped every server that uses it |
+| `destination blob store is not empty` | Blobs already there | `--resume` continues an interrupted restore (metadata must still be empty); `--force` allows it anyway |
+| `newer than this server (vN)` | The backup's schema is newer than this binary | Restore with the newer `leep-server` (ADR 0023); never edit the backup |
+| `does not match its manifest` | `meta.db` was damaged or replaced | Use another snapshot |
+| `closure check failed` / `was skipped` | The backup was sealed with problems, or without a check | Use another snapshot, or `--accept-failed-check` after reading the problems |
+| `manifest format N` | Written by a newer Leep | Use a newer `leep-server` |
+
+An older schema is not a refusal: it is migrated on a scratch copy and loaded
+(ADR 0023), so a backup from before an upgrade restores into the new version.
+A restore interrupted by a crash leaves the metadata empty (it is loaded last,
+in one transaction), so run the same command again with `--resume`.
+
+A backup can be restored into the other metadata backend: a snapshot taken
+from Postgres loads into SQLite and the other way round. That is also the
+supported way to move between them.
+
+After a restore, filesystem blobs have the restore time as their modification
+time, so GC's `--grace` window starts again: nothing is deleted for a day.
+
+### Checking a backup without restoring it
+
+```sh
+leep-server backup-verify --from /backups/leep               # newest snapshot: file hash, then every blob it names
+leep-server backup-verify --from /backups/leep --rehash      # also re-read and re-hash the blobs
+```
+
+Exit `0` clean, `1` problems (with the first ones named), `2` could not run. Run
+it after copying a backup elsewhere, after a `--no-blobs` run, and from cron
+against the backup directory: bit rot in the pool shows up here, not during the
+disaster.
+
+### The restore drill
+
+Do this on a schedule (monthly is a good start, and after every Leep upgrade),
+on a scratch host or the same host with throwaway stores. It is the
+`crates/leep-e2e/tests/backup.rs` test done by hand against your real backup,
+and the only way to know the backup works:
+
+```sh
+# 1. Restore the newest backup into scratch stores, never the real ones.
+export LEEP_META='sqlite:///scratch/drill/meta.db?mode=rwc'     # or a scratch Postgres database
+export LEEP_BLOBS=file:///scratch/drill/blobs
+leep-server restore --from /backups/leep --rehash               # exit 0, "result: restored"
+
+# 2. Full verification of the restored stores.
+leep-server verify --full --rehash                              # exit 0, "result: clean"
+
+# 3. Serve it and ask questions.
+leep-server --listen 127.0.0.1:7071 &
+export LEEP_SERVER=http://127.0.0.1:7071
+leep refs                                                       # every tip in manifest.json "refs"
+leep log main -n 20; leep blame main some/file; leep search 'a known string' --rev main
+leep init /scratch/drill/wc && cd /scratch/drill/wc && leep checkout main   # a fresh checkout
+```
+
+Pass criteria: `restore` and `verify` exit 0; `leep refs` equals the manifest's
+`refs`; the checkout has the files you expect; the time from step 1 to step 2 is
+your measured RTO. Record the date and the time. Then delete the scratch
+stores. If any step fails the backup you tested is not good: take another,
+keep the failed one for diagnosis, and find out why before the next run.
+
+### Alerts
+
+`backup --metrics-file` writes node_exporter text-file metrics. Alert on:
+
+| Alert | Expression | Meaning |
+|---|---|---|
+| No recent backup | `time() - leep_backup_last_success_timestamp_seconds > 2 * 86400` (use twice your interval) | Backups are not running or not passing |
+| Last backup failed its check | `leep_backup_last_run_ok == 0` | A sealed snapshot is not restorable; read the run's output |
+| Backup slowing | `leep_backup_duration_seconds` rising week on week | The store is outgrowing the window |
+| Drill overdue | your own metric or ticket: no drill in 35 days | An untested backup is not a backup |
+
+Also alert on the cron job's exit status (2 means nothing was sealed), and on
+free space where `--out` lives. The metrics (`last_run_timestamp`,
+`snapshot_timestamp` (the recovery point), `duration`, `check_problems`,
+`changesets`, `blobs_copied`, `blob_bytes_copied`) are listed in ADR 0026.
+
 ## Crash and fault tests
 
 Two suites check what happens when stores fail and processes die (ADR 0021).
@@ -527,6 +762,7 @@ release flow need a server the harness started).
 | `--files` | 3000 | Files in the synthetic repository |
 | `--request-timeout` | 8s | The server's `--request-timeout`; the GC fence is derived from it (1.5 times it plus 2 s) |
 | `--gc-interval`, `--derive-interval` | duration/3 (60 s to 30 min), duration/8 (30 s to 10 min) | Pause between fenced GCs, and between `derive-search main` warmups; 0 disables |
+| `--backup-interval` | off | Pause between `leep-server backup` runs beside the swarm; each must seal with a clean check. With it, the run ends with a quiet backup that is restored into scratch SQLite and file stores and verified (`--full --rehash`), whatever the source backend (ADR 0026). Violations are reported under `backup` and `restore` |
 | `--chaos`, `--chaos-restarts` | off, 4 | Restart the server, SIGTERM for two in three and SIGKILL for the others |
 | `--rate-limit`, `--rate-burst`, `--max-concurrent` | off | Passed to the server per token. The `leep` agents' tokens are exempt: a checkout is thousands of reads (see Request limits above) |
 | `--cache-mib` | 32 | The server's blob cache. Keep it small: a cache still filling looks like a leak |

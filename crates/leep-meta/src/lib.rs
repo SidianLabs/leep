@@ -10,6 +10,7 @@ use leep_core::{Error, MetaStore, Result};
 
 pub mod migrate;
 mod postgres;
+pub mod snapshot;
 mod sqlite;
 
 pub use migrate::{AppliedMigration, Migration, MigrationRef, MigrationReport};
@@ -122,5 +123,7 @@ fn log_entry(row: LogRow) -> Result<leep_core::RefLogEntry> {
 
 #[cfg(test)]
 mod migrate_tests;
+#[cfg(test)]
+mod snapshot_tests;
 #[cfg(test)]
 mod tests;

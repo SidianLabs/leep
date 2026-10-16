@@ -56,5 +56,13 @@ Backends implement `leep_core::BlobStore` (in `leep-store`) or
    call applied means for it. For a MetaStore, abandon `cas_ref_logged` at
    random suspension points (`leep_testkit::cancel_after_polls`) and check
    the ref log still replays to the refs.
-6. Add the schema or key layout to FORMATS.md and a row to the scaling table in
+6. Backups (ADR 0026). `leep_store::sync::sync_blobs` copies between any two
+   `BlobStore`s and relies on `list_page` being strictly ascending and on
+   `put_with_hash`/`delete` being idempotent, so a blob backend needs nothing
+   more (the conformance test covers the listing). A MetaStore does need
+   work: `leep_meta::snapshot` reads and writes each backend's tables through
+   a `Source` and `Sink`; add them for the new backend, with a snapshot of
+   the new backend restoring into SQLite and back in `snapshot_tests.rs`, or
+   say in the ADR that backups of it use the database's own tooling.
+7. Add the schema or key layout to FORMATS.md and a row to the scaling table in
    ARCHITECTURE.md §11 if relevant.

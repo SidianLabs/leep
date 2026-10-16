@@ -54,5 +54,13 @@ Migrations are forward-only and numbered; a released one is never edited
    of the file lists the steps.
 5. Run `LEEP_TEST_POSTGRES_URL=... cargo test -p leep-meta` (both backends)
    and `cargo test -p leep-e2e --test migrate`.
-6. Update docs/FORMATS.md (schema section), the CHANGELOG and, if operators
+6. Backups (ADR 0026): `crates/leep-meta/src/snapshot.rs` reads and writes the
+   current layout of every table. A migration that adds or changes a column or
+   table must teach its `Source` and `Sink` (SQLite and Postgres), and
+   `snapshot_tests.rs` must populate and compare it. Old backups keep
+   restoring: they are migrated on a scratch copy like any old database, so add
+   a restore of the previous schema's snapshot to the test. A change to the
+   backup directory or `manifest.json` needs a new manifest `format` unless it
+   only adds a field.
+7. Update docs/FORMATS.md (schema section), the CHANGELOG and, if operators
    must do something, docs/OPERATIONS.md "Upgrading".

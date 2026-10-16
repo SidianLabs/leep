@@ -261,6 +261,29 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   cover them.
 - The crash test verifies the store after every kill, and the soak test and
   the git import e2e test verify it at the end (`--full --rehash`).
+- `leep-server backup`, `restore` and `backup-verify` (ADR 0026): a
+  consistent backup of metadata and blobs while servers and GC keep running.
+  The metadata is read first in one transaction (`REPEATABLE READ` on
+  Postgres) and written as a SQLite file with the normal schema, from either
+  backend; the blobs the backup pool lacks are copied second (incremental:
+  blobs are immutable and content-addressed); then every changeset of the
+  snapshot is walked against the pool, and the result is sealed in
+  `manifest.json` (schema version, counts, ref tips, BLAKE3 of the file). A
+  blob a stored changeset needs is never deleted (ADR 0012), so no GC pause is
+  needed, and a backup whose check finds a missing blob exits 1 and `restore`
+  refuses it. `restore` loads blobs, then metadata in one transaction, into
+  empty stores only (`--force`, `--resume`), refuses a newer schema, a damaged
+  file or a failed snapshot, migrates an older one (ADR 0023), keeps the ref
+  log numbering, and checks the result. A snapshot from Postgres restores into
+  SQLite and the other way round. `--metrics-file` writes node_exporter
+  text-file metrics (last success time). Nothing persisted or on `/v1`
+  changes; the backup layout is in `docs/FORMATS.md`.
+- The restore drill: `crates/leep-e2e/tests/backup.rs` backs up a server under
+  agent load while `gc` runs between the two halves of the backup, restores
+  into fresh stores, and compares `verify --full --rehash`, every ref tip,
+  history, blame, search, the ref log and a fresh checkout (SQLite, Postgres,
+  and across the two). `docs/OPERATIONS.md`, "Backup and restore", has the
+  procedure, the scheduled drill, RPO and RTO notes and alerts.
 
 ### Fixes
 - Processes opening a new SQLite metadata file at the same moment (servers
