@@ -211,6 +211,21 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   first-parent skip list (the answer is unchanged), and checks its cache before
   walking.
 
+### Operations
+- Config reload without restart (ADR 0024): SIGHUP re-reads the tokens file
+  (including per-token limits), the signing keys file and the review policy
+  file, so tokens and keys rotate, tokens are revoked and protected refs and
+  review rules change with no downtime. Every file is read and validated first
+  with the startup checks; if any is invalid the old config stays in force and
+  an error is logged, otherwise everything swaps at once. A request finishes
+  under the config it started with, and a `land` uses one policy for its whole
+  duration. Limiter state is kept for tokens whose limits did not change.
+  Flags, listeners and stores still need a restart. New metrics:
+  `leep_config_reload_total{result}`, `leep_config_generation` and
+  `leep_config_last_reload_timestamp_seconds`, with alert examples in
+  `docs/OPERATIONS.md`. There is no reload endpoint and no file watcher.
+- A SIGHUP no longer terminates the server.
+
 ### Project
 - Workspace version set to 0.0.1, with a CI check that keeps it below
   0.1.0.

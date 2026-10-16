@@ -105,8 +105,9 @@ list asks for size, rate and concurrency limits per token.
 ## Consequences
 - A well-behaved deployment pays nothing; a limited one pays two mutex
   operations per request.
-- Limits live in the tokens file, so changing them needs a restart, like
-  everything else in that file (config reload is M6).
+- Limits live in the tokens file and reload on SIGHUP (ADR 0024), keeping the
+  state of tokens whose limits did not change. The server-wide defaults are
+  flags and still need a restart.
 - Rate state is not shared between servers or persisted, and resets on
   restart.
 - Floods of unauthenticated requests are not limited here (they fail

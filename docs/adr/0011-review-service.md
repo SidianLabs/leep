@@ -80,7 +80,7 @@ functions of the old and new bytes and the path; the classification lives in
 - `docs_only`: the path matches a docs glob (`globset`, `*` stays within one
   directory level, `**` crosses levels). Adds, deletes and modifies all count.
   Needs `docs_globs`, and `docs_globs` needs the rule, so a half-written policy
-  fails at startup.
+  fails at startup (and on reload, ADR 0024).
 - `whitespace_only`: a `Modify` of a non-symlink file, same kind as before,
   whose old and new content are equal line by line once trailing spaces, tabs
   and CRs and trailing blank lines are dropped; both must be UTF-8. Leading

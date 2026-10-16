@@ -182,7 +182,8 @@ names exactly and were not validated. `LEEP_REQUIRE_REVIEW="main, release"`
 protects `main` and ` release` (with a space), which no ref can be called, so
 `release` is silently unprotected. The server now refuses to start with a name
 that fails the ref name rules, and logs a warning for a protected name that
-has no ref yet. Test: `server_refuses_to_start_with_bad_review_config`.
+has no ref yet. Config reload (ADR 0024) runs the same checks, so a SIGHUP
+with a bad name keeps the old config. Test: `server_refuses_to_start_with_bad_review_config`.
 
 ### S-07: `OWNERS` under a docs glob (Low, fixed)
 
@@ -281,8 +282,8 @@ closes the gap. Recorded in ADR 0011.
   re-verified against the current key set on every read and land. The policy
   never accepts a changeset through the server-written `rebased-origin-v1`
   link, and covers land, raw CAS and `undo`; rewinding (S-09) or deleting a
-  protected ref is refused. Changing the keys file takes effect at restart and
-  applies to old signatures too, as ADR 0010 says.
+  protected ref is refused. Changing the keys file takes effect at restart or SIGHUP
+  (ADR 0024) and applies to old signatures too, as ADR 0010 says.
 - **Refs (S-18).** Every write path validates names (`cas_ref_checked`,
   `land`); tags cannot move by CAS, land or undo; deleting a protected ref is
   refused on every path; the ref log's actor is the token name and clients
