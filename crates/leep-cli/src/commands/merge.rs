@@ -34,7 +34,7 @@ pub struct MergeArgs {
     /// Give up a merge that stopped on conflicts and restore the working copy.
     #[arg(long)]
     pub abort: bool,
-    /// Author of a clean merge commit (default: $LEEP_AUTHOR, else $USER).
+    /// Author of a clean merge commit (default as for `commit --author`).
     #[arg(long)]
     pub author: Option<String>,
     /// Sign a clean merge commit with this private key file. After a conflict,
@@ -101,7 +101,7 @@ pub fn run(ctx: &mut Ctx, args: &MergeArgs) -> Result<i32> {
         parents: [base, other],
         message: message.clone(),
         authorship: Authorship {
-            author: snapshot::author(args.author.as_deref()),
+            author: snapshot::author(ctx, args.author.as_deref()),
             timestamp: Some(snapshot::now_secs()),
         },
         extra: BTreeMap::new(),

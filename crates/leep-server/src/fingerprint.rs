@@ -17,7 +17,7 @@ use crate::limits::Quota;
 
 /// Bump when the encoding changes, so a new release never silently matches an
 /// old one that computed the same bytes differently.
-const DOMAIN: &str = "leep-config-fingerprint-v1";
+const DOMAIN: &str = "leep-config-fingerprint-v2";
 
 /// Length-prefixed, tagged encoding, so no two different configs can produce
 /// the same byte stream by shifting data between fields.
@@ -83,6 +83,13 @@ impl Canon {
             None => self.u64(0),
             Some(Quota::Unlimited) => self.u64(1),
             Some(Quota::Limit(x)) => self.u64(2).u64(x.to_bits()),
+        }
+    }
+
+    pub(crate) fn opt_str(&mut self, v: Option<&str>) -> &mut Self {
+        match v {
+            None => self.u64(0),
+            Some(s) => self.u64(1).str(s),
         }
     }
 

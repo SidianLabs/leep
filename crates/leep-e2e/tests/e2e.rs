@@ -2223,3 +2223,68 @@ fn request_limits_throttle_one_token_and_the_cli_reports_it() {
     );
     assert!(started.elapsed() < std::time::Duration::from_secs(5));
 }
+
+#[test]
+fn author_falls_back_to_the_token_name_when_nothing_local_names_one() {
+    let _g = serial();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let (carol_t, entry) = gen_token("carol", "write");
+    let (dave_t, mut dave) = gen_token("dave", "write");
+    dave["author"] = "Dave Example <dave@example.com>".into();
+    let tokens = root.join("tokens.json");
+    fs::write(
+        &tokens,
+        serde_json::json!({ "tokens": [entry, dave] }).to_string(),
+    )
+    .unwrap();
+    let stores = Stores::sqlite(&root.join("data"));
+    let server = Server::start_with(
+        free_port(),
+        &stores,
+        root,
+        &["--tokens-file", tokens.to_str().unwrap()],
+    );
+    let client = Client::new(&server.url, &root.join("cache"));
+    // Like a container or CI job: no login name at all.
+    let token = std::cell::RefCell::new(carol_t);
+    let leep = |cwd: &Path, author: Option<&str>, args: &[&str]| {
+        let mut c = client.cmd(cwd);
+        c.env("LEEP_TOKEN", &*token.borrow())
+            .env_remove("LEEP_AUTHOR")
+            .env_remove("USER")
+            .env_remove("LOGNAME")
+            .env_remove("USERNAME");
+        if let Some(a) = author {
+            c.env("LEEP_AUTHOR", a);
+        }
+        let out = c.args(args).output().unwrap();
+        assert_ok(&out, &format!("leep {args:?}"));
+        stdout(&out)
+    };
+    let author_of_tip = |wc: &Path| -> String {
+        let out = leep(wc, None, &["--json", "log", "-n", "1"]);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        v["entries"][0]["changeset"]["author"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+
+    let wc = root.join("wc");
+    leep(root, None, &["init", wc.to_str().unwrap()]);
+    write(&wc, "a.txt", "one\n");
+    leep(&wc, None, &["commit", "-m", "first"]);
+    assert_eq!(author_of_tip(&wc), "carol");
+
+    // A locally named author still wins over the token.
+    write(&wc, "a.txt", "two\n");
+    leep(&wc, Some("Carol Example"), &["commit", "-m", "second"]);
+    assert_eq!(author_of_tip(&wc), "Carol Example");
+
+    // A token whose entry sets `author` stamps that, not its bare name.
+    *token.borrow_mut() = dave_t;
+    write(&wc, "a.txt", "three\n");
+    leep(&wc, None, &["commit", "-m", "third"]);
+    assert_eq!(author_of_tip(&wc), "Dave Example <dave@example.com>");
+}

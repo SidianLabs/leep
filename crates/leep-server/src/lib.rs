@@ -180,6 +180,7 @@ pub fn router_with_ready_timeout(
     let router = Router::new()
         .route("/v1/health", get(health))
         .route("/v1/ready", get(ready).with_state(ready_state))
+        .route("/v1/whoami", get(whoami))
         .route("/v1/blobs/missing", post(missing_blobs))
         .route("/v1/blobs/{hash}", get(get_blob).put(put_blob))
         .route("/v1/changesets", post(create_changeset))
@@ -416,6 +417,17 @@ struct MergeBaseQuery {
 /// because a database is down; `/v1/ready` is for that.
 async fn health() -> Json<&'static str> {
     Json("ok")
+}
+
+async fn whoami(auth::MaybePrincipal(who): auth::MaybePrincipal) -> Json<WhoAmIResponse> {
+    Json(match who {
+        Some(p) => WhoAmIResponse {
+            role: Some(p.role.as_str().to_string()),
+            name: Some(p.name),
+            author: p.author,
+        },
+        None => WhoAmIResponse::default(),
+    })
 }
 
 /// Whether a request is a public probe: no token, no per-token limits.

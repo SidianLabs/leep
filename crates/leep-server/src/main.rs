@@ -133,6 +133,10 @@ enum Cmd {
         /// `read` or `write`.
         #[arg(long)]
         role: Role,
+        /// Author for changesets made with this token when the client names
+        /// none, e.g. "Name <email>".
+        #[arg(long)]
+        author: Option<String>,
     },
     /// Delete blobs no changeset references (uses --meta and --blobs; safe
     /// beside running servers). Without a phase: condemn, wait --fence, then
@@ -363,8 +367,9 @@ fn run_command(cmd: Cmd) -> anyhow::Result<()> {
         | Cmd::BackupVerify(_) => {
             unreachable!("handled in main")
         }
-        Cmd::GenToken { name, role } => {
-            let (token, entry) = auth::generate(&name, role).map_err(anyhow::Error::msg)?;
+        Cmd::GenToken { name, role, author } => {
+            let (token, mut entry) = auth::generate(&name, role).map_err(anyhow::Error::msg)?;
+            entry.author = author;
             println!("token: {token}");
             println!("entry: {}", serde_json::to_string(&entry)?);
             eprintln!("Store the token now; it cannot be recovered. Add the entry to the `tokens` array of your tokens file.");

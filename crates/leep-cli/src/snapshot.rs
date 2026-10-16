@@ -20,13 +20,32 @@ pub fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
-/// `--author`, else `$LEEP_AUTHOR`, else `$USER`.
-pub fn author(flag: Option<&str>) -> String {
-    let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+/// `--author`, else `$LEEP_AUTHOR`, else the login name, else what the server
+/// says for our token (its `author`, else its name). Containers and CI often
+/// set no login name, and the token is still a real identity there.
+pub fn author(ctx: &Ctx, flag: Option<&str>) -> String {
+    local_author(flag)
+        .or_else(|| {
+            let w = ctx.client.whoami().ok()?;
+            w.author.or(w.name)
+        })
+        .unwrap_or_else(|| "unknown".into())
+}
+
+/// The author named without asking the server. `USERNAME` is Windows' name
+/// for `USER`, and `LOGNAME` is set by login(1) where `USER` may not be.
+fn local_author(flag: Option<&str>) -> Option<String> {
+    let env = |k: &str| {
+        std::env::var(k)
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
     flag.map(str::to_string)
         .or_else(|| env("LEEP_AUTHOR"))
         .or_else(|| env("USER"))
-        .unwrap_or_else(|| "unknown".into())
+        .or_else(|| env("LOGNAME"))
+        .or_else(|| env("USERNAME"))
 }
 
 /// The changes `st` describes, relative to the base, with their blobs
@@ -85,7 +104,7 @@ pub fn create(ctx: &Ctx, st: &Status, message: String, kind: &str) -> Result<Cha
     let changes = upload_changes(ctx, st)?;
     let cs = Changeset {
         parents: ctx.wc.state.base.into_iter().collect(),
-        author: author(None),
+        author: author(ctx, None),
         timestamp: now_secs(),
         message,
         changes,
