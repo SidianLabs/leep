@@ -1,6 +1,6 @@
 //! In-memory stores for tests and single-process use.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::sync::Mutex;
 
@@ -97,20 +97,48 @@ impl BlobStore for MemoryBlobStore {
 pub struct MemoryMetaStore {
     changesets: Mutex<BTreeMap<ChangesetId, Changeset>>,
     refs: Mutex<Refs>,
-    derived: Mutex<HashMap<(String, Hash), Bytes>>,
+    derived: Mutex<BTreeMap<(String, Hash), Bytes>>,
 }
 
 /// Refs and their log share one lock, so a move and its entry are one step.
 #[derive(Default)]
 struct Refs {
     heads: BTreeMap<String, ChangesetId>,
-    /// Ascending by `seq`, which is the index plus one.
+    /// Ascending by `seq`.
     log: Vec<RefLogEntry>,
 }
 
 impl MemoryMetaStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Set a ref without logging the move, as a damaged database would show
+    /// it. For tests of verification and repair only.
+    #[doc(hidden)]
+    pub fn set_ref_unlogged(&self, name: &str, target: Option<ChangesetId>) {
+        let mut refs = self.refs.lock().unwrap();
+        match target {
+            Some(id) => refs.heads.insert(name.to_string(), id),
+            None => refs.heads.remove(name),
+        };
+    }
+
+    /// Remove one ref log entry. Later moves keep their `seq`, so the log has
+    /// a hole. For tests of verification and repair only.
+    #[doc(hidden)]
+    pub fn remove_log_entry(&self, seq: u64) -> bool {
+        let mut refs = self.refs.lock().unwrap();
+        let before = refs.log.len();
+        refs.log.retain(|e| e.seq != seq);
+        refs.log.len() != before
+    }
+
+    /// Delete a stored changeset, which the real stores never do. For tests
+    /// of verification and repair only.
+    #[doc(hidden)]
+    pub fn remove_changeset(&self, id: &ChangesetId) -> bool {
+        self.changesets.lock().unwrap().remove(id).is_some()
     }
 }
 
@@ -168,7 +196,7 @@ impl MetaStore for MemoryMetaStore {
             Some(id) => refs.heads.insert(name.to_string(), id),
             None => refs.heads.remove(name),
         };
-        let seq = refs.log.len() as u64 + 1;
+        let seq = refs.log.last().map_or(0, |e| e.seq) + 1;
         refs.log.push(RefLogEntry {
             seq,
             name: name.to_string(),
@@ -211,6 +239,34 @@ impl MetaStore for MemoryMetaStore {
             .unwrap()
             .get(&(kind.to_string(), *key))
             .cloned())
+    }
+
+    async fn list_derived(
+        &self,
+        kind: &str,
+        after: Option<Hash>,
+        limit: usize,
+    ) -> Result<Vec<(Hash, Bytes)>> {
+        let lower = match after {
+            Some(a) => Bound::Excluded((kind.to_string(), a)),
+            None => Bound::Included((kind.to_string(), Hash([0; 32]))),
+        };
+        Ok(self
+            .derived
+            .lock()
+            .unwrap()
+            .range((lower, Bound::Unbounded))
+            .take_while(|((k, _), _)| k == kind)
+            .take(limit)
+            .map(|((_, key), v)| (*key, v.clone()))
+            .collect())
+    }
+
+    async fn delete_derived_kind(&self, kind: &str) -> Result<u64> {
+        let mut rows = self.derived.lock().unwrap();
+        let before = rows.len();
+        rows.retain(|(k, _), _| k != kind);
+        Ok((before - rows.len()) as u64)
     }
 
     async fn put_derived(&self, kind: &str, key: &Hash, value: Bytes) -> Result<()> {
@@ -291,6 +347,80 @@ pub async fn check_meta_store_contract(store: &dyn MetaStore) {
         &b"v"[..]
     );
     assert!(store.get_derived("other", &key).await.unwrap().is_none());
+
+    check_list_derived(store).await;
+}
+
+/// Listing derived rows pages in key order without gaps or repeats, stays
+/// within one kind, and deleting a kind removes exactly its rows.
+async fn check_list_derived(store: &dyn MetaStore) {
+    let row = |kind: &str, n: u32| {
+        (
+            Hash::of_blob(format!("{kind}/{n}").as_bytes()),
+            Bytes::from(format!("{kind}:{n}")),
+        )
+    };
+    assert!(store
+        .list_derived("ld-none", None, 10)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(store.delete_derived_kind("ld-none").await.unwrap(), 0);
+
+    let mut want_a: Vec<_> = (0..7).map(|n| row("ld-a", n)).collect();
+    for (k, v) in &want_a {
+        store.put_derived("ld-a", k, v.clone()).await.unwrap();
+    }
+    for n in 0..3 {
+        let (k, v) = row("ld-b", n);
+        store.put_derived("ld-b", &k, v).await.unwrap();
+    }
+    want_a.sort_by_key(|(k, _)| *k);
+
+    let mut got = Vec::new();
+    let mut after = None;
+    loop {
+        let page = store.list_derived("ld-a", after, 3).await.unwrap();
+        assert!(page.len() <= 3, "limit is honoured");
+        let Some((last, _)) = page.last().cloned() else {
+            break;
+        };
+        after = Some(last);
+        got.extend(page);
+    }
+    assert_eq!(got, want_a, "ascending, complete, one kind only");
+    assert!(
+        store
+            .list_derived("ld-a", Some(want_a[6].0), 10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "`after` is exclusive"
+    );
+    assert_eq!(
+        store.list_derived("ld-a", None, 100).await.unwrap().len(),
+        7
+    );
+
+    assert_eq!(store.delete_derived_kind("ld-a").await.unwrap(), 7);
+    assert!(store
+        .list_derived("ld-a", None, 100)
+        .await
+        .unwrap()
+        .is_empty());
+    for (k, _) in &want_a {
+        assert!(store.get_derived("ld-a", k).await.unwrap().is_none());
+    }
+    assert_eq!(
+        store.list_derived("ld-b", None, 100).await.unwrap().len(),
+        3
+    );
+    assert_eq!(
+        store.delete_derived_kind("ld-a").await.unwrap(),
+        0,
+        "idempotent"
+    );
+    assert_eq!(store.delete_derived_kind("ld-b").await.unwrap(), 3);
 }
 
 /// The ref log: one entry per change that happened, none for a lost or empty

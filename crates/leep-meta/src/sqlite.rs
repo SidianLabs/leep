@@ -8,7 +8,7 @@ use leep_core::{Changeset, ChangesetId, Hash, MetaStore, RefLogEntry, RefUpdateC
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 
-use crate::{decode_checked, log_entry, storage, to_id, LogRow};
+use crate::{decode_checked, log_entry, storage, to_hash, to_id, LogRow, DELETE_BATCH};
 
 const SCHEMA: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS changesets (id BLOB PRIMARY KEY, data BLOB NOT NULL)",
@@ -203,6 +203,55 @@ impl MetaStore for SqliteMetaStore {
             .await
             .map_err(storage)?;
         Ok(row.map(|r| Bytes::from(r.get::<Vec<u8>, _>(0))))
+    }
+
+    /// An empty `after` sorts below every 32-byte key, so `None` needs no
+    /// separate query; `(kind, key)` is the primary key, so this is a range scan.
+    async fn list_derived(
+        &self,
+        kind: &str,
+        after: Option<Hash>,
+        limit: usize,
+    ) -> Result<Vec<(Hash, Bytes)>> {
+        let after = after.map_or_else(Vec::new, |h| h.0.to_vec());
+        let rows = sqlx::query(
+            "SELECT key, value FROM derived WHERE kind = ? AND key > ? ORDER BY key LIMIT ?",
+        )
+        .bind(kind)
+        .bind(after)
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(storage)?;
+        rows.into_iter()
+            .map(|r| {
+                Ok((
+                    to_hash(&r.get::<Vec<u8>, _>(0))?,
+                    Bytes::from(r.get::<Vec<u8>, _>(1)),
+                ))
+            })
+            .collect()
+    }
+
+    async fn delete_derived_kind(&self, kind: &str) -> Result<u64> {
+        let mut total = 0;
+        loop {
+            let n = sqlx::query(
+                "DELETE FROM derived WHERE kind = ? AND key IN \
+                 (SELECT key FROM derived WHERE kind = ? LIMIT ?)",
+            )
+            .bind(kind)
+            .bind(kind)
+            .bind(DELETE_BATCH)
+            .execute(&self.pool)
+            .await
+            .map_err(storage)?
+            .rows_affected();
+            total += n;
+            if n == 0 {
+                return Ok(total);
+            }
+        }
     }
 
     async fn put_derived(&self, kind: &str, key: &Hash, value: Bytes) -> Result<()> {

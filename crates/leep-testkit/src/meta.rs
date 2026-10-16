@@ -106,6 +106,31 @@ impl MetaStore for FaultyMetaStore {
             .await
     }
 
+    async fn list_derived(
+        &self,
+        kind: &str,
+        after: Option<Hash>,
+        limit: usize,
+    ) -> Result<Vec<(Hash, Bytes)>> {
+        self.plan
+            .run(
+                Op::ListDerived,
+                self.inner.list_derived(kind, after, limit),
+                |_, v| v,
+            )
+            .await
+    }
+
+    async fn delete_derived_kind(&self, kind: &str) -> Result<u64> {
+        self.plan
+            .run(
+                Op::DeleteDerivedKind,
+                self.inner.delete_derived_kind(kind),
+                |_, v| v,
+            )
+            .await
+    }
+
     async fn put_derived(&self, kind: &str, key: &Hash, value: Bytes) -> Result<()> {
         self.plan
             .run(

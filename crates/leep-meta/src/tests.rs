@@ -217,6 +217,57 @@ async fn sqlite_detects_corruption() {
     ));
 }
 
+/// More rows than one delete batch, so dropping a kind takes several statements
+/// and still removes exactly that kind's rows.
+async fn check_delete_kind_spans_batches(store: &dyn MetaStore) {
+    let n = crate::DELETE_BATCH as usize * 2 + 37;
+    for i in 0..n {
+        let key = leep_core::Hash::of_blob(&(i as u64).to_be_bytes());
+        store
+            .put_derived("batch-a", &key, bytes::Bytes::from_static(b"x"))
+            .await
+            .unwrap();
+        if i < 5 {
+            store
+                .put_derived("batch-b", &key, bytes::Bytes::from_static(b"y"))
+                .await
+                .unwrap();
+        }
+    }
+    assert_eq!(
+        store.delete_derived_kind("batch-a").await.unwrap(),
+        n as u64
+    );
+    assert!(store
+        .list_derived("batch-a", None, 10)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        store
+            .list_derived("batch-b", None, 100)
+            .await
+            .unwrap()
+            .len(),
+        5
+    );
+    assert_eq!(store.delete_derived_kind("batch-b").await.unwrap(), 5);
+}
+
+#[tokio::test]
+async fn sqlite_delete_kind_spans_batches() {
+    let s = SqliteMetaStore::connect("sqlite::memory:").await.unwrap();
+    check_delete_kind_spans_batches(&s).await;
+}
+
+#[tokio::test]
+async fn postgres_delete_kind_spans_batches() {
+    let Some((s, _)) = pg_store("batches").await else {
+        return;
+    };
+    check_delete_kind_spans_batches(&s).await;
+}
+
 #[tokio::test]
 async fn open_dispatch() {
     let m = open_meta_store("mem://").await.unwrap();

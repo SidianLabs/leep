@@ -26,6 +26,8 @@ pub enum Op {
     ListRefs,
     GetDerived,
     PutDerived,
+    ListDerived,
+    DeleteDerivedKind,
 }
 
 impl Op {
@@ -34,7 +36,12 @@ impl Op {
     pub fn is_write(self) -> bool {
         matches!(
             self,
-            Op::Put | Op::Delete | Op::PutChangeset | Op::CasRef | Op::PutDerived
+            Op::Put
+                | Op::Delete
+                | Op::PutChangeset
+                | Op::CasRef
+                | Op::PutDerived
+                | Op::DeleteDerivedKind
         )
     }
 
@@ -56,6 +63,8 @@ impl Op {
         Op::ListRefs,
         Op::GetDerived,
         Op::PutDerived,
+        Op::ListDerived,
+        Op::DeleteDerivedKind,
     ];
     /// Calls that change state, blob and meta.
     pub const WRITES: &'static [Op] = &[
@@ -64,6 +73,7 @@ impl Op {
         Op::PutChangeset,
         Op::CasRef,
         Op::PutDerived,
+        Op::DeleteDerivedKind,
     ];
 }
 
