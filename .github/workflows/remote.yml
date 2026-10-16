@@ -51,7 +51,10 @@ jobs:
           printf '%s\n' "$COMMAND" | ssh -i ~/.ssh/deploy \
             -o StrictHostKeyChecking=yes -o BatchMode=yes \
             -o ServerAliveInterval=30 -o ServerAliveCountMax=6 \
-            "$USER_NAME@$HOST" 'bash -s'
+            "$USER_NAME@$HOST" \
+            'f=$(mktemp) && cat > "$f" && bash "$f" < /dev/null; rc=$?; rm -f "$f"; exit $rc'
+          # The script goes to a file first: run from stdin, a command that
+          # reads stdin (docker compose exec -T, ssh) would swallow the rest.
       - name: Remove key
         if: always()
         run: rm -f ~/.ssh/deploy
