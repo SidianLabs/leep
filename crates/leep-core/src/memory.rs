@@ -158,6 +158,11 @@ impl MetaStore for MemoryMetaStore {
         Ok(self.changesets.lock().unwrap().get(id).cloned())
     }
 
+    async fn get_changesets(&self, ids: &[ChangesetId]) -> Result<Vec<Option<Changeset>>> {
+        let all = self.changesets.lock().unwrap();
+        Ok(ids.iter().map(|id| all.get(id).cloned()).collect())
+    }
+
     async fn list_changesets(
         &self,
         after: Option<ChangesetId>,
@@ -239,6 +244,18 @@ impl MetaStore for MemoryMetaStore {
             .unwrap()
             .get(&(kind.to_string(), *key))
             .cloned())
+    }
+
+    async fn get_derived_many(&self, kind: &str, keys: &[Hash]) -> Result<Vec<Option<Bytes>>> {
+        let rows = self.derived.lock().unwrap();
+        let mut k = (kind.to_string(), Hash([0; 32]));
+        Ok(keys
+            .iter()
+            .map(|key| {
+                k.1 = *key;
+                rows.get(&k).cloned()
+            })
+            .collect())
     }
 
     async fn list_derived(
@@ -349,6 +366,95 @@ pub async fn check_meta_store_contract(store: &dyn MetaStore) {
     assert!(store.get_derived("other", &key).await.unwrap().is_none());
 
     check_list_derived(store).await;
+    check_batched_reads(store).await;
+}
+
+/// The batched reads answer exactly what the single reads do: one slot per
+/// requested id in request order, `None` for absent ids, repeats answered at
+/// every position, nothing for an empty request, and other kinds untouched.
+async fn check_batched_reads(store: &dyn MetaStore) {
+    let mut ids = Vec::new();
+    let mut want = Vec::new();
+    for n in 0..5 {
+        let cs = Changeset {
+            parents: ids.last().copied().into_iter().collect(),
+            author: "t".into(),
+            timestamp: 3000 + n,
+            message: format!("batch {n}"),
+            changes: BTreeMap::new(),
+            extra: BTreeMap::from([("k".to_string(), n.to_string())]),
+        };
+        ids.push(store.put_changeset(&cs).await.unwrap());
+        want.push(cs);
+    }
+    let absent = ChangesetId(Hash::of_blob(b"batch absent"));
+    assert!(store.get_changesets(&[]).await.unwrap().is_empty());
+    let ask = [ids[3], absent, ids[0], ids[3], ids[4], absent, ids[1]];
+    let got = store.get_changesets(&ask).await.unwrap();
+    assert_eq!(got.len(), ask.len(), "one slot per id");
+    for (id, cs) in ask.iter().zip(&got) {
+        assert_eq!(cs.as_ref(), store.get_changeset(id).await.unwrap().as_ref());
+    }
+    assert_eq!(got[0].as_ref(), Some(&want[3]));
+    assert_eq!(got[1], None);
+    assert_eq!(got[3], got[0], "a repeat is answered again");
+    assert_eq!(
+        store.get_changesets(&[absent]).await.unwrap(),
+        vec![None],
+        "only absent ids"
+    );
+
+    let key = |n: u32| Hash::of_blob(format!("batch key {n}").as_bytes());
+    for n in 0..4 {
+        store
+            .put_derived("bd-a", &key(n), Bytes::from(format!("a{n}")))
+            .await
+            .unwrap();
+    }
+    store
+        .put_derived("bd-b", &key(9), Bytes::from_static(b"b9"))
+        .await
+        .unwrap();
+    assert!(store
+        .get_derived_many("bd-a", &[])
+        .await
+        .unwrap()
+        .is_empty());
+    let ask = [key(2), key(9), key(0), key(2), key(7), key(3)];
+    let got = store.get_derived_many("bd-a", &ask).await.unwrap();
+    let want: Vec<Option<Bytes>> = vec![
+        Some(Bytes::from_static(b"a2")),
+        None,
+        Some(Bytes::from_static(b"a0")),
+        Some(Bytes::from_static(b"a2")),
+        None,
+        Some(Bytes::from_static(b"a3")),
+    ];
+    assert_eq!(got, want, "in order, absent and other-kind keys are None");
+    for (k, v) in ask.iter().zip(&got) {
+        assert_eq!(v, &store.get_derived("bd-a", k).await.unwrap());
+    }
+    assert_eq!(
+        store.get_derived_many("bd-b", &[key(9)]).await.unwrap(),
+        vec![Some(Bytes::from_static(b"b9"))]
+    );
+    // Larger than any reasonable statement parameter limit per batch.
+    let many: Vec<Hash> = (0..2500).map(|n| key(n % 6)).collect();
+    let got = store.get_derived_many("bd-a", &many).await.unwrap();
+    assert_eq!(got.len(), many.len());
+    assert!(got.iter().zip(&many).all(
+        |(v, k)| v.is_some() == (*k == key(0) || *k == key(1) || *k == key(2) || *k == key(3))
+    ));
+    let many_ids: Vec<ChangesetId> = (0..2500)
+        .map(|n| if n % 7 == 0 { absent } else { ids[n % 5] })
+        .collect();
+    let got = store.get_changesets(&many_ids).await.unwrap();
+    assert!(got
+        .iter()
+        .zip(&many_ids)
+        .all(|(cs, id)| cs.as_ref().map(Changeset::id) == (*id != absent).then_some(*id)));
+    store.delete_derived_kind("bd-a").await.unwrap();
+    store.delete_derived_kind("bd-b").await.unwrap();
 }
 
 /// Listing derived rows pages in key order without gaps or repeats, stays

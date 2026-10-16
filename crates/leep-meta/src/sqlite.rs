@@ -9,7 +9,10 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Row, SqliteConnection, SqlitePool};
 
 use crate::migrate::{self, AppliedMigration, Migration, MigrationReport, Session};
-use crate::{decode_checked, log_entry, storage, to_hash, to_id, LogRow, SchemaMode, DELETE_BATCH};
+use crate::{
+    changesets_in_order, decode_checked, log_entry, placeholders, storage, to_hash, to_id, unique,
+    values_in_order, LogRow, SchemaMode, BATCH_PARAMS, DELETE_BATCH,
+};
 
 /// The compiled migration list (ADR 0023). Append only.
 pub const MIGRATIONS: &[Migration] = &[Migration {
@@ -234,6 +237,25 @@ impl MetaStore for SqliteMetaStore {
             .transpose()
     }
 
+    /// One `IN (...)` query per [`BATCH_PARAMS`] distinct ids.
+    async fn get_changesets(&self, ids: &[ChangesetId]) -> Result<Vec<Option<Changeset>>> {
+        let keys: Vec<&[u8]> = unique(ids.iter().map(|i| i.0.as_bytes().as_slice()));
+        let mut found: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(keys.len());
+        for chunk in keys.chunks(BATCH_PARAMS) {
+            let sql = format!(
+                "SELECT id, data FROM changesets WHERE id IN ({})",
+                placeholders(chunk.len())
+            );
+            let mut q = sqlx::query(&sql);
+            for k in chunk {
+                q = q.bind(*k);
+            }
+            let rows = q.fetch_all(&self.pool).await.map_err(storage)?;
+            found.extend(rows.iter().map(|r| (r.get(0), r.get(1))));
+        }
+        changesets_in_order(ids, found.into_iter())
+    }
+
     /// An empty `after` sorts below every 32-byte id, so `None` needs no
     /// separate query.
     async fn list_changesets(
@@ -357,6 +379,25 @@ impl MetaStore for SqliteMetaStore {
             .await
             .map_err(storage)?;
         Ok(row.map(|r| Bytes::from(r.get::<Vec<u8>, _>(0))))
+    }
+
+    /// One `IN (...)` query per [`BATCH_PARAMS`] distinct keys.
+    async fn get_derived_many(&self, kind: &str, keys: &[Hash]) -> Result<Vec<Option<Bytes>>> {
+        let wanted: Vec<&[u8]> = unique(keys.iter().map(|k| k.as_bytes().as_slice()));
+        let mut found: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(wanted.len());
+        for chunk in wanted.chunks(BATCH_PARAMS) {
+            let sql = format!(
+                "SELECT key, value FROM derived WHERE kind = ? AND key IN ({})",
+                placeholders(chunk.len())
+            );
+            let mut q = sqlx::query(&sql).bind(kind);
+            for k in chunk {
+                q = q.bind(*k);
+            }
+            let rows = q.fetch_all(&self.pool).await.map_err(storage)?;
+            found.extend(rows.iter().map(|r| (r.get(0), r.get(1))));
+        }
+        Ok(values_in_order(keys, found.into_iter()))
     }
 
     /// An empty `after` sorts below every 32-byte key, so `None` needs no
