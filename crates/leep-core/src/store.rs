@@ -63,6 +63,25 @@ pub struct RefLogEntry {
     pub message: Option<String>,
 }
 
+/// One derived row to write: `(kind, key) -> value`, as in
+/// [`MetaStore::put_derived`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DerivedRow {
+    pub kind: String,
+    pub key: Hash,
+    pub value: Bytes,
+}
+
+impl DerivedRow {
+    pub fn new(kind: impl Into<String>, key: Hash, value: Bytes) -> Self {
+        Self {
+            kind: kind.into(),
+            key,
+            value,
+        }
+    }
+}
+
 /// What a blob listing reports about one stored blob.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BlobMeta {
@@ -226,6 +245,40 @@ pub trait MetaStore: Send + Sync + 'static {
     }
 
     async fn put_derived(&self, kind: &str, key: &Hash, value: Bytes) -> Result<()>;
+
+    /// [`put_derived`](Self::put_derived) for many rows in one round trip
+    /// (ADR 0031). The result is that of putting the rows one by one in
+    /// order, so a key given twice keeps its last value.
+    ///
+    /// The default makes one call per row; database backends override it with
+    /// one atomic statement or transaction. Callers must not depend on that:
+    /// after an error any prefix of the rows may be stored.
+    async fn put_derived_many(&self, rows: &[DerivedRow]) -> Result<()> {
+        for r in rows {
+            self.put_derived(&r.kind, &r.key, r.value.clone()).await?;
+        }
+        Ok(())
+    }
+
+    /// Store a changeset together with derived rows computed for it, in one
+    /// round trip (ADR 0031). Idempotent like [`put_changeset`](Self::put_changeset);
+    /// the rows are written as by [`put_derived_many`](Self::put_derived_many)
+    /// even when the changeset was already stored.
+    ///
+    /// Database backends override it with one atomic write, so the changeset
+    /// is never visible without its rows. The default writes the changeset,
+    /// then the rows in order, the order changeset creation always used: a
+    /// failure in between leaves the changeset with some rows missing, which
+    /// derivation fills in later. Callers must stay correct under either.
+    async fn put_changeset_with_derived(
+        &self,
+        cs: &Changeset,
+        rows: &[DerivedRow],
+    ) -> Result<ChangesetId> {
+        let id = self.put_changeset(cs).await?;
+        self.put_derived_many(rows).await?;
+        Ok(id)
+    }
 
     /// Version of the newest schema migration applied (ADR 0023), for
     /// diagnostics. `None` for a store without a versioned schema.
