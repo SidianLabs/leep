@@ -7,10 +7,9 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 use leep_core::BlobStore;
 use leep_derive::Repo;
-use leep_server::auth::{self, Auth, Role};
-use leep_server::limits::{Defaults as LimitDefaults, Limiter};
-use leep_server::review::{RequireReview, ReviewPolicy, ReviewService};
-use leep_server::signing::{RequireSignatures, SigningKeys};
+use leep_server::auth::{self, Role};
+use leep_server::limits::Defaults as LimitDefaults;
+use leep_server::reload::{ConfigHandle, ReloadSources, RuntimeConfig};
 use leep_store::CachedBlobStore;
 use tracing_subscriber::EnvFilter;
 
@@ -73,12 +72,12 @@ struct Args {
     /// upload; a token entry's `max_body` overrides it. Needs --tokens-file.
     #[arg(long, env = "LEEP_READ_MAX_BODY_BYTES")]
     read_max_body_bytes: Option<usize>,
-    /// JSON file of `blake3:` token digests; enables authentication. Read once
-    /// at startup.
+    /// JSON file of `blake3:` token digests; enables authentication. Read at
+    /// startup and again on SIGHUP.
     #[arg(long, env = "LEEP_TOKENS_FILE")]
     tokens_file: Option<std::path::PathBuf>,
     /// JSON file of trusted Ed25519 author keys (`ed25519:<hex>`); enables
-    /// `POST /v1/changesets/{id}/signatures`. Read once at startup.
+    /// `POST /v1/changesets/{id}/signatures`. Read at startup and on SIGHUP.
     #[arg(long, env = "LEEP_SIGNING_KEYS_FILE")]
     signing_keys_file: Option<std::path::PathBuf>,
     /// Refuse to land onto this ref unless every changeset it would add is
@@ -89,7 +88,7 @@ struct Args {
     /// JSON review policy: refs that require review and the auto-approval
     /// rules (`comment_only`, `whitespace_only`, `docs_only`). Its `refs` are
     /// protected as if listed in --require-review. Needs --tokens-file. Read
-    /// once at startup.
+    /// at startup and on SIGHUP.
     #[arg(long, env = "LEEP_REVIEW_POLICY_FILE")]
     review_policy_file: Option<std::path::PathBuf>,
     /// Refuse to land onto this ref unless every changeset it would add is
@@ -426,68 +425,21 @@ async fn main() -> anyhow::Result<()> {
         None => {}
     }
     let metrics_app = args.metrics_listen.map(|_| install_metrics()).transpose()?;
-    let auth = match &args.tokens_file {
-        Some(path) => {
-            let a = Auth::from_file(path).map_err(anyhow::Error::msg)?;
-            tracing::info!(tokens = a.len(), "authentication enabled");
-            Some(a)
-        }
-        None => {
-            tracing::warn!("authentication disabled: no --tokens-file; anyone who can reach this server can read and write");
-            None
-        }
-    };
-    let limiter = Limiter::build(
-        auth.as_ref(),
-        &LimitDefaults {
+    let config = ConfigHandle::load(ReloadSources {
+        tokens_file: args.tokens_file.clone(),
+        signing_keys_file: args.signing_keys_file.clone(),
+        review_policy_file: args.review_policy_file.clone(),
+        limit_defaults: LimitDefaults {
             rate: args.rate_limit,
             burst: args.rate_burst,
             concurrency: args.max_concurrent_per_token,
             read_max_body: args.read_max_body_bytes,
         },
-    )
-    .map_err(anyhow::Error::msg)
-    .context("request limits")?
-    .map(Arc::new);
-    if let Some(l) = &limiter {
-        tracing::info!(
-            limited_tokens = l.limited_tokens(),
-            anonymous = l.limits_anonymous(),
-            "request limits enabled"
-        );
-    }
-    let signing = match &args.signing_keys_file {
-        Some(path) => {
-            let k = SigningKeys::from_file(path).map_err(anyhow::Error::msg)?;
-            tracing::info!(keys = k.len(), "signature verification enabled");
-            Some(Arc::new(k))
-        }
-        None if !args.require_signatures.is_empty() => {
-            anyhow::bail!("--require-signatures needs --signing-keys-file")
-        }
-        None => None,
-    };
-    let policy = match &args.review_policy_file {
-        Some(path) => ReviewPolicy::from_file(path).map_err(anyhow::Error::msg)?,
-        None => ReviewPolicy::parse("{}").map_err(anyhow::Error::msg)?,
-    };
-    let mut review_refs = args.require_review.clone();
-    for r in &policy.refs {
-        if !review_refs.contains(r) {
-            review_refs.push(r.clone());
-        }
-    }
-    leep_server::check_protected_refs("--require-signatures", &args.require_signatures)
-        .map_err(anyhow::Error::msg)?;
-    leep_server::check_protected_refs("--require-review or the review policy", &review_refs)
-        .map_err(anyhow::Error::msg)?;
-    let review = match &auth {
-        Some(a) => Some(Arc::new(ReviewService::new(a.reviewers(), policy.rules))),
-        None if !review_refs.is_empty() || args.review_policy_file.is_some() => {
-            anyhow::bail!("--require-review and --review-policy-file need --tokens-file")
-        }
-        None => None,
-    };
+        require_signatures: args.require_signatures.clone(),
+        require_review: args.require_review.clone(),
+    })
+    .map_err(anyhow::Error::msg)?;
+    log_config(&config.current());
     ensure_local_dirs(&args.meta, &args.blobs)?;
 
     let mut blobs = leep_store::open_blob_store(&args.blobs).context("opening blob store")?;
@@ -499,41 +451,17 @@ async fn main() -> anyhow::Result<()> {
     if let Some(v) = meta.schema_version().await? {
         metrics::gauge!("leep_schema_version").set(v as f64);
     }
-    let mut repo = Repo::new(blobs, meta);
-    if let (Some(keys), false) = (&signing, args.require_signatures.is_empty()) {
-        tracing::info!(refs = ?args.require_signatures, "signatures required to land");
-        repo = repo.with_land_policy(Arc::new(RequireSignatures::new(
-            keys.clone(),
-            args.require_signatures.clone(),
-        )));
-    }
-    if let (Some(service), false) = (&review, review_refs.is_empty()) {
-        tracing::info!(refs = ?review_refs, "review required to land");
-        repo = repo.with_land_policy(Arc::new(RequireReview::new(
-            service.clone(),
-            review_refs.clone(),
-        )));
-    }
-    for name in args.require_signatures.iter().chain(&review_refs) {
-        if repo.meta().get_ref(name).await?.is_none() {
-            tracing::warn!(
-                name = %name,
-                "protected ref does not exist yet; check the name if it should"
-            );
-        }
-    }
+    // The land policy comes from the reloadable config, not from the repo.
+    let repo = Repo::new(blobs, meta);
+    leep_server::reload::warn_missing_refs(repo.meta().as_ref(), &config.current()).await;
     if args.request_timeout.is_zero() {
         tracing::warn!("request timeout disabled: gc --fence cannot be guaranteed safe");
     }
-    let app = leep_server::router_with_limits(
-        repo,
-        args.max_body_bytes,
-        auth,
-        signing,
-        review,
-        args.request_timeout,
-        limiter,
-    );
+    #[cfg(unix)]
+    leep_server::reload::spawn_sighup_reload(config.clone(), repo.meta().clone())
+        .context("installing the SIGHUP handler")?;
+    let app =
+        leep_server::router_with_config(repo, args.max_body_bytes, args.request_timeout, config);
 
     let listener = tokio::net::TcpListener::bind(args.listen)
         .await
@@ -552,6 +480,27 @@ async fn main() -> anyhow::Result<()> {
     }
     leep_server::serve(listener, app, shutdown_signal()).await?;
     Ok(())
+}
+
+/// The startup summary of what the files configured. Counts only.
+fn log_config(c: &RuntimeConfig) {
+    match &c.auth {
+        Some(a) => tracing::info!(tokens = a.len(), "authentication enabled"),
+        None => tracing::warn!("authentication disabled: no --tokens-file; anyone who can reach this server can read and write"),
+    }
+    if let Some(l) = &c.limiter {
+        tracing::info!(
+            limited_tokens = l.limited_tokens(),
+            anonymous = l.limits_anonymous(),
+            "request limits enabled"
+        );
+    }
+    if let Some(k) = &c.signing {
+        tracing::info!(keys = k.len(), "signature verification enabled");
+    }
+    if !c.protected_refs().is_empty() {
+        tracing::info!(refs = ?c.protected_refs(), "land policy protects refs");
+    }
 }
 
 /// Lets the cache wrap an already-boxed store.
