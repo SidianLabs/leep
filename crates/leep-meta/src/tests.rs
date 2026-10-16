@@ -69,8 +69,10 @@ async fn check_ref_log_race(store: Arc<dyn MetaStore>) {
             let mut losses = 0;
             while wins < 2 {
                 let cur = store.get_ref("race").await.unwrap();
+                // Ids must not repeat across tasks: a CAS to the value the
+                // ref already holds succeeds without a log entry.
                 let id = store
-                    .put_changeset(&cs(1000 + i * 10 + wins + losses))
+                    .put_changeset(&cs(1000 + i * 1_000_000 + wins + losses))
                     .await
                     .unwrap();
                 if store
