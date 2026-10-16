@@ -284,6 +284,19 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   history, blame, search, the ref log and a fresh checkout (SQLite, Postgres,
   and across the two). `docs/OPERATIONS.md`, "Backup and restore", has the
   procedure, the scheduled drill, RPO and RTO notes and alerts.
+- `docs/RUNBOOKS.md`: a runbook for every alert in `docs/OPERATIONS.md` (meaning
+  and urgency, impact, diagnosis with real commands and log lines, likely causes,
+  safe fixes and what not to do, what to collect for a bug report). The suggested
+  alert rules now carry a `severity` label and a `runbook_url`, the backup alerts
+  are named rules (`LeepBackupStale`, `LeepBackupCheckFailed`, `LeepBackupSlow`),
+  and new rules cover a server that cannot be scraped, request timeouts, broad
+  throttling, lost land compare-and-swaps, schema and version skew, the weekly
+  `backup-verify`, the restore drill, GC and disk space. `LeepLandErrors` now
+  counts HTTP 5xx on the land route (the `error` outcome of `leep_land_total`
+  also counts refused lands), and the land and backup rules no longer miss the
+  first event of a counter or a backup that never succeeded.
+  `scripts/check-runbooks.sh`, run in CI, fails when an alert and its runbook
+  do not match.
 
 ### Fixes
 - Processes opening a new SQLite metadata file at the same moment (servers

@@ -15,6 +15,7 @@ Status: early development (v0.1).
 - [Roadmap](docs/ROADMAP.md)
 - [Deploying with Docker](docs/DEPLOY.md)
 - [Operating: logs and metrics](docs/OPERATIONS.md)
+- [Runbooks: what to do when an alert fires](docs/RUNBOOKS.md)
 - [Using Leep from AI agents (MCP)](docs/MCP.md)
 - [Contributing](CONTRIBUTING.md) and the [agent guide](CLAUDE.md)
 

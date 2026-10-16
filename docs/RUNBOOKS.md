@@ -1,0 +1,1272 @@
+# Runbooks
+
+One runbook for every alert in [OPERATIONS.md](OPERATIONS.md#suggested-alerts).
+Each alert's `runbook_url` annotation points at its section here; the anchor is
+the alert name in lower case (`#leeplandexhausted`). `scripts/check-runbooks.sh`
+fails CI when an alert has no section or a section has no alert, so the two
+cannot drift apart.
+
+Every runbook has the same parts:
+
+- **Meaning**: what fired, and whether it is a *page* (wake someone) or a
+  *ticket* (fix in working hours). The rule's `severity` label says the same.
+- **Impact**: what users and agents experience.
+- **Diagnose**: commands, queries and the log lines to look for.
+- **Likely causes**, most likely first, each with how to confirm it.
+- **Mitigate / fix**, in the safe order, with what not to do.
+- **Escalate / collect**: what to attach to a bug report.
+
+Read [Before you start](#before-you-start) once; it holds the rules that apply to
+every runbook.
+
+## Alert index
+
+| Alert | Severity | Fires when |
+|---|---|---|
+| [LeepServerDown](#leepserverdown) | page | a server's metrics endpoint has not been scrapable for 2 minutes |
+| [LeepServerErrors](#leepservererrors) | page | more than 1% of requests answer 5xx for 5 minutes |
+| [LeepLandErrors](#leeplanderrors) | page | `POST /v1/land` answered 5xx in the last 10 minutes |
+| [LeepLandExhausted](#leeplandexhausted) | ticket | a land lost the ref compare-and-swap on all 32 attempts |
+| [LeepLandCasLossesHigh](#leeplandcaslosseshigh) | ticket | more than one lost compare-and-swap per land, for 15 minutes |
+| [LeepLandSlowP99](#leeplandslowp99) | ticket | land p99 latency above 5 seconds for 10 minutes |
+| [LeepRequestTimeouts](#leeprequesttimeouts) | ticket | more than 5 requests hit `--request-timeout` (408) in 15 minutes |
+| [LeepTokenThrottled](#leeptokenthrottled) | ticket | one token has been limited steadily for 15 minutes |
+| [LeepBroadThrottling](#leepbroadthrottling) | ticket | more than 5% of all requests are 429 for 15 minutes |
+| [LeepBlobCacheColdHitRatio](#leepblobcachecoldhitratio) | ticket | blob cache hit ratio below 50% for 30 minutes |
+| [LeepConfigReloadFailed](#leepconfigreloadfailed) | page | a SIGHUP reload was refused |
+| [LeepConfigGenerationSkew](#leepconfiggenerationskew) | ticket | servers report different config generations for 15 minutes |
+| [LeepSchemaVersionSkew](#leepschemaversionskew) | ticket | servers report different schema versions for 1 hour |
+| [LeepMixedVersions](#leepmixedversions) | ticket | servers report different `version` for 2 hours |
+| [LeepBackupStale](#leepbackupstale) | ticket | no backup has passed its check for 2 days (or ever) |
+| [LeepBackupCheckFailed](#leepbackupcheckfailed) | ticket | the newest backup is sealed but did not pass its check |
+| [LeepBackupSlow](#leepbackupslow) | ticket | backup duration is growing week on week |
+| [LeepBackupVerifyFailed](#leepbackupverifyfailed) | ticket | the weekly `backup-verify` failed or has not passed in 9 days |
+| [LeepRestoreDrillOverdue](#leeprestoredrilloverdue) | ticket | no passing restore drill in 35 days |
+| [LeepGcStale](#leepgcstale) | ticket | `leep-server gc` has not succeeded in 3 days |
+| [LeepDiskSpaceLow](#leepdiskspacelow) | ticket | a Leep data or backup filesystem has under 10% free |
+
+The last four rows depend on things Leep does not export itself: wrapper
+metrics from [Cron wrappers](#cron-wrappers) and node_exporter's filesystem
+metrics. Leep has no GC or disk metrics of its own.
+
+## Before you start
+
+**Rules that hold in every runbook.**
+
+- **Refs move only by compare-and-swap.** Never edit the `refs` or `ref_log`
+  tables by hand. To put a ref back, use `leep undo REF` (a client-side CAS
+  against the ref log, ADR 0018). On a ref covered by `--require-signatures` or
+  review, `undo` of a land is refused with 400 and the CLI tells you to
+  `leep revert` the change and land the revert. `leep reflog REF -n 50` shows
+  who moved it, when and from what.
+- **Never run `leep-server gc --unsafe-no-fence` while any server is running**,
+  and never give `gc` a `--fence` shorter than the servers' `--request-timeout`
+  plus clock skew (ADR 0012). A fence that is too short is silent data loss: a
+  stored changeset pointing at a deleted blob.
+- **Never edit an applied migration or the `schema_migrations` table**, and
+  never point an older binary at a migrated database. The only way back from a
+  migration is restoring the backup taken before it (ADR 0023).
+- **Never delete blob files, tree nodes or `derived` rows by hand.** Unreferenced
+  blobs go through `gc`; derived rows go through `repair drop` or `repair
+  rederive`. A reachable blob that is gone is recoverable only from backup.
+- **Never restore over live stores.** `restore` goes into new, empty stores
+  (`--force` deletes what is there and is only for stores no server uses).
+- **A killed server is not damaged.** SIGKILL, OOM kills and host crashes are
+  covered by the failure model (ARCHITECTURE.md, section 9): restarting is
+  always safe.
+- Take a backup before any step that cannot be undone, and check it with
+  `backup-verify`.
+
+**Running `leep-server`.** The offline subcommands (`verify`, `repair`, `gc`,
+`migrate`, `backup`, `restore`, `backup-verify`) open the stores directly with
+the same `--meta`/`--blobs` (`LEEP_META`/`LEEP_BLOBS`) as the servers. The
+runbooks write `leep-server SUBCOMMAND`; run it as:
+
+```sh
+leep-server SUBCOMMAND ...                                                   # a host, with the server's environment
+docker compose -f deploy/docker-compose.yml run --rm leep-server SUBCOMMAND ...   # the compose stack
+docker run --rm -v leep-data:/var/lib/leep leep:dev SUBCOMMAND ...           # the single container
+```
+
+Most of them are safe beside running servers (`verify`, `gc`, `repair`,
+`backup`, `backup-verify`, `derive-search`, `migrate --status`). `restore` is the
+one that is not, and it refuses a non-empty target.
+
+**Logs.** Every request logs one INFO line, `request completed`, with `status`
+and `latency_ms` in the `request` span (`method`, `route`). A 5xx also logs an
+ERROR, `request failed`, with the error text in the `error` field. With
+`--log-format json`:
+
+```sh
+docker compose -f deploy/docker-compose.yml logs --since 30m leep-server \
+  | jq -r 'select(.fields.message=="request failed") | .fields.error' | sort | uniq -c | sort -rn
+```
+
+The request line carries no token name. Token names appear in the DEBUG
+authentication span and in `request limited` DEBUG lines (`RUST_LOG=leep_server=debug`),
+which needs a restart because `RUST_LOG` is read at startup. The reason for a 429
+or 413 is logged at DEBUG only; the INFO `request completed` line still shows its
+status.
+
+**Metrics.** Scrape `GET /metrics` on `--metrics-listen` (private port; the
+compose stack does not enable it). To look at one server by hand:
+`curl -s http://127.0.0.1:9187/metrics | grep '^leep_'`. Queries below use
+Prometheus syntax; add `by (instance)` to see one server.
+
+**Health check.** `GET /v1/health` answers `"ok"` whenever the process is
+serving HTTP. It does not touch the metadata or blob store, so an `"ok"` with
+failing requests means a store problem, not a dead server.
+
+## Collecting a bug report
+
+Attach what applies, with secrets removed. The server never logs tokens or
+digests, but `LEEP_META` may hold a database password: redact it.
+
+1. Versions: `leep-server --version` on every instance, the image digest (two
+   builds can share a version string, see [LeepMixedVersions](#leepmixedversions)),
+   and `leep-server migrate --status`.
+2. The alert's expression graphed for the hour around the event, and a raw
+   `curl -s .../metrics` from each instance taken while the problem lasted.
+3. Server logs for 15 minutes either side, in JSON, at least the WARN and ERROR
+   lines and the `request completed` lines for the routes involved.
+4. `leep-server verify --json > verify.json` (sample mode is cheap; add
+   `--full` if you can wait). Exit status 0 clean, 1 problems, 2 could not run.
+5. For anything that moved a ref: `leep reflog REF -n 200` and the changeset
+   ids involved.
+6. The flags and environment the servers run with (tokens, keys and policy
+   files are not needed; their names and mounts are), the metadata backend
+   (SQLite or Postgres and its version) and the blob backend (directory or S3).
+7. For backup problems: the backup's output (`--json` for the report), the
+   `manifest.json` of the newest snapshot, and `ls -l` of `snapshots/`.
+8. What changed in the last day: deploys, config edits, new agents, a restore,
+   a migration, a store maintenance job.
+
+Never attach the tokens file, signing keys file, backup directory or database
+dump: they hold repository content and credentials.
+
+## LeepServerDown
+
+**Meaning.** Prometheus could not scrape a server's `/metrics` for 2 minutes
+(`up == 0`). **Page.** It means the process is gone, hung or unreachable, or that
+only its metrics listener died while the API still serves. Replace
+`job="leep"` in the rule with your scrape job's name.
+
+**Impact.** If the process is down, requests to that instance fail (the CLI
+reports a network error and exits 2) and the other instances behind the
+balancer carry the load. With one instance it is a full outage. Nothing is
+corrupted: servers keep no durable state of their own.
+
+**Diagnose.**
+
+1. Is the API up? `curl -fsS http://HOST:7070/v1/health` should print `"ok"`.
+   API up and metrics down points at the metrics listener or the network path
+   to it (step 4); API down points at the process (steps 2 and 3).
+2. Is the process running, and why did it stop? `docker compose -f
+   deploy/docker-compose.yml ps`, `docker inspect -f '{{.State.OOMKilled}}
+   {{.State.ExitCode}}' CONTAINER`, `systemctl status leep`. A container that
+   restarts repeatedly (`restart: unless-stopped`) is a crash loop: read the last
+   lines of its log.
+3. Read the log around the last start. A normal stop logs `shutting down`
+   (SIGTERM or SIGINT). A startup refusal prints `Error:` and a cause, for
+   example:
+   - `binding 0.0.0.0:7070` (port in use or no permission) or `binding metrics
+     ADDR`;
+   - `opening meta store` or `opening blob store` with the store's error (wrong
+     URL, database down, bucket missing, credentials);
+   - `database schema v3 is newer than this server (max v2); upgrade the server`;
+   - `1 schema migration(s) pending (database is at v1, this server needs v2,
+     first pending v2); run leep-server migrate, or start without --no-migrate`
+     (only with `--no-migrate` / `LEEP_NO_MIGRATE=1`);
+   - `migration v2 (name) differs from the one applied to this database ...;
+     applied migrations are immutable`;
+   - a config file error naming the file (`tokens file /etc/leep/tokens.json:
+     bad JSON: ...`).
+4. Metrics listener only: `ERROR metrics listener stopped` in the log; check
+   that `LEEP_METRICS_LISTEN` is set (the compose stack does not set it), that
+   the address is reachable from Prometheus, and `ss -ltnp | grep 9187`.
+5. Out of memory: `dmesg -T | grep -i 'killed process'`. The blob cache is
+   `--cache-bytes` (default 256 MiB), and request bodies are read whole, up to
+   `--max-body-bytes` (default 512 MiB) each, so a few large concurrent uploads
+   add to the cache.
+
+**Likely causes.**
+
+1. A deploy or config change that the server refuses to start with (step 3).
+   Confirm: the log shows `Error:` right after the change.
+2. Out of memory (step 5): `OOMKilled=true` or a `dmesg` line. Confirm: memory
+   graph rising to the container limit before the stop.
+3. Host, network or orchestrator failure. Confirm: other services on the host are
+   down too, or the API health check fails from outside only.
+4. The metrics listener is not reachable (firewall, wrong interface) while the
+   API is fine. Confirm: step 1 answers and `curl` to the metrics port fails.
+5. A hung process that still holds its port. Confirm: the port accepts
+   connections but neither `/v1/health` nor `/metrics` answers; the store may be
+   stalled (see [LeepServerErrors](#leepservererrors)).
+
+**Mitigate / fix.**
+
+- Restart the instance. It is always safe, whatever killed it.
+- Fix a refusal by its cause. For `newer than this server`, deploy the newer
+  binary; do not edit the database, and do not remove `--no-migrate` to make a
+  server start on a schema it does not understand (it refuses regardless).
+  For a pending migration, run `leep-server migrate` (after a backup), see
+  [Upgrading](OPERATIONS.md#upgrading).
+- For OOM, lower `--cache-bytes`, give the container more memory, or cap
+  `--max-body-bytes`; do not disable the request timeout.
+- With several instances, drain the dead one from the balancer first.
+
+**Escalate / collect.** Exit code and `OOMKilled`, the log from before the stop to
+the failed restart, `dmesg` lines, the `leep-server --version`, and the
+[standard bundle](#collecting-a-bug-report).
+
+## LeepServerErrors
+
+**Meaning.** More than 1% of HTTP requests answered 5xx for 5 minutes. **Page.**
+Leep returns 500 only when a store call or an internal step fails
+(`Storage`, `Encoding` and `Other` errors); user mistakes are 400, 404 and 409,
+and neither those nor 408 and 429 count here. `GET /v1/health` is in the
+denominator, so a busy probe dilutes the ratio.
+
+**Impact.** Agents see failed commits, lands and reads; the CLI prints the
+server's message and exits 2. Writes are idempotent, so retrying is safe, but
+retries will keep failing until the cause is fixed.
+
+**Diagnose.**
+
+1. Where: `sum by (route, status) (rate(leep_http_requests_total{status=~"5.."}[5m]))`.
+   One route points at a derived-data or content problem; every route points at
+   a store.
+2. Which error: group the `request failed` lines (see
+   [Before you start](#before-you-start)). The text after `error` is the
+   `leep_core::Error`: `storage error: ...` for stores, for example
+   `storage error: corrupt tree node HASH`, `storage error: corrupt history node HASH`
+   or `storage error: corrupt changeset row HEX`. Database and disk errors are
+   the driver's or the OS's words: `pool timed out while waiting for an open
+   connection` (Postgres pool of 16 connections per server exhausted),
+   `database is locked` (SQLite, after its 30 s busy timeout), `database or disk is
+   full`, `No space left on device`, connection refused or reset, S3 errors.
+3. Are the stores healthy? Postgres: `pg_isready`, `SELECT count(*) FROM
+   pg_stat_activity` against `max_connections`, locks and long transactions.
+   SQLite: the file is on local disk (WAL needs it), disk has space. Blobs:
+   `df -h` and permissions on the directory, bucket reachability and
+   credentials.
+4. Are latencies up too? `histogram_quantile(0.99, sum by (le, route)
+   (rate(leep_http_request_duration_seconds_bucket[5m])))`.
+5. Damage: `leep-server verify` (read-only, safe beside servers).
+
+**Likely causes.**
+
+1. The metadata store is down, overloaded or out of connections. Confirm: errors
+   on every route, step 2 shows connection or pool errors, step 3 agrees.
+2. The disk holding SQLite, the blob directory or Postgres is full. Confirm:
+   `df -h`, see [LeepDiskSpaceLow](#leepdiskspacelow).
+3. The blob store is failing (S3 outage, credentials expired, mount gone).
+   Confirm: errors mention the object store or the file path; reads and writes of
+   blobs fail while metadata-only routes work.
+4. A damaged tree node, history node or changeset row after a disk problem or bad
+   restore. Confirm: 5xx on specific routes and refs only, `corrupt ...` errors,
+   and `verify` reports `corrupt_tree`, `corrupt_history_node` or similar.
+5. A bad deploy. Confirm: the rise starts at the deploy and ERROR messages are
+   new.
+
+**Mitigate / fix.**
+
+- Fix the store, then do nothing to Leep: servers reconnect on their own and
+  clients retry. A 5xx never leaves partial mutable state (ARCHITECTURE.md,
+  section 9).
+- For damage, follow [Verify and repair](OPERATIONS.md#verify-and-repair): fix
+  history, trees and blobs first, derived rows after, with `repair rederive`.
+- Roll back a bad deploy of the binary only if the schema did not change
+  (`leep-server migrate --status`); otherwise roll forward.
+- Do not run `gc`, `repair drop` or `restore --force` as a fix for 5xx.
+
+**Escalate / collect.** The grouped error text, the per-route 5xx graph, store
+health output, `verify --json`, and the [standard bundle](#collecting-a-bug-report).
+
+## LeepLandErrors
+
+**Meaning.** `POST /v1/land` answered 5xx at least once in 10 minutes: a store
+failed while landing. **Page.** The rule counts HTTP 5xx on the land route, not
+`leep_land_total{outcome="error"}`: that outcome counts every failed land except
+a lost race, including refused lands (400: unsigned or unreviewed changeset, tag
+ref, bad ref name) and unknown changesets (404), which are the caller's
+doing and would page on every policy refusal.
+
+**Impact.** The agent's land fails (CLI exit 2). `land` already retries a failed
+commit from a fresh read up to three times in a row before it gives up, and the
+commit that failed may or may not have applied.
+
+**Diagnose.**
+
+1. `request failed` ERROR lines around the time, see
+   [LeepServerErrors](#leepservererrors) for what the text means.
+2. Did the land actually apply? `leep reflog main -n 20` (a `land` entry by the
+   token) and `leep log main -n 20`. A repeated land finds its earlier result and
+   reports it, so repeating is safe; the one exception is a retry after more than
+   1024 changesets landed in between (ADR 0021), where a duplicate stack is
+   possible: look at the log first when in doubt.
+3. Whether other routes fail too: if so, it is [LeepServerErrors](#leepservererrors).
+   If only land fails, suspect a damaged object on the replay path (`corrupt tree
+   node`, `corrupt changeset row`) and run `leep-server verify`.
+4. The breakdown of outcomes: `sum by (outcome) (increase(leep_land_total[1h]))`
+   against `sum by (status) (increase(leep_http_requests_total{route="/v1/land"}[1h]))`.
+
+**Likely causes.**
+
+1. The metadata store is failing (connections, locks, disk). Confirm: step 3, and
+   store health as in [LeepServerErrors](#leepservererrors).
+2. Disk full on the metadata or blob volume. Confirm: `df -h`, `No space left on
+   device` or `database or disk is full` in the error text.
+3. A damaged tree node or changeset row on the ref being landed on. Confirm:
+   `corrupt ...` in the error and `verify` problems.
+4. A blob store error while the server writes tree nodes or merge results.
+   Confirm: errors name the object store.
+
+**Mitigate / fix.**
+
+- Fix the store; agents retry and `land` resolves ambiguous commits itself.
+- If a land is reported failed but the log shows it landed, nothing to do. If it
+  landed wrongly, `leep undo main` (unprotected refs) or `leep revert` plus a land
+  (protected refs). Never edit the ref.
+- Do not retry in a tight loop while the store is down; the CLI does not retry
+  writes, so restart the agent step after the fix.
+
+**Escalate / collect.** Error text, `leep reflog` and `leep log` for the ref,
+`verify --json`, land metrics for the hour, and the
+[standard bundle](#collecting-a-bug-report).
+
+## LeepLandExhausted
+
+**Meaning.** A land lost the ref compare-and-swap on all 32 attempts
+(`leep_land_total{outcome="exhausted"}`). **Ticket**; page if it repeats for
+half an hour. The client got HTTP 409 with `conflict: land onto "main" lost the
+race 32 times; retry`. The rule also catches the first event of a series that
+did not exist before (a counter that first appears at 1 has no earlier sample,
+so `increase()` alone would report 0).
+
+**Impact.** The agent's land fails with a 409 (CLI exit 1) and must be repeated;
+nothing is half done. Retrying is safe.
+
+**Diagnose.**
+
+1. Lands within one server process are serialized per ref, so CAS losses come
+   from other processes writing the same ref: other `leep-server` instances,
+   `leep-git import`, or clients using raw `POST /v1/refs/{name}`. Check how many
+   instances take land traffic.
+2. Who moves the ref: `leep reflog main -n 100`. The actor is the token name and
+   the operation is `land`, `undo`, `import` or the client's own label (default
+   `cas`). A burst of non-land entries is a raw-CAS loop.
+3. Contention: `sum(rate(leep_land_cas_losses_total[10m]))` per instance,
+   `histogram_quantile(0.99, sum by (le) (rate(leep_land_attempts_bucket[10m])))`,
+   and `sum(rate(leep_land_attempts_sum[10m])) / sum(rate(leep_land_attempts_count[10m]))`
+   (mean attempts per land).
+4. Slowness that widens the race window: land p99 and
+   [store health](#leepservererrors). Each loss waits a random backoff of at most
+   200 ms.
+
+**Likely causes.**
+
+1. Many instances landing on one hot ref at once under heavy agent load. Confirm:
+   losses on several instances, lock wait small compared with land duration
+   (`leep_land_lock_wait_seconds`).
+2. A raw-CAS writer or importer in a loop. Confirm: step 2.
+3. A slow metadata store, so the head moves between a land's read and its swap.
+   Confirm: land and request latencies up on all routes.
+4. Very long unlanded stacks, whose replay takes long enough for the head to move.
+   Confirm: `leep_land_duration_seconds` and `leep_derive_duration_seconds` high.
+
+**Mitigate / fix.**
+
+- Agents repeat the land (`leep sync`, then `leep land`).
+- Send `POST /v1/land` to a single instance (route by path at the balancer): one
+  process serializes per ref, which removes cross-process losses.
+- Find the looping writer by actor name; stop the agent, or revoke its token (edit
+  the tokens file, then SIGHUP, see [DEPLOY.md](DEPLOY.md#reloading-config)).
+- Ask agents to land smaller stacks and sync more often.
+- Do not edit refs, and do not restart servers to "clear" it: there is nothing to
+  clear. The 32-attempt bound is compiled in.
+
+**Escalate / collect.** `leep reflog` excerpt (100 entries), the per-instance
+attempts and CAS-loss graphs, the number of instances, which clients write the
+ref, and the [standard bundle](#collecting-a-bug-report).
+
+## LeepLandCasLossesHigh
+
+**Meaning.** Over 15 minutes, on average more than one lost ref compare-and-swap
+per land (`leep_land_cas_losses_total` against `leep_land_total`), sustained for
+15 minutes. **Ticket.** It is the early warning for
+[LeepLandExhausted](#leeplandexhausted): one process never loses to itself, so
+losses are other writers of the same ref.
+
+**Impact.** Lands take more attempts and longer (each loss adds up to 200 ms of
+backoff and a replay); the land p99 rises. Nothing fails until a land loses 32
+times in a row.
+
+**Diagnose.** Same as [LeepLandExhausted](#leeplandexhausted), steps 1 to 4.
+Compare `sum by (instance) (rate(leep_land_cas_losses_total[15m]))`: losses on
+every instance mean all of them are racing each other; losses on one point at
+something that writes through it. With a single server instance, losses should
+be near zero, so a rate there means a raw-CAS or import writer.
+
+**Likely causes.** As in LeepLandExhausted: several instances on a hot ref, a raw
+writer in a loop, a slow metadata store.
+
+**Mitigate / fix.** As in LeepLandExhausted. Rule of thumb for deciding to act: the
+ratio is still below one when agents are merely busy; above it for hours means
+the topology (several instances landing on one ref) no longer fits the load.
+Do not add instances to speed up lands on one ref: they add cross-process
+losses.
+
+**Escalate / collect.** As in LeepLandExhausted.
+
+## LeepLandSlowP99
+
+**Meaning.** The 99th percentile of the whole land call, including the wait for
+the per-ref lock, has been above 5 seconds for 10 minutes. **Ticket.** The
+histogram tops out at 10 s, so very slow lands read as 10 s.
+
+**Impact.** Agents wait; lands to one ref queue behind each other in the server,
+so the latency of the busiest ref grows with the number of agents landing on it.
+
+**Diagnose.**
+
+1. Queueing or work? Mean lock wait against mean duration:
+   `sum(rate(leep_land_lock_wait_seconds_sum[10m])) / sum(rate(leep_land_lock_wait_seconds_count[10m]))`
+   and the same for `leep_land_duration_seconds`. If the wait is most of the
+   latency, the offered load exceeds what one ref can serialize (about 6 lands per
+   second on the 4 vCPU machine in [PERFORMANCE.md](PERFORMANCE.md), see the soak
+   notes in [OPERATIONS.md](OPERATIONS.md#soak-tests)).
+2. Offered load: `sum(rate(leep_land_total[5m]))`.
+3. Retries: mean attempts per land (see
+   [LeepLandExhausted](#leeplandexhausted)); above 1 means CAS contention.
+4. Cold derived data: `sum by (kind) (rate(leep_derive_total[5m]))` high and
+   `leep_derive_duration_seconds` by kind. Derived rows are computed on first use;
+   after a restore or a `repair drop` the first land or query derives a whole
+   history.
+5. Store latency: [LeepServerErrors](#leepservererrors), step 3.
+
+**Likely causes.**
+
+1. More landing agents than one ref can serialize. Confirm: step 1.
+2. Agents landing stacks that are far behind main: a land costs more the further
+   behind its stack is (replay). Confirm: durations grow with stack age, not with
+   count.
+3. A slow metadata or blob store. Confirm: all routes slow.
+4. Derived data being rebuilt after a restore, `repair drop` or a very large
+   import. Confirm: step 4.
+5. CAS contention between instances. Confirm: step 3.
+
+**Mitigate / fix.**
+
+- Warm derived data instead of waiting for users: `leep-server repair rederive --kind
+  all` (safe beside servers), and `leep-server derive-search main` for search.
+- Ask agents to `leep sync` more often so stacks stay short; lengthen the agents'
+  think time or reduce how many land on one ref.
+- Scale or tune the metadata store.
+- Do not add server instances to parallelize lands on one ref: lands are only
+  serialized within a process, so more instances mean more lost swaps.
+
+**Escalate / collect.** Land duration and lock-wait histograms, derive rates by
+kind, lands per second, and the [standard bundle](#collecting-a-bug-report).
+
+## LeepRequestTimeouts
+
+**Meaning.** More than 5 requests were aborted with 408 by `--request-timeout`
+(default 5 minutes) within 15 minutes. **Ticket.** A timed-out request stops and
+writes nothing further, but a statement already sent to Postgres can still commit
+shortly afterwards (ADR 0012).
+
+**Impact.** Those requests fail (CLI exit 2). Repeating is safe, but if the cause
+is structural (an upload that can never finish in time) it fails again.
+
+**Diagnose.**
+
+1. Which routes: `sum by (route) (increase(leep_http_requests_total{status="408"}[1h]))`.
+2. Latency of those routes: `histogram_quantile(0.99, sum by (le, route)
+   (rate(leep_http_request_duration_seconds_bucket[10m])))`. The histogram measures
+   until the response head is ready, not the body stream.
+3. Uploads: `PUT /v1/blobs/{hash}` and `POST /v1/changesets` timing out means big
+   blobs on slow links. Searches: `/v1/search/{rev}` timing out on a never-indexed
+   tree means the index is deriving (about a second per 20 000 files on in-memory
+   stores, longer on real ones).
+4. Saturation: `sum(leep_requests_in_flight)` and
+   [LeepTokenThrottled](#leeptokenthrottled).
+5. The current setting: the server's `--request-timeout` / `LEEP_REQUEST_TIMEOUT`,
+   and the `--fence` your GC runs with.
+
+**Likely causes.**
+
+1. Large uploads over a slow link. Confirm: step 3, a `PUT /v1/blobs/{hash}`
+   route, and a handful of clients.
+2. A slow blob or metadata store. Confirm: all routes slow.
+3. A cold search index or history index. Confirm: `/v1/search/{rev}` or `/v1/log/{id}`
+   routes, and `leep_search_total{indexed="false"}`/`leep_derive_total` rising.
+4. A paused or overloaded host. Confirm: CPU steal, swapping, or a VM freeze (a
+   server paused longer than the timeout can resume a request after its deadline).
+
+**Mitigate / fix.**
+
+- For legitimate big uploads, raise `--request-timeout` **and** `--fence` of every
+  `gc` job together: the fence must exceed the request timeout plus clock skew
+  plus a margin. A timeout that reaches the fence makes GC unsafe. Never set
+  `--request-timeout 0` on servers that GC runs beside (the server warns
+  `request timeout disabled: gc --fence cannot be guaranteed safe`).
+- Warm indexes before an agent swarm starts: `leep-server derive-search main`,
+  `leep-server repair rederive --kind all`.
+- Fix the slow store, see [LeepServerErrors](#leepservererrors).
+- After a long VM freeze, restart the servers.
+
+**Escalate / collect.** Routes and latency graphs, the server flags, the GC
+command lines, and the [standard bundle](#collecting-a-bug-report).
+
+## LeepTokenThrottled
+
+**Meaning.** One token (or `anonymous`) is refused by a request limit at more than
+0.5 requests per second for 15 minutes, per `reason`: `rate`, `concurrency` or
+`size`. **Ticket.** Either an agent is stuck in a retry loop or its limit is too low
+for legitimate use.
+
+**Impact.** That token's requests get 429 with `Retry-After` (`rate limit
+exceeded; retry after Ns`, `too many concurrent requests; retry after 1s`) or 413
+(`request body exceeds the limit of N bytes for this token`). The CLI retries a
+throttled GET up to four tries, waiting no more than 10 seconds each; writes
+(commit, land) fail at once. Other tokens are unaffected, which is the point of the
+limits.
+
+**Diagnose.**
+
+1. Who and why: `topk(5, sum by (token, reason) (rate(leep_requests_limited_total[10m])))`.
+2. Is it a loop or real work? `leep_requests_in_flight{token="NAME"}` against its
+   concurrency limit, and the request rate of the whole fleet. A flat, high refusal
+   rate with no change in real work is a loop. Enable `RUST_LOG=leep_server=debug`
+   (restart needed) to see `request limited` lines with the token and reason, and
+   the routes the token hits.
+3. `reason="concurrency"` with a low request rate means slow requests are holding
+   slots: look at route latencies before raising the cap.
+   `reason="size"` is almost always a client bug (a read token uploading).
+4. Anonymous mode: `token="anonymous"` is every client address when there is no
+   tokens file, and behind a proxy it is a single bucket for everybody
+   ([DEPLOY.md](DEPLOY.md#request-limits)).
+5. Limits are per server process: with N servers, each applies the whole limit.
+
+**Likely causes.**
+
+1. A runaway agent retrying. Confirm: step 2.
+2. A limit set too low for a legitimate workload, such as a CI or merge bot sharing
+   the default. Confirm: the token's work is real and steady.
+3. Slow requests holding concurrency slots (`reason="concurrency"`). Confirm: step 3.
+4. Anonymous mode behind a proxy. Confirm: step 4.
+5. A recent change to the defaults (`LEEP_RATE_LIMIT`, `LEEP_RATE_BURST`,
+   `LEEP_MAX_CONCURRENT_PER_TOKEN`). Confirm: deploy history.
+
+**Mitigate / fix.**
+
+- Runaway agent: stop it, fix its loop, or revoke its token (edit the tokens file,
+  SIGHUP; requests already admitted finish, up to `--request-timeout`).
+- Legitimate load: give the token its own entry in the tokens file with `rate`,
+  `burst` and `concurrency` (per-token fields reload on SIGHUP; the flag defaults
+  need a restart). Set the rate near twice the steady rate and the burst to the
+  largest legitimate burst; see [Request limits](OPERATIONS.md#request-limits).
+- Do not give everyone `"unlimited"`, and do not raise the default to fix one
+  token.
+- Anonymous behind a proxy: enable tokens, and rate-limit at the proxy.
+
+**Escalate / collect.** The `topk` table, in-flight graph, the token's tokens-file
+entry (without its hash), the server's limit flags and the number of servers.
+
+## LeepBroadThrottling
+
+**Meaning.** More than 5% of all HTTP requests answered 429 for 15 minutes.
+**Ticket.** It catches what [LeepTokenThrottled](#leeptokenthrottled) cannot: many
+tokens each just under 0.5 refusals per second, or the shared `anonymous` bucket.
+Only the request limits produce 429.
+
+**Impact.** A large part of the fleet is slowed or failing: reads are retried by
+the CLI, writes fail at once.
+
+**Diagnose.**
+
+1. `sum by (route) (rate(leep_http_requests_total{status="429"}[10m]))` and
+   `sum by (token, reason) (rate(leep_requests_limited_total[10m]))`: is it one
+   route, one reason, one token, or everyone?
+2. `token="anonymous"` dominant: no tokens file, or a proxy collapsing all clients
+   into one address.
+3. Did the fleet grow, or did the limits shrink? Compare with the deploy history
+   and the agent count. Each server applies the whole limit.
+4. Slow requests holding concurrency slots: route latencies.
+
+**Likely causes.**
+
+1. Defaults sized for a smaller fleet. Confirm: refusals spread over many tokens,
+   most with real work.
+2. Anonymous mode behind a proxy (one bucket). Confirm: step 2.
+3. A new agent swarm or a retry storm after an outage. Confirm: request rate up
+   across the board, often right after another alert.
+4. Slowness (store, cold index) filling concurrency slots. Confirm: step 4.
+
+**Mitigate / fix.** Fix the slowness first if there is one. Otherwise raise the
+defaults with a restart of every server (they are flags), and give heavy
+tokens their own entries. Enable tokens in anonymous deployments. Do not remove the
+limits to make the alert go away: they are what keeps one agent from starving the
+rest.
+
+**Escalate / collect.** The 429 breakdown by route, token and reason, the limit
+flags, the agent count, and the [standard bundle](#collecting-a-bug-report).
+
+## LeepBlobCacheColdHitRatio
+
+**Meaning.** Fewer than half of blob reads were served from the in-memory cache,
+over 15 minutes, for 30 minutes (summed over all servers). **Ticket.** A miss is a
+read from the durable store, which is slower and (on S3) costs requests. Tree nodes
+are blobs too, so they count. With `--cache-bytes 0` the series do not exist and the
+alert cannot fire.
+
+**Impact.** Higher latency and more load on the blob store. Nothing fails.
+
+**Diagnose.**
+
+1. Occupancy against the limit: `leep_blob_cache_bytes` and `leep_blob_cache_entries`
+   per instance against `--cache-bytes` (default 256 MiB). A cache sitting at its
+   limit is evicting.
+2. Per-instance ratio: `sum by (instance) (rate(leep_blob_cache_hits_total[15m])) /
+   (sum by (instance) (rate(leep_blob_cache_hits_total[15m])) + sum by (instance)
+   (rate(leep_blob_cache_misses_total[15m])))`. One cold instance is a restart.
+3. Workload: `rate(leep_search_total{indexed="false"}[15m])` (scans read many
+   files), large checkouts, new agents on other parts of the tree.
+4. Blob sizes: a blob larger than the whole cache is never cached, so every read of
+   it is a miss.
+
+**Likely causes.**
+
+1. A restart or deploy: caches start empty. Confirm: the server's uptime. It heals
+   by itself.
+2. The working set is larger than `--cache-bytes`. Confirm: step 1 at the limit and
+   the ratio falling as traffic grows.
+3. Scan-heavy traffic (unindexed searches, many whole checkouts). Confirm: step 3.
+4. Large blobs that never fit. Confirm: step 4.
+5. Several instances behind a balancer that spreads one workload thinly over all
+   caches. Confirm: every instance equally low.
+
+**Mitigate / fix.** Raise `--cache-bytes` (a flag, so a restart) and give the
+container the memory: resident size is the cache plus request buffers. Warm what
+searches need with `leep-server derive-search main`. For scans, narrow the queries
+with a `path`. Do not set `--cache-bytes 0` to quiet the alert: it removes the cache
+and the series.
+
+**Escalate / collect.** Cache gauges and hit and miss rates per instance, search
+and derive rates, `--cache-bytes`, the blob store type and its read latency.
+
+## LeepConfigReloadFailed
+
+**Meaning.** A SIGHUP reload was refused in the last 10 minutes: the server is
+healthy but running its previous config (`leep_config_reload_total{result="error"}`
+increased). **Page**, because the edit may have been a revocation: a token you meant
+to remove still works. **The alert clears after 10 minutes even though the config
+is still stale**; verify the fix, do not wait for the alert to resolve.
+
+**Impact.** None visible to agents; the server keeps serving the old tokens, signing
+keys and review policy. A restart does not help: it applies the same checks and
+refuses to start on the bad file.
+
+**Diagnose.**
+
+1. The log line: `ERROR config reload failed; keeping the previous config` with
+   `error=` naming the file and the reason, for example `tokens file
+   /etc/leep/tokens.json: bad JSON: ...`, `cannot read tokens file PATH: ...`,
+   `duplicate token name "ci"`, `token "agent-7": ...`, `request limits: ...`,
+   `--require-signatures needs --signing-keys-file`, or `--require-review and
+   --review-policy-file need --tokens-file`. A line `config reload task failed` is
+   an internal failure of the reload task. `SIGHUP: no tokens, signing keys or
+   review policy file to reload` means the server has no file configured.
+2. Which instance: the counter is per server; `sum by (instance)
+   (increase(leep_config_reload_total{result="error"}[10m]))`.
+3. Was the file half written, or not yet synced to that host (a ConfigMap volume
+   updates after a delay)? Compare `sha256sum` across hosts.
+4. Validate offline with the startup checks, which are the same as a reload's. Use
+   throwaway in-memory stores and the same flags as production (`--tokens-file`,
+   `--signing-keys-file`, `--review-policy-file`, `--require-signatures`,
+   `--require-review`):
+   ```sh
+   timeout 3 leep-server --listen 127.0.0.1:0 --meta mem:// --blobs mem:// \
+     --tokens-file new/tokens.json --signing-keys-file new/signing-keys.json
+   ```
+   A bad file prints the same error and exits at once; a good one starts listening
+   and `timeout` stops it.
+
+**Likely causes.**
+
+1. A syntax or schema error in the edited file (trailing comma, unknown field,
+   bad `blake3:` digest, duplicate name). Confirm: step 1.
+2. An inconsistent set of files: a review policy without a tokens file,
+   `--require-signatures` without keys, a ref name with a stray space. Confirm:
+   step 1.
+3. A file written non-atomically, or missing on one host. Confirm: step 3.
+4. A single-file bind mount that still points at the old inode after a rename.
+   Confirm: the host's file is right but `changed=false` follows every reload; mount
+   the directory instead, see [DEPLOY.md](DEPLOY.md#reloading-config).
+
+**Mitigate / fix.**
+
+1. If the edit was a revocation and you cannot fix the file quickly, put back the
+   last good file with only the revoked entry removed, rather than anything new.
+2. Fix the file, write it atomically (save beside it, then `mv` over it), validate
+   it (step 4), then `kill -HUP "$(pidof leep-server)"` (or `docker kill
+   --signal=HUP leep`, or `docker compose kill -s HUP leep-server`) on every
+   instance.
+3. Confirm per instance: `config reloaded` with a higher `generation`,
+   `leep_config_generation` increased, and `leep_config_last_reload_timestamp_seconds`
+   is recent. Try the revoked token (`LEEP_TOKEN=... leep refs`) and expect an authentication
+   error (401).
+4. Do not restart the server to "pick up" a bad file; do not edit flags expecting
+   SIGHUP to apply them (listeners, stores, cache size, request timeout, size and
+   limit defaults, and the `--require-*` refs need a restart).
+
+**Escalate / collect.** The full `config reload failed` line, the file with
+digests and keys removed, and the [standard bundle](#collecting-a-bug-report).
+
+## LeepConfigGenerationSkew
+
+**Meaning.** The servers report different `leep_config_generation` values for 15
+minutes. **Ticket.** The generation is a per-process counter: 1 at startup, plus one
+for every successful reload, **even when the files did not change**
+(`config reloaded ... changed=false` still advances it). So it detects "a SIGHUP did
+not reach everyone", but it also differs after any single restart (the restarted
+server is back at 1) and it can never prove that two servers run the same files.
+
+**Impact.** If a reload really missed a server, it still serves old tokens, keys or
+review rules: a revoked token may still work there, and the same land can be
+accepted by one server and refused by another.
+
+**Diagnose.**
+
+1. `leep_config_generation` and `leep_config_last_reload_timestamp_seconds` per
+   instance.
+2. Per instance log: `SIGHUP: reloading config` followed by `config reloaded
+   generation=N changed=...`, or an ERROR (then it is also
+   [LeepConfigReloadFailed](#leepconfigreloadfailed)). Look for a start-up line
+   (`leep-server listening`) after the last reload: a restart.
+3. The files themselves: `sha256sum` of the tokens, keys and policy files on every
+   host or mount. This is the real comparison.
+
+**Likely causes.**
+
+1. One server restarted or crashed since the last reload, so its counter reset.
+   Confirm: step 2, and its generation is lowest.
+2. SIGHUP was not delivered to every instance (a missed host, a container that was
+   not signalled). Confirm: no `SIGHUP: reloading config` line on the lagging one.
+3. A reload failed on one instance only. Confirm: ERROR line there.
+4. The files differ between hosts. Confirm: step 3.
+
+**Mitigate / fix.**
+
+- If the files are identical and every instance logged its reload, the skew is
+  cosmetic. To clear it, restart the instances with the higher generation in a
+  rolling restart so all counters return to 1 (or silence the alert until the next
+  deploy, which restarts everything).
+- If an instance missed the reload, send it SIGHUP, or restart it.
+- If the files differ, make them identical (configuration management), validate,
+  and reload everywhere.
+- Do not treat equal generations as proof of equal config.
+
+**Escalate / collect.** Generation and timestamp per instance, each instance's
+reload log lines, and file checksums.
+
+## LeepSchemaVersionSkew
+
+**Meaning.** Running servers report different `leep_schema_version` (the newest
+migration applied when they opened the store) for an hour. **Ticket.** Normal in the
+middle of a rolling upgrade; a problem when the rollout is stuck.
+
+**Impact.** Usually none, if the release notes say the new migrations tolerate old
+servers. A server never writes to a schema it does not understand at startup, but
+one that is already running is not checked again: an old server keeps running on a
+database a newer one migrated. Servers from before ADR 0023 do not read the
+version at all.
+
+**Diagnose.**
+
+1. `leep_schema_version` and `leep_build_info` per instance.
+2. `leep-server migrate --status` with the new binary (read-only): prints `schema
+   version: N (this server: M)`, the `applied  v0001 name (...)` history and what is
+   pending.
+3. Rollout state: which instances run the old image, and why they were not
+   replaced (crash loop, drained, an autoscaler template with the old tag).
+4. Refusal messages in an old instance's log on restart: `database schema vN is
+   newer than this server (max vM); upgrade the server`.
+
+**Likely causes.**
+
+1. A rolling upgrade in progress. Confirm: instances are being replaced; the skew
+   shrinks.
+2. A stuck rollout: an instance not replaced or an autoscaler template still
+   pointing at the old image. Confirm: step 3.
+3. A rollback of some instances onto a migrated database, which the old binary
+   refuses at startup (step 4), leaving fewer servers than intended.
+4. A server that was restarted on a build whose migration list differs, refused
+   with `migration vN (name) differs from the one applied to this database ...;
+   applied migrations are immutable`. Confirm: that message.
+
+**Mitigate / fix.**
+
+- Finish the rollout: restart the old instances on the new image. Check the release
+  notes for whether old and new may run together while you wait.
+- There is no downgrade. Going back means restoring the backup taken before the
+  upgrade into new stores, which loses everything since (see
+  [Upgrading](OPERATIONS.md#upgrading) and [Restoring](OPERATIONS.md#restoring)).
+- Never edit `schema_migrations` or an applied migration, and never stop servers
+  "to avoid skew" by pointing an old build at the migrated database.
+
+**Escalate / collect.** The per-instance gauge values, `migrate --status` output,
+image digests and the log lines around each instance's start.
+
+## LeepMixedVersions
+
+**Meaning.** Servers report more than one `version` in `leep_build_info` for 2
+hours. **Ticket.** Expected during a rollout; a problem when it lasts. `version` is
+the server crate's version, which only the maintainer bumps and stays below 0.1.0:
+**two different builds can report the same version**, so equal values do not prove
+equal builds. Compare image digests too.
+
+**Impact.** Mixed behaviour across a fleet: a fix present on some servers only,
+different limits or messages per request depending on the balancer's choice. The
+schema may also differ ([LeepSchemaVersionSkew](#leepschemaversionskew)).
+
+**Diagnose.** `leep_build_info` per instance; `leep-server --version` and the image
+digest on each host; the rollout tool's status; schema versions per instance.
+
+**Likely causes.** A rollout in progress; a stuck rollout; an instance that cannot
+start on the new image (check its log, see [LeepServerDown](#leepserverdown)); an
+autoscaler or restart policy that pulls an old tag.
+
+**Mitigate / fix.** Finish the rollout (or roll back the binary only if the schema
+did not change, see [LeepSchemaVersionSkew](#leepschemaversionskew)). Pin image
+digests instead of tags.
+
+**Escalate / collect.** Per-instance version and digest, schema version, and the
+rollout log.
+
+## LeepBackupStale
+
+**Meaning.** `leep_backup_last_success_timestamp_seconds` is older than 2 days
+(use twice your backup interval), or does not exist at all. **Ticket**; treat it as
+a page when the stores have had trouble lately or the gap passes three intervals.
+The metric is written by `leep-server backup --metrics-file` and served by
+node_exporter's textfile collector. It moves only when a backup is sealed *and*
+passes its check; a run that exits 2 (nothing sealed) writes nothing, so staleness is
+how that failure shows. `absent()` also catches a backup that never succeeded, or a
+textfile collector that is not reading the file.
+
+**Impact.** None for users. Your recovery point (RPO) is the last good snapshot, and
+grows by the hour; a disaster now loses everything since.
+
+**Diagnose.**
+
+1. Is the metrics path working? On the backup host: `ls -l
+   /var/lib/node_exporter/textfile/leep_backup.prom` (the file name must end in
+   `.prom`, and node_exporter must run with `--collector.textfile.directory`
+   pointing there; `node_textfile_scrape_error` and `node_textfile_mtime_seconds`
+   say whether it is read).
+2. Is the job running, and what did it say? Cron logs, and the job's own output.
+   Exit status 0 sealed and clean, 1 sealed but the check found problems
+   ([LeepBackupCheckFailed](#leepbackupcheckfailed)), 2 could not run. Run it by hand:
+   `leep-server backup --out /backups/leep --metrics-file /var/lib/node_exporter/textfile/leep_backup.prom`.
+3. Messages of a run that could not run (`error:` on stderr):
+   - `metadata database PATH does not exist (backup never creates one)` or `blob
+     directory DIR does not exist (backup never creates one)`: wrong `LEEP_META` or
+     `LEEP_BLOBS` in the cron environment;
+   - `N schema migration(s) pending ... run leep-server migrate` while
+     `opening the source metadata store`: the backup binary is newer than the
+     database. Run `leep-server migrate` (or start the new servers) after a backup
+     taken with the old binary;
+   - `database schema vN is newer than this server`: the backup binary is older than
+     the database;
+   - `a mem:// store lives in one process, so there is nothing to back up`;
+   - `cannot snapshot a metadata store at ...: only sqlite: and postgres:// are
+     supported`;
+   - errors from `starting the snapshot read`, `copying rows`, `creating the
+     snapshot file` (database, permissions, scratch space: `TMPDIR` needs room for
+     the metadata), or `writing PATH` (the metrics file);
+   - blob copy errors (S3 credentials, permissions on `--out`, a full disk).
+4. Free space and permissions where `--out` lives: `df -h /backups`.
+5. The newest sealed snapshot: `ls /backups/leep/snapshots | tail -3` and `jq
+   '{name, created_at, snapshot_taken_at, check, elapsed_secs}'
+   /backups/leep/snapshots/NAME/manifest.json`. A snapshot directory without a
+   `manifest.json` is an interrupted run; ignore or delete it.
+
+**Likely causes.**
+
+1. The cron job stopped or is failing before it seals: wrong environment, host
+   rebuilt, crontab lost, `flock` held by a hung run. Confirm: steps 2 and 3.
+2. The source is not backup-able right now: pending migrations after an upgrade,
+   a database newer than the binary. Confirm: step 3 messages.
+3. The destination is full or unwritable. Confirm: step 4.
+4. Backups run but fail their check (`leep_backup_last_run_ok == 0`): the
+   last-success time is carried over, so staleness follows. Confirm:
+   [LeepBackupCheckFailed](#leepbackupcheckfailed).
+5. The textfile pipeline is broken (collector directory, file ownership, the file
+   not named `.prom`). Confirm: step 1, while snapshots under `snapshots/` are new.
+
+**Mitigate / fix.** Fix the cause and run the backup by hand; confirm
+`result: sealed and checked` and that the metric moved. Then check the pool with
+`leep-server backup-verify --from /backups/leep`. Do not "fix" the alert by
+touching the metrics file, and do not delete old snapshots to make room before the
+next backup has passed.
+
+**Escalate / collect.** The run's stderr and (with `--json`) its report, the newest
+`manifest.json`, `ls -l` of `snapshots/`, free space, and the cron configuration.
+
+## LeepBackupCheckFailed
+
+**Meaning.** `leep_backup_last_run_ok == 0`: the newest backup was sealed but its
+closure check found problems, or the run used `--no-check` (the manifest's check
+`mode` is `skipped`, the run exits 0, and the metric is still 0). **Ticket**, same
+day. That snapshot is not proven restorable and `restore` refuses it: `this
+snapshot's closure check failed (N problem(s): ...); a restore from it would not
+verify. Restore an earlier snapshot, or pass --accept-failed-check` (or `was
+skipped`).
+
+**Impact.** None for users. Your recovery point is the last snapshot that passed,
+which may be older than you think; a failed check usually means the source stores
+themselves are damaged.
+
+**Diagnose.**
+
+1. What failed: the run's output (`PROBLEMS: N` and the listed lines) or `jq
+   .check /backups/leep/snapshots/NAME/manifest.json` (`mode`, `ok`, `problems`,
+   `first_problems`), and `jq .blobs.corrupt` for source blobs that do not hash to
+   their names (`WARNING: source blob HASH does not hash to its name; not copied`).
+2. Is the source damaged? `leep-server verify --full --rehash` against the live
+   stores (read-only, safe beside servers). If it finds `missing_blob`,
+   `corrupt_blob`, `missing_tree` and so on, the source is the problem: use
+   [Verify and repair](OPERATIONS.md#runbook-verify-found-x).
+3. Was it transient? Run the backup again. A source or destination object store
+   whose listing lagged (S3) can fail one run and pass the next.
+4. Was the check skipped on purpose? `--no-check` in the job's command line.
+5. `--no-blobs`: the check ran against the source blobs; the platform's own copy is
+   still unproven until `backup-verify --blobs-from URL` passes.
+
+**Likely causes.**
+
+1. Damaged source: a blob a changeset needs is missing or corrupt (a bad restore, a
+   deleted file, disk trouble). Confirm: step 2.
+2. A GC mistake: `gc --unsafe-no-fence` run beside live servers, or a fence shorter
+   than the request timeout. Confirm: GC command lines in cron and shell history;
+   `verify` shows `missing_blob`.
+3. A transient listing or copy problem. Confirm: step 3 passes.
+4. `--no-check`. Confirm: step 4.
+
+**Mitigate / fix.**
+
+- Get a good snapshot first: fix the cause (repair or restore the damaged blobs
+  from an earlier backup or a client's cache, see the verify runbook), then run the
+  backup again and confirm `result: sealed and checked`.
+- Keep the failed snapshot for diagnosis, but pause retention deletions until a
+  newer good one exists.
+- Do not use `--accept-failed-check` unless you are in a disaster and nothing better
+  exists; then expect `verify` to report the same problems after the restore.
+- Do not remove `--rehash` or the check from the job to make the metric green.
+
+**Escalate / collect.** The failing run's report (`--json`), `manifest.json`,
+`verify --full --rehash --json` of the source, GC command lines, and recent
+storage events.
+
+## LeepBackupSlow
+
+**Meaning.** The average backup duration over the last 7 days is more than 1.5 times
+the week before, and above 10 minutes (`leep_backup_duration_seconds`). **Ticket.**
+The store is outgrowing the window.
+
+**Impact.** None yet. A backup that approaches the interval overlaps the next run,
+delays the recovery point and holds a metadata read transaction open longer (on
+Postgres it holds back vacuum; on SQLite it delays WAL checkpoints).
+
+**Diagnose.**
+
+1. What the last runs did: `jq '{name, elapsed_secs, counts, blobs: {copied:
+   .blobs.copied, bytes_copied: .blobs.bytes_copied, listed: .blobs.listed}, check}'`
+   over the newest manifests. Duration splits into the metadata stream (grows with
+   changesets and derived rows), the blob copy (what is new) and the check (with
+   `--rehash`, every referenced blob).
+2. Does the job use `--rehash`? That makes every run read the whole repository.
+3. Did you rotate the pool recently? A new pool copies every blob once.
+4. Backup storage and network: throughput to `--out` or the `--blobs-to` bucket.
+5. Overlapping runs: two at once are safe but compete.
+
+**Likely causes.**
+
+1. Growth in content or history, as expected. Confirm: `counts.changesets` and
+   copied bytes grow.
+2. `--rehash` on the daily job. Confirm: step 2.
+3. A new pool after a rotation (one run, then back to normal). Confirm: step 3.
+4. Slow or throttled backup storage. Confirm: step 4.
+5. A very large metadata store streaming in one transaction. Confirm: the metadata
+   part dominates.
+
+**Mitigate / fix.**
+
+- Keep `--rehash` for the weekly `backup-verify --rehash`, as in the schedule in
+  [Backup and restore](OPERATIONS.md#schedule-retention-rpo-and-rto).
+- Raise `--concurrency` if the network allows; memory is about `--concurrency`
+  times your largest blob.
+- Stop runs overlapping with `flock`.
+- For metadata too large to stream, use Postgres base backups with WAL archiving
+  and `backup --no-blobs`; for blobs that the platform already protects, `--no-blobs`
+  and `backup-verify --blobs-from URL`.
+- Do not skip the check to save time.
+
+**Escalate / collect.** Durations and counts from the last month of manifests, the
+job's command line, backup storage throughput.
+
+## LeepBackupVerifyFailed
+
+**Meaning.** The scheduled `leep-server backup-verify` (weekly, through the
+[wrapper](#cron-wrappers)) exited non-zero (1: problems found, 2: could not run), or
+has not passed in 9 days, or its metric does not exist. **Ticket**, same day. It
+is the bit-rot check of the backup medium: damage shows here, not during the
+disaster.
+
+**Impact.** None for users. Some or all snapshots may not restore.
+
+**Diagnose.**
+
+1. Run it: `leep-server backup-verify --from /backups/leep --rehash --json`. Exit 1
+   lists problems (`PROBLEMS: N`), exit 2 prints an `error:`; for example `FILE does
+   not match its manifest (BLAKE3 ..., N bytes; expected ..., N bytes): the file was
+   damaged or replaced after the backup`.
+2. Which snapshots are affected: repeat with `--snapshot NAME` for the last few. A
+   bad `meta.db` damages one snapshot; a missing or corrupt pool blob damages every
+   snapshot that needs it.
+3. Is the live store fine? `leep-server verify` on the source: if the blob is intact
+   there, it can be copied again.
+4. Is the medium failing? Kernel and disk logs (`dmesg`, SMART), filesystem errors,
+   a full or remounted volume, an S3 lifecycle rule deleting objects.
+
+**Likely causes.**
+
+1. Bit rot or a failing disk under the pool. Confirm: step 4, a few blobs or files
+   affected.
+2. Someone deleted or modified files under the backup directory (cleanup scripts,
+   retention that removed `blobs/`). Confirm: file times, shell history.
+3. The backup directory was moved or the mount is missing: `error:` mentions `is not
+   a backup directory`. Confirm: `ls`.
+4. A `--no-blobs` platform copy that has not caught up. Confirm: `backup-verify
+   --blobs-from URL` problems list recent blobs.
+
+**Mitigate / fix.**
+
+- For a damaged pool blob that still exists in the source: delete that file from the
+  pool (`blobs/ab/cdef...`) and run `leep-server backup`, which copies every blob the
+  pool lacks, then run `backup-verify --rehash` again. If the source also lost it,
+  see the `missing_blob` row in [the verify runbook](OPERATIONS.md#runbook-verify-found-x).
+- For a damaged `meta.db`: rely on another snapshot, and take a fresh backup.
+- If the medium is failing, start a new pool on healthy storage (`--out` a new
+  directory) and keep the old one until the new one verifies.
+- Do not delete old snapshots until a newer one verifies clean.
+
+**Escalate / collect.** The `backup-verify --json` output, the list of affected
+snapshots, medium health logs, and the retention and cleanup jobs on the host.
+
+## LeepRestoreDrillOverdue
+
+**Meaning.** The restore drill has not passed in 35 days (or never), according to
+the metric your drill job writes through the [wrapper](#cron-wrappers). **Ticket.** A
+backup nobody has restored is a hope: the drill is the only evidence of your
+recovery time (RTO) and that the backup restores at all.
+
+**Impact.** None today. Unknown recoverability.
+
+**Diagnose.**
+
+1. Did the drill run and fail, or not run? `leep_restore_drill_last_exit_code` and
+   `leep_restore_drill_last_run_timestamp_seconds`.
+2. If it failed, rerun the steps by hand, in scratch stores only, from
+   [The restore drill](OPERATIONS.md#the-restore-drill): `restore --from
+   /backups/leep --rehash`, `verify --full --rehash`, serve it, `leep refs` against the
+   manifest's `refs`, a fresh checkout. Each step has an expected result.
+3. Refusals from `restore` and what they mean are in the table in
+   [Restoring](OPERATIONS.md#restoring): `destination metadata store is not empty`
+   (the scratch stores were not fresh), `newer than this server (vN)` (use a newer
+   binary), `does not match its manifest` (damaged `meta.db`; try another snapshot),
+   `closure check failed` or `was skipped`.
+
+**Likely causes.**
+
+1. Nobody scheduled it, or the owner changed. Confirm: no runs.
+2. Scratch space or time ran out (the drill needs room for the whole store and
+   `$TMPDIR` for the metadata). Confirm: the failing step.
+3. The backup is not restorable. Confirm: a restore or verify step fails.
+   [LeepBackupCheckFailed](#leepbackupcheckfailed) and
+   [LeepBackupVerifyFailed](#leepbackupverifyfailed) usually fired first.
+4. A new Leep version changed a step. Confirm: the release notes; run the drill
+   after every upgrade.
+
+**Mitigate / fix.** Run the drill now and record the date and the time from restore
+to verify (your measured RTO). If any step fails, treat the backup as not good: take
+another, keep the failed one for diagnosis, and find out why before the next
+scheduled run. Never run the drill against the real stores or with `--force`.
+
+**Escalate / collect.** The failing step's output, the manifest, the restore and
+verify `--json` reports, free space on the scratch host.
+
+## LeepGcStale
+
+**Meaning.** `leep-server gc` has not exited successfully in 3 days (daily cron),
+according to the metric written by the [wrapper](#cron-wrappers); Leep exports no GC
+metric of its own. **Ticket.** Abandoned uploads and failed commits leave
+unreferenced blobs and only GC reclaims them.
+
+**Impact.** None immediately; the blob store grows until
+[LeepDiskSpaceLow](#leepdiskspacelow). GC never runs in the request path.
+
+**Diagnose.**
+
+1. `leep_gc_last_exit_code` and the cron log. Run what it would do without writing
+   anything: `leep-server gc --dry-run`. The report lines are `changesets scanned`,
+   `would condemn: N blobs, B bytes`, `kept (within grace)`, `kept (recently
+   claimed)`.
+2. Errors from the command:
+   - `opening blob store` or `opening meta store` with the store's error (wrong
+     environment in cron, credentials, database down);
+   - `database schema vN is newer than this server (max vM); upgrade the server`, or
+     pending migrations with `--no-migrate`;
+   - `invalid input: a zero fence can lose blobs while servers run; pass a positive
+     fence (longer than the servers' request timeout) or --unsafe-no-fence`;
+   - `bad duration "..."; use e.g. 0, 90s, 30m, 24h, 7d`.
+3. Is it simply slow or killed? Condemn and collect mark from every stored changeset,
+   so they take longer as history deepens; a job killed by a timeout or an
+   overlapping run never reports success. Killing GC is safe, and a killed run is
+   finished by running it again.
+4. Nothing deleted for a day after a restore: restored blobs have the restore time
+   as their modification time, so `--grace` (default 24h) starts again.
+
+**Likely causes.**
+
+1. The job is not scheduled, or its environment differs from the server's. Confirm:
+   steps 1 and 2.
+2. A refusal because of the schema (after an upgrade) or flags. Confirm: step 2.
+3. The job is killed before it finishes (cron timeout, host reboots, an overlapping
+   run). Confirm: step 3, the run's duration against its schedule.
+4. The stores are unreachable from the job's host. Confirm: step 2.
+
+**Mitigate / fix.**
+
+- Fix the cause and run `leep-server gc` (or `gc condemn` now and `gc collect` later,
+  as two jobs). Run one GC at a time (`flock`).
+- Keep `--fence` above the servers' `--request-timeout` plus clock skew plus a margin
+  (default 10m against 5m), and `--grace` above the time agents take from upload to
+  commit.
+- Never use `--unsafe-no-fence` beside running servers. Never delete blobs by hand to
+  make room: use [LeepDiskSpaceLow](#leepdiskspacelow) for urgent space.
+
+**Escalate / collect.** The cron output of the last runs, `gc --dry-run` output,
+the job's flags and the servers' `--request-timeout`, and the store sizes.
+
+## LeepDiskSpaceLow
+
+**Meaning.** A filesystem that holds Leep data (blobs, the SQLite file, Postgres
+data, the backup directory) has less than 10% free for 15 minutes. **Ticket**; a
+page when it is near full. The rule uses node_exporter's `node_filesystem_avail_bytes`
+and `node_filesystem_size_bytes` with `mountpoint` placeholders you must set; Leep
+exports no disk metrics, and an S3 bucket needs the cloud provider's own alerts.
+
+**Impact.** At zero free space writes fail: servers answer 5xx (`storage error:
+...` with `No space left on device` or SQLite's `database or disk is full`),
+Postgres cannot write, backups fail (see [LeepBackupStale](#leepbackupstale)).
+
+**Diagnose.**
+
+1. `df -h` and `df -i` (inodes: the filesystem blob store makes one file per blob).
+2. What grows: `du -xsh /var/lib/leep/*`, `du -xsh /backups/leep/*`, and for
+   Postgres `SELECT pg_size_pretty(pg_database_size('leep'))` plus the size of its WAL
+   directory and replication slots (a stuck slot or broken archiving keeps WAL).
+3. What GC could reclaim: `leep-server gc --dry-run` (`would condemn: N blobs, B
+   bytes`). Only blobs older than `--grace` (24h default) and unreferenced qualify,
+   and deletion follows the fence.
+4. Leftover temp files in a filesystem blob store: `find /var/lib/leep/blobs -name
+   '.tmp-*' -mmin +60 -delete` is documented as safe for files older than the request
+   timeout; count them first without `-delete`.
+5. Backups: the pool only grows; old snapshot directories are the thing to expire.
+6. Metadata: derived rows dominate (the search index is about 30% of the indexed text
+   for source code, up to about 100% for random text); the ref log is never pruned
+   but small (tens of MB a year).
+
+**Likely causes.**
+
+1. Normal growth of content and history. Confirm: steady growth in `du` over weeks.
+2. GC not running or not keeping up. Confirm: [LeepGcStale](#leepgcstale), and a large
+   `would condemn`.
+3. The backup volume filling with snapshots, or a pool that was never rotated.
+   Confirm: step 5.
+4. A burst: a large import, an agent swarm uploading big files, or abandoned uploads.
+   Confirm: growth starts at an event.
+5. Postgres WAL retained by a stuck slot or failing archive. Confirm: step 2.
+6. Leftover `.tmp-*` after crashes. Confirm: step 4.
+
+**Mitigate / fix**, in this order:
+
+1. If space is critical, free the safe things first: backup snapshot directories past
+   your retention (delete whole directories under `snapshots/`; the pool is shared
+   and stays), old logs, and `.tmp-*` older than the request timeout.
+2. Run `leep-server gc`. Space returns after the grace window and the fence, not at
+   once.
+3. Grow the volume: that is the fix for steady growth. On SQLite, freed pages are
+   reused inside the file but the file does not shrink by itself.
+4. Last resort for metadata: `leep-server repair drop --kind blob-trigrams-v1
+   tree-trigrams-v1` removes the search index rows; they rebuild on demand and the
+   first searches are slow (`derive-search main` warms them). Take a backup first.
+- Do not delete blob files, `-wal` files of SQLite or Postgres WAL by hand, and do not
+  lower `--grace` to hurry GC while agents upload. Do not use `--unsafe-no-fence`.
+
+**Escalate / collect.** `df` and `du` output over time, the GC dry-run report, the
+size of the largest tables or WAL, and the [standard bundle](#collecting-a-bug-report).
+
+## Cron wrappers
+
+Leep exports no metric for `gc`, `backup-verify` or the restore drill, and a cron
+job's exit status is invisible to Prometheus. This small wrapper runs any command
+and writes node_exporter text-file metrics for it. [LeepBackupVerifyFailed](#leepbackupverifyfailed),
+[LeepRestoreDrillOverdue](#leeprestoredrilloverdue) and [LeepGcStale](#leepgcstale) alert on them.
+(The `leep-server backup` job writes its own metrics with `--metrics-file`.)
+
+```sh
+#!/usr/bin/env bash
+# /usr/local/bin/leep-cron NAME COMMAND [ARG...]
+# Runs COMMAND, then writes node_exporter text-file metrics for NAME:
+#   leep_NAME_last_run_timestamp_seconds, leep_NAME_last_exit_code and
+#   leep_NAME_last_success_timestamp_seconds (carried over while runs fail).
+set -u
+name=$1; shift
+dir=${LEEP_TEXTFILE_DIR:-/var/lib/node_exporter/textfile}
+out=$dir/leep_$name.prom
+prev=$(grep "^leep_${name}_last_success_timestamp_seconds " "$out" 2>/dev/null || true)
+"$@"
+code=$?
+now=$(date +%s)
+tmp=$(mktemp "$dir/.leep_$name.XXXXXX")
+{
+  echo "leep_${name}_last_run_timestamp_seconds $now"
+  echo "leep_${name}_last_exit_code $code"
+  if [ "$code" -eq 0 ]; then
+    echo "leep_${name}_last_success_timestamp_seconds $now"
+  elif [ -n "$prev" ]; then
+    echo "$prev"
+  fi
+} >"$tmp"
+chmod 0644 "$tmp"
+mv "$tmp" "$out"   # atomic, and not a *.prom name until it is complete
+exit "$code"
+```
+
+```cron
+17 3 * * *  flock -n /run/leep-gc.lock  leep-cron gc leep-server gc
+20 5 * * 0  leep-cron backup_verify leep-server backup-verify --from /backups/leep --rehash
+```
+
+The names matter: the rules read `leep_gc_*`, `leep_backup_verify_*` and
+`leep_restore_drill_*`. For the drill, put the steps of
+[The restore drill](OPERATIONS.md#the-restore-drill) in a script that stops at the
+first failing step (`set -e`) and run it monthly as `leep-cron restore_drill
+/usr/local/bin/leep-restore-drill`. A job that exits non-zero keeps the old
+last-success time, so the age-based alerts fire. These three rules also fire
+when the metric does not exist at all; delete the `absent(...)` line of a rule for a
+task you do not run.

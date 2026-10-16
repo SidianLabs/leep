@@ -36,9 +36,9 @@ measured until the response head is ready, not until the body is streamed.
 |---|---|---|---|
 | `leep_http_requests_total` | counter | `method`, `route`, `status` | Requests handled. `route` is the matched template or `unmatched`; unknown methods are `other`. |
 | `leep_http_request_duration_seconds` | histogram | `method`, `route` | Time to produce the response head. |
-| `leep_land_total` | counter | `outcome` = `landed`, `conflicts`, `exhausted`, `error` | Land calls by result. `conflicts` is a normal reply that needs client action; `exhausted` means the CAS lost every retry. |
+| `leep_land_total` | counter | `outcome` = `landed`, `conflicts`, `exhausted`, `error` | Land calls by result. `conflicts` is a normal reply that needs client action; `exhausted` means the CAS lost every retry (HTTP 409). `error` is every other failure, including refused lands (400: unsigned, unreviewed, bad ref) and unknown changesets (404), so it is not a server-health signal; count 5xx on `route="/v1/land"` for that. |
 | `leep_land_attempts` | histogram | none | CAS attempts per land that reached the retry loop; above 1 means contention. |
-| `leep_land_cas_losses_total` | counter | none | Lost ref compare-and-swaps (races with other server instances). |
+| `leep_land_cas_losses_total` | counter | none | Lost ref compare-and-swaps (races with other writers of the ref: other server instances, imports, raw ref updates; lands in one process never race each other). |
 | `leep_land_duration_seconds` | histogram | none | Whole land call, including lock wait. |
 | `leep_land_lock_wait_seconds` | histogram | none | Time waiting on the per-ref in-process land lock. |
 | `leep_derive_total` | counter | `kind` | Derived values computed (cache hits in the meta store are not counted). |
@@ -65,38 +65,209 @@ polling interval. With `--cache-bytes 0` there is no cache and the
 
 ### Suggested alerts
 
+Every alert has a runbook in [RUNBOOKS.md](RUNBOOKS.md), linked from the rule's
+`runbook_url`. `scripts/check-runbooks.sh` (run in CI) fails if a rule here has
+no section there or a section has no rule. The rules assume the metrics above
+and, for the last two groups, the backup `--metrics-file`, the cron wrapper and
+node_exporter described in the runbooks.
+
 ```yaml
+# Every rule's runbook_url ends in RUNBOOKS.md#<alert name in lower case>.
+# Replace the base URL below with wherever you publish docs/RUNBOOKS.md;
+# scripts/check-runbooks.sh only checks the part from "RUNBOOKS.md#" on.
+# severity: page = wake someone, ticket = fix in working hours.
+#
+# Leep's counters appear when they are first incremented, and increase() cannot
+# see a counter's first event (there is no earlier sample), so the rules that
+# watch rare events add a second branch: "present now, absent 10 minutes ago".
 groups:
 - name: leep
   rules:
-  - alert: LeepLandExhausted
-    expr: increase(leep_land_total{outcome="exhausted"}[10m]) > 0
-    annotations: {summary: "A land lost the ref CAS on every retry; check contention across instances."}
+  - alert: LeepServerDown
+    # Needs the metrics listener scraped under a job named "leep"; adjust.
+    expr: up{job="leep"} == 0
+    for: 2m
+    labels: {severity: page}
+    annotations:
+      summary: "A leep-server's /metrics cannot be scraped: the process is down, or only its metrics listener is."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepserverdown
+  - alert: LeepServerErrors
+    expr: sum(rate(leep_http_requests_total{status=~"5.."}[5m])) / sum(rate(leep_http_requests_total[5m])) > 0.01
+    for: 5m
+    labels: {severity: page}
+    annotations:
+      summary: "More than 1% of requests answer 5xx: a store is failing, or data is damaged."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepservererrors
   - alert: LeepLandErrors
-    expr: increase(leep_land_total{outcome="error"}[10m]) > 0
+    # Counts HTTP 5xx on the land route. leep_land_total{outcome="error"} also
+    # counts refused lands (400, 404), so it is not used here.
+    expr: |
+      sum(increase(leep_http_requests_total{route="/v1/land",status=~"5.."}[10m])) > 0
+      or
+      sum(leep_http_requests_total{route="/v1/land",status=~"5.."} unless leep_http_requests_total{route="/v1/land",status=~"5.."} offset 10m) > 0
+    labels: {severity: page}
+    annotations:
+      summary: "A land failed with a server error (5xx): a store failed while landing. Refused lands do not count."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leeplanderrors
+  - alert: LeepLandExhausted
+    expr: |
+      sum(increase(leep_land_total{outcome="exhausted"}[10m])) > 0
+      or
+      sum(leep_land_total{outcome="exhausted"} unless leep_land_total{outcome="exhausted"} offset 10m) > 0
+    labels: {severity: ticket}
+    annotations:
+      summary: "A land lost the ref compare-and-swap on all 32 attempts; other writers are racing it for the same ref."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leeplandexhausted
+  - alert: LeepLandCasLossesHigh
+    expr: sum(rate(leep_land_cas_losses_total[15m])) / sum(rate(leep_land_total[15m])) > 1
+    for: 15m
+    labels: {severity: ticket}
+    annotations:
+      summary: "More than one lost ref compare-and-swap per land: several writers contend for one ref."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leeplandcaslosseshigh
   - alert: LeepLandSlowP99
     expr: histogram_quantile(0.99, sum by (le) (rate(leep_land_duration_seconds_bucket[5m]))) > 5
     for: 10m
+    labels: {severity: ticket}
+    annotations:
+      summary: "Land p99 above 5 s (includes the wait for the per-ref lock)."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leeplandslowp99
+  - alert: LeepRequestTimeouts
+    expr: sum(increase(leep_http_requests_total{status="408"}[15m])) > 5
+    labels: {severity: ticket}
+    annotations:
+      summary: "Requests are hitting --request-timeout (408). If you raise it, raise the GC --fence with it."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leeprequesttimeouts
+  - alert: LeepTokenThrottled
+    expr: sum by (token, reason) (rate(leep_requests_limited_total[10m])) > 0.5
+    for: 15m
+    labels: {severity: ticket}
+    annotations:
+      summary: "A token is being limited steadily: a runaway agent, or a limit set too low."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leeptokenthrottled
+  - alert: LeepBroadThrottling
+    expr: sum(rate(leep_http_requests_total{status="429"}[10m])) / sum(rate(leep_http_requests_total[10m])) > 0.05
+    for: 15m
+    labels: {severity: ticket}
+    annotations:
+      summary: "More than 5% of all requests are throttled (429): limits too low for the fleet, or one shared anonymous bucket."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepbroadthrottling
   - alert: LeepBlobCacheColdHitRatio
     expr: |
       sum(rate(leep_blob_cache_hits_total[15m]))
         / (sum(rate(leep_blob_cache_hits_total[15m])) + sum(rate(leep_blob_cache_misses_total[15m]))) < 0.5
     for: 30m
-    annotations: {summary: "Cache hit ratio below 50%; consider a larger --cache-bytes."}
-  - alert: LeepServerErrors
-    expr: sum(rate(leep_http_requests_total{status=~"5.."}[5m])) / sum(rate(leep_http_requests_total[5m])) > 0.01
-    for: 5m
-  - alert: LeepTokenThrottled
-    expr: sum by (token, reason) (rate(leep_requests_limited_total[10m])) > 0.5
-    for: 15m
-    annotations: {summary: "A token is being limited steadily: a runaway agent, or a limit set too low."}
+    labels: {severity: ticket}
+    annotations:
+      summary: "Cache hit ratio below 50%; consider a larger --cache-bytes."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepblobcachecoldhitratio
   - alert: LeepConfigReloadFailed
     expr: increase(leep_config_reload_total{result="error"}[10m]) > 0
-    annotations: {summary: "A SIGHUP reload was refused; the server runs the previous config. Read the ERROR log line, fix the file and signal again."}
+    labels: {severity: page}
+    annotations:
+      summary: "A SIGHUP reload was refused; the server runs the previous config. This alert clears after 10 minutes even if the file is still bad: read the ERROR log line, fix the file, signal again, and confirm."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepconfigreloadfailed
   - alert: LeepConfigGenerationSkew
     expr: max(leep_config_generation) != min(leep_config_generation)
     for: 15m
-    annotations: {summary: "Servers run different config generations; a reload did not reach all of them."}
+    labels: {severity: ticket}
+    annotations:
+      summary: "Servers report different config generations: a reload missed one, or one restarted (a restart resets the counter). Compare the files, not the numbers."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepconfiggenerationskew
+  - alert: LeepSchemaVersionSkew
+    expr: max(leep_schema_version) != min(leep_schema_version)
+    for: 1h
+    labels: {severity: ticket}
+    annotations:
+      summary: "Servers run against the same database but report different schema versions: a rollout is unfinished."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepschemaversionskew
+  - alert: LeepMixedVersions
+    expr: count(count by (version) (leep_build_info)) > 1
+    for: 2h
+    labels: {severity: ticket}
+    annotations:
+      summary: "Servers report different versions for over 2 hours: a rollout is unfinished (equal versions do not prove equal builds)."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepmixedversions
+- name: leep-backup
+  # Metrics written by `leep-server backup --metrics-file` (node_exporter textfile collector).
+  rules:
+  - alert: LeepBackupStale
+    # Use twice your backup interval. absent() covers "never succeeded" and a
+    # textfile collector that does not read the file.
+    expr: |
+      time() - leep_backup_last_success_timestamp_seconds > 2 * 86400
+      or
+      absent(leep_backup_last_success_timestamp_seconds)
+    for: 30m
+    labels: {severity: ticket}
+    annotations:
+      summary: "No backup has passed its check recently (or ever): your recovery point is getting older."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepbackupstale
+  - alert: LeepBackupCheckFailed
+    expr: leep_backup_last_run_ok == 0
+    labels: {severity: ticket}
+    annotations:
+      summary: "The newest backup was sealed but failed its check (or ran with --no-check); restore refuses it."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepbackupcheckfailed
+  - alert: LeepBackupSlow
+    # Last 7 days against the 7 days before (needs 14 days of retention), above 10 minutes.
+    expr: |
+      avg_over_time(leep_backup_duration_seconds[7d]) > 600
+      and
+      avg_over_time(leep_backup_duration_seconds[7d]) > 1.5 * avg_over_time(leep_backup_duration_seconds[7d] offset 7d)
+    labels: {severity: ticket}
+    annotations:
+      summary: "Backups take over 1.5 times longer than a week ago: the store is outgrowing the window."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepbackupslow
+- name: leep-cron
+  # Metrics written by the leep-cron wrapper (docs/RUNBOOKS.md#cron-wrappers),
+  # not by Leep. Delete the absent() line of a task you do not run.
+  rules:
+  - alert: LeepBackupVerifyFailed
+    expr: |
+      leep_backup_verify_last_exit_code != 0
+      or
+      time() - leep_backup_verify_last_success_timestamp_seconds > 9 * 86400
+      or
+      absent(leep_backup_verify_last_success_timestamp_seconds)
+    for: 30m
+    labels: {severity: ticket}
+    annotations:
+      summary: "The weekly backup-verify failed or has not passed in 9 days: the backup medium may be damaged."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepbackupverifyfailed
+  - alert: LeepRestoreDrillOverdue
+    expr: |
+      time() - leep_restore_drill_last_success_timestamp_seconds > 35 * 86400
+      or
+      absent(leep_restore_drill_last_success_timestamp_seconds)
+    for: 1h
+    labels: {severity: ticket}
+    annotations:
+      summary: "No passing restore drill in 35 days: an untested backup is not a backup."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leeprestoredrilloverdue
+  - alert: LeepGcStale
+    expr: |
+      time() - leep_gc_last_success_timestamp_seconds > 3 * 86400
+      or
+      absent(leep_gc_last_success_timestamp_seconds)
+    for: 1h
+    labels: {severity: ticket}
+    annotations:
+      summary: "leep-server gc has not succeeded in 3 days: unreferenced blobs are piling up."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepgcstale
+- name: leep-host
+  # node_exporter metrics, not Leep's. Set the mountpoints to the filesystems
+  # that hold the blob directory, the SQLite file or Postgres data, and the backups.
+  rules:
+  - alert: LeepDiskSpaceLow
+    expr: |
+      node_filesystem_avail_bytes{mountpoint=~"/var/lib/leep.*|/backups.*"}
+        / node_filesystem_size_bytes{mountpoint=~"/var/lib/leep.*|/backups.*"} < 0.10
+    for: 15m
+    labels: {severity: ticket}
+    annotations:
+      summary: "A Leep data or backup filesystem has under 10% free; when it fills, writes fail."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepdiskspacelow
 ```
 
 ## Request limits
@@ -158,7 +329,11 @@ Watch it with:
   reason. Tokens and digests are never logged.
 - Metrics: `leep_config_reload_total{result}`, `leep_config_generation` and
   `leep_config_last_reload_timestamp_seconds`. Alert on any `error`, and on
-  generations that differ between servers for longer than a rollout takes.
+  generations that differ between servers for longer than a rollout takes
+  (the generation is per process, so one restarted server differs until the
+  others restart too; compare the files, not only the numbers). Runbooks:
+  [LeepConfigReloadFailed](RUNBOOKS.md#leepconfigreloadfailed),
+  [LeepConfigGenerationSkew](RUNBOOKS.md#leepconfiggenerationskew).
 - A reload that logs `changed=false` found the files identical to what was
   running. Check that the file you edited is the file the server was started
   with (`LEEP_TOKENS_FILE` and friends), and, in a container, that you mounted
@@ -659,19 +834,25 @@ keep the failed one for diagnosis, and find out why before the next run.
 
 ### Alerts
 
-`backup --metrics-file` writes node_exporter text-file metrics. Alert on:
+`backup --metrics-file` writes node_exporter text-file metrics (the file must be
+named `*.prom` in the directory node_exporter's textfile collector reads). The
+rules are in [Suggested alerts](#suggested-alerts), each with a runbook:
 
-| Alert | Expression | Meaning |
+| Alert | Fires when | Runbook |
 |---|---|---|
-| No recent backup | `time() - leep_backup_last_success_timestamp_seconds > 2 * 86400` (use twice your interval) | Backups are not running or not passing |
-| Last backup failed its check | `leep_backup_last_run_ok == 0` | A sealed snapshot is not restorable; read the run's output |
-| Backup slowing | `leep_backup_duration_seconds` rising week on week | The store is outgrowing the window |
-| Drill overdue | your own metric or ticket: no drill in 35 days | An untested backup is not a backup |
+| LeepBackupStale | `leep_backup_last_success_timestamp_seconds` is older than twice your interval, or absent (never succeeded, or the metric is not collected). A run that exits 2 writes nothing, so this is how it shows | [LeepBackupStale](RUNBOOKS.md#leepbackupstale) |
+| LeepBackupCheckFailed | `leep_backup_last_run_ok == 0`: a sealed snapshot is not restorable (or the run used `--no-check`) | [LeepBackupCheckFailed](RUNBOOKS.md#leepbackupcheckfailed) |
+| LeepBackupSlow | `leep_backup_duration_seconds` averages over 1.5 times last week's and over 10 minutes | [LeepBackupSlow](RUNBOOKS.md#leepbackupslow) |
+| LeepBackupVerifyFailed | the weekly `backup-verify` exited non-zero or has not passed in 9 days (cron wrapper metric) | [LeepBackupVerifyFailed](RUNBOOKS.md#leepbackupverifyfailed) |
+| LeepRestoreDrillOverdue | no passing drill in 35 days (cron wrapper metric) | [LeepRestoreDrillOverdue](RUNBOOKS.md#leeprestoredrilloverdue) |
 
-Also alert on the cron job's exit status (2 means nothing was sealed), and on
-free space where `--out` lives. The metrics (`last_run_timestamp`,
-`snapshot_timestamp` (the recovery point), `duration`, `check_problems`,
-`changesets`, `blobs_copied`, `blob_bytes_copied`) are listed in ADR 0026.
+Leep exports no metric for `backup-verify`, the drill or `gc`; the
+[cron wrapper](RUNBOOKS.md#cron-wrappers) turns a job's exit status into
+metrics for them (and [LeepGcStale](RUNBOOKS.md#leepgcstale)). Alert on free
+space where `--out` lives too ([LeepDiskSpaceLow](RUNBOOKS.md#leepdiskspacelow)).
+The backup metrics (`last_run_timestamp`, `snapshot_timestamp` (the recovery
+point), `duration`, `check_problems`, `changesets`, `blobs_copied`,
+`blob_bytes_copied`) are listed in ADR 0026.
 
 ## Crash and fault tests
 
