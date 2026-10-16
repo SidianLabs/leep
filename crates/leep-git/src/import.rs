@@ -235,18 +235,20 @@ fn read_blob(ts: &gix::ThreadSafeRepository, oid: ObjectId) -> Result<Vec<u8>> {
 async fn prepare_and_upload(
     repo: &Repo,
     ts: &gix::ThreadSafeRepository,
-    cache: &Mutex<HashMap<ObjectId, (Hash, u64)>>,
+    cache: &Arc<Mutex<HashMap<ObjectId, (Hash, u64)>>>,
     oid: ObjectId,
 ) -> Result<(ObjectId, Prepared, usize)> {
-    let known: HashSet<ObjectId> = cache.lock().unwrap().keys().copied().collect();
-    let ts = ts.clone();
+    let (ts, known) = (ts.clone(), cache.clone());
     let (p, blobs) = tokio::task::spawn_blocking(move || -> Result<_> {
         let p = prepare(&ts, oid)?;
         let mut wanted = HashSet::new();
         let mut blobs = Vec::new();
         for (_, change) in &p.changes {
             if let Some((_, b)) = change {
-                if !known.contains(b) && wanted.insert(*b) {
+                // One lookup per blob: copying the key set per commit cost
+                // time and memory proportional to the whole repository.
+                let stored = known.lock().unwrap().contains_key(b);
+                if !stored && wanted.insert(*b) {
                     blobs.push((*b, read_blob(&ts, *b)?));
                 }
             }

@@ -26,6 +26,7 @@ mod reviews;
 pub mod search;
 mod signatures;
 mod tree_ops;
+pub mod warm;
 
 #[cfg(test)]
 mod fault_tests;

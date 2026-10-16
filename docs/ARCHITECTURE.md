@@ -150,7 +150,11 @@ changeset, and concurrent servers that race produce identical bytes.
 
 `root_tree` and `generation` are derived eagerly when a changeset is created.
 Other kinds are derived on first read (the search kinds on the first search
-that needs them; see "Code search"). Add new kinds with the
+that needs them; see "Code search"), and every server also warms them in the
+background for each ref head that moved, every `--warm-interval` (ADR 0028), so
+queries on an imported or restarted history do not pay for the whole history.
+`derive` takes a per-kind lock once a value is missing, so concurrent requests
+and the warmer never derive the same range twice. Add new kinds with the
 [`add-derived-data-kind`](../.claude/skills/add-derived-data-kind/SKILL.md)
 skill. A new kind never requires a client change.
 
@@ -165,7 +169,8 @@ is iterative and returns exactly what the old scan returned, in the same order,
 reading only changesets that changed the path. A merge's entry is the merge
 itself if it changed the path relative to its first parent, otherwise the union
 of its parents' entries, so a side branch's changes are never lost. The index
-is derived on the first path query for a history, oldest first. `author` and
+is derived oldest first, by the warmer or by the first path query, whichever
+comes first. `author` and
 `extra` filters apply to the changesets the walk yields, so a selective filter
 on a frequently changed path still reads each of them.
 Directory nodes keep deleted entries, so a busy directory's node grows with
@@ -213,9 +218,9 @@ test checks; the walk is lazy, so a search that has enough matches stops early.
 Limits: 100 matches by default, 1000 at most, 256 MiB of blob content scanned,
 `truncated` when either is hit. Only UTF-8 text blobs up to 1 MiB are searched;
 others count as `files_skipped`. The index rows are derived lazily by the first
-search that needs them and are keyed by content, so a new revision derives only
-what it changed; `leep-server derive-search <rev>` warms a revision ahead of
-time. Clients are `leep search` and the `leep_search` MCP tool.
+search that needs them, or by the warmer for ref heads (ADR 0028), and are
+keyed by content, so a new revision derives only what it changed;
+`leep-server derive-search <rev>` warms any other revision ahead of time. Clients are `leep search` and the `leep_search` MCP tool.
 
 **Verification and repair** ([ADR 0025](adr/0025-repair-tools.md)).
 `leep-server verify` and `leep-server repair` run offline against the stores

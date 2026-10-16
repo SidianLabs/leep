@@ -48,12 +48,45 @@ struct Frame {
     next: usize,
 }
 
+tokio::task_local! {
+    /// Kinds whose derive lock this task holds, so a derivation that asks for
+    /// its own kind again (a merge asking for its merge base) does not wait on
+    /// itself.
+    static HELD: std::cell::RefCell<Vec<&'static str>>;
+}
+
 /// Get (deriving and caching if needed) kind `K` for `id`.
+///
+/// Deriving a kind takes that kind's lock, so concurrent requests (and the
+/// background warmer) never derive the same range twice: the second waits,
+/// then finds the rows the first stored. Kinds only depend on other kinds
+/// without cycles, so the locks are always taken in one order.
 pub async fn derive<K: DerivedKind>(repo: &Repo, id: ChangesetId) -> Result<Bytes> {
-    let meta = repo.meta();
-    if let Some(v) = meta.get_derived(K::NAME, &id.0).await? {
+    if let Some(v) = repo.meta().get_derived(K::NAME, &id.0).await? {
         return Ok(v);
     }
+    let held = HELD
+        .try_with(|h| h.borrow().contains(&K::NAME))
+        .unwrap_or(false);
+    if held {
+        return derive_missing::<K>(repo, id).await;
+    }
+    let lock = repo.derive_lock(K::NAME);
+    let _guard = lock.lock().await;
+    if let Some(v) = repo.meta().get_derived(K::NAME, &id.0).await? {
+        return Ok(v);
+    }
+    let mut kinds = HELD.try_with(|h| h.borrow().clone()).unwrap_or_default();
+    kinds.push(K::NAME);
+    HELD.scope(
+        std::cell::RefCell::new(kinds),
+        derive_missing::<K>(repo, id),
+    )
+    .await
+}
+
+async fn derive_missing<K: DerivedKind>(repo: &Repo, id: ChangesetId) -> Result<Bytes> {
+    let meta = repo.meta();
     // Iterative post-order DFS over parents that lack a value.
     let mut order: Vec<(ChangesetId, Changeset)> = Vec::new();
     let mut visited: HashSet<ChangesetId> = HashSet::from([id]);
@@ -90,6 +123,9 @@ pub async fn derive<K: DerivedKind>(repo: &Repo, id: ChangesetId) -> Result<Byte
             pv.push(v);
         }
         let started = std::time::Instant::now();
+        #[cfg(test)]
+        repo.derive_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let v = K::derive(repo, cid, &cs, &pv).await?;
         metrics::counter!("leep_derive_total", "kind" => K::NAME).increment(1);
         metrics::histogram!("leep_derive_duration_seconds", "kind" => K::NAME)

@@ -63,7 +63,16 @@ pub struct Repo {
     pub(crate) ancestry: Arc<AncestryCache>,
     /// Decoded path-history rows (see `read_history_row`).
     pub(crate) history_rows: Arc<HistoryRowCache>,
+    /// One lock per derived kind, held while a missing range is derived (see
+    /// `derived::derive`).
+    pub(crate) derive_locks: Arc<Mutex<HashMap<&'static str, DeriveLock>>>,
+    /// Values computed by `derived::derive`, any kind; tests check for
+    /// duplicated work with it.
+    #[cfg(test)]
+    pub(crate) derive_calls: Arc<std::sync::atomic::AtomicUsize>,
 }
+
+type DeriveLock = Arc<tokio::sync::Mutex<()>>;
 
 /// Parents and generation of changesets, kept in memory because history
 /// walks (`is_ancestor`, `merge_base`) visit thousands of changesets and would
@@ -189,6 +198,9 @@ impl Repo {
             land_policy: None,
             ancestry: Arc::default(),
             history_rows: Arc::default(),
+            derive_locks: Arc::default(),
+            #[cfg(test)]
+            derive_calls: Arc::default(),
         }
     }
 
@@ -330,6 +342,15 @@ impl Repo {
         let g = derived::decode_u64(&v)?;
         self.ancestry.update(id, |e| e.generation = Some(g));
         Ok(g)
+    }
+
+    pub(crate) fn derive_lock(&self, kind: &'static str) -> DeriveLock {
+        self.derive_locks
+            .lock()
+            .unwrap()
+            .entry(kind)
+            .or_default()
+            .clone()
     }
 
     /// Parents of a stored changeset, without decoding it again once seen.
