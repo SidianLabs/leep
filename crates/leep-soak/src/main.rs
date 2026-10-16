@@ -385,8 +385,8 @@ async fn drive(
     let Ok(existing) = existing else {
         bail!("cannot reach the server at {base_url}");
     };
-    if existing.is_none() {
-        repo::import(&ops_api, layout, args.seed)
+    if existing.is_none() || args.seed_on_existing {
+        repo::import(&ops_api, layout, args.seed, existing)
             .await
             .map_err(|e| anyhow::anyhow!("importing the repository failed: {e:?}"))?;
     }

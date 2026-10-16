@@ -949,7 +949,11 @@ server on them and look; its `work` directory is cleared when the same `--out`
 is used again. Use `--server URL --token T` to soak a server you
 run yourself; give it `--metrics-url`, `--pid`, `--meta` and `--blobs` to get
 resource trends and GC, otherwise those parts are skipped (chaos and the
-release flow need a server the harness started).
+release flow need a server the harness started). If that server's `main`
+already holds a history (an imported git repository, say), add
+`--seed-on-existing`: the synthetic files land on top of it under `src/`,
+`docs/` and `assets/`, so the swarm measures lands, reads and GC at that
+history's depth.
 
 | Flag | Default | Meaning |
 |---|---|---|
