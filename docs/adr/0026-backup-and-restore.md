@@ -216,6 +216,15 @@ finishes it. `--force` on a Postgres target takes `ACCESS EXCLUSIVE` locks on
 the four tables for the length of the load, and the caller must stop servers
 first: Leep cannot tell. The restored ref log continues its numbering.
 
+Restore writes the `refs` and `ref_log` rows directly instead of moving each
+ref through `MetaStore::cas_ref`. This is not a ref move: the target holds no
+refs, the emptiness check and the load run in one transaction that excludes
+writers (`BEGIN IMMEDIATE` on SQLite, `ACCESS EXCLUSIVE` on Postgres), and the
+refs arrive together with the ref log entries that produced them, so refs and
+log agree from the first instant the target has any. Replaying the log
+through `cas_ref` would write new entries and lose the original times, actors
+and messages.
+
 ### The drill
 A backup nobody has restored is a hope. `crates/leep-e2e/tests/backup.rs` is
 the drill, with the real binaries, for SQLite and (when
