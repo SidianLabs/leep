@@ -6,7 +6,8 @@
 //! the write-role tokens from the tokens file. Reviewers are therefore bound
 //! to the token names the server was started with.
 //!
-//! The policy file is read once at startup and is strict like the others:
+//! The policy file is read at startup and again on SIGHUP (ADR 0024), and is
+//! strict like the others:
 //!
 //! ```json
 //! { "refs": ["main"],
@@ -42,6 +43,10 @@ struct PolicyFile {
 pub struct ReviewPolicy {
     pub refs: Vec<String>,
     pub rules: ReviewRules,
+    /// The rule names and globs as written, so a reload can tell whether the
+    /// rules changed (`ReviewRules` is opaque).
+    pub auto_approve: Vec<String>,
+    pub docs_globs: Vec<String>,
 }
 
 impl ReviewPolicy {
@@ -68,6 +73,8 @@ impl ReviewPolicy {
         Ok(ReviewPolicy {
             refs: file.refs,
             rules,
+            auto_approve: file.auto_approve,
+            docs_globs: file.docs_globs,
         })
     }
 

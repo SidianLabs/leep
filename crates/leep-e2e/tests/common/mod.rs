@@ -138,6 +138,16 @@ impl Server {
         fs::read_to_string(&self.log).unwrap_or_default()
     }
 
+    /// Send SIGHUP, which makes the server reload its config files.
+    pub fn sighup(&self) {
+        let pid = self.child.as_ref().expect("server not running").id();
+        let status = Command::new("kill")
+            .args(["-HUP", &pid.to_string()])
+            .status()
+            .expect("run kill");
+        assert!(status.success(), "kill -HUP {pid} failed");
+    }
+
     /// SIGKILL, so durability does not depend on a clean shutdown.
     pub fn kill(&mut self) {
         if let Some(mut c) = self.child.take() {

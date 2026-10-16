@@ -1,8 +1,8 @@
 //! Trusted signing keys and the `--require-signatures` land policy (ADR 0010).
 //!
-//! The keys file is read once at startup and is as strict as the tokens file:
-//! unknown fields, malformed keys, duplicates and an empty list all fail
-//! startup.
+//! The keys file is read at startup and again on SIGHUP (ADR 0024). It is as
+//! strict as the tokens file: unknown fields, malformed keys, duplicates and an
+//! empty list all fail the load, and a failed reload keeps the old keys.
 //!
 //! ```json
 //! { "keys": [
@@ -106,6 +106,22 @@ impl SigningKeys {
 
     pub fn is_empty(&self) -> bool {
         self.keys.is_empty()
+    }
+
+    /// Names of the keys `newer` adds and drops, by key id, sorted. A key
+    /// that only changed its name is neither.
+    pub fn diff(&self, newer: &SigningKeys) -> (Vec<String>, Vec<String>) {
+        let missing_from = |a: &SigningKeys, b: &SigningKeys| {
+            let mut names: Vec<_> = b
+                .keys
+                .iter()
+                .filter(|k| !a.keys.iter().any(|o| o.key_id == k.key_id))
+                .map(|k| k.name.clone())
+                .collect();
+            names.sort();
+            names
+        };
+        (missing_from(self, newer), missing_from(newer, self))
     }
 
     pub fn find(&self, public_key: &[u8; 32]) -> Option<&TrustedKey> {
@@ -263,6 +279,17 @@ mod tests {
 
     fn err(text: &str) -> String {
         SigningKeys::parse(text).err().expect("should be rejected")
+    }
+
+    #[test]
+    fn diff_goes_by_key_and_ignores_renames() {
+        let old = SigningKeys::parse(&file(&[("alice", &key(1)), ("bob", &key(2))])).unwrap();
+        let new =
+            SigningKeys::parse(&file(&[("alice-laptop", &key(1)), ("carol", &key(3))])).unwrap();
+        let (added, removed) = old.diff(&new);
+        assert_eq!(added, ["carol"]);
+        assert_eq!(removed, ["bob"]);
+        assert_eq!(old.diff(&old), (vec![], vec![]));
     }
 
     #[test]

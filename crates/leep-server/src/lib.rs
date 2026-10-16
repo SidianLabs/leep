@@ -4,6 +4,7 @@
 pub mod auth;
 pub mod limits;
 pub mod observe;
+pub mod reload;
 pub mod review;
 pub mod signing;
 
@@ -116,6 +117,7 @@ pub fn router_with_timeout(
 
 /// Like [`router_with_timeout`], plus per-principal request limits (ADR 0020).
 /// Build the [`limits::Limiter`] from the same `auth` so token names match.
+/// The config is fixed; for one that reloads see [`router_with_config`].
 pub fn router_with_limits(
     repo: Repo,
     max_body_bytes: usize,
@@ -125,14 +127,25 @@ pub fn router_with_limits(
     request_timeout: Duration,
     limits: Option<Arc<limits::Limiter>>,
 ) -> Router {
-    let review = review.or_else(|| {
-        auth.as_ref().map(|a| {
-            Arc::new(review::ReviewService::new(
-                a.reviewers(),
-                leep_derive::review::ReviewRules::default(),
-            ))
-        })
-    });
+    let config =
+        reload::RuntimeConfig::fixed(auth, signing, review, limits, repo.land_policy().cloned());
+    router_with_config(
+        repo,
+        max_body_bytes,
+        request_timeout,
+        reload::ConfigHandle::fixed(config),
+    )
+}
+
+/// Build the router over a [`reload::ConfigHandle`] (ADR 0024). Tokens,
+/// limits, signing keys and the land policy come from the handle's current
+/// config, taken once per request; the land policy set on `repo` is ignored.
+pub fn router_with_config(
+    repo: Repo,
+    max_body_bytes: usize,
+    request_timeout: Duration,
+    config: Arc<reload::ConfigHandle>,
+) -> Router {
     let router = Router::new()
         .route("/v1/health", get(health))
         .route("/v1/blobs/missing", post(missing_blobs))
@@ -165,23 +178,14 @@ pub fn router_with_limits(
         .route("/v1/merge-base", get(merge_base))
         .route("/v1/merge", post(merge))
         .route("/v1/rebase", post(rebase))
-        .route("/v1/land", post(land))
-        .layer(Extension(signing))
-        .layer(Extension(review));
+        .route("/v1/land", post(land));
     // Just inside authentication, which names the principal, and still before
     // any body is read.
-    let router = match limits {
-        Some(l) => router.layer(middleware::from_fn_with_state(l, limits::enforce)),
-        None => router,
-    };
+    let router = router.layer(middleware::from_fn(limits::enforce));
     // Next in, so a rejected request never has its body read.
-    let router = match auth {
-        Some(a) => router.layer(middleware::from_fn_with_state(
-            Arc::new(a),
-            auth::require_token,
-        )),
-        None => router,
-    };
+    let router = router.layer(middleware::from_fn(auth::require_token));
+    // Outside both: the request keeps this config snapshot to its end.
+    let router = router.layer(middleware::from_fn_with_state(config, reload::snapshot));
     let router = router
         .layer(DefaultBodyLimit::disable())
         .layer(RequestBodyLimitLayer::new(max_body_bytes));
@@ -427,18 +431,19 @@ async fn get_changeset(State(repo): S, Path(id): Path<String>) -> ApiResult<Json
     Ok(Json(repo.info(cid(&id)?).await?))
 }
 
-type Keys = Extension<Option<Arc<signing::SigningKeys>>>;
+/// The config snapshot the request started with.
+type Cfg = Extension<Arc<reload::RuntimeConfig>>;
 
 async fn add_signature(
     State(repo): S,
-    Extension(keys): Keys,
+    Extension(config): Cfg,
     Path(id): Path<String>,
     body: Bytes,
 ) -> ApiResult<Json<AddSignatureResponse>> {
     let id = cid(&id)?;
     let req: AddSignatureRequest = parse_json(&body)?;
     repo.get_changeset(id).await?;
-    let keys = keys.ok_or_else(|| {
+    let keys = config.signing.as_ref().ok_or_else(|| {
         Error::Invalid("this server has no signing keys configured (--signing-keys-file)".into())
     })?;
     let public_key = leep_core::signature::parse_public_key(&req.public_key)?;
@@ -459,12 +464,12 @@ async fn add_signature(
 
 async fn get_signatures(
     State(repo): S,
-    Extension(keys): Keys,
+    Extension(config): Cfg,
     Path(id): Path<String>,
 ) -> ApiResult<Json<SignaturesResponse>> {
     let id = cid(&id)?;
     repo.get_changeset(id).await?;
-    let resp = match keys {
+    let resp = match &config.signing {
         Some(k) => k.describe(&repo, id).await?,
         None => SignaturesResponse {
             signatures: vec![],
@@ -474,8 +479,6 @@ async fn get_signatures(
     };
     Ok(Json(resp))
 }
-
-type Reviews = Extension<Option<Arc<review::ReviewService>>>;
 
 const NEEDS_AUTH: &str = "reviews need authentication (start the server with --tokens-file)";
 
@@ -516,24 +519,30 @@ async fn add_review(
 
 async fn get_reviews(
     State(repo): S,
-    Extension(service): Reviews,
+    Extension(config): Cfg,
     Path(id): Path<String>,
 ) -> ApiResult<Json<ReviewsResponse>> {
     let id = cid(&id)?;
     repo.get_changeset(id).await?;
-    let service = service.ok_or_else(|| Error::Invalid(NEEDS_AUTH.into()))?;
+    let service = config
+        .review
+        .as_ref()
+        .ok_or_else(|| Error::Invalid(NEEDS_AUTH.into()))?;
     Ok(Json(service.describe(&repo, id).await?))
 }
 
 async fn review_status(
     State(repo): S,
-    Extension(service): Reviews,
+    Extension(config): Cfg,
     Path(id): Path<String>,
     Query(q): Query<StatusQuery>,
 ) -> ApiResult<Json<ReviewStatusResponse>> {
     let id = cid(&id)?;
     repo.get_changeset(id).await?;
-    let service = service.ok_or_else(|| Error::Invalid(NEEDS_AUTH.into()))?;
+    let service = config
+        .review
+        .as_ref()
+        .ok_or_else(|| Error::Invalid(NEEDS_AUTH.into()))?;
     let target = q.target_ref.unwrap_or_else(|| "main".into());
     Ok(Json(service.status(&repo, id, &target).await?))
 }
@@ -583,12 +592,15 @@ fn ref_context(who: Option<&auth::Principal>, req: &CasRefRequest) -> ApiResult<
 
 async fn cas_ref(
     State(repo): S,
+    Extension(config): Cfg,
     auth::MaybePrincipal(who): auth::MaybePrincipal,
     Path(name): Path<String>,
     body: Bytes,
 ) -> ApiResult<Response> {
     let req: CasRefRequest = parse_json(&body)?;
     let ctx = ref_context(who.as_ref(), &req)?;
+    // One policy snapshot for the whole move: protection, forward-only, checks.
+    let repo = repo.with_land_policy_replaced(config.land_policy.clone());
     let won = repo
         .cas_ref_checked(&name, req.expected, req.new, &ctx)
         .await?;
@@ -800,10 +812,14 @@ async fn rebase(State(repo): S, body: Bytes) -> ApiResult<Json<RebaseResponse>> 
 
 async fn land(
     State(repo): S,
+    Extension(config): Cfg,
     auth::MaybePrincipal(who): auth::MaybePrincipal,
     body: Bytes,
 ) -> ApiResult<Json<LandResponse>> {
     let req: LandRequest = parse_json(&body)?;
+    // The policy the request arrived under, even if the body took a while or
+    // a reload happened since; `land` keeps it across its retries.
+    let repo = repo.with_land_policy_replaced(config.land_policy.clone());
     let actor = who.as_ref().map(|p| p.name.as_str());
     Ok(Json(
         repo.land_as(req.changeset, &req.target_ref, actor).await?,
