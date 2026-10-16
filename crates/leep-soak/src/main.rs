@@ -612,6 +612,10 @@ async fn drive(
     if let Err(e) = fin {
         eprintln!("final check did not complete: {e:?}");
     }
+    if let (Some(st), Some(bins)) = (stores.as_ref(), bin_dir) {
+        eprintln!("final verify ...");
+        ops::final_verify(bins, st, sh).await;
+    }
     sh.stop.store(true, std::sync::atomic::Ordering::Relaxed);
     finish(
         args,

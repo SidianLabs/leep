@@ -12,7 +12,10 @@ use leep_server::limits::{Defaults as LimitDefaults, Limiter};
 use leep_server::review::{RequireReview, ReviewPolicy, ReviewService};
 use leep_server::signing::{RequireSignatures, SigningKeys};
 use leep_store::CachedBlobStore;
+use tracing_subscriber::fmt::writer::BoxMakeWriter;
 use tracing_subscriber::EnvFilter;
+
+mod repair;
 
 #[derive(Parser)]
 #[command(version, about = "Leep HTTP server")]
@@ -146,6 +149,15 @@ enum Cmd {
         /// Ref name or full changeset id.
         rev: String,
     },
+    /// Check a store without writing to it: every ref's history, tree nodes
+    /// and blobs exist and match their addresses, the ref log replays to the
+    /// refs, and derived rows equal a recomputation. Uses --meta and --blobs.
+    /// Exit status 0 clean, 1 problems found, 2 could not run.
+    Verify(repair::VerifyArgs),
+    /// Rewrite or drop derived data (uses --meta and --blobs; safe beside
+    /// running servers): `rederive` recomputes rows of a kind and writes the
+    /// wrong ones, `drop` deletes a kind so it derives again on demand.
+    Repair(repair::RepairArgs),
 }
 
 #[derive(Subcommand, Clone, Copy)]
@@ -234,7 +246,9 @@ fn run_command(cmd: Cmd) -> anyhow::Result<()> {
             }
             println!("{}", auth::hash_token(&token));
         }
-        Cmd::Gc { .. } | Cmd::DeriveSearch { .. } => unreachable!("handled in main"),
+        Cmd::Gc { .. } | Cmd::DeriveSearch { .. } | Cmd::Verify(_) | Cmd::Repair(_) => {
+            unreachable!("handled in main")
+        }
         Cmd::GenToken { name, role } => {
             let (token, entry) = auth::generate(&name, role).map_err(anyhow::Error::msg)?;
             println!("token: {token}");
@@ -312,11 +326,21 @@ async fn shutdown_signal() {
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
+    // `verify` and `repair` print their report on stdout, so logs go to stderr.
+    let writer = if matches!(args.command, Some(Cmd::Verify(_) | Cmd::Repair(_))) {
+        BoxMakeWriter::new(std::io::stderr)
+    } else {
+        BoxMakeWriter::new(std::io::stdout)
+    };
     match args.log_format {
-        LogFormat::Text => tracing_subscriber::fmt().with_env_filter(filter).init(),
+        LogFormat::Text => tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(writer)
+            .init(),
         LogFormat::Json => tracing_subscriber::fmt()
             .json()
             .with_env_filter(filter)
+            .with_writer(writer)
             .init(),
     }
     match args.command {
@@ -342,6 +366,12 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Cmd::DeriveSearch { rev }) => {
             return run_derive_search(&args.meta, &args.blobs, &rev).await
+        }
+        Some(Cmd::Verify(v)) => {
+            std::process::exit(repair::run_verify(&args.meta, &args.blobs, v).await)
+        }
+        Some(Cmd::Repair(r)) => {
+            std::process::exit(repair::run_repair(&args.meta, &args.blobs, r).await)
         }
         Some(cmd) => return run_command(cmd),
         None => {}

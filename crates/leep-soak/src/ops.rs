@@ -498,6 +498,74 @@ pub async fn derive_loop(
     }
 }
 
+/// `leep-server verify --full --rehash` over the stores once the swarm has
+/// stopped (ADR 0025): everything the run wrote must be reachable, intact and
+/// derived correctly, however many restarts, collects and rebases it took.
+/// Violations are reported under `verify`.
+pub async fn final_verify(bin_dir: &Path, stores: &Stores, sh: &Shared) {
+    let t0 = Instant::now();
+    let out = Command::new(bin_dir.join("leep-server"))
+        .args(["--meta", &stores.meta, "--blobs", &stores.blobs])
+        .args(["verify", "--full", "--rehash", "--json"])
+        .env("RUST_LOG", "warn")
+        .stdin(Stdio::null())
+        .kill_on_drop(true)
+        .output()
+        .await;
+    let out = match out {
+        Ok(o) => o,
+        Err(e) => {
+            sh.violate("verify", format!("could not run verify: {e}"));
+            return;
+        }
+    };
+    let report: Option<serde_json::Value> = serde_json::from_slice(&out.stdout).ok();
+    let n = |path: &[&str]| {
+        path.iter()
+            .try_fold(report.as_ref()?, |v, k| v.get(*k))?
+            .as_u64()
+    };
+    sh.stats.add(
+        "verify_changesets",
+        n(&["stats", "changesets_reachable"]).unwrap_or(0)
+            + n(&["stats", "changesets_other"]).unwrap_or(0),
+    );
+    sh.stats
+        .add("verify_millis", t0.elapsed().as_millis() as u64);
+    if out.status.success() {
+        return;
+    }
+    let problems: Vec<String> = report
+        .as_ref()
+        .and_then(|r| r["problems"].as_array())
+        .map(|ps| {
+            ps.iter()
+                .take(5)
+                .map(|p| {
+                    format!(
+                        "[{}] {}",
+                        p["code"].as_str().unwrap_or("?"),
+                        p["message"].as_str().unwrap_or("?")
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    sh.violate(
+        "verify",
+        format!(
+            "verify exited {} with {} problems; first: {}; stderr: {}",
+            out.status,
+            n(&["problems_total"]).unwrap_or(0),
+            problems.join("; "),
+            String::from_utf8_lossy(&out.stderr)
+                .chars()
+                .take(400)
+                .collect::<String>()
+        ),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
