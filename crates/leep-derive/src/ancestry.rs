@@ -41,7 +41,7 @@ impl Repo {
         let mut seen = HashSet::from([descendant]);
         let mut stack = vec![descendant];
         while let Some(c) = stack.pop() {
-            for p in self.get_changeset(c).await?.parents {
+            for &p in self.parents(c).await?.iter() {
                 if p == ancestor {
                     return Ok(true);
                 }
@@ -148,7 +148,7 @@ impl Repo {
                 f |= STALE;
                 flags.insert(id, f);
             }
-            for p in self.get_changeset(id).await?.parents {
+            for &p in self.parents(id).await?.iter() {
                 let old = flags.get(&p).copied().unwrap_or(0);
                 let new = old | f;
                 if new == old {

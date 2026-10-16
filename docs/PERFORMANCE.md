@@ -261,6 +261,51 @@ and land p50 rose from 5 ms to 6 s with 54 requests hitting the request timeout.
 After the fix a blame is 12 ms cold and 3 ms cached on the same history, and
 the run above is flat.
 
+## Real history: git/git
+
+The benchmarks above use synthetic, mostly linear histories. `git/git` is real
+and merge-heavy (82,500 commits, 21,347 of them merges, longest parent
+chain 26,484), so it exercises what they do not.
+
+Import, on the Oracle VPS of `docs/DEPLOY.md` (4 Neoverse-N1 cores, 11 GiB,
+Postgres 16 with `shared_buffers` 2GB, blobs on a block volume), with the
+one-commit-at-a-time importer of before #50: 82,500 commits in 47 minutes
+(29 per second, falling from 45 to 31 as commits grow). Result: 238 MB of
+metadata and 8.9 GB of blobs (162,500 file contents stored whole), against
+322 MB for the same history as a git pack. Storing contents uncompressed is
+the largest cost Leep pays against git.
+
+The first path query on that history derives the path-history index for every
+changeset, and was the first thing to break: about 180 ms per changeset, so
+about four hours before the first `last-change` answered. A probe on the first
+3,795 commits (367 merges; a local Postgres 16) put almost all of it in merges: at a
+merge, each path that differs between the parents' history trees went through
+`maximal`, whose `is_ancestor` checks fell back to the generation-ordered walk
+(fetching and decoding every changeset on the way) and cost about 6 ms each.
+Merges touching 230 paths took 5 to 8 s.
+
+Two changes fixed it, with byte-identical index rows (same checksum of every
+`history-tree-v1` and `history-node-v1` row):
+
+- At a two-parent merge, a path's set at the merge base settles it: if one
+  parent's set equals the base's, nothing behind that parent changed the path
+  since the base, so the other parent's set is the answer. Only paths changed
+  on both sides still need `maximal`. Test builds cross-check every shortcut
+  against `maximal`.
+- `Repo` keeps the parents and generation of changesets it has walked in a
+  bounded in-memory cache (about 2 x 262,144 entries). Both are immutable, so
+  entries never go stale, and walks stop making a round trip per step.
+
+| Deriving the index for the first 3,795 commits of git/git | Time |
+|---|---|
+| Before | 270 s |
+| Merge-base shortcut alone, using the first-parent common ancestor | 254 s |
+| Merge-base shortcut with the true merge base | 101 s |
+| Plus the ancestry cache | 24 s |
+
+What remains is about 4.6 ms per changeset of node reads and writes, one
+metadata round trip each, plus octopus merges, which still take `maximal`.
+
 ## Analysis
 
 Principle 5 (cost scales with the change, not the repository) holds for the
@@ -284,7 +329,8 @@ commit path.
   skiplist jumps. That answer is used whenever neither chain has a merge
   above it (tracked by the `last_merge-v1` derived kind); histories with
   merges in between still take the generation-ordered walk, which is linear
-  in the distance.
+  in the distance. That walk reads parents and generations from `Repo`'s
+  ancestry cache once they have been seen (see "Real history: git/git").
 
 - Path `log` and `last_change`: the path-history index (ADR 0013) turns the
   scan into lookups. The old walk read every ancestor (about 7.5 us per

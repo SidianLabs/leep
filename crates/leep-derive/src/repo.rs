@@ -59,6 +59,70 @@ pub struct Repo {
     /// Per-ref locks serializing lands within this process (see `land`).
     pub(crate) land_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     pub(crate) land_policy: Option<Arc<dyn LandPolicy>>,
+    /// Parents and generations of changesets seen by history walks.
+    pub(crate) ancestry: Arc<AncestryCache>,
+}
+
+/// Parents and generation of changesets, kept in memory because history
+/// walks (`is_ancestor`, `merge_base`) visit thousands of changesets and would
+/// otherwise make a metadata round trip, and decode a whole changeset, per
+/// step. Both are immutable, so entries never go stale. Bounded: entries live
+/// in two generations of maps, and the older one is dropped when the newer
+/// fills, so recently used entries survive.
+#[derive(Default)]
+pub(crate) struct AncestryCache {
+    inner: Mutex<AncestryMaps>,
+}
+
+#[derive(Default)]
+struct AncestryMaps {
+    new: HashMap<ChangesetId, AncestryEntry>,
+    old: HashMap<ChangesetId, AncestryEntry>,
+}
+
+#[derive(Clone, Default)]
+struct AncestryEntry {
+    parents: Option<Arc<[ChangesetId]>>,
+    generation: Option<u64>,
+}
+
+/// Entries per map; two maps at most, so about 2 * this many changesets.
+const ANCESTRY_CACHE_ENTRIES: usize = 1 << 18;
+
+impl AncestryCache {
+    fn get(&self, id: &ChangesetId) -> AncestryEntry {
+        let mut m = self.inner.lock().unwrap();
+        if let Some(e) = m.new.get(id) {
+            return e.clone();
+        }
+        match m.old.remove(id) {
+            Some(e) => {
+                m.insert(*id, e.clone());
+                e
+            }
+            None => AncestryEntry::default(),
+        }
+    }
+
+    fn update(&self, id: ChangesetId, f: impl FnOnce(&mut AncestryEntry)) {
+        let mut m = self.inner.lock().unwrap();
+        let mut e = m
+            .new
+            .remove(&id)
+            .or_else(|| m.old.remove(&id))
+            .unwrap_or_default();
+        f(&mut e);
+        m.insert(id, e);
+    }
+}
+
+impl AncestryMaps {
+    fn insert(&mut self, id: ChangesetId, e: AncestryEntry) {
+        if self.new.len() >= ANCESTRY_CACHE_ENTRIES {
+            self.old = std::mem::take(&mut self.new);
+        }
+        self.new.insert(id, e);
+    }
 }
 
 impl Repo {
@@ -68,6 +132,7 @@ impl Repo {
             meta,
             land_locks: Arc::default(),
             land_policy: None,
+            ancestry: Arc::default(),
         }
     }
 
@@ -202,8 +267,23 @@ impl Repo {
 
     /// Length of the longest parent chain to a root; roots are 1.
     pub async fn generation(&self, id: ChangesetId) -> Result<u64> {
+        if let Some(g) = self.ancestry.get(&id).generation {
+            return Ok(g);
+        }
         let v = derived::derive::<Generation>(self, id).await?;
-        derived::decode_u64(&v)
+        let g = derived::decode_u64(&v)?;
+        self.ancestry.update(id, |e| e.generation = Some(g));
+        Ok(g)
+    }
+
+    /// Parents of a stored changeset, without decoding it again once seen.
+    pub(crate) async fn parents(&self, id: ChangesetId) -> Result<Arc<[ChangesetId]>> {
+        if let Some(p) = self.ancestry.get(&id).parents {
+            return Ok(p);
+        }
+        let p: Arc<[ChangesetId]> = self.get_changeset(id).await?.parents.into();
+        self.ancestry.update(id, |e| e.parents = Some(p.clone()));
+        Ok(p)
     }
 
     /// Read one tree node. The empty tree always exists.
@@ -239,5 +319,41 @@ impl Repo {
             }
         }
         Err(Error::NotFound(format!("revision {rev:?}")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn id(n: usize) -> ChangesetId {
+        let mut b = [0u8; 32];
+        b[..8].copy_from_slice(&(n as u64).to_le_bytes());
+        ChangesetId(Hash(b))
+    }
+
+    #[test]
+    fn ancestry_cache_is_bounded_and_keeps_recent_entries() {
+        let c = AncestryCache::default();
+        let total = 2 * ANCESTRY_CACHE_ENTRIES + 10;
+        for n in 0..total {
+            c.update(id(n), |e| e.generation = Some(n as u64));
+            if n % 1000 == 0 {
+                // Touching an old entry keeps it alive across rotations.
+                assert_eq!(c.get(&id(0)).generation, Some(0));
+            }
+        }
+        let m = c.inner.lock().unwrap();
+        assert!(m.new.len() + m.old.len() <= 2 * ANCESTRY_CACHE_ENTRIES);
+        drop(m);
+        assert_eq!(c.get(&id(total - 1)).generation, Some(total as u64 - 1));
+        assert_eq!(c.get(&id(0)).generation, Some(0));
+        assert_eq!(c.get(&id(1)).generation, None, "evicted");
+        c.update(id(5), |e| e.parents = Some(Arc::from([id(4)])));
+        let e = c.get(&id(5));
+        assert_eq!(
+            (e.parents.as_deref(), e.generation),
+            (Some(&[id(4)][..]), None)
+        );
     }
 }

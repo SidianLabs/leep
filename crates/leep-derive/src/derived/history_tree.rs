@@ -129,6 +129,20 @@ impl DerivedKind for HistoryTree {
         let mut new = Cursor::<TreeNode>::new(repo, repo.root_tree(id).await?);
         let mut hist: Vec<Cursor<HistoryNode>> =
             heads.iter().map(|h| Cursor::new(repo, *h)).collect();
+        // At a two-parent merge, the history at the merge base settles most
+        // paths without ancestry checks; see `inherit`. Any common ancestor
+        // would be correct, but only the best one is recent enough to match
+        // the parents' entries for paths one side never touched.
+        let mut common = match cs.parents.as_slice() {
+            [a, b] => match repo.merge_base(*a, *b).await? {
+                Some(c) => Some(Cursor::<HistoryNode>::new(
+                    repo,
+                    decode_hash(&super::derive::<HistoryTree>(repo, c).await?)?,
+                )),
+                None => None,
+            },
+            _ => None,
+        };
 
         let mut kids: HashMap<&str, Vec<&str>> = HashMap::new();
         for p in &paths {
@@ -146,13 +160,24 @@ impl DerivedKind for HistoryTree {
             } else {
                 // Not changed here, so everything that last changed it lies
                 // behind some parent.
-                let mut all = Vec::new();
+                let mut sets = Vec::with_capacity(hist.len());
                 for h in &mut hist {
-                    if let Some(e) = h.entry(p).await? {
-                        all.extend_from_slice(e.changed());
-                    }
+                    sets.push(changed_of(h.entry(p).await?));
                 }
-                maximal(repo, all).await?
+                match &mut common {
+                    Some(c) => {
+                        let at_common = changed_of(c.entry(p).await?);
+                        match inherit(&sets[0], &sets[1], &at_common) {
+                            Some(set) => {
+                                #[cfg(test)]
+                                assert_eq!(set, maximal(repo, sets.concat()).await?, "{p}");
+                                set
+                            }
+                            None => maximal(repo, sets.concat()).await?,
+                        }
+                    }
+                    None => maximal(repo, sets.concat()).await?,
+                }
             };
             let first = match hist.first_mut() {
                 Some(h) => h.entry(p).await?.and_then(|e| e.node()),
@@ -193,6 +218,33 @@ async fn rebuild<'a>(
         node.entries.insert(name.to_string(), entry);
     }
     repo.put_history_node(&node).await
+}
+
+fn changed_of(e: Option<HistoryEntry>) -> Vec<ChangesetId> {
+    e.map(|e| e.changed().to_vec()).unwrap_or_default()
+}
+
+/// The newest changes of a path at a merge of `first` and `second`, given its
+/// set at `common`, a common ancestor of both parents, when that settles it.
+///
+/// Each set holds the maximal changes among a changeset's ancestors. If the
+/// first parent's set equals the common ancestor's, every change behind the
+/// first parent is behind `common` and so behind the second parent, where its
+/// set already covers it: the answer is the second parent's set. The same
+/// holds the other way round. Only paths changed on both sides since `common`
+/// need [`maximal`], whose ancestry checks walk history on merge-heavy graphs.
+fn inherit(
+    first: &[ChangesetId],
+    second: &[ChangesetId],
+    common: &[ChangesetId],
+) -> Option<Vec<ChangesetId>> {
+    if first == common {
+        Some(second.to_vec())
+    } else if second == common {
+        Some(first.to_vec())
+    } else {
+        None
+    }
 }
 
 /// Drop ids that are ancestors of other ids in the set. Sorted by id.
