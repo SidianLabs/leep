@@ -4,14 +4,16 @@ use std::str::FromStr;
 use async_trait::async_trait;
 use bytes::Bytes;
 use leep_core::store::unix_now;
-use leep_core::{Changeset, ChangesetId, Hash, MetaStore, RefLogEntry, RefUpdateContext, Result};
+use leep_core::{
+    Changeset, ChangesetId, DerivedRow, Hash, MetaStore, RefLogEntry, RefUpdateContext, Result,
+};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{PgConnection, PgPool, Row};
 
 use crate::migrate::{self, AppliedMigration, Migration, MigrationReport, Session};
 use crate::{
-    changesets_in_order, decode_checked, log_entry, storage, to_hash, to_id, unique,
-    values_in_order, LogRow, SchemaMode, DELETE_BATCH,
+    changesets_in_order, decode_checked, derived_columns, log_entry, storage, to_hash, to_id,
+    unique, values_in_order, LogRow, SchemaMode, DELETE_BATCH,
 };
 
 /// The compiled migration list (ADR 0023). Append only.
@@ -464,6 +466,53 @@ impl MetaStore for PostgresMetaStore {
         .await
         .map_err(storage)?;
         Ok(())
+    }
+
+    /// One `INSERT ... SELECT FROM UNNEST` statement, so the batch is atomic.
+    async fn put_derived_many(&self, rows: &[DerivedRow]) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let (kinds, keys, values) = derived_columns(rows);
+        sqlx::query(
+            "INSERT INTO derived (kind, key, value) \
+             SELECT * FROM UNNEST($1::text[], $2::bytea[], $3::bytea[]) \
+             ON CONFLICT (kind, key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(kinds)
+        .bind(keys)
+        .bind(values)
+        .execute(&self.pool)
+        .await
+        .map_err(storage)?;
+        Ok(())
+    }
+
+    /// One statement: the changeset insert is a data-modifying `WITH`, which
+    /// Postgres runs to completion even though nothing reads it, so the
+    /// changeset and its rows commit together or not at all.
+    async fn put_changeset_with_derived(
+        &self,
+        cs: &Changeset,
+        rows: &[DerivedRow],
+    ) -> Result<ChangesetId> {
+        let id = cs.id();
+        let (kinds, keys, values) = derived_columns(rows);
+        sqlx::query(
+            "WITH c AS (INSERT INTO changesets (id, data) VALUES ($1, $2) ON CONFLICT DO NOTHING) \
+             INSERT INTO derived (kind, key, value) \
+             SELECT * FROM UNNEST($3::text[], $4::bytea[], $5::bytea[]) \
+             ON CONFLICT (kind, key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(id.0.as_bytes().as_slice())
+        .bind(cs.encode())
+        .bind(kinds)
+        .bind(keys)
+        .bind(values)
+        .execute(&self.pool)
+        .await
+        .map_err(storage)?;
+        Ok(id)
     }
 
     async fn schema_version(&self) -> Result<Option<u64>> {

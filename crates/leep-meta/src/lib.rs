@@ -135,6 +135,24 @@ fn values_in_order(
         .collect()
 }
 
+/// The rows of a batched derived write as three columns, keeping only the
+/// last row for each `(kind, key)`: that is what writing them in order leaves,
+/// and Postgres refuses to update one row twice in a statement.
+fn derived_columns(rows: &[leep_core::DerivedRow]) -> (Vec<&str>, Vec<&[u8]>, Vec<&[u8]>) {
+    let mut seen = std::collections::HashSet::new();
+    let mut last: Vec<&leep_core::DerivedRow> = rows
+        .iter()
+        .rev()
+        .filter(|r| seen.insert((r.kind.as_str(), r.key)))
+        .collect();
+    last.reverse();
+    (
+        last.iter().map(|r| r.kind.as_str()).collect(),
+        last.iter().map(|r| r.key.as_bytes().as_slice()).collect(),
+        last.iter().map(|r| r.value.as_ref()).collect(),
+    )
+}
+
 /// Rows `delete_derived_kind` removes per statement, so dropping a large kind
 /// is many short transactions, not one that holds locks for minutes.
 const DELETE_BATCH: i64 = 10_000;

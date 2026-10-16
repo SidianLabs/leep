@@ -204,6 +204,87 @@ async fn postgres_delete_kind_spans_batches() {
     check_delete_kind_spans_batches(&s).await;
 }
 
+/// A batched write the database refuses part of leaves nothing behind. The
+/// caller has installed a trigger that rejects rows of kind `boom`.
+async fn check_batched_writes_are_atomic(store: &dyn MetaStore) {
+    use bytes::Bytes;
+    use leep_core::{DerivedRow, Hash};
+
+    let ok = |n: u32| {
+        DerivedRow::new(
+            "atomic",
+            Hash::of_blob(&n.to_be_bytes()),
+            Bytes::from_static(b"v"),
+        )
+    };
+    let boom = DerivedRow::new("boom", Hash::of_blob(b"boom"), Bytes::from_static(b"x"));
+    let c = cs(7_000);
+    assert!(store
+        .put_changeset_with_derived(&c, &[ok(1), boom.clone(), ok(2)])
+        .await
+        .is_err());
+    assert_eq!(
+        store.get_changeset(&c.id()).await.unwrap(),
+        None,
+        "no changeset"
+    );
+    assert!(store
+        .get_derived("atomic", &ok(1).key)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(store.put_derived_many(&[ok(3), boom, ok(4)]).await.is_err());
+    assert!(store
+        .list_derived("atomic", None, 10)
+        .await
+        .unwrap()
+        .is_empty());
+    // The same write without the refused row goes through whole.
+    store
+        .put_changeset_with_derived(&c, &[ok(1), ok(2)])
+        .await
+        .unwrap();
+    assert_eq!(store.get_changeset(&c.id()).await.unwrap(), Some(c));
+    assert_eq!(
+        store.list_derived("atomic", None, 10).await.unwrap().len(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn sqlite_batched_writes_are_atomic() {
+    let s = SqliteMetaStore::connect("sqlite::memory:").await.unwrap();
+    sqlx::query(
+        "CREATE TRIGGER boom BEFORE INSERT ON derived WHEN NEW.kind = 'boom' \
+         BEGIN SELECT RAISE(ABORT, 'boom'); END",
+    )
+    .execute(&s.pool)
+    .await
+    .unwrap();
+    check_batched_writes_are_atomic(&s).await;
+}
+
+#[tokio::test]
+async fn postgres_batched_writes_are_atomic() {
+    let Some((s, _)) = pg_store("atomic").await else {
+        return;
+    };
+    sqlx::query(
+        "CREATE FUNCTION boom() RETURNS trigger LANGUAGE plpgsql AS \
+         $$ BEGIN IF NEW.kind = 'boom' THEN RAISE EXCEPTION 'boom'; END IF; RETURN NEW; END $$",
+    )
+    .execute(&s.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER boom BEFORE INSERT ON derived FOR EACH ROW EXECUTE FUNCTION boom()",
+    )
+    .execute(&s.pool)
+    .await
+    .unwrap();
+    check_batched_writes_are_atomic(&s).await;
+}
+
 #[tokio::test]
 async fn open_dispatch() {
     let m = open_meta_store("mem://").await.unwrap();
