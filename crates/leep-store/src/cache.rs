@@ -15,8 +15,9 @@ pub struct CacheStats {
     pub bytes: usize,
 }
 
+/// Shared with the pack reader's cache of decoded objects.
 #[derive(Default)]
-struct Lru {
+pub(crate) struct Lru {
     map: HashMap<Hash, (Bytes, u64)>,
     order: BTreeMap<u64, Hash>,
     tick: u64,
@@ -24,7 +25,7 @@ struct Lru {
 }
 
 impl Lru {
-    fn get(&mut self, hash: &Hash) -> Option<Bytes> {
+    pub(crate) fn get(&mut self, hash: &Hash) -> Option<Bytes> {
         let (data, old) = self.map.get_mut(hash)?;
         self.order.remove(old);
         self.tick += 1;
@@ -33,7 +34,7 @@ impl Lru {
         Some(data.clone())
     }
 
-    fn insert(&mut self, hash: Hash, data: Bytes, capacity: usize) {
+    pub(crate) fn insert(&mut self, hash: Hash, data: Bytes, capacity: usize) {
         if data.len() > capacity {
             return;
         }
@@ -48,7 +49,7 @@ impl Lru {
         self.evict_over(capacity);
     }
 
-    fn remove(&mut self, hash: &Hash) {
+    pub(crate) fn remove(&mut self, hash: &Hash) {
         if let Some((d, tick)) = self.map.remove(hash) {
             self.order.remove(&tick);
             self.bytes -= d.len();

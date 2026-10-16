@@ -12,6 +12,9 @@ bytes.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 metrics.workspace = true
+blake3.workspace = true
+hex.workspace = true
+zstd.workspace = true
 object_store = { version = "0.12", features = ["aws"] }
 url = "2"
 futures = "0.3"

@@ -1,9 +1,15 @@
-//! `BlobStore` backends for Leep: local filesystem, S3-compatible object
-//! storage, and a bounded LRU cache that can sit in front of any of them.
+//! `BlobStore` backends for Leep: local filesystem (loose objects plus
+//! packs, ADR 0029), S3-compatible object storage, and a bounded LRU cache
+//! that can sit in front of any of them.
 
 mod cache;
 mod fs;
 mod object;
+pub mod pack;
+#[cfg(test)]
+mod pack_tests;
+mod packset;
+mod repack;
 pub mod sync;
 
 use std::path::PathBuf;
@@ -15,9 +21,19 @@ use leep_core::{BlobStore, Error, Result};
 pub use cache::{CacheStats, CachedBlobStore};
 pub use fs::FsBlobStore;
 pub use object::{ObjectBlobStore, S3Config};
+pub use repack::{PublishedPack, RepackHook, RepackOptions, RepackReport, RepackStep};
 
 fn storage_err(e: impl std::fmt::Display) -> Error {
     Error::Storage(e.to_string())
+}
+
+/// The directory of a filesystem blob store URL (`file:///abs/path` or a
+/// bare path), `None` for any other kind.
+pub fn fs_blob_root(url: &str) -> Option<PathBuf> {
+    if let Some(rest) = url.strip_prefix("file://") {
+        return Some(PathBuf::from(rest));
+    }
+    (!url.contains("://") && url != "mem:").then(|| PathBuf::from(url))
 }
 
 /// Open a blob store from a URL: `mem://`, `file:///abs/path` (or a bare
@@ -78,6 +94,10 @@ mod tests {
         assert!(open_blob_store("s3://").is_err());
         assert!(open_blob_store("ftp://x").is_err());
         assert!(open_blob_store("s3://b?bogus=1").is_err());
+        assert_eq!(fs_blob_root(&format!("file://{p}")).unwrap(), dir.path());
+        assert_eq!(fs_blob_root(p).unwrap(), dir.path());
+        assert!(fs_blob_root("s3://bucket").is_none());
+        assert!(fs_blob_root("mem://").is_none());
     }
 
     /// With nothing scheduled the fault injector is transparent: every
