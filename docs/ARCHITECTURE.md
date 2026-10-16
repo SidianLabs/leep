@@ -578,6 +578,7 @@ implementation. Nothing above the traits changes.
 
 Storage is the cost that grows fastest with history: every blob and tree
 node is stored whole, so imported git/git takes 8.7 GB of objects against a
-0.33 GB git pack. ADR 0029 (proposed) adds packs below `BlobStore`: a
+0.33 GB git pack. ADR 0029 adds packs below `BlobStore`: a
 `repack` job stores objects as zstd deltas against the previous version of
-the same path, with no change to hashes, the API or clients.
+the same path, with no change to hashes, the API or clients (a prototype
+packed the first 3,795 commits into 3.2 MB against git's 4.4 MB).
