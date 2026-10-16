@@ -366,8 +366,8 @@ median of five more; statements counted with `log_statement = all`:
 Before, the first request made exactly three statements per entry (changeset,
 parent generation, root tree) and later ones two; after, the whole slice takes
 84 batched statements and 100 entries take 27, most of them in the first rounds
-while the skiplists double the known window. The full git/git history was not re-measured
-here; its `log limit 10000` took 3.6 s before.
+while the skiplists double the known window. On the full git/git history (below) `log limit 10000` went from 3.6 s to
+0.64 s.
 
 Path logs (`log --path`) are unchanged: each changeset the path walk yields is
 found in the index at the previous one's parents, so batches would hold one
@@ -380,6 +380,98 @@ heap of guesses, decoding a skiplist per changeset) and its extra skiplist
 reads make the walk 2 to 4 times slower, 3 to 4 us per changeset. Against about
 0.1 ms per Postgres round trip saved per changeset, that is the right trade
 for any real backend.
+
+### Full history with chunked nodes, warming and batched log
+
+The whole of git/git again, on the same VPS, after ADRs 0027 (chunked nodes),
+0028 (warming) and 0030 (batched log). All path-history and search rows were
+deleted and a server started with `--warm-interval 30s`; nobody sent a query.
+
+| Path-history index, all 82,500 commits | Before (v1, derived by the first query) | Now (v2, derived by the warmer) |
+|---|---|---|
+| Time to build | 69 min, inside one request | 41 min, in the background |
+| Node rows | 174,978 | 410,685 |
+| Node bytes | 6.1 GB | 796 MB |
+| Whole database | 3.7 GB | 1.0 GB (238 MB of it changesets and mappings) |
+
+Queries against a freshly started server on that database (`main` at
+generation 26,484), first request and the repeat. A Linux kernel import ran
+on the same machine during these runs, so times are somewhat inflated; the two
+passes agreed within 20%.
+
+| Query | First | Repeat |
+|---|---|---|
+| `log` 100 | 75–81 ms | 34–44 ms |
+| `log` 10,000 (19.5 MB of JSON) | 0.75–0.77 s | 0.64–0.69 s |
+| `last-change Makefile` (changed often) | 6–8 ms | 2.3–2.6 ms |
+| `last-change COPYING` (changed rarely) | 9–11 ms | 7.0–7.5 ms |
+| `log` of a path that never existed | 2–3 ms | 1.2–1.5 ms |
+| `log path=Makefile` 50 | 0.17–0.22 s | 90–94 ms |
+| `blame Makefile` (derived once, 6.7 s, then stored) | 0.31–0.35 s | 0.34 s |
+| `blame COPYING` | 3–6 ms | 3–5 ms |
+| `diff` against 1,000 commits back | 18–65 ms | 11–12 ms |
+| `merge-base` with `master~20000` | 2.2 s | 0.11–0.14 s |
+| `merge-base` with `master~1000` | **70 s** | 0.10 s |
+| `search strbuf_addf` (limit 100) | 0.29–0.30 s | 0.23–0.25 s |
+| `log author=Junio` 100 | 69–82 ms | 85–87 ms |
+
+The cold `merge-base` against an ancestor 1,000 commits back is a bug: the
+fast path does not apply on a merge-heavy history, and the reference walk then
+follows long-merged topic branches one round trip at a time. The repeat is
+fast only because the walk's parents and generations are cached by then.
+
+### Against other version control systems
+
+The same history and queries with git (as cloned, and with a
+commit-graph), jj 0.46 (`jj git clone`), Sapling (`sl clone --git`), Fossil
+(`git fast-export --reencode=yes | fossil import --git`) and Mercurial 6.7
+(`hg convert`), each command run twice on the same VPS, repeat times shown.
+Leep is the server above, measured over HTTP on loopback, so it includes
+JSON encoding and transfer; the others are local command lines and include
+process start (about 0.25 s for Mercurial, 0.3 s for Sapling). A dash means
+not measured.
+
+| Query, repeat | Leep | git | git + commit-graph | jj | Sapling | Fossil | Mercurial |
+|---|---|---|---|---|---|---|---|
+| `log` 100 | 34–44 ms | 5 ms | 5 ms | 0.31 s | 0.36 s | 7 ms | 0.28 s |
+| `log` 10,000 | 0.64 s | 0.15 s | 0.15 s | 26 s | 2.6 s | — | 2.0 s |
+| `last-change Makefile` | 2.5 ms | 5 ms | 4 ms | 23 s | 2.5 s | 66 ms | 0.28 s |
+| `last-change COPYING` | 7 ms | 0.35 s | 65 ms | 18 s | 0.56 s | 5 ms | 0.40 s |
+| Path that never existed | 1.3 ms | 0.89 s | 50 ms | 19 s | — | 6 ms | 0.44 s |
+| `log path=Makefile` 50 | 92 ms | 25 ms | 12 ms | 1.3 s | 2.5 s | 66 ms | 0.30 s |
+| `blame Makefile` | 0.34 s | 1.5 s | 1.2 s | 27 s | 21 s | 1.0 s | 6.9 s |
+| `blame COPYING` | 4 ms | 0.50 s | 94 ms | 18 s | 0.62 s | 49 ms | 0.35 s |
+| `diff` 1,000 back | 11 ms | 24 ms | 24 ms | 31 ms | 0.37 s | — | 0.28 s |
+| `merge-base` deep | 0.12 s | 0.70 s | 0.11 s | 36 ms | 0.35 s | — | 0.26 s |
+| `merge-base` 1,000 back | 0.10 s (70 s cold) | 0.17 s | 27 ms | 24 ms | 0.33 s | — | 0.26 s |
+| Search / `grep` | 0.24 s | 0.18 s | 0.18 s | — | — | — | 2.3 s |
+| `log author=…` 100 | 86 ms | 0.94 s | 0.89 s | 0.90 s | — | — | 0.29 s |
+
+| Storage and import | Leep | git | jj | Sapling | Fossil | Mercurial |
+|---|---|---|---|---|---|---|
+| On disk | 1.0 GB database + 8.9 GB loose blobs | 328 MB | 444 MB | 386 MB | 512 MB | 404 MB |
+| Import from git | 47 min (before the pipelined importer, #50) | — | 43 s | 43 s | 72 min | 84 min |
+
+What this shows:
+
+- **Per-path history is where Leep leads.** `last-change` and `log` of a rare
+  or missing path answer from the path-history index in milliseconds whatever
+  the history's depth; git without a commit-graph scans 0.35–0.9 s for them,
+  and jj and Sapling take seconds to tens of seconds. Blame of a hot file is
+  3–4x faster than git's once stored, and blame of a rare file is two orders
+  of magnitude faster. Author filters are 3x faster than Mercurial and 10x
+  faster than the others.
+- **Full-history listing is where git leads.** `log` 10,000 is 4x slower than
+  git: Leep returns 19.5 MB of JSON over HTTP where git prints a line per
+  commit from a memory-mapped pack. Short `log`s pay a round trip and JSON
+  encoding that a local command does not.
+- **Storage is the largest gap.** Loose, uncompressed blobs make Leep 27x
+  larger than git. Packs (ADR 0029, below) store the first 3,795 commits in
+  4.2 MB against 91.2 MB loose and git's 4.4 MB; the full history has not been
+  repacked yet.
+- **Not compared:** Scion. There was no build to run on this machine, and
+  published figures from other hardware and other histories are not
+  comparable with these.
 
 ## Packed blobs
 
