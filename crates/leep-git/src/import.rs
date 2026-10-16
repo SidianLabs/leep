@@ -8,11 +8,11 @@ use gix::bstr::ByteSlice;
 use gix::objs::tree::EntryKind;
 use gix::ObjectId;
 use leep_core::{
-    Changeset, ChangesetId, Error, FileChange, FileKind, Hash, RefUpdateContext, RepoPath, Result,
+    Changeset, ChangesetId, DerivedRow, Error, FileChange, FileKind, Hash, RefUpdateContext,
+    RepoPath, Result,
 };
 use leep_derive::Repo;
 use tokio::sync::mpsc;
-use tokio::task::JoinSet;
 
 use crate::{
     format_tz, gerr, git_key, lookup_leep, EXTRA_GIT_AUTHOR_TZ, EXTRA_GIT_COMMIT,
@@ -21,15 +21,11 @@ use crate::{
 };
 
 /// Commits decoded and with their blobs uploaded ahead of the changeset
-/// writes. Bounds memory to this many commits' new blobs.
+/// writes. Bounds memory to this many commits' new blobs. A commit's blobs
+/// are written a few at a time and their metadata in two batched queries
+/// (`Repo::put_blobs`), so this many commits ahead stay well under the
+/// metadata pool's 16 connections.
 const COMMITS_AHEAD: usize = 16;
-/// Concurrent blob uploads per commit; with COMMITS_AHEAD this lets blob
-/// fsyncs overlap instead of running one after another. Each upload also
-/// writes a claim row, so this and the next bound stay under the metadata
-/// pool's 16 connections most of the time.
-const BLOB_UPLOADS_PER_COMMIT: usize = 4;
-/// Git-to-Leep mapping rows written concurrently behind the changesets.
-const MAPPING_WRITES_IN_FLIGHT: usize = 4;
 
 #[derive(Clone, Debug, Default)]
 pub struct ImportOptions {
@@ -258,16 +254,15 @@ async fn prepare_and_upload(
     .await
     .map_err(|e| Error::Other(format!("prepare task: {e}")))??;
     let uploaded = blobs.len();
-    let mut puts = stream::iter(blobs)
-        .map(|(oid, data)| async move {
-            let size = data.len() as u64;
-            let h = repo.put_blob(Bytes::from(data)).await?;
-            Ok::<_, Error>((oid, h, size))
-        })
-        .buffer_unordered(BLOB_UPLOADS_PER_COMMIT);
-    while let Some(r) = puts.next().await {
-        let (b, h, size) = r?;
-        cache.lock().unwrap().insert(b, (h, size));
+    let (oids, data): (Vec<ObjectId>, Vec<Bytes>) = blobs
+        .into_iter()
+        .map(|(oid, d)| (oid, Bytes::from(d)))
+        .unzip();
+    let sizes: Vec<u64> = data.iter().map(|d| d.len() as u64).collect();
+    let hashes = repo.put_blobs(data).await?;
+    let mut cache = cache.lock().unwrap();
+    for ((b, h), size) in oids.into_iter().zip(hashes).zip(sizes) {
+        cache.insert(b, (h, size));
     }
     Ok((oid, p, uploaded))
 }
@@ -374,7 +369,6 @@ pub async fn import(
         })
     };
 
-    let mut mapping_writes = JoinSet::new();
     while let Some(next) = rx.recv().await {
         let (oid, p, uploaded) = next?;
         report.blobs_uploaded += uploaded;
@@ -429,39 +423,29 @@ pub async fn import(
             let json = serde_json::to_string(&p.headers).map_err(gerr)?;
             extra.insert(EXTRA_GIT_HEADERS.to_string(), json);
         }
-        let id = repo
-            .create_changeset(Changeset {
-                parents,
-                author: p.author,
-                timestamp: p.time,
-                message: p.message,
-                changes,
-                extra,
-            })
-            .await?;
-        mapped.insert(oid, id);
-        // The mapping is written behind the next changesets. A crash before it
-        // lands only means a rerun imports this commit again, to the same id.
-        let m = meta.clone();
-        mapping_writes.spawn(async move {
-            m.put_derived(
+        let cs = Changeset {
+            parents,
+            author: p.author,
+            timestamp: p.time,
+            message: p.message,
+            changes,
+            extra,
+        };
+        // The mapping goes in the changeset's own write, so it never names a
+        // changeset that is not stored; a crash before it only means a rerun
+        // imports this commit again, to the same id.
+        let cid = cs.id();
+        let mapping = vec![
+            DerivedRow::new(
                 GIT_TO_LEEP,
-                &git_key(oid.as_bytes()),
-                Bytes::copy_from_slice(id.0.as_bytes()),
-            )
-            .await?;
-            m.put_derived(LEEP_TO_GIT, &id.0, Bytes::copy_from_slice(oid.as_bytes()))
-                .await
-        });
-        while mapping_writes.len() >= MAPPING_WRITES_IN_FLIGHT {
-            if let Some(r) = mapping_writes.join_next().await {
-                r.map_err(|e| Error::Other(format!("mapping write task: {e}")))??;
-            }
-        }
+                git_key(oid.as_bytes()),
+                Bytes::copy_from_slice(cid.0.as_bytes()),
+            ),
+            DerivedRow::new(LEEP_TO_GIT, cid.0, Bytes::copy_from_slice(oid.as_bytes())),
+        ];
+        let id = repo.create_changeset_with_rows(cs, mapping).await?;
+        mapped.insert(oid, id);
         report.commits_imported += 1;
-    }
-    while let Some(r) = mapping_writes.join_next().await {
-        r.map_err(|e| Error::Other(format!("mapping write task: {e}")))??;
     }
     producer
         .await
