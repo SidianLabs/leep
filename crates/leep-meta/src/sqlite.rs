@@ -77,7 +77,7 @@ impl SqliteMetaStore {
         } else {
             (
                 opts.journal_mode(SqliteJournalMode::Wal)
-                    .busy_timeout(std::time::Duration::from_secs(30)),
+                    .busy_timeout(BUSY_TIMEOUT),
                 8,
             )
         };
@@ -89,7 +89,18 @@ impl SqliteMetaStore {
                 .idle_timeout(None)
                 .max_lifetime(None);
         }
-        pool.connect_with(opts).await.map_err(storage)
+        // Switching a new file to WAL needs an exclusive lock, and SQLite can
+        // report a busy database at once instead of waiting out the busy
+        // timeout, so processes opening a fresh file together retry here.
+        let deadline = std::time::Instant::now() + BUSY_TIMEOUT;
+        loop {
+            match pool.clone().connect_with(opts.clone()).await {
+                Err(e) if is_busy(&e) && std::time::Instant::now() < deadline => {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                r => return r.map_err(storage),
+            }
+        }
     }
 
     /// One transaction. `BEGIN IMMEDIATE` takes the write lock first, so
@@ -110,6 +121,14 @@ impl SqliteMetaStore {
         tx.commit().await.map_err(storage)?;
         Ok(report)
     }
+}
+
+/// How long a writer waits for the database lock before giving up.
+const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// `SQLITE_BUSY`: another connection holds a lock this one needs.
+fn is_busy(e: &sqlx::Error) -> bool {
+    matches!(e, sqlx::Error::Database(d) if d.code().as_deref() == Some("5"))
 }
 
 struct SqliteSession<'a>(&'a mut SqliteConnection);
