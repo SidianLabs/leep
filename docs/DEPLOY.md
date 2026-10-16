@@ -246,7 +246,9 @@ unsigned again, including for `land`.
 
 With several servers behind a balancer, signal every instance and compare
 `leep_config_generation` across them. See
-[OPERATIONS.md](OPERATIONS.md#config-reload) for metrics and alerts.
+[OPERATIONS.md](OPERATIONS.md#config-reload) for metrics and alerts, and
+[LeepConfigReloadFailed](RUNBOOKS.md#leepconfigreloadfailed) for what to do when
+a reload is refused.
 
 ## Environment variables
 
@@ -333,7 +335,8 @@ URL` checks the copy.
 Take a backup before every upgrade, schedule one daily, check it with
 `backup-verify`, and run the restore drill on a schedule: an untested backup is
 not a backup. The procedure, retention, RPO and RTO, the drill and the alerts
-are in [OPERATIONS.md](OPERATIONS.md#backup-and-restore).
+are in [OPERATIONS.md](OPERATIONS.md#backup-and-restore); what to do when a
+backup alert fires is in [RUNBOOKS.md](RUNBOOKS.md#leepbackupstale).
 
 ## Upgrades
 
@@ -357,3 +360,13 @@ docker compose -f deploy/docker-compose.yml run --rm leep-server migrate        
 
 The full procedure, rolling upgrades and the newer-schema refusal are in
 [OPERATIONS.md](OPERATIONS.md#upgrading).
+
+## Monitoring and runbooks
+
+Start the server with `--metrics-listen` (the compose stack does not set it) and
+load the rules from [OPERATIONS.md](OPERATIONS.md#suggested-alerts) into
+Prometheus. Every rule has a `runbook_url` pointing at its section of
+[RUNBOOKS.md](RUNBOOKS.md): what fired, the impact, how to diagnose, the likely
+causes and the safe fix. Set the base URL in the rules to wherever you publish
+that file. `GET /v1/health` only says the process is serving HTTP; it does not
+check the stores, so alert on the metrics, not on the probe alone.

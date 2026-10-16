@@ -29,6 +29,8 @@ jobs:
       - run: cargo fmt --all -- --check
       # Versions move only when the maintainer decides; see docs/ROADMAP.md.
       - run: ./scripts/check-version.sh
+      # Every alert in docs/OPERATIONS.md has a runbook in docs/RUNBOOKS.md and the other way round.
+      - run: ./scripts/check-runbooks.sh
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       # Compile only, so the benches do not rot.

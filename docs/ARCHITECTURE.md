@@ -455,7 +455,8 @@ GC and restarts running beside a swarm of agents.
 Observability: libraries emit `tracing` events and `metrics` facade calls
 (no-ops without a recorder); only `leep-server` installs a recorder and
 serves `/metrics` on a separate listener. Land retries, exhaustion and cache
-hit ratio are the signals to watch; see [OPERATIONS.md](OPERATIONS.md).
+hit ratio are the signals to watch; see [OPERATIONS.md](OPERATIONS.md), and
+[RUNBOOKS.md](RUNBOOKS.md) for what to do when each alert fires.
 
 ## 10. Security
 

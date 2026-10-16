@@ -6,6 +6,9 @@
    ([docs/adr/](docs/adr/)) and must follow [docs/FORMATS.md](docs/FORMATS.md).
 3. Before opening a PR, run `cargo fmt --all`, `cargo clippy --workspace
    --all-targets -- -D warnings` and `cargo test --workspace`.
+   If you add or rename an alert in [docs/OPERATIONS.md](docs/OPERATIONS.md),
+   give it a `## <AlertName>` runbook in [docs/RUNBOOKS.md](docs/RUNBOOKS.md) and
+   run `scripts/check-runbooks.sh`, which CI runs too.
 4. Keep PRs to one logical change. Follow the commit, branch and PR
    conventions in [`.claude/skills/commit-and-pr/SKILL.md`](.claude/skills/commit-and-pr/SKILL.md).
    Commits and PRs credit human authors only, never AI tools.
