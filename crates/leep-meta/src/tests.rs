@@ -6,7 +6,7 @@ use leep_core::{Changeset, MetaStore, RefUpdateContext};
 
 use super::*;
 
-fn cs(n: i64) -> Changeset {
+pub(crate) fn cs(n: i64) -> Changeset {
     Changeset {
         parents: vec![],
         author: "t".into(),
@@ -119,72 +119,6 @@ async fn memory_ref_log_race() {
     check_ref_log_race(open_meta_store("mem://").await.unwrap()).await;
 }
 
-/// The schema before the ref log existed; a database made by that version
-/// must open and start logging.
-const OLD_SQLITE_SCHEMA: &[&str] = &[
-    "CREATE TABLE changesets (id BLOB PRIMARY KEY, data BLOB NOT NULL)",
-    "CREATE TABLE refs (name TEXT PRIMARY KEY, target BLOB NOT NULL)",
-    "CREATE TABLE derived (kind TEXT NOT NULL, key BLOB NOT NULL, \
-     value BLOB NOT NULL, PRIMARY KEY (kind, key))",
-];
-
-/// Moves made after the upgrade are logged; the first one's `old` is the
-/// value the ref had before the upgrade.
-async fn check_upgraded(store: &dyn MetaStore, old_head: leep_core::ChangesetId) {
-    assert_eq!(store.get_ref("legacy").await.unwrap(), Some(old_head));
-    assert!(store.ref_log(None, None, 10).await.unwrap().is_empty());
-    let next = store.put_changeset(&cs(2)).await.unwrap();
-    assert!(store
-        .cas_ref_logged(
-            "legacy",
-            Some(old_head),
-            Some(next),
-            &RefUpdateContext::new("land")
-        )
-        .await
-        .unwrap());
-    let log = store.ref_log(Some("legacy"), None, 10).await.unwrap();
-    assert_eq!(log.len(), 1);
-    assert_eq!((log[0].old, log[0].new), (Some(old_head), Some(next)));
-    check_meta_store_contract(store).await;
-}
-
-#[tokio::test]
-async fn sqlite_old_schema_upgrades() {
-    let dir = std::env::temp_dir().join(format!("leep-meta-old-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let url = format!("sqlite://{}?mode=rwc", dir.join("old.db").display());
-    let old = cs(1);
-    let old_head = old.id();
-    {
-        use std::str::FromStr;
-        let opts = sqlx::sqlite::SqliteConnectOptions::from_str(&url).unwrap();
-        let pool = sqlx::SqlitePool::connect_with(opts).await.unwrap();
-        for sql in OLD_SQLITE_SCHEMA {
-            sqlx::query(sql).execute(&pool).await.unwrap();
-        }
-        sqlx::query("INSERT INTO changesets (id, data) VALUES (?, ?)")
-            .bind(old_head.0.as_bytes().as_slice())
-            .bind(old.encode())
-            .execute(&pool)
-            .await
-            .unwrap();
-        sqlx::query("INSERT INTO refs (name, target) VALUES ('legacy', ?)")
-            .bind(old_head.0.as_bytes().as_slice())
-            .execute(&pool)
-            .await
-            .unwrap();
-        pool.close().await;
-    }
-    let s = SqliteMetaStore::connect(&url).await.unwrap();
-    check_upgraded(&s, old_head).await;
-    // Opening again keeps the log.
-    drop(s);
-    let s = SqliteMetaStore::connect(&url).await.unwrap();
-    assert!(!s.ref_log(None, None, 10).await.unwrap().is_empty());
-    std::fs::remove_dir_all(&dir).ok();
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sqlite_file_persists_and_races() {
     let dir = std::env::temp_dir().join(format!("leep-meta-{}", std::process::id()));
@@ -226,7 +160,7 @@ async fn open_dispatch() {
     assert!(open_meta_store("bogus://x").await.is_err());
 }
 
-fn pg_url() -> Option<String> {
+pub(crate) fn pg_url() -> Option<String> {
     let url = std::env::var("LEEP_TEST_POSTGRES_URL").ok();
     if url.is_none() {
         eprintln!("skipping: LEEP_TEST_POSTGRES_URL not set");
@@ -234,7 +168,7 @@ fn pg_url() -> Option<String> {
     url
 }
 
-fn schema(name: &str) -> String {
+pub(crate) fn schema(name: &str) -> String {
     format!("leep_test_{name}_{}", std::process::id())
 }
 
@@ -270,55 +204,6 @@ async fn postgres_cas_race() {
         return;
     };
     check_ref_log_race(Arc::new(s)).await;
-}
-
-#[tokio::test]
-async fn postgres_old_schema_upgrades() {
-    let Some(url) = pg_url() else {
-        return;
-    };
-    let name = schema("old");
-    let old = cs(1);
-    let old_head = old.id();
-    {
-        use std::str::FromStr;
-        let opts = sqlx::postgres::PgConnectOptions::from_str(&url).unwrap();
-        // One connection, so the search_path set below applies to every statement.
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(1)
-            .connect_with(opts)
-            .await
-            .unwrap();
-        let q = format!("\"{name}\"");
-        for sql in [
-            format!("DROP SCHEMA IF EXISTS {q} CASCADE"),
-            format!("CREATE SCHEMA {q}"),
-            format!("SET search_path TO {q}"),
-            "CREATE TABLE changesets (id BYTEA PRIMARY KEY, data BYTEA NOT NULL)".into(),
-            "CREATE TABLE refs (name TEXT PRIMARY KEY, target BYTEA NOT NULL)".into(),
-            "CREATE TABLE derived (kind TEXT NOT NULL, key BYTEA NOT NULL, \
-             value BYTEA NOT NULL, PRIMARY KEY (kind, key))"
-                .into(),
-        ] {
-            sqlx::query(&sql).execute(&pool).await.unwrap();
-        }
-        sqlx::query("INSERT INTO changesets (id, data) VALUES ($1, $2)")
-            .bind(old_head.0.as_bytes().as_slice())
-            .bind(old.encode())
-            .execute(&pool)
-            .await
-            .unwrap();
-        sqlx::query("INSERT INTO refs (name, target) VALUES ('legacy', $1)")
-            .bind(old_head.0.as_bytes().as_slice())
-            .execute(&pool)
-            .await
-            .unwrap();
-        pool.close().await;
-    }
-    let s = PostgresMetaStore::connect_with_schema(&url, &name)
-        .await
-        .unwrap();
-    check_upgraded(&s, old_head).await;
 }
 
 /// Tasks start ref moves and abandon them after a seeded number of
