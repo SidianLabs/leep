@@ -155,7 +155,14 @@ pub fn change_of(data: &[u8], kind: FileKind) -> FileChange {
 
 /// Create the repository: a chain of changesets of at most 400 files each,
 /// landed on `main` by creating the ref.
-pub async fn import(api: &Api, layout: Layout, seed: u64) -> R<ChangesetId> {
+/// Land the synthetic repository on `main`: as its first history, or on top
+/// of `onto` (the current head of an existing `main`).
+pub async fn import(
+    api: &Api,
+    layout: Layout,
+    seed: u64,
+    onto: Option<ChangesetId>,
+) -> R<ChangesetId> {
     let mut files: Vec<(String, Vec<u8>)> = Vec::new();
     for d in 0..layout.dirs {
         for i in 0..FILES_PER_DIR {
@@ -171,7 +178,7 @@ pub async fn import(api: &Api, layout: Layout, seed: u64) -> R<ChangesetId> {
         let mut rng = Rng::new(seed ^ ((i as u64 + 0xA55E7) * 0x51ED));
         files.push((asset_path(i), asset_bytes(&mut rng)));
     }
-    let mut parent: Option<ChangesetId> = None;
+    let mut parent: Option<ChangesetId> = onto;
     for (n, chunk) in files.chunks(400).enumerate() {
         api.upload(
             &chunk
@@ -206,8 +213,8 @@ pub async fn import(api: &Api, layout: Layout, seed: u64) -> R<ChangesetId> {
         }
     }
     let head = parent.expect("a repository has files");
-    if !api.cas_ref("main", None, Some(head)).await? {
-        api.sh.violate("import", "main already exists");
+    if !api.cas_ref("main", onto, Some(head)).await? {
+        api.sh.violate("import", "main moved during the import");
         return Err(Fail::Bad);
     }
     Ok(head)

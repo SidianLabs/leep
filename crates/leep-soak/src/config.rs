@@ -65,6 +65,11 @@ pub struct Args {
     /// no resource trends; the release flow and chaos need an owned server.
     #[arg(long)]
     pub server: Option<String>,
+    /// With --server whose `main` already exists (say, an imported git
+    /// history), land the synthetic files on top of it so the swarm runs
+    /// against that history. Their paths are `src/`, `docs/` and `assets/`.
+    #[arg(long, requires = "server")]
+    pub seed_on_existing: bool,
     /// Bearer token for --server (write role).
     #[arg(long, env = "LEEP_TOKEN")]
     pub token: Option<String>,
