@@ -122,7 +122,7 @@ pub(crate) fn check_not_in_the_way(abs: &Path, path: &str, content: &Hash) -> Re
     )))
 }
 
-fn prune_empty_dirs(root: &Path, file: &Path) {
+pub(crate) fn prune_empty_dirs(root: &Path, file: &Path) {
     let mut dir = file.parent();
     while let Some(d) = dir {
         if d == root || fs::remove_dir(d).is_err() {

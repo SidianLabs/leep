@@ -1138,3 +1138,47 @@ fn branch_and_tag_need_a_base_or_a_rev() {
     assert!(e.contains("no base"), "{e}");
     assert!(mock.data.lock().unwrap().refs.is_empty());
 }
+
+#[test]
+fn a_failed_init_leaves_no_working_copy_and_can_be_retried() {
+    let mock = Mock::start();
+    let (wc_dir, cache) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let first = mock.seed(
+        None,
+        &[
+            ("a.txt", "a\n", FileKind::Regular),
+            ("keep.txt", "k\n", FileKind::Regular),
+            ("z.txt", "z\n", FileKind::Regular),
+        ],
+        &[],
+    );
+    // Already in the directory before init, with the content the ref has.
+    fs::write(wc_dir.path().join("keep.txt"), "k\n").unwrap();
+    // The checkout fails part way: the last blob comes back with the wrong
+    // bytes, after a.txt has been written.
+    let bad = Hash::of_blob(b"z\n");
+    mock.data.lock().unwrap().corrupt.insert(bad);
+    assert!(init_wc(&mock, wc_dir.path(), cache.path(), &[]).is_err());
+    assert!(
+        !wc_dir.path().join(".leep").exists(),
+        "a failed init must not leave a working copy behind"
+    );
+    assert!(
+        !wc_dir.path().join("a.txt").exists(),
+        "files the failed init wrote are removed"
+    );
+    assert_eq!(
+        fs::read_to_string(wc_dir.path().join("keep.txt")).unwrap(),
+        "k\n",
+        "a file that was there before init is left alone"
+    );
+
+    // Meanwhile the ref moves, changing a file the failed attempt had
+    // written; the retry must still succeed.
+    mock.seed(Some(first), &[("a.txt", "a2\n", FileKind::Regular)], &[]);
+    mock.data.lock().unwrap().corrupt.remove(&bad);
+    let ctx = init_wc(&mock, wc_dir.path(), cache.path(), &[]).unwrap();
+    assert_eq!(fs::read_to_string(ctx.wc.abs("a.txt")).unwrap(), "a2\n");
+    assert_eq!(fs::read_to_string(ctx.wc.abs("z.txt")).unwrap(), "z\n");
+    assert!(status(&ctx.wc).unwrap().is_clean());
+}

@@ -231,6 +231,11 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 - `leep_schema_version` gauge, and `MetaStore::schema_version()` (a provided
   method, so existing implementations keep compiling).
 
+### Fixes
+- A `leep init` whose checkout fails part way (server restarting, a bad
+  blob) now removes the files it wrote and its `.leep`, so retrying works.
+  It used to leave a half-made working copy that refused the retry.
+
 ### Project
 - Workspace version set to 0.0.1, with a CI check that keeps it below
   0.1.0.
