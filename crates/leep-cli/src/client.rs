@@ -1,8 +1,9 @@
 //! Blocking HTTP client wrapping every endpoint in `leep_core::api`.
 //!
-//! Network failures and 5xx answers are [`CliError::Server`] (exit 2); 4xx
-//! answers are [`CliError::User`] (exit 1). `ErrorResponse` bodies become the
-//! error message. 401 and 403 get fixed, token-free messages instead.
+//! Network failures, 5xx and 408 answers are [`CliError::Server`] (exit 2);
+//! other 4xx answers are [`CliError::User`] (exit 1). `ErrorResponse` bodies
+//! become the error message. 401 and 403 get fixed, token-free messages
+//! instead.
 //!
 //! A 429 from the server's request limits (ADR 0020) is retried for GET
 //! requests only, honoring `Retry-After`; anything else fails at once, since a
@@ -507,7 +508,14 @@ fn error_from(resp: Response, has_token: bool) -> CliError {
     } else {
         format!("server: {msg} ({status})")
     };
-    if status.is_server_error() {
+    // The server's request timeout cancels a request at any point, possibly
+    // after it took effect: like a lost connection, the outcome is unknown and
+    // running the command again is the answer, not a refusal.
+    if status == StatusCode::REQUEST_TIMEOUT {
+        CliError::Server(format!(
+            "{msg}; the request may or may not have taken effect, so run the command again"
+        ))
+    } else if status.is_server_error() {
         CliError::Server(msg)
     } else {
         CliError::User(msg)
@@ -592,6 +600,22 @@ mod tests {
         let e = Client::new(&url).put_blob(&h, b"x".to_vec()).unwrap_err();
         assert!(e.to_string().contains("rate limit exceeded"), "{e}");
         assert_eq!(seen.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_request_timeout_is_a_server_error_and_is_not_retried() {
+        const TIMED_OUT: &str = "HTTP/1.1 408 Request Timeout\r\ncontent-length: 0\r\n\
+            connection: close\r\n\r\n";
+        let (url, seen) = stub(&[TIMED_OUT, OK]);
+        let e = Client::new(&url)
+            .land(&LandRequest {
+                changeset: ChangesetId(Hash::of_blob(b"x")),
+                target_ref: "main".into(),
+            })
+            .unwrap_err();
+        assert_eq!(e.exit_code(), 2, "{e}");
+        assert!(e.to_string().contains("run the command again"), "{e}");
+        assert_eq!(seen.load(Ordering::SeqCst), 1, "a write is never resent");
     }
 
     #[test]
