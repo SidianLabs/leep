@@ -506,7 +506,8 @@ If you raise `--request-timeout`, raise `--fence` with it. `--request-timeout
 `gc` refuses `--fence 0` unless `--unsafe-no-fence` is given, which is only
 valid with every server stopped.
 
-Run one GC at a time. A cron job such as `17 3 * * *  leep-server gc` works; to
+Run one GC at a time. A cron job such as `17 3 * * *  leep-server gc` works
+(see [Packing blobs](#packing-blobs) for the `repack` line beside it); to
 avoid a long-lived process use `17 3 * * *  leep-server gc condemn` and `47 3 *
 * *  leep-server gc collect`. The report counts blobs condemned, rescued (by an
 upload, by a changeset that referenced them during the fence, or by a newer
@@ -520,6 +521,65 @@ means a request exceeded `--request-timeout`.
 
 Upgrade note: servers built before ADR 0012 ignore condemnations. Upgrade every
 server before the first `condemn`.
+
+## Packing blobs
+
+A filesystem blob store keeps every object whole in its own file until
+`leep-server repack` packs them (ADR 0029). A pack stores each file version
+as a zstd delta against the previous version at its path and each tree node
+against the same directory one commit earlier, so a long history shrinks by
+one to two orders of magnitude (the first 3,795 commits of git/git: 91.2 MB
+loose, 4.2 MB packed with its index) and the store holds a handful of files
+instead of one per object. New writes stay loose until the next repack.
+
+```sh
+leep-server repack                    # pack, wait --fence, delete what the pack replaces
+leep-server repack --level 19         # smaller and slower (zstd level 1..22, default 9)
+leep-server repack --json             # the report as JSON
+```
+
+It uses the same `--meta` and `--blobs` as the server and runs beside running
+servers: it walks every changeset for delta bases, writes and publishes one
+new pack holding every live object (loose and already packed), waits
+`--fence` (default 10m, the same rule as `gc --fence`: longer than the
+servers' `--request-timeout` plus clock skew), then deletes the loose copies
+and the old packs. `--fence 0` is refused unless `--unsafe-no-fence` is
+given, which is only valid with every server stopped. Only filesystem blob
+stores (`file://` or a path) can be packed for now; an `s3://` store is
+refused with a message saying so.
+
+The report counts loose objects and packs before, the new pack's size, how
+many objects were stored as deltas and how many whole, objects dropped
+because GC had deleted them, and what is left loose (objects uploaded during
+the repack), with the time spent walking, writing, fencing and cleaning up.
+Only one repack runs at a time per store (a second one exits with "another
+repack is running"). Killing it is safe at any point: the store stays
+readable, and the next run deletes the leftovers and finishes.
+
+When to run it: after a large import, and then on a schedule. Each run
+rewrites the whole store (phase 2 of ADR 0029 has no incremental mode), so
+daily suits stores up to a few GB and weekly suits larger ones. Run it after
+`gc` so the deleted objects are dropped from the new pack:
+
+```cron
+# 03:17 daily: collect garbage; 04:37 daily: repack (filesystem blob stores)
+17 3 * * *  leep-server gc
+37 4 * * *  leep-server repack
+```
+
+GC and repack may overlap; a blob GC deletes during a repack stays deleted.
+GC deletes a packed blob by appending a line to `packs/tombstones`; the next
+full repack leaves those blobs out and empties the file. Reads of packed blobs
+decode a delta chain (at most 32 entries), which the store's cache of decoded
+objects and the server's blob cache absorb; [PERFORMANCE.md](PERFORMANCE.md)
+has the measured latencies. Backups copy packed blobs as loose ones into the
+backup pool, so restoring a packed store gives a loose one; run `repack` on it
+afterwards.
+
+Do not delete anything under `packs/` by hand, and do not delete
+`.repack-*` files in the shard directories: each is a whole object that the
+next repack puts back. `.tmp-*` files under `packs/` belong to a running
+repack, or are leftovers the next repack deletes.
 
 ## Verify and repair
 
@@ -932,11 +992,22 @@ names the backend, the seed and the round, then the invariant that broke
 in the test's temporary directory (`server-*.log`), which is removed when the
 test ends, so rerun with the seed and read the output of the failing round.
 
+**Repack** (ADR 0029). `cargo test -p leep-store pack_tests` aborts a repack
+at every step (`a_repack_killed_at_any_step_leaves_a_readable_store`) and
+checks every object still reads before and after the next repack;
+`cargo test -p leep-e2e --test repack` SIGKILLs the real `leep-server repack`
+while it writes, after it publishes and during its cleanup, and checks that
+log, blame, search and show answer the same and `verify --full --rehash` is
+clean. Run both after changing the pack format, the filesystem store or GC.
+
 **Leftovers after a real crash.** A killed filesystem blob store can leave
 `.tmp-*` files in its shard directories. Nothing reads or lists them, and
 nothing removes them; delete those older than the request timeout if the
 space matters:
-`find /var/lib/leep/blobs -name '.tmp-*' -mmin +60 -delete`.
+`find /var/lib/leep/blobs -path '*/packs' -prune -o -name '.tmp-*' -mmin +60 -delete`.
+A killed repack leaves `.tmp-*` files in `packs/` and `.repack-*` files in the
+shard directories; leave them, the next repack deletes the first and puts the
+second (whole objects) back.
 
 ## Soak tests
 

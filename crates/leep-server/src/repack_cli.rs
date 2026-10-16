@@ -1,0 +1,184 @@
+//! `leep-server repack` (ADR 0029): pack every live object of a filesystem
+//! blob store into one new pack, compressing each file version against the
+//! previous one at its path and each tree node against the same directory in
+//! the first parent. Safe beside running servers: the old layout stays
+//! readable until a fence after the new pack is published.
+
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use anyhow::Context;
+use clap::Args;
+use leep_derive::Repo;
+use leep_store::{FsBlobStore, RepackOptions, RepackReport};
+
+#[derive(Args)]
+pub struct RepackArgs {
+    /// zstd compression level, 1 (fast) to 22 (small).
+    #[arg(long, default_value_t = 9, value_parser = clap::value_parser!(i32).range(1..=22))]
+    level: i32,
+    /// Wait this long after publishing the new pack before deleting the loose
+    /// copies and old packs it replaces. Must exceed the servers'
+    /// --request-timeout plus clock skew, like `gc --fence`.
+    #[arg(long, default_value = "10m", value_parser = super::parse_grace)]
+    fence: Duration,
+    /// Allow --fence 0. Only safe while no server is running.
+    #[arg(long)]
+    unsafe_no_fence: bool,
+    /// Print the report as one JSON object.
+    #[arg(long)]
+    json: bool,
+}
+
+pub async fn run_repack(meta: &str, blobs: &str, args: RepackArgs) -> anyhow::Result<()> {
+    let Some(root) = leep_store::fs_blob_root(blobs) else {
+        anyhow::bail!(
+            "repack works on filesystem blob stores (file:// or a path) only; \
+             {blobs:?} is not one. Packs for object stores are planned (ADR 0029, phase 3)"
+        );
+    };
+    if args.fence.is_zero() && !args.unsafe_no_fence {
+        anyhow::bail!(
+            "a zero fence can fail reads of running servers; pass a positive fence \
+             (longer than the servers' request timeout) or --unsafe-no-fence"
+        );
+    }
+    let started = Instant::now();
+    let store = FsBlobStore::new(&root);
+    let meta = super::open_meta(meta).await.context("opening meta store")?;
+    let repo = Repo::new(Arc::new(store.clone()), meta);
+    tracing::info!("walking history for delta bases");
+    let order = leep_derive::pack_order::pack_order(&repo).await?;
+    let walked = started.elapsed();
+    tracing::info!(
+        changesets = order.changesets,
+        objects = order.objects.len(),
+        "writing the pack"
+    );
+    let opts = RepackOptions {
+        level: args.level,
+        ..RepackOptions::default()
+    };
+    let published = store.repack_publish(order.objects, opts).await?;
+    let written = started.elapsed();
+    tracing::info!(fence = ?args.fence, "published; waiting out the fence before cleanup");
+    tokio::time::sleep(args.fence).await;
+    let fenced = started.elapsed();
+    let report = published.finish().await?;
+    let total = started.elapsed();
+    let timing = Timing {
+        walk: walked,
+        write: written - walked,
+        fence: fenced - written,
+        cleanup: total - fenced,
+        total,
+    };
+    if args.json {
+        println!("{}", json(&report, order.changesets, &timing));
+    } else {
+        print_report(&report, order.changesets, &timing);
+    }
+    Ok(())
+}
+
+struct Timing {
+    walk: Duration,
+    write: Duration,
+    fence: Duration,
+    cleanup: Duration,
+    total: Duration,
+}
+
+fn json(r: &RepackReport, changesets: u64, t: &Timing) -> serde_json::Value {
+    serde_json::json!({
+        "changesets": changesets,
+        "loose_before": r.loose_before,
+        "loose_bytes_before": r.loose_bytes_before,
+        "packs_before": r.packs_before,
+        "packed_before": r.packed_before,
+        "pack_bytes_before": r.pack_bytes_before,
+        "pack_id": r.pack_id,
+        "objects": r.objects,
+        "logical_bytes": r.logical_bytes,
+        "deltas": r.deltas,
+        "whole": r.whole,
+        "pack_bytes": r.pack_bytes,
+        "index_bytes": r.index_bytes,
+        "dropped_tombstoned": r.dropped_tombstoned,
+        "corrupt": r.corrupt.iter().map(|h| h.to_hex()).collect::<Vec<_>>(),
+        "vanished": r.vanished,
+        "late_tombstones": r.late_tombstones,
+        "garbage_removed": r.garbage_removed,
+        "leftovers_restored": r.leftovers_restored,
+        "loose_removed": r.loose_removed,
+        "loose_kept": r.loose_kept,
+        "old_packs_removed": r.old_packs_removed,
+        "loose_after": r.loose_after,
+        "loose_bytes_after": r.loose_bytes_after,
+        "seconds": {
+            "walk": t.walk.as_secs_f64(),
+            "write": t.write.as_secs_f64(),
+            "fence": t.fence.as_secs_f64(),
+            "cleanup": t.cleanup.as_secs_f64(),
+            "total": t.total.as_secs_f64(),
+        },
+    })
+}
+
+fn print_report(r: &RepackReport, changesets: u64, t: &Timing) {
+    println!("changesets walked: {changesets}");
+    println!(
+        "before: {} loose objects ({} bytes), {} packs ({} objects, {} bytes)",
+        r.loose_before, r.loose_bytes_before, r.packs_before, r.packed_before, r.pack_bytes_before
+    );
+    match &r.pack_id {
+        Some(id) => println!(
+            "new pack: {id} ({} bytes, index {} bytes)",
+            r.pack_bytes, r.index_bytes
+        ),
+        None => println!("new pack: none (nothing to pack)"),
+    }
+    println!(
+        "objects packed: {} ({} bytes uncompressed): {} as delta, {} whole",
+        r.objects, r.logical_bytes, r.deltas, r.whole
+    );
+    println!("dropped (deleted by gc): {}", r.dropped_tombstoned);
+    if r.late_tombstones > 0 {
+        println!("deleted by gc during the repack: {}", r.late_tombstones);
+    }
+    if r.vanished > 0 {
+        println!("deleted before they were read: {}", r.vanished);
+    }
+    if !r.corrupt.is_empty() {
+        println!(
+            "corrupt loose objects left in place (run `leep-server verify --full --rehash`): {}",
+            r.corrupt.len()
+        );
+        for h in &r.corrupt {
+            println!("  {h}");
+        }
+    }
+    if r.garbage_removed + r.leftovers_restored > 0 {
+        println!(
+            "left by an earlier killed repack: {} files deleted, {} loose copies put back",
+            r.garbage_removed, r.leftovers_restored
+        );
+    }
+    println!(
+        "loose copies deleted: {}, kept (written again meanwhile): {}",
+        r.loose_removed, r.loose_kept
+    );
+    println!("old packs deleted: {}", r.old_packs_removed);
+    println!(
+        "after: {} loose objects ({} bytes), pack {} bytes",
+        r.loose_after, r.loose_bytes_after, r.pack_bytes
+    );
+    println!(
+        "elapsed: {:.1}s (walk {:.1}s, write {:.1}s, fence {:.1}s, cleanup {:.1}s)",
+        t.total.as_secs_f64(),
+        t.walk.as_secs_f64(),
+        t.write.as_secs_f64(),
+        t.fence.as_secs_f64(),
+        t.cleanup.as_secs_f64()
+    );
+}

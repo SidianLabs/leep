@@ -100,3 +100,68 @@ pack) with room to spare.
 - `repack` becomes a scheduled maintenance job beside `gc` and `backup`.
 - The blob store layout gains `packs/`; old stores are read unchanged, and a
   store with no packs behaves exactly as today.
+
+## Implementation (phase 2)
+Packs for the filesystem store and a full `leep-server repack` are in
+`leep-store` (`pack.rs` for the format, `packset.rs` for reads, `repack.rs`
+for the writer) and `leep-derive::pack_order` (the walk); the byte layout is
+in [FORMATS.md](../FORMATS.md), "Packs". On the same 3,795 commits the pack
+is 3.10 MB (10,795 of 11,735 objects as deltas) plus a 1.13 MB index, written
+in 8.4 s; `docs/PERFORMANCE.md` has the read latencies. Where this plan was
+silent, or where implementing it changed it:
+
+- **GC deletes packed objects with tombstones, and a full repack packs every
+  live object, reachable or not** (instead of item 5's "a full repack copies
+  only reachable objects"). Reachability stays GC's call alone, so the
+  condemn, rescue and doom protocol of ADR 0012 applies to packed objects
+  unchanged and repack needs no mark. `BlobStore::delete` of a packed object
+  appends `<pack id> <hash>` to `packs/tombstones` (fsynced, under
+  `packs/tombstones.lock`); a tombstoned copy is absent from `get`, `contains`
+  and listings. A tombstone names a pack, so it never hides a copy in a pack
+  written later, and a loose copy (an upload rescuing the blob) always wins.
+  A full repack leaves tombstoned objects out and keeps only the tombstones
+  of packs that still exist.
+- **Each index record keeps the object's own modification time** (the loose
+  file's mtime when it was packed), and listings report it, rather than the
+  pack's mtime. With the pack's mtime, every repack would make all packed
+  garbage look freshly written: GC's grace window would never pass for it,
+  and a repack between condemn and collect would read as a rescue by upload.
+- **`put` of an object that is only packed writes a loose copy**, so a
+  re-upload refreshes `modified` as the GC contract requires.
+- **Deltas use zstd's reference prefix**, not a loaded dictionary: a prefix
+  is always raw content, while a dictionary that happens to start with zstd's
+  dictionary magic would be parsed as a trained dictionary. The window is set
+  to cover base and object; pairs above 128 MiB are stored whole. Readers
+  decode with a per-thread decoder and the base as raw content (a prefix for
+  a base that starts with the magic).
+- **The index binds the pack**: its header holds the pack's length and
+  BLAKE3, and the pack id is the BLAKE3 of the whole index, so one id means
+  the same pack bytes everywhere (item 6).
+- **Reads check every decoded object** against its address (a file blob or a
+  `tree-v1` node), so damage is a storage error, never wrong bytes. Decoded
+  objects go through a 64 MiB cache inside the store as well as
+  `CachedBlobStore`: a delta chain's bases are not visible to the latter.
+- **Removing loose copies after the fence** moves each one aside
+  (`.repack-<name>` in its shard), then deletes it only if its mtime is the
+  one that was packed and the new pack's copy is not tombstoned; otherwise it
+  is put back. GC writes its tombstone before it unlinks, so an upload that
+  rescues a blob GC deleted from the new pack keeps its loose copy. A
+  leftover `.repack-*` file is a whole object and the next repack puts it
+  back.
+- **Deletes during a repack.** After publishing, repack tombstones in the new
+  pack every object whose loose file GC removed, or whose old packed copy GC
+  tombstoned, while the pack was written. A delete that starts after the
+  publish finds the new pack itself.
+- **One repack at a time**, enforced with a lock on `packs/repack.lock`
+  (released by the kernel if the process dies); a second one fails with a
+  conflict. Temp files and packs without an index are deleted only under it.
+- **Write order.** Objects are written in the walk's order (bases first);
+  objects the walk does not reach (unlanded uploads, orphans) follow whole,
+  in hash order. Every entry is its own frame, so grouping by path would not
+  change the size. The walk orders changesets by generation computed in
+  memory from parents, not from derived rows; a file's base is the first
+  parent's version at the same path, else the last version listed at that
+  path.
+- Phase 3 items stay open: incremental repack, copying packs as files in
+  backups (until then a backup copies packed objects as loose ones, which is
+  correct but not smaller), and packs for the object store backend.
