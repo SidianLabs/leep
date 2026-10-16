@@ -473,6 +473,63 @@ What this shows:
   published figures from other hardware and other histories are not
   comparable with these.
 
+### Writing changesets
+
+ADR 0031 stores a changeset with one round of batched reads and one write
+(changeset, root tree, generation and skiplist rows together, plus the rebase
+link or the git mapping), checks the condemnation rows of new tree nodes and
+uploaded blobs in batches, and caches skiplists so building a new one does not
+read one ancestor's list per level. Same 3,795-commit slice, local Postgres 16
+over a Unix socket, release builds, filesystem blobs, `--warm-interval 0`.
+Statements were counted with `log_statement = all` on a scratch database;
+timings were taken with logging off, on fresh imports made by each version,
+two rounds alternating old and new (the machine is shared, so compare within a
+round).
+
+| | Before | After |
+|---|---|---|
+| `leep-git import` of the slice (3,795 commits, 6,850 blobs), two runs | 42.6 s / 38.7 s | 14.1 s / 13.8 s |
+| Statements per imported commit | 38.3 | 7.8 |
+| Same import of the first 914 commits, SQLite | 8.5 s | 4.4 s |
+
+Per commit, the import made 27.4 single derived reads (12.6 skiplist, 5.4
+`blob-condemned-v1`, 5.0 generation, one root tree, one mapping lookup), 3.1
+changeset reads and 7.8 writes. It now makes three batched reads, the parent
+read, one root tree read, the mapping lookup of the planning walk and two
+writes (the changeset with its rows and mapping; the commit's blob claims).
+The imported data is byte-identical to the old importer's: same checksum of
+every changeset, `root_tree`, `generation`, `skiplist` and mapping row, same
+claim keys and the same blobs.
+
+HTTP, driven by a script that per iteration creates a changeset `x` on the
+head and a sibling `y` (one existing blob at a new path three directories
+deep), lands `x` (a fast-forward) and then `y` (a replay of one changeset onto
+`x`). Latency is the median over 100 iterations after 20 warm-up ones, on a
+freshly started server; statements are per request, over 20 iterations right
+after start ("cold") and over 20 after another 100 ("steady"):
+
+| Request | Statements, before | Statements, after (cold / steady) | p50, before (two rounds) | p50, after |
+|---|---|---|---|---|
+| `POST /v1/changesets` | 34 | 11.7 / 7.4 | 13.4 / 9.4 ms | 5.1 / 4.1 ms |
+| `POST /v1/land`, replaying one changeset | 50 | 26.6 / 22.4 | 17.4 / 12.8 ms | 9.0 / 7.5 ms |
+| `POST /v1/land`, fast-forward | 9 | 8.1 / 8 | 2.9 / 2.3 ms | 2.5 / 2.2 ms |
+
+A create used to make 27 single derived reads, three changeset reads and four
+writes. Now, at steady state, it makes two batched condemnation reads (the
+contents, then the new tree nodes), one batched parent read, the first
+parent's root tree, the one write, and two or three skiplist reads for the
+chain entries deep enough that the server has not seen them yet. A server
+that has just started reads more of those (about log2 of the history, as
+every create did before) until it has worked through that stretch. The fast
+land is the ref CAS (five statements, unchanged by design) and three reads.
+The replaying land still reads its merge base, tree merge and landed-copy scan
+one row at a time; those are reads outside the write path.
+
+The first import with batched claims failed with `deadlock detected`: commits
+uploaded ahead of the writer wrote claim batches that shared blobs in
+different orders. Batched statements now insert in `(kind, key)` order (ADR
+0031); a test races overlapping batches on every backend.
+
 ## Packed blobs
 
 `leep-server repack` (ADR 0029) on a copy of the first 3,795 commits of
@@ -593,7 +650,8 @@ children only.
 
 ### Optimization ideas (not implemented)
 
-- `create_changeset` validates parents with `get_changeset`, which transfers
-  the full parent, including all its changes. An `exists`-style `MetaStore`
+- `create_changeset` validates parents with `get_changesets` (one batched
+  read since ADR 0031), which transfers the full parents, including all
+  their changes. An `exists`-style `MetaStore`
   method (or a generation lookup) would make the check O(1) regardless of
   parent size. This needs a trait addition, so it is an ADR-sized change.

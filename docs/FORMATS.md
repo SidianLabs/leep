@@ -472,6 +472,22 @@ the same with `IN (...)` of at most 500 distinct keys per statement. Changeset
 rows are decoded and checked against their id as in `get_changeset`. No
 encoding, hash, index, table or `/v1` shape changed.
 
+## Batched writes (new `MetaStore` methods, no format change)
+
+ADR 0031 adds `MetaStore::put_derived_many` and `put_changeset_with_derived`.
+They write the existing tables with the existing encodings. Postgres runs
+`INSERT INTO derived (kind, key, value) SELECT * FROM UNNEST($1::text[],
+$2::bytea[], $3::bytea[]) ORDER BY 1, 2 ON CONFLICT (kind, key) DO UPDATE SET
+value = excluded.value`, and for a changeset with rows the same statement
+behind `WITH c AS (INSERT INTO changesets (id, data) VALUES ($1, $2) ON
+CONFLICT DO NOTHING)`, so either is one atomic statement. Rows repeating a
+`(kind, key)` are reduced to the last one first, and the `ORDER BY` gives every
+batch the same row lock order. SQLite runs the single-row statements inside one
+transaction. The rows a new changeset is stored with (`root_tree`,
+`generation`, `skiplist`, and `rebased-origin-v1` or the git mapping kinds) are
+byte-identical to what the derived kinds and the old writes produced. No
+encoding, hash, index, table or `/v1` shape changed.
+
 ## Fenced garbage collection (new derived kinds, no other format change)
 
 ADR 0012 adds the three GC kinds in the table above (`blob-claim-v1` already
