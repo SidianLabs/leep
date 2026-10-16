@@ -16,11 +16,12 @@ leep-store.workspace = true
 leep-meta.workspace = true
 anyhow.workspace = true
 bytes.workspace = true
+futures-util.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 clap = { version = "4", features = ["derive"] }
-gix = { version = "0.89", default-features = false, features = ["sha1", "revision"] }
+gix = { version = "0.89", default-features = false, features = ["sha1", "revision", "parallel"] }
 
 [dev-dependencies]
 tempfile = "3"

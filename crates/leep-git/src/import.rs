@@ -1,7 +1,9 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
+use futures_util::stream::{self, StreamExt};
 use gix::bstr::ByteSlice;
 use gix::objs::tree::EntryKind;
 use gix::ObjectId;
@@ -9,12 +11,25 @@ use leep_core::{
     Changeset, ChangesetId, Error, FileChange, FileKind, Hash, RefUpdateContext, RepoPath, Result,
 };
 use leep_derive::Repo;
+use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 
 use crate::{
     format_tz, gerr, git_key, lookup_leep, EXTRA_GIT_AUTHOR_TZ, EXTRA_GIT_COMMIT,
     EXTRA_GIT_COMMITTER, EXTRA_GIT_COMMITTER_TZ, EXTRA_GIT_ENCODING, EXTRA_GIT_HEADERS,
     GIT_TO_LEEP, LEEP_TO_GIT,
 };
+
+/// Commits decoded and with their blobs uploaded ahead of the changeset
+/// writes. Bounds memory to this many commits' new blobs.
+const COMMITS_AHEAD: usize = 16;
+/// Concurrent blob uploads per commit; with COMMITS_AHEAD this lets blob
+/// fsyncs overlap instead of running one after another. Each upload also
+/// writes a claim row, so this and the next bound stay under the metadata
+/// pool's 16 connections most of the time.
+const BLOB_UPLOADS_PER_COMMIT: usize = 4;
+/// Git-to-Leep mapping rows written concurrently behind the changesets.
+const MAPPING_WRITES_IN_FLIGHT: usize = 4;
 
 #[derive(Clone, Debug, Default)]
 pub struct ImportOptions {
@@ -215,6 +230,46 @@ fn read_blob(ts: &gix::ThreadSafeRepository, oid: ObjectId) -> Result<Vec<u8>> {
     Ok(data)
 }
 
+/// Decode and diff one commit on a blocking thread, then upload the blobs it
+/// introduces that are not stored yet, a few at a time.
+async fn prepare_and_upload(
+    repo: &Repo,
+    ts: &gix::ThreadSafeRepository,
+    cache: &Mutex<HashMap<ObjectId, (Hash, u64)>>,
+    oid: ObjectId,
+) -> Result<(ObjectId, Prepared, usize)> {
+    let known: HashSet<ObjectId> = cache.lock().unwrap().keys().copied().collect();
+    let ts = ts.clone();
+    let (p, blobs) = tokio::task::spawn_blocking(move || -> Result<_> {
+        let p = prepare(&ts, oid)?;
+        let mut wanted = HashSet::new();
+        let mut blobs = Vec::new();
+        for (_, change) in &p.changes {
+            if let Some((_, b)) = change {
+                if !known.contains(b) && wanted.insert(*b) {
+                    blobs.push((*b, read_blob(&ts, *b)?));
+                }
+            }
+        }
+        Ok((p, blobs))
+    })
+    .await
+    .map_err(|e| Error::Other(format!("prepare task: {e}")))??;
+    let uploaded = blobs.len();
+    let mut puts = stream::iter(blobs)
+        .map(|(oid, data)| async move {
+            let size = data.len() as u64;
+            let h = repo.put_blob(Bytes::from(data)).await?;
+            Ok::<_, Error>((oid, h, size))
+        })
+        .buffer_unordered(BLOB_UPLOADS_PER_COMMIT);
+    while let Some(r) = puts.next().await {
+        let (b, h, size) = r?;
+        cache.lock().unwrap().insert(b, (h, size));
+    }
+    Ok((oid, p, uploaded))
+}
+
 /// Commits reachable from `head` that are not yet mapped, parents first, plus
 /// the number of mapped commits met on the way.
 async fn plan(
@@ -281,44 +336,76 @@ pub async fn import(
         commits_skipped: skipped,
         ..Default::default()
     };
-    let mut blob_cache: HashMap<ObjectId, (Hash, u64)> = HashMap::new();
     let meta = repo.meta();
+    // Blobs already stored, by git id. Shared with the stage that uploads
+    // ahead; a blob two in-flight commits both introduce may be uploaded
+    // twice, which content addressing makes harmless.
+    let blob_cache: Arc<Mutex<HashMap<ObjectId, (Hash, u64)>>> = Default::default();
+    // Commits mapped in this run, so parents need no metadata lookup.
+    let mut mapped: HashMap<ObjectId, ChangesetId> = HashMap::new();
 
-    for oid in order {
-        let p = prepare(&ts, oid)?;
+    // Decoding, diffing and blob uploads run ahead of the changeset writes,
+    // which must stay in parent-first order (`buffered` keeps it). They run
+    // in tasks of their own: a future that is not polled while it holds a
+    // pooled connection would starve the changeset writes.
+    let (tx, mut rx) = mpsc::channel(COMMITS_AHEAD);
+    let producer = {
+        let (repo, ts, cache) = (repo.clone(), ts.clone(), blob_cache.clone());
+        tokio::spawn(async move {
+            // Each commit is its own task, so the uploads keep going while
+            // this loop waits for room in the channel.
+            let mut ahead = stream::iter(order)
+                .map(|oid| {
+                    let (repo, ts, cache) = (repo.clone(), ts.clone(), cache.clone());
+                    tokio::spawn(async move { prepare_and_upload(&repo, &ts, &cache, oid).await })
+                })
+                .buffered(COMMITS_AHEAD);
+            while let Some(r) = ahead.next().await {
+                let r = r
+                    .map_err(|e| Error::Other(format!("prepare task: {e}")))
+                    .and_then(|r| r);
+                let failed = r.is_err();
+                if tx.send(r).await.is_err() || failed {
+                    break;
+                }
+            }
+        })
+    };
+
+    let mut mapping_writes = JoinSet::new();
+    while let Some(next) = rx.recv().await {
+        let (oid, p, uploaded) = next?;
+        report.blobs_uploaded += uploaded;
         let mut parents = Vec::new();
         for gp in &p.parents {
-            parents.push(
-                lookup_leep(&**meta, gp)
+            let id = match mapped.get(gp) {
+                Some(id) => *id,
+                None => lookup_leep(&**meta, gp)
                     .await?
                     .ok_or_else(|| Error::Other(format!("parent {gp} of {oid} not imported")))?,
-            );
+            };
+            parents.push(id);
         }
         let mut changes = BTreeMap::new();
-        for (path, change) in p.changes {
-            let path = RepoPath::new(path)?;
-            let change = match change {
-                None => FileChange::Delete,
-                Some((kind, blob)) => {
-                    let (content, size) = match blob_cache.get(&blob) {
-                        Some(v) => *v,
-                        None => {
-                            let data = read_blob(&ts, blob)?;
-                            let size = data.len() as u64;
-                            let h = repo.put_blob(Bytes::from(data)).await?;
-                            report.blobs_uploaded += 1;
-                            blob_cache.insert(blob, (h, size));
-                            (h, size)
+        {
+            let cache = blob_cache.lock().unwrap();
+            for (path, change) in p.changes {
+                let path = RepoPath::new(path)?;
+                let change = match change {
+                    None => FileChange::Delete,
+                    Some((kind, blob)) => {
+                        let (content, size) = *cache.get(&blob).ok_or_else(|| {
+                            Error::Other(format!("blob {blob} of {oid} was not uploaded"))
+                        })?;
+                        FileChange::Modify {
+                            content,
+                            kind,
+                            size,
                         }
-                    };
-                    FileChange::Modify {
-                        content,
-                        kind,
-                        size,
                     }
-                }
-            };
-            changes.insert(path, change);
+                };
+                changes.insert(path, change);
+            }
         }
         report.submodules_skipped += p.submodules;
         let mut extra = BTreeMap::from([
@@ -350,16 +437,33 @@ pub async fn import(
                 extra,
             })
             .await?;
-        meta.put_derived(
-            GIT_TO_LEEP,
-            &git_key(oid.as_bytes()),
-            Bytes::copy_from_slice(id.0.as_bytes()),
-        )
-        .await?;
-        meta.put_derived(LEEP_TO_GIT, &id.0, Bytes::copy_from_slice(oid.as_bytes()))
+        mapped.insert(oid, id);
+        // The mapping is written behind the next changesets. A crash before it
+        // lands only means a rerun imports this commit again, to the same id.
+        let m = meta.clone();
+        mapping_writes.spawn(async move {
+            m.put_derived(
+                GIT_TO_LEEP,
+                &git_key(oid.as_bytes()),
+                Bytes::copy_from_slice(id.0.as_bytes()),
+            )
             .await?;
+            m.put_derived(LEEP_TO_GIT, &id.0, Bytes::copy_from_slice(oid.as_bytes()))
+                .await
+        });
+        while mapping_writes.len() >= MAPPING_WRITES_IN_FLIGHT {
+            if let Some(r) = mapping_writes.join_next().await {
+                r.map_err(|e| Error::Other(format!("mapping write task: {e}")))??;
+            }
+        }
         report.commits_imported += 1;
     }
+    while let Some(r) = mapping_writes.join_next().await {
+        r.map_err(|e| Error::Other(format!("mapping write task: {e}")))??;
+    }
+    producer
+        .await
+        .map_err(|e| Error::Other(format!("prepare task: {e}")))?;
 
     let head_id = lookup_leep(&**meta, &head)
         .await?

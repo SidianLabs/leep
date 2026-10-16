@@ -523,3 +523,51 @@ async fn signed_commits_round_trip() {
     assert_eq!(git(&bare, &["rev-parse", "main"]), signed);
     git(&bare, &["fsck", "--strict"]);
 }
+
+/// More commits than the importer decodes ahead, with contents that come
+/// back again and again, so in-flight commits share blobs; plus merges.
+#[tokio::test]
+async fn long_history_with_repeated_blobs_matches_git() {
+    let d = init();
+    let p = d.path();
+    for i in 0..60 {
+        write(p, "flip.txt", if i % 2 == 0 { "even\n" } else { "odd\n" });
+        write(p, &format!("dir{}/f.txt", i % 5), &format!("v{}\n", i % 3));
+        commit(p, &format!("c{i}"));
+        if i % 20 == 19 {
+            git(p, &["checkout", "-q", "-b", &format!("side{i}"), "HEAD~3"]);
+            write(p, &format!("side{i}.txt"), "side\n");
+            commit(p, &format!("side {i}"));
+            git(p, &["checkout", "-q", "-"]);
+            git(p, &["merge", "-q", "--no-edit", &format!("side{i}")]);
+        }
+    }
+    let repo = new_repo();
+    let r = import(
+        &repo,
+        p.join(".git").as_path(),
+        "HEAD",
+        &ImportOptions::default(),
+    )
+    .await
+    .unwrap();
+    let expected: usize = git(p, &["rev-list", "--count", "HEAD"]).parse().unwrap();
+    assert_eq!(r.commits_imported, expected);
+    let head = r.head.unwrap();
+    assert_matches_git(&repo, head, p, "HEAD").await;
+    let mut id = head;
+    for n in 1..=40 {
+        id = repo.get_changeset(id).await.unwrap().parents[0];
+        assert_matches_git(&repo, id, p, &format!("HEAD~{n}")).await;
+    }
+    // A rerun finds every commit mapped.
+    let again = import(
+        &repo,
+        p.join(".git").as_path(),
+        "HEAD",
+        &ImportOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!((again.commits_imported, again.head), (0, Some(head)));
+}
