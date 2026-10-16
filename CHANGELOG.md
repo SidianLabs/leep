@@ -355,6 +355,13 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   the data written is byte-identical. `MetaStore` gains `put_derived_many`
   and `put_changeset_with_derived` (provided methods; batched rows are
   written in `(kind, key)` order so concurrent batches cannot deadlock).
+- `merge_base` on merge-heavy histories no longer walks the whole history on
+  a fresh server: it stops at the first changeset both sides reach (the
+  answer, same as before), returns an input that is a first-parent ancestor
+  of the other after a few skiplist reads, and reads the walk in batches.
+  On git/git, `main` against `master~1000` took 70 s cold; on the first
+  3,795 commits it takes 6 ms instead of 0.92 s and 8 statements instead of
+  7,385. `is_ancestor`'s fallback search reads in batches too.
 
 ### Fixes
 - Processes opening a new SQLite metadata file at the same moment (servers

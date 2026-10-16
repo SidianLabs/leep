@@ -274,8 +274,11 @@ async fn lands_under_faults(seed: u64) {
     for t in tasks {
         agents.push(t.await.unwrap());
     }
+    // Guards against a plan that injects nothing. How many land on a given
+    // seed depends on task scheduling and on how many store calls a land
+    // makes: from 18 to about 100 per run.
     assert!(
-        w.plan.injected().total() > 20,
+        w.plan.injected().total() > 10,
         "seed {seed}: the plan injected almost nothing"
     );
 

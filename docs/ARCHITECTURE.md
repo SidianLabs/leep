@@ -420,6 +420,18 @@ requested prefixes are materialized; other files are fetched on demand with
 Identical changes on both sides merge trivially. Text files merge by line
 (`diffy`). Binary files and delete-vs-modify cases are returned as conflicts.
 
+`merge_base(a, b)` is the common ancestor with the highest generation, ties
+going to the highest id; no other common ancestor can descend from it. It is
+found cheapest first: the deepest changeset on both first-parent chains, by
+skiplist jumps (bounded at 64 reads), is a common ancestor and so a lower
+bound; if it is `a` or `b` itself, or neither chain has a merge above it
+(`last_merge-v1`), it is the answer. Otherwise a walk marks changesets newest
+first by (generation, id) with the side or sides that reach them and stops at
+the first one both reach, or when either side runs out; parents and
+generations come from `Repo`'s ancestry cache or are read ahead in batches as
+the log walk does (ADR 0030). `is_ancestor` rides the skiplist and falls back
+to the same walk.
+
 ## 7. Caching tiers
 
 ```
