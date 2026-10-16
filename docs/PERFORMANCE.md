@@ -530,6 +530,80 @@ uploaded ahead of the writer wrote claim batches that shared blobs in
 different orders. Batched statements now insert in `(kind, key)` order (ADR
 0031); a test races overlapping batches on every backend.
 
+### Merge base
+
+On all of git/git (82,500 commits) on the VPS, `GET /v1/merge-base` of `main`
+and `master~1000` took 70 s on a freshly started server (31 s with the
+machine less loaded) and 0.10 s once the process had cached the ancestry it
+walked; `main` against `master~20000` took 2.2 s. `master~1000` is an
+ancestor of `main`, so the answer is `master~1000` itself. git/git merges
+everywhere, so the first-parent shortcut never applied and the request fell
+to the reference walk, which painted both histories down until no unstale
+entry was left. Topic branches merged long ago kept one-sided entries alive
+deep into history, every step was one metadata round trip for the parents
+and one per new generation, and the candidates were then filtered with
+pairwise `is_ancestor` calls, each a one-read-per-step search of its own.
+
+Three changes, with the same answers in every case:
+
+- The best common ancestor is the one with the highest (generation, id), and
+  the walk pops changesets in that order with their marks final, so the
+  first changeset both sides reach is the answer. The walk stops there (or
+  when either side has nothing queued) and the pairwise filter is gone.
+  A randomized test checks this against a copy of the old walk on DAGs with
+  criss-crosses, octopus merges and unrelated roots, cold and warm, with and
+  without batched reads.
+- The first-parent common ancestor found by skiplist jumps is a lower bound.
+  When it is one of the two inputs, that input is an ancestor of the other
+  and is returned without a walk: `main` against `master~1000` is a few
+  skiplist reads. Its search stops after 64 reads, since long parallel
+  first-parent stretches were read one round trip per step; the walk does
+  better on those.
+- The walk reads parents and generations through the log walk's batched
+  read-ahead (ADR 0030) and keeps them in the ancestry cache. `is_ancestor`
+  falls back to the same walk instead of a one-read-per-step search.
+
+On the first 3,795 commits of git/git in a scratch copy of the database
+(local Postgres 16 over a Unix socket, release builds, `--warm-interval 0`,
+statements counted with `log_statement = all`): a freshly started server per
+case, then the same request again. Times are medians of three runs.
+
+| `GET /v1/merge-base` | Before: cold / warm | After: cold / warm | Statements, cold (warm) |
+|---|---|---|---|
+| head vs `head~1000` | 0.92 s / 8 ms | 6 ms / 3 ms | 7,385 (7) -> 8 (6) |
+| head vs root | 1.02 s / 6 ms | 5 ms / 2.5 ms | 7,593 (3) -> 4 (2) |
+| head vs a topic merged at `head~841` (an ancestor through a second parent) | 0.95 s / 8 ms | 0.11 s / 11 ms | 7,345 (20) -> 134 (20) |
+| parents of the merge at `head~121` | 44 ms / 5 ms | 34 ms / 6 ms | 245 (18) -> 40 (18) |
+| parents of the merge at `head~446` | 0.16 s / 20 ms | 27 ms / 14 ms | 1,302 (149) -> 73 (64) |
+| parents of a merge whose base is 3,326 commits back | 0.86 s / 25 ms | 0.11 s / 17 ms | 7,017 (186) -> 192 (64) |
+
+Before, a cold request read the whole slice twice over whatever the answer;
+on all of git/git that is the 70 s above. After, the two ancestor cases cost
+a logarithmic number of reads, and the others a batch per window of the
+changesets above the answer. Warm requests still read skiplist rows, which
+are not cached in memory. Deriving the path-history index for the slice,
+which calls `merge_base` at every merge and `is_ancestor` for paths changed
+on both sides, gave byte-identical rows (23.6 s before, 22.3 s after).
+
+The same shapes on a synthetic git-like history in the memory store (16,616
+changesets, 6,053 on the first-parent chain, topics forked up to 400 back
+and merged, some merging main first), each metadata call delayed by 1 ms
+(about 2 ms with tokio's timer); `cargo test -p leep-derive --release --lib
+merge_base_cold_cost -- --ignored --nocapture`:
+
+| Pair | Before: cold, reads | After: cold, reads (single + batched) |
+|---|---|---|
+| head vs `head~1000` | 92 s, 43,013 | 18 ms, 8 + 0 |
+| head vs root | 71 s, 33,171 | 19 ms, 9 + 0 |
+| head vs a topic merged ~1,000 back | 16.5 s, 7,635 | 129 ms, 10 + 118 |
+| head vs an open topic forked at `head~800` | 13.0 s, 5,980 | 125 ms, 19 + 96 |
+
+Batched reads are issued three at a time (changesets, generations,
+skiplists), so 118 of them are about 40 round trips. The in-memory
+`merge_base` and `is_ancestor` benchmarks are unchanged (same machine, both
+builds: 9-14 us and 5-6 us). `merge_base_on_a_git_like_history_reads_little`
+keeps the read counts bounded.
+
 ## Packed blobs
 
 `leep-server repack` (ADR 0029) on a copy of the first 3,795 commits of
@@ -608,10 +682,12 @@ commit path.
   the distance to the fork point (376 us, 12 ms, 112 ms) until it learned to
   find the deepest common changeset of the two first-parent chains with
   skiplist jumps. That answer is used whenever neither chain has a merge
-  above it (tracked by the `last_merge-v1` derived kind); histories with
-  merges in between still take the generation-ordered walk, which is linear
-  in the distance. That walk reads parents and generations from `Repo`'s
-  ancestry cache once they have been seen (see "Real history: git/git").
+  above it (tracked by the `last_merge-v1` derived kind), or when one side is
+  a first-parent ancestor of the other. Histories with merges in between
+  take the generation-ordered walk, which stops at the first changeset both
+  sides reach and reads ahead in batches; it is linear in the changesets
+  above the answer, not in history (see "Merge base" under "Real history:
+  git/git").
 
 - Path `log` and `last_change`: the path-history index (ADR 0013) turns the
   scan into lookups. The old walk read every ancestor (about 7.5 us per

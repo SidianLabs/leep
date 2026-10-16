@@ -590,6 +590,22 @@ impl Repo {
         self.ancestry.get(&id).generation
     }
 
+    /// Parents of `id` if this process has seen them, without a read.
+    pub(crate) fn cached_parents(&self, id: ChangesetId) -> Option<Arc<[ChangesetId]>> {
+        self.ancestry.get(&id).parents
+    }
+
+    /// Keep parents a batched read returned, for later walks.
+    pub(crate) fn remember_parents(&self, id: ChangesetId, parents: Arc<[ChangesetId]>) {
+        self.ancestry.update(id, |e| e.parents = Some(parents));
+    }
+
+    /// Keep a generation a batched read or a skiplist entry gave.
+    pub(crate) fn remember_generation(&self, id: ChangesetId, generation: u64) {
+        self.ancestry
+            .update(id, |e| e.generation = Some(generation));
+    }
+
     pub(crate) fn derive_lock(&self, kind: &'static str) -> DeriveLock {
         self.derive_locks
             .lock()
