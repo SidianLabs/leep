@@ -241,8 +241,9 @@ pub async fn run_backup(meta: &str, blobs: &str, args: BackupArgs) -> i32 {
 async fn backup_inner(meta: &str, blobs: &str, args: BackupArgs) -> anyhow::Result<i32> {
     backup::check_source_exists(meta, blobs)?;
     let source = leep_store::open_blob_store(blobs).context("opening the source blob store")?;
-    let (dest, location) = if args.no_blobs {
-        (None, String::new())
+    let source_packs = leep_store::open_pack_files(blobs)?;
+    let (dest, dest_packs, location) = if args.no_blobs {
+        (None, None, String::new())
     } else {
         let url = args
             .blobs_to
@@ -256,6 +257,7 @@ async fn backup_inner(meta: &str, blobs: &str, args: BackupArgs) -> anyhow::Resu
         }
         (
             Some(leep_store::open_blob_store(&url).context("opening the backup blob store")?),
+            leep_store::open_pack_files(&url)?,
             url,
         )
     };
@@ -264,8 +266,10 @@ async fn backup_inner(meta: &str, blobs: &str, args: BackupArgs) -> anyhow::Resu
         BackupOptions {
             meta_url: meta.to_string(),
             source_blobs: source,
+            source_packs,
             out: args.out.clone(),
             dest_blobs: dest,
+            dest_packs,
             dest_blobs_location: location,
             check: !args.no_check,
             rehash: args.rehash,
@@ -320,6 +324,19 @@ fn print_backup(o: &BackupOutcome, code: i32) {
             m.blobs.vanished,
             m.blobs.only_in_backup
         );
+        if m.blobs.packs_listed + m.blobs.packs_pruned > 0 {
+            println!(
+                "packs: {} in the source, {} already in the backup, {} copied ({}), {} merged away and pruned",
+                m.blobs.packs_listed,
+                m.blobs.packs_already_present,
+                m.blobs.packs_copied,
+                bytes_human(m.blobs.pack_bytes_copied),
+                m.blobs.packs_pruned
+            );
+        }
+        for id in &m.blobs.corrupt_packs {
+            println!("WARNING: source pack {id} does not match its index; not copied");
+        }
         println!("blobs at: {}", m.blobs.location);
         for h in &m.blobs.corrupt {
             println!("WARNING: source blob {h} does not hash to its name; not copied");
@@ -376,6 +393,8 @@ struct RestoreJson<'a> {
     blobs_listed: u64,
     blobs_copied: u64,
     blob_bytes_copied: u64,
+    packs_copied: u64,
+    pack_bytes_copied: u64,
     changesets: u64,
     refs: u64,
     derived: u64,
@@ -401,6 +420,8 @@ async fn restore_inner(
     }
     let source = leep_store::open_blob_store(&source_url).context("opening the backup blobs")?;
     let target = leep_store::open_blob_store(blobs).context("opening the blob store")?;
+    let source_packs = leep_store::open_pack_files(&source_url)?;
+    let target_packs = leep_store::open_pack_files(blobs)?;
     let mode = if no_migrate {
         leep_meta::SchemaMode::RequireCurrent
     } else {
@@ -413,7 +434,9 @@ async fn restore_inner(
             meta_url: meta.to_string(),
             meta_mode: mode,
             target_blobs: target,
+            target_packs,
             source_blobs: Some(source),
+            source_packs,
             force: args.force,
             resume: args.resume,
             accept_failed_check: args.accept_failed_check,
@@ -441,6 +464,8 @@ async fn restore_inner(
                 blobs_listed: listed,
                 blobs_copied: copied,
                 blob_bytes_copied: bytes,
+                packs_copied: o.packs.as_ref().map_or(0, |p| p.copied),
+                pack_bytes_copied: o.packs.as_ref().map_or(0, |p| p.bytes_copied),
                 changesets: o.imported.changesets,
                 refs: o.imported.refs,
                 derived: o.imported.derived,
@@ -459,6 +484,14 @@ async fn restore_inner(
             "blobs: {listed} in the backup, {copied} copied ({})",
             bytes_human(bytes)
         );
+        if let Some(p) = o.packs.as_ref().filter(|p| p.listed > 0) {
+            println!(
+                "packs: {} in the backup, {} copied whole ({})",
+                p.listed,
+                p.copied,
+                bytes_human(p.bytes_copied)
+            );
+        }
         match &o.report {
             Some(r) => {
                 print_check(r);

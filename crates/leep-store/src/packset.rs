@@ -346,15 +346,7 @@ impl PackSet {
     }
 
     pub fn append_tombstones(&self, lines: &str) -> Result<()> {
-        let _lock = lock_tombstones(&self.dir)?;
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(self.dir.join(TOMBSTONES))
-            .map_err(storage_err)?;
-        f.write_all(lines.as_bytes()).map_err(storage_err)?;
-        f.sync_all().map_err(storage_err)?;
-        sync_dir(&self.dir)
+        append_tombstones(&self.dir, lines)
     }
 }
 
@@ -487,6 +479,19 @@ pub(crate) fn merge_listing<'a>(
         merged.insert(m.hash, m);
     }
     merged.into_values().take(limit).collect()
+}
+
+/// Append lines to `packs/tombstones` under its lock, durably.
+pub(crate) fn append_tombstones(dir: &Path, lines: &str) -> Result<()> {
+    let _lock = lock_tombstones(dir)?;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join(TOMBSTONES))
+        .map_err(storage_err)?;
+    f.write_all(lines.as_bytes()).map_err(storage_err)?;
+    f.sync_all().map_err(storage_err)?;
+    sync_dir(dir)
 }
 
 /// Exclusive lock on `packs/tombstones.lock`, released on drop.

@@ -37,6 +37,13 @@ pub(crate) enum SourceRead<S> {
 pub(crate) trait PackSource {
     type Stamp;
     fn read(&mut self, hash: &Hash) -> Result<SourceRead<Self::Stamp>>;
+    /// The frame `hash` already has in an old pack and that frame's base,
+    /// when [`read`](Self::read) reads it from there. A delta frame decodes
+    /// the same against the same base in any pack, so a writer that gives it
+    /// the same base copies it instead of compressing again.
+    fn stored_frame(&mut self, _hash: &Hash) -> Result<Option<(Vec<u8>, Option<Hash>)>> {
+        Ok(None)
+    }
 }
 
 /// A pack's entries as written, before its index is encoded.
@@ -114,29 +121,26 @@ pub(crate) fn write_pack<W: Write, S: PackSource>(
                 continue;
             }
         };
-        let mut frame = pack::compress_whole(&data, opts.level)?;
-        let mut used = None;
-        let mut d = 0;
-        if let Some(b) = base.filter(|b| *b != hash) {
-            if let Some(&(bp, bd)) = written.get(&b).filter(|(_, bd)| *bd < opts.max_chain) {
-                let base_bytes = match bases.get(&b) {
-                    Some(x) => Some(x),
-                    None => match src.read(&b)? {
-                        SourceRead::Ok { data, .. } => Some(data),
-                        _ => None,
-                    },
-                };
-                if let Some(bb) = base_bytes {
-                    if let Some(delta) = pack::compress_delta(&bb, &data, opts.level)? {
-                        if delta.len() < frame.len() {
-                            frame = delta;
-                            used = Some(bp);
-                            d = bd + 1;
-                        }
-                    }
-                }
+        let base = base.filter(|b| *b != hash);
+        // The bytes were decoded and checked above, so a copied frame is
+        // known good.
+        let reuse = match src.stored_frame(&hash)? {
+            Some((frame, old)) if old == base => match old {
+                None => Some((frame, None, 0)),
+                Some(b) => written
+                    .get(&b)
+                    .filter(|(_, bd)| *bd < opts.max_chain)
+                    .map(|&(bp, bd)| (frame, Some(bp), bd + 1)),
+            },
+            _ => None,
+        };
+        let (frame, used, d) = match reuse {
+            Some(r) => {
+                report.frames_reused += 1;
+                r
             }
-        }
+            None => compress(src, &hash, &data, base, &written, &mut bases, opts)?,
+        };
         let at = emit(&frame, out)?;
         entries.push(IdxEntry {
             hash,
@@ -166,4 +170,78 @@ pub(crate) fn write_pack<W: Write, S: PackSource>(
         hash: *hasher.finalize().as_bytes(),
         from_loose,
     })
+}
+
+/// A new frame for `data`: a delta against `base` if that is already in this
+/// pack within the chain cap and smaller, else whole. Returns the frame, the
+/// base's position and the chain depth.
+fn compress<S: PackSource>(
+    src: &mut S,
+    hash: &Hash,
+    data: &[u8],
+    base: Option<Hash>,
+    written: &HashMap<Hash, (u32, usize)>,
+    bases: &mut Lru,
+    opts: &RepackOptions,
+) -> Result<(Vec<u8>, Option<u32>, usize)> {
+    let whole = pack::compress_whole(data, opts.level)?;
+    let Some(b) = base.filter(|b| b != hash) else {
+        return Ok((whole, None, 0));
+    };
+    let Some(&(bp, bd)) = written.get(&b).filter(|(_, bd)| *bd < opts.max_chain) else {
+        return Ok((whole, None, 0));
+    };
+    let base_bytes = match bases.get(&b) {
+        Some(x) => x,
+        None => match src.read(&b)? {
+            SourceRead::Ok { data, .. } => data,
+            _ => return Ok((whole, None, 0)),
+        },
+    };
+    match pack::compress_delta(&base_bytes, data, opts.level)? {
+        Some(delta) if delta.len() < whole.len() => Ok((delta, Some(bp), bd + 1)),
+        _ => Ok((whole, None, 0)),
+    }
+}
+
+/// The packs an incremental repack folds into its new pack, given each
+/// pack's live object count and the number of loose objects.
+///
+/// Like git's `repack --geometric`: the largest packs that already grow by
+/// `factor` each stay; everything below the first break merges with the
+/// loose objects, and the merge keeps absorbing the next pack while that pack
+/// is less than `factor` times the merged total. Then the smallest remaining
+/// packs join until at most `max_packs` remain. Sizes are object counts, so
+/// loose and packed objects compare, and the count bounds how many indexes a
+/// read that misses searches.
+pub fn plan_merge(
+    packs: &[(String, u64)],
+    loose: u64,
+    factor: u64,
+    max_packs: usize,
+) -> Vec<String> {
+    let mut sorted: Vec<&(String, u64)> = packs.iter().collect();
+    sorted.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+    let n = sorted.len();
+    let mut split = 0;
+    for i in (0..n.saturating_sub(1)).rev() {
+        if sorted[i + 1].1 < sorted[i].1.saturating_mul(factor) {
+            split = i + 1;
+            break;
+        }
+    }
+    let mut total = loose + sorted[..split].iter().map(|p| p.1).sum::<u64>();
+    while split < n && sorted[split].1 < total.saturating_mul(factor) {
+        total += sorted[split].1;
+        split += 1;
+    }
+    let after = |split: usize| n - split + usize::from(loose > 0 || split > 0);
+    while split < n && after(split) > max_packs.max(1) {
+        split += 1;
+    }
+    // Rewriting one pack alone gains nothing.
+    if loose == 0 && split < 2 {
+        return Vec::new();
+    }
+    sorted[..split].iter().map(|p| p.0.clone()).collect()
 }

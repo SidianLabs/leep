@@ -900,6 +900,32 @@ this size. ADR 0038's index layout stores about 47-49 bytes per object
 instead (projected 219-228 MB for this pack, 15% of pack plus index; see
 "Packed blobs"). The import then resumed from the packed store.
 
+### Incremental repack
+
+ADR 0039, measured with `cargo run --release -p leep-server --example
+incremental_repack -- <dir>`, which grows a synthetic history in a fresh
+store (SQLite metadata, filesystem blobs, 20 directories, three files edited
+per commit, one commit in twenty adds a file). It lands 10,000 commits with
+an incremental repack every 500, then 20 rounds of 100 commits each followed
+by an incremental repack, then one `--full` (sandbox VM, release build, no
+fence):
+
+| | Walk | Write | Total | Packs after |
+|---|---|---|---|---|
+| Incremental, 500 new commits (history up to 10,000) | 0.42–0.89 s | 0.88–1.56 s | 1.7–2.9 s | 1–3 |
+| Incremental, 100 new commits (history 10,100–12,000), 15 rounds that only pack loose objects or merge small packs | 0.10–0.20 s | 0.17–0.32 s | 0.36–0.59 s | 2–5 |
+| The same, the round that merged 5 packs (72,631 objects, 71,945 frames copied as they were) | 0.12 s | 1.35 s | 1.61 s | 1 |
+| Full, 12,000 commits | 11.24 s | 4.08 s | 15.34 s | 1 |
+
+The incremental walk stays at about 0.1 s per 100 new commits whatever the
+history's depth, while the full walk grows with it. The pack count never
+exceeded 5. Size: a store maintained only by incremental repacks had
+10.44 MB of packs where `--full` gives 6.91 MB (indexes about 3.56 MB in
+both), because the first new version of each path is written whole (its base
+is in an older pack). Writing a whole copy of that base and a delta instead
+was measured on every such chain head (about 256 per round): 3.6% larger
+than writing the version whole.
+
 ## Garbage collection
 
 `leep-server gc` phases timed with

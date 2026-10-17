@@ -656,10 +656,18 @@ Nothing persisted by the server or sent over `/v1` changes.
 
 ```
 <dir>/blobs/<2 hex>/<62 hex>              blob pool: the filesystem layout above (or any blob store via --blobs-to)
+<dir>/blobs/packs/...                     packs copied whole from a packed source (ADR 0039): the "Packs" layout above
 <dir>/snapshots/<name>/meta.db            metadata snapshot
 <dir>/snapshots/<name>/manifest.json      written last, atomically; a snapshot without one does not exist
 ```
 `name` is the UTC time the run started, `YYYYMMDDTHHMMSSZ` (or `--name`).
+
+The pool holds the source's packs as files when both sides keep packs
+(ADR 0039): `packs/<id>.pack`, `packs/<id>.idx` and the tombstones of those
+packs. In a bucket (`--blobs-to s3://...`) they use the object store layout
+of ADR 0040, with tombstones at `packs/tombstones/<id>/<hash>`. Loose objects
+stay loose. A pool may hold an object both loose and packed, and pools
+written before ADR 0039 hold no packs; both read and restore the same way.
 
 `meta.db` is a SQLite database with the schema of `schema_migrations` (ADR
 0023) at the version in the manifest, whatever backend the metadata came from:
@@ -684,7 +692,7 @@ work on a scratch copy.
 | `counts` | `changesets`, `refs`, `derived`, `ref_log` row counts; a restore must load exactly these |
 | `ref_log_last_seq` | highest ref log `seq` ever issued |
 | `refs` | ref name to changeset id (hex) at the snapshot |
-| `blobs` | `included`, `location`, `listed`, `already_present`, `copied`, `bytes_copied`, `replaced`, `vanished`, `only_in_backup`, `corrupt` (hashes the source held with wrong bytes) |
+| `blobs` | `included`, `location`, `listed`, `already_present`, `copied`, `bytes_copied`, `replaced`, `vanished`, `only_in_backup`, `corrupt` (hashes the source held with wrong bytes); since ADR 0039 also `packs_listed`, `packs_already_present`, `packs_copied`, `pack_bytes_copied`, `packs_pruned`, `tombstones_copied`, `corrupt_packs` (0 or empty when absent) |
 | `check` | `mode` (`closure`, `closure+rehash`, `skipped`), `ok`, `changesets`, `tree_nodes`, `blobs_checked`, `blobs_rehashed`, `problems`, `first_problems` |
 | `elapsed_secs` | wall time of the run |
 

@@ -571,6 +571,11 @@ impl ObjectBlobStore {
                 opts.level
             )));
         }
+        if opts.mode != crate::RepackMode::Full {
+            return Err(Error::Invalid(
+                "object stores support only a full repack for now".into(),
+            ));
+        }
         let lease = Lease::acquire(self.store.clone()).await?;
         match self.publish_leased(hints, &opts, &lease).await {
             Ok(p) => Ok(PublishedObjectPack {

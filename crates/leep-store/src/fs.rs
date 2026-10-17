@@ -47,6 +47,12 @@ impl FsBlobStore {
         &self.root
     }
 
+    /// Whether `hash` has a loose copy: what an incremental repack packs.
+    /// One `stat`, for the history walk that picks delta bases.
+    pub fn is_loose(&self, hash: &Hash) -> bool {
+        self.path_for(hash).is_file()
+    }
+
     pub(crate) fn path_for(&self, hash: &Hash) -> PathBuf {
         let hex = hash.to_hex();
         self.root.join(&hex[..2]).join(&hex[2..])

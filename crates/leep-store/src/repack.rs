@@ -1,6 +1,8 @@
-//! Full repack of a filesystem store (ADR 0029): every live loose and packed
-//! object goes into one new pack, which is made durable and published; after
-//! a fence the loose copies and the replaced packs are deleted.
+//! Repack of a filesystem store (ADR 0029, ADR 0039): live objects go into
+//! one new pack, which is made durable and published; after a fence the loose
+//! copies and the replaced packs are deleted. A full repack packs every loose
+//! and packed object; an incremental one packs the loose objects and folds in
+//! only the packs its merge rule picks.
 //!
 //! The two halves are separate calls ([`FsBlobStore::repack_publish`] and
 //! [`PublishedPack::finish`]) so the caller waits out the fence in between.
@@ -23,7 +25,7 @@ use crate::pack::{self, IdxEntry, PackIndex, MAX_CHAIN};
 use crate::packset::{
     lock_tombstones, parse_tombstones, published_ids, sync_dir, tombstone_line, Pack, TOMBSTONES,
 };
-use crate::packwrite::{write_order, write_pack, PackSource, SourceRead};
+use crate::packwrite::{plan_merge, write_order, write_pack, PackSource, SourceRead};
 use crate::{storage_err, FsBlobStore};
 
 /// Held for a whole repack, fence included, so two never overlap. A lock,
@@ -62,12 +64,24 @@ pub enum RepackStep {
 
 pub type RepackHook = Arc<dyn Fn(RepackStep) -> Result<()> + Send + Sync>;
 
+/// Which packs a repack replaces.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RepackMode {
+    /// Every live object, loose or packed, into one pack; every pack replaced.
+    Full,
+    /// The loose objects into a new pack, together with the packs
+    /// [`plan_merge`](crate::plan_merge) picks, so pack sizes stay a geometric series and the
+    /// count stays at most `max_packs`. The other packs are left alone.
+    Incremental { factor: u64, max_packs: usize },
+}
+
 #[derive(Clone)]
 pub struct RepackOptions {
     /// zstd level, 1 to 22.
     pub level: i32,
     /// Longest delta chain written.
     pub max_chain: usize,
+    pub mode: RepackMode,
     /// Called at each step; an error aborts the repack where it stands.
     pub hook: Option<RepackHook>,
 }
@@ -77,6 +91,7 @@ impl Default for RepackOptions {
         RepackOptions {
             level: 9,
             max_chain: MAX_CHAIN,
+            mode: RepackMode::Full,
             hook: None,
         }
     }
@@ -87,6 +102,7 @@ impl std::fmt::Debug for RepackOptions {
         f.debug_struct("RepackOptions")
             .field("level", &self.level)
             .field("max_chain", &self.max_chain)
+            .field("mode", &self.mode)
             .finish_non_exhaustive()
     }
 }
@@ -105,6 +121,10 @@ pub struct RepackReport {
     /// Objects stored as a delta against a base, and stored whole.
     pub deltas: u64,
     pub whole: u64,
+    /// Packs folded into the new one (every pack, for a full repack).
+    pub packs_merged: u64,
+    /// Packed objects copied frame for frame: their base did not change.
+    pub frames_reused: u64,
     /// `None` when there was nothing to pack.
     pub pack_id: Option<String>,
     pub pack_bytes: u64,
@@ -127,6 +147,7 @@ pub struct RepackReport {
     /// new pack by GC and uploaded again.
     pub loose_kept: u64,
     pub old_packs_removed: u64,
+    pub packs_after: u64,
     pub loose_after: u64,
     pub loose_bytes_after: u64,
 }
@@ -203,7 +224,7 @@ impl PublishedPack {
         step(&self.opts, RepackStep::OldPacksRemoved)?;
         rewrite_tombstones(&dir)?;
         step(&self.opts, RepackStep::TombstonesRewritten)?;
-        store.packs.refresh()?;
+        self.report.packs_after = store.packs.refresh()?.packs.len() as u64;
         let (n, bytes) = count_loose(store.root())?;
         self.report.loose_after = n;
         self.report.loose_bytes_after = bytes;
@@ -391,6 +412,16 @@ impl PackSource for FsSource<'_> {
     fn read(&mut self, hash: &Hash) -> Result<Read> {
         read_source(self.store, &self.sources[hash], hash)
     }
+
+    /// Only for an object read from its pack: a loose copy is what the new
+    /// pack records then.
+    fn stored_frame(&mut self, hash: &Hash) -> Result<Option<(Vec<u8>, Option<Hash>)>> {
+        let (None, Some((p, e))) = (&self.sources[hash].loose, &self.sources[hash].packed) else {
+            return Ok(None);
+        };
+        let base = e.base.map(|r| p.index.hash_at(r as usize));
+        Ok(Some((p.frame(e)?, base)))
+    }
 }
 
 fn read_source(store: &FsBlobStore, src: &Source, hash: &Hash) -> Result<Read> {
@@ -490,26 +521,64 @@ impl FsBlobStore {
         let loose = loose_objects(self.root(), &mut leftovers)?;
         report.leftovers_restored = leftovers.restored;
         report.garbage_removed += leftovers.removed;
-        let mut sources: HashMap<Hash, Source> = HashMap::new();
         report.packs_before = view.packs.len() as u64;
+        let live = |dead: &HashSet<Hash>, p: &Pack| p.index.len().saturating_sub(dead.len()) as u64;
+        let merged: HashSet<String> = match opts.mode {
+            RepackMode::Full => view.packs.iter().map(|(p, _)| p.id.clone()).collect(),
+            RepackMode::Incremental { factor, max_packs } => {
+                if factor < 2 || max_packs < 1 {
+                    return Err(Error::Invalid(format!(
+                        "geometric factor {factor} must be at least 2 and max packs {max_packs} at least 1"
+                    )));
+                }
+                let sizes: Vec<(String, u64)> = view
+                    .packs
+                    .iter()
+                    .map(|(p, dead)| (p.id.clone(), live(dead, p)))
+                    .collect();
+                plan_merge(&sizes, loose.len() as u64, factor, max_packs)
+                    .into_iter()
+                    .collect()
+            }
+        };
+        report.packs_merged = merged.len() as u64;
+        let mut sources: HashMap<Hash, Source> = HashMap::new();
+        let mut seen_packed: HashSet<Hash> = HashSet::new();
+        // Objects of the merged packs in each pack's write order, with the
+        // base each had there, so a merge keeps the deltas it had.
+        let mut old_bases: Vec<(Hash, Option<Hash>)> = Vec::new();
+        let mut tombstoned: HashSet<Hash> = HashSet::new();
         for (p, dead) in &view.packs {
             report.pack_bytes_before += p.index.pack_len();
+            let merging = merged.contains(&p.id);
+            if merging {
+                tombstoned.extend(dead.iter().copied());
+            }
+            let mut in_order = Vec::new();
             for e in p.index.iter() {
                 if dead.contains(&e.hash) {
+                    continue;
+                }
+                if seen_packed.insert(e.hash) {
+                    report.packed_before += 1;
+                }
+                if !merging {
                     continue;
                 }
                 let s = sources.entry(e.hash).or_default();
                 if s.packed.is_none() {
                     s.packed = Some((p.clone(), e));
-                    report.packed_before += 1;
+                    in_order.push(e);
                 }
             }
+            in_order.sort_by_key(|e| e.offset);
+            old_bases.extend(
+                in_order
+                    .into_iter()
+                    .map(|e| (e.hash, e.base.map(|r| p.index.hash_at(r as usize)))),
+            );
         }
-        let tombstoned: HashSet<Hash> = view
-            .packs
-            .iter()
-            .flat_map(|(_, dead)| dead.iter().copied())
-            .collect();
+        drop(seen_packed);
         for o in loose {
             report.loose_before += 1;
             report.loose_bytes_before += o.len;
@@ -520,8 +589,14 @@ impl FsBlobStore {
             .filter(|h| !sources.contains_key(h))
             .count() as u64;
 
+        // A full repack trusts the walk first; an incremental one writes the
+        // merged packs first, so loose objects can use them as bases.
+        let (first, second) = match opts.mode {
+            RepackMode::Full => (hints, old_bases),
+            RepackMode::Incremental { .. } => (old_bases, hints),
+        };
         let live: HashSet<Hash> = sources.keys().copied().collect();
-        let order = write_order(hints, &live);
+        let order = write_order(first.into_iter().chain(second).collect(), &live);
 
         let tmp_pack = temp_name(&dir, "pack");
         let mut out =
@@ -536,7 +611,12 @@ impl FsBlobStore {
         file.sync_all().map_err(storage_err)?;
         drop(file);
         step(&opts, RepackStep::PackSynced)?;
-        let replaced: Vec<String> = view.packs.iter().map(|(p, _)| p.id.clone()).collect();
+        let replaced: Vec<String> = view
+            .packs
+            .iter()
+            .map(|(p, _)| p.id.clone())
+            .filter(|id| merged.contains(id))
+            .collect();
 
         if entries.is_empty() {
             remove_if_present(&tmp_pack)?;

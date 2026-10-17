@@ -10,7 +10,7 @@ use leep_core::memory::check_blob_store_contract;
 use leep_core::{BlobStore, Error, Hash, TreeNode};
 
 use crate::pack::{self, IdxEntry, PackIndex};
-use crate::{FsBlobStore, RepackOptions, RepackReport, RepackStep};
+use crate::{plan_merge, FsBlobStore, RepackMode, RepackOptions, RepackReport, RepackStep};
 
 /// Versions of a growing file: each a small edit of the one before.
 fn versions(n: usize) -> Vec<Bytes> {
@@ -37,6 +37,25 @@ fn chain_hints(hashes: &[Hash]) -> Vec<(Hash, Option<Hash>)> {
 async fn repack(store: &FsBlobStore, hints: Vec<(Hash, Option<Hash>)>) -> RepackReport {
     store
         .repack_publish(hints, RepackOptions::default())
+        .await
+        .unwrap()
+        .finish()
+        .await
+        .unwrap()
+}
+
+const INCREMENTAL: RepackMode = RepackMode::Incremental {
+    factor: 2,
+    max_packs: 8,
+};
+
+async fn repack_incremental(store: &FsBlobStore, hints: Vec<(Hash, Option<Hash>)>) -> RepackReport {
+    let opts = RepackOptions {
+        mode: INCREMENTAL,
+        ..RepackOptions::default()
+    };
+    store
+        .repack_publish(hints, opts)
         .await
         .unwrap()
         .finish()
@@ -664,35 +683,47 @@ async fn a_second_repack_waits_for_the_first() {
 }
 
 /// A world with a pack, newer loose objects, a deleted packed object and one
-/// rescued by a later upload, so every kind of source is in play.
+/// rescued by a later upload, so every kind of source is in play. With
+/// `two_packs`, a big pack and a small one an incremental repack wrote, each
+/// with a deleted and a rescued object, so an incremental repack of it merges
+/// the small pack and keeps the big one.
 struct World {
     live: BTreeMap<Hash, Bytes>,
     gone: Vec<Hash>,
     hints: Vec<(Hash, Option<Hash>)>,
 }
 
-async fn build_world(store: &FsBlobStore) -> World {
-    let vs = versions(24);
+async fn build_world(store: &FsBlobStore, two_packs: bool) -> World {
+    let vs = versions(if two_packs { 70 } else { 24 });
+    let (packed, small) = if two_packs { (60, 63) } else { (16, 16) };
     let mut hashes = Vec::new();
     let mut live = BTreeMap::new();
-    for v in &vs[..16] {
+    for (i, v) in vs.iter().enumerate() {
+        if i == packed {
+            repack(store, chain_hints(&hashes)).await;
+        }
+        if i == small && small > packed {
+            let r = repack_incremental(store, chain_hints(&hashes)).await;
+            assert_eq!((r.packs_merged, r.packs_after), (0, 2), "{r:?}");
+        }
         let h = store.put(v.clone()).await.unwrap();
         hashes.push(h);
         live.insert(h, v.clone());
     }
-    repack(store, chain_hints(&hashes)).await;
-    for v in &vs[16..] {
-        let h = store.put(v.clone()).await.unwrap();
-        hashes.push(h);
-        live.insert(h, v.clone());
+    let mut gone = vec![hashes[2], hashes[3]];
+    let mut rescued = vec![hashes[7]];
+    if two_packs {
+        gone.push(hashes[61]);
+        rescued.push(hashes[62]);
     }
-    let gone = vec![hashes[2], hashes[3]];
     for h in &gone {
         store.delete(h).await.unwrap();
         live.remove(h);
     }
-    store.delete(&hashes[7]).await.unwrap();
-    store.put(vs[7].clone()).await.unwrap();
+    for h in &rescued {
+        store.delete(h).await.unwrap();
+        store.put(live[h].clone()).await.unwrap();
+    }
     World {
         live,
         gone,
@@ -718,12 +749,12 @@ async fn check_world(root: &Path, w: &World, what: &str) {
 
 /// Abort a repack at each step, as a kill there would leave it, then check
 /// every object reads, and that the next repack cleans up and succeeds.
-#[tokio::test]
-async fn a_repack_killed_at_any_step_leaves_a_readable_store() {
+async fn kill_sweep(mode: RepackMode) {
+    let incremental = mode != RepackMode::Full;
     let steps = [
         RepackStep::Started,
         RepackStep::Wrote(1),
-        RepackStep::Wrote(10),
+        RepackStep::Wrote(5),
         RepackStep::PackSynced,
         RepackStep::PackRenamed,
         RepackStep::IndexSynced,
@@ -737,11 +768,13 @@ async fn a_repack_killed_at_any_step_leaves_a_readable_store() {
     for kill_at in steps {
         let dir = tempfile::tempdir().unwrap();
         let store = FsBlobStore::new(dir.path());
-        let w = build_world(&store).await;
+        let w = build_world(&store, incremental).await;
         check_world(dir.path(), &w, "before").await;
+        let big = pack_ids(dir.path());
         let seen = Arc::new(Mutex::new(Vec::new()));
         let log = seen.clone();
         let opts = RepackOptions {
+            mode,
             hook: Some(Arc::new(move |s| {
                 log.lock().unwrap().push(s);
                 if s == kill_at {
@@ -758,20 +791,49 @@ async fn a_repack_killed_at_any_step_leaves_a_readable_store() {
         };
         assert!(res.is_err(), "{kill_at:?} was reached");
         assert!(seen.lock().unwrap().contains(&kill_at));
-        let what = format!("killed at {kill_at:?}");
+        let what = format!("{mode:?} killed at {kill_at:?}");
         check_world(dir.path(), &w, &what).await;
 
-        let report = repack(&store, w.hints.clone()).await;
+        let report = if incremental {
+            repack_incremental(&store, w.hints.clone()).await
+        } else {
+            repack(&store, w.hints.clone()).await
+        };
         check_world(dir.path(), &w, &format!("{what}, repacked")).await;
-        assert_eq!(pack_ids(dir.path()).len(), 1, "{what}");
-        assert_eq!(report.objects, w.live.len() as u64, "{what}");
+        let after = pack_ids(dir.path());
         let junk = files_named(dir.path(), |n| {
             n.starts_with(".tmp-") || n.starts_with(".repack-")
         });
         assert!(junk.is_empty(), "{what}: {junk:?}");
         assert_eq!(loose_count(dir.path()), 0, "{what}");
-        assert!(!dir.path().join("packs/tombstones").exists(), "{what}");
+        if incremental {
+            // The big pack stays, with its tombstones; the small one and
+            // everything loose end up in one new pack.
+            assert_eq!(after.len(), 2, "{what}: {report:?}");
+            assert!(after.contains(&big[0]) || after.contains(&big[1]), "{what}");
+            let tomb = std::fs::read_to_string(dir.path().join("packs/tombstones")).unwrap();
+            for line in tomb.lines() {
+                assert!(
+                    after.iter().any(|id| line.starts_with(id.as_str())),
+                    "{what}: {line}"
+                );
+            }
+        } else {
+            assert_eq!(after.len(), 1, "{what}");
+            assert_eq!(report.objects, w.live.len() as u64, "{what}");
+            assert!(!dir.path().join("packs/tombstones").exists(), "{what}");
+        }
     }
+}
+
+#[tokio::test]
+async fn a_repack_killed_at_any_step_leaves_a_readable_store() {
+    kill_sweep(RepackMode::Full).await;
+}
+
+#[tokio::test]
+async fn an_incremental_repack_killed_at_any_step_leaves_a_readable_store() {
+    kill_sweep(INCREMENTAL).await;
 }
 
 /// GC deleting objects while a repack runs: what it deleted stays deleted,
@@ -780,7 +842,7 @@ async fn a_repack_killed_at_any_step_leaves_a_readable_store() {
 async fn deletes_during_a_repack_stay_deleted() {
     let dir = tempfile::tempdir().unwrap();
     let store = FsBlobStore::new(dir.path());
-    let w = build_world(&store).await;
+    let w = build_world(&store, false).await;
     let victims: Vec<Hash> = w.live.keys().take(3).copied().collect();
     let gc = FsBlobStore::new(dir.path());
     let published = store
@@ -837,4 +899,126 @@ async fn deletes_during_a_repack_stay_deleted() {
         .await
         .unwrap()
         .is_none());
+}
+
+#[test]
+fn the_merge_rule_keeps_pack_sizes_geometric_and_their_count_bounded() {
+    let packs = |sizes: &[u64]| -> Vec<(String, u64)> {
+        sizes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (format!("p{i}"), *n))
+            .collect()
+    };
+    let plan = |sizes: &[u64], loose: u64, max: usize| {
+        let mut v = plan_merge(&packs(sizes), loose, 2, max);
+        v.sort();
+        v
+    };
+    // A big pack and a few loose objects: the big pack stays.
+    assert!(plan(&[1000], 10, 8).is_empty());
+    // Small packs roll up into the new one while they are not half its size.
+    assert_eq!(plan(&[1000, 4, 3], 2, 8), ["p1", "p2"]);
+    assert_eq!(plan(&[1000, 40, 3], 2, 8), ["p2"]);
+    // A break in the series high up merges everything below it.
+    assert_eq!(plan(&[1000, 900, 3], 1, 8), ["p0", "p1", "p2"]);
+    // Nothing loose and already geometric: nothing to do; one pack alone is
+    // never rewritten.
+    assert!(plan(&[1000, 100, 10], 0, 8).is_empty());
+    assert!(plan(&[5], 0, 8).is_empty());
+    // max_packs forces the smallest packs together.
+    let series = [1 << 20, 1 << 15, 1 << 10, 1 << 5];
+    assert_eq!(plan(&series, 0, 2), ["p1", "p2", "p3"]);
+    assert_eq!(plan(&series, 1, 3), ["p2", "p3"]);
+
+    // Simulated daily runs: the count stays logarithmic in the history.
+    let mut sizes: Vec<u64> = vec![100_000];
+    let mut most = 0;
+    for day in 0..2000u64 {
+        let loose = 20 + day % 50;
+        let merged = plan_merge(&packs(&sizes), loose, 2, 8);
+        let idx: Vec<usize> = merged.iter().map(|m| m[1..].parse().unwrap()).collect();
+        let total = loose + idx.iter().map(|&i| sizes[i]).sum::<u64>();
+        sizes = sizes
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !idx.contains(i))
+            .map(|(_, n)| *n)
+            .collect();
+        sizes.push(total);
+        most = most.max(sizes.len());
+    }
+    assert!(most <= 8, "{most}");
+    assert_eq!(
+        sizes.iter().sum::<u64>(),
+        100_000 + (0..2000u64).map(|d| 20 + d % 50).sum::<u64>()
+    );
+}
+
+/// An incremental repack packs only loose objects, leaves the big pack as it
+/// is, and merging a small pack keeps its deltas without recompressing them.
+#[tokio::test]
+async fn incremental_repacks_pack_loose_objects_and_merge_small_packs() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FsBlobStore::new(dir.path());
+    let vs = versions(60);
+    let mut hashes = Vec::new();
+    for v in &vs[..50] {
+        hashes.push(store.put(v.clone()).await.unwrap());
+    }
+    let first = repack_incremental(&store, chain_hints(&hashes)).await;
+    assert_eq!((first.objects, first.packs_after), (50, 1), "{first:?}");
+    let big = pack_ids(dir.path());
+    let big_bytes = std::fs::read(dir.path().join(format!("packs/{}.pack", big[0]))).unwrap();
+
+    for v in &vs[50..54] {
+        hashes.push(store.put(v.clone()).await.unwrap());
+    }
+    let second = repack_incremental(&store, chain_hints(&hashes)).await;
+    assert_eq!(
+        (second.objects, second.packs_merged, second.packs_after),
+        (4, 0, 2),
+        "{second:?}"
+    );
+    // The first of the four has its base in the big pack, so it is whole;
+    // the rest are deltas inside the new pack.
+    assert_eq!((second.whole, second.deltas), (1, 3), "{second:?}");
+
+    // Three loose objects are worth merging the four-object pack for
+    // (4 < 2 * 3); the big pack is not (50 >= 2 * 7).
+    for v in &vs[54..57] {
+        hashes.push(store.put(v.clone()).await.unwrap());
+    }
+    let third = repack_incremental(&store, chain_hints(&hashes)).await;
+    assert_eq!(
+        (third.objects, third.packs_merged, third.packs_after),
+        (7, 1, 2),
+        "{third:?}"
+    );
+    assert_eq!(
+        third.frames_reused, 4,
+        "the merged pack's frames: {third:?}"
+    );
+    assert_eq!((third.whole, third.deltas), (1, 6), "{third:?}");
+    assert!(pack_ids(dir.path()).contains(&big[0]), "the big pack stays");
+    assert_eq!(
+        std::fs::read(dir.path().join(format!("packs/{}.pack", big[0]))).unwrap(),
+        big_bytes
+    );
+    let fresh = FsBlobStore::with_decoded_cache(dir.path(), 0);
+    for (h, v) in hashes.iter().zip(&vs) {
+        assert_eq!(&fresh.get(h).await.unwrap().unwrap(), v);
+    }
+    assert_eq!(loose_count(dir.path()), 0);
+
+    // A full repack folds both into one, reusing the frames it can.
+    let full = repack(&store, chain_hints(&hashes)).await;
+    assert_eq!((full.objects, full.packs_after), (57, 1), "{full:?}");
+    assert!(full.frames_reused >= 50, "{full:?}");
+    for (h, v) in hashes.iter().zip(&vs) {
+        assert_eq!(
+            &FsBlobStore::new(dir.path()).get(h).await.unwrap().unwrap(),
+            v
+        );
+    }
 }

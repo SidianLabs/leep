@@ -70,9 +70,9 @@ content-addressing and (b) the atomicity of `MetaStore::cas_ref`.
 | Crate | Role | May depend on |
 |---|---|---|
 | `leep-core` | Types, hashing, encoding, `BlobStore`/`MetaStore` traits (including listing and blob deletion for GC, a changeset id prefix lookup for short ids, listing and dropping derived rows by kind for repair, batched changeset and derived reads for history walks, and batched derived writes and changeset-with-rows writes for changeset creation), in-memory stores, conformance tests, API types, pure rename detection | no other leep crate; no I/O, no async runtime |
-| `leep-store` | `BlobStore` backends: filesystem (loose objects plus delta-compressed packs and the repack writer, ADR 0029), `object_store` (S3/MinIO; loose objects plus the same packs, ADR 0040), `CachedBlobStore`, `open_blob_store(url)`, and the incremental blob copy backup and restore use (`sync`, ADR 0026) | core |
+| `leep-store` | `BlobStore` backends: filesystem (loose objects plus delta-compressed packs and the repack writer, ADR 0029, ADR 0039), `object_store` (S3/MinIO; loose objects plus the same packs, ADR 0040), `CachedBlobStore`, `open_blob_store(url)`, and the incremental blob and pack copy backup and restore use (`sync`, `packfiles`, ADR 0026, ADR 0039) | core |
 | `leep-meta` | `MetaStore` backends: SQLite, Postgres, `open_meta_store(url)`, the versioned schema migrator (`migrate`, ADR 0023), and metadata snapshots and their import (`snapshot`, ADR 0026) | core |
-| `leep-derive` | `Repo`: derived data framework and kinds, plus all operations, blob garbage collection (`gc`), the delta-base walk for `repack` (`pack_order`) and store verification and repair (`integrity`) | core (traits only, never a concrete backend) |
+| `leep-derive` | `Repo`: derived data framework and kinds, plus all operations, blob garbage collection (`gc`), the delta-base walks for `repack` (`pack_order`, full or loose-only) and store verification and repair (`integrity`) | core (traits only, never a concrete backend) |
 | `leep-server` | HTTP server binary `leep-server`, and its offline subcommands (`gc`, `migrate`, `verify`, `repair`, `backup`, `restore`, `backup-verify`) | core, store, meta, derive |
 | `leep-cli` | Client binary `leep` | core only |
 | `leep-mcp` | MCP server binary `leep-mcp` for AI agents (stdio JSON-RPC; talks to `leep-server` over HTTP) | core and the `leep-cli` library (its HTTP client); never derive, store, meta or server outside dev-dependencies |
@@ -506,7 +506,15 @@ FsBlobStore.get(hash)
 ```
 `leep-server repack` moves loose objects into a pack: a file version is
 stored as a zstd delta against the previous version at its path, a tree node
-against the same directory in the first parent, chains capped at 32. A read
+against the same directory in the first parent, chains capped at 32. By
+default it is incremental (ADR 0039). It walks back from the refs only
+through changesets whose root tree is still loose, packs the loose objects,
+and merges the smallest packs by a geometric rule, so the pack count stays
+logarithmic and at most `--max-packs`. Merged entries whose base does not
+change are copied frame for frame. `--full` walks all history and rewrites
+everything into one pack. Backups copy packs and their tombstones as files
+(`leep_store::packfiles`, `sync::sync_packs`) before the object-by-object
+copy, which then finds the packed objects present. A read
 decodes the chain iteratively and checks the result against its hash. GC
 deletes a packed object by appending a tombstone; the next full repack leaves
 it out. A store reads a pack published by another process on its next miss
@@ -735,5 +743,7 @@ repack` stores objects as zstd deltas against the previous version of the
 same path, with no change to hashes, the API or clients. The filesystem
 store has them (the first 3,795 commits of git/git: 91.2 MB loose, a 3.1 MB
 pack plus a 0.5 MB index since ADR 0038, against git's 4.4 MB pack), and
-so does the object store backend since ADR 0040; incremental repacks are
+so does the object store backend since ADR 0040. Since ADR 0039 the
+scheduled repack is incremental (it costs the new history, not all of it)
+and backups copy packs as files; incremental repacks of object stores are
 next.
