@@ -376,6 +376,15 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   one transaction). New metrics `leep_land_batch_size` and
   `leep_land_cancelled_total`; `leep_land_lock_wait_seconds` now measures the
   time queued. `leep-land-bench` measures land throughput by number of agents.
+- GC marks incrementally (ADR 0033): each `gc` run records what it marked in
+  `gc-mark-v1` rows, written so that a row always vouches for everything below
+  it, and the next run walks only changesets stored since and stops at marked
+  tree nodes. Ref and tag moves never force a full walk, since liveness comes
+  from stored changesets. `collect` reads condemnation rows in batches. On
+  21,000 commits of git/git a GC after 10 new commits takes 1.7 s instead of
+  59 s (packed store). `gc --full` walks everything and rewrites the record;
+  `repair drop` refuses the kind, and `verify` checks its rows. New example
+  `gc_profile` times GC phases and counts store calls.
 
 ### Fixes
 - Processes opening a new SQLite metadata file at the same moment (servers

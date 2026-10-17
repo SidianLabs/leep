@@ -145,6 +145,7 @@ changeset, and concurrent servers that race produce identical bytes.
 | `blob-claim-v1` / `blob-condemned-v1` / `blob-rescue-v1` / `blob-doom-v1` | per blob hash, 8-byte big-endian unix seconds (doom adds a state byte); GC bookkeeping, not derived from changesets: claims by uploads and dedup checks, condemnation by `gc condemn`, rescue by uploads of a condemned blob, doom by `gc collect` (ADR 0012) | blob garbage collection and the server's missing-blob checks |
 | `history-tree-v2` | 32-byte address of the root history node, a tree parallel to `root_tree` recording for each path (including deleted ones) the newest changesets that changed it; nodes are `history-node-v2` rows keyed by content hash, and nodes of more than 64 entries are stored as content-defined chunks so an edit rewrites one chunk (ADR 0027). Built from the first parent's tree plus the spines of changed paths, and at merges the paths where another parent's history differs (ADR 0013) | path log, `last-change` |
 | `blame` | per (changeset, path), keyed `Hash::of_object("blame", id‖path)` | blame |
+| `gc-mark-v1` | per changeset id, tree node hash or blob hash, one byte: "referenced by a stored changeset, and everything below has a row"; written by GC marks in post-order (ADR 0033) | incremental GC marks, which skip covered changesets and stop at marked tree nodes |
 | `blob-trigrams-v1` | per blob hash: sorted trigram set of a UTF-8 text blob up to 1 MiB (delta varints), or a "not indexed" marker (ADR 0014) | code search |
 | `tree-trigrams-v1` | per tree node hash: fixed-size bloom filter (2^19 bits) over every trigram below the directory, the OR of its children's filters; shared by every revision with the same subtree (ADR 0014) | code search directory pruning |
 
@@ -502,7 +503,12 @@ misses and occupancy as Prometheus metrics (see [OPERATIONS.md](OPERATIONS.md)).
   re-upload it, and an upload rescues it; collect orders its delete against
   uploads with a two-flag handshake in meta. Grace and fence together make GC
   safe beside running servers, with no residual race. See ADR 0008 and
-  ADR 0012.
+  ADR 0012. The mark is incremental (ADR 0033): each run records what it
+  walked in `gc-mark-v1` rows, written so a row always vouches for
+  everything below it, and the next run walks only changesets with no row
+  and stops at marked tree nodes. Changesets are never deleted, so liveness
+  only grows and ref moves never force a full walk; `gc --full` walks
+  everything anyway.
 
 ## 9. Failure model
 

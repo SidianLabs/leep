@@ -486,6 +486,7 @@ leep-server gc --dry-run                     # what would be condemned; writes n
 leep-server gc                               # condemn, wait --fence, collect
 leep-server gc condemn                       # phase one only
 leep-server gc collect --fence 10m           # phase two only
+leep-server gc --full                        # walk all of history, not only what is new
 ```
 
 How it works: **condemn** marks every unreferenced blob older than `--grace`
@@ -494,6 +495,23 @@ again if they need it. After `--fence` (default 10m) **collect** marks again and
 deletes the blobs that are still condemned. Collect acts only on condemnations
 at least `--fence` old, so the two phases can run as separate cron jobs or
 processes. A crashed run is safe: rerun it.
+
+Marking is incremental (ADR 0033): each run records what it marked in
+`gc-mark-v1` rows and the next one walks only changesets stored since, so a
+run costs a listing of changesets and blobs plus the new history, not a walk
+of all of it. The first run after an upgrade walks everything once. The
+report's `changesets walked` and `referenced blobs and trees marked by this
+run` show the walk; `referenced blobs marked by earlier runs` the rest.
+Moving, deleting or recreating refs and tags never needs a full walk, because
+GC keeps whatever any stored changeset references. `--full` ignores the record,
+walks everything and rewrites it. It is never needed for safety; it costs a
+walk of all of history (about 10 s per phase per 20,000 commits on Postgres,
+see `docs/PERFORMANCE.md`), and because it reads every tree node again it also
+fails loudly on a tree node lost from the store, which `verify` reports too.
+`repair drop` refuses `gc-mark-v1`: dropping part of it could let a collect
+delete a referenced blob. On a loose filesystem store the blob
+listing then dominates a run (about 40 us per loose object); `repack` makes it
+about 7 us per object.
 
 Choosing durations:
 
@@ -706,7 +724,7 @@ servers no longer use; see [Upgrading](#upgrading).
 Kinds that cannot be rederived (and so are refused by `drop` with an
 explanation and exit status 2): `signature-v1` and `review-v1` (clients wrote
 them), `rebased-origin-v1` (written by rebase; `land`'s retry detection depends
-on it), `blob-claim-v1`, `blob-condemned-v1`, `blob-rescue-v1`, `blob-doom-v1` (the GC
+on it), `blob-claim-v1`, `blob-condemned-v1`, `blob-rescue-v1`, `blob-doom-v1`, `gc-mark-v1` (the GC
 fence, ADR 0012), `history-node-v2` (or `-v1`) on its own, and the ref log. The full table
 with reasons is in ADR 0025. `blame` can be dropped but not rederived: its rows
 are keyed by a hash of (changeset, path) and cannot be listed.

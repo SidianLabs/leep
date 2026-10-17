@@ -10,7 +10,9 @@
 //!
 //! The mark set holds one 32-byte hash per live blob and tree node, so memory
 //! grows linearly with the number of distinct live blobs (roughly 50 bytes
-//! each). Subtrees shared between snapshots are walked once.
+//! each). Subtrees shared between snapshots are walked once. Each mark
+//! records what it walked ([`GC_MARK`]), so the next one walks only what is
+//! new (ADR 0033).
 
 use std::collections::HashSet;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -395,9 +397,17 @@ impl Default for GcOptions {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CondemnReport {
+    /// Stored changesets listed.
     pub changesets_scanned: u64,
-    /// Distinct blobs and tree nodes referenced by stored changesets.
+    /// Changesets whose blobs and trees this run walked: all of them in a
+    /// full mark, those no earlier run marked otherwise.
+    pub changesets_walked: u64,
+    /// Distinct blobs and tree nodes this run walked and found referenced.
+    /// In a full mark, every referenced one.
     pub marked: u64,
+    /// Listed blobs found referenced through the record of an earlier run's
+    /// mark rather than walked again.
+    pub marked_earlier: u64,
     pub blobs_scanned: u64,
     /// Blobs newly condemned, or that would be in a dry run.
     pub condemned: u64,
@@ -417,6 +427,7 @@ pub struct CondemnReport {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CollectReport {
     pub changesets_scanned: u64,
+    pub changesets_walked: u64,
     pub marked: u64,
     pub blobs_scanned: u64,
     /// Condemnations at least a fence old that this run examined.
@@ -442,10 +453,20 @@ pub struct GcReport {
     pub collect: CollectReport,
 }
 
-/// Condemn, wait out the fence, then collect.
+/// Condemn, wait out the fence, then collect, marking incrementally.
 pub async fn run(repo: &Repo, opts: &GcOptions, clock: &dyn Clock) -> Result<GcReport> {
+    run_with(repo, opts, Mark::Incremental, clock).await
+}
+
+/// [`run`] with a choice of mark. A full mark applies to both phases.
+pub async fn run_with(
+    repo: &Repo,
+    opts: &GcOptions,
+    mode: Mark,
+    clock: &dyn Clock,
+) -> Result<GcReport> {
     check_fence(opts)?;
-    let condemn = condemn(repo, opts, clock).await?;
+    let condemn = condemn_with(repo, opts, mode, clock).await?;
     if opts.dry_run {
         return Ok(GcReport {
             condemn,
@@ -453,7 +474,7 @@ pub async fn run(repo: &Repo, opts: &GcOptions, clock: &dyn Clock) -> Result<GcR
         });
     }
     clock.sleep(opts.fence).await;
-    let collect = collect(repo, opts, clock).await?;
+    let collect = collect_with(repo, opts, mode, clock).await?;
     Ok(GcReport { condemn, collect })
 }
 
@@ -472,58 +493,336 @@ fn secs(d: Duration) -> i64 {
     i64::try_from(d.as_secs()).unwrap_or(i64::MAX)
 }
 
-/// Every blob and tree node referenced by any stored changeset. Any error
-/// aborts before anything is deleted, so an incomplete mark set never loses a
-/// blob.
-async fn mark(repo: &Repo, changesets_scanned: &mut u64) -> Result<HashSet<Hash>> {
-    let mut marked: HashSet<Hash> = HashSet::new();
+/// How a run finds the referenced blobs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Mark {
+    /// Walk only changesets no earlier run recorded as marked, and stop at
+    /// tree nodes an earlier run marked (ADR 0033).
+    #[default]
+    Incremental,
+    /// Walk every stored changeset and tree, ignoring and then rewriting the
+    /// record earlier runs left.
+    Full,
+}
+
+/// Derived-data kind recording what earlier marks covered (ADR 0033). Keyed
+/// by a changeset id, a tree node hash or a blob hash; the value is
+/// [`MARK_VALUE`]. A row says the object is referenced by a stored
+/// changeset, and is written only after rows for everything below it: a
+/// changeset's row after its `Modify` contents and root tree, a tree node's
+/// after its entries. So a row always vouches for the whole closure under it,
+/// and a run may stop walking there. Changesets are never deleted, so a row
+/// never goes stale.
+pub const GC_MARK: &str = "gc-mark-v1";
+
+/// The only value a [`GC_MARK`] row has. Anything else reads as no row,
+/// which costs a walk and never loses a blob.
+const MARK_VALUE: &[u8] = &[1];
+
+fn is_mark(v: &Option<Bytes>) -> bool {
+    v.as_deref() == Some(MARK_VALUE)
+}
+
+/// Check a [`GC_MARK`] row's value. Public for verification and the fuzz
+/// harness.
+#[doc(hidden)]
+pub fn decode_mark(v: &[u8]) -> Result<()> {
+    if v == MARK_VALUE {
+        Ok(())
+    } else {
+        Err(Error::Other(format!("corrupt {GC_MARK} row")))
+    }
+}
+
+#[derive(Default)]
+struct MarkStats {
+    changesets_scanned: u64,
+    changesets_walked: u64,
+}
+
+/// What a mark found: the objects this run walked, plus, when it trusted the
+/// rows of earlier runs, those rows for everything else.
+struct Marked {
+    walked: HashSet<Hash>,
+    rows: bool,
+}
+
+impl Marked {
+    /// Whether each of `hashes` is referenced by a stored changeset, with one
+    /// batched read for the ones this run did not walk. Also returns how many
+    /// were known only from earlier runs.
+    async fn which(&self, repo: &Repo, hashes: &[Hash]) -> Result<(Vec<bool>, u64)> {
+        let mut out: Vec<bool> = hashes.iter().map(|h| self.walked.contains(h)).collect();
+        if !self.rows {
+            return Ok((out, 0));
+        }
+        let ask: Vec<Hash> = hashes
+            .iter()
+            .zip(&out)
+            .filter(|(_, m)| !**m)
+            .map(|(h, _)| *h)
+            .collect();
+        if ask.is_empty() {
+            return Ok((out, 0));
+        }
+        let rows = repo.meta().get_derived_many(GC_MARK, &ask).await?;
+        let earlier: HashSet<Hash> = ask
+            .into_iter()
+            .zip(rows)
+            .filter(|(_, v)| is_mark(v))
+            .map(|(h, _)| h)
+            .collect();
+        for (h, m) in hashes.iter().zip(out.iter_mut()) {
+            *m = *m || earlier.contains(h);
+        }
+        Ok((out, earlier.len() as u64))
+    }
+}
+
+/// Rows waiting to be written, in the order that keeps every row's closure
+/// written first. Flushed in batches; `put_derived_many` stores a prefix on
+/// failure, so a crash never leaves a row without the rows below it.
+struct MarkWriter<'a> {
+    repo: &'a Repo,
+    write: bool,
+    rows: Vec<DerivedRow>,
+}
+
+impl MarkWriter<'_> {
+    async fn push(&mut self, key: Hash) -> Result<()> {
+        if !self.write {
+            return Ok(());
+        }
+        self.rows.push(DerivedRow::new(
+            GC_MARK,
+            key,
+            Bytes::from_static(MARK_VALUE),
+        ));
+        if self.rows.len() >= PAGE {
+            self.flush().await?;
+        }
+        Ok(())
+    }
+
+    async fn flush(&mut self) -> Result<()> {
+        if !self.rows.is_empty() {
+            self.repo.meta().put_derived_many(&self.rows).await?;
+            self.rows.clear();
+        }
+        Ok(())
+    }
+}
+
+/// Which of `hashes` earlier runs marked, or none if rows are not consulted.
+async fn marked_rows(repo: &Repo, check: bool, hashes: &[Hash]) -> Result<HashSet<Hash>> {
+    if !check || hashes.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let rows = repo.meta().get_derived_many(GC_MARK, hashes).await?;
+    Ok(hashes
+        .iter()
+        .zip(rows)
+        .filter(|(_, v)| is_mark(v))
+        .map(|(h, _)| *h)
+        .collect())
+}
+
+/// Every blob and tree node referenced by any stored changeset: those this
+/// run walks, plus (incrementally) those earlier runs recorded. Any error
+/// aborts before anything is condemned or deleted, so an incomplete mark
+/// never loses a blob. Unless `write` is false, records what it walked for
+/// the next run.
+async fn mark(repo: &Repo, mode: Mark, write: bool, stats: &mut MarkStats) -> Result<Marked> {
+    let trust = mode == Mark::Incremental;
+    let mut walked: HashSet<Hash> = HashSet::new();
+    let mut out = MarkWriter {
+        repo,
+        write,
+        rows: Vec::new(),
+    };
     let mut after: Option<ChangesetId> = None;
     loop {
         let page = repo.meta().list_changesets(after, PAGE).await?;
         let Some(last) = page.last().copied() else {
-            return Ok(marked);
+            break;
         };
         after = Some(last);
-        for id in page {
-            *changesets_scanned += 1;
-            let cs = repo.get_changeset(id).await?;
+        stats.changesets_scanned += page.len() as u64;
+        let keys: Vec<Hash> = page.iter().map(|id| id.0).collect();
+        let covered = marked_rows(repo, trust, &keys).await?;
+        let todo: Vec<ChangesetId> = page
+            .into_iter()
+            .filter(|id| !covered.contains(&id.0))
+            .collect();
+        if todo.is_empty() {
+            continue;
+        }
+        // A page with nothing covered is a first run (or close to one): its
+        // trees are almost all new, so asking about them would only add
+        // reads. Not asking is always safe.
+        let check = trust && !covered.is_empty();
+        stats.changesets_walked += todo.len() as u64;
+        let changesets = repo.meta().get_changesets(&todo).await?;
+        let roots = repo.root_trees(&todo).await?;
+        let mut tops: Vec<Hash> = Vec::new();
+        for cs in changesets.iter().flatten() {
             for change in cs.changes.values() {
                 if let FileChange::Modify { content, .. } = change {
-                    marked.insert(*content);
+                    tops.push(*content);
                 }
             }
-            // Tree and blob hashes are domain-separated, so one set doubles as
-            // the visited set: a tree already in it was fully walked (or is
-            // queued below) via an earlier snapshot.
-            let mut stack = vec![repo.root_tree(id).await?];
-            while let Some(tree) = stack.pop() {
-                if !marked.insert(tree) {
-                    continue;
+        }
+        tops.extend(&roots);
+        tops.retain(|h| !walked.contains(h));
+        tops.sort_unstable();
+        tops.dedup();
+        let known = marked_rows(repo, check, &tops).await?;
+        for ((id, cs), root) in todo.iter().zip(changesets).zip(roots) {
+            let cs = cs.ok_or_else(|| Error::NotFound(format!("changeset {id}")))?;
+            for change in cs.changes.values() {
+                if let FileChange::Modify { content, .. } = change {
+                    if !known.contains(content) && walked.insert(*content) {
+                        out.push(*content).await?;
+                    }
                 }
-                for entry in repo.read_tree(tree).await?.entries.into_values() {
-                    match entry {
-                        TreeEntry::File { content, .. } => {
-                            marked.insert(content);
-                        }
-                        TreeEntry::Dir { tree } => {
-                            if !marked.contains(&tree) {
-                                stack.push(tree);
-                            }
-                        }
+            }
+            if !known.contains(&root) {
+                walk_tree(repo, root, check, &mut walked, &mut out).await?;
+            }
+            out.push(id.0).await?;
+        }
+    }
+    out.flush().await?;
+    Ok(Marked {
+        walked,
+        rows: trust,
+    })
+}
+
+/// Test oracle: an incremental mark that records what it walks must agree
+/// with a full mark on every stored blob and every referenced object, and
+/// every row it trusts must name a referenced object or a stored changeset.
+/// Returns how many changesets the incremental mark walked.
+#[cfg(test)]
+pub(crate) async fn check_incremental_mark(r: &Repo) -> std::result::Result<u64, String> {
+    let mut stats = MarkStats::default();
+    let full = mark(r, Mark::Full, false, &mut stats)
+        .await
+        .map_err(|e| e.to_string())?
+        .walked;
+    let mut stats = MarkStats::default();
+    let inc = mark(r, Mark::Incremental, true, &mut stats)
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut all: Vec<Hash> = r
+        .blobs()
+        .list_page(None, usize::MAX)
+        .await
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|m| m.hash)
+        .collect();
+    all.extend(full.iter().copied());
+    all.sort_unstable();
+    all.dedup();
+    let (got, _) = inc.which(r, &all).await.map_err(|e| e.to_string())?;
+    for (h, g) in all.iter().zip(got) {
+        if g != full.contains(h) {
+            return Err(format!("{h} is marked {g} incrementally, {} fully", !g));
+        }
+    }
+    let ids: HashSet<Hash> = r
+        .meta()
+        .list_changesets(None, usize::MAX)
+        .await
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|id| id.0)
+        .collect();
+    let rows = r
+        .meta()
+        .list_derived(GC_MARK, None, usize::MAX)
+        .await
+        .map_err(|e| e.to_string())?;
+    for (key, value) in rows {
+        if value.as_ref() != MARK_VALUE || !(full.contains(&key) || ids.contains(&key)) {
+            return Err(format!("row {key} names nothing referenced"));
+        }
+    }
+    Ok(stats.changesets_walked)
+}
+
+/// Mark `root` and everything below it that is not marked yet, writing rows
+/// in post-order: a node's row follows its entries' rows. Iterative, with an
+/// explicit stack. A node joins `walked` when it is expanded, so a node in
+/// `walked` but not yet written is on the current path, which content
+/// addressing makes impossible below itself.
+async fn walk_tree(
+    repo: &Repo,
+    root: Hash,
+    check: bool,
+    walked: &mut HashSet<Hash>,
+    out: &mut MarkWriter<'_>,
+) -> Result<()> {
+    let mut stack: Vec<(Hash, bool)> = vec![(root, false)];
+    while let Some((tree, expanded)) = stack.pop() {
+        if expanded {
+            out.push(tree).await?;
+            continue;
+        }
+        // Tree and blob hashes are domain-separated, so one set serves both.
+        if !walked.insert(tree) {
+            continue;
+        }
+        stack.push((tree, true));
+        let entries = repo.read_tree(tree).await?.entries;
+        let fresh: Vec<Hash> = entries
+            .values()
+            .map(|e| match e {
+                TreeEntry::File { content, .. } => *content,
+                TreeEntry::Dir { tree } => *tree,
+            })
+            .filter(|h| !walked.contains(h))
+            .collect();
+        let known = marked_rows(repo, check, &fresh).await?;
+        for entry in entries.into_values() {
+            match entry {
+                TreeEntry::File { content, .. } => {
+                    if !known.contains(&content) && walked.insert(content) {
+                        out.push(content).await?;
+                    }
+                }
+                TreeEntry::Dir { tree } => {
+                    if !known.contains(&tree) && !walked.contains(&tree) {
+                        stack.push((tree, false));
                     }
                 }
             }
         }
     }
+    Ok(())
 }
 
 /// Phase one: mark, then write a condemnation for every unreferenced blob
-/// that is old and unclaimed. Deletes nothing.
+/// that is old and unclaimed. Deletes nothing. Marks incrementally.
 pub async fn condemn(repo: &Repo, opts: &GcOptions, clock: &dyn Clock) -> Result<CondemnReport> {
+    condemn_with(repo, opts, Mark::Incremental, clock).await
+}
+
+/// [`condemn`] with a choice of mark.
+pub async fn condemn_with(
+    repo: &Repo,
+    opts: &GcOptions,
+    mode: Mark,
+    clock: &dyn Clock,
+) -> Result<CondemnReport> {
     let mut report = CondemnReport::default();
     let started_at = clock.now();
-    let marked = mark(repo, &mut report.changesets_scanned).await?;
-    report.marked = marked.len() as u64;
+    let mut stats = MarkStats::default();
+    let marked = mark(repo, mode, !opts.dry_run, &mut stats).await?;
+    report.changesets_scanned = stats.changesets_scanned;
+    report.changesets_walked = stats.changesets_walked;
+    report.marked = marked.walked.len() as u64;
     let grace = secs(opts.grace);
     let cutoff = started_at.saturating_sub(grace);
     let mut after: Option<Hash> = None;
@@ -533,9 +832,12 @@ pub async fn condemn(repo: &Repo, opts: &GcOptions, clock: &dyn Clock) -> Result
             return Ok(report);
         };
         after = Some(last);
-        for blob in page {
+        let hashes: Vec<Hash> = page.iter().map(|b| b.hash).collect();
+        let (referenced, earlier) = marked.which(repo, &hashes).await?;
+        report.marked_earlier += earlier;
+        for (blob, referenced) in page.into_iter().zip(referenced) {
             report.blobs_scanned += 1;
-            if marked.contains(&blob.hash) {
+            if referenced {
                 continue;
             }
             match blob.modified {
@@ -575,14 +877,27 @@ pub async fn condemn(repo: &Repo, opts: &GcOptions, clock: &dyn Clock) -> Result
 /// Phase two: delete blobs whose condemnation is at least `fence` older than
 /// this run's start and that nothing has rescued. The mark runs after the
 /// fence, so it sees every changeset stored by a request that passed its
-/// check before the condemnation.
+/// check before the condemnation. Marks incrementally.
 pub async fn collect(repo: &Repo, opts: &GcOptions, clock: &dyn Clock) -> Result<CollectReport> {
+    collect_with(repo, opts, Mark::Incremental, clock).await
+}
+
+/// [`collect`] with a choice of mark.
+pub async fn collect_with(
+    repo: &Repo,
+    opts: &GcOptions,
+    mode: Mark,
+    clock: &dyn Clock,
+) -> Result<CollectReport> {
     check_fence(opts)?;
     let mut report = CollectReport::default();
     let started_at = clock.now();
     let eligible_before = started_at.saturating_sub(secs(opts.fence));
-    let marked = mark(repo, &mut report.changesets_scanned).await?;
-    report.marked = marked.len() as u64;
+    let mut stats = MarkStats::default();
+    let marked = mark(repo, mode, !opts.dry_run, &mut stats).await?;
+    report.changesets_scanned = stats.changesets_scanned;
+    report.changesets_walked = stats.changesets_walked;
+    report.marked = marked.walked.len() as u64;
     let mut after: Option<Hash> = None;
     loop {
         let page = repo.blobs().list_page(after, PAGE).await?;
@@ -590,8 +905,19 @@ pub async fn collect(repo: &Repo, opts: &GcOptions, clock: &dyn Clock) -> Result
             return Ok(report);
         };
         after = Some(last);
-        for blob in page {
+        // Condemnation rows for the whole page in one read; only blobs that
+        // have one need the rest of their fence state.
+        let hashes: Vec<Hash> = page.iter().map(|b| b.hash).collect();
+        let rows = repo
+            .meta()
+            .get_derived_many(BLOB_CONDEMNED, &hashes)
+            .await?;
+        let mut candidates = Vec::new();
+        for (blob, row) in page.into_iter().zip(rows) {
             report.blobs_scanned += 1;
+            if row.is_none() {
+                continue;
+            }
             let state = repo.fence_state(&blob.hash).await?;
             let Some(c) = state.condemned else {
                 continue;
@@ -600,8 +926,12 @@ pub async fn collect(repo: &Repo, opts: &GcOptions, clock: &dyn Clock) -> Result
                 report.fence_pending += 1;
                 continue;
             }
+            candidates.push((blob, state, c));
+        }
+        let hashes: Vec<Hash> = candidates.iter().map(|(b, _, _)| b.hash).collect();
+        let (referenced, _) = marked.which(repo, &hashes).await?;
+        for ((blob, state, c), is_marked) in candidates.into_iter().zip(referenced) {
             report.condemned += 1;
-            let is_marked = marked.contains(&blob.hash);
             if !state.is_condemned() {
                 if !is_marked {
                     report.rescued_by_claim += 1;
@@ -1535,9 +1865,7 @@ mod tests {
 
     /// No stored changeset may point at a blob or tree that is gone.
     async fn assert_no_dangling(r: &Repo) {
-        let mut n = 0;
-        let marked = mark(r, &mut n).await.unwrap();
-        for h in marked {
+        for h in full_mark(r).await {
             if h == TreeNode::empty_hash() {
                 continue;
             }
@@ -1780,5 +2108,261 @@ mod tests {
             }
             assert_no_dangling(&r).await;
         }
+    }
+
+    // --- incremental marking (ADR 0033) ------------------------------------
+
+    /// What a full mark finds, writing nothing: the oracle.
+    async fn full_mark(r: &Repo) -> HashSet<Hash> {
+        let mut stats = MarkStats::default();
+        mark(r, Mark::Full, false, &mut stats).await.unwrap().walked
+    }
+
+    async fn assert_marks_agree(r: &Repo, what: &str) -> MarkStats {
+        let walked = check_incremental_mark(r)
+            .await
+            .unwrap_or_else(|e| panic!("{what}: {e}"));
+        MarkStats {
+            changesets_scanned: 0,
+            changesets_walked: walked,
+        }
+    }
+
+    #[tokio::test]
+    async fn incremental_runs_walk_only_what_is_new() {
+        let (r, blobs) = setup();
+        let ids = build_history(&r).await;
+        age_all(&blobs).await;
+        let t = now();
+        let first = condemn(&r, &opts(1, false), &TestClock::at(t))
+            .await
+            .unwrap();
+        assert_eq!((first.changesets_walked, first.marked_earlier), (7, 0));
+        assert_eq!(first.marked as usize, blobs.len());
+
+        // Nothing new: nothing walked, every blob known from the record.
+        let again = condemn(&r, &opts(1, false), &TestClock::at(t + 1))
+            .await
+            .unwrap();
+        assert_eq!((again.changesets_walked, again.marked), (0, 0));
+        assert_eq!(again.marked_earlier as usize, blobs.len());
+        assert_eq!(again.condemned, 0);
+
+        // One new changeset deep in the tree: only its new path is walked.
+        let tip = commit(&r, &[ids[6]], &[("d/e/z.txt", Some("z\n"))]).await;
+        let c = condemn(&r, &opts(1, false), &TestClock::at(t + 2))
+            .await
+            .unwrap();
+        assert_eq!(c.changesets_walked, 1);
+        // The blob and the three new tree nodes on its path (d/e, d, root).
+        assert_eq!(c.marked, 4, "{c:?}");
+        assert_marks_agree(&r, "after one commit").await;
+
+        // A ref moved backwards or deleted changes nothing: liveness comes
+        // from stored changesets, not refs.
+        r.meta().cas_ref("main", None, Some(tip)).await.unwrap();
+        r.meta()
+            .cas_ref("main", Some(tip), Some(ids[0]))
+            .await
+            .unwrap();
+        r.meta().cas_ref("main", Some(ids[0]), None).await.unwrap();
+        let c = condemn(&r, &opts(1, false), &TestClock::at(t + 3))
+            .await
+            .unwrap();
+        assert_eq!((c.changesets_walked, c.condemned), (0, 0));
+
+        // A full run walks everything again and agrees.
+        let f = condemn_with(&r, &opts(1, false), Mark::Full, &TestClock::at(t + 4))
+            .await
+            .unwrap();
+        assert_eq!(f.changesets_walked as usize, all_ids(&r).await.len());
+        assert_eq!((f.marked as usize, f.marked_earlier), (blobs.len(), 0));
+    }
+
+    #[tokio::test]
+    async fn dry_run_marks_without_recording() {
+        let (r, blobs) = setup();
+        build_history(&r).await;
+        age_all(&blobs).await;
+        let d = condemn(&r, &opts(1, true), &TestClock::at(now()))
+            .await
+            .unwrap();
+        assert_eq!(d.marked as usize, blobs.len());
+        assert!(r
+            .meta()
+            .list_derived(GC_MARK, None, 10)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_damaged_row_reads_as_unmarked() {
+        let (r, blobs) = setup();
+        let id = commit(&r, &[], &[("d/a.txt", Some("a\n"))]).await;
+        condemn(&r, &opts(1, false), &TestClock::at(now()))
+            .await
+            .unwrap();
+        let root = r.root_tree(id).await.unwrap();
+        // A damaged changeset row and root row: the next run walks again.
+        for key in [id.0, root] {
+            r.meta()
+                .put_derived(GC_MARK, &key, Bytes::from_static(&[7]))
+                .await
+                .unwrap();
+        }
+        // Golden bytes: changing them makes every recorded mark read as absent.
+        assert_eq!(MARK_VALUE, [1u8]);
+        assert!(decode_mark(&[7]).is_err() && decode_mark(MARK_VALUE).is_ok());
+        let stats = assert_marks_agree(&r, "damaged rows").await;
+        assert_eq!(stats.changesets_walked, 1);
+        assert_eq!(blobs.len(), 3);
+        assert!(crate::integrity::kinds::check_droppable(GC_MARK).is_err());
+    }
+
+    /// Random histories with branches, merges, failed commits, orphans, and
+    /// refs and tags moving forwards, backwards, deleted and recreated, with
+    /// incremental condemns and collects in between: after every step the
+    /// incremental mark agrees with a full mark on every object, a dry run
+    /// of each would condemn the same, and nothing referenced is ever lost.
+    #[tokio::test]
+    async fn incremental_mark_matches_full_mark_on_random_histories() {
+        let seeds = std::env::var("LEEP_FAULT_SEEDS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(25);
+        for seed in 1..=seeds {
+            random_history_gc(seed).await;
+        }
+    }
+
+    async fn random_history_gc(seed: u64) {
+        let (r, blobs) = setup();
+        let mut rng = leep_testkit::Rng::new(seed);
+        let mut ids: Vec<ChangesetId> = Vec::new();
+        let paths = [
+            "a.txt",
+            "d/x.txt",
+            "d/e/y.txt",
+            "d/e/f/z.txt",
+            "g/h.txt",
+            "g/i/j.txt",
+        ];
+        let body = |rng: &mut leep_testkit::Rng| format!("body {}\n", rng.below(12));
+        let mut t = now() + 1000;
+        for step in 0..40 {
+            match rng.below(10) {
+                0..=3 => {
+                    let parent =
+                        (!ids.is_empty() && rng.below(6) > 0).then(|| ids[rng.below(ids.len())]);
+                    let mut changes = BTreeMap::new();
+                    for _ in 0..rng.below(3) + 1 {
+                        let p = paths[rng.below(paths.len())];
+                        let ch = if rng.below(4) == 0 {
+                            FileChange::Delete
+                        } else {
+                            let b = body(&mut rng);
+                            FileChange::Modify {
+                                content: r.put_blob(Bytes::from(b.clone())).await.unwrap(),
+                                kind: FileKind::Regular,
+                                size: b.len() as u64,
+                            }
+                        };
+                        changes.insert(rp(p), ch);
+                    }
+                    let cs = Changeset {
+                        parents: parent.into_iter().collect(),
+                        author: "t".into(),
+                        timestamp: step,
+                        message: format!("s{seed} {step}"),
+                        changes,
+                        extra: BTreeMap::new(),
+                    };
+                    // Deletes of absent paths and condemned blobs fail, leaving
+                    // their uploads and tree nodes as garbage.
+                    if let Ok(id) = r.create_changeset(cs).await {
+                        ids.push(id);
+                    }
+                }
+                4 if ids.len() >= 2 => {
+                    let (a, b) = (ids[rng.below(ids.len())], ids[rng.below(ids.len())]);
+                    if let Ok(MergeResponse::Merged { id }) = r
+                        .merge(MergeRequest {
+                            parents: [a, b],
+                            message: "merge".into(),
+                            authorship: Authorship {
+                                author: "m".into(),
+                                timestamp: Some(5),
+                            },
+                            extra: BTreeMap::new(),
+                        })
+                        .await
+                    {
+                        ids.push(id);
+                    }
+                }
+                5 => {
+                    // Orphans: an upload never committed, and a tree node no
+                    // changeset reaches.
+                    let b = format!("orphan {seed} {step}");
+                    let h = r.blobs().put(Bytes::from(b.clone())).await.unwrap();
+                    let node = TreeNode {
+                        entries: BTreeMap::from([(
+                            "o".to_string(),
+                            TreeEntry::File {
+                                content: h,
+                                kind: FileKind::Regular,
+                                size: b.len() as u64,
+                            },
+                        )]),
+                    };
+                    r.blobs()
+                        .put_with_hash(node.hash(), Bytes::from(node.encode()))
+                        .await
+                        .unwrap();
+                }
+                6 if !ids.is_empty() => {
+                    // Refs and tags: create, move anywhere (forwards or
+                    // backwards), delete, recreate. Always through cas_ref.
+                    let name = ["main", "dev", "tags/v1", "tags/v2"][rng.below(4)];
+                    let cur = r.meta().get_ref(name).await.unwrap();
+                    let new = (rng.below(4) > 0).then(|| ids[rng.below(ids.len())]);
+                    r.meta().cas_ref(name, cur, new).await.unwrap();
+                }
+                7 => {
+                    age_all(&blobs).await;
+                    condemn(&r, &opts(1, false), &TestClock::at(t))
+                        .await
+                        .unwrap();
+                }
+                8 => {
+                    t += FENCE;
+                    collect(&r, &opts(1, false), &TestClock::at(t))
+                        .await
+                        .unwrap();
+                }
+                _ => {
+                    // Both marks, as dry runs, condemn the same.
+                    age_all(&blobs).await;
+                    let clock = TestClock::at(t);
+                    let inc = condemn(&r, &opts(1, true), &clock).await.unwrap();
+                    let full = condemn_with(&r, &opts(1, true), Mark::Full, &clock)
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        (inc.condemned, inc.already_condemned, inc.kept_by_claim),
+                        (full.condemned, full.already_condemned, full.kept_by_claim),
+                        "seed {seed} step {step}"
+                    );
+                }
+            }
+            t += 1;
+            assert_marks_agree(&r, &format!("seed {seed} step {step}")).await;
+        }
+        // Everything stored is still readable after a last full cycle.
+        age_all(&blobs).await;
+        let before = read_everything(&r).await;
+        gc_at(&r, 1, false, t + 10).await;
+        assert_eq!(read_everything(&r).await, before, "seed {seed}");
     }
 }

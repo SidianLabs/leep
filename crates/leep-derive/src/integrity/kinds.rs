@@ -9,7 +9,7 @@ use leep_core::Error;
 use crate::derived::{
     DerivedKind, Generation, HistoryTree, LastMerge, RootTree, Skiplist, HISTORY_NODE_KIND,
 };
-use crate::gc::{BLOB_CLAIM, BLOB_CONDEMNED, BLOB_DOOM, BLOB_RESCUE};
+use crate::gc::{BLOB_CLAIM, BLOB_CONDEMNED, BLOB_DOOM, BLOB_RESCUE, GC_MARK};
 use crate::search::{BLOB_KIND as BLOB_TRIGRAMS, TREE_KIND as TREE_TRIGRAMS};
 use crate::signatures::REBASED_ORIGIN_KIND;
 
@@ -199,6 +199,17 @@ static KINDS: &[KindInfo] = &[
         summary: "state of a blob's delete handshake",
         rederive: Rederive::No("garbage collection state is not derived"),
         drop: DropPolicy::Refused(GC_REFUSAL),
+    },
+    KindInfo {
+        name: GC_MARK,
+        class: KindClass::Bookkeeping,
+        summary: "what earlier garbage collection marks covered",
+        rederive: Rederive::No("`leep-server gc --full` walks all of history and rewrites it"),
+        drop: DropPolicy::Refused(
+            "incremental garbage collection stops walking at a marked tree node (ADR 0033); \
+             dropping part of the kind can leave a row whose subtree lost its rows, and the \
+             next collect would delete blobs a changeset references",
+        ),
     },
 ];
 

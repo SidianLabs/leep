@@ -764,6 +764,60 @@ Repeat requests are unchanged; first requests that read many tree nodes or
 file contents (listings, diffs, path logs, search) pay for decoding delta
 chains until the decoded-object cache holds them.
 
+## Garbage collection
+
+`leep-server gc` phases timed with
+`cargo run --release -p leep-server --example gc_profile -- <meta> <blobs> [condemn|collect|both] [--full] [--commits N]`,
+which wraps both stores to count calls and runs with a zero fence (scratch
+stores only). Local Postgres 16 over a Unix socket, filesystem blob store,
+4 vCPU Intel Xeon @ 2.10GHz, release build. "Before" is the build of main
+before ADR 0033; "incremental" is a run after a previous run, with 10 new
+changesets stored first (`--commits 10`, each changing one file three
+levels deep).
+
+First 3,795 commits of git/git (11,735 objects):
+
+| | condemn | collect | store calls (condemn + collect) |
+|---|---|---|---|
+| Before | 2.5 s | 4.5 s | 12,552 + 24,287 |
+| First run after the change (walks everything, writes the record) | 1.46 s | 0.54 s | 4,990 + 34 |
+| Incremental, nothing new, loose | 0.69 s | 0.61 s | 34 + 34 |
+| Incremental, 10 new commits, loose | 0.95 s | 0.55 s | 104 + 34 |
+| Incremental, 10 new commits, packed | 0.17 s | 0.10 s | 34 + 34 |
+| `--full`, loose | 1.28 s | 1.36 s | 5,016 + 5,028 |
+
+First 20,967 commits of git/git (70,323 objects; imported with `leep-git
+import`):
+
+| | condemn | collect | store calls (condemn + collect) |
+|---|---|---|---|
+| Before, loose | 18.2 s | 29.7 s | 75,085 + 145,408 |
+| Before, packed | 24.5 s | 34.6 s | 75,135 + 145,498 |
+| First run after the change, loose | 10.8 s | 3.3 s | 33,306 + 186 |
+| Incremental, 10 new commits, loose | 3.4 s | 3.3 s | 274 + 186 |
+| Incremental, 10 new commits, packed | **0.95 s** | **0.71 s** | 268 + 186 |
+| `--full`, loose | 9.4 s | 9.7 s | 33,315 + 33,386 |
+| `--full`, packed | 14.9 s | 16.0 s | 33,345 + 33,416 |
+
+Where the time went before (20,967 commits, loose, condemn): 4.7 s in one
+`get_changeset` per changeset, 4.4 s in one root-tree `get_derived` per
+changeset, 2.3 s reading 33,057 tree nodes, 2.8 s listing blobs, the rest
+decoding and hashing tree nodes. Collect repeated the mark and added one
+`get_derived` per blob for its condemnation row (91,290 calls, 16 s). Packed,
+tree node reads cost more (delta chains), so the full mark is slower.
+
+After: an incremental run makes one call per 1,000 changesets listed, one
+batched row read per 1,000 changesets and per 1,000 blobs, and two reads per
+new tree node on a changed path (the node and its entries' rows). What is
+left grows with the store, not with history walked: the blob listing (about
+40 us per loose object, mostly a `stat`, or 7 us per packed object) and the
+batched row reads (about 5 us per object). On the 82,500-commit git/git
+(326,731 objects) that projects to a few seconds per phase packed, against
+about 4 minutes per GC before. The first run after the change still walks
+everything, faster than before because changesets and root trees are read in
+batches of 1,000 (ADR 0030), and writes one `gc-mark-v1` row per referenced
+object and changeset (91,290 rows, about 1 s).
+
 ## Analysis
 
 Principle 5 (cost scales with the change, not the repository) holds for the

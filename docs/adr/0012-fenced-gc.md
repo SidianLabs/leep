@@ -1,5 +1,6 @@
 # 0012. Fenced two-phase blob garbage collection
-Status: Accepted
+Status: Accepted; the mark of both phases is incremental, and collect reads
+condemnation rows in batches, since ADR 0033
 Date: 2026-10-15
 
 ## Context

@@ -1,5 +1,6 @@
 # 0008. Blob garbage collection
-Status: Accepted; the residual race is closed by ADR 0012
+Status: Accepted; the residual race is closed by ADR 0012, and the mark is
+incremental since ADR 0033
 Date: 2026-10-15
 
 ## Context

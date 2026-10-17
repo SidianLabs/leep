@@ -1240,3 +1240,92 @@ async fn gc_under_faults_never_loses_referenced_data() {
         gc_under_faults(seed).await;
     }
 }
+
+/// Incremental marking (ADR 0033) killed anywhere: the GC process dies at
+/// random points and its writes fail before or after landing, while clients
+/// commit new files deep in the tree. After every round the record left
+/// behind must still agree with a full mark, so the next incremental run
+/// never stops at a tree node whose subtree was not recorded, and nothing
+/// referenced is lost.
+async fn incremental_mark_under_faults(seed: u64) {
+    let w = World::new(seed);
+    small_history(seed, &w.clean).await;
+    let mut rng = Rng::new(seed ^ 0x33);
+    let gc_plan = FaultPlan::new(seed ^ 3);
+    gc_plan
+        .jitter(2)
+        .rate(&[Op::PutDerived], 25, Fault::FailAfter)
+        .rate(&[Op::PutDerived], 25, Fault::Fail)
+        .rate(Op::META, 2, Fault::Fail)
+        .rate(&[Op::GetDerived, Op::Get], 3, Fault::Corrupt);
+    let gc_repo = w.server_with(&gc_plan);
+    let mut t = now() + 1000;
+    let mut tips: Vec<ChangesetId> = w
+        .clean
+        .meta()
+        .list_changesets(None, usize::MAX)
+        .await
+        .unwrap();
+    for round in 0..10 {
+        let mut clients = Vec::new();
+        for k in 0..rng.below(4) {
+            let repo = w.clean.clone();
+            let parent = tips[rng.below(tips.len())];
+            let path = format!("p{}/q{}/r{round}-{k}.txt", rng.below(3), rng.below(2));
+            let body = format!("seed {seed} round {round} file {k} v{}\n", rng.below(3));
+            clients.push(tokio::spawn(async move {
+                commit_file(seed, &repo, Some(parent), &path, &body, "deep").await
+            }));
+        }
+        if rng.below(4) == 0 {
+            w.blobs
+                .put(Bytes::from(format!("orphan {seed} {round}")))
+                .await
+                .unwrap();
+            age_all(&w.blobs).await;
+        }
+        let kill_after = if rng.below(4) == 0 {
+            usize::MAX
+        } else {
+            rng.below(80)
+        };
+        let (r, opts, clock) = (gc_repo.clone(), gc_opts(), TestClock::at(t));
+        let collecting = rng.below(2) == 0;
+        let gc_run = tokio::spawn(async move {
+            // Dying mid-run is the point; the result is not.
+            if collecting {
+                let _ =
+                    leep_testkit::cancel_after_polls(gc::collect(&r, &opts, &clock), kill_after)
+                        .await;
+            } else {
+                let _ =
+                    leep_testkit::cancel_after_polls(gc::condemn(&r, &opts, &clock), kill_after)
+                        .await;
+            }
+        });
+        gc_run.await.unwrap();
+        for c in clients {
+            tips.push(c.await.unwrap());
+        }
+        t += FENCE + 1;
+        if let Err(e) = gc::check_incremental_mark(&w.clean).await {
+            panic!("seed {seed} round {round}: {e}");
+        }
+        assert_no_dangling(seed, &w).await;
+    }
+    // A clean cycle afterwards collects the garbage and keeps the history.
+    gc::condemn(&w.clean, &gc_opts(), &TestClock::at(t + HOUR))
+        .await
+        .unwrap();
+    gc::collect(&w.clean, &gc_opts(), &TestClock::at(t + HOUR + FENCE))
+        .await
+        .unwrap();
+    assert_no_dangling(seed, &w).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn incremental_mark_survives_being_killed_anywhere() {
+    for seed in seeds() {
+        incremental_mark_under_faults(seed).await;
+    }
+}
