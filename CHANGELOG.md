@@ -136,6 +136,12 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   /v1/resolve-prefix/{prefix}` and `MetaStore::changesets_with_prefix`, with a
   default built on `list_changesets` and range-scan overrides for SQLite and
   Postgres.
+- `leep land` no longer creates a ref that does not exist unless given
+  `--create` (ADR 0035): `leep land --ref typo` fails with exit 4 and a hint.
+  The first land onto `main` of an empty repository still works without it,
+  and a land that creates a ref prints `created ref NAME`. `POST /v1/land`
+  takes an optional `create`; without it the server creates the ref as
+  before, so older clients, the MCP server and scripts are unaffected.
 
 ### Hardening
 - Fuzz targets for every decoder and parser: persisted objects, derived

@@ -229,7 +229,14 @@ fn clean_merge_makes_a_two_parent_local_commit_that_lands() {
 
     // The merge lands like any commit; here, as a fast-forward.
     assert_eq!(
-        land::run(&mut ctx, &LandArgs { target_ref: None }).unwrap(),
+        land::run(
+            &mut ctx,
+            &LandArgs {
+                target_ref: None,
+                create: false
+            }
+        )
+        .unwrap(),
         0
     );
     assert_eq!(env.main(), id);
@@ -330,7 +337,16 @@ fn merge_conflict_writes_markers_then_commit_records_both_parents() {
         let m = conflict_err(e);
         assert!(m.contains("merge of") && m.contains("in progress"), "{m}");
     };
-    in_progress(land::run(&mut ctx, &LandArgs { target_ref: None }).unwrap_err());
+    in_progress(
+        land::run(
+            &mut ctx,
+            &LandArgs {
+                target_ref: None,
+                create: false,
+            },
+        )
+        .unwrap_err(),
+    );
     in_progress(sync(&mut ctx, &SyncArgs::default()).unwrap_err());
     in_progress(merge::run(&mut ctx, &merge_args("feature")).unwrap_err());
     in_progress(rebase::run(&mut ctx, &rebase_args(None)).unwrap_err());
@@ -390,7 +406,14 @@ fn merge_conflict_writes_markers_then_commit_records_both_parents() {
     assert!(status(&ctx.wc).unwrap().is_clean());
     // Lands as a fast-forward of main.
     assert_eq!(
-        land::run(&mut ctx, &LandArgs { target_ref: None }).unwrap(),
+        land::run(
+            &mut ctx,
+            &LandArgs {
+                target_ref: None,
+                create: false
+            }
+        )
+        .unwrap(),
         0
     );
     assert_eq!(env.main(), id);
@@ -483,7 +506,16 @@ fn merge_binary_conflict_keeps_our_file_and_blocks_until_resolved() {
     );
     let m = conflict_err(commit::run(&mut ctx, &finish_args()).unwrap_err());
     assert!(m.contains("img.bin") && m.contains("leep resolve"), "{m}");
-    let m = conflict_err(land::run(&mut ctx, &LandArgs { target_ref: None }).unwrap_err());
+    let m = conflict_err(
+        land::run(
+            &mut ctx,
+            &LandArgs {
+                target_ref: None,
+                create: false,
+            },
+        )
+        .unwrap_err(),
+    );
     assert!(m.contains("in progress"), "{m}");
 
     resolve::run(
@@ -649,7 +681,14 @@ fn rebase_without_an_argument_goes_onto_the_target_head() {
     assert_eq!(read(&ctx, "b.txt"), "b local\n");
     // The moved commit lands as a fast-forward.
     assert_eq!(
-        land::run(&mut ctx, &LandArgs { target_ref: None }).unwrap(),
+        land::run(
+            &mut ctx,
+            &LandArgs {
+                target_ref: None,
+                create: false
+            }
+        )
+        .unwrap(),
         0
     );
     assert_eq!(env.main(), ctx.wc.state.base.unwrap());
@@ -777,7 +816,14 @@ fn cherry_pick_copies_one_change_onto_the_base() {
     assert!(status(&ctx.wc).unwrap().is_clean());
     assert_eq!(env.main(), main, "no ref moves");
     assert_eq!(
-        land::run(&mut ctx, &LandArgs { target_ref: None }).unwrap(),
+        land::run(
+            &mut ctx,
+            &LandArgs {
+                target_ref: None,
+                create: false
+            }
+        )
+        .unwrap(),
         0
     );
     assert_eq!(env.main(), id);

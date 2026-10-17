@@ -984,8 +984,11 @@ async fn land(
     // a reload happened since; `land` keeps it across its retries.
     let repo = repo.with_land_policy_replaced(config.land_policy.clone());
     let actor = who.as_ref().map(|p| p.name.as_str());
+    // Old clients send no `create` and keep the original behaviour.
+    let create = req.create.unwrap_or(true);
     Ok(Json(
-        repo.land_as(req.changeset, &req.target_ref, actor).await?,
+        repo.land_with(req.changeset, &req.target_ref, actor, create)
+            .await?,
     ))
 }
 

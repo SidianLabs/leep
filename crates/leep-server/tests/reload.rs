@@ -170,6 +170,7 @@ impl Rig {
             &LandRequest {
                 changeset: id,
                 target_ref: target.into(),
+                create: None,
             },
         )
         .await
@@ -695,6 +696,7 @@ async fn an_in_flight_request_finishes_under_the_config_it_started_with() {
     let body = serde_json::to_vec(&LandRequest {
         changeset: next,
         target_ref: "main".into(),
+        create: None,
     })
     .unwrap();
     land_tx.send(Bytes::from(body)).await.unwrap();
@@ -769,6 +771,7 @@ async fn requests_stay_well_formed_while_reloads_churn() {
                 &LandRequest {
                     changeset: next,
                     target_ref: "scratch".into(),
+                    create: None,
                 },
             )
             .await;

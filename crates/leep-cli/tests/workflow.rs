@@ -246,7 +246,14 @@ fn sync_with_conflicts_writes_markers_and_blocks_commit() {
     assert!(changes(&ctx).contains(&("a.txt".to_string(), Change::Conflicted)));
     let e = commit::run(&mut ctx, &commit_args("no")).unwrap_err();
     assert!(conflict_err(e).contains("conflict"));
-    let e = land::run(&mut ctx, &LandArgs { target_ref: None }).unwrap_err();
+    let e = land::run(
+        &mut ctx,
+        &LandArgs {
+            target_ref: None,
+            create: false,
+        },
+    )
+    .unwrap_err();
     assert!(conflict_err(e).contains("unresolved conflicts"));
     // Syncing again, or stashing, is refused until the markers are resolved.
     assert!(sync(&mut ctx, &SyncArgs::default()).is_err());
@@ -323,7 +330,14 @@ fn sync_moves_local_commits_and_keeps_edits() {
     // The moved stack lands as a fast-forward.
     commit::run(&mut ctx, &commit_args("three")).unwrap();
     assert_eq!(
-        land::run(&mut ctx, &LandArgs { target_ref: None }).unwrap(),
+        land::run(
+            &mut ctx,
+            &LandArgs {
+                target_ref: None,
+                create: false
+            }
+        )
+        .unwrap(),
         0
     );
     assert_eq!(env.main(), ctx.wc.state.base.unwrap());
@@ -777,7 +791,14 @@ fn amend_refuses_a_landed_base_nothing_to_do_and_conflicts() {
     let e = amend::run(&mut ctx, &AmendArgs::default()).unwrap_err();
     assert!(exits(6, e).contains("nothing to amend"));
 
-    land::run(&mut ctx, &LandArgs { target_ref: None }).unwrap();
+    land::run(
+        &mut ctx,
+        &LandArgs {
+            target_ref: None,
+            create: false,
+        },
+    )
+    .unwrap();
     write(&ctx, "a.txt", "more\n");
     let base = ctx.wc.state.base;
     let e = amend::run(&mut ctx, &AmendArgs::default()).unwrap_err();
@@ -978,7 +999,16 @@ fn sync_binary_conflict_blocks_commit_until_resolved() {
     );
     let m = conflict_err(commit::run(&mut ctx, &commit_args("no")).unwrap_err());
     assert!(m.contains("img.bin") && m.contains("leep resolve"), "{m}");
-    let m = conflict_err(land::run(&mut ctx, &LandArgs { target_ref: None }).unwrap_err());
+    let m = conflict_err(
+        land::run(
+            &mut ctx,
+            &LandArgs {
+                target_ref: None,
+                create: false,
+            },
+        )
+        .unwrap_err(),
+    );
     assert!(m.contains("unresolved conflicts in img.bin"), "{m}");
     // The state survives a restart, and the JSON status reports it.
     let mut again = env.reopen(&ctx);
@@ -992,7 +1022,14 @@ fn sync_binary_conflict_blocks_commit_until_resolved() {
     assert!(ctx.wc.state.unresolved.is_empty());
     commit::run(&mut ctx, &commit_args("keep mine on purpose")).unwrap();
     assert_eq!(
-        land::run(&mut ctx, &LandArgs { target_ref: None }).unwrap(),
+        land::run(
+            &mut ctx,
+            &LandArgs {
+                target_ref: None,
+                create: false
+            }
+        )
+        .unwrap(),
         0
     );
 }
@@ -1022,7 +1059,10 @@ fn land_binary_conflict_blocks_commit_until_resolved() {
         &[("img.bin", "theirs\0", FileKind::Regular)],
         &[],
     );
-    let land_args = LandArgs { target_ref: None };
+    let land_args = LandArgs {
+        target_ref: None,
+        create: false,
+    };
     assert_eq!(land::run(&mut ctx, &land_args).unwrap(), 5);
     assert_eq!(ctx.wc.state.base, Some(head));
     assert_eq!(ctx.wc.state.unresolved, ["img.bin"]);

@@ -1027,7 +1027,11 @@ fn review_owners_and_auto_approval_gate_landing_on_a_protected_ref() {
         "// the entry point\nfn a() { 2 } // trailing\n",
     );
     bob.ok(&wc_b, &["commit", "-m", "more code"]);
+    // A ref that does not exist yet needs --create (ADR 0035).
     let out = bob.run(&wc_b, &["land", "--ref", "release"]);
+    assert_eq!(out.status.code(), Some(4), "{}", stderr(&out));
+    assert!(stderr(&out).contains("--create"), "{}", stderr(&out));
+    let out = bob.run(&wc_b, &["land", "--ref", "release", "--create"]);
     assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
     assert!(
         stderr(&out).contains("path src/lib.rs needs approval from any reviewer"),
@@ -1036,7 +1040,7 @@ fn review_owners_and_auto_approval_gate_landing_on_a_protected_ref() {
     );
     alice.ok(root, &["review", "approve", &bob.tip(&wc_b)]);
     assert!(bob
-        .ok(&wc_b, &["land", "--ref", "release"])
+        .ok(&wc_b, &["land", "--ref", "release", "--create"])
         .contains("Landed"));
 }
 

@@ -248,3 +248,56 @@ fn json_nothing_to_commit_and_conflict_outcomes() {
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["status"], "conflicts");
 }
+
+#[test]
+fn land_onto_a_missing_ref_needs_create() {
+    let leep = Leep::new();
+    let mock = Mock::start();
+    let wc = init(&leep, &mock);
+    std::fs::write(wc.path().join("a.txt"), "a\n").unwrap();
+    leep.ok(wc.path(), &["commit", "-m", "first"]);
+
+    // The first land onto `main` of an empty repository creates it.
+    let out = leep.run(wc.path(), &["land"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(text(&out.stderr).contains("created ref main"));
+    assert!(mock.data.lock().unwrap().refs.contains_key("main"));
+
+    // A typo does not make a branch.
+    std::fs::write(wc.path().join("a.txt"), "b\n").unwrap();
+    leep.ok(wc.path(), &["commit", "-m", "second"]);
+    let out = leep.run(wc.path(), &["land", "--ref", "mian"]);
+    assert_eq!(out.status.code(), Some(4), "{}", text(&out.stderr));
+    let err = text(&out.stderr);
+    assert!(err.contains("--create"), "{err}");
+    assert!(!mock.data.lock().unwrap().refs.contains_key("mian"));
+    let out = leep.run(wc.path(), &["--json", "land", "--ref", "mian"]);
+    assert_eq!(out.status.code(), Some(4));
+    assert_eq!(json_error(&out)["code"], "not_found");
+
+    // `--create` makes it and says so; landing there again does not.
+    let out = leep.run(wc.path(), &["land", "--ref", "feature", "--create"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(text(&out.stderr).contains("created ref feature"));
+    assert!(mock.data.lock().unwrap().refs.contains_key("feature"));
+    let out = leep.run(wc.path(), &["land", "--ref", "feature", "--create"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(!text(&out.stderr).contains("created ref"));
+}
+
+#[test]
+fn main_is_created_unasked_only_in_an_empty_repository() {
+    let leep = Leep::new();
+    let mock = Mock::start();
+    mock.seed_on("other", None, &[("a.txt", "a\n", FileKind::Regular)], &[]);
+    let wc = tempfile::tempdir().unwrap();
+    leep.ok(
+        wc.path(),
+        &["--server", &mock.url, "init", "--ref", "other", "."],
+    );
+    std::fs::write(wc.path().join("a.txt"), "b\n").unwrap();
+    leep.ok(wc.path(), &["commit", "-m", "x"]);
+    let out = leep.run(wc.path(), &["land", "--ref", "main"]);
+    assert_eq!(out.status.code(), Some(4), "{}", text(&out.stderr));
+    assert!(!mock.data.lock().unwrap().refs.contains_key("main"));
+}

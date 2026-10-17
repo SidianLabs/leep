@@ -152,9 +152,11 @@ impl Server {
             extra,
         };
         let created = self.client.create_changeset(&cs)?;
+        // No `create`: the tool keeps creating a missing ref, as before.
         let resp = self.client.land(&LandRequest {
             changeset: created,
             target_ref: target_ref.clone(),
+            create: None,
         })?;
         match resp {
             LandResponse::Landed {

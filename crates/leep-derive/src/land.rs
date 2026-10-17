@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use leep_core::api::{LandResponse, RebaseResponse};
-use leep_core::refname::{self, NOT_FORWARD_MARKER};
+use leep_core::refname::{self, MISSING_REF_MARKER, NOT_FORWARD_MARKER};
 use leep_core::{ChangesetId, Error, RefStep, RefUpdateContext, Result};
 use tokio::sync::oneshot;
 
@@ -105,6 +105,8 @@ struct Queued {
     /// arrived under.
     repo: Repo,
     cs: ChangesetId,
+    /// Whether the land may create the ref.
+    create: bool,
     ctx: RefUpdateContext,
     queued: Instant,
     reply: oneshot::Sender<Answer>,
@@ -229,12 +231,29 @@ impl Repo {
         target_ref: &str,
         actor: Option<&str>,
     ) -> Result<LandResponse> {
+        self.land_with(cs, target_ref, actor, true).await
+    }
+
+    /// [`land_as`](Self::land_as), refusing with `NotFound` when `create` is
+    /// false and `target_ref` does not exist at the head the land reads, so a
+    /// typo cannot make a ref (ADR 0035). The check is made where the head
+    /// is read for the compare-and-swap, so a ref deleted meanwhile is not
+    /// silently recreated.
+    pub async fn land_with(
+        &self,
+        cs: ChangesetId,
+        target_ref: &str,
+        actor: Option<&str>,
+        create: bool,
+    ) -> Result<LandResponse> {
         let started = Instant::now();
         let mut stats = LandStats::default();
         let ctx = RefUpdateContext::new("land")
             .actor(actor)
             .message(format!("landed {cs}"));
-        let result = self.land_inner(cs, target_ref, ctx, &mut stats).await;
+        let result = self
+            .land_inner(cs, target_ref, create, ctx, &mut stats)
+            .await;
         stats.record(&result, started.elapsed());
         result
     }
@@ -243,6 +262,7 @@ impl Repo {
         &self,
         cs: ChangesetId,
         target_ref: &str,
+        create: bool,
         ctx: RefUpdateContext,
         stats: &mut LandStats,
     ) -> Result<LandResponse> {
@@ -260,6 +280,7 @@ impl Repo {
             q.pending.push_back(Queued {
                 repo: self.clone(),
                 cs,
+                create,
                 ctx,
                 queued: Instant::now(),
                 reply,
@@ -323,6 +344,7 @@ impl Repo {
                 let step = repo
                     .land_step(
                         l.q.cs,
+                        l.q.create,
                         head,
                         target_ref,
                         attempt,
@@ -425,15 +447,22 @@ impl Repo {
 
     /// What landing `cs` does on top of `head`: what one attempt of a lone
     /// land did between reading the head and swapping it.
+    #[allow(clippy::too_many_arguments)]
     async fn land_step(
         &self,
         cs: ChangesetId,
+        create: bool,
         head: Option<ChangesetId>,
         target_ref: &str,
         attempt: u32,
         checked: &mut Checked,
         origins: &mut HashMap<ChangesetId, Option<ChangesetId>>,
     ) -> Result<Step> {
+        if head.is_none() && !create {
+            return Err(Error::NotFound(format!(
+                "ref {target_ref:?} {MISSING_REF_MARKER}"
+            )));
+        }
         let mut fast_forward = false;
         if let Some(h) = head {
             if h == cs || self.is_ancestor(cs, h).await? {

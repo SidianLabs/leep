@@ -513,6 +513,16 @@ AND id <= ? ORDER BY id LIMIT ?`, the bounds being the prefix padded with
 `0x00` and `0xff` bytes (`leep_core::prefix::IdPrefix`). No encoding, hash,
 index or table changed, and no existing `/v1` shape changed.
 
+## Explicit ref creation on land (additive API field, ADR 0035)
+
+`LandRequest` gains the optional `create` (`true`, `false` or absent; omitted
+when unset). Absent means what it always meant: a missing `target_ref` is
+created. `false` turns a land onto a missing ref into a 404 containing
+`does not exist and the land may not create it`. Old clients never send the
+field and old servers ignore it, so neither side's behaviour changes until
+both are new and the client asks. No response shape, stored object or table
+changed.
+
 ## Fenced garbage collection (new derived kinds, no other format change)
 
 ADR 0012 adds the three GC kinds in the table above (`blob-claim-v1` already

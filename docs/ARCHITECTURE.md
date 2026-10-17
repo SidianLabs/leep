@@ -347,6 +347,11 @@ send it again and gets the copy back instead of a second one. It looks for a
 rebased copy that `Repo::rebase` recorded (`rebased-origin-v1`), not for the
 forgeable `leep.rebased_from` extra, among the head's ancestors above `cs`'s
 generation, and gives up after 1024 changesets (ADR 0021).
+A land onto a ref that does not exist creates it, unless the request says
+`create: false` ([ADR 0035](adr/0035-explicit-ref-creation-on-land.md)), which
+`leep land` does unless given `--create` (or landing the first changeset onto
+`main` of an empty repository); then the step that finds no head answers 404
+and the ref stays absent. The check uses the head the batch read for its CAS.
 Replaying the whole stack matters: rebasing only `cs` would silently drop the
 changes of unlanded changesets below it. On conflict the client applies
 `clean`, resolves `conflicts` on top of `onto`, commits once and lands again,

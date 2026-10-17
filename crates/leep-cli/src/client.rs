@@ -664,6 +664,7 @@ mod tests {
             .land(&LandRequest {
                 changeset: ChangesetId(Hash::of_blob(b"x")),
                 target_ref: "main".into(),
+                create: None,
             })
             .unwrap_err();
         assert_eq!(e.kind(), ErrorKind::Timeout, "{e}");

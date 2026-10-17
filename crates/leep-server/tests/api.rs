@@ -628,6 +628,7 @@ async fn rebase_and_land() {
             &LandRequest {
                 changeset: feat,
                 target_ref: "main".into(),
+                create: None,
             },
         )
         .await;
@@ -649,6 +650,7 @@ async fn rebase_and_land() {
             &LandRequest {
                 changeset: k1,
                 target_ref: "side".into(),
+                create: None,
             },
         )
         .await;
@@ -659,6 +661,7 @@ async fn rebase_and_land() {
             &LandRequest {
                 changeset: k2,
                 target_ref: "side".into(),
+                create: None,
             },
         )
         .await;
@@ -671,6 +674,7 @@ async fn rebase_and_land() {
             &LandRequest {
                 changeset: unknown,
                 target_ref: "main".into(),
+                create: None,
             },
         )
         .await;
@@ -1160,6 +1164,7 @@ async fn ref_writes_validate_names() {
                         .replace("%20", " ")
                         .replace("%3A", ":")
                         .replace("%5E", "^"),
+                    create: None,
                 },
             )
             .await;
@@ -1202,6 +1207,7 @@ async fn tags_are_created_and_deleted_but_never_moved() {
                 &LandRequest {
                     changeset: b,
                     target_ref: name.into(),
+                    create: None,
                 },
             )
             .await;
@@ -1256,6 +1262,7 @@ async fn reflog_records_lands_and_ref_writes_newest_first() {
     let land = |id| LandRequest {
         changeset: id,
         target_ref: "main".into(),
+        create: None,
     };
     assert_eq!(c.post("/v1/land", &land(a)).await.status, StatusCode::OK);
     assert_eq!(c.post("/v1/land", &land(b)).await.status, StatusCode::OK);
@@ -1409,4 +1416,49 @@ async fn resolve_prefix_finds_one_lists_many_and_rejects_bad_input() {
         let e: ErrorResponse = r.json();
         assert!(e.error.contains("short id"), "{bad}: {}", e.error);
     }
+}
+
+#[tokio::test]
+async fn land_creates_a_missing_ref_only_when_allowed() {
+    let c = Client::new();
+    let a = c.commit(&[], &[("a", Some("1\n"))], "a").await;
+    let land = |target: &str, create: Option<bool>| LandRequest {
+        changeset: a,
+        target_ref: target.into(),
+        create,
+    };
+
+    let r = c.post("/v1/land", &land("typo", Some(false))).await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
+    let e: ErrorResponse = r.json();
+    assert!(
+        e.error.contains(leep_core::refname::MISSING_REF_MARKER),
+        "{}",
+        e.error
+    );
+    let head: RefResponse = c.get("/v1/refs/typo").await.json();
+    assert_eq!(head.target, None);
+    let log: RefLogResponse = c.get("/v1/reflog").await.json();
+    assert!(log.entries.is_empty(), "a refused land logs nothing");
+
+    // `true`, and an old client that sends no `create`, both create.
+    for (name, create) in [("asked", Some(true)), ("old-client", None)] {
+        let r = c.post("/v1/land", &land(name, create)).await;
+        assert_eq!(r.status, StatusCode::OK, "{name}");
+        let head: RefResponse = c.get(&format!("/v1/refs/{name}")).await.json();
+        assert_eq!(head.target, Some(a), "{name}");
+    }
+    // An existing ref lands with `create: false`.
+    let b = c.commit(&[a], &[("a", Some("2\n"))], "b").await;
+    let r = c
+        .post(
+            "/v1/land",
+            &LandRequest {
+                changeset: b,
+                target_ref: "asked".into(),
+                create: Some(false),
+            },
+        )
+        .await;
+    assert!(matches!(r.json(), LandResponse::Landed { landed, .. } if landed == b));
 }

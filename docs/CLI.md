@@ -20,6 +20,15 @@ A ref wins over a short id that spells the same. An ambiguous short id fails
 with exit 1 and lists the candidates (`--json`: `code: "ambiguous"` and
 `candidates`).
 
+## Landing onto a new ref
+
+`leep land` moves the working copy's target ref, or the ref given with
+`--ref`. A ref that does not exist is not created unless you pass `--create`
+([ADR 0035](adr/0035-explicit-ref-creation-on-land.md)), so a typo such as
+`--ref mian` fails with exit 4 instead of making a branch. The one exception
+is the first land onto `main` of an empty repository. When a land creates a
+ref, `leep` prints `created ref NAME` on stderr.
+
 ## Exit codes
 
 Decided in [ADR 0033](adr/0033-cli-exit-codes-and-json-errors.md).

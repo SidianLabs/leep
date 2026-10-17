@@ -35,7 +35,7 @@
 //! | GET  | `/v1/changesets/{id}/review-status?ref=main` | – | [`ReviewStatusResponse`] (`ref` defaults to `main`) |
 //! | POST | `/v1/merge` | [`MergeRequest`] | [`MergeResponse`] |
 //! | POST | `/v1/rebase` | [`RebaseRequest`] | [`RebaseResponse`] |
-//! | POST | `/v1/land` | [`LandRequest`] | [`LandResponse`] |
+//! | POST | `/v1/land` | [`LandRequest`] | [`LandResponse`] (`create: false` refuses to create a missing `target_ref` with 404; absent creates it, as before; ADR 0035) |
 //!
 //! Ref names may contain `/` (e.g. `release/1.0`); `{name}` and `{rev}` match
 //! the rest of the path. Every ref write (`POST /v1/refs/{name}` and the
@@ -554,6 +554,12 @@ pub struct LandRequest {
     pub changeset: ChangesetId,
     #[serde(default = "default_ref")]
     pub target_ref: String,
+    /// May the land create `target_ref` if it does not exist? Absent keeps
+    /// the original behaviour for old clients: it creates. `false` makes a
+    /// land onto a missing ref a 404 whose message carries
+    /// [`crate::refname::MISSING_REF_MARKER`] (ADR 0035).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub create: Option<bool>,
 }
 
 fn default_ref() -> String {
@@ -767,6 +773,18 @@ mod tests {
         let req: LandRequest =
             serde_json::from_value(serde_json::json!({ "changeset": id.to_string() })).unwrap();
         assert_eq!(req.target_ref, "main");
+        assert_eq!(req.create, None, "old clients send no create");
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            v.as_object().unwrap().len(),
+            2,
+            "an unset create is omitted"
+        );
+        let req = LandRequest {
+            create: Some(false),
+            ..req
+        };
+        assert_eq!(serde_json::to_value(&req).unwrap()["create"], false);
     }
 
     #[test]

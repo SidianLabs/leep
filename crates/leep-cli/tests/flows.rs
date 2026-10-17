@@ -197,7 +197,10 @@ fn land_fast_forward_rebase_and_conflict() {
         .iter()
         .map(|d| init_wc(&mock, d.path(), cache.path(), &[]).unwrap())
         .collect();
-    let land_args = LandArgs { target_ref: None };
+    let land_args = LandArgs {
+        target_ref: None,
+        create: false,
+    };
 
     // A fast-forwards.
     write(&wcs[0], "a.txt", "a from A\n");
@@ -343,7 +346,14 @@ mod auth {
         write(&ctx, "b.txt", "new\n");
         assert_eq!(commit::run(&mut ctx, &commit_args("add b")).unwrap(), 0);
         assert_eq!(
-            land::run(&mut ctx, &LandArgs { target_ref: None }).unwrap(),
+            land::run(
+                &mut ctx,
+                &LandArgs {
+                    target_ref: None,
+                    create: false
+                }
+            )
+            .unwrap(),
             0
         );
 
@@ -669,7 +679,14 @@ mod signing {
 
         write(&ctx, "a.txt", "one\n");
         commit::run(&mut ctx, &commit_args("unsigned")).unwrap();
-        let e = land::run(&mut ctx, &LandArgs { target_ref: None }).unwrap_err();
+        let e = land::run(
+            &mut ctx,
+            &LandArgs {
+                target_ref: None,
+                create: false,
+            },
+        )
+        .unwrap_err();
         let msg = e.to_string();
         assert!(msg.contains("is not signed by a trusted key"), "{msg}");
         assert!(msg.contains("leep commit --sign"), "{msg}");
@@ -681,7 +698,14 @@ mod signing {
         args.sign = Some(keyfile);
         commit::run(&mut ctx, &args).unwrap();
         assert_eq!(
-            land::run(&mut ctx, &LandArgs { target_ref: None }).unwrap(),
+            land::run(
+                &mut ctx,
+                &LandArgs {
+                    target_ref: None,
+                    create: false
+                }
+            )
+            .unwrap(),
             0
         );
         assert_eq!(
@@ -1014,7 +1038,14 @@ fn branch_create_switch_land_and_delete() {
     commit::run(&mut ctx, &commit_args("work")).unwrap();
     let work = ctx.wc.state.base.unwrap();
     assert_eq!(
-        land::run(&mut ctx, &LandArgs { target_ref: None }).unwrap(),
+        land::run(
+            &mut ctx,
+            &LandArgs {
+                target_ref: None,
+                create: false
+            }
+        )
+        .unwrap(),
         0
     );
     assert_eq!(ref_of(&mock, "feature"), Some(work));

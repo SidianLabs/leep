@@ -35,7 +35,17 @@ fn land_file(ctx: &mut Ctx, body: &str) -> ChangesetId {
         ..Default::default()
     };
     commit::run(ctx, &args).unwrap();
-    assert_eq!(land::run(ctx, &LandArgs { target_ref: None }).unwrap(), 0);
+    assert_eq!(
+        land::run(
+            ctx,
+            &LandArgs {
+                target_ref: None,
+                create: false
+            }
+        )
+        .unwrap(),
+        0
+    );
     ctx.wc.state.base.unwrap()
 }
 

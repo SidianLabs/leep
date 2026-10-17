@@ -809,6 +809,16 @@ async fn land(State(s): State<Shared>, Json(r): Json<LandRequest>) -> Resp<LandR
         ));
     }
     let head = d.refs.get(&r.target_ref).copied();
+    if head.is_none() && r.create == Some(false) {
+        return Err(err(
+            StatusCode::NOT_FOUND,
+            &format!(
+                "not found: ref {:?} {}",
+                r.target_ref,
+                leep_core::refname::MISSING_REF_MARKER
+            ),
+        ));
+    }
     let parent = cs.parents.first().copied();
     let Some(head) = head.filter(|h| Some(*h) != parent) else {
         let msg = format!("landed {}", r.changeset);
