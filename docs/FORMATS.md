@@ -40,9 +40,10 @@ skill.
 | derived `gc-mark-v1` | — | `MetaStore.derived`, key = changeset id, tree node hash or blob hash, value = the single byte `0x01` (anything else reads as absent). Written by GC marks in post-order, so a row exists only after the rows of everything below it (ADR 0033) |
 | derived `blob-trigrams-v1` | — | `MetaStore.derived`, key = blob hash, value = see "Code search index" below |
 | derived `tree-trigrams-v1` | — | `MetaStore.derived`, key = tree node hash (`TreeNode::hash()`), value = see "Code search index" below |
-| derived `history-tree-v2` | — | `MetaStore.derived`, key = changeset id, value = 32 raw bytes (address of that changeset's root history node) |
-| `StoredHistoryNode` | `history-node-v2` | `MetaStore.derived` (kind `history-node-v2`), key = `Hash::of_object("history-node-v2", postcard(row))`, value = the postcard bytes; a whole node, a chunk of one, or a split node's chunk list (ADR 0027) |
+| derived `history-tree-v3` | — | `MetaStore.derived`, key = changeset id, value = 32 raw bytes (address of that changeset's root history node) |
+| `StoredHistoryNode` | `history-node-v3` | `MetaStore.derived` (kind `history-node-v3`), key = `Hash::of_object("history-node-v3", postcard(row))`, value = the postcard bytes; a whole node, a chunk of one, a split node's chunk list (ADR 0027), or a patch of a node, chunk or list on an earlier whole version (ADR 0037) |
 | retired `history-tree-v1`, `history-node-v1` | — | written by servers before ADR 0027; never read by current servers; removed with `repair drop --kind history-tree-v1` |
+| retired `history-tree-v2`, `history-node-v2` | — | written by servers from ADR 0027 to ADR 0037; never read by current servers; removed with `repair drop --kind history-tree-v2` |
 | other derived kinds | — | owned and versioned by `leep-derive` |
 
 ## Integrity on read
@@ -166,7 +167,8 @@ The `/v1/search/{rev}` endpoint only adds an endpoint and types (`SearchResponse
 Ranges are byte offsets into the returned (possibly cut) `line`.
 ## Path-history index (new derived kinds, no change to `Changeset`)
 
-ADR 0013, stored in chunks since ADR 0027. The logical node is
+ADR 0013, stored in chunks since ADR 0027 and as patches since ADR 0037. The
+logical node is
 `leep_derive::derived::HistoryNode { entries: BTreeMap<String, HistoryEntry> }`,
 keyed by single path components, postcard-encoded. `HistoryEntry` is an
 externally tagged enum, **variant order is format**:
@@ -181,8 +183,9 @@ two ids):
 02 | 01 61 00 01 <32 bytes id1> | 01 64 01 02 <32 bytes id1> <32 bytes id2> <32 bytes node>
 ```
 
-A node is stored as one or more `history-node-v2` rows, each a postcard
-`StoredHistoryNode`, an externally tagged enum (**variant order is format**):
+A node is stored as one or more `history-node-v3` rows, each a postcard
+`StoredHistoryNode`, an externally tagged enum (**variant order is format**).
+`Flat` and `Split` are keyframes; `Patch` and `SplitPatch` are edits of one.
 
 - `Flat(HistoryNode)` (variant 0): the whole node. Used for nodes of at most
   64 entries, and for every chunk. The example above is stored as
@@ -190,8 +193,8 @@ A node is stored as one or more `history-node-v2` rows, each a postcard
   readers treat its address as present.
 - `Split(Vec<ChunkRef>)` (variant 1), `ChunkRef { first: String, node: Hash }`:
   a node of more than 64 entries, cut into runs of entries in name order. Each
-  chunk is a `Flat` row; `first` is its first name and `node` its address. A
-  chunk ends after an entry whose name `n` has
+  chunk is a `Flat` or `Patch` row; `first` is its first name and `node` its
+  address. A chunk ends after an entry whose name `n` has
   `Hash::of_object("history-chunk-boundary", n)` with its first byte's low 5
   bits zero (about one name in 32), or when it reaches 128 entries, or at the
   last entry. Boundaries depend only on names, so an edit rewrites one chunk
@@ -202,26 +205,70 @@ A node is stored as one or more `history-node-v2` rows, each a postcard
 01 21 | 05 66 30 30 30 30 <32 bytes chunk 0> | 05 66 30 30 33 30 <32 bytes chunk 1> | ...
 ```
 
-A node's address (the `history-tree-v2` value, and `Tree.node` in its parent)
-is the hash of its top row, `Flat` or `Split`. Splitting is deterministic, so a
-logical node has one address. Readers check that each chunk is `Flat`, starts
-with its `first` and ends before the next chunk's `first`; a split node of
-`n` entries needs about `n / 32` refs, one level deep.
+- `Patch { base: Hash, over: HistoryNode }` (variant 2): the `Flat` row
+  `base` with the entries of `over` added or replaced. Example, `a` set on the
+  keyframe `<base>`:
 
-The golden bytes and boundary choice are asserted in `leep-derive`
-(`node_encoding_is_stable`, `chunk_boundaries_are_stable`). Rows are
+```
+02 <32 bytes base> | 01 | 01 61 00 01 <32 bytes id1>
+```
+
+- `SplitPatch { base: Hash, refs: BTreeMap<String, Option<SplitChange>> }`
+  (variant 3), `SplitChange { node: Hash, next: Option<String> }`: the
+  `Split` row `base` with the chunk whose first name is the key set to `node`
+  (`Some`) or removed (`None`). `next` is the first name of the chunk after
+  it in the patched list (`None` if last), so a lookup that falls in a set
+  chunk's range needs no read of `base`; it must match the patched list.
+  Example, chunk `a` set (next `q`) and chunk `m` removed:
+
+```
+03 <32 bytes base> | 02 | 01 61 01 <32 bytes chunk> 01 01 71 | 01 6d 00
+```
+
+A patch's `base` must be a keyframe of the patch's shape (`Flat` for `Patch`,
+`Split` for `SplitPatch`), never another patch, so any row reads in at most
+two rows. Rows are written by `put_history_node` from the new logical node and
+the stored predecessor, the first parent's version of the same node. The
+predecessor of a chunk is the predecessor node's chunk whose range holds the
+new chunk's first name. For each whole node, chunk and chunk list that
+changed, with `K` the predecessor's keyframe (the predecessor itself if it is
+one), the row is:
+
+- `K` itself, if the content equals `K`;
+- otherwise a patch on `K` of the entries (or refs) that differ, if every
+  name of `K` is still present and the patch's encoded length `p` satisfies
+  `p² <= 128 × w`, where `w` is the encoded length of the whole row;
+- otherwise the whole row, a new keyframe.
+
+Unchanged chunks keep their address. With no predecessor, or one of the other
+shape, every row is a keyframe.
+
+A node's address (the `history-tree-v3` value, and `Tree.node` in its parent)
+is the hash of its top row. Rows depend only on the content and the stored
+predecessor, so derivation is deterministic, but the same logical node can be
+stored under more than one address when reached from different predecessors.
+Readers check that each chunk starts with its `first`, ends before the next
+chunk's `first`, and that a patch fits its keyframe; a split node of `n`
+entries needs about `n / 32` refs, one level deep.
+
+The golden bytes, the boundary choice and the patch rule are asserted in
+`leep-derive` (`node_encoding_is_stable`, `chunk_boundaries_are_stable`,
+`patches_are_chosen_while_small_and_name_their_keyframe`). Rows are
 content-addressed and idempotent. The meaning of `changed` (the maximal
 changesets whose entry at the path differs from their first parent's; merges
 take the union of parents' sets for paths they leave as in `parents[0]`) is
-part of the format: changing it, the field or variant order, the split rule or
-the key derivation requires `history-tree-v3` and `history-node-v3`. Entries
-of deleted paths are kept. The API addition (`GET /v1/last-change/{id}`) adds
-one endpoint and one response type; `/v1/log` is unchanged.
+part of the format: changing it, the field or variant order, the split rule,
+the patch rule or the key derivation requires `history-tree-v4` and
+`history-node-v4`. Entries of deleted paths are kept. The API addition
+(`GET /v1/last-change/{id}`) adds one endpoint and one response type;
+`/v1/log` is unchanged.
 
 `history-tree-v1` and `history-node-v1` (ADR 0013 as first written) stored each
 node as one row of the bare `HistoryNode` postcard, keyed by
-`Hash::of_object("history-node-v1", bytes)`. Current servers neither read nor
-write them.
+`Hash::of_object("history-node-v1", bytes)`. `history-tree-v2` and
+`history-node-v2` (ADR 0027) stored `Flat` and `Split` rows only, keyed by
+`Hash::of_object("history-node-v2", bytes)`. Current servers neither read nor
+write either.
 
 ## Rename detection (no persisted change)
 

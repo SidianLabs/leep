@@ -168,7 +168,7 @@ fn run_verify_workflow(stores: &Stores, work: &Path) {
         "generation",
         "skiplist",
         "root_tree",
-        "history-tree-v2",
+        "history-tree-v3",
         "blob-trigrams-v1",
         "tree-trigrams-v1",
         "blame",

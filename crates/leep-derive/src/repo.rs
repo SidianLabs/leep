@@ -201,12 +201,13 @@ impl SkiplistMaps {
     }
 }
 
-/// Decoded `history-node-v2` rows by hash. A split node is read one row per
-/// chunk, and derivation reads the same root and directory nodes for every
-/// changeset, so without this each changeset would re-read and re-decode
-/// dozens of rows. Rows are content addressed and checked against their hash
-/// before they are cached, so entries never go stale. Bounded like
-/// [`AncestryCache`], by bytes: each map holds up to half the budget.
+/// Decoded `history-node-v3` rows by hash, as stored. A split node is read
+/// one row per chunk, a patch with its keyframe, and derivation reads the
+/// same root and directory nodes for every changeset, so without this each
+/// changeset would re-read and re-decode dozens of rows. Rows are content
+/// addressed and checked against their hash before they are cached, so
+/// entries never go stale. Bounded like [`AncestryCache`], by bytes: each map
+/// holds up to half the budget.
 #[derive(Default)]
 pub(crate) struct HistoryRowCache {
     inner: Mutex<HistoryRowMaps>,

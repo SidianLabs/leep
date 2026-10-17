@@ -3069,6 +3069,122 @@ mod path_history {
         assert!(split, "no history node was split");
     }
 
+    /// A wide and deep history with merges: a root of 80 files, `src` of
+    /// 400, `docs/a/b` of 60, and 400 changesets each editing a few files,
+    /// sometimes adding one, with a merge of a short branch every 25.
+    async fn wide_deep_history(r: &Repo) -> ChangesetId {
+        let mut rng = Rng(0x51ce_c0de);
+        let mut names: Vec<String> = (0..80)
+            .map(|i| format!("top{i:02}.c"))
+            .chain((0..400).map(|i| format!("src/m{i:03}.c")))
+            .chain((0..60).map(|i| format!("docs/a/b/p{i:02}.txt")))
+            .collect();
+        let initial: Vec<(&str, Option<&str>)> =
+            names.iter().map(|n| (n.as_str(), Some("0"))).collect();
+        let mut tip = commit(r, &[], &initial, "import").await;
+        let mut branch = None;
+        for n in 1..400 {
+            let mut edits: Vec<(String, String)> = (0..1 + rng.below(3))
+                .map(|_| (names[rng.below(names.len())].clone(), format!("{n}")))
+                .collect();
+            if rng.below(8) == 0 {
+                let new = format!("src/new{n:03}.c");
+                names.push(new.clone());
+                edits.push((new, "new".into()));
+            }
+            let edits: Vec<(&str, Option<&str>)> = edits
+                .iter()
+                .map(|(p, c)| (p.as_str(), Some(c.as_str())))
+                .collect();
+            if n % 25 == 5 {
+                branch = Some(tip);
+            }
+            match branch {
+                Some(b) if n % 25 == 10 => {
+                    let side = commit(
+                        r,
+                        &[b],
+                        &[("docs/a/b/side.txt", Some(&*n.to_string()))],
+                        "side",
+                    )
+                    .await;
+                    tip = commit(r, &[tip, side], &edits, &format!("m{n}")).await;
+                    branch = None;
+                }
+                _ => tip = commit(r, &[tip], &edits, &format!("c{n}")).await,
+            }
+        }
+        tip
+    }
+
+    async fn node_rows(r: &Repo) -> Vec<(Hash, Bytes)> {
+        r.meta()
+            .list_derived(derived::HISTORY_NODE_KIND, None, usize::MAX)
+            .await
+            .unwrap()
+    }
+
+    /// Patches depend only on what each changeset's parents stored, so two
+    /// servers deriving the same history, in any order, write identical rows.
+    #[tokio::test]
+    async fn history_rows_are_byte_identical_across_derivations() {
+        let (a, b) = (repo(), repo());
+        let tip = wide_deep_history(&a).await;
+        assert_eq!(wide_deep_history(&b).await, tip);
+        derived::derive::<HistoryTree>(&a, tip).await.unwrap();
+        // `b` derives a middle changeset first, then the rest.
+        let middle = a.log(tip, None, 200).await.unwrap().pop().unwrap().id;
+        derived::derive::<HistoryTree>(&b, middle).await.unwrap();
+        derived::derive::<HistoryTree>(&b, tip).await.unwrap();
+        let rows = node_rows(&a).await;
+        assert!(rows.len() > 400);
+        assert_eq!(rows, node_rows(&b).await);
+        let tree = <HistoryTree as derived::DerivedKind>::NAME;
+        assert_eq!(
+            a.meta().list_derived(tree, None, usize::MAX).await.unwrap(),
+            b.meta().list_derived(tree, None, usize::MAX).await.unwrap()
+        );
+    }
+
+    /// The bytes of every distinct row the same history would take with
+    /// keyframes only (the encoding before ADR 0037): each logical node any
+    /// changeset's index reaches, stored whole or in whole chunks.
+    async fn keyframe_only_bytes(r: &Repo, tip: ChangesetId) -> usize {
+        let mut rows: std::collections::HashMap<Hash, usize> = Default::default();
+        let mut seen = std::collections::HashSet::new();
+        let mut stack: Vec<Hash> = Vec::new();
+        for info in r.log(tip, None, usize::MAX).await.unwrap() {
+            stack.push(r.history_root(info.id).await.unwrap());
+        }
+        while let Some(h) = stack.pop() {
+            if !seen.insert(h) {
+                continue;
+            }
+            let node = r.read_history_node(h).await.unwrap();
+            stack.extend(node.entries.values().filter_map(|e| e.node()));
+            for row in node.rows() {
+                rows.insert(row.hash, row.bytes.len());
+            }
+        }
+        rows.values().sum()
+    }
+
+    /// Size regression: patches must keep the index several times smaller
+    /// than whole rows on a history whose busy directories are wide and deep.
+    #[tokio::test]
+    async fn patched_history_rows_are_several_times_smaller() {
+        let r = repo();
+        let tip = wide_deep_history(&r).await;
+        derived::derive::<HistoryTree>(&r, tip).await.unwrap();
+        let stored: usize = node_rows(&r).await.iter().map(|(_, v)| v.len()).sum();
+        let whole = keyframe_only_bytes(&r, tip).await;
+        assert!(
+            stored * 3 <= whole,
+            "stored {stored} bytes, {whole} with keyframes only ({:.2}x)",
+            whole as f64 / stored as f64
+        );
+    }
+
     /// Build random histories over `pool` and compare indexed answers for
     /// `queries` with the scan. Says whether any history node was split.
     async fn check_index_against_scan(

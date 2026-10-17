@@ -387,6 +387,7 @@ under load from other jobs, the index derived from scratch three times each):
 |---|---|---|---|---|
 | `history-node-v1` (whole nodes) | 5,224 | 45.2 MB | 58.7 / 30.7 / 35.0 s | 14.6 / 13.5 / 14.9 s |
 | `history-node-v2` (chunked) | 11,725 | 13.0 MB | 34.1 / 34.2 / 38.3 s | 13.4 / 13.7 / 14.6 s |
+| `history-node-v3` (chunked, patched), later on a quieter machine | 11,733 | 3.70 MB | 15.7 / 16.0 / 16.0 s (v2: 18.5 / 19.4 / 18.5 s) | 9.2 / 9.4 / 9.4 s (v2: 9.6 to 9.8 s) |
 
 Derivation costs the same; wall times vary with the machine's load. The 4,160
 chunk lists average 496 bytes and the 7,565 whole nodes and chunks 1.4 KB.
@@ -395,6 +396,65 @@ and a v2 server on one database agreed for 51 paths (files, directories,
 deleted and re-created paths, and paths that never existed). The prefix's
 directories are narrow compared with later git/git, so the full history
 should shrink by more than this factor of 3.5.
+
+**Patched rows (ADR 0037).** The v2 bytes on that slice were 55% changeset
+ids, 24% entry names and 16% chunk lists. The 222,540 ids stored were only
+3,792 distinct ones: each new version of a chunk repeated its unchanged
+entries. What per-row compression and the alternatives achieve on those rows:
+
+| v2 rows of the 3,795-commit slice (13.0 MB) | Bytes | Smaller by |
+|---|---|---|
+| Postgres pglz, as stored (only rows over about 2 KB are compressed) | 11.2 MB | 1.16x |
+| zstd per row, level 3 / 19 | 9.30 / 9.15 MB | 1.40x / 1.42x |
+| Per-row id table and front-coded names | 9.79 MB | 1.33x |
+| zstd with a 110 KB dictionary trained on all rows | 2.52 MB | 5.2x |
+| The same, trained on the older half, on the newer half | | 2.0x |
+| Patches on keyframes (v3) | 3.70 MB | 3.5x |
+
+The dictionary's figure comes from the slice's own changeset ids sitting in
+the dictionary; on rows it has not seen it falls to 2x and keeps falling as
+history moves on. v3 stores each changed node, chunk or list as a patch on an
+earlier whole version. It holds 942 keyframe nodes and chunks (1.05 MB),
+1,024 keyframe lists (0.42 MB), 6,631 patches averaging 255 bytes and 3,136
+list patches averaging 173 bytes. The threshold for starting a new keyframe
+was chosen on this slice:
+
+| Patch kept while | Node bytes |
+|---|---|
+| at most 1/2 / 1/3 / 1/4 / 1/8 of the whole row | 4.83 / 3.95 / 3.88 / 5.36 MB |
+| `patch² <= C × whole`, C = 64 / 96 / 128 / 200 / 300 | 3.71 / 3.60 / 3.62 / 3.98 / 4.54 MB |
+| C = 128, lists never patched | 4.80 MB |
+| C = 128, list patches naming the next chunk (as shipped) | 3.70 MB |
+
+In Postgres the node rows, copied into their own table with their primary
+key, took 14.5 MB for v2 (12 MB heap, 1.4 MB TOAST, 0.9 MB index) and 5.8 MB
+for v3 (4.6 MB, 0.1 MB, 0.9 MB). Deriving from scratch got faster, because
+the rows of a node now go in one write; the warmer took 15.1 s. Three
+derivations, and the warmer's, wrote byte-identical rows (same checksum of
+every row), and `verify --full` recomputed all 11,733 and found them equal.
+
+Queries on a scratch copy of the slice, release builds, a v2 and a v3 server
+in turn on one database (each holding its own index), `--warm-interval 0`.
+"Cold" is the first request to a freshly started server, the median of 5
+starts (15 for single lookups); "warm" the median of as many repeats; blame
+rows were deleted before each cold blame. Bodies for 50 paths (`last-change`,
+`log path=… limit=1000` and `blame` each, 150 responses) were byte-identical.
+
+| Query | v2 cold / warm | v3 cold / warm |
+|---|---|---|
+| `last-change Makefile` | 5.5 / 1.4 ms | 5.4 / 1.3 ms |
+| `last-change COPYING` | 4.8 / 1.3 ms | 5.1 / 1.3 ms |
+| `last-change` of a path that never existed | 3.5 / 0.9 ms | 3.8 / 1.0 ms |
+| `last-change Documentation/git-pull.txt` | 5.0 / 1.3 ms | 5.6 / 1.6 ms |
+| `log path=Makefile limit=50` | 61 / 24 ms | 57 / 20 ms |
+| `log path=Documentation limit=1000` | 604 / 306 ms | 602 / 319 ms |
+| `blame Makefile` | 520 / 14 ms | 503 / 15 ms |
+| `blame COPYING` | 13.8 / 1.9 ms | 13.0 / 1.9 ms |
+
+Path logs and blame, which make many lookups, are unchanged. A single lookup
+on a fresh server can read one more row, the keyframe of the newest chunk
+list when the name lies in a chunk that list patch does not set: up to
+0.6 ms. A name that changed recently is answered from the patches alone.
 
 ### Warming instead of deriving on first query
 
@@ -452,12 +512,17 @@ The whole of git/git again, on the same VPS, after ADRs 0027 (chunked nodes),
 0028 (warming) and 0030 (batched log). All path-history and search rows were
 deleted and a server started with `--warm-interval 30s`; nobody sent a query.
 
-| Path-history index, all 82,500 commits | Before (v1, derived by the first query) | Now (v2, derived by the warmer) |
+| Path-history index, all 82,500 commits | Before (v1, derived by the first query) | v2, derived by the warmer |
 |---|---|---|
 | Time to build | 69 min, inside one request | 41 min, in the background |
 | Node rows | 174,978 | 410,685 |
 | Node bytes | 6.1 GB | 796 MB |
 | Whole database | 3.7 GB | 1.0 GB (238 MB of it changesets and mappings) |
+
+ADR 0037's patched rows (`history-node-v3`) are not yet measured on the full
+history. They store 3.5x fewer node bytes than v2 on the 3,795-commit slice,
+whose rows are smaller (1.1 KB on average against 1.9 KB here); the same
+factor would bring the 796 MB to about 230 MB.
 
 Queries against a freshly started server on that database (`main` at
 generation 26,484), first request and the repeat. A Linux kernel import ran
@@ -536,7 +601,9 @@ What this shows:
 - **Storage was the largest gap.** Loose, uncompressed blobs made Leep 27x
   larger than git. After `repack` (ADR 0029, "Packed blobs" below) the blobs
   of all of git/git take 190 MB against git's 328 MB for the whole repository;
-  what remains is the 1.0 GB database, most of it the path-history index.
+  what remains is the 1.0 GB database, most of it the path-history index
+  (measured with v2 rows; ADR 0037 stores the index 3.5x smaller on the
+  3,795-commit slice, not yet re-measured on the full history).
 - **Not compared:** Scion. There was no build to run on this machine, and
   published figures from other hardware and other histories are not
   comparable with these.

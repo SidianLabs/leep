@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use leep_core::review::{Review, Verdict};
 use leep_core::signature::{format_public_key, key_id, Signature};
 use leep_core::{Changeset, FileChange, FileKind, Hash, RepoPath, TreeEntry, TreeNode};
-use leep_derive::derived::{ChunkRef, HistoryEntry, HistoryNode, StoredHistoryNode};
+use leep_derive::derived::{ChunkRef, HistoryEntry, HistoryNode, SplitChange, StoredHistoryNode};
 use leep_derive::search::trigram::{extract, BlobRow, Bloom};
 use serde_json::json;
 
@@ -158,8 +158,13 @@ fn objects(out: &mut Out) {
     out.add(
         "history_node",
         "leaf-and-tree",
-        StoredHistoryNode::Flat(hist).encode(),
+        StoredHistoryNode::Flat(hist.clone()).encode(),
     );
+    let patch = StoredHistoryNode::Patch {
+        base: HistoryNode::empty_hash(),
+        over: hist,
+    };
+    out.add("history_node", "patch", patch.encode());
     out.add(
         "history_node",
         "empty",
@@ -176,6 +181,21 @@ fn objects(out: &mut Out) {
         },
     ]);
     out.add("history_node", "split", split.encode());
+    let split_patch = StoredHistoryNode::SplitPatch {
+        base: HistoryNode::empty_hash(),
+        refs: [
+            (
+                "a".to_string(),
+                Some(SplitChange {
+                    node: HistoryNode::empty_hash(),
+                    next: Some("m".into()),
+                }),
+            ),
+            ("q".to_string(), None),
+        ]
+        .into(),
+    };
+    out.add("history_node", "split-patch", split_patch.encode());
 
     let pk = [7u8; 32];
     let sig = Signature {

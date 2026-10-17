@@ -5,7 +5,9 @@
 //! content-addressed under [`NODE_KIND`], so a changeset shares every node it
 //! did not touch with its first parent. Large nodes are stored in chunks
 //! (ADR 0027), so a change to one entry of a wide directory rewrites one chunk,
-//! not the whole node. Derivation reads only the spines of changed paths, like
+//! not the whole node, and a changed node or chunk is stored as a patch on an
+//! earlier version (ADR 0037), so it costs the entries that changed, not all
+//! of them. Derivation reads only the spines of changed paths, like
 //! `root_tree`.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -22,14 +24,19 @@ use crate::Repo;
 
 /// Meta-store kind holding stored history nodes and chunks, keyed by the hash
 /// of their [`StoredHistoryNode`] bytes. The label is the only versioned name:
-/// `-v1` rows held whole nodes, and an older server may still read them.
-pub const NODE_KIND: &str = "history-node-v2";
+/// `-v1` rows held whole nodes and `-v2` rows had no patches, and an older
+/// server may still read them.
+pub const NODE_KIND: &str = "history-node-v3";
 
 /// Nodes with at most this many entries are stored whole.
 pub const FLAT_MAX: usize = 64;
 /// Most entries in one chunk, so a run of names without a boundary cannot
 /// make a chunk as large as the node it splits.
 pub const CHUNK_MAX: usize = 128;
+/// A changed row is stored as a patch on its predecessor's keyframe while
+/// `patch² <= PATCH_BUDGET * whole` (bytes); past that a new keyframe starts.
+/// See [`worth_patching`].
+pub const PATCH_BUDGET: usize = 128;
 /// Domain of the hash that picks chunk boundaries from entry names.
 const BOUNDARY_DOMAIN: &str = "history-chunk-boundary";
 
@@ -85,7 +92,9 @@ impl HistoryNode {
         Ok(postcard::from_bytes(bytes)?)
     }
 
-    /// Address of the node: the hash of its top stored row.
+    /// Address of the node stored without a predecessor: the hash of its top
+    /// keyframe row. A node stored as an edit of another may have a patch as
+    /// its top row and so another address (see [`flat_row`]).
     pub fn hash(&self) -> Hash {
         self.rows().pop().expect("a node has a top row").hash
     }
@@ -95,32 +104,50 @@ impl HistoryNode {
         *EMPTY.get_or_init(|| HistoryNode::default().hash())
     }
 
-    /// The rows that store this node: its chunks, if split, then the top row.
-    /// Chunk boundaries depend only on entry names (see [`ends_chunk`]), so an
-    /// edit rewrites the chunk holding the entry and every other chunk keeps
-    /// its hash and is shared with the previous version.
-    pub fn rows(&self) -> Vec<HistoryRow> {
+    /// The node cut into chunks, or `None` if it is stored whole. Chunk
+    /// boundaries depend only on entry names (see [`ends_chunk`]), so an edit
+    /// changes the chunk holding the entry and every other chunk is shared
+    /// with the previous version.
+    pub fn chunks(&self) -> Option<Vec<HistoryNode>> {
         if self.entries.len() <= FLAT_MAX {
-            return vec![HistoryRow::new(StoredHistoryNode::Flat(self.clone()))];
+            return None;
         }
-        let mut rows = Vec::new();
-        let mut refs = Vec::new();
+        let mut chunks = Vec::new();
         let mut chunk = HistoryNode::default();
         let last = self.entries.len() - 1;
         for (i, (name, entry)) in self.entries.iter().enumerate() {
             chunk.entries.insert(name.clone(), entry.clone());
             if i == last || chunk.entries.len() == CHUNK_MAX || ends_chunk(name) {
-                let first = chunk.entries.keys().next().expect("non-empty").clone();
-                let row = HistoryRow::new(StoredHistoryNode::Flat(std::mem::take(&mut chunk)));
-                refs.push(ChunkRef {
-                    first,
-                    node: row.hash,
-                });
-                rows.push(row);
+                chunks.push(std::mem::take(&mut chunk));
             }
+        }
+        Some(chunks)
+    }
+
+    /// The rows that store this node with no predecessor, all keyframes: its
+    /// chunks, if split, then the top row.
+    pub fn rows(&self) -> Vec<HistoryRow> {
+        let Some(chunks) = self.chunks() else {
+            return vec![HistoryRow::new(StoredHistoryNode::Flat(self.clone()))];
+        };
+        let mut rows = Vec::new();
+        let mut refs = Vec::new();
+        for chunk in chunks {
+            let first = chunk.first_name().to_string();
+            let row = HistoryRow::new(StoredHistoryNode::Flat(chunk));
+            refs.push(ChunkRef {
+                first,
+                node: row.hash,
+            });
+            rows.push(row);
         }
         rows.push(HistoryRow::new(StoredHistoryNode::Split(refs)));
         rows
+    }
+
+    /// Name of the first entry; empty for the empty node.
+    pub fn first_name(&self) -> &str {
+        self.entries.keys().next().map_or("", |n| n.as_str())
     }
 }
 
@@ -129,14 +156,125 @@ fn ends_chunk(name: &str) -> bool {
     Hash::of_object(BOUNDARY_DOMAIN, name.as_bytes()).0[0] & 0x1f == 0
 }
 
-/// One `history-node-v2` row. A node with more than [`FLAT_MAX`] entries is
-/// stored `Split`: a list of chunks, each a `Flat` row holding a run of its
+/// Whether a patch of `patch` bytes is stored instead of a keyframe of
+/// `whole` bytes.
+///
+/// A patch holds every change since its keyframe, so it grows by about `d`
+/// bytes (one entry, about 64) per version until a new keyframe of `T` bytes
+/// starts the next run. Ending runs at a patch of `L` bytes costs about
+/// `L / 2 + d * T / L` bytes per version, least at `L = sqrt(2 * d * T)`: a
+/// quarter of a 2 KB chunk, but half of a 500-byte chunk list, which a fixed
+/// fraction would keyframe after one or two changes. On git/git's first
+/// 3,795 commits this stores 7% fewer bytes than a fixed quarter.
+pub fn worth_patching(patch: usize, whole: usize) -> bool {
+    patch * patch <= PATCH_BUDGET * whole
+}
+
+/// The row storing the whole node or chunk `node`, given `key`, the keyframe
+/// (address and entries) its predecessor was stored against, if any.
+///
+/// Successive versions of a node differ in a few entries, but a keyframe
+/// repeats all of them, changeset ids included (over half of v2's bytes). So
+/// while every name of `key` is still in `node` (names are never removed by
+/// derivation) and the entries that differ from it are small enough
+/// ([`worth_patching`]), the row is a `Patch` holding only those entries.
+/// Patches always point at a keyframe, never at another patch, so a read
+/// costs at most two rows, and the keyframe is shared by every patch on it.
+/// The row is a function of `(key, node)` only, so derivation stays
+/// deterministic, and `node` equal to the keyframe gives the keyframe itself.
+pub fn flat_row(node: &HistoryNode, key: Option<(Hash, &HistoryNode)>) -> HistoryRow {
+    let whole = HistoryRow::new(StoredHistoryNode::Flat(node.clone()));
+    let Some((base, key)) = key else {
+        return whole;
+    };
+    if key == node {
+        return whole;
+    }
+    if !key.entries.keys().all(|n| node.entries.contains_key(n)) {
+        return whole;
+    }
+    let over = HistoryNode {
+        entries: node
+            .entries
+            .iter()
+            .filter(|(n, e)| key.entries.get(*n) != Some(e))
+            .map(|(n, e)| (n.clone(), e.clone()))
+            .collect(),
+    };
+    let patch = HistoryRow::new(StoredHistoryNode::Patch { base, over });
+    if worth_patching(patch.bytes.len(), whole.bytes.len()) {
+        patch
+    } else {
+        whole
+    }
+}
+
+/// The row storing the chunk list `refs`, given the keyframe list its
+/// predecessor was stored against: a `SplitPatch` of the refs that changed or
+/// went away while that is small, as for [`flat_row`]. Each changed ref also
+/// names the first name of the chunk after it, so a lookup that lands in a
+/// changed chunk's range needs no read of the keyframe list.
+pub fn split_row(refs: Vec<ChunkRef>, key: Option<(Hash, &[ChunkRef])>) -> HistoryRow {
+    let Some((base, key)) = key else {
+        return HistoryRow::new(StoredHistoryNode::Split(refs));
+    };
+    if key == refs.as_slice() {
+        return HistoryRow::new(StoredHistoryNode::Split(refs));
+    }
+    let new: BTreeSet<&str> = refs.iter().map(|r| r.first.as_str()).collect();
+    let old: BTreeMap<&str, Hash> = key.iter().map(|r| (r.first.as_str(), r.node)).collect();
+    let mut changes: BTreeMap<String, Option<SplitChange>> = key
+        .iter()
+        .filter(|r| !new.contains(r.first.as_str()))
+        .map(|r| (r.first.clone(), None))
+        .collect();
+    for (i, r) in refs.iter().enumerate() {
+        if old.get(r.first.as_str()) != Some(&r.node) {
+            let next = refs.get(i + 1).map(|n| n.first.clone());
+            changes.insert(r.first.clone(), Some(SplitChange { node: r.node, next }));
+        }
+    }
+    let whole = HistoryRow::new(StoredHistoryNode::Split(refs));
+    let patch = HistoryRow::new(StoredHistoryNode::SplitPatch {
+        base,
+        refs: changes,
+    });
+    if worth_patching(patch.bytes.len(), whole.bytes.len()) {
+        patch
+    } else {
+        whole
+    }
+}
+
+/// One `history-node-v3` row. A node with more than [`FLAT_MAX`] entries is
+/// split: a list of chunks, each a whole or patched row holding a run of its
 /// entries in name order. One level is enough: chunks average 32 entries, so
 /// the list stays near 1/32 of the node (about 1.3 KB per 1,000 entries).
+/// `Flat` and `Split` are keyframes; `Patch` and `SplitPatch` are edits of a
+/// keyframe of the matching shape (see [`flat_row`]).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StoredHistoryNode {
     Flat(HistoryNode),
     Split(Vec<ChunkRef>),
+    /// The `Flat` row `base` with the entries of `over` added or replaced.
+    Patch {
+        base: Hash,
+        over: HistoryNode,
+    },
+    /// The `Split` row `base` with the refs named in `refs` set (`Some`) or
+    /// removed (`None`), keyed by their first name.
+    SplitPatch {
+        base: Hash,
+        refs: BTreeMap<String, Option<SplitChange>>,
+    },
+}
+
+/// A chunk a [`StoredHistoryNode::SplitPatch`] sets: its row, and the first
+/// name of the chunk after it in the patched list (`None` if it is last).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SplitChange {
+    pub node: Hash,
+    pub next: Option<String>,
 }
 
 /// A chunk of a split node: the name of its first entry and its row.
@@ -153,6 +291,64 @@ impl StoredHistoryNode {
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         Ok(postcard::from_bytes(bytes)?)
+    }
+
+    /// The keyframe a patch is stored against.
+    pub fn base(&self) -> Option<Hash> {
+        match self {
+            StoredHistoryNode::Flat(_) | StoredHistoryNode::Split(_) => None,
+            StoredHistoryNode::Patch { base, .. } | StoredHistoryNode::SplitPatch { base, .. } => {
+                Some(*base)
+            }
+        }
+    }
+
+    /// This row as a keyframe: a patch applied to `key`, the row at its
+    /// `base`. `Err` says why the two do not fit together.
+    pub fn resolve(self, key: Option<&StoredHistoryNode>) -> std::result::Result<Self, String> {
+        match (self, key) {
+            (row @ (StoredHistoryNode::Flat(_) | StoredHistoryNode::Split(_)), None) => Ok(row),
+            (StoredHistoryNode::Patch { over, .. }, Some(StoredHistoryNode::Flat(key))) => {
+                let mut node = key.clone();
+                node.entries.extend(over.entries);
+                Ok(StoredHistoryNode::Flat(node))
+            }
+            (StoredHistoryNode::SplitPatch { refs, .. }, Some(StoredHistoryNode::Split(key))) => {
+                let mut all: BTreeMap<String, Hash> =
+                    key.iter().map(|r| (r.first.clone(), r.node)).collect();
+                for (first, change) in &refs {
+                    match change {
+                        Some(c) => {
+                            all.insert(first.clone(), c.node);
+                        }
+                        None => {
+                            if all.remove(first).is_none() {
+                                return Err(format!("removes {first:?}, which its base lacks"));
+                            }
+                        }
+                    }
+                }
+                if all.is_empty() {
+                    return Err("leaves no chunks".into());
+                }
+                let all: Vec<ChunkRef> = all
+                    .into_iter()
+                    .map(|(first, node)| ChunkRef { first, node })
+                    .collect();
+                // Lookups trust `next` without reading the base, so it must
+                // be the patched list's own successor.
+                for (i, r) in all.iter().enumerate() {
+                    if let Some(Some(c)) = refs.get(&r.first) {
+                        if c.next.as_deref() != all.get(i + 1).map(|n| n.first.as_str()) {
+                            return Err(format!("names the wrong chunk after {:?}", r.first));
+                        }
+                    }
+                }
+                Ok(StoredHistoryNode::Split(all))
+            }
+            (_, Some(_)) => Err("is a patch on a row of another shape".into()),
+            (_, None) => Err("is a patch without its base".into()),
+        }
     }
 }
 
@@ -174,12 +370,21 @@ impl HistoryRow {
     }
 }
 
+/// A row as readers use it: always `Flat` or `Split`, with any patch applied,
+/// and the address of the keyframe it was stored against (its own if it is
+/// one), which the next version is patched against.
+#[derive(Debug)]
+pub struct ResolvedRow {
+    pub node: StoredHistoryNode,
+    pub keyframe: Hash,
+}
+
 /// History tree root of a changeset. Value: 32 bytes, the root node's hash.
 pub struct HistoryTree;
 
 #[async_trait]
 impl DerivedKind for HistoryTree {
-    const NAME: &'static str = "history-tree-v2";
+    const NAME: &'static str = "history-tree-v3";
 
     async fn derive(
         repo: &Repo,
@@ -510,7 +715,7 @@ mod tests {
     }
 
     /// Golden bytes: changing them orphans every stored history node. A new
-    /// encoding needs a new kind name (`history-node-v3`).
+    /// encoding needs a new kind name (`history-node-v4`).
     #[test]
     fn node_encoding_is_stable() {
         let node = HistoryNode {
@@ -542,10 +747,10 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].bytes, want);
         assert_eq!(StoredHistoryNode::decode(&want).unwrap(), rows[0].node);
-        assert_eq!(node.hash(), Hash::of_object("history-node-v2", &want));
+        assert_eq!(node.hash(), Hash::of_object("history-node-v3", &want));
         assert_eq!(
             HistoryNode::empty_hash(),
-            Hash::of_object("history-node-v2", &[0, 0])
+            Hash::of_object("history-node-v3", &[0, 0])
         );
 
         // Split (variant 1): the chunk count, then each chunk's first name
@@ -567,8 +772,162 @@ mod tests {
         assert_eq!(split.encode(), want);
         assert_eq!(StoredHistoryNode::decode(&want).unwrap(), split);
 
-        assert_eq!(HistoryTree::NAME, "history-tree-v2");
-        assert_eq!(NODE_KIND, "history-node-v2");
+        // Patch (variant 2): the keyframe's address, then the entries that
+        // differ from it, encoded as a node.
+        let patch = StoredHistoryNode::Patch {
+            base: Hash([6; 32]),
+            over: HistoryNode {
+                entries: BTreeMap::from([("a".to_string(), leaf(1))]),
+            },
+        };
+        let mut want = vec![2];
+        want.extend([6; 32]);
+        want.extend([1, 1, b'a', 0, 1]);
+        want.extend([1; 32]);
+        assert_eq!(patch.encode(), want);
+        assert_eq!(StoredHistoryNode::decode(&want).unwrap(), patch);
+
+        // SplitPatch (variant 3): the keyframe list's address, then changes
+        // by first name, each an option: 0 removed, or 1 then the chunk's
+        // address and the next chunk's first name (an option too).
+        let patch = StoredHistoryNode::SplitPatch {
+            base: Hash([7; 32]),
+            refs: BTreeMap::from([
+                (
+                    "a".to_string(),
+                    Some(SplitChange {
+                        node: Hash([8; 32]),
+                        next: Some("q".into()),
+                    }),
+                ),
+                ("m".to_string(), None),
+            ]),
+        };
+        let mut want = vec![3];
+        want.extend([7; 32]);
+        want.extend([2, 1, b'a', 1]);
+        want.extend([8; 32]);
+        want.extend([1, 1, b'q']);
+        want.extend([1, b'm', 0]);
+        assert_eq!(patch.encode(), want);
+        assert_eq!(StoredHistoryNode::decode(&want).unwrap(), patch);
+
+        assert_eq!(HistoryTree::NAME, "history-tree-v3");
+        assert_eq!(NODE_KIND, "history-node-v3");
+        assert_eq!(PATCH_BUDGET, 128);
+        assert!(worth_patching(400, 1250) && !worth_patching(401, 1250));
+    }
+
+    /// When a patch is chosen over a keyframe is part of the format: it
+    /// decides which rows, and so which addresses, an edit produces.
+    #[test]
+    fn patches_are_chosen_while_small_and_name_their_keyframe() {
+        let key = wide(40);
+        let key_hash = key.hash();
+        let mut node = key.clone();
+        for i in 0..5 {
+            node.entries.insert(format!("f{i:04}"), leaf(2));
+        }
+        let row = flat_row(&node, Some((key_hash, &key)));
+        let StoredHistoryNode::Patch { base, over } = &row.node else {
+            panic!("five of forty entries changed: a patch");
+        };
+        assert_eq!(*base, key_hash);
+        assert_eq!(over.entries.len(), 5);
+        assert_eq!(row.hash, Hash::of_object(NODE_KIND, &row.bytes));
+        let resolved = row
+            .node
+            .clone()
+            .resolve(Some(&StoredHistoryNode::Flat(key.clone())));
+        assert_eq!(resolved, Ok(StoredHistoryNode::Flat(node.clone())));
+
+        // Past the budget a new keyframe starts.
+        for i in 5..15 {
+            node.entries.insert(format!("f{i:04}"), leaf(2));
+        }
+        let row = flat_row(&node, Some((key_hash, &key)));
+        assert_eq!(row.node, StoredHistoryNode::Flat(node.clone()));
+        assert_eq!(row.hash, node.hash());
+
+        // Unchanged: the keyframe itself. A name of the keyframe missing from
+        // the node cannot be expressed as a patch.
+        assert_eq!(flat_row(&key, Some((key_hash, &key))).hash, key_hash);
+        let mut fewer = key.clone();
+        fewer.entries.remove("f0001");
+        assert!(matches!(
+            flat_row(&fewer, Some((key_hash, &key))).node,
+            StoredHistoryNode::Flat(_)
+        ));
+
+        // Lists: a changed ref and a removed one.
+        let refs: Vec<ChunkRef> = (0..40)
+            .map(|i| ChunkRef {
+                first: format!("n{i:02}"),
+                node: Hash([i; 32]),
+            })
+            .collect();
+        let list = Hash([9; 32]);
+        let mut edited = refs.clone();
+        edited[3].node = Hash([99; 32]);
+        edited.remove(7);
+        let row = split_row(edited.clone(), Some((list, &refs)));
+        let change = |node: u8, next: &str| {
+            Some(SplitChange {
+                node: Hash([node; 32]),
+                next: Some(next.to_string()),
+            })
+        };
+        let want = StoredHistoryNode::SplitPatch {
+            base: list,
+            refs: BTreeMap::from([
+                ("n03".to_string(), change(99, "n04")),
+                ("n07".to_string(), None),
+            ]),
+        };
+        assert_eq!(row.node, want);
+        assert_eq!(
+            want.resolve(Some(&StoredHistoryNode::Split(refs.clone()))),
+            Ok(StoredHistoryNode::Split(edited))
+        );
+        // A change must name its true successor: lookups rely on it.
+        let lying = StoredHistoryNode::SplitPatch {
+            base: list,
+            refs: BTreeMap::from([("n03".to_string(), change(99, "n05"))]),
+        };
+        assert!(lying
+            .resolve(Some(&StoredHistoryNode::Split(refs.clone())))
+            .is_err());
+        assert_eq!(
+            split_row(refs.clone(), Some((list, &refs))).node,
+            StoredHistoryNode::Split(refs)
+        );
+    }
+
+    #[test]
+    fn patches_only_resolve_against_a_keyframe_of_their_shape() {
+        let flat = StoredHistoryNode::Flat(wide(3));
+        let split = StoredHistoryNode::Split(vec![ChunkRef {
+            first: "a".into(),
+            node: Hash([1; 32]),
+        }]);
+        let patch = StoredHistoryNode::Patch {
+            base: Hash([2; 32]),
+            over: wide(1),
+        };
+        let split_patch = StoredHistoryNode::SplitPatch {
+            base: Hash([3; 32]),
+            refs: BTreeMap::from([("a".to_string(), None)]),
+        };
+        assert!(patch.clone().resolve(None).is_err());
+        assert!(patch.clone().resolve(Some(&split)).is_err());
+        assert!(patch.clone().resolve(Some(&patch)).is_err());
+        assert!(split_patch.clone().resolve(Some(&flat)).is_err());
+        assert!(
+            split_patch.clone().resolve(Some(&split)).is_err(),
+            "removing the only chunk leaves none"
+        );
+        assert!(flat.clone().resolve(Some(&flat)).is_err());
+        assert_eq!(flat.clone().resolve(None), Ok(flat));
     }
 
     /// Chunk boundaries are part of the format: a different choice gives the
@@ -647,6 +1006,7 @@ mod tests {
     #[tokio::test]
     async fn a_split_node_round_trips_and_an_edit_writes_one_chunk() {
         use leep_core::memory::{MemoryBlobStore, MemoryMetaStore};
+        use leep_core::MetaStore;
         use std::sync::Arc;
         let meta = Arc::new(MemoryMetaStore::new());
         let repo = Repo::new(Arc::new(MemoryBlobStore::new()), meta.clone());
@@ -673,6 +1033,156 @@ mod tests {
         }
         for name in ["", "a", "f05", "zzz"] {
             assert_eq!(cold.history_child(h2, name).await.unwrap(), None);
+        }
+        // Both new rows are patches on the keyframes they replace.
+        let StoredHistoryNode::SplitPatch { base, refs } =
+            StoredHistoryNode::decode(&meta.get_derived(NODE_KIND, &h2).await.unwrap().unwrap())
+                .unwrap()
+        else {
+            panic!("an edit of one chunk is a list patch");
+        };
+        assert_eq!(base, h);
+        assert_eq!(refs.len(), 1);
+        let chunk = refs.values().next().unwrap().as_ref().unwrap().node;
+        let row =
+            StoredHistoryNode::decode(&meta.get_derived(NODE_KIND, &chunk).await.unwrap().unwrap())
+                .unwrap();
+        assert!(
+            matches!(row, StoredHistoryNode::Patch { ref over, .. } if over.entries.len() == 1)
+        );
+
+        // A lookup of the changed name reads the list patch and the chunk
+        // patch only: with both keyframes gone it still answers, and any other
+        // name reports the damage instead of a wrong answer.
+        let StoredHistoryNode::Patch {
+            base: chunk_key, ..
+        } = row
+        else {
+            unreachable!()
+        };
+        let mut rows = meta
+            .list_derived(NODE_KIND, None, usize::MAX)
+            .await
+            .unwrap();
+        rows.retain(|(k, _)| *k != h && *k != chunk_key);
+        meta.delete_derived_kind(NODE_KIND).await.unwrap();
+        for (k, v) in rows {
+            meta.put_derived(NODE_KIND, &k, v).await.unwrap();
+        }
+        let cold = Repo::new(Arc::new(MemoryBlobStore::new()), meta.clone());
+        assert_eq!(
+            cold.history_child(h2, "f0500").await.unwrap(),
+            Some(leaf(9))
+        );
+        for name in ["f0501", "f0000"] {
+            let e = cold.history_child(h2, name).await.unwrap_err().to_string();
+            assert!(e.contains("missing"), "{name}: {e}");
+        }
+    }
+
+    /// A long run of edits, each stored against the previous version: every
+    /// version reads back from a cold cache, patches always point at a
+    /// keyframe, keyframes restart as patches grow, and the bytes are a small
+    /// part of what whole rows would take.
+    #[tokio::test]
+    async fn a_chain_of_edits_stays_two_reads_deep_and_small() {
+        use leep_core::memory::{MemoryBlobStore, MemoryMetaStore};
+        use leep_core::MetaStore;
+        use std::sync::Arc;
+        let meta = Arc::new(MemoryMetaStore::new());
+        let repo = Repo::new(Arc::new(MemoryBlobStore::new()), meta.clone());
+        let mut node = wide(300);
+        let mut h = repo.put_history_node(&node, None).await.unwrap();
+        let mut versions = vec![(h, node.clone())];
+        let mut whole = 0;
+        for step in 0..200u32 {
+            let name = match step % 3 {
+                0 => format!("f{:04}", (step * 37) % 300),
+                1 => format!("g{step:04}"),
+                _ => "f0150".to_string(),
+            };
+            node.entries.insert(name, leaf((step % 250) as u8));
+            whole += node.rows().iter().map(|r| r.bytes.len()).sum::<usize>();
+            h = repo.put_history_node(&node, Some(h)).await.unwrap();
+            versions.push((h, node.clone()));
+        }
+        let rows = meta
+            .list_derived(NODE_KIND, None, usize::MAX)
+            .await
+            .unwrap();
+        let mut patches = 0;
+        let mut stored = 0;
+        for (key, value) in &rows {
+            stored += value.len();
+            let row = StoredHistoryNode::decode(value).unwrap();
+            if let Some(base) = row.base() {
+                patches += 1;
+                let key_row = rows
+                    .iter()
+                    .find(|(k, _)| *k == base)
+                    .expect("keyframe stored");
+                let key_row = StoredHistoryNode::decode(&key_row.1).unwrap();
+                assert!(key_row.base().is_none(), "{key}: patch on a patch");
+            }
+        }
+        assert!(patches > rows.len() / 2, "{patches} of {}", rows.len());
+        assert!(
+            stored * 3 < whole,
+            "stored {stored} bytes against {whole} for whole rows"
+        );
+        let cold = Repo::new(Arc::new(MemoryBlobStore::new()), meta.clone());
+        for (h, node) in &versions {
+            assert_eq!(&cold.read_history_node(*h).await.unwrap(), node);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_patch_on_a_patch_is_corrupt() {
+        use leep_core::memory::{MemoryBlobStore, MemoryMetaStore};
+        use leep_core::MetaStore;
+        use std::sync::Arc;
+        let meta = Arc::new(MemoryMetaStore::new());
+        let repo = Repo::new(Arc::new(MemoryBlobStore::new()), meta.clone());
+        let key = repo.put_history_node(&wide(10), None).await.unwrap();
+        let put = |row: StoredHistoryNode| {
+            let bytes = row.encode();
+            let h = Hash::of_object(NODE_KIND, &bytes);
+            let meta = meta.clone();
+            async move {
+                meta.put_derived(NODE_KIND, &h, Bytes::from(bytes))
+                    .await
+                    .unwrap();
+                h
+            }
+        };
+        let first = put(StoredHistoryNode::Patch {
+            base: key,
+            over: HistoryNode {
+                entries: BTreeMap::from([("x".to_string(), leaf(2))]),
+            },
+        })
+        .await;
+        let second = put(StoredHistoryNode::Patch {
+            base: first,
+            over: HistoryNode {
+                entries: BTreeMap::from([("y".to_string(), leaf(3))]),
+            },
+        })
+        .await;
+        assert_eq!(
+            repo.read_history_node(first).await.unwrap().entries.len(),
+            11
+        );
+        for repo in [
+            repo.clone(),
+            Repo::new(Arc::new(MemoryBlobStore::new()), meta.clone()),
+        ] {
+            let e = repo
+                .read_history_node(second)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("corrupt history node"), "{e}");
         }
     }
 

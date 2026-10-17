@@ -368,6 +368,15 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   derives again on the first path query after the upgrade (or with
   `repair rederive --kind history-tree-v2`), and `repair drop --kind
   history-tree-v1` removes the old rows once no older server is running.
+- The path-history index stores each changed node, chunk and chunk list as a
+  patch on an earlier whole version of it, holding only the entries that
+  differ (ADR 0037). On the first 3,795 commits of git/git its node bytes fell
+  from 13.0 MB to 3.7 MB (14.5 MB to 5.8 MB in Postgres) and deriving it got
+  about 15% faster, with byte-identical answers. The derived kinds are now
+  `history-tree-v3` and `history-node-v3`: the warmer derives the index after
+  the upgrade (or `repair rederive --kind history-tree-v3` does), and `repair
+  drop --kind history-tree-v2` removes the old rows once no older server is
+  running.
 - `leep-server repack` packs a filesystem blob store (ADR 0029): every live
   blob and tree node goes into one pack, each file version a zstd delta
   against the previous version at its path and each tree node against the
