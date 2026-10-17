@@ -1,4 +1,4 @@
-//! The documented exit codes (ADR 0033), checked by running the `leep`
+//! The documented exit codes (ADR 0034), checked by running the `leep`
 //! binary against the in-memory mock server.
 
 mod common;

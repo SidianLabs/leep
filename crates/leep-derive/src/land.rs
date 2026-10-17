@@ -236,7 +236,7 @@ impl Repo {
 
     /// [`land_as`](Self::land_as), refusing with `NotFound` when `create` is
     /// false and `target_ref` does not exist at the head the land reads, so a
-    /// typo cannot make a ref (ADR 0035). The check is made where the head
+    /// typo cannot make a ref (ADR 0036). The check is made where the head
     /// is read for the compare-and-swap, so a ref deleted meanwhile is not
     /// silently recreated.
     pub async fn land_with(

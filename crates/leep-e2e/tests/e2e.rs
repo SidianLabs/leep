@@ -1027,7 +1027,7 @@ fn review_owners_and_auto_approval_gate_landing_on_a_protected_ref() {
         "// the entry point\nfn a() { 2 } // trailing\n",
     );
     bob.ok(&wc_b, &["commit", "-m", "more code"]);
-    // A ref that does not exist yet needs --create (ADR 0035).
+    // A ref that does not exist yet needs --create (ADR 0036).
     let out = bob.run(&wc_b, &["land", "--ref", "release"]);
     assert_eq!(out.status.code(), Some(4), "{}", stderr(&out));
     assert!(stderr(&out).contains("--create"), "{}", stderr(&out));

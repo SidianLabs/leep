@@ -165,7 +165,7 @@ pub trait MetaStore: Send + Sync + 'static {
     ) -> Result<Vec<ChangesetId>>;
 
     /// Up to `limit` changeset ids that start with `prefix`, in ascending
-    /// byte order: how a short id is resolved (ADR 0034). Asking for two
+    /// byte order: how a short id is resolved (ADR 0035). Asking for two
     /// tells a unique prefix from an ambiguous one.
     ///
     /// The default reads one page of [`list_changesets`](Self::list_changesets)

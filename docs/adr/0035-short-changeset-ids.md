@@ -1,4 +1,4 @@
-# 0034. Short changeset ids
+# 0035. Short changeset ids
 Status: Accepted
 Date: 2026-10-17
 
@@ -43,7 +43,7 @@ itself; the server has to.
   `/v1/resolve-prefix`. A ref therefore always wins over a short id that spells
   the same (a branch named `cafe`). An ambiguous prefix is exit 1 with the
   `ambiguous` code, the candidates on stderr and in the `--json` error's
-  `candidates` (ADR 0033). An unknown one is the usual not-found (exit 4) with
+  `candidates` (ADR 0034). An unknown one is the usual not-found (exit 4) with
   a hint. Against a server without the endpoint a short id stays a 404.
 - **Printing.** `leep log` headers print the 12-digit short id, which is what
   the other commands already printed; `--json` keeps full ids everywhere, and

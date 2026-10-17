@@ -93,7 +93,7 @@ Examples:
   leep review reject 2a954d8ef7c7 -m \"breaks the parser\"";
 /// Shown under the top-level help; the full contract is docs/CLI.md.
 pub const EXIT_CODES: &str = "\
-Exit codes (ADR 0033):
+Exit codes (ADR 0034):
   0  success
   1  generic failure (bad input, refused operation, authentication);
      also \"no\" from `search` and `review status`

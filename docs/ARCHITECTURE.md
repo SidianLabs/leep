@@ -348,7 +348,7 @@ rebased copy that `Repo::rebase` recorded (`rebased-origin-v1`), not for the
 forgeable `leep.rebased_from` extra, among the head's ancestors above `cs`'s
 generation, and gives up after 1024 changesets (ADR 0021).
 A land onto a ref that does not exist creates it, unless the request says
-`create: false` ([ADR 0035](adr/0035-explicit-ref-creation-on-land.md)), which
+`create: false` ([ADR 0036](adr/0036-explicit-ref-creation-on-land.md)), which
 `leep land` does unless given `--create` (or landing the first changeset onto
 `main` of an empty repository); then the step that finds no head answers 404
 and the ref stays absent. The check uses the head the batch read for its CAS.
@@ -444,7 +444,7 @@ missing blobs through its local content-addressed cache and writes them. Only
 requested prefixes are materialized; other files are fetched on demand with
 `leep cat`.
 
-**CLI contract** ([ADR 0033](adr/0033-cli-exit-codes-and-json-errors.md)).
+**CLI contract** ([ADR 0034](adr/0034-cli-exit-codes-and-json-errors.md)).
 Every CLI failure is a `CliError` with a kind, and the kind alone decides the
 exit code: 1 generic, 2 usage, 3 server or network (retry may work), 4 not
 found, 5 conflict, 6 nothing to do (`commit`, `amend`, `stash push` only).
@@ -454,7 +454,7 @@ HTTP statuses map to kinds in one place, the client's `error_from`. With
 `docs/CLI.md` is the user-facing list. Colour and paging (`term.rs`) apply
 only to human output on a terminal; JSON and piped output stay plain.
 
-**Short ids** ([ADR 0034](adr/0034-short-changeset-ids.md)). A revision
+**Short ids** ([ADR 0035](adr/0035-short-changeset-ids.md)). A revision
 argument is `@`, a full id, a ref or tag name, or 4 to 64 hex digits of a
 changeset id. The CLI asks `/v1/resolve/{rev}` first, so a ref always wins,
 then `GET /v1/resolve-prefix/{prefix}`, which `Repo::resolve_prefix` answers

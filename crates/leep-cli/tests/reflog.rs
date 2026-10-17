@@ -71,7 +71,7 @@ fn msg(e: leep_cli::error::CliError) -> String {
     e.to_string()
 }
 
-/// The message of an error with the given exit code (ADR 0033).
+/// The message of an error with the given exit code (ADR 0034).
 #[track_caller]
 fn exits(code: i32, e: leep_cli::error::CliError) -> String {
     assert_eq!(e.exit_code(), code, "{e}");

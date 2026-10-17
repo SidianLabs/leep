@@ -101,7 +101,7 @@ pub struct Remote<'a> {
 
 impl Remote<'_> {
     /// `@` = working copy base; 64-hex = id; otherwise a ref or tag name,
-    /// then a short id of 4 or more hex digits (ADR 0034). A ref wins over a
+    /// then a short id of 4 or more hex digits (ADR 0035). A ref wins over a
     /// short id that spells the same.
     pub fn resolve(&self, rev: &str) -> Result<ChangesetId> {
         if rev == "@" {

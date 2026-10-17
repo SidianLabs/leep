@@ -1,9 +1,9 @@
 //! CLI error type. Every error has a kind, and the kind alone decides the
-//! process exit code and the stable `code` of `--json` errors (ADR 0033).
+//! process exit code and the stable `code` of `--json` errors (ADR 0034).
 
 use std::fmt;
 
-/// Documented process exit codes (ADR 0033). Commands that finish but report
+/// Documented process exit codes (ADR 0034). Commands that finish but report
 /// an outcome (a land conflict, an unapproved review) return these too.
 pub mod exit {
     pub const OK: i32 = 0;
@@ -205,7 +205,7 @@ impl CliError {
 
     /// Print `leep: message` plus any candidates and hint on stderr, and
     /// with `json` also the [`to_json`](Self::to_json) document on stdout,
-    /// where agents read results (ADR 0033).
+    /// where agents read results (ADR 0034).
     pub fn report(&self, json: bool) {
         if json {
             println!("{}", self.to_json());

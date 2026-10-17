@@ -110,7 +110,7 @@ pub fn run(ctx: &mut Ctx, args: &LandArgs) -> Result<i32> {
 }
 
 /// Land, creating the ref only if asked to or if this is the first land onto
-/// `main` of an empty repository (ADR 0035). Returns whether the ref was
+/// `main` of an empty repository (ADR 0036). Returns whether the ref was
 /// created.
 fn land_creating(
     ctx: &Ctx,

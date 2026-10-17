@@ -1,5 +1,5 @@
 //! Short changeset ids: a hex prefix of a full id, resolved by a range scan
-//! over the ids' bytes (ADR 0034).
+//! over the ids' bytes (ADR 0035).
 
 use std::fmt;
 

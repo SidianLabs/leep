@@ -663,7 +663,7 @@ impl Repo {
 
     /// The changesets whose id starts with `prefix` (4 to 64 hex digits):
     /// one, or up to [`MAX_PREFIX_CANDIDATES`] when it is ambiguous. No match
-    /// is `NotFound`; a malformed prefix is `Invalid` (ADR 0034).
+    /// is `NotFound`; a malformed prefix is `Invalid` (ADR 0035).
     pub async fn resolve_prefix(&self, prefix: &str) -> Result<PrefixMatch> {
         let p = IdPrefix::parse(prefix)?;
         let mut found = self

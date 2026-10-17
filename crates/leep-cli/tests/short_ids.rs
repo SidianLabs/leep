@@ -1,4 +1,4 @@
-//! Short changeset ids (ADR 0034): accepted wherever a revision is, printed
+//! Short changeset ids (ADR 0035): accepted wherever a revision is, printed
 //! by `log`, resolved by the server's prefix lookup.
 
 mod common;

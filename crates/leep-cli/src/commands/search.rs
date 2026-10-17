@@ -70,7 +70,7 @@ pub fn run(r: &Remote, args: &SearchArgs) -> Result<i32> {
             resp.matches.len()
         );
     }
-    // A predicate like grep: "no match" is exit 1, not an error (ADR 0033).
+    // A predicate like grep: "no match" is exit 1, not an error (ADR 0034).
     Ok(if resp.matches.is_empty() {
         exit::USER
     } else {

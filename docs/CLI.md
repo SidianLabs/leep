@@ -48,7 +48,7 @@ Wherever a command takes a revision (`REV`, `FROM TO`, `--rev`, `--source`):
   branch has that name);
 - a changeset id, full (64 hex digits) or short: 4 or more leading digits, in
   any case, as long as only one changeset starts with them
-  ([ADR 0034](adr/0034-short-changeset-ids.md)). `leep log` and the other
+  ([ADR 0035](adr/0035-short-changeset-ids.md)). `leep log` and the other
   commands print 12-digit ids, which work as they are.
 
 A ref wins over a short id that spells the same. An ambiguous short id fails
@@ -59,7 +59,7 @@ with exit 1 and lists the candidates (`--json`: `code: "ambiguous"` and
 
 `leep land` moves the working copy's target ref, or the ref given with
 `--ref`. A ref that does not exist is not created unless you pass `--create`
-([ADR 0035](adr/0035-explicit-ref-creation-on-land.md)), so a typo such as
+([ADR 0036](adr/0036-explicit-ref-creation-on-land.md)), so a typo such as
 `--ref mian` fails with exit 4 instead of making a branch. The one exception
 is the first land onto `main` of an empty repository. When a land creates a
 ref, `leep` prints `created ref NAME` on stderr.
@@ -85,7 +85,7 @@ files written by older clients with `<<<<<<< ours` still block `commit` and
 
 ## Exit codes
 
-Decided in [ADR 0033](adr/0033-cli-exit-codes-and-json-errors.md).
+Decided in [ADR 0034](adr/0034-cli-exit-codes-and-json-errors.md).
 
 | Code | Meaning |
 |---|---|

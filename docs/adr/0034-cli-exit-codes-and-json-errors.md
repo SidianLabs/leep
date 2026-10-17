@@ -1,4 +1,4 @@
-# 0033. CLI exit codes and JSON errors
+# 0034. CLI exit codes and JSON errors
 Status: Accepted
 Date: 2026-10-17
 
@@ -88,7 +88,7 @@ prints one line on stdout:
   kinds may be added, existing ones are never renamed. `message` is the
   human text, `hint` a suggested next step or null, `retryable` whether
   running the same command again can succeed. An ambiguous short id adds
-  `candidates` (ADR 0034). Fields may be added, never removed.
+  `candidates` (ADR 0035). Fields may be added, never removed.
 - **stdout, deliberately.** Agents parse stdout, so with `--json` stdout
   always holds exactly one JSON document per run: the result or the error.
   `out=$(leep --json show X)` is always parseable, and the exit code says

@@ -81,7 +81,7 @@ fn commit_uploads_only_missing_blobs() {
     }
     assert!(status(&ctx.wc).unwrap().is_clean());
 
-    // Nothing to commit has its own exit code (ADR 0033).
+    // Nothing to commit has its own exit code (ADR 0034).
     let e = commit::run(&mut ctx, &commit_args("noop")).unwrap_err();
     assert_eq!(e.exit_code(), 6);
 
@@ -971,7 +971,7 @@ fn msg(e: leep_cli::error::CliError) -> String {
     e.to_string()
 }
 
-/// The message of a not-found error (exit 4, ADR 0033).
+/// The message of a not-found error (exit 4, ADR 0034).
 fn missing(e: leep_cli::error::CliError) -> String {
     assert_eq!(e.exit_code(), 4, "{e}");
     e.to_string()

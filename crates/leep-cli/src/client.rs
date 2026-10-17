@@ -1,7 +1,7 @@
 //! Blocking HTTP client wrapping every endpoint in `leep_core::api`.
 //!
 //! Every failed request becomes a [`CliError`] whose kind follows the HTTP
-//! status (ADR 0033): no connection is `Unreachable`, 5xx `Server`, 408
+//! status (ADR 0034): no connection is `Unreachable`, 5xx `Server`, 408
 //! `Timeout`, 429 `RateLimited`, 404 `NotFound`, 409 `Conflict` (retryable),
 //! 401 and 403 `Auth`, any other 4xx `User`. `ErrorResponse` bodies become the
 //! error message. 401 and 403 get fixed, token-free messages instead.
@@ -341,7 +341,7 @@ impl Client {
     }
 
     /// The one changeset whose id starts with `prefix`. Several matches are
-    /// an `Ambiguous` error carrying the candidates (ADR 0034).
+    /// an `Ambiguous` error carrying the candidates (ADR 0035).
     pub fn resolve_prefix(&self, prefix: &str) -> Result<ChangesetId> {
         let r: ResolvePrefixResponse = self.json(
             self.http

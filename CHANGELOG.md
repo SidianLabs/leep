@@ -118,7 +118,7 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   waiting for its commit.
 
 ### CLI for agents
-- Documented exit codes (ADR 0033, `docs/CLI.md`): 1 generic failure, 2 usage,
+- Documented exit codes (ADR 0034, `docs/CLI.md`): 1 generic failure, 2 usage,
   3 server or network failure (was 2), 4 not found (was 1), 5 conflict (a
   land, sync, merge, cherry-pick, revert or stash apply with conflicts, a
   refusal while conflicts wait, or a lost race; was 1), 6 nothing to do
@@ -129,7 +129,7 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   "retryable"}}` on stdout (the text still goes to stderr), with a stable
   `code` such as `not_found`, `conflict`, `server` or `usage`. Usage errors
   follow it when `--json` is anywhere on the command line.
-- Short changeset ids (ADR 0034): every command that takes a revision accepts
+- Short changeset ids (ADR 0035): every command that takes a revision accepts
   4 or more leading hex digits of a changeset id, such as the 12-digit ids the
   CLI prints; an ambiguous one lists the candidates. `leep log` headers now
   print 12-digit ids (`--json` keeps full ids). New `GET
@@ -137,7 +137,7 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   default built on `list_changesets` and range-scan overrides for SQLite and
   Postgres.
 - `leep land` no longer creates a ref that does not exist unless given
-  `--create` (ADR 0035): `leep land --ref typo` fails with exit 4 and a hint.
+  `--create` (ADR 0036): `leep land --ref typo` fails with exit 4 and a hint.
   The first land onto `main` of an empty repository still works without it,
   and a land that creates a ref prints `created ref NAME`. `POST /v1/land`
   takes an optional `create`; without it the server creates the ref as

@@ -17,7 +17,7 @@
 //! | GET  | `/v1/reflog?before=seq&limit=n` | – | [`RefLogResponse`] (every ref move, newest first; `limit` defaults to 50, capped at 1000; `before` returns entries with a smaller `seq`) |
 //! | GET  | `/v1/reflog/{name}?before=seq&limit=n` | – | [`RefLogResponse`] (the moves of one ref; an unknown or never-moved ref is an empty list) |
 //! | GET  | `/v1/resolve/{rev}` | – | [`ResolveResponse`] (`rev` = ref name, full 64-hex id or short tag name) |
-//! | GET  | `/v1/resolve-prefix/{prefix}` | – | [`ResolvePrefixResponse`] (the one changeset whose id starts with `prefix`, 4 to 64 hex digits in any case; 404 if none; 400 [`AmbiguousPrefixResponse`] listing up to 10 `candidates` if several; 400 if the prefix is shorter than 4 digits, longer than 64 or not hex; ADR 0034) |
+//! | GET  | `/v1/resolve-prefix/{prefix}` | – | [`ResolvePrefixResponse`] (the one changeset whose id starts with `prefix`, 4 to 64 hex digits in any case; 404 if none; 400 [`AmbiguousPrefixResponse`] listing up to 10 `candidates` if several; 400 if the prefix is shorter than 4 digits, longer than 64 or not hex; ADR 0035) |
 //! | GET  | `/v1/tree/{id}?path=dir` | – | [`TreeResponse`] (one directory level) |
 //! | GET  | `/v1/files/{id}?prefix=dir` | – | [`FilesResponse`] (recursive listing) |
 //! | GET  | `/v1/file/{id}?path=p` | – | raw bytes + `x-leep-kind` header, or 404 |
@@ -35,7 +35,7 @@
 //! | GET  | `/v1/changesets/{id}/review-status?ref=main` | – | [`ReviewStatusResponse`] (`ref` defaults to `main`) |
 //! | POST | `/v1/merge` | [`MergeRequest`] | [`MergeResponse`] |
 //! | POST | `/v1/rebase` | [`RebaseRequest`] | [`RebaseResponse`] |
-//! | POST | `/v1/land` | [`LandRequest`] | [`LandResponse`] (`create: false` refuses to create a missing `target_ref` with 404; absent creates it, as before; ADR 0035) |
+//! | POST | `/v1/land` | [`LandRequest`] | [`LandResponse`] (`create: false` refuses to create a missing `target_ref` with 404; absent creates it, as before; ADR 0036) |
 //!
 //! Ref names may contain `/` (e.g. `release/1.0`); `{name}` and `{rev}` match
 //! the rest of the path. Every ref write (`POST /v1/refs/{name}` and the
@@ -557,7 +557,7 @@ pub struct LandRequest {
     /// May the land create `target_ref` if it does not exist? Absent keeps
     /// the original behaviour for old clients: it creates. `false` makes a
     /// land onto a missing ref a 404 whose message carries
-    /// [`crate::refname::MISSING_REF_MARKER`] (ADR 0035).
+    /// [`crate::refname::MISSING_REF_MARKER`] (ADR 0036).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub create: Option<bool>,
 }

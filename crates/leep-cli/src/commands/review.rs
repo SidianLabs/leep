@@ -92,7 +92,7 @@ pub fn status(r: &Remote, args: &StatusArgs) -> Result<i32> {
             println!("{line}");
         }
     }
-    // A predicate: "not approved" is exit 1, not an error (ADR 0033).
+    // A predicate: "not approved" is exit 1, not an error (ADR 0034).
     Ok(if resp.approved { exit::OK } else { exit::USER })
 }
 

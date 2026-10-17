@@ -502,7 +502,7 @@ the same moves made one swap at a time. No `/v1` shape changed.
 
 ## Short changeset ids (new endpoint and `MetaStore` method, no format change)
 
-ADR 0034 adds `GET /v1/resolve-prefix/{prefix}` with two response types:
+ADR 0035 adds `GET /v1/resolve-prefix/{prefix}` with two response types:
 `ResolvePrefixResponse` `{"id"}` (200, one match) and
 `AmbiguousPrefixResponse` `{"error", "candidates", "truncated"}` (400, several
 matches, at most 10 candidates in ascending order; a superset of
@@ -513,7 +513,7 @@ AND id <= ? ORDER BY id LIMIT ?`, the bounds being the prefix padded with
 `0x00` and `0xff` bytes (`leep_core::prefix::IdPrefix`). No encoding, hash,
 index or table changed, and no existing `/v1` shape changed.
 
-## Explicit ref creation on land (additive API field, ADR 0035)
+## Explicit ref creation on land (additive API field, ADR 0036)
 
 `LandRequest` gains the optional `create` (`true`, `false` or absent; omitted
 when unset). Absent means what it always meant: a missing `target_ref` is
