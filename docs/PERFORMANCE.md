@@ -512,17 +512,24 @@ The whole of git/git again, on the same VPS, after ADRs 0027 (chunked nodes),
 0028 (warming) and 0030 (batched log). All path-history and search rows were
 deleted and a server started with `--warm-interval 30s`; nobody sent a query.
 
-| Path-history index, all 82,500 commits | Before (v1, derived by the first query) | v2, derived by the warmer |
-|---|---|---|
-| Time to build | 69 min, inside one request | 41 min, in the background |
-| Node rows | 174,978 | 410,685 |
-| Node bytes | 6.1 GB | 796 MB |
-| Whole database | 3.7 GB | 1.0 GB (238 MB of it changesets and mappings) |
+| Path-history index, all 82,500 commits | v1, derived by the first query | v2, derived by the warmer | v3 (ADR 0037), derived by the warmer |
+|---|---|---|---|
+| Time to build | 69 min, inside one request | 41 min, in the background | 44 min, in the background (beside a Linux repack) |
+| Node rows | 174,978 | 410,685 | 411,290 |
+| Node bytes | 6.1 GB | 796 MB | **157 MB** |
+| Whole database | 3.7 GB | 1.0 GB | **483 MB** (`derived` 389 MB) |
 
-ADR 0037's patched rows (`history-node-v3`) are not yet measured on the full
-history. They store 3.5x fewer node bytes than v2 on the 3,795-commit slice,
-whose rows are smaller (1.1 KB on average against 1.9 KB here); the same
-factor would bring the 796 MB to about 230 MB.
+ADR 0037's patched rows store 5.1x fewer node bytes than v2 on the full
+history, more than the 3.5x of the 3,795-commit slice because the full
+history's rows are larger. The database figure is after `repair drop --kind
+history-tree-v2` and `VACUUM FULL derived`; of what remains, 157 MB is the
+path-history index, 44 MB skiplists, and the rest changesets, mappings and
+table overhead.
+Queries on v3 (fresh server, repeat; a Linux import was running beside them):
+`last-change Makefile` 4.4 ms, `last-change COPYING` 7.4 ms, a path that
+never existed 2.7 ms, `log path=Makefile` 50 entries 91 ms, `blame Makefile`
+0.36 s, merge-base 5-8 ms: the same as v2 within the noise of the shared
+machine.
 
 Queries against a freshly started server on that database (`main` at
 generation 26,484), first request and the repeat. A Linux kernel import ran
@@ -582,7 +589,7 @@ not measured.
 
 | Storage and import | Leep | git | jj | Sapling | Fossil | Mercurial |
 |---|---|---|---|---|---|---|
-| On disk | 1.0 GB database + 190 MB packed blobs (8.9 GB loose) | 328 MB | 444 MB | 386 MB | 512 MB | 404 MB |
+| On disk | 483 MB database + 225 MB packed blobs (was 1.0 GB + 8.9 GB loose) | 328 MB | 444 MB | 386 MB | 512 MB | 404 MB |
 | Import from git | 47 min (before the pipelined importer, #50) | — | 43 s | 43 s | 72 min | 84 min |
 
 What this shows:
@@ -599,11 +606,11 @@ What this shows:
   commit from a memory-mapped pack. Short `log`s pay a round trip and JSON
   encoding that a local command does not.
 - **Storage was the largest gap.** Loose, uncompressed blobs made Leep 27x
-  larger than git. After `repack` (ADR 0029, "Packed blobs" below) the blobs
-  of all of git/git take 190 MB against git's 328 MB for the whole repository;
-  what remains is the 1.0 GB database, most of it the path-history index
-  (measured with v2 rows; ADR 0037 stores the index 3.5x smaller on the
-  3,795-commit slice, not yet re-measured on the full history).
+  larger than git. With packed blobs (ADR 0029, "Packed blobs" below) and
+  patched path-history rows (ADR 0037), all of git/git takes 708 MB (483 MB
+  database, 225 MB blobs on disk) against git's 328 MB, down from about
+  10 GB. That 2.2x buys the per-path index, skiplists and mappings git does
+  not keep.
 - **Not compared:** Scion. There was no build to run on this machine, and
   published figures from other hardware and other histories are not
   comparable with these.
@@ -830,6 +837,27 @@ it does not affect; first request / repeat):
 Repeat requests are unchanged; first requests that read many tree nodes or
 file contents (listings, diffs, path logs, search) pay for decoding delta
 chains until the decoded-object cache holds them.
+
+### Linux, first 669,466 commits
+
+The Linux kernel import was stopped at commit 669,466 (45% of 1,484,762) by
+an importer bug (fixed in #66) and with 73 GB of loose blobs on a disk with
+55 GB free. `leep-server repack --json` on that store, release image, same
+VPS, default level 9 and fence:
+
+| | |
+|---|---|
+| Loose objects before | 4,653,029; 66.0 GB logical, 73 GB on disk |
+| Pack | 1.24 GB (1,244,502,985 bytes) |
+| Index | 447 MB (446,690,872 bytes) |
+| Blob directory after | 2.1 GB on disk, no loose objects left |
+| Stored as deltas / whole | 4,417,908 / 235,121 |
+| Time | 2 h 55 min: 49 min walking history, 1 h 45 min writing, 10 min fence, 10 min cleanup |
+
+That is 35x smaller on disk, with no corrupt objects. Memory peaked at about
+5 GB of the machine's 11 GB. The index is 26% of pack plus index, so the 96-byte record (a
+32-byte base hash per object) is the next thing to shrink for histories of
+this size. The import then resumed from the packed store.
 
 ## Garbage collection
 
