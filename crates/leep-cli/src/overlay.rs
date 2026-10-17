@@ -468,7 +468,7 @@ pub fn rebase_stack(
     match move_stack(ctx, base, head)? {
         Moved::Contained => Ok(None),
         Moved::Moved { tip, count } => Ok(Some((tip, count))),
-        Moved::Conflict { commit, conflicts } => Err(CliError::user(format!(
+        Moved::Conflict { commit, conflicts } => Err(CliError::conflict(format!(
             "local commit {} conflicts with the target ref in {} file{}; \
              nothing changed. Run `leep land` to bring it up to date and \
              resolve the conflicts",

@@ -15,11 +15,25 @@ use crate::state::{resolve_token, WorkCopy};
 
 const DEFAULT_SERVER: &str = "http://127.0.0.1:8080";
 
+/// Shown under the top-level help; the full contract is docs/CLI.md.
+const EXIT_CODES_HELP: &str = "\
+Exit codes (ADR 0033):
+  0  success
+  1  generic failure (bad input, refused operation, authentication);
+     also \"no\" from `search` and `review status`
+  2  usage: the command line does not parse
+  3  server or network failure; running the command again may work
+  4  not found (revision, ref, branch, tag, file, stash)
+  5  conflict: resolve the conflicts, or retry a lost race
+  6  nothing to do (`commit`, `amend`, `stash push` with nothing to record)
+  130 interrupted";
+
 #[derive(Parser, Debug)]
 #[command(
     name = "leep",
     version,
-    about = "Client for the Leep version control server"
+    about = "Client for the Leep version control server",
+    after_help = EXIT_CODES_HELP
 )]
 pub struct Cli {
     /// Server URL (overrides the working copy config).
@@ -109,7 +123,7 @@ pub fn main() -> ExitCode {
     match run(cli) {
         Ok(code) => ExitCode::from(code as u8),
         Err(e) => {
-            eprintln!("leep: {e}");
+            e.report();
             ExitCode::from(e.exit_code() as u8)
         }
     }

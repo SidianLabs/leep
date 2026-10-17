@@ -117,6 +117,15 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 - `leep commit -m` may be left out while a merge, cherry-pick or revert is
   waiting for its commit.
 
+### CLI for agents
+- Documented exit codes (ADR 0033, `docs/CLI.md`): 1 generic failure, 2 usage,
+  3 server or network failure (was 2), 4 not found (was 1), 5 conflict (a
+  land, sync, merge, cherry-pick, revert or stash apply with conflicts, a
+  refusal while conflicts wait, or a lost race; was 1), 6 nothing to do
+  (`commit`, `amend` and `stash push` with nothing to record; was 1). Scripts
+  that tested for exactly 1 or 2 need updating. An error may add a
+  `hint: ...` line, for example where the server URL came from.
+
 ### Hardening
 - Fuzz targets for every decoder and parser: persisted objects, derived
   rows, API bodies, the router, `OWNERS` and the server's config files, the

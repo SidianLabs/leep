@@ -66,7 +66,8 @@ impl Cache {
         if Hash::of_blob(data) != *h {
             return Err(CliError::server(format!(
                 "blob content does not match hash {h}; refusing to cache"
-            )));
+            ))
+            .retryable(false));
         }
         let path = self.path(h);
         if path.exists() {

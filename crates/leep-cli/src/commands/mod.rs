@@ -44,7 +44,7 @@ impl Ctx {
     pub fn refuse_in_progress(&self) -> Result<()> {
         let state = &self.wc.state;
         if let Some(m) = &state.merge_in_progress {
-            return Err(CliError::user(format!(
+            return Err(CliError::conflict(format!(
                 "a merge of {} is in progress; resolve the conflicts and `leep commit`, \
                  or `leep merge --abort`",
                 crate::fmt::short(m.other)
@@ -56,7 +56,7 @@ impl Ctx {
             } else {
                 ("cherry-pick", "leep cherry-pick --abort")
             };
-            return Err(CliError::user(format!(
+            return Err(CliError::conflict(format!(
                 "a {what} of {} is in progress; resolve the conflicts and `leep commit`, \
                  or `{abort}`",
                 crate::fmt::short(p.from)

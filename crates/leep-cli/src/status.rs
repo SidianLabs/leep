@@ -71,7 +71,7 @@ impl Status {
         if paths.is_empty() {
             return Ok(());
         }
-        Err(crate::error::CliError::user(format!(
+        Err(crate::error::CliError::conflict(format!(
             "unresolved conflicts in {}; fix the markers, or `leep resolve PATH` once \
              you have chosen (`leep restore PATH` takes the base version); see `leep status`",
             paths.join(", ")

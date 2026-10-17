@@ -435,6 +435,13 @@ missing blobs through its local content-addressed cache and writes them. Only
 requested prefixes are materialized; other files are fetched on demand with
 `leep cat`.
 
+**CLI contract** ([ADR 0033](adr/0033-cli-exit-codes-and-json-errors.md)).
+Every CLI failure is a `CliError` with a kind, and the kind alone decides the
+exit code: 1 generic, 2 usage, 3 server or network (retry may work), 4 not
+found, 5 conflict, 6 nothing to do (`commit`, `amend`, `stash push` only).
+HTTP statuses map to kinds in one place, the client's `error_from`.
+`docs/CLI.md` is the user-facing list.
+
 **Merge**: three-way, per path, with base = `merge_base(ours, theirs)`.
 Identical changes on both sides merge trivially. Text files merge by line
 (`diffy`). Binary files and delete-vs-modify cases are returned as conflicts.

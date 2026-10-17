@@ -8,7 +8,7 @@ use clap::{Args, Subcommand};
 
 use super::restore::discard;
 use super::{print_json, Ctx};
-use crate::error::{CliError, Result};
+use crate::error::{exit, CliError, Result};
 use crate::fmt::{plural, short};
 use crate::overlay;
 use crate::snapshot;
@@ -78,7 +78,7 @@ pub fn run(ctx: &mut Ctx, args: &StashArgs) -> Result<i32> {
 fn nth(ctx: &Ctx, index: usize) -> Result<Stash> {
     ctx.wc.state.stashes.get(index).cloned().ok_or_else(|| {
         let n = ctx.wc.state.stashes.len();
-        CliError::user(if n == 0 {
+        CliError::not_found(if n == 0 {
             "no stashes".to_string()
         } else {
             format!(
@@ -95,7 +95,7 @@ fn push(ctx: &mut Ctx, args: &PushArgs) -> Result<i32> {
     let st = status(&ctx.wc)?;
     st.refuse_conflicts()?;
     if st.is_clean() {
-        return Err(CliError::user("no local changes to stash"));
+        return Err(CliError::nothing_to_do("no local changes to stash"));
     }
     let Some(base) = ctx.wc.state.base else {
         return Err(CliError::user(
@@ -213,6 +213,7 @@ fn apply(ctx: &mut Ctx, target: Option<&str>, pop: bool) -> Result<i32> {
     let plan = overlay::plan(ctx, id, base)?;
     let stats = overlay::apply(ctx, &plan)?;
     let conflicted = !plan.conflicts.is_empty() || !plan.unmerged.is_empty();
+    let code = if conflicted { exit::CONFLICT } else { exit::OK };
     let drop_it = pop && !conflicted;
     if drop_it {
         if let Some(i) = index {
@@ -225,7 +226,7 @@ fn apply(ctx: &mut Ctx, target: Option<&str>, pop: bool) -> Result<i32> {
             "stash": id, "written": stats.written, "removed": stats.removed,
             "conflicts": plan.conflicts, "unmerged": plan.unmerged, "dropped": drop_it,
         }))?;
-        return Ok(i32::from(conflicted));
+        return Ok(code);
     }
     println!(
         "Applied {} on {} ({} written, {} removed)",
@@ -250,7 +251,7 @@ fn apply(ctx: &mut Ctx, target: Option<&str>, pop: bool) -> Result<i32> {
     } else if drop_it {
         println!("Dropped stash {}", index.unwrap_or(0));
     }
-    Ok(i32::from(conflicted))
+    Ok(code)
 }
 
 fn drop_one(ctx: &mut Ctx, index: usize) -> Result<i32> {

@@ -161,7 +161,7 @@ only its metrics listener died while the API still serves. Replace
 `job="leep"` in the rule with your scrape job's name.
 
 **Impact.** If the process is down, requests to that instance fail (the CLI
-reports a network error and exits 2) and the other instances behind the
+reports a network error and exits 3) and the other instances behind the
 balancer carry the load. With one instance it is a full outage. Nothing is
 corrupted: servers keep no durable state of their own.
 
@@ -305,7 +305,7 @@ and neither those nor 408 and 429 count here. `GET /v1/health` and
 failing `/v1/ready` (503) counts as a 5xx.
 
 **Impact.** Agents see failed commits, lands and reads; the CLI prints the
-server's message and exits 2. Writes are idempotent, so retrying is safe, but
+server's message and exits 3. Writes are idempotent, so retrying is safe, but
 retries will keep failing until the cause is fixed.
 
 **Diagnose.**
@@ -370,7 +370,7 @@ a lost race, including refused lands (400: unsigned or unreviewed changeset, tag
 ref, bad ref name) and unknown changesets (404), which are the caller's
 doing and would page on every policy refusal.
 
-**Impact.** The agent's land fails (CLI exit 2). `land` already retries a failed
+**Impact.** The agent's land fails (CLI exit 3). `land` already retries a failed
 commit from a fresh read up to three times in a row before it gives up, and the
 commit that failed may or may not have applied.
 
@@ -422,7 +422,7 @@ race 32 times; retry`. The rule also catches the first event of a series that
 did not exist before (a counter that first appears at 1 has no earlier sample,
 so `increase()` alone would report 0).
 
-**Impact.** The agent's land fails with a 409 (CLI exit 1) and must be repeated;
+**Impact.** The agent's land fails with a 409 (CLI exit 5) and must be repeated;
 nothing is half done. Retrying is safe.
 
 **Diagnose.**
@@ -560,7 +560,7 @@ kind, lands per second, and the [standard bundle](#collecting-a-bug-report).
 writes nothing further, but a statement already sent to Postgres can still commit
 shortly afterwards (ADR 0012).
 
-**Impact.** Those requests fail (CLI exit 2). Repeating is safe, but if the cause
+**Impact.** Those requests fail (CLI exit 3). Repeating is safe, but if the cause
 is structural (an upload that can never finish in time) it fails again.
 
 **Diagnose.**

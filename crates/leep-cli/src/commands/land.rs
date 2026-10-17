@@ -10,7 +10,7 @@ use leep_core::signature::NOT_SIGNED_MARKER;
 use leep_core::{ChangesetId, FileChange, FileKind, RepoPath};
 
 use super::{print_json, Ctx};
-use crate::error::{CliError, Result};
+use crate::error::{exit, CliError, ErrorKind, Result};
 use crate::fmt::short;
 use crate::materialize::{materialize, write_file};
 use crate::status::status;
@@ -100,24 +100,29 @@ pub fn run(ctx: &mut Ctx, args: &LandArgs) -> Result<i32> {
                     short(onto)
                 );
             }
-            Ok(1)
+            Ok(exit::CONFLICT)
         }
     }
 }
 
 /// The server names the changeset a policy refused; add what to do about it.
 fn hint_policy(e: CliError, target_ref: &str) -> CliError {
-    match e {
-        CliError::User(m) if m.contains(NEEDS_REVIEW_MARKER) => CliError::User(format!(
+    if e.kind() != ErrorKind::User {
+        return e;
+    }
+    if e.message().contains(NEEDS_REVIEW_MARKER) {
+        return e.map_message(|m| format!(
             "{m}\n{target_ref} needs approval from the owners of the paths a changeset changes: \
              ask one to run `leep review approve <changeset>`; `leep review status <changeset> --ref {target_ref}` shows what is missing."
-        )),
-        CliError::User(m) if m.contains(NOT_SIGNED_MARKER) => CliError::User(format!(
+        ));
+    }
+    if e.message().contains(NOT_SIGNED_MARKER) {
+        return e.map_message(|m| format!(
             "{m}\n{target_ref} only accepts signed changesets: every changeset being landed needs a signature. \
              Commit with `leep commit --sign KEYFILE` (or set LEEP_SIGNING_KEY); create a key with `leep keygen`."
-        )),
-        e => e,
+        ));
     }
+    e
 }
 
 /// Move the working copy to `onto` and re-apply the local changes there:

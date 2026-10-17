@@ -229,7 +229,8 @@ pub fn check_repo_path(path: &str, windows: bool) -> Result<()> {
         if let Some(why) = bad {
             return Err(CliError::server(format!(
                 "refusing to write repository path {path:?}: component {c:?} {why}"
-            )));
+            ))
+            .retryable(false));
         }
     }
     Ok(())
@@ -324,7 +325,8 @@ impl WorkCopy {
                         "refusing to write {path}: {} is a symbolic link, so the file \
                          would land outside the working copy",
                         dir.strip_prefix(&self.root).unwrap_or(&dir).display()
-                    )));
+                    ))
+                    .retryable(false));
                 }
                 Ok(_) => {}
                 Err(_) => break,

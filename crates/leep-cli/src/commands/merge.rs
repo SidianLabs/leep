@@ -14,7 +14,7 @@ use leep_core::{ChangesetId, FileChange, RepoPath};
 
 use super::integrate::{abort, added_paths, load_key, print_conflicts, sign};
 use super::{print_json, Ctx};
-use crate::error::{CliError, Result};
+use crate::error::{exit, CliError, Result};
 use crate::fmt::short;
 use crate::overlay::{self, Keep, Pending};
 use crate::snapshot;
@@ -160,7 +160,7 @@ pub fn run(ctx: &mut Ctx, args: &MergeArgs) -> Result<i32> {
                      merge, or `leep merge --abort`."
                 );
             }
-            Ok(1)
+            Ok(exit::CONFLICT)
         }
     }
 }

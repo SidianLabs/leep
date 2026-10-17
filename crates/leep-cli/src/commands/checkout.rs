@@ -3,7 +3,7 @@
 use clap::Args;
 
 use super::{print_json, Ctx};
-use crate::error::{CliError, Result};
+use crate::error::{exit, CliError, Result};
 use crate::fmt::{plural, short};
 use crate::materialize::materialize;
 use crate::overlay::{self, rebase_stack};
@@ -61,7 +61,7 @@ pub fn sync(ctx: &mut Ctx, args: &SyncArgs) -> Result<i32> {
         .client
         .get_ref(&name)?
         .target
-        .ok_or_else(|| CliError::user(format!("ref {name} does not exist")))?;
+        .ok_or_else(|| CliError::not_found(format!("ref {name} does not exist")))?;
     let st = status(&ctx.wc)?;
     st.refuse_conflicts()?;
     let base = match ctx.wc.state.base {
@@ -101,10 +101,7 @@ pub fn sync(ctx: &mut Ctx, args: &SyncArgs) -> Result<i32> {
             "{e}\nnothing changed locally; your uncommitted changes are also saved on the \
              server as snapshot {snapshot} (`leep stash apply {snapshot}` re-applies them)"
         );
-        match e {
-            CliError::User(_) => CliError::user(note),
-            CliError::Server(_) => CliError::server(note),
-        }
+        e.map_message(|_| note)
     };
     let plan = overlay::plan(ctx, snapshot, new_base).map_err(kept_msg)?;
     let stats = overlay::apply(ctx, &plan).map_err(kept_msg)?;
@@ -135,7 +132,11 @@ fn finish(
     conflicts: &[String],
     unmerged: &[String],
 ) -> Result<i32> {
-    let code = i32::from(!conflicts.is_empty() || !unmerged.is_empty());
+    let code = if conflicts.is_empty() && unmerged.is_empty() {
+        exit::OK
+    } else {
+        exit::CONFLICT
+    };
     if ctx.json {
         print_json(&serde_json::json!({
             "base": new_base, "written": stats.written, "removed": stats.removed,
@@ -169,7 +170,7 @@ fn finish(
             short(new_base)
         );
     }
-    if code == 1 {
+    if code == exit::CONFLICT {
         println!(
             "Resolve the conflicts (`leep resolve PATH` when you have chosen, or \
              `leep restore PATH`), then `leep commit`."

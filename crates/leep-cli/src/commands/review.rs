@@ -6,7 +6,7 @@ use leep_core::api::{AddReviewRequest, ReviewStatusResponse, ReviewsResponse};
 use leep_core::review::Verdict;
 
 use super::{print_json, Remote};
-use crate::error::Result;
+use crate::error::{exit, Result};
 use crate::fmt::{plural, short, utc_time};
 
 #[derive(Subcommand, Debug)]
@@ -92,7 +92,8 @@ pub fn status(r: &Remote, args: &StatusArgs) -> Result<i32> {
             println!("{line}");
         }
     }
-    Ok(if resp.approved { 0 } else { 1 })
+    // A predicate: "not approved" is exit 1, not an error (ADR 0033).
+    Ok(if resp.approved { exit::OK } else { exit::USER })
 }
 
 pub fn list(r: &Remote, args: &ListArgs) -> Result<i32> {

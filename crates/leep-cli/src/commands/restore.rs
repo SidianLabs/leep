@@ -112,7 +112,9 @@ pub fn run(ctx: &mut Ctx, args: &RestoreArgs) -> Result<i32> {
                     let known =
                         ctx.wc.state.files.keys().any(|p| within(p, s)) || ctx.wc.abs(s).exists();
                     if !known {
-                        return Err(CliError::user(format!("{raw} does not match any file")));
+                        return Err(CliError::not_found(format!(
+                            "{raw} does not match any file"
+                        )));
                     }
                 }
             }

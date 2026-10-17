@@ -17,7 +17,7 @@ use leep_core::{Changeset, ChangesetId, FileChange};
 
 use super::integrate::{abort, added_paths, load_key, print_conflicts, sign};
 use super::{print_json, Ctx};
-use crate::error::{CliError, Result};
+use crate::error::{exit, CliError, Result};
 use crate::fmt::short;
 use crate::materialize::list_files;
 use crate::overlay::{self, contained_in, Keep, Pending};
@@ -281,7 +281,7 @@ fn finish(
                      the {verb}, or `leep {verb} --abort`."
                 );
             }
-            Ok(1)
+            Ok(exit::CONFLICT)
         }
     }
 }

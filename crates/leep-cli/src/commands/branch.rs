@@ -88,7 +88,7 @@ pub fn switch(ctx: &mut Ctx, args: &SwitchArgs) -> Result<i32> {
             )));
         }
         ctx.client.get_ref(name)?.target.ok_or_else(|| {
-            CliError::user(format!(
+            CliError::not_found(format!(
                 "branch {name} does not exist; create it with `leep switch -c {name}`"
             ))
         })?
@@ -140,7 +140,7 @@ pub fn tag(ctx: &Ctx, args: &TagArgs) -> Result<i32> {
             .client
             .get_ref(&full)?
             .target
-            .ok_or_else(|| CliError::user(format!("tag {short_name} does not exist")))?;
+            .ok_or_else(|| CliError::not_found(format!("tag {short_name} does not exist")))?;
         swap(ctx, &full, Some(head), None, || {
             format!("tag {short_name} changed while deleting it (409 conflict); run `leep tag` and retry")
         })?;
@@ -200,7 +200,7 @@ fn delete_branch(ctx: &Ctx, name: &str, force: bool) -> Result<i32> {
         .client
         .get_ref(name)?
         .target
-        .ok_or_else(|| CliError::user(format!("branch {name} does not exist")))?;
+        .ok_or_else(|| CliError::not_found(format!("branch {name} does not exist")))?;
     if !force {
         let merged = match ctx.client.get_ref(target)?.target {
             Some(t) => contained_in(ctx, head, t)?,
@@ -295,8 +295,11 @@ fn swap(
     )?;
     if resp.ok {
         Ok(())
-    } else {
+    } else if expected.is_none() {
+        // A create loses only to a ref that exists: a state, not a race.
         Err(CliError::user(lost()))
+    } else {
+        Err(CliError::lost_race(lost()))
     }
 }
 
