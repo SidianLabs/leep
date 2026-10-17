@@ -222,11 +222,7 @@ fn repack_beside_a_server_changes_no_answer() {
         &["repack"],
     );
     assert!(!out.status.success());
-    assert!(
-        stderr(&out).contains("is neither"),
-        "{}",
-        stderr(&out)
-    );
+    assert!(stderr(&out).contains("is neither"), "{}", stderr(&out));
     let out = server_cmd(&stores, &["repack", "--fence", "0"]);
     assert!(!out.status.success());
     assert!(
