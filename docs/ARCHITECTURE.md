@@ -451,7 +451,8 @@ found, 5 conflict, 6 nothing to do (`commit`, `amend`, `stash push` only).
 HTTP statuses map to kinds in one place, the client's `error_from`. With
 `--json` an error is also printed on stdout as
 `{"error":{"code","message","hint","retryable"}}`, `code` being the kind.
-`docs/CLI.md` is the user-facing list.
+`docs/CLI.md` is the user-facing list. Colour and paging (`term.rs`) apply
+only to human output on a terminal; JSON and piped output stay plain.
 
 **Short ids** ([ADR 0034](adr/0034-short-changeset-ids.md)). A revision
 argument is `@`, a full id, a ref or tag name, or 4 to 64 hex digits of a

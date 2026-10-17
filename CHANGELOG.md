@@ -151,6 +151,11 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   and `sync`, `yours` and `ID (merging)` after `merge`, and similarly for
   `cherry-pick`, `revert` and `stash apply`. Files with the old labels are
   still recognised; the `/v1` text and fields are unchanged.
+- Colour and a pager for human output: diffs, status letters and changeset
+  headers are coloured when stdout is a terminal, honouring `NO_COLOR`,
+  `CLICOLOR_FORCE`, `CLICOLOR` and `--color auto|always|never`; `log`, `diff`
+  and `show` page through `LEEP_PAGER`, `PAGER` or `less` on a terminal. Pipes
+  and `--json` stay plain and unpaged. No new dependency.
 
 ### Hardening
 - Fuzz targets for every decoder and parser: persisted objects, derived

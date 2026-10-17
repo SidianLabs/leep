@@ -24,6 +24,20 @@ Global options, accepted by every command and listed only in `leep --help`:
 | `--server URL` | Server URL; overrides `LEEP_SERVER`, which overrides `.leep/config.json`. |
 | `--token TOKEN` | Bearer token; overrides `LEEP_TOKEN` and `.leep/config.json`. Prefer `LEEP_TOKEN`: a flag is visible in process listings. |
 | `--json` | Print results as JSON (usually the raw `/v1` response), and errors as one JSON document (below). |
+| `--color WHEN` | `auto` (default), `always` or `never`; see "Colour and paging". |
+
+## Colour and paging
+
+Human output is coloured only when stdout is a terminal, unless the flag or
+the environment says otherwise: `--color always` or `never` wins; in `auto`,
+a non-empty `NO_COLOR` turns colour off, then `CLICOLOR_FORCE` (not `0`)
+forces it on, then `CLICOLOR=0` or `TERM=dumb` turn it off. `--json` output is
+never coloured. Diffs, status letters and changeset headers are coloured.
+
+On a terminal, `log`, `diff` and `show` page through `LEEP_PAGER`, else
+`PAGER`, else `less` (with `LESS=FRX` unless `LESS` is set, so a short output
+just prints). An empty `LEEP_PAGER`, or `cat`, turns paging off. Output to a
+pipe or a file, and `--json`, is never paged.
 
 ## Revisions
 
@@ -134,6 +148,8 @@ print their normal JSON result and exit 5 rather than an error.
   | `LEEP_AGENT_MODEL`, `LEEP_AGENT_SESSION`, `LEEP_AGENT_PROMPT`, `LEEP_AGENT_TESTS` | Provenance recorded by `commit` and `amend` (`agent.*` metadata). |
   | `LEEP_SIGNING_KEY` | Key file that `commit`, `amend`, `merge`, `cherry-pick` and `revert` sign with. |
   | `LEEP_CACHE_DIR` | Local blob cache. |
+  | `NO_COLOR`, `CLICOLOR_FORCE`, `CLICOLOR` | Colour, as above; output to a pipe is plain unless `CLICOLOR_FORCE` is set. |
+  | `LEEP_PAGER`, `PAGER` | Pager for `log`, `diff` and `show` on a terminal; never used for a pipe. |
 
 - `leep commit` prints the new changeset's full id on stdout, so
   `id=$(leep commit -m ...)` works.

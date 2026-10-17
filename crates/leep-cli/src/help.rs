@@ -153,12 +153,17 @@ Global options (every command accepts them):
                        Prefer LEEP_TOKEN: a flag is visible in process listings
       --json           Print results as JSON (usually the raw /v1 response); errors
                        too, as one JSON document on stdout (docs/CLI.md)
+      --color <WHEN>   auto (default: on a terminal, unless NO_COLOR; CLICOLOR_FORCE
+                       forces it), always or never. JSON is never coloured
   -h, --help           Print help; `leep COMMAND --help` for one command
-  -V, --version        Print version";
+  -V, --version        Print version
+
+On a terminal, log, diff and show page through LEEP_PAGER, else PAGER, else
+`less`; an empty LEEP_PAGER turns paging off.";
 
 /// Footer of every command's own help, pointing at the global options.
 const GLOBAL_FOOTER: &str =
-    "Global options: --server URL, --token TOKEN, --json (see `leep --help`)";
+    "Global options: --server URL, --token TOKEN, --json, --color WHEN (see `leep --help`)";
 
 /// Give `cmd` the grouped top-level help and every subcommand the global
 /// options footer.

@@ -10,6 +10,7 @@ use super::{print_json, Remote};
 use crate::client::LogQuery;
 use crate::error::{CliError, Result};
 use crate::fmt::{rename_line, short, utc_time};
+use crate::term::{self, Style};
 
 #[derive(Args, Debug)]
 pub struct LogArgs {
@@ -126,24 +127,29 @@ pub struct BlameArgs {
 
 /// `abbreviate` prints the 12-digit short id, which every command accepts
 /// back; `--json` always has the full id.
-fn header(info: &ChangesetInfo, abbreviate: bool) {
-    if abbreviate {
-        println!("changeset {}", short(info.id));
+fn header(info: &ChangesetInfo, abbreviate: bool) -> String {
+    let id = if abbreviate {
+        short(info.id)
     } else {
-        println!("changeset {}", info.id);
-    }
-    println!("Author: {}", info.changeset.author);
-    println!("Date:   {}", utc_time(info.changeset.timestamp));
+        info.id.to_string()
+    };
+    let mut out = format!(
+        "{}\n",
+        term::paint(&format!("changeset {id}"), Style::Yellow)
+    );
+    out.push_str(&format!("Author: {}\n", info.changeset.author));
+    out.push_str(&format!("Date:   {}\n", utc_time(info.changeset.timestamp)));
     for (k, v) in &info.changeset.extra {
-        println!("{k}: {v}");
+        out.push_str(&format!("{k}: {v}\n"));
     }
     for line in follow_lines(info) {
-        println!("{line}");
+        out.push_str(&format!("{line}\n"));
     }
-    println!();
+    out.push('\n');
     for line in info.changeset.message.lines() {
-        println!("    {line}");
+        out.push_str(&format!("    {line}\n"));
     }
+    out
 }
 
 /// What `log --follow` adds to an entry: the file's name there, and the
@@ -166,10 +172,12 @@ pub fn log(r: &Remote, args: &LogArgs) -> Result<i32> {
         print_json(&resp)?;
         return Ok(0);
     }
+    let mut out = String::new();
     for info in &resp.entries {
-        header(info, true);
-        println!();
+        out.push_str(&header(info, true));
+        out.push('\n');
     }
+    term::page(&out, false)?;
     Ok(0)
 }
 
@@ -180,7 +188,7 @@ pub fn last_change(r: &Remote, args: &LastChangeArgs) -> Result<i32> {
         print_json(&resp)?;
         return Ok(0);
     }
-    header(&resp.changeset, false);
+    print!("{}", header(&resp.changeset, false));
     for c in &resp.concurrent {
         println!("also changed concurrently in {c}");
     }
@@ -194,17 +202,18 @@ pub fn show(r: &Remote, args: &ShowArgs) -> Result<i32> {
         print_json(&info)?;
         return Ok(0);
     }
+    let mut out = String::new();
     for p in &info.changeset.parents {
-        println!("parent {p}");
+        out.push_str(&format!("parent {p}\n"));
     }
-    header(&info, false);
+    out.push_str(&header(&info, false));
     // Older servers lack the endpoint; a changeset is still worth showing.
     if let Ok(sigs) = r.client.signatures(&id) {
         for line in signature_lines(&sigs) {
-            println!("{line}");
+            out.push_str(&format!("{line}\n"));
         }
     }
-    println!();
+    out.push('\n');
     // Ask the server so additions and modifications are told apart.
     let parent = info.changeset.parents.first().copied();
     for e in r.client.diff(parent.as_ref(), &id, None)?.entries {
@@ -213,8 +222,9 @@ pub fn show(r: &Remote, args: &ShowArgs) -> Result<i32> {
             (Some(_), None) => 'D',
             _ => 'M',
         };
-        println!("{letter} {}", e.path);
+        out.push_str(&format!("{} {}\n", term::letter(letter), e.path));
     }
+    term::page(&out, false)?;
     Ok(0)
 }
 

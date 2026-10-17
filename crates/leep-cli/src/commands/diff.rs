@@ -12,6 +12,7 @@ use super::{print_json, Ctx, Remote};
 use crate::error::{CliError, Result};
 use crate::fmt::{file_diff, rename_line, renamed_diff};
 use crate::status::{read_content, status, working_renames, Change};
+use crate::term;
 
 #[derive(Args, Debug, Default)]
 pub struct DiffArgs {
@@ -63,7 +64,7 @@ fn working_copy(ctx: &Ctx, threshold: Option<u8>) -> Result<i32> {
     if ctx.json {
         print_json(&serde_json::json!({ "diff": text, "renames": renames }))?;
     } else {
-        print!("{text}");
+        term::page(&term::diff(&text), false)?;
     }
     Ok(0)
 }
@@ -127,7 +128,7 @@ fn revisions(r: &Remote, from: &str, to: &str, threshold: Option<u8>) -> Result<
         print_json(&resp)?;
         return Ok(0);
     }
-    print!("{}", diff_text(r, &resp)?);
+    term::page(&term::diff(&diff_text(r, &resp)?), false)?;
     Ok(0)
 }
 

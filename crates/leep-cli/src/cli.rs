@@ -13,6 +13,7 @@ use crate::commands::{
 use crate::error::{CliError, ErrorKind, Result};
 use crate::help;
 use crate::state::{resolve_token, WorkCopy};
+use crate::term;
 
 const DEFAULT_SERVER: &str = "http://127.0.0.1:8080";
 
@@ -34,6 +35,17 @@ pub struct Cli {
     /// `{"error":{"code","message","hint","retryable"}}` on stdout.
     #[arg(long, global = true, hide = true)]
     pub json: bool,
+    /// Colour human output: auto (on a terminal, honouring NO_COLOR and
+    /// CLICOLOR_FORCE), always or never.
+    #[arg(
+        long,
+        global = true,
+        hide = true,
+        value_enum,
+        default_value_t,
+        value_name = "WHEN"
+    )]
+    pub color: term::ColorChoice,
     #[command(subcommand)]
     pub command: Command,
 }
@@ -135,6 +147,7 @@ pub fn main() -> ExitCode {
         Err(e) => return usage_error(e),
     };
     let json = cli.json;
+    term::init(cli.color);
     match run(cli) {
         Ok(code) => ExitCode::from(code as u8),
         Err(e) => {
