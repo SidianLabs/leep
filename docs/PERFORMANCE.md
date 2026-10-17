@@ -475,15 +475,18 @@ passes agreed within 20%.
 | `blame Makefile` (derived once, 6.7 s, then stored) | 0.31–0.35 s | 0.34 s |
 | `blame COPYING` | 3–6 ms | 3–5 ms |
 | `diff` against 1,000 commits back | 18–65 ms | 11–12 ms |
-| `merge-base` with `master~20000` | 2.2 s | 0.11–0.14 s |
-| `merge-base` with `master~1000` | **70 s** | 0.10 s |
+| `merge-base` with `master~20000` | 2.2 s (3 ms after the fix below) | 0.11–0.14 s |
+| `merge-base` with `master~1000` | **70 s** (6 ms after the fix below) | 0.10 s |
 | `search strbuf_addf` (limit 100) | 0.29–0.30 s | 0.23–0.25 s |
 | `log author=Junio` 100 | 69–82 ms | 85–87 ms |
 
-The cold `merge-base` against an ancestor 1,000 commits back is a bug: the
+The cold `merge-base` against an ancestor 1,000 commits back was a bug: the
 fast path does not apply on a merge-heavy history, and the reference walk then
-follows long-merged topic branches one round trip at a time. The repeat is
-fast only because the walk's parents and generations are cached by then.
+followed long-merged topic branches one round trip at a time. The repeat was
+fast only because the walk's parents and generations were cached by then.
+After the fix ("Merge base" below), the same database on a freshly started
+server answers `master~1000` in 6 ms, `master~20000` in 3 ms and the root in
+5 ms.
 
 ### Against other version control systems
 
@@ -507,14 +510,14 @@ not measured.
 | `blame Makefile` | 0.34 s | 1.5 s | 1.2 s | 27 s | 21 s | 1.0 s | 6.9 s |
 | `blame COPYING` | 4 ms | 0.50 s | 94 ms | 18 s | 0.62 s | 49 ms | 0.35 s |
 | `diff` 1,000 back | 11 ms | 24 ms | 24 ms | 31 ms | 0.37 s | — | 0.28 s |
-| `merge-base` deep | 0.12 s | 0.70 s | 0.11 s | 36 ms | 0.35 s | — | 0.26 s |
-| `merge-base` 1,000 back | 0.10 s (70 s cold) | 0.17 s | 27 ms | 24 ms | 0.33 s | — | 0.26 s |
+| `merge-base` deep | 4 ms | 0.70 s | 0.11 s | 36 ms | 0.35 s | — | 0.26 s |
+| `merge-base` 1,000 back | 4–7 ms | 0.17 s | 27 ms | 24 ms | 0.33 s | — | 0.26 s |
 | Search / `grep` | 0.24 s | 0.18 s | 0.18 s | — | — | — | 2.3 s |
 | `log author=…` 100 | 86 ms | 0.94 s | 0.89 s | 0.90 s | — | — | 0.29 s |
 
 | Storage and import | Leep | git | jj | Sapling | Fossil | Mercurial |
 |---|---|---|---|---|---|---|
-| On disk | 1.0 GB database + 8.9 GB loose blobs | 328 MB | 444 MB | 386 MB | 512 MB | 404 MB |
+| On disk | 1.0 GB database + 190 MB packed blobs (8.9 GB loose) | 328 MB | 444 MB | 386 MB | 512 MB | 404 MB |
 | Import from git | 47 min (before the pipelined importer, #50) | — | 43 s | 43 s | 72 min | 84 min |
 
 What this shows:
@@ -530,10 +533,10 @@ What this shows:
   git: Leep returns 19.5 MB of JSON over HTTP where git prints a line per
   commit from a memory-mapped pack. Short `log`s pay a round trip and JSON
   encoding that a local command does not.
-- **Storage is the largest gap.** Loose, uncompressed blobs make Leep 27x
-  larger than git. Packs (ADR 0029, below) store the first 3,795 commits in
-  4.2 MB against 91.2 MB loose and git's 4.4 MB; the full history has not been
-  repacked yet.
+- **Storage was the largest gap.** Loose, uncompressed blobs made Leep 27x
+  larger than git. After `repack` (ADR 0029, "Packed blobs" below) the blobs
+  of all of git/git take 190 MB against git's 328 MB for the whole repository;
+  what remains is the 1.0 GB database, most of it the path-history index.
 - **Not compared:** Scion. There was no build to run on this machine, and
   published figures from other hardware and other histories are not
   comparable with these.
@@ -723,8 +726,43 @@ request, then the median of five more):
 
 With indexes derived, these read few blobs, so packing changes them by less
 than the run-to-run noise, except a first blame (about +10 ms; it reads
-file contents, which now come through delta chains).Deriving indexes from
+file contents, which now come through delta chains). Deriving indexes from
 scratch over a packed store was not measured.
+
+### All of git/git
+
+`leep-server repack --json` on the VPS store of the whole history (82,500
+changesets; server stopped, Linux import running beside it), default level 9
+and fence:
+
+| | |
+|---|---|
+| Loose objects before | 326,731, 8.69 GB logical, 8.9 GB on disk |
+| Pack | 167 MB (167,467,024 bytes) |
+| Index | 31 MB (31,366,264 bytes) |
+| Blob directory after | 190 MB logical, 225 MB on disk, no loose objects left |
+| Stored as deltas / whole | 312,029 / 14,702 |
+| Time | 27.4 min: 6.2 walking history, 10.4 writing, 10 fence, 0.7 cleanup |
+
+That is 46x smaller than the loose store and smaller than git's 328 MB for the
+same history; the index is 16% of pack plus index. Queries on a freshly
+started server over the packed store, against the loose runs on the same
+database just before the repack (current main, or the previous image for rows
+it does not affect; first request / repeat):
+
+| Query | Loose | Packed |
+|---|---|---|
+| `log` 100 | 122 / 53 ms | 52 / 38 ms |
+| `log` 10,000 | 1.27 / 0.63 s | 0.79 / 0.71 s |
+| Full file listing | 0.18 / 0.02 s | 0.46 / 0.01 s |
+| `log path=Makefile` 50 | 0.17–0.22 / 0.09 s | 0.42 / 0.10 s |
+| `blame Makefile` (stored) | 0.48 / 0.31 s | 0.37 / 0.39 s |
+| `diff` 1,000 back | 18–65 / 11 ms | 115 / 15 ms |
+| `search strbuf_addf` | 0.29 / 0.24 s | 0.45 / 0.24 s |
+
+Repeat requests are unchanged; first requests that read many tree nodes or
+file contents (listings, diffs, path logs, search) pay for decoding delta
+chains until the decoded-object cache holds them.
 
 ## Analysis
 
