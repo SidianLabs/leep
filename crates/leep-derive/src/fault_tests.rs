@@ -831,8 +831,8 @@ impl Outcomes {
 /// to never panicking.
 const VERIFIED: &[&str] = &[
     "root_tree",
-    "history-tree-v2",
-    "history-node-v2",
+    "history-tree-v3",
+    "history-node-v3",
     "tree node",
 ];
 

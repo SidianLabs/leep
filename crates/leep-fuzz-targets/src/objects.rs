@@ -5,7 +5,7 @@
 use leep_core::review::{Review, Verdict};
 use leep_core::signature::Signature;
 use leep_core::{Changeset, Hash, TreeNode};
-use leep_derive::derived::{HistoryNode, StoredHistoryNode};
+use leep_derive::derived::{flat_row, HistoryNode, StoredHistoryNode};
 
 pub fn changeset(data: &[u8]) {
     let Ok(cs) = Changeset::decode(data) else {
@@ -35,7 +35,7 @@ pub fn tree_node(data: &[u8]) {
     assert_eq!(node.hash(), Hash::of_object(TreeNode::KIND, &enc));
 }
 
-/// A stored `history-node-v2` row: a whole node, or a split node's chunk list.
+/// A stored `history-node-v3` row: a whole node or chunk, a chunk list, or a patch of either.
 pub fn history_node(data: &[u8]) {
     let Ok(stored) = StoredHistoryNode::decode(data) else {
         return;
@@ -44,9 +44,32 @@ pub fn history_node(data: &[u8]) {
     let again = StoredHistoryNode::decode(&enc).expect("re-encoded history row must decode");
     assert_eq!(again, stored);
     assert_eq!(again.encode(), enc);
+    // Applying a patch to any keyframe fails or gives a keyframe.
+    for key in [
+        StoredHistoryNode::Flat(HistoryNode::default()),
+        StoredHistoryNode::Split(Vec::new()),
+    ] {
+        if let Ok(r) = stored.clone().resolve(Some(&key)) {
+            assert!(r.base().is_none());
+        }
+    }
     let StoredHistoryNode::Flat(node) = stored else {
         return;
     };
+    // Stored as an edit of itself without its last entry, the row must read
+    // back as the node.
+    let mut key = node.clone();
+    if key.entries.pop_last().is_some() {
+        let row = flat_row(&node, Some((key.hash(), &key)));
+        let back = match row.node.base() {
+            Some(_) => row
+                .node
+                .clone()
+                .resolve(Some(&StoredHistoryNode::Flat(key))),
+            None => Ok(row.node.clone()),
+        };
+        assert_eq!(back, Ok(StoredHistoryNode::Flat(node.clone())));
+    }
     // Storing the node again must give rows that hold the same entries.
     let rows = node.rows();
     let (top, chunks) = rows.split_last().expect("a node has a top row");
@@ -67,6 +90,7 @@ pub fn history_node(data: &[u8]) {
             }
             joined
         }
+        _ => unreachable!("rows() writes keyframes only"),
     };
     assert_eq!(joined, node);
     let enc = node.encode();

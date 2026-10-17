@@ -143,7 +143,7 @@ changeset, and concurrent servers that race produce identical bytes.
 | `review-v1` | review verdicts, keyed per (changeset, reviewer name) (`Hash::of_object("review", id‖name)`); attestations written by `put_review`, last write wins, listed with one lookup per principal | review listing and the review land policy |
 | `last_merge-v1` | generation of the nearest merge on the first-parent chain (0 if none) | lets `merge_base` answer from skiplists when no merge sits above the first-parent common ancestor |
 | `blob-claim-v1` / `blob-condemned-v1` / `blob-rescue-v1` / `blob-doom-v1` | per blob hash, 8-byte big-endian unix seconds (doom adds a state byte); GC bookkeeping, not derived from changesets: claims by uploads and dedup checks, condemnation by `gc condemn`, rescue by uploads of a condemned blob, doom by `gc collect` (ADR 0012) | blob garbage collection and the server's missing-blob checks |
-| `history-tree-v2` | 32-byte address of the root history node, a tree parallel to `root_tree` recording for each path (including deleted ones) the newest changesets that changed it; nodes are `history-node-v2` rows keyed by content hash, and nodes of more than 64 entries are stored as content-defined chunks so an edit rewrites one chunk (ADR 0027). Built from the first parent's tree plus the spines of changed paths, and at merges the paths where another parent's history differs (ADR 0013) | path log, `last-change` |
+| `history-tree-v3` | 32-byte address of the root history node, a tree parallel to `root_tree` recording for each path (including deleted ones) the newest changesets that changed it; nodes are `history-node-v3` rows keyed by content hash, nodes of more than 64 entries are stored as content-defined chunks so an edit rewrites one chunk (ADR 0027), and a changed node, chunk or chunk list is stored as a patch on an earlier whole version (ADR 0037). Built from the first parent's tree plus the spines of changed paths, and at merges the paths where another parent's history differs (ADR 0013) | path log, `last-change` |
 | `blame` | per (changeset, path), keyed `Hash::of_object("blame", id‖path)` | blame |
 | `gc-mark-v1` | per changeset id, tree node hash or blob hash, one byte: "referenced by a stored changeset, and everything below has a row"; written by GC marks in post-order (ADR 0033) | incremental GC marks, which skip covered changesets and stop at marked tree nodes |
 | `blob-trigrams-v1` | per blob hash: sorted trigram set of a UTF-8 text blob up to 1 MiB (delta varints), or a "not indexed" marker (ADR 0014) | code search |
@@ -174,7 +174,7 @@ order are those of the plain walk, and whatever a batch did not return is read
 singly at the point the plain walk would read it.
 
 **Path history.** `log --path P` and `GET /v1/last-change/{id}?path=P` read
-the `history-tree-v2` index instead of scanning ancestors (ADR 0013). A lookup
+the `history-tree-v3` index instead of scanning ancestors (ADR 0013). A lookup
 walks `P`'s components through the changeset's history tree, reading only the
 chunk that holds each component in a large directory, and yields the
 newest changesets that changed `P` (for a directory, anything under it). The
@@ -192,9 +192,17 @@ Directory nodes keep deleted entries, so a busy directory's node grows with
 every name it ever held. Nodes of more than 64 entries are therefore stored as
 chunks of about 32 entries whose boundaries depend only on the names (ADR
 0027): a changeset rewrites the chunk holding each changed entry and a short
-chunk list, and shares the rest with its parent. Each `Repo` keeps a 64 MiB
-cache of decoded node rows, so derivation does not re-read the chunks of the
-root and other hot directories for every changeset.
+chunk list, and shares the rest with its parent. A rewritten chunk would
+still repeat its unchanged entries, so a changed node, chunk or list is
+stored as a patch (ADR 0037): a row naming a keyframe, an earlier whole
+version, and holding only the entries that differ from it. A new keyframe
+starts once the patch grows past about `sqrt(128 × keyframe size)` bytes.
+Patches point only at keyframes, so a row costs at most two reads, and a
+lookup of a recently changed name is answered from the patch alone. Rows
+depend only on the content and the first parent's stored version, so every
+server derives identical bytes. Each `Repo` keeps a 64 MiB cache of decoded
+node rows, so derivation does not re-read the chunks of the root and other
+hot directories for every changeset.
 
 **Rename detection** ([ADR 0016](adr/0016-rename-detection.md)). Changesets
 store a rename as a delete plus an add, and renames are detected when

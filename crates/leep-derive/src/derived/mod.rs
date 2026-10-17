@@ -19,8 +19,8 @@ use crate::Repo;
 
 pub use generation::Generation;
 pub use history_tree::{
-    ChunkRef, HistoryEntry, HistoryNode, HistoryRow, HistoryTree, StoredHistoryNode,
-    NODE_KIND as HISTORY_NODE_KIND,
+    flat_row, split_row, ChunkRef, HistoryEntry, HistoryNode, HistoryRow, HistoryTree, ResolvedRow,
+    SplitChange, StoredHistoryNode, NODE_KIND as HISTORY_NODE_KIND,
 };
 pub use last_merge::LastMerge;
 pub use root_tree::RootTree;

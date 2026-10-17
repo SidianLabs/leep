@@ -31,7 +31,7 @@ use super::walk::{HistoryWalk, Visitor};
 use crate::blame::{cache_key, CachedBlame};
 use crate::derived::{DerivedKind, HistoryTree, StoredHistoryNode};
 use crate::gc;
-use crate::path_history::{bad_chunk, chunk_fits, load_history_row};
+use crate::path_history::{bad_chunk, chunk_fits, load_history_row, resolve_row};
 use crate::search::index::TreeRowMemo;
 use crate::search::{BLOB_KIND as BLOB_TRIGRAMS, TREE_KIND as TREE_TRIGRAMS};
 use crate::signatures::{storage_key as signature_storage_key, REBASED_ORIGIN_KIND};
@@ -254,6 +254,7 @@ pub async fn verify(
         visited_trees: HashSet::new(),
         visited_blobs: HashSet::new(),
         visited_hnodes: HashSet::new(),
+        damaged_hnodes: HashSet::new(),
         pending: Vec::new(),
         ticker: Ticker::new(Duration::from_secs(5)),
         phase: "starting",
@@ -298,6 +299,7 @@ struct Verifier<'a> {
     visited_trees: HashSet<Hash>,
     visited_blobs: HashSet<Hash>,
     visited_hnodes: HashSet<Hash>,
+    damaged_hnodes: HashSet<Hash>,
     pending: Vec<BlobRef>,
     ticker: Ticker,
     phase: &'static str,
@@ -631,9 +633,9 @@ impl Verifier<'_> {
         Ok(())
     }
 
-    /// The history nodes a stored `history-tree-v2` row leads to, and the
-    /// chunks of split ones, exist and match their addresses: the root only
-    /// when sampling, all of them when `deep`.
+    /// The history nodes a stored `history-tree-v3` row leads to, the chunks
+    /// of split ones and the keyframes of patched ones, exist and match their
+    /// addresses: the root only when sampling, all of them when `deep`.
     async fn check_history_nodes(
         &mut self,
         id: ChangesetId,
@@ -643,37 +645,20 @@ impl Verifier<'_> {
         let Ok(root) = <[u8; 32]>::try_from(stored) else {
             return Ok(());
         };
-        // Read the real store without the repo's cache: a cached or
-        // shadow-recomputed row would hide damage on disk.
-        let meta = self.repo.meta().clone();
         let mut stack = vec![Hash(root)];
         while let Some(node) = stack.pop() {
             if !self.visited_hnodes.insert(node) {
                 continue;
             }
-            let row = match load_history_row(&*meta, node).await {
-                Ok((row, _)) => row,
-                Err(e) => {
-                    self.history_damage(id, node, e)?;
-                    continue;
-                }
+            let Some(row) = self.load_history_node(id, node).await? else {
+                continue;
             };
             let mut children = Vec::new();
             match &row {
-                StoredHistoryNode::Flat(n) => {
-                    children.extend(n.entries.values().filter_map(|e| e.node()))
-                }
                 StoredHistoryNode::Split(refs) => {
                     for (i, r) in refs.iter().enumerate() {
-                        // A damaged chunk is named by its own address, once.
-                        let first_visit = self.visited_hnodes.insert(r.node);
-                        let chunk = match load_history_row(&*meta, r.node).await {
-                            Ok((chunk, _)) => chunk,
-                            Err(e) if first_visit => {
-                                self.history_damage(id, r.node, e)?;
-                                continue;
-                            }
-                            Err(_) => continue,
+                        let Some(chunk) = self.load_history_node(id, r.node).await? else {
+                            continue;
                         };
                         match chunk_fits(refs, i, &chunk) {
                             Some(n) => children.extend(n.entries.values().filter_map(|e| e.node())),
@@ -681,6 +666,10 @@ impl Verifier<'_> {
                         }
                     }
                 }
+                StoredHistoryNode::Flat(n) => {
+                    children.extend(n.entries.values().filter_map(|e| e.node()))
+                }
+                _ => unreachable!("resolved rows are Flat or Split"),
             }
             if deep {
                 stack.extend(children);
@@ -689,12 +678,52 @@ impl Verifier<'_> {
         Ok(())
     }
 
+    /// One history row with its patch applied, read from the real store
+    /// without the repo's cache: a cached or shadow-recomputed row would hide
+    /// damage on disk. Damage is reported under the address of the row that
+    /// is damaged (the patch or its keyframe), and `None` returned.
+    async fn load_history_node(
+        &mut self,
+        id: ChangesetId,
+        node: Hash,
+    ) -> Result<Option<StoredHistoryNode>> {
+        let meta = self.repo.meta().clone();
+        let row = match load_history_row(&*meta, node).await {
+            Ok((row, _)) => row,
+            Err(e) => {
+                self.history_damage(id, node, e)?;
+                return Ok(None);
+            }
+        };
+        let key = match row.base() {
+            None => None,
+            Some(base) => match load_history_row(&*meta, base).await {
+                Ok((key, _)) => Some(key),
+                Err(e) => {
+                    self.history_damage(id, base, e)?;
+                    return Ok(None);
+                }
+            },
+        };
+        match resolve_row(node, row, key.as_ref()) {
+            Ok(r) => Ok(Some(r.node)),
+            Err(e) => {
+                self.history_damage(id, node, e)?;
+                Ok(None)
+            }
+        }
+    }
+
     /// Report a damaged history node or chunk, or pass on an error that is
     /// not damage.
     fn history_damage(&mut self, id: ChangesetId, node: Hash, e: Error) -> Result<()> {
         let Some(d) = damage_of(&e) else {
             return Err(e);
         };
+        // A chunk or keyframe shared by many nodes is reported once.
+        if !self.damaged_hnodes.insert(node) {
+            return Ok(());
+        }
         self.log.push(
             Problem::new(
                 "derived",
