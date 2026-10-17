@@ -268,7 +268,7 @@ impl Repo {
     }
 
     /// Root trees of `ids` with one batched read, deriving any not stored.
-    async fn root_trees(&self, ids: &[ChangesetId]) -> Result<Vec<Hash>> {
+    pub(crate) async fn root_trees(&self, ids: &[ChangesetId]) -> Result<Vec<Hash>> {
         let keys: Vec<Hash> = ids.iter().map(|id| id.0).collect();
         let rows = match self.meta().get_derived_many(RootTree::NAME, &keys).await {
             Ok(rows) if rows.len() == ids.len() => rows,

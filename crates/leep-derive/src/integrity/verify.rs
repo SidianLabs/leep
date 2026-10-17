@@ -1037,6 +1037,7 @@ impl Verifier<'_> {
             gc::BLOB_CONDEMNED,
             gc::BLOB_RESCUE,
             gc::BLOB_DOOM,
+            gc::GC_MARK,
         ] {
             if !self.has(kind) {
                 continue;
@@ -1045,7 +1046,12 @@ impl Verifier<'_> {
             while let Some(page) = scan.next(&*meta).await? {
                 for (key, value) in page {
                     self.kstats(kind).checked += 1;
-                    if let Err(e) = gc::decode_row(kind, &value) {
+                    let decoded = if kind == gc::GC_MARK {
+                        gc::decode_mark(&value)
+                    } else {
+                        gc::decode_row(kind, &value).map(|_| ())
+                    };
+                    if let Err(e) = decoded {
                         self.kstats(kind).mismatched += 1;
                         self.log.push(
                             Problem::new(

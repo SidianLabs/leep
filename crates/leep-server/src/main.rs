@@ -174,6 +174,10 @@ enum Cmd {
         /// Allow --fence 0. Only safe while no server is running.
         #[arg(long, global = true)]
         unsafe_no_fence: bool,
+        /// Walk all of history and every tree instead of only what earlier
+        /// runs did not mark (ADR 0033), and rewrite their record.
+        #[arg(long, global = true)]
+        full: bool,
     },
     /// Pack every live blob and tree node of a filesystem blob store into one
     /// delta-compressed pack (ADR 0029; uses --meta and --blobs; safe beside
@@ -312,6 +316,7 @@ async fn run_gc(
     blobs: &str,
     phase: Option<GcPhase>,
     opts: leep_derive::gc::GcOptions,
+    mark: leep_derive::gc::Mark,
 ) -> anyhow::Result<()> {
     use leep_derive::gc;
     let blobs = leep_store::open_blob_store(blobs).context("opening blob store")?;
@@ -320,20 +325,34 @@ async fn run_gc(
     let clock = gc::SystemClock;
     let dry = opts.dry_run;
     let (condemn, collect) = match phase {
-        Some(GcPhase::Condemn) => (Some(gc::condemn(&repo, &opts, &clock).await?), None),
-        Some(GcPhase::Collect) => (None, Some(gc::collect(&repo, &opts, &clock).await?)),
+        Some(GcPhase::Condemn) => (
+            Some(gc::condemn_with(&repo, &opts, mark, &clock).await?),
+            None,
+        ),
+        Some(GcPhase::Collect) => (
+            None,
+            Some(gc::collect_with(&repo, &opts, mark, &clock).await?),
+        ),
         None => {
             if !dry {
                 tracing::info!(fence = ?opts.fence, "condemning, then waiting out the fence");
             }
-            let r = gc::run(&repo, &opts, &clock).await?;
+            let r = gc::run_with(&repo, &opts, mark, &clock).await?;
             (Some(r.condemn), (!dry).then_some(r.collect))
         }
     };
     if let Some(r) = condemn {
         let verb = if dry { "would condemn" } else { "condemned" };
         println!("changesets scanned: {}", r.changesets_scanned);
-        println!("referenced blobs and trees: {}", r.marked);
+        println!("changesets walked: {}", r.changesets_walked);
+        println!(
+            "referenced blobs and trees marked by this run: {}",
+            r.marked
+        );
+        println!(
+            "referenced blobs marked by earlier runs: {}",
+            r.marked_earlier
+        );
         println!("blobs scanned: {}", r.blobs_scanned);
         println!("{verb}: {} blobs, {} bytes", r.condemned, r.condemned_bytes);
         println!("already condemned: {}", r.already_condemned);
@@ -506,7 +525,13 @@ async fn main() -> anyhow::Result<()> {
             grace,
             fence,
             unsafe_no_fence,
+            full,
         }) => {
+            let mark = if full {
+                leep_derive::gc::Mark::Full
+            } else {
+                leep_derive::gc::Mark::Incremental
+            };
             return run_gc(
                 &args.meta,
                 &args.blobs,
@@ -517,8 +542,9 @@ async fn main() -> anyhow::Result<()> {
                     unsafe_no_fence,
                     dry_run,
                 },
+                mark,
             )
-            .await
+            .await;
         }
         Some(Cmd::Repack(r)) => return repack_cli::run_repack(&args.meta, &args.blobs, r).await,
         Some(Cmd::DeriveSearch { rev }) => {

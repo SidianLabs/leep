@@ -1244,10 +1244,12 @@ unreferenced blobs and only GC reclaims them.
    - `invalid input: a zero fence can lose blobs while servers run; pass a positive
      fence (longer than the servers' request timeout) or --unsafe-no-fence`;
    - `bad duration "..."; use e.g. 0, 90s, 30m, 24h, 7d`.
-3. Is it simply slow or killed? Condemn and collect mark from every stored changeset,
-   so they take longer as history deepens; a job killed by a timeout or an
-   overlapping run never reports success. Killing GC is safe, and a killed run is
-   finished by running it again.
+3. Is it simply slow or killed? Condemn and collect walk only changesets stored since
+   the last run (`changesets walked` in the report; ADR 0033), but still list every
+   changeset and blob, so they take longer as the store grows, and the first run
+   after an upgrade, or one with `--full`, walks all of history. A job killed by a
+   timeout or an overlapping run never reports success. Killing GC is safe, and a
+   killed run is finished by running it again; what it marked before dying is kept.
 4. Nothing deleted for a day after a restore: restored blobs have the restore time
    as their modification time, so `--grace` (default 24h) starts again.
 
