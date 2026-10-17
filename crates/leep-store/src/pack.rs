@@ -135,6 +135,11 @@ impl PackIndex {
         &self.pack_hash
     }
 
+    /// The index file's bytes, exactly as read.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
     /// The magic this index was read with.
     pub fn magic(&self) -> [u8; 8] {
         match self.layout {

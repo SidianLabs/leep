@@ -10,6 +10,8 @@ use object_store::memory::InMemory;
 use object_store::path::Path;
 use object_store::{ObjectStore, PutPayload};
 
+use crate::objpacks::{RemotePackSet, DEFAULT_REFRESH_INTERVAL};
+use crate::packset::DEFAULT_DECODED_CACHE;
 use crate::storage_err;
 
 /// Settings for an S3-compatible bucket. Credentials come from the standard
@@ -23,15 +25,45 @@ pub struct S3Config {
     pub allow_http: bool,
 }
 
-/// Blobs in any `object_store` backend under `blobs/<2 hex>/<62 hex>`.
+/// Blobs in any `object_store` backend: loose under `blobs/<2 hex>/<62 hex>`,
+/// and packed under `packs/` once `repack` has run (ADR 0040). New writes are
+/// always loose; reads try the loose object first, then the packs.
 #[derive(Clone)]
 pub struct ObjectBlobStore {
-    store: Arc<dyn ObjectStore>,
+    pub(crate) store: Arc<dyn ObjectStore>,
+    pub(crate) packs: Arc<RemotePackSet>,
+}
+
+impl std::fmt::Debug for ObjectBlobStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ObjectBlobStore")
+            .field("store", &self.store.to_string())
+            .finish_non_exhaustive()
+    }
 }
 
 impl ObjectBlobStore {
+    /// Packs are listed on first use, not here, so opening never fails.
     pub fn new(store: Arc<dyn ObjectStore>) -> Self {
-        Self { store }
+        Self::with_options(store, DEFAULT_DECODED_CACHE, DEFAULT_REFRESH_INTERVAL)
+    }
+
+    /// Like [`new`](Self::new), with the byte budget for decoded packed
+    /// objects (0 disables it) and the shortest time between two pack
+    /// listings a miss may cause. The interval must stay well below the
+    /// repack fence, or a reader could miss an object whose loose copy a
+    /// repack deleted after the fence.
+    pub fn with_options(
+        store: Arc<dyn ObjectStore>,
+        decoded_cache: usize,
+        refresh_interval: std::time::Duration,
+    ) -> Self {
+        let packs = Arc::new(RemotePackSet::new(
+            store.clone(),
+            decoded_cache,
+            refresh_interval,
+        ));
+        Self { store, packs }
     }
 
     pub fn s3(cfg: S3Config) -> Result<Self> {
@@ -57,7 +89,7 @@ impl ObjectBlobStore {
         Ok(Self::new(Arc::new(fs)))
     }
 
-    fn key(hash: &Hash) -> Path {
+    pub(crate) fn key(hash: &Hash) -> Path {
         let hex = hash.to_hex();
         Path::from(format!("blobs/{}/{}", &hex[..2], &hex[2..]))
     }
@@ -65,6 +97,8 @@ impl ObjectBlobStore {
 
 #[async_trait]
 impl BlobStore for ObjectBlobStore {
+    /// Always writes, so a re-upload refreshes `modified` (GC's grace window,
+    /// ADR 0012) and a loose copy outlives a tombstone on a packed one.
     async fn put_with_hash(&self, hash: Hash, data: Bytes) -> Result<()> {
         self.store
             .put(&Self::key(&hash), PutPayload::from_bytes(data))
@@ -76,7 +110,7 @@ impl BlobStore for ObjectBlobStore {
     async fn get(&self, hash: &Hash) -> Result<Option<Bytes>> {
         match self.store.get(&Self::key(hash)).await {
             Ok(r) => Ok(Some(r.bytes().await.map_err(storage_err)?)),
-            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(object_store::Error::NotFound { .. }) => self.packs.get(hash).await,
             Err(e) => Err(storage_err(e)),
         }
     }
@@ -84,14 +118,36 @@ impl BlobStore for ObjectBlobStore {
     async fn contains(&self, hash: &Hash) -> Result<bool> {
         match self.store.head(&Self::key(hash)).await {
             Ok(_) => Ok(true),
-            Err(object_store::Error::NotFound { .. }) => Ok(false),
+            Err(object_store::Error::NotFound { .. }) => self.packs.contains(hash).await,
             Err(e) => Err(storage_err(e)),
         }
     }
 
-    /// Lists one shard prefix at a time and sorts it, because `object_store`
-    /// does not promise listing order across backends.
+    /// Loose and packed blobs merged in hash order, with logical sizes and
+    /// each packed blob's recorded `modified`, as the filesystem store lists.
+    /// The loose page is listed before the packs, so a loose copy a repack
+    /// deletes in between is found in the pack that replaced it.
     async fn list_page(&self, after: Option<Hash>, limit: usize) -> Result<Vec<BlobMeta>> {
+        let loose = self.list_loose(after, limit).await?;
+        self.packs.merge_page(loose, after, limit).await
+    }
+
+    /// Tombstones packed copies first, then deletes the loose object, so a
+    /// repack that finds the tombstone keeps the loose copy.
+    async fn delete(&self, hash: &Hash) -> Result<()> {
+        self.packs.tombstone(hash).await?;
+        match self.store.delete(&Self::key(hash)).await {
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(e) => Err(storage_err(e)),
+        }
+    }
+}
+
+impl ObjectBlobStore {
+    /// Loose blobs above `after`, at most `limit`. Lists one shard prefix at
+    /// a time and sorts it, because `object_store` does not promise listing
+    /// order across backends.
+    async fn list_loose(&self, after: Option<Hash>, limit: usize) -> Result<Vec<BlobMeta>> {
         let mut out = Vec::new();
         let first_shard = after.map_or(0, |h| h.0[0]);
         for shard in first_shard..=255u8 {
@@ -128,13 +184,6 @@ impl BlobStore for ObjectBlobStore {
         }
         out.truncate(limit);
         Ok(out)
-    }
-
-    async fn delete(&self, hash: &Hash) -> Result<()> {
-        match self.store.delete(&Self::key(hash)).await {
-            Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
-            Err(e) => Err(storage_err(e)),
-        }
     }
 }
 

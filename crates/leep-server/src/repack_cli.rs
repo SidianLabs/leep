@@ -1,16 +1,20 @@
-//! `leep-server repack` (ADR 0029): pack every live object of a filesystem
-//! blob store into one new pack, compressing each file version against the
-//! previous one at its path and each tree node against the same directory in
-//! the first parent. Safe beside running servers: the old layout stays
-//! readable until a fence after the new pack is published.
+//! `leep-server repack` (ADR 0029, ADR 0040): pack every live object of a
+//! filesystem or object store (`s3://`) blob store into one new pack,
+//! compressing each file version against the previous one at its path and
+//! each tree node against the same directory in the first parent. Safe
+//! beside running servers: the old layout stays readable until a fence after
+//! the new pack is published.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use clap::Args;
+use leep_core::BlobStore;
 use leep_derive::Repo;
-use leep_store::{FsBlobStore, RepackOptions, RepackReport};
+use leep_store::{
+    FsBlobStore, ObjectBlobStore, PublishedObjectPack, PublishedPack, RepackOptions, RepackReport,
+};
 
 #[derive(Args)]
 pub struct RepackArgs {
@@ -30,13 +34,61 @@ pub struct RepackArgs {
     json: bool,
 }
 
-pub async fn run_repack(meta: &str, blobs: &str, args: RepackArgs) -> anyhow::Result<()> {
-    let Some(root) = leep_store::fs_blob_root(blobs) else {
+/// The blob stores that can hold packs.
+enum Target {
+    Fs(FsBlobStore),
+    Object(ObjectBlobStore),
+}
+
+enum Published {
+    Fs(PublishedPack),
+    Object(PublishedObjectPack),
+}
+
+impl Target {
+    fn open(blobs: &str) -> anyhow::Result<Target> {
+        if let Some(root) = leep_store::fs_blob_root(blobs) {
+            return Ok(Target::Fs(FsBlobStore::new(root)));
+        }
+        if let Some(store) = leep_store::open_object_blob_store(blobs)? {
+            return Ok(Target::Object(store));
+        }
         anyhow::bail!(
-            "repack works on filesystem blob stores (file:// or a path) only; \
-             {blobs:?} is not one. Packs for object stores are planned (ADR 0029, phase 3)"
-        );
-    };
+            "repack works on filesystem (file:// or a path) and object store (s3://) \
+             blob stores; {blobs:?} is neither"
+        )
+    }
+
+    fn blob_store(&self) -> Arc<dyn BlobStore> {
+        match self {
+            Target::Fs(s) => Arc::new(s.clone()),
+            Target::Object(s) => Arc::new(s.clone()),
+        }
+    }
+
+    async fn publish(
+        &self,
+        hints: Vec<(leep_core::Hash, Option<leep_core::Hash>)>,
+        opts: RepackOptions,
+    ) -> leep_core::Result<Published> {
+        Ok(match self {
+            Target::Fs(s) => Published::Fs(s.repack_publish(hints, opts).await?),
+            Target::Object(s) => Published::Object(s.repack_publish(hints, opts).await?),
+        })
+    }
+}
+
+impl Published {
+    async fn finish(self) -> leep_core::Result<RepackReport> {
+        match self {
+            Published::Fs(p) => p.finish().await,
+            Published::Object(p) => p.finish().await,
+        }
+    }
+}
+
+pub async fn run_repack(meta: &str, blobs: &str, args: RepackArgs) -> anyhow::Result<()> {
+    let target = Target::open(blobs)?;
     if args.fence.is_zero() && !args.unsafe_no_fence {
         anyhow::bail!(
             "a zero fence can fail reads of running servers; pass a positive fence \
@@ -44,9 +96,8 @@ pub async fn run_repack(meta: &str, blobs: &str, args: RepackArgs) -> anyhow::Re
         );
     }
     let started = Instant::now();
-    let store = FsBlobStore::new(&root);
     let meta = super::open_meta(meta).await.context("opening meta store")?;
-    let repo = Repo::new(Arc::new(store.clone()), meta);
+    let repo = Repo::new(target.blob_store(), meta);
     tracing::info!("walking history for delta bases");
     let order = leep_derive::pack_order::pack_order(&repo).await?;
     let walked = started.elapsed();
@@ -59,7 +110,7 @@ pub async fn run_repack(meta: &str, blobs: &str, args: RepackArgs) -> anyhow::Re
         level: args.level,
         ..RepackOptions::default()
     };
-    let published = store.repack_publish(order.objects, opts).await?;
+    let published = target.publish(order.objects, opts).await?;
     let written = started.elapsed();
     tracing::info!(fence = ?args.fence, "published; waiting out the fence before cleanup");
     tokio::time::sleep(args.fence).await;

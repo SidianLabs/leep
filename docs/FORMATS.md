@@ -405,7 +405,8 @@ hash or derived encoding changed. Rules:
 
 - Filesystem: loose objects at `<root>/<hex[0..2]>/<hex[2..]>`, and packs in
   `<root>/packs/` (below)
-- Object store: `blobs/<hex[0..2]>/<hex[2..]>`
+- Object store: loose objects at `blobs/<hex[0..2]>/<hex[2..]>`, and packs
+  under `packs/` (below, "Packs in an object store")
 
 ### Packs (filesystem store, ADR 0029)
 
@@ -521,6 +522,26 @@ pack still exists, and removes it when none remain.
 `<id>.pack`, then does the same for `<id>.idx` and fsyncs the directory after
 each rename. The index rename publishes. A `.pack` with no `.idx` is garbage.
 Replaced packs are removed index first.
+
+### Packs in an object store (ADR 0040)
+
+The same `.pack` and `.idx` bytes and ids as the filesystem store, at the
+same names relative to the bucket. Locks and the append-only tombstones file
+are replaced:
+
+| Key | Contents |
+|---|---|
+| `packs/<id>.pack` | the entries, uploaded first (a multipart upload, visible only when complete) |
+| `packs/<id>.idx` | the index, uploaded after the pack; its presence publishes the pack |
+| `packs/tombstones/<pack id>/<object hash hex>` | empty; the object's copy in that pack is deleted |
+| `packs/repack.lease` | text: `leep repack lease\nholder <id>\nexpires <unix seconds>\n`; present while a repack runs |
+
+A tombstone hides only the copy in the pack it names, and a loose copy of
+the same hash is always served, as on the filesystem. Readers ignore keys
+under `packs/` they do not recognise. The lease is created only if absent
+and replaced only if its etag is the one its holder last wrote; once its
+expiry has passed another repack may take it over. A `.pack` with no `.idx`
+is garbage. Replaced packs are removed index first, then their tombstones.
 
 Golden bytes: `leep-store` asserts a fixed `LEEPIDX2` index's bytes and id
 (`pack::tests::index_golden_bytes`), decodes fixed `LEEPIDX1` bytes with

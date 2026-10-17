@@ -5,10 +5,15 @@
 mod cache;
 mod fs;
 mod object;
+#[cfg(test)]
+mod objpack_tests;
+mod objpacks;
+mod objrepack;
 pub mod pack;
 #[cfg(test)]
 mod pack_tests;
 mod packset;
+mod packwrite;
 mod repack;
 pub mod sync;
 
@@ -21,6 +26,7 @@ use leep_core::{BlobStore, Error, Result};
 pub use cache::{CacheStats, CachedBlobStore};
 pub use fs::FsBlobStore;
 pub use object::{ObjectBlobStore, S3Config};
+pub use objrepack::PublishedObjectPack;
 pub use repack::{PublishedPack, RepackHook, RepackOptions, RepackReport, RepackStep};
 
 fn storage_err(e: impl std::fmt::Display) -> Error {
@@ -36,6 +42,32 @@ pub fn fs_blob_root(url: &str) -> Option<PathBuf> {
     (!url.contains("://") && url != "mem:").then(|| PathBuf::from(url))
 }
 
+/// The object store a blob store URL names (`s3://...`), `None` for any
+/// other kind. See [`open_blob_store`] for the options.
+pub fn open_object_blob_store(url: &str) -> Result<Option<ObjectBlobStore>> {
+    if !url.starts_with("s3://") {
+        return Ok(None);
+    }
+    let u = url::Url::parse(url).map_err(|e| Error::Invalid(format!("bad url {url:?}: {e}")))?;
+    let bucket = u
+        .host_str()
+        .filter(|b| !b.is_empty())
+        .ok_or_else(|| Error::Invalid(format!("missing bucket in {url:?}")))?;
+    let mut cfg = S3Config {
+        bucket: bucket.to_string(),
+        ..S3Config::default()
+    };
+    for (k, v) in u.query_pairs() {
+        match &*k {
+            "endpoint" => cfg.endpoint = Some(v.into_owned()),
+            "region" => cfg.region = Some(v.into_owned()),
+            "allow_http" => cfg.allow_http = matches!(&*v, "true" | "1"),
+            other => return Err(Error::Invalid(format!("unknown s3 option {other:?}"))),
+        }
+    }
+    Ok(Some(ObjectBlobStore::s3(cfg)?))
+}
+
 /// Open a blob store from a URL: `mem://`, `file:///abs/path` (or a bare
 /// path), or `s3://bucket?endpoint=..&region=..&allow_http=true`. S3
 /// credentials come from the standard AWS environment variables.
@@ -46,26 +78,8 @@ pub fn open_blob_store(url: &str) -> Result<Arc<dyn BlobStore>> {
     if let Some(rest) = url.strip_prefix("file://") {
         return Ok(Arc::new(FsBlobStore::new(PathBuf::from(rest))));
     }
-    if url.starts_with("s3://") {
-        let u =
-            url::Url::parse(url).map_err(|e| Error::Invalid(format!("bad url {url:?}: {e}")))?;
-        let bucket = u
-            .host_str()
-            .filter(|b| !b.is_empty())
-            .ok_or_else(|| Error::Invalid(format!("missing bucket in {url:?}")))?;
-        let mut cfg = S3Config {
-            bucket: bucket.to_string(),
-            ..S3Config::default()
-        };
-        for (k, v) in u.query_pairs() {
-            match &*k {
-                "endpoint" => cfg.endpoint = Some(v.into_owned()),
-                "region" => cfg.region = Some(v.into_owned()),
-                "allow_http" => cfg.allow_http = matches!(&*v, "true" | "1"),
-                other => return Err(Error::Invalid(format!("unknown s3 option {other:?}"))),
-            }
-        }
-        return Ok(Arc::new(ObjectBlobStore::s3(cfg)?));
+    if let Some(store) = open_object_blob_store(url)? {
+        return Ok(Arc::new(store));
     }
     if url.contains("://") {
         return Err(Error::Invalid(format!(

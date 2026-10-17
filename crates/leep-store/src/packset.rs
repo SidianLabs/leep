@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
 use bytes::Bytes;
-use leep_core::{Error, Hash, Result};
+use leep_core::{BlobMeta, Error, Hash, Result};
 
 use crate::cache::Lru;
 use crate::pack::{self, IdxEntry, PackIndex, PACK_MAGIC, READ_CHAIN_LIMIT};
@@ -218,8 +218,7 @@ pub(crate) struct PackSet {
     dir: PathBuf,
     view: RwLock<Option<Arc<View>>>,
     refreshing: Mutex<()>,
-    decoded: Mutex<Lru>,
-    decoded_capacity: usize,
+    decoded: DecodedCache,
 }
 
 impl PackSet {
@@ -228,8 +227,7 @@ impl PackSet {
             dir: root.join(PACKS_DIR),
             view: RwLock::new(None),
             refreshing: Mutex::new(()),
-            decoded: Mutex::default(),
-            decoded_capacity,
+            decoded: DecodedCache::new(decoded_capacity),
         }
     }
 
@@ -322,48 +320,11 @@ impl PackSet {
         Ok(self.refresh()?.locate(hash).is_some())
     }
 
-    /// Decode an entry, following its delta chain iteratively down to a whole
-    /// entry or a cached object, then back up. Every decoded object is checked
-    /// against its hash, so damage is an error and never wrong bytes.
+    /// Decode an entry and check it against its hash.
     pub fn decode(&self, pack: &Pack, entry: &IdxEntry) -> Result<Bytes> {
-        let corrupt = |why: String| {
-            Error::Storage(format!(
-                "corrupt packed object {} in pack {}: {why}",
-                entry.hash, pack.id
-            ))
-        };
-        let mut chain = vec![*entry];
-        let mut start: Option<Bytes> = None;
-        loop {
-            let cur = *chain.last().unwrap();
-            if let Some(b) = self.decoded.lock().unwrap().get(&cur.hash) {
-                chain.pop();
-                start = Some(b);
-                break;
-            }
-            // In range: decoding the index checked every base.
-            let Some(base) = cur.base else { break };
-            if chain.len() >= READ_CHAIN_LIMIT {
-                return Err(corrupt("delta chain too long".into()));
-            }
-            chain.push(pack.index.entry(base));
-        }
-        let mut bytes = start;
-        while let Some(e) = chain.pop() {
-            let frame = pack.frame(&e)?;
-            let data = pack::decompress(&frame, bytes.as_deref(), e.len)
-                .map_err(|err| corrupt(err.to_string()))?;
-            if !pack::object_intact(&e.hash, &data) {
-                return Err(corrupt(format!("{} decodes to other bytes", e.hash)));
-            }
-            let data = Bytes::from(data);
-            self.decoded
-                .lock()
-                .unwrap()
-                .insert(e.hash, data.clone(), self.decoded_capacity);
-            bytes = Some(data);
-        }
-        Ok(bytes.expect("the chain decodes at least one entry"))
+        let chain = self.decoded.plan(&pack.id, &pack.index, entry)?;
+        self.decoded
+            .finish(&pack.id, entry, chain, |e| pack.frame(e))
     }
 
     /// Hide packed copies of `hash` from every pack that has one. Durable
@@ -395,6 +356,137 @@ impl PackSet {
         f.sync_all().map_err(storage_err)?;
         sync_dir(&self.dir)
     }
+}
+
+/// Decoded packed objects, shared by every pack of a store. A read of a
+/// recent version usually decodes the older versions it is based on, which
+/// the next read needs again.
+pub(crate) struct DecodedCache {
+    lru: Mutex<Lru>,
+    capacity: usize,
+}
+
+/// What a delta chain needs: entries to decode, the wanted one first and the
+/// deepest base last, and the cached object below them, if any.
+pub(crate) struct Chain {
+    pub entries: Vec<IdxEntry>,
+    start: Option<Bytes>,
+}
+
+fn corrupt(pack_id: &str, hash: &Hash, why: String) -> Error {
+    Error::Storage(format!(
+        "corrupt packed object {hash} in pack {pack_id}: {why}"
+    ))
+}
+
+impl DecodedCache {
+    pub fn new(capacity: usize) -> Self {
+        DecodedCache {
+            lru: Mutex::default(),
+            capacity,
+        }
+    }
+
+    /// Follow `entry`'s chain iteratively down to a whole entry or a cached
+    /// object. Separate from [`finish`](Self::finish) so a remote reader can
+    /// fetch every frame of the chain in one batch.
+    pub fn plan(&self, pack_id: &str, index: &PackIndex, entry: &IdxEntry) -> Result<Chain> {
+        let mut entries = vec![*entry];
+        loop {
+            let cur = *entries.last().unwrap();
+            if let Some(b) = self.lru.lock().unwrap().get(&cur.hash) {
+                entries.pop();
+                return Ok(Chain {
+                    entries,
+                    start: Some(b),
+                });
+            }
+            // In range: decoding the index checked every base.
+            let Some(base) = cur.base else {
+                return Ok(Chain {
+                    entries,
+                    start: None,
+                });
+            };
+            if entries.len() >= READ_CHAIN_LIMIT {
+                return Err(corrupt(pack_id, &entry.hash, "delta chain too long".into()));
+            }
+            entries.push(index.entry(base));
+        }
+    }
+
+    /// Decode a planned chain back up, given each entry's frame. Every decoded
+    /// object is checked against its hash, so damage is an error and never
+    /// wrong bytes.
+    pub fn finish<F, B>(
+        &self,
+        pack_id: &str,
+        entry: &IdxEntry,
+        chain: Chain,
+        mut frame: F,
+    ) -> Result<Bytes>
+    where
+        F: FnMut(&IdxEntry) -> Result<B>,
+        B: AsRef<[u8]>,
+    {
+        let Chain {
+            mut entries,
+            start: mut bytes,
+        } = chain;
+        let bad = |why: String| corrupt(pack_id, &entry.hash, why);
+        while let Some(e) = entries.pop() {
+            let frame = frame(&e)?;
+            let data = pack::decompress(frame.as_ref(), bytes.as_deref(), e.len)
+                .map_err(|err| bad(err.to_string()))?;
+            if !pack::object_intact(&e.hash, &data) {
+                return Err(bad(format!("{} decodes to other bytes", e.hash)));
+            }
+            let data = Bytes::from(data);
+            self.lru
+                .lock()
+                .unwrap()
+                .insert(e.hash, data.clone(), self.capacity);
+            bytes = Some(data);
+        }
+        Ok(bytes.expect("the chain decodes at least one entry"))
+    }
+}
+
+/// Packed objects above `after`, minus each pack's deleted ones, merged with
+/// `loose` (which wins) in hash order, at most `limit`. A copy in several
+/// packs is listed once, with its latest modification time.
+pub(crate) fn merge_listing<'a>(
+    packs: impl IntoIterator<Item = (&'a PackIndex, &'a HashSet<Hash>)>,
+    loose: Vec<BlobMeta>,
+    after: Option<Hash>,
+    limit: usize,
+) -> Vec<BlobMeta> {
+    let mut merged = std::collections::BTreeMap::new();
+    for (index, dead) in packs {
+        let from = after.map_or(0, |a| match index.rank_of(&a) {
+            Ok(r) => r + 1,
+            Err(r) => r,
+        });
+        for e in (from..index.len())
+            .map(|r| index.entry(r as u32))
+            .filter(|e| !dead.contains(&e.hash))
+            .take(limit)
+        {
+            let m = BlobMeta {
+                hash: e.hash,
+                size: e.len,
+                modified: Some(e.modified),
+            };
+            merged
+                .entry(e.hash)
+                .and_modify(|old: &mut BlobMeta| old.modified = old.modified.max(m.modified))
+                .or_insert(m);
+        }
+    }
+    for m in loose {
+        merged.insert(m.hash, m);
+    }
+    merged.into_values().take(limit).collect()
 }
 
 /// Exclusive lock on `packs/tombstones.lock`, released on drop.

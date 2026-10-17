@@ -548,8 +548,9 @@ server before the first `condemn`.
 
 ## Packing blobs
 
-A filesystem blob store keeps every object whole in its own file until
-`leep-server repack` packs them (ADR 0029). A pack stores each file version
+A blob store keeps every object whole in its own file (or bucket object)
+until `leep-server repack` packs them (ADR 0029; for `s3://` stores,
+ADR 0040). A pack stores each file version
 as a zstd delta against the previous version at its path and each tree node
 against the same directory one commit earlier, so a long history shrinks by
 one to two orders of magnitude (the first 3,795 commits of git/git: 91.2 MB
@@ -568,9 +569,9 @@ new pack holding every live object (loose and already packed), waits
 `--fence` (default 10m, the same rule as `gc --fence`: longer than the
 servers' `--request-timeout` plus clock skew), then deletes the loose copies
 and the old packs. `--fence 0` is refused unless `--unsafe-no-fence` is
-given, which is only valid with every server stopped. Only filesystem blob
-stores (`file://` or a path) can be packed for now; an `s3://` store is
-refused with a message saying so.
+given, which is only valid with every server stopped. Filesystem blob
+stores (`file://` or a path) and object stores (`s3://`) can be packed; a
+`mem://` store is refused.
 
 The report counts loose objects and packs before, the new pack's size, how
 many objects were stored as deltas and how many whole, objects dropped
@@ -586,7 +587,7 @@ daily suits stores up to a few GB and weekly suits larger ones. Run it after
 `gc` so the deleted objects are dropped from the new pack:
 
 ```cron
-# 03:17 daily: collect garbage; 04:37 daily: repack (filesystem blob stores)
+# 03:17 daily: collect garbage; 04:37 daily: repack
 17 3 * * *  leep-server gc
 37 4 * * *  leep-server repack
 ```
@@ -604,6 +605,43 @@ Do not delete anything under `packs/` by hand, and do not delete
 `.repack-*` files in the shard directories: each is a whole object that the
 next repack puts back. `.tmp-*` files under `packs/` belong to a running
 repack, or are leftovers the next repack deletes.
+
+### Packing an object store (`s3://`)
+
+The same command and flags. Differences from a filesystem store:
+
+- **Local disk.** The repack downloads the packs it replaces and writes the
+  new pack to a temp file before uploading it, so the machine running it
+  needs free space in `TMPDIR` of about twice the packed size (plus the new
+  pack). A full repack reads every loose object once (one GET each, 32 at a
+  time) and every pack once.
+- **Conditional writes.** One repack at a time is enforced with a lease
+  object, `packs/repack.lease`, created with `If-None-Match` and renewed
+  with `If-Match`. AWS S3, MinIO, Cloudflare R2 and GCS support these; a
+  bucket that does not makes `repack` exit with a storage error before it
+  writes anything. Reads do not need them.
+- **A killed repack holds the lease for up to 10 minutes.** A second repack
+  in that time exits with "another repack is running ... until unix time
+  T". Wait, or, if you are sure no repack is running, delete
+  `packs/repack.lease`. Everything else a kill leaves is cleaned by the next
+  runs: a `.pack` with no `.idx` is deleted once it is older than the lease
+  TTL.
+- **Incomplete multipart uploads** from a killed repack are invisible but
+  billed. Give the bucket a lifecycle rule that aborts incomplete multipart
+  uploads after a day (`AbortIncompleteMultipartUpload`, `DaysAfterInitiation:
+  1`).
+- **Tombstones** are empty objects under `packs/tombstones/<pack id>/`, one
+  per blob GC deleted from a pack; the next full repack removes them with
+  their pack. Do not delete them by hand.
+- **Readers** fetch each pack's index once and keep it in memory. A server
+  notices a pack another process published on its next miss, listing
+  `packs/` at most every 5 s; the repack's fence (minutes) keeps every object
+  readable until then. A packed read costs one GET for the loose miss plus
+  one ranged GET in the common case; `contains` of a packed blob costs three
+  HEADs. ADR 0040 has the full request costs.
+
+Backups (`leep-server backup`) read a packed object store like an unpacked
+one.
 
 ## Verify and repair
 
@@ -1024,6 +1062,12 @@ checks every object still reads before and after the next repack;
 while it writes, after it publishes and during its cleanup, and checks that
 log, blame, search and show answer the same and `verify --full --rehash` is
 clean. Run both after changing the pack format, the filesystem store or GC.
+`cargo test -p leep-store objpack_tests` does the same for object stores
+(ADR 0040) over the in-memory and local-filesystem `object_store` backends:
+the kill sweep, GC deletes and a rescue racing the cleanup, and readers
+holding indexes of deleted packs; `cargo test -p leep-server --test
+repack_object` runs GC against a packed object store. Run them after
+changing the object store backend.
 
 **Leftovers after a real crash.** A killed filesystem blob store can leave
 `.tmp-*` files in its shard directories. Nothing reads or lists them, and

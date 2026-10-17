@@ -399,6 +399,13 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   answers a lookup in 0.9 us instead of 1.8 us. Existing `LEEPIDX1` indexes
   still read, now in place as well, and a full repack rewrites them. Upgrade
   every server before repacking: older servers refuse the new indexes.
+- `leep-server repack` packs `s3://` blob stores too (ADR 0040), with the
+  same pack files at `packs/<id>.pack` and `packs/<id>.idx` in the bucket.
+  Servers read packed objects with ranged GETs and see a new pack on their
+  next miss; GC deletes packed blobs with one empty tombstone object each;
+  one repack runs at a time through a lease object (`packs/repack.lease`)
+  written with conditional PUTs. Upgrade every server that reads the bucket
+  before the first repack: older servers do not read packs.
 - `log` without a path, `log` filtered by author or `extra`, and
   provenance read history in batches instead of a changeset at a time
   (ADR 0030): on the first 3,795 commits of git/git on Postgres, a log of the
