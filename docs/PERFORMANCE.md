@@ -896,7 +896,9 @@ VPS, default level 9 and fence:
 That is 35x smaller on disk, with no corrupt objects. Memory peaked at about
 5 GB of the machine's 11 GB. The index is 26% of pack plus index, so the 96-byte record (a
 32-byte base hash per object) is the next thing to shrink for histories of
-this size. The import then resumed from the packed store.
+this size. ADR 0038's index layout stores about 47-49 bytes per object
+instead (projected 219-228 MB for this pack, 15% of pack plus index; see
+"Packed blobs"). The import then resumed from the packed store.
 
 ## Garbage collection
 
