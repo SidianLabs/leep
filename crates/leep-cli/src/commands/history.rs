@@ -101,11 +101,13 @@ pub struct LastChangeArgs {
 
 #[derive(Args, Debug)]
 pub struct ShowArgs {
+    /// Ref or tag name, changeset id (full, or 4+ leading hex digits), or `@`.
     pub rev: String,
 }
 
 #[derive(Args, Debug)]
 pub struct CatArgs {
+    /// Ref or tag name, changeset id (full, or 4+ leading hex digits), or `@`.
     pub rev: String,
     /// Repository-relative path.
     pub path: String,

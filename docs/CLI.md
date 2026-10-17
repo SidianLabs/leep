@@ -4,6 +4,27 @@
 `leep COMMAND --help` explains one. This page holds what the help cannot: the
 exit codes and the contract scripts and agents can rely on.
 
+## Commands
+
+`leep --help` groups the commands by task, and `leep COMMAND --help` shows a
+command's options with examples for the common ones.
+
+| Group | Commands |
+|---|---|
+| Work | `init`, `checkout`, `status`, `diff`, `commit`, `amend`, `stash`, `restore`, `resolve`, `reset`, `sync`, `land` |
+| Branches | `branch`, `switch`, `tag`, `merge`, `rebase`, `cherry-pick`, `revert` |
+| History | `log`, `show`, `cat`, `blame`, `last-change`, `search`, `provenance`, `refs`, `reflog` |
+| Review | `review` (`approve`, `reject`, `status`, `list`), `reviews` |
+| Admin | `undo`, `keygen` |
+
+Global options, accepted by every command and listed only in `leep --help`:
+
+| Option | Effect |
+|---|---|
+| `--server URL` | Server URL; overrides `LEEP_SERVER`, which overrides `.leep/config.json`. |
+| `--token TOKEN` | Bearer token; overrides `LEEP_TOKEN` and `.leep/config.json`. Prefer `LEEP_TOKEN`: a flag is visible in process listings. |
+| `--json` | Print results as JSON (usually the raw `/v1` response), and errors as one JSON document (below). |
+
 ## Revisions
 
 Wherever a command takes a revision (`REV`, `FROM TO`, `--rev`, `--source`):

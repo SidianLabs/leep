@@ -13,7 +13,7 @@ use crate::status::status;
 
 #[derive(Args, Debug)]
 pub struct CheckoutArgs {
-    /// Ref name, 64-hex changeset id, or `@`.
+    /// Ref or tag name, changeset id (full, or 4+ leading hex digits), or `@`.
     pub rev: String,
     /// Replace the sparse prefixes (repeatable).
     #[arg(long = "prefix")]

@@ -142,6 +142,10 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   and a land that creates a ref prints `created ref NAME`. `POST /v1/land`
   takes an optional `create`; without it the server creates the ref as
   before, so older clients, the MCP server and scripts are unaffected.
+- `leep --help` groups the commands (Work, Branches, History, Review, Admin)
+  and describes `--server`, `--token` and `--json` once; each command's help
+  no longer repeats them and points there instead. The most used commands
+  have examples in their `--help`.
 
 ### Hardening
 - Fuzz targets for every decoder and parser: persisted objects, derived

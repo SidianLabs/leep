@@ -2,7 +2,7 @@
 
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 
 use crate::cache::Cache;
 use crate::client::Client;
@@ -11,40 +11,28 @@ use crate::commands::{
     reflog, reset, resolve, restore, review, search, stash, status, Ctx, Remote,
 };
 use crate::error::{CliError, ErrorKind, Result};
+use crate::help;
 use crate::state::{resolve_token, WorkCopy};
 
 const DEFAULT_SERVER: &str = "http://127.0.0.1:8080";
-
-/// Shown under the top-level help; the full contract is docs/CLI.md.
-const EXIT_CODES_HELP: &str = "\
-Exit codes (ADR 0033):
-  0  success
-  1  generic failure (bad input, refused operation, authentication);
-     also \"no\" from `search` and `review status`
-  2  usage: the command line does not parse
-  3  server or network failure; running the command again may work
-  4  not found (revision, ref, branch, tag, file, stash)
-  5  conflict: resolve the conflicts, or retry a lost race
-  6  nothing to do (`commit`, `amend`, `stash push` with nothing to record)
-  130 interrupted";
 
 #[derive(Parser, Debug)]
 #[command(
     name = "leep",
     version,
     about = "Client for the Leep version control server",
-    after_help = EXIT_CODES_HELP
+    after_help = help::EXIT_CODES
 )]
 pub struct Cli {
     /// Server URL (overrides the working copy config).
-    #[arg(long, global = true, env = "LEEP_SERVER")]
+    #[arg(long, global = true, env = "LEEP_SERVER", hide = true)]
     pub server: Option<String>,
     /// Bearer token (or set LEEP_TOKEN; falls back to `.leep/config.json`).
-    #[arg(long, global = true, hide_env_values = true)]
+    #[arg(long, global = true, hide_env_values = true, hide = true)]
     pub token: Option<String>,
     /// Print the raw API response as JSON; an error becomes
     /// `{"error":{"code","message","hint","retryable"}}` on stdout.
-    #[arg(long, global = true)]
+    #[arg(long, global = true, hide = true)]
     pub json: bool,
     #[command(subcommand)]
     pub command: Command,
@@ -53,16 +41,21 @@ pub struct Cli {
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Create a working copy.
+    #[command(after_help = help::INIT)]
     Init(init::InitArgs),
     /// Materialize a revision.
+    #[command(after_help = help::CHECKOUT)]
     Checkout(checkout::CheckoutArgs),
     /// Show added, modified, deleted and conflicted files.
+    #[command(after_help = help::STATUS)]
     Status,
     /// Show changes (working copy vs base, or `FROM TO` on the server).
+    #[command(after_help = help::DIFF)]
     Diff(diff::DiffArgs),
     /// Create an author signing key for `leep commit --sign`.
     Keygen(keygen::KeygenArgs),
     /// Record local changes as a changeset.
+    #[command(after_help = help::COMMIT)]
     Commit(commit::CommitArgs),
     /// Fold uncommitted changes and a new message into an unlanded base.
     Amend(amend::AmendArgs),
@@ -83,26 +76,34 @@ pub enum Command {
     /// Undo one changeset with a new local commit.
     Revert(pick::RevertArgs),
     /// Land the current changeset on the target ref.
+    #[command(after_help = help::LAND)]
     Land(land::LandArgs),
     /// Move to the head of the target ref, keeping uncommitted work.
+    #[command(after_help = help::SYNC)]
     Sync(checkout::SyncArgs),
     /// List, create or delete branches.
+    #[command(after_help = help::BRANCH)]
     Branch(branch::BranchArgs),
     /// Switch the working copy to another branch.
+    #[command(after_help = help::SWITCH)]
     Switch(branch::SwitchArgs),
     /// List, create or delete tags (immutable named revisions).
     Tag(branch::TagArgs),
     /// Show history.
+    #[command(after_help = help::LOG)]
     Log(history::LogArgs),
     /// Show the newest changeset that changed a file or directory.
     LastChange(history::LastChangeArgs),
     /// Show one changeset.
+    #[command(after_help = help::SHOW)]
     Show(history::ShowArgs),
     /// Print a file at a revision.
     Cat(history::CatArgs),
     /// Search file contents at a revision on the server, like grep.
+    #[command(after_help = help::SEARCH)]
     Search(search::SearchArgs),
     /// Show who last changed each line.
+    #[command(after_help = help::BLAME)]
     Blame(history::BlameArgs),
     /// Summarize which agents and authors made the changesets.
     Provenance(history::ProvenanceArgs),
@@ -111,16 +112,25 @@ pub enum Command {
     /// Show how refs moved: who, when, and from where to where.
     Reflog(reflog::ReflogArgs),
     /// Move a ref back to where it was before its last (or a chosen) move.
+    #[command(after_help = help::UNDO)]
     Undo(reflog::UndoArgs),
     /// Approve or reject changesets, and see what a changeset needs to land.
-    #[command(subcommand)]
+    #[command(subcommand, after_help = help::REVIEW)]
     Review(review::ReviewCmd),
     /// List the reviews a changeset has (same as `review list`).
     Reviews(review::ListArgs),
 }
 
+/// The command line definition with the help text of [`help`].
+pub fn command() -> clap::Command {
+    help::decorate(Cli::command())
+}
+
 pub fn main() -> ExitCode {
-    let cli = match Cli::try_parse() {
+    let parsed = command()
+        .try_get_matches()
+        .and_then(|m| Cli::from_arg_matches(&m));
+    let cli = match parsed {
         Ok(cli) => cli,
         Err(e) => return usage_error(e),
     };
