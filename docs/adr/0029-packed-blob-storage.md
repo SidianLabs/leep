@@ -167,3 +167,6 @@ silent, or where implementing it changed it:
 - Phase 3 items stay open: incremental repack, copying packs as files in
   backups (until then a backup copies packed objects as loose ones, which is
   correct but not smaller), and packs for the object store backend.
+  [ADR 0040](0040-packs-in-object-stores.md) adds the last: the same files
+  in a bucket, tombstones as one object each, and a lease object in place of
+  the repack lock.

@@ -7,7 +7,7 @@ use bytes::Bytes;
 use leep_core::{BlobMeta, BlobStore, Error, Hash, Result};
 use tokio::io::AsyncWriteExt;
 
-use crate::packset::{PackSet, DEFAULT_DECODED_CACHE};
+use crate::packset::{merge_listing, PackSet, DEFAULT_DECODED_CACHE};
 use crate::storage_err;
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -194,33 +194,8 @@ impl BlobStore for FsBlobStore {
         if view.is_empty() {
             return Ok(loose);
         }
-        let mut merged = std::collections::BTreeMap::new();
-        for (pack, dead) in &view.packs {
-            let index = &pack.index;
-            let from = after.map_or(0, |a| match index.rank_of(&a) {
-                Ok(r) => r + 1,
-                Err(r) => r,
-            });
-            for e in (from..index.len())
-                .map(|r| index.entry(r as u32))
-                .filter(|e| !dead.contains(&e.hash))
-                .take(limit)
-            {
-                let m = BlobMeta {
-                    hash: e.hash,
-                    size: e.len,
-                    modified: Some(e.modified),
-                };
-                merged
-                    .entry(e.hash)
-                    .and_modify(|old: &mut BlobMeta| old.modified = old.modified.max(m.modified))
-                    .or_insert(m);
-            }
-        }
-        for m in loose {
-            merged.insert(m.hash, m);
-        }
-        Ok(merged.into_values().take(limit).collect())
+        let packs = view.packs.iter().map(|(p, dead)| (&p.index, dead));
+        Ok(merge_listing(packs, loose, after, limit))
     }
 
     /// Tombstones packed copies first, then removes the loose file, so a

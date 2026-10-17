@@ -179,8 +179,9 @@ enum Cmd {
         #[arg(long, global = true)]
         full: bool,
     },
-    /// Pack every live blob and tree node of a filesystem blob store into one
-    /// delta-compressed pack (ADR 0029; uses --meta and --blobs; safe beside
+    /// Pack every live blob and tree node of a filesystem or s3:// blob store
+    /// into one delta-compressed pack (ADR 0029, ADR 0040; uses --meta and
+    /// --blobs; safe beside
     /// running servers): write and publish the pack, wait --fence, then
     /// delete the loose copies and old packs it replaces.
     Repack(repack_cli::RepackArgs),

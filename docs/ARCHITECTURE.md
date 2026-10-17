@@ -70,7 +70,7 @@ content-addressing and (b) the atomicity of `MetaStore::cas_ref`.
 | Crate | Role | May depend on |
 |---|---|---|
 | `leep-core` | Types, hashing, encoding, `BlobStore`/`MetaStore` traits (including listing and blob deletion for GC, a changeset id prefix lookup for short ids, listing and dropping derived rows by kind for repair, batched changeset and derived reads for history walks, and batched derived writes and changeset-with-rows writes for changeset creation), in-memory stores, conformance tests, API types, pure rename detection | no other leep crate; no I/O, no async runtime |
-| `leep-store` | `BlobStore` backends: filesystem (loose objects plus delta-compressed packs and the repack writer, ADR 0029), `object_store` (S3/MinIO), `CachedBlobStore`, `open_blob_store(url)`, and the incremental blob copy backup and restore use (`sync`, ADR 0026) | core |
+| `leep-store` | `BlobStore` backends: filesystem (loose objects plus delta-compressed packs and the repack writer, ADR 0029), `object_store` (S3/MinIO; loose objects plus the same packs, ADR 0040), `CachedBlobStore`, `open_blob_store(url)`, and the incremental blob copy backup and restore use (`sync`, ADR 0026) | core |
 | `leep-meta` | `MetaStore` backends: SQLite, Postgres, `open_meta_store(url)`, the versioned schema migrator (`migrate`, ADR 0023), and metadata snapshots and their import (`snapshot`, ADR 0026) | core |
 | `leep-derive` | `Repo`: derived data framework and kinds, plus all operations, blob garbage collection (`gc`), the delta-base walk for `repack` (`pack_order`) and store verification and repair (`integrity`) | core (traits only, never a concrete backend) |
 | `leep-server` | HTTP server binary `leep-server`, and its offline subcommands (`gc`, `migrate`, `verify`, `repair`, `backup`, `restore`, `backup-verify`) | core, store, meta, derive |
@@ -515,7 +515,25 @@ the hashes in a sorted column behind a 256-entry fanout table. Each hash then
 has a record whose field widths are chosen per pack, about 45 bytes per
 object in all. The store keeps index files in memory as they are on disk and
 searches them without decoding. Indexes in the original 96-byte layout still
-read, and a full repack rewrites them. Planned: a regional cache tier, the same server binary in a
+read, and a full repack rewrites them.
+
+The object store backend (ADR 0040) reads the same packs from the bucket:
+
+```
+ObjectBlobStore.get(hash)
+   → GET blobs/<2 hex>/<62 hex>                     (every new write lands here)
+   → packs/*.idx  (fetched once, kept in memory; minus packs/tombstones/<id>/<hash>)
+        → decoded-object cache → one batched ranged GET of the chain's frames in the .pack
+```
+With no directory to watch, a miss lists `packs/` again at most every 5 s,
+which is safe because a repack deletes loose copies only after a fence of
+minutes, and a read that finds its cached pack deleted lists at once.
+`contains` HEADs the copy's tombstone and the pack's index, so it is exact
+across processes as GC needs. Tombstones are one empty object each, so GC
+deletes never contend, and a lease object (`packs/repack.lease`, conditional
+create and renew) replaces the repack lock.
+
+Planned: a regional cache tier, the same server binary in a
 read-through mode against an upstream server. Strict tiering means a cold
 regional cache cannot stampede the origin. The server's cache reports hits,
 misses and occupancy as Prometheus metrics (see [OPERATIONS.md](OPERATIONS.md)).
@@ -568,6 +586,7 @@ misses and occupancy as Prometheus metrics (see [OPERATIONS.md](OPERATIONS.md)).
 | Disk, volume or database lost | Everything since the last backup's snapshot instant | `leep-server restore` into fresh stores, `verify --full --rehash`, start servers (OPERATIONS.md, "Backup and restore") |
 | `gc` killed at any point | Rows it wrote are harmless (a condemned blob is re-uploaded on demand, an announced delete is closed by the next collect); no reachable blob was deleted | Run `gc collect` again |
 | `repack` killed at any point | Before the index rename nothing is published (temp files and an index-less pack are garbage); after it every object is in the new pack and perhaps also loose, moved aside, or in an old pack. Every object reads throughout | Run `repack` again: it deletes the garbage, puts moved-aside copies back and finishes |
+| `repack` of an object store killed at any point | Before the index upload nothing is published (an index-less `.pack` or an incomplete multipart upload is garbage); after it every object is in the new pack and perhaps also loose or in an old pack. Every object reads throughout. The lease stays until it expires (10 min) | Run `repack` again after the lease expires: it deletes the garbage (once older than the lease) and finishes |
 
 **What each backend guarantees.** "Applied" means durable against a process
 kill; the SQL backends and the filesystem store also survive power loss
@@ -581,6 +600,7 @@ except where noted.
 | Filesystem blobs | Write a temp file, fsync it, rename it into place | A blob is never visible partly written; a crash before the rename leaves a `.tmp-*` file that is never listed, read or counted as the blob and never removed (safe to delete when older than the request timeout). The shard directory is not fsynced, so power loss (not a kill) can lose the rename of a put that was acknowledged | A put that errors after the rename leaves a whole blob; repeating it is a no-op |
 | Filesystem packs | A pack is published by renaming its fsynced index into place after its fsynced pack file, fsyncing `packs/` after each; a delete of a packed object is one fsynced tombstone line | Nothing partial is ever read: an unpublished pack has no index, and a torn tombstone line is ignored. Loose copies and replaced packs are deleted only after the fence, so a reader that listed the old layout still finds every object | A delete that errors after its tombstone was written has deleted; repeating it is a no-op |
 | Object store (S3) | One PUT | No partial objects | Same as above |
+| Object store packs | A pack is published by uploading its index after the complete pack (a multipart upload is invisible until completed); a delete of a packed object is one tombstone object per pack | Nothing partial is ever read. Loose copies and replaced packs are deleted only after the fence, and readers list `packs/` again on a miss or a missing pack | A delete that errors after its tombstones were written has deleted; repeating it is a no-op |
 | `CachedBlobStore` | None (memory) | Gone with the process | A failed put or read caches nothing; a deleted blob can be served from the cache until evicted, which is harmless because only unreferenced blobs are deleted |
 
 Derived data is only ever missing after a failure, never wrong: a row is
@@ -714,5 +734,6 @@ node is stored whole, so imported git/git takes 8.7 GB of objects against a
 repack` stores objects as zstd deltas against the previous version of the
 same path, with no change to hashes, the API or clients. The filesystem
 store has them (the first 3,795 commits of git/git: 91.2 MB loose, a 3.1 MB
-pack plus a 0.5 MB index since ADR 0038, against git's 4.4 MB pack); the
-object store backend and incremental repacks are next.
+pack plus a 0.5 MB index since ADR 0038, against git's 4.4 MB pack), and
+so does the object store backend since ADR 0040; incremental repacks are
+next.

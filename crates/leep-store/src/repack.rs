@@ -16,15 +16,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use bytes::Bytes;
 use leep_core::{Error, Hash, Result};
 
-use crate::cache::Lru;
 use crate::fs::unix_secs;
-use crate::pack::{self, IdxEntry, PackIndex, MAX_CHAIN, PACK_MAGIC};
+use crate::pack::{self, IdxEntry, PackIndex, MAX_CHAIN};
 use crate::packset::{
     lock_tombstones, parse_tombstones, published_ids, sync_dir, tombstone_line, Pack, TOMBSTONES,
 };
+use crate::packwrite::{write_order, write_pack, PackSource, SourceRead};
 use crate::{storage_err, FsBlobStore};
 
 /// Held for a whole repack, fence included, so two never overlap. A lock,
@@ -33,9 +32,6 @@ const REPACK_LOCK: &str = "repack.lock";
 /// Prefix of a loose copy moved aside while a repack decides whether to
 /// delete it. A leftover is a whole object and the next repack puts it back.
 const ASIDE_PREFIX: &str = ".repack-";
-/// Recently written objects kept as delta bases while writing a pack.
-const BASE_CACHE: usize = 256 << 20;
-
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Where a repack is. The hook sees each step before it runs or after it is
@@ -215,7 +211,7 @@ impl PublishedPack {
     }
 }
 
-fn step(opts: &RepackOptions, s: RepackStep) -> Result<()> {
+pub(crate) fn step(opts: &RepackOptions, s: RepackStep) -> Result<()> {
     match &opts.hook {
         Some(h) => h(s),
         None => Ok(()),
@@ -383,14 +379,18 @@ struct Source {
     packed: Option<(Arc<Pack>, IdxEntry)>,
 }
 
-enum Read {
-    Ok {
-        data: Bytes,
-        modified: i64,
-        from_loose: Option<Option<SystemTime>>,
-    },
-    Vanished,
-    Corrupt,
+type Read = SourceRead<Option<SystemTime>>;
+
+struct FsSource<'a> {
+    store: &'a FsBlobStore,
+    sources: &'a HashMap<Hash, Source>,
+}
+
+impl PackSource for FsSource<'_> {
+    type Stamp = Option<SystemTime>;
+    fn read(&mut self, hash: &Hash) -> Result<Read> {
+        read_source(self.store, &self.sources[hash], hash)
+    }
 }
 
 fn read_source(store: &FsBlobStore, src: &Source, hash: &Hash) -> Result<Read> {
@@ -520,107 +520,22 @@ impl FsBlobStore {
             .filter(|h| !sources.contains_key(h))
             .count() as u64;
 
-        let mut order: Vec<(Hash, Option<Hash>)> = Vec::with_capacity(sources.len());
-        let mut placed: HashSet<Hash> = HashSet::with_capacity(sources.len());
-        for (h, base) in hints {
-            if sources.contains_key(&h) && placed.insert(h) {
-                order.push((h, base));
-            }
-        }
-        let mut rest: Vec<Hash> = sources
-            .keys()
-            .filter(|h| !placed.contains(*h))
-            .copied()
-            .collect();
-        rest.sort();
-        order.extend(rest.into_iter().map(|h| (h, None)));
+        let live: HashSet<Hash> = sources.keys().copied().collect();
+        let order = write_order(hints, &live);
 
         let tmp_pack = temp_name(&dir, "pack");
         let mut out =
             BufWriter::with_capacity(1 << 20, File::create(&tmp_pack).map_err(storage_err)?);
-        let mut hasher = blake3::Hasher::new();
-        let mut offset = 0u64;
-        let mut emit = |bytes: &[u8], out: &mut BufWriter<File>| -> Result<u64> {
-            out.write_all(bytes).map_err(storage_err)?;
-            hasher.update(bytes);
-            let at = offset;
-            offset += bytes.len() as u64;
-            Ok(at)
+        let mut src = FsSource {
+            store: self,
+            sources: &sources,
         };
-        emit(&PACK_MAGIC, &mut out)?;
-        // In pack order; a base is a position in this list.
-        let mut entries: Vec<IdxEntry> = Vec::with_capacity(order.len());
-        // Position in `entries` and chain depth of each object written.
-        let mut written: HashMap<Hash, (u32, usize)> = HashMap::with_capacity(order.len());
-        let mut bases = Lru::default();
-        let mut from_loose = Vec::new();
-        for (hash, base) in order {
-            let src = &sources[&hash];
-            let (data, modified, loose_mtime) = match read_source(self, src, &hash)? {
-                Read::Ok {
-                    data,
-                    modified,
-                    from_loose,
-                } => (data, modified, from_loose),
-                Read::Vanished => {
-                    report.vanished += 1;
-                    continue;
-                }
-                Read::Corrupt => {
-                    report.corrupt.push(hash);
-                    continue;
-                }
-            };
-            let mut frame = pack::compress_whole(&data, opts.level)?;
-            let mut used = None;
-            let mut d = 0;
-            if let Some(b) = base.filter(|b| *b != hash) {
-                if let Some(&(bp, bd)) = written.get(&b).filter(|(_, bd)| *bd < opts.max_chain) {
-                    let base_bytes = match bases.get(&b) {
-                        Some(x) => Some(x),
-                        None => match read_source(self, &sources[&b], &b)? {
-                            Read::Ok { data, .. } => Some(data),
-                            _ => None,
-                        },
-                    };
-                    if let Some(bb) = base_bytes {
-                        if let Some(delta) = pack::compress_delta(&bb, &data, opts.level)? {
-                            if delta.len() < frame.len() {
-                                frame = delta;
-                                used = Some(bp);
-                                d = bd + 1;
-                            }
-                        }
-                    }
-                }
-            }
-            let at = emit(&frame, &mut out)?;
-            entries.push(IdxEntry {
-                hash,
-                offset: at,
-                stored_len: frame.len() as u64,
-                len: data.len() as u64,
-                base: used,
-                modified,
-            });
-            if used.is_some() {
-                report.deltas += 1;
-            } else {
-                report.whole += 1;
-            }
-            report.logical_bytes += data.len() as u64;
-            written.insert(hash, (entries.len() as u32 - 1, d));
-            bases.insert(hash, data, BASE_CACHE);
-            if let Some(m) = loose_mtime {
-                from_loose.push((hash, m));
-            }
-            step(&opts, RepackStep::Wrote(entries.len() as u64))?;
-        }
+        let written = write_pack(order, &mut src, &opts, &mut out, &mut report)?;
+        let (entries, from_loose) = (written.entries, written.from_loose);
         let file = out.into_inner().map_err(|e| storage_err(e.error()))?;
         file.sync_all().map_err(storage_err)?;
         drop(file);
         step(&opts, RepackStep::PackSynced)?;
-        report.objects = entries.len() as u64;
         let replaced: Vec<String> = view.packs.iter().map(|(p, _)| p.id.clone()).collect();
 
         if entries.is_empty() {
@@ -634,7 +549,7 @@ impl FsBlobStore {
                 _lock: lock,
             });
         }
-        let idx_bytes = PackIndex::encode(offset, *hasher.finalize().as_bytes(), &entries)?;
+        let idx_bytes = PackIndex::encode(written.len, written.hash, &entries)?;
         let id = pack::pack_id(&idx_bytes);
         std::fs::rename(&tmp_pack, dir.join(format!("{id}.pack"))).map_err(storage_err)?;
         sync_dir(&dir)?;
@@ -645,7 +560,7 @@ impl FsBlobStore {
         std::fs::rename(&tmp_idx, dir.join(format!("{id}.idx"))).map_err(storage_err)?;
         sync_dir(&dir)?;
         step(&opts, RepackStep::Published)?;
-        report.pack_bytes = offset;
+        report.pack_bytes = written.len;
         report.index_bytes = idx_bytes.len() as u64;
         report.pack_id = Some(id.clone());
 
