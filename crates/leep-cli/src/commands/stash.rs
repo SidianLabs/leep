@@ -210,7 +210,8 @@ fn apply(ctx: &mut Ctx, target: Option<&str>, pop: bool) -> Result<i32> {
             "working copy has uncommitted changes; commit or stash them first",
         ));
     }
-    let plan = overlay::plan(ctx, id, base)?;
+    let labels = crate::markers::Labels::new("working copy", format!("stash {}", short(id)));
+    let plan = overlay::plan(ctx, id, base, &labels)?;
     let stats = overlay::apply(ctx, &plan)?;
     let conflicted = !plan.conflicts.is_empty() || !plan.unmerged.is_empty();
     let code = if conflicted { exit::CONFLICT } else { exit::OK };

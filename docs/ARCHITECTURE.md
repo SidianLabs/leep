@@ -381,7 +381,11 @@ call `POST /v1/rebase` for the snapshot onto the new base and write the result
 back as uncommitted changes (`overlay.rs`): everything is fetched first, each
 file is written through a temp file and renamed, writes are journalled and
 undone if anything fails, and the state is saved last. Conflicts become marker
-files like in `land`, and `commit` and `land` refuse while any remain.
+files like in `land`, and `commit` and `land` refuse while any remain. The CLI
+relabels the server's `<<<<<<< ours` / `>>>>>>> theirs` by role before writing
+(`main (landed)` / `yours` for `land` and `sync`, `yours` / `ID (merging)` for
+`merge`; `markers.rs`); detection only checks the `<<<<<<< ` prefix, so old and
+new labels both count.
 Conflicts with no text merge (binary, delete versus modify) keep the local
 version and are recorded in `state.unresolved`; they block the same way until
 `leep resolve PATH` or `leep restore PATH` clears them. If the

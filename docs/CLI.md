@@ -50,6 +50,25 @@ with exit 1 and lists the candidates (`--json`: `code: "ambiguous"` and
 is the first land onto `main` of an empty repository. When a land creates a
 ref, `leep` prints `created ref NAME` on stderr.
 
+## Conflict markers
+
+When a land, sync, merge, cherry-pick, revert or stash apply cannot merge a
+text file, `leep` writes conflict markers into it, labelled by role:
+
+| Command | `<<<<<<<` side | `>>>>>>>` side |
+|---|---|---|
+| `land`, `sync` | `TARGET (landed)`, for example `main (landed)` | `yours` |
+| `merge REV` | `yours` | `ID (merging)` |
+| `cherry-pick REV`, `revert REV` | `yours` | `ID (cherry-pick)`, `ID (revert)` |
+| `stash apply`, `stash pop` | `working copy` | `stash ID` |
+
+A diff3 base section (`||||||| original`) may sit between them. Only the
+labels are the CLI's: the server's `merged_with_markers` text, which the MCP
+server passes on, still says `ours` and `theirs`, and the `/v1` fields keep
+those names. Detection only looks for a line starting with `<<<<<<< `, so
+files written by older clients with `<<<<<<< ours` still block `commit` and
+`land` until resolved.
+
 ## Exit codes
 
 Decided in [ADR 0033](adr/0033-cli-exit-codes-and-json-errors.md).

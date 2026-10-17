@@ -13,6 +13,7 @@ use leep_core::{ChangesetId, FileChange, FileKind, RepoPath};
 use super::{print_json, Ctx};
 use crate::error::{exit, CliError, ErrorKind, Result};
 use crate::fmt::short;
+use crate::markers::{relabel, Labels};
 use crate::materialize::{materialize, write_file};
 use crate::status::status;
 
@@ -77,7 +78,7 @@ pub fn run(ctx: &mut Ctx, args: &LandArgs) -> Result<i32> {
             conflicts,
             clean,
         } => {
-            let unmerged = rebase_locally(ctx, onto, &conflicts, &clean)?;
+            let unmerged = rebase_locally(ctx, &target_ref, onto, &conflicts, &clean)?;
             if !ctx.json {
                 println!(
                     "Cannot land cleanly: {} conflict{} against {} on {target_ref}",
@@ -194,6 +195,7 @@ fn hint_policy(e: CliError, target_ref: &str) -> CliError {
 /// markers.
 fn rebase_locally(
     ctx: &mut Ctx,
+    target_ref: &str,
     onto: ChangesetId,
     conflicts: &[Conflict],
     clean: &BTreeMap<RepoPath, FileChange>,
@@ -221,6 +223,7 @@ fn rebase_locally(
         let path = c.path.to_string();
         match (&c.merged_with_markers, &c.theirs) {
             (Some(text), _) => {
+                let text = relabel(text, &Labels::landed(target_ref));
                 write_file(
                     &ctx.wc.abs_for_write(&path)?,
                     text.as_bytes(),

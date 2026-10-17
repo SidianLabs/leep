@@ -16,6 +16,7 @@ use super::integrate::{abort, added_paths, load_key, print_conflicts, sign};
 use super::{print_json, Ctx};
 use crate::error::{exit, CliError, Result};
 use crate::fmt::short;
+use crate::markers::Labels;
 use crate::overlay::{self, Keep, Pending};
 use crate::snapshot;
 use crate::state::MergeState;
@@ -134,8 +135,15 @@ pub fn run(ctx: &mut Ctx, args: &MergeArgs) -> Result<i32> {
         MergeResponse::Conflicts { conflicts, clean } => {
             check_clean_reported(ctx, fork, other, base, &conflicts, &clean)?;
             let base_files = crate::materialize::list_files(ctx, &base)?;
-            let mut plan =
-                overlay::plan_conflicts(ctx, base, base_files, conflicts, clean, Keep::Ours)?;
+            let mut plan = overlay::plan_conflicts(
+                ctx,
+                base,
+                base_files,
+                conflicts,
+                clean,
+                Keep::Ours,
+                &Labels::new("yours", format!("{} (merging)", short(other))),
+            )?;
             plan.pending = Some(Pending::Merge(MergeState {
                 other,
                 message: message.clone(),

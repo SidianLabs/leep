@@ -1235,3 +1235,37 @@ fn every_command_refuses_unresolved_paths_by_name() {
         assert!(m.contains("unresolved conflicts in img.bin"), "{m}");
     }
 }
+
+#[test]
+fn conflict_markers_name_the_sides_and_old_labels_still_count() {
+    let mut env = Env::new();
+    let (mut ctx, _main, feat) = text_conflict(&mut env);
+    assert_eq!(merge::run(&mut ctx, &merge_args("feature")).unwrap(), 5);
+    let text = read(&ctx, "a.txt");
+    let theirs = format!(">>>>>>> {} (merging)\n", &feat.to_string()[..12]);
+    assert!(text.starts_with("<<<<<<< yours\n"), "{text}");
+    assert!(text.contains(&theirs), "{text}");
+    assert!(!text.contains("<<<<<<< ours"), "{text}");
+
+    let resolve_a = |ctx: &mut Ctx| {
+        resolve::run(
+            ctx,
+            &ResolveArgs {
+                paths: vec!["a.txt".into()],
+                force: false,
+            },
+        )
+    };
+    let m = conflict_err(resolve_a(&mut ctx).unwrap_err());
+    assert!(m.contains("markers remain"), "{m}");
+    // A file with the old labels (an older client wrote it) still counts.
+    write(
+        &ctx,
+        "a.txt",
+        "<<<<<<< ours\na main\n=======\na feature\n>>>>>>> theirs\n",
+    );
+    let m = conflict_err(resolve_a(&mut ctx).unwrap_err());
+    assert!(m.contains("markers remain"), "{m}");
+    write(&ctx, "a.txt", "a both\n");
+    assert_eq!(resolve_a(&mut ctx).unwrap(), 0);
+}

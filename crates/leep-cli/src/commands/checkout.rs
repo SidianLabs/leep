@@ -103,7 +103,8 @@ pub fn sync(ctx: &mut Ctx, args: &SyncArgs) -> Result<i32> {
         );
         e.map_message(|_| note)
     };
-    let plan = overlay::plan(ctx, snapshot, new_base).map_err(kept_msg)?;
+    let labels = crate::markers::Labels::landed(&ctx.wc.config.target_ref);
+    let plan = overlay::plan(ctx, snapshot, new_base, &labels).map_err(kept_msg)?;
     let stats = overlay::apply(ctx, &plan).map_err(kept_msg)?;
     finish(
         ctx,

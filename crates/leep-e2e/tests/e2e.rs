@@ -1451,6 +1451,11 @@ fn run_everyday_workflow(stores: &Stores, work: &Path) {
     assert!(stdout(&out).contains("C doc.txt"), "{}", stdout(&out));
     let doc = fs::read_to_string(b.join("doc.txt")).unwrap();
     assert!(doc.contains("<<<<<<<") && doc.contains("one from A") && doc.contains("one from B"));
+    // The server's diff3 markers, relabelled by role.
+    assert!(
+        doc.contains("<<<<<<< main (landed)\n") && doc.contains(">>>>>>> yours\n"),
+        "{doc}"
+    );
     assert!(client.ok(&b, &["status"]).contains("C doc.txt"));
     let out = client.run(&b, &["commit", "-m", "too soon"]);
     assert_eq!(out.status.code(), Some(5));

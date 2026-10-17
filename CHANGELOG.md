@@ -146,6 +146,11 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   and describes `--server`, `--token` and `--json` once; each command's help
   no longer repeats them and points there instead. The most used commands
   have examples in their `--help`.
+- Conflict markers written by the CLI name the sides by role instead of
+  `ours` / `theirs`: `<<<<<<< main (landed)` and `>>>>>>> yours` after `land`
+  and `sync`, `yours` and `ID (merging)` after `merge`, and similarly for
+  `cherry-pick`, `revert` and `stash apply`. Files with the old labels are
+  still recognised; the `/v1` text and fields are unchanged.
 
 ### Hardening
 - Fuzz targets for every decoder and parser: persisted objects, derived

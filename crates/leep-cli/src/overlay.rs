@@ -15,6 +15,7 @@ use leep_core::{ChangesetId, FileChange, FileKind, Hash, RepoPath};
 
 use crate::commands::Ctx;
 use crate::error::{CliError, Result};
+use crate::markers::{relabel, Labels};
 use crate::materialize::{check_not_in_the_way, list_files, remove_file, write_file, Stats};
 use crate::state::{FileState, MergeState, PickState};
 use crate::status::{self, mtime_ns, read_content, scan_file, Change};
@@ -90,7 +91,7 @@ pub struct Plan {
 /// Ask the server to rebase `change` (a snapshot) onto `onto` and turn the
 /// answer into a [`Plan`]. Nothing local changes. Conflicts are never
 /// resolved here: they become marker files, as in `land`.
-pub fn plan(ctx: &Ctx, change: ChangesetId, onto: ChangesetId) -> Result<Plan> {
+pub fn plan(ctx: &Ctx, change: ChangesetId, onto: ChangesetId, labels: &Labels) -> Result<Plan> {
     let base_files = list_files(ctx, &onto)?;
     let resp = ctx.client.rebase(&RebaseRequest {
         changeset: change,
@@ -114,7 +115,7 @@ pub fn plan(ctx: &Ctx, change: ChangesetId, onto: ChangesetId) -> Result<Plan> {
         RebaseResponse::Conflicts {
             conflicts: found,
             clean,
-        } => plan_conflicts(ctx, onto, base_files, found, clean, Keep::Theirs),
+        } => plan_conflicts(ctx, onto, base_files, found, clean, Keep::Theirs, labels),
     }
 }
 
@@ -130,6 +131,7 @@ pub fn plan_conflicts(
     found: Vec<Conflict>,
     clean: BTreeMap<RepoPath, FileChange>,
     keep: Keep,
+    labels: &Labels,
 ) -> Result<Plan> {
     let outside: Vec<String> = clean
         .keys()
@@ -182,7 +184,7 @@ pub fn plan_conflicts(
                 want.insert(
                     path.clone(),
                     Want::Text {
-                        text: text.clone(),
+                        text: relabel(text, labels),
                         kind,
                     },
                 );

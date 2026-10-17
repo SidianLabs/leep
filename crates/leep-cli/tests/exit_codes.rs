@@ -301,3 +301,28 @@ fn main_is_created_unasked_only_in_an_empty_repository() {
     assert_eq!(out.status.code(), Some(4), "{}", text(&out.stderr));
     assert!(!mock.data.lock().unwrap().refs.contains_key("main"));
 }
+
+#[test]
+fn land_conflict_markers_say_which_side_is_landed() {
+    let leep = Leep::new();
+    let mock = Mock::start();
+    mock.seed(None, &[("a.txt", "base\n", FileKind::Regular)], &[]);
+    let (a, b) = (init(&leep, &mock), init(&leep, &mock));
+    std::fs::write(a.path().join("a.txt"), "from a\n").unwrap();
+    std::fs::write(b.path().join("a.txt"), "from b\n").unwrap();
+    leep.ok(a.path(), &["commit", "-m", "a"]);
+    leep.ok(b.path(), &["commit", "-m", "b"]);
+    leep.ok(a.path(), &["land"]);
+    assert_eq!(leep.run(b.path(), &["land"]).status.code(), Some(5));
+    let text = std::fs::read_to_string(b.path().join("a.txt")).unwrap();
+    assert_eq!(
+        text,
+        "<<<<<<< main (landed)\nfrom a\n=======\nfrom b\n>>>>>>> yours\n"
+    );
+    // `status` and `commit` still see the conflict.
+    assert!(leep.ok(b.path(), &["status"]).contains("C a.txt"));
+    assert_eq!(
+        leep.run(b.path(), &["commit", "-m", "x"]).status.code(),
+        Some(5)
+    );
+}
