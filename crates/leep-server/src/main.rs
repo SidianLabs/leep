@@ -422,6 +422,7 @@ fn install_metrics() -> anyhow::Result<axum::Router> {
     let handle = PrometheusBuilder::new()
         .set_buckets_for_metric(Matcher::Suffix("_seconds".into()), SECONDS_BUCKETS)?
         .set_buckets_for_metric(Matcher::Full("leep_land_attempts".into()), ATTEMPT_BUCKETS)?
+        .set_buckets_for_metric(Matcher::Full("leep_land_batch_size".into()), BATCH_BUCKETS)?
         .install_recorder()
         .context("installing metrics recorder")?;
     leep_server::observe::record_build_info();
@@ -439,6 +440,8 @@ const SECONDS_BUCKETS: &[f64] = &[
     0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
 ];
 const ATTEMPT_BUCKETS: &[f64] = &[1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 24.0, 32.0];
+/// Lands per group commit; a batch holds at most 64.
+const BATCH_BUCKETS: &[f64] = &[1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0];
 
 async fn shutdown_signal() {
     let ctrl_c = async {

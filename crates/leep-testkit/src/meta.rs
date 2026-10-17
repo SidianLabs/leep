@@ -3,7 +3,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use leep_core::{Changeset, ChangesetId, Hash, MetaStore, RefLogEntry, RefUpdateContext, Result};
+use leep_core::{
+    Changeset, ChangesetId, Hash, MetaStore, RefLogEntry, RefStep, RefUpdateContext, Result,
+};
 
 use crate::plan::{FaultPlan, Op};
 
@@ -70,6 +72,22 @@ impl MetaStore for FaultyMetaStore {
             .run(
                 Op::CasRef,
                 self.inner.cas_ref_logged(name, expected, new, ctx),
+                |_, v| v,
+            )
+            .await
+    }
+
+    /// Faults as for `cas_ref_logged`; `FailAfter` applied the whole chain.
+    async fn cas_ref_logged_chain(
+        &self,
+        name: &str,
+        expected: Option<ChangesetId>,
+        steps: &[RefStep],
+    ) -> Result<usize> {
+        self.plan
+            .run(
+                Op::CasRef,
+                self.inner.cas_ref_logged_chain(name, expected, steps),
                 |_, v| v,
             )
             .await

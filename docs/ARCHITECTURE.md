@@ -99,7 +99,7 @@ Rules:
 | `TreeNode` (one directory) | `Hash::of_object("tree-v1", postcard)` | `BlobStore::put_with_hash` |
 | `Changeset` | `Hash::of_object("changeset-v1", postcard)` | `MetaStore::put_changeset` |
 | Ref | name → `ChangesetId` | `MetaStore`, CAS only |
-| Ref log entry | `seq` → (ref, old, new, time, actor, operation, message) | `MetaStore`, appended by `cas_ref_logged` in the CAS's own transaction |
+| Ref log entry | `seq` → (ref, old, new, time, actor, operation, message) | `MetaStore`, appended by `cas_ref_logged` (or `cas_ref_logged_chain`, one entry per step) in the CAS's own transaction |
 | Derived value | `(kind, key)` → bytes | `MetaStore::put_derived` |
 
 `Changeset { parents, author, timestamp, message, changes, extra }`:
@@ -298,32 +298,48 @@ and those it reads while creating changesets (never rows read by `verify` or
 `repair`, which substitute recomputed rows as they go). Whatever the batched
 round does not supply is read or derived singly, as before.
 
-**Land** (`leep land`, the no-merge-queue path):
+**Land** (`leep land`, the no-merge-queue path), group committed per ref
+within each server process ([ADR 0032](adr/0032-group-commit-for-lands.md)):
 ```
-lock(target)                      # per ref, within this server process
+land(cs):  check name/tag/cs; enqueue on queue(target); start a leader if none; await answer
+
+leader(target):  while queue not empty: land_batch(take ≤64 queued, in arrival order)
+
+land_batch:
 loop (≤32 attempts):
-  head ← get_ref(target)
-  if head is None:                 CAS(None → cs)
-  elif cs is an ancestor of head:  already landed
-  elif head is an ancestor of cs:  CAS(head → cs)          # fast-forward
-  elif head's history holds a server-made copy of cs:  already landed
-  else:
-    stack ← first-parent chain from cs down to where it joins head's history
-    replay each stack entry onto head, oldest first        # 3-way per entry
-    conflict? → return Conflicts{onto: head, conflicts, clean}
-                (the whole stack squashed into one 3-way merge vs head;
-                 never auto-resolved on the server)
-    CAS(head → replayed top)
-  CAS won → Landed;  CAS lost → jittered backoff, retry
+  start ← get_ref(target);  head ← start
+  for each land (dropped if its caller left before it was reached):
+    if head is None:                 move to cs
+    elif cs is an ancestor of head:  already landed
+    elif head is an ancestor of cs:  move to cs                   # fast-forward
+    elif head's history holds a server-made copy of cs:  already landed
+    else:
+      stack ← first-parent chain from cs down to where it joins head's history
+      replay each stack entry onto head, oldest first        # 3-way per entry
+      conflict? → Conflicts{onto: head, conflicts, clean} for this land only
+                  (the whole stack squashed into one 3-way merge vs head;
+                   never auto-resolved on the server)
+      move to replayed top
+    a move sets head; answers that precede every move are sent at once
+  no moves → done
+  CAS(start → head) logging one entry per move (cas_ref_logged_chain)
+  CAS won → every land gets its answer;  CAS lost → jittered backoff, redo batch
   CAS errored → it may have applied: the next pass re-reads the head and
-                finds the copy, or tries again (3 errors in a row → the error)
-attempts exhausted → 409 Conflict (client retries)
+                finds each land's copy, or tries again (3 errors in a row → the error)
+attempts exhausted → 409 Conflict for every land left (client retries)
 ```
-Lands on one ref are serialized within each server process. Without that,
-concurrent lands each redo the replay only to lose the CAS to a sibling
-request, so under a swarm most of them exhaust their attempts. The CAS still
-coordinates separate server processes; jittered backoff keeps them from
-colliding in lockstep.
+Each land's answer is the one it would get if the batch's lands ran one after
+another, and the ref log reads the same way: one entry per land that moved the
+ref, with its own actor, chained from the batch's starting head, written in
+the same transaction as the single ref update. Batching is what removed the
+cost of contention: lands on one ref in one process never race the CAS (they
+were serialized by a per-ref lock before), but each paid a ref read, a commit
+and a landed-copy scan as long as the number of agents ahead of it; a batch
+pays the read and commit once and its scans share the rows they read. The CAS
+still coordinates separate server processes; a lost swap redoes the batch, and
+jittered backoff keeps processes from colliding in lockstep. The leader is a
+spawned task, so a cancelled request cannot stop a batch; a land cancelled
+before its batch reached it is dropped, one already replayed lands.
 The copy test makes `land` idempotent: a client that never saw the answer to
 a land that applied (a timeout, a killed server, an error after commit) can
 send it again and gets the copy back instead of a second one. It looks for a
@@ -395,7 +411,9 @@ has the cleanly merged paths; the CLI checks that a server reported them.
 create, move or delete appends a row to `ref_log` in the same transaction (or
 under the same lock, in memory) as the conditional update, so a ref never
 moves unrecorded and a lost CAS writes nothing. Callers pass a
-`RefUpdateContext` (actor, operation, message) to `MetaStore::cas_ref_logged`:
+`RefUpdateContext` (actor, operation, message) to `MetaStore::cas_ref_logged`,
+or one per step to `cas_ref_logged_chain`, which a land batch uses to move the
+ref once while logging each land (ADR 0032):
 `land` records `land`, the git bridge `import`, and the server passes the
 token's name and the request's operation for `POST /v1/refs/{name}` (`land`
 and `import` are reserved so clients cannot forge them). `GET /v1/reflog` and

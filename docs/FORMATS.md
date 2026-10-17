@@ -488,6 +488,17 @@ transaction. The rows a new changeset is stored with (`root_tree`,
 byte-identical to what the derived kinds and the old writes produced. No
 encoding, hash, index, table or `/v1` shape changed.
 
+## Chained ref moves (new `MetaStore` method, no format change)
+
+ADR 0032 adds `MetaStore::cas_ref_logged_chain(name, expected, steps)`, which
+group commit of lands uses. It writes the existing `refs` and `ref_log` tables
+with the existing encodings: one conditional update of `refs` to the last
+step's target, then (after the Postgres advisory lock, as for
+`cas_ref_logged`) one multi-row `INSERT INTO ref_log` whose rows are listed in
+step order, so `seq` increases along the chain and each row's `old_target` is
+the previous row's `new_target`. A reader of the log sees the same rows as for
+the same moves made one swap at a time. No `/v1` shape changed.
+
 ## Fenced garbage collection (new derived kinds, no other format change)
 
 ADR 0012 adds the three GC kinds in the table above (`blob-claim-v1` already

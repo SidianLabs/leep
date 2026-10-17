@@ -37,10 +37,12 @@ measured until the response head is ready, not until the body is streamed.
 | `leep_http_requests_total` | counter | `method`, `route`, `status` | Requests handled. `route` is the matched template or `unmatched`; unknown methods are `other`. |
 | `leep_http_request_duration_seconds` | histogram | `method`, `route` | Time to produce the response head. |
 | `leep_land_total` | counter | `outcome` = `landed`, `conflicts`, `exhausted`, `error` | Land calls by result. `conflicts` is a normal reply that needs client action; `exhausted` means the CAS lost every retry (HTTP 409). `error` is every other failure, including refused lands (400: unsigned, unreviewed, bad ref) and unknown changesets (404), so it is not a server-health signal; count 5xx on `route="/v1/land"` for that. |
-| `leep_land_attempts` | histogram | none | CAS attempts per land that reached the retry loop; above 1 means contention. |
-| `leep_land_cas_losses_total` | counter | none | Lost ref compare-and-swaps (races with other writers of the ref: other server instances, imports, raw ref updates; lands in one process never race each other). |
-| `leep_land_duration_seconds` | histogram | none | Whole land call, including lock wait. |
-| `leep_land_lock_wait_seconds` | histogram | none | Time waiting on the per-ref in-process land lock. |
+| `leep_land_attempts` | histogram | none | CAS attempts of the batch a land was committed in (ADR 0032); above 1 means another writer of the ref won a race. |
+| `leep_land_cas_losses_total` | counter | none | Lost ref compare-and-swaps, one per batch attempt that lost (races with other writers of the ref: other server instances, imports, raw ref updates; lands in one process are batched and never race each other). |
+| `leep_land_duration_seconds` | histogram | none | Whole land call, including time queued. |
+| `leep_land_lock_wait_seconds` | histogram | none | Time a land waited in its ref's in-process queue before its batch started (the name dates from the per-ref lock that batching replaced). |
+| `leep_land_batch_size` | histogram | none | Lands taken by each batch (group commit, ADR 0032), cancelled ones excluded. 1 means no contention; under load it approaches the number of lands queued behind one batch, at most 64. |
+| `leep_land_cancelled_total` | counter | none | Lands whose caller went away (timeout, disconnect) while queued, dropped before their batch replayed them. |
 | `leep_derive_total` | counter | `kind` | Derived values computed (cache hits in the meta store are not counted). |
 | `leep_derive_duration_seconds` | histogram | `kind` | Time to compute one derived value. |
 | `leep_warm_refs_total` | counter | `result` = `ok`, `error` | Ref heads the background warmer derived indexes for (ADR 0028). Errors are retried on the next pass. |
@@ -62,7 +64,7 @@ measured until the response head is ready, not until the body is streamed.
 | `leep_schema_version` | gauge | none | Newest metadata schema migration applied (ADR 0023), read when the server opened the store. Servers sharing a database report the same value once all are upgraded. |
 
 Seconds histograms use buckets from 1 ms to 10 s; `leep_land_attempts` uses
-1 to 32. The cache metrics are recorded by `CachedBlobStore` itself as it
+1 to 32 and `leep_land_batch_size` 1 to 64. The cache metrics are recorded by `CachedBlobStore` itself as it
 serves requests (the gauges refresh on every read and write), so there is no
 polling interval. With `--cache-bytes 0` there is no cache and the
 `leep_blob_cache_*` series are absent.
@@ -134,7 +136,7 @@ groups:
     for: 10m
     labels: {severity: ticket}
     annotations:
-      summary: "Land p99 above 5 s (includes the wait for the per-ref lock)."
+      summary: "Land p99 above 5 s (includes the time queued for the ref's next batch)."
       runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leeplandslowp99
   - alert: LeepRequestTimeouts
     expr: sum(increase(leep_http_requests_total{status="408"}[15m])) > 5
@@ -1067,10 +1069,11 @@ history's depth.
 | `--baseline`, `--max-regression` | none, 1.5 | Compare p99 and throughput with an earlier `report.json` |
 | `--no-fail-fast` | off | Keep running after the first violation |
 
-**Size `--think` to the machine.** Lands to one ref are serialized in the
-server, so a ref takes only as many lands per second as one land costs. On the
-4 vCPU machine of `docs/PERFORMANCE.md` that is about 6 per second with p99 near a
-second, which 50 agents with the default 6 s think time offer. Agents that offer
+**Size `--think` to the machine.** Lands to one ref are replayed one after
+another in the server (in batches, ADR 0032), so a ref takes only as many lands
+per second as one replay costs. On the
+4 vCPU machine of `docs/PERFORMANCE.md` that was about 6 per second with p99 near a
+second (measured before batching), which 50 agents with the default 6 s think time offer. Agents that offer
 more only queue: land latency becomes about the number of agents times the
 service time and the p99 bound fails, which says the offered load was wrong,
 not that Leep regressed. Watch `land_lock_wait_mean_ms` against
