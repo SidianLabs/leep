@@ -16,6 +16,7 @@ Status: early development (v0.1).
 - [Deploying with Docker](docs/DEPLOY.md)
 - [Operating: logs and metrics](docs/OPERATIONS.md)
 - [Runbooks: what to do when an alert fires](docs/RUNBOOKS.md)
+- [The `leep` command line: exit codes and the agent contract](docs/CLI.md)
 - [Using Leep from AI agents (MCP)](docs/MCP.md)
 - [Contributing](CONTRIBUTING.md) and the [agent guide](CLAUDE.md)
 

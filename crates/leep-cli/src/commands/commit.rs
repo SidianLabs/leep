@@ -93,14 +93,15 @@ pub fn run(ctx: &mut Ctx, args: &CommitArgs) -> Result<i32> {
     // A merge may resolve every conflict in favour of the base and still has
     // a second parent to record.
     if st.is_clean() && merge.is_none() {
-        return Err(CliError::user(match &pick {
-            Some(p) => format!(
+        return Err(match &pick {
+            // The pick is still waiting: the user has a decision to make.
+            Some(p) => CliError::user(format!(
                 "nothing to commit: resolving the conflicts left the working copy unchanged; \
                  `leep {} --abort` ends it",
                 if p.revert { "revert" } else { "cherry-pick" }
-            ),
-            None => "nothing to commit, working copy clean".to_string(),
-        }));
+            )),
+            None => CliError::nothing_to_do("nothing to commit, working copy clean"),
+        });
     }
     let message = args
         .message

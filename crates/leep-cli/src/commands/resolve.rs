@@ -47,7 +47,7 @@ pub fn run(ctx: &mut Ctx, args: &ResolveArgs) -> Result<i32> {
             .filter(|p| still_conflicted(&ctx.wc, p))
             .collect();
         if !marked.is_empty() {
-            return Err(CliError::user(format!(
+            return Err(CliError::conflict(format!(
                 "conflict markers remain in {}; remove them, or use --force",
                 marked
                     .iter()

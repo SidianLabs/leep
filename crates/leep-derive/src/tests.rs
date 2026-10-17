@@ -3630,6 +3630,30 @@ mod ref_rules {
     }
 
     #[tokio::test]
+    async fn land_without_create_refuses_a_missing_ref_and_logs_nothing() {
+        let r = repo();
+        let a = commit(&r, &[], &[("a", Some("1\n"))], "a").await;
+        let b = commit(&r, &[a], &[("a", Some("2\n"))], "b").await;
+        match r.land_with(a, "typo", None, false).await {
+            Err(Error::NotFound(m)) => {
+                assert!(m.contains(leep_core::refname::MISSING_REF_MARKER), "{m}")
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(r.meta().get_ref("typo").await.unwrap(), None);
+        assert!(r.meta().ref_log(None, None, 10).await.unwrap().is_empty());
+
+        // Allowed to create: it does, and then `create` no longer matters.
+        r.land_with(a, "feature", None, true).await.unwrap();
+        assert_eq!(r.meta().get_ref("feature").await.unwrap(), Some(a));
+        let resp = r.land_with(b, "feature", None, false).await.unwrap();
+        assert!(matches!(resp, LandResponse::Landed { landed, .. } if landed == b));
+        // The old entry points keep creating.
+        r.land(a, "legacy").await.unwrap();
+        assert_eq!(r.meta().get_ref("legacy").await.unwrap(), Some(a));
+    }
+
+    #[tokio::test]
     async fn resolve_finds_tags_by_short_name_after_branches_and_ids() {
         let r = repo();
         let a = commit(&r, &[], &[("a", Some("1\n"))], "a").await;

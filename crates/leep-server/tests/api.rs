@@ -628,6 +628,7 @@ async fn rebase_and_land() {
             &LandRequest {
                 changeset: feat,
                 target_ref: "main".into(),
+                create: None,
             },
         )
         .await;
@@ -649,6 +650,7 @@ async fn rebase_and_land() {
             &LandRequest {
                 changeset: k1,
                 target_ref: "side".into(),
+                create: None,
             },
         )
         .await;
@@ -659,6 +661,7 @@ async fn rebase_and_land() {
             &LandRequest {
                 changeset: k2,
                 target_ref: "side".into(),
+                create: None,
             },
         )
         .await;
@@ -671,6 +674,7 @@ async fn rebase_and_land() {
             &LandRequest {
                 changeset: unknown,
                 target_ref: "main".into(),
+                create: None,
             },
         )
         .await;
@@ -1160,6 +1164,7 @@ async fn ref_writes_validate_names() {
                         .replace("%20", " ")
                         .replace("%3A", ":")
                         .replace("%5E", "^"),
+                    create: None,
                 },
             )
             .await;
@@ -1202,6 +1207,7 @@ async fn tags_are_created_and_deleted_but_never_moved() {
                 &LandRequest {
                     changeset: b,
                     target_ref: name.into(),
+                    create: None,
                 },
             )
             .await;
@@ -1256,6 +1262,7 @@ async fn reflog_records_lands_and_ref_writes_newest_first() {
     let land = |id| LandRequest {
         changeset: id,
         target_ref: "main".into(),
+        create: None,
     };
     assert_eq!(c.post("/v1/land", &land(a)).await.status, StatusCode::OK);
     assert_eq!(c.post("/v1/land", &land(b)).await.status, StatusCode::OK);
@@ -1361,4 +1368,97 @@ async fn old_cas_bodies_without_log_fields_still_work() {
     assert_eq!(r.status, StatusCode::OK);
     let log: RefLogResponse = c.get("/v1/reflog/old").await.json();
     assert_eq!(log.entries[0].operation, "cas");
+}
+
+#[tokio::test]
+async fn resolve_prefix_finds_one_lists_many_and_rejects_bad_input() {
+    let c = Client::new();
+    // Commit until two ids share their first four hex digits.
+    let mut by_prefix: BTreeMap<String, ChangesetId> = BTreeMap::new();
+    let (a, b) = loop {
+        let id = c
+            .commit(&[], &[], &format!("prefix {}", by_prefix.len()))
+            .await;
+        if let Some(other) = by_prefix.insert(id.to_string()[..4].to_string(), id) {
+            break (other.min(id), other.max(id));
+        }
+    };
+
+    let hex = a.to_string();
+    for short in [&hex[..12], &hex[..5], &hex[..64]] {
+        let r = c.get(&format!("/v1/resolve-prefix/{short}")).await;
+        assert_eq!(r.status, StatusCode::OK, "{short}");
+        assert_eq!(r.json::<ResolvePrefixResponse>().id, a);
+    }
+    let upper = hex[..12].to_uppercase();
+    let r = c.get(&format!("/v1/resolve-prefix/{upper}")).await;
+    assert_eq!(r.json::<ResolvePrefixResponse>().id, a, "any case");
+
+    let r = c.get(&format!("/v1/resolve-prefix/{}", &hex[..4])).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    let amb: AmbiguousPrefixResponse = r.json();
+    assert_eq!(amb.candidates, [a, b]);
+    assert!(!amb.truncated);
+    assert!(amb.error.contains("ambiguous"), "{}", amb.error);
+    // Clients that know only ErrorResponse still read the message.
+    assert!(r.json::<ErrorResponse>().error.contains("ambiguous"));
+
+    let absent = (0u32..)
+        .map(|n| format!("{n:06x}"))
+        .find(|p| !by_prefix.keys().any(|k| p.starts_with(k.as_str())))
+        .unwrap();
+    let r = c.get(&format!("/v1/resolve-prefix/{absent}")).await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
+
+    for bad in ["abc", "zzzz", "12g4", &"a".repeat(65)] {
+        let r = c.get(&format!("/v1/resolve-prefix/{bad}")).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{bad}");
+        let e: ErrorResponse = r.json();
+        assert!(e.error.contains("short id"), "{bad}: {}", e.error);
+    }
+}
+
+#[tokio::test]
+async fn land_creates_a_missing_ref_only_when_allowed() {
+    let c = Client::new();
+    let a = c.commit(&[], &[("a", Some("1\n"))], "a").await;
+    let land = |target: &str, create: Option<bool>| LandRequest {
+        changeset: a,
+        target_ref: target.into(),
+        create,
+    };
+
+    let r = c.post("/v1/land", &land("typo", Some(false))).await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
+    let e: ErrorResponse = r.json();
+    assert!(
+        e.error.contains(leep_core::refname::MISSING_REF_MARKER),
+        "{}",
+        e.error
+    );
+    let head: RefResponse = c.get("/v1/refs/typo").await.json();
+    assert_eq!(head.target, None);
+    let log: RefLogResponse = c.get("/v1/reflog").await.json();
+    assert!(log.entries.is_empty(), "a refused land logs nothing");
+
+    // `true`, and an old client that sends no `create`, both create.
+    for (name, create) in [("asked", Some(true)), ("old-client", None)] {
+        let r = c.post("/v1/land", &land(name, create)).await;
+        assert_eq!(r.status, StatusCode::OK, "{name}");
+        let head: RefResponse = c.get(&format!("/v1/refs/{name}")).await.json();
+        assert_eq!(head.target, Some(a), "{name}");
+    }
+    // An existing ref lands with `create: false`.
+    let b = c.commit(&[a], &[("a", Some("2\n"))], "b").await;
+    let r = c
+        .post(
+            "/v1/land",
+            &LandRequest {
+                changeset: b,
+                target_ref: "asked".into(),
+                create: Some(false),
+            },
+        )
+        .await;
+    assert!(matches!(r.json(), LandResponse::Landed { landed, .. } if landed == b));
 }

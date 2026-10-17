@@ -17,6 +17,7 @@
 //! | GET  | `/v1/reflog?before=seq&limit=n` | – | [`RefLogResponse`] (every ref move, newest first; `limit` defaults to 50, capped at 1000; `before` returns entries with a smaller `seq`) |
 //! | GET  | `/v1/reflog/{name}?before=seq&limit=n` | – | [`RefLogResponse`] (the moves of one ref; an unknown or never-moved ref is an empty list) |
 //! | GET  | `/v1/resolve/{rev}` | – | [`ResolveResponse`] (`rev` = ref name, full 64-hex id or short tag name) |
+//! | GET  | `/v1/resolve-prefix/{prefix}` | – | [`ResolvePrefixResponse`] (the one changeset whose id starts with `prefix`, 4 to 64 hex digits in any case; 404 if none; 400 [`AmbiguousPrefixResponse`] listing up to 10 `candidates` if several; 400 if the prefix is shorter than 4 digits, longer than 64 or not hex; ADR 0035) |
 //! | GET  | `/v1/tree/{id}?path=dir` | – | [`TreeResponse`] (one directory level) |
 //! | GET  | `/v1/files/{id}?prefix=dir` | – | [`FilesResponse`] (recursive listing) |
 //! | GET  | `/v1/file/{id}?path=p` | – | raw bytes + `x-leep-kind` header, or 404 |
@@ -34,7 +35,7 @@
 //! | GET  | `/v1/changesets/{id}/review-status?ref=main` | – | [`ReviewStatusResponse`] (`ref` defaults to `main`) |
 //! | POST | `/v1/merge` | [`MergeRequest`] | [`MergeResponse`] |
 //! | POST | `/v1/rebase` | [`RebaseRequest`] | [`RebaseResponse`] |
-//! | POST | `/v1/land` | [`LandRequest`] | [`LandResponse`] |
+//! | POST | `/v1/land` | [`LandRequest`] | [`LandResponse`] (`create: false` refuses to create a missing `target_ref` with 404; absent creates it, as before; ADR 0036) |
 //!
 //! Ref names may contain `/` (e.g. `release/1.0`); `{name}` and `{rev}` match
 //! the rest of the path. Every ref write (`POST /v1/refs/{name}` and the
@@ -302,6 +303,26 @@ pub struct ResolveResponse {
     pub id: ChangesetId,
 }
 
+/// Body of `GET /v1/resolve-prefix/{prefix}` when exactly one changeset
+/// matches.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvePrefixResponse {
+    pub id: ChangesetId,
+}
+
+/// The 400 body of `GET /v1/resolve-prefix/{prefix}` when several changesets
+/// match. A superset of [`ErrorResponse`], so clients that only read `error`
+/// still get the message.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AmbiguousPrefixResponse {
+    pub error: String,
+    /// Matching ids, ascending, at most 10.
+    pub candidates: Vec<ChangesetId>,
+    /// More changesets match than `candidates` lists.
+    #[serde(default)]
+    pub truncated: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TreeResponse {
     pub path: String,
@@ -533,6 +554,12 @@ pub struct LandRequest {
     pub changeset: ChangesetId,
     #[serde(default = "default_ref")]
     pub target_ref: String,
+    /// May the land create `target_ref` if it does not exist? Absent keeps
+    /// the original behaviour for old clients: it creates. `false` makes a
+    /// land onto a missing ref a 404 whose message carries
+    /// [`crate::refname::MISSING_REF_MARKER`] (ADR 0036).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub create: Option<bool>,
 }
 
 fn default_ref() -> String {
@@ -711,6 +738,29 @@ mod tests {
     }
 
     #[test]
+    fn prefix_shapes_are_stable() {
+        let id = ChangesetId(Hash::of_blob(b"p"));
+        let v = serde_json::to_value(ResolvePrefixResponse { id }).unwrap();
+        assert_eq!(v, serde_json::json!({ "id": id.to_string() }));
+        let amb = AmbiguousPrefixResponse {
+            error: "ambiguous".into(),
+            candidates: vec![id],
+            truncated: false,
+        };
+        let v = serde_json::to_value(&amb).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({ "error": "ambiguous", "candidates": [id.to_string()], "truncated": false })
+        );
+        // An old client reads it as a plain error.
+        let e: ErrorResponse = serde_json::from_value(v).unwrap();
+        assert_eq!(e.error, "ambiguous");
+        let back: AmbiguousPrefixResponse =
+            serde_json::from_value(serde_json::json!({ "error": "x", "candidates": [] })).unwrap();
+        assert!(!back.truncated);
+    }
+
+    #[test]
     fn tagged_enums_serialize_with_status() {
         let id = ChangesetId(Hash::of_blob(b"x"));
         let v = serde_json::to_value(LandResponse::Landed {
@@ -723,6 +773,18 @@ mod tests {
         let req: LandRequest =
             serde_json::from_value(serde_json::json!({ "changeset": id.to_string() })).unwrap();
         assert_eq!(req.target_ref, "main");
+        assert_eq!(req.create, None, "old clients send no create");
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            v.as_object().unwrap().len(),
+            2,
+            "an unset create is omitted"
+        );
+        let req = LandRequest {
+            create: Some(false),
+            ..req
+        };
+        assert_eq!(serde_json::to_value(&req).unwrap()["create"], false);
     }
 
     #[test]

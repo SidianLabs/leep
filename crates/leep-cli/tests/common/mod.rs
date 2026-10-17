@@ -195,6 +195,7 @@ impl Mock {
             .route("/v1/reflog", get(reflog_all))
             .route("/v1/reflog/{*name}", get(reflog_one))
             .route("/v1/resolve/{*rev}", get(resolve))
+            .route("/v1/resolve-prefix/{prefix}", get(resolve_prefix))
             .route("/v1/merge-base", get(merge_base))
             .route("/v1/files/{id}", get(files))
             .route("/v1/log/{id}", get(log))
@@ -503,6 +504,41 @@ async fn resolve(State(s): State<Shared>, Path(rev): Path<String>) -> Resp<Resol
     }
 }
 
+/// Like the real server: one match, 400 with the candidates, or 404.
+async fn resolve_prefix(
+    State(s): State<Shared>,
+    Path(prefix): Path<String>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let p = match leep_core::prefix::IdPrefix::parse(&prefix) {
+        Ok(p) => p,
+        Err(e) => return err(StatusCode::BAD_REQUEST, &e.to_string()).into_response(),
+    };
+    let d = s.lock().unwrap();
+    let mut found: Vec<ChangesetId> = d
+        .changesets
+        .keys()
+        .filter(|id| p.matches(id))
+        .copied()
+        .collect();
+    found.sort();
+    match found.len() {
+        0 => err(StatusCode::NOT_FOUND, "no changeset id starts with it").into_response(),
+        1 => Json(ResolvePrefixResponse { id: found[0] }).into_response(),
+        n => (
+            StatusCode::BAD_REQUEST,
+            Json(AmbiguousPrefixResponse {
+                error: format!(
+                    "invalid input: short id {p} is ambiguous: it matches {n} changesets"
+                ),
+                candidates: found,
+                truncated: false,
+            }),
+        )
+            .into_response(),
+    }
+}
+
 fn ancestors(d: &Data, from: ChangesetId) -> Vec<ChangesetId> {
     let mut seen = vec![from];
     let mut i = 0;
@@ -773,6 +809,16 @@ async fn land(State(s): State<Shared>, Json(r): Json<LandRequest>) -> Resp<LandR
         ));
     }
     let head = d.refs.get(&r.target_ref).copied();
+    if head.is_none() && r.create == Some(false) {
+        return Err(err(
+            StatusCode::NOT_FOUND,
+            &format!(
+                "not found: ref {:?} {}",
+                r.target_ref,
+                leep_core::refname::MISSING_REF_MARKER
+            ),
+        ));
+    }
     let parent = cs.parents.first().copied();
     let Some(head) = head.filter(|h| Some(*h) != parent) else {
         let msg = format!("landed {}", r.changeset);

@@ -2,7 +2,7 @@
 
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 
 use crate::cache::Cache;
 use crate::client::Client;
@@ -10,8 +10,10 @@ use crate::commands::{
     amend, branch, checkout, commit, diff, history, init, keygen, land, merge, pick, rebase,
     reflog, reset, resolve, restore, review, search, stash, status, Ctx, Remote,
 };
-use crate::error::{CliError, Result};
+use crate::error::{CliError, ErrorKind, Result};
+use crate::help;
 use crate::state::{resolve_token, WorkCopy};
+use crate::term;
 
 const DEFAULT_SERVER: &str = "http://127.0.0.1:8080";
 
@@ -19,18 +21,31 @@ const DEFAULT_SERVER: &str = "http://127.0.0.1:8080";
 #[command(
     name = "leep",
     version,
-    about = "Client for the Leep version control server"
+    about = "Client for the Leep version control server",
+    after_help = help::EXIT_CODES
 )]
 pub struct Cli {
     /// Server URL (overrides the working copy config).
-    #[arg(long, global = true, env = "LEEP_SERVER")]
+    #[arg(long, global = true, env = "LEEP_SERVER", hide = true)]
     pub server: Option<String>,
     /// Bearer token (or set LEEP_TOKEN; falls back to `.leep/config.json`).
-    #[arg(long, global = true, hide_env_values = true)]
+    #[arg(long, global = true, hide_env_values = true, hide = true)]
     pub token: Option<String>,
-    /// Print the raw API response as JSON.
-    #[arg(long, global = true)]
+    /// Print the raw API response as JSON; an error becomes
+    /// `{"error":{"code","message","hint","retryable"}}` on stdout.
+    #[arg(long, global = true, hide = true)]
     pub json: bool,
+    /// Colour human output: auto (on a terminal, honouring NO_COLOR and
+    /// CLICOLOR_FORCE), always or never.
+    #[arg(
+        long,
+        global = true,
+        hide = true,
+        value_enum,
+        default_value_t,
+        value_name = "WHEN"
+    )]
+    pub color: term::ColorChoice,
     #[command(subcommand)]
     pub command: Command,
 }
@@ -38,16 +53,21 @@ pub struct Cli {
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Create a working copy.
+    #[command(after_help = help::INIT)]
     Init(init::InitArgs),
     /// Materialize a revision.
+    #[command(after_help = help::CHECKOUT)]
     Checkout(checkout::CheckoutArgs),
     /// Show added, modified, deleted and conflicted files.
+    #[command(after_help = help::STATUS)]
     Status,
     /// Show changes (working copy vs base, or `FROM TO` on the server).
+    #[command(after_help = help::DIFF)]
     Diff(diff::DiffArgs),
     /// Create an author signing key for `leep commit --sign`.
     Keygen(keygen::KeygenArgs),
     /// Record local changes as a changeset.
+    #[command(after_help = help::COMMIT)]
     Commit(commit::CommitArgs),
     /// Fold uncommitted changes and a new message into an unlanded base.
     Amend(amend::AmendArgs),
@@ -68,26 +88,34 @@ pub enum Command {
     /// Undo one changeset with a new local commit.
     Revert(pick::RevertArgs),
     /// Land the current changeset on the target ref.
+    #[command(after_help = help::LAND)]
     Land(land::LandArgs),
     /// Move to the head of the target ref, keeping uncommitted work.
+    #[command(after_help = help::SYNC)]
     Sync(checkout::SyncArgs),
     /// List, create or delete branches.
+    #[command(after_help = help::BRANCH)]
     Branch(branch::BranchArgs),
     /// Switch the working copy to another branch.
+    #[command(after_help = help::SWITCH)]
     Switch(branch::SwitchArgs),
     /// List, create or delete tags (immutable named revisions).
     Tag(branch::TagArgs),
     /// Show history.
+    #[command(after_help = help::LOG)]
     Log(history::LogArgs),
     /// Show the newest changeset that changed a file or directory.
     LastChange(history::LastChangeArgs),
     /// Show one changeset.
+    #[command(after_help = help::SHOW)]
     Show(history::ShowArgs),
     /// Print a file at a revision.
     Cat(history::CatArgs),
     /// Search file contents at a revision on the server, like grep.
+    #[command(after_help = help::SEARCH)]
     Search(search::SearchArgs),
     /// Show who last changed each line.
+    #[command(after_help = help::BLAME)]
     Blame(history::BlameArgs),
     /// Summarize which agents and authors made the changesets.
     Provenance(history::ProvenanceArgs),
@@ -96,23 +124,63 @@ pub enum Command {
     /// Show how refs moved: who, when, and from where to where.
     Reflog(reflog::ReflogArgs),
     /// Move a ref back to where it was before its last (or a chosen) move.
+    #[command(after_help = help::UNDO)]
     Undo(reflog::UndoArgs),
     /// Approve or reject changesets, and see what a changeset needs to land.
-    #[command(subcommand)]
+    #[command(subcommand, after_help = help::REVIEW)]
     Review(review::ReviewCmd),
     /// List the reviews a changeset has (same as `review list`).
     Reviews(review::ListArgs),
 }
 
+/// The command line definition with the help text of [`help`].
+pub fn command() -> clap::Command {
+    help::decorate(Cli::command())
+}
+
 pub fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let parsed = command()
+        .try_get_matches()
+        .and_then(|m| Cli::from_arg_matches(&m));
+    let cli = match parsed {
+        Ok(cli) => cli,
+        Err(e) => return usage_error(e),
+    };
+    let json = cli.json;
+    term::init(cli.color);
     match run(cli) {
         Ok(code) => ExitCode::from(code as u8),
         Err(e) => {
-            eprintln!("leep: {e}");
+            e.report(json);
             ExitCode::from(e.exit_code() as u8)
         }
     }
+}
+
+/// clap's own output for help and version; for a real usage error also the
+/// JSON document when `--json` is on the command line, which clap could not
+/// parse for us.
+fn usage_error(e: clap::Error) -> ExitCode {
+    let code = e.exit_code();
+    let json = std::env::args_os().skip(1).any(|a| a == "--json");
+    if code == 0 || !json {
+        let _ = e.print();
+        return ExitCode::from(code as u8);
+    }
+    let text = e.render().to_string();
+    let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
+    let message = lines
+        .next()
+        .unwrap_or("bad command line")
+        .trim_start_matches("error: ")
+        .to_string();
+    let rest: Vec<&str> = lines.collect();
+    let mut err = CliError::new(ErrorKind::Usage, message);
+    if !rest.is_empty() {
+        err = err.with_hint(rest.join("\n"));
+    }
+    err.report(true);
+    ExitCode::from(code as u8)
 }
 
 fn env_token() -> Option<String> {

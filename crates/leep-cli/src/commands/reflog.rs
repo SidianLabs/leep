@@ -12,7 +12,7 @@ use leep_core::refname::NOT_FORWARD_MARKER;
 use leep_core::{ChangesetId, RefLogEntry};
 
 use super::{print_json, Remote};
-use crate::error::{CliError, Result};
+use crate::error::{CliError, ErrorKind, Result};
 use crate::fmt::{short, utc_time};
 
 /// Most entries one server request returns.
@@ -101,7 +101,7 @@ pub fn undo(r: &Remote, args: &UndoArgs) -> Result<i32> {
             .into_iter()
             .next()
             .filter(|e| e.seq == seq)
-            .ok_or_else(|| CliError::user(format!("{name} has no log entry {seq}")))?,
+            .ok_or_else(|| CliError::not_found(format!("{name} has no log entry {seq}")))?,
         None => r
             .client
             .ref_log(Some(name), None, 1)?
@@ -118,7 +118,7 @@ pub fn undo(r: &Remote, args: &UndoArgs) -> Result<i32> {
     let current = r.client.get_ref(name)?.target;
     if args.to.is_none() && current != entry.new {
         // The log's newest entry should describe where the ref is now.
-        return Err(CliError::user(format!(
+        return Err(CliError::lost_race(format!(
             "{name} moved while undoing it (now {}, log says {}); run `leep reflog {name}` \
              and retry",
             side(current),
@@ -142,21 +142,23 @@ pub fn undo(r: &Remote, args: &UndoArgs) -> Result<i32> {
                 message: Some(format!("undo of {}", entry.seq)),
             },
         )
-        .map_err(|e| match e {
+        .map_err(|e| {
             // A protected ref never moves back, so the change has to be undone
             // by a new change that goes through review and signing.
-            CliError::User(m) if m.contains(NOT_FORWARD_MARKER) => {
-                let undone = entry.new.map_or_else(|| "<id>".into(), |id| id.to_string());
-                CliError::User(format!(
+            if e.kind() != ErrorKind::User || !e.message().contains(NOT_FORWARD_MARKER) {
+                return e;
+            }
+            let undone = entry.new.map_or_else(|| "<id>".into(), |id| id.to_string());
+            e.map_message(|m| {
+                format!(
                     "{m}\n{name} is protected, so undo cannot move it back. Revert the change \
                  instead: `leep revert {undone}` (once per changeset the move brought in), \
                  then `leep land`, which goes through review and signing."
-                ))
-            }
-            e => e,
+                )
+            })
         })?;
     if !resp.ok {
-        return Err(CliError::user(format!(
+        return Err(CliError::lost_race(format!(
             "{name} changed while undoing it (409 conflict, now {}); run `leep reflog {name}` \
              and retry",
             side(resp.current)

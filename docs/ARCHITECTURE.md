@@ -69,7 +69,7 @@ content-addressing and (b) the atomicity of `MetaStore::cas_ref`.
 
 | Crate | Role | May depend on |
 |---|---|---|
-| `leep-core` | Types, hashing, encoding, `BlobStore`/`MetaStore` traits (including listing and blob deletion for GC, listing and dropping derived rows by kind for repair, batched changeset and derived reads for history walks, and batched derived writes and changeset-with-rows writes for changeset creation), in-memory stores, conformance tests, API types, pure rename detection | no other leep crate; no I/O, no async runtime |
+| `leep-core` | Types, hashing, encoding, `BlobStore`/`MetaStore` traits (including listing and blob deletion for GC, a changeset id prefix lookup for short ids, listing and dropping derived rows by kind for repair, batched changeset and derived reads for history walks, and batched derived writes and changeset-with-rows writes for changeset creation), in-memory stores, conformance tests, API types, pure rename detection | no other leep crate; no I/O, no async runtime |
 | `leep-store` | `BlobStore` backends: filesystem (loose objects plus delta-compressed packs and the repack writer, ADR 0029), `object_store` (S3/MinIO), `CachedBlobStore`, `open_blob_store(url)`, and the incremental blob copy backup and restore use (`sync`, ADR 0026) | core |
 | `leep-meta` | `MetaStore` backends: SQLite, Postgres, `open_meta_store(url)`, the versioned schema migrator (`migrate`, ADR 0023), and metadata snapshots and their import (`snapshot`, ADR 0026) | core |
 | `leep-derive` | `Repo`: derived data framework and kinds, plus all operations, blob garbage collection (`gc`), the delta-base walk for `repack` (`pack_order`) and store verification and repair (`integrity`) | core (traits only, never a concrete backend) |
@@ -347,6 +347,11 @@ send it again and gets the copy back instead of a second one. It looks for a
 rebased copy that `Repo::rebase` recorded (`rebased-origin-v1`), not for the
 forgeable `leep.rebased_from` extra, among the head's ancestors above `cs`'s
 generation, and gives up after 1024 changesets (ADR 0021).
+A land onto a ref that does not exist creates it, unless the request says
+`create: false` ([ADR 0036](adr/0036-explicit-ref-creation-on-land.md)), which
+`leep land` does unless given `--create` (or landing the first changeset onto
+`main` of an empty repository); then the step that finds no head answers 404
+and the ref stays absent. The check uses the head the batch read for its CAS.
 Replaying the whole stack matters: rebasing only `cs` would silently drop the
 changes of unlanded changesets below it. On conflict the client applies
 `clean`, resolves `conflicts` on top of `onto`, commits once and lands again,
@@ -376,7 +381,11 @@ call `POST /v1/rebase` for the snapshot onto the new base and write the result
 back as uncommitted changes (`overlay.rs`): everything is fetched first, each
 file is written through a temp file and renamed, writes are journalled and
 undone if anything fails, and the state is saved last. Conflicts become marker
-files like in `land`, and `commit` and `land` refuse while any remain.
+files like in `land`, and `commit` and `land` refuse while any remain. The CLI
+relabels the server's `<<<<<<< ours` / `>>>>>>> theirs` by role before writing
+(`main (landed)` / `yours` for `land` and `sync`, `yours` / `ID (merging)` for
+`merge`; `markers.rs`); detection only checks the `<<<<<<< ` prefix, so old and
+new labels both count.
 Conflicts with no text merge (binary, delete versus modify) keep the local
 version and are recorded in `state.unresolved`; they block the same way until
 `leep resolve PATH` or `leep restore PATH` clears them. If the
@@ -434,6 +443,24 @@ files under the requested prefixes (`GET /v1/files`). It then fetches the
 missing blobs through its local content-addressed cache and writes them. Only
 requested prefixes are materialized; other files are fetched on demand with
 `leep cat`.
+
+**CLI contract** ([ADR 0034](adr/0034-cli-exit-codes-and-json-errors.md)).
+Every CLI failure is a `CliError` with a kind, and the kind alone decides the
+exit code: 1 generic, 2 usage, 3 server or network (retry may work), 4 not
+found, 5 conflict, 6 nothing to do (`commit`, `amend`, `stash push` only).
+HTTP statuses map to kinds in one place, the client's `error_from`. With
+`--json` an error is also printed on stdout as
+`{"error":{"code","message","hint","retryable"}}`, `code` being the kind.
+`docs/CLI.md` is the user-facing list. Colour and paging (`term.rs`) apply
+only to human output on a terminal; JSON and piped output stay plain.
+
+**Short ids** ([ADR 0035](adr/0035-short-changeset-ids.md)). A revision
+argument is `@`, a full id, a ref or tag name, or 4 to 64 hex digits of a
+changeset id. The CLI asks `/v1/resolve/{rev}` first, so a ref always wins,
+then `GET /v1/resolve-prefix/{prefix}`, which `Repo::resolve_prefix` answers
+from `MetaStore::changesets_with_prefix`: a bounded range scan of the
+changesets' primary key (the prefix padded with `00` and `ff` bytes). Several
+matches are a 400 listing up to 10 candidates; `leep log` prints 12-digit ids.
 
 **Merge**: three-way, per path, with base = `merge_base(ours, theirs)`.
 Identical changes on both sides merge trivially. Text files merge by line

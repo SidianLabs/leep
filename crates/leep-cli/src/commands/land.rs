@@ -5,13 +5,15 @@ use std::fs;
 
 use clap::Args;
 use leep_core::api::{Conflict, LandRequest, LandResponse};
+use leep_core::refname::MISSING_REF_MARKER;
 use leep_core::review::NEEDS_REVIEW_MARKER;
 use leep_core::signature::NOT_SIGNED_MARKER;
 use leep_core::{ChangesetId, FileChange, FileKind, RepoPath};
 
 use super::{print_json, Ctx};
-use crate::error::{CliError, Result};
+use crate::error::{exit, CliError, ErrorKind, Result};
 use crate::fmt::short;
+use crate::markers::{relabel, Labels};
 use crate::materialize::{materialize, write_file};
 use crate::status::status;
 
@@ -20,6 +22,11 @@ pub struct LandArgs {
     /// Ref to land on (default: the working copy's target ref).
     #[arg(long = "ref")]
     pub target_ref: Option<String>,
+    /// Create the ref if it does not exist. Without it, landing onto a
+    /// missing ref fails (exit 4), so a typo cannot make a branch; only the
+    /// first land onto `main` of an empty repository creates it unasked.
+    #[arg(long)]
+    pub create: bool,
 }
 
 pub fn run(ctx: &mut Ctx, args: &LandArgs) -> Result<i32> {
@@ -40,13 +47,10 @@ pub fn run(ctx: &mut Ctx, args: &LandArgs) -> Result<i32> {
         .target_ref
         .clone()
         .unwrap_or_else(|| ctx.wc.config.target_ref.clone());
-    let resp = ctx
-        .client
-        .land(&LandRequest {
-            changeset: base,
-            target_ref: target_ref.clone(),
-        })
-        .map_err(|e| hint_policy(e, &target_ref))?;
+    let (resp, created) = land_creating(ctx, base, &target_ref, args.create)?;
+    if created {
+        eprintln!("created ref {target_ref}");
+    }
     if ctx.json {
         print_json(&resp)?;
     }
@@ -74,7 +78,7 @@ pub fn run(ctx: &mut Ctx, args: &LandArgs) -> Result<i32> {
             conflicts,
             clean,
         } => {
-            let unmerged = rebase_locally(ctx, onto, &conflicts, &clean)?;
+            let unmerged = rebase_locally(ctx, &target_ref, onto, &conflicts, &clean)?;
             if !ctx.json {
                 println!(
                     "Cannot land cleanly: {} conflict{} against {} on {target_ref}",
@@ -100,24 +104,88 @@ pub fn run(ctx: &mut Ctx, args: &LandArgs) -> Result<i32> {
                     short(onto)
                 );
             }
-            Ok(1)
+            Ok(exit::CONFLICT)
         }
     }
 }
 
+/// Land, creating the ref only if asked to or if this is the first land onto
+/// `main` of an empty repository (ADR 0036). Returns whether the ref was
+/// created.
+fn land_creating(
+    ctx: &Ctx,
+    base: ChangesetId,
+    target_ref: &str,
+    create: bool,
+) -> Result<(LandResponse, bool)> {
+    let land = |create: bool| {
+        ctx.client
+            .land(&LandRequest {
+                changeset: base,
+                target_ref: target_ref.to_string(),
+                create: Some(create),
+            })
+            .map_err(|e| hint_policy(e, target_ref))
+    };
+    // Whether `--create` will create or just land: asked only when it may.
+    let existed = if create {
+        ctx.client.get_ref(target_ref)?.target.is_some()
+    } else {
+        true
+    };
+    match land(create) {
+        Ok(resp) => {
+            let created = !existed && landed(&resp);
+            Ok((resp, created))
+        }
+        Err(e) if missing_ref(&e) => {
+            if target_ref == "main" {
+                let refs = ctx.client.refs()?.refs;
+                if refs.is_empty() {
+                    let resp = land(true)?;
+                    let created = landed(&resp);
+                    return Ok((resp, created));
+                }
+                // Another client's first land got there in between.
+                if refs.contains_key("main") {
+                    return Ok((land(false)?, false));
+                }
+            }
+            Err(e.with_hint(format!(
+                "`leep land --ref {target_ref} --create` creates it; `leep branch` lists branches"
+            )))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn landed(resp: &LandResponse) -> bool {
+    matches!(resp, LandResponse::Landed { .. })
+}
+
+/// A land refused because the ref does not exist and may not be created.
+fn missing_ref(e: &CliError) -> bool {
+    e.kind() == ErrorKind::NotFound && e.message().contains(MISSING_REF_MARKER)
+}
+
 /// The server names the changeset a policy refused; add what to do about it.
 fn hint_policy(e: CliError, target_ref: &str) -> CliError {
-    match e {
-        CliError::User(m) if m.contains(NEEDS_REVIEW_MARKER) => CliError::User(format!(
+    if e.kind() != ErrorKind::User {
+        return e;
+    }
+    if e.message().contains(NEEDS_REVIEW_MARKER) {
+        return e.map_message(|m| format!(
             "{m}\n{target_ref} needs approval from the owners of the paths a changeset changes: \
              ask one to run `leep review approve <changeset>`; `leep review status <changeset> --ref {target_ref}` shows what is missing."
-        )),
-        CliError::User(m) if m.contains(NOT_SIGNED_MARKER) => CliError::User(format!(
+        ));
+    }
+    if e.message().contains(NOT_SIGNED_MARKER) {
+        return e.map_message(|m| format!(
             "{m}\n{target_ref} only accepts signed changesets: every changeset being landed needs a signature. \
              Commit with `leep commit --sign KEYFILE` (or set LEEP_SIGNING_KEY); create a key with `leep keygen`."
-        )),
-        e => e,
+        ));
     }
+    e
 }
 
 /// Move the working copy to `onto` and re-apply the local changes there:
@@ -127,6 +195,7 @@ fn hint_policy(e: CliError, target_ref: &str) -> CliError {
 /// markers.
 fn rebase_locally(
     ctx: &mut Ctx,
+    target_ref: &str,
     onto: ChangesetId,
     conflicts: &[Conflict],
     clean: &BTreeMap<RepoPath, FileChange>,
@@ -154,6 +223,7 @@ fn rebase_locally(
         let path = c.path.to_string();
         match (&c.merged_with_markers, &c.theirs) {
             (Some(text), _) => {
+                let text = relabel(text, &Labels::landed(target_ref));
                 write_file(
                     &ctx.wc.abs_for_write(&path)?,
                     text.as_bytes(),

@@ -17,8 +17,9 @@ use leep_core::{Changeset, ChangesetId, FileChange};
 
 use super::integrate::{abort, added_paths, load_key, print_conflicts, sign};
 use super::{print_json, Ctx};
-use crate::error::{CliError, Result};
+use crate::error::{exit, CliError, Result};
 use crate::fmt::short;
+use crate::markers::Labels;
 use crate::materialize::list_files;
 use crate::overlay::{self, contained_in, Keep, Pending};
 use crate::sign::AuthorKey;
@@ -250,8 +251,15 @@ fn finish(
         }
         RebaseResponse::Conflicts { conflicts, clean } => {
             let base_files = list_files(ctx, &base)?;
-            let mut plan =
-                overlay::plan_conflicts(ctx, base, base_files, conflicts, clean, Keep::Ours)?;
+            let mut plan = overlay::plan_conflicts(
+                ctx,
+                base,
+                base_files,
+                conflicts,
+                clean,
+                Keep::Ours,
+                &Labels::new("yours", format!("{} ({verb})", short(pick.from))),
+            )?;
             plan.pending = Some(Pending::Pick(PickState {
                 from: pick.from,
                 message: pick.message.clone(),
@@ -281,7 +289,7 @@ fn finish(
                      the {verb}, or `leep {verb} --abort`."
                 );
             }
-            Ok(1)
+            Ok(exit::CONFLICT)
         }
     }
 }

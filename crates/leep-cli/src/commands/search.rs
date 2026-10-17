@@ -5,7 +5,7 @@ use leep_core::api::SearchResponse;
 
 use super::{print_json, Remote};
 use crate::client::SearchQuery;
-use crate::error::Result;
+use crate::error::{exit, Result};
 
 #[derive(Args, Debug)]
 pub struct SearchArgs {
@@ -70,7 +70,12 @@ pub fn run(r: &Remote, args: &SearchArgs) -> Result<i32> {
             resp.matches.len()
         );
     }
-    Ok(if resp.matches.is_empty() { 1 } else { 0 })
+    // A predicate like grep: "no match" is exit 1, not an error (ADR 0034).
+    Ok(if resp.matches.is_empty() {
+        exit::USER
+    } else {
+        exit::OK
+    })
 }
 
 #[cfg(test)]

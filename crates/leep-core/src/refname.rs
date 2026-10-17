@@ -13,6 +13,10 @@ pub const TAGS_PREFIX: &str = "tags/";
 /// fast-forward; the CLI matches it to suggest a revert.
 pub const NOT_FORWARD_MARKER: &str = "only moves forward";
 
+/// Stable text in the 404 for a land onto a ref that does not exist when the
+/// request said `create: false`; the CLI matches it to offer `--create`.
+pub const MISSING_REF_MARKER: &str = "does not exist and the land may not create it";
+
 /// Longest accepted ref name, in bytes.
 pub const MAX_LEN: usize = 255;
 

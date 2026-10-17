@@ -35,7 +35,17 @@ fn land_file(ctx: &mut Ctx, body: &str) -> ChangesetId {
         ..Default::default()
     };
     commit::run(ctx, &args).unwrap();
-    assert_eq!(land::run(ctx, &LandArgs { target_ref: None }).unwrap(), 0);
+    assert_eq!(
+        land::run(
+            ctx,
+            &LandArgs {
+                target_ref: None,
+                create: false
+            }
+        )
+        .unwrap(),
+        0
+    );
     ctx.wc.state.base.unwrap()
 }
 
@@ -55,8 +65,16 @@ fn undo(ctx: &Ctx, name: Option<&str>, to: Option<u64>) -> leep_cli::error::Resu
     reflog::undo(&ctx.remote(), &args)
 }
 
+#[track_caller]
 fn msg(e: leep_cli::error::CliError) -> String {
     assert_eq!(e.exit_code(), 1, "{e}");
+    e.to_string()
+}
+
+/// The message of an error with the given exit code (ADR 0034).
+#[track_caller]
+fn exits(code: i32, e: leep_cli::error::CliError) -> String {
+    assert_eq!(e.exit_code(), code, "{e}");
     e.to_string()
 }
 
@@ -152,9 +170,9 @@ fn undo_refuses_when_there_is_nothing_to_undo_or_the_ref_moved() {
     let b = land_file(&mut ctx, "b\n");
     assert_ne!(a, b);
 
-    let e = msg(undo(&ctx, None, Some(99)).unwrap_err());
+    let e = exits(4, undo(&ctx, None, Some(99)).unwrap_err());
     assert!(e.contains("no log entry 99"), "{e}");
-    let e = msg(undo(&ctx, Some("other"), Some(1)).unwrap_err());
+    let e = exits(4, undo(&ctx, Some("other"), Some(1)).unwrap_err());
     assert!(e.contains("no log entry 1"), "{e}");
 
     // Already there: undoing entry 2 twice with --to.
@@ -166,7 +184,7 @@ fn undo_refuses_when_there_is_nothing_to_undo_or_the_ref_moved() {
     // makes the default undo stop instead of guessing.
     mock.data.lock().unwrap().refs.insert("main".into(), b);
     let before = log(&mock).len();
-    let e = msg(undo(&ctx, None, None).unwrap_err());
+    let e = exits(5, undo(&ctx, None, None).unwrap_err());
     assert!(e.contains("moved while undoing"), "{e}");
     assert_eq!(ref_of(&mock, "main"), Some(b));
     assert_eq!(log(&mock).len(), before);

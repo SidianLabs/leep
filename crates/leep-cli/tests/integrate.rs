@@ -151,8 +151,16 @@ fn changes(ctx: &Ctx) -> Vec<(String, Change)> {
         .collect()
 }
 
+#[track_caller]
 fn user_err(e: CliError) -> String {
     assert_eq!(e.exit_code(), 1, "{e}");
+    e.to_string()
+}
+
+/// The message of an error that reports conflicts to resolve (exit 5).
+#[track_caller]
+fn conflict_err(e: CliError) -> String {
+    assert_eq!(e.exit_code(), 5, "{e}");
     e.to_string()
 }
 
@@ -221,7 +229,14 @@ fn clean_merge_makes_a_two_parent_local_commit_that_lands() {
 
     // The merge lands like any commit; here, as a fast-forward.
     assert_eq!(
-        land::run(&mut ctx, &LandArgs { target_ref: None }).unwrap(),
+        land::run(
+            &mut ctx,
+            &LandArgs {
+                target_ref: None,
+                create: false
+            }
+        )
+        .unwrap(),
         0
     );
     assert_eq!(env.main(), id);
@@ -291,7 +306,7 @@ fn merge_conflict_writes_markers_then_commit_records_both_parents() {
     let mut env = Env::new();
     let (mut ctx, main, feat) = text_conflict(&mut env);
 
-    assert_eq!(merge::run(&mut ctx, &merge_args("feature")).unwrap(), 1);
+    assert_eq!(merge::run(&mut ctx, &merge_args("feature")).unwrap(), 5);
     let text = read(&ctx, "a.txt");
     assert!(text.contains("<<<<<<<") && text.contains("a main") && text.contains("a feature"));
     assert_eq!(read(&ctx, "c.txt"), "c\n", "the clean change is applied");
@@ -316,13 +331,22 @@ fn merge_conflict_writes_markers_then_commit_records_both_parents() {
     );
 
     // Everything else waits until the merge is finished or aborted.
-    let m = user_err(commit::run(&mut ctx, &commit_args("too soon")).unwrap_err());
+    let m = conflict_err(commit::run(&mut ctx, &commit_args("too soon")).unwrap_err());
     assert!(m.contains("conflict") && m.contains("a.txt"), "{m}");
     let in_progress = |e: CliError| {
-        let m = user_err(e);
+        let m = conflict_err(e);
         assert!(m.contains("merge of") && m.contains("in progress"), "{m}");
     };
-    in_progress(land::run(&mut ctx, &LandArgs { target_ref: None }).unwrap_err());
+    in_progress(
+        land::run(
+            &mut ctx,
+            &LandArgs {
+                target_ref: None,
+                create: false,
+            },
+        )
+        .unwrap_err(),
+    );
     in_progress(sync(&mut ctx, &SyncArgs::default()).unwrap_err());
     in_progress(merge::run(&mut ctx, &merge_args("feature")).unwrap_err());
     in_progress(rebase::run(&mut ctx, &rebase_args(None)).unwrap_err());
@@ -382,7 +406,14 @@ fn merge_conflict_writes_markers_then_commit_records_both_parents() {
     assert!(status(&ctx.wc).unwrap().is_clean());
     // Lands as a fast-forward of main.
     assert_eq!(
-        land::run(&mut ctx, &LandArgs { target_ref: None }).unwrap(),
+        land::run(
+            &mut ctx,
+            &LandArgs {
+                target_ref: None,
+                create: false
+            }
+        )
+        .unwrap(),
         0
     );
     assert_eq!(env.main(), id);
@@ -413,7 +444,7 @@ fn a_merge_resolved_entirely_to_our_side_still_commits_as_a_merge() {
     );
     let main = env.mock.seed(Some(cs1), &[("a.txt", "a main\n", REG)], &[]);
     let mut ctx = env.wc();
-    assert_eq!(merge::run(&mut ctx, &merge_args("feature")).unwrap(), 1);
+    assert_eq!(merge::run(&mut ctx, &merge_args("feature")).unwrap(), 5);
     restore::run(
         &mut ctx,
         &RestoreArgs {
@@ -461,7 +492,7 @@ fn merge_binary_conflict_keeps_our_file_and_blocks_until_resolved() {
     let main = env.mock.seed(Some(cs1), &[("img.bin", "ours\0", REG)], &[]);
     let mut ctx = env.wc();
 
-    assert_eq!(merge::run(&mut ctx, &merge_args("feature")).unwrap(), 1);
+    assert_eq!(merge::run(&mut ctx, &merge_args("feature")).unwrap(), 5);
     assert_eq!(read(&ctx, "img.bin"), "ours\0", "our version kept");
     assert_eq!(read(&ctx, "a.txt"), "a feature\n", "clean change applied");
     assert_eq!(ctx.wc.state.unresolved, ["img.bin"]);
@@ -473,9 +504,18 @@ fn merge_binary_conflict_keeps_our_file_and_blocks_until_resolved() {
             ("img.bin".to_string(), Change::Conflicted)
         ]
     );
-    let m = user_err(commit::run(&mut ctx, &finish_args()).unwrap_err());
+    let m = conflict_err(commit::run(&mut ctx, &finish_args()).unwrap_err());
     assert!(m.contains("img.bin") && m.contains("leep resolve"), "{m}");
-    let m = user_err(land::run(&mut ctx, &LandArgs { target_ref: None }).unwrap_err());
+    let m = conflict_err(
+        land::run(
+            &mut ctx,
+            &LandArgs {
+                target_ref: None,
+                create: false,
+            },
+        )
+        .unwrap_err(),
+    );
     assert!(m.contains("in progress"), "{m}");
 
     resolve::run(
@@ -506,7 +546,7 @@ fn merge_abort_restores_the_working_copy_and_removes_what_the_merge_added() {
     .unwrap_err();
     assert!(user_err(err).contains("no merge is in progress"));
 
-    assert_eq!(merge::run(&mut ctx, &merge_args("feature")).unwrap(), 1);
+    assert_eq!(merge::run(&mut ctx, &merge_args("feature")).unwrap(), 5);
     write(&ctx, "b.txt", "stray edit\n");
     let abort = MergeArgs {
         abort: true,
@@ -522,7 +562,7 @@ fn merge_abort_restores_the_working_copy_and_removes_what_the_merge_added() {
     assert!(status(&ctx.wc).unwrap().is_clean());
     assert!(env.reopen(&ctx).wc.state.merge_in_progress.is_none());
     // And the same merge can be started again.
-    assert_eq!(merge::run(&mut ctx, &merge_args("feature")).unwrap(), 1);
+    assert_eq!(merge::run(&mut ctx, &merge_args("feature")).unwrap(), 5);
 }
 
 #[test]
@@ -554,7 +594,7 @@ fn merge_conflict_with_nothing_clean_works_against_such_a_server() {
     let mut ctx = env.wc();
     env.mock.data.lock().unwrap().omit_merge_clean = true;
     // Nothing besides the conflict changed, so an empty `clean` is complete.
-    assert_eq!(merge::run(&mut ctx, &merge_args("feature")).unwrap(), 1);
+    assert_eq!(merge::run(&mut ctx, &merge_args("feature")).unwrap(), 5);
     assert!(read(&ctx, "a.txt").contains("<<<<<<<"));
 }
 
@@ -641,7 +681,14 @@ fn rebase_without_an_argument_goes_onto_the_target_head() {
     assert_eq!(read(&ctx, "b.txt"), "b local\n");
     // The moved commit lands as a fast-forward.
     assert_eq!(
-        land::run(&mut ctx, &LandArgs { target_ref: None }).unwrap(),
+        land::run(
+            &mut ctx,
+            &LandArgs {
+                target_ref: None,
+                create: false
+            }
+        )
+        .unwrap(),
         0
     );
     assert_eq!(env.main(), ctx.wc.state.base.unwrap());
@@ -702,7 +749,7 @@ fn rebase_stops_on_a_conflict_with_nothing_changed() {
     let base = ctx.wc.state.base.unwrap();
     let state_before = ctx.wc.state.clone();
 
-    let m = user_err(rebase::run(&mut ctx, &rebase_args(Some("feature"))).unwrap_err());
+    let m = conflict_err(rebase::run(&mut ctx, &rebase_args(Some("feature"))).unwrap_err());
     assert!(m.contains("local edits a") && m.contains("a.txt"), "{m}");
     assert!(
         m.contains("nothing changed") && m.contains("cherry-pick"),
@@ -769,7 +816,14 @@ fn cherry_pick_copies_one_change_onto_the_base() {
     assert!(status(&ctx.wc).unwrap().is_clean());
     assert_eq!(env.main(), main, "no ref moves");
     assert_eq!(
-        land::run(&mut ctx, &LandArgs { target_ref: None }).unwrap(),
+        land::run(
+            &mut ctx,
+            &LandArgs {
+                target_ref: None,
+                create: false
+            }
+        )
+        .unwrap(),
         0
     );
     assert_eq!(env.main(), id);
@@ -807,7 +861,7 @@ fn cherry_pick_conflict_then_commit_uses_the_picked_message() {
 
     assert_eq!(
         pick::cherry_pick(&mut ctx, &pick_args("feature")).unwrap(),
-        1
+        5
     );
     assert_eq!(ctx.wc.state.base, Some(main));
     let p = ctx.wc.state.pick_in_progress.clone().unwrap();
@@ -817,9 +871,9 @@ fn cherry_pick_conflict_then_commit_uses_the_picked_message() {
     );
     assert!(read(&ctx, "a.txt").contains("<<<<<<<"));
     assert_eq!(read(&ctx, "c.txt"), "c\n");
-    let m = user_err(commit::run(&mut ctx, &finish_args()).unwrap_err());
+    let m = conflict_err(commit::run(&mut ctx, &finish_args()).unwrap_err());
     assert!(m.contains("conflict"), "{m}");
-    let m = user_err(merge::run(&mut ctx, &merge_args("feature")).unwrap_err());
+    let m = conflict_err(merge::run(&mut ctx, &merge_args("feature")).unwrap_err());
     assert!(
         m.contains("cherry-pick of") && m.contains("in progress"),
         "{m}"
@@ -976,7 +1030,7 @@ fn revert_conflict_then_commit_uses_the_revert_message() {
 
     assert_eq!(
         pick::revert(&mut ctx, &revert_args(&edit.to_string())).unwrap(),
-        1
+        5
     );
     assert_eq!(ctx.wc.state.base, Some(later));
     let message = format!("Revert \"edit b\"\n\nThis reverts {edit}.");
@@ -988,7 +1042,7 @@ fn revert_conflict_then_commit_uses_the_revert_message() {
     let text = read(&ctx, "b.txt");
     assert!(text.contains("<<<<<<<") && text.contains("b3"), "{text}");
     assert_eq!(changes(&ctx), [("b.txt".to_string(), Change::Conflicted)]);
-    let m = user_err(commit::run(&mut ctx, &finish_args()).unwrap_err());
+    let m = conflict_err(commit::run(&mut ctx, &finish_args()).unwrap_err());
     assert!(m.contains("conflict") && m.contains("b.txt"), "{m}");
     let m = user_err(
         pick::cherry_pick(
@@ -1057,11 +1111,11 @@ fn revert_binary_conflict_keeps_our_file_and_needs_resolve() {
     let mut ctx = env.wc();
     assert_eq!(
         pick::revert(&mut ctx, &revert_args(&v2.to_string())).unwrap(),
-        1
+        5
     );
     assert_eq!(read(&ctx, "img.bin"), "v3\0");
     assert_eq!(ctx.wc.state.unresolved, ["img.bin"]);
-    let m = user_err(commit::run(&mut ctx, &finish_args()).unwrap_err());
+    let m = conflict_err(commit::run(&mut ctx, &finish_args()).unwrap_err());
     assert!(m.contains("img.bin") && m.contains("leep resolve"), "{m}");
     resolve::run(
         &mut ctx,
@@ -1177,7 +1231,41 @@ fn every_command_refuses_unresolved_paths_by_name() {
         pick::cherry_pick(&mut ctx, &pick_args("feature")).unwrap_err(),
         pick::revert(&mut ctx, &revert_args("@")).unwrap_err(),
     ] {
-        let m = user_err(e);
+        let m = conflict_err(e);
         assert!(m.contains("unresolved conflicts in img.bin"), "{m}");
     }
+}
+
+#[test]
+fn conflict_markers_name_the_sides_and_old_labels_still_count() {
+    let mut env = Env::new();
+    let (mut ctx, _main, feat) = text_conflict(&mut env);
+    assert_eq!(merge::run(&mut ctx, &merge_args("feature")).unwrap(), 5);
+    let text = read(&ctx, "a.txt");
+    let theirs = format!(">>>>>>> {} (merging)\n", &feat.to_string()[..12]);
+    assert!(text.starts_with("<<<<<<< yours\n"), "{text}");
+    assert!(text.contains(&theirs), "{text}");
+    assert!(!text.contains("<<<<<<< ours"), "{text}");
+
+    let resolve_a = |ctx: &mut Ctx| {
+        resolve::run(
+            ctx,
+            &ResolveArgs {
+                paths: vec!["a.txt".into()],
+                force: false,
+            },
+        )
+    };
+    let m = conflict_err(resolve_a(&mut ctx).unwrap_err());
+    assert!(m.contains("markers remain"), "{m}");
+    // A file with the old labels (an older client wrote it) still counts.
+    write(
+        &ctx,
+        "a.txt",
+        "<<<<<<< ours\na main\n=======\na feature\n>>>>>>> theirs\n",
+    );
+    let m = conflict_err(resolve_a(&mut ctx).unwrap_err());
+    assert!(m.contains("markers remain"), "{m}");
+    write(&ctx, "a.txt", "a both\n");
+    assert_eq!(resolve_a(&mut ctx).unwrap(), 0);
 }

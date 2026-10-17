@@ -81,9 +81,9 @@ fn commit_uploads_only_missing_blobs() {
     }
     assert!(status(&ctx.wc).unwrap().is_clean());
 
-    // Nothing to commit is a user error.
+    // Nothing to commit has its own exit code (ADR 0034).
     let e = commit::run(&mut ctx, &commit_args("noop")).unwrap_err();
-    assert_eq!(e.exit_code(), 1);
+    assert_eq!(e.exit_code(), 6);
 
     // Modify, delete, and add a file whose content the server already has.
     write(&ctx, "a.txt", "changed\n");
@@ -197,7 +197,10 @@ fn land_fast_forward_rebase_and_conflict() {
         .iter()
         .map(|d| init_wc(&mock, d.path(), cache.path(), &[]).unwrap())
         .collect();
-    let land_args = LandArgs { target_ref: None };
+    let land_args = LandArgs {
+        target_ref: None,
+        create: false,
+    };
 
     // A fast-forwards.
     write(&wcs[0], "a.txt", "a from A\n");
@@ -218,11 +221,11 @@ fn land_fast_forward_rebase_and_conflict() {
     assert_eq!(read(&wcs[1], "b.txt"), "b from B\n");
     assert!(status(&wcs[1].wc).unwrap().is_clean());
 
-    // C edits a.txt differently from A and adds c.txt: conflict, exit 1.
+    // C edits a.txt differently from A and adds c.txt: conflict, exit 5.
     write(&wcs[2], "a.txt", "a from C\n");
     write(&wcs[2], "c.txt", "c from C\n");
     commit::run(&mut wcs[2], &commit_args("C")).unwrap();
-    assert_eq!(land::run(&mut wcs[2], &land_args).unwrap(), 1);
+    assert_eq!(land::run(&mut wcs[2], &land_args).unwrap(), 5);
     assert_eq!(
         mock.data.lock().unwrap().refs["main"],
         head,
@@ -266,7 +269,8 @@ fn corrupt_download_is_rejected_and_not_cached() {
     let err = init_wc(&mock, wc_dir.path(), cache.path(), &[])
         .err()
         .unwrap();
-    assert_eq!(err.exit_code(), 2);
+    assert_eq!(err.exit_code(), 3);
+    assert!(!err.is_retryable());
     assert!(err.to_string().contains("does not match"));
     let h = Hash::of_blob(b"precious\n").to_hex();
     assert!(!cache.path().join(&h[..2]).join(&h[2..]).exists());
@@ -342,7 +346,14 @@ mod auth {
         write(&ctx, "b.txt", "new\n");
         assert_eq!(commit::run(&mut ctx, &commit_args("add b")).unwrap(), 0);
         assert_eq!(
-            land::run(&mut ctx, &LandArgs { target_ref: None }).unwrap(),
+            land::run(
+                &mut ctx,
+                &LandArgs {
+                    target_ref: None,
+                    create: false
+                }
+            )
+            .unwrap(),
             0
         );
 
@@ -668,7 +679,14 @@ mod signing {
 
         write(&ctx, "a.txt", "one\n");
         commit::run(&mut ctx, &commit_args("unsigned")).unwrap();
-        let e = land::run(&mut ctx, &LandArgs { target_ref: None }).unwrap_err();
+        let e = land::run(
+            &mut ctx,
+            &LandArgs {
+                target_ref: None,
+                create: false,
+            },
+        )
+        .unwrap_err();
         let msg = e.to_string();
         assert!(msg.contains("is not signed by a trusted key"), "{msg}");
         assert!(msg.contains("leep commit --sign"), "{msg}");
@@ -680,7 +698,14 @@ mod signing {
         args.sign = Some(keyfile);
         commit::run(&mut ctx, &args).unwrap();
         assert_eq!(
-            land::run(&mut ctx, &LandArgs { target_ref: None }).unwrap(),
+            land::run(
+                &mut ctx,
+                &LandArgs {
+                    target_ref: None,
+                    create: false
+                }
+            )
+            .unwrap(),
             0
         );
         assert_eq!(
@@ -946,6 +971,12 @@ fn msg(e: leep_cli::error::CliError) -> String {
     e.to_string()
 }
 
+/// The message of a not-found error (exit 4, ADR 0034).
+fn missing(e: leep_cli::error::CliError) -> String {
+    assert_eq!(e.exit_code(), 4, "{e}");
+    e.to_string()
+}
+
 #[test]
 fn branch_create_switch_land_and_delete() {
     let mock = Mock::start();
@@ -971,7 +1002,7 @@ fn branch_create_switch_land_and_delete() {
     }
     let e = msg(branch::branch(&ctx, &branch_args("tags/x", None)).unwrap_err());
     assert!(e.contains("leep tag"), "{e}");
-    let e = msg(branch::branch(&ctx, &branch_args("x", Some("nope"))).unwrap_err());
+    let e = missing(branch::branch(&ctx, &branch_args("x", Some("nope"))).unwrap_err());
     assert!(e.contains("unknown revision"), "{e}");
     assert_eq!(
         branch::branch(
@@ -990,7 +1021,7 @@ fn branch_create_switch_land_and_delete() {
     let e = msg(branch::switch(&mut ctx, &switch_args("feature", false, None)).unwrap_err());
     assert!(e.contains("uncommitted"), "{e}");
     fs::remove_file(ctx.wc.abs("dirty.txt")).unwrap();
-    let e = msg(branch::switch(&mut ctx, &switch_args("nope", false, None)).unwrap_err());
+    let e = missing(branch::switch(&mut ctx, &switch_args("nope", false, None)).unwrap_err());
     assert!(e.contains("does not exist"), "{e}");
     assert_eq!(ctx.wc.config.target_ref, "main");
 
@@ -1007,7 +1038,14 @@ fn branch_create_switch_land_and_delete() {
     commit::run(&mut ctx, &commit_args("work")).unwrap();
     let work = ctx.wc.state.base.unwrap();
     assert_eq!(
-        land::run(&mut ctx, &LandArgs { target_ref: None }).unwrap(),
+        land::run(
+            &mut ctx,
+            &LandArgs {
+                target_ref: None,
+                create: false
+            }
+        )
+        .unwrap(),
         0
     );
     assert_eq!(ref_of(&mock, "feature"), Some(work));
@@ -1019,7 +1057,7 @@ fn branch_create_switch_land_and_delete() {
     assert_eq!(ref_of(&mock, "old"), None);
     let e = msg(branch::branch(&ctx, &delete_args("feature", true)).unwrap_err());
     assert!(e.contains("target"), "{e}");
-    let e = msg(branch::branch(&ctx, &delete_args("gone", false)).unwrap_err());
+    let e = missing(branch::branch(&ctx, &delete_args("gone", false)).unwrap_err());
     assert!(e.contains("does not exist"), "{e}");
 
     // Back on main, `feature` holds unmerged work: `-d` refuses, `-D` deletes.
@@ -1114,7 +1152,7 @@ fn tags_are_created_listed_resolved_and_deleted() {
     // Delete, then it can be created again somewhere else.
     assert_eq!(branch::tag(&ctx, &tag_args("v1", None, true)).unwrap(), 0);
     assert_eq!(ref_of(&mock, "tags/v1"), None);
-    let e = msg(branch::tag(&ctx, &tag_args("v1", None, true)).unwrap_err());
+    let e = missing(branch::tag(&ctx, &tag_args("v1", None, true)).unwrap_err());
     assert!(e.contains("does not exist"), "{e}");
     branch::tag(&ctx, &tag_args("v1", Some("tags/v2"), false)).unwrap();
     assert_eq!(ref_of(&mock, "tags/v1"), ref_of(&mock, "tags/v2"));

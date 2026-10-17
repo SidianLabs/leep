@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use leep_core::prefix::IdPrefix;
 use leep_core::{
     Changeset, ChangesetId, Hash, MetaStore, RefLogEntry, RefStep, RefUpdateContext, Result,
 };
@@ -50,6 +51,21 @@ impl MetaStore for FaultyMetaStore {
             .run(
                 Op::ListChangesets,
                 self.inner.list_changesets(after, limit),
+                |_, v| v,
+            )
+            .await
+    }
+
+    /// Faults as for `list_changesets`, the read it stands in for.
+    async fn changesets_with_prefix(
+        &self,
+        prefix: &IdPrefix,
+        limit: usize,
+    ) -> Result<Vec<ChangesetId>> {
+        self.plan
+            .run(
+                Op::ListChangesets,
+                self.inner.changesets_with_prefix(prefix, limit),
                 |_, v| v,
             )
             .await

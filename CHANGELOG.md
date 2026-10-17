@@ -117,6 +117,46 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 - `leep commit -m` may be left out while a merge, cherry-pick or revert is
   waiting for its commit.
 
+### CLI for agents
+- Documented exit codes (ADR 0034, `docs/CLI.md`): 1 generic failure, 2 usage,
+  3 server or network failure (was 2), 4 not found (was 1), 5 conflict (a
+  land, sync, merge, cherry-pick, revert or stash apply with conflicts, a
+  refusal while conflicts wait, or a lost race; was 1), 6 nothing to do
+  (`commit`, `amend` and `stash push` with nothing to record; was 1). Scripts
+  that tested for exactly 1 or 2 need updating. An error may add a
+  `hint: ...` line, for example where the server URL came from.
+- With `--json`, errors are JSON too: `{"error":{"code","message","hint",
+  "retryable"}}` on stdout (the text still goes to stderr), with a stable
+  `code` such as `not_found`, `conflict`, `server` or `usage`. Usage errors
+  follow it when `--json` is anywhere on the command line.
+- Short changeset ids (ADR 0035): every command that takes a revision accepts
+  4 or more leading hex digits of a changeset id, such as the 12-digit ids the
+  CLI prints; an ambiguous one lists the candidates. `leep log` headers now
+  print 12-digit ids (`--json` keeps full ids). New `GET
+  /v1/resolve-prefix/{prefix}` and `MetaStore::changesets_with_prefix`, with a
+  default built on `list_changesets` and range-scan overrides for SQLite and
+  Postgres.
+- `leep land` no longer creates a ref that does not exist unless given
+  `--create` (ADR 0036): `leep land --ref typo` fails with exit 4 and a hint.
+  The first land onto `main` of an empty repository still works without it,
+  and a land that creates a ref prints `created ref NAME`. `POST /v1/land`
+  takes an optional `create`; without it the server creates the ref as
+  before, so older clients, the MCP server and scripts are unaffected.
+- `leep --help` groups the commands (Work, Branches, History, Review, Admin)
+  and describes `--server`, `--token` and `--json` once; each command's help
+  no longer repeats them and points there instead. The most used commands
+  have examples in their `--help`.
+- Conflict markers written by the CLI name the sides by role instead of
+  `ours` / `theirs`: `<<<<<<< main (landed)` and `>>>>>>> yours` after `land`
+  and `sync`, `yours` and `ID (merging)` after `merge`, and similarly for
+  `cherry-pick`, `revert` and `stash apply`. Files with the old labels are
+  still recognised; the `/v1` text and fields are unchanged.
+- Colour and a pager for human output: diffs, status letters and changeset
+  headers are coloured when stdout is a terminal, honouring `NO_COLOR`,
+  `CLICOLOR_FORCE`, `CLICOLOR` and `--color auto|always|never`; `log`, `diff`
+  and `show` page through `LEEP_PAGER`, `PAGER` or `less` on a terminal. Pipes
+  and `--json` stay plain and unpaged. No new dependency.
+
 ### Hardening
 - Fuzz targets for every decoder and parser: persisted objects, derived
   rows, API bodies, the router, `OWNERS` and the server's config files, the

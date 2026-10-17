@@ -10,6 +10,7 @@ pub mod error;
 pub mod hash;
 pub mod memory;
 pub mod path;
+pub mod prefix;
 pub mod refname;
 pub mod rename;
 pub mod review;

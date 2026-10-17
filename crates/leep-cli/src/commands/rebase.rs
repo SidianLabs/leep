@@ -30,7 +30,7 @@ pub fn run(ctx: &mut Ctx, args: &RebaseArgs) -> Result<i32> {
             ctx.client
                 .get_ref(name)?
                 .target
-                .ok_or_else(|| CliError::user(format!("ref {name} does not exist")))?
+                .ok_or_else(|| CliError::not_found(format!("ref {name} does not exist")))?
         }
     };
 
@@ -88,7 +88,7 @@ fn conflict_error(
 ) -> Result<CliError> {
     let msg = ctx.client.get_changeset(&commit)?.changeset.message;
     let paths: Vec<&str> = conflicts.iter().map(|c| c.path.as_str()).collect();
-    Ok(CliError::user(format!(
+    Ok(CliError::conflict(format!(
         "local commit {} (\"{}\") conflicts with {} in {}; nothing changed.\n\
          To settle it by hand: `leep checkout {onto}`, then `leep cherry-pick {commit}` for each local \
          commit, oldest first, resolving the conflicts as they come up.",

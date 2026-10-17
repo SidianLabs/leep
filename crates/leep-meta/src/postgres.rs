@@ -3,6 +3,7 @@ use std::str::FromStr;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use leep_core::prefix::IdPrefix;
 use leep_core::store::unix_now;
 use leep_core::{
     check_ref_chain, Changeset, ChangesetId, DerivedRow, Hash, MetaStore, RefLogEntry, RefStep,
@@ -277,6 +278,26 @@ impl MetaStore for PostgresMetaStore {
             .fetch_all(&self.pool)
             .await
             .map_err(storage)?;
+        rows.into_iter()
+            .map(|r| to_id(&r.get::<Vec<u8>, _>(0)))
+            .collect()
+    }
+
+    /// One bounded range scan of the primary key.
+    async fn changesets_with_prefix(
+        &self,
+        prefix: &IdPrefix,
+        limit: usize,
+    ) -> Result<Vec<ChangesetId>> {
+        let rows = sqlx::query(
+            "SELECT id FROM changesets WHERE id >= $1 AND id <= $2 ORDER BY id LIMIT $3",
+        )
+        .bind(prefix.lower().0 .0.to_vec())
+        .bind(prefix.upper().0 .0.to_vec())
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(storage)?;
         rows.into_iter()
             .map(|r| to_id(&r.get::<Vec<u8>, _>(0)))
             .collect()

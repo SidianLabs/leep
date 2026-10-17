@@ -1,9 +1,10 @@
 //! Blocking HTTP client wrapping every endpoint in `leep_core::api`.
 //!
-//! Network failures, 5xx and 408 answers are [`CliError::Server`] (exit 2);
-//! other 4xx answers are [`CliError::User`] (exit 1). `ErrorResponse` bodies
-//! become the error message. 401 and 403 get fixed, token-free messages
-//! instead.
+//! Every failed request becomes a [`CliError`] whose kind follows the HTTP
+//! status (ADR 0034): no connection is `Unreachable`, 5xx `Server`, 408
+//! `Timeout`, 429 `RateLimited`, 404 `NotFound`, 409 `Conflict` (retryable),
+//! 401 and 403 `Auth`, any other 4xx `User`. `ErrorResponse` bodies become the
+//! error message. 401 and 403 get fixed, token-free messages instead.
 //!
 //! A 429 from the server's request limits (ADR 0020) is retried for GET
 //! requests only, honoring `Retry-After`; anything else fails at once, since a
@@ -18,7 +19,7 @@ use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, RETRY_AFTER};
 use reqwest::StatusCode;
 use serde::de::DeserializeOwned;
 
-use crate::error::{CliError, Result};
+use crate::error::{CliError, ErrorKind, Result};
 
 /// Tries per GET before a 429 is reported.
 const MAX_ATTEMPTS: u32 = 4;
@@ -147,7 +148,7 @@ impl Client {
 
     fn send(&self, req: RequestBuilder) -> Result<Response> {
         let (http, built) = req.build_split();
-        let built = built.map_err(|e| CliError::server(format!("bad request: {e}")))?;
+        let built = built.map_err(|e| CliError::user(format!("bad request: {e}")))?;
         let idempotent = built.method() == reqwest::Method::GET;
         let mut current = built;
         let mut attempt = 1;
@@ -157,9 +158,7 @@ impl Client {
             } else {
                 None
             };
-            let resp = http
-                .execute(current)
-                .map_err(|e| CliError::server(format!("cannot reach {}: {e}", self.base)))?;
+            let resp = http.execute(current).map_err(|e| self.unreachable(e))?;
             let status = resp.status();
             if status.is_success() {
                 return Ok(resp);
@@ -178,10 +177,23 @@ impl Client {
         }
     }
 
+    /// A request that never got an answer. A timeout may have taken effect;
+    /// a refused connection did not.
+    fn unreachable(&self, e: reqwest::Error) -> CliError {
+        let kind = if e.is_timeout() {
+            ErrorKind::Timeout
+        } else {
+            ErrorKind::Unreachable
+        };
+        CliError::new(kind, format!("cannot reach {}: {e}", self.base)).with_hint(
+            "check that leep-server runs at that URL; it comes from --server, \
+             LEEP_SERVER or .leep/config.json",
+        )
+    }
+
     fn json<T: DeserializeOwned>(&self, req: RequestBuilder) -> Result<T> {
         let resp = self.send(req)?;
-        resp.json::<T>()
-            .map_err(|e| CliError::server(format!("bad response from server: {e}")))
+        resp.json::<T>().map_err(bad_response)
     }
 
     pub fn health(&self) -> Result<()> {
@@ -313,11 +325,9 @@ impl Client {
             .post(self.url(&format!("/v1/refs/{}", enc(name))))
             .json(req)
             .send()
-            .map_err(|e| CliError::server(format!("cannot reach {}: {e}", self.base)))?;
+            .map_err(|e| self.unreachable(e))?;
         if resp.status().is_success() || resp.status() == StatusCode::CONFLICT {
-            return resp
-                .json()
-                .map_err(|e| CliError::server(format!("bad response from server: {e}")));
+            return resp.json().map_err(bad_response);
         }
         Err(error_from(resp, self.has_token))
     }
@@ -326,6 +336,16 @@ impl Client {
         let r: ResolveResponse = self.json(
             self.http
                 .get(self.url(&format!("/v1/resolve/{}", enc(rev)))),
+        )?;
+        Ok(r.id)
+    }
+
+    /// The one changeset whose id starts with `prefix`. Several matches are
+    /// an `Ambiguous` error carrying the candidates (ADR 0035).
+    pub fn resolve_prefix(&self, prefix: &str) -> Result<ChangesetId> {
+        let r: ResolvePrefixResponse = self.json(
+            self.http
+                .get(self.url(&format!("/v1/resolve-prefix/{}", enc(prefix)))),
         )?;
         Ok(r.id)
     }
@@ -489,21 +509,43 @@ fn retry_after(resp: &Response) -> Option<Duration> {
     Some(Duration::from_secs(secs))
 }
 
+/// An answer that does not decode: a version mismatch or a broken proxy, so
+/// running the command again will not help.
+fn bad_response(e: reqwest::Error) -> CliError {
+    CliError::server(format!("bad response from server: {e}")).retryable(false)
+}
+
 fn error_from(resp: Response, has_token: bool) -> CliError {
     let status = resp.status();
     match status {
         StatusCode::UNAUTHORIZED if has_token => {
-            return CliError::user(
+            return CliError::new(
+                ErrorKind::Auth,
                 "authentication required: the server rejected the token; check LEEP_TOKEN",
             )
         }
         StatusCode::UNAUTHORIZED => {
-            return CliError::user("authentication required: set LEEP_TOKEN (or pass --token)")
+            return CliError::new(
+                ErrorKind::Auth,
+                "authentication required: set LEEP_TOKEN (or pass --token)",
+            )
         }
-        StatusCode::FORBIDDEN => return CliError::user("token lacks write access"),
+        StatusCode::FORBIDDEN => return CliError::new(ErrorKind::Auth, "token lacks write access"),
         _ => {}
     }
     let body = resp.text().unwrap_or_default();
+    if status == StatusCode::BAD_REQUEST {
+        if let Ok(amb) = serde_json::from_str::<AmbiguousPrefixResponse>(&body) {
+            let mut candidates: Vec<String> =
+                amb.candidates.iter().map(ToString::to_string).collect();
+            if amb.truncated {
+                candidates.push("...".into());
+            }
+            return CliError::new(ErrorKind::Ambiguous, format!("server: {}", amb.error))
+                .with_candidates(candidates)
+                .with_hint("give more digits of the id; the candidates are listed above");
+        }
+    }
     let msg = serde_json::from_str::<ErrorResponse>(&body)
         .map(|e| e.error)
         .unwrap_or_else(|_| body.trim().to_string());
@@ -512,17 +554,23 @@ fn error_from(resp: Response, has_token: bool) -> CliError {
     } else {
         format!("server: {msg} ({status})")
     };
-    // The server's request timeout cancels a request at any point, possibly
-    // after it took effect: like a lost connection, the outcome is unknown and
-    // running the command again is the answer, not a refusal.
-    if status == StatusCode::REQUEST_TIMEOUT {
-        CliError::Server(format!(
-            "{msg}; the request may or may not have taken effect, so run the command again"
-        ))
-    } else if status.is_server_error() {
-        CliError::Server(msg)
-    } else {
-        CliError::User(msg)
+    match status {
+        // The server's request timeout cancels a request at any point,
+        // possibly after it took effect: like a lost connection, the outcome
+        // is unknown and running the command again is the answer.
+        StatusCode::REQUEST_TIMEOUT => CliError::new(
+            ErrorKind::Timeout,
+            format!(
+                "{msg}; the request may or may not have taken effect, so run the command again"
+            ),
+        ),
+        StatusCode::TOO_MANY_REQUESTS => CliError::new(ErrorKind::RateLimited, msg),
+        StatusCode::NOT_FOUND => CliError::not_found(msg),
+        // Only concurrent updates answer 409 (a land that kept losing, a ref
+        // that moved); content conflicts are a normal land answer.
+        StatusCode::CONFLICT => CliError::lost_race(msg),
+        s if s.is_server_error() => CliError::server(msg),
+        _ => CliError::user(msg),
     }
 }
 
@@ -586,7 +634,8 @@ mod tests {
         let e = Client::new(&url).refs().unwrap_err();
         assert!(e.to_string().contains("rate limit exceeded"), "{e}");
         assert_eq!(seen.load(Ordering::SeqCst), MAX_ATTEMPTS as usize);
-        assert_eq!(e.exit_code(), 1);
+        assert_eq!(e.kind(), ErrorKind::RateLimited);
+        assert_eq!(e.exit_code(), 3);
     }
 
     #[test]
@@ -615,9 +664,11 @@ mod tests {
             .land(&LandRequest {
                 changeset: ChangesetId(Hash::of_blob(b"x")),
                 target_ref: "main".into(),
+                create: None,
             })
             .unwrap_err();
-        assert_eq!(e.exit_code(), 2, "{e}");
+        assert_eq!(e.kind(), ErrorKind::Timeout, "{e}");
+        assert_eq!(e.exit_code(), 3, "{e}");
         assert!(e.to_string().contains("run the command again"), "{e}");
         assert_eq!(seen.load(Ordering::SeqCst), 1, "a write is never resent");
     }

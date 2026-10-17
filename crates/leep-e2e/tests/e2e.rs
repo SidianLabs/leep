@@ -183,7 +183,7 @@ fn run_agent(client: &Client, root: &Path, n: usize) -> Result<(), String> {
         let out = step(&["land"])?;
         match out.status.code() {
             Some(0) => return Ok(()),
-            Some(1) if stdout(&out).contains("Cannot land cleanly") => {
+            Some(5) if stdout(&out).contains("Cannot land cleanly") => {
                 let path = wc.join("shared.txt");
                 let text = fs::read_to_string(&path).map_err(|e| e.to_string())?;
                 if has_markers(&text) {
@@ -1027,7 +1027,11 @@ fn review_owners_and_auto_approval_gate_landing_on_a_protected_ref() {
         "// the entry point\nfn a() { 2 } // trailing\n",
     );
     bob.ok(&wc_b, &["commit", "-m", "more code"]);
+    // A ref that does not exist yet needs --create (ADR 0036).
     let out = bob.run(&wc_b, &["land", "--ref", "release"]);
+    assert_eq!(out.status.code(), Some(4), "{}", stderr(&out));
+    assert!(stderr(&out).contains("--create"), "{}", stderr(&out));
+    let out = bob.run(&wc_b, &["land", "--ref", "release", "--create"]);
     assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
     assert!(
         stderr(&out).contains("path src/lib.rs needs approval from any reviewer"),
@@ -1036,7 +1040,7 @@ fn review_owners_and_auto_approval_gate_landing_on_a_protected_ref() {
     );
     alice.ok(root, &["review", "approve", &bob.tip(&wc_b)]);
     assert!(bob
-        .ok(&wc_b, &["land", "--ref", "release"])
+        .ok(&wc_b, &["land", "--ref", "release", "--create"])
         .contains("Landed"));
 }
 
@@ -1368,7 +1372,7 @@ fn run_branch_and_tag_workflow(stores: &Stores, work: &Path) {
     assert!(refs(&wc).get("tags/v1").is_none());
     assert_eq!(client.ok(&wc, &["tag"]), "");
     let out = client.run(&wc, &["tag", "-d", "v1"]);
-    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(out.status.code(), Some(4));
 }
 
 #[test]
@@ -1443,16 +1447,21 @@ fn run_everyday_workflow(stores: &Stores, work: &Path) {
     write(&b, "doc.txt", "one from B\ntwo\nthree\n");
     write(&b, "extra.txt", "extra\n");
     let out = client.run(&b, &["sync"]);
-    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert_eq!(out.status.code(), Some(5), "{}", stderr(&out));
     assert!(stdout(&out).contains("C doc.txt"), "{}", stdout(&out));
     let doc = fs::read_to_string(b.join("doc.txt")).unwrap();
     assert!(doc.contains("<<<<<<<") && doc.contains("one from A") && doc.contains("one from B"));
+    // The server's diff3 markers, relabelled by role.
+    assert!(
+        doc.contains("<<<<<<< main (landed)\n") && doc.contains(">>>>>>> yours\n"),
+        "{doc}"
+    );
     assert!(client.ok(&b, &["status"]).contains("C doc.txt"));
     let out = client.run(&b, &["commit", "-m", "too soon"]);
-    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(out.status.code(), Some(5));
     assert!(stderr(&out).contains("conflict"), "{}", stderr(&out));
     let out = client.run(&b, &["land"]);
-    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(out.status.code(), Some(5));
     write(&b, "doc.txt", "one merged\ntwo\nthree\n");
     client.ok(&b, &["commit", "-m", "merged doc"]);
     client.ok(&b, &["land"]);
@@ -1480,7 +1489,7 @@ fn run_everyday_workflow(stores: &Stores, work: &Path) {
         "{shown}"
     );
     let out = client.run(&b, &["stash", "drop", "7"]);
-    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(out.status.code(), Some(4));
     // Another change lands first; the stash still applies on top of it.
     write(&a, "c.txt", "c again from A\n");
     client.ok(&a, &["commit", "-m", "A edits c again"]);
@@ -1489,7 +1498,7 @@ fn run_everyday_workflow(stores: &Stores, work: &Path) {
     // The stash deletes c.txt, which the head changed: no text merge, so the
     // pop keeps the stash and flags the path until it is resolved.
     let out = client.run(&b, &["stash", "pop"]);
-    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert_eq!(out.status.code(), Some(5), "{}", stderr(&out));
     assert!(stdout(&out).contains("no text merge"), "{}", stdout(&out));
     assert!(client.ok(&b, &["status"]).contains("C c.txt"));
     client.ok(&b, &["resolve", "c.txt"]);
@@ -1505,7 +1514,7 @@ fn run_everyday_workflow(stores: &Stores, work: &Path) {
     assert!(!b.join("c.txt").exists(), "stashed delete came back");
     assert_eq!(client.ok(&b, &["stash", "list"]), "");
     let out = client.run(&b, &["stash", "pop"]);
-    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(out.status.code(), Some(4));
 
     // Restore: one file back, the new one is left unless --force.
     client.ok(&b, &["restore", "b.txt", "c.txt"]);
@@ -1591,13 +1600,13 @@ fn run_everyday_workflow(stores: &Stores, work: &Path) {
     client.ok(&a, &["land"]);
     fs::write(b.join("img.bin"), b"from B\xff").unwrap();
     let out = client.run(&b, &["sync"]);
-    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert_eq!(out.status.code(), Some(5), "{}", stderr(&out));
     assert!(stdout(&out).contains("no text merge"), "{}", stdout(&out));
     assert_eq!(fs::read(b.join("img.bin")).unwrap(), b"from B\xff");
     let st = client.json(&b, &["status"]);
     assert_eq!(st["changes"][0]["status"], "conflicted");
     let out = client.run(&b, &["commit", "-m", "x"]);
-    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(out.status.code(), Some(5));
     assert!(stderr(&out).contains("img.bin"), "{}", stderr(&out));
     client.ok(&b, &["resolve", "img.bin"]);
     client.ok(&b, &["commit", "-m", "keep B image"]);
@@ -1902,7 +1911,7 @@ fn run_merge_rebase_revert_workflow(stores: &Stores, work: &Path) {
     commit_land(&b, "feature edits a");
     let feature_head = head("feature");
     let out = client.run(&a, &["merge", "feature"]);
-    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert_eq!(out.status.code(), Some(5), "{}", stderr(&out));
     assert!(stdout(&out).contains("C a.txt"), "{}", stdout(&out));
     let text = read(&a, "a.txt");
     assert!(text.contains("<<<<<<<") && text.contains("a main") && text.contains("a feature"));
@@ -1912,10 +1921,10 @@ fn run_merge_rebase_revert_workflow(stores: &Stores, work: &Path) {
         feature_head.as_str()
     );
     let out = client.run(&a, &["commit", "-m", "too soon"]);
-    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(out.status.code(), Some(5));
     assert!(stderr(&out).contains("conflict"), "{}", stderr(&out));
     let out = client.run(&a, &["land"]);
-    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(out.status.code(), Some(5));
     assert!(stderr(&out).contains("in progress"), "{}", stderr(&out));
     client.ok(&a, &["merge", "--abort"]);
     assert_eq!(read(&a, "a.txt"), "a main\n");
@@ -1923,7 +1932,7 @@ fn run_merge_rebase_revert_workflow(stores: &Stores, work: &Path) {
     assert!(client.json(&a, &["status"])["merging"].is_null());
 
     let out = client.run(&a, &["merge", "feature"]);
-    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(out.status.code(), Some(5));
     write(&a, "a.txt", "a resolved\n");
     client.ok(&a, &["commit"]);
     let top = &log(&a, "@")[0]["changeset"];
@@ -1958,7 +1967,7 @@ fn run_merge_rebase_revert_workflow(stores: &Stores, work: &Path) {
     write(&a, "pick.txt", "picked on main\n");
     commit_land(&a, "main edits pick");
     let out = client.run(&a, &["cherry-pick", &edit_id]);
-    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert_eq!(out.status.code(), Some(5), "{}", stderr(&out));
     assert!(read(&a, "pick.txt").contains("<<<<<<<"));
     assert!(client.ok(&a, &["status"]).contains("cherry-picking"));
     client.ok(&a, &["cherry-pick", "--abort"]);
@@ -1985,7 +1994,7 @@ fn run_merge_rebase_revert_workflow(stores: &Stores, work: &Path) {
     client.ok(&a, &["land"]);
     assert_eq!(
         client.run(&a, &["cat", "main", "r.txt"]).status.code(),
-        Some(1)
+        Some(4)
     );
     let reverts = client.json(&a, &["log", "main", "--extra", "leep.revert_of"]);
     assert_eq!(reverts["entries"].as_array().unwrap().len(), 1);
@@ -2021,7 +2030,7 @@ fn run_merge_rebase_revert_workflow(stores: &Stores, work: &Path) {
     write(&a, "hunk2.txt", &numbered(&[(5, "line 5 B")]));
     commit_land(&a, "change line 5 again");
     let out = client.run(&a, &["revert", &change5]);
-    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert_eq!(out.status.code(), Some(5), "{}", stderr(&out));
     assert!(stdout(&out).contains("C hunk2.txt"), "{}", stdout(&out));
     assert!(read(&a, "hunk2.txt").contains("<<<<<<<"));
     client.ok(&a, &["revert", "--abort"]);
@@ -2215,7 +2224,7 @@ fn request_limits_throttle_one_token_and_the_cli_reports_it() {
     stingy_user.ok(&wc, &["log"]);
     let started = std::time::Instant::now();
     let out = stingy_user.run(&wc, &["log"]);
-    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert_eq!(out.status.code(), Some(3), "{}", stderr(&out));
     let err = stderr(&out);
     assert!(
         err.contains("rate limit exceeded") && err.contains("retry after 100s"),

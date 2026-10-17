@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
+use crate::prefix::IdPrefix;
 use crate::{Changeset, ChangesetId, Error, Hash, Result};
 
 /// Unix seconds now, the server clock every ref log entry is stamped with.
@@ -162,6 +163,29 @@ pub trait MetaStore: Send + Sync + 'static {
         after: Option<ChangesetId>,
         limit: usize,
     ) -> Result<Vec<ChangesetId>>;
+
+    /// Up to `limit` changeset ids that start with `prefix`, in ascending
+    /// byte order: how a short id is resolved (ADR 0035). Asking for two
+    /// tells a unique prefix from an ambiguous one.
+    ///
+    /// The default reads one page of [`list_changesets`](Self::list_changesets)
+    /// from just below the prefix's range, which is already a range scan on
+    /// stores that order ids; database backends override it with a bounded
+    /// range query.
+    async fn changesets_with_prefix(
+        &self,
+        prefix: &IdPrefix,
+        limit: usize,
+    ) -> Result<Vec<ChangesetId>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let page = self.list_changesets(prefix.before_lower(), limit).await?;
+        Ok(page
+            .into_iter()
+            .take_while(|id| prefix.matches(id))
+            .collect())
+    }
 
     async fn get_ref(&self, name: &str) -> Result<Option<ChangesetId>>;
 

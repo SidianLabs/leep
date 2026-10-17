@@ -14,8 +14,9 @@ use leep_core::{ChangesetId, FileChange, RepoPath};
 
 use super::integrate::{abort, added_paths, load_key, print_conflicts, sign};
 use super::{print_json, Ctx};
-use crate::error::{CliError, Result};
+use crate::error::{exit, CliError, Result};
 use crate::fmt::short;
+use crate::markers::Labels;
 use crate::overlay::{self, Keep, Pending};
 use crate::snapshot;
 use crate::state::MergeState;
@@ -134,8 +135,15 @@ pub fn run(ctx: &mut Ctx, args: &MergeArgs) -> Result<i32> {
         MergeResponse::Conflicts { conflicts, clean } => {
             check_clean_reported(ctx, fork, other, base, &conflicts, &clean)?;
             let base_files = crate::materialize::list_files(ctx, &base)?;
-            let mut plan =
-                overlay::plan_conflicts(ctx, base, base_files, conflicts, clean, Keep::Ours)?;
+            let mut plan = overlay::plan_conflicts(
+                ctx,
+                base,
+                base_files,
+                conflicts,
+                clean,
+                Keep::Ours,
+                &Labels::new("yours", format!("{} (merging)", short(other))),
+            )?;
             plan.pending = Some(Pending::Merge(MergeState {
                 other,
                 message: message.clone(),
@@ -160,13 +168,13 @@ pub fn run(ctx: &mut Ctx, args: &MergeArgs) -> Result<i32> {
                      merge, or `leep merge --abort`."
                 );
             }
-            Ok(1)
+            Ok(exit::CONFLICT)
         }
     }
 }
 
 fn default_message(rev: &str, other: ChangesetId, target_ref: &str) -> String {
-    let name = if rev == "@" || rev.len() == 64 {
+    let name = if rev == "@" || leep_core::prefix::looks_like_prefix(rev) {
         short(other)
     } else {
         rev.to_string()

@@ -161,7 +161,7 @@ pub fn run(ctx: &Ctx) -> Result<i32> {
             }
             _ => "",
         };
-        println!("{line}{note}");
+        println!("{}{note}", paint_letter(&line));
     }
     if st.has_conflicts() {
         println!(
@@ -188,4 +188,15 @@ pub fn change_lines(st: &Status, renames: &[RenameEntry]) -> Vec<String> {
         }
     }
     out
+}
+
+/// `X path` with the status letter coloured; other lines (renames) as is.
+fn paint_letter(line: &str) -> String {
+    let mut chars = line.chars();
+    match (chars.next(), chars.next()) {
+        (Some(c @ ('A' | 'M' | 'D' | 'C')), Some(' ')) => {
+            format!("{}{}", crate::term::letter(c), &line[1..])
+        }
+        _ => line.to_string(),
+    }
 }

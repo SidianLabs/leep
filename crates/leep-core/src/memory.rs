@@ -7,6 +7,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use bytes::Bytes;
 
+use crate::prefix::IdPrefix;
 use crate::store::{
     check_ref_chain, unix_now, BlobMeta, DerivedRow, RefLogEntry, RefStep, RefUpdateContext,
 };
@@ -176,6 +177,21 @@ impl MetaStore for MemoryMetaStore {
             .lock()
             .unwrap()
             .range((lower, Bound::Unbounded))
+            .take(limit)
+            .map(|(id, _)| *id)
+            .collect())
+    }
+
+    async fn changesets_with_prefix(
+        &self,
+        prefix: &IdPrefix,
+        limit: usize,
+    ) -> Result<Vec<ChangesetId>> {
+        Ok(self
+            .changesets
+            .lock()
+            .unwrap()
+            .range(prefix.lower()..=prefix.upper())
             .take(limit)
             .map(|(id, _)| *id)
             .collect())
@@ -407,6 +423,7 @@ pub async fn check_meta_store_contract(store: &dyn MetaStore) {
     assert!(store.get_ref("main").await.unwrap().is_none());
 
     check_list_changesets(store).await;
+    check_prefix_lookup(store).await;
     check_ref_log(store).await;
     check_ref_chain_log(store).await;
 
@@ -991,6 +1008,87 @@ async fn check_list_changesets(store: &dyn MetaStore) {
         .is_empty());
     let first = store.list_changesets(None, 1).await.unwrap();
     assert_eq!(first, vec![all[0]]);
+}
+
+/// Short id lookup: exactly the stored ids with the prefix, ascending, at
+/// most `limit`, for even and odd lengths, at the edges of the id space, and
+/// for a prefix two ids share.
+async fn check_prefix_lookup(store: &dyn MetaStore) {
+    let make = |n: i64| Changeset {
+        parents: vec![],
+        author: "t".into(),
+        timestamp: n,
+        message: format!("prefix {n}"),
+        changes: BTreeMap::new(),
+        extra: BTreeMap::new(),
+    };
+    // Changesets whose ids share their first four hex digits, found by
+    // hashing locally (ids are deterministic), so the store holds a pair.
+    let mut seen: BTreeMap<String, Changeset> = BTreeMap::new();
+    let (a, b) = (0..)
+        .find_map(|n| {
+            let cs = make(n);
+            let key = cs.id().to_string()[..4].to_string();
+            seen.insert(key, cs.clone()).map(|other| (other, cs))
+        })
+        .unwrap();
+    let a = store.put_changeset(&a).await.unwrap();
+    let b = store.put_changeset(&b).await.unwrap();
+    let extra = store.put_changeset(&make(-1)).await.unwrap();
+
+    let all = store.list_changesets(None, 100_000).await.unwrap();
+    let expect = |p: &IdPrefix, limit: usize| -> Vec<ChangesetId> {
+        all.iter()
+            .filter(|id| p.matches(id))
+            .take(limit)
+            .copied()
+            .collect()
+    };
+    let lookup = |text: String, limit: usize| async move {
+        let p = IdPrefix::parse(&text).unwrap();
+        let got = store.changesets_with_prefix(&p, limit).await.unwrap();
+        (p, got)
+    };
+
+    let shared = a.to_string()[..4].to_string();
+    let (p, got) = lookup(shared.clone(), 10).await;
+    assert!(got.contains(&a) && got.contains(&b), "{shared} is shared");
+    assert_eq!(got, expect(&p, 10));
+    assert!(got.windows(2).all(|w| w[0] < w[1]), "ascending");
+    let (p, got) = lookup(shared.to_uppercase(), 1).await;
+    assert_eq!(got, expect(&p, 1), "limit is respected");
+    assert_eq!(got.len(), 1);
+    let (_, got) = lookup(shared, 0).await;
+    assert!(got.is_empty());
+
+    for id in [a, b, extra] {
+        let hex = id.to_string();
+        for len in [5, 12, 63, 64] {
+            let (p, got) = lookup(hex[..len].to_string(), 10).await;
+            assert!(got.contains(&id), "{} finds {id}", &hex[..len]);
+            assert_eq!(got, expect(&p, 10));
+        }
+        let (_, got) = lookup(hex[..12].to_string(), 2).await;
+        assert_eq!(got, [id], "12 digits are unique here");
+    }
+
+    for edge in [
+        "0000",
+        "00000",
+        "ffff",
+        "fffff",
+        &"f".repeat(64),
+        &"0".repeat(64),
+    ] {
+        let (p, got) = lookup(edge.to_string(), 10).await;
+        assert_eq!(got, expect(&p, 10), "{edge}");
+    }
+    // A prefix no stored id has.
+    let absent = (0u32..)
+        .map(|n| format!("{n:06x}"))
+        .find(|p| !all.iter().any(|id| id.to_string().starts_with(p.as_str())))
+        .unwrap();
+    assert!(lookup(absent, 10).await.1.is_empty());
 }
 
 /// Conformance checks every `BlobStore` implementation should pass.

@@ -168,7 +168,7 @@ impl CliAgent {
             if low.contains("429 too many") || low.contains("too many requests") {
                 self.sh.stats.inc("throttled_429");
                 tokio::time::sleep(Duration::from_millis(300)).await;
-            } else if o.code == 2
+            } else if o.code == 3
                 || low.contains("error sending request")
                 || low.contains("connection")
                 || low.contains("timed out")
@@ -177,7 +177,7 @@ impl CliAgent {
                 let now = self.sh.now_secs();
                 if self.sh.in_chaos(now) || self.sh.in_chaos(started) {
                     self.sh.stats.inc("attributed_to_restart");
-                } else if o.code == 2 {
+                } else if o.code == 3 {
                     self.sh.violate(
                         "cli_server_error",
                         format!(
@@ -395,7 +395,7 @@ impl CliAgent {
                         .push(t0.elapsed().as_micros() as u32);
                     return LandResult::Landed(Landed { id, rebased, clean });
                 }
-                (1, Some("conflicts")) => {
+                (5, Some("conflicts")) => {
                     self.sh.stats.inc("land_conflicts");
                     self.sh.ledger.forbid(keys);
                     return LandResult::Conflicts;
@@ -411,7 +411,7 @@ impl CliAgent {
                         return LandResult::Failed;
                     }
                     let low = o.stderr.to_lowercase();
-                    let transient = o.code == 2
+                    let transient = o.code == 3
                         || low.contains("408 request")
                         || low.contains("409 conflict")
                         || low.contains("kept losing")

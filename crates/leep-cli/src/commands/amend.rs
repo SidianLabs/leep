@@ -74,7 +74,7 @@ pub fn run(ctx: &mut Ctx, args: &AmendArgs) -> Result<i32> {
         &args.agent_tests,
     );
     if st.is_clean() && args.message.is_none() && extra_given.is_empty() && args.author.is_none() {
-        return Err(CliError::user(
+        return Err(CliError::nothing_to_do(
             "nothing to amend: no uncommitted changes and no new message",
         ));
     }
