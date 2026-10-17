@@ -76,6 +76,11 @@ pub struct Repo {
     pub(crate) ancestry: Arc<AncestryCache>,
     /// Decoded path-history rows (see `read_history_row`).
     pub(crate) history_rows: Arc<HistoryRowCache>,
+    /// History rows a derivation computed but has not stored yet (see
+    /// `stage_history_rows`).
+    pub(crate) history_staged: Arc<Mutex<HashMap<Hash, Arc<StoredHistoryNode>>>>,
+    /// Decoded tree nodes (see `read_tree_shared`).
+    pub(crate) trees: Arc<TreeCache>,
     /// Skiplists computed, or read while creating changesets (see
     /// `SkiplistCache`).
     pub(crate) skiplists: Arc<SkiplistCache>,
@@ -111,6 +116,9 @@ struct AncestryMaps {
 struct AncestryEntry {
     parents: Option<Arc<[ChangesetId]>>,
     generation: Option<u64>,
+    /// Root tree, read ahead for path-history derivation (see
+    /// `Repo::root_tree_prefetched`).
+    root: Option<Hash>,
 }
 
 /// Entries per map; two maps at most, so about 2 * this many changesets.
@@ -206,50 +214,72 @@ impl SkiplistMaps {
 /// same root and directory nodes for every changeset, so without this each
 /// changeset would re-read and re-decode dozens of rows. Rows are content
 /// addressed and checked against their hash before they are cached, so
-/// entries never go stale. Bounded like [`AncestryCache`], by bytes: each map
-/// holds up to half the budget.
-#[derive(Default)]
-pub(crate) struct HistoryRowCache {
-    inner: Mutex<HistoryRowMaps>,
+/// entries never go stale.
+pub(crate) type HistoryRowCache = SizedCache<StoredHistoryNode, HISTORY_CACHE_BYTES>;
+
+/// Decoded tree nodes by hash, for path-history derivation: each changeset
+/// reads the directories its parent's derivation just read (the parent's
+/// new tree is its old one), and a node read from a pack decodes a delta
+/// chain first. Checked against their hash before they are cached.
+pub(crate) type TreeCache = SizedCache<TreeNode, TREE_CACHE_BYTES>;
+
+/// Content-addressed values by hash, bounded like [`AncestryCache`] but by
+/// bytes: each map holds up to half of `BUDGET`.
+pub(crate) struct SizedCache<V, const BUDGET: usize> {
+    inner: Mutex<SizedMaps<V>>,
 }
 
-#[derive(Default)]
-struct HistoryRowMaps {
-    new: HashMap<Hash, (Arc<StoredHistoryNode>, usize)>,
+impl<V, const BUDGET: usize> Default for SizedCache<V, BUDGET> {
+    fn default() -> Self {
+        SizedCache {
+            inner: Mutex::new(SizedMaps {
+                new: HashMap::new(),
+                new_bytes: 0,
+                old: HashMap::new(),
+            }),
+        }
+    }
+}
+
+struct SizedMaps<V> {
+    new: HashMap<Hash, (Arc<V>, usize)>,
     new_bytes: usize,
-    old: HashMap<Hash, (Arc<StoredHistoryNode>, usize)>,
+    old: HashMap<Hash, (Arc<V>, usize)>,
 }
 
-/// Bytes both maps together may hold, counting each row at twice its encoded
-/// size (about its decoded size).
+/// Bytes the history row cache may hold, counting each row at twice its
+/// encoded size (about its decoded size).
 const HISTORY_CACHE_BYTES: usize = 64 << 20;
 
-impl HistoryRowCache {
-    pub(crate) fn get(&self, hash: &Hash) -> Option<Arc<StoredHistoryNode>> {
+/// Bytes the tree cache may hold, counted like [`HISTORY_CACHE_BYTES`].
+const TREE_CACHE_BYTES: usize = 32 << 20;
+
+impl<V, const BUDGET: usize> SizedCache<V, BUDGET> {
+    pub(crate) fn get(&self, hash: &Hash) -> Option<Arc<V>> {
         let mut m = self.inner.lock().unwrap();
         if let Some((n, _)) = m.new.get(hash) {
             return Some(n.clone());
         }
         let (n, size) = m.old.remove(hash)?;
-        m.insert(*hash, n.clone(), size);
+        m.insert::<BUDGET>(*hash, n.clone(), size);
         Some(n)
     }
 
-    pub(crate) fn insert(&self, hash: Hash, node: Arc<StoredHistoryNode>, encoded_len: usize) {
+    pub(crate) fn insert(&self, hash: Hash, value: Arc<V>, encoded_len: usize) {
         self.inner
             .lock()
             .unwrap()
-            .insert(hash, node, 2 * encoded_len);
+            .insert::<BUDGET>(hash, value, 2 * encoded_len);
     }
 }
 
-impl HistoryRowMaps {
-    fn insert(&mut self, hash: Hash, node: Arc<StoredHistoryNode>, size: usize) {
-        if self.new_bytes + size > HISTORY_CACHE_BYTES / 2 {
+impl<V> SizedMaps<V> {
+    fn insert<const BUDGET: usize>(&mut self, hash: Hash, value: Arc<V>, size: usize) {
+        if self.new_bytes + size > BUDGET / 2 {
             self.old = std::mem::take(&mut self.new);
             self.new_bytes = 0;
         }
-        if self.new.insert(hash, (node, size)).is_none() {
+        if self.new.insert(hash, (value, size)).is_none() {
             self.new_bytes += size;
         }
     }
@@ -264,6 +294,8 @@ impl Repo {
             land_policy: None,
             ancestry: Arc::default(),
             history_rows: Arc::default(),
+            history_staged: Arc::default(),
+            trees: Arc::default(),
             skiplists: Arc::default(),
             derive_locks: Arc::default(),
             #[cfg(test)]
@@ -576,6 +608,66 @@ impl Repo {
         derived::decode_hash(&v)
     }
 
+    /// [`Repo::root_tree`], answered from what [`Repo::prefetch_root_trees`]
+    /// read when it can. Only path-history derivation uses it: verification
+    /// substitutes recomputed root trees as it goes, and a value read before
+    /// that must not answer later reads.
+    pub(crate) async fn root_tree_prefetched(&self, id: ChangesetId) -> Result<Hash> {
+        match self.ancestry.get(&id).root {
+            Some(r) => Ok(r),
+            None => self.root_tree(id).await,
+        }
+    }
+
+    /// Read the stored generations of `ids` this process has not seen, in
+    /// one round trip. Misses and failures are left to [`Repo::generation`].
+    pub(crate) async fn prefetch_generations(&self, ids: &[ChangesetId]) {
+        let keys: Vec<Hash> = ids
+            .iter()
+            .filter(|id| self.cached_generation(**id).is_none())
+            .map(|id| id.0)
+            .collect();
+        if keys.is_empty() {
+            return;
+        }
+        let Ok(values) = self.meta.get_derived_many(Generation::NAME, &keys).await else {
+            return;
+        };
+        if values.len() != keys.len() {
+            return;
+        }
+        for (key, v) in keys.iter().zip(values) {
+            if let Some(g) = v.and_then(|v| derived::decode_u64(&v).ok()) {
+                self.remember_generation(ChangesetId(*key), g);
+            }
+        }
+    }
+
+    /// Read the stored root trees of `ids` in one round trip, for
+    /// [`Repo::root_tree_prefetched`]. Misses and failures are left to it.
+    pub(crate) async fn prefetch_root_trees(&self, ids: &[ChangesetId]) {
+        let keys: Vec<Hash> = ids
+            .iter()
+            .filter(|id| self.ancestry.get(id).root.is_none())
+            .map(|id| id.0)
+            .collect();
+        if keys.is_empty() {
+            return;
+        }
+        let Ok(values) = self.meta.get_derived_many(RootTree::NAME, &keys).await else {
+            return;
+        };
+        if values.len() != keys.len() {
+            return;
+        }
+        for (key, v) in keys.iter().zip(values) {
+            if let Some(r) = v.and_then(|v| derived::decode_hash(&v).ok()) {
+                self.ancestry
+                    .update(ChangesetId(*key), |e| e.root = Some(r));
+            }
+        }
+    }
+
     /// Length of the longest parent chain to a root; roots are 1.
     pub async fn generation(&self, id: ChangesetId) -> Result<u64> {
         if let Some(g) = self.ancestry.get(&id).generation {
@@ -640,6 +732,19 @@ impl Repo {
             None if tree == TreeNode::empty_hash() => Ok(TreeNode::default()),
             None => Err(Error::NotFound(format!("tree {tree}"))),
         }
+    }
+
+    /// [`Repo::read_tree`], shared and kept in a bounded cache, for walks
+    /// that read the same directories again and again.
+    pub(crate) async fn read_tree_shared(&self, tree: Hash) -> Result<Arc<TreeNode>> {
+        if let Some(t) = self.trees.get(&tree) {
+            return Ok(t);
+        }
+        let node = Arc::new(self.read_tree(tree).await?);
+        // About the encoded size: a name and a 32-byte hash per entry.
+        let len = node.entries.keys().map(|n| n.len() + 40).sum();
+        self.trees.insert(tree, node.clone(), len);
+        Ok(node)
     }
 
     /// Resolve a ref name or full 64-hex changeset id. As a last resort a

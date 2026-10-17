@@ -11,14 +11,16 @@
 //! `root_tree`.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use leep_core::{Changeset, ChangesetId, Hash, Result, TreeEntry, TreeNode};
+use leep_core::{Changeset, ChangesetId, DerivedRow, Hash, Result, TreeEntry, TreeNode};
 use serde::{Deserialize, Serialize};
 
 use super::{decode_hash, DerivedKind};
+use crate::ancestry::Ancestors;
+use crate::path_history::{NodeLookup, PendingRows};
 use crate::tree_ops::join;
 use crate::Repo;
 
@@ -109,19 +111,19 @@ impl HistoryNode {
     /// changes the chunk holding the entry and every other chunk is shared
     /// with the previous version.
     pub fn chunks(&self) -> Option<Vec<HistoryNode>> {
-        if self.entries.len() <= FLAT_MAX {
-            return None;
-        }
-        let mut chunks = Vec::new();
-        let mut chunk = HistoryNode::default();
-        let last = self.entries.len() - 1;
-        for (i, (name, entry)) in self.entries.iter().enumerate() {
-            chunk.entries.insert(name.clone(), entry.clone());
-            if i == last || chunk.entries.len() == CHUNK_MAX || ends_chunk(name) {
-                chunks.push(std::mem::take(&mut chunk));
-            }
-        }
-        Some(chunks)
+        let entries: Vec<_> = self.entries.iter().collect();
+        let ranges = chunk_ranges(entries.iter().map(|(n, _)| n.as_str()))?;
+        Some(
+            ranges
+                .into_iter()
+                .map(|r| HistoryNode {
+                    entries: entries[r]
+                        .iter()
+                        .map(|(n, e)| ((*n).clone(), (*e).clone()))
+                        .collect(),
+                })
+                .collect(),
+        )
     }
 
     /// The rows that store this node with no predecessor, all keyframes: its
@@ -149,6 +151,27 @@ impl HistoryNode {
     pub fn first_name(&self) -> &str {
         self.entries.keys().next().map_or("", |n| n.as_str())
     }
+}
+
+/// Where [`HistoryNode::chunks`] cuts a node whose entries have these names,
+/// in order, as index ranges; `None` if it is stored whole. Lets a writer
+/// compare and copy only the chunks that changed.
+pub fn chunk_ranges<'a>(
+    names: impl ExactSizeIterator<Item = &'a str>,
+) -> Option<Vec<std::ops::Range<usize>>> {
+    let len = names.len();
+    if len <= FLAT_MAX {
+        return None;
+    }
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    for (i, name) in names.enumerate() {
+        if i == len - 1 || i + 1 - start == CHUNK_MAX || ends_chunk(name) {
+            ranges.push(start..i + 1);
+            start = i + 1;
+        }
+    }
+    Some(ranges)
 }
 
 /// Whether a chunk ends after `name`: about one name in 32.
@@ -392,6 +415,62 @@ impl DerivedKind for HistoryTree {
         cs: &Changeset,
         parents: &[Bytes],
     ) -> Result<Bytes> {
+        let mut pending = PendingRows::default();
+        let v = Self::derive_into(repo, id, cs, parents, &mut pending).await?;
+        repo.write_history_rows(pending).await?;
+        Ok(v)
+    }
+
+    const STAGED: bool = true;
+
+    async fn derive_staged(
+        repo: &Repo,
+        id: ChangesetId,
+        cs: &Changeset,
+        parents: &[Bytes],
+        rows: &mut Vec<DerivedRow>,
+    ) -> Result<Bytes> {
+        let mut pending = PendingRows::default();
+        let v = Self::derive_into(repo, id, cs, parents, &mut pending).await?;
+        repo.stage_history_rows(pending, rows);
+        Ok(v)
+    }
+
+    fn unstage(repo: &Repo, rows: &[DerivedRow]) {
+        repo.unstage_history_rows(rows);
+    }
+
+    /// Root trees of the window and of its first parents, which each
+    /// derivation compares, and the parents and generations merges walk
+    /// (`merge_base`, ancestry checks), which would otherwise be read a
+    /// batch per walk.
+    async fn prepare(repo: &Repo, window: &[(ChangesetId, &Changeset)]) {
+        let mut ids: Vec<ChangesetId> = window.iter().map(|(id, _)| *id).collect();
+        for (id, cs) in window {
+            repo.remember_parents(*id, cs.parents.as_slice().into());
+            ids.extend(&cs.parents);
+        }
+        ids.sort();
+        ids.dedup();
+        repo.prefetch_generations(&ids).await;
+        ids.retain(|id| {
+            window
+                .iter()
+                .any(|(w, cs)| w == id || cs.parents.first() == Some(id))
+        });
+        repo.prefetch_root_trees(&ids).await;
+    }
+}
+
+impl HistoryTree {
+    /// The history root of `id`, adding the rows it stores to `pending`.
+    async fn derive_into(
+        repo: &Repo,
+        id: ChangesetId,
+        cs: &Changeset,
+        parents: &[Bytes],
+        pending: &mut PendingRows,
+    ) -> Result<Bytes> {
         let heads = parents
             .iter()
             .map(|p| decode_hash(p))
@@ -401,13 +480,35 @@ impl DerivedKind for HistoryTree {
             .copied()
             .unwrap_or_else(HistoryNode::empty_hash);
 
+        // At a two-parent merge, the history at the merge base settles most
+        // paths without ancestry checks; see `inherit`. Any common ancestor
+        // would be correct, but only the best one is recent enough to match
+        // the parents' entries for paths one side never touched.
+        let common = match cs.parents.as_slice() {
+            [a, b] => match repo.merge_base(*a, *b).await? {
+                Some(c) => Some(decode_hash(&super::derive::<HistoryTree>(repo, c).await?)?),
+                None => None,
+            },
+            _ => None,
+        };
+
         // Paths whose entry may differ from the first parent's: what this
         // changeset changed, plus, at a merge, wherever another parent's
-        // history differs from the first parent's.
+        // history differs. With a merge base, only paths the second parent
+        // changed since it can: where its entry equals the base's, `inherit`
+        // gives the first parent's set, and an equal directory entry means an
+        // equal subtree. On Linux, mainline moves thousands of paths while a
+        // branch is out, and comparing against the first parent visited them
+        // all at every merge.
         let mut touched: BTreeSet<String> =
             cs.changes.keys().map(|p| p.as_str().to_string()).collect();
-        for &other in heads.iter().skip(1) {
-            diff_history(repo, base, other, &mut touched).await?;
+        match common {
+            Some(c) => diff_history(repo, c, heads[1], &mut touched).await?,
+            None => {
+                for &other in heads.iter().skip(1) {
+                    diff_history(repo, base, other, &mut touched).await?;
+                }
+            }
         }
         if touched.is_empty() {
             return Ok(Bytes::copy_from_slice(base.as_bytes()));
@@ -421,28 +522,20 @@ impl DerivedKind for HistoryTree {
         }
 
         let old_tree = match cs.parents.first() {
-            Some(p) => repo.root_tree(*p).await?,
+            Some(p) => repo.root_tree_prefetched(*p).await?,
             None => TreeNode::empty_hash(),
         };
         let mut old = Cursor::<TreeNode>::new(repo, old_tree);
-        let mut new = Cursor::<TreeNode>::new(repo, repo.root_tree(id).await?);
-        let mut hist: Vec<Cursor<HistoryNode>> =
-            heads.iter().map(|h| Cursor::new(repo, *h)).collect();
-        // At a two-parent merge, the history at the merge base settles most
-        // paths without ancestry checks; see `inherit`. Any common ancestor
-        // would be correct, but only the best one is recent enough to match
-        // the parents' entries for paths one side never touched.
-        let mut common = match cs.parents.as_slice() {
-            [a, b] => match repo.merge_base(*a, *b).await? {
-                Some(c) => Some(Cursor::<HistoryNode>::new(
-                    repo,
-                    decode_hash(&super::derive::<HistoryTree>(repo, c).await?)?,
-                )),
-                None => None,
-            },
-            _ => None,
-        };
-
+        let mut new = Cursor::<TreeNode>::new(repo, repo.root_tree_prefetched(id).await?);
+        // The first parent's directories are rebuilt, so read whole; the other
+        // parents' are only looked up in.
+        let mut first_hist = heads.first().map(|h| Cursor::<HistoryNode>::new(repo, *h));
+        let mut other_hist: Vec<HistCursor> = heads
+            .iter()
+            .skip(1)
+            .map(|h| HistCursor::new(repo, *h))
+            .collect();
+        let mut merge = MergeAncestry::new(repo, &cs.parents, common);
         let mut kids: HashMap<&str, Vec<&str>> = HashMap::new();
         for p in &paths {
             kids.entry(p.rsplit_once('/').map_or("", |(d, _)| d))
@@ -459,32 +552,42 @@ impl DerivedKind for HistoryTree {
             } else {
                 // Not changed here, so everything that last changed it lies
                 // behind some parent.
-                let mut sets = Vec::with_capacity(hist.len());
-                for h in &mut hist {
+                let mut sets = Vec::with_capacity(heads.len());
+                if let Some(h) = &mut first_hist {
                     sets.push(changed_of(h.entry(p).await?));
                 }
-                match &mut common {
-                    Some(c) => {
-                        let at_common = changed_of(c.entry(p).await?);
-                        match inherit(&sets[0], &sets[1], &at_common) {
-                            Some(set) => {
-                                #[cfg(test)]
-                                assert_eq!(set, maximal(repo, sets.concat()).await?, "{p}");
-                                set
-                            }
-                            None => maximal(repo, sets.concat()).await?,
-                        }
-                    }
-                    None => maximal(repo, sets.concat()).await?,
+                for h in &mut other_hist {
+                    sets.push(changed_of(h.entry(p).await?));
                 }
+                let at_common = match sets.len() {
+                    2 => match merge.base(repo, 0, 1).await? {
+                        Some(c) => Some(changed_of(c.entry(p).await?)),
+                        None => None,
+                    },
+                    _ => None,
+                };
+                let inherited = at_common.and_then(|c| inherit(&sets[0], &sets[1], &c));
+                let set = match inherited {
+                    Some(set) => set,
+                    None => merge.maximal(repo, p, &sets).await?,
+                };
+                #[cfg(test)]
+                assert_eq!(set, maximal(repo, sets.concat()).await?, "{p}");
+                set
             };
-            let first = match hist.first_mut() {
+            let first = match first_hist.as_mut() {
                 Some(h) => h.entry(p).await?.and_then(|e| e.node()),
                 None => None,
             };
             let node = match kids.get(p.as_str()) {
                 None => first,
-                Some(names) => Some(rebuild(repo, first, names, &mut built).await?),
+                Some(names) => {
+                    let loaded = match first_hist.as_mut() {
+                        Some(h) => h.take(p),
+                        None => None,
+                    };
+                    Some(rebuild(repo, first, loaded, names, &mut built, pending).await?)
+                }
             };
             built.insert(
                 p.as_str(),
@@ -494,29 +597,37 @@ impl DerivedKind for HistoryTree {
                 },
             );
         }
-        let root = rebuild(repo, Some(base), &kids[""], &mut built).await?;
+        let loaded = match first_hist.as_mut() {
+            Some(h) => h.take(""),
+            None => None,
+        };
+        let root = rebuild(repo, Some(base), loaded, &kids[""], &mut built, pending).await?;
         Ok(Bytes::copy_from_slice(root.as_bytes()))
     }
 }
 
 /// Store `first` (or an empty node) with the entries of `names` replaced by
-/// their rebuilt versions, and return its hash.
+/// their rebuilt versions, and return its hash. `loaded` is `first` if the
+/// first parent's cursor already read it, saving a second read and join.
 async fn rebuild<'a>(
     repo: &Repo,
     first: Option<Hash>,
+    loaded: Option<HistoryNode>,
     names: &[&'a str],
     built: &mut HashMap<&'a str, HistoryEntry>,
+    pending: &mut PendingRows,
 ) -> Result<Hash> {
-    let mut node = match first {
-        Some(h) => repo.read_history_node(h).await?,
-        None => HistoryNode::default(),
+    let mut node = match (loaded, first) {
+        (Some(n), _) => n,
+        (None, Some(h)) => repo.read_history_node(h).await?,
+        (None, None) => HistoryNode::default(),
     };
     for path in names {
         let entry = built.remove(path).expect("children are built first");
         let name = path.rsplit('/').next().expect("non-empty");
         node.entries.insert(name.to_string(), entry);
     }
-    repo.put_history_node(&node, first).await
+    repo.stage_history_node(&node, first, pending).await
 }
 
 fn changed_of(e: Option<HistoryEntry>) -> Vec<ChangesetId> {
@@ -546,7 +657,131 @@ fn inherit(
     }
 }
 
-/// Drop ids that are ancestors of other ids in the set. Sorted by id.
+/// `maximal` of the parents' sets at a path, when [`inherit`] does not
+/// settle it. Most ancestry questions are answered from the history at the
+/// parents' merge bases; the rest share one walk per parent instead of
+/// walking history once per pair of ids and path, which made a Linux merge
+/// take seconds and its twelve-parent merge minutes.
+struct MergeAncestry<'a> {
+    parents: Vec<ChangesetId>,
+    /// Ancestors of each parent, walked as deep as questions needed.
+    walks: Vec<Option<Ancestors>>,
+    /// History at the merge base of each pair of parents, `None` inside for
+    /// unrelated ones.
+    bases: HashMap<(usize, usize), Option<HistCursor<'a>>>,
+}
+
+impl<'a> MergeAncestry<'a> {
+    /// `first_two`: at a two-parent merge, the history root at the parents'
+    /// merge base, already found (`None` for unrelated parents).
+    fn new(repo: &'a Repo, parents: &[ChangesetId], first_two: Option<Hash>) -> Self {
+        let mut bases = HashMap::new();
+        if parents.len() == 2 {
+            bases.insert((0, 1), first_two.map(|r| HistCursor::new(repo, r)));
+        }
+        MergeAncestry {
+            parents: parents.to_vec(),
+            walks: parents.iter().map(|_| None).collect(),
+            bases,
+        }
+    }
+
+    /// An id of a parent's set is dropped if it lies strictly behind an id of
+    /// another parent's set; `sets[j]` holds the maximal changes behind
+    /// parent `j`, so that is when it lies behind parent `j` and is not in
+    /// `sets[j]`. For `x` in `sets[i]` and the merge base `m` of parents `i`
+    /// and `j`, whose set covers every change behind it and is covered by
+    /// `sets[i]`:
+    ///
+    /// - `x` in `m`'s set lies behind `m`, so behind parent `j`: dropped.
+    /// - Otherwise `x` is not behind `m`, and can only be behind parent `j`
+    ///   as a common ancestor other than the merge base (criss-cross
+    ///   merges): checked against a walk of parent `j`'s ancestors, then
+    ///   exactly.
+    async fn maximal(
+        &mut self,
+        repo: &'a Repo,
+        path: &str,
+        sets: &[Vec<ChangesetId>],
+    ) -> Result<Vec<ChangesetId>> {
+        let mut all: Vec<ChangesetId> = sets.concat();
+        all.sort();
+        all.dedup();
+        let mut keep = Vec::with_capacity(all.len());
+        'next: for x in all {
+            let i = sets
+                .iter()
+                .position(|s| s.contains(&x))
+                .expect("x comes from a set");
+            for (j, set) in sets.iter().enumerate() {
+                if !set.is_empty()
+                    && !set.contains(&x)
+                    && self.behind(repo, path, x, i, j, set).await?
+                {
+                    continue 'next;
+                }
+            }
+            keep.push(x);
+        }
+        Ok(keep)
+    }
+
+    /// Whether `x`, in parent `i`'s set and not in `set`, parent `j`'s, lies
+    /// behind an id of `set`.
+    async fn behind(
+        &mut self,
+        repo: &'a Repo,
+        path: &str,
+        x: ChangesetId,
+        i: usize,
+        j: usize,
+        set: &[ChangesetId],
+    ) -> Result<bool> {
+        if let Some(base) = self.base(repo, i.min(j), i.max(j)).await? {
+            if changed_of(base.entry(path).await?).contains(&x) {
+                return Ok(true);
+            }
+        }
+        let walk = match &mut self.walks[j] {
+            Some(w) => w,
+            slot => {
+                let tip = self.parents[j];
+                slot.insert(Ancestors::new(tip, repo.generation(tip).await?))
+            }
+        };
+        if !walk.contains(repo, x, repo.generation(x).await?).await? {
+            return Ok(false);
+        }
+        for &y in set {
+            if repo.is_ancestor(x, y).await? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// The history at the merge base of parents `a` and `b`.
+    async fn base(
+        &mut self,
+        repo: &'a Repo,
+        a: usize,
+        b: usize,
+    ) -> Result<Option<&mut HistCursor<'a>>> {
+        if !self.bases.contains_key(&(a, b)) {
+            let root = match repo.merge_base(self.parents[a], self.parents[b]).await? {
+                Some(m) => Some(decode_hash(&super::derive::<HistoryTree>(repo, m).await?)?),
+                None => None,
+            };
+            self.bases
+                .insert((a, b), root.map(|r| HistCursor::new(repo, r)));
+        }
+        Ok(self.bases.get_mut(&(a, b)).and_then(|c| c.as_mut()))
+    }
+}
+
+/// Drop ids that are ancestors of other ids in the set. Sorted by id. The
+/// reference `MergeAncestry` is checked against in tests.
+#[cfg(test)]
 async fn maximal(repo: &Repo, mut ids: Vec<ChangesetId>) -> Result<Vec<ChangesetId>> {
     ids.sort();
     ids.dedup();
@@ -573,17 +808,8 @@ async fn diff_history(repo: &Repo, a: Hash, b: Hash, out: &mut BTreeSet<String>)
         if a == b {
             continue;
         }
-        let (na, nb) = (
-            repo.read_history_node(a).await?,
-            repo.read_history_node(b).await?,
-        );
-        let names: BTreeSet<&String> = na.entries.keys().chain(nb.entries.keys()).collect();
-        for name in names {
-            let (ea, eb) = (na.entries.get(name), nb.entries.get(name));
-            if ea == eb {
-                continue;
-            }
-            let path = join(&dir, name);
+        for (name, ea, eb) in repo.diff_history_nodes(a, b).await? {
+            let path = join(&dir, &name);
             out.insert(path.clone());
             let (ca, cb) = (ea.and_then(|e| e.node()), eb.and_then(|e| e.node()));
             if ca != cb {
@@ -597,10 +823,10 @@ async fn diff_history(repo: &Repo, a: Hash, b: Hash, out: &mut BTreeSet<String>)
 
 /// A directory-shaped node that [`Cursor`] can walk.
 #[async_trait]
-trait Layer: Sized + Send + Sync {
+trait Layer: Sized + Clone + Send + Sync {
     type Entry: Clone + Send + Sync;
 
-    async fn load(repo: &Repo, node: Hash) -> Result<Self>;
+    async fn load(repo: &Repo, node: Hash) -> Result<Arc<Self>>;
     fn get(&self, name: &str) -> Option<&Self::Entry>;
     fn child(entry: &Self::Entry) -> Option<Hash>;
 }
@@ -609,8 +835,8 @@ trait Layer: Sized + Send + Sync {
 impl Layer for TreeNode {
     type Entry = TreeEntry;
 
-    async fn load(repo: &Repo, node: Hash) -> Result<Self> {
-        repo.read_tree(node).await
+    async fn load(repo: &Repo, node: Hash) -> Result<Arc<Self>> {
+        repo.read_tree_shared(node).await
     }
 
     fn get(&self, name: &str) -> Option<&TreeEntry> {
@@ -629,8 +855,8 @@ impl Layer for TreeNode {
 impl Layer for HistoryNode {
     type Entry = HistoryEntry;
 
-    async fn load(repo: &Repo, node: Hash) -> Result<Self> {
-        repo.read_history_node(node).await
+    async fn load(repo: &Repo, node: Hash) -> Result<Arc<Self>> {
+        Ok(Arc::new(repo.read_history_node(node).await?))
     }
 
     fn get(&self, name: &str) -> Option<&HistoryEntry> {
@@ -647,7 +873,7 @@ impl Layer for HistoryNode {
 struct Cursor<'a, N: Layer> {
     repo: &'a Repo,
     root: Hash,
-    dirs: HashMap<String, Option<N>>,
+    dirs: HashMap<String, Option<Arc<N>>>,
 }
 
 impl<'a, N: Layer> Cursor<'a, N> {
@@ -657,6 +883,13 @@ impl<'a, N: Layer> Cursor<'a, N> {
             root,
             dirs: HashMap::new(),
         }
+    }
+
+    /// The loaded node of directory `dir`, removed from the cursor: a later
+    /// lookup below it reads it again.
+    fn take(&mut self, dir: &str) -> Option<N> {
+        let node = self.dirs.remove(dir).flatten()?;
+        Some(Arc::try_unwrap(node).unwrap_or_else(|n| (*n).clone()))
     }
 
     /// Entry at the non-empty `path`.
@@ -684,6 +917,67 @@ impl<'a, N: Layer> Cursor<'a, N> {
                     .and_then(N::child);
                 let node = match child {
                     Some(h) => Some(N::load(self.repo, h).await?),
+                    None => None,
+                };
+                self.dirs.insert(next.clone(), node);
+            }
+            cur = next;
+        }
+        Ok(())
+    }
+}
+
+/// Path lookups in one history tree, like [`Cursor`], that read only the
+/// chunk holding each name instead of joining every chunk of a directory:
+/// at a merge, the other parents' and the merge bases' trees are only
+/// looked up in, never rebuilt.
+struct HistCursor<'a> {
+    repo: &'a Repo,
+    root: Hash,
+    dirs: HashMap<String, Option<NodeLookup>>,
+}
+
+impl<'a> HistCursor<'a> {
+    fn new(repo: &'a Repo, root: Hash) -> Self {
+        HistCursor {
+            repo,
+            root,
+            dirs: HashMap::new(),
+        }
+    }
+
+    /// Entry at the non-empty `path`.
+    async fn entry(&mut self, path: &str) -> Result<Option<HistoryEntry>> {
+        let (dir, name) = path.rsplit_once('/').unwrap_or(("", path));
+        self.load(dir).await?;
+        match &self.dirs[dir] {
+            Some(l) => self.repo.lookup_child(l, name).await,
+            None => Ok(None),
+        }
+    }
+
+    async fn load(&mut self, dir: &str) -> Result<()> {
+        if self.dirs.contains_key(dir) {
+            return Ok(());
+        }
+        if !self.dirs.contains_key("") {
+            let root = self.repo.node_lookup(self.root).await?;
+            self.dirs.insert(String::new(), Some(root));
+        }
+        let mut cur = String::new();
+        for comp in dir.split('/').filter(|c| !c.is_empty()) {
+            let next = join(&cur, comp);
+            if !self.dirs.contains_key(&next) {
+                let child = match &self.dirs[&cur] {
+                    Some(l) => self
+                        .repo
+                        .lookup_child(l, comp)
+                        .await?
+                        .and_then(|e| e.node()),
+                    None => None,
+                };
+                let node = match child {
+                    Some(h) => Some(self.repo.node_lookup(h).await?),
                     None => None,
                 };
                 self.dirs.insert(next.clone(), node);
@@ -1133,6 +1427,58 @@ mod tests {
         let cold = Repo::new(Arc::new(MemoryBlobStore::new()), meta.clone());
         for (h, node) in &versions {
             assert_eq!(&cold.read_history_node(*h).await.unwrap(), node);
+        }
+    }
+
+    /// Diffs that skip shared chunks, and lookups through a prepared node,
+    /// agree with whole nodes read cold, across patched, split and whole
+    /// versions.
+    #[tokio::test]
+    async fn chunked_diffs_and_lookups_match_whole_nodes() {
+        use leep_core::memory::{MemoryBlobStore, MemoryMetaStore};
+        use std::sync::Arc;
+        let meta = Arc::new(MemoryMetaStore::new());
+        let repo = Repo::new(Arc::new(MemoryBlobStore::new()), meta.clone());
+        let mut node = wide(40);
+        let mut h = repo.put_history_node(&node, None).await.unwrap();
+        let mut versions = vec![h];
+        for step in 0..120u32 {
+            let name = match step % 4 {
+                0 => format!("f{:04}", (step * 37) % 300),
+                1 | 2 => format!("g{step:04}"),
+                _ => "f0010".to_string(),
+            };
+            node.entries.insert(name, leaf((step % 250) as u8));
+            h = repo.put_history_node(&node, Some(h)).await.unwrap();
+            versions.push(h);
+        }
+        let cold = Repo::new(Arc::new(MemoryBlobStore::new()), meta.clone());
+        for (i, &a) in versions.iter().enumerate().step_by(7) {
+            let whole_a = cold.read_history_node(a).await.unwrap();
+            let lookup = cold.node_lookup(a).await.unwrap();
+            for name in ["f0000", "f0010", "f0039", "g0001", "g0118", "a", "zz"] {
+                assert_eq!(
+                    cold.lookup_child(&lookup, name).await.unwrap().as_ref(),
+                    whole_a.entries.get(name),
+                    "{name} in version {i}"
+                );
+            }
+            for &b in versions.iter().skip(i).step_by(11) {
+                let whole_b = cold.read_history_node(b).await.unwrap();
+                let mut want = Vec::new();
+                let names: BTreeSet<&String> = whole_a
+                    .entries
+                    .keys()
+                    .chain(whole_b.entries.keys())
+                    .collect();
+                for n in names {
+                    let (ea, eb) = (whole_a.entries.get(n), whole_b.entries.get(n));
+                    if ea != eb {
+                        want.push((n.clone(), ea.cloned(), eb.cloned()));
+                    }
+                }
+                assert_eq!(cold.diff_history_nodes(a, b).await.unwrap(), want);
+            }
         }
     }
 

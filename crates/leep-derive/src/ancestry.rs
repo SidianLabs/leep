@@ -236,6 +236,58 @@ impl Repo {
     }
 }
 
+/// The ancestors of one changeset down to a generation that only moves
+/// down, so many ancestry questions against the same descendant share one
+/// walk instead of making one each (`is_ancestor` walks from the descendant
+/// to the other side's generation every time it is asked).
+pub(crate) struct Ancestors {
+    reader: Reader,
+    /// Every changeset reached, all ancestors (inclusive).
+    seen: HashSet<ChangesetId>,
+    /// Reached but not yet expanded, newest first.
+    heap: BinaryHeap<(u64, ChangesetId)>,
+}
+
+impl Ancestors {
+    pub(crate) fn new(tip: ChangesetId, generation: u64) -> Self {
+        Ancestors {
+            reader: Reader::default(),
+            seen: HashSet::from([tip]),
+            heap: BinaryHeap::from([(generation, tip)]),
+        }
+    }
+
+    /// Whether `id`, of generation `generation`, is an ancestor of the tip.
+    /// Every ancestor at or above that generation is reached through
+    /// changesets above it, so expanding down to it settles the answer.
+    pub(crate) async fn contains(
+        &mut self,
+        repo: &Repo,
+        id: ChangesetId,
+        generation: u64,
+    ) -> Result<bool> {
+        while let Some(&(g, top)) = self.heap.peek() {
+            if self.seen.contains(&id) || g <= generation {
+                break;
+            }
+            self.heap.pop();
+            let parents = self.reader.parents(repo, top, g).await?;
+            let new: Vec<ChangesetId> = parents
+                .iter()
+                .copied()
+                .filter(|p| !self.seen.contains(p))
+                .collect();
+            let gens = self.reader.generations(repo, &new, g).await?;
+            for (p, gp) in new.into_iter().zip(gens) {
+                if self.seen.insert(p) {
+                    self.heap.push((gp, p));
+                }
+            }
+        }
+        Ok(self.seen.contains(&id))
+    }
+}
+
 /// Parents and generations for a newest-first walk: from `Repo`'s ancestry
 /// cache if seen before, else read ahead in batches (see [`ReadAhead`]) and
 /// kept in that cache. What a batch misses is read singly, as before.
