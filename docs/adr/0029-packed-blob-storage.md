@@ -137,6 +137,8 @@ silent, or where implementing it changed it:
 - **The index binds the pack**: its header holds the pack's length and
   BLAKE3, and the pack id is the BLAKE3 of the whole index, so one id means
   the same pack bytes everywhere (item 6).
+  ADR 0038 replaced the 96-byte index records with a compact layout
+  (`LEEPIDX2`, about 45 bytes per object). Indexes in this layout still read.
 - **Reads check every decoded object** against its address (a file blob or a
   `tree-v1` node), so damage is a storage error, never wrong bytes. Decoded
   objects go through a 64 MiB cache inside the store as well as

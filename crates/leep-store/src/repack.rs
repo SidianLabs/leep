@@ -493,14 +493,14 @@ impl FsBlobStore {
         let mut sources: HashMap<Hash, Source> = HashMap::new();
         report.packs_before = view.packs.len() as u64;
         for (p, dead) in &view.packs {
-            report.pack_bytes_before += p.index.pack_len;
-            for e in &p.index.entries {
+            report.pack_bytes_before += p.index.pack_len();
+            for e in p.index.iter() {
                 if dead.contains(&e.hash) {
                     continue;
                 }
                 let s = sources.entry(e.hash).or_default();
                 if s.packed.is_none() {
-                    s.packed = Some((p.clone(), *e));
+                    s.packed = Some((p.clone(), e));
                     report.packed_before += 1;
                 }
             }
@@ -548,8 +548,10 @@ impl FsBlobStore {
             Ok(at)
         };
         emit(&PACK_MAGIC, &mut out)?;
+        // In pack order; a base is a position in this list.
         let mut entries: Vec<IdxEntry> = Vec::with_capacity(order.len());
-        let mut depth: HashMap<Hash, usize> = HashMap::with_capacity(order.len());
+        // Position in `entries` and chain depth of each object written.
+        let mut written: HashMap<Hash, (u32, usize)> = HashMap::with_capacity(order.len());
         let mut bases = Lru::default();
         let mut from_loose = Vec::new();
         for (hash, base) in order {
@@ -573,7 +575,7 @@ impl FsBlobStore {
             let mut used = None;
             let mut d = 0;
             if let Some(b) = base.filter(|b| *b != hash) {
-                if let Some(&bd) = depth.get(&b).filter(|&&bd| bd < opts.max_chain) {
+                if let Some(&(bp, bd)) = written.get(&b).filter(|(_, bd)| *bd < opts.max_chain) {
                     let base_bytes = match bases.get(&b) {
                         Some(x) => Some(x),
                         None => match read_source(self, &sources[&b], &b)? {
@@ -585,7 +587,7 @@ impl FsBlobStore {
                         if let Some(delta) = pack::compress_delta(&bb, &data, opts.level)? {
                             if delta.len() < frame.len() {
                                 frame = delta;
-                                used = Some(b);
+                                used = Some(bp);
                                 d = bd + 1;
                             }
                         }
@@ -607,7 +609,7 @@ impl FsBlobStore {
                 report.whole += 1;
             }
             report.logical_bytes += data.len() as u64;
-            depth.insert(hash, d);
+            written.insert(hash, (entries.len() as u32 - 1, d));
             bases.insert(hash, data, BASE_CACHE);
             if let Some(m) = loose_mtime {
                 from_loose.push((hash, m));
@@ -632,13 +634,7 @@ impl FsBlobStore {
                 _lock: lock,
             });
         }
-        entries.sort_by_key(|e| e.hash);
-        let index = PackIndex {
-            pack_len: offset,
-            pack_hash: *hasher.finalize().as_bytes(),
-            entries,
-        };
-        let idx_bytes = index.encode();
+        let idx_bytes = PackIndex::encode(offset, *hasher.finalize().as_bytes(), &entries)?;
         let id = pack::pack_id(&idx_bytes);
         std::fs::rename(&tmp_pack, dir.join(format!("{id}.pack"))).map_err(storage_err)?;
         sync_dir(&dir)?;
@@ -655,7 +651,7 @@ impl FsBlobStore {
 
         // GC may have deleted objects after this run read them. Hide them in
         // the new pack too; a delete that starts from now on sees the pack.
-        let late = self.late_deletes(&index, &sources)?;
+        let late = self.late_deletes(entries.iter().map(|e| e.hash), &sources)?;
         if !late.is_empty() {
             let lines: String = late.iter().map(|h| tombstone_line(&id, h)).collect();
             self.packs.append_tombstones(&lines)?;
@@ -676,7 +672,7 @@ impl FsBlobStore {
     /// a loose file that is gone, or a packed copy tombstoned since.
     fn late_deletes(
         &self,
-        index: &PackIndex,
+        packed: impl Iterator<Item = Hash>,
         sources: &HashMap<Hash, Source>,
     ) -> Result<Vec<Hash>> {
         let tombstones = match std::fs::read(self.packs.dir().join(TOMBSTONES)) {
@@ -685,15 +681,15 @@ impl FsBlobStore {
             Err(e) => return Err(storage_err(e)),
         };
         let mut late = Vec::new();
-        for e in &index.entries {
-            let src = &sources[&e.hash];
+        for hash in packed {
+            let src = &sources[&hash];
             let gone = match (&src.loose, &src.packed) {
                 (Some((path, _)), _) => !path.exists(),
-                (None, Some((p, _))) => tombstones.get(&p.id).is_some_and(|d| d.contains(&e.hash)),
+                (None, Some((p, _))) => tombstones.get(&p.id).is_some_and(|d| d.contains(&hash)),
                 (None, None) => false,
             };
             if gone {
-                late.push(e.hash);
+                late.push(hash);
             }
         }
         Ok(late)

@@ -196,10 +196,13 @@ impl BlobStore for FsBlobStore {
         }
         let mut merged = std::collections::BTreeMap::new();
         for (pack, dead) in &view.packs {
-            let entries = &pack.index.entries;
-            let from = after.map_or(0, |a| entries.partition_point(|e| e.hash <= a));
-            for e in entries[from..]
-                .iter()
+            let index = &pack.index;
+            let from = after.map_or(0, |a| match index.rank_of(&a) {
+                Ok(r) => r + 1,
+                Err(r) => r,
+            });
+            for e in (from..index.len())
+                .map(|r| index.entry(r as u32))
                 .filter(|e| !dead.contains(&e.hash))
                 .take(limit)
             {

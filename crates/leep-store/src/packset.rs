@@ -49,7 +49,7 @@ impl Pack {
             )));
         }
         let index =
-            PackIndex::decode(&idx_bytes).map_err(|e| Error::Storage(format!("pack {id}: {e}")))?;
+            PackIndex::decode(idx_bytes).map_err(|e| Error::Storage(format!("pack {id}: {e}")))?;
         let file = match File::open(dir.join(format!("{id}.pack"))) {
             Ok(f) => f,
             Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
@@ -57,10 +57,11 @@ impl Pack {
         };
         let len = file.metadata().map_err(storage_err)?.len();
         let mut magic = [0u8; 8];
-        if len != index.pack_len || read_at(&file, &mut magic, 0).is_err() || magic != PACK_MAGIC {
+        if len != index.pack_len() || read_at(&file, &mut magic, 0).is_err() || magic != PACK_MAGIC
+        {
             return Err(Error::Storage(format!(
                 "corrupt pack {id}.pack: {len} bytes or bad magic, index says {}",
-                index.pack_len
+                index.pack_len()
             )));
         }
         Ok(Some(Pack {
@@ -201,7 +202,7 @@ pub(crate) struct View {
 
 impl View {
     /// The first live packed copy of `hash`.
-    pub fn locate(&self, hash: &Hash) -> Option<(&Arc<Pack>, &IdxEntry)> {
+    pub fn locate(&self, hash: &Hash) -> Option<(&Arc<Pack>, IdxEntry)> {
         self.packs.iter().find_map(|(p, dead)| {
             let e = p.index.find(hash)?;
             (!dead.contains(hash)).then_some((p, e))
@@ -305,11 +306,11 @@ impl PackSet {
     pub fn get(&self, hash: &Hash) -> Result<Option<Bytes>> {
         let v = self.view()?;
         if let Some((p, e)) = v.locate(hash) {
-            return self.decode(p, e).map(Some);
+            return self.decode(p, &e).map(Some);
         }
         let v = self.refresh()?;
         match v.locate(hash) {
-            Some((p, e)) => self.decode(p, e).map(Some),
+            Some((p, e)) => self.decode(p, &e).map(Some),
             None => Ok(None),
         }
     }
@@ -340,14 +341,12 @@ impl PackSet {
                 start = Some(b);
                 break;
             }
+            // In range: decoding the index checked every base.
             let Some(base) = cur.base else { break };
-            let Some(next) = pack.index.find(&base) else {
-                return Err(corrupt(format!("base {base} is not in the pack")));
-            };
             if chain.len() >= READ_CHAIN_LIMIT {
                 return Err(corrupt("delta chain too long".into()));
             }
-            chain.push(*next);
+            chain.push(pack.index.entry(base));
         }
         let mut bytes = start;
         while let Some(e) = chain.pop() {
