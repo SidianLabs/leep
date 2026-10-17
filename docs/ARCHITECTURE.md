@@ -127,9 +127,14 @@ A derived kind is a pure function
 `value(cs) = f(cs, value(parent₁), …, value(parentₙ))`. The framework:
 
 1. finds ancestors without a stored value by walking parents **iteratively**
-   (histories can be hundreds of thousands deep);
-2. derives them oldest-first;
-3. stores each with `put_derived(kind, cs_id, bytes)`.
+   (histories can be hundreds of thousands deep), checking and reading 256 per
+   round trip and keeping only their parents, so memory follows the number of
+   changesets and not their size;
+2. derives them oldest-first, reading changesets again 256 at a time;
+3. stores each with `put_derived(kind, cs_id, bytes)`; a kind may instead
+   stage its rows and write a window's in one `put_derived_many`, each
+   changeset's value after the rows it names (`history-tree-v3` does, writing
+   before each merge so the merge can read its merge base's value).
 
 Because inputs are immutable, a value is computed at most once per kind and
 changeset, and concurrent servers that race produce identical bytes.
@@ -143,7 +148,7 @@ changeset, and concurrent servers that race produce identical bytes.
 | `review-v1` | review verdicts, keyed per (changeset, reviewer name) (`Hash::of_object("review", id‖name)`); attestations written by `put_review`, last write wins, listed with one lookup per principal | review listing and the review land policy |
 | `last_merge-v1` | generation of the nearest merge on the first-parent chain (0 if none) | lets `merge_base` answer from skiplists when no merge sits above the first-parent common ancestor |
 | `blob-claim-v1` / `blob-condemned-v1` / `blob-rescue-v1` / `blob-doom-v1` | per blob hash, 8-byte big-endian unix seconds (doom adds a state byte); GC bookkeeping, not derived from changesets: claims by uploads and dedup checks, condemnation by `gc condemn`, rescue by uploads of a condemned blob, doom by `gc collect` (ADR 0012) | blob garbage collection and the server's missing-blob checks |
-| `history-tree-v3` | 32-byte address of the root history node, a tree parallel to `root_tree` recording for each path (including deleted ones) the newest changesets that changed it; nodes are `history-node-v3` rows keyed by content hash, nodes of more than 64 entries are stored as content-defined chunks so an edit rewrites one chunk (ADR 0027), and a changed node, chunk or chunk list is stored as a patch on an earlier whole version (ADR 0037). Built from the first parent's tree plus the spines of changed paths, and at merges the paths where another parent's history differs (ADR 0013) | path log, `last-change` |
+| `history-tree-v3` | 32-byte address of the root history node, a tree parallel to `root_tree` recording for each path (including deleted ones) the newest changesets that changed it; nodes are `history-node-v3` rows keyed by content hash, nodes of more than 64 entries are stored as content-defined chunks so an edit rewrites one chunk (ADR 0027), and a changed node, chunk or chunk list is stored as a patch on an earlier whole version (ADR 0037). Built from the first parent's tree plus the spines of changed paths, and at merges the paths where the second parent's history differs from the merge base's (another parent's from the first's, for octopus or unrelated merges) (ADR 0013) | path log, `last-change` |
 | `blame` | per (changeset, path), keyed `Hash::of_object("blame", id‖path)` | blame |
 | `gc-mark-v1` | per changeset id, tree node hash or blob hash, one byte: "referenced by a stored changeset, and everything below has a row"; written by GC marks in post-order (ADR 0033) | incremental GC marks, which skip covered changesets and stop at marked tree nodes |
 | `blob-trigrams-v1` | per blob hash: sorted trigram set of a UTF-8 text blob up to 1 MiB (delta varints), or a "not indexed" marker (ADR 0014) | code search |

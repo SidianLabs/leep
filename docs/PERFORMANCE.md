@@ -50,7 +50,7 @@ indicative; expect roughly +/-15% run to run.
 | `log` path filter, no match, old scan | | 75 ms | |
 | `log` path filter, no match, path-history index | | 3.1 us | |
 | `last_change` of a file, a rarely changed file, a directory | | 4.0 / 4.2 / 3.7 us | |
-| derive the history index (per changeset, one file each) | | 36 us | |
+| derive the history index (per changeset, one file each) | | 32 us (36 us before the batched derivation of "Path history on Linux") | |
 | `log` without a path, limit 100 (before / after ADR 0030) | | 95 us / 214 us | |
 | `log` without a path, limit 10,000 (before / after ADR 0030) | | 22.7 ms / 59.7 ms | |
 | `log` with an author filter matching nothing, all 10k (before / after ADR 0030) | | 8.6 ms / 35.5 ms | |
@@ -926,6 +926,106 @@ is in an older pack). Writing a whole copy of that base and a delta instead
 was measured on every such chain head (about 256 per round): 3.6% larger
 than writing the version whole.
 
+## Path history on Linux
+
+**The problem.** The whole Linux history (1,484,762 commits) imported into a
+Postgres 16 store, blobs in one filesystem pack, on the VPS of
+`docs/DEPLOY.md`: the first `last-change` started deriving the path-history
+index and managed about 390 changesets a minute (19,504 in 50 minutes, the
+2005-2006 commits), so about 63 hours for the whole history, at 99% of one
+core and 7.25 GiB resident (`--cache-bytes 512 MiB`). All of git/git had
+derived at about 1,875 a minute.
+
+**Reproduced** on the first 21,109 commits (`v2.6.16`: 1,522 merges, one of
+them with twelve parents), imported with `leep-git import`, local Postgres 16
+over TCP, release builds, 4 vCPU Xeon, timed with
+`cargo run --release -p leep-server --example history_profile -- <meta> <blobs> main --reset`,
+which derives the index for a head and counts store calls. Profiled with
+`perf` and with per-changeset timers (not kept). Causes, largest first:
+
+- **Ancestry checks at merges.** A path changed on both sides of a merge took
+  `maximal`: an `is_ancestor` per pair of ids, each a generation-ordered walk
+  from one id down to the other's generation, repeated for every such path.
+  The walks were 60-70% of CPU samples (`AncestryCache::get`,
+  `newest_common_ancestor`, hashing ids). Single merges with 3,000-3,600 such
+  paths took 7-20 s, almost all of it there; the twelve-parent merge, which
+  takes `maximal` for all of its 12,063 paths, took minutes.
+- **Paths visited at merges.** The extra paths were found by diffing the
+  first parent's history tree against the second's, which includes every path
+  mainline changed while the branch was out. Merges visited 600-6,900 paths
+  each, nearly all to conclude that nothing changed.
+- **Cost per visited path**, about 0.4-0.7 ms: every directory on a changed
+  spine was joined from its chunks (each chunk's keyframe cloned, the patch
+  applied) up to five times (cursor, rebuild, write, each parent and the
+  merge base), and cost a write round trip, a read round trip per chunk not in
+  the cache, and two root-tree reads per changeset.
+- **Memory.** Finding the missing range kept every missing changeset decoded,
+  with all its changes, until the last was derived. Changesets average 1.7 KB
+  encoded on this slice and about 5 KB decoded, which is the 7.25 GiB measured
+  on the 1.48 million of Linux.
+
+**Fixes** (rows unchanged: the 265,273 rows the old code wrote for the first
+16,800 changesets, 1,262 merges among them, are all among the new
+derivation's 311,439, byte for byte):
+
+- At a two-parent merge, only paths whose history at the second parent
+  differs from the merge base's are visited: where they are equal, the first
+  parent's entry is the answer, and an equal directory entry means an equal
+  subtree.
+- `maximal` at a merge answers from the history at the merge base: an id of
+  one parent's set that is in the merge base's set lies behind the other
+  parent and is dropped; one that is not can only lie behind the other
+  parent's set at a criss-cross merge, which one walk per parent (shared by
+  every path of the merge) rules out before any exact check. Octopus merges do
+  the same per pair of parents. Tests check every answer against the old
+  `maximal`.
+- The range is found, read and written 256 changesets per round trip, keeping
+  only parents (about 170 bytes per changeset, so about 250 MB for all of
+  Linux) and dropping each value after its last child used it. Root trees,
+  generations and parents of a window are read in one batch each, and a
+  window's node rows and values are written in one `put_derived_many`, before
+  each merge so it can read its merge base's value.
+- A directory is joined once per changeset; writing it compares chunks with
+  the parent's without joining them, a join reads all chunk rows in one batch,
+  the other parents' and merge bases' trees are looked up chunk by chunk, the
+  merge diff skips chunks the two trees share, and tree nodes are kept decoded
+  in a 32 MiB cache (each changeset's old tree is the previous one's new tree).
+
+| Deriving the index for the 21,109 commits | Loose blobs | Packed blobs (one pack) |
+|---|---|---|
+| Before, stopped after 40 minutes | about 16,800 changesets, 7.0 per second, peak RSS 256 MiB | about 17,000 changesets, 7.1 per second, peak RSS 349 MiB |
+| After (two runs) | 95-103 s, **205-221 per second**, peak RSS 238-239 MiB | 94-97 s, **217-224 per second**, peak RSS 344-348 MiB |
+| After, the first 16,800 | 81-83 s (about 29x) | about 82 s (about 29x) |
+
+The old code never reached the twelve-parent merge (changeset 19,532). Peak
+memory is alike on the slice because its 21,109 changesets decode to about
+100 MB; it is the 1.48 million of Linux that no longer have to fit.
+
+Store calls after, loose, the second run (packed, blob reads took 10.8 s for
+the same 126,609):
+
+| Call | Calls | Items | Time |
+|---|---|---|---|
+| blob `get` (tree nodes) | 126,609 | | 11.1 s |
+| `get_derived` history nodes (cache misses) | 37,558 | | 8.9 s |
+| `get_derived` skiplists (`merge_base`) | 35,234 | | 9.3 s |
+| `put_derived_many` | 1,678 | 371,132 | 11.9 s |
+| `get_changesets` | 557 | 42,218 | 1.7 s |
+| the rest (merge bases' values, last merges, batched reads) | 6,422 | | 2.5 s |
+
+Packing costs the walk little: it reads trees oldest first, and the store's
+decoded-object cache resumes each delta chain from the previous version, so a
+tree read averaged 83-85 us packed against 77-88 us loose. The cold full listing is
+another matter (9.7 s on Linux), not addressed here.
+
+What remains: the twelve-parent merge still takes about 1 s and the largest
+two-parent merges 0.5-0.9 s (thousands of paths a side branch's mainline merge
+made its own); skiplist reads in `merge_base`, read one per round trip and not
+cached so that verification never trusts a row it has not checked; and a
+changeset still joins every chunk of each directory it rewrites, so the cost
+grows with directory width (Linux's widest directories hold thousands of
+names).
+
 ## Garbage collection
 
 `leep-server gc` phases timed with
@@ -1023,10 +1123,12 @@ commit path.
 
 What does not scale with the change:
 
-- Merges: deriving the index for a merge diffs the first parent's history tree
-  against each other parent's, so a merge of a branch that changed many paths
-  derives in time proportional to those paths. The benchmarks use linear
-  histories and do not measure this.
+- Merges: deriving the index for a merge diffs the second parent's history
+  tree against the merge base's, so a merge of a branch that changed many
+  paths (or merged mainline into itself, which makes its merge the last change
+  of everything mainline brought) derives in time proportional to those paths.
+  The benchmarks use linear histories and do not measure this; "Path history
+  on Linux" does.
 - `log` without `path` and the `author` or `extra` filters alone scan
   changesets linearly. Since ADR 0030 the scan reads them in batches, so on a
   database it costs a round trip per window of up to 256 changesets rather
