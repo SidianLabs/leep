@@ -40,7 +40,8 @@ pub const EXTRA_GIT_HEADERS: &str = "git.extra_headers";
 pub(crate) const GIT_ALLOC_LIMIT: usize = 4 << 30;
 
 /// Open a git repository with [`GIT_ALLOC_LIMIT`] instead of gix's
-/// reduced-trust fallback.
+/// reduced-trust fallback. It is passed like `git -c`, so it also wins over
+/// a smaller limit in the repository's own configuration.
 pub(crate) fn open_git(git_dir: &std::path::Path) -> leep_core::Result<gix::Repository> {
     open_git_with(git_dir, gix::open::Options::default())
 }
@@ -49,8 +50,7 @@ pub(crate) fn open_git_with(
     git_dir: &std::path::Path,
     options: gix::open::Options,
 ) -> leep_core::Result<gix::Repository> {
-    let options =
-        options.config_overrides([format!("gitoxide.objects.allocLimit={GIT_ALLOC_LIMIT}")]);
+    let options = options.cli_overrides([format!("gitoxide.objects.allocLimit={GIT_ALLOC_LIMIT}")]);
     gix::open_opts(git_dir, options).map_err(gerr)
 }
 
@@ -130,24 +130,47 @@ pub(crate) fn parse_tz(s: &str) -> i32 {
 mod tests {
     use super::*;
 
-    /// A repository opened with reduced trust (as for a checkout owned by
-    /// another user) still reads objects above gix's 16 MiB fallback.
-    #[test]
-    fn reduced_trust_reads_large_objects() {
+    fn repo_with_big_blob() -> (tempfile::TempDir, gix::ObjectId, usize) {
         let dir = tempfile::tempdir().unwrap();
         let repo = gix::init_bare(dir.path()).unwrap();
         let big = vec![b'x'; 17 << 20];
         let id = repo.write_blob(&big).unwrap().detach();
-        drop(repo);
+        (dir, id, big.len())
+    }
 
-        let reduced = gix::open::Options::default().with(gix::sec::Trust::Reduced);
-        let plain = gix::open_opts(dir.path(), reduced.clone()).unwrap();
+    /// A 16 MiB cap, as gix applies to a repository owned by another user,
+    /// no longer stops the bridge from reading a larger object.
+    #[test]
+    fn objects_above_a_16_mib_cap_are_read() {
+        let (dir, id, len) = repo_with_big_blob();
+        let config = dir.path().join("config");
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text.push_str("[gitoxide \"objects\"]\n\tallocLimit = 16777216\n");
+        std::fs::write(&config, text).unwrap();
+
+        let plain = gix::open(dir.path()).unwrap();
         assert!(
             plain.find_object(id).is_err(),
-            "gix's fallback limit no longer applies"
+            "the cap applies without the override"
         );
+        assert_eq!(
+            open_git(dir.path())
+                .unwrap()
+                .find_object(id)
+                .unwrap()
+                .data
+                .len(),
+            len
+        );
+    }
 
-        let ours = open_git_with(dir.path(), reduced).unwrap();
-        assert_eq!(ours.find_object(id).unwrap().data.len(), big.len());
+    /// Opened with reduced trust, the case of the server container reading
+    /// a checkout owned by the host user.
+    #[test]
+    fn reduced_trust_reads_large_objects() {
+        let (dir, id, len) = repo_with_big_blob();
+        let reduced = gix::open::Options::default().with(gix::sec::Trust::Reduced);
+        let repo = open_git_with(dir.path(), reduced).unwrap();
+        assert_eq!(repo.find_object(id).unwrap().data.len(), len);
     }
 }
