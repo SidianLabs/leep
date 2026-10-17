@@ -76,7 +76,7 @@ fn index_of(root: &Path) -> PackIndex {
     let ids = pack_ids(root);
     assert_eq!(ids.len(), 1, "one pack");
     let bytes = std::fs::read(root.join("packs").join(format!("{}.idx", ids[0]))).unwrap();
-    PackIndex::decode(&bytes).unwrap()
+    PackIndex::decode(bytes).unwrap()
 }
 
 async fn list_all(store: &dyn BlobStore, page: usize) -> Vec<leep_core::BlobMeta> {
@@ -177,18 +177,23 @@ async fn reads_after_repack_equal_the_originals_and_deltas_are_used() {
     }
     // Chains are capped, and every base precedes its delta.
     let idx = index_of(dir.path());
-    for e in &idx.entries {
+    assert_eq!(
+        idx.magic(),
+        pack::IDX_MAGIC,
+        "new packs use the compact index"
+    );
+    for e in idx.iter() {
         let mut depth = 0;
-        let mut cur = *e;
+        let mut cur = e;
         while let Some(b) = cur.base {
-            let base = *idx.find(&b).unwrap();
+            let base = idx.entry(b);
             assert!(base.offset < cur.offset);
             cur = base;
             depth += 1;
         }
         assert!(depth <= pack::MAX_CHAIN, "depth {depth}");
     }
-    assert!(idx.entries.iter().any(|e| e.base.is_some()));
+    assert!(idx.iter().any(|e| e.base.is_some()));
 }
 
 #[tokio::test]
@@ -304,7 +309,7 @@ async fn tombstones_hide_packed_objects_and_a_full_repack_drops_them() {
             assert_eq!(s.get(h).await.unwrap().is_none(), gone, "after repack {i}");
         }
     }
-    assert_eq!(index_of(dir.path()).entries.len(), 8);
+    assert_eq!(index_of(dir.path()).len(), 8);
 }
 
 #[tokio::test]
@@ -345,7 +350,8 @@ async fn a_corrupt_pack_entry_is_a_storage_error_not_wrong_bytes() {
 }
 
 /// A pack written by hand from the layout in docs/FORMATS.md: a raw-block
-/// zstd frame and a delta frame against it. Readers must keep reading it.
+/// zstd frame and a delta frame against it, with an index in each layout.
+/// Readers must keep reading both.
 #[tokio::test]
 async fn hand_written_pack_reads() {
     let base = b"the quick brown fox jumps over the lazy dog".repeat(4);
@@ -361,7 +367,7 @@ async fn hand_written_pack_reads() {
     packfile.extend_from_slice(&whole);
     packfile.extend_from_slice(delta);
     let (hb, hd) = (Hash::of_blob(&base), Hash::of_blob(&data));
-    let mut entries = vec![
+    let entries = vec![
         IdxEntry {
             hash: hb,
             offset: 8,
@@ -375,36 +381,265 @@ async fn hand_written_pack_reads() {
             offset: 8 + whole.len() as u64,
             stored_len: delta.len() as u64,
             len: data.len() as u64,
-            base: Some(hb),
+            base: Some(0),
             modified: 2_000,
         },
     ];
-    entries.sort_by_key(|e| e.hash);
-    let idx = PackIndex {
-        pack_len: packfile.len() as u64,
-        pack_hash: *blake3::hash(&packfile).as_bytes(),
-        entries,
+    let pack_len = packfile.len() as u64;
+    let pack_hash = *blake3::hash(&packfile).as_bytes();
+    for idx in [
+        pack::encode_idx1(pack_len, pack_hash, &entries),
+        PackIndex::encode(pack_len, pack_hash, &entries).unwrap(),
+    ] {
+        let id = pack::pack_id(&idx);
+        let dir = tempfile::tempdir().unwrap();
+        let packs = dir.path().join("packs");
+        std::fs::create_dir_all(&packs).unwrap();
+        std::fs::write(packs.join(format!("{id}.pack")), &packfile).unwrap();
+        std::fs::write(packs.join(format!("{id}.idx")), &idx).unwrap();
+        let store = FsBlobStore::new(dir.path());
+        assert_eq!(store.get(&hd).await.unwrap().unwrap(), data);
+        assert_eq!(store.get(&hb).await.unwrap().unwrap(), base);
+        let listed = store.list_page(None, 10).await.unwrap();
+        assert_eq!(listed.len(), 2);
+        assert!(listed.iter().all(|m| m.modified.is_some()));
+        // The writer produces the same pack layout.
+        let report = repack(&store, vec![(hb, None), (hd, Some(hb))]).await;
+        assert_eq!((report.objects, report.deltas), (2, 1));
+        let written =
+            std::fs::read(packs.join(format!("{}.pack", report.pack_id.as_ref().unwrap())))
+                .unwrap();
+        assert_eq!(&written[..8], b"LEEPPAK1");
+        let idx = index_of(dir.path());
+        assert_eq!(idx.magic(), pack::IDX_MAGIC);
+        assert_eq!(idx.find(&hd).unwrap().modified, 2_000);
     }
-    .encode();
+}
+
+/// Write a pack whose index has the original `LEEPIDX1` layout, as stores
+/// packed before `LEEPIDX2` hold. Each object is a delta against the one
+/// before it. Returns the pack id.
+fn write_idx1_pack(root: &Path, objects: &[(Bytes, i64)]) -> String {
+    let mut packfile = b"LEEPPAK1".to_vec();
+    let mut entries = Vec::new();
+    for (i, (data, modified)) in objects.iter().enumerate() {
+        let frame = match i.checked_sub(1) {
+            Some(b) => pack::compress_delta(&objects[b].0, data, 9)
+                .unwrap()
+                .unwrap(),
+            None => pack::compress_whole(data, 9).unwrap(),
+        };
+        entries.push(IdxEntry {
+            hash: Hash::of_blob(data),
+            offset: packfile.len() as u64,
+            stored_len: frame.len() as u64,
+            len: data.len() as u64,
+            base: i.checked_sub(1).map(|b| b as u32),
+            modified: *modified,
+        });
+        packfile.extend_from_slice(&frame);
+    }
+    let idx = pack::encode_idx1(
+        packfile.len() as u64,
+        *blake3::hash(&packfile).as_bytes(),
+        &entries,
+    );
     let id = pack::pack_id(&idx);
-    let dir = tempfile::tempdir().unwrap();
-    let packs = dir.path().join("packs");
+    let packs = root.join("packs");
     std::fs::create_dir_all(&packs).unwrap();
     std::fs::write(packs.join(format!("{id}.pack")), &packfile).unwrap();
     std::fs::write(packs.join(format!("{id}.idx")), &idx).unwrap();
+    id
+}
+
+fn idx_magic(root: &Path, id: &str) -> Vec<u8> {
+    std::fs::read(root.join("packs").join(format!("{id}.idx"))).unwrap()[..8].to_vec()
+}
+
+/// A deployed store holds `LEEPIDX1` packs; after this change it also gets
+/// `LEEPIDX2` ones. Both read, list and take tombstones side by side, and a
+/// full repack folds them into one new-format pack.
+#[tokio::test]
+async fn a_store_with_old_and_new_indexes_reads_lists_deletes_and_repacks() {
+    let dir = tempfile::tempdir().unwrap();
+    let vs = versions(30);
+    // Versions 0..12 in an old pack, with recorded ages; 10 and 11 are also
+    // in the new pack below.
+    let old: Vec<(Bytes, i64)> = vs[..12]
+        .iter()
+        .enumerate()
+        .map(|(i, v)| (v.clone(), 1_600_000_000 + i as i64))
+        .collect();
+    let old_id = write_idx1_pack(dir.path(), &old);
     let store = FsBlobStore::new(dir.path());
-    assert_eq!(store.get(&hd).await.unwrap().unwrap(), data);
-    assert_eq!(store.get(&hb).await.unwrap().unwrap(), base);
-    let listed = store.list_page(None, 10).await.unwrap();
-    assert_eq!(listed.len(), 2);
-    assert!(listed.iter().all(|m| m.modified.is_some()));
-    // The writer produces the same layout.
-    let report = repack(&store, vec![(hb, None), (hd, Some(hb))]).await;
-    assert_eq!((report.objects, report.deltas), (2, 1));
-    let written =
-        std::fs::read(packs.join(format!("{}.pack", report.pack_id.as_ref().unwrap()))).unwrap();
-    assert_eq!(&written[..8], b"LEEPPAK1");
-    assert_eq!(index_of(dir.path()).find(&hd).unwrap().modified, 2_000);
+    let hashes: Vec<Hash> = vs.iter().map(|v| Hash::of_blob(v)).collect();
+    for v in &vs[10..24] {
+        store.put(v.clone()).await.unwrap();
+    }
+    // A repack packs everything it sees, so hide the old pack while writing
+    // a new one that holds only 10..24.
+    let packs = dir.path().join("packs");
+    let aside = dir.path().join("old-pack-aside");
+    std::fs::create_dir_all(&aside).unwrap();
+    for ext in ["idx", "pack"] {
+        let name = format!("{old_id}.{ext}");
+        std::fs::rename(packs.join(&name), aside.join(&name)).unwrap();
+    }
+    let store = FsBlobStore::new(dir.path());
+    let first = repack(&store, chain_hints(&hashes[10..24])).await;
+    let new_id = first.pack_id.unwrap();
+    for ext in ["idx", "pack"] {
+        let name = format!("{old_id}.{ext}");
+        std::fs::rename(aside.join(&name), packs.join(&name)).unwrap();
+    }
+    for v in &vs[24..] {
+        store.put(v.clone()).await.unwrap();
+    }
+    assert_eq!(idx_magic(dir.path(), &old_id), b"LEEPIDX1");
+    assert_eq!(idx_magic(dir.path(), &new_id), b"LEEPIDX2");
+    assert_eq!(pack_ids(dir.path()).len(), 2);
+
+    let store = FsBlobStore::new(dir.path());
+    let check = |store: FsBlobStore, gone: Vec<Hash>| {
+        let vs = vs.clone();
+        let hashes = hashes.clone();
+        async move {
+            for (i, h) in hashes.iter().enumerate() {
+                let got = store.get(h).await.unwrap();
+                if gone.contains(h) {
+                    assert!(got.is_none(), "{i} gone");
+                    assert!(!store.contains(h).await.unwrap());
+                } else {
+                    assert_eq!(got.as_ref(), Some(&vs[i]), "{i}");
+                    assert!(store.contains(h).await.unwrap());
+                }
+            }
+            let want: BTreeMap<Hash, u64> = hashes
+                .iter()
+                .zip(&vs)
+                .filter(|(h, _)| !gone.contains(h))
+                .map(|(h, v)| (*h, v.len() as u64))
+                .collect();
+            for page in [1, 4, 1000] {
+                let all = list_all(&store, page).await;
+                let listed: BTreeMap<Hash, u64> = all.iter().map(|m| (m.hash, m.size)).collect();
+                assert_eq!(listed, want, "page {page}");
+                assert_eq!(all.len(), want.len(), "listed once each");
+            }
+            list_all(&store, 1000).await
+        }
+    };
+    let listed = check(FsBlobStore::with_decoded_cache(dir.path(), 0), vec![]).await;
+    // Ages of objects only in the old pack come from its records.
+    let age = |h: &Hash| listed.iter().find(|m| m.hash == *h).unwrap().modified;
+    assert_eq!(age(&hashes[3]), Some(1_600_000_003));
+
+    // Delete the base of the old pack's chain, an object in both packs and
+    // one only in the new pack.
+    let doomed = vec![hashes[0], hashes[11], hashes[15]];
+    for h in &doomed {
+        store.delete(h).await.unwrap();
+    }
+    let tombstones = std::fs::read_to_string(packs.join("tombstones")).unwrap();
+    let mut lines: Vec<&str> = tombstones.lines().collect();
+    lines.sort();
+    let mut want = vec![
+        format!("{old_id} {}", hashes[0]),
+        format!("{old_id} {}", hashes[11]),
+        format!("{new_id} {}", hashes[11]),
+        format!("{new_id} {}", hashes[15]),
+    ];
+    want.sort();
+    assert_eq!(lines, want);
+    check(FsBlobStore::new(dir.path()), doomed.clone()).await;
+    check(store.clone(), doomed.clone()).await;
+
+    // A full repack converts everything to one new-format pack.
+    let report = repack(&store, chain_hints(&hashes)).await;
+    assert_eq!(report.packs_before, 2);
+    assert_eq!(report.objects, 27, "{report:?}");
+    assert_eq!(report.dropped_tombstoned, 3, "{report:?}");
+    let ids = pack_ids(dir.path());
+    assert_eq!(ids.len(), 1);
+    assert_eq!(idx_magic(dir.path(), &ids[0]), b"LEEPIDX2");
+    assert!(!packs.join("tombstones").exists());
+    assert_eq!(loose_count(dir.path()), 0);
+    let listed = check(FsBlobStore::with_decoded_cache(dir.path(), 0), doomed).await;
+    let age = |h: &Hash| listed.iter().find(|m| m.hash == *h).unwrap().modified;
+    assert_eq!(age(&hashes[3]), Some(1_600_000_003), "old ages survive");
+}
+
+/// A new-format index that is damaged but still named by its own hash (so
+/// only the decoder can catch it) is refused, whatever the damage.
+#[tokio::test]
+async fn corrupt_new_indexes_are_refused_by_the_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FsBlobStore::new(dir.path());
+    let vs = versions(4);
+    let mut hashes = Vec::new();
+    for v in &vs {
+        hashes.push(store.put(v.clone()).await.unwrap());
+    }
+    repack(&store, chain_hints(&hashes)).await;
+    let packs = dir.path().join("packs");
+    let id = pack_ids(dir.path()).remove(0);
+    let good = std::fs::read(packs.join(format!("{id}.idx"))).unwrap();
+    assert_eq!(&good[..8], b"LEEPIDX2");
+    let widths: [u8; 5] = good[64..69].try_into().unwrap();
+    let rec: usize = widths.iter().map(|&w| w as usize).sum();
+    let records = pack::IDX_HEADER_LEN + pack::IDX_FANOUT_LEN + 4 * 32;
+    let base_at = (widths[0] + widths[1]) as usize;
+    type Damage = Box<dyn Fn(&mut Vec<u8>)>;
+    let damages: Vec<(&str, Damage)> = vec![
+        (
+            "base ordinal past the end",
+            Box::new(move |b| b[records + base_at + widths[2] as usize - 1] = 5),
+        ),
+        (
+            "base is itself",
+            Box::new(move |b| b[records + base_at + widths[2] as usize - 1] = 1),
+        ),
+        ("bad widths", Box::new(|b| b[66] = 9)),
+        (
+            "frame outside the pack",
+            Box::new(move |b| {
+                for x in &mut b[records + rec..records + rec + widths[0] as usize] {
+                    *x = 0xff;
+                }
+            }),
+        ),
+        ("pack length", Box::new(|b| b[23] ^= 1)),
+    ];
+    for (what, damage) in damages {
+        let mut bytes = good.clone();
+        damage(&mut bytes);
+        let body = bytes.len() - 32;
+        let sum = *blake3::hash(&bytes[..body]).as_bytes();
+        bytes[body..].copy_from_slice(&sum);
+        let bad_id = pack::pack_id(&bytes);
+        std::fs::remove_file(packs.join(format!("{id}.idx"))).unwrap();
+        std::fs::rename(
+            packs.join(format!("{id}.pack")),
+            packs.join(format!("{bad_id}.pack")),
+        )
+        .unwrap();
+        std::fs::write(packs.join(format!("{bad_id}.idx")), &bytes).unwrap();
+        match FsBlobStore::new(dir.path()).get(&hashes[1]).await {
+            Err(Error::Storage(msg)) => assert!(msg.contains("corrupt"), "{what}: {msg}"),
+            other => panic!("{what}: expected a storage error, got {other:?}"),
+        }
+        std::fs::remove_file(packs.join(format!("{bad_id}.idx"))).unwrap();
+        std::fs::rename(
+            packs.join(format!("{bad_id}.pack")),
+            packs.join(format!("{id}.pack")),
+        )
+        .unwrap();
+        std::fs::write(packs.join(format!("{id}.idx")), &good).unwrap();
+    }
+    let fresh = FsBlobStore::new(dir.path());
+    for (h, v) in hashes.iter().zip(&vs) {
+        assert_eq!(&fresh.get(h).await.unwrap().unwrap(), v);
+    }
 }
 
 #[tokio::test]

@@ -501,7 +501,7 @@ The filesystem store has two layers of its own (ADR 0029):
 ```
 FsBlobStore.get(hash)
    → loose file <root>/<2 hex>/<62 hex>          (every new write lands here)
-   → packs/*.idx  (in memory: hash → pack, offset, base; minus tombstones)
+   → packs/*.idx  (in memory as file bytes, searched in place: hash → pack, offset, base; minus tombstones)
         → decoded-object cache (64 MiB, per store) → delta chain in the .pack
 ```
 `leep-server repack` moves loose objects into a pack: a file version is
@@ -510,7 +510,12 @@ against the same directory in the first parent, chains capped at 32. A read
 decodes the chain iteratively and checks the result against its hash. GC
 deletes a packed object by appending a tombstone; the next full repack leaves
 it out. A store reads a pack published by another process on its next miss
-(it rescans `packs/` before answering "absent"). Planned: a regional cache tier, the same server binary in a
+(it rescans `packs/` before answering "absent"). An index (ADR 0038) keeps
+the hashes in a sorted column behind a 256-entry fanout table. Each hash then
+has a record whose field widths are chosen per pack, about 45 bytes per
+object in all. The store keeps index files in memory as they are on disk and
+searches them without decoding. Indexes in the original 96-byte layout still
+read, and a full repack rewrites them. Planned: a regional cache tier, the same server binary in a
 read-through mode against an upstream server. Strict tiering means a cold
 regional cache cannot stampede the origin. The server's cache reports hits,
 misses and occupancy as Prometheus metrics (see [OPERATIONS.md](OPERATIONS.md)).
@@ -709,5 +714,5 @@ node is stored whole, so imported git/git takes 8.7 GB of objects against a
 repack` stores objects as zstd deltas against the previous version of the
 same path, with no change to hashes, the API or clients. The filesystem
 store has them (the first 3,795 commits of git/git: 91.2 MB loose, a 3.1 MB
-pack plus a 1.1 MB index, against git's 4.4 MB pack); the object store
-backend and incremental repacks are next.
+pack plus a 0.5 MB index since ADR 0038, against git's 4.4 MB pack); the
+object store backend and incremental repacks are next.

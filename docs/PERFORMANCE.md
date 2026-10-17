@@ -756,7 +756,8 @@ git/git (a local Postgres 16, filesystem blobs; 4 vCPU Intel Xeon @ 2.10GHz,
 |---|---|
 | Loose objects (11,735: 6,791 file versions, 4,944 tree nodes) | 91,168,650 |
 | Pack | 3,100,053 |
-| Index (96 bytes per object) | 1,126,648 |
+| Index (43.1 bytes per object, ADR 0038) | 505,733 |
+| Index before ADR 0038 (96 bytes per object) | 1,126,648 |
 | Prototype's pack (ADR 0029), no index | 3.2 MB |
 | `git pack-objects` of the same commits | 4.4 MB |
 
@@ -782,11 +783,49 @@ A first read of a packed object decodes its chain (13 frames on average) and
 checks each against its hash. The store keeps 64 MiB of decoded objects, so
 reading neighbouring versions, or the same object again, skips the chain: with
 the cache off, repeated reads cost as much as first ones. The p99 of first
-reads is the deepest chains plus loading the 1.1 MB index on the first call.
+reads is the deepest chains plus loading the index (1.1 MB then) on the first call.
 Two implementation choices mattered: one zstd decoder per thread instead of
 one per frame (first-read mean 340 us before), and reading the loose file and
 the pack in one blocking task (one thread-pool hop per `get`, as for a loose
 store).
+
+#### Index size, lookups and memory (ADR 0038)
+
+The compact index (`LEEPIDX2`) against the original 96-byte records
+(`LEEPIDX1`). Slice figures come from repacking the same store with each
+binary; the pack bytes are identical. The 5-million-object rows come from a
+synthetic index: random hashes, 100 to 1,000-byte frames, 15 in 16 objects
+deltas
+(`cargo run --release -p leep-store --example pack_index_scale -- build
+<file> 5000000`, then `-- load <file>` in a fresh process, 1,000,000 random
+lookups of present and of absent hashes; two runs agreed within 10%).
+
+| | Before | After |
+|---|---|---|
+| Slice index (11,735 objects) | 1,126,648 bytes, 96.0 per object | **505,733 bytes, 43.1 per object** (widths 3+2+2+3+1) |
+| 5M synthetic index on disk | 96.0 bytes per object | **46.0** |
+| Resident memory of a loaded index | 104 bytes per object (decoded to a `Vec`) | **46.0** (file bytes searched in place); an old index read by the new code: 100 |
+| Load and check, 5M objects | 10.9 s (one binary search per base) | **1.5 s**; an old index read by the new code: 6.8 s |
+| Lookup, 5M objects, present / absent | 1.8 / 2.2 us | **0.9 / 0.8 us** (fanout table, dense hash column); old index, new code: 1.3 / 1.4 us |
+| Lookup, 326,731 objects, present / absent | 0.85 / 1.0 us | **0.30 / 0.27 us** |
+| `get` of 1,000 random objects on the slice, first read mean / again mean (three seeds) | 161-221 / 33-44 us | 161-204 / 33-35 us; old index, new code: 204-223 / 34-41 us |
+
+`get` latency does not change: decoding the delta chain dominates it, and
+the lookup is under 1 us. The index's bytes per object follow the field
+widths of each pack: 32 for the hash plus offset (bytes to hold the pack's
+length), stored length, base (bytes to hold the object count), logical
+length and modification time (bytes to hold the span from the earliest).
+Projected for the measured stores below, the 4-byte offsets and 3-byte
+bases, stored and logical lengths, and 2- or 3-byte modification times (a
+span under 194 days) give 47 to 49 bytes per object:
+
+| Store | Objects | Index before (measured) | Index after (projected) | Share of pack + index, before / after |
+|---|---|---|---|---|
+| All of git/git | 326,731 | 31.4 MB | 15.4-16.0 MB | 16% / 8-9% |
+| Linux, first 669,466 commits (1.24 GB pack) | 4,653,029 | 446.7 MB | 219-228 MB | 26% / 15% |
+
+For the Linux slice, that is also about 260 MB less resident memory per
+server process that has the pack open.
 
 Queries through a server over each store (`--warm-interval 0`, derived rows
 already present, server started fresh with the page cache dropped; first
@@ -813,13 +852,13 @@ and fence:
 |---|---|
 | Loose objects before | 326,731, 8.69 GB logical, 8.9 GB on disk |
 | Pack | 167 MB (167,467,024 bytes) |
-| Index | 31 MB (31,366,264 bytes) |
+| Index | 31 MB (31,366,264 bytes; about 15.5 MB with ADR 0038's layout, projected above) |
 | Blob directory after | 190 MB logical, 225 MB on disk, no loose objects left |
 | Stored as deltas / whole | 312,029 / 14,702 |
 | Time | 27.4 min: 6.2 walking history, 10.4 writing, 10 fence, 0.7 cleanup |
 
 That is 46x smaller than the loose store and smaller than git's 328 MB for the
-same history; the index is 16% of pack plus index. Queries on a freshly
+same history; the index is 16% of pack plus index (8-9% with ADR 0038). Queries on a freshly
 started server over the packed store, against the loose runs on the same
 database just before the repack (current main, or the previous image for rows
 it does not affect; first request / repeat):
@@ -857,7 +896,9 @@ VPS, default level 9 and fence:
 That is 35x smaller on disk, with no corrupt objects. Memory peaked at about
 5 GB of the machine's 11 GB. The index is 26% of pack plus index, so the 96-byte record (a
 32-byte base hash per object) is the next thing to shrink for histories of
-this size. The import then resumed from the packed store.
+this size. ADR 0038's index layout stores about 47-49 bytes per object
+instead (projected 219-228 MB for this pack, 15% of pack plus index; see
+"Packed blobs"). The import then resumed from the packed store.
 
 ## Garbage collection
 

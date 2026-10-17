@@ -388,6 +388,17 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   without packs behaves as before. GC deletes packed blobs through
   `packs/tombstones`, and the next repack drops them. Only filesystem stores
   can be packed so far; backups copy packed blobs as loose ones.
+- Pack indexes are about half the size, on disk and in memory (ADR 0038).
+  New packs get a `LEEPIDX2` index: hashes in a sorted column behind a
+  256-entry fanout table, then one record per hash whose field widths are
+  chosen per pack, with bases as record ranks instead of 32-byte hashes and
+  modification times relative to the pack's earliest. On the first 3,795
+  commits of git/git the index takes 0.51 MB instead of 1.13 MB (43 bytes
+  per object instead of 96). At 5 million objects it takes 46 bytes per
+  object in memory instead of 104, loads in 1.5 s instead of 11 s, and
+  answers a lookup in 0.9 us instead of 1.8 us. Existing `LEEPIDX1` indexes
+  still read, now in place as well, and a full repack rewrites them. Upgrade
+  every server before repacking: older servers refuse the new indexes.
 - `log` without a path, `log` filtered by author or `extra`, and
   provenance read history in batches instead of a changeset at a time
   (ADR 0030): on the first 3,795 commits of git/git on Postgres, a log of the

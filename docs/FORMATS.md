@@ -433,7 +433,47 @@ content size, without zstd's checksum), either:
   reference prefix (`zstd --patch-from=<base>`). The base is another entry of
   the same pack, at a lower offset.
 
-**`.idx`**:
+**`.idx`**: one of two layouts, told apart by the magic. Writers produce
+`LEEPIDX2` (ADR 0038); readers accept both, because stores packed before
+ADR 0038 hold `LEEPIDX1` indexes. Both list every object of the pack once,
+in strictly ascending hash order.
+
+`LEEPIDX2`:
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 8 | magic `LEEPIDX2` |
+| 8 | 8 | record count `n` |
+| 16 | 8 | length of the `.pack` file in bytes |
+| 24 | 32 | BLAKE3 of the whole `.pack` file |
+| 56 | 8 | base modification time `t0` (signed unix seconds; the earliest in the pack) |
+| 64 | 5 | field widths in bytes: offset `wo`, stored length `ws`, base `wb`, logical length `wl`, modification time `wm` |
+| 69 | 3 | zero |
+| 72 | 1024 | fanout: 256 u32, entry `b` = number of hashes whose first byte is at most `b` |
+| 1096 | 32 × `n` | object hashes, strictly ascending |
+| 1096 + 32`n` | `r` × `n` | records, the `i`-th for the `i`-th hash; `r = wo + ws + wb + wl + wm` |
+| 1096 + (32 + `r`)`n` | 32 | BLAKE3 of all bytes before it |
+
+Each record is five big-endian unsigned integers of the header's widths, back
+to back:
+
+| Field | Width | Value |
+|---|---|---|
+| offset | `wo` (1 to 8) | offset of the entry's frame in the `.pack` |
+| stored length | `ws` (1 to 8) | length of the frame |
+| base | `wb` (1 to 4) | 0 for a whole entry; for a delta, 1 + the rank (position in hash order) of its base's record |
+| logical length | `wl` (0 to 8) | decoded length of the object |
+| modification time | `wm` (0 to 8) | the object's modification time before it was packed, minus `t0` |
+
+A writer picks each width as the fewest bytes that hold that field's largest
+value in the pack (`wb` from `n`), and `t0` as the earliest modification
+time. A width of 0 means the field is 0 for every record. A reader refuses
+widths outside the ranges above, nonzero reserved bytes, a length other than
+`1128 + (32 + r)n`, a fanout that does not count the hashes, `n` too large
+for `wb`, a base past `n` or naming its own record, and a modification time
+that overflows i64.
+
+`LEEPIDX1` (read only):
 
 | Offset | Size | Field |
 |---|---|---|
@@ -455,9 +495,10 @@ Each 96-byte record:
 | 56 | 32 | base object hash, or 32 zero bytes for a whole entry |
 | 88 | 8 | the object's modification time before it was packed (signed unix seconds) |
 
-A reader checks the magic, the trailing checksum, the order, that every frame
-lies inside the pack, that every base is an earlier entry of the same pack
-(so chains end), and that the `.pack` has the recorded length and magic. It
+A reader of either layout checks the magic, the trailing checksum, the order,
+that every frame lies inside the pack after its magic, that every base is
+another entry of the same pack at a lower offset (so chains end), and that
+the `.pack` has the recorded length and magic. It
 decodes a delta chain iteratively (the writer caps chains at 32; readers
 refuse more than 64) and checks every decoded object against its address:
 `BLAKE3(bytes)` for a file blob, `Hash::of_object("tree-v1", bytes)` for a
@@ -481,12 +522,13 @@ pack still exists, and removes it when none remain.
 each rename. The index rename publishes. A `.pack` with no `.idx` is garbage.
 Replaced packs are removed index first.
 
-Golden bytes: `leep-store` asserts a fixed index's bytes and id
-(`pack::tests::index_golden_bytes`), decodes fixed whole and delta frames
+Golden bytes: `leep-store` asserts a fixed `LEEPIDX2` index's bytes and id
+(`pack::tests::index_golden_bytes`), decodes fixed `LEEPIDX1` bytes with
+their id (`idx1_golden_bytes_decode`), decodes fixed whole and delta frames
 (`frame_golden_bytes_decode`), and reads a pack written by hand from this
-layout (`pack_tests::hand_written_pack_reads`). A new layout needs a new
-magic (`LEEPPAK2`/`LEEPIDX2`) that old readers refuse, and readers must keep
-reading version 1.
+layout with an index of each kind (`pack_tests::hand_written_pack_reads`).
+A new layout needs a new magic (`LEEPPAK2`, `LEEPIDX3`) that old readers
+refuse, and readers must keep reading the earlier ones.
 
 ## Garbage collection (no format change)
 
