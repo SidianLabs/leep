@@ -129,6 +129,13 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   "retryable"}}` on stdout (the text still goes to stderr), with a stable
   `code` such as `not_found`, `conflict`, `server` or `usage`. Usage errors
   follow it when `--json` is anywhere on the command line.
+- Short changeset ids (ADR 0034): every command that takes a revision accepts
+  4 or more leading hex digits of a changeset id, such as the 12-digit ids the
+  CLI prints; an ambiguous one lists the candidates. `leep log` headers now
+  print 12-digit ids (`--json` keeps full ids). New `GET
+  /v1/resolve-prefix/{prefix}` and `MetaStore::changesets_with_prefix`, with a
+  default built on `list_changesets` and range-scan overrides for SQLite and
+  Postgres.
 
 ### Hardening
 - Fuzz targets for every decoder and parser: persisted objects, derived

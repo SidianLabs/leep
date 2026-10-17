@@ -69,7 +69,7 @@ content-addressing and (b) the atomicity of `MetaStore::cas_ref`.
 
 | Crate | Role | May depend on |
 |---|---|---|
-| `leep-core` | Types, hashing, encoding, `BlobStore`/`MetaStore` traits (including listing and blob deletion for GC, listing and dropping derived rows by kind for repair, batched changeset and derived reads for history walks, and batched derived writes and changeset-with-rows writes for changeset creation), in-memory stores, conformance tests, API types, pure rename detection | no other leep crate; no I/O, no async runtime |
+| `leep-core` | Types, hashing, encoding, `BlobStore`/`MetaStore` traits (including listing and blob deletion for GC, a changeset id prefix lookup for short ids, listing and dropping derived rows by kind for repair, batched changeset and derived reads for history walks, and batched derived writes and changeset-with-rows writes for changeset creation), in-memory stores, conformance tests, API types, pure rename detection | no other leep crate; no I/O, no async runtime |
 | `leep-store` | `BlobStore` backends: filesystem (loose objects plus delta-compressed packs and the repack writer, ADR 0029), `object_store` (S3/MinIO), `CachedBlobStore`, `open_blob_store(url)`, and the incremental blob copy backup and restore use (`sync`, ADR 0026) | core |
 | `leep-meta` | `MetaStore` backends: SQLite, Postgres, `open_meta_store(url)`, the versioned schema migrator (`migrate`, ADR 0023), and metadata snapshots and their import (`snapshot`, ADR 0026) | core |
 | `leep-derive` | `Repo`: derived data framework and kinds, plus all operations, blob garbage collection (`gc`), the delta-base walk for `repack` (`pack_order`) and store verification and repair (`integrity`) | core (traits only, never a concrete backend) |
@@ -443,6 +443,14 @@ HTTP statuses map to kinds in one place, the client's `error_from`. With
 `--json` an error is also printed on stdout as
 `{"error":{"code","message","hint","retryable"}}`, `code` being the kind.
 `docs/CLI.md` is the user-facing list.
+
+**Short ids** ([ADR 0034](adr/0034-short-changeset-ids.md)). A revision
+argument is `@`, a full id, a ref or tag name, or 4 to 64 hex digits of a
+changeset id. The CLI asks `/v1/resolve/{rev}` first, so a ref always wins,
+then `GET /v1/resolve-prefix/{prefix}`, which `Repo::resolve_prefix` answers
+from `MetaStore::changesets_with_prefix`: a bounded range scan of the
+changesets' primary key (the prefix padded with `00` and `ff` bytes). Several
+matches are a 400 listing up to 10 candidates; `leep log` prints 12-digit ids.
 
 **Merge**: three-way, per path, with base = `merge_base(ours, theirs)`.
 Identical changes on both sides merge trivially. Text files merge by line

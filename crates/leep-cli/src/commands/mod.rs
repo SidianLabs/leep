@@ -22,12 +22,13 @@ pub mod search;
 pub mod stash;
 pub mod status;
 
+use leep_core::prefix::looks_like_prefix;
 use leep_core::ChangesetId;
 use serde::Serialize;
 
 use crate::cache::Cache;
 use crate::client::Client;
-use crate::error::{CliError, Result};
+use crate::error::{CliError, ErrorKind, Result};
 use crate::state::WorkCopy;
 
 /// Everything a working-copy command needs.
@@ -99,7 +100,9 @@ pub struct Remote<'a> {
 }
 
 impl Remote<'_> {
-    /// `@` = working copy base; 64-hex = id; otherwise a ref name.
+    /// `@` = working copy base; 64-hex = id; otherwise a ref or tag name,
+    /// then a short id of 4 or more hex digits (ADR 0034). A ref wins over a
+    /// short id that spells the same.
     pub fn resolve(&self, rev: &str) -> Result<ChangesetId> {
         if rev == "@" {
             return self
@@ -111,7 +114,20 @@ impl Remote<'_> {
                 return Ok(id);
             }
         }
-        self.client.resolve(rev)
+        let missing = match self.client.resolve(rev) {
+            Err(e) if e.kind() == ErrorKind::NotFound => e.with_hint(
+                "`leep refs` lists branches and tags, `leep log` shows changeset ids; \
+                 a short id needs at least 4 hex digits",
+            ),
+            other => return other,
+        };
+        if !looks_like_prefix(rev) {
+            return Err(missing);
+        }
+        match self.client.resolve_prefix(rev) {
+            Err(e) if e.kind() == ErrorKind::NotFound => Err(missing),
+            other => other,
+        }
     }
 
     /// Default revision: the working copy base, else the target ref.

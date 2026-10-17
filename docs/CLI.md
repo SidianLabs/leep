@@ -4,6 +4,22 @@
 `leep COMMAND --help` explains one. This page holds what the help cannot: the
 exit codes and the contract scripts and agents can rely on.
 
+## Revisions
+
+Wherever a command takes a revision (`REV`, `FROM TO`, `--rev`, `--source`):
+
+- `@` is the working copy's base changeset;
+- a ref name (`main`, `release/1.0`) or a tag (`tags/v1`, or `v1` when no
+  branch has that name);
+- a changeset id, full (64 hex digits) or short: 4 or more leading digits, in
+  any case, as long as only one changeset starts with them
+  ([ADR 0034](adr/0034-short-changeset-ids.md)). `leep log` and the other
+  commands print 12-digit ids, which work as they are.
+
+A ref wins over a short id that spells the same. An ambiguous short id fails
+with exit 1 and lists the candidates (`--json`: `code: "ambiguous"` and
+`candidates`).
+
 ## Exit codes
 
 Decided in [ADR 0033](adr/0033-cli-exit-codes-and-json-errors.md).

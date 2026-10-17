@@ -500,6 +500,19 @@ step order, so `seq` increases along the chain and each row's `old_target` is
 the previous row's `new_target`. A reader of the log sees the same rows as for
 the same moves made one swap at a time. No `/v1` shape changed.
 
+## Short changeset ids (new endpoint and `MetaStore` method, no format change)
+
+ADR 0034 adds `GET /v1/resolve-prefix/{prefix}` with two response types:
+`ResolvePrefixResponse` `{"id"}` (200, one match) and
+`AmbiguousPrefixResponse` `{"error", "candidates", "truncated"}` (400, several
+matches, at most 10 candidates in ascending order; a superset of
+`ErrorResponse`). No match is 404; a prefix that is not 4 to 64 hex digits is
+400 with `ErrorResponse`. `MetaStore::changesets_with_prefix(prefix, limit)`
+reads the existing `changesets` table: `SELECT id FROM changesets WHERE id >= ?
+AND id <= ? ORDER BY id LIMIT ?`, the bounds being the prefix padded with
+`0x00` and `0xff` bytes (`leep_core::prefix::IdPrefix`). No encoding, hash,
+index or table changed, and no existing `/v1` shape changed.
+
 ## Fenced garbage collection (new derived kinds, no other format change)
 
 ADR 0012 adds the three GC kinds in the table above (`blob-claim-v1` already

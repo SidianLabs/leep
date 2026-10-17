@@ -17,6 +17,7 @@
 //! | GET  | `/v1/reflog?before=seq&limit=n` | – | [`RefLogResponse`] (every ref move, newest first; `limit` defaults to 50, capped at 1000; `before` returns entries with a smaller `seq`) |
 //! | GET  | `/v1/reflog/{name}?before=seq&limit=n` | – | [`RefLogResponse`] (the moves of one ref; an unknown or never-moved ref is an empty list) |
 //! | GET  | `/v1/resolve/{rev}` | – | [`ResolveResponse`] (`rev` = ref name, full 64-hex id or short tag name) |
+//! | GET  | `/v1/resolve-prefix/{prefix}` | – | [`ResolvePrefixResponse`] (the one changeset whose id starts with `prefix`, 4 to 64 hex digits in any case; 404 if none; 400 [`AmbiguousPrefixResponse`] listing up to 10 `candidates` if several; 400 if the prefix is shorter than 4 digits, longer than 64 or not hex; ADR 0034) |
 //! | GET  | `/v1/tree/{id}?path=dir` | – | [`TreeResponse`] (one directory level) |
 //! | GET  | `/v1/files/{id}?prefix=dir` | – | [`FilesResponse`] (recursive listing) |
 //! | GET  | `/v1/file/{id}?path=p` | – | raw bytes + `x-leep-kind` header, or 404 |
@@ -300,6 +301,26 @@ pub struct RefLogResponse {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolveResponse {
     pub id: ChangesetId,
+}
+
+/// Body of `GET /v1/resolve-prefix/{prefix}` when exactly one changeset
+/// matches.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvePrefixResponse {
+    pub id: ChangesetId,
+}
+
+/// The 400 body of `GET /v1/resolve-prefix/{prefix}` when several changesets
+/// match. A superset of [`ErrorResponse`], so clients that only read `error`
+/// still get the message.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AmbiguousPrefixResponse {
+    pub error: String,
+    /// Matching ids, ascending, at most 10.
+    pub candidates: Vec<ChangesetId>,
+    /// More changesets match than `candidates` lists.
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -708,6 +729,29 @@ mod tests {
         );
         let back: RefLogResponse = serde_json::from_value(v).unwrap();
         assert_eq!(back.entries, [e]);
+    }
+
+    #[test]
+    fn prefix_shapes_are_stable() {
+        let id = ChangesetId(Hash::of_blob(b"p"));
+        let v = serde_json::to_value(ResolvePrefixResponse { id }).unwrap();
+        assert_eq!(v, serde_json::json!({ "id": id.to_string() }));
+        let amb = AmbiguousPrefixResponse {
+            error: "ambiguous".into(),
+            candidates: vec![id],
+            truncated: false,
+        };
+        let v = serde_json::to_value(&amb).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({ "error": "ambiguous", "candidates": [id.to_string()], "truncated": false })
+        );
+        // An old client reads it as a plain error.
+        let e: ErrorResponse = serde_json::from_value(v).unwrap();
+        assert_eq!(e.error, "ambiguous");
+        let back: AmbiguousPrefixResponse =
+            serde_json::from_value(serde_json::json!({ "error": "x", "candidates": [] })).unwrap();
+        assert!(!back.truncated);
     }
 
     #[test]

@@ -340,6 +340,16 @@ impl Client {
         Ok(r.id)
     }
 
+    /// The one changeset whose id starts with `prefix`. Several matches are
+    /// an `Ambiguous` error carrying the candidates (ADR 0034).
+    pub fn resolve_prefix(&self, prefix: &str) -> Result<ChangesetId> {
+        let r: ResolvePrefixResponse = self.json(
+            self.http
+                .get(self.url(&format!("/v1/resolve-prefix/{}", enc(prefix)))),
+        )?;
+        Ok(r.id)
+    }
+
     pub fn tree(&self, id: &ChangesetId, path: &str) -> Result<TreeResponse> {
         self.json(
             self.http
@@ -524,6 +534,18 @@ fn error_from(resp: Response, has_token: bool) -> CliError {
         _ => {}
     }
     let body = resp.text().unwrap_or_default();
+    if status == StatusCode::BAD_REQUEST {
+        if let Ok(amb) = serde_json::from_str::<AmbiguousPrefixResponse>(&body) {
+            let mut candidates: Vec<String> =
+                amb.candidates.iter().map(ToString::to_string).collect();
+            if amb.truncated {
+                candidates.push("...".into());
+            }
+            return CliError::new(ErrorKind::Ambiguous, format!("server: {}", amb.error))
+                .with_candidates(candidates)
+                .with_hint("give more digits of the id; the candidates are listed above");
+        }
+    }
     let msg = serde_json::from_str::<ErrorResponse>(&body)
         .map(|e| e.error)
         .unwrap_or_else(|_| body.trim().to_string());

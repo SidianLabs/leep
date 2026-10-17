@@ -166,7 +166,7 @@ pub fn run(ctx: &mut Ctx, args: &MergeArgs) -> Result<i32> {
 }
 
 fn default_message(rev: &str, other: ChangesetId, target_ref: &str) -> String {
-    let name = if rev == "@" || rev.len() == 64 {
+    let name = if rev == "@" || leep_core::prefix::looks_like_prefix(rev) {
         short(other)
     } else {
         rev.to_string()

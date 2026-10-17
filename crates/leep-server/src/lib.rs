@@ -24,7 +24,7 @@ use axum::{Extension, Json, Router};
 use leep_core::api::*;
 use leep_core::rename::RenameOptions;
 use leep_core::{Changeset, ChangesetId, Error, FileKind, Hash, RefUpdateContext, RepoPath};
-use leep_derive::{search, ExtraMatch, LogFilter, Repo, SearchQuery};
+use leep_derive::{search, ExtraMatch, LogFilter, PrefixMatch, Repo, SearchQuery};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use tower_http::limit::RequestBodyLimitLayer;
@@ -199,6 +199,7 @@ pub fn router_with_ready_timeout(
         .route("/v1/reflog", get(ref_log_all))
         .route("/v1/reflog/{*name}", get(ref_log_one))
         .route("/v1/resolve/{*rev}", get(resolve))
+        .route("/v1/resolve-prefix/{prefix}", get(resolve_prefix))
         .route("/v1/tree/{id}", get(tree))
         .route("/v1/files/{id}", get(files))
         .route("/v1/file/{id}", get(file))
@@ -794,6 +795,33 @@ async fn resolve(State(repo): S, Path(rev): Path<String>) -> ApiResult<Json<Reso
     Ok(Json(ResolveResponse {
         id: repo.resolve(&rev).await?,
     }))
+}
+
+/// A short id: 200 with the one match, or 400 listing the candidates.
+async fn resolve_prefix(State(repo): S, Path(prefix): Path<String>) -> ApiResult<Response> {
+    Ok(match repo.resolve_prefix(&prefix).await? {
+        PrefixMatch::One(id) => Json(ResolvePrefixResponse { id }).into_response(),
+        PrefixMatch::Many {
+            candidates,
+            truncated,
+        } => {
+            let count = if truncated {
+                format!("more than {}", candidates.len())
+            } else {
+                candidates.len().to_string()
+            };
+            let body = AmbiguousPrefixResponse {
+                error: format!(
+                    "invalid input: short id {} is ambiguous: it matches {count} changesets; \
+                     give more digits",
+                    prefix.to_ascii_lowercase()
+                ),
+                candidates,
+                truncated,
+            };
+            (StatusCode::BAD_REQUEST, Json(body)).into_response()
+        }
+    })
 }
 
 async fn tree(

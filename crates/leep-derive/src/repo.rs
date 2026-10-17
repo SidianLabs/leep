@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use leep_core::api::ChangesetInfo;
+use leep_core::prefix::IdPrefix;
 use leep_core::refname;
 use leep_core::{
     BlobStore, Changeset, ChangesetId, DerivedRow, Error, FileChange, Hash, MetaStore, RepoPath,
@@ -659,6 +660,43 @@ impl Repo {
         }
         Err(Error::NotFound(format!("revision {rev:?}")))
     }
+
+    /// The changesets whose id starts with `prefix` (4 to 64 hex digits):
+    /// one, or up to [`MAX_PREFIX_CANDIDATES`] when it is ambiguous. No match
+    /// is `NotFound`; a malformed prefix is `Invalid` (ADR 0034).
+    pub async fn resolve_prefix(&self, prefix: &str) -> Result<PrefixMatch> {
+        let p = IdPrefix::parse(prefix)?;
+        let mut found = self
+            .meta
+            .changesets_with_prefix(&p, MAX_PREFIX_CANDIDATES + 1)
+            .await?;
+        match found.len() {
+            0 => Err(Error::NotFound(format!("no changeset id starts with {p}"))),
+            1 => Ok(PrefixMatch::One(found[0])),
+            n => {
+                found.truncate(MAX_PREFIX_CANDIDATES);
+                Ok(PrefixMatch::Many {
+                    candidates: found,
+                    truncated: n > MAX_PREFIX_CANDIDATES,
+                })
+            }
+        }
+    }
+}
+
+/// Most candidates an ambiguous short id reports.
+pub const MAX_PREFIX_CANDIDATES: usize = 10;
+
+/// What a short id resolves to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PrefixMatch {
+    One(ChangesetId),
+    /// Several matches, ascending; `truncated` when there were more than
+    /// [`MAX_PREFIX_CANDIDATES`].
+    Many {
+        candidates: Vec<ChangesetId>,
+        truncated: bool,
+    },
 }
 
 #[cfg(test)]

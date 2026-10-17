@@ -122,8 +122,14 @@ pub struct BlameArgs {
     pub who: bool,
 }
 
-fn header(info: &ChangesetInfo) {
-    println!("changeset {}", info.id);
+/// `abbreviate` prints the 12-digit short id, which every command accepts
+/// back; `--json` always has the full id.
+fn header(info: &ChangesetInfo, abbreviate: bool) {
+    if abbreviate {
+        println!("changeset {}", short(info.id));
+    } else {
+        println!("changeset {}", info.id);
+    }
     println!("Author: {}", info.changeset.author);
     println!("Date:   {}", utc_time(info.changeset.timestamp));
     for (k, v) in &info.changeset.extra {
@@ -159,7 +165,7 @@ pub fn log(r: &Remote, args: &LogArgs) -> Result<i32> {
         return Ok(0);
     }
     for info in &resp.entries {
-        header(info);
+        header(info, true);
         println!();
     }
     Ok(0)
@@ -172,7 +178,7 @@ pub fn last_change(r: &Remote, args: &LastChangeArgs) -> Result<i32> {
         print_json(&resp)?;
         return Ok(0);
     }
-    header(&resp.changeset);
+    header(&resp.changeset, false);
     for c in &resp.concurrent {
         println!("also changed concurrently in {c}");
     }
@@ -189,7 +195,7 @@ pub fn show(r: &Remote, args: &ShowArgs) -> Result<i32> {
     for p in &info.changeset.parents {
         println!("parent {p}");
     }
-    header(&info);
+    header(&info, false);
     // Older servers lack the endpoint; a changeset is still worth showing.
     if let Ok(sigs) = r.client.signatures(&id) {
         for line in signature_lines(&sigs) {

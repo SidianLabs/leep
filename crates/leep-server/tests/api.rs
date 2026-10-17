@@ -1362,3 +1362,51 @@ async fn old_cas_bodies_without_log_fields_still_work() {
     let log: RefLogResponse = c.get("/v1/reflog/old").await.json();
     assert_eq!(log.entries[0].operation, "cas");
 }
+
+#[tokio::test]
+async fn resolve_prefix_finds_one_lists_many_and_rejects_bad_input() {
+    let c = Client::new();
+    // Commit until two ids share their first four hex digits.
+    let mut by_prefix: BTreeMap<String, ChangesetId> = BTreeMap::new();
+    let (a, b) = loop {
+        let id = c
+            .commit(&[], &[], &format!("prefix {}", by_prefix.len()))
+            .await;
+        if let Some(other) = by_prefix.insert(id.to_string()[..4].to_string(), id) {
+            break (other.min(id), other.max(id));
+        }
+    };
+
+    let hex = a.to_string();
+    for short in [&hex[..12], &hex[..5], &hex[..64]] {
+        let r = c.get(&format!("/v1/resolve-prefix/{short}")).await;
+        assert_eq!(r.status, StatusCode::OK, "{short}");
+        assert_eq!(r.json::<ResolvePrefixResponse>().id, a);
+    }
+    let upper = hex[..12].to_uppercase();
+    let r = c.get(&format!("/v1/resolve-prefix/{upper}")).await;
+    assert_eq!(r.json::<ResolvePrefixResponse>().id, a, "any case");
+
+    let r = c.get(&format!("/v1/resolve-prefix/{}", &hex[..4])).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    let amb: AmbiguousPrefixResponse = r.json();
+    assert_eq!(amb.candidates, [a, b]);
+    assert!(!amb.truncated);
+    assert!(amb.error.contains("ambiguous"), "{}", amb.error);
+    // Clients that know only ErrorResponse still read the message.
+    assert!(r.json::<ErrorResponse>().error.contains("ambiguous"));
+
+    let absent = (0u32..)
+        .map(|n| format!("{n:06x}"))
+        .find(|p| !by_prefix.keys().any(|k| p.starts_with(k.as_str())))
+        .unwrap();
+    let r = c.get(&format!("/v1/resolve-prefix/{absent}")).await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
+
+    for bad in ["abc", "zzzz", "12g4", &"a".repeat(65)] {
+        let r = c.get(&format!("/v1/resolve-prefix/{bad}")).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{bad}");
+        let e: ErrorResponse = r.json();
+        assert!(e.error.contains("short id"), "{bad}: {}", e.error);
+    }
+}
