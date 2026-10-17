@@ -3,15 +3,17 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use leep_cli::error::{CliError, ErrorKind};
 use leep_core::api::{Conflict, FileInfo, LandRequest, LandResponse};
 use leep_core::changeset::{
     EXTRA_AGENT_MODEL, EXTRA_AGENT_PROMPT, EXTRA_AGENT_SESSION, EXTRA_AGENT_TESTS,
 };
+use leep_core::refname::MISSING_REF_MARKER;
 use leep_core::{Changeset, ChangesetId, FileChange, FileKind, Hash, RepoPath};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::{as_text, parse_args, truncate, ToolError, ToolOutput, ToolResult};
+use super::{as_text, parse_args, truncate, ToolError, ToolOutput, ToolResult, DEFAULT_REF};
 use crate::Server;
 
 /// Per-side cap for text shown in a conflict report.
@@ -23,6 +25,8 @@ struct Args {
     changes: Vec<Edit>,
     base: Option<String>,
     target_ref: Option<String>,
+    #[serde(default)]
+    create_ref: bool,
     prompt: Option<String>,
     tests: Option<String>,
 }
@@ -152,12 +156,7 @@ impl Server {
             extra,
         };
         let created = self.client.create_changeset(&cs)?;
-        // No `create`: the tool keeps creating a missing ref, as before.
-        let resp = self.client.land(&LandRequest {
-            changeset: created,
-            target_ref: target_ref.clone(),
-            create: None,
-        })?;
+        let resp = self.land_creating(created, &target_ref, a.create_ref)?;
         match resp {
             LandResponse::Landed {
                 landed,
@@ -196,6 +195,42 @@ impl Server {
             .into_iter()
             .find(|f| &f.path == path)
             .map(|f| f.kind))
+    }
+
+    /// Land, creating the ref only when asked to or on the first land onto
+    /// `main` of an empty repository, like `leep land` (ADR 0036).
+    fn land_creating(
+        &self,
+        changeset: ChangesetId,
+        target_ref: &str,
+        create: bool,
+    ) -> Result<LandResponse, ToolError> {
+        let land = |create: bool| {
+            self.client.land(&LandRequest {
+                changeset,
+                target_ref: target_ref.to_string(),
+                create: Some(create),
+            })
+        };
+        match land(create) {
+            Err(e) if missing_ref(&e) => {
+                if target_ref == DEFAULT_REF {
+                    let refs = self.client.refs()?.refs;
+                    if refs.is_empty() {
+                        return Ok(land(true)?);
+                    }
+                    // Another client's first land got there in between.
+                    if refs.contains_key(DEFAULT_REF) {
+                        return Ok(land(false)?);
+                    }
+                }
+                Err(ToolError(format!(
+                    "ref `{target_ref}` does not exist and nothing was landed. Check the name \
+                     with leep_refs, or call again with create_ref:true to create it."
+                )))
+            }
+            other => Ok(other?),
+        }
     }
 
     fn conflict_report(
@@ -262,4 +297,9 @@ impl Server {
             }
         })
     }
+}
+
+/// A land refused because the ref does not exist and may not be created.
+fn missing_ref(e: &CliError) -> bool {
+    e.kind() == ErrorKind::NotFound && e.message().contains(MISSING_REF_MARKER)
 }

@@ -45,7 +45,7 @@ Logs go to stderr; stdout carries protocol messages only.
 
 ## Tools
 
-`rev` is a branch name (default `main`), a tag (`tags/v1`, or `v1` when no branch has that name) or a full 64-hex changeset id.
+`rev` is a branch name (default `main`), a tag (`tags/v1`, or `v1` when no branch has that name), a full 64-hex changeset id, or a unique prefix of one of at least 4 hex digits (ADR 0035; a ref wins over a prefix that spells the same).
 
 | Tool | Arguments | Result |
 |---|---|---|
@@ -58,7 +58,7 @@ Logs go to stderr; stdout carries protocol messages only.
 | `leep_blame` | `rev?`, `path` | per-line changeset and author |
 | `leep_search` | `query`, `rev?`, `regex?`, `case_insensitive?`, `path?`, `glob?`, `limit?` (default 50, max 200) | matching lines `{path, line_number, line, ranges}` ordered by path then line, `truncated`, `stats`; per line, UTF-8 text files up to 1 MiB (others counted in `stats.files_skipped`) |
 | `leep_review_status` | `rev`, `ref?` (default `main`) | per changed path: the rule that satisfies it (`auto:*`, `owner`, `merge_parent`) or `pending` / `rejected`, with owners and who approved or rejected, plus `approved`, `blocked_paths` and `next_step`; needs a server with authentication |
-| `leep_commit_and_land` | `message`, `changes[]`, `base?`, `target_ref?`, `prompt?`, `tests?` | landed id, or a conflict report |
+| `leep_commit_and_land` | `message`, `changes[]`, `base?`, `target_ref?`, `create_ref?`, `prompt?`, `tests?` | landed id, or a conflict report |
 
 Data tools return JSON as text and as `structuredContent`; file and diff
 tools return plain text. Failures (bad arguments, 401, 403, 404, unreachable
@@ -95,6 +95,11 @@ revision the agent read the files from (default: head of `target_ref`, which
 defaults to `main`). The tool uploads missing blobs, creates one changeset
 with `agent.*` provenance, and lands it. If `main` moved and the edits do not
 overlap, the server rebases automatically (`rebased: true`).
+
+Landing onto a ref that does not exist fails (`isError: true`, nothing landed)
+unless `create_ref: true` is given, so a mistyped `target_ref` cannot create a
+new ref (ADR 0036). The first land onto `main` of an empty repository creates
+it without the flag, as `leep land` does.
 
 On overlapping edits nothing lands, `main` is unchanged, and the result
 (`isError: true`, `status: "conflict"`) contains:

@@ -413,14 +413,15 @@ fn review_status_reports_owners_and_blocked_paths() {
     // main requires review, so the agent lands on a topic ref and asks.
     let r = commit(
         &agent,
-        json!({ "message": "seed", "target_ref": "topic",
+        json!({ "message": "seed", "target_ref": "topic", "create_ref": true,
                 "changes": [{ "path": "OWNERS", "content": "alice\n" },
                             { "path": "a.rs", "content": "fn a() {}\n" }] }),
     );
     let seed = data(&r)["landed"].as_str().unwrap().to_string();
     let r = commit(
         &agent,
-        json!({ "message": "seed main", "changes": [{ "path": "a.rs", "content": "x" }] }),
+        json!({ "message": "seed main", "create_ref": true,
+                "changes": [{ "path": "a.rs", "content": "x" }] }),
     );
     assert_eq!(r["isError"], true);
     assert!(text(&r).contains("needs review"), "{}", text(&r));
@@ -637,4 +638,68 @@ fn renames_in_diff_and_follow_in_log() {
         let r = call(&s, "leep_log", args);
         assert_eq!(r["isError"], true);
     }
+}
+
+#[test]
+fn landing_onto_a_missing_ref_needs_create_ref() {
+    let s = Server::new(config(&start_server()));
+    // First land onto main of an empty repository creates it unasked.
+    let r = commit(
+        &s,
+        json!({ "message": "root", "changes": [{ "path": "a.txt", "content": "a\n" }] }),
+    );
+    assert_eq!(data(&r)["status"], "landed");
+
+    // A mistyped ref is an error, and nothing is created.
+    let r = commit(
+        &s,
+        json!({ "message": "typo", "target_ref": "mian",
+                "changes": [{ "path": "b.txt", "content": "b\n" }] }),
+    );
+    assert_eq!(r["isError"], true);
+    assert!(text(&r).contains("create_ref"), "{}", text(&r));
+    let refs = data(&call(&s, "leep_refs", json!({})));
+    assert!(refs["refs"].get("mian").is_none(), "{refs}");
+
+    // Asked for, the ref is created.
+    let r = commit(
+        &s,
+        json!({ "message": "topic", "target_ref": "topic", "create_ref": true,
+                "changes": [{ "path": "b.txt", "content": "b\n" }] }),
+    );
+    let landed = data(&r)["landed"].as_str().unwrap().to_string();
+    let refs = data(&call(&s, "leep_refs", json!({})));
+    assert_eq!(refs["refs"]["topic"], landed.as_str());
+
+    // An existing ref needs no flag.
+    let r = commit(
+        &s,
+        json!({ "message": "more", "target_ref": "topic",
+                "changes": [{ "path": "c.txt", "content": "c\n" }] }),
+    );
+    assert_eq!(data(&r)["status"], "landed");
+}
+
+#[test]
+fn short_ids_resolve_in_read_tools() {
+    let s = Server::new(config(&start_server()));
+    let r = commit(
+        &s,
+        json!({ "message": "root", "changes": [{ "path": "a.txt", "content": "short\n" }] }),
+    );
+    let id = data(&r)["landed"].as_str().unwrap().to_string();
+
+    let shown = data(&call(&s, "leep_show", json!({ "rev": &id[..8] })));
+    assert_eq!(shown["id"], id.as_str());
+    let file = call(
+        &s,
+        "leep_read_file",
+        json!({ "rev": &id[..12], "path": "a.txt" }),
+    );
+    assert!(text(&file).contains("short"), "{}", text(&file));
+
+    // Too short to be an id and not a ref: a clear error.
+    let r = call(&s, "leep_show", json!({ "rev": &id[..3] }));
+    assert_eq!(r["isError"], true);
+    assert!(text(&r).contains("prefix"), "{}", text(&r));
 }

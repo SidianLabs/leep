@@ -5,7 +5,8 @@
 mod commit;
 mod read;
 
-use leep_cli::error::CliError;
+use leep_cli::error::{CliError, ErrorKind};
+use leep_core::prefix::looks_like_prefix;
 use leep_core::ChangesetId;
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
@@ -16,7 +17,7 @@ use crate::Server;
 pub const MAX_TEXT_BYTES: usize = 256 * 1024;
 /// Largest file the diff tool will fetch, per side.
 pub const MAX_DIFF_FILE_BYTES: u64 = 1024 * 1024;
-const DEFAULT_REF: &str = "main";
+pub(super) const DEFAULT_REF: &str = "main";
 
 #[derive(Debug)]
 pub struct ToolError(pub String);
@@ -116,17 +117,29 @@ pub fn truncate(s: &str, max: usize) -> (&str, bool) {
 }
 
 impl Server {
-    /// Resolve a ref name or full id; empty or absent means `main`.
+    /// Resolve a ref name, full id or short id (4 or more hex digits, ADR
+    /// 0035); empty or absent means `main`. A ref wins over a short id that
+    /// spells the same, as in the CLI.
     pub(crate) fn resolve_rev(&self, rev: Option<&str>) -> Result<ChangesetId, ToolError> {
         let rev = rev
             .map(str::trim)
             .filter(|r| !r.is_empty())
             .unwrap_or(DEFAULT_REF);
-        self.client.resolve(rev).map_err(|e| {
+        let fail = |e: CliError| {
             ToolError(format!(
-                "cannot resolve rev `{rev}`: {e}. Use a ref name from leep_refs or a full 64-hex changeset id."
+                "cannot resolve rev `{rev}`: {e}. Use a ref name from leep_refs, a changeset id, \
+                 or a unique prefix of one (at least 4 hex digits)."
             ))
-        })
+        };
+        match self.client.resolve(rev) {
+            Err(e) if e.kind() == ErrorKind::NotFound && looks_like_prefix(rev) => {
+                match self.client.resolve_prefix(rev) {
+                    Err(p) if p.kind() == ErrorKind::NotFound => Err(fail(e)),
+                    other => other.map_err(fail),
+                }
+            }
+            other => other.map_err(fail),
+        }
     }
 
     pub(crate) fn blob(&self, hash: &leep_core::Hash) -> Result<Vec<u8>, ToolError> {
@@ -337,7 +350,8 @@ pub fn definitions() -> Vec<Value> {
              non-overlapping changes are merged automatically. On conflict NOTHING is landed and the \
              result lists each conflicting path with base/ours/theirs text; resolve them and call \
              again with base set to the reported `onto` id, including all your changes (clean \
-             paths too). Text files only.",
+             paths too). Landing onto a ref that does not exist needs create_ref:true. Text \
+             files only.",
             json!({
                 "type": "object",
                 "properties": {
@@ -359,6 +373,7 @@ pub fn definitions() -> Vec<Value> {
                     },
                     "base": { "type": "string", "description": "Revision the changes are based on. Default: head of target_ref." },
                     "target_ref": { "type": "string", "description": "Ref to land on (default `main`)." },
+                    "create_ref": { "type": "boolean", "description": "Create target_ref if it does not exist (default false, so a mistyped ref is an error). The first land onto `main` of an empty repository creates it without this." },
                     "prompt": { "type": "string", "description": "The request that led to this change, recorded as provenance." },
                     "tests": { "type": "string", "description": "Tests run and their results, recorded as provenance." }
                 },
