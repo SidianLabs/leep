@@ -213,17 +213,17 @@ fn repack_beside_a_server_changes_no_answer() {
     verify_clean(&stores, "after the second repack");
     drop(server);
 
-    // Blob stores that are not on the filesystem are refused, clearly.
+    // Blob stores with nowhere to keep packs are refused, clearly.
     let out = server_cmd(
         &Stores {
             meta: stores.meta.clone(),
-            blobs: "s3://bucket?region=us-east-1".into(),
+            blobs: "mem://".into(),
         },
         &["repack"],
     );
     assert!(!out.status.success());
     assert!(
-        stderr(&out).contains("filesystem blob stores"),
+        stderr(&out).contains("is neither"),
         "{}",
         stderr(&out)
     );
