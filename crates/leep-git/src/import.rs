@@ -317,7 +317,7 @@ pub async fn import(
     rev: &str,
     opts: &ImportOptions,
 ) -> Result<ImportReport> {
-    let ts = gix::open(git_dir).map_err(gerr)?.into_sync();
+    let ts = crate::open_git(git_dir)?.into_sync();
     let head = {
         let g = ts.to_thread_local();
         let obj = g

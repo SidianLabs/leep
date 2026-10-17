@@ -33,6 +33,27 @@ pub const EXTRA_GIT_ENCODING: &str = "git.encoding";
 /// not round-trip to the same sha.
 pub const EXTRA_GIT_HEADERS: &str = "git.extra_headers";
 
+/// Largest single object the bridge reads from git. gix caps allocations
+/// at 16 MiB when it opens a repository owned by another user (reduced
+/// trust), which rejects real blobs such as the firmware files in Linux; the
+/// operator chose this repository, so allow what git itself handles.
+pub(crate) const GIT_ALLOC_LIMIT: usize = 4 << 30;
+
+/// Open a git repository with [`GIT_ALLOC_LIMIT`] instead of gix's
+/// reduced-trust fallback.
+pub(crate) fn open_git(git_dir: &std::path::Path) -> leep_core::Result<gix::Repository> {
+    open_git_with(git_dir, gix::open::Options::default())
+}
+
+pub(crate) fn open_git_with(
+    git_dir: &std::path::Path,
+    options: gix::open::Options,
+) -> leep_core::Result<gix::Repository> {
+    let options =
+        options.config_overrides([format!("gitoxide.objects.allocLimit={GIT_ALLOC_LIMIT}")]);
+    gix::open_opts(git_dir, options).map_err(gerr)
+}
+
 pub(crate) fn gerr(e: impl std::fmt::Display) -> Error {
     Error::Other(format!("git: {e}"))
 }
@@ -102,5 +123,31 @@ pub(crate) fn parse_tz(s: &str) -> i32 {
         -v
     } else {
         v
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A repository opened with reduced trust (as for a checkout owned by
+    /// another user) still reads objects above gix's 16 MiB fallback.
+    #[test]
+    fn reduced_trust_reads_large_objects() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = gix::init_bare(dir.path()).unwrap();
+        let big = vec![b'x'; 17 << 20];
+        let id = repo.write_blob(&big).unwrap().detach();
+        drop(repo);
+
+        let reduced = gix::open::Options::default().with(gix::sec::Trust::Reduced);
+        let plain = gix::open_opts(dir.path(), reduced.clone()).unwrap();
+        assert!(
+            plain.find_object(id).is_err(),
+            "gix's fallback limit no longer applies"
+        );
+
+        let ours = open_git_with(dir.path(), reduced).unwrap();
+        assert_eq!(ours.find_object(id).unwrap().data.len(), big.len());
     }
 }
