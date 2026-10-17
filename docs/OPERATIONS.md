@@ -558,48 +558,74 @@ loose, 4.2 MB packed with its index) and the store holds a handful of files
 instead of one per object. New writes stay loose until the next repack.
 
 ```sh
-leep-server repack                    # pack, wait --fence, delete what the pack replaces
+leep-server repack                    # loose objects into a new pack; merge small packs (ADR 0039)
+leep-server repack --full             # every live object into one pack
 leep-server repack --level 19         # smaller and slower (zstd level 1..22, default 9)
 leep-server repack --json             # the report as JSON
 ```
 
 It uses the same `--meta` and `--blobs` as the server and runs beside running
-servers: it walks every changeset for delta bases, writes and publishes one
-new pack holding every live object (loose and already packed), waits
-`--fence` (default 10m, the same rule as `gc --fence`: longer than the
-servers' `--request-timeout` plus clock skew), then deletes the loose copies
-and the old packs. `--fence 0` is refused unless `--unsafe-no-fence` is
-given, which is only valid with every server stopped. Filesystem blob
-stores (`file://` or a path) and object stores (`s3://`) can be packed; a
-`mem://` store is refused.
+servers. By default it is incremental. It walks back from every ref only as
+far as the history whose objects are still loose, writes and publishes a new
+pack holding the loose objects, and leaves existing packs alone, except that
+it folds in small packs so the count stays low. It then waits `--fence`
+(default 10m, the same rule as `gc --fence`: longer than the servers'
+`--request-timeout` plus clock skew) and deletes the loose copies and any
+packs it merged. `--fence 0` is refused unless `--unsafe-no-fence` is given,
+which is only valid with every server stopped. Filesystem blob stores
+(`file://` or a path) and object stores (`s3://`) can be packed; a `mem://`
+store is refused. Object stores are always packed in full for now (ADR 0040).
+
+The merge rule (`--geometric 2 --max-packs 8`, the defaults): packs whose
+sizes in objects already grow by a factor of 2 stay, and the smaller ones are
+merged into the new pack, as `git repack --geometric` does. Then the smallest
+packs are merged until at most `--max-packs` remain. A merge copies the
+merged packs' compressed entries as they are, so it costs about a read of
+those packs. The report's `packs_merged`, `frames_reused` and `packs_after`
+show what it did.
+
+`--full` walks every changeset, recompresses where a base changed, and
+writes one pack of every live object. It is the only mode that drops objects
+GC deleted from packs it would otherwise keep, and the only one that writes
+the first new version of each file as a delta. An incremental run writes it
+whole, because its base is in an older pack. A store kept only by
+incremental runs is larger: 51% more pack bytes in the ADR 0039 measurement.
+A full repack reuses unchanged entries too, but its walk is linear in the
+history: 15 s at 12,000 commits of a synthetic history, against about 0.4 s
+for an incremental run over 100 new commits.
 
 The report counts loose objects and packs before, the new pack's size, how
-many objects were stored as deltas and how many whole, objects dropped
-because GC had deleted them, and what is left loose (objects uploaded during
-the repack), with the time spent walking, writing, fencing and cleaning up.
-Only one repack runs at a time per store (a second one exits with "another
-repack is running"). Killing it is safe at any point: the store stays
-readable, and the next run deletes the leftovers and finishes.
+many objects were stored as deltas and how many whole, how many were copied
+from merged packs without recompressing, objects dropped because GC had
+deleted them, and what is left loose (objects uploaded during the repack). It
+also gives the time spent walking, writing, fencing and cleaning up. Only one
+repack runs at a time per store (a second one exits with "another repack is
+running"). Killing it is safe at any point: the store stays readable, and
+the next run deletes the leftovers and finishes.
 
-When to run it: after a large import, and then on a schedule. Each run
-rewrites the whole store (phase 2 of ADR 0029 has no incremental mode), so
-daily suits stores up to a few GB and weekly suits larger ones. Run it after
-`gc` so the deleted objects are dropped from the new pack:
+When to run it: after a large import, then incremental runs often and a full
+one rarely. The incremental run's cost follows the new history, so daily or
+hourly both suit. Run `--full` weekly to monthly, depending on how much
+GC deletes and how much the pack bytes grow between full runs. Run both after
+`gc`, so deleted objects are dropped:
 
 ```cron
-# 03:17 daily: collect garbage; 04:37 daily: repack
+# 03:17 daily: collect garbage; 04:37 daily: incremental repack; Sunday 05:07: full repack
 17 3 * * *  leep-server gc
 37 4 * * *  leep-server repack
+7 5 * * 0   leep-server repack --full
 ```
+The daily and weekly jobs may collide; the second one exits with "another
+repack is running" and the next day's run picks up.
 
 GC and repack may overlap; a blob GC deletes during a repack stays deleted.
-GC deletes a packed blob by appending a line to `packs/tombstones`; the next
-full repack leaves those blobs out and empties the file. Reads of packed blobs
-decode a delta chain (at most 32 entries), which the store's cache of decoded
-objects and the server's blob cache absorb; [PERFORMANCE.md](PERFORMANCE.md)
-has the measured latencies. Backups copy packed blobs as loose ones into the
-backup pool, so restoring a packed store gives a loose one; run `repack` on it
-afterwards.
+GC deletes a packed blob by appending a line to `packs/tombstones`. A repack
+leaves those blobs out of every pack it writes, and drops the lines of the
+packs it replaces. Reads of packed blobs decode a delta chain (at most 32
+entries), which the store's cache of decoded objects and the server's blob
+cache absorb; [PERFORMANCE.md](PERFORMANCE.md) has the measured latencies.
+Backups copy packs as files into the backup pool (ADR 0039; see "Backup and
+restore"), so restoring a packed store gives a packed store.
 
 Do not delete anything under `packs/` by hand, and do not delete
 `.repack-*` files in the shard directories: each is a whole object that the
@@ -893,9 +919,19 @@ both stores:
   drill measures both on your data; figures from a modest store are in
   [PERFORMANCE.md](PERFORMANCE.md). Blob bytes over your network dominate on
   large stores.
+- **Packed sources** (ADR 0039). When the source and the pool both keep
+  packs (filesystem or `s3://`), `backup` copies each new pack and its
+  index as files, checked against the hash the index records, then copies
+  the loose objects one by one as before. The pool stays about the size of
+  the packed source, and an unchanged store copies nothing. A pool pack that
+  the source merged away is deleted once other pool packs hold every object
+  it held (`packs_pruned` in the manifest). `restore` copies the packs back
+  first, so a packed store restores packed. Pools from before this change
+  (all loose) restore as they always did; later backups add packs beside
+  their loose objects.
 - **Retention.** A snapshot directory is self-contained apart from the pool, so
   deleting old directories under `snapshots/` is safe. The pool is shared and
-  only grows: to reclaim space, start a new pool (`--out` a new directory) every
+  its set of objects only grows: to reclaim space, start a new pool (`--out` a new directory) every
   few months and delete the old directory once its newest snapshot is older than
   your retention. Keep at least the last few snapshots and one that is a few
   weeks old: a corruption noticed late is only recoverable from a snapshot from
@@ -1055,8 +1091,10 @@ names the backend, the seed and the round, then the invariant that broke
 in the test's temporary directory (`server-*.log`), which is removed when the
 test ends, so rerun with the seed and read the output of the failing round.
 
-**Repack** (ADR 0029). `cargo test -p leep-store pack_tests` aborts a repack
-at every step (`a_repack_killed_at_any_step_leaves_a_readable_store`) and
+**Repack** (ADR 0029, ADR 0039). `cargo test -p leep-store pack_tests` aborts
+a full and an incremental repack at every step
+(`a_repack_killed_at_any_step_leaves_a_readable_store`,
+`an_incremental_repack_killed_at_any_step_leaves_a_readable_store`) and
 checks every object still reads before and after the next repack;
 `cargo test -p leep-e2e --test repack` SIGKILLs the real `leep-server repack`
 while it writes, after it publishes and during its cleanup, and checks that

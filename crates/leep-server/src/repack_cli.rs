@@ -1,6 +1,8 @@
-//! `leep-server repack` (ADR 0029, ADR 0040): pack every live object of a
-//! filesystem or object store (`s3://`) blob store into one new pack,
-//! compressing each file version against the previous one at its path and
+//! `leep-server repack` (ADR 0029, ADR 0039, ADR 0040): pack the loose
+//! objects of a filesystem blob store into a new pack, merging small packs
+//! so their count stays low, or with `--full` pack every live object into
+//! one pack. An object store (`s3://`) is always packed in full for now.
+//! Each file version is compressed against the previous one at its path and
 //! each tree node against the same directory in the first parent. Safe
 //! beside running servers: the old layout stays readable until a fence after
 //! the new pack is published.
@@ -13,11 +15,25 @@ use clap::Args;
 use leep_core::BlobStore;
 use leep_derive::Repo;
 use leep_store::{
-    FsBlobStore, ObjectBlobStore, PublishedObjectPack, PublishedPack, RepackOptions, RepackReport,
+    FsBlobStore, ObjectBlobStore, PublishedObjectPack, PublishedPack, RepackMode, RepackOptions,
+    RepackReport,
 };
 
 #[derive(Args)]
 pub struct RepackArgs {
+    /// Pack every live object, loose and packed, into one pack, walking all
+    /// of history for delta bases. Drops objects GC deleted from packs.
+    /// Without it, only loose objects are packed and the walk covers only
+    /// the history they belong to. Object stores always pack in full.
+    #[arg(long)]
+    full: bool,
+    /// Merge packs until each is at least this many times the size (in
+    /// objects) of the next smaller one, like `git repack --geometric`.
+    #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u64).range(2..), conflicts_with = "full")]
+    geometric: u64,
+    /// Then merge the smallest packs until at most this many remain.
+    #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u64).range(1..), conflicts_with = "full")]
+    max_packs: u64,
     /// zstd compression level, 1 (fast) to 22 (small).
     #[arg(long, default_value_t = 9, value_parser = clap::value_parser!(i32).range(1..=22))]
     level: i32,
@@ -98,16 +114,31 @@ pub async fn run_repack(meta: &str, blobs: &str, args: RepackArgs) -> anyhow::Re
     let started = Instant::now();
     let meta = super::open_meta(meta).await.context("opening meta store")?;
     let repo = Repo::new(target.blob_store(), meta);
-    tracing::info!("walking history for delta bases");
-    let order = leep_derive::pack_order::pack_order(&repo).await?;
+    let mode = match &target {
+        Target::Fs(_) if !args.full => RepackMode::Incremental {
+            factor: args.geometric,
+            max_packs: args.max_packs as usize,
+        },
+        _ => RepackMode::Full,
+    };
+    tracing::info!(?mode, "walking history for delta bases");
+    let order = match &target {
+        Target::Fs(s) if mode != RepackMode::Full => {
+            let s = s.clone();
+            leep_derive::pack_order::pack_order_loose(&repo, &move |h| s.is_loose(h)).await?
+        }
+        _ => leep_derive::pack_order::pack_order(&repo).await?,
+    };
     let walked = started.elapsed();
     tracing::info!(
         changesets = order.changesets,
         objects = order.objects.len(),
         "writing the pack"
     );
+    let full = mode == RepackMode::Full;
     let opts = RepackOptions {
         level: args.level,
+        mode,
         ..RepackOptions::default()
     };
     let published = target.publish(order.objects, opts).await?;
@@ -125,9 +156,9 @@ pub async fn run_repack(meta: &str, blobs: &str, args: RepackArgs) -> anyhow::Re
         total,
     };
     if args.json {
-        println!("{}", json(&report, order.changesets, &timing));
+        println!("{}", json(&report, full, order.changesets, &timing));
     } else {
-        print_report(&report, order.changesets, &timing);
+        print_report(&report, full, order.changesets, &timing);
     }
     Ok(())
 }
@@ -140,19 +171,22 @@ struct Timing {
     total: Duration,
 }
 
-fn json(r: &RepackReport, changesets: u64, t: &Timing) -> serde_json::Value {
+fn json(r: &RepackReport, full: bool, changesets: u64, t: &Timing) -> serde_json::Value {
     serde_json::json!({
+        "mode": if full { "full" } else { "incremental" },
         "changesets": changesets,
         "loose_before": r.loose_before,
         "loose_bytes_before": r.loose_bytes_before,
         "packs_before": r.packs_before,
         "packed_before": r.packed_before,
         "pack_bytes_before": r.pack_bytes_before,
+        "packs_merged": r.packs_merged,
         "pack_id": r.pack_id,
         "objects": r.objects,
         "logical_bytes": r.logical_bytes,
         "deltas": r.deltas,
         "whole": r.whole,
+        "frames_reused": r.frames_reused,
         "pack_bytes": r.pack_bytes,
         "index_bytes": r.index_bytes,
         "dropped_tombstoned": r.dropped_tombstoned,
@@ -164,6 +198,7 @@ fn json(r: &RepackReport, changesets: u64, t: &Timing) -> serde_json::Value {
         "loose_removed": r.loose_removed,
         "loose_kept": r.loose_kept,
         "old_packs_removed": r.old_packs_removed,
+        "packs_after": r.packs_after,
         "loose_after": r.loose_after,
         "loose_bytes_after": r.loose_bytes_after,
         "seconds": {
@@ -176,7 +211,15 @@ fn json(r: &RepackReport, changesets: u64, t: &Timing) -> serde_json::Value {
     })
 }
 
-fn print_report(r: &RepackReport, changesets: u64, t: &Timing) {
+fn print_report(r: &RepackReport, full: bool, changesets: u64, t: &Timing) {
+    println!(
+        "mode: {}",
+        if full {
+            "full"
+        } else {
+            "incremental (loose objects, merging packs by the geometric rule)"
+        }
+    );
     println!("changesets walked: {changesets}");
     println!(
         "before: {} loose objects ({} bytes), {} packs ({} objects, {} bytes)",
@@ -192,6 +235,10 @@ fn print_report(r: &RepackReport, changesets: u64, t: &Timing) {
     println!(
         "objects packed: {} ({} bytes uncompressed): {} as delta, {} whole",
         r.objects, r.logical_bytes, r.deltas, r.whole
+    );
+    println!(
+        "packs merged into it: {}; packed objects copied without recompressing: {}",
+        r.packs_merged, r.frames_reused
     );
     println!("dropped (deleted by gc): {}", r.dropped_tombstoned);
     if r.late_tombstones > 0 {
@@ -219,7 +266,10 @@ fn print_report(r: &RepackReport, changesets: u64, t: &Timing) {
         "loose copies deleted: {}, kept (written again meanwhile): {}",
         r.loose_removed, r.loose_kept
     );
-    println!("old packs deleted: {}", r.old_packs_removed);
+    println!(
+        "old packs deleted: {}, packs now: {}",
+        r.old_packs_removed, r.packs_after
+    );
     println!(
         "after: {} loose objects ({} bytes), pack {} bytes",
         r.loose_after, r.loose_bytes_after, r.pack_bytes

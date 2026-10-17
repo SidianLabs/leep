@@ -191,17 +191,37 @@ fn repack_beside_a_server_changes_no_answer() {
     assert_eq!(checkout(&client, work, "co-live"), files);
     verify_clean(&stores, "after the first repack");
 
-    // New work lands loose beside the pack; a second full repack folds both
-    // into one new pack and deletes the old one.
+    // New work lands loose beside the pack. The default (incremental)
+    // repack walks only the new changeset and packs only its objects into a
+    // second pack, leaving the first alone.
     write(&wc, "src/lib.rs", &format!("{BODY}// after the repack\n"));
     client.ok(&wc, &["commit", "-m", "after repack"]);
     client.ok(&wc, &["land"]);
     let after_work = answers(&client, &wc);
-    assert!(loose(&stores) > 0);
+    let new_loose = loose(&stores) as u64;
+    assert!(new_loose > 0);
+    let first_pack = pack_files(&stores);
     let r2 = repack(&stores, &[]);
-    assert_eq!(r2["packs_before"], 1, "{r2}");
-    assert_eq!(r2["old_packs_removed"], 1, "{r2}");
+    assert_eq!(r2["mode"], "incremental", "{r2}");
+    assert_eq!(r2["changesets"], 1, "{r2}");
+    assert_eq!(r2["objects"].as_u64().unwrap(), new_loose, "{r2}");
+    assert_eq!(
+        (r2["packs_merged"].as_u64(), r2["packs_after"].as_u64()),
+        (Some(0), Some(2)),
+        "{r2}"
+    );
     assert_eq!(loose(&stores), 0);
+    assert_eq!(pack_files(&stores).len(), 4);
+    assert!(first_pack.iter().all(|f| pack_files(&stores).contains(f)));
+    assert_eq!(answers(&client, &wc), after_work);
+    verify_clean(&stores, "after the incremental repack");
+
+    // A full repack folds both into one new pack and deletes the old ones.
+    let r3 = repack(&stores, &["--full"]);
+    assert_eq!(r3["mode"], "full", "{r3}");
+    assert_eq!(r3["packs_before"], 2, "{r3}");
+    assert_eq!(r3["old_packs_removed"], 2, "{r3}");
+    assert!(r3["frames_reused"].as_u64().unwrap() > 0, "{r3}");
     assert_eq!(pack_files(&stores).len(), 2);
     assert_eq!(answers(&client, &wc), after_work);
     drop(server);
@@ -230,6 +250,8 @@ fn repack_beside_a_server_changes_no_answer() {
         "{}",
         stderr(&out)
     );
+    let out = server_cmd(&stores, &["repack", "--full", "--geometric", "3"]);
+    assert!(!out.status.success(), "--full takes no merge rule");
 }
 
 /// SIGKILL `repack` at several moments: while it walks and writes, just
@@ -303,8 +325,8 @@ fn killed_repack_loses_nothing() {
     verify_clean(&stores, "after the final repack");
 }
 
-/// A packed store backs up (its packed objects are read, checked and copied
-/// like loose ones) and restores into fresh stores that answer the same.
+/// A packed store backs up (its packs are copied as files, ADR 0039) and
+/// restores into fresh stores that answer the same.
 #[test]
 fn packed_store_backs_up_and_restores() {
     let _g = serial();
@@ -336,6 +358,17 @@ fn packed_store_backs_up_and_restores() {
     assert_ok(&out, "backup of a packed store");
     let b: Value = serde_json::from_str(&stdout(&out)).unwrap();
     assert_eq!(b["ok"], true, "{b}");
+    // The pack crossed as files; no object went one by one.
+    assert_eq!(b["manifest"]["blobs"]["packs_copied"], 1, "{b}");
+    assert_eq!(b["manifest"]["blobs"]["copied"], 0, "{b}");
+    let pool = out_dir.join("blobs").join("packs");
+    for f in pack_files(&src) {
+        assert_eq!(
+            fs::read(pool.join(&f)).unwrap(),
+            fs::read(blobs_dir(&src).join("packs").join(&f)).unwrap(),
+            "{f}"
+        );
+    }
     let name = b["manifest"]["name"].as_str().unwrap().to_string();
     // An unchanged packed store has nothing new to copy: listings agree on
     // logical sizes.
@@ -354,6 +387,17 @@ fn packed_store_backs_up_and_restores() {
     let again: Value = serde_json::from_str(&stdout(&again)).unwrap();
     assert_eq!(again["manifest"]["blobs"]["copied"], 0, "{again}");
     assert_eq!(again["manifest"]["blobs"]["replaced"], 0, "{again}");
+    assert_eq!(again["manifest"]["blobs"]["packs_copied"], 0, "{again}");
+    let out = server_cmd(
+        &src,
+        &[
+            "backup-verify",
+            "--from",
+            out_dir.to_str().unwrap(),
+            "--rehash",
+        ],
+    );
+    assert_ok(&out, "backup-verify --rehash of a pool holding packs");
 
     let dest = Stores::sqlite(&work.join("dest"));
     let out = server_cmd(
@@ -369,6 +413,12 @@ fn packed_store_backs_up_and_restores() {
         ],
     );
     assert_ok(&out, "restore");
+    assert_eq!(
+        pack_files(&dest),
+        pack_files(&src),
+        "the packs restore as files"
+    );
+    assert_eq!(loose(&dest), 0);
     verify_clean(&dest, "restored");
     let server = Server::start(&dest, work);
     let client = Client::new(&server.url, &work.join("cache-dest"));

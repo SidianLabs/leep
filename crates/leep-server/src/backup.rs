@@ -4,7 +4,8 @@
 //! snapshots:
 //!
 //! ```text
-//! <out>/blobs/<2 hex>/<62 hex>          every blob any snapshot needs
+//! <out>/blobs/<2 hex>/<62 hex>          every blob any snapshot needs (loose)
+//! <out>/blobs/packs/<id>.pack, .idx     packs copied whole from a packed source
 //! <out>/snapshots/<UTC stamp>/meta.db   metadata as of one instant
 //! <out>/snapshots/<UTC stamp>/manifest.json   written last: the snapshot exists
 //! ```
@@ -27,7 +28,8 @@ use leep_derive::integrity::{self, Problem, Progress, VerifyOptions};
 use leep_derive::Repo;
 use leep_meta::snapshot::{self, SnapshotInfo};
 use leep_meta::SchemaMode;
-use leep_store::sync::{sync_blobs, SyncOptions, SyncReport};
+use leep_store::sync::{sync_blobs, sync_packs, PackSyncReport, SyncOptions, SyncReport};
+use leep_store::PackFiles;
 use serde::{Deserialize, Serialize};
 
 /// Manifest layout version. A reader refuses a larger one.
@@ -102,6 +104,23 @@ pub struct BlobSection {
     pub only_in_backup: u64,
     #[serde(default)]
     pub corrupt: Vec<String>,
+    /// Packs copied whole (ADR 0039); zero when either side keeps none.
+    #[serde(default)]
+    pub packs_listed: u64,
+    #[serde(default)]
+    pub packs_already_present: u64,
+    #[serde(default)]
+    pub packs_copied: u64,
+    #[serde(default)]
+    pub pack_bytes_copied: u64,
+    /// Pool packs a source repack merged away, deleted because other pool
+    /// packs hold all they held.
+    #[serde(default)]
+    pub packs_pruned: u64,
+    #[serde(default)]
+    pub tombstones_copied: u64,
+    #[serde(default)]
+    pub corrupt_packs: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -141,9 +160,13 @@ impl Hooks for NoHooks {}
 pub struct BackupOptions {
     pub meta_url: String,
     pub source_blobs: Arc<dyn BlobStore>,
+    /// The source's pack files, copied whole when the destination has a
+    /// place for them too.
+    pub source_packs: Option<Arc<dyn PackFiles>>,
     pub out: PathBuf,
     /// Where blobs go; `None` for `--no-blobs`.
     pub dest_blobs: Option<Arc<dyn BlobStore>>,
+    pub dest_packs: Option<Arc<dyn PackFiles>>,
     pub dest_blobs_location: String,
     /// Run the closure check (against the copied blobs, or the source's when
     /// there are none).
@@ -327,8 +350,16 @@ fn check_section(r: Option<&integrity::VerifyReport>, rehash: bool) -> CheckSect
     }
 }
 
-fn blob_section(location: &str, r: &SyncReport) -> BlobSection {
+fn blob_section(location: &str, r: &SyncReport, p: Option<&PackSyncReport>) -> BlobSection {
+    let p = p.cloned().unwrap_or_default();
     BlobSection {
+        packs_listed: p.listed,
+        packs_already_present: p.present,
+        packs_copied: p.copied,
+        pack_bytes_copied: p.bytes_copied,
+        packs_pruned: p.pruned,
+        tombstones_copied: p.tombstones_added,
+        corrupt_packs: p.corrupt,
         included: true,
         location: location.to_string(),
         listed: r.listed,
@@ -357,6 +388,33 @@ fn sync_options(
             ));
         })),
     }
+}
+
+/// Copy whole packs when both sides keep them, before the object copy: a
+/// destination that reads packs then lists their objects as present.
+async fn copy_packs(
+    src: Option<&dyn PackFiles>,
+    dst: Option<&dyn PackFiles>,
+    prune: bool,
+    progress: &dyn Progress,
+    what: &str,
+) -> Result<Option<PackSyncReport>> {
+    let (Some(src), Some(dst)) = (src, dst) else {
+        return Ok(None);
+    };
+    let r = sync_packs(src, dst, prune).await?;
+    if r.listed > 0 || r.pruned > 0 {
+        progress.info(&format!(
+            "{what}: packs: {} in the source, {} already there, {} copied ({} bytes), {} merged away and pruned, {} tombstones copied",
+            r.listed, r.present, r.copied, r.bytes_copied, r.pruned, r.tombstones_added
+        ));
+    }
+    for id in &r.corrupt {
+        progress.info(&format!(
+            "{what}: WARNING: pack {id} in the source does not match its index; not copied (its objects are copied one by one if they read)"
+        ));
+    }
+    Ok(Some(r))
 }
 
 /// Take a backup: snapshot the metadata, copy the blobs the destination
@@ -408,6 +466,14 @@ pub async fn backup(
     // 2. Blobs second: everything the snapshot references is already stored.
     let blobs = match &opts.dest_blobs {
         Some(dest) => {
+            let packs = copy_packs(
+                opts.source_packs.as_deref(),
+                opts.dest_packs.as_deref(),
+                true,
+                &*progress,
+                "backup",
+            )
+            .await?;
             progress.info("backup: copying blobs the backup lacks");
             let r = sync_blobs(
                 &*opts.source_blobs,
@@ -424,7 +490,7 @@ pub async fn backup(
                     "backup: WARNING: blob {h} in the source does not hash to its name; not copied"
                 ));
             }
-            blob_section(&opts.dest_blobs_location, &r)
+            blob_section(&opts.dest_blobs_location, &r, packs.as_ref())
         }
         None => BlobSection::default(),
     };
@@ -632,9 +698,14 @@ pub struct RestoreOptions {
     /// What opening the target metadata store does about migrations.
     pub meta_mode: SchemaMode,
     pub target_blobs: Arc<dyn BlobStore>,
+    pub target_packs: Option<Arc<dyn PackFiles>>,
     /// Blobs to restore from, normally the backup's pool; `None` when the
     /// backup holds none (`--no-blobs`) and the caller gave no source.
     pub source_blobs: Option<Arc<dyn BlobStore>>,
+    /// Packs in the backup, copied whole when the target keeps packs too.
+    /// A backup taken before packs were copied holds none; its objects are
+    /// all loose and restore as before.
+    pub source_packs: Option<Arc<dyn PackFiles>>,
     /// Allow a non-empty target: delete the metadata that is there, and
     /// accept blobs that are there.
     pub force: bool,
@@ -653,6 +724,7 @@ pub struct RestoreOptions {
 pub struct RestoreOutcome {
     pub manifest: Manifest,
     pub blobs: Option<SyncReport>,
+    pub packs: Option<PackSyncReport>,
     pub imported: snapshot::ImportInfo,
     pub report: Option<integrity::VerifyReport>,
     pub elapsed_secs: f64,
@@ -717,15 +789,8 @@ pub async fn restore(opts: RestoreOptions, progress: Arc<dyn Progress>) -> Resul
         ));
     }
 
-    let blob_report = match (&opts.source_blobs, manifest.blobs.included) {
-        (Some(src), _) => Some(
-            sync_blobs(
-                &**src,
-                &*opts.target_blobs,
-                &sync_options(opts.concurrency, &progress, "restore"),
-            )
-            .await?,
-        ),
+    let src = match (&opts.source_blobs, manifest.blobs.included) {
+        (Some(src), _) => src,
         (None, true) => {
             return Err(Error::Invalid(
                 "no blob source given for this backup".into(),
@@ -739,6 +804,29 @@ pub async fn restore(opts: RestoreOptions, progress: Arc<dyn Progress>) -> Resul
             ))
         }
     };
+    let pack_report = copy_packs(
+        opts.source_packs.as_deref(),
+        opts.target_packs.as_deref(),
+        false,
+        &*progress,
+        "restore",
+    )
+    .await?;
+    if let Some(p) = pack_report.as_ref().filter(|p| !p.corrupt.is_empty()) {
+        return Err(Error::Storage(format!(
+            "{} pack(s) in the backup do not match their indexes (first: {}); the backup is damaged",
+            p.corrupt.len(),
+            p.corrupt[0]
+        )));
+    }
+    let blob_report = Some(
+        sync_blobs(
+            &**src,
+            &*opts.target_blobs,
+            &sync_options(opts.concurrency, &progress, "restore"),
+        )
+        .await?,
+    );
     if let Some(r) = &blob_report {
         progress.info(&format!(
             "restore: blobs: {} in the backup, {} already there, {} copied ({} bytes)",
@@ -800,6 +888,7 @@ pub async fn restore(opts: RestoreOptions, progress: Arc<dyn Progress>) -> Resul
     Ok(RestoreOutcome {
         manifest,
         blobs: blob_report,
+        packs: pack_report,
         imported,
         report,
         elapsed_secs: started.elapsed().as_secs_f64(),

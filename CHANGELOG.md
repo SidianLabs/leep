@@ -399,6 +399,21 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   answers a lookup in 0.9 us instead of 1.8 us. Existing `LEEPIDX1` indexes
   still read, now in place as well, and a full repack rewrites them. Upgrade
   every server before repacking: older servers refuse the new indexes.
+- `leep-server repack` is incremental by default (ADR 0039). It packs only
+  loose objects, walks back from the refs only through the history they
+  belong to, and merges small packs by a geometric rule (`--geometric 2`,
+  `--max-packs 8`), copying merged entries without recompressing them.
+  `--full` keeps the previous behaviour. On a 12,000-commit synthetic
+  history, a run after 100 new commits takes 0.4 s against 15 s for a full
+  repack, and the store never held more than 5 packs. Object stores are
+  still packed in full.
+- Backups copy packs as files (ADR 0039). `backup` copies each pack and
+  index the pool lacks, checked against the index's recorded hash, plus
+  their tombstones, then the loose objects as before. It prunes pool packs
+  a source repack merged away once other pool packs cover them. `restore`
+  copies the packs back, so a packed store restores packed. Pools from
+  before this change still restore. The manifest's `blobs` section gains
+  pack counters.
 - `leep-server repack` packs `s3://` blob stores too (ADR 0040), with the
   same pack files at `packs/<id>.pack` and `packs/<id>.idx` in the bucket.
   Servers read packed objects with ranged GETs and see a new pack on their

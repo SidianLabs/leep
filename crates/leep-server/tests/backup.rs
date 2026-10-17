@@ -140,11 +140,14 @@ fn opts(site: &Site, out: &Path) -> BackupOptions {
     BackupOptions {
         meta_url: site.meta_url.clone(),
         source_blobs: leep_store::open_blob_store(&site.blobs_url).unwrap(),
+        source_packs: leep_store::open_pack_files(&site.blobs_url).unwrap(),
         out: out.to_path_buf(),
         dest_blobs: Some(
             leep_store::open_blob_store(&format!("file://{}", out.join("blobs").display()))
                 .unwrap(),
         ),
+        dest_packs: leep_store::open_pack_files(&format!("file://{}", out.join("blobs").display()))
+            .unwrap(),
         dest_blobs_location: out.join("blobs").display().to_string(),
         check: true,
         rehash: true,
@@ -165,10 +168,16 @@ fn restore_opts(from: &Path, dest: &Site) -> RestoreOptions {
         meta_url: dest.meta_url.clone(),
         meta_mode: SchemaMode::Migrate,
         target_blobs: leep_store::open_blob_store(&dest.blobs_url).unwrap(),
+        target_packs: leep_store::open_pack_files(&dest.blobs_url).unwrap(),
         source_blobs: Some(
             leep_store::open_blob_store(&format!("file://{}", from.join("blobs").display()))
                 .unwrap(),
         ),
+        source_packs: leep_store::open_pack_files(&format!(
+            "file://{}",
+            from.join("blobs").display()
+        ))
+        .unwrap(),
         force: false,
         resume: false,
         accept_failed_check: false,
@@ -572,4 +581,149 @@ async fn backup_never_creates_a_missing_source() {
     assert!(err.contains("does not exist"), "{err}");
     assert!(!root.path().join("nope.db").exists());
     assert!(backup::check_source_exists("mem://", "file:///tmp").is_err());
+}
+
+async fn repack_site(site: &Site, mode: leep_store::RepackMode) -> leep_store::RepackReport {
+    let root = leep_store::fs_blob_root(&site.blobs_url).unwrap();
+    let store = leep_store::FsBlobStore::new(root);
+    let s = store.clone();
+    let order = leep_derive::pack_order::pack_order_loose(&site.repo, &move |h| s.is_loose(h))
+        .await
+        .unwrap();
+    let opts = leep_store::RepackOptions {
+        mode,
+        ..leep_store::RepackOptions::default()
+    };
+    store
+        .repack_publish(order.objects, opts)
+        .await
+        .unwrap()
+        .finish()
+        .await
+        .unwrap()
+}
+
+fn pack_names(dir: &Path) -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(dir.join("packs"))
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.ends_with(".pack") || n.ends_with(".idx"))
+                .collect()
+        })
+        .unwrap_or_default();
+    v.sort();
+    v
+}
+
+/// A packed source backs up as pack files plus its loose objects (ADR 0039),
+/// incrementally; the pool verifies with --rehash and restores into a store
+/// that gets the packs. A pool from before packs were copied (every object
+/// loose) keeps restoring, and later backups into it add packs beside.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn packed_sources_back_up_packs_whole_and_old_loose_pools_still_restore() {
+    let incremental = leep_store::RepackMode::Incremental {
+        factor: 2,
+        max_packs: 8,
+    };
+    let root = tempfile::tempdir().unwrap();
+    let site = Site::new(root.path(), "src").await;
+    let (tip, _, _) = site.populate().await;
+    let out = root.path().join("backup");
+
+    // A pool taken the old way: no pack files on either side.
+    let mut old = opts(&site, &out);
+    old.name = Some("20260101T000000Z".into());
+    old.source_packs = None;
+    old.dest_packs = None;
+    let first = backup::backup(old, &NoHooks, quiet()).await.unwrap();
+    assert!(first.ok());
+    assert_eq!(first.manifest.blobs.packs_copied, 0);
+    assert!(pack_names(&out.join("blobs")).is_empty());
+
+    // The source is packed, and more work lands loose beside the pack.
+    repack_site(&site, incremental).await;
+    let c = site
+        .commit(&[tip], &[("late.txt", "after the repack\n")], "c")
+        .await;
+    site.advance("main", c).await;
+    let mut o = opts(&site, &out);
+    o.name = Some("20260102T000000Z".into());
+    let second = backup::backup(o, &NoHooks, quiet()).await.unwrap();
+    assert!(second.ok(), "{:?}", second.manifest.check);
+    let b = &second.manifest.blobs;
+    assert_eq!((b.packs_listed, b.packs_copied), (1, 1), "{b:?}");
+    assert!(b.pack_bytes_copied > 0);
+    // Only the new loose objects crossed one by one.
+    assert!(b.copied > 0 && b.copied < 5, "{b:?}");
+    assert_eq!(pack_names(&out.join("blobs")).len(), 2);
+
+    // Unchanged: nothing crosses.
+    let mut o = opts(&site, &out);
+    o.name = Some("20260103T000000Z".into());
+    let third = backup::backup(o, &NoHooks, quiet()).await.unwrap();
+    let b = &third.manifest.blobs;
+    assert_eq!((b.packs_copied, b.copied), (0, 0), "{b:?}");
+
+    // An incremental repack and a full one later: the pool follows, and
+    // drops the packs the full repack replaced.
+    repack_site(&site, incremental).await;
+    let mut o = opts(&site, &out);
+    o.name = Some("20260104T000000Z".into());
+    let b = backup::backup(o, &NoHooks, quiet())
+        .await
+        .unwrap()
+        .manifest
+        .blobs;
+    assert_eq!((b.packs_copied, b.copied), (1, 0), "{b:?}");
+    repack_site(&site, leep_store::RepackMode::Full).await;
+    let mut o = opts(&site, &out);
+    o.name = Some("20260105T000000Z".into());
+    let fifth = backup::backup(o, &NoHooks, quiet()).await.unwrap();
+    assert!(fifth.ok());
+    let b = &fifth.manifest.blobs;
+    assert_eq!(
+        (b.packs_copied, b.packs_pruned, b.copied),
+        (1, 2, 0),
+        "{b:?}"
+    );
+
+    let pool =
+        || leep_store::open_blob_store(&format!("file://{}", out.join("blobs").display())).unwrap();
+    for snapshot in ["20260101T000000Z", "20260105T000000Z"] {
+        let v = backup::verify_backup(
+            VerifyBackupOptions {
+                from: out.clone(),
+                snapshot: Some(snapshot.into()),
+                blobs: pool(),
+                rehash: true,
+                max_problems: 10,
+            },
+            &Quiet,
+        )
+        .await
+        .unwrap();
+        assert!(v.report.ok(), "{snapshot}: {:?}", v.report.problems);
+        assert!(v.report.stats.blobs_rehashed > 0);
+
+        // Each restores, the newest with packs in the target.
+        let dest = Site::new(root.path(), &format!("restored-{snapshot}")).await;
+        let mut r = restore_opts(&out, &dest);
+        r.snapshot = Some(snapshot.into());
+        let r = backup::restore(r, quiet()).await.unwrap();
+        assert!(r.report.unwrap().ok(), "{snapshot}");
+        assert_eq!(r.packs.unwrap().copied, 1, "{snapshot}");
+        assert_eq!(pack_names(&dest.dir.join("blobs")).len(), 2);
+    }
+
+    // The old way of restoring a pool, without pack files: every object
+    // still arrives (one by one).
+    let dest = Site::new(root.path(), "restored-loose").await;
+    let mut r = restore_opts(&out, &dest);
+    r.source_packs = None;
+    r.target_packs = None;
+    let r = backup::restore(r, quiet()).await.unwrap();
+    assert!(r.report.unwrap().ok());
+    assert!(pack_names(&dest.dir.join("blobs")).is_empty());
+    assert_eq!(dest.repo.meta().get_ref("main").await.unwrap(), Some(c));
 }

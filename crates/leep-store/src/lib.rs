@@ -12,6 +12,7 @@ mod objrepack;
 pub mod pack;
 #[cfg(test)]
 mod pack_tests;
+pub mod packfiles;
 mod packset;
 mod packwrite;
 mod repack;
@@ -27,7 +28,9 @@ pub use cache::{CacheStats, CachedBlobStore};
 pub use fs::FsBlobStore;
 pub use object::{ObjectBlobStore, S3Config};
 pub use objrepack::PublishedObjectPack;
-pub use repack::{PublishedPack, RepackHook, RepackOptions, RepackReport, RepackStep};
+pub use packfiles::{FsPackFiles, ObjectPackFiles, PackFiles};
+pub use packwrite::plan_merge;
+pub use repack::{PublishedPack, RepackHook, RepackMode, RepackOptions, RepackReport, RepackStep};
 
 fn storage_err(e: impl std::fmt::Display) -> Error {
     Error::Storage(e.to_string())
@@ -87,6 +90,24 @@ pub fn open_blob_store(url: &str) -> Result<Arc<dyn BlobStore>> {
         )));
     }
     Ok(Arc::new(FsBlobStore::new(PathBuf::from(url))))
+}
+
+/// The pack files of the blob store at `url`, for copying packs whole
+/// (ADR 0039): `packs/` of a filesystem store, `packs/` keys of a bucket.
+/// `None` for a store that keeps no packs (`mem://`).
+pub fn open_pack_files(url: &str) -> Result<Option<Arc<dyn PackFiles>>> {
+    if url == "mem://" || url == "mem:" {
+        return Ok(None);
+    }
+    if let Some(store) = open_object_blob_store(url)? {
+        return Ok(Some(Arc::new(ObjectPackFiles::new(store.store))));
+    }
+    match fs_blob_root(url) {
+        Some(root) => Ok(Some(Arc::new(FsPackFiles::new(root)))),
+        None => Err(Error::Invalid(format!(
+            "unsupported blob store url {url:?}"
+        ))),
+    }
 }
 
 #[cfg(test)]

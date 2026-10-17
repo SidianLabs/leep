@@ -169,4 +169,8 @@ silent, or where implementing it changed it:
   correct but not smaller), and packs for the object store backend.
   [ADR 0040](0040-packs-in-object-stores.md) adds the last: the same files
   in a bucket, tombstones as one object each, and a lease object in place of
-  the repack lock.
+  the repack lock. [ADR 0039](0039-incremental-repack-and-pack-backups.md)
+  adds the first two. `repack` is now incremental by default: it packs loose
+  objects, walks only the history they belong to, and merges small packs by
+  a geometric rule (`--full` keeps the behaviour above). Backups copy packs
+  and their tombstones as files.

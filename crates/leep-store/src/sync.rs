@@ -1,16 +1,20 @@
 //! Incremental blob copy between two stores, for backup and restore
-//! (ADR 0026).
+//! (ADR 0026), and the copy of whole packs that goes first when both sides
+//! keep packs (ADR 0039).
 //!
 //! Blobs are immutable and named by their content, so "copy what the other
 //! side lacks" is always safe: a blob present under a hash holds the bytes of
 //! that hash, whenever and by whomever it was written. The two ascending
 //! listings are merged, so an unchanged store costs two listings and no reads.
 
-use std::collections::VecDeque;
-use std::sync::Arc;
+use std::collections::{HashSet, VecDeque};
+use std::sync::{Arc, Mutex};
 
 use futures::stream::{self, StreamExt};
 use leep_core::{BlobMeta, BlobStore, Error, Hash, Result, TreeNode};
+
+use crate::pack::{self, PackIndex};
+use crate::packfiles::{read_all, PackFiles};
 
 /// Listing page size.
 const PAGE: usize = 1000;
@@ -226,6 +230,181 @@ pub async fn sync_blobs(
     Ok(report)
 }
 
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PackSyncReport {
+    /// Packs the source has published.
+    pub listed: u64,
+    /// Already published in the destination.
+    pub present: u64,
+    /// Copied, and their pack plus index bytes.
+    pub copied: u64,
+    pub bytes_copied: u64,
+    /// Replaced in the source (by a repack) before they could be read. Their
+    /// objects are in the pack that replaced them, or copied loose.
+    pub vanished: u64,
+    /// Source packs whose bytes do not match their index; not copied.
+    pub corrupt: Vec<String>,
+    /// Tombstone lines copied for packs the destination holds.
+    pub tombstones_added: u64,
+    /// Destination packs the source no longer has, deleted because other
+    /// destination packs hold every live object they did.
+    pub pruned: u64,
+}
+
+/// Copy the packs `src` has published that `dst` lacks, each as its two
+/// files, then the tombstones of the packs `dst` holds. Run it before
+/// [`sync_blobs`]: a destination that reads packs then lists their objects
+/// as present, so only loose objects are copied one by one, and one that
+/// does not still gets every object loose.
+///
+/// The pack file goes first and the index publishes it, as in a repack, so
+/// an interrupted copy leaves an unpublished pack that the next run writes
+/// again. Each pack is checked against the length and BLAKE3 its index
+/// records while it streams, and the index against its name, so a damaged
+/// source pack is reported and never published in the destination.
+///
+/// With `prune`, a destination pack the source no longer has (a repack
+/// merged it into a bigger one) is deleted when the destination's other
+/// packs hold every live object it holds, so a backup pool does not keep
+/// every intermediate pack. Objects are never lost that way; a pack that
+/// holds anything no other pack does stays.
+pub async fn sync_packs(
+    src: &dyn PackFiles,
+    dst: &dyn PackFiles,
+    prune: bool,
+) -> Result<PackSyncReport> {
+    let mut report = PackSyncReport::default();
+    let src_ids = src.pack_ids().await?;
+    let dst_ids: HashSet<String> = dst.pack_ids().await?.into_iter().collect();
+    report.listed = src_ids.len() as u64;
+    for id in &src_ids {
+        if dst_ids.contains(id) {
+            report.present += 1;
+            continue;
+        }
+        let idx_name = format!("{id}.idx");
+        let pack_name = format!("{id}.pack");
+        let Some(idx) = read_all(src, &idx_name).await? else {
+            report.vanished += 1;
+            continue;
+        };
+        let index = match (pack::pack_id(&idx) == *id).then(|| PackIndex::decode(idx.clone())) {
+            Some(Ok(i)) => i,
+            _ => {
+                report.corrupt.push(id.clone());
+                continue;
+            }
+        };
+        let Some(data) = src.read(&pack_name).await? else {
+            report.vanished += 1;
+            continue;
+        };
+        let hasher = Arc::new(Mutex::new((blake3::Hasher::new(), 0u64)));
+        let h = hasher.clone();
+        let want = index.pack_len();
+        let data = data
+            .map(move |chunk| {
+                let chunk = chunk?;
+                let mut g = h.lock().unwrap();
+                g.0.update(&chunk);
+                g.1 += chunk.len() as u64;
+                if g.1 > want {
+                    return Err(Error::Storage("pack longer than its index says".into()));
+                }
+                Ok(chunk)
+            })
+            .boxed();
+        let n = match dst.write(&pack_name, data).await {
+            Ok(n) => n,
+            Err(_) if hasher.lock().unwrap().1 > want => {
+                report.corrupt.push(id.clone());
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        let digest = *hasher.lock().unwrap().0.finalize().as_bytes();
+        if n != want || &digest != index.pack_hash() {
+            dst.delete(&pack_name).await?;
+            report.corrupt.push(id.clone());
+            continue;
+        }
+        let idx_len = idx.len() as u64;
+        dst.write(&idx_name, stream::once(async { Ok(idx.into()) }).boxed())
+            .await?;
+        report.copied += 1;
+        report.bytes_copied += n + idx_len;
+    }
+
+    let held: HashSet<String> = dst.pack_ids().await?.into_iter().collect();
+    let theirs = src.tombstones().await?;
+    let ours = dst.tombstones().await?;
+    let mut add = Vec::new();
+    for (id, hashes) in &theirs {
+        if !held.contains(id) {
+            continue;
+        }
+        let mut new: Vec<&Hash> = hashes
+            .iter()
+            .filter(|h| !ours.get(id).is_some_and(|o| o.contains(h)))
+            .collect();
+        new.sort();
+        add.extend(new.into_iter().map(|h| (id.clone(), *h)));
+    }
+    add.sort();
+    report.tombstones_added = add.len() as u64;
+    if !add.is_empty() {
+        dst.add_tombstones(&add).await?;
+    }
+
+    if prune {
+        let source: HashSet<&String> = src_ids.iter().collect();
+        report.pruned = prune_superseded(dst, &source).await?;
+    }
+    Ok(report)
+}
+
+/// Delete destination packs the source no longer has whose every live object
+/// is live in another destination pack. Index first, as a repack does.
+async fn prune_superseded(dst: &dyn PackFiles, source: &HashSet<&String>) -> Result<u64> {
+    let ids = dst.pack_ids().await?;
+    if ids.iter().all(|id| source.contains(id)) {
+        return Ok(0);
+    }
+    let dead = dst.tombstones().await?;
+    let mut packs: Vec<(String, PackIndex)> = Vec::new();
+    for id in ids {
+        if let Some(bytes) = read_all(dst, &format!("{id}.idx")).await? {
+            if pack::pack_id(&bytes) != id {
+                continue;
+            }
+            packs.push((id, PackIndex::decode(bytes)?));
+        }
+    }
+    let no_dead = HashSet::new();
+    let live = |id: &str, h: &Hash| !dead.get(id).unwrap_or(&no_dead).contains(h);
+    let mut pruned = 0;
+    let mut i = 0;
+    while i < packs.len() {
+        let (id, index) = &packs[i];
+        let covered = !source.contains(id)
+            && index.hashes().filter(|h| live(id, h)).all(|h| {
+                packs
+                    .iter()
+                    .enumerate()
+                    .any(|(j, (oid, o))| j != i && o.find(&h).is_some() && live(oid, &h))
+            });
+        if covered {
+            dst.delete(&format!("{id}.idx")).await?;
+            dst.delete(&format!("{id}.pack")).await?;
+            packs.remove(i);
+            pruned += 1;
+        } else {
+            i += 1;
+        }
+    }
+    Ok(pruned)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -384,5 +563,183 @@ mod tests {
             progress: None,
         };
         assert!(sync_blobs(&s, &s, &o).await.is_err());
+    }
+
+    mod packs {
+        use super::*;
+        use crate::{
+            FsBlobStore, FsPackFiles, ObjectBlobStore, ObjectPackFiles, RepackMode, RepackOptions,
+        };
+        use object_store::memory::InMemory;
+
+        async fn repack(store: &FsBlobStore, mode: RepackMode) {
+            let opts = RepackOptions {
+                mode,
+                ..RepackOptions::default()
+            };
+            store
+                .repack_publish(Vec::new(), opts)
+                .await
+                .unwrap()
+                .finish()
+                .await
+                .unwrap();
+        }
+
+        const INCREMENTAL: RepackMode = RepackMode::Incremental {
+            factor: 2,
+            max_packs: 8,
+        };
+
+        async fn all(store: &dyn BlobStore) -> Vec<Hash> {
+            let mut out = Vec::new();
+            let mut after = None;
+            loop {
+                let page = store.list_page(after, 100).await.unwrap();
+                let Some(last) = page.last() else { return out };
+                after = Some(last.hash);
+                out.extend(page.iter().map(|m| m.hash));
+            }
+        }
+
+        /// A packed source with loose objects beside its packs and a
+        /// deleted packed object.
+        async fn source(dir: &std::path::Path) -> (FsBlobStore, Vec<Hash>) {
+            let src = FsBlobStore::new(dir);
+            let mut hashes = Vec::new();
+            for i in 0..40 {
+                hashes.push(src.put(Bytes::from(format!("object {i}"))).await.unwrap());
+            }
+            repack(&src, RepackMode::Full).await;
+            for i in 40..45 {
+                hashes.push(src.put(Bytes::from(format!("object {i}"))).await.unwrap());
+            }
+            repack(&src, INCREMENTAL).await;
+            src.delete(&hashes[3]).await.unwrap();
+            for i in 45..48 {
+                hashes.push(src.put(Bytes::from(format!("object {i}"))).await.unwrap());
+            }
+            (src, hashes)
+        }
+
+        #[tokio::test]
+        async fn packs_copy_whole_to_a_filesystem_store_and_objects_follow() {
+            let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+            let (src, hashes) = source(a.path()).await;
+            let dst = FsBlobStore::new(b.path());
+            let (sp, dp) = (FsPackFiles::new(a.path()), FsPackFiles::new(b.path()));
+            let r = sync_packs(&sp, &dp, true).await.unwrap();
+            assert_eq!((r.listed, r.copied, r.present), (2, 2, 0), "{r:?}");
+            assert_eq!(r.tombstones_added, 1, "{r:?}");
+            assert!(r.corrupt.is_empty());
+            let b2 = sync_blobs(&src, &dst, &SyncOptions::default())
+                .await
+                .unwrap();
+            assert_eq!(b2.copied, 3, "only the loose objects: {b2:?}");
+            assert_eq!(all(&src).await, all(&dst).await);
+            assert!(
+                dst.get(&hashes[3]).await.unwrap().is_none(),
+                "deleted stays deleted"
+            );
+            for h in hashes.iter().filter(|h| **h != hashes[3]) {
+                assert!(dst.get(h).await.unwrap().is_some());
+            }
+            // Again: nothing to do.
+            let r = sync_packs(&sp, &dp, true).await.unwrap();
+            assert_eq!(
+                (r.copied, r.present, r.tombstones_added),
+                (0, 2, 0),
+                "{r:?}"
+            );
+
+            // The source merges its packs; the pool gets the merged pack and
+            // drops the two it supersedes, losing no object.
+            repack(&src, RepackMode::Full).await;
+            let r = sync_packs(&sp, &dp, true).await.unwrap();
+            assert_eq!((r.copied, r.pruned), (1, 2), "{r:?}");
+            assert_eq!(dp.pack_ids().await.unwrap(), sp.pack_ids().await.unwrap());
+            let fresh = FsBlobStore::new(b.path());
+            for h in hashes.iter().filter(|h| **h != hashes[3]) {
+                assert!(fresh.get(h).await.unwrap().is_some());
+            }
+        }
+
+        #[tokio::test]
+        async fn a_pool_pack_holding_something_no_other_pack_holds_is_kept() {
+            let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+            let (src, hashes) = source(a.path()).await;
+            let (sp, dp) = (FsPackFiles::new(a.path()), FsPackFiles::new(b.path()));
+            sync_packs(&sp, &dp, true).await.unwrap();
+            // GC deletes another packed object; the full repack drops it, so
+            // only the pool's old pack still has it.
+            src.delete(&hashes[5]).await.unwrap();
+            repack(&src, RepackMode::Full).await;
+            let r = sync_packs(&sp, &dp, true).await.unwrap();
+            assert_eq!((r.copied, r.pruned), (1, 1), "{r:?}");
+            let pool = FsBlobStore::new(b.path());
+            assert!(
+                pool.get(&hashes[5]).await.unwrap().is_some(),
+                "the pool keeps it"
+            );
+        }
+
+        #[tokio::test]
+        async fn packs_copy_to_an_object_store_under_packs_keys() {
+            let a = tempfile::tempdir().unwrap();
+            let (src, _) = source(a.path()).await;
+            let bucket: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+            let dp = ObjectPackFiles::new(bucket.clone());
+            let sp = FsPackFiles::new(a.path());
+            let r = sync_packs(&sp, &dp, true).await.unwrap();
+            assert_eq!(r.copied, 2, "{r:?}");
+            let ids = sp.pack_ids().await.unwrap();
+            assert_eq!(dp.pack_ids().await.unwrap(), ids);
+            for id in &ids {
+                for ext in ["pack", "idx"] {
+                    let key = object_store::path::Path::from(format!("packs/{id}.{ext}"));
+                    let got = bucket.get(&key).await.unwrap().bytes().await.unwrap();
+                    let want = std::fs::read(a.path().join(format!("packs/{id}.{ext}"))).unwrap();
+                    assert_eq!(got, want);
+                }
+            }
+            assert_eq!(
+                dp.tombstones().await.unwrap(),
+                sp.tombstones().await.unwrap()
+            );
+            // The object store reads the packs, so only loose objects follow
+            // one by one, and it lists what the source does.
+            let dst = ObjectBlobStore::new(bucket);
+            let r = sync_blobs(&src, &dst, &SyncOptions::default())
+                .await
+                .unwrap();
+            assert_eq!(r.copied, 3, "{r:?}");
+            assert_eq!(all(&src).await, all(&dst).await);
+            // And back: packs restore from the bucket into a fresh store.
+            let c = tempfile::tempdir().unwrap();
+            let r = sync_packs(&dp, &FsPackFiles::new(c.path()), false)
+                .await
+                .unwrap();
+            assert_eq!((r.copied, r.tombstones_added), (2, 1), "{r:?}");
+            assert_eq!(all(&FsBlobStore::new(c.path())).await.len(), 44);
+        }
+
+        #[tokio::test]
+        async fn a_damaged_source_pack_is_reported_and_not_published() {
+            let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+            source(a.path()).await;
+            let sp = FsPackFiles::new(a.path());
+            let ids = sp.pack_ids().await.unwrap();
+            let path = a.path().join(format!("packs/{}.pack", ids[0]));
+            let mut bytes = std::fs::read(&path).unwrap();
+            let last = bytes.len() - 1;
+            bytes[last] ^= 1;
+            std::fs::write(&path, bytes).unwrap();
+            let dp = FsPackFiles::new(b.path());
+            let r = sync_packs(&sp, &dp, false).await.unwrap();
+            assert_eq!(r.corrupt, vec![ids[0].clone()], "{r:?}");
+            assert_eq!(r.copied, 1);
+            assert_eq!(dp.pack_ids().await.unwrap(), vec![ids[1].clone()]);
+            assert!(dp.len(&format!("{}.pack", ids[0])).await.unwrap().is_none());
+        }
     }
 }
