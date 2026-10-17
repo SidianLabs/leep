@@ -496,6 +496,10 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 - The crash test's HTTP agents land the same changeset again after an
   unanswered land, as a real client does, instead of rebuilding the stack on
   the new head, which landed it twice when the first land had applied.
+- Batched derived-row reads on Postgres no longer slow to seconds when an
+  index has grown since the last `ANALYZE`: the planner estimated a row or two
+  for the kind and scanned all its rows instead of looking the keys up. Found
+  deriving path history on Linux (2.3 s per lookup, now 3 ms).
 
 ### Project
 - Workspace version set to 0.0.1, with a CI check that keeps it below

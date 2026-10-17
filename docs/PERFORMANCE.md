@@ -1026,6 +1026,18 @@ changeset still joins every chunk of each directory it rewrites, so the cost
 grows with directory width (Linux's widest directories hold thousands of
 names).
 
+**Stale planner statistics.** On the full Linux database the first run of
+this code derived only about 500 changesets a minute, with Postgres at 100%
+CPU and the server idle. The table was last analyzed before the path-history
+rows existed, so Postgres estimated a row or two for `history-node-v3`, and
+answered each batched `get_derived_many` by walking all 512,000 rows of the
+kind and filtering on `key`: 2.3 s per lookup. `ANALYZE derived` brought it
+to 3 ms and the derivation to about 10,300 changesets a minute. The query now
+takes the kind through a sub-select, which keeps the planner off the per-kind
+estimate: on a local reproduction (300,000 rows of a new kind added after
+`ANALYZE`) a 200-key lookup takes 1-3 ms with fresh or stale statistics,
+against 191 ms before.
+
 ## Garbage collection
 
 `leep-server gc` phases timed with
