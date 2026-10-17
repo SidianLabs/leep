@@ -10,7 +10,7 @@ use crate::commands::{
     amend, branch, checkout, commit, diff, history, init, keygen, land, merge, pick, rebase,
     reflog, reset, resolve, restore, review, search, stash, status, Ctx, Remote,
 };
-use crate::error::{CliError, Result};
+use crate::error::{CliError, ErrorKind, Result};
 use crate::state::{resolve_token, WorkCopy};
 
 const DEFAULT_SERVER: &str = "http://127.0.0.1:8080";
@@ -42,7 +42,8 @@ pub struct Cli {
     /// Bearer token (or set LEEP_TOKEN; falls back to `.leep/config.json`).
     #[arg(long, global = true, hide_env_values = true)]
     pub token: Option<String>,
-    /// Print the raw API response as JSON.
+    /// Print the raw API response as JSON; an error becomes
+    /// `{"error":{"code","message","hint","retryable"}}` on stdout.
     #[arg(long, global = true)]
     pub json: bool,
     #[command(subcommand)]
@@ -119,14 +120,44 @@ pub enum Command {
 }
 
 pub fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => return usage_error(e),
+    };
+    let json = cli.json;
     match run(cli) {
         Ok(code) => ExitCode::from(code as u8),
         Err(e) => {
-            e.report();
+            e.report(json);
             ExitCode::from(e.exit_code() as u8)
         }
     }
+}
+
+/// clap's own output for help and version; for a real usage error also the
+/// JSON document when `--json` is on the command line, which clap could not
+/// parse for us.
+fn usage_error(e: clap::Error) -> ExitCode {
+    let code = e.exit_code();
+    let json = std::env::args_os().skip(1).any(|a| a == "--json");
+    if code == 0 || !json {
+        let _ = e.print();
+        return ExitCode::from(code as u8);
+    }
+    let text = e.render().to_string();
+    let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
+    let message = lines
+        .next()
+        .unwrap_or("bad command line")
+        .trim_start_matches("error: ")
+        .to_string();
+    let rest: Vec<&str> = lines.collect();
+    let mut err = CliError::new(ErrorKind::Usage, message);
+    if !rest.is_empty() {
+        err = err.with_hint(rest.join("\n"));
+    }
+    err.report(true);
+    ExitCode::from(code as u8)
 }
 
 fn env_token() -> Option<String> {

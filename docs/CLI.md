@@ -21,8 +21,39 @@ Decided in [ADR 0033](adr/0033-cli-exit-codes-and-json-errors.md).
 
 Errors print `leep: MESSAGE` on stderr, sometimes followed by `hint: ...`.
 
+## JSON output
+
+`--json` (on any command) prints the result as JSON on stdout, usually the
+server's `/v1` response. With `--json`, an error is also JSON on stdout, one
+line, in addition to the usual text on stderr:
+
+```json
+{"error":{"code":"not_found","message":"...","hint":null,"retryable":false}}
+```
+
+| `code` | Exit | Meaning |
+|---|---|---|
+| `user` | 1 | Bad input or a refused operation. |
+| `auth` | 1 | Missing, unknown or read-only token (401, 403). |
+| `ambiguous` | 1 | A short changeset id matches several changesets; `candidates` lists them. |
+| `usage` | 2 | The command line does not parse. |
+| `unreachable` | 3 | No connection to the server. |
+| `server` | 3 | A 5xx answer, an answer that does not decode, or data that fails its hash check. |
+| `timeout` | 3 | The request timed out; it may or may not have taken effect. |
+| `rate_limited` | 3 | 429 after the client's own retries. |
+| `not_found` | 4 | Something named does not exist. |
+| `conflict` | 5 | Conflicts to resolve, or (with `retryable: true`) a concurrent update that won. |
+| `nothing_to_do` | 6 | Nothing to record. |
+
+`code` values are stable; new ones may be added. `retryable` says whether
+running the same command again can succeed. Commands that finish with
+conflicts (`land`, `sync`, `merge`, `cherry-pick`, `revert`, `stash apply`)
+print their normal JSON result and exit 5 rather than an error.
+
 ## For agents
 
+- **Use `--json`.** stdout then always holds exactly one JSON document, the
+  result or `{"error":{...}}`, so nothing needs scraping.
 - **Branch on the exit code.** 3 means wait and retry; 4 means a name is
   wrong; 5 means resolve the conflicts (`leep status` lists them) and commit,
   or for a lost race, retry; 6 means the work is already recorded.

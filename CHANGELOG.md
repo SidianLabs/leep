@@ -125,6 +125,10 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   (`commit`, `amend` and `stash push` with nothing to record; was 1). Scripts
   that tested for exactly 1 or 2 need updating. An error may add a
   `hint: ...` line, for example where the server URL came from.
+- With `--json`, errors are JSON too: `{"error":{"code","message","hint",
+  "retryable"}}` on stdout (the text still goes to stderr), with a stable
+  `code` such as `not_found`, `conflict`, `server` or `usage`. Usage errors
+  follow it when `--json` is anywhere on the command line.
 
 ### Hardening
 - Fuzz targets for every decoder and parser: persisted objects, derived

@@ -188,8 +188,28 @@ impl CliError {
         self.kind.exit_code()
     }
 
-    /// Print `leep: message` plus any candidates and hint on stderr.
-    pub fn report(&self) {
+    /// The `--json` form: `{"error":{"code","message","hint","retryable"}}`,
+    /// plus `candidates` for an ambiguous short id.
+    pub fn to_json(&self) -> serde_json::Value {
+        let mut e = serde_json::json!({
+            "code": self.kind.code(),
+            "message": self.message,
+            "hint": self.hint,
+            "retryable": self.retryable,
+        });
+        if !self.candidates.is_empty() {
+            e["candidates"] = serde_json::json!(self.candidates);
+        }
+        serde_json::json!({ "error": e })
+    }
+
+    /// Print `leep: message` plus any candidates and hint on stderr, and
+    /// with `json` also the [`to_json`](Self::to_json) document on stdout,
+    /// where agents read results (ADR 0033).
+    pub fn report(&self, json: bool) {
+        if json {
+            println!("{}", self.to_json());
+        }
         eprintln!("leep: {}", self.message);
         for c in &self.candidates {
             eprintln!("  {c}");
@@ -257,5 +277,27 @@ mod tests {
                 (code, exit, retry)
             );
         }
+    }
+
+    #[test]
+    fn json_shape_is_stable() {
+        let e = CliError::not_found("revision \"x\" not found").with_hint("try `leep log`");
+        assert_eq!(
+            e.to_json(),
+            serde_json::json!({ "error": {
+                "code": "not_found", "message": "revision \"x\" not found",
+                "hint": "try `leep log`", "retryable": false,
+            }})
+        );
+        let e = CliError::new(ErrorKind::Ambiguous, "m").with_candidates(vec!["ab".into()]);
+        assert_eq!(e.to_json()["error"]["hint"], serde_json::Value::Null);
+        assert_eq!(
+            e.to_json()["error"]["candidates"],
+            serde_json::json!(["ab"])
+        );
+        assert_eq!(
+            CliError::lost_race("m").to_json()["error"]["retryable"],
+            true
+        );
     }
 }

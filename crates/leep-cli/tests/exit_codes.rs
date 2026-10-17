@@ -165,3 +165,86 @@ fn an_unreachable_server_names_where_the_url_comes_from() {
         "{err}"
     );
 }
+
+fn json_error(out: &Output) -> serde_json::Value {
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|e| panic!("stdout is not JSON ({e}): {}", text(&out.stdout)));
+    let err = &v["error"];
+    let keys: Vec<&str> = err
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(keys, ["code", "hint", "message", "retryable"], "{v}");
+    assert!(err["message"].as_str().is_some_and(|m| !m.is_empty()));
+    err.clone()
+}
+
+#[test]
+fn json_errors_go_to_stdout_with_a_stable_code() {
+    let leep = Leep::new();
+    let mock = Mock::start();
+    let dir = tempfile::tempdir().unwrap();
+    let missing = "ab".repeat(32);
+    let cases: Vec<(Vec<&str>, &str, i32, bool)> = vec![
+        (
+            vec!["--json", "--server", &mock.url, "show", &missing],
+            "not_found",
+            4,
+            false,
+        ),
+        (vec!["--json", "cat"], "usage", 2, false),
+        (
+            vec!["cat", "--json", "nosuch-flag", "x", "y"],
+            "usage",
+            2,
+            false,
+        ),
+        (
+            vec!["--json", "--server", "http://127.0.0.1:1", "refs"],
+            "unreachable",
+            3,
+            true,
+        ),
+        (vec!["--json", "refs"], "user", 1, false),
+    ];
+    for (args, code, exit, retryable) in cases {
+        let out = leep.run(dir.path(), &args);
+        assert_eq!(out.status.code(), Some(exit), "{args:?}");
+        let err = json_error(&out);
+        assert_eq!(err["code"], code, "{args:?}: {err}");
+        assert_eq!(err["retryable"], retryable, "{args:?}: {err}");
+        // The human line still goes to stderr.
+        assert!(text(&out.stderr).starts_with("leep: "), "{args:?}");
+    }
+
+    // Without --json, stdout stays empty.
+    let out = leep.run(dir.path(), &["--server", &mock.url, "show", &missing]);
+    assert!(out.stdout.is_empty());
+}
+
+#[test]
+fn json_nothing_to_commit_and_conflict_outcomes() {
+    let leep = Leep::new();
+    let mock = Mock::start();
+    mock.seed(None, &[("a.txt", "a\n", FileKind::Regular)], &[]);
+    let wc = init(&leep, &mock);
+    let out = leep.run(wc.path(), &["--json", "commit", "-m", "nothing"]);
+    assert_eq!(out.status.code(), Some(6));
+    assert_eq!(json_error(&out)["code"], "nothing_to_do");
+
+    // A land conflict is a result, not an error: the land response, exit 5.
+    let mock = Mock::start();
+    mock.seed(None, &[("a.txt", "base\n", FileKind::Regular)], &[]);
+    let (a, b) = (init(&leep, &mock), init(&leep, &mock));
+    std::fs::write(a.path().join("a.txt"), "from a\n").unwrap();
+    std::fs::write(b.path().join("a.txt"), "from b\n").unwrap();
+    leep.ok(a.path(), &["commit", "-m", "a"]);
+    leep.ok(b.path(), &["commit", "-m", "b"]);
+    leep.ok(a.path(), &["land"]);
+    let out = leep.run(b.path(), &["--json", "land"]);
+    assert_eq!(out.status.code(), Some(5));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["status"], "conflicts");
+}

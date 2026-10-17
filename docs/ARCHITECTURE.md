@@ -439,7 +439,9 @@ requested prefixes are materialized; other files are fetched on demand with
 Every CLI failure is a `CliError` with a kind, and the kind alone decides the
 exit code: 1 generic, 2 usage, 3 server or network (retry may work), 4 not
 found, 5 conflict, 6 nothing to do (`commit`, `amend`, `stash push` only).
-HTTP statuses map to kinds in one place, the client's `error_from`.
+HTTP statuses map to kinds in one place, the client's `error_from`. With
+`--json` an error is also printed on stdout as
+`{"error":{"code","message","hint","retryable"}}`, `code` being the kind.
 `docs/CLI.md` is the user-facing list.
 
 **Merge**: three-way, per path, with base = `merge_base(ours, theirs)`.

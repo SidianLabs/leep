@@ -76,6 +76,35 @@ change costlier. This record fixes them before 0.1.
   `hint: ...`, on stderr (for example where the server URL comes from when the
   server cannot be reached).
 
+**JSON errors.** `--json` covered only results; an error was plain text on
+stderr (R4), so an agent had to scrape messages. With `--json`, an error now
+prints one line on stdout:
+
+```json
+{"error":{"code":"not_found","message":"server: not found: revision \"x\" (404 Not Found)","hint":null,"retryable":false}}
+```
+
+- `code` is the kind from the table above, a stable snake_case string; new
+  kinds may be added, existing ones are never renamed. `message` is the
+  human text, `hint` a suggested next step or null, `retryable` whether
+  running the same command again can succeed. An ambiguous short id adds
+  `candidates` (ADR 0034). Fields may be added, never removed.
+- **stdout, deliberately.** Agents parse stdout, so with `--json` stdout
+  always holds exactly one JSON document per run: the result or the error.
+  `out=$(leep --json show X)` is always parseable, and the exit code says
+  which it is. The human `leep: ...` line (and hint) still goes to stderr as
+  without `--json`, so logs and tools that read stderr see the same text;
+  clig.dev's "messages to stderr" holds for humans, and the machine document
+  goes where machine output goes.
+- **Usage errors too.** When clap rejects the command line and `--json`
+  appears anywhere in it, the CLI prints the same shape with `code: "usage"`
+  and exit 2 (clap could not parse the flag, so the raw arguments are
+  checked). `--help` and `--version` print their usual text.
+- **Outcomes are not errors.** A land, sync, merge, cherry-pick, revert or
+  stash apply that reports conflicts prints its normal `--json` result (for
+  example `{"status":"conflicts",...}`) and exits 5; `search` with no match
+  prints its empty result and exits 0, as before.
+
 ## Consequences
 - An agent can branch on the code alone: 3 means wait and retry, 4 means a
   name is wrong, 5 means resolve (or, for a retryable conflict, retry), 6
@@ -86,4 +115,6 @@ change costlier. This record fixes them before 0.1.
   and the end-to-end tests were updated with this change.
 - New error sites must pick a kind deliberately; `CliError::user` is the
   default and means exit 1.
-- `docs/CLI.md` lists the codes for users and agents.
+- An agent with `--json` never parses free text: success and failure are
+  both one JSON document on stdout.
+- `docs/CLI.md` lists the codes and the JSON shape for users and agents.
