@@ -431,6 +431,10 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   `gc_profile` times GC phases and counts store calls.
 
 ### Fixes
+- `leep-git import` and `export` no longer fail with "Entry too large to fit
+  in memory" on objects over 16 MiB when the git repository belongs to
+  another user (as in the server container): gix's reduced-trust allocation
+  cap is replaced by an explicit 4 GiB limit. Found importing Linux.
 - Processes opening a new SQLite metadata file at the same moment (servers
   starting together, or `migrate` beside a server) no longer fail with
   "database is locked": switching the file to WAL can report a busy database

@@ -166,7 +166,7 @@ pub async fn export(
     opts: &ExportOptions,
 ) -> Result<ExportReport> {
     let ts = if git_dir.exists() {
-        gix::open(git_dir).map_err(gerr)?
+        crate::open_git(git_dir)?
     } else {
         gix::init_bare(git_dir).map_err(gerr)?
     }
