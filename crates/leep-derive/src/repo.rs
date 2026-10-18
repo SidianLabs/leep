@@ -329,6 +329,18 @@ impl Repo {
         }
     }
 
+    /// A handle on other stores sharing this one's caches, queues and policy:
+    /// the staged stores of a land batch (ADR 0043). The caches hold only
+    /// facts fixed by content, true whether or not the staged writes are
+    /// ever stored.
+    pub(crate) fn with_stores(&self, blobs: Arc<dyn BlobStore>, meta: Arc<dyn MetaStore>) -> Self {
+        Repo {
+            blobs,
+            meta,
+            ..self.clone()
+        }
+    }
+
     pub fn blobs(&self) -> &Arc<dyn BlobStore> {
         &self.blobs
     }

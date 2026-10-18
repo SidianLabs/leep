@@ -344,6 +344,25 @@ pub trait MetaStore: Send + Sync + 'static {
         Ok(id)
     }
 
+    /// Store many changesets and derived rows in one round trip: what a land
+    /// batch built (ADR 0043). Idempotent; rows are written as by
+    /// [`put_derived_many`](Self::put_derived_many).
+    ///
+    /// Database backends override it with one atomic write, so none of the
+    /// changesets is visible without the rows. The default writes the
+    /// changesets in order, then the rows, which callers must also survive
+    /// stopping part way.
+    async fn put_changesets_with_derived(
+        &self,
+        changesets: &[Changeset],
+        rows: &[DerivedRow],
+    ) -> Result<()> {
+        for cs in changesets {
+            self.put_changeset(cs).await?;
+        }
+        self.put_derived_many(rows).await
+    }
+
     /// Version of the newest schema migration applied (ADR 0023), for
     /// diagnostics. `None` for a store without a versioned schema.
     async fn schema_version(&self) -> Result<Option<u64>> {

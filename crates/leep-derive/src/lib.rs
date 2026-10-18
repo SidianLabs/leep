@@ -16,6 +16,7 @@ pub mod gc;
 mod history;
 pub mod integrity;
 mod land;
+mod land_stage;
 mod merge;
 pub mod owners;
 pub mod pack_order;

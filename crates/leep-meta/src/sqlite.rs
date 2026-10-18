@@ -578,6 +578,28 @@ impl MetaStore for SqliteMetaStore {
         Ok(id)
     }
 
+    /// One transaction, as for `put_changeset_with_derived`.
+    async fn put_changesets_with_derived(
+        &self,
+        changesets: &[Changeset],
+        rows: &[DerivedRow],
+    ) -> Result<()> {
+        if changesets.is_empty() && rows.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self.pool.begin().await.map_err(storage)?;
+        for cs in changesets {
+            sqlx::query("INSERT INTO changesets (id, data) VALUES (?, ?) ON CONFLICT DO NOTHING")
+                .bind(cs.id().0.as_bytes().as_slice())
+                .bind(cs.encode())
+                .execute(&mut *tx)
+                .await
+                .map_err(storage)?;
+        }
+        put_rows(&mut tx, rows).await?;
+        tx.commit().await.map_err(storage)
+    }
+
     async fn schema_version(&self) -> Result<Option<u64>> {
         let v: Option<i64> = sqlx::query_scalar("SELECT MAX(version) FROM schema_migrations")
             .fetch_one(&self.pool)

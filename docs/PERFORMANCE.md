@@ -271,9 +271,11 @@ the run above is flat.
 server. Each agent loops: read `main`, upload one blob, create a changeset on
 that head writing its own file (`agents/a<i>/f`, so nothing conflicts), and
 land it onto `main`. Every land except the first of a round is a replay, since
-the other agents moved the head meanwhile. The table reports lands per second
-over 10 s per N (after a one-second warm-up), the land request's latency, and
-from the server's metrics the CAS losses and the mean batch size:
+the other agents moved the head meanwhile. The tables report lands per second
+over 10 s per N (after a one-second warm-up), the land request's latency, the
+upload and create latencies of the same loop, and from the server's metrics
+the CAS losses, the mean time a land waits for its batch and the mean batch
+size:
 
 ```sh
 cargo build --release -p leep-server -p leep-soak
@@ -283,7 +285,66 @@ target/release/leep-land-bench --server http://127.0.0.1:7391 \
   --metrics http://127.0.0.1:7392 --agents 1,4,16,64 --duration 10
 ```
 
-Same 4 vCPU Xeon @ 2.80GHz as above, shared with another agent's builds (load
+**Staged batches (ADR 0043).** Group commit (below) made the ref move once per
+batch, but each replay inside the batch still went to the stores: on a 4-vCPU
+VPS (Postgres 16, blobs on a real disk) throughput was a flat 56 to 62 lands/s
+at 1, 4, 16 and 64 agents, batch mean 32 at 64 agents, land p50 0.9 s and lock
+wait 0.3 s. A batch of 32 took half a second. Timers in a local run of the
+same shape (Postgres, 64 agents, 45 lands/s) put 16 ms on each land in a batch:
+9 ms storing its replayed copy (three tree nodes written and fsynced, the
+condemnation read after them, the creation inputs, one transaction for the
+changeset and its rows), 4 ms in the first landed-copy scan of each batch
+(one `rebased-origin-v1` read per changeset the previous batch added), 3 ms of
+reads of the land's changeset and trees and the merge itself (0.5 ms). Each
+read or write was a round trip waiting for a connection of a pool the 64
+agents' uploads and creates also use. Trees were already patched along the
+changed paths only; computing a replay was never the cost.
+
+A batch now replays into a staging layer that keeps writes in memory and
+serves them back, and stores everything once before the swap: one wave of
+blob writes (then the GC rescue check), one `put_changesets_with_derived`.
+It also reads its lands' changesets and root trees and the head's rebase
+links in one round of batched reads. A replay in a batch then costs about
+2 ms (merge 0.7, building and staging the copy 0.6, reads 0.3 to 0.6), the
+landed-copy scans nothing, and a batch of 32 about 100 to 140 ms: the replays,
+20 to 45 ms of store (blobs 18 ms, metadata 4 to 16 ms), 20 ms of prefetch and
+a few milliseconds each for the ref read and swap, all of them waiting for
+pool connections behind the agents' uploads and creates.
+
+Same local 4 vCPU Xeon as below, shared with other agents' builds and
+benchmarks (load average 4 to 12), same harness. Before is `main` with group
+commit, after is staged batches; run alternately, two rounds, both shown
+(round 1 / round 2):
+
+| Store, agents | Lands/s before | Lands/s after | Land p50 ms before / after | p99 ms before / after | Put p50 ms after | Create p50 ms after | Lock wait mean ms before / after | Batch mean before / after |
+|---|---|---|---|---|---|---|---|---|
+| Postgres, 1 | 96 / 71 | 66 / 86 ¹ | 2.0 / 2.3 | 5 / 6 | 4.4 | 7.0 | 0.0 / 0.0 | 1.0 / 1.0 |
+| Postgres, 4 | 109 / 70 | 83 / 115 | 19-36 / 19-27 | 72-199 / 43-52 | 4.8-7.3 | 7.6-10.6 | 4-8 / 5-9 | 2.0 / 1.6 |
+| Postgres, 16 | 114 / 69 | 186 / 216 | 112-194 / 42-44 | 262-388 / 86-312 | 9.3-10.1 | 15.9-16.8 | 48-51 / 9-11 | 8.0 / 6.9-7.5 |
+| Postgres, 64 | 70 / 58 | 229 / 215 | 824-937 / 173-192 | 1029-1108 / 270-398 | 27-29 | 62-64 | 79-107 / 35-37 | 32 / 31 |
+| SQLite, 1 | 75 / 44 | 60 / 49 | 1.8-2.1 / 1.9-2.1 | 5-12 / 8-12 | 4.5-4.6 | 7.1-7.2 | 0.0 / 0.0 | 1.0 / 1.0 |
+| SQLite, 4 | 102 / 113 | 147 / 86 | 20-21 / 13-23 | 41-49 / 30-49 | 3.8-6.9 | 5.8-10.8 | 4-5 / 4-7 | 1.7 / 1.3-1.4 |
+| SQLite, 16 | 103 / 128 | 197 / 125 | 92-110 / 38-60 | 166-444 / 79-132 | 7.9-14.6 | 13.1-20.7 | 33-43 / 13-21 | 7.5 / 5.1 |
+| SQLite, 64 | 96 / 90 | 199 / 199 | 564-598 / 188-190 | 686-721 / 300-340 | 30-33 | 75-82 | 224-231 / 48 | 32 / 25-26 |
+
+¹ The lone land does the same store calls as before (no prefetch, nothing to
+store for a fast-forward). The first two rounds put it at 42 and 32 lands/s
+after a Postgres checkpoint from the previous run's dropped database; three
+back-to-back alternating 6 s runs gave 62 / 66, 86 / 86 and 75 / 75 lands/s,
+p50 1.8 to 2.4 ms on both, which the row shows.
+
+No run lost a CAS or answered 409. At 16 and 64 agents throughput is now
+2 to 4 times what it was and grows with the batch instead of staying flat;
+land p50 at 64 agents fell from about 0.9 s to 0.18 s. At 4 agents the loop is
+bound by its own latency (upload, create, land in turn), not by the batch.
+What is left per batch is mostly round trips that queue for one of the 16
+pool connections behind the agents' own uploads and creates (whose latency
+rises from 4 and 7 ms at one agent to 30 and 60-80 ms at 64): a leader that
+did not share the pool, or creates that cost fewer round trips, are the next
+steps. On the VPS, where each fsync is slower, storing a batch's blobs as one
+concurrent wave instead of a wave per land should matter more than here.
+
+**Group commit (ADR 0032).** Same 4 vCPU Xeon @ 2.80GHz as above, shared with another agent's builds (load
 average 2 to 6), harness and server on the same cores; a fresh database per
 run, Postgres 16 on a Unix socket or SQLite in WAL mode. Before and after were
 run alternately, two rounds each; the table shows the second round (the first

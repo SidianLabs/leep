@@ -636,6 +636,42 @@ impl MetaStore for PostgresMetaStore {
         Ok(id)
     }
 
+    /// One statement, as for `put_changeset_with_derived`, with the
+    /// changesets in id order so concurrent batches lock them in one order.
+    async fn put_changesets_with_derived(
+        &self,
+        changesets: &[Changeset],
+        rows: &[DerivedRow],
+    ) -> Result<()> {
+        if changesets.is_empty() && rows.is_empty() {
+            return Ok(());
+        }
+        let encoded: Vec<(ChangesetId, Vec<u8>)> =
+            changesets.iter().map(|c| (c.id(), c.encode())).collect();
+        let ids: Vec<&[u8]> = encoded
+            .iter()
+            .map(|(id, _)| id.0.as_bytes().as_slice())
+            .collect();
+        let data: Vec<&[u8]> = encoded.iter().map(|(_, d)| d.as_slice()).collect();
+        let (kinds, keys, values) = derived_columns(rows);
+        sqlx::query(
+            "WITH c AS (INSERT INTO changesets (id, data) \
+             SELECT * FROM UNNEST($1::bytea[], $2::bytea[]) ORDER BY 1 ON CONFLICT DO NOTHING) \
+             INSERT INTO derived (kind, key, value) \
+             SELECT * FROM UNNEST($3::text[], $4::bytea[], $5::bytea[]) ORDER BY 1, 2 \
+             ON CONFLICT (kind, key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(ids)
+        .bind(data)
+        .bind(kinds)
+        .bind(keys)
+        .bind(values)
+        .execute(&self.pool)
+        .await
+        .map_err(storage)?;
+        Ok(())
+    }
+
     async fn schema_version(&self) -> Result<Option<u64>> {
         let v: Option<i64> = sqlx::query_scalar("SELECT MAX(version) FROM schema_migrations")
             .fetch_one(&self.pool)
