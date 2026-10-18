@@ -536,7 +536,12 @@ through changesets whose root tree is still loose, packs the loose objects,
 and merges the smallest packs by a geometric rule, so the pack count stays
 logarithmic and at most `--max-packs`. Merged entries whose base does not
 change are copied frame for frame. `--full` walks all history and rewrites
-everything into one pack. Backups copy packs and their tombstones as files
+everything into one pack. The walk and the writer hold each hash once and
+name objects by `u32` ids (a sorted table of the run's objects, whose ranks
+are the ids, and `leep_core::intern` in the walk), about 140 bytes per
+object for a full repack. Compression runs on one thread per CPU; a single
+writer thread picks each frame in order, so the pack's bytes do not depend
+on the thread count. Backups copy packs and their tombstones as files
 (`leep_store::packfiles`, `sync::sync_packs`) before the object-by-object
 copy, which then finds the packed objects present. A read
 decodes the chain iteratively and checks the result against its hash. GC

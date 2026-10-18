@@ -253,88 +253,146 @@ impl PackIndex {
     /// passes pack order); each `base` is a position in `entries`, of an
     /// entry at a lower offset. Hashes must be distinct.
     pub fn encode(pack_len: u64, pack_hash: [u8; 32], entries: &[IdxEntry]) -> Result<Vec<u8>> {
-        let bad = |why: &str| Error::Storage(format!("cannot write pack index: {why}"));
         let count = entries.len();
         if count >= u32::MAX as usize {
-            return Err(bad("too many objects"));
+            return Err(encode_err("too many objects"));
         }
         let mut order: Vec<u32> = (0..count as u32).collect();
         order.sort_unstable_by_key(|&i| entries[i as usize].hash);
-        if order
-            .windows(2)
-            .any(|w| entries[w[0] as usize].hash == entries[w[1] as usize].hash)
-        {
-            return Err(bad("duplicate hash"));
-        }
         let mut rank = vec![0u32; count];
         for (r, &i) in order.iter().enumerate() {
             rank[i as usize] = r as u32;
         }
-        let modified_base = entries.iter().map(|e| e.modified).min().unwrap_or(0);
+        for (i, e) in entries.iter().enumerate() {
+            if let Some(b) = e.base {
+                if b as usize == i || b as usize >= count {
+                    return Err(encode_err("base missing or not earlier in the pack"));
+                }
+            }
+        }
+        Self::encode_sorted(pack_len, pack_hash, count, |r| {
+            let e = entries[order[r] as usize];
+            IdxEntry {
+                base: e.base.map(|b| rank[b as usize]),
+                ..e
+            }
+        })
+    }
+
+    /// Serialize as `LEEPIDX2` from `count` entries given in hash order by
+    /// `entry(rank)`, each `base` a rank. Called a few times per entry, so
+    /// a writer can keep its records in whatever compact form it likes.
+    pub fn encode_sorted(
+        pack_len: u64,
+        pack_hash: [u8; 32],
+        count: usize,
+        entry: impl Fn(usize) -> IdxEntry,
+    ) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        Self::encode_sorted_to(pack_len, pack_hash, count, entry, &mut |b: &[u8]| {
+            out.extend_from_slice(b);
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    /// [`encode_sorted`](Self::encode_sorted), handing the bytes to `sink`
+    /// in pieces instead of holding the whole index: at 45 bytes per object
+    /// it would be a third of a large repack's memory.
+    pub fn encode_sorted_to(
+        pack_len: u64,
+        pack_hash: [u8; 32],
+        count: usize,
+        entry: impl Fn(usize) -> IdxEntry,
+        sink: &mut dyn FnMut(&[u8]) -> Result<()>,
+    ) -> Result<()> {
+        if count >= u32::MAX as usize {
+            return Err(encode_err("too many objects"));
+        }
         let mut w = Widths {
             offset: 1,
             stored: 1,
             base: width_of(count as u64, 1),
             len: 0,
             modified: 0,
-            modified_base,
+            modified_base: 0,
         };
-        for (i, e) in entries.iter().enumerate() {
+        let mut fanout = [0u32; 256];
+        let mut prev: Option<Hash> = None;
+        let mut modified_base = i64::MAX;
+        for r in 0..count {
+            let e = entry(r);
+            if prev.is_some_and(|p| p >= e.hash) {
+                return Err(encode_err("duplicate hash"));
+            }
+            prev = Some(e.hash);
             if let Some(b) = e.base {
-                let ok = entries
-                    .get(b as usize)
-                    .is_some_and(|base| b as usize != i && base.offset < e.offset);
+                let ok =
+                    (b as usize) < count && b as usize != r && entry(b as usize).offset < e.offset;
                 if !ok {
-                    return Err(bad("base missing or not earlier in the pack"));
+                    return Err(encode_err("base missing or not earlier in the pack"));
                 }
             }
             if e.offset
                 .checked_add(e.stored_len)
                 .is_none_or(|end| end > pack_len)
             {
-                return Err(bad("entry outside the pack"));
+                return Err(encode_err("entry outside the pack"));
             }
             w.offset = w.offset.max(width_of(e.offset, 1));
             w.stored = w.stored.max(width_of(e.stored_len, 1));
             w.len = w.len.max(width_of(e.len, 0));
-            w.modified = w
-                .modified
-                .max(width_of(e.modified.abs_diff(modified_base), 0));
-        }
-        let mut out = Vec::with_capacity(HASHES_AT + count * (32 + w.record()) + IDX_TRAILER_LEN);
-        out.extend_from_slice(&IDX_MAGIC);
-        out.extend_from_slice(&(count as u64).to_be_bytes());
-        out.extend_from_slice(&pack_len.to_be_bytes());
-        out.extend_from_slice(&pack_hash);
-        out.extend_from_slice(&modified_base.to_be_bytes());
-        for width in [w.offset, w.stored, w.base, w.len, w.modified] {
-            out.push(width as u8);
-        }
-        out.extend_from_slice(&[0; 3]);
-        let mut fanout = [0u32; 256];
-        for e in entries {
+            modified_base = modified_base.min(e.modified);
             fanout[usize::from(e.hash.as_bytes()[0])] += 1;
         }
+        if count == 0 {
+            modified_base = 0;
+        }
+        w.modified_base = modified_base;
+        for r in 0..count {
+            w.modified = w
+                .modified
+                .max(width_of(entry(r).modified.abs_diff(modified_base), 0));
+        }
+        let mut sum = blake3::Hasher::new();
+        let mut buf: Vec<u8> = Vec::with_capacity(HASHES_AT.max(1 << 16) + 64);
+        let mut flush = |buf: &mut Vec<u8>, force: bool| -> Result<()> {
+            if force || buf.len() >= 1 << 16 {
+                sum.update(buf);
+                sink(buf)?;
+                buf.clear();
+            }
+            Ok(())
+        };
+        buf.extend_from_slice(&IDX_MAGIC);
+        buf.extend_from_slice(&(count as u64).to_be_bytes());
+        buf.extend_from_slice(&pack_len.to_be_bytes());
+        buf.extend_from_slice(&pack_hash);
+        buf.extend_from_slice(&modified_base.to_be_bytes());
+        for width in [w.offset, w.stored, w.base, w.len, w.modified] {
+            buf.push(width as u8);
+        }
+        buf.extend_from_slice(&[0; 3]);
         let mut total = 0;
         for f in fanout {
             total += f;
-            out.extend_from_slice(&total.to_be_bytes());
+            buf.extend_from_slice(&total.to_be_bytes());
         }
-        for &i in &order {
-            out.extend_from_slice(entries[i as usize].hash.as_bytes());
+        for r in 0..count {
+            buf.extend_from_slice(entry(r).hash.as_bytes());
+            flush(&mut buf, false)?;
         }
-        for &i in &order {
-            let e = &entries[i as usize];
-            put_uint(&mut out, e.offset, w.offset);
-            put_uint(&mut out, e.stored_len, w.stored);
-            let base = e.base.map_or(0, |b| u64::from(rank[b as usize]) + 1);
-            put_uint(&mut out, base, w.base);
-            put_uint(&mut out, e.len, w.len);
-            put_uint(&mut out, e.modified.abs_diff(modified_base), w.modified);
+        for r in 0..count {
+            let e = entry(r);
+            put_uint(&mut buf, e.offset, w.offset);
+            put_uint(&mut buf, e.stored_len, w.stored);
+            put_uint(&mut buf, e.base.map_or(0, |b| u64::from(b) + 1), w.base);
+            put_uint(&mut buf, e.len, w.len);
+            put_uint(&mut buf, e.modified.abs_diff(modified_base), w.modified);
+            flush(&mut buf, false)?;
         }
-        let sum = blake3::hash(&out);
-        out.extend_from_slice(sum.as_bytes());
-        Ok(out)
+        flush(&mut buf, true)?;
+        sink(sum.finalize().as_bytes())
     }
 
     /// Parse and check an index of either layout: checksum, order, bounds,
@@ -466,13 +524,17 @@ impl PackIndex {
     }
 }
 
+fn encode_err(why: &str) -> Error {
+    Error::Storage(format!("cannot write pack index: {why}"))
+}
+
 fn zstd_err(what: &str, code: usize) -> Error {
     Error::Storage(format!("{what}: {}", zstd_safe::get_error_name(code)))
 }
 
 /// Compress `data` alone.
 pub fn compress_whole(data: &[u8], level: i32) -> Result<Vec<u8>> {
-    zstd::bulk::compress(data, level).map_err(|e| Error::Storage(format!("zstd: {e}")))
+    Compressor::default().whole(data, level)
 }
 
 /// Compress `data` with `base` as a reference prefix (zstd's `--patch-from`
@@ -480,26 +542,55 @@ pub fn compress_whole(data: &[u8], level: i32) -> Result<Vec<u8>> {
 /// content, even if the base happens to start with the dictionary magic.
 /// `None` when the pair is too large for one decoder window.
 pub fn compress_delta(base: &[u8], data: &[u8], level: i32) -> Result<Option<Vec<u8>>> {
-    let total = (base.len() + data.len()).max(1);
-    let window_log = usize::BITS - (total - 1).leading_zeros();
-    if window_log > MAX_DELTA_WINDOW_LOG {
-        return Ok(None);
+    Compressor::default().delta(base, data, level)
+}
+
+/// A zstd context kept across whole frames: creating one per frame cost
+/// several percent of a repack. A reused context writes the same bytes,
+/// because every parameter is reset and set again per frame. A delta's
+/// context borrows its base, so it is made per frame.
+#[derive(Default)]
+pub struct Compressor {
+    cctx: Option<zstd_safe::CCtx<'static>>,
+}
+
+impl Compressor {
+    /// As [`compress_whole`].
+    pub fn whole(&mut self, data: &[u8], level: i32) -> Result<Vec<u8>> {
+        let cctx = self.cctx.get_or_insert_with(zstd_safe::CCtx::create);
+        cctx.reset(zstd_safe::ResetDirective::SessionAndParameters)
+            .map_err(|c| zstd_err("zstd reset", c))?;
+        cctx.set_parameter(CParameter::CompressionLevel(level))
+            .map_err(|c| zstd_err("zstd parameter", c))?;
+        let mut out = Vec::with_capacity(zstd_safe::compress_bound(data.len()));
+        cctx.compress2(&mut out, data)
+            .map_err(|c| zstd_err("zstd compress", c))?;
+        Ok(out)
     }
-    let mut cctx = zstd_safe::CCtx::create();
-    let set = |cctx: &mut zstd_safe::CCtx, p| {
-        cctx.set_parameter(p)
-            .map_err(|c| zstd_err("zstd parameter", c))
-    };
-    set(&mut cctx, CParameter::CompressionLevel(level))?;
-    // The level's default window can be smaller than base plus object, which
-    // would hide the start of the base from the matcher.
-    set(&mut cctx, CParameter::WindowLog(window_log.max(10)))?;
-    cctx.ref_prefix(base)
-        .map_err(|c| zstd_err("zstd prefix", c))?;
-    let mut out = Vec::with_capacity(zstd_safe::compress_bound(data.len()));
-    cctx.compress2(&mut out, data)
-        .map_err(|c| zstd_err("zstd compress", c))?;
-    Ok(Some(out))
+
+    /// As [`compress_delta`].
+    pub fn delta(&self, base: &[u8], data: &[u8], level: i32) -> Result<Option<Vec<u8>>> {
+        let total = (base.len() + data.len()).max(1);
+        let window_log = usize::BITS - (total - 1).leading_zeros();
+        if window_log > MAX_DELTA_WINDOW_LOG {
+            return Ok(None);
+        }
+        let mut cctx = zstd_safe::CCtx::create();
+        let set = |cctx: &mut zstd_safe::CCtx, p| {
+            cctx.set_parameter(p)
+                .map_err(|c| zstd_err("zstd parameter", c))
+        };
+        set(&mut cctx, CParameter::CompressionLevel(level))?;
+        // The level's default window can be smaller than base plus object,
+        // which would hide the start of the base from the matcher.
+        set(&mut cctx, CParameter::WindowLog(window_log.max(10)))?;
+        cctx.ref_prefix(base)
+            .map_err(|c| zstd_err("zstd prefix", c))?;
+        let mut out = Vec::with_capacity(zstd_safe::compress_bound(data.len()));
+        cctx.compress2(&mut out, data)
+            .map_err(|c| zstd_err("zstd compress", c))?;
+        Ok(Some(out))
+    }
 }
 
 /// zstd's dictionary magic (`0xEC30A437`, little-endian). A base starting

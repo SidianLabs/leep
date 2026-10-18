@@ -1071,3 +1071,75 @@ async fn a_tombstone_append_killed_at_any_byte_loses_no_later_delete() {
         assert!(std::fs::read(&path).unwrap().ends_with(b"\n"), "{what}");
     }
 }
+
+/// Copy a store directory, keeping each file's modification time (packs
+/// record it), so two copies repack from the same input.
+fn copy_store(from: &Path, to: &Path) {
+    for e in std::fs::read_dir(from).unwrap().flatten() {
+        let (src, dst) = (e.path(), to.join(e.file_name()));
+        if src.is_dir() {
+            std::fs::create_dir_all(&dst).unwrap();
+            copy_store(&src, &dst);
+        } else {
+            std::fs::copy(&src, &dst).unwrap();
+            let mtime = std::fs::metadata(&src).unwrap().modified().unwrap();
+            let f = std::fs::File::options().write(true).open(&dst).unwrap();
+            f.set_modified(mtime).unwrap();
+        }
+    }
+}
+
+/// Compression runs on several threads, but every choice of frame depends
+/// only on the objects before it: the pack is the same for any thread
+/// count, with chains past the cap, frames copied from an old pack, and
+/// hints that name bases later in the order or not stored at all.
+#[tokio::test]
+async fn the_pack_does_not_depend_on_the_thread_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FsBlobStore::new(dir.path());
+    let mut chains: Vec<Vec<Hash>> = Vec::new();
+    for f in 0..4 {
+        let mut chain = Vec::new();
+        for (i, v) in versions(45).into_iter().enumerate() {
+            let v = Bytes::from(format!("file {f}\n{}", String::from_utf8_lossy(&v)));
+            if i == 20 && f == 0 {
+                // Half of one file packed already: its frames are reused.
+                let old: Vec<(Hash, Option<Hash>)> = chain_hints(&chain);
+                repack(&store, old).await;
+            }
+            chain.push(store.put(v).await.unwrap());
+        }
+        chains.push(chain);
+    }
+    let mut hints: Vec<(Hash, Option<Hash>)> = chains.iter().flat_map(|c| chain_hints(c)).collect();
+    // A base named after its delta, a base that is not stored, a self-base.
+    hints.swap(50, 51);
+    hints.push((chains[1][3], Some(Hash::of_blob(b"not stored"))));
+    hints.insert(0, (chains[2][7], Some(chains[2][7])));
+    let mut ids = Vec::new();
+    for threads in [1, 2, 8] {
+        let copy = tempfile::tempdir().unwrap();
+        copy_store(dir.path(), copy.path());
+        let s = FsBlobStore::new(copy.path());
+        let opts = RepackOptions {
+            threads,
+            ..RepackOptions::default()
+        };
+        let r = s
+            .repack_publish(hints.clone(), opts)
+            .await
+            .unwrap()
+            .finish()
+            .await
+            .unwrap();
+        assert!(r.frames_reused > 10, "{r:?}");
+        assert!(r.deltas > 100 && r.whole > 4, "{r:?}");
+        let id = r.pack_id.clone().unwrap();
+        let bytes = std::fs::read(copy.path().join(format!("packs/{id}.pack"))).unwrap();
+        ids.push((id, bytes));
+    }
+    assert!(
+        ids.windows(2).all(|w| w[0] == w[1]),
+        "same pack for 1, 2, 8 threads"
+    );
+}

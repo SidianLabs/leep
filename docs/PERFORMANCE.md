@@ -733,6 +733,40 @@ uploaded ahead of the writer wrote claim batches that shared blobs in
 different orders. Batched statements now insert in `(kind, key)` order (ADR
 0031); a test races overlapping batches on every backend.
 
+### Importer memory
+
+The import of all of Linux grew to about 8.5 GB and was restarted by a
+guard, while its own maps (blobs by git id, commits imported this run)
+stay well under 1 GB. Profiled with heaptrack and `/proc/<pid>/status`
+sampled every 2 s on two local imports (SQLite metadata, filesystem blobs,
+4 vCPU sandbox):
+
+- **Whole commits buffered.** A commit's new blobs were all read into memory
+  before any was uploaded, and 16 commits run ahead. Linux's first commit
+  adds 187 MB in 17,118 files; heaptrack's peak heap was 222 MB, almost all
+  of it that buffer. Blobs are now read and uploaded in 8 MB slices.
+- **Allocator retention.** glibc keeps freed memory in per-thread arenas (up
+  to eight per CPU), and the importer frees blob buffers on other threads
+  than the ones that read them. After the slices, heap peaked at 59 MB but
+  anonymous memory still reached 243 MB and kept growing; with two arenas it
+  ended at 78 MB, and the import ran faster. `leep-git` now restarts itself
+  with `MALLOC_ARENA_MAX=2` unless it is set.
+- **Mapped packs.** gix maps the pack files, and every page read stays
+  resident in the process (file-backed, reclaimable, but counted by RSS-based
+  guards). Over all of Linux that approaches the whole multi-gigabyte pack.
+  The importer now opens a fresh repository handle every 20,000 commits,
+  which unmaps what the previous one read.
+
+| | Before | After |
+|---|---|---|
+| git/git to v1.7.0 (21,205 commits): time, peak RSS, anonymous at the end | 3:16, 165 MB, 97 MB | **2:29, 98 MB, 45 MB** |
+| Linux to v2.6.16 (21,109 commits, 76,000 blobs): time, peak RSS | 5:30, 496 MB | **3:56, 212 MB** |
+| Linux slice: RSS at 1, 2, 4 min, and at the end (anonymous + file) | 428, 463, 484 MB; 353 + 130 MB | **151, 173, 193 MB; 78 + 73 MB** |
+
+Both importers produced the same head changeset. What still grows with
+history is the blob map (about 100 bytes per distinct blob, a few hundred
+MB for Linux) and the commit map, both well under 1 GB.
+
 ### Merge base
 
 On all of git/git (82,500 commits) on the VPS, `GET /v1/merge-base` of `main`
@@ -824,8 +858,9 @@ git/git (a local Postgres 16, filesystem blobs; 4 vCPU Intel Xeon @ 2.10GHz,
 
 10,795 objects were stored as deltas and 940 whole; the mean delta chain is 12
 entries (cap 32). The run took 8.4 s: 3.6 s walking history for bases, 4.6 s
-compressing and writing (single-threaded, two compressions per object to pick
-the smaller), 0.2 s deleting the loose copies. `verify --full --rehash`
+compressing and writing (single-threaded then, two compressions per object to
+pick the smaller; compression now runs on every CPU, see "Repack memory and
+time"), 0.2 s deleting the loose copies. `verify --full --rehash`
 reports the packed copy clean in the same 47 s as the loose one (it is
 dominated by checking derived rows).
 
@@ -986,6 +1021,73 @@ both), because the first new version of each path is written whole (its base
 is in an older pack). Writing a whole copy of that base and a delta instead
 was measured on every such chain head (about 256 per round): 3.6% larger
 than writing the version whole.
+
+### Repack memory and time
+
+A full repack of all of Linux (10.08M objects) on the VPS peaked at about
+6.2 GiB, roughly 620 bytes per object, and took 4 h 55 min (1 h 23 min
+walking, the rest writing). Almost all of that memory was per-object
+structures keyed by 32-byte hashes, each hash held several times over:
+
+| Held during a full repack (bytes per object) | Before | After |
+|---|---|---|
+| Walk output (object, base) | 65 (`(Hash, Option<Hash>)`) | 8 (two `u32` ids) plus each hash once, 32 |
+| Walk's seen set, roots, changeset maps | 40-80, plus 64 and about 350 per changeset | 1 bit, plus about 10 for the id table and 60 per changeset |
+| Sources (loose path and mtime, packed entry) | 170-340 in a `HashMap<Hash, Source>`, plus about 100 of path per loose object | 16 in two arrays by id |
+| Live set, placed set, write order, old bases | 40-80 + 40-80 + 65 + 65 | one sorted hash table of 32 (ids are ranks), 8 for the order, 1 bit placed |
+| Written map and index records | 50-100 + 72 | 4 (position) + 1 (depth) + 28 (four arrays) |
+| Index encoding | 8 + 45 (the whole new index in memory) | 4; the index is streamed to its file twice, once for its id |
+| Old pack index, loaded by the store | 45 | 45 (unchanged) |
+| Base cache | 256 MiB of data, plus about 150 bytes of bookkeeping per entry without a count limit (280 MB for small objects) | 256 MiB including bookkeeping, at most 131,072 entries |
+
+Measured with `cargo run --release -p leep-store --example repack_scale`
+(synthetic 350-byte objects in chains of 32, written in batches of 500,000
+and packed incrementally, then `full` in a fresh process; peak is `VmHWM`;
+4 vCPU sandbox, release build, the same input copied for each run):
+
+| Full repack of a packed store | Before: peak / write | After: peak / write |
+|---|---|---|
+| 1,000,000 objects | 1,307 MB / 21.4 s | **315 MB** / 14.0 s |
+| 3,000,000 objects | 2,230 MB / 58.4 s | **601 MB** / 48.0 s |
+| Slope | 462 bytes per object | **143 bytes per object** (45 of them the old pack's index) |
+
+Projected to Linux's 10.08M objects: about 1.6 GB instead of 6.2 GiB. Every
+pack and index above was byte-identical between the two binaries.
+
+Time. Writing was single-threaded, and each object is compressed twice
+(whole, and against its base, to keep the smaller), so zstd at level 9 took
+nearly all of it. Compression now runs on one thread per CPU
+(`--threads`): a reader thread reads objects in order, worker threads make
+both candidate frames, and a writer thread picks between them in order with
+the same rules (the base written, within the chain cap, the delta smaller),
+so the bytes do not depend on the thread count. Whole frames reuse one zstd
+context per thread (about 15% of single-threaded write time went to creating
+contexts and clearing their tables); a delta's context borrows its base, so
+it is still made per frame. The walk reads changesets and root trees in
+batches of 1,000 and reads tree nodes through the shared tree cache (the
+parent's node is usually the one just read). The fsyncs are one per pack and
+index and do not show in profiles.
+
+Full repacks on SQLite stores imported with `leep-git import`, the same
+input copied for each run (4 vCPU sandbox with another build running beside
+it; walk / write / total, peak RSS):
+
+| | Before | After |
+|---|---|---|
+| git/git to v1.7.0: 21,205 changesets, 71,122 loose objects (1.21 GB) | 33.0 / 85.6 / 120.7 s, 405 MB | **12.7 / 24.4 / 39.1 s**, 433 MB |
+| Linux to v2.6.16: 21,109 changesets, 168,402 loose objects | 52.7 / 163.4 / 220.3 s, 484 MB | **27.4 / 39.4 / 71.4 s**, 501 MB |
+| git/git v1.7.0 packed plus v1.8.0 loose (38,796), incremental, merging the pack | 21.6 / 48.1 / 70.7 s, 486 MB | **13.2 / 18.2 / 32.7 s**, 530 MB |
+| The same store, `--full` | 47.3 / 47.4 / 95.7 s, 537 MB | **23.6 / 19.2 / 43.7 s**, 565 MB |
+
+The pack and index files were byte-identical (same checksums) in every
+row. At these sizes the fixed caches (256 MiB of bases, 64 MiB of decoded
+objects, 32 MiB of tree nodes) dominate peak memory, and the new writer
+holds up to 64 MiB of objects in flight and a zstd context per thread, so
+peak RSS is 5 to 10% higher; the per-object savings show from about a
+million objects. With every frame copied from an old pack (the synthetic
+runs above), compression is idle and the single reader, which decodes each
+object and checks its hash, sets the pace. Decoding on the worker threads
+is the next step for merge-heavy repacks.
 
 ## Path history on Linux
 

@@ -438,6 +438,22 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   one repack runs at a time through a lease object (`packs/repack.lease`)
   written with conditional PUTs. Upgrade every server that reads the bucket
   before the first repack: older servers do not read packs.
+- `leep-server repack` holds each hash once and refers to objects by `u32`
+  ids everywhere else, streams the new index to its file instead of holding
+  it, and compresses on every CPU (`--threads`, default one per CPU) with
+  the same frame choices, so packs and indexes are byte-identical to before.
+  A full repack of a packed store takes 143 bytes per object instead of 462
+  (3M synthetic objects: 601 MB peak instead of 2,230 MB), projecting about
+  1.6 GB for all of Linux instead of 6.2 GiB. Full repacks of imported
+  stores run about 3x faster (Linux to v2.6.16: 71 s instead of 220 s); the
+  walk reads changesets and root trees in batches. `repack_publish` takes
+  `impl Into<PackHints>` (`leep_core::intern`), and `pack_order` returns
+  `PackHints`. New example `repack_scale`.
+- `leep-git import` reads and uploads a commit's new blobs in 8 MB slices
+  instead of all at once, reopens the git repository every 20,000 commits so
+  mapped pack pages are released, and restarts itself with
+  `MALLOC_ARENA_MAX=2` (glibc). Importing Linux to v2.6.16 peaks at 212 MB
+  instead of 496 MB and takes 3:56 instead of 5:30.
 - `log` without a path, `log` filtered by author or `extra`, and
   provenance read history in batches instead of a changeset at a time
   (ADR 0030): on the first 3,795 commits of git/git on Postgres, a log of the

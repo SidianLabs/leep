@@ -8,6 +8,7 @@ pub mod api;
 pub mod changeset;
 pub mod error;
 pub mod hash;
+pub mod intern;
 pub mod memory;
 pub mod path;
 pub mod prefix;

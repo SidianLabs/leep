@@ -161,7 +161,10 @@ impl Site {
         };
         let walk = t.elapsed();
         let copies = if measure_copies {
-            Some(self.base_copy_cost(&order.objects).await)
+            Some(
+                self.base_copy_cost(&order.objects.iter().collect::<Vec<_>>())
+                    .await,
+            )
         } else {
             None
         };
