@@ -550,7 +550,10 @@ impl HistoryTree {
         // the parents' entries for paths one side never touched.
         let common = match cs.parents.as_slice() {
             [a, b] => match repo.merge_base(*a, *b).await? {
-                Some(c) => Some(decode_hash(&super::derive::<HistoryTree>(repo, c).await?)?),
+                Some(c) => Some((
+                    c,
+                    decode_hash(&super::derive::<HistoryTree>(repo, c).await?)?,
+                )),
                 None => None,
             },
             _ => None,
@@ -567,7 +570,7 @@ impl HistoryTree {
         let mut touched: BTreeSet<String> =
             cs.changes.keys().map(|p| p.as_str().to_string()).collect();
         match common {
-            Some(c) => diff_history(repo, c, heads[1], &mut touched).await?,
+            Some((_, c)) => diff_history(repo, c, heads[1], &mut touched).await?,
             None => {
                 for &other in heads.iter().skip(1) {
                     diff_history(repo, base, other, &mut touched).await?;
@@ -610,9 +613,9 @@ impl HistoryTree {
         for h in &mut other_hist {
             h.preload(&paths).await;
         }
-        let mut merge = MergeAncestry::new(repo, &cs.parents, common);
+        let mut merge = MergeAncestry::new(repo, &cs.parents, common).await?;
         if let Some(Some(c)) = merge.bases.get_mut(&(0, 1)) {
-            c.preload(&paths).await;
+            c.history.preload(&paths).await;
         }
         let mut kids: HashMap<&str, Vec<&str>> = HashMap::new();
         for p in &paths {
@@ -639,7 +642,7 @@ impl HistoryTree {
                 }
                 let at_common = match sets.len() {
                     2 => match merge.base(repo, 0, 1).await? {
-                        Some(c) => Some(changed_of(c.entry(p).await?)),
+                        Some(c) => Some(changed_of(c.history.entry(p).await?)),
                         None => None,
                     },
                     _ => None,
@@ -724,45 +727,57 @@ fn inherit(
 
 /// `maximal` of the parents' sets at a path, when [`inherit`] does not
 /// settle it. Most ancestry questions are answered from the history at the
-/// parents' merge bases; the rest share one walk per parent instead of
-/// walking history once per pair of ids and path, which made a Linux merge
-/// take seconds and its twelve-parent merge minutes.
+/// parents' merge bases and their generations; the rest share one walk per
+/// parent instead of walking history once per pair of ids and path, which
+/// made a Linux merge take seconds and its twelve-parent merge minutes.
 struct MergeAncestry<'a> {
     parents: Vec<ChangesetId>,
     /// Ancestors of each parent, walked as deep as questions needed.
     walks: Vec<Option<Ancestors>>,
-    /// History at the merge base of each pair of parents, `None` inside for
-    /// unrelated ones.
-    bases: HashMap<(usize, usize), Option<HistCursor<'a>>>,
+    /// The merge base of each pair of parents, `None` inside for unrelated
+    /// ones.
+    bases: HashMap<(usize, usize), Option<MergeBase<'a>>>,
 }
 
+/// The merge base of two parents: its rank and its history.
+struct MergeBase<'a> {
+    key: (u64, ChangesetId),
+    history: HistCursor<'a>,
+    /// Whether the two parents provably have no common ancestor outside the
+    /// merge base's ancestors, once asked (see [`MergeAncestry::behind`]).
+    sole: Option<bool>,
+}
+
+/// Changesets [`Repo::side_is_clear`] may walk per side before giving up.
+const SIDE_BUDGET: usize = 10_000;
+
 impl<'a> MergeAncestry<'a> {
-    /// `first_two`: at a two-parent merge, the history root at the parents'
-    /// merge base, already found (`None` for unrelated parents).
-    fn new(repo: &'a Repo, parents: &[ChangesetId], first_two: Option<Hash>) -> Self {
+    /// `first_two`: at a two-parent merge, the parents' merge base and the
+    /// history root there, already found (`None` for unrelated parents).
+    async fn new(
+        repo: &'a Repo,
+        parents: &[ChangesetId],
+        first_two: Option<(ChangesetId, Hash)>,
+    ) -> Result<Self> {
         let mut bases = HashMap::new();
         if parents.len() == 2 {
-            bases.insert((0, 1), first_two.map(|r| HistCursor::new(repo, r)));
+            let base = match first_two {
+                Some((m, root)) => Some(MergeBase::new(repo, m, root).await?),
+                None => None,
+            };
+            bases.insert((0, 1), base);
         }
-        MergeAncestry {
+        Ok(MergeAncestry {
             parents: parents.to_vec(),
             walks: parents.iter().map(|_| None).collect(),
             bases,
-        }
+        })
     }
 
     /// An id of a parent's set is dropped if it lies strictly behind an id of
     /// another parent's set; `sets[j]` holds the maximal changes behind
-    /// parent `j`, so that is when it lies behind parent `j` and is not in
-    /// `sets[j]`. For `x` in `sets[i]` and the merge base `m` of parents `i`
-    /// and `j`, whose set covers every change behind it and is covered by
-    /// `sets[i]`:
-    ///
-    /// - `x` in `m`'s set lies behind `m`, so behind parent `j`: dropped.
-    /// - Otherwise `x` is not behind `m`, and can only be behind parent `j`
-    ///   as a common ancestor other than the merge base (criss-cross
-    ///   merges): checked against a walk of parent `j`'s ancestors, then
-    ///   exactly.
+    /// parent `j`, so that is exactly when it lies behind parent `j` and is
+    /// not in `sets[j]` (see [`MergeAncestry::behind`]).
     async fn maximal(
         &mut self,
         repo: &'a Repo,
@@ -779,10 +794,7 @@ impl<'a> MergeAncestry<'a> {
                 .position(|s| s.contains(&x))
                 .expect("x comes from a set");
             for (j, set) in sets.iter().enumerate() {
-                if !set.is_empty()
-                    && !set.contains(&x)
-                    && self.behind(repo, path, x, i, j, set).await?
-                {
+                if !set.is_empty() && !set.contains(&x) && self.behind(repo, path, x, i, j).await? {
                     continue 'next;
                 }
             }
@@ -791,8 +803,24 @@ impl<'a> MergeAncestry<'a> {
         Ok(keep)
     }
 
-    /// Whether `x`, in parent `i`'s set and not in `set`, parent `j`'s, lies
-    /// behind an id of `set`.
+    /// Whether `x`, a change in parent `i`'s set, lies behind parent `j`.
+    ///
+    /// `sets[j]` covers every change behind parent `j`, so if `x` lies
+    /// behind it and is not in `sets[j]`, it lies strictly behind an id of
+    /// `sets[j]`: no check against that set's ids is needed. With `m` the
+    /// merge base of the two parents, whose set covers every change behind
+    /// it and whose changes behind parent `i` are covered by `sets[i]`:
+    ///
+    /// - `x` in `m`'s set lies behind `m`, so behind parent `j`.
+    /// - Otherwise `x` is not behind `m` (it would be in `m`'s set, being
+    ///   maximal behind parent `i`), so it is behind parent `j` only as a
+    ///   common ancestor outside `m`'s ancestors (criss-cross merges). Such
+    ///   a common ancestor ranks below `m`, the best one, by (generation,
+    ///   id); and there is none if one parent's ancestors outside `m`'s
+    ///   that rank below `m` are all behind `m` (a branch forked from `m`,
+    ///   however old). Only then is parent `j`'s walk asked, which is the
+    ///   walk an old-based merge of a small branch used to pay for: from
+    ///   the tip down to the oldest such `x`.
     async fn behind(
         &mut self,
         repo: &'a Repo,
@@ -800,12 +828,48 @@ impl<'a> MergeAncestry<'a> {
         x: ChangesetId,
         i: usize,
         j: usize,
-        set: &[ChangesetId],
     ) -> Result<bool> {
-        if let Some(base) = self.base(repo, i.min(j), i.max(j)).await? {
-            if changed_of(base.entry(path).await?).contains(&x) {
-                return Ok(true);
+        let (lo, hi) = (i.min(j), i.max(j));
+        let parents = (self.parents[lo], self.parents[hi]);
+        let Some(base) = self.base(repo, lo, hi).await? else {
+            // Unrelated parents share no ancestor.
+            return Ok(false);
+        };
+        if changed_of(base.history.entry(path).await?).contains(&x) {
+            return Ok(true);
+        }
+        let gx = repo.generation(x).await?;
+        if (gx, x) > base.key {
+            return Ok(false);
+        }
+        let sole = match base.sole {
+            Some(s) => s,
+            None => {
+                let (gm, m) = base.key;
+                let (ga, gb) = (
+                    repo.generation(parents.0).await?,
+                    repo.generation(parents.1).await?,
+                );
+                // The side closer to the merge base first: usually the
+                // branch, a few changesets.
+                let sides = if gb - gm <= ga - gm {
+                    [parents.1, parents.0]
+                } else {
+                    [parents.0, parents.1]
+                };
+                let mut s = false;
+                for tip in sides {
+                    if repo.side_is_clear(tip, (gm, m), SIDE_BUDGET).await? {
+                        s = true;
+                        break;
+                    }
+                }
+                base.sole = Some(s);
+                s
             }
+        };
+        if sole {
+            return Ok(false);
         }
         let walk = match &mut self.walks[j] {
             Some(w) => w,
@@ -814,33 +878,37 @@ impl<'a> MergeAncestry<'a> {
                 slot.insert(Ancestors::new(tip, repo.generation(tip).await?))
             }
         };
-        if !walk.contains(repo, x, repo.generation(x).await?).await? {
-            return Ok(false);
-        }
-        for &y in set {
-            if repo.is_ancestor(x, y).await? {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+        walk.contains(repo, x, gx).await
     }
 
-    /// The history at the merge base of parents `a` and `b`.
+    /// The merge base of parents `a` and `b`.
     async fn base(
         &mut self,
         repo: &'a Repo,
         a: usize,
         b: usize,
-    ) -> Result<Option<&mut HistCursor<'a>>> {
+    ) -> Result<Option<&mut MergeBase<'a>>> {
         if !self.bases.contains_key(&(a, b)) {
-            let root = match repo.merge_base(self.parents[a], self.parents[b]).await? {
-                Some(m) => Some(decode_hash(&super::derive::<HistoryTree>(repo, m).await?)?),
+            let base = match repo.merge_base(self.parents[a], self.parents[b]).await? {
+                Some(m) => {
+                    let root = decode_hash(&super::derive::<HistoryTree>(repo, m).await?)?;
+                    Some(MergeBase::new(repo, m, root).await?)
+                }
                 None => None,
             };
-            self.bases
-                .insert((a, b), root.map(|r| HistCursor::new(repo, r)));
+            self.bases.insert((a, b), base);
         }
         Ok(self.bases.get_mut(&(a, b)).and_then(|c| c.as_mut()))
+    }
+}
+
+impl<'a> MergeBase<'a> {
+    async fn new(repo: &'a Repo, m: ChangesetId, root: Hash) -> Result<Self> {
+        Ok(MergeBase {
+            key: (repo.generation(m).await?, m),
+            history: HistCursor::new(repo, root),
+            sole: None,
+        })
     }
 }
 
@@ -1554,6 +1622,49 @@ mod tests {
                 assert_eq!(s, v, "last merge of {k}");
             }
         }
+    }
+
+    /// A merge of a small branch forked long before the tip, with a change
+    /// older than the fork still among the first parent's newest (the shape
+    /// of Linux's `work.thaw` merge): the index answers as the scan does,
+    /// and the merge base is the only common ancestor the branch side has.
+    #[tokio::test]
+    async fn an_old_based_merge_derives_correctly() {
+        use crate::wide_history::{build, Spec};
+        use crate::LogFilter;
+        use leep_core::memory::{MemoryBlobStore, MemoryMetaStore};
+        use std::sync::Arc;
+        let repo = Repo::new(
+            Arc::new(MemoryBlobStore::new()),
+            Arc::new(MemoryMetaStore::new()),
+        );
+        let mut spec = Spec::small(500).with_old_branch(150, 2);
+        spec.wide_min = 200;
+        spec.wide_step = 100;
+        let head = build(&repo, &spec).await;
+        let cs = repo.get_changeset(head).await.unwrap();
+        let [p1, p2] = cs.parents[..] else {
+            panic!("the head is a two-parent merge")
+        };
+        let m = repo.merge_base(p1, p2).await.unwrap().unwrap();
+        let gm = repo.generation(m).await.unwrap();
+        assert_eq!(repo.generation(p2).await.unwrap(), gm + 2);
+        assert!(repo.side_is_clear(p2, (gm, m), 10).await.unwrap());
+        for path in ["cherry", "cherry/pick.c", "cherry/new.c", "wide/w00"] {
+            let indexed = repo.log(head, Some(path), 50).await.unwrap();
+            let scanned = repo
+                .log_scan(head, Some(path), 50, &LogFilter::default())
+                .await
+                .unwrap();
+            let ids = |l: &[leep_core::api::ChangesetInfo]| -> Vec<ChangesetId> {
+                l.iter().map(|i| i.id).collect()
+            };
+            assert_eq!(ids(&indexed), ids(&scanned), "{path}");
+        }
+        // Both copies of the twice-applied change stay newest behind the
+        // first parent.
+        let at_p1 = repo.log(p1, Some("cherry/pick.c"), 10).await.unwrap();
+        assert_eq!(at_p1.len(), 2);
     }
 
     async fn rows_of(meta: &dyn leep_core::MetaStore) -> usize {

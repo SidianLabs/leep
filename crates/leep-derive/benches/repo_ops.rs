@@ -430,6 +430,38 @@ fn derive_history_index(c: &mut Criterion) {
             },
         )
     });
+    // One merge of a two-commit branch forked 200 changesets back, into a
+    // history of 3,000 with a change behind the first parent older than the
+    // fork (Linux's `work.thaw` shape, see "Path history on Linux"). The rest
+    // is derived first; each iteration derives a fresh copy of the merge on
+    // a `Repo` with nothing cached. Its cost should follow the branch and
+    // how far mainline moved since the fork, not the length of history.
+    let (stores, head) = rt.block_on(async {
+        let repo = new_repo();
+        let spec = wide_history::Spec::small(3000).with_old_branch(200, 2);
+        let head = wide_history::build(&repo, &spec).await;
+        let cs = repo.get_changeset(head).await.unwrap();
+        for p in &cs.parents {
+            repo.log(*p, Some("cherry"), 1).await.unwrap();
+        }
+        (repo, head)
+    });
+    g.bench_function("old_base_merge_3000_changesets", |b| {
+        timed(
+            &rt,
+            b,
+            || async {
+                let mut cs = stores.get_changeset(head).await.unwrap();
+                cs.message = format!("again {}", SEQ.fetch_add(1, Ordering::Relaxed));
+                let merge = stores.create_changeset(cs).await.unwrap();
+                let repo = Repo::new(stores.blobs().clone(), stores.meta().clone());
+                (repo, merge)
+            },
+            |(repo, merge)| async move {
+                repo.log(merge, Some("cherry"), 1).await.unwrap();
+            },
+        )
+    });
     g.finish();
 }
 

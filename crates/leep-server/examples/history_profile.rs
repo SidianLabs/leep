@@ -12,7 +12,10 @@
 //! `--synth N` first builds a synthetic late-Linux-shaped history of N
 //! changesets after its import (`--small` for the bench's smaller shape; see
 //! `leep-derive/benches/support/wide_history.rs`) and points `<rev>` at it;
-//! with `mem://` stores that is the only way to have a history. `--dump FILE`
+//! with `mem://` stores that is the only way to have a history; `--old-base
+//! BACK` ends it with a merge of a two-commit branch forked BACK changesets
+//! before the end. `--last` derives the head's first parent first and then
+//! times the head alone. `--dump FILE`
 //! writes every row of both kinds afterwards, sorted, as `kind key
 //! blake3(value)` lines, to compare two builds' rows.
 
@@ -258,7 +261,7 @@ fn status_kib(field: &str) -> u64 {
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let usage =
-        "usage: history_profile <meta url> <blob url> <rev> [--reset] [--synth N [--small]] [--dump FILE]";
+        "usage: history_profile <meta url> <blob url> <rev> [--reset] [--synth N [--small] [--old-base BACK]] [--last] [--dump FILE]";
     let meta_url = args.first().expect(usage);
     let blob_url = args.get(1).expect(usage);
     let rev = args.get(2).expect(usage);
@@ -276,6 +279,10 @@ async fn main() {
             wide_history::Spec::small(n)
         } else {
             wide_history::Spec::linux_like(n)
+        };
+        let spec = match flag("--old-base") {
+            Some(back) => spec.with_old_branch(back.parse().expect(usage), 2),
+            None => spec,
         };
         let t = Instant::now();
         let builder = Repo::new(raw_blobs.clone(), raw_meta.clone());
@@ -315,6 +322,20 @@ async fn main() {
             }
         })
     };
+    if args.iter().any(|a| a == "--last") {
+        let cs = repo.get_changeset(head).await.unwrap();
+        if let Some(&p) = cs.parents.first() {
+            derived::derive::<HistoryTree>(&repo, p).await.unwrap();
+            let t = Instant::now();
+            derived::derive::<HistoryTree>(&repo, head).await.unwrap();
+            println!(
+                "head ({} parents) alone: {:.3} s after {:.1} s for the rest",
+                cs.parents.len(),
+                t.elapsed().as_secs_f64(),
+                (t - started).as_secs_f64()
+            );
+        }
+    }
     derived::derive::<HistoryTree>(&repo, head).await.unwrap();
     progress.abort();
     let took = started.elapsed().as_secs_f64();
