@@ -16,7 +16,7 @@ use crate::derived::{
     self, DerivedKind, Generation, RootTree, SkipEntry, Skiplist, StoredHistoryNode,
 };
 use crate::signatures::{LandPolicy, PolicySet};
-use crate::tree_ops::apply_changes;
+use crate::tree_ops::{apply_changes, TreeView};
 
 /// Longest path, in bytes, a client changeset may name (Linux's `PATH_MAX`).
 pub const MAX_PATH_BYTES: usize = 4096;
@@ -79,7 +79,7 @@ pub struct Repo {
     /// History rows a derivation computed but has not stored yet (see
     /// `stage_history_rows`).
     pub(crate) history_staged: Arc<Mutex<HashMap<Hash, Arc<StoredHistoryNode>>>>,
-    /// Decoded tree nodes (see `read_tree_shared`).
+    /// Tree nodes viewed for lookups (see `read_tree_view`).
     pub(crate) trees: Arc<TreeCache>,
     /// Skiplists computed, or read while creating changesets (see
     /// `SkiplistCache`).
@@ -87,6 +87,9 @@ pub struct Repo {
     /// One lock per derived kind, held while a missing range is derived (see
     /// `derived::derive`).
     pub(crate) derive_locks: Arc<Mutex<HashMap<&'static str, DeriveLock>>>,
+    /// Values of staged kinds computed but not stored yet, by kind and
+    /// changeset (see `derived::derive`).
+    pub(crate) staged_values: Arc<Mutex<HashMap<(&'static str, Hash), Bytes>>>,
     /// Values computed by `derived::derive`, any kind; tests check for
     /// duplicated work with it.
     #[cfg(test)]
@@ -108,8 +111,32 @@ pub(crate) struct AncestryCache {
 
 #[derive(Default)]
 struct AncestryMaps {
-    new: HashMap<ChangesetId, AncestryEntry>,
-    old: HashMap<ChangesetId, AncestryEntry>,
+    new: HashMap<ChangesetId, AncestryEntry, ByKey>,
+    old: HashMap<ChangesetId, AncestryEntry, ByKey>,
+}
+
+/// Hashing for maps keyed by content hashes (changeset ids, row and node
+/// addresses): they are uniform already, and SipHash over 32 bytes was a
+/// visible part of path-history derivation, which looks them up constantly.
+pub(crate) type ByKey = std::hash::BuildHasherDefault<KeyHasher>;
+
+/// See [`ByKey`]: an FxHash-style mix of the bytes written.
+#[derive(Default)]
+pub(crate) struct KeyHasher(u64);
+
+impl std::hash::Hasher for KeyHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for chunk in bytes.chunks(8) {
+            let mut word = [0u8; 8];
+            word[..chunk.len()].copy_from_slice(chunk);
+            self.0 = (self.0.rotate_left(5) ^ u64::from_le_bytes(word))
+                .wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -217,11 +244,11 @@ impl SkiplistMaps {
 /// entries never go stale.
 pub(crate) type HistoryRowCache = SizedCache<StoredHistoryNode, HISTORY_CACHE_BYTES>;
 
-/// Decoded tree nodes by hash, for path-history derivation: each changeset
-/// reads the directories its parent's derivation just read (the parent's
-/// new tree is its old one), and a node read from a pack decodes a delta
-/// chain first. Checked against their hash before they are cached.
-pub(crate) type TreeCache = SizedCache<TreeNode, TREE_CACHE_BYTES>;
+/// Tree nodes by hash, viewed for lookups, for path-history derivation: each
+/// changeset reads the directories its parent's derivation just read (the
+/// parent's new tree is its old one), and a node read from a pack decodes a
+/// delta chain first. Checked against their hash before they are cached.
+pub(crate) type TreeCache = SizedCache<TreeView, TREE_CACHE_BYTES>;
 
 /// Content-addressed values by hash, bounded like [`AncestryCache`] but by
 /// bytes: each map holds up to half of `BUDGET`.
@@ -233,18 +260,18 @@ impl<V, const BUDGET: usize> Default for SizedCache<V, BUDGET> {
     fn default() -> Self {
         SizedCache {
             inner: Mutex::new(SizedMaps {
-                new: HashMap::new(),
+                new: HashMap::default(),
                 new_bytes: 0,
-                old: HashMap::new(),
+                old: HashMap::default(),
             }),
         }
     }
 }
 
 struct SizedMaps<V> {
-    new: HashMap<Hash, (Arc<V>, usize)>,
+    new: HashMap<Hash, (Arc<V>, usize), ByKey>,
     new_bytes: usize,
-    old: HashMap<Hash, (Arc<V>, usize)>,
+    old: HashMap<Hash, (Arc<V>, usize), ByKey>,
 }
 
 /// Bytes the history row cache may hold, counting each row at twice its
@@ -298,6 +325,7 @@ impl Repo {
             trees: Arc::default(),
             skiplists: Arc::default(),
             derive_locks: Arc::default(),
+            staged_values: Arc::default(),
             #[cfg(test)]
             derive_calls: Arc::default(),
         }
@@ -734,17 +762,24 @@ impl Repo {
         }
     }
 
-    /// [`Repo::read_tree`], shared and kept in a bounded cache, for walks
-    /// that read the same directories again and again.
-    pub(crate) async fn read_tree_shared(&self, tree: Hash) -> Result<Arc<TreeNode>> {
+    /// [`Repo::read_tree`] as a [`TreeView`], kept in a bounded cache, for
+    /// walks that look up names in the same directories again and again.
+    pub(crate) async fn read_tree_view(&self, tree: Hash) -> Result<Arc<TreeView>> {
         if let Some(t) = self.trees.get(&tree) {
             return Ok(t);
         }
-        let node = Arc::new(self.read_tree(tree).await?);
-        // About the encoded size: a name and a 32-byte hash per entry.
-        let len = node.entries.keys().map(|n| n.len() + 40).sum();
-        self.trees.insert(tree, node.clone(), len);
-        Ok(node)
+        let view = match self.blobs.get(&tree).await? {
+            Some(b) if Hash::of_object(TreeNode::KIND, &b) != tree => {
+                return Err(Error::Storage(format!("corrupt tree node {tree}")))
+            }
+            Some(b) => TreeView::parse(b)?,
+            None if tree == TreeNode::empty_hash() => TreeView::empty(),
+            None => return Err(Error::NotFound(format!("tree {tree}"))),
+        };
+        let view = Arc::new(view);
+        // `insert` counts twice what it is given.
+        self.trees.insert(tree, view.clone(), view.size() / 2);
+        Ok(view)
     }
 
     /// Resolve a ref name or full 64-hex changeset id. As a last resort a

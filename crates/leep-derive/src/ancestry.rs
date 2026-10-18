@@ -7,7 +7,26 @@ use leep_core::{ChangesetId, Result};
 
 use crate::derived::{self, LastMerge, SkipEntry};
 use crate::prefetch::{ReadAhead, MAX_BATCH};
+use crate::repo::SkiplistCache;
 use crate::Repo;
+
+tokio::task_local! {
+    /// Skiplist rows read by ancestry queries during one derivation that
+    /// asks many of them (path history at merges: a `merge_base` per merge,
+    /// riding the same first-parent chains). Kept for that derivation only:
+    /// `SkiplistCache` keeps no rows read by queries, so a row repaired
+    /// later is read again, and a derivation reads each row once anyway.
+    pub(crate) static SKIPLIST_READS: Option<Arc<SkiplistCache>>;
+}
+
+/// What a derivation scopes [`SKIPLIST_READS`] to: the enclosing
+/// derivation's cache, else a new one if `keep`.
+pub(crate) fn skiplist_reads_for(keep: bool) -> Option<Arc<SkiplistCache>> {
+    match SKIPLIST_READS.try_with(|c| c.clone()) {
+        Ok(Some(c)) => Some(c),
+        _ => keep.then(Arc::default),
+    }
+}
 
 const P1: u8 = 1;
 const P2: u8 = 2;
@@ -100,7 +119,17 @@ impl Repo {
     /// Skiplist of `id`. The generations it names are kept, so riding it
     /// down does not read them again.
     async fn skiplist_noting_generations(&self, id: ChangesetId) -> Result<Arc<[SkipEntry]>> {
-        let list = self.skiplist(id).await?;
+        let reads = SKIPLIST_READS.try_with(|c| c.clone()).ok().flatten();
+        let list = match reads.as_ref().and_then(|c| c.get(&id)) {
+            Some(list) => list,
+            None => {
+                let list = self.skiplist(id).await?;
+                if let Some(c) = &reads {
+                    c.insert(id, list.clone());
+                }
+                list
+            }
+        };
         for e in list.iter() {
             self.remember_generation(e.id, e.generation);
         }

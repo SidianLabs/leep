@@ -1018,13 +1018,104 @@ decoded-object cache resumes each delta chain from the previous version, so a
 tree read averaged 83-85 us packed against 77-88 us loose. The cold full listing is
 another matter (9.7 s on Linux), not addressed here.
 
-What remains: the twelve-parent merge still takes about 1 s and the largest
-two-parent merges 0.5-0.9 s (thousands of paths a side branch's mainline merge
-made its own); skiplist reads in `merge_base`, read one per round trip and not
-cached so that verification never trusts a row it has not checked; and a
-changeset still joins every chunk of each directory it rewrites, so the cost
-grows with directory width (Linux's widest directories hold thousands of
-names).
+What remained after that: the twelve-parent merge still took about 1 s and
+the largest two-parent merges 0.5-0.9 s; skiplist reads in `merge_base`, one
+per round trip; and a changeset still joined every chunk of each directory it
+rewrote, so the cost grew with directory width.
+
+**Wide directories.** Later Linux has 70,000-90,000 files, directories of
+thousands of names (`drivers/*`, `arch/*`) and many more merges, and the full
+history derived at only about 40 changesets a second there, CPU-bound in the
+server. Reproduced with a synthetic history of that shape: `history_profile
+--synth N` (generator in `crates/leep-derive/benches/support/wide_history.rs`)
+imports 83,000 files, 12 directories of 2,000-5,000 files and 800 directories
+of 52 in 42 changesets, then grows them with 8 subsystem branches that take
+topic merges, merge mainline back into themselves and are merged into
+mainline, so most merges carry hundreds of paths from their second parent.
+6,000 changesets of it (5,860 on the head's history) derived at 80 a second
+on in-memory stores and 52-55 on Postgres, against about 200 for the
+narrower v2.6.16 slice. Per-phase timers and `perf` (not kept), in-memory
+stores, 3,900 changesets:
+
+| Phase | Before | After |
+|---|---|---|
+| Rebuilding directories (join every chunk, re-cut, compare) | 19.9 s | 3.6 s |
+| First parent's entries (joins every directory on a spine) | 14.7 s | 0.6 s |
+| Old and new tree lookups (decode wide tree nodes, drop them on eviction) | 13.7 s | 0.5 s |
+| Merge diffs (join both sides' unshared chunks) | 5.1 s | 1.5 s |
+| All of the derivation | 55 s | 8.4 s |
+
+On Postgres the store added single `last_merge-v1` writes (one per changeset:
+4.9 s on the synthetic history, 56 s on the slice), skiplist reads in `merge_base` (12,184, 4.4-5.6 s) and,
+on the Linux slice, 37,558 single history-row reads (16-21 s) that missed the
+64 MiB row cache.
+
+**Fixes** (rows unchanged: every `history-tree-v3` and `history-node-v3` row of
+the old and new derivations compared equal, by key and value hash, on the
+synthetic history in memory and on Postgres, 137,961 rows, and on the
+v2.6.16 slice, 311,439 rows):
+
+- A directory is edited chunk by chunk (`Repo::stage_history_edit`). Chunks
+  are cut after boundary names wherever they fall, so the runs of chunks
+  between boundary names that hold no changed name are the base's chunks;
+  only the runs that do are read and cut again, each chunk against the same
+  predecessor a full rebuild picks. Tests check every edit against a full
+  rebuild. The first parent's directories are looked up chunk-locally like
+  the other parents'.
+- Tree nodes are read as views (`TreeView`): the encoded bytes and an offset
+  per entry, built in one pass without allocating, looked up by binary
+  search. The directories a changeset reads are loaded a level of the tree at
+  a time with the reads of a level in flight together, and the history rows
+  of the other parents and the merge base a batch per level.
+- Merge diffs compare split nodes a run of chunks at a time; a run of one
+  chunk a side whose rows are patches on the same keyframe is compared only
+  at the names the patches set. Merge diffs read a level's rows in one batch.
+- Staged values (`history-tree-v3`, and now `last_merge-v1`) are found by
+  later derivations in the same run, so a window's rows go in one write
+  instead of a write before every merge; `last_merge-v1` is staged, and
+  derived for a window from the changesets in hand before its merges ask.
+- Skiplist rows read by ancestry queries are kept for the duration of one
+  path-history derivation (not across derivations, so a repaired row is read
+  again).
+- Smaller costs: rows are encoded and hashed only when chosen, chunk lists
+  are resolved by merging instead of through a map, and hash-keyed caches
+  hash with a cheap mix instead of SipHash.
+
+| Deriving the index, release builds, local Postgres 16 over TCP, blobs on tmpfs, two runs each | Before | After |
+|---|---|---|
+| Synthetic late-Linux shape, in memory (5,860 changesets) | 70-74 s, 80-83 per second | 14-16 s, **371-406 per second** (4.6-4.9x) |
+| Synthetic late-Linux shape, Postgres | 106-114 s, 52-55 per second | 28-29 s, **201-211 per second** (3.8-3.9x) |
+| v2.6.16 slice, Postgres, `last_merge-v1` derived too | 197-262 s, 81-107 per second | 89-90 s, **235-237 per second** |
+| v2.6.16 slice, Postgres, `last_merge-v1` present | 153 s, 138 per second | 89 s, **236 per second** |
+
+Peak RSS was 206-242 MiB before and after on Postgres. The machine was shared
+(load 1-6), which moved the old code's runs most. Store calls after, on the
+v2.6.16 slice (first run):
+
+| Call | Calls | Items | Time |
+|---|---|---|---|
+| blob `get` (tree nodes, 16 in flight) | 112,731 | | 12.4 s |
+| `put_derived_many` | 520 | 392,241 | 12.4 s |
+| `get_derived` skiplists (`merge_base`) | 11,267 | | 4.8 s |
+| `get_derived_many` history nodes | 3,202 | 44,049 | 2.2 s |
+| `get_changesets` | 814 | 42,730 | 2.8 s |
+| `get_derived` history nodes (cache misses) | 2,480 | | 1.2 s |
+| the rest | 3,612 | | 2.3 s |
+
+`cargo bench -p leep-derive -- derive_history` has a wide case
+(`wide_merges_300_changesets`, directories of 1,000-2,000 files): 438 ms
+before, 141 ms after; `1000_changesets` 56 ms before, 46 ms after; path `log`
+and `last_change` queries unchanged.
+
+What remains: CPU in the chunk edits (copying the chunks of a run and the
+chunk list, about 150 refs for a 5,000-name directory, once per changed
+directory), resolving list patches each time a cursor opens a directory
+(not cached), skiplist reads in `merge_base` on the first meeting of each
+chain (one per round trip), and the writes themselves. The row cache stays
+at 64 MiB: on the slice, 256 MiB made misses vanish and derived at 241 a
+second, but the whole slice's rows then fit, which says nothing about full
+Linux; batching took most of the same gain without the memory. Not measured
+here: the packed blob store and the full Linux history.
 
 **Stale planner statistics.** On the full Linux database the first run of
 this code derived only about 500 changesets a minute, with Postgres at 100%
