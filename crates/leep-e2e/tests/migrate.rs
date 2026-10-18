@@ -101,14 +101,15 @@ fn migrate_adopts_an_unversioned_database() {
 
     let out = server(&stores, &["migrate"]);
     assert_ok(&out, "migrate");
+    let latest = leep_meta::SQLITE_MIGRATIONS.len();
     assert!(
-        stdout(&out).contains("migrated from v0 to v1"),
+        stdout(&out).contains(&format!("migrated from v0 to v{latest}")),
         "{}",
         stdout(&out)
     );
     let out = server(&stores, &["migrate", "--status"]);
     assert!(
-        stdout(&out).contains("up to date at v1"),
+        stdout(&out).contains(&format!("up to date at v{latest}")),
         "{}",
         stdout(&out)
     );
@@ -128,13 +129,15 @@ fn server_refuses_a_newer_schema() {
     assert_ok(&server(&stores, &["migrate"]), "migrate");
     // A later server recorded a migration this one has never heard of.
     let url = stores.meta.clone();
+    let latest = leep_meta::SQLITE_MIGRATIONS.len();
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         let opts = sqlx::sqlite::SqliteConnectOptions::from_str(&url).unwrap();
         let pool = sqlx::SqlitePool::connect_with(opts).await.unwrap();
         sqlx::query(
             "INSERT INTO schema_migrations (version, name, applied_at, checksum) \
-             VALUES (2, 'future', 1, 'x')",
+             VALUES ($1, 'future', 1, 'x')",
         )
+        .bind(latest as i64 + 1)
         .execute(&pool)
         .await
         .unwrap();
@@ -148,7 +151,10 @@ fn server_refuses_a_newer_schema() {
         let out = server(&stores, args);
         assert!(!out.status.success(), "{args:?}");
         assert!(
-            stderr(&out).contains("database schema v2 is newer than this server (max v1)"),
+            stderr(&out).contains(&format!(
+                "database schema v{} is newer than this server (max v{latest})",
+                latest + 1
+            )),
             "{args:?}: {}",
             stderr(&out)
         );

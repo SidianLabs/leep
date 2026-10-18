@@ -359,11 +359,12 @@ pub async fn import_snapshot(
     let source_store =
         SqliteMetaStore::connect_with(&opened.url, SchemaMode::RequireCurrent).await?;
     let mut source = SqliteSource::begin(&source_store.pool).await?;
+    let mut pg = None;
     let mut sink: Box<dyn Sink> = if is_sqlite(dest_url) {
         let store = SqliteMetaStore::connect_with(dest_url, mode).await?;
         Box::new(SqliteSink::begin(&store.pool).await?)
     } else if is_postgres(dest_url) {
-        let store = PostgresMetaStore::connect_with(dest_url, mode).await?;
+        let store = pg.insert(PostgresMetaStore::connect_with(dest_url, mode).await?);
         Box::new(PgSink::begin(&store.pool).await?)
     } else {
         return Err(Error::Invalid(format!(
@@ -383,6 +384,13 @@ pub async fn import_snapshot(
     }
     let info = copy(&mut source, &mut *sink).await?;
     sink.commit().await?;
+    // Every row arrived after the tables were last analyzed (ADR 0042). The
+    // restore has committed, so a failure here is only worth a warning.
+    if let Some(store) = pg {
+        if let Err(e) = store.analyze().await {
+            tracing::warn!(error = %e, "restore: ANALYZE after loading failed");
+        }
+    }
     Ok(ImportInfo {
         changesets: info.changesets,
         refs: info.refs.len() as u64,

@@ -61,6 +61,23 @@ pub async fn migrate_meta_store(url: &str, dry_run: bool) -> Result<MigrationRep
     }
 }
 
+/// After a bulk load into the store at `url`, refresh the planner statistics
+/// of its tables so the queries that follow do not plan from estimates made
+/// before the load (ADR 0042). Postgres only; returns whether it ran. SQLite
+/// and `mem://` need nothing, and an unknown URL is refused as elsewhere.
+pub async fn analyze_meta_store(url: &str) -> Result<bool> {
+    if url.starts_with("postgres://") || url.starts_with("postgresql://") {
+        let store = PostgresMetaStore::connect_with(url, SchemaMode::RequireCurrent).await?;
+        let r = store.analyze().await;
+        store.pool.close().await;
+        r.map(|()| true)
+    } else if url.starts_with("sqlite:") || url.starts_with("mem://") {
+        Ok(false)
+    } else {
+        Err(Error::Invalid(format!("unsupported meta store url: {url}")))
+    }
+}
+
 fn storage(e: impl std::fmt::Display) -> Error {
     Error::Storage(e.to_string())
 }

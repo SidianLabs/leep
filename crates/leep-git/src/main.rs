@@ -73,6 +73,14 @@ async fn main() -> Result<()> {
             if let Some(h) = r.head {
                 println!("head {h}");
             }
+            // Indexes are usually derived right after an import, from
+            // statistics that predate it (ADR 0042). The import itself is
+            // done, so a failure only warns.
+            if r.commits_imported > 0 {
+                if let Err(e) = leep_meta::analyze_meta_store(&meta).await {
+                    eprintln!("warning: ANALYZE after import failed: {e}");
+                }
+            }
         }
         Cmd::Export {
             meta,

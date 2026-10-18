@@ -118,14 +118,17 @@ async fn sqlite_round_trip_keeps_everything_and_the_ref_log_sequence() {
     assert_eq!(info.changesets, 26);
     assert_eq!(info.refs.len(), 2);
     assert_eq!(info.derived, 26);
-    assert_eq!(info.schema_version, 1);
+    assert_eq!(info.schema_version, latest_schema_version());
     assert_eq!(info.ref_log_last_seq, last as u64);
     assert!(info.ref_log < last as u64);
     // One self-contained file.
     assert!(snap.is_file());
     assert!(!dir.path().join("snap.db-wal").exists());
     assert!(!dir.path().join("snap.db.partial").exists());
-    assert_eq!(snapshot_schema_version(&snap).await.unwrap(), 1);
+    assert_eq!(
+        snapshot_schema_version(&snap).await.unwrap(),
+        latest_schema_version()
+    );
 
     let dest_url = sqlite_url(dir.path(), "restored.db");
     let imported = import_snapshot(&snap, &dest_url, false, SchemaMode::Migrate)
@@ -291,8 +294,26 @@ async fn schema_version_rules_follow_adr_0023() {
         .await
         .unwrap();
     let d2 = open_meta_store(&dest_url).await.unwrap();
-    assert_eq!(d2.schema_version().await.unwrap(), Some(1));
+    assert_eq!(
+        d2.schema_version().await.unwrap(),
+        Some(latest_schema_version())
+    );
     assert_eq!(dump(&*src).await, dump(&*d2).await);
+
+    // From v1, the schema before migration 2 (which changes nothing in
+    // SQLite): migrated on the scratch copy, then restored.
+    let v1 = edit("v1.db", "DELETE FROM schema_migrations WHERE version > 1").await;
+    assert_eq!(snapshot_schema_version(&v1).await.unwrap(), 1);
+    let dest_url = sqlite_url(dir.path(), "d4.db");
+    import_snapshot(&v1, &dest_url, false, SchemaMode::Migrate)
+        .await
+        .unwrap();
+    let d4 = open_meta_store(&dest_url).await.unwrap();
+    assert_eq!(
+        d4.schema_version().await.unwrap(),
+        Some(latest_schema_version())
+    );
+    assert_eq!(dump(&*src).await, dump(&*d4).await);
 
     // Not a snapshot at all.
     let junk = dir.path().join("junk.db");
@@ -365,6 +386,15 @@ async fn postgres_to_sqlite_to_postgres() {
         .unwrap();
     let dest = open_meta_store(&b.url).await.unwrap();
     assert_eq!(dump(&*src).await, dump(&*dest).await);
+    // The restore analyzed what it loaded: a table never analyzed or
+    // vacuumed has `reltuples = -1` (ADR 0042).
+    let mut c = sqlx::PgConnection::connect(&b.url).await.unwrap();
+    let tuples: f32 =
+        sqlx::query_scalar("SELECT reltuples FROM pg_class WHERE relname = 'changesets'")
+            .fetch_one(&mut c)
+            .await
+            .unwrap();
+    assert_eq!(tuples, 26.0);
     let id = dest.put_changeset(&cs(900)).await.unwrap();
     assert!(dest.cas_ref("fresh", None, Some(id)).await.unwrap());
     assert_eq!(dest.ref_log(None, None, 1).await.unwrap()[0].seq, last + 1);
