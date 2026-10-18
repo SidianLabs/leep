@@ -365,6 +365,23 @@ fn gen_token_subcommand() {
     assert!(!bad.status.success());
 }
 
+/// Without tokens, a server reachable from other hosts would let anyone
+/// rewrite every ref, so it needs an explicit opt-in.
+#[test]
+fn startup_refuses_a_public_listen_without_tokens() {
+    for addr in ["0.0.0.0:0", "[::]:0"] {
+        let out = server_bin()
+            .args(["--listen", addr, "--meta", "mem://", "--blobs", "mem://"])
+            .env_remove("LEEP_TOKENS_FILE")
+            .env_remove("LEEP_INSECURE_NO_AUTH")
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{addr}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("--insecure-no-auth"), "{addr}: {err}");
+    }
+}
+
 #[test]
 fn startup_fails_on_bad_tokens_file() {
     let dir = tempfile::tempdir().unwrap();

@@ -239,13 +239,23 @@ async fn prepare_and_upload(
         let p = prepare(&ts, oid)?;
         let mut wanted = HashSet::new();
         let mut blobs = Vec::new();
-        for (_, change) in &p.changes {
+        for (path, change) in &p.changes {
             if let Some((_, b)) = change {
                 // One lookup per blob: copying the key set per commit cost
                 // time and memory proportional to the whole repository.
                 let stored = known.lock().unwrap().contains_key(b);
                 if !stored && wanted.insert(*b) {
-                    blobs.push((*b, read_blob(&ts, *b)?));
+                    let data = read_blob(&ts, *b)?;
+                    // Stop before anything of this commit is written, and name
+                    // the file, rather than fail on an anonymous blob.
+                    if leep_core::hash::is_object_preimage(&data) {
+                        return Err(Error::Invalid(format!(
+                            "commit {oid}: {path} starts with \"leep:\" and a \
+                             NUL-terminated kind, which Leep reserves for its own \
+                             objects and cannot store yet (ADR 0041)"
+                        )));
+                    }
+                    blobs.push((*b, data));
                 }
             }
         }

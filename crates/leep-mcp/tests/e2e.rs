@@ -703,3 +703,53 @@ fn short_ids_resolve_in_read_tools() {
     assert_eq!(r["isError"], true);
     assert!(text(&r).contains("prefix"), "{}", text(&r));
 }
+
+/// A call whose answer was lost (a 408 can come after the land applied) is
+/// retried with the same `request_id`, or by landing the `changeset` the
+/// first call made. Neither lands the change a second time.
+#[test]
+fn retried_commit_and_land_lands_once() {
+    let s = Server::new(config(&start_server()));
+    let args = json!({
+        "message": "first",
+        "changes": [{ "path": "a.txt", "content": "one\n" }],
+        "request_id": "req-1",
+    });
+    let first = data(&commit(&s, args.clone()));
+    assert_eq!(first["status"], "landed");
+    let again = data(&commit(&s, args));
+    assert_eq!(again["changeset"], first["changeset"]);
+    assert_eq!(again["landed"], first["landed"]);
+
+    let by_id = data(&commit(&s, json!({ "changeset": first["changeset"] })));
+    assert_eq!(by_id["landed"], first["landed"]);
+    assert_eq!(by_id["files_changed"], 1);
+
+    let log = data(&call(&s, "leep_log", json!({})));
+    let entries = log["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["agent"]["request_id"], "req-1");
+
+    // The same id for another ref is a different request, refused.
+    let r = commit(
+        &s,
+        json!({
+            "message": "elsewhere",
+            "changes": [{ "path": "b.txt", "content": "b\n" }],
+            "request_id": "req-1",
+            "target_ref": "other",
+            "create_ref": true,
+        }),
+    );
+    assert_eq!(r["isError"], true);
+    assert!(text(&r).contains("req-1"), "{}", text(&r));
+    // A changeset and changes together are ambiguous.
+    let r = commit(
+        &s,
+        json!({
+            "changeset": first["changeset"],
+            "changes": [{ "path": "b.txt", "content": "b\n" }],
+        }),
+    );
+    assert_eq!(r["isError"], true);
+}

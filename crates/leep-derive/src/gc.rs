@@ -168,6 +168,20 @@ fn doom_value(epoch: i64, state: Doom) -> Bytes {
     Bytes::from(v)
 }
 
+/// Blob bytes that would share an address with a tree or other object are
+/// refused: the store keeps whichever was written first, so the object
+/// would read back as corrupt (ADR 0041).
+pub fn refuse_object_preimage(data: &[u8]) -> Result<()> {
+    if leep_core::hash::is_object_preimage(data) {
+        return Err(Error::Invalid(
+            "blob starts with \"leep:\" and a NUL-terminated kind, a prefix reserved \
+             for Leep's own objects (ADR 0041)"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 impl Repo {
     /// The subset of `hashes` the caller must upload. A condemned blob counts
     /// as missing and is not claimed. Every other stored hash is claimed
@@ -202,7 +216,9 @@ impl Repo {
     }
 
     /// Store an uploaded blob and claim it. Rescues a condemned blob.
+    /// Refuses bytes that would take an object's address (ADR 0041).
     pub async fn put_blob(&self, data: Bytes) -> Result<Hash> {
+        refuse_object_preimage(&data)?;
         let h = Hash::of_blob(&data);
         self.put_rescuing(h, data).await?;
         self.meta()
@@ -215,6 +231,9 @@ impl Repo {
     /// one batch after all of them are written, and their claims written in
     /// one batch after that. Returns their hashes in order.
     pub async fn put_blobs(&self, data: Vec<Bytes>) -> Result<Vec<Hash>> {
+        for d in &data {
+            refuse_object_preimage(d)?;
+        }
         let items: Vec<(Hash, Bytes)> = data.into_iter().map(|d| (Hash::of_blob(&d), d)).collect();
         let hashes: Vec<Hash> = items.iter().map(|(h, _)| *h).collect();
         self.put_rescuing_many(items).await?;

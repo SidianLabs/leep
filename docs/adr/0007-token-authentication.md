@@ -59,3 +59,13 @@ See [SECURITY-REVIEW.md](../SECURITY-REVIEW.md).
   request.
 - The metrics listener is unauthenticated, and per-token limit metrics carry
   token names (not tokens). Keep it on a private address.
+
+## Safe default, 2026-10-18
+Authentication stays optional, but serving without it is now loopback only by
+default: `leep-server` refuses to start on a non-loopback `--listen` with no
+`--tokens-file` unless `--insecure-no-auth` (`LEEP_INSECURE_NO_AUTH=1`) says
+the operator means it, for example behind a proxy that authenticates or in a
+container whose port is published on the host's loopback only. An open server
+lets anyone rewrite every ref; a forgotten flag should fail loudly, not
+silently. The container image listens on `0.0.0.0`, so it now needs a tokens
+file or that variable.

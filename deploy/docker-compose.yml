@@ -34,6 +34,9 @@ services:
         condition: service_healthy
     environment:
       LEEP_LISTEN: 0.0.0.0:7070
+      # No tokens file in this dev stack, and the port is published on the
+      # host's loopback only. Add LEEP_TOKENS_FILE before exposing it.
+      LEEP_INSECURE_NO_AUTH: "1"
       LEEP_META: postgres://leep:leep-dev-password@postgres:5432/leep
       LEEP_BLOBS: file:///var/lib/leep/blobs
     volumes:

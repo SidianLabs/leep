@@ -93,12 +93,21 @@ struct Args {
     max_concurrent_per_token: Option<usize>,
     /// Maximum request body size in bytes for `read` tokens, which should not
     /// upload; a token entry's `max_body` overrides it. Needs --tokens-file.
+    /// Defaults to 1 MiB when there is one.
     #[arg(long, env = "LEEP_READ_MAX_BODY_BYTES")]
     read_max_body_bytes: Option<usize>,
     /// JSON file of `blake3:` token digests; enables authentication. Read at
     /// startup and again on SIGHUP.
     #[arg(long, env = "LEEP_TOKENS_FILE")]
     tokens_file: Option<std::path::PathBuf>,
+    /// Serve without authentication on an address other hosts can reach.
+    /// Without it, a non-loopback --listen needs --tokens-file.
+    #[arg(
+        long,
+        env = "LEEP_INSECURE_NO_AUTH",
+        value_parser = clap::builder::BoolishValueParser::new(),
+    )]
+    insecure_no_auth: bool,
     /// JSON file of trusted Ed25519 author keys (`ed25519:<hex>`); enables
     /// `POST /v1/changesets/{id}/signatures`. Read at startup and on SIGHUP.
     #[arg(long, env = "LEEP_SIGNING_KEYS_FILE")]
@@ -567,7 +576,17 @@ async fn main() -> anyhow::Result<()> {
         Some(cmd) => return run_command(cmd),
         None => {}
     }
+    check_open_listen(
+        args.listen,
+        args.tokens_file.is_some(),
+        args.insecure_no_auth,
+    )?;
     let metrics_app = args.metrics_listen.map(|_| install_metrics()).transpose()?;
+    let read_max_body = match (args.read_max_body_bytes, &args.tokens_file) {
+        (Some(n), _) => Some(n),
+        (None, Some(_)) => Some(leep_server::DEFAULT_READ_MAX_BODY_BYTES),
+        (None, None) => None,
+    };
     let config = ConfigHandle::load(ReloadSources {
         tokens_file: args.tokens_file.clone(),
         signing_keys_file: args.signing_keys_file.clone(),
@@ -576,7 +595,7 @@ async fn main() -> anyhow::Result<()> {
             rate: args.rate_limit,
             burst: args.rate_burst,
             concurrency: args.max_concurrent_per_token,
-            read_max_body: args.read_max_body_bytes,
+            read_max_body,
         },
         require_signatures: args.require_signatures.clone(),
         require_review: args.require_review.clone(),
@@ -638,6 +657,24 @@ async fn main() -> anyhow::Result<()> {
     }
     leep_server::serve(listener, app, shutdown_signal()).await?;
     Ok(())
+}
+
+/// Without tokens anyone who reaches the server can read and rewrite every
+/// ref, so only loopback may be served that way unless the operator says
+/// otherwise (for example behind a proxy that authenticates).
+fn check_open_listen(listen: SocketAddr, tokens: bool, insecure: bool) -> anyhow::Result<()> {
+    if tokens || listen.ip().is_loopback() {
+        return Ok(());
+    }
+    if insecure {
+        tracing::warn!(%listen, "serving without authentication on a non-loopback address");
+        return Ok(());
+    }
+    anyhow::bail!(
+        "refusing to listen on {listen} without authentication: give --tokens-file \
+         (LEEP_TOKENS_FILE), listen on a loopback address, or pass --insecure-no-auth \
+         (LEEP_INSECURE_NO_AUTH=1) to serve anyone who can reach it"
+    )
 }
 
 /// The startup summary of what the files configured. Counts only.

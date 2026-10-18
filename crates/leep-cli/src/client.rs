@@ -216,13 +216,20 @@ impl Client {
             .map_err(|e| CliError::server(format!("download of blob {hash} failed: {e}")))
     }
 
+    /// Asks in requests of [`MISSING_BLOBS_CHUNK`] hashes, well under the
+    /// server's cap and a read token's body limit.
     pub fn missing_blobs(&self, hashes: Vec<Hash>) -> Result<Vec<Hash>> {
-        let r: MissingBlobsResponse = self.json(
-            self.http
-                .post(self.url("/v1/blobs/missing"))
-                .json(&MissingBlobsRequest { hashes }),
-        )?;
-        Ok(r.missing)
+        let mut missing = Vec::new();
+        for chunk in hashes.chunks(MISSING_BLOBS_CHUNK) {
+            let r: MissingBlobsResponse =
+                self.json(self.http.post(self.url("/v1/blobs/missing")).json(
+                    &MissingBlobsRequest {
+                        hashes: chunk.to_vec(),
+                    },
+                ))?;
+            missing.extend(r.missing);
+        }
+        Ok(missing)
     }
 
     pub fn create_changeset(&self, cs: &Changeset) -> Result<ChangesetId> {

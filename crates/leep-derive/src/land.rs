@@ -490,7 +490,7 @@ impl Repo {
         self.enforce_land_policy(cs, head, target_ref, checked)
             .await?;
         match head {
-            Some(h) if !fast_forward => match self.replay_stack(cs, h).await? {
+            Some(h) if !fast_forward => match self.replay_stack(cs, h, origins).await? {
                 Ok(id) => Ok(Step::Move(id)),
                 Err(resp) => Ok(Step::Done(resp)),
             },
@@ -634,8 +634,11 @@ impl Repo {
 
     /// Rebase every changeset of the stack under `cs` onto `head`, oldest
     /// first. The stack is the first-parent chain from `cs` down to (not
-    /// including) the first changeset already in `head`'s history. Replaying
-    /// only `cs` would silently drop the rest of the stack.
+    /// including) the first changeset already in `head`'s history, or whose
+    /// rebased copy is (an agent that landed `a` and then built `b` on its own
+    /// `a`). Replaying only `cs` would silently drop the rest of the stack;
+    /// replaying a landed member again would add an empty duplicate of it, or
+    /// a false conflict once the ref has changed its files since.
     ///
     /// On conflict, returns the whole stack squashed into one three-way merge
     /// relative to `head`, so the client can resolve it in a single commit.
@@ -643,6 +646,7 @@ impl Repo {
         &self,
         cs: ChangesetId,
         head: ChangesetId,
+        origins: &mut HashMap<ChangesetId, Option<ChangesetId>>,
     ) -> Result<Result<ChangesetId, LandResponse>> {
         let mut stack = Vec::new();
         let mut fork = None;
@@ -660,7 +664,13 @@ impl Repo {
                     fork = Some(p);
                     break;
                 }
-                Some(&p) => cur = p,
+                Some(&p) => {
+                    if self.landed_copy(p, head, origins).await?.is_some() {
+                        fork = Some(p);
+                        break;
+                    }
+                    cur = p;
+                }
                 None => break,
             }
         }

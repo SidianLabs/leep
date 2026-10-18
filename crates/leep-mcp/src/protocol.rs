@@ -1,6 +1,10 @@
 //! JSON-RPC 2.0 framing and the MCP methods this server implements.
 
+use std::collections::HashMap;
+use std::sync::Mutex;
+
 use leep_cli::client::Client;
+use leep_core::ChangesetId;
 use serde_json::{json, Value};
 
 use crate::tools::{self, ToolOutput};
@@ -23,12 +27,20 @@ content for every file you changed.";
 pub struct Server {
     pub(crate) client: Client,
     pub(crate) cfg: Config,
+    /// `request_id` → the changeset `leep_commit_and_land` made for it and
+    /// the ref it was landing on, so a retried request lands that changeset
+    /// again instead of making a second one.
+    pub(crate) requests: Mutex<HashMap<String, (ChangesetId, String)>>,
 }
 
 impl Server {
     pub fn new(cfg: Config) -> Self {
         let client = Client::with_token(&cfg.server, cfg.token.as_deref());
-        Server { client, cfg }
+        Server {
+            client,
+            cfg,
+            requests: Mutex::default(),
+        }
     }
 
     /// Handle one newline-delimited message. `None` means no reply is due

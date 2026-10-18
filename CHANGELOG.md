@@ -254,6 +254,23 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   them. It now jumps between changes with the path-history index and the
   first-parent skip list (the answer is unchanged), and checks its cache before
   walking.
+- Security: a blob could take a tree node's address, since a tree is stored
+  in the blob store under `BLAKE3("leep:tree-v1\0" ‖ bytes)` and a blob
+  with exactly those bytes hashes the same. Uploading it before the tree
+  existed made that tree read as corrupt for good. Blob writes now refuse
+  bytes that start with `leep:` and contain a NUL (400); text files that
+  only start with `leep:` are unaffected. `leep-git import` stops at such a
+  file with an error naming it, a merge that would produce one is a
+  conflict, and ADR 0041 weighs the proper fix (separate store namespaces
+  for trees).
+- Safer server defaults. `leep-server` refuses to start on a non-loopback
+  `--listen` without `--tokens-file` unless `--insecure-no-auth`
+  (`LEEP_INSECURE_NO_AUTH=1`) is given; the container image listens on
+  `0.0.0.0`, so it needs one or the other (the compose dev stack sets the
+  variable). `read` tokens' request bodies are capped at 1 MiB by default.
+  `POST /v1/blobs/missing` takes at most 100,000 hashes (400 beyond), and the
+  CLI and MCP client send 10,000 at a time, which also fits a read token's
+  limit.
 
 ### Operations
 - Versioned schema migrations for SQLite and Postgres (ADR 0023). The
@@ -493,6 +510,23 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   means the request was refused. The timeout can cancel a `land` after it
   moved the ref, so a 408 does not mean it failed; running `leep land` again
   sends the same changeset, and the server reports the earlier success.
+- The filesystem blob store fsyncs the shard directory after renaming a new
+  blob into place (and the store root when the shard is new), so a power
+  loss can no longer drop a blob whose put was acknowledged.
+- A delete of a packed blob after an earlier tombstone append died part way
+  could be lost: the new line was appended to the torn one and readers
+  dropped the joined line. The append now cuts the torn line off first,
+  under the tombstone lock.
+- Landing a changeset built on one that was already landed as a rebased
+  copy (land `a`, which lands as `a'`, then land `b` on the original `a`)
+  replayed `a` again: an empty duplicate of `a` on the ref, or a false
+  conflict if the ref had since changed `a`'s files. The stack walk now
+  stops at an entry whose copy is already on the ref.
+- MCP `leep_commit_and_land` can be retried safely. A retry after a timeout
+  used to build a new changeset (with a new timestamp) on the moved head,
+  landing a second, empty copy of the change. It now takes `changeset` (land one that exists;
+  ambiguous failures name it) and `request_id` (recorded as
+  `agent.request_id`; a repeat lands the changeset the first call made).
 - The crash test's HTTP agents land the same changeset again after an
   unanswered land, as a real client does, instead of rebuilding the stack on
   the new head, which landed it twice when the first land had applied.

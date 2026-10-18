@@ -43,7 +43,7 @@ cargo test
 
 ```sh
 docker build -t leep:dev .
-docker run -p 127.0.0.1:7070:7070 -v leep-data:/var/lib/leep leep:dev
+docker run -p 127.0.0.1:7070:7070 -e LEEP_INSECURE_NO_AUTH=1 -v leep-data:/var/lib/leep leep:dev
 ```
 
 See [docs/DEPLOY.md](docs/DEPLOY.md) for the Postgres compose stack and S3 storage.

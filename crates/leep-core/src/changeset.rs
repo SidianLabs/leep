@@ -82,6 +82,9 @@ pub const EXTRA_AGENT_MODEL: &str = "agent.model";
 pub const EXTRA_AGENT_SESSION: &str = "agent.session";
 pub const EXTRA_AGENT_PROMPT: &str = "agent.prompt";
 pub const EXTRA_AGENT_TESTS: &str = "agent.tests";
+/// A client-chosen id for one write request, so a retry of a request whose
+/// answer was lost lands the changeset it already made (`leep-mcp`).
+pub const EXTRA_AGENT_REQUEST_ID: &str = "agent.request_id";
 /// Set by the server when it rebases a changeset; value is the original id.
 pub const EXTRA_REBASED_FROM: &str = "leep.rebased_from";
 /// Set by the CLI on a changeset that only carries uncommitted work (`sync`,

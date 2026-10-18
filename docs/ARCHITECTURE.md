@@ -118,6 +118,11 @@ with `Error::Invalid`:
   million directories (256 MiB of directory names), since building the tree
   holds each changed directory and its full path in memory.
 
+A blob may not be the hash preimage of an object (bytes starting `leep:`
+with a NUL after it): it would share a tree node's address in the
+`BlobStore`, so `Repo::put_blob` refuses it with `Error::Invalid`
+([ADR 0041](adr/0041-blob-and-object-address-separation.md)).
+
 `RepoPath` is validated on construction and on deserialization, so invalid
 paths cannot enter the system through any route.
 
@@ -328,7 +333,8 @@ loop (≤32 attempts):
     elif head is an ancestor of cs:  move to cs                   # fast-forward
     elif head's history holds a server-made copy of cs:  already landed
     else:
-      stack ← first-parent chain from cs down to where it joins head's history
+      stack ← first-parent chain from cs down to where it joins head's history,
+              or to an entry whose server-made copy is in it
       replay each stack entry onto head, oldest first        # 3-way per entry
       conflict? → Conflicts{onto: head, conflicts, clean} for this land only
                   (the whole stack squashed into one 3-way merge vs head;
@@ -366,7 +372,10 @@ A land onto a ref that does not exist creates it, unless the request says
 `main` of an empty repository); then the step that finds no head answers 404
 and the ref stays absent. The check uses the head the batch read for its CAS.
 Replaying the whole stack matters: rebasing only `cs` would silently drop the
-changes of unlanded changesets below it. On conflict the client applies
+changes of unlanded changesets below it. The stack also stops at an entry
+whose rebased copy already landed: an agent that landed `a` (landed as `a'`)
+and built `b` on its own `a` lands only `b`, instead of a second, empty copy
+of `a`, or a false conflict when the ref changed `a`'s files since. On conflict the client applies
 `clean`, resolves `conflicts` on top of `onto`, commits once and lands again,
 which is then a fast-forward. Stacks containing merges are rejected.
 
@@ -610,8 +619,8 @@ except where noted.
 | `MemoryMetaStore`, `MemoryBlobStore` | One call, under a lock; a ref and its log entry share the lock | Not durable | Cannot happen |
 | SQLite (WAL, synchronous FULL) | One transaction per call; `cas_ref_logged` changes the ref and appends its log entry in one | The open transaction rolls back (the next writer sees nothing of it); a committed one is durable | Only when the error is raised while `COMMIT` is in flight; the caller must treat any `cas_ref` error as unknown |
 | Postgres | Same, one transaction per call, plus an advisory lock for log order | The server drops the connection, Postgres rolls the transaction back; committed work stays | Connection lost after `COMMIT` was sent: the commit may have applied |
-| Filesystem blobs | Write a temp file, fsync it, rename it into place | A blob is never visible partly written; a crash before the rename leaves a `.tmp-*` file that is never listed, read or counted as the blob and never removed (safe to delete when older than the request timeout). The shard directory is not fsynced, so power loss (not a kill) can lose the rename of a put that was acknowledged | A put that errors after the rename leaves a whole blob; repeating it is a no-op |
-| Filesystem packs | A pack is published by renaming its fsynced index into place after its fsynced pack file, fsyncing `packs/` after each; a delete of a packed object is one fsynced tombstone line | Nothing partial is ever read: an unpublished pack has no index, and a torn tombstone line is ignored. Loose copies and replaced packs are deleted only after the fence, so a reader that listed the old layout still finds every object | A delete that errors after its tombstone was written has deleted; repeating it is a no-op |
+| Filesystem blobs | Write a temp file, fsync it, rename it into place, fsync the shard directory (and the root when the shard is new) | A blob is never visible partly written; a crash before the rename leaves a `.tmp-*` file that is never listed, read or counted as the blob and never removed (safe to delete when older than the request timeout). | A put that errors after the rename leaves a whole blob; repeating it is a no-op |
+| Filesystem packs | A pack is published by renaming its fsynced index into place after its fsynced pack file, fsyncing `packs/` after each; a delete of a packed object is one fsynced tombstone line | Nothing partial is ever read: an unpublished pack has no index, and a torn tombstone line is ignored, then cut off under the lock by the next append so it cannot swallow that append's first line. Loose copies and replaced packs are deleted only after the fence, so a reader that listed the old layout still finds every object | A delete that errors after its tombstone was written has deleted; repeating it is a no-op |
 | Object store (S3) | One PUT | No partial objects | Same as above |
 | Object store packs | A pack is published by uploading its index after the complete pack (a multipart upload is invisible until completed); a delete of a packed object is one tombstone object per pack | Nothing partial is ever read. Loose copies and replaced packs are deleted only after the fence, and readers list `packs/` again on a miss or a missing pack | A delete that errors after its tombstones were written has deleted; repeating it is a no-op |
 | `CachedBlobStore` | None (memory) | Gone with the process | A failed put or read caches nothing; a deleted blob can be served from the cache until evicted, which is harmless because only unreferenced blobs are deleted |
@@ -642,11 +651,13 @@ Authentication is static bearer tokens ([ADR 0007](adr/0007-token-authentication
 `leep-server --tokens-file <PATH>` (or `LEEP_TOKENS_FILE`) loads a JSON file of
 `{name, role, hash}` entries, where `hash` is `blake3:<hex>` of the token; the
 file is read at startup and on SIGHUP (see Config reload below). Without it,
-auth is off and the server warns.
+auth is off and the server warns, and it refuses a non-loopback `--listen`
+unless `--insecure-no-auth` is given.
 With it, an axum middleware requires `Authorization: Bearer <token>` on every
 endpoint except `GET /v1/health`: 401 (with `WWW-Authenticate: Bearer`) when the
 token is missing or unknown, 403 when a `read` token makes a mutating request.
-`POST /v1/blobs/missing` counts as read because it only queries. Digests are
+`POST /v1/blobs/missing` counts as read because it only queries; it takes at
+most 100,000 hashes (the CLI sends 10,000 at a time), and read tokens' bodies are capped at 1 MiB by default. Digests are
 compared in constant time, and only the token name is logged. Use
 `leep-server gen-token` and `hash-token` to create entries. Terminate TLS in
 front of the server; bearer tokens are otherwise visible on the wire.
