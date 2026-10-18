@@ -45,6 +45,10 @@ pub struct RepackArgs {
     /// Allow --fence 0. Only safe while no server is running.
     #[arg(long)]
     unsafe_no_fence: bool,
+    /// Threads compressing the pack; 0 for one per CPU. The pack's bytes
+    /// are the same for any value.
+    #[arg(long, default_value_t = 0)]
+    threads: usize,
     /// Print the report as one JSON object.
     #[arg(long)]
     json: bool,
@@ -84,7 +88,7 @@ impl Target {
 
     async fn publish(
         &self,
-        hints: Vec<(leep_core::Hash, Option<leep_core::Hash>)>,
+        hints: leep_core::intern::PackHints,
         opts: RepackOptions,
     ) -> leep_core::Result<Published> {
         Ok(match self {
@@ -139,8 +143,10 @@ pub async fn run_repack(meta: &str, blobs: &str, args: RepackArgs) -> anyhow::Re
     let opts = RepackOptions {
         level: args.level,
         mode,
+        threads: args.threads,
         ..RepackOptions::default()
     };
+    let changesets = order.changesets;
     let published = target.publish(order.objects, opts).await?;
     let written = started.elapsed();
     tracing::info!(fence = ?args.fence, "published; waiting out the fence before cleanup");
@@ -156,9 +162,9 @@ pub async fn run_repack(meta: &str, blobs: &str, args: RepackArgs) -> anyhow::Re
         total,
     };
     if args.json {
-        println!("{}", json(&report, full, order.changesets, &timing));
+        println!("{}", json(&report, full, changesets, &timing));
     } else {
-        print_report(&report, full, order.changesets, &timing);
+        print_report(&report, full, changesets, &timing);
     }
     Ok(())
 }

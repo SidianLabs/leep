@@ -32,9 +32,10 @@ use crate::objpacks::{
 };
 use crate::pack::{self, IdxEntry, PackIndex};
 use crate::packset::{self, PackSet, DEFAULT_DECODED_CACHE};
-use crate::packwrite::{write_order, write_pack, PackSource, SourceRead};
+use crate::packwrite::{hint_ids, write_order, write_pack, ObjectTable, PackSource, SourceRead};
 use crate::repack::step;
 use crate::{storage_err, ObjectBlobStore, RepackOptions, RepackReport, RepackStep};
+use leep_core::intern::PackHints;
 
 const LEASE_KEY: &str = "packs/repack.lease";
 /// How long a lease outlives its holder's last renewal. Only matters when a
@@ -395,7 +396,8 @@ type Fetch = JoinHandle<Result<Option<Bytes>>>;
 struct ObjectSource<'a> {
     rt: tokio::runtime::Handle,
     store: Arc<dyn ObjectStore>,
-    sources: &'a HashMap<Hash, Source>,
+    /// By id in the repack's [`ObjectTable`].
+    sources: &'a [Source],
     local: PackSet,
     local_view: Arc<packset::View>,
     /// Objects with a loose copy, in write order.
@@ -446,8 +448,8 @@ impl Drop for ObjectSource<'_> {
 impl PackSource for ObjectSource<'_> {
     type Stamp = LooseStamp;
 
-    fn read(&mut self, hash: &Hash) -> Result<SourceRead<LooseStamp>> {
-        let src = &self.sources[hash];
+    fn read(&mut self, id: u32, hash: &Hash) -> Result<SourceRead<LooseStamp>> {
+        let src = &self.sources[id as usize];
         let mut corrupt = false;
         if let Some(stamp) = &src.loose {
             match self.fetch(hash)? {
@@ -562,9 +564,10 @@ impl ObjectBlobStore {
     /// Refuses with `Conflict` while another repack holds the lease.
     pub async fn repack_publish(
         &self,
-        hints: Vec<(Hash, Option<Hash>)>,
+        hints: impl Into<PackHints>,
         opts: RepackOptions,
     ) -> Result<PublishedObjectPack> {
+        let hints = hints.into();
         if !(1..=22).contains(&opts.level) {
             return Err(Error::Invalid(format!(
                 "zstd level {} is outside 1..=22",
@@ -595,7 +598,7 @@ impl ObjectBlobStore {
 
     async fn publish_leased(
         &self,
-        hints: Vec<(Hash, Option<Hash>)>,
+        hints: PackHints,
         opts: &RepackOptions,
         lease: &Lease,
     ) -> Result<Published> {
@@ -651,12 +654,15 @@ impl ObjectBlobStore {
             download_pack(&*self.store, &p.id, &p.index, &local_packs).await?;
         }
 
-        let live: HashSet<Hash> = sources.keys().copied().collect();
-        let order = write_order(hints, &live);
+        let mut sources: Vec<(Hash, Source)> = sources.into_iter().collect();
+        sources.sort_unstable_by_key(|(h, _)| *h);
+        let (hashes, sources): (Vec<Hash>, Vec<Source>) = sources.into_iter().unzip();
+        let table = ObjectTable::from_sorted(hashes)?;
+        let order = write_order(&table, hint_ids(&table, hints), Vec::new());
         let ahead: Vec<Hash> = order
             .iter()
-            .map(|(h, _)| *h)
-            .filter(|h| sources[h].loose.is_some())
+            .filter(|(id, _)| sources[*id as usize].loose.is_some())
+            .map(|(id, _)| *table.hash(*id))
             .collect();
         let new_pack = work.0.join("new.pack");
         let (rt, store, root, path, wopts) = (
@@ -666,7 +672,7 @@ impl ObjectBlobStore {
             new_pack.clone(),
             opts.clone(),
         );
-        let (written, report, sources) = tokio::task::spawn_blocking(move || {
+        let (written, report, sources, table) = tokio::task::spawn_blocking(move || {
             let local = PackSet::new(&root, DEFAULT_DECODED_CACHE);
             let local_view = local.refresh()?;
             let mut src = ObjectSource {
@@ -681,17 +687,17 @@ impl ObjectBlobStore {
             };
             let file = std::fs::File::create(&path).map_err(storage_err)?;
             let mut out = BufWriter::with_capacity(1 << 20, file);
-            let written = write_pack(order, &mut src, &wopts, &mut out, &mut report)?;
+            let written = write_pack(&table, order, &mut src, &wopts, &mut out, &mut report)?;
             drop(src);
             out.into_inner().map_err(|e| storage_err(e.error()))?;
-            Ok::<_, Error>((written, report, sources))
+            Ok::<_, Error>((written, report, sources, table))
         })
         .await
         .map_err(|e| Error::Storage(format!("repack task failed: {e}")))??;
         let mut report = report;
         step(opts, RepackStep::PackSynced)?;
         let replaced: Vec<String> = view.packs.iter().map(|(p, _)| p.id.clone()).collect();
-        if written.entries.is_empty() {
+        if written.records.is_empty() {
             return Ok(Published {
                 report,
                 from_loose: Vec::new(),
@@ -699,7 +705,7 @@ impl ObjectBlobStore {
             });
         }
 
-        let idx_bytes = PackIndex::encode(written.len, written.hash, &written.entries)?;
+        let idx_bytes = written.encode_index(&table)?;
         let id = pack::pack_id(&idx_bytes);
         // One id means the same bytes, so a repack that changed nothing finds
         // its pack published already and uploads nothing.
@@ -737,7 +743,7 @@ impl ObjectBlobStore {
 
         // GC may have deleted objects after this run read them. Hide them in
         // the new pack too; a delete that starts from now on sees the pack.
-        let late = self.late_deletes(&written.entries, &sources).await?;
+        let late = self.late_deletes(&table, written.ids(), &sources).await?;
         if !late.is_empty() {
             self.packs
                 .write_tombstones(late.iter().map(|h| (id.as_str(), *h)))
@@ -747,7 +753,11 @@ impl ObjectBlobStore {
         self.packs.refresh().await?;
         Ok(Published {
             report,
-            from_loose: written.from_loose,
+            from_loose: written
+                .from_loose
+                .into_iter()
+                .map(|(id, stamp)| (*table.hash(id), stamp))
+                .collect(),
             replaced: replaced.into_iter().filter(|r| *r != id).collect(),
         })
     }
@@ -756,19 +766,23 @@ impl ObjectBlobStore {
     /// a loose copy that is gone, or a packed copy tombstoned since.
     async fn late_deletes(
         &self,
-        entries: &[IdxEntry],
-        sources: &HashMap<Hash, Source>,
+        table: &ObjectTable,
+        packed: impl Iterator<Item = u32>,
+        sources: &[Source],
     ) -> Result<Vec<Hash>> {
         let loose = list_all_loose(&*self.store).await?;
         let tombstones = list_tombstones(&*self.store).await?;
-        Ok(entries
-            .iter()
-            .map(|e| e.hash)
-            .filter(|h| match (&sources[h].loose, &sources[h].packed) {
-                (Some(_), _) => !loose.contains_key(h),
-                (None, Some((id, _))) => tombstones.get(id).is_some_and(|d| d.contains(h)),
-                (None, None) => false,
+        Ok(packed
+            .filter(|&i| {
+                let h = table.hash(i);
+                let s = &sources[i as usize];
+                match (&s.loose, &s.packed) {
+                    (Some(_), _) => !loose.contains_key(h),
+                    (None, Some((id, _))) => tombstones.get(id).is_some_and(|d| d.contains(h)),
+                    (None, None) => false,
+                }
             })
+            .map(|i| *table.hash(i))
             .collect())
     }
 

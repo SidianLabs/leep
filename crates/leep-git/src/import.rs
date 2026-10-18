@@ -21,11 +21,22 @@ use crate::{
 };
 
 /// Commits decoded and with their blobs uploaded ahead of the changeset
-/// writes. Bounds memory to this many commits' new blobs. A commit's blobs
+/// writes. Bounds memory to this many slices of new blobs (below). A commit's blobs
 /// are written a few at a time and their metadata in two batched queries
 /// (`Repo::put_blobs`), so this many commits ahead stay well under the
 /// metadata pool's 16 connections.
 const COMMITS_AHEAD: usize = 16;
+/// New blob bytes one commit holds before uploading them. A commit can add
+/// thousands of files (Linux's first adds 187 MB in 17,000), so its blobs
+/// are read and uploaded in slices of about this size: in-flight blob
+/// memory stays near `COMMITS_AHEAD` times this.
+const UPLOAD_SLICE_BYTES: usize = 8 << 20;
+/// Commits read through one git repository handle before a fresh one
+/// replaces it. A handle maps the pack files and keeps every page it
+/// touched resident, and over a history the size of Linux's that is the
+/// whole multi-gigabyte pack: page cache the kernel can reclaim, but
+/// counted in the importer's resident memory.
+const COMMITS_PER_HANDLE: usize = 20_000;
 
 #[derive(Clone, Debug, Default)]
 pub struct ImportOptions {
@@ -220,61 +231,72 @@ fn prepare(ts: &gix::ThreadSafeRepository, id: ObjectId) -> Result<Prepared> {
     })
 }
 
-fn read_blob(ts: &gix::ThreadSafeRepository, oid: ObjectId) -> Result<Vec<u8>> {
-    let g = ts.to_thread_local();
-    let data = g.find_object(oid).map_err(gerr)?.detach().data;
-    Ok(data)
-}
-
 /// Decode and diff one commit on a blocking thread, then upload the blobs it
-/// introduces that are not stored yet, a few at a time.
+/// introduces that are not stored yet, a slice at a time.
 async fn prepare_and_upload(
     repo: &Repo,
     ts: &gix::ThreadSafeRepository,
     cache: &Arc<Mutex<HashMap<ObjectId, (Hash, u64)>>>,
     oid: ObjectId,
 ) -> Result<(ObjectId, Prepared, usize)> {
-    let (ts, known) = (ts.clone(), cache.clone());
-    let (p, blobs) = tokio::task::spawn_blocking(move || -> Result<_> {
-        let p = prepare(&ts, oid)?;
-        let mut wanted = HashSet::new();
-        let mut blobs = Vec::new();
+    let (ts2, known) = (ts.clone(), cache.clone());
+    let (p, wanted) = tokio::task::spawn_blocking(move || -> Result<_> {
+        let p = prepare(&ts2, oid)?;
+        let mut seen = HashSet::new();
+        let mut wanted: Vec<(ObjectId, String)> = Vec::new();
         for (path, change) in &p.changes {
             if let Some((_, b)) = change {
                 // One lookup per blob: copying the key set per commit cost
                 // time and memory proportional to the whole repository.
                 let stored = known.lock().unwrap().contains_key(b);
-                if !stored && wanted.insert(*b) {
-                    let data = read_blob(&ts, *b)?;
-                    // Stop before anything of this commit is written, and name
-                    // the file, rather than fail on an anonymous blob.
-                    if leep_core::hash::is_object_preimage(&data) {
-                        return Err(Error::Invalid(format!(
-                            "commit {oid}: {path} starts with \"leep:\" and a \
-                             NUL-terminated kind, which Leep reserves for its own \
-                             objects and cannot store yet (ADR 0041)"
-                        )));
-                    }
-                    blobs.push((*b, data));
+                if !stored && seen.insert(*b) {
+                    wanted.push((*b, path.clone()));
                 }
             }
         }
-        Ok((p, blobs))
+        Ok((p, wanted))
     })
     .await
     .map_err(|e| Error::Other(format!("prepare task: {e}")))??;
-    let uploaded = blobs.len();
-    let (oids, data): (Vec<ObjectId>, Vec<Bytes>) = blobs
-        .into_iter()
-        .map(|(oid, d)| (oid, Bytes::from(d)))
-        .unzip();
-    let sizes: Vec<u64> = data.iter().map(|d| d.len() as u64).collect();
-    let hashes = repo.put_blobs(data).await?;
-    let mut cache = cache.lock().unwrap();
-    for ((b, h), size) in oids.into_iter().zip(hashes).zip(sizes) {
-        cache.insert(b, (h, size));
+    let wanted = Arc::new(wanted);
+    let mut next = 0;
+    while next < wanted.len() {
+        let (ts2, wanted2, from) = (ts.clone(), wanted.clone(), next);
+        let (oids, data, to) = tokio::task::spawn_blocking(move || -> Result<_> {
+            let g = ts2.to_thread_local();
+            let (mut oids, mut data, mut bytes) = (Vec::new(), Vec::new(), 0);
+            let mut i = from;
+            while i < wanted2.len() && bytes < UPLOAD_SLICE_BYTES {
+                let (b, path) = &wanted2[i];
+                let blob = g.find_object(*b).map_err(gerr)?.detach().data;
+                // Name the file, rather than fail on an anonymous blob. Earlier
+                // slices of this commit may be stored already; nothing names
+                // them, so GC collects them.
+                if leep_core::hash::is_object_preimage(&blob) {
+                    return Err(Error::Invalid(format!(
+                        "commit {oid}: {path} starts with \"leep:\" and a \
+                         NUL-terminated kind, which Leep reserves for its own \
+                         objects and cannot store yet (ADR 0041)"
+                    )));
+                }
+                bytes += blob.len();
+                oids.push(*b);
+                data.push(Bytes::from(blob));
+                i += 1;
+            }
+            Ok((oids, data, i))
+        })
+        .await
+        .map_err(|e| Error::Other(format!("prepare task: {e}")))??;
+        next = to;
+        let sizes: Vec<u64> = data.iter().map(|d| d.len() as u64).collect();
+        let hashes = repo.put_blobs(data).await?;
+        let mut cache = cache.lock().unwrap();
+        for ((b, h), size) in oids.into_iter().zip(hashes).zip(sizes) {
+            cache.insert(b, (h, size));
+        }
     }
-    Ok((oid, p, uploaded))
+    Ok((oid, p, wanted.len()))
 }
 
 /// Commits reachable from `head` that are not yet mapped, parents first, plus
@@ -356,14 +378,26 @@ pub async fn import(
     // in tasks of their own: a future that is not polled while it holds a
     // pooled connection would starve the changeset writes.
     let (tx, mut rx) = mpsc::channel(COMMITS_AHEAD);
+    drop(ts);
     let producer = {
-        let (repo, ts, cache) = (repo.clone(), ts.clone(), blob_cache.clone());
+        let (repo, cache, git_dir) = (repo.clone(), blob_cache.clone(), git_dir.to_path_buf());
         tokio::spawn(async move {
             // Each commit is its own task, so the uploads keep going while
             // this loop waits for room in the channel.
-            let mut ahead = stream::iter(order)
-                .map(|oid| {
-                    let (repo, ts, cache) = (repo.clone(), ts.clone(), cache.clone());
+            let mut handle: Option<gix::ThreadSafeRepository> = None;
+            let mut ahead = stream::iter(order.into_iter().enumerate())
+                .map(|(n, oid)| {
+                    if n % COMMITS_PER_HANDLE == 0 {
+                        handle = None;
+                    }
+                    let ts = match &handle {
+                        Some(ts) => ts.clone(),
+                        None => match crate::open_git(&git_dir) {
+                            Ok(g) => handle.insert(g.into_sync()).clone(),
+                            Err(e) => return tokio::spawn(async move { Err(e) }),
+                        },
+                    };
+                    let (repo, cache) = (repo.clone(), cache.clone());
                     tokio::spawn(async move { prepare_and_upload(&repo, &ts, &cache, oid).await })
                 })
                 .buffered(COMMITS_AHEAD);

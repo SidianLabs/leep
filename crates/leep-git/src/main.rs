@@ -54,8 +54,41 @@ async fn open(meta: &str, blobs: &str) -> Result<Repo> {
     Ok(Repo::new(blobs, meta))
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// glibc gives each thread that contends for the heap an arena of its own,
+/// up to eight per CPU, and each keeps the memory freed in it. An import
+/// frees blob buffers on threads other than the ones that read them, so
+/// that kept memory grew with the history: importing Linux to v2.6.16 ended
+/// at 243 MB of anonymous memory with the default and 75 MB with two
+/// arenas, and ran faster. glibc reads the limit only at startup, so the
+/// process starts itself again with it set. Other allocators ignore it.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn limit_malloc_arenas() {
+    use std::os::unix::process::CommandExt;
+    if std::env::var_os("MALLOC_ARENA_MAX").is_some() {
+        return;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let mut args = std::env::args_os();
+    let arg0 = args.next().unwrap_or_else(|| exe.clone().into_os_string());
+    let err = std::process::Command::new(&exe)
+        .arg0(arg0)
+        .args(args)
+        .env("MALLOC_ARENA_MAX", "2")
+        .exec();
+    eprintln!("warning: could not restart with MALLOC_ARENA_MAX=2: {err}");
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn limit_malloc_arenas() {}
+
+fn main() -> Result<()> {
+    limit_malloc_arenas();
+    tokio::runtime::Runtime::new()?.block_on(run())
+}
+
+async fn run() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::Import {
             meta,

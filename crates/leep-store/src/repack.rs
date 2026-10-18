@@ -10,22 +10,26 @@
 //! nothing is published (the next repack deletes the temp files), and after
 //! it every object is in the new pack, perhaps also loose or in an old pack.
 
-use std::collections::{HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashSet};
 use std::fs::File;
 use std::io::{BufWriter, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use leep_core::intern::{PackHints, NO_ID};
 use leep_core::{Error, Hash, Result};
 
 use crate::fs::unix_secs;
-use crate::pack::{self, IdxEntry, PackIndex, MAX_CHAIN};
+use crate::pack::{self, MAX_CHAIN};
 use crate::packset::{
     lock_tombstones, parse_tombstones, published_ids, sync_dir, tombstone_line, Pack, TOMBSTONES,
 };
-use crate::packwrite::{plan_merge, write_order, write_pack, PackSource, SourceRead};
+use crate::packwrite::{
+    hint_ids, plan_merge, write_order, write_pack, ObjectTable, PackSource, SourceRead,
+};
 use crate::{storage_err, FsBlobStore};
 
 /// Held for a whole repack, fence included, so two never overlap. A lock,
@@ -82,6 +86,9 @@ pub struct RepackOptions {
     /// Longest delta chain written.
     pub max_chain: usize,
     pub mode: RepackMode,
+    /// Threads compressing frames; 0 for one per CPU. The pack's bytes do
+    /// not depend on it.
+    pub threads: usize,
     /// Called at each step; an error aborts the repack where it stands.
     pub hook: Option<RepackHook>,
 }
@@ -92,6 +99,7 @@ impl Default for RepackOptions {
             level: 9,
             max_chain: MAX_CHAIN,
             mode: RepackMode::Full,
+            threads: 0,
             hook: None,
         }
     }
@@ -103,6 +111,7 @@ impl std::fmt::Debug for RepackOptions {
             .field("level", &self.level)
             .field("max_chain", &self.max_chain)
             .field("mode", &self.mode)
+            .field("threads", &self.threads)
             .finish_non_exhaustive()
     }
 }
@@ -158,8 +167,9 @@ pub struct RepackReport {
 pub struct PublishedPack {
     store: FsBlobStore,
     report: RepackReport,
-    /// Objects packed from loose files, with the file mtime that was packed.
-    from_loose: Vec<(Hash, Option<SystemTime>)>,
+    /// Objects packed from loose files, with the file mtime that was packed
+    /// (see [`stamp_of`]).
+    from_loose: Vec<(Hash, i64)>,
     replaced: Vec<String>,
     opts: RepackOptions,
     _lock: File,
@@ -195,7 +205,7 @@ impl PublishedPack {
                 Err(e) => return Err(storage_err(e)),
             }
             step(&self.opts, RepackStep::LooseMovedAside(n))?;
-            let rewritten = mtime(&aside)? != *packed_mtime;
+            let rewritten = stamp_of(mtime(&aside)?) != *packed_mtime;
             // Collect writes its tombstone before it unlinks the loose file,
             // and the upload that rescues the blob comes after the unlink.
             let view = store.packs.fresh_tombstones()?;
@@ -251,6 +261,30 @@ fn mtime(path: &Path) -> Result<Option<SystemTime>> {
     std::fs::metadata(path)
         .map(|m| m.modified().ok())
         .map_err(storage_err)
+}
+
+/// A loose copy's mtime as nanoseconds from the epoch, in 8 bytes instead
+/// of 16; [`NO_MTIME`] when there is none (or it is out of range).
+fn stamp_of(t: Option<SystemTime>) -> i64 {
+    let nanos = t.and_then(|t| match t.duration_since(UNIX_EPOCH) {
+        Ok(d) => i64::try_from(d.as_nanos()).ok(),
+        Err(e) => i64::try_from(e.duration().as_nanos()).ok().map(|n| -n),
+    });
+    nanos.unwrap_or(NO_MTIME)
+}
+
+/// The stamp of an object with no loose copy.
+const NOT_LOOSE: i64 = i64::MIN;
+const NO_MTIME: i64 = i64::MIN + 1;
+
+/// What the index records for a loose copy with this stamp: its mtime in
+/// whole seconds, or now.
+fn stamp_secs(stamp: i64) -> i64 {
+    if stamp >= 0 {
+        stamp / 1_000_000_000
+    } else {
+        now_secs()
+    }
 }
 
 fn aside_path(path: &Path) -> PathBuf {
@@ -338,7 +372,6 @@ struct LeftoverCounts {
 
 struct LooseObject {
     hash: Hash,
-    path: PathBuf,
     len: u64,
     mtime: Option<SystemTime>,
 }
@@ -371,7 +404,6 @@ fn loose_objects(root: &Path, leftovers: &mut LeftoverCounts) -> Result<Vec<Loos
                         let hash = format!("{prefix}{rest}").parse().unwrap();
                         out.push(LooseObject {
                             hash,
-                            path,
                             len: m.len(),
                             mtime: m.modified().ok(),
                         });
@@ -389,7 +421,6 @@ fn loose_objects(root: &Path, leftovers: &mut LeftoverCounts) -> Result<Vec<Loos
             };
             out.push(LooseObject {
                 hash,
-                path: entry.path(),
                 len: m.len(),
                 mtime: m.modified().ok(),
             });
@@ -400,48 +431,64 @@ fn loose_objects(root: &Path, leftovers: &mut LeftoverCounts) -> Result<Vec<Loos
     Ok(out)
 }
 
-/// Where a repack reads an object from. A loose copy is preferred: it is
-/// live even where the packed copy is tombstoned.
-#[derive(Default)]
-struct Source {
-    loose: Option<(PathBuf, Option<SystemTime>)>,
-    packed: Option<(Arc<Pack>, IdxEntry)>,
+/// Where each object of a repack is read from, by id in its
+/// [`ObjectTable`]. A loose copy is preferred: it is live even where the
+/// packed copy is tombstoned. 16 bytes per object.
+struct Sources {
+    /// The loose copy's stamp ([`stamp_of`]), or [`NOT_LOOSE`].
+    loose: Vec<i64>,
+    /// `pack << 32 | rank` of the packed copy in `packs`, or `u64::MAX`.
+    packed: Vec<u64>,
+    packs: Vec<Arc<Pack>>,
 }
 
-type Read = SourceRead<Option<SystemTime>>;
+impl Sources {
+    fn packed(&self, id: u32) -> Option<(&Arc<Pack>, u32)> {
+        match self.packed[id as usize] {
+            u64::MAX => None,
+            v => Some((&self.packs[(v >> 32) as usize], v as u32)),
+        }
+    }
+}
+
+type Read = SourceRead<i64>;
 
 struct FsSource<'a> {
     store: &'a FsBlobStore,
-    sources: &'a HashMap<Hash, Source>,
+    sources: &'a Sources,
 }
 
 impl PackSource for FsSource<'_> {
-    type Stamp = Option<SystemTime>;
-    fn read(&mut self, hash: &Hash) -> Result<Read> {
-        read_source(self.store, &self.sources[hash], hash)
+    type Stamp = i64;
+    fn read(&mut self, id: u32, hash: &Hash) -> Result<Read> {
+        read_source(self.store, self.sources, id, hash)
     }
 
     /// Only for an object read from its pack: a loose copy is what the new
     /// pack records then.
-    fn stored_frame(&mut self, hash: &Hash) -> Result<Option<(Vec<u8>, Option<Hash>)>> {
-        let (None, Some((p, e))) = (&self.sources[hash].loose, &self.sources[hash].packed) else {
+    fn stored_frame(&mut self, id: u32, _hash: &Hash) -> Result<Option<(Vec<u8>, Option<Hash>)>> {
+        if self.sources.loose[id as usize] != NOT_LOOSE {
+            return Ok(None);
+        }
+        let Some((p, rank)) = self.sources.packed(id) else {
             return Ok(None);
         };
+        let e = p.index.entry(rank);
         let base = e.base.map(|r| p.index.hash_at(r as usize));
-        Ok(Some((p.frame(e)?, base)))
+        Ok(Some((p.frame(&e)?, base)))
     }
 }
 
-fn read_source(store: &FsBlobStore, src: &Source, hash: &Hash) -> Result<Read> {
+fn read_source(store: &FsBlobStore, src: &Sources, id: u32, hash: &Hash) -> Result<Read> {
     let mut corrupt = false;
-    if let Some((path, mtime)) = &src.loose {
-        match std::fs::read(path) {
+    let stamp = src.loose[id as usize];
+    if stamp != NOT_LOOSE {
+        match std::fs::read(store.path_for(hash)) {
             Ok(data) if pack::object_intact(hash, &data) => {
-                let modified = mtime.and_then(unix_secs).unwrap_or_else(now_secs);
                 return Ok(Read::Ok {
                     data: data.into(),
-                    modified,
-                    from_loose: Some(*mtime),
+                    modified: stamp_secs(stamp),
+                    from_loose: Some(stamp),
                 });
             }
             Ok(_) => corrupt = true,
@@ -449,8 +496,9 @@ fn read_source(store: &FsBlobStore, src: &Source, hash: &Hash) -> Result<Read> {
             Err(e) => return Err(storage_err(e)),
         }
     }
-    if let Some((p, e)) = &src.packed {
-        let data = store.packs.decode(p, e)?;
+    if let Some((p, rank)) = src.packed(id) {
+        let e = p.index.entry(rank);
+        let data = store.packs.decode(p, &e)?;
         return Ok(Read::Ok {
             data,
             modified: e.modified,
@@ -461,6 +509,39 @@ fn read_source(store: &FsBlobStore, src: &Source, hash: &Hash) -> Result<Read> {
         Read::Corrupt
     } else {
         Read::Vanished
+    })
+}
+
+/// Live hashes of `packs` in ascending order, each once, with the first
+/// pack (in the order given) that has it and its rank there. A heap merge
+/// of the sorted indexes, so it holds nothing per object.
+fn merge_packs<'a>(
+    packs: &'a [(usize, &'a Pack, &'a HashSet<Hash>)],
+) -> impl Iterator<Item = (Hash, usize, u32)> + 'a {
+    let mut heap: BinaryHeap<Reverse<(Hash, usize, u32)>> = BinaryHeap::new();
+    let next_live = |k: usize, mut rank: u32| -> Option<(Hash, usize, u32)> {
+        let (_, p, dead) = packs[k];
+        while (rank as usize) < p.index.len() {
+            let h = p.index.hash_at(rank as usize);
+            if !dead.contains(&h) {
+                return Some((h, k, rank));
+            }
+            rank += 1;
+        }
+        None
+    };
+    for k in 0..packs.len() {
+        heap.extend(next_live(k, 0).map(Reverse));
+    }
+    let mut last: Option<Hash> = None;
+    std::iter::from_fn(move || loop {
+        let Reverse((h, k, rank)) = heap.pop()?;
+        heap.extend(next_live(k, rank + 1).map(Reverse));
+        if last == Some(h) {
+            continue;
+        }
+        last = Some(h);
+        return Some((h, packs[k].0, rank));
     })
 }
 
@@ -478,20 +559,17 @@ impl FsBlobStore {
     /// Refuses with `Conflict` while another repack holds the store.
     pub async fn repack_publish(
         &self,
-        hints: Vec<(Hash, Option<Hash>)>,
+        hints: impl Into<PackHints>,
         opts: RepackOptions,
     ) -> Result<PublishedPack> {
         let store = self.clone();
+        let hints = hints.into();
         tokio::task::spawn_blocking(move || store.publish_blocking(hints, opts))
             .await
             .map_err(|e| Error::Storage(format!("repack task failed: {e}")))?
     }
 
-    fn publish_blocking(
-        &self,
-        hints: Vec<(Hash, Option<Hash>)>,
-        opts: RepackOptions,
-    ) -> Result<PublishedPack> {
+    fn publish_blocking(&self, hints: PackHints, opts: RepackOptions) -> Result<PublishedPack> {
         if !(1..=22).contains(&opts.level) {
             return Err(Error::Invalid(format!(
                 "zstd level {} is outside 1..=22",
@@ -550,61 +628,111 @@ impl FsBlobStore {
             }
         };
         report.packs_merged = merged.len() as u64;
-        let mut sources: HashMap<Hash, Source> = HashMap::new();
-        let mut seen_packed: HashSet<Hash> = HashSet::new();
+        let all: Vec<(usize, &Pack, &HashSet<Hash>)> = view
+            .packs
+            .iter()
+            .enumerate()
+            .map(|(i, (p, dead))| (i, &**p, dead))
+            .collect();
+        report.pack_bytes_before = all.iter().map(|(_, p, _)| p.index.pack_len()).sum();
+        report.packed_before = merge_packs(&all).count() as u64;
+        let merging: Vec<(usize, &Pack, &HashSet<Hash>)> = all
+            .iter()
+            .copied()
+            .filter(|(_, p, _)| merged.contains(&p.id))
+            .collect();
+
+        // Every object to pack, in hash order, from the merged packs and the
+        // loose listing at once; an object's id is its position.
+        let most = loose.len() + merging.iter().map(|(_, p, _)| p.index.len()).sum::<usize>();
+        let mut hashes: Vec<Hash> = Vec::with_capacity(most);
+        let mut sources = Sources {
+            loose: Vec::with_capacity(most),
+            packed: Vec::with_capacity(most),
+            packs: view.packs.iter().map(|(p, _)| p.clone()).collect(),
+        };
+        {
+            let mut packed = merge_packs(&merging).peekable();
+            let mut loose = loose.into_iter().peekable();
+            loop {
+                let take_packed = match (packed.peek(), loose.peek()) {
+                    (None, None) => break,
+                    (Some(_), None) => true,
+                    (None, Some(_)) => false,
+                    (Some(p), Some(l)) => p.0 <= l.hash,
+                };
+                let take_loose = match (packed.peek(), loose.peek()) {
+                    (_, None) => false,
+                    (None, Some(_)) => true,
+                    (Some(p), Some(l)) => l.hash <= p.0,
+                };
+                let mut hash = None;
+                let mut src_packed = u64::MAX;
+                let mut src_loose = NOT_LOOSE;
+                if take_packed {
+                    let (h, k, rank) = packed.next().unwrap();
+                    hash = Some(h);
+                    src_packed = (k as u64) << 32 | u64::from(rank);
+                }
+                if take_loose {
+                    let o = loose.next().unwrap();
+                    report.loose_before += 1;
+                    report.loose_bytes_before += o.len;
+                    hash = Some(o.hash);
+                    src_loose = stamp_of(o.mtime);
+                }
+                hashes.push(hash.unwrap());
+                sources.packed.push(src_packed);
+                sources.loose.push(src_loose);
+            }
+        }
+        hashes.shrink_to_fit();
+        sources.loose.shrink_to_fit();
+        sources.packed.shrink_to_fit();
+        let table = ObjectTable::from_sorted(hashes)?;
+        let mut tombstoned: Vec<Hash> = merging
+            .iter()
+            .flat_map(|(_, _, dead)| dead.iter().copied())
+            .collect();
+        tombstoned.sort_unstable();
+        tombstoned.dedup();
+        report.dropped_tombstoned =
+            tombstoned.iter().filter(|h| table.id(h).is_none()).count() as u64;
+        drop(tombstoned);
+
         // Objects of the merged packs in each pack's write order, with the
         // base each had there, so a merge keeps the deltas it had.
-        let mut old_bases: Vec<(Hash, Option<Hash>)> = Vec::new();
-        let mut tombstoned: HashSet<Hash> = HashSet::new();
-        for (p, dead) in &view.packs {
-            report.pack_bytes_before += p.index.pack_len();
-            let merging = merged.contains(&p.id);
-            if merging {
-                tombstoned.extend(dead.iter().copied());
-            }
-            let mut in_order = Vec::new();
-            for e in p.index.iter() {
-                if dead.contains(&e.hash) {
+        let mut old_bases: Vec<(u32, u32)> = Vec::new();
+        for &(k, p, dead) in &merging {
+            let mut in_order: Vec<(u64, u32, u32)> = Vec::new();
+            for rank in 0..p.index.len() as u32 {
+                let h = p.index.hash_at(rank as usize);
+                if dead.contains(&h) {
                     continue;
                 }
-                if seen_packed.insert(e.hash) {
-                    report.packed_before += 1;
-                }
-                if !merging {
+                let Some(id) = table.id(&h) else { continue };
+                if sources.packed[id as usize] != (k as u64) << 32 | u64::from(rank) {
                     continue;
                 }
-                let s = sources.entry(e.hash).or_default();
-                if s.packed.is_none() {
-                    s.packed = Some((p.clone(), e));
-                    in_order.push(e);
-                }
+                let e = p.index.entry(rank);
+                let base = e.base.map_or(NO_ID, |r| {
+                    table.id(&p.index.hash_at(r as usize)).unwrap_or(NO_ID)
+                });
+                in_order.push((e.offset, id, base));
             }
-            in_order.sort_by_key(|e| e.offset);
-            old_bases.extend(
-                in_order
-                    .into_iter()
-                    .map(|e| (e.hash, e.base.map(|r| p.index.hash_at(r as usize)))),
-            );
+            in_order.sort_unstable();
+            old_bases.extend(in_order.into_iter().map(|(_, id, base)| (id, base)));
         }
-        drop(seen_packed);
-        for o in loose {
-            report.loose_before += 1;
-            report.loose_bytes_before += o.len;
-            sources.entry(o.hash).or_default().loose = Some((o.path, o.mtime));
-        }
-        report.dropped_tombstoned = tombstoned
-            .iter()
-            .filter(|h| !sources.contains_key(h))
-            .count() as u64;
+        drop(merging);
+        drop(all);
 
         // A full repack trusts the walk first; an incremental one writes the
         // merged packs first, so loose objects can use them as bases.
-        let (first, second) = match opts.mode {
-            RepackMode::Full => (hints, old_bases),
-            RepackMode::Incremental { .. } => (old_bases, hints),
+        let hints = hint_ids(&table, hints);
+        let order = match opts.mode {
+            RepackMode::Full => write_order(&table, hints, old_bases),
+            RepackMode::Incremental { .. } => write_order(&table, old_bases, hints),
         };
-        let live: HashSet<Hash> = sources.keys().copied().collect();
-        let order = write_order(first.into_iter().chain(second).collect(), &live);
 
         let tmp_pack = temp_name(&dir, "pack");
         let mut out =
@@ -613,8 +741,12 @@ impl FsBlobStore {
             store: self,
             sources: &sources,
         };
-        let written = write_pack(order, &mut src, &opts, &mut out, &mut report)?;
-        let (entries, from_loose) = (written.entries, written.from_loose);
+        let written = write_pack(&table, order, &mut src, &opts, &mut out, &mut report)?;
+        let from_loose: Vec<(Hash, i64)> = written
+            .from_loose
+            .iter()
+            .map(|&(id, stamp)| (*table.hash(id), stamp))
+            .collect();
         let file = out.into_inner().map_err(|e| storage_err(e.error()))?;
         file.sync_all().map_err(storage_err)?;
         drop(file);
@@ -626,7 +758,7 @@ impl FsBlobStore {
             .filter(|id| merged.contains(id))
             .collect();
 
-        if entries.is_empty() {
+        if written.records.is_empty() {
             remove_if_present(&tmp_pack)?;
             return Ok(PublishedPack {
                 store: self.clone(),
@@ -637,29 +769,55 @@ impl FsBlobStore {
                 _lock: lock,
             });
         }
-        let idx_bytes = PackIndex::encode(written.len, written.hash, &entries)?;
-        let id = pack::pack_id(&idx_bytes);
+        // The index is encoded twice, once for its id and once into its
+        // file, so it is never all in memory.
+        let mut id_hasher = blake3::Hasher::new();
+        let mut index_len = 0u64;
+        written.write_index(&table, &mut |b: &[u8]| {
+            id_hasher.update(b);
+            index_len += b.len() as u64;
+            Ok(())
+        })?;
+        let id = hex::encode(id_hasher.finalize().as_bytes());
         std::fs::rename(&tmp_pack, dir.join(format!("{id}.pack"))).map_err(storage_err)?;
         sync_dir(&dir)?;
         step(&opts, RepackStep::PackRenamed)?;
         let tmp_idx = temp_name(&dir, "idx");
-        write_durably(&tmp_idx, &idx_bytes)?;
+        {
+            let mut f =
+                BufWriter::with_capacity(1 << 20, File::create(&tmp_idx).map_err(storage_err)?);
+            let mut check = blake3::Hasher::new();
+            written.write_index(&table, &mut |b: &[u8]| {
+                check.update(b);
+                f.write_all(b).map_err(storage_err)
+            })?;
+            if hex::encode(check.finalize().as_bytes()) != id {
+                return Err(Error::Storage(
+                    "pack index encoded differently twice".into(),
+                ));
+            }
+            let f = f.into_inner().map_err(|e| storage_err(e.error()))?;
+            f.sync_all().map_err(storage_err)?;
+        }
         step(&opts, RepackStep::IndexSynced)?;
         std::fs::rename(&tmp_idx, dir.join(format!("{id}.idx"))).map_err(storage_err)?;
         sync_dir(&dir)?;
         step(&opts, RepackStep::Published)?;
         report.pack_bytes = written.len;
-        report.index_bytes = idx_bytes.len() as u64;
+        report.index_bytes = index_len;
         report.pack_id = Some(id.clone());
 
         // GC may have deleted objects after this run read them. Hide them in
         // the new pack too; a delete that starts from now on sees the pack.
-        let late = self.late_deletes(entries.iter().map(|e| e.hash), &sources)?;
+        let late = self.late_deletes(&table, written.ids(), &sources)?;
         if !late.is_empty() {
             let lines: String = late.iter().map(|h| tombstone_line(&id, h)).collect();
             self.packs.append_tombstones(&lines)?;
             report.late_tombstones = late.len() as u64;
         }
+        // Loading the new index holds it beside the old ones; the per-object
+        // arrays of this run go first.
+        drop((written, sources, table, view));
         self.packs.refresh()?;
         Ok(PublishedPack {
             store: self.clone(),
@@ -675,8 +833,9 @@ impl FsBlobStore {
     /// a loose file that is gone, or a packed copy tombstoned since.
     fn late_deletes(
         &self,
-        packed: impl Iterator<Item = Hash>,
-        sources: &HashMap<Hash, Source>,
+        table: &ObjectTable,
+        packed: impl Iterator<Item = u32>,
+        sources: &Sources,
     ) -> Result<Vec<Hash>> {
         let tombstones = match std::fs::read(self.packs.dir().join(TOMBSTONES)) {
             Ok(t) => parse_tombstones(&t),
@@ -684,15 +843,17 @@ impl FsBlobStore {
             Err(e) => return Err(storage_err(e)),
         };
         let mut late = Vec::new();
-        for hash in packed {
-            let src = &sources[&hash];
-            let gone = match (&src.loose, &src.packed) {
-                (Some((path, _)), _) => !path.exists(),
-                (None, Some((p, _))) => tombstones.get(&p.id).is_some_and(|d| d.contains(&hash)),
-                (None, None) => false,
+        for id in packed {
+            let hash = table.hash(id);
+            let gone = if sources.loose[id as usize] != NOT_LOOSE {
+                !self.path_for(hash).exists()
+            } else if let Some((p, _)) = sources.packed(id) {
+                tombstones.get(&p.id).is_some_and(|d| d.contains(hash))
+            } else {
+                false
             };
             if gone {
-                late.push(hash);
+                late.push(*hash);
             }
         }
         Ok(late)
