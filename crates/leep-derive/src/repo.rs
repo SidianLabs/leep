@@ -152,17 +152,20 @@ struct AncestryEntry {
 const ANCESTRY_CACHE_ENTRIES: usize = 1 << 18;
 
 impl AncestryCache {
-    fn get(&self, id: &ChangesetId) -> AncestryEntry {
+    /// `f` of the entry of `id` (an empty one if absent). Walks ask for one
+    /// field of each changeset they visit, so the entry is not cloned.
+    fn get<T>(&self, id: &ChangesetId, f: impl FnOnce(&AncestryEntry) -> T) -> T {
         let mut m = self.inner.lock().unwrap();
         if let Some(e) = m.new.get(id) {
-            return e.clone();
+            return f(e);
         }
         match m.old.remove(id) {
             Some(e) => {
-                m.insert(*id, e.clone());
-                e
+                let out = f(&e);
+                m.insert(*id, e);
+                out
             }
-            None => AncestryEntry::default(),
+            None => f(&AncestryEntry::default()),
         }
     }
 
@@ -658,7 +661,7 @@ impl Repo {
     /// substitutes recomputed root trees as it goes, and a value read before
     /// that must not answer later reads.
     pub(crate) async fn root_tree_prefetched(&self, id: ChangesetId) -> Result<Hash> {
-        match self.ancestry.get(&id).root {
+        match self.ancestry.get(&id, |e| e.root) {
             Some(r) => Ok(r),
             None => self.root_tree(id).await,
         }
@@ -693,7 +696,7 @@ impl Repo {
     pub(crate) async fn prefetch_root_trees(&self, ids: &[ChangesetId]) {
         let keys: Vec<Hash> = ids
             .iter()
-            .filter(|id| self.ancestry.get(id).root.is_none())
+            .filter(|id| self.ancestry.get(id, |e| e.root.is_none()))
             .map(|id| id.0)
             .collect();
         if keys.is_empty() {
@@ -715,7 +718,7 @@ impl Repo {
 
     /// Length of the longest parent chain to a root; roots are 1.
     pub async fn generation(&self, id: ChangesetId) -> Result<u64> {
-        if let Some(g) = self.ancestry.get(&id).generation {
+        if let Some(g) = self.ancestry.get(&id, |e| e.generation) {
             return Ok(g);
         }
         let v = derived::derive::<Generation>(self, id).await?;
@@ -726,12 +729,12 @@ impl Repo {
 
     /// Generation of `id` if this process has seen it, without a read.
     pub(crate) fn cached_generation(&self, id: ChangesetId) -> Option<u64> {
-        self.ancestry.get(&id).generation
+        self.ancestry.get(&id, |e| e.generation)
     }
 
     /// Parents of `id` if this process has seen them, without a read.
     pub(crate) fn cached_parents(&self, id: ChangesetId) -> Option<Arc<[ChangesetId]>> {
-        self.ancestry.get(&id).parents
+        self.ancestry.get(&id, |e| e.parents.clone())
     }
 
     /// Keep parents a batched read returned, for later walks.
@@ -756,7 +759,7 @@ impl Repo {
 
     /// Parents of a stored changeset, without decoding it again once seen.
     pub(crate) async fn parents(&self, id: ChangesetId) -> Result<Arc<[ChangesetId]>> {
-        if let Some(p) = self.ancestry.get(&id).parents {
+        if let Some(p) = self.ancestry.get(&id, |e| e.parents.clone()) {
             return Ok(p);
         }
         let p: Arc<[ChangesetId]> = self.get_changeset(id).await?.parents.into();
@@ -875,17 +878,20 @@ mod tests {
             c.update(id(n), |e| e.generation = Some(n as u64));
             if n % 1000 == 0 {
                 // Touching an old entry keeps it alive across rotations.
-                assert_eq!(c.get(&id(0)).generation, Some(0));
+                assert_eq!(c.get(&id(0), |e| e.generation), Some(0));
             }
         }
         let m = c.inner.lock().unwrap();
         assert!(m.new.len() + m.old.len() <= 2 * ANCESTRY_CACHE_ENTRIES);
         drop(m);
-        assert_eq!(c.get(&id(total - 1)).generation, Some(total as u64 - 1));
-        assert_eq!(c.get(&id(0)).generation, Some(0));
-        assert_eq!(c.get(&id(1)).generation, None, "evicted");
+        assert_eq!(
+            c.get(&id(total - 1), |e| e.generation),
+            Some(total as u64 - 1)
+        );
+        assert_eq!(c.get(&id(0), |e| e.generation), Some(0));
+        assert_eq!(c.get(&id(1), |e| e.generation), None, "evicted");
         c.update(id(5), |e| e.parents = Some(Arc::from([id(4)])));
-        let e = c.get(&id(5));
+        let e = c.get(&id(5), AncestryEntry::clone);
         assert_eq!(
             (e.parents.as_deref(), e.generation),
             (Some(&[id(4)][..]), None)

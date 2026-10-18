@@ -7,7 +7,7 @@ use leep_core::{ChangesetId, Result};
 
 use crate::derived::{self, LastMerge, SkipEntry};
 use crate::prefetch::{ReadAhead, MAX_BATCH};
-use crate::repo::SkiplistCache;
+use crate::repo::{ByKey, SkiplistCache};
 use crate::Repo;
 
 tokio::task_local! {
@@ -53,22 +53,11 @@ impl Repo {
         if self.generation(descendant).await? <= target {
             return Ok(false);
         }
-        // Fast path: ride the first-parent chain down via skip pointers.
-        let mut x = descendant;
-        loop {
-            if x == ancestor {
-                return Ok(true);
-            }
-            match self
-                .skiplist_noting_generations(x)
-                .await?
-                .iter()
-                .rev()
-                .find(|e| e.generation >= target)
-            {
-                Some(e) => x = e.id,
-                None => break,
-            }
+        if self
+            .on_first_parent_chain(ancestor, target, descendant)
+            .await?
+        {
+            return Ok(true);
         }
         // Full search over all parents. Nothing at or above `ancestor` can be
         // a common ancestor except `ancestor` itself.
@@ -110,6 +99,84 @@ impl Repo {
                 .await?
                 .unwrap_or(c),
         ))
+    }
+
+    /// Whether `ancestor`, of generation `target`, is on the first-parent
+    /// chain of `descendant`: rides it down via skip pointers, so the cost is
+    /// logarithmic in the distance.
+    async fn on_first_parent_chain(
+        &self,
+        ancestor: ChangesetId,
+        target: u64,
+        descendant: ChangesetId,
+    ) -> Result<bool> {
+        let mut x = descendant;
+        loop {
+            if x == ancestor {
+                return Ok(true);
+            }
+            match self
+                .skiplist_noting_generations(x)
+                .await?
+                .iter()
+                .rev()
+                .find(|e| e.generation >= target)
+            {
+                Some(e) => x = e.id,
+                None => return Ok(false),
+            }
+        }
+    }
+
+    /// Whether every ancestor of `tip` that ranks below `base` (by
+    /// generation, then id) is an ancestor of `base`; `false` also when that
+    /// takes more than `budget` changesets, or an ancestor below `base` is
+    /// off its first-parent chain, to tell.
+    ///
+    /// With `base` the merge base of `tip` and another changeset, `true`
+    /// means they have no common ancestor outside `base`'s ancestors: one
+    /// would rank below `base`, the best common ancestor. Walks only `tip`'s
+    /// ancestors outside `base`'s, so a branch of a few changesets forked
+    /// from `base` costs a few steps however old `base` is.
+    pub(crate) async fn side_is_clear(
+        &self,
+        tip: ChangesetId,
+        base: (u64, ChangesetId),
+        budget: usize,
+    ) -> Result<bool> {
+        let mut reader = Reader::default();
+        let gt = reader.generations(self, &[tip], u64::MAX).await?[0];
+        let mut seen: HashSet<ChangesetId, ByKey> = HashSet::default();
+        seen.insert(tip);
+        let mut heap = BinaryHeap::from([(gt, tip)]);
+        let mut steps = 0usize;
+        while let Some((g, id)) = heap.pop() {
+            if id == base.1 {
+                continue;
+            }
+            if (g, id) < base {
+                // Ancestors of `base` have only ancestors of `base` behind
+                // them; anything else is what this rules out.
+                if self.on_first_parent_chain(id, g, base.1).await? {
+                    continue;
+                }
+                return Ok(false);
+            }
+            // Ranks above `base`, so not behind it.
+            steps += 1;
+            if steps > budget {
+                return Ok(false);
+            }
+            let parents = reader.parents(self, id, g).await?;
+            let new: Vec<ChangesetId> = parents
+                .iter()
+                .copied()
+                .filter(|p| seen.insert(*p))
+                .collect();
+            let gens = reader.generations(self, &new, g).await?;
+            heap.extend(gens.into_iter().zip(new));
+        }
+        Ok(true)
     }
 
     async fn last_merge(&self, id: ChangesetId) -> Result<u64> {
@@ -203,8 +270,8 @@ impl Repo {
         if a == b {
             return Ok((!below((tips[0], a))).then_some(a));
         }
-        let mut marks: HashMap<ChangesetId, u8> = HashMap::new();
-        let mut pruned: HashSet<ChangesetId> = HashSet::new();
+        let mut marks: HashMap<ChangesetId, u8, ByKey> = HashMap::default();
+        let mut pruned: HashSet<ChangesetId, ByKey> = HashSet::default();
         let mut heap: BinaryHeap<(u64, ChangesetId)> = BinaryHeap::new();
         // Queued changesets carrying each side's mark.
         let mut queued = [0usize; 2];
@@ -239,7 +306,7 @@ impl Repo {
                 .copied()
                 .filter(|p| !marks.contains_key(p) && !pruned.contains(p))
                 .collect();
-            let gens: HashMap<ChangesetId, u64> = new
+            let gens: HashMap<ChangesetId, u64, ByKey> = new
                 .iter()
                 .copied()
                 .zip(reader.generations(self, &new, g).await?)
@@ -272,7 +339,7 @@ impl Repo {
 pub(crate) struct Ancestors {
     reader: Reader,
     /// Every changeset reached, all ancestors (inclusive).
-    seen: HashSet<ChangesetId>,
+    seen: HashSet<ChangesetId, ByKey>,
     /// Reached but not yet expanded, newest first.
     heap: BinaryHeap<(u64, ChangesetId)>,
 }
@@ -281,7 +348,7 @@ impl Ancestors {
     pub(crate) fn new(tip: ChangesetId, generation: u64) -> Self {
         Ancestors {
             reader: Reader::default(),
-            seen: HashSet::from([tip]),
+            seen: HashSet::from_iter([tip]),
             heap: BinaryHeap::from([(generation, tip)]),
         }
     }
@@ -355,17 +422,20 @@ impl Reader {
     }
 
     async fn generations(&mut self, repo: &Repo, ids: &[ChangesetId], at: u64) -> Result<Vec<u64>> {
+        let cached: Vec<Option<u64>> = ids.iter().map(|&id| repo.cached_generation(id)).collect();
+        if cached.iter().all(Option::is_some) {
+            return Ok(cached.into_iter().flatten().collect());
+        }
         let missing: Vec<ChangesetId> = ids
             .iter()
-            .copied()
-            .filter(|&id| repo.cached_generation(id).is_none())
+            .zip(&cached)
+            .filter(|(_, g)| g.is_none())
+            .map(|(id, _)| *id)
             .collect();
-        if !missing.is_empty() {
-            self.ahead.ensure(repo, &missing, at, MAX_BATCH).await;
-        }
+        self.ahead.ensure(repo, &missing, at, MAX_BATCH).await;
         let mut out = Vec::with_capacity(ids.len());
-        for &id in ids {
-            let g = match repo.cached_generation(id) {
+        for (&id, g) in ids.iter().zip(cached) {
+            let g = match g.or_else(|| repo.cached_generation(id)) {
                 Some(g) => g,
                 None => {
                     let g = self.ahead.generation(repo, id).await?;
@@ -757,6 +827,44 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `side_is_clear` is only trusted when it says the merge base is the
+    /// only maximal common ancestor; check that against every changeset.
+    #[tokio::test]
+    async fn a_clear_side_leaves_no_common_ancestor_outside_the_merge_base() {
+        let mut cleared = 0;
+        for seed in 1..=8u64 {
+            let mut rng = Lcg(seed);
+            let mut f = Fixture::new(Counter::default());
+            let n = 30 + rng.below(90);
+            let ids = random_dag(&mut f, &mut rng, n).await;
+            let r = f.cold();
+            for _ in 0..60 {
+                let (a, b) = (ids[rng.below(ids.len())], ids[rng.below(ids.len())]);
+                let Some(m) = r.merge_base(a, b).await.unwrap() else {
+                    continue;
+                };
+                let gm = r.generation(m).await.unwrap();
+                for tip in [a, b] {
+                    if !r.side_is_clear(tip, (gm, m), usize::MAX).await.unwrap() {
+                        continue;
+                    }
+                    cleared += 1;
+                    for &c in &ids {
+                        if r.is_ancestor_reference(c, a).await.unwrap()
+                            && r.is_ancestor_reference(c, b).await.unwrap()
+                        {
+                            assert!(
+                                r.is_ancestor_reference(c, m).await.unwrap(),
+                                "{c} is common to {a} and {b} but not behind {m}, seed {seed}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(cleared > 50, "{cleared}");
     }
 
     struct GitLike {

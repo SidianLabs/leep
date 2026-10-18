@@ -31,6 +31,16 @@ pub struct Spec {
     /// Long-lived subsystem branches.
     pub branches: usize,
     pub seed: u64,
+    /// `(back, commits)`: at the end, a branch of `commits` small changesets
+    /// forked from mainline as it was `back` changesets before the end is
+    /// merged into mainline, like Linux's `work.thaw` (2 commits on a base
+    /// five months old). Its merge's second parent differs from the first
+    /// in every path mainline changed since, though it brings in little.
+    /// The branch also adds a file to `cherry/`, where mainline holds a file
+    /// that a side branch forked at the import and mainline made identical
+    /// changes to (a patch applied twice) after the fork, so the side
+    /// branch's old change is still among mainline's newest for `cherry`.
+    pub old_branch: Option<(usize, usize)>,
 }
 
 impl Spec {
@@ -44,6 +54,7 @@ impl Spec {
             commits,
             branches: 8,
             seed: 0x5eed,
+            old_branch: None,
         }
     }
 
@@ -58,7 +69,15 @@ impl Spec {
             commits,
             branches: 4,
             seed: 0x5eed,
+            old_branch: None,
         }
+    }
+
+    /// This shape ending in a merge of an old-based branch (see
+    /// [`Spec::old_branch`]).
+    pub fn with_old_branch(mut self, back: usize, commits: usize) -> Self {
+        self.old_branch = Some((back, commits));
+        self
     }
 }
 
@@ -280,7 +299,42 @@ pub async fn build(repo: &Repo, spec: &Spec) -> ChangesetId {
         .collect();
 
     let start = g.seq;
+    let mut fork: Option<Line> = None;
+    let cherry = (String::from("cherry/pick.c"), 1);
+    let mut side = None;
+    if spec.old_branch.is_some() {
+        let updates = BTreeMap::from([cherry.clone()]);
+        side = Some(Line {
+            tip: g.commit(vec![main.tip], updates.clone()).await,
+            state: updates.clone().into_iter().collect(),
+            dirty: updates.into_keys().collect(),
+            synced: 0,
+            home: Vec::new(),
+            commits: 0,
+            merge_after: 0,
+        });
+    }
     while ((g.seq - start) as usize) < spec.commits {
+        if let Some((back, _)) = spec.old_branch {
+            if fork.is_none() && (g.seq - start) as usize + back >= spec.commits {
+                fork = Some(Line {
+                    tip: main.tip,
+                    state: main.state.clone(),
+                    dirty: BTreeSet::new(),
+                    synced: 0,
+                    home: vec![0, g.wide + 3],
+                    commits: 0,
+                    merge_after: 0,
+                });
+                // The same change on mainline, then the side branch merged:
+                // the merge changes nothing, so both changes stay newest.
+                let updates = BTreeMap::from([cherry.clone()]);
+                main.tip = g.commit(vec![main.tip], updates).await;
+                main.state.insert(cherry.0.clone(), cherry.1);
+                let side = side.take().expect("made above");
+                merge_into(&mut g, &mut main, &side).await;
+            }
+        }
         let r = g.rng.below(100);
         if r < 8 {
             // A direct commit on mainline.
@@ -359,6 +413,18 @@ pub async fn build(repo: &Repo, spec: &Spec) -> ChangesetId {
             }
         }
         branches[b] = line;
+    }
+    if let (Some(mut line), Some((_, commits))) = (fork, spec.old_branch) {
+        for _ in 0..commits.saturating_sub(1) {
+            g.work(&mut line).await;
+        }
+        let mut updates = BTreeMap::from([("cherry/new.c".to_string(), 1)]);
+        let (path, v) = g.pick(&line.home.clone(), &line.state);
+        updates.insert(path, v);
+        line.tip = g.commit(vec![line.tip], updates.clone()).await;
+        line.dirty.extend(updates.keys().cloned());
+        line.state.extend(updates);
+        merge_into(&mut g, &mut main, &line).await;
     }
     main.tip
 }

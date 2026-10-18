@@ -1379,6 +1379,74 @@ about 5,000 changesets. Statistics now follow bulk writes: migration 2
 re-analyzes `derived` after 1% of it changes and `changesets` after 2%, and
 `leep-git import` and `restore` run `ANALYZE` when done.
 
+**Merges with ancestry walks per path.** On the full Linux history (Postgres
+16, packed store, the code above) derivation ran at 4,400-5,500 changesets a
+minute but stopped for about 30 minutes of CPU at single merges, such as
+`7214dd4ea9` ("Merge branch 'work.thaw'", 2018-04: two commits on
+`v4.14-rc3`, five months and 44,583 changesets behind the first parent, 35,917
+files apart). `perf` showed the ancestry walks: `AncestryCache::get` from
+`Reader::generations`, `Arc` clones, SipHash of ids and
+`newest_common_ancestor`.
+
+Reproduced with `cargo run --release -p leep-derive --example dag_replay`,
+which replays a real commit graph (`git rev-list --parents`, fetched with
+`--filter=tree:0`) with synthetic contents (1-2 of 9,216 files per commit;
+merges take the other side's changes since the merge base) on in-memory
+stores. The whole graph up to `7214dd4ea9` (751,193 commits) did not fit in
+15 GB, so the run keeps the 119,255 commits above generation 123,457 (10,000
+below the merge base) on a 3,335-changeset chain standing in for older
+history. Per-merge counters (not kept) showed:
+
+- **An exact `is_ancestor` per path at criss-cross merges.** When an id of
+  one parent's set was not in the merge base's set but the other parent's
+  walk reached it, `maximal` checked it against each id of the other set
+  with `is_ancestor`, a walk from that id down to the first, per path. The
+  slowest merge made 38,230 such calls, 394 million walk steps, and took
+  582 s; 22 merges over 1 s took 897 of the run's 1,232 s.
+- **A walk as deep as the oldest id asked about.** An id older than the
+  merge base and not behind it (a change merged in from an old branch, kept
+  newest because the merge changed nothing there, as when the same patch
+  went in twice) sent the other parent's walk down to that id's generation:
+  for a branch on a five-month-old base, through every changeset behind the
+  base above it, which on Linux can be most of history and more than the
+  ancestry cache holds. In the replay the `work.thaw` merge itself had no
+  such id and took 72 ms.
+
+Merge-base search was not the problem: one walk per merge, 38,651 changesets
+for `work.thaw` (about 1 s on a cold cache, 30-60 ms warm).
+
+**Fix** (rows unchanged): an id `x` of parent `i`'s set lies behind another
+parent `j` exactly when it is an ancestor of `j`, since `j`'s set covers every
+change behind `j`; the per-id `is_ancestor` checks were redundant and are
+gone. Before the walk, two exact shortcuts with `m` the merge base of the two
+parents: `x` not in `m`'s set is not behind `m`, so it can only be a common
+ancestor outside `m`'s ancestors, which ranks below `m` by (generation, id);
+an `x` ranking above `m` is answered without a walk. And if one parent's
+ancestors outside `m`'s that rank below `m` are all on `m`'s first-parent
+chain (`Repo::side_is_clear`, walking at most 10,000 changesets of that side,
+the closer one first), there is no such common ancestor at all: a two-commit
+branch on `m` settles every question in three steps, however old `m` is. The
+walks also hash ids with the cheap key hash and read single fields of the
+ancestry cache instead of cloning entries.
+
+| Dag replay above, in memory, one run each | Before | After |
+|---|---|---|
+| Deriving 122,590 changesets | 1,232 s, 99 per second | 290 s, **422 per second** |
+| Slowest merge | 582 s | 1.1 s (that one: 0.22 s) |
+| Merges over 1 s | 22, 897 s in all | 2 (1.1 s and 1.0 s) |
+| The `work.thaw` merge alone | 72 ms | 65 ms |
+
+All 1,157,442 rows of both kinds were identical. The synthetic late-Linux
+history with such a merge at its end (`history_profile --synth 20000
+--old-base 15000 --last`) and the v2.6.16 slice were unchanged in speed,
+having no such merges (memory 186 and 187 per second; Postgres 127 and 126,
+the final merge 64 ms and 42 ms; slice on Postgres 246 per second both),
+with identical rows (560,483 and 311,439). Criterion: the new
+`derive_history_index/old_base_merge_3000_changesets` 8.8 ms before, 7.6 ms
+after; other `derive_history`, `merge_base`, `log_path` and `last_change`
+cases unchanged within noise (`wide_merges_300_changesets` 131 ms and
+137 ms, `1000_changesets` 39 ms and 34 ms).
+
 ## Garbage collection
 
 `leep-server gc` phases timed with

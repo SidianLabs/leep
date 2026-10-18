@@ -52,7 +52,7 @@ struct Ahead {
 
 pub(crate) struct ReadAhead {
     roots: bool,
-    known: HashMap<ChangesetId, State>,
+    known: HashMap<ChangesetId, State, crate::repo::ByKey>,
     /// Guesses not yet asked for, newest (best estimate) first.
     guesses: BinaryHeap<(u64, ChangesetId)>,
 }
