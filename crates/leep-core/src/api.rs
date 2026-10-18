@@ -142,8 +142,14 @@ pub struct ReadyFailure {
 
 /// Most hashes one `POST /v1/blobs/missing` may ask about. Each costs a
 /// metadata read and a claim write, so an unbounded list is an unbounded
-/// request; clients split longer lists.
-pub const MAX_MISSING_BLOBS: usize = 10_000;
+/// request. Well above what clients send at once ([`MISSING_BLOBS_CHUNK`]),
+/// so a client that does not split its list (older CLIs send a whole tree,
+/// about 90k hashes for Linux) still works.
+pub const MAX_MISSING_BLOBS: usize = 100_000;
+
+/// Hashes per `POST /v1/blobs/missing` that the CLI sends: about 670 KB of
+/// JSON, under the 1 MiB default body cap of `read` tokens.
+pub const MISSING_BLOBS_CHUNK: usize = 10_000;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MissingBlobsRequest {

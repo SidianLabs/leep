@@ -268,8 +268,9 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   (`LEEP_INSECURE_NO_AUTH=1`) is given; the container image listens on
   `0.0.0.0`, so it needs one or the other (the compose dev stack sets the
   variable). `read` tokens' request bodies are capped at 1 MiB by default.
-  `POST /v1/blobs/missing` takes at most 10,000 hashes (400 beyond), and the
-  CLI and MCP client split longer lists.
+  `POST /v1/blobs/missing` takes at most 100,000 hashes (400 beyond), and the
+  CLI and MCP client send 10,000 at a time, which also fits a read token's
+  limit.
 
 ### Operations
 - Versioned schema migrations for SQLite and Postgres (ADR 0023). The
