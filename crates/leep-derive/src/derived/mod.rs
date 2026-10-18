@@ -23,6 +23,7 @@ pub use history_tree::{
     chunk_ranges, flat_row, split_row, ChunkRef, HistoryEntry, HistoryNode, HistoryRow,
     HistoryTree, ResolvedRow, SplitChange, StoredHistoryNode, NODE_KIND as HISTORY_NODE_KIND,
 };
+pub(crate) use history_tree::{ends_chunk, run_ranges, FLAT_MAX};
 pub use last_merge::LastMerge;
 pub use root_tree::RootTree;
 pub use skiplist::{SkipEntry, Skiplist};
@@ -44,9 +45,9 @@ pub trait DerivedKind: Send + Sync + 'static {
 
     /// Whether [`derive`] may hold this kind's rows back and store a window
     /// of changesets' rows in one write, through [`DerivedKind::derive_staged`].
-    /// Only for kinds whose derivation reads no value of its own kind but
-    /// its parents' (passed in) and, at a merge, values stored before it:
-    /// the rows of a window are written before any merge is derived.
+    /// Values held back are found by [`derive`] (a merge asks for its merge
+    /// base's), and other rows through [`DerivedKind::derive_staged`]'s own
+    /// staging, until they are stored.
     const STAGED: bool = false;
 
     /// [`DerivedKind::derive`], adding any other rows it stores to `rows`
@@ -71,6 +72,10 @@ pub trait DerivedKind: Send + Sync + 'static {
     /// Called before each window of changesets is derived, oldest first, to
     /// read what their derivations will need in a few round trips.
     async fn prepare(_repo: &Repo, _window: &[(ChangesetId, &Changeset)]) {}
+
+    /// Whether a derivation of this kind keeps the skiplist rows its
+    /// ancestry queries read until it ends (see `ancestry::SKIPLIST_READS`).
+    const KEEP_SKIPLIST_READS: bool = false;
 }
 
 tokio::task_local! {
@@ -87,6 +92,9 @@ tokio::task_local! {
 /// then finds the rows the first stored. Kinds only depend on other kinds
 /// without cycles, so the locks are always taken in one order.
 pub async fn derive<K: DerivedKind>(repo: &Repo, id: ChangesetId) -> Result<Bytes> {
+    if let Some(v) = staged_value(repo, K::NAME, id) {
+        return Ok(v);
+    }
     if let Some(v) = repo.meta().get_derived(K::NAME, &id.0).await? {
         return Ok(v);
     }
@@ -98,14 +106,18 @@ pub async fn derive<K: DerivedKind>(repo: &Repo, id: ChangesetId) -> Result<Byte
     }
     let lock = repo.derive_lock(K::NAME);
     let _guard = lock.lock().await;
+    if let Some(v) = staged_value(repo, K::NAME, id) {
+        return Ok(v);
+    }
     if let Some(v) = repo.meta().get_derived(K::NAME, &id.0).await? {
         return Ok(v);
     }
     let mut kinds = HELD.try_with(|h| h.borrow().clone()).unwrap_or_default();
     kinds.push(K::NAME);
+    let reads = crate::ancestry::skiplist_reads_for(K::KEEP_SKIPLIST_READS);
     HELD.scope(
         std::cell::RefCell::new(kinds),
-        derive_missing::<K>(repo, id),
+        crate::ancestry::SKIPLIST_READS.scope(reads, derive_missing::<K>(repo, id)),
     )
     .await
 }
@@ -180,7 +192,25 @@ async fn derive_missing<K: DerivedKind>(repo: &Repo, id: ChangesetId) -> Result<
         Err(e) => Err(e),
     };
     K::unstage(repo, &staged);
+    forget_staged_values(repo, K::NAME, &staged);
     result
+}
+
+/// A value of `kind` computed by a running derivation and not stored yet.
+fn staged_value(repo: &Repo, kind: &'static str, id: ChangesetId) -> Option<Bytes> {
+    repo.staged_values
+        .lock()
+        .unwrap()
+        .get(&(kind, id.0))
+        .cloned()
+}
+
+/// Forget the staged values among `rows`, once stored or dropped.
+fn forget_staged_values(repo: &Repo, kind: &'static str, rows: &[DerivedRow]) {
+    let mut values = repo.staged_values.lock().unwrap();
+    for row in rows.iter().filter(|r| r.kind == kind) {
+        values.remove(&(kind, row.key));
+    }
 }
 
 /// Most staged rows held back before a write.
@@ -238,10 +268,11 @@ async fn derive_order<K: DerivedKind>(
             repo.derive_calls
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let v = if K::STAGED {
-                if cs.parents.len() > 1 {
-                    write_staged::<K>(repo, staged).await?;
-                }
                 let v = K::derive_staged(repo, cid, cs, &pv, staged).await?;
+                repo.staged_values
+                    .lock()
+                    .unwrap()
+                    .insert((K::NAME, cid.0), v.clone());
                 staged.push(DerivedRow::new(K::NAME, cid.0, v.clone()));
                 if staged.len() >= STAGED_ROWS {
                     write_staged::<K>(repo, staged).await?;
@@ -274,6 +305,7 @@ async fn write_staged<K: DerivedKind>(repo: &Repo, staged: &mut Vec<DerivedRow>)
         repo.meta().put_derived_many(batch).await?;
     }
     K::unstage(repo, staged);
+    forget_staged_values(repo, K::NAME, staged);
     staged.clear();
     Ok(())
 }

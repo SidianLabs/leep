@@ -138,8 +138,9 @@ A derived kind is a pure function
 2. derives them oldest-first, reading changesets again 256 at a time;
 3. stores each with `put_derived(kind, cs_id, bytes)`; a kind may instead
    stage its rows and write a window's in one `put_derived_many`, each
-   changeset's value after the rows it names (`history-tree-v3` does, writing
-   before each merge so the merge can read its merge base's value).
+   changeset's value after the rows it names (`history-tree-v3` and
+   `last_merge-v1` do; values held back are found by later derivations in
+   the same run, as a merge asks for its merge base's).
 
 Because inputs are immutable, a value is computed at most once per kind and
 changeset, and concurrent servers that race produce identical bytes.

@@ -16,6 +16,9 @@ use leep_core::{Changeset, ChangesetId, FileChange, FileKind, RepoPath};
 use leep_derive::{LogFilter, Repo};
 use tokio::runtime::Runtime;
 
+#[path = "support/wide_history.rs"]
+mod wide_history;
+
 const FILES_PER_DIR: usize = 1000;
 
 /// Makes every changeset created by the benches unique.
@@ -407,6 +410,23 @@ fn derive_history_index(c: &mut Criterion) {
             },
             |(repo, tip)| async move {
                 repo.log(tip, Some("d0/f"), 1).await.unwrap();
+            },
+        )
+    });
+    // Late-Linux shape: directories of 1,000 to 2,000 files, subsystem
+    // branches with topic merges and merges of mainline back into them.
+    g.bench_function("wide_merges_300_changesets", |b| {
+        timed(
+            &rt,
+            b,
+            || async {
+                let repo = new_repo();
+                let tip = wide_history::build(&repo, &wide_history::Spec::small(300)).await;
+                // A fresh `Repo` on the same stores: nothing cached.
+                (Repo::new(repo.blobs().clone(), repo.meta().clone()), tip)
+            },
+            |(repo, tip)| async move {
+                repo.log(tip, Some("wide/w00"), 1).await.unwrap();
             },
         )
     });
