@@ -1,5 +1,5 @@
 # 0044. Deferred directory syncs for filesystem blobs
-Status: Accepted
+Status: Accepted (sync waves replaced by per-directory syncs, ADR 0048)
 Date: 2026-10-18
 
 ## Context

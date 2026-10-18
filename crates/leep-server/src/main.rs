@@ -726,6 +726,9 @@ impl BlobStore for ArcBlobs {
     async fn flush(&self, named: &[leep_core::Hash]) -> leep_core::Result<()> {
         self.0.flush(named).await
     }
+    async fn flush_blobs(&self, hashes: &[leep_core::Hash]) -> leep_core::Result<()> {
+        self.0.flush_blobs(hashes).await
+    }
     async fn list_page(
         &self,
         after: Option<leep_core::Hash>,

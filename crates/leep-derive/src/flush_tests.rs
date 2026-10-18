@@ -83,6 +83,19 @@ impl BlobStore for Deferred {
             .retain(|h| !named.contains(h));
         Ok(())
     }
+
+    /// Syncs only what it is told, so a caller that relied on another
+    /// request's flush, or on a blanket one, is caught.
+    async fn flush_blobs(&self, hashes: &[Hash]) -> Result<()> {
+        *self.flushes.lock().unwrap() += 1;
+        let named: HashSet<Hash> = hashes.iter().copied().collect();
+        self.unsynced.lock().unwrap().retain(|h| !named.contains(h));
+        self.elsewhere
+            .lock()
+            .unwrap()
+            .retain(|h| !named.contains(h));
+        Ok(())
+    }
 }
 
 /// Refuses (records) any changeset write naming an unsynced blob.

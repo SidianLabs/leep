@@ -319,9 +319,10 @@ impl Repo {
     /// writes the handshake and then reads the rescue, so either collect
     /// abandons the delete or this call sees it and waits.
     ///
-    /// The blobs, and the stored copies of `named`, are then flushed
-    /// ([`leep_core::BlobStore::flush`]) alongside that read, in one call so
-    /// they share a sync wave: callers store something that names them next.
+    /// The blobs, and the stored copies of `named`, are then made durable
+    /// ([`leep_core::BlobStore::flush_blobs`]) alongside that read, in one
+    /// call and without waiting for other requests' writes: callers store
+    /// something that names them next.
     pub(crate) async fn put_rescuing_many(
         &self,
         items: Vec<(Hash, Bytes)>,
@@ -346,12 +347,14 @@ impl Repo {
             try_join_all(writes).await?;
         }
         let hashes: Vec<Hash> = items.iter().map(|(h, _)| *h).collect();
+        let mut durable = hashes.clone();
+        durable.extend_from_slice(named);
         let (batch, flushed) = tokio::join!(
             self.meta().get_derived_many(BLOB_CONDEMNED, &hashes),
-            self.blobs().flush(named)
+            self.blobs().flush_blobs(&durable)
         );
         flushed?;
-        let mut rescued = false;
+        let mut rescued = Vec::new();
         for (i, (hash, data)) in items.into_iter().enumerate() {
             let row = match &batch {
                 Ok(rows) => rows[i]
@@ -363,12 +366,12 @@ impl Repo {
             };
             if let Some(c) = row {
                 self.rescue(hash, data, c).await?;
-                rescued = true;
+                rescued.push(hash);
             }
         }
-        if rescued {
+        if !rescued.is_empty() {
             // A rescue may have written the blob again.
-            self.blobs().flush(&[]).await?;
+            self.blobs().flush_blobs(&rescued).await?;
         }
         Ok(())
     }

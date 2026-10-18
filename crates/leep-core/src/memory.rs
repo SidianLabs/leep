@@ -1167,6 +1167,8 @@ pub async fn check_blob_store_contract(store: &dyn BlobStore) {
     assert!(store.contains_many(&[]).await.unwrap().is_empty());
     store.flush(&[]).await.unwrap();
     store.flush(&[h, other]).await.unwrap();
+    store.flush_blobs(&[]).await.unwrap();
+    store.flush_blobs(&[h, other]).await.unwrap();
 
     check_blob_list_and_delete(store).await;
 }
