@@ -1100,7 +1100,13 @@ has the table.
    fast-forward and deletes `leep-diverged/main`. If agents land again
    before the push, it diverges again with a newer `leep-diverged/main`:
    repeat. If it keeps happening, people should push their work through
-   Leep (`leep land`) rather than straight to busy branches.
+   Leep (`leep land`) or to a land branch (`git push origin
+   HEAD:leep-land/main/NAME`, with `--land-branches`) rather than straight
+   to busy branches. If the changes rarely touch the same files, restart
+   the mirror with `--on-divergence merge`: it merges clean divergences
+   itself and reports only conflicts (ADR 0049). With that mode on, the
+   detail says why this one was not merged: the conflicting paths, a land
+   policy refusal of the merge, or a remote tip Leep moved back from.
 2. **`rewound`**: someone ran `leep undo` (or a raw ref CAS) on a mirrored
    ref, so Leep is behind the remote. Either land a revert in Leep, which
    the mirror pushes as a fast-forward, or undo the undo (`leep undo`
@@ -1125,6 +1131,46 @@ the state comes from the two refs, not from the directory.
 
 **Escalate / collect.** The status JSON, `git log --oneline --graph -20
 origin/main origin/leep-diverged/main`, and `leep log main -n 20`.
+
+## LeepMirrorLandBranchFailing
+
+**Meaning.** For an hour at least one land branch
+(`leep-land/<ref>/<name>`, with `--land-branches`) has stayed on the remote
+because it conflicts with its Leep ref or was refused. **Ticket.**
+
+**Impact.** The work on that branch has not landed. Nothing else is
+affected: the mirrored ref stays in sync, other land branches keep landing,
+and nothing is lost (ADR 0049).
+
+**Diagnose.** `leep-git mirror status --work-dir DIR` lists each land
+branch with its state and a detail; `--json` has them under
+`land_branches`. `leep_mirror_land_branches_failing{ref}` says which ref.
+
+**Likely causes and fixes.**
+
+1. **`conflict`**: the branch and the ref changed the same paths (the
+   detail lists them). Tell the person who pushed it. They rebase and push
+   again:
+   ```sh
+   git fetch origin
+   git rebase origin/main            # resolve the listed paths
+   git push --force-with-lease origin HEAD:leep-land/main/NAME
+   ```
+   The mirror tries a new value at once.
+2. **`refused`**, by the land policy (`not signed`, `needs review`): get
+   the review or signature in Leep; the mirror retries every minute. Never
+   relax the policy for it.
+3. **`refused`**, `is a merge`: land replays only linear stacks. Rebase the
+   branch instead of merging main into it, and push again.
+4. **`refused`**, `names no mirrored ref`, or a 404 for the ref: the name
+   is wrong, or the ref is not mirrored. Push to
+   `leep-land/<mirrored ref>/<name>` and delete the old branch.
+5. A branch nobody will fix: delete it (`git push origin
+   :refs/heads/leep-land/main/NAME`). The mirror forgets it.
+
+**What not to do.** Do not resolve the conflict by landing the branch with
+a raw ref CAS, and do not push it straight to the mirrored branch to get
+around the conflict: that only moves the conflict to a divergence.
 
 ## LeepBackupStale
 

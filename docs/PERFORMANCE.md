@@ -1191,8 +1191,9 @@ cold (first request after a restart) and warm:
 Indexed history queries answer in milliseconds on 1.48M commits. The slow
 rows have known causes: a cold full listing or deep diff decodes thousands
 of tree nodes from the pack; the first `blame` of a long-lived file derives
-its blame rows; and `log author=` has no index, so a rare author scans all
-of history. They are the next query targets.
+its blame rows; and `log author=` had no index, so a rare author scanned all
+of history. The log filter index (ADR 0047, "Filtered log" below) answers
+those filters now; it has not been measured on Linux yet.
 "Cold queries" below finds where the cold listing, diff and blame spend
 their time and what changed.
 
@@ -1381,6 +1382,61 @@ Blame is now mostly the history-index lookup and skiplist read of each step,
 which depend on the step before. On Linux the same causes apply at about 26
 times the history (and a 508 MB index), so the 14.4 s, 19.7 s and 47 s rows
 should fall by similar factors; they have not been remeasured there.
+
+## Filtered log
+
+ADR 0047. `log` with `author=` or `extra=` and no path used to test every
+ancestor; it now scans 512 changesets plainly (longer while at least one in
+150 matches) and continues with the `log-filter-v1` index, skipping
+first-parent stretches that cannot hold a match. Measured with
+`cargo run --release -p leep-server --example log_filter_profile --
+<meta url> main --synth 200000 --authors 4000 --scan`: a synthetic history of
+200,001 changesets in local Postgres 16 (Unix socket) on a shared 4-vCPU
+machine with a load average around 8, built to be hard on the index: 24
+long-lived branches, mainline merging one of them on 30% of its steps,
+branches merging mainline back every ~67 commits, authors Zipf over 4,000
+(`Developer 0` writes about 6.5% of changesets, `Developer 50` 0.22%), a third of changesets
+carrying `agent.model` (Zipf over 8 models), `agent.session` (about 20
+changesets each) and a prompt, and three rare authors only in the oldest 2%.
+"First" is a fresh `Repo` (no caches), "repeat" the same query again; "scan"
+is the old code (`log_scan`) on a fresh `Repo`. Every answer was checked
+equal to the scan's. Limit 100 unless noted:
+
+| Query | Matches | First | Repeat | Scan (before) |
+|---|---|---|---|---|
+| rare author (oldest 2%) | 2 | 0.72 s | 68 ms | 7.0 s |
+| rare author, full name | 1 | 0.33 s | 59 ms | 7.3 s |
+| tail author (`Developer 2000`) | 6 | 0.76 s | 0.19 s | 5.8 s |
+| `author=nobody`, limit 10 | 0 | 0.14 s | 41 ms | 5.0 s |
+| one `agent.session` | 12 | 0.33 s | 69 ms | 6.4 s |
+| common author (`Developer 0`) | 100 | 0.12 s | 66 ms | 0.10 s |
+| mid author (`Developer 50`) | 100 | 2.4 s | 0.60 s | 1.6 s |
+| `--agent` (key present) | 100 | 34 ms | 30 ms | 25 ms |
+| common / rare `--agent-model` | 100 | 67 / 165 ms | 63 / 165 ms | 57 / 157 ms |
+| `Developer 3` and one model | 100 | 2.6 s | 0.77 s | 1.7 s |
+
+Rare values go from a scan of the whole history to a few hundred
+milliseconds cold and tens warm; frequent values stay on the scan, which
+reaches the limit first. The walk visits about 20 changesets per match
+(climbing and descending the levels, measured with the ignored
+`profile_branchy_history` test: `Developer 50` visits 3,300 changesets for 100
+matches where the scan reads 37,500), each a round trip when cold, so a
+value of middling frequency, here one changeset in 450, is the worst case:
+slower than the scan cold, faster once its rows are cached (64 MiB of
+decoded rows and 32 MiB of skiplists per process). On this loaded machine a
+cold round trip took about 1.2 ms; most of the cold time is those.
+
+**Size and derivation.** 172 MB of rows for 200,001 changesets, 859 bytes
+per changeset, plus 4,002 name rows (154 KB). The branches' back-merges are
+what makes it this large: a branch's levels cover what mainline brought it,
+about 1,500 changesets of other branches every 67 commits. On the same shape
+in memory, 60,000 changesets take 626 bytes each. Deriving all 200,001 rows took 240 s against
+Postgres (8.3 s for 60,000 in memory), mostly `merge_base` at merges. A first
+version that used the side branch's own levels at merges (rather than
+walking merges on the side exactly) stored 5.2 KB per changeset and skipped
+almost nothing; walking each side with a merge base per nested chain took
+48 s for the 60,000 in memory, and one shared walk of the first parent's
+ancestors for nearby questions brought that to 8.3 s.
 
 ## Path history on Linux
 

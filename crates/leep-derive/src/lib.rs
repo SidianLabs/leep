@@ -12,6 +12,7 @@ mod ancestry;
 mod blame;
 mod comments;
 pub mod derived;
+mod filter_log;
 pub mod gc;
 mod history;
 pub mod integrity;

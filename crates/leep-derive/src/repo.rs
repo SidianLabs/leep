@@ -96,6 +96,8 @@ pub struct Repo {
     /// Skiplists computed, or read while creating changesets (see
     /// `SkiplistCache`).
     pub(crate) skiplists: Arc<SkiplistCache>,
+    /// Decoded `log-filter-v1` rows and author names (see `filter_row`).
+    pub(crate) log_filter: Arc<crate::derived::LogFilterCaches>,
     /// One lock per derived kind, held while a missing range is derived (see
     /// `derived::derive`).
     pub(crate) derive_locks: Arc<Mutex<HashMap<&'static str, DeriveLock>>>,
@@ -370,6 +372,7 @@ impl Repo {
             history_roots: Arc::default(),
             trees: Arc::default(),
             skiplists: Arc::default(),
+            log_filter: Arc::default(),
             derive_locks: Arc::default(),
             staged_values: Arc::default(),
             #[cfg(test)]

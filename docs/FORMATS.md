@@ -46,6 +46,8 @@ skill.
 | derived `tree-trigrams-v1` | — | `MetaStore.derived`, key = tree node hash (`TreeNode::hash()`), value = see "Code search index" below |
 | derived `history-tree-v4` | — | `MetaStore.derived`, key = changeset id, value = part 0 of the changeset's history pack (ADR 0045): the history nodes its derivation wrote, and its root node's address |
 | history pack part | `history-node-v4` | `MetaStore.derived` (kind `history-node-v4`), key = `Hash::of_object("history-node-v4", changeset id ‖ part as u32 LE)`, value = part 1 and up of a pack that did not fit in one |
+| derived `log-filter-v1` | — | `MetaStore.derived`, key = changeset id, value = see "Log filter index" below (ADR 0047) |
+| derived `log-filter-name-v1` | — | `MetaStore.derived`, key = `Hash::of_object("log-filter-name-v1", fingerprint as 8 bytes big-endian)`, value = the author's name, lower-cased (`str::to_lowercase`), UTF-8 |
 | retired `history-tree-v1`, `history-node-v1` | — | written by servers before ADR 0027; never read by current servers; removed with `repair drop --kind history-tree-v1` |
 | retired `history-tree-v2`, `history-node-v2` | — | written by servers from ADR 0027 to ADR 0037; never read by current servers; removed with `repair drop --kind history-tree-v2` |
 | retired `history-tree-v3`, `history-node-v3` | — | written by servers from ADR 0037 to ADR 0045 (one content-addressed postcard row per node, chunk, list or patch, keyed by `Hash::of_object("history-node-v3", bytes)`); never read by current servers; removed with `repair drop --kind history-tree-v3` |
@@ -171,6 +173,32 @@ The rows are lazily derived. A search over `path` derives only the subtree.
 The `/v1/search/{rev}` endpoint only adds an endpoint and types (`SearchResponse`,
 `SearchMatch`, `SearchRange`, `SearchStats`), all with `#[serde(default)]` fields.
 Ranges are byte offsets into the returned (possibly cut) `line`.
+## Log filter index (new derived kinds, no change to `Changeset`)
+
+ADR 0047. Golden values are asserted in `leep-derive`
+(`golden_fingerprints_and_bytes`); any change to the fingerprint, the values
+indexed, the caps or the encoding is a new kind name (`-v2`).
+
+A *fingerprint* is a `u64`: take `h = Hash::of_object("log-filter-fp", c ‖
+p₁ ‖ 0x00 ‖ p₂ ‖ 0x00 …)` with `c` the class as one byte, read its first 8
+bytes big-endian as `v`, and the fingerprint is `(v >> 2) | (c << 62)`.
+Classes: 0 author (`p₁` = the author lower-cased with `str::to_lowercase`),
+1 `extra` key present (`p₁` = key), 2 `extra` key with value (`p₁` = key,
+`p₂` = value), for the keys `agent.model` and `agent.session` only.
+
+A changeset's *depth* is 0 for a root, else its first parent's depth + 1.
+It has `tz(depth) + 1` *levels* (`tz` = trailing zero bits; a root has 1).
+Level 0 holds the fingerprints of the changeset and, at a merge, of what
+each other parent brings; level `j` is level `j - 1` united with level
+`j - 1` of the first-parent ancestor `2^(j-1)` steps up. A class of more
+than 65,536 fingerprints in one level is dropped from it and flagged.
+
+**`log-filter-v1`** value: LEB128 varint depth, varint level count (must be
+`tz(depth) + 1`), then per level: one byte of overflow flags (bit `c` set:
+class `c` overflowed and has no fingerprints here), a varint count, and the
+fingerprints ascending, as varint deltas, the first relative to zero (a
+zero delta after the first is invalid). No trailing bytes.
+
 ## Path-history index (new derived kinds, no change to `Changeset`)
 
 ADR 0013, stored in chunks since ADR 0027, as patches since ADR 0037 and in

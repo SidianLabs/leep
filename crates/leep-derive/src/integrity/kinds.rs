@@ -7,7 +7,8 @@ use leep_core::signature::SIGNATURE_KIND;
 use leep_core::Error;
 
 use crate::derived::{
-    DerivedKind, Generation, HistoryTree, LastMerge, RootTree, Skiplist, HISTORY_NODE_KIND,
+    DerivedKind, Generation, HistoryTree, LastMerge, LogFilterIndex, RootTree, Skiplist,
+    HISTORY_NODE_KIND, LOG_FILTER_NAME_KIND,
 };
 use crate::gc::{BLOB_CLAIM, BLOB_CONDEMNED, BLOB_DOOM, BLOB_RESCUE, GC_MARK};
 use crate::search::{BLOB_KIND as BLOB_TRIGRAMS, TREE_KIND as TREE_TRIGRAMS};
@@ -109,6 +110,25 @@ static KINDS: &[KindInfo] = &[
         drop: DropPolicy::Allowed {
             also: &[HISTORY_NODE_KIND],
         },
+    },
+    KindInfo {
+        name: LogFilterIndex::NAME,
+        class: KindClass::PerChangeset,
+        summary: "authors and agent values in stretches of history, for filtered logs \
+                  (rewriting also restores author names)",
+        rederive: Rederive::Yes,
+        drop: DropPolicy::Allowed {
+            also: &[LOG_FILTER_NAME_KIND],
+        },
+    },
+    KindInfo {
+        name: LOG_FILTER_NAME_KIND,
+        class: KindClass::Content,
+        summary: "lower-cased author name behind a log-filter fingerprint",
+        rederive: Rederive::No("rewritten by `rederive --kind log-filter-v1`"),
+        drop: DropPolicy::Refused(
+            "log-filter-v1 names its authors by these rows; drop log-filter-v1, which removes both",
+        ),
     },
     KindInfo {
         name: BLOB_TRIGRAMS,
@@ -302,6 +322,8 @@ pub fn dependencies(kind: &str) -> &'static [&'static str] {
         &[Generation::NAME]
     } else if kind == HistoryTree::NAME {
         &[Generation::NAME, Skiplist::NAME, RootTree::NAME]
+    } else if kind == LogFilterIndex::NAME {
+        &[Generation::NAME, Skiplist::NAME, LastMerge::NAME]
     } else if kind == TREE_TRIGRAMS {
         &[BLOB_TRIGRAMS]
     } else {
@@ -390,7 +412,9 @@ mod tests {
                 matches!(k.class, KindClass::Attestation | KindClass::Bookkeeping);
             assert_eq!(
                 droppable,
-                !attestation_or_state && k.name != HISTORY_NODE_KIND
+                !attestation_or_state
+                    && k.name != HISTORY_NODE_KIND
+                    && k.name != LOG_FILTER_NAME_KIND
             );
         }
         assert!(check_droppable("ref_log").is_err());

@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use leep_core::{ChangesetId, Result};
 
-use crate::derived::{self, HistoryTree};
+use crate::derived::{self, HistoryTree, LogFilterIndex};
 use crate::Repo;
 
 /// What one [`Warmer::pass`] did.
@@ -89,10 +89,11 @@ impl Warmer {
 }
 
 /// Derive the indexes queries need for `id`: the path-history index (which
-/// brings generation, skiplists and last-merge with it) and, with `search`,
-/// the code-search index of its tree.
+/// brings generation, skiplists and last-merge with it), the log-filter
+/// index and, with `search`, the code-search index of its tree.
 async fn warm(repo: &Repo, id: ChangesetId, search: bool) -> Result<()> {
     derived::derive::<HistoryTree>(repo, id).await?;
+    derived::derive::<LogFilterIndex>(repo, id).await?;
     if search {
         repo.derive_search(id).await?;
     }

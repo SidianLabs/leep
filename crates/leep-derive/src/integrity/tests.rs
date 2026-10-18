@@ -146,6 +146,9 @@ async fn world() -> World {
     for id in ids.iter().copied().chain([copy]) {
         derived::derive::<HistoryTree>(&r, id).await.unwrap();
         derived::derive::<LastMerge>(&r, id).await.unwrap();
+        derived::derive::<derived::LogFilterIndex>(&r, id)
+            .await
+            .unwrap();
     }
     r.derive_search(tip).await.unwrap();
     r.derive_search(left2).await.unwrap();
@@ -977,6 +980,17 @@ async fn answers(w: &World) -> String {
                 .map(|i| (i.id, i.generation, i.root_tree))
                 .collect::<Vec<_>>()
         ));
+        for author in ["t", "m"] {
+            let filter = crate::LogFilter {
+                author: Some(author.into()),
+                extra: vec![],
+            };
+            let log = r.log_by_filter_with(*rev, 100, &filter, 0).await.unwrap();
+            out.push_str(&format!(
+                "log {rev} author {author}: {:?}\n",
+                log.iter().map(|i| i.id).collect::<Vec<_>>()
+            ));
+        }
         for path in ["a.txt", "d", "d/e/y.txt", "r2.txt", "gone.txt"] {
             let log = r.log(*rev, Some(path), 100).await.unwrap();
             out.push_str(&format!(

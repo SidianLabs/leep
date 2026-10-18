@@ -235,6 +235,15 @@ groups:
     annotations:
       summary: "A mirrored ref needs a person: it diverged, was rewound in Leep, was refused by the land policy, or the remote is ahead."
       runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepmirrorstuck
+  - alert: LeepMirrorLandBranchFailing
+    # Land branches (--land-branches) that conflict or were refused; the
+    # person who pushed them fixes them, so this is a ticket, not a page.
+    expr: max by (instance, ref) (leep_mirror_land_branches_failing) > 0
+    for: 1h
+    labels: {severity: ticket}
+    annotations:
+      summary: "A land branch on the git remote has conflicted with, or been refused by, its Leep ref for over an hour."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepmirrorlandbranchfailing
 - name: leep-backup
   # Metrics written by `leep-server backup --metrics-file` (node_exporter textfile collector).
   rules:
@@ -428,8 +437,11 @@ can push to over https, ssh or a path) in step with a Leep server
 about a second plus the push time. With `--import`, commits pushed to the
 remote land in Leep when they fast-forward the Leep ref. When both sides
 moved, the mirror reports `diverged` and stops that ref until someone merges
-in git. It never resolves a conflict itself and never force-pushes a
-mirrored branch.
+in git; with `--on-divergence merge` it first tries a clean merge on the
+server and lands it. With `--land-branches`, people push to
+`leep-land/<ref>/<name>` and the mirror lands that work through Leep like an
+agent's land ([ADR 0049](adr/0049-mirror-merges-and-land-branches.md)). It
+never resolves a conflict itself and never force-pushes a mirrored branch.
 
 The mirror is a separate process. It talks to `leep-server` over the HTTP
 API with a token, and to the remote with the system `git` (2.30 or later).
@@ -442,7 +454,7 @@ leep-git mirror run \
   --remote https://github.com/acme/app.git \
   --work-dir /var/lib/leep-mirror/app \
   --ref main --ref release/1.0 --tags \
-  --import \
+  --import --on-divergence merge --land-branches \
   --listen 127.0.0.1:9188
 ```
 
@@ -473,8 +485,11 @@ leep-git mirror run \
     anything wrong.
 - **Branch protection.** The remote must let the mirror's credential push
   to the mirrored branches, and create and delete branches under
-  `--diverged-prefix` (default `leep-diverged/`). The mirror never needs
-  force-push rights.
+  `--diverged-prefix` (default `leep-diverged/`) and, with
+  `--land-branches`, delete branches under `--land-prefix` (default
+  `leep-land/`). People need to be able to push there. The mirror never
+  needs force-push rights: it deletes a land branch with a lease on the
+  value it landed.
   - An exception is a ref listed in `--allow-rewind`, which it updates with
     `--force-with-lease`. `main` and tags cannot be listed there.
   - Required pull requests or status checks on the mirrored branch make
@@ -493,6 +508,10 @@ leep-git mirror run \
 | `--max-backoff` | `5m` | Longest wait between retries of a failing ref. |
 | `--allow-rewind NAME` | – | Push Leep undos of this ref with a lease. Never `main` or a tag. |
 | `--diverged-prefix` | `leep-diverged/` | The branch prefix the mirror owns. |
+| `--on-divergence` | `report` | When both sides moved: `report` stops the ref for a merge in git; `merge` (needs `--import`) asks the server for a merge and lands it when it is clean and the land policy allows, and reports otherwise. |
+| `--merge-author` | `Leep git mirror <git-mirror@leep.invalid>` | Author of the mirror's merges. Part of each merge's id: choose once. |
+| `--land-branches` | off | Land remote branches `PREFIX<ref>/<name>` onto the Leep ref `<ref>` through the server's land, then delete them. Needs `--import`. |
+| `--land-prefix` | `leep-land/` | Prefix of land branches. Must not overlap `--diverged-prefix` or any mirrored branch. |
 | `--provenance-trailers`, `--no-changeset-trailer` | off | Change commit messages, and so commit ids. Choose once, before the first push. |
 | `--listen ADDR` | off | Serve `GET /metrics`, `GET /status`, `GET /health` and `POST /poke`. |
 | `--once` | off | Run until nothing changes, then exit 0 if healthy and 1 if not (for cron or a check). |
@@ -522,7 +541,7 @@ when there is no status file.
 |---|---|---|
 | `in-sync` | The remote ref is the export of the Leep ref. | Nothing. |
 | `pending` | One side moved and the mirror is catching up, or retrying after the remote moved under a push. | Nothing, unless the lag keeps growing ([LeepMirrorLagging](RUNBOOKS.md#leepmirrorlagging)). |
-| `diverged` | Both sides have commits the other lacks. Leep's side is on `leep-diverged/<branch>`. | In git, merge `origin/leep-diverged/<branch>` into the branch and push. The mirror lands the merge and deletes the diverged branch. |
+| `diverged` | Both sides have commits the other lacks. Leep's side is on `leep-diverged/<branch>`. With `--on-divergence merge` the detail says why the mirror did not merge: the conflicting paths, a land policy refusal, or a remote tip Leep moved back from. | In git, merge `origin/leep-diverged/<branch>` into the branch and push. The mirror lands the merge and deletes the diverged branch. |
 | `rewound` | Leep moved the ref back (an undo). The remote keeps the newer commits. | Land a revert in Leep (the usual fix), or, for a scratch branch, allow it with `--allow-rewind`. |
 | `remote-ahead` | The remote has commits Leep lacks and `--import` is off. | Enable `--import`, or remove the commits from the remote. |
 | `refused` | Leep's land policy refused a push from git (unsigned, unreviewed, OWNERS). The detail quotes the server. | Approve the changesets with `leep review`, or revert the push in git. Checked again every minute. |
@@ -539,7 +558,10 @@ when there is no status file.
 | `leep_mirror_last_sync_timestamp_seconds` | gauge | `ref` | When the ref was last in sync. |
 | `leep_mirror_pushes_total` | counter | `ref`, `result` = `ok`, `rejected`, `failed` | Pushes of mirrored refs. `rejected` is the remote refusing (it moved, or branch protection); `failed` is a transport or credential failure. |
 | `leep_mirror_imports_total` | counter | `ref`, `result` = `landed`, `refused`, `lost_race` | Remote pushes the mirror tried to land in Leep. |
-| `leep_mirror_divergences_total` | counter | `ref` | Times the ref entered `diverged`. A steady rate means people push to a ref agents land on all the time. |
+| `leep_mirror_divergences_total` | counter | `ref` | Times the ref entered `diverged`. A steady rate means people push to a ref agents land on all the time. With `--on-divergence merge` only divergences the mirror could not merge count. |
+| `leep_mirror_merges_total` | counter | `ref`, `result` = `landed`, `conflicts`, `refused`, `lost_race` | The mirror's automatic merges (`--on-divergence merge`). `conflicts` and `refused` fall back to `diverged`. |
+| `leep_mirror_land_branches_total` | counter | `ref`, `result` = `landed`, `conflicts`, `refused` | Land branches tried, counted once per pushed commit. |
+| `leep_mirror_land_branches_failing` | gauge | `ref` | Land branches left on the remote because they conflict or were refused (`ref=""` for a name that matches no mirrored ref). |
 | `leep_mirror_commits_exported_total` | counter | none | Commits written from changesets. |
 | `leep_mirror_commits_imported_total` | counter | none | Changesets created from remote commits. |
 | `leep_mirror_errors_total` | counter | `stage` = `leep`, `git`, `export`, `import` | Failed steps. |
@@ -550,11 +572,47 @@ Counters restart from 0 when the mirror restarts. The log goes to stderr,
 one line per state change, push or landed import, with credentials
 redacted.
 
+### Land branches
+
+With `--land-branches`, a person hands work to Leep by pushing it to
+`leep-land/<ref>/<name>` instead of to `<ref>`:
+
+```sh
+git push origin HEAD:leep-land/main/fix-login
+```
+
+The mirror imports the commits and lands them with `POST /v1/land`: a
+fast-forward if the branch sits on the current head, otherwise the server
+rebases them onto it like an agent's land. Then it deletes the branch and
+pushes the new head to `main`. `<ref>` is the longest mirrored branch the
+name continues, so `leep-land/release/1.0/x` lands on `release/1.0` when
+that is mirrored.
+
+A land branch that cannot land stays on the remote and is listed under
+`land_branches` in the status (`leep-git mirror status` prints it as
+`land branch ... conflict` or `refused`):
+
+| State | Meaning | What to do |
+|---|---|---|
+| `pending` | Seen and not landed yet. | Nothing. |
+| `conflict` | It conflicts with the ref; the detail lists the paths. Checked again every 30 seconds. | Rebase it onto `origin/<branch>`, resolve, and push it again (with `--force-with-lease`; it is your branch). |
+| `refused` | The land policy refused it, it contains a merge commit (land replays only linear stacks), the ref does not exist, or its name matches no mirrored ref. Checked again every minute. | Read the detail: get a review or signature, rebase away the merge, or fix the name. |
+| `error` | The last attempt failed (server or remote). Retried with backoff. | As for the ref's `error` state. |
+
+A failing land branch does not make `mirror status` exit 1: it needs the
+person who pushed it, not the operator.
+[LeepMirrorLandBranchFailing](RUNBOOKS.md#leepmirrorlandbranchfailing)
+opens a ticket after an hour.
+
 **Crashes.** Killing the mirror at any moment is safe, SIGKILL included.
 Each cycle decides from the current Leep ref and remote ref, not from
 remembered progress. A push the remote accepted before the crash is found
 there, and a push is never repeated. An import that created changesets but
 did not move the ref finishes on restart, without importing anything twice.
+A merge the mirror made but did not land is made again with the same id,
+because its author, message and time depend only on the two sides. A land
+branch landed but not deleted is landed again, which the server answers
+with what is already there, and then deleted.
 `LEEP_MIRROR_CRASH_AT` is a test hook that aborts the process at a named
 step; never set it in production.
 
@@ -1326,7 +1384,13 @@ the mirror against in-memory stores and local bare repositories.
 - an abort at each named step (`LEEP_MIRROR_CRASH_AT`): mid-export, after
   the export, after a push whose answer is lost, after an import, after its
   land, and after a diverged push;
-- agents landing while a person pushes to git.
+- with `--on-divergence merge --land-branches` (ADR 0049): a clean merge, a
+  conflicting divergence reported, land branches landing and conflicting, a
+  kill sweep that also pushes land branches, and an abort after the
+  remote's side is imported, after the merge, after it lands, after its
+  push, and after a land branch is imported, landed and deleted;
+- agents landing while a person pushes to git, in both modes; the merging
+  mode converges with no merge in git.
 
 After each test, every changeset on Leep's main has exactly one commit on
 the remote, the remote's reflog shows only fast-forwards, and the trees

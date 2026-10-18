@@ -120,14 +120,21 @@ impl Remote {
         Ok((status.success(), redact(&stdout), redact(stderr.trim())))
     }
 
-    /// Current values of `refs` on the remote. Refs it does not have are
-    /// absent from the map.
-    pub fn ls_remote(&self, refs: &[String]) -> Result<BTreeMap<String, ObjectId>, String> {
-        if refs.is_empty() {
+    /// Current values of `refs`, and of every ref under one of `prefixes`
+    /// (each ending in `/`), on the remote. Refs it does not have are absent
+    /// from the map.
+    pub fn ls_remote(
+        &self,
+        refs: &[String],
+        prefixes: &[String],
+    ) -> Result<BTreeMap<String, ObjectId>, String> {
+        if refs.is_empty() && prefixes.is_empty() {
             return Ok(BTreeMap::new());
         }
+        let globs: Vec<String> = prefixes.iter().map(|p| format!("{p}*")).collect();
         let mut args = vec!["ls-remote", "--", self.url.as_str()];
         args.extend(refs.iter().map(String::as_str));
+        args.extend(globs.iter().map(String::as_str));
         let (ok, out, err) = self.run(&args)?;
         if !ok {
             return Err(format!(
@@ -141,7 +148,9 @@ impl Remote {
                 continue;
             };
             // ls-remote matches patterns against the tail of each name.
-            if refs.iter().any(|r| r == name) {
+            if refs.iter().any(|r| r == name)
+                || prefixes.iter().any(|p| name.starts_with(p.as_str()))
+            {
                 let oid = ObjectId::from_hex(sha.as_bytes())
                     .map_err(|e| format!("bad ls-remote line {line:?}: {e}"))?;
                 found.insert(name.to_string(), oid);
@@ -258,6 +267,16 @@ impl Remote {
             Ok(())
         } else {
             Err(format!("git update-ref {name} failed: {err}"))
+        }
+    }
+
+    /// Remove a local ref (a no-op if it is absent).
+    pub fn delete_local_ref(&self, name: &str) -> Result<(), String> {
+        let (ok, _, err) = self.run(&["update-ref", "-d", name])?;
+        if ok {
+            Ok(())
+        } else {
+            Err(format!("git update-ref -d {name} failed: {err}"))
         }
     }
 
