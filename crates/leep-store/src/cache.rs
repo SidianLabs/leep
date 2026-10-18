@@ -139,6 +139,49 @@ impl<S: BlobStore> BlobStore for CachedBlobStore<S> {
         Ok(found)
     }
 
+    /// Hits from the cache; the misses in one `get_many` of the inner store.
+    async fn get_many(&self, hashes: &[Hash]) -> Result<Vec<Option<Bytes>>> {
+        let mut out = Vec::with_capacity(hashes.len());
+        let mut misses = Vec::new();
+        {
+            let mut lru = self.lru.lock().unwrap();
+            for (i, h) in hashes.iter().enumerate() {
+                let hit = lru.get(h);
+                if hit.is_none() {
+                    misses.push(i);
+                }
+                out.push(hit);
+            }
+        }
+        let hits = (hashes.len() - misses.len()) as u64;
+        self.hits.fetch_add(hits, Ordering::Relaxed);
+        self.misses
+            .fetch_add(misses.len() as u64, Ordering::Relaxed);
+        metrics::counter!("leep_blob_cache_hits_total").increment(hits);
+        metrics::counter!("leep_blob_cache_misses_total").increment(misses.len() as u64);
+        if misses.is_empty() {
+            return Ok(out);
+        }
+        let asked: Vec<Hash> = misses.iter().map(|&i| hashes[i]).collect();
+        let found = self.inner.get_many(&asked).await?;
+        if found.len() != asked.len() {
+            return Err(leep_core::Error::Storage(format!(
+                "get_many answered {} of {} blobs",
+                found.len(),
+                asked.len()
+            )));
+        }
+        let mut lru = self.lru.lock().unwrap();
+        for (i, d) in misses.into_iter().zip(found) {
+            if let Some(d) = &d {
+                lru.insert(hashes[i], d.clone(), self.capacity);
+            }
+            out[i] = d;
+        }
+        Self::publish(&lru);
+        Ok(out)
+    }
+
     async fn list_page(&self, after: Option<Hash>, limit: usize) -> Result<Vec<BlobMeta>> {
         self.inner.list_page(after, limit).await
     }
@@ -205,6 +248,30 @@ mod tests {
         cache.get(&big).await.unwrap();
         assert!(cache.stats().bytes <= 100);
         assert!(cache.get(&Hash::of_blob(b"nope")).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn get_many_serves_hits_and_caches_misses() {
+        let inner = MemoryBlobStore::new();
+        let a = inner.put(Bytes::from_static(b"a")).await.unwrap();
+        let b = inner.put(Bytes::from_static(b"b")).await.unwrap();
+        let absent = Hash::of_blob(b"nope");
+        let cache = CachedBlobStore::new(inner, 1024);
+        cache.get(&a).await.unwrap();
+        let got = cache.get_many(&[b, absent, a, b]).await.unwrap();
+        assert_eq!(
+            got,
+            vec![
+                Some(Bytes::from_static(b"b")),
+                None,
+                Some(Bytes::from_static(b"a")),
+                Some(Bytes::from_static(b"b"))
+            ]
+        );
+        // `a` was a hit; `b` (asked twice) and `absent` went to the store.
+        assert_eq!((cache.stats().hits, cache.stats().misses), (1, 4));
+        cache.get(&b).await.unwrap();
+        assert_eq!(cache.stats().hits, 2, "a miss is cached");
     }
 
     #[tokio::test]

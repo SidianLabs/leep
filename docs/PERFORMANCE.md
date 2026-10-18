@@ -1143,6 +1143,8 @@ rows have known causes: a cold full listing or deep diff decodes thousands
 of tree nodes from the pack; the first `blame` of a long-lived file derives
 its blame rows; and `log author=` has no index, so a rare author scans all
 of history. They are the next query targets.
+"Cold queries" below finds where the cold listing, diff and blame spend
+their time and what changed.
 
 ### Incremental repack
 
@@ -1236,6 +1238,99 @@ million objects. With every frame copied from an old pack (the synthetic
 runs above), compression is idle and the single reader, which decodes each
 object and checks its hash, sets the pace. Decoding on the worker threads
 is the next step for merge-heavy repacks.
+
+## Cold queries
+
+The cold full listing (14.4 s), deep diff (19.7 s) and first `blame
+Makefile` (47 s) on all of Linux, reproduced on a synthetic history with
+`cargo run --release -p leep-server --example cold_queries`, which builds a
+Linux-shaped history (`build`), and times one query on freshly opened
+stores (`query`, a 256 MiB blob cache in front as in `leep-server`).
+
+**The store.** `build --commits 60000` (stopped by a time limit at 57,345
+changesets; `finish` then pointed `main` at the changeset of the highest
+generation, 7,802, and derived its path history), then `leep-server repack
+--full`: 706,331 objects, 599,701 of them deltas, a 73 MB pack and a 32 MB
+index. At the head: 3,211 directories, 86,684 files, and a 1,825-line root
+`Makefile` that 1,764 first-parent changesets changed, directly or by merge.
+Commits per generation are 7.3, against 7.1 for Linux. Postgres 16 in a
+private cluster, filesystem blobs, a 4-vCPU sandbox shared with other jobs.
+Cold means: page cache dropped (`echo 3 > /proc/sys/vm/drop_caches`),
+Postgres restarted, a new process.
+
+**Where the time went**, `derive/history-index-size` (b03750c):
+
+- *Listing and diff.* `list_files` read one tree node at a time, depth
+  first; `diff` the same for both sides. Each node is the head of a delta
+  chain of up to 32 frames (each tree node is a delta on its directory's
+  previous version, so a head node decodes 16 on average), and the chain's
+  frames, written with the changesets that made them, lie far apart in the
+  pack: every frame was one synchronous `pread` from a cold disk. The
+  listing spent 9.85 of 10.0 s in 3,211 sequential blob reads on a busy
+  disk, about 2 s on a quiet one.
+- *Blame.* About 18,600 sequential round trips for 1,896 examined
+  changesets: per step a history-index lookup, the changers' generations,
+  a skiplist descent from the top (3,800 skiplist reads), the changeset (for
+  its parent), the parent's root tree and root node (to compare the file), a
+  cached-blame lookup per changer (1,765), one file version read at a time,
+  and a changeset read per distinct changeset at the end. Replaying the
+  versions copied every line's text through every version (1,825 lines times
+  1,764 versions), about 1.5 s of CPU.
+- *Opening the pack.* The first read after a start checks the whole index:
+  350 ms for 706,331 objects, a single-threaded pass of random reads of the
+  index that grows with it (10.36M objects on Linux).
+
+**Changes:**
+
+- `BlobStore::get_many` (default: 32 `get`s at a time). The filesystem
+  store splits it over up to 16 blocking tasks, each of which first plans all
+  its chains from the index and asks the kernel for every frame
+  (`posix_fadvise WILLNEED`) before decoding; `CachedBlobStore` serves hits
+  and forwards misses in one call. A single `get` of a chain prefetches its
+  frames too.
+- `list_files` and `diff` walk breadth first and read each level (up to
+  1,024 nodes) with one `get_many` (`Repo::read_trees`).
+- Blame: the walk keeps every skiplist entry it has read by generation and
+  starts each descent from the nearest known point, takes the parent from
+  the skiplist instead of reading the changeset, and remembers skiplist
+  generations; the files at the parents are read 64 steps at a time (one
+  batched root-tree read, one `get_many` per directory level), cached blames
+  32 changers at a time, versions 64 at a time with one `get_many` and
+  diffed on four threads; lines carry (changeset, line) until the last
+  version supplies their text; summaries are one `get_changesets`.
+- The pack index check reads only the fields each check needs and runs on up
+  to 8 threads for indexes of 65,536 objects or more (350 to 110-140 ms here).
+- A decoded chain hashes each link once: links share the kind (tree node or
+  file) of the link below, which is tried first.
+
+**Results**, the same store, cold, median of three interleaved rounds (load
+average 4-6 from other jobs):
+
+| Query | Before | After |
+|---|---|---|
+| Full file listing (86,684 files) | 2.22 s | 0.51 s |
+| `blame Makefile` (1,764 changers, nothing cached) | 10.48 s | 5.02 s |
+| Diff head vs 1,000 first parents back (9,635 entries) | 2.74 s | 0.62 s |
+| Diff head vs 3,000 back (18,786 entries) | 3.13 s | 0.73 s |
+
+On a busy disk (load average 12, the first round measured) the listing went
+from 10.0 to 1.3 s and the 1,000-back diff from 3.4 to 1.8 s. Blame's store
+calls, cold:
+
+| Calls | Before | After |
+|---|---|---|
+| history-index rows | 2,852 | 2,852 |
+| skiplists | 3,800 | 1,926 |
+| generations | 2,489 | 753 |
+| changesets | 2,203 | 1 batch (307) |
+| root trees | 1,896 | 30 batches (1,895) |
+| cached-blame lookups | 1,765 | 56 batches (1,764) |
+| blob reads | 3,660 | 58 `get_many` (3,659) + 1 |
+
+Blame is now mostly the history-index lookup and skiplist read of each step,
+which depend on the step before. On Linux the same causes apply at about 26
+times the history (and a 508 MB index), so the 14.4 s, 19.7 s and 47 s rows
+should fall by similar factors; they have not been remeasured there.
 
 ## Path history on Linux
 

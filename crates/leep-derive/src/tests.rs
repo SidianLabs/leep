@@ -1079,6 +1079,22 @@ async fn blame_attributes_lines() {
     assert!(is_invalid(r.blame(c5, &rp("bin")).await));
 }
 
+/// Line texts come from the last version, with `\r\n` and `\n` stripped,
+/// and a last line that gains a newline counts as changed.
+#[tokio::test]
+async fn blame_texts_follow_line_endings() {
+    let r = repo();
+    let c1 = commit(&r, &[], &[("f", Some("a\r\nb"))], "c1").await;
+    let c2 = commit(&r, &[c1], &[("f", Some("a\r\nb\nc"))], "c2").await;
+    let b = r.blame(c2, &rp("f")).await.unwrap();
+    let got: Vec<_> = b
+        .lines
+        .iter()
+        .map(|l| (l.text.as_str(), l.changeset, l.origin_line))
+        .collect();
+    assert_eq!(got, [("a", c1, 1), ("b", c2, 2), ("c", c2, 3)]);
+}
+
 /// Copy a linear history into another repo (same ids), returning the tip.
 async fn replay(from: &Repo, to: &Repo, tip: ChangesetId) -> ChangesetId {
     let mut log = from.log(tip, None, usize::MAX).await.unwrap();
@@ -1140,6 +1156,31 @@ async fn blame_of_an_untouched_file_does_not_walk_the_whole_history() {
     let (_, again) = r.blame_walk(tip, &rp("old"), true, true).await.unwrap();
     assert_eq!(again, 0);
     assert_eq!(b.lines.len(), 3);
+}
+
+/// A blame cached at an older changer is found although the walk looks up
+/// cached blames a batch of changers at a time, and gives the answer of a
+/// walk without any cache, whether the hit is near the tip or many changers
+/// down.
+#[tokio::test]
+async fn blame_resumes_from_a_cached_older_blame() {
+    let r = repo();
+    let mut text = String::from("base\n");
+    let mut tip = commit(&r, &[], &[("f", Some(&text))], "root").await;
+    let mut tips = vec![tip];
+    for i in 0..100 {
+        text.push_str(&format!("line {i}\n"));
+        tip = commit(&r, &[tip], &[("f", Some(&text))], "edit").await;
+        tips.push(tip);
+        tip = commit(&r, &[tip], &[(&format!("o{i}"), Some("x\n"))], "other").await;
+    }
+    for cached_at in [tips[3], tips[60], tips[98]] {
+        r.meta().delete_derived_kind("blame").await.unwrap();
+        r.blame(cached_at, &rp("f")).await.unwrap();
+        let (full, _) = r.blame_walk(tip, &rp("f"), false, false).await.unwrap();
+        let (with_cache, _) = r.blame_walk(tip, &rp("f"), true, true).await.unwrap();
+        assert_eq!(with_cache, full);
+    }
 }
 
 /// Skipping is an optimisation: over histories with edits, reverts, deletes,
