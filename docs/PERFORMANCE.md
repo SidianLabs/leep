@@ -287,6 +287,56 @@ target/release/leep-land-bench --server http://127.0.0.1:7391 \
 `--missing 90000` first times `POST /v1/blobs/missing` with 90,000 hashes
 that were never stored, three times.
 
+**Per-directory flushes (ADR 0048).** After ADR 0044, with 64 agents and
+10-file changesets (`--files 10`) create p50 was about 25% worse than before
+it. Timers on the create path put 20 to 44 ms of a create's 51 to 93 ms
+server time in its flush: one sync wave of every directory dirtied since the
+last (80 to 122, 21 to 40 ms), of which the create needed about 13. Waves
+started as soon as a flush asked, so starting them eagerly was not the fix:
+a build that ran waves continuously in the background improved create p50
+(129 ms against 156 for `main`, against 108 for per-directory flushes, in
+the same four rounds) only by keeping waves smaller. A flush now syncs only
+the directories of the blobs its caller wrote or names and shares syncs
+already running; a create's flush takes 3 to 6 ms, under the condemnation
+read beside it, and mean server time per create at 64 agents fell from 74 to
+56 ms (median of eight 5-second windows, alternating builds).
+
+Same local 4-vCPU Xeon, shared with other agents' builds and benchmarks
+(load average 7 to 12 during these rounds, up to 28 in earlier ones),
+Postgres 16, blobs on ext4, `--files 10 --duration 10`. Six alternating
+rounds of each build; cells are medians, p50 / p99 in ms. Before is `04d8312`
+(the parent of ADR 0044's change), `main` is `d958eae`:
+
+| Agents | Build | Lands/s | Land p50 / p99 | Put p50 / p99 | Create p50 / p99 |
+|---|---|---|---|---|---|
+| 1 | before | 12.3 | 3.3 / 10.7 | 5.6 / 17.6 | 10.0 / 22.4 |
+| 1 | main | 17.4 | 3.0 / 7.7 | 3.8 / 11.4 | 10.2 / 24.0 |
+| 1 | per-directory | 9.0 ¹ | 4.2 / 12.7 | 8.0 / 19.3 | 16.1 / 34.2 |
+| 8 | before | 47.9 | 39.4 / 89.7 | 9.4 / 25.1 | 17.2 / 45.2 |
+| 8 | main | 54.1 | 50.6 / 180 | 5.8 / 17.7 | 22.5 / 77.7 |
+| 8 | per-directory | 52.9 | 47.4 / 103 | 6.7 / 22.5 | 20.0 / 47.8 |
+| 64 | before | 66.8 | 315 / 515 | 45.0 / 113 | 99.4 / 212 |
+| 64 | main | 69.5 | 378 / 788 | 30.4 / 128 | 143 / 275 |
+| 64 | per-directory | 62.2 | 399 / 774 | 39.5 / 91.2 | 135 / 235 |
+
+¹ Single-agent runs on this machine fall into two modes for every build
+(about 17 lands/s and a 10 ms create, or about 9 lands/s and a 16 to 19 ms
+create, for a whole run); four of the six per-directory runs and one or two
+of each other build's landed in the slow one. Three further alternating
+1- and 8-agent rounds with timers put `main` and per-directory flushes level:
+create p50 10.5 / 12.2 / 18.5 ms against 11.0 / 7.6 / 19.8, server time per
+create 11.8 to 13.0 ms against 10.0 to 14.7, flush 4.6 to 4.9 ms against 2.8
+to 3.6.
+
+At 64 agents the create p50 medians of three sets of rounds were 119, 127
+and 99 ms before, 181, 156 and 143 ms on `main`, and 137, 108 and 135 ms
+with per-directory flushes; single rounds of one build ranged over 70 to
+170 ms. The client's create time is about twice the server's: on this
+machine the rest is waiting for a CPU, which is also why moving the flush
+off the critical path shows up more clearly in the server's timers than in
+the bench. Lands per second and land latency moved within the noise; no run
+lost a CAS or answered 409.
+
 **Write path (ADR 0044).** After staged batches, on a 4-vCPU VPS (Postgres
 16, blobs on a real disk) 64 agents landed about 117 times a second and the
 limit was the agents' own requests: put p50 66 to 110 ms, create p50 130 to
