@@ -25,9 +25,10 @@ pub enum RefState {
     /// Leep moved and the mirror has not caught up yet (or is retrying).
     #[default]
     Pending,
-    /// Both sides have commits the other lacks. Nothing moves on either side
-    /// until someone merges in git; Leep's side is pushed to the diverged
-    /// branch to merge from.
+    /// Both sides have commits the other lacks, and the mirror did not merge
+    /// them (`--on-divergence report`, or a conflict or refusal). Nothing
+    /// moves on either side until someone merges in git; Leep's side is
+    /// pushed to the diverged branch to merge from.
     Diverged,
     /// Leep moved the ref back (an undo); the remote still has the newer
     /// commits and the mirror does not force it.
@@ -87,6 +88,71 @@ pub struct ImportCounts {
     pub lost_race: u64,
 }
 
+/// The mirror's automatic merges of diverged refs (`--on-divergence merge`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MergeCounts {
+    pub landed: u64,
+    pub conflicts: u64,
+    pub refused: u64,
+    pub lost_race: u64,
+}
+
+/// Land branches landed onto a ref.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LandCounts {
+    pub landed: u64,
+    pub conflicts: u64,
+    pub refused: u64,
+}
+
+/// Where one land branch stands. A landed branch is deleted and leaves the
+/// status.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LandState {
+    /// Seen and not landed yet, or landed and waiting to be deleted.
+    #[default]
+    Pending,
+    /// It conflicts with the target ref; the person rebases it and pushes
+    /// again.
+    Conflict,
+    /// The server refused it: land policy, a merge in the branch, or a
+    /// target that does not exist.
+    Refused,
+    /// The last attempt failed; retried with backoff.
+    Error,
+}
+
+impl LandState {
+    pub fn label(self) -> &'static str {
+        match self {
+            LandState::Pending => "pending",
+            LandState::Conflict => "conflict",
+            LandState::Refused => "refused",
+            LandState::Error => "error",
+        }
+    }
+
+    /// Needs the person who pushed the branch.
+    pub fn failing(self) -> bool {
+        matches!(self, LandState::Conflict | LandState::Refused)
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LandBranchStatus {
+    /// The full git ref, `refs/heads/leep-land/<ref>/<name>`.
+    pub branch: String,
+    /// The Leep ref it lands on; None when the name matches no mirrored ref.
+    pub leep_ref: Option<String>,
+    pub commit: String,
+    pub state: LandState,
+    #[serde(default)]
+    pub detail: String,
+    /// Unix seconds the mirror first saw this commit on the branch.
+    pub since: u64,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RefStatus {
     pub leep_ref: String,
@@ -113,6 +179,10 @@ pub struct RefStatus {
     /// Times the ref entered the diverged state.
     #[serde(default)]
     pub divergences: u64,
+    #[serde(default)]
+    pub merges: MergeCounts,
+    #[serde(default)]
+    pub land_branches: LandCounts,
 }
 
 impl RefStatus {
@@ -139,6 +209,9 @@ pub struct Status {
     pub cycles: u64,
     /// Failures by stage: `leep`, `git`, `export`, `import`.
     pub errors: BTreeMap<String, u64>,
+    /// Land branches on the remote that are not landed and deleted yet.
+    #[serde(default)]
+    pub land_branches: Vec<LandBranchStatus>,
 }
 
 pub fn now() -> u64 {
@@ -277,6 +350,65 @@ pub fn render_metrics(s: &Status) -> String {
             "leep_mirror_divergences_total{{ref=\"{}\"}} {}",
             esc(&r.leep_ref),
             r.divergences
+        );
+    }
+    head(
+        &mut o,
+        "leep_mirror_merges_total",
+        "counter",
+        "Automatic merges of diverged refs by result: landed, conflicts, refused (land policy), lost_race.",
+    );
+    for r in &s.refs {
+        for (k, v) in [
+            ("landed", r.merges.landed),
+            ("conflicts", r.merges.conflicts),
+            ("refused", r.merges.refused),
+            ("lost_race", r.merges.lost_race),
+        ] {
+            let _ = writeln!(
+                o,
+                "leep_mirror_merges_total{{ref=\"{}\",result=\"{k}\"}} {v}",
+                esc(&r.leep_ref)
+            );
+        }
+    }
+    head(
+        &mut o,
+        "leep_mirror_land_branches_total",
+        "counter",
+        "Land branches by result: landed, conflicts, refused (land policy or a bad branch).",
+    );
+    for r in &s.refs {
+        for (k, v) in [
+            ("landed", r.land_branches.landed),
+            ("conflicts", r.land_branches.conflicts),
+            ("refused", r.land_branches.refused),
+        ] {
+            let _ = writeln!(
+                o,
+                "leep_mirror_land_branches_total{{ref=\"{}\",result=\"{k}\"}} {v}",
+                esc(&r.leep_ref)
+            );
+        }
+    }
+    head(
+        &mut o,
+        "leep_mirror_land_branches_failing",
+        "gauge",
+        "Land branches left on the remote because they conflict or were refused.",
+    );
+    let mut failing: BTreeMap<&str, u64> =
+        s.refs.iter().map(|r| (r.leep_ref.as_str(), 0)).collect();
+    for b in s.land_branches.iter().filter(|b| b.state.failing()) {
+        *failing
+            .entry(b.leep_ref.as_deref().unwrap_or(""))
+            .or_default() += 1;
+    }
+    for (r, n) in failing {
+        let _ = writeln!(
+            o,
+            "leep_mirror_land_branches_failing{{ref=\"{}\"}} {n}",
+            esc(r)
         );
     }
     head(

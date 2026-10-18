@@ -11,16 +11,22 @@
 //! | `G` missing, or an ancestor of `E` | push `E` (the remote accepts only a fast-forward) |
 //! | `E` an ancestor of `G`, tip from git | import the new commits and move the Leep ref by compare-and-swap, through the land policy |
 //! | `E` an ancestor of `G`, tip from Leep | Leep moved back: report, never force (unless allowed for that ref) |
-//! | neither | diverged: report, push Leep's side to a separate branch, move nothing |
+//! | neither | diverged: report, push Leep's side to a separate branch, move nothing; or, with `--on-divergence merge`, import the remote's side, merge on the server and land the merge if it is clean |
+//!
+//! Land branches (`leep-land/<ref>/<name>` on the remote) are imported and
+//! landed onto `<ref>` through `POST /v1/land`, which rebases them like an
+//! agent's land, and then deleted with an exact lease (ADR 0049).
 //!
 //! The decision depends only on the two current values and the map, never
 //! on remembered progress, so a crash at any point is recovered by running
-//! the cycle again: exports are deterministic and a push of a value the
-//! remote already has is a no-op.
+//! the cycle again: exports are deterministic, the mirror's merges are
+//! deterministic, lands are idempotent and a push of a value the remote
+//! already has is a no-op.
 
 pub mod export;
 mod git;
 pub mod import;
+mod land;
 pub mod map;
 pub mod status;
 
@@ -33,22 +39,25 @@ use anyhow::{anyhow, bail, Context, Result};
 use gix::ObjectId;
 use leep_cli::client::Client;
 use leep_cli::error::ErrorKind;
-use leep_core::api::CasRefRequest;
+use leep_core::api::{
+    Authorship, CasRefRequest, LandRequest, LandResponse, MergeRequest, MergeResponse,
+};
 use leep_core::{Changeset, ChangesetId, Hash};
 
 pub use export::CommitStyle;
 pub use git::redact;
 use git::{PushOutcome, Remote};
 use map::{Map, Origin};
-pub use status::{read_status, RefState, RefStatus, Status};
+pub use status::{read_status, LandBranchStatus, LandState, RefState, RefStatus, Status};
 
 /// Ref log label of the mirror's moves of Leep refs.
 pub const CAS_OPERATION: &str = "git-mirror";
 
 /// Test hook: the mirror aborts, as a SIGKILL would stop it, when it reaches
 /// the step this names (`export-commit`, `exported`, `pushed`, `imported`,
-/// `landed`, `diverged-pushed`). Lets the crash tests stop it exactly between
-/// two steps rather than at a random moment.
+/// `landed`, `diverged-pushed`, `merge-imported`, `merged`, `merge-landed`,
+/// `land-imported`, `land-landed`, `land-deleted`). Lets the crash tests stop
+/// it exactly between two steps rather than at a random moment.
 pub const CRASH_ENV: &str = "LEEP_MIRROR_CRASH_AT";
 
 pub(crate) fn crash_point(name: &str) {
@@ -79,6 +88,33 @@ pub trait Leep {
         new: ChangesetId,
         message: &str,
     ) -> Result<Cas>;
+    /// `POST /v1/merge`: a three-way merge stored as a new changeset, or the
+    /// paths that conflict. Never resolves a conflict.
+    fn merge(&self, req: &MergeRequest) -> Result<MergeOutcome>;
+    /// `POST /v1/land` onto an existing ref (`create: false`): the server
+    /// rebases the unlanded stack onto the head, through the land policy.
+    fn land(&self, changeset: ChangesetId, target_ref: &str) -> Result<LandOutcome>;
+}
+
+/// How a server-side merge ended.
+#[derive(Debug, PartialEq, Eq)]
+pub enum MergeOutcome {
+    Clean(ChangesetId),
+    /// The conflicting paths.
+    Conflicts(Vec<String>),
+}
+
+/// How a land ended.
+#[derive(Debug, PartialEq, Eq)]
+pub enum LandOutcome {
+    /// The changeset now at the ref head for this land (a rebased copy if the
+    /// ref had moved).
+    Landed(ChangesetId),
+    /// The conflicting paths against the head.
+    Conflicts(Vec<String>),
+    /// The server refused (400 or 404): land policy, a merge in the stack, or
+    /// a missing ref.
+    Refused(String),
 }
 
 /// How a compare-and-swap of a Leep ref ended.
@@ -162,7 +198,66 @@ impl Leep for Client {
             Err(e) => Err(e.into()),
         }
     }
+
+    fn merge(&self, req: &MergeRequest) -> Result<MergeOutcome> {
+        Ok(match Client::merge(self, req)? {
+            MergeResponse::Merged { id } => MergeOutcome::Clean(id),
+            MergeResponse::Conflicts { conflicts, .. } => MergeOutcome::Conflicts(
+                conflicts
+                    .into_iter()
+                    .map(|c| c.path.as_str().to_string())
+                    .collect(),
+            ),
+        })
+    }
+
+    fn land(&self, changeset: ChangesetId, target_ref: &str) -> Result<LandOutcome> {
+        let req = LandRequest {
+            changeset,
+            target_ref: target_ref.to_string(),
+            create: Some(false),
+        };
+        match Client::land(self, &req) {
+            Ok(LandResponse::Landed { landed, .. }) => Ok(LandOutcome::Landed(landed)),
+            Ok(LandResponse::Conflicts { conflicts, .. }) => Ok(LandOutcome::Conflicts(
+                conflicts
+                    .into_iter()
+                    .map(|c| c.path.as_str().to_string())
+                    .collect(),
+            )),
+            Err(e) if matches!(e.kind(), ErrorKind::User | ErrorKind::NotFound) => {
+                Ok(LandOutcome::Refused(e.message().to_string()))
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
 }
+
+/// What the mirror does when both sides of a ref moved.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OnDivergence {
+    /// Report it and push Leep's side to the diverged branch for a person
+    /// to merge in git.
+    #[default]
+    Report,
+    /// Ask the server for a merge and land it when it is clean and the land
+    /// policy allows it; report as above otherwise.
+    Merge,
+}
+
+impl std::str::FromStr for OnDivergence {
+    type Err = String;
+    fn from_str(s: &str) -> std::result::Result<Self, String> {
+        match s {
+            "report" => Ok(OnDivergence::Report),
+            "merge" => Ok(OnDivergence::Merge),
+            _ => Err(format!("{s:?}: expected report or merge")),
+        }
+    }
+}
+
+/// Author of the merges the mirror asks the server for.
+pub const DEFAULT_MERGE_AUTHOR: &str = "Leep git mirror <git-mirror@leep.invalid>";
 
 /// One Leep ref and the remote ref it is mirrored to.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -221,6 +316,13 @@ pub struct Config {
     pub allow_rewind: Vec<String>,
     /// Prefix of the mirror-owned branch Leep's side goes to on divergence.
     pub diverged_prefix: String,
+    pub on_divergence: OnDivergence,
+    /// Author of the mirror's merges. Part of the merge's id, so keep it
+    /// fixed for the life of a mirror.
+    pub merge_author: String,
+    /// Land branches pushed under this prefix (`<prefix><ref>/<name>`); None
+    /// turns them off.
+    pub land_prefix: Option<String>,
     pub style: CommitStyle,
     /// How often to ask the server whether any ref moved.
     pub interval: Duration,
@@ -243,20 +345,37 @@ impl Config {
         if self.refs.is_empty() && !self.tags {
             bail!("nothing to mirror: pass --ref (repeatable) or --tags");
         }
-        if !self.diverged_prefix.ends_with('/') || self.diverged_prefix.starts_with('/') {
-            bail!("--diverged-prefix must be a relative branch prefix ending in '/'");
+        let mut owned = vec![("--diverged-prefix", &self.diverged_prefix)];
+        if let Some(p) = &self.land_prefix {
+            owned.push(("--land-prefix", p));
         }
-        for r in &self.refs {
-            if r.git
-                .strip_prefix("refs/heads/")
-                .is_some_and(|b| b.starts_with(&self.diverged_prefix))
-            {
-                bail!(
-                    "{} maps into {}, which the mirror owns",
-                    r.leep,
-                    self.diverged_prefix
-                );
+        for (flag, prefix) in &owned {
+            if !prefix.ends_with('/') || prefix.starts_with('/') {
+                bail!("{flag} must be a relative branch prefix ending in '/'");
             }
+            for r in &self.refs {
+                if r.git
+                    .strip_prefix("refs/heads/")
+                    .is_some_and(|b| b.starts_with(prefix.as_str()))
+                {
+                    bail!("{} maps into {prefix}, which the mirror owns", r.leep);
+                }
+            }
+        }
+        if let Some(p) = &self.land_prefix {
+            let d = &self.diverged_prefix;
+            if p.starts_with(d.as_str()) || d.starts_with(p.as_str()) {
+                bail!("--land-prefix {p} and --diverged-prefix {d} overlap");
+            }
+            if !self.import {
+                bail!("land branches (--land-branches) need --import");
+            }
+        }
+        if self.on_divergence == OnDivergence::Merge && !self.import {
+            bail!("--on-divergence merge needs --import");
+        }
+        if self.merge_author.trim().is_empty() {
+            bail!("--merge-author must not be empty");
         }
         Ok(())
     }
@@ -274,6 +393,16 @@ struct Tracked {
     next_try: Instant,
     /// Set from configuration, or discovered (`--tags`).
     configured: bool,
+    /// The last automatic merge that fell back to a report, so the same
+    /// pair is not merged again every cycle.
+    merge_memo: Option<MergeMemo>,
+}
+
+struct MergeMemo {
+    leep: ChangesetId,
+    remote: ObjectId,
+    until: Option<Instant>,
+    reason: String,
 }
 
 impl Tracked {
@@ -291,6 +420,7 @@ impl Tracked {
             local: None,
             next_try: Instant::now(),
             configured,
+            merge_memo: None,
         }
     }
 
@@ -315,6 +445,8 @@ pub struct Mirror<'a> {
     pub status: Arc<Mutex<Status>>,
     status_path: PathBuf,
     pushes_since_gc: u32,
+    /// Land branches on the remote, by git ref.
+    lands: BTreeMap<String, land::LandBranch>,
     _lock: std::fs::File,
 }
 
@@ -386,6 +518,7 @@ impl<'a> Mirror<'a> {
             remote_stale: true,
             status: Arc::new(Mutex::new(status)),
             pushes_since_gc: 0,
+            lands: BTreeMap::new(),
             _lock: lock,
         })
     }
@@ -415,11 +548,16 @@ impl<'a> Mirror<'a> {
         for _ in 0..6 {
             self.remote_stale = true;
             self.cycle();
-            let now: Vec<_> = self
-                .refs
-                .iter()
-                .map(|r| (r.st.state, r.leep, r.remote))
-                .collect();
+            let now: (Vec<_>, Vec<_>) = (
+                self.refs
+                    .iter()
+                    .map(|r| (r.st.state, r.leep, r.remote))
+                    .collect(),
+                self.lands
+                    .iter()
+                    .map(|(n, b)| (n.clone(), b.commit, b.st.state))
+                    .collect(),
+            );
             if last.as_ref() == Some(&now) {
                 break;
             }
@@ -473,7 +611,8 @@ impl<'a> Mirror<'a> {
                     .max(Instant::now() + max.min(Duration::from_secs(30)));
             }
             if let Err(e) = result {
-                let stage = if format!("{e:#}").contains("import") {
+                let text = format!("{e:#}");
+                let stage = if text.contains("import") || text.contains("merge") {
                     "import"
                 } else {
                     "export"
@@ -485,6 +624,7 @@ impl<'a> Mirror<'a> {
                 backoff(r, self.cfg.max_backoff);
             }
         }
+        self.sync_lands();
         if self.pushes_since_gc >= 200 {
             self.remote.gc_auto();
             self.pushes_since_gc = 0;
@@ -498,6 +638,7 @@ impl<'a> Mirror<'a> {
             s.updated = status::now();
             s.cycles += 1;
             s.refs = self.refs.iter().map(|r| r.st.clone()).collect();
+            s.land_branches = self.lands.values().map(|b| b.st.clone()).collect();
             s.commits_exported = self.ex.commits_written;
             s.ref_log_seq = self.seq.flatten();
             s.clone()
@@ -554,7 +695,16 @@ impl<'a> Mirror<'a> {
                 names.push(s);
             }
         }
-        let found = self.remote.ls_remote(&names).map_err(|e| anyhow!(e))?;
+        let land_prefix = self
+            .cfg
+            .land_prefix
+            .as_ref()
+            .map(|p| format!("refs/heads/{p}"));
+        let prefixes: Vec<String> = land_prefix.iter().cloned().collect();
+        let found = self
+            .remote
+            .ls_remote(&names, &prefixes)
+            .map_err(|e| anyhow!(e))?;
         let fetch: Vec<String> = found
             .iter()
             .filter(|(_, oid)| !self.ex.repo.has_object(*oid))
@@ -572,6 +722,13 @@ impl<'a> Mirror<'a> {
                 .side_ref(&self.cfg.diverged_prefix)
                 .and_then(|s| found.get(&s).copied());
             r.st.diverged_branch = r.side.and(r.side_ref(&self.cfg.diverged_prefix));
+        }
+        if let Some(prefix) = land_prefix {
+            let lands: BTreeMap<String, ObjectId> = found
+                .into_iter()
+                .filter(|(n, _)| n.starts_with(&prefix))
+                .collect();
+            self.update_lands(lands);
         }
         Ok(())
     }
@@ -663,7 +820,7 @@ impl<'a> Mirror<'a> {
                     Ok(())
                 }
             }
-            Some(g) => self.diverged(i, e, g),
+            Some(g) => self.diverged(i, l, e, g),
         }
     }
 
@@ -820,7 +977,16 @@ impl<'a> Mirror<'a> {
         }
     }
 
-    fn diverged(&mut self, i: usize, e: ObjectId, g: ObjectId) -> Result<()> {
+    /// Both sides moved. With `--on-divergence merge`, try a clean merge on
+    /// the server first; anything short of a landed merge is reported.
+    fn diverged(&mut self, i: usize, l: ChangesetId, e: ObjectId, g: ObjectId) -> Result<()> {
+        let mut merge_note = None;
+        if self.cfg.on_divergence == OnDivergence::Merge {
+            match self.merge(i, l, g)? {
+                None => return Ok(()),
+                Some(why) => merge_note = Some(why),
+            }
+        }
         let prefix = self.cfg.diverged_prefix.clone();
         let side_name = self.refs[i].side_ref(&prefix);
         if let Some(name) = &side_name {
@@ -852,15 +1018,186 @@ impl<'a> Mirror<'a> {
             ),
             None => String::new(),
         };
+        let note = merge_note
+            .map(|n| format!("; not merged automatically: {n}"))
+            .unwrap_or_default();
         set_state(
             r,
             RefState::Diverged,
             format!(
-                "Leep exports to {e} and the remote has {g}, and neither contains the other{hint}"
+                "Leep exports to {e} and the remote has {g}, and neither contains the other\
+                 {note}{hint}"
             ),
         );
         Ok(())
     }
+
+    /// Import the remote's side `g`, merge it into `l` on the server and
+    /// land the merge by CAS from `l`. `Ok(None)` when the ref moved (the
+    /// merge landed, or Leep moved first); `Ok(Some(why))` when the
+    /// divergence must be reported instead.
+    ///
+    /// The merge is a function of `l` and `g` alone (fixed author, message
+    /// and the newer parent's timestamp), so a rerun after a crash at any
+    /// step asks for, and gets, the same changeset, and so the same commit.
+    fn merge(&mut self, i: usize, l: ChangesetId, g: ObjectId) -> Result<Option<String>> {
+        if let Some(m) = &self.refs[i].merge_memo {
+            if m.leep == l && m.remote == g && m.until.is_none_or(|t| Instant::now() < t) {
+                return Ok(Some(m.reason.clone()));
+            }
+        }
+        let name = self.refs[i].spec.leep.clone();
+        // A remote tip Leep moved back from is an undo the merge would
+        // revert without anyone asking: the same rule as for fast-forwards.
+        let origin =
+            import::leep_origin(self.leep, &mut self.ex, g)?.and_then(|_| self.ex.map.leep(&g));
+        let undone = match origin {
+            Some((_, Origin::Exported)) => true,
+            Some((cg, Origin::Imported)) => self.leep.ref_had(&name, &cg)?,
+            None => false,
+        };
+        if undone {
+            return Ok(Some(self.memo_merge(
+                i,
+                l,
+                g,
+                None,
+                format!("the remote's tip {g} came from Leep, which moved {name} back from it"),
+            )));
+        }
+        let report = import::import(self.leep, &mut self.ex, g).context("import")?;
+        self.status.lock().unwrap().commits_imported += report.commits;
+        let theirs = report
+            .head
+            .ok_or_else(|| anyhow!("import: {g} has no changeset after import"))?;
+        crash_point("merge-imported");
+        let timestamp = self
+            .leep
+            .changeset(&l)
+            .context("merge: reading Leep's side")?
+            .timestamp
+            .max(
+                self.leep
+                    .changeset(&theirs)
+                    .context("merge: reading the remote's side")?
+                    .timestamp,
+            );
+        let git_ref = self.refs[i].spec.git.clone();
+        let req = MergeRequest {
+            parents: [l, theirs],
+            message: format!(
+                "Merge {} from git into {name}\n\nThe git mirror merged the remote's {g} into \
+                 Leep's {l}; no path conflicted.\n",
+                git_ref.strip_prefix("refs/heads/").unwrap_or(&git_ref)
+            ),
+            authorship: Authorship {
+                author: self.cfg.merge_author.clone(),
+                timestamp: Some(timestamp),
+            },
+            extra: BTreeMap::from([(MERGE_EXTRA.to_string(), g.to_string())]),
+        };
+        let merged = match self.leep.merge(&req).context("merge")? {
+            MergeOutcome::Clean(m) => m,
+            MergeOutcome::Conflicts(paths) => {
+                self.refs[i].st.merges.conflicts += 1;
+                let why = format!("{} conflicting {}", paths.len(), list_paths(&paths));
+                return Ok(Some(self.memo_merge(i, l, g, None, why)));
+            }
+        };
+        crash_point("merged");
+        let outcome = self
+            .leep
+            .cas_ref(
+                &name,
+                Some(l),
+                merged,
+                &format!("git {g} merged as {merged}"),
+            )
+            .context("merge: moving the Leep ref")?;
+        let r = &mut self.refs[i];
+        match outcome {
+            Cas::Won => {
+                crash_point("merge-landed");
+                r.st.merges.landed += 1;
+                r.leep = Some(merged);
+                r.st.leep = Some(merged.to_string());
+                r.merge_memo = None;
+                log(format!(
+                    "{name}: merged {g} from the remote into {l} as {merged} ({} new changesets)",
+                    report.commits
+                ));
+                mark_pending(r);
+                set_state(
+                    r,
+                    RefState::Pending,
+                    format!("merged {g} from the remote as {merged}"),
+                );
+                r.next_try = Instant::now();
+                Ok(None)
+            }
+            Cas::Lost(now) => {
+                r.st.merges.lost_race += 1;
+                r.leep = now;
+                r.st.leep = hex(now);
+                mark_pending(r);
+                set_state(
+                    r,
+                    RefState::Pending,
+                    "Leep moved while the remote's side was merged; checking again".into(),
+                );
+                Ok(None)
+            }
+            Cas::Refused(why) => {
+                r.st.merges.refused += 1;
+                // A policy answer can change (a review, a new key); ask again later.
+                let until = Instant::now() + self.cfg.max_backoff.min(Duration::from_secs(60));
+                let why = format!("Leep refused to land the merge {merged}: {why}");
+                Ok(Some(self.memo_merge(i, l, g, Some(until), why)))
+            }
+        }
+    }
+
+    fn memo_merge(
+        &mut self,
+        i: usize,
+        l: ChangesetId,
+        g: ObjectId,
+        until: Option<Instant>,
+        reason: String,
+    ) -> String {
+        self.refs[i].merge_memo = Some(MergeMemo {
+            leep: l,
+            remote: g,
+            until,
+            reason: reason.clone(),
+        });
+        reason
+    }
+}
+
+/// Extra key on the mirror's merges: the remote commit merged.
+pub const MERGE_EXTRA: &str = "git-mirror.merged";
+
+/// `path` or `paths: a, b, c and N more`, for a detail line.
+fn list_paths(paths: &[String]) -> String {
+    const SHOWN: usize = 5;
+    let mut s = if paths.len() == 1 {
+        "path: ".to_string()
+    } else {
+        "paths: ".to_string()
+    };
+    s.push_str(
+        &paths
+            .iter()
+            .take(SHOWN)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
+    if paths.len() > SHOWN {
+        s.push_str(&format!(" and {} more", paths.len() - SHOWN));
+    }
+    s
 }
 
 fn count_error(status: &Mutex<Status>, stage: &str) {
@@ -957,6 +1294,9 @@ mod tests {
             import: false,
             allow_rewind: vec![],
             diverged_prefix: "leep-diverged/".into(),
+            on_divergence: OnDivergence::Report,
+            merge_author: DEFAULT_MERGE_AUTHOR.into(),
+            land_prefix: None,
             style: CommitStyle {
                 provenance_trailers: false,
                 changeset_trailer: true,
@@ -984,6 +1324,37 @@ mod tests {
         c.refs
             .push(RefSpec::parse("x:refs/heads/leep-diverged/x").unwrap());
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn merging_and_land_branches_need_import_and_their_own_prefix() {
+        let mut c = config();
+        c.on_divergence = OnDivergence::Merge;
+        assert!(c.validate().is_err(), "merge without --import");
+        c.import = true;
+        assert!(c.validate().is_ok());
+        c.land_prefix = Some("leep-land/".into());
+        assert!(c.validate().is_ok());
+        c.land_prefix = Some("leep-land".into());
+        assert!(c.validate().is_err(), "no trailing slash");
+        c.land_prefix = Some("leep-diverged/land/".into());
+        assert!(c.validate().is_err(), "overlaps the diverged prefix");
+        c.land_prefix = Some("leep-land/".into());
+        c.refs
+            .push(RefSpec::parse("x:refs/heads/leep-land/x").unwrap());
+        assert!(c.validate().is_err(), "a ref maps into the land prefix");
+        let mut c = config();
+        c.land_prefix = Some("leep-land/".into());
+        assert!(c.validate().is_err(), "land branches without --import");
+        assert_eq!("merge".parse(), Ok(OnDivergence::Merge));
+        assert!("rebase".parse::<OnDivergence>().is_err());
+    }
+
+    #[test]
+    fn path_lists_are_cut_short() {
+        assert_eq!(list_paths(&["a".into()]), "path: a");
+        let many: Vec<String> = (0..7).map(|i| format!("p{i}")).collect();
+        assert_eq!(list_paths(&many), "paths: p0, p1, p2, p3, p4 and 2 more");
     }
 
     #[test]

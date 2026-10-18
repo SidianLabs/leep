@@ -545,6 +545,17 @@ if the map lists it or its trailer names a changeset whose export is exactly
 that commit; those are never imported, and imported changesets export to
 their original commits.
 
+Two opt-in additions ([ADR 0049](adr/0049-mirror-merges-and-land-branches.md)):
+with `--on-divergence merge`, the "otherwise" row imports `G`, asks
+`POST /v1/merge` for `[L, T]` and lands the merge by ref CAS from `L`
+(land policy applies), then pushes it as a fast-forward; conflicts or a
+refusal fall back to the report. The merge's author, message and timestamp
+are functions of `L` and `G`, so a crash anywhere reproduces the same
+changeset and commit. With `--land-branches`, remote branches
+`leep-land/<ref>/*` are imported and landed with `POST /v1/land`
+(`create: false`), which rebases them like an agent's land, then deleted
+with an exact lease; conflicts and refusals stay in the status.
+
 ## 7. Caching tiers
 
 ```
