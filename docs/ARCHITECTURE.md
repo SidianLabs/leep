@@ -159,6 +159,7 @@ changeset, and concurrent servers that race produce identical bytes.
 | `last_merge-v1` | generation of the nearest merge on the first-parent chain (0 if none) | lets `merge_base` answer from skiplists when no merge sits above the first-parent common ancestor |
 | `blob-claim-v1` / `blob-condemned-v1` / `blob-rescue-v1` / `blob-doom-v1` | per blob hash, 8-byte big-endian unix seconds (doom adds a state byte); GC bookkeeping, not derived from changesets: claims by uploads and dedup checks, condemnation by `gc condemn`, rescue by uploads of a condemned blob, doom by `gc collect` (ADR 0012) | blob garbage collection and the server's missing-blob checks |
 | `history-tree-v3` | 32-byte address of the root history node, a tree parallel to `root_tree` recording for each path (including deleted ones) the newest changesets that changed it; nodes are `history-node-v3` rows keyed by content hash, nodes of more than 64 entries are stored as content-defined chunks so an edit rewrites one chunk (ADR 0027), and a changed node, chunk or chunk list is stored as a patch on an earlier whole version (ADR 0037). Built from the first parent's tree plus the spines of changed paths, and at merges the paths where the second parent's history differs from the merge base's (another parent's from the first's, for octopus or unrelated merges) (ADR 0013) | path log, `last-change` |
+| `log-filter-v1` | per changeset at first-parent depth `d`: for each level `j ≤ tz(d)`, the 64-bit fingerprints of the authors, `extra` keys and `agent.model`/`agent.session` values of everything reachable from it but not from its first-parent ancestor `2^j` up (side branches included); lower-cased author names by fingerprint in `log-filter-name-v1` (ADR 0047) | `log` with `author`/`extra` filters and no path |
 | `blame` | per (changeset, path), keyed `Hash::of_object("blame", id‖path)` | blame |
 | `gc-mark-v1` | per changeset id, tree node hash or blob hash, one byte: "referenced by a stored changeset, and everything below has a row"; written by GC marks in post-order (ADR 0033) | incremental GC marks, which skip covered changesets and stop at marked tree nodes |
 | `blob-trigrams-v1` | per blob hash: sorted trigram set of a UTF-8 text blob up to 1 MiB (delta varints), or a "not indexed" marker (ADR 0014) | code search |
@@ -175,8 +176,7 @@ and the warmer never derive the same range twice. Add new kinds with the
 [`add-derived-data-kind`](../.claude/skills/add-derived-data-kind/SKILL.md)
 skill. A new kind never requires a client change.
 
-**Log without a path.** `log` with no path (alone or with `author` and
-`extra` filters) and `provenance` walk all ancestors on a heap ordered by
+**Log without a path.** `log` with no path and `provenance` walk all ancestors on a heap ordered by
 generation and id. The walk reads ahead in batches (ADR 0030): when it needs a
 changeset it has not read, it reads up to 256 that it expects to reach next,
 with their generations, root trees and skiplists, through
@@ -233,14 +233,40 @@ working-copy `diff` and `status` run the same code, and `GET /v1/log` with
 rename at the changeset that created the file.
 
 **Provenance queries.** `agent.*` keys in `extra` (see `EXTRA_AGENT_*`) are
-queryable without any new persisted data. `GET /v1/log` takes `author` and
-repeated `extra=key:value` / `extra=key` filters (ANDed), `GET /v1/provenance`
-counts changesets per agent model and session and per human author, and blame
-responses carry a deduplicated per-changeset summary (author, time, first
-message line, `agent.*` keys). The summaries are attached on read, so the
-cached `blame` value keeps its original encoding. All of these walk history
-linearly (provenance is capped at 10 000 changesets and reports `truncated`);
-an index over `agent.*` keys is future work.
+queryable without any new data on changesets. `GET /v1/log` takes `author`
+and repeated `extra=key:value` / `extra=key` filters (ANDed), `GET
+/v1/provenance` counts changesets per agent model and session and per human
+author, and blame responses carry a deduplicated per-changeset summary
+(author, time, first message line, `agent.*` keys). The summaries are
+attached on read, so the cached `blame` value keeps its original encoding.
+Provenance scans the newest changesets (capped at 10 000, reporting
+`truncated`).
+
+**Filtered log** ([ADR 0047](adr/0047-log-filter-index.md)). A log with
+`author` or `extra` filters and no path scans its first 512 changesets
+plainly, longer while at least one in 150 matches (frequent values are found
+there), then continues the same walk with
+the `log-filter-v1` index. Each changeset stores fingerprint sets for
+first-parent stretches of `2^j` steps, `j` up to its depth's trailing zero
+bits, covering everything those stretches reach, side branches included.
+Before expanding a changeset the walk reads its row; if a level rules out a
+match it queues the first-parent ancestor at that level's far end instead of
+the parents. Every remaining match is still below something queued, so the
+heap yields exactly the scan's matches in the scan's order, while reading
+only changesets near matches and a row per skipped stretch. An author
+substring becomes the set of author fingerprints whose name (in
+`log-filter-name-v1`) contains it, found from the head's widest levels; a
+filter on an `extra` value outside `agent.model`/`agent.session` uses the
+key's presence. A merge's level 0 holds exactly what its other parents bring
+in: their first-parent chains down to the first changeset the first parent
+reaches (bounded by `merge_base`), covered by levels where no merge
+intervenes, and recursively the sides of merges on those chains. The row
+also names that first reached changeset per side, its *stop*, and the walk
+into a side ends there, leaving the rest to the first parent's walk; without
+it, the walk into a branch that merges mainline back would follow the branch
+to its root. Rows, skiplists and changesets are read a batch at a time for
+the changesets nearest the top of the heap. The warmer derives the kind for
+ref heads; otherwise the first filtered query past the plain scan does.
 
 **Code search** ([ADR 0014](adr/0014-code-search.md)). `GET /v1/search/{rev}`
 greps a revision on the server: a literal or regex (`regex` crate), optionally
