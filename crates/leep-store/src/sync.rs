@@ -157,6 +157,7 @@ async fn copy_one(
 /// Copy every blob of `src` that `dst` lacks. Blobs only in `dst` stay.
 /// Safe to repeat and to interrupt: a half-finished run leaves whole blobs
 /// only (the stores write atomically) and the next run continues from there.
+/// Everything copied is flushed (`BlobStore::flush`) before it returns.
 pub async fn sync_blobs(
     src: &dyn BlobStore,
     dst: &dyn BlobStore,
@@ -227,6 +228,9 @@ pub async fn sync_blobs(
         }
     }
     report.only_in_destination += dst_cursor.count_rest().await?;
+    // A backup or restore is sealed after this returns, so every copy must
+    // survive a power loss by then (ADR 0044).
+    dst.flush(&[]).await?;
     Ok(report)
 }
 

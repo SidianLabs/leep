@@ -74,6 +74,11 @@ async fn ensure_dir(
 /// Apply `changes` to the tree `base`, rewriting only directories on changed
 /// paths and pruning empty ones. Returns the new root hash. Errors with
 /// `Invalid` for deletes of absent files and file/directory clashes.
+///
+/// The nodes written and the contents `changes` names are flushed
+/// (`BlobStore::flush`) before it returns, so the changeset built on the
+/// result can be stored at once (ADR 0044). Callers check the contents exist
+/// first, so the flush follows whatever write made them visible.
 pub(crate) async fn apply_changes(
     repo: &Repo,
     base: Hash,
@@ -82,7 +87,8 @@ pub(crate) async fn apply_changes(
     if changes.is_empty() {
         if base == TreeNode::empty_hash() {
             let empty = TreeNode::default();
-            repo.put_rescuing(base, Bytes::from(empty.encode())).await?;
+            repo.put_rescuing_many(vec![(base, Bytes::from(empty.encode()))], &[])
+                .await?;
         }
         return Ok(base);
     }
@@ -157,7 +163,16 @@ pub(crate) async fn apply_changes(
     let root = nodes.remove("").expect("root");
     let h = root.hash();
     rewritten.push((h, Bytes::from(root.encode())));
-    repo.put_rescuing_many(rewritten).await?;
+    let mut named: Vec<Hash> = changes
+        .values()
+        .filter_map(|c| match c {
+            FileChange::Modify { content, .. } => Some(*content),
+            FileChange::Delete => None,
+        })
+        .collect();
+    named.sort_unstable();
+    named.dedup();
+    repo.put_rescuing_many(rewritten, &named).await?;
     Ok(h)
 }
 

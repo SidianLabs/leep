@@ -19,7 +19,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures_util::future::try_join_all;
+use futures_util::future::{join_all, try_join_all};
 use leep_core::{ChangesetId, DerivedRow, Error, FileChange, Hash, Result, TreeEntry};
 
 use crate::Repo;
@@ -31,6 +31,16 @@ const PAGE: usize = 1000;
 /// independent and content addressed, so order does not matter, and a store
 /// that syncs every write gets them done together.
 const BLOB_WRITES_IN_FLIGHT: usize = 4;
+
+/// Fence reads in flight in [`Repo::missing_blobs`], for the hashes that
+/// have a condemnation row (or all of them, if the batched read failed).
+const FENCES_IN_FLIGHT: usize = 64;
+
+/// Hashes per batched condemnation read in [`Repo::missing_blobs`], and how
+/// many such reads run at once: a 90,000-key lookup is one index probe per
+/// key in one backend, so splitting it lets several backends share it.
+const CONDEMNED_READ_CHUNK: usize = 8192;
+const CONDEMNED_READS_IN_FLIGHT: usize = 4;
 
 /// Derived-data kind recording when a client was last told a blob already
 /// exists, or uploaded it (value: unix seconds, big-endian). A client that
@@ -188,24 +198,66 @@ impl Repo {
     /// first (see [`BLOB_CLAIM`]), so a concurrent GC cannot delete a blob a
     /// client was just told it may reuse.
     ///
-    /// The condemnation rows are read in one batch and the claims written in
-    /// another; each hash's fence is still read before its existence and
-    /// both before its claim.
+    /// Done in phases, each for every hash before the next starts, so each
+    /// hash's fence is still read before its existence and both before its
+    /// claim: the condemnation rows in batched reads, the full fence of the few
+    /// that have one [`FENCES_IN_FLIGHT`] at a time, existence in one
+    /// `contains_many`, the claims in one batch.
     pub async fn missing_blobs(&self, hashes: &[Hash]) -> Result<Vec<Hash>> {
         let now = time_value(unix_now());
-        // A failed batch reads every fence singly.
-        let condemned = self
-            .meta()
-            .get_derived_many(BLOB_CONDEMNED, hashes)
-            .await
-            .ok();
+        // Large requests read in chunks over several connections. A failed
+        // chunk reads its fences singly.
+        let chunks: Vec<&[Hash]> = hashes.chunks(CONDEMNED_READ_CHUNK).collect();
+        let mut maybe_condemned = Vec::with_capacity(hashes.len());
+        for group in chunks.chunks(CONDEMNED_READS_IN_FLIGHT) {
+            let mut reads = Vec::with_capacity(group.len());
+            for chunk in group {
+                reads.push(self.meta().get_derived_many(BLOB_CONDEMNED, chunk));
+            }
+            for (chunk, rows) in group.iter().zip(join_all(reads).await) {
+                match rows {
+                    Ok(rows) => maybe_condemned.extend(rows.iter().map(Option::is_some)),
+                    Err(_) => maybe_condemned.extend(std::iter::repeat_n(true, chunk.len())),
+                }
+            }
+        }
+        let maybe: Vec<usize> = maybe_condemned
+            .into_iter()
+            .enumerate()
+            .filter(|(_, m)| *m)
+            .map(|(i, _)| i)
+            .collect();
+        let mut blocked = vec![false; hashes.len()];
+        for chunk in maybe.chunks(FENCES_IN_FLIGHT) {
+            let mut reads = Vec::with_capacity(chunk.len());
+            for &i in chunk {
+                reads.push(self.fence_state(&hashes[i]));
+            }
+            let fences = try_join_all(reads).await?;
+            for (&i, f) in chunk.iter().zip(fences) {
+                blocked[i] = f.blocked();
+            }
+        }
+        // Fence first, then existence: see `check_reusable`.
+        let ask: Vec<Hash> = hashes
+            .iter()
+            .zip(&blocked)
+            .filter(|(_, b)| !**b)
+            .map(|(h, _)| *h)
+            .collect();
+        let present = self.blobs().contains_many(&ask).await?;
+        if present.len() != ask.len() {
+            return Err(Error::Storage(format!(
+                "contains_many answered {} of {} hashes",
+                present.len(),
+                ask.len()
+            )));
+        }
+        let mut present = present.into_iter();
         let mut missing = Vec::new();
         let mut claims = Vec::new();
-        for (i, h) in hashes.iter().enumerate() {
-            let maybe = condemned.as_ref().is_none_or(|c| c[i].is_some());
-            // Fence first, then existence: see `check_reusable`.
-            let blocked = maybe && self.fence_state(h).await?.blocked();
-            if blocked || !self.blobs().contains(h).await? {
+        for (h, b) in hashes.iter().zip(blocked) {
+            if b || !present.next().unwrap_or(false) {
                 missing.push(*h);
             } else {
                 claims.push(DerivedRow::new(BLOB_CLAIM, *h, now.clone()));
@@ -217,13 +269,24 @@ impl Repo {
 
     /// Store an uploaded blob and claim it. Rescues a condemned blob.
     /// Refuses bytes that would take an object's address (ADR 0041).
+    ///
+    /// The claim is written alongside the condemnation read rather than
+    /// after it: both follow the blob write, which is all the rescue needs,
+    /// and the claim only keeps `condemn` from picking the blob, which its
+    /// fresh modification time does anyway until the claim lands.
     pub async fn put_blob(&self, data: Bytes) -> Result<Hash> {
         refuse_object_preimage(&data)?;
         let h = Hash::of_blob(&data);
-        self.put_rescuing(h, data).await?;
-        self.meta()
-            .put_derived(BLOB_CLAIM, &h, time_value(unix_now()))
-            .await?;
+        self.blobs().put_with_hash(h, data.clone()).await?;
+        let (condemned, claimed) = tokio::join!(
+            self.condemned_row(&h),
+            self.meta()
+                .put_derived(BLOB_CLAIM, &h, time_value(unix_now()))
+        );
+        claimed?;
+        if let Some(c) = condemned? {
+            self.rescue(h, data, c).await?;
+        }
         Ok(h)
     }
 
@@ -236,7 +299,7 @@ impl Repo {
         }
         let items: Vec<(Hash, Bytes)> = data.into_iter().map(|d| (Hash::of_blob(&d), d)).collect();
         let hashes: Vec<Hash> = items.iter().map(|(h, _)| *h).collect();
-        self.put_rescuing_many(items).await?;
+        self.put_rescuing_many(items, &[]).await?;
         let now = time_value(unix_now());
         let claims: Vec<DerivedRow> = hashes
             .iter()
@@ -246,28 +309,25 @@ impl Repo {
         Ok(hashes)
     }
 
-    /// Store `data` under `hash` such that GC cannot delete it afterwards
-    /// without the caller noticing. Every server-side write of a blob that a
-    /// changeset may reference goes through here, [`Repo::put_rescuing_many`]
-    /// or [`Repo::put_blob`].
+    /// Store blobs such that GC cannot delete them afterwards without the
+    /// caller noticing. Every server-side write of a blob that a changeset
+    /// may reference goes through here or [`Repo::put_blob`].
     ///
-    /// If the blob is condemned, write the rescue, then read the delete
-    /// handshake: collect writes the handshake and then reads the rescue, so
-    /// either collect abandons the delete or this call sees it and waits.
-    pub(crate) async fn put_rescuing(&self, hash: Hash, data: Bytes) -> Result<()> {
-        self.blobs().put_with_hash(hash, data.clone()).await?;
-        let Some(c) = self.condemned_row(&hash).await? else {
-            return Ok(());
-        };
-        self.rescue(hash, data, c).await
-    }
-
-    /// [`Repo::put_rescuing`] for many blobs. Every blob is written before
-    /// the condemnation rows are read, in one batch, so each blob's write
-    /// still precedes its own check; the rare condemned one is then rescued
-    /// as `put_rescuing` would.
-    pub(crate) async fn put_rescuing_many(&self, items: Vec<(Hash, Bytes)>) -> Result<()> {
-        self.put_rescuing_many_in_flight(items, BLOB_WRITES_IN_FLIGHT)
+    /// Every blob is written before the condemnation rows are read, in one
+    /// batch, so each blob's write precedes its own check. A condemned one
+    /// is rescued: write the rescue, then read the delete handshake; collect
+    /// writes the handshake and then reads the rescue, so either collect
+    /// abandons the delete or this call sees it and waits.
+    ///
+    /// The blobs, and the stored copies of `named`, are then flushed
+    /// ([`leep_core::BlobStore::flush`]) alongside that read, in one call so
+    /// they share a sync wave: callers store something that names them next.
+    pub(crate) async fn put_rescuing_many(
+        &self,
+        items: Vec<(Hash, Bytes)>,
+        named: &[Hash],
+    ) -> Result<()> {
+        self.put_rescuing_many_in_flight(items, BLOB_WRITES_IN_FLIGHT, named)
             .await
     }
 
@@ -276,6 +336,7 @@ impl Repo {
         &self,
         items: Vec<(Hash, Bytes)>,
         in_flight: usize,
+        named: &[Hash],
     ) -> Result<()> {
         for chunk in items.chunks(in_flight.max(1)) {
             let writes: Vec<_> = chunk
@@ -285,7 +346,12 @@ impl Repo {
             try_join_all(writes).await?;
         }
         let hashes: Vec<Hash> = items.iter().map(|(h, _)| *h).collect();
-        let batch = self.meta().get_derived_many(BLOB_CONDEMNED, &hashes).await;
+        let (batch, flushed) = tokio::join!(
+            self.meta().get_derived_many(BLOB_CONDEMNED, &hashes),
+            self.blobs().flush(named)
+        );
+        flushed?;
+        let mut rescued = false;
         for (i, (hash, data)) in items.into_iter().enumerate() {
             let row = match &batch {
                 Ok(rows) => rows[i]
@@ -297,13 +363,18 @@ impl Repo {
             };
             if let Some(c) = row {
                 self.rescue(hash, data, c).await?;
+                rescued = true;
             }
+        }
+        if rescued {
+            // A rescue may have written the blob again.
+            self.blobs().flush(&[]).await?;
         }
         Ok(())
     }
 
-    /// The part of [`Repo::put_rescuing`] after the blob is written and found
-    /// condemned at `c`.
+    /// The part of [`Repo::put_rescuing_many`] after a blob is written and
+    /// found condemned at `c`.
     async fn rescue(&self, hash: Hash, data: Bytes, c: i64) -> Result<()> {
         self.meta()
             .put_derived(BLOB_RESCUE, &hash, time_value(c))
@@ -2049,7 +2120,9 @@ mod tests {
                         r.put_blob(Bytes::from(n)).await.unwrap();
                     }
                     1 => {
-                        r.missing_blobs(&[h]).await.unwrap();
+                        // Several hashes, so the batched checks race GC too.
+                        let other = Hash::of_blob(names[rng.below(names.len())].as_bytes());
+                        r.missing_blobs(&[h, other]).await.unwrap();
                     }
                     2 => {
                         // Begin a commit: the check passes now, the store comes later.
@@ -2082,7 +2155,9 @@ mod tests {
                         r.put_blob(Bytes::from(n)).await.unwrap();
                     }
                     1 => {
-                        r.missing_blobs(&[h]).await.unwrap();
+                        // Several hashes, so the batched checks race GC too.
+                        let other = Hash::of_blob(names[rng.below(names.len())].as_bytes());
+                        r.missing_blobs(&[h, other]).await.unwrap();
                     }
                     2 => {
                         let cs = client_commit(h, n.len() as u64, &format!("r{paths}"));
@@ -2393,5 +2468,247 @@ mod tests {
         let before = read_everything(&r).await;
         gc_at(&r, 1, false, t + 10).await;
         assert_eq!(read_everything(&r).await, before, "seed {seed}");
+    }
+
+    /// Every fence, existence and claim access of one `missing_blobs` call,
+    /// numbered in the order they happened.
+    #[derive(Default)]
+    struct Log {
+        next: std::sync::atomic::AtomicU64,
+        /// (hash, what, seq): "fence" when a fence read returned, "exists" and
+        /// "exists_done" when an existence check started and returned,
+        /// "claim" when a claim write started.
+        events: Mutex<Vec<(Hash, &'static str, u64)>>,
+        /// Fail the batched condemnation read containing this hash.
+        fail_batch_with: Mutex<Option<Hash>>,
+    }
+
+    impl Log {
+        fn record(&self, keys: &[Hash], what: &'static str) {
+            let seq = self.next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut e = self.events.lock().unwrap();
+            e.extend(keys.iter().map(|k| (*k, what, seq)));
+        }
+    }
+
+    struct LoggedBlobs {
+        inner: MemoryBlobStore,
+        log: Arc<Log>,
+    }
+
+    #[async_trait]
+    impl BlobStore for LoggedBlobs {
+        async fn put_with_hash(&self, hash: Hash, data: Bytes) -> Result<()> {
+            self.inner.put_with_hash(hash, data).await
+        }
+        async fn get(&self, hash: &Hash) -> Result<Option<Bytes>> {
+            self.inner.get(hash).await
+        }
+        async fn contains(&self, hash: &Hash) -> Result<bool> {
+            self.log.record(&[*hash], "exists");
+            tokio::task::yield_now().await;
+            let r = self.inner.contains(hash).await;
+            self.log.record(&[*hash], "exists_done");
+            r
+        }
+        async fn contains_many(&self, hashes: &[Hash]) -> Result<Vec<bool>> {
+            self.log.record(hashes, "exists");
+            let r = self.inner.contains_many(hashes).await;
+            self.log.record(hashes, "exists_done");
+            r
+        }
+        async fn list_page(&self, after: Option<Hash>, limit: usize) -> Result<Vec<BlobMeta>> {
+            self.inner.list_page(after, limit).await
+        }
+        async fn delete(&self, hash: &Hash) -> Result<()> {
+            self.inner.delete(hash).await
+        }
+    }
+
+    struct LoggedMeta {
+        inner: MemoryMetaStore,
+        log: Arc<Log>,
+    }
+
+    fn fence_kind(kind: &str) -> bool {
+        kind == BLOB_CONDEMNED || kind == BLOB_RESCUE || kind == BLOB_DOOM
+    }
+
+    #[async_trait]
+    impl MetaStore for LoggedMeta {
+        async fn put_changeset(&self, cs: &Changeset) -> Result<ChangesetId> {
+            self.inner.put_changeset(cs).await
+        }
+        async fn get_changeset(&self, id: &ChangesetId) -> Result<Option<Changeset>> {
+            self.inner.get_changeset(id).await
+        }
+        async fn list_changesets(
+            &self,
+            after: Option<ChangesetId>,
+            limit: usize,
+        ) -> Result<Vec<ChangesetId>> {
+            self.inner.list_changesets(after, limit).await
+        }
+        async fn get_ref(&self, name: &str) -> Result<Option<ChangesetId>> {
+            self.inner.get_ref(name).await
+        }
+        async fn cas_ref_logged(
+            &self,
+            name: &str,
+            expected: Option<ChangesetId>,
+            new: Option<ChangesetId>,
+            ctx: &leep_core::RefUpdateContext,
+        ) -> Result<bool> {
+            self.inner.cas_ref_logged(name, expected, new, ctx).await
+        }
+        async fn ref_log(
+            &self,
+            name: Option<&str>,
+            before_seq: Option<u64>,
+            limit: usize,
+        ) -> Result<Vec<leep_core::RefLogEntry>> {
+            self.inner.ref_log(name, before_seq, limit).await
+        }
+        async fn list_refs(&self) -> Result<BTreeMap<String, ChangesetId>> {
+            self.inner.list_refs().await
+        }
+        async fn get_derived(&self, kind: &str, key: &Hash) -> Result<Option<Bytes>> {
+            // Suspend so the concurrent single reads interleave.
+            tokio::task::yield_now().await;
+            let r = self.inner.get_derived(kind, key).await;
+            if fence_kind(kind) {
+                self.log.record(&[*key], "fence");
+            }
+            r
+        }
+        async fn get_derived_many(&self, kind: &str, keys: &[Hash]) -> Result<Vec<Option<Bytes>>> {
+            let fail = *self.log.fail_batch_with.lock().unwrap();
+            if kind == BLOB_CONDEMNED && fail.is_some_and(|f| keys.contains(&f)) {
+                return Err(Error::Storage("injected".into()));
+            }
+            let r = self.inner.get_derived_many(kind, keys).await;
+            if fence_kind(kind) {
+                self.log.record(keys, "fence");
+            }
+            r
+        }
+        async fn put_derived(&self, kind: &str, key: &Hash, value: Bytes) -> Result<()> {
+            if kind == BLOB_CLAIM {
+                self.log.record(&[*key], "claim");
+            }
+            self.inner.put_derived(kind, key, value).await
+        }
+        async fn put_derived_many(&self, rows: &[DerivedRow]) -> Result<()> {
+            for r in rows.iter().filter(|r| r.kind == BLOB_CLAIM) {
+                self.log.record(&[r.key], "claim");
+            }
+            self.inner.put_derived_many(rows).await
+        }
+    }
+
+    /// `missing_blobs` checks hashes in batches and concurrently, but for each
+    /// hash still reads its whole fence before its existence, and both before
+    /// its claim (ADR 0012); its answers match what one-at-a-time checks
+    /// give, with batched reads failing or not.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn batched_missing_blobs_keeps_the_order_per_hash() {
+        for fail in [false, true] {
+            let log = Arc::new(Log::default());
+            let r = Repo::new(
+                Arc::new(LoggedBlobs {
+                    inner: MemoryBlobStore::new(),
+                    log: log.clone(),
+                }),
+                Arc::new(LoggedMeta {
+                    inner: MemoryMetaStore::new(),
+                    log: log.clone(),
+                }),
+            );
+            let n = CONDEMNED_READ_CHUNK * 2 + 300;
+            let mut hashes = Vec::with_capacity(n);
+            let mut expect_missing = Vec::new();
+            let t = now();
+            for i in 0..n {
+                let data = Bytes::from(format!("blob {i}"));
+                let h = Hash::of_blob(&data);
+                hashes.push(h);
+                match i % 7 {
+                    // Absent.
+                    0 => expect_missing.push(h),
+                    // Present and condemned.
+                    1 => {
+                        r.blobs().put(data).await.unwrap();
+                        r.meta()
+                            .put_derived(BLOB_CONDEMNED, &h, time_value(t))
+                            .await
+                            .unwrap();
+                        expect_missing.push(h);
+                    }
+                    // Present, condemned, then rescued.
+                    2 => {
+                        r.blobs().put(data).await.unwrap();
+                        r.meta()
+                            .put_derived(BLOB_CONDEMNED, &h, time_value(t))
+                            .await
+                            .unwrap();
+                        r.meta()
+                            .put_derived(BLOB_RESCUE, &h, time_value(t))
+                            .await
+                            .unwrap();
+                    }
+                    // Present, with a delete announced.
+                    3 => {
+                        r.blobs().put(data).await.unwrap();
+                        for (kind, v) in [
+                            (BLOB_CONDEMNED, time_value(t)),
+                            (BLOB_RESCUE, time_value(t)),
+                            (BLOB_DOOM, doom_value(t + 1, Doom::Deleting)),
+                        ] {
+                            r.meta().put_derived(kind, &h, v).await.unwrap();
+                        }
+                        r.meta()
+                            .put_derived(BLOB_CONDEMNED, &h, time_value(t + 1))
+                            .await
+                            .unwrap();
+                        expect_missing.push(h);
+                    }
+                    // Present.
+                    _ => {
+                        r.blobs().put(data).await.unwrap();
+                    }
+                }
+            }
+            if fail {
+                *log.fail_batch_with.lock().unwrap() = Some(hashes[CONDEMNED_READ_CHUNK + 5]);
+            }
+            log.events.lock().unwrap().clear();
+            let missing = r.missing_blobs(&hashes).await.unwrap();
+            assert_eq!(missing, expect_missing, "fail={fail}");
+
+            let events = log.events.lock().unwrap();
+            let mut by_hash: std::collections::HashMap<Hash, Vec<(&str, u64)>> =
+                std::collections::HashMap::new();
+            for (h, what, seq) in events.iter() {
+                by_hash.entry(*h).or_default().push((what, *seq));
+            }
+            let missing: HashSet<Hash> = missing.into_iter().collect();
+            for h in &hashes {
+                let ev = &by_hash[h];
+                let last = |w: &str| ev.iter().filter(|e| e.0 == w).map(|e| e.1).max();
+                let first = |w: &str| ev.iter().filter(|e| e.0 == w).map(|e| e.1).min();
+                let fence = last("fence").expect("every hash's fence is read");
+                if let Some(exists) = first("exists") {
+                    assert!(fence < exists, "fence before existence for {h}");
+                }
+                match first("claim") {
+                    Some(claim) => {
+                        assert!(!missing.contains(h), "a missing blob is not claimed");
+                        let exists = last("exists_done").expect("claimed after an existence check");
+                        assert!(exists < claim, "existence before claim for {h}");
+                    }
+                    None => assert!(missing.contains(h), "a present blob is claimed: {h}"),
+                }
+            }
+        }
     }
 }

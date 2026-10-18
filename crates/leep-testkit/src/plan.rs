@@ -16,6 +16,8 @@ pub enum Op {
     Contains,
     ListPage,
     Delete,
+    /// [`leep_core::BlobStore::flush`]: making earlier puts durable.
+    Flush,
     // MetaStore
     PutChangeset,
     GetChangeset,
@@ -51,7 +53,14 @@ impl Op {
     }
 
     /// Every blob store call.
-    pub const BLOB: &'static [Op] = &[Op::Put, Op::Get, Op::Contains, Op::ListPage, Op::Delete];
+    pub const BLOB: &'static [Op] = &[
+        Op::Put,
+        Op::Get,
+        Op::Contains,
+        Op::ListPage,
+        Op::Delete,
+        Op::Flush,
+    ];
     /// Every meta store call.
     pub const META: &'static [Op] = &[
         Op::PutChangeset,

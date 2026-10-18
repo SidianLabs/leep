@@ -47,6 +47,18 @@ impl BlobStore for FaultyBlobStore {
             .await
     }
 
+    async fn contains_many(&self, hashes: &[Hash]) -> Result<Vec<bool>> {
+        self.plan
+            .run(Op::Contains, self.inner.contains_many(hashes), |_, v| v)
+            .await
+    }
+
+    async fn flush(&self, named: &[Hash]) -> Result<()> {
+        self.plan
+            .run(Op::Flush, self.inner.flush(named), |_, v| v)
+            .await
+    }
+
     async fn list_page(&self, after: Option<Hash>, limit: usize) -> Result<Vec<BlobMeta>> {
         self.plan
             .run(Op::ListPage, self.inner.list_page(after, limit), |_, v| v)

@@ -34,6 +34,8 @@ pub mod warm;
 #[cfg(test)]
 mod fault_tests;
 #[cfg(test)]
+mod flush_tests;
+#[cfg(test)]
 mod land_batch_tests;
 #[cfg(test)]
 mod tests;

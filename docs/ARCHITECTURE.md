@@ -345,8 +345,8 @@ loop (≤32 attempts):
       move to replayed top
     a move sets head; answers that precede every move are sent at once
   no moves → done (staging dropped)
-  store staging: blobs (one wave, GC rescue check), then changesets and rows
-                 (one atomic write); an error counts as a CAS error below
+  store staging: blobs (one wave, GC rescue check, flush), then changesets
+                 and rows (one atomic write); an error counts as a CAS error below
   CAS(start → head) logging one entry per move (cas_ref_logged_chain)
   CAS won → every land gets its answer;  CAS lost → jittered backoff, redo batch
   CAS errored → it may have applied: the next pass re-reads the head and
@@ -582,6 +582,16 @@ misses and occupancy as Prometheus metrics (see [OPERATIONS.md](OPERATIONS.md)).
   `(kind, key)` order, so two batches that share rows (claims for the same
   blob from two uploads) queue on each other's row locks instead of
   deadlocking (ADR 0031).
+- Durability follows references: a changeset is stored only after every blob
+  it names survives power loss. `BlobStore::flush(named)` makes a store's
+  recent writes and the named blobs durable; tree writes flush together with
+  the contents their changeset names, and a land batch flushes before its
+  metadata write. The filesystem store defers its directory fsyncs to the
+  flush and coalesces concurrent flushes into shared waves, so an upload is
+  answered before its directory is synced (ADR 0044).
+  `POST /v1/blobs/missing` checks fences, then existence
+  (`BlobStore::contains_many`), then claims, each phase for all hashes in
+  batches.
 - A blob may be orphaned if a client uploads it and never commits, and tree
   nodes or merge blobs may be orphaned if the changeset that would reference
   them fails to store. `leep-server gc` reclaims them in two fenced phases:
@@ -630,7 +640,7 @@ except where noted.
 | `MemoryMetaStore`, `MemoryBlobStore` | One call, under a lock; a ref and its log entry share the lock | Not durable | Cannot happen |
 | SQLite (WAL, synchronous FULL) | One transaction per call; `cas_ref_logged` changes the ref and appends its log entry in one | The open transaction rolls back (the next writer sees nothing of it); a committed one is durable | Only when the error is raised while `COMMIT` is in flight; the caller must treat any `cas_ref` error as unknown |
 | Postgres | Same, one transaction per call, plus an advisory lock for log order | The server drops the connection, Postgres rolls the transaction back; committed work stays | Connection lost after `COMMIT` was sent: the commit may have applied |
-| Filesystem blobs | Write a temp file, fsync it, rename it into place, fsync the shard directory (and the root when the shard is new) | A blob is never visible partly written; a crash before the rename leaves a `.tmp-*` file that is never listed, read or counted as the blob and never removed (safe to delete when older than the request timeout). | A put that errors after the rename leaves a whole blob; repeating it is a no-op |
+| Filesystem blobs | Write a temp file, fsync it, rename it into place. The shard directory (and the root, for a shard this process has not synced it for) is synced by the next `flush`, which every changeset write and backup runs first, naming the contents it references (ADR 0044) | A blob is never visible partly written; a crash before the rename leaves a `.tmp-*` file that is never listed, read or counted as the blob and never removed (safe to delete when older than the request timeout). A power loss can drop a blob whose put was answered but that no stored changeset names yet; never one a stored changeset names | A put that errors after the rename leaves a whole blob; repeating it is a no-op |
 | Filesystem packs | A pack is published by renaming its fsynced index into place after its fsynced pack file, fsyncing `packs/` after each; a delete of a packed object is one fsynced tombstone line | Nothing partial is ever read: an unpublished pack has no index, and a torn tombstone line is ignored, then cut off under the lock by the next append so it cannot swallow that append's first line. Loose copies and replaced packs are deleted only after the fence, so a reader that listed the old layout still finds every object | A delete that errors after its tombstone was written has deleted; repeating it is a no-op |
 | Object store (S3) | One PUT | No partial objects | Same as above |
 | Object store packs | A pack is published by uploading its index after the complete pack (a multipart upload is invisible until completed); a delete of a packed object is one tombstone object per pack | Nothing partial is ever read. Loose copies and replaced packs are deleted only after the fence, and readers list `packs/` again on a miss or a missing pack | A delete that errors after its tombstones were written has deleted; repeating it is a no-op |

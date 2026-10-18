@@ -102,6 +102,10 @@ pub struct BlobMeta {
     pub modified: Option<i64>,
 }
 
+/// How many `contains` calls the default [`BlobStore::contains_many`] keeps
+/// in flight.
+pub const CONTAINS_IN_FLIGHT: usize = 64;
+
 /// Immutable content-addressed bytes: file contents and tree nodes.
 #[async_trait]
 pub trait BlobStore: Send + Sync + 'static {
@@ -120,6 +124,35 @@ pub trait BlobStore: Send + Sync + 'static {
 
     async fn contains(&self, hash: &Hash) -> Result<bool> {
         Ok(self.get(hash).await?.is_some())
+    }
+
+    /// [`contains`](Self::contains) for many hashes, answered in order and
+    /// each as exactly. The default asks [`CONTAINS_IN_FLIGHT`] at a time;
+    /// backends that can answer a batch more cheaply override it.
+    async fn contains_many(&self, hashes: &[Hash]) -> Result<Vec<bool>> {
+        let mut out = Vec::with_capacity(hashes.len());
+        for chunk in hashes.chunks(CONTAINS_IN_FLIGHT) {
+            let mut asks = Vec::with_capacity(chunk.len());
+            for h in chunk {
+                asks.push(self.contains(h));
+            }
+            out.extend(futures_util::future::try_join_all(asks).await?);
+        }
+        Ok(out)
+    }
+
+    /// Make durable, before returning, every blob this store has written, or
+    /// found already stored, since the last flush, and the stored copies of
+    /// `named`. A backend may acknowledge a put before the blob would survive
+    /// a power loss (the filesystem store defers its directory syncs, ADR
+    /// 0044); callers flush before acknowledging anything that depends on
+    /// those blobs, such as storing a changeset that names them or sealing a
+    /// backup. `named` covers blobs another process, or this one before a
+    /// restart, wrote. The default does nothing, for backends whose puts are
+    /// durable when they return.
+    async fn flush(&self, named: &[Hash]) -> Result<()> {
+        let _ = named;
+        Ok(())
     }
 
     /// Up to `limit` blobs with hash strictly greater than `after`, in
