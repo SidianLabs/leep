@@ -394,6 +394,19 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   the upgrade (or `repair rederive --kind history-tree-v3` does), and `repair
   drop --kind history-tree-v2` removes the old rows once no older server is
   running.
+- The path-history index stores the nodes each changeset's derivation writes
+  in one pack (ADR 0045): one row per changeset (its `history-tree-v4` value)
+  unless the pack passes 16 KB, nodes addressed by (changeset, part, index),
+  changeset ids as indices into a table per part, patches naming the entries
+  they replace by position, front-coded names, and zstd. On Linux to v2.6.16
+  the index fell from 210 MB in 311,439 rows to 34.6 MB in 22,774 (6.1x;
+  200 MB to 43 MB in Postgres after `VACUUM FULL`), and on a synthetic
+  late-Linux history from 15.2 KB to 2.6 KB per changeset, with
+  byte-identical `log`, `last-change` and `blame` answers, unchanged query
+  latency and derivation at least as fast. The derived kinds are now
+  `history-tree-v4` and `history-node-v4`: rederive with `repair rederive
+  --kind history-tree-v4` before switching servers, then `repair drop --kind
+  history-tree-v3` (OPERATIONS.md, "Upgrading").
 - `leep-server repack` packs a filesystem blob store (ADR 0029): every live
   blob and tree node goes into one pack, each file version a zstd delta
   against the previous version at its path and each tree node against the

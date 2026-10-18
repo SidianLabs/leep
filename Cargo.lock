@@ -2381,6 +2381,7 @@ dependencies = [
  "similar",
  "tokio",
  "tracing",
+ "zstd",
 ]
 
 [[package]]
@@ -2488,6 +2489,7 @@ dependencies = [
  "leep-testkit",
  "metrics",
  "metrics-exporter-prometheus",
+ "postcard",
  "reqwest",
  "serde",
  "serde_json",
@@ -2498,6 +2500,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "zstd",
 ]
 
 [[package]]

@@ -11,7 +11,10 @@ use std::collections::BTreeMap;
 use leep_core::review::{Review, Verdict};
 use leep_core::signature::{format_public_key, key_id, Signature};
 use leep_core::{Changeset, FileChange, FileKind, Hash, RepoPath, TreeEntry, TreeNode};
-use leep_derive::derived::{ChunkRef, HistoryEntry, HistoryNode, SplitChange, StoredHistoryNode};
+use leep_derive::derived::history_pack::PackBuilder;
+use leep_derive::derived::{
+    ChunkRef, HistoryEntry, HistoryNode, NodeRef, SplitChange, StoredHistoryNode,
+};
 use leep_derive::search::trigram::{extract, BlobRow, Bloom};
 use serde_json::json;
 
@@ -141,6 +144,17 @@ fn objects(out: &mut Out) {
     out.add("tree_node", "mixed", tree.encode());
     out.add("tree_node", "empty", TreeNode::default().encode());
 
+    // History packs: one node each, as a derivation writes them.
+    let pack = |node: StoredHistoryNode, key: Option<StoredHistoryNode>| {
+        let mut b = PackBuilder::new(id(9));
+        let at = b.stage(node, key.map(std::sync::Arc::new));
+        b.finish(at).value.to_vec()
+    };
+    let elsewhere = NodeRef {
+        cs: id(3),
+        part: 2,
+        idx: 1,
+    };
     let mut hist = HistoryNode::default();
     hist.entries.insert(
         "a".into(),
@@ -152,42 +166,64 @@ fn objects(out: &mut Out) {
         "d".into(),
         HistoryEntry::Tree {
             changed: vec![id(1), id(2)],
-            node: HistoryNode::empty_hash(),
+            node: elsewhere,
         },
     );
     out.add(
         "history_node",
         "leaf-and-tree",
-        StoredHistoryNode::Flat(hist.clone()).encode(),
+        pack(StoredHistoryNode::Flat(hist.clone()), None),
+    );
+    let mut wider = hist.clone();
+    wider.entries.insert(
+        "b".into(),
+        HistoryEntry::Leaf {
+            changed: vec![id(9)],
+        },
     );
     let patch = StoredHistoryNode::Patch {
-        base: HistoryNode::empty_hash(),
-        over: hist,
+        base: elsewhere,
+        over: HistoryNode {
+            entries: wider
+                .entries
+                .iter()
+                .filter(|(n, _)| n.as_str() != "d")
+                .map(|(n, e)| (n.clone(), e.clone()))
+                .collect(),
+        },
     };
-    out.add("history_node", "patch", patch.encode());
+    out.add(
+        "history_node",
+        "patch",
+        pack(patch, Some(StoredHistoryNode::Flat(hist))),
+    );
     out.add(
         "history_node",
         "empty",
-        StoredHistoryNode::Flat(HistoryNode::default()).encode(),
+        pack(StoredHistoryNode::Flat(HistoryNode::default()), None),
     );
-    let split = StoredHistoryNode::Split(vec![
+    let refs = vec![
         ChunkRef {
             first: "a".into(),
-            node: HistoryNode::empty_hash(),
+            node: elsewhere,
         },
         ChunkRef {
             first: "m".into(),
-            node: HistoryNode::empty_hash(),
+            node: elsewhere,
         },
-    ]);
-    out.add("history_node", "split", split.encode());
+    ];
+    out.add(
+        "history_node",
+        "split",
+        pack(StoredHistoryNode::Split(refs.clone()), None),
+    );
     let split_patch = StoredHistoryNode::SplitPatch {
-        base: HistoryNode::empty_hash(),
+        base: elsewhere,
         refs: [
             (
                 "a".to_string(),
                 Some(SplitChange {
-                    node: HistoryNode::empty_hash(),
+                    node: elsewhere,
                     next: Some("m".into()),
                 }),
             ),
@@ -195,7 +231,11 @@ fn objects(out: &mut Out) {
         ]
         .into(),
     };
-    out.add("history_node", "split-patch", split_patch.encode());
+    out.add(
+        "history_node",
+        "split-patch",
+        pack(split_patch, Some(StoredHistoryNode::Split(refs))),
+    );
 
     let pk = [7u8; 32];
     let sig = Signature {

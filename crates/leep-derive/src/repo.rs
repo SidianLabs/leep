@@ -13,7 +13,9 @@ use leep_core::{
 };
 
 use crate::derived::{
-    self, DerivedKind, Generation, RootTree, SkipEntry, Skiplist, StoredHistoryNode,
+    self,
+    history_pack::{Part, RawNode},
+    DerivedKind, Generation, NodeRef, RootTree, SkipEntry, Skiplist, StoredHistoryNode,
 };
 use crate::signatures::{LandPolicy, PolicySet};
 use crate::tree_ops::{apply_changes, TreeView};
@@ -74,11 +76,21 @@ pub struct Repo {
     pub(crate) land_policy: Option<Arc<dyn LandPolicy>>,
     /// Parents and generations of changesets seen by history walks.
     pub(crate) ancestry: Arc<AncestryCache>,
-    /// Decoded path-history rows (see `read_history_row`).
+    /// Decoded path-history nodes, keyed by `NodeRef::cache_key` (see
+    /// `read_history_row`).
     pub(crate) history_rows: Arc<HistoryRowCache>,
-    /// History rows a derivation computed but has not stored yet (see
-    /// `stage_history_rows`).
-    pub(crate) history_staged: Arc<Mutex<HashMap<Hash, Arc<StoredHistoryNode>>>>,
+    /// Decoded patches that still name their keyframe's entries by
+    /// position: a node evicted from `history_rows` is named again from here
+    /// without decoding its part.
+    pub(crate) history_raw: Arc<HistoryRawCache>,
+    /// Nodes of packs derived but not yet stored (see `stage_history_pack`).
+    pub(crate) history_staged: Arc<Mutex<StagedNodes>>,
+    /// Parts of packs read, by row key, whose nodes are decoded when asked
+    /// for (see `read_history_row`).
+    pub(crate) history_parts: Arc<HistoryPartCache>,
+    /// The root history node of changesets whose pack was read, by id: a
+    /// path lookup at a changeset would otherwise read its value each time.
+    pub(crate) history_roots: Arc<HistoryRootCache>,
     /// Tree nodes viewed for lookups (see `read_tree_view`).
     pub(crate) trees: Arc<TreeCache>,
     /// Skiplists computed, or read while creating changesets (see
@@ -241,13 +253,40 @@ impl SkiplistMaps {
     }
 }
 
-/// Decoded `history-node-v3` rows by hash, as stored. A split node is read
-/// one row per chunk, a patch with its keyframe, and derivation reads the
-/// same root and directory nodes for every changeset, so without this each
-/// changeset would re-read and re-decode dozens of rows. Rows are content
-/// addressed and checked against their hash before they are cached, so
-/// entries never go stale.
+/// Decoded path-history nodes (ADR 0045), patches with their entries named.
+/// A split node is read one chunk at a time, a patch with its keyframe, and
+/// derivation reads the same root and directory nodes for every changeset,
+/// so without this each changeset would re-read and re-decode dozens of
+/// parts. A pack is a function of its changeset and parts are checked
+/// against their checksum before they are cached, so entries never go stale.
 pub(crate) type HistoryRowCache = SizedCache<StoredHistoryNode, HISTORY_CACHE_BYTES>;
+
+/// Decoded patches waiting for their keyframe (see `Repo::history_raw`).
+pub(crate) type HistoryRawCache = SizedCache<RawNode, HISTORY_RAW_CACHE_BYTES>;
+
+/// Bytes [`HistoryRawCache`] may hold.
+const HISTORY_RAW_CACHE_BYTES: usize = 16 << 20;
+
+/// Parts of packs as read (see `Repo::history_parts`).
+pub(crate) type HistoryPartCache = SizedCache<Part, HISTORY_PART_CACHE_BYTES>;
+
+/// Root nodes by changeset (see `Repo::history_roots`).
+pub(crate) type HistoryRootCache = SizedCache<NodeRef, HISTORY_ROOT_CACHE_BYTES>;
+
+/// Bytes [`HistoryPartCache`] may hold: parts uncompressed, each at most
+/// 16 KB, so a few thousand.
+const HISTORY_PART_CACHE_BYTES: usize = 32 << 20;
+
+/// Bytes [`HistoryRootCache`] may hold, at 64 per root: about 65,000 roots.
+const HISTORY_ROOT_CACHE_BYTES: usize = 4 << 20;
+
+/// Nodes of staged packs by cache key, and the keys of each part's nodes by
+/// the part's row key, to forget them once the part is stored.
+#[derive(Default)]
+pub(crate) struct StagedNodes {
+    pub(crate) nodes: HashMap<Hash, Arc<StoredHistoryNode>>,
+    pub(crate) by_row: HashMap<Hash, Vec<Hash>>,
+}
 
 /// Tree nodes by hash, viewed for lookups, for path-history derivation: each
 /// changeset reads the directories its parent's derivation just read (the
@@ -279,9 +318,10 @@ struct SizedMaps<V> {
     old: HashMap<Hash, (Arc<V>, usize), ByKey>,
 }
 
-/// Bytes the history row cache may hold, counting each row at twice its
-/// encoded size (about its decoded size).
-const HISTORY_CACHE_BYTES: usize = 64 << 20;
+/// Bytes the history row cache may hold, counting each node at about its
+/// decoded size (`history_pack::cache_size`). v3 counted rows at twice their
+/// encoded size under 64 MiB, which undercounted decoded rows by about 1.7x.
+const HISTORY_CACHE_BYTES: usize = 96 << 20;
 
 /// Bytes the tree cache may hold, counted like [`HISTORY_CACHE_BYTES`].
 const TREE_CACHE_BYTES: usize = 32 << 20;
@@ -326,7 +366,10 @@ impl Repo {
             land_policy: None,
             ancestry: Arc::default(),
             history_rows: Arc::default(),
+            history_raw: Arc::default(),
             history_staged: Arc::default(),
+            history_parts: Arc::default(),
+            history_roots: Arc::default(),
             trees: Arc::default(),
             skiplists: Arc::default(),
             log_filter: Arc::default(),

@@ -104,7 +104,8 @@ static KINDS: &[KindInfo] = &[
     KindInfo {
         name: HistoryTree::NAME,
         class: KindClass::PerChangeset,
-        summary: "root of the path-history index (rewriting also restores history nodes)",
+        summary: "pack of path-history nodes naming the index's root (rewriting also \
+                  restores the pack's other parts)",
         rederive: Rederive::Yes,
         drop: DropPolicy::Allowed {
             also: &[HISTORY_NODE_KIND],
@@ -146,10 +147,10 @@ static KINDS: &[KindInfo] = &[
     KindInfo {
         name: HISTORY_NODE_KIND,
         class: KindClass::Content,
-        summary: "content-addressed node of the path-history index",
-        rederive: Rederive::No("rewritten by `rederive --kind history-tree-v3`"),
+        summary: "part of a changeset's pack of path-history nodes, after the first",
+        rederive: Rederive::No("rewritten by `rederive --kind history-tree-v4`"),
         drop: DropPolicy::Refused(
-            "history-tree-v3 rows point at these nodes; drop history-tree-v3, which removes both",
+            "history-tree-v4 rows point at these parts; drop history-tree-v4, which removes both",
         ),
     },
     KindInfo {
@@ -243,7 +244,7 @@ static RETIRED: &[KindInfo] = &[
         class: KindClass::PerChangeset,
         summary: "path-history roots of the whole-node encoding, replaced by history-tree-v2 \
                   (ADR 0027) and then history-tree-v3 (ADR 0037)",
-        rederive: Rederive::No("retired; this version derives history-tree-v3 instead"),
+        rederive: Rederive::No("retired; this version derives history-tree-v4 instead"),
         drop: DropPolicy::Allowed {
             also: &["history-node-v1"],
         },
@@ -252,7 +253,7 @@ static RETIRED: &[KindInfo] = &[
         name: "history-node-v1",
         class: KindClass::Content,
         summary: "whole path-history nodes, replaced by history-node-v2 (ADR 0027)",
-        rederive: Rederive::No("retired; this version derives history-tree-v3 instead"),
+        rederive: Rederive::No("retired; this version derives history-tree-v4 instead"),
         drop: DropPolicy::Refused(
             "history-tree-v1 rows point at these nodes; drop history-tree-v1, which removes both",
         ),
@@ -262,7 +263,7 @@ static RETIRED: &[KindInfo] = &[
         class: KindClass::PerChangeset,
         summary: "path-history roots of the chunked encoding without patches, replaced by \
                   history-tree-v3 (ADR 0037)",
-        rederive: Rederive::No("retired; this version derives history-tree-v3 instead"),
+        rederive: Rederive::No("retired; this version derives history-tree-v4 instead"),
         drop: DropPolicy::Allowed {
             also: &["history-node-v2"],
         },
@@ -272,9 +273,29 @@ static RETIRED: &[KindInfo] = &[
         class: KindClass::Content,
         summary: "chunked path-history nodes without patches, replaced by history-node-v3 \
                   (ADR 0037)",
-        rederive: Rederive::No("retired; this version derives history-tree-v3 instead"),
+        rederive: Rederive::No("retired; this version derives history-tree-v4 instead"),
         drop: DropPolicy::Refused(
             "history-tree-v2 rows point at these nodes; drop history-tree-v2, which removes both",
+        ),
+    },
+    KindInfo {
+        name: "history-tree-v3",
+        class: KindClass::PerChangeset,
+        summary: "path-history roots of the content-addressed encoding, one row per node, \
+                  replaced by history-tree-v4 packs (ADR 0045)",
+        rederive: Rederive::No("retired; this version derives history-tree-v4 instead"),
+        drop: DropPolicy::Allowed {
+            also: &["history-node-v3"],
+        },
+    },
+    KindInfo {
+        name: "history-node-v3",
+        class: KindClass::Content,
+        summary: "content-addressed path-history nodes, chunks and patches, replaced by \
+                  history-node-v4 packs (ADR 0045)",
+        rederive: Rederive::No("retired; this version derives history-tree-v4 instead"),
+        drop: DropPolicy::Refused(
+            "history-tree-v3 rows point at these nodes; drop history-tree-v3, which removes both",
         ),
     },
 ];
@@ -419,6 +440,16 @@ mod tests {
         assert!(check_droppable("history-node-v2").is_err());
         assert!(check_rederivable("history-tree-v2").is_err());
         assert!(lookup("history-tree-v2").is_none());
-        assert_eq!(HistoryTree::NAME, "history-tree-v3");
+        let v3 = check_droppable("history-tree-v3").unwrap();
+        assert_eq!(
+            v3.drop,
+            DropPolicy::Allowed {
+                also: &["history-node-v3"]
+            }
+        );
+        assert!(check_droppable("history-node-v3").is_err());
+        assert!(check_rederivable("history-tree-v3").is_err());
+        assert!(lookup("history-tree-v3").is_none());
+        assert_eq!(HistoryTree::NAME, "history-tree-v4");
     }
 }

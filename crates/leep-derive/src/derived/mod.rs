@@ -4,6 +4,7 @@
 //! oldest-first and caches each under `(kind, changeset id)` in the `MetaStore`.
 
 mod generation;
+pub mod history_pack;
 mod history_tree;
 mod last_merge;
 mod log_filter;
@@ -21,8 +22,9 @@ use crate::Repo;
 
 pub use generation::Generation;
 pub use history_tree::{
-    chunk_ranges, flat_row, split_row, ChunkRef, HistoryEntry, HistoryNode, HistoryRow,
-    HistoryTree, ResolvedRow, SplitChange, StoredHistoryNode, NODE_KIND as HISTORY_NODE_KIND,
+    chunk_ranges, flat_row, split_row, worth_patching, ChunkRef, HistoryEntry, HistoryNode,
+    HistoryTree, NodeRef, ResolvedRow, Row, SplitChange, StoredHistoryNode,
+    NODE_KIND as HISTORY_NODE_KIND,
 };
 pub(crate) use history_tree::{ends_chunk, run_ranges, FLAT_MAX};
 pub use last_merge::LastMerge;

@@ -1587,6 +1587,117 @@ after; other `derive_history`, `merge_base`, `log_path` and `last_change`
 cases unchanged within noise (`wide_merges_300_changesets` 131 ms and
 137 ms, `1000_changesets` 39 ms and 34 ms).
 
+### Index size: packs (ADR 0045)
+
+**The problem.** With the index complete on all of Linux, `history-node-v3`
+held 25,426,370 rows and 24 GB of values (about 17 rows and 16 KB per
+changeset) in a 27 GB database, against 3.8 GB for git's repository.
+
+**What the bytes were.** `history_profile --breakdown-v3` attributes every
+row to the changeset whose derivation wrote it. On the v2.6.16 slice (local
+Postgres 16) and the synthetic late-Linux history (`--synth 20000 --old-base
+15000`, in memory):
+
+| | v2.6.16 slice | Synthetic |
+|---|---|---|
+| Node rows, value bytes | 290,330, 209.8 MB | 540,706, 300.8 MB |
+| Per changeset | 13.8 rows, 9.9 KB | 27.3 rows, 15.2 KB |
+| Merges | 1,522: 121 rows, 115 KB each; 83.5% of bytes | 1,930: 187 rows, 125 KB each; 80.4% |
+| Other changesets | 5.4 rows, 1.8 KB | 10.1 rows, 3.3 KB |
+| Bytes per changeset, p50 / p99 / max | 1.3 KB / 188 KB / 1.96 MB | 2.9 KB / 474 KB / 1.35 MB |
+| Ids in `changed` / names / child addresses | 72.0% / 12.5% / 7.6% | 61.9% / 9.5% / 7.3% |
+| Chunk-list addresses and names / patch bases / tags and lengths | 2.2% / 2.9% / 2.8% | 13.8% / 4.6% / 2.9% |
+| Ids a merge's rows hold, distinct ids among them | 2,748, 47 | 2,570, 63 |
+| Directories a changeset writes: merges / others | 124 / 4.5 | 115 / 7.5 |
+| Keyframes (whole nodes, chunks, lists) | 77.7% of bytes | 61.0% |
+| Rows of directories over 500 entries | 3.3% of rows, 4.8% of bytes | 29.6%, 35.2% |
+
+The synthetic history's 15.2 KB per changeset is Linux's 16 KB; the slice
+is narrower and lighter on merges. Per-row estimates from the same rows: an
+id table per row 1.86x (slice) and 1.39x (synthetic), with front-coded names
+1.91x and 1.44x, zstd -3 per row 1.98x and 1.47x.
+
+**The change.** One pack per changeset of every node its derivation writes,
+cut into parts of 16 KB (part 0 is the changeset's value), with ids
+interned per part, nodes addressed by (writer, part, index), positional
+patches, front-coded names and zstd. Variants measured on the way are in
+ADR 0045.
+
+| | v3 | v4 |
+|---|---|---|
+| Slice: value bytes, rows | 210.5 MB, 311,439 | **34.6 MB, 22,774 (6.1x, 13.7x)** |
+| Slice: history in Postgres after `VACUUM FULL` (heap, TOAST, index) | 200.1 MB | **42.6 MB (4.7x)** |
+| Slice: database after `VACUUM FULL` | 292 MB | 135 MB |
+| Synthetic: value bytes, rows | 301.4 MB, 560,483 | **51.8 MB, 22,004 (5.8x, 25x)** |
+| Synthetic: bytes per changeset | 15.2 KB | 2.6 KB |
+| Slice: merge / other changeset | 115 KB / 1.8 KB | 13.1 KB / 0.75 KB |
+| Synthetic: merge / other changeset | 125 KB / 3.3 KB | 15.3 KB / 1.2 KB |
+
+Extrapolated to Linux (16 KB per changeset, 24 GB): 2.8 KB per changeset
+and about 4 GB at the synthetic ratio, 2.6 GB at the slice's.
+
+Derivation (release builds, rows written in one run of `history_profile
+--reset`; alternating runs):
+
+| | v3 | v4 |
+|---|---|---|
+| Slice, Postgres (6 runs each) | 95.5 to 120.5 s | 85.4 to 112.9 s (final build: 85.4 s against 102.0 s for v3 run beside it) |
+| Synthetic, Postgres (4 runs / 2 runs of the final build) | 164.5 to 184.0 s | 167.7 to 174.0 s |
+| Synthetic, in memory | 121.0 s | 162.3 s |
+| Rows written (slice) | 371,132 in 437 calls, 10.8 to 12.8 s | 22,774 in 83 calls, 1.3 s |
+| Peak RSS: synthetic on Postgres / slice | 239 to 241 / 209 to 217 MiB | 253 to 254 / 236 MiB |
+
+v4 writes a sixteenth of the rows, and spends the time on encoding (each
+node is costed for the patch rule and encoded again into its part) and on
+cache misses, which decode a node from its part (up to 16 KB uncompressed)
+and name a patch from its keyframe. In memory, where writes cost nothing,
+that is 34% more time on the synthetic history; with a 512 MiB row cache
+the difference was 5% (25.4 s against 24.1 s on 8,000 changesets). The row
+cache now counts nodes at about their decoded size, under 96 MiB, beside
+32 MiB of parts, 16 MiB of patches waiting for their keyframe and 4 MiB of
+roots; v3 counted rows at twice their encoded size under 64 MiB, which
+undercounted decoded rows by about 1.7x. With v4's row cache at 64 MiB the
+synthetic history took 197 to 221 s on Postgres, missing three times as
+often.
+
+Queries on the slice (312 paths: 12 well-known files, 220 random files, 50
+directories, 30 deleted files; 50-entry `log path=`, `last-change`, and 30
+blames), each run against a freshly started server and then again warm, v3
+and v4 servers alternating on one database, totals per run in seconds:
+
+| | v3 (6 runs) | v4 (final build, 2 runs) |
+|---|---|---|
+| `last-change`, cold | 5.70 to 6.61 | 5.88 |
+| `last-change`, warm | 5.56 to 6.26 | 6.79 to 6.91 |
+| `log path=`, cold | 42.2 to 48.6 | 37.8 to 39.3 |
+| `log path=`, warm | 35.3 to 41.3 | 38.2 to 40.2 |
+| `blame`, cold / warm | 0.97 to 6.58 / 0.88 to 1.18 | 0.99 to 1.02 / 1.08 to 1.12 |
+| `last-change` alone, cold / warm (2 runs each) | 5.64 to 5.86 / 5.77 to 6.21 | 5.58 to 5.59 / 5.08 to 5.28 |
+
+The warm pass interleaves each path's `last-change` with the previous
+path's 50-entry log, whose walk turns the caches over; asked alone,
+`last-change` is as fast as v3's or faster.
+
+All 654 response bodies were identical between the two servers, in every
+one of 34 runs. A first v4
+build, which decoded whole parts and read each changeset's value again for
+every lookup at it, was 50 to 80% slower on `log`; decoding only the node
+asked for (parts carry node lengths) and caching each changeset's root
+closed that.
+
+Criterion (`cargo bench -p leep-derive -- 'derive_history|log_path|last_change'`,
+in-memory stores, so encoding and decoding without the writes they save):
+
+| Case | v3 | v4 |
+|---|---|---|
+| `log_path_filter_10k_history/index/limit_10` | 23.8 us | 17.3 us |
+| `log_path_filter_10k_history/index/limit_1000` | 7.48 ms | 8.47 ms |
+| `log_path_filter_10k_history/index/rare_path` | 26.6 us | 18.9 us |
+| `last_change_10k_history/d0/f` | 1.66 us | 1.39 us |
+| `derive_history_index/1000_changesets` | 47.8 ms | 53.0 ms |
+| `derive_history_index/wide_merges_300_changesets` | 146 ms | 157 ms |
+| `derive_history_index/old_base_merge_3000_changesets` | 8.57 ms | 8.73 ms |
+
 ## Garbage collection
 
 `leep-server gc` phases timed with
