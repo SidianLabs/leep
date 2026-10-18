@@ -68,6 +68,21 @@ fn with_trailers(message: &str, extra: &BTreeMap<String, String>) -> String {
     m
 }
 
+/// Git's tree order: by name, with a directory compared as if its name
+/// ended in `/`.
+pub(crate) fn sort_entries(entries: &mut [Entry]) {
+    entries.sort_by(|a, b| {
+        let key = |e: &Entry| {
+            let mut k = e.filename.to_vec();
+            if e.mode.is_tree() {
+                k.push(b'/');
+            }
+            k
+        };
+        key(a).cmp(&key(b))
+    });
+}
+
 struct Files {
     /// Directory path -> entries directly inside it.
     dirs: HashMap<String, Vec<Entry>>,
@@ -86,16 +101,7 @@ fn write_trees(g: &gix::Repository, mut files: Files) -> Result<ObjectId> {
     let mut root = None;
     for dir in keys {
         let mut entries = files.dirs.remove(&dir).unwrap_or_default();
-        entries.sort_by(|a, b| {
-            let key = |e: &Entry| {
-                let mut k = e.filename.to_vec();
-                if e.mode.is_tree() {
-                    k.push(b'/');
-                }
-                k
-            };
-            key(a).cmp(&key(b))
-        });
+        sort_entries(&mut entries);
         let oid = g
             .write_object(gix::objs::Tree { entries })
             .map_err(gerr)?
@@ -119,6 +125,92 @@ fn write_trees(g: &gix::Repository, mut files: Files) -> Result<ObjectId> {
         }
     }
     root.ok_or_else(|| Error::Other("no root tree".into()))
+}
+
+/// The git commit for `cs`, given its tree and parent commits. Changesets
+/// imported from git carry what it takes to reproduce the original bytes
+/// (committer, time zones, encoding, extra headers). `changeset_trailer`
+/// names the changeset in a `Leep-Changeset:` trailer, which the live mirror
+/// adds to changesets that did not come from git (ADR 0046).
+pub(crate) fn commit_object(
+    cs: &leep_core::Changeset,
+    tree: ObjectId,
+    parents: Vec<ObjectId>,
+    provenance_trailers: bool,
+    changeset_trailer: Option<ChangesetId>,
+) -> Result<gix::objs::Commit> {
+    let tz = |k: &str| cs.extra.get(k).map(String::as_str).unwrap_or("+0000");
+    let author = sig(&cs.author, cs.timestamp, tz(EXTRA_GIT_AUTHOR_TZ));
+    let committer = match cs.extra.get(EXTRA_GIT_COMMITTER) {
+        Some(c) => match c.rsplit_once(' ') {
+            Some((ident, t)) => sig(
+                ident,
+                t.parse().unwrap_or(cs.timestamp),
+                tz(EXTRA_GIT_COMMITTER_TZ),
+            ),
+            None => sig(c, cs.timestamp, tz(EXTRA_GIT_COMMITTER_TZ)),
+        },
+        None => author.clone(),
+    };
+    let extra_headers: Vec<(gix::bstr::BString, gix::bstr::BString)> =
+        match cs.extra.get(EXTRA_GIT_HEADERS) {
+            Some(json) => serde_json::from_str::<Vec<(String, String)>>(json)
+                .map_err(gerr)?
+                .into_iter()
+                .map(|(k, v)| (k.into(), v.into()))
+                .collect(),
+            None => Vec::new(),
+        };
+    let mut message = if provenance_trailers {
+        with_trailers(&cs.message, &cs.extra)
+    } else {
+        cs.message.clone()
+    };
+    if let Some(id) = changeset_trailer {
+        message = with_changeset_trailer(&message, id);
+    }
+    Ok(gix::objs::Commit {
+        tree,
+        parents: parents.into(),
+        author,
+        committer,
+        encoding: cs.extra.get(EXTRA_GIT_ENCODING).map(|e| e.as_str().into()),
+        message: message.into(),
+        extra_headers,
+    })
+}
+
+/// Trailer key the mirror uses to name the changeset a commit came from.
+pub const CHANGESET_TRAILER: &str = "Leep-Changeset";
+
+/// Append `Leep-Changeset: <id>` to the final trailer paragraph, or start one.
+fn with_changeset_trailer(message: &str, id: ChangesetId) -> String {
+    let body = message.trim_end_matches('\n');
+    let last = body.rsplit("\n\n").next().unwrap_or("");
+    let in_trailers = !body.is_empty()
+        && body.contains("\n\n")
+        && last.lines().all(|l| {
+            l.split_once(": ")
+                .is_some_and(|(k, _)| !k.is_empty() && !k.contains(' '))
+        });
+    let sep = if body.is_empty() {
+        ""
+    } else if in_trailers {
+        "\n"
+    } else {
+        "\n\n"
+    };
+    format!("{body}{sep}{CHANGESET_TRAILER}: {id}\n")
+}
+
+/// The changeset a commit message names in its `Leep-Changeset:` trailer.
+pub(crate) fn changeset_trailer(message: &str) -> Option<ChangesetId> {
+    let body = message.trim_end_matches('\n');
+    let last = body.rsplit("\n\n").next()?;
+    last.lines().rev().find_map(|l| {
+        let v = l.strip_prefix(CHANGESET_TRAILER)?.strip_prefix(": ")?;
+        v.trim().parse().ok()
+    })
 }
 
 /// Unmapped (or missing from `g`) changesets reachable from `rev`, parents
@@ -236,45 +328,8 @@ pub async fn export(
 
         let g = ts.to_thread_local();
         let tree = write_trees(&g, files)?;
-        let tz = |k: &str| cs.extra.get(k).map(String::as_str).unwrap_or("+0000");
-        let author = sig(&cs.author, cs.timestamp, tz(EXTRA_GIT_AUTHOR_TZ));
-        let committer = match cs.extra.get(EXTRA_GIT_COMMITTER) {
-            Some(c) => match c.rsplit_once(' ') {
-                Some((ident, t)) => sig(
-                    ident,
-                    t.parse().unwrap_or(cs.timestamp),
-                    tz(EXTRA_GIT_COMMITTER_TZ),
-                ),
-                None => sig(c, cs.timestamp, tz(EXTRA_GIT_COMMITTER_TZ)),
-            },
-            None => author.clone(),
-        };
-        let extra_headers: Vec<(gix::bstr::BString, gix::bstr::BString)> =
-            match cs.extra.get(EXTRA_GIT_HEADERS) {
-                Some(json) => serde_json::from_str::<Vec<(String, String)>>(json)
-                    .map_err(gerr)?
-                    .into_iter()
-                    .map(|(k, v)| (k.into(), v.into()))
-                    .collect(),
-                None => Vec::new(),
-            };
-        let message = if opts.provenance_trailers {
-            with_trailers(&cs.message, &cs.extra)
-        } else {
-            cs.message.clone()
-        };
-        let oid = g
-            .write_object(gix::objs::Commit {
-                tree,
-                parents: parents.into(),
-                author,
-                committer,
-                encoding: cs.extra.get(EXTRA_GIT_ENCODING).map(|e| e.as_str().into()),
-                message: message.into(),
-                extra_headers,
-            })
-            .map_err(gerr)?
-            .detach();
+        let commit = commit_object(&cs, tree, parents, opts.provenance_trailers, None)?;
+        let oid = g.write_object(commit).map_err(gerr)?.detach();
         done.insert(id, oid);
         report.commits_written += 1;
 

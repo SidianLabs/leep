@@ -1,6 +1,6 @@
 [package]
 name = "leep-git"
-description = "Import and export between git repositories and Leep"
+description = "Import, export and live mirroring between git repositories and Leep"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -14,13 +14,15 @@ leep-core.workspace = true
 leep-derive.workspace = true
 leep-store.workspace = true
 leep-meta.workspace = true
+leep-cli = { path = "../leep-cli" }
 anyhow.workspace = true
 bytes.workspace = true
 futures-util.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 gix = { version = "0.89", default-features = false, features = ["sha1", "revision", "parallel"] }
 
 [dev-dependencies]

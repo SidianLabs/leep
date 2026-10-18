@@ -54,8 +54,8 @@ pub struct ImportReport {
 }
 
 /// One git commit, decoded and diffed against its first parent.
-struct Prepared {
-    parents: Vec<ObjectId>,
+pub(crate) struct Prepared {
+    pub(crate) parents: Vec<ObjectId>,
     author: String,
     author_tz: i32,
     time: i64,
@@ -65,8 +65,8 @@ struct Prepared {
     message: String,
     encoding: Option<String>,
     headers: Vec<(String, String)>,
-    changes: Vec<(String, Option<(FileKind, ObjectId)>)>,
-    submodules: usize,
+    pub(crate) changes: Vec<(String, Option<(FileKind, ObjectId)>)>,
+    pub(crate) submodules: usize,
 }
 
 type Entry = (EntryKind, ObjectId);
@@ -123,7 +123,7 @@ fn flatten(
     Ok(out)
 }
 
-fn prepare(ts: &gix::ThreadSafeRepository, id: ObjectId) -> Result<Prepared> {
+pub(crate) fn prepare(ts: &gix::ThreadSafeRepository, id: ObjectId) -> Result<Prepared> {
     let g = ts.to_thread_local();
     let commit = g
         .find_object(id)
@@ -228,6 +228,61 @@ fn prepare(ts: &gix::ThreadSafeRepository, id: ObjectId) -> Result<Prepared> {
         headers,
         changes,
         submodules: subs,
+    })
+}
+
+/// The changeset for git commit `oid`, given its parents' changeset ids and
+/// the stored hash and size of each blob it adds. The importer and the live
+/// mirror both build changesets here, so a commit gets the same id whichever
+/// of them imports it.
+pub(crate) fn changeset_for(
+    oid: ObjectId,
+    p: Prepared,
+    parents: Vec<ChangesetId>,
+    blob: impl Fn(&ObjectId) -> Result<(Hash, u64)>,
+) -> Result<Changeset> {
+    let mut changes = BTreeMap::new();
+    for (path, change) in p.changes {
+        let path = RepoPath::new(path)?;
+        let change = match change {
+            None => FileChange::Delete,
+            Some((kind, b)) => {
+                let (content, size) = blob(&b)?;
+                FileChange::Modify {
+                    content,
+                    kind,
+                    size,
+                }
+            }
+        };
+        changes.insert(path, change);
+    }
+    let mut extra = BTreeMap::from([
+        (EXTRA_GIT_COMMIT.to_string(), oid.to_string()),
+        (
+            EXTRA_GIT_COMMITTER.to_string(),
+            format!("{} {}", p.committer, p.committer_time),
+        ),
+        (EXTRA_GIT_AUTHOR_TZ.to_string(), format_tz(p.author_tz)),
+        (
+            EXTRA_GIT_COMMITTER_TZ.to_string(),
+            format_tz(p.committer_tz),
+        ),
+    ]);
+    if let Some(e) = p.encoding {
+        extra.insert(EXTRA_GIT_ENCODING.to_string(), e);
+    }
+    if !p.headers.is_empty() {
+        let json = serde_json::to_string(&p.headers).map_err(gerr)?;
+        extra.insert(EXTRA_GIT_HEADERS.to_string(), json);
+    }
+    Ok(Changeset {
+        parents,
+        author: p.author,
+        timestamp: p.time,
+        message: p.message,
+        changes,
+        extra,
     })
 }
 
@@ -426,54 +481,15 @@ pub async fn import(
             };
             parents.push(id);
         }
-        let mut changes = BTreeMap::new();
-        {
-            let cache = blob_cache.lock().unwrap();
-            for (path, change) in p.changes {
-                let path = RepoPath::new(path)?;
-                let change = match change {
-                    None => FileChange::Delete,
-                    Some((kind, blob)) => {
-                        let (content, size) = *cache.get(&blob).ok_or_else(|| {
-                            Error::Other(format!("blob {blob} of {oid} was not uploaded"))
-                        })?;
-                        FileChange::Modify {
-                            content,
-                            kind,
-                            size,
-                        }
-                    }
-                };
-                changes.insert(path, change);
-            }
-        }
         report.submodules_skipped += p.submodules;
-        let mut extra = BTreeMap::from([
-            (EXTRA_GIT_COMMIT.to_string(), oid.to_string()),
-            (
-                EXTRA_GIT_COMMITTER.to_string(),
-                format!("{} {}", p.committer, p.committer_time),
-            ),
-            (EXTRA_GIT_AUTHOR_TZ.to_string(), format_tz(p.author_tz)),
-            (
-                EXTRA_GIT_COMMITTER_TZ.to_string(),
-                format_tz(p.committer_tz),
-            ),
-        ]);
-        if let Some(e) = p.encoding {
-            extra.insert(EXTRA_GIT_ENCODING.to_string(), e);
-        }
-        if !p.headers.is_empty() {
-            let json = serde_json::to_string(&p.headers).map_err(gerr)?;
-            extra.insert(EXTRA_GIT_HEADERS.to_string(), json);
-        }
-        let cs = Changeset {
-            parents,
-            author: p.author,
-            timestamp: p.time,
-            message: p.message,
-            changes,
-            extra,
+        let cs = {
+            let cache = blob_cache.lock().unwrap();
+            changeset_for(oid, p, parents, |blob| {
+                cache
+                    .get(blob)
+                    .copied()
+                    .ok_or_else(|| Error::Other(format!("blob {blob} of {oid} was not uploaded")))
+            })?
         };
         // The mapping goes in the changeset's own write, so it never names a
         // changeset that is not stored; a crash before it only means a rerun

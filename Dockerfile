@@ -18,8 +18,10 @@ FROM debian:bookworm-slim
 # No HEALTHCHECK: the slim image has no curl/wget and the server has no
 # self-check flag. Probe from outside: GET /v1/health (liveness) and
 # GET /v1/ready (readiness: both stores answer).
+# git and the ssh client are for `leep-git mirror run`, which pushes and
+# fetches through the system git (ADR 0046).
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates \
+ && apt-get install -y --no-install-recommends ca-certificates git openssh-client \
  && rm -rf /var/lib/apt/lists/* \
  && useradd --system --uid 10001 --home-dir /var/lib/leep --shell /usr/sbin/nologin leep \
  && mkdir -p /var/lib/leep && chown leep:leep /var/lib/leep
