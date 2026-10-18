@@ -261,15 +261,19 @@ async fn dbs(name: &str) -> Vec<Db> {
 
 // ---- Migration lists with extra steps ---------------------------------------
 
+/// Newest compiled version (the lists agree, see
+/// `compiled_lists_are_consistent`); the injected steps below follow it.
+const LATEST: i64 = POSTGRES_MIGRATIONS.len() as i64;
+
 /// Steps that need no backend-specific SQL.
-const EXTRA_2: Migration = Migration {
-    version: 2,
+const ONCE: Migration = Migration {
+    version: LATEST + 1,
     name: "once",
     sql: "CREATE TABLE once (n INTEGER); INSERT INTO once (n) VALUES (1);",
     satisfied_by: &[],
 };
-const EXTRA_3: Migration = Migration {
-    version: 3,
+const WIDGETS: Migration = Migration {
+    version: LATEST + 2,
     name: "widgets",
     sql: "CREATE TABLE widgets (id INTEGER PRIMARY KEY, label TEXT NOT NULL); \
           INSERT INTO widgets (id, label) VALUES (1, 'one'); \
@@ -278,8 +282,8 @@ const EXTRA_3: Migration = Migration {
     satisfied_by: &[],
 };
 /// Creates a table, then fails: both must roll back.
-const BAD_3: Migration = Migration {
-    version: 3,
+const HALF: Migration = Migration {
+    version: LATEST + 2,
     name: "half",
     sql: "CREATE TABLE half (x INTEGER); INSERT INTO no_such_table VALUES (1);",
     satisfied_by: &[],
@@ -596,23 +600,32 @@ async fn fresh_database_migrates_once() {
         let kind = db.kind();
         let before = db.report(db.compiled()).await;
         assert_eq!(before.from, 0, "{kind}");
-        assert_eq!(before.pending.len(), 1, "{kind}");
+        assert_eq!(before.pending.len(), LATEST as usize, "{kind}");
         assert!(before.adopted.is_empty(), "{kind}");
         assert!(!before.performed, "{kind}");
         assert!(db.objects().await.is_empty(), "dry run wrote nothing");
 
         let s = db.open(db.compiled(), SchemaMode::Migrate).await.unwrap();
-        assert_eq!(s.schema_version().await.unwrap(), Some(1), "{kind}");
+        assert_eq!(
+            s.schema_version().await.unwrap(),
+            Some(LATEST as u64),
+            "{kind}"
+        );
         assert_eq!(db.objects().await, full_schema(), "{kind}");
         check_meta_store_contract(&*s).await;
 
         let after = db.report(db.compiled()).await;
         assert!(after.is_current(), "{kind}");
-        assert_eq!(after.applied.len(), 1, "{kind}");
-        let row = &after.applied[0];
-        assert_eq!((row.version, row.name.as_str()), (1, "initial"), "{kind}");
-        assert_eq!(row.checksum, db.compiled()[0].checksum(), "{kind}");
-        assert!(row.applied_at > 1_700_000_000, "{kind}");
+        assert_eq!(after.applied.len(), LATEST as usize, "{kind}");
+        for (row, m) in after.applied.iter().zip(db.compiled()) {
+            assert_eq!(
+                (row.version, row.name.as_str()),
+                (m.version, m.name),
+                "{kind}"
+            );
+            assert_eq!(row.checksum, m.checksum(), "{kind}");
+            assert!(row.applied_at > 1_700_000_000, "{kind}");
+        }
 
         // Reopening is a no-op: the row is not rewritten.
         drop(s);
@@ -640,11 +653,23 @@ async fn upgrade_from_every_stage() {
             // What would happen, without doing it.
             let plan = db.report(db.compiled()).await;
             assert_eq!(plan.from, 0, "{kind} {}", stage.name);
+            // Only the baseline is ever adopted; every later step runs.
+            let versions = |m: &[MigrationRef]| m.iter().map(|m| m.version).collect::<Vec<_>>();
             if stage.ref_log {
-                assert_eq!(plan.adopted.len(), 1, "{kind} {}: adopt", stage.name);
-                assert!(plan.pending.is_empty(), "{kind} {}", stage.name);
+                assert_eq!(versions(&plan.adopted), [1], "{kind} {}: adopt", stage.name);
+                assert_eq!(
+                    versions(&plan.pending),
+                    (2..=LATEST).collect::<Vec<_>>(),
+                    "{kind} {}",
+                    stage.name
+                );
             } else {
-                assert_eq!(plan.pending.len(), 1, "{kind} {}: finish", stage.name);
+                assert_eq!(
+                    versions(&plan.pending),
+                    (1..=LATEST).collect::<Vec<_>>(),
+                    "{kind} {}: finish",
+                    stage.name
+                );
                 assert!(plan.adopted.is_empty(), "{kind} {}", stage.name);
             }
             assert!(
@@ -662,7 +687,7 @@ async fn upgrade_from_every_stage() {
             assert!(!db.has_schema_migrations().await, "{kind}");
 
             let s = db.open(db.compiled(), SchemaMode::Migrate).await.unwrap();
-            verify(&*s, stage, &d, 1).await;
+            verify(&*s, stage, &d, LATEST as u64).await;
             assert_eq!(db.objects().await, full_schema(), "{kind} {}", stage.name);
             let rep = db.report(db.compiled()).await;
             assert!(rep.is_current(), "{kind}");
@@ -677,13 +702,91 @@ async fn upgrade_from_every_stage() {
     }
 }
 
+/// A database at v1, as the binary before migration 2 left it (its compiled
+/// prefix, data written with that version's SQL), upgrades with its data
+/// intact. On Postgres the large tables then carry migration 2's analyze
+/// thresholds, and `analyze` refreshes their statistics (ADR 0041).
+#[tokio::test]
+async fn upgrade_from_v1_sets_analyze_thresholds() {
+    for db in dbs("fromv1").await {
+        let kind = db.kind();
+        let d = data();
+        drop(
+            db.open(&db.compiled()[..1], SchemaMode::Migrate)
+                .await
+                .unwrap(),
+        );
+        // The unversioned DDL is `IF NOT EXISTS`, so only the rows go in.
+        load(&db, &STAGES[1], &d).await;
+        let plan = db.report(db.compiled()).await;
+        assert_eq!(plan.from, 1, "{kind}");
+        assert_eq!(
+            plan.pending.iter().map(|m| m.version).collect::<Vec<_>>(),
+            (2..=LATEST).collect::<Vec<_>>(),
+            "{kind}"
+        );
+        let s = db.open(db.compiled(), SchemaMode::Migrate).await.unwrap();
+        verify(&*s, &STAGES[1], &d, LATEST as u64).await;
+        drop(s);
+        if let Db::Pg { url, schema } = &db {
+            let store = PostgresMetaStore::connect_with_migrations(
+                url,
+                Some(schema),
+                SchemaMode::RequireCurrent,
+                db.compiled(),
+            )
+            .await
+            .unwrap();
+            let rows: Vec<(String, Option<Vec<String>>)> = sqlx::query_as(
+                "SELECT c.relname::text, c.reloptions FROM pg_class c \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE n.nspname = $1 AND c.relname IN ('changesets', 'derived') ORDER BY 1",
+            )
+            .bind(schema)
+            .fetch_all(&store.pool)
+            .await
+            .unwrap();
+            let opts = |scale: &str| {
+                Some(vec![
+                    format!("autovacuum_analyze_scale_factor={scale}"),
+                    "autovacuum_analyze_threshold=10000".to_string(),
+                ])
+            };
+            assert_eq!(rows[0].0, "changesets");
+            assert_eq!(rows[0].1, opts("0.02"));
+            assert_eq!(rows[1].0, "derived");
+            assert_eq!(rows[1].1, opts("0.01"));
+            store.analyze().await.unwrap();
+            let tuples: Vec<f32> = sqlx::query_scalar(
+                "SELECT c.reltuples FROM pg_class c \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE n.nspname = $1 AND c.relname IN ('changesets', 'derived') ORDER BY c.relname",
+            )
+            .bind(schema)
+            .fetch_all(&store.pool)
+            .await
+            .unwrap();
+            let counts: (f32, f32) = sqlx::query_as(
+                "SELECT (SELECT count(*) FROM changesets)::real, \
+                 (SELECT count(*) FROM derived)::real",
+            )
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+            assert_eq!(tuples, [counts.0, counts.1], "{kind}");
+            store.pool.close().await;
+        }
+        db.cleanup().await;
+    }
+}
+
 /// The multi-step path: an un-versioned database adopts v1 and then runs the
 /// steps after it; so does a database at v1; so does one one step behind.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn multi_step_upgrades() {
     for db in dbs("steps").await {
         let kind = db.kind();
-        let list = with(db.compiled(), &[EXTRA_2, EXTRA_3]);
+        let list = with(db.compiled(), &[ONCE, WIDGETS]);
         let stage = &STAGES[1];
         let d = data();
         load(&db, stage, &d).await;
@@ -696,16 +799,16 @@ async fn multi_step_upgrades() {
         );
         assert_eq!(
             plan.pending.iter().map(|m| m.version).collect::<Vec<_>>(),
-            [2, 3],
+            (2..=LATEST + 2).collect::<Vec<_>>(),
             "{kind}"
         );
         let s = db.open(&list, SchemaMode::Migrate).await.unwrap();
-        verify(&*s, stage, &d, 3).await;
+        verify(&*s, stage, &d, LATEST as u64 + 2).await;
         drop(s);
         let rep = db.report(&list).await;
         assert_eq!(
             rep.applied.iter().map(|a| a.version).collect::<Vec<_>>(),
-            [1, 2, 3],
+            (1..=LATEST + 2).collect::<Vec<_>>(),
             "{kind}"
         );
         db.exec(
@@ -719,7 +822,7 @@ async fn multi_step_upgrades() {
     // binary (its compiled prefix) upgrades with data intact.
     for db in dbs("steps2").await {
         let kind = db.kind();
-        let list = with(db.compiled(), &[EXTRA_2, EXTRA_3]);
+        let list = with(db.compiled(), &[ONCE, WIDGETS]);
         for from in 1..list.len() {
             let d = data();
             let s = db.open(&list[..from], SchemaMode::Migrate).await.unwrap();
@@ -734,7 +837,7 @@ async fn multi_step_upgrades() {
             let s = db.open(&list, SchemaMode::Migrate).await.unwrap();
             assert_eq!(
                 s.schema_version().await.unwrap(),
-                Some(3),
+                Some(LATEST as u64 + 2),
                 "{kind} from {from}"
             );
             assert_eq!(s.list_refs().await.unwrap().len(), 2, "{kind} from {from}");
@@ -772,7 +875,7 @@ impl Db {
 async fn newer_database_is_refused() {
     for db in dbs("newer").await {
         let kind = db.kind();
-        let newer = with(db.compiled(), &[EXTRA_2]);
+        let newer = with(db.compiled(), &[ONCE]);
         db.open(&newer, SchemaMode::Migrate).await.unwrap();
         let before = db.report(&newer).await;
         for mode in [SchemaMode::Migrate, SchemaMode::RequireCurrent] {
@@ -783,8 +886,10 @@ async fn newer_database_is_refused() {
                 .expect("must refuse");
             let msg = err.to_string();
             assert!(
-                msg.contains("database schema v2 is newer than this server (max v1)")
-                    && msg.contains("upgrade the server"),
+                msg.contains(&format!(
+                    "database schema v{} is newer than this server (max v{LATEST})",
+                    LATEST + 1
+                )) && msg.contains("upgrade the server"),
                 "{kind}: {msg}"
             );
         }
@@ -797,30 +902,33 @@ async fn newer_database_is_refused() {
 /// Editing a migration after it was applied is caught.
 #[tokio::test]
 async fn edited_migration_is_refused() {
-    const EDITED: &[Migration] = &[Migration {
-        version: 1,
-        name: "initial",
-        sql: "CREATE TABLE IF NOT EXISTS changesets (id BLOB PRIMARY KEY, data BLOB NOT NULL);",
-        satisfied_by: &["changesets"],
-    }];
     for db in dbs("edited").await {
         let kind = db.kind();
         db.open(db.compiled(), SchemaMode::Migrate).await.unwrap();
+        let mut edited = db.compiled().to_vec();
+        edited[0].sql =
+            "CREATE TABLE IF NOT EXISTS changesets (id BLOB PRIMARY KEY, data BLOB NOT NULL);";
         for mode in [SchemaMode::Migrate, SchemaMode::RequireCurrent] {
-            let err = db.open(EDITED, mode).await.err().expect("must refuse");
+            let err = db.open(&edited, mode).await.err().expect("must refuse");
             let msg = err.to_string();
             assert!(
                 msg.contains("migration v1 (initial)") && msg.contains("immutable"),
                 "{kind}: {msg}"
             );
         }
-        // The CRLF form of the same file is the same migration.
-        let crlf = Migration {
-            sql: Box::leak(db.compiled()[0].sql.replace('\n', "\r\n").into_boxed_str()),
-            ..db.compiled()[0]
-        };
-        assert_eq!(crlf.checksum(), db.compiled()[0].checksum());
-        db.open(&[crlf], SchemaMode::Migrate).await.unwrap();
+        // The CRLF form of the same files is the same migrations.
+        let crlf: Vec<Migration> = db
+            .compiled()
+            .iter()
+            .map(|m| Migration {
+                sql: Box::leak(m.sql.replace('\n', "\r\n").into_boxed_str()),
+                ..*m
+            })
+            .collect();
+        for (a, b) in crlf.iter().zip(db.compiled()) {
+            assert_eq!(a.checksum(), b.checksum());
+        }
+        db.open(&crlf, SchemaMode::Migrate).await.unwrap();
         db.cleanup().await;
     }
 }
@@ -831,21 +939,31 @@ async fn edited_migration_is_refused() {
 async fn inconsistent_history_is_refused() {
     for db in dbs("gap").await {
         let kind = db.kind();
-        let list = with(db.compiled(), &[EXTRA_2, EXTRA_3]);
+        let list = with(db.compiled(), &[ONCE, WIDGETS]);
         db.open(&list, SchemaMode::Migrate).await.unwrap();
-        db.exec("DELETE FROM schema_migrations WHERE version = 2", vec![])
-            .await;
+        db.exec(
+            &format!(
+                "DELETE FROM schema_migrations WHERE version = {}",
+                LATEST + 1
+            ),
+            vec![],
+        )
+        .await;
         let err = db
             .open(&list, SchemaMode::Migrate)
             .await
             .err()
             .expect("hole");
         assert!(
-            err.to_string().contains("v2 is missing but v3 is applied"),
+            err.to_string().contains(&format!(
+                "v{} is missing but v{} is applied",
+                LATEST + 1,
+                LATEST + 2
+            )),
             "{kind}: {err}"
         );
         // A list that is not 1, 2, 3... is a programming error, caught early.
-        let bad = [EXTRA_2];
+        let bad = [ONCE];
         assert!(db.migrate(&bad, true).await.is_err(), "{kind}");
         db.cleanup().await;
     }
@@ -858,22 +976,23 @@ async fn inconsistent_history_is_refused() {
 async fn failed_migration_rolls_back_fully() {
     for db in dbs("rollback").await {
         let kind = db.kind();
-        // On a new database: v1 and v2 succeed, v3 fails.
-        let bad = with(db.compiled(), &[EXTRA_2, BAD_3]);
+        // On a new database: the compiled steps and `once` succeed, `half` fails.
+        let bad = with(db.compiled(), &[ONCE, HALF]);
         let err = db
             .open(&bad, SchemaMode::Migrate)
             .await
             .err()
             .expect("fails");
         assert!(
-            err.to_string().contains("migration v3 (half) failed"),
+            err.to_string()
+                .contains(&format!("migration v{} (half) failed", LATEST + 2)),
             "{err}"
         );
         assert!(db.objects().await.is_empty(), "{kind}: nothing created");
         let rep = db.report(db.compiled()).await;
         assert!(rep.applied.is_empty() && rep.from == 0, "{kind}");
 
-        // On a database at v1: still at v1, with its data.
+        // On a database at the compiled version: still there, with its data.
         let s = db.open(db.compiled(), SchemaMode::Migrate).await.unwrap();
         let id = s.put_changeset(&crate::tests::cs(1)).await.unwrap();
         drop(s);
@@ -884,15 +1003,19 @@ async fn failed_migration_rolls_back_fully() {
             "{kind}: no once, no half"
         );
         let rep = db.report(db.compiled()).await;
-        assert_eq!(rep.applied.len(), 1, "{kind}");
+        assert_eq!(rep.applied.len(), LATEST as usize, "{kind}");
         let s = db.open(db.compiled(), SchemaMode::Migrate).await.unwrap();
         assert!(s.get_changeset(&id).await.unwrap().is_some(), "{kind}");
         drop(s);
 
         // Fixing the list lets the same database move on.
-        let good = with(db.compiled(), &[EXTRA_2, EXTRA_3]);
+        let good = with(db.compiled(), &[ONCE, WIDGETS]);
         let s = db.open(&good, SchemaMode::Migrate).await.unwrap();
-        assert_eq!(s.schema_version().await.unwrap(), Some(3), "{kind}");
+        assert_eq!(
+            s.schema_version().await.unwrap(),
+            Some(LATEST as u64 + 2),
+            "{kind}"
+        );
         drop(s);
         db.cleanup().await;
     }
@@ -905,7 +1028,7 @@ async fn concurrent_migrators_apply_once() {
     for db in dbs("race").await {
         let kind = db.kind();
         let db = Arc::new(db);
-        let list = Arc::new(with(db.compiled(), &[EXTRA_2, EXTRA_3]));
+        let list = Arc::new(with(db.compiled(), &[ONCE, WIDGETS]));
         let mut tasks = Vec::new();
         for _ in 0..8 {
             let (db, list) = (db.clone(), list.clone());
@@ -916,19 +1039,19 @@ async fn concurrent_migrators_apply_once() {
         let mut performed = 0;
         for t in tasks {
             let r = t.await.unwrap();
-            assert_eq!(r.to, 3, "{kind}");
+            assert_eq!(r.to, LATEST as u64 + 2, "{kind}");
             performed += r.performed as usize;
         }
         assert_eq!(performed, 1, "{kind}: exactly one migrator did the work");
         let rep = db.report(&list).await;
         assert_eq!(
             rep.applied.iter().map(|a| a.version).collect::<Vec<_>>(),
-            [1, 2, 3],
+            (1..=LATEST + 2).collect::<Vec<_>>(),
             "{kind}"
         );
         // `once` holds the single row its migration inserted.
         let s = db.open(&list, SchemaMode::Migrate).await.unwrap();
-        assert_eq!(s.schema_version().await.unwrap(), Some(3));
+        assert_eq!(s.schema_version().await.unwrap(), Some(LATEST as u64 + 2));
         drop(s);
         db.exec("INSERT INTO once (n) VALUES (2)", vec![]).await;
         let db = Arc::try_unwrap(db).ok().unwrap();
@@ -957,10 +1080,10 @@ async fn concurrent_adoption_records_once() {
         }
         assert_eq!(performed, 1, "{kind}");
         let rep = db.report(db.compiled()).await;
-        assert_eq!(rep.applied.len(), 1, "{kind}");
+        assert_eq!(rep.applied.len(), LATEST as usize, "{kind}");
         let db = Arc::try_unwrap(db).ok().unwrap();
         let s = db.open(db.compiled(), SchemaMode::Migrate).await.unwrap();
-        verify(&*s, &STAGES[1], &d, 1).await;
+        verify(&*s, &STAGES[1], &d, LATEST as u64).await;
         drop(s);
         db.cleanup().await;
     }
@@ -999,18 +1122,25 @@ async fn url_dispatch() {
     let dry = migrate_meta_store(url, true).await.unwrap();
     assert_eq!(
         (dry.from, dry.to, dry.latest, dry.performed),
-        (0, 0, 1, false)
+        (0, 0, LATEST as u64, false)
     );
     assert!(open_meta_store_with(url, SchemaMode::RequireCurrent)
         .await
         .is_err());
     let done = migrate_meta_store(url, false).await.unwrap();
-    assert_eq!((done.from, done.to, done.performed), (0, 1, true));
+    assert_eq!(
+        (done.from, done.to, done.performed),
+        (0, LATEST as u64, true)
+    );
     let s = open_meta_store_with(url, SchemaMode::RequireCurrent)
         .await
         .unwrap();
-    assert_eq!(s.schema_version().await.unwrap(), Some(1));
+    assert_eq!(s.schema_version().await.unwrap(), Some(LATEST as u64));
     assert!(migrate_meta_store("mem://", false).await.is_err());
+    // Only Postgres has statistics to refresh.
+    assert!(!analyze_meta_store(url).await.unwrap());
+    assert!(!analyze_meta_store("mem://").await.unwrap());
+    assert!(analyze_meta_store("redis://x").await.is_err());
     assert_eq!(
         open_meta_store("mem://")
             .await

@@ -496,6 +496,17 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 - The crash test's HTTP agents land the same changeset again after an
   unanswered land, as a real client does, instead of rebuilding the stack on
   the new head, which landed it twice when the first land had applied.
+- Postgres statistics no longer go stale while an index is built or after a
+  bulk load (ADR 0041). Schema migration 2 makes autovacuum re-analyze
+  `derived` after 1% plus 10,000 changed rows (it waited for 10%, 1.1M rows on
+  Linux, which a new 512k-row kind never reached) and `changesets` after 2%
+  plus 10,000; `leep-git import` and `leep-server restore` run `ANALYZE` when
+  done. Deleting a derived kind (`repair drop`) no longer stalls on a kind
+  added since the last `ANALYZE`: with a one-row estimate Postgres compared
+  every row of the kind with each batch, taking 17 s for a 100-row batch on a
+  300,000-row kind and minutes for a full one; each batch now takes 30-50 ms
+  whatever the statistics. Servers older than this change refuse the
+  migrated database, as for any migration.
 
 ### Project
 - Workspace version set to 0.0.1, with a CI check that keeps it below

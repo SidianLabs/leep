@@ -19,12 +19,23 @@ use crate::{
 };
 
 /// The compiled migration list (ADR 0023). Append only.
-pub const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "initial",
-    sql: include_str!("../migrations/postgres/0001_initial.sql"),
-    satisfied_by: &["changesets", "refs", "derived", "ref_log", "ref_log_name"],
-}];
+pub const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "initial",
+        sql: include_str!("../migrations/postgres/0001_initial.sql"),
+        satisfied_by: &["changesets", "refs", "derived", "ref_log", "ref_log_name"],
+    },
+    Migration {
+        version: 2,
+        name: "analyze_thresholds",
+        sql: include_str!("../migrations/postgres/0002_analyze_thresholds.sql"),
+        satisfied_by: &[],
+    },
+];
+
+/// Every table a bulk load fills, for [`PostgresMetaStore::analyze`].
+pub(crate) const ANALYZE_TABLES: &str = "ANALYZE changesets, refs, derived, ref_log";
 
 /// Serializes migrators. Servers older than ADR 0023 take it too, around
 /// their `CREATE TABLE IF NOT EXISTS`.
@@ -90,6 +101,19 @@ impl PostgresMetaStore {
         let r = Self::run(&pool, migrations, !dry_run).await;
         pool.close().await;
         r
+    }
+
+    /// Refresh the planner statistics of every table. Autovacuum would get
+    /// there, but only a minute or more after a bulk load ends, and the
+    /// queries that run right after one (deriving indexes over what was just
+    /// imported) are the ones a stale estimate hurts (ADR 0041).
+    pub async fn analyze(&self) -> Result<()> {
+        use sqlx::Executor;
+        self.pool
+            .execute(ANALYZE_TABLES)
+            .await
+            .map(|_| ())
+            .map_err(storage)
     }
 
     async fn open(
@@ -515,12 +539,17 @@ impl MetaStore for PostgresMetaStore {
             .collect()
     }
 
+    /// Each batch is one ordered walk of the primary key, deleted by `ctid`:
+    /// a plan no estimate can change. `key IN (SELECT ...)` became a nested
+    /// loop over the whole kind per batch row when a stale estimate put the
+    /// kind at a row or two (ADR 0041). A row updated meanwhile has a new
+    /// `ctid` and goes in the next batch.
     async fn delete_derived_kind(&self, kind: &str) -> Result<u64> {
         let mut total = 0;
         loop {
             let n = sqlx::query(
-                "DELETE FROM derived WHERE kind = $1 AND key IN \
-                 (SELECT key FROM derived WHERE kind = $1 LIMIT $2)",
+                "DELETE FROM derived WHERE ctid = ANY(ARRAY( \
+                 SELECT ctid FROM derived WHERE kind = $1 ORDER BY key LIMIT $2))",
             )
             .bind(kind)
             .bind(DELETE_BATCH)

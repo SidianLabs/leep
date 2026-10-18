@@ -1026,6 +1026,29 @@ changeset still joins every chunk of each directory it rewrites, so the cost
 grows with directory width (Linux's widest directories hold thousands of
 names).
 
+**Planner statistics after bulk writes** (ADR 0041). A local reproduction on
+Postgres 16: `derived` with 600,000 rows of two kinds, `ANALYZE`, then 300,000
+rows of a new kind with autovacuum off; `changesets` analyzed at 1,000 rows,
+then grown to 300,000. Every `postgres.rs` statement was run with
+`EXPLAIN ANALYZE` under custom and generic plans, stale and after `ANALYZE`.
+Two misbehave on stale statistics, both with the kind estimated at one row:
+the batched key lookup `kind = $1 AND key = ANY($2)` (200 keys: 530 ms
+stale, 3.3 ms after `ANALYZE`), and the batch of `delete_derived_kind`, a
+nested loop comparing every row of the kind with the batch (17.0 s for a
+100-row batch, linear in the batch, so about half an hour for the 10,000-row
+batch it uses; with fresh statistics 84 ms for 100 rows, from a heap scan
+that starts at the front of the table each time). Deleting by `ctid` from
+one ordered primary-key walk takes 30-50 ms per 10,000-row batch with stale
+or fresh statistics and either plan. Lookups on the single-column primary
+keys and range scans of `(kind, key)` keep their plans either way (0.03-4 ms).
+The only `changesets` sequential scans in an import, index warming, GC,
+`verify`, `backup` and `restore` of a 2,700-changeset history were batched
+reads (`id = ANY` of 256 or 1,000 ids) and backup pages on that small table,
+which the planner rightly scans; a 256-id batch switches to the index from
+about 5,000 changesets. Statistics now follow bulk writes: migration 2
+re-analyzes `derived` after 1% of it changes and `changesets` after 2%, and
+`leep-git import` and `restore` run `ANALYZE` when done.
+
 ## Garbage collection
 
 `leep-server gc` phases timed with

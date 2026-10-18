@@ -19,12 +19,20 @@ use crate::{
 };
 
 /// The compiled migration list (ADR 0023). Append only.
-pub const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "initial",
-    sql: include_str!("../migrations/sqlite/0001_initial.sql"),
-    satisfied_by: &["changesets", "refs", "derived", "ref_log", "ref_log_name"],
-}];
+pub const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "initial",
+        sql: include_str!("../migrations/sqlite/0001_initial.sql"),
+        satisfied_by: &["changesets", "refs", "derived", "ref_log", "ref_log_name"],
+    },
+    Migration {
+        version: 2,
+        name: "analyze_thresholds",
+        sql: include_str!("../migrations/sqlite/0002_analyze_thresholds.sql"),
+        satisfied_by: &[],
+    },
+];
 
 pub struct SqliteMetaStore {
     pub(crate) pool: SqlitePool,

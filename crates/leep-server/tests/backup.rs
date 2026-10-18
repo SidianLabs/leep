@@ -483,7 +483,11 @@ async fn restore_refuses_what_it_should() {
         std::fs::write(&manifest_path, text).unwrap();
     };
     let d3 = Site::new(root.path(), "d3").await;
-    edit("\"schema_version\": 1", "\"schema_version\": 99");
+    let current = format!(
+        "\"schema_version\": {}",
+        leep_meta::snapshot::latest_schema_version()
+    );
+    edit(&current, "\"schema_version\": 99");
     let err = backup::restore(restore_opts(&out, &d3), quiet())
         .await
         .err()

@@ -357,6 +357,14 @@ or delete and never updated or deleted. `old_target` is NULL for a create,
 index come from migration 0001; databases made before the ref log existed
 gain them on upgrade, and refs that moved before then simply have no rows.
 
+Migration 0002 (`analyze_thresholds`, ADR 0041) changes no table, column or
+index. On Postgres it sets storage parameters so autovacuum re-analyzes the
+large tables sooner: `derived (autovacuum_analyze_scale_factor = 0.01,
+autovacuum_analyze_threshold = 10000)` and `changesets
+(autovacuum_analyze_scale_factor = 0.02, autovacuum_analyze_threshold =
+10000)`. The SQLite migration of the same number does nothing; it keeps the
+two backends' versions equal.
+
 ### Schema versioning (ADR 0023)
 
 ```
@@ -569,7 +577,9 @@ is `SELECT key, value FROM derived WHERE kind = ? AND key > ? ORDER BY key LIMIT
 (a range scan of the primary key `(kind, key)`, an empty `after` sorting below
 every 32-byte key), and `delete_derived_kind` is
 `DELETE FROM derived WHERE kind = ? AND key IN (SELECT key FROM derived WHERE kind = ? LIMIT 10000)`
-repeated until it removes nothing. No encoding, hash, index, table or `/v1`
+repeated until it removes nothing (on Postgres, since ADR 0041,
+`DELETE FROM derived WHERE ctid = ANY(ARRAY(SELECT ctid FROM derived WHERE kind = $1 ORDER BY key LIMIT 10000))`,
+which no statistics can turn into a nested loop). No encoding, hash, index, table or `/v1`
 shape changed, and `verify` and `repair` are not part of the HTTP API.
 `verify` lists every kind to check it; `repair` rewrites or drops only the kinds
 that history can regenerate, and refuses the rest (ADR 0025).
