@@ -1084,6 +1084,22 @@ The path-history index costs about 16 KB per changeset on Linux against
 bring in hundreds of paths from the second parent. It is now the largest
 thing Leep stores and the next storage target.
 
+**Repack after #80.** A second full repack over the finished store (10,358,516
+objects, 329,002 of them loose), `leep:a3a75de`, 4 threads:
+
+| Full repack of all of Linux | #69 (first repack) | #80 |
+|---|---|---|
+| Objects | 10.08M | 10.36M |
+| Walk | 1 h 23 min | 23 min |
+| Write | about 3 h 20 min | 44 min |
+| Total, with the 10 min fence | 4 h 55 min | 1 h 18 min |
+| Peak memory (anonymous, page cache excluded) | 6.2 GiB | 2.16 GiB |
+| Pack + index | 2.74 GB + 484 MB | 2.82 GB + 508 MB |
+
+9.73M of the 10.36M frames were copied from the old pack without
+recompressing. The blob directory went from 11 GB (the old pack plus the
+loose objects of the last 42k commits) to 3.7 GB.
+
 **Building the path-history index.** The background warmer derived it for
 `master` while the server ran (5 GB memory cap):
 
