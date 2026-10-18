@@ -188,7 +188,7 @@ impl Repo {
     /// steps at a time ([`Repo::lookup_files`]), and the steps replayed in
     /// order. A step past the end of the file's history costs only index
     /// reads, and at most a batch of them is wasted.
-    async fn walk_indexed(
+    async fn blame_walk_indexed(
         &self,
         id: ChangesetId,
         path: &RepoPath,
@@ -326,7 +326,7 @@ impl Repo {
             cached: None,
         };
         let examined = if skip {
-            self.walk_indexed(id, path, cache, &mut acc).await?
+            self.blame_walk_indexed(id, path, cache, &mut acc).await?
         } else {
             let (mut cur, mut examined) = (id, 0);
             loop {
