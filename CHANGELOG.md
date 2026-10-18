@@ -502,6 +502,13 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   means the request was refused. The timeout can cancel a `land` after it
   moved the ref, so a 408 does not mean it failed; running `leep land` again
   sends the same changeset, and the server reports the earlier success.
+- The filesystem blob store fsyncs the shard directory after renaming a new
+  blob into place (and the store root when the shard is new), so a power
+  loss can no longer drop a blob whose put was acknowledged.
+- A delete of a packed blob after an earlier tombstone append died part way
+  could be lost: the new line was appended to the torn one and readers
+  dropped the joined line. The append now cuts the torn line off first,
+  under the tombstone lock.
 - The crash test's HTTP agents land the same changeset again after an
   unanswered land, as a real client does, instead of rebuilding the stack on
   the new head, which landed it twice when the first land had applied.

@@ -7,7 +7,7 @@ use bytes::Bytes;
 use leep_core::{BlobMeta, BlobStore, Error, Hash, Result};
 use tokio::io::AsyncWriteExt;
 
-use crate::packset::{merge_listing, PackSet, DEFAULT_DECODED_CACHE};
+use crate::packset::{merge_listing, sync_dir, PackSet, DEFAULT_DECODED_CACHE};
 use crate::storage_err;
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -143,6 +143,7 @@ impl BlobStore for FsBlobStore {
             return Ok(());
         }
         let dir = path.parent().expect("blob path has a parent");
+        let new_shard = !tokio::fs::try_exists(dir).await.map_err(storage_err)?;
         tokio::fs::create_dir_all(dir).await.map_err(storage_err)?;
         let tmp = dir.join(format!(
             ".tmp-{}-{}",
@@ -161,7 +162,17 @@ impl BlobStore for FsBlobStore {
             let _ = tokio::fs::remove_file(&tmp).await;
             return Err(storage_err(e));
         }
-        Ok(())
+        // The rename, and a new shard's entry in the root, survive a power
+        // loss only once their directories are synced. Without this a blob a
+        // changeset already names could vanish.
+        let (dir, root) = (dir.to_path_buf(), self.root.clone());
+        self.blocking(move |_| {
+            if new_shard {
+                sync_dir(&root)?;
+            }
+            sync_dir(&dir)
+        })
+        .await
     }
 
     /// The loose file and the packs are read in one blocking task, so a

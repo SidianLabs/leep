@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{ErrorKind, Write};
+use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -484,6 +484,7 @@ pub(crate) fn merge_listing<'a>(
 /// Append lines to `packs/tombstones` under its lock, durably.
 pub(crate) fn append_tombstones(dir: &Path, lines: &str) -> Result<()> {
     let _lock = lock_tombstones(dir)?;
+    cut_torn_tombstone(&dir.join(TOMBSTONES))?;
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -492,6 +493,43 @@ pub(crate) fn append_tombstones(dir: &Path, lines: &str) -> Result<()> {
     f.write_all(lines.as_bytes()).map_err(storage_err)?;
     f.sync_all().map_err(storage_err)?;
     sync_dir(dir)
+}
+
+/// Cut off a last line without its newline, left by an append that died part
+/// way. Appending after it would join it to the new first line, and readers
+/// drop the joined line, losing a tombstone that was reported written. Call
+/// with the tombstone lock held. The torn line's delete never returned, so
+/// dropping it is what readers did already.
+fn cut_torn_tombstone(path: &Path) -> Result<()> {
+    let mut f = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(storage_err(e)),
+    };
+    let len = f.metadata().map_err(storage_err)?.len();
+    if len == 0 {
+        return Ok(());
+    }
+    let mut last = [0u8; 1];
+    f.seek(SeekFrom::Start(len - 1)).map_err(storage_err)?;
+    f.read_exact(&mut last).map_err(storage_err)?;
+    if last[0] == b'\n' {
+        return Ok(());
+    }
+    let mut text = Vec::new();
+    f.seek(SeekFrom::Start(0)).map_err(storage_err)?;
+    f.read_to_end(&mut text).map_err(storage_err)?;
+    let keep = text.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+    tracing::warn!(
+        bytes = text.len() - keep,
+        "cutting a torn last line off packs/tombstones"
+    );
+    f.set_len(keep as u64).map_err(storage_err)?;
+    f.sync_all().map_err(storage_err)
 }
 
 /// Exclusive lock on `packs/tombstones.lock`, released on drop.

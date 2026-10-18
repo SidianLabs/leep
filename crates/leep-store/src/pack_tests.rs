@@ -1022,3 +1022,52 @@ async fn incremental_repacks_pack_loose_objects_and_merge_small_packs() {
         );
     }
 }
+
+/// An append to `packs/tombstones` killed after any number of bytes leaves a
+/// last line without its newline. The next delete must not glue its line to
+/// that fragment, which readers would drop, losing a delete that returned.
+#[tokio::test]
+async fn a_tombstone_append_killed_at_any_byte_loses_no_later_delete() {
+    use std::io::Write as _;
+    // `<pack id> <hash>\n`: 64 + 1 + 64 + 1 bytes.
+    const LINE: usize = 130;
+    for cut in 1..LINE {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsBlobStore::new(dir.path());
+        let vs = versions(3);
+        let mut hashes = Vec::new();
+        for v in &vs {
+            hashes.push(store.put(v.clone()).await.unwrap());
+        }
+        repack(&store, chain_hints(&hashes)).await;
+        store.delete(&hashes[0]).await.unwrap();
+        let path = dir.path().join("packs/tombstones");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let pack_id = text.split(' ').next().unwrap().to_string();
+        // The killed append: part of the line deleting hashes[1].
+        let torn = crate::packset::tombstone_line(&pack_id, &hashes[1]);
+        assert_eq!(torn.len(), LINE);
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        f.write_all(&torn.as_bytes()[..cut]).unwrap();
+        drop(f);
+
+        // Another process deletes hashes[2] afterwards.
+        FsBlobStore::new(dir.path())
+            .delete(&hashes[2])
+            .await
+            .unwrap();
+        let fresh = FsBlobStore::new(dir.path());
+        let what = format!("append killed after {cut} bytes");
+        assert!(fresh.get(&hashes[0]).await.unwrap().is_none(), "{what}");
+        assert_eq!(
+            fresh.get(&hashes[1]).await.unwrap().unwrap(),
+            vs[1],
+            "the killed delete did not happen: {what}"
+        );
+        assert!(fresh.get(&hashes[2]).await.unwrap().is_none(), "{what}");
+        assert!(std::fs::read(&path).unwrap().ends_with(b"\n"), "{what}");
+    }
+}

@@ -516,7 +516,8 @@ repack.
 
 **`tombstones`**: append-only text, one line per deleted packed copy:
 `<pack id hex> <object hash hex>\n`. A final line without its newline (a
-torn append) is ignored, as is any malformed line. A tombstone hides only the
+torn append) is ignored, as is any malformed line; the next append cuts a
+torn line off first, under the lock, so the two cannot run together. A tombstone hides only the
 copy in the pack it names; a loose copy of the same hash is always served.
 Appends and rewrites hold an exclusive lock on `tombstones.lock`; a full
 repack rewrites the file (temp file, fsync, rename) keeping only lines whose
