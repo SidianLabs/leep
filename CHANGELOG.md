@@ -505,6 +505,22 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   unchanged, and so are durability and the order objects are stored in.
   `MetaStore` gains `put_changesets_with_derived` (a provided method; memory,
   SQLite and Postgres write everything atomically).
+- Faster uploads and missing-blob checks (ADR 0044). The filesystem blob
+  store no longer fsyncs a blob's directory on every put: it records the
+  directory, and `BlobStore::flush` (a new provided method) syncs every
+  recorded directory in one wave shared by concurrent callers before a
+  changeset that names the blobs is stored, a land batch stores its copies,
+  or a backup finishes. A create flushes its tree nodes and the contents it
+  names together. Stored changesets keep their guarantee that their blobs
+  survive power loss; an answered upload alone no longer has it.
+  `POST /v1/blobs/missing` checks existence in batches
+  (`BlobStore::contains_many`, a new provided method) and reads condemnation
+  rows in parallel chunks, keeping each hash's fence, existence and claim in
+  order: 90,000 unknown hashes take 0.34 to 0.44 s instead of 7 to 11 s on a
+  loaded local machine (2.2 to 2.9 s on the VPS before). Uploads write their
+  claim alongside the condemnation read; upload p50 with 64 agents on one
+  ref halves. Fixed: two puts creating the same new shard could both skip
+  syncing the store root, and a loose copy a repack puts back was not synced.
 - GC marks incrementally (ADR 0033): each `gc` run records what it marked in
   `gc-mark-v1` rows, written so that a row always vouches for everything below
   it, and the next run walks only changesets stored since and stops at marked
@@ -538,7 +554,8 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   sends the same changeset, and the server reports the earlier success.
 - The filesystem blob store fsyncs the shard directory after renaming a new
   blob into place (and the store root when the shard is new), so a power
-  loss can no longer drop a blob whose put was acknowledged.
+  loss can no longer drop a blob a stored changeset names. (Since ADR 0044
+  the sync happens at the next flush, before such a changeset is stored.)
 - A delete of a packed blob after an earlier tombstone append died part way
   could be lost: the new line was appended to the torn one and readers
   dropped the joined line. The append now cuts the torn line off first,

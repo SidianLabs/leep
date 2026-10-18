@@ -74,6 +74,11 @@ async fn ensure_dir(
 /// Apply `changes` to the tree `base`, rewriting only directories on changed
 /// paths and pruning empty ones. Returns the new root hash. Errors with
 /// `Invalid` for deletes of absent files and file/directory clashes.
+///
+/// The nodes written and the contents `changes` names are flushed
+/// (`BlobStore::flush`) before it returns, so the changeset built on the
+/// result can be stored at once (ADR 0044). Callers check the contents exist
+/// first, so the flush follows whatever write made them visible.
 pub(crate) async fn apply_changes(
     repo: &Repo,
     base: Hash,
@@ -82,7 +87,8 @@ pub(crate) async fn apply_changes(
     if changes.is_empty() {
         if base == TreeNode::empty_hash() {
             let empty = TreeNode::default();
-            repo.put_rescuing(base, Bytes::from(empty.encode())).await?;
+            repo.put_rescuing_many(vec![(base, Bytes::from(empty.encode()))], &[])
+                .await?;
         }
         return Ok(base);
     }
@@ -157,7 +163,16 @@ pub(crate) async fn apply_changes(
     let root = nodes.remove("").expect("root");
     let h = root.hash();
     rewritten.push((h, Bytes::from(root.encode())));
-    repo.put_rescuing_many(rewritten).await?;
+    let mut named: Vec<Hash> = changes
+        .values()
+        .filter_map(|c| match c {
+            FileChange::Modify { content, .. } => Some(*content),
+            FileChange::Delete => None,
+        })
+        .collect();
+    named.sort_unstable();
+    named.dedup();
+    repo.put_rescuing_many(rewritten, &named).await?;
     Ok(h)
 }
 
@@ -341,5 +356,183 @@ impl Repo {
         };
         let to_tree = self.root_tree(to).await?;
         self.diff_trees(from_tree, to_tree, prefix).await
+    }
+}
+
+/// A tree node read for lookups only: its encoded bytes and where each entry
+/// starts. Path-history derivation looks up a few names in each directory on
+/// a changed path, twice per changeset (old and new tree); decoding a
+/// directory of thousands of names into a map of owned names, and dropping
+/// it when the cache rotates, cost more than the rest of the derivation.
+/// A view costs one pass over the bytes and no allocation per entry.
+pub(crate) struct TreeView {
+    bytes: Bytes,
+    /// Per entry, by name: where its name starts, the name's length, and
+    /// where its `TreeEntry` starts.
+    index: Vec<(u32, u32, u32)>,
+}
+
+impl TreeView {
+    /// The view of an encoded tree node, which answers lookups exactly as
+    /// the decoded node would. Bytes that are not a canonical encoding
+    /// (names out of order, trailing bytes) are decoded as before, with the
+    /// same errors, and viewed through their canonical encoding.
+    pub(crate) fn parse(bytes: Bytes) -> Result<Self> {
+        if let Some(index) = Self::scan(&bytes) {
+            return Ok(TreeView { bytes, index });
+        }
+        let bytes = Bytes::from(TreeNode::decode(&bytes)?.encode());
+        let index = Self::scan(&bytes)
+            .ok_or_else(|| Error::Encoding("tree node does not re-encode canonically".into()))?;
+        Ok(TreeView { bytes, index })
+    }
+
+    pub(crate) fn empty() -> Self {
+        TreeView::parse(Bytes::from(TreeNode::default().encode())).expect("the empty node parses")
+    }
+
+    fn scan(b: &[u8]) -> Option<Vec<(u32, u32, u32)>> {
+        u32::try_from(b.len()).ok()?;
+        let mut pos = 0;
+        let n = varint(b, &mut pos)?;
+        let mut index = Vec::with_capacity(n.min(b.len()));
+        let mut prev: Option<&[u8]> = None;
+        for _ in 0..n {
+            let len = varint(b, &mut pos)?;
+            let name = b.get(pos..pos.checked_add(len)?)?;
+            std::str::from_utf8(name).ok()?;
+            if prev.is_some_and(|p| p >= name) {
+                return None;
+            }
+            let name_at = pos;
+            pos += len;
+            let entry_at = pos;
+            // A `TreeEntry`: variant 0 (`File`) with a hash, a kind and a
+            // size, or 1 (`Dir`) with a hash. Skipped without decoding: the
+            // hash alone is 32 fields to postcard.
+            let tag = varint(b, &mut pos)?;
+            pos = pos.checked_add(32).filter(|&p| p <= b.len())?;
+            match tag {
+                0 => {
+                    if varint(b, &mut pos)? > 2 {
+                        return None;
+                    }
+                    varint(b, &mut pos)?;
+                }
+                1 => {}
+                _ => return None,
+            }
+            let pos_after = pos;
+            pos = entry_at;
+            index.push((
+                u32::try_from(name_at).ok()?,
+                u32::try_from(len).ok()?,
+                u32::try_from(pos).ok()?,
+            ));
+            pos = pos_after;
+            prev = Some(name);
+        }
+        (pos == b.len()).then_some(index)
+    }
+
+    pub(crate) fn get(&self, name: &str) -> Result<Option<TreeEntry>> {
+        let Ok(i) = self.index.binary_search_by(|&(at, len, _)| {
+            self.bytes[at as usize..(at + len) as usize].cmp(name.as_bytes())
+        }) else {
+            return Ok(None);
+        };
+        let at = self.index[i].2 as usize;
+        Ok(Some(
+            postcard::take_from_bytes::<TreeEntry>(&self.bytes[at..])?.0,
+        ))
+    }
+
+    /// About the memory it holds, for cache accounting.
+    pub(crate) fn size(&self) -> usize {
+        self.bytes.len() + 12 * self.index.len()
+    }
+}
+
+/// A postcard varint (LEB128, at most 10 bytes) at `pos`, advancing it.
+fn varint(b: &[u8], pos: &mut usize) -> Option<usize> {
+    let mut v: u64 = 0;
+    for i in 0..10 {
+        let byte = *b.get(*pos)?;
+        *pos += 1;
+        if i == 9 && byte > 1 {
+            return None;
+        }
+        v |= u64::from(byte & 0x7f) << (7 * i);
+        if byte & 0x80 == 0 {
+            return usize::try_from(v).ok();
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use leep_core::FileKind;
+
+    fn node(n: usize) -> TreeNode {
+        TreeNode {
+            entries: (0..n)
+                .map(|i| {
+                    let e = if i % 3 == 0 {
+                        TreeEntry::Dir {
+                            tree: Hash([i as u8; 32]),
+                        }
+                    } else {
+                        TreeEntry::File {
+                            content: Hash([7; 32]),
+                            kind: [FileKind::Regular, FileKind::Executable, FileKind::Symlink]
+                                [i % 3],
+                            size: (i as u64) << (i % 50),
+                        }
+                    };
+                    (format!("n{i:05}é"), e)
+                })
+                .collect(),
+        }
+    }
+
+    /// A view answers every lookup as the decoded node does, including for
+    /// bytes that are not a canonical encoding.
+    #[test]
+    fn tree_views_answer_as_decoded_nodes() {
+        for n in [0, 1, 2, 300, 3000] {
+            let t = node(n);
+            let view = TreeView::parse(Bytes::from(t.encode())).unwrap();
+            for (name, e) in &t.entries {
+                assert_eq!(view.get(name).unwrap().as_ref(), Some(e));
+            }
+            for name in ["", "a", "n00001", "zzz"] {
+                assert_eq!(view.get(name).unwrap(), None);
+            }
+        }
+        // Names out of order and a duplicate: postcard decodes them into the
+        // map, the last duplicate winning.
+        let a = TreeEntry::Dir {
+            tree: Hash([1; 32]),
+        };
+        let b = TreeEntry::Dir {
+            tree: Hash([2; 32]),
+        };
+        let pairs = vec![
+            ("y".to_string(), a.clone()),
+            ("x".to_string(), a.clone()),
+            ("y".to_string(), b.clone()),
+        ];
+        let bytes = postcard::to_stdvec(&pairs).unwrap();
+        let decoded = TreeNode::decode(&bytes).unwrap();
+        let view = TreeView::parse(Bytes::from(bytes)).unwrap();
+        for name in ["x", "y", "z"] {
+            assert_eq!(view.get(name).unwrap().as_ref(), decoded.entries.get(name));
+        }
+        // Damage is the decoder's error.
+        let mut bytes = node(5).encode();
+        bytes.truncate(bytes.len() - 3);
+        assert!(TreeView::parse(Bytes::from(bytes)).is_err());
     }
 }

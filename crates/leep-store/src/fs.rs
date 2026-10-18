@@ -5,9 +5,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
 use leep_core::{BlobMeta, BlobStore, Error, Hash, Result};
-use tokio::io::AsyncWriteExt;
+use std::io::Write;
 
-use crate::packset::{merge_listing, sync_dir, PackSet, DEFAULT_DECODED_CACHE};
+use crate::dirsync::DirSyncer;
+use crate::packset::{merge_listing, PackSet, DEFAULT_DECODED_CACHE};
 use crate::storage_err;
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -15,10 +16,15 @@ static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// Blobs on the local filesystem: loose at `<root>/<2 hex>/<62 hex>`, and
 /// packed in `<root>/packs/` once `repack` has run (ADR 0029). New writes are
 /// always loose; reads try the loose file first, then the packs.
+///
+/// A put syncs its file but not its directory; [`BlobStore::flush`] syncs
+/// the directories of every put since the last flush (ADR 0044). Clones share
+/// that record, so a flush on one covers puts through another.
 #[derive(Clone)]
 pub struct FsBlobStore {
     root: PathBuf,
     pub(crate) packs: Arc<PackSet>,
+    dirs: Arc<DirSyncer>,
 }
 
 impl std::fmt::Debug for FsBlobStore {
@@ -40,7 +46,18 @@ impl FsBlobStore {
     pub fn with_decoded_cache(root: impl Into<PathBuf>, bytes: usize) -> Self {
         let root = root.into();
         let packs = Arc::new(PackSet::new(&root, bytes));
-        Self { root, packs }
+        let dirs = Arc::new(DirSyncer::new(&root));
+        Self { root, packs, dirs }
+    }
+
+    /// Directory fsyncs issued by flushes so far, for tests.
+    pub fn dir_syncs(&self) -> u64 {
+        self.dirs.syncs()
+    }
+
+    /// Directories with renames a flush has not synced yet, for tests.
+    pub fn unsynced_dirs(&self) -> usize {
+        self.dirs.pending()
     }
 
     pub fn root(&self) -> &Path {
@@ -136,43 +153,103 @@ pub(crate) fn unix_secs(t: std::time::SystemTime) -> Option<i64> {
 impl BlobStore for FsBlobStore {
     /// A packed copy does not count: the loose write refreshes `modified`,
     /// which GC's grace window needs (ADR 0012), and a loose copy also
-    /// outlives a tombstone on the packed one.
+    /// outlives a tombstone on the packed one. One blocking task does the
+    /// whole write. The directory is synced by the next [`flush`](Self::flush),
+    /// which is also told about a blob found already stored, since it may be
+    /// another writer's rename that is not synced yet.
     async fn put_with_hash(&self, hash: Hash, data: Bytes) -> Result<()> {
         let path = self.path_for(&hash);
-        if touch(&path).map_err(storage_err)? {
-            return Ok(());
-        }
-        let dir = path.parent().expect("blob path has a parent");
-        let new_shard = !tokio::fs::try_exists(dir).await.map_err(storage_err)?;
-        tokio::fs::create_dir_all(dir).await.map_err(storage_err)?;
-        let tmp = dir.join(format!(
-            ".tmp-{}-{}",
-            std::process::id(),
-            TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        let res = async {
-            let mut f = tokio::fs::File::create(&tmp).await?;
-            f.write_all(&data).await?;
-            f.sync_all().await?;
-            drop(f);
-            tokio::fs::rename(&tmp, &path).await
-        }
-        .await;
-        if let Err(e) = res {
-            let _ = tokio::fs::remove_file(&tmp).await;
-            return Err(storage_err(e));
-        }
-        // The rename, and a new shard's entry in the root, survive a power
-        // loss only once their directories are synced. Without this a blob a
-        // changeset already names could vanish.
-        let (dir, root) = (dir.to_path_buf(), self.root.clone());
+        let dirs = self.dirs.clone();
+        let shard = hash.0[0];
         self.blocking(move |_| {
-            if new_shard {
-                sync_dir(&root)?;
+            if touch(&path).map_err(storage_err)? {
+                dirs.mark(shard);
+                return Ok(());
             }
-            sync_dir(&dir)
+            let dir = path.parent().expect("blob path has a parent");
+            std::fs::create_dir_all(dir).map_err(storage_err)?;
+            let tmp = dir.join(format!(
+                ".tmp-{}-{}",
+                std::process::id(),
+                TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+            ));
+            let res = (|| {
+                let mut f = std::fs::File::create(&tmp)?;
+                f.write_all(&data)?;
+                f.sync_all()?;
+                drop(f);
+                std::fs::rename(&tmp, &path)
+            })();
+            if let Err(e) = res {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(storage_err(e));
+            }
+            dirs.mark(shard);
+            Ok(())
         })
         .await
+    }
+
+    /// Syncs the shard directories (and the root for shards it has not
+    /// synced it for) of every put since the last flush and of `named`, all
+    /// at once. Concurrent flushes share waves.
+    async fn flush(&self, named: &[Hash]) -> Result<()> {
+        self.dirs.flush(named.iter().map(|h| h.0[0])).await
+    }
+
+    /// Stats the loose files in a few blocking tasks, then looks up the
+    /// misses in the packs after one rescan, instead of a task and a rescan
+    /// per hash. Every miss is looked up in packs scanned after its stat, as
+    /// in `contains`.
+    async fn contains_many(&self, hashes: &[Hash]) -> Result<Vec<bool>> {
+        const CHUNK: usize = 4096;
+        if hashes.len() <= 1 {
+            let mut out = Vec::with_capacity(hashes.len());
+            for h in hashes {
+                out.push(self.contains(h).await?);
+            }
+            return Ok(out);
+        }
+        let mut tasks = Vec::new();
+        for chunk in hashes.chunks(CHUNK) {
+            let paths: Vec<PathBuf> = chunk.iter().map(|h| self.path_for(h)).collect();
+            tasks.push(tokio::task::spawn_blocking(move || {
+                paths
+                    .iter()
+                    .map(|p| p.try_exists().map_err(storage_err))
+                    .collect::<Result<Vec<bool>>>()
+            }));
+        }
+        let mut found = Vec::with_capacity(hashes.len());
+        for t in tasks {
+            found.extend(
+                t.await
+                    .map_err(|e| Error::Storage(format!("stat task failed: {e}")))??,
+            );
+        }
+        let misses: Vec<(usize, Hash)> = found
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| !**f)
+            .map(|(i, _)| (i, hashes[i]))
+            .collect();
+        if misses.is_empty() {
+            return Ok(found);
+        }
+        let packed = self
+            .blocking(move |p| {
+                let v = p.refresh()?;
+                Ok(misses
+                    .into_iter()
+                    .filter(|(_, h)| v.locate(h).is_some())
+                    .map(|(i, _)| i)
+                    .collect::<Vec<usize>>())
+            })
+            .await?;
+        for i in packed {
+            found[i] = true;
+        }
+        Ok(found)
     }
 
     /// The loose file and the packs are read in one blocking task, so a
@@ -268,6 +345,58 @@ mod tests {
         std::fs::write(dir.path().join(&hex[..2]).join(".tmp-1-1"), b"x").unwrap();
         std::fs::write(dir.path().join(&hex[..2]).join("junk"), b"x").unwrap();
         assert_eq!(store.list_page(None, 10).await.unwrap().len(), 1);
+    }
+
+    /// A put syncs its file but leaves its directory (and a new shard's
+    /// entry in the root) to the next flush, which syncs each once (ADR
+    /// 0044). Finding a blob already stored also counts, since that may be
+    /// another writer's unsynced rename, and so does naming it in a flush.
+    #[tokio::test]
+    async fn puts_leave_their_directories_to_the_next_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsBlobStore::new(dir.path());
+        let mut shards = std::collections::HashSet::new();
+        for i in 0..20u32 {
+            let h = store.put(Bytes::from(format!("blob {i}"))).await.unwrap();
+            shards.insert(h.0[0]);
+        }
+        assert_eq!(store.dir_syncs(), 0, "no put synced a directory");
+        assert_eq!(store.unsynced_dirs(), shards.len() + 1, "shards and root");
+        store.flush(&[]).await.unwrap();
+        assert_eq!(store.dir_syncs(), shards.len() as u64 + 1);
+        assert_eq!(store.unsynced_dirs(), 0);
+        store.flush(&[]).await.unwrap();
+        assert_eq!(store.dir_syncs(), shards.len() as u64 + 1, "nothing new");
+
+        // Another handle on the same directory: a process that did not write
+        // the blob, or one restarted since.
+        let other = FsBlobStore::new(dir.path());
+        let h = store.put(Bytes::from_static(b"blob 0")).await.unwrap();
+        assert_eq!(store.unsynced_dirs(), 1, "found present: its shard");
+        other.flush(&[h]).await.unwrap();
+        assert_eq!(other.dir_syncs(), 2, "the named shard and, once, the root");
+        let packed_only = Hash::of_blob(b"in no shard directory");
+        other.flush(&[packed_only]).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn contains_many_matches_contains() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsBlobStore::new(dir.path());
+        let mut asked = Vec::new();
+        for i in 0..5000u32 {
+            let data = Bytes::from(format!("blob {i}"));
+            if i % 3 == 0 {
+                asked.push(store.put(data).await.unwrap());
+            } else {
+                asked.push(Hash::of_blob(&data));
+            }
+        }
+        let many = store.contains_many(&asked).await.unwrap();
+        for (h, found) in asked.iter().zip(&many) {
+            assert_eq!(*found, store.contains(h).await.unwrap());
+        }
+        assert_eq!(many.iter().filter(|f| **f).count(), 1667);
     }
 
     #[tokio::test]

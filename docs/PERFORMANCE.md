@@ -282,8 +282,72 @@ cargo build --release -p leep-server -p leep-soak
 target/release/leep-server --meta <url> --blobs file:///tmp/b --listen 127.0.0.1:7391 \
   --metrics-listen 127.0.0.1:7392 --warm-interval 0 --request-timeout 0 &
 target/release/leep-land-bench --server http://127.0.0.1:7391 \
-  --metrics http://127.0.0.1:7392 --agents 1,4,16,64 --duration 10
+  --metrics http://127.0.0.1:7392 --agents 1,4,16,64 --duration 10 --missing 90000
 ```
+`--missing 90000` first times `POST /v1/blobs/missing` with 90,000 hashes
+that were never stored, three times.
+
+**Write path (ADR 0044).** After staged batches, on a 4-vCPU VPS (Postgres
+16, blobs on a real disk) 64 agents landed about 117 times a second and the
+limit was the agents' own requests: put p50 66 to 110 ms, create p50 130 to
+215 ms (one agent: 6.5 and 10.5 ms). Timers on the put and create paths and
+a `perf` profile of the server at 64 agents (local run) found:
+
+- Every put fsynced its shard directory after the rename, and every create
+  wrote three or four tree nodes, each with its own file and directory
+  fsync. Nothing needs an upload's directory synced until a changeset names
+  the blob.
+- `missing_blobs` checked existence one hash at a time: a blocking task per
+  hash and, for every miss, a rescan of `packs/` under a lock (25 to 80 µs
+  each), 2.2 to 2.9 s for 90,000 hashes on the VPS and 7 to 11 s on the
+  loaded local machine. The batched condemnation read before it (one query
+  of 90,000 keys) took 0.2 to 0.3 s in Postgres.
+- A put made three round trips in turn: the blob write (six hops to the
+  blocking pool through `tokio::fs`), the condemnation read, the claim write.
+- Under load each Postgres round trip took 5 to 15 ms, but Postgres itself
+  was mostly idle (10 of 16 pooled connections idle, the rest waiting on the
+  server) and raising the pool from 16 to 48 connections changed nothing
+  beyond the noise: the server was short of CPU, most of it (30% of samples)
+  in the kernel scheduling threads, not in the pool. A separate pool for the
+  land leader would not have helped here and was left out.
+
+Fixed: a put syncs only its file and records the directory, and a flush
+before every changeset write syncs the recorded directories in one wave
+shared by every request waiting (`BlobStore::flush`); a create's tree nodes
+and the contents it names share one wave. The blob write is one blocking
+task. The claim is written alongside the condemnation read. `missing_blobs`
+runs in phases over all hashes (condemnation rows in parallel chunks, fences
+of the few with a row 64 at a time, existence in one batched
+`contains_many` that stats in a few tasks and rescans the packs once,
+claims), keeping each hash's order.
+
+Same local 4-vCPU Xeon as below, shared with other agents' builds and tests
+(load average 6 to 8 throughout), Postgres 16, blobs on ext4. Before is
+`main` with staged batches; run alternately, two rounds, both shown
+(round 1 / round 2; latency cells read before → after):
+
+| Agents | Lands/s before | Lands/s after | Put p50 ms | Put p99 ms | Create p50 ms | Create p99 ms |
+|---|---|---|---|---|---|---|
+| 1 | 40 / 77 | 110 / 84 | 9.3 / 3.5 → 1.8 / 3.0 | 20.7 / 8.7 → 5.6 / 6.5 | 8.1 / 5.2 → 4.0 / 5.2 | 20.1 / 11.7 → 9.5 / 10.9 |
+| 4 | 115 / 72 | 98 / 135 | 4.9 / 7.2 → 3.8 / 3.1 | 14.8 / 23.7 → 15.6 / 8.3 | 7.2 / 11.4 → 9.4 / 7.8 | 17.9 / 30.5 → 31.5 / 15.1 |
+| 16 | 162 / 139 | 175 / 239 | 13.0 / 14.3 → 7.6 / 6.3 | 36.8 / 57.7 → 28.9 / 17.8 | 20.5 / 23.1 → 24.3 / 19.9 | 52.1 / 75.9 → 70.1 / 36.0 |
+| 64 | 184 / 160 | 170 / 231 | 39.8 / 42.3 → 22.2 / 18.9 | 121 / 139 → 118 / 45 | 76.7 / 93.1 → 81.4 / 64.8 | 169 / 181 → 202 / 123 |
+
+`POST /v1/blobs/missing`, 90,000 never-stored hashes in one request, three
+runs each round: 9.2 to 11.6 s / 6.8 to 7.3 s before, 0.34 to 0.44 s / 0.35
+to 0.40 s after. What is left is mostly the condemnation lookup in Postgres
+(one index probe per key) and parsing the 6 MB request.
+
+No run lost a CAS or answered 409. Uploads are faster at every agent count,
+about half the time at 16 and 64 agents. Creates and lands per second at 4
+to 64 agents moved within the machine's noise (the two rounds disagree more
+than before and after do): a create now waits for a sync wave that holds
+every directory written since the previous one, by all agents, instead of
+only its own syncs, so under heavy load it trades its own fsyncs for a share
+of a larger wave. On storage where each fsync is slower (the VPS: 1.3 to
+2 ms per directory sync) the saving per upload and per create is larger.
+Earlier runs during the work, with lower load, gave 300 to 320 lands/s at 64
+agents against 184 to 220 before.
 
 **Staged batches (ADR 0043).** Group commit (below) made the ref move once per
 batch, but each replay inside the batch still went to the stores: on a 4-vCPU
@@ -1181,13 +1245,104 @@ decoded-object cache resumes each delta chain from the previous version, so a
 tree read averaged 83-85 us packed against 77-88 us loose. The cold full listing is
 another matter (9.7 s on Linux), not addressed here.
 
-What remains: the twelve-parent merge still takes about 1 s and the largest
-two-parent merges 0.5-0.9 s (thousands of paths a side branch's mainline merge
-made its own); skiplist reads in `merge_base`, read one per round trip and not
-cached so that verification never trusts a row it has not checked; and a
-changeset still joins every chunk of each directory it rewrites, so the cost
-grows with directory width (Linux's widest directories hold thousands of
-names).
+What remained after that: the twelve-parent merge still took about 1 s and
+the largest two-parent merges 0.5-0.9 s; skiplist reads in `merge_base`, one
+per round trip; and a changeset still joined every chunk of each directory it
+rewrote, so the cost grew with directory width.
+
+**Wide directories.** Later Linux has 70,000-90,000 files, directories of
+thousands of names (`drivers/*`, `arch/*`) and many more merges, and the full
+history derived at only about 40 changesets a second there, CPU-bound in the
+server. Reproduced with a synthetic history of that shape: `history_profile
+--synth N` (generator in `crates/leep-derive/benches/support/wide_history.rs`)
+imports 83,000 files, 12 directories of 2,000-5,000 files and 800 directories
+of 52 in 42 changesets, then grows them with 8 subsystem branches that take
+topic merges, merge mainline back into themselves and are merged into
+mainline, so most merges carry hundreds of paths from their second parent.
+6,000 changesets of it (5,860 on the head's history) derived at 80 a second
+on in-memory stores and 52-55 on Postgres, against about 200 for the
+narrower v2.6.16 slice. Per-phase timers and `perf` (not kept), in-memory
+stores, 3,900 changesets:
+
+| Phase | Before | After |
+|---|---|---|
+| Rebuilding directories (join every chunk, re-cut, compare) | 19.9 s | 3.6 s |
+| First parent's entries (joins every directory on a spine) | 14.7 s | 0.6 s |
+| Old and new tree lookups (decode wide tree nodes, drop them on eviction) | 13.7 s | 0.5 s |
+| Merge diffs (join both sides' unshared chunks) | 5.1 s | 1.5 s |
+| All of the derivation | 55 s | 8.4 s |
+
+On Postgres the store added single `last_merge-v1` writes (one per changeset:
+4.9 s on the synthetic history, 56 s on the slice), skiplist reads in `merge_base` (12,184, 4.4-5.6 s) and,
+on the Linux slice, 37,558 single history-row reads (16-21 s) that missed the
+64 MiB row cache.
+
+**Fixes** (rows unchanged: every `history-tree-v3` and `history-node-v3` row of
+the old and new derivations compared equal, by key and value hash, on the
+synthetic history in memory and on Postgres, 137,961 rows, and on the
+v2.6.16 slice, 311,439 rows):
+
+- A directory is edited chunk by chunk (`Repo::stage_history_edit`). Chunks
+  are cut after boundary names wherever they fall, so the runs of chunks
+  between boundary names that hold no changed name are the base's chunks;
+  only the runs that do are read and cut again, each chunk against the same
+  predecessor a full rebuild picks. Tests check every edit against a full
+  rebuild. The first parent's directories are looked up chunk-locally like
+  the other parents'.
+- Tree nodes are read as views (`TreeView`): the encoded bytes and an offset
+  per entry, built in one pass without allocating, looked up by binary
+  search. The directories a changeset reads are loaded a level of the tree at
+  a time with the reads of a level in flight together, and the history rows
+  of the other parents and the merge base a batch per level.
+- Merge diffs compare split nodes a run of chunks at a time; a run of one
+  chunk a side whose rows are patches on the same keyframe is compared only
+  at the names the patches set. Merge diffs read a level's rows in one batch.
+- Staged values (`history-tree-v3`, and now `last_merge-v1`) are found by
+  later derivations in the same run, so a window's rows go in one write
+  instead of a write before every merge; `last_merge-v1` is staged, and
+  derived for a window from the changesets in hand before its merges ask.
+- Skiplist rows read by ancestry queries are kept for the duration of one
+  path-history derivation (not across derivations, so a repaired row is read
+  again).
+- Smaller costs: rows are encoded and hashed only when chosen, chunk lists
+  are resolved by merging instead of through a map, and hash-keyed caches
+  hash with a cheap mix instead of SipHash.
+
+| Deriving the index, release builds, local Postgres 16 over TCP, blobs on tmpfs, two runs each | Before | After |
+|---|---|---|
+| Synthetic late-Linux shape, in memory (5,860 changesets) | 70-74 s, 80-83 per second | 14-16 s, **371-406 per second** (4.6-4.9x) |
+| Synthetic late-Linux shape, Postgres | 106-114 s, 52-55 per second | 28-29 s, **201-211 per second** (3.8-3.9x) |
+| v2.6.16 slice, Postgres, `last_merge-v1` derived too | 197-262 s, 81-107 per second | 89-90 s, **235-237 per second** |
+| v2.6.16 slice, Postgres, `last_merge-v1` present | 153 s, 138 per second | 89 s, **236 per second** |
+
+Peak RSS was 206-242 MiB before and after on Postgres. The machine was shared
+(load 1-6), which moved the old code's runs most. Store calls after, on the
+v2.6.16 slice (first run):
+
+| Call | Calls | Items | Time |
+|---|---|---|---|
+| blob `get` (tree nodes, 16 in flight) | 112,731 | | 12.4 s |
+| `put_derived_many` | 520 | 392,241 | 12.4 s |
+| `get_derived` skiplists (`merge_base`) | 11,267 | | 4.8 s |
+| `get_derived_many` history nodes | 3,202 | 44,049 | 2.2 s |
+| `get_changesets` | 814 | 42,730 | 2.8 s |
+| `get_derived` history nodes (cache misses) | 2,480 | | 1.2 s |
+| the rest | 3,612 | | 2.3 s |
+
+`cargo bench -p leep-derive -- derive_history` has a wide case
+(`wide_merges_300_changesets`, directories of 1,000-2,000 files): 438 ms
+before, 141 ms after; `1000_changesets` 56 ms before, 46 ms after; path `log`
+and `last_change` queries unchanged.
+
+What remains: CPU in the chunk edits (copying the chunks of a run and the
+chunk list, about 150 refs for a 5,000-name directory, once per changed
+directory), resolving list patches each time a cursor opens a directory
+(not cached), skiplist reads in `merge_base` on the first meeting of each
+chain (one per round trip), and the writes themselves. The row cache stays
+at 64 MiB: on the slice, 256 MiB made misses vanish and derived at 241 a
+second, but the whole slice's rows then fit, which says nothing about full
+Linux; batching took most of the same gain without the memory. Not measured
+here: the packed blob store and the full Linux history.
 
 **Stale planner statistics.** On the full Linux database the first run of
 this code derived only about 500 changesets a minute, with Postgres at 100%

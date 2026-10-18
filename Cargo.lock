@@ -2352,6 +2352,7 @@ dependencies = [
  "async-trait",
  "blake3",
  "bytes",
+ "futures-util",
  "hex",
  "postcard",
  "serde",

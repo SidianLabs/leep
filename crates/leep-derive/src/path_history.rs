@@ -1,7 +1,7 @@
 //! Path log and last-change queries answered from the `history-tree-v3`
 //! index instead of a scan of all ancestors (ADR 0013).
 
-use std::collections::{BTreeMap, BinaryHeap, HashSet};
+use std::collections::{BTreeSet, BinaryHeap, HashSet};
 use std::ops::Bound;
 use std::sync::Arc;
 
@@ -252,6 +252,46 @@ fn within(lo: &str, hi: &str, first: &str, next: Option<&str>) -> bool {
     lo >= first && next.is_none_or(|n| hi < n)
 }
 
+/// Where chunk `k` of `refs` ends: the next chunk's first name, `None` for
+/// the last.
+fn run_end(refs: &[ChunkRef], k: usize) -> Option<&str> {
+    refs.get(k + 1).map(|r| r.first.as_str())
+}
+
+/// Append to `out` the names whose entries differ between two name-ordered
+/// entry lists, with both entries.
+fn diff_sorted<'a>(
+    a: impl Iterator<Item = (&'a String, &'a HistoryEntry)>,
+    b: impl Iterator<Item = (&'a String, &'a HistoryEntry)>,
+    out: &mut Vec<(String, Option<HistoryEntry>, Option<HistoryEntry>)>,
+) {
+    let (mut a, mut b) = (a.peekable(), b.peekable());
+    loop {
+        match (a.peek(), b.peek()) {
+            (Some(x), Some(y)) if x.0 == y.0 => {
+                if x.1 != y.1 {
+                    out.push((x.0.clone(), Some(x.1.clone()), Some(y.1.clone())));
+                }
+                a.next();
+                b.next();
+            }
+            (Some(x), Some(y)) if x.0 < y.0 => {
+                out.push((x.0.clone(), Some(x.1.clone()), None));
+                a.next();
+            }
+            (Some(x), None) => {
+                out.push((x.0.clone(), Some(x.1.clone()), None));
+                a.next();
+            }
+            (_, Some(y)) => {
+                out.push((y.0.clone(), None, Some(y.1.clone())));
+                b.next();
+            }
+            (None, None) => break,
+        }
+    }
+}
+
 impl Repo {
     /// Root history node of `id`, deriving the index for its ancestors first.
     pub(crate) async fn history_root(&self, id: ChangesetId) -> Result<Hash> {
@@ -279,7 +319,7 @@ impl Repo {
     /// node costs two round trips rather than one or two per chunk. Only
     /// fills the cache: whatever this misses or cannot check is read again,
     /// singly, by the caller, with its errors.
-    async fn prefetch_history_rows(&self, hashes: impl Iterator<Item = Hash>) {
+    pub(crate) async fn prefetch_history_rows(&self, hashes: impl Iterator<Item = Hash>) {
         let mut want: Vec<Hash> = hashes.collect();
         for _ in 0..2 {
             let empty = HistoryNode::empty_hash();
@@ -339,7 +379,9 @@ impl Repo {
         resolve_row(hash, (*row).clone(), key.as_deref())
     }
 
-    /// Read one history node, joining its chunks if it is split.
+    /// Read one history node, joining its chunks if it is split. Derivation
+    /// edits nodes chunk by chunk instead; tests compare against this.
+    #[cfg(test)]
     pub(crate) async fn read_history_node(&self, node: Hash) -> Result<HistoryNode> {
         let refs = match self.read_resolved(node).await?.node {
             StoredHistoryNode::Split(refs) => refs,
@@ -374,55 +416,198 @@ impl Repo {
     }
 
     /// The names whose entries differ between the history nodes `a` and `b`,
-    /// with both entries. Chunks the two share are skipped unread: a chunk
-    /// row holds the same names and entries in both, and no other chunk of
-    /// either holds those names.
+    /// with both entries, in name order.
+    ///
+    /// Split nodes are compared a run of chunks at a time, between first
+    /// names both lists share, so names in a run are in no other chunk of
+    /// either side. A run of one chunk the two share is skipped unread. A
+    /// run of one chunk a side, both patches on the same keyframe, differs
+    /// at most in the names the patches set, so only those are compared: the
+    /// merge base's and the second parent's versions of a directory are
+    /// usually such siblings, and joining them cost as much as the rest of
+    /// a merge. Other runs are joined and compared in full.
     pub(crate) async fn diff_history_nodes(
         &self,
         a: Hash,
         b: Hash,
     ) -> Result<Vec<(String, Option<HistoryEntry>, Option<HistoryEntry>)>> {
         let (ra, rb) = (self.read_resolved(a).await?, self.read_resolved(b).await?);
-        let shared: HashSet<Hash> = match (&ra.node, &rb.node) {
-            (StoredHistoryNode::Split(x), StoredHistoryNode::Split(y)) => {
-                let x: HashSet<Hash> = x.iter().map(|r| r.node).collect();
-                y.iter().map(|r| r.node).filter(|h| x.contains(h)).collect()
+        let (x, y) = match (ra.node, rb.node) {
+            (StoredHistoryNode::Split(x), StoredHistoryNode::Split(y)) => (x, y),
+            (na, nb) => {
+                let ea = self.resolved_entries(a, na).await?;
+                let eb = self.resolved_entries(b, nb).await?;
+                let mut out = Vec::new();
+                diff_sorted(
+                    ea.iter().map(|(n, e)| (n, e)),
+                    eb.iter().map(|(n, e)| (n, e)),
+                    &mut out,
+                );
+                return Ok(out);
             }
-            _ => HashSet::new(),
         };
-        let mut sides: Vec<BTreeMap<String, HistoryEntry>> = Vec::with_capacity(2);
-        for (node, row) in [(a, ra), (b, rb)] {
-            sides.push(match row.node {
-                StoredHistoryNode::Flat(n) => n.entries,
-                StoredHistoryNode::Split(refs) => {
-                    let mut out = BTreeMap::new();
-                    let keep: Vec<usize> = (0..refs.len())
-                        .filter(|&i| !shared.contains(&refs[i].node))
-                        .collect();
-                    let wanted: Vec<ChunkRef> = keep.iter().map(|&i| refs[i].clone()).collect();
-                    let rows = self.chunk_rows(&wanted).await?;
-                    for (&i, (row, key)) in keep.iter().zip(&rows) {
-                        for (n, e) in chunk_view(node, &refs, i, row, key.as_deref())? {
-                            out.insert(n.clone(), e.clone());
-                        }
-                    }
-                    out
-                }
-                _ => unreachable!("resolved rows are Flat or Split"),
-            });
-        }
-        let nb = sides.pop().expect("two sides");
-        let mut na = sides.pop().expect("two sides");
+        let shared: HashSet<Hash> = {
+            let xs: HashSet<Hash> = x.iter().map(|r| r.node).collect();
+            y.iter()
+                .map(|r| r.node)
+                .filter(|h| xs.contains(h))
+                .collect()
+        };
+        self.prefetch_history_rows(
+            x.iter()
+                .chain(&y)
+                .map(|r| r.node)
+                .filter(|h| !shared.contains(h)),
+        )
+        .await;
         let mut out = Vec::new();
-        for (name, eb) in nb {
-            let ea = na.remove(&name);
-            if ea.as_ref() != Some(&eb) {
-                out.push((name, ea, Some(eb)));
+        let (mut i, mut j) = (0, 0);
+        while i < x.len() || j < y.len() {
+            // Grow the run on whichever side ends first until both end at
+            // the same name (or both run out).
+            let (i0, j0) = (i, j);
+            if i >= x.len() || j >= y.len() {
+                // One side is out of chunks: the rest of the other is one run.
+                i = x.len().max(i);
+                j = y.len().max(j);
+                let ea = self.run_entries(a, &x, i0..i).await?;
+                let eb = self.run_entries(b, &y, j0..j).await?;
+                diff_sorted(
+                    ea.iter().map(|(n, e)| (n, e)),
+                    eb.iter().map(|(n, e)| (n, e)),
+                    &mut out,
+                );
+                break;
+            }
+            loop {
+                let (ex, ey) = (run_end(&x, i), run_end(&y, j));
+                if ex == ey {
+                    break;
+                }
+                if ey.is_none() || ex.is_some_and(|ex| ey.is_some_and(|ey| ex < ey)) {
+                    i += 1;
+                } else {
+                    j += 1;
+                }
+            }
+            i += 1;
+            j += 1;
+            if i - i0 == 1 && j - j0 == 1 {
+                if x[i0].node == y[j0].node {
+                    continue;
+                }
+                if self
+                    .diff_sibling_chunks(a, &x, i0, b, &y, j0, &mut out)
+                    .await?
+                {
+                    continue;
+                }
+            }
+            let ea = self.run_entries(a, &x, i0..i).await?;
+            let eb = self.run_entries(b, &y, j0..j).await?;
+            diff_sorted(
+                ea.iter().map(|(n, e)| (n, e)),
+                eb.iter().map(|(n, e)| (n, e)),
+                &mut out,
+            );
+        }
+        Ok(out)
+    }
+
+    /// The entries of a resolved row: a whole node's, or all its chunks'.
+    async fn resolved_entries(
+        &self,
+        node: Hash,
+        row: StoredHistoryNode,
+    ) -> Result<Vec<(String, HistoryEntry)>> {
+        match row {
+            StoredHistoryNode::Flat(n) => Ok(n.entries.into_iter().collect()),
+            StoredHistoryNode::Split(refs) => self.run_entries(node, &refs, 0..refs.len()).await,
+            _ => unreachable!("resolved rows are Flat or Split"),
+        }
+    }
+
+    /// The entries of chunks `run` of the split node `node`, in name order.
+    async fn run_entries(
+        &self,
+        node: Hash,
+        refs: &[ChunkRef],
+        run: std::ops::Range<usize>,
+    ) -> Result<Vec<(String, HistoryEntry)>> {
+        let rows = self.chunk_rows(&refs[run.clone()]).await?;
+        let mut out = Vec::new();
+        for (i, (row, key)) in run.zip(&rows) {
+            out.extend(
+                chunk_view(node, refs, i, row, key.as_deref())?
+                    .into_iter()
+                    .map(|(n, e)| (n.clone(), e.clone())),
+            );
+        }
+        Ok(out)
+    }
+
+    /// Diff chunk `i` of `a` (split as `x`) against chunk `j` of `b` (split
+    /// as `y`), which cover the same names, through their patches if both
+    /// are patches on one keyframe; `false` if they are not.
+    #[allow(clippy::too_many_arguments)]
+    async fn diff_sibling_chunks(
+        &self,
+        a: Hash,
+        x: &[ChunkRef],
+        i: usize,
+        b: Hash,
+        y: &[ChunkRef],
+        j: usize,
+        out: &mut Vec<(String, Option<HistoryEntry>, Option<HistoryEntry>)>,
+    ) -> Result<bool> {
+        let (ra, rb) = (
+            self.read_history_row(x[i].node).await?,
+            self.read_history_row(y[j].node).await?,
+        );
+        let (
+            StoredHistoryNode::Patch { base: ka, over: oa },
+            StoredHistoryNode::Patch { base: kb, over: ob },
+        ) = (&*ra, &*rb)
+        else {
+            return Ok(false);
+        };
+        if ka != kb {
+            return Ok(false);
+        }
+        let key = self
+            .history_key(x[i].node, &ra)
+            .await?
+            .expect("a patch has a keyframe");
+        let at_a = ChunkAt {
+            first: x[i].first.clone(),
+            node: x[i].node,
+            next: x.get(i + 1).map(|r| r.first.clone()),
+        };
+        let at_b = ChunkAt {
+            first: y[j].first.clone(),
+            node: y[j].node,
+            next: y.get(j + 1).map(|r| r.first.clone()),
+        };
+        // The checks a lookup through each patch makes.
+        for (node, at, row, over) in [(a, &at_a, &ra, oa), (b, &at_b, &rb, ob)] {
+            match (over.entries.keys().next(), over.entries.keys().next_back()) {
+                (Some(lo), Some(hi)) if within(lo, hi, &at.first, at.next.as_deref()) => {}
+                _ => return Err(misfit(node, &at.first)),
+            }
+            self.patched_chunk_child(node, at, row, &key, "")?;
+        }
+        let StoredHistoryNode::Flat(key) = &*key else {
+            unreachable!("history_key checked the shape")
+        };
+        let names: BTreeSet<&String> = oa.entries.keys().chain(ob.entries.keys()).collect();
+        for name in names {
+            let ea = oa.entries.get(name).or_else(|| key.entries.get(name));
+            let eb = ob.entries.get(name).or_else(|| key.entries.get(name));
+            if ea != eb {
+                out.push((name.clone(), ea.cloned(), eb.cloned()));
             }
         }
-        out.extend(na.into_iter().map(|(name, ea)| (name, Some(ea), None)));
-        out.sort_by(|x, y| x.0.cmp(&y.0));
-        Ok(out)
+        Ok(true)
     }
 
     /// The entry `name` of the node `node`, reading only the chunk that would
@@ -510,6 +695,27 @@ impl Repo {
                 _ => unreachable!("a resolved list patch is Split"),
             },
         })
+    }
+
+    /// The rows [`Repo::lookup_child`] would read to find `name`, as far as
+    /// the cache tells: the row it lands in and, for a cached patch, its
+    /// keyframe. For batched reads ahead of lookups.
+    pub(crate) fn lookup_rows(&self, lookup: &NodeLookup, name: &str) -> Vec<Hash> {
+        let row = match lookup {
+            NodeLookup::Row(node) => *node,
+            NodeLookup::Split { refs, .. } => {
+                let i = refs.partition_point(|r| r.first.as_str() <= name);
+                if i == 0 {
+                    return Vec::new();
+                }
+                refs[i - 1].node
+            }
+        };
+        let mut out = vec![row];
+        if let Some(base) = self.history_rows.get(&row).and_then(|r| r.base()) {
+            out.push(base);
+        }
+        out
     }
 
     /// The entry `name` of a node prepared by [`Repo::node_lookup`], as
@@ -722,6 +928,230 @@ impl Repo {
             }
         }
         Ok(hash)
+    }
+
+    /// [`Repo::stage_history_node`] of the stored node `base` (or an empty
+    /// node) with the entries of `updates`, sorted by name, added or
+    /// replaced, without joining `base`: the same rows and address, at a cost
+    /// that follows the edit rather than the node's width.
+    ///
+    /// A split node is cut only after boundary names, wherever they lie, and
+    /// within the 128-entry cap from the previous cut. So the runs of chunks
+    /// between boundary names that hold no updated name are cut as before
+    /// and are the base's chunks; only the runs that do are read, edited and
+    /// cut again, each chunk against the same predecessor (the base chunk
+    /// whose range holds its first name) that a full rebuild compares it
+    /// with. Names are never removed, so a split base stays split. On Linux,
+    /// directories of thousands of names made joining and re-cutting whole
+    /// nodes most of the cost of every changeset.
+    pub(crate) async fn stage_history_edit(
+        &self,
+        base: Option<Hash>,
+        updates: Vec<(String, HistoryEntry)>,
+        pending: &mut PendingRows,
+    ) -> Result<Hash> {
+        let Some(b) = base else {
+            let node = HistoryNode {
+                entries: updates.into_iter().collect(),
+            };
+            return self.stage_history_node(&node, None, pending).await;
+        };
+        let ResolvedRow {
+            node: resolved,
+            keyframe,
+        } = self.read_resolved(b).await?;
+        let refs = match resolved {
+            StoredHistoryNode::Split(refs) => refs,
+            StoredHistoryNode::Flat(mut node) => {
+                node.entries.extend(updates);
+                if node.entries.len() > derived::FLAT_MAX {
+                    return self.stage_history_node(&node, Some(b), pending).await;
+                }
+                // `stage_history_node` for a whole base, which is resolved
+                // already.
+                let key = self.read_history_row(keyframe).await?;
+                let key = match &*key {
+                    StoredHistoryNode::Flat(k) => Some((keyframe, k)),
+                    _ => None,
+                };
+                let row = derived::flat_row(&node, key);
+                let hash = row.hash;
+                #[cfg(test)]
+                {
+                    let mut full = PendingRows::default();
+                    let want = self.stage_history_node(&node, Some(b), &mut full).await?;
+                    assert_eq!(want, hash, "an edit must store what a full rebuild does");
+                    let rows: Vec<Hash> = full.rows.iter().map(|r| r.hash).collect();
+                    let mine = (hash != b && hash != HistoryNode::empty_hash()).then_some(hash);
+                    assert_eq!(rows, Vec::from_iter(mine));
+                }
+                if hash != b && hash != HistoryNode::empty_hash() && pending.seen.insert(hash) {
+                    pending.rows.push(row);
+                }
+                return Ok(hash);
+            }
+            _ => unreachable!("resolved rows are Flat or Split"),
+        };
+        #[cfg(test)]
+        let joined = {
+            let mut node = self.read_history_node(b).await?;
+            node.entries.extend(updates.iter().cloned());
+            node
+        };
+        let chunk_of = |name: &str| {
+            refs.partition_point(|r| r.first.as_str() <= name)
+                .saturating_sub(1)
+        };
+        // The chunks edited and their neighbours, whose last names decide
+        // where runs start, in one read.
+        let last = refs.len() - 1;
+        let mut wanted: Vec<usize> = updates
+            .iter()
+            .flat_map(|(n, _)| {
+                let i = chunk_of(n);
+                [i.saturating_sub(1), i, (i + 1).min(last)]
+            })
+            .collect();
+        wanted.dedup();
+        self.prefetch_history_rows(wanted.iter().map(|&i| refs[i].node))
+            .await;
+
+        let mut known: HashSet<Hash> = HashSet::from([HistoryNode::empty_hash(), b]);
+        let mut out: Vec<ChunkRef> = Vec::with_capacity(refs.len() + 1);
+        let mut writes: Vec<HistoryRow> = Vec::new();
+        // Base chunks before `next` are passed on or replaced; `next` is 0
+        // or follows a boundary name.
+        let mut next = 0;
+        let mut updates = updates.into_iter().peekable();
+        while let Some((name, _)) = updates.peek() {
+            let mut start = chunk_of(name);
+            while start > next {
+                let prev = self.chunk_entries(b, &refs, start - 1).await?;
+                if prev.last().is_some_and(|(n, _)| derived::ends_chunk(n)) {
+                    break;
+                }
+                start -= 1;
+            }
+            out.extend_from_slice(&refs[next..start]);
+            let mut entries: Vec<(String, HistoryEntry)> = Vec::new();
+            let mut end = start;
+            loop {
+                let mut chunk = self
+                    .chunk_entries(b, &refs, end)
+                    .await?
+                    .into_iter()
+                    .peekable();
+                let mut mine = Vec::new();
+                while updates.peek().is_some_and(|(n, _)| chunk_of(n) == end) {
+                    mine.push(updates.next().expect("peeked"));
+                }
+                let mut mine = mine.into_iter().peekable();
+                loop {
+                    let order = match (chunk.peek(), mine.peek()) {
+                        (Some(c), Some(m)) => m.0.cmp(&c.0),
+                        (None, Some(_)) => std::cmp::Ordering::Less,
+                        (Some(_), None) => std::cmp::Ordering::Greater,
+                        (None, None) => break,
+                    };
+                    if order == std::cmp::Ordering::Equal {
+                        chunk.next();
+                    }
+                    entries.extend(if order.is_gt() {
+                        chunk.next()
+                    } else {
+                        mine.next()
+                    });
+                }
+                end += 1;
+                if end == refs.len() || entries.last().is_some_and(|(n, _)| derived::ends_chunk(n))
+                {
+                    break;
+                }
+            }
+            for range in derived::run_ranges(entries.iter().map(|(n, _)| n.as_str())) {
+                let want = &entries[range];
+                let first = want[0].0.clone();
+                let mut key = None;
+                let i = refs.partition_point(|r| r.first <= first);
+                if i > 0 {
+                    let at = refs[i - 1].node;
+                    known.insert(at);
+                    let row = self.read_history_row(at).await?;
+                    let row_key = self.history_key(at, &row).await?;
+                    let view = chunk_view(b, &refs, i - 1, &row, row_key.as_deref())?;
+                    if view.len() == want.len()
+                        && view
+                            .iter()
+                            .zip(want)
+                            .all(|(v, w)| *v.0 == w.0 && *v.1 == w.1)
+                    {
+                        out.push(ChunkRef { first, node: at });
+                        continue;
+                    }
+                    key = Some(match row_key {
+                        Some(k) => (row.base().expect("a patch has a base"), k),
+                        None => (at, row),
+                    });
+                }
+                let key = key.as_ref().and_then(|(h, k)| match &**k {
+                    StoredHistoryNode::Flat(k) => Some((*h, k)),
+                    _ => None,
+                });
+                let chunk = HistoryNode {
+                    entries: want.iter().cloned().collect(),
+                };
+                let row = derived::flat_row(&chunk, key);
+                out.push(ChunkRef {
+                    first,
+                    node: row.hash,
+                });
+                writes.push(row);
+            }
+            next = end;
+        }
+        out.extend_from_slice(&refs[next..]);
+        let key = self.read_history_row(keyframe).await?;
+        let key = match &*key {
+            StoredHistoryNode::Split(r) => Some((keyframe, r.as_slice())),
+            _ => None,
+        };
+        let top = derived::split_row(out, key);
+        let hash = top.hash;
+        writes.push(top);
+        let writes: Vec<HistoryRow> = writes
+            .into_iter()
+            .filter(|r| known.insert(r.hash))
+            .collect();
+        #[cfg(test)]
+        {
+            let mut full = PendingRows::default();
+            let want = self.stage_history_node(&joined, Some(b), &mut full).await?;
+            assert_eq!(want, hash, "an edit must store what a full rebuild does");
+            let got: Vec<Hash> = writes.iter().map(|r| r.hash).collect();
+            let full: Vec<Hash> = full.rows.iter().map(|r| r.hash).collect();
+            assert_eq!(got, full, "an edit must write the rows a full rebuild does");
+        }
+        for row in writes {
+            if pending.seen.insert(row.hash) {
+                pending.rows.push(row);
+            }
+        }
+        Ok(hash)
+    }
+
+    /// The entries of chunk `i` of the split node `node`, checked to fit it.
+    async fn chunk_entries(
+        &self,
+        node: Hash,
+        refs: &[ChunkRef],
+        i: usize,
+    ) -> Result<Vec<(String, HistoryEntry)>> {
+        let row = self.read_history_row(refs[i].node).await?;
+        let key = self.history_key(refs[i].node, &row).await?;
+        Ok(chunk_view(node, refs, i, &row, key.as_deref())?
+            .into_iter()
+            .map(|(n, e)| (n.clone(), e.clone()))
+            .collect())
     }
 
     /// Hand rows staged by [`Repo::stage_history_node`] to a caller that

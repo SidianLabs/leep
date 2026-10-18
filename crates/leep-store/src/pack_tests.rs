@@ -306,6 +306,12 @@ async fn tombstones_hide_packed_objects_and_a_full_repack_drops_them() {
                 assert_eq!(s.get(h).await.unwrap().unwrap(), vs[i]);
             }
         }
+        let expect: Vec<bool> = hashes.iter().map(|h| !doomed.contains(h)).collect();
+        assert_eq!(
+            s.contains_many(&hashes).await.unwrap(),
+            expect,
+            "contains_many"
+        );
         let listed: Vec<Hash> = list_all(s, 3).await.iter().map(|m| m.hash).collect();
         assert_eq!(listed.len(), hashes.len() - doomed.len());
         assert!(doomed.iter().all(|h| !listed.contains(h)));

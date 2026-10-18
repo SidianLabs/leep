@@ -3,6 +3,7 @@
 //! that can sit in front of any of them.
 
 mod cache;
+mod dirsync;
 mod fs;
 mod object;
 #[cfg(test)]

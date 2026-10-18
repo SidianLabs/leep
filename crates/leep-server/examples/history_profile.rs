@@ -8,6 +8,13 @@
 //! `--reset` first deletes every `history-tree-v3` and `history-node-v3` row,
 //! so only point it at stores no server is using. Prints progress every 10 s
 //! and, at the end, changesets per second, peak RSS and calls per store method.
+//!
+//! `--synth N` first builds a synthetic late-Linux-shaped history of N
+//! changesets after its import (`--small` for the bench's smaller shape; see
+//! `leep-derive/benches/support/wide_history.rs`) and points `<rev>` at it;
+//! with `mem://` stores that is the only way to have a history. `--dump FILE`
+//! writes every row of both kinds afterwards, sorted, as `kind key
+//! blake3(value)` lines, to compare two builds' rows.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -22,6 +29,9 @@ use leep_core::{
 };
 use leep_derive::derived::{self, DerivedKind, HistoryTree, HISTORY_NODE_KIND};
 use leep_derive::Repo;
+
+#[path = "../../leep-derive/benches/support/wide_history.rs"]
+mod wide_history;
 
 /// Calls and time per store method.
 #[derive(Default)]
@@ -247,19 +257,38 @@ fn status_kib(field: &str) -> u64 {
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let usage = "usage: history_profile <meta url> <blob url> <rev> [--reset]";
+    let usage =
+        "usage: history_profile <meta url> <blob url> <rev> [--reset] [--synth N [--small]] [--dump FILE]";
     let meta_url = args.first().expect(usage);
     let blob_url = args.get(1).expect(usage);
     let rev = args.get(2).expect(usage);
+    let flag = |name: &str| {
+        args.iter()
+            .position(|a| a == name)
+            .map(|i| args.get(i + 1).expect(usage).clone())
+    };
     let tally = Arc::new(Tally::default());
-    let blobs: Arc<dyn BlobStore> = Arc::new(Blobs(
-        leep_store::open_blob_store(blob_url).unwrap(),
-        tally.clone(),
-    ));
-    let meta: Arc<dyn MetaStore> = Arc::new(Meta(
-        leep_meta::open_meta_store(meta_url).await.unwrap(),
-        tally.clone(),
-    ));
+    let raw_blobs = leep_store::open_blob_store(blob_url).unwrap();
+    let raw_meta = leep_meta::open_meta_store(meta_url).await.unwrap();
+    if let Some(n) = flag("--synth") {
+        let n: usize = n.parse().expect(usage);
+        let spec = if args.iter().any(|a| a == "--small") {
+            wide_history::Spec::small(n)
+        } else {
+            wide_history::Spec::linux_like(n)
+        };
+        let t = Instant::now();
+        let builder = Repo::new(raw_blobs.clone(), raw_meta.clone());
+        let head = wide_history::build(&builder, &spec).await;
+        let old = raw_meta.get_ref(rev).await.unwrap();
+        assert!(raw_meta.cas_ref(rev, old, Some(head)).await.unwrap());
+        println!(
+            "built {spec:?} in {:.1} s, head {head}",
+            t.elapsed().as_secs_f64()
+        );
+    }
+    let blobs: Arc<dyn BlobStore> = Arc::new(Blobs(raw_blobs, tally.clone()));
+    let meta: Arc<dyn MetaStore> = Arc::new(Meta(raw_meta.clone(), tally.clone()));
     let repo = Repo::new(blobs, meta.clone());
     let head = repo.resolve(rev).await.unwrap();
     if args.iter().any(|a| a == "--reset") {
@@ -296,4 +325,21 @@ async fn main() {
         status_kib("VmHWM") / 1024
     );
     print_tally(&tally);
+    if let Some(path) = flag("--dump") {
+        let mut lines = Vec::new();
+        for kind in [HistoryTree::NAME, HISTORY_NODE_KIND] {
+            let mut after = None;
+            loop {
+                let page = raw_meta.list_derived(kind, after, 10_000).await.unwrap();
+                let Some(last) = page.last() else { break };
+                after = Some(last.0);
+                for (k, v) in &page {
+                    lines.push(format!("{kind} {k} {}", Hash::of_blob(v)));
+                }
+            }
+        }
+        lines.sort();
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+        println!("dumped {} rows to {path}", lines.len());
+    }
 }

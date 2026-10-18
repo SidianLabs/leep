@@ -720,6 +720,12 @@ impl BlobStore for ArcBlobs {
     async fn contains(&self, hash: &leep_core::Hash) -> leep_core::Result<bool> {
         self.0.contains(hash).await
     }
+    async fn contains_many(&self, hashes: &[leep_core::Hash]) -> leep_core::Result<Vec<bool>> {
+        self.0.contains_many(hashes).await
+    }
+    async fn flush(&self, named: &[leep_core::Hash]) -> leep_core::Result<()> {
+        self.0.flush(named).await
+    }
     async fn list_page(
         &self,
         after: Option<leep_core::Hash>,

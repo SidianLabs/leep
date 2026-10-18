@@ -34,6 +34,8 @@ pub mod warm;
 #[cfg(test)]
 mod fault_tests;
 #[cfg(test)]
+mod flush_tests;
+#[cfg(test)]
 mod land_batch_tests;
 #[cfg(test)]
 mod tests;
@@ -45,3 +47,10 @@ pub use history::{ExtraMatch, LogFilter};
 pub use repo::{PrefixMatch, Repo, MAX_PREFIX_CANDIDATES};
 pub use search::{SearchIndexReport, SearchQuery};
 pub use signatures::{LandPolicy, PolicySet, REBASED_ORIGIN_KIND};
+
+/// The benches' synthetic late-Linux-shaped history, for tests.
+#[cfg(test)]
+#[path = "../benches/support/wide_history.rs"]
+mod wide_history;
+#[cfg(test)]
+extern crate self as leep_derive;
