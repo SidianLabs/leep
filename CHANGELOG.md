@@ -531,6 +531,26 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   `repair drop` refuses the kind, and `verify` checks its rows. New example
   `gc_profile` times GC phases and counts store calls.
 
+### Git compatibility (M7)
+- Live git mirror (ADR 0046): `leep-git mirror run` keeps a git remote
+  (GitHub, GitLab, any https, ssh or file remote) in step with a Leep
+  server. Lands reach the remote within about a second.
+  - It uses only the HTTP API and the system `git`, so the server gains no
+    git code and needs no change.
+  - Exports are incremental and deterministic, and match `leep-git export`,
+    plus a `Leep-Changeset:` trailer on changesets made in Leep.
+  - Pushes are fast-forward only and never forced.
+  - With `--import`, fast-forward pushes to the remote land in Leep through
+    a ref compare-and-swap that the land policy checks.
+  - When both sides moved, the ref is reported `diverged` and Leep's side is
+    pushed to `leep-diverged/<branch>` for a merge in git; nothing is
+    resolved automatically.
+  - Crash safe at every step: decisions come from current values, a repeated
+    push is a no-op, and imports are content addressed.
+  - `leep-git mirror status`, `--listen` (`/metrics`, `/status`, `/poke` for
+    webhooks), and three alerts with runbooks: `LeepMirrorDown`,
+    `LeepMirrorLagging` and `LeepMirrorStuck`.
+
 ### Fixes
 - `leep-git import` and `export` no longer fail with "Entry too large to fit
   in memory" on objects over 16 MiB when the git repository belongs to

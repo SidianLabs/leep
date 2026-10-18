@@ -73,9 +73,10 @@ polling interval. With `--cache-bytes 0` there is no cache and the
 
 Every alert has a runbook in [RUNBOOKS.md](RUNBOOKS.md), linked from the rule's
 `runbook_url`. `scripts/check-runbooks.sh` (run in CI) fails if a rule here has
-no section there or a section has no rule. The rules assume the metrics above
-and, for the last two groups, the backup `--metrics-file`, the cron wrapper and
-node_exporter described in the runbooks.
+no section there or a section has no rule. The rules assume the metrics above,
+the git mirror's own metrics for the `leep-mirror` group (see
+[Git mirror](#git-mirror)) and, for the last groups, the backup
+`--metrics-file`, the cron wrapper and node_exporter described in the runbooks.
 
 ```yaml
 # Every rule's runbook_url ends in RUNBOOKS.md#<alert name in lower case>.
@@ -204,6 +205,36 @@ groups:
     annotations:
       summary: "Servers report different versions for over 2 hours: a rollout is unfinished (equal versions do not prove equal builds)."
       runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepmixedversions
+- name: leep-mirror
+  # Metrics from `leep-git mirror run --listen`, scraped under a job named
+  # "leep-mirror"; adjust. See "Git mirror" above.
+  rules:
+  - alert: LeepMirrorDown
+    expr: up{job="leep-mirror"} == 0
+    for: 5m
+    labels: {severity: page}
+    annotations:
+      summary: "A leep-git mirror cannot be scraped: lands are not reaching git, and pushes to git are not landing."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepmirrordown
+  - alert: LeepMirrorLagging
+    # Only while the mirror is still trying (pending or error); states that
+    # need a person are LeepMirrorStuck.
+    expr: |
+      max by (instance, ref) (leep_mirror_lag_seconds) > 600
+      and on (instance, ref)
+      max by (instance, ref) (leep_mirror_ref_state{state=~"pending|error"}) == 1
+    for: 2m
+    labels: {severity: page}
+    annotations:
+      summary: "A mirrored ref has differed between Leep and git for over 10 minutes while the mirror retries: the remote, its credentials or the server is failing."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepmirrorlagging
+  - alert: LeepMirrorStuck
+    expr: max by (instance, ref) (leep_mirror_ref_state{state=~"diverged|rewound|remote-ahead|refused|deleted-in-leep"}) == 1
+    for: 15m
+    labels: {severity: ticket}
+    annotations:
+      summary: "A mirrored ref needs a person: it diverged, was rewound in Leep, was refused by the land policy, or the remote is ahead."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepmirrorstuck
 - name: leep-backup
   # Metrics written by `leep-server backup --metrics-file` (node_exporter textfile collector).
   rules:
@@ -388,6 +419,144 @@ deleted, so `leep-server gc` is unaffected and a ref restored with `leep undo`
 always points at an existing changeset. Postgres serializes the final insert of
 each ref move with an advisory lock (key 7164738) so `seq` follows commit order;
 it is held for the length of one insert.
+
+## Git mirror
+
+`leep-git mirror run` keeps a git remote (GitHub, GitLab, any server git
+can push to over https, ssh or a path) in step with a Leep server
+([ADR 0046](adr/0046-live-git-mirror.md)). Lands reach the remote within
+about a second plus the push time. With `--import`, commits pushed to the
+remote land in Leep when they fast-forward the Leep ref. When both sides
+moved, the mirror reports `diverged` and stops that ref until someone merges
+in git. It never resolves a conflict itself and never force-pushes a
+mirrored branch.
+
+The mirror is a separate process. It talks to `leep-server` over the HTTP
+API with a token, and to the remote with the system `git` (2.30 or later).
+It needs no access to the metadata or blob stores. Run one mirror per remote.
+
+```sh
+LEEP_TOKEN=$(cat /etc/leep/mirror.token) \
+leep-git mirror run \
+  --server https://leep.internal:8080 \
+  --remote https://github.com/acme/app.git \
+  --work-dir /var/lib/leep-mirror/app \
+  --ref main --ref release/1.0 --tags \
+  --import \
+  --listen 127.0.0.1:9188
+```
+
+- **Token.** Pass it with `--token-file` or `LEEP_TOKEN`, never on the
+  command line. A `read` token is enough without `--import`. With
+  `--import` the mirror creates changesets and moves refs, so it needs a
+  `write` token. Its name is the actor of the mirror's ref log entries
+  (operation `git-mirror`), so give it a recognisable name such as
+  `git-mirror`.
+- **Git credentials** stay with git:
+  - for https, a credential helper or a token in the helper's store. A
+    token embedded in the URL also works, and the mirror redacts it from
+    every log line and the status file, but a helper keeps it out of the
+    process list;
+  - for ssh, a deploy key with write access, for example through
+    `GIT_SSH_COMMAND="ssh -i /etc/leep/deploy_key -o IdentitiesOnly=yes"`.
+
+  The mirror sets `GIT_TERMINAL_PROMPT=0`, so a missing credential fails
+  with an error rather than waiting for a password.
+- **Work directory.** Holds `git/` (a bare repository of everything
+  exported and fetched), `map` (changeset to commit), `status.json` and a
+  lock that stops a second mirror on the same directory. Keep it on
+  persistent storage and back it up.
+  - If you lose it, a new mirror rebuilds it by exporting again; exports
+    are deterministic, so the commits come out the same. The exception is a
+    commit imported from git that Leep cannot reproduce, such as one with
+    submodules: that ref then reports `diverged` instead of pushing
+    anything wrong.
+- **Branch protection.** The remote must let the mirror's credential push
+  to the mirrored branches, and create and delete branches under
+  `--diverged-prefix` (default `leep-diverged/`). The mirror never needs
+  force-push rights.
+  - An exception is a ref listed in `--allow-rewind`, which it updates with
+    `--force-with-lease`. `main` and tags cannot be listed there.
+  - Required pull requests or status checks on the mirrored branch make
+    every push fail. The ref goes to `error` after three rejections. Let the
+    mirror's account bypass those rules.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--ref NAME[:GIT_REF]` | – | Mirror a Leep ref, repeatable. `NAME` maps to `refs/heads/NAME`, `tags/T` to `refs/tags/T`. |
+| `--tags` | off | Also mirror every Leep tag. Tags are created, never moved. |
+| `--import` | off | Land fast-forward pushes from the remote in Leep, through the land policy. |
+| `--interval` | `1s` | How often to check the ref log for moves. |
+| `--git-poll` | `15s` | How often to `ls-remote` the remote. `POST /poke` polls at once. |
+| `--reconcile` | `60s` | Re-read every Leep ref even if the ref log is quiet. |
+| `--git-timeout` | `10m` | Kill a git command that runs longer. |
+| `--max-backoff` | `5m` | Longest wait between retries of a failing ref. |
+| `--allow-rewind NAME` | – | Push Leep undos of this ref with a lease. Never `main` or a tag. |
+| `--diverged-prefix` | `leep-diverged/` | The branch prefix the mirror owns. |
+| `--provenance-trailers`, `--no-changeset-trailer` | off | Change commit messages, and so commit ids. Choose once, before the first push. |
+| `--listen ADDR` | off | Serve `GET /metrics`, `GET /status`, `GET /health` and `POST /poke`. |
+| `--once` | off | Run until nothing changes, then exit 0 if healthy and 1 if not (for cron or a check). |
+
+**First start against an existing remote.** If the remote is the repository
+Leep was first imported from (`leep-git import`), the mirror's first run
+exports Leep's history over HTTP. Imported changesets reproduce their
+original commits, so the first push is a fast-forward. If the remote was
+filled by `leep-git export`, add `--no-changeset-trailer` to produce the
+same commits. Without it, the ref reports `diverged` on the first run.
+
+**Webhooks.** To skip the `--git-poll` delay, point a push webhook from
+GitHub or GitLab at `POST http://<mirror>/poke`, through a proxy that only
+forwards that path. The poke carries no data and needs no secret: at worst
+a forged one makes the mirror poll sooner.
+
+### Mirror states
+
+`leep-git mirror status --work-dir DIR` prints each ref's state, both
+values, the lag and the reason. `--json` prints the whole status document,
+which `GET /status` also serves. The command exits 0 when every ref is
+`in-sync` or `pending`, 1 when a ref needs a person or the status is more
+than three intervals old (the daemon is down or stuck in a long push), and 2
+when there is no status file.
+
+| State | Meaning | What to do |
+|---|---|---|
+| `in-sync` | The remote ref is the export of the Leep ref. | Nothing. |
+| `pending` | One side moved and the mirror is catching up, or retrying after the remote moved under a push. | Nothing, unless the lag keeps growing ([LeepMirrorLagging](RUNBOOKS.md#leepmirrorlagging)). |
+| `diverged` | Both sides have commits the other lacks. Leep's side is on `leep-diverged/<branch>`. | In git, merge `origin/leep-diverged/<branch>` into the branch and push. The mirror lands the merge and deletes the diverged branch. |
+| `rewound` | Leep moved the ref back (an undo). The remote keeps the newer commits. | Land a revert in Leep (the usual fix), or, for a scratch branch, allow it with `--allow-rewind`. |
+| `remote-ahead` | The remote has commits Leep lacks and `--import` is off. | Enable `--import`, or remove the commits from the remote. |
+| `refused` | Leep's land policy refused a push from git (unsigned, unreviewed, OWNERS). The detail quotes the server. | Approve the changesets with `leep review`, or revert the push in git. Checked again every minute. |
+| `deleted-in-leep` | The Leep ref is gone. The remote branch is left alone. | Delete the remote branch by hand if that is intended. |
+| `error` | The last attempt failed: server, remote, credentials, or the remote rejecting pushes. Retried with backoff. | Read the detail and the log ([LeepMirrorLagging](RUNBOOKS.md#leepmirrorlagging)). |
+
+### Mirror metrics
+
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `leep_mirror_up` | gauge | none | 1 while the mirror serves metrics. |
+| `leep_mirror_ref_state` | gauge | `ref`, `state` | 1 for the state each ref is in, 0 for the others. |
+| `leep_mirror_lag_seconds` | gauge | `ref` | Seconds since the two sides first differed; 0 in sync. |
+| `leep_mirror_last_sync_timestamp_seconds` | gauge | `ref` | When the ref was last in sync. |
+| `leep_mirror_pushes_total` | counter | `ref`, `result` = `ok`, `rejected`, `failed` | Pushes of mirrored refs. `rejected` is the remote refusing (it moved, or branch protection); `failed` is a transport or credential failure. |
+| `leep_mirror_imports_total` | counter | `ref`, `result` = `landed`, `refused`, `lost_race` | Remote pushes the mirror tried to land in Leep. |
+| `leep_mirror_divergences_total` | counter | `ref` | Times the ref entered `diverged`. A steady rate means people push to a ref agents land on all the time. |
+| `leep_mirror_commits_exported_total` | counter | none | Commits written from changesets. |
+| `leep_mirror_commits_imported_total` | counter | none | Changesets created from remote commits. |
+| `leep_mirror_errors_total` | counter | `stage` = `leep`, `git`, `export`, `import` | Failed steps. |
+| `leep_mirror_cycles_total` | counter | none | Poll cycles. |
+| `leep_mirror_last_cycle_timestamp_seconds` | gauge | none | When the last cycle finished. |
+
+Counters restart from 0 when the mirror restarts. The log goes to stderr,
+one line per state change, push or landed import, with credentials
+redacted.
+
+**Crashes.** Killing the mirror at any moment is safe, SIGKILL included.
+Each cycle decides from the current Leep ref and remote ref, not from
+remembered progress. A push the remote accepted before the crash is found
+there, and a push is never repeated. An import that created changesets but
+did not move the ref finishes on restart, without importing anything twice.
+`LEEP_MIRROR_CRASH_AT` is a test hook that aborts the process at a named
+step; never set it in production.
 
 ## Upgrading
 
@@ -1118,6 +1287,22 @@ the kill sweep, GC deletes and a rescue racing the cleanup, and readers
 holding indexes of deleted packs; `cargo test -p leep-server --test
 repack_object` runs GC against a packed object store. Run them after
 changing the object store backend.
+
+**Git mirror** (ADR 0046). `cargo test -p leep-git --test mirror` drives
+the mirror against in-memory stores and local bare repositories.
+`cargo test -p leep-e2e --test mirror` runs the real binaries:
+- follow and import, including the diverge-and-merge flow;
+- a seeded SIGKILL sweep over export, import and diverged rounds
+  (`LEEP_MIRROR_KILL_ROUNDS`, default 12, and `LEEP_MIRROR_SEED`);
+- an abort at each named step (`LEEP_MIRROR_CRASH_AT`): mid-export, after
+  the export, after a push whose answer is lost, after an import, after its
+  land, and after a diverged push;
+- agents landing while a person pushes to git.
+
+After each test, every changeset on Leep's main has exactly one commit on
+the remote, the remote's reflog shows only fast-forwards, and the trees
+match. Run them after changing the mirror, the git bridge's commit format or
+ref CAS.
 
 **Leftovers after a real crash.** A killed filesystem blob store can leave
 `.tmp-*` files in its shard directories. Nothing reads or lists them, and

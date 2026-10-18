@@ -12,6 +12,9 @@ host's loopback only.
 The repo `Dockerfile` builds `leep-server`, `leep` and `leep-git` into one
 `debian:bookworm-slim` image. The entrypoint is `leep-server`; it runs as the
 non-root user `leep` (uid 10001) and keeps state under `/var/lib/leep`.
+The image also carries `git` and the ssh client, so the same image can run
+the git mirror with `--entrypoint leep-git` and the arguments
+`mirror run ...` ([OPERATIONS.md](OPERATIONS.md#git-mirror)).
 
 ```sh
 docker build -t leep:dev .
@@ -216,7 +219,10 @@ refs are flags and need a restart ([Reloading config](#reloading-config)). Autho
 commit with `leep commit --sign KEYFILE` or `LEEP_SIGNING_KEY=KEYFILE`; the key
 file must be mode 0600. Raw ref updates (`POST /v1/refs/{name}`) are checked
 the same way. `leep-git` import writes to the stores directly and is not
-covered, so run it only as an operator.
+covered, so run it only as an operator. The git mirror (`leep-git mirror run
+--import`) lands pushes from git through those raw ref updates, so it is
+covered: an unsigned push to a protected ref is refused and reported
+([OPERATIONS.md](OPERATIONS.md#git-mirror)).
 
 ## Review and owners
 
