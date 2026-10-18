@@ -1026,7 +1026,18 @@ changeset still joins every chunk of each directory it rewrites, so the cost
 grows with directory width (Linux's widest directories hold thousands of
 names).
 
-<<<<<<< HEAD
+**Stale planner statistics.** On the full Linux database the first run of
+this code derived only about 500 changesets a minute, with Postgres at 100%
+CPU and the server idle. The table was last analyzed before the path-history
+rows existed, so Postgres estimated a row or two for `history-node-v3`, and
+answered each batched `get_derived_many` by walking all 512,000 rows of the
+kind and filtering on `key`: 2.3 s per lookup. `ANALYZE derived` brought it
+to 3 ms and the derivation to about 10,300 changesets a minute. The query now
+takes the kind through a sub-select, which keeps the planner off the per-kind
+estimate: on a local reproduction (300,000 rows of a new kind added after
+`ANALYZE`) a 200-key lookup takes 1-3 ms with fresh or stale statistics,
+against 191 ms before.
+
 **Planner statistics after bulk writes** (ADR 0042). A local reproduction on
 Postgres 16: `derived` with 600,000 rows of two kinds, `ANALYZE`, then 300,000
 rows of a new kind with autovacuum off; `changesets` analyzed at 1,000 rows,
@@ -1049,19 +1060,6 @@ which the planner rightly scans; a 256-id batch switches to the index from
 about 5,000 changesets. Statistics now follow bulk writes: migration 2
 re-analyzes `derived` after 1% of it changes and `changesets` after 2%, and
 `leep-git import` and `restore` run `ANALYZE` when done.
-=======
-**Stale planner statistics.** On the full Linux database the first run of
-this code derived only about 500 changesets a minute, with Postgres at 100%
-CPU and the server idle. The table was last analyzed before the path-history
-rows existed, so Postgres estimated a row or two for `history-node-v3`, and
-answered each batched `get_derived_many` by walking all 512,000 rows of the
-kind and filtering on `key`: 2.3 s per lookup. `ANALYZE derived` brought it
-to 3 ms and the derivation to about 10,300 changesets a minute. The query now
-takes the kind through a sub-select, which keeps the planner off the per-kind
-estimate: on a local reproduction (300,000 rows of a new kind added after
-`ANALYZE`) a 200-key lookup takes 1-3 ms with fresh or stale statistics,
-against 191 ms before.
->>>>>>> 1cbe85245467b16a60ef54b3cfd0dd518e6e9b33
 
 ## Garbage collection
 
