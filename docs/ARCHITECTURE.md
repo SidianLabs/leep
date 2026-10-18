@@ -8,8 +8,9 @@ Mononoke (bonsai changesets, derived data) and adds Zed DeltaDB's idea of
 recording agent provenance with every change.
 
 Leep does not try to replace git for ordinary projects. It targets
-repositories with very high merge rates, and interoperates with git through an
-import/export bridge.
+repositories with very high merge rates, and interoperates with git through a
+bridge: offline import and export, and a live two-way mirror that keeps a git
+remote such as GitHub in step with a server ([ADR 0046](adr/0046-live-git-mirror.md)).
 
 This document is the source of truth for how Leep fits together. Decisions and
 their reasons live in [`adr/`](adr/). Wire and storage formats are specified in
@@ -59,6 +60,9 @@ These are load-bearing. A change that breaks one needs an ADR.
         ▲
         │ in-process
  leep-git (import git history → changesets; export → git)
+
+ leep-git mirror run ── HTTP/JSON (v1) ──► leep-server
+        └── system git (https / ssh) ──► git remote (GitHub, GitLab, ...)
 ```
 
 Any number of server instances can run behind a load balancer. They share
@@ -76,15 +80,15 @@ content-addressing and (b) the atomicity of `MetaStore::cas_ref`.
 | `leep-server` | HTTP server binary `leep-server`, and its offline subcommands (`gc`, `migrate`, `verify`, `repair`, `backup`, `restore`, `backup-verify`) | core, store, meta, derive |
 | `leep-cli` | Client binary `leep` | core only |
 | `leep-mcp` | MCP server binary `leep-mcp` for AI agents (stdio JSON-RPC; talks to `leep-server` over HTTP) | core and the `leep-cli` library (its HTTP client); never derive, store, meta or server outside dev-dependencies |
-| `leep-git` | Git bridge: library plus the `leep-git` admin binary | core, derive; store and meta only to open stores by URL in the binary |
+| `leep-git` | Git bridge: library plus the `leep-git` admin binary (offline `import` and `export`, which open the stores; the `mirror` daemon, which uses only the HTTP API and the system `git`) | core, derive, and the `leep-cli` library (its HTTP client, for the mirror); store and meta only to open stores by URL in the binary |
 | `leep-fuzz-targets` | Test-only (`publish = false`): fuzz harness functions and the seed corpus loader for every decoder and parser (`docs/FUZZING.md`) | core, derive, server (to drive the real router and config parsers); nothing depends on it except the `fuzz/` crate |
 | `leep-testkit` | Fault-injecting `BlobStore`/`MetaStore` wrappers and a seeded fault plan, for tests (ADR 0021) | core; a dev-dependency only, never a normal dependency of any crate |
 | `leep-soak` | Soak test binary (`publish = false`): an agent swarm against a real `leep-server`, invariant checks, GC and restarts beside it, a trend report (ADR 0022). Starts the `leep` and `leep-server` binaries; talks to the server over HTTP only | core only (types); nothing depends on it |
 
 Rules:
 - Dependencies point toward `leep-core`. Nothing depends on `leep-server`
-  except the test-only `leep-fuzz-targets`, and only `leep-mcp` depends on
-  `leep-cli` (for its client library).
+  except the test-only `leep-fuzz-targets`, and only `leep-mcp` and
+  `leep-git` (for the mirror) depend on `leep-cli`, for its client library.
 - `leep-derive` must stay backend-agnostic. It is tested against
   `leep_core::memory`.
 - Every `BlobStore`/`MetaStore` backend must pass
@@ -530,6 +534,36 @@ generations come from `Repo`'s ancestry cache or are read ahead in batches as
 the log walk does (ADR 0030). `is_ancestor` rides the skiplist and falls back
 to the same walk.
 
+**Git mirror** (`leep-git mirror run`, [ADR 0046](adr/0046-live-git-mirror.md)).
+A daemon outside the server, one per git remote, on the `/v1` API and the
+system `git`; the server has no git code and holds no git credentials. Every
+cycle (1 s) it reads the newest ref log `seq`, and `GET /v1/refs` when it
+moved; the remote's refs come from `git ls-remote` every 15 s or on
+`POST /poke`. Per mirrored ref it compares the export `E` of the Leep ref `L`
+with the remote ref `G`:
+```
+G == E                       in sync
+G absent or G ⊂ E            git push E (no force: the remote takes only a fast-forward)
+E ⊂ G, tip from git          import the new commits (POST /v1/blobs/missing, PUT blobs,
+                             POST /v1/changesets), then POST /v1/refs CAS L → head
+                             (land policy applies; fast-forward only)
+E ⊂ G, tip from Leep         Leep moved back: report "rewound", never force
+otherwise                    "diverged": push E to leep-diverged/<branch>, move nothing
+```
+The export is incremental and deterministic: a changeset becomes its first
+parent's git tree with its own changes applied (only touched directories are
+rewritten, only named blobs fetched), and the same commit `leep-git export`
+writes, plus a `Leep-Changeset:` trailer for changesets made in Leep. Imports
+build changesets with the importer's code, so a commit has one id however
+often it arrives. A work directory holds the mirror's bare repository and an
+append-only changeset-to-commit map. Because each decision uses only the two
+current values and the map, a crash anywhere is recovered by the next cycle:
+re-exports give the same commits, a push the remote already took is a no-op,
+and the ref CAS lands an import once. Loop prevention: a commit is Leep's own
+if the map lists it or its trailer names a changeset whose export is exactly
+that commit; those are never imported, and imported changesets export to
+their original commits.
+
 ## 7. Caching tiers
 
 ```
@@ -700,7 +734,9 @@ GC and restarts running beside a swarm of agents.
 
 Observability: libraries emit `tracing` events and `metrics` facade calls
 (no-ops without a recorder); only `leep-server` installs a recorder and
-serves `/metrics` on a separate listener. Land retries, exhaustion and cache
+serves `/metrics` on a separate listener. The git mirror reports on its own:
+a `status.json` in its work directory, `leep-git mirror status`, and
+`/metrics` and `/status` on its `--listen` address. Land retries, exhaustion and cache
 hit ratio are the signals to watch; see [OPERATIONS.md](OPERATIONS.md), and
 [RUNBOOKS.md](RUNBOOKS.md) for what to do when each alert fires.
 
@@ -741,7 +777,8 @@ no signature of their own and are linked to their originals by a server-written
 `rebased-origin-v1` row, which `GET` reports as `via`. The hook is
 `leep-derive`'s `LandPolicy`; the key handling lives in `leep-server`. `leep
 keygen` and `leep commit --sign` are the client side. Raw ref CAS over HTTP is
-gated the same way; the offline git bridge is not.
+gated the same way; the offline git bridge is not, but the git mirror moves
+refs only through that gated CAS.
 
 **Review service** ([ADR 0011](adr/0011-review-service.md)). Approvals are
 attestations too (derived kind `review-v1`, one row per changeset and reviewer,

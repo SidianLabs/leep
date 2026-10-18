@@ -7,8 +7,9 @@
 
 mod export;
 mod import;
+pub mod mirror;
 
-pub use export::{export, ExportOptions, ExportReport};
+pub use export::{export, ExportOptions, ExportReport, CHANGESET_TRAILER};
 pub use import::{import, ImportOptions, ImportReport};
 
 use leep_core::{ChangesetId, Error, Hash, MetaStore};
