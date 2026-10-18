@@ -1060,6 +1060,90 @@ this size. ADR 0038's index layout stores about 47-49 bytes per object
 instead (projected 219-228 MB for this pack, 15% of pack plus index; see
 "Packed blobs"). The import then resumed from the packed store.
 
+### All of Linux
+
+The whole Linux kernel history: 1,484,762 commits on `master` (head
+generation 208,600), imported into Postgres 16 with filesystem blobs on a
+4-vCPU, 12 GB VPS (149 GB data disk) that also runs other services.
+
+**Import and storage.** The import stopped once at 1,442,634 commits when
+the disk guard hit 86%; a full repack (ADR 0038 index, `leep:3e1966e`) then
+took the store from 104 GB of loose objects to one 2.74 GB pack plus a
+484 MB index (48 bytes per object for 10.08M objects) in 4 h 55 min
+(1 h 23 min walking history), and the last 42,128 commits imported on top.
+
+| Store, all of Linux | Size |
+|---|---|
+| git repository (bare clone) | 3.8 GB |
+| Leep blobs: pack + index | 3.2 GB (plus loose objects of the last 42k commits until the next repack) |
+| Leep Postgres, before path history | 8.3 GB (`changesets` 2.9 GB, skiplists 0.9 GB) |
+| Leep Postgres, with the full path-history index | 27 GB (`history-node-v3`: 25.4M rows, 24 GB of values) |
+
+The path-history index costs about 16 KB per changeset on Linux against
+1.9 KB on git/git: Linux's directories hold thousands of names and its merges
+bring in hundreds of paths from the second parent. It is now the largest
+thing Leep stores and the next storage target.
+
+**Repack after #80.** A second full repack over the finished store (10,358,516
+objects, 329,002 of them loose), `leep:a3a75de`, 4 threads:
+
+| Full repack of all of Linux | #69 (first repack) | #80 |
+|---|---|---|
+| Objects | 10.08M | 10.36M |
+| Walk | 1 h 23 min | 23 min |
+| Write | about 3 h 20 min | 44 min |
+| Total, with the 10 min fence | 4 h 55 min | 1 h 18 min |
+| Peak memory (anonymous, page cache excluded) | 6.2 GiB | 2.16 GiB |
+| Pack + index | 2.74 GB + 484 MB | 2.82 GB + 508 MB |
+
+9.73M of the 10.36M frames were copied from the old pack without
+recompressing. The blob directory went from 11 GB (the old pack plus the
+loose objects of the last 42k commits) to 3.7 GB.
+
+**Building the path-history index.** The background warmer derived it for
+`master` while the server ran (5 GB memory cap):
+
+| Stage | Commits | Rate |
+|---|---|---|
+| Before #72 (first attempt) | 19,504 in 50 min | ~390/min, 7.25 GiB and growing; stopped |
+| #72, stale planner statistics | | ~500/min, Postgres at 100% CPU |
+| #72 after `ANALYZE` (#73, #75 make it permanent) | to 611,689 | ~2,500/min average |
+| #78 | to 1,484,762 | 4,400–5,500/min on most of history, 2,000–2,600/min on the last, merge-heavy third |
+| One merge (`7214dd4e`, work.thaw) | | about 30 min alone; #81 addresses the cause |
+
+Memory stayed between 0.9 and 2.5 GiB throughout. From the first attempt's
+projected 63 hours, the index took about 9.5 hours of wall time across the
+code changes (including two restarts).
+
+**Queries**, `leep:e643adf` (#78) over the finished index, packed store,
+cold (first request after a restart) and warm:
+
+| Query | Cold | Warm |
+|---|---|---|
+| `log` limit 100 | 0.28 s | 0.055 s |
+| `log` limit 10,000 | 5.5 s | 1.27 s |
+| full file listing (~90k files, 15 MB) | 14.4 s | 0.17 s |
+| root tree / `Makefile` contents | 20 / 2.6 ms | 1.5 / 1.6 ms |
+| `last-change Makefile` | 6.9 ms | 2.0 ms |
+| `log path=Makefile` limit 50 | 0.40 s | 0.20 s |
+| `last-change COPYING` (rare) | 55 ms | 38 ms |
+| `log path=COPYING` limit 50 | 1.24 s | 0.84 s |
+| `log` of a path that never existed | 184 ms | 1.8 ms |
+| `blame Makefile` (derived once, then stored) | 47 s | 0.13 s |
+| `blame COPYING` | 166 ms | 17 ms |
+| diff head vs 1,000 back | 3.8 s | 0.17 s |
+| diff head vs 20,000 back | 19.7 s | 0.36 s |
+| merge-base head vs 1,000 back / 20,000 back / root | 54 / 4.9 / 8.5 ms | 2.9 / 2.7 / 4.0 ms |
+| search a common token (limit 100) / a rare token | 1.6 s / 0.61 s | 1.5 s / 0.64 s |
+| provenance, limit 10,000 | 0.98 s | 0.97 s |
+| `log author=Junio` limit 100 | 154 s | 151 s |
+
+Indexed history queries answer in milliseconds on 1.48M commits. The slow
+rows have known causes: a cold full listing or deep diff decodes thousands
+of tree nodes from the pack; the first `blame` of a long-lived file derives
+its blame rows; and `log author=` has no index, so a rare author scans all
+of history. They are the next query targets.
+
 ### Incremental repack
 
 ADR 0039, measured with `cargo run --release -p leep-server --example
