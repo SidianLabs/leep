@@ -59,6 +59,12 @@ impl BlobStore for FaultyBlobStore {
             .await
     }
 
+    async fn flush_blobs(&self, hashes: &[Hash]) -> Result<()> {
+        self.plan
+            .run(Op::Flush, self.inner.flush_blobs(hashes), |_, v| v)
+            .await
+    }
+
     async fn list_page(&self, after: Option<Hash>, limit: usize) -> Result<Vec<BlobMeta>> {
         self.plan
             .run(Op::ListPage, self.inner.list_page(after, limit), |_, v| v)

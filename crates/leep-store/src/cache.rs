@@ -210,6 +210,10 @@ impl<S: BlobStore> BlobStore for CachedBlobStore<S> {
     async fn flush(&self, named: &[Hash]) -> Result<()> {
         self.inner.flush(named).await
     }
+
+    async fn flush_blobs(&self, hashes: &[Hash]) -> Result<()> {
+        self.inner.flush_blobs(hashes).await
+    }
 }
 
 #[cfg(test)]

@@ -213,6 +213,10 @@ impl BlobStore for StagedBlobs {
         Ok(())
     }
 
+    async fn flush_blobs(&self, _: &[Hash]) -> Result<()> {
+        Ok(())
+    }
+
     async fn list_page(&self, after: Option<Hash>, limit: usize) -> Result<Vec<BlobMeta>> {
         self.inner.list_page(after, limit).await
     }

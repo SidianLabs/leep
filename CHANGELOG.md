@@ -544,6 +544,13 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   claim alongside the condemnation read; upload p50 with 64 agents on one
   ref halves. Fixed: two puts creating the same new shard could both skip
   syncing the store root, and a loose copy a repack puts back was not synced.
+- Creates no longer wait for other requests' uploads to be synced (ADR 0048).
+  `BlobStore::flush_blobs` (a new provided method) makes only the given blobs
+  durable; tree writes, land batches and rescues use it, and the filesystem
+  store syncs each needed shard directory on its own, sharing syncs already
+  running, instead of one wave of every directory dirtied since the last.
+  At 64 agents a create's flush takes 3 to 6 ms instead of 20 to 44 and mean
+  server time per create falls about 25%. Durability is unchanged.
 - GC marks incrementally (ADR 0033): each `gc` run records what it marked in
   `gc-mark-v1` rows, written so that a row always vouches for everything below
   it, and the next run walks only changesets stored since and stops at marked

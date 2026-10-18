@@ -30,12 +30,15 @@ Backends implement `leep_core::BlobStore` (in `leep-store`) or
    - Durability (ADR 0044): a `BlobStore` whose `put` returns before the
      blob would survive power loss must override `flush(named)` to make
      every earlier put, and the stored copies of `named`, durable; the
-     default no-op is only right when puts are durable on return. A store
+     default no-op is only right when puts are durable on return. Such a
+     store should also override `flush_blobs(hashes)` to make only those
+     blobs durable (ADR 0048); the default calls `flush(hashes)`, which is
+     correct but makes every create wait for every recent upload. A store
      that can answer many existence checks at once should override
      `contains_many` (the default runs 64 `contains` at a time), and one
      that can read many blobs at once should override `get_many` (the
      default runs 32 `get`s at a time; tree walks and blame read whole
-     levels through it). Wrappers forward all three.
+     levels through it). Wrappers forward all four.
    - **MetaStore `cas_ref` must be one atomic conditional operation.** That
      means a conditional update/insert/delete, or a transaction at
      serializable isolation. Never read then write.

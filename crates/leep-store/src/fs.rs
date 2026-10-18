@@ -201,7 +201,14 @@ impl BlobStore for FsBlobStore {
     /// synced it for) of every put since the last flush and of `named`, all
     /// at once. Concurrent flushes share waves.
     async fn flush(&self, named: &[Hash]) -> Result<()> {
-        self.dirs.flush(named.iter().map(|h| h.0[0])).await
+        self.dirs.flush_all(named.iter().map(|h| h.0[0])).await
+    }
+
+    /// Syncs the shard directories of `hashes` (and the root for shards it
+    /// has not synced it for) and nothing else, sharing syncs already running
+    /// that started after this call.
+    async fn flush_blobs(&self, hashes: &[Hash]) -> Result<()> {
+        self.dirs.flush_shards(hashes.iter().map(|h| h.0[0])).await
     }
 
     /// Stats the loose files in a few blocking tasks, then looks up the
@@ -433,6 +440,28 @@ mod tests {
         assert_eq!(other.dir_syncs(), 2, "the named shard and, once, the root");
         let packed_only = Hash::of_blob(b"in no shard directory");
         other.flush(&[packed_only]).await.unwrap();
+    }
+
+    /// `flush_blobs` syncs the shards of the blobs it names and nothing else,
+    /// so a create does not wait for other requests' uploads (ADR 0048).
+    #[tokio::test]
+    async fn flush_blobs_syncs_only_their_shards() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsBlobStore::new(dir.path());
+        let mut by_shard = std::collections::BTreeMap::new();
+        let mut i = 0u32;
+        while by_shard.len() < 3 {
+            let h = store.put(Bytes::from(format!("blob {i}"))).await.unwrap();
+            by_shard.entry(h.0[0]).or_insert(h);
+            i += 1;
+        }
+        let pending = store.unsynced_dirs();
+        let mine = *by_shard.values().next().unwrap();
+        store.flush_blobs(&[mine]).await.unwrap();
+        assert_eq!(store.dir_syncs(), 2, "its shard and the root");
+        assert_eq!(store.unsynced_dirs(), pending - 2, "the other shards");
+        store.flush(&[]).await.unwrap();
+        assert_eq!(store.unsynced_dirs(), 0);
     }
 
     #[tokio::test]

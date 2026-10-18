@@ -178,6 +178,16 @@ pub trait BlobStore: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Make the stored copies of `hashes` durable before returning, without
+    /// waiting for anything else written since the last flush. Callers that
+    /// know every blob a write depends on (the nodes they wrote and the
+    /// contents they name) use this instead of [`flush`](Self::flush), so a
+    /// create does not wait for other requests' uploads (ADR 0048). The
+    /// default is `flush(hashes)`, which covers at least as much.
+    async fn flush_blobs(&self, hashes: &[Hash]) -> Result<()> {
+        self.flush(hashes).await
+    }
+
     /// Up to `limit` blobs with hash strictly greater than `after`, in
     /// ascending hash order. Paged so garbage collection can scan stores too
     /// large to list at once.

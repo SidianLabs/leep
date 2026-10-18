@@ -81,7 +81,7 @@ async fn ensure_dir(
 /// `Invalid` for deletes of absent files and file/directory clashes.
 ///
 /// The nodes written and the contents `changes` names are flushed
-/// (`BlobStore::flush`) before it returns, so the changeset built on the
+/// (`BlobStore::flush_blobs`) before it returns, so the changeset built on the
 /// result can be stored at once (ADR 0044). Callers check the contents exist
 /// first, so the flush follows whatever write made them visible.
 pub(crate) async fn apply_changes(
