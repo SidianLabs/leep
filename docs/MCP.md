@@ -58,7 +58,7 @@ Logs go to stderr; stdout carries protocol messages only.
 | `leep_blame` | `rev?`, `path` | per-line changeset and author |
 | `leep_search` | `query`, `rev?`, `regex?`, `case_insensitive?`, `path?`, `glob?`, `limit?` (default 50, max 200) | matching lines `{path, line_number, line, ranges}` ordered by path then line, `truncated`, `stats`; per line, UTF-8 text files up to 1 MiB (others counted in `stats.files_skipped`) |
 | `leep_review_status` | `rev`, `ref?` (default `main`) | per changed path: the rule that satisfies it (`auto:*`, `owner`, `merge_parent`) or `pending` / `rejected`, with owners and who approved or rejected, plus `approved`, `blocked_paths` and `next_step`; needs a server with authentication |
-| `leep_commit_and_land` | `message`, `changes[]`, `base?`, `target_ref?`, `create_ref?`, `prompt?`, `tests?` | landed id, or a conflict report |
+| `leep_commit_and_land` | `message`, `changes[]`, `base?`, `target_ref?`, `create_ref?`, `prompt?`, `tests?`, `request_id?`; or `changeset` alone | landed id, or a conflict report |
 
 Data tools return JSON as text and as `structuredContent`; file and diff
 tools return plain text. Failures (bad arguments, 401, 403, 404, unreachable
@@ -95,6 +95,18 @@ revision the agent read the files from (default: head of `target_ref`, which
 defaults to `main`). The tool uploads missing blobs, creates one changeset
 with `agent.*` provenance, and lands it. If `main` moved and the edits do not
 overlap, the server rebases automatically (`rebased: true`).
+
+**Retrying.** The server's request timeout (408) can cancel a land after it
+moved the ref, so a failed call does not mean nothing landed. When the land
+itself fails that way (timeout, lost connection, 5xx) the error names the
+changeset the call made; calling again with `changeset` set to that id lands
+it at most once, since the server answers a changeset that is already on the
+ref, or landed there as a rebased copy, with the earlier result. Or give every
+call a `request_id` (recorded as `agent.request_id`): a second call with the
+same id, to the same MCP server process, lands the changeset the first call
+made instead of building a new one on the moved head. A conflict forgets the
+id, since the resolving call carries new content; using one id for two
+different changes is otherwise a mistake the tool cannot see.
 
 Landing onto a ref that does not exist fails (`isError: true`, nothing landed)
 unless `create_ref: true` is given, so a mistyped `target_ref` cannot create a

@@ -514,6 +514,11 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   replayed `a` again: an empty duplicate of `a` on the ref, or a false
   conflict if the ref had since changed `a`'s files. The stack walk now
   stops at an entry whose copy is already on the ref.
+- MCP `leep_commit_and_land` can be retried safely. A retry after a timeout
+  used to build a new changeset (with a new timestamp) on the moved head,
+  landing a second, empty copy of the change. It now takes `changeset` (land one that exists;
+  ambiguous failures name it) and `request_id` (recorded as
+  `agent.request_id`; a repeat lands the changeset the first call made).
 - The crash test's HTTP agents land the same changeset again after an
   unanswered land, as a real client does, instead of rebuilding the stack on
   the new head, which landed it twice when the first land had applied.

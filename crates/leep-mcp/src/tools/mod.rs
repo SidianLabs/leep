@@ -351,13 +351,16 @@ pub fn definitions() -> Vec<Value> {
              result lists each conflicting path with base/ours/theirs text; resolve them and call \
              again with base set to the reported `onto` id, including all your changes (clean \
              paths too). Landing onto a ref that does not exist needs create_ref:true. Text \
-             files only.",
+             files only. If a call fails without an answer (timeout, lost connection), it may \
+             have landed: call again with `changeset` set to the id the error names, or with \
+             the same `request_id`; that never lands the change twice.",
             json!({
                 "type": "object",
                 "properties": {
-                    "message": { "type": "string", "description": "Commit message." },
+                    "message": { "type": "string", "description": "Commit message. Required unless `changeset` is given." },
                     "changes": {
                         "type": "array",
+                        "description": "Required unless `changeset` is given.",
                         "minItems": 1,
                         "items": {
                             "type": "object",
@@ -375,9 +378,13 @@ pub fn definitions() -> Vec<Value> {
                     "target_ref": { "type": "string", "description": "Ref to land on (default `main`)." },
                     "create_ref": { "type": "boolean", "description": "Create target_ref if it does not exist (default false, so a mistyped ref is an error). The first land onto `main` of an empty repository creates it without this." },
                     "prompt": { "type": "string", "description": "The request that led to this change, recorded as provenance." },
-                    "tests": { "type": "string", "description": "Tests run and their results, recorded as provenance." }
+                    "tests": { "type": "string", "description": "Tests run and their results, recorded as provenance." },
+                    "changeset": { "type": "string", "description": "Land this existing changeset (id or unique prefix) instead of creating one, e.g. to finish a call that timed out. Give no changes with it." },
+                    "request_id": { "type": "string", "description": "Your own id for this request, unique per change. A retry with the same id lands the changeset the first call made instead of making another. Use a new id after a conflict." }
                 },
-                "required": ["message", "changes"],
+                // `message` and `changes` are required unless `changeset` is
+                // given. Not expressed with a top-level `anyOf`, which some
+                // model APIs refuse in a tool schema; the tool checks it.
                 "additionalProperties": false
             }),
             false,

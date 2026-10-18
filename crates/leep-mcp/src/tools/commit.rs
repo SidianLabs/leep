@@ -6,7 +6,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use leep_cli::error::{CliError, ErrorKind};
 use leep_core::api::{Conflict, FileInfo, LandRequest, LandResponse};
 use leep_core::changeset::{
-    EXTRA_AGENT_MODEL, EXTRA_AGENT_PROMPT, EXTRA_AGENT_SESSION, EXTRA_AGENT_TESTS,
+    EXTRA_AGENT_MODEL, EXTRA_AGENT_PROMPT, EXTRA_AGENT_REQUEST_ID, EXTRA_AGENT_SESSION,
+    EXTRA_AGENT_TESTS,
 };
 use leep_core::refname::MISSING_REF_MARKER;
 use leep_core::{Changeset, ChangesetId, FileChange, FileKind, Hash, RepoPath};
@@ -21,7 +22,9 @@ const MAX_CONFLICT_TEXT: usize = 64 * 1024;
 
 #[derive(Deserialize)]
 struct Args {
+    #[serde(default)]
     message: String,
+    #[serde(default)]
     changes: Vec<Edit>,
     base: Option<String>,
     target_ref: Option<String>,
@@ -29,6 +32,16 @@ struct Args {
     create_ref: bool,
     prompt: Option<String>,
     tests: Option<String>,
+    /// Land this existing changeset instead of making one: the retry of a
+    /// call whose answer was lost.
+    changeset: Option<String>,
+    /// Client-chosen id of this request. A second call with the same id in
+    /// this process lands the changeset the first one made.
+    request_id: Option<String>,
+}
+
+fn non_empty(s: Option<&str>) -> Option<&str> {
+    s.map(str::trim).filter(|s| !s.is_empty())
 }
 
 #[derive(Deserialize)]
@@ -45,12 +58,6 @@ struct Edit {
 impl Server {
     pub(super) fn commit_and_land(&self, args: Value) -> ToolResult {
         let a: Args = parse_args(args)?;
-        if a.message.trim().is_empty() {
-            return Err(ToolError::new("message must not be empty"));
-        }
-        if a.changes.is_empty() {
-            return Err(ToolError::new("changes must contain at least one entry"));
-        }
         let target_ref = a
             .target_ref
             .as_deref()
@@ -58,6 +65,34 @@ impl Server {
             .filter(|r| !r.is_empty())
             .unwrap_or("main")
             .to_string();
+        if let Some(rev) = non_empty(a.changeset.as_deref()) {
+            if !a.changes.is_empty() {
+                return Err(ToolError::new(
+                    "give either changeset (to land one that exists) or changes, not both",
+                ));
+            }
+            let id = self.resolve_rev(Some(rev))?;
+            return self.land_existing(id, &target_ref, a.create_ref, None);
+        }
+        let request_id = non_empty(a.request_id.as_deref()).map(str::to_string);
+        if let Some(r) = &request_id {
+            let known = self.requests.lock().unwrap().get(r).cloned();
+            if let Some((id, onto)) = known {
+                if onto != target_ref {
+                    return Err(ToolError(format!(
+                        "request_id `{r}` was used for changeset {id} on `{onto}`; use a new \
+                         request_id for a different request"
+                    )));
+                }
+                return self.land_existing(id, &target_ref, a.create_ref, Some(r.as_str()));
+            }
+        }
+        if a.message.trim().is_empty() {
+            return Err(ToolError::new("message must not be empty"));
+        }
+        if a.changes.is_empty() {
+            return Err(ToolError::new("changes must contain at least one entry"));
+        }
 
         // Validate everything before touching the server.
         let mut inherit_kind: Vec<RepoPath> = Vec::new();
@@ -144,6 +179,9 @@ impl Server {
                 extra.insert(k.to_string(), v.clone());
             }
         }
+        if let Some(r) = &request_id {
+            extra.insert(EXTRA_AGENT_REQUEST_ID.to_string(), r.clone());
+        }
         let cs = Changeset {
             parents: parent.into_iter().collect(),
             author: self.cfg.author.clone(),
@@ -156,7 +194,47 @@ impl Server {
             extra,
         };
         let created = self.client.create_changeset(&cs)?;
-        let resp = self.land_creating(created, &target_ref, a.create_ref)?;
+        if let Some(r) = &request_id {
+            self.requests
+                .lock()
+                .unwrap()
+                .insert(r.clone(), (created, target_ref.clone()));
+        }
+        let files = cs.changes.len();
+        self.land_and_report(
+            created,
+            &target_ref,
+            a.create_ref,
+            files,
+            request_id.as_deref(),
+        )
+    }
+
+    /// Land a changeset that already exists. Safe to repeat: one already on
+    /// the ref, or landed there as a rebased copy, is reported as landed
+    /// rather than added again.
+    fn land_existing(
+        &self,
+        id: ChangesetId,
+        target_ref: &str,
+        create: bool,
+        request_id: Option<&str>,
+    ) -> ToolResult {
+        let files = self.client.get_changeset(&id)?.changeset.changes.len();
+        self.land_and_report(id, target_ref, create, files, request_id)
+    }
+
+    /// Land `created` and report the outcome. A conflict forgets
+    /// `request_id`, since the retry that resolves it carries new content.
+    fn land_and_report(
+        &self,
+        created: ChangesetId,
+        target_ref: &str,
+        create: bool,
+        files_changed: usize,
+        request_id: Option<&str>,
+    ) -> ToolResult {
+        let resp = self.land_creating(created, target_ref, create)?;
         match resp {
             LandResponse::Landed {
                 landed,
@@ -169,13 +247,18 @@ impl Server {
                 "target_ref": target_ref,
                 "rebased": rebased,
                 "attempts": attempts,
-                "files_changed": cs.changes.len(),
+                "files_changed": files_changed,
             }))),
             LandResponse::Conflicts {
                 onto,
                 conflicts,
                 clean,
-            } => self.conflict_report(&target_ref, created, onto, &conflicts, &clean),
+            } => {
+                if let Some(r) = request_id {
+                    self.requests.lock().unwrap().remove(r);
+                }
+                self.conflict_report(target_ref, created, onto, &conflicts, &clean)
+            }
         }
     }
 
@@ -217,11 +300,11 @@ impl Server {
                 if target_ref == DEFAULT_REF {
                     let refs = self.client.refs()?.refs;
                     if refs.is_empty() {
-                        return Ok(land(true)?);
+                        return land(true).map_err(|e| land_error(e, changeset));
                     }
                     // Another client's first land got there in between.
                     if refs.contains_key(DEFAULT_REF) {
-                        return Ok(land(false)?);
+                        return land(false).map_err(|e| land_error(e, changeset));
                     }
                 }
                 Err(ToolError(format!(
@@ -229,7 +312,7 @@ impl Server {
                      with leep_refs, or call again with create_ref:true to create it."
                 )))
             }
-            other => Ok(other?),
+            other => other.map_err(|e| land_error(e, changeset)),
         }
     }
 
@@ -296,6 +379,19 @@ impl Server {
                 json!({ "text": shown, "size": f.size, "truncated": cut })
             }
         })
+    }
+}
+
+/// A failed land, with how to finish it safely when it may have applied: the
+/// server's timeout can cancel a land after it moved the ref.
+fn land_error(e: CliError, changeset: ChangesetId) -> ToolError {
+    match e.kind() {
+        ErrorKind::Timeout | ErrorKind::Unreachable | ErrorKind::Server => ToolError(format!(
+            "{e}. The land of changeset {changeset} may have applied. Call \
+             leep_commit_and_land again with changeset: \"{changeset}\" (or the same \
+             request_id) to finish it; a changeset that already landed is not landed twice."
+        )),
+        _ => e.into(),
     }
 }
 
