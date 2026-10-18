@@ -12,7 +12,7 @@ Status: early development (v0.1).
 - [Architecture](docs/ARCHITECTURE.md)
 - [Formats and compatibility](docs/FORMATS.md)
 - [Decision records](docs/adr/)
-- [Roadmap](docs/ROADMAP.md)
+- [Strategy](docs/STRATEGY.md) and [roadmap](docs/ROADMAP.md)
 - [Deploying with Docker](docs/DEPLOY.md)
 - [Operating: logs and metrics](docs/OPERATIONS.md)
 - [Runbooks: what to do when an alert fires](docs/RUNBOOKS.md)

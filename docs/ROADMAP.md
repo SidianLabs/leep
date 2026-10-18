@@ -82,6 +82,16 @@ operator action, and their benchmarks are in `docs/PERFORMANCE.md`.
   fixed or written down in the relevant ADR (`docs/SECURITY-REVIEW.md`)
 - [x] Request size, rate and concurrency limits per token (ADR 0020)
 
+### Scale on real histories (git/git, Linux; PERFORMANCE.md)
+- [x] Import, pack and index the whole Linux history (1.48M commits) on a
+  4-vCPU, 12 GB machine, with the results in PERFORMANCE.md
+- [x] Lands scale with batching under many agents (ADR 0043)
+- [x] Repack of all of Linux in about 2 GB of memory (#80)
+- [ ] Path-history index at least 5x smaller on Linux (24 GB today), queries
+  no slower
+- [ ] Index for `log --author` and provenance filters (154 s on Linux today)
+- [ ] Cold full listings, deep diffs and first blames on Linux in seconds
+
 Exit: a full soak run and the fuzzers find nothing new for two weeks.
 
 ## M6: Operations
@@ -103,29 +113,58 @@ Exit: a full soak run and the fuzzers find nothing new for two weeks.
 Exit: an operator who has never seen Leep can deploy, back up, restore and
 upgrade it from the docs alone.
 
-## M7: Product
-- Multiple repositories per server, each with its own refs, tokens and
-  policies
-- Identity: OIDC or mTLS in addition to static tokens; per-repository roles
-- Client polish: clear errors, `leep status`/`diff` UX, conflict resolution
-  flow, shell completions
+## M7: Git compatibility
+Leep stays its own system; git is a door in (see [STRATEGY.md](STRATEGY.md)).
+- Live two-way mirror with GitHub and GitLab: lands appear in git within
+  seconds, and pushes to the git side land in Leep, with conflicts reported,
+  never silently resolved
+- Self-host Leep's own development through the mirror (the M5 item above)
+- git wire protocol on the server: `git clone`, `fetch` and `push` against a
+  Leep server, so IDEs and CI work unchanged
 - Installable releases: prebuilt binaries, a published container image,
   `cargo install`
-- A read-only web view of history, diffs and reviews
+- Client polish: clear errors, `leep status`/`diff` UX, conflict resolution
+  flow, shell completions
+
+Exit: a team keeps working in git and its CI unchanged while its agents
+land through Leep, for a month, with no lost or diverged change.
+
+## M8: Multi-repository and identity
+- Multiple repositories per server, each with its own refs, tokens, policies
+  and indexes
+- Organizations, teams and per-repository roles
+- Identity: OIDC and SAML single sign-on, and mTLS for machines, in addition
+  to static tokens
+- Audit log of every authenticated action
+- Events and webhooks (lands, proposals, ref moves) for CI and other tools
 
 Exit: the design partners' top requests for this milestone are shipped,
-and Leep's own development has run on a Leep server since M5.
+and Leep's own development has run on a Leep server since M7.
 
-## M8: Scale out
+## M9: Collaboration
+- Proposals: Leep's equivalent of a pull request, with review threads,
+  approvals and required checks, built on the existing review service
+- Early conflict warnings: the land queue tells an agent its change will
+  conflict before it lands
+- A web view of repositories, history, diffs and proposals
+
+Exit: a design partner reviews and lands its human changes in Leep, not in
+a mirror.
+
+## M10: Enterprise operations and scale out
+- High availability: several servers on one database, with tested failover
+- Helm chart and a documented production topology
+- Large binary files
 - Regional read-through cache tier
 - Distributed SQL `MetaStore` backend
 - FUSE virtual filesystem (`leep mount`)
 - Published performance targets (land latency, read latency, repository
   size) with benchmarks that check them
 
-Exit: the targets hold in a multi-region test deployment.
+Exit: the targets hold in a multi-region test deployment, and a server can
+be lost without losing an acknowledged land.
 
-## M9: Release candidate
+## M11: Release candidate
 - Freeze on-disk formats and the `/v1` API; document what is stable
 - Deprecation and support policy
 - Complete user, operator and API reference docs
@@ -139,6 +178,15 @@ Exit: no format or API change needed for one full milestone.
 - Upgrades from the last two minor versions are tested in CI
 - No open security findings rated high or above
 - A maintainer signs off on the release
+
+## M12: Hosted platform (after 1.0)
+- Multi-tenant hosted Leep built on the open core: organizations,
+  repositories and the web interface for code, history and review
+- Billing, usage limits and support
+- Features for agent-heavy teams: per-agent identity and provenance views,
+  merge queues for thousands of lands a day, agent APIs
+
+Exit: outside teams run their main repositories on the hosted service.
 
 ## Later / research
 - DeltaDB-style live edit streams (CRDT worktrees) between commits

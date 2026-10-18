@@ -4,6 +4,28 @@ The maintainer agreed these decisions on 2026-10-15. They guide what goes on
 [the roadmap](ROADMAP.md) and how it is ordered. Changing one is a maintainer
 decision: record the new decision and its date here.
 
+## Decision of 2026-10-18: an independent system, then a platform
+
+The maintainer widened the goal. Leep is to be an independent version control
+system, as Scion, Sapling and jj are, that a company can fork and deploy as
+its complete source-control infrastructure; later, Sidian Labs builds a
+hosted platform on it, as GitHub is for git, to serve everyone. The first
+market below is unchanged and still decides what comes first. What changes:
+
+- **The git bridge becomes a full compatibility layer.** A live two-way
+  mirror first, then the git wire protocol, so git clients, IDEs and CI can
+  use a Leep server directly. Leep's own model and API stay primary.
+- **A review interface is now in scope**: proposals with review threads in
+  the core, a web interface in the platform. Teams may still mirror to
+  GitHub or GitLab while they move.
+- **Everything a company needs to run Leep for itself goes in the open
+  core**: multi-repository, identity, audit, events, high availability. Only
+  what a hosted multi-tenant service needs (control plane, billing) can be
+  separate.
+
+[STRATEGY.md](STRATEGY.md) lays out the layers and the order of work; the
+[roadmap](ROADMAP.md) carries them as milestones M7 to M12.
+
 ## Who Leep is for first
 
 **Teams that run many coding agents against one codebase.** A platform or
@@ -27,10 +49,12 @@ prioritised for them before the first market is served.
 
 ### Not goals for now
 
-- Replacing GitHub's or GitLab's human code-review UI. Leep mirrors to them.
 - A desktop GUI client.
-- Supporting every git workflow. The git bridge exists for import, export and
-  mirroring, not as a git server.
+- Supporting every git workflow. The git compatibility layer covers clone,
+  fetch, push and mirroring, not every git command or hosting feature.
+
+(Until 2026-10-18 this list also excluded a review UI and serving git; see
+the decision above.)
 
 ## Business model
 
@@ -42,8 +66,9 @@ prioritised for them before the first market is served.
 - Sidian Labs may later run Leep as a hosted service, and may sell what large
   teams need on top of the core, such as SSO, audit logs, a multi-tenant
   control plane, regional caches and support.
-- Multi-repository support and real identity (M7) are prerequisites for a
-  hosted service. That is why they come before scale-out on the roadmap.
+- Git compatibility (M7), then multi-repository support and real identity
+  (M8), are prerequisites for both self-hosted replacement and a hosted
+  service. That is why they come before scale-out on the roadmap.
 
 ## License and contributions
 
@@ -62,9 +87,10 @@ design partner won't hit, and it is the most convincing demo there is.
 
 ## Design partners
 
-Before M7, find two or three teams from the first market to run Leep for real
-work. M5 and M6 (hardening and operations) can proceed on our own judgement.
-M7 (identity, the web view, integrations) is shaped by what those teams need.
+Before M8, find two or three teams from the first market to run Leep for real
+work. M5 to M7 (hardening, operations, git compatibility) can proceed on our
+own judgement. M8 onward (identity, collaboration, the web view,
+integrations) is shaped by what those teams need.
 
 ## How work is reviewed
 
