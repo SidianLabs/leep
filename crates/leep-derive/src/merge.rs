@@ -107,6 +107,11 @@ impl Repo {
                 return Ok(Resolved::Conflict(None));
             };
             match diffy::merge(&b, &ot, &th) {
+                // A merge result the blob store would refuse (ADR 0041) is
+                // left to the caller to resolve.
+                Ok(merged) if leep_core::hash::is_object_preimage(merged.as_bytes()) => {
+                    return Ok(Resolved::Conflict(None));
+                }
                 Ok(merged) => {
                     let bytes = Bytes::from(merged.into_bytes());
                     let size = bytes.len() as u64;

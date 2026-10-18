@@ -118,6 +118,11 @@ with `Error::Invalid`:
   million directories (256 MiB of directory names), since building the tree
   holds each changed directory and its full path in memory.
 
+A blob may not be the hash preimage of an object (bytes starting `leep:`
+with a NUL after it): it would share a tree node's address in the
+`BlobStore`, so `Repo::put_blob` refuses it with `Error::Invalid`
+([ADR 0041](adr/0041-blob-and-object-address-separation.md)).
+
 `RepoPath` is validated on construction and on deserialization, so invalid
 paths cannot enter the system through any route.
 

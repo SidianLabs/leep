@@ -254,6 +254,15 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   them. It now jumps between changes with the path-history index and the
   first-parent skip list (the answer is unchanged), and checks its cache before
   walking.
+- Security: a blob could take a tree node's address, since a tree is stored
+  in the blob store under `BLAKE3("leep:tree-v1\0" ‖ bytes)` and a blob
+  with exactly those bytes hashes the same. Uploading it before the tree
+  existed made that tree read as corrupt for good. Blob writes now refuse
+  bytes that start with `leep:` and contain a NUL (400); text files that
+  only start with `leep:` are unaffected. `leep-git import` stops at such a
+  file with an error naming it, a merge that would produce one is a
+  conflict, and ADR 0041 weighs the proper fix (separate store namespaces
+  for trees).
 
 ### Operations
 - Versioned schema migrations for SQLite and Postgres (ADR 0023). The

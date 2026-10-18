@@ -10,8 +10,12 @@ skill.
 - Algorithm: BLAKE3, 32 bytes. Hex is lowercase, 64 characters.
 - Blob: `BLAKE3(raw file bytes)`, with no header.
 - Object: `BLAKE3("leep:" ‖ kind ‖ 0x00 ‖ postcard(object))`, where `kind`
-  carries a version suffix (`changeset-v1`, `tree-v1`). This domain separation
-  means a blob can never collide with an object.
+  carries a version suffix (`changeset-v1`, `tree-v1`). The prefix separates
+  object kinds from each other, but not from blobs: the blob whose bytes are
+  that preimage has the object's address. Since tree nodes share the
+  `BlobStore` with blobs, blob writes refuse any bytes that start with
+  `leep:` and contain a NUL (`leep_core::hash::is_object_preimage`) until the
+  two are stored in separate namespaces (ADR 0041).
 
 ## Binary encoding
 

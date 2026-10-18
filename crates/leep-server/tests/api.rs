@@ -194,6 +194,40 @@ async fn blob_errors() {
     );
 }
 
+/// A blob whose bytes are a tree's hash preimage has the tree's address. If
+/// it were stored first, the tree would read back as corrupt forever
+/// (ADR 0041), so the upload is refused.
+#[tokio::test]
+async fn blob_cannot_take_a_tree_address() {
+    let c = Client::new();
+    let empty = leep_core::TreeNode::default();
+    let mut preimage = format!("leep:{}", leep_core::TreeNode::KIND).into_bytes();
+    preimage.push(0);
+    preimage.extend_from_slice(&empty.encode());
+    let h = Hash::of_blob(&preimage);
+    assert_eq!(h, leep_core::TreeNode::empty_hash());
+    let r = c
+        .raw(Method::PUT, &format!("/v1/blobs/{h}"), preimage)
+        .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert!(r.json::<ErrorResponse>().error.contains("ADR 0041"));
+
+    // The tree itself is still stored and read normally.
+    let a = c.commit(&[], &[("a.txt", Some("one\n"))], "add").await;
+    let b = c.commit(&[a], &[("a.txt", None)], "remove").await;
+    let r = c.get(&format!("/v1/tree/{b}")).await;
+    assert_eq!(
+        r.status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&r.body)
+    );
+    assert!(r.json::<TreeResponse>().entries.is_empty());
+
+    // A text file that merely starts with the prefix is an ordinary blob.
+    c.put_blob(b"leep: true\n").await;
+}
+
 #[tokio::test]
 async fn body_limit() {
     let repo = Repo::new(

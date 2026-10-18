@@ -241,6 +241,32 @@ async fn incremental_import_and_set_ref() {
     assert_eq!(repo.resolve("main").await.unwrap(), r3.head.unwrap());
 }
 
+/// A file whose bytes are an object's hash preimage cannot be stored as a
+/// blob (ADR 0041). Import stops at that commit with an error naming the
+/// file, after importing the commits before it; a text file that only starts
+/// with `leep:` imports normally.
+#[tokio::test]
+async fn reserved_blob_prefix_stops_import_clearly() {
+    let d = init();
+    let p = d.path();
+    write(p, "config.yml", "leep: true\n");
+    commit(p, "ordinary");
+    write(p, "evil.bin", "leep:tree-v1\0\0");
+    commit(p, "reserved");
+    let repo = new_repo();
+    let err = import(&repo, &p.join(".git"), "HEAD", &ImportOptions::default())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, leep_core::Error::Invalid(_)), "{err}");
+    assert!(err.to_string().contains("evil.bin"), "{err}");
+
+    let r = import(&repo, &p.join(".git"), "HEAD~1", &ImportOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(r.commits_imported + r.commits_skipped, 1);
+    assert_matches_git(&repo, r.head.unwrap(), p, "HEAD~1").await;
+}
+
 #[tokio::test]
 async fn submodules_are_skipped() {
     let d = init();
