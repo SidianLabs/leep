@@ -106,6 +106,24 @@ struct RunArgs {
     /// pushed to PREFIX/BRANCH for someone to merge.
     #[arg(long, default_value = "leep-diverged/")]
     diverged_prefix: String,
+    /// When both sides of a ref moved: `report` (push Leep's side to the
+    /// diverged branch for a person to merge) or `merge` (import the
+    /// remote's side, merge on the server and land the merge when it is
+    /// clean and the land policy allows; report otherwise). Needs --import.
+    #[arg(long, default_value = "report")]
+    on_divergence: mirror::OnDivergence,
+    /// Author of the mirror's merges. Part of each merge's id: keep it fixed
+    /// for the life of a mirror.
+    #[arg(long, default_value = mirror::DEFAULT_MERGE_AUTHOR)]
+    merge_author: String,
+    /// Land branches pushed to PREFIX<ref>/<name> onto the Leep ref <ref>
+    /// through the server's land (rebased like an agent's land), then delete
+    /// them. Needs --import.
+    #[arg(long)]
+    land_branches: bool,
+    /// Branch prefix of land branches (with --land-branches).
+    #[arg(long, default_value = "leep-land/")]
+    land_prefix: String,
     /// Add `Leep-Agent-*` trailers. Changes commit ids: keep it fixed for
     /// the life of a mirror.
     #[arg(long)]
@@ -210,6 +228,20 @@ fn run_mirror(cmd: MirrorCmd) -> Result<i32> {
                         }
                     );
                 }
+                for b in &s.land_branches {
+                    println!(
+                        "  land branch {} -> {} {} at {}{}",
+                        b.branch.trim_start_matches("refs/heads/"),
+                        b.leep_ref.as_deref().unwrap_or("?"),
+                        b.state.label(),
+                        &b.commit[..12.min(b.commit.len())],
+                        if b.detail.is_empty() {
+                            String::new()
+                        } else {
+                            format!("\n      {}", b.detail)
+                        }
+                    );
+                }
                 for p in &problems {
                     eprintln!("attention: {p}");
                 }
@@ -233,6 +265,9 @@ fn run_mirror(cmd: MirrorCmd) -> Result<i32> {
                 import: a.import,
                 allow_rewind: a.allow_rewind,
                 diverged_prefix: a.diverged_prefix,
+                on_divergence: a.on_divergence,
+                merge_author: a.merge_author,
+                land_prefix: a.land_branches.then_some(a.land_prefix),
                 style: CommitStyle {
                     provenance_trailers: a.provenance_trailers,
                     changeset_trailer: !a.no_changeset_trailer,

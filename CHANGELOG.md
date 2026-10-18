@@ -570,6 +570,27 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   - `leep-git mirror status`, `--listen` (`/metrics`, `/status`, `/poke` for
     webhooks), and three alerts with runbooks: `LeepMirrorDown`,
     `LeepMirrorLagging` and `LeepMirrorStuck`.
+- The git mirror can merge and land (ADR 0049), both opt-in:
+  - `--on-divergence merge`: when both sides moved, the mirror imports the
+    remote's side, asks `POST /v1/merge` for a merge and lands it by ref
+    compare-and-swap if it is clean and the land policy allows, then pushes
+    it as a fast-forward. Conflicts and refusals fall back to the
+    `diverged` report; nothing is resolved automatically. The merge is
+    deterministic (`--merge-author`, a fixed message, the newer parent's
+    time), so a crash at any step reproduces the same commit.
+  - `--land-branches`: a push to `leep-land/<ref>/<name>` is imported and
+    landed onto `<ref>` through `POST /v1/land`, rebased like an agent's
+    land, and the branch is deleted with an exact lease. Conflicts and
+    refusals stay in `status.json` (`land_branches`) and the new metrics
+    `leep_mirror_land_branches_total` and
+    `leep_mirror_land_branches_failing`, with the alert
+    `LeepMirrorLandBranchFailing`.
+  - New metric `leep_mirror_merges_total`; new crash-test steps for
+    `LEEP_MIRROR_CRASH_AT`.
+  - A changeset whose export is not the commit its `git.commit` names (a
+    rebased copy of an imported changeset) now gets the `Leep-Changeset:`
+    trailer. Commits of every changeset the mirror exported before are
+    unchanged.
 
 ### Fixes
 - `leep-git import` and `export` no longer fail with "Entry too large to fit

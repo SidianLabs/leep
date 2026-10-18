@@ -153,9 +153,20 @@ impl Exporter {
             Some(t) => t,
             None => self.repo.write_object(gix::objs::Tree::empty())?.detach(),
         };
-        let trailer = (self.style.changeset_trailer && !cs.extra.contains_key(EXTRA_GIT_COMMIT))
-            .then_some(id);
-        let commit = commit_object(cs, tree, parents, self.style.provenance_trailers, trailer)?;
+        let mut commit = commit_object(
+            cs,
+            tree,
+            parents.clone(),
+            self.style.provenance_trailers,
+            None,
+        )?;
+        // Only a changeset whose export is the commit it came from goes
+        // without the trailer. One that names a `git.commit` it does not
+        // reproduce (the server's rebased copy of an imported changeset, as
+        // a land branch makes) is Leep's own and must say so.
+        if self.style.changeset_trailer && !reproduces(self.repo.object_hash(), cs, &commit)? {
+            commit = commit_object(cs, tree, parents, self.style.provenance_trailers, Some(id))?;
+        }
         let oid = self.repo.write_object(commit)?.detach();
         self.map.insert(id, oid, Origin::Exported)?;
         self.commits_written += 1;
@@ -177,6 +188,17 @@ impl Exporter {
         self.blobs.insert(*hash, oid);
         Ok(oid)
     }
+}
+
+/// Is `commit` the commit `cs` was imported from?
+fn reproduces(kind: gix::hash::Kind, cs: &Changeset, commit: &gix::objs::Commit) -> Result<bool> {
+    let Some(want) = cs.extra.get(EXTRA_GIT_COMMIT) else {
+        return Ok(false);
+    };
+    let mut buf = Vec::new();
+    gix::objs::WriteTo::write_to(commit, &mut buf)?;
+    let oid = gix::objs::compute_hash(kind, gix::objs::Kind::Commit, &buf)?;
+    Ok(want.parse::<ObjectId>().is_ok_and(|w| w == oid))
 }
 
 fn fetch(leep: &dyn Leep, id: &ChangesetId) -> Result<Changeset> {

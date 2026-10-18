@@ -8,7 +8,11 @@
 //!   loses and duplicates nothing, and no update of the remote is ever
 //!   anything but a fast-forward;
 //! - agents landing while a person pushes end with both sides holding every
-//!   change, with any divergence reported and resolved by a merge in git.
+//!   change, with any divergence reported and resolved by a merge in git;
+//! - with `--on-divergence merge` and `--land-branches` (ADR 0049), clean
+//!   divergences are merged by the mirror, land branches land through the
+//!   server, conflicts are reported and left alone, and crashes at every new
+//!   step neither lose nor repeat a merge or a land.
 //!
 //! Knobs: `LEEP_MIRROR_KILL_ROUNDS` (default 12) and `LEEP_MIRROR_SEED`. Run
 //! `cargo build --workspace` first.
@@ -27,6 +31,9 @@ use leep_testkit::Rng;
 const DEFAULT_SEED: u64 = 0x6172_6F72;
 /// The CLI's author; the mirror exports it as the commit author.
 const TIMEOUT: Duration = Duration::from_secs(60);
+/// The flags of a mirror that merges clean divergences and lands land
+/// branches.
+const MERGING: &[&str] = &["--on-divergence", "merge", "--land-branches"];
 
 fn env_u64(key: &str, default: u64) -> u64 {
     std::env::var(key)
@@ -148,6 +155,11 @@ impl Mirror {
             .unwrap();
         let v = serde_json::from_slice(&out.stdout).unwrap_or(serde_json::Value::Null);
         (out.status.code().unwrap_or(-1), v)
+    }
+
+    fn land_branches(&self) -> Vec<serde_json::Value> {
+        let (_, v) = self.status();
+        v["land_branches"].as_array().cloned().unwrap_or_default()
     }
 
     fn main_status(&self) -> serde_json::Value {
@@ -314,6 +326,25 @@ impl Person {
             self.catch_up();
         }
         panic!("push of {path} kept being rejected");
+    }
+
+    /// Commit a file on top of the remote's main and push it to the land
+    /// branch `leep-land/main/<name>`; local main is left as it was.
+    fn push_land(&self, name: &str, path: &str, body: &str) -> String {
+        self.git(&["fetch", "-q", "origin"]);
+        self.git(&["checkout", "-q", "-B", "landing", "origin/main"]);
+        write(&self.dir, path, body);
+        self.git(&["add", "-A"]);
+        self.git(&["commit", "-q", "-m", &format!("person lands {path}")]);
+        self.git(&[
+            "push",
+            "-q",
+            "origin",
+            &format!("HEAD:refs/heads/leep-land/main/{name}"),
+        ]);
+        let sha = self.git(&["rev-parse", "HEAD"]).trim().to_string();
+        self.git(&["checkout", "-q", "main"]);
+        sha
     }
 
     /// Push a merge of Leep's side if the mirror reported a divergence.
@@ -561,14 +592,53 @@ fn mirror_follows_lands_and_imports_pushes_postgres() {
     run_follow_and_import(&stores, tmp.path());
 }
 
+fn land_branches_on(remote: &Path) -> Vec<String> {
+    git(
+        remote,
+        &[
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/heads/leep-land/",
+        ],
+    )
+    .lines()
+    .map(String::from)
+    .collect()
+}
+
+/// Leep's main holds a change whose message is `msg` exactly once: a land
+/// branch or a merge was not applied twice under different ids.
+fn assert_landed_once(client: &Client, wc: &Path, msg: &str) {
+    let log = client.json(wc, &["log", "main", "-n", "10000"]);
+    let n = log["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["changeset"]["message"].as_str().map(str::trim) == Some(msg))
+        .count();
+    assert_eq!(n, 1, "{msg:?} is on Leep main {n} times");
+}
+
 /// SIGKILL the mirror at seeded random moments while it exports a backlog,
 /// pushes it, and imports pushes from the remote; then let one run finish.
 #[test]
 fn killed_mirror_loses_and_duplicates_nothing() {
+    kill_sweep(&[], 12);
+}
+
+/// The kill sweep with a mirror that merges divergences and lands land
+/// branches: nobody resolves anything by hand.
+#[test]
+fn killed_merging_mirror_loses_and_duplicates_nothing() {
+    kill_sweep(MERGING, 8);
+}
+
+fn kill_sweep(extra: &[&str], default_rounds: u64) {
     let _g = serial();
+    let merging = !extra.is_empty();
     let seed = env_u64("LEEP_MIRROR_SEED", DEFAULT_SEED);
-    let rounds = env_u64("LEEP_MIRROR_KILL_ROUNDS", 12);
-    eprintln!("mirror kill sweep: seed {seed:#x}, {rounds} rounds");
+    let rounds = env_u64("LEEP_MIRROR_KILL_ROUNDS", default_rounds);
+    eprintln!("mirror kill sweep {extra:?}: seed {seed:#x}, {rounds} rounds");
     let mut rng = Rng::new(seed);
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
@@ -580,28 +650,32 @@ fn killed_mirror_loses_and_duplicates_nothing() {
     agent.land("seed.txt", "seed\n");
     let work = root.join("work");
     {
-        let m = Mirror::start(&server, &remote, &work, root, &[]);
+        let m = Mirror::start(&server, &remote, &work, root, extra);
         wait_converged(&server, &remote, &m);
     }
     let person = Person::clone(&remote, root);
+    // A merging mirror needs nobody: the person never resolves.
+    let settled = |m: &Mirror| {
+        if !merging && m.main_status()["state"] == "diverged" {
+            person.resolve();
+        }
+        converged(&server, &remote, m) && land_branches_on(&remote).is_empty()
+    };
     let mut kills = 0;
+    let mut landed = Vec::new();
     for round in 0..rounds {
         // 0: a backlog of lands to export and push; 1: pushes to import;
-        // 2: both at once, which diverges and is merged by the person.
-        let kind = rng.below(3);
+        // 2: both at once, which diverges and is merged by the person (or
+        // by the mirror); 3 (merging only): a land branch while agents land.
+        let kind = rng.below(if merging { 4 } else { 3 });
         // Each round starts from both sides agreeing (the killed runs of the
         // previous round may have left work behind), so its kill lands in
         // the round's own export, push or import.
-        let m = Mirror::start(&server, &remote, &work, root, &[]);
+        let m = Mirror::start(&server, &remote, &work, root, extra);
         wait_until(
             "the mirror to converge between rounds",
             TIMEOUT,
-            || {
-                if m.main_status()["state"] == "diverged" {
-                    person.resolve();
-                }
-                converged(&server, &remote, &m)
-            },
+            || settled(&m),
             || format!("seed {seed:#x} round {round}\n{}", m.log_text()),
         );
         drop(m);
@@ -614,12 +688,17 @@ fn killed_mirror_loses_and_duplicates_nothing() {
                 );
             }
         }
-        if kind != 0 {
+        if kind == 1 || kind == 2 {
             for k in 0..1 + rng.below(3) {
                 person.push_file(&format!("r{round}/person-{k}.txt"), "p\n");
             }
         }
-        let mut m = Mirror::start(&server, &remote, &work, root, &[]);
+        if kind == 3 {
+            let path = format!("r{round}/land.txt");
+            person.push_land(&format!("r{round}"), &path, "l\n");
+            landed.push(format!("person lands {path}"));
+        }
+        let mut m = Mirror::start(&server, &remote, &work, root, extra);
         let delay = rng.below(700) as u64;
         std::thread::sleep(Duration::from_millis(delay));
         m.kill();
@@ -632,26 +711,33 @@ fn killed_mirror_loses_and_duplicates_nothing() {
     }
     eprintln!("mirror kill sweep: {kills} kills");
 
-    // A run left alone converges, with the person resolving divergences.
-    let m = Mirror::start(&server, &remote, &work, root, &[]);
+    // A run left alone converges.
+    let m = Mirror::start(&server, &remote, &work, root, extra);
     wait_until(
         "the mirror to converge after the kills",
         TIMEOUT,
-        || {
-            if m.main_status()["state"] == "diverged" {
-                person.resolve();
-            }
-            converged(&server, &remote, &m)
-        },
+        || settled(&m),
         || format!("seed {seed:#x}\n{}\n{}", m.main_status(), m.log_text()),
     );
     let log = m.log_text();
     eprintln!(
-        "mirror kill sweep: {} pushes, {} imports, {} divergences across all runs",
+        "mirror kill sweep: {} pushes, {} imports, {} merges, {} land branches, {} divergences \
+         across all runs",
         log.matches(": pushed ").count(),
         log.matches(": landed ").count(),
+        log.matches(" from the remote into ").count(),
+        log.matches(" onto main as ").count(),
         log.matches(": diverged: ").count()
     );
+    if merging {
+        assert!(
+            !log.contains(": diverged: "),
+            "no divergence needed a person:\n{log}"
+        );
+    }
+    for msg in &landed {
+        assert_landed_once(&client, &agent.wc, msg);
+    }
     assert_histories_match(&client, &agent.wc, &remote);
     assert_remote_only_fast_forwarded(&remote);
     assert_trees_match(&client, root, &remote, "kills");
@@ -662,10 +748,22 @@ fn killed_mirror_loses_and_duplicates_nothing() {
 /// once. Every change ends up on both sides.
 #[test]
 fn agents_land_while_a_person_pushes_to_git() {
+    concurrent_writers(&[]);
+}
+
+/// The same with a merging mirror: it converges with no merge in git, and
+/// half the person's work goes through land branches.
+#[test]
+fn agents_land_while_a_person_pushes_to_git_and_the_mirror_merges() {
+    concurrent_writers(MERGING);
+}
+
+fn concurrent_writers(extra: &[&str]) {
     let _g = serial();
     const AGENTS: usize = 3;
     const LANDS: usize = 5;
-    const PUSHES: usize = 5;
+    const PUSHES: usize = 6;
+    let merging = !extra.is_empty();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     let stores = Stores::sqlite(&root.join("data"));
@@ -674,7 +772,7 @@ fn agents_land_while_a_person_pushes_to_git() {
     let remote = make_remote(root);
     let first = Agent::new(&client, root, "agent-first");
     first.land("start.txt", "start\n");
-    let m = Mirror::start(&server, &remote, &root.join("work"), root, &[]);
+    let m = Mirror::start(&server, &remote, &root.join("work"), root, extra);
     wait_converged(&server, &remote, &m);
     let person = Person::clone(&remote, root);
 
@@ -694,8 +792,14 @@ fn agents_land_while_a_person_pushes_to_git() {
         }
         s.spawn(|| {
             for k in 0..PUSHES {
-                person.catch_up();
-                person.push_file(&format!("people/{k}.txt"), &format!("push {k}\n"));
+                let path = format!("people/{k}.txt");
+                let body = format!("push {k}\n");
+                if merging && k % 2 == 1 {
+                    person.push_land(&format!("p{k}"), &path, &body);
+                } else {
+                    person.catch_up();
+                    person.push_file(&path, &body);
+                }
                 std::thread::sleep(Duration::from_millis(100));
             }
         });
@@ -704,10 +808,10 @@ fn agents_land_while_a_person_pushes_to_git() {
         "both sides to hold every change",
         TIMEOUT,
         || {
-            if m.main_status()["state"] == "diverged" {
+            if !merging && m.main_status()["state"] == "diverged" {
                 person.resolve();
             }
-            converged(&server, &remote, &m)
+            converged(&server, &remote, &m) && land_branches_on(&remote).is_empty()
         },
         || format!("{}\n{}", m.main_status(), m.log_text()),
     );
@@ -728,11 +832,20 @@ fn agents_land_while_a_person_pushes_to_git() {
     }
     assert_histories_match(&client, &first.wc, &remote);
     assert_remote_only_fast_forwarded(&remote);
+    git(&remote, &["fsck", "--strict", "--no-dangling"]);
     let st = m.main_status();
     eprintln!(
-        "concurrent writers: pushes {} imports {} divergences {}",
-        st["pushes"], st["imports"], st["divergences"]
+        "concurrent writers {extra:?}: pushes {} imports {} divergences {} merges {} land branches {}",
+        st["pushes"], st["imports"], st["divergences"], st["merges"], st["land_branches"]
     );
+    if merging {
+        assert_eq!(st["divergences"], 0, "nobody had to merge in git: {st}");
+        assert_eq!(remote_ref(&remote, "refs/heads/leep-diverged/main"), None);
+        assert_eq!(st["land_branches"]["landed"], (PUSHES / 2) as u64, "{st}");
+        for k in (1..PUSHES).step_by(2) {
+            assert_landed_once(&client, &first.wc, &format!("person lands people/{k}.txt"));
+        }
+    }
 }
 
 /// Abort the mirror exactly between two steps (`LEEP_MIRROR_CRASH_AT`) and
@@ -826,5 +939,314 @@ fn crash_points_resume_exactly_once() {
         assert_remote_only_fast_forwarded(&remote);
     }
     assert_trees_match(&client, root, &remote, "crash-points");
+    git(&remote, &["fsck", "--strict", "--no-dangling"]);
+}
+
+/// Conflicting work from the person: resolve by taking both lines, commit
+/// and push. Returns the pushed commit.
+fn resolve_by_hand(person: &Person, path: &str, body: &str) -> String {
+    person.git(&["fetch", "-q", "origin"]);
+    let _ = person.try_git(&["merge", "-q", "--no-edit", "origin/leep-diverged/main"]);
+    write(&person.dir, path, body);
+    person.git(&["add", "-A"]);
+    person.git(&["commit", "-q", "--no-edit", "-m", "resolve by hand"]);
+    person.git(&["push", "-q", "origin", "main"]);
+    person.git(&["rev-parse", "HEAD"]).trim().to_string()
+}
+
+/// `--on-divergence merge` and `--land-branches` with the real binaries: a
+/// clean divergence is merged by the mirror, a conflicting one is reported
+/// and left for a person, and land branches land through the server or are
+/// reported.
+#[test]
+fn merging_mirror_merges_clean_divergence_and_lands_land_branches() {
+    let _g = serial();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let stores = Stores::sqlite(&root.join("data"));
+    let server = Server::start(&stores, root);
+    let client = Client::new(&server.url, &root.join("cache"));
+    let remote = make_remote(root);
+    let agent = Agent::new(&client, root, "agent");
+    agent.land("a.txt", "one\n");
+    let work = root.join("work");
+    let mut m = Mirror::start(&server, &remote, &work, root, MERGING);
+    wait_converged(&server, &remote, &m);
+    let person = Person::clone(&remote, root);
+
+    // Clean divergence: merged by the mirror, pushed as a fast-forward.
+    m.kill();
+    agent.land("b.txt", "leep\n");
+    let theirs = person.push_file("person.txt", "git\n");
+    let mut m = Mirror::start(&server, &remote, &work, root, MERGING);
+    wait_until(
+        "the mirror to merge",
+        TIMEOUT,
+        || {
+            converged(&server, &remote, &m)
+                && remote_ref(&remote, "refs/heads/main").as_deref() != Some(theirs.as_str())
+        },
+        || format!("{}\n{}", m.main_status(), m.log_text()),
+    );
+    let st = m.main_status();
+    assert_eq!(st["merges"]["landed"], 1, "{st}");
+    assert_eq!(st["divergences"], 0, "{st}");
+    assert_eq!(remote_ref(&remote, "refs/heads/leep-diverged/main"), None);
+    let tip = remote_ref(&remote, "refs/heads/main").unwrap();
+    assert!(git(&remote, &["rev-list", "--parents", "-1", &tip])
+        .split_whitespace()
+        .any(|p| p == theirs));
+    let body = git(&remote, &["log", "-1", "--format=%an <%ae>%n%B", "main"]);
+    assert!(
+        body.starts_with(
+            "Leep git mirror <git-mirror@leep.invalid>\nMerge main from git into main"
+        ),
+        "{body}"
+    );
+    let reflog = client.json(&agent.wc, &["reflog", "main", "-n", "1"]);
+    assert_eq!(reflog["entries"][0]["operation"], "git-mirror", "{reflog}");
+    let addr = m.listen.parse().unwrap();
+    let (_, _, metrics) = http_get(addr, "/metrics", None);
+    assert!(
+        metrics.contains("leep_mirror_merges_total{ref=\"main\",result=\"landed\"} 1"),
+        "{metrics}"
+    );
+
+    // Conflicting divergence: reported, nothing resolved, a person merges.
+    m.kill();
+    person.catch_up();
+    agent.land("clash.txt", "leep\n");
+    person.push_file("clash.txt", "git\n");
+    let mut m = Mirror::start(&server, &remote, &work, root, MERGING);
+    wait_until(
+        "the conflict to be reported",
+        TIMEOUT,
+        || {
+            let st = m.main_status();
+            st["state"] == "diverged"
+                && st["detail"]
+                    .as_str()
+                    .is_some_and(|d| d.contains("1 conflicting path: clash.txt"))
+                && remote_ref(&remote, "refs/heads/leep-diverged/main").is_some()
+        },
+        || format!("{}\n{}", m.main_status(), m.log_text()),
+    );
+    assert_eq!(m.status().0, 1, "a conflict needs a person");
+    assert_eq!(m.main_status()["merges"]["conflicts"], 1);
+    let resolved = resolve_by_hand(&person, "clash.txt", "both\n");
+    wait_until(
+        "the person's resolution to land",
+        TIMEOUT,
+        || {
+            converged(&server, &remote, &m)
+                && remote_ref(&remote, "refs/heads/main").as_deref() == Some(resolved.as_str())
+                && remote_ref(&remote, "refs/heads/leep-diverged/main").is_none()
+        },
+        || format!("{}\n{}", m.main_status(), m.log_text()),
+    );
+
+    // A land branch lands through the server, rebased onto an agent's land.
+    agent.land("c.txt", "three\n");
+    wait_converged(&server, &remote, &m);
+    m.kill();
+    agent.land("d.txt", "four\n");
+    person.git(&["fetch", "-q", "origin"]);
+    person.git(&["checkout", "-q", "-B", "landing", "origin/main~1"]);
+    write(&person.dir, "feature.txt", "feature\n");
+    person.git(&["add", "-A"]);
+    person.git(&["commit", "-q", "-m", "person lands feature.txt"]);
+    person.git(&[
+        "push",
+        "-q",
+        "origin",
+        "HEAD:refs/heads/leep-land/main/feature",
+    ]);
+    person.git(&["checkout", "-q", "main"]);
+    let mut m = Mirror::start(&server, &remote, &work, root, MERGING);
+    wait_until(
+        "the land branch to land",
+        TIMEOUT,
+        || converged(&server, &remote, &m) && land_branches_on(&remote).is_empty(),
+        || {
+            format!(
+                "{}\n{:?}\n{}",
+                m.main_status(),
+                m.land_branches(),
+                m.log_text()
+            )
+        },
+    );
+    assert_eq!(git(&remote, &["show", "main:feature.txt"]), "feature\n");
+    assert_landed_once(&client, &agent.wc, "person lands feature.txt");
+    let reflog = client.json(&agent.wc, &["reflog", "main", "-n", "5"]);
+    assert!(
+        reflog["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["operation"] == "land"),
+        "landed through POST /v1/land: {reflog}"
+    );
+
+    // A conflicting land branch is reported and left in place.
+    m.kill();
+    agent.land("e.txt", "leep\n");
+    person.push_land("bad", "e.txt", "git\n");
+    let m = Mirror::start(&server, &remote, &work, root, MERGING);
+    wait_until(
+        "the land branch conflict to be reported",
+        TIMEOUT,
+        || {
+            converged(&server, &remote, &m)
+                && m.land_branches().iter().any(|b| {
+                    b["branch"] == "refs/heads/leep-land/main/bad" && b["state"] == "conflict"
+                })
+        },
+        || format!("{:?}\n{}", m.land_branches(), m.log_text()),
+    );
+    assert_eq!(land_branches_on(&remote), ["refs/heads/leep-land/main/bad"]);
+    let (code, _) = m.status();
+    assert_eq!(
+        code, 0,
+        "a land branch conflict is the pusher's, not the mirror's"
+    );
+    let (_, _, metrics) = http_get(m.listen.parse().unwrap(), "/metrics", None);
+    assert!(
+        metrics.contains("leep_mirror_land_branches_failing{ref=\"main\"} 1"),
+        "{metrics}"
+    );
+    let out = Command::new(bin("leep-git"))
+        .args(["mirror", "status", "--work-dir"])
+        .arg(&work)
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("land branch leep-land/main/bad -> main conflict"),
+        "{text}"
+    );
+
+    let files = assert_trees_match(&client, root, &remote, "merging");
+    for f in [
+        "a.txt",
+        "b.txt",
+        "person.txt",
+        "clash.txt",
+        "c.txt",
+        "d.txt",
+        "feature.txt",
+    ] {
+        assert!(files.contains_key(f), "{f} missing: {files:?}");
+    }
+    assert_histories_match(&client, &agent.wc, &remote);
+    assert_remote_only_fast_forwarded(&remote);
+    git(&remote, &["fsck", "--strict", "--no-dangling"]);
+    assert!(!m.log_text().contains("panicked"));
+}
+
+/// Abort a merging mirror at each step it adds and check a restart finishes
+/// the job exactly once: after the remote's side was imported and before the
+/// merge (`merge-imported`), after the merge was created and before the ref
+/// moved (`merged`), after it moved and before the push (`merge-landed`),
+/// after the merge's push and before the mirror saw the answer (`pushed`);
+/// for land branches, after the import (`land-imported`), after the land and
+/// before the delete (`land-landed`), and after the delete (`land-deleted`).
+#[test]
+fn merging_crash_points_resume_exactly_once() {
+    use std::os::unix::process::ExitStatusExt;
+    let _g = serial();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let stores = Stores::sqlite(&root.join("data"));
+    let server = Server::start(&stores, root);
+    let client = Client::new(&server.url, &root.join("cache"));
+    let remote = make_remote(root);
+    let agent = Agent::new(&client, root, "agent");
+    agent.land("seed.txt", "seed\n");
+    let work = root.join("work");
+    let person = {
+        let m = Mirror::start(&server, &remote, &work, root, MERGING);
+        wait_converged(&server, &remote, &m);
+        Person::clone(&remote, root)
+    };
+    let moves = |op: &str| {
+        let log = client.json(&agent.wc, &["reflog", "main", "-n", "1000"]);
+        log["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["operation"] == op)
+            .count()
+    };
+    for (n, point) in [
+        "merge-imported",
+        "merged",
+        "merge-landed",
+        "pushed",
+        "land-imported",
+        "land-landed",
+        "land-deleted",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        person.catch_up();
+        let (mirror_moves, lands) = (moves("git-mirror"), moves("land"));
+        for k in 0..2 {
+            agent.land(&format!("{point}/agent-{k}.txt"), &format!("{n} {k}\n"));
+        }
+        let land_msg = format!("person lands {point}/land.txt");
+        let merging = !point.starts_with("land-");
+        if merging {
+            for k in 0..2 {
+                person.push_file(&format!("{point}/person-{k}.txt"), "p\n");
+            }
+        } else {
+            person.push_land(point, &format!("{point}/land.txt"), "l\n");
+        }
+        let mut m = Mirror::start_env(&server, &remote, &work, root, MERGING, Some(point));
+        let st = m.wait_exit(TIMEOUT);
+        assert_eq!(st.signal(), Some(6), "{point}: expected an abort, got {st}");
+        let m = Mirror::start(&server, &remote, &work, root, MERGING);
+        wait_until(
+            &format!("convergence after a crash at {point}"),
+            TIMEOUT,
+            || converged(&server, &remote, &m) && land_branches_on(&remote).is_empty(),
+            || {
+                format!(
+                    "{}\n{:?}\n{}",
+                    m.main_status(),
+                    m.land_branches(),
+                    m.log_text()
+                )
+            },
+        );
+        let st = m.main_status();
+        assert_eq!(st["divergences"], 0, "{point}: nobody merged by hand: {st}");
+        if merging {
+            assert_eq!(
+                moves("git-mirror"),
+                mirror_moves + 1,
+                "{point}: the merge landed exactly once"
+            );
+            if point == "merge-landed" || point == "pushed" {
+                // The restart found the merge landed and only pushed it, or
+                // found it pushed and pushed nothing.
+                assert_eq!(st["merges"]["landed"], 0, "{point}: {st}");
+            }
+            if point == "pushed" {
+                assert_eq!(st["pushes"]["ok"], 0, "{point}: {st}");
+            }
+        } else {
+            assert_landed_once(&client, &agent.wc, &land_msg);
+            // Agents' lands plus one for the land branch, and no second land.
+            assert_eq!(moves("land"), lands + 3, "{point}: one land for the branch");
+            assert_eq!(moves("git-mirror"), mirror_moves, "{point}");
+        }
+        drop(m);
+        assert_histories_match(&client, &agent.wc, &remote);
+        assert_remote_only_fast_forwarded(&remote);
+    }
+    assert_trees_match(&client, root, &remote, "merging-crash-points");
     git(&remote, &["fsck", "--strict", "--no-dangling"]);
 }

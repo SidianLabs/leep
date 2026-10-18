@@ -1,5 +1,5 @@
 # 0046. Live two-way mirror between Leep and a git remote
-Status: Accepted
+Status: Accepted; extended by [0049](0049-mirror-merges-and-land-branches.md)
 Date: 2026-10-18
 
 ## Context
@@ -121,8 +121,9 @@ re-read.
     without provenance trailers.
 - **Commit identity.** Changesets imported from git carry `git.commit` and
   the extras that rebuild the original bytes, so they export to their
-  original commit. Changesets made in Leep get a `Leep-Changeset: <id>`
-  trailer, added to an existing trailer paragraph if there is one. The
+  original commit. Changesets made in Leep (and, since ADR 0049, any
+  changeset whose export is not the commit its `git.commit` names, such as
+  a rebased copy) get a `Leep-Changeset: <id>` trailer, added to an existing trailer paragraph if there is one. The
   trailer tells people which Leep change a commit is, and it lets loop
   prevention work without the map (below). `--no-changeset-trailer` and
   `--provenance-trailers` change commit ids, so they must stay fixed for the
@@ -196,7 +197,8 @@ re-read.
   Stopping is the only choice that is right under every policy. Its cost
   shows in the concurrency test: while agents land continuously, a git
   push usually races a land, so the ref spends time `diverged` until
-  someone merges.
+  someone merges. It stays the default; ADR 0049 adds the opt-in
+  `--on-divergence merge` and land branches.
 - **Loop prevention.**
   - A commit is Leep's own if the map lists it. Otherwise, it is Leep's own
     if its `Leep-Changeset:` trailer names a changeset the server has *and*
@@ -295,12 +297,8 @@ re-read.
   or it diverges on the first push.
 
 ### Remaining for M7
-- Clean-merge mode for divergence (`--on-divergence merge`): import `G`, ask
-  the server for a merge (`POST /v1/merge`), and land it if clean and if
-  policy allows. Conflicts still stop the ref.
-- Land branches: pushes to `leep-land/<ref>/*` land through `/v1/land`
-  (server rebase, conflicts reported back), so people can work like agents
-  and avoid divergence on busy refs.
+- Clean-merge mode for divergence and land branches: done in
+  [ADR 0049](0049-mirror-merges-and-land-branches.md).
 - Optional long-poll on the ref log, mirroring of Leep ref deletes for
   allowed refs, and seeding the map offline.
 - The git wire protocol on the server (`git clone`, `fetch`, `push` against
