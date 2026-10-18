@@ -205,7 +205,13 @@ impl DirSyncer {
                 s.mark(shard);
             }
             let dirty = s.dirty();
-            s.targets(&dirty)
+            let mut targets = s.targets(&dirty);
+            // The root can be behind with no shard dirty: a shard's own sync
+            // may finish before the root sync that publishes its entry.
+            if s.synced[ROOT] < s.marked[ROOT] && !targets.iter().any(|&(d, _)| d == ROOT) {
+                targets.push((ROOT, s.marked[ROOT]));
+            }
+            targets
         };
         self.reach(targets).await
     }
@@ -407,6 +413,22 @@ mod tests {
             .expect("a sync started by a cancelled flush is still recorded")
             .unwrap();
         assert_eq!(d.pending(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_full_flush_syncs_the_root_when_no_shard_is_dirty() {
+        let dir = tempfile::tempdir().unwrap();
+        shard_dirs(dir.path());
+        let d = DirSyncer::new(dir.path());
+        d.mark(5);
+        // Shard 5's own sync finished; the root sync for its entry has not.
+        {
+            let mut s = d.lock();
+            s.synced[5] = s.marked[5];
+        }
+        d.flush_all([]).await.unwrap();
+        assert_eq!(d.pending(), 0);
+        assert!(d.lock().in_root.contains(5));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
