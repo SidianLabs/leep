@@ -38,6 +38,9 @@ every runbook.
 | [LeepConfigSkew](#leepconfigskew) | ticket | servers report different config fingerprints for 15 minutes |
 | [LeepSchemaVersionSkew](#leepschemaversionskew) | ticket | servers report different schema versions for 1 hour |
 | [LeepMixedVersions](#leepmixedversions) | ticket | servers report different `version` for 2 hours |
+| [LeepMirrorDown](#leepmirrordown) | page | a git mirror's metrics endpoint has not been scrapable for 5 minutes |
+| [LeepMirrorLagging](#leepmirrorlagging) | page | a mirrored ref has differed between Leep and git for 10 minutes while the mirror retries |
+| [LeepMirrorStuck](#leepmirrorstuck) | ticket | a mirrored ref is diverged, rewound, refused, remote-ahead or deleted in Leep for 15 minutes |
 | [LeepBackupStale](#leepbackupstale) | ticket | no backup has passed its check for 2 days (or ever) |
 | [LeepBackupCheckFailed](#leepbackupcheckfailed) | ticket | the newest backup is sealed but did not pass its check |
 | [LeepBackupSlow](#leepbackupslow) | ticket | backup duration is growing week on week |
@@ -956,6 +959,172 @@ digests instead of tags.
 
 **Escalate / collect.** Per-instance version and digest, schema version, and the
 rollout log.
+
+## LeepMirrorDown
+
+**Meaning.** The `leep-git mirror run` process's `--listen` endpoint has not
+been scrapable for 5 minutes. **Page.**
+
+**Impact.** Lands stop reaching the git remote, so the team's CI and the
+people working in git stop seeing agent changes. Pushes to git stop landing
+in Leep. Nothing is lost: Leep keeps landing, and the remote keeps what it
+has. A restarted mirror catches up with one push per ref.
+
+**Diagnose.**
+
+1. Is the process running? Check `systemctl status leep-mirror` or the
+   container. Its last log lines on stderr give the reason for an exit:
+   - `another mirror holds .../lock`: a second instance on the same work
+     directory;
+   - `reading token file`: the token file is missing;
+   - `--allow-rewind main: main and tags are never rewound`: a refused flag.
+2. `leep-git mirror status --work-dir DIR` reads the last status the mirror
+   wrote, even when it is down. It exits 1 with `status is Ns old; is the
+   mirror (pid P) running?` when the file is stale.
+3. If the process runs but cannot be scraped, check `--listen`: the address
+   and port, a firewall, and whether the scrape job's target matches.
+4. A long first export or a huge push can block the loop for minutes (up
+   to `--git-timeout`). The process is alive and the log shows the push
+   when it ends. Scrapes still answer during it; only the status file goes
+   stale.
+
+**Likely causes.**
+
+1. The process exited: a deploy, a crash, or a configuration error at
+   startup. Confirm: step 1.
+2. The host or container was rescheduled without its work directory, and
+   the new one is still exporting history. Confirm: a fresh `started` in
+   `GET /status` and a growing `commits_exported`.
+3. A scrape configuration problem. Confirm: step 3.
+
+**Mitigate / fix.**
+
+- Restart it with the same work directory. Restarting is always safe; the
+  mirror decides from current values and repeats nothing (ADR 0046).
+- Never run two mirrors on one work directory. The lock refuses it. Two
+  mirrors with different work directories pushing the same remote do not
+  corrupt anything, since pushes are fast-forward only, but they double the
+  traffic.
+- If the work directory is lost, start with an empty one. It rebuilds by
+  exporting again, to the same commits.
+
+**Escalate / collect.** The mirror's stderr log, `leep-git mirror status
+--json`, its flags (without the token), and `git --version`.
+
+## LeepMirrorLagging
+
+**Meaning.** A mirrored ref has differed between Leep and the remote for
+over 10 minutes while the mirror is still trying (state `pending` or
+`error`). **Page.**
+
+**Impact.** As [LeepMirrorDown](#leepmirrordown), for this ref. Lands
+pile up and reach git in one push once the cause is fixed.
+
+**Diagnose.**
+
+1. `leep-git mirror status --work-dir DIR` shows the ref's `detail`. The
+   log (stderr) has the same text, with credentials redacted.
+2. `leep_mirror_pushes_total{result=...}` and `leep_mirror_errors_total{stage=...}`
+   say which side fails:
+   - `stage="git"` or `result="failed"`: the remote or its credentials. In
+     the detail, `git push ... failed:` or `git ls-remote ... failed:` is
+     followed by git's own message:
+     - `Authentication failed` or `Permission denied (publickey)`: an
+       expired token or key;
+     - `Could not resolve host`: DNS or the network;
+     - `timed out after`: a hung transfer.
+   - `result="rejected"` repeating: the remote refuses the update. The
+     detail quotes the reason: `pre-receive hook declined`, `protected
+     branch hook declined`, or `non-fast-forward` that does not clear.
+   - `stage="leep"`: the server. In the log, `reading refs from the server
+     failed:` is followed by the CLI's error: `cannot reach`, 401 or 403
+     (token), 429 (limits).
+   - `stage="export"` or `"import"`: reading a changeset or blob, or
+     creating one, failed. The detail names the changeset or commit.
+3. Try git by hand as the mirror's user:
+   `git --git-dir DIR/git ls-remote <remote> refs/heads/main`.
+4. Try the server: `curl -H "Authorization: Bearer $LEEP_TOKEN" $SERVER/v1/refs/main`.
+
+**Likely causes.**
+
+1. The remote's credential expired or lost write access. Confirm: step 3.
+2. Branch protection or a hook on the remote rejects the mirror's pushes.
+   Confirm: `result="rejected"` and the detail.
+3. The remote or the network is down or slow. Confirm: step 3, the
+   provider's status page, and `timed out` in the detail.
+4. The Leep server is down, throttling the mirror's token, or refusing its
+   token. Confirm: step 4, [LeepTokenThrottled](#leeptokenthrottled).
+5. A changeset cannot be exported (a missing blob). Confirm: a stable
+   `export of <id>` detail. Run `leep-server verify` and see
+   [OPERATIONS.md](OPERATIONS.md#verify-and-repair).
+
+**Mitigate / fix.**
+
+- Renew the credential, or let the mirror's account bypass branch
+  protection on the mirrored branches. It needs push, but never force-push.
+- The mirror retries on its own, with backoff up to `--max-backoff`. A new
+  land or push retries at once. `POST /poke` forces a remote poll.
+- Do not push Leep's commits to the remote by hand, and do not force-push
+  the remote to "help". The mirror's next push is already the complete
+  backlog.
+
+**Escalate / collect.** The status JSON, the log since the lag began,
+`git --version`, and the output of steps 3 and 4.
+
+## LeepMirrorStuck
+
+**Meaning.** For 15 minutes a mirrored ref has been in a state only a
+person can clear: `diverged`, `rewound`, `remote-ahead`, `refused` or
+`deleted-in-leep`. **Ticket.**
+
+**Impact.** That ref is not mirrored in either direction. The other refs
+are unaffected. Nothing is lost: each side keeps its own commits, and the
+mirror resolves no conflict and forces nothing (ADR 0046).
+
+**Diagnose.** `leep-git mirror status --work-dir DIR` gives the state and a
+detail that says what to do; [OPERATIONS.md](OPERATIONS.md#mirror-states)
+has the table.
+
+**Likely causes and fixes.**
+
+1. **`diverged`**: someone pushed to git while agents landed in Leep, so
+   both sides moved. `leep_mirror_divergences_total` counts how often. The
+   fix happens in git:
+   ```sh
+   git fetch origin
+   git checkout main && git merge --ff-only origin/main
+   git merge origin/leep-diverged/main     # resolve any conflict here
+   git push origin main
+   ```
+   The merge contains both sides, so the mirror lands it in Leep as a
+   fast-forward and deletes `leep-diverged/main`. If agents land again
+   before the push, it diverges again with a newer `leep-diverged/main`:
+   repeat. If it keeps happening, people should push their work through
+   Leep (`leep land`) rather than straight to busy branches.
+2. **`rewound`**: someone ran `leep undo` (or a raw ref CAS) on a mirrored
+   ref, so Leep is behind the remote. Either land a revert in Leep, which
+   the mirror pushes as a fast-forward, or undo the undo (`leep undo`
+   again). For a scratch branch where rewinding is normal, restart the
+   mirror with `--allow-rewind NAME`.
+3. **`refused`**: a push from git did not pass Leep's land policy. The
+   detail quotes the server, for example `changeset X is not signed by a
+   trusted key` or `needs review`. Approve the changesets with `leep review`
+   (the mirror retries every minute), or revert the push in git. Never
+   relax the policy to let a mirror through.
+4. **`remote-ahead`**: `--import` is off and someone pushed to the remote.
+   Enable `--import`, or remove the commits from the remote by an ordinary
+   revert pushed through Leep.
+5. **`deleted-in-leep`**: the Leep ref was deleted. Delete the remote branch
+   if that was intended (`git push origin :refs/heads/NAME`), or recreate
+   the Leep ref. Remove the `--ref` if the branch is no longer mirrored.
+
+**What not to do.** Do not force-push the remote's branch to match Leep, and
+do not move the Leep ref to match the remote with a raw CAS. Both discard
+someone's commits. Do not delete the mirror's work directory to "reset" it:
+the state comes from the two refs, not from the directory.
+
+**Escalate / collect.** The status JSON, `git log --oneline --graph -20
+origin/main origin/leep-diverged/main`, and `leep log main -n 20`.
 
 ## LeepBackupStale
 

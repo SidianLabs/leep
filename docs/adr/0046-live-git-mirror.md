@@ -1,4 +1,4 @@
-# 0045. Live two-way mirror between Leep and a git remote
+# 0046. Live two-way mirror between Leep and a git remote
 Status: Accepted
 Date: 2026-10-18
 
