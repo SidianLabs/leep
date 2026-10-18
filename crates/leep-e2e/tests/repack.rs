@@ -309,7 +309,10 @@ fn killed_repack_loses_nothing() {
         drop(server);
         verify_clean(&stores, &format!("after kill {i}"));
     }
-    let r = repack(&stores, &["--unsafe-no-fence"]);
+    // Full, so every pack a killed run published folds into one: an
+    // incremental run keeps packs that already grow geometrically, and how
+    // many the kills left depends on timing.
+    let r = repack(&stores, &["--full", "--unsafe-no-fence"]);
     assert_eq!(r["loose_after"], 0, "{r}");
     assert_eq!(pack_files(&stores).len(), 2, "{:?}", pack_files(&stores));
     let leftovers: Vec<_> = fs::read_dir(blobs_dir(&stores).join("packs"))
