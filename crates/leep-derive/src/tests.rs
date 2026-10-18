@@ -1380,6 +1380,57 @@ async fn land_conflict_on_a_stack_reports_clean_changes_and_resolves_in_one_comm
     }
 }
 
+/// An agent lands `a` (the server rebases it to `a'`), then lands `b`, which
+/// it built on its own `a`. Only `b` is new: replaying `a` again would add an
+/// empty duplicate of it.
+#[tokio::test]
+async fn land_on_a_changeset_landed_as_a_rebased_copy_replays_only_the_rest() {
+    let r = repo();
+    let c1 = commit(&r, &[], &[("f", Some("base\n"))], "c1").await;
+    r.land(c1, "main").await.unwrap();
+    let other = commit(&r, &[c1], &[("o", Some("o\n"))], "other").await;
+    r.land(other, "main").await.unwrap();
+    let a = commit(&r, &[c1], &[("a", Some("a\n"))], "a").await;
+    let LandResponse::Landed { landed: a2, .. } = r.land(a, "main").await.unwrap() else {
+        panic!("expected land");
+    };
+    assert_ne!(a2, a, "a was rebased");
+    let b = commit(&r, &[a], &[("b", Some("b\n"))], "b").await;
+    let LandResponse::Landed { landed: b2, .. } = r.land(b, "main").await.unwrap() else {
+        panic!("expected land");
+    };
+    let top = r.get_changeset(b2).await.unwrap();
+    assert_eq!(top.message, "b");
+    assert_eq!(top.parents, [a2], "no second copy of a below b");
+    for (path, want) in [("a", "a\n"), ("b", "b\n"), ("o", "o\n")] {
+        assert_eq!(text(&r, b2, path).await.as_deref(), Some(want), "{path}");
+    }
+}
+
+/// As above, but the ref moved on and changed a file `a` changed. Replaying
+/// `a` again would report a conflict with a change that already landed.
+#[tokio::test]
+async fn land_on_a_changeset_landed_as_a_rebased_copy_is_not_a_false_conflict() {
+    let r = repo();
+    let c1 = commit(&r, &[], &[("f", Some("base\n"))], "c1").await;
+    r.land(c1, "main").await.unwrap();
+    let other = commit(&r, &[c1], &[("o", Some("o\n"))], "other").await;
+    r.land(other, "main").await.unwrap();
+    let a = commit(&r, &[c1], &[("f", Some("a\n"))], "a").await;
+    let LandResponse::Landed { landed: a2, .. } = r.land(a, "main").await.unwrap() else {
+        panic!("expected land");
+    };
+    let later = commit(&r, &[a2], &[("f", Some("later\n"))], "later").await;
+    r.land(later, "main").await.unwrap();
+    let b = commit(&r, &[a], &[("b", Some("b\n"))], "b").await;
+    let LandResponse::Landed { landed: b2, .. } = r.land(b, "main").await.unwrap() else {
+        panic!("expected land, not a conflict on f");
+    };
+    assert_eq!(r.get_changeset(b2).await.unwrap().parents, [later]);
+    assert_eq!(text(&r, b2, "f").await.as_deref(), Some("later\n"));
+    assert_eq!(text(&r, b2, "b").await.as_deref(), Some("b\n"));
+}
+
 #[tokio::test]
 async fn land_refuses_a_stack_containing_a_merge() {
     let r = repo();

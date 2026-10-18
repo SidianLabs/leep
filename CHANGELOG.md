@@ -509,6 +509,11 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   could be lost: the new line was appended to the torn one and readers
   dropped the joined line. The append now cuts the torn line off first,
   under the tombstone lock.
+- Landing a changeset built on one that was already landed as a rebased
+  copy (land `a`, which lands as `a'`, then land `b` on the original `a`)
+  replayed `a` again: an empty duplicate of `a` on the ref, or a false
+  conflict if the ref had since changed `a`'s files. The stack walk now
+  stops at an entry whose copy is already on the ref.
 - The crash test's HTTP agents land the same changeset again after an
   unanswered land, as a real client does, instead of rebuilding the stack on
   the new head, which landed it twice when the first land had applied.

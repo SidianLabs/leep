@@ -333,7 +333,8 @@ loop (≤32 attempts):
     elif head is an ancestor of cs:  move to cs                   # fast-forward
     elif head's history holds a server-made copy of cs:  already landed
     else:
-      stack ← first-parent chain from cs down to where it joins head's history
+      stack ← first-parent chain from cs down to where it joins head's history,
+              or to an entry whose server-made copy is in it
       replay each stack entry onto head, oldest first        # 3-way per entry
       conflict? → Conflicts{onto: head, conflicts, clean} for this land only
                   (the whole stack squashed into one 3-way merge vs head;
@@ -371,7 +372,10 @@ A land onto a ref that does not exist creates it, unless the request says
 `main` of an empty repository); then the step that finds no head answers 404
 and the ref stays absent. The check uses the head the batch read for its CAS.
 Replaying the whole stack matters: rebasing only `cs` would silently drop the
-changes of unlanded changesets below it. On conflict the client applies
+changes of unlanded changesets below it. The stack also stops at an entry
+whose rebased copy already landed: an agent that landed `a` (landed as `a'`)
+and built `b` on its own `a` lands only `b`, instead of a second, empty copy
+of `a`, or a false conflict when the ref changed `a`'s files since. On conflict the client applies
 `clean`, resolves `conflicts` on top of `onto`, commits once and lands again,
 which is then a fast-forward. Stacks containing merges are rejected.
 
