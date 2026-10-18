@@ -407,6 +407,16 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   `history-tree-v4` and `history-node-v4`: rederive with `repair rederive
   --kind history-tree-v4` before switching servers, then `repair drop --kind
   history-tree-v3` (OPERATIONS.md, "Upgrading").
+- Cold reads of many objects are batched: `BlobStore::get_many`, which the
+  filesystem store splits over up to 16 tasks that ask the kernel for every
+  pack frame of their delta chains before decoding; breadth-first `files` and
+  `diff` walks that read each tree level at once; a blame walk that reads no
+  files while it skips through the path-history index, then reads parents'
+  files, cached blames and versions in batches; and a faster pack index check.
+  On a 57,345-changeset Linux-shaped packed store, cold: the full listing
+  2.2 s to 0.51 s, a deep diff 3.1 s to 0.73 s, and a first `blame Makefile`
+  10.5 s to 5.0 s (PERFORMANCE.md, "Cold queries"). New example
+  `cold_queries`.
 - `leep-server repack` packs a filesystem blob store (ADR 0029): every live
   blob and tree node goes into one pack, each file version a zstd delta
   against the previous version at its path and each tree node against the

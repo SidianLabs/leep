@@ -71,6 +71,29 @@ impl Pack {
         }))
     }
 
+    /// Ask the kernel to start reading `entries`' frames, without waiting.
+    /// A delta chain's frames lie far apart in the pack (each version is
+    /// written with the changeset that made it), so reading them one by one
+    /// from a cold disk waits once per frame; asked for together, the disk
+    /// serves them at once. Advice only: errors are ignored, and other
+    /// systems read as before.
+    pub fn prefetch(&self, entries: &[IdxEntry]) {
+        #[cfg(target_os = "linux")]
+        for e in entries {
+            let Some(len) = std::num::NonZeroU64::new(e.stored_len) else {
+                continue;
+            };
+            let _ = rustix::fs::fadvise(
+                &self.file,
+                e.offset,
+                Some(len),
+                rustix::fs::Advice::WillNeed,
+            );
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = entries;
+    }
+
     pub fn frame(&self, e: &IdxEntry) -> Result<Vec<u8>> {
         let len = usize::try_from(e.stored_len)
             .map_err(|_| Error::Storage("pack entry too large".into()))?;
@@ -320,9 +343,32 @@ impl PackSet {
         Ok(self.refresh()?.locate(hash).is_some())
     }
 
+    /// Start reading every frame that decoding `hashes` will need (see
+    /// [`Pack::prefetch`]); a later [`get`](Self::get) of each finds its
+    /// frames in the page cache or on their way. Hashes not packed are
+    /// skipped.
+    pub fn prefetch(&self, hashes: &[Hash]) -> Result<()> {
+        if hashes.is_empty() {
+            return Ok(());
+        }
+        let v = self.view()?;
+        for h in hashes {
+            if let Some((p, e)) = v.locate(h) {
+                // A chain that does not plan fails its own read instead.
+                if let Ok(chain) = self.decoded.plan(&p.id, &p.index, &e) {
+                    p.prefetch(&chain.entries);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Decode an entry and check it against its hash.
     pub fn decode(&self, pack: &Pack, entry: &IdxEntry) -> Result<Bytes> {
         let chain = self.decoded.plan(&pack.id, &pack.index, entry)?;
+        if chain.entries.len() > 1 {
+            pack.prefetch(&chain.entries);
+        }
         self.decoded
             .finish(&pack.id, entry, chain, |e| pack.frame(e))
     }
@@ -356,6 +402,10 @@ impl PackSet {
 pub(crate) struct DecodedCache {
     lru: Mutex<Lru>,
     capacity: usize,
+    /// Whether the last object decoded was a tree node: reads come in runs
+    /// of one kind (a tree walk, a file's versions), so its kind is checked
+    /// first. Only a hint; every object is still checked.
+    last_tree: std::sync::atomic::AtomicBool,
 }
 
 /// What a delta chain needs: entries to decode, the wanted one first and the
@@ -376,6 +426,7 @@ impl DecodedCache {
         DecodedCache {
             lru: Mutex::default(),
             capacity,
+            last_tree: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -426,12 +477,14 @@ impl DecodedCache {
             start: mut bytes,
         } = chain;
         let bad = |why: String| corrupt(pack_id, &entry.hash, why);
+        let mut tree_first = self.last_tree.load(std::sync::atomic::Ordering::Relaxed);
         while let Some(e) = entries.pop() {
             let frame = frame(&e)?;
             let data = pack::decompress(frame.as_ref(), bytes.as_deref(), e.len)
                 .map_err(|err| bad(err.to_string()))?;
-            if !pack::object_intact(&e.hash, &data) {
-                return Err(bad(format!("{} decodes to other bytes", e.hash)));
+            match pack::object_kind(&e.hash, &data, tree_first) {
+                Some(tree) => tree_first = tree,
+                None => return Err(bad(format!("{} decodes to other bytes", e.hash))),
             }
             let data = Bytes::from(data);
             self.lru
@@ -440,6 +493,8 @@ impl DecodedCache {
                 .insert(e.hash, data.clone(), self.capacity);
             bytes = Some(data);
         }
+        self.last_tree
+            .store(tree_first, std::sync::atomic::Ordering::Relaxed);
         Ok(bytes.expect("the chain decodes at least one entry"))
     }
 }

@@ -35,8 +35,10 @@ Backends implement `leep_core::BlobStore` (in `leep-store`) or
      blobs durable (ADR 0048); the default calls `flush(hashes)`, which is
      correct but makes every create wait for every recent upload. A store
      that can answer many existence checks at once should override
-     `contains_many` (the default runs 64 `contains` at a time). Wrappers
-     forward all three.
+     `contains_many` (the default runs 64 `contains` at a time), and one
+     that can read many blobs at once should override `get_many` (the
+     default runs 32 `get`s at a time; tree walks and blame read whole
+     levels through it). Wrappers forward all four.
    - **MetaStore `cas_ref` must be one atomic conditional operation.** That
      means a conditional update/insert/delete, or a transaction at
      serializable isolation. Never read then write.

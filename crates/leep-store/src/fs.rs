@@ -13,6 +13,13 @@ use crate::storage_err;
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Most blocking tasks one `get_many` uses: enough to keep a disk's queue
+/// and the cores busy, few enough to leave the blocking pool to others.
+const READ_TASKS: usize = 16;
+/// Fewest blobs given to one of those tasks, so a small batch is not spread
+/// over more task hops than it saves.
+const MIN_PER_READ_TASK: usize = 8;
+
 /// Blobs on the local filesystem: loose at `<root>/<2 hex>/<62 hex>`, and
 /// packed in `<root>/packs/` once `repack` has run (ADR 0029). New writes are
 /// always loose; reads try the loose file first, then the packs.
@@ -270,6 +277,55 @@ impl BlobStore for FsBlobStore {
             Err(e) => Err(storage_err(e)),
         })
         .await
+    }
+
+    /// Split over up to [`READ_TASKS`] blocking tasks, each of which first
+    /// asks the kernel for every pack frame its blobs need (see
+    /// [`PackSet::prefetch`]), so a cold read of many packed objects waits on
+    /// the disk for all of them at once instead of one frame at a time, and
+    /// decodes on several cores.
+    async fn get_many(&self, hashes: &[Hash]) -> Result<Vec<Option<Bytes>>> {
+        if hashes.len() <= 1 {
+            let mut out = Vec::with_capacity(hashes.len());
+            for h in hashes {
+                out.push(self.get(h).await?);
+            }
+            return Ok(out);
+        }
+        let per_task = hashes.len().div_ceil(READ_TASKS).max(MIN_PER_READ_TASK);
+        let mut tasks = Vec::new();
+        for chunk in hashes.chunks(per_task) {
+            let jobs: Vec<(Hash, PathBuf)> = chunk.iter().map(|h| (*h, self.path_for(h))).collect();
+            let packs = self.packs.clone();
+            tasks.push(tokio::task::spawn_blocking(move || {
+                let mut out: Vec<Option<Bytes>> = Vec::with_capacity(jobs.len());
+                let mut packed = Vec::new();
+                for (i, (hash, path)) in jobs.iter().enumerate() {
+                    match std::fs::read(path) {
+                        Ok(v) => out.push(Some(v.into())),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            out.push(None);
+                            packed.push((i, *hash));
+                        }
+                        Err(e) => return Err(storage_err(e)),
+                    }
+                }
+                let wanted: Vec<Hash> = packed.iter().map(|(_, h)| *h).collect();
+                packs.prefetch(&wanted)?;
+                for (i, hash) in packed {
+                    out[i] = packs.get(&hash)?;
+                }
+                Ok(out)
+            }));
+        }
+        let mut out = Vec::with_capacity(hashes.len());
+        for t in tasks {
+            out.extend(
+                t.await
+                    .map_err(|e| Error::Storage(format!("pack task failed: {e}")))??,
+            );
+        }
+        Ok(out)
     }
 
     /// Rereads the tombstones if they changed, so a blob GC deleted from a

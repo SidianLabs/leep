@@ -194,6 +194,31 @@ async fn reads_after_repack_equal_the_originals_and_deltas_are_used() {
             assert!(s.contains(h).await.unwrap());
         }
     }
+    // `get_many` over a fresh handle (prefetching whole chains, split over
+    // tasks) answers each in order, with packed, loose, repeated and absent
+    // hashes mixed.
+    let loose = store
+        .put(Bytes::from_static(b"loose after the repack"))
+        .await
+        .unwrap();
+    let absent = Hash::of_blob(b"never stored");
+    let mut asked: Vec<Hash> = originals.keys().rev().copied().collect();
+    asked.extend([loose, absent, chain[3], absent]);
+    for s in [
+        FsBlobStore::new(dir.path()),
+        FsBlobStore::with_decoded_cache(dir.path(), 0),
+    ] {
+        let got = s.get_many(&asked).await.unwrap();
+        assert_eq!(got.len(), asked.len());
+        for (h, b) in asked.iter().zip(&got) {
+            let want = match originals.get(h) {
+                Some(b) => Some(b.clone()),
+                None if *h == loose => Some(Bytes::from_static(b"loose after the repack")),
+                None => None,
+            };
+            assert_eq!(b, &want, "{h}");
+        }
+    }
     // Chains are capped, and every base precedes its delta.
     let idx = index_of(dir.path());
     assert_eq!(

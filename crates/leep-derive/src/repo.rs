@@ -828,6 +828,52 @@ impl Repo {
         }
     }
 
+    /// [`Repo::read_tree`] of each of `trees`, in order, with one
+    /// [`BlobStore::get_many`](leep_core::BlobStore::get_many) for the
+    /// distinct ones: a walk that knows a whole level of a tree reads it with
+    /// many reads in flight instead of one.
+    pub async fn read_trees(&self, trees: &[Hash]) -> Result<Vec<TreeNode>> {
+        let mut distinct = trees.to_vec();
+        distinct.sort_unstable();
+        distinct.dedup();
+        let found = self.blobs.get_many(&distinct).await?;
+        if found.len() != distinct.len() {
+            return Err(Error::Storage(format!(
+                "get_many answered {} of {} tree nodes",
+                found.len(),
+                distinct.len()
+            )));
+        }
+        let mut uses: HashMap<Hash, usize> = HashMap::with_capacity(distinct.len());
+        for t in trees {
+            *uses.entry(*t).or_default() += 1;
+        }
+        let mut nodes = HashMap::with_capacity(distinct.len());
+        for (tree, bytes) in distinct.into_iter().zip(found) {
+            let node = match bytes {
+                Some(b) if Hash::of_object(TreeNode::KIND, &b) != tree => {
+                    return Err(Error::Storage(format!("corrupt tree node {tree}")))
+                }
+                Some(b) => TreeNode::decode(&b)?,
+                None if tree == TreeNode::empty_hash() => TreeNode::default(),
+                None => return Err(Error::NotFound(format!("tree {tree}"))),
+            };
+            nodes.insert(tree, node);
+        }
+        let mut out = Vec::with_capacity(trees.len());
+        for t in trees {
+            // The last use of a node takes it; earlier repeats clone.
+            let left = uses.get_mut(t).expect("counted");
+            *left -= 1;
+            out.push(if *left > 0 {
+                nodes[t].clone()
+            } else {
+                nodes.remove(t).expect("each distinct node decoded once")
+            });
+        }
+        Ok(out)
+    }
+
     /// [`Repo::read_tree`] as a [`TreeView`], kept in a bounded cache, for
     /// walks that look up names in the same directories again and again.
     pub(crate) async fn read_tree_view(&self, tree: Hash) -> Result<Arc<TreeView>> {

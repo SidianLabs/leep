@@ -1165,6 +1165,19 @@ pub async fn check_blob_store_contract(store: &dyn BlobStore) {
         "contains_many answers in order"
     );
     assert!(store.contains_many(&[]).await.unwrap().is_empty());
+    let got = store.get_many(&asked).await.unwrap();
+    assert_eq!(
+        got,
+        vec![
+            None,
+            Some(data.clone()),
+            Some(Bytes::from_static(b"node")),
+            None,
+            Some(Bytes::new())
+        ],
+        "get_many answers in order"
+    );
+    assert!(store.get_many(&[]).await.unwrap().is_empty());
     store.flush(&[]).await.unwrap();
     store.flush(&[h, other]).await.unwrap();
     store.flush_blobs(&[]).await.unwrap();

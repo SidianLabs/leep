@@ -73,6 +73,9 @@ enum Layout {
     Columns(Widths),
 }
 
+/// Indexes of at least this many objects are checked on several threads.
+const CHECK_PARALLEL_MIN: usize = 1 << 16;
+
 /// Byte widths of a `LEEPIDX2` record's fields, chosen per pack as the
 /// fewest that hold its largest value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -461,10 +464,17 @@ impl PackIndex {
     }
 
     fn check(&mut self, bad: &dyn Fn(&str) -> Error) -> Result<()> {
-        if let Layout::Columns(_) = self.layout {
+        if let Layout::Columns(w) = self.layout {
+            // One pass over the hashes for the fanout and the order, then the
+            // records split over threads: an index of millions of objects is
+            // checked when a server first reads from its pack, and the base
+            // lookups it makes are random reads of the whole index.
             let mut counts = [0usize; 256];
             for r in 0..self.count {
                 counts[usize::from(self.hash_bytes(r)[0])] += 1;
+                if r > 0 && self.hash_bytes(r - 1) >= self.hash_bytes(r) {
+                    return Err(bad("records out of order"));
+                }
             }
             let mut total = 0;
             for (b, c) in counts.iter().enumerate() {
@@ -473,46 +483,54 @@ impl PackIndex {
                     return Err(bad("fanout does not match the hashes"));
                 }
             }
+            let threads = if self.count < CHECK_PARALLEL_MIN {
+                1
+            } else {
+                std::thread::available_parallelism().map_or(1, |n| n.get().min(8))
+            };
+            let per = self.count.div_ceil(threads).max(1);
+            let this = &*self;
+            let found = std::thread::scope(|scope| {
+                let tasks: Vec<_> = (0..self.count)
+                    .step_by(per)
+                    .map(|start| {
+                        let end = (start + per).min(this.count);
+                        scope.spawn(move || this.check_columns(&w, start..end))
+                    })
+                    .collect();
+                tasks
+                    .into_iter()
+                    .map(|t| t.join().unwrap_or(Some("check thread panicked")))
+                    .find_map(|e| e)
+            });
+            return match found {
+                Some(why) => Err(bad(why)),
+                None => Ok(()),
+            };
         }
         for r in 1..self.count {
             if self.hash_bytes(r - 1) >= self.hash_bytes(r) {
                 return Err(bad("records out of order"));
             }
         }
-        if let Layout::Wide(_) = self.layout {
-            let mut bases = Vec::with_capacity(self.count);
-            for r in 0..self.count {
-                let at = IDX1_HEADER_LEN + r * IDX1_RECORD_LEN;
-                let base: [u8; 32] = self.bytes[at + 56..at + 88].try_into().unwrap();
-                bases.push(if base == [0; 32] {
-                    u32::MAX
-                } else {
-                    match self.rank_of(&Hash(base)) {
-                        Ok(b) => b as u32,
-                        Err(_) => return Err(bad("delta base missing or not earlier in the pack")),
-                    }
-                });
-            }
-            self.layout = Layout::Wide(bases);
-        }
+        let mut bases = Vec::with_capacity(self.count);
         for r in 0..self.count {
-            if let Layout::Columns(w) = self.layout {
-                let rec = w.record();
-                let at = HASHES_AT + self.count * 32 + r * rec;
-                let field = &self.bytes[at + w.offset + w.stored..][..w.base];
-                let base = be_uint(field);
-                if base > self.count as u64 || base == r as u64 + 1 {
-                    return Err(bad("delta base out of range"));
+            let at = IDX1_HEADER_LEN + r * IDX1_RECORD_LEN;
+            let base: [u8; 32] = self.bytes[at + 56..at + 88].try_into().unwrap();
+            bases.push(if base == [0; 32] {
+                u32::MAX
+            } else {
+                match self.rank_of(&Hash(base)) {
+                    Ok(b) => b as u32,
+                    Err(_) => return Err(bad("delta base missing or not earlier in the pack")),
                 }
-                let delta = be_uint(&self.bytes[at + rec - w.modified..at + rec]);
-                if w.modified_base.checked_add_unsigned(delta).is_none() {
-                    return Err(bad("modification time out of range"));
-                }
-            }
+            });
+        }
+        self.layout = Layout::Wide(bases);
+        for r in 0..self.count {
             let e = self.entry(r as u32);
-            let end = e.offset.checked_add(e.stored_len);
-            if e.offset < PACK_MAGIC.len() as u64 || end.is_none_or(|end| end > self.pack_len) {
-                return Err(bad("entry outside the pack"));
+            if let Some(why) = self.check_frame(e.offset, e.stored_len) {
+                return Err(bad(why));
             }
             if let Some(b) = e.base {
                 if self.entry(b).offset >= e.offset {
@@ -521,6 +539,41 @@ impl PackIndex {
             }
         }
         Ok(())
+    }
+
+    /// Why a frame at `offset` of `stored` bytes is not inside the pack.
+    fn check_frame(&self, offset: u64, stored: u64) -> Option<&'static str> {
+        let end = offset.checked_add(stored);
+        (offset < PACK_MAGIC.len() as u64 || end.is_none_or(|end| end > self.pack_len))
+            .then_some("entry outside the pack")
+    }
+
+    /// Check the records of `ranks` of a columns index, reading only the
+    /// fields each check needs; why the first bad one is bad.
+    fn check_columns(&self, w: &Widths, ranks: std::ops::Range<usize>) -> Option<&'static str> {
+        let rec = w.record();
+        let records = HASHES_AT + self.count * 32;
+        let offset_of = |r: usize| be_uint(&self.bytes[records + r * rec..][..w.offset]);
+        for r in ranks {
+            let at = records + r * rec;
+            let base = be_uint(&self.bytes[at + w.offset + w.stored..][..w.base]);
+            if base > self.count as u64 || base == r as u64 + 1 {
+                return Some("delta base out of range");
+            }
+            let delta = be_uint(&self.bytes[at + rec - w.modified..at + rec]);
+            if w.modified_base.checked_add_unsigned(delta).is_none() {
+                return Some("modification time out of range");
+            }
+            let offset = offset_of(r);
+            let stored = be_uint(&self.bytes[at + w.offset..][..w.stored]);
+            if let Some(why) = self.check_frame(offset, stored) {
+                return Some(why);
+            }
+            if base > 0 && offset_of(base as usize - 1) >= offset {
+                return Some("delta base missing or not earlier in the pack");
+            }
+        }
+        None
     }
 }
 
@@ -634,7 +687,27 @@ pub fn decompress(frame: &[u8], base: Option<&[u8]>, len: u64) -> Result<Vec<u8>
 /// Do `data` hash to `hash`, as file contents or as a tree node? Blobs and
 /// tree nodes are the only objects in a blob store.
 pub fn object_intact(hash: &Hash, data: &[u8]) -> bool {
-    Hash::of_blob(data) == *hash || Hash::of_object(TreeNode::KIND, data) == *hash
+    object_kind(hash, data, false).is_some()
+}
+
+/// Whether `data` hashes to `hash` as a tree node (`Some(true)`) or as file
+/// contents (`Some(false)`), trying the kind `tree_first` names first; `None`
+/// if neither. A delta chain holds one kind, so a reader that tries the kind
+/// the last link matched hashes each link once instead of twice.
+pub fn object_kind(hash: &Hash, data: &[u8], tree_first: bool) -> Option<bool> {
+    let tree = || Hash::of_object(TreeNode::KIND, data) == *hash;
+    let blob = || Hash::of_blob(data) == *hash;
+    if tree_first {
+        if tree() {
+            Some(true)
+        } else {
+            blob().then_some(false)
+        }
+    } else if blob() {
+        Some(false)
+    } else {
+        tree().then_some(true)
+    }
 }
 
 /// Bytes of a `LEEPIDX1` index, which this writer no longer produces, for
@@ -1027,5 +1100,10 @@ mod tests {
         assert!(object_intact(&Hash::of_blob(b"x"), b"x"));
         assert!(object_intact(&Hash::of_object("tree-v1", b"node"), b"node"));
         assert!(!object_intact(&Hash::of_blob(b"x"), b"y"));
+        let node = Hash::of_object("tree-v1", b"node");
+        assert_eq!(object_kind(&node, b"node", false), Some(true));
+        assert_eq!(object_kind(&node, b"node", true), Some(true));
+        assert_eq!(object_kind(&Hash::of_blob(b"x"), b"x", true), Some(false));
+        assert_eq!(object_kind(&node, b"other", true), None);
     }
 }

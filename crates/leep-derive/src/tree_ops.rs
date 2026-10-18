@@ -1,12 +1,17 @@
 //! Tree operations: applying changes, lookups, listings and tree diffs.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Arc;
 
 use bytes::Bytes;
 use leep_core::api::{DiffEntry, FileInfo, TreeResponse};
 use leep_core::{ChangesetId, Error, FileChange, Hash, RepoPath, Result, TreeEntry, TreeNode};
 
 use crate::Repo;
+
+/// Most tree nodes one [`Repo::read_trees`] of a breadth-first walk asks
+/// for, bounding the bytes held at once.
+const TREE_BATCH: usize = 1024;
 
 pub(crate) fn join(dir: &str, name: &str) -> String {
     if dir.is_empty() {
@@ -239,23 +244,38 @@ impl Repo {
         Ok(out)
     }
 
+    /// Breadth first, one [`Repo::read_trees`] per level, so a cold listing
+    /// waits on the store about once per level of depth rather than once per
+    /// directory.
     async fn collect_files(
         &self,
         path: &str,
         entry: Option<TreeEntry>,
         out: &mut Vec<FileInfo>,
     ) -> Result<()> {
-        let mut stack = vec![(path.to_string(), entry)];
-        while let Some((p, e)) = stack.pop() {
-            match e {
-                None => {}
-                Some(TreeEntry::Dir { tree }) => {
-                    for (name, child) in self.read_tree(tree).await?.entries {
-                        stack.push((join(&p, &name), Some(child)));
+        let mut level = match entry {
+            None => return Ok(()),
+            Some(TreeEntry::Dir { tree }) => vec![(path.to_string(), tree)],
+            Some(f) => {
+                out.extend(file_info(RepoPath::new(path.to_string())?, &f));
+                return Ok(());
+            }
+        };
+        while !level.is_empty() {
+            let mut next = Vec::new();
+            for batch in level.chunks(TREE_BATCH) {
+                let hashes: Vec<Hash> = batch.iter().map(|(_, t)| *t).collect();
+                let nodes = self.read_trees(&hashes).await?;
+                for ((p, _), node) in batch.iter().zip(nodes) {
+                    for (name, child) in node.entries {
+                        match child {
+                            TreeEntry::Dir { tree } => next.push((join(p, &name), tree)),
+                            f => out.extend(file_info(RepoPath::new(join(p, &name))?, &f)),
+                        }
                     }
                 }
-                Some(f) => out.extend(file_info(RepoPath::new(p)?, &f)),
             }
+            level = next;
         }
         Ok(())
     }
@@ -289,55 +309,73 @@ impl Repo {
         prefix: &str,
     ) -> Result<Vec<DiffEntry>> {
         let prefix = prefix.trim_matches('/');
-        let mut stack = vec![(
+        // Breadth first: every directory pair of one level is read in one
+        // `read_trees`, so a cold diff waits on the store once per level and
+        // batch rather than once per changed directory.
+        let mut level = vec![(
             prefix.to_string(),
             self.entry_at(from, prefix).await?,
             self.entry_at(to, prefix).await?,
         )];
         let mut out = Vec::new();
-        while let Some((path, old, new)) = stack.pop() {
-            if old == new {
-                continue;
-            }
-            let dir_of = |e: &Option<TreeEntry>| match e {
-                Some(TreeEntry::Dir { tree }) => Some(*tree),
-                _ => None,
-            };
-            let (old_dir, new_dir) = (dir_of(&old), dir_of(&new));
-            if old_dir.is_none() && new_dir.is_none() {
-                let rp = RepoPath::new(path)?;
-                out.push(DiffEntry {
-                    old: old.as_ref().and_then(|e| file_info(rp.clone(), e)),
-                    new: new.as_ref().and_then(|e| file_info(rp.clone(), e)),
-                    path: rp,
-                });
-                continue;
-            }
-            // A file opposite a directory is a one-sided file change.
-            let is_file = |e: &Option<TreeEntry>| matches!(e, Some(TreeEntry::File { .. }));
-            if is_file(&old) || is_file(&new) {
-                let rp = RepoPath::new(path.clone())?;
-                out.push(DiffEntry {
-                    old: old.as_ref().and_then(|e| file_info(rp.clone(), e)),
-                    new: new.as_ref().and_then(|e| file_info(rp.clone(), e)),
-                    path: rp,
-                });
-            }
-            let load = |t: Option<Hash>| async move {
-                match t {
-                    Some(t) => self.read_tree(t).await,
-                    None => Ok(TreeNode::default()),
+        let dir_of = |e: &Option<TreeEntry>| match e {
+            Some(TreeEntry::Dir { tree }) => Some(*tree),
+            _ => None,
+        };
+        let is_file = |e: &Option<TreeEntry>| matches!(e, Some(TreeEntry::File { .. }));
+        while !level.is_empty() {
+            let mut dirs = Vec::new();
+            for (path, old, new) in level {
+                if old == new {
+                    continue;
                 }
-            };
-            let (a, b) = (load(old_dir).await?, load(new_dir).await?);
-            let names: BTreeSet<&String> = a.entries.keys().chain(b.entries.keys()).collect();
-            for name in names {
-                stack.push((
-                    join(&path, name),
-                    a.entries.get(name).cloned(),
-                    b.entries.get(name).cloned(),
-                ));
+                let (old_dir, new_dir) = (dir_of(&old), dir_of(&new));
+                // A file opposite a directory (or nothing) is a one-sided
+                // file change; a directory is expanded below.
+                if is_file(&old) || is_file(&new) || (old_dir.is_none() && new_dir.is_none()) {
+                    let rp = RepoPath::new(path.clone())?;
+                    out.push(DiffEntry {
+                        old: old.as_ref().and_then(|e| file_info(rp.clone(), e)),
+                        new: new.as_ref().and_then(|e| file_info(rp.clone(), e)),
+                        path: rp,
+                    });
+                }
+                if old_dir.is_some() || new_dir.is_some() {
+                    dirs.push((path, old_dir, new_dir));
+                }
             }
+            let mut next = Vec::new();
+            for batch in dirs.chunks(TREE_BATCH / 2) {
+                let hashes: Vec<Hash> = batch
+                    .iter()
+                    .flat_map(|(_, a, b)| [*a, *b])
+                    .flatten()
+                    .collect();
+                // The same node can be on both sides of different pairs.
+                let nodes: HashMap<Hash, Arc<TreeNode>> = hashes
+                    .iter()
+                    .copied()
+                    .zip(self.read_trees(&hashes).await?.into_iter().map(Arc::new))
+                    .collect();
+                let empty = Arc::new(TreeNode::default());
+                let take = |t: Option<Hash>| match t.and_then(|t| nodes.get(&t)) {
+                    Some(n) => n.clone(),
+                    None => empty.clone(),
+                };
+                for (path, old_dir, new_dir) in batch {
+                    let (a, b) = (take(*old_dir), take(*new_dir));
+                    let names: BTreeSet<&String> =
+                        a.entries.keys().chain(b.entries.keys()).collect();
+                    for name in names {
+                        next.push((
+                            join(path, name),
+                            a.entries.get(name).cloned(),
+                            b.entries.get(name).cloned(),
+                        ));
+                    }
+                }
+            }
+            level = next;
         }
         out.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(out)

@@ -220,6 +220,24 @@ server derives identical bytes. Each `Repo` keeps a 64 MiB cache of decoded
 node rows, so derivation does not re-read the chunks of the root and other
 hot directories for every changeset.
 
+**Blame.** Blame follows first parents and credits each line to the
+changeset whose diff against its first parent inserted it; the result is
+cached under `blame` for the changeset and for the newest changer. The walk
+asks the path-history index where the next change is: the newest changers'
+largest generation `g` says that no first-parent ancestor above `g` changed
+the file, and skiplists find the lowest one at or above it. Every skiplist
+read during a walk names first-parent ancestors 1, 2, 4, ... steps further
+down, so the walk keeps them by generation and starts each descent from
+the nearest known point, and keeps their generations, which spares a read
+for changers on the chain. The walk itself reads no files: the files at
+the examined changesets' parents, which decide whether each one changed
+the file and where its history starts, are read 64 steps at a time (root
+trees in one batched metadata read, each directory level of the path in
+one `get_many`), cached blames are looked up 32 changers at a time, the
+versions are read 64 at a time and diffed on several threads, and lines
+carry only (changeset, line) until the last version gives them their text.
+The changeset summaries are one `get_changesets`.
+
 **Rename detection** ([ADR 0016](adr/0016-rename-detection.md)). Changesets
 store a rename as a delete plus an add, and renames are detected when
 displaying, with nothing persisted. `leep_core::rename` pairs the deleted and
@@ -625,7 +643,21 @@ the hashes in a sorted column behind a 256-entry fanout table. Each hash then
 has a record whose field widths are chosen per pack, about 45 bytes per
 object in all. The store keeps index files in memory as they are on disk and
 searches them without decoding. Indexes in the original 96-byte layout still
-read, and a full repack rewrites them.
+read, and a full repack rewrites them. A store checks an index's structure
+when it first opens the pack, on several threads for large indexes.
+
+**Cold reads.** A chain's frames were written with the changesets that made
+each version, so they lie far apart in the pack; reading them one at a time
+from a cold disk waits once per frame. A read plans the chain from the index
+first and asks the kernel for every frame at once (`posix_fadvise
+WILLNEED`, Linux only, advice only). Walks that know many objects before
+reading any (the file listing, tree diffs, blame's file versions) use
+`BlobStore::get_many`: the filesystem store splits it over up to 16
+blocking tasks that each prefetch all their chains before decoding, the
+cache serves its hits and forwards the misses in one call, and other stores
+run 32 `get`s at a time. `list_files` and `diff` walk the tree breadth first
+and read each level (up to 1,024 nodes) with one `get_many`, so a cold walk
+waits on the store about once per level rather than once per directory.
 
 The object store backend (ADR 0040) reads the same packs from the bucket:
 

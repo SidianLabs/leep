@@ -106,6 +106,11 @@ pub struct BlobMeta {
 /// in flight.
 pub const CONTAINS_IN_FLIGHT: usize = 64;
 
+/// How many `get` calls the default [`BlobStore::get_many`] keeps in flight.
+/// Bounded so a batch of large blobs does not hold all of them at once
+/// before the first is used.
+pub const GET_IN_FLIGHT: usize = 32;
+
 /// Immutable content-addressed bytes: file contents and tree nodes.
 #[async_trait]
 pub trait BlobStore: Send + Sync + 'static {
@@ -121,6 +126,24 @@ pub trait BlobStore: Send + Sync + 'static {
     async fn put_with_hash(&self, hash: Hash, data: Bytes) -> Result<()>;
 
     async fn get(&self, hash: &Hash) -> Result<Option<Bytes>>;
+
+    /// [`get`](Self::get) for many hashes, answered in order and each as
+    /// exactly. Walks that know a whole level of a tree before reading any of
+    /// it call this, so a store whose reads wait on a disk or a network can
+    /// have many in flight instead of one. The default asks
+    /// [`GET_IN_FLIGHT`] at a time; backends that can do better override
+    /// it.
+    async fn get_many(&self, hashes: &[Hash]) -> Result<Vec<Option<Bytes>>> {
+        let mut out = Vec::with_capacity(hashes.len());
+        for chunk in hashes.chunks(GET_IN_FLIGHT) {
+            let mut asks = Vec::with_capacity(chunk.len());
+            for h in chunk {
+                asks.push(self.get(h));
+            }
+            out.extend(futures_util::future::try_join_all(asks).await?);
+        }
+        Ok(out)
+    }
 
     async fn contains(&self, hash: &Hash) -> Result<bool> {
         Ok(self.get(hash).await?.is_some())

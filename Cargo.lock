@@ -2533,6 +2533,7 @@ dependencies = [
  "leep-testkit",
  "metrics",
  "object_store",
+ "rustix",
  "tempfile",
  "tokio",
  "tracing",

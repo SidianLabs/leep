@@ -19,6 +19,9 @@ object_store = { version = "0.12", features = ["aws"] }
 url = "2"
 futures = "0.3"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1", features = ["fs"] }
+
 [dev-dependencies]
 leep-testkit.workspace = true
 tempfile = "3"

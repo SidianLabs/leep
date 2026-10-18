@@ -717,6 +717,12 @@ impl BlobStore for ArcBlobs {
     async fn get(&self, hash: &leep_core::Hash) -> leep_core::Result<Option<bytes::Bytes>> {
         self.0.get(hash).await
     }
+    async fn get_many(
+        &self,
+        hashes: &[leep_core::Hash],
+    ) -> leep_core::Result<Vec<Option<bytes::Bytes>>> {
+        self.0.get_many(hashes).await
+    }
     async fn contains(&self, hash: &leep_core::Hash) -> leep_core::Result<bool> {
         self.0.contains(hash).await
     }
