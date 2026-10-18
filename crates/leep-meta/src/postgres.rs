@@ -493,18 +493,24 @@ impl MetaStore for PostgresMetaStore {
         Ok(row.map(|r| Bytes::from(r.get::<Vec<u8>, _>(0))))
     }
 
-    /// One `= ANY($2)` query whatever the number of keys.
+    /// One `= ANY($2)` query whatever the number of keys. The kind goes in
+    /// through a sub-select so stale statistics can't steer the plan: a kind
+    /// that grew since the last `ANALYZE` is estimated at a row or two, and
+    /// the planner then scans every row of the kind instead of looking the
+    /// keys up (2.3 s instead of 3 ms per lookup on Linux).
     async fn get_derived_many(&self, kind: &str, keys: &[Hash]) -> Result<Vec<Option<Bytes>>> {
         if keys.is_empty() {
             return Ok(Vec::new());
         }
         let wanted: Vec<&[u8]> = unique(keys.iter().map(|k| k.as_bytes().as_slice()));
-        let rows = sqlx::query("SELECT key, value FROM derived WHERE kind = $1 AND key = ANY($2)")
-            .bind(kind)
-            .bind(wanted)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(storage)?;
+        let rows = sqlx::query(
+            "SELECT key, value FROM derived WHERE kind = (SELECT $1::text) AND key = ANY($2)",
+        )
+        .bind(kind)
+        .bind(wanted)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(storage)?;
         Ok(values_in_order(
             keys,
             rows.iter().map(|r| (r.get(0), r.get(1))),

@@ -496,6 +496,7 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 - The crash test's HTTP agents land the same changeset again after an
   unanswered land, as a real client does, instead of rebuilding the stack on
   the new head, which landed it twice when the first land had applied.
+<<<<<<< HEAD
 - Postgres statistics no longer go stale while an index is built or after a
   bulk load (ADR 0042). Schema migration 2 makes autovacuum re-analyze
   `derived` after 1% plus 10,000 changed rows (it waited for 10%, 1.1M rows on
@@ -507,6 +508,12 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   300,000-row kind and minutes for a full one; each batch now takes 30-50 ms
   whatever the statistics. Servers older than this change refuse the
   migrated database, as for any migration.
+=======
+- Batched derived-row reads on Postgres no longer slow to seconds when an
+  index has grown since the last `ANALYZE`: the planner estimated a row or two
+  for the kind and scanned all its rows instead of looking the keys up. Found
+  deriving path history on Linux (2.3 s per lookup, now 3 ms).
+>>>>>>> 1cbe85245467b16a60ef54b3cfd0dd518e6e9b33
 
 ### Project
 - Workspace version set to 0.0.1, with a CI check that keeps it below
