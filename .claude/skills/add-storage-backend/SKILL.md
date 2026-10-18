@@ -27,6 +27,13 @@ Backends implement `leep_core::BlobStore` (in `leep-store`) or
        grace window will not protect re-uploaded orphans.
      - `MetaStore::list_changesets(after, limit)`: ids strictly greater than
        `after` in ascending byte order. Never skip or repeat across pages.
+   - Durability (ADR 0044): a `BlobStore` whose `put` returns before the
+     blob would survive power loss must override `flush(named)` to make
+     every earlier put, and the stored copies of `named`, durable; the
+     default no-op is only right when puts are durable on return. A store
+     that can answer many existence checks at once should override
+     `contains_many` (the default runs 64 `contains` at a time). Wrappers
+     forward both.
    - **MetaStore `cas_ref` must be one atomic conditional operation.** That
      means a conditional update/insert/delete, or a transaction at
      serializable isolation. Never read then write.

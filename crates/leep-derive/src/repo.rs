@@ -450,6 +450,11 @@ impl Repo {
             (Some(p), None) => self.root_tree(*p).await?,
             (None, _) => TreeNode::empty_hash(),
         };
+        // The changeset makes its blobs reachable, so they must survive a
+        // power loss before it is stored (ADR 0044): `apply_changes` flushes
+        // the tree nodes it writes and every content the changeset names,
+        // which may have been uploaded to another process or before a
+        // restart, after the checks above found them.
         let tree = apply_changes(self, base, &cs.changes).await?;
 
         let started = std::time::Instant::now();

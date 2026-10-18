@@ -162,7 +162,10 @@ impl Staging {
             (blobs, changesets, rows)
         };
         if !blobs.is_empty() {
-            repo.put_rescuing_many_in_flight(blobs, FLUSH_WRITES_IN_FLIGHT)
+            // Flushed there, before any changeset names them (ADR 0044). The
+            // copies name no other new contents: theirs were made durable
+            // when the landed changesets were created.
+            repo.put_rescuing_many_in_flight(blobs, FLUSH_WRITES_IN_FLIGHT, &[])
                 .await?;
         }
         if !changesets.is_empty() || !rows.is_empty() {
@@ -202,6 +205,12 @@ impl BlobStore for StagedBlobs {
             return Ok(true);
         }
         self.inner.contains(hash).await
+    }
+
+    /// Nothing staged is durable or acknowledged until [`Staging::flush`]
+    /// stores it and flushes the real store; a replay's own flush is a no-op.
+    async fn flush(&self, _: &[Hash]) -> Result<()> {
+        Ok(())
     }
 
     async fn list_page(&self, after: Option<Hash>, limit: usize) -> Result<Vec<BlobMeta>> {
@@ -328,7 +337,7 @@ impl MetaStore for StagedMeta {
     }
 
     /// A staged blob reads as not condemned: its condemnation is checked
-    /// when the batch stores it, after the write, as `put_rescuing` requires.
+    /// when the batch stores it, after the write, as `put_rescuing_many` requires.
     async fn get_derived_many(&self, kind: &str, keys: &[Hash]) -> Result<Vec<Option<Bytes>>> {
         let (mut out, skip): (Vec<Option<Bytes>>, Vec<bool>) = {
             let s = self.staging.lock();

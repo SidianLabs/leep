@@ -181,6 +181,7 @@ impl PublishedPack {
     fn finish_blocking(mut self) -> Result<RepackReport> {
         let store = self.store.clone();
         let new_id = self.report.pack_id.clone();
+        let mut put_back_dirs = std::collections::BTreeSet::new();
         for (n, (hash, packed_mtime)) in std::mem::take(&mut self.from_loose).iter().enumerate() {
             let n = n as u64 + 1;
             step(&self.opts, RepackStep::RemovingLoose(n))?;
@@ -206,11 +207,18 @@ impl PublishedPack {
             });
             if rewritten || dead {
                 put_back(&aside, &path)?;
+                put_back_dirs.insert(path.parent().expect("blob path has a parent").to_path_buf());
                 self.report.loose_kept += 1;
             } else {
                 remove_if_present(&aside)?;
                 self.report.loose_removed += 1;
             }
+        }
+        // A copy put back may be the only live one (its packed copy is
+        // tombstoned), so its rename must be durable before anything else
+        // is removed.
+        for d in &put_back_dirs {
+            sync_dir(d)?;
         }
         let dir = store.packs.dir().to_path_buf();
         for id in &self.replaced {

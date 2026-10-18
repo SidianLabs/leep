@@ -282,8 +282,72 @@ cargo build --release -p leep-server -p leep-soak
 target/release/leep-server --meta <url> --blobs file:///tmp/b --listen 127.0.0.1:7391 \
   --metrics-listen 127.0.0.1:7392 --warm-interval 0 --request-timeout 0 &
 target/release/leep-land-bench --server http://127.0.0.1:7391 \
-  --metrics http://127.0.0.1:7392 --agents 1,4,16,64 --duration 10
+  --metrics http://127.0.0.1:7392 --agents 1,4,16,64 --duration 10 --missing 90000
 ```
+`--missing 90000` first times `POST /v1/blobs/missing` with 90,000 hashes
+that were never stored, three times.
+
+**Write path (ADR 0044).** After staged batches, on a 4-vCPU VPS (Postgres
+16, blobs on a real disk) 64 agents landed about 117 times a second and the
+limit was the agents' own requests: put p50 66 to 110 ms, create p50 130 to
+215 ms (one agent: 6.5 and 10.5 ms). Timers on the put and create paths and
+a `perf` profile of the server at 64 agents (local run) found:
+
+- Every put fsynced its shard directory after the rename, and every create
+  wrote three or four tree nodes, each with its own file and directory
+  fsync. Nothing needs an upload's directory synced until a changeset names
+  the blob.
+- `missing_blobs` checked existence one hash at a time: a blocking task per
+  hash and, for every miss, a rescan of `packs/` under a lock (25 to 80 µs
+  each), 2.2 to 2.9 s for 90,000 hashes on the VPS and 7 to 11 s on the
+  loaded local machine. The batched condemnation read before it (one query
+  of 90,000 keys) took 0.2 to 0.3 s in Postgres.
+- A put made three round trips in turn: the blob write (six hops to the
+  blocking pool through `tokio::fs`), the condemnation read, the claim write.
+- Under load each Postgres round trip took 5 to 15 ms, but Postgres itself
+  was mostly idle (10 of 16 pooled connections idle, the rest waiting on the
+  server) and raising the pool from 16 to 48 connections changed nothing
+  beyond the noise: the server was short of CPU, most of it (30% of samples)
+  in the kernel scheduling threads, not in the pool. A separate pool for the
+  land leader would not have helped here and was left out.
+
+Fixed: a put syncs only its file and records the directory, and a flush
+before every changeset write syncs the recorded directories in one wave
+shared by every request waiting (`BlobStore::flush`); a create's tree nodes
+and the contents it names share one wave. The blob write is one blocking
+task. The claim is written alongside the condemnation read. `missing_blobs`
+runs in phases over all hashes (condemnation rows in parallel chunks, fences
+of the few with a row 64 at a time, existence in one batched
+`contains_many` that stats in a few tasks and rescans the packs once,
+claims), keeping each hash's order.
+
+Same local 4-vCPU Xeon as below, shared with other agents' builds and tests
+(load average 6 to 8 throughout), Postgres 16, blobs on ext4. Before is
+`main` with staged batches; run alternately, two rounds, both shown
+(round 1 / round 2; latency cells read before → after):
+
+| Agents | Lands/s before | Lands/s after | Put p50 ms | Put p99 ms | Create p50 ms | Create p99 ms |
+|---|---|---|---|---|---|---|
+| 1 | 40 / 77 | 110 / 84 | 9.3 / 3.5 → 1.8 / 3.0 | 20.7 / 8.7 → 5.6 / 6.5 | 8.1 / 5.2 → 4.0 / 5.2 | 20.1 / 11.7 → 9.5 / 10.9 |
+| 4 | 115 / 72 | 98 / 135 | 4.9 / 7.2 → 3.8 / 3.1 | 14.8 / 23.7 → 15.6 / 8.3 | 7.2 / 11.4 → 9.4 / 7.8 | 17.9 / 30.5 → 31.5 / 15.1 |
+| 16 | 162 / 139 | 175 / 239 | 13.0 / 14.3 → 7.6 / 6.3 | 36.8 / 57.7 → 28.9 / 17.8 | 20.5 / 23.1 → 24.3 / 19.9 | 52.1 / 75.9 → 70.1 / 36.0 |
+| 64 | 184 / 160 | 170 / 231 | 39.8 / 42.3 → 22.2 / 18.9 | 121 / 139 → 118 / 45 | 76.7 / 93.1 → 81.4 / 64.8 | 169 / 181 → 202 / 123 |
+
+`POST /v1/blobs/missing`, 90,000 never-stored hashes in one request, three
+runs each round: 9.2 to 11.6 s / 6.8 to 7.3 s before, 0.34 to 0.44 s / 0.35
+to 0.40 s after. What is left is mostly the condemnation lookup in Postgres
+(one index probe per key) and parsing the 6 MB request.
+
+No run lost a CAS or answered 409. Uploads are faster at every agent count,
+about half the time at 16 and 64 agents. Creates and lands per second at 4
+to 64 agents moved within the machine's noise (the two rounds disagree more
+than before and after do): a create now waits for a sync wave that holds
+every directory written since the previous one, by all agents, instead of
+only its own syncs, so under heavy load it trades its own fsyncs for a share
+of a larger wave. On storage where each fsync is slower (the VPS: 1.3 to
+2 ms per directory sync) the saving per upload and per create is larger.
+Earlier runs during the work, with lower load, gave 300 to 320 lands/s at 64
+agents against 184 to 220 before.
 
 **Staged batches (ADR 0043).** Group commit (below) made the ref move once per
 batch, but each replay inside the batch still went to the stores: on a 4-vCPU

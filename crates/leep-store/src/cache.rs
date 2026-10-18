@@ -158,6 +158,15 @@ impl<S: BlobStore> BlobStore for CachedBlobStore<S> {
     async fn contains(&self, hash: &Hash) -> Result<bool> {
         self.inner.contains(hash).await
     }
+
+    /// Always asks the inner store, as `contains` does.
+    async fn contains_many(&self, hashes: &[Hash]) -> Result<Vec<bool>> {
+        self.inner.contains_many(hashes).await
+    }
+
+    async fn flush(&self, named: &[Hash]) -> Result<()> {
+        self.inner.flush(named).await
+    }
 }
 
 #[cfg(test)]
