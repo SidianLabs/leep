@@ -4,8 +4,11 @@
 
 use leep_core::review::{Review, Verdict};
 use leep_core::signature::Signature;
-use leep_core::{Changeset, Hash, TreeNode};
-use leep_derive::derived::{flat_row, HistoryNode, StoredHistoryNode};
+use std::sync::Arc;
+
+use leep_core::{Changeset, ChangesetId, Hash, TreeNode};
+use leep_derive::derived::history_pack::{decode_part, decode_unchecked, PackBuilder, RawNode};
+use leep_derive::derived::{flat_row, HistoryNode, NodeRef, Row, StoredHistoryNode};
 
 pub fn changeset(data: &[u8]) {
     let Ok(cs) = Changeset::decode(data) else {
@@ -35,76 +38,79 @@ pub fn tree_node(data: &[u8]) {
     assert_eq!(node.hash(), Hash::of_object(TreeNode::KIND, &enc));
 }
 
-/// A stored `history-node-v3` row: a whole node or chunk, a chunk list, or a patch of either.
+/// A part of a `history-tree-v4` pack (ADR 0045), whatever its checksum
+/// says: a decode may fail but never panics; a node resolves against a
+/// keyframe or says why not; and a decoded keyframe, stored again in a pack
+/// of its own, or as an edit of itself without its last entry, reads back
+/// as the same node.
 pub fn history_node(data: &[u8]) {
-    let Ok(stored) = StoredHistoryNode::decode(data) else {
-        return;
-    };
-    let enc = stored.encode();
-    let again = StoredHistoryNode::decode(&enc).expect("re-encoded history row must decode");
-    assert_eq!(again, stored);
-    assert_eq!(again.encode(), enc);
-    // Applying a patch to any keyframe fails or gives a keyframe.
-    for key in [
-        StoredHistoryNode::Flat(HistoryNode::default()),
-        StoredHistoryNode::Split(Vec::new()),
-    ] {
-        if let Ok(r) = stored.clone().resolve(Some(&key)) {
-            assert!(r.base().is_none());
-        }
-    }
-    let StoredHistoryNode::Flat(node) = stored else {
-        return;
-    };
-    // Stored as an edit of itself without its last entry, the row must read
-    // back as the node.
-    let mut key = node.clone();
-    if key.entries.pop_last().is_some() {
-        let row = flat_row(&node, Some((key.hash(), &key)));
-        let back = match row.node.base() {
-            Some(_) => row
-                .node
-                .clone()
-                .resolve(Some(&StoredHistoryNode::Flat(key))),
-            None => Ok(row.node.clone()),
+    let cs = ChangesetId(Hash([7; 32]));
+    let other = ChangesetId(Hash([8; 32]));
+    for part in [0, 1] {
+        let Ok(decoded) = decode_unchecked(data, cs, part) else {
+            continue;
         };
-        assert_eq!(back, Ok(StoredHistoryNode::Flat(node.clone())));
-    }
-    // Storing the node again must give rows that hold the same entries.
-    let rows = node.rows();
-    let (top, chunks) = rows.split_last().expect("a node has a top row");
-    assert_eq!(top.hash, node.hash());
-    let joined = match &top.node {
-        StoredHistoryNode::Flat(n) => {
-            assert!(chunks.is_empty());
-            n.clone()
-        }
-        StoredHistoryNode::Split(refs) => {
-            assert_eq!(refs.len(), chunks.len());
-            let mut joined = HistoryNode::default();
-            for c in chunks {
-                let StoredHistoryNode::Flat(n) = &c.node else {
-                    panic!("chunks are stored whole");
-                };
-                joined.entries.extend(n.entries.clone());
+        for (node, _) in decoded.nodes {
+            for key in [
+                StoredHistoryNode::Flat(HistoryNode::default()),
+                StoredHistoryNode::Split(Vec::new()),
+            ] {
+                if let Ok(named) = node.clone().resolve(Some(&key)) {
+                    if let Ok(r) = named.resolve(Some(&key)) {
+                        assert!(r.base().is_none());
+                    }
+                }
             }
-            joined
+            let RawNode::Ready(n) = node else {
+                continue;
+            };
+            if n.base().is_some() {
+                continue;
+            }
+            let mut b = PackBuilder::new(other);
+            let at = b.stage(n.clone(), None);
+            let pack = b.finish(at);
+            let back = decode_part(&pack.value, other, 0).expect("own pack must decode");
+            assert_eq!(back.nodes.len(), 1);
+            assert_eq!(back.nodes[0].0, RawNode::Ready(n.clone()));
+            let StoredHistoryNode::Flat(node) = n else {
+                continue;
+            };
+            for entry in node.entries.values() {
+                // The accessors must agree with the variant.
+                assert_eq!(
+                    entry.node().is_some(),
+                    matches!(entry, leep_derive::derived::HistoryEntry::Tree { .. })
+                );
+            }
+            let mut key = node.clone();
+            if key.entries.pop_last().is_none() {
+                continue;
+            }
+            let key = Arc::new(StoredHistoryNode::Flat(key));
+            let base = NodeRef {
+                cs,
+                part: 0,
+                idx: 0,
+            };
+            let (row, row_key) = match flat_row(other, &node, Some((base, &key))) {
+                Row::New(row, k) => (row, k),
+                Row::Keep(_) => panic!("a node with one more entry is not its keyframe"),
+            };
+            let mut b = PackBuilder::new(other);
+            let at = b.stage(row, row_key);
+            let pack = b.finish(at);
+            let (raw, _) = decode_part(&pack.value, other, 0)
+                .expect("own pack must decode")
+                .nodes
+                .remove(0);
+            let named = raw.resolve(Some(&key)).expect("own patch must resolve");
+            let whole = match named.base() {
+                Some(_) => named.resolve(Some(&key)),
+                None => Ok(named),
+            };
+            assert_eq!(whole, Ok(StoredHistoryNode::Flat(node.clone())));
         }
-        _ => unreachable!("rows() writes keyframes only"),
-    };
-    assert_eq!(joined, node);
-    let enc = node.encode();
-    let again = HistoryNode::decode(&enc).expect("re-encoded history node must decode");
-    assert_eq!(again, node);
-    assert_eq!(again.encode(), enc);
-    assert_eq!(again.hash(), node.hash());
-    for entry in node.entries.values() {
-        // The accessors must agree with the variant.
-        assert_eq!(
-            entry.node().is_some(),
-            matches!(entry, leep_derive::derived::HistoryEntry::Tree { .. })
-        );
-        let _ = entry.changed();
     }
 }
 

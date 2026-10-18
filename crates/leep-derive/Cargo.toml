@@ -12,6 +12,7 @@ bytes.workspace = true
 futures-util.workspace = true
 globset.workspace = true
 postcard.workspace = true
+zstd.workspace = true
 regex.workspace = true
 regex-syntax.workspace = true
 serde.workspace = true

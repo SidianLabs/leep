@@ -1,11 +1,11 @@
-//! Time path-history derivation (`history-tree-v3`) against real stores and
+//! Time path-history derivation (`history-tree-v4`) against real stores and
 //! count the store calls it makes, as measured in docs/PERFORMANCE.md
 //! ("Path history on Linux").
 //!
 //! ```sh
 //! cargo run --release -p leep-server --example history_profile -- <meta url> <blob url> <rev> [--reset]
 //! ```
-//! `--reset` first deletes every `history-tree-v3` and `history-node-v3` row,
+//! `--reset` first deletes every `history-tree-v4` and `history-node-v4` row,
 //! so only point it at stores no server is using. Prints progress every 10 s
 //! and, at the end, changesets per second, peak RSS and calls per store method.
 //!
@@ -18,6 +18,13 @@
 //! times the head alone. `--dump FILE`
 //! writes every row of both kinds afterwards, sorted, as `kind key
 //! blake3(value)` lines, to compare two builds' rows.
+//!
+//! `--breakdown` then prints what the index's bytes are (ADR 0045): bytes and
+//! rows per changeset, merges against the rest, packs of several parts, nodes
+//! by kind and the share of id tables. `--breakdown-v3` does the same for a
+//! store's retired `history-node-v3` rows, attributing each to the changeset
+//! that wrote it and counting bytes by row type, directory width and field,
+//! with estimates of other encodings; it reads every row into memory.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -35,6 +42,9 @@ use leep_derive::Repo;
 
 #[path = "../../leep-derive/benches/support/wide_history.rs"]
 mod wide_history;
+
+#[path = "support/history_breakdown.rs"]
+mod history_breakdown;
 
 /// Calls and time per store method.
 #[derive(Default)]
@@ -261,7 +271,7 @@ fn status_kib(field: &str) -> u64 {
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let usage =
-        "usage: history_profile <meta url> <blob url> <rev> [--reset] [--synth N [--small] [--old-base BACK]] [--last] [--dump FILE]";
+        "usage: history_profile <meta url> <blob url> <rev> [--reset] [--synth N [--small] [--old-base BACK]] [--last] [--dump FILE] [--breakdown] [--breakdown-v3]";
     let meta_url = args.first().expect(usage);
     let blob_url = args.get(1).expect(usage);
     let rev = args.get(2).expect(usage);
@@ -346,6 +356,12 @@ async fn main() {
         status_kib("VmHWM") / 1024
     );
     print_tally(&tally);
+    if args.iter().any(|a| a == "--breakdown") {
+        history_breakdown::breakdown_v4(&*raw_meta).await;
+    }
+    if args.iter().any(|a| a == "--breakdown-v3") {
+        history_breakdown::breakdown_v3(&*raw_meta).await;
+    }
     if let Some(path) = flag("--dump") {
         let mut lines = Vec::new();
         for kind in [HistoryTree::NAME, HISTORY_NODE_KIND] {

@@ -142,7 +142,7 @@ A derived kind is a pure function
 2. derives them oldest-first, reading changesets again 256 at a time;
 3. stores each with `put_derived(kind, cs_id, bytes)`; a kind may instead
    stage its rows and write a window's in one `put_derived_many`, each
-   changeset's value after the rows it names (`history-tree-v3` and
+   changeset's value after the rows it names (`history-tree-v4` and
    `last_merge-v1` do; values held back are found by later derivations in
    the same run, as a merge asks for its merge base's).
 
@@ -158,7 +158,7 @@ changeset, and concurrent servers that race produce identical bytes.
 | `review-v1` | review verdicts, keyed per (changeset, reviewer name) (`Hash::of_object("review", id‖name)`); attestations written by `put_review`, last write wins, listed with one lookup per principal | review listing and the review land policy |
 | `last_merge-v1` | generation of the nearest merge on the first-parent chain (0 if none) | lets `merge_base` answer from skiplists when no merge sits above the first-parent common ancestor |
 | `blob-claim-v1` / `blob-condemned-v1` / `blob-rescue-v1` / `blob-doom-v1` | per blob hash, 8-byte big-endian unix seconds (doom adds a state byte); GC bookkeeping, not derived from changesets: claims by uploads and dedup checks, condemnation by `gc condemn`, rescue by uploads of a condemned blob, doom by `gc collect` (ADR 0012) | blob garbage collection and the server's missing-blob checks |
-| `history-tree-v3` | 32-byte address of the root history node, a tree parallel to `root_tree` recording for each path (including deleted ones) the newest changesets that changed it; nodes are `history-node-v3` rows keyed by content hash, nodes of more than 64 entries are stored as content-defined chunks so an edit rewrites one chunk (ADR 0027), and a changed node, chunk or chunk list is stored as a patch on an earlier whole version (ADR 0037). Built from the first parent's tree plus the spines of changed paths, and at merges the paths where the second parent's history differs from the merge base's (another parent's from the first's, for octopus or unrelated merges) (ADR 0013) | path log, `last-change` |
+| `history-tree-v4` | the changeset's history pack (ADR 0045): the nodes of a tree parallel to `root_tree` recording for each path (including deleted ones) the newest changesets that changed it, as written by this changeset's derivation, and the address of its root. A pack is cut into parts of about 16 KB; this value is part 0 and `history-node-v4` rows hold the rest. Nodes are addressed by (writer, part, index) and name changesets through a table per part, so the hundreds of nodes a merge rewrites name its few dozen ids once; nodes of more than 64 entries are stored as content-defined chunks so an edit rewrites one chunk (ADR 0027), and a changed node, chunk or chunk list is stored as a patch on an earlier whole version that names the entries it replaces by position (ADR 0037). Built from the first parent's tree plus the spines of changed paths, and at merges the paths where the second parent's history differs from the merge base's (another parent's from the first's, for octopus or unrelated merges) (ADR 0013) | path log, `last-change` |
 | `blame` | per (changeset, path), keyed `Hash::of_object("blame", id‖path)` | blame |
 | `gc-mark-v1` | per changeset id, tree node hash or blob hash, one byte: "referenced by a stored changeset, and everything below has a row"; written by GC marks in post-order (ADR 0033) | incremental GC marks, which skip covered changesets and stop at marked tree nodes |
 | `blob-trigrams-v1` | per blob hash: sorted trigram set of a UTF-8 text blob up to 1 MiB (delta varints), or a "not indexed" marker (ADR 0014) | code search |
@@ -189,9 +189,10 @@ order are those of the plain walk, and whatever a batch did not return is read
 singly at the point the plain walk would read it.
 
 **Path history.** `log --path P` and `GET /v1/last-change/{id}?path=P` read
-the `history-tree-v3` index instead of scanning ancestors (ADR 0013). A lookup
+the `history-tree-v4` index instead of scanning ancestors (ADR 0013). A lookup
 walks `P`'s components through the changeset's history tree, reading only the
-chunk that holds each component in a large directory, and yields the
+chunk that holds each component in a large directory (and the keyframe a
+patch is on), and yields the
 newest changesets that changed `P` (for a directory, anything under it). The
 log pushes those on a heap ordered by generation and id, yields the newest,
 looks `P` up in that changeset's parents to find the next ones, and repeats. It
@@ -693,8 +694,8 @@ link and an imported commit's mapping are written in the changeset's own
 atomic call, so a crash never leaves a stored changeset without them; a
 backend without that call writes the changeset first and the rows after, and
 nothing depends on the difference (ADR 0031). What the stores do not protect is a row or
-blob that is damaged at rest. Tree nodes and history nodes are content
-addressed and checked on read; most other derived rows are not (ADR 0021
+blob that is damaged at rest. Tree nodes are content addressed and history
+packs carry checksums, and both are checked on read; most other derived rows are not (ADR 0021
 lists them). `leep-server verify` closes that gap offline by recomputation (ADR 0025). The tests that establish all of this are in ADR 0021; the soak test
 (ADR 0022) checks the same properties over hours and a deep history, with
 GC and restarts running beside a swarm of agents.

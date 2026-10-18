@@ -1,9 +1,9 @@
-//! Path log and last-change queries answered from the `history-tree-v3`
+//! Path log and last-change queries answered from the `history-tree-v4`
 //! index instead of a scan of all ancestors (ADR 0013).
 
 use std::collections::{BTreeSet, BinaryHeap, HashSet};
 use std::ops::Bound;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use bytes::Bytes;
 use leep_core::api::{ChangesetInfo, RenameEntry};
@@ -13,8 +13,11 @@ use leep_core::{
     TreeEntry,
 };
 
+use crate::derived::history_pack::{
+    cache_size, decode_part, part_key, raw_cache_size, Pack, PackBuilder, Part, RawNode,
+};
 use crate::derived::{
-    self, ChunkRef, HistoryEntry, HistoryNode, HistoryRow, HistoryTree, ResolvedRow,
+    self, ChunkRef, DerivedKind, HistoryEntry, HistoryNode, HistoryTree, NodeRef, ResolvedRow, Row,
     StoredHistoryNode, HISTORY_NODE_KIND as NODE_KIND,
 };
 use crate::history::LogFilter;
@@ -106,62 +109,97 @@ impl FollowWalk {
 /// A history node prepared for lookups (see [`Repo::node_lookup`]).
 pub(crate) enum NodeLookup {
     /// A whole or patched node, looked up in its row.
-    Row(Hash),
+    Row(NodeRef),
     /// A split node and its resolved chunk list.
-    Split { node: Hash, refs: Vec<ChunkRef> },
+    Split { node: NodeRef, refs: Vec<ChunkRef> },
 }
 
 /// A chunk's row and, for a patch, its keyframe.
 type ChunkRows = (Arc<StoredHistoryNode>, Option<Arc<StoredHistoryNode>>);
 
-/// History rows staged for one write, each once.
-#[derive(Default)]
-pub(crate) struct PendingRows {
-    rows: Vec<HistoryRow>,
-    seen: HashSet<Hash>,
-}
-
 /// Most history rows one write carries.
 const WRITE_BATCH: usize = 1024;
+
+/// The address of `row`: an existing node, or a new one staged in `pending`.
+fn stage(pending: &mut PackBuilder, row: Row) -> NodeRef {
+    match row {
+        Row::Keep(r) => r,
+        Row::New(node, key) => pending.stage(node, key),
+    }
+}
 
 /// Split into components, ignoring empty ones the way tree lookups do.
 fn components(path: &str) -> impl Iterator<Item = &str> {
     path.split('/').filter(|c| !c.is_empty())
 }
 
-/// Read and check one stored history row without any cache, as stored (a
-/// patch is not applied), and its encoded length. The empty node always
-/// exists.
-pub(crate) async fn load_history_row(
-    meta: &dyn MetaStore,
-    hash: Hash,
-) -> Result<(StoredHistoryNode, usize)> {
-    if hash == HistoryNode::empty_hash() {
-        return Ok((StoredHistoryNode::Flat(HistoryNode::default()), 2));
-    }
-    match meta.get_derived(NODE_KIND, &hash).await? {
-        Some(b) if Hash::of_object(NODE_KIND, &b) != hash => {
-            Err(Error::Storage(format!("corrupt history node {hash}")))
-        }
-        Some(b) => Ok((StoredHistoryNode::decode(&b)?, b.len())),
-        None => Err(Error::Storage(format!("history node {hash} missing"))),
+/// Kind and key of part `part` of `cs`'s pack: part 0 is the changeset's
+/// `history-tree-v4` value.
+pub(crate) fn part_row(cs: ChangesetId, part: u32) -> (&'static str, Hash) {
+    if part == 0 {
+        (HistoryTree::NAME, cs.0)
+    } else {
+        (NODE_KIND, part_key(cs, part))
     }
 }
 
-/// `row`, stored at `hash`, with its patch applied to `key` (the row at its
+fn missing(r: NodeRef) -> Error {
+    Error::Storage(format!("history node {r} missing"))
+}
+
+fn empty_node() -> Arc<StoredHistoryNode> {
+    static EMPTY: OnceLock<Arc<StoredHistoryNode>> = OnceLock::new();
+    EMPTY
+        .get_or_init(|| Arc::new(StoredHistoryNode::Flat(HistoryNode::default())))
+        .clone()
+}
+
+/// Read and check one stored history node without any cache, as stored (a
+/// patch still names its keyframe's entries by position), and about the
+/// bytes it takes. The empty node always exists.
+pub(crate) async fn load_history_row(meta: &dyn MetaStore, r: NodeRef) -> Result<(RawNode, usize)> {
+    if r == NodeRef::EMPTY {
+        return Ok((
+            RawNode::Ready(StoredHistoryNode::Flat(HistoryNode::default())),
+            1,
+        ));
+    }
+    let (kind, key) = part_row(r.cs, r.part);
+    let Some(bytes) = meta.get_derived(kind, &key).await? else {
+        return Err(missing(r));
+    };
+    decode_part(&bytes, r.cs, r.part)?
+        .nodes
+        .into_iter()
+        .nth(r.idx as usize)
+        .ok_or_else(|| missing(r))
+}
+
+/// [`resolve_row`] of a node as decoded, whose patch may still name its
+/// keyframe's entries by position.
+pub(crate) fn resolve_raw_row(
+    r: NodeRef,
+    row: RawNode,
+    key: Option<&StoredHistoryNode>,
+) -> Result<ResolvedRow> {
+    let named = row
+        .resolve(key)
+        .map_err(|why| Error::Storage(format!("corrupt history node {r}: {why}")))?;
+    resolve_row(r, named, key)
+}
+
+/// `row`, stored at `r`, with its patch applied to `key` (the row at its
 /// base, as stored). A patch must point at a keyframe of its own shape, so a
 /// damaged or foreign row is an error, not a wrong answer.
 pub(crate) fn resolve_row(
-    hash: Hash,
+    r: NodeRef,
     row: StoredHistoryNode,
     key: Option<&StoredHistoryNode>,
 ) -> Result<ResolvedRow> {
-    let keyframe = row.base().unwrap_or(hash);
+    let keyframe = row.base().unwrap_or(r);
     match row.resolve(key) {
         Ok(node) => Ok(ResolvedRow { node, keyframe }),
-        Err(why) => Err(Error::Storage(format!(
-            "corrupt history node {hash}: {why}"
-        ))),
+        Err(why) => Err(Error::Storage(format!("corrupt history node {r}: {why}"))),
     }
 }
 
@@ -187,7 +225,7 @@ pub(crate) fn chunk_fits<'a>(
 /// entries over its keyframe's. A chunk that does not fit its range is an
 /// error, as for [`chunk_fits`] on the joined chunk.
 fn chunk_view<'r>(
-    node: Hash,
+    node: NodeRef,
     refs: &[ChunkRef],
     i: usize,
     row: &'r StoredHistoryNode,
@@ -227,13 +265,13 @@ fn chunk_view<'r>(
     }
 }
 
-pub(crate) fn bad_chunk(node: Hash, i: usize) -> Error {
+pub(crate) fn bad_chunk(node: NodeRef, i: usize) -> Error {
     Error::Storage(format!(
         "corrupt history node {node}: chunk {i} does not fit"
     ))
 }
 
-fn misfit(node: Hash, first: &str) -> Error {
+fn misfit(node: NodeRef, first: &str) -> Error {
     Error::Storage(format!(
         "corrupt history node {node}: the chunk at {first:?} does not fit"
     ))
@@ -243,7 +281,7 @@ fn misfit(node: Hash, first: &str) -> Error {
 /// that range's first name, and the next chunk's first name.
 struct ChunkAt {
     first: String,
-    node: Hash,
+    node: NodeRef,
     next: Option<String>,
 }
 
@@ -294,69 +332,165 @@ fn diff_sorted<'a>(
 
 impl Repo {
     /// Root history node of `id`, deriving the index for its ancestors first.
-    pub(crate) async fn history_root(&self, id: ChangesetId) -> Result<Hash> {
-        derived::decode_hash(&derived::derive::<HistoryTree>(self, id).await?)
+    pub(crate) async fn history_root(&self, id: ChangesetId) -> Result<NodeRef> {
+        if let Some(r) = self.history_roots.get(&id.0) {
+            return Ok(*r);
+        }
+        let value = derived::derive::<HistoryTree>(self, id).await?;
+        let part = Part::read(&value, id, 0)?;
+        let root = part.root.expect("part 0 names a root");
+        self.history_roots.insert(id.0, Arc::new(root), 32);
+        let size = part.size();
+        self.history_parts.insert(id.0, Arc::new(part), size);
+        Ok(root)
     }
 
-    /// Read one stored `history-node-v3` row as stored: a whole node or a
-    /// chunk, a split node's chunk list, or a patch of either. The empty node
-    /// always exists.
-    pub(crate) async fn read_history_row(&self, hash: Hash) -> Result<Arc<StoredHistoryNode>> {
-        if let Some(n) = self.history_rows.get(&hash) {
-            return Ok(n);
-        }
-        if let Some(n) = self.history_staged.lock().unwrap().get(&hash) {
-            return Ok(n.clone());
-        }
-        let (node, len) = load_history_row(&**self.meta(), hash).await?;
-        let node = Arc::new(node);
-        self.history_rows.insert(hash, node.clone(), len);
+    /// Read one stored history node: a whole node or a chunk, a split node's
+    /// chunk list, or a patch of either, with a patch's entries named (which
+    /// reads its keyframe). The empty node always exists.
+    pub(crate) async fn read_history_row(&self, r: NodeRef) -> Result<Arc<StoredHistoryNode>> {
+        let raw = match self.fetch_history_row(r).await? {
+            Ok(node) => return Ok(node),
+            Err(raw) => raw,
+        };
+        let base = raw.base().expect("only patches wait for a keyframe");
+        let key = match self.fetch_history_row(base).await? {
+            Ok(key) => key,
+            Err(_) => {
+                return Err(Error::Storage(format!(
+                    "corrupt history node {r}: its base is not a keyframe of its shape"
+                )))
+            }
+        };
+        let named = raw
+            .resolve_ref(Some(&key))
+            .map_err(|why| Error::Storage(format!("corrupt history node {r}: {why}")))?;
+        let node = Arc::new(named);
+        self.history_rows
+            .insert(r.cache_key(), node.clone(), cache_size(&node));
         Ok(node)
     }
 
-    /// Read the rows `hashes` that are not cached, and then the keyframes
-    /// they are patches on, in one batched read each, so joining a split
-    /// node costs two round trips rather than one or two per chunk. Only
-    /// fills the cache: whatever this misses or cannot check is read again,
-    /// singly, by the caller, with its errors.
-    pub(crate) async fn prefetch_history_rows(&self, hashes: impl Iterator<Item = Hash>) {
-        let mut want: Vec<Hash> = hashes.collect();
-        for _ in 0..2 {
-            let empty = HistoryNode::empty_hash();
-            want.retain(|h| *h != empty && self.history_rows.get(h).is_none());
-            {
-                let staged = self.history_staged.lock().unwrap();
-                want.retain(|h| !staged.contains_key(h));
-            }
-            want.sort();
-            want.dedup();
-            if want.len() < 2 {
-                return;
-            }
-            let Ok(found) = self.meta().get_derived_many(NODE_KIND, &want).await else {
-                return;
-            };
-            let mut bases = Vec::new();
-            for (hash, bytes) in want.iter().zip(found) {
-                let Some(b) = bytes else { continue };
-                if Hash::of_object(NODE_KIND, &b) != *hash {
-                    continue;
-                }
-                let Ok(row) = StoredHistoryNode::decode(&b) else {
-                    continue;
+    /// A node from the caches, the staged packs or the store: `Ok` if it is
+    /// ready to use, `Err` with a patch that still names its keyframe's
+    /// entries by position.
+    async fn fetch_history_row(
+        &self,
+        r: NodeRef,
+    ) -> Result<std::result::Result<Arc<StoredHistoryNode>, Arc<RawNode>>> {
+        if r == NodeRef::EMPTY {
+            return Ok(Ok(empty_node()));
+        }
+        let k = r.cache_key();
+        if let Some(n) = self.history_rows.get(&k) {
+            return Ok(Ok(n));
+        }
+        if let Some(n) = self.history_staged.lock().unwrap().nodes.get(&k) {
+            return Ok(Ok(n.clone()));
+        }
+        if let Some(raw) = self.history_raw.get(&k) {
+            return Ok(Err(raw));
+        }
+        let (kind, key) = part_row(r.cs, r.part);
+        let part = match self.history_parts.get(&key) {
+            Some(p) => p,
+            None => {
+                let Some(bytes) = self.meta().get_derived(kind, &key).await? else {
+                    return Err(missing(r));
                 };
-                bases.extend(row.base());
-                self.history_rows.insert(*hash, Arc::new(row), b.len());
+                self.cache_part(r.cs, r.part, &bytes)?
             }
-            want = bases;
+        };
+        match part.node(r.idx).ok_or_else(|| missing(r))?? {
+            RawNode::Ready(n) => {
+                let size = cache_size(&n);
+                let n = Arc::new(n);
+                self.history_rows.insert(k, n.clone(), size);
+                Ok(Ok(n))
+            }
+            raw => {
+                let size = raw_cache_size(&raw);
+                let raw = Arc::new(raw);
+                self.history_raw.insert(k, raw.clone(), size);
+                Ok(Err(raw))
+            }
         }
     }
 
-    /// The keyframe the patch `row` (at `hash`) is stored against, checked to
+    /// Check a part and cache it; its nodes are decoded when first read.
+    fn cache_part(&self, cs: ChangesetId, part: u32, bytes: &[u8]) -> Result<Arc<Part>> {
+        let p = Arc::new(Part::read(bytes, cs, part)?);
+        let size = p.size();
+        self.history_parts
+            .insert(part_row(cs, part).1, p.clone(), size);
+        Ok(p)
+    }
+
+    /// Whether `r` can be read without the store.
+    fn history_row_cached(&self, r: NodeRef) -> bool {
+        let k = r.cache_key();
+        r == NodeRef::EMPTY
+            || self.history_rows.get(&k).is_some()
+            || self.history_raw.get(&k).is_some()
+            || self.history_parts.get(&part_row(r.cs, r.part).1).is_some()
+            || self.history_staged.lock().unwrap().nodes.contains_key(&k)
+    }
+
+    /// Read the parts holding the rows `refs` that are not cached, and then
+    /// those holding the keyframes they are patches on, in one batched read
+    /// per kind each, so joining a split node costs two round trips rather
+    /// than one or two per chunk. Only fills the cache: whatever this misses
+    /// or cannot check is read again, singly, by the caller, with its errors.
+    pub(crate) async fn prefetch_history_rows(&self, refs: impl Iterator<Item = NodeRef>) {
+        let mut want: Vec<NodeRef> = refs.filter(|r| !self.history_row_cached(*r)).collect();
+        let mut asked: Vec<NodeRef> = want.clone();
+        for round in 0..2 {
+            let mut parts: Vec<(ChangesetId, u32)> = want.iter().map(|r| (r.cs, r.part)).collect();
+            parts.sort();
+            parts.dedup();
+            if round == 0 && want.len() < 2 {
+                return;
+            }
+            for kind in [HistoryTree::NAME, NODE_KIND] {
+                let these: Vec<(ChangesetId, u32)> = parts
+                    .iter()
+                    .copied()
+                    .filter(|(cs, p)| part_row(*cs, *p).0 == kind)
+                    .collect();
+                if these.is_empty() {
+                    continue;
+                }
+                let keys: Vec<Hash> = these.iter().map(|(cs, p)| part_row(*cs, *p).1).collect();
+                let Ok(found) = self.meta().get_derived_many(kind, &keys).await else {
+                    return;
+                };
+                for ((cs, p), bytes) in these.iter().zip(found) {
+                    if let Some(b) = bytes {
+                        let _ = self.cache_part(*cs, *p, &b);
+                    }
+                }
+            }
+            // The keyframes of the patches among them.
+            want = asked
+                .iter()
+                .filter_map(|r| {
+                    let part = self.history_parts.get(&part_row(r.cs, r.part).1)?;
+                    part.node(r.idx)?.ok()?.base()
+                })
+                .filter(|b| !self.history_row_cached(*b))
+                .collect();
+            asked = Vec::new();
+            if want.is_empty() {
+                return;
+            }
+        }
+    }
+
+    /// The keyframe the patch `row` (at `r`) is stored against, checked to
     /// be a keyframe of its shape; `None` if `row` is a keyframe.
     async fn history_key(
         &self,
-        hash: Hash,
+        r: NodeRef,
         row: &StoredHistoryNode,
     ) -> Result<Option<Arc<StoredHistoryNode>>> {
         let Some(base) = row.base() else {
@@ -367,22 +501,22 @@ impl Repo {
             (StoredHistoryNode::Patch { .. }, StoredHistoryNode::Flat(_))
             | (StoredHistoryNode::SplitPatch { .. }, StoredHistoryNode::Split(_)) => Ok(Some(key)),
             _ => Err(Error::Storage(format!(
-                "corrupt history node {hash}: its base is not a keyframe of its shape"
+                "corrupt history node {r}: its base is not a keyframe of its shape"
             ))),
         }
     }
 
     /// A row as a keyframe, with any patch applied, and its keyframe.
-    async fn read_resolved(&self, hash: Hash) -> Result<ResolvedRow> {
-        let row = self.read_history_row(hash).await?;
-        let key = self.history_key(hash, &row).await?;
-        resolve_row(hash, (*row).clone(), key.as_deref())
+    async fn read_resolved(&self, r: NodeRef) -> Result<ResolvedRow> {
+        let row = self.read_history_row(r).await?;
+        let key = self.history_key(r, &row).await?;
+        resolve_row(r, (*row).clone(), key.as_deref())
     }
 
     /// Read one history node, joining its chunks if it is split. Derivation
     /// edits nodes chunk by chunk instead; tests compare against this.
     #[cfg(test)]
-    pub(crate) async fn read_history_node(&self, node: Hash) -> Result<HistoryNode> {
+    pub(crate) async fn read_history_node(&self, node: NodeRef) -> Result<HistoryNode> {
         let refs = match self.read_resolved(node).await?.node {
             StoredHistoryNode::Split(refs) => refs,
             StoredHistoryNode::Flat(n) => return Ok(n),
@@ -428,8 +562,8 @@ impl Repo {
     /// a merge. Other runs are joined and compared in full.
     pub(crate) async fn diff_history_nodes(
         &self,
-        a: Hash,
-        b: Hash,
+        a: NodeRef,
+        b: NodeRef,
     ) -> Result<Vec<(String, Option<HistoryEntry>, Option<HistoryEntry>)>> {
         let (ra, rb) = (self.read_resolved(a).await?, self.read_resolved(b).await?);
         let (x, y) = match (ra.node, rb.node) {
@@ -446,8 +580,8 @@ impl Repo {
                 return Ok(out);
             }
         };
-        let shared: HashSet<Hash> = {
-            let xs: HashSet<Hash> = x.iter().map(|r| r.node).collect();
+        let shared: HashSet<NodeRef> = {
+            let xs: HashSet<NodeRef> = x.iter().map(|r| r.node).collect();
             y.iter()
                 .map(|r| r.node)
                 .filter(|h| xs.contains(h))
@@ -517,7 +651,7 @@ impl Repo {
     /// The entries of a resolved row: a whole node's, or all its chunks'.
     async fn resolved_entries(
         &self,
-        node: Hash,
+        node: NodeRef,
         row: StoredHistoryNode,
     ) -> Result<Vec<(String, HistoryEntry)>> {
         match row {
@@ -530,7 +664,7 @@ impl Repo {
     /// The entries of chunks `run` of the split node `node`, in name order.
     async fn run_entries(
         &self,
-        node: Hash,
+        node: NodeRef,
         refs: &[ChunkRef],
         run: std::ops::Range<usize>,
     ) -> Result<Vec<(String, HistoryEntry)>> {
@@ -552,10 +686,10 @@ impl Repo {
     #[allow(clippy::too_many_arguments)]
     async fn diff_sibling_chunks(
         &self,
-        a: Hash,
+        a: NodeRef,
         x: &[ChunkRef],
         i: usize,
-        b: Hash,
+        b: NodeRef,
         y: &[ChunkRef],
         j: usize,
         out: &mut Vec<(String, Option<HistoryEntry>, Option<HistoryEntry>)>,
@@ -611,11 +745,12 @@ impl Repo {
     }
 
     /// The entry `name` of the node `node`, reading only the chunk that would
-    /// hold it, and a patch's keyframe only when the patch does not settle the
-    /// question: a recently changed name is in the patch.
+    /// hold it. A patch is read with its keyframe, whose entries it names by
+    /// position, but once read a name it sets (a recently changed one) is
+    /// answered from the patch alone.
     pub(crate) async fn history_child(
         &self,
-        node: Hash,
+        node: NodeRef,
         name: &str,
     ) -> Result<Option<HistoryEntry>> {
         let row = self.read_history_row(node).await?;
@@ -682,7 +817,7 @@ impl Repo {
     /// `node` ready for many [`Repo::lookup_child`] calls: a split node's
     /// chunk list is resolved once rather than at each lookup a patch of it
     /// does not settle.
-    pub(crate) async fn node_lookup(&self, node: Hash) -> Result<NodeLookup> {
+    pub(crate) async fn node_lookup(&self, node: NodeRef) -> Result<NodeLookup> {
         let row = self.read_history_row(node).await?;
         Ok(match &*row {
             StoredHistoryNode::Flat(_) | StoredHistoryNode::Patch { .. } => NodeLookup::Row(node),
@@ -700,7 +835,7 @@ impl Repo {
     /// The rows [`Repo::lookup_child`] would read to find `name`, as far as
     /// the cache tells: the row it lands in and, for a cached patch, its
     /// keyframe. For batched reads ahead of lookups.
-    pub(crate) fn lookup_rows(&self, lookup: &NodeLookup, name: &str) -> Vec<Hash> {
+    pub(crate) fn lookup_rows(&self, lookup: &NodeLookup, name: &str) -> Vec<NodeRef> {
         let row = match lookup {
             NodeLookup::Row(node) => *node,
             NodeLookup::Split { refs, .. } => {
@@ -712,7 +847,11 @@ impl Repo {
             }
         };
         let mut out = vec![row];
-        if let Some(base) = self.history_rows.get(&row).and_then(|r| r.base()) {
+        if let Some(base) = self
+            .history_rows
+            .get(&row.cache_key())
+            .and_then(|r| r.base())
+        {
             out.push(base);
         }
         out
@@ -748,7 +887,7 @@ impl Repo {
     /// and against its keyframe's when that is read.
     async fn chunk_child(
         &self,
-        node: Hash,
+        node: NodeRef,
         at: &ChunkAt,
         name: &str,
     ) -> Result<Option<HistoryEntry>> {
@@ -784,7 +923,7 @@ impl Repo {
     /// [`Repo::chunk_child`] for a patched chunk whose patch lacks `name`.
     fn patched_chunk_child(
         &self,
-        node: Hash,
+        node: NodeRef,
         at: &ChunkAt,
         row: &StoredHistoryNode,
         key: &StoredHistoryNode,
@@ -807,58 +946,64 @@ impl Repo {
         Ok(key.entries.get(name).cloned())
     }
 
-    /// Store `node` and return its hash. `base` is the stored node it was
-    /// edited from: rows shared with it are not written again, so an edit to
-    /// a split node writes one chunk and the chunk list, and each changed row
-    /// is a patch on the keyframe of its predecessor in `base` while that is
-    /// small (see `flat_row`). Skipping by `base`, not by the cache, stays
-    /// right after `repair drop`: `base` was stored by the derivation that
-    /// made it, as with untouched subdirectories, but a cached row may since
-    /// have been deleted. The rows depend only on `node` and the stored
-    /// `base`, so derivation stays deterministic; they are content addressed
-    /// and idempotent, so racing derivations are harmless.
+    /// Store `node`, written by `writer`, as the root of `writer`'s pack,
+    /// and return its address. `base` is the stored node it was edited from:
+    /// rows shared with it are not written again, so an edit to a split node
+    /// writes one chunk and the chunk list, and each changed row is a patch
+    /// on the keyframe of its predecessor in `base` while that is small (see
+    /// `flat_row`). The rows depend only on `node`, `writer` and the stored
+    /// `base`, so derivation stays deterministic.
     #[cfg(test)]
     pub(crate) async fn put_history_node(
         &self,
+        writer: ChangesetId,
         node: &HistoryNode,
-        base: Option<Hash>,
-    ) -> Result<Hash> {
-        let mut pending = PendingRows::default();
-        let hash = self.stage_history_node(node, base, &mut pending).await?;
-        self.write_history_rows(pending).await?;
-        Ok(hash)
+        base: Option<NodeRef>,
+    ) -> Result<NodeRef> {
+        let mut pending = PackBuilder::new(writer);
+        let r = self.stage_history_node(node, base, &mut pending).await?;
+        let pack = pending.finish(r);
+        let root = crate::derived::history_pack::decode_root(writer, &pack.value)?;
+        let value = self.write_history_pack(pack).await?;
+        self.meta()
+            .put_derived(HistoryTree::NAME, &writer.0, value)
+            .await?;
+        Ok(root)
     }
 
-    /// [`Repo::put_history_node`] without the write: the rows go to
-    /// `pending`, so a derivation writes all the nodes of a changeset in one
-    /// round trip instead of one per directory.
+    /// [`Repo::put_history_node`] without the write: the nodes go to
+    /// `pending`, the pack of the changeset being derived, and its address
+    /// is returned (the base itself if nothing changed).
     pub(crate) async fn stage_history_node(
         &self,
         node: &HistoryNode,
-        base: Option<Hash>,
-        pending: &mut PendingRows,
-    ) -> Result<Hash> {
+        base: Option<NodeRef>,
+        pending: &mut PackBuilder,
+    ) -> Result<NodeRef> {
+        if node.entries.is_empty() {
+            return Ok(NodeRef::EMPTY);
+        }
         let base_row = match base {
             Some(b) => Some(self.read_resolved(b).await?),
             None => None,
         };
-        let mut known: HashSet<Hash> = HashSet::from([HistoryNode::empty_hash()]);
-        known.extend(base);
-        let mut writes: Vec<HistoryRow> = Vec::new();
         let entries: Vec<(&String, &HistoryEntry)> = node.entries.iter().collect();
         let top = match derived::chunk_ranges(entries.iter().map(|(n, _)| n.as_str())) {
             None => {
+                if let (Some(b), Some(StoredHistoryNode::Flat(n))) =
+                    (base, base_row.as_ref().map(|r| &r.node))
+                {
+                    if n == node {
+                        return Ok(b);
+                    }
+                }
                 let key = match &base_row {
                     Some(b) if matches!(b.node, StoredHistoryNode::Flat(_)) => {
                         Some((b.keyframe, self.read_history_row(b.keyframe).await?))
                     }
                     _ => None,
                 };
-                let key = key.as_ref().and_then(|(h, k)| match &**k {
-                    StoredHistoryNode::Flat(k) => Some((*h, k)),
-                    _ => None,
-                });
-                derived::flat_row(node, key)
+                derived::flat_row(pending.cs, node, key.as_ref().map(|(h, k)| (*h, k)))
             }
             Some(ranges) => {
                 let base_refs = match base_row.as_ref().map(|b| &b.node) {
@@ -877,7 +1022,6 @@ impl Repo {
                         let i = brefs.partition_point(|r| r.first <= first);
                         if i > 0 {
                             let at = brefs[i - 1].node;
-                            known.insert(at);
                             let row = self.read_history_row(at).await?;
                             let row_key = self.history_key(at, &row).await?;
                             if chunk_view(b, brefs, i - 1, &row, row_key.as_deref())? == want {
@@ -890,22 +1034,23 @@ impl Repo {
                             });
                         }
                     }
-                    let key = key.as_ref().and_then(|(h, k)| match &**k {
-                        StoredHistoryNode::Flat(k) => Some((*h, k)),
-                        _ => None,
-                    });
                     let chunk = HistoryNode {
                         entries: want
                             .iter()
                             .map(|(n, e)| ((*n).clone(), (*e).clone()))
                             .collect(),
                     };
-                    let row = derived::flat_row(&chunk, key);
+                    let row =
+                        derived::flat_row(pending.cs, &chunk, key.as_ref().map(|(h, k)| (*h, k)));
                     refs.push(ChunkRef {
                         first,
-                        node: row.hash,
+                        node: stage(pending, row),
                     });
-                    writes.push(row);
+                }
+                if let (Some(b), Some(brefs)) = (base, base_refs) {
+                    if brefs == refs.as_slice() {
+                        return Ok(b);
+                    }
                 }
                 let key = match &base_row {
                     Some(b) if matches!(b.node, StoredHistoryNode::Split(_)) => {
@@ -913,21 +1058,10 @@ impl Repo {
                     }
                     _ => None,
                 };
-                let key = key.as_ref().and_then(|(h, k)| match &**k {
-                    StoredHistoryNode::Split(r) => Some((*h, r.as_slice())),
-                    _ => None,
-                });
-                derived::split_row(refs, key)
+                derived::split_row(pending.cs, refs, key.as_ref().map(|(h, k)| (*h, k)))
             }
         };
-        let hash = top.hash;
-        writes.push(top);
-        for row in writes {
-            if known.insert(row.hash) && pending.seen.insert(row.hash) {
-                pending.rows.push(row);
-            }
-        }
-        Ok(hash)
+        Ok(stage(pending, top))
     }
 
     /// [`Repo::stage_history_node`] of the stored node `base` (or an empty
@@ -946,10 +1080,10 @@ impl Repo {
     /// nodes most of the cost of every changeset.
     pub(crate) async fn stage_history_edit(
         &self,
-        base: Option<Hash>,
+        base: Option<NodeRef>,
         updates: Vec<(String, HistoryEntry)>,
-        pending: &mut PendingRows,
-    ) -> Result<Hash> {
+        pending: &mut PackBuilder,
+    ) -> Result<NodeRef> {
         let Some(b) = base else {
             let node = HistoryNode {
                 entries: updates.into_iter().collect(),
@@ -963,35 +1097,33 @@ impl Repo {
         let refs = match resolved {
             StoredHistoryNode::Split(refs) => refs,
             StoredHistoryNode::Flat(mut node) => {
+                if updates.iter().all(|(n, e)| node.entries.get(n) == Some(e)) {
+                    return Ok(b);
+                }
                 node.entries.extend(updates);
                 if node.entries.len() > derived::FLAT_MAX {
                     return self.stage_history_node(&node, Some(b), pending).await;
                 }
                 // `stage_history_node` for a whole base, which is resolved
                 // already.
+                #[cfg(test)]
+                let mut full = pending.clone();
                 let key = self.read_history_row(keyframe).await?;
-                let key = match &*key {
-                    StoredHistoryNode::Flat(k) => Some((keyframe, k)),
-                    _ => None,
-                };
-                let row = derived::flat_row(&node, key);
-                let hash = row.hash;
+                let row = derived::flat_row(pending.cs, &node, Some((keyframe, &key)));
+                let at = stage(pending, row);
                 #[cfg(test)]
                 {
-                    let mut full = PendingRows::default();
+                    let from = full.len();
                     let want = self.stage_history_node(&node, Some(b), &mut full).await?;
-                    assert_eq!(want, hash, "an edit must store what a full rebuild does");
-                    let rows: Vec<Hash> = full.rows.iter().map(|r| r.hash).collect();
-                    let mine = (hash != b && hash != HistoryNode::empty_hash()).then_some(hash);
-                    assert_eq!(rows, Vec::from_iter(mine));
+                    assert_eq!(want, at, "an edit must store what a full rebuild does");
+                    assert_eq!(pending.tail(from), full.tail(from));
                 }
-                if hash != b && hash != HistoryNode::empty_hash() && pending.seen.insert(hash) {
-                    pending.rows.push(row);
-                }
-                return Ok(hash);
+                return Ok(at);
             }
             _ => unreachable!("resolved rows are Flat or Split"),
         };
+        #[cfg(test)]
+        let mut full = pending.clone();
         #[cfg(test)]
         let joined = {
             let mut node = self.read_history_node(b).await?;
@@ -1016,9 +1148,7 @@ impl Repo {
         self.prefetch_history_rows(wanted.iter().map(|&i| refs[i].node))
             .await;
 
-        let mut known: HashSet<Hash> = HashSet::from([HistoryNode::empty_hash(), b]);
         let mut out: Vec<ChunkRef> = Vec::with_capacity(refs.len() + 1);
-        let mut writes: Vec<HistoryRow> = Vec::new();
         // Base chunks before `next` are passed on or replaced; `next` is 0
         // or follows a boundary name.
         let mut next = 0;
@@ -1075,7 +1205,6 @@ impl Repo {
                 let i = refs.partition_point(|r| r.first <= first);
                 if i > 0 {
                     let at = refs[i - 1].node;
-                    known.insert(at);
                     let row = self.read_history_row(at).await?;
                     let row_key = self.history_key(at, &row).await?;
                     let view = chunk_view(b, &refs, i - 1, &row, row_key.as_deref())?;
@@ -1093,56 +1222,45 @@ impl Repo {
                         None => (at, row),
                     });
                 }
-                let key = key.as_ref().and_then(|(h, k)| match &**k {
-                    StoredHistoryNode::Flat(k) => Some((*h, k)),
-                    _ => None,
-                });
                 let chunk = HistoryNode {
                     entries: want.iter().cloned().collect(),
                 };
-                let row = derived::flat_row(&chunk, key);
+                let row = derived::flat_row(pending.cs, &chunk, key.as_ref().map(|(h, k)| (*h, k)));
                 out.push(ChunkRef {
                     first,
-                    node: row.hash,
+                    node: stage(pending, row),
                 });
-                writes.push(row);
             }
             next = end;
         }
         out.extend_from_slice(&refs[next..]);
-        let key = self.read_history_row(keyframe).await?;
-        let key = match &*key {
-            StoredHistoryNode::Split(r) => Some((keyframe, r.as_slice())),
-            _ => None,
+        let at = if out == refs {
+            b
+        } else {
+            let key = self.read_history_row(keyframe).await?;
+            stage(
+                pending,
+                derived::split_row(pending.cs, out, Some((keyframe, &key))),
+            )
         };
-        let top = derived::split_row(out, key);
-        let hash = top.hash;
-        writes.push(top);
-        let writes: Vec<HistoryRow> = writes
-            .into_iter()
-            .filter(|r| known.insert(r.hash))
-            .collect();
         #[cfg(test)]
         {
-            let mut full = PendingRows::default();
+            let from = full.len();
             let want = self.stage_history_node(&joined, Some(b), &mut full).await?;
-            assert_eq!(want, hash, "an edit must store what a full rebuild does");
-            let got: Vec<Hash> = writes.iter().map(|r| r.hash).collect();
-            let full: Vec<Hash> = full.rows.iter().map(|r| r.hash).collect();
-            assert_eq!(got, full, "an edit must write the rows a full rebuild does");
+            assert_eq!(want, at, "an edit must store what a full rebuild does");
+            assert_eq!(
+                pending.tail(from),
+                full.tail(from),
+                "an edit must write the rows a full rebuild does"
+            );
         }
-        for row in writes {
-            if pending.seen.insert(row.hash) {
-                pending.rows.push(row);
-            }
-        }
-        Ok(hash)
+        Ok(at)
     }
 
     /// The entries of chunk `i` of the split node `node`, checked to fit it.
     async fn chunk_entries(
         &self,
-        node: Hash,
+        node: NodeRef,
         refs: &[ChunkRef],
         i: usize,
     ) -> Result<Vec<(String, HistoryEntry)>> {
@@ -1154,46 +1272,59 @@ impl Repo {
             .collect())
     }
 
-    /// Hand rows staged by [`Repo::stage_history_node`] to a caller that
-    /// writes them later, in order, as `rows`. Until
-    /// [`Repo::unstage_history_rows`], reads find them here, since the cache
-    /// may drop them before they are stored.
-    pub(crate) fn stage_history_rows(&self, pending: PendingRows, rows: &mut Vec<DerivedRow>) {
+    /// Hand a finished pack to a caller that writes it later: its parts
+    /// after the first go to `rows`, in order, and part 0 is returned, the
+    /// changeset's value. Until [`Repo::unstage_history_rows`], reads find
+    /// its nodes here, since the cache may drop them before they are stored.
+    pub(crate) fn stage_history_pack(&self, pack: Pack, rows: &mut Vec<DerivedRow>) -> Bytes {
         let mut staged = self.history_staged.lock().unwrap();
-        for row in pending.rows {
-            let node = Arc::new(row.node);
-            self.history_rows
-                .insert(row.hash, node.clone(), row.bytes.len());
-            staged.insert(row.hash, node);
-            rows.push(DerivedRow::new(NODE_KIND, row.hash, Bytes::from(row.bytes)));
+        for (r, node, size) in pack.nodes {
+            let k = r.cache_key();
+            self.history_rows.insert(k, node.clone(), size);
+            staged.nodes.insert(k, node);
+            staged
+                .by_row
+                .entry(part_row(r.cs, r.part).1)
+                .or_default()
+                .push(k);
         }
+        for (key, bytes) in pack.rows {
+            rows.push(DerivedRow::new(NODE_KIND, key, bytes));
+        }
+        pack.value
     }
 
-    /// Forget staged rows among `rows`, once stored or dropped.
+    /// Forget the staged nodes of the parts among `rows`, once stored or
+    /// dropped.
     pub(crate) fn unstage_history_rows(&self, rows: &[DerivedRow]) {
         let mut staged = self.history_staged.lock().unwrap();
-        for row in rows.iter().filter(|r| r.kind == NODE_KIND) {
-            staged.remove(&row.key);
+        for row in rows
+            .iter()
+            .filter(|r| r.kind == NODE_KIND || r.kind == HistoryTree::NAME)
+        {
+            if let Some(keys) = staged.by_row.remove(&row.key) {
+                for k in keys {
+                    staged.nodes.remove(&k);
+                }
+            }
         }
     }
 
-    /// Store rows staged by [`Repo::stage_history_node`], in staging order.
-    /// Chunks come before the list that names them and children before
-    /// their parents, so any prefix a failed batch leaves behind holds no
-    /// dangling reference.
-    pub(crate) async fn write_history_rows(&self, pending: PendingRows) -> Result<()> {
-        for batch in pending.rows.chunks(WRITE_BATCH) {
+    /// Store a finished pack's parts after the first, in order (children's
+    /// parts before their parents'), and return part 0, the changeset's
+    /// value, for the caller to store last.
+    pub(crate) async fn write_history_pack(&self, pack: Pack) -> Result<Bytes> {
+        for batch in pack.rows.chunks(WRITE_BATCH) {
             let rows: Vec<DerivedRow> = batch
                 .iter()
-                .map(|r| DerivedRow::new(NODE_KIND, r.hash, Bytes::copy_from_slice(&r.bytes)))
+                .map(|(k, v)| DerivedRow::new(NODE_KIND, *k, v.clone()))
                 .collect();
             self.meta().put_derived_many(&rows).await?;
         }
-        for row in pending.rows {
-            let len = row.bytes.len();
-            self.history_rows.insert(row.hash, Arc::new(row.node), len);
+        for (r, node, size) in pack.nodes {
+            self.history_rows.insert(r.cache_key(), node, size);
         }
-        Ok(())
+        Ok(pack.value)
     }
 
     /// Index entry for `path` at `id`: `None` if the path never existed in

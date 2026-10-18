@@ -29,9 +29,12 @@ use super::rows::{describe, expected_blob_row, recompute, RowScan, PAGE};
 use super::shadow::{ShadowBlobs, ShadowMeta};
 use super::walk::{HistoryWalk, Visitor};
 use crate::blame::{cache_key, CachedBlame};
-use crate::derived::{DerivedKind, HistoryTree, StoredHistoryNode};
+use crate::derived::history_pack::{
+    decode_part, decode_root, part_identity, part_key, same_part, RawNode,
+};
+use crate::derived::{DerivedKind, HistoryTree, NodeRef, StoredHistoryNode};
 use crate::gc;
-use crate::path_history::{bad_chunk, chunk_fits, load_history_row, resolve_row};
+use crate::path_history::{bad_chunk, chunk_fits, load_history_row, part_row, resolve_raw_row};
 use crate::search::index::TreeRowMemo;
 use crate::search::{BLOB_KIND as BLOB_TRIGRAMS, TREE_KIND as TREE_TRIGRAMS};
 use crate::signatures::{storage_key as signature_storage_key, REBASED_ORIGIN_KIND};
@@ -298,8 +301,8 @@ struct Verifier<'a> {
     current_ref: Option<String>,
     visited_trees: HashSet<Hash>,
     visited_blobs: HashSet<Hash>,
-    visited_hnodes: HashSet<Hash>,
-    damaged_hnodes: HashSet<Hash>,
+    visited_hnodes: HashSet<NodeRef>,
+    damaged_hnodes: HashSet<NodeRef>,
     pending: Vec<BlobRef>,
     ticker: Ticker,
     phase: &'static str,
@@ -613,7 +616,14 @@ impl Verifier<'_> {
             let deep = self.opts.full;
             self.check_history_nodes(id, &stored, deep).await?;
         }
-        if expected != stored {
+        // Packs are compared by content: zstd versions may compress the same
+        // pack differently (ADR 0045).
+        let same = if kind == HistoryTree::NAME {
+            same_part(&expected, &stored)
+        } else {
+            expected == stored
+        };
+        if !same {
             self.kstats(kind).mismatched += 1;
             self.log.push(
                 Problem::new(
@@ -633,19 +643,21 @@ impl Verifier<'_> {
         Ok(())
     }
 
-    /// The history nodes a stored `history-tree-v3` row leads to, the chunks
-    /// of split ones and the keyframes of patched ones, exist and match their
-    /// addresses: the root only when sampling, all of them when `deep`.
+    /// The history nodes a stored `history-tree-v4` row leads to, the chunks
+    /// of split ones and the keyframes of patched ones, exist and pass their
+    /// parts' checksums: the root only when sampling, all of them when
+    /// `deep`.
     async fn check_history_nodes(
         &mut self,
         id: ChangesetId,
         stored: &[u8],
         deep: bool,
     ) -> Result<()> {
-        let Ok(root) = <[u8; 32]>::try_from(stored) else {
+        // A value that does not decode is reported as a mismatch.
+        let Ok(root) = decode_root(id, stored) else {
             return Ok(());
         };
-        let mut stack = vec![Hash(root)];
+        let mut stack = vec![root];
         while let Some(node) = stack.pop() {
             if !self.visited_hnodes.insert(node) {
                 continue;
@@ -685,7 +697,7 @@ impl Verifier<'_> {
     async fn load_history_node(
         &mut self,
         id: ChangesetId,
-        node: Hash,
+        node: NodeRef,
     ) -> Result<Option<StoredHistoryNode>> {
         let meta = self.repo.meta().clone();
         let row = match load_history_row(&*meta, node).await {
@@ -698,14 +710,21 @@ impl Verifier<'_> {
         let key = match row.base() {
             None => None,
             Some(base) => match load_history_row(&*meta, base).await {
-                Ok((key, _)) => Some(key),
+                Ok((RawNode::Ready(key), _)) => Some(key),
+                Ok(_) => {
+                    let e = Error::Storage(format!(
+                        "corrupt history node {node}: its base is not a keyframe"
+                    ));
+                    self.history_damage(id, node, e)?;
+                    return Ok(None);
+                }
                 Err(e) => {
                     self.history_damage(id, base, e)?;
                     return Ok(None);
                 }
             },
         };
-        match resolve_row(node, row, key.as_ref()) {
+        match resolve_raw_row(node, row, key.as_ref()) {
             Ok(r) => Ok(Some(r.node)),
             Err(e) => {
                 self.history_damage(id, node, e)?;
@@ -716,7 +735,7 @@ impl Verifier<'_> {
 
     /// Report a damaged history node or chunk, or pass on an error that is
     /// not damage.
-    fn history_damage(&mut self, id: ChangesetId, node: Hash, e: Error) -> Result<()> {
+    fn history_damage(&mut self, id: ChangesetId, node: NodeRef, e: Error) -> Result<()> {
         let Some(d) = damage_of(&e) else {
             return Err(e);
         };
@@ -737,7 +756,7 @@ impl Verifier<'_> {
                 ),
             )
             .kind(kinds::HISTORY_NODE)
-            .key(&node)
+            .key(&part_row(node.cs, node.part).1)
             .changeset(id),
         );
         Ok(())
@@ -823,13 +842,16 @@ impl Verifier<'_> {
         while let Some(page) = scan.next(&*meta).await? {
             for (key, value) in page {
                 self.kstats(kind).checked += 1;
-                let actual = Hash::of_object(kind, &value);
-                let why = if actual != key {
-                    Some(format!("holds bytes that hash to {actual}"))
-                } else {
-                    StoredHistoryNode::decode(&value)
+                // A part names its writer and number, which its key and
+                // checksum are made from.
+                let why = match part_identity(&value) {
+                    Err(e) => Some(format!("does not decode: {e}")),
+                    Ok((cs, part)) if part == 0 || part_key(cs, part) != key => Some(format!(
+                        "holds part {part} of the pack of {cs}, which belongs under another key"
+                    )),
+                    Ok((cs, part)) => decode_part(&value, cs, part)
                         .err()
-                        .map(|e| format!("does not decode: {e}"))
+                        .map(|e| format!("does not decode: {e}")),
                 };
                 if let Some(why) = why {
                     self.kstats(kind).mismatched += 1;

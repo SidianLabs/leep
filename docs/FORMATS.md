@@ -44,17 +44,19 @@ skill.
 | derived `gc-mark-v1` | — | `MetaStore.derived`, key = changeset id, tree node hash or blob hash, value = the single byte `0x01` (anything else reads as absent). Written by GC marks in post-order, so a row exists only after the rows of everything below it (ADR 0033) |
 | derived `blob-trigrams-v1` | — | `MetaStore.derived`, key = blob hash, value = see "Code search index" below |
 | derived `tree-trigrams-v1` | — | `MetaStore.derived`, key = tree node hash (`TreeNode::hash()`), value = see "Code search index" below |
-| derived `history-tree-v3` | — | `MetaStore.derived`, key = changeset id, value = 32 raw bytes (address of that changeset's root history node) |
-| `StoredHistoryNode` | `history-node-v3` | `MetaStore.derived` (kind `history-node-v3`), key = `Hash::of_object("history-node-v3", postcard(row))`, value = the postcard bytes; a whole node, a chunk of one, a split node's chunk list (ADR 0027), or a patch of a node, chunk or list on an earlier whole version (ADR 0037) |
+| derived `history-tree-v4` | — | `MetaStore.derived`, key = changeset id, value = part 0 of the changeset's history pack (ADR 0045): the history nodes its derivation wrote, and its root node's address |
+| history pack part | `history-node-v4` | `MetaStore.derived` (kind `history-node-v4`), key = `Hash::of_object("history-node-v4", changeset id ‖ part as u32 LE)`, value = part 1 and up of a pack that did not fit in one |
 | retired `history-tree-v1`, `history-node-v1` | — | written by servers before ADR 0027; never read by current servers; removed with `repair drop --kind history-tree-v1` |
 | retired `history-tree-v2`, `history-node-v2` | — | written by servers from ADR 0027 to ADR 0037; never read by current servers; removed with `repair drop --kind history-tree-v2` |
+| retired `history-tree-v3`, `history-node-v3` | — | written by servers from ADR 0037 to ADR 0045 (one content-addressed postcard row per node, chunk, list or patch, keyed by `Hash::of_object("history-node-v3", bytes)`); never read by current servers; removed with `repair drop --kind history-tree-v3` |
 | other derived kinds | — | owned and versioned by `leep-derive` |
 
 ## Integrity on read
 
-Content-addressed data is verified when read: `Repo::read_tree` and
-`read_history_row` hash the stored bytes and compare them with the key, and
-the SQL backends decode a changeset and compare its id with its row key. A
+Content-addressed data is verified when read: `Repo::read_tree` hashes the
+stored bytes and compares them with the key, the SQL backends decode a
+changeset and compare its id with its row key, and a history pack's part is
+checked against its checksum, which covers its writer and number. A
 mismatch is `Error::Storage`. File blobs and the other derived kinds are not
 verified (ADR 0021 lists which).
 
@@ -171,108 +173,148 @@ The `/v1/search/{rev}` endpoint only adds an endpoint and types (`SearchResponse
 Ranges are byte offsets into the returned (possibly cut) `line`.
 ## Path-history index (new derived kinds, no change to `Changeset`)
 
-ADR 0013, stored in chunks since ADR 0027 and as patches since ADR 0037. The
-logical node is
+ADR 0013, stored in chunks since ADR 0027, as patches since ADR 0037 and in
+one pack per changeset since ADR 0045. The logical node is
 `leep_derive::derived::HistoryNode { entries: BTreeMap<String, HistoryEntry> }`,
-keyed by single path components, postcard-encoded. `HistoryEntry` is an
-externally tagged enum, **variant order is format**:
-`Leaf { changed: Vec<ChangesetId> }` (variant 0) and
-`Tree { changed: Vec<ChangesetId>, node: Hash }` (variant 1). `changed` is a
-sorted (by id bytes), deduplicated set of changeset ids, serialized as a
-varint length and 32 raw bytes per id; `node` is 32 raw bytes, the address of
-the children's node. Example, a node with `a` (Leaf, one id) and `d` (Tree,
-two ids):
+keyed by single path components. `HistoryEntry` is
+`Leaf { changed: Vec<ChangesetId> }` or
+`Tree { changed: Vec<ChangesetId>, node: NodeRef }`. `changed` is a sorted
+(by id bytes), deduplicated set of changeset ids; `node` is where the
+children's node is stored. The meaning of `changed` (the maximal changesets
+whose entry at the path differs from their first parent's; merges take the
+union of parents' sets for paths they leave as in `parents[0]`) is part of
+the format. Entries of deleted paths are kept.
 
-```
-02 | 01 61 00 01 <32 bytes id1> | 01 64 01 02 <32 bytes id1> <32 bytes id2> <32 bytes node>
-```
+**Stored nodes.** A node is stored as one `StoredHistoryNode`, or as a chunk
+list and chunks:
 
-A node is stored as one or more `history-node-v3` rows, each a postcard
-`StoredHistoryNode`, an externally tagged enum (**variant order is format**).
-`Flat` and `Split` are keyframes; `Patch` and `SplitPatch` are edits of one.
+- `Flat(HistoryNode)`: the whole node. Used for nodes of at most 64 entries,
+  and for every chunk. The empty node is never stored; its address
+  `NodeRef::EMPTY` (the zero changeset id, part 0, index 0) is always
+  present.
+- `Split(Vec<ChunkRef>)`, `ChunkRef { first, node }`: a node of more than 64
+  entries, cut into runs of entries in name order. A chunk ends after an
+  entry whose name `n` has `Hash::of_object("history-chunk-boundary", n)`
+  with its first byte's low 5 bits zero (about one name in 32), or when it
+  reaches 128 entries, or at the last entry.
+- `Patch { base, over }`: the `Flat` node `base` with the entries of `over`
+  added or replaced.
+- `SplitPatch { base, refs }`: the `Split` node `base` with the chunk whose
+  first name is each key set (`Some`) or removed (`None`).
 
-- `Flat(HistoryNode)` (variant 0): the whole node. Used for nodes of at most
-  64 entries, and for every chunk. The example above is stored as
-  `00 02 01 61 00 01 ...`. The empty node is `00 00`; it is never stored, and
-  readers treat its address as present.
-- `Split(Vec<ChunkRef>)` (variant 1), `ChunkRef { first: String, node: Hash }`:
-  a node of more than 64 entries, cut into runs of entries in name order. Each
-  chunk is a `Flat` or `Patch` row; `first` is its first name and `node` its
-  address. A chunk ends after an entry whose name `n` has
-  `Hash::of_object("history-chunk-boundary", n)` with its first byte's low 5
-  bits zero (about one name in 32), or when it reaches 128 entries, or at the
-  last entry. Boundaries depend only on names, so an edit rewrites one chunk
-  and an insert at most two. Example, a directory of 1,000 names
-  `f0000`..`f0999` (the first boundary is after `f0029`), 33 chunks:
+A patch's `base` must be a keyframe (`Flat` or `Split`) of its shape, never
+another patch. For each whole node, chunk and chunk list that changed, with
+`K` the keyframe of its predecessor (the first parent's version of the same
+node; for a chunk, the predecessor's chunk whose range holds its first
+name), the stored node is:
 
-```
-01 21 | 05 66 30 30 30 30 <32 bytes chunk 0> | 05 66 30 30 33 30 <32 bytes chunk 1> | ...
-```
-
-- `Patch { base: Hash, over: HistoryNode }` (variant 2): the `Flat` row
-  `base` with the entries of `over` added or replaced. Example, `a` set on the
-  keyframe `<base>`:
-
-```
-02 <32 bytes base> | 01 | 01 61 00 01 <32 bytes id1>
-```
-
-- `SplitPatch { base: Hash, refs: BTreeMap<String, Option<SplitChange>> }`
-  (variant 3), `SplitChange { node: Hash, next: Option<String> }`: the
-  `Split` row `base` with the chunk whose first name is the key set to `node`
-  (`Some`) or removed (`None`). `next` is the first name of the chunk after
-  it in the patched list (`None` if last), so a lookup that falls in a set
-  chunk's range needs no read of `base`; it must match the patched list.
-  Example, chunk `a` set (next `q`) and chunk `m` removed:
-
-```
-03 <32 bytes base> | 02 | 01 61 01 <32 bytes chunk> 01 01 71 | 01 6d 00
-```
-
-A patch's `base` must be a keyframe of the patch's shape (`Flat` for `Patch`,
-`Split` for `SplitPatch`), never another patch, so any row reads in at most
-two rows. Rows are written by `put_history_node` from the new logical node and
-the stored predecessor, the first parent's version of the same node. The
-predecessor of a chunk is the predecessor node's chunk whose range holds the
-new chunk's first name. For each whole node, chunk and chunk list that
-changed, with `K` the predecessor's keyframe (the predecessor itself if it is
-one), the row is:
-
-- `K` itself, if the content equals `K`;
+- `K` itself, if the content equals `K`, and the predecessor itself if the
+  content equals it;
 - otherwise a patch on `K` of the entries (or refs) that differ, if every
-  name of `K` is still present and the patch's encoded length `p` satisfies
-  `p² <= 128 × w`, where `w` is the encoded length of the whole row;
-- otherwise the whole row, a new keyframe.
+  name of `K` is still present and `p² <= 96 × w`, where `p` and `w` are
+  `history_pack::cost` of the patch and of the whole node (the bytes each
+  takes encoded as below, in a part of its own with its own id table: 32
+  bytes per distinct id other than the writer's, and three per reference to
+  a node of the same pack);
+- otherwise the whole node, a new keyframe.
 
-Unchanged chunks keep their address. With no predecessor, or one of the other
-shape, every row is a keyframe.
+Unchanged chunks keep their address.
 
-A node's address (the `history-tree-v3` value, and `Tree.node` in its parent)
-is the hash of its top row. Rows depend only on the content and the stored
-predecessor, so derivation is deterministic, but the same logical node can be
-stored under more than one address when reached from different predecessors.
-Readers check that each chunk starts with its `first`, ends before the next
-chunk's `first`, and that a patch fits its keyframe; a split node of `n`
-entries needs about `n / 32` refs, one level deep.
+**Addresses.** A node's address is a `NodeRef { cs, part, idx }`: node `idx`
+of part `part` of the pack written by changeset `cs`'s derivation.
 
-The golden bytes, the boundary choice and the patch rule are asserted in
-`leep-derive` (`node_encoding_is_stable`, `chunk_boundaries_are_stable`,
-`patches_are_chosen_while_small_and_name_their_keyframe`). Rows are
-content-addressed and idempotent. The meaning of `changed` (the maximal
-changesets whose entry at the path differs from their first parent's; merges
-take the union of parents' sets for paths they leave as in `parents[0]`) is
-part of the format: changing it, the field or variant order, the split rule,
-the patch rule or the key derivation requires `history-tree-v4` and
-`history-node-v4`. Entries of deleted paths are kept. The API addition
-(`GET /v1/last-change/{id}`) adds one endpoint and one response type;
-`/v1/log` is unchanged.
+**Packs.** A changeset's derivation writes every node it creates into its
+pack, children before the nodes that name them, and cuts the sequence into
+parts: a node goes into the current part unless the part already holds a
+node and would then exceed 16,384 bytes (counting its node bytes and id
+table, before compression); then a new part starts. Parts are numbered from
+the last one cut, which holds the root and is part 0: the changeset's
+`history-tree-v4` value. Parts 1 and up are `history-node-v4` rows. A
+changeset whose history equals its first parent's has a part 0 with no
+nodes, naming that root.
+
+**A part** is
+
+```
+checksum (8 bytes) | encoding (1 byte) | rest
+```
+
+`checksum` is the first 8 bytes of
+`Hash::of_object("history-node-v4", cs ‖ part as u32 LE ‖ rest)`, with
+`rest` uncompressed. `encoding` 0 means `rest` follows as is; 1 means a
+varint of its length and then a zstd frame of it (written at level 3, when
+shorter). Two copies of a part are the same part when their checksums and
+uncompressed `rest` are equal; their compressed bytes may differ between
+zstd versions. `rest` is, with varints in LEB128:
+
+```
+[parts 1 and up: cs (32 bytes) | part (varint)]
+table length (varint) | table ids (32 bytes each)
+[part 0: root (node reference)]
+node count (varint) | each node's length in bytes (varint) | nodes
+```
+
+The table holds the changeset ids the part names other than its writer `cs`.
+An **id** is a varint: 0 for `cs`, `i` for the table's `i`-th id (from 1). A
+**node reference** is an id, then a part and an index (varints). For the
+writer's own pack the part is counted from the part holding the reference
+(the referenced part's number minus this one's), and for another pack it is
+the part's number.
+
+A **name** is front-coded against the previous one (or the empty string):
+the length of the prefix they share (varint), the length of the rest
+(varint), the rest. An **entry** after its name is `(ids << 1) | tree`
+(varint, `tree` 1 for `Tree`), the ids of `changed`, and for `Tree` the node
+reference. Nodes are a tag and a body:
+
+- `0` `Flat`: entry count, then each entry's name and entry.
+- `1` `Split`: chunk count, then each chunk's first name and node reference.
+- `2` `Patch`: the base's node reference, the count of `over`, then each
+  entry of `over`, in name order: a varint `d` and the entry. `d >= 1` names
+  the keyframe's entry at position `prev + d` (positions from 0, `prev`
+  starting at -1 and set to each position named); `d = 0` is followed by a
+  name the keyframe lacks, front-coded against the previous such name.
+- `3` `SplitPatch`: the base's node reference, the count of changes, then
+  each change, in first-name order: its first name as for `Patch` (a step
+  over the keyframe list's chunks, or 0 and a new name), then 0 (removed) or
+  1 and the chunk's node reference. The first name of the chunk after each
+  set chunk is not stored; readers take it from the patched list.
+
+Example: the pack of changeset `w` with one node holding `a` (a file last
+changed by `w` itself) and `ab` (a directory last changed by changeset `c`,
+whose node is node 3 of part 2 of `c`'s pack). Its part 0 is stored
+uncompressed (`encoding` 0) with this `rest`:
+
+```
+01 <32 bytes c> | 00 00 00 | 01 0f | 00 02 | 00 01 61 02 00 | 01 01 62 03 01 01 02 03
+```
+
+(one table id; root: this pack, part 0, node 0; one node of 15 bytes; `Flat`,
+two entries; `a`, one id, leaf, the writer; prefix `a` plus `b`, one id,
+tree, table id 1, node at table id 1, part 2, node 3.)
+
+Readers check each part's checksum, that a part after the first names its
+own writer and number, that each node is exactly its length, that each
+chunk starts with its `first` and ends before the next chunk's `first`, and
+that a patch fits its keyframe; damage is an error, not a wrong answer. A
+node index past a part's nodes is a missing node. The golden bytes, the
+boundary choice and the patch rule are asserted in `leep-derive`
+(`pack_encoding_is_stable`, `chunk_boundaries_are_stable`,
+`patches_are_chosen_while_small_and_name_their_keyframe`). Changing any of
+them, the cut, the field or variant order, the meaning of `changed` or the
+key derivation requires `history-tree-v5` and `history-node-v5`. The API
+addition (`GET /v1/last-change/{id}`) adds one endpoint and one response
+type; `/v1/log` is unchanged.
 
 `history-tree-v1` and `history-node-v1` (ADR 0013 as first written) stored each
-node as one row of the bare `HistoryNode` postcard, keyed by
-`Hash::of_object("history-node-v1", bytes)`. `history-tree-v2` and
-`history-node-v2` (ADR 0027) stored `Flat` and `Split` rows only, keyed by
-`Hash::of_object("history-node-v2", bytes)`. Current servers neither read nor
-write either.
+node as one row of the bare postcard `HistoryNode` (32-byte ids and child
+addresses), keyed by `Hash::of_object("history-node-v1", bytes)`.
+`history-tree-v2` and `history-node-v2` (ADR 0027) stored postcard `Flat` and
+`Split` rows, and `history-tree-v3` and `history-node-v3` (ADR 0037) added
+`Patch` and `SplitPatch` rows (whose list patches stored each set chunk's
+successor), each keyed by `Hash::of_object` of its kind and bytes, with a
+`history-tree-v*` value of 32 bytes, the root's row hash. Current servers
+neither read nor write any of them.
 
 ## Rename detection (no persisted change)
 

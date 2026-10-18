@@ -3168,11 +3168,16 @@ mod path_history {
         tip
     }
 
+    /// Every row of both history kinds: packs' first parts and the rest.
     async fn node_rows(r: &Repo) -> Vec<(Hash, Bytes)> {
-        r.meta()
-            .list_derived(derived::HISTORY_NODE_KIND, None, usize::MAX)
-            .await
-            .unwrap()
+        let mut rows = Vec::new();
+        for kind in [
+            <HistoryTree as derived::DerivedKind>::NAME,
+            derived::HISTORY_NODE_KIND,
+        ] {
+            rows.extend(r.meta().list_derived(kind, None, usize::MAX).await.unwrap());
+        }
+        rows
     }
 
     /// Patches depend only on what each changeset's parents stored, so two
@@ -3188,22 +3193,26 @@ mod path_history {
         derived::derive::<HistoryTree>(&b, middle).await.unwrap();
         derived::derive::<HistoryTree>(&b, tip).await.unwrap();
         let rows = node_rows(&a).await;
-        assert!(rows.len() > 400);
+        assert!(rows.len() > 150);
         assert_eq!(rows, node_rows(&b).await);
-        let tree = <HistoryTree as derived::DerivedKind>::NAME;
-        assert_eq!(
-            a.meta().list_derived(tree, None, usize::MAX).await.unwrap(),
-            b.meta().list_derived(tree, None, usize::MAX).await.unwrap()
-        );
     }
 
-    /// The bytes of every distinct row the same history would take with
-    /// keyframes only (the encoding before ADR 0037): each logical node any
+    /// The bytes the same history would take in whole rows of 32-byte ids
+    /// and addresses (the encoding before ADR 0037): each node version any
     /// changeset's index reaches, stored whole or in whole chunks.
     async fn keyframe_only_bytes(r: &Repo, tip: ChangesetId) -> usize {
-        let mut rows: std::collections::HashMap<Hash, usize> = Default::default();
+        fn node_len(n: &derived::HistoryNode) -> usize {
+            1 + n
+                .entries
+                .iter()
+                .map(|(name, e)| {
+                    2 + name.len() + 1 + 32 * e.changed().len() + 32 * e.node().is_some() as usize
+                })
+                .sum::<usize>()
+        }
         let mut seen = std::collections::HashSet::new();
-        let mut stack: Vec<Hash> = Vec::new();
+        let mut stack = Vec::new();
+        let mut total = 0;
         for info in r.log(tip, None, usize::MAX).await.unwrap() {
             stack.push(r.history_root(info.id).await.unwrap());
         }
@@ -3213,11 +3222,18 @@ mod path_history {
             }
             let node = r.read_history_node(h).await.unwrap();
             stack.extend(node.entries.values().filter_map(|e| e.node()));
-            for row in node.rows() {
-                rows.insert(row.hash, row.bytes.len());
-            }
+            total += match node.chunks() {
+                None => 1 + node_len(&node),
+                Some(chunks) => {
+                    chunks.iter().map(|c| 1 + node_len(c)).sum::<usize>()
+                        + chunks
+                            .iter()
+                            .map(|c| 34 + c.first_name().len())
+                            .sum::<usize>()
+                }
+            };
         }
-        rows.values().sum()
+        total
     }
 
     /// Size regression: patches must keep the index several times smaller
@@ -3230,7 +3246,7 @@ mod path_history {
         let stored: usize = node_rows(&r).await.iter().map(|(_, v)| v.len()).sum();
         let whole = keyframe_only_bytes(&r, tip).await;
         assert!(
-            stored * 3 <= whole,
+            stored * 8 <= whole,
             "stored {stored} bytes, {whole} with keyframes only ({:.2}x)",
             whole as f64 / stored as f64
         );
@@ -3310,14 +3326,26 @@ mod path_history {
             }
             let rows = r
                 .meta()
-                .list_derived(crate::derived::HISTORY_NODE_KIND, None, usize::MAX)
+                .list_derived(
+                    <HistoryTree as derived::DerivedKind>::NAME,
+                    None,
+                    usize::MAX,
+                )
                 .await
                 .unwrap();
-            split |= rows.iter().any(|(_, v)| {
-                matches!(
-                    crate::derived::StoredHistoryNode::decode(v),
-                    Ok(crate::derived::StoredHistoryNode::Split(_))
-                )
+            split |= rows.iter().any(|(k, v)| {
+                crate::derived::history_pack::decode_part(v, ChangesetId(*k), 0)
+                    .unwrap()
+                    .nodes
+                    .iter()
+                    .any(|(n, _)| {
+                        matches!(
+                            n,
+                            crate::derived::history_pack::RawNode::Ready(
+                                crate::derived::StoredHistoryNode::Split(_)
+                            )
+                        )
+                    })
             });
         }
         split
