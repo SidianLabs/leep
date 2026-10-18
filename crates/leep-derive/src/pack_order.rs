@@ -288,20 +288,25 @@ impl Walk {
             self.objects.push((tree_id, base));
             // Shared: the parent's node read here is usually the node the
             // parent's own walk just read.
-            let node = repo.read_tree_shared(tree).await?;
+            let node = repo.read_tree_view(tree).await?;
             let old_node = match old_id {
                 NO_ID => None,
                 o if *self.ids.hash(o) == empty => None,
-                o => Some(repo.read_tree_shared(*self.ids.hash(o)).await?),
+                o => Some(repo.read_tree_view(*self.ids.hash(o)).await?),
             };
-            for (name, entry) in &node.entries {
+            for item in node.entries() {
+                let (name, entry) = item?;
                 let child_path = if path.is_empty() {
-                    name.clone()
+                    name.to_string()
                 } else {
                     format!("{path}/{name}")
                 };
-                let before = old_node.as_ref().and_then(|n| n.entries.get(name));
-                match entry {
+                let before = match &old_node {
+                    Some(n) => n.get(name)?,
+                    None => None,
+                };
+                let before = before.as_ref();
+                match &entry {
                     TreeEntry::File { content, .. } => {
                         let content_id = self.id(content);
                         if !self.see(content_id) {

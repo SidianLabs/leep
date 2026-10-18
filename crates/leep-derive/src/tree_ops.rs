@@ -447,6 +447,17 @@ impl TreeView {
         ))
     }
 
+    /// Every entry in name order.
+    pub(crate) fn entries(&self) -> impl Iterator<Item = Result<(&str, TreeEntry)>> + '_ {
+        self.index.iter().map(|&(at, len, entry)| {
+            // `scan` checked the name is UTF-8.
+            let name = std::str::from_utf8(&self.bytes[at as usize..(at + len) as usize])
+                .map_err(|e| Error::Encoding(e.to_string()))?;
+            let entry = postcard::take_from_bytes::<TreeEntry>(&self.bytes[entry as usize..])?.0;
+            Ok((name, entry))
+        })
+    }
+
     /// About the memory it holds, for cache accounting.
     pub(crate) fn size(&self) -> usize {
         self.bytes.len() + 12 * self.index.len()
