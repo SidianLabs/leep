@@ -3,7 +3,9 @@
 use bytes::Bytes;
 use leep_core::{Changeset, ChangesetId, Error, Hash, MetaStore, Result};
 
-use crate::derived::{self, DerivedKind, Generation, HistoryTree, LastMerge, RootTree, Skiplist};
+use crate::derived::{
+    self, DerivedKind, Generation, HistoryTree, LastMerge, LogFilterIndex, RootTree, Skiplist,
+};
 use crate::search::trigram::BlobRow;
 use crate::Repo;
 
@@ -41,6 +43,8 @@ pub(crate) async fn recompute(
         recompute_with::<RootTree>(repo, id, cs).await
     } else if kind == HistoryTree::NAME {
         recompute_with::<HistoryTree>(repo, id, cs).await
+    } else if kind == LogFilterIndex::NAME {
+        recompute_with::<LogFilterIndex>(repo, id, cs).await
     } else {
         Err(Error::Other(format!("{kind} is not a per-changeset kind")))
     }

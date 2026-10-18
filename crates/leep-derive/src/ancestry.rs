@@ -185,7 +185,10 @@ impl Repo {
 
     /// Skiplist of `id`. The generations it names are kept, so riding it
     /// down does not read them again.
-    async fn skiplist_noting_generations(&self, id: ChangesetId) -> Result<Arc<[SkipEntry]>> {
+    pub(crate) async fn skiplist_noting_generations(
+        &self,
+        id: ChangesetId,
+    ) -> Result<Arc<[SkipEntry]>> {
         let reads = SKIPLIST_READS.try_with(|c| c.clone()).ok().flatten();
         let list = match reads.as_ref().and_then(|c| c.get(&id)) {
             Some(list) => list,

@@ -2,9 +2,8 @@
 //!
 //! Path queries use the path-history index (`path_history`). Filters on
 //! `extra` and `author` are applied to the changesets that walk yields, and
-//! without a path they are evaluated by a linear walk over history, so a
-//! selective filter on a deep history scans all of it. An index over
-//! `agent.*` keys is future work.
+//! without a path they are answered with the `log-filter-v1` index
+//! (`filter_log`), which skips stretches of history without a match.
 
 use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 
@@ -74,24 +73,29 @@ impl LogFilter {
 /// Iterative newest-first walk over all parents; histories are too deep to
 /// recurse over. Reads ahead in batches (see [`ReadAhead`]) without changing
 /// the order or the set of changesets it yields.
-struct Walk {
-    seen: HashSet<ChangesetId>,
-    heap: BinaryHeap<(u64, ChangesetId)>,
+pub(crate) struct Walk {
+    pub(crate) seen: HashSet<ChangesetId>,
+    pub(crate) heap: BinaryHeap<(u64, ChangesetId)>,
     ahead: ReadAhead,
 }
 
 /// One changeset a [`Walk`] yields, with its root tree if it was read ahead.
-struct Step {
-    generation: u64,
-    id: ChangesetId,
-    cs: Changeset,
-    root: Option<Hash>,
+pub(crate) struct Step {
+    pub(crate) generation: u64,
+    pub(crate) id: ChangesetId,
+    pub(crate) cs: Changeset,
+    pub(crate) root: Option<Hash>,
 }
 
 impl Walk {
     /// `roots`: also read ahead root trees. `want`: how many changesets the
     /// caller expects to visit, which bounds the first read-ahead.
-    async fn start(repo: &Repo, id: ChangesetId, roots: bool, want: usize) -> Result<Self> {
+    pub(crate) async fn start(
+        repo: &Repo,
+        id: ChangesetId,
+        roots: bool,
+        want: usize,
+    ) -> Result<Self> {
         let mut ahead = ReadAhead::new(roots);
         ahead.ensure(repo, &[id], u64::MAX, want).await;
         Ok(Walk {
@@ -101,12 +105,12 @@ impl Walk {
         })
     }
 
-    fn is_done(&self) -> bool {
+    pub(crate) fn is_done(&self) -> bool {
         self.heap.is_empty()
     }
 
     /// The next changeset; `want` as in [`Walk::start`], counting this one.
-    async fn next(&mut self, repo: &Repo, want: usize) -> Result<Option<Step>> {
+    pub(crate) async fn next(&mut self, repo: &Repo, want: usize) -> Result<Option<Step>> {
         let Some((generation, cid)) = self.heap.pop() else {
             return Ok(None);
         };
@@ -187,7 +191,8 @@ impl Repo {
     ) -> Result<Vec<ChangesetInfo>> {
         match norm(path) {
             Some(path) => self.log_indexed(id, path, limit, filter).await,
-            None => self.log_scan(id, None, limit, filter).await,
+            None if filter.is_empty() => self.log_scan(id, None, limit, filter).await,
+            None => self.log_by_filter(id, limit, filter).await,
         }
     }
 
