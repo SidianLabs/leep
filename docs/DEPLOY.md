@@ -3,7 +3,11 @@
 Authentication is **off unless you give the server a tokens file**, and
 `leep-server` never terminates TLS. For anything beyond localhost, enable
 tokens (below) and put a TLS-terminating reverse proxy in front: bearer
-tokens must not cross untrusted networks in cleartext.
+tokens must not cross untrusted networks in cleartext. Without a tokens file
+the server refuses to listen on anything but a loopback address unless
+`LEEP_INSECURE_NO_AUTH=1` (`--insecure-no-auth`) is set. The image listens on
+`0.0.0.0:7070`, so the local examples below set it and publish the port on the
+host's loopback only.
 
 The repo `Dockerfile` builds `leep-server`, `leep` and `leep-git` into one
 `debian:bookworm-slim` image. The entrypoint is `leep-server`; it runs as the
@@ -17,7 +21,7 @@ docker build -t leep:dev .
 
 ```sh
 docker run -d --name leep -p 127.0.0.1:7070:7070 \
-  -v leep-data:/var/lib/leep leep:dev
+  -e LEEP_INSECURE_NO_AUTH=1 -v leep-data:/var/lib/leep leep:dev
 curl -s localhost:7070/v1/health      # "ok": the process is up
 curl -s localhost:7070/v1/ready       # {"status":"ready"}: it can reach its stores
 ```
@@ -168,7 +172,7 @@ and any entry in the tokens file can override them, or opt out with
 | Rate | `--rate-limit` / `LEEP_RATE_LIMIT` | `rate` | Requests per second, as a decimal (`0.5` is one per two seconds). Reads and writes have separate buckets with these parameters. |
 | Burst | `--rate-burst` / `LEEP_RATE_BURST` | `burst` | Requests allowed at once; default is the rate rounded up. Needs a rate. |
 | Concurrency | `--max-concurrent-per-token` / `LEEP_MAX_CONCURRENT_PER_TOKEN` | `concurrency` | Requests in flight, reads and writes together. More are refused, not queued. |
-| Body size | `--read-max-body-bytes` / `LEEP_READ_MAX_BODY_BYTES` (read tokens only) | `max_body` | Largest request body in bytes. `--max-body-bytes` still caps everyone. |
+| Body size | `--read-max-body-bytes` / `LEEP_READ_MAX_BODY_BYTES` (read tokens only; default 1 MiB) | `max_body` | Largest request body in bytes. `--max-body-bytes` still caps everyone. |
 
 A token that sets `rate` but not `burst` uses `--rate-burst` if given, else its
 rate rounded up. Bad values (zero, negative, a burst without a rate, a read body
@@ -196,7 +200,9 @@ keys you list, and can refuse to land unsigned work on chosen refs (ADR 0010).
 leep keygen --out ~/.config/leep/alice.key --name alice   # prints the keys-file entry
 echo '{"keys":[<entries, comma separated>]}' > signing-keys.json
 docker run -d -p 127.0.0.1:7070:7070 -v leep-data:/var/lib/leep \
+  -v "$PWD/tokens.json:/etc/leep/tokens.json:ro" \
   -v "$PWD/signing-keys.json:/etc/leep/signing-keys.json:ro" \
+  -e LEEP_TOKENS_FILE=/etc/leep/tokens.json \
   -e LEEP_SIGNING_KEYS_FILE=/etc/leep/signing-keys.json \
   -e LEEP_REQUIRE_SIGNATURES=main leep:dev
 ```
@@ -311,6 +317,7 @@ a reload is refused.
 | `LEEP_META` | `sqlite:///var/lib/leep/meta.db?mode=rwc` | Metadata store: `sqlite:`, `postgres://`, `mem://`. |
 | `LEEP_BLOBS` | `file:///var/lib/leep/blobs` | Blob store: `file://`, `s3://bucket?endpoint=URL&region=R&allow_http=true`, `mem://`. |
 | `LEEP_TOKENS_FILE` | none | Tokens file; enables authentication. |
+| `LEEP_INSECURE_NO_AUTH` | off | `1` lets the server run without a tokens file on a non-loopback address (the image's default listen address). Only for a port published on loopback or behind a proxy that authenticates. |
 | `LEEP_SIGNING_KEYS_FILE` | none | Trusted author keys file; enables signature submission. |
 | `LEEP_REQUIRE_SIGNATURES` | none | Comma-separated refs that only accept signed lands; needs the keys file. |
 | `LEEP_REVIEW_POLICY_FILE` | none | Review policy JSON (auto-approval rules, refs that require review); needs the tokens file. |
@@ -321,7 +328,7 @@ a reload is refused.
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | none | S3 credentials (standard AWS variables). |
 | `LEEP_RATE_LIMIT`, `LEEP_RATE_BURST` | none | Per-token request rate and burst; see [Request limits](#request-limits). |
 | `LEEP_MAX_CONCURRENT_PER_TOKEN` | none | Requests in flight per token. |
-| `LEEP_READ_MAX_BODY_BYTES` | none | Body size cap for read tokens; needs the tokens file. |
+| `LEEP_READ_MAX_BODY_BYTES` | 1 MiB with a tokens file | Body size cap for read tokens; needs the tokens file. |
 | `LEEP_NO_MIGRATE` | off | `1` makes the server (and `gc`, `derive-search`) refuse to start while metadata schema migrations are pending instead of applying them; see [Upgrades](#upgrades). |
 | `LEEP_REQUEST_TIMEOUT` | `5m` | Abort any request that runs longer (`90s`, `5m`; `0` disables). `leep-server gc --fence` must exceed it; see [OPERATIONS.md](OPERATIONS.md#blob-garbage-collection). |
 | `LEEP_WARM_INTERVAL` | `30s` | How often the background warmer looks for moved refs and derives their path-history and search indexes (ADR 0028); `0` turns it off. With several servers on one metadata store, one warmer is enough. |

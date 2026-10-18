@@ -651,11 +651,13 @@ Authentication is static bearer tokens ([ADR 0007](adr/0007-token-authentication
 `leep-server --tokens-file <PATH>` (or `LEEP_TOKENS_FILE`) loads a JSON file of
 `{name, role, hash}` entries, where `hash` is `blake3:<hex>` of the token; the
 file is read at startup and on SIGHUP (see Config reload below). Without it,
-auth is off and the server warns.
+auth is off and the server warns, and it refuses a non-loopback `--listen`
+unless `--insecure-no-auth` is given.
 With it, an axum middleware requires `Authorization: Bearer <token>` on every
 endpoint except `GET /v1/health`: 401 (with `WWW-Authenticate: Bearer`) when the
 token is missing or unknown, 403 when a `read` token makes a mutating request.
-`POST /v1/blobs/missing` counts as read because it only queries. Digests are
+`POST /v1/blobs/missing` counts as read because it only queries; it takes at
+most 10,000 hashes, and read tokens' bodies are capped at 1 MiB by default. Digests are
 compared in constant time, and only the token name is logged. Use
 `leep-server gen-token` and `hash-token` to create entries. Terminate TLS in
 front of the server; bearer tokens are otherwise visible on the wire.

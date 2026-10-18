@@ -263,6 +263,13 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   file with an error naming it, a merge that would produce one is a
   conflict, and ADR 0041 weighs the proper fix (separate store namespaces
   for trees).
+- Safer server defaults. `leep-server` refuses to start on a non-loopback
+  `--listen` without `--tokens-file` unless `--insecure-no-auth`
+  (`LEEP_INSECURE_NO_AUTH=1`) is given; the container image listens on
+  `0.0.0.0`, so it needs one or the other (the compose dev stack sets the
+  variable). `read` tokens' request bodies are capped at 1 MiB by default.
+  `POST /v1/blobs/missing` takes at most 10,000 hashes (400 beyond), and the
+  CLI and MCP client split longer lists.
 
 ### Operations
 - Versioned schema migrations for SQLite and Postgres (ADR 0023). The

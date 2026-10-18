@@ -8,7 +8,7 @@
 //! | GET  | `/v1/ready` | – | [`ReadyResponse`] (readiness: 200 `{"status":"ready"}` when the metadata and blob stores each answered a cheap read within the server's ready timeout, else 503 with `failed` naming the stores) |
 //! | PUT  | `/v1/blobs/{hash}` | raw bytes | 204; 400 if `Hash::of_blob(body) != hash` |
 //! | GET  | `/v1/blobs/{hash}` | – | raw bytes, or 404 |
-//! | POST | `/v1/blobs/missing` | [`MissingBlobsRequest`] | [`MissingBlobsResponse`] |
+//! | POST | `/v1/blobs/missing` | [`MissingBlobsRequest`] | [`MissingBlobsResponse`]; 400 if over [`MAX_MISSING_BLOBS`] hashes |
 //! | POST | `/v1/changesets` | [`Changeset`] | [`CreateChangesetResponse`] |
 //! | GET  | `/v1/changesets/{id}` | – | [`ChangesetInfo`] |
 //! | GET  | `/v1/refs` | – | [`RefsResponse`] |
@@ -139,6 +139,11 @@ pub struct ReadyFailure {
     /// could carry a connection string; the server logs the detail.
     pub reason: String,
 }
+
+/// Most hashes one `POST /v1/blobs/missing` may ask about. Each costs a
+/// metadata read and a claim write, so an unbounded list is an unbounded
+/// request; clients split longer lists.
+pub const MAX_MISSING_BLOBS: usize = 10_000;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MissingBlobsRequest {

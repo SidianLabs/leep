@@ -33,6 +33,10 @@ use tower_http::timeout::TimeoutLayer;
 /// Default cap on request bodies (blob uploads), in bytes.
 pub const DEFAULT_MAX_BODY_BYTES: usize = 512 * 1024 * 1024;
 
+/// Default cap on request bodies from `read` tokens, which cannot upload: the
+/// largest body they send is a `POST /v1/blobs/missing` list.
+pub const DEFAULT_READ_MAX_BODY_BYTES: usize = 1024 * 1024;
+
 /// Default bound on each store check behind `GET /v1/ready`. Short, so a
 /// probe fails fast instead of piling up behind a hung database.
 pub const DEFAULT_READY_TIMEOUT: Duration = Duration::from_secs(2);
@@ -553,6 +557,13 @@ fn octet_stream<const N: usize>(data: Bytes, extra: [(&'static str, &'static str
 
 async fn missing_blobs(State(repo): S, body: Bytes) -> ApiResult<Json<MissingBlobsResponse>> {
     let req: MissingBlobsRequest = parse_json(&body)?;
+    if req.hashes.len() > MAX_MISSING_BLOBS {
+        return Err(Error::Invalid(format!(
+            "at most {MAX_MISSING_BLOBS} hashes per request, got {}; split the list",
+            req.hashes.len()
+        ))
+        .into());
+    }
     let missing = repo.missing_blobs(&req.hashes).await?;
     Ok(Json(MissingBlobsResponse { missing }))
 }

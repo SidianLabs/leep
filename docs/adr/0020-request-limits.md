@@ -128,3 +128,14 @@ See [SECURITY-REVIEW.md](../SECURITY-REVIEW.md).
 - `POST /v1/changesets` refuses a path over 4096 bytes, or paths naming over
   a million directories or 256 MiB of directory names, because building the
   tree needs memory quadratic in path depth (S-04, fixed).
+
+## Tighter defaults, 2026-10-18
+- `read` tokens get a 1 MiB body cap by default when a tokens file is given
+  (`--read-max-body-bytes` or a token's `max_body` overrides it). They cannot
+  upload, and their largest legitimate body is a `POST /v1/blobs/missing`
+  list; the old default was the 512 MiB global cap, which let a read token
+  make one request claim about eight million blobs (see ADR 0007, S-11).
+- `POST /v1/blobs/missing` takes at most 10,000 hashes (`MAX_MISSING_BLOBS`)
+  and answers more with 400. Each hash costs a metadata read and a claim
+  write, so the list bounds the work of one request whatever the token; the
+  CLI and MCP client split longer lists.

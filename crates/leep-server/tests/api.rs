@@ -176,6 +176,35 @@ async fn blobs_put_get_missing() {
 }
 
 #[tokio::test]
+async fn missing_blobs_caps_the_list() {
+    let c = Client::new();
+    let hashes: Vec<Hash> = (0..=MAX_MISSING_BLOBS)
+        .map(|i| Hash::of_blob(&i.to_le_bytes()))
+        .collect();
+    let r = c
+        .post(
+            "/v1/blobs/missing",
+            &MissingBlobsRequest {
+                hashes: hashes.clone(),
+            },
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert!(r.json::<ErrorResponse>().error.contains("at most"));
+    let r = c
+        .post(
+            "/v1/blobs/missing",
+            &MissingBlobsRequest {
+                hashes: hashes[1..].to_vec(),
+            },
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK);
+    let missing = r.json::<MissingBlobsResponse>().missing;
+    assert_eq!(missing.len(), MAX_MISSING_BLOBS);
+}
+
+#[tokio::test]
 async fn blob_errors() {
     let c = Client::new();
     let wrong = Hash::of_blob(b"other");
