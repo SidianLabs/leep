@@ -318,7 +318,8 @@ and those it reads while creating changesets (never rows read by `verify` or
 round does not supply is read or derived singly, as before.
 
 **Land** (`leep land`, the no-merge-queue path), group committed per ref
-within each server process ([ADR 0032](adr/0032-group-commit-for-lands.md)):
+within each server process ([ADR 0032](adr/0032-group-commit-for-lands.md)),
+with the batch's writes staged in memory ([ADR 0043](adr/0043-staged-land-batches.md)):
 ```
 land(cs):  check name/tag/cs; enqueue on queue(target); start a leader if none; await answer
 
@@ -326,8 +327,9 @@ leader(target):  while queue not empty: land_batch(take ≤64 queued, in arrival
 
 land_batch:
 loop (≤32 attempts):
-  start ← get_ref(target);  head ← start
-  for each land (dropped if its caller left before it was reached):
+  start ← get_ref(target);  head ← start;  staging ← empty
+  prefetch the lands' changesets, root trees and the head's rebase links
+  for each land, writing into staging and reading it back (dropped if its caller left before it was reached):
     if head is None:                 move to cs
     elif cs is an ancestor of head:  already landed
     elif head is an ancestor of cs:  move to cs                   # fast-forward
@@ -341,7 +343,9 @@ loop (≤32 attempts):
                    never auto-resolved on the server)
       move to replayed top
     a move sets head; answers that precede every move are sent at once
-  no moves → done
+  no moves → done (staging dropped)
+  store staging: blobs (one wave, GC rescue check), then changesets and rows
+                 (one atomic write); an error counts as a CAS error below
   CAS(start → head) logging one entry per move (cas_ref_logged_chain)
   CAS won → every land gets its answer;  CAS lost → jittered backoff, redo batch
   CAS errored → it may have applied: the next pass re-reads the head and
@@ -355,7 +359,13 @@ the same transaction as the single ref update. Batching is what removed the
 cost of contention: lands on one ref in one process never race the CAS (they
 were serialized by a per-ref lock before), but each paid a ref read, a commit
 and a landed-copy scan as long as the number of agents ahead of it; a batch
-pays the read and commit once and its scans share the rows they read. The CAS
+pays the read and commit once and its scans share the rows they read. Its
+replays write into a staging layer (`land_stage.rs`: a `BlobStore` and a
+`MetaStore` over the real ones that keep writes in memory and serve them back),
+so a replay costs memory reads and CPU instead of a tree fsync wave and a
+transaction; the batch then stores everything with one wave of blob writes and
+one `put_changesets_with_derived` before the swap, in the order a lone write
+keeps, so the ref never names an object that is not durable. The CAS
 still coordinates separate server processes; a lost swap redoes the batch, and
 jittered backoff keeps processes from colliding in lockstep. The leader is a
 spawned task, so a cancelled request cannot stop a batch; a land cancelled

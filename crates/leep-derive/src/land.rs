@@ -13,6 +13,7 @@ use leep_core::refname::{self, MISSING_REF_MARKER, NOT_FORWARD_MARKER};
 use leep_core::{ChangesetId, Error, RefStep, RefUpdateContext, Result};
 use tokio::sync::oneshot;
 
+use crate::land_stage::Staging;
 use crate::Repo;
 
 /// Lands within one process are batched per ref, so losses only come from
@@ -328,9 +329,26 @@ impl Repo {
                 }
             };
             let mut head = start;
+            // The replays write here; it is stored just before the ref moves.
+            let staging = Arc::new(Staging::default());
+            let ids: Vec<ChangesetId> = lands.iter().map(|l| l.q.cs).collect();
+            let staged = staging.repo(self);
             // Origins read by this attempt's landed-copy scans: the lands
             // of a batch walk the same stretch of history.
-            let mut origins = HashMap::new();
+            let (_, mut origins) = tokio::join!(
+                async {
+                    // A lone land reads no more than the prefetch would.
+                    if ids.len() > 1 {
+                        staging.prefetch(self, &ids).await;
+                    }
+                },
+                async {
+                    match start {
+                        Some(h) => staged.prefetch_origins(h, &ids).await,
+                        None => HashMap::new(),
+                    }
+                }
+            );
             let mut steps: Vec<RefStep> = Vec::new();
             let mut waiting: Vec<(InFlight, Result<Step>)> = Vec::new();
             let mut taken = Vec::new();
@@ -340,7 +358,7 @@ impl Repo {
                     continue;
                 }
                 taken.push(l.q.cs);
-                let repo = l.q.repo.clone();
+                let repo = staging.repo(&l.q.repo);
                 let step = repo
                     .land_step(
                         l.q.cs,
@@ -374,15 +392,10 @@ impl Repo {
             if steps.is_empty() {
                 return;
             }
-            let applied = if let [step] = &steps[..] {
-                self.meta()
-                    .cas_ref_logged(target_ref, start, step.new, &step.ctx)
-                    .await
-                    .map(usize::from)
-            } else {
-                self.meta()
-                    .cas_ref_logged_chain(target_ref, start, &steps)
-                    .await
+            let flushed = staging.flush(self).await;
+            let applied = match flushed {
+                Err(e) => Err(e),
+                Ok(()) => self.commit_steps(target_ref, start, &steps).await,
             };
             match applied {
                 Ok(n) => {
@@ -445,6 +458,68 @@ impl Repo {
         }
     }
 
+    /// One land the way it ran before batches were staged: replayed straight
+    /// into the stores, then swapped. The oracle staged batches are checked
+    /// against.
+    #[cfg(test)]
+    pub(crate) async fn land_unstaged(
+        &self,
+        cs: ChangesetId,
+        target_ref: &str,
+        actor: Option<&str>,
+    ) -> Result<LandResponse> {
+        let ctx = RefUpdateContext::new("land")
+            .actor(actor)
+            .message(format!("landed {cs}"));
+        let head = self.meta().get_ref(target_ref).await?;
+        let step = self
+            .land_step(
+                cs,
+                true,
+                head,
+                target_ref,
+                1,
+                &mut Checked::default(),
+                &mut HashMap::new(),
+            )
+            .await?;
+        match step {
+            Step::Done(resp) => Ok(resp),
+            Step::Move(new) => {
+                let step = RefStep {
+                    new: Some(new),
+                    ctx,
+                };
+                assert_eq!(self.commit_steps(target_ref, head, &[step]).await?, 1);
+                Ok(LandResponse::Landed {
+                    landed: new,
+                    rebased: new != cs,
+                    attempts: 1,
+                })
+            }
+        }
+    }
+
+    /// Move the ref through `steps` from `start`; a batch of one makes the
+    /// statements a lone land always made.
+    async fn commit_steps(
+        &self,
+        target_ref: &str,
+        start: Option<ChangesetId>,
+        steps: &[RefStep],
+    ) -> Result<usize> {
+        if let [step] = steps {
+            self.meta()
+                .cas_ref_logged(target_ref, start, step.new, &step.ctx)
+                .await
+                .map(usize::from)
+        } else {
+            self.meta()
+                .cas_ref_logged_chain(target_ref, start, steps)
+                .await
+        }
+    }
+
     /// What landing `cs` does on top of `head`: what one attempt of a lone
     /// land did between reading the head and swapping it.
     #[allow(clippy::too_many_arguments)]
@@ -496,6 +571,68 @@ impl Repo {
             },
             _ => Ok(Step::Move(cs)),
         }
+    }
+
+    /// Read in one round trip the `rebased-origin-v1` rows the batch's
+    /// landed-copy scans will want: those of `head`'s ancestors above the
+    /// lowest generation among `ids`, as far as [`landed_copy`] walks and
+    /// this process already knows the ancestry, so the walk itself reads
+    /// nothing. The first scan of a batch otherwise reads them one by one.
+    /// Anything not read here the scans read as before.
+    ///
+    /// [`landed_copy`]: Self::landed_copy
+    async fn prefetch_origins(
+        &self,
+        head: ChangesetId,
+        ids: &[ChangesetId],
+    ) -> HashMap<ChangesetId, Option<ChangesetId>> {
+        let mut origins = HashMap::new();
+        let Some(floor) = ids
+            .iter()
+            .filter_map(|id| self.cached_generation(*id))
+            .min()
+        else {
+            return origins;
+        };
+        let mut want = Vec::new();
+        let mut seen = HashSet::from([head]);
+        let mut stack = vec![head];
+        while let Some(id) = stack.pop() {
+            if !self.cached_generation(id).is_some_and(|g| g > floor) {
+                continue;
+            }
+            want.push(id);
+            if want.len() >= LANDED_COPY_SCAN {
+                break;
+            }
+            if let Some(parents) = self.cached_parents(id) {
+                stack.extend(parents.iter().filter(|p| seen.insert(**p)));
+            }
+        }
+        if want.is_empty() {
+            return origins;
+        }
+        let keys: Vec<_> = want.iter().map(|id| id.0).collect();
+        let Ok(rows) = self
+            .meta()
+            .get_derived_many(crate::REBASED_ORIGIN_KIND, &keys)
+            .await
+        else {
+            return origins;
+        };
+        for (id, row) in want.into_iter().zip(rows) {
+            match row {
+                None => {
+                    origins.insert(id, None);
+                }
+                Some(v) => {
+                    if let Ok(arr) = <[u8; 32]>::try_from(v.as_ref()) {
+                        origins.insert(id, Some(ChangesetId(leep_core::Hash(arr))));
+                    }
+                }
+            }
+        }
+        origins
     }
 
     /// The server's rebased copy of `cs` among `head`'s ancestors, if an

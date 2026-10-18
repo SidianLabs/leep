@@ -267,7 +267,17 @@ impl Repo {
     /// still precedes its own check; the rare condemned one is then rescued
     /// as `put_rescuing` would.
     pub(crate) async fn put_rescuing_many(&self, items: Vec<(Hash, Bytes)>) -> Result<()> {
-        for chunk in items.chunks(BLOB_WRITES_IN_FLIGHT) {
+        self.put_rescuing_many_in_flight(items, BLOB_WRITES_IN_FLIGHT)
+            .await
+    }
+
+    /// [`Repo::put_rescuing_many`] writing up to `in_flight` blobs at once.
+    pub(crate) async fn put_rescuing_many_in_flight(
+        &self,
+        items: Vec<(Hash, Bytes)>,
+        in_flight: usize,
+    ) -> Result<()> {
+        for chunk in items.chunks(in_flight.max(1)) {
             let writes: Vec<_> = chunk
                 .iter()
                 .map(|(h, d)| self.blobs().put_with_hash(*h, d.clone()))

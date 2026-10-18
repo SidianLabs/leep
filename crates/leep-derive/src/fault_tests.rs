@@ -276,9 +276,10 @@ async fn lands_under_faults(seed: u64) {
     }
     // Guards against a plan that injects nothing. How many land on a given
     // seed depends on task scheduling and on how many store calls a land
-    // makes: from 18 to about 100 per run.
+    // makes: from about 10 to 100 per run, since a batch stores its replays
+    // in one write (ADR 0043).
     assert!(
-        w.plan.injected().total() > 10,
+        w.plan.injected().total() > 5,
         "seed {seed}: the plan injected almost nothing"
     );
 

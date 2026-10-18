@@ -479,6 +479,16 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   one transaction). New metrics `leep_land_batch_size` and
   `leep_land_cancelled_total`; `leep_land_lock_wait_seconds` now measures the
   time queued. `leep-land-bench` measures land throughput by number of agents.
+- A land batch stages its replays (ADR 0043): replayed copies, their tree
+  nodes and rows are kept in memory and read back by the lands after them,
+  then stored with one wave of blob writes and one metadata write just before
+  the ref moves, and the batch reads its lands' changesets, root trees and
+  rebase links in one round of batched reads. With 64 agents on one ref a
+  local Postgres run takes 215 to 230 lands/s instead of 58 to 70 (land p50
+  0.18 s instead of 0.9 s), SQLite 199 instead of 90 to 96; a lone land is
+  unchanged, and so are durability and the order objects are stored in.
+  `MetaStore` gains `put_changesets_with_derived` (a provided method; memory,
+  SQLite and Postgres write everything atomically).
 - GC marks incrementally (ADR 0033): each `gc` run records what it marked in
   `gc-mark-v1` rows, written so that a row always vouches for everything below
   it, and the next run walks only changesets stored since and stops at marked

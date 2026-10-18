@@ -30,6 +30,10 @@ struct Gate {
     waiting_swaps: AtomicUsize,
     swap_calls: AtomicUsize,
     chain_calls: AtomicUsize,
+    /// `put_changesets_with_derived` calls: one per batch that stored replays.
+    batch_writes: AtomicUsize,
+    /// `put_changeset_with_derived` calls.
+    single_writes: AtomicUsize,
     /// Moved in by "another server" right before the next swap.
     intruder: Mutex<Option<(Option<ChangesetId>, ChangesetId)>>,
 }
@@ -44,6 +48,8 @@ impl Gate {
             waiting_swaps: AtomicUsize::new(0),
             swap_calls: AtomicUsize::new(0),
             chain_calls: AtomicUsize::new(0),
+            batch_writes: AtomicUsize::new(0),
+            single_writes: AtomicUsize::new(0),
             intruder: Mutex::new(None),
         })
     }
@@ -84,7 +90,18 @@ impl MetaStore for Gate {
         cs: &Changeset,
         rows: &[leep_core::DerivedRow],
     ) -> Result<ChangesetId> {
+        self.single_writes.fetch_add(1, Ordering::SeqCst);
         self.inner.put_changeset_with_derived(cs, rows).await
+    }
+    async fn put_changesets_with_derived(
+        &self,
+        changesets: &[Changeset],
+        rows: &[leep_core::DerivedRow],
+    ) -> Result<()> {
+        self.batch_writes.fetch_add(1, Ordering::SeqCst);
+        self.inner
+            .put_changesets_with_derived(changesets, rows)
+            .await
     }
     async fn get_changeset(&self, id: &ChangesetId) -> Result<Option<Changeset>> {
         self.inner.get_changeset(id).await
@@ -676,4 +693,272 @@ async fn random_concurrent_lands_match_landing_in_turn() {
         "lands were batched ({batched} batches of several)"
     );
     assert!(conflicts > 5, "some lands conflicted ({conflicts})");
+}
+
+/// The batch replays into memory and stores everything with one metadata
+/// write after its blobs (ADR 0043), not one write per replay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_batch_stores_its_replays_in_one_metadata_write() {
+    use Parent::*;
+    let script = vec![
+        spec(&[Base], &[("a", Some("a\n"))], "a"),
+        spec(&[Base], &[("b", Some("b\n"))], "b"),
+        spec(&[Script(1)], &[("b2", Some("b2\n"))], "b2"),
+        spec(&[Base], &[("c", Some("c\n"))], "c"),
+    ];
+    let (r, gate) = gated_repo();
+    let (base, ids) = build(&r, &script).await;
+    let lands: Vec<_> = [0, 2, 3].iter().map(|&i| (ids[i], None)).collect();
+    let (blocker, tasks) = queue_in_order(&r, &gate, base, &lands).await;
+    let singles = gate.single_writes.load(Ordering::SeqCst);
+    release(&gate);
+    blocker.await.unwrap().unwrap();
+    for t in tasks {
+        assert!(matches!(
+            t.await.unwrap().unwrap(),
+            LandResponse::Landed { .. }
+        ));
+    }
+    assert_eq!(gate.batch_writes.load(Ordering::SeqCst), 1);
+    assert_eq!(gate.single_writes.load(Ordering::SeqCst), singles);
+    let head = r.meta().get_ref("main").await.unwrap().unwrap();
+    assert_stored(&r, head).await;
+}
+
+/// Every changeset in `head`'s history is stored with its root tree,
+/// generation and skiplist rows, and every tree node under its root tree is
+/// in the blob store itself (not only in a cache).
+async fn assert_stored(r: &Repo, head: ChangesetId) {
+    use crate::derived::{DerivedKind, Generation, RootTree, Skiplist};
+    let mut stack = vec![head];
+    let mut seen = std::collections::HashSet::new();
+    while let Some(id) = stack.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        let cs = r.meta().get_changeset(&id).await.unwrap().expect("stored");
+        for kind in [RootTree::NAME_STR, Generation::NAME, Skiplist::NAME] {
+            assert!(
+                r.meta().get_derived(kind, &id.0).await.unwrap().is_some(),
+                "{kind} row of {id}"
+            );
+        }
+        let mut trees = vec![r.root_tree(id).await.unwrap()];
+        while let Some(t) = trees.pop() {
+            let bytes = r.blobs().get(&t).await.unwrap().expect("tree stored");
+            let node = leep_core::TreeNode::decode(&bytes).unwrap();
+            for e in node.entries.values() {
+                if let leep_core::TreeEntry::Dir { tree } = e {
+                    trees.push(*tree);
+                }
+            }
+        }
+        stack.extend(cs.parents);
+    }
+}
+
+/// What a store holds for `head`'s history: each changeset and its rows.
+async fn stored_history(r: &Repo, head: ChangesetId) -> Vec<String> {
+    use crate::derived::{DerivedKind, Generation, RootTree, Skiplist};
+    let mut out = Vec::new();
+    let mut stack = vec![head];
+    let mut seen = std::collections::HashSet::new();
+    while let Some(id) = stack.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        let cs = r.meta().get_changeset(&id).await.unwrap().unwrap();
+        let mut line = format!("{id} {:?}", cs.encode());
+        for kind in [
+            RootTree::NAME_STR,
+            Generation::NAME,
+            Skiplist::NAME,
+            crate::REBASED_ORIGIN_KIND,
+        ] {
+            let v = r.meta().get_derived(kind, &id.0).await.unwrap();
+            line.push_str(&format!(" {kind}={v:?}"));
+        }
+        out.push(line);
+        stack.extend(cs.parents);
+    }
+    out.sort();
+    out
+}
+
+/// Staged batches store byte for byte what lands replayed straight into the
+/// stores, one at a time in the batches' order, store: the same changesets,
+/// rows, trees, answers, ref log and head.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn staged_batches_store_what_unstaged_lands_store() {
+    let mut batched = 0;
+    for seed in 1..=20u64 {
+        let mut rng = Rng(seed.wrapping_mul(0xA24B_AED4_963E_E407) | 1);
+        let agents = 2 + rng.below(12);
+        let mut script = Vec::new();
+        let mut tips = Vec::new();
+        for a in 0..agents {
+            let mut parent = Parent::Base;
+            for d in 0..1 + rng.below(3) {
+                let path = match rng.below(5) {
+                    0 => format!("shared/{}", rng.below(3)),
+                    1 => format!("deep/{}/x/y/{a}", rng.below(2)),
+                    _ => format!("own/{a}/{d}"),
+                };
+                script.push(spec(
+                    &[parent],
+                    &[(path.as_str(), Some(&format!("{seed} {a} {d}\n")))],
+                    &format!("agent {a} step {d}"),
+                ));
+                parent = Parent::Script(script.len() - 1);
+            }
+            tips.push(script.len() - 1);
+        }
+        let r = plain_repo();
+        let (_, ids) = build(&r, &script).await;
+        let tasks: Vec<_> = tips
+            .iter()
+            .map(|&i| {
+                let r = r.clone();
+                let cs = ids[i];
+                tokio::spawn(async move { (cs, outcome(&r.land(cs, "main").await)) })
+            })
+            .collect();
+        let mut got = BTreeMap::new();
+        for t in tasks {
+            let (cs, answer) = t.await.unwrap();
+            got.insert(cs, answer);
+        }
+        let batches = r.land_queues.batches.lock().unwrap().clone();
+        batched += batches.iter().filter(|b| b.len() > 1).count();
+        let order: Vec<ChangesetId> = batches.into_iter().flatten().collect();
+
+        let oracle = plain_repo();
+        let (_, oids) = build(&oracle, &script).await;
+        assert_eq!(oids, ids);
+        let mut want = Vec::new();
+        for cs in &order {
+            want.push(outcome(&oracle.land_unstaged(*cs, "main", None).await));
+        }
+        let answers: Vec<_> = order.iter().map(|cs| got[cs].clone()).collect();
+        assert_eq!(answers, want, "seed {seed}");
+        let head = r.meta().get_ref("main").await.unwrap().unwrap();
+        assert_eq!(
+            Some(head),
+            oracle.meta().get_ref("main").await.unwrap(),
+            "seed {seed}"
+        );
+        assert_eq!(
+            log_steps(&r.meta().ref_log(Some("main"), None, 10_000).await.unwrap()),
+            log_steps(
+                &oracle
+                    .meta()
+                    .ref_log(Some("main"), None, 10_000)
+                    .await
+                    .unwrap()
+            ),
+            "seed {seed}"
+        );
+        assert_eq!(
+            stored_history(&r, head).await,
+            stored_history(&oracle, head).await,
+            "seed {seed}"
+        );
+        assert_stored(&r, head).await;
+    }
+    assert!(
+        batched > 5,
+        "lands were batched ({batched} batches of several)"
+    );
+}
+
+/// Blob writes that fail while armed.
+struct FailingBlobs {
+    inner: MemoryBlobStore,
+    failures: AtomicUsize,
+}
+
+#[async_trait]
+impl leep_core::BlobStore for FailingBlobs {
+    async fn put_with_hash(&self, hash: Hash, data: Bytes) -> Result<()> {
+        let left = self.failures.load(Ordering::SeqCst);
+        if left > 0 {
+            self.failures.store(left - 1, Ordering::SeqCst);
+            return Err(leep_core::Error::Storage("injected".into()));
+        }
+        self.inner.put_with_hash(hash, data).await
+    }
+    async fn get(&self, hash: &Hash) -> Result<Option<Bytes>> {
+        self.inner.get(hash).await
+    }
+    async fn list_page(
+        &self,
+        after: Option<Hash>,
+        limit: usize,
+    ) -> Result<Vec<leep_core::BlobMeta>> {
+        self.inner.list_page(after, limit).await
+    }
+    async fn delete(&self, hash: &Hash) -> Result<()> {
+        self.inner.delete(hash).await
+    }
+}
+
+/// A batch whose objects cannot be stored never moves the ref: the failure
+/// counts as a failed commit, so the batch is redone from a fresh read and
+/// lands once storing works, or answers the error after three failures with
+/// the ref and the changesets untouched. A batch that only conflicts stores
+/// nothing.
+#[tokio::test]
+async fn a_batch_that_cannot_store_its_replays_moves_nothing() {
+    use Parent::*;
+    let script = vec![
+        spec(&[Base], &[("a", Some("a\n"))], "a"),
+        spec(&[Base], &[("b", Some("b\n"))], "b"),
+        spec(&[Base], &[("a", Some("other\n"))], "conflicts with a"),
+    ];
+    let blobs = Arc::new(FailingBlobs {
+        inner: MemoryBlobStore::new(),
+        failures: AtomicUsize::new(0),
+    });
+    let meta = Arc::new(MemoryMetaStore::new());
+    let r = Repo::new(blobs.clone(), meta.clone());
+    let (base, ids) = build(&r, &script).await;
+    r.land(ids[0], "main").await.unwrap();
+    let after_a = r.meta().get_ref("main").await.unwrap();
+    let stored = meta.list_changesets(None, 1000).await.unwrap().len();
+
+    // Every attempt fails: the error is answered and nothing moved or stored.
+    blobs.failures.store(usize::MAX, Ordering::SeqCst);
+    let err = r.land(ids[1], "main").await.unwrap_err();
+    assert!(matches!(err, leep_core::Error::Storage(_)), "{err}");
+    assert_eq!(r.meta().get_ref("main").await.unwrap(), after_a);
+    assert_eq!(
+        meta.list_changesets(None, 1000).await.unwrap().len(),
+        stored
+    );
+
+    // One failure: the batch is redone and lands.
+    blobs.failures.store(1, Ordering::SeqCst);
+    let resp = r.land(ids[1], "main").await.unwrap();
+    let LandResponse::Landed {
+        landed,
+        rebased: true,
+        attempts: 2,
+    } = resp
+    else {
+        panic!("{resp:?}");
+    };
+    assert_eq!(r.meta().get_ref("main").await.unwrap(), Some(landed));
+    assert_stored(&r, landed).await;
+    let log = r.meta().ref_log(Some("main"), None, 10).await.unwrap();
+    assert_eq!(log.len(), 3, "base, a and b, each once");
+
+    // A conflict writes nothing at all.
+    let stored = meta.list_changesets(None, 1000).await.unwrap().len();
+    let resp = r.land(ids[2], "main").await.unwrap();
+    assert!(matches!(resp, LandResponse::Conflicts { .. }), "{resp:?}");
+    assert_eq!(
+        meta.list_changesets(None, 1000).await.unwrap().len(),
+        stored
+    );
+    assert!(r.is_ancestor(base, landed).await.unwrap());
 }

@@ -369,6 +369,22 @@ impl MetaStore for MemoryMetaStore {
         }
         Ok(id)
     }
+
+    async fn put_changesets_with_derived(
+        &self,
+        changesets: &[Changeset],
+        rows: &[DerivedRow],
+    ) -> Result<()> {
+        let mut stored = self.changesets.lock().unwrap();
+        let mut all = self.derived.lock().unwrap();
+        for cs in changesets {
+            stored.entry(cs.id()).or_insert_with(|| cs.clone());
+        }
+        for r in rows {
+            all.insert((r.kind.clone(), r.key), r.value.clone());
+        }
+        Ok(())
+    }
 }
 
 /// Conformance checks every `MetaStore` implementation should pass. Backend
@@ -536,7 +552,32 @@ async fn check_batched_writes(store: &dyn MetaStore) {
         store.get_changeset(&id3).await.unwrap().as_ref(),
         Some(&three)
     );
-    for kind in ["bw-a", "bw-b", "bw-many", "bw-cs"] {
+    // Many changesets and rows at once, a key given twice keeping its last
+    // value, and already stored changesets accepted again.
+    let (four, five) = (cs(4), cs(5));
+    let batch_rows = [
+        row("bw-css", 1, "first"),
+        row("bw-css", 2, "two"),
+        row("bw-css", 1, "last"),
+    ];
+    store
+        .put_changesets_with_derived(&[four.clone(), five.clone(), one.clone()], &batch_rows)
+        .await
+        .unwrap();
+    for c in [&four, &five, &one] {
+        assert_eq!(
+            store.get_changeset(&c.id()).await.unwrap().as_ref(),
+            Some(c)
+        );
+    }
+    assert_eq!(get("bw-css", 1).await.unwrap(), &b"last"[..]);
+    assert_eq!(get("bw-css", 2).await.unwrap(), &b"two"[..]);
+    store
+        .put_changesets_with_derived(std::slice::from_ref(&four), &batch_rows)
+        .await
+        .unwrap();
+    store.put_changesets_with_derived(&[], &[]).await.unwrap();
+    for kind in ["bw-a", "bw-b", "bw-many", "bw-cs", "bw-css"] {
         store.delete_derived_kind(kind).await.unwrap();
     }
 }
