@@ -484,7 +484,7 @@ Postgres plans from statistics that autovacuum refreshes after a share of a
 table changes. Migration 2 lowers that share for `derived` (1% plus 10,000
 rows) and `changesets` (2% plus 10,000), and `leep-git import` and
 `leep-server restore` run `ANALYZE` on the metadata tables when they finish
-(ADR 0041). After loading by any other means (`pg_restore`, bulk SQL, copying
+(ADR 0042). After loading by any other means (`pg_restore`, bulk SQL, copying
 rows between databases), run `ANALYZE changesets, refs, derived, ref_log;`
 before serving traffic or deriving indexes. A sign of stale statistics is
 Postgres busy with few requests in flight while `pg_stat_user_tables` shows

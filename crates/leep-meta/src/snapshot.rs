@@ -384,7 +384,7 @@ pub async fn import_snapshot(
     }
     let info = copy(&mut source, &mut *sink).await?;
     sink.commit().await?;
-    // Every row arrived after the tables were last analyzed (ADR 0041). The
+    // Every row arrived after the tables were last analyzed (ADR 0042). The
     // restore has committed, so a failure here is only worth a warning.
     if let Some(store) = pg {
         if let Err(e) = store.analyze().await {

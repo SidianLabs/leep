@@ -1026,7 +1026,7 @@ changeset still joins every chunk of each directory it rewrites, so the cost
 grows with directory width (Linux's widest directories hold thousands of
 names).
 
-**Planner statistics after bulk writes** (ADR 0041). A local reproduction on
+**Planner statistics after bulk writes** (ADR 0042). A local reproduction on
 Postgres 16: `derived` with 600,000 rows of two kinds, `ANALYZE`, then 300,000
 rows of a new kind with autovacuum off; `changesets` analyzed at 1,000 rows,
 then grown to 300,000. Every `postgres.rs` statement was run with

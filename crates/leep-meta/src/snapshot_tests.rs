@@ -387,7 +387,7 @@ async fn postgres_to_sqlite_to_postgres() {
     let dest = open_meta_store(&b.url).await.unwrap();
     assert_eq!(dump(&*src).await, dump(&*dest).await);
     // The restore analyzed what it loaded: a table never analyzed or
-    // vacuumed has `reltuples = -1` (ADR 0041).
+    // vacuumed has `reltuples = -1` (ADR 0042).
     let mut c = sqlx::PgConnection::connect(&b.url).await.unwrap();
     let tuples: f32 =
         sqlx::query_scalar("SELECT reltuples FROM pg_class WHERE relname = 'changesets'")

@@ -497,7 +497,7 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   unanswered land, as a real client does, instead of rebuilding the stack on
   the new head, which landed it twice when the first land had applied.
 - Postgres statistics no longer go stale while an index is built or after a
-  bulk load (ADR 0041). Schema migration 2 makes autovacuum re-analyze
+  bulk load (ADR 0042). Schema migration 2 makes autovacuum re-analyze
   `derived` after 1% plus 10,000 changed rows (it waited for 10%, 1.1M rows on
   Linux, which a new 512k-row kind never reached) and `changesets` after 2%
   plus 10,000; `leep-git import` and `leep-server restore` run `ANALYZE` when

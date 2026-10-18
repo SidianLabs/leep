@@ -1,5 +1,5 @@
 -- Re-analyze the two large tables after a bounded amount of change instead
--- of the default 50 rows plus 10% of the table (ADR 0041). Storage
+-- of the default 50 rows plus 10% of the table (ADR 0042). Storage
 -- parameters only: no data, column or index changes, and `ALTER TABLE ...
 -- SET` takes a lock that does not block reads or writes.
 --

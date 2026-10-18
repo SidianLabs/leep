@@ -63,7 +63,7 @@ pub async fn migrate_meta_store(url: &str, dry_run: bool) -> Result<MigrationRep
 
 /// After a bulk load into the store at `url`, refresh the planner statistics
 /// of its tables so the queries that follow do not plan from estimates made
-/// before the load (ADR 0041). Postgres only; returns whether it ran. SQLite
+/// before the load (ADR 0042). Postgres only; returns whether it ran. SQLite
 /// and `mem://` need nothing, and an unknown URL is refused as elsewhere.
 pub async fn analyze_meta_store(url: &str) -> Result<bool> {
     if url.starts_with("postgres://") || url.starts_with("postgresql://") {

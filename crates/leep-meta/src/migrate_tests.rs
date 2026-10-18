@@ -705,7 +705,7 @@ async fn upgrade_from_every_stage() {
 /// A database at v1, as the binary before migration 2 left it (its compiled
 /// prefix, data written with that version's SQL), upgrades with its data
 /// intact. On Postgres the large tables then carry migration 2's analyze
-/// thresholds, and `analyze` refreshes their statistics (ADR 0041).
+/// thresholds, and `analyze` refreshes their statistics (ADR 0042).
 #[tokio::test]
 async fn upgrade_from_v1_sets_analyze_thresholds() {
     for db in dbs("fromv1").await {

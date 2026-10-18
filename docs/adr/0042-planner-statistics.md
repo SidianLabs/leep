@@ -1,4 +1,4 @@
-# 0041. Planner statistics after bulk writes
+# 0042. Planner statistics after bulk writes
 Status: Accepted
 Date: 2026-10-18
 

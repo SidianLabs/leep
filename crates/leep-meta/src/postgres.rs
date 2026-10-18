@@ -106,7 +106,7 @@ impl PostgresMetaStore {
     /// Refresh the planner statistics of every table. Autovacuum would get
     /// there, but only a minute or more after a bulk load ends, and the
     /// queries that run right after one (deriving indexes over what was just
-    /// imported) are the ones a stale estimate hurts (ADR 0041).
+    /// imported) are the ones a stale estimate hurts (ADR 0042).
     pub async fn analyze(&self) -> Result<()> {
         use sqlx::Executor;
         self.pool
@@ -542,7 +542,7 @@ impl MetaStore for PostgresMetaStore {
     /// Each batch is one ordered walk of the primary key, deleted by `ctid`:
     /// a plan no estimate can change. `key IN (SELECT ...)` became a nested
     /// loop over the whole kind per batch row when a stale estimate put the
-    /// kind at a row or two (ADR 0041). A row updated meanwhile has a new
+    /// kind at a row or two (ADR 0042). A row updated meanwhile has a new
     /// `ctid` and goes in the next batch.
     async fn delete_derived_kind(&self, kind: &str) -> Result<u64> {
         let mut total = 0;
