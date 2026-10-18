@@ -20,7 +20,8 @@ The targets run three ways:
 
 | Target | What it covers |
 |---|---|
-| `changeset`, `tree_node`, `history_node`, `signature`, `review` | postcard decoders of persisted objects: decode never panics, a decoded value re-encodes and decodes to itself, content hashes are stable |
+| `changeset`, `tree_node`, `signature`, `review` | postcard decoders of persisted objects: decode never panics, a decoded value re-encodes and decodes to itself, content hashes are stable |
+| `history_node` | parts of path-history packs (ADR 0045): decode never panics, nodes resolve against a keyframe or fail, and a decoded keyframe stored again (whole, or as an edit of itself) reads back the same |
 | `blob_trigrams_row`, `tree_trigrams_row`, `trigram_codec` | code search rows (`blob-trigrams-v1`, `tree-trigrams-v1`): the decoders, the lazy `Probe`, and encoders against decoders |
 | `gc_rows` | `blob-claim`, `-condemned`, `-rescue` and `-doom` rows |
 | `skiplist_row` | the skiplist derived row |

@@ -295,7 +295,7 @@ async fn a_healthy_store_verifies_clean_and_verify_writes_nothing() {
         "skiplist",
         "last_merge-v1",
         "root_tree",
-        "history-tree-v3",
+        "history-tree-v4",
     ] {
         assert!(
             r.derived[kind].checked >= 8,
@@ -307,7 +307,7 @@ async fn a_healthy_store_verifies_clean_and_verify_writes_nothing() {
     for kind in [
         "blob-trigrams-v1",
         "tree-trigrams-v1",
-        "history-node-v3",
+        "history-node-v4",
         "blame",
         "signature-v1",
         "review-v1",
@@ -429,7 +429,7 @@ async fn every_per_changeset_kind_is_checked_by_recomputation_and_repaired() {
         ("skiplist", 2),
         ("last_merge-v1", 5),
         ("root_tree", 2),
-        ("history-tree-v3", 2),
+        ("history-tree-v4", 2),
     ] {
         let w = world().await;
         let id = w.ids[victim];
@@ -503,29 +503,31 @@ async fn a_damaged_generation_does_not_blame_the_rows_derived_from_it() {
 
 #[tokio::test]
 async fn a_damaged_history_pointer_or_node_is_found_and_rewritten() {
-    // A pointer to a node that does not exist.
+    // A pack whose root is a node that does not exist.
     let w = world().await;
     let id = w.ids[2];
-    put_row(&w, "history-tree-v3", &id.0, vec![0xAB; 32]).await;
+    let nowhere = derived::NodeRef {
+        cs: ChangesetId(Hash([0xAB; 32])),
+        part: 0,
+        idx: 0,
+    };
+    let pack = derived::history_pack::PackBuilder::new(id).finish(nowhere);
+    put_row(&w, "history-tree-v4", &id.0, pack.value).await;
     let r = run_verify(&w, &VerifyOptions::default()).await;
     assert!(codes(&r).contains(&"derived_mismatch"), "{:#?}", r.problems);
     assert!(codes(&r).contains(&"missing_history_node"));
-    rederive_kinds(&w, &["history-tree-v3"], false).await;
+    rederive_kinds(&w, &["history-tree-v4"], false).await;
     assert_clean(&w).await;
 
-    // A node whose bytes no longer match its address.
-    let w = world().await;
+    // A part whose bytes no longer match its checksum.
+    let (w, _) = wide_world().await;
     let rows = w
         .meta
-        .list_derived("history-node-v3", None, usize::MAX)
+        .list_derived("history-node-v4", None, usize::MAX)
         .await
         .unwrap();
-    let (key, value) = rows
-        .iter()
-        .find(|(_, v)| v.len() > 3)
-        .expect("a non-trivial node")
-        .clone();
-    put_row(&w, "history-node-v3", &key, flip(&value)).await;
+    let (key, value) = rows.first().expect("a pack of several parts").clone();
+    put_row(&w, "history-node-v4", &key, flip(&value)).await;
     for opts in [VerifyOptions::default(), full()] {
         let r = run_verify(&w, &opts).await;
         assert!(
@@ -534,14 +536,14 @@ async fn a_damaged_history_pointer_or_node_is_found_and_rewritten() {
             r.problems
         );
     }
-    let fixed = rederive_kinds(&w, &["history-tree-v3"], false).await;
+    let fixed = rederive_kinds(&w, &["history-tree-v4"], false).await;
     assert_eq!(fixed.failed(), 0, "{:#?}", fixed.problems);
-    assert_eq!(row(&w, "history-node-v3", &key).await, value);
+    assert_eq!(row(&w, "history-node-v4", &key).await, value);
     assert_clean(&w).await;
 }
 
 /// The world plus a directory wide enough that its history node is split,
-/// and the address of one of its chunks.
+/// and the key of a part of the pack that holds its chunks.
 async fn wide_world() -> (World, Hash) {
     let mut w = world().await;
     let names: Vec<String> = (0..100).map(|i| format!("w/f{i:03}")).collect();
@@ -559,28 +561,38 @@ async fn wide_world() -> (World, Hash) {
     w.ids.push(wide);
     w.ids[6] = tip;
     w.repo.last_change(tip, "w/f050").await.unwrap();
-    let rows = w
+    let pack = w
         .meta
-        .list_derived("history-node-v3", None, usize::MAX)
+        .get_derived("history-tree-v4", &wide.0)
         .await
+        .unwrap()
         .unwrap();
-    let chunk = rows
+    let decoded = derived::history_pack::decode_part(&pack, wide, 0).unwrap();
+    let split = decoded
+        .nodes
         .iter()
-        .find_map(|(_, v)| match StoredHistoryNode::decode(v).unwrap() {
-            StoredHistoryNode::Split(refs) => Some(refs[1].node),
+        .find_map(|(n, _)| match n {
+            derived::history_pack::RawNode::Ready(StoredHistoryNode::Split(refs)) => {
+                Some(refs.clone())
+            }
             _ => None,
         })
         .expect("a split node");
-    (w, chunk)
+    let chunk = split
+        .iter()
+        .map(|r| r.node)
+        .find(|r| r.part != 0)
+        .expect("a chunk outside part 0");
+    (w, derived::history_pack::part_key(wide, chunk.part))
 }
 
 #[tokio::test]
 async fn a_damaged_or_missing_history_chunk_is_found_and_rewritten() {
     let (w, chunk) = wide_world().await;
     assert_clean(&w).await;
-    let value = row(&w, "history-node-v3", &chunk).await;
+    let value = row(&w, "history-node-v4", &chunk).await;
 
-    put_row(&w, "history-node-v3", &chunk, flip(&value)).await;
+    put_row(&w, "history-node-v4", &chunk, flip(&value)).await;
     let r = run_verify(&w, &full()).await;
     assert!(
         r.problems
@@ -590,42 +602,43 @@ async fn a_damaged_or_missing_history_chunk_is_found_and_rewritten() {
         r.problems
     );
     assert!(!r.problems.is_empty());
-    let fixed = rederive_kinds(&w, &["history-tree-v3"], false).await;
+    let fixed = rederive_kinds(&w, &["history-tree-v4"], false).await;
     assert_eq!(fixed.failed(), 0, "{:#?}", fixed.problems);
-    assert_eq!(row(&w, "history-node-v3", &chunk).await, value);
+    assert_eq!(row(&w, "history-node-v4", &chunk).await, value);
     assert_clean(&w).await;
 
     // Gone altogether: only the walk from the history roots can notice.
     let rows = w
         .meta
-        .list_derived("history-node-v3", None, usize::MAX)
+        .list_derived("history-node-v4", None, usize::MAX)
         .await
         .unwrap();
-    w.meta.delete_derived_kind("history-node-v3").await.unwrap();
+    w.meta.delete_derived_kind("history-node-v4").await.unwrap();
     for (k, v) in rows.into_iter().filter(|(k, _)| *k != chunk) {
-        put_row(&w, "history-node-v3", &k, v).await;
+        put_row(&w, "history-node-v4", &k, v).await;
     }
     let r = run_verify(&w, &full()).await;
     let p = only(&r, "missing_history_node");
     assert_eq!(p.key, Some(chunk.to_hex()));
     assert_eq!(r.problems.len(), 1, "{:#?}", r.problems);
-    rederive_kinds(&w, &["history-tree-v3"], false).await;
-    assert_eq!(row(&w, "history-node-v3", &chunk).await, value);
+    rederive_kinds(&w, &["history-tree-v4"], false).await;
+    assert_eq!(row(&w, "history-node-v4", &chunk).await, value);
     assert_clean(&w).await;
 }
 
 #[tokio::test]
 async fn dropping_the_retired_history_indexes_removes_only_their_rows() {
-    let w = world().await;
+    let (w, _) = wide_world().await;
     let current = w
         .meta
-        .list_derived("history-node-v3", None, usize::MAX)
+        .list_derived("history-node-v4", None, usize::MAX)
         .await
         .unwrap();
     assert!(!current.is_empty());
     for (tree, node) in [
         ("history-tree-v1", "history-node-v1"),
         ("history-tree-v2", "history-node-v2"),
+        ("history-tree-v3", "history-node-v3"),
     ] {
         put_row(&w, tree, &w.tip().0, vec![7; 32]).await;
         put_row(&w, node, &Hash([7; 32]), vec![0]).await;
@@ -637,7 +650,7 @@ async fn dropping_the_retired_history_indexes_removes_only_their_rows() {
         }
         assert_eq!(
             w.meta
-                .list_derived("history-node-v3", None, usize::MAX)
+                .list_derived("history-node-v4", None, usize::MAX)
                 .await
                 .unwrap(),
             current
@@ -905,13 +918,13 @@ async fn only_the_first_problems_are_kept_but_all_are_counted() {
 async fn missing_rows_are_not_problems_but_repair_fills_them() {
     let w = world().await;
     w.meta.delete_derived_kind("last_merge-v1").await.unwrap();
-    w.meta.delete_derived_kind("history-tree-v3").await.unwrap();
+    w.meta.delete_derived_kind("history-tree-v4").await.unwrap();
     let r = run_verify(&w, &full()).await;
     assert!(r.ok(), "{:#?}", r.problems);
     assert!(r.derived["last_merge-v1"].missing >= 7);
-    let fixed = rederive_kinds(&w, &["last_merge-v1", "history-tree-v3"], false).await;
+    let fixed = rederive_kinds(&w, &["last_merge-v1", "history-tree-v4"], false).await;
     assert!(fixed.kind_reports["last_merge-v1"].filled >= 7);
-    assert!(fixed.kind_reports["history-tree-v3"].filled >= 7);
+    assert!(fixed.kind_reports["history-tree-v4"].filled >= 7);
     let r = run_verify(&w, &full()).await;
     assert_eq!(r.derived["last_merge-v1"].missing, 0);
 }
@@ -1047,15 +1060,15 @@ async fn dropping_a_kind_changes_no_answer() {
 
 #[tokio::test]
 async fn dropping_history_trees_takes_the_nodes_with_them() {
-    let w = world().await;
-    let report = drop_kinds(&w.repo, &["history-tree-v3"], false, &Quiet)
+    let (w, _) = wide_world().await;
+    let report = drop_kinds(&w.repo, &["history-tree-v4"], false, &Quiet)
         .await
         .unwrap();
-    assert!(report.rows["history-tree-v3"] >= 8);
-    assert!(report.rows["history-node-v3"] > 0);
+    assert!(report.rows["history-tree-v4"] >= 8);
+    assert!(report.rows["history-node-v4"] > 0);
     assert!(w
         .meta
-        .list_derived("history-node-v3", None, 1)
+        .list_derived("history-node-v4", None, 1)
         .await
         .unwrap()
         .is_empty());
@@ -1086,7 +1099,7 @@ async fn kinds_history_cannot_regenerate_are_refused() {
         "blob-condemned-v1",
         "blob-rescue-v1",
         "blob-doom-v1",
-        "history-node-v3",
+        "history-node-v4",
         "ref_log",
         "unheard-of",
     ] {
@@ -1107,7 +1120,7 @@ async fn kinds_history_cannot_regenerate_are_refused() {
         .unwrap_err();
     assert!(err.to_string().contains("review-v1"));
     assert_eq!(snapshot(&w).await, before);
-    for kind in ["history-node-v3", "blame", "signature-v1", "bogus"] {
+    for kind in ["history-node-v4", "blame", "signature-v1", "bogus"] {
         let r = rederive(
             &w.repo,
             &RederiveOptions {

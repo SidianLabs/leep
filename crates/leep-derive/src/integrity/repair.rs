@@ -19,6 +19,8 @@ use super::problems::{recoverable, Damage, Problem, ProblemLog, Progress, Ticker
 use super::rows::{expected_blob_row, recompute, RowScan, PAGE};
 use super::shadow::{ShadowBlobs, ShadowMeta};
 use super::walk::{HistoryWalk, Visitor};
+use crate::derived::history_pack::same_part;
+use crate::derived::{DerivedKind, HistoryTree};
 use crate::search::index::TreeRowMemo;
 use crate::search::{BLOB_KIND as BLOB_TRIGRAMS, TREE_KIND as TREE_TRIGRAMS};
 use crate::Repo;
@@ -331,7 +333,12 @@ impl Visitor for Rederive<'_> {
                 Err(e) => return Err(e),
             };
             match self.real.meta().get_derived(kind, &id.0).await? {
-                Some(stored) if stored == expected => self.report(kind).matched += 1,
+                Some(stored)
+                    if stored == expected
+                        || (kind == HistoryTree::NAME && same_part(&stored, &expected)) =>
+                {
+                    self.report(kind).matched += 1
+                }
                 stored => {
                     if stored.is_some() {
                         self.report(kind).overwritten += 1;

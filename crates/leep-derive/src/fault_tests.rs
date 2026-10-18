@@ -664,7 +664,15 @@ async fn answers(r: &Repo, ids: &[ChangesetId]) -> Result<Answers> {
     }
     let tip = *ids.last().unwrap();
     let mut last_changes = Vec::new();
-    for path in ["a.txt", "d", "d/x.txt", "d/e/y.txt", "z.txt"] {
+    for path in [
+        "a.txt",
+        "d",
+        "d/x.txt",
+        "d/e/y.txt",
+        "z.txt",
+        "w0/f0.txt",
+        "w3/f9.txt",
+    ] {
         last_changes.push(match r.last_change(tip, path).await {
             Ok((info, _)) => Some(info.id),
             Err(Error::NotFound(_)) => None,
@@ -832,8 +840,8 @@ impl Outcomes {
 /// to never panicking.
 const VERIFIED: &[&str] = &[
     "root_tree",
-    "history-tree-v3",
-    "history-node-v3",
+    "history-tree-v4",
+    "history-node-v4",
     "tree node",
 ];
 
@@ -843,7 +851,34 @@ async fn flip_outcomes() -> BTreeMap<String, Outcomes> {
     let blobs = Arc::new(MemoryBlobStore::new());
     let truth_meta = Tamper::new(Arc::new(MemoryMetaStore::new()));
     let truth = Repo::new(blobs.clone(), truth_meta.clone());
-    let ids = small_history(0, &truth).await;
+    let mut ids = small_history(0, &truth).await;
+    // A changeset touching enough directories that its history pack takes
+    // more than one part, so `history-node-v4` rows are swept too.
+    let mut changes = BTreeMap::new();
+    for i in 0..24 {
+        let text = format!("wide {i}\n");
+        let content = truth.put_blob(Bytes::from(text.clone())).await.unwrap();
+        changes.insert(
+            rp(&format!("w{}/f{i}.txt", i % 6)),
+            FileChange::Modify {
+                content,
+                kind: FileKind::Regular,
+                size: text.len() as u64,
+            },
+        );
+    }
+    let wide = truth
+        .create_changeset(Changeset {
+            parents: vec![*ids.last().unwrap()],
+            author: "t".into(),
+            timestamp: 1,
+            message: "wide".into(),
+            changes,
+            extra: BTreeMap::new(),
+        })
+        .await
+        .unwrap();
+    ids.push(wide);
     let want = Arc::new(answers(&truth, &ids).await.unwrap());
     for id in &ids {
         for step in 0..DERIVE_STEPS {

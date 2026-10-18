@@ -466,17 +466,44 @@ whole history: warm it with `leep-server repair rederive --kind <new kind>`
 before sending traffic, and drop the old kind once no server of the previous
 version is left (`repair drop` accepts retired kind names; it changes no
 answer of the new servers). The path-history index moved from
-`history-tree-v1` to `history-tree-v2` this way (ADR 0027), and from
-`history-tree-v2` to `history-tree-v3` (ADR 0037). The warmer derives the new
+`history-tree-v1` to `history-tree-v2` this way (ADR 0027), from
+`history-tree-v2` to `history-tree-v3` (ADR 0037), and from
+`history-tree-v3` to `history-tree-v4` (ADR 0045). The warmer derives the new
 index in the background after the new servers start; on a long history,
 rederive first if path queries must not wait for it:
 
 ```sh
-leep-server repair rederive --kind history-tree-v3          # warm the new index
-leep-server repair drop --kind history-tree-v2 --dry-run    # count the old rows (and history-node-v2)
-leep-server repair drop --kind history-tree-v2              # delete them once no old server runs
+leep-server repair rederive --kind history-tree-v4          # warm the new index (old servers keep serving from v3)
+leep-server repair drop --kind history-tree-v3 --dry-run    # count the old rows (and history-node-v3)
+leep-server repair drop --kind history-tree-v3              # delete them once no old server runs
+leep-server repair drop --kind history-tree-v2              # rows left from before ADR 0037, if any
 leep-server repair drop --kind history-tree-v1              # rows left from before ADR 0027, if any
 ```
+
+**From `history-tree-v3` to `history-tree-v4` on a large store** (ADR 0045).
+The v4 index is about a sixth of v3's size: on all of Linux, where v3 holds
+24 GB of values in 25 million rows, v4 should take about 2.5 to 4 GB. With
+the old servers still serving from v3:
+
+1. Check that the disk has room for the v4 index beside v3 (a sixth of v3's
+   size, plus Postgres overhead), then run the new binary's
+   `leep-server repair rederive --kind history-tree-v4` against the shared
+   database. It is safe beside running servers, derives oldest first and can
+   be stopped and run again; it skips what is already derived. On Linux
+   expect hours (v4 derives at about v3's rate or faster on Postgres: 187 to
+   247 changesets a second on the v2.6.16 slice against 175 to 221 for v3).
+2. Replace the old servers with new ones. Path queries are answered from v4
+   at once.
+3. `repair drop --kind history-tree-v3 --dry-run`, then without `--dry-run`,
+   which deletes `history-tree-v3` and `history-node-v3` rows in batches.
+4. Postgres keeps the freed pages for reuse; to give the space back to the
+   operating system, run `VACUUM FULL derived` in a maintenance window (it
+   locks the table and needs room for a copy of what remains) or use
+   `pg_repack`. Then `ANALYZE derived`.
+
+If the disk cannot hold both indexes, drop v3 first (step 3), start the new
+servers and let the warmer (or `rederive`) build v4: path queries wait for
+derivation, or derive on demand, until it has caught up.
 
 ## Bulk loads and planner statistics (Postgres)
 
@@ -758,7 +785,7 @@ history, trees and blobs first, derived rows after.
 | `corrupt_blob`, `blob_size_mismatch` (`--rehash`) | The bytes under a blob's address do not hash to it, or are not the declared length | Delete the file and restore from backup, as for a missing blob. Until then reads of it return the damaged bytes |
 | `derived_mismatch` | A derived row differs from its recomputation. The report gives kind, row key and changeset | `leep-server repair rederive --kind <kind>` and run `verify --full` again. Find out why (disk, restore, an old version): derived rows are only ever wrong through damage |
 | `derived_unverifiable` | A row could not be recomputed because something it reads is damaged | Fix the damaged tree node, blob or parent, then verify again |
-| `corrupt_history_node`, `missing_history_node` | A history index node, chunk or patch does not match its address, a split node's chunk does not fit its list, a patch does not fit its keyframe, or a `history-tree-v3` row, chunk list or patch points at nothing | `repair rederive --kind history-tree-v3` rewrites the nodes, chunks and patches. Or `repair drop --kind history-tree-v3` and let the index rebuild on the next path query (slow on a long history: it derives the whole index at once) |
+| `corrupt_history_node`, `missing_history_node` | A part of a history pack fails its checksum or does not decode, a `history-node-v4` row holds another part than its key says, a split node's chunk does not fit its list, a patch does not fit its keyframe, or a `history-tree-v4` row, chunk list or patch points at nothing | `repair rederive --kind history-tree-v4` rewrites the packs. Or `repair drop --kind history-tree-v4` and let the index rebuild on the next path query (slow on a long history: it derives the whole index at once) |
 | `bad_attestation`, `invalid_signature` | A signature or review row does not decode, does not belong to any changeset, or a signature does not verify | These are not derived from history and are never rewritten by `repair`. Restore the row from a backup, or delete it with SQL if it is junk, and have the author sign again |
 | `bad_rebased_origin`, `bad_gc_row` | Bookkeeping rows that are malformed or name changesets that do not exist | Restore from a backup. A bad GC row can be deleted with SQL while no `gc` runs; `repair` refuses to touch them |
 | `reflog_divergence` | A ref's newest ref log entry does not say where the ref is now | Someone changed the `refs` table or the log directly, or a restore mixed two points in time. Decide which is right: if the ref is right, the log is merely incomplete and nothing breaks; if the log is right, `leep undo`-style recovery is `POST /v1/refs/{name}` to the logged value. `repair` never edits either |
@@ -776,7 +803,7 @@ leep-server repair rederive --kind skiplist               # also checks generati
 leep-server repair rederive --kind root_tree --ref main   # only the history of one ref
 leep-server repair rederive --kind all                    # every kind that can be recomputed
 leep-server repair drop --kind blame blob-trigrams-v1     # delete rows; they derive again when asked for
-leep-server repair drop --kind history-tree-v3 --dry-run  # also removes history-node-v3; counts only
+leep-server repair drop --kind history-tree-v4 --dry-run  # also removes history-node-v4; counts only
 ```
 
 `rederive` walks the chosen changesets oldest first, recomputes each selected
@@ -786,27 +813,29 @@ kind how many it examined, how many were already right, how many it wrote, and
 how many it could not recompute. Rows no query ever asked for are written too:
 for the lazily derived kinds that is eager derivation, which is also how to
 warm an index after a restore. It is safe to repeat and to run beside servers;
-the servers write the same bytes. `root_tree` and `history-tree-v3` also
-rewrite the tree and history nodes they derive, which is what restores a
-missing or damaged one. The search kinds (`blob-trigrams-v1`,
+the servers write the same bytes (for `history-tree-v4`, the same packs:
+their compressed bytes may differ between zstd versions, and `verify` and
+`repair` compare them uncompressed). `root_tree` and `history-tree-v4` also
+rewrite the tree nodes and history pack parts they derive, which is what
+restores a missing or damaged one. The search kinds (`blob-trigrams-v1`,
 `tree-trigrams-v1`) are rewritten for the rows that exist; use
 `derive-search REV` to build rows that do not.
 
 `drop` removes every row of a kind in batches and the kind then derives again
 on demand. It changes no answer, only latency: the next query that needs a row
-derives it, and for `generation`, `skiplist`, `root_tree` and `history-tree-v3` on a
+derives it, and for `generation`, `skiplist`, `root_tree` and `history-tree-v4` on a
 long history the first query derives the whole history. Warm them with
-`repair rederive` instead of waiting for a user. Dropping `history-tree-v3` also
-drops `history-node-v3`, because only it refers to those rows. `drop` also
-accepts the retired `history-tree-v1` and `history-tree-v2` (with
-`history-node-v1` and `history-node-v2`), which current servers no longer use;
-see [Upgrading](#upgrading).
+`repair rederive` instead of waiting for a user. Dropping `history-tree-v4` also
+drops `history-node-v4`, because only it refers to those rows. `drop` also
+accepts the retired `history-tree-v1`, `history-tree-v2` and `history-tree-v3`
+(with `history-node-v1`, `history-node-v2` and `history-node-v3`), which
+current servers no longer use; see [Upgrading](#upgrading).
 
 Kinds that cannot be rederived (and so are refused by `drop` with an
 explanation and exit status 2): `signature-v1` and `review-v1` (clients wrote
 them), `rebased-origin-v1` (written by rebase; `land`'s retry detection depends
 on it), `blob-claim-v1`, `blob-condemned-v1`, `blob-rescue-v1`, `blob-doom-v1`, `gc-mark-v1` (the GC
-fence, ADR 0012), `history-node-v3` (or `-v2`, `-v1`) on its own, and the ref log. The full table
+fence, ADR 0012), `history-node-v4` (or `-v3`, `-v2`, `-v1`) on its own, and the ref log. The full table
 with reasons is in ADR 0025. `blame` can be dropped but not rederived: its rows
 are keyed by a hash of (changeset, path) and cannot be listed.
 
