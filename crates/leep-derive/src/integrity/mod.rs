@@ -9,6 +9,7 @@ mod problems;
 pub mod repair;
 mod rows;
 mod shadow;
+pub mod upgrade;
 pub mod verify;
 mod walk;
 
@@ -17,4 +18,8 @@ mod tests;
 
 pub use problems::{Problem, Progress, Quiet};
 pub use repair::{drop_kinds, rederive, DropReport, RederiveOptions, RederiveReport, Scope};
+pub use upgrade::{
+    plan_upgrade, run_upgrade, CurrentKind, IndexStatus, RetiredKind, UpgradeOptions, UpgradePlan,
+    UpgradeReport,
+};
 pub use verify::{verify, KindStats, SignatureCheck, Stats, VerifyOptions, VerifyReport};

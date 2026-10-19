@@ -16,6 +16,7 @@ mod drop;
 pub mod migrate;
 mod postgres;
 pub mod snapshot;
+pub mod space;
 mod sqlite;
 
 pub use migrate::{AppliedMigration, Migration, MigrationRef, MigrationReport};

@@ -644,7 +644,7 @@ fn drop_progress(deleted: u64, step: &DeleteStep, elapsed: Duration) -> String {
     line
 }
 
-fn human_secs(s: f64) -> String {
+pub(crate) fn human_secs(s: f64) -> String {
     let s = s.round() as u64;
     match s {
         0..=99 => format!("{s}s"),

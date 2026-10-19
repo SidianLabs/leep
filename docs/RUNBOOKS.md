@@ -546,6 +546,9 @@ latency of the busiest ref grows with the number of agents landing on it.
 
 - Warm derived data instead of waiting for users: `leep-server repair rederive --kind
   all` (safe beside servers), and `leep-server derive-search main` for search.
+  After an upgrade that changed an index, `leep-server upgrade-index` shows
+  which indexes are incomplete and `--yes` builds them (resumable; see
+  [Upgrading](OPERATIONS.md#upgrading)).
 - Ask agents to `leep sync` more often so stacks stay short; lengthen the agents'
   think time or reduce how many land on one ref.
 - Scale or tune the metadata store.

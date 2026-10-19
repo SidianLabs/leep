@@ -17,6 +17,7 @@ use tracing_subscriber::EnvFilter;
 mod backup_cli;
 mod repack_cli;
 mod repair;
+mod upgrade_cli;
 
 #[derive(Parser)]
 #[command(version, about = "Leep HTTP server")]
@@ -260,6 +261,13 @@ enum Cmd {
     /// manifest and every blob it references is present. Exit status 0 clean,
     /// 1 problems, 2 could not run.
     BackupVerify(backup_cli::VerifyBackupArgs),
+    /// Bring the derived indexes up to this version in one resumable command
+    /// (uses --meta and --blobs; safe beside running servers): plan from
+    /// counts, derive what is missing, drop retired kinds only with
+    /// --drop-retired --old-servers-stopped, and print how to reclaim space.
+    /// Without --yes it only plans. Exit status 0 done or nothing to do, 1
+    /// work to do, 2 could not run.
+    UpgradeIndex(upgrade_cli::UpgradeIndexArgs),
 }
 
 #[derive(Subcommand, Clone, Copy)]
@@ -505,7 +513,8 @@ fn run_command(cmd: Cmd) -> anyhow::Result<()> {
         | Cmd::Repair(_)
         | Cmd::Backup(_)
         | Cmd::Restore(_)
-        | Cmd::BackupVerify(_) => {
+        | Cmd::BackupVerify(_)
+        | Cmd::UpgradeIndex(_) => {
             unreachable!("handled in main")
         }
         Cmd::GenToken { name, role, author } => {
@@ -598,6 +607,7 @@ async fn main() -> anyhow::Result<()> {
                 | Cmd::Backup(_)
                 | Cmd::Restore(_)
                 | Cmd::BackupVerify(_)
+                | Cmd::UpgradeIndex(_)
         )
     ) {
         BoxMakeWriter::new(std::io::stderr)
@@ -679,6 +689,9 @@ async fn main() -> anyhow::Result<()> {
             backup_cli::run_restore(&args.meta, &args.blobs, args.no_migrate, r).await,
         ),
         Some(Cmd::BackupVerify(v)) => std::process::exit(backup_cli::run_verify_backup(v).await),
+        Some(Cmd::UpgradeIndex(u)) => {
+            std::process::exit(upgrade_cli::run_upgrade_index(&args.meta, &args.blobs, u).await)
+        }
         Some(cmd) => return run_command(cmd),
         None => {}
     }
