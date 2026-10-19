@@ -6,16 +6,17 @@ use bytes::Bytes;
 use leep_core::prefix::IdPrefix;
 use leep_core::store::unix_now;
 use leep_core::{
-    check_ref_chain, Changeset, ChangesetId, DerivedRow, Hash, MetaStore, RefLogEntry, RefStep,
-    RefUpdateContext, Result,
+    check_ref_chain, Changeset, ChangesetId, DeleteStep, DerivedRow, Hash, MetaStore, RefLogEntry,
+    RefStep, RefUpdateContext, Result,
 };
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Row, SqliteConnection, SqlitePool};
 
+use crate::drop::{self, nothing_left, Cursor, KEY_BATCH};
 use crate::migrate::{self, AppliedMigration, Migration, MigrationReport, Session};
 use crate::{
     changesets_in_order, decode_checked, log_entry, placeholders, storage, to_hash, to_id, unique,
-    values_in_order, LogRow, SchemaMode, BATCH_PARAMS, DELETE_BATCH,
+    values_in_order, LogRow, SchemaMode, BATCH_PARAMS,
 };
 
 /// The compiled migration list (ADR 0023). Append only.
@@ -223,6 +224,108 @@ impl Session for SqliteSession<'_> {
         .await
         .map_err(storage)?;
         Ok(())
+    }
+}
+
+impl SqliteMetaStore {
+    /// One past the largest `rowid` in `derived`; a walk ends there.
+    async fn rowid_end(&self) -> Result<u64> {
+        let n: Option<i64> = sqlx::query_scalar("SELECT max(rowid) FROM derived")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(storage)?;
+        Ok(n.map_or(0, |n| n as u64 + 1))
+    }
+
+    /// Delete the rows of `kinds` with `rowid` in `[at, at + span)`. `+kind`
+    /// keeps SQLite on the `rowid` range instead of the key index.
+    async fn walk_step(&self, kinds: &[&str], at: u64, span: u64) -> Result<DeleteStep> {
+        let rowids = self.rowid_end().await?;
+        let mut deleted = vec![0; kinds.len()];
+        if at >= rowids {
+            return Ok(DeleteStep {
+                deleted,
+                next: None,
+                done: rowids,
+                total: rowids,
+                unit: "rowids",
+            });
+        }
+        let end = (at + span).min(i64::MAX as u64);
+        let started = std::time::Instant::now();
+        let sql = format!(
+            "DELETE FROM derived WHERE rowid >= ? AND rowid < ? AND +kind IN ({}) RETURNING kind",
+            placeholders(kinds.len())
+        );
+        let mut q = sqlx::query_scalar::<_, String>(&sql)
+            .bind(at as i64)
+            .bind(end as i64);
+        for k in kinds {
+            q = q.bind(*k);
+        }
+        let gone = q.fetch_all(&self.pool).await.map_err(storage)?;
+        drop::tally(kinds, &mut deleted, gone.into_iter().map(|k| (k, 1)));
+        let next = Cursor::Walk {
+            at: end,
+            span: drop::next_span(span, started.elapsed()),
+        };
+        Ok(DeleteStep {
+            deleted,
+            next: Some(next.encode()),
+            done: end.min(rowids),
+            total: rowids,
+            unit: "rowids",
+        })
+    }
+
+    /// Delete the next [`KEY_BATCH`] rows of `kinds[kind]` after `after`.
+    async fn keys_step(
+        &self,
+        kinds: &[&str],
+        kind: usize,
+        after: Vec<u8>,
+        done: u64,
+        total: u64,
+    ) -> Result<DeleteStep> {
+        let mut deleted = vec![0; kinds.len()];
+        let Some(name) = kinds.get(kind) else {
+            return Ok(nothing_left(kinds));
+        };
+        let keys: Vec<Vec<u8>> = sqlx::query_scalar(
+            "DELETE FROM derived WHERE kind = ?1 AND key IN \
+             (SELECT key FROM derived WHERE kind = ?1 AND key > ?2 ORDER BY key LIMIT ?3) \
+             RETURNING key",
+        )
+        .bind(name)
+        .bind(after)
+        .bind(KEY_BATCH)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(storage)?;
+        deleted[kind] = keys.len() as u64;
+        let done = done + keys.len() as u64;
+        let next = match keys.into_iter().max() {
+            Some(key) => Some(Cursor::Keys {
+                kind,
+                after: key,
+                done,
+                total,
+            }),
+            None if kind + 1 < kinds.len() => Some(Cursor::Keys {
+                kind: kind + 1,
+                after: Vec::new(),
+                done,
+                total,
+            }),
+            None => None,
+        };
+        Ok(DeleteStep {
+            deleted,
+            next: next.map(|c| c.encode()),
+            done,
+            total: total.max(done),
+            unit: "rows",
+        })
     }
 }
 
@@ -513,24 +616,47 @@ impl MetaStore for SqliteMetaStore {
             .collect()
     }
 
-    async fn delete_derived_kind(&self, kind: &str) -> Result<u64> {
-        let mut total = 0;
-        loop {
-            let n = sqlx::query(
-                "DELETE FROM derived WHERE kind = ? AND key IN \
-                 (SELECT key FROM derived WHERE kind = ? LIMIT ?)",
-            )
+    async fn count_derived(&self, kind: &str) -> Result<u64> {
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM derived WHERE kind = ?")
             .bind(kind)
-            .bind(kind)
-            .bind(DELETE_BATCH)
-            .execute(&self.pool)
+            .fetch_one(&self.pool)
             .await
-            .map_err(storage)?
-            .rows_affected();
-            total += n;
-            if n == 0 {
-                return Ok(total);
+            .map_err(storage)?;
+        Ok(n as u64)
+    }
+
+    /// As in Postgres (see [`crate::drop`]), walking `rowid` ranges.
+    async fn delete_derived_step(
+        &self,
+        kinds: &[&str],
+        cursor: Option<&[u8]>,
+    ) -> Result<DeleteStep> {
+        let cursor = match cursor {
+            Some(b) => Cursor::decode(b)?,
+            None => {
+                let sql = format!(
+                    "SELECT count(*) FROM derived WHERE kind IN ({})",
+                    placeholders(kinds.len())
+                );
+                let mut q = sqlx::query_scalar::<_, i64>(&sql);
+                for k in kinds {
+                    q = q.bind(*k);
+                }
+                let rows = q.fetch_one(&self.pool).await.map_err(storage)?;
+                match drop::plan(rows as u64, self.rowid_end().await?) {
+                    Some(c) => c,
+                    None => return Ok(nothing_left(kinds)),
+                }
             }
+        };
+        match cursor {
+            Cursor::Walk { at, span } => self.walk_step(kinds, at, span).await,
+            Cursor::Keys {
+                kind,
+                after,
+                done,
+                total,
+            } => self.keys_step(kinds, kind, after, done, total).await,
         }
     }
 

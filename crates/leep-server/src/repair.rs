@@ -376,7 +376,11 @@ fn print_rederive(r: &RederiveReport) {
 }
 
 fn print_drop(r: &DropReport) {
-    println!("drop{}:", if r.dry_run { " (dry run)" } else { "" });
+    println!(
+        "drop{}: ({:.1}s)",
+        if r.dry_run { " (dry run)" } else { "" },
+        r.elapsed_secs
+    );
     for (kind, n) in &r.rows {
         println!(
             "  {kind:<18} {n} row(s) {}",

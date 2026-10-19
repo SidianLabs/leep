@@ -5,7 +5,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use leep_core::prefix::IdPrefix;
 use leep_core::{
-    Changeset, ChangesetId, Hash, MetaStore, RefLogEntry, RefStep, RefUpdateContext, Result,
+    Changeset, ChangesetId, DeleteStep, Hash, MetaStore, RefLogEntry, RefStep, RefUpdateContext,
+    Result,
 };
 
 use crate::plan::{FaultPlan, Op};
@@ -155,11 +156,22 @@ impl MetaStore for FaultyMetaStore {
             .await
     }
 
-    async fn delete_derived_kind(&self, kind: &str) -> Result<u64> {
+    async fn count_derived(&self, kind: &str) -> Result<u64> {
+        self.plan
+            .run(Op::ListDerived, self.inner.count_derived(kind), |_, v| v)
+            .await
+    }
+
+    /// Each step is one faultable call; `delete_derived_kind` is their loop.
+    async fn delete_derived_step(
+        &self,
+        kinds: &[&str],
+        cursor: Option<&[u8]>,
+    ) -> Result<DeleteStep> {
         self.plan
             .run(
                 Op::DeleteDerivedKind,
-                self.inner.delete_derived_kind(kind),
+                self.inner.delete_derived_step(kinds, cursor),
                 |_, v| v,
             )
             .await

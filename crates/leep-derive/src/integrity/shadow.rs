@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use bytes::Bytes;
 use leep_core::{
-    BlobMeta, BlobStore, Changeset, ChangesetId, Error, Hash, MetaStore, RefLogEntry,
+    BlobMeta, BlobStore, Changeset, ChangesetId, DeleteStep, Error, Hash, MetaStore, RefLogEntry,
     RefUpdateContext, Result,
 };
 
@@ -110,7 +110,7 @@ impl MetaStore for ShadowMeta {
         Ok(())
     }
 
-    async fn delete_derived_kind(&self, _: &str) -> Result<u64> {
+    async fn delete_derived_step(&self, _: &[&str], _: Option<&[u8]>) -> Result<DeleteStep> {
         Err(read_only())
     }
 }
