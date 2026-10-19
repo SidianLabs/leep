@@ -34,6 +34,9 @@ pub struct SnapshotInfo {
     /// the snapshot references was in the blob store at this time.
     pub taken_at: i64,
     pub changesets: u64,
+    /// Changeset compression dictionaries (ADR 0053), which the rows that
+    /// use them cannot be read without.
+    pub changeset_dicts: u64,
     /// Ref tips at the snapshot.
     pub refs: BTreeMap<String, ChangesetId>,
     pub derived: u64,
@@ -83,12 +86,15 @@ fn is_postgres(url: &str) -> bool {
 
 type Pair = (Vec<u8>, Vec<u8>);
 type DerivedRow = (String, Vec<u8>, Vec<u8>);
+/// `changeset_dicts`: id, created_at, data.
+type DictRow = (i64, i64, Vec<u8>);
 
 /// Rows of one read transaction on the source.
 #[async_trait]
 trait Source: Send {
     async fn schema_version(&mut self) -> Result<u64>;
     async fn changesets(&mut self, after: &[u8], limit: usize) -> Result<Vec<Pair>>;
+    async fn changeset_dicts(&mut self) -> Result<Vec<DictRow>>;
     async fn refs(&mut self) -> Result<Vec<(String, Vec<u8>)>>;
     async fn derived(&mut self, after: &(String, Vec<u8>), limit: usize)
         -> Result<Vec<DerivedRow>>;
@@ -102,6 +108,7 @@ trait Sink: Send {
     async fn is_empty(&mut self) -> Result<bool>;
     async fn clear(&mut self) -> Result<()>;
     async fn put_changesets(&mut self, rows: &[Pair]) -> Result<()>;
+    async fn put_changeset_dicts(&mut self, rows: &[DictRow]) -> Result<()>;
     async fn put_refs(&mut self, rows: &[(String, Vec<u8>)]) -> Result<()>;
     async fn put_derived(&mut self, rows: &[DerivedRow]) -> Result<()>;
     async fn put_ref_log(&mut self, rows: &[LogRow]) -> Result<()>;
@@ -115,11 +122,15 @@ async fn copy(src: &mut dyn Source, dst: &mut dyn Sink) -> Result<SnapshotInfo> 
         schema_version: src.schema_version().await?,
         taken_at: leep_core::store::unix_now(),
         changesets: 0,
+        changeset_dicts: 0,
         refs: BTreeMap::new(),
         derived: 0,
         ref_log: 0,
         ref_log_last_seq: 0,
     };
+    let dicts = src.changeset_dicts().await?;
+    info.changeset_dicts = dicts.len() as u64;
+    dst.put_changeset_dicts(&dicts).await?;
     let mut after = Vec::new();
     loop {
         let page = src.changesets(&after, PAGE).await?;
@@ -423,6 +434,13 @@ impl Source for SqliteSource {
         Ok(v.unwrap_or(0) as u64)
     }
 
+    async fn changeset_dicts(&mut self) -> Result<Vec<DictRow>> {
+        sqlx::query_as("SELECT id, created_at, data FROM changeset_dicts ORDER BY id")
+            .fetch_all(&mut *self.0)
+            .await
+            .map_err(storage)
+    }
+
     async fn changesets(&mut self, after: &[u8], limit: usize) -> Result<Vec<Pair>> {
         let rows = sqlx::query("SELECT id, data FROM changesets WHERE id > ? ORDER BY id LIMIT ?")
             .bind(after)
@@ -503,7 +521,8 @@ impl Sink for SqliteSink {
             "SELECT (SELECT COUNT(*) FROM (SELECT 1 FROM changesets LIMIT 1)) \
              + (SELECT COUNT(*) FROM (SELECT 1 FROM refs LIMIT 1)) \
              + (SELECT COUNT(*) FROM (SELECT 1 FROM derived LIMIT 1)) \
-             + (SELECT COUNT(*) FROM (SELECT 1 FROM ref_log LIMIT 1))",
+             + (SELECT COUNT(*) FROM (SELECT 1 FROM ref_log LIMIT 1)) \
+             + (SELECT COUNT(*) FROM (SELECT 1 FROM changeset_dicts LIMIT 1))",
         )
         .fetch_one(&mut *self.0)
         .await
@@ -512,12 +531,31 @@ impl Sink for SqliteSink {
     }
 
     async fn clear(&mut self) -> Result<()> {
-        for t in ["changesets", "refs", "derived", "ref_log"] {
+        for t in [
+            "changesets",
+            "changeset_dicts",
+            "refs",
+            "derived",
+            "ref_log",
+        ] {
             sqlx::query(&format!("DELETE FROM {t}"))
                 .execute(&mut *self.0)
                 .await
                 .map_err(storage)?;
         }
+        Ok(())
+    }
+
+    async fn put_changeset_dicts(&mut self, rows: &[DictRow]) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut q =
+            QueryBuilder::<Sqlite>::new("INSERT INTO changeset_dicts (id, created_at, data) ");
+        q.push_values(rows, |mut b, (id, at, data)| {
+            b.push_bind(id).push_bind(at).push_bind(data);
+        });
+        q.build().execute(&mut *self.0).await.map_err(storage)?;
         Ok(())
     }
 
@@ -618,6 +656,13 @@ impl Source for PgSource {
         Ok(v.unwrap_or(0) as u64)
     }
 
+    async fn changeset_dicts(&mut self) -> Result<Vec<DictRow>> {
+        sqlx::query_as("SELECT id, created_at, data FROM changeset_dicts ORDER BY id")
+            .fetch_all(&mut *self.0)
+            .await
+            .map_err(storage)
+    }
+
     async fn changesets(&mut self, after: &[u8], limit: usize) -> Result<Vec<Pair>> {
         let rows =
             sqlx::query("SELECT id, data FROM changesets WHERE id > $1 ORDER BY id LIMIT $2")
@@ -701,7 +746,7 @@ impl Sink for PgSink {
         // Writers are excluded so that "empty" stays true until commit. A
         // concurrent server inserting meanwhile would be a deployment error;
         // the lock turns it into a wait, not a corrupt mix.
-        sqlx::query("LOCK TABLE changesets, refs, derived, ref_log IN ACCESS EXCLUSIVE MODE")
+        sqlx::query("LOCK TABLE changesets, changeset_dicts, refs, derived, ref_log IN ACCESS EXCLUSIVE MODE")
             .execute(&mut *self.0)
             .await
             .map_err(storage)?;
@@ -709,7 +754,8 @@ impl Sink for PgSink {
             "SELECT (SELECT COUNT(*) FROM (SELECT 1 FROM changesets LIMIT 1) a) \
              + (SELECT COUNT(*) FROM (SELECT 1 FROM refs LIMIT 1) b) \
              + (SELECT COUNT(*) FROM (SELECT 1 FROM derived LIMIT 1) c) \
-             + (SELECT COUNT(*) FROM (SELECT 1 FROM ref_log LIMIT 1) d)",
+             + (SELECT COUNT(*) FROM (SELECT 1 FROM ref_log LIMIT 1) d) \
+             + (SELECT COUNT(*) FROM (SELECT 1 FROM changeset_dicts LIMIT 1) e)",
         )
         .fetch_one(&mut *self.0)
         .await
@@ -718,12 +764,31 @@ impl Sink for PgSink {
     }
 
     async fn clear(&mut self) -> Result<()> {
-        for t in ["changesets", "refs", "derived", "ref_log"] {
+        for t in [
+            "changesets",
+            "changeset_dicts",
+            "refs",
+            "derived",
+            "ref_log",
+        ] {
             sqlx::query(&format!("DELETE FROM {t}"))
                 .execute(&mut *self.0)
                 .await
                 .map_err(storage)?;
         }
+        Ok(())
+    }
+
+    async fn put_changeset_dicts(&mut self, rows: &[DictRow]) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut q =
+            QueryBuilder::<Postgres>::new("INSERT INTO changeset_dicts (id, created_at, data) ");
+        q.push_values(rows, |mut b, (id, at, data)| {
+            b.push_bind(id).push_bind(at).push_bind(data);
+        });
+        q.build().execute(&mut *self.0).await.map_err(storage)?;
         Ok(())
     }
 

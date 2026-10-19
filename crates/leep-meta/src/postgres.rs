@@ -6,16 +6,18 @@ use bytes::Bytes;
 use leep_core::prefix::IdPrefix;
 use leep_core::store::unix_now;
 use leep_core::{
-    check_ref_chain, Changeset, ChangesetId, DerivedRow, Hash, MetaStore, RefLogEntry, RefStep,
-    RefUpdateContext, Result,
+    check_ref_chain, Changeset, ChangesetId, DeleteStep, DerivedRow, Hash, MetaStore, RefLogEntry,
+    RefStep, RefUpdateContext, Result,
 };
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{PgConnection, PgPool, Row};
 
+use crate::codec::Codec;
+use crate::drop::{self, nothing_left, Cursor, KEY_BATCH};
 use crate::migrate::{self, AppliedMigration, Migration, MigrationReport, Session};
 use crate::{
-    changesets_in_order, decode_checked, derived_columns, log_entry, storage, to_hash, to_id,
-    unique, values_in_order, LogRow, SchemaMode, DELETE_BATCH,
+    changesets_in_order, derived_columns, log_entry, storage, to_hash, to_id, unique,
+    values_in_order, LogRow, SchemaMode,
 };
 
 /// The compiled migration list (ADR 0023). Append only.
@@ -30,6 +32,12 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 2,
         name: "analyze_thresholds",
         sql: include_str!("../migrations/postgres/0002_analyze_thresholds.sql"),
+        satisfied_by: &[],
+    },
+    Migration {
+        version: 3,
+        name: "changeset_dicts",
+        sql: include_str!("../migrations/postgres/0003_changeset_dicts.sql"),
         satisfied_by: &[],
     },
 ];
@@ -47,6 +55,11 @@ const LOG_LOCK: i64 = 7164738;
 
 pub struct PostgresMetaStore {
     pub(crate) pool: PgPool,
+    /// Changeset dictionaries (ADR 0053).
+    pub(crate) codec: Codec,
+    /// Whether the schema has `changeset_dicts`: tests open stores with
+    /// shorter migration lists.
+    pub(crate) has_dicts: bool,
 }
 
 impl PostgresMetaStore {
@@ -127,7 +140,9 @@ impl PostgresMetaStore {
         if mode == SchemaMode::RequireCurrent {
             migrate::require_current(&report)?;
         }
-        Ok(Self { pool })
+        let store = Self::with_pool(pool, migrations);
+        store.load_dicts().await?;
+        Ok(store)
     }
 
     async fn pool(url: &str, schema: Option<String>) -> Result<PgPool> {
@@ -251,13 +266,208 @@ fn quote_ident(s: &str) -> String {
     format!("\"{}\"", s.replace('"', "\"\""))
 }
 
+impl PostgresMetaStore {
+    fn with_pool(pool: PgPool, migrations: &[Migration]) -> Self {
+        Self {
+            pool,
+            codec: Codec::default(),
+            has_dicts: migrations
+                .iter()
+                .any(|m| m.version >= crate::compact::DICTS_SCHEMA_VERSION),
+        }
+    }
+
+    /// Learn the changeset dictionaries added since this store last looked.
+    pub(crate) async fn load_dicts(&self) -> Result<()> {
+        if !self.has_dicts {
+            return Ok(());
+        }
+        let ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM changeset_dicts ORDER BY id")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(storage)?;
+        let mut rows = Vec::new();
+        for id in ids {
+            if u32::try_from(id).is_ok_and(|i| self.codec.knows(i)) {
+                continue;
+            }
+            let data: Vec<u8> =
+                sqlx::query_scalar("SELECT data FROM changeset_dicts WHERE id = $1")
+                    .bind(id)
+                    .fetch_one(&self.pool)
+                    .await
+                    .map_err(storage)?;
+            rows.push((id, data));
+        }
+        self.codec.add(rows)?;
+        self.codec.mark_checked();
+        Ok(())
+    }
+
+    /// The row bytes for `cs`, with the newest dictionary any writer could
+    /// know of a minute ago.
+    async fn encode(&self, cs: &Changeset) -> Result<Vec<u8>> {
+        if self.has_dicts && self.codec.due() {
+            self.load_dicts().await?;
+        }
+        Ok(self.codec.encode(cs))
+    }
+
+    /// Decode fetched rows, first learning any dictionary they name that
+    /// this store has not seen (a compaction ran since it started).
+    async fn decode_rows(
+        &self,
+        ids: &[ChangesetId],
+        rows: Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> Result<Vec<Option<Changeset>>> {
+        if self
+            .codec
+            .missing(rows.iter().map(|r| r.1.as_slice()))
+            .is_some()
+        {
+            self.load_dicts().await?;
+        }
+        changesets_in_order(&self.codec, ids, rows.into_iter())
+    }
+}
+
+/// Run first in a walk step's transaction; see [`PostgresMetaStore::walk_step`].
+pub(crate) const NO_INDEX_PATHS: &str = "SELECT set_config('enable_indexscan', 'off', true), \
+     set_config('enable_indexonlyscan', 'off', true), \
+     set_config('enable_bitmapscan', 'off', true)";
+
+/// One walk step: the rows of kinds `$1` on pages `[$2, $3)`, counted per kind.
+pub(crate) const WALK_DELETE: &str = "WITH gone AS (DELETE FROM derived \
+     WHERE ctid >= $2::tid AND ctid < $3::tid AND kind = ANY($1) RETURNING kind) \
+     SELECT kind, count(*) FROM gone GROUP BY kind";
+
+impl PostgresMetaStore {
+    /// Pages in `derived` now; a walk ends when it reaches the current end.
+    async fn derived_pages(&self) -> Result<u64> {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT pg_relation_size('derived') / current_setting('block_size')::bigint",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(storage)?;
+        Ok(n as u64)
+    }
+
+    /// Delete the rows of `kinds` on pages `[at, at + span)`. Index paths are
+    /// switched off for the statement: with an estimate of a row or two for
+    /// a kind (ADR 0042) Postgres would otherwise walk the whole kind
+    /// through the primary key for every page range.
+    async fn walk_step(&self, kinds: &[&str], at: u64, span: u64) -> Result<DeleteStep> {
+        let pages = self.derived_pages().await?;
+        let mut deleted = vec![0; kinds.len()];
+        if at >= pages {
+            return Ok(DeleteStep {
+                deleted,
+                next: None,
+                done: pages,
+                total: pages,
+                unit: "pages",
+            });
+        }
+        // Block numbers are 32 bits; the last range ends past every block.
+        let end = (at + span).min(u64::from(u32::MAX));
+        let started = std::time::Instant::now();
+        let mut tx = self.pool.begin().await.map_err(storage)?;
+        sqlx::query(NO_INDEX_PATHS)
+            .execute(&mut *tx)
+            .await
+            .map_err(storage)?;
+        let gone: Vec<(String, i64)> = sqlx::query_as(WALK_DELETE)
+            .bind(kinds)
+            .bind(format!("({at},0)"))
+            .bind(format!("({end},0)"))
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(storage)?;
+        tx.commit().await.map_err(storage)?;
+        drop::tally(
+            kinds,
+            &mut deleted,
+            gone.into_iter().map(|(k, n)| (k, n as u64)),
+        );
+        let next = Cursor::Walk {
+            at: end,
+            span: drop::next_span(span, started.elapsed()),
+        };
+        Ok(DeleteStep {
+            deleted,
+            next: Some(next.encode()),
+            done: end.min(pages),
+            total: pages,
+            unit: "pages",
+        })
+    }
+
+    /// Delete the next [`KEY_BATCH`] rows of `kinds[kind]` after `after`, by
+    /// one ordered walk of the primary key deleted by `ctid`: a plan no
+    /// estimate can change (ADR 0042). The cursor moves past every row the
+    /// batch selected, so dead index entries of earlier batches are not
+    /// walked again.
+    async fn keys_step(
+        &self,
+        kinds: &[&str],
+        kind: usize,
+        after: Vec<u8>,
+        done: u64,
+        total: u64,
+    ) -> Result<DeleteStep> {
+        let mut deleted = vec![0; kinds.len()];
+        let Some(name) = kinds.get(kind) else {
+            return Ok(nothing_left(kinds));
+        };
+        let (last, n): (Option<Vec<u8>>, i64) = sqlx::query_as(
+            "WITH batch AS MATERIALIZED ( \
+               SELECT ctid, key FROM derived WHERE kind = $1 AND key > $2 ORDER BY key LIMIT $3), \
+             gone AS (DELETE FROM derived \
+               WHERE ctid = ANY(ARRAY(SELECT ctid FROM batch)) RETURNING 1) \
+             SELECT (SELECT key FROM batch ORDER BY key DESC LIMIT 1), (SELECT count(*) FROM gone)",
+        )
+        .bind(name)
+        .bind(after)
+        .bind(KEY_BATCH)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(storage)?;
+        deleted[kind] = n as u64;
+        let done = done + n as u64;
+        let next = match last {
+            Some(key) => Some(Cursor::Keys {
+                kind,
+                after: key,
+                done,
+                total,
+            }),
+            None if kind + 1 < kinds.len() => Some(Cursor::Keys {
+                kind: kind + 1,
+                after: Vec::new(),
+                done,
+                total,
+            }),
+            None => None,
+        };
+        Ok(DeleteStep {
+            deleted,
+            next: next.map(|c| c.encode()),
+            done,
+            total: total.max(done),
+            unit: "rows",
+        })
+    }
+}
+
 #[async_trait]
 impl MetaStore for PostgresMetaStore {
     async fn put_changeset(&self, cs: &Changeset) -> Result<ChangesetId> {
         let id = cs.id();
+        let data = self.encode(cs).await?;
         sqlx::query("INSERT INTO changesets (id, data) VALUES ($1, $2) ON CONFLICT DO NOTHING")
             .bind(id.0.as_bytes().as_slice())
-            .bind(cs.encode())
+            .bind(data)
             .execute(&self.pool)
             .await
             .map_err(storage)?;
@@ -270,8 +480,14 @@ impl MetaStore for PostgresMetaStore {
             .fetch_optional(&self.pool)
             .await
             .map_err(storage)?;
-        row.map(|r| decode_checked(id, &r.get::<Vec<u8>, _>(0)))
-            .transpose()
+        let Some(row) = row else { return Ok(None) };
+        let data: Vec<u8> = row.get(0);
+        let id_bytes = id.0.as_bytes().to_vec();
+        Ok(self
+            .decode_rows(std::slice::from_ref(id), vec![(id_bytes, data)])
+            .await?
+            .pop()
+            .flatten())
     }
 
     /// One `= ANY($1)` query whatever the number of ids.
@@ -285,7 +501,8 @@ impl MetaStore for PostgresMetaStore {
             .fetch_all(&self.pool)
             .await
             .map_err(storage)?;
-        changesets_in_order(ids, rows.iter().map(|r| (r.get(0), r.get(1))))
+        self.decode_rows(ids, rows.iter().map(|r| (r.get(0), r.get(1))).collect())
+            .await
     }
 
     /// An empty `after` sorts below every 32-byte id, so `None` needs no
@@ -545,28 +762,46 @@ impl MetaStore for PostgresMetaStore {
             .collect()
     }
 
-    /// Each batch is one ordered walk of the primary key, deleted by `ctid`:
-    /// a plan no estimate can change. `key IN (SELECT ...)` became a nested
-    /// loop over the whole kind per batch row when a stale estimate put the
-    /// kind at a row or two (ADR 0042). A row updated meanwhile has a new
-    /// `ctid` and goes in the next batch.
-    async fn delete_derived_kind(&self, kind: &str) -> Result<u64> {
-        let mut total = 0;
-        loop {
-            let n = sqlx::query(
-                "DELETE FROM derived WHERE ctid = ANY(ARRAY( \
-                 SELECT ctid FROM derived WHERE kind = $1 ORDER BY key LIMIT $2))",
-            )
+    /// An index-only scan of the primary key: no value is read.
+    async fn count_derived(&self, kind: &str) -> Result<u64> {
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM derived WHERE kind = $1")
             .bind(kind)
-            .bind(DELETE_BATCH)
-            .execute(&self.pool)
+            .fetch_one(&self.pool)
             .await
-            .map_err(storage)?
-            .rows_affected();
-            total += n;
-            if n == 0 {
-                return Ok(total);
+            .map_err(storage)?;
+        Ok(n as u64)
+    }
+
+    /// See [`crate::drop`]: the first step counts the rows and the table's
+    /// pages and picks a walk by `ctid` range or key-order batches.
+    async fn delete_derived_step(
+        &self,
+        kinds: &[&str],
+        cursor: Option<&[u8]>,
+    ) -> Result<DeleteStep> {
+        let cursor = match cursor {
+            Some(b) => Cursor::decode(b)?,
+            None => {
+                let rows: i64 =
+                    sqlx::query_scalar("SELECT count(*) FROM derived WHERE kind = ANY($1)")
+                        .bind(kinds)
+                        .fetch_one(&self.pool)
+                        .await
+                        .map_err(storage)?;
+                match drop::plan(rows as u64, self.derived_pages().await?) {
+                    Some(c) => c,
+                    None => return Ok(nothing_left(kinds)),
+                }
             }
+        };
+        match cursor {
+            Cursor::Walk { at, span } => self.walk_step(kinds, at, span).await,
+            Cursor::Keys {
+                kind,
+                after,
+                done,
+                total,
+            } => self.keys_step(kinds, kind, after, done, total).await,
         }
     }
 
@@ -618,6 +853,7 @@ impl MetaStore for PostgresMetaStore {
         rows: &[DerivedRow],
     ) -> Result<ChangesetId> {
         let id = cs.id();
+        let data = self.encode(cs).await?;
         let (kinds, keys, values) = derived_columns(rows);
         sqlx::query(
             "WITH c AS (INSERT INTO changesets (id, data) VALUES ($1, $2) ON CONFLICT DO NOTHING) \
@@ -626,7 +862,7 @@ impl MetaStore for PostgresMetaStore {
              ON CONFLICT (kind, key) DO UPDATE SET value = excluded.value",
         )
         .bind(id.0.as_bytes().as_slice())
-        .bind(cs.encode())
+        .bind(data)
         .bind(kinds)
         .bind(keys)
         .bind(values)
@@ -646,8 +882,10 @@ impl MetaStore for PostgresMetaStore {
         if changesets.is_empty() && rows.is_empty() {
             return Ok(());
         }
-        let encoded: Vec<(ChangesetId, Vec<u8>)> =
-            changesets.iter().map(|c| (c.id(), c.encode())).collect();
+        let mut encoded: Vec<(ChangesetId, Vec<u8>)> = Vec::with_capacity(changesets.len());
+        for c in changesets {
+            encoded.push((c.id(), self.encode(c).await?));
+        }
         let ids: Vec<&[u8]> = encoded
             .iter()
             .map(|(id, _)| id.0.as_bytes().as_slice())

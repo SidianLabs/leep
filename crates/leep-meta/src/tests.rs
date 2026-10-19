@@ -5,6 +5,7 @@ use leep_core::memory::check_meta_store_contract;
 use leep_core::{Changeset, MetaStore, RefUpdateContext};
 
 use super::*;
+use crate::drop::{Cursor, KEY_BATCH};
 
 pub(crate) fn cs(n: i64) -> Changeset {
     Changeset {
@@ -156,7 +157,7 @@ async fn sqlite_detects_corruption() {
 /// More rows than one delete batch, so dropping a kind takes several statements
 /// and still removes exactly that kind's rows.
 async fn check_delete_kind_spans_batches(store: &dyn MetaStore) {
-    let n = crate::DELETE_BATCH as usize * 2 + 37;
+    let n = crate::drop::KEY_BATCH as usize * 2 + 37;
     for i in 0..n {
         let key = leep_core::Hash::of_blob(&(i as u64).to_be_bytes());
         store
@@ -206,6 +207,159 @@ async fn postgres_delete_kind_spans_batches() {
 
 /// A batched write the database refuses part of leaves nothing behind. The
 /// caller has installed a trigger that rejects rows of kind `boom`.
+/// Run a drop of `kinds` to the end: (rows deleted per kind, steps, how the
+/// first step said to go on).
+async fn drop_all(store: &dyn MetaStore, kinds: &[&str]) -> (Vec<u64>, usize, Option<Cursor>) {
+    let mut deleted = vec![0; kinds.len()];
+    let mut cursor: Option<Vec<u8>> = None;
+    let mut first = None;
+    for steps in 1.. {
+        let step = store
+            .delete_derived_step(kinds, cursor.as_deref())
+            .await
+            .unwrap();
+        for (n, d) in deleted.iter_mut().zip(&step.deleted) {
+            *n += d;
+        }
+        assert!(step.done <= step.total, "{step:?}");
+        if steps == 1 {
+            first = step.next.as_deref().map(|c| Cursor::decode(c).unwrap());
+        }
+        match step.next {
+            Some(next) => cursor = Some(next),
+            None => return (deleted, steps, first),
+        }
+    }
+    unreachable!()
+}
+
+/// A kind that is a small share of a large table is deleted in key-order
+/// batches, never walking the table; one that is a large share is deleted
+/// by walking the table. Both take several statements here and leave other
+/// kinds alone.
+async fn check_delete_paths(store: &dyn MetaStore) {
+    let key = |kind: &str, n: u32| leep_core::Hash::of_blob(format!("{kind}/{n}").as_bytes());
+    let big = bytes::Bytes::from(vec![7u8; 1000]);
+    let mut rows = Vec::new();
+    for n in 0..10_000 {
+        rows.push(leep_core::DerivedRow::new(
+            "dp-big",
+            key("dp-big", n),
+            big.clone(),
+        ));
+        if n % 40 == 0 {
+            rows.push(leep_core::DerivedRow::new(
+                "dp-small",
+                key("dp-small", n),
+                bytes::Bytes::from_static(b"s"),
+            ));
+        }
+        if n % 100 == 0 {
+            rows.push(leep_core::DerivedRow::new(
+                "dp-keep",
+                key("dp-keep", n),
+                bytes::Bytes::from_static(b"k"),
+            ));
+        }
+    }
+    for chunk in rows.chunks(1000) {
+        store.put_derived_many(chunk).await.unwrap();
+    }
+
+    let (deleted, steps, first) = drop_all(store, &["dp-small"]).await;
+    assert_eq!(deleted, [250]);
+    assert!(matches!(first, Some(Cursor::Keys { .. })), "{first:?}");
+    assert!(
+        steps >= 3,
+        "250 rows in batches of {KEY_BATCH}: {steps} steps"
+    );
+    assert_eq!(store.count_derived("dp-big").await.unwrap(), 10_000);
+
+    let (deleted, steps, first) = drop_all(store, &["dp-big", "dp-none"]).await;
+    assert_eq!(deleted, [10_000, 0]);
+    assert!(matches!(first, Some(Cursor::Walk { .. })), "{first:?}");
+    assert!(steps >= 3, "{steps} steps");
+    assert_eq!(store.count_derived("dp-keep").await.unwrap(), 100);
+    assert_eq!(drop_all(store, &["dp-big"]).await.0, [0], "idempotent");
+    assert_eq!(store.delete_derived_kind("dp-keep").await.unwrap(), 100);
+}
+
+#[tokio::test]
+async fn sqlite_delete_paths() {
+    let s = SqliteMetaStore::connect("sqlite::memory:").await.unwrap();
+    check_delete_paths(&s).await;
+}
+
+#[tokio::test]
+async fn postgres_delete_paths() {
+    let Some((s, _)) = pg_store("delete_paths").await else {
+        return;
+    };
+    check_delete_paths(&s).await;
+}
+
+/// With statistics from before a kind existed, Postgres estimates a row or
+/// two for it and would delete a page range through the primary key, which
+/// walks the whole kind every step (ADR 0042, ADR 0052). The walk statement
+/// must stay a scan of the page range.
+#[tokio::test]
+async fn postgres_walk_plan_ignores_stale_estimates() {
+    let Some((s, _)) = pg_store("walk_plan").await else {
+        return;
+    };
+    let key = |kind: &str, n: u32| leep_core::Hash::of_blob(format!("{kind}/{n}").as_bytes());
+    let rows: Vec<_> = (0..2000)
+        .map(|n| {
+            leep_core::DerivedRow::new("wp-old", key("wp-old", n), bytes::Bytes::from(vec![1; 300]))
+        })
+        .collect();
+    s.put_derived_many(&rows).await.unwrap();
+    sqlx::query("ANALYZE derived")
+        .execute(&s.pool)
+        .await
+        .unwrap();
+    let rows: Vec<_> = (0..5000)
+        .map(|n| {
+            leep_core::DerivedRow::new("wp-new", key("wp-new", n), bytes::Bytes::from(vec![2; 300]))
+        })
+        .collect();
+    for chunk in rows.chunks(1000) {
+        s.put_derived_many(chunk).await.unwrap();
+    }
+    let explain = |guarded: bool| {
+        let pool = s.pool.clone();
+        async move {
+            let mut tx = pool.begin().await.unwrap();
+            if guarded {
+                sqlx::query(crate::postgres::NO_INDEX_PATHS)
+                    .execute(&mut *tx)
+                    .await
+                    .unwrap();
+            }
+            let plan: Vec<String> =
+                sqlx::query_scalar(&format!("EXPLAIN {}", crate::postgres::WALK_DELETE))
+                    .bind(vec!["wp-new"])
+                    .bind("(0,0)")
+                    .bind("(64,0)")
+                    .fetch_all(&mut *tx)
+                    .await
+                    .unwrap();
+            tx.rollback().await.unwrap();
+            plan.join("\n")
+        }
+    };
+    let unguarded = explain(false).await;
+    assert!(
+        unguarded.contains("Index"),
+        "the stale estimate is reproduced:\n{unguarded}"
+    );
+    let guarded = explain(true).await;
+    assert!(guarded.contains("Tid Range Scan"), "{guarded}");
+    assert!(!guarded.contains("Index"), "{guarded}");
+    assert_eq!(s.delete_derived_kind("wp-new").await.unwrap(), 5000);
+    assert_eq!(s.count_derived("wp-old").await.unwrap(), 2000);
+}
+
 async fn check_batched_writes_are_atomic(store: &dyn MetaStore) {
     use bytes::Bytes;
     use leep_core::{DerivedRow, Hash};
@@ -367,7 +521,7 @@ pub(crate) fn schema(name: &str) -> String {
     format!("leep_test_{name}_{}", std::process::id())
 }
 
-async fn pg_store(name: &str) -> Option<(PostgresMetaStore, String)> {
+pub(crate) async fn pg_store(name: &str) -> Option<(PostgresMetaStore, String)> {
     let url = pg_url()?;
     let s = PostgresMetaStore::connect_with_schema(&url, &schema(name))
         .await

@@ -30,7 +30,7 @@ skill.
 
 | Type | Kind tag | Where |
 |---|---|---|
-| `Changeset` | `changeset-v1` | `MetaStore.changesets.data` |
+| `Changeset` | `changeset-v1` | `MetaStore.changesets.data`, as the canonical bytes or a zstd frame of them (ADR 0053, "Changeset rows" below) |
 | `TreeNode` | `tree-v1` | `BlobStore`, keyed by `TreeNode::hash()` |
 | derived `root_tree` | — | `MetaStore.derived`, value = 32 raw bytes |
 | derived `generation` | — | `MetaStore.derived`, value = u64 (owned by leep-derive) |
@@ -57,7 +57,8 @@ skill.
 
 Content-addressed data is verified when read: `Repo::read_tree` hashes the
 stored bytes and compares them with the key, the SQL backends decode a
-changeset and compare its id with its row key, and a history pack's part is
+changeset (decompressing a compressed row first) and compare its id with its
+row key, and a history pack's part is
 checked against its checksum, which covers its writer and number. A
 mismatch is `Error::Storage`. File blobs and the other derived kinds are not
 verified (ADR 0021 lists which).
@@ -425,7 +426,9 @@ a blank line and `This reverts <id>.`.
 ## SQL schema (leep-meta)
 
 ```
-changesets(id BYTEA PRIMARY KEY, data BYTEA NOT NULL)          -- data = Changeset::encode()
+changesets(id BYTEA PRIMARY KEY, data BYTEA NOT NULL)          -- data = Changeset::encode(), or a zstd frame of it (ADR 0053)
+changeset_dicts(id BIGINT PRIMARY KEY,                         -- SQLite: INTEGER; migration 0003
+                created_at BIGINT NOT NULL, data BYTEA NOT NULL) -- a zstd dictionary whose header id = id
 refs(name TEXT PRIMARY KEY, target BYTEA NOT NULL)
 derived(kind TEXT, key BYTEA, value BYTEA, PRIMARY KEY(kind, key))
 ref_log(seq BIGSERIAL PRIMARY KEY,                             -- SQLite: INTEGER PRIMARY KEY AUTOINCREMENT
@@ -449,6 +452,39 @@ autovacuum_analyze_threshold = 10000)` and `changesets
 (autovacuum_analyze_scale_factor = 0.02, autovacuum_analyze_threshold =
 10000)`. The SQLite migration of the same number does nothing; it keeps the
 two backends' versions equal.
+
+Migration 0003 (`changeset_dicts`, ADR 0053) adds the dictionaries table,
+empty. Nothing else changes, and a server keeps writing plain changeset rows
+until the table has a row; see "Changeset rows" below.
+
+### Changeset rows (ADR 0053)
+
+`changesets.data` is one of:
+
+- **Plain**: the canonical postcard bytes, `Changeset::encode()`. Every row
+  written before ADR 0053, and every row written while `changeset_dicts` is
+  empty, a changeset whose frame would not be smaller, or one over 256 MiB.
+- **Compressed**: one zstd frame (magic `28 b5 2f fd`) whose content is
+  exactly the canonical bytes. The frame header records the content size
+  (required; at most 256 MiB) and the dictionary id: a `changeset_dicts.id`,
+  or 0 (absent) for a frame made without a dictionary. No checksum: the id
+  check covers it. Written at level 9; the level is not part of the format.
+
+A reader that finds the magic decompresses with the named dictionary,
+decodes and compares the id with the row key; if that fails it decodes the
+row as plain bytes, since a plain changeset with 40 parents whose first id
+starts `b5 2f fd` begins with the magic too. A row that is neither is
+`Error::Storage` ("corrupt changeset row", or "needs dictionary N, which
+changeset_dicts lacks"). Writers never store plain bytes that start with the
+magic; they compress them, with dictionary 0 if there is none.
+
+`changeset_dicts.data` is a zstd dictionary (magic `37 a4 30 ec`, then the
+dictionary id as `u32` little-endian), trained with zstd's
+`ZDICT_trainFromBuffer` on canonical changeset bytes; its header id must
+equal the row's `id` (ids start at 1). Rows are added by `leep-server
+compact-changesets` and never changed or deleted. Rows in different stores
+of the same history are different bytes; only the decoded changesets and
+their ids compare.
 
 ### Schema versioning (ADR 0023)
 
@@ -670,6 +706,17 @@ shape changed, and `verify` and `repair` are not part of the HTTP API.
 `verify` lists every kind to check it; `repair` rewrites or drops only the kinds
 that history can regenerate, and refuses the rest (ADR 0025).
 
+ADR 0052 adds `MetaStore::count_derived` (`SELECT count(*) FROM derived WHERE
+kind = ?`) and `delete_derived_step`, which replaces the loops above as the way
+backends delete; `delete_derived_kind` is now a provided method over it. A
+large drop walks the table in physical order, on Postgres
+`DELETE FROM derived WHERE ctid >= $2::tid AND ctid < $3::tid AND kind = ANY($1)`
+with index paths switched off for the statement, on SQLite
+`DELETE FROM derived WHERE rowid >= ? AND rowid < ? AND +kind IN (...)`; a
+small one runs the key-order batch from a cursor (`key > $after`). The cursor
+passed between steps is in memory only and never stored. No table, index,
+encoding or `/v1` shape changed.
+
 ## Batched reads (new `MetaStore` methods, no format change)
 
 ADR 0030 adds `MetaStore::get_changesets` and `get_derived_many`. They read the
@@ -767,9 +814,10 @@ written before ADR 0039 hold no packs; both read and restore the same way.
 
 `meta.db` is a SQLite database with the schema of `schema_migrations` (ADR
 0023) at the version in the manifest, whatever backend the metadata came from:
-tables `changesets`, `refs`, `derived`, `ref_log` hold the rows of one read
-transaction, byte for byte, including every `derived` kind (signatures,
-reviews and GC rows too). It is a single file (journal mode `DELETE`, no `-wal`).
+tables `changesets`, `changeset_dicts` (from schema 3), `refs`, `derived`,
+`ref_log` hold the rows of one read transaction, byte for byte, including
+every `derived` kind (signatures, reviews and GC rows too) and compressed
+changeset rows with the dictionaries they need. It is a single file (journal mode `DELETE`, no `-wal`).
 The highest ref log `seq` ever issued is preserved (`sqlite_sequence`), so a
 restore continues the numbering. It is never opened in place by a reader: tools
 work on a scratch copy.

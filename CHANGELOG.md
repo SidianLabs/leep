@@ -614,6 +614,32 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   built before resume with `repair rederive --kind log-filter-v1 --missing`.
   `history_profile --releases C` builds a history shaped like Linux's
   release cycles and `--time-back-merges [--cold]` times its back-merges.
+- Changeset rows compressed with a dictionary trained on the store's own
+  history (ADR 0053): `leep-server compact-changesets` trains and stores the
+  dictionary (schema migration 0003 adds `changeset_dicts`), rewrites existing
+  rows in place, and servers write new rows compressed from then on. Ids,
+  hashes, the API and `Changeset` are unchanged, and every row is still
+  checked against its id when read. The `changesets` table shrinks to about
+  55-60%: 19.9 to 10.9 MB on git/git v1.7.0 and 262 to 159 MB on the last
+  117,680 Linux commits (about 2.9 to 1.75 GB projected for all of Linux),
+  with derivation and `log` speed unchanged within noise. **Upgrade:** the
+  migration tolerates old servers, but run `compact-changesets` only once
+  every server is on this version (OPERATIONS.md, "Upgrading"). Backups
+  carry the dictionaries. The `changeset_compression` example measures
+  encodings on a store's rows or on a git history.
+- `repair drop` of a large kind is fast (ADR 0052). It walks the `derived`
+  table in storage order, a range of pages per short transaction, instead of
+  deleting in key order, which read pages at random and logged each page to
+  WAL several times. In a cold-cache reproduction it deletes 35,000 rows a
+  second instead of 6,100, with a fifth of the WAL; dropping
+  `history-tree-v3` on Linux (26.9M rows) should take 10 to 20 minutes
+  instead of 5.5 hours. The kinds of one command go in one walk, with rows,
+  rate, position and ETA printed every ten seconds, and a small kind is still
+  deleted from the primary key without reading the rest of the table.
+  `--dry-run` counts from the index without reading values: 2 s instead of
+  154 s in the reproduction, 38 minutes on Linux before. SQLite drops twice
+  as fast. New `MetaStore::count_derived` and `delete_derived_step` (bounded,
+  resumable steps); `delete_derived_kind` becomes a provided method over them.
 
 ### Git compatibility (M7)
 - Live git mirror (ADR 0046): `leep-git mirror run` keeps a git remote

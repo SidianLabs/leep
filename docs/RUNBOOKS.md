@@ -1520,7 +1520,8 @@ Postgres cannot write, backups fail (see [LeepBackupStale](#leepbackupstale)).
 5. Backups: the pool only grows; old snapshot directories are the thing to expire.
 6. Metadata: derived rows dominate (the search index is about 30% of the indexed text
    for source code, up to about 100% for random text); the ref log is never pruned
-   but small (tens of MB a year).
+   but small (tens of MB a year). `leep-server compact-changesets --dry-run` reports
+   how much compressing the `changesets` table would save (about half, ADR 0053).
 7. Is the store packed? A filesystem store with no `packs/*.pack` keeps one file
    per object, uncompressed; `leep-server repack` usually shrinks a long history
    ten to thirty times (OPERATIONS.md, "Packing blobs").
@@ -1549,6 +1550,10 @@ Postgres cannot write, backups fail (see [LeepBackupStale](#leepbackupstale)).
    after its fence.
 3. Grow the volume: that is the fix for steady growth. On SQLite, freed pages are
    reused inside the file but the file does not shrink by itself.
+   If `changesets` was never compacted, `leep-server compact-changesets` (every
+   server must be on a release that reads compressed rows; OPERATIONS.md,
+   "Upgrading") halves it, then `VACUUM FULL changesets` returns the space (each
+   needs free room of about half the table while it runs).
 4. Last resort for metadata: `leep-server repair drop --kind blob-trigrams-v1
    tree-trigrams-v1` removes the search index rows; they rebuild on demand and the
    first searches are slow (`derive-search main` warms them). Take a backup first.

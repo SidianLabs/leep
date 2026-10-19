@@ -725,16 +725,67 @@ the old servers still serving from v3:
    the number of idle cores.
 2. Replace the old servers with new ones. Path queries are answered from v4
    at once.
-3. `repair drop --kind history-tree-v3 --dry-run`, then without `--dry-run`,
-   which deletes `history-tree-v3` and `history-node-v3` rows in batches.
-4. Postgres keeps the freed pages for reuse; to give the space back to the
-   operating system, run `VACUUM FULL derived` in a maintenance window (it
-   locks the table and needs room for a copy of what remains) or use
-   `pg_repack`. Then `ANALYZE derived`.
+3. `repair drop --kind history-tree-v3 --dry-run` (it counts without reading
+   values: about a minute on Linux), then without `--dry-run`, which deletes
+   `history-tree-v3` and `history-node-v3` rows in one walk of the `derived`
+   table in storage order, a range of pages per short transaction (ADR 0052).
+   It prints rows deleted, the rate, how far through the table it is and an
+   ETA every ten seconds. Expect about the time to read the table once and
+   write about as much WAL and data: 10 to 20 minutes for Linux's 33 GB
+   table on a disk that streams 150 to 300 MB/s (it took 5.5 hours before
+   ADR 0052). Make sure `pg_wal` can absorb that write rate: WAL is about
+   the size of the table, recycled at each checkpoint. It is safe beside
+   running servers; if it is stopped, run it again, which reads the table
+   again from the start but has only the rest to delete.
+4. Postgres keeps the freed pages for reuse. Soon after the drop autovacuum
+   vacuums `derived` (another sequential pass over the table) so the space
+   can be reused. To give the space back to the operating system, run
+   `VACUUM FULL derived` in a maintenance window (it locks the table and
+   needs room for a copy of what remains) or use `pg_repack`. Then
+   `ANALYZE derived`.
 
 If the disk cannot hold both indexes, drop v3 first (step 3), start the new
 servers and let the warmer (or `rederive`) build v4: path queries wait for
 derivation, or derive on demand, until it has caught up.
+
+**Compressing changesets (schema v3, ADR 0053).** Migration 0003 adds an
+empty `changeset_dicts` table and changes nothing old servers read, so it
+may be applied while servers of the previous version still run (rolling
+upgrade). The space saving is a separate step, run once every server is on
+this version or later, because older servers cannot read compressed rows:
+
+1. Finish the rollout: no server, `leep-git` importer or tool older than
+   this release may still use the database.
+2. See what it would do (trains a dictionary in memory, writes nothing):
+   ```sh
+   leep-server compact-changesets --dry-run
+   ```
+3. Run it. It stores a dictionary trained on 50,000 changesets of this
+   store, then rewrites every plain changeset row in batches; servers keep
+   serving, and reads and writes are unaffected (each row reads the same
+   before and after). It can be stopped and run again; a later run only
+   compresses rows that are still plain. On Postgres each rewritten row is a
+   new, smaller row version beside the old one until vacuum, so it needs free
+   disk of about half the table.
+   ```sh
+   leep-server compact-changesets
+   ```
+   About 4 minutes per million changesets of Linux's size on Postgres
+   (PERFORMANCE.md, "Changeset compression"), with the `changesets` table
+   about halved. Servers pick up the dictionary on their next read of a
+   compressed row, or within a minute for writes; rows a server wrote plain
+   meanwhile are compressed by the next run, so run it again after a day or
+   on a schedule (it skips compressed rows, but reads every row).
+4. On Postgres the old row versions are free space in the table; `VACUUM
+   FULL changesets` (locks the table for the copy; minutes on all of Linux)
+   or `pg_repack` returns it to the filesystem, then `ANALYZE changesets`.
+   On SQLite, `VACUUM`.
+
+Never delete a `changeset_dicts` row: the changesets compressed with it
+cannot be read without it. Backups carry both tables. `--retrain` trains a
+new dictionary (for example after the history has changed character) and
+moves every row to it; the old dictionary stays. A store with fewer than
+1,000 changesets is left alone.
 
 ## Indexing a large history
 
@@ -1095,8 +1146,15 @@ restores a missing or damaged one. The search kinds (`blob-trigrams-v1`,
 `tree-trigrams-v1`) are rewritten for the rows that exist; use
 `derive-search REV` to build rows that do not.
 
-`drop` removes every row of a kind in batches and the kind then derives again
-on demand. It changes no answer, only latency: the next query that needs a row
+`drop` removes every row of a kind and the kind then derives again on demand.
+A kind that is a large share of `derived` is deleted by walking the table in
+storage order, a range of pages per transaction of under a second; a small one
+in key-order batches of 10,000 (ADR 0052). The kinds of one command go in one
+walk, with a progress line (rows, rate, position, ETA) every ten seconds, and
+`--dry-run` counts rows from the index without reading values. It is safe
+beside servers: rows of other kinds are untouched, and a row of the dropped
+kind that a server writes while it runs may survive, as one written just after
+it would. A stopped `drop` is finished by running it again. It changes no answer, only latency: the next query that needs a row
 derives it, and for `generation`, `skiplist`, `root_tree` and `history-tree-v4` on a
 long history the first query derives the whole history. Warm them with
 `repair rederive` instead of waiting for a user. Dropping `history-tree-v4` also
@@ -1128,7 +1186,7 @@ procedure, not an extra.
 
 | What | Where it lives | How |
 |---|---|---|
-| Metadata: changesets, refs, ref log, signatures, reviews, derived data | SQLite file or Postgres database (`--meta`) | `leep-server backup` |
+| Metadata: changesets and their compression dictionaries, refs, ref log, signatures, reviews, derived data | SQLite file or Postgres database (`--meta`) | `leep-server backup` |
 | Blobs: file contents and tree nodes | filesystem directory or S3 bucket (`--blobs`) | `leep-server backup` |
 | Configuration: tokens file, signing keys file, review policy file, TLS/proxy config | wherever you keep it | your configuration management; **not in the stores and not in the backup** |
 
