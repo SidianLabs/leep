@@ -297,10 +297,14 @@ substring becomes the set of author fingerprints whose name (in
 `log-filter-name-v1`) contains it, found from the head's widest levels; a
 filter on an `extra` value outside `agent.model`/`agent.session` uses the
 key's presence. A merge's level 0 holds exactly what its other parents bring
-in: their first-parent chains down to the first changeset the first parent
-reaches (bounded by `merge_base`), covered by levels where no merge
-intervenes, and recursively the sides of merges on those chains. The row
-also names that first reached changeset per side, its *stop*, and the walk
+in, found by one walk of both parents' histories newest first
+([ADR 0051](adr/0051-log-filter-merge-walk.md)), as `git rev-list
+first..side` does, so a back-merge that brings in a release with thousands
+of merges costs one walk, not a `merge_base` per inner merge. Past 200,000
+changesets the walk gives up and stores a superset from the sides' own
+levels, bounding every merge. The row
+also names per side the first changeset on its first-parent chain that the
+first parent reaches, its *stop*, and the walk
 into a side ends there, leaving the rest to the first parent's walk; without
 it, the walk into a branch that merges mainline back would follow the branch
 to its root. Rows, skiplists and changesets are read a batch at a time for

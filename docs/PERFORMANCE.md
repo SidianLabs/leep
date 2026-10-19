@@ -1438,6 +1438,36 @@ almost nothing; walking each side with a merge base per nested chain took
 48 s for the 60,000 in memory, and one shared walk of the first parent's
 ancestors for nearby questions brought that to 8.3 s.
 
+**Back-merges (ADR 0051).** On all of Linux the build stalled for hours at
+back-merges such as "Merge tag 'v4.9-rc3' into xtensa-for-next" (30,248
+changesets and 2,061 merges brought in): the side walk above made a
+`merge_base` per inner merge whose branch was based long before the first
+parent. Each merge is now one walk of both parents' histories, giving up
+past 200,000 changesets. Measured with `cargo run --release -p leep-server
+--example history_profile -- <meta url> mem:// main --releases 8 --next-back
+4 --old-percent 30 --old-back 14 --direct 3 --log-filter --time-back-merges
+--jobs 2`: 8 release cycles shaped like Linux's (400 subsystem branches a
+cycle, 30% based on a release up to 14 cycles back, topic merges and merges
+of mainline inside them, two `for-next` branches a cycle merging a release
+four cycles newer back), 80,886 changesets, 14 back-merges each walking
+about 80,000 changesets; local Postgres 16 over a Unix socket, 4 vCPUs, the
+old code timed with a counter of its `merge_base` calls:
+
+| | Before | After |
+|---|---|---|
+| One back-merge, parents derived first (oldest to newest) | 2.3 s to 35 s | 0.025 s to 0.11 s |
+| The same on a fresh `Repo` (empty caches) | | 0.36 s to 1.6 s |
+| `merge_base` calls for one merge's side, most | 1,423 | 0 |
+| All 80,886 changesets, 2 jobs | 843 s (96/s), stalls of 40 s at 0/s | 59.5 s (1,360/s) |
+| The same in memory | 549 s (147/s) | 43.8 s (1,845/s) |
+| Single reads: changesets, skiplists | 451,734, 975,296 | 14, 0 |
+
+The rows were byte for byte the old code's (all 83,856, compared in
+memory). Merges of branches based many cycles back still walk the first
+parent's history down to the base, about 80,000 changesets here, which is
+most of what derivation now spends; past the budget such a merge stores a
+superset from the branch's own levels instead.
+
 ## Path history on Linux
 
 **The problem.** The whole Linux history (1,484,762 commits) imported into a

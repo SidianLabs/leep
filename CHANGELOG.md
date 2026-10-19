@@ -593,6 +593,14 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   as fast as the old `rederive`. A name row dropped by a failed derivation
   is now written by the next one (it was lost for the life of the process).
   `history_profile` takes `--jobs` and `--log-filter`.
+- Log filter rows at merges come from one walk of both parents' histories
+  (ADR 0051) instead of a `merge_base` per merge inside the side, which
+  stalled the build for hours at Linux back-merges bringing in a release.
+  A walk past 200,000 changesets stores a superset from the side's own
+  levels, so every merge is bounded. Rows are otherwise unchanged; stores
+  built before resume with `repair rederive --kind log-filter-v1 --missing`.
+  `history_profile --releases C` builds a history shaped like Linux's
+  release cycles and `--time-back-merges [--cold]` times its back-merges.
 
 ### Git compatibility (M7)
 - Live git mirror (ADR 0046): `leep-git mirror run` keeps a git remote
