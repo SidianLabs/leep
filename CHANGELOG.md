@@ -614,6 +614,21 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   every server is on this version (OPERATIONS.md, "Upgrading"). Backups
   carry the dictionaries. The `changeset_compression` example measures
   encodings on a store's rows or on a git history.
+- `leep-server upgrade-index` upgrades a store's derived indexes in one
+  command instead of the manual rederive, switch, drop and reclaim steps.
+  Without `--yes` it plans and changes nothing: per current kind the rows
+  stored against the changesets reachable from refs (missing, partial or
+  complete, from the fast count of ADR 0052 and the ref heads' rows), the
+  retired kinds that still have rows with their size, estimated time and
+  disk, the free space where it can see it (warning when short), and the
+  command to reclaim space; exit status 1 when there is work. `--yes`
+  derives what is missing through the `repair rederive --missing` path
+  (`--jobs`, resumable, with rate and ETA), drops retired kinds only with
+  `--drop-retired --old-servers-stopped` (`--drop-first` for a disk that
+  cannot hold both), optionally runs `VACUUM (ANALYZE) derived`
+  (`--vacuum`), and never runs `VACUUM FULL`. A run that is stopped
+  continues where it was; a store that is up to date prints "nothing to do".
+  No new formats or API.
 - `repair drop` of a large kind is fast (ADR 0052). It walks the `derived`
   table in storage order, a range of pages per short transaction, instead of
   deleting in key order, which read pages at random and logged each page to

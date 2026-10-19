@@ -654,7 +654,7 @@ server applies pending migrations itself, as it always created its tables.
 This is what a single-container deployment wants, and the same transaction and
 lock apply, so a fleet that starts together migrates once. Use `--no-migrate`
 whenever you want a change window or the server's database account may not
-alter the schema. `gc`, `derive-search`, `verify` and `repair` follow the same
+alter the schema. `gc`, `derive-search`, `verify`, `repair` and `upgrade-index` follow the same
 flag.
 
 **First start after the versioning release.** A database made by an older
@@ -689,10 +689,55 @@ need no setup: the first server creates them at the current version.
 kind is stored gives it a new name, so old and new servers never read each
 other's rows; nothing to migrate. The new kind derives on first use, which on
 a long history means the first query after the upgrade derives it for the
-whole history: warm it with `leep-server repair rederive --kind <new kind>`
-before sending traffic, and drop the old kind once no server of the previous
-version is left (`repair drop` accepts retired kind names; it changes no
-answer of the new servers). The path-history index moved from
+whole history. One command does the whole job, with the new binary against
+the shared stores:
+
+```sh
+leep-server upgrade-index                         # plan only: exit 0 nothing to do, 1 work to do
+leep-server upgrade-index --yes --jobs 8          # derive what is missing (beside the old servers)
+# ... replace the old servers with new ones ...
+leep-server upgrade-index --yes --drop-retired --old-servers-stopped   # then drop the old index
+```
+
+- The plan reads the history of every ref once (about the time `repair
+  rederive` takes to plan) and counts rows without reading them. For each
+  kind this version reads it shows rows, how many reachable changesets lack
+  one, and `complete`, `partial` or `missing`; then the retired kinds that
+  still have rows (such as `history-tree-v3` with `history-node-v3`) and the
+  size of their values; then the steps with estimated time (from the rates
+  in PERFORMANCE.md: about 150 changesets a second per free core for
+  `history-tree-v4`, 25,000 to 140,000 rows a second for a drop), the disk
+  the new rows need against the free space it can see (the SQLite file's
+  filesystem, or Postgres's data directory when the role may read
+  `data_directory` and the database is on this machine; otherwise it says it
+  cannot tell), and the command to reclaim space. It changes nothing.
+- `--yes` derives the missing rows exactly as `repair rederive --missing
+  --jobs N` does: from each ref's head, parents first, `--jobs` at a time,
+  with rows, rate and an ETA every ten seconds. Stop it at any point and run
+  it again: it continues. If the counts show rows missing behind stored ones
+  (a `repair drop` of a current kind that was stopped), it checks every
+  reachable changeset and fills those too. It refuses to start when the free
+  space is known to be smaller than its estimate (`--skip-space-check`).
+- Retired kinds are dropped only with `--drop-retired`, which requires
+  `--old-servers-stopped`: servers of the previous version read them, so
+  drop only once none is left. The drop is `repair drop`'s walk (ADR 0052),
+  after the current kinds are complete. `--drop-first` drops before deriving,
+  for a disk that cannot hold both (path queries then wait for derivation
+  until the run has caught up), and with `--vacuum` runs `VACUUM (ANALYZE)
+  derived` so Postgres reuses the freed space for the new rows.
+- It never runs `VACUUM FULL`, which locks the table: it prints the command
+  for the backend. `--vacuum` runs the plain, non-blocking `VACUUM (ANALYZE)
+  derived` on Postgres after a drop.
+- Exit status 0 when done or nothing is left to do, 1 when a plan shows work
+  (or a run left a kind incomplete), 2 when it could not run (including
+  `--drop-retired` without `--old-servers-stopped`). `--json` prints the
+  plan, estimates and report as one object.
+
+The manual steps it runs, for reference: warm the new kind with
+`leep-server repair rederive --kind <new kind> --missing` before sending
+traffic, and drop the old kind once no server of the previous version is
+left (`repair drop` accepts retired kind names; it changes no answer of the
+new servers). The path-history index moved from
 `history-tree-v1` to `history-tree-v2` this way (ADR 0027), from
 `history-tree-v2` to `history-tree-v3` (ADR 0037), and from
 `history-tree-v3` to `history-tree-v4` (ADR 0045). The warmer derives the new
@@ -708,6 +753,7 @@ leep-server repair drop --kind history-tree-v1              # rows left from bef
 ```
 
 **From `history-tree-v3` to `history-tree-v4` on a large store** (ADR 0045).
+`upgrade-index` runs these steps; they are kept here to say what each costs.
 The v4 index is about a sixth of v3's size: on all of Linux, where v3 holds
 24 GB of values in 25 million rows, v4 should take about 2.5 to 4 GB. With
 the old servers still serving from v3:

@@ -1217,3 +1217,215 @@ async fn a_deep_history_verifies_without_recursing() {
     assert_eq!(report.stats.changesets_reachable, 3000);
     assert_eq!(report.derived["generation"].checked, 3000);
 }
+
+// --- upgrade-index ---------------------------------------------------------
+
+async fn rows_of(w: &World, kind: &str) -> Vec<(Hash, Bytes)> {
+    w.meta.list_derived(kind, None, usize::MAX).await.unwrap()
+}
+
+fn status(p: &UpgradePlan, kind: &str) -> CurrentKind {
+    p.current
+        .iter()
+        .find(|k| k.kind == kind)
+        .unwrap_or_else(|| panic!("{kind} not in {p:#?}"))
+        .clone()
+}
+
+fn upgrade_opts(drop_retired: bool) -> UpgradeOptions {
+    UpgradeOptions {
+        jobs: 4,
+        drop_retired,
+    }
+}
+
+#[tokio::test]
+async fn upgrade_plans_derives_drops_and_then_has_nothing_to_do() {
+    let w = world().await;
+    let index = rows_of(&w, "history-tree-v4").await;
+    let nodes = rows_of(&w, "history-node-v4").await;
+    let filters = rows_of(&w, "log-filter-v1").await;
+    // A store from before the index: no v4 rows, the tip's log-filter row
+    // missing, and retired rows an older server wrote.
+    drop_kinds(&w.repo, &["history-tree-v4"], false, &Quiet)
+        .await
+        .unwrap();
+    w.meta.delete_derived_kind("log-filter-v1").await.unwrap();
+    for (k, v) in filters.iter().filter(|(k, _)| *k != w.tip().0) {
+        put_row(&w, "log-filter-v1", k, v.clone()).await;
+    }
+    for id in &w.ids {
+        put_row(&w, "history-tree-v3", &id.0, vec![3; 40]).await;
+    }
+    for i in 0..20u8 {
+        put_row(&w, "history-node-v3", &Hash([i; 32]), vec![i; 100]).await;
+    }
+    put_row(&w, "history-tree-v1", &w.tip().0, vec![1; 32]).await;
+
+    let plan = plan_upgrade(&w.repo, &Quiet).await.unwrap();
+    assert_eq!(plan.refs, 2);
+    assert_eq!(plan.reachable, 7, "{plan:#?}");
+    assert!(!plan.nothing_to_do());
+    let tree = status(&plan, "history-tree-v4");
+    assert_eq!(tree.status, IndexStatus::Missing);
+    assert_eq!((tree.rows, tree.missing, tree.heads_missing), (0, 7, 2));
+    let filter = status(&plan, "log-filter-v1");
+    assert_eq!(filter.status, IndexStatus::Partial, "{filter:#?}");
+    assert_eq!(filter.heads_missing, 1);
+    assert!(filter.missing >= 1);
+    assert!(filter.value_bytes_per_changeset.unwrap() > 0);
+    for k in ["generation", "skiplist", "last_merge-v1", "root_tree"] {
+        assert_eq!(status(&plan, k).status, IndexStatus::Complete, "{k}");
+    }
+    assert_eq!(plan.to_derive(), ["history-tree-v4", "log-filter-v1"]);
+    assert_eq!(plan.to_drop(), ["history-tree-v1", "history-tree-v3"]);
+    let v3 = &plan.retired[1];
+    assert_eq!(v3.rows["history-tree-v3"], 7);
+    assert_eq!(v3.rows["history-node-v3"], 20);
+    assert_eq!(v3.value_bytes, Some(7 * 40 + 20 * 100));
+
+    // Planning writes nothing.
+    let untouched = snapshot(&w).await;
+    plan_upgrade(&w.repo, &Quiet).await.unwrap();
+    assert_eq!(snapshot(&w).await, untouched);
+
+    // Without --drop-retired the retired rows stay.
+    let r = run_upgrade(&w.repo, &plan, &upgrade_opts(false), &Quiet)
+        .await
+        .unwrap();
+    assert_eq!(r.derived["history-tree-v4"], 7, "{r:#?}");
+    assert_eq!(r.derived["log-filter-v1"], 1);
+    assert!(r.dropped.is_none());
+    assert!(r.after.to_derive().is_empty(), "{:#?}", r.after);
+    assert_eq!(r.after.to_drop(), ["history-tree-v1", "history-tree-v3"]);
+    // The rows a query would have derived; the rebased copy no ref reaches
+    // is not derived.
+    let reachable_only = |rows: &[(Hash, Bytes)]| -> Vec<(Hash, Bytes)> {
+        rows.iter()
+            .filter(|(k, _)| *k != w.copy.0)
+            .cloned()
+            .collect()
+    };
+    assert_eq!(rows_of(&w, "history-tree-v4").await, reachable_only(&index));
+    assert_eq!(rows_of(&w, "log-filter-v1").await, filters);
+    for (k, v) in rows_of(&w, "history-node-v4").await {
+        assert!(nodes.contains(&(k, v)));
+    }
+
+    // With it, only the retired kinds go.
+    let before = snapshot(&w).await;
+    let plan = plan_upgrade(&w.repo, &Quiet).await.unwrap();
+    assert!(plan.to_derive().is_empty());
+    let r = run_upgrade(&w.repo, &plan, &upgrade_opts(true), &Quiet)
+        .await
+        .unwrap();
+    assert!(r.derived.is_empty());
+    let dropped = r.dropped.expect("dropped");
+    assert_eq!(dropped.rows["history-tree-v3"], 7);
+    assert_eq!(dropped.rows["history-node-v3"], 20);
+    assert_eq!(dropped.rows["history-tree-v1"], 1);
+    assert!(r.after.nothing_to_do(), "{:#?}", r.after);
+    assert_eq!(snapshot(&w).await, before);
+    for k in ["history-tree-v3", "history-node-v3", "history-tree-v1"] {
+        assert!(rows_of(&w, k).await.is_empty(), "{k}");
+    }
+
+    // A second run finds nothing to do and changes nothing.
+    let plan = plan_upgrade(&w.repo, &Quiet).await.unwrap();
+    assert!(plan.nothing_to_do(), "{plan:#?}");
+    let r = run_upgrade(&w.repo, &plan, &upgrade_opts(true), &Quiet)
+        .await
+        .unwrap();
+    assert!(r.derived.is_empty() && r.dropped.is_none());
+    assert_eq!(snapshot(&w).await, before);
+}
+
+#[tokio::test]
+async fn upgrade_fills_rows_deleted_behind_stored_ones() {
+    let w = world().await;
+    let want = rows_of(&w, "history-tree-v4").await;
+    // A drop stopped part way: the heads keep their rows, older ones lost.
+    w.meta.delete_derived_kind("history-tree-v4").await.unwrap();
+    for (k, v) in want
+        .iter()
+        .filter(|(k, _)| *k != w.ids[1].0 && *k != w.ids[3].0)
+    {
+        put_row(&w, "history-tree-v4", k, v.clone()).await;
+    }
+    let plan = plan_upgrade(&w.repo, &Quiet).await.unwrap();
+    let tree = status(&plan, "history-tree-v4");
+    assert_eq!(tree.status, IndexStatus::Partial, "{tree:#?}");
+    assert_eq!(tree.heads_missing, 0);
+    let r = run_upgrade(&w.repo, &plan, &upgrade_opts(false), &Quiet)
+        .await
+        .unwrap();
+    assert_eq!(r.derived["history-tree-v4"], 2, "{r:#?}");
+    assert_eq!(rows_of(&w, "history-tree-v4").await, want);
+    assert!(r.after.nothing_to_do());
+}
+
+/// A run stopped part way (here by a failing write, as a kill would) leaves
+/// rows the next run builds on, and that run ends with every row a
+/// derivation from scratch stores.
+#[tokio::test]
+async fn an_interrupted_upgrade_completes_when_run_again() {
+    use leep_testkit::{Fault, FaultPlan, FaultyMetaStore, Op};
+
+    let blobs = Arc::new(MemoryBlobStore::new());
+    let meta = Arc::new(MemoryMetaStore::new());
+    let r = Repo::new(blobs.clone(), meta.clone());
+    let mut tip = commit(&r, &[], &[("a.txt", Some(b"0\n"))]).await;
+    for i in 1..700u32 {
+        let body = format!("{i}\n");
+        let path = format!("d{}/f{}.txt", i % 7, i % 13);
+        tip = commit(&r, &[tip], &[(path.as_str(), Some(body.as_bytes()))]).await;
+    }
+    assert!(meta.cas_ref("main", None, Some(tip)).await.unwrap());
+    let kinds = ["history-tree-v4", "history-node-v4", "log-filter-v1"];
+    let fresh = plan_upgrade(&r, &Quiet).await.unwrap();
+    assert_eq!(fresh.reachable, 700);
+    run_upgrade(&r, &fresh, &upgrade_opts(false), &Quiet)
+        .await
+        .unwrap();
+    let mut want = Vec::new();
+    for k in kinds {
+        want.push(meta.list_derived(k, None, usize::MAX).await.unwrap());
+    }
+    drop_kinds(&r, &["history-tree-v4", "log-filter-v1"], false, &Quiet)
+        .await
+        .unwrap();
+
+    let faults = FaultPlan::new(7);
+    faults.script(Op::PutDerived, 300, Fault::Fail);
+    let faulty = Repo::new(
+        blobs.clone(),
+        Arc::new(FaultyMetaStore::new(meta.clone(), faults.clone())),
+    );
+    let plan = plan_upgrade(&faulty, &Quiet).await.unwrap();
+    assert_eq!(plan.to_derive(), ["history-tree-v4", "log-filter-v1"]);
+    assert!(run_upgrade(&faulty, &plan, &upgrade_opts(false), &Quiet)
+        .await
+        .is_err());
+    assert_eq!(faults.injected().total(), 1);
+    let stored = meta.count_derived("history-tree-v4").await.unwrap();
+    assert!(stored > 0 && stored < 700, "{stored}");
+
+    let again = Repo::new(blobs, meta.clone());
+    let plan = plan_upgrade(&again, &Quiet).await.unwrap();
+    assert_eq!(
+        status(&plan, "history-tree-v4").status,
+        IndexStatus::Partial
+    );
+    let done = run_upgrade(&again, &plan, &upgrade_opts(false), &Quiet)
+        .await
+        .unwrap();
+    assert_eq!(done.derived["history-tree-v4"], 700 - stored);
+    assert!(done.after.nothing_to_do(), "{:#?}", done.after);
+    for (k, rows) in kinds.iter().zip(want) {
+        assert_eq!(
+            meta.list_derived(k, None, usize::MAX).await.unwrap(),
+            rows,
+            "{k}"
+        );
+    }
+}
