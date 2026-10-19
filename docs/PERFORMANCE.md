@@ -1537,6 +1537,76 @@ all the VPS has. Its first byte arrives sooner than the whole body did
 (470 to 319 ms warm in another interleaved run). The next step for the log is the store's decoding: every changeset
 is decoded, re-encoded and hashed to check its id.
 
+### First blame in stretches
+
+The first blame of a long-lived file was still mostly round trips in a row
+after the batching above: each step of the walk reads the index entry at a
+changer's parent and a skiplist, and needs the step before it. Blame now
+walks the first 32 steps from the tip as before, and meanwhile cuts the
+first-parent chain into about 256 stretches; if the walk goes on, up to 64
+stretches are walked at once below where it stopped, as separate tasks,
+with their reads gathered into batched reads, and their steps are taken in
+order (ARCHITECTURE.md, "Blame"). The replay splits each version into lines
+and numbers them once instead of twice per diff, and reads each window of
+versions while the one before is diffed.
+
+**Measured** on all of git/git (82,513 changesets, imported with `leep-git`
+into Postgres 16 in a private cluster, filesystem blobs repacked into one
+167 MB pack, path history derived), `cold_queries query ... blame PATH`,
+which drops all blame rows first, so every run is a first blame. Base is
+main at #92. Warm: a new process with Postgres and the page cache warm;
+cold: Postgres restarted and the page cache dropped. Median of three
+interleaved runs, a 4-vCPU sandbox under load from other jobs (load
+average 6 to 14), with a 16-step head (the 32 kept is below):
+
+| File (first-parent changes, lines) | Warm before | Warm after | Cold before | Cold after |
+|---|---|---|---|---|
+| `Makefile` (1,501, 4,143) | 3.35 s | 1.18 s | 3.00 s | 1.13 s |
+| `diff.c` (741, 7,860) | 1.82 s | 0.81 s | 1.92 s | 0.90 s |
+| `revision.c` (504, 4,833) | 1.16 s | 0.57 s | 1.53 s | 0.83 s |
+| `t/test-lib.sh` (381, 2,019) | 1.18 s | 0.55 s | 1.85 s | 1.19 s |
+| `git-compat-util.h` (361, 1,144) | 0.92 s | 0.46 s | 1.50 s | 0.89 s |
+| `ewah/bitmap.c` (17, 310) | 0.16 s | 0.18 s | 0.25 s | 0.32 s |
+| `COPYING` (2, 360) | 0.06 s | 0.08 s | 0.09 s | 0.10 s |
+
+With a 32-step head (cold, a separate interleaved round): `ewah/bitmap.c`
+0.19 s against 0.19 s before, `Makefile` 1.84 s against 4.28 s and
+`revision.c` 1.24 s against 2.31 s at a higher load. Stored blames are read
+as before.
+
+**Where the time went**, `Makefile`, cold: before, about 6,050 store calls,
+nearly all single-row reads one after another (3,187 index rows, 2,053
+skiplists, 677 generations), plus 48 batched blob reads. After, about 2,200
+calls, most of them batches (757 index batches for 3,558 rows, 751
+skiplist batches for 3,874). Each stretch's work no longer waits on the
+others, so the walk is bound by what the process and Postgres can do: on
+this machine about 0.85 s of CPU for the walk, half of it decoding root
+trees (git/git's root directory holds hundreds of names, and each root
+tree is a delta chain in the pack) and half decoding history-pack parts,
+and 0.45 s for the replay, down from about 0.8 s. Steps tried along the
+way, warm `Makefile`:
+
+| Change | Time |
+|---|---|
+| Before | 2.9 to 3.6 s |
+| 64 stretches walked 12 at a time in one task | 1.9 to 2.5 s |
+| ... each stretch a task of its own | 1.5 to 2.3 s (the walk 0.9 to 1.3 s whatever the stretch count: 7,000 single-row reads a second was the limit) |
+| ... reads gathered into batches | 1.3 to 1.8 s |
+| ... diffs numbering lines once | 1.1 to 1.4 s (replay 0.9 to 0.35 to 0.55 s) |
+| ... no read of the file at every cut up front (0.1 to 0.46 s of root trees) | 1.0 to 1.3 s |
+
+More stretches (512, 1,024) were no faster on `Makefile` and slower on
+rarely changed files, which pay a few reads per stretch: the head walk
+keeps those as they were. A file whose stretches lie below its creation
+stops each at its top's index entry.
+
+All of Linux has not been remeasured; its root directory is small, so its
+root trees decode faster than git/git's, and `Makefile`'s 1,800 changes
+should take about what git/git's 1,501 do. What remains is CPU: decoding a
+delta chain per root tree read (a `get_many` splits its hashes over tasks
+that do not share decoded bases), history-pack parts, and the replay.
+
+
 ## Filtered log
 
 ADR 0047. `log` with `author=` or `extra=` and no path used to test every

@@ -267,14 +267,43 @@ the file, and skiplists find the lowest one at or above it. Every skiplist
 read during a walk names first-parent ancestors 1, 2, 4, ... steps further
 down, so the walk keeps them by generation and starts each descent from
 the nearest known point, and keeps their generations, which spares a read
-for changers on the chain. The walk itself reads no files: the files at
-the examined changesets' parents, which decide whether each one changed
-the file and where its history starts, are read 64 steps at a time (root
-trees in one batched metadata read, each directory level of the path in
-one `get_many`), cached blames are looked up 32 changers at a time, the
-versions are read 64 at a time and diffed on several threads, and lines
-carry only (changeset, line) until the last version gives them their text.
-The changeset summaries are one `get_changesets`.
+for changers on the chain; a step reads the index entry and the skiplist of
+the changeset it moves to together. The walk reads no files itself: the
+files at the examined changesets' parents, which decide whether each one
+changed the file and where its history starts, are read 64 steps at a time
+(root trees in one batched metadata read, each directory level of the path
+in one `get_many`), and cached blames are looked up 32 changers at a time.
+
+Each step needs the one before it, so a file changed thousands of times
+costs thousands of round trips in a row. The first 32 steps are walked
+from the tip, which is all that most files (changed rarely) and a cached
+blame near the tip need. Meanwhile the first-parent chain is cut into
+**stretches** of about 1/256 of the tip's generation (at least 32
+generations, shorter near the tip), the cuts found a level of skiplists at
+a time (each round one batched read of the lists of cuts above a gap still
+too wide). If the walk goes on, the stretches below where it stopped are
+walked at once, up to 64, each from its top, as separate tasks; their reads
+are gathered into batched reads (`batched_reads`: single-row and batched
+derived reads that arrive while a batch is out go in the next
+`get_derived_many`, blob batches in the next `get_many`), so the stretches
+advance a step per round trip together. A stretch does not know the file
+at its top, which is where the stretch above ends, so its first step's
+cached blame is looked up in case it changed the file; the steps are then
+taken in order, newest first, each stretch's first step judged against the
+file the one above ended with, down to the first step that ends the walk
+(the file's creation, the chain's root or a cached blame), and the walks
+below it are dropped. A stretch whose top has no index entry for the path
+lies below the file's creation and stops at once. The steps are exactly
+those of one walk, so the answer is too, and a file untouched for most of
+history costs a few reads per stretch rather than any per changeset.
+
+The versions are read 64 (and at most 32 MiB) at a time, each window while
+the one before is diffed on several threads. Each diff is the one
+`similar::TextDiff::diff_lines` makes, with each version split into lines
+and its lines numbered once per task rather than twice per diff (Myers
+compares lines only for equality, so the numbers give the same diff), and
+lines carry only (changeset, line) until the last version gives them their
+text. The changeset summaries are one `get_changesets`.
 
 **Rename detection** ([ADR 0016](adr/0016-rename-detection.md)). Changesets
 store a rename as a delete plus an add, and renames are detected when

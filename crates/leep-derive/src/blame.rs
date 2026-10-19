@@ -1,14 +1,17 @@
 //! Line-level blame over first-parent history, cached as derived data.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use futures_util::StreamExt;
 use leep_core::api::{BlameLine, BlameResponse, ChangesetSummary, FileInfo};
 use leep_core::{ChangesetId, Error, Hash, RepoPath, Result, TreeEntry};
-use similar::{DiffTag, TextDiff};
+use similar::{Algorithm, DiffTag};
 
-use crate::derived::{self, DerivedKind, HistoryEntry, RootTree, Skiplist};
+use crate::batched_reads::{BatchedBlobs, BatchedMeta};
+use crate::derived::{self, DerivedKind, HistoryEntry, RootTree, SkipEntry, Skiplist};
 use crate::history::agent_keys;
 use crate::tree_ops::file_info;
 use crate::Repo;
@@ -26,15 +29,44 @@ const DIFF_TIMEOUT: Duration = Duration::from_millis(500);
 /// per batch instead of one per changer.
 const CACHE_CHECK_BATCH: usize = 32;
 
-/// File versions read at once (one `get_many`) when replaying them. Bounds
-/// the memory held for a file with thousands of versions.
+/// File versions read at once (one `get_many`) when replaying them, at
+/// most. With [`CONTENT_BYTES`], bounds the memory held for a file with
+/// thousands of versions: two windows, the one diffed and the one read
+/// ahead.
 const CONTENT_BATCH: usize = 64;
 
-/// Blocking tasks one window of versions is diffed on.
-const DIFF_TASKS: usize = 4;
+/// Bytes of file versions read at once when replaying them, at most (but
+/// one version at a time may be larger).
+const CONTENT_BYTES: u64 = 32 << 20;
+
+/// Most blocking tasks one window of versions is diffed on.
+const DIFF_TASKS: usize = 8;
 
 /// Steps of an indexed blame walk whose parents' files are read together.
 const LOOKUP_BATCH: usize = 64;
+
+/// Stretches a first-parent chain is cut into for a blame, at most about:
+/// one per this fraction of the tip's generation, so a walk costs a bounded
+/// number of reads per stretch however old the file, plus a few per change.
+/// On git/git's `Makefile` (1,501 changes in 82,513 changesets), 256 was
+/// faster than 64 or 128 and about as fast as 512 or 1,024, which cost
+/// rarely changed files more.
+const STRETCHES: u64 = 256;
+
+/// Fewest generations a stretch spans (but those near the tip), so a short
+/// history is walked as one or a few stretches.
+const MIN_STRETCH_SPAN: u64 = 32;
+
+/// Steps walked from the tip before the stretches below are: enough for
+/// most files, which change rarely, and for a cached blame near the tip.
+/// On git/git, 32 kept a file of 17 changes as fast as before stretches
+/// (16 cost it 30 ms cold), and cost files of hundreds of changes nothing
+/// measurable.
+const HEAD_STEPS: usize = 32;
+
+/// Stretches walked at once. Their reads are gathered into batched reads,
+/// so this bounds memory and tasks rather than store connections.
+const STRETCHES_IN_FLIGHT: usize = 64;
 
 /// What is cached under `blame`. Kept at the original `{path, lines}` shape so
 /// entries written before changeset summaries existed still decode; summaries
@@ -151,92 +183,397 @@ impl Repo {
         Ok(self.blame_walk(id, path, true, true).await?.0)
     }
 
-    /// The lowest first-parent ancestor of `cur` (itself included) that blame
-    /// must examine, given `entry`, the path-history index entry of the path
-    /// at `cur`: no changeset above it changed the path. Without this, blame
-    /// visits every ancestor down to the changeset that last changed the
-    /// file, which is the whole history for a file that has not been touched
-    /// in a long time.
+    /// Where blame goes next from `cur`, given `entry`, the path-history
+    /// index entry of the path at `cur`: the lowest first-parent ancestor of
+    /// `cur` (itself included) it must examine, as no changeset above it
+    /// changed the path. Without this, blame visits every ancestor down to
+    /// the changeset that last changed the file, which is the whole history
+    /// for a file that has not been touched in a long time.
     ///
     /// The index entry holds the maximal changers of the path under ancestry,
     /// so every changer's generation is at most the largest one, `g`. A
     /// first-parent ancestor with a generation above `g` cannot be a changer,
     /// and [`FirstParents::lowest_at_or_above`] finds the last one at or
-    /// above `g`.
+    /// above `g`. With `g` at or below `bottom`, nothing above the generation
+    /// `bottom` changed the path.
     async fn skip_unchanged(
         &self,
         chain: &mut FirstParents,
         entry: Option<HistoryEntry>,
-    ) -> Result<Option<ChangesetId>> {
+        bottom: u64,
+    ) -> Result<Skip> {
         let Some(entry) = entry else {
-            return Ok(None);
+            return Ok(Skip::Here);
         };
         let gens =
             futures_util::future::try_join_all(entry.changed().iter().map(|&c| self.generation(c)))
                 .await?;
         let Some(g) = gens.into_iter().max() else {
-            return Ok(None);
+            return Ok(Skip::Here);
         };
-        chain.lowest_at_or_above(self, g).await.map(Some)
+        if g <= bottom {
+            return Ok(Skip::Past);
+        }
+        chain.lowest_at_or_above(self, g).await.map(Skip::To)
     }
 
-    /// The first-parent walk of [`Repo::blame_walk`] with skipping: from
-    /// each changeset, the path-history index and the skiplists say which
-    /// first-parent ancestor to examine next, without reading files. The
-    /// files at the examined changesets' parents, which decide whether each
-    /// changed the file and where the walk ends, are then read a batch of
-    /// steps at a time ([`Repo::lookup_files`]), and the steps replayed in
-    /// order. A step past the end of the file's history costs only index
-    /// reads, and at most a batch of them is wasted.
-    async fn blame_walk_indexed(
+    /// The first-parent walk of [`Repo::blame_walk`] with skipping, over one
+    /// stretch of the chain: from `top` down to the first-parent ancestor at
+    /// generation `bottom` or below (0: to the chain's root), which it does
+    /// not examine. From each changeset, the path-history index and the
+    /// skiplists say which first-parent ancestor to examine next, without
+    /// reading files. The files at the examined changesets' parents, which
+    /// decide whether each changed the file and where the walk ends, are
+    /// then read a batch of steps at a time ([`Repo::lookup_files`]). A step
+    /// past the end of the file's history costs only index reads, and at
+    /// most a batch of them is wasted.
+    ///
+    /// The walk does not know the file at `top`, which is the file the
+    /// stretch above ends with, so it cannot tell whether its first step
+    /// changed the file; [`Repo::blame_stretches`] decides that. The cached
+    /// blame of that step is looked up all the same, and those of the steps
+    /// that changed the file a batch at a time, the walk ending at the first
+    /// found.
+    async fn walk_stretch(
         &self,
-        id: ChangesetId,
         path: &RepoPath,
         cache: bool,
-        acc: &mut Changers,
-    ) -> Result<usize> {
-        let mut first_parents = FirstParents::new(self, id).await?;
-        let mut entry = self.history_entry(id, path.as_str()).await?;
-        let mut cur = id;
+        stretch: Stretch,
+    ) -> Result<StretchWalk> {
+        let Stretch {
+            top,
+            bottom,
+            most,
+            mut first_parents,
+        } = stretch;
+        let mut walk = StretchWalk {
+            steps: Vec::new(),
+            first_cached: None,
+            cached: None,
+            resume: None,
+            absent: false,
+        };
+        // Steps that changed the file (or, the first, may have) whose cached
+        // blames were not looked up yet.
+        let mut unchecked: Vec<usize> = Vec::new();
+        let mut entry = self.entry_and_list(&mut first_parents, top, path).await?;
+        if entry.is_none() && most == usize::MAX {
+            // The file never existed at `top`, so the walk ends above it.
+            walk.absent = true;
+            return Ok(walk);
+        }
+        let mut cur = top;
         let mut pending: Vec<(ChangesetId, Option<ChangesetId>)> = Vec::new();
-        let mut examined = 0;
         loop {
             // Nothing changed between `cur` and the changeset skipped to, so
             // the file there is the one the last step found.
-            let x = match self
-                .skip_unchanged(&mut first_parents, entry.take())
+            let mut finished = true;
+            let next = match self
+                .skip_unchanged(&mut first_parents, entry.take(), bottom)
                 .await?
             {
-                Some(x) => x,
-                None => cur,
+                Skip::To(x) => Some(x),
+                Skip::Here => Some(cur),
+                Skip::Past => None,
             };
-            let parent = first_parents.parent(self, x).await?;
-            pending.push((x, parent));
-            if let Some(p) = parent {
-                entry = self.history_entry(p, path.as_str()).await?;
-                cur = p;
+            if let Some(x) = next {
+                let parent = first_parents.parent(self, x).await?;
+                pending.push((x, parent.map(|p| p.id)));
+                if let Some(p) = parent.filter(|p| p.generation > bottom) {
+                    if walk.steps.len() + pending.len() < most {
+                        entry = self.entry_and_list(&mut first_parents, p.id, path).await?;
+                        cur = p.id;
+                        finished = false;
+                    } else {
+                        walk.resume = Some(p);
+                    }
+                }
             }
             // No entry at the parent: the file never existed there, which
-            // the replay finds and stops at.
-            if pending.len() < LOOKUP_BATCH && parent.is_some() && entry.is_some() {
+            // the step finds and stops at.
+            if pending.len() < LOOKUP_BATCH && !finished && entry.is_some() {
                 continue;
             }
             let parents: Vec<ChangesetId> = pending.iter().filter_map(|(_, p)| *p).collect();
             let mut infos = self.lookup_files(&parents, path).await?.into_iter();
+            let mut ended = false;
             for (x, parent) in pending.drain(..) {
-                examined += 1;
                 let parent_info = match parent {
                     Some(_) => infos.next().expect("one file per parent"),
                     None => None,
                 };
-                if !acc
-                    .step(self, path, cache, x, parent.is_some(), parent_info)
-                    .await?
-                {
-                    return Ok(examined);
+                // The file at `x` is the one at the last step's parent.
+                let changed = match walk.steps.last() {
+                    None => true,
+                    Some(Step {
+                        parent_info: Some(here),
+                        ..
+                    }) => parent_info
+                        .as_ref()
+                        .is_none_or(|p| p.content != here.content),
+                    Some(_) => unreachable!("a step without a file at its parent ends the walk"),
+                };
+                if changed {
+                    unchecked.push(walk.steps.len());
+                }
+                ended = parent.is_none() || parent_info.is_none();
+                walk.steps.push(Step {
+                    x,
+                    has_parent: parent.is_some(),
+                    parent_info,
+                });
+                if ended {
+                    break;
                 }
             }
+            let done = ended || finished;
+            if cache && !unchecked.is_empty() && (done || unchecked.len() >= CACHE_CHECK_BATCH) {
+                let keys: Vec<Hash> = unchecked
+                    .iter()
+                    .map(|&i| cache_key(walk.steps[i].x, path))
+                    .collect();
+                let found = self.meta().get_derived_many("blame", &keys).await?;
+                for (i, v) in unchecked.drain(..).zip(found) {
+                    let Some(v) = v else {
+                        continue;
+                    };
+                    let blame: CachedBlame = postcard::from_bytes(&v)?;
+                    if i == 0 {
+                        walk.first_cached = Some(blame);
+                    } else {
+                        walk.steps.truncate(i + 1);
+                        walk.cached = Some((i, blame));
+                        return Ok(walk);
+                    }
+                }
+            }
+            if done {
+                if ended {
+                    walk.resume = None;
+                }
+                return Ok(walk);
+            }
         }
+    }
+
+    /// The index entry of `path` at `cur`, a changeset of `chain`, read
+    /// together with `cur`'s skiplist: the walk needs the list next, to go
+    /// to `cur`'s parent if `cur` changed the file, or to start its descent
+    /// to the next change from near `cur`.
+    async fn entry_and_list(
+        &self,
+        chain: &mut FirstParents,
+        cur: ChangesetId,
+        path: &RepoPath,
+    ) -> Result<Option<HistoryEntry>> {
+        let (entry, list) = futures_util::future::join(
+            self.history_entry(cur, path.as_str()),
+            chain.list(self, cur),
+        )
+        .await;
+        list?;
+        entry
+    }
+
+    /// The changers of `path` from `id` (where the file is `tip`), newest
+    /// first, down to the file's creation or to the newest changer with a
+    /// cached blame, which is returned with its file: the walk of
+    /// [`Repo::walk_stretch`] over the whole first-parent chain, cut into
+    /// stretches walked at once.
+    ///
+    /// Each step of a walk needs the step before it (the index entry at a
+    /// changer's parent says where the next change is), so one walk makes a
+    /// few round trips per change: thousands, one after another, for a file
+    /// changed thousands of times. A stretch needs only its top, so the chain
+    /// is cut at first-parent ancestors spread over its generations (found a
+    /// level of skiplists at a time, [`Repo::plan_stretches`]), and up to
+    /// [`STRETCHES_IN_FLIGHT`] stretches are walked at once, their reads
+    /// gathered into batched reads ([`crate::batched_reads`]). Their steps
+    /// are then taken in order, newest first, each stretch's first step
+    /// judged against the file the one above ended with, down to the first
+    /// step that ends the walk (at the file's creation, the chain's root or
+    /// a cached blame); the walks below it are dropped. The steps are those
+    /// of one walk, so the answer is too.
+    ///
+    /// Cutting costs a few reads per stretch, wasted on a file changed only
+    /// a few times or with a cached blame near `id`. So the first
+    /// `cuts.head` steps are walked from `id` while the cuts are planned,
+    /// and the stretches are walked only below where those steps stop, if
+    /// the walk did not end there.
+    async fn blame_stretches(
+        &self,
+        id: ChangesetId,
+        tip: FileInfo,
+        path: &RepoPath,
+        cache: bool,
+        cuts: Cuts,
+    ) -> Result<Found> {
+        // Derives the index first if it is missing, with the stores as they
+        // are: derivation batches its own reads.
+        self.history_root(id).await?;
+        let walker = self.with_stores(
+            Arc::new(BatchedBlobs::new(self.blobs().clone())),
+            Arc::new(BatchedMeta::new(self.meta().clone())),
+        );
+        let tip_gen = self.generation(id).await?;
+        let head = walker.walk_stretch(
+            path,
+            cache,
+            Stretch {
+                top: id,
+                bottom: 0,
+                most: cuts.head,
+                first_parents: FirstParents {
+                    known: BTreeMap::from([(tip_gen, id)]),
+                    lists: HashMap::new(),
+                },
+            },
+        );
+        let plan = self.plan_stretches(id, tip_gen, cuts.min_span);
+        let (head, plan) = match futures_util::future::select(Box::pin(head), Box::pin(plan)).await
+        {
+            futures_util::future::Either::Left((head, plan)) => {
+                let head = head?;
+                if head.resume.is_none() {
+                    (head, None)
+                } else {
+                    (head, Some(plan.await?))
+                }
+            }
+            futures_util::future::Either::Right((plan, head)) => (head.await?, Some(plan?)),
+        };
+        let mut found = Found {
+            chain: Vec::new(),
+            cached: None,
+            examined: 0,
+        };
+        let mut cur_info = tip;
+        let resume = head.resume;
+        if found.take(head, &mut cur_info) {
+            return Ok(found);
+        }
+        let (Some(resume), Some((cuts, mut known, lists))) = (resume, plan) else {
+            return Ok(found);
+        };
+        known.insert(resume.generation, resume.id);
+        // The stretch from where the head stopped, then those of the cuts
+        // below it.
+        let tops: Vec<SkipEntry> = std::iter::once(resume)
+            .chain(
+                cuts.into_iter()
+                    .filter(|c| c.generation < resume.generation),
+            )
+            .collect();
+        let stretches: Vec<Stretch> = tops
+            .iter()
+            .enumerate()
+            .map(|(i, top)| {
+                let bottom = tops.get(i + 1).map_or(0, |c| c.generation);
+                let known: BTreeMap<u64, ChangesetId> = known
+                    .range(bottom..=top.generation)
+                    .map(|(g, c)| (*g, *c))
+                    .collect();
+                let lists = known
+                    .values()
+                    .filter_map(|c| lists.get(c).map(|l| (*c, l.clone())))
+                    .collect();
+                Stretch {
+                    top: top.id,
+                    bottom,
+                    most: usize::MAX,
+                    first_parents: FirstParents { known, lists },
+                }
+            })
+            .collect();
+        let mut walks = futures_util::stream::iter(stretches)
+            .map(|s| {
+                let (repo, path) = (walker.clone(), path.clone());
+                let task = Spawned(tokio::spawn(async move {
+                    repo.walk_stretch(&path, cache, s).await
+                }));
+                async move {
+                    task.await
+                        .map_err(|e| Error::Other(format!("blame walk failed: {e}")))?
+                }
+            })
+            .buffered(STRETCHES_IN_FLIGHT);
+        while let Some(walk) = walks.next().await {
+            if found.take(walk?, &mut cur_info) {
+                break;
+            }
+        }
+        Ok(found)
+    }
+
+    /// Cuts for [`Repo::blame_stretches`]: first-parent ancestors of `id`
+    /// (itself first), newest first, at most about the larger of `min_span`
+    /// and 1/[`STRETCHES`] of `id`'s generation apart, and closer together
+    /// near `id`, where a cached blame is most likely to end the walk. Also
+    /// returns every first-parent ancestor seen by generation and the
+    /// skiplists read, which the stretches' walks start from.
+    ///
+    /// The skiplist of a cut names ancestors 1, 2, 4, ... steps below it, so
+    /// one names a point at least halfway down to the next cut; each round
+    /// reads, in one batched read, the lists of the cuts above a gap still
+    /// too wide (and of the lowest, until the chain's root is found), and
+    /// about log2 of the number of stretches rounds suffice.
+    async fn plan_stretches(
+        &self,
+        id: ChangesetId,
+        tip_gen: u64,
+        min_span: u64,
+    ) -> Result<(Vec<SkipEntry>, BTreeMap<u64, ChangesetId>, SkipLists)> {
+        let span = (tip_gen / STRETCHES).max(min_span).max(1);
+        let mut known = BTreeMap::from([(tip_gen, id)]);
+        let mut lists: SkipLists = HashMap::new();
+        loop {
+            let mut want: Vec<ChangesetId> = Vec::new();
+            let mut below: Option<u64> = None;
+            for (&g, &c) in known.iter() {
+                // Read the list of a point with a wide gap below it, or with
+                // nothing known below it.
+                let wide = match below {
+                    Some(b) => g - b > span,
+                    None => g > span,
+                };
+                if wide && !lists.contains_key(&c) {
+                    want.push(c);
+                }
+                below = Some(g);
+            }
+            if want.is_empty() {
+                break;
+            }
+            let keys: Vec<Hash> = want.iter().map(|c| c.0).collect();
+            let found = self.meta().get_derived_many(Skiplist::NAME, &keys).await?;
+            for (i, c) in want.into_iter().enumerate() {
+                let list = match found.get(i).cloned().flatten() {
+                    Some(v) => Skiplist::decode(&v)?,
+                    None => Skiplist::decode(&derived::derive::<Skiplist>(self, c).await?)?,
+                };
+                for e in &list {
+                    known.insert(e.generation, e.id);
+                    self.remember_generation(e.id, e.generation);
+                }
+                lists.insert(c, Arc::new(list));
+            }
+        }
+        // Keep a point as a cut once it is far enough below the last cut:
+        // `span`, or half its own distance from `id`, whichever is less.
+        let mut cuts = vec![SkipEntry {
+            id,
+            generation: tip_gen,
+        }];
+        for (&g, &c) in known.iter().rev().skip(1) {
+            let last = cuts[cuts.len() - 1].generation;
+            if last - g >= span.min((tip_gen - g) / 2).max(1) {
+                cuts.push(SkipEntry {
+                    id: c,
+                    generation: g,
+                });
+            }
+        }
+        Ok((cuts, known, lists))
     }
 
     /// [`Repo::lookup_file`] of `path` at each of `ids`, in order: their root
@@ -294,14 +631,31 @@ impl Repo {
     }
 
     /// Blame by walking first parents. `skip` jumps over stretches where the
-    /// index says the file did not change; without it every ancestor is read,
-    /// which tests use as the reference. `cache` reads and writes cached
-    /// blames. Returns the blame and the number of changesets examined.
+    /// index says the file did not change, and walks many stretches at once;
+    /// without it every ancestor is read, which tests use as the reference.
+    /// `cache` reads and writes cached blames. Returns the blame and the
+    /// number of changesets examined.
     pub(crate) async fn blame_walk(
         &self,
         id: ChangesetId,
         path: &RepoPath,
         skip: bool,
+        cache: bool,
+    ) -> Result<(CachedBlame, usize)> {
+        let skip = skip.then_some(Cuts {
+            head: HEAD_STEPS,
+            min_span: MIN_STRETCH_SPAN,
+        });
+        self.blame_walk_in(id, path, skip, cache).await
+    }
+
+    /// [`Repo::blame_walk`], with skipping if `cuts` are given (tests make
+    /// them small to cut short histories into many stretches).
+    pub(crate) async fn blame_walk_in(
+        &self,
+        id: ChangesetId,
+        path: &RepoPath,
+        cuts: Option<Cuts>,
         cache: bool,
     ) -> Result<(CachedBlame, usize)> {
         let tip = self
@@ -319,33 +673,37 @@ impl Repo {
         }
         // Walk first parents collecting the changesets that changed the file,
         // stopping at its creation or at a cached blame.
-        let mut acc = Changers {
-            chain: Vec::new(),
-            checked: 0,
-            cur_info: tip,
-            cached: None,
-        };
-        let examined = if skip {
-            self.blame_walk_indexed(id, path, cache, &mut acc).await?
-        } else {
-            let (mut cur, mut examined) = (id, 0);
-            loop {
-                examined += 1;
-                let parent = self.get_changeset(cur).await?.parents.first().copied();
-                let parent_info = match parent {
-                    Some(p) => self.lookup_file(p, path).await?,
-                    None => None,
+        let Found {
+            chain,
+            cached,
+            examined,
+        } = match cuts {
+            Some(cuts) => self.blame_stretches(id, tip, path, cache, cuts).await?,
+            None => {
+                let mut acc = Changers {
+                    chain: Vec::new(),
+                    checked: 0,
+                    cur_info: tip,
+                    cached: None,
                 };
-                if !acc
-                    .step(self, path, cache, cur, parent.is_some(), parent_info)
-                    .await?
-                {
-                    break examined;
+                let (mut cur, mut examined) = (id, 0);
+                loop {
+                    examined += 1;
+                    let parent = self.get_changeset(cur).await?.parents.first().copied();
+                    let parent_info = match parent {
+                        Some(p) => self.lookup_file(p, path).await?,
+                        None => None,
+                    };
+                    if !acc
+                        .step(self, path, cache, cur, parent.is_some(), parent_info)
+                        .await?
+                    {
+                        break acc.found(examined);
+                    }
+                    cur = parent.expect("a step continues only with a parent");
                 }
-                cur = parent.expect("a step continues only with a parent");
             }
         };
-        let Changers { chain, cached, .. } = acc;
         let latest = chain.first().map(|(c, _)| *c);
         // Lines are tracked as (changeset, line in it) while the versions are
         // replayed, and given their text from the last version at the end:
@@ -366,12 +724,36 @@ impl Repo {
             None => (Vec::new(), String::new()),
         };
         let oldest_first: Vec<(ChangesetId, FileInfo)> = chain.into_iter().rev().collect();
-        for window in oldest_first.chunks(CONTENT_BATCH) {
-            let texts = self.utf8_contents(window.iter().map(|(_, i)| i)).await?;
+        let mut windows: Vec<&[(ChangesetId, FileInfo)]> = Vec::new();
+        let (mut start, mut bytes) = (0, 0);
+        for (i, (_, info)) in oldest_first.iter().enumerate() {
+            if i > start && (i - start == CONTENT_BATCH || bytes + info.size > CONTENT_BYTES) {
+                windows.push(&oldest_first[start..i]);
+                (start, bytes) = (i, 0);
+            }
+            bytes += info.size;
+        }
+        if start < oldest_first.len() {
+            windows.push(&oldest_first[start..]);
+        }
+        let windows = &windows;
+        let read = |k: usize| async move {
+            match windows.get(k) {
+                Some(w) => self.utf8_contents(w.iter().map(|(_, i)| i)).await.map(Some),
+                None => Ok(None),
+            }
+        };
+        // Each window's versions are read while the one before is diffed.
+        let mut next = read(0).await?;
+        for (k, window) in windows.iter().enumerate() {
+            let texts = next.take().expect("a window read for each window");
             let mut versions = Vec::with_capacity(texts.len() + 1);
             versions.push(std::mem::take(&mut old_text));
             versions.extend(texts);
-            let (ops, mut versions) = diff_versions(versions).await?;
+            let (diffed, ahead) =
+                futures_util::future::join(diff_versions(versions), read(k + 1)).await;
+            let (ops, mut versions) = diffed?;
+            next = ahead?;
             for ((cid, _), ops) in window.iter().zip(ops) {
                 let mut next = Vec::with_capacity(lines.len());
                 for (tag, old, new) in ops {
@@ -418,29 +800,55 @@ impl Repo {
 }
 
 /// One diff of consecutive versions, as `(tag, old lines, new lines)`.
-type Ops = Vec<(DiffTag, std::ops::Range<usize>, std::ops::Range<usize>)>;
+pub(crate) type Ops = Vec<(DiffTag, std::ops::Range<usize>, std::ops::Range<usize>)>;
 
 /// The line diffs of each version in `versions` against the one before,
 /// computed on several cores: they do not depend on each other, only
 /// applying them does. Returns the versions too.
-async fn diff_versions(versions: Vec<String>) -> Result<(Vec<Ops>, Vec<String>)> {
-    let versions = std::sync::Arc::new(versions);
+///
+/// Each diff is the one `TextDiff::configure().timeout(DIFF_TIMEOUT)
+/// .diff_lines` makes, but cheaper: that splits both versions into lines and
+/// numbers the distinct lines for every pair, so every version was split and
+/// hashed twice. Here each task splits and numbers its versions once, and
+/// diffs the numbers with the same algorithm, which compares lines only for
+/// equality and so gives the same diff.
+pub(crate) async fn diff_versions(versions: Vec<String>) -> Result<(Vec<Ops>, Vec<String>)> {
+    let versions = Arc::new(versions);
     let pairs = versions.len().saturating_sub(1);
-    let per_task = pairs.div_ceil(DIFF_TASKS).max(1);
+    let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let per_task = pairs.div_ceil(cores.min(DIFF_TASKS)).max(1);
     let mut tasks = Vec::new();
     for start in (0..pairs).step_by(per_task) {
         let versions = versions.clone();
         let end = (start + per_task).min(pairs);
         tasks.push(tokio::task::spawn_blocking(move || {
-            (start..end)
-                .map(|i| {
-                    TextDiff::configure()
-                        .timeout(DIFF_TIMEOUT)
-                        .diff_lines(&versions[i], &versions[i + 1])
-                        .ops()
-                        .iter()
-                        .map(|op| op.as_tag_tuple())
-                        .collect::<Ops>()
+            let mut ids: HashMap<&str, u32> = HashMap::new();
+            let numbered: Vec<Vec<u32>> = versions[start..=end]
+                .iter()
+                .map(|v| {
+                    split_lines(v)
+                        .map(|line| {
+                            let next = ids.len() as u32;
+                            *ids.entry(line).or_insert(next)
+                        })
+                        .collect()
+                })
+                .collect();
+            numbered
+                .windows(2)
+                .map(|w| {
+                    let deadline = std::time::Instant::now().checked_add(DIFF_TIMEOUT);
+                    similar::capture_diff_deadline(
+                        Algorithm::Myers,
+                        &w[0][..],
+                        0..w[0].len(),
+                        &w[1][..],
+                        0..w[1].len(),
+                        deadline,
+                    )
+                    .iter()
+                    .map(|op| op.as_tag_tuple())
+                    .collect::<Ops>()
                 })
                 .collect::<Vec<Ops>>()
         }));
@@ -452,8 +860,38 @@ async fn diff_versions(versions: Vec<String>) -> Result<(Vec<Ops>, Vec<String>)>
                 .map_err(|e| Error::Other(format!("blame diff task failed: {e}")))?,
         );
     }
-    let versions = std::sync::Arc::try_unwrap(versions).unwrap_or_else(|v| (*v).clone());
+    let versions = Arc::try_unwrap(versions).unwrap_or_else(|v| (*v).clone());
     Ok((out, versions))
+}
+
+/// The lines of `text` as `similar` splits them for a line diff: each ends
+/// after `\n`, `\r\n`, or a `\r` not followed by `\n`.
+pub(crate) fn split_lines(text: &str) -> impl Iterator<Item = &str> {
+    let b = text.as_bytes();
+    let mut start = 0;
+    let mut i = 0;
+    std::iter::from_fn(move || {
+        while i < b.len() {
+            let end = match b[i] {
+                b'\n' => i + 1,
+                b'\r' if b.get(i + 1) == Some(&b'\n') => i + 2,
+                b'\r' => i + 1,
+                _ => {
+                    i += 1;
+                    continue;
+                }
+            };
+            let line = &text[start..end];
+            (start, i) = (end, end);
+            return Some(line);
+        }
+        if start < b.len() {
+            let line = &text[start..];
+            start = b.len();
+            return Some(line);
+        }
+        None
+    })
 }
 
 /// The changesets that changed the file, newest first, as a blame walk
@@ -469,7 +907,136 @@ struct Changers {
     cached: Option<(CachedBlame, FileInfo)>,
 }
 
+/// How a blame walk is cut into stretches: steps walked from the tip before
+/// the stretches below are, and the fewest generations a stretch spans.
+#[derive(Clone, Copy)]
+pub(crate) struct Cuts {
+    pub(crate) head: usize,
+    pub(crate) min_span: u64,
+}
+
+/// What a blame's walk found: the changers, newest first, down to the end
+/// of the file's history or to `cached`, the newest changer's cached blame
+/// and the file it is of; and how many changesets it examined.
+struct Found {
+    chain: Vec<(ChangesetId, FileInfo)>,
+    cached: Option<(CachedBlame, FileInfo)>,
+    examined: usize,
+}
+
+impl Found {
+    /// Take the steps of the next stretch down, where the file at the top is
+    /// `cur_info` (and, after, at the bottom). Returns whether the walk ends
+    /// in this stretch.
+    fn take(&mut self, walk: StretchWalk, cur_info: &mut FileInfo) -> bool {
+        let StretchWalk {
+            steps,
+            mut first_cached,
+            mut cached,
+            absent,
+            ..
+        } = walk;
+        if absent {
+            return true;
+        }
+        for (i, step) in steps.into_iter().enumerate() {
+            self.examined += 1;
+            let changed = step
+                .parent_info
+                .as_ref()
+                .is_none_or(|p| p.content != cur_info.content);
+            if changed {
+                let hit = match &cached {
+                    _ if i == 0 => first_cached.take(),
+                    Some((j, _)) if *j == i => cached.take().map(|(_, b)| b),
+                    _ => None,
+                };
+                if let Some(blame) = hit {
+                    self.cached = Some((blame, cur_info.clone()));
+                    return true;
+                }
+                self.chain.push((step.x, cur_info.clone()));
+            }
+            match step.parent_info {
+                Some(info) if step.has_parent => *cur_info = info,
+                _ => return true,
+            }
+        }
+        false
+    }
+}
+
+/// One examined changeset of a walk, whether it has a first parent, and the
+/// file there.
+struct Step {
+    x: ChangesetId,
+    has_parent: bool,
+    parent_info: Option<FileInfo>,
+}
+
+/// What [`Repo::walk_stretch`] found: the steps, newest first, down to the
+/// bottom of the stretch or the end of the walk, and cached blames: of the
+/// first step, and of the step the walk ended at.
+struct StretchWalk {
+    steps: Vec<Step>,
+    first_cached: Option<CachedBlame>,
+    cached: Option<(usize, CachedBlame)>,
+    /// Where the walk stopped after its most steps, with the stretch below
+    /// still to walk.
+    resume: Option<SkipEntry>,
+    /// The file never existed at the top: the walk ends above.
+    absent: bool,
+}
+
+/// One stretch of the first-parent chain for [`Repo::walk_stretch`].
+struct Stretch {
+    top: ChangesetId,
+    /// The generation of the next stretch's top, 0 for none.
+    bottom: u64,
+    /// Steps to take at most.
+    most: usize,
+    /// Seeded with the chain's ancestors known between `top` and `bottom`.
+    first_parents: FirstParents,
+}
+
+/// Where [`Repo::skip_unchanged`] says to go.
+enum Skip {
+    /// Examine this first-parent ancestor next.
+    To(ChangesetId),
+    /// Examine the current changeset (the index has no entry for the path).
+    Here,
+    /// Nothing changed the path above the stretch's bottom.
+    Past,
+}
+
+/// Skiplists read, by changeset.
+type SkipLists = HashMap<ChangesetId, Arc<Vec<SkipEntry>>>;
+
 impl Changers {
+    fn found(self, examined: usize) -> Found {
+        Found {
+            chain: self.chain,
+            cached: self.cached,
+            examined,
+        }
+    }
+
+    /// Look the changers not yet looked up in the blame cache up, and drop
+    /// those past the newest found. Returns whether one was found.
+    async fn check_cache(&mut self, repo: &Repo, path: &RepoPath) -> Result<bool> {
+        if let Some((i, blame)) = repo
+            .newest_cached(path, &self.chain[self.checked..])
+            .await?
+        {
+            let i = self.checked + i;
+            self.cached = Some((blame, self.chain[i].1.clone()));
+            self.chain.truncate(i);
+            return Ok(true);
+        }
+        self.checked = self.chain.len();
+        Ok(false)
+    }
+
     /// Record one examined changeset `x`, whose first parent (if
     /// `has_parent`) holds `parent_info`. Cached blames are looked up a batch
     /// of changers at a time, and the changers past the newest one found are
@@ -490,17 +1057,11 @@ impl Changers {
             self.chain.push((x, self.cur_info.clone()));
         }
         let more = has_parent && parent_info.is_some();
-        if cache && (self.chain.len() - self.checked >= CACHE_CHECK_BATCH || !more) {
-            if let Some((i, blame)) = repo
-                .newest_cached(path, &self.chain[self.checked..])
-                .await?
-            {
-                let i = self.checked + i;
-                self.cached = Some((blame, self.chain[i].1.clone()));
-                self.chain.truncate(i);
-                return Ok(false);
-            }
-            self.checked = self.chain.len();
+        if cache
+            && (self.chain.len() - self.checked >= CACHE_CHECK_BATCH || !more)
+            && self.check_cache(repo, path).await?
+        {
+            return Ok(false);
         }
         if let Some(info) = parent_info.filter(|_| more) {
             self.cur_info = info;
@@ -519,20 +1080,11 @@ impl Changers {
 /// the distance.
 struct FirstParents {
     known: BTreeMap<u64, ChangesetId>,
-    lists: HashMap<ChangesetId, Vec<derived::SkipEntry>>,
+    lists: SkipLists,
 }
 
 impl FirstParents {
-    async fn new(repo: &Repo, tip: ChangesetId) -> Result<Self> {
-        let mut known = BTreeMap::new();
-        known.insert(repo.generation(tip).await?, tip);
-        Ok(FirstParents {
-            known,
-            lists: HashMap::new(),
-        })
-    }
-
-    async fn list(&mut self, repo: &Repo, id: ChangesetId) -> Result<&[derived::SkipEntry]> {
+    async fn list(&mut self, repo: &Repo, id: ChangesetId) -> Result<&[SkipEntry]> {
         if !self.lists.contains_key(&id) {
             let list = Skiplist::decode(&derived::derive::<Skiplist>(repo, id).await?)?;
             for e in &list {
@@ -541,14 +1093,14 @@ impl FirstParents {
                 // needs no read of its own.
                 repo.remember_generation(e.id, e.generation);
             }
-            self.lists.insert(id, list);
+            self.lists.insert(id, Arc::new(list));
         }
         Ok(&self.lists[&id])
     }
 
     /// The first parent of `id`, a changeset of this chain.
-    async fn parent(&mut self, repo: &Repo, id: ChangesetId) -> Result<Option<ChangesetId>> {
-        Ok(self.list(repo, id).await?.first().map(|e| e.id))
+    async fn parent(&mut self, repo: &Repo, id: ChangesetId) -> Result<Option<SkipEntry>> {
+        Ok(self.list(repo, id).await?.first().copied())
     }
 
     /// The lowest changeset of the chain with a generation of at least `g`.
@@ -573,5 +1125,26 @@ impl FirstParents {
                 None => return Ok(x),
             }
         }
+    }
+}
+
+/// A spawned task, aborted when dropped: a blame that stops early (at a
+/// cached blame or the file's creation) does not leave walks running.
+struct Spawned<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for Spawned<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+impl<T> std::future::Future for Spawned<T> {
+    type Output = std::result::Result<T, tokio::task::JoinError>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        std::pin::Pin::new(&mut self.0).poll(cx)
     }
 }
