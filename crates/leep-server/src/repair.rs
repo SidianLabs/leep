@@ -105,7 +105,7 @@ enum RepairCmd {
     },
 }
 
-struct Stderr;
+pub(crate) struct Stderr;
 
 impl Progress for Stderr {
     fn info(&self, message: &str) {
@@ -141,7 +141,7 @@ fn check_exists(meta: &str, blobs: Option<&str>) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn open(meta: &str, blobs: &str) -> anyhow::Result<Repo> {
+pub(crate) async fn open(meta: &str, blobs: &str) -> anyhow::Result<Repo> {
     check_exists(meta, Some(blobs))?;
     let blobs = leep_store::open_blob_store(blobs).context("opening blob store")?;
     let meta = crate::open_meta(meta).await.context("opening meta store")?;
@@ -186,7 +186,7 @@ fn signature_check() -> integrity::SignatureCheck {
     })
 }
 
-fn bytes_human(n: u64) -> String {
+pub(crate) fn bytes_human(n: u64) -> String {
     const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
     let mut v = n as f64;
     let mut u = 0;
@@ -242,7 +242,7 @@ struct Envelope<'a, T: Serialize> {
     report: &'a T,
 }
 
-fn print_json<T: Serialize>(ok: bool, exit_code: i32, report: &T) -> anyhow::Result<()> {
+pub(crate) fn print_json<T: Serialize>(ok: bool, exit_code: i32, report: &T) -> anyhow::Result<()> {
     println!(
         "{}",
         serde_json::to_string_pretty(&Envelope {
