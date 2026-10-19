@@ -104,9 +104,11 @@ pub struct Repo {
     /// Values of staged kinds computed but not stored yet, by kind and
     /// changeset (see `derived::derive`).
     pub(crate) staged_values: Arc<Mutex<HashMap<(&'static str, Hash), Bytes>>>,
-    /// Values computed by `derived::derive`, any kind; tests check for
-    /// duplicated work with it.
-    #[cfg(test)]
+    /// Changesets a derivation of a missing range works on at once (ADR
+    /// 0050).
+    derive_jobs: usize,
+    /// Values computed by `derived::derive`, any kind: what `repair
+    /// rederive --missing` reports, and tests check for duplicated work.
     pub(crate) derive_calls: Arc<std::sync::atomic::AtomicUsize>,
 }
 
@@ -357,6 +359,18 @@ impl<V> SizedMaps<V> {
     }
 }
 
+/// Jobs a derivation uses unless told otherwise: the cores the process may
+/// use, up to [`MAX_DEFAULT_DERIVE_JOBS`].
+pub fn default_derive_jobs() -> usize {
+    std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(MAX_DEFAULT_DERIVE_JOBS)
+}
+
+/// Past this many, more jobs mostly wait on the metadata store's connection
+/// pool (16 on Postgres) and lock each other out of the shared caches.
+pub const MAX_DEFAULT_DERIVE_JOBS: usize = 8;
+
 impl Repo {
     pub fn new(blobs: Arc<dyn BlobStore>, meta: Arc<dyn MetaStore>) -> Self {
         Repo {
@@ -375,7 +389,7 @@ impl Repo {
             log_filter: Arc::default(),
             derive_locks: Arc::default(),
             staged_values: Arc::default(),
-            #[cfg(test)]
+            derive_jobs: default_derive_jobs(),
             derive_calls: Arc::default(),
         }
     }
@@ -388,6 +402,24 @@ impl Repo {
             Some(prev) => Arc::new(PolicySet::new(vec![prev, policy])),
         });
         self
+    }
+
+    /// Derive missing ranges `jobs` changesets at a time (at least one).
+    /// Rows are the same for any number; more jobs use more cores and more
+    /// concurrent store requests.
+    pub fn with_derive_jobs(mut self, jobs: usize) -> Self {
+        self.derive_jobs = jobs.max(1);
+        self
+    }
+
+    /// Values `derived::derive` computed through this handle and its clones.
+    pub(crate) fn derived_count(&self) -> u64 {
+        self.derive_calls.load(std::sync::atomic::Ordering::Relaxed) as u64
+    }
+
+    /// See [`Repo::with_derive_jobs`].
+    pub fn derive_jobs(&self) -> usize {
+        self.derive_jobs
     }
 
     /// The land policy in force, if any.

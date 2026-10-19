@@ -782,6 +782,171 @@ async fn derivation_under_faults_leaves_no_wrong_rows() {
     }
 }
 
+/// A history five lanes wide: mainline and four branches, each editing its
+/// own directory and a shared one under its own author, branches restarting
+/// from mainline now and then, mainline merging a branch every ten steps
+/// and an octopus merge of every lane at the end. Derivation has several
+/// changesets ready at once. Returns every id, the octopus last.
+async fn lanes_history(r: &Repo, n: usize) -> Vec<ChangesetId> {
+    async fn commit(
+        r: &Repo,
+        parents: &[ChangesetId],
+        author: &str,
+        files: &[(String, String)],
+    ) -> ChangesetId {
+        let mut changes = BTreeMap::new();
+        for (path, body) in files {
+            let content = r.put_blob(Bytes::from(body.clone())).await.unwrap();
+            changes.insert(
+                rp(path),
+                FileChange::Modify {
+                    content,
+                    kind: FileKind::Regular,
+                    size: body.len() as u64,
+                },
+            );
+        }
+        let cs = Changeset {
+            parents: parents.to_vec(),
+            author: author.into(),
+            timestamp: 1,
+            message: format!("{} files", files.len()),
+            changes,
+            extra: BTreeMap::new(),
+        };
+        r.create_changeset(cs).await.unwrap()
+    }
+    let root = commit(r, &[], "Root", &[("shared/s0".into(), "0".into())]).await;
+    let mut ids = vec![root];
+    let mut tips = [root; 5];
+    for i in 1..n {
+        let lane = i % 5;
+        let id = if lane == 0 && i % 10 == 0 {
+            let other = tips[(i / 10) % 4 + 1];
+            let files = [(format!("m/f{}", i % 13), i.to_string())];
+            commit(r, &[tips[0], other], "Merger", &files).await
+        } else {
+            let files = [
+                (format!("l{lane}/f{}", i % 17), i.to_string()),
+                (format!("shared/s{}", i % 7), format!("{lane}.{i}")),
+            ];
+            commit(r, &[tips[lane]], &format!("Dev {lane}"), &files).await
+        };
+        tips[lane] = id;
+        ids.push(id);
+        if lane != 0 && i % 37 == 0 {
+            tips[lane] = tips[0];
+        }
+    }
+    let mut parents: Vec<ChangesetId> = Vec::new();
+    for t in tips {
+        if !parents.contains(&t) {
+            parents.push(t);
+        }
+    }
+    ids.push(commit(r, &parents, "Octopus", &[]).await);
+    ids
+}
+
+/// Deriving on several cores (ADR 0050) under faults stores rows only after
+/// their parents' rows and a changeset's value only after the rows it names,
+/// so whatever a failed run leaves is where a retry, a restarted server or
+/// a query resumes, and they end with the rows a fault-free serial run
+/// writes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn parallel_derivation_under_faults_stores_rows_after_their_parents() {
+    use crate::derived::{
+        derive, DerivedKind, HistoryTree, LogFilterIndex, HISTORY_NODE_KIND, LOG_FILTER_NAME_KIND,
+    };
+    let blobs = Arc::new(MemoryBlobStore::new());
+    let truth_meta = Tamper::new(Arc::new(MemoryMetaStore::new()));
+    let truth = Repo::new(blobs.clone(), truth_meta.clone()).with_derive_jobs(1);
+    let ids = lanes_history(&truth, 300).await;
+    let tip = *ids.last().unwrap();
+    derive::<HistoryTree>(&truth, tip).await.unwrap();
+    derive::<LogFilterIndex>(&truth, tip).await.unwrap();
+    let truth_rows = truth_meta.rows();
+    let mut parents: HashMap<leep_core::Hash, Vec<ChangesetId>> = HashMap::new();
+    for id in &ids {
+        parents.insert(id.0, truth.get_changeset(*id).await.unwrap().parents);
+    }
+    let chained = [HistoryTree::NAME, LogFilterIndex::NAME];
+    let compared = [
+        HistoryTree::NAME,
+        HISTORY_NODE_KIND,
+        LogFilterIndex::NAME,
+        LOG_FILTER_NAME_KIND,
+    ];
+
+    // Each seed derives 300 changesets several times over; every third
+    // seed keeps a sweep's time near the other tests'.
+    for seed in seeds().step_by(3) {
+        let (bare, _) = without_derived(&truth).await;
+        let spy = Tamper::new(bare);
+        let plan = FaultPlan::new(seed);
+        // Rows reach the store a window of 256 changesets at a time, so an
+        // attempt keeps only the windows it finished: faults are rare enough
+        // for one to get through, and often enough to hit most runs, and
+        // writes partway.
+        plan.rate(Op::META, 2, Fault::Fail)
+            .rate(&[Op::PutDerived], 4, Fault::FailAfter)
+            .rate(Op::BLOB, 1, Fault::Fail);
+        let repo = Repo::new(
+            Arc::new(FaultyBlobStore::new(blobs.clone(), plan.clone())),
+            Arc::new(FaultyMetaStore::new(spy.clone(), plan.clone())),
+        )
+        .with_derive_jobs(4);
+        let mut failures = 0;
+        loop {
+            let (a, b) = futures_util::join!(
+                derive::<HistoryTree>(&repo, tip),
+                derive::<LogFilterIndex>(&repo, tip)
+            );
+            let rows = spy.rows();
+            for ((kind, key), row) in &rows {
+                assert_eq!(
+                    truth_rows.get(&(kind.clone(), *key)),
+                    Some(row),
+                    "seed {seed}: wrong row {kind} {key}"
+                );
+                if chained.contains(&kind.as_str()) {
+                    for p in &parents[key] {
+                        assert!(
+                            rows.contains_key(&(kind.clone(), p.0)),
+                            "seed {seed}: the {kind} row of {key} is stored before its parent {p}'s"
+                        );
+                    }
+                }
+            }
+            match (a, b) {
+                (Ok(_), Ok(_)) => break,
+                (a, b) => {
+                    for e in [a.err(), b.err()].into_iter().flatten() {
+                        assert!(is_injected(&e), "seed {seed}: {e}");
+                    }
+                    failures += 1;
+                }
+            }
+            assert!(failures < 5000, "seed {seed}: derivation never completes");
+        }
+        assert!(failures > 0, "seed {seed}: no fault hit a derivation");
+        let rows = spy.rows();
+        for kind in compared {
+            let of = |m: &BTreeMap<(String, leep_core::Hash), Bytes>| {
+                m.iter()
+                    .filter(|((k, _), _)| k == kind)
+                    .map(|((_, h), v)| (*h, v.clone()))
+                    .collect::<Vec<_>>()
+            };
+            assert!(
+                of(&rows) == of(&truth_rows),
+                "seed {seed}: {kind} rows differ"
+            );
+        }
+        assert!(spy.conflicts.lock().unwrap().is_empty(), "seed {seed}");
+    }
+}
+
 /// A blob store that flips one bit of one blob on read.
 struct FlipBlob {
     inner: Arc<dyn BlobStore>,

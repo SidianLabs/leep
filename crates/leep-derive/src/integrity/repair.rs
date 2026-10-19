@@ -11,15 +11,17 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use futures_util::future::BoxFuture;
 use leep_core::{Changeset, ChangesetId, Error, Hash, MetaStore, Result};
 use serde::Serialize;
 
 use super::kinds::{self, DropPolicy, KindClass};
 use super::problems::{recoverable, Damage, Problem, ProblemLog, Progress, Ticker};
-use super::rows::{expected_blob_row, recompute, RowScan, PAGE};
+use super::rows::{derive_kind, expected_blob_row, prepare, recompute, RowScan, PAGE};
 use super::shadow::{ShadowBlobs, ShadowMeta};
-use super::walk::{HistoryWalk, Visitor};
+use super::walk::{plan, Unreadable};
 use crate::derived::history_pack::same_part;
+use crate::derived::wavefront::{self, Dag, Preparer, Wave, Window, OUTSIDE};
 use crate::derived::{DerivedKind, HistoryTree};
 use crate::search::index::TreeRowMemo;
 use crate::search::{BLOB_KIND as BLOB_TRIGRAMS, TREE_KIND as TREE_TRIGRAMS};
@@ -44,6 +46,12 @@ pub struct RederiveOptions {
     /// Count what would change and write nothing.
     pub dry_run: bool,
     pub max_problems: usize,
+    /// Changesets recomputed at once (ADR 0050). A dry run uses one.
+    pub jobs: usize,
+    /// Only derive rows that are absent, as queries and the warmer would,
+    /// and leave stored rows unchecked: an initial build that can stop and
+    /// resume where it was.
+    pub missing_only: bool,
 }
 
 /// What a rederivation did to one kind. In a dry run `filled` and
@@ -152,18 +160,20 @@ pub async fn rederive(
 
     if !r.changeset_kinds.is_empty() {
         let meta = repo.meta().clone();
-        let mut walk = HistoryWalk::new();
-        match &opts.scope {
+        let starts = match &opts.scope {
             Scope::Refs(names) => {
                 let refs = meta.list_refs().await?;
+                let mut starts = Vec::with_capacity(names.len());
                 for name in names {
                     let id = refs
                         .get(name)
                         .ok_or_else(|| Error::NotFound(format!("ref {name:?}")))?;
-                    walk.run_from(&*meta, *id, &mut r).await?;
+                    starts.push(*id);
                 }
+                starts
             }
             Scope::All => {
+                let mut starts = Vec::new();
                 let mut after = None;
                 loop {
                     let page = meta.list_changesets(after, PAGE).await?;
@@ -171,11 +181,28 @@ pub async fn rederive(
                         break;
                     };
                     after = Some(last);
-                    for id in page {
-                        walk.run_from(&*meta, id, &mut r).await?;
-                    }
+                    starts.extend(page);
                 }
+                starts
             }
+        };
+        if opts.missing_only && !opts.dry_run {
+            r.fill_missing(&starts, opts.jobs).await?;
+            notes.push(
+                "only missing rows were derived and stored rows were not checked; `examined` \
+                 counts the starting changesets and `filled` every row derived"
+                    .into(),
+            );
+        } else {
+            let jobs = if opts.dry_run { 1 } else { opts.jobs };
+            let dag = plan(&*meta, &starts, &mut r).await?;
+            progress.info(&format!(
+                "repair: {} changesets, {jobs} at a time",
+                dag.len()
+            ));
+            let mut wave = RederiveWave { r: &mut r };
+            let compute = wave.r.compute.clone();
+            wavefront::run(&compute, &dag, jobs, &mut wave).await?;
         }
     } else if matches!(opts.scope, Scope::Refs(_)) {
         notes
@@ -294,66 +321,206 @@ impl Rederive<'_> {
     }
 }
 
-#[async_trait]
-impl Visitor for Rederive<'_> {
-    async fn visit(&mut self, id: ChangesetId, cs: &Changeset, parent_broken: bool) -> Result<()> {
-        self.visited += 1;
-        for kind in self.changeset_kinds.clone() {
-            self.report(kind).examined += 1;
-            if parent_broken {
-                self.report(kind).failed += 1;
-                self.log.push(
+/// What recomputing one kind's row of one changeset found.
+enum Outcome {
+    Matched,
+    Filled,
+    Overwritten,
+    Failed(Problem),
+}
+
+/// Recompute every kind of `id` (kinds in dependency order) and write the
+/// rows that differ. Runs as a task of its own, after the changeset's
+/// parents' rows are written.
+async fn recompute_all(
+    real: Repo,
+    compute: Repo,
+    shadow: Option<Arc<ShadowMeta>>,
+    kinds: Vec<&'static str>,
+    id: ChangesetId,
+    cs: Arc<Changeset>,
+) -> Result<Vec<Outcome>> {
+    let mut out = Vec::with_capacity(kinds.len());
+    for kind in kinds {
+        let expected = match recompute(kind, &compute, id, &cs).await {
+            Ok(v) => v,
+            Err(e) if recoverable(&e) => {
+                out.push(Outcome::Failed(
                     Problem::new(
                         "derived",
                         "rederive_failed",
-                        format!("the {kind} row of {id} depends on an unreadable parent"),
+                        format!("the {kind} row of {id} cannot be recomputed: {e}"),
                     )
                     .kind(kind)
                     .key(&id.0)
                     .changeset(id),
-                );
+                ));
                 continue;
             }
-            let expected = match recompute(kind, &self.compute, id, cs).await {
-                Ok(v) => v,
-                Err(e) if recoverable(&e) => {
-                    self.report(kind).failed += 1;
-                    self.log.push(
+            Err(e) => return Err(e),
+        };
+        match real.meta().get_derived(kind, &id.0).await? {
+            Some(stored)
+                if stored == expected
+                    || (kind == HistoryTree::NAME && same_part(&stored, &expected)) =>
+            {
+                out.push(Outcome::Matched)
+            }
+            stored => {
+                out.push(if stored.is_some() {
+                    Outcome::Overwritten
+                } else {
+                    Outcome::Filled
+                });
+                match &shadow {
+                    // A dry run still records the value, so later
+                    // recomputations see what a real run would have written.
+                    Some(shadow) => shadow.set(kind, &id.0, expected),
+                    None => real.meta().put_derived(kind, &id.0, expected).await?,
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// A rederivation of per-changeset kinds as a [`wavefront`] run: each
+/// changeset's rows are recomputed, compared and written in a task, and the
+/// counts and problems are recorded here, parents first.
+struct RederiveWave<'r, 'a> {
+    r: &'r mut Rederive<'a>,
+}
+
+#[async_trait]
+impl Wave for RederiveWave<'_, '_> {
+    type Out = Vec<Outcome>;
+
+    fn preparer(&self) -> Preparer {
+        let kinds = self.r.changeset_kinds.clone();
+        Arc::new(move |repo: Repo, window: Window| {
+            let kinds = kinds.clone();
+            Box::pin(async move {
+                let pairs: Vec<(ChangesetId, &Changeset)> =
+                    window.iter().map(|(id, cs)| (*id, &**cs)).collect();
+                prepare(&kinds, &repo, &pairs).await;
+            })
+        })
+    }
+
+    fn start(
+        &mut self,
+        dag: &Dag,
+        i: usize,
+        cs: Arc<Changeset>,
+    ) -> Result<BoxFuture<'static, Result<Vec<Outcome>>>> {
+        let id = dag.id(i);
+        let kinds = self.r.changeset_kinds.clone();
+        if dag.parents(i).contains(&OUTSIDE) {
+            // Every readable ancestor is in the plan, so a parent outside it
+            // could not be read.
+            let out = kinds
+                .into_iter()
+                .map(|kind| {
+                    Outcome::Failed(
                         Problem::new(
                             "derived",
                             "rederive_failed",
-                            format!("the {kind} row of {id} cannot be recomputed: {e}"),
+                            format!("the {kind} row of {id} depends on an unreadable parent"),
                         )
                         .kind(kind)
                         .key(&id.0)
                         .changeset(id),
-                    );
-                    continue;
-                }
-                Err(e) => return Err(e),
-            };
-            match self.real.meta().get_derived(kind, &id.0).await? {
-                Some(stored)
-                    if stored == expected
-                        || (kind == HistoryTree::NAME && same_part(&stored, &expected)) =>
-                {
-                    self.report(kind).matched += 1
-                }
-                stored => {
-                    if stored.is_some() {
-                        self.report(kind).overwritten += 1;
-                    } else {
-                        self.report(kind).filled += 1;
-                    }
-                    self.write(kind, &id.0, expected).await?;
+                    )
+                })
+                .collect();
+            return Ok(Box::pin(async move { Ok(out) }));
+        }
+        Ok(Box::pin(recompute_all(
+            self.r.real.clone(),
+            self.r.compute.clone(),
+            self.r.shadow_meta.clone(),
+            kinds,
+            id,
+            cs,
+        )))
+    }
+
+    async fn finish(&mut self, _: &Dag, _: usize, out: Vec<Outcome>) -> Result<()> {
+        let r = &mut *self.r;
+        r.visited += 1;
+        for (kind, outcome) in r.changeset_kinds.clone().into_iter().zip(out) {
+            let report = r.report(kind);
+            report.examined += 1;
+            match outcome {
+                Outcome::Matched => report.matched += 1,
+                Outcome::Filled => report.filled += 1,
+                Outcome::Overwritten => report.overwritten += 1,
+                Outcome::Failed(p) => {
+                    report.failed += 1;
+                    r.log.push(p);
                 }
             }
         }
-        self.clear_shadow();
-        self.tick();
+        // Only a dry run writes to the shadow, and it runs one job, so no
+        // recomputation is under way.
+        r.clear_shadow();
+        r.tick();
         Ok(())
     }
+}
 
+impl Rederive<'_> {
+    /// Derive each kind where it is missing for `starts` and their
+    /// ancestors, as queries would, `jobs` changesets at a time; stored rows
+    /// are not read again, so a stopped run resumes where it was.
+    async fn fill_missing(&mut self, starts: &[ChangesetId], jobs: usize) -> Result<()> {
+        let repo = self.real.clone().with_derive_jobs(jobs);
+        let meta = repo.meta().clone();
+        for kind in self.changeset_kinds.clone() {
+            self.progress.info(&format!(
+                "repair: deriving missing {kind} rows, {jobs} at a time"
+            ));
+            let before = repo.derived_count();
+            let mut checked = 0u64;
+            for chunk in starts.chunks(PAGE) {
+                let keys: Vec<Hash> = chunk.iter().map(|id| id.0).collect();
+                let have = meta.get_derived_many(kind, &keys).await?;
+                for (id, v) in chunk.iter().zip(have) {
+                    if v.is_some() {
+                        continue;
+                    }
+                    let derivation = derive_kind(kind, &repo, *id);
+                    tokio::pin!(derivation);
+                    let mut ticks = tokio::time::interval(Duration::from_secs(5));
+                    ticks.tick().await;
+                    loop {
+                        tokio::select! {
+                            done = &mut derivation => {
+                                done?;
+                                break;
+                            }
+                            _ = ticks.tick() => self.progress.info(&format!(
+                                "repair: {} {kind} rows derived",
+                                repo.derived_count() - before
+                            )),
+                        }
+                    }
+                }
+                checked += chunk.len() as u64;
+                self.visited = checked;
+                let filled = repo.derived_count() - before;
+                let report = self.report(kind);
+                report.examined = checked;
+                report.filled = filled;
+                self.tick();
+            }
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Unreadable for Rederive<'_> {
     async fn broken(
         &mut self,
         id: ChangesetId,

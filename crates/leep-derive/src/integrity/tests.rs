@@ -264,6 +264,8 @@ async fn rederive_kinds(w: &World, kinds: &[&'static str], dry_run: bool) -> Red
             scope: Scope::All,
             dry_run,
             max_problems: 1000,
+            jobs: 4,
+            missing_only: false,
         },
         &Quiet,
     )
@@ -749,7 +751,9 @@ async fn blame_rows_must_match_the_file() {
             kinds: vec![BLAME_KIND],
             scope: Scope::All,
             dry_run: false,
-            max_problems: 10
+            max_problems: 10,
+            jobs: 4,
+            missing_only: false,
         },
         &Quiet
     )
@@ -932,6 +936,45 @@ async fn missing_rows_are_not_problems_but_repair_fills_them() {
     assert_eq!(r.derived["last_merge-v1"].missing, 0);
 }
 
+/// `--missing` derives absent rows only: a damaged stored row is left for a
+/// full rederive, and the rows it writes are the ones a full pass writes.
+#[tokio::test]
+async fn missing_only_fills_absent_rows_and_leaves_stored_ones() {
+    let w = world().await;
+    let full_rows = |w: &World| {
+        let meta = w.meta.clone();
+        async move {
+            meta.list_derived("history-tree-v4", None, usize::MAX)
+                .await
+                .unwrap()
+        }
+    };
+    let want = full_rows(&w).await;
+    w.meta.delete_derived_kind("history-tree-v4").await.unwrap();
+    let good = row(&w, "generation", &w.ids[3].0).await;
+    put_row(&w, "generation", &w.ids[3].0, flip(&good)).await;
+    let r = rederive(
+        &w.repo,
+        &RederiveOptions {
+            kinds: vec!["history-tree-v4"],
+            scope: Scope::All,
+            dry_run: false,
+            max_problems: 10,
+            jobs: 4,
+            missing_only: true,
+        },
+        &Quiet,
+    )
+    .await
+    .unwrap();
+    assert!(r.kind_reports["history-tree-v4"].filled >= 7, "{r:#?}");
+    assert_eq!(r.kind_reports["generation"].filled, 0);
+    assert_eq!(full_rows(&w).await, want);
+    assert_eq!(row(&w, "generation", &w.ids[3].0).await, flip(&good));
+    let fixed = rederive_kinds(&w, &["generation"], false).await;
+    assert_eq!(fixed.kind_reports["generation"].overwritten, 1);
+}
+
 #[tokio::test]
 async fn rederive_can_be_limited_to_the_history_of_a_ref() {
     let w = world().await;
@@ -947,6 +990,8 @@ async fn rederive_can_be_limited_to_the_history_of_a_ref() {
             scope: Scope::Refs(vec!["feature".into()]),
             dry_run: false,
             max_problems: 10,
+            jobs: 4,
+            missing_only: false,
         },
         &Quiet,
     )
@@ -1142,6 +1187,8 @@ async fn kinds_history_cannot_regenerate_are_refused() {
                 scope: Scope::All,
                 dry_run: false,
                 max_problems: 10,
+                jobs: 4,
+                missing_only: false,
             },
             &Quiet,
         )

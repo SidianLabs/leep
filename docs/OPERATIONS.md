@@ -714,11 +714,15 @@ the old servers still serving from v3:
 
 1. Check that the disk has room for the v4 index beside v3 (a sixth of v3's
    size, plus Postgres overhead), then run the new binary's
-   `leep-server repair rederive --kind history-tree-v4` against the shared
-   database. It is safe beside running servers, derives oldest first and can
-   be stopped and run again; it skips what is already derived. On Linux
-   expect hours (v4 derives at about v3's rate or faster on Postgres: 187 to
-   247 changesets a second on the v2.6.16 slice against 175 to 221 for v3).
+   `leep-server repair rederive --kind history-tree-v4 --missing --jobs N`
+   against the shared database (see [Indexing a large
+   history](#indexing-a-large-history)). It is safe beside running servers,
+   derives parents first and can be stopped and run again; with `--missing`
+   it skips what is already derived (without it, every stored row is
+   recomputed and compared again). On Linux expect hours with one job (v4
+   derives at about v3's rate or faster on Postgres: 187 to 247 changesets a
+   second on the v2.6.16 slice against 175 to 221 for v3), divided by about
+   the number of idle cores.
 2. Replace the old servers with new ones. Path queries are answered from v4
    at once.
 3. `repair drop --kind history-tree-v3 --dry-run`, then without `--dry-run`,
@@ -731,6 +735,45 @@ the old servers still serving from v3:
 If the disk cannot hold both indexes, drop v3 first (step 3), start the new
 servers and let the warmer (or `rederive`) build v4: path queries wait for
 derivation, or derive on demand, until it has caught up.
+
+## Indexing a large history
+
+After importing a long history (`leep-git import`, a restore without
+derived rows, or a `repair drop`), the lazily derived indexes
+(`history-tree-v4` for path history and blame, `log-filter-v1` for filtered
+logs) are missing for every changeset. The warmer derives them in the
+background (ADR 0028), and since ADR 0050 every derivation of a missing range
+uses several cores: changesets whose parents are done derive side by side,
+`--derive-jobs` at a time (`LEEP_DERIVE_JOBS`, default the cores up to 8).
+To build them before sending traffic, or on a machine of its own, run:
+
+```sh
+leep-server repair rederive --kind history-tree-v4 log-filter-v1 --missing --jobs 16
+```
+
+- `--missing` derives only rows that are absent and never reads stored
+  ones again, so the command can be stopped (Ctrl-C, a reboot, `kill -9`)
+  and run again: it resumes where it was. Rows reach the database in
+  windows of 256 changesets, always after their parents' rows, so a stop
+  loses at most the windows in flight. Without `--missing`, `rederive`
+  recomputes and compares every stored row too, which is what repairing
+  damaged rows needs and costs a full pass however much is already there.
+- `--jobs N`: changesets derived at once. The work is CPU-bound in the
+  `leep-server` process, so use about the cores the machine can spare;
+  with Postgres on another host a little more (1.5 to 2 times the cores)
+  hides round trips. Each job may hold a Postgres connection at a time and
+  the pool has 16, so more than 16 jobs gains nothing. Memory stays near
+  that of one job (a few hundred MB on Linux-sized histories); the
+  history-row and tree caches are shared.
+- Run `ANALYZE changesets, refs, derived;` first if the import did not (see
+  the next section).
+- Rows are byte-identical whatever `--jobs` is, and identical to what a
+  server's warmer or a query derives, so servers may keep running and
+  warming beside it.
+- `--dry-run` runs one changeset at a time.
+
+`rederive` prints the rows derived so far every five seconds. On a server,
+the rate of `leep_derive_total{kind}` is the warmer's derivation speed.
 
 ## Bulk loads and planner statistics (Postgres)
 
@@ -1029,13 +1072,17 @@ leep-server repair rederive --kind generation --dry-run   # what would change; e
 leep-server repair rederive --kind skiplist               # also checks generation, which it reads
 leep-server repair rederive --kind root_tree --ref main   # only the history of one ref
 leep-server repair rederive --kind all                    # every kind that can be recomputed
+leep-server repair rederive --kind history-tree-v4 --missing --jobs 16   # build an index after an import; resumable
 leep-server repair drop --kind blame blob-trigrams-v1     # delete rows; they derive again when asked for
 leep-server repair drop --kind history-tree-v4 --dry-run  # also removes history-node-v4; counts only
 ```
 
-`rederive` walks the chosen changesets oldest first, recomputes each selected
-kind and every kind it depends on (so a skiplist is never rebuilt from a
-damaged generation), and writes rows that are missing or wrong. It reports per
+`rederive` walks the chosen changesets parents first, recomputes each
+selected kind and every kind it depends on (so a skiplist is never rebuilt
+from a damaged generation), and writes rows that are missing or wrong.
+Changesets whose parents are done are recomputed side by side, `--jobs` at a
+time (default the cores, up to 8; ADR 0050); `--missing` only fills absent
+rows (see [Indexing a large history](#indexing-a-large-history)). It reports per
 kind how many it examined, how many were already right, how many it wrote, and
 how many it could not recompute. Rows no query ever asked for are written too:
 for the lazily derived kinds that is eager derivation, which is also how to

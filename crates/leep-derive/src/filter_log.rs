@@ -767,6 +767,59 @@ mod tests {
         }
     }
 
+    /// Deriving several changesets at once (ADR 0050) stores exactly the
+    /// rows of one at a time, on a history with octopus merges, criss-cross
+    /// merges and several roots, both kinds deriving side by side.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn parallel_derivation_stores_the_serial_rows() {
+        use crate::derived::{HistoryTree, LastMerge, HISTORY_NODE_KIND, LOG_FILTER_NAME_KIND};
+        async fn rows(r: &Repo) -> Vec<(&'static str, Vec<(Hash, Bytes)>)> {
+            let mut out = Vec::new();
+            for kind in [
+                HistoryTree::NAME,
+                HISTORY_NODE_KIND,
+                LogFilterIndex::NAME,
+                LOG_FILTER_NAME_KIND,
+                LastMerge::NAME,
+            ] {
+                let rows = r.meta().list_derived(kind, None, usize::MAX).await.unwrap();
+                out.push((kind, rows));
+            }
+            out
+        }
+        let serial = repo().with_derive_jobs(1);
+        let ids = random_dag(&serial, &mut Lcg(23), 700, 30).await;
+        for &id in &ids {
+            derive::<HistoryTree>(&serial, id).await.unwrap();
+            derive::<LogFilterIndex>(&serial, id).await.unwrap();
+        }
+        let want = rows(&serial).await;
+        assert_eq!(want[0].1.len(), 700);
+        for jobs in [2, 8] {
+            let r = repo().with_derive_jobs(jobs);
+            assert_eq!(random_dag(&r, &mut Lcg(23), 700, 30).await, ids);
+            // Newest first, so most derivations start on a long missing range.
+            for &id in ids.iter().rev() {
+                let (a, b) = futures_util::join!(
+                    derive::<HistoryTree>(&r, id),
+                    derive::<LogFilterIndex>(&r, id)
+                );
+                a.unwrap();
+                b.unwrap();
+            }
+            for ((kind, want), (_, got)) in want.iter().zip(rows(&r).await) {
+                if *kind == LastMerge::NAME {
+                    // Which of these get stored depends on what asked for
+                    // them, not their values.
+                    let want: std::collections::HashMap<_, _> = want.iter().cloned().collect();
+                    assert!(got.iter().all(|(k, v)| want.get(k).is_none_or(|w| w == v)));
+                } else {
+                    assert!(*want == got, "{kind} rows differ with {jobs} jobs");
+                }
+            }
+        }
+    }
+
     /// A rare author far back on a long chain is found by skipping, with a
     /// read per level rather than per changeset.
     #[tokio::test]

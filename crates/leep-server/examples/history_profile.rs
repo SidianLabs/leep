@@ -15,7 +15,9 @@
 //! with `mem://` stores that is the only way to have a history; `--old-base
 //! BACK` ends it with a merge of a two-commit branch forked BACK changesets
 //! before the end. `--last` derives the head's first parent first and then
-//! times the head alone. `--dump FILE`
+//! times the head alone. `--jobs N` derives N changesets at a time (ADR
+//! 0050; default: the cores, up to 8). `--log-filter` times (and resets
+//! and dumps) `log-filter-v1` and its name rows instead. `--dump FILE`
 //! writes every row of both kinds afterwards, sorted, as `kind key
 //! blake3(value)` lines, to compare two builds' rows.
 //!
@@ -37,7 +39,9 @@ use leep_core::{
     BlobMeta, BlobStore, Changeset, ChangesetId, DerivedRow, Hash, MetaStore, RefLogEntry, RefStep,
     RefUpdateContext, Result,
 };
-use leep_derive::derived::{self, DerivedKind, HistoryTree, HISTORY_NODE_KIND};
+use leep_derive::derived::{
+    self, DerivedKind, HistoryTree, LogFilterIndex, HISTORY_NODE_KIND, LOG_FILTER_NAME_KIND,
+};
 use leep_derive::Repo;
 
 #[path = "../../leep-derive/benches/support/wide_history.rs"]
@@ -203,7 +207,7 @@ impl MetaStore for Meta {
         r
     }
     async fn put_derived(&self, kind: &str, key: &Hash, value: Bytes) -> Result<()> {
-        if kind == HistoryTree::NAME {
+        if kind == HistoryTree::NAME || kind == LogFilterIndex::NAME {
             self.1 .1.fetch_add(1, Ordering::Relaxed);
         }
         timed!(
@@ -214,7 +218,10 @@ impl MetaStore for Meta {
         )
     }
     async fn put_derived_many(&self, rows: &[DerivedRow]) -> Result<()> {
-        let trees = rows.iter().filter(|r| r.kind == HistoryTree::NAME).count();
+        let trees = rows
+            .iter()
+            .filter(|r| r.kind == HistoryTree::NAME || r.kind == LogFilterIndex::NAME)
+            .count();
         self.1 .1.fetch_add(trees as u64, Ordering::Relaxed);
         timed!(
             self.1,
@@ -271,7 +278,7 @@ fn status_kib(field: &str) -> u64 {
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let usage =
-        "usage: history_profile <meta url> <blob url> <rev> [--reset] [--synth N [--small] [--old-base BACK]] [--last] [--dump FILE] [--breakdown] [--breakdown-v3]";
+        "usage: history_profile <meta url> <blob url> <rev> [--reset] [--synth N [--small] [--old-base BACK]] [--last] [--jobs N] [--log-filter] [--dump FILE] [--breakdown] [--breakdown-v3]";
     let meta_url = args.first().expect(usage);
     let blob_url = args.get(1).expect(usage);
     let rev = args.get(2).expect(usage);
@@ -306,12 +313,22 @@ async fn main() {
     }
     let blobs: Arc<dyn BlobStore> = Arc::new(Blobs(raw_blobs, tally.clone()));
     let meta: Arc<dyn MetaStore> = Arc::new(Meta(raw_meta.clone(), tally.clone()));
-    let repo = Repo::new(blobs, meta.clone());
+    let log_filter = args.iter().any(|a| a == "--log-filter");
+    let kinds = if log_filter {
+        [LogFilterIndex::NAME, LOG_FILTER_NAME_KIND]
+    } else {
+        [HistoryTree::NAME, HISTORY_NODE_KIND]
+    };
+    let mut repo = Repo::new(blobs, meta.clone());
+    if let Some(jobs) = flag("--jobs") {
+        repo = repo.with_derive_jobs(jobs.parse().expect(usage));
+    }
+    println!("deriving {} changesets at a time", repo.derive_jobs());
     let head = repo.resolve(rev).await.unwrap();
     if args.iter().any(|a| a == "--reset") {
-        let t = meta.delete_derived_kind(HistoryTree::NAME).await.unwrap();
-        let n = meta.delete_derived_kind(HISTORY_NODE_KIND).await.unwrap();
-        println!("deleted {t} tree rows, {n} node rows");
+        let t = meta.delete_derived_kind(kinds[0]).await.unwrap();
+        let n = meta.delete_derived_kind(kinds[1]).await.unwrap();
+        println!("deleted {t} {} rows, {n} {} rows", kinds[0], kinds[1]);
     }
     tally.take();
     let started = Instant::now();
@@ -346,7 +363,13 @@ async fn main() {
             );
         }
     }
-    derived::derive::<HistoryTree>(&repo, head).await.unwrap();
+    if log_filter {
+        derived::derive::<LogFilterIndex>(&repo, head)
+            .await
+            .unwrap();
+    } else {
+        derived::derive::<HistoryTree>(&repo, head).await.unwrap();
+    }
     progress.abort();
     let took = started.elapsed().as_secs_f64();
     let n = tally.1.load(Ordering::Relaxed);
@@ -364,7 +387,7 @@ async fn main() {
     }
     if let Some(path) = flag("--dump") {
         let mut lines = Vec::new();
-        for kind in [HistoryTree::NAME, HISTORY_NODE_KIND] {
+        for kind in kinds {
             let mut after = None;
             loop {
                 let page = raw_meta.list_derived(kind, after, 10_000).await.unwrap();
