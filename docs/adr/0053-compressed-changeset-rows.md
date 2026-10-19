@@ -1,4 +1,4 @@
-# 0052. Changeset rows compressed with a per-store dictionary
+# 0053. Changeset rows compressed with a per-store dictionary
 Status: Accepted
 Date: 2026-10-19
 

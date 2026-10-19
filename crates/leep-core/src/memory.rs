@@ -9,7 +9,8 @@ use bytes::Bytes;
 
 use crate::prefix::IdPrefix;
 use crate::store::{
-    check_ref_chain, unix_now, BlobMeta, DerivedRow, RefLogEntry, RefStep, RefUpdateContext,
+    check_ref_chain, unix_now, BlobMeta, DeleteStep, DerivedRow, RefLogEntry, RefStep,
+    RefUpdateContext,
 };
 use crate::{BlobStore, Changeset, ChangesetId, Hash, MetaStore, Result};
 
@@ -330,11 +331,34 @@ impl MetaStore for MemoryMetaStore {
             .collect())
     }
 
-    async fn delete_derived_kind(&self, kind: &str) -> Result<u64> {
+    async fn count_derived(&self, kind: &str) -> Result<u64> {
+        let rows = self.derived.lock().unwrap();
+        Ok(rows.keys().filter(|(k, _)| k == kind).count() as u64)
+    }
+
+    /// One step: nothing is held long enough to need more.
+    async fn delete_derived_step(
+        &self,
+        kinds: &[&str],
+        _cursor: Option<&[u8]>,
+    ) -> Result<DeleteStep> {
         let mut rows = self.derived.lock().unwrap();
-        let before = rows.len();
-        rows.retain(|(k, _), _| k != kind);
-        Ok((before - rows.len()) as u64)
+        let mut deleted = vec![0; kinds.len()];
+        rows.retain(|(k, _), _| match kinds.iter().position(|w| w == k) {
+            Some(i) => {
+                deleted[i] += 1;
+                false
+            }
+            None => true,
+        });
+        let n = deleted.iter().sum();
+        Ok(DeleteStep {
+            deleted,
+            next: None,
+            done: n,
+            total: n,
+            unit: "rows",
+        })
     }
 
     async fn put_derived(&self, kind: &str, key: &Hash, value: Bytes) -> Result<()> {
@@ -460,6 +484,7 @@ pub async fn check_meta_store_contract(store: &dyn MetaStore) {
     assert!(store.get_derived("other", &key).await.unwrap().is_none());
 
     check_list_derived(store).await;
+    check_delete_derived_steps(store).await;
     check_batched_reads(store).await;
     check_batched_writes(store).await;
 }
@@ -740,6 +765,88 @@ async fn check_list_derived(store: &dyn MetaStore) {
         "idempotent"
     );
     assert_eq!(store.delete_derived_kind("ld-b").await.unwrap(), 3);
+}
+
+/// Dropping kinds step by step: counts are exact, the kinds asked for go
+/// in one delete with a count per kind, other kinds are untouched, and a
+/// delete abandoned part way (a killed `repair drop`) is finished by
+/// starting again. Enough rows, with values of realistic size, that a
+/// database backend takes several steps.
+async fn check_delete_derived_steps(store: &dyn MetaStore) {
+    let key = |kind: &str, n: u32| Hash::of_blob(format!("{kind}/{n}").as_bytes());
+    let value = |n: u32| Bytes::from(vec![(n % 251) as u8; 700 + (n as usize % 600)]);
+    let (a, b, keep) = ("dds-a", "dds-b", "dds-keep");
+    let mut rows = Vec::new();
+    for n in 0..3000 {
+        rows.push(DerivedRow::new(a, key(a, n), value(n)));
+        if n % 10 == 0 {
+            rows.push(DerivedRow::new(keep, key(keep, n), value(n)));
+        }
+        if n % 1000 == 0 {
+            rows.push(DerivedRow::new(b, key(b, n), value(n)));
+        }
+    }
+    for chunk in rows.chunks(500) {
+        store.put_derived_many(chunk).await.unwrap();
+    }
+    assert_eq!(store.count_derived(a).await.unwrap(), 3000);
+    assert_eq!(store.count_derived(b).await.unwrap(), 3);
+    assert_eq!(store.count_derived(keep).await.unwrap(), 300);
+    assert_eq!(store.count_derived("dds-none").await.unwrap(), 0);
+
+    // Killed after the first step that deleted anything.
+    let kinds = [a, b];
+    let mut first = [0u64; 2];
+    let mut cursor: Option<Vec<u8>> = None;
+    loop {
+        let step = store
+            .delete_derived_step(&kinds, cursor.as_deref())
+            .await
+            .unwrap();
+        assert_eq!(step.deleted.len(), 2, "one count per kind");
+        assert!(step.done <= step.total, "{step:?}");
+        first[0] += step.deleted[0];
+        first[1] += step.deleted[1];
+        match step.next {
+            Some(next) if first == [0, 0] => cursor = Some(next),
+            _ => break,
+        }
+    }
+    assert!(first[0] > 0, "the first steps deleted rows of the big kind");
+    // Started again from scratch, as a re-run of the command would.
+    let mut again = [0u64; 2];
+    let mut cursor: Option<Vec<u8>> = None;
+    let mut steps = 0;
+    loop {
+        let step = store
+            .delete_derived_step(&kinds, cursor.as_deref())
+            .await
+            .unwrap();
+        again[0] += step.deleted[0];
+        again[1] += step.deleted[1];
+        steps += 1;
+        assert!(steps < 100_000, "the delete ends");
+        match step.next {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+    assert_eq!(first[0] + again[0], 3000, "every row of a, once");
+    assert_eq!(first[1] + again[1], 3, "every row of b, once");
+    assert_eq!(store.count_derived(a).await.unwrap(), 0);
+    assert_eq!(store.count_derived(b).await.unwrap(), 0);
+    assert!(store.list_derived(a, None, 10).await.unwrap().is_empty());
+    assert!(store.get_derived(b, &key(b, 0)).await.unwrap().is_none());
+    assert_eq!(store.count_derived(keep).await.unwrap(), 300, "untouched");
+    for n in (0..3000).step_by(10) {
+        assert_eq!(
+            store.get_derived(keep, &key(keep, n)).await.unwrap(),
+            Some(value(n)),
+            "other kinds keep their values"
+        );
+    }
+    assert_eq!(store.delete_derived_kind(a).await.unwrap(), 0, "idempotent");
+    assert_eq!(store.delete_derived_kind(keep).await.unwrap(), 300);
 }
 
 /// The ref log: one entry per change that happened, none for a lost or empty

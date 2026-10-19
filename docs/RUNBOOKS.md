@@ -1521,7 +1521,7 @@ Postgres cannot write, backups fail (see [LeepBackupStale](#leepbackupstale)).
 6. Metadata: derived rows dominate (the search index is about 30% of the indexed text
    for source code, up to about 100% for random text); the ref log is never pruned
    but small (tens of MB a year). `leep-server compact-changesets --dry-run` reports
-   how much compressing the `changesets` table would save (about half, ADR 0052).
+   how much compressing the `changesets` table would save (about half, ADR 0053).
 7. Is the store packed? A filesystem store with no `packs/*.pack` keeps one file
    per object, uncompressed; `leep-server repack` usually shrinks a long history
    ten to thirty times (OPERATIONS.md, "Packing blobs").

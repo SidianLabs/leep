@@ -130,7 +130,7 @@ with a NUL after it): it would share a tree node's address in the
 `RepoPath` is validated on construction and on deserialization, so invalid
 paths cannot enter the system through any route.
 
-**Stored changeset rows** ([ADR 0052](adr/0052-compressed-changeset-rows.md)).
+**Stored changeset rows** ([ADR 0053](adr/0053-compressed-changeset-rows.md)).
 The SQL backends store a changeset either as its canonical bytes or as a
 zstd frame of those bytes compressed with a dictionary trained on the
 store's own history (`changeset_dicts`, named by the frame's dictionary
@@ -360,7 +360,12 @@ same recomputation against the real stores and writes the rows that differ
 missing ones), several changesets at a time once their parents are done
 (ADR 0050); `repair rederive --missing` only derives absent rows, through
 `derive`, so a stopped initial build resumes where it was; `repair drop`
-deletes a kind so it derives again on demand.
+deletes a kind so it derives again on demand, through
+`MetaStore::delete_derived_step` ([ADR 0052](adr/0052-fast-derived-kind-drop.md)):
+a kind that is a large share of the table is deleted by walking the table in
+physical order, a range of pages per short transaction, so each page is read
+and changed once; a small kind in key-order batches. Its dry run counts with
+`count_derived`, which reads no values.
 Only kinds that history can regenerate are rederived or dropped; signatures,
 reviews, rebase links, GC fence rows and the ref log are refused. The table of
 kinds is `leep_derive::integrity::kinds`, mirrored in the ADR.

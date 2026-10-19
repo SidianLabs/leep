@@ -210,7 +210,7 @@ enum Cmd {
         status: bool,
     },
     /// Compress stored changesets with a dictionary trained on this store's
-    /// own history (ADR 0052; uses --meta). The first run trains and stores
+    /// own history (ADR 0053; uses --meta). The first run trains and stores
     /// the dictionary, then rewrites every plain row; later runs compress
     /// rows written plain since. Safe beside running servers of this version
     /// or newer, never beside older ones (they cannot read compressed rows).

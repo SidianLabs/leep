@@ -323,7 +323,7 @@ async fn schema_version_rules_follow_adr_0023() {
     );
     assert_eq!(dump(&*src).await, dump(&*d4).await);
 
-    // From v2, before `changeset_dicts` (ADR 0052): the table is created on
+    // From v2, before `changeset_dicts` (ADR 0053): the table is created on
     // the scratch copy, empty, and the plain rows restore as they were.
     let v2 = edit(
         "v2.db",
@@ -368,7 +368,7 @@ async fn stored_rows(url: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
 }
 
 /// Add history worth compressing to the store at `url` and compress it
-/// (ADR 0052); returns the history.
+/// (ADR 0053); returns the history.
 async fn compacted(url: &str, store: &dyn MetaStore) -> Vec<leep_core::Changeset> {
     let history = crate::compact_tests::history(crate::compact::MIN_TRAINING_ROWS, 4);
     for chunk in history.chunks(200) {

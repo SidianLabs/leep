@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use futures_util::future::BoxFuture;
-use leep_core::{Changeset, ChangesetId, Error, Hash, MetaStore, Result};
+use leep_core::{Changeset, ChangesetId, DeleteStep, Error, Hash, Result};
 use serde::Serialize;
 
 use super::kinds::{self, DropPolicy, KindClass};
@@ -550,13 +550,16 @@ impl Unreadable for Rederive<'_> {
 #[derive(Debug, Serialize)]
 pub struct DropReport {
     pub dry_run: bool,
-    /// Rows per kind, in the order the kinds were (or would be) dropped.
+    /// Rows per kind deleted (or, in a dry run, stored).
     pub rows: BTreeMap<String, u64>,
+    pub elapsed_secs: f64,
 }
 
 /// Delete every row of each named kind (and the kinds that only make sense
 /// with it), so they derive again on demand. All names are checked before
-/// anything is deleted; one refusal refuses the whole command.
+/// anything is deleted; one refusal refuses the whole command. The kinds go
+/// in one [`MetaStore::delete_derived_step`] walk (ADR 0052), with a progress
+/// line every ten seconds; a dry run counts them.
 pub async fn drop_kinds(
     repo: &Repo,
     names: &[&str],
@@ -577,28 +580,111 @@ pub async fn drop_kinds(
         }
     }
     let meta = repo.meta();
-    let mut rows = BTreeMap::new();
-    for kind in order {
-        let n = if dry_run {
-            count_rows(&**meta, kind).await?
-        } else {
-            progress.info(&format!("repair: dropping {kind}"));
-            meta.delete_derived_kind(kind).await?
-        };
-        rows.insert(kind.to_string(), n);
+    let started = Instant::now();
+    let mut deleted = vec![0u64; order.len()];
+    if dry_run {
+        for (n, kind) in deleted.iter_mut().zip(&order) {
+            *n = meta.count_derived(kind).await?;
+        }
+    } else {
+        progress.info(&format!("repair: dropping {}", order.join(" ")));
+        let mut ticks = Ticker::new(Duration::from_secs(10));
+        let mut cursor: Option<Vec<u8>> = None;
+        loop {
+            let mut step = meta.delete_derived_step(&order, cursor.as_deref()).await?;
+            for (n, d) in deleted.iter_mut().zip(&step.deleted) {
+                *n += d;
+            }
+            let Some(next) = step.next.take() else {
+                break;
+            };
+            cursor = Some(next);
+            if ticks.due() {
+                progress.info(&drop_progress(
+                    deleted.iter().sum(),
+                    &step,
+                    started.elapsed(),
+                ));
+            }
+        }
     }
-    Ok(DropReport { dry_run, rows })
+    let rows = order
+        .iter()
+        .zip(deleted)
+        .map(|(k, n)| (k.to_string(), n))
+        .collect();
+    Ok(DropReport {
+        dry_run,
+        rows,
+        elapsed_secs: started.elapsed().as_secs_f64(),
+    })
 }
 
-async fn count_rows(meta: &dyn MetaStore, kind: &str) -> Result<u64> {
-    let mut n = 0;
-    let mut after = None;
-    loop {
-        let page = meta.list_derived(kind, after, 1000).await?;
-        let Some((last, _)) = page.last() else {
-            return Ok(n);
+/// "repair: 1234567 rows deleted (41000/s), 120000 of 4000000 pages (3%), about 9m left"
+fn drop_progress(deleted: u64, step: &DeleteStep, elapsed: Duration) -> String {
+    let secs = elapsed.as_secs_f64().max(1e-3);
+    let mut line = format!(
+        "repair: {deleted} rows deleted ({:.0}/s)",
+        deleted as f64 / secs
+    );
+    if step.total > 0 {
+        let share = step.done as f64 / step.total as f64;
+        line += &format!(
+            ", {} of {} {} ({:.0}%)",
+            step.done,
+            step.total,
+            step.unit,
+            share * 100.0
+        );
+        if share > 0.0 {
+            let left = secs * (1.0 - share) / share;
+            line += &format!(", about {} left", human_secs(left));
+        }
+    }
+    line
+}
+
+fn human_secs(s: f64) -> String {
+    let s = s.round() as u64;
+    match s {
+        0..=99 => format!("{s}s"),
+        100..=5999 => format!("{}m", (s + 30) / 60),
+        _ => {
+            let m = (s + 30) / 60;
+            format!("{}h{:02}m", m / 60, m % 60)
+        }
+    }
+}
+
+#[cfg(test)]
+mod drop_progress_tests {
+    use super::*;
+
+    #[test]
+    fn progress_lines_give_rate_position_and_eta() {
+        let step = DeleteStep {
+            deleted: vec![10, 0],
+            next: Some(vec![]),
+            done: 1_000_000,
+            total: 4_000_000,
+            unit: "pages",
         };
-        after = Some(*last);
-        n += page.len() as u64;
+        assert_eq!(
+            drop_progress(6_000_000, &step, Duration::from_secs(150)),
+            "repair: 6000000 rows deleted (40000/s), 1000000 of 4000000 pages (25%), \
+             about 8m left"
+        );
+        let start = DeleteStep {
+            total: 0,
+            ..step.clone()
+        };
+        assert_eq!(
+            drop_progress(0, &start, Duration::from_secs(10)),
+            "repair: 0 rows deleted (0/s)"
+        );
+        assert_eq!(human_secs(42.4), "42s");
+        assert_eq!(human_secs(5999.0), "100m");
+        assert_eq!(human_secs(19_800.0), "5h30m");
+        assert_eq!(human_secs(7_190.0), "2h00m");
     }
 }

@@ -30,7 +30,7 @@ skill.
 
 | Type | Kind tag | Where |
 |---|---|---|
-| `Changeset` | `changeset-v1` | `MetaStore.changesets.data`, as the canonical bytes or a zstd frame of them (ADR 0052, "Changeset rows" below) |
+| `Changeset` | `changeset-v1` | `MetaStore.changesets.data`, as the canonical bytes or a zstd frame of them (ADR 0053, "Changeset rows" below) |
 | `TreeNode` | `tree-v1` | `BlobStore`, keyed by `TreeNode::hash()` |
 | derived `root_tree` | — | `MetaStore.derived`, value = 32 raw bytes |
 | derived `generation` | — | `MetaStore.derived`, value = u64 (owned by leep-derive) |
@@ -426,7 +426,7 @@ a blank line and `This reverts <id>.`.
 ## SQL schema (leep-meta)
 
 ```
-changesets(id BYTEA PRIMARY KEY, data BYTEA NOT NULL)          -- data = Changeset::encode(), or a zstd frame of it (ADR 0052)
+changesets(id BYTEA PRIMARY KEY, data BYTEA NOT NULL)          -- data = Changeset::encode(), or a zstd frame of it (ADR 0053)
 changeset_dicts(id BIGINT PRIMARY KEY,                         -- SQLite: INTEGER; migration 0003
                 created_at BIGINT NOT NULL, data BYTEA NOT NULL) -- a zstd dictionary whose header id = id
 refs(name TEXT PRIMARY KEY, target BYTEA NOT NULL)
@@ -453,16 +453,16 @@ autovacuum_analyze_threshold = 10000)` and `changesets
 10000)`. The SQLite migration of the same number does nothing; it keeps the
 two backends' versions equal.
 
-Migration 0003 (`changeset_dicts`, ADR 0052) adds the dictionaries table,
+Migration 0003 (`changeset_dicts`, ADR 0053) adds the dictionaries table,
 empty. Nothing else changes, and a server keeps writing plain changeset rows
 until the table has a row; see "Changeset rows" below.
 
-### Changeset rows (ADR 0052)
+### Changeset rows (ADR 0053)
 
 `changesets.data` is one of:
 
 - **Plain**: the canonical postcard bytes, `Changeset::encode()`. Every row
-  written before ADR 0052, and every row written while `changeset_dicts` is
+  written before ADR 0053, and every row written while `changeset_dicts` is
   empty, a changeset whose frame would not be smaller, or one over 256 MiB.
 - **Compressed**: one zstd frame (magic `28 b5 2f fd`) whose content is
   exactly the canonical bytes. The frame header records the content size
@@ -705,6 +705,17 @@ which no statistics can turn into a nested loop). No encoding, hash, index, tabl
 shape changed, and `verify` and `repair` are not part of the HTTP API.
 `verify` lists every kind to check it; `repair` rewrites or drops only the kinds
 that history can regenerate, and refuses the rest (ADR 0025).
+
+ADR 0052 adds `MetaStore::count_derived` (`SELECT count(*) FROM derived WHERE
+kind = ?`) and `delete_derived_step`, which replaces the loops above as the way
+backends delete; `delete_derived_kind` is now a provided method over it. A
+large drop walks the table in physical order, on Postgres
+`DELETE FROM derived WHERE ctid >= $2::tid AND ctid < $3::tid AND kind = ANY($1)`
+with index paths switched off for the statement, on SQLite
+`DELETE FROM derived WHERE rowid >= ? AND rowid < ? AND +kind IN (...)`; a
+small one runs the key-order batch from a cursor (`key > $after`). The cursor
+passed between steps is in memory only and never stored. No table, index,
+encoding or `/v1` shape changed.
 
 ## Batched reads (new `MetaStore` methods, no format change)
 

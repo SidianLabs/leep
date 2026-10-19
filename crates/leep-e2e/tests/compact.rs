@@ -1,4 +1,4 @@
-//! `leep-server compact-changesets` through the real binary (ADR 0052): a
+//! `leep-server compact-changesets` through the real binary (ADR 0053): a
 //! dry run changes nothing, a run trains a dictionary and compresses every
 //! row, `verify --full` stays clean, and a server serves the history and
 //! keeps writing compressed rows.

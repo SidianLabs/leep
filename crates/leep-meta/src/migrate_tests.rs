@@ -789,7 +789,7 @@ async fn upgrade_from_v1_sets_analyze_thresholds() {
 
 /// A database at v2, as the binary before migration 3 left it, upgrades with
 /// its changesets readable, gains an empty `changeset_dicts`, and stores
-/// changesets as before until a compaction trains a dictionary (ADR 0052).
+/// changesets as before until a compaction trains a dictionary (ADR 0053).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn upgrade_from_v2_adds_changeset_dicts() {
     for db in dbs("fromv2").await {

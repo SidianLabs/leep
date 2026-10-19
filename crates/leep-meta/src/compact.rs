@@ -1,5 +1,5 @@
 //! Compress stored changeset rows with a dictionary trained on the store's
-//! own history (ADR 0052): `leep-server compact-changesets`.
+//! own history (ADR 0053): `leep-server compact-changesets`.
 //!
 //! A row's bytes are an encoding of an immutable value, and every reader
 //! checks what it decodes against the row's id, so rewriting a row in place

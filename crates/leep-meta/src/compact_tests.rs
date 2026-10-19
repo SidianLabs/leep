@@ -1,4 +1,4 @@
-//! Compressed changeset rows and `compact-changesets` (ADR 0052) on both
+//! Compressed changeset rows and `compact-changesets` (ADR 0053) on both
 //! backends.
 
 use std::collections::BTreeMap;

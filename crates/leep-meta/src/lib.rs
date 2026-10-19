@@ -3,7 +3,7 @@
 //! and implement `cas_ref` as a single conditional SQL statement. A fourth
 //! table, `ref_log`, records every ref move in the same transaction. A fifth,
 //! `changeset_dicts`, holds the dictionaries changeset rows are compressed
-//! with ([`compact`], ADR 0052). The schema is versioned by forward-only
+//! with ([`compact`], ADR 0053). The schema is versioned by forward-only
 //! migrations ([`migrate`], ADR 0023).
 
 use std::sync::Arc;
@@ -12,6 +12,7 @@ use leep_core::{Error, MetaStore, Result};
 
 mod codec;
 pub mod compact;
+mod drop;
 pub mod migrate;
 mod postgres;
 pub mod snapshot;
@@ -162,10 +163,6 @@ fn derived_columns(rows: &[leep_core::DerivedRow]) -> (Vec<&str>, Vec<&[u8]>, Ve
         last.iter().map(|r| r.value.as_ref()).collect(),
     )
 }
-
-/// Rows `delete_derived_kind` removes per statement, so dropping a large kind
-/// is many short transactions, not one that holds locks for minutes.
-const DELETE_BATCH: i64 = 10_000;
 
 /// The row layout both backends select from `ref_log`.
 type LogRow = (

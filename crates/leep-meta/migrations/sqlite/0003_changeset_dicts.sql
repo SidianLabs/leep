@@ -1,4 +1,4 @@
--- Compression dictionaries for changeset rows (ADR 0052). A `changesets`
+-- Compression dictionaries for changeset rows (ADR 0053). A `changesets`
 -- row whose data is a zstd frame was compressed with the dictionary whose
 -- id the frame names; the dictionary's own header carries the same id.
 -- `leep-server compact-changesets` adds rows; nothing changes or deletes

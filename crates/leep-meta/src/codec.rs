@@ -1,4 +1,4 @@
-//! How a changeset row's `data` is stored (ADR 0052). A row holds either the
+//! How a changeset row's `data` is stored (ADR 0053). A row holds either the
 //! changeset's canonical postcard bytes, as every row did before, or a zstd
 //! frame of exactly those bytes compressed with one of the database's own
 //! dictionaries (`changeset_dicts`), named by the frame's dictionary id.
@@ -159,7 +159,7 @@ impl Codec {
                     return Ok(cs);
                 }
             }
-            // A plain row from before ADR 0052 can start with the magic (a
+            // A plain row from before ADR 0053 can start with the magic (a
             // changeset of 40 parents whose first id begins b5 2f fd).
             if let Some(cs) = Changeset::decode(data).ok().filter(|cs| cs.id() == *id) {
                 return Ok(cs);

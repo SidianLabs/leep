@@ -27,6 +27,12 @@ Backends implement `leep_core::BlobStore` (in `leep-store`) or
        grace window will not protect re-uploaded orphans.
      - `MetaStore::list_changesets(after, limit)`: ids strictly greater than
        `after` in ascending byte order. Never skip or repeat across pages.
+   - Repair (ADR 0025, ADR 0052) needs `MetaStore::list_derived`,
+     `count_derived` (count without reading values; the default pages
+     through `list_derived`) and `delete_derived_step`: bounded steps that
+     each commit on their own, with an opaque cursor, deleting several
+     kinds in one pass. Delete in storage order when the kinds are a large
+     share of the table, so each page is read and changed once.
    - Durability (ADR 0044): a `BlobStore` whose `put` returns before the
      blob would survive power loss must override `flush(named)` to make
      every earlier put, and the stored copies of `named`, durable; the

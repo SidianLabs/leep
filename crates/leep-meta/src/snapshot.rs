@@ -34,7 +34,7 @@ pub struct SnapshotInfo {
     /// the snapshot references was in the blob store at this time.
     pub taken_at: i64,
     pub changesets: u64,
-    /// Changeset compression dictionaries (ADR 0052), which the rows that
+    /// Changeset compression dictionaries (ADR 0053), which the rows that
     /// use them cannot be read without.
     pub changeset_dicts: u64,
     /// Ref tips at the snapshot.
