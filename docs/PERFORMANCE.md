@@ -1188,14 +1188,83 @@ cold (first request after a restart) and warm:
 | provenance, limit 10,000 | 0.98 s | 0.97 s |
 | `log author=Junio` limit 100 | 154 s | 151 s |
 
-Indexed history queries answer in milliseconds on 1.48M commits. The slow
-rows have known causes: a cold full listing or deep diff decodes thousands
-of tree nodes from the pack; the first `blame` of a long-lived file derives
-its blame rows; and `log author=` had no index, so a rare author scanned all
-of history. The log filter index (ADR 0047, "Filtered log" below) answers
-those filters now; it has not been measured on Linux yet.
-"Cold queries" below finds where the cold listing, diff and blame spend
-their time and what changed.
+Indexed history queries answered in milliseconds on 1.48M commits; the slow
+rows were a cold full listing or deep diff (thousands of tree nodes decoded
+one at a time), the first `blame` of a long-lived file, and `log author=`,
+which had no index. The run below, after #84 to #91, measures the fixes.
+
+#### After #84 to #91
+
+`leep:dcf16c0` (main after #91) on the same store and VPS, which this run
+had with two CPUs available to containers (`nproc` 2) and other services
+beside it. Same query script, cold (first request after a restart) and warm.
+
+**Path-history index v4** (ADR 0045, #84), rederived beside v3 with
+`repair rederive --kind history-tree-v4` (`leep:b03750c`, before parallel
+derivation):
+
+| | v3 | v4 |
+|---|---|---|
+| Rows | 25.4M nodes + 1.48M trees | 233,792 parts + 1,484,762 trees |
+| Values | 24 GB | 2.68 GB + 1.63 GB = 4.3 GB (5.6x smaller) |
+| Build | | 10 h 6 min, peak 2.2 GiB, 0 rows that could not be recomputed |
+
+The v3 rows are still in the database (33 GB in all); dropping them with
+`repair drop --kind history-tree-v3` and `VACUUM FULL derived` is the last
+step of the upgrade (OPERATIONS.md, "Upgrading") and was left out of this
+run.
+
+**Log filter index** (ADR 0047, #86): the first attempt (main at #90)
+derived 636k changesets in 20 minutes, then stalled for over an hour with
+memory growing to 3 GiB. `perf` showed the time in `merge_base` called per
+chain of large back-merges (mainline merged into a topic branch, such as
+"Merge tag 'v4.9-rc3' into xtensa-for-next", which brings in 30,248 commits
+with 2,061 merges). #91 (ADR 0051) walks each merge once. Resumed with
+`repair rederive --kind log-filter-v1 --missing --jobs 2`, the remaining
+846,554 changesets took 12 min 37 s (1,118 a second), peak 595 MiB. The
+index is 635 MB for 1,484,762 rows (430 bytes a changeset) plus 43,523
+name rows (1.6 MB).
+
+**Queries**, before (`leep:e643adf`, above) and after:
+
+| Query | Before, cold / warm | After, cold / warm |
+|---|---|---|
+| `log` limit 100 | 0.28 s / 0.055 s | 0.23 s / 0.047 s |
+| `log` limit 10,000 | 5.5 s / 1.27 s | 4.6 s / 1.19 s |
+| full file listing (~90k files, 15 MB) | 14.4 s / 0.17 s | **1.35 s** / 0.21 s |
+| root tree / `Makefile` contents | 20 / 2.6 ms | 72 / 9 ms cold, 1.8 / 2.0 ms warm |
+| `last-change Makefile` | 6.9 / 2.0 ms | 6.3 / 2.0 ms |
+| `log path=Makefile` limit 50 | 0.40 s / 0.20 s | 0.41 s / 0.17 s |
+| `log path=COPYING` limit 50 | 1.24 s / 0.84 s | 1.15 s / 0.70 s |
+| `blame Makefile` | 47 s (first, derives rows) / 0.13 s | 0.36 s (rows stored earlier) / 0.085 s |
+| diff head vs 1,000 back | 3.8 s / 0.17 s | **0.70 s** / 0.20 s |
+| diff head vs 20,000 back | 19.7 s / 0.36 s | **1.18 s** / 0.40 s |
+| merge-base head vs 1,000 back / root | 54 / 8.5 ms | 167 / 3.9 ms cold, 5.0 / 3.7 ms warm |
+| search a common token / a rare token | 1.6 s / 0.61 s | 3.3 s / 0.69 s cold, 1.4 s / 0.54 s warm |
+| provenance, limit 10,000 | 0.98 s | 1.04 s / 0.96 s |
+| `log author=Junio` limit 100 | 154 s / 151 s | **2.6 s / 0.52 s** |
+
+The cold listing is 11x faster and the deep diff 17x, from batched tree
+reads (#88); a rare author's log is 59x faster cold and 290x warm, from the
+log filter index (#86, #91). The `blame Makefile` row is not a first blame:
+its rows were stored by the earlier runs, so it measures reading them.
+Search and merge-base cold times move with what the page cache held after
+the restart.
+
+**Concurrent lands** on this VPS (fresh database, `leep-land-bench`,
+15 s per agent count):
+
+| Changesets | Agents | Lands/s | Land p50 / p99 | Create p50 / p99 | 409s, CAS losses |
+|---|---|---|---|---|---|
+| 1 file | 1 | 76.2 | 2.1 / 3.4 ms | 6.9 / 9.1 ms | 0 |
+| 1 file | 8 | 112.1 | 38 / 64 ms | 19 / 32 ms | 0 |
+| 1 file | 64 | 152.7 | 233 / 405 ms | 120 / 192 ms | 0 |
+| 10 files | 1 | 21.2 | 2.3 / 3.9 ms | 7.5 / 10.2 ms | 0 |
+| 10 files | 8 | 40.7 | 59 / 97 ms | 28 / 48 ms | 0 |
+| 10 files | 64 | 51.9 | 268 / 629 ms | 227 / 271 ms | 0 |
+
+At 64 agents with one-file changesets that is 153 lands a second against
+117 after #77 on this machine, with batches of 31 lands on average.
 
 ### Incremental repack
 
