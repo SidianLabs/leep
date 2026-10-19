@@ -12,6 +12,7 @@ leep-core.workspace = true
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "postgres"] }
 tokio.workspace = true
 tracing.workspace = true
+zstd.workspace = true
 
 [dev-dependencies]
 leep-testkit.workspace = true

@@ -1127,6 +1127,7 @@ took the store from 104 GB of loose objects to one 2.74 GB pack plus a
 | git repository (bare clone) | 3.8 GB |
 | Leep blobs: pack + index | 3.2 GB (plus loose objects of the last 42k commits until the next repack) |
 | Leep Postgres, before path history | 8.3 GB (`changesets` 2.9 GB, skiplists 0.9 GB) |
+| Leep Postgres, before path history, changesets compressed (ADR 0052, projected) | about 7.1 GB (`changesets` about 1.6-1.75 GB; see "Changeset compression") |
 | Leep Postgres, with the full path-history index | 27 GB (`history-node-v3`: 25.4M rows, 24 GB of values) |
 
 The path-history index costs about 16 KB per changeset on Linux against
@@ -2081,6 +2082,95 @@ about 4 minutes per GC before. The first run after the change still walks
 everything, faster than before because changesets and root trees are read in
 batches of 1,000 (ADR 0030), and writes one `gc-mark-v1` row per referenced
 object and changeset (91,290 rows, about 1 s).
+
+## Changeset compression
+
+ADR 0052 stores changeset rows as zstd frames compressed with a dictionary
+trained on the store's own history. Measured on a local Postgres 16
+(`shared_buffers` 512 MB, 4 cores shared with other work) on two
+histories:
+
+- **git/git v1.7.0**: 21,205 commits imported with `leep-git import`.
+- **Linux, last 117,680 commits** (`--shallow-since=2025-06-01`, blobless
+  clone): rows built by the `changeset_compression` example the way
+  `leep-git` imports each commit (same fields and `extra` keys; blob hashes
+  and sizes are stand-ins, which compress no better or worse than real
+  ones), loaded into a Leep schema with `COPY`. These rows are larger than
+  Linux's average (2,279 bytes against about 1.8 KB over all of history):
+  recent commits have longer messages, more trailers and `mergetag`
+  signatures.
+
+**What a row holds**, from the example's breakdown (bytes per row): git/git
+763 (parents 37, blob hashes 87, paths 50, message 374, author 35, `extra`
+146); Linux 2,279 (parents 35, blob hashes 471, paths 518 for 15.1 changes,
+message 856, author 38, `extra` 263). Ids and hashes, 16% and 22%, do not
+compress.
+
+**Encodings** (`cargo run --release -p leep-server --example
+changeset_compression -- --hex rows.hex` or `--git DIR`), total size against
+plain rows:
+
+| Encoding | git/git | Linux |
+|---|---|---|
+| zstd -3 per row | 1.36x | 1.58x |
+| zstd -19 per row | 1.38x | 1.62x |
+| zstd -3, 32 KB segments of consecutive rows | 2.01x | 2.04x |
+| zstd -19, 32 KB segments | 2.12x | 2.15x |
+| zstd -3, 16 / 32 / 64 / 110 KB dictionary from the rows | 1.87 / 1.91 / 1.98 / 2.01x | |
+| zstd -9, 32 / 64 / 110 KB dictionary from the rows | | 1.93 / 1.97 / 2.00x |
+| zstd -1 / -9 / -19, 64 KB dictionary | 1.81 / 2.08 / 2.13x | 1.78 / 1.97 / 2.00x |
+| newer half, 64 KB dictionary from the older half | 1.88x (-3) | 1.93x (-9) |
+| 64 KB dictionary trained on the other history | | 1.81x |
+
+A dictionary trained on the store's own rows gets within 2-8% of segments,
+row by row, and loses 2-6% on history newer than it; one built into the
+binary (trained on git/git) would be 8% worse on Linux. Training 64 KB on
+50,000 Linux rows takes about 14 s.
+
+**Codec cost** per git/git row (release build, one thread, 64 KB
+dictionary): writing 6 µs at level 3 (1.98x), 22 µs at 6 (2.07x), 39 µs at
+9 (2.10x, the level used); reading about 2 µs at any level, beside 3-4 µs to
+decode postcard and hash the id, which every read did before.
+
+**Tables**, before and after `leep-server compact-changesets` and `VACUUM
+FULL changesets`:
+
+| | git/git, before | after | Linux slice, before | after |
+|---|---|---|---|---|
+| `data`, as written | 16.19 MB (763 B a row) | 7.68 MB (362 B) | 268.2 MB (2,279 B) | 135.3 MB (1,150 B) |
+| `data`, as stored (`pg_column_size`; pglz on rows over 2 KB) | 16.03 MB | 7.76 MB | 228.5 MB | 135.8 MB |
+| table with TOAST and index (`pg_total_relation_size`) | 19.9 MB (938 B a row) | **10.9 MB** (512 B) | 261.8 MB (2,225 B) | **159.1 MB** (1,352 B) |
+| `compact-changesets` | | 4.3 s | | 31.8 s, 275 MB peak |
+
+The dictionary row is 64 KB. Postgres already compressed the 14% of Linux
+rows over 2 KB with pglz (1.17x on all rows); zstd with the dictionary takes
+what is stored from 228.5 to 135.8 MB, and rows no longer reach TOAST as
+often.
+
+**All of Linux, projected.** The table is 2.9 GB for 1,484,762 rows; the
+slice's table shrank to 61% and git/git's to 55%, so about **1.6 to 1.75 GB,
+saving 1.15 to 1.3 GB** (8.3 GB of Postgres before path history becomes about
+7.1 GB). `compact-changesets` took about 190 µs a row on the slice with
+reading and writing, so about 5 minutes, plus `VACUUM FULL`.
+
+**Speed** on the git/git store, compressed against a copy of the same
+database with plain rows (`CREATE DATABASE ... TEMPLATE`, rows reloaded), the
+same release binary, alternating runs:
+
+| | Plain | Compressed |
+|---|---|---|
+| Path-history derivation, `history_profile --reset`, 4 jobs (3 runs) | 22.9 / 24.1 / 21.5 s | 25.1 / 19.4 / 21.2 s |
+| ... of which `get_changesets` (1,875 calls, 42,410 rows) | 1.41 / 1.66 / 1.17 s | 1.23 / 1.45 / 1.43 s |
+| `log` limit 10,000, mean / best of 10 (fresh server every 5) | 0.42 / 0.39 s | 0.47 / 0.39 s |
+| `log` limit 100, mean of 6 | 11 ms | 14 ms |
+| `log path=Makefile` limit 50, mean / best of 6 | 53 / 31 ms | 44 / 19 ms |
+| `log author=Linus` limit 100, mean / best of 6 | 178 / 139 ms | 229 / 156 ms |
+
+Differences are within the run-to-run noise of this shared machine; the
+codec adds about 2 µs a changeset read (20 ms per 10,000), and with the
+tables in memory the smaller rows save no I/O. On a store larger than
+memory, as all of Linux is on its VPS, half the bytes per changeset read
+should make cold walks faster.
 
 ## Analysis
 

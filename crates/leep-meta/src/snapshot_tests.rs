@@ -264,10 +264,10 @@ async fn schema_version_rules_follow_adr_0023() {
         let sql = sql.to_string();
         let url = sqlite_file_url(&path, false);
         async move {
-            sqlx::query(&sql)
-                .execute(&mut sqlx::SqliteConnection::connect(&url).await.unwrap())
-                .await
-                .unwrap();
+            let mut c = sqlx::SqliteConnection::connect(&url).await.unwrap();
+            for stmt in sql.split(';') {
+                sqlx::query(stmt).execute(&mut c).await.unwrap();
+            }
             path
         }
     };
@@ -288,7 +288,11 @@ async fn schema_version_rules_follow_adr_0023() {
     assert_eq!(snapshot_schema_version(&newer).await.unwrap(), 99);
 
     // From an un-versioned database (before ADR 0023): adopted, then restored.
-    let older = edit("older.db", "DROP TABLE schema_migrations").await;
+    let older = edit(
+        "older.db",
+        "DROP TABLE schema_migrations; DROP TABLE changeset_dicts",
+    )
+    .await;
     let dest_url = sqlite_url(dir.path(), "d2.db");
     import_snapshot(&older, &dest_url, false, SchemaMode::Migrate)
         .await
@@ -301,8 +305,12 @@ async fn schema_version_rules_follow_adr_0023() {
     assert_eq!(dump(&*src).await, dump(&*d2).await);
 
     // From v1, the schema before migration 2 (which changes nothing in
-    // SQLite): migrated on the scratch copy, then restored.
-    let v1 = edit("v1.db", "DELETE FROM schema_migrations WHERE version > 1").await;
+    // SQLite) and 3: migrated on the scratch copy, then restored.
+    let v1 = edit(
+        "v1.db",
+        "DROP TABLE changeset_dicts; DELETE FROM schema_migrations WHERE version > 1",
+    )
+    .await;
     assert_eq!(snapshot_schema_version(&v1).await.unwrap(), 1);
     let dest_url = sqlite_url(dir.path(), "d4.db");
     import_snapshot(&v1, &dest_url, false, SchemaMode::Migrate)
@@ -315,6 +323,25 @@ async fn schema_version_rules_follow_adr_0023() {
     );
     assert_eq!(dump(&*src).await, dump(&*d4).await);
 
+    // From v2, before `changeset_dicts` (ADR 0052): the table is created on
+    // the scratch copy, empty, and the plain rows restore as they were.
+    let v2 = edit(
+        "v2.db",
+        "DROP TABLE changeset_dicts; DELETE FROM schema_migrations WHERE version > 2",
+    )
+    .await;
+    assert_eq!(snapshot_schema_version(&v2).await.unwrap(), 2);
+    let dest_url = sqlite_url(dir.path(), "d5.db");
+    import_snapshot(&v2, &dest_url, false, SchemaMode::Migrate)
+        .await
+        .unwrap();
+    let d5 = open_meta_store(&dest_url).await.unwrap();
+    assert_eq!(
+        d5.schema_version().await.unwrap(),
+        Some(latest_schema_version())
+    );
+    assert_eq!(dump(&*src).await, dump(&*d5).await);
+
     // Not a snapshot at all.
     let junk = dir.path().join("junk.db");
     std::fs::write(&junk, b"not a database").unwrap();
@@ -326,6 +353,72 @@ async fn schema_version_rules_follow_adr_0023() {
     )
     .await
     .is_err());
+}
+
+/// Every changeset row's stored bytes, in id order.
+async fn stored_rows(url: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let q = "SELECT id, data FROM changesets ORDER BY id";
+    if url.starts_with("sqlite:") {
+        let mut c = sqlx::SqliteConnection::connect(url).await.unwrap();
+        sqlx::query_as(q).fetch_all(&mut c).await.unwrap()
+    } else {
+        let mut c = sqlx::PgConnection::connect(url).await.unwrap();
+        sqlx::query_as(q).fetch_all(&mut c).await.unwrap()
+    }
+}
+
+/// Add history worth compressing to the store at `url` and compress it
+/// (ADR 0052); returns the history.
+async fn compacted(url: &str, store: &dyn MetaStore) -> Vec<leep_core::Changeset> {
+    let history = crate::compact_tests::history(crate::compact::MIN_TRAINING_ROWS, 4);
+    for chunk in history.chunks(200) {
+        store.put_changesets_with_derived(chunk, &[]).await.unwrap();
+    }
+    let r = crate::compact::compact_changesets(
+        url,
+        SchemaMode::RequireCurrent,
+        &Default::default(),
+        &mut |_| {},
+    )
+    .await
+    .unwrap();
+    assert_eq!(r.dictionary, 1);
+    history
+}
+
+/// Compressed changeset rows and their dictionary travel with a snapshot
+/// byte for byte, and the restored store reads them and writes new ones.
+#[tokio::test]
+async fn compressed_changesets_and_their_dictionary_round_trip() {
+    let dir = tempfile::tempdir().unwrap();
+    let src_url = sqlite_url(dir.path(), "src.db");
+    let src = open_meta_store(&src_url).await.unwrap();
+    populate(&*src).await;
+    let history = compacted(&src_url, &*src).await;
+    let snap = dir.path().join("snap.db");
+    let info = export_snapshot(&src_url, &snap).await.unwrap();
+    assert_eq!(info.changeset_dicts, 1);
+    assert_eq!(info.changesets, 26 + history.len() as u64);
+    let rows = stored_rows(&src_url).await;
+    assert_eq!(stored_rows(&sqlite_file_url(&snap, false)).await, rows);
+
+    let dest_url = sqlite_url(dir.path(), "restored.db");
+    import_snapshot(&snap, &dest_url, false, SchemaMode::Migrate)
+        .await
+        .unwrap();
+    assert_eq!(stored_rows(&dest_url).await, rows);
+    let dest = open_meta_store(&dest_url).await.unwrap();
+    assert_eq!(dump(&*src).await, dump(&*dest).await);
+    for c in &history {
+        assert_eq!(dest.get_changeset(&c.id()).await.unwrap().as_ref(), Some(c));
+    }
+    let next = crate::compact_tests::history(3, 11);
+    dest.put_changesets_with_derived(&next, &[]).await.unwrap();
+    let after = stored_rows(&dest_url).await;
+    for c in &next {
+        let row = &after.iter().find(|r| r.0 == c.id().0 .0).unwrap().1;
+        assert!(crate::codec::Codec::uses(row, 1));
+    }
 }
 
 /// A throwaway Postgres database.
@@ -373,13 +466,16 @@ async fn postgres_to_sqlite_to_postgres() {
     let b = PgDb::create("b").await.unwrap();
     let src = open_meta_store(&a.url).await.unwrap();
     populate(&*src).await;
+    let history = compacted(&a.url, &*src).await;
+    let rows = stored_rows(&a.url).await;
     let last = src.ref_log(None, None, 1).await.unwrap()[0].seq;
     let dir = tempfile::tempdir().unwrap();
 
     // Postgres to a snapshot file, and from it to a different Postgres.
     let snap = dir.path().join("pg.db");
     let info = export_snapshot(&a.url, &snap).await.unwrap();
-    assert_eq!(info.changesets, 26);
+    assert_eq!(info.changesets, 26 + history.len() as u64);
+    assert_eq!(info.changeset_dicts, 1);
     assert_eq!(info.ref_log_last_seq, last);
     import_snapshot(&snap, &b.url, false, SchemaMode::Migrate)
         .await
@@ -394,7 +490,8 @@ async fn postgres_to_sqlite_to_postgres() {
             .fetch_one(&mut c)
             .await
             .unwrap();
-    assert_eq!(tuples, 26.0);
+    assert_eq!(tuples, 26.0 + history.len() as f32);
+    assert_eq!(stored_rows(&b.url).await, rows);
     let id = dest.put_changeset(&cs(900)).await.unwrap();
     assert!(dest.cas_ref("fresh", None, Some(id)).await.unwrap());
     assert_eq!(dest.ref_log(None, None, 1).await.unwrap()[0].seq, last + 1);
@@ -414,6 +511,7 @@ async fn postgres_to_sqlite_to_postgres() {
         .unwrap();
     let sqm = open_meta_store(&sq).await.unwrap();
     assert_eq!(dump(&*src).await, dump(&*sqm).await);
+    assert_eq!(stored_rows(&sq).await, rows);
     let snap2 = dir.path().join("sq.db");
     export_snapshot(&sq, &snap2).await.unwrap();
     import_snapshot(&snap2, &b.url, true, SchemaMode::Migrate)

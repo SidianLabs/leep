@@ -736,6 +736,45 @@ If the disk cannot hold both indexes, drop v3 first (step 3), start the new
 servers and let the warmer (or `rederive`) build v4: path queries wait for
 derivation, or derive on demand, until it has caught up.
 
+**Compressing changesets (schema v3, ADR 0052).** Migration 0003 adds an
+empty `changeset_dicts` table and changes nothing old servers read, so it
+may be applied while servers of the previous version still run (rolling
+upgrade). The space saving is a separate step, run once every server is on
+this version or later, because older servers cannot read compressed rows:
+
+1. Finish the rollout: no server, `leep-git` importer or tool older than
+   this release may still use the database.
+2. See what it would do (trains a dictionary in memory, writes nothing):
+   ```sh
+   leep-server compact-changesets --dry-run
+   ```
+3. Run it. It stores a dictionary trained on 50,000 changesets of this
+   store, then rewrites every plain changeset row in batches; servers keep
+   serving, and reads and writes are unaffected (each row reads the same
+   before and after). It can be stopped and run again; a later run only
+   compresses rows that are still plain. On Postgres each rewritten row is a
+   new, smaller row version beside the old one until vacuum, so it needs free
+   disk of about half the table.
+   ```sh
+   leep-server compact-changesets
+   ```
+   About 4 minutes per million changesets of Linux's size on Postgres
+   (PERFORMANCE.md, "Changeset compression"), with the `changesets` table
+   about halved. Servers pick up the dictionary on their next read of a
+   compressed row, or within a minute for writes; rows a server wrote plain
+   meanwhile are compressed by the next run, so run it again after a day or
+   on a schedule (it skips compressed rows, but reads every row).
+4. On Postgres the old row versions are free space in the table; `VACUUM
+   FULL changesets` (locks the table for the copy; minutes on all of Linux)
+   or `pg_repack` returns it to the filesystem, then `ANALYZE changesets`.
+   On SQLite, `VACUUM`.
+
+Never delete a `changeset_dicts` row: the changesets compressed with it
+cannot be read without it. Backups carry both tables. `--retrain` trains a
+new dictionary (for example after the history has changed character) and
+moves every row to it; the old dictionary stays. A store with fewer than
+1,000 changesets is left alone.
+
 ## Indexing a large history
 
 After importing a long history (`leep-git import`, a restore without
@@ -1128,7 +1167,7 @@ procedure, not an extra.
 
 | What | Where it lives | How |
 |---|---|---|
-| Metadata: changesets, refs, ref log, signatures, reviews, derived data | SQLite file or Postgres database (`--meta`) | `leep-server backup` |
+| Metadata: changesets and their compression dictionaries, refs, ref log, signatures, reviews, derived data | SQLite file or Postgres database (`--meta`) | `leep-server backup` |
 | Blobs: file contents and tree nodes | filesystem directory or S3 bucket (`--blobs`) | `leep-server backup` |
 | Configuration: tokens file, signing keys file, review policy file, TLS/proxy config | wherever you keep it | your configuration management; **not in the stores and not in the backup** |
 

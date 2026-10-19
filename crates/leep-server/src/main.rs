@@ -209,6 +209,26 @@ enum Cmd {
         #[arg(long)]
         status: bool,
     },
+    /// Compress stored changesets with a dictionary trained on this store's
+    /// own history (ADR 0052; uses --meta). The first run trains and stores
+    /// the dictionary, then rewrites every plain row; later runs compress
+    /// rows written plain since. Safe beside running servers of this version
+    /// or newer, never beside older ones (they cannot read compressed rows).
+    CompactChangesets {
+        /// Report the sizes before and after, and write nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Train a new dictionary even if one exists and recompress every
+        /// row with it (old dictionaries stay; nothing deletes one).
+        #[arg(long)]
+        retrain: bool,
+        /// Largest dictionary to train, in bytes.
+        #[arg(long, default_value_t = leep_meta::compact::CompactOptions::default().dict_size)]
+        dict_size: usize,
+        /// Changesets to train on: the first ones by id, a uniform sample.
+        #[arg(long, default_value_t = leep_meta::compact::CompactOptions::default().samples)]
+        samples: usize,
+    },
     /// Compute the code search index (trigram rows) for a revision, so the
     /// first `leep search` on it is fast. Uses --meta and --blobs; safe beside
     /// running servers, and cheap to repeat: only missing rows are computed.
@@ -302,6 +322,71 @@ async fn run_migrate(meta: &str, dry_run: bool, status: bool) -> anyhow::Result<
             "{} change(s) to apply to reach v{}; run `leep-server migrate`",
             r.adopted.len() + r.pending.len(),
             r.latest
+        );
+    }
+    Ok(())
+}
+
+async fn run_compact(meta: &str, opts: leep_meta::compact::CompactOptions) -> anyhow::Result<()> {
+    let mode = if NO_MIGRATE.load(std::sync::atomic::Ordering::Relaxed) {
+        leep_meta::SchemaMode::RequireCurrent
+    } else {
+        leep_meta::SchemaMode::Migrate
+    };
+    let start = std::time::Instant::now();
+    let mut last = std::time::Instant::now();
+    let mut progress = |r: &leep_meta::compact::CompactReport| {
+        if last.elapsed() >= std::time::Duration::from_secs(10) {
+            last = std::time::Instant::now();
+            println!(
+                "{:>8.0} s  {} rows, {} rewritten, {} -> {} bytes",
+                start.elapsed().as_secs_f64(),
+                r.rows,
+                r.rewritten,
+                r.bytes_before,
+                r.bytes_after
+            );
+        }
+    };
+    let r = leep_meta::compact::compact_changesets(meta, mode, &opts, &mut progress)
+        .await
+        .context("compacting changesets")?;
+    if r.dictionary == 0 {
+        println!(
+            "fewer than {} changesets: nothing to train a dictionary on, nothing changed",
+            leep_meta::compact::MIN_TRAINING_ROWS
+        );
+        return Ok(());
+    }
+    if r.trained {
+        let verb = if opts.dry_run {
+            "would store"
+        } else {
+            "stored"
+        };
+        println!(
+            "{verb} dictionary {} ({} bytes) trained on {} changesets",
+            r.dictionary, r.dictionary_bytes, r.samples
+        );
+    }
+    let verb = if opts.dry_run {
+        "would rewrite"
+    } else {
+        "rewrote"
+    };
+    println!(
+        "{verb} {} of {} changeset rows in {:.1} s: {} -> {} bytes ({:.2}x)",
+        r.rewritten,
+        r.rows,
+        start.elapsed().as_secs_f64(),
+        r.bytes_before,
+        r.bytes_after,
+        r.bytes_before as f64 / r.bytes_after.max(1) as f64
+    );
+    if !opts.dry_run && r.rewritten > 0 && meta.starts_with("postgres") {
+        println!(
+            "the old row versions are free space now; `VACUUM FULL changesets` returns it to the \
+             filesystem (it locks the table)"
         );
     }
     Ok(())
@@ -415,6 +500,7 @@ fn run_command(cmd: Cmd) -> anyhow::Result<()> {
         | Cmd::Repack(_)
         | Cmd::DeriveSearch { .. }
         | Cmd::Migrate { .. }
+        | Cmd::CompactChangesets { .. }
         | Cmd::Verify(_)
         | Cmd::Repair(_)
         | Cmd::Backup(_)
@@ -562,6 +648,21 @@ async fn main() -> anyhow::Result<()> {
             .await;
         }
         Some(Cmd::Repack(r)) => return repack_cli::run_repack(&args.meta, &args.blobs, r).await,
+        Some(Cmd::CompactChangesets {
+            dry_run,
+            retrain,
+            dict_size,
+            samples,
+        }) => {
+            let opts = leep_meta::compact::CompactOptions {
+                dict_size,
+                samples,
+                retrain,
+                dry_run,
+                ..Default::default()
+            };
+            return run_compact(&args.meta, opts).await;
+        }
         Some(Cmd::DeriveSearch { rev }) => {
             return run_derive_search(&args.meta, &args.blobs, &rev).await
         }
