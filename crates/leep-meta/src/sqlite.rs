@@ -12,11 +12,12 @@ use leep_core::{
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Row, SqliteConnection, SqlitePool};
 
+use crate::codec::Codec;
 use crate::drop::{self, nothing_left, Cursor, KEY_BATCH};
 use crate::migrate::{self, AppliedMigration, Migration, MigrationReport, Session};
 use crate::{
-    changesets_in_order, decode_checked, log_entry, placeholders, storage, to_hash, to_id, unique,
-    values_in_order, LogRow, SchemaMode, BATCH_PARAMS,
+    changesets_in_order, log_entry, placeholders, storage, to_hash, to_id, unique, values_in_order,
+    LogRow, SchemaMode, BATCH_PARAMS,
 };
 
 /// The compiled migration list (ADR 0023). Append only.
@@ -33,10 +34,21 @@ pub const MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/sqlite/0002_analyze_thresholds.sql"),
         satisfied_by: &[],
     },
+    Migration {
+        version: 3,
+        name: "changeset_dicts",
+        sql: include_str!("../migrations/sqlite/0003_changeset_dicts.sql"),
+        satisfied_by: &[],
+    },
 ];
 
 pub struct SqliteMetaStore {
     pub(crate) pool: SqlitePool,
+    /// Changeset dictionaries (ADR 0053).
+    pub(crate) codec: Codec,
+    /// Whether the schema has `changeset_dicts`: tests open stores with
+    /// shorter migration lists.
+    pub(crate) has_dicts: bool,
 }
 
 impl SqliteMetaStore {
@@ -65,7 +77,9 @@ impl SqliteMetaStore {
         if mode == SchemaMode::RequireCurrent {
             migrate::require_current(&report)?;
         }
-        Ok(Self { pool })
+        let store = Self::with_pool(pool, migrations);
+        store.load_dicts().await?;
+        Ok(store)
     }
 
     /// Apply pending migrations, or with `dry_run` only report them.
@@ -99,7 +113,7 @@ impl SqliteMetaStore {
             .await
             .map_err(storage)?;
         Self::run(&pool, MIGRATIONS, true).await?;
-        Ok(Self { pool })
+        Ok(Self::with_pool(pool, MIGRATIONS))
     }
 
     async fn pool(url: &str) -> Result<SqlitePool> {
@@ -228,6 +242,68 @@ impl Session for SqliteSession<'_> {
 }
 
 impl SqliteMetaStore {
+    fn with_pool(pool: SqlitePool, migrations: &[Migration]) -> Self {
+        Self {
+            pool,
+            codec: Codec::default(),
+            has_dicts: migrations
+                .iter()
+                .any(|m| m.version >= crate::compact::DICTS_SCHEMA_VERSION),
+        }
+    }
+
+    /// Learn the changeset dictionaries added since this store last looked.
+    pub(crate) async fn load_dicts(&self) -> Result<()> {
+        if !self.has_dicts {
+            return Ok(());
+        }
+        let ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM changeset_dicts ORDER BY id")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(storage)?;
+        let mut rows = Vec::new();
+        for id in ids {
+            if u32::try_from(id).is_ok_and(|i| self.codec.knows(i)) {
+                continue;
+            }
+            let data: Vec<u8> = sqlx::query_scalar("SELECT data FROM changeset_dicts WHERE id = ?")
+                .bind(id)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(storage)?;
+            rows.push((id, data));
+        }
+        self.codec.add(rows)?;
+        self.codec.mark_checked();
+        Ok(())
+    }
+
+    /// The row bytes for `cs`, with the newest dictionary any writer could
+    /// know of a minute ago.
+    async fn encode(&self, cs: &Changeset) -> Result<Vec<u8>> {
+        if self.has_dicts && self.codec.due() {
+            self.load_dicts().await?;
+        }
+        Ok(self.codec.encode(cs))
+    }
+
+    /// Decode fetched rows, first learning any dictionary they name that
+    /// this store has not seen (a compaction ran since it started).
+    async fn decode_rows(
+        &self,
+        ids: &[ChangesetId],
+        rows: Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> Result<Vec<Option<Changeset>>> {
+        if self
+            .codec
+            .missing(rows.iter().map(|r| r.1.as_slice()))
+            .is_some()
+        {
+            self.load_dicts().await?;
+        }
+        changesets_in_order(&self.codec, ids, rows.into_iter())
+    }
+
     /// One past the largest `rowid` in `derived`; a walk ends there.
     async fn rowid_end(&self) -> Result<u64> {
         let n: Option<i64> = sqlx::query_scalar("SELECT max(rowid) FROM derived")
@@ -333,9 +409,10 @@ impl SqliteMetaStore {
 impl MetaStore for SqliteMetaStore {
     async fn put_changeset(&self, cs: &Changeset) -> Result<ChangesetId> {
         let id = cs.id();
+        let data = self.encode(cs).await?;
         sqlx::query("INSERT INTO changesets (id, data) VALUES (?, ?) ON CONFLICT DO NOTHING")
             .bind(id.0.as_bytes().as_slice())
-            .bind(cs.encode())
+            .bind(data)
             .execute(&self.pool)
             .await
             .map_err(storage)?;
@@ -348,8 +425,14 @@ impl MetaStore for SqliteMetaStore {
             .fetch_optional(&self.pool)
             .await
             .map_err(storage)?;
-        row.map(|r| decode_checked(id, &r.get::<Vec<u8>, _>(0)))
-            .transpose()
+        let Some(row) = row else { return Ok(None) };
+        let data: Vec<u8> = row.get(0);
+        let id_bytes = id.0.as_bytes().to_vec();
+        Ok(self
+            .decode_rows(std::slice::from_ref(id), vec![(id_bytes, data)])
+            .await?
+            .pop()
+            .flatten())
     }
 
     /// One `IN (...)` query per [`BATCH_PARAMS`] distinct ids.
@@ -368,7 +451,7 @@ impl MetaStore for SqliteMetaStore {
             let rows = q.fetch_all(&self.pool).await.map_err(storage)?;
             found.extend(rows.iter().map(|r| (r.get(0), r.get(1))));
         }
-        changesets_in_order(ids, found.into_iter())
+        self.decode_rows(ids, found).await
     }
 
     /// An empty `after` sorts below every 32-byte id, so `None` needs no
@@ -692,10 +775,11 @@ impl MetaStore for SqliteMetaStore {
         rows: &[DerivedRow],
     ) -> Result<ChangesetId> {
         let id = cs.id();
+        let data = self.encode(cs).await?;
         let mut tx = self.pool.begin().await.map_err(storage)?;
         sqlx::query("INSERT INTO changesets (id, data) VALUES (?, ?) ON CONFLICT DO NOTHING")
             .bind(id.0.as_bytes().as_slice())
-            .bind(cs.encode())
+            .bind(data)
             .execute(&mut *tx)
             .await
             .map_err(storage)?;
@@ -713,11 +797,15 @@ impl MetaStore for SqliteMetaStore {
         if changesets.is_empty() && rows.is_empty() {
             return Ok(());
         }
-        let mut tx = self.pool.begin().await.map_err(storage)?;
+        let mut encoded = Vec::with_capacity(changesets.len());
         for cs in changesets {
+            encoded.push((cs.id(), self.encode(cs).await?));
+        }
+        let mut tx = self.pool.begin().await.map_err(storage)?;
+        for (id, data) in &encoded {
             sqlx::query("INSERT INTO changesets (id, data) VALUES (?, ?) ON CONFLICT DO NOTHING")
-                .bind(cs.id().0.as_bytes().as_slice())
-                .bind(cs.encode())
+                .bind(id.0.as_bytes().as_slice())
+                .bind(data.as_slice())
                 .execute(&mut *tx)
                 .await
                 .map_err(storage)?;

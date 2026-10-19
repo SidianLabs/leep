@@ -130,6 +130,20 @@ with a NUL after it): it would share a tree node's address in the
 `RepoPath` is validated on construction and on deserialization, so invalid
 paths cannot enter the system through any route.
 
+**Stored changeset rows** ([ADR 0053](adr/0053-compressed-changeset-rows.md)).
+The SQL backends store a changeset either as its canonical bytes or as a
+zstd frame of those bytes compressed with a dictionary trained on the
+store's own history (`changeset_dicts`, named by the frame's dictionary
+id). The encoding lives entirely inside `leep-meta`: `MetaStore` takes and
+returns `Changeset` values, readers check every decoded row against its id
+as before, and ids, hashes and the API are unchanged. A server writes with
+the newest dictionary it knows (it looks again on a read that names an
+unknown one and at most a minute before a write), and plain rows until a
+dictionary exists. `leep-server compact-changesets` trains the dictionary
+and rewrites existing rows in place, beside running servers of this
+version; on git/git and Linux it halves the table (about 2.9 to 1.75 GB on
+all of Linux).
+
 ## 5. Derived data
 
 A derived kind is a pure function
@@ -370,7 +384,8 @@ is the consistency argument: a blob a stored changeset needs is never deleted
 looks, however GC interleaves; the walk enforces it on every run, so no lock
 against GC is needed. `restore` loads blobs, then metadata in one transaction,
 into empty stores only, refusing a newer schema and a damaged file, and the
-restored stores pass `verify`. `backup-verify` checks a backup without
+restored stores pass `verify`. Compressed changeset rows and their
+dictionaries are copied byte for byte. `backup-verify` checks a backup without
 restoring it. The format is in FORMATS.md; the drill and the runbook are in
 OPERATIONS.md.
 

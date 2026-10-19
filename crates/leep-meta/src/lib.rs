@@ -1,13 +1,17 @@
 //! `MetaStore` backends: SQLite (single node, tests) and Postgres
 //! (production). Both keep changesets, refs and derived data in three tables
 //! and implement `cas_ref` as a single conditional SQL statement. A fourth
-//! table, `ref_log`, records every ref move in the same transaction. The
-//! schema is versioned by forward-only migrations ([`migrate`], ADR 0023).
+//! table, `ref_log`, records every ref move in the same transaction. A fifth,
+//! `changeset_dicts`, holds the dictionaries changeset rows are compressed
+//! with ([`compact`], ADR 0053). The schema is versioned by forward-only
+//! migrations ([`migrate`], ADR 0023).
 
 use std::sync::Arc;
 
 use leep_core::{Error, MetaStore, Result};
 
+mod codec;
+pub mod compact;
 mod drop;
 pub mod migrate;
 mod postgres;
@@ -83,18 +87,6 @@ fn storage(e: impl std::fmt::Display) -> Error {
     Error::Storage(e.to_string())
 }
 
-/// Decode stored changeset bytes and check they hash to `id`.
-fn decode_checked(id: &leep_core::ChangesetId, data: &[u8]) -> Result<leep_core::Changeset> {
-    let cs = leep_core::Changeset::decode(data)?;
-    if cs.id() != *id {
-        return Err(Error::Storage(format!(
-            "corrupt changeset row {}",
-            id.0.to_hex()
-        )));
-    }
-    Ok(cs)
-}
-
 fn to_id(bytes: &[u8]) -> Result<leep_core::ChangesetId> {
     let arr: [u8; 32] = bytes
         .try_into()
@@ -129,13 +121,14 @@ fn unique<'a>(keys: impl Iterator<Item = &'a [u8]>) -> Vec<&'a [u8]> {
 /// Answer a batched changeset read in request order from `(id, data)` rows,
 /// decoding and checking each stored row once.
 fn changesets_in_order(
+    codec: &codec::Codec,
     ids: &[leep_core::ChangesetId],
     rows: impl Iterator<Item = (Vec<u8>, Vec<u8>)>,
 ) -> Result<Vec<Option<leep_core::Changeset>>> {
     let mut found = std::collections::HashMap::new();
     for (id, data) in rows {
         let id = to_id(&id)?;
-        let cs = decode_checked(&id, &data)?;
+        let cs = codec.decode_checked(&id, &data)?;
         found.insert(id, cs);
     }
     Ok(ids.iter().map(|id| found.get(id).cloned()).collect())
@@ -197,6 +190,8 @@ fn log_entry(row: LogRow) -> Result<leep_core::RefLogEntry> {
     })
 }
 
+#[cfg(test)]
+mod compact_tests;
 #[cfg(test)]
 mod migrate_tests;
 #[cfg(test)]

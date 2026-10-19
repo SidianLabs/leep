@@ -585,9 +585,16 @@ async fn verify(store: &dyn MetaStore, stage: &Stage, d: &Data, version: u64) {
 }
 
 fn full_schema() -> BTreeSet<String> {
-    ["changesets", "refs", "derived", "ref_log", "ref_log_name"]
-        .map(String::from)
-        .into()
+    [
+        "changesets",
+        "changeset_dicts",
+        "refs",
+        "derived",
+        "ref_log",
+        "ref_log_name",
+    ]
+    .map(String::from)
+    .into()
 }
 
 // ---- Tests ---------------------------------------------------------------
@@ -776,6 +783,90 @@ async fn upgrade_from_v1_sets_analyze_thresholds() {
             assert_eq!(tuples, [counts.0, counts.1], "{kind}");
             store.pool.close().await;
         }
+        db.cleanup().await;
+    }
+}
+
+/// A database at v2, as the binary before migration 3 left it, upgrades with
+/// its changesets readable, gains an empty `changeset_dicts`, and stores
+/// changesets as before until a compaction trains a dictionary (ADR 0053).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn upgrade_from_v2_adds_changeset_dicts() {
+    for db in dbs("fromv2").await {
+        let kind = db.kind();
+        let d = data();
+        drop(
+            db.open(&db.compiled()[..2], SchemaMode::Migrate)
+                .await
+                .unwrap(),
+        );
+        load(&db, &STAGES[1], &d).await;
+        let plan = db.report(db.compiled()).await;
+        assert_eq!(plan.from, 2, "{kind}");
+        assert_eq!(
+            plan.pending.iter().map(|m| m.version).collect::<Vec<_>>(),
+            (3..=LATEST).collect::<Vec<_>>(),
+            "{kind}"
+        );
+        let s = db.open(db.compiled(), SchemaMode::Migrate).await.unwrap();
+        verify(&*s, &STAGES[1], &d, LATEST as u64).await;
+        assert_eq!(db.objects().await, full_schema(), "{kind}");
+        drop(s);
+
+        // Enough history to train on, in rows as v2 wrote them (canonical
+        // bytes, as v3 still writes them before a dictionary exists).
+        let more = crate::compact_tests::history(crate::compact::MIN_TRAINING_ROWS, 2);
+        for chunk in more.chunks(250) {
+            let values = vec!["(?, ?)"; chunk.len()].join(", ");
+            let args = chunk
+                .iter()
+                .flat_map(|c| [Arg::Bytes(c.id().0 .0.to_vec()), Arg::Bytes(c.encode())])
+                .collect();
+            db.exec(
+                &format!("INSERT INTO changesets (id, data) VALUES {values}"),
+                args,
+            )
+            .await;
+        }
+        let opts = crate::compact::CompactOptions::default();
+        let r = match &db {
+            Db::Sqlite { url, .. } => {
+                let s = SqliteMetaStore::connect(url).await.unwrap();
+                assert!(s.has_dicts && s.codec.newest_id() == 0, "{kind}");
+                crate::compact::run(&s, &opts, &mut |_| {}).await.unwrap()
+            }
+            Db::Pg { url, schema } => {
+                let s = PostgresMetaStore::connect_with_migrations(
+                    url,
+                    Some(schema),
+                    SchemaMode::Migrate,
+                    db.compiled(),
+                )
+                .await
+                .unwrap();
+                assert!(s.has_dicts && s.codec.newest_id() == 0, "{kind}");
+                let r = crate::compact::run(&s, &opts, &mut |_| {}).await.unwrap();
+                s.pool.close().await;
+                r
+            }
+        };
+        assert_eq!(r.dictionary, 1, "{kind}");
+        // The stage's changesets, verify's and the contract's, and the new
+        // history; at least the history is worth compressing.
+        assert!(r.rows > (d.changesets.len() + more.len()) as u64, "{kind}");
+        assert!(r.rewritten >= more.len() as u64, "{kind}");
+        let s = db
+            .open(db.compiled(), SchemaMode::RequireCurrent)
+            .await
+            .unwrap();
+        for c in d.changesets.iter().chain(&more) {
+            assert_eq!(
+                s.get_changeset(&c.id()).await.unwrap().as_ref(),
+                Some(c),
+                "{kind}"
+            );
+        }
+        drop(s);
         db.cleanup().await;
     }
 }

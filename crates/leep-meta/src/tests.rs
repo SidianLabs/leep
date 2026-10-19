@@ -521,7 +521,7 @@ pub(crate) fn schema(name: &str) -> String {
     format!("leep_test_{name}_{}", std::process::id())
 }
 
-async fn pg_store(name: &str) -> Option<(PostgresMetaStore, String)> {
+pub(crate) async fn pg_store(name: &str) -> Option<(PostgresMetaStore, String)> {
     let url = pg_url()?;
     let s = PostgresMetaStore::connect_with_schema(&url, &schema(name))
         .await
