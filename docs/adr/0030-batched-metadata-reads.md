@@ -39,7 +39,12 @@ changeset per level.
    a window at a time instead of one level per round trip, and generations come
    from the skiplists rather than another read. An unfiltered `log` reads no
    further than `limit`: a changeset more than `want` generations below the
-   walk cannot be among the next `want` it visits.
+   walk cannot be among the next `want` it visits. A walk that expects to visit
+   more than one batch (a `log` or `provenance` with a large limit) issues up to
+   two batches at once, each on its own task so their answers decode on separate
+   threads, with skiplist guesses up to two batches' reach; the extra batch only
+   takes guesses while the changesets read and not yet visited number fewer
+   than `want`, so a long log reads about as far past its limit as before.
 3. **The walk's answer does not depend on the read-ahead.** The walk keeps its
    heap ordered by generation then id, its `seen` set and its `limit`
    semantics, and asks the read-ahead for data by id. Anything a batch did not

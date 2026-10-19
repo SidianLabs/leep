@@ -396,6 +396,8 @@ mod read_ahead_tests {
         fail_batches: bool,
         singles: AtomicUsize,
         batches: AtomicUsize,
+        /// Changesets asked for by batched reads.
+        batched: AtomicUsize,
     }
 
     #[async_trait::async_trait]
@@ -409,6 +411,7 @@ mod read_ahead_tests {
         }
         async fn get_changesets(&self, ids: &[ChangesetId]) -> Result<Vec<Option<Changeset>>> {
             self.batches.fetch_add(1, Ordering::Relaxed);
+            self.batched.fetch_add(ids.len(), Ordering::Relaxed);
             if self.fail_batches {
                 return Err(Error::Storage("no batches".into()));
             }
@@ -469,6 +472,7 @@ mod read_ahead_tests {
             fail_batches,
             singles: AtomicUsize::new(0),
             batches: AtomicUsize::new(0),
+            batched: AtomicUsize::new(0),
         });
         (Repo::new(Arc::new(MemoryBlobStore::new()), p.clone()), p)
     }
@@ -698,5 +702,33 @@ mod read_ahead_tests {
             batches * 20 < reachable,
             "{batches} batched reads for {reachable} changesets"
         );
+    }
+
+    /// Long walks read several batches at once on their own tasks; the
+    /// answer must not depend on that, and what they read beyond the end
+    /// stays bounded by what the walk was told to expect.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_read_ahead_keeps_the_answer() {
+        for (seed, fail) in [(5u64, false), (9, false), (13, true)] {
+            let (r, p) = probe(fail);
+            let mut rng = Lcg(seed);
+            let ids = random_dag(&r, &mut rng, 2500).await;
+            let tip = *ids.last().unwrap();
+            for limit in [255, 300, 1000, 1700, usize::MAX] {
+                let want = serial_log(&r, tip, limit, &LogFilter::default())
+                    .await
+                    .unwrap();
+                let before = p.batched.load(Ordering::Relaxed);
+                let got = r.log(tip, None, limit).await.unwrap();
+                assert_eq!(got, want, "seed {seed}, limit {limit}");
+                let read = p.batched.load(Ordering::Relaxed) - before;
+                if !fail && limit != usize::MAX {
+                    assert!(
+                        read <= limit + limit / 2 + 512,
+                        "seed {seed}: {read} changesets read for limit {limit}"
+                    );
+                }
+            }
+        }
     }
 }

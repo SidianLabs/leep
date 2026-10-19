@@ -78,7 +78,10 @@ impl FromStr for Hash {
 impl Serialize for Hash {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         if s.is_human_readable() {
-            s.serialize_str(&self.to_hex())
+            // On the stack: a log or listing encodes thousands of hashes.
+            let mut buf = [0u8; 64];
+            hex::encode_to_slice(self.0, &mut buf).expect("64 hex digits for 32 bytes");
+            s.serialize_str(std::str::from_utf8(&buf).expect("hex is ASCII"))
         } else {
             self.0.serialize(s)
         }

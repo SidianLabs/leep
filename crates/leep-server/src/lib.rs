@@ -21,6 +21,7 @@ use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
+use futures_util::StreamExt;
 use leep_core::api::*;
 use leep_core::rename::RenameOptions;
 use leep_core::{Changeset, ChangesetId, Error, FileKind, Hash, RefUpdateContext, RepoPath};
@@ -876,7 +877,7 @@ async fn log(
     State(repo): S,
     Path(id): Path<String>,
     Query(pairs): Query<Vec<(String, String)>>,
-) -> ApiResult<Json<LogResponse>> {
+) -> ApiResult<Response> {
     let q = LogQuery::parse(pairs)?;
     let limit = q.limit.unwrap_or(DEFAULT_LOG_LIMIT).min(MAX_LOG_LIMIT);
     let entries = if q.follow {
@@ -890,7 +891,65 @@ async fn log(
         repo.log_filtered(cid(&id)?, q.path.as_deref(), limit, &q.filter)
             .await?
     };
-    Ok(Json(LogResponse { entries }))
+    Ok(log_json(entries))
+}
+
+/// Entries one task encodes of a long log.
+const LOG_CHUNK_ENTRIES: usize = 512;
+
+/// `Json(LogResponse { entries })`, byte for byte, for a long log: chunks of
+/// entries are encoded on blocking threads, several at once, and streamed in
+/// order, so the first bytes leave while later entries are encoded. 10,000
+/// entries are tens of megabytes of JSON. The walk has finished, so a failure
+/// of the store still answers with an error status; encoding these types
+/// cannot fail.
+fn log_json(entries: Vec<ChangesetInfo>) -> Response {
+    if entries.len() <= LOG_CHUNK_ENTRIES {
+        return Json(LogResponse { entries }).into_response();
+    }
+    let mut chunks = Vec::with_capacity(entries.len().div_ceil(LOG_CHUNK_ENTRIES));
+    let mut rest = entries.into_iter();
+    loop {
+        let chunk: Vec<ChangesetInfo> = rest.by_ref().take(LOG_CHUNK_ENTRIES).collect();
+        if chunk.is_empty() {
+            break;
+        }
+        chunks.push(chunk);
+    }
+    let last = chunks.len() - 1;
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get().min(4));
+    let body = futures_util::stream::iter(chunks.into_iter().enumerate())
+        .map(move |(i, chunk)| {
+            tokio::task::spawn_blocking(move || encode_log_chunk(&chunk, i == 0, i == last))
+        })
+        .buffered(threads)
+        .map(|r| match r {
+            Ok(Ok(bytes)) => Ok(bytes),
+            Ok(Err(e)) => Err(std::io::Error::other(e)),
+            Err(e) => Err(std::io::Error::other(e)),
+        });
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        axum::body::Body::from_stream(body),
+    )
+        .into_response()
+}
+
+/// Part of a `LogResponse` body: `chunk`'s entries, comma separated, opened
+/// by the object's head if `first` or by a comma if not, closed if `last`.
+fn encode_log_chunk(chunk: &[ChangesetInfo], first: bool, last: bool) -> serde_json::Result<Bytes> {
+    let mut out = Vec::with_capacity(chunk.len() * 1024);
+    out.extend_from_slice(if first { &b"{\"entries\":["[..] } else { b"," });
+    for (k, entry) in chunk.iter().enumerate() {
+        if k > 0 {
+            out.push(b',');
+        }
+        serde_json::to_writer(&mut out, entry)?;
+    }
+    if last {
+        out.extend_from_slice(b"]}");
+    }
+    Ok(Bytes::from(out))
 }
 
 async fn last_change(
@@ -1011,6 +1070,53 @@ mod tests {
         q.iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    /// The chunked encoding of a long log is the one-piece encoding, byte
+    /// for byte, on each side of the chunk boundaries.
+    #[tokio::test]
+    async fn log_json_is_the_one_piece_encoding() {
+        use http_body_util::BodyExt;
+        let entry = |i: usize| ChangesetInfo {
+            id: leep_core::ChangesetId(Hash::of_blob(format!("{i}").as_bytes())),
+            changeset: Changeset {
+                parents: vec![leep_core::ChangesetId(Hash::of_blob(b"p"))],
+                author: format!("a\"{i}\" \u{e9}"),
+                timestamp: i as i64,
+                message: format!("line\n\tnext {i}"),
+                changes: BTreeMap::from([
+                    (
+                        RepoPath::new(format!("d/{i}")).unwrap(),
+                        leep_core::FileChange::Modify {
+                            content: Hash::of_blob(b"x"),
+                            kind: FileKind::Executable,
+                            size: i as u64,
+                        },
+                    ),
+                    (
+                        RepoPath::new("gone").unwrap(),
+                        leep_core::FileChange::Delete,
+                    ),
+                ]),
+                extra: BTreeMap::from([("agent.model".to_string(), "m".to_string())]),
+            },
+            generation: i as u64 + 1,
+            root_tree: Hash::of_blob(b"root"),
+            path_at: None,
+            renamed: None,
+        };
+        let n = LOG_CHUNK_ENTRIES;
+        for len in [0, 1, n - 1, n, n + 1, 2 * n, 2 * n + 1, 5 * n + 17] {
+            let entries: Vec<ChangesetInfo> = (0..len).map(entry).collect();
+            let want = serde_json::to_vec(&LogResponse {
+                entries: entries.clone(),
+            })
+            .unwrap();
+            let resp = log_json(entries);
+            assert_eq!(resp.headers()[header::CONTENT_TYPE], "application/json");
+            let got = resp.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(got, want, "{len} entries");
+        }
     }
 
     #[test]

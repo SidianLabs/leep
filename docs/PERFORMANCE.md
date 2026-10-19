@@ -1452,6 +1452,90 @@ which depend on the step before. On Linux the same causes apply at about 26
 times the history (and a 508 MB index), so the 14.4 s, 19.7 s and 47 s rows
 should fall by similar factors; they have not been remeasured there.
 
+## Search and long logs
+
+On all of Linux (above, "After #84 to #91") a search for a common token took
+3.3 s cold and 1.4 s warm, and `log` limit 10,000 4.6 s cold and 1.19 s
+warm. Reproduced on two local stores, Postgres 16 in a private cluster
+(`fsync` off), filesystem blobs repacked with `repack --full`, release build,
+a 4-vCPU sandbox shared with other builds (load average 7 to 13 throughout;
+the server and Postgres ran at `nice -15`):
+
+- *git/git*: all 82,513 commits imported with `leep-git import` (in four
+  stages, repacking between them for disk), the search index derived with
+  `derive-search main`; 4,737 files at the head.
+- *Linux-shaped tree*: `cargo run --release -p leep-server --example
+  cold_queries -- build <meta> <blobs> --commits 0` (82,765 files in 3,211
+  directories, a few of them with thousands of files), repacked and indexed
+  the same way.
+
+Cold is: Postgres restarted, page cache dropped, a new server process, first
+request. Warm is the median of 8 requests after it. Each row is the median of
+3 (git/git) or 2 (Linux-shaped) such rounds, base and new interleaved.
+
+**Where the time went.**
+
+- *Search.* The walk opened one directory at a time: one `get_derived` for its
+  filter, one `read_tree`, then one `get_derived` per file, 16 in flight. A
+  search for a token near the end of the tree in path order (Linux's
+  `strbuf_addf` lives in `tools/`) paid a round trip for every directory
+  before it and one for every 16 files in directories its filters did not
+  rule out: on the Linux-shaped tree, 1,879 files and 115 directories for one
+  match. Matching ran on the task that polled the pipeline, one file at a
+  time.
+- *Log.* `log` limit 10,000 on git/git spent 350 ms walking and 65 ms
+  encoding 19.5 MB of JSON (instrumented build, warm). The walk was 47
+  read-ahead batches of 256 changesets, read one after another, at about
+  7 ms each; most of that was decoding the answers on one thread (postcard,
+  the id check, and a clone of every changeset in the store's batched read),
+  not Postgres. Encoding allocated a `String` for every hash written.
+
+**Changes.**
+
+- Search opens a directory with one `get_derived_many` for its
+  subdirectories' filters and one for its files' rows, then one `read_trees`
+  for the subdirectories that survive, and opens the subdirectories of the
+  directory it is in ahead of the walk, four at a time per search, on their
+  own tasks (aborted if the search stops early). Matching runs on blocking
+  threads. Results, their order and `truncated` are unchanged; under
+  truncation `dirs_pruned` now also counts pruned siblings of the directories
+  the walk entered.
+- The log's read-ahead issues two batches at once on separate tasks when the
+  walk expects to visit more than one batch, while the changesets it has read
+  and not yet visited number fewer than the limit (so it reads about as far
+  past the limit as before: 12,481 changesets for 10,000 entries on git/git,
+  against about 12,000).
+- Batched changeset reads hand each decoded changeset to its request instead
+  of cloning it (only repeated ids clone).
+- A log of more than 512 entries is encoded in chunks of 512 on blocking
+  threads and streamed in order, after the walk has finished (so a failed walk
+  still gets its error status). The body is byte-for-byte what one-piece
+  encoding gives. Hashes are hex-encoded on the stack in every JSON response.
+
+**Results** (ms, base `fc98b7f` / after; answers compared byte for byte):
+
+| Query | Cold | Warm |
+|---|---|---|
+| git/git: search `strbuf_addf`, limit 100 | 160 / 158 | 97 / 54 |
+| git/git: search `xdl_cleanup_merge` (1 file) | 150 / 88 | 79 / 35 |
+| git/git: `log` limit 10,000 (19.5 MB) | 845 / 627 | 450 / 325 |
+| git/git: `log` limit 100 | 67 / 60 | 16 / 14 |
+| Linux-shaped: search `file 8165` (4 files near the end) | 324 / 140 | 229 / 36 |
+| Linux-shaped: search `of file 81657 lorem` (1 file) | 334 / 164 | 184 / 40 |
+| Linux-shaped: search `rem dolor` (trigrams in every file, no match; scans 256 MiB) | 11,665 / 5,145 | 11,239 / 5,085 |
+
+The git/git searches are small (926 files considered); their cold time is
+mostly reading the matched files' delta chains from a cold pack. The
+Linux-shaped tree shows what the round trips cost on a large tree: 5 to 6
+times faster warm and twice as fast cold. On all of Linux, where the large
+directories' filters are saturated and the walk reaches thousands of
+directories before `tools/`, the search should improve at least as much; it
+has not been remeasured there. The long log is 1.4 times faster: two lanes
+overlap the round trips, but decoding is the larger part and two threads is
+all the VPS has. Its first byte arrives sooner than the whole body did
+(470 to 319 ms warm in another interleaved run). The next step for the log is the store's decoding: every changeset
+is decoded, re-encoded and hashed to check its id.
+
 ## Filtered log
 
 ADR 0047. `log` with `author=` or `extra=` and no path used to test every

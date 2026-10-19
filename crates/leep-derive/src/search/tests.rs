@@ -866,3 +866,71 @@ async fn indexed_search_equals_a_naive_scan_on_random_trees() {
     );
     assert!(found > 1000, "queries found something: {found}");
 }
+
+/// Directories are opened ahead of the walk on their own tasks, a few at a
+/// time. With more of them than run at once, on several levels, answers and
+/// their order stay those of a brute-force scan, and a complete search counts
+/// every pruned directory once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn opening_directories_ahead_keeps_the_answer() {
+    let r = repo();
+    let mut files: Vec<(String, Vec<u8>)> = vec![
+        ("a.txt".into(), b"needle at the top\n".to_vec()),
+        ("d03/z.txt".into(), b"needle in the middle\n".to_vec()),
+    ];
+    for a in 0..12 {
+        for b in 0..12 {
+            for f in 0..3 {
+                let body = if (a * 12 + b + f) % 5 == 0 {
+                    format!("needle {a} {b} {f}\nhay\nneedle again\n")
+                } else {
+                    format!("hay {a} {b} {f}\n")
+                };
+                files.push((format!("d{a:02}/e{b:02}/f{f}.txt"), body.into_bytes()));
+            }
+        }
+    }
+    let refs: Vec<File> = files
+        .iter()
+        .map(|(p, b)| (p.as_str(), Some(b.as_slice())))
+        .collect();
+    let c = commit(&r, &[], &refs).await;
+    for pattern in ["needle", "needle again", "nothing here", "hay 7 1"] {
+        for limit in [1, 2, 7, 50, 1000] {
+            let q = SearchQuery {
+                limit,
+                ..SearchQuery::new(pattern)
+            };
+            let want = oracle(&r, c, &q).await;
+            let got = r.search(c, &q).await.unwrap();
+            assert_eq!(
+                (render(&got), got.truncated),
+                want,
+                "{pattern:?} limit {limit}"
+            );
+        }
+    }
+    let q = SearchQuery {
+        limit: MAX_LIMIT,
+        ..SearchQuery::new("nothing here")
+    };
+    let res = r.search(c, &q).await.unwrap();
+    let scan = r
+        .search(
+            c,
+            &SearchQuery {
+                use_index: false,
+                ..q.clone()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(res.matches.is_empty() && !res.truncated);
+    assert_eq!(scan.stats.files_considered, files.len() as u64);
+    // Every leaf directory is ruled out by its filter, or the whole tree is.
+    assert!(res.stats.dirs_pruned >= 1 && res.stats.dirs_pruned <= 1 + 12 + 144);
+    // A complete search's counts do not depend on how the reads interleaved.
+    for _ in 0..3 {
+        assert_eq!(r.search(c, &q).await.unwrap().stats, res.stats);
+    }
+}

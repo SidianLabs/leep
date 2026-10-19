@@ -19,10 +19,11 @@ mod tests;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use bytes::Bytes;
 use futures_util::{stream, StreamExt};
 use globset::{GlobBuilder, GlobMatcher};
 use leep_core::api::{SearchMatch, SearchResponse, SearchStats};
-use leep_core::{ChangesetId, Error, FileKind, Hash, RepoPath, Result, TreeEntry};
+use leep_core::{ChangesetId, Error, FileKind, Hash, RepoPath, Result, TreeEntry, TreeNode};
 
 pub use index::{BLOB_KIND, TREE_KIND};
 pub use trigram::MAX_INDEXED_BYTES;
@@ -86,6 +87,9 @@ struct FileRef {
     content: Hash,
     kind: FileKind,
     size: u64,
+    /// The file's `blob-trigrams-v1` row, when the walk read it with its
+    /// directory's batch; `None` means look it up (and derive it if missing).
+    row: Option<Bytes>,
 }
 
 enum Outcome {
@@ -170,78 +174,80 @@ struct WalkStats {
     dirs_pruned: AtomicU64,
 }
 
-type DirEntries = std::vec::IntoIter<(String, TreeEntry)>;
+/// A child of an opened directory that the walk will visit: a file, or a
+/// directory whose filter did not rule it out, with its node already read.
+enum Child {
+    Dir {
+        path: String,
+        node: TreeNode,
+    },
+    /// A directory being opened ahead of the walk.
+    Opening {
+        path: String,
+        task: Opening,
+    },
+    File(FileRef),
+}
 
-/// Depth-first walk that yields files lazily, in path order, so a search that
-/// has enough matches stops reading directories too. Directories are visited
-/// in the order of their full paths (a directory `a` sorts as `a/`, so it
-/// follows a sibling file `a.txt`); this is the same order as sorting the
-/// file paths as strings. Uses an explicit stack.
-///
-/// Owns its inputs (cheap clones and `Arc`s) because a stream closure that
-/// takes a borrowing state makes the search future fail the `Send` check that
-/// axum handlers need.
-struct Walk {
+/// An opened directory: its children in path order, and how many of its
+/// subdirectories their filters ruled out.
+struct Opened {
+    children: Vec<Child>,
+    pruned: u64,
+}
+
+/// A directory opened on its own task, which is aborted if the walk is
+/// dropped before it gets there (a search that has its matches).
+struct Opening(tokio::task::JoinHandle<Result<Opened>>);
+
+impl Drop for Opening {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Directories opened ahead of the walk at once. Each is two batched
+/// metadata reads and one batched tree read, so four leave half of a
+/// 16-connection pool to other requests.
+const OPEN_AHEAD: usize = 4;
+
+/// What opening a directory needs, shared by the walk and the tasks that
+/// open directories ahead of it.
+struct Opener {
     repo: Repo,
     filter: Arc<Filter>,
     compiled: Arc<Compiled>,
     indexed: bool,
     counters: Arc<Counters>,
-    stats: Arc<WalkStats>,
-    start: Option<(String, Hash)>,
-    first_file: Option<FileRef>,
-    stack: Vec<(String, DirEntries)>,
+    ahead: Arc<tokio::sync::Semaphore>,
 }
 
-impl Walk {
-    /// Open a directory, or `None` if its summary rules it out.
-    async fn enter(&self, path: String, tree: Hash) -> Result<Option<(String, DirEntries)>> {
-        if self.indexed {
-            let row = self.repo.tree_row(tree, &self.counters).await?;
-            let present = self.compiled.probe.tree(&row)?;
-            if !self.compiled.required.eval(&|t| present.has(t)) {
-                self.stats.dirs_pruned.fetch_add(1, Ordering::Relaxed);
-                return Ok(None);
-            }
-        }
-        let mut entries: Vec<(String, TreeEntry)> = self
-            .repo
-            .read_tree(tree)
-            .await?
-            .entries
-            .into_iter()
-            .collect();
+impl Opener {
+    /// Whether a directory filter admits the query.
+    fn admits(&self, row: &[u8]) -> Result<bool> {
+        let present = self.compiled.probe.tree(row)?;
+        Ok(self.compiled.required.eval(&|t| present.has(t)))
+    }
+
+    /// The children of the directory `dir` (node `node`) that the walk will
+    /// visit, in path order. Reads what they need in batches: one
+    /// `get_derived_many` for the filters of the subdirectories and one for
+    /// the rows of the files, then one `read_trees` for the subdirectories
+    /// that survive.
+    async fn open(&self, dir: &str, node: TreeNode) -> Result<Opened> {
+        let mut entries: Vec<(String, TreeEntry)> = node.entries.into_iter().collect();
         entries.sort_by_cached_key(|(name, e)| match e {
             TreeEntry::Dir { .. } => format!("{name}/"),
             TreeEntry::File { .. } => name.clone(),
         });
-        Ok(Some((path, entries.into_iter())))
-    }
-
-    async fn next(&mut self) -> Result<Option<FileRef>> {
-        if let Some(f) = self.first_file.take() {
-            return Ok(Some(f));
-        }
-        if let Some((path, tree)) = self.start.take() {
-            if let Some(frame) = self.enter(path, tree).await? {
-                self.stack.push(frame);
-            }
-        }
-        loop {
-            let Some((dir, entries)) = self.stack.last_mut() else {
-                return Ok(None);
-            };
-            let Some((name, entry)) = entries.next() else {
-                self.stack.pop();
-                continue;
-            };
+        let mut dirs: Vec<(usize, String, Hash)> = Vec::new();
+        let mut files: Vec<(usize, FileRef)> = Vec::new();
+        for (i, (name, entry)) in entries.into_iter().enumerate() {
             let path = join(dir, &name);
             match entry {
                 TreeEntry::Dir { tree } => {
                     if self.filter.may_contain(&path) {
-                        if let Some(frame) = self.enter(path, tree).await? {
-                            self.stack.push(frame);
-                        }
+                        dirs.push((i, path, tree));
                     }
                 }
                 TreeEntry::File {
@@ -250,18 +256,198 @@ impl Walk {
                     size,
                 } => {
                     if self.filter.accepts_file(&path) {
-                        self.stats.considered.fetch_add(1, Ordering::Relaxed);
-                        return Ok(Some(FileRef {
-                            path,
-                            content,
-                            kind,
-                            size,
-                        }));
+                        files.push((
+                            i,
+                            FileRef {
+                                path,
+                                content,
+                                kind,
+                                size,
+                                row: None,
+                            },
+                        ));
                     }
                 }
             }
         }
+        let mut pruned = 0;
+        if self.indexed {
+            // Files that `check_file` skips without a row need none.
+            let wanted: Vec<usize> = (0..files.len())
+                .filter(|&k| needs_row(&files[k].1))
+                .collect();
+            let blob_keys: Vec<Hash> = wanted.iter().map(|&k| files[k].1.content).collect();
+            let tree_keys: Vec<Hash> = dirs.iter().map(|d| d.2).collect();
+            let meta = self.repo.meta();
+            let (tree_rows, blob_rows) = futures_util::try_join!(
+                many(meta.as_ref(), TREE_KIND, &tree_keys),
+                many(meta.as_ref(), BLOB_KIND, &blob_keys),
+            )?;
+            for (k, row) in wanted.into_iter().zip(blob_rows) {
+                files[k].1.row = row;
+            }
+            let mut kept = Vec::with_capacity(dirs.len());
+            for (d, row) in dirs.into_iter().zip(tree_rows) {
+                let row = match row {
+                    Some(row) => row,
+                    None => self.repo.tree_row(d.2, &self.counters).await?,
+                };
+                if self.admits(&row)? {
+                    kept.push(d);
+                } else {
+                    pruned += 1;
+                }
+            }
+            dirs = kept;
+        }
+        let hashes: Vec<Hash> = dirs.iter().map(|d| d.2).collect();
+        let nodes = self.repo.read_trees(&hashes).await?;
+        let mut out: Vec<(usize, Child)> = Vec::with_capacity(dirs.len() + files.len());
+        out.extend(
+            dirs.into_iter()
+                .zip(nodes)
+                .map(|((i, path, _), node)| (i, Child::Dir { path, node })),
+        );
+        out.extend(files.into_iter().map(|(i, f)| (i, Child::File(f))));
+        out.sort_unstable_by_key(|c| c.0);
+        Ok(Opened {
+            children: out.into_iter().map(|(_, c)| c).collect(),
+            pruned,
+        })
     }
+
+    /// Start opening each subdirectory among `children` on its own task, at
+    /// most [`OPEN_AHEAD`] at a time across the walk, in path order.
+    fn open_ahead(self: &Arc<Self>, children: Vec<Child>) -> Vec<Child> {
+        children
+            .into_iter()
+            .map(|child| {
+                let Child::Dir { path, node } = child else {
+                    return child;
+                };
+                let opener = self.clone();
+                let dir = path.clone();
+                // The semaphore is fair, so directories start in walk order.
+                let task = tokio::spawn(async move {
+                    let _permit = opener
+                        .ahead
+                        .clone()
+                        .acquire_owned()
+                        .await
+                        .map_err(|e| Error::Other(format!("search walk: {e}")))?;
+                    opener.open(&dir, node).await
+                });
+                Child::Opening {
+                    path,
+                    task: Opening(task),
+                }
+            })
+            .collect()
+    }
+}
+
+/// Depth-first walk that yields files lazily, in path order, so a search that
+/// has enough matches stops reading directories too. Directories are visited
+/// in the order of their full paths (a directory `a` sorts as `a/`, so it
+/// follows a sibling file `a.txt`); this is the same order as sorting the
+/// file paths as strings. Uses an explicit stack.
+///
+/// Opening a directory reads its children's index rows and nodes in batches
+/// ([`Opener::open`]), and when the walk enters a directory it starts opening
+/// that directory's subdirectories ahead of it, a few at a time. Probed one at
+/// a time, these reads were sequential round trips per directory and per file,
+/// which set the pace of a search over a large tree. What the walk yields, and
+/// in what order, does not depend on how far ahead it has read.
+///
+/// Owns its inputs (cheap clones and `Arc`s) because a stream closure that
+/// takes a borrowing state makes the search future fail the `Send` check that
+/// axum handlers need.
+struct Walk {
+    opener: Arc<Opener>,
+    stats: Arc<WalkStats>,
+    start: Option<(String, Hash)>,
+    first_file: Option<FileRef>,
+    stack: Vec<std::vec::IntoIter<Child>>,
+}
+
+impl Walk {
+    /// Make `opened` the directory the walk is in.
+    fn descend(&mut self, opened: Opened) {
+        let Opened { children, pruned } = opened;
+        self.stats.dirs_pruned.fetch_add(pruned, Ordering::Relaxed);
+        let children = self.opener.open_ahead(children);
+        self.stack.push(children.into_iter());
+    }
+
+    async fn next(&mut self) -> Result<Option<FileRef>> {
+        if let Some(f) = self.first_file.take() {
+            return Ok(Some(f));
+        }
+        if let Some((path, tree)) = self.start.take() {
+            let o = &self.opener;
+            let admitted = !o.indexed || {
+                let row = o.repo.tree_row(tree, &o.counters).await?;
+                o.admits(&row)?
+            };
+            if admitted {
+                let node = o.repo.read_tree(tree).await?;
+                let opened = o.open(&path, node).await?;
+                self.descend(opened);
+            } else {
+                self.stats.dirs_pruned.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        loop {
+            let Some(children) = self.stack.last_mut() else {
+                return Ok(None);
+            };
+            match children.next() {
+                None => {
+                    self.stack.pop();
+                }
+                Some(Child::Dir { path, node }) => {
+                    let opened = self.opener.open(&path, node).await?;
+                    self.descend(opened);
+                }
+                Some(Child::Opening { path, mut task }) => {
+                    let opened = (&mut task.0).await.map_err(|e| {
+                        Error::Other(format!("search walk failed in {path}: {e}"))
+                    })??;
+                    self.descend(opened);
+                }
+                Some(Child::File(f)) => {
+                    self.stats.considered.fetch_add(1, Ordering::Relaxed);
+                    return Ok(Some(f));
+                }
+            }
+        }
+    }
+}
+
+/// Whether `check_file` consults the file's index row.
+fn needs_row(f: &FileRef) -> bool {
+    f.kind != FileKind::Symlink && f.size <= MAX_INDEXED_BYTES
+}
+
+/// `get_derived_many` that skips the round trip for no keys and checks the
+/// answer's length.
+async fn many(
+    meta: &dyn leep_core::MetaStore,
+    kind: &str,
+    keys: &[Hash],
+) -> Result<Vec<Option<Bytes>>> {
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows = meta.get_derived_many(kind, keys).await?;
+    if rows.len() != keys.len() {
+        return Err(Error::Storage(format!(
+            "get_derived_many answered {} of {} {kind} rows",
+            rows.len(),
+            keys.len()
+        )));
+    }
+    Ok(rows)
 }
 
 impl Repo {
@@ -284,11 +470,14 @@ impl Repo {
         let root = self.root_tree(id).await?;
         let start = q.path.trim_matches('/');
         let mut walk = Walk {
-            repo: self.clone(),
-            filter: filter.clone(),
-            compiled: compiled.clone(),
-            indexed,
-            counters: counters.clone(),
+            opener: Arc::new(Opener {
+                repo: self.clone(),
+                filter: filter.clone(),
+                compiled: compiled.clone(),
+                indexed,
+                counters: counters.clone(),
+                ahead: Arc::new(tokio::sync::Semaphore::new(OPEN_AHEAD)),
+            }),
             stats: walk_stats.clone(),
             start: None,
             first_file: None,
@@ -308,6 +497,7 @@ impl Repo {
                     content,
                     kind,
                     size,
+                    row: None,
                 });
             }
             Some(TreeEntry::File { .. }) => {}
@@ -388,17 +578,20 @@ impl Repo {
     /// match it. At most `max` matches are kept, since no more can be used.
     async fn check_file(
         &self,
-        f: FileRef,
-        compiled: &Compiled,
+        mut f: FileRef,
+        compiled: &Arc<Compiled>,
         indexed: bool,
         max: usize,
         counters: &Counters,
     ) -> Result<Outcome> {
-        if f.kind == FileKind::Symlink || f.size > MAX_INDEXED_BYTES {
+        if !needs_row(&f) {
             return Ok(Outcome::Skipped { fetched: 0 });
         }
         if indexed {
-            let row = self.blob_row_bytes(f.content, f.size, counters).await?;
+            let row = match f.row.take() {
+                Some(row) => row,
+                None => self.blob_row_bytes(f.content, f.size, counters).await?,
+            };
             match compiled.probe.blob(&row)? {
                 None => return Ok(Outcome::Skipped { fetched: 0 }),
                 Some(present) => {
@@ -413,12 +606,24 @@ impl Repo {
                 Error::Storage(format!("blob {} missing for {}", f.content, f.path))
             })?;
         let fetched = data.len() as u64;
-        if !is_text(&data) {
+        let path = RepoPath::new(f.path.as_str())?;
+        // Matching is the CPU part of a search; off the async workers, files
+        // in flight are matched on as many threads as the runtime allows.
+        let compiled = compiled.clone();
+        let scanned = tokio::task::spawn_blocking(move || {
+            if !is_text(&data) {
+                return None;
+            }
+            let text = std::str::from_utf8(&data).expect("checked by is_text");
+            let mut matches = Vec::new();
+            compiled.scan(&path, text, max, &mut matches);
+            Some(matches)
+        })
+        .await
+        .map_err(|e| Error::Other(format!("search scan failed: {e}")))?;
+        let Some(matches) = scanned else {
             return Ok(Outcome::Skipped { fetched });
-        }
-        let text = std::str::from_utf8(&data).expect("checked by is_text");
-        let mut matches = Vec::new();
-        compiled.scan(&RepoPath::new(f.path.as_str())?, text, max, &mut matches);
+        };
         Ok(Outcome::Scanned { fetched, matches })
     }
 }

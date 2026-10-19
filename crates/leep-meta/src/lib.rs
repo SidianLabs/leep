@@ -137,7 +137,26 @@ fn changesets_in_order(
         let cs = decode_checked(&id, &data)?;
         found.insert(id, cs);
     }
-    Ok(ids.iter().map(|id| found.get(id).cloned()).collect())
+    // The last request for an id takes the decoded changeset; only repeats
+    // clone it. A long log reads thousands, and cloning each was as costly as
+    // decoding it.
+    let mut uses: std::collections::HashMap<&leep_core::ChangesetId, usize> =
+        std::collections::HashMap::with_capacity(ids.len());
+    for id in ids {
+        *uses.entry(id).or_default() += 1;
+    }
+    Ok(ids
+        .iter()
+        .map(|id| {
+            let left = uses.get_mut(id).expect("counted");
+            *left -= 1;
+            if *left > 0 {
+                found.get(id).cloned()
+            } else {
+                found.remove(id)
+            }
+        })
+        .collect())
 }
 
 /// Answer a batched derived read in request order from `(key, value)` rows.

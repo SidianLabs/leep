@@ -417,6 +417,19 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   2.2 s to 0.51 s, a deep diff 3.1 s to 0.73 s, and a first `blame Makefile`
   10.5 s to 5.0 s (PERFORMANCE.md, "Cold queries"). New example
   `cold_queries`.
+- Faster code search and long logs, with unchanged answers. A search opens
+  a directory with one batched read of its subdirectories' filters, one of
+  its files' trigram rows and one of the surviving subdirectories' nodes,
+  opens subdirectories ahead of the walk four at a time, and matches files
+  on blocking threads. A long `log` reads two read-ahead batches at once on
+  separate tasks, batched changeset reads no longer clone each changeset,
+  and a log of more than 512 entries is encoded in parallel chunks and
+  streamed (the same JSON, byte for byte). On an 82,765-file Linux-shaped
+  tree a search for a token near the end of the tree went from 229 to 36 ms
+  warm and 324 to 140 ms cold; on all of git/git a rare token 79 to 35 ms
+  warm, and `log` limit 10,000 450 to 325 ms warm and 845 to 627 ms cold
+  (PERFORMANCE.md, "Search and long logs"). Under truncation, a search's
+  `dirs_pruned` also counts pruned siblings of the directories it entered.
 - `leep-server repack` packs a filesystem blob store (ADR 0029): every live
   blob and tree node goes into one pack, each file version a zstd delta
   against the previous version at its path and each tree node against the
