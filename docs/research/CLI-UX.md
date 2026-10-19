@@ -33,7 +33,7 @@ against a real `leep-server` (SQLite, filesystem blobs) built from this commit.
    examples in `--help`, completions.
 9. UI: do not build a web UI now. Build a read-only terminal "smartlog"
    (`leep log --graph` / `leep activity`) first; a web view comes after design
-   partners ask (it is already M7 on the roadmap).
+   partners ask (it is on the roadmap, now under M9).
 10. Everything in section 5 is a CLI-side change except the items marked
     `/v1`.
 
@@ -444,8 +444,8 @@ changeset is blocked), not editing.
    shows it can be the centerpiece of the UX. Contents: local unlanded commits, target head,
    recent landings with author/agent/model, and review status.
 2. **Read-only web view served by `leep-server`: build later, after design partners.** It is
-   already on the roadmap under M7 (the "web view") and PRODUCT.md lists replacing GitHub's
-   review UI as a non-goal. If built, keep it to refs, history, blame, search and a live
+   on the roadmap (the "web view", now under M9). When this was written PRODUCT.md listed
+   replacing GitHub's review UI as a non-goal; the 2026-10-18 decision brought it into scope. If built, keep it to refs, history, blame, search and a live
    "landing activity" feed with provenance; do not add editing, review threads or auth UI.
    Do not build it before the JSON contract (P1-2) exists, so the view and CLI share it.
 3. **TUI (lazygit/tig style): do not build.** It serves humans doing interactive staging,
