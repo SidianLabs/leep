@@ -642,6 +642,14 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   154 s in the reproduction, 38 minutes on Linux before. SQLite drops twice
   as fast. New `MetaStore::count_derived` and `delete_derived_step` (bounded,
   resumable steps); `delete_derived_kind` becomes a provided method over them.
+- The first blame of a long-lived file walks its history in stretches:
+  the first 32 steps from the tip as before, then up to 64 of about 256
+  stretches of the first-parent chain at once, their reads gathered into
+  batched reads, and the steps taken in order, so answers are unchanged.
+  Line diffs number each version's lines once. On git/git, cold, a first
+  `blame Makefile` (1,501 changes) went from 3.0 s to 1.1 s and `diff.c`
+  from 1.9 s to 0.9 s, with rarely changed files as before
+  (PERFORMANCE.md, "First blame in stretches").
 
 ### Git compatibility (M7)
 - Live git mirror (ADR 0046): `leep-git mirror run` keeps a git remote

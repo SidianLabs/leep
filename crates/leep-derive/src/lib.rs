@@ -9,6 +9,7 @@
 //! `docs/ARCHITECTURE.md`.
 
 mod ancestry;
+mod batched_reads;
 mod blame;
 mod comments;
 pub mod derived;
@@ -32,6 +33,8 @@ mod signatures;
 mod tree_ops;
 pub mod warm;
 
+#[cfg(test)]
+mod blame_tests;
 #[cfg(test)]
 mod fault_tests;
 #[cfg(test)]
