@@ -2082,6 +2082,61 @@ everything, faster than before because changesets and root trees are read in
 batches of 1,000 (ADR 0030), and writes one `gc-mark-v1` row per referenced
 object and changeset (91,290 rows, about 1 s).
 
+## Dropping a derived kind
+
+`repair drop --kind history-tree-v3` (which also drops `history-node-v3`)
+before and after ADR 0052. On the Linux VPS (Postgres 16, 2 vCPUs, 26.9M rows,
+24 GB of values in a 33 GB `derived` table) the old dry run took 38 minutes
+and the delete 6.7 to 8.5 s per 10,000-row batch with autovacuum running,
+about 5.5 hours.
+
+Reproduction: local Postgres 16, 4 vCPU Intel Xeon @ 2.10GHz, debug build of
+`leep-server`, defaults except `shared_buffers`. A synthetic `derived` table
+shaped like Linux's: per changeset 17 `history-node-v3` rows of 400 to 1,500
+bytes (one in 40 of 6 KB, stored out of line), a `history-tree-v3` row and
+four small rows of other kinds, interleaved as derivation writes them, then
+three `history-node-v4` rows and a `history-tree-v4` row per changeset
+appended; `VACUUM ANALYZE`d. Keys are hashes, as in Leep. "Cold" sets
+`debug_io_direct = data` and `shared_buffers = 256MB`, so reads go to disk
+as on a table larger than memory; direct IO also disables readahead, which
+slows sequential reads (a plain sequential scan read 40 MB/s here), so cold
+numbers for the walk are pessimistic. Autovacuum ran beside every delete
+(it started part way through each).
+
+| 100,000 changesets: 1.8M rows to drop, 2.6 GB table, cold | before | after |
+|---|---|---|
+| `--dry-run` | 153.6 s | 2.0 s |
+| delete | 6,100 rows/s (killed after 710k rows) | 34,700 rows/s (51.9 s) |
+| WAL per row deleted | 6.5 KB | 1.2 KB |
+
+| 240,000 changesets: 4.3M rows to drop, 6.3 GB table | before | after |
+|---|---|---|
+| `--dry-run`, cold | 414 s | 7.9 s (`count(*)` in psql) |
+| delete, cold | 4,900 rows/s (killed after 1.39M rows) | 37,200 rows/s (116 s; walk run as a SQL procedure) |
+| delete, warm | 43,000 rows/s (100 s) | 144,000 rows/s (30 s; SQL procedure) |
+| WAL | 28.5 GB (warm; 7.7 KB per row cold) | 5.1 GB |
+
+The old delete took each batch in key order, so its 10,000 rows sat on about
+10,000 pages scattered over the table: read at random, and each changed page
+logged in full again after every checkpoint (6.5 to 7.7 KB of WAL per 1 KB
+row; 28.5 GB to delete 4.3M rows from a 4.9 GB heap). The walk reads each
+page once in order and logs it about once: the WAL is about the heap's size.
+With a stale estimate the walk statement, left to the planner, became an
+index scan over the whole kind for every page range; it runs with index paths
+off (a test checks the plan).
+
+Extrapolated to Linux (26.9M rows, 6.2 times the larger reproduction): the
+old dry run predicts 43 minutes (38 measured on the VPS), the new one about a
+minute. The new delete reads 33 GB in order and writes about 33 GB of WAL and
+33 GB of pages: 10 to 20 minutes at 150 to 300 MB/s, against 5.5 hours. The
+cold reproduction's 5.7 times speedup, with its handicapped sequential reads,
+bounds it at about an hour. A kill part way and a rerun finished the drop and
+left every other kind's row count as it was.
+
+SQLite (release build, warm, 24,000 changesets: 432,000 rows to drop from a
+520 MB file): dry-run count 4.6 s to 61 ms; delete 20,900 to 40,800 rows a
+second (rowid walk, 40 steps).
+
 ## Analysis
 
 Principle 5 (cost scales with the change, not the repository) holds for the

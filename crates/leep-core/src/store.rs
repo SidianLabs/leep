@@ -91,6 +91,20 @@ impl DerivedRow {
     }
 }
 
+/// One bounded step of [`MetaStore::delete_derived_step`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DeleteStep {
+    /// Rows this step deleted, one count per kind asked for, in that order.
+    pub deleted: Vec<u64>,
+    /// The cursor for the next step; `None` once the kinds are gone.
+    pub next: Option<Vec<u8>>,
+    /// How far the whole delete has got, `done` of `total` in `unit`s
+    /// ("rows", "pages": whatever the backend walks), for progress and ETA.
+    pub done: u64,
+    pub total: u64,
+    pub unit: &'static str,
+}
+
 /// What a blob listing reports about one stored blob.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BlobMeta {
@@ -343,17 +357,57 @@ pub trait MetaStore: Send + Sync + 'static {
         ))
     }
 
-    /// Delete every row of `kind` and return how many were removed. Idempotent,
-    /// and rows of other kinds are untouched. Only the repair tools call it,
-    /// and only for kinds that derive again from history (ADR 0025); in
-    /// bounded batches, so an interrupted call leaves the kind partly dropped.
+    /// How many rows of `kind` are stored. Database backends count without
+    /// reading values (ADR 0052); the default pages through
+    /// [`list_derived`](Self::list_derived).
+    async fn count_derived(&self, kind: &str) -> Result<u64> {
+        let mut n = 0;
+        let mut after = None;
+        loop {
+            let page = self.list_derived(kind, after, 1000).await?;
+            let Some((last, _)) = page.last() else {
+                return Ok(n);
+            };
+            after = Some(*last);
+            n += page.len() as u64;
+        }
+    }
+
+    /// Delete every row of `kinds`, one bounded step at a time (ADR 0052):
+    /// start with `cursor` `None` and pass each step's `next` back until it
+    /// is `None`. Each step is short and commits on its own, so the delete
+    /// runs beside servers and an interrupted one is finished by starting
+    /// again. Rows of other kinds are untouched. A row of these kinds
+    /// written while the delete runs may survive it, as one written just
+    /// after it would. Only the repair tools call it, and only for kinds
+    /// that derive again from history (ADR 0025).
     ///
     /// Every backend must implement this (see [`list_derived`](Self::list_derived)).
-    async fn delete_derived_kind(&self, kind: &str) -> Result<u64> {
-        let _ = kind;
+    async fn delete_derived_step(
+        &self,
+        kinds: &[&str],
+        cursor: Option<&[u8]>,
+    ) -> Result<DeleteStep> {
+        let _ = (kinds, cursor);
         Err(Error::Invalid(
             "this metadata store cannot delete derived rows".into(),
         ))
+    }
+
+    /// Delete every row of `kind` and return how many were removed: all
+    /// [`delete_derived_step`](Self::delete_derived_step)s of it. Idempotent,
+    /// and rows of other kinds are untouched.
+    async fn delete_derived_kind(&self, kind: &str) -> Result<u64> {
+        let mut total = 0;
+        let mut cursor: Option<Vec<u8>> = None;
+        loop {
+            let step = self.delete_derived_step(&[kind], cursor.as_deref()).await?;
+            total += step.deleted.iter().sum::<u64>();
+            match step.next {
+                Some(next) => cursor = Some(next),
+                None => return Ok(total),
+            }
+        }
     }
 
     /// Derived data is keyed by (kind, key), e.g. ("root_tree", changeset id).

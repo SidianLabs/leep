@@ -670,6 +670,17 @@ shape changed, and `verify` and `repair` are not part of the HTTP API.
 `verify` lists every kind to check it; `repair` rewrites or drops only the kinds
 that history can regenerate, and refuses the rest (ADR 0025).
 
+ADR 0052 adds `MetaStore::count_derived` (`SELECT count(*) FROM derived WHERE
+kind = ?`) and `delete_derived_step`, which replaces the loops above as the way
+backends delete; `delete_derived_kind` is now a provided method over it. A
+large drop walks the table in physical order, on Postgres
+`DELETE FROM derived WHERE ctid >= $2::tid AND ctid < $3::tid AND kind = ANY($1)`
+with index paths switched off for the statement, on SQLite
+`DELETE FROM derived WHERE rowid >= ? AND rowid < ? AND +kind IN (...)`; a
+small one runs the key-order batch from a cursor (`key > $after`). The cursor
+passed between steps is in memory only and never stored. No table, index,
+encoding or `/v1` shape changed.
+
 ## Batched reads (new `MetaStore` methods, no format change)
 
 ADR 0030 adds `MetaStore::get_changesets` and `get_derived_many`. They read the
