@@ -305,6 +305,12 @@ pub fn kinds() -> &'static [KindInfo] {
     KINDS
 }
 
+/// Kinds an older version wrote and this one no longer uses, oldest first.
+/// Only `repair drop` and `upgrade-index` act on them.
+pub fn retired() -> &'static [KindInfo] {
+    RETIRED
+}
+
 pub fn lookup(name: &str) -> Option<&'static KindInfo> {
     KINDS.iter().find(|k| k.name == name)
 }

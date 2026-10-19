@@ -394,7 +394,12 @@ deletes a kind so it derives again on demand, through
 a kind that is a large share of the table is deleted by walking the table in
 physical order, a range of pages per short transaction, so each page is read
 and changed once; a small kind in key-order batches. Its dry run counts with
-`count_derived`, which reads no values.
+`count_derived`, which reads no values. `leep-server upgrade-index`
+(`integrity::upgrade`) composes these for an upgrade: it compares each
+current kind's count and ref heads' rows with the reachable history, derives
+what is missing through `derive` from the heads (rows are stored after their
+parents', so that finds every gap but one a stopped drop left), and drops
+retired kinds only when told no older server reads them.
 Only kinds that history can regenerate are rederived or dropped; signatures,
 reviews, rebase links, GC fence rows and the ref log are refused. The table of
 kinds is `leep_derive::integrity::kinds`, mirrored in the ADR.
