@@ -1,5 +1,5 @@
 # 0047. Log filter index
-Status: Accepted
+Status: Accepted; how a merge's side is computed is replaced by ADR 0051
 Date: 2026-10-18
 
 ## Context

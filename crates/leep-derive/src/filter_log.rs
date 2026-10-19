@@ -617,6 +617,128 @@ mod tests {
         ids
     }
 
+    /// A changeset with random metadata, as in [`random_dag`].
+    async fn commit(
+        r: &Repo,
+        rng: &mut Lcg,
+        parents: Vec<ChangesetId>,
+        authors: usize,
+    ) -> ChangesetId {
+        let i = rng.below(1 << 30);
+        let mut extra = BTreeMap::new();
+        if rng.below(3) == 0 {
+            extra.insert(
+                EXTRA_AGENT_MODEL.to_string(),
+                format!("model-{}", rng.zipf(6)),
+            );
+            extra.insert(
+                EXTRA_AGENT_SESSION.to_string(),
+                format!("s{}", rng.below(60)),
+            );
+        }
+        if rng.below(40) == 0 {
+            extra.insert("ci.flaky".to_string(), "yes".to_string());
+        }
+        let a = rng.zipf(authors);
+        r.create_changeset(Changeset {
+            parents,
+            author: format!("Dev{a} Name <dev{a}@example.com>"),
+            timestamp: i as i64,
+            message: format!("c{i}"),
+            changes: BTreeMap::new(),
+            extra,
+        })
+        .await
+        .unwrap()
+    }
+
+    /// Release cycles like Linux's, small: each cycle mainline merges
+    /// branches based on the last release, a recent changeset or an old
+    /// release, with topics and merges of mainline inside them, and
+    /// `for-next` branches forked from an older release merge the new one
+    /// back, bringing in whole cycles with their merges, before mainline
+    /// merges them. Returns every id (creation order), the back-merges and
+    /// the head.
+    async fn release_dag(
+        r: &Repo,
+        rng: &mut Lcg,
+        cycles: usize,
+        branches: usize,
+        authors: usize,
+    ) -> (Vec<ChangesetId>, Vec<ChangesetId>, ChangesetId) {
+        let mut ids = Vec::new();
+        let mut history = Vec::new();
+        let mut main = commit(r, rng, vec![], authors).await;
+        ids.push(main);
+        history.push(main);
+        let mut tags = vec![0usize];
+        let (mut next, mut done, mut back) = (Vec::new(), Vec::new(), Vec::new());
+        for _ in 0..cycles {
+            let recent = tags[tags.len().saturating_sub(2)];
+            let mut tips = std::mem::take(&mut done);
+            for _ in 0..branches {
+                let at = match rng.below(10) {
+                    0..=2 => tags[tags.len() - 1 - rng.below(tags.len())],
+                    3..=5 => recent + rng.below(history.len() - recent),
+                    _ => *tags.last().unwrap(),
+                };
+                let mut tip = history[at];
+                for _ in 0..1 + rng.below(6) {
+                    tip = commit(r, rng, vec![tip], authors).await;
+                    ids.push(tip);
+                    match rng.below(10) {
+                        0 => {
+                            let mut topic = tip;
+                            for _ in 0..1 + rng.below(3) {
+                                topic = commit(r, rng, vec![topic], authors).await;
+                                ids.push(topic);
+                            }
+                            tip = commit(r, rng, vec![tip, topic], authors).await;
+                            ids.push(tip);
+                        }
+                        1 if at + 1 < history.len() => {
+                            let rc = history[at + 1 + rng.below(history.len() - at - 1)];
+                            tip = commit(r, rng, vec![tip, rc], authors).await;
+                            ids.push(tip);
+                        }
+                        _ => {}
+                    }
+                }
+                tips.push(tip);
+            }
+            for tip in tips {
+                if rng.below(2) == 0 {
+                    main = commit(r, rng, vec![main], authors).await;
+                    ids.push(main);
+                    history.push(main);
+                }
+                main = commit(r, rng, vec![main, tip], authors).await;
+                ids.push(main);
+                history.push(main);
+            }
+            tags.push(history.len() - 1);
+            for tip in std::mem::take(&mut next) {
+                let m = commit(r, rng, vec![tip, main], authors).await;
+                ids.push(m);
+                back.push(m);
+                done.push(m);
+            }
+            for i in 0..2 {
+                let mut tip = history[tags[tags.len().saturating_sub(2 + rng.below(3))]];
+                for _ in 0..i * rng.below(3) {
+                    tip = commit(r, rng, vec![tip], authors).await;
+                    ids.push(tip);
+                }
+                next.push(tip);
+            }
+        }
+        let mut parents = vec![main];
+        parents.extend(done);
+        let head = commit(r, rng, parents, authors).await;
+        ids.push(head);
+        (ids, back, head)
+    }
+
     fn filters(authors: usize) -> Vec<LogFilter> {
         let author = |s: String| LogFilter {
             author: Some(s),
@@ -683,6 +805,159 @@ mod tests {
                             );
                         }
                     }
+                }
+            }
+        }
+    }
+
+    /// Branches that merge whole release cycles back (each bringing in many
+    /// changesets and merges), also with a merge's side walk giving up after
+    /// a few changesets: answers stay the scan's.
+    #[tokio::test]
+    async fn indexed_log_equals_the_scan_on_release_histories() {
+        let seeds: u64 = std::env::var("LEEP_FILTER_SEEDS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(4);
+        for seed in 1..=seeds {
+            for budget in [0, 1, 7, 60] {
+                let mut rng = Lcg(seed);
+                let r = repo();
+                r.log_filter.set_side_budget(budget);
+                let authors = 5 + rng.below(30);
+                let (ids, back, head) = release_dag(&r, &mut rng, 5, 6, authors).await;
+                let mut tips = vec![head];
+                tips.extend(back.iter().step_by(3));
+                tips.push(ids[rng.below(ids.len())]);
+                for &tip in &tips {
+                    for filter in filters(authors) {
+                        for limit in [1, 10, usize::MAX] {
+                            let want = r.log_scan(tip, None, limit, &filter).await.unwrap();
+                            let got = r.log_by_filter_with(tip, limit, &filter, 0).await.unwrap();
+                            assert_eq!(
+                                got, want,
+                                "seed {seed}, budget {budget}, tip {tip}, limit {limit}, {filter:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Back-merges of whole release cycles, each bringing in a few thousand
+    /// changesets and hundreds of merges, with and without the walk giving
+    /// up part way.
+    #[tokio::test]
+    async fn large_back_merges_answer_as_the_scan() {
+        for budget in [0, 400] {
+            let mut rng = Lcg(77);
+            let r = repo();
+            r.log_filter.set_side_budget(budget);
+            let (ids, back, head) = release_dag(&r, &mut rng, 6, 80, 40).await;
+            assert!(ids.len() > 3000, "{}", ids.len());
+            for &tip in [head].iter().chain(back.iter().rev().take(2)) {
+                for filter in filters(40) {
+                    for limit in [10, usize::MAX] {
+                        let want = r.log_scan(tip, None, limit, &filter).await.unwrap();
+                        let got = r.log_by_filter_with(tip, limit, &filter, 0).await.unwrap();
+                        assert_eq!(got, want, "budget {budget}, tip {tip}, {filter:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Every merge's row against sets of ancestors: level 0 holds exactly the
+    /// values of what its other parents bring in, and each stop is the first
+    /// changeset on that parent's first-parent chain the first parent
+    /// reaches. Past a small budget, level 0 holds at least those values and
+    /// each stop is on the chain and reached, or absent.
+    #[tokio::test]
+    async fn merge_rows_hold_what_the_sides_bring_in() {
+        use crate::derived::own_fingerprints;
+        for seed in 1..=6u64 {
+            for budget in [0, 3, 25] {
+                let mut rng = Lcg(seed);
+                let r = repo();
+                r.log_filter.set_side_budget(budget);
+                let ids = if seed % 2 == 0 {
+                    random_dag(&r, &mut rng, 300, 12).await
+                } else {
+                    release_dag(&r, &mut rng, 4, 5, 12).await.0
+                };
+                let mut once = HashSet::new();
+                let ids: Vec<ChangesetId> = ids.into_iter().filter(|id| once.insert(*id)).collect();
+                let pos: HashMap<ChangesetId, usize> =
+                    ids.iter().enumerate().map(|(i, id)| (*id, i)).collect();
+                let mut css = Vec::new();
+                for &id in &ids {
+                    css.push(r.get_changeset(id).await.unwrap());
+                }
+                // Creation order is parents first.
+                let mut anc: Vec<HashSet<usize>> = Vec::new();
+                for (i, cs) in css.iter().enumerate() {
+                    let mut a = HashSet::from([i]);
+                    for p in &cs.parents {
+                        a.extend(anc[pos[p]].iter().copied());
+                    }
+                    anc.push(a);
+                }
+                let mut merges = 0;
+                let mut gave_up = 0;
+                for (i, cs) in css.iter().enumerate() {
+                    if cs.parents.len() < 2 {
+                        continue;
+                    }
+                    merges += 1;
+                    let row = r.filter_row(ids[i]).await.unwrap();
+                    let first = pos[&cs.parents[0]];
+                    let mut fps = own_fingerprints(cs);
+                    let mut exact_stops = Vec::new();
+                    for side in &cs.parents[1..] {
+                        for &k in &anc[pos[side]] {
+                            if !anc[first].contains(&k) {
+                                fps.extend(own_fingerprints(&css[k]));
+                            }
+                        }
+                        let mut x = pos[side];
+                        exact_stops.push(loop {
+                            if anc[first].contains(&x) {
+                                break Some(ids[x]);
+                            }
+                            match css[x].parents.first() {
+                                Some(p) => x = pos[p],
+                                None => break None,
+                            }
+                        });
+                    }
+                    let exact = Level::of(fps);
+                    let stops: Vec<Option<ChangesetId>> =
+                        row.stops.iter().map(|s| s.map(|s| s.1)).collect();
+                    if row.levels[0] == exact && stops == exact_stops {
+                        continue;
+                    }
+                    assert!(budget > 0, "seed {seed}, merge {}", ids[i]);
+                    gave_up += 1;
+                    for class in [CLASS_AUTHOR, CLASS_KEY, CLASS_VALUE] {
+                        if let Some(have) = row.levels[0].class(class) {
+                            let want = exact.class(class).unwrap();
+                            assert!(want.iter().all(|f| have.binary_search(f).is_ok()));
+                        }
+                    }
+                    for (stop, side) in row.stops.iter().zip(&cs.parents[1..]) {
+                        let Some((g, s)) = *stop else { continue };
+                        assert_eq!(g, r.generation(s).await.unwrap());
+                        assert!(anc[first].contains(&pos[&s]), "seed {seed}");
+                        let mut x = pos[side];
+                        while ids[x] != s {
+                            x = pos[css[x].parents.first().expect("stop on the chain")];
+                        }
+                    }
+                }
+                assert!(merges > 20, "{merges}");
+                if budget == 3 {
+                    assert!(gave_up > 0);
                 }
             }
         }

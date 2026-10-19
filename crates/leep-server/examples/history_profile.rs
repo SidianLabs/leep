@@ -21,6 +21,15 @@
 //! writes every row of both kinds afterwards, sorted, as `kind key
 //! blake3(value)` lines, to compare two builds' rows.
 //!
+//! `--releases C` instead builds C release cycles shaped like Linux's (see
+//! `leep-derive/benches/support/release_history.rs`): subsystem branches
+//! with topic merges, and `for-next` branches merging a new release back,
+//! each such back-merge bringing in a cycle or two (`--next-back K`, default
+//! 2), and `--old-percent`, `--old-back`, `--direct` and `--branches` set the
+//! other fields of its `Spec`. With `--log-filter`, `--time-back-merges` then derives each
+//! back-merge's parents and times the back-merge alone, oldest first
+//! (`--cold`: on a fresh `Repo`, with empty caches).
+//!
 //! `--breakdown` then prints what the index's bytes are (ADR 0045): bytes and
 //! rows per changeset, merges against the rest, packs of several parts, nodes
 //! by kind and the share of id tables. `--breakdown-v3` does the same for a
@@ -46,6 +55,9 @@ use leep_derive::Repo;
 
 #[path = "../../leep-derive/benches/support/wide_history.rs"]
 mod wide_history;
+
+#[path = "../../leep-derive/benches/support/release_history.rs"]
+mod release_history;
 
 #[path = "support/history_breakdown.rs"]
 mod history_breakdown;
@@ -278,7 +290,7 @@ fn status_kib(field: &str) -> u64 {
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let usage =
-        "usage: history_profile <meta url> <blob url> <rev> [--reset] [--synth N [--small] [--old-base BACK]] [--last] [--jobs N] [--log-filter] [--dump FILE] [--breakdown] [--breakdown-v3]";
+        "usage: history_profile <meta url> <blob url> <rev> [--reset] [--synth N [--small] [--old-base BACK]] [--releases C [--next-back K] [--time-back-merges [--cold]]] [--last] [--jobs N] [--log-filter] [--dump FILE] [--breakdown] [--breakdown-v3]";
     let meta_url = args.first().expect(usage);
     let blob_url = args.get(1).expect(usage);
     let rev = args.get(2).expect(usage);
@@ -290,6 +302,34 @@ async fn main() {
     let tally = Arc::new(Tally::default());
     let raw_blobs = leep_store::open_blob_store(blob_url).unwrap();
     let raw_meta = leep_meta::open_meta_store(meta_url).await.unwrap();
+    let mut back_merges = Vec::new();
+    if let Some(c) = flag("--releases") {
+        let mut spec = release_history::Spec::linux_like(c.parse().expect(usage));
+        for (name, field) in [
+            ("--next-back", &mut spec.next_back),
+            ("--old-percent", &mut spec.old_percent),
+            ("--old-back", &mut spec.old_back),
+            ("--direct", &mut spec.direct),
+            ("--branches", &mut spec.branches),
+        ] {
+            if let Some(v) = flag(name) {
+                *field = v.parse().expect(usage);
+            }
+        }
+        let t = Instant::now();
+        let builder = Repo::new(raw_blobs.clone(), raw_meta.clone());
+        let built = release_history::build(&builder, &spec).await;
+        let old = raw_meta.get_ref(rev).await.unwrap();
+        assert!(raw_meta.cas_ref(rev, old, Some(built.head)).await.unwrap());
+        println!(
+            "built {spec:?}: {} changesets, {} back-merges, in {:.1} s, head {}",
+            built.changesets,
+            built.back_merges.len(),
+            t.elapsed().as_secs_f64(),
+            built.head
+        );
+        back_merges = built.back_merges;
+    }
     if let Some(n) = flag("--synth") {
         let n: usize = n.parse().expect(usage);
         let spec = if args.iter().any(|a| a == "--small") {
@@ -360,6 +400,30 @@ async fn main() {
                 cs.parents.len(),
                 t.elapsed().as_secs_f64(),
                 (t - started).as_secs_f64()
+            );
+        }
+    }
+    if log_filter && args.iter().any(|a| a == "--time-back-merges") {
+        for (i, &m) in back_merges.iter().enumerate() {
+            let cs = repo.get_changeset(m).await.unwrap();
+            let t = Instant::now();
+            for &p in &cs.parents {
+                derived::derive::<LogFilterIndex>(&repo, p).await.unwrap();
+            }
+            let parents = t.elapsed();
+            // `--cold`: with empty caches, as in a process that starts there.
+            let on = if args.iter().any(|a| a == "--cold") {
+                Repo::new(repo.blobs().clone(), repo.meta().clone())
+                    .with_derive_jobs(repo.derive_jobs())
+            } else {
+                repo.clone()
+            };
+            let t = Instant::now();
+            derived::derive::<LogFilterIndex>(&on, m).await.unwrap();
+            println!(
+                "back-merge {i} ({m}): {:.3} s alone, after {:.1} s for its parents",
+                t.elapsed().as_secs_f64(),
+                parents.as_secs_f64()
             );
         }
     }

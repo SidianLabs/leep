@@ -3,9 +3,9 @@
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
 
-use leep_core::{ChangesetId, Result};
+use leep_core::{Changeset, ChangesetId, Result};
 
-use crate::derived::{self, LastMerge, SkipEntry};
+use crate::derived::{self, DerivedKind, LastMerge, SkipEntry};
 use crate::prefetch::{ReadAhead, MAX_BATCH};
 use crate::repo::{ByKey, SkiplistCache};
 use crate::Repo;
@@ -206,13 +206,47 @@ impl Repo {
         Ok(list)
     }
 
+    /// Read the stored skiplists of `ids` in one round trip into the
+    /// enclosing derivation's [`SKIPLIST_READS`], for
+    /// [`Repo::skiplist_noting_generations`]. Without one, or for rows a
+    /// batch misses, nothing is kept and those are read singly as before.
+    pub(crate) async fn prefetch_skiplists(&self, ids: &[ChangesetId]) {
+        let Some(reads) = SKIPLIST_READS.try_with(|c| c.clone()).ok().flatten() else {
+            return;
+        };
+        let missing: Vec<ChangesetId> = ids
+            .iter()
+            .copied()
+            .filter(|id| reads.get(id).is_none() && self.skiplists.get(id).is_none())
+            .collect();
+        if missing.is_empty() {
+            return;
+        }
+        let keys: Vec<leep_core::Hash> = missing.iter().map(|id| id.0).collect();
+        let Ok(rows) = self
+            .meta()
+            .get_derived_many(derived::Skiplist::NAME, &keys)
+            .await
+        else {
+            return;
+        };
+        if rows.len() != keys.len() {
+            return;
+        }
+        for (id, row) in missing.into_iter().zip(rows) {
+            if let Some(list) = row.and_then(|b| derived::Skiplist::decode(&b).ok()) {
+                reads.insert(id, list.into());
+            }
+        }
+    }
+
     /// Deepest changeset on both first-parent chains, or `None` if they share
     /// no root or finding it takes more than `max_steps` skiplist reads. Jumps the chain with the higher generation down to the other's
     /// generation via the skiplist; equal generations step one at a time, so
     /// cost is logarithmic in history plus the length of genuinely parallel
     /// stretches. Those are read one round trip per step, so long ones are
     /// left to the batched walk.
-    async fn first_parent_lca(
+    pub(crate) async fn first_parent_lca(
         &self,
         a: ChangesetId,
         b: ChangesetId,
@@ -390,21 +424,48 @@ impl Ancestors {
 /// Parents and generations for a newest-first walk: from `Repo`'s ancestry
 /// cache if seen before, else read ahead in batches (see [`ReadAhead`]) and
 /// kept in that cache. What a batch misses is read singly, as before.
-struct Reader {
+pub(crate) struct Reader {
     ahead: ReadAhead,
+    /// Changesets not worth reading ahead: the walk has all it needs of them.
+    skip: Option<fn(&Repo, ChangesetId) -> bool>,
 }
 
 impl Default for Reader {
     fn default() -> Self {
         Reader {
             ahead: ReadAhead::new(false),
+            skip: None,
         }
     }
 }
 
 impl Reader {
+    /// A reader that does not read ahead changesets for which `skip` holds.
+    pub(crate) fn skipping(skip: fn(&Repo, ChangesetId) -> bool) -> Self {
+        Reader {
+            skip: Some(skip),
+            ..Reader::default()
+        }
+    }
+
+    async fn ensure(&mut self, repo: &Repo, ids: &[ChangesetId], at: u64) {
+        match self.skip {
+            Some(skip) => {
+                self.ahead
+                    .ensure_skipping(repo, ids, at, MAX_BATCH, |id| skip(repo, id))
+                    .await
+            }
+            None => self.ahead.ensure(repo, ids, at, MAX_BATCH).await,
+        }
+    }
+
+    /// A changeset already read ahead, without reading it.
+    pub(crate) fn take_read(&mut self, id: ChangesetId) -> Option<Changeset> {
+        self.ahead.take(id).0
+    }
+
     /// `at`: the generation the walk has reached, which bounds read-ahead.
-    async fn parents(
+    pub(crate) async fn parents(
         &mut self,
         repo: &Repo,
         id: ChangesetId,
@@ -413,7 +474,7 @@ impl Reader {
         if let Some(p) = repo.cached_parents(id) {
             return Ok(p);
         }
-        self.ahead.ensure(repo, &[id], at, MAX_BATCH).await;
+        self.ensure(repo, &[id], at).await;
         match self.ahead.take(id).0 {
             Some(cs) => {
                 let p: Arc<[ChangesetId]> = cs.parents.into();
@@ -424,7 +485,29 @@ impl Reader {
         }
     }
 
-    async fn generations(&mut self, repo: &Repo, ids: &[ChangesetId], at: u64) -> Result<Vec<u64>> {
+    /// The changeset `id` itself, for a walk that needs more than its
+    /// parents; read ahead like [`Reader::parents`], whose cache it fills.
+    pub(crate) async fn changeset(
+        &mut self,
+        repo: &Repo,
+        id: ChangesetId,
+        at: u64,
+    ) -> Result<Changeset> {
+        self.ensure(repo, &[id], at).await;
+        let cs = match self.ahead.take(id).0 {
+            Some(cs) => cs,
+            None => repo.get_changeset(id).await?,
+        };
+        repo.remember_parents(id, cs.parents.as_slice().into());
+        Ok(cs)
+    }
+
+    pub(crate) async fn generations(
+        &mut self,
+        repo: &Repo,
+        ids: &[ChangesetId],
+        at: u64,
+    ) -> Result<Vec<u64>> {
         let cached: Vec<Option<u64>> = ids.iter().map(|&id| repo.cached_generation(id)).collect();
         if cached.iter().all(Option::is_some) {
             return Ok(cached.into_iter().flatten().collect());
@@ -435,7 +518,7 @@ impl Reader {
             .filter(|(_, g)| g.is_none())
             .map(|(id, _)| *id)
             .collect();
-        self.ahead.ensure(repo, &missing, at, MAX_BATCH).await;
+        self.ensure(repo, &missing, at).await;
         let mut out = Vec::with_capacity(ids.len());
         for (&id, g) in ids.iter().zip(cached) {
             let g = match g.or_else(|| repo.cached_generation(id)) {

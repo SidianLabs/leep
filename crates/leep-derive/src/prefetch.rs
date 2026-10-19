@@ -77,6 +77,19 @@ impl ReadAhead {
     /// unvisited ancestor at every generation in between. Guesses that low
     /// wait for a later batch.
     pub(crate) async fn ensure(&mut self, repo: &Repo, ids: &[ChangesetId], at: u64, want: usize) {
+        self.ensure_skipping(repo, ids, at, want, |_| false).await
+    }
+
+    /// [`ReadAhead::ensure`], leaving out guesses for which `skip` says the
+    /// walk already has what it needs.
+    pub(crate) async fn ensure_skipping(
+        &mut self,
+        repo: &Repo,
+        ids: &[ChangesetId],
+        at: u64,
+        want: usize,
+        skip: impl Fn(ChangesetId) -> bool,
+    ) {
         let (mut batch, mut gens) = (Vec::new(), Vec::new());
         for &id in ids {
             if let Some(g) = self.ask(repo, id) {
@@ -95,6 +108,9 @@ impl ReadAhead {
                 _ => break,
             }
             let (_, id) = self.guesses.pop().expect("peeked");
+            if skip(id) {
+                continue;
+            }
             if let Some(g) = self.ask(repo, id) {
                 batch.push(id);
                 gens.push(g);

@@ -13,13 +13,12 @@
 //! tree, a few levels cover any first-parent stretch, and the walk in
 //! `filter_log` uses them to skip.
 //!
-//! A merge's level 0 holds exactly what its other parents bring in: their
-//! first-parent chains down to the first changeset the first parent reaches,
-//! bounded by `merge_base` and covered by levels where no merge intervenes,
-//! and recursively what merges on those chains brought (see
-//! [`side_values`]).
+//! A merge's level 0 holds exactly what its other parents bring in, found
+//! by one walk of both parents' histories (see [`merge_side`]), or, past
+//! [`SIDE_BUDGET`] changesets, a superset from the sides' own levels.
 
-use std::collections::HashSet;
+use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -28,8 +27,8 @@ use leep_core::changeset::{EXTRA_AGENT_MODEL, EXTRA_AGENT_SESSION};
 use leep_core::{Changeset, ChangesetId, DerivedRow, Error, Hash, Result};
 
 use super::{derive, DerivedKind, SkipEntry};
-use crate::ancestry::Ancestors;
-use crate::repo::SizedCache;
+use crate::ancestry::Reader;
+use crate::repo::{ByKey, SizedCache};
 use crate::Repo;
 
 /// Per-changeset kind; see the module docs.
@@ -355,6 +354,10 @@ const NAME_CACHE_BYTES: usize = 16 << 20;
 /// Bytes of skiplists kept for filtered logs.
 const SKIP_CACHE_BYTES: usize = 32 << 20;
 
+/// Bytes of [`own_fingerprints`] kept, counting about 80 bytes of overhead
+/// per changeset: a few hundred thousand changesets.
+const FPS_CACHE_BYTES: usize = 48 << 20;
+
 /// Author fingerprints whose name row this process has staged, so each
 /// author's row is written once per process rather than once per changeset.
 const WRITTEN_NAMES: usize = 1 << 20;
@@ -368,7 +371,28 @@ pub(crate) struct LogFilterCaches {
     /// Skiplists read by filtered logs, which `Repo`'s skiplist cache does
     /// not keep.
     skips: SizedCache<Arc<[SkipEntry]>, SKIP_CACHE_BYTES>,
+    /// Fingerprints of changesets' own values, which merge walks read for
+    /// every changeset a side brings in, often the same ones merge after
+    /// merge.
+    fps: SizedCache<Vec<u64>, FPS_CACHE_BYTES>,
     written: Mutex<HashSet<u64>>,
+    /// [`SIDE_BUDGET`] unless a test lowers it (0: the default).
+    side_budget: AtomicUsize,
+}
+
+impl LogFilterCaches {
+    fn side_budget(&self) -> usize {
+        match self.side_budget.load(Ordering::Relaxed) {
+            0 => SIDE_BUDGET,
+            n => n,
+        }
+    }
+
+    /// Give up on merge sides past `n` changesets, to test what happens.
+    #[cfg(test)]
+    pub(crate) fn set_side_budget(&self, n: usize) {
+        self.side_budget.store(n, Ordering::Relaxed);
+    }
 }
 
 impl Repo {
@@ -383,6 +407,19 @@ impl Repo {
         let weight = row.weight();
         self.log_filter.rows.insert(id.0, row.clone(), weight / 2);
         Ok(row)
+    }
+
+    /// Fingerprints of `cs`'s own values, kept for later merge walks.
+    fn own_fps(&self, id: ChangesetId, cs: &Changeset) -> Arc<Vec<u64>> {
+        let fps = Arc::new(own_fingerprints(cs));
+        self.log_filter
+            .fps
+            .insert(id.0, fps.clone(), 24 + 8 * fps.len());
+        fps
+    }
+
+    fn cached_own_fps(&self, id: ChangesetId) -> Option<Arc<Vec<u64>>> {
+        self.log_filter.fps.get(&id.0)
     }
 
     /// A row this process has decoded, without a read.
@@ -454,161 +491,247 @@ impl Repo {
     }
 }
 
-/// Add to `acc` the values of exactly the changesets reachable from `side`
-/// but not from `first`. Returns where `side`'s own first-parent chain
-/// meets `first`'s history (see [`FilterRow::stops`]).
+/// Most changesets one merge's side walk ([`merge_side`]) visits, counting
+/// both those its other parents bring in and the first parent's ancestors
+/// walked to tell them apart, so one merge never holds derivation up for
+/// long. Past it, level 0 is a superset found from the sides' levels (see
+/// [`given_up`]). Rows depend on it: changing it changes the rows of merges
+/// between the two values (`verify` would report them), never answers.
+pub const SIDE_BUDGET: usize = 200_000;
+
+const FIRST: u8 = 1;
+const SIDE: u8 = 2;
+
+/// What a merge's other parents bring in: the values of exactly the
+/// changesets reachable from one of `sides` but not from `first`, and per
+/// side its stop (see [`FilterRow::stops`]).
 ///
-/// Walks `side`'s first-parent chain down. With `m = merge_base(first, w)`,
-/// `w` being where the walk started, every chain changeset ranking above `m`
-/// (by generation, then id) is outside `first`'s ancestors: one inside would
-/// be a common ancestor ranking above the best one. The walk stops at `m`,
-/// which `first` reaches; if it passes `m`'s rank without meeting it (`m` is
-/// off the chain), it starts again from there with a new merge base.
-/// Unrelated histories walk to the root.
+/// One walk over both histories, newest first by (generation, id), marking
+/// each changeset with the sides that reach it: `first`, or only `sides`.
+/// A changeset pops only after every walked changeset that reaches it, so
+/// its mark is final then: marked by `sides` alone, it is brought in. The
+/// walk ends when no changeset marked by `sides` alone is left, since every
+/// one not yet reached is then behind a changeset `first` reaches. That is
+/// `git rev-list first..side`, and it costs what the side brings in plus the
+/// first parent's history down to the oldest changeset brought in, once per
+/// merge however many merges the side holds. A side's stop is where its
+/// first-parent chain first meets a changeset marked by `first`.
 ///
-/// A stretch of the chain without merges is covered by one level. A merge
-/// on the chain adds its own values and queues its other parents, rather
-/// than its level 0: that covers what it merged relative to its own first
-/// parent, which on a branch that merges mainline back is mostly history
-/// `first` already reaches, and would make every level above say "maybe".
-pub(crate) async fn side_values(
+/// Past `budget` changesets the walk gives up (see [`given_up`]).
+pub(crate) async fn merge_side(
     repo: &Repo,
     first: ChangesetId,
-    side: ChangesetId,
-    acc: &mut Level,
-) -> Result<Option<(u64, ChangesetId)>> {
-    let mut walk = SideWalk {
-        first,
-        first_generation: repo.generation(first).await?,
-        ancestors: None,
-        seen: HashSet::new(),
-        own: Vec::new(),
-        stack: Vec::new(),
-    };
-    let (stop, base) = walk.chain(repo, side, None, acc).await?;
-    // Everything the walk meets is an ancestor of `side`, so the first merge
-    // base bounds the other chains too until they pass its rank.
-    while let Some(w) = walk.stack.pop() {
-        walk.chain(repo, w, Some(base), acc).await?;
+    sides: &[ChangesetId],
+    budget: usize,
+) -> Result<(Level, Vec<Option<(u64, ChangesetId)>>)> {
+    let mut walk = Paint::default();
+    let mut ids = vec![first];
+    ids.extend_from_slice(sides);
+    let gens = walk.reader.generations(repo, &ids, u64::MAX).await?;
+    walk.mark(first, gens[0], FIRST);
+    for (&s, &g) in sides.iter().zip(&gens[1..]) {
+        walk.mark(s, g, SIDE);
     }
-    *acc = acc.union(&Level::of(std::mem::take(&mut walk.own)));
-    Ok(stop)
+    // Per side: the changeset on its first-parent chain still to be told
+    // apart, or its stop.
+    let mut stops: Vec<Result<Option<(u64, ChangesetId)>, ChangesetId>> =
+        sides.iter().map(|&s| Err(s)).collect();
+    let mut fps = Vec::new();
+    let mut visited = 0usize;
+    while walk.side_only > 0 {
+        if visited == budget {
+            return given_up(repo, first, sides, stops, &walk).await;
+        }
+        visited += 1;
+        let (g, x) = walk.heap.pop().expect("marked changesets are queued");
+        let (m, _) = walk.marks.remove(&x).expect("queued changesets are marked");
+        if m & FIRST != 0 {
+            for stop in stops.iter_mut() {
+                if *stop == Err(x) {
+                    *stop = Ok(Some((g, x)));
+                }
+            }
+            let parents = match repo.cached_parents(x) {
+                Some(p) => {
+                    // Read ahead anyway: keep its values for later walks.
+                    if let Some(cs) = walk.reader.take_read(x) {
+                        repo.own_fps(x, &cs);
+                    }
+                    p
+                }
+                None => {
+                    let cs = walk.reader.changeset(repo, x, g).await?;
+                    repo.own_fps(x, &cs);
+                    cs.parents.into()
+                }
+            };
+            walk.queue(repo, &parents, g, FIRST).await?;
+        } else {
+            walk.side_only -= 1;
+            let (parents, own) = match (repo.cached_parents(x), repo.cached_own_fps(x)) {
+                (Some(p), Some(own)) => (p, own),
+                _ => {
+                    let cs = walk.reader.changeset(repo, x, g).await?;
+                    let own = repo.own_fps(x, &cs);
+                    (cs.parents.into(), own)
+                }
+            };
+            fps.extend_from_slice(&own);
+            if fps.len() > 1 << 20 {
+                fps.sort_unstable();
+                fps.dedup();
+            }
+            for stop in stops.iter_mut() {
+                if *stop == Err(x) {
+                    *stop = match parents.first() {
+                        Some(&p) => Err(p),
+                        None => Ok(None),
+                    };
+                }
+            }
+            walk.queue(repo, &parents, g, SIDE).await?;
+        }
+    }
+    // Every changeset still queued is marked by `first`, a chain's next
+    // changeset among them.
+    let stops = stops
+        .into_iter()
+        .map(|stop| match stop {
+            Ok(stop) => stop,
+            Err(x) => walk.marks.get(&x).map(|&(_, g)| (g, x)),
+        })
+        .collect();
+    Ok((Level::of(fps), stops))
 }
 
-struct SideWalk {
+/// [`merge_side`] past its budget: each side's stop as far as the walk got,
+/// else the first changeset both first-parent chains share, and the levels
+/// down each side's chain to its stop. Those cover every changeset the side
+/// reaches but its stop does not, a superset of what it brings in since
+/// `first` reaches the stop.
+async fn given_up(
+    repo: &Repo,
     first: ChangesetId,
-    first_generation: u64,
-    ancestors: Option<Ancestors>,
-    seen: HashSet<ChangesetId>,
-    /// Own values of merges met on the way.
-    own: Vec<u64>,
-    /// Other parents of those merges, still to walk.
-    stack: Vec<ChangesetId>,
-}
-
-impl SideWalk {
-    /// Walk `w`'s first-parent chain down to the first changeset `first`
-    /// reaches, which it returns with its generation (`None` if the chain
-    /// reaches a root first, or meets a changeset walked before), and the
-    /// first merge base it measured. `base`: a merge base of `first` and a
-    /// descendant of `w` to start from instead of measuring.
-    async fn chain(
-        &mut self,
-        repo: &Repo,
-        w: ChangesetId,
-        mut base: Option<Option<(u64, ChangesetId)>>,
-        acc: &mut Level,
-    ) -> Result<(Option<(u64, ChangesetId)>, Option<(u64, ChangesetId)>)> {
-        let mut x = w;
-        let mut gx = repo.generation(x).await?;
-        let mut first_base = None;
-        'measure: loop {
-            let m_rank = match base.take() {
-                Some(b) => b,
-                None => match repo.merge_base(self.first, x).await? {
-                    Some(m) => Some((repo.generation(m).await?, m)),
+    sides: &[ChangesetId],
+    stops: Vec<Result<Option<(u64, ChangesetId)>, ChangesetId>>,
+    walk: &Paint,
+) -> Result<(Level, Vec<Option<(u64, ChangesetId)>>)> {
+    let mut level = Level::default();
+    let mut out = Vec::with_capacity(stops.len());
+    for (stop, &side) in stops.into_iter().zip(sides) {
+        let stop = match stop {
+            Ok(stop) => stop,
+            Err(x) => match walk.marks.get(&x) {
+                Some(&(m, g)) if m & FIRST != 0 => Some((g, x)),
+                _ => match repo.first_parent_lca(first, side, 64).await? {
+                    Some(c) => Some((repo.generation(c).await?, c)),
                     None => None,
                 },
-            };
-            let m = m_rank.map(|r| r.1);
-            let measured = *first_base.get_or_insert(m_rank);
-            // Below the merge base's rank, near `first`, whether `first`
-            // reaches a changeset is asked of one walk of `first`'s
-            // ancestors instead of a merge base per question.
-            let mut oracle = false;
-            loop {
-                if Some(x) == m {
-                    return Ok((Some((gx, x)), measured));
+            },
+        };
+        level = level.union(&chain_levels(repo, side, stop.map(|s| s.1)).await?);
+        out.push(stop);
+    }
+    Ok((level, out))
+}
+
+/// The union of levels covering `from`'s first-parent chain down to `to`
+/// (exclusive; `None`: to the root, inclusive): every changeset `from`
+/// reaches and `to` does not. `to` must be on the chain.
+async fn chain_levels(repo: &Repo, from: ChangesetId, to: Option<ChangesetId>) -> Result<Level> {
+    let floor = match to {
+        Some(c) => repo.filter_row(c).await?.depth,
+        None => 0,
+    };
+    let mut acc = Level::default();
+    let mut y = from;
+    while Some(y) != to {
+        let row = repo.filter_row(y).await?;
+        if row.depth == 0 {
+            acc = acc.union(&row.levels[0]);
+            break;
+        }
+        let sk = repo.skiplist_noting_generations(y).await?;
+        let span = row
+            .depth
+            .checked_sub(floor)
+            .filter(|&s| s > 0)
+            .ok_or_else(|| {
+                Error::Storage(format!("{to:?} is not on the first-parent chain of {from}"))
+            })?;
+        let j = (0..row.levels.len().min(sk.len()))
+            .rev()
+            .find(|&j| 1u64 << j <= span)
+            .ok_or_else(|| Error::Storage(format!("skiplist of {y} is empty")))?;
+        acc = acc.union(&row.levels[j]);
+        y = sk[j].id;
+    }
+    Ok(acc)
+}
+
+struct Paint {
+    reader: Reader,
+    /// Queued changesets: their marks and generations. A changeset is
+    /// queued at most once, since everything that reaches it ranks above it
+    /// and pops first.
+    marks: HashMap<ChangesetId, (u8, u64), ByKey>,
+    heap: BinaryHeap<(u64, ChangesetId)>,
+    /// Queued changesets marked by the sides alone.
+    side_only: usize,
+}
+
+impl Default for Paint {
+    fn default() -> Self {
+        Paint {
+            // What a walk needs of a changeset is its parents, generation
+            // and values, all kept once read.
+            reader: Reader::skipping(|repo, id| {
+                repo.cached_parents(id).is_some()
+                    && repo.cached_generation(id).is_some()
+                    && repo.cached_own_fps(id).is_some()
+            }),
+            marks: HashMap::default(),
+            heap: BinaryHeap::new(),
+            side_only: 0,
+        }
+    }
+}
+
+impl Paint {
+    fn mark(&mut self, id: ChangesetId, generation: u64, m: u8) {
+        match self.marks.get_mut(&id) {
+            Some((old, _)) => {
+                if *old == SIDE && m & FIRST != 0 {
+                    self.side_only -= 1;
                 }
-                if oracle || m_rank.is_some_and(|mr| (gx, x) <= mr) {
-                    match self.reached(repo, x, gx).await? {
-                        Some(true) => return Ok((Some((gx, x)), measured)),
-                        Some(false) => oracle = true,
-                        None => continue 'measure,
-                    }
-                }
-                if !self.seen.insert(x) {
-                    return Ok((None, measured));
-                }
-                let row = repo.filter_row(x).await?;
-                if row.depth == 0 {
-                    *acc = acc.union(&row.levels[0]);
-                    return Ok((None, measured));
-                }
-                let sk = repo.skiplist_noting_generations(x).await?;
-                let merge = row.last_merge;
-                let top = row.levels.len().min(sk.len());
-                let mut stretch = None;
-                for j in (0..top).rev() {
-                    let e = sk[j];
-                    if merge > e.generation {
-                        continue;
-                    }
-                    let outside = if oracle {
-                        // Everything above an unreached changeset on the
-                        // chain is unreached too.
-                        self.reached(repo, e.id, e.generation).await? == Some(false)
-                    } else {
-                        m_rank.is_none_or(|mr| (e.generation, e.id) >= mr)
-                    };
-                    if outside || j == 0 {
-                        stretch = Some(j);
-                        break;
-                    }
-                }
-                match stretch {
-                    Some(j) => {
-                        *acc = acc.union(&row.levels[j]);
-                        (x, gx) = (sk[j].id, sk[j].generation);
-                    }
-                    None => {
-                        // `x` is a merge.
-                        let cs = repo.get_changeset(x).await?;
-                        self.own.extend(own_fingerprints(&cs));
-                        self.stack.extend(cs.parents.iter().skip(1).copied());
-                        (x, gx) = (sk[0].id, sk[0].generation);
-                    }
+                *old |= m;
+            }
+            None => {
+                self.marks.insert(id, (m, generation));
+                self.heap.push((generation, id));
+                if m == SIDE {
+                    self.side_only += 1;
                 }
             }
         }
     }
 
-    /// Whether `first` reaches `x`, from the shared walk of its ancestors;
-    /// `None` when `x` is too far below `first` for that walk to be cheap.
-    async fn reached(&mut self, repo: &Repo, x: ChangesetId, gx: u64) -> Result<Option<bool>> {
-        if self.first_generation.saturating_sub(gx) > ORACLE_SPAN {
-            return Ok(None);
+    async fn queue(&mut self, repo: &Repo, parents: &[ChangesetId], at: u64, m: u8) -> Result<()> {
+        let mut new = Vec::new();
+        for &p in parents {
+            match self.marks.get(&p) {
+                Some(&(_, g)) => self.mark(p, g, m),
+                None if !new.contains(&p) => new.push(p),
+                None => {}
+            }
         }
-        let anc = self
-            .ancestors
-            .get_or_insert_with(|| Ancestors::new(self.first, self.first_generation));
-        Ok(Some(anc.contains(repo, x, gx).await?))
+        let gens = self.reader.generations(repo, &new, at).await?;
+        for (p, g) in new.into_iter().zip(gens) {
+            self.mark(p, g, m);
+        }
+        Ok(())
     }
 }
-
-/// Generations below `first` within which [`SideWalk::reached`] walks
-/// `first`'s ancestors rather than measuring a merge base.
-const ORACLE_SPAN: u64 = 2048;
 
 impl LogFilterIndex {
     /// The row of `id`, and the name rows it introduces.
@@ -644,8 +767,11 @@ impl LogFilterIndex {
             p1.last_merge
         };
         let mut stops = Vec::new();
-        for &side in &cs.parents[1..] {
-            stops.push(side_values(repo, first, side, &mut level0).await?);
+        if cs.parents.len() > 1 {
+            let budget = repo.log_filter.side_budget();
+            let (side, s) = merge_side(repo, first, &cs.parents[1..], budget).await?;
+            level0 = level0.union(&side);
+            stops = s;
         }
         let mut levels = vec![level0];
         let n = level_count(depth);
@@ -715,10 +841,13 @@ impl DerivedKind for LogFilterIndex {
         }
     }
 
-    /// Generations of the window and its parents, and at merges the parents'
-    /// last merges, which `merge_base` reads.
+    /// Generations of the window and its parents, which every merge's walk
+    /// starts from, and the window's skiplists, which name the ancestors
+    /// whose levels the upper levels unite: one batch each instead of a read
+    /// per changeset.
     async fn prepare(repo: &Repo, window: &[(ChangesetId, &Changeset)]) {
-        let mut ids: Vec<ChangesetId> = window.iter().map(|(id, _)| *id).collect();
+        let own: Vec<ChangesetId> = window.iter().map(|(id, _)| *id).collect();
+        let mut ids = own.clone();
         for (id, cs) in window {
             repo.remember_parents(*id, cs.parents.as_slice().into());
             ids.extend(&cs.parents);
@@ -726,9 +855,7 @@ impl DerivedKind for LogFilterIndex {
         ids.sort();
         ids.dedup();
         repo.prefetch_generations(&ids).await;
-        if window.iter().any(|(_, cs)| cs.parents.len() > 1) {
-            let _ = super::LastMerge::derive_window(repo, window).await;
-        }
+        repo.prefetch_skiplists(&own).await;
     }
 }
 

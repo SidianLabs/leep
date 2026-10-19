@@ -189,15 +189,26 @@ Classes: 0 author (`p₁` = the author lower-cased with `str::to_lowercase`),
 A changeset's *depth* is 0 for a root, else its first parent's depth + 1.
 It has `tz(depth) + 1` *levels* (`tz` = trailing zero bits; a root has 1).
 Level 0 holds the fingerprints of the changeset and, at a merge, of what
-each other parent brings; level `j` is level `j - 1` united with level
-`j - 1` of the first-parent ancestor `2^(j-1)` steps up. A class of more
-than 65,536 fingerprints in one level is dropped from it and flagged.
+each other parent brings (the changesets they reach and the first parent
+does not); level `j` is level `j - 1` united with level `j - 1` of the
+first-parent ancestor `2^(j-1)` steps up. A class of more than 65,536
+fingerprints in one level is dropped from it and flagged. A merge whose
+walk (ADR 0051) visits more than 200,000 changesets instead stores, besides
+its own values, the union of the levels down each other parent's
+first-parent chain to that parent's stop (a superset). A merge's *stop* per
+other parent is the first changeset on that parent's first-parent chain
+that the first parent reaches; past the walk's budget, any changeset on that
+chain the first parent reaches, or none.
 
-**`log-filter-v1`** value: LEB128 varint depth, varint level count (must be
-`tz(depth) + 1`), then per level: one byte of overflow flags (bit `c` set:
-class `c` overflowed and has no fingerprints here), a varint count, and the
-fingerprints ascending, as varint deltas, the first relative to zero (a
-zero delta after the first is invalid). No trailing bytes.
+**`log-filter-v1`** value: LEB128 varint depth, varint generation of the
+nearest merge on the first-parent chain (the changeset included; 0 if none),
+varint level count (must be `tz(depth) + 1`), then per level: one byte of
+overflow flags (bit `c` set: class `c` overflowed and has no fingerprints
+here), a varint count, and the fingerprints ascending, as varint deltas, the
+first relative to zero (a zero delta after the first is invalid). Then a
+varint count of stops, one per parent after the first, each a byte 0 (none)
+or 1 followed by the stop's varint generation and 32-byte id. No trailing
+bytes.
 
 ## Path-history index (new derived kinds, no change to `Changeset`)
 

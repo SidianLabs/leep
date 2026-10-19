@@ -36,7 +36,7 @@ pub(crate) use log_filter::LogFilterCaches;
 pub use log_filter::{
     author_fingerprint, class_of, key_fingerprint, level_count, name_key, own_fingerprints,
     value_fingerprint, FilterRow, Level, LogFilterIndex, CLASS_AUTHOR, CLASS_KEY, CLASS_VALUE,
-    INDEXED_VALUES, LEVEL_CAP, NAME_KIND as LOG_FILTER_NAME_KIND,
+    INDEXED_VALUES, LEVEL_CAP, NAME_KIND as LOG_FILTER_NAME_KIND, SIDE_BUDGET,
 };
 pub use root_tree::RootTree;
 pub use skiplist::{SkipEntry, Skiplist};
