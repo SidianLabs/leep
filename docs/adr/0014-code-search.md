@@ -58,9 +58,15 @@ reports `stats.indexed: false`.
 `Repo::search(rev, query)` walks the tree depth first with an explicit stack and
 yields files lazily in path order. A directory is skipped when its filter lacks a
 required trigram; a file is skipped when its row lacks one; the rest are fetched,
-at most 16 at a time with order preserved (`buffered`), and matched. Because the
-walk is lazy and ordered, a search that has enough matches stops reading
-directories as well. Output is ordered by path then line, so it is
+at most 16 at a time with order preserved (`buffered`), and matched on blocking
+threads. Opening a directory reads the filters of all its subdirectories and the
+rows of all its files with one `get_derived_many` each, then the nodes of the
+subdirectories that survive with one `read_trees`; when the walk enters a
+directory it opens that directory's subdirectories ahead of it on their own
+tasks, four at a time per search, and aborts them if it stops early. (Before,
+each filter and each row was its own round trip, one directory at a time, which
+set the pace of a search over a large tree.) Because the walk is lazy and
+ordered, a search that has enough matches stops reading directories as well. Output is ordered by path then line, so it is
 deterministic and identical with or without the index (a property test checks
 this against a brute-force scan). Limits:
 - at most `limit` matches (default 100, capped at 1000); `truncated` is set if

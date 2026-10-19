@@ -34,6 +34,11 @@ use crate::Repo;
 /// Most changesets one batch asks for, bounding both the read-ahead past
 /// the end of a limited walk and the size of one query.
 pub(crate) const MAX_BATCH: usize = 256;
+/// Most batches one read-ahead issues together, for a walk that expects to
+/// visit several batches' worth, so that a long log waits for several round
+/// trips at once and decodes their answers on several threads. A batch is four
+/// queries; two leave half of a 16-connection pool to other requests.
+const MAX_LANES: usize = 2;
 
 enum State {
     /// Named by a fetched changeset, not yet asked for; with its generation
@@ -48,6 +53,8 @@ struct Ahead {
     cs: Option<Changeset>,
     generation: Option<u64>,
     root: Option<Hash>,
+    /// The walk has taken this changeset.
+    taken: bool,
 }
 
 pub(crate) struct ReadAhead {
@@ -55,6 +62,8 @@ pub(crate) struct ReadAhead {
     known: HashMap<ChangesetId, State, crate::repo::ByKey>,
     /// Guesses not yet asked for, newest (best estimate) first.
     guesses: BinaryHeap<(u64, ChangesetId)>,
+    /// Changesets asked for and not yet taken by the walk.
+    waiting: usize,
 }
 
 impl ReadAhead {
@@ -64,6 +73,7 @@ impl ReadAhead {
             roots,
             known: HashMap::default(),
             guesses: BinaryHeap::new(),
+            waiting: 0,
         }
     }
 
@@ -101,22 +111,61 @@ impl ReadAhead {
             return;
         }
         let window = want.clamp(1, MAX_BATCH);
+        let lanes = want.div_ceil(MAX_BATCH).clamp(1, MAX_LANES);
         let floor = at.saturating_sub(u64::try_from(want).unwrap_or(u64::MAX));
-        while batch.len() < window {
-            match self.guesses.peek() {
-                Some(&(g, _)) if g > floor => {}
-                _ => break,
+        let mut batches = vec![(batch, gens)];
+        // Room for the extra batches: what the walk expects to visit, less
+        // what it has been given and not reached. The generation floor alone
+        // admits several times `want` changesets where branches run side by
+        // side.
+        let mut room = 0usize;
+        'fill: loop {
+            let first = batches.len() == 1;
+            let (batch, gens) = batches.last_mut().expect("one batch at least");
+            while batch.len() < window && (first || room > 0) {
+                match self.guesses.peek() {
+                    Some(&(g, _)) if g > floor => {}
+                    _ => break 'fill,
+                }
+                let (_, id) = self.guesses.pop().expect("peeked");
+                if skip(id) {
+                    continue;
+                }
+                if let Some(g) = self.ask(repo, id) {
+                    batch.push(id);
+                    gens.push(g);
+                    room = room.saturating_sub(usize::from(!first));
+                }
             }
-            let (_, id) = self.guesses.pop().expect("peeked");
-            if skip(id) {
-                continue;
+            if first {
+                room = want.saturating_sub(self.waiting);
             }
-            if let Some(g) = self.ask(repo, id) {
-                batch.push(id);
-                gens.push(g);
+            if batches.len() == lanes || room == 0 {
+                break;
+            }
+            batches.push((Vec::new(), Vec::new()));
+        }
+        batches.retain(|(batch, _)| !batch.is_empty());
+        let roots = self.roots;
+        if let [_] = batches[..] {
+            let (batch, gens) = batches.pop().expect("one batch");
+            let read = read_batch(repo.clone(), batch, gens, roots).await;
+            self.apply(read, window);
+            return;
+        }
+        // Each batch on its own task, so that decoding the answers, which
+        // costs about as much as waiting for them, runs on several threads.
+        let tasks: Vec<_> = batches
+            .into_iter()
+            .map(|(batch, gens)| tokio::spawn(read_batch(repo.clone(), batch, gens, roots)))
+            .collect();
+        for task in tasks {
+            // A batch whose task failed only loses its read-ahead, like a
+            // failed read: its items are read singly.
+            if let Ok(read) = task.await {
+                self.apply(read, window * lanes);
             }
         }
-        self.fetch(repo, batch, gens, window).await;
     }
 
     /// Mark `id` asked for, and return the generation a skiplist or the
@@ -129,51 +178,21 @@ impl ReadAhead {
             State::Guessed(g) => *g,
         };
         *state = State::Asked(Ahead::default());
+        self.waiting += 1;
         Some(known.or_else(|| repo.cached_generation(id)))
     }
 
-    async fn fetch(
-        &mut self,
-        repo: &Repo,
-        batch: Vec<ChangesetId>,
-        mut gens: Vec<Option<u64>>,
-        reach: usize,
-    ) {
-        let meta = repo.meta();
-        let keys: Vec<Hash> = batch.iter().map(|id| id.0).collect();
-        let unknown: Vec<usize> = (0..batch.len()).filter(|&i| gens[i].is_none()).collect();
-        let gen_keys: Vec<Hash> = unknown.iter().map(|&i| keys[i]).collect();
-        let want_roots = self.roots;
-        let (css, read, roots, skips) = tokio::join!(
-            meta.get_changesets(&batch),
-            async {
-                if gen_keys.is_empty() {
-                    Ok(Vec::new())
-                } else {
-                    meta.get_derived_many(Generation::NAME, &gen_keys).await
-                }
-            },
-            async {
-                if want_roots {
-                    meta.get_derived_many(RootTree::NAME, &keys).await
-                } else {
-                    Ok(Vec::new())
-                }
-            },
-            meta.get_derived_many(Skiplist::NAME, &keys),
-        );
-        // A failed batch only loses its read-ahead; the walk reads those
-        // items singly, and reports any error then.
-        let n = batch.len();
-        let mut css = slot(css, n).map(|v| v.into_iter());
-        for (&i, v) in unknown
-            .iter()
-            .zip(slot(read, unknown.len()).unwrap_or_default())
-        {
-            gens[i] = v.as_deref().and_then(|b| decode_u64(b).ok());
-        }
-        let roots = slot(roots, n);
-        let skips = slot(skips, n);
+    /// Record what [`read_batch`] got, and queue what it names: the parents
+    /// of each changeset, and its skiplist's ancestors up to `reach` steps.
+    fn apply(&mut self, read: Read, reach: usize) {
+        let Read {
+            batch,
+            gens,
+            css,
+            roots,
+            skips,
+        } = read;
+        let mut css = css.map(|v| v.into_iter());
         for (i, id) in batch.iter().enumerate() {
             let cs = css.as_mut().and_then(|it| it.next()).flatten();
             let generation = gens[i];
@@ -206,6 +225,7 @@ impl ReadAhead {
                     cs,
                     generation,
                     root,
+                    taken: false,
                 };
             }
         }
@@ -242,11 +262,71 @@ impl ReadAhead {
     pub(crate) fn take(&mut self, id: ChangesetId) -> (Option<Changeset>, Option<Hash>) {
         match self.known.get_mut(&id) {
             Some(State::Asked(a)) => {
-                let a = std::mem::take(a);
-                (a.cs, a.root)
+                let was = std::mem::take(a);
+                if !was.taken {
+                    self.waiting -= 1;
+                }
+                a.taken = true;
+                (was.cs, was.root)
             }
             _ => (None, None),
         }
+    }
+}
+
+/// One batch as the store answered it; a failed or malformed answer of a kind
+/// is `None`, and the walk reads those items singly.
+struct Read {
+    batch: Vec<ChangesetId>,
+    gens: Vec<Option<u64>>,
+    css: Option<Vec<Option<Changeset>>>,
+    roots: Option<Vec<Option<bytes::Bytes>>>,
+    skips: Option<Vec<Option<bytes::Bytes>>>,
+}
+
+/// Read `batch`'s changesets, the generations `gens` lacks, root trees (with
+/// `want_roots`) and skiplists, one batched call of each kind, together.
+async fn read_batch(
+    repo: Repo,
+    batch: Vec<ChangesetId>,
+    mut gens: Vec<Option<u64>>,
+    want_roots: bool,
+) -> Read {
+    let meta = repo.meta();
+    let keys: Vec<Hash> = batch.iter().map(|id| id.0).collect();
+    let unknown: Vec<usize> = (0..batch.len()).filter(|&i| gens[i].is_none()).collect();
+    let gen_keys: Vec<Hash> = unknown.iter().map(|&i| keys[i]).collect();
+    let (css, read, roots, skips) = tokio::join!(
+        meta.get_changesets(&batch),
+        async {
+            if gen_keys.is_empty() {
+                Ok(Vec::new())
+            } else {
+                meta.get_derived_many(Generation::NAME, &gen_keys).await
+            }
+        },
+        async {
+            if want_roots {
+                meta.get_derived_many(RootTree::NAME, &keys).await
+            } else {
+                Ok(Vec::new())
+            }
+        },
+        meta.get_derived_many(Skiplist::NAME, &keys),
+    );
+    let n = batch.len();
+    for (&i, v) in unknown
+        .iter()
+        .zip(slot(read, unknown.len()).unwrap_or_default())
+    {
+        gens[i] = v.as_deref().and_then(|b| decode_u64(b).ok());
+    }
+    Read {
+        css: slot(css, n),
+        roots: slot(roots, n),
+        skips: slot(skips, n),
+        batch,
+        gens,
     }
 }
 

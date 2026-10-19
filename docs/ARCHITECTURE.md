@@ -217,7 +217,11 @@ with their generations, root trees and skiplists, through
 `MetaStore::get_changesets` and `get_derived_many`, issued together. Its
 guesses are the parents of what it has read and the skiplist entries within
 the batch size, so a long first-parent chain is read a window per round trip
-rather than one changeset. An unfiltered log reads no further than its limit.
+rather than one changeset. A walk that expects to visit more than one batch
+reads two at once, on separate tasks. An unfiltered log reads no further than
+its limit. A long log's JSON is encoded in chunks of 512 entries on blocking
+threads and streamed in order once the walk has finished, so a failed walk
+still answers with an error status.
 The read-ahead never changes the answer: the heap, the `seen` set and the
 order are those of the plain walk, and whatever a batch did not return is read
 singly at the point the plain walk would read it.
@@ -362,7 +366,10 @@ planner turns the query into trigrams every matching file must contain
 tree; none means a plain scan). Execution walks the tree depth first with an
 explicit stack, skipping directories whose `tree-trigrams-v1` filter lacks a
 required trigram and files whose `blob-trigrams-v1` set does, then fetches the
-survivors (16 at a time, order preserved) and runs the matcher. Output is ordered
+survivors (16 at a time, order preserved) and runs the matcher on blocking
+threads. A directory's children's rows and surviving nodes are read in batches
+when it is opened, and the subdirectories of the directory the walk is in are
+opened ahead of it, four at a time. Output is ordered
 by path then line and is identical with or without the index, which a property
 test checks; the walk is lazy, so a search that has enough matches stops early.
 Limits: 100 matches by default, 1000 at most, 256 MiB of blob content scanned,

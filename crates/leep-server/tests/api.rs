@@ -524,6 +524,32 @@ async fn last_change_and_indexed_path_log() {
     assert_eq!(l.entries.iter().map(|e| e.id).collect::<Vec<_>>(), [b]);
 }
 
+/// A long log is encoded in chunks and streamed; the body is the same JSON,
+/// byte for byte, as encoding the response in one piece.
+#[tokio::test]
+async fn long_logs_are_the_same_json() {
+    let c = Client::new();
+    let mut chain = Vec::new();
+    for i in 0..1100 {
+        let parents: Vec<ChangesetId> = chain.last().copied().into_iter().collect();
+        let text = format!("v{i} \"quoted\" \u{e9}\n");
+        let path = format!("d{}/f", i % 7);
+        let files = [(path.as_str(), Some(text.as_str()))];
+        chain.push(c.commit(&parents, &files, &format!("c{i}\n\tbody")).await);
+    }
+    let tip = *chain.last().unwrap();
+    for limit in [1, 512, 513, 1024, 1025, 1100, 10000] {
+        let r = c.get(&format!("/v1/log/{tip}?limit={limit}")).await;
+        assert_eq!(r.status, StatusCode::OK);
+        assert_eq!(r.headers["content-type"], "application/json");
+        let l: LogResponse = r.json();
+        let ids: Vec<ChangesetId> = l.entries.iter().map(|e| e.id).collect();
+        let want: Vec<ChangesetId> = chain.iter().rev().take(limit).copied().collect();
+        assert_eq!(ids, want, "limit {limit}");
+        assert_eq!(serde_json::to_vec(&l).unwrap(), r.body, "limit {limit}");
+    }
+}
+
 #[tokio::test]
 async fn log_diff_blame_merge_base() {
     let c = Client::new();

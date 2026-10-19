@@ -268,11 +268,40 @@ pub fn http_get(addr: SocketAddr, path: &str, token: Option<&str>) -> (u16, Stri
     let auth = token.map_or(String::new(), |t| format!("Authorization: Bearer {t}\r\n"));
     let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n{auth}\r\n");
     s.write_all(req.as_bytes()).unwrap();
-    let mut resp = String::new();
-    s.read_to_string(&mut resp).unwrap();
-    let status = resp.split_whitespace().nth(1).unwrap().parse().unwrap();
-    let (head, body) = resp.split_once("\r\n\r\n").unwrap_or((&resp, ""));
-    (status, head.to_lowercase(), body.to_string())
+    let mut resp = Vec::new();
+    s.read_to_end(&mut resp).unwrap();
+    let split = resp.windows(4).position(|w| w == b"\r\n\r\n");
+    let (head, body) = match split {
+        Some(i) => (&resp[..i], &resp[i + 4..]),
+        None => (&resp[..], &[][..]),
+    };
+    let head = String::from_utf8_lossy(head).to_lowercase();
+    let status = head.split_whitespace().nth(1).unwrap().parse().unwrap();
+    let body = if head.contains("transfer-encoding: chunked") {
+        dechunk(body)
+    } else {
+        body.to_vec()
+    };
+    (status, head, String::from_utf8(body).unwrap())
+}
+
+/// Long responses (a big log) stream with chunked encoding.
+fn dechunk(mut rest: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    loop {
+        let eol = rest
+            .windows(2)
+            .position(|w| w == b"\r\n")
+            .expect("chunk size line");
+        let line = std::str::from_utf8(&rest[..eol]).unwrap();
+        let size = usize::from_str_radix(line.split(';').next().unwrap().trim(), 16).unwrap();
+        rest = &rest[eol + 2..];
+        if size == 0 {
+            return out;
+        }
+        out.extend_from_slice(&rest[..size]);
+        rest = &rest[size + 2..];
+    }
 }
 
 /// Settings for the `leep` client shared by every working copy of a test.
