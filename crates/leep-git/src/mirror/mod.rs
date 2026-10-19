@@ -474,12 +474,21 @@ impl<'a> Mirror<'a> {
             .truncate(false)
             .write(true)
             .open(cfg.work_dir.join("lock"))?;
-        lock.try_lock().map_err(|_| {
-            anyhow!(
-                "another mirror holds {}; run one mirror per work directory",
-                cfg.work_dir.join("lock").display()
-            )
-        })?;
+        // A child forked elsewhere in this process keeps a copy of a lock
+        // just released here until it execs, so a restart waits briefly.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match lock.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+                Err(_) => bail!(
+                    "another mirror holds {}; run one mirror per work directory",
+                    cfg.work_dir.join("lock").display()
+                ),
+            }
+        }
         let git_dir = cfg.work_dir.join("git");
         let repo = if git_dir.exists() {
             crate::open_git(&git_dir)?
