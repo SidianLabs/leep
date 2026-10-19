@@ -50,6 +50,52 @@ pub(crate) async fn recompute(
     }
 }
 
+/// Read ahead what recomputing `kinds` for `window` (oldest first) needs:
+/// the kinds' own [`DerivedKind::prepare`], unless one of them is
+/// `last_merge-v1`, which those would store ahead of its recomputation (and
+/// its report); then only the parents, generations and root trees.
+pub(crate) async fn prepare(kinds: &[&str], repo: &Repo, window: &[(ChangesetId, &Changeset)]) {
+    if kinds.contains(&LastMerge::NAME) {
+        let mut ids: Vec<ChangesetId> = Vec::with_capacity(window.len() * 2);
+        for (id, cs) in window {
+            repo.remember_parents(*id, cs.parents.as_slice().into());
+            ids.push(*id);
+            ids.extend(cs.parents.first());
+        }
+        ids.sort();
+        ids.dedup();
+        repo.prefetch_generations(&ids).await;
+        repo.prefetch_root_trees(&ids).await;
+        return;
+    }
+    for kind in kinds {
+        if *kind == HistoryTree::NAME {
+            HistoryTree::prepare(repo, window).await
+        } else if *kind == LogFilterIndex::NAME {
+            LogFilterIndex::prepare(repo, window).await
+        }
+    }
+}
+
+/// Derive `kind` for `id` and its ancestors where missing, as a query would.
+pub(crate) async fn derive_kind(kind: &str, repo: &Repo, id: ChangesetId) -> Result<Bytes> {
+    if kind == Generation::NAME {
+        derived::derive::<Generation>(repo, id).await
+    } else if kind == Skiplist::NAME {
+        derived::derive::<Skiplist>(repo, id).await
+    } else if kind == LastMerge::NAME {
+        derived::derive::<LastMerge>(repo, id).await
+    } else if kind == RootTree::NAME {
+        derived::derive::<RootTree>(repo, id).await
+    } else if kind == HistoryTree::NAME {
+        derived::derive::<HistoryTree>(repo, id).await
+    } else if kind == LogFilterIndex::NAME {
+        derived::derive::<LogFilterIndex>(repo, id).await
+    } else {
+        Err(Error::Other(format!("{kind} is not a per-changeset kind")))
+    }
+}
+
 /// The row a blob's bytes should have.
 pub(crate) fn expected_blob_row(data: &[u8]) -> Bytes {
     Bytes::from(BlobRow::of(data).encode())

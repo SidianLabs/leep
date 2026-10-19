@@ -3238,6 +3238,46 @@ mod path_history {
         assert_eq!(rows, node_rows(&b).await);
     }
 
+    /// Deriving several changesets at once (ADR 0050) stores the rows of one
+    /// at a time, byte for byte, whichever finishes first.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn parallel_history_rows_are_byte_identical() {
+        let serial = repo().with_derive_jobs(1);
+        let tip = wide_deep_history(&serial).await;
+        derived::derive::<HistoryTree>(&serial, tip).await.unwrap();
+        let want = node_rows(&serial).await;
+        for jobs in [2, 4, 16] {
+            let r = repo().with_derive_jobs(jobs);
+            assert_eq!(wide_deep_history(&r).await, tip);
+            derived::derive::<HistoryTree>(&r, tip).await.unwrap();
+            assert_eq!(node_rows(&r).await, want, "{jobs} jobs");
+        }
+    }
+
+    /// A derivation dropped midway (a request that timed out) leaves nothing
+    /// staged and rows that a later derivation completes into the serial
+    /// ones.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_dropped_parallel_derivation_resumes_to_the_same_rows() {
+        let serial = repo().with_derive_jobs(1);
+        let tip = wide_deep_history(&serial).await;
+        derived::derive::<HistoryTree>(&serial, tip).await.unwrap();
+        let want = node_rows(&serial).await;
+        let r = repo().with_derive_jobs(4);
+        assert_eq!(wide_deep_history(&r).await, tip);
+        for ms in [5, 20, 80, 160] {
+            let limit = std::time::Duration::from_millis(ms);
+            let _ = tokio::time::timeout(limit, derived::derive::<HistoryTree>(&r, tip)).await;
+            assert!(r.staged_values.lock().unwrap().is_empty());
+        }
+        assert!(
+            node_rows(&r).await.len() < want.len(),
+            "nothing was dropped"
+        );
+        derived::derive::<HistoryTree>(&r, tip).await.unwrap();
+        assert_eq!(node_rows(&r).await, want);
+    }
+
     /// The bytes the same history would take in whole rows of 32-byte ids
     /// and addresses (the encoding before ADR 0037): each node version any
     /// changeset's index reaches, stored whole or in whole chunks.

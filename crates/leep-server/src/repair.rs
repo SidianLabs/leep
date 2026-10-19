@@ -76,9 +76,19 @@ enum RepairCmd {
         /// Only the history of this ref (repeatable).
         #[arg(long = "ref", value_name = "REF")]
         refs: Vec<String>,
-        /// Report what would change and write nothing.
+        /// Report what would change and write nothing (one changeset at a
+        /// time).
         #[arg(long)]
         dry_run: bool,
+        /// Changesets recomputed at once (ADR 0050). Default: the cores, up
+        /// to 8.
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=256))]
+        jobs: Option<u32>,
+        /// Only derive rows that are missing, as the warmer would, without
+        /// checking stored ones: an initial build that resumes where a
+        /// stopped run left off.
+        #[arg(long, conflicts_with = "dry_run")]
+        missing: bool,
         #[arg(long)]
         json: bool,
     },
@@ -387,6 +397,8 @@ async fn repair_inner(meta: &str, blobs: &str, args: RepairArgs) -> anyhow::Resu
             all: _,
             refs,
             dry_run,
+            jobs,
+            missing,
             json,
         } => {
             let kinds = parse_kinds(&names, Which::Rederivable)?;
@@ -400,6 +412,8 @@ async fn repair_inner(meta: &str, blobs: &str, args: RepairArgs) -> anyhow::Resu
                 },
                 dry_run,
                 max_problems: 1000,
+                jobs: jobs.map_or_else(leep_derive::default_derive_jobs, |j| j as usize),
+                missing_only: missing,
             };
             let report = integrity::rederive(&repo, &opts, &Stderr).await?;
             let bad = report.failed() > 0 || (dry_run && report.changed() > 0);

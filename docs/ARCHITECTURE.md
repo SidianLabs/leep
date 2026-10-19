@@ -139,15 +139,35 @@ A derived kind is a pure function
    (histories can be hundreds of thousands deep), checking and reading 256 per
    round trip and keeping only their parents, so memory follows the number of
    changesets and not their size;
-2. derives them oldest-first, reading changesets again 256 at a time;
+2. derives them parents first, several at a time (ADR 0050, below),
+   reading changesets again 256 at a time;
 3. stores each with `put_derived(kind, cs_id, bytes)`; a kind may instead
    stage its rows and write a window's in one `put_derived_many`, each
-   changeset's value after the rows it names (`history-tree-v4` and
-   `last_merge-v1` do; values held back are found by later derivations in
-   the same run, as a merge asks for its merge base's).
+   changeset's value after the rows it names (`history-tree-v4`,
+   `log-filter-v1` and `last_merge-v1` do; values held back are found by
+   later derivations in the same run, as a merge asks for its merge base's).
 
 Because inputs are immutable, a value is computed at most once per kind and
 changeset, and concurrent servers that race produce identical bytes.
+
+**Parallel derivation** ([ADR 0050](adr/0050-parallel-derivation.md)). A
+changeset whose parents all have their rows depends on nothing still being
+computed, so `derived::wavefront` runs a missing range as a wavefront: the
+range in a parents-first order with its links as positions (about 50 bytes
+a changeset), a heap of ready changesets by position, and up to `jobs`
+derivations at once as Tokio tasks, lowest position first (one job is the
+serial order). Results return to one coordinator in the order changesets
+finish, which lists parents before children; staged rows join a buffer in
+that order and go to `put_derived_many` a window at a time, one write in
+flight while derivation goes on, so any prefix stored is whole changesets
+after their parents and a stopped run resumes cleanly. Changesets are read,
+and the kind's `prepare` runs, a window ahead of the work, at most
+`max(8, 4 x jobs)` windows past the oldest unfinished changeset. Tasks
+inherit the derivation's held-lock list and skiplist reads. Rows are the
+same bytes for any number of jobs. `Repo::with_derive_jobs` sets the number
+(default: the cores, up to 8; `leep-server --derive-jobs`), and `repair
+rederive --jobs` runs its recompute-compare-write per changeset the same
+way.
 
 | Kind | Value | Used by |
 |---|---|---|
@@ -319,7 +339,10 @@ value, so one flipped bit is one finding. The recomputation runs on in-memory
 shadows of the stores, so `verify` cannot write. `repair rederive` runs the
 same recomputation against the real stores and writes the rows that differ
 (derivation also rewrites the tree and history nodes it derives, which restores
-missing ones); `repair drop` deletes a kind so it derives again on demand.
+missing ones), several changesets at a time once their parents are done
+(ADR 0050); `repair rederive --missing` only derives absent rows, through
+`derive`, so a stopped initial build resumes where it was; `repair drop`
+deletes a kind so it derives again on demand.
 Only kinds that history can regenerate are rederived or dropped; signatures,
 reviews, rebase links, GC fence rows and the ref log are refused. The table of
 kinds is `leep_derive::integrity::kinds`, mirrored in the ADR.

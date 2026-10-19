@@ -45,7 +45,9 @@ mod tests;
 #[doc(hidden)]
 pub use comments::strip_comments;
 pub use history::{ExtraMatch, LogFilter};
-pub use repo::{PrefixMatch, Repo, MAX_PREFIX_CANDIDATES};
+pub use repo::{
+    default_derive_jobs, PrefixMatch, Repo, MAX_DEFAULT_DERIVE_JOBS, MAX_PREFIX_CANDIDATES,
+};
 pub use search::{SearchIndexReport, SearchQuery};
 pub use signatures::{LandPolicy, PolicySet, REBASED_ORIGIN_KIND};
 

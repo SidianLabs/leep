@@ -75,6 +75,11 @@ struct Args {
         value_parser = clap::builder::BoolishValueParser::new(),
     )]
     warm_search: bool,
+    /// Changesets a derivation of a missing range (the warmer's catch-up, or
+    /// the first query over un-derived history) works on at once (ADR 0050).
+    /// Default: the cores, up to 8.
+    #[arg(long, env = "LEEP_DERIVE_JOBS", value_parser = clap::value_parser!(u32).range(1..=256))]
+    derive_jobs: Option<u32>,
     /// Maximum request body size in bytes.
     #[arg(long, default_value_t = leep_server::DEFAULT_MAX_BODY_BYTES)]
     max_body_bytes: usize,
@@ -614,7 +619,10 @@ async fn main() -> anyhow::Result<()> {
         metrics::gauge!("leep_schema_version").set(v as f64);
     }
     // The land policy comes from the reloadable config, not from the repo.
-    let repo = Repo::new(blobs, meta);
+    let mut repo = Repo::new(blobs, meta);
+    if let Some(jobs) = args.derive_jobs {
+        repo = repo.with_derive_jobs(jobs as usize);
+    }
     leep_server::reload::warn_missing_refs(repo.meta().as_ref(), &config.current()).await;
     if args.request_timeout.is_zero() {
         tracing::warn!("request timeout disabled: gc --fence cannot be guaranteed safe");

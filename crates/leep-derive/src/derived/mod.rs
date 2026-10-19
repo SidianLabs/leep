@@ -1,7 +1,8 @@
 //! Derived data framework. Each kind computes `value(changeset)` from the
 //! changeset and its parents' values; [`derive`] walks missing ancestors with
 //! an explicit stack (histories are too deep for recursion), derives them
-//! oldest-first and caches each under `(kind, changeset id)` in the `MetaStore`.
+//! parents first, several at a time ([`wavefront`], ADR 0050), and caches
+//! each under `(kind, changeset id)` in the `MetaStore`.
 
 mod generation;
 pub mod history_pack;
@@ -10,12 +11,15 @@ mod last_merge;
 mod log_filter;
 mod root_tree;
 mod skiplist;
+pub(crate) mod wavefront;
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures_util::future::BoxFuture;
 use leep_core::{Changeset, ChangesetId, DerivedRow, Error, Hash, MetaStore, Result};
 
 use crate::Repo;
@@ -78,8 +82,13 @@ pub trait DerivedKind: Send + Sync + 'static {
     /// error.
     fn unstage(_repo: &Repo, _rows: &[DerivedRow]) {}
 
+    /// Called with staged rows dropped after an error, which were never
+    /// stored (or not known to be), after [`DerivedKind::unstage`].
+    fn dropped(_repo: &Repo, _rows: &[DerivedRow]) {}
+
     /// Called before each window of changesets is derived, oldest first, to
-    /// read what their derivations will need in a few round trips.
+    /// read what their derivations will need in a few round trips. Windows
+    /// are prepared one after another, while earlier windows derive.
     async fn prepare(_repo: &Repo, _window: &[(ChangesetId, &Changeset)]) {}
 
     /// Whether a derivation of this kind keeps the skiplist rows its
@@ -194,15 +203,21 @@ async fn derive_missing<K: DerivedKind>(repo: &Repo, id: ChangesetId) -> Result<
     }
     drop(done);
 
-    let mut staged: Vec<DerivedRow> = Vec::new();
-    let result = derive_order::<K>(repo, &order, &arena, &parents, &mut staged).await;
+    let dag = wavefront::Dag::new(order, |id| &arena[parents[id].clone()]);
+    drop(parents);
+    drop(arena);
+    let mut wave = DeriveWave::<K>::new(repo, &dag);
+    let result = wavefront::run(repo, &dag, repo.derive_jobs(), &mut wave).await;
     let result = match result {
-        Ok(v) => write_staged::<K>(repo, &mut staged).await.map(|()| v),
+        Ok(()) => wave.flush(true).await,
         Err(e) => Err(e),
     };
-    K::unstage(repo, &staged);
-    forget_staged_values(repo, K::NAME, &staged);
-    result
+    wave.abandon().await;
+    result.and_then(|()| {
+        wave.last
+            .take()
+            .ok_or_else(|| Error::Storage("derivation produced no value".into()))
+    })
 }
 
 /// A value of `kind` computed by a running derivation and not stored yet.
@@ -225,98 +240,223 @@ fn forget_staged_values(repo: &Repo, kind: &'static str, rows: &[DerivedRow]) {
 /// Most staged rows held back before a write.
 const STAGED_ROWS: usize = 4096;
 
-/// Derive `order` (parents first), holding back a [`DerivedKind::STAGED`]
-/// kind's rows in `staged` and writing them a window at a time.
-async fn derive_order<K: DerivedKind>(
-    repo: &Repo,
-    order: &[ChangesetId],
-    arena: &[ChangesetId],
-    parents: &HashMap<ChangesetId, Range<usize>>,
-    staged: &mut Vec<DerivedRow>,
-) -> Result<Bytes> {
-    let meta = repo.meta();
-    // A computed value is kept until its last child in the range has used
-    // it, so memory follows the width of history, not its length.
-    let mut children: HashMap<ChangesetId, u32> = HashMap::new();
-    for cid in order {
-        for p in &arena[parents[cid].clone()] {
-            if parents.contains_key(p) {
-                *children.entry(*p).or_default() += 1;
-            }
+/// A spawned write of staged rows.
+type StagedWrite = tokio::task::JoinHandle<Result<()>>;
+
+/// Deriving a missing range of kind `K`, a changeset per task. A
+/// [`DerivedKind::STAGED`] kind's rows are held back in the order changesets
+/// finish (parents first) and written a window at a time, one write in
+/// flight while derivation goes on; other kinds store each value in its
+/// task, after its parents' values.
+struct DeriveWave<K: DerivedKind> {
+    repo: Repo,
+    /// Values of finished changesets with children still to start, and how
+    /// many: memory follows the width of history, not its length.
+    computed: HashMap<u32, (Bytes, u32)>,
+    /// Staged rows of finished changesets, not yet handed to a write.
+    pending: Vec<DerivedRow>,
+    /// Changesets finished since the last write.
+    since_write: usize,
+    /// The write in flight and the rows it carries.
+    writing: Option<(StagedWrite, Arc<[DerivedRow]>)>,
+    head: usize,
+    last: Option<Bytes>,
+    _kind: std::marker::PhantomData<fn() -> K>,
+}
+
+impl<K: DerivedKind> DeriveWave<K> {
+    fn new(repo: &Repo, dag: &wavefront::Dag) -> Self {
+        DeriveWave {
+            repo: repo.clone(),
+            computed: HashMap::new(),
+            pending: Vec::new(),
+            since_write: 0,
+            writing: None,
+            head: dag.len().saturating_sub(1),
+            last: None,
+            _kind: std::marker::PhantomData,
         }
     }
-    let mut computed: HashMap<ChangesetId, Bytes> = HashMap::new();
-    let mut last = None;
-    for window in order.chunks(BATCH) {
-        let changesets = get_changesets(repo, window).await?;
-        let pairs: Vec<(ChangesetId, &Changeset)> =
-            window.iter().copied().zip(changesets.iter()).collect();
-        K::prepare(repo, &pairs).await;
-        for (cid, cs) in pairs {
-            let mut pv = Vec::with_capacity(cs.parents.len());
-            for p in &cs.parents {
-                let v = match computed.get(p) {
-                    Some(v) => {
-                        let v = v.clone();
-                        let left = children.get_mut(p).expect("counted above");
-                        *left -= 1;
-                        if *left == 0 {
-                            computed.remove(p);
-                        }
-                        v
-                    }
+
+    /// Wait for the write in flight, then forget what it staged.
+    async fn settle(&mut self) -> Result<()> {
+        let Some((handle, rows)) = self.writing.take() else {
+            return Ok(());
+        };
+        let result = match handle.await {
+            Ok(r) => r,
+            Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+            Err(e) => Err(Error::Other(format!("staged write failed: {e}"))),
+        };
+        K::unstage(&self.repo, &rows);
+        forget_staged_values(&self.repo, K::NAME, &rows);
+        if result.is_err() {
+            K::dropped(&self.repo, &rows);
+        }
+        result
+    }
+
+    /// Hand the pending rows to a write, after the one in flight; with
+    /// `wait`, also wait for it.
+    async fn flush(&mut self, wait: bool) -> Result<()> {
+        self.settle().await?;
+        self.since_write = 0;
+        if !self.pending.is_empty() {
+            let rows: Arc<[DerivedRow]> = std::mem::take(&mut self.pending).into();
+            let meta = self.repo.meta().clone();
+            let carried = rows.clone();
+            let handle = tokio::spawn(async move {
+                for batch in carried.chunks(STAGED_WRITE) {
+                    meta.put_derived_many(batch).await?;
+                }
+                Ok(())
+            });
+            self.writing = Some((handle, rows));
+        }
+        if wait {
+            self.settle().await?;
+        }
+        Ok(())
+    }
+
+    /// Forget the rows not stored, after an error: the write in flight
+    /// finishes first, so the windows it carries are not lost.
+    async fn abandon(&mut self) {
+        let _ = self.settle().await;
+        self.forget_pending();
+    }
+
+    fn forget_pending(&mut self) {
+        let rows = std::mem::take(&mut self.pending);
+        K::unstage(&self.repo, &rows);
+        forget_staged_values(&self.repo, K::NAME, &rows);
+        K::dropped(&self.repo, &rows);
+    }
+}
+
+/// A derivation dropped midway (a request that timed out) leaves nothing
+/// staged behind: the write in flight is stopped (whatever part of it was
+/// stored is whole changesets after their parents) and the rest forgotten,
+/// so a later derivation finds them missing and derives them again.
+impl<K: DerivedKind> Drop for DeriveWave<K> {
+    fn drop(&mut self) {
+        if let Some((handle, rows)) = self.writing.take() {
+            handle.abort();
+            K::unstage(&self.repo, &rows);
+            forget_staged_values(&self.repo, K::NAME, &rows);
+            K::dropped(&self.repo, &rows);
+        }
+        self.forget_pending();
+    }
+}
+
+/// What one task of a [`DeriveWave`] returns.
+struct Derived {
+    value: Bytes,
+    rows: Vec<DerivedRow>,
+}
+
+#[async_trait]
+impl<K: DerivedKind> wavefront::Wave for DeriveWave<K> {
+    type Out = Derived;
+
+    fn preparer(&self) -> wavefront::Preparer {
+        Arc::new(|repo: Repo, window: wavefront::Window| {
+            Box::pin(async move {
+                let pairs: Vec<(ChangesetId, &Changeset)> =
+                    window.iter().map(|(id, cs)| (*id, &**cs)).collect();
+                K::prepare(&repo, &pairs).await;
+            })
+        })
+    }
+
+    fn start(
+        &mut self,
+        dag: &wavefront::Dag,
+        i: usize,
+        cs: Arc<Changeset>,
+    ) -> Result<BoxFuture<'static, Result<Derived>>> {
+        let mut known: Vec<Option<Bytes>> = Vec::with_capacity(cs.parents.len());
+        for &p in dag.parents(i) {
+            if p == wavefront::OUTSIDE {
+                known.push(None);
+                continue;
+            }
+            let slot = self.computed.get_mut(&p).expect("parents finish first");
+            known.push(Some(slot.0.clone()));
+            slot.1 -= 1;
+            if slot.1 == 0 {
+                self.computed.remove(&p);
+            }
+        }
+        let repo = self.repo.clone();
+        let id = dag.id(i);
+        Ok(Box::pin(async move {
+            let meta = repo.meta();
+            let mut pv = Vec::with_capacity(known.len());
+            for (p, v) in cs.parents.iter().zip(known) {
+                pv.push(match v {
+                    Some(v) => v,
                     None => meta
                         .get_derived(K::NAME, &p.0)
                         .await?
                         .ok_or_else(|| Error::Storage(format!("{} missing for {p}", K::NAME)))?,
-                };
-                pv.push(v);
+                });
             }
             let started = std::time::Instant::now();
-            #[cfg(test)]
             repo.derive_calls
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let v = if K::STAGED {
-                let v = K::derive_staged(repo, cid, cs, &pv, staged).await?;
-                repo.staged_values
-                    .lock()
-                    .unwrap()
-                    .insert((K::NAME, cid.0), v.clone());
-                staged.push(DerivedRow::new(K::NAME, cid.0, v.clone()));
-                if staged.len() >= STAGED_ROWS {
-                    write_staged::<K>(repo, staged).await?;
+            let mut rows = Vec::new();
+            let value = if K::STAGED {
+                match K::derive_staged(&repo, id, &cs, &pv, &mut rows).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        K::unstage(&repo, &rows);
+                        K::dropped(&repo, &rows);
+                        return Err(e);
+                    }
                 }
-                v
             } else {
-                let v = K::derive(repo, cid, cs, &pv).await?;
-                meta.put_derived(K::NAME, &cid.0, v.clone()).await?;
+                let v = K::derive(&repo, id, &cs, &pv).await?;
+                meta.put_derived(K::NAME, &id.0, v.clone()).await?;
                 v
             };
             record_derivation(K::NAME, started);
-            if children.contains_key(&cid) {
-                computed.insert(cid, v.clone());
-            }
-            last = Some(v);
-        }
-        write_staged::<K>(repo, staged).await?;
+            Ok(Derived { value, rows })
+        }))
     }
-    last.ok_or_else(|| Error::Storage("derivation produced no value".into()))
-}
 
-/// Store staged rows in order, a bounded batch per write. Each changeset's
-/// rows end with its value, after the rows it names, so any prefix a failed
-/// write leaves behind holds no dangling reference.
-async fn write_staged<K: DerivedKind>(repo: &Repo, staged: &mut Vec<DerivedRow>) -> Result<()> {
-    if staged.is_empty() {
-        return Ok(());
+    async fn finish(&mut self, dag: &wavefront::Dag, i: usize, out: Derived) -> Result<()> {
+        let id = dag.id(i);
+        let Derived { value, mut rows } = out;
+        if K::STAGED {
+            self.repo
+                .staged_values
+                .lock()
+                .unwrap()
+                .insert((K::NAME, id.0), value.clone());
+            self.pending.append(&mut rows);
+            self.pending
+                .push(DerivedRow::new(K::NAME, id.0, value.clone()));
+            self.since_write += 1;
+            if self.pending.len() >= STAGED_ROWS || self.since_write >= BATCH {
+                self.flush(false).await?;
+            }
+        }
+        let children = dag.children(i).len() as u32;
+        if children > 0 {
+            self.computed.insert(i as u32, (value.clone(), children));
+        }
+        if i == self.head {
+            self.last = Some(value);
+        }
+        Ok(())
     }
-    for batch in staged.chunks(STAGED_WRITE) {
-        repo.meta().put_derived_many(batch).await?;
+
+    fn discard(&mut self, out: Derived) {
+        K::unstage(&self.repo, &out.rows);
+        K::dropped(&self.repo, &out.rows);
     }
-    K::unstage(repo, staged);
-    forget_staged_values(repo, K::NAME, staged);
-    staged.clear();
-    Ok(())
 }
 
 /// Most rows one staged write carries.

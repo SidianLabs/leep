@@ -575,6 +575,24 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   bytes per changeset there. The warmer derives it; `verify` checks it,
   `repair rederive`/`drop --kind log-filter-v1` handle it. New example
   `log_filter_profile`.
+- Derivation uses several cores (ADR 0050). A missing range (the warmer's
+  catch-up after an import, a first query over un-derived history, `repair
+  rederive`) used to derive one changeset after another on one core: about
+  nine hours for `history-tree-v4` on all of Linux. Changesets whose parents
+  are done now derive side by side, rows are stored in an order that keeps
+  every changeset after its parents (so a stopped run resumes cleanly), and
+  changesets are read and prepared a window ahead. Rows are byte-identical
+  for any number of jobs. `leep-server --derive-jobs N` (`LEEP_DERIVE_JOBS`)
+  and `repair rederive --jobs N` set it (default: the cores, up to 8); the
+  warmer derives `history-tree-v4` and `log-filter-v1` side by side. New
+  `repair rederive --missing` derives only absent rows, without recomputing
+  stored ones, so an initial build can be stopped and resumed. On a 4-vCPU
+  machine shared with other work, 4 jobs derived a 20,000-changeset
+  late-Linux-shaped history in Postgres about twice as fast, the full
+  `rederive` about three times as fast, and `rederive --missing` six times
+  as fast as the old `rederive`. A name row dropped by a failed derivation
+  is now written by the next one (it was lost for the life of the process).
+  `history_profile` takes `--jobs` and `--log-filter`.
 
 ### Git compatibility (M7)
 - Live git mirror (ADR 0046): `leep-git mirror run` keeps a git remote

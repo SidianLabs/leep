@@ -1843,6 +1843,92 @@ in-memory stores, so encoding and decoding without the writes they save):
 | `derive_history_index/wide_merges_300_changesets` | 146 ms | 157 ms |
 | `derive_history_index/old_base_merge_3000_changesets` | 8.57 ms | 8.73 ms |
 
+## Parallel derivation
+
+ADR 0050. Derivation of a missing range runs changesets whose parents are
+done side by side, `jobs` at a time, and stores rows in an order that keeps
+each after its parents. Measured on the synthetic late-Linux history
+(`history_profile --synth 20000 --old-base 15000`: 19,777 changesets on
+`main`, 20,045 stored) in a local Postgres 16 (TCP on 127.0.0.1) with
+filesystem blobs (loose objects), release builds, on a 4-vCPU, 16 GB VM that
+another workload shared throughout (load average 1.2 to 5 before each run,
+mostly 2 to 3, so about two cores were free). "Serial" is the build before
+the change (`d9150a4`). Every run's rows were dumped (`--dump`, or
+`history_profile ... --dump` after a `rederive`) and compared with the serial
+build's: all identical.
+
+**Deriving** (`history_profile <meta> <blobs> main --reset --jobs N`, two
+alternating rounds; `history-tree-v4`, 19,777 changesets):
+
+| | Wall, round 1 / 2 | Changesets/s | Peak RSS |
+|---|---|---|---|
+| Serial | 160.3 / 127.9 s | 123 / 155 | 246 / 252 MiB |
+| 1 job | 123.0 / 114.3 s | 161 / 173 | 361 / 366 MiB |
+| 2 jobs | 70.5 / 67.9 s | 280 / 292 | 312 / 325 MiB |
+| 4 jobs | 59.0 / 65.6 s | 335 / 302 | 331 / 329 MiB |
+| 8 jobs | 63.1 / 61.3 s | 313 / 323 | 322 / 324 MiB |
+
+The final build, once more on a quieter machine (load average 1.4): one job
+127.3 s, four jobs 52.3 s (378 a second, 2.4 times one job), rows again
+identical.
+
+The work is CPU-bound in the process: with one job it kept 0.92 cores busy
+(99.8 s user and 17.2 s system over 127.5 s), with four 1.98 cores (119.9 s
+and 17.9 s over 69.5 s), which was what the other workload left. Past two
+jobs the gain stopped where the idle cores ran out, and CPU time per
+changeset rose by 18% at four jobs. One job beats the serial build by the
+read-ahead (changesets and their prepared inputs a window ahead, writes in
+flight while the next window derives).
+
+Peak memory is about 100 MB above the serial build's at any number of jobs,
+and most of it is the allocator: with `MALLOC_ARENA_MAX=2` the peaks were
+276 MiB (1 job) and 270 MiB (4 jobs), but four jobs then took 100 s instead
+of 60 to 65, contending for the allocator. An allocator built for threads
+(jemalloc, mimalloc) is the next thing to try for both memory and the 18%.
+
+`log-filter-v1` on the same history (`--log-filter`), which spends its time
+on round trips (5 s of user time in 12.8 s with one job):
+
+| | 1 job | 2 jobs | 4 jobs | 8 jobs |
+|---|---|---|---|---|
+| Wall | 12.8 s | 8.0 s | 6.4 s | 6.5 s |
+| Peak RSS | 81 MiB | 82 MiB | 89 MiB | 93 MiB |
+
+**`repair rederive`** (`leep-server repair rederive --kind history-tree-v4`,
+every stored changeset, which also recomputes `generation`, `skiplist` and
+`root_tree`; one run each):
+
+| | Rows stored (recompute and compare) | From scratch (after `repair drop`) | `--missing`, from scratch |
+|---|---|---|---|
+| Serial | 380.2 s (53/s), 249 MiB | 411.4 s (49/s), 247 MiB | (no such flag) |
+| 1 job | 290.3 s, 349 MiB | | 131.9 s, 359 MiB |
+| 2 jobs | | | 81.2 s, 319 MiB |
+| 4 jobs | 131.0 s (153/s), 317 MiB | 144.1 s (139/s), 312 MiB | 67.9 / 70.8 s (295/s), 333 MiB |
+
+The serial rederive's 49 to 53 changesets a second is the 45 a second seen
+on all of Linux. With four jobs the full pass is 2.9 times faster. A build
+of a missing index is faster again with `--missing`, which derives through
+`derive` (the warmer's path, which batches its reads and stages its writes)
+instead of recomputing, reading back and comparing each row: six times the
+serial rederive. For `log-filter-v1` from scratch: serial rederive 121.6 s,
+one job 60.5 s, four jobs 23.1 s, four jobs with `--missing` 9.9 s, all
+with the serial build's rows.
+
+**Kill and resume.** `rederive --missing --jobs 4` killed with SIGKILL after
+30 s had stored 10,007 of the 20,045 rows; run again, it derived the other
+10,038 in 60.6 s. A full `rederive --jobs 4` killed after 70 s had stored
+8,678; the next run found those right and wrote the other 11,367. Both ended
+with every `history-tree-v4` and `history-node-v4` row (22,291) identical to
+the serial build's. In memory, `fault_tests::parallel_derivation_under_faults_stores_rows_after_their_parents`
+injects store failures into four-job derivations of both kinds and checks
+after every failed attempt that each stored row has its parents' rows and
+the fault-free value.
+
+**On a large machine.** The gain follows the free cores: on Linux, where
+the serial `rederive` ran at about 45 a second (nine hours), `rederive
+--missing --jobs N` derives at the warmer's rate times about the idle
+cores, with memory near one job's. Not yet measured on Linux.
+
 ## Garbage collection
 
 `leep-server gc` phases timed with

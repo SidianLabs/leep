@@ -27,7 +27,7 @@ use super::kinds::{self, KindClass, BLAME_KIND};
 use super::problems::{damage_of, recoverable, Damage, Problem, ProblemLog, Progress, Ticker};
 use super::rows::{describe, expected_blob_row, recompute, RowScan, PAGE};
 use super::shadow::{ShadowBlobs, ShadowMeta};
-use super::walk::{HistoryWalk, Visitor};
+use super::walk::{HistoryWalk, Unreadable, Visitor};
 use crate::blame::{cache_key, CachedBlame};
 use crate::derived::history_pack::{
     decode_part, decode_root, part_identity, part_key, same_part, RawNode,
@@ -1387,7 +1387,10 @@ impl Visitor for Verifier<'_> {
         self.tick();
         Ok(())
     }
+}
 
+#[async_trait]
+impl Unreadable for Verifier<'_> {
     async fn broken(
         &mut self,
         id: ChangesetId,

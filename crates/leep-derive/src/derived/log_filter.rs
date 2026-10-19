@@ -704,6 +704,17 @@ impl DerivedKind for LogFilterIndex {
         Ok(Self::compute(repo, id, cs, parents, rows).await?.encode())
     }
 
+    /// Name rows dropped after an error must be staged again by whichever
+    /// derivation next meets the author.
+    fn dropped(repo: &Repo, rows: &[DerivedRow]) {
+        let mut written = repo.log_filter.written.lock().unwrap();
+        for r in rows.iter().filter(|r| r.kind == NAME_KIND) {
+            if let Ok(name) = std::str::from_utf8(&r.value) {
+                written.remove(&author_fingerprint(name));
+            }
+        }
+    }
+
     /// Generations of the window and its parents, and at merges the parents'
     /// last merges, which `merge_base` reads.
     async fn prepare(repo: &Repo, window: &[(ChangesetId, &Changeset)]) {

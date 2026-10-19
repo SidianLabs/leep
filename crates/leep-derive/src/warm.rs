@@ -90,10 +90,14 @@ impl Warmer {
 
 /// Derive the indexes queries need for `id`: the path-history index (which
 /// brings generation, skiplists and last-merge with it), the log-filter
-/// index and, with `search`, the code-search index of its tree.
+/// index and, with `search`, the code-search index of its tree. The first
+/// two need only each other's inputs, so they derive side by side, each on
+/// the repo's derive jobs (ADR 0050).
 async fn warm(repo: &Repo, id: ChangesetId, search: bool) -> Result<()> {
-    derived::derive::<HistoryTree>(repo, id).await?;
-    derived::derive::<LogFilterIndex>(repo, id).await?;
+    futures_util::try_join!(
+        derived::derive::<HistoryTree>(repo, id),
+        derived::derive::<LogFilterIndex>(repo, id)
+    )?;
     if search {
         repo.derive_search(id).await?;
     }

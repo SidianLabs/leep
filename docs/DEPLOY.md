@@ -339,6 +339,7 @@ a reload is refused.
 | `LEEP_REQUEST_TIMEOUT` | `5m` | Abort any request that runs longer (`90s`, `5m`; `0` disables). `leep-server gc --fence` must exceed it; see [OPERATIONS.md](OPERATIONS.md#blob-garbage-collection). |
 | `LEEP_WARM_INTERVAL` | `30s` | How often the background warmer looks for moved refs and derives their path-history and search indexes (ADR 0028); `0` turns it off. With several servers on one metadata store, one warmer is enough. |
 | `LEEP_WARM_SEARCH` | `true` | Whether the warmer also derives the code-search index of each ref head. |
+| `LEEP_DERIVE_JOBS` | the cores, up to 8 | Changesets the warmer's catch-up, or a query over un-derived history, derives at once (ADR 0050). Lower it to leave cores for requests while a large import is being indexed. |
 | `LEEP_READY_TIMEOUT` | `2s` | Bound on each store check behind `GET /v1/ready` (`500ms`, `2s`; not zero). See [Probes](#probes). |
 | `LEEP_METRICS_LISTEN` | off | Address for a separate, unauthenticated `GET /metrics` listener; keep it private. See [OPERATIONS.md](OPERATIONS.md). |
 | `LEEP_LOG_FORMAT` | `text` | `text` or `json` (one object per line). |
