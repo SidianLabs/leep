@@ -566,7 +566,7 @@ impl Sink for SqliteSink {
             "derived",
             "ref_log",
             // Leases name servers of the old store; never restored.
-            "land_leases",
+            "leases",
         ] {
             sqlx::query(&format!("DELETE FROM {t}"))
                 .execute(&mut *self.0)
@@ -828,7 +828,7 @@ impl Sink for PgSink {
             "derived",
             "ref_log",
             // Leases name servers of the old store; never restored.
-            "land_leases",
+            "leases",
         ] {
             sqlx::query(&format!("DELETE FROM {t}"))
                 .execute(&mut *self.0)

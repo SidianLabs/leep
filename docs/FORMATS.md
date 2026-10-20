@@ -439,12 +439,14 @@ ref_log(seq BIGSERIAL PRIMARY KEY,                             -- SQLite: INTEGE
         land_id BYTEA, land_changeset BYTEA)                   -- migration 0005; NULL unless a keyed land
 ref_log_name: INDEX ON ref_log(name, seq)
 ref_log_land_id: UNIQUE INDEX ON ref_log(name, land_id) WHERE land_id IS NOT NULL
-land_leases(repo_id BIGINT NOT NULL DEFAULT 1,                 -- migration 0006; SQLite: INTEGER
-            ref_name TEXT NOT NULL, holder TEXT NOT NULL,      -- holder: random per server process
-            address TEXT NOT NULL, protocol INTEGER NOT NULL,  -- the holder's --advertise-url; 1
-            epoch BIGINT NOT NULL,                             -- +1 whenever the holder changes
-            renewed_at BIGINT NOT NULL, expires_at BIGINT NOT NULL, -- ms, the store's clock; 0 = released
-            PRIMARY KEY (repo_id, ref_name))
+leases(scope TEXT NOT NULL,                                     -- migration 0006; 'land' for lands
+       repo_id BIGINT NOT NULL DEFAULT 1,                       -- SQLite: INTEGER
+       name TEXT NOT NULL, shard INTEGER NOT NULL DEFAULT 0,    -- land: the ref, shard 0
+       holder TEXT NOT NULL, address TEXT NOT NULL,             -- holder: random per server process; its --advertise-url
+       protocol INTEGER NOT NULL, meta TEXT NOT NULL DEFAULT '',-- per scope; land: protocol 1, meta ''
+       epoch BIGINT NOT NULL,                                   -- +1 whenever the holder changes
+       renewed_at BIGINT NOT NULL, expires_at BIGINT NOT NULL,  -- ms, the store's clock; 0 = released
+       PRIMARY KEY (scope, repo_id, name, shard))
 ```
 
 `ref_log` (ADR 0018) is appended in the transaction of every ref create, move
@@ -480,9 +482,10 @@ writes exactly the columns of v4. An id is unique per ref. The rows are read
 by `MetaStore::find_lands`, never changed, and kept with the entry. v4
 servers neither read nor write the columns.
 
-Migration 0006 (`land_leases`, ADR 0056) adds the land lease table, empty.
-Servers write it only with `--land-coordination on`; older servers never read
-it, so the migration tolerates them. See "Land leases" below.
+Migration 0006 (`leases`, ADR 0056) adds the lease table, empty. Servers
+write it only with `--land-coordination on` (and, later, for the indexer
+scope of ADR 0058); older servers never read it, so the migration tolerates
+them. See "Leases" below.
 
 ### Changeset rows (ADR 0053)
 
@@ -576,9 +579,11 @@ hash or derived encoding changed. Rules:
 - Entries are never removed. They name changesets, which are never deleted, so
   blob garbage collection is unaffected.
 
-## Land leases (new table, `MetaStore` methods and headers, ADR 0056)
+## Leases (new table, `MetaStore` methods and headers, ADR 0056)
 
-The `land_leases` table above holds, per ref, which server batches its lands.
+The `leases` table above holds which server holds one kind of work (`scope`)
+over one name and shard. Land coordination uses scope `land`: per ref
+(`name`, shard 0), which server batches its lands.
 A row is written only by single conditional statements: take or keep
 (`INSERT ... ON CONFLICT DO UPDATE ... WHERE` the row is the claimant's own,
 or `expires_at` has passed, or `renewed_at` is older than the caller's
@@ -589,10 +594,10 @@ the database's clock on Postgres and by the process clock on SQLite.
 `repo_id` is 1 until repositories exist (ADR 0054). Rows are hints about
 where lands are batched and are never needed to read anything: a backup does
 not copy them and a restore clears the table. `MetaStore` gains
-`supports_land_leases`, `land_lease`, `acquire_land_lease`,
-`renew_land_leases` and `release_land_lease`; the defaults refuse, which
-leaves a backend without them uncoordinated. `check_land_lease_contract`
-checks them.
+`supports_leases`, `lease`, `acquire_lease`, `renew_leases` and
+`release_lease`, keyed by `LeaseKey` (scope, repo_id, name, shard), with the
+timing passed per call; the defaults refuse, which leaves a backend without
+them uncoordinated. `check_lease_contract` checks them.
 
 On the wire nothing a client sends or reads changed. Between servers:
 

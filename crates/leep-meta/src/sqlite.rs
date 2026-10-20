@@ -54,8 +54,8 @@ pub const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 6,
-        name: "land_leases",
-        sql: include_str!("../migrations/sqlite/0006_land_leases.sql"),
+        name: "leases",
+        sql: include_str!("../migrations/sqlite/0006_leases.sql"),
         satisfied_by: &[],
     },
 ];
@@ -620,37 +620,42 @@ impl MetaStore for SqliteMetaStore {
         Ok(true)
     }
 
-    fn supports_land_leases(&self) -> bool {
+    fn supports_leases(&self) -> bool {
         true
     }
 
-    async fn land_lease(
+    async fn lease(
         &self,
-        ref_name: &str,
+        key: &leep_core::LeaseKey,
         timing: leep_core::LeaseTiming,
-    ) -> Result<Option<leep_core::LandLease>> {
-        crate::leases::sqlite_get(&self.pool, ref_name, timing).await
+    ) -> Result<Option<leep_core::Lease>> {
+        crate::leases::sqlite_get(&self.pool, key, timing).await
     }
 
-    async fn acquire_land_lease(
+    async fn acquire_lease(
         &self,
         claim: &leep_core::LeaseClaim<'_>,
         timing: leep_core::LeaseTiming,
-    ) -> Result<leep_core::LandLease> {
+    ) -> Result<leep_core::Lease> {
         crate::leases::sqlite_acquire(&self.pool, claim, timing).await
     }
 
-    async fn renew_land_leases(
+    async fn renew_leases(
         &self,
         holder: &str,
-        held: &[(String, u64)],
+        held: &[(leep_core::LeaseKey, u64)],
         timing: leep_core::LeaseTiming,
     ) -> Result<Vec<Option<std::time::Duration>>> {
         crate::leases::sqlite_renew(&self.pool, holder, held, timing).await
     }
 
-    async fn release_land_lease(&self, ref_name: &str, holder: &str, epoch: u64) -> Result<bool> {
-        crate::leases::sqlite_release(&self.pool, ref_name, holder, epoch).await
+    async fn release_lease(
+        &self,
+        key: &leep_core::LeaseKey,
+        holder: &str,
+        epoch: u64,
+    ) -> Result<bool> {
+        crate::leases::sqlite_release(&self.pool, key, holder, epoch).await
     }
 
     async fn cas_ref_logged_chain(

@@ -527,7 +527,7 @@ are unaffected. Nothing is lost or landed twice.
 1. Why: `sum by (reason) (rate(leep_land_forwarded_total{outcome="failed"}[10m]))`
    on the senders. `not_allowed` is step 2; `connect` and `timeout` are
    step 3; `reset` with a healthy network points at the holder (step 4).
-   Which holder: `SELECT ref_name, holder, address, epoch FROM land_leases`
+   Which holder: `SELECT name, holder, address, epoch FROM leases WHERE scope = 'land'`
    on the metadata store, and the WARN lines `peer address ... is not
    allowed` on the senders.
 2. An address the senders refuse: it is outside their `--peer-url-prefix` /
@@ -547,7 +547,7 @@ SIGTERM) the holder: it releases its leases on shutdown, and the next land
 elsewhere takes them. As a last resort, `--land-coordination off` everywhere
 brings back the old behaviour, with its contention.
 
-**Escalate / collect.** The `land_leases` rows, each server's flags, the
+**Escalate / collect.** The `leases` rows of scope `land`, each server's flags, the
 WARN lines and the [standard bundle](#collecting-a-bug-report).
 
 ## LeepLandLeaseFlapping

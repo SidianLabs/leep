@@ -56,16 +56,23 @@ variant, which this ADR now records:
 ## Decision
 
 ### Lease
-Migration 0006 (Postgres and SQLite) adds `land_leases`. It is numbered
-after ADR 0057's migration 0005:
+Migration 0006 (Postgres and SQLite) adds one `leases` table for every kind
+of work a server can hold, so the indexer service of ADR 0058 reuses it
+without a migration of its own. It is numbered after ADR 0057's migration
+0005:
 
 ```sql
-land_leases(repo_id BIGINT NOT NULL DEFAULT 1, ref_name TEXT NOT NULL,
-            holder TEXT NOT NULL, address TEXT NOT NULL, protocol INTEGER NOT NULL,
-            epoch BIGINT NOT NULL, renewed_at BIGINT NOT NULL, expires_at BIGINT NOT NULL,
-            PRIMARY KEY (repo_id, ref_name))
+leases(scope TEXT NOT NULL, repo_id BIGINT NOT NULL DEFAULT 1, name TEXT NOT NULL,
+       shard INTEGER NOT NULL DEFAULT 0, holder TEXT NOT NULL, address TEXT NOT NULL,
+       protocol INTEGER NOT NULL, meta TEXT NOT NULL DEFAULT '', epoch BIGINT NOT NULL,
+       renewed_at BIGINT NOT NULL, expires_at BIGINT NOT NULL,
+       PRIMARY KEY (scope, repo_id, name, shard))
 ```
 
+- `scope` names the kind of work. Land coordination uses `land`, with the
+  ref as `name` and shard 0. Each scope picks its own timing per call (land:
+  2 s TTL renewed every 500 ms; ADR 0058 plans 15 s and 3 s).
+- `meta` is free text a holder publishes for its scope; lands leave it empty.
 - `holder` is random per process start.
 - `address` is the holder's `--advertise-url`.
 - Times are milliseconds by the store's clock: `clock_timestamp()` on
@@ -73,11 +80,14 @@ land_leases(repo_id BIGINT NOT NULL DEFAULT 1, ref_name TEXT NOT NULL,
 - `repo_id` is ready for ADR 0054.
 - The migration only creates a table, so it tolerates old servers.
 
-`MetaStore` gains `supports_land_leases`, `land_lease`,
-`acquire_land_lease`, `renew_land_leases` and `release_land_lease`. Each is
-one conditional statement, plus a read of the row it settled. The defaults
+`MetaStore` gains generic `supports_leases`, `lease`, `acquire_lease`,
+`renew_leases` and `release_lease`, keyed by `LeaseKey` (scope, repository,
+name, shard); `LandCoordinator` wraps them for the `land` scope. Each is one
+conditional statement, plus a read of the row it settled. The defaults
 refuse, and a store that refuses is left uncoordinated.
-`check_land_lease_contract` covers memory, SQLite and Postgres.
+`check_lease_contract` covers memory, SQLite and Postgres, for the land
+scope, a sharded scope with `meta`, and keys that differ only in scope,
+repository, name or shard. All scopes share the store's lease connections.
 
 - **Take.** `INSERT ... ON CONFLICT DO UPDATE ... WHERE` the row is the
   claimant's own, or `expires_at` has passed, or `renewed_at` is older than
@@ -294,6 +304,13 @@ The code review of the implementation added:
 - A server shutting down answers lands 503 instead of batching them.
 - The startup warning for an allow-list of host names, failure reasons on
   `leep_land_forwarded_total`, and the peer-network and prefix guidance.
+
+The indexer service's design review (ADR 0058) asked for one lease table
+for every kind of work instead of `land_leases`, so the indexer needs no
+second migration: `leases` keyed by scope, repository, name and shard, a
+generic `MetaStore` API with timing per call, one contract for both scopes,
+and one set of lease connections shared by all scopes. Still migration
+0006.
 
 ## Testing
 - **Store contract** on memory, SQLite and Postgres: take, keep, refuse a

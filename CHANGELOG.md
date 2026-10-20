@@ -565,7 +565,7 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 - Lands on one ref are batched by one server however many servers share the
   metadata store (ADR 0056), with `--land-coordination on` (off by default
   until it is measured on separate hosts; see `docs/OPERATIONS.md`). A per-ref lease
-  in the new `land_leases` table (migration 0006) names the server that
+  in the new `leases` table (migration 0006, scope `land`; other kinds of work can reuse it) names the server that
   batches a ref's lands; the others forward lands to it over HTTP with the
   client's own body and token, only to addresses on an allow-list
   (`--advertise-url`, `--peer-url-prefix`, `--peer-cidr`). Before, two or

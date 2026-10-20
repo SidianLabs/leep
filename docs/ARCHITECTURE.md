@@ -1044,7 +1044,7 @@ implementation. Nothing above the traits changes.
 ([ADR 0056](adr/0056-land-coordinator-per-ref.md)). Group commit batches a
 ref's lands only within one process, so from the Team stage on, servers must
 not race each other on a hot ref: run them with `--land-coordination on`.
-Each ref gets one leader: the server holding its row in `land_leases`, taken
+Each ref gets one leader: the server holding its `land` row in `leases`, taken
 and renewed with single conditional statements (2 s TTL, renewed every
 500 ms, taken over only once the TTL has passed without a renewal). Other
 servers forward `POST /v1/land` to the leader's `--advertise-url`, checked

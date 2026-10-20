@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use leep_core::api::LandResponse;
 use leep_core::refname;
 use leep_core::{
-    ChangesetId, Error, LandId, LandLease, LeaseClaim, LeaseTiming, MetaStore, Result,
+    ChangesetId, Error, LandId, Lease, LeaseClaim, LeaseKey, LeaseTiming, MetaStore, Result,
 };
 use tokio::sync::watch;
 use tokio::time::Instant;
@@ -78,7 +78,7 @@ pub enum Route {
     /// This server holds the lease at this epoch and batches the land.
     Lead(u64),
     /// Another server holds a live lease.
-    Forward(LandLease),
+    Forward(Lease),
     /// No live lease is known and none could be taken (the store failed):
     /// batch it here, racing the CAS as before.
     Uncoordinated,
@@ -115,7 +115,7 @@ impl<A> Forwarded<A> {
 /// Sends one land to the server named by a lease.
 #[async_trait]
 pub trait LandForward<A>: Send + Sync {
-    async fn forward(&self, lease: &LandLease) -> Forwarded<A>;
+    async fn forward(&self, lease: &Lease) -> Forwarded<A>;
 }
 
 /// The outcome of [`Repo::land_coordinated`].
@@ -142,7 +142,7 @@ struct Held {
 }
 
 struct Seen {
-    lease: Option<LandLease>,
+    lease: Option<Lease>,
     read_at: Instant,
     /// A forward to it failed: read again before trusting it, but keep it
     /// as the fallback while the store cannot be read.
@@ -212,6 +212,23 @@ impl LandCoordinator {
         metrics::gauge!("leep_land_leases_held").set(n as f64);
     }
 
+    /// Renew the land leases of `held` refs (the `land` lease scope).
+    async fn renew(&self, held: &[(String, u64)]) -> Result<Vec<Option<Duration>>> {
+        let keys: Vec<(LeaseKey, u64)> = held
+            .iter()
+            .map(|(r, e)| (LeaseKey::land(r.as_str()), *e))
+            .collect();
+        self.meta
+            .renew_leases(&self.cfg.holder, &keys, self.cfg.timing())
+            .await
+    }
+
+    async fn release(&self, r: &str, epoch: u64) -> Result<bool> {
+        self.meta
+            .release_lease(&LeaseKey::land(r), &self.cfg.holder, epoch)
+            .await
+    }
+
     async fn renew_all(&self) {
         let now = Instant::now();
         let (renew, idle): (Vec<HeldLease>, Vec<HeldLease>) = {
@@ -229,19 +246,12 @@ impl LandCoordinator {
         for (r, epoch) in idle {
             // Gone from `held` first, so no land is routed to it meanwhile.
             self.lock().held.remove(&r);
-            let _ = self
-                .meta
-                .release_land_lease(&r, &self.cfg.holder, epoch)
-                .await;
+            let _ = self.release(&r, epoch).await;
             metrics::counter!("leep_land_lease_lost_total", "reason" => "idle").increment(1);
         }
         if !renew.is_empty() {
             let sent = Instant::now();
-            if let Ok(left) = self
-                .meta
-                .renew_land_leases(&self.cfg.holder, &renew, self.cfg.timing())
-                .await
-            {
+            if let Ok(left) = self.renew(&renew).await {
                 let mut s = self.lock();
                 for ((r, epoch), left) in renew.iter().zip(left) {
                     match left {
@@ -271,11 +281,7 @@ impl LandCoordinator {
     async fn renew_one(&self, r: &str, epoch: u64) -> bool {
         let sent = Instant::now();
         let held = [(r.to_string(), epoch)];
-        match self
-            .meta
-            .renew_land_leases(&self.cfg.holder, &held, self.cfg.timing())
-            .await
-        {
+        match self.renew(&held).await {
             Ok(left) => {
                 let mut s = self.lock();
                 match left.first().copied().flatten() {
@@ -303,7 +309,7 @@ impl LandCoordinator {
 
     /// The lease row of `r`, from a read at most half a renew interval old
     /// unless `fresh`.
-    async fn read(&self, r: &str, fresh: bool) -> Result<Option<LandLease>> {
+    async fn read(&self, r: &str, fresh: bool) -> Result<Option<Lease>> {
         if !fresh {
             let s = self.lock();
             if let Some(seen) = s.seen.get(r).filter(|seen| !seen.stale) {
@@ -317,7 +323,10 @@ impl LandCoordinator {
             }
         }
         let read_at = Instant::now();
-        let lease = self.meta.land_lease(r, self.cfg.timing()).await?;
+        let lease = self
+            .meta
+            .lease(&LeaseKey::land(r), self.cfg.timing())
+            .await?;
         self.lock().seen.insert(
             r.to_string(),
             Seen {
@@ -333,7 +342,7 @@ impl LandCoordinator {
     /// run out by its own reported time since: what a land falls back on
     /// while the store cannot be read, so it is never batched here under a
     /// lease another server may still hold (H1).
-    fn cached_live(&self, r: &str) -> Option<LandLease> {
+    fn cached_live(&self, r: &str) -> Option<Lease> {
         let s = self.lock();
         let seen = s.seen.get(r)?;
         let mut l = seen.lease.clone()?;
@@ -384,18 +393,16 @@ impl LandCoordinator {
         if self.lock().stopped {
             return Route::ShuttingDown;
         }
+        let key = LeaseKey::land(r);
         let claim = LeaseClaim {
-            ref_name: r,
+            key: &key,
             holder: &self.cfg.holder,
             address: &self.cfg.address,
             protocol: LAND_FORWARD_PROTOCOL,
+            meta: "",
         };
         let sent = Instant::now();
-        match self
-            .meta
-            .acquire_land_lease(&claim, self.cfg.timing())
-            .await
-        {
+        match self.meta.acquire_lease(&claim, self.cfg.timing()).await {
             Ok(l) if l.holder == self.cfg.holder => {
                 let mut s = self.lock();
                 s.seen.remove(r);
@@ -434,7 +441,7 @@ impl LandCoordinator {
         }
     }
 
-    fn forward_to(&self, l: LandLease) -> Route {
+    fn forward_to(&self, l: Lease) -> Route {
         if l.protocol == LAND_FORWARD_PROTOCOL {
             Route::Forward(l)
         } else {
@@ -467,7 +474,7 @@ impl LandCoordinator {
     /// Resolves once `r`'s lease is no longer `lease` (another holder or
     /// epoch), or is no longer live. A forward waits on it, so a land never
     /// waits on a holder that has gone.
-    pub async fn lease_changed(&self, r: &str, lease: &LandLease) {
+    pub async fn lease_changed(&self, r: &str, lease: &Lease) {
         loop {
             tokio::time::sleep(self.cfg.renew / 2).await;
             match self.read(r, false).await {
@@ -489,10 +496,7 @@ impl LandCoordinator {
         };
         self.stop.send_replace(true);
         for (r, epoch) in held {
-            let _ = self
-                .meta
-                .release_land_lease(&r, &self.cfg.holder, epoch)
-                .await;
+            let _ = self.release(&r, epoch).await;
         }
         self.set_held_gauge(0);
     }

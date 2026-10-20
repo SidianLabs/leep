@@ -32,7 +32,7 @@ pub enum Op {
     DeleteDerivedKind,
     /// [`leep_core::MetaStore::find_lands`].
     FindLands,
-    /// Every land lease call (ADR 0056). Not in [`Op::META`], so plans
+    /// Every lease call (ADR 0056). Not in [`Op::META`], so plans
     /// written before leases existed inject what they always did.
     Lease,
 }

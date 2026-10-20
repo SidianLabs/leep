@@ -584,15 +584,17 @@ async fn verify(store: &dyn MetaStore, stage: &Stage, d: &Data, version: u64) {
     check_meta_store_contract(store).await;
     let timing = leep_core::LeaseTiming {
         ttl: std::time::Duration::from_secs(2),
-        stale_after: std::time::Duration::from_secs(1),
+        stale_after: std::time::Duration::from_secs(2),
     };
+    let key = leep_core::LeaseKey::land("main");
     let claim = leep_core::LeaseClaim {
-        ref_name: "main",
+        key: &key,
         holder: "verify",
         address: "http://127.0.0.1:1",
         protocol: 1,
+        meta: "",
     };
-    let lease = store.acquire_land_lease(&claim, timing).await.unwrap();
+    let lease = store.acquire_lease(&claim, timing).await.unwrap();
     assert_eq!((lease.holder.as_str(), lease.epoch), ("verify", 1), "{ctx}");
 }
 
@@ -601,7 +603,7 @@ fn full_schema() -> BTreeSet<String> {
         "changesets",
         "changeset_dicts",
         "store_features",
-        "land_leases",
+        "leases",
         "refs",
         "derived",
         "ref_log",
@@ -1000,7 +1002,7 @@ async fn upgrade_from_v4_adds_land_ids() {
         assert_eq!(plan.from, 4, "{kind}");
         assert_eq!(
             plan.pending.iter().map(|m| m.name).collect::<Vec<_>>(),
-            ["land_ids", "land_leases"],
+            ["land_ids", "leases"],
             "{kind}"
         );
         let s = db.open(db.compiled(), SchemaMode::Migrate).await.unwrap();

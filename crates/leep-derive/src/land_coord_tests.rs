@@ -18,8 +18,8 @@ use bytes::Bytes;
 use leep_core::api::LandResponse;
 use leep_core::memory::MemoryMetaStore;
 use leep_core::{
-    Changeset, ChangesetId, Error, Hash, LandId, LandLease, LandRecord, LeaseClaim, LeaseTiming,
-    MetaStore, RefLogEntry, RefStep, RefUpdateContext, Result,
+    Changeset, ChangesetId, Error, Hash, LandId, LandRecord, Lease, LeaseClaim, LeaseKey,
+    LeaseTiming, MetaStore, RefLogEntry, RefStep, RefUpdateContext, Result,
 };
 use leep_testkit::{is_injected, Fault, FaultPlan, FaultyBlobStore, FaultyMetaStore, Op, Rng};
 use tokio::sync::watch;
@@ -146,33 +146,29 @@ impl MetaStore for Pausable {
         self.gate().await;
         self.inner.find_lands(name, ids).await
     }
-    fn supports_land_leases(&self) -> bool {
-        self.inner.supports_land_leases()
+    fn supports_leases(&self) -> bool {
+        self.inner.supports_leases()
     }
-    async fn land_lease(&self, ref_name: &str, timing: LeaseTiming) -> Result<Option<LandLease>> {
+    async fn lease(&self, key: &LeaseKey, timing: LeaseTiming) -> Result<Option<Lease>> {
         self.gate().await;
-        self.inner.land_lease(ref_name, timing).await
+        self.inner.lease(key, timing).await
     }
-    async fn acquire_land_lease(
-        &self,
-        claim: &LeaseClaim<'_>,
-        timing: LeaseTiming,
-    ) -> Result<LandLease> {
+    async fn acquire_lease(&self, claim: &LeaseClaim<'_>, timing: LeaseTiming) -> Result<Lease> {
         self.gate().await;
-        self.inner.acquire_land_lease(claim, timing).await
+        self.inner.acquire_lease(claim, timing).await
     }
-    async fn renew_land_leases(
+    async fn renew_leases(
         &self,
         holder: &str,
-        held: &[(String, u64)],
+        held: &[(LeaseKey, u64)],
         timing: LeaseTiming,
     ) -> Result<Vec<Option<Duration>>> {
         self.gate().await;
-        self.inner.renew_land_leases(holder, held, timing).await
+        self.inner.renew_leases(holder, held, timing).await
     }
-    async fn release_land_lease(&self, ref_name: &str, holder: &str, epoch: u64) -> Result<bool> {
+    async fn release_lease(&self, key: &LeaseKey, holder: &str, epoch: u64) -> Result<bool> {
         self.gate().await;
-        self.inner.release_land_lease(ref_name, holder, epoch).await
+        self.inner.release_lease(key, holder, epoch).await
     }
 }
 
@@ -238,14 +234,14 @@ struct NoForward;
 
 #[async_trait]
 impl LandForward<Result<LandResponse>> for NoForward {
-    async fn forward(&self, _: &LandLease) -> Forwarded<Result<LandResponse>> {
+    async fn forward(&self, _: &Lease) -> Forwarded<Result<LandResponse>> {
         panic!("a land forwarded to this server was forwarded again");
     }
 }
 
 #[async_trait]
 impl LandForward<Result<LandResponse>> for Fwd {
-    async fn forward(&self, lease: &LandLease) -> Forwarded<Result<LandResponse>> {
+    async fn forward(&self, lease: &Lease) -> Forwarded<Result<LandResponse>> {
         let Some(node) = self
             .net
             .nodes
@@ -466,10 +462,10 @@ async fn wait_for_leader(net: &Net) -> Arc<Node> {
     panic!("no server took the lease");
 }
 
-async fn lease_now(w: &World) -> LandLease {
+async fn lease_now(w: &World) -> Lease {
     w.meta
-        .land_lease(
-            REF,
+        .lease(
+            &LeaseKey::land(REF),
             LeaseTiming {
                 ttl: Duration::from_secs(2),
                 stale_after: Duration::from_secs(2),

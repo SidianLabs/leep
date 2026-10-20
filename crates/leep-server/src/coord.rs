@@ -22,7 +22,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use bytes::Bytes;
 use leep_core::api::ErrorResponse;
-use leep_core::LandLease;
+use leep_core::Lease;
 use leep_derive::land_coord::{Forwarded, LandForward, LAND_FORWARD_PROTOCOL};
 
 /// Marks a land forwarded by another server: `v=1; epoch=N; from=HOLDER`.
@@ -338,11 +338,11 @@ impl HttpForward {
 
 #[async_trait]
 impl LandForward<Relayed> for HttpForward {
-    async fn forward(&self, lease: &LandLease) -> Forwarded<Relayed> {
+    async fn forward(&self, lease: &Lease) -> Forwarded<Relayed> {
         let url = match self.coord.policy.check_url(&lease.address) {
             Ok(u) => u,
             Err(why) => {
-                tracing::warn!(r#ref = %lease.ref_name, holder = %lease.holder, "{why}");
+                tracing::warn!(r#ref = %lease.key.name, holder = %lease.holder, "{why}");
                 return Forwarded::failed("not_allowed", why);
             }
         };

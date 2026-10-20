@@ -356,7 +356,7 @@ Without coordination, servers that share a metadata store race each other's
 batches through the ref's compare-and-swap, and under load one wins every
 swap while the others' agents wait tens of seconds (`docs/PERFORMANCE.md`,
 "Several servers on one ref"). With `--land-coordination on` (ADR 0056) one
-server per ref, the holder of the ref's lease in the `land_leases` table,
+server per ref, the holder of the ref's lease in the `leases` table (scope `land`),
 batches every land on it; the others forward lands to it over HTTP.
 
 **Status.** Off by default. A single server, or SQLite, does not need it. For
@@ -441,7 +441,7 @@ on both servers.
 landing locally, racing the leader. During a rolling upgrade, keep routing
 `POST /v1/land` to one instance at the balancer, then turn coordination on
 everywhere and remove the rule. Migration 0006 only adds the empty
-`land_leases` table. To back out, set `--land-coordination off`; leases left
+`leases` table. To back out, set `--land-coordination off`; leases left
 behind expire within the TTL.
 
 A tier of dedicated landing servers (API servers that only forward, landers

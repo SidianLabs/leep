@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use leep_core::prefix::IdPrefix;
 use leep_core::{
-    Changeset, ChangesetId, DeleteStep, Hash, LandId, LandLease, LandRecord, LeaseClaim,
+    Changeset, ChangesetId, DeleteStep, Hash, LandId, LandRecord, Lease, LeaseClaim, LeaseKey,
     LeaseTiming, MetaStore, RefLogEntry, RefStep, RefUpdateContext, Result,
 };
 
@@ -94,50 +94,42 @@ impl MetaStore for FaultyMetaStore {
             .await
     }
 
-    fn supports_land_leases(&self) -> bool {
-        self.inner.supports_land_leases()
+    fn supports_leases(&self) -> bool {
+        self.inner.supports_leases()
     }
 
-    async fn land_lease(&self, ref_name: &str, timing: LeaseTiming) -> Result<Option<LandLease>> {
+    async fn lease(&self, key: &LeaseKey, timing: LeaseTiming) -> Result<Option<Lease>> {
         self.plan
-            .run(Op::Lease, self.inner.land_lease(ref_name, timing), |_, v| v)
+            .run(Op::Lease, self.inner.lease(key, timing), |_, v| v)
             .await
     }
 
-    async fn acquire_land_lease(
-        &self,
-        claim: &LeaseClaim<'_>,
-        timing: LeaseTiming,
-    ) -> Result<LandLease> {
+    async fn acquire_lease(&self, claim: &LeaseClaim<'_>, timing: LeaseTiming) -> Result<Lease> {
         self.plan
-            .run(
-                Op::Lease,
-                self.inner.acquire_land_lease(claim, timing),
-                |_, v| v,
-            )
+            .run(Op::Lease, self.inner.acquire_lease(claim, timing), |_, v| v)
             .await
     }
 
-    async fn renew_land_leases(
+    async fn renew_leases(
         &self,
         holder: &str,
-        held: &[(String, u64)],
+        held: &[(LeaseKey, u64)],
         timing: LeaseTiming,
     ) -> Result<Vec<Option<std::time::Duration>>> {
         self.plan
             .run(
                 Op::Lease,
-                self.inner.renew_land_leases(holder, held, timing),
+                self.inner.renew_leases(holder, held, timing),
                 |_, v| v,
             )
             .await
     }
 
-    async fn release_land_lease(&self, ref_name: &str, holder: &str, epoch: u64) -> Result<bool> {
+    async fn release_lease(&self, key: &LeaseKey, holder: &str, epoch: u64) -> Result<bool> {
         self.plan
             .run(
                 Op::Lease,
-                self.inner.release_land_lease(ref_name, holder, epoch),
+                self.inner.release_lease(key, holder, epoch),
                 |_, v| v,
             )
             .await

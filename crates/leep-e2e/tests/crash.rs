@@ -856,7 +856,7 @@ fn lease_holder(meta_url: &str) -> Option<String> {
     common_block_on(async {
         let mut c = sqlx::PgConnection::connect(meta_url).await.ok()?;
         let row = sqlx::query(
-            "SELECT address FROM land_leases WHERE ref_name = 'main' \
+            "SELECT address FROM leases WHERE scope = 'land' AND name = 'main' \
              AND expires_at > (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT",
         )
         .fetch_optional(&mut c)

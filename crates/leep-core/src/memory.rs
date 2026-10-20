@@ -10,8 +10,8 @@ use bytes::Bytes;
 use crate::prefix::IdPrefix;
 use crate::store::{
     check_land_key, check_ref_chain, land_id_taken, lease_remaining_ms, unix_now, BlobMeta,
-    DeleteStep, DerivedRow, LandId, LandLease, LandRecord, LeaseClaim, LeaseTiming, RefLogEntry,
-    RefStep, RefUpdateContext,
+    DeleteStep, DerivedRow, LandId, LandRecord, Lease, LeaseClaim, LeaseKey, LeaseTiming,
+    RefLogEntry, RefStep, RefUpdateContext,
 };
 use crate::{BlobStore, Changeset, ChangesetId, Hash, MetaStore, Result};
 
@@ -103,7 +103,7 @@ pub struct MemoryMetaStore {
     changesets: Mutex<BTreeMap<ChangesetId, Changeset>>,
     refs: Mutex<Refs>,
     derived: Mutex<BTreeMap<(String, Hash), Bytes>>,
-    leases: Mutex<BTreeMap<String, LeaseRow>>,
+    leases: Mutex<BTreeMap<LeaseKey, LeaseRow>>,
     lease_clock: LeaseClock,
 }
 
@@ -129,19 +129,21 @@ struct LeaseRow {
     holder: String,
     address: String,
     protocol: u32,
+    meta: String,
     epoch: u64,
     renewed_at: i64,
     expires_at: i64,
 }
 
 impl LeaseRow {
-    fn lease(&self, ref_name: &str, now: i64, timing: LeaseTiming) -> LandLease {
+    fn lease(&self, key: &LeaseKey, now: i64, timing: LeaseTiming) -> Lease {
         let left = lease_remaining_ms(now, self.renewed_at, self.expires_at, timing);
-        LandLease {
-            ref_name: ref_name.to_string(),
+        Lease {
+            key: key.clone(),
             holder: self.holder.clone(),
             address: self.address.clone(),
             protocol: self.protocol,
+            meta: self.meta.clone(),
             epoch: self.epoch,
             remaining: std::time::Duration::from_millis(left as u64),
         }
@@ -253,34 +255,31 @@ impl MemoryMetaStore {
 
 #[async_trait]
 impl MetaStore for MemoryMetaStore {
-    fn supports_land_leases(&self) -> bool {
+    fn supports_leases(&self) -> bool {
         true
     }
 
-    async fn land_lease(&self, ref_name: &str, timing: LeaseTiming) -> Result<Option<LandLease>> {
+    async fn lease(&self, key: &LeaseKey, timing: LeaseTiming) -> Result<Option<Lease>> {
         let now = self.lease_clock.now();
         let leases = self.leases.lock().unwrap();
-        Ok(leases.get(ref_name).map(|r| r.lease(ref_name, now, timing)))
+        Ok(leases.get(key).map(|r| r.lease(key, now, timing)))
     }
 
-    async fn acquire_land_lease(
-        &self,
-        claim: &LeaseClaim<'_>,
-        timing: LeaseTiming,
-    ) -> Result<LandLease> {
+    async fn acquire_lease(&self, claim: &LeaseClaim<'_>, timing: LeaseTiming) -> Result<Lease> {
         let now = self.lease_clock.now();
         let mut leases = self.leases.lock().unwrap();
         let fresh = |epoch| LeaseRow {
             holder: claim.holder.to_string(),
             address: claim.address.to_string(),
             protocol: claim.protocol,
+            meta: claim.meta.to_string(),
             epoch,
             renewed_at: now,
             expires_at: now.saturating_add(ms(timing.ttl)),
         };
-        match leases.get_mut(claim.ref_name) {
+        match leases.get_mut(claim.key) {
             None => {
-                leases.insert(claim.ref_name.to_string(), fresh(1));
+                leases.insert(claim.key.clone(), fresh(1));
             }
             Some(row) if row.holder == claim.holder => *row = fresh(row.epoch),
             Some(row) if lease_remaining_ms(now, row.renewed_at, row.expires_at, timing) == 0 => {
@@ -288,33 +287,33 @@ impl MetaStore for MemoryMetaStore {
             }
             Some(_) => {}
         }
-        Ok(leases[claim.ref_name].lease(claim.ref_name, now, timing))
+        Ok(leases[claim.key].lease(claim.key, now, timing))
     }
 
-    async fn renew_land_leases(
+    async fn renew_leases(
         &self,
         holder: &str,
-        held: &[(String, u64)],
+        held: &[(LeaseKey, u64)],
         timing: LeaseTiming,
     ) -> Result<Vec<Option<std::time::Duration>>> {
         let now = self.lease_clock.now();
         let mut leases = self.leases.lock().unwrap();
         Ok(held
             .iter()
-            .map(|(name, epoch)| match leases.get_mut(name) {
+            .map(|(key, epoch)| match leases.get_mut(key) {
                 Some(row) if row.holder == holder && row.epoch == *epoch => {
                     row.renewed_at = now;
                     row.expires_at = now.saturating_add(ms(timing.ttl));
-                    Some(row.lease(name, now, timing).remaining)
+                    Some(row.lease(key, now, timing).remaining)
                 }
                 _ => None,
             })
             .collect())
     }
 
-    async fn release_land_lease(&self, ref_name: &str, holder: &str, epoch: u64) -> Result<bool> {
+    async fn release_lease(&self, key: &LeaseKey, holder: &str, epoch: u64) -> Result<bool> {
         let mut leases = self.leases.lock().unwrap();
-        match leases.get_mut(ref_name) {
+        match leases.get_mut(key) {
             Some(row) if row.holder == holder && row.epoch == epoch => {
                 row.renewed_at = 0;
                 row.expires_at = 0;
@@ -578,66 +577,110 @@ impl MetaStore for MemoryMetaStore {
     }
 }
 
-/// Conformance checks for the land lease methods (ADR 0056), for every
-/// `MetaStore` whose `supports_land_leases` is true. Sleeps for real (about a
-/// second in all), so the store's clock must be the system's.
-pub async fn check_land_lease_contract(store: &dyn MetaStore) {
+/// Conformance checks for the lease methods (ADR 0056), for every
+/// `MetaStore` whose `supports_leases` is true: land coordination's scope and
+/// a sharded scope of another kind, and their independence. Sleeps for real
+/// (about a second in all), so the store's clock must be the system's.
+pub async fn check_lease_contract(store: &dyn MetaStore) {
+    assert!(store.supports_leases());
+    let land = LeaseKey::land("lease-contract/a");
+    check_one_lease_scope(store, &land, "").await;
+    let other = LeaseKey::new("lease-contract-indexer", "lease-contract/a").with_shard(3);
+    check_one_lease_scope(store, &other, "{\"part\":3}").await;
+
+    // Keys differ in scope, repository, name or shard: independent leases.
     use std::time::Duration;
-    assert!(store.supports_land_leases());
+    let timing = LeaseTiming {
+        ttl: Duration::from_millis(600),
+        stale_after: Duration::from_millis(600),
+    };
+    let base = LeaseKey::new("lease-contract-iso", "x");
+    let keys = [
+        base.clone(),
+        LeaseKey::new("lease-contract-iso2", "x"),
+        LeaseKey {
+            repo_id: 2,
+            ..base.clone()
+        },
+        LeaseKey::new("lease-contract-iso", "y"),
+        base.clone().with_shard(1),
+    ];
+    for (i, key) in keys.iter().enumerate() {
+        let holder = format!("iso-{i}");
+        let got = store
+            .acquire_lease(
+                &LeaseClaim {
+                    key,
+                    holder: &holder,
+                    address: "http://10.0.0.1:7070",
+                    protocol: 1,
+                    meta: "",
+                },
+                timing,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            (got.holder.as_str(), got.epoch),
+            (holder.as_str(), 1),
+            "{key:?}"
+        );
+        assert_eq!(&got.key, key);
+    }
+}
+
+/// The rules of one lease, under `key`.
+async fn check_one_lease_scope(store: &dyn MetaStore, key: &LeaseKey, meta: &str) {
+    use std::time::Duration;
     let timing = LeaseTiming {
         ttl: Duration::from_millis(600),
         stale_after: Duration::from_millis(300),
     };
-    let claim = |ref_name, holder| LeaseClaim {
-        ref_name,
+    let claim = |key, holder| LeaseClaim {
+        key,
         holder,
         address: "http://10.0.0.1:7070",
         protocol: 1,
+        meta,
     };
-    let a = "lease-contract/a";
-    assert_eq!(store.land_lease(a, timing).await.unwrap(), None);
+    let a = key;
+    assert_eq!(store.lease(a, timing).await.unwrap(), None);
 
-    let got = store
-        .acquire_land_lease(&claim(a, "h1"), timing)
-        .await
-        .unwrap();
+    let got = store.acquire_lease(&claim(a, "h1"), timing).await.unwrap();
     assert_eq!((got.holder.as_str(), got.epoch), ("h1", 1));
+    assert_eq!(&got.key, a);
     assert_eq!(got.address, "http://10.0.0.1:7070");
     assert_eq!(got.protocol, 1);
+    assert_eq!(got.meta, meta);
     assert!(got.is_live());
     assert!(got.remaining <= timing.stale_after, "{got:?}");
 
     // A live lease of another holder is never taken; its own holder keeps it.
-    let other = store
-        .acquire_land_lease(&claim(a, "h2"), timing)
-        .await
-        .unwrap();
+    let other = store.acquire_lease(&claim(a, "h2"), timing).await.unwrap();
     assert_eq!((other.holder.as_str(), other.epoch), ("h1", 1));
     assert!(other.is_live());
-    let again = store
-        .acquire_land_lease(&claim(a, "h1"), timing)
-        .await
-        .unwrap();
+    let again = store.acquire_lease(&claim(a, "h1"), timing).await.unwrap();
     assert_eq!((again.holder.as_str(), again.epoch), ("h1", 1));
-    let read = store.land_lease(a, timing).await.unwrap().unwrap();
+    let read = store.lease(a, timing).await.unwrap().unwrap();
     assert_eq!((read.holder.as_str(), read.epoch), ("h1", 1));
+    assert_eq!(read.meta, meta);
 
     // Only the holder at its epoch renews.
     let renewed = store
-        .renew_land_leases("h1", &[(a.to_string(), 1)], timing)
+        .renew_leases("h1", &[(a.clone(), 1)], timing)
         .await
         .unwrap();
     assert!(renewed[0].is_some_and(|d| !d.is_zero() && d <= timing.stale_after));
     assert_eq!(
         store
-            .renew_land_leases("h2", &[(a.to_string(), 1)], timing)
+            .renew_leases("h2", &[(a.clone(), 1)], timing)
             .await
             .unwrap(),
         vec![None]
     );
     assert_eq!(
         store
-            .renew_land_leases("h1", &[(a.to_string(), 2)], timing)
+            .renew_leases("h1", &[(a.clone(), 2)], timing)
             .await
             .unwrap(),
         vec![None]
@@ -646,72 +689,55 @@ pub async fn check_land_lease_contract(store: &dyn MetaStore) {
     // Not renewed for longer than `stale_after`, though its ttl has not run
     // out: another holder takes it, at the next epoch.
     std::thread::sleep(Duration::from_millis(400));
-    let read = store.land_lease(a, timing).await.unwrap().unwrap();
+    let read = store.lease(a, timing).await.unwrap().unwrap();
     assert!(!read.is_live(), "{read:?}");
-    let taken = store
-        .acquire_land_lease(&claim(a, "h2"), timing)
-        .await
-        .unwrap();
+    let taken = store.acquire_lease(&claim(a, "h2"), timing).await.unwrap();
     assert_eq!((taken.holder.as_str(), taken.epoch), ("h2", 2));
     assert!(taken.is_live());
     assert_eq!(
         store
-            .renew_land_leases("h1", &[(a.to_string(), 1)], timing)
+            .renew_leases("h1", &[(a.clone(), 1)], timing)
             .await
             .unwrap(),
         vec![None],
         "the old holder learns it lost the lease"
     );
-    assert!(!store.release_land_lease(a, "h1", 1).await.unwrap());
-    assert!(store
-        .land_lease(a, timing)
-        .await
-        .unwrap()
-        .unwrap()
-        .is_live());
+    assert!(!store.release_lease(a, "h1", 1).await.unwrap());
+    assert!(store.lease(a, timing).await.unwrap().unwrap().is_live());
 
     // A released lease can be taken at once, and its epoch keeps growing.
-    assert!(store.release_land_lease(a, "h2", 2).await.unwrap());
-    assert!(!store
-        .land_lease(a, timing)
-        .await
-        .unwrap()
-        .unwrap()
-        .is_live());
-    let next = store
-        .acquire_land_lease(&claim(a, "h3"), timing)
-        .await
-        .unwrap();
+    assert!(store.release_lease(a, "h2", 2).await.unwrap());
+    assert!(!store.lease(a, timing).await.unwrap().unwrap().is_live());
+    let next = store.acquire_lease(&claim(a, "h3"), timing).await.unwrap();
     assert_eq!((next.holder.as_str(), next.epoch), ("h3", 3));
 
     // One renewal covers every lease of a holder, slot by slot.
-    let b = "lease-contract/b";
-    let got = store
-        .acquire_land_lease(&claim(b, "h3"), timing)
-        .await
-        .unwrap();
+    let b = LeaseKey {
+        name: format!("{}-b", a.name),
+        ..a.clone()
+    };
+    let got = store.acquire_lease(&claim(&b, "h3"), timing).await.unwrap();
     assert_eq!((got.holder.as_str(), got.epoch), ("h3", 1));
+    let none = LeaseKey {
+        name: format!("{}-none", a.name),
+        ..a.clone()
+    };
     let renewed = store
-        .renew_land_leases(
-            "h3",
-            &[
-                (a.to_string(), 3),
-                (b.to_string(), 1),
-                ("lease-contract/none".to_string(), 1),
-            ],
-            timing,
-        )
+        .renew_leases("h3", &[(a.clone(), 3), (b.clone(), 1), (none, 1)], timing)
         .await
         .unwrap();
     assert!(renewed[0].is_some() && renewed[1].is_some(), "{renewed:?}");
     assert_eq!(renewed[2], None);
 
-    // Racing claimants on a free ref: exactly one holds it afterwards.
-    let c = "lease-contract/c";
-    let (h4, h5) = (claim(c, "h4"), claim(c, "h5"));
+    // Racing claimants on a free lease: exactly one holds it afterwards.
+    let c = LeaseKey {
+        name: format!("{}-c", a.name),
+        ..a.clone()
+    };
+    let (h4, h5) = (claim(&c, "h4"), claim(&c, "h5"));
     let (x, y) = futures_util::join!(
-        store.acquire_land_lease(&h4, timing),
-        store.acquire_land_lease(&h5, timing)
+        store.acquire_lease(&h4, timing),
+        store.acquire_lease(&h5, timing)
     );
     let (x, y) = (x.unwrap(), y.unwrap());
     assert_eq!(x.holder, y.holder, "{x:?} {y:?}");
@@ -1856,19 +1882,19 @@ mod tests {
 
     #[tokio::test]
     async fn memory_leases_pass_contract() {
-        check_land_lease_contract(&MemoryMetaStore::new()).await;
+        check_lease_contract(&MemoryMetaStore::new()).await;
     }
 
     /// A store without leases says so, and its lease calls refuse.
     #[tokio::test]
     async fn stores_without_leases_refuse_lease_calls() {
         let store = DefaultChain(MemoryMetaStore::new());
-        assert!(!store.supports_land_leases());
+        assert!(!store.supports_leases());
         let timing = LeaseTiming {
             ttl: std::time::Duration::from_secs(2),
             stale_after: std::time::Duration::from_secs(1),
         };
-        assert!(store.land_lease("main", timing).await.is_err());
+        assert!(store.lease(&LeaseKey::land("main"), timing).await.is_err());
     }
 
     /// Forwards everything but `cas_ref_logged_chain`, so the trait's

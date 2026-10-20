@@ -910,7 +910,7 @@ fn land_coordination(
     if args.peer_url_prefix.is_empty() && args.peer_cidr.is_empty() {
         anyhow::bail!("--land-coordination on needs --peer-url-prefix or --peer-cidr");
     }
-    if !meta.supports_land_leases() {
+    if !meta.supports_leases() {
         anyhow::bail!("--land-coordination on needs a Postgres or SQLite metadata store");
     }
     if args.land_lease_renew.is_zero() || args.land_lease_ttl < args.land_lease_renew * 2 {

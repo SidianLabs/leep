@@ -55,8 +55,8 @@ pub const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 6,
-        name: "land_leases",
-        sql: include_str!("../migrations/postgres/0006_land_leases.sql"),
+        name: "leases",
+        sql: include_str!("../migrations/postgres/0006_leases.sql"),
         satisfied_by: &[],
     },
 ];
@@ -72,15 +72,16 @@ const MIGRATE_LOCK: i64 = 7164737;
 /// order is commit order. Nothing waits on a row lock while holding it.
 const LOG_LOCK: i64 = 7164738;
 
-/// Connections reserved for land lease calls: one renewal statement per
-/// process every renew interval, plus the odd claim or release.
+/// Connections reserved for lease calls of every scope: one renewal
+/// statement per process and scope every renew interval, plus the odd
+/// claim or release.
 const LEASE_POOL_SIZE: u32 = 2;
 
 pub struct PostgresMetaStore {
     pub(crate) pool: PgPool,
-    /// Land lease calls only (ADR 0056), so a renewal never waits for a
-    /// connection behind data traffic: a lease not renewed in time is taken
-    /// over. Connects on first use.
+    /// Lease calls only (ADR 0056), every scope, so a renewal never waits
+    /// for a connection behind data traffic: a lease not renewed in time is
+    /// taken over. Connects on first use.
     pub(crate) lease_pool: PgPool,
     /// Changeset dictionaries (ADR 0053).
     pub(crate) codec: Codec,
@@ -748,37 +749,42 @@ impl MetaStore for PostgresMetaStore {
         Ok(true)
     }
 
-    fn supports_land_leases(&self) -> bool {
+    fn supports_leases(&self) -> bool {
         true
     }
 
-    async fn land_lease(
+    async fn lease(
         &self,
-        ref_name: &str,
+        key: &leep_core::LeaseKey,
         timing: leep_core::LeaseTiming,
-    ) -> Result<Option<leep_core::LandLease>> {
-        crate::leases::pg_get(&self.lease_pool, ref_name, timing).await
+    ) -> Result<Option<leep_core::Lease>> {
+        crate::leases::pg_get(&self.lease_pool, key, timing).await
     }
 
-    async fn acquire_land_lease(
+    async fn acquire_lease(
         &self,
         claim: &leep_core::LeaseClaim<'_>,
         timing: leep_core::LeaseTiming,
-    ) -> Result<leep_core::LandLease> {
+    ) -> Result<leep_core::Lease> {
         crate::leases::pg_acquire(&self.lease_pool, claim, timing).await
     }
 
-    async fn renew_land_leases(
+    async fn renew_leases(
         &self,
         holder: &str,
-        held: &[(String, u64)],
+        held: &[(leep_core::LeaseKey, u64)],
         timing: leep_core::LeaseTiming,
     ) -> Result<Vec<Option<std::time::Duration>>> {
         crate::leases::pg_renew(&self.lease_pool, holder, held, timing).await
     }
 
-    async fn release_land_lease(&self, ref_name: &str, holder: &str, epoch: u64) -> Result<bool> {
-        crate::leases::pg_release(&self.lease_pool, ref_name, holder, epoch).await
+    async fn release_lease(
+        &self,
+        key: &leep_core::LeaseKey,
+        holder: &str,
+        epoch: u64,
+    ) -> Result<bool> {
+        crate::leases::pg_release(&self.lease_pool, key, holder, epoch).await
     }
 
     async fn cas_ref_logged_chain(
