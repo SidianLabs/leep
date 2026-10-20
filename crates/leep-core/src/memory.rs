@@ -879,6 +879,61 @@ pub async fn check_meta_store_contract(store: &dyn MetaStore) {
     check_delete_derived_steps(store).await;
     check_batched_reads(store).await;
     check_batched_writes(store).await;
+    check_rewrites(store).await;
+}
+
+/// Through every write path, an identical write leaves the row alone (same
+/// value, no second row) and a different value replaces it. Derivation is
+/// deterministic, so racing derivations write identical rows; review
+/// verdicts rely on the last write winning. Backends that can skip the
+/// identical write (Postgres, SQLite) also test that the row is not
+/// rewritten.
+async fn check_rewrites(store: &dyn MetaStore) {
+    let key = |n: u32| Hash::of_blob(format!("rewrite {n}").as_bytes());
+    let value = |tag: &str, n: u32| Bytes::from(format!("{tag} {n}"));
+    let cs = |n: i64| Changeset {
+        parents: vec![],
+        author: "t".into(),
+        timestamp: 5000 + n,
+        message: format!("rewrite {n}"),
+        changes: BTreeMap::new(),
+        extra: BTreeMap::new(),
+    };
+    let write = |tag: &'static str| async move {
+        let row = |n: u32| DerivedRow::new("rewrite", key(n), value(tag, n));
+        store
+            .put_derived("rewrite", &key(0), value(tag, 0))
+            .await
+            .unwrap();
+        store.put_derived_many(&[row(1)]).await.unwrap();
+        store
+            .put_changeset_with_derived(&cs(1), &[row(2)])
+            .await
+            .unwrap();
+        store
+            .put_changesets_with_derived(&[cs(2)], &[row(3)])
+            .await
+            .unwrap();
+    };
+    let check = |tag: &'static str| async move {
+        for n in 0..4 {
+            assert_eq!(
+                store.get_derived("rewrite", &key(n)).await.unwrap(),
+                Some(value(tag, n)),
+                "row {n} after writing {tag:?}"
+            );
+        }
+        assert_eq!(
+            store.list_derived("rewrite", None, 10).await.unwrap().len(),
+            4,
+            "one row per key"
+        );
+    };
+    write("same").await;
+    write("same").await;
+    check("same").await;
+    write("changed").await;
+    check("changed").await;
 }
 
 /// The batched writes store what the single writes would, applied in order:

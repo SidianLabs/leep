@@ -685,6 +685,9 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   bytes per changeset there. The warmer derives it; `verify` checks it,
   `repair rederive`/`drop --kind log-filter-v1` handle it. New example
   `log_filter_profile`.
+- Writing a derived row that is already stored with the same bytes no
+  longer rewrites it, so duplicate derivations (several servers warming,
+  a query and the warmer) add no dead row versions or WAL on Postgres.
 - The index warmer follows the ref log (ADR 0058, phase 0). It used to
   list every ref every 30 s, so on a busy ref the path-history and
   log-filter indexes trailed the head by up to 30 s of lands before any

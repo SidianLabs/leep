@@ -1062,7 +1062,9 @@ fn code_search_over_the_real_binaries() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     let stores = Stores::sqlite(&root.join("data"));
-    let server = Server::start(&stores, root);
+    // The test counts the rows `derive-search` writes, so the warmer must not
+    // derive them first.
+    let server = Server::start_with(free_port(), &stores, root, &["--warm-interval", "0"]);
     let client = Client::new(&server.url, &root.join("cache"));
 
     let wc = root.join("wc");
