@@ -1,5 +1,5 @@
 # 0028. Background index warming
-Status: Accepted
+Status: Accepted; amended by 0058 (the warmer tails the ref log every 250 ms and lists refs every 5 s)
 Date: 2026-10-16
 
 ## Context

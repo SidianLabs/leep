@@ -224,32 +224,35 @@ refs' new changesets derive side by side (ADR 0058, phase 0).
 and the warmer never derive the same range twice. The lock and the warmer are
 per process, so servers sharing a store each derive every range.
 
-**One indexer per kind** ([ADR 0058](adr/0058-one-indexer-per-kind.md),
-designed, not implemented yet). Today's behaviour stays the default
-(`--indexing local`). In the `lease` and `off` modes:
+**One indexer per kind** ([ADR 0058](adr/0058-one-indexer-per-kind.md)).
+Phase 0 is in place: the warmer's ref-log tail and `derive_heads` above, and
+derived upserts that leave a row alone when the bytes are already stored, so
+duplicate derivations cost no row versions. The rest is designed, not built.
+The default stays `--indexing local`. Under `lease` and `off`:
 
-- **One builder per group.** A store lease per index group and shard
-  (`index_leases`, the timing model of ADR 0056) names the one process that
-  builds `history-tree-v4`, `log-filter-v1` or the search rows. That process
-  is a dedicated `leep-server indexer`, or a server in `lease` mode.
-- **No fixed interval.** It tails the ref log and derives the union of the
-  moved heads' missing ranges on one wavefront, with imports in a separate
-  backfill lane.
-- **Advisory frontier.** It publishes a frontier row per ref and kind
-  (`index_frontier`). The row feeds metrics, `Retry-After` and
-  `GET /v1/index-status`, never correctness.
-- **Queries do not derive.** They answer from the rows that exist and examine
-  the un-indexed changesets above them directly, up to a budget. The answer
-  is byte for byte the indexed one, and nothing is stored.
-- **Over the budget.** A client that sent `Leep-Indexing: retry` gets 503
-  with `Retry-After`. Any other client waits briefly for the indexer, then
-  derives inline as today. With no live lease, queries derive inline at once.
+- **One builder per group.** A lease in ADR 0056's `leases` table (`scope =
+  'index'`, named by the group's kind) lets only one process warm
+  `history-tree-v4`, `log-filter-v1` or the search rows. Repair tools that
+  drop or rebuild rows take that lease and wait a fence first.
+- **Queries do not derive.** They answer from the rows that exist and
+  examine the un-indexed changesets above them directly, up to a budget.
+  Entries, order and `truncated` are those of the indexed answer, and
+  nothing is stored.
+- **Over the budget**, the `Leep-Indexing` request header decides:
+  - `retry` gets 503 with `Retry-After`;
+  - `stale-ok` gets the answer at the newest indexed ancestor, with
+    `answered_at` and `behind`;
+  - other clients wait briefly, bounded and capped, then scan with a larger
+    budget.
+
+  While a lease lives, queries never derive inline.
 - **`last_merge-v1`** moves to the write path, so ancestry queries never
   derive.
 
-Lands never wait for indexing. A trunk built by lands is a chain, so its
-path history grows at one core's rate whatever the number of indexers; ADR
-0058 section 8 sizes that. Add new kinds with the
+Lands never wait for indexing. A trunk built by lands is a chain, which one
+derivation follows at 380 to 460 changesets a second when catching up on
+Postgres (PERFORMANCE.md, "Hot chain rate"). That is above one ref's land
+rate. Add new kinds with the
 [`add-derived-data-kind`](../.claude/skills/add-derived-data-kind/SKILL.md)
 skill. A new kind never requires a client change.
 
@@ -1047,13 +1050,14 @@ and self-approval rules for reviews. See the roadmap.
 Moving between stages means swapping a `MetaStore`/`BlobStore`
 implementation. Nothing above the traits changes.
 
-**Indexing at scale** (ADR 0058, designed). From the "Team" stage on, index
-building moves out of the query servers into lease-holding indexers: one per
-index group, sharded by repository when the chains together outgrow one
-process's cores. One trunk's path history is bounded by the derivation rate
-of one core (about 40 to 200 changesets a second, depending on tree shape),
-so per-chain derivation speed, not the number of indexers, sets how many
-agents one trunk can serve with a current index.
+**Indexing at scale** (ADR 0058). From the "Team" stage on, index building
+moves out of the query servers to one lease holder per index group,
+sharded by repository once the chains together outgrow one process's cores
+(deferred until measured). A trunk's path history is bounded by how fast one
+derivation follows a chain (measured at 380 to 460 changesets a second
+catching up on synthetic git/git- and Linux-shaped trees, against one ref's
+200 to 250 lands a second). Splitting a chain's derivation by directory is
+the next step, if real histories fall short of that.
 
 **Multiple repositories** (M7, designed in
 [ADR 0054](adr/0054-multiple-repositories-per-server.md), not implemented
