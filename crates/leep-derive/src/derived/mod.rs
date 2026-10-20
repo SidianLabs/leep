@@ -130,14 +130,70 @@ pub async fn derive<K: DerivedKind>(repo: &Repo, id: ChangesetId) -> Result<Byte
     if let Some(v) = repo.meta().get_derived(K::NAME, &id.0).await? {
         return Ok(v);
     }
+    holding::<K, _>(derive_missing::<K>(repo, id)).await
+}
+
+/// Run `work` as the holder of `K`'s derive lock, which the caller took.
+async fn holding<K: DerivedKind, T>(work: impl std::future::Future<Output = T>) -> T {
     let mut kinds = HELD.try_with(|h| h.borrow().clone()).unwrap_or_default();
     kinds.push(K::NAME);
     let reads = crate::ancestry::skiplist_reads_for(K::KEEP_SKIPLIST_READS);
     HELD.scope(
         std::cell::RefCell::new(kinds),
-        crate::ancestry::SKIPLIST_READS.scope(reads, derive_missing::<K>(repo, id)),
+        crate::ancestry::SKIPLIST_READS.scope(reads, work),
     )
     .await
+}
+
+/// Derive kind `K` for every head in `heads` as one range: what any of them
+/// lacks, each changeset once, on one wavefront (ADR 0058). History the
+/// heads share is derived once, and the chains of different heads run side
+/// by side. Returns how many heads lacked a value.
+pub async fn derive_heads<K: DerivedKind>(repo: &Repo, heads: &[ChangesetId]) -> Result<usize> {
+    let missing = missing_heads::<K>(repo, heads).await?;
+    if missing.is_empty() {
+        return Ok(0);
+    }
+    let held = HELD
+        .try_with(|h| h.borrow().contains(&K::NAME))
+        .unwrap_or(false);
+    if held {
+        derive_range::<K>(repo, &missing).await?;
+        return Ok(missing.len());
+    }
+    let lock = repo.derive_lock(K::NAME);
+    let _guard = lock.lock().await;
+    // Another derivation may have stored some while this one waited.
+    let missing = missing_heads::<K>(repo, &missing).await?;
+    if !missing.is_empty() {
+        holding::<K, _>(derive_range::<K>(repo, &missing)).await?;
+    }
+    Ok(missing.len())
+}
+
+/// `heads` without a stored or staged value of `K`, once each, in order.
+async fn missing_heads<K: DerivedKind>(
+    repo: &Repo,
+    heads: &[ChangesetId],
+) -> Result<Vec<ChangesetId>> {
+    let mut seen = HashSet::new();
+    let heads: Vec<ChangesetId> = heads
+        .iter()
+        .copied()
+        .filter(|h| seen.insert(*h) && staged_value(repo, K::NAME, *h).is_none())
+        .collect();
+    let mut out = Vec::new();
+    for chunk in heads.chunks(BATCH) {
+        let have = get_derived_many(repo.meta().as_ref(), K::NAME, chunk).await?;
+        out.extend(
+            chunk
+                .iter()
+                .zip(have)
+                .filter(|(_, v)| v.is_none())
+                .map(|(id, _)| *id),
+        );
+    }
+    Ok(out)
 }
 
 /// Changesets read or checked per round trip while finding and deriving a
@@ -145,25 +201,33 @@ pub async fn derive<K: DerivedKind>(repo: &Repo, id: ChangesetId) -> Result<Byte
 const BATCH: usize = 256;
 
 async fn derive_missing<K: DerivedKind>(repo: &Repo, id: ChangesetId) -> Result<Bytes> {
+    derive_range::<K>(repo, &[id])
+        .await?
+        .ok_or_else(|| Error::Storage("derivation produced no value".into()))
+}
+
+/// Derive `K` for `roots`, which the caller found missing, and every
+/// ancestor of theirs that lacks a value. Returns the value of the root
+/// placed last, which for one root is that root's.
+async fn derive_range<K: DerivedKind>(repo: &Repo, roots: &[ChangesetId]) -> Result<Option<Bytes>> {
     let meta = repo.meta();
     // Find the changesets lacking a value, a batch of them per round trip,
     // keeping only their parents: a whole range of changesets (Linux has 1.5
     // million) does not fit in memory, and each is read again when derived.
     let mut parents: HashMap<ChangesetId, Range<usize>> = HashMap::new();
     let mut arena: Vec<ChangesetId> = Vec::new();
-    let mut seen: HashSet<ChangesetId> = HashSet::from([id]);
-    let mut frontier = vec![id];
+    let mut seen: HashSet<ChangesetId> = roots.iter().copied().collect();
+    let mut frontier: Vec<ChangesetId> = seen.iter().copied().collect();
     let mut first = true;
     while !frontier.is_empty() {
         let mut missing = Vec::with_capacity(frontier.len());
         for chunk in frontier.chunks(BATCH) {
-            // The head was checked by the caller.
+            // The roots were checked by the caller.
             let have = if first {
-                vec![None]
+                vec![None; chunk.len()]
             } else {
                 get_derived_many(meta.as_ref(), K::NAME, chunk).await?
             };
-            first = false;
             missing.extend(
                 chunk
                     .iter()
@@ -172,6 +236,7 @@ async fn derive_missing<K: DerivedKind>(repo: &Repo, id: ChangesetId) -> Result<
                     .map(|(id, _)| *id),
             );
         }
+        first = false;
         frontier.clear();
         for chunk in missing.chunks(BATCH) {
             for (cid, cs) in chunk.iter().zip(get_changesets(repo, chunk).await?) {
@@ -187,18 +252,22 @@ async fn derive_missing<K: DerivedKind>(repo: &Repo, id: ChangesetId) -> Result<
     // Parents before children: iterative post-order over the parents found.
     let mut order: Vec<ChangesetId> = Vec::with_capacity(parents.len());
     let mut done: HashSet<ChangesetId> = HashSet::with_capacity(parents.len());
-    let mut stack = vec![(id, 0usize)];
-    done.insert(id);
-    while let Some((top, next)) = stack.last_mut() {
-        let ps = &arena[parents[top].clone()];
-        if let Some(&p) = ps.get(*next) {
-            *next += 1;
-            if parents.contains_key(&p) && done.insert(p) {
-                stack.push((p, 0));
+    for &root in roots {
+        if !done.insert(root) {
+            continue;
+        }
+        let mut stack = vec![(root, 0usize)];
+        while let Some((top, next)) = stack.last_mut() {
+            let ps = &arena[parents[top].clone()];
+            if let Some(&p) = ps.get(*next) {
+                *next += 1;
+                if parents.contains_key(&p) && done.insert(p) {
+                    stack.push((p, 0));
+                }
+            } else {
+                order.push(*top);
+                stack.pop();
             }
-        } else {
-            order.push(*top);
-            stack.pop();
         }
     }
     drop(done);
@@ -213,11 +282,7 @@ async fn derive_missing<K: DerivedKind>(repo: &Repo, id: ChangesetId) -> Result<
         Err(e) => Err(e),
     };
     wave.abandon().await;
-    result.and_then(|()| {
-        wave.last
-            .take()
-            .ok_or_else(|| Error::Storage("derivation produced no value".into()))
-    })
+    result.map(|()| wave.last.take())
 }
 
 /// A value of `kind` computed by a running derivation and not stored yet.

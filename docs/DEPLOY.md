@@ -337,7 +337,7 @@ a reload is refused.
 | `LEEP_READ_MAX_BODY_BYTES` | 1 MiB with a tokens file | Body size cap for read tokens; needs the tokens file. |
 | `LEEP_NO_MIGRATE` | off | `1` makes the server (and `gc`, `derive-search`) refuse to start while metadata schema migrations are pending instead of applying them; see [Upgrades](#upgrades). |
 | `LEEP_REQUEST_TIMEOUT` | `5m` | Abort any request that runs longer (`90s`, `5m`; `0` disables). `leep-server gc --fence` must exceed it; see [OPERATIONS.md](OPERATIONS.md#blob-garbage-collection). |
-| `LEEP_WARM_INTERVAL` | `30s` | How often the background warmer looks for moved refs and derives their path-history and search indexes (ADR 0028); `0` turns it off. With several servers on one metadata store, one warmer is enough. |
+| `LEEP_WARM_INTERVAL` | `250ms` | How often the background warmer reads the ref log for moved refs and derives their path-history, log-filter and search indexes (ADR 0028, ADR 0058); every ref is also listed every 5 s. Accepts `ms`. `0` turns it off. With several servers on one metadata store, set `0` on all but one (see OPERATIONS.md, "Indexing a large history"). |
 | `LEEP_WARM_SEARCH` | `true` | Whether the warmer also derives the code-search index of each ref head. |
 | `LEEP_DERIVE_JOBS` | the cores, up to 8 | Changesets the warmer's catch-up, or a query over un-derived history, derives at once (ADR 0050). Lower it to leave cores for requests while a large import is being indexed. |
 | `LEEP_META_POOL_SIZE` | 16 | Most connections to a Postgres metadata store per process; keep the sum over every server and tool under `max_connections` (OPERATIONS.md, "Connection pool and caches"). |
