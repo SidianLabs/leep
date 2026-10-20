@@ -65,8 +65,8 @@ Facts this design rests on:
     swarm.
 - **Derived rows are shared across repositories** (ADR 0054 section 5).
   Only ref heads are per repository.
-- **ADR 0056 owns leases.** PR #106 (branch `derive/land-coordinator`,
-  migration 0006, not merged yet) generalises `land_leases` into one
+- **ADR 0056 owns leases.** PR #106 (migration 0006, merged as 8171c42)
+  generalises `land_leases` into one
   `leases(scope, repo_id, name, shard, holder, address, protocol, meta,
   epoch, renewed_at, expires_at)` table, primary key `(scope, repo_id, name,
   shard)`. It comes with:
@@ -125,7 +125,9 @@ An **index lease** is a row of ADR 0056's `leases` table:
 
 The holder is the only process that builds that group, for every repository
 and ref. It takes, renews and releases the lease through PR #106's methods
-with `LeaseKey { scope: "index", repo_id: 0, name, shard: 0 }`, passing the
+with `LeaseKey { scope: "index", repo_id: 0, name, shard: 0 }`, built
+explicitly rather than with `LeaseKey::new`, which names the default
+repository (1), passing the
 timing below on each call. No index table of its own is added, and no
 `MetaStore` method.
 
@@ -169,7 +171,7 @@ implemented steps 1 and 2.
 
    The lanes run at once, so a Linux backfill never holds agents' new heads
    behind it. Repositories take turns within a lane (ADR 0054 section 7).
-4. **Hold the lease** (once the `leases` table has merged). In `lease` mode
+4. **Hold the lease** (next; the `leases` table merged with PR #106). In `lease` mode
    a pass runs only for the groups this process holds.
    - The holder checks its lease view before each staged write batch and
      between passes. On losing the lease it abandons the wavefront at the
@@ -434,7 +436,7 @@ SQLite serves one process.
 - upserts skip identical bytes;
 - `examples/chain_rate.rs`, the hot chain measurement.
 
-**Phase 0**, after ADR 0056's `leases` table merges: the `index` scope, the
+**Phase 0**, now that ADR 0056's `leases` table has merged (PR #106): the `index` scope, the
 `lease` mode (one server warms each group), lease metrics and the fence in
 the repair tools.
 
@@ -613,8 +615,8 @@ reports the per-agent land rate it saw.
    clear. For search, "a revision a minute old" may surprise an agent that
    just landed the file it searches for. Should MCP default to `retry` for
    search?
-3. **Lease `meta` contents.** This ADR stores the rate, backlog and shard
-   count in it, in whatever encoding PR #106 settles for `meta`. They are
+3. **Lease `meta` contents.** `meta` is text in PR #106. This ADR stores
+   the rate, backlog and shard count in it as a small JSON object. They are
    renewed every 3 s with the lease.
 4. **Real chain rates.** The sizing rests on synthetic chains. The first
    measurement on a real import may move section 8.
