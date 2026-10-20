@@ -216,7 +216,35 @@ that needs them; see "Code search"), and every server also warms them in the
 background for each ref head that moved, every `--warm-interval` (ADR 0028), so
 queries on an imported or restarted history do not pay for the whole history.
 `derive` takes a per-kind lock once a value is missing, so concurrent requests
-and the warmer never derive the same range twice. Add new kinds with the
+and the warmer never derive the same range twice. The lock and the warmer are
+per process, so servers sharing a store each derive every range.
+
+**One indexer per kind** ([ADR 0058](adr/0058-one-indexer-per-kind.md),
+designed, not implemented yet). Today's behaviour stays the default
+(`--indexing local`). In the `lease` and `off` modes:
+
+- **One builder per group.** A store lease per index group and shard
+  (`index_leases`, the timing model of ADR 0056) names the one process that
+  builds `history-tree-v4`, `log-filter-v1` or the search rows. That process
+  is a dedicated `leep-server indexer`, or a server in `lease` mode.
+- **No fixed interval.** It tails the ref log and derives the union of the
+  moved heads' missing ranges on one wavefront, with imports in a separate
+  backfill lane.
+- **Advisory frontier.** It publishes a frontier row per ref and kind
+  (`index_frontier`). The row feeds metrics, `Retry-After` and
+  `GET /v1/index-status`, never correctness.
+- **Queries do not derive.** They answer from the rows that exist and examine
+  the un-indexed changesets above them directly, up to a budget. The answer
+  is byte for byte the indexed one, and nothing is stored.
+- **Over the budget.** A client that sent `Leep-Indexing: retry` gets 503
+  with `Retry-After`. Any other client waits briefly for the indexer, then
+  derives inline as today. With no live lease, queries derive inline at once.
+- **`last_merge-v1`** moves to the write path, so ancestry queries never
+  derive.
+
+Lands never wait for indexing. A trunk built by lands is a chain, so its
+path history grows at one core's rate whatever the number of indexers; ADR
+0058 section 8 sizes that. Add new kinds with the
 [`add-derived-data-kind`](../.claude/skills/add-derived-data-kind/SKILL.md)
 skill. A new kind never requires a client change.
 
@@ -1013,6 +1041,14 @@ and self-approval rules for reviews. See the roadmap.
 
 Moving between stages means swapping a `MetaStore`/`BlobStore`
 implementation. Nothing above the traits changes.
+
+**Indexing at scale** (ADR 0058, designed). From the "Team" stage on, index
+building moves out of the query servers into lease-holding indexers: one per
+index group, sharded by repository when the chains together outgrow one
+process's cores. One trunk's path history is bounded by the derivation rate
+of one core (about 40 to 200 changesets a second, depending on tree shape),
+so per-chain derivation speed, not the number of indexers, sets how many
+agents one trunk can serve with a current index.
 
 **Multiple repositories** (M7, designed in
 [ADR 0054](adr/0054-multiple-repositories-per-server.md), not implemented
