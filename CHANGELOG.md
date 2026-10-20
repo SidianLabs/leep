@@ -663,6 +663,12 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   `blame Makefile` (1,501 changes) went from 3.0 s to 1.1 s and `diff.c`
   from 1.9 s to 0.9 s, with rarely changed files as before
   (PERFORMANCE.md, "First blame in stretches").
+- `leep-land-bench` drives several servers that share one database
+  (`--server` and `--metrics` take lists) and reports lands per server and
+  agents that made no progress. With 2 or 3 servers landing on one ref, one
+  instance wins every swap and the other instances' lands wait 20 s or more
+  (PERFORMANCE.md, "Several servers on one ref"); route a hot ref's lands to
+  one instance.
 
 ### Git compatibility (M7)
 - Live git mirror (ADR 0046): `leep-git mirror run` keeps a git remote
