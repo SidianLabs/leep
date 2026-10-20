@@ -37,10 +37,11 @@ tower-http = { version = "0.6", features = ["trace", "limit", "timeout"] }
 clap = { version = "4", features = ["derive", "env"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 futures-util.workspace = true
+# Forwarding lands to the server that coordinates their ref (ADR 0056).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 
 [dev-dependencies]
 leep-testkit.workspace = true
-reqwest = { version = "0.12", default-features = false }
 tempfile = "3"
 bytes.workspace = true
 zstd.workspace = true

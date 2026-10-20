@@ -162,8 +162,46 @@ struct Args {
     /// Log output format.
     #[arg(long, env = "LEEP_LOG_FORMAT", value_enum, default_value_t = LogFormat::Text)]
     log_format: LogFormat,
+    /// Batch the lands of each ref on one server across every server that
+    /// shares this metadata store (ADR 0056): `on` takes a per-ref lease in
+    /// the store and forwards lands to the ref's lease holder. Turn it on for
+    /// every server of a multi-server Postgres deployment; needs
+    /// --advertise-url and --peer-url-prefix or --peer-cidr.
+    #[arg(long, env = "LEEP_LAND_COORDINATION", value_enum, default_value_t = Coordination::Off)]
+    land_coordination: Coordination,
+    /// URL other servers reach this one at directly (not through the load
+    /// balancer), e.g. `http://10.0.3.7:7070`. Checked at startup.
+    #[arg(long, env = "LEEP_ADVERTISE_URL")]
+    advertise_url: Option<String>,
+    /// Servers' URLs start with this; lands, with their client's token, are
+    /// forwarded only to an address that starts with one of these or whose
+    /// IP address is in a --peer-cidr. Repeatable; the environment variable
+    /// takes a comma-separated list.
+    #[arg(long, env = "LEEP_PEER_URL_PREFIX", value_delimiter = ',')]
+    peer_url_prefix: Vec<String>,
+    /// Networks the servers are in, e.g. `10.0.0.0/16`. Requests from these
+    /// addresses may carry forwarded lands. Repeatable.
+    #[arg(long, env = "LEEP_PEER_CIDR", value_delimiter = ',')]
+    peer_cidr: Vec<leep_server::coord::Cidr>,
+    /// Allow forwarding over plain http to hosts that are not loopback or
+    /// private addresses (a client's token crosses that network).
+    #[arg(long, env = "LEEP_PEER_ALLOW_PLAIN_HTTP")]
+    peer_allow_plain_http: bool,
+    /// How long a land lease lives after a renewal.
+    #[arg(long, env = "LEEP_LAND_LEASE_TTL", default_value = "2s", value_parser = parse_ready_timeout)]
+    land_lease_ttl: std::time::Duration,
+    /// How often held land leases are renewed; another server may take a
+    /// lease not renewed for twice this long.
+    #[arg(long, env = "LEEP_LAND_LEASE_RENEW", default_value = "500ms", value_parser = parse_ready_timeout)]
+    land_lease_renew: std::time::Duration,
     #[command(subcommand)]
     command: Option<Cmd>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum Coordination {
+    On,
+    Off,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -799,13 +837,23 @@ async fn main() -> anyhow::Result<()> {
         );
         leep_derive::warm::Warmer::new(repo.clone(), args.warm_search).spawn(args.warm_interval);
     }
-    let app = leep_server::router_with_ready_timeout(
+    let coordination = match args.land_coordination {
+        Coordination::Off => None,
+        Coordination::On => Some(land_coordination(&args, repo.meta().clone())?),
+    };
+    if let Some((coordinator, _)) = &coordination {
+        repo = repo.with_land_coordinator(coordinator.clone());
+    }
+    let mut app = leep_server::router_with_ready_timeout(
         repo,
         args.max_body_bytes,
         args.request_timeout,
         config,
         args.ready_timeout,
     );
+    if let Some((_, http)) = &coordination {
+        app = leep_server::coord::layer(app, http.clone());
+    }
 
     let listener = tokio::net::TcpListener::bind(args.listen)
         .await
@@ -822,8 +870,69 @@ async fn main() -> anyhow::Result<()> {
             }
         });
     }
-    leep_server::serve(listener, app, shutdown_signal()).await?;
+    let Some((coordinator, http)) = coordination else {
+        leep_server::serve(listener, app, shutdown_signal()).await?;
+        return Ok(());
+    };
+    // Leases are given up as soon as shutdown starts, so another server
+    // takes the refs at once; lands still in flight here are handed back.
+    let stopping = coordinator.clone();
+    let server = tokio::spawn(leep_server::serve(listener, app, async move {
+        shutdown_signal().await;
+        stopping.shutdown().await;
+    }));
+    let address = coordinator.config().address.clone();
+    if let Err(e) = http.check_self(&address).await {
+        coordinator.shutdown().await;
+        return Err(e);
+    }
+    coordinator.start();
+    tracing::info!(
+        advertise = %address,
+        holder = %coordinator.config().holder,
+        "coordinating lands with other servers"
+    );
+    server.await.context("server task")??;
     Ok(())
+}
+
+/// The land coordinator and its HTTP side, from the flags (ADR 0056).
+fn land_coordination(
+    args: &Args,
+    meta: Arc<dyn leep_core::MetaStore>,
+) -> anyhow::Result<(
+    Arc<leep_derive::land_coord::LandCoordinator>,
+    Arc<leep_server::coord::Coordination>,
+)> {
+    let Some(address) = args.advertise_url.clone() else {
+        anyhow::bail!("--land-coordination on needs --advertise-url");
+    };
+    if args.peer_url_prefix.is_empty() && args.peer_cidr.is_empty() {
+        anyhow::bail!("--land-coordination on needs --peer-url-prefix or --peer-cidr");
+    }
+    if !meta.supports_land_leases() {
+        anyhow::bail!("--land-coordination on needs a Postgres or SQLite metadata store");
+    }
+    if args.land_lease_renew.is_zero() || args.land_lease_ttl < args.land_lease_renew * 2 {
+        anyhow::bail!("--land-lease-ttl must be at least twice --land-lease-renew");
+    }
+    let policy = leep_server::coord::PeerPolicy {
+        prefixes: args.peer_url_prefix.clone(),
+        cidrs: args.peer_cidr.clone(),
+        allow_plain_http: args.peer_allow_plain_http,
+    };
+    policy
+        .check_url(&address)
+        .map_err(|e| anyhow::anyhow!("--advertise-url: {e}"))?;
+    let mut id = [0u8; 16];
+    getrandom::fill(&mut id).map_err(|e| anyhow::anyhow!("random holder id: {e}"))?;
+    let holder = hex::encode(id);
+    let mut cfg = leep_derive::land_coord::CoordinatorConfig::new(holder.clone(), address);
+    cfg.ttl = args.land_lease_ttl;
+    cfg.renew = args.land_lease_renew;
+    let coordinator = leep_derive::land_coord::LandCoordinator::new(meta, cfg);
+    let http = leep_server::coord::Coordination::new(policy, holder)?;
+    Ok((coordinator, http))
 }
 
 /// Without tokens anyone who reaches the server can read and rewrite every

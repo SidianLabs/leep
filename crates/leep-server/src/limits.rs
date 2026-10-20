@@ -649,13 +649,22 @@ pub async fn enforce(req: Request, next: Next) -> Response {
             Some(secs),
         );
     }
-    let Some(guard) = InFlight::enter(&slot) else {
-        slot.limited("concurrency");
-        return refuse(
-            StatusCode::TOO_MANY_REQUESTS,
-            "too many concurrent requests; retry after 1s",
-            Some(1),
-        );
+    // A land forwarded by a peer server (ADR 0056) holds its concurrency
+    // permit there; counting it again here would cap a shared token's lands
+    // at one server's permits for every server that forwards them.
+    let from_peer = req.extensions().get::<crate::coord::FromPeer>().is_some();
+    let guard = if from_peer {
+        None
+    } else {
+        let Some(guard) = InFlight::enter(&slot) else {
+            slot.limited("concurrency");
+            return refuse(
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many concurrent requests; retry after 1s",
+                Some(1),
+            );
+        };
+        Some(guard)
     };
     // The check above sees only a declared length; this catches chunked bodies.
     let req = match max_body {

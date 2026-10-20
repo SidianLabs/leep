@@ -538,10 +538,27 @@ still coordinates separate server processes; a lost swap redoes the batch, and
 jittered backoff keeps processes from colliding in lockstep. That is not
 enough under load: with several servers on one ref one instance wins every
 swap and the others' lands starve (`docs/PERFORMANCE.md`, "Several servers on
-one ref"). [ADR 0056](adr/0056-land-coordinator-per-ref.md) (designed, not
-implemented yet) gives each ref one coordinating server, chosen by a lease in
-the metadata store, to which the others forward their lands; the CAS stays the
-only thing correctness rests on. The leader is a
+one ref"). With `--land-coordination on`
+([ADR 0056](adr/0056-land-coordinator-per-ref.md), `land_coord.rs`) each ref
+has one coordinating server, the holder of its lease in the metadata store,
+to which the others forward their lands; the CAS stays the only thing
+correctness rests on:
+```
+land_coordinated(cs, ref):  loop until answered (at most 30 s, then 409):
+  route(ref):
+    this server holds a lease whose view is valid (or renews now) → batch it here (as above);
+      a batch that finds the lease gone before an attempt hands its lands back → route again
+    another server holds a live lease → forward the client's body and token to its address;
+      no answer → ask again after 500 ms, or ask the next holder once the lease changes;
+      never batch it here while that lease is live
+    no live lease → take it (one conditional upsert) → batch it here
+    store failing → batch it here, uncoordinated
+```
+A lease lives 2 s from its last renewal and may be taken by another server
+once that renewal is older than 1 s (twice the 500 ms renew interval); a
+holder trusts it only until the store-reported time left, less one renew
+interval, counted from when it sent that renewal. A forwarded land is never
+forwarded again. The leader of a batch is a
 spawned task, so a cancelled request cannot stop a batch; a land cancelled
 before its batch reached it is dropped, one already replayed lands.
 The copy test makes `land` idempotent: a client that never saw the answer to
@@ -859,6 +876,7 @@ misses and occupancy as Prometheus metrics (see [OPERATIONS.md](OPERATIONS.md)).
 | Failure | Effect | Recovery |
 |---|---|---|
 | Server instance dies mid-request (SIGKILL included) | No partial mutable state: refs move by one transaction, everything else is written idempotently, so a request leaves at most unreferenced blobs, tree nodes and derived rows | Client retries; every write is idempotent and a repeated `land` finds its earlier result |
+| The server coordinating a ref's lands dies or stalls (`--land-coordination on`) | Its lease is not renewed; lands forwarded to it get no answer and are asked again, never batched elsewhere while the lease is live | Another server takes the lease once its last renewal is a second old (measured: every agent landed again within 1.3 s of a SIGKILL); a stalled leader resuming finds its lease gone and hands its lands back. A graceful shutdown releases leases at once (ADR 0056) |
 | Store call errors | The request fails with 500 (or 409 when the swap lost); nothing it did is rolled back, and nothing needs to be | Client retries |
 | Store call applies, then reports an error (lost commit acknowledgement, timeout after commit) | The write may exist. For a blob, changeset or derived row that is harmless. For `cas_ref` the caller cannot tell | `land` reads the ref again and recognises its own result (by land id at any age, ADR 0057; otherwise within the last 1024 changesets); other ref callers must read the ref before repeating |
 | Request cancelled by `--request-timeout` or a client disconnect | Same as a dead server for the work it had done; it performs no further writes | Client retries |
@@ -1020,18 +1038,20 @@ and self-approval rules for reviews. See the roadmap.
 Moving between stages means swapping a `MetaStore`/`BlobStore`
 implementation. Nothing above the traits changes.
 
-**Lands across servers** (designed in
-[ADR 0056](adr/0056-land-coordinator-per-ref.md), not implemented yet).
-Group commit batches a ref's lands only within one process, so from the Team
-stage on, servers must not race each other on a hot ref. Each ref gets one
-leader: the server holding its row in `land_leases` (taken and renewed with
-single conditional statements, 5 s TTL, an epoch per holder). Other servers
-forward `POST /v1/land` to the leader's `--advertise-url` with the client's
-own body and token, and land locally if the leader cannot be reached. A
-stale or dead leader costs only time: its swap loses or wins on `cas_ref`
-like any other. One owner per ref is also what later allows pipelined and
-parallel replays and a dedicated pool of lander instances for the agent
-swarm stage.
+**Lands across servers**
+([ADR 0056](adr/0056-land-coordinator-per-ref.md)). Group commit batches a
+ref's lands only within one process, so from the Team stage on, servers must
+not race each other on a hot ref: run them with `--land-coordination on`.
+Each ref gets one leader: the server holding its row in `land_leases`, taken
+and renewed with single conditional statements (2 s TTL, renewed every
+500 ms, taken over only once a second has passed without a renewal). Other
+servers forward `POST /v1/land` to the leader's `--advertise-url`, checked
+against an allow-list, with the client's own body and token, and never batch
+a land themselves while a live lease names another server. A stale or dead
+leader costs only time: its swap loses or wins on `cas_ref` like any other.
+Throughput per ref stays one leader's; one owner per ref is what later allows
+pipelined and parallel replays and a dedicated tier of landing servers for
+the agent swarm stage.
 
 **Multiple repositories** (M7, designed in
 [ADR 0054](adr/0054-multiple-repositories-per-server.md), not implemented

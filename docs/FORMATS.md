@@ -439,6 +439,12 @@ ref_log(seq BIGSERIAL PRIMARY KEY,                             -- SQLite: INTEGE
         land_id BYTEA, land_changeset BYTEA)                   -- migration 0005; NULL unless a keyed land
 ref_log_name: INDEX ON ref_log(name, seq)
 ref_log_land_id: UNIQUE INDEX ON ref_log(name, land_id) WHERE land_id IS NOT NULL
+land_leases(repo_id BIGINT NOT NULL DEFAULT 1,                 -- migration 0006; SQLite: INTEGER
+            ref_name TEXT NOT NULL, holder TEXT NOT NULL,      -- holder: random per server process
+            address TEXT NOT NULL, protocol INTEGER NOT NULL,  -- the holder's --advertise-url; 1
+            epoch BIGINT NOT NULL,                             -- +1 whenever the holder changes
+            renewed_at BIGINT NOT NULL, expires_at BIGINT NOT NULL, -- ms, the store's clock; 0 = released
+            PRIMARY KEY (repo_id, ref_name))
 ```
 
 `ref_log` (ADR 0018) is appended in the transaction of every ref create, move
@@ -473,6 +479,10 @@ unique partial index `ref_log_land_id`. A move made by a land that carried a
 writes exactly the columns of v4. An id is unique per ref. The rows are read
 by `MetaStore::find_lands`, never changed, and kept with the entry. v4
 servers neither read nor write the columns.
+
+Migration 0006 (`land_leases`, ADR 0056) adds the land lease table, empty.
+Servers write it only with `--land-coordination on`; older servers never read
+it, so the migration tolerates them. See "Land leases" below.
 
 ### Changeset rows (ADR 0053)
 
@@ -562,6 +572,36 @@ hash or derived encoding changed. Rules:
   no control characters. `actor` is never taken from a request.
 - Entries are never removed. They name changesets, which are never deleted, so
   blob garbage collection is unaffected.
+
+## Land leases (new table, `MetaStore` methods and headers, ADR 0056)
+
+The `land_leases` table above holds, per ref, which server batches its lands.
+A row is written only by single conditional statements: take or keep
+(`INSERT ... ON CONFLICT DO UPDATE ... WHERE` the row is the claimant's own,
+or `expires_at` has passed, or `renewed_at` is older than twice the renew
+interval), renew (`UPDATE ... WHERE holder AND epoch`) and release (the same,
+setting both times to 0 so `epoch` keeps growing). Times are milliseconds by
+the database's clock on Postgres and by the process clock on SQLite.
+`repo_id` is 1 until repositories exist (ADR 0054). Rows are hints about
+where lands are batched and are never needed to read anything: a backup does
+not copy them and a restore clears the table. `MetaStore` gains
+`supports_land_leases`, `land_lease`, `acquire_land_lease`,
+`renew_land_leases` and `release_land_lease`; the defaults refuse, which
+leaves a backend without them uncoordinated. `check_land_lease_contract`
+checks them.
+
+On the wire nothing a client sends or reads changed. Between servers:
+
+- A forwarded `POST /v1/land` carries the client's body byte for byte and its
+  `Authorization` header, plus `Leep-Land-Forward: v=1; epoch=<n>;
+  from=<holder>`. The header is an unauthenticated hint, honoured only from
+  an address in the receiving server's `--peer-url-prefix` hosts or
+  `--peer-cidr` networks; from anywhere else the request is an ordinary land.
+- A server that does not coordinate the ref answers such a land `503` with
+  `Leep-Land-Not-Leader: 1` and an `ErrorResponse` body; the sender routes the
+  land again. Clients never see it.
+- With coordination on, `GET /v1/health` carries `Leep-Instance: <holder>`,
+  which a server uses to check that its `--advertise-url` reaches itself.
 
 ## Blob storage layout (leep-store)
 

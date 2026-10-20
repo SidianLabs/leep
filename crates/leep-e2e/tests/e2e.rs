@@ -2297,3 +2297,30 @@ fn author_falls_back_to_the_token_name_when_nothing_local_names_one() {
     leep(&wc, None, &["commit", "-m", "third"]);
     assert_eq!(author_of_tip(&wc), "Dave Example <dave@example.com>");
 }
+
+/// A server whose `--advertise-url` does not reach itself refuses to start
+/// with land coordination on, instead of stranding every land forwarded to
+/// it (ADR 0056); one whose address is outside the peer allow-list too.
+#[test]
+fn land_coordination_checks_the_advertise_url_at_startup() {
+    let tmp = tempfile::tempdir().unwrap();
+    let stores = Stores::sqlite(tmp.path());
+    let port = free_port();
+    let elsewhere = free_port();
+    let run = |advertise: String, prefix: &str| {
+        let out = std::process::Command::new(bin("leep-server"))
+            .args(["--listen", &format!("127.0.0.1:{port}")])
+            .args(["--meta", &stores.meta, "--blobs", &stores.blobs])
+            .args(["--land-coordination", "on", "--advertise-url", &advertise])
+            .args(["--peer-url-prefix", prefix])
+            .env("RUST_LOG", "warn")
+            .output()
+            .expect("run leep-server");
+        assert!(!out.status.success(), "started with {advertise}");
+        format!("{}{}", stdout(&out), stderr(&out))
+    };
+    let log = run(format!("http://127.0.0.1:{elsewhere}"), "http://127.0.0.1:");
+    assert!(log.contains("does not reach this server"), "{log}");
+    let log = run(format!("http://127.0.0.1:{port}"), "https://leep-");
+    assert!(log.contains("not allowed"), "{log}");
+}

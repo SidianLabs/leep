@@ -29,6 +29,8 @@ every runbook.
 | [LeepLandErrors](#leeplanderrors) | page | `POST /v1/land` answered 5xx in the last 10 minutes |
 | [LeepLandExhausted](#leeplandexhausted) | ticket | a land lost the ref compare-and-swap on all 32 attempts |
 | [LeepLandCasLossesHigh](#leeplandcaslosseshigh) | ticket | more than one lost compare-and-swap per land, for 15 minutes |
+| [LeepLandForwardFailing](#leeplandforwardfailing) | ticket | servers fail to reach the server coordinating a ref's lands, for 10 minutes |
+| [LeepLandLeaseFlapping](#leeplandleaseflapping) | ticket | land leases change hands more than six times a minute, for 10 minutes |
 | [LeepLandSlowP99](#leeplandslowp99) | ticket | land p99 latency above 5 seconds for 10 minutes |
 | [LeepRequestTimeouts](#leeprequesttimeouts) | ticket | more than 5 requests hit `--request-timeout` (408) in 15 minutes |
 | [LeepTokenThrottled](#leeptokenthrottled) | ticket | one token has been limited steadily for 15 minutes |
@@ -465,8 +467,11 @@ nothing is half done. Retrying is safe.
 **Mitigate / fix.**
 
 - Agents repeat the land (`leep sync`, then `leep land`).
-- Send `POST /v1/land` to a single instance (route by path at the balancer): one
-  process batches the lands of a ref, which removes cross-process losses.
+- Turn on `--land-coordination` on every instance (`docs/OPERATIONS.md`,
+  "Several servers on one ref", ADR 0056): one server per ref batches every
+  land on it and the others forward to it. Until every instance runs it (a
+  rolling upgrade), send `POST /v1/land` to a single instance (route by path
+  at the balancer) instead.
 - Find the looping writer by actor name; stop the agent, or revoke its token (edit
   the tokens file, then SIGHUP, see [DEPLOY.md](DEPLOY.md#reloading-config)).
 - Ask agents to land smaller stacks and sync more often.
@@ -505,6 +510,71 @@ Do not add instances to speed up lands on one ref: they add cross-process
 losses.
 
 **Escalate / collect.** As in LeepLandExhausted.
+
+## LeepLandForwardFailing
+
+**Meaning.** With `--land-coordination on`, servers sent lands to the server
+holding their ref's lease and got no answer, more than once every 10 seconds
+for 10 minutes (`leep_land_forwarded_total{outcome="failed"}`). **Ticket.**
+
+**Impact.** Those lands wait: the sender asks the holder again every half
+second but never batches the land itself while the lease is live, and
+answers 409 after 30 seconds. Agents retry. Lands sent to the holder itself
+are unaffected. Nothing is lost or landed twice.
+
+**Diagnose.**
+
+1. Which holder: `SELECT ref_name, holder, address, epoch FROM land_leases`
+   on the metadata store, and the WARN lines `peer address ... is not
+   allowed` on the senders.
+2. An address the senders refuse: it is outside their `--peer-url-prefix` /
+   `--peer-cidr`, or is plain http to a public host. Compare the holder's
+   `--advertise-url` with the senders' allow-list; a server whose list
+   differs from the rest is a config skew.
+3. An address that does not answer: from a sender's host, `curl -i
+   <address>/v1/health` should answer 200 with a `Leep-Instance` header equal
+   to the lease's `holder`. A firewall between servers, or a balancer
+   address used as `--advertise-url`, shows here. (Servers check their own
+   address at startup, so a typo stops the server rather than this alert.)
+4. A holder that is alive but overloaded: its request latency and CPU.
+
+**Mitigate / fix.** Fix the allow-list or the network so servers reach each
+other's `--advertise-url` directly. To get lands flowing at once, restart (or
+SIGTERM) the holder: it releases its leases on shutdown, and the next land
+elsewhere takes them. As a last resort, `--land-coordination off` everywhere
+brings back the old behaviour, with its contention.
+
+**Escalate / collect.** The `land_leases` rows, each server's flags, the
+WARN lines and the [standard bundle](#collecting-a-bug-report).
+
+## LeepLandLeaseFlapping
+
+**Meaning.** Land leases were taken more than six times a minute for 10
+minutes (`leep_land_lease_acquired_total`). **Ticket.** A lease changes hands
+only when its holder failed to renew it for a second, released it after 30 s
+idle, or shut down.
+
+**Impact.** Each change costs the lands in flight on the old holder a
+reroute, and lands batched on both sides for a moment race the CAS as
+without coordination. Correctness is unaffected.
+
+**Diagnose.**
+
+1. `leep_land_lease_lost_total` by `reason` on each server: `taken` means a
+   holder failed to renew; `idle` with reacquisitions means refs that see a
+   land every half minute or so (harmless churn, raise nothing).
+2. Renewals failing: the metadata store's latency and errors (a renewal is
+   one `UPDATE` every 500 ms per server), and the servers' logs.
+3. Servers restarting: `LeepServerDown`, deploy history.
+4. Clock: Postgres judges lease times by its own clock, so server clocks do
+   not matter; SQLite judges by the host's clock.
+
+**Mitigate / fix.** Fix the store's latency. If renewals are slow but
+succeed, raise `--land-lease-renew` and `--land-lease-ttl` together on every
+server (for example 1s and 4s).
+
+**Escalate / collect.** The lease metrics of every server, store latency
+graphs and the [standard bundle](#collecting-a-bug-report).
 
 ## LeepLandSlowP99
 
