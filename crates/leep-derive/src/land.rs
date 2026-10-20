@@ -364,6 +364,12 @@ impl Repo {
         let mut commit_errors = 0;
         let mut lookup_errors = 0;
         let mut last_error = None;
+        // `rebased-origin-v1` rows read by earlier attempts of this batch,
+        // stored ones only (see `Staging::retain_stored`). A stored
+        // changeset's row is written with it, before any ref can reach it,
+        // and never changes, so a later attempt reads only the rows of the
+        // head's new ancestors instead of scanning the whole stretch again.
+        let mut carried: HashMap<ChangesetId, Option<ChangesetId>> = HashMap::new();
         for attempt in 1..=MAX_LAND_ATTEMPTS {
             let start = match self.meta().get_ref(target_ref).await {
                 Ok(h) => h,
@@ -392,10 +398,11 @@ impl Repo {
                     }
                 },
                 async {
-                    match start {
-                        Some(h) => staged.prefetch_origins(h, &ids).await,
-                        None => HashMap::new(),
+                    let mut origins = std::mem::take(&mut carried);
+                    if let Some(h) = start {
+                        staged.prefetch_origins(h, &ids, &mut origins).await;
                     }
+                    origins
                 }
             );
             // A failed land id lookup holds back only the lands with ids, to
@@ -466,6 +473,8 @@ impl Repo {
                 #[cfg(test)]
                 self.land_queues.batches.lock().unwrap().push(taken);
             }
+            staging.retain_stored(&mut origins);
+            carried = origins;
             if steps.is_empty() {
                 if lands.is_empty() {
                     return;
@@ -693,31 +702,36 @@ impl Repo {
     /// lowest generation among `ids`, as far as [`landed_copy`] walks and
     /// this process already knows the ancestry, so the walk itself reads
     /// nothing. The first scan of a batch otherwise reads them one by one.
-    /// Anything not read here the scans read as before.
+    /// Anything not read here the scans read as before. Rows already in
+    /// `origins` (carried from an earlier attempt) are not read again.
     ///
     /// [`landed_copy`]: Self::landed_copy
     async fn prefetch_origins(
         &self,
         head: ChangesetId,
         ids: &[ChangesetId],
-    ) -> HashMap<ChangesetId, Option<ChangesetId>> {
-        let mut origins = HashMap::new();
+        origins: &mut HashMap<ChangesetId, Option<ChangesetId>>,
+    ) {
         let Some(floor) = ids
             .iter()
             .filter_map(|id| self.cached_generation(*id))
             .min()
         else {
-            return origins;
+            return;
         };
         let mut want = Vec::new();
+        let mut walked = 0;
         let mut seen = HashSet::from([head]);
         let mut stack = vec![head];
         while let Some(id) = stack.pop() {
             if !self.cached_generation(id).is_some_and(|g| g > floor) {
                 continue;
             }
-            want.push(id);
-            if want.len() >= LANDED_COPY_SCAN {
+            if !origins.contains_key(&id) {
+                want.push(id);
+            }
+            walked += 1;
+            if walked >= LANDED_COPY_SCAN {
                 break;
             }
             if let Some(parents) = self.cached_parents(id) {
@@ -725,7 +739,7 @@ impl Repo {
             }
         }
         if want.is_empty() {
-            return origins;
+            return;
         }
         let keys: Vec<_> = want.iter().map(|id| id.0).collect();
         let Ok(rows) = self
@@ -733,7 +747,7 @@ impl Repo {
             .get_derived_many(crate::REBASED_ORIGIN_KIND, &keys)
             .await
         else {
-            return origins;
+            return;
         };
         for (id, row) in want.into_iter().zip(rows) {
             match row {
@@ -747,7 +761,6 @@ impl Repo {
                 }
             }
         }
-        origins
     }
 
     /// The server's rebased copy of `cs` among `head`'s ancestors, if an

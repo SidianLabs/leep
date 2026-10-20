@@ -44,6 +44,8 @@ struct Gate {
     intruder_moves: Mutex<Vec<Move>>,
     /// `find_lands` calls left to fail.
     find_fails: AtomicUsize,
+    /// Keys of every `rebased-origin-v1` row read from the store.
+    origin_reads: Mutex<Vec<Hash>>,
 }
 
 impl Gate {
@@ -61,6 +63,7 @@ impl Gate {
             intruder: Mutex::new(None),
             intruder_moves: Mutex::new(Vec::new()),
             find_fails: AtomicUsize::new(0),
+            origin_reads: Mutex::new(Vec::new()),
         })
     }
 
@@ -183,6 +186,9 @@ impl MetaStore for Gate {
         self.inner.list_refs().await
     }
     async fn get_derived(&self, kind: &str, key: &Hash) -> Result<Option<Bytes>> {
+        if kind == crate::REBASED_ORIGIN_KIND {
+            self.origin_reads.lock().unwrap().push(*key);
+        }
         self.inner.get_derived(kind, key).await
     }
     async fn put_derived(&self, kind: &str, key: &Hash, value: Bytes) -> Result<()> {
@@ -540,6 +546,96 @@ async fn a_swap_lost_to_another_server_redoes_the_batch_on_its_head() {
         .await
         .unwrap();
     assert_eq!(log_steps(&log), log_steps(&want_log));
+}
+
+/// A redone batch keeps the `rebased-origin-v1` rows its lost attempt read
+/// from the store, so its landed-copy scans read only what the head gained
+/// (ADR 0056, "Scan carry").
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_redone_batch_reads_each_stored_origin_row_once() {
+    use Parent::*;
+    let mut script: Vec<Spec> = (0..12)
+        .map(|i| {
+            let path = format!("landed/{i}");
+            spec(&[Base], &[(path.as_str(), Some("x\n"))], &format!("l{i}"))
+        })
+        .collect();
+    for i in 0..4 {
+        let path = format!("queued/{i}");
+        script.push(spec(
+            &[Base],
+            &[(path.as_str(), Some("q\n"))],
+            &format!("q{i}"),
+        ));
+    }
+    // Written by the other server.
+    script.push(spec(&[Base], &[("other", Some("o\n"))], "other"));
+    let (r, gate) = gated_repo();
+    let (base, ids) = build(&r, &script).await;
+    // Twelve replays on main: rebased copies with origin rows, all above the
+    // generation of the queued lands, so every scan walks them.
+    for &id in &ids[..12] {
+        r.land(id, "main").await.unwrap();
+    }
+    let head = r.meta().get_ref("main").await.unwrap().unwrap();
+    let other = make(
+        &r,
+        &[head],
+        &[("other".into(), Some("o\n".into()))],
+        "other",
+    )
+    .await;
+    let lands: Vec<_> = ids[12..16].iter().map(|&id| (id, None)).collect();
+    let (blocker, tasks) = queue_in_order(&r, &gate, base, &lands).await;
+    *gate.intruder.lock().unwrap() = Some((Some(head), other));
+    gate.origin_reads.lock().unwrap().clear();
+    release(&gate);
+    blocker.await.unwrap().unwrap();
+    for t in tasks {
+        match t.await.unwrap().unwrap() {
+            LandResponse::Landed { attempts, .. } => assert_eq!(attempts, 2),
+            other => panic!("{other:?}"),
+        }
+    }
+    // The blocker's batch and the first attempt each read the copies' rows;
+    // the redone attempt reads only the new head's.
+    let reads = gate.origin_reads.lock().unwrap().clone();
+    let mut counts: std::collections::HashMap<Hash, usize> = Default::default();
+    for k in &reads {
+        *counts.entry(*k).or_default() += 1;
+    }
+    assert_eq!(counts.get(&other.0), Some(&1), "{reads:?}");
+    assert!(counts.len() >= 12, "the scans walked the landed copies");
+    let again: Vec<_> = counts.iter().filter(|(_, n)| **n > 2).collect();
+    assert!(again.is_empty(), "read by the redone attempt: {again:?}");
+}
+
+/// What an attempt staged is never carried: a changeset or origin row it
+/// wrote may not have been stored when its swap lost.
+#[tokio::test]
+async fn staged_origins_are_not_carried_to_the_next_attempt() {
+    use crate::land_stage::Staging;
+    let r = plain_repo();
+    let (base, ids) = build(
+        &r,
+        &[
+            spec(&[Parent::Base], &[("a", Some("a\n"))], "a"),
+            spec(&[Parent::Base], &[("b", Some("b\n"))], "b"),
+        ],
+    )
+    .await;
+    let staging = Arc::new(Staging::default());
+    let staged = staging.repo(&r);
+    let copy = match staged.rebase(ids[0], ids[1]).await.unwrap() {
+        leep_core::api::RebaseResponse::Rebased { id } => id,
+        other => panic!("{other:?}"),
+    };
+    assert!(r.meta().get_changeset(&copy).await.unwrap().is_none());
+    let mut origins =
+        std::collections::HashMap::from([(copy, Some(ids[0])), (base, None), (ids[0], None)]);
+    staging.retain_stored(&mut origins);
+    assert!(!origins.contains_key(&copy), "the staged copy is dropped");
+    assert_eq!(origins.len(), 2, "rows read from the store are kept");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -492,7 +492,8 @@ leader(target):  while queue not empty: land_batch(take ≤64 queued, in arrival
 land_batch:
 loop (≤32 attempts):
   start ← get_ref(target);  head ← start;  staging ← empty
-  prefetch the lands' changesets, root trees and the head's rebase links,
+  prefetch the lands' changesets, root trees and the head's rebase links
+           (stored rebase links an earlier attempt of the batch read are kept),
     and what target's ref log recorded for the lands' land ids
   for each land, writing into staging and reading it back (dropped if its caller left before it was reached):
     if its land id is recorded (or moved earlier in this batch):
