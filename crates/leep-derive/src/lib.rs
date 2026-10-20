@@ -19,6 +19,7 @@ pub mod gc;
 mod history;
 pub mod integrity;
 mod land;
+pub mod land_coord;
 mod land_stage;
 mod merge;
 pub mod owners;
@@ -42,6 +43,8 @@ mod fault_tests;
 mod flush_tests;
 #[cfg(test)]
 mod land_batch_tests;
+#[cfg(test)]
+mod land_coord_tests;
 #[cfg(test)]
 mod page_tests;
 #[cfg(test)]

@@ -22,18 +22,23 @@ use leep_testkit::{is_injected, Fault, FaultPlan, FaultyBlobStore, FaultyMetaSto
 use crate::Repo;
 
 /// Stores shared by any number of faulty "servers" and one clean verifier.
-struct World {
-    blobs: Arc<MemoryBlobStore>,
-    meta: Arc<MemoryMetaStore>,
-    plan: Arc<FaultPlan>,
+pub(crate) struct World {
+    pub(crate) blobs: Arc<MemoryBlobStore>,
+    pub(crate) meta: Arc<MemoryMetaStore>,
+    pub(crate) plan: Arc<FaultPlan>,
     /// Reads the same data with no faults.
-    clean: Repo,
+    pub(crate) clean: Repo,
 }
 
 impl World {
     fn new(seed: u64) -> World {
+        Self::with_meta(seed, MemoryMetaStore::new())
+    }
+
+    /// Like [`World::new`], over `meta` (for example one with a lease clock).
+    pub(crate) fn with_meta(seed: u64, meta: MemoryMetaStore) -> World {
         let blobs = Arc::new(MemoryBlobStore::new());
-        let meta = Arc::new(MemoryMetaStore::new());
+        let meta = Arc::new(meta);
         World {
             clean: Repo::new(blobs.clone(), meta.clone()),
             plan: FaultPlan::new(seed),
@@ -57,13 +62,13 @@ impl World {
     }
 }
 
-fn rp(s: &str) -> RepoPath {
+pub(crate) fn rp(s: &str) -> RepoPath {
     RepoPath::new(s).unwrap()
 }
 
 /// Run `f` until it succeeds, the way a client retries a failed request.
 /// Only injected faults are retried; a real error is a bug and panics.
-async fn retry<T, Fut: Future<Output = Result<T>>>(
+pub(crate) async fn retry<T, Fut: Future<Output = Result<T>>>(
     seed: u64,
     what: &str,
     mut f: impl FnMut() -> Fut,
@@ -79,7 +84,7 @@ async fn retry<T, Fut: Future<Output = Result<T>>>(
 }
 
 /// Upload one file and commit it on `parent`, retrying through faults.
-async fn commit_file(
+pub(crate) async fn commit_file(
     seed: u64,
     repo: &Repo,
     parent: Option<ChangesetId>,
@@ -111,7 +116,7 @@ async fn commit_file(
 }
 
 /// Every changeset reachable from `head`, found iteratively.
-async fn history(r: &Repo, head: ChangesetId) -> Vec<ChangesetId> {
+pub(crate) async fn history(r: &Repo, head: ChangesetId) -> Vec<ChangesetId> {
     let mut seen = HashSet::from([head]);
     let mut out = Vec::new();
     let mut stack = vec![head];
@@ -133,7 +138,7 @@ async fn history(r: &Repo, head: ChangesetId) -> Vec<ChangesetId> {
 
 /// Everything a ref reaches is readable: each changeset in its history, its
 /// whole tree and every file blob. Returns the history.
-async fn assert_ref_sound(seed: u64, r: &Repo, name: &str) -> Vec<ChangesetId> {
+pub(crate) async fn assert_ref_sound(seed: u64, r: &Repo, name: &str) -> Vec<ChangesetId> {
     let head = r
         .meta()
         .get_ref(name)
@@ -160,7 +165,7 @@ async fn assert_ref_sound(seed: u64, r: &Repo, name: &str) -> Vec<ChangesetId> {
 
 /// The ref log replays to the current refs: per ref, entries chain
 /// (`old` is the previous `new`) and end at the ref's value.
-async fn assert_ref_log_replays(seed: u64, meta: &dyn MetaStore) {
+pub(crate) async fn assert_ref_log_replays(seed: u64, meta: &dyn MetaStore) {
     let mut log = meta.ref_log(None, None, usize::MAX).await.unwrap();
     log.reverse();
     let mut replay: BTreeMap<String, ChangesetId> = BTreeMap::new();
@@ -191,7 +196,7 @@ const AGENTS: usize = 12;
 
 /// Seeds to run: `LEEP_FAULT_SEED=n` replays one, `LEEP_FAULT_SEEDS=n` runs
 /// `1..=n`, and the default is a short sweep.
-fn seeds() -> std::ops::RangeInclusive<u64> {
+pub(crate) fn seeds() -> std::ops::RangeInclusive<u64> {
     let var = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<u64>().ok());
     match (var("LEEP_FAULT_SEED"), var("LEEP_FAULT_SEEDS")) {
         (Some(one), _) => one..=one,
@@ -201,12 +206,12 @@ fn seeds() -> std::ops::RangeInclusive<u64> {
 }
 
 /// What one simulated agent was told.
-struct Agent {
-    n: usize,
+pub(crate) struct Agent {
+    pub(crate) n: usize,
     /// Paths and bodies of its stack, oldest first.
-    files: Vec<(String, String)>,
+    pub(crate) files: Vec<(String, String)>,
     /// The id every `land` reply that said success named.
-    reported: Vec<ChangesetId>,
+    pub(crate) reported: Vec<ChangesetId>,
 }
 
 async fn run_agent(seed: u64, repo: Repo, n: usize, steps: usize, per_try: Duration) -> Agent {
@@ -291,11 +296,18 @@ async fn lands_under_faults(seed: u64) {
     );
 
     w.plan.pause();
+    assert_lands_kept(seed, &w, &agents).await;
+}
+
+/// After agents stop: everything `main` reaches is readable, every land an
+/// agent was told about is in its history with every file of its stack,
+/// nothing landed twice, and the ref log replays to the refs.
+pub(crate) async fn assert_lands_kept(seed: u64, w: &World, agents: &[Agent]) {
     let ids = assert_ref_sound(seed, &w.clean, "main").await;
     let head = w.meta.get_ref("main").await.unwrap().unwrap();
 
     // Every reported success is in history, and so is every file it carried.
-    for a in &agents {
+    for a in agents {
         for landed in &a.reported {
             assert!(
                 w.clean.is_ancestor(*landed, head).await.unwrap(),
