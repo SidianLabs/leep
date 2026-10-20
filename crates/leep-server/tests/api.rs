@@ -1551,3 +1551,136 @@ async fn land_creates_a_missing_ref_only_when_allowed() {
         .await;
     assert!(matches!(r.json(), LandResponse::Landed { landed, .. } if landed == b));
 }
+
+/// `?after=` pages through log, search and the ref log over HTTP; requests
+/// without it answer as before, plus `next` only when they stopped early.
+#[tokio::test]
+async fn list_endpoints_page_with_cursors() {
+    let c = Client::new();
+    let mut chain: Vec<ChangesetId> = Vec::new();
+    for i in 0..40 {
+        let parents: Vec<ChangesetId> = chain.last().copied().into_iter().collect();
+        let text = format!("needle {i}\nhay\nneedle again {i}\n");
+        let path = format!("d{}/f{i}", i % 3);
+        let files = [(path.as_str(), Some(text.as_str()))];
+        chain.push(c.commit(&parents, &files, &format!("c{i}")).await);
+        let r = c
+            .post(
+                "/v1/refs/main",
+                &CasRefRequest {
+                    expected: parents.first().copied(),
+                    new: chain.last().copied(),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::OK);
+    }
+    let tip = *chain.last().unwrap();
+
+    // An unpaged request: no `next`, and a client that knows nothing of
+    // cursors decodes the body as before.
+    #[derive(serde::Deserialize)]
+    struct OldLog {
+        entries: Vec<ChangesetInfo>,
+    }
+    let r = c.get(&format!("/v1/log/{tip}")).await;
+    let v: serde_json::Value = r.json();
+    assert!(v.get("next").is_none());
+    assert_eq!(r.json::<OldLog>().entries.len(), 40);
+    let r = c.get(&format!("/v1/log/{tip}?limit=7")).await;
+    assert!(r.json::<LogResponse>().next.is_some());
+    assert_eq!(r.json::<OldLog>().entries.len(), 7);
+
+    for query in ["", "&path=d1", "&path=d2/f5", "&author=t"] {
+        let mut got = Vec::new();
+        let mut after: Option<String> = None;
+        loop {
+            let mut uri = format!("/v1/log/{tip}?limit=3{query}");
+            if let Some(a) = &after {
+                uri.push_str(&format!("&after={a}"));
+            }
+            let r = c.get(&uri).await;
+            assert_eq!(r.status, StatusCode::OK, "{uri}");
+            let page: LogResponse = r.json();
+            got.extend(page.entries.into_iter().map(|e| e.id));
+            match page.next {
+                Some(n) => after = Some(n),
+                None => break,
+            }
+        }
+        let all: LogResponse = c
+            .get(&format!("/v1/log/{tip}?limit=10000{query}"))
+            .await
+            .json();
+        let want: Vec<ChangesetId> = all.entries.iter().map(|e| e.id).collect();
+        assert_eq!(got, want, "{query}");
+    }
+
+    // A cursor is bound to its query, and garbage is a 400 with a message.
+    let first: LogResponse = c.get(&format!("/v1/log/{tip}?limit=2")).await.json();
+    let next = first.next.unwrap();
+    for uri in [
+        format!("/v1/log/{tip}?limit=2&path=d1&after={next}"),
+        format!("/v1/log/{}?limit=2&after={next}", chain[3]),
+        format!("/v1/log/{tip}?after=not-a-cursor"),
+        format!("/v1/log/{tip}?after={}", "A".repeat(5000)),
+        format!("/v1/search/main?q=needle&after={next}"),
+        format!("/v1/reflog?after={next}"),
+    ] {
+        let r = c.get(&uri).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{uri}");
+        let e: ErrorResponse = r.json();
+        assert!(e.error.contains("cursor"), "{uri}: {}", e.error);
+    }
+
+    // Search: pages concatenate, and `truncated` stays set on cut pages.
+    let all: SearchResponse = c.get("/v1/search/main?q=needle&limit=1000").await.json();
+    assert_eq!(all.matches.len(), 80);
+    assert!(!all.truncated && all.next.is_none());
+    let mut got = Vec::new();
+    let mut after: Option<String> = None;
+    loop {
+        let mut uri = "/v1/search/main?q=needle&limit=7".to_string();
+        if let Some(a) = &after {
+            uri.push_str(&format!("&after={a}"));
+        }
+        let page: SearchResponse = c.get(&uri).await.json();
+        got.extend(page.matches);
+        match page.next {
+            Some(n) => {
+                assert!(page.truncated);
+                after = Some(n);
+            }
+            None => break,
+        }
+    }
+    assert_eq!(got, all.matches);
+
+    // Ref log: cursors and the old `before` both page; together they are 400.
+    let all: RefLogResponse = c.get("/v1/reflog/main?limit=1000").await.json();
+    assert_eq!(all.entries.len(), 40);
+    let mut got = Vec::new();
+    let mut after: Option<String> = None;
+    loop {
+        let mut uri = "/v1/reflog/main?limit=6".to_string();
+        if let Some(a) = &after {
+            uri.push_str(&format!("&after={a}"));
+        }
+        let page: RefLogResponse = c.get(&uri).await.json();
+        got.extend(page.entries);
+        match page.next {
+            Some(n) => after = Some(n),
+            None => break,
+        }
+    }
+    assert_eq!(got, all.entries);
+    let page: RefLogResponse = c.get("/v1/reflog/main?limit=6").await.json();
+    let r = c
+        .get(&format!(
+            "/v1/reflog/main?limit=6&before=9&after={}",
+            page.next.unwrap()
+        ))
+        .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+}

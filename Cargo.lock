@@ -2366,6 +2366,7 @@ name = "leep-derive"
 version = "0.0.1"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "bytes",
  "criterion",
  "diffy",

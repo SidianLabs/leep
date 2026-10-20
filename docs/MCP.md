@@ -50,13 +50,13 @@ Logs go to stderr; stdout carries protocol messages only.
 | Tool | Arguments | Result |
 |---|---|---|
 | `leep_refs` | none | refs and their changeset ids; tags are the names under `tags/` |
-| `leep_log` | `rev?`, `path?`, `follow?`, `limit?` (default 20, max 200), `author?`, `agent_model?`, `agent_session?` (filters combine with AND) | entries with author, message, `agent` metadata; with `follow` (needs a file `path`) history continues under the file's old name across renames, and entries carry `path_at` and, where the rename happened, `renamed {from, to, similarity, exact}` |
+| `leep_log` | `rev?`, `path?`, `follow?`, `limit?` (default 20, max 200), `author?`, `agent_model?`, `agent_session?` (filters combine with AND), `cursor?` | entries with author, message, `agent` metadata, and `next` when more history follows (call again with the same arguments, `rev` set to the result's `from` and `cursor` set to `next`); with `follow` (needs a file `path`) history continues under the file's old name across renames, and entries carry `path_at` and, where the rename happened, `renamed {from, to, similarity, exact}` |
 | `leep_show` | `rev` | one changeset and its changed paths (A/M/D) |
 | `leep_list_files` | `rev?`, `prefix?` | recursive file list with sizes |
 | `leep_read_file` | `rev?`, `path` | text content; capped at 256 KiB; binary is reported, not returned |
 | `leep_diff` | `from?`, `to`, `prefix?`, `renames?`, `rename_threshold?` (0 to 100, default 50) | unified diff; `from` defaults to the first parent of `to`. With `renames` (default false) a moved file shows once, with `rename from` / `rename to` / `similarity index` lines and a content diff only if it changed (ADR 0016) |
 | `leep_blame` | `rev?`, `path` | per-line changeset and author |
-| `leep_search` | `query`, `rev?`, `regex?`, `case_insensitive?`, `path?`, `glob?`, `limit?` (default 50, max 200) | matching lines `{path, line_number, line, ranges}` ordered by path then line, `truncated`, `stats`; per line, UTF-8 text files up to 1 MiB (others counted in `stats.files_skipped`) |
+| `leep_search` | `query`, `rev?`, `regex?`, `case_insensitive?`, `path?`, `glob?`, `limit?` (default 50, max 200), `cursor?` | matching lines `{path, line_number, line, ranges}` ordered by path then line, `truncated`, `stats`, and `next` when the page stopped early (pass it back as `cursor`, with `rev` set to the result's `rev`); per line, UTF-8 text files up to 1 MiB (others counted in `stats.files_skipped`) |
 | `leep_review_status` | `rev`, `ref?` (default `main`) | per changed path: the rule that satisfies it (`auto:*`, `owner`, `merge_parent`) or `pending` / `rejected`, with owners and who approved or rejected, plus `approved`, `blocked_paths` and `next_step`; needs a server with authentication |
 | `leep_commit_and_land` | `message`, `changes[]`, `base?`, `target_ref?`, `create_ref?`, `prompt?`, `tests?`, `request_id?`; or `changeset` alone | landed id, or a conflict report |
 

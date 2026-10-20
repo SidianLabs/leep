@@ -55,6 +55,17 @@ A ref wins over a short id that spells the same. An ambiguous short id fails
 with exit 1 and lists the candidates (`--json`: `code: "ambiguous"` and
 `candidates`).
 
+## Long listings
+
+`leep log -n`, `leep search -n` and `leep reflog -n` may ask for more than the
+server returns per request (10000 log entries, 1000 search matches, 1000 ref
+log entries); the CLI fetches the rest page by page with the server's cursors.
+With `--json`, a log or search that stopped at `-n` while more remains carries
+`next`; `leep log --after NEXT` and `leep search --after NEXT`, with the same
+other flags and revision (use the full id the first page started from if a ref
+may move), continue from there. An older server without cursors answers one
+page.
+
 ## Landing onto a new ref
 
 `leep land` moves the working copy's target ref, or the ref given with

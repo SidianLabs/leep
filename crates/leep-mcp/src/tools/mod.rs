@@ -197,7 +197,8 @@ pub fn definitions() -> Vec<Value> {
              message and `agent` metadata (model, session, prompt, tests) when an agent made the \
              change. With `follow` and a file `path`, history continues under the file's old name \
              when it was renamed (each entry then has `path_at`, and `renamed` where the rename \
-             happened).",
+             happened). When more history follows, the result has `next`: pass it back as \
+             `cursor` for the next page.",
             json!({
                 "type": "object",
                 "properties": {
@@ -207,7 +208,8 @@ pub fn definitions() -> Vec<Value> {
                     "limit": { "type": "integer", "minimum": 1, "maximum": 200, "description": "Max matching entries (default 20)." },
                     "author": { "type": "string", "description": "Only changesets whose author contains this text (case-insensitive)." },
                     "agent_model": { "type": "string", "description": "Only changesets made by this agent model (exact match on agent.model)." },
-                    "agent_session": { "type": "string", "description": "Only changesets from this agent session (exact match on agent.session)." }
+                    "agent_session": { "type": "string", "description": "Only changesets from this agent session (exact match on agent.session)." },
+                    "cursor": { "type": "string", "description": "The `next` value of the previous page, to continue it (repeat the other arguments, with `rev` set to that page's `from`)." }
                 },
                 "additionalProperties": false
             }),
@@ -303,7 +305,8 @@ pub fn definitions() -> Vec<Value> {
              them, e.g. `**/*.rs`). Results are ordered by path then line, each with the file, \
              line number, the line (cut at 1024 bytes) and the byte ranges that matched. \
              Binary, non-UTF-8 and files over 1 MiB are skipped (`stats.files_skipped`). \
-             `truncated` means more matches exist or the server's scan budget ran out. The first \
+             `truncated` means more matches exist or the server's scan budget ran out; then \
+             `next`, passed back as `cursor`, continues where the page stopped. The first \
              search of a large revision can be slow while the server builds its index.",
             json!({
                 "type": "object",
@@ -314,7 +317,8 @@ pub fn definitions() -> Vec<Value> {
                     "case_insensitive": { "type": "boolean", "description": "Ignore case (default false)." },
                     "path": { "type": "string", "description": "Only files at or below this directory or file path." },
                     "glob": { "type": "string", "description": "Only paths matching this glob, e.g. `**/*.rs` or `src/*.toml`." },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 200, "description": "Max matching lines (default 50)." }
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 200, "description": "Max matching lines (default 50)." },
+                    "cursor": { "type": "string", "description": "The `next` value of the previous page, to continue it (repeat the other arguments, with `rev` set to that page's `rev`)." }
                 },
                 "required": ["query"],
                 "additionalProperties": false

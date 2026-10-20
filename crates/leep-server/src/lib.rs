@@ -25,7 +25,7 @@ use futures_util::StreamExt;
 use leep_core::api::*;
 use leep_core::rename::RenameOptions;
 use leep_core::{Changeset, ChangesetId, Error, FileKind, Hash, RefUpdateContext, RepoPath};
-use leep_derive::{search, ExtraMatch, LogFilter, PrefixMatch, Repo, SearchQuery};
+use leep_derive::{search, ExtraMatch, LogFilter, LogParams, PrefixMatch, Repo, SearchQuery};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use tower_http::limit::RequestBodyLimitLayer;
@@ -342,6 +342,8 @@ struct LogQuery {
     limit: Option<usize>,
     follow: bool,
     filter: LogFilter,
+    /// The previous page's `next` cursor.
+    after: Option<String>,
 }
 
 impl LogQuery {
@@ -357,6 +359,7 @@ impl LogQuery {
                     )
                 }
                 "follow" => q.follow = parse_bool("follow", &v)?,
+                "after" => q.after = Some(v),
                 "author" => q.filter.author = Some(v),
                 "extra" => q.filter.extra.push(ExtraMatch::parse(&v)?),
                 _ => {}
@@ -388,6 +391,7 @@ struct SearchParams {
     path: Option<String>,
     glob: Option<String>,
     limit: Option<usize>,
+    after: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -766,6 +770,7 @@ struct RefLogQuery {
     /// Text, so a bad value is our 400 and not the extractor's.
     before: Option<String>,
     limit: Option<String>,
+    after: Option<String>,
 }
 
 async fn ref_log(
@@ -784,8 +789,10 @@ async fn ref_log(
     let limit = num::<usize>("limit", q.limit)?
         .unwrap_or(DEFAULT_REFLOG_LIMIT)
         .min(MAX_REFLOG_LIMIT);
-    let entries = repo.meta().ref_log(name, before, limit).await?;
-    Ok(Json(RefLogResponse { entries }))
+    Ok(Json(
+        repo.ref_log_page(name, before, q.after.as_deref(), limit)
+            .await?,
+    ))
 }
 
 async fn ref_log_all(
@@ -880,32 +887,29 @@ async fn log(
 ) -> ApiResult<Response> {
     let q = LogQuery::parse(pairs)?;
     let limit = q.limit.unwrap_or(DEFAULT_LOG_LIMIT).min(MAX_LOG_LIMIT);
-    let entries = if q.follow {
-        let path = q
-            .path
-            .as_deref()
-            .filter(|p| !p.trim_matches('/').is_empty());
-        let path = path.ok_or_else(|| Error::Invalid("follow needs a file path".into()))?;
-        repo.log_follow(cid(&id)?, path, limit, &q.filter).await?
-    } else {
-        repo.log_filtered(cid(&id)?, q.path.as_deref(), limit, &q.filter)
-            .await?
+    let params = LogParams {
+        path: q.path,
+        follow: q.follow,
+        filter: q.filter,
     };
-    Ok(log_json(entries))
+    let page = repo
+        .log_page(cid(&id)?, &params, limit, q.after.as_deref())
+        .await?;
+    Ok(log_json(page.entries, page.next))
 }
 
 /// Entries one task encodes of a long log.
 const LOG_CHUNK_ENTRIES: usize = 512;
 
-/// `Json(LogResponse { entries })`, byte for byte, for a long log: chunks of
+/// `Json(LogResponse { entries, next })`, byte for byte, for a long log: chunks of
 /// entries are encoded on blocking threads, several at once, and streamed in
 /// order, so the first bytes leave while later entries are encoded. 10,000
 /// entries are tens of megabytes of JSON. The walk has finished, so a failure
 /// of the store still answers with an error status; encoding these types
 /// cannot fail.
-fn log_json(entries: Vec<ChangesetInfo>) -> Response {
+fn log_json(entries: Vec<ChangesetInfo>, next: Option<String>) -> Response {
     if entries.len() <= LOG_CHUNK_ENTRIES {
-        return Json(LogResponse { entries }).into_response();
+        return Json(LogResponse { entries, next }).into_response();
     }
     let mut chunks = Vec::with_capacity(entries.len().div_ceil(LOG_CHUNK_ENTRIES));
     let mut rest = entries.into_iter();
@@ -920,7 +924,8 @@ fn log_json(entries: Vec<ChangesetInfo>) -> Response {
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get().min(4));
     let body = futures_util::stream::iter(chunks.into_iter().enumerate())
         .map(move |(i, chunk)| {
-            tokio::task::spawn_blocking(move || encode_log_chunk(&chunk, i == 0, i == last))
+            let next = (i == last).then(|| next.clone()).flatten();
+            tokio::task::spawn_blocking(move || encode_log_chunk(&chunk, i == 0, i == last, next))
         })
         .buffered(threads)
         .map(|r| match r {
@@ -936,8 +941,14 @@ fn log_json(entries: Vec<ChangesetInfo>) -> Response {
 }
 
 /// Part of a `LogResponse` body: `chunk`'s entries, comma separated, opened
-/// by the object's head if `first` or by a comma if not, closed if `last`.
-fn encode_log_chunk(chunk: &[ChangesetInfo], first: bool, last: bool) -> serde_json::Result<Bytes> {
+/// by the object's head if `first` or by a comma if not, closed (with `next`,
+/// if any) if `last`.
+fn encode_log_chunk(
+    chunk: &[ChangesetInfo],
+    first: bool,
+    last: bool,
+    next: Option<String>,
+) -> serde_json::Result<Bytes> {
     let mut out = Vec::with_capacity(chunk.len() * 1024);
     out.extend_from_slice(if first { &b"{\"entries\":["[..] } else { b"," });
     for (k, entry) in chunk.iter().enumerate() {
@@ -947,7 +958,12 @@ fn encode_log_chunk(chunk: &[ChangesetInfo], first: bool, last: bool) -> serde_j
         serde_json::to_writer(&mut out, entry)?;
     }
     if last {
-        out.extend_from_slice(b"]}");
+        out.push(b']');
+        if let Some(next) = next {
+            out.extend_from_slice(b",\"next\":");
+            serde_json::to_writer(&mut out, &next)?;
+        }
+        out.push(b'}');
     }
     Ok(Bytes::from(out))
 }
@@ -985,7 +1001,6 @@ async fn search_rev(
     Path(rev): Path<String>,
     Query(p): Query<SearchParams>,
 ) -> ApiResult<Json<SearchResponse>> {
-    let id = repo.resolve(&rev).await?;
     let q = SearchQuery {
         regex: p.regex.unwrap_or(false),
         case_insensitive: p.i.unwrap_or(false),
@@ -997,7 +1012,7 @@ async fn search_rev(
             .clamp(1, search::MAX_LIMIT),
         ..SearchQuery::new(p.q)
     };
-    Ok(Json(repo.search(id, &q).await?))
+    Ok(Json(repo.search_page(&rev, &q, p.after.as_deref()).await?))
 }
 
 async fn diff(State(repo): S, Query(q): Query<DiffQuery>) -> ApiResult<Json<DiffResponse>> {
@@ -1107,15 +1122,18 @@ mod tests {
         };
         let n = LOG_CHUNK_ENTRIES;
         for len in [0, 1, n - 1, n, n + 1, 2 * n, 2 * n + 1, 5 * n + 17] {
-            let entries: Vec<ChangesetInfo> = (0..len).map(entry).collect();
-            let want = serde_json::to_vec(&LogResponse {
-                entries: entries.clone(),
-            })
-            .unwrap();
-            let resp = log_json(entries);
-            assert_eq!(resp.headers()[header::CONTENT_TYPE], "application/json");
-            let got = resp.into_body().collect().await.unwrap().to_bytes();
-            assert_eq!(got, want, "{len} entries");
+            for next in [None, Some("AQE-_x".to_string())] {
+                let entries: Vec<ChangesetInfo> = (0..len).map(entry).collect();
+                let want = serde_json::to_vec(&LogResponse {
+                    entries: entries.clone(),
+                    next: next.clone(),
+                })
+                .unwrap();
+                let resp = log_json(entries, next.clone());
+                assert_eq!(resp.headers()[header::CONTENT_TYPE], "application/json");
+                let got = resp.into_body().collect().await.unwrap().to_bytes();
+                assert_eq!(got, want, "{len} entries, next {next:?}");
+            }
         }
     }
 

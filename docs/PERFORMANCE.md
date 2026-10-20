@@ -287,6 +287,74 @@ target/release/leep-land-bench --server http://127.0.0.1:7391 \
 `--missing 90000` first times `POST /v1/blobs/missing` with 90,000 hashes
 that were never stored, three times.
 
+**Several servers on one ref.** `--server` and `--metrics` take
+comma-separated lists; agent `i` talks to server `i % count`, and the
+counters are summed over the servers. The instances share one database and
+one blob directory. Since this change the bench also keeps the latency of
+lands still waiting when the window closes (every agent finishes its land
+before stopping), reports lands per server, and counts *stalled agents*,
+those with no land answered inside the window; lands per second still counts
+only lands answered inside it.
+
+Local 4-vCPU Xeon shared with other agents' builds (load average 9 to 24),
+Postgres 16 on the same machine, blobs on ext4, `05b7630`, release build,
+`--agents 8,64,256 --duration 20` on a fresh database and blob directory
+per run, three rounds with the server-count order rotated. Cells are the
+median of the three runs, with the range in brackets; latencies in ms:
+
+| Servers | Agents | Lands/s | Land p50 | Land p99 | Land max | CAS losses | 409 retries | Stalled agents |
+|---|---|---|---|---|---|---|---|---|
+| 1 | 8 | 147 (102–159) | 29 (23–33) | 101 (72–259) | 463 (444–1184) | 0 | 0 | 0 |
+| 1 | 64 | 201 (185–265) | 194 (141–218) | 460 (383–493) | 590 (528–976) | 0 | 0 | 0 |
+| 1 | 256 | 125 (99–163) | 1769 (1396–2031) | 2175 (2002–3028) | 2190 (2040–3080) | 0 | 0 | 0 |
+| 2 | 8 | 84 (56–86) | 25 (25–28) | 91 (67–323) | 22101 (21602–22965) | 26 (24–38) | 3 | 4 of 8 |
+| 2 | 64 | 170 (169–190) | 112 (96–117) | 564 (474–588) | 25702 (22820–30459) | 8 (6–16) | 0 | 32 of 64 |
+| 2 | 256 | 147 (132–147) | 602 (595–692) | 23070 (22837–25390) | 23137 (22878–25426) | 9 (8–14) | 0 | 128 of 256 |
+| 3 | 8 | 59 (54–96) | 19 (17–22) | 55 (37–319) | 22035 (21888–22552) | 67 (67–83) | 2 (1–2) | 5 (4–6) of 8 |
+| 3 | 64 | 170 (166–180) | 71 (66–78) | 21480 (21289–22024) | 23051 (22579–23293) | 34 (34–49) | 0 | 43 (42–43) of 64 |
+| 3 | 256 | 146 (138–163) | 383 (338–397) | 24401 (23530–24761) | 24584 (23716–24989) | 24 (23–28) | 0 | 171 of 256 |
+
+Adding servers does not add throughput, and it starves agents: in every one
+of the 18 multi-server runs one instance answered every land inside the
+window (lands per server `0 / 3410`, `0 / 0 / 3258` and so on), and the
+agents of the other instances waited for the whole window. Their lands
+finished only when the winning instance's agents stopped, 21 to 30 s after
+they were sent, or ran out of the 32 attempts and answered 409 (the bench
+then lands again). The lands per second and p50 above are the winner's
+agents alone, which is why they look no worse than one server: their
+batches are smaller (15 at 64 agents with 2 servers, 10 with 3, against 32
+with one) and come round faster.
+
+Why the loser never wins, from per-attempt timers in a profiling build
+(`LEEP_LAND_PROFILE`, not merged; medians, ms):
+
+| Batch | Lands | Attempt | Prefetch | Replays | of which landed-copy scan | Blob store | Changesets and rows | CAS and ref log |
+|---|---|---|---|---|---|---|---|---|
+| 1 server, 64 agents | 28 | 170 | 14 | 108 | 0.8 | 31 | 3.8 | 2.7 |
+| 1 server, 256 agents | 64 | 417 | 23 | 340 | 5.4 | 37 | 5.3 | 3.6 |
+| 2 servers, 64 agents, winner | 16 | 74 | 7 | 36 | 0.2 | 21 | 2.5 | 2.2 |
+| 2 servers, 64 agents, loser (attempt 2 to 19) | 30 | 754 | 5 | 671 | 465 | 49 | 4.1 | 1.1 |
+| 2 servers, 256 agents, loser (attempt 2 to 12) | 64 | 1058 | 6 | 948 | 467 | 135 | 9.0 | 1.3 |
+
+The winning instance moves the ref every 70 to 80 ms; a losing attempt
+takes 0.75 to 1 s between reading the head and the swap, so it always finds
+the head moved. Each loss makes the next attempt slower: the losing lands
+fall further behind the head, and the landed-copy scan (ADR 0021, 0032)
+walks every changeset the head gained since their base, up to its bound of
+1024, which is half the attempt by the second or third loss. All of the
+losing instance's agents are waiting, so its batch is always all of them,
+and its replays onto a head further away cost more (7 to 15 ms each, against
+2 to 5). The backoff (at most 200 ms) does not break the cycle, because the
+winner never pauses. With one server, the time of a batch at 64 and more
+agents is replays (65 to 80%), then storing the staged tree blobs with their
+fsync and condemnation read (10 to 20%), the prefetch (5 to 8%), the
+changeset and derived-row write (1 to 3%) and the swap with its ref log
+rows (1 to 2%); the landed-copy scan is under 2%.
+
+As far as the bench checks, correctness held: every land was answered
+`Landed` (after the 409s above), and none conflicted or errored. Until lands are coordinated across instances,
+route each hot ref's lands to one instance (`docs/RUNBOOKS.md`).
+
 **Per-directory flushes (ADR 0048).** After ADR 0044, with 64 agents and
 10-file changesets (`--files 10`) create p50 was about 25% worse than before
 it. Timers on the create path put 20 to 44 ms of a create's 51 to 93 ms

@@ -876,6 +876,48 @@ A snapshot restores when `check.ok` is true (or `--accept-failed-check`), its
 changesets need. Adding a manifest field is additive; changing the meaning of
 an existing one needs a new `format`.
 
+## Page cursors (additive API fields, no persisted change)
+
+`LogResponse`, `SearchResponse` and `RefLogResponse` gain an optional `next`
+(`#[serde(default)]`, omitted when absent), and `GET /v1/log/{id}`,
+`GET /v1/search/{rev}` and `GET /v1/reflog[/{name}]` accept `after=<cursor>`.
+A response carries `next` when the page stopped before the end; the same
+request plus `after=<next>` returns the following page, and concatenated pages
+equal one uncapped answer. Requests without `after` answer exactly as before
+apart from the extra field, so old clients are unaffected; old servers never
+send `next`, so new clients stop after one page.
+
+The cursor is opaque text, at most 4096 characters of base64url without
+padding (`leep_derive::MAX_CURSOR_CHARS`). Clients must not parse or build
+one. Today's layout (version 1) is `version (1 byte) | endpoint kind (1: log,
+2: search, 3: ref log) | fingerprint (16 bytes: the first bytes of BLAKE3 over
+the kind and the postcard encoding of every query parameter that changes the
+answer, but not `limit`) | postcard body`:
+
+- log: either the walk's queue when the page ended (`Frontier`: up to 64
+  changeset ids, each with the followed file's name for `follow=true` and the
+  merge-side bound of the `log-filter-v1` walk, plus whether that walk had
+  switched to the index) or, when the queue is wider, `Below { generation, id
+  }` of the last entry, which restarts from the tip and skips what ranks at or
+  above it. Every log walk pops changesets in descending `(generation, id)` and
+  queues only ancestors of what it popped, so a walk seeded with the queue
+  yields exactly the rest of the original walk.
+- search: the changeset searched (pinned, so later pages read the same tree
+  even if `rev` moved) and the position after the last match kept (`path`,
+  `line`), or after the last file finished (`line = u64::MAX`) when the scan
+  budget cut the page short.
+- ref log: the `seq` bound (`before`) of the next page.
+
+The server treats a cursor as untrusted: it checks the length before
+decoding, then the version, kind and fingerprint, decodes the body strictly
+(no trailing bytes), and checks that named changesets exist and that a log
+queue is no wider than 64 entries and matches the query's walk (names only
+with `follow`, bounds only from the indexed walk). Any failure is 400 with an
+`error` that mentions the cursor; the client restarts without `after`. A
+change to the layout bumps the version byte, so cursors from an older server
+are refused rather than misread. `before` and `after` together on the ref log
+are 400.
+
 ## Request limits (additive, ADR 0020)
 
 Nothing persisted changed. On the wire, any endpoint may now answer `429` with

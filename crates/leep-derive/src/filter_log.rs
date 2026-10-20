@@ -22,6 +22,7 @@ use std::sync::Arc;
 
 use leep_core::{Changeset, ChangesetId, Hash, Result, TreeNode};
 
+use crate::cursor::{FrontierEntry, LogFrom, LogPageRaw};
 use crate::derived::{
     author_fingerprint, key_fingerprint, value_fingerprint, DerivedKind, FilterRow, Level,
     LogFilterIndex, SkipEntry, Skiplist, CLASS_AUTHOR, CLASS_KEY, CLASS_VALUE, INDEXED_VALUES,
@@ -75,8 +76,58 @@ impl Repo {
         filter: &LogFilter,
         scan_first: usize,
     ) -> Result<Vec<ChangesetInfo>> {
+        Ok(self
+            .log_by_filter_from(id, limit, filter, scan_first, &LogFrom::tip())
+            .await?
+            .entries)
+    }
+
+    /// [`Repo::log_by_filter_with`] from `from`, returning what is still
+    /// queued. A queue left by the indexed phase resumes in it, bounds and
+    /// all; one left by the scan resumes with the scan.
+    pub(crate) async fn log_by_filter_from(
+        &self,
+        id: ChangesetId,
+        limit: usize,
+        filter: &LogFilter,
+        scan_first: usize,
+        from: &LogFrom,
+    ) -> Result<LogPageRaw> {
         let mut out = Vec::new();
-        let mut walk = Walk::start(self, id, false, usize::MAX).await?;
+        let rest = match &from.seeds {
+            Some(seeds) if from.indexed => {
+                self.resume_indexed(id, seeds, limit, filter, from, &mut out)
+                    .await?
+            }
+            _ => {
+                self.scan_then_index(id, limit, filter, scan_first, from, &mut out)
+                    .await?
+            }
+        };
+        let ids: Vec<ChangesetId> = out.iter().map(|i| i.id).collect();
+        for (info, root) in out.iter_mut().zip(self.root_trees(&ids).await?) {
+            info.root_tree = root;
+        }
+        Ok(LogPageRaw { entries: out, rest })
+    }
+
+    /// The scan of [`SCAN_FIRST`] changesets, then the indexed walk.
+    async fn scan_then_index(
+        &self,
+        id: ChangesetId,
+        limit: usize,
+        filter: &LogFilter,
+        scan_first: usize,
+        from: &LogFrom,
+        out: &mut Vec<ChangesetInfo>,
+    ) -> Result<Option<(Vec<FrontierEntry>, bool)>> {
+        let mut walk = match &from.seeds {
+            Some(seeds) => {
+                let ids: Vec<ChangesetId> = seeds.iter().map(|e| e.id).collect();
+                Walk::start_many(self, &ids, false, usize::MAX).await?
+            }
+            None => Walk::start(self, id, false, usize::MAX).await?,
+        };
         let mut scanned = 0;
         // Keep scanning while matches come often enough that the scan is the
         // cheaper way to the limit (see `SCAN_RATIO`).
@@ -86,7 +137,7 @@ impl Repo {
                 break;
             };
             scanned += 1;
-            push_match(&mut out, step, filter);
+            push_match(out, step, filter, from);
             if scanned == budget && out.len() * SCAN_RATIO >= scanned {
                 budget += scan_first;
             }
@@ -94,28 +145,63 @@ impl Repo {
         if out.len() < limit && !walk.is_done() {
             match self.filter_probe(id, filter).await? {
                 Some(probe) => {
-                    let (seen, heap) = (
-                        std::mem::take(&mut walk.seen),
-                        std::mem::take(&mut walk.heap),
-                    );
-                    self.walk_indexed(seen, heap, &probe, limit, filter, &mut out)
+                    let mut st = Indexed {
+                        seen: std::mem::take(&mut walk.seen),
+                        heap: std::mem::take(&mut walk.heap),
+                        bounds: HashMap::new(),
+                    };
+                    self.walk_indexed(&mut st, &probe, limit, filter, from, out)
                         .await?;
+                    return Ok(st.rest());
                 }
                 None => {
                     while out.len() < limit {
                         let Some(step) = walk.next(self, usize::MAX).await? else {
                             break;
                         };
-                        push_match(&mut out, step, filter);
+                        push_match(out, step, filter, from);
                     }
                 }
             }
         }
-        let ids: Vec<ChangesetId> = out.iter().map(|i| i.id).collect();
-        for (info, root) in out.iter_mut().zip(self.root_trees(&ids).await?) {
-            info.root_tree = root;
+        Ok(walk.rest())
+    }
+
+    /// Continue the indexed walk from a page's queue.
+    async fn resume_indexed(
+        &self,
+        id: ChangesetId,
+        seeds: &[FrontierEntry],
+        limit: usize,
+        filter: &LogFilter,
+        from: &LogFrom,
+        out: &mut Vec<ChangesetInfo>,
+    ) -> Result<Option<(Vec<FrontierEntry>, bool)>> {
+        let Some(probe) = self.filter_probe(id, filter).await? else {
+            // The index no longer narrows this filter (it cannot tell the
+            // authors apart any more): the bounds only saved work, so the
+            // scan from the same queue yields the same changesets.
+            let unbounded = LogFrom {
+                seeds: Some(seeds.iter().map(|e| FrontierEntry::id(e.id)).collect()),
+                indexed: false,
+                below: from.below,
+            };
+            return self
+                .scan_then_index(id, limit, filter, usize::MAX, &unbounded, out)
+                .await;
+        };
+        let mut st = Indexed::default();
+        for e in seeds {
+            let g = self.generation(e.id).await?;
+            let bound = e.bound.map(|(g, stop, first)| Bound {
+                stop: (g, stop),
+                first,
+            });
+            queue(&mut st.seen, &mut st.heap, &mut st.bounds, g, e.id, bound);
         }
-        Ok(out)
+        self.walk_indexed(&mut st, &probe, limit, filter, from, out)
+            .await?;
+        Ok(st.rest())
     }
 
     /// Continue a walk from `heap`, skipping stretches the index rules out.
@@ -134,14 +220,14 @@ impl Repo {
     /// dropped one is forgotten, so the walk responsible can still queue it.
     async fn walk_indexed(
         &self,
-        mut seen: HashSet<ChangesetId>,
-        mut heap: BinaryHeap<(u64, ChangesetId)>,
+        st: &mut Indexed,
         probe: &Probe,
         limit: usize,
         filter: &LogFilter,
+        from: &LogFrom,
         out: &mut Vec<ChangesetInfo>,
     ) -> Result<usize> {
-        let mut bounds: HashMap<ChangesetId, Bound> = HashMap::new();
+        let Indexed { seen, heap, bounds } = st;
         let mut ahead = Ahead::default();
         let mut pops = 0;
         while out.len() < limit {
@@ -157,7 +243,7 @@ impl Repo {
                 continue;
             }
             if !ahead.has_rows(x) {
-                ahead.read_rows(self, x, &heap).await?;
+                ahead.read_rows(self, x, heap).await?;
             }
             let (row, sk) = ahead.take(x);
             // Levels nest, so the widest stretch without a match is the
@@ -167,12 +253,12 @@ impl Repo {
                 .find(|&j| !probe.may_match(&row.levels[j]))
             {
                 if let Some(e) = sk.get(j) {
-                    queue(&mut seen, &mut heap, &mut bounds, e.generation, e.id, bound);
+                    queue(seen, heap, bounds, e.generation, e.id, bound);
                 }
                 continue;
             }
             if !ahead.css.contains_key(&x) {
-                ahead.read_changesets(self, x, &heap, probe).await?;
+                ahead.read_changesets(self, x, heap, probe).await?;
             }
             let cs = match ahead.css.remove(&x) {
                 Some(cs) => cs,
@@ -199,9 +285,9 @@ impl Repo {
                         first: cs.parents[0],
                     })
                 };
-                queue(&mut seen, &mut heap, &mut bounds, g, p, b);
+                queue(seen, heap, bounds, g, p, b);
             }
-            if filter.matches(&cs) {
+            if from.admits(generation, x) && filter.matches(&cs) {
                 out.push(ChangesetInfo {
                     id: x,
                     changeset: cs,
@@ -445,6 +531,32 @@ impl Ahead {
     }
 }
 
+/// The indexed walk's queue: what it has seen, what is queued, and the
+/// bounds of queued merge sides.
+#[derive(Default)]
+struct Indexed {
+    seen: HashSet<ChangesetId>,
+    heap: BinaryHeap<(u64, ChangesetId)>,
+    bounds: HashMap<ChangesetId, Bound>,
+}
+
+impl Indexed {
+    fn rest(&self) -> Option<(Vec<FrontierEntry>, bool)> {
+        (!self.heap.is_empty()).then(|| {
+            let entries = self
+                .heap
+                .iter()
+                .map(|&(_, id)| FrontierEntry {
+                    id,
+                    name: None,
+                    bound: self.bounds.get(&id).map(|b| (b.stop.0, b.stop.1, b.first)),
+                })
+                .collect();
+            (entries, true)
+        })
+    }
+}
+
 /// A walk down one side of a merge: the merge's first parent reaches
 /// `stop` and everything below it on this chain, so the walk ends there.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -478,8 +590,8 @@ fn queue(
 
 /// Keep `step` if it matches; its root tree is filled in at the end, in one
 /// batch for all matches.
-fn push_match(out: &mut Vec<ChangesetInfo>, step: Step, filter: &LogFilter) {
-    if filter.matches(&step.cs) {
+fn push_match(out: &mut Vec<ChangesetInfo>, step: Step, filter: &LogFilter, from: &LogFrom) {
+    if from.admits(step.generation, step.id) && filter.matches(&step.cs) {
         out.push(ChangesetInfo {
             id: step.id,
             changeset: step.cs,
@@ -492,7 +604,7 @@ fn push_match(out: &mut Vec<ChangesetInfo>, step: Step, filter: &LogFilter) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
@@ -508,10 +620,10 @@ mod tests {
     pub(super) static POPS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     use crate::history::ExtraMatch;
 
-    struct Lcg(u64);
+    pub(crate) struct Lcg(pub(crate) u64);
 
     impl Lcg {
-        fn below(&mut self, n: usize) -> usize {
+        pub(crate) fn below(&mut self, n: usize) -> usize {
             self.0 = self
                 .0
                 .wrapping_mul(6364136223846793005)
@@ -520,7 +632,7 @@ mod tests {
         }
 
         /// Roughly Zipf over `0..n`: small values are common.
-        fn zipf(&mut self, n: usize) -> usize {
+        pub(crate) fn zipf(&mut self, n: usize) -> usize {
             let r = (self.below(1 << 20) + 1) as f64 / (1 << 20) as f64;
             ((n as f64).powf(r) as usize).saturating_sub(1).min(n - 1)
         }
@@ -537,7 +649,12 @@ mod tests {
     /// in, merge each other (criss-cross) and are merged into the main line,
     /// octopus merges and a few extra roots. Returns every id; the last is the
     /// main line's head.
-    async fn random_dag(r: &Repo, rng: &mut Lcg, n: usize, authors: usize) -> Vec<ChangesetId> {
+    pub(crate) async fn random_dag(
+        r: &Repo,
+        rng: &mut Lcg,
+        n: usize,
+        authors: usize,
+    ) -> Vec<ChangesetId> {
         let mut ids: Vec<ChangesetId> = Vec::new();
         let mut branches: Vec<ChangesetId> = Vec::new();
         for i in 0..n {
@@ -659,7 +776,7 @@ mod tests {
     /// back, bringing in whole cycles with their merges, before mainline
     /// merges them. Returns every id (creation order), the back-merges and
     /// the head.
-    async fn release_dag(
+    pub(crate) async fn release_dag(
         r: &Repo,
         rng: &mut Lcg,
         cycles: usize,
@@ -739,7 +856,7 @@ mod tests {
         (ids, back, head)
     }
 
-    fn filters(authors: usize) -> Vec<LogFilter> {
+    pub(crate) fn filters(authors: usize) -> Vec<LogFilter> {
         let author = |s: String| LogFilter {
             author: Some(s),
             extra: vec![],
@@ -1188,11 +1305,15 @@ mod tests {
         let mut out = Vec::new();
         let pops = r
             .walk_indexed(
-                HashSet::from([tip]),
-                BinaryHeap::from([(r.generation(tip).await.unwrap(), tip)]),
+                &mut Indexed {
+                    seen: HashSet::from([tip]),
+                    heap: BinaryHeap::from([(r.generation(tip).await.unwrap(), tip)]),
+                    bounds: HashMap::new(),
+                },
                 &probe,
                 usize::MAX,
                 &filter,
+                &LogFrom::tip(),
                 &mut out,
             )
             .await

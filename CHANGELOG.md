@@ -38,6 +38,16 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 - Path-history index and `leep last-change` (ADR 0013).
 - Server-side code search: `leep search`, `GET /v1/search` and the MCP
   `leep_search` tool (ADR 0014).
+- Cursor pagination for `GET /v1/log`, `GET /v1/search` and `GET /v1/reflog`:
+  responses carry an optional opaque `next` cursor and requests accept
+  `after=<cursor>`, so a log longer than the 10000-entry cap, a search with
+  more than 1000 matches or a long ref log can be read page by page;
+  concatenated pages equal one uncapped answer. Malformed cursors, or cursors
+  from another query, are 400. `leep log -n`, `leep search -n` and `leep
+  reflog -n` follow cursors past one page, `leep log` and `leep search` take
+  `--after`, and the MCP `leep_log` and `leep_search` tools return `next` and
+  take `cursor`. Requests without `after` are unchanged (additive fields; see
+  docs/FORMATS.md, "Page cursors").
 
 ### Everyday workflow
 - `leep branch` lists, creates and deletes branches. `branch -d` deletes
@@ -684,6 +694,12 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 - `verify` no longer reports `log-filter-v1` merge rows as damaged when they
   hold exactly what the merge brings in, as rows written before the
   side-walk budget did (ADR 0051). It notes them instead.
+- `leep-land-bench` drives several servers that share one database
+  (`--server` and `--metrics` take lists) and reports lands per server and
+  agents that made no progress. With 2 or 3 servers landing on one ref, one
+  instance wins every swap and the other instances' lands wait 20 s or more
+  (PERFORMANCE.md, "Several servers on one ref"); route a hot ref's lands to
+  one instance.
 
 ### Git compatibility (M7)
 - Live git mirror (ADR 0046): `leep-git mirror run` keeps a git remote

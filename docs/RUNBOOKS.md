@@ -452,7 +452,10 @@ nothing is half done. Retrying is safe.
 
 1. Many instances landing on one hot ref at once under heavy agent load. Confirm:
    losses on several instances, queue wait small compared with land duration
-   (`leep_land_lock_wait_seconds`).
+   (`leep_land_lock_wait_seconds`). Often one instance wins every swap and the
+   others starve: their land p99 is tens of seconds and their batches are
+   full while the winner's are small (`docs/PERFORMANCE.md`, "Several servers
+   on one ref").
 2. A raw-CAS writer or importer in a loop. Confirm: step 2.
 3. A slow metadata store, so the head moves between a land's read and its swap.
    Confirm: land and request latencies up on all routes.
