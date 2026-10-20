@@ -1021,6 +1021,53 @@ async fn upgrade_from_v4_adds_land_ids() {
     }
 }
 
+/// On Postgres the land id columns and index may be built by hand before
+/// migration 0005, the index CONCURRENTLY so ref moves are not blocked
+/// (OPERATIONS.md, "Upgrading"); the migration then finds them and succeeds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn land_id_index_built_by_hand_before_migration_5() {
+    use leep_core::{LandId, LandKey};
+    let Some(db) = Db::pg("v4hand").await else {
+        return;
+    };
+    let d = data();
+    drop(
+        db.open(&db.compiled()[..4], SchemaMode::Migrate)
+            .await
+            .unwrap(),
+    );
+    load(&db, &STAGES[1], &d).await;
+    db.exec_raw(&[
+        "ALTER TABLE ref_log ADD COLUMN IF NOT EXISTS land_id BYTEA",
+        "ALTER TABLE ref_log ADD COLUMN IF NOT EXISTS land_changeset BYTEA",
+        "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS ref_log_land_id \
+         ON ref_log (name, land_id) WHERE land_id IS NOT NULL",
+    ])
+    .await;
+    let s = db.open(db.compiled(), SchemaMode::Migrate).await.unwrap();
+    verify(&*s, &STAGES[1], &d, LATEST as u64).await;
+    assert_eq!(db.objects().await, full_schema());
+    let id = LandId::from_bytes(&[5; 16]).unwrap();
+    let head = s.get_ref("trunk").await.unwrap().unwrap();
+    let next = d.changesets[3].id();
+    let ctx = RefUpdateContext::new("land").land(Some(LandKey {
+        id: id.clone(),
+        changeset: next,
+    }));
+    assert!(s
+        .cas_ref_logged("trunk", Some(head), Some(next), &ctx)
+        .await
+        .unwrap());
+    assert_eq!(
+        s.find_lands("trunk", &[id]).await.unwrap()[0]
+            .unwrap()
+            .landed,
+        next
+    );
+    drop(s);
+    db.cleanup().await;
+}
+
 /// The multi-step path: an un-versioned database adopts v1 and then runs the
 /// steps after it; so does a database at v1; so does one one step behind.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
