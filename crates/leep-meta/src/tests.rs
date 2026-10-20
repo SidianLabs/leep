@@ -689,3 +689,100 @@ async fn postgres_estimates_large_kinds() {
     assert_eq!(s.estimate_derived("late").await.unwrap(), exact(120_000));
     assert_eq!(s.count_derived("big").await.unwrap(), 150_000);
 }
+
+/// Writes every derived row through each write path: once with `tag` in the
+/// values, so a second call with the same `tag` repeats identical rows.
+async fn write_rows_every_way(store: &dyn MetaStore, tag: &str) -> Vec<leep_core::Hash> {
+    use leep_core::{DerivedRow, Hash};
+    let keys: Vec<Hash> = (0..4u8).map(|i| Hash::of_blob(&[i])).collect();
+    let row = |i: usize| {
+        DerivedRow::new(
+            "upsert",
+            keys[i],
+            bytes::Bytes::from(format!("{tag} {i}").into_bytes()),
+        )
+    };
+    store
+        .put_derived("upsert", &keys[0], row(0).value)
+        .await
+        .unwrap();
+    store.put_derived_many(&[row(1)]).await.unwrap();
+    store
+        .put_changeset_with_derived(&cs(9001), &[row(2)])
+        .await
+        .unwrap();
+    store
+        .put_changesets_with_derived(&[cs(9002)], &[row(3)])
+        .await
+        .unwrap();
+    keys
+}
+
+/// A row written again with the same bytes is left alone, so racing or
+/// repeated derivations cost no row versions (ADR 0058); a different value
+/// still replaces it (last write wins, as `review-v1` relies on).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn postgres_identical_upserts_keep_row_versions() {
+    let Some((s, _)) = pg_store("upsert").await else {
+        return;
+    };
+    let versions = |keys: Vec<leep_core::Hash>| {
+        let pool = s.pool.clone();
+        async move {
+            let mut out = Vec::new();
+            for k in keys {
+                let v: String = sqlx::query_scalar(
+                    "SELECT xmin::text FROM derived WHERE kind = $1 AND key = $2",
+                )
+                .bind("upsert")
+                .bind(k.as_bytes().as_slice())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                out.push(v);
+            }
+            out
+        }
+    };
+    let keys = write_rows_every_way(&s, "a").await;
+    let before = versions(keys.clone()).await;
+    write_rows_every_way(&s, "a").await;
+    assert_eq!(versions(keys.clone()).await, before);
+    write_rows_every_way(&s, "b").await;
+    let after = versions(keys.clone()).await;
+    for (b, a) in before.iter().zip(&after) {
+        assert_ne!(b, a);
+    }
+    assert_eq!(
+        s.get_derived("upsert", &keys[0]).await.unwrap().unwrap(),
+        bytes::Bytes::from_static(b"b 0")
+    );
+}
+
+#[tokio::test]
+async fn sqlite_identical_upserts_do_not_update_rows() {
+    let s = SqliteMetaStore::connect("sqlite::memory:").await.unwrap();
+    for sql in [
+        "CREATE TABLE upsert_updates (n INTEGER NOT NULL)",
+        "INSERT INTO upsert_updates VALUES (0)",
+        "CREATE TRIGGER upsert_count AFTER UPDATE ON derived \
+         BEGIN UPDATE upsert_updates SET n = n + 1; END",
+    ] {
+        sqlx::query(sql).execute(&s.pool).await.unwrap();
+    }
+    let updates = || async {
+        sqlx::query_scalar::<_, i64>("SELECT n FROM upsert_updates")
+            .fetch_one(&s.pool)
+            .await
+            .unwrap()
+    };
+    let keys = write_rows_every_way(&s, "a").await;
+    write_rows_every_way(&s, "a").await;
+    assert_eq!(updates().await, 0);
+    write_rows_every_way(&s, "b").await;
+    assert_eq!(updates().await, 4);
+    assert_eq!(
+        s.get_derived("upsert", &keys[3]).await.unwrap().unwrap(),
+        bytes::Bytes::from_static(b"b 3")
+    );
+}

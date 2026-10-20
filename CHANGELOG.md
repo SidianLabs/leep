@@ -624,6 +624,9 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   bytes per changeset there. The warmer derives it; `verify` checks it,
   `repair rederive`/`drop --kind log-filter-v1` handle it. New example
   `log_filter_profile`.
+- Writing a derived row that is already stored with the same bytes no
+  longer rewrites it, so duplicate derivations (several servers warming,
+  a query and the warmer) add no dead row versions or WAL on Postgres.
 - Derivation uses several cores (ADR 0050). A missing range (the warmer's
   catch-up after an import, a first query over un-derived history, `repair
   rederive`) used to derive one changeset after another on one core: about

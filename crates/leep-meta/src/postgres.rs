@@ -984,10 +984,14 @@ impl MetaStore for PostgresMetaStore {
         }
     }
 
+    /// Every derived upsert here skips a row whose stored value is already
+    /// the same bytes: derivation is deterministic, so a repeated or racing
+    /// write would otherwise only add a dead row version and WAL (ADR 0058).
     async fn put_derived(&self, kind: &str, key: &Hash, value: Bytes) -> Result<()> {
         sqlx::query(
             "INSERT INTO derived (kind, key, value) VALUES ($1, $2, $3) \
-             ON CONFLICT (kind, key) DO UPDATE SET value = excluded.value",
+             ON CONFLICT (kind, key) DO UPDATE SET value = excluded.value \
+             WHERE derived.value IS DISTINCT FROM excluded.value",
         )
         .bind(kind)
         .bind(key.as_bytes().as_slice())
@@ -1010,7 +1014,8 @@ impl MetaStore for PostgresMetaStore {
         sqlx::query(
             "INSERT INTO derived (kind, key, value) \
              SELECT * FROM UNNEST($1::text[], $2::bytea[], $3::bytea[]) ORDER BY 1, 2 \
-             ON CONFLICT (kind, key) DO UPDATE SET value = excluded.value",
+             ON CONFLICT (kind, key) DO UPDATE SET value = excluded.value \
+             WHERE derived.value IS DISTINCT FROM excluded.value",
         )
         .bind(kinds)
         .bind(keys)
@@ -1038,7 +1043,8 @@ impl MetaStore for PostgresMetaStore {
             "WITH c AS (INSERT INTO changesets (id, data) VALUES ($1, $2) ON CONFLICT DO NOTHING) \
              INSERT INTO derived (kind, key, value) \
              SELECT * FROM UNNEST($3::text[], $4::bytea[], $5::bytea[]) ORDER BY 1, 2 \
-             ON CONFLICT (kind, key) DO UPDATE SET value = excluded.value",
+             ON CONFLICT (kind, key) DO UPDATE SET value = excluded.value \
+             WHERE derived.value IS DISTINCT FROM excluded.value",
         )
         .bind(id.0.as_bytes().as_slice())
         .bind(data)
@@ -1076,7 +1082,8 @@ impl MetaStore for PostgresMetaStore {
              SELECT * FROM UNNEST($1::bytea[], $2::bytea[]) ORDER BY 1 ON CONFLICT DO NOTHING) \
              INSERT INTO derived (kind, key, value) \
              SELECT * FROM UNNEST($3::text[], $4::bytea[], $5::bytea[]) ORDER BY 1, 2 \
-             ON CONFLICT (kind, key) DO UPDATE SET value = excluded.value",
+             ON CONFLICT (kind, key) DO UPDATE SET value = excluded.value \
+             WHERE derived.value IS DISTINCT FROM excluded.value",
         )
         .bind(ids)
         .bind(data)

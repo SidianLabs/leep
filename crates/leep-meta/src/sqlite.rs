@@ -835,7 +835,8 @@ impl MetaStore for SqliteMetaStore {
     async fn put_derived(&self, kind: &str, key: &Hash, value: Bytes) -> Result<()> {
         sqlx::query(
             "INSERT INTO derived (kind, key, value) VALUES (?, ?, ?) \
-             ON CONFLICT (kind, key) DO UPDATE SET value = excluded.value",
+             ON CONFLICT (kind, key) DO UPDATE SET value = excluded.value \
+             WHERE derived.value IS NOT excluded.value",
         )
         .bind(kind)
         .bind(key.as_bytes().as_slice())
@@ -918,7 +919,8 @@ async fn put_rows(conn: &mut SqliteConnection, rows: &[DerivedRow]) -> Result<()
     for r in rows {
         sqlx::query(
             "INSERT INTO derived (kind, key, value) VALUES (?, ?, ?) \
-             ON CONFLICT (kind, key) DO UPDATE SET value = excluded.value",
+             ON CONFLICT (kind, key) DO UPDATE SET value = excluded.value \
+             WHERE derived.value IS NOT excluded.value",
         )
         .bind(&r.kind)
         .bind(r.key.as_bytes().as_slice())
