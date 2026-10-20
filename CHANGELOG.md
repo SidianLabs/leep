@@ -681,6 +681,9 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   of `count(*)`, which took about 32 s a kind on all of Linux. Counts are
   exact where a decision rests on them, and `--exact-counts` counts
   everything. New `MetaStore::estimate_derived`.
+- `verify` no longer reports `log-filter-v1` merge rows as damaged when they
+  hold exactly what the merge brings in, as rows written before the
+  side-walk budget did (ADR 0051). It notes them instead.
 
 ### Git compatibility (M7)
 - Live git mirror (ADR 0046): `leep-git mirror run` keeps a git remote

@@ -497,6 +497,17 @@ impl Repo {
         self
     }
 
+    /// A handle on the same stores whose `log-filter-v1` merge walks never
+    /// give up (ADR 0051), with caches of its own; for `verify`.
+    pub(crate) fn with_unbounded_side_walks(&self) -> Self {
+        let caches = crate::derived::LogFilterCaches::default();
+        caches.set_side_budget(usize::MAX);
+        Repo {
+            log_filter: Arc::new(caches),
+            ..self.clone()
+        }
+    }
+
     /// Values `derived::derive` computed through this handle and its clones.
     pub(crate) fn derived_count(&self) -> u64 {
         self.derive_calls.load(std::sync::atomic::Ordering::Relaxed) as u64

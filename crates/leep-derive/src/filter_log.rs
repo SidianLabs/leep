@@ -868,6 +868,58 @@ mod tests {
         }
     }
 
+    /// ADR 0051: a merge row of exactly what the merge brings in, as code
+    /// before the side-walk budget wrote, is valid; `verify` recomputing
+    /// with a budget those merges exceed reports it as such, not as damage,
+    /// and still reports a damaged merge row.
+    #[tokio::test]
+    async fn verify_accepts_merge_rows_written_without_the_budget() {
+        use crate::derived::LogFilterIndex;
+        use crate::integrity::{verify, Quiet, VerifyOptions};
+        let mut rng = Lcg(5);
+        let r = repo();
+        let (_, back, head) = release_dag(&r, &mut rng, 4, 8, 12).await;
+        assert!(r.meta().cas_ref("main", None, Some(head)).await.unwrap());
+        derive::<LogFilterIndex>(&r, head).await.unwrap();
+        let opts = VerifyOptions {
+            full: true,
+            derived: vec![LogFilterIndex::NAME],
+            ..VerifyOptions::default()
+        };
+        let clean = verify(&r, &opts, &Quiet).await.unwrap();
+        assert!(clean.ok() && clean.notes.is_empty(), "{clean:#?}");
+
+        r.log_filter.set_side_budget(2);
+        let report = verify(&r, &opts, &Quiet).await.unwrap();
+        assert!(report.ok(), "{:#?}", report.problems);
+        assert!(
+            report.notes.iter().any(|n| n.contains("ADR 0051")),
+            "no merge exceeded the budget: {:#?}",
+            report.notes
+        );
+
+        // A merge row swapped for another merge's is damage either way.
+        let (a, b) = (back[0], back[back.len() - 1]);
+        assert_ne!(a, b);
+        let other = r
+            .meta()
+            .get_derived(LogFilterIndex::NAME, &b.0)
+            .await
+            .unwrap()
+            .unwrap();
+        r.meta()
+            .put_derived(LogFilterIndex::NAME, &a.0, other)
+            .await
+            .unwrap();
+        let damaged = verify(&r, &opts, &Quiet).await.unwrap();
+        let bad: Vec<_> = damaged
+            .problems
+            .iter()
+            .filter(|p| p.code == "derived_mismatch")
+            .collect();
+        assert!(!bad.is_empty(), "{:#?}", damaged.problems);
+    }
+
     /// Every merge's row against sets of ancestors: level 0 holds exactly the
     /// values of what its other parents bring in, and each stop is the first
     /// changeset on that parent's first-parent chain the first parent

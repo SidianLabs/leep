@@ -78,7 +78,10 @@ above it, a row this code writes differs from the one ADR 0047 would have
 written for the same merge, and both are valid. The budget is part of the
 format in the sense that rows depend on it: changing it changes the rows of
 the merges between the two values (`verify` reports them; queries are
-unaffected).
+unaffected). *Amended:* `verify` walks a merge whose stored row differs
+again without the budget, and accepts the row when it equals that exact
+set, as ADR 0047's code wrote it, adding a note to the report rather than a
+problem. Rows written with a different budget value are still reported.
 
 ## Consequences
 - On the synthetic release history in Postgres, 2 jobs: back-merges take
@@ -91,7 +94,7 @@ unaffected).
   matters little since read-ahead fetches them in batches.
 - Stores built by ADR 0047's code stay valid and can resume with `repair
   rederive --kind log-filter-v1 --missing`; only merges past the budget
-  would be stored differently by a full rederive, and `verify` would report
-  those.
+  would be stored differently by a full rederive. `verify` accepts their
+  exact rows (see the amendment above).
 - `log-filter-v1` derivation no longer asks for `merge_base` or
   `last_merge-v1`.

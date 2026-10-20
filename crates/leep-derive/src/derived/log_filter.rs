@@ -380,7 +380,7 @@ pub(crate) struct LogFilterCaches {
     /// merge.
     fps: SizedCache<Vec<u64>, FPS_CACHE_BYTES>,
     written: Mutex<HashSet<u64>>,
-    /// [`SIDE_BUDGET`] unless a test lowers it (0: the default).
+    /// [`SIDE_BUDGET`] unless set otherwise (0: the default).
     side_budget: AtomicUsize,
 }
 
@@ -402,9 +402,16 @@ impl LogFilterCaches {
         }
     }
 
-    /// Give up on merge sides past `n` changesets, to test what happens.
-    #[cfg(test)]
+    /// Give up on merge sides past `n` changesets: tests lower it, and
+    /// `verify` lifts it to tell rows written without it from damage.
     pub(crate) fn set_side_budget(&self, n: usize) {
+        self.side_budget.store(n, Ordering::Relaxed);
+    }
+
+    /// Use `other`'s side budget: verification recomputes rows as the
+    /// repository it checks would.
+    pub(crate) fn copy_side_budget(&self, other: &LogFilterCaches) {
+        let n = other.side_budget.load(Ordering::Relaxed);
         self.side_budget.store(n, Ordering::Relaxed);
     }
 }
