@@ -1,6 +1,6 @@
 //! In-memory stores for tests and single-process use.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ops::Bound;
 use std::sync::Mutex;
 
@@ -9,8 +9,8 @@ use bytes::Bytes;
 
 use crate::prefix::IdPrefix;
 use crate::store::{
-    check_ref_chain, unix_now, BlobMeta, DeleteStep, DerivedRow, RefLogEntry, RefStep,
-    RefUpdateContext,
+    check_land_key, check_ref_chain, land_id_taken, unix_now, BlobMeta, DeleteStep, DerivedRow,
+    LandId, LandRecord, RefLogEntry, RefStep, RefUpdateContext,
 };
 use crate::{BlobStore, Changeset, ChangesetId, Hash, MetaStore, Result};
 
@@ -110,6 +110,56 @@ struct Refs {
     heads: BTreeMap<String, ChangesetId>,
     /// Ascending by `seq`.
     log: Vec<RefLogEntry>,
+    /// The land keys of log entries, as the databases keep them in the row.
+    lands: HashMap<(String, LandId), LandRecord>,
+}
+
+impl Refs {
+    /// Append the entry for one move, with its land key.
+    fn log(
+        &mut self,
+        name: &str,
+        old: Option<ChangesetId>,
+        new: Option<ChangesetId>,
+        ctx: &RefUpdateContext,
+    ) {
+        let seq = self.log.last().map_or(0, |e| e.seq) + 1;
+        self.log.push(RefLogEntry {
+            seq,
+            name: name.to_string(),
+            old,
+            new,
+            time: unix_now(),
+            actor: ctx.actor.clone(),
+            operation: ctx.operation.clone(),
+            message: ctx.message.clone(),
+        });
+        if let (Some(land), Some(landed)) = (&ctx.land, new) {
+            self.lands.insert(
+                (name.to_string(), land.id.clone()),
+                LandRecord {
+                    changeset: land.changeset,
+                    landed,
+                    seq,
+                },
+            );
+        }
+    }
+
+    fn land_taken<'a>(
+        &self,
+        name: &str,
+        mut ctxs: impl Iterator<Item = &'a RefUpdateContext>,
+    ) -> Result<()> {
+        match ctxs.find_map(|c| {
+            c.land
+                .as_ref()
+                .filter(|l| self.lands.contains_key(&(name.to_string(), l.id.clone())))
+        }) {
+            Some(l) => Err(land_id_taken(name, &l.id)),
+            None => Ok(()),
+        }
+    }
 }
 
 impl MemoryMetaStore {
@@ -135,6 +185,7 @@ impl MemoryMetaStore {
         let mut refs = self.refs.lock().unwrap();
         let before = refs.log.len();
         refs.log.retain(|e| e.seq != seq);
+        refs.lands.retain(|_, r| r.seq != seq);
         refs.log.len() != before
     }
 
@@ -209,6 +260,7 @@ impl MetaStore for MemoryMetaStore {
         new: Option<ChangesetId>,
         ctx: &RefUpdateContext,
     ) -> Result<bool> {
+        check_land_key(new, ctx)?;
         let mut refs = self.refs.lock().unwrap();
         if refs.heads.get(name).copied() != expected {
             return Ok(false);
@@ -216,21 +268,12 @@ impl MetaStore for MemoryMetaStore {
         if expected == new {
             return Ok(true);
         }
+        refs.land_taken(name, std::iter::once(ctx))?;
         match new {
             Some(id) => refs.heads.insert(name.to_string(), id),
             None => refs.heads.remove(name),
         };
-        let seq = refs.log.last().map_or(0, |e| e.seq) + 1;
-        refs.log.push(RefLogEntry {
-            seq,
-            name: name.to_string(),
-            old: expected,
-            new,
-            time: unix_now(),
-            actor: ctx.actor.clone(),
-            operation: ctx.operation.clone(),
-            message: ctx.message.clone(),
-        });
+        refs.log(name, expected, new, ctx);
         Ok(true)
     }
 
@@ -245,19 +288,10 @@ impl MetaStore for MemoryMetaStore {
         if refs.heads.get(name).copied() != expected {
             return Ok(0);
         }
+        refs.land_taken(name, steps.iter().map(|s| &s.ctx))?;
         let mut old = expected;
         for step in steps {
-            let seq = refs.log.last().map_or(0, |e| e.seq) + 1;
-            refs.log.push(RefLogEntry {
-                seq,
-                name: name.to_string(),
-                old,
-                new: step.new,
-                time: unix_now(),
-                actor: step.ctx.actor.clone(),
-                operation: step.ctx.operation.clone(),
-                message: step.ctx.message.clone(),
-            });
+            refs.log(name, old, step.new, &step.ctx);
             old = step.new;
         }
         match old {
@@ -265,6 +299,14 @@ impl MetaStore for MemoryMetaStore {
             None => refs.heads.remove(name),
         };
         Ok(steps.len())
+    }
+
+    async fn find_lands(&self, name: &str, ids: &[LandId]) -> Result<Vec<Option<LandRecord>>> {
+        let refs = self.refs.lock().unwrap();
+        Ok(ids
+            .iter()
+            .map(|id| refs.lands.get(&(name.to_string(), id.clone())).copied())
+            .collect())
     }
 
     async fn ref_log(
@@ -466,6 +508,7 @@ pub async fn check_meta_store_contract(store: &dyn MetaStore) {
     check_prefix_lookup(store).await;
     check_ref_log(store).await;
     check_ref_chain_log(store).await;
+    check_land_ids(store).await;
 
     let key = Hash::of_blob(b"k");
     assert!(store.get_derived("kind", &key).await.unwrap().is_none());
@@ -986,6 +1029,178 @@ async fn check_ref_log(store: &dyn MetaStore) {
         .is_empty());
 }
 
+/// Land keys are stored with their move, atomically, found by id per ref,
+/// and never recorded twice for one ref (ADR 0057).
+async fn check_land_ids(store: &dyn MetaStore) {
+    use crate::store::LandKey;
+    use crate::Error;
+
+    let mut ids = Vec::new();
+    for n in 0..4 {
+        let cs = Changeset {
+            parents: vec![],
+            author: "t".into(),
+            timestamp: 4000 + n,
+            message: format!("land ids {n}"),
+            changes: BTreeMap::new(),
+            extra: BTreeMap::new(),
+        };
+        ids.push(store.put_changeset(&cs).await.unwrap());
+    }
+    let (a, b, c, d) = (ids[0], ids[1], ids[2], ids[3]);
+    let lid = |n: u8| LandId::from_bytes(&[n; 16]).unwrap();
+    let ctx = |n: u8, cs: ChangesetId| {
+        RefUpdateContext::new("land").land(Some(LandKey {
+            id: lid(n),
+            changeset: cs,
+        }))
+    };
+    let find = |name: &'static str, ns: Vec<u8>| async move {
+        let want: Vec<LandId> = ns.iter().map(|n| lid(*n)).collect();
+        store.find_lands(name, &want).await.unwrap()
+    };
+    assert!(store.find_lands("li/x", &[]).await.unwrap().is_empty());
+    assert_eq!(find("li/x", vec![1]).await, [None]);
+
+    assert!(store
+        .cas_ref_logged("li/x", None, Some(a), &ctx(1, a))
+        .await
+        .unwrap());
+    let seq = store.ref_log(Some("li/x"), None, 1).await.unwrap()[0].seq;
+    assert_eq!(
+        find("li/x", vec![1, 2]).await,
+        [
+            Some(LandRecord {
+                changeset: a,
+                landed: a,
+                seq
+            }),
+            None
+        ]
+    );
+
+    // A chain records each step's key with that step's entry; a rebased land
+    // records what was asked for and where it went.
+    let chain = [
+        RefStep {
+            new: Some(b),
+            ctx: ctx(2, c),
+        },
+        RefStep {
+            new: Some(c),
+            ctx: RefUpdateContext::new("land"),
+        },
+        RefStep {
+            new: Some(d),
+            ctx: ctx(3, d),
+        },
+    ];
+    assert_eq!(
+        store
+            .cas_ref_logged_chain("li/x", Some(a), &chain)
+            .await
+            .unwrap(),
+        3
+    );
+    let log = store.ref_log(Some("li/x"), None, 10).await.unwrap();
+    let seq_of = |new| log.iter().find(|e| e.new == Some(new)).unwrap().seq;
+    let found = find("li/x", vec![3, 2, 1, 4]).await;
+    assert_eq!(
+        found,
+        [
+            Some(LandRecord {
+                changeset: d,
+                landed: d,
+                seq: seq_of(d)
+            }),
+            Some(LandRecord {
+                changeset: c,
+                landed: b,
+                seq: seq_of(b)
+            }),
+            Some(LandRecord {
+                changeset: a,
+                landed: a,
+                seq
+            }),
+            None
+        ]
+    );
+
+    // Ids are per ref.
+    assert_eq!(find("li/y", vec![1]).await, [None]);
+    assert!(store
+        .cas_ref_logged("li/y", None, Some(b), &ctx(1, b))
+        .await
+        .unwrap());
+    assert_eq!(find("li/y", vec![1]).await[0].unwrap().landed, b);
+    assert_eq!(find("li/x", vec![1]).await[0].unwrap().landed, a);
+
+    // A recorded id is never recorded again: a swap that would happen fails
+    // with Conflict and changes nothing; a lost swap is just lost.
+    let entries = store.ref_log(Some("li/x"), None, 100).await.unwrap().len();
+    assert!(matches!(
+        store
+            .cas_ref_logged("li/x", Some(d), Some(a), &ctx(2, a))
+            .await,
+        Err(Error::Conflict(_))
+    ));
+    assert!(!store
+        .cas_ref_logged("li/x", Some(a), Some(b), &ctx(2, b))
+        .await
+        .unwrap());
+    let taken = [
+        RefStep {
+            new: Some(a),
+            ctx: ctx(9, a),
+        },
+        RefStep {
+            new: Some(b),
+            ctx: ctx(3, b),
+        },
+    ];
+    assert!(matches!(
+        store.cas_ref_logged_chain("li/x", Some(d), &taken).await,
+        Err(Error::Conflict(_))
+    ));
+    assert_eq!(store.get_ref("li/x").await.unwrap(), Some(d));
+    assert_eq!(
+        store.ref_log(Some("li/x"), None, 100).await.unwrap().len(),
+        entries
+    );
+    assert_eq!(find("li/x", vec![9]).await, [None], "nothing of it applied");
+
+    // One id twice in a chain, or on a delete, is refused.
+    let twice = [
+        RefStep {
+            new: Some(a),
+            ctx: ctx(7, a),
+        },
+        RefStep {
+            new: Some(b),
+            ctx: ctx(7, b),
+        },
+    ];
+    assert!(matches!(
+        store.cas_ref_logged_chain("li/x", Some(d), &twice).await,
+        Err(Error::Invalid(_))
+    ));
+    assert!(matches!(
+        store
+            .cas_ref_logged("li/x", Some(d), None, &ctx(8, d))
+            .await,
+        Err(Error::Invalid(_))
+    ));
+    assert_eq!(store.get_ref("li/x").await.unwrap(), Some(d));
+    assert_eq!(find("li/x", vec![7, 8]).await, [None, None]);
+
+    // Moves without a key record none, and the record outlives later moves
+    // and even the ref.
+    assert!(store.cas_ref("li/x", Some(d), None).await.unwrap());
+    assert!(store.cas_ref("li/x", None, Some(c)).await.unwrap());
+    assert_eq!(find("li/x", vec![1]).await[0].unwrap().landed, a);
+}
+
 /// A chained swap logs one entry per step, oldest first and replaying to the
 /// head, or nothing when the ref is not where the caller expects.
 async fn check_ref_chain_log(store: &dyn MetaStore) {
@@ -1405,6 +1620,14 @@ mod tests {
         ) -> Result<bool> {
             self.0.cas_ref_logged(name, expected, new, ctx).await
         }
+        async fn find_lands(
+            &self,
+            name: &str,
+            ids: &[crate::LandId],
+        ) -> Result<Vec<Option<crate::LandRecord>>> {
+            self.0.find_lands(name, ids).await
+        }
+
         async fn ref_log(
             &self,
             name: Option<&str>,

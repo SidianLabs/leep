@@ -5,8 +5,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use leep_core::prefix::IdPrefix;
 use leep_core::{
-    Changeset, ChangesetId, DeleteStep, Hash, MetaStore, RefLogEntry, RefStep, RefUpdateContext,
-    Result,
+    Changeset, ChangesetId, DeleteStep, Hash, LandId, LandRecord, MetaStore, RefLogEntry, RefStep,
+    RefUpdateContext, Result,
 };
 
 use crate::plan::{FaultPlan, Op};
@@ -107,6 +107,12 @@ impl MetaStore for FaultyMetaStore {
                 self.inner.cas_ref_logged_chain(name, expected, steps),
                 |_, v| v,
             )
+            .await
+    }
+
+    async fn find_lands(&self, name: &str, ids: &[LandId]) -> Result<Vec<Option<LandRecord>>> {
+        self.plan
+            .run(Op::FindLands, self.inner.find_lands(name, ids), |_, v| v)
             .await
     }
 

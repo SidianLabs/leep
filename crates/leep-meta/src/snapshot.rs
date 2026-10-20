@@ -17,8 +17,8 @@ use leep_core::{ChangesetId, Error, Result};
 use sqlx::{PgPool, Postgres, QueryBuilder, Row, Sqlite, SqlitePool, Transaction};
 
 use crate::{
-    migrate, storage, to_id, LogRow, PostgresMetaStore, SchemaMode, SqliteMetaStore,
-    POSTGRES_MIGRATIONS, SQLITE_MIGRATIONS,
+    migrate, storage, to_id, PostgresMetaStore, SchemaMode, SqliteMetaStore, POSTGRES_MIGRATIONS,
+    SQLITE_MIGRATIONS,
 };
 
 /// Rows read or written per statement. Changeset rows can be large, so the
@@ -90,6 +90,19 @@ type DerivedRow = (String, Vec<u8>, Vec<u8>);
 type DictRow = (i64, i64, Vec<u8>);
 /// `store_features`: name, added_at.
 type FeatureRow = (String, i64);
+/// A `ref_log` row with every column, land ids included (ADR 0057).
+type SnapLogRow = (
+    i64,
+    String,
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+    i64,
+    Option<String>,
+    String,
+    Option<String>,
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+);
 
 /// Rows of one read transaction on the source.
 #[async_trait]
@@ -101,7 +114,7 @@ trait Source: Send {
     async fn refs(&mut self) -> Result<Vec<(String, Vec<u8>)>>;
     async fn derived(&mut self, after: &(String, Vec<u8>), limit: usize)
         -> Result<Vec<DerivedRow>>;
-    async fn ref_log(&mut self, after_seq: i64, limit: usize) -> Result<Vec<LogRow>>;
+    async fn ref_log(&mut self, after_seq: i64, limit: usize) -> Result<Vec<SnapLogRow>>;
     async fn ref_log_last_seq(&mut self) -> Result<i64>;
 }
 
@@ -115,7 +128,7 @@ trait Sink: Send {
     async fn put_store_features(&mut self, rows: &[FeatureRow]) -> Result<()>;
     async fn put_refs(&mut self, rows: &[(String, Vec<u8>)]) -> Result<()>;
     async fn put_derived(&mut self, rows: &[DerivedRow]) -> Result<()>;
-    async fn put_ref_log(&mut self, rows: &[LogRow]) -> Result<()>;
+    async fn put_ref_log(&mut self, rows: &[SnapLogRow]) -> Result<()>;
     async fn set_ref_log_last_seq(&mut self, seq: i64) -> Result<()>;
     async fn commit(self: Box<Self>) -> Result<()>;
 }
@@ -493,10 +506,10 @@ impl Source for SqliteSource {
             .collect())
     }
 
-    async fn ref_log(&mut self, after_seq: i64, limit: usize) -> Result<Vec<LogRow>> {
+    async fn ref_log(&mut self, after_seq: i64, limit: usize) -> Result<Vec<SnapLogRow>> {
         sqlx::query_as(
-            "SELECT seq, name, old_target, new_target, time, actor, operation, message \
-             FROM ref_log WHERE seq > ? ORDER BY seq LIMIT ?",
+            "SELECT seq, name, old_target, new_target, time, actor, operation, message, \
+             land_id, land_changeset FROM ref_log WHERE seq > ? ORDER BY seq LIMIT ?",
         )
         .bind(after_seq)
         .bind(limit as i64)
@@ -615,9 +628,10 @@ impl Sink for SqliteSink {
         Ok(())
     }
 
-    async fn put_ref_log(&mut self, rows: &[LogRow]) -> Result<()> {
+    async fn put_ref_log(&mut self, rows: &[SnapLogRow]) -> Result<()> {
         let mut q = QueryBuilder::<Sqlite>::new(
-            "INSERT INTO ref_log (seq, name, old_target, new_target, time, actor, operation, message) ",
+            "INSERT INTO ref_log (seq, name, old_target, new_target, time, actor, operation, message, \
+             land_id, land_changeset) ",
         );
         q.push_values(rows, |mut b, r| {
             b.push_bind(r.0)
@@ -627,7 +641,9 @@ impl Sink for SqliteSink {
                 .push_bind(r.4)
                 .push_bind(&r.5)
                 .push_bind(&r.6)
-                .push_bind(&r.7);
+                .push_bind(&r.7)
+                .push_bind(&r.8)
+                .push_bind(&r.9);
         });
         q.build().execute(&mut *self.0).await.map_err(storage)?;
         Ok(())
@@ -737,10 +753,10 @@ impl Source for PgSource {
             .collect())
     }
 
-    async fn ref_log(&mut self, after_seq: i64, limit: usize) -> Result<Vec<LogRow>> {
+    async fn ref_log(&mut self, after_seq: i64, limit: usize) -> Result<Vec<SnapLogRow>> {
         sqlx::query_as(
-            "SELECT seq, name, old_target, new_target, time, actor, operation, message \
-             FROM ref_log WHERE seq > $1 ORDER BY seq LIMIT $2",
+            "SELECT seq, name, old_target, new_target, time, actor, operation, message, \
+             land_id, land_changeset FROM ref_log WHERE seq > $1 ORDER BY seq LIMIT $2",
         )
         .bind(after_seq)
         .bind(limit as i64)
@@ -872,9 +888,10 @@ impl Sink for PgSink {
         Ok(())
     }
 
-    async fn put_ref_log(&mut self, rows: &[LogRow]) -> Result<()> {
+    async fn put_ref_log(&mut self, rows: &[SnapLogRow]) -> Result<()> {
         let mut q = QueryBuilder::<Postgres>::new(
-            "INSERT INTO ref_log (seq, name, old_target, new_target, time, actor, operation, message) ",
+            "INSERT INTO ref_log (seq, name, old_target, new_target, time, actor, operation, message, \
+             land_id, land_changeset) ",
         );
         q.push_values(rows, |mut b, r| {
             b.push_bind(r.0)
@@ -884,7 +901,9 @@ impl Sink for PgSink {
                 .push_bind(r.4)
                 .push_bind(&r.5)
                 .push_bind(&r.6)
-                .push_bind(&r.7);
+                .push_bind(&r.7)
+                .push_bind(&r.8)
+                .push_bind(&r.9);
         });
         q.build().execute(&mut *self.0).await.map_err(storage)?;
         Ok(())
