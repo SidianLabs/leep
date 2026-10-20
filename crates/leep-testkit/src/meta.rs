@@ -5,8 +5,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use leep_core::prefix::IdPrefix;
 use leep_core::{
-    Changeset, ChangesetId, DeleteStep, Hash, LandId, LandRecord, MetaStore, RefLogEntry, RefStep,
-    RefUpdateContext, Result,
+    Changeset, ChangesetId, DeleteStep, Hash, LandId, LandLease, LandRecord, LeaseClaim,
+    LeaseTiming, MetaStore, RefLogEntry, RefStep, RefUpdateContext, Result,
 };
 
 use crate::plan::{FaultPlan, Op};
@@ -89,6 +89,55 @@ impl MetaStore for FaultyMetaStore {
             .run(
                 Op::CasRef,
                 self.inner.cas_ref_logged(name, expected, new, ctx),
+                |_, v| v,
+            )
+            .await
+    }
+
+    fn supports_land_leases(&self) -> bool {
+        self.inner.supports_land_leases()
+    }
+
+    async fn land_lease(&self, ref_name: &str, timing: LeaseTiming) -> Result<Option<LandLease>> {
+        self.plan
+            .run(Op::Lease, self.inner.land_lease(ref_name, timing), |_, v| v)
+            .await
+    }
+
+    async fn acquire_land_lease(
+        &self,
+        claim: &LeaseClaim<'_>,
+        timing: LeaseTiming,
+    ) -> Result<LandLease> {
+        self.plan
+            .run(
+                Op::Lease,
+                self.inner.acquire_land_lease(claim, timing),
+                |_, v| v,
+            )
+            .await
+    }
+
+    async fn renew_land_leases(
+        &self,
+        holder: &str,
+        held: &[(String, u64)],
+        timing: LeaseTiming,
+    ) -> Result<Vec<Option<std::time::Duration>>> {
+        self.plan
+            .run(
+                Op::Lease,
+                self.inner.renew_land_leases(holder, held, timing),
+                |_, v| v,
+            )
+            .await
+    }
+
+    async fn release_land_lease(&self, ref_name: &str, holder: &str, epoch: u64) -> Result<bool> {
+        self.plan
+            .run(
+                Op::Lease,
+                self.inner.release_land_lease(ref_name, holder, epoch),
                 |_, v| v,
             )
             .await

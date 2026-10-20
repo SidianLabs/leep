@@ -100,6 +100,65 @@ pub struct LandRecord {
     pub seq: u64,
 }
 
+/// Timing of land lease calls (ADR 0056), measured by the store's clock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LeaseTiming {
+    /// How long a lease stays live after it is taken or renewed.
+    pub ttl: std::time::Duration,
+    /// Another server may take a lease whose last renewal is older than
+    /// this, even before `ttl` runs out: twice the holder's renew interval.
+    pub stale_after: std::time::Duration,
+}
+
+/// Which server coordinates the lands of one ref (ADR 0056). Leases decide
+/// only where lands are batched; refs still move only by compare-and-swap,
+/// so two servers that both believe they lead are slow, never wrong.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LandLease {
+    pub ref_name: String,
+    /// Random per server process start.
+    pub holder: String,
+    /// Where the holder takes forwarded lands (its `--advertise-url`).
+    pub address: String,
+    /// Forwarding protocol the holder speaks.
+    pub protocol: u32,
+    /// Counts holders: changes whenever another holder takes the lease.
+    pub epoch: u64,
+    /// Time until another server may take it, by the store's clock at the
+    /// call. Zero means it may be taken now.
+    pub remaining: std::time::Duration,
+}
+
+impl LandLease {
+    /// Whether another server must leave it alone.
+    pub fn is_live(&self) -> bool {
+        !self.remaining.is_zero()
+    }
+}
+
+/// A server asking for the lease of a ref.
+#[derive(Clone, Copy, Debug)]
+pub struct LeaseClaim<'a> {
+    pub ref_name: &'a str,
+    pub holder: &'a str,
+    pub address: &'a str,
+    pub protocol: u32,
+}
+
+fn no_land_leases() -> Error {
+    Error::Invalid("this metadata store does not support land leases".into())
+}
+
+/// When a lease row may be taken by another holder, and how long is left
+/// until then, from its two timestamps (store clock, milliseconds).
+pub fn lease_remaining_ms(now: i64, renewed_at: i64, expires_at: i64, timing: LeaseTiming) -> i64 {
+    let stale = i64::try_from(timing.stale_after.as_millis()).unwrap_or(i64::MAX);
+    expires_at
+        .min(renewed_at.saturating_add(stale))
+        .saturating_sub(now)
+        .max(0)
+}
+
 /// Who moved a ref and why, recorded in the ref log with the move itself.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RefUpdateContext {
@@ -609,6 +668,53 @@ pub trait MetaStore: Send + Sync + 'static {
             self.put_changeset(cs).await?;
         }
         self.put_derived_many(rows).await
+    }
+
+    /// Whether the land lease methods below work. Without them every land
+    /// is batched by the server that received it, as before ADR 0056.
+    fn supports_land_leases(&self) -> bool {
+        false
+    }
+
+    /// The lease row of `ref_name`, live or not.
+    async fn land_lease(&self, ref_name: &str, timing: LeaseTiming) -> Result<Option<LandLease>> {
+        let _ = (ref_name, timing);
+        Err(no_land_leases())
+    }
+
+    /// Take or keep the lease of `claim.ref_name` for `claim.holder`, in one
+    /// atomic step: it succeeds when there is none, when it is the holder's
+    /// own, or when its expiry has passed or its last renewal is older than
+    /// `timing.stale_after`; a live lease of another holder is never taken.
+    /// The epoch grows by one whenever the holder changes, and never falls.
+    /// Returns the lease as it is afterwards: the claimant's when it got it.
+    async fn acquire_land_lease(
+        &self,
+        claim: &LeaseClaim<'_>,
+        timing: LeaseTiming,
+    ) -> Result<LandLease> {
+        let _ = (claim, timing);
+        Err(no_land_leases())
+    }
+
+    /// Renew every `(ref, epoch)` lease `holder` still holds, in one atomic
+    /// step. One slot per lease, in order: the time left after the renewal,
+    /// or `None` when the lease is no longer `holder`'s at that epoch.
+    async fn renew_land_leases(
+        &self,
+        holder: &str,
+        held: &[(String, u64)],
+        timing: LeaseTiming,
+    ) -> Result<Vec<Option<std::time::Duration>>> {
+        let _ = (holder, held, timing);
+        Err(no_land_leases())
+    }
+
+    /// Give the lease up so another server can take it at once, if it is
+    /// still `holder`'s at `epoch`. The row stays, so epochs never repeat.
+    async fn release_land_lease(&self, ref_name: &str, holder: &str, epoch: u64) -> Result<bool> {
+        let _ = (ref_name, holder, epoch);
+        Err(no_land_leases())
     }
 
     /// Version of the newest schema migration applied (ADR 0023), for

@@ -322,7 +322,8 @@ async fn schema_version_rules_follow_adr_0023() {
         "older.db",
         "DROP TABLE schema_migrations; DROP TABLE changeset_dicts; DROP TABLE store_features; \
          DROP INDEX ref_log_land_id; ALTER TABLE ref_log DROP COLUMN land_changeset; \
-         ALTER TABLE ref_log DROP COLUMN land_id",
+         ALTER TABLE ref_log DROP COLUMN land_id; \
+         DROP TABLE land_leases",
     )
     .await;
     let dest_url = sqlite_url(dir.path(), "d2.db");
@@ -343,7 +344,7 @@ async fn schema_version_rules_follow_adr_0023() {
     // SQLite) and 3: migrated on the scratch copy, then restored.
     let v1 = edit(
         "v1.db",
-        "DROP TABLE changeset_dicts; DROP TABLE store_features; DROP INDEX ref_log_land_id; ALTER TABLE ref_log DROP COLUMN land_changeset; \
+        "DROP TABLE changeset_dicts; DROP TABLE store_features; DROP TABLE land_leases; DROP INDEX ref_log_land_id; ALTER TABLE ref_log DROP COLUMN land_changeset; \
          ALTER TABLE ref_log DROP COLUMN land_id; \
          DELETE FROM schema_migrations WHERE version > 1",
     )
@@ -367,7 +368,7 @@ async fn schema_version_rules_follow_adr_0023() {
     // the scratch copy, empty, and the plain rows restore as they were.
     let v2 = edit(
         "v2.db",
-        "DROP TABLE changeset_dicts; DROP TABLE store_features; DROP INDEX ref_log_land_id; ALTER TABLE ref_log DROP COLUMN land_changeset; \
+        "DROP TABLE changeset_dicts; DROP TABLE store_features; DROP TABLE land_leases; DROP INDEX ref_log_land_id; ALTER TABLE ref_log DROP COLUMN land_changeset; \
          ALTER TABLE ref_log DROP COLUMN land_id; \
          DELETE FROM schema_migrations WHERE version > 2",
     )
@@ -391,7 +392,7 @@ async fn schema_version_rules_follow_adr_0023() {
     // copy; the source had no dictionary, so it names no feature.
     let v3 = edit(
         "v3.db",
-        "DROP TABLE store_features; DROP INDEX ref_log_land_id; ALTER TABLE ref_log DROP COLUMN land_changeset; \
+        "DROP TABLE store_features; DROP TABLE land_leases; DROP INDEX ref_log_land_id; ALTER TABLE ref_log DROP COLUMN land_changeset; \
          ALTER TABLE ref_log DROP COLUMN land_id; \
          DELETE FROM schema_migrations WHERE version > 3",
     )
@@ -417,7 +418,7 @@ async fn schema_version_rules_follow_adr_0023() {
     let v4 = edit(
         "v4.db",
         "DROP INDEX ref_log_land_id; ALTER TABLE ref_log DROP COLUMN land_changeset; \
-         ALTER TABLE ref_log DROP COLUMN land_id; \
+         ALTER TABLE ref_log DROP COLUMN land_id; DROP TABLE land_leases; \
          DELETE FROM schema_migrations WHERE version > 4",
     )
     .await;

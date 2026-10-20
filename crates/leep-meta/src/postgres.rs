@@ -53,6 +53,12 @@ pub const MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/postgres/0005_land_ids.sql"),
         satisfied_by: &[],
     },
+    Migration {
+        version: 6,
+        name: "land_leases",
+        sql: include_str!("../migrations/postgres/0006_land_leases.sql"),
+        satisfied_by: &[],
+    },
 ];
 
 /// Every table a bulk load fills, for [`PostgresMetaStore::analyze`].
@@ -725,6 +731,39 @@ impl MetaStore for PostgresMetaStore {
             .map_err(|e| log_insert_error(name, e))?;
         tx.commit().await.map_err(storage)?;
         Ok(true)
+    }
+
+    fn supports_land_leases(&self) -> bool {
+        true
+    }
+
+    async fn land_lease(
+        &self,
+        ref_name: &str,
+        timing: leep_core::LeaseTiming,
+    ) -> Result<Option<leep_core::LandLease>> {
+        crate::leases::pg_get(&self.pool, ref_name, timing).await
+    }
+
+    async fn acquire_land_lease(
+        &self,
+        claim: &leep_core::LeaseClaim<'_>,
+        timing: leep_core::LeaseTiming,
+    ) -> Result<leep_core::LandLease> {
+        crate::leases::pg_acquire(&self.pool, claim, timing).await
+    }
+
+    async fn renew_land_leases(
+        &self,
+        holder: &str,
+        held: &[(String, u64)],
+        timing: leep_core::LeaseTiming,
+    ) -> Result<Vec<Option<std::time::Duration>>> {
+        crate::leases::pg_renew(&self.pool, holder, held, timing).await
+    }
+
+    async fn release_land_lease(&self, ref_name: &str, holder: &str, epoch: u64) -> Result<bool> {
+        crate::leases::pg_release(&self.pool, ref_name, holder, epoch).await
     }
 
     async fn cas_ref_logged_chain(

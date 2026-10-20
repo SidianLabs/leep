@@ -16,6 +16,7 @@ mod codec;
 pub mod compact;
 mod drop;
 pub mod features;
+mod leases;
 pub mod migrate;
 mod postgres;
 pub mod snapshot;
