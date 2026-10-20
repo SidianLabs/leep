@@ -121,7 +121,47 @@ use crate::{Changeset, ChangesetId, FileChange, FileKind, Hash, RepoPath, TreeEn
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ErrorResponse {
     pub error: String,
+    /// Set on a 503 from a query whose index is too far behind (ADR 0058):
+    /// what is behind and when to retry. Absent otherwise and from older
+    /// servers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub indexing: Option<IndexingInfo>,
 }
+
+impl ErrorResponse {
+    pub fn new(error: impl Into<String>) -> Self {
+        ErrorResponse {
+            error: error.into(),
+            indexing: None,
+        }
+    }
+}
+
+/// Why a query was answered `503` with `Retry-After` (ADR 0058): its index
+/// is `behind` changesets behind and the server would not scan that far
+/// without it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexingInfo {
+    /// The index group, by its lease name (`history-tree-v4`,
+    /// `log-filter-v1`, `tree-trigrams-v1`).
+    pub kind: String,
+    pub behind: u64,
+    pub retry_after_ms: u64,
+}
+
+/// Request header choosing what a query does when its index is behind
+/// (ADR 0058): [`INDEXING_RETRY`] or [`INDEXING_STALE_OK`]. Servers that
+/// list [`FEATURE_INDEXING_RETRY`] honour it; others ignore it.
+pub const INDEXING_HEADER: &str = "leep-indexing";
+/// [`INDEXING_HEADER`] value: answer `503` with `Retry-After` instead of
+/// waiting.
+pub const INDEXING_RETRY: &str = "retry";
+/// [`INDEXING_HEADER`] value: answer at the newest indexed first-parent
+/// ancestor, naming it in `answered_at` and the lag in `behind`.
+pub const INDEXING_STALE_OK: &str = "stale-ok";
+/// Response header of an indexed read: changesets (or, for search, files)
+/// without index rows that the answer examined directly.
+pub const INDEX_SCANNED_HEADER: &str = "leep-index-scanned";
 
 /// Body of `GET /v1/whoami`. Lets a client name the author of its changesets
 /// after the token when nothing local names one.
@@ -154,6 +194,10 @@ pub struct ReadyResponse {
 /// In [`ReadyResponse::features`]: the server records [`LandRequest::land_id`]
 /// and answers a repeat of a recorded land with its result (ADR 0057).
 pub const FEATURE_LAND_ID: &str = "land-id";
+
+/// In [`ReadyResponse::features`]: the server honours [`INDEXING_HEADER`]
+/// (ADR 0058).
+pub const FEATURE_INDEXING_RETRY: &str = "indexing-retry";
 
 /// One store that failed its readiness check.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -390,6 +434,13 @@ pub struct LogResponse {
     /// ended and from older servers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next: Option<String>,
+    /// With `Leep-Indexing: stale-ok`, the changeset the answer is for when
+    /// it is not the requested one (ADR 0058). Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answered_at: Option<ChangesetId>,
+    /// Generations between `answered_at` and the requested changeset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub behind: Option<u64>,
 }
 
 /// Newest change to a path, from the path-history index.
@@ -402,6 +453,11 @@ pub struct LastChangeResponse {
     /// parent. Usually empty.
     #[serde(default)]
     pub concurrent: Vec<ChangesetId>,
+    /// See [`LogResponse::answered_at`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answered_at: Option<ChangesetId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub behind: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -474,6 +530,11 @@ pub struct BlameResponse {
     /// responses of servers older than provenance support.
     #[serde(default)]
     pub changesets: BTreeMap<ChangesetId, ChangesetSummary>,
+    /// See [`LogResponse::answered_at`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answered_at: Option<ChangesetId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub behind: Option<u64>,
 }
 
 /// Changesets made by one agent model, optionally narrowed to one session.
@@ -692,6 +753,14 @@ pub struct SearchStats {
     /// scanned without the index.
     #[serde(default)]
     pub indexed: bool,
+    /// Files without an index row that were fetched and matched directly
+    /// because the index was behind (ADR 0058); omitted when 0.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub files_unindexed: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 /// Matches ordered by path, then line. `truncated` is set when more matches
@@ -709,6 +778,11 @@ pub struct SearchResponse {
     /// ended and from older servers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next: Option<String>,
+    /// See [`LogResponse::answered_at`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answered_at: Option<ChangesetId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub behind: Option<u64>,
 }
 
 #[cfg(test)]
@@ -748,6 +822,8 @@ mod tests {
         let log = LogResponse {
             entries: vec![],
             next: Some("abc".into()),
+            answered_at: None,
+            behind: None,
         };
         assert_eq!(
             serde_json::to_value(&log).unwrap(),
@@ -953,6 +1029,58 @@ mod tests {
     }
 
     #[test]
+    fn indexing_fields_are_additive() {
+        let id = ChangesetId(Hash::of_blob(b"z"));
+        // Older bodies decode, and the new fields are omitted when unset.
+        let log: LogResponse =
+            serde_json::from_value(serde_json::json!({ "entries": [] })).unwrap();
+        assert_eq!((log.answered_at, log.behind), (None, None));
+        let log = LogResponse {
+            entries: vec![],
+            next: None,
+            answered_at: Some(id),
+            behind: Some(7),
+        };
+        assert_eq!(
+            serde_json::to_value(&log).unwrap(),
+            serde_json::json!({ "entries": [], "answered_at": id.to_string(), "behind": 7 })
+        );
+        let err = ErrorResponse::new("x");
+        assert_eq!(
+            serde_json::to_value(&err).unwrap(),
+            serde_json::json!({ "error": "x" })
+        );
+        let err = ErrorResponse {
+            error: "indexing: ...".into(),
+            indexing: Some(IndexingInfo {
+                kind: "history-tree-v4".into(),
+                behind: 5210,
+                retry_after_ms: 4000,
+            }),
+        };
+        assert_eq!(
+            serde_json::to_value(&err).unwrap(),
+            serde_json::json!({
+                "error": "indexing: ...",
+                "indexing": { "kind": "history-tree-v4", "behind": 5210, "retry_after_ms": 4000 }
+            })
+        );
+        let old: ErrorResponse =
+            serde_json::from_value(serde_json::json!({ "error": "e" })).unwrap();
+        assert_eq!(old.indexing, None);
+        let stats = SearchStats::default();
+        assert!(serde_json::to_value(&stats)
+            .unwrap()
+            .get("files_unindexed")
+            .is_none());
+        let stats = SearchStats {
+            files_unindexed: 3,
+            ..SearchStats::default()
+        };
+        assert_eq!(serde_json::to_value(&stats).unwrap()["files_unindexed"], 3);
+    }
+
+    #[test]
     fn blame_summaries_round_trip_keyed_by_id() {
         let id = ChangesetId(Hash::of_blob(b"y"));
         let r = BlameResponse {
@@ -967,6 +1095,8 @@ mod tests {
                     agent: BTreeMap::from([("agent.model".into(), "m1".into())]),
                 },
             )]),
+            answered_at: None,
+            behind: None,
         };
         let v = serde_json::to_value(&r).unwrap();
         assert_eq!(

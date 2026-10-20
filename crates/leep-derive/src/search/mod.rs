@@ -498,7 +498,13 @@ impl Repo {
         q: &SearchQuery,
         after: Option<&str>,
     ) -> Result<SearchResponse> {
-        let fp = Fingerprint::of(
+        let (id, pos) = self.search_resume(rev, q, after).await?;
+        self.search_page_at(rev, id, q, pos.as_ref()).await
+    }
+
+    /// The query's fingerprint for search cursors.
+    fn search_fingerprint(rev: &str, q: &SearchQuery) -> Fingerprint {
+        Fingerprint::of(
             CursorKind::Search,
             &(
                 rev,
@@ -508,9 +514,20 @@ impl Repo {
                 q.path.trim_matches('/'),
                 q.glob.as_deref(),
             ),
-        );
-        let (id, pos) = match after {
-            None => (self.resolve(rev).await?, None),
+        )
+    }
+
+    /// The revision a search page reads (`rev` resolved, or the one an
+    /// earlier page's cursor pins) and where in it the page starts.
+    pub(crate) async fn search_resume(
+        &self,
+        rev: &str,
+        q: &SearchQuery,
+        after: Option<&str>,
+    ) -> Result<(ChangesetId, Option<SearchPos>)> {
+        let fp = Self::search_fingerprint(rev, q);
+        match after {
+            None => Ok((self.resolve(rev).await?, None)),
             Some(text) => {
                 let pos: SearchPos = cursor::decode(text, CursorKind::Search, fp)?;
                 match self.root_tree(pos.id).await {
@@ -522,14 +539,31 @@ impl Repo {
                     }
                     Err(e) => return Err(e),
                 }
-                (pos.id, Some(pos))
+                Ok((pos.id, Some(pos)))
             }
-        };
-        let (mut resp, resume) = self.search_from(id, q, pos.as_ref()).await?;
+        }
+    }
+
+    /// One page of the search of the tree of `id`, whose cursor pins `id`.
+    pub(crate) async fn search_page_at(
+        &self,
+        rev: &str,
+        id: ChangesetId,
+        q: &SearchQuery,
+        pos: Option<&SearchPos>,
+    ) -> Result<SearchResponse> {
+        let fp = Self::search_fingerprint(rev, q);
+        let (mut resp, resume) = self.search_from(id, q, pos).await?;
         if let Some((path, line)) = resume {
             resp.next = cursor::encode(CursorKind::Search, fp, &SearchPos { id, path, line });
         }
         Ok(resp)
+    }
+
+    /// Whether a search with `q` consults the index at all.
+    pub(crate) fn search_uses_index(q: &SearchQuery) -> Result<bool> {
+        let compiled = Compiled::new(&q.pattern, q.regex, q.case_insensitive)?;
+        Ok(q.use_index && !compiled.required.is_true())
     }
 
     /// [`Repo::search`] after `after`, also returning where the next page
@@ -548,7 +582,12 @@ impl Repo {
         let filter = Arc::new(Filter::new(q.glob.as_deref(), after)?);
         let limit = q.limit.clamp(1, MAX_LIMIT);
         let indexed = q.use_index && !compiled.required.is_true();
-        let counters = Arc::new(Counters::default());
+        // A bounded search (ADR 0058) computes missing rows in memory.
+        let scan = self.bounded.as_ref().and_then(|b| b.search.clone());
+        let counters = Arc::new(match &scan {
+            Some(scan) => Counters::scanning(scan.clone()),
+            None => Counters::default(),
+        });
         let walk_stats = Arc::new(WalkStats::default());
         let mut stats = SearchStats {
             indexed,
@@ -653,6 +692,9 @@ impl Repo {
         stats.dirs_pruned = walk_stats.dirs_pruned.load(Ordering::Relaxed);
         stats.blob_rows_derived = counters.blob_rows();
         stats.tree_rows_derived = counters.tree_rows();
+        if let Some(scan) = &scan {
+            stats.files_unindexed = scan.files.load(Ordering::Relaxed);
+        }
         metrics::counter!("leep_search_total", "indexed" => indexed.to_string()).increment(1);
         metrics::histogram!("leep_search_duration_seconds").record(started.elapsed().as_secs_f64());
         Ok((
@@ -661,6 +703,8 @@ impl Repo {
                 truncated,
                 stats,
                 next: None,
+                answered_at: None,
+                behind: None,
             },
             resume,
         ))

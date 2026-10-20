@@ -24,6 +24,15 @@ pub struct ToolError(pub String);
 
 impl From<CliError> for ToolError {
     fn from(e: CliError) -> Self {
+        if e.kind() == leep_cli::error::ErrorKind::Indexing {
+            // ADR 0058: say what lags, by how much, and when to ask again.
+            let secs = e.retry_after_ms().unwrap_or(1000).div_ceil(1000);
+            return ToolError(format!(
+                "{}; retry in about {secs}s, or call again without `fresh` for an answer at the \
+                 newest indexed changeset",
+                e.message().trim_start_matches("server: ")
+            ));
+        }
         ToolError(e.to_string())
     }
 }
@@ -177,6 +186,10 @@ fn tool(name: &str, title: &str, description: &str, schema: Value, read_only: bo
     })
 }
 
+const FRESH_DOC: &str = "Insist on an answer at `rev` itself (default false). By default, \
+     when the server's index lags behind recent changes, the answer is for the newest indexed \
+     changeset and the result names it in `answered_at`, with `behind` changesets of lag.";
+
 const REV_DOC: &str =
     "Branch name (default `main`), `tags/<name>` or a tag's short name, or full 64-hex changeset id.";
 
@@ -209,7 +222,8 @@ pub fn definitions() -> Vec<Value> {
                     "author": { "type": "string", "description": "Only changesets whose author contains this text (case-insensitive)." },
                     "agent_model": { "type": "string", "description": "Only changesets made by this agent model (exact match on agent.model)." },
                     "agent_session": { "type": "string", "description": "Only changesets from this agent session (exact match on agent.session)." },
-                    "cursor": { "type": "string", "description": "The `next` value of the previous page, to continue it (repeat the other arguments, with `rev` set to that page's `from`)." }
+                    "cursor": { "type": "string", "description": "The `next` value of the previous page, to continue it (repeat the other arguments, with `rev` set to that page's `from`)." },
+                    "fresh": { "type": "boolean", "description": FRESH_DOC }
                 },
                 "additionalProperties": false
             }),
@@ -288,7 +302,8 @@ pub fn definitions() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "rev": { "type": "string", "description": REV_DOC },
-                    "path": { "type": "string", "description": "File path." }
+                    "path": { "type": "string", "description": "File path." },
+                    "fresh": { "type": "boolean", "description": FRESH_DOC }
                 },
                 "required": ["path"],
                 "additionalProperties": false
@@ -318,7 +333,8 @@ pub fn definitions() -> Vec<Value> {
                     "path": { "type": "string", "description": "Only files at or below this directory or file path." },
                     "glob": { "type": "string", "description": "Only paths matching this glob, e.g. `**/*.rs` or `src/*.toml`." },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 200, "description": "Max matching lines (default 50)." },
-                    "cursor": { "type": "string", "description": "The `next` value of the previous page, to continue it (repeat the other arguments, with `rev` set to that page's `rev`)." }
+                    "cursor": { "type": "string", "description": "The `next` value of the previous page, to continue it (repeat the other arguments, with `rev` set to that page's `rev`)." },
+                    "fresh": { "type": "boolean", "description": FRESH_DOC }
                 },
                 "required": ["query"],
                 "additionalProperties": false

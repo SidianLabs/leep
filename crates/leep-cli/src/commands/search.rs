@@ -35,6 +35,10 @@ pub struct SearchArgs {
     /// of `--json` output); the query and flags must match that request's.
     #[arg(long, value_name = "CURSOR")]
     pub after: Option<String>,
+    /// When the server's index lags, search the newest indexed changeset
+    /// instead of waiting for it (says which on stderr).
+    #[arg(long)]
+    pub stale_ok: bool,
 }
 
 impl SearchArgs {
@@ -62,10 +66,12 @@ pub fn search_lines(resp: &SearchResponse) -> Vec<String> {
 /// Exits 1 when nothing matched (text mode), like grep.
 pub fn run(r: &Remote, args: &SearchArgs) -> Result<i32> {
     let id = r.resolve_default(args.rev.as_deref())?;
+    let client = r.client.clone().with_stale_ok(args.stale_ok);
     let resp = match args.limit {
-        Some(n) if n > SEARCH_PAGE => r.client.search_all(&id, &args.query(), n as usize)?,
-        _ => r.client.search(&id, &args.query())?,
+        Some(n) if n > SEARCH_PAGE => client.search_all(&id, &args.query(), n as usize)?,
+        _ => client.search(&id, &args.query())?,
     };
+    super::history::note_stale(resp.answered_at, resp.behind);
     if r.json {
         print_json(&resp)?;
         return Ok(0);

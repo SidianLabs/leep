@@ -296,7 +296,7 @@ impl Mock {
 type Resp<T> = Result<Json<T>, (StatusCode, Json<ErrorResponse>)>;
 
 fn err(code: StatusCode, msg: &str) -> (StatusCode, Json<ErrorResponse>) {
-    (code, Json(ErrorResponse { error: msg.into() }))
+    (code, Json(ErrorResponse::new(msg)))
 }
 
 async fn missing(
@@ -969,7 +969,12 @@ async fn log(
         .find(|(k, _)| k == "after")
         .map(|(_, v)| v.as_str());
     let (entries, next) = page(&d, entries, limit, after);
-    Ok(Json(LogResponse { entries, next }))
+    Ok(Json(LogResponse {
+        entries,
+        next,
+        answered_at: None,
+        behind: None,
+    }))
 }
 
 /// File-level diff between two changesets, with rename detection when asked,
@@ -1062,6 +1067,8 @@ async fn last_change(
             renamed: None,
         },
         concurrent: vec![],
+        answered_at: None,
+        behind: None,
     }))
 }
 
@@ -1100,6 +1107,8 @@ async fn blame(
             text: "hello".into(),
         }],
         changesets: BTreeMap::from([(id, summary)]),
+        answered_at: None,
+        behind: None,
     }))
 }
 
@@ -1159,6 +1168,8 @@ async fn search(
         matches,
         stats: SearchStats::default(),
         next,
+        answered_at: None,
+        behind: None,
     }))
 }
 

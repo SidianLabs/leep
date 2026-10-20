@@ -587,6 +587,11 @@ pub async fn check_lease_contract(store: &dyn MetaStore) {
     check_one_lease_scope(store, &land, "").await;
     let other = LeaseKey::new("lease-contract-indexer", "lease-contract/a").with_shard(3);
     check_one_lease_scope(store, &other, "{\"part\":3}").await;
+    // The index scope of ADR 0058: repository 0, a kind as name, JSON meta.
+    let index = LeaseKey::index("lease-contract-history-tree-v4");
+    assert_eq!((index.repo_id, index.shard), (0, 0));
+    check_one_lease_scope(store, &index, "{\"rate\":12.5,\"backlog\":40}").await;
+    check_index_timing(store).await;
 
     // Keys differ in scope, repository, name or shard: independent leases.
     use std::time::Duration;
@@ -627,6 +632,59 @@ pub async fn check_lease_contract(store: &dyn MetaStore) {
         );
         assert_eq!(&got.key, key);
     }
+}
+
+/// The index scope's own timing (ADR 0058: 15 s TTL, taken once its
+/// renewal is 6 s old): the time left is the stale bound, a repository-1
+/// key of the same name is another lease, and the holder's meta is
+/// replaced by its renewals' claims.
+async fn check_index_timing(store: &dyn MetaStore) {
+    use std::time::Duration;
+    let timing = LeaseTiming {
+        ttl: Duration::from_secs(15),
+        stale_after: Duration::from_secs(6),
+    };
+    let key = LeaseKey::index("lease-contract-timing");
+    let claim = |key, holder, meta| LeaseClaim {
+        key,
+        holder,
+        address: "",
+        protocol: 1,
+        meta,
+    };
+    let got = store
+        .acquire_lease(&claim(&key, "ix1", "{\"rate\":1}"), timing)
+        .await
+        .unwrap();
+    assert_eq!((got.holder.as_str(), got.epoch), ("ix1", 1));
+    assert!(
+        got.remaining <= Duration::from_secs(6) && got.remaining > Duration::from_secs(4),
+        "{got:?}"
+    );
+    let refused = store
+        .acquire_lease(&claim(&key, "ix2", ""), timing)
+        .await
+        .unwrap();
+    assert_eq!(
+        (refused.holder.as_str(), refused.meta.as_str()),
+        ("ix1", "{\"rate\":1}")
+    );
+    // The holder publishes new meta by claiming its own lease again.
+    let kept = store
+        .acquire_lease(&claim(&key, "ix1", "{\"rate\":2}"), timing)
+        .await
+        .unwrap();
+    assert_eq!((kept.epoch, kept.meta.as_str()), (1, "{\"rate\":2}"));
+    let same_name = LeaseKey {
+        repo_id: 1,
+        ..key.clone()
+    };
+    let other = store
+        .acquire_lease(&claim(&same_name, "ix2", ""), timing)
+        .await
+        .unwrap();
+    assert_eq!((other.holder.as_str(), other.epoch), ("ix2", 1));
+    assert!(store.release_lease(&key, "ix1", 1).await.unwrap());
 }
 
 /// The rules of one lease, under `key`.

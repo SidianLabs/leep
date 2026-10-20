@@ -347,13 +347,7 @@ pub(crate) fn needs_write(method: &Method, path: &str) -> bool {
 }
 
 pub(crate) fn reject(status: StatusCode, msg: &str) -> Response {
-    let mut resp = (
-        status,
-        Json(ErrorResponse {
-            error: msg.to_string(),
-        }),
-    )
-        .into_response();
+    let mut resp = (status, Json(ErrorResponse::new(msg.to_string()))).into_response();
     if status == StatusCode::UNAUTHORIZED {
         resp.headers_mut()
             .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));

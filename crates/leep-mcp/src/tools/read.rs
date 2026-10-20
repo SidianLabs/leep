@@ -34,6 +34,7 @@ struct LogArgs {
     agent_model: Option<String>,
     agent_session: Option<String>,
     cursor: Option<String>,
+    fresh: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -54,6 +55,13 @@ struct PathArgs {
 }
 
 #[derive(Deserialize)]
+struct BlameArgs {
+    rev: Option<String>,
+    path: String,
+    fresh: Option<bool>,
+}
+
+#[derive(Deserialize)]
 struct SearchArgs {
     query: String,
     rev: Option<String>,
@@ -63,6 +71,7 @@ struct SearchArgs {
     glob: Option<String>,
     limit: Option<u32>,
     cursor: Option<String>,
+    fresh: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -120,11 +129,34 @@ fn summary(info: &ChangesetInfo) -> Value {
     v
 }
 
+/// Add `answered_at` and `behind` when the answer is for an older changeset
+/// than asked (ADR 0058).
+fn mark_stale(v: &mut Value, answered_at: Option<ChangesetId>, behind: Option<u64>) {
+    if let Some(at) = answered_at {
+        v["answered_at"] = json!(at.to_string());
+        v["behind"] = json!(behind.unwrap_or(0));
+    }
+}
+
 fn file_json(f: &FileInfo) -> Value {
     json!({ "path": f.path.to_string(), "size": f.size, "kind": f.kind })
 }
 
 impl Server {
+    /// The client for an index-backed query: `stale-ok` by default, so an
+    /// agent gets a slightly older answer now; with `fresh`, `retry`, with
+    /// one retry within 5 s (ADR 0058).
+    fn index_client(&self, fresh: bool) -> leep_cli::client::Client {
+        if fresh {
+            self.client
+                .clone()
+                .with_stale_ok(false)
+                .with_index_retries(std::time::Duration::from_secs(5), 1)
+        } else {
+            self.client.clone().with_stale_ok(true)
+        }
+    }
+
     pub(super) fn refs(&self) -> ToolResult {
         let refs = self.client.refs()?.refs;
         let map: BTreeMap<String, String> =
@@ -157,9 +189,12 @@ impl Server {
             follow,
             after: non_empty(a.cursor),
         };
-        let log = self.client.log(&id, &query)?;
+        let log = self
+            .index_client(a.fresh.unwrap_or(false))
+            .log(&id, &query)?;
         let entries: Vec<Value> = log.entries.iter().map(summary).collect();
         let mut v = json!({ "from": id.to_string(), "entries": entries });
+        mark_stale(&mut v, log.answered_at, log.behind);
         if let Some(next) = log.next {
             v["next"] = json!(next);
             v["note"] = json!(
@@ -370,13 +405,16 @@ impl Server {
             ),
             after: non_empty(a.cursor),
         };
-        let resp = self.client.search(&id, &query)?;
+        let resp = self
+            .index_client(a.fresh.unwrap_or(false))
+            .search(&id, &query)?;
         let mut v = json!({
             "rev": id.to_string(),
             "matches": resp.matches,
             "truncated": resp.truncated,
             "stats": resp.stats,
         });
+        mark_stale(&mut v, resp.answered_at, resp.behind);
         if let Some(next) = resp.next {
             v["next"] = json!(next);
             v["note"] = json!(
@@ -421,9 +459,11 @@ impl Server {
     }
 
     pub(super) fn blame(&self, args: Value) -> ToolResult {
-        let a: PathArgs = parse_args(args)?;
+        let a: BlameArgs = parse_args(args)?;
         let id = self.resolve_rev(a.rev.as_deref())?;
-        let blame = self.client.blame(&id, &a.path)?;
+        let blame = self
+            .index_client(a.fresh.unwrap_or(false))
+            .blame(&id, &a.path)?;
         let mut authors: BTreeMap<ChangesetId, String> = BTreeMap::new();
         let mut out = String::new();
         for (n, line) in blame.lines.iter().enumerate() {
@@ -448,11 +488,22 @@ impl Server {
                 line.text.trim_end_matches(['\n', '\r'])
             );
         }
-        let mut header = format!(
-            "blame of {} at {} (changeset, author, line: text)\n",
-            a.path,
-            short(&id)
-        );
+        let mut header = match blame.answered_at {
+            Some(at) => format!(
+                "blame of {} at {} (answered_at {}, {} behind the requested {}; changeset, \
+                 author, line: text)\n",
+                a.path,
+                short(&at),
+                at,
+                blame.behind.unwrap_or(0),
+                short(&id)
+            ),
+            None => format!(
+                "blame of {} at {} (changeset, author, line: text)\n",
+                a.path,
+                short(&id)
+            ),
+        };
         header.push_str(&out);
         Ok(ToolOutput::text(header))
     }

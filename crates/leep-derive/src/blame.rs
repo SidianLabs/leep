@@ -176,6 +176,8 @@ impl Repo {
             path,
             lines,
             changesets,
+            answered_at: None,
+            behind: None,
         })
     }
 
@@ -199,10 +201,12 @@ impl Repo {
     async fn skip_unchanged(
         &self,
         chain: &mut FirstParents,
-        entry: Option<HistoryEntry>,
+        entry: Lookup,
         bottom: u64,
     ) -> Result<Skip> {
-        let Some(entry) = entry else {
+        // A step without a row (ADR 0058) is examined, as every step is
+        // without the index.
+        let Lookup::Entry(Some(entry)) = entry else {
             return Ok(Skip::Here);
         };
         let gens =
@@ -257,7 +261,7 @@ impl Repo {
         // blames were not looked up yet.
         let mut unchecked: Vec<usize> = Vec::new();
         let mut entry = self.entry_and_list(&mut first_parents, top, path).await?;
-        if entry.is_none() && most == usize::MAX {
+        if matches!(entry, Lookup::Entry(None)) && most == usize::MAX {
             // The file never existed at `top`, so the walk ends above it.
             walk.absent = true;
             return Ok(walk);
@@ -269,7 +273,11 @@ impl Repo {
             // the file there is the one the last step found.
             let mut finished = true;
             let next = match self
-                .skip_unchanged(&mut first_parents, entry.take(), bottom)
+                .skip_unchanged(
+                    &mut first_parents,
+                    std::mem::replace(&mut entry, Lookup::Entry(None)),
+                    bottom,
+                )
                 .await?
             {
                 Skip::To(x) => Some(x),
@@ -291,7 +299,7 @@ impl Repo {
             }
             // No entry at the parent: the file never existed there, which
             // the step finds and stops at.
-            if pending.len() < LOOKUP_BATCH && !finished && entry.is_some() {
+            if pending.len() < LOOKUP_BATCH && !finished && !matches!(entry, Lookup::Entry(None)) {
                 continue;
             }
             let parents: Vec<ChangesetId> = pending.iter().filter_map(|(_, p)| *p).collect();
@@ -365,14 +373,25 @@ impl Repo {
         chain: &mut FirstParents,
         cur: ChangesetId,
         path: &RepoPath,
-    ) -> Result<Option<HistoryEntry>> {
+    ) -> Result<Lookup> {
+        if let Some(floor) = self.bounded.as_ref().and_then(|b| b.floor) {
+            // A bounded blame (ADR 0058): first-parent ancestors above the
+            // newest indexed one have no row.
+            if self.generation(cur).await? > floor {
+                if let Some(b) = &self.bounded {
+                    b.examined(1);
+                }
+                chain.list(self, cur).await?;
+                return Ok(Lookup::Unknown);
+            }
+        }
         let (entry, list) = futures_util::future::join(
             self.history_entry(cur, path.as_str()),
             chain.list(self, cur),
         )
         .await;
         list?;
-        entry
+        entry.map(Lookup::Entry)
     }
 
     /// The changers of `path` from `id` (where the file is `tip`), newest
@@ -409,8 +428,11 @@ impl Repo {
         cuts: Cuts,
     ) -> Result<Found> {
         // Derives the index first if it is missing, with the stores as they
-        // are: derivation batches its own reads.
-        self.history_root(id).await?;
+        // are: derivation batches its own reads. A bounded blame (ADR 0058)
+        // derives nothing and walks the steps without rows one by one.
+        if self.bounded.is_none() {
+            self.history_root(id).await?;
+        }
         let walker = self.with_stores(
             Arc::new(BatchedBlobs::new(self.blobs().clone())),
             Arc::new(BatchedMeta::new(self.meta().clone())),
@@ -997,6 +1019,13 @@ struct Stretch {
     most: usize,
     /// Seeded with the chain's ancestors known between `top` and `bottom`.
     first_parents: FirstParents,
+}
+
+/// The path-history entry of a step: `Unknown` when the step has no row in
+/// a bounded blame (ADR 0058).
+enum Lookup {
+    Entry(Option<HistoryEntry>),
+    Unknown,
 }
 
 /// Where [`Repo::skip_unchanged`] says to go.

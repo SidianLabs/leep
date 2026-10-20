@@ -116,6 +116,7 @@ pub async fn derive<K: DerivedKind>(repo: &Repo, id: ChangesetId) -> Result<Byte
     if let Some(v) = repo.meta().get_derived(K::NAME, &id.0).await? {
         return Ok(v);
     }
+    refuse_in_bounded_query(repo, K::NAME)?;
     let held = HELD
         .try_with(|h| h.borrow().contains(&K::NAME))
         .unwrap_or(false);
@@ -150,25 +151,64 @@ async fn holding<K: DerivedKind, T>(work: impl std::future::Future<Output = T>) 
 /// heads share is derived once, and the chains of different heads run side
 /// by side. Returns how many heads lacked a value.
 pub async fn derive_heads<K: DerivedKind>(repo: &Repo, heads: &[ChangesetId]) -> Result<usize> {
+    Ok(derive_heads_with::<K>(repo, heads).await?.0)
+}
+
+/// [`derive_heads`], returning how many changesets were derived.
+pub async fn derive_heads_counted<K: DerivedKind>(
+    repo: &Repo,
+    heads: &[ChangesetId],
+) -> Result<usize> {
+    Ok(derive_heads_with::<K>(repo, heads).await?.1)
+}
+
+/// Heads that lacked a value, and changesets derived.
+async fn derive_heads_with<K: DerivedKind>(
+    repo: &Repo,
+    heads: &[ChangesetId],
+) -> Result<(usize, usize)> {
     let missing = missing_heads::<K>(repo, heads).await?;
     if missing.is_empty() {
-        return Ok(0);
+        return Ok((0, 0));
     }
+    refuse_in_bounded_query(repo, K::NAME)?;
     let held = HELD
         .try_with(|h| h.borrow().contains(&K::NAME))
         .unwrap_or(false);
     if held {
-        derive_range::<K>(repo, &missing).await?;
-        return Ok(missing.len());
+        let (_, n) = derive_range::<K>(repo, &missing).await?;
+        return Ok((missing.len(), n));
     }
     let lock = repo.derive_lock(K::NAME);
     let _guard = lock.lock().await;
     // Another derivation may have stored some while this one waited.
     let missing = missing_heads::<K>(repo, &missing).await?;
+    let mut n = 0;
     if !missing.is_empty() {
-        holding::<K, _>(derive_range::<K>(repo, &missing)).await?;
+        n = holding::<K, _>(derive_range::<K>(repo, &missing)).await?.1;
     }
-    Ok(missing.len())
+    Ok((missing.len(), n))
+}
+
+/// A bounded query (ADR 0058) never derives an index range: rows it
+/// expected are gone (a `repair drop` raced it), so it answers that the
+/// index is behind and the client retries.
+fn refuse_in_bounded_query(repo: &Repo, kind: &'static str) -> Result<()> {
+    if repo.bounded.is_none() {
+        return Ok(());
+    }
+    match crate::indexing::IndexGroup::of_kind(kind) {
+        Some(g) => {
+            metrics::counter!("leep_query_rows_vanished_total", "kind" => g.lease_name())
+                .increment(1);
+            Err(Error::Indexing {
+                kind: g.lease_name().into(),
+                behind: 0,
+                retry_after_ms: 1000,
+            })
+        }
+        None => Ok(()),
+    }
 }
 
 /// `heads` without a stored or staged value of `K`, once each, in order.
@@ -198,18 +238,23 @@ async fn missing_heads<K: DerivedKind>(
 
 /// Changesets read or checked per round trip while finding and deriving a
 /// missing range.
-const BATCH: usize = 256;
+pub(crate) const BATCH: usize = 256;
 
 async fn derive_missing<K: DerivedKind>(repo: &Repo, id: ChangesetId) -> Result<Bytes> {
     derive_range::<K>(repo, &[id])
         .await?
+        .0
         .ok_or_else(|| Error::Storage("derivation produced no value".into()))
 }
 
 /// Derive `K` for `roots`, which the caller found missing, and every
 /// ancestor of theirs that lacks a value. Returns the value of the root
-/// placed last, which for one root is that root's.
-async fn derive_range<K: DerivedKind>(repo: &Repo, roots: &[ChangesetId]) -> Result<Option<Bytes>> {
+/// placed last, which for one root is that root's, and how many changesets
+/// the range held.
+async fn derive_range<K: DerivedKind>(
+    repo: &Repo,
+    roots: &[ChangesetId],
+) -> Result<(Option<Bytes>, usize)> {
     let meta = repo.meta();
     // Find the changesets lacking a value, a batch of them per round trip,
     // keeping only their parents: a whole range of changesets (Linux has 1.5
@@ -282,7 +327,7 @@ async fn derive_range<K: DerivedKind>(repo: &Repo, roots: &[ChangesetId]) -> Res
         Err(e) => Err(e),
     };
     wave.abandon().await;
-    result.map(|()| wave.last.take())
+    result.map(|()| (wave.last.take(), dag.len()))
 }
 
 /// A value of `kind` computed by a running derivation and not stored yet.
@@ -367,6 +412,13 @@ impl<K: DerivedKind> DeriveWave<K> {
         self.settle().await?;
         self.since_write = 0;
         if !self.pending.is_empty() {
+            // The warmer's lease (ADR 0058): a holder that lost it stops
+            // here, and the rows not written are dropped.
+            if !self.repo.write_allowed().await {
+                return Err(Error::Other(
+                    "stopped deriving: the index lease was lost".into(),
+                ));
+            }
             let rows: Arc<[DerivedRow]> = std::mem::take(&mut self.pending).into();
             let meta = self.repo.meta().clone();
             let carried = rows.clone();
@@ -528,7 +580,7 @@ impl<K: DerivedKind> wavefront::Wave for DeriveWave<K> {
 const STAGED_WRITE: usize = 1024;
 
 /// `ids`' values of `kind`, in one read if the store can, else one by one.
-async fn get_derived_many(
+pub(crate) async fn get_derived_many(
     meta: &dyn MetaStore,
     kind: &str,
     ids: &[ChangesetId],
@@ -548,7 +600,7 @@ async fn get_derived_many(
 
 /// The changesets `ids`, in one read if the store can, else one by one;
 /// `NotFound` if any is absent.
-async fn get_changesets(repo: &Repo, ids: &[ChangesetId]) -> Result<Vec<Changeset>> {
+pub(crate) async fn get_changesets(repo: &Repo, ids: &[ChangesetId]) -> Result<Vec<Changeset>> {
     if let Ok(v) = repo.meta().get_changesets(ids).await {
         if v.len() == ids.len() {
             if let Some(found) = v.into_iter().collect::<Option<Vec<_>>>() {

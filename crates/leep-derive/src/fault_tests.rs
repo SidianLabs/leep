@@ -636,7 +636,7 @@ async fn land_reports_a_commit_that_keeps_failing() {
 /// A meta store that remembers every derived row written through it and can
 /// flip one bit of one row on read. Sits below the fault injector so it sees
 /// what really reached storage.
-struct Tamper {
+pub(crate) struct Tamper {
     inner: Arc<dyn MetaStore>,
     written: std::sync::Mutex<BTreeMap<(String, leep_core::Hash), Bytes>>,
     /// A key written twice with different values, which derived data forbids.
@@ -730,6 +730,43 @@ impl MetaStore for Tamper {
             }
         }
         self.inner.put_derived(kind, key, value).await
+    }
+    async fn delete_derived_kind(&self, kind: &str) -> Result<u64> {
+        self.written.lock().unwrap().retain(|(k, _), _| k != kind);
+        self.inner.delete_derived_kind(kind).await
+    }
+    fn supports_leases(&self) -> bool {
+        self.inner.supports_leases()
+    }
+    async fn lease(
+        &self,
+        key: &leep_core::LeaseKey,
+        timing: leep_core::LeaseTiming,
+    ) -> Result<Option<leep_core::Lease>> {
+        self.inner.lease(key, timing).await
+    }
+    async fn acquire_lease(
+        &self,
+        claim: &leep_core::LeaseClaim<'_>,
+        timing: leep_core::LeaseTiming,
+    ) -> Result<leep_core::Lease> {
+        self.inner.acquire_lease(claim, timing).await
+    }
+    async fn renew_leases(
+        &self,
+        holder: &str,
+        held: &[(leep_core::LeaseKey, u64)],
+        timing: leep_core::LeaseTiming,
+    ) -> Result<Vec<Option<Duration>>> {
+        self.inner.renew_leases(holder, held, timing).await
+    }
+    async fn release_lease(
+        &self,
+        key: &leep_core::LeaseKey,
+        holder: &str,
+        epoch: u64,
+    ) -> Result<bool> {
+        self.inner.release_lease(key, holder, epoch).await
     }
 }
 
@@ -1716,5 +1753,327 @@ async fn incremental_mark_under_faults(seed: u64) {
 async fn incremental_mark_survives_being_killed_anywhere() {
     for seed in seeds() {
         incremental_mark_under_faults(seed).await;
+    }
+}
+
+/// A store whose lease clock follows tokio's, so a paused test moves both.
+fn clocked_meta() -> MemoryMetaStore {
+    let base = tokio::time::Instant::now();
+    MemoryMetaStore::new().with_lease_clock(Arc::new(move || {
+        1_000_000 + base.elapsed().as_millis() as i64
+    }))
+}
+
+/// A copy of `src`'s changesets with no derived rows, on a lease clock that
+/// follows tokio's.
+async fn clocked_copy(src: &Repo) -> Arc<MemoryMetaStore> {
+    let meta = Arc::new(clocked_meta());
+    for id in src.meta().list_changesets(None, usize::MAX).await.unwrap() {
+        meta.put_changeset(&src.get_changeset(id).await.unwrap())
+            .await
+            .unwrap();
+    }
+    meta
+}
+
+/// One index server of [`index_holders_under_faults`]: a candidate for the
+/// path-history and log-filter leases, warming in `lease` mode.
+struct IndexServer {
+    leases: Arc<crate::indexing::IndexLeases>,
+    warmer: crate::warm::Warmer,
+    plan: Arc<FaultPlan>,
+}
+
+impl IndexServer {
+    fn new(blobs: &Arc<MemoryBlobStore>, meta: &Arc<Tamper>, seed: u64, n: u64) -> IndexServer {
+        use crate::indexing::{IndexGroup, IndexLeaseConfig, IndexLeases};
+        let plan = FaultPlan::new(seed * 1000 + n);
+        plan.rate(Op::META, 2, Fault::Fail)
+            .rate(&[Op::PutDerived], 4, Fault::FailAfter)
+            .rate(&[Op::Lease], 60, Fault::Fail)
+            .rate(&[Op::Lease], 20, Fault::FailAfter);
+        let faulty: Arc<dyn MetaStore> = Arc::new(FaultyMetaStore::new(meta.clone(), plan.clone()));
+        let repo = Repo::new(
+            Arc::new(FaultyBlobStore::new(blobs.clone(), plan.clone())),
+            faulty.clone(),
+        )
+        .with_derive_jobs(3);
+        let cfg = IndexLeaseConfig::new(format!("server-{n}"), "")
+            .with_candidates(vec![IndexGroup::History, IndexGroup::LogFilter]);
+        let leases = IndexLeases::new(faulty, cfg);
+        let warmer = crate::warm::Warmer::new(repo, false)
+            .with_leases(leases.clone())
+            .with_full_listing_every(Duration::ZERO);
+        IndexServer {
+            leases,
+            warmer,
+            plan,
+        }
+    }
+}
+
+/// ADR 0058's lease fault sweep. Index servers in `lease` mode take turns
+/// at random: renewing (or taking) leases, warming, warming while another
+/// warms, being killed at a random point of a wavefront (their lease left
+/// to go stale), and being paused past the stale time (the store's clock
+/// jumps), all under store faults, lease calls included. After every step
+/// each stored row is the fault-free row and has its parents' rows, and in
+/// the end the rows are the fault-free run's.
+async fn index_holders_under_faults(
+    seed: u64,
+    truth: &Repo,
+    truth_rows: &RowsByKey,
+    parents: &HashMap<leep_core::Hash, Vec<ChangesetId>>,
+    heads: &[ChangesetId],
+) {
+    use crate::derived::{
+        DerivedKind, HistoryTree, LogFilterIndex, HISTORY_NODE_KIND, LOG_FILTER_NAME_KIND,
+    };
+    let bare = clocked_copy(truth).await;
+    for (i, h) in heads.iter().enumerate() {
+        bare.cas_ref(&format!("lane{i}"), None, Some(*h))
+            .await
+            .unwrap();
+    }
+    let spy = Tamper::new(bare);
+    let blobs = Arc::new(MemoryBlobStore::new());
+    for id in truth
+        .meta()
+        .list_changesets(None, usize::MAX)
+        .await
+        .unwrap()
+    {
+        for (_, change) in truth.get_changeset(id).await.unwrap().changes {
+            if let FileChange::Modify { content, .. } = change {
+                let data = truth.blobs().get(&content).await.unwrap().unwrap();
+                blobs.put(data).await.unwrap();
+            }
+        }
+    }
+    let mut rng = Rng::new(seed);
+    let mut servers = vec![
+        IndexServer::new(&blobs, &spy, seed, 0),
+        IndexServer::new(&blobs, &spy, seed, 1),
+    ];
+    let mut next = 2;
+    let chained = [HistoryTree::NAME, LogFilterIndex::NAME];
+    let compared = [
+        HistoryTree::NAME,
+        HISTORY_NODE_KIND,
+        LogFilterIndex::NAME,
+        LOG_FILTER_NAME_KIND,
+    ];
+    let check = |step: usize| {
+        let rows = spy.rows();
+        for ((kind, key), row) in &rows {
+            assert_eq!(
+                truth_rows.get(&(kind.clone(), *key)),
+                Some(row),
+                "seed {seed}, step {step}: wrong row {kind} {key}"
+            );
+            if chained.contains(&kind.as_str()) {
+                for p in &parents[key] {
+                    assert!(
+                        rows.contains_key(&(kind.clone(), p.0)),
+                        "seed {seed}, step {step}: the {kind} row of {key} without its parent {p}'s"
+                    );
+                }
+            }
+        }
+        assert!(spy.conflicts.lock().unwrap().is_empty(), "seed {seed}");
+        compared.iter().all(|kind| {
+            let of = |m: &RowsByKey| {
+                m.iter()
+                    .filter(|((k, _), _)| k == kind)
+                    .map(|((_, h), v)| (*h, v.clone()))
+                    .collect::<Vec<_>>()
+            };
+            of(&rows) == of(truth_rows)
+        })
+    };
+    let mut kills = 0;
+    for step in 0..600 {
+        let i = rng.below(servers.len());
+        match rng.below(10) {
+            0..=2 => servers[i].leases.tick().await,
+            3..=5 => {
+                let _ = servers[i].warmer.pass().await;
+            }
+            6 => {
+                // Both warm at once: whoever holds a group derives it.
+                let (a, b) = servers.split_at_mut(1);
+                let _ = futures_util::join!(a[0].warmer.pass(), b[0].warmer.pass());
+            }
+            7 => {
+                // Killed at a random point of a pass: the pass is dropped
+                // once the store has seen a random number more reads, and
+                // the lease is left to go stale.
+                let target = servers[i].plan.calls(Op::GetDerived) + 1 + rng.below(400) as u64;
+                let plan = servers[i].plan.clone();
+                let killer = async move {
+                    while plan.calls(Op::GetDerived) < target {
+                        tokio::task::yield_now().await;
+                    }
+                };
+                tokio::select! {
+                    _ = servers[i].warmer.pass() => {}
+                    () = killer => {}
+                }
+                servers[i].leases.halt();
+                servers[i] = IndexServer::new(&blobs, &spy, seed, next);
+                next += 1;
+                kills += 1;
+            }
+            8 => {
+                // Paused past the stale time: another may take over while
+                // this one still trusts its view for a moment.
+                tokio::time::advance(Duration::from_secs(7)).await;
+            }
+            _ => tokio::time::advance(Duration::from_millis(1500)).await,
+        }
+        if check(step) && step > 40 {
+            break;
+        }
+    }
+    // Then a calm finish: faults off, and the leases settle.
+    for s in &servers {
+        s.plan.clear();
+    }
+    for round in 0..20 {
+        tokio::time::advance(Duration::from_secs(7)).await;
+        for s in &mut servers {
+            s.leases.tick().await;
+            let _ = s.warmer.pass().await;
+        }
+        if check(10_000 + round) {
+            let epoch = spy
+                .lease(
+                    &leep_core::LeaseKey::index(HistoryTree::NAME),
+                    leep_core::LeaseTiming {
+                        ttl: Duration::from_secs(15),
+                        stale_after: Duration::from_secs(6),
+                    },
+                )
+                .await
+                .unwrap()
+                .map_or(0, |l| l.epoch);
+            eprintln!("seed {seed}: {kills} kills, history lease epoch {epoch}");
+            return;
+        }
+    }
+    panic!("seed {seed}: the indexes never completed");
+}
+
+type RowsByKey = BTreeMap<(String, leep_core::Hash), Bytes>;
+
+#[tokio::test(start_paused = true)]
+async fn index_holders_killed_paused_and_racing_store_the_fault_free_rows() {
+    use crate::derived::{derive, HistoryTree, LogFilterIndex};
+    let blobs = Arc::new(MemoryBlobStore::new());
+    let truth_meta = Tamper::new(Arc::new(MemoryMetaStore::new()));
+    let truth = Repo::new(blobs.clone(), truth_meta.clone()).with_derive_jobs(1);
+    let ids = lanes_history(&truth, 160).await;
+    let tip = *ids.last().unwrap();
+    // Heads: the octopus and a few older lane tips, so passes have several.
+    let heads = vec![tip, ids[40], ids[97], ids[133]];
+    for h in &heads {
+        derive::<HistoryTree>(&truth, *h).await.unwrap();
+        derive::<LogFilterIndex>(&truth, *h).await.unwrap();
+    }
+    let truth_rows = truth_meta.rows();
+    let mut parents: HashMap<leep_core::Hash, Vec<ChangesetId>> = HashMap::new();
+    for id in &ids {
+        parents.insert(id.0, truth.get_changeset(*id).await.unwrap().parents);
+    }
+    for seed in seeds().step_by(5) {
+        index_holders_under_faults(seed, &truth, &truth_rows, &parents, &heads).await;
+    }
+}
+
+/// ADR 0058 section 6: a tool that drops an index takes its lease and waits
+/// the fence before deleting, so a write a paused former holder still had
+/// in flight lands before the drop, not after it. Without the fence the
+/// late write leaves rows whose parents' rows the drop removed.
+#[tokio::test(start_paused = true)]
+async fn a_fence_holds_a_drop_back_until_a_paused_holder_write_lands() {
+    use crate::derived::{derive, DerivedKind, HistoryTree, HISTORY_NODE_KIND};
+    use crate::indexing::{IndexGroup, IndexLeaseConfig, IndexLeases, ToolLease};
+    for fence in [Duration::from_secs(5), Duration::ZERO] {
+        let blobs = Arc::new(MemoryBlobStore::new());
+        let meta = Arc::new(clocked_meta());
+        let clean = Repo::new(blobs.clone(), meta.clone());
+        let ids = lanes_history(&clean, 200).await;
+        let tip = *ids.last().unwrap();
+        // The lower part is indexed already; the holder derives the rest.
+        derive::<HistoryTree>(&clean, ids[100]).await.unwrap();
+        meta.cas_ref("main", None, Some(tip)).await.unwrap();
+        // The holder's writes reach the store 8 s late.
+        let plan = FaultPlan::new(1);
+        plan.script(Op::PutDerived, 1, Fault::Delay(Duration::from_secs(8)));
+        let faulty: Arc<dyn MetaStore> = Arc::new(FaultyMetaStore::new(meta.clone(), plan.clone()));
+        let holder = Repo::new(blobs.clone(), faulty.clone());
+        let leases = IndexLeases::new(
+            faulty,
+            IndexLeaseConfig::new("holder", "").with_candidates(vec![IndexGroup::History]),
+        );
+        leases.tick().await;
+        assert!(leases.holds(IndexGroup::History));
+        let mut warmer = crate::warm::Warmer::new(holder, false).with_leases(leases.clone());
+        let warming = tokio::spawn(async move {
+            let _ = warmer.pass().await;
+        });
+        // The holder reaches its delayed write, then pauses (no renewals);
+        // once its lease is stale the tool takes it, waits the fence, and
+        // drops the kind.
+        while plan.calls(Op::PutDerived) == 0 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(Duration::from_secs(7)).await;
+        let say = |_: &str| {};
+        let tool = ToolLease::take(
+            meta.clone(),
+            "repair-drop",
+            &[IndexGroup::History],
+            false,
+            fence,
+            &say,
+        )
+        .await
+        .unwrap();
+        for k in [HistoryTree::NAME, HISTORY_NODE_KIND] {
+            meta.delete_derived_kind(k).await.unwrap();
+        }
+        warming.await.unwrap();
+        let left = meta
+            .list_derived(HistoryTree::NAME, None, usize::MAX)
+            .await
+            .unwrap();
+        let mut orphans = 0;
+        for (key, _) in &left {
+            for p in clean
+                .get_changeset(ChangesetId(*key))
+                .await
+                .unwrap()
+                .parents
+            {
+                if meta
+                    .get_derived(HistoryTree::NAME, &p.0)
+                    .await
+                    .unwrap()
+                    .is_none()
+                {
+                    orphans += 1;
+                }
+            }
+        }
+        tool.release().await;
+        if fence.is_zero() {
+            assert!(
+                orphans > 0,
+                "without a fence the late write leaves orphaned rows"
+            );
+        } else {
+            assert_eq!(left.len(), 0, "the late write landed before the drop");
+        }
     }
 }

@@ -31,6 +31,8 @@ struct PathWalk {
     path: String,
     seen: HashSet<ChangesetId>,
     heap: BinaryHeap<(u64, ChangesetId)>,
+    /// Changesets without a row found to have changed the path.
+    known: HashSet<ChangesetId>,
 }
 
 impl PathWalk {
@@ -39,6 +41,7 @@ impl PathWalk {
             path: path.to_string(),
             seen: HashSet::new(),
             heap: BinaryHeap::new(),
+            known: HashSet::new(),
         };
         match &from.seeds {
             // A page's queue: changesets that changed the path, as queued.
@@ -65,7 +68,16 @@ impl PathWalk {
         })
     }
 
+    /// Queue what changed the path at or below `at`: its index entry's
+    /// newest changes, or, in a bounded query (ADR 0058), `at` itself when
+    /// it has no row, to be examined directly.
     async fn push_frontier(&mut self, repo: &Repo, at: ChangesetId) -> Result<()> {
+        if repo.unindexed(at) {
+            if self.seen.insert(at) {
+                self.heap.push((repo.generation(at).await?, at));
+            }
+            return Ok(());
+        }
         let Some(entry) = repo.history_entry(at, &self.path).await? else {
             return Ok(());
         };
@@ -77,15 +89,58 @@ impl PathWalk {
         Ok(())
     }
 
+    /// The next changeset that changed the path. One without a row is
+    /// examined (changed relative to its first parent at the path, as in
+    /// `log_scan`) and its parents queued either way, so the walk yields
+    /// what the indexed walk yields, in the same order.
     async fn next(&mut self, repo: &Repo) -> Result<Option<(u64, ChangesetId, Changeset)>> {
-        let Some((generation, cid)) = self.heap.pop() else {
-            return Ok(None);
-        };
-        let cs = repo.get_changeset(cid).await?;
-        for &p in &cs.parents {
-            self.push_frontier(repo, p).await?;
+        loop {
+            let Some((generation, cid)) = self.heap.pop() else {
+                return Ok(None);
+            };
+            let cs = repo.get_changeset(cid).await?;
+            for &p in &cs.parents {
+                self.push_frontier(repo, p).await?;
+            }
+            if repo.unindexed(cid)
+                && !self.known.contains(&cid)
+                && !repo.examine_path(cid, &cs, &self.path).await?
+            {
+                continue;
+            }
+            return Ok(Some((generation, cid, cs)));
         }
-        Ok(Some((generation, cid, cs)))
+    }
+
+    /// Replace every queued changeset without a row by what it stands for:
+    /// itself if it changed the path, else its parents' frontier. The queue
+    /// then holds only changesets that changed the path, as the indexed
+    /// walk's does, so a page carries a `next` cursor exactly when the
+    /// indexed walk's would, and the cursor needs no marks.
+    async fn settle(&mut self, repo: &Repo) -> Result<()> {
+        if repo.bounded.is_none() {
+            return Ok(());
+        }
+        loop {
+            let (todo, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut self.heap)
+                .into_iter()
+                .partition(|(_, id)| repo.unindexed(*id) && !self.known.contains(id));
+            self.heap = keep.into_iter().collect();
+            if todo.is_empty() {
+                return Ok(());
+            }
+            for (generation, cid) in todo {
+                let cs = repo.get_changeset(cid).await?;
+                if repo.examine_path(cid, &cs, &self.path).await? {
+                    self.known.insert(cid);
+                    self.heap.push((generation, cid));
+                } else {
+                    for &p in &cs.parents {
+                        self.push_frontier(repo, p).await?;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -97,10 +152,19 @@ impl PathWalk {
 struct FollowWalk {
     seen: HashSet<(ChangesetId, Arc<str>)>,
     heap: BinaryHeap<(u64, ChangesetId, Arc<str>)>,
+    /// Changesets without a row found to have changed the name queued.
+    known: HashSet<(ChangesetId, Arc<str>)>,
 }
 
 impl FollowWalk {
     async fn push_frontier(&mut self, repo: &Repo, at: ChangesetId, path: &Arc<str>) -> Result<()> {
+        if repo.unindexed(at) {
+            if self.seen.insert((at, path.clone())) {
+                self.heap
+                    .push((repo.generation(at).await?, at, path.clone()));
+            }
+            return Ok(());
+        }
         let Some(entry) = repo.history_entry(at, path).await? else {
             return Ok(());
         };
@@ -125,6 +189,35 @@ impl FollowWalk {
                 .collect();
             (entries, false)
         })
+    }
+
+    /// [`PathWalk::settle`] for the names queued.
+    async fn settle(&mut self, repo: &Repo) -> Result<()> {
+        if repo.bounded.is_none() {
+            return Ok(());
+        }
+        loop {
+            let (todo, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut self.heap)
+                .into_iter()
+                .partition(|(_, id, name)| {
+                    repo.unindexed(*id) && !self.known.contains(&(*id, name.clone()))
+                });
+            self.heap = keep.into_iter().collect();
+            if todo.is_empty() {
+                return Ok(());
+            }
+            for (generation, cid, name) in todo {
+                let cs = repo.get_changeset(cid).await?;
+                if repo.examine_path(cid, &cs, &name).await? {
+                    self.known.insert((cid, name.clone()));
+                    self.heap.push((generation, cid, name));
+                } else {
+                    for &p in &cs.parents {
+                        self.push_frontier(repo, p, &name).await?;
+                    }
+                }
+            }
+        }
     }
 
     /// Pop every name the newest changeset is queued under.
@@ -1432,6 +1525,7 @@ impl Repo {
                 renamed: None,
             });
         }
+        walk.settle(self).await?;
         Ok(LogPageRaw {
             entries: out,
             rest: walk.rest(),
@@ -1522,6 +1616,7 @@ impl Repo {
         let mut walk = FollowWalk {
             seen: HashSet::new(),
             heap: BinaryHeap::new(),
+            known: HashSet::new(),
         };
         match &from.seeds {
             Some(seeds) => {
@@ -1536,10 +1631,30 @@ impl Repo {
         }
         let mut out = Vec::new();
         while out.len() < limit {
-            let Some((generation, cid, names)) = walk.pop_group() else {
+            let Some((generation, cid, mut names)) = walk.pop_group() else {
                 break;
             };
             let cs = self.get_changeset(cid).await?;
+            if self.unindexed(cid) {
+                // Without a row: keep the names it changed, and follow the
+                // others into its parents unchanged.
+                let mut changed = Vec::with_capacity(names.len());
+                for name in names {
+                    if walk.known.contains(&(cid, name.clone()))
+                        || self.examine_path(cid, &cs, &name).await?
+                    {
+                        changed.push(name);
+                    } else {
+                        for &p in &cs.parents {
+                            walk.push_frontier(self, p, &name).await?;
+                        }
+                    }
+                }
+                if changed.is_empty() {
+                    continue;
+                }
+                names = changed;
+            }
             let mut renames = None;
             let mut shown: Option<(Arc<str>, Option<RenameEntry>)> = None;
             for name in names {
@@ -1578,6 +1693,7 @@ impl Repo {
                 renamed,
             });
         }
+        walk.settle(self).await?;
         Ok(LogPageRaw {
             entries: out,
             rest: walk.rest(),
