@@ -17,8 +17,8 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use leep_core::api::{
-    CasRefRequest, CreateChangesetResponse, LandId, LandRequest, LandResponse, LogResponse,
-    RefResponse,
+    CasRefRequest, ChangesetInfo, CreateChangesetResponse, LandId, LandRequest, LandResponse,
+    LogResponse, RefResponse,
 };
 use leep_core::{Changeset, ChangesetId, FileChange, FileKind, Hash, RepoPath};
 use reqwest::{Client, Method, StatusCode};
@@ -209,6 +209,9 @@ struct Tally {
     status_409: u64,
     resends: u64,
     rebased: u64,
+    /// Sent a land inside the window.
+    sent_in_window: bool,
+    /// Had a land answered (landed or conflicts) inside the window.
     answered_in_window: bool,
     /// Markers of lands answered `Landed`.
     landed: Vec<String>,
@@ -495,6 +498,9 @@ async fn agent(s: Arc<Shared>, who: usize, start_after: Duration) -> Tally {
             land_id,
         })
         .expect("encodes");
+        if s.measuring.load(Ordering::Relaxed) && !s.stop.load(Ordering::Relaxed) {
+            t.sent_in_window = true;
+        }
         let t0 = Instant::now();
         let mut tries = 0;
         let answer = loop {
@@ -591,9 +597,15 @@ fn pct(sorted: &[u64], p: f64) -> f64 {
     sorted[i] as f64 / 1000.0
 }
 
-/// Generations the head is ahead of the newest changeset in its first
-/// `window` log entries that has a row of `kind`.
-async fn lag_sample(s: &Shared, pool: &sqlx::PgPool) -> Result<(u64, u64)> {
+/// Generations the head is ahead of the newest head this run saw that has
+/// a row of each index kind: one ref read, one indexed query per kind over
+/// the heads seen (at most 4096 ids) and a changeset read per generation
+/// needed. Cheap enough to run every few seconds beside the load.
+async fn lag_sample(
+    s: &Shared,
+    pool: &sqlx::PgPool,
+    generations: &mut HashMap<ChangesetId, u64>,
+) -> Result<(u64, u64)> {
     let Answer::Ok(r) = s
         .call::<RefResponse>(0, Method::GET, &format!("/v1/refs/{}", s.args.target), None)
         .await
@@ -601,18 +613,12 @@ async fn lag_sample(s: &Shared, pool: &sqlx::PgPool) -> Result<(u64, u64)> {
         bail!("reading the ref");
     };
     let head = r.target.context("no head")?;
-    let Answer::Ok(log) = s
-        .call::<LogResponse>(0, Method::GET, &format!("/v1/log/{head}?limit=2000"), None)
-        .await
-    else {
-        bail!("reading the log");
+    let ring: Vec<ChangesetId> = {
+        let r = s.heads.ring.lock().unwrap();
+        r.iter().rev().copied().collect()
     };
-    let head_gen = log.entries.first().map_or(0, |e| e.generation);
-    let keys: Vec<Vec<u8>> = log
-        .entries
-        .iter()
-        .map(|e| e.id.0.as_bytes().to_vec())
-        .collect();
+    let keys: Vec<Vec<u8>> = ring.iter().map(|id| id.0.as_bytes().to_vec()).collect();
+    let head_gen = generation(s, head, generations).await?;
     let mut out = [0u64; 2];
     for (n, kind) in ["history-tree-v4", "log-filter-v1"].iter().enumerate() {
         let rows: Vec<(Vec<u8>,)> =
@@ -622,16 +628,65 @@ async fn lag_sample(s: &Shared, pool: &sqlx::PgPool) -> Result<(u64, u64)> {
                 .fetch_all(pool)
                 .await?;
         let have: HashSet<Vec<u8>> = rows.into_iter().map(|r| r.0).collect();
-        let newest = log
-            .entries
+        // The heads seen are in about the order they were made; the oldest
+        // seen bounds the lag when none of them is indexed.
+        let newest = ring
             .iter()
-            .find(|e| have.contains(e.id.0.as_bytes().as_slice()))
-            .map_or(head_gen.saturating_sub(log.entries.len() as u64), |e| {
-                e.generation
-            });
-        out[n] = head_gen - newest;
+            .find(|id| have.contains(id.0.as_bytes().as_slice()))
+            .or(ring.last())
+            .copied()
+            .unwrap_or(head);
+        out[n] = head_gen.saturating_sub(generation(s, newest, generations).await?);
     }
     Ok((out[0], out[1]))
+}
+
+async fn generation(
+    s: &Shared,
+    id: ChangesetId,
+    cache: &mut HashMap<ChangesetId, u64>,
+) -> Result<u64> {
+    if let Some(g) = cache.get(&id) {
+        return Ok(*g);
+    }
+    let Answer::Ok(info) = s
+        .call::<ChangesetInfo>(0, Method::GET, &format!("/v1/changesets/{id}"), None)
+        .await
+    else {
+        bail!("reading {id}");
+    };
+    cache.insert(id, info.generation);
+    Ok(info.generation)
+}
+
+/// Derived kinds the write path stores (create and land); every other kind
+/// is an index built by reads or the warmer.
+const WRITE_KINDS: &[&str] = &["root_tree", "generation", "skiplist", "rebased-origin-v1"];
+
+/// Logical bytes in the database: changesets, ref log and refs plus the
+/// write path's derived rows, and the other derived rows.
+async fn logical_bytes(pool: &sqlx::PgPool) -> Result<(i64, i64)> {
+    let base: i64 = sqlx::query_scalar(
+        "SELECT (SELECT COALESCE(SUM(octet_length(id) + octet_length(data)), 0) FROM changesets)::BIGINT \
+         + (SELECT COALESCE(SUM(pg_column_size(ref_log.*)), 0) FROM ref_log)::BIGINT \
+         + (SELECT COALESCE(SUM(pg_column_size(refs.*)), 0) FROM refs)::BIGINT",
+    )
+    .fetch_one(pool)
+    .await?;
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT kind, SUM(octet_length(key) + octet_length(value))::BIGINT FROM derived GROUP BY kind",
+    )
+    .fetch_all(pool)
+    .await?;
+    let (mut write, mut read) = (base, 0);
+    for (kind, bytes) in rows {
+        if WRITE_KINDS.contains(&kind.as_str()) {
+            write += bytes;
+        } else {
+            read += bytes;
+        }
+    }
+    Ok((write, read))
 }
 
 async fn db_bytes(pool: &sqlx::PgPool) -> Result<i64> {
@@ -766,7 +821,11 @@ struct Report {
     conflicts: u64,
     status_409: u64,
     resends: u64,
+    /// Agents that sent a land inside the window and had none answered there.
     stalled_agents: usize,
+    /// Agents that sent no land inside the window (still thinking, reading
+    /// or building one when it closed).
+    incomplete_cycles: usize,
     lands_per_server: Vec<u64>,
     double_lands: Option<usize>,
     lost_lands: Option<usize>,
@@ -778,6 +837,11 @@ struct Report {
     warmer_lag_history: Option<(u64, u64)>,
     warmer_lag_log_filter: Option<(u64, u64)>,
     db_bytes_per_land: Option<f64>,
+    /// Logical bytes per land written by the write path (changesets, ref
+    /// log, refs and their derived rows), and by indexes reads and the
+    /// warmer built.
+    write_bytes_per_land: Option<f64>,
+    index_bytes_per_land: Option<f64>,
     load_average: String,
 }
 
@@ -845,7 +909,7 @@ async fn main() -> Result<()> {
 
     let before = scrape(&client, &args.metrics).await;
     let bytes_before = match &pool {
-        Some(p) => Some(db_bytes(p).await?),
+        Some(p) => Some((db_bytes(p).await?, logical_bytes(p).await?)),
         None => None,
     };
     s.measuring.store(true, Ordering::Relaxed);
@@ -854,8 +918,9 @@ async fn main() -> Result<()> {
     let lag_task = pool.clone().map(|p| {
         let (s, lags) = (Arc::clone(&s), Arc::clone(&lags));
         tokio::spawn(async move {
+            let mut generations = HashMap::new();
             while !s.stop.load(Ordering::Relaxed) {
-                if let Ok((h, l)) = lag_sample(&s, &p).await {
+                if let Ok((h, l)) = lag_sample(&s, &p, &mut generations).await {
                     let mut g = lags.lock().unwrap();
                     g.0.push(h);
                     g.1.push(l);
@@ -869,11 +934,12 @@ async fn main() -> Result<()> {
     let elapsed = started.elapsed().as_secs_f64();
     let after = scrape(&client, &args.metrics).await;
     let mut tally = Tally::default();
-    let mut answered = 0;
+    let (mut stalled, mut incomplete) = (0, 0);
     let mut per_server = vec![0u64; s.servers.len()];
     for (i, t) in tasks.into_iter().enumerate() {
         let a = t.await?;
-        answered += usize::from(a.answered_in_window);
+        stalled += usize::from(a.sent_in_window && !a.answered_in_window);
+        incomplete += usize::from(!a.sent_in_window);
         per_server[i % s.servers.len()] += a.lands_in_window;
         for (k, v) in a.ops {
             tally.ops.entry(k).or_default().extend(v);
@@ -893,7 +959,7 @@ async fn main() -> Result<()> {
         t.await?;
     }
     let bytes_after = match &pool {
-        Some(p) => Some(db_bytes(p).await?),
+        Some(p) => Some((db_bytes(p).await?, logical_bytes(p).await?)),
         None => None,
     };
     let (doubles, lost) = if args.no_history_check {
@@ -911,6 +977,10 @@ async fn main() -> Result<()> {
     let d = |name: &str| metric(&after, name) - metric(&before, name);
     let batches = d("leep_land_batch_size_count");
     let landed_total = tally.landed.len() as u64;
+    let per_land = |before: Option<i64>, after: Option<i64>| match (before, after) {
+        (Some(b), Some(a)) if landed_total > 0 => Some((a - b) as f64 / landed_total as f64),
+        _ => None,
+    };
     let (mut lh, mut ll) = std::mem::take(&mut *lags.lock().unwrap());
     let report = Report {
         servers: s.servers.len(),
@@ -925,7 +995,8 @@ async fn main() -> Result<()> {
         conflicts: tally.conflicts,
         status_409: tally.status_409,
         resends: tally.resends,
-        stalled_agents: args.agents - answered,
+        stalled_agents: stalled,
+        incomplete_cycles: incomplete,
         lands_per_server: per_server,
         double_lands: doubles,
         lost_lands: lost,
@@ -950,10 +1021,9 @@ async fn main() -> Result<()> {
         land_recorded: d("leep_land_recorded_total"),
         warmer_lag_history: lag_summary(&mut lh),
         warmer_lag_log_filter: lag_summary(&mut ll),
-        db_bytes_per_land: match (bytes_before, bytes_after) {
-            (Some(b), Some(a)) if landed_total > 0 => Some((a - b) as f64 / landed_total as f64),
-            _ => None,
-        },
+        db_bytes_per_land: per_land(bytes_before.map(|b| b.0), bytes_after.map(|a| a.0)),
+        write_bytes_per_land: per_land(bytes_before.map(|b| b.1 .0), bytes_after.map(|a| a.1 .0)),
+        index_bytes_per_land: per_land(bytes_before.map(|b| b.1 .1), bytes_after.map(|a| a.1 .1)),
         load_average: std::fs::read_to_string("/proc/loadavg")
             .map(|l| l.split_whitespace().take(3).collect::<Vec<_>>().join(" "))
             .unwrap_or_default(),
@@ -990,11 +1060,11 @@ fn print_report(r: &Report) {
         r.load_average
     );
     println!(
-        "| lands | lands/s | rebased | conflicts | 409s | resends | CAS losses | batch mean | recorded-id answers | stalled agents | lands per server | double lands | lost lands | warmer lag history p50/max | log-filter p50/max | DB bytes/land |"
+        "| lands | lands/s | rebased | conflicts | 409s | resends | CAS losses | batch mean | recorded-id answers | stalled agents | incomplete cycles | lands per server | double lands | lost lands | warmer lag history p50/max | log-filter p50/max | DB bytes/land | write bytes/land | index bytes/land |"
     );
-    println!("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|");
+    println!("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|");
     println!(
-        "| {} | {:.1} | {} | {} | {} | {} | {} | {} | {} | {} of {} | {} | {} | {} | {} | {} | {} |",
+        "| {} | {:.1} | {} | {} | {} | {} | {} | {} | {} | {} of {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
         r.lands,
         r.lands_per_s,
         r.rebased,
@@ -1006,6 +1076,7 @@ fn print_report(r: &Report) {
         r.land_recorded,
         r.stalled_agents,
         r.agents,
+        r.incomplete_cycles,
         r.lands_per_server
             .iter()
             .map(u64::to_string)
@@ -1016,6 +1087,8 @@ fn print_report(r: &Report) {
         lag(r.warmer_lag_history),
         lag(r.warmer_lag_log_filter),
         r.db_bytes_per_land.map_or("-".into(), |b| format!("{b:.0}")),
+        r.write_bytes_per_land.map_or("-".into(), |b| format!("{b:.0}")),
+        r.index_bytes_per_land.map_or("-".into(), |b| format!("{b:.0}")),
     );
     println!("| op | count | p50 ms | p99 ms |");
     println!("|---|---|---|---|");

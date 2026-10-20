@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::fs;
 
 use clap::Args;
-use leep_core::api::{Conflict, LandId, LandRequest, LandResponse};
+use leep_core::api::{Conflict, LandId, LandRequest, LandResponse, FEATURE_LAND_ID};
 use leep_core::refname::MISSING_REF_MARKER;
 use leep_core::review::NEEDS_REVIEW_MARKER;
 use leep_core::signature::NOT_SIGNED_MARKER;
@@ -140,13 +140,62 @@ fn land_creating(
     result
 }
 
-/// The id of the land of `base` onto `target_ref`: the one a land without a
-/// final answer used (ADR 0057), or a new one, saved before it is sent.
-fn pending_land_id(ctx: &mut Ctx, base: ChangesetId, target_ref: &str) -> Result<LandId> {
-    if let Some(p) = &ctx.wc.state.pending_land {
-        if p.changeset == base && p.target_ref == target_ref {
-            return Ok(p.land_id.clone());
+/// What to do about a land an earlier run sent without a final answer.
+#[derive(Debug, PartialEq, Eq)]
+enum Pending {
+    /// None for this changeset and ref: a new land, with a new id.
+    New,
+    /// Send it again under its id: the server answers with the earlier
+    /// result if it applied.
+    Resend(LandId),
+    /// The server does not record land ids, and sending again could land it
+    /// twice (once its copy is past the server's landed-copy scan).
+    Ask,
+}
+
+fn pending(
+    p: Option<&PendingLand>,
+    base: ChangesetId,
+    target_ref: &str,
+    server_records_ids: impl FnOnce() -> Result<bool>,
+) -> Result<Pending> {
+    Ok(match p {
+        Some(p) if p.changeset == base && p.target_ref == target_ref => {
+            if server_records_ids()? {
+                Pending::Resend(p.land_id.clone())
+            } else {
+                Pending::Ask
+            }
         }
+        _ => Pending::New,
+    })
+}
+
+/// The id of the land of `base` onto `target_ref`: the one a land without a
+/// final answer used (ADR 0057), when the server records ids, or a new one,
+/// saved before it is sent.
+fn pending_land_id(ctx: &mut Ctx, base: ChangesetId, target_ref: &str) -> Result<LandId> {
+    let client = &ctx.client;
+    match pending(ctx.wc.state.pending_land.as_ref(), base, target_ref, || {
+        Ok(client
+            .server_features()?
+            .iter()
+            .any(|f| f == FEATURE_LAND_ID))
+    })? {
+        Pending::Resend(id) => return Ok(id),
+        Pending::Ask => {
+            ctx.wc.state.pending_land = None;
+            ctx.wc.save_state()?;
+            return Err(CliError::user(format!(
+                "an earlier `leep land` of {} onto {target_ref} got no answer, and it may have \
+                 landed; this server does not record land ids, so sending it again could land it twice",
+                short(base)
+            ))
+            .with_hint(format!(
+                "`leep reflog {target_ref}` shows `landed {base}` if it did; if not, run `leep land` again"
+            )));
+        }
+        Pending::New => {}
     }
     let land_id = new_land_id();
     ctx.wc.state.pending_land = Some(PendingLand {
@@ -305,5 +354,40 @@ fn apply(ctx: &Ctx, path: &str, change: &FileChange) -> Result<()> {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e.into()),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use leep_core::Hash;
+
+    #[test]
+    fn a_pending_land_is_resent_only_to_a_server_that_records_ids() {
+        let (a, b) = (
+            ChangesetId(Hash::of_blob(b"a")),
+            ChangesetId(Hash::of_blob(b"b")),
+        );
+        let id = new_land_id();
+        let p = PendingLand {
+            changeset: a,
+            target_ref: "main".into(),
+            land_id: id.clone(),
+        };
+        let ask = |p, cs, r: &str, has: Result<bool>| pending(p, cs, r, || has).ok();
+        assert_eq!(ask(None, a, "main", Ok(true)), Some(Pending::New));
+        assert_eq!(
+            ask(Some(&p), a, "main", Ok(true)),
+            Some(Pending::Resend(id))
+        );
+        assert_eq!(ask(Some(&p), a, "main", Ok(false)), Some(Pending::Ask));
+        // A server that cannot be asked is not taken for an old one: the
+        // land stays pending.
+        let down = Err(CliError::new(ErrorKind::Unreachable, "down"));
+        assert_eq!(ask(Some(&p), a, "main", down), None);
+        // Another changeset or ref is another land; the server is not asked.
+        let never = || -> Result<bool> { unreachable!() };
+        assert_eq!(pending(Some(&p), b, "main", never).ok(), Some(Pending::New));
+        assert_eq!(pending(Some(&p), a, "dev", never).ok(), Some(Pending::New));
     }
 }

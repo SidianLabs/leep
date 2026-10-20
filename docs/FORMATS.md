@@ -550,7 +550,10 @@ and are compiled into the binary. Rules:
 - Every schema change is a new numbered migration in both backends, plus a
   fixture of the schema it upgrades from in `migrate_tests.rs`.
 - Only 0001 is idempotent (`IF NOT EXISTS`); it must be, to finish databases
-  that predate the ref log. Later migrations run exactly once.
+  that predate the ref log. Later migrations run exactly once. The one
+  exception is 0005, whose Postgres columns and index (and SQLite index) are
+  `IF NOT EXISTS` so the index can be built by hand `CONCURRENTLY` first
+  (ADR 0057).
 - A migration runs in a transaction together with all the others pending in
   that run, so it must not contain statements that cannot (`CREATE INDEX
   CONCURRENTLY`, `VACUUM`).
@@ -864,7 +867,10 @@ hex digits (16 to 32 bytes), omitted when unset. Anything else is 400. A
 land carrying an id whose land `target_ref` already recorded answers with
 that land's `Landed` result and moves nothing; if the recorded land was of
 another changeset it is 400 (`land id ... already landed ...`). Old clients
-never send it and old servers ignore it. No response shape changed.
+never send it and old servers ignore it. `ReadyResponse` (`GET /v1/ready`)
+gains `features`, a list of strings omitted when empty and absent from older
+servers; a server that records land ids lists `land-id`. No other response
+shape changed.
 
 Stored as above ("SQL schema", migration 0005). `MetaStore` gains
 `find_lands(name, ids)`; `RefUpdateContext` gains `land`, which

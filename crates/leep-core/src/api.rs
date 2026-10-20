@@ -5,7 +5,7 @@
 //! |---|---|---|---|
 //! | GET  | `/v1/health` | – | `"ok"` (liveness: the process is up and serving HTTP; checks nothing else) |
 //! | GET  | `/v1/whoami` | – | [`WhoAmIResponse`] (the calling token's name, role and optional `author`; null when authentication is off) |
-//! | GET  | `/v1/ready` | – | [`ReadyResponse`] (readiness: 200 `{"status":"ready"}` when the metadata and blob stores each answered a cheap read within the server's ready timeout, else 503 with `failed` naming the stores) |
+//! | GET  | `/v1/ready` | – | [`ReadyResponse`] (readiness: 200 `{"status":"ready","features":[...]}` when the metadata and blob stores each answered a cheap read within the server's ready timeout, else 503 with `failed` naming the stores; `features` lists optional behaviours such as `land-id`, ADR 0057) |
 //! | PUT  | `/v1/blobs/{hash}` | raw bytes | 204; 400 if `Hash::of_blob(body) != hash` |
 //! | GET  | `/v1/blobs/{hash}` | – | raw bytes, or 404 |
 //! | POST | `/v1/blobs/missing` | [`MissingBlobsRequest`] | [`MissingBlobsResponse`]; 400 if over [`MAX_MISSING_BLOBS`] hashes |
@@ -144,7 +144,16 @@ pub struct ReadyResponse {
     pub status: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub failed: Vec<ReadyFailure>,
+    /// Optional behaviours this server has, for clients that must know
+    /// before relying on one (absent from older servers): see
+    /// [`FEATURE_LAND_ID`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub features: Vec<String>,
 }
+
+/// In [`ReadyResponse::features`]: the server records [`LandRequest::land_id`]
+/// and answers a repeat of a recorded land with its result (ADR 0057).
+pub const FEATURE_LAND_ID: &str = "land-id";
 
 /// One store that failed its readiness check.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -786,6 +786,34 @@ A failed migration rolls back completely and leaves the database as it was;
 fix the cause and run `migrate` again. Fresh SQLite and Postgres databases
 need no setup: the first server creates them at the current version.
 
+**Migration 5 (land ids, ADR 0057) on a large Postgres.** The migration adds
+two nullable columns to `ref_log` (instant) and builds a unique index on it,
+which holds a `SHARE` lock on `ref_log` for the whole build: no ref moves,
+so no lands, until it finishes. On a ref log of millions of entries, build
+it by hand first, beside the running v4 servers, without blocking writes:
+
+```sql
+ALTER TABLE ref_log ADD COLUMN IF NOT EXISTS land_id BYTEA;
+ALTER TABLE ref_log ADD COLUMN IF NOT EXISTS land_changeset BYTEA;
+CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS ref_log_land_id
+    ON ref_log (name, land_id) WHERE land_id IS NOT NULL;
+```
+
+(in the schema the servers use). A `CONCURRENTLY` build that fails leaves an
+invalid index under that name, which `IF NOT EXISTS` would then accept:
+check `SELECT indisvalid FROM pg_index WHERE indexrelid =
+'ref_log_land_id'::regclass` is true, and if not, `DROP INDEX CONCURRENTLY
+ref_log_land_id` and build it again. Then run `leep-server migrate`, which
+finds the columns and index and only records the version.
+
+**Upgrade every server before clients rely on land ids.** A v4 server
+ignores `land_id`, so it cannot answer a late retry with the earlier result;
+only the landed-copy scan (the last 1024 changesets) protects it. `leep
+land` resends a land saved in `state.json` from an earlier run only to a
+server whose `GET /v1/ready` lists `land-id` in `features`; against an
+older server it stops and says the land may have applied (check `leep
+reflog REF`). Other clients that resend across runs should do the same.
+
 **Derived kinds that change encoding.** A release that changes how a derived
 kind is stored gives it a new name, so old and new servers never read each
 other's rows; nothing to migrate. The new kind derives on first use, which on
