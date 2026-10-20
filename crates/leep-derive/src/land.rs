@@ -362,6 +362,7 @@ impl Repo {
             })
             .collect();
         let mut commit_errors = 0;
+        let mut lookup_errors = 0;
         let mut last_error = None;
         for attempt in 1..=MAX_LAND_ATTEMPTS {
             let start = match self.meta().get_ref(target_ref).await {
@@ -397,12 +398,23 @@ impl Repo {
                     }
                 }
             );
+            // A failed land id lookup holds back only the lands with ids, to
+            // the next attempt, until it has failed as often as a commit may.
+            match &recorded {
+                Ok(_) => lookup_errors = 0,
+                Err(_) => lookup_errors += 1,
+            }
+            let hold_keyed = recorded.is_err() && lookup_errors < MAX_COMMIT_ERRORS;
             let mut steps: Vec<RefStep> = Vec::new();
             let mut waiting: Vec<(InFlight, Result<Step>)> = Vec::new();
             let mut taken = Vec::new();
             for mut l in std::mem::take(&mut lands) {
                 if attempt == 1 && l.q.reply.is_closed() {
                     metrics::counter!("leep_land_cancelled_total").increment(1);
+                    continue;
+                }
+                if hold_keyed && l.q.ctx.land.is_some() {
+                    lands.push(l);
                     continue;
                 }
                 taken.push(l.q.cs);
@@ -425,6 +437,8 @@ impl Repo {
                 match step {
                     Ok(Step::Move(new)) => {
                         // A duplicate later in the batch answers with this.
+                        // Its log entry's `seq` is unknown until the commit,
+                        // and nothing in `land` reads it.
                         if let (Ok(r), Some(key)) = (&mut recorded, &l.q.ctx.land) {
                             r.insert(
                                 key.id.clone(),
@@ -453,12 +467,19 @@ impl Repo {
                 self.land_queues.batches.lock().unwrap().push(taken);
             }
             if steps.is_empty() {
-                return;
+                if lands.is_empty() {
+                    return;
+                }
+                tokio::time::sleep(backoff(attempt)).await;
+                continue;
             }
-            let flushed = staging.flush(self).await;
-            let applied = match flushed {
-                Err(e) => Err(e),
-                Ok(()) => self.commit_steps(target_ref, start, &steps).await,
+            // Whether an error came from the swap itself.
+            let applied = match staging.flush(self).await {
+                Err(e) => Err((e, false)),
+                Ok(()) => self
+                    .commit_steps(target_ref, start, &steps)
+                    .await
+                    .map_err(|e| (e, true)),
             };
             match applied {
                 Ok(n) => {
@@ -488,12 +509,21 @@ impl Repo {
                         l.answer(result, attempt, false);
                     }
                 }
+                // A land id another server recorded after this attempt's
+                // lookup (the ref came back to `start` meanwhile): the swap
+                // did not apply. Redo the attempt like a lost race; its lookup
+                // answers that land.
+                Err((Error::Conflict(_), true)) => {
+                    commit_errors = 0;
+                    metrics::counter!("leep_land_cas_losses_total").increment(1);
+                    lands.extend(waiting.into_iter().map(|(l, _)| l));
+                }
                 // The commit may or may not have applied. Another pass reads
                 // the head again and either finds each stack in it or replays.
-                Err(e) => {
+                Err((e, _)) => {
                     commit_errors += 1;
                     if commit_errors >= MAX_COMMIT_ERRORS {
-                        for (l, _) in waiting {
+                        for l in waiting.into_iter().map(|(l, _)| l).chain(lands) {
                             l.answer(Err(duplicate(&e)), attempt, false);
                         }
                         return;
