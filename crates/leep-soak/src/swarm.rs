@@ -195,6 +195,9 @@ struct Shared {
     measuring: AtomicBool,
     /// Files of the base tree, for blame.
     seeded_files: Vec<String>,
+    /// Generation of the head the run started from; the history check stops
+    /// there, so a run on a long history does not walk all of it.
+    base_generation: u64,
     land_ids_sent: AtomicU64,
 }
 
@@ -710,7 +713,7 @@ async fn history_markers(s: &Shared) -> Result<HashMap<String, u32>> {
     let head = r.target.context("no head")?;
     let mut after: Option<String> = None;
     loop {
-        let mut path = format!("/v1/log/{head}?limit=10000");
+        let mut path = format!("/v1/log/{head}?limit=1000");
         if let Some(a) = &after {
             path.push_str(&format!("&after={a}"));
         }
@@ -719,19 +722,28 @@ async fn history_markers(s: &Shared) -> Result<HashMap<String, u32>> {
             Answer::Status(c) => bail!("log page: {c}"),
             Answer::Lost(e) => bail!("log page: {e}"),
         };
+        let mut below_base = false;
         for e in &page.entries {
+            if e.generation <= s.base_generation {
+                below_base = true;
+                continue;
+            }
             if e.changeset.message.starts_with(&prefix) {
                 *counts.entry(e.changeset.message.clone()).or_default() += 1;
             }
         }
         match page.next {
-            Some(n) => after = Some(n),
-            None => return Ok(counts),
+            // The log is in descending generation order, so once it reaches
+            // the base no later page holds this run's lands.
+            Some(n) if !below_base => after = Some(n),
+            _ => return Ok(counts),
         }
     }
 }
 
-async fn setup(s: &Shared) -> Result<Vec<String>> {
+/// Seeds the target (unless it exists) and returns the base tree's files and
+/// the generation of the head the run starts from.
+async fn setup(s: &Shared) -> Result<(Vec<String>, u64)> {
     let mut files = Vec::new();
     let mut changes = BTreeMap::new();
     for d in 0..10 {
@@ -749,8 +761,15 @@ async fn setup(s: &Shared) -> Result<Vec<String>> {
         bail!("reading {}", s.args.target);
     };
     if let Some(h) = r.target {
+        let Answer::Ok(page) = s
+            .call::<LogResponse>(0, Method::GET, &format!("/v1/log/{h}?limit=1"), None)
+            .await
+        else {
+            bail!("reading the generation of {}", s.args.target);
+        };
+        let generation = page.entries.first().map_or(0, |e| e.generation);
         s.heads.push(h);
-        return Ok(files);
+        return Ok((files, generation));
     }
     for f in &files {
         let data = format!("{f}\nline 2\nline 3\n").into_bytes();
@@ -797,7 +816,7 @@ async fn setup(s: &Shared) -> Result<Vec<String>> {
         _ => bail!("creating {}", s.args.target),
     }
     s.heads.push(created.id);
-    Ok(files)
+    Ok((files, 0))
 }
 
 #[derive(Serialize)]
@@ -884,9 +903,10 @@ async fn main() -> Result<()> {
         stop: AtomicBool::new(false),
         measuring: AtomicBool::new(false),
         seeded_files: Vec::new(),
+        base_generation: 0,
         land_ids_sent: AtomicU64::new(0),
     };
-    shared.seeded_files = setup(&shared).await?;
+    (shared.seeded_files, shared.base_generation) = setup(&shared).await?;
     let s = Arc::new(shared);
     let pool = match &args.database_url {
         Some(u) => Some(
