@@ -10,7 +10,9 @@ use std::time::{Duration, Instant};
 
 use leep_core::api::{LandResponse, RebaseResponse};
 use leep_core::refname::{self, MISSING_REF_MARKER, NOT_FORWARD_MARKER};
-use leep_core::{ChangesetId, Error, RefStep, RefUpdateContext, Result};
+use leep_core::{
+    ChangesetId, Error, LandId, LandKey, LandRecord, RefStep, RefUpdateContext, Result,
+};
 use tokio::sync::oneshot;
 
 use crate::land_stage::Staging;
@@ -147,6 +149,33 @@ enum Step {
     Move(ChangesetId),
 }
 
+/// The answer for a land whose id the ref already recorded: that land's
+/// result, or `Invalid` if the id named another changeset. `None` when the
+/// land must run.
+fn recorded_step(
+    q: &Queued,
+    recorded: &Result<HashMap<LandId, LandRecord>>,
+    attempt: u32,
+) -> Option<Result<Step>> {
+    let key = q.ctx.land.as_ref()?;
+    let found = match recorded {
+        Ok(found) => found.get(&key.id)?,
+        Err(e) => return Some(Err(duplicate(e))),
+    };
+    if found.changeset != key.changeset {
+        return Some(Err(Error::Invalid(format!(
+            "land id {} already landed {}; use a new land id to land {}",
+            key.id, found.changeset, key.changeset
+        ))));
+    }
+    metrics::counter!("leep_land_recorded_total").increment(1);
+    Some(Ok(Step::Done(LandResponse::Landed {
+        landed: found.landed,
+        rebased: found.landed != key.changeset,
+        attempts: attempt,
+    })))
+}
+
 fn is_move(step: &Result<Step>) -> bool {
     matches!(step, Ok(Step::Move(_)))
 }
@@ -247,11 +276,27 @@ impl Repo {
         actor: Option<&str>,
         create: bool,
     ) -> Result<LandResponse> {
+        self.land_keyed(cs, target_ref, actor, create, None).await
+    }
+
+    /// [`land_with`](Self::land_with) under the client's `land_id`
+    /// (ADR 0057): the move records it, and a land whose id the ref already
+    /// recorded answers with that land's result instead of landing again,
+    /// however many lands came after it.
+    pub async fn land_keyed(
+        &self,
+        cs: ChangesetId,
+        target_ref: &str,
+        actor: Option<&str>,
+        create: bool,
+        land_id: Option<LandId>,
+    ) -> Result<LandResponse> {
         let started = Instant::now();
         let mut stats = LandStats::default();
         let ctx = RefUpdateContext::new("land")
             .actor(actor)
-            .message(format!("landed {cs}"));
+            .message(format!("landed {cs}"))
+            .land(land_id.map(|id| LandKey { id, changeset: cs }));
         let result = self
             .land_inner(cs, target_ref, create, ctx, &mut stats)
             .await;
@@ -335,7 +380,10 @@ impl Repo {
             let staged = staging.repo(self);
             // Origins read by this attempt's landed-copy scans: the lands
             // of a batch walk the same stretch of history.
-            let (_, mut origins) = tokio::join!(
+            let (mut recorded, _, mut origins) = tokio::join!(
+                // After the head: a land recorded since would have moved it,
+                // so the swap from `start` cannot repeat it.
+                self.recorded_lands(target_ref, &lands),
                 async {
                     // A lone land reads no more than the prefetch would.
                     if ids.len() > 1 {
@@ -359,19 +407,34 @@ impl Repo {
                 }
                 taken.push(l.q.cs);
                 let repo = staging.repo(&l.q.repo);
-                let step = repo
-                    .land_step(
-                        l.q.cs,
-                        l.q.create,
-                        head,
-                        target_ref,
-                        attempt,
-                        &mut l.checked,
-                        &mut origins,
-                    )
-                    .await;
+                let step = match recorded_step(&l.q, &recorded, attempt) {
+                    Some(step) => step,
+                    None => {
+                        repo.land_step(
+                            l.q.cs,
+                            l.q.create,
+                            head,
+                            target_ref,
+                            attempt,
+                            &mut l.checked,
+                            &mut origins,
+                        )
+                        .await
+                    }
+                };
                 match step {
                     Ok(Step::Move(new)) => {
+                        // A duplicate later in the batch answers with this.
+                        if let (Ok(r), Some(key)) = (&mut recorded, &l.q.ctx.land) {
+                            r.insert(
+                                key.id.clone(),
+                                LandRecord {
+                                    changeset: key.changeset,
+                                    landed: new,
+                                    seq: 0,
+                                },
+                            );
+                        }
                         steps.push(RefStep {
                             new: Some(new),
                             ctx: l.q.ctx.clone(),
@@ -456,6 +519,28 @@ impl Repo {
                 ),
             }
         }
+    }
+
+    /// What `target_ref` recorded for the land ids in `lands`; nothing is read
+    /// when none carries one.
+    async fn recorded_lands(
+        &self,
+        target_ref: &str,
+        lands: &[InFlight],
+    ) -> Result<HashMap<LandId, LandRecord>> {
+        let ids: Vec<LandId> = lands
+            .iter()
+            .filter_map(|l| l.q.ctx.land.as_ref().map(|k| k.id.clone()))
+            .collect();
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let found = self.meta().find_lands(target_ref, &ids).await?;
+        Ok(ids
+            .into_iter()
+            .zip(found)
+            .filter_map(|(id, r)| r.map(|r| (id, r)))
+            .collect())
     }
 
     /// One land the way it ran before batches were staged: replayed straight

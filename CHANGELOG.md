@@ -172,6 +172,21 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   and `--json` stay plain and unpaged. No new dependency.
 
 ### Hardening
+- Land ids (ADR 0057): `POST /v1/land` takes an optional `land_id` (16 to 32
+  random bytes, hex), the same on every retry of one land. The server stores
+  it in the ref log entry of the move, in the same transaction, and answers a
+  later land with that id with the original result, however many lands came
+  in between, instead of landing the stack a second time; reusing an id for
+  another changeset is 400. Before, a retry was recognised only while its
+  rebased copy was among the last 1024 changesets, which a busy ref passes in
+  under a minute. `leep land` keeps the id in `state.json` until it has an
+  answer and resends a keyed land after a timeout, a 5xx or a lost
+  connection; the MCP server reuses the id when the same land is called
+  again. Migration 0005 adds the nullable `ref_log.land_id` and
+  `land_changeset` columns and a unique index; it runs beside v4 servers.
+  `MetaStore` gains `find_lands`, `RefUpdateContext` gains `land`, and
+  `MetaStore` wrappers must forward `find_lands`. New metric
+  `leep_land_recorded_total`.
 - Fuzz targets for every decoder and parser: persisted objects, derived
   rows, API bodies, the router, `OWNERS` and the server's config files, the
   comment lexer, rename detection, ref names, paths and the search planner.

@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use leep_core::{ChangesetId, FileKind, Hash, RepoPath};
+use leep_core::{ChangesetId, FileKind, Hash, LandId, RepoPath};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{CliError, Result};
@@ -125,6 +125,19 @@ pub struct State {
     pub merge_in_progress: Option<MergeState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pick_in_progress: Option<PickState>,
+    /// A land sent without a final answer (ADR 0057): running `leep land`
+    /// again for the same changeset and ref reuses its id, so the server
+    /// answers with the earlier result instead of landing twice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_land: Option<PendingLand>,
+}
+
+/// See [`State::pending_land`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingLand {
+    pub changeset: ChangesetId,
+    pub target_ref: String,
+    pub land_id: LandId,
 }
 
 #[derive(Debug)]
@@ -535,6 +548,7 @@ mod tests {
         assert!(st.merge_in_progress.is_none() && st.pick_in_progress.is_none());
         let out = serde_json::to_string(&st).unwrap();
         assert!(!out.contains("in_progress"), "unset fields are not written");
+        assert!(st.pending_land.is_none() && !out.contains("pending_land"));
     }
 
     #[test]

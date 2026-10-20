@@ -429,6 +429,17 @@ always points at an existing changeset. Postgres serializes the final insert of
 each ref move with an advisory lock (key 7164738) so `seq` follows commit order;
 it is held for the length of one insert.
 
+A land that names itself with a `land_id` (ADR 0057; `leep land` and
+`leep-mcp` always do) has the id stored in its entry. That is how a retry of
+the land, however late, is answered with the original result instead of
+landing twice, so the ids are kept with the log: about 120 more bytes per
+keyed land, index included. Never prune or rewrite `ref_log` by hand; a
+removed entry takes its id with it, and a retry older than that falls back
+to the landed-copy scan, which only sees the last 1024 changesets.
+`leep_land_recorded_total` counts lands answered from a recorded id: a
+steady rate means clients are retrying lands that had already applied
+(timeouts, restarts), which is expected in small numbers.
+
 ## Git mirror
 
 `leep-git mirror run` keeps a git remote (GitHub, GitLab, any server git
