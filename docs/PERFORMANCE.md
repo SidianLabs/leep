@@ -394,7 +394,9 @@ arrive together all claim the free lease at the start, each claim succeeded
 as the same holder at epoch 1, and each was counted. Only the first claim of
 an epoch counts now. Lease calls also use connections of their own, so a
 renewal can no longer queue behind 256 agents' uploads for the takeover
-window.
+window. Six more such runs after the lease table became the generic
+`leases` table, on a busier host (load average 8 to 26), again took the
+lease once each and lost none.
 
 **Throughput.** It is 75 to 91% of one server's at the same total number of
 agents, short of the 95% target ADR 0056 set. All the processes share one

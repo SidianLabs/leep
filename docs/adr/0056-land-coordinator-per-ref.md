@@ -340,7 +340,8 @@ and one set of lease connections shared by all scopes. Still migration
   nothing twice, and the ref log replays.
 - **End-to-end.** The crash test gains three servers on Postgres. Each
   round SIGKILLs the lease holder and requires every agent to land again
-  within TTL + 2 s; the longest wait measured was 1.25 s. The usual
+  within TTL + 2 s; with takeover at the TTL the longest waits measured
+  were 2.1 to 2.4 s (1.25 s before, when takeover came at 1 s). The usual
   exactness checks follow: every commit once, one ref move per land. A
   second test starts a server with a wrong `--advertise-url`, or one
   outside its allow-list, and expects it to refuse.
