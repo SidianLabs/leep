@@ -4081,6 +4081,9 @@ mod ref_log {
 
 mod warm {
     use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    use leep_core::MetaStore;
 
     use leep_testkit::{FaultPlan, FaultyMetaStore};
 
@@ -4207,6 +4210,223 @@ mod warm {
             calls, alone,
             "two concurrent derivations did the work of one"
         );
+    }
+
+    /// A history of two branches off a shared trunk, each on its own ref,
+    /// with a merge on `main`; returns the refs' heads.
+    async fn branchy(r: &Repo) -> Vec<(String, ChangesetId)> {
+        let mut trunk = commit(r, &[], &[("a", Some("0"))], "base").await;
+        for i in 0..12 {
+            trunk = commit(r, &[trunk], &[("t", Some(&i.to_string()))], "t").await;
+        }
+        let (mut left, mut right) = (trunk, trunk);
+        for i in 0..15 {
+            left = commit(r, &[left], &[("l/x", Some(&i.to_string()))], "l").await;
+            right = commit(r, &[right], &[("r/y", Some(&i.to_string()))], "r").await;
+        }
+        let main = commit(r, &[left, right], &[("m", Some("1"))], "merge").await;
+        vec![
+            ("main".into(), main),
+            ("left".into(), left),
+            ("right".into(), right),
+            ("trunk".into(), trunk),
+        ]
+    }
+
+    async fn rows_of<K: DerivedKind>(r: &Repo) -> Vec<(leep_core::Hash, bytes::Bytes)> {
+        r.meta()
+            .list_derived(K::NAME, None, usize::MAX)
+            .await
+            .unwrap()
+    }
+
+    /// Several heads derive as one range: each changeset once, and the same
+    /// rows as deriving each head alone, with any number of jobs.
+    #[tokio::test]
+    async fn derive_heads_matches_one_head_at_a_time() {
+        let serial = repo().with_derive_jobs(1);
+        let heads = branchy(&serial).await;
+        for (_, h) in &heads {
+            derived::derive::<HistoryTree>(&serial, *h).await.unwrap();
+            derived::derive::<derived::LogFilterIndex>(&serial, *h)
+                .await
+                .unwrap();
+        }
+        for jobs in [1, 4] {
+            let r = repo().with_derive_jobs(jobs);
+            let heads = branchy(&r).await;
+            let ids: Vec<ChangesetId> = heads.iter().map(|(_, h)| *h).collect();
+            let before = r.derive_calls.load(Ordering::Relaxed);
+            assert_eq!(
+                derived::derive_heads::<HistoryTree>(&r, &ids)
+                    .await
+                    .unwrap(),
+                4
+            );
+            // 1 + 12 + 30 + 1 changesets, each derived once.
+            assert_eq!(rows_of::<HistoryTree>(&r).await.len(), 44);
+            let history_calls = r.derive_calls.load(Ordering::Relaxed) - before;
+            derived::derive_heads::<derived::LogFilterIndex>(&r, &ids)
+                .await
+                .unwrap();
+            assert_eq!(
+                rows_of::<HistoryTree>(&r).await,
+                rows_of::<HistoryTree>(&serial).await
+            );
+            assert_eq!(
+                rows_of::<derived::LogFilterIndex>(&r).await,
+                rows_of::<derived::LogFilterIndex>(&serial).await
+            );
+            // Again: nothing missing, nothing derived.
+            let calls = r.derive_calls.load(Ordering::Relaxed);
+            assert_eq!(
+                derived::derive_heads::<HistoryTree>(&r, &ids)
+                    .await
+                    .unwrap(),
+                0
+            );
+            assert_eq!(r.derive_calls.load(Ordering::Relaxed), calls);
+            assert!(history_calls >= 44);
+        }
+    }
+
+    /// After the first full listing a pass reads only the ref log: it looks
+    /// at the refs that moved, not at every ref.
+    #[tokio::test]
+    async fn passes_follow_the_ref_log() {
+        let r = repo();
+        let base = commit(&r, &[], &[("a", Some("0"))], "base").await;
+        for i in 0..10 {
+            r.meta()
+                .cas_ref(&format!("r{i}"), None, Some(base))
+                .await
+                .unwrap();
+        }
+        let mut w = Warmer::new(r.clone(), false);
+        let report = w.pass().await.unwrap();
+        assert_eq!((report.refs, report.warmed), (10, 10));
+        assert_eq!(w.pass().await.unwrap(), WarmReport::default());
+
+        let next = commit(&r, &[base], &[("b", Some("1"))], "next").await;
+        r.meta()
+            .cas_ref("r3", Some(base), Some(next))
+            .await
+            .unwrap();
+        r.meta().cas_ref("r4", Some(base), None).await.unwrap();
+        let report = w.pass().await.unwrap();
+        assert_eq!(
+            report,
+            WarmReport {
+                refs: 1,
+                warmed: 1,
+                failed: 0
+            }
+        );
+        assert!(has_history(&r, next).await);
+        // A ref moved away and back is looked at, but is already warm.
+        r.meta()
+            .cas_ref("r5", Some(base), Some(next))
+            .await
+            .unwrap();
+        r.meta()
+            .cas_ref("r5", Some(next), Some(base))
+            .await
+            .unwrap();
+        let report = w.pass().await.unwrap();
+        assert_eq!((report.refs, report.warmed), (1, 0));
+    }
+
+    /// More moves than the tail reads in a pass: it lists every ref instead,
+    /// and still warms the heads.
+    #[tokio::test]
+    async fn a_long_gap_falls_back_to_listing_refs() {
+        let r = repo();
+        let a = commit(&r, &[], &[("a", Some("0"))], "a").await;
+        let b = commit(&r, &[a], &[("a", Some("1"))], "b").await;
+        r.meta().cas_ref("other", None, Some(a)).await.unwrap();
+        r.meta().cas_ref("main", None, Some(a)).await.unwrap();
+        let mut w = Warmer::new(r.clone(), false);
+        w.pass().await.unwrap();
+        let mut head = a;
+        for _ in 0..(256 * 16 + 1) {
+            let next = if head == a { b } else { a };
+            r.meta()
+                .cas_ref("main", Some(head), Some(next))
+                .await
+                .unwrap();
+            head = next;
+        }
+        let c = commit(&r, &[b], &[("c", Some("2"))], "c").await;
+        r.meta().cas_ref("main", Some(head), Some(c)).await.unwrap();
+        let report = w.pass().await.unwrap();
+        assert_eq!((report.refs, report.warmed), (2, 1), "every ref listed");
+        assert!(has_history(&r, c).await);
+    }
+
+    /// With a 250 ms pass, a moved head is indexed within about a second,
+    /// where the old 30 s poll left it un-indexed for up to that long.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn moved_heads_are_indexed_within_a_second() {
+        let r = repo();
+        let mut head = commit(&r, &[], &[("a", Some("0"))], "base").await;
+        r.meta().cas_ref("main", None, Some(head)).await.unwrap();
+        let task = Warmer::new(r.clone(), true).spawn(Duration::from_millis(250));
+        for i in 0..20 {
+            let next = commit(&r, &[head], &[("f", Some(&i.to_string()))], "c").await;
+            r.meta()
+                .cas_ref("main", Some(head), Some(next))
+                .await
+                .unwrap();
+            head = next;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let moved = std::time::Instant::now();
+        while !has_history(&r, head).await {
+            assert!(
+                moved.elapsed() < Duration::from_secs(3),
+                "head not indexed 3 s after it moved"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        task.abort();
+    }
+
+    /// Two warmers on one store, as two servers would run, race over the
+    /// same moves: every row is stored, and the rows are those one serial
+    /// derivation gives.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn racing_warmers_store_the_same_rows() {
+        let meta: Arc<dyn MetaStore> = Arc::new(MemoryMetaStore::new());
+        let blobs: Arc<dyn leep_core::BlobStore> = Arc::new(MemoryBlobStore::new());
+        let a = Repo::new(blobs.clone(), meta.clone()).with_derive_jobs(2);
+        let b = Repo::new(blobs, meta).with_derive_jobs(3);
+        let heads = branchy(&a).await;
+        for (name, h) in &heads {
+            a.meta().cas_ref(name, None, Some(*h)).await.unwrap();
+        }
+        let mut wa = Warmer::new(a.clone(), true).with_full_listing_every(Duration::ZERO);
+        let mut wb = Warmer::new(b.clone(), true);
+        let (ra, rb) = tokio::join!(wa.pass(), wb.pass());
+        assert_eq!(ra.unwrap().failed + rb.unwrap().failed, 0);
+
+        let serial = repo().with_derive_jobs(1);
+        for (_, h) in branchy(&serial).await {
+            derived::derive::<HistoryTree>(&serial, h).await.unwrap();
+            derived::derive::<derived::LogFilterIndex>(&serial, h)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            rows_of::<HistoryTree>(&a).await,
+            rows_of::<HistoryTree>(&serial).await
+        );
+        assert_eq!(
+            rows_of::<derived::LogFilterIndex>(&b).await,
+            rows_of::<derived::LogFilterIndex>(&serial).await
+        );
+        // Nothing left for either.
+        assert_eq!(wa.pass().await.unwrap().warmed, 0);
+        assert_eq!(wb.pass().await.unwrap().warmed, 0);
     }
 }
 

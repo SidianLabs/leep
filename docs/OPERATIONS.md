@@ -54,8 +54,9 @@ measured until the response head is ready, not until the body is streamed.
 | `leep_land_routed_total` | counter | `route` = `uncoordinated` | Lands batched here with coordination on but no lease: no live lease was known and none could be taken (the store failing). They race the CAS as without coordination. |
 | `leep_derive_total` | counter | `kind` | Derived values computed (cache hits in the meta store are not counted). |
 | `leep_derive_duration_seconds` | histogram | `kind` | Time to compute one derived value. |
-| `leep_warm_refs_total` | counter | `result` = `ok`, `error` | Ref heads the background warmer derived indexes for (ADR 0028). Errors are retried on the next pass. |
-| `leep_warm_duration_seconds` | histogram | none | Time to warm one ref head. Seconds to hours after an import or a restart onto a large history; milliseconds once warm. |
+| `leep_warm_refs_total` | counter | `result` = `ok`, `error` | Ref heads the background warmer derived indexes for (ADR 0028). Errors are retried by the next full listing of refs, every 5 s. |
+| `leep_warm_duration_seconds` | histogram | none | Time to warm the heads that moved since the last pass, together (ADR 0058). Seconds to hours after an import or a restart onto a large history; milliseconds once warm. |
+| `leep_warm_delay_seconds` | histogram | none | Time from a ref move (its ref log entry, whole seconds) until the warmer stored that head's indexes. How far the indexes trail the refs; 0 or 1 when the warmer keeps up. |
 | `leep_search_total` | counter | `indexed` = `true`, `false` | Searches served; `false` means the query had no required trigram and scanned files directly. |
 | `leep_search_duration_seconds` | histogram | none | Whole search call, including any index rows it derived. |
 | `leep_blob_cache_hits_total` | counter | none | Blob reads served from the in-memory cache. |

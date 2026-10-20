@@ -636,6 +636,24 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   bytes per changeset there. The warmer derives it; `verify` checks it,
   `repair rederive`/`drop --kind log-filter-v1` handle it. New example
   `log_filter_profile`.
+- The index warmer follows the ref log (ADR 0058, phase 0). It used to
+  list every ref every 30 s, so on a busy ref the path-history and
+  log-filter indexes trailed the head by up to 30 s of lands before any
+  derivation started (890 generations at 2,000 swarm agents). A pass now
+  reads the ref log entries newer than the last it saw, one indexed query
+  when nothing moved, and lists every ref every 5 s as a backstop. All
+  heads that moved derive as one range per kind, so shared history is
+  derived once and new changesets of different refs derive side by side. A
+  ref whose warming fails is retried by the next full listing.
+- **Default changed:** `--warm-interval` (`LEEP_WARM_INTERVAL`) is now
+  `250ms` instead of `30s`, and accepts milliseconds (`250ms`) as well as
+  `s`, `m`, `h` and `d`. A server that set `30s` explicitly keeps polling
+  every 30 s. With several servers on one metadata store, set `0` on all but
+  one until index leases exist (ADR 0058), or every server derives the same
+  heads at once.
+- New histogram `leep_warm_delay_seconds`: time from a ref move to its
+  indexes being stored, at 1-second resolution (ref log times are whole
+  seconds), recorded only for moves the ref-log tail found.
 - Derivation uses several cores (ADR 0050). A missing range (the warmer's
   catch-up after an import, a first query over un-derived history, `repair
   rederive`) used to derive one changeset after another on one core: about
