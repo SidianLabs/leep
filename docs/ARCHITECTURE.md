@@ -531,7 +531,13 @@ transaction; the batch then stores everything with one wave of blob writes and
 one `put_changesets_with_derived` before the swap, in the order a lone write
 keeps, so the ref never names an object that is not durable. The CAS
 still coordinates separate server processes; a lost swap redoes the batch, and
-jittered backoff keeps processes from colliding in lockstep. The leader is a
+jittered backoff keeps processes from colliding in lockstep. That is not
+enough under load: with several servers on one ref one instance wins every
+swap and the others' lands starve (`docs/PERFORMANCE.md`, "Several servers on
+one ref"). [ADR 0056](adr/0056-land-coordinator-per-ref.md) (designed, not
+implemented yet) gives each ref one coordinating server, chosen by a lease in
+the metadata store, to which the others forward their lands; the CAS stays the
+only thing correctness rests on. The leader is a
 spawned task, so a cancelled request cannot stop a batch; a land cancelled
 before its batch reached it is dropped, one already replayed lands.
 The copy test makes `land` idempotent: a client that never saw the answer to
@@ -1003,6 +1009,19 @@ and self-approval rules for reviews. See the roadmap.
 
 Moving between stages means swapping a `MetaStore`/`BlobStore`
 implementation. Nothing above the traits changes.
+
+**Lands across servers** (designed in
+[ADR 0056](adr/0056-land-coordinator-per-ref.md), not implemented yet).
+Group commit batches a ref's lands only within one process, so from the Team
+stage on, servers must not race each other on a hot ref. Each ref gets one
+leader: the server holding its row in `land_leases` (taken and renewed with
+single conditional statements, 5 s TTL, an epoch per holder). Other servers
+forward `POST /v1/land` to the leader's `--advertise-url` with the client's
+own body and token, and land locally if the leader cannot be reached. A
+stale or dead leader costs only time: its swap loses or wins on `cas_ref`
+like any other. One owner per ref is also what later allows pipelined and
+parallel replays and a dedicated pool of lander instances for the agent
+swarm stage.
 
 **Multiple repositories** (M7, designed in
 [ADR 0054](adr/0054-multiple-repositories-per-server.md), not implemented
