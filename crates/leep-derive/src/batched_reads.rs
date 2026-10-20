@@ -263,6 +263,16 @@ impl MetaStore for BatchedMeta {
         self.inner.cas_ref_logged_chain(name, expected, steps).await
     }
 
+    async fn find_lands(
+        &self,
+
+        name: &str,
+
+        ids: &[leep_core::LandId],
+    ) -> Result<Vec<Option<leep_core::LandRecord>>> {
+        self.inner.find_lands(name, ids).await
+    }
+
     async fn ref_log(
         &self,
         name: Option<&str>,

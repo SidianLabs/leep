@@ -24,7 +24,7 @@ pub use error::{Error, Result};
 pub use hash::Hash;
 pub use path::RepoPath;
 pub use store::{
-    check_ref_chain, BlobMeta, BlobStore, DeleteStep, DerivedRow, MetaStore, RefLogEntry, RefStep,
-    RefUpdateContext, RowCount,
+    check_land_key, check_ref_chain, land_id_taken, BlobMeta, BlobStore, DeleteStep, DerivedRow,
+    LandId, LandKey, LandRecord, MetaStore, RefLogEntry, RefStep, RefUpdateContext, RowCount,
 };
 pub use tree::{TreeEntry, TreeNode};

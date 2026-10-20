@@ -30,6 +30,8 @@ pub enum Op {
     PutDerived,
     ListDerived,
     DeleteDerivedKind,
+    /// [`leep_core::MetaStore::find_lands`].
+    FindLands,
 }
 
 impl Op {
@@ -74,6 +76,7 @@ impl Op {
         Op::PutDerived,
         Op::ListDerived,
         Op::DeleteDerivedKind,
+        Op::FindLands,
     ];
     /// Calls that change state, blob and meta.
     pub const WRITES: &'static [Op] = &[

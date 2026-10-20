@@ -718,6 +718,7 @@ async fn rebase_and_land() {
                 changeset: feat,
                 target_ref: "main".into(),
                 create: None,
+                land_id: None,
             },
         )
         .await;
@@ -740,6 +741,7 @@ async fn rebase_and_land() {
                 changeset: k1,
                 target_ref: "side".into(),
                 create: None,
+                land_id: None,
             },
         )
         .await;
@@ -751,6 +753,7 @@ async fn rebase_and_land() {
                 changeset: k2,
                 target_ref: "side".into(),
                 create: None,
+                land_id: None,
             },
         )
         .await;
@@ -764,6 +767,7 @@ async fn rebase_and_land() {
                 changeset: unknown,
                 target_ref: "main".into(),
                 create: None,
+                land_id: None,
             },
         )
         .await;
@@ -1254,6 +1258,7 @@ async fn ref_writes_validate_names() {
                         .replace("%3A", ":")
                         .replace("%5E", "^"),
                     create: None,
+                    land_id: None,
                 },
             )
             .await;
@@ -1297,6 +1302,7 @@ async fn tags_are_created_and_deleted_but_never_moved() {
                     changeset: b,
                     target_ref: name.into(),
                     create: None,
+                    land_id: None,
                 },
             )
             .await;
@@ -1352,6 +1358,7 @@ async fn reflog_records_lands_and_ref_writes_newest_first() {
         changeset: id,
         target_ref: "main".into(),
         create: None,
+        land_id: None,
     };
     assert_eq!(c.post("/v1/land", &land(a)).await.status, StatusCode::OK);
     assert_eq!(c.post("/v1/land", &land(b)).await.status, StatusCode::OK);
@@ -1515,6 +1522,7 @@ async fn land_creates_a_missing_ref_only_when_allowed() {
         changeset: a,
         target_ref: target.into(),
         create,
+        land_id: None,
     };
 
     let r = c.post("/v1/land", &land("typo", Some(false))).await;
@@ -1546,6 +1554,7 @@ async fn land_creates_a_missing_ref_only_when_allowed() {
                 changeset: b,
                 target_ref: "asked".into(),
                 create: Some(false),
+                land_id: None,
             },
         )
         .await;
