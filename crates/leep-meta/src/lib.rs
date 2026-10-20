@@ -203,6 +203,59 @@ fn derived_columns(rows: &[leep_core::DerivedRow]) -> (Vec<&str>, Vec<&[u8]>, Ve
     )
 }
 
+/// The `land_id` and `land_changeset` columns of a move's log entry
+/// (ADR 0057).
+fn land_columns(ctx: &leep_core::RefUpdateContext) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+    match &ctx.land {
+        Some(l) => (
+            Some(l.id.as_bytes().to_vec()),
+            Some(l.changeset.0 .0.to_vec()),
+        ),
+        None => (None, None),
+    }
+}
+
+/// The error of a ref log insert: one that hit `ref_log_land_id` recorded a
+/// land id twice for the ref, which the contract makes `Conflict`.
+fn log_insert_error(name: &str, e: sqlx::Error) -> Error {
+    if e.as_database_error()
+        .is_some_and(|d| d.is_unique_violation())
+    {
+        return Error::Conflict(format!(
+            "a land id of this move is already recorded for ref {name:?}"
+        ));
+    }
+    storage(e)
+}
+
+/// `(land_id, land_changeset, new_target, seq)` as selected by `find_lands`.
+type LandRow = (Vec<u8>, Option<Vec<u8>>, Option<Vec<u8>>, i64);
+
+/// Answer `find_lands` in request order.
+fn lands_in_order(
+    ids: &[leep_core::LandId],
+    rows: Vec<LandRow>,
+) -> Result<Vec<Option<leep_core::LandRecord>>> {
+    let mut found = std::collections::HashMap::new();
+    for (id, cs, new, seq) in rows {
+        let (Some(cs), Some(new)) = (cs, new) else {
+            return Err(storage("ref log row has a land id but no changesets"));
+        };
+        found.insert(
+            id,
+            leep_core::LandRecord {
+                changeset: to_id(&cs)?,
+                landed: to_id(&new)?,
+                seq: u64::try_from(seq).map_err(|_| storage("negative ref log seq in db"))?,
+            },
+        );
+    }
+    Ok(ids
+        .iter()
+        .map(|id| found.get(id.as_bytes()).copied())
+        .collect())
+}
+
 /// The row layout both backends select from `ref_log`.
 type LogRow = (
     i64,

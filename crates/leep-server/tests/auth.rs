@@ -218,6 +218,7 @@ async fn write_token_does_everything() {
             changeset: id,
             target_ref: "main".into(),
             create: None,
+            land_id: None,
         }),
     )
     .await;
@@ -453,6 +454,7 @@ async fn read_token_reads_the_reflog_and_the_actor_is_the_token_name() {
         changeset: id,
         target_ref: "main".into(),
         create: None,
+        land_id: None,
     };
     let r = call(&app, Method::POST, "/v1/land", Some(WRITE), json(&land)).await;
     assert_eq!(r.status, StatusCode::OK);

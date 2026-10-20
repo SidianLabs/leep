@@ -435,8 +435,10 @@ refs(name TEXT PRIMARY KEY, target BYTEA NOT NULL)
 derived(kind TEXT, key BYTEA, value BYTEA, PRIMARY KEY(kind, key))
 ref_log(seq BIGSERIAL PRIMARY KEY,                             -- SQLite: INTEGER PRIMARY KEY AUTOINCREMENT
         name TEXT NOT NULL, old_target BYTEA, new_target BYTEA, -- 32-byte ids; NULL = no ref
-        time BIGINT NOT NULL, actor TEXT, operation TEXT NOT NULL, message TEXT)
+        time BIGINT NOT NULL, actor TEXT, operation TEXT NOT NULL, message TEXT,
+        land_id BYTEA, land_changeset BYTEA)                   -- migration 0005; NULL unless a keyed land
 ref_log_name: INDEX ON ref_log(name, seq)
+ref_log_land_id: UNIQUE INDEX ON ref_log(name, land_id) WHERE land_id IS NOT NULL
 ```
 
 `ref_log` (ADR 0018) is appended in the transaction of every ref create, move
@@ -462,6 +464,15 @@ until the table has a row; see "Changeset rows" below.
 Migration 0004 (`store_features`, ADR 0055) adds the table of format
 features, and inserts `changeset-zstd-dict` if `changeset_dicts` has a row;
 see "Format features" below.
+
+Migration 0005 (`land_ids`, ADR 0057) adds the nullable `ref_log` columns
+`land_id` (16 to 32 bytes, the client's id) and `land_changeset` (32-byte id
+of the changeset the land asked for; `new_target` is where it went) and the
+unique partial index `ref_log_land_id`. A move made by a land that carried a
+`land_id` writes both in its entry; every other entry leaves them NULL, and
+writes exactly the columns of v4. An id is unique per ref. The rows are read
+by `MetaStore::find_lands`, never changed, and kept with the entry. v4
+servers neither read nor write the columns.
 
 ### Changeset rows (ADR 0053)
 
@@ -805,6 +816,25 @@ created. `false` turns a land onto a missing ref into a 404 containing
 field and old servers ignore it, so neither side's behaviour changes until
 both are new and the client asks. No response shape, stored object or table
 changed.
+
+## Land ids (additive API field and ref log columns, ADR 0057)
+
+`LandRequest` gains the optional `land_id`: a string of 32 to 64 lowercase
+hex digits (16 to 32 bytes), omitted when unset. Anything else is 400. A
+land carrying an id whose land `target_ref` already recorded answers with
+that land's `Landed` result and moves nothing; if the recorded land was of
+another changeset it is 400 (`land id ... already landed ...`). Old clients
+never send it and old servers ignore it. No response shape changed.
+
+Stored as above ("SQL schema", migration 0005). `MetaStore` gains
+`find_lands(name, ids)`; `RefUpdateContext` gains `land`, which
+`cas_ref_logged` and `cas_ref_logged_chain` store with the entry, refusing a
+taken id with `Conflict` and a land id on a delete or twice in one chain with
+`Invalid`. No changeset, tree, hash or derived encoding changed.
+
+The CLI's `.leep/state.json` gains the optional `pending_land` (`changeset`,
+`target_ref`, `land_id`), present only while a land waits for a final
+answer; older CLIs ignore it.
 
 ## Fenced garbage collection (new derived kinds, no other format change)
 

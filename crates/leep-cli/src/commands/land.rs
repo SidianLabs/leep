@@ -4,17 +4,19 @@ use std::collections::BTreeMap;
 use std::fs;
 
 use clap::Args;
-use leep_core::api::{Conflict, LandRequest, LandResponse};
+use leep_core::api::{Conflict, LandId, LandRequest, LandResponse};
 use leep_core::refname::MISSING_REF_MARKER;
 use leep_core::review::NEEDS_REVIEW_MARKER;
 use leep_core::signature::NOT_SIGNED_MARKER;
 use leep_core::{ChangesetId, FileChange, FileKind, RepoPath};
 
 use super::{print_json, Ctx};
+use crate::client::new_land_id;
 use crate::error::{exit, CliError, ErrorKind, Result};
 use crate::fmt::short;
 use crate::markers::{relabel, Labels};
 use crate::materialize::{materialize, write_file};
+use crate::state::PendingLand;
 use crate::status::status;
 
 #[derive(Args, Debug)]
@@ -113,20 +115,55 @@ pub fn run(ctx: &mut Ctx, args: &LandArgs) -> Result<i32> {
 /// `main` of an empty repository (ADR 0036). Returns whether the ref was
 /// created.
 fn land_creating(
-    ctx: &Ctx,
+    ctx: &mut Ctx,
     base: ChangesetId,
     target_ref: &str,
     create: bool,
 ) -> Result<(LandResponse, bool)> {
+    let land_id = pending_land_id(ctx, base, target_ref)?;
     let land = |create: bool| {
-        ctx.client
-            .land(&LandRequest {
-                changeset: base,
-                target_ref: target_ref.to_string(),
-                create: Some(create),
-            })
-            .map_err(|e| hint_policy(e, target_ref))
+        let r = ctx.client.land_resending(&LandRequest {
+            changeset: base,
+            target_ref: target_ref.to_string(),
+            create: Some(create),
+            land_id: Some(land_id.clone()),
+        });
+        r.map_err(|e| hint_policy(e, target_ref))
     };
+    let result = land_creating_with(ctx, target_ref, create, land);
+    // An answer, or an error that sending again cannot change, ends this
+    // land; otherwise the next `leep land` resends it under the same id.
+    if !result.as_ref().is_err_and(|e| e.is_retryable()) {
+        ctx.wc.state.pending_land = None;
+        ctx.wc.save_state()?;
+    }
+    result
+}
+
+/// The id of the land of `base` onto `target_ref`: the one a land without a
+/// final answer used (ADR 0057), or a new one, saved before it is sent.
+fn pending_land_id(ctx: &mut Ctx, base: ChangesetId, target_ref: &str) -> Result<LandId> {
+    if let Some(p) = &ctx.wc.state.pending_land {
+        if p.changeset == base && p.target_ref == target_ref {
+            return Ok(p.land_id.clone());
+        }
+    }
+    let land_id = new_land_id();
+    ctx.wc.state.pending_land = Some(PendingLand {
+        changeset: base,
+        target_ref: target_ref.to_string(),
+        land_id: land_id.clone(),
+    });
+    ctx.wc.save_state()?;
+    Ok(land_id)
+}
+
+fn land_creating_with(
+    ctx: &Ctx,
+    target_ref: &str,
+    create: bool,
+    land: impl Fn(bool) -> Result<LandResponse>,
+) -> Result<(LandResponse, bool)> {
     // Whether `--create` will create or just land: asked only when it may.
     let existed = if create {
         ctx.client.get_ref(target_ref)?.target.is_some()

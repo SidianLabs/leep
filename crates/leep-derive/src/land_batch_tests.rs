@@ -141,6 +141,14 @@ impl MetaStore for Gate {
         self.chain_calls.fetch_add(1, Ordering::SeqCst);
         self.inner.cas_ref_logged_chain(name, expected, steps).await
     }
+    async fn find_lands(
+        &self,
+        name: &str,
+        ids: &[leep_core::LandId],
+    ) -> Result<Vec<Option<leep_core::LandRecord>>> {
+        self.inner.find_lands(name, ids).await
+    }
+
     async fn ref_log(
         &self,
         name: Option<&str>,
@@ -1057,4 +1065,107 @@ async fn a_batch_that_cannot_store_its_replays_moves_nothing() {
         stored
     );
     assert!(r.is_ancestor(base, landed).await.unwrap());
+}
+
+/// [`queue_in_order`] for lands that carry land ids.
+async fn queue_keyed(
+    r: &Repo,
+    gate: &Gate,
+    base: ChangesetId,
+    lands: &[(ChangesetId, Option<leep_core::LandId>)],
+) -> (Pending, Vec<Pending>) {
+    gate.reads.send_replace(false);
+    let blocker = {
+        let r = r.clone();
+        tokio::spawn(async move { r.land(base, "main").await })
+    };
+    wait_for(|| gate.waiting_reads.load(Ordering::SeqCst) == 1).await;
+    let mut tasks = Vec::new();
+    for (i, (cs, id)) in lands.iter().cloned().enumerate() {
+        let r2 = r.clone();
+        tasks.push(tokio::spawn(async move {
+            r2.land_keyed(cs, "main", None, true, id).await
+        }));
+        wait_for(|| r.land_queues.pending("main") == i + 1).await;
+    }
+    (blocker, tasks)
+}
+
+/// Land ids in one batch (ADR 0057): a duplicate of a land earlier in the
+/// batch is answered with that land's result once the batch commits, an id
+/// reused for another changeset is refused, an id recorded by an earlier
+/// batch answers with its result, and none of it touches the other lands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn land_ids_in_a_batch_are_settled_per_land() {
+    use leep_core::LandId;
+    use Parent::*;
+    let script = vec![
+        spec(&[Base], &[("u/1", Some("1\n"))], "u1"), // 0
+        spec(&[Base], &[("x", Some("x\n"))], "x"),    // 1: keyed
+        spec(&[Base], &[("u/2", Some("2\n"))], "u2"), // 2
+        spec(&[Base], &[("y", Some("y\n"))], "y"),    // 3: reuses x's id
+        spec(&[Base], &[("u/3", Some("3\n"))], "u3"), // 4
+        spec(&[Base], &[("k", Some("k\n"))], "k"),    // 5: landed before
+        spec(&[Base], &[("u/4", Some("4\n"))], "u4"), // 6
+    ];
+    let (r, gate) = gated_repo();
+    let (_, ids) = build(&r, &script).await;
+    let key = |n: u8| Some(LandId::from_bytes(&[n; 16]).unwrap());
+    let earlier = r
+        .land_keyed(ids[5], "main", None, true, key(5))
+        .await
+        .unwrap();
+    let base = r.meta().get_ref("main").await.unwrap().unwrap();
+    let lands = vec![
+        (ids[0], None),
+        (ids[1], key(1)),
+        (ids[2], None),
+        (ids[1], key(1)), // duplicate in the batch
+        (ids[3], key(1)), // id reused for another changeset
+        (ids[4], key(9)),
+        (ids[5], key(5)), // recorded by an earlier batch
+        (ids[6], None),
+    ];
+    let (blocker, tasks) = queue_keyed(&r, &gate, base, &lands).await;
+    release(&gate);
+    blocker.await.unwrap().unwrap();
+    let mut results = Vec::new();
+    for t in tasks {
+        results.push(t.await.unwrap());
+    }
+    let landed = |i: usize| match &results[i] {
+        Ok(LandResponse::Landed { landed, .. }) => *landed,
+        other => panic!("land {i}: {other:?}"),
+    };
+    for i in [0, 2, 5, 7] {
+        landed(i);
+    }
+    assert_eq!(
+        landed(1),
+        landed(3),
+        "the duplicate gets the original's copy"
+    );
+    assert!(
+        matches!(&results[4], Err(leep_core::Error::Invalid(m)) if m.contains("land id")),
+        "{:?}",
+        results[4]
+    );
+    match (&earlier, &results[6]) {
+        (LandResponse::Landed { landed: a, .. }, Ok(LandResponse::Landed { landed: b, .. })) => {
+            assert_eq!(a, b)
+        }
+        other => panic!("{other:?}"),
+    }
+    let batches = r.land_queues.batches.lock().unwrap().clone();
+    assert_eq!(batches.last().unwrap().len(), lands.len(), "one batch");
+    let log = r.meta().ref_log(Some("main"), None, 100).await.unwrap();
+    let moves = log.iter().filter(|e| e.seq > 2).count();
+    assert_eq!(moves, 5, "u1, x, u2, u3 (keyed 9), u4: one move each");
+    let found = r
+        .meta()
+        .find_lands("main", &[key(1).unwrap(), key(9).unwrap()])
+        .await
+        .unwrap();
+    assert_eq!(found[0].unwrap().landed, landed(1));
+    assert_eq!(found[1].unwrap().landed, landed(5));
 }

@@ -18,6 +18,88 @@ pub fn unix_now() -> i64 {
         .map_or(0, |d| d.as_secs() as i64)
 }
 
+/// A client's name for one logical land (ADR 0057). The server records it
+/// with the ref move, so a retry of the land is recognised at any age
+/// instead of only while its rebased copy is near the head. 16 to 32 bytes,
+/// lowercase hex on the wire; clients pick it at random.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct LandId(Vec<u8>);
+
+impl LandId {
+    pub const MIN_LEN: usize = 16;
+    pub const MAX_LEN: usize = 32;
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        if !(Self::MIN_LEN..=Self::MAX_LEN).contains(&bytes.len()) {
+            return Err(Error::Invalid(format!(
+                "a land id is {} to {} bytes, not {}",
+                Self::MIN_LEN,
+                Self::MAX_LEN,
+                bytes.len()
+            )));
+        }
+        Ok(Self(bytes.to_vec()))
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for LandId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&hex::encode(&self.0))
+    }
+}
+
+impl std::str::FromStr for LandId {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        // Lowercase only, so one id has one spelling.
+        if s.bytes().any(|b| b.is_ascii_uppercase()) {
+            return Err(Error::Invalid(format!(
+                "land id {s:?} is not lowercase hex"
+            )));
+        }
+        let bytes =
+            hex::decode(s).map_err(|_| Error::Invalid(format!("land id {s:?} is not hex")))?;
+        Self::from_bytes(&bytes)
+    }
+}
+
+impl Serialize for LandId {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for LandId {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        s.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+/// The land a ref move completes: the client's id for it and the changeset
+/// it asked to land. Stored with the move's log entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LandKey {
+    pub id: LandId,
+    pub changeset: ChangesetId,
+}
+
+/// What [`MetaStore::find_lands`] found for one land id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LandRecord {
+    /// The changeset the land asked for.
+    pub changeset: ChangesetId,
+    /// Where the move took the ref: `changeset` or its rebased copy.
+    pub landed: ChangesetId,
+    /// The `seq` of the move's log entry.
+    pub seq: u64,
+}
+
 /// Who moved a ref and why, recorded in the ref log with the move itself.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RefUpdateContext {
@@ -26,6 +108,8 @@ pub struct RefUpdateContext {
     /// Short free-form label: `land`, `cas`, `undo`, `import`, ...
     pub operation: String,
     pub message: Option<String>,
+    /// The client land this move completes, if the client named it.
+    pub land: Option<LandKey>,
 }
 
 impl RefUpdateContext {
@@ -34,7 +118,13 @@ impl RefUpdateContext {
             actor: None,
             operation: operation.into(),
             message: None,
+            land: None,
         }
+    }
+
+    pub fn land(mut self, land: Option<LandKey>) -> Self {
+        self.land = land;
+        self
     }
 
     pub fn actor(mut self, actor: Option<impl Into<String>>) -> Self {
@@ -297,6 +387,10 @@ pub trait MetaStore: Send + Sync + 'static {
     /// A swap that happens appends one [`RefLogEntry`] in the same atomic
     /// step, so a ref never moves unrecorded. A lost swap, and a swap that
     /// changes nothing (`expected == new`), write no entry.
+    ///
+    /// `ctx.land` is recorded with the entry. A land key on a delete is
+    /// `Invalid`; one whose id `name` already recorded makes a swap that
+    /// would happen fail with `Conflict` and change nothing.
     async fn cas_ref_logged(
         &self,
         name: &str,
@@ -335,6 +429,21 @@ pub trait MetaStore: Send + Sync + 'static {
             old = step.new;
         }
         Ok(steps.len())
+    }
+
+    /// The moves of `name` recorded under each of `ids` (one answer per id,
+    /// in order), at any age: a move whose context carries a
+    /// [`LandKey`] stores it with its log entry, atomically with the move,
+    /// and keeps it as long as the entry (ADR 0057).
+    ///
+    /// Every backend must implement this (see
+    /// [`list_derived`](Self::list_derived)); `land` calls it only for lands
+    /// that carry an id.
+    async fn find_lands(&self, name: &str, ids: &[LandId]) -> Result<Vec<Option<LandRecord>>> {
+        let _ = (name, ids);
+        Err(Error::Invalid(
+            "this metadata store cannot look up land ids".into(),
+        ))
     }
 
     /// Ref log entries, newest first: those of `name` or of every ref, with
@@ -509,14 +618,40 @@ pub trait MetaStore: Send + Sync + 'static {
     }
 }
 
+/// A land key names where a land took the ref, so it never rides on a delete.
+pub fn check_land_key(new: Option<ChangesetId>, ctx: &RefUpdateContext) -> Result<()> {
+    if new.is_none() && ctx.land.is_some() {
+        return Err(Error::Invalid(
+            "a ref delete cannot record a land id".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// The error a store returns for a move whose land id the ref already
+/// recorded.
+pub fn land_id_taken(name: &str, id: &LandId) -> Error {
+    Error::Conflict(format!("land id {id} is already recorded for ref {name:?}"))
+}
+
 /// The rules every [`MetaStore::cas_ref_logged_chain`] applies before moving
 /// anything: steps exist, each changes the ref, and the chain does not end
 /// where it started.
 pub fn check_ref_chain(expected: Option<ChangesetId>, steps: &[RefStep]) -> Result<()> {
     let mut old = expected;
+    let mut lands = std::collections::HashSet::new();
     for step in steps {
         if step.new == old {
             return Err(Error::Invalid("a ref chain step must move the ref".into()));
+        }
+        check_land_key(step.new, &step.ctx)?;
+        if let Some(land) = &step.ctx.land {
+            if !lands.insert(&land.id) {
+                return Err(Error::Invalid(format!(
+                    "land id {} appears twice in one ref chain",
+                    land.id
+                )));
+            }
         }
         old = step.new;
     }

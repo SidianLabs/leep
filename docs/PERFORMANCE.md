@@ -572,6 +572,112 @@ and 5.3 ms against 1.3, 99 and 63 lands/s at N = 1 against 138). Batches fill on
 their own: lands arriving while a batch replays form the next one. The server
 does not linger.
 
+## Many-agent workload
+
+`leep-swarm` (in `crates/leep-soak`) simulates a team of agents rather than a
+land loop: thousands of async agents, each a cheap task with its own seeded
+choices, against one or more running servers. Each agent repeats a cycle:
+think, sync its working copy (read the ref, list its own files at the head),
+make `--reads` reads drawn from `--read-mix` (log, with a hot path half the
+time; files; blame; search; diff from its last base), think, upload
+`--files` blobs of `--blob-bytes`, create a changeset on a head up to
+`--stale` observed heads behind the newest, and land it. Before every
+operation it thinks for an exponentially distributed time with mean
+`--think-ms` (0 is a burst). A share `--hot-fraction` of the files written
+are one of `--hot-files` shared files, which is where conflicts come from.
+A land answered 409 is sent again after a short pause; one that times out,
+loses its connection or gets a 5xx is resent the way a client would, with
+its land id (ADR 0057) unless `--land-id false`.
+
+Every land writes a unique marker (its message, `swarm <run> a<agent> s<seq>`).
+After the window the generator walks the target ref's whole history and
+reports *double lands* (a marker found more than once) and *lost lands* (a
+land answered `landed` whose marker is absent); with land ids on it exits
+non-zero if either is above zero, and always if a land is lost.
+
+It reports lands per second (answered inside the window), p50 and p99 of
+every operation, conflicts, 409s, resends, the servers' CAS losses, batch
+size and lands answered from a recorded id, stalled agents (no land answered
+inside the window), lands per server and, with `--database-url` pointing at
+the Postgres metadata store, the warmer's lag and database bytes per land.
+Warmer lag is sampled every `--lag-every` seconds as the head's generation
+minus the generation of the newest of its last 2000 changesets that has a
+`history-tree-v4` row (path history) or a `log-filter-v1` row; a value near
+2000 means "at least that". Queries derive what they need, so the lag is
+the index's, not only the warmer's. Bytes per land is the growth of
+`pg_database_size` over the window divided by every land answered
+`landed`. `--json FILE` writes the same report as JSON.
+
+```sh
+cargo build --release -p leep-server -p leep-soak
+target/release/leep-server --listen 127.0.0.1:7471 --metrics-listen 127.0.0.1:7472 \
+  --meta postgres://localhost/swarm --blobs file:///var/tmp/swarm/blobs --meta-pool-size 32 &
+target/release/leep-swarm --server http://127.0.0.1:7471 --metrics http://127.0.0.1:7472 \
+  --database-url postgres://localhost/swarm \
+  --agents 2000 --think-ms 2000 --duration 60 --ramp 20 \
+  --read-mix log=3,files=3,blame=1,search=1,diff=2 --reads 4 --files 2 \
+  --hot-files 8 --hot-fraction 0.02 --stale 4
+```
+
+Several `--server` URLs (with their `--metrics`) share the agents round
+robin, as in `leep-land-bench`. The target ref is created with a 200-file
+tree and the hot files when absent.
+
+**First baseline.** One server, Postgres 16 on the same machine, blobs on
+ext4, `9297c27` plus the generator, release build, a fresh database and blob
+directory per run, server defaults (warmer every 30 s with search warming,
+256 MiB blob cache) and `--meta-pool-size 32`. Generator defaults
+(`--reads 4`, the mix above, `--files 2` of 512 bytes, 8 hot files at 2%,
+`--stale 4`, 30 s request timeout) and land ids on, except where named. The
+machine is a shared 4-vCPU Xeon (2.8 GHz, 15 GB) on which another agent was
+working: the load average was about 4 to 5 before the runs and 9 to 21
+during them, and the generator itself (thousands of tasks) runs on the same
+four cores. One run each, so treat differences under about 20% as noise.
+
+| Run | Lands | Lands/s | Land p50 / p99 ms | Conflicts | Resends | Batch mean | Stalled agents | Double / lost lands | Lag path history p50 / max | Lag log filter p50 / max | DB bytes per land |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 500 agents, think 2 s, 60 s | 1937 | 32.3 | 138 / 2698 | 1 | 0 | 2.8 | 0 of 500 | 0 / 0 | 21 / 128 | 592 / 1194 | 9,352 |
+| 2000 agents, think 2 s, 60 s | 1666 | 27.8 | 4163 / 13749 | 36 | 0 | 50.2 | 551 of 2000 | 0 / 0 | 1125 / 1958 | 1412 / ≥2000 | 5,232 |
+| 2000 agents, think 2 s, no search reads | 1300 | 21.7 | 27649 / 74876 | 96 | 1375 | 58.1 | 722 of 2000 | 0 / 0 | 502 / 745 | 803 / 1213 | 5,467 |
+| 256 agents, no think time, 30 s | 1241 | 41.4 | 198 / 757 | 17 | 0 | 5.5 | 0 of 256 | 0 / 0 | 277 / 304 | 712 / 1276 | 7,404 |
+| same, land ids off | 1307 | 43.6 | 170 / 1038 | 18 | 0 | 5.3 | 0 of 256 | 0 / 0 | 269 / 304 | 693 / 1335 | 7,852 |
+
+Reads, p50 / p99 ms:
+
+| Run | sync | log | files | blame | search | diff | upload | create |
+|---|---|---|---|---|---|---|---|---|
+| 500 agents | 16 / 1884 | 54 / 6717 | 8 / 1023 | 91 / 7663 | 2800 / 13688 | 17 / 1912 | 15 / 2456 | 35 / 4104 |
+| 2000 agents | 197 / 1582 | 530 / 2476 | 92 / 1349 | timeouts | 27889 (2 answered) | 187 / 1613 | 86 / 315 | 245 / 814 |
+| 2000, no search | 79 / 632 | 265 / 28750 | 27 / 177 | 12343 / 29180 | – | 58 / 327 | 31 / 193 | 67 / 398 |
+| 256 burst | 20 / 76 | 109 / 9194 | 11 / 44 | 5485 / 9208 | 1972 / 4435 | 19 / 82 | 16 / 160 | 38 / 232 |
+
+What it shows, on this machine:
+
+- **Search reads dominate at 500 agents.** One search in eight reads costs
+  2.8 s at p50: the head moves several times a second, so most searches
+  land on a head whose trigram index is not warm and derive it. At 2000
+  agents 1,173 searches, 1,327 logs and 902 blames timed out at 30 s.
+- **Land throughput falls as agents rise** (32 lands/s at 500 agents, 22 to
+  28 at 2000) while batches fill (3 to 58 lands): every land of a full batch
+  replays onto a head up to 64 lands newer, on a stale base, and the batch
+  competes for the same four cores with the reads. Without search the
+  agents spend less time reading and more of them land at once, so lands
+  wait longest there (p50 28 s): 1,375 lands timed out at the client's 30 s
+  and were resent under their land id. None landed twice; the resent ones
+  had been dropped from their batch when their request was cancelled.
+- **The indexes fall behind under load.** The warmer runs every 30 s; with
+  thousands of agents the path-history index trails the head by hundreds to
+  a thousand generations and the log-filter index by more, so path logs and
+  blames derive on the request path (the multi-second p99s).
+- **Double lands were zero in every run**, with and without land ids. No
+  run lost an answer after its commit, so this baseline does not exercise
+  the window ADR 0057 closes; the crash and fault tests do. The land-id
+  lookup cost nothing measurable in the burst (41 against 44 lands/s, within
+  the noise).
+- **About 5 to 9 KB of database per land**, with two small files: the ref
+  log entry, the changeset row and its copy, tree and derived rows and the
+  indexes' rows.
+
 ## Real history: git/git
 
 The benchmarks above use synthetic, mostly linear histories. `git/git` is real

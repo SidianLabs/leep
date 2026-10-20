@@ -23,6 +23,9 @@ use crate::error::{CliError, ErrorKind, Result};
 
 /// Tries per GET before a 429 is reported.
 const MAX_ATTEMPTS: u32 = 4;
+/// Times a land with a land id is sent again after an answer that may not
+/// have been the server's last word (ADR 0057).
+const LAND_RESENDS: u32 = 3;
 /// Longest pause between tries. A longer `Retry-After` means the server wants
 /// the caller gone for a while, so fail with that advice instead of hanging.
 const MAX_RETRY_WAIT: Duration = Duration::from_secs(10);
@@ -595,6 +598,41 @@ impl Client {
     pub fn land(&self, req: &LandRequest) -> Result<LandResponse> {
         self.json(self.http.post(self.url("/v1/land")).json(req))
     }
+
+    /// [`land`](Self::land), sent again with the same land id after a
+    /// timeout, a lost connection, a 5xx or a lost race. The id makes a
+    /// repeat answer with the first one's result if that one landed, so a
+    /// resend never lands twice. Without an id it sends once.
+    pub fn land_resending(&self, req: &LandRequest) -> Result<LandResponse> {
+        let mut resends = 0;
+        loop {
+            match self.land(req) {
+                Err(e) if req.land_id.is_some() && resends < LAND_RESENDS && resend_land(&e) => {
+                    std::thread::sleep(Duration::from_millis(500 << resends));
+                    resends += 1;
+                }
+                r => return r,
+            }
+        }
+    }
+}
+
+/// An error after which the land may or may not have happened, or may
+/// succeed if sent again.
+fn resend_land(e: &CliError) -> bool {
+    e.is_retryable()
+        && matches!(
+            e.kind(),
+            ErrorKind::Timeout | ErrorKind::Server | ErrorKind::Unreachable | ErrorKind::Conflict
+        )
+}
+
+/// A new random land id (ADR 0057): one per logical land, reused on every
+/// retry of it.
+pub fn new_land_id() -> LandId {
+    let mut b = [0u8; 16];
+    getrandom::fill(&mut b).expect("the OS random source is available");
+    LandId::from_bytes(&b).expect("16 bytes is a valid land id")
 }
 
 /// The pause the server asked for. A missing or unparsable header counts as
@@ -763,12 +801,52 @@ mod tests {
                 changeset: ChangesetId(Hash::of_blob(b"x")),
                 target_ref: "main".into(),
                 create: None,
+                land_id: None,
             })
             .unwrap_err();
         assert_eq!(e.kind(), ErrorKind::Timeout, "{e}");
         assert_eq!(e.exit_code(), 3, "{e}");
         assert!(e.to_string().contains("run the command again"), "{e}");
         assert_eq!(seen.load(Ordering::SeqCst), 1, "a write is never resent");
+    }
+
+    #[test]
+    fn a_land_with_a_land_id_is_resent_after_a_timeout() {
+        const TIMED_OUT: &str = "HTTP/1.1 408 Request Timeout\r\ncontent-length: 0\r\n\
+            connection: close\r\n\r\n";
+        let id = ChangesetId(Hash::of_blob(b"x"));
+        let body = format!(
+            "{{\"status\":\"landed\",\"landed\":\"{id}\",\"rebased\":false,\"attempts\":1}}"
+        );
+        let landed: &'static str = Box::leak(
+            format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                 content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .into_boxed_str(),
+        );
+        let req = LandRequest {
+            changeset: id,
+            target_ref: "main".into(),
+            create: None,
+            land_id: Some(new_land_id()),
+        };
+        let (url, seen) = stub(&[TIMED_OUT, TIMED_OUT, landed]);
+        let resp = Client::new(&url).land_resending(&req).unwrap();
+        assert!(matches!(resp, LandResponse::Landed { landed, .. } if landed == id));
+        assert_eq!(seen.load(Ordering::SeqCst), 3);
+
+        // Without an id a resend could land twice: sent once.
+        let (url, seen) = stub(&[TIMED_OUT, landed]);
+        let req = LandRequest {
+            land_id: None,
+            ..req
+        };
+        let e = Client::new(&url).land_resending(&req).unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Timeout);
+        assert_eq!(seen.load(Ordering::SeqCst), 1);
+        assert_ne!(new_land_id(), new_land_id());
     }
 
     #[test]

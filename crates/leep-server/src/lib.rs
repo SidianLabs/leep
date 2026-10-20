@@ -1072,7 +1072,7 @@ async fn land(
     // Old clients send no `create` and keep the original behaviour.
     let create = req.create.unwrap_or(true);
     Ok(Json(
-        repo.land_with(req.changeset, &req.target_ref, actor, create)
+        repo.land_keyed(req.changeset, &req.target_ref, actor, create, req.land_id)
             .await?,
     ))
 }
