@@ -58,15 +58,21 @@ a batch without ids). A land whose id is recorded is answered
 nothing; one whose id was recorded for a different changeset is 400. A land
 whose id appears earlier in the same batch, on a land that moves the ref,
 waits for that batch's commit and gets the same answer. Each of these
-settles only its own land; the rest of the batch goes on.
+settles only its own land; the rest of the batch goes on. A lookup that
+fails holds back only the lands with ids, to the next attempt, and fails
+them only after three failures in a row (the budget of failed commits).
 
 Ordering makes this race-free across servers. The lookup runs after the
 head read. If the original's move committed before the lookup, the lookup
 sees it. If it commits after, the head this attempt read does not contain
 it, so this attempt's swap from that head loses, and the next attempt's
-lookup finds it. The unique index is the safety net: a move that
-would record a taken id fails with `Conflict`, which `land` treats like any
-failed commit, re-reading the head and finding the record.
+lookup finds it. The exception is a ref that came back to the head this
+attempt read (another server landed the id, then the ref was undone): the
+swap would succeed, and the unique index stops it. A move that would record
+a taken id fails with `Conflict` and applies nothing, so `land` treats it as
+a lost race, not a failed commit: it re-reads the head and redoes the
+attempt, whose lookup answers that land, without spending the commit-error
+budget.
 
 The landed-copy scan stays as it is, for clients that send no id and for
 ids recorded by nothing (a land answered "already landed" moves nothing and
@@ -76,7 +82,8 @@ records nothing; a retry of it is found the same way).
 - `leep land` saves the id in the working copy's `state.json`
   (`pending_land`: changeset, ref, id) before sending, and clears it once it
   has an answer or an error that sending again cannot change. Running
-  `leep land` again for the same changeset and ref reuses the id. Within one
+  `leep land` again for the same changeset and ref reuses the id, if the
+  server advertises `land-id` (see "Upgrade and mixed versions"). Within one
   run, `Client::land_resending` sends a keyed land again, with the same id,
   after a timeout, a lost connection, a 5xx or a lost race (three more times,
   0.5 to 2 s apart). A land without an id is still never resent.
@@ -100,13 +107,27 @@ which is what happened, and does not land it again.
 ## Upgrade and mixed versions
 Migration 0005 adds two nullable columns and an index. Servers of v4 never
 read or write the columns, so it may be applied beside them. On Postgres the
-`ALTER TABLE ... ADD COLUMN` without a default is a catalog change and the
-index build reads `ref_log` once under a `SHARE` lock, which holds ref moves
-for the time it takes (about a second per few million entries).
+`ALTER TABLE ... ADD COLUMN` without a default is a catalog change, but the
+index build reads `ref_log` once under a `SHARE` lock, which blocks every
+ref move (every land) for the time it takes. So the migration is written
+with `IF NOT EXISTS` (`ADD COLUMN IF NOT EXISTS` and `CREATE UNIQUE INDEX IF
+NOT EXISTS` on Postgres; the index only on SQLite, which cannot build
+concurrently anyway), the one exception to "only 0001 is idempotent": a
+large deployment adds the columns and builds the index by hand first with
+`CREATE UNIQUE INDEX CONCURRENTLY`, which does not block writes, and the
+migration then finds them done (OPERATIONS.md, "Upgrading").
 
-During a rollout a keyed land that reaches a v4 server is landed without its
-id (old servers ignore unknown fields) and is not found by id later; a retry
-falls back to the scan. Clients send the id whatever the server's version.
+**Upgrade servers before relying on ids.** A v4 server ignores `land_id`
+(unknown fields are dropped): it lands without recording the id, and a
+repeat is recognised only by the landed-copy scan. That is harmless for a
+resend within seconds, but a resend in a later run, after many lands, can
+land twice. So clients resend across runs only to a server that says it
+records ids: `GET /v1/ready` lists `land-id` in its new `features` field.
+`leep land` checks it before resending a land saved in `state.json`; against
+a server that does not list it, it clears the saved land and says the land
+may have applied and how to check (`leep reflog REF`). Resends within one
+run (after a timeout, a 5xx or a lost connection) stay, since the scan
+covers them.
 
 Backups (ADR 0026) copy the columns. A backup from v4 restores through the
 scratch-copy migration, with no ids.

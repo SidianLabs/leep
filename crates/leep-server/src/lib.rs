@@ -277,6 +277,11 @@ pub async fn serve(
 type S = State<Arc<Repo>>;
 type ApiResult<T> = Result<T, ApiError>;
 
+/// What `GET /v1/ready` advertises.
+fn features() -> Vec<String> {
+    vec![leep_core::api::FEATURE_LAND_ID.into()]
+}
+
 /// The single place `leep_core::Error` becomes an HTTP status.
 #[derive(Debug)]
 pub struct ApiError(Error);
@@ -487,7 +492,7 @@ where
 }
 
 /// Readiness: both stores answer a cheap real read, concurrently, each within
-/// the ready timeout. 200 `{"status":"ready"}`, or 503 naming the failed
+/// the ready timeout. 200 `{"status":"ready","features":[...]}`, or 503 naming the failed
 /// stores. Public and unlimited like `/v1/health` (see [`is_probe`]).
 async fn ready(State((repo, limit)): State<(Arc<Repo>, Duration)>) -> Response {
     let meta = repo.meta().clone();
@@ -510,6 +515,7 @@ async fn ready(State((repo, limit)): State<(Arc<Repo>, Duration)>) -> Response {
             ReadyResponse {
                 status: "ready".into(),
                 failed,
+                features: features(),
             },
         )
     } else {
@@ -518,6 +524,7 @@ async fn ready(State((repo, limit)): State<(Arc<Repo>, Duration)>) -> Response {
             ReadyResponse {
                 status: "not ready".into(),
                 failed,
+                features: features(),
             },
         )
     };

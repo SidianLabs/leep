@@ -227,6 +227,25 @@ impl Client {
         resp.json::<T>().map_err(bad_response)
     }
 
+    /// The features `GET /v1/ready` advertises, read from a 200 or a 503
+    /// (stores down); none for a server too old to name any (no field, or no
+    /// `/v1/ready`). A server that cannot be asked is an error, so a client
+    /// never mistakes an outage for an old server.
+    pub fn server_features(&self) -> Result<Vec<String>> {
+        let resp = self
+            .http
+            .get(self.url("/v1/ready"))
+            .send()
+            .map_err(|e| self.unreachable(e))?;
+        match resp.status() {
+            StatusCode::OK | StatusCode::SERVICE_UNAVAILABLE => Ok(resp
+                .json::<ReadyResponse>()
+                .map_or_else(|_| Vec::new(), |r| r.features)),
+            StatusCode::NOT_FOUND => Ok(Vec::new()),
+            _ => Err(error_from(resp, self.has_token)),
+        }
+    }
+
     pub fn health(&self) -> Result<()> {
         self.send(self.http.get(self.url("/v1/health"))).map(|_| ())
     }
@@ -618,7 +637,8 @@ impl Client {
 }
 
 /// An error after which the land may or may not have happened, or may
-/// succeed if sent again.
+/// succeed if sent again. `Conflict` here is only the 409 of a land that lost
+/// the race too often; a land with conflicts is a 200 answer, never resent.
 fn resend_land(e: &CliError) -> bool {
     e.is_retryable()
         && matches!(
@@ -847,6 +867,25 @@ mod tests {
         assert_eq!(e.kind(), ErrorKind::Timeout);
         assert_eq!(seen.load(Ordering::SeqCst), 1);
         assert_ne!(new_land_id(), new_land_id());
+
+        // A land with conflicts is an answer: sent once.
+        let body = format!("{{\"status\":\"conflicts\",\"onto\":\"{id}\",\"conflicts\":[]}}");
+        let conflicts: &'static str = Box::leak(
+            format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                 content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .into_boxed_str(),
+        );
+        let (url, seen) = stub(&[conflicts, landed]);
+        let req = LandRequest {
+            land_id: Some(new_land_id()),
+            ..req
+        };
+        let resp = Client::new(&url).land_resending(&req).unwrap();
+        assert!(matches!(resp, LandResponse::Conflicts { .. }));
+        assert_eq!(seen.load(Ordering::SeqCst), 1);
     }
 
     #[test]
