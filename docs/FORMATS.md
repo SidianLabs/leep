@@ -739,6 +739,14 @@ small one runs the key-order batch from a cursor (`key > $after`). The cursor
 passed between steps is in memory only and never stored. No table, index,
 encoding or `/v1` shape changed.
 
+`MetaStore::estimate_derived` returns a `RowCount { rows, exact }` for
+`upgrade-index`'s plan. The default is `count_derived`. Postgres counts up
+to 100,000 rows (`SELECT count(*) FROM (SELECT 1 FROM derived WHERE kind = $1
+LIMIT 100000)`), and past that multiplies `pg_class.reltuples` of `derived`
+by the kind's frequency among `pg_stats.most_common_vals` of `kind`. If the
+kind is missing from the statistics it counts. `rows` is 0 only when there
+are none. Nothing is stored.
+
 ## Batched reads (new `MetaStore` methods, no format change)
 
 ADR 0030 adds `MetaStore::get_changesets` and `get_derived_many`. They read the

@@ -2,21 +2,29 @@
 //! reads, in one command that can be stopped and run again.
 //!
 //! It is an orchestration of existing paths, not a new one. The plan counts
-//! rows with [`MetaStore::count_derived`] (ADR 0052) and compares them with
-//! the changesets reachable from refs; missing rows are derived through
+//! rows with [`MetaStore::estimate_derived`] (ADR 0052), which on Postgres
+//! estimates a large kind from planner statistics instead of reading its
+//! whole index, and compares them with the changesets reachable from refs; missing rows are derived through
 //! `derive`, as `repair rederive --missing` does (ADR 0050), so they are
 //! byte-identical to what a query or the warmer would store; retired kinds go
 //! through `repair drop`'s walk. Rows are stored after their parents', so the
 //! rows of a kind are closed under ancestry and deriving from each ref's head
 //! finds everything missing; only a store whose rows were deleted part way
 //! (an interrupted `repair drop` of a current kind) needs the slower check of
-//! every reachable changeset, and the counts say when.
+//! every reachable changeset, and the counts say when. Decisions that rest
+//! on a count use an exact one: whether a kind has rows at all (always
+//! exact), whether a kind whose heads all have rows is short (an estimate
+//! below the reachable changesets is counted before calling it partial),
+//! and, after deriving, whether the slow check is needed. Estimates only
+//! size the work and label the output. A kind whose rows were deleted part
+//! way while its statistics still show them looks complete until an
+//! `ANALYZE`; [`PlanOptions::exact_counts`] counts everything.
 
 use std::collections::{BTreeMap, HashSet};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use leep_core::{ChangesetId, Hash, MetaStore, Result};
+use leep_core::{ChangesetId, Hash, MetaStore, Result, RowCount};
 use serde::Serialize;
 
 use super::kinds::{self, DropPolicy, KindClass, KindInfo, Rederive};
@@ -47,6 +55,8 @@ pub struct CurrentKind {
     pub kind: &'static str,
     /// Rows stored, including those of changesets no ref reaches.
     pub rows: u64,
+    /// `rows` is an estimate (large kinds on Postgres).
+    pub rows_estimated: bool,
     /// Ref heads without a row.
     pub heads_missing: u64,
     /// Reachable changesets without a row: an estimate from the counts.
@@ -64,6 +74,8 @@ pub struct RetiredKind {
     pub kind: &'static str,
     /// Rows of the kind and of each kind dropped with it.
     pub rows: BTreeMap<String, u64>,
+    /// Some of `rows` are estimates.
+    pub rows_estimated: bool,
     /// Bytes of values, estimated from a sample; `None` when the store
     /// cannot list rows.
     pub value_bytes: Option<u64>,
@@ -91,6 +103,8 @@ pub struct UpgradePlan {
     /// Reachable changesets, parents first.
     #[serde(skip)]
     order: Vec<ChangesetId>,
+    #[serde(skip)]
+    exact_counts: bool,
 }
 
 impl UpgradePlan {
@@ -111,6 +125,13 @@ impl UpgradePlan {
     pub fn nothing_to_do(&self) -> bool {
         self.to_derive().is_empty() && self.retired.is_empty()
     }
+}
+
+/// How [`plan_upgrade_with`] counts.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PlanOptions {
+    /// Count every kind's rows instead of estimating large ones.
+    pub exact_counts: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -177,9 +198,30 @@ async fn value_bytes(meta: &dyn MetaStore, kind: &str, rows: u64) -> Option<u64>
     Some(total * rows / sample.len() as u64)
 }
 
+/// Rows of `kind`, counted when `exact`, else estimated where the store can.
+async fn rows_of(meta: &dyn MetaStore, kind: &str, exact: bool) -> Result<RowCount> {
+    if exact {
+        Ok(RowCount {
+            rows: meta.count_derived(kind).await?,
+            exact: true,
+        })
+    } else {
+        meta.estimate_derived(kind).await
+    }
+}
+
+/// [`plan_upgrade_with`] with estimates allowed.
+pub async fn plan_upgrade(repo: &Repo, progress: &dyn Progress) -> Result<UpgradePlan> {
+    plan_upgrade_with(repo, PlanOptions::default(), progress).await
+}
+
 /// Walk the history of every ref and count what each derived kind has.
 /// Reads every reachable changeset once and writes nothing.
-pub async fn plan_upgrade(repo: &Repo, progress: &dyn Progress) -> Result<UpgradePlan> {
+pub async fn plan_upgrade_with(
+    repo: &Repo,
+    opts: PlanOptions,
+    progress: &dyn Progress,
+) -> Result<UpgradePlan> {
     let started = Instant::now();
     let meta = repo.meta().clone();
     let refs = meta.list_refs().await?;
@@ -216,6 +258,7 @@ pub async fn plan_upgrade(repo: &Repo, progress: &dyn Progress) -> Result<Upgrad
         elapsed_secs: 0.0,
         heads,
         order,
+        exact_counts: opts.exact_counts,
     };
     p.recount(&*meta).await?;
     p.elapsed_secs = started.elapsed().as_secs_f64();
@@ -227,13 +270,19 @@ impl UpgradePlan {
     async fn recount(&mut self, meta: &dyn MetaStore) -> Result<()> {
         self.current.clear();
         for info in current_kinds() {
-            let rows = meta.count_derived(info.name).await?;
+            let mut count = rows_of(meta, info.name, self.exact_counts).await?;
             let mut heads_missing = 0u64;
             for chunk in self.heads.chunks(PAGE) {
                 let keys: Vec<Hash> = chunk.iter().map(|id| id.0).collect();
                 let have = meta.get_derived_many(info.name, &keys).await?;
                 heads_missing += have.iter().filter(|v| v.is_none()).count() as u64;
             }
+            // With every head stored, the count alone decides between
+            // complete and partial; a lagging estimate must not invent work.
+            if heads_missing == 0 && !count.exact && count.rows < self.reachable {
+                count = rows_of(meta, info.name, true).await?;
+            }
+            let rows = count.rows;
             let status = if self.reachable == 0 || (heads_missing == 0 && rows >= self.reachable) {
                 IndexStatus::Complete
             } else if rows == 0 {
@@ -252,13 +301,14 @@ impl UpgradePlan {
             };
             for also in companions(info) {
                 if let Some(b) = bytes {
-                    let n = meta.count_derived(also).await?;
+                    let n = rows_of(meta, also, self.exact_counts).await?.rows;
                     bytes = value_bytes(meta, also, n).await.map(|a| a + b);
                 }
             }
             self.current.push(CurrentKind {
                 kind: info.name,
                 rows,
+                rows_estimated: !count.exact,
                 heads_missing,
                 missing,
                 status,
@@ -272,8 +322,12 @@ impl UpgradePlan {
             };
             let mut rows = BTreeMap::new();
             let mut bytes = Some(0u64);
+            let mut estimated = false;
             for kind in std::iter::once(info.name).chain(also.iter().copied()) {
-                let n = meta.count_derived(kind).await?;
+                // Whether any remain is exact either way.
+                let count = rows_of(meta, kind, self.exact_counts).await?;
+                estimated |= !count.exact;
+                let n = count.rows;
                 rows.insert(kind.to_string(), n);
                 if let Some(b) = bytes {
                     bytes = value_bytes(meta, kind, n).await.map(|v| v + b);
@@ -283,6 +337,7 @@ impl UpgradePlan {
                 self.retired.push(RetiredKind {
                     kind: info.name,
                     rows,
+                    rows_estimated: estimated,
                     value_bytes: bytes,
                 });
             }
@@ -346,6 +401,7 @@ pub async fn run_upgrade(
         elapsed_secs: 0.0,
         heads: plan.heads.clone(),
         order: Vec::new(),
+        exact_counts: plan.exact_counts,
     };
     after.recount(&*meta).await?;
     Ok(UpgradeReport {

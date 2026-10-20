@@ -25,6 +25,6 @@ pub use hash::Hash;
 pub use path::RepoPath;
 pub use store::{
     check_ref_chain, BlobMeta, BlobStore, DeleteStep, DerivedRow, MetaStore, RefLogEntry, RefStep,
-    RefUpdateContext,
+    RefUpdateContext, RowCount,
 };
 pub use tree::{TreeEntry, TreeNode};

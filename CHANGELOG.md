@@ -676,6 +676,11 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   default 340 MiB) sets the budget of the derived-index caches, which were
   fixed. Defaults are unchanged (OPERATIONS.md, "Connection pool and
   caches").
+- `upgrade-index` plans in seconds on large Postgres stores: kinds over
+  100,000 rows are estimated from planner statistics (marked `~`) instead
+  of `count(*)`, which took about 32 s a kind on all of Linux. Counts are
+  exact where a decision rests on them, and `--exact-counts` counts
+  everything. New `MetaStore::estimate_derived`.
 
 ### Git compatibility (M7)
 - Live git mirror (ADR 0046): `leep-git mirror run` keeps a git remote

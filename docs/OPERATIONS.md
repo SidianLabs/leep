@@ -700,7 +700,17 @@ leep-server upgrade-index --yes --drop-retired --old-servers-stopped   # then dr
 ```
 
 - The plan reads the history of every ref once (about the time `repair
-  rederive` takes to plan) and counts rows without reading them. For each
+  rederive` takes to plan) and counts rows without reading them. On
+  Postgres it estimates a kind of more than 100,000 rows from the planner's
+  statistics, which takes milliseconds where `count(*)` takes about 30 s a
+  kind on all of Linux. Estimates are marked `~`. It counts exactly where a
+  decision rests on the number: whether a kind has any rows (always exact),
+  and whether a kind whose ref heads all have rows is short. An estimate
+  below the reachable changesets is checked with a count before the plan
+  calls the kind partial. One case is caught only by an exact count: an
+  interrupted `repair drop` of a *current* kind that left the heads' rows,
+  before autovacuum's `ANALYZE` has seen the delete. After such a drop, run
+  `ANALYZE derived` or pass `--exact-counts`. SQLite always counts. For each
   kind this version reads it shows rows, how many reachable changesets lack
   one, and `complete`, `partial` or `missing`; then the retired kinds that
   still have rows (such as `history-tree-v3` with `history-node-v3`) and the

@@ -7,7 +7,7 @@ use leep_core::prefix::IdPrefix;
 use leep_core::store::unix_now;
 use leep_core::{
     check_ref_chain, Changeset, ChangesetId, DeleteStep, DerivedRow, Hash, MetaStore, RefLogEntry,
-    RefStep, RefUpdateContext, Result,
+    RefStep, RefUpdateContext, Result, RowCount,
 };
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{PgConnection, PgPool, Row};
@@ -221,6 +221,43 @@ impl PostgresMetaStore {
         let report = migrate::drive(&mut PgSession(&mut tx), migrations, write).await?;
         tx.commit().await.map_err(storage)?;
         Ok(report)
+    }
+}
+
+/// Kinds with fewer rows than this are counted, not estimated; counting
+/// this many takes milliseconds.
+const EXACT_UP_TO: i64 = 100_000;
+
+/// `reltuples`, and the most common values of `kind` with their frequencies.
+type StatsRow = (f64, Option<Vec<String>>, Option<Vec<f64>>);
+
+impl PostgresMetaStore {
+    /// Rows of `kind` by the last `ANALYZE`: the table's row estimate times
+    /// the kind's frequency among its most common values. `None` when the
+    /// table was never analyzed or the kind is not among them.
+    async fn planner_rows(&self, kind: &str) -> Result<Option<u64>> {
+        let row: Option<StatsRow> = sqlx::query_as(
+            "SELECT c.reltuples::float8, s.most_common_vals::text::text[], \
+                    s.most_common_freqs::float8[] \
+             FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+             LEFT JOIN pg_stats s ON s.schemaname = n.nspname AND s.tablename = c.relname \
+                 AND s.attname = 'kind' \
+             WHERE c.oid = 'derived'::regclass",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(storage)?;
+        let Some((tuples, Some(vals), Some(freqs))) = row else {
+            return Ok(None);
+        };
+        if tuples <= 0.0 {
+            return Ok(None);
+        }
+        Ok(vals
+            .iter()
+            .zip(&freqs)
+            .find(|(v, _)| v.as_str() == kind)
+            .map(|(_, f)| (tuples * f).round() as u64))
     }
 }
 
@@ -832,6 +869,38 @@ impl MetaStore for PostgresMetaStore {
             .await
             .map_err(storage)?;
         Ok(n as u64)
+    }
+
+    /// Up to [`EXACT_UP_TO`] rows are counted; past that, the planner's
+    /// statistics give the kind's share of the table (ADR 0052). Counting
+    /// a large kind reads its whole index: about 30 s a kind on all of
+    /// Linux.
+    async fn estimate_derived(&self, kind: &str) -> Result<RowCount> {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM (SELECT 1 FROM derived WHERE kind = $1 LIMIT $2) t",
+        )
+        .bind(kind)
+        .bind(EXACT_UP_TO)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(storage)?;
+        if n < EXACT_UP_TO {
+            return Ok(RowCount {
+                rows: n as u64,
+                exact: true,
+            });
+        }
+        match self.planner_rows(kind).await? {
+            Some(est) => Ok(RowCount {
+                rows: est.max(EXACT_UP_TO as u64),
+                exact: false,
+            }),
+            // Not analyzed since the kind grew: count.
+            None => Ok(RowCount {
+                rows: self.count_derived(kind).await?,
+                exact: true,
+            }),
+        }
     }
 
     /// See [`crate::drop`]: the first step counts the rows and the table's
