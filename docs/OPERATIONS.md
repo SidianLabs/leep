@@ -45,12 +45,13 @@ measured until the response head is ready, not until the body is streamed.
 | `leep_land_cancelled_total` | counter | none | Lands whose caller went away (timeout, disconnect) while queued, dropped before their batch replayed them. |
 | `leep_land_leases_held` | gauge | none | Refs whose land lease this server holds ([Several servers on one ref](#several-servers-on-one-ref), ADR 0056). |
 | `leep_land_lease_acquired_total` | counter | none | Land leases this server took. Under steady traffic about one per hot ref per server restart; more means leases change hands. |
-| `leep_land_lease_lost_total` | counter | `reason` = `taken`, `idle` | Leases this server stopped holding: another server took it after this one failed to renew (`taken`), or it released it after 30 s without a land (`idle`). |
-| `leep_land_forwarded_total` | counter | `outcome` = `answered`, `not_leader`, `failed`, `lease_changed` | Lands this server sent to the lease holder. `failed` (no answer: refused, reset, address not allowed) is retried to the same holder or its successor, never batched here while the lease is live. |
+| `leep_land_lease_lost_total` | counter | `reason` = `taken`, `idle` | Leases this server stopped holding: another server took it after this one failed to renew it for the TTL (`taken`), or it released it after 30 s without a land (`idle`). |
+| `leep_land_forwarded_total` | counter | `outcome` = `answered`, `not_leader`, `failed`, `lease_changed`; with `failed`, `reason` = `not_allowed`, `connect`, `timeout`, `reset`, `redirect` | Lands this server sent to the lease holder. `failed` (no answer) is retried to the same holder or its successor, never batched here while the lease is live; `not_allowed` means the lease names an address outside the allow-list. |
+| `leep_land_lease_read_failed_total` | counter | none | Reads of a lease that failed; the land went on with the last lease read while that was still live. |
 | `leep_land_forward_gave_up_total` | counter | none | Lands answered 409 after 30 s without reaching the server coordinating their ref. |
 | `leep_land_received_forwarded_total` | counter | none | Lands forwarded here by an allowed peer. |
 | `leep_land_rerouted_total` | counter | none | Lands handed back because this server lost the lease before replaying them; each is routed again. |
-| `leep_land_routed_total` | counter | `route` = `uncoordinated` | Lands batched here with coordination on but no lease: the store could not be read or written, or the server is shutting down. They race the CAS as without coordination. |
+| `leep_land_routed_total` | counter | `route` = `uncoordinated` | Lands batched here with coordination on but no lease: no live lease was known and none could be taken (the store failing). They race the CAS as without coordination. |
 | `leep_derive_total` | counter | `kind` | Derived values computed (cache hits in the meta store are not counted). |
 | `leep_derive_duration_seconds` | histogram | `kind` | Time to compute one derived value. |
 | `leep_warm_refs_total` | counter | `result` = `ok`, `error` | Ref heads the background warmer derived indexes for (ADR 0028). Errors are retried on the next pass. |
@@ -358,13 +359,19 @@ swap while the others' agents wait tens of seconds (`docs/PERFORMANCE.md`,
 server per ref, the holder of the ref's lease in the `land_leases` table,
 batches every land on it; the others forward lands to it over HTTP.
 
-**Turn it on for every server of a multi-server deployment.** It is off by
-default. A single server, or SQLite, does not need it.
+**Status.** Off by default. A single server, or SQLite, does not need it. For
+several servers on one Postgres it removes the starvation (no agent stalled
+in any bench run), but on one shared host it cost 9 to 25% of one server's
+throughput (`docs/PERFORMANCE.md`). It will be recommended as the
+multi-server default only after throughput is measured with the servers on
+separate hosts at 95% of one server's or better. Until then the alternative
+is to route `POST /v1/land` to one instance at the balancer
+(`docs/RUNBOOKS.md`, LeepLandExhausted).
 
 ```sh
 leep-server --meta postgres://... --blobs ... --listen 0.0.0.0:7070 \
   --land-coordination on \
-  --advertise-url http://10.0.3.7:7070 \
+  --advertise-url http://10.0.3.7:7070/ \
   --peer-cidr 10.0.3.0/24
 ```
 
@@ -372,11 +379,24 @@ leep-server --meta postgres://... --blobs ... --listen 0.0.0.0:7070 \
 |---|---|---|
 | `--land-coordination on\|off` | `LEEP_LAND_COORDINATION` | Default `off`. Needs Postgres or SQLite, `--advertise-url` and an allow-list. |
 | `--advertise-url URL` | `LEEP_ADVERTISE_URL` | Where other servers reach this one directly, not through the balancer. Checked at startup: the server fetches `URL/v1/health` and refuses to start unless the answer comes from itself. |
-| `--peer-url-prefix P` | `LEEP_PEER_URL_PREFIX` | Repeatable (comma-separated in the variable). A land, with its client's token, is forwarded only to a lease address that starts with one of these... |
-| `--peer-cidr NET` | `LEEP_PEER_CIDR` | ...or whose host is an IP address in one of these networks. Requests from these networks (and from the IP hosts of the prefixes) may carry forwarded lands. |
+| `--peer-url-prefix P` | `LEEP_PEER_URL_PREFIX` | Repeatable (comma-separated in the variable). A land, with its client's token, is forwarded only to a lease address that starts with one of these, compared as raw text: write the scheme, host, port and the trailing slash, `https://leep-1.internal:7070/`, never `https://leep-` (which also matches `https://leep-evil.example`). |
+| `--peer-cidr NET` | `LEEP_PEER_CIDR` | ...or whose host is an IP address in one of these networks. Requests from these networks (and from the IP hosts of the prefixes) are recognised as peers. |
 | `--peer-allow-plain-http` | `LEEP_PEER_ALLOW_PLAIN_HTTP` | Allow `http://` to a host that is not a loopback or private IP address. Without it such a peer needs `https://`. |
-| `--land-lease-ttl` | `LEEP_LAND_LEASE_TTL` | Default `2s`. |
-| `--land-lease-renew` | `LEEP_LAND_LEASE_RENEW` | Default `500ms`. Another server may take a lease not renewed for twice this. |
+| `--land-lease-ttl` | `LEEP_LAND_LEASE_TTL` | Default `2s`. Another server takes over a lease not renewed for this long; the holder itself stops trusting it one renew interval earlier (1.5 s by default). |
+| `--land-lease-renew` | `LEEP_LAND_LEASE_RENEW` | Default `500ms`. At most half the TTL. |
+
+**Peer networks.** `--peer-cidr` must cover the servers' own addresses and
+nothing that forwards client traffic: exclude load balancers, ingress
+controllers and sidecar proxies. A request that reaches a server from a
+peer address with a `Leep-Land-Forward` header skips that token's
+concurrency limit, so a client whose requests arrive through a proxy inside
+a peer network could set the header itself and get round the limit. If the
+servers sit behind a sidecar that connects to them over loopback, list the
+sidecar-free addresses the servers use for each other, not `127.0.0.0/8`. An
+allow-list of host names alone recognises no peer (names are never
+resolved), which the server warns about at startup: forwarded lands are then
+charged the concurrency limit twice, and a land reaching a server that no
+longer leads is forwarded again.
 
 **What it guarantees.** Correctness never depends on the lease: refs move
 only by compare-and-swap, so two servers that both believe they lead are as
@@ -384,34 +404,45 @@ safe as two uncoordinated servers. The lease gives liveness: lands of a ref
 are batched in one place, so no server's agents starve. A server takes a
 ref's lease on the first land it receives for a ref nobody leads, renews it
 every 500 ms in one statement for all its leases, releases it after 30 s
-without a land, and releases all of them at the start of a graceful shutdown.
-A SIGKILLed leader's lease is taken by another server after about a second
-(its last renewal is older than twice the renew interval); measured, every
-agent landed again within 1.3 s (`cargo test -p leep-e2e --test crash`).
+without a land, and releases all of them at the start of a graceful
+shutdown. Lease calls use connections of their own (two on Postgres), so a
+renewal never waits behind the data traffic of a busy pool. A SIGKILLed
+leader's lease is taken over by another server once it has not been
+renewed for the TTL; the crash test checks every agent lands again within
+the TTL plus two seconds (`cargo test -p leep-e2e --test crash`).
 
 **When the leader cannot be reached.** A server whose forward gets no answer
 asks the leader again, or its successor once the lease changes, but never
 batches the land itself while a live lease names another server: the land
 may still be in that server's batch. After 30 s it answers 409, which
-clients already retry. It batches locally only when no live lease exists and
-it cannot take one (the store is failing), counted in
-`leep_land_routed_total{route="uncoordinated"}`.
+clients already retry. When the store cannot be read, a server forwards on
+the last lease it read for as long as that lease's own time left lasts. It
+batches locally only when no live lease is known and none can be taken (the
+store is failing), counted in `leep_land_routed_total{route="uncoordinated"}`.
+A server shutting down answers lands it no longer coordinates with 503
+(`Retry-After: 1`), and `leep land` sends them again under their land id.
 
-**Security.** A forward carries the client's own token, and the leader
-authenticates it and applies its own land policy, so forwarding grants no
-identity. Tokens are sent only to addresses on the allow-list, never through
-a redirect, and over plain http only to loopback or private addresses unless
-`--peer-allow-plain-http`. The `Leep-Land-Forward` header is a hint: from an
-allowed peer address it exempts the land from the per-token concurrency cap
-(the sending server holds the permit) and stops it being forwarded again;
-from anywhere else it is ignored. Rate limits are charged on both servers.
+**Security.** A forward carries the client's own token to another server on
+the allow-list, and the leader authenticates it and applies its own land
+policy, so forwarding grants no identity. Tokens are sent only to addresses
+on the allow-list, never through a redirect, and over plain http only to
+loopback or private addresses unless `--peer-allow-plain-http`. Lease
+addresses come from the metadata store, and anyone who can write it could
+point a lease at another address; the allow-list bounds where a token can
+go to the servers the operator listed. That is no new exposure: write access
+to the metadata store already owns every ref of the repository. The store
+holds no secret for coordination. The `Leep-Land-Forward` header is a hint:
+from an allowed peer address it exempts the land from the per-token
+concurrency cap (the sending server holds the permit) and stops it being
+forwarded again; from anywhere else it is ignored. Rate limits are charged
+on both servers.
 
 **Rollout.** Servers from before this change do not read leases and keep
 landing locally, racing the leader. During a rolling upgrade, keep routing
-`POST /v1/land` to one instance at the balancer (`docs/RUNBOOKS.md`,
-LeepLandExhausted), then turn coordination on everywhere and remove the rule.
-Migration 0006 only adds the empty `land_leases` table. To back out, set
-`--land-coordination off`; leases left behind expire within two seconds.
+`POST /v1/land` to one instance at the balancer, then turn coordination on
+everywhere and remove the rule. Migration 0006 only adds the empty
+`land_leases` table. To back out, set `--land-coordination off`; leases left
+behind expire within the TTL.
 
 A tier of dedicated landing servers (API servers that only forward, landers
 that only lead) is future work; today every coordinating server can lead.

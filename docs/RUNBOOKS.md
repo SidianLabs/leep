@@ -524,7 +524,10 @@ are unaffected. Nothing is lost or landed twice.
 
 **Diagnose.**
 
-1. Which holder: `SELECT ref_name, holder, address, epoch FROM land_leases`
+1. Why: `sum by (reason) (rate(leep_land_forwarded_total{outcome="failed"}[10m]))`
+   on the senders. `not_allowed` is step 2; `connect` and `timeout` are
+   step 3; `reset` with a healthy network points at the holder (step 4).
+   Which holder: `SELECT ref_name, holder, address, epoch FROM land_leases`
    on the metadata store, and the WARN lines `peer address ... is not
    allowed` on the senders.
 2. An address the senders refuse: it is outside their `--peer-url-prefix` /
@@ -551,7 +554,7 @@ WARN lines and the [standard bundle](#collecting-a-bug-report).
 
 **Meaning.** Land leases were taken more than six times a minute for 10
 minutes (`leep_land_lease_acquired_total`). **Ticket.** A lease changes hands
-only when its holder failed to renew it for a second, released it after 30 s
+only when its holder failed to renew it for the TTL (2 s), released it after 30 s
 idle, or shut down.
 
 **Impact.** Each change costs the lands in flight on the old holder a
@@ -564,7 +567,9 @@ without coordination. Correctness is unaffected.
    holder failed to renew; `idle` with reacquisitions means refs that see a
    land every half minute or so (harmless churn, raise nothing).
 2. Renewals failing: the metadata store's latency and errors (a renewal is
-   one `UPDATE` every 500 ms per server), and the servers' logs.
+   one `UPDATE` every 500 ms per server, on connections reserved for lease
+   calls, so a busy pool does not delay it; a slow or overloaded database
+   does), and the servers' logs.
 3. Servers restarting: `LeepServerDown`, deploy history.
 4. Clock: Postgres judges lease times by its own clock, so server clocks do
    not matter; SQLite judges by the host's clock.

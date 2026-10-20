@@ -81,17 +81,24 @@ refuse, and a store that refuses is left uncoordinated.
 
 - **Take.** `INSERT ... ON CONFLICT DO UPDATE ... WHERE` the row is the
   claimant's own, or `expires_at` has passed, or `renewed_at` is older than
-  `stale_after`, which is twice the renew interval. A live lease of another
+  the caller's `stale_after`. The coordinator passes the TTL as
+  `stale_after`, so there is one rule: a lease is taken over one TTL after
+  its last renewal. A live lease of another
   server is never taken: there is no stealing, even when its address does
   not answer. The epoch grows by one whenever the holder changes. A
   release sets both times to 0 instead of deleting the row, so the epoch
   never falls.
-- **Timing.** The TTL is 2 s (`--land-lease-ttl`). One statement renews
-  every lease a process holds, every 500 ms (`--land-lease-renew`).
-  Another server may take a lease once its last renewal is 1 s old.
-  Failover after a crash therefore comes from the short lease. After a
-  graceful shutdown it comes from the release: a server gives up its
-  leases when shutdown starts, before it drains its requests.
+- **Timing.** The TTL is 2 s (`--land-lease-ttl`), and it means what it
+  says: another server may take a lease once its last renewal is one TTL
+  old. One statement renews every lease a process holds, every 500 ms
+  (`--land-lease-renew`, at most half the TTL). Failover after a crash
+  therefore comes from the short lease. After a graceful shutdown it comes
+  from the release: a server gives up its leases when shutdown starts,
+  before it drains its requests.
+- **A connection of its own.** Lease calls never wait behind data traffic.
+  On Postgres they use a pool of two connections of their own, opened on
+  first use; a renewal that queued behind a saturated data pool for longer
+  than the takeover window would hand the lease over with nothing wrong.
 - **The holder's own view.** The store reports the time left: the lesser
   of `expires_at` and `renewed_at + stale_after`, minus now. A holder trusts
   its lease until the moment it sent its last successful renewal, plus that
@@ -118,14 +125,22 @@ loop, for at most 30 s (then 409, which clients retry):
       no answer     → wait one renew interval, or less if the lease changes; route again
       (while a forward is in flight, a change of holder or epoch, or expiry, abandons it)
   no live lease → take it → batch it here
-  the store cannot be read or written, or this server is shutting down → batch it here, uncoordinated
+  the store cannot be read → forward on the last lease read, while its own time left lasts
+  no live lease known, none can be taken (the store failing) → batch it here, uncoordinated
+  this server is shutting down, no other live lease → 503 Not-Leader; the client sends it again
 ```
 
 - **H1, never batch locally under a live lease.** A follower whose forward
   gets no answer asks the holder again, or its successor once the lease
   changes. The land may still be in the holder's batch, and batching it in
-  two places is the race this ADR removes. It is batched locally only when
-  no live lease exists and none can be taken.
+  two places is the race this ADR removes. When the store cannot be read,
+  a server forwards on the last lease it read, for as long as that
+  lease's reported time left has not run out. It is batched locally only
+  when no live lease is known and none can be taken.
+- **Shutdown.** A server that has started shutting down never batches a
+  land itself again. A land it does not hand to another live holder,
+  including one its own batches handed back, is answered 503 with
+  `Retry-After: 1`; `leep land` sends it again under its land id.
 - **Repeats are safe.** `land` finds its earlier landing (ADR 0021, and the
   land id of ADR 0057).
 - **Step-down.** A leader asks `still_leading` before every attempt of a
@@ -160,10 +175,22 @@ loop, for at most 30 s (then 409, which clients retry):
     and checks that `GET {advertise-url}/v1/health` answers with its own
     `Leep-Instance` header. A wrong URL stops the server instead of
     stranding lands.
+  - `--peer-url-prefix` is compared as raw text, so it is written with the
+    port and trailing slash (`https://leep-1.internal:7070/`).
+  - A server whose allow-list has host names only warns at startup: no
+    request can be recognised as a peer's, so forwarded lands are charged
+    the concurrency limit twice and may be forwarded again.
 - **H3, no shared key.** The forward header is an unauthenticated hint. It
   counts only on a request whose peer address is a `--peer-cidr` address or
   a prefix's IP host. From anywhere else it is ignored and the request is
-  an ordinary client land.
+  an ordinary client land. Peer networks must therefore exclude load
+  balancers and sidecar proxies, or a client behind one could set the
+  header and skip its concurrency limit.
+- **Threat model.** A forward carries a client's token to another server.
+  Lease addresses come from the metadata store, so whoever can write the
+  store could point a lease elsewhere; the allow-list keeps tokens within
+  the servers the operator listed. That adds nothing: write access to the
+  store already owns every ref. The store holds no secret for coordination.
 - **Limits for forwarded lands.** The follower charges the token's rate and
   concurrency limits as for any request. The leader skips only the
   per-token concurrency permit for a recognised forward, since the follower
@@ -175,8 +202,10 @@ loop, for at most 30 s (then 409, which clients retry):
 ### Modes and rollout
 `--land-coordination on|off`, default `off`.
 
-- `on` needs Postgres or SQLite, `--advertise-url` and an allow-list. Docs
-  recommend `on` for every server of a multi-server deployment.
+- `on` needs Postgres or SQLite, `--advertise-url` and an allow-list. It
+  stays off by default, and is recommended as the multi-server default
+  only once throughput is measured at 95% of one server's or better with
+  the servers on separate hosts (see Testing).
 - Servers from before this change, and servers with `off`, never read
   leases. They land locally and race the leader through the CAS: correct,
   but contended. During a rolling upgrade, keep `/v1/land` pinned to one
@@ -193,7 +222,9 @@ None of these carries a ref label.
 - `leep_land_leases_held` (gauge).
 - `leep_land_lease_acquired_total`.
 - `leep_land_lease_lost_total{reason=taken|idle}`.
-- `leep_land_forwarded_total{outcome=answered|not_leader|failed|lease_changed}`.
+- `leep_land_forwarded_total{outcome=answered|not_leader|failed|lease_changed}`,
+  with `reason=not_allowed|connect|timeout|reset|redirect` on `failed`.
+- `leep_land_lease_read_failed_total`.
 - `leep_land_forward_gave_up_total`.
 - `leep_land_received_forwarded_total`.
 - `leep_land_rerouted_total`.
@@ -252,6 +283,18 @@ These are the differences from the first draft, made at review:
 - The per-ref queue bound and `--land-batch-max` of the draft are dropped
   from this change.
 
+The code review of the implementation added:
+
+- Lease calls on connections of their own, after renewals queued behind a
+  saturated pool handed leases over under load.
+- One takeover rule, the TTL, instead of a separate window of twice the
+  renew interval.
+- When a lease cannot be read, the last lease read is used while it is
+  still live, instead of batching locally (a gap in H1).
+- A server shutting down answers lands 503 instead of batching them.
+- The startup warning for an allow-list of host names, failure reasons on
+  `leep_land_forwarded_total`, and the peer-network and prefix guidance.
+
 ## Testing
 - **Store contract** on memory, SQLite and Postgres: take, keep, refuse a
   live lease, take over a stale or expired one at the next epoch, renew
@@ -269,7 +312,10 @@ These are the differences from the first draft, made at review:
     TTL + 2 s;
   - a wrong advertise address: the lease never changes hands, and
     followers give up with 409 instead of landing;
-  - release on shutdown and when idle;
+  - release on shutdown and when idle, and a shutting-down server
+    answering Not-Leader instead of batching;
+  - lease reads failing on every server but a healthy leader (a 300-seed
+    sweep): lands keep reaching the leader and none is batched elsewhere;
   - a 300-seed sweep with store faults, lost and reset forwards, and a
     leader killed or paused.
 
@@ -285,19 +331,20 @@ These are the differences from the first draft, made at review:
   multi-server results: 2 and 3 servers, 8, 64 and 256 agents, three
   rotated rounds on a shared 4-vCPU host.
   - Met: no stalled agents in any run (4 to 171 per run before), land max
-    at most 1.5 times one server's (22 to 30 s before), no 409s, no lost
-    swaps.
-  - Not met: throughput was 74 to 96% of one server's at the same total
+    at most 1.2 times one server's (22 to 30 s before), no 409s, no lost
+    swaps. Six further runs at 256 agents took the lease once each and
+    ended at epoch 1: no handover without a failure.
+  - Not met: throughput was 75 to 91% of one server's at the same total
     agents, against the 95% target. Every process shares the one host, and
     a forwarded land costs the follower an extra request and answer on the
-    same CPUs as the leader's replays. On separate hosts the follower's
-    work is not taken from the leader. Measuring that is the next check.
+    same CPUs as the leader's replays. The target must be re-measured with
+    the servers on separate hosts before `on` is recommended as the
+    multi-server default.
   - The bench also found that a leader replayed lands created on other
     servers with cold caches: parents and generations were read one at a
     time, and the rebase-link prefetch was skipped. A batch now learns them
     in one batched read first. That raised throughput through a follower
-    from 122 to 147 lands/s at 8 agents, and the multi-server ratio from
-    54-78% to 74-96%.
+    from 122 to 147 lands/s at 8 agents.
 
 ## Consequences
 - However many servers take traffic, a ref's lands are batched in one

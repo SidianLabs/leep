@@ -187,11 +187,11 @@ struct Args {
     /// private addresses (a client's token crosses that network).
     #[arg(long, env = "LEEP_PEER_ALLOW_PLAIN_HTTP")]
     peer_allow_plain_http: bool,
-    /// How long a land lease lives after a renewal.
+    /// Another server takes over a land lease not renewed for this long;
+    /// the holder stops trusting it one renew interval earlier.
     #[arg(long, env = "LEEP_LAND_LEASE_TTL", default_value = "2s", value_parser = parse_ready_timeout)]
     land_lease_ttl: std::time::Duration,
-    /// How often held land leases are renewed; another server may take a
-    /// lease not renewed for twice this long.
+    /// How often held land leases are renewed.
     #[arg(long, env = "LEEP_LAND_LEASE_RENEW", default_value = "500ms", value_parser = parse_ready_timeout)]
     land_lease_renew: std::time::Duration,
     #[command(subcommand)]
@@ -924,6 +924,15 @@ fn land_coordination(
     policy
         .check_url(&address)
         .map_err(|e| anyhow::anyhow!("--advertise-url: {e}"))?;
+    if !policy.recognises_peers() {
+        tracing::warn!(
+            "the peer allow-list names hosts only (no --peer-cidr, no IP address in \
+             --peer-url-prefix): no request is recognised as a peer's, so forwarded lands \
+             are charged the per-token concurrency limit again on the coordinating server, \
+             and one that arrives at a server that no longer leads is forwarded again; \
+             add --peer-cidr for the servers' network"
+        );
+    }
     let mut id = [0u8; 16];
     getrandom::fill(&mut id).map_err(|e| anyhow::anyhow!("random holder id: {e}"))?;
     let holder = hex::encode(id);

@@ -252,14 +252,14 @@ impl LandForward<Result<LandResponse>> for Fwd {
             .iter()
             .find(|n| n.address == lease.address && n.address != UNREACHABLE)
         else {
-            return Forwarded::Failed("no server at that address".into());
+            return Forwarded::failed("connect", "no server at that address");
         };
         let (drop, lose) = {
             let mut r = self.net.rng.lock().unwrap();
             (r.chance(self.net.drop), r.chance(self.net.lose))
         };
         if drop {
-            return Forwarded::Failed("reset before it was sent".into());
+            return Forwarded::failed("reset", "reset before it was sent");
         }
         let out = node
             .call(node.repo.land_coordinated(
@@ -274,10 +274,10 @@ impl LandForward<Result<LandResponse>> for Fwd {
             .await;
         if lose {
             self.net.lost.fetch_add(1, Ordering::Relaxed);
-            return Forwarded::Failed("answer lost".into());
+            return Forwarded::failed("reset", "answer lost");
         }
         match out {
-            None => Forwarded::Failed("server died".into()),
+            None => Forwarded::failed("reset", "server died"),
             Some(Ok(Coordinated::Landed(r))) => Forwarded::Answered(Ok(r)),
             Some(Ok(Coordinated::NotLeader)) => Forwarded::NotLeader,
             Some(Ok(Coordinated::Forwarded(_))) => unreachable!("NoForward panics"),
@@ -472,7 +472,7 @@ async fn lease_now(w: &World) -> LandLease {
             REF,
             LeaseTiming {
                 ttl: Duration::from_secs(2),
-                stale_after: Duration::from_secs(1),
+                stale_after: Duration::from_secs(2),
             },
         )
         .await
@@ -733,7 +733,7 @@ async fn leases_are_released_on_shutdown_and_when_idle() {
             {
                 Coordinated::Landed(_) => "here",
                 Coordinated::Forwarded(_) => "forwarded",
-                Coordinated::NotLeader => unreachable!(),
+                Coordinated::NotLeader => "not leader",
             }
         }
     };
@@ -741,6 +741,9 @@ async fn leases_are_released_on_shutdown_and_when_idle() {
     assert_eq!(land(b.clone(), "b1").await, "forwarded");
     let t = Instant::now();
     a.coord.shutdown().await;
+    // A server that gave its lease up never batches a land itself again; the
+    // client sends it elsewhere.
+    assert_eq!(land(a.clone(), "a2").await, "not leader");
     assert_eq!(land(b.clone(), "b2").await, "here");
     assert!(t.elapsed() < Duration::from_millis(100), "taken at once");
     assert_eq!(lease_now(&w).await.epoch, 2);
@@ -748,6 +751,76 @@ async fn leases_are_released_on_shutdown_and_when_idle() {
     tokio::time::sleep(b.coord.config().idle_release + Duration::from_secs(2)).await;
     assert_eq!(b.coord.held_epoch(REF), None, "released when idle");
     assert!(!lease_now(&w).await.is_live());
+}
+
+/// Reads of the lease fail on every server but the leader. Lands keep going
+/// to the leader on the last lease each server read, and none is batched
+/// anywhere else (H1).
+#[tokio::test(start_paused = true)]
+async fn failing_lease_reads_keep_lands_on_the_leader() {
+    let mut failed_reads = 0;
+    for seed in seeds() {
+        let w = world(seed);
+        seed_main(seed, &w).await;
+        // Swaps take a while, so the lands span many lease reads.
+        w.plan.rate(
+            &[Op::CasRef],
+            1000,
+            Fault::Delay(Duration::from_millis(300)),
+        );
+        let flaky = FaultPlan::new(seed);
+        flaky.pause();
+        flaky.rate(&[Op::Lease], 500, Fault::Fail);
+        let nodes: Vec<_> = (0..3)
+            .map(|i| {
+                let plan = if i == 0 { &w.plan } else { &flaky };
+                node(&w, plan, i, format!("node-{i}"), |_| {})
+            })
+            .collect();
+        let net = net(nodes, seed, 0, 0);
+        // The leader takes the lease, and every server reads it once.
+        for (i, n) in net.nodes.iter().enumerate() {
+            let head = w.meta.get_ref(REF).await.unwrap();
+            let file = format!("warm-{i}");
+            let cs = commit_file(seed, &w.clean, head, &file, "w\n", &file).await;
+            let fwd = Fwd {
+                net: net.clone(),
+                cs,
+                land_id: None,
+            };
+            n.repo
+                .land_coordinated(cs, REF, None, true, None, false, &fwd)
+                .await
+                .unwrap();
+        }
+        assert_eq!(net.nodes[0].coord.held_epoch(REF), Some(1));
+        flaky.resume();
+        let mut tasks = Vec::new();
+        for n in 0..24 {
+            tasks.push(tokio::spawn(agent(
+                seed,
+                net.clone(),
+                w.clean.clone(),
+                n,
+                1,
+            )));
+        }
+        for t in tasks {
+            t.await.unwrap();
+        }
+        failed_reads += flaky.injected().total();
+        for n in &net.nodes {
+            assert_eq!(
+                n.coord.uncoordinated_lands(),
+                0,
+                "seed {seed}: a land was batched without the lease"
+            );
+        }
+        assert_eq!(lease_now(&w).await.epoch, 1, "seed {seed}");
+    }
+    // How many reads a seed makes depends on scheduling; across the sweep
+    // the case must have been exercised.
+    assert!(failed_reads > 0, "no lease read failed");
 }
 
 /// Store faults, lost and reset forwards, and a leader killed or paused at

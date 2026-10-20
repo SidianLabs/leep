@@ -39,10 +39,10 @@ pub struct CoordinatorConfig {
     pub holder: String,
     /// Where other servers send this one lands (`--advertise-url`).
     pub address: String,
-    /// How long a lease lives after a renewal.
+    /// Another server may take a lease not renewed for this long; the
+    /// holder itself stops trusting it one `renew` earlier.
     pub ttl: Duration,
-    /// How often held leases are renewed. Another server may take a lease
-    /// not renewed for twice this long.
+    /// How often held leases are renewed.
     pub renew: Duration,
     /// A lease with no land for this long is released.
     pub idle_release: Duration,
@@ -66,7 +66,8 @@ impl CoordinatorConfig {
     pub fn timing(&self) -> LeaseTiming {
         LeaseTiming {
             ttl: self.ttl,
-            stale_after: self.renew * 2,
+            // One rule: a lease is taken over `ttl` after its last renewal.
+            stale_after: self.ttl,
         }
     }
 }
@@ -78,9 +79,13 @@ pub enum Route {
     Lead(u64),
     /// Another server holds a live lease.
     Forward(LandLease),
-    /// No live lease and none could be taken (the store failed, or this
-    /// server is shutting down): batch it here, racing the CAS as before.
+    /// No live lease is known and none could be taken (the store failed):
+    /// batch it here, racing the CAS as before.
     Uncoordinated,
+    /// This server is shutting down and no other server holds a live
+    /// lease: the land is answered Not-Leader (503), and the client sends
+    /// it again, to a server that will take the lease.
+    ShuttingDown,
 }
 
 /// What a forward to the lease holder came back with.
@@ -90,8 +95,21 @@ pub enum Forwarded<A> {
     /// It does not hold the lease any more.
     NotLeader,
     /// No answer: refused, reset, timed out, or the address is not allowed.
-    /// The land may or may not have happened there.
-    Failed(String),
+    /// The land may or may not have happened there. `reason` is a short
+    /// metric label (`not_allowed`, `connect`, `timeout`, `reset`, ...).
+    Failed {
+        reason: &'static str,
+        detail: String,
+    },
+}
+
+impl<A> Forwarded<A> {
+    pub fn failed(reason: &'static str, detail: impl Into<String>) -> Self {
+        Forwarded::Failed {
+            reason,
+            detail: detail.into(),
+        }
+    }
 }
 
 /// Sends one land to the server named by a lease.
@@ -126,6 +144,9 @@ struct Held {
 struct Seen {
     lease: Option<LandLease>,
     read_at: Instant,
+    /// A forward to it failed: read again before trusting it, but keep it
+    /// as the fallback while the store cannot be read.
+    stale: bool,
 }
 
 #[derive(Default)]
@@ -285,7 +306,7 @@ impl LandCoordinator {
     async fn read(&self, r: &str, fresh: bool) -> Result<Option<LandLease>> {
         if !fresh {
             let s = self.lock();
-            if let Some(seen) = s.seen.get(r) {
+            if let Some(seen) = s.seen.get(r).filter(|seen| !seen.stale) {
                 let age = Instant::now().duration_since(seen.read_at);
                 if age < self.cfg.renew / 2 {
                     return Ok(seen.lease.clone().map(|mut l| {
@@ -302,14 +323,31 @@ impl LandCoordinator {
             Seen {
                 lease: lease.clone(),
                 read_at,
+                stale: false,
             },
         );
         Ok(lease)
     }
 
-    /// Drop the cached lease of `r`, after a forward to it failed.
+    /// The last lease of `r` read, if it named another server and has not
+    /// run out by its own reported time since: what a land falls back on
+    /// while the store cannot be read, so it is never batched here under a
+    /// lease another server may still hold (H1).
+    fn cached_live(&self, r: &str) -> Option<LandLease> {
+        let s = self.lock();
+        let seen = s.seen.get(r)?;
+        let mut l = seen.lease.clone()?;
+        let age = Instant::now().duration_since(seen.read_at);
+        l.remaining = l.remaining.checked_sub(age)?;
+        (l.is_live() && l.holder != self.cfg.holder).then_some(l)
+    }
+
+    /// Read `r`'s lease again before the next forward, after a forward to it
+    /// failed.
     pub fn forget(&self, r: &str) {
-        self.lock().seen.remove(r);
+        if let Some(seen) = self.lock().seen.get_mut(r) {
+            seen.stale = true;
+        }
     }
 
     /// Where a land on `r` goes now. Takes the lease when nobody holds a
@@ -331,13 +369,20 @@ impl LandCoordinator {
         }
         let lease = match self.read(r, false).await {
             Ok(l) => l,
-            Err(_) => return Route::Uncoordinated,
+            Err(_) => {
+                metrics::counter!("leep_land_lease_read_failed_total").increment(1);
+                return match self.cached_live(r) {
+                    Some(l) => self.forward_to(l),
+                    None if self.lock().stopped => Route::ShuttingDown,
+                    None => Route::Uncoordinated,
+                };
+            }
         };
         if let Some(l) = lease.filter(|l| l.is_live() && l.holder != self.cfg.holder) {
             return self.forward_to(l);
         }
         if self.lock().stopped {
-            return Route::Uncoordinated;
+            return Route::ShuttingDown;
         }
         let claim = LeaseClaim {
             ref_name: r,
@@ -355,7 +400,9 @@ impl LandCoordinator {
                 let mut s = self.lock();
                 s.seen.remove(r);
                 let epoch = l.epoch;
-                s.held.insert(
+                // Lands that arrive together all claim the free lease; only
+                // the first claim of an epoch counts as taking it.
+                let before = s.held.insert(
                     r.to_string(),
                     Held {
                         epoch,
@@ -366,8 +413,10 @@ impl LandCoordinator {
                 let n = s.held.len();
                 drop(s);
                 self.set_held_gauge(n);
-                metrics::counter!("leep_land_lease_acquired_total").increment(1);
-                tracing::info!(r#ref = r, epoch, "took the land lease");
+                if before.is_none_or(|h| h.epoch != epoch) {
+                    metrics::counter!("leep_land_lease_acquired_total").increment(1);
+                    tracing::info!(r#ref = r, epoch, "took the land lease");
+                }
                 Route::Lead(epoch)
             }
             Ok(l) if l.is_live() => {
@@ -376,6 +425,7 @@ impl LandCoordinator {
                     Seen {
                         lease: Some(l.clone()),
                         read_at: sent,
+                        stale: false,
                     },
                 );
                 self.forward_to(l)
@@ -513,6 +563,9 @@ impl Repo {
                 // Only the holder takes a forwarded land; the sender routes
                 // it again and may take the lease itself.
                 Route::Uncoordinated if from_peer => return Ok(Coordinated::NotLeader),
+                // Shutting down: never batch a land here after giving the
+                // lease up. The client sends it again (with its land id).
+                Route::ShuttingDown => return Ok(Coordinated::NotLeader),
                 Route::Uncoordinated => {
                     coord.uncoordinated.fetch_add(1, Ordering::Relaxed);
                     metrics::counter!("leep_land_routed_total", "route" => "uncoordinated")
@@ -549,24 +602,34 @@ impl Repo {
                             return Ok(Coordinated::Forwarded(a));
                         }
                         Some(Forwarded::NotLeader) => "not_leader",
-                        Some(Forwarded::Failed(why)) => {
+                        Some(Forwarded::Failed { reason, detail }) => {
                             tracing::debug!(
                                 r#ref = target_ref,
                                 to = %lease.address,
-                                error = %why,
+                                reason,
+                                error = %detail,
                                 "forwarding a land failed"
                             );
+                            metrics::counter!(
+                                "leep_land_forwarded_total",
+                                "outcome" => "failed",
+                                "reason" => reason
+                            )
+                            .increment(1);
                             // Wait for the holder to come back, renew, or
                             // be replaced before asking again.
                             tokio::select! {
                                 _ = tokio::time::sleep(coord.config().renew) => {}
                                 () = coord.lease_changed(target_ref, &lease) => {}
                             }
-                            "failed"
+                            ""
                         }
                         None => "lease_changed",
                     };
-                    metrics::counter!("leep_land_forwarded_total", "outcome" => label).increment(1);
+                    if !label.is_empty() {
+                        metrics::counter!("leep_land_forwarded_total", "outcome" => label)
+                            .increment(1);
+                    }
                     coord.forget(target_ref);
                 }
             }

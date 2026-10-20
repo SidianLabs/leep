@@ -563,8 +563,8 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   `leep_land_cancelled_total`; `leep_land_lock_wait_seconds` now measures the
   time queued. `leep-land-bench` measures land throughput by number of agents.
 - Lands on one ref are batched by one server however many servers share the
-  metadata store (ADR 0056), with `--land-coordination on` (off by default;
-  turn it on for every server of a multi-server deployment). A per-ref lease
+  metadata store (ADR 0056), with `--land-coordination on` (off by default
+  until it is measured on separate hosts; see `docs/OPERATIONS.md`). A per-ref lease
   in the new `land_leases` table (migration 0006) names the server that
   batches a ref's lands; the others forward lands to it over HTTP with the
   client's own body and token, only to addresses on an allow-list
@@ -572,7 +572,7 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   three servers landing on one ref left most agents waiting 20 to 30 s while
   one server won every swap. New metrics `leep_land_leases_held`,
   `leep_land_lease_acquired_total`, `leep_land_lease_lost_total`,
-  `leep_land_forwarded_total` and others, and alerts
+  `leep_land_forwarded_total` (with a `reason` on failures) and others, and alerts
   `LeepLandForwardFailing` and `LeepLandLeaseFlapping`.
 - A land batch redone after losing its swap keeps the rebase links it
   already read from the store, so its search for earlier copies of its lands

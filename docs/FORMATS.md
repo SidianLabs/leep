@@ -581,8 +581,9 @@ hash or derived encoding changed. Rules:
 The `land_leases` table above holds, per ref, which server batches its lands.
 A row is written only by single conditional statements: take or keep
 (`INSERT ... ON CONFLICT DO UPDATE ... WHERE` the row is the claimant's own,
-or `expires_at` has passed, or `renewed_at` is older than twice the renew
-interval), renew (`UPDATE ... WHERE holder AND epoch`) and release (the same,
+or `expires_at` has passed, or `renewed_at` is older than the caller's
+`stale_after`, which the coordinator sets to the TTL, so a lease is taken over
+exactly one TTL after its last renewal), renew (`UPDATE ... WHERE holder AND epoch`) and release (the same,
 setting both times to 0 so `epoch` keeps growing). Times are milliseconds by
 the database's clock on Postgres and by the process clock on SQLite.
 `repo_id` is 1 until repositories exist (ADR 0054). Rows are hints about

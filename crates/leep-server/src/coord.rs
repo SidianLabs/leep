@@ -160,6 +160,19 @@ impl PeerPolicy {
         Ok(url)
     }
 
+    /// Whether any request could be recognised as a peer's: a CIDR, or a
+    /// prefix whose host is an IP address. Host names are never resolved, so
+    /// an allow-list of names alone recognises no peer.
+    pub fn recognises_peers(&self) -> bool {
+        !self.cidrs.is_empty()
+            || self.prefixes.iter().any(|p| {
+                reqwest::Url::parse(p)
+                    .ok()
+                    .and_then(|u| host_ip(&u))
+                    .is_some()
+            })
+    }
+
     /// Whether a request from `ip` comes from a peer server.
     pub fn is_peer(&self, ip: IpAddr) -> bool {
         let ip = canonical(ip);
@@ -283,6 +296,8 @@ pub fn not_leader() -> Response {
         .into_response();
     resp.headers_mut()
         .insert(NOT_LEADER_HEADER, HeaderValue::from_static("1"));
+    resp.headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
     resp
 }
 
@@ -328,12 +343,12 @@ impl LandForward<Relayed> for HttpForward {
             Ok(u) => u,
             Err(why) => {
                 tracing::warn!(r#ref = %lease.ref_name, holder = %lease.holder, "{why}");
-                return Forwarded::Failed(why);
+                return Forwarded::failed("not_allowed", why);
             }
         };
         let url = match url.join("v1/land") {
             Ok(u) => u,
-            Err(e) => return Forwarded::Failed(e.to_string()),
+            Err(e) => return Forwarded::failed("not_allowed", e.to_string()),
         };
         let mut req = self
             .coord
@@ -353,7 +368,7 @@ impl LandForward<Relayed> for HttpForward {
         }
         let resp = match req.send().await {
             Ok(r) => r,
-            Err(e) => return Forwarded::Failed(e.to_string()),
+            Err(e) => return Forwarded::failed(send_failure(&e), e.to_string()),
         };
         let status = resp.status();
         if status == StatusCode::SERVICE_UNAVAILABLE
@@ -371,8 +386,21 @@ impl LandForward<Relayed> for HttpForward {
                 headers,
                 body,
             }),
-            Err(e) => Forwarded::Failed(e.to_string()),
+            Err(e) => Forwarded::failed("reset", e.to_string()),
         }
+    }
+}
+
+/// Metric label for a forward that got no answer.
+fn send_failure(e: &reqwest::Error) -> &'static str {
+    if e.is_timeout() {
+        "timeout"
+    } else if e.is_connect() {
+        "connect"
+    } else if e.is_redirect() {
+        "redirect"
+    } else {
+        "reset"
     }
 }
 
@@ -439,5 +467,8 @@ mod tests {
             !p.is_peer("10.0.0.1".parse().unwrap()),
             "names are not resolved"
         );
+        assert!(!p.recognises_peers(), "names alone recognise no peer");
+        assert!(policy(&["http://127.0.0.1:7070/"], &[], false).recognises_peers());
+        assert!(policy(&[], &["10.0.0.0/8"], false).recognises_peers());
     }
 }

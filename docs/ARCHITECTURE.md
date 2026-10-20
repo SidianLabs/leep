@@ -552,13 +552,15 @@ land_coordinated(cs, ref):  loop until answered (at most 30 s, then 409):
       no answer → ask again after 500 ms, or ask the next holder once the lease changes;
       never batch it here while that lease is live
     no live lease → take it (one conditional upsert) → batch it here
-    store failing → batch it here, uncoordinated
+    store unreadable → forward on the last lease read while it is still live;
+      none known and none can be taken → batch it here, uncoordinated
+    shutting down and no other live lease → 503, the client sends it again
 ```
-A lease lives 2 s from its last renewal and may be taken by another server
-once that renewal is older than 1 s (twice the 500 ms renew interval); a
-holder trusts it only until the store-reported time left, less one renew
-interval, counted from when it sent that renewal. A forwarded land is never
-forwarded again. The leader of a batch is a
+A lease lives 2 s (the TTL) from its last renewal, and only then may another
+server take it; a holder trusts it until the store-reported time left, less
+one renew interval (500 ms), counted from when it sent that renewal. Lease
+calls use connections of their own, so a renewal never waits behind data
+traffic. A forwarded land is never forwarded again. The leader of a batch is a
 spawned task, so a cancelled request cannot stop a batch; a land cancelled
 before its batch reached it is dropped, one already replayed lands.
 The copy test makes `land` idempotent: a client that never saw the answer to
@@ -876,7 +878,7 @@ misses and occupancy as Prometheus metrics (see [OPERATIONS.md](OPERATIONS.md)).
 | Failure | Effect | Recovery |
 |---|---|---|
 | Server instance dies mid-request (SIGKILL included) | No partial mutable state: refs move by one transaction, everything else is written idempotently, so a request leaves at most unreferenced blobs, tree nodes and derived rows | Client retries; every write is idempotent and a repeated `land` finds its earlier result |
-| The server coordinating a ref's lands dies or stalls (`--land-coordination on`) | Its lease is not renewed; lands forwarded to it get no answer and are asked again, never batched elsewhere while the lease is live | Another server takes the lease once its last renewal is a second old (measured: every agent landed again within 1.3 s of a SIGKILL); a stalled leader resuming finds its lease gone and hands its lands back. A graceful shutdown releases leases at once (ADR 0056) |
+| The server coordinating a ref's lands dies or stalls (`--land-coordination on`) | Its lease is not renewed; lands forwarded to it get no answer and are asked again, never batched elsewhere while the lease is live | Another server takes the lease once its last renewal is a TTL (2 s) old; the crash test checks every agent lands again within the TTL plus 2 s of a SIGKILL; a stalled leader resuming finds its lease gone and hands its lands back. A graceful shutdown releases leases at once (ADR 0056) |
 | Store call errors | The request fails with 500 (or 409 when the swap lost); nothing it did is rolled back, and nothing needs to be | Client retries |
 | Store call applies, then reports an error (lost commit acknowledgement, timeout after commit) | The write may exist. For a blob, changeset or derived row that is harmless. For `cas_ref` the caller cannot tell | `land` reads the ref again and recognises its own result (by land id at any age, ADR 0057; otherwise within the last 1024 changesets); other ref callers must read the ref before repeating |
 | Request cancelled by `--request-timeout` or a client disconnect | Same as a dead server for the work it had done; it performs no further writes | Client retries |
@@ -1044,7 +1046,7 @@ ref's lands only within one process, so from the Team stage on, servers must
 not race each other on a hot ref: run them with `--land-coordination on`.
 Each ref gets one leader: the server holding its row in `land_leases`, taken
 and renewed with single conditional statements (2 s TTL, renewed every
-500 ms, taken over only once a second has passed without a renewal). Other
+500 ms, taken over only once the TTL has passed without a renewal). Other
 servers forward `POST /v1/land` to the leader's `--advertise-url`, checked
 against an allow-list, with the client's own body and token, and never batch
 a land themselves while a live lease names another server. A stale or dead
