@@ -595,6 +595,8 @@ impl Repo {
                 #[cfg(test)]
                 self.land_queues.batches.lock().unwrap().push(taken);
             }
+            staging.retain_stored(&mut origins);
+            carried = origins;
             if steps.is_empty() {
                 if lands.is_empty() {
                     return;
@@ -602,8 +604,6 @@ impl Repo {
                 tokio::time::sleep(backoff(attempt)).await;
                 continue;
             }
-            staging.retain_stored(&mut origins);
-            carried = origins;
             // Whether an error came from the swap itself.
             let applied = match staging.flush(self).await {
                 Err(e) => Err((e, false)),
