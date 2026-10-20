@@ -715,6 +715,14 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   instance wins every swap and the other instances' lands wait 20 s or more
   (PERFORMANCE.md, "Several servers on one ref"); route a hot ref's lands to
   one instance.
+- `leep-swarm` (in `leep-soak`) is a many-agent workload generator:
+  thousands of async agents with think time, a read mix (log, files, blame,
+  search, diff), working-copy syncs, uploads, creates on stale bases and
+  lands, some on shared hot files, against one or more servers. It reports
+  lands per second, p50/p99 per operation, 409s, conflicts, stalled agents,
+  lands per server, warmer lag and database bytes per land, and checks
+  history for lands that landed twice or got lost (PERFORMANCE.md,
+  "Many-agent workload", with a first baseline).
 
 ### Git compatibility (M7)
 - Live git mirror (ADR 0046): `leep-git mirror run` keeps a git remote

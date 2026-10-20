@@ -1645,7 +1645,10 @@ changing `land`, GC, derived data, a store backend or the request limits, and
 for a long time when hardening. CI runs it weekly for 30 minutes
 (`.github/workflows/soak.yml`, also on demand from the Actions tab), and
 `cargo test` runs a ten-second version (`leep-e2e`, `soak_smoke`) so it keeps
-working.
+working. For load rather than endurance, `leep-swarm` drives thousands of
+simulated agents with think time, reads and hot files against servers you
+start yourself, and checks history for double lands at the end
+(PERFORMANCE.md, "Many-agent workload").
 
 ```sh
 cargo build --release --workspace    # leep-soak starts leep-server and leep from its own directory
