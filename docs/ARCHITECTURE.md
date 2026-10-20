@@ -142,7 +142,8 @@ unknown one and at most a minute before a write), and plain rows until a
 dictionary exists. `leep-server compact-changesets` trains the dictionary
 and rewrites existing rows in place, beside running servers of this
 version; on git/git and Linux it halves the table (about 2.9 to 1.75 GB on
-all of Linux).
+all of Linux). A frame header's claimed size is trusted for at most 1 MiB
+of memory up front; larger frames decode as a stream.
 
 ## 5. Derived data
 

@@ -27,8 +27,13 @@ const DICT_MAGIC: [u8; 4] = [0x37, 0xA4, 0x30, 0xEC];
 /// costs about 2 µs at any level.
 pub const LEVEL: i32 = 9;
 
-/// Largest changeset a compressed row may decode to. Larger changesets are
-/// stored plain, so a damaged frame header cannot ask for a huge buffer.
+/// Largest changeset a compressed row may decode to; larger changesets are
+/// stored plain. Part of the row format (FORMATS.md): a reader with a lower
+/// bound could not read rows a writer with a higher one compressed. It is
+/// below the largest changeset a default server accepts (a JSON body of at
+/// most `DEFAULT_MAX_BODY_BYTES`, 512 MiB, is always longer than the
+/// changeset's canonical bytes). A frame header's claimed size is never
+/// trusted for more than [`ONE_SHOT_MAX`] of memory up front.
 pub const MAX_DECODED: usize = 256 << 20;
 
 /// How often a writer looks for a dictionary added since it last looked.
@@ -223,6 +228,9 @@ fn compress(plain: &[u8], dict: Option<&Dict>) -> Vec<u8> {
 fn decompress(data: &[u8], dict: Option<&Dict>) -> Option<Vec<u8>> {
     let size = zstd::zstd_safe::get_frame_content_size(data).ok()??;
     let size = usize::try_from(size).ok().filter(|s| *s <= MAX_DECODED)?;
+    if size > ONE_SHOT_MAX {
+        return decompress_streaming(data, dict, size);
+    }
     let mut out = Vec::with_capacity(size);
     DCTX.with(|d| {
         let mut d = d.borrow_mut();
@@ -232,6 +240,33 @@ fn decompress(data: &[u8], dict: Option<&Dict>) -> Option<Vec<u8>> {
         }
     })
     .ok()?;
+    (out.len() == size).then_some(out)
+}
+
+/// Largest frame decoded into a buffer reserved up front from the size its
+/// header claims. The header is unchecked until the bytes hash to the id, so
+/// a damaged one must not reserve more than this; real rows are a few KB.
+const ONE_SHOT_MAX: usize = 1 << 20;
+
+/// Largest window a streamed frame may use, as a power of two. A streaming
+/// decoder allocates its window up front, and a single-segment frame's
+/// window is its claimed size, so this bounds that allocation too. Level 9
+/// uses a 4 MiB window (2^22), with or without a dictionary, and a frame
+/// is single-segment only when its content fits that window.
+const WINDOW_LOG_MAX: u32 = 23;
+
+/// Decode a frame claiming more than [`ONE_SHOT_MAX`], growing the buffer
+/// only as bytes actually come out, so a false header costs nothing.
+fn decompress_streaming(data: &[u8], dict: Option<&Dict>, size: usize) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let decoder = match dict {
+        Some(dict) => zstd::stream::read::Decoder::with_prepared_dictionary(data, &dict.dec),
+        None => zstd::stream::read::Decoder::with_buffer(data),
+    };
+    let mut decoder = decoder.ok()?.single_frame();
+    decoder.window_log_max(WINDOW_LOG_MAX).ok()?;
+    let mut out = Vec::with_capacity(ONE_SHOT_MAX);
+    decoder.take(size as u64 + 1).read_to_end(&mut out).ok()?;
     (out.len() == size).then_some(out)
 }
 
@@ -383,6 +418,66 @@ mod tests {
         let mut huge = zstd::bulk::compress(&c.encode(), 3).unwrap();
         huge.truncate(6);
         assert!(codec.decode_checked(&c.id(), &huge).is_err());
+    }
+
+    /// A one-block frame whose header claims `size` bytes of content.
+    fn frame_claiming(size: u64) -> Vec<u8> {
+        let mut f = ZSTD_MAGIC.to_vec();
+        // 8-byte content size, single segment, no checksum, no dictionary.
+        f.push(0xE0);
+        f.extend_from_slice(&size.to_le_bytes());
+        // The last block: raw, 4 bytes.
+        f.extend_from_slice(&[(4 << 3) | 1, 0, 0]);
+        f.extend_from_slice(b"leep");
+        f
+    }
+
+    /// A damaged header can claim up to the format's bound, or far past
+    /// it; neither may reserve a buffer of that size, and both are refused.
+    #[test]
+    fn false_content_sizes_reserve_nothing() {
+        let honest = frame_claiming(4);
+        assert_eq!(decompress(&honest, None).as_deref(), Some(&b"leep"[..]));
+        for size in [
+            ONE_SHOT_MAX as u64 + 1,
+            MAX_DECODED as u64,
+            MAX_DECODED as u64 + 1,
+            1 << 40,
+            u64::MAX >> 1,
+        ] {
+            let f = frame_claiming(size);
+            assert_eq!(
+                zstd::zstd_safe::get_frame_content_size(&f).unwrap(),
+                Some(size)
+            );
+            assert!(decompress(&f, None).is_none(), "{size}");
+            let id = cs(1, vec![]).id();
+            assert!(Codec::default().decode_checked(&id, &f).is_err());
+        }
+        // Frames past the one-shot bound still decode, through the stream,
+        // including ones larger than the window, with or without a
+        // dictionary.
+        let codec = Codec::default();
+        codec.add(vec![(1, trained(1))]).unwrap();
+        let dict = codec.dicts.read().unwrap().newest.clone().unwrap();
+        for len in [ONE_SHOT_MAX + 1, 9 << 20] {
+            let mut x = 1u64;
+            let big: Vec<u8> = (0..len)
+                .map(|i| {
+                    x = x.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    if i % 3 == 0 {
+                        (x >> 59) as u8
+                    } else {
+                        b'a'
+                    }
+                })
+                .collect();
+            let packed = compress(&big, None);
+            assert!(packed.len() < big.len());
+            assert_eq!(decompress(&packed, None).as_ref(), Some(&big));
+            let packed = compress(&big, Some(&dict));
+            assert_eq!(decompress(&packed, Some(&dict)).as_ref(), Some(&big));
+        }
     }
 
     /// Plain bytes that begin like a frame: 40 parents, the first of which

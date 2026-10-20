@@ -466,7 +466,9 @@ until the table has a row; see "Changeset rows" below.
   empty, a changeset whose frame would not be smaller, or one over 256 MiB.
 - **Compressed**: one zstd frame (magic `28 b5 2f fd`) whose content is
   exactly the canonical bytes. The frame header records the content size
-  (required; at most 256 MiB) and the dictionary id: a `changeset_dicts.id`,
+  (required; at most 256 MiB, which bounds the decoded size; readers never
+  reserve more than 1 MiB on the header's word and decode larger frames as
+  a stream with a window of at most 8 MiB) and the dictionary id: a `changeset_dicts.id`,
   or 0 (absent) for a frame made without a dictionary. No checksum: the id
   check covers it. Written at level 9; the level is not part of the format.
 

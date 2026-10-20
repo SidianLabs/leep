@@ -706,6 +706,10 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
     unchanged.
 
 ### Fixes
+- A damaged compressed changeset row whose frame header claims a large size
+  no longer makes a read reserve that much memory (up to 256 MiB a row).
+  Readers reserve at most 1 MiB on the header's word and decode larger
+  frames as a stream, growing the buffer only as bytes come out.
 - `leep-git import` and `export` no longer fail with "Entry too large to fit
   in memory" on objects over 16 MiB when the git repository belongs to
   another user (as in the server container): gix's reduced-trust allocation
