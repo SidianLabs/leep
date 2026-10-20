@@ -465,6 +465,8 @@ impl Repo {
                 }
             })
             .collect();
+        self.learn_ancestry(&lands.iter().map(|l| l.q.cs).collect::<Vec<_>>())
+            .await;
         let mut commit_errors = 0;
         let mut last_error = None;
         // `rebased-origin-v1` rows read by earlier attempts of this batch,
@@ -670,6 +672,48 @@ impl Repo {
             .zip(found)
             .filter_map(|(id, r)| r.map(|r| (id, r)))
             .collect())
+    }
+
+    /// Learn the parents and generations of a batch's changesets this
+    /// process has not seen, in one round of batched reads. A land created
+    /// through another server (forwarded to this one, ADR 0056, or landed
+    /// after a restart) would otherwise read them one at a time in its
+    /// replay, and the batch's prefetch of rebase links, which needs the
+    /// generations, would read nothing. A failed read is left to the
+    /// replays, which read singly.
+    async fn learn_ancestry(&self, ids: &[ChangesetId]) {
+        let missing: Vec<ChangesetId> = ids
+            .iter()
+            .copied()
+            .filter(|id| {
+                self.cached_generation(*id).is_none() || self.cached_parents(*id).is_none()
+            })
+            .collect();
+        if missing.is_empty() {
+            return;
+        }
+        let keys: Vec<_> = missing.iter().map(|id| id.0).collect();
+        let (changesets, generations) = tokio::join!(
+            self.meta().get_changesets(&missing),
+            self.meta().get_derived_many(
+                <crate::derived::Generation as crate::derived::DerivedKind>::NAME,
+                &keys
+            )
+        );
+        if let Ok(changesets) = changesets {
+            for (id, cs) in missing.iter().zip(changesets) {
+                if let Some(cs) = cs {
+                    self.remember_parents(*id, cs.parents.into());
+                }
+            }
+        }
+        if let Ok(generations) = generations {
+            for (id, g) in missing.iter().zip(generations) {
+                if let Some(g) = g.and_then(|g| crate::derived::decode_u64(&g).ok()) {
+                    self.remember_generation(*id, g);
+                }
+            }
+        }
     }
 
     /// One land the way it ran before batches were staged: replayed straight
