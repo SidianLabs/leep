@@ -693,6 +693,49 @@ What it suggests, to be checked on the real baseline:
   and the warmer; `pg_database_size` grew 5 to 8 KB per land, the rest
   being Postgres's own index and page overhead.
 
+### On all of Linux (VPS)
+
+`leep-swarm` (#105) against `leep:34c5ea3` on the Linux store (1,484,762
+changesets, the same VPS as "All of Linux"). Every run lands on its own ref
+created at Linux's `master`, so agents read, sync and blame against the
+whole Linux tree and their changes land on top of it. One server, Postgres
+on the same host, `--meta-pool-size 32`, warmer every 30 s, generator in a
+container on the same host. The VPS has **two cores** shared by the server,
+Postgres, the generator and the live server; the load average was 5 to 10
+during the runs. Three rounds per configuration, 120 s measured after a
+30 s ramp, generator defaults otherwise (2 files of 512 bytes per change,
+8 hot files at 2%, `--stale 4`, 30 s request timeout, land ids on). These
+numbers are a floor for this hardware, not for Leep.
+
+Medians of three rounds (range):
+
+| Run | Lands/s | Land p50 | Stalled agents | Path-history lag p50 (generations) | Double / lost lands |
+|---|---|---|---|---|---|
+| 500 agents, 2 s think | 6.0 (2.7–6.8) | 1.6 s (1.6–58 s) | 27 of 500 (24–43) | 936 (110–1,031) | 0 / 0 |
+| 2,000 agents, 2 s think | 7.4 (3.8–8.1) | 56 s (30–58 s) | 701 of 2,000 (647–1,533) | 1,522 (930–1,644) | 0 / 0 |
+| 256 agents, no think time | 5.0 (3.7–7.4) | 1.8 s (1.5–2.2 s) | 5 of 256 (0–16) | 671 (178–718) | 0 / 0 |
+
+Reads, median of the three rounds' p50s: sync 0.14–0.35 s, files 0.07–0.14
+s, diff 0.13–0.28 s, log 0.4–0.8 s, create 0.19–0.28 s, upload 0.08–0.12 s.
+Search almost never finished: 2 to 30 searches per run answered (p50 22–29
+s) against 328 to 1,301 timeouts. Logs timed out 0 to 1,569 times per run.
+
+- **Reads saturate the server first.** Search over Linux's ~90k files on a
+  head whose search index is not warm derives it inline; at two cores that
+  takes the CPU the lands need, and lands queue behind it (2,000 agents:
+  land p50 56 s, 6,126 to 7,280 lands timed out at 30 s and were resent).
+- **Index lag is the second cause.** The warmer runs every 30 s and the
+  path-history index trailed the head by about 900 to 1,500 generations, so
+  path logs and blames derived on the request path. Both are what ADR 0058
+  (indexing off the request path, bounded queries, the ref-log tail) is for.
+- **No double or lost lands in any run**, through thousands of resends
+  under land ids (ADR 0057).
+- **Write path per land**: 2.1 to 2.4 KB of logical data; total database
+  growth 6.5 to 22 KB per land including rows built by reads.
+- The blame errors in the raw output (`blame 404`) are the generator asking
+  for files its run has not created yet on this ref; they cost a round trip
+  and are not server errors.
+
 ## Real history: git/git
 
 The benchmarks above use synthetic, mostly linear histories. `git/git` is real
