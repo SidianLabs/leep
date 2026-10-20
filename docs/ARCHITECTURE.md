@@ -145,6 +145,15 @@ version; on git/git and Linux it halves the table (about 2.9 to 1.75 GB on
 all of Linux). A frame header's claimed size is trusted for at most 1 MiB
 of memory up front; larger frames decode as a stream.
 
+**Format features** ([ADR 0055](adr/0055-store-format-features.md)). The
+`store_features` table names what a store's rows use that a reader must
+understand (`changeset-zstd-dict` so far). A tool records a feature before
+it writes the first row that needs it (`compact-changesets` does so before
+it stores a dictionary). Every binary that has the table reads it on open
+and refuses to start on a name it does not know, so a newer format fails
+at startup rather than on the first row it cannot read. Binaries from
+before the table do not check it.
+
 ## 5. Derived data
 
 A derived kind is a pure function
@@ -825,6 +834,7 @@ misses and occupancy as Prometheus metrics (see [OPERATIONS.md](OPERATIONS.md)).
 | BlobStore slow | Cache tiers absorb repeated reads | — |
 | Land CAS contention | Bounded retries, then an error | Client retries `land` |
 | Server started on a database from a newer release, or whose applied migration was edited | The store refuses to open (`database schema vN is newer than this server`), before any write | Upgrade the server; never edit an applied migration (ADR 0023) |
+| Server started on a store whose rows use a format feature it does not know (`store_features`) | The store refuses to open, naming the feature, before any read of a row | Upgrade the server (ADR 0055). Servers from before the table cannot check it, so finish a rollout before running `compact-changesets` |
 | Migration fails or the migrating process dies mid-run | Every pending migration and its `schema_migrations` row run in one transaction: the database stays at the version it started at | Fix the cause and start again; concurrent starters wait on the lock and find the work done |
 | Data damaged at rest (bit rot, a bad restore, a hand-edited table) | Content-addressed objects fail their hash check on read; derived rows without one can answer wrongly and silently (ADR 0021) | `leep-server verify` names every damaged object and row; `repair rederive` rewrites derived rows, and blobs and changesets are restored from backup (OPERATIONS.md, "Verify and repair") |
 | Backup taken while servers and GC run | The metadata snapshot is one instant; blobs are copied after it, and a blob the snapshot needs cannot have been deleted (ADR 0012), so the backup restores. A backup whose check finds a missing blob is sealed as failed, exits 1, and `restore` refuses it | Alert on `leep_backup_last_run_ok` and the last-success age; take another backup (ADR 0026) |

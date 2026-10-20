@@ -3,8 +3,10 @@
 //! and implement `cas_ref` as a single conditional SQL statement. A fourth
 //! table, `ref_log`, records every ref move in the same transaction. A fifth,
 //! `changeset_dicts`, holds the dictionaries changeset rows are compressed
-//! with ([`compact`], ADR 0053). The schema is versioned by forward-only
-//! migrations ([`migrate`], ADR 0023).
+//! with ([`compact`], ADR 0053), and a sixth, `store_features`, the format
+//! features rows use, which servers check on open ([`features`], ADR 0055).
+//! The schema is versioned by forward-only migrations ([`migrate`], ADR
+//! 0023).
 
 use std::sync::Arc;
 
@@ -13,6 +15,7 @@ use leep_core::{Error, MetaStore, Result};
 mod codec;
 pub mod compact;
 mod drop;
+pub mod features;
 pub mod migrate;
 mod postgres;
 pub mod snapshot;

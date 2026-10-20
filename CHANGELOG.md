@@ -663,6 +663,14 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   `blame Makefile` (1,501 changes) went from 3.0 s to 1.1 s and `diff.c`
   from 1.9 s to 0.9 s, with rarely changed files as before
   (PERFORMANCE.md, "First blame in stretches").
+- Format features (ADR 0055): schema migration 0004 adds `store_features`,
+  and `compact-changesets` records `changeset-zstd-dict` before it stores a
+  dictionary (the migration records it for a store already compacted).
+  Servers and tools refuse to open a store that names a feature they do not
+  know, so a later format change fails at startup on servers that cannot
+  read it instead of failing their reads. Servers from before this release
+  do not check: still run `compact-changesets` only after every server
+  runs ADR 0053's release or newer. Backups carry the table.
 
 ### Git compatibility (M7)
 - Live git mirror (ADR 0046): `leep-git mirror run` keeps a git remote

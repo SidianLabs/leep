@@ -88,6 +88,8 @@ type Pair = (Vec<u8>, Vec<u8>);
 type DerivedRow = (String, Vec<u8>, Vec<u8>);
 /// `changeset_dicts`: id, created_at, data.
 type DictRow = (i64, i64, Vec<u8>);
+/// `store_features`: name, added_at.
+type FeatureRow = (String, i64);
 
 /// Rows of one read transaction on the source.
 #[async_trait]
@@ -95,6 +97,7 @@ trait Source: Send {
     async fn schema_version(&mut self) -> Result<u64>;
     async fn changesets(&mut self, after: &[u8], limit: usize) -> Result<Vec<Pair>>;
     async fn changeset_dicts(&mut self) -> Result<Vec<DictRow>>;
+    async fn store_features(&mut self) -> Result<Vec<FeatureRow>>;
     async fn refs(&mut self) -> Result<Vec<(String, Vec<u8>)>>;
     async fn derived(&mut self, after: &(String, Vec<u8>), limit: usize)
         -> Result<Vec<DerivedRow>>;
@@ -109,6 +112,7 @@ trait Sink: Send {
     async fn clear(&mut self) -> Result<()>;
     async fn put_changesets(&mut self, rows: &[Pair]) -> Result<()>;
     async fn put_changeset_dicts(&mut self, rows: &[DictRow]) -> Result<()>;
+    async fn put_store_features(&mut self, rows: &[FeatureRow]) -> Result<()>;
     async fn put_refs(&mut self, rows: &[(String, Vec<u8>)]) -> Result<()>;
     async fn put_derived(&mut self, rows: &[DerivedRow]) -> Result<()>;
     async fn put_ref_log(&mut self, rows: &[LogRow]) -> Result<()>;
@@ -128,6 +132,8 @@ async fn copy(src: &mut dyn Source, dst: &mut dyn Sink) -> Result<SnapshotInfo> 
         ref_log: 0,
         ref_log_last_seq: 0,
     };
+    // Features first: they say how to read the rows that follow.
+    dst.put_store_features(&src.store_features().await?).await?;
     let dicts = src.changeset_dicts().await?;
     info.changeset_dicts = dicts.len() as u64;
     dst.put_changeset_dicts(&dicts).await?;
@@ -441,6 +447,13 @@ impl Source for SqliteSource {
             .map_err(storage)
     }
 
+    async fn store_features(&mut self) -> Result<Vec<FeatureRow>> {
+        sqlx::query_as("SELECT name, added_at FROM store_features ORDER BY name")
+            .fetch_all(&mut *self.0)
+            .await
+            .map_err(storage)
+    }
+
     async fn changesets(&mut self, after: &[u8], limit: usize) -> Result<Vec<Pair>> {
         let rows = sqlx::query("SELECT id, data FROM changesets WHERE id > ? ORDER BY id LIMIT ?")
             .bind(after)
@@ -522,7 +535,8 @@ impl Sink for SqliteSink {
              + (SELECT COUNT(*) FROM (SELECT 1 FROM refs LIMIT 1)) \
              + (SELECT COUNT(*) FROM (SELECT 1 FROM derived LIMIT 1)) \
              + (SELECT COUNT(*) FROM (SELECT 1 FROM ref_log LIMIT 1)) \
-             + (SELECT COUNT(*) FROM (SELECT 1 FROM changeset_dicts LIMIT 1))",
+             + (SELECT COUNT(*) FROM (SELECT 1 FROM changeset_dicts LIMIT 1)) \
+             + (SELECT COUNT(*) FROM (SELECT 1 FROM store_features LIMIT 1))",
         )
         .fetch_one(&mut *self.0)
         .await
@@ -534,6 +548,7 @@ impl Sink for SqliteSink {
         for t in [
             "changesets",
             "changeset_dicts",
+            "store_features",
             "refs",
             "derived",
             "ref_log",
@@ -554,6 +569,18 @@ impl Sink for SqliteSink {
             QueryBuilder::<Sqlite>::new("INSERT INTO changeset_dicts (id, created_at, data) ");
         q.push_values(rows, |mut b, (id, at, data)| {
             b.push_bind(id).push_bind(at).push_bind(data);
+        });
+        q.build().execute(&mut *self.0).await.map_err(storage)?;
+        Ok(())
+    }
+
+    async fn put_store_features(&mut self, rows: &[FeatureRow]) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut q = QueryBuilder::<Sqlite>::new("INSERT INTO store_features (name, added_at) ");
+        q.push_values(rows, |mut b, (name, at)| {
+            b.push_bind(name).push_bind(at);
         });
         q.build().execute(&mut *self.0).await.map_err(storage)?;
         Ok(())
@@ -663,6 +690,13 @@ impl Source for PgSource {
             .map_err(storage)
     }
 
+    async fn store_features(&mut self) -> Result<Vec<FeatureRow>> {
+        sqlx::query_as("SELECT name, added_at FROM store_features ORDER BY name")
+            .fetch_all(&mut *self.0)
+            .await
+            .map_err(storage)
+    }
+
     async fn changesets(&mut self, after: &[u8], limit: usize) -> Result<Vec<Pair>> {
         let rows =
             sqlx::query("SELECT id, data FROM changesets WHERE id > $1 ORDER BY id LIMIT $2")
@@ -746,16 +780,20 @@ impl Sink for PgSink {
         // Writers are excluded so that "empty" stays true until commit. A
         // concurrent server inserting meanwhile would be a deployment error;
         // the lock turns it into a wait, not a corrupt mix.
-        sqlx::query("LOCK TABLE changesets, changeset_dicts, refs, derived, ref_log IN ACCESS EXCLUSIVE MODE")
-            .execute(&mut *self.0)
-            .await
-            .map_err(storage)?;
+        sqlx::query(
+            "LOCK TABLE changesets, changeset_dicts, store_features, refs, derived, ref_log \
+             IN ACCESS EXCLUSIVE MODE",
+        )
+        .execute(&mut *self.0)
+        .await
+        .map_err(storage)?;
         let n: i64 = sqlx::query_scalar(
             "SELECT (SELECT COUNT(*) FROM (SELECT 1 FROM changesets LIMIT 1) a) \
              + (SELECT COUNT(*) FROM (SELECT 1 FROM refs LIMIT 1) b) \
              + (SELECT COUNT(*) FROM (SELECT 1 FROM derived LIMIT 1) c) \
              + (SELECT COUNT(*) FROM (SELECT 1 FROM ref_log LIMIT 1) d) \
-             + (SELECT COUNT(*) FROM (SELECT 1 FROM changeset_dicts LIMIT 1) e)",
+             + (SELECT COUNT(*) FROM (SELECT 1 FROM changeset_dicts LIMIT 1) e) \
+             + (SELECT COUNT(*) FROM (SELECT 1 FROM store_features LIMIT 1) f)",
         )
         .fetch_one(&mut *self.0)
         .await
@@ -767,6 +805,7 @@ impl Sink for PgSink {
         for t in [
             "changesets",
             "changeset_dicts",
+            "store_features",
             "refs",
             "derived",
             "ref_log",
@@ -787,6 +826,18 @@ impl Sink for PgSink {
             QueryBuilder::<Postgres>::new("INSERT INTO changeset_dicts (id, created_at, data) ");
         q.push_values(rows, |mut b, (id, at, data)| {
             b.push_bind(id).push_bind(at).push_bind(data);
+        });
+        q.build().execute(&mut *self.0).await.map_err(storage)?;
+        Ok(())
+    }
+
+    async fn put_store_features(&mut self, rows: &[FeatureRow]) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut q = QueryBuilder::<Postgres>::new("INSERT INTO store_features (name, added_at) ");
+        q.push_values(rows, |mut b, (name, at)| {
+            b.push_bind(name).push_bind(at);
         });
         q.build().execute(&mut *self.0).await.map_err(storage)?;
         Ok(())

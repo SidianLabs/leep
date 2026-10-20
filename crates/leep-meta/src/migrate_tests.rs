@@ -588,6 +588,7 @@ fn full_schema() -> BTreeSet<String> {
     [
         "changesets",
         "changeset_dicts",
+        "store_features",
         "refs",
         "derived",
         "ref_log",
@@ -868,6 +869,101 @@ async fn upgrade_from_v2_adds_changeset_dicts() {
         }
         drop(s);
         db.cleanup().await;
+    }
+}
+
+/// A database at v3 upgrades to `store_features` (ADR 0055). One with no
+/// dictionary names no feature; one compacted at v3 (a dictionary exists)
+/// gets `changeset-zstd-dict` from the migration. A store naming a feature
+/// this binary does not know is refused on open, before any row is read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn upgrade_from_v3_adds_store_features() {
+    use crate::features::{CHANGESET_ZSTD_DICT, FEATURES_SCHEMA_VERSION};
+    let v3 = FEATURES_SCHEMA_VERSION as usize - 1;
+    for compacted in [false, true] {
+        let name = if compacted { "fromv3c" } else { "fromv3" };
+        for db in dbs(name).await {
+            let kind = db.kind();
+            let d = data();
+            drop(
+                db.open(&db.compiled()[..v3], SchemaMode::Migrate)
+                    .await
+                    .unwrap(),
+            );
+            load(&db, &STAGES[1], &d).await;
+            if compacted {
+                let samples: Vec<Vec<u8>> =
+                    crate::compact_tests::history(crate::compact::MIN_TRAINING_ROWS, 4)
+                        .iter()
+                        .map(Changeset::encode)
+                        .collect();
+                let dict = codec::train(&samples, 16 << 10, 1).unwrap();
+                db.exec(
+                    "INSERT INTO changeset_dicts (id, created_at, data) VALUES (?, ?, ?)",
+                    vec![Arg::Int(1), Arg::Int(1_700_000_000), Arg::Bytes(dict)],
+                )
+                .await;
+            }
+            let plan = db.report(db.compiled()).await;
+            assert_eq!(plan.from, v3 as u64, "{kind}");
+            let s = db.open(db.compiled(), SchemaMode::Migrate).await.unwrap();
+            verify(&*s, &STAGES[1], &d, LATEST as u64).await;
+            assert_eq!(db.objects().await, full_schema(), "{kind}");
+            drop(s);
+            let features = |db: &Db| {
+                let (url, schema) = match db {
+                    Db::Sqlite { url, .. } => (url.clone(), None),
+                    Db::Pg { url, schema } => (url.clone(), Some(schema.clone())),
+                };
+                async move {
+                    match schema {
+                        None => {
+                            let s = SqliteMetaStore::connect(&url).await.unwrap();
+                            s.features().await.unwrap()
+                        }
+                        Some(schema) => {
+                            let s = PostgresMetaStore::connect_with_schema(&url, &schema)
+                                .await
+                                .unwrap();
+                            let f = s.features().await.unwrap();
+                            s.pool.close().await;
+                            f
+                        }
+                    }
+                }
+            };
+            let want: Vec<String> = if compacted {
+                vec![CHANGESET_ZSTD_DICT.into()]
+            } else {
+                vec![]
+            };
+            assert_eq!(features(&db).await, want, "{kind}");
+
+            // A newer binary's feature locks this one out, in either mode.
+            db.exec(
+                "INSERT INTO store_features (name, added_at) VALUES (?, ?)",
+                vec![Arg::Text("from-the-future".into()), Arg::Int(1)],
+            )
+            .await;
+            for mode in [SchemaMode::Migrate, SchemaMode::RequireCurrent] {
+                let err = db.open(db.compiled(), mode).await.err().unwrap();
+                assert!(
+                    err.to_string().contains("(from-the-future)"),
+                    "{kind}: {err}"
+                );
+            }
+            db.exec(
+                "DELETE FROM store_features WHERE name = ?",
+                vec![Arg::Text("from-the-future".into())],
+            )
+            .await;
+            drop(
+                db.open(db.compiled(), SchemaMode::RequireCurrent)
+                    .await
+                    .unwrap(),
+            );
+            db.cleanup().await;
+        }
     }
 }
 

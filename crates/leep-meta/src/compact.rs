@@ -4,13 +4,17 @@
 //! A row's bytes are an encoding of an immutable value, and every reader
 //! checks what it decodes against the row's id, so rewriting a row in place
 //! is safe beside running servers of this version: a reader sees the old
-//! bytes or the new ones, and both decode to the same changeset.
+//! bytes or the new ones, and both decode to the same changeset. Servers
+//! older than ADR 0053 cannot read the new bytes; a run records the
+//! `changeset-zstd-dict` feature first, which servers since ADR 0055 check
+//! when they open the store.
 
 use async_trait::async_trait;
 use leep_core::{Error, Result};
 use sqlx::Row;
 
 use crate::codec::{self, Codec};
+use crate::features::CHANGESET_ZSTD_DICT;
 use crate::{storage, to_id, PostgresMetaStore, SchemaMode, SqliteMetaStore};
 
 /// The schema version that adds `changeset_dicts`.
@@ -109,6 +113,10 @@ pub(crate) trait Rows: Sync {
     /// Insert a dictionary; `false` if another run took the id first.
     async fn insert_dict(&self, id: i64, data: &[u8]) -> Result<bool>;
     async fn rewrite(&self, rows: &[Pair]) -> Result<()>;
+    /// Record a format feature (ADR 0055); idempotent.
+    async fn add_feature(&self, name: &str) -> Result<()>;
+    #[cfg(test)]
+    async fn features(&self) -> Result<Vec<String>>;
 }
 
 pub(crate) async fn run(
@@ -141,6 +149,9 @@ pub(crate) async fn run(
             scratch.add(vec![(id, dict.clone())])?;
             codec = &scratch;
         } else {
+            // Before the dictionary: servers of this version start
+            // compressing new rows with it within a minute.
+            store.add_feature(CHANGESET_ZSTD_DICT).await?;
             if !store.insert_dict(id, &dict).await? {
                 return Err(Error::Conflict(format!(
                     "changeset dictionary {id} was added by another compaction; run again"
@@ -154,6 +165,11 @@ pub(crate) async fn run(
     }
     report.dictionary = codec.newest_id();
     let target = report.dictionary;
+    if !opts.dry_run {
+        // A store compacted before the feature table existed got its row
+        // from the migration; this covers one restored without it.
+        store.add_feature(CHANGESET_ZSTD_DICT).await?;
+    }
     let mut after = Vec::new();
     loop {
         let page = store.page(&after, opts.batch).await?;
@@ -270,6 +286,15 @@ impl Rows for PostgresMetaStore {
         .map_err(storage)?;
         Ok(())
     }
+
+    async fn add_feature(&self, name: &str) -> Result<()> {
+        PostgresMetaStore::add_feature(self, name).await
+    }
+
+    #[cfg(test)]
+    async fn features(&self) -> Result<Vec<String>> {
+        PostgresMetaStore::features(self).await
+    }
 }
 
 #[async_trait]
@@ -328,5 +353,14 @@ impl Rows for SqliteMetaStore {
                 .map_err(storage)?;
         }
         tx.commit().await.map_err(storage)
+    }
+
+    async fn add_feature(&self, name: &str) -> Result<()> {
+        SqliteMetaStore::add_feature(self, name).await
+    }
+
+    #[cfg(test)]
+    async fn features(&self) -> Result<Vec<String>> {
+        SqliteMetaStore::features(self).await
     }
 }

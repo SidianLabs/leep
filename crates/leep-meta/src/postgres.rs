@@ -40,6 +40,12 @@ pub const MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/postgres/0003_changeset_dicts.sql"),
         satisfied_by: &[],
     },
+    Migration {
+        version: 4,
+        name: "store_features",
+        sql: include_str!("../migrations/postgres/0004_store_features.sql"),
+        satisfied_by: &[],
+    },
 ];
 
 /// Every table a bulk load fills, for [`PostgresMetaStore::analyze`].
@@ -60,6 +66,8 @@ pub struct PostgresMetaStore {
     /// Whether the schema has `changeset_dicts`: tests open stores with
     /// shorter migration lists.
     pub(crate) has_dicts: bool,
+    /// Whether the schema has `store_features` (ADR 0055).
+    pub(crate) has_features: bool,
 }
 
 impl PostgresMetaStore {
@@ -141,6 +149,7 @@ impl PostgresMetaStore {
             migrate::require_current(&report)?;
         }
         let store = Self::with_pool(pool, migrations);
+        crate::features::check(&store.features().await?)?;
         store.load_dicts().await?;
         Ok(store)
     }
@@ -274,7 +283,40 @@ impl PostgresMetaStore {
             has_dicts: migrations
                 .iter()
                 .any(|m| m.version >= crate::compact::DICTS_SCHEMA_VERSION),
+            has_features: migrations
+                .iter()
+                .any(|m| m.version >= crate::features::FEATURES_SCHEMA_VERSION),
         }
+    }
+
+    /// The format features the store names (ADR 0055).
+    pub async fn features(&self) -> Result<Vec<String>> {
+        if !self.has_features {
+            return Ok(Vec::new());
+        }
+        sqlx::query_scalar("SELECT name FROM store_features ORDER BY name")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(storage)
+    }
+
+    /// Record that the store's rows may use `name`; idempotent.
+    pub(crate) async fn add_feature(&self, name: &str) -> Result<()> {
+        if !self.has_features {
+            return Err(leep_core::Error::Invalid(format!(
+                "the schema predates store features (v{}); run `leep-server migrate` first",
+                crate::features::FEATURES_SCHEMA_VERSION
+            )));
+        }
+        sqlx::query(
+            "INSERT INTO store_features (name, added_at) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+        )
+        .bind(name)
+        .bind(unix_now())
+        .execute(&self.pool)
+        .await
+        .map_err(storage)?;
+        Ok(())
     }
 
     /// Learn the changeset dictionaries added since this store last looked.

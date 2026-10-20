@@ -833,6 +833,34 @@ new dictionary (for example after the history has changed character) and
 moves every row to it; the old dictionary stays. A store with fewer than
 1,000 changesets is left alone.
 
+### Format features
+
+**Format features (schema v4, ADR 0055).** Migration 0004 adds a
+`store_features` table. Like 0003, it may be applied beside servers of the
+previous version. A row names a format the store's rows use that a server
+must understand. `compact-changesets` records `changeset-zstd-dict` before
+it stores a dictionary, and the migration records it for a store compacted
+before the table existed. A server, or any `leep-server` tool, that opens a
+store naming a feature it does not know refuses to start:
+
+```
+the metadata store uses format features this server cannot read (some-feature);
+a newer leep-server wrote them. Upgrade this server
+```
+
+Upgrade that binary. Do not delete the row: the rows it describes are
+already written, and an older binary would fail on them anyway.
+`leep-server verify` and backups behave the same way, and backups carry the
+table.
+
+The check only protects against binaries that have it. **Servers from
+before this release do not read the table**, and those from before ADR 0053
+cannot read compressed rows. So for this release the rule above still
+holds: no server, importer or tool older than ADR 0053 may use the
+database when `compact-changesets` runs. From now on, a format change that
+old servers cannot read is refused by them at startup, instead of failing
+their reads.
+
 ## Indexing a large history
 
 After importing a long history (`leep-git import`, a restore without
