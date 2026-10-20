@@ -671,6 +671,11 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   read it instead of failing their reads. Servers from before this release
   do not check: still run `compact-changesets` only after every server
   runs ADR 0053's release or newer. Backups carry the table.
+- `--meta-pool-size` (`LEEP_META_POOL_SIZE`, default 16) sets the Postgres
+  connection pool, and `--derive-cache-bytes` (`LEEP_DERIVE_CACHE_BYTES`,
+  default 340 MiB) sets the budget of the derived-index caches, which were
+  fixed. Defaults are unchanged (OPERATIONS.md, "Connection pool and
+  caches").
 
 ### Git compatibility (M7)
 - Live git mirror (ADR 0046): `leep-git mirror run` keeps a git remote

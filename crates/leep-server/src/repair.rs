@@ -145,7 +145,7 @@ pub(crate) async fn open(meta: &str, blobs: &str) -> anyhow::Result<Repo> {
     check_exists(meta, Some(blobs))?;
     let blobs = leep_store::open_blob_store(blobs).context("opening blob store")?;
     let meta = crate::open_meta(meta).await.context("opening meta store")?;
-    Ok(Repo::new(blobs, meta))
+    Ok(crate::new_repo(blobs, meta))
 }
 
 /// Kind names from the command line: `all`, `none`, or names from the table.

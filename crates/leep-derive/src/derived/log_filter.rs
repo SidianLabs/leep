@@ -28,7 +28,7 @@ use leep_core::{Changeset, ChangesetId, DerivedRow, Error, Hash, Result};
 
 use super::{derive, DerivedKind, SkipEntry};
 use crate::ancestry::Reader;
-use crate::repo::{ByKey, SizedCache};
+use crate::repo::{ByKey, CacheScale, SizedCache};
 use crate::Repo;
 
 /// Per-changeset kind; see the module docs.
@@ -358,6 +358,10 @@ const SKIP_CACHE_BYTES: usize = 32 << 20;
 /// per changeset: a few hundred thousand changesets.
 const FPS_CACHE_BYTES: usize = 48 << 20;
 
+/// What the caches below hold in total at their defaults.
+pub(crate) const LOG_FILTER_CACHE_BYTES: usize =
+    ROW_CACHE_BYTES + NAME_CACHE_BYTES + SKIP_CACHE_BYTES + FPS_CACHE_BYTES;
+
 /// Author fingerprints whose name row this process has staged, so each
 /// author's row is written once per process rather than once per changeset.
 const WRITTEN_NAMES: usize = 1 << 20;
@@ -381,6 +385,16 @@ pub(crate) struct LogFilterCaches {
 }
 
 impl LogFilterCaches {
+    pub(crate) fn scaled(s: CacheScale) -> Self {
+        LogFilterCaches {
+            rows: SizedCache::scaled(s),
+            names: SizedCache::scaled(s),
+            skips: SizedCache::scaled(s),
+            fps: SizedCache::scaled(s),
+            ..Default::default()
+        }
+    }
+
     fn side_budget(&self) -> usize {
         match self.side_budget.load(Ordering::Relaxed) {
             0 => SIDE_BUDGET,

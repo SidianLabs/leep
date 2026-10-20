@@ -42,13 +42,29 @@ pub async fn open_meta_store(url: &str) -> Result<Arc<dyn MetaStore>> {
     open_meta_store_with(url, SchemaMode::Migrate).await
 }
 
+/// Connections a Postgres store opens at most unless told otherwise
+/// (`leep-server --meta-pool-size`).
+pub const DEFAULT_POSTGRES_POOL_SIZE: u32 = 16;
+
 /// [`open_meta_store`] with a choice of what to do about pending migrations.
 /// Either way, a database newer than this binary is refused.
 pub async fn open_meta_store_with(url: &str, mode: SchemaMode) -> Result<Arc<dyn MetaStore>> {
+    open_meta_store_with_pool(url, mode, DEFAULT_POSTGRES_POOL_SIZE).await
+}
+
+/// [`open_meta_store_with`], with at most `pool_size` connections to
+/// Postgres. SQLite keeps its own small pool: it has one writer at a time.
+pub async fn open_meta_store_with_pool(
+    url: &str,
+    mode: SchemaMode,
+    pool_size: u32,
+) -> Result<Arc<dyn MetaStore>> {
     if url.starts_with("sqlite:") {
         Ok(Arc::new(SqliteMetaStore::connect_with(url, mode).await?))
     } else if url.starts_with("postgres://") || url.starts_with("postgresql://") {
-        Ok(Arc::new(PostgresMetaStore::connect_with(url, mode).await?))
+        Ok(Arc::new(
+            PostgresMetaStore::connect_with_pool(url, mode, pool_size).await?,
+        ))
     } else if url.starts_with("mem://") {
         Ok(Arc::new(leep_core::memory::MemoryMetaStore::new()))
     } else {

@@ -79,7 +79,13 @@ impl PostgresMetaStore {
     /// Connect; with [`SchemaMode::RequireCurrent`] refuse instead of
     /// migrating when the schema is not current.
     pub async fn connect_with(url: &str, mode: SchemaMode) -> Result<Self> {
-        Self::open(url, None, mode, MIGRATIONS).await
+        Self::connect_with_pool(url, mode, crate::DEFAULT_POSTGRES_POOL_SIZE).await
+    }
+
+    /// [`connect_with`](Self::connect_with), opening at most `pool_size`
+    /// connections.
+    pub async fn connect_with_pool(url: &str, mode: SchemaMode, pool_size: u32) -> Result<Self> {
+        Self::open(url, None, mode, MIGRATIONS, pool_size).await
     }
 
     /// Like [`connect`](Self::connect), but keeps all tables in `schema`
@@ -90,6 +96,7 @@ impl PostgresMetaStore {
             Some(schema.to_string()),
             SchemaMode::Migrate,
             MIGRATIONS,
+            crate::DEFAULT_POSTGRES_POOL_SIZE,
         )
         .await
     }
@@ -103,7 +110,14 @@ impl PostgresMetaStore {
         mode: SchemaMode,
         migrations: &[Migration],
     ) -> Result<Self> {
-        Self::open(url, schema.map(str::to_string), mode, migrations).await
+        Self::open(
+            url,
+            schema.map(str::to_string),
+            mode,
+            migrations,
+            crate::DEFAULT_POSTGRES_POOL_SIZE,
+        )
+        .await
     }
 
     /// Apply pending migrations, or with `dry_run` only report them.
@@ -118,7 +132,12 @@ impl PostgresMetaStore {
         migrations: &[Migration],
         dry_run: bool,
     ) -> Result<MigrationReport> {
-        let pool = Self::pool(url, schema.map(str::to_string)).await?;
+        let pool = Self::pool(
+            url,
+            schema.map(str::to_string),
+            crate::DEFAULT_POSTGRES_POOL_SIZE,
+        )
+        .await?;
         let r = Self::run(&pool, migrations, !dry_run).await;
         pool.close().await;
         r
@@ -142,8 +161,9 @@ impl PostgresMetaStore {
         schema: Option<String>,
         mode: SchemaMode,
         migrations: &[Migration],
+        pool_size: u32,
     ) -> Result<Self> {
-        let pool = Self::pool(url, schema).await?;
+        let pool = Self::pool(url, schema, pool_size).await?;
         let report = Self::run(&pool, migrations, mode == SchemaMode::Migrate).await?;
         if mode == SchemaMode::RequireCurrent {
             migrate::require_current(&report)?;
@@ -154,7 +174,7 @@ impl PostgresMetaStore {
         Ok(store)
     }
 
-    async fn pool(url: &str, schema: Option<String>) -> Result<PgPool> {
+    async fn pool(url: &str, schema: Option<String>, max: u32) -> Result<PgPool> {
         let opts = PgConnectOptions::from_str(url).map_err(storage)?;
         if let Some(schema) = &schema {
             let quoted = quote_ident(schema);
@@ -170,7 +190,7 @@ impl PostgresMetaStore {
             admin.close().await;
         }
         PgPoolOptions::new()
-            .max_connections(16)
+            .max_connections(max.max(1))
             .after_connect(move |conn, _| {
                 let set = schema
                     .as_ref()

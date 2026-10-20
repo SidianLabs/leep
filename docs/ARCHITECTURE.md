@@ -264,8 +264,9 @@ starts once the patch grows past about `sqrt(128 × keyframe size)` bytes.
 Patches point only at keyframes, so a row costs at most two reads, and a
 lookup of a recently changed name is answered from the patch alone. Rows
 depend only on the content and the first parent's stored version, so every
-server derives identical bytes. Each `Repo` keeps a 64 MiB cache of decoded
-node rows, so derivation does not re-read the chunks of the root and other
+server derives identical bytes. Each `Repo` keeps a cache of decoded
+node rows (96 MiB by default; all of `Repo`'s derive caches scale with
+`leep-server --derive-cache-bytes`), so derivation does not re-read the chunks of the root and other
 hot directories for every changeset.
 
 **Blame.** Blame follows first parents and credits each line to the

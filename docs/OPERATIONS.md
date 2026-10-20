@@ -861,6 +861,34 @@ database when `compact-changesets` runs. From now on, a format change that
 old servers cannot read is refused by them at startup, instead of failing
 their reads.
 
+## Connection pool and caches
+
+Two settings size a `leep-server` process. Both are global flags, so they
+apply to the server and to its tools (`verify`, `repair`, `upgrade-index`,
+`gc`, `derive-search`):
+
+| Flag / env | Default | What it bounds |
+|---|---|---|
+| `--meta-pool-size` / `LEEP_META_POOL_SIZE` | 16 | Connections this process opens to a Postgres metadata store. SQLite ignores it. |
+| `--derive-cache-bytes` / `LEEP_DERIVE_CACHE_BYTES` | 356515840 (340 MiB) | The in-memory caches of derived indexes: path-history nodes, parts and roots (148 MiB), tree nodes (32 MiB), and the filtered-log caches (160 MiB). The ancestry and skiplist caches are bounded by entries, about 100 MB together by default, and scale by the same factor. |
+
+`--cache-bytes` (256 MiB) is separate: it caches blobs.
+
+- **Pool.** A request or derivation job holds at most one connection at a
+  time. Raise the pool with `--derive-jobs` or `rederive --jobs` past 16 on
+  a machine with the cores for it. Every server and tool has its own pool,
+  so keep the sum of all pools under Postgres's `max_connections` (100 by
+  default) less what other clients need. A pool that is too small makes
+  requests wait. They do not fail unless they wait past sqlx's 30 s acquire
+  timeout.
+- **Derive caches.** Every cache gets its default share of the budget
+  times `budget / 340 MiB`. More helps derivation of very wide histories
+  and filtered logs over long ranges: `history-tree-v4` derivation re-reads
+  hot directory nodes, and `log-filter-v1` merge walks reuse fingerprints.
+  Less suits small containers. A small budget changes no answer, only how
+  often rows are read again. RSS also holds the blob cache, request
+  buffers and the derivation working set.
+
 ## Indexing a large history
 
 After importing a long history (`leep-git import`, a restore without
@@ -887,7 +915,8 @@ leep-server repair rederive --kind history-tree-v4 log-filter-v1 --missing --job
   `leep-server` process, so use about the cores the machine can spare;
   with Postgres on another host a little more (1.5 to 2 times the cores)
   hides round trips. Each job may hold a Postgres connection at a time and
-  the pool has 16, so more than 16 jobs gains nothing. Memory stays near
+  the pool has 16 (`--meta-pool-size`), so more jobs than connections gains
+  nothing; see [Connection pool and caches](#connection-pool-and-caches). Memory stays near
   that of one job (a few hundred MB on Linux-sized histories); the
   history-row and tree caches are shared.
 - Run `ANALYZE changesets, refs, derived;` first if the import did not (see
