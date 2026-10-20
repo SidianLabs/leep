@@ -2,6 +2,11 @@
 //! upload blobs, create a changeset on that head and land it onto `main`.
 //! Reports lands per second, upload, create and land latency and the server's
 //! retry counters for each N, and optionally times a missing-blobs query.
+//! Several `--server` URLs share the agents round-robin, to measure server
+//! instances that share one database racing for the same ref. Latencies
+//! include lands still waiting when the window closes (each agent finishes
+//! its land before stopping); lands per second counts only lands answered
+//! inside the window, and "stalled agents" those with none answered there.
 //! See "Concurrent lands on one ref" in docs/PERFORMANCE.md.
 
 use std::collections::BTreeMap;
@@ -21,12 +26,14 @@ use reqwest::Client;
 #[derive(Parser)]
 #[command(about = "Concurrent lands onto one ref against a running leep-server")]
 struct Args {
-    /// Server base URL.
-    #[arg(long, default_value = "http://127.0.0.1:7070")]
-    server: String,
-    /// The server's `--metrics-listen` base URL, to read its land counters.
-    #[arg(long)]
-    metrics: Option<String>,
+    /// Server base URLs, comma separated: agent `i` talks to server
+    /// `i % count`. Instances must share the metadata and blob stores.
+    #[arg(long, value_delimiter = ',', default_value = "http://127.0.0.1:7070")]
+    server: Vec<String>,
+    /// The servers' `--metrics-listen` base URLs, to read and sum their land
+    /// counters.
+    #[arg(long, value_delimiter = ',')]
+    metrics: Vec<String>,
     /// Agent counts to run, one after another.
     #[arg(long, value_delimiter = ',', default_value = "1,4,16,64")]
     agents: Vec<usize>,
@@ -119,12 +126,21 @@ fn modify(data: &[u8]) -> FileChange {
 
 #[derive(Default)]
 struct Totals {
+    /// Lands answered inside the measured window: the throughput.
+    lands: u64,
+    /// Latency of every land answered after the window opened, including
+    /// those still waiting when it closed, so a starved land is not dropped
+    /// from the percentiles.
     latencies_us: Vec<u64>,
     put_us: Vec<u64>,
     create_us: Vec<u64>,
     rebased: u64,
     retried_409: u64,
     attempts_above_one: u64,
+    /// Lands answered by each server, to show one instance starving another.
+    per_server: Vec<u64>,
+    /// Agents that had a land answered inside the window.
+    progressed: std::collections::HashSet<usize>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -134,6 +150,7 @@ async fn agent(
     files: usize,
     blob_bytes: usize,
     who: usize,
+    server: usize,
     stop: Arc<AtomicBool>,
     measuring: Arc<AtomicBool>,
     totals: Arc<Mutex<Totals>>,
@@ -200,7 +217,7 @@ async fn agent(
         else {
             bail!("unexpected conflicts: agents edit disjoint files");
         };
-        if measuring.load(Ordering::Relaxed) && !stop.load(Ordering::Relaxed) {
+        if measuring.load(Ordering::Relaxed) {
             let mut t = totals.lock().unwrap();
             t.latencies_us.push(dt.as_micros() as u64);
             t.put_us.extend(puts);
@@ -208,6 +225,14 @@ async fn agent(
             t.rebased += u64::from(rebased);
             t.retried_409 += retried;
             t.attempts_above_one += u64::from(attempts > 1);
+            if !stop.load(Ordering::Relaxed) {
+                t.lands += 1;
+                t.progressed.insert(who);
+                if t.per_server.len() <= server {
+                    t.per_server.resize(server + 1, 0);
+                }
+                t.per_server[server] += 1;
+            }
         }
     }
     Ok(())
@@ -225,14 +250,16 @@ fn metric(page: &str, name: &str) -> f64 {
         .sum()
 }
 
-async fn scrape(client: &Client, metrics: &Option<String>) -> String {
-    let Some(m) = metrics else {
-        return String::new();
-    };
-    match client.get(format!("{m}/metrics")).send().await {
-        Ok(r) => r.text().await.unwrap_or_default(),
-        Err(_) => String::new(),
+/// Every server's metrics page, concatenated so `metric` sums across them.
+async fn scrape(client: &Client, metrics: &[String]) -> String {
+    let mut all = String::new();
+    for m in metrics {
+        if let Ok(r) = client.get(format!("{m}/metrics")).send().await {
+            all.push_str(&r.text().await.unwrap_or_default());
+            all.push('\n');
+        }
     }
+    all
 }
 
 fn pct(sorted: &[u64], p: f64) -> f64 {
@@ -252,10 +279,17 @@ async fn main() -> Result<()> {
         .tcp_nodelay(true)
         .pool_max_idle_per_host(256)
         .build()?;
-    let http = Arc::new(Http {
-        client: client.clone(),
-        base: args.server.trim_end_matches('/').to_string(),
-    });
+    let servers: Vec<Arc<Http>> = args
+        .server
+        .iter()
+        .map(|s| {
+            Arc::new(Http {
+                client: client.clone(),
+                base: s.trim_end_matches('/').to_string(),
+            })
+        })
+        .collect();
+    let http = Arc::clone(&servers[0]);
 
     if args.missing > 0 {
         let hashes: Vec<Hash> = (0..args.missing)
@@ -330,9 +364,9 @@ async fn main() -> Result<()> {
     }
 
     println!(
-        "| agents | lands | lands/s | p50 ms | p99 ms | max ms | blob puts/s | put p50/p99 ms | create p50/p99 ms | replayed | 409 retries | CAS losses | attempts>1 | lock wait mean ms | batch mean |"
+        "| servers | agents | lands | lands/s | p50 ms | p99 ms | max ms | blob puts/s | put p50/p99 ms | create p50/p99 ms | replayed | 409 retries | CAS losses | attempts>1 | lock wait mean ms | batch mean | lands per server | stalled agents |"
     );
-    println!("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|");
+    println!("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|");
     for &n in &args.agents {
         let stop = Arc::new(AtomicBool::new(false));
         let measuring = Arc::new(AtomicBool::new(false));
@@ -340,11 +374,12 @@ async fn main() -> Result<()> {
         let tasks: Vec<_> = (0..n)
             .map(|i| {
                 tokio::spawn(agent(
-                    Arc::clone(&http),
+                    Arc::clone(&servers[i % servers.len()]),
                     args.target.clone(),
                     args.files.max(1),
                     args.blob_bytes,
                     i,
+                    i % servers.len(),
                     Arc::clone(&stop),
                     Arc::clone(&measuring),
                     Arc::clone(&totals),
@@ -367,11 +402,14 @@ async fn main() -> Result<()> {
         t.latencies_us.sort_unstable();
         t.put_us.sort_unstable();
         t.create_us.sort_unstable();
-        let lands = t.latencies_us.len();
+        let lands = t.lands;
+        t.per_server.resize(servers.len(), 0);
+        let stalled = n - t.progressed.len();
         let waits = d("leep_land_lock_wait_seconds_count");
         let batches = d("leep_land_batch_size_count");
         println!(
-            "| {n} | {lands} | {:.1} | {:.1} | {:.1} | {:.1} | {:.0} | {:.1} / {:.1} | {:.1} / {:.1} | {} | {} | {} | {} | {} | {} |",
+            "| {} | {n} | {lands} | {:.1} | {:.1} | {:.1} | {:.1} | {:.0} | {:.1} / {:.1} | {:.1} / {:.1} | {} | {} | {} | {} | {} | {} | {} | {stalled} |",
+            servers.len(),
             lands as f64 / elapsed,
             pct(&t.latencies_us, 0.5),
             pct(&t.latencies_us, 0.99),
@@ -398,6 +436,11 @@ async fn main() -> Result<()> {
             } else {
                 "-".into()
             },
+            t.per_server
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(" / "),
         );
     }
     Ok(())
