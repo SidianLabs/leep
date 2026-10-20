@@ -811,6 +811,29 @@ s) against 328 to 1,301 timeouts. Logs timed out 0 to 1,569 times per run.
   for files its run has not created yet on this ref; they cost a round trip
   and are not server errors.
 
+#### Warmer every 250 ms (#109)
+
+The same runs against `leep:5403ff9`, which tails the ref log and warms
+every 250 ms instead of every 30 s; everything else unchanged.
+
+| Run | Lands/s | Land p50 | Stalled agents | Path-history lag p50 (generations) | Double / lost lands |
+|---|---|---|---|---|---|
+| 500 agents, 2 s think | 5.9 (2.7–6.7) | 1.8 s (1.3–57 s) | 34 of 500 (7–54) | 771 (39–842) | 0 / 0 |
+| 2,000 agents, 2 s think | 7.0 (5.0–9.3) | 59 s (59–60 s) | 352 of 2,000 (280–799) | 1,406 (736–1,647) | 0 / 0 |
+| 256 agents, no think time | 5.7 (2.6–8.7) | 1.8 s (1.6–20 s) | 1 of 256 (0–50) | 527 (358–625) | 0 / 0 |
+
+- **Polling more often barely moved the lag** (8% to 21% lower medians,
+  inside the run-to-run spread). The warmer now notices a move within
+  250 ms, but on two saturated cores it cannot derive as fast as agents
+  land, so it falls behind by the same amount. The lag is a derivation
+  throughput limit, not a polling delay.
+- Throughput, land latency and timeouts are unchanged within noise; search
+  still times out hundreds of times per run.
+- What helps is taking derivation off the request path entirely (ADR 0058
+  phase 1: one indexer per kind, queries that answer from what is indexed
+  instead of deriving inline), so reads stop competing with the indexer
+  for the same cores, and running the indexer on its own host.
+
 ## Real history: git/git
 
 The benchmarks above use synthetic, mostly linear histories. `git/git` is real
