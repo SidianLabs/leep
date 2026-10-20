@@ -105,7 +105,7 @@ upgrade it from the docs alone.
 
 ## M7: Product
 - Multiple repositories per server, each with its own refs, tokens and
-  policies
+  policies (design: [ADR 0054](adr/0054-multiple-repositories-per-server.md))
 - Identity: OIDC or mTLS in addition to static tokens; per-repository roles
 - Client polish: clear errors, `leep status`/`diff` UX, conflict resolution
   flow, shell completions

@@ -990,6 +990,19 @@ and self-approval rules for reviews. See the roadmap.
 Moving between stages means swapping a `MetaStore`/`BlobStore`
 implementation. Nothing above the traits changes.
 
+**Multiple repositories** (M7, designed in
+[ADR 0054](adr/0054-multiple-repositories-per-server.md), not implemented
+yet). A server will hold many repositories in one metadata store and one blob
+store. Content-addressed objects and the derived kinds that are pure
+functions of their key stay shared; refs, the ref log and a few
+policy-bearing kinds (`review-v1`, `signature-v1`, the mirror maps) gain a
+repository id; membership tables, closed under ancestry, decide which
+changesets and blobs a repository can reach, so only entry points are
+checked. Today's `/v1` paths keep serving the default repository and every
+endpoint is also served under `/v1/repos/{repo}/...`. Authorization becomes a
+function of principal and repository behind one `Authorizer` seam, and
+`derived` is not partitioned by repository.
+
 Storage is the cost that grows fastest with history: every blob and tree
 node is stored whole, so imported git/git takes 8.7 GB of objects against a
 0.33 GB git pack. ADR 0029 adds packs below `BlobStore`: `leep-server
