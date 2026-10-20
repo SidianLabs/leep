@@ -83,10 +83,11 @@ struct Args {
     /// checked concurrently) before reporting it down (500ms, 2s).
     #[arg(long, env = "LEEP_READY_TIMEOUT", default_value = "2s", value_parser = parse_ready_timeout)]
     ready_timeout: std::time::Duration,
-    /// How often to look for moved refs and derive their indexes in the
-    /// background (ADR 0028), so queries find them ready; 0 turns warming off
-    /// and indexes are derived by the first query that needs them.
-    #[arg(long, env = "LEEP_WARM_INTERVAL", default_value = "30s", value_parser = parse_grace)]
+    /// How often to read the ref log for moved refs and derive their indexes
+    /// in the background (ADR 0028, ADR 0058), so queries find them ready;
+    /// every ref is also listed every 5 s. 0 turns warming off and indexes
+    /// are derived by the first query that needs them.
+    #[arg(long, env = "LEEP_WARM_INTERVAL", default_value = "250ms", value_parser = parse_interval)]
     warm_interval: std::time::Duration,
     /// Also warm the code-search index of each ref head.
     #[arg(
@@ -441,14 +442,20 @@ async fn run_compact(meta: &str, opts: leep_meta::compact::CompactOptions) -> an
 }
 
 /// `500ms`, `2s`, `1m`; a bare number is seconds. Zero would fail every probe.
-fn parse_ready_timeout(s: &str) -> Result<std::time::Duration, String> {
-    let d = match s.trim().strip_suffix("ms") {
-        Some(n) => std::time::Duration::from_millis(
+/// A duration that may be given in milliseconds (250ms) as well as the
+/// units of [`parse_grace`].
+fn parse_interval(s: &str) -> Result<std::time::Duration, String> {
+    match s.trim().strip_suffix("ms") {
+        Some(n) => Ok(std::time::Duration::from_millis(
             n.parse()
                 .map_err(|_| format!("bad duration {s:?}; use e.g. 500ms, 2s"))?,
-        ),
-        None => parse_grace(s)?,
-    };
+        )),
+        None => parse_grace(s),
+    }
+}
+
+fn parse_ready_timeout(s: &str) -> Result<std::time::Duration, String> {
+    let d = parse_interval(s)?;
     if d.is_zero() {
         return Err("must be greater than zero".into());
     }
