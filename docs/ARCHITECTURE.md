@@ -326,7 +326,20 @@ author, and blame responses carry a deduplicated per-changeset summary
 (author, time, first message line, `agent.*` keys). The summaries are
 attached on read, so the cached `blame` value keeps its original encoding.
 Provenance scans the newest changesets (capped at 10 000, reporting
-`truncated`).
+`truncated`); it is an aggregate, so it has no cursor.
+
+**Page cursors.** `GET /v1/log`, `/v1/search` and `/v1/reflog` answer one
+capped page and, when more remains, an opaque `next` cursor that the client
+sends back as `after` (`leep_derive::cursor`, layout in FORMATS.md). A log
+cursor carries the walk's queue: every log walk (plain, path index, `follow`,
+and the `log-filter-v1` walk with its merge-side bounds) pops in descending
+`(generation, id)` and queues only ancestors, so seeding a fresh walk with
+the queue continues it exactly, and pages cost what one long walk costs. A
+queue wider than 64 entries falls back to "restart from the tip below the
+last entry", which is correct but rescans. A search cursor pins the searched
+changeset and the last (path, line), and the walk skips directories and files
+before it. Cursors are bound to their query by a fingerprint and validated as
+untrusted input (400 on any failure).
 
 **Filtered log** ([ADR 0047](adr/0047-log-filter-index.md)). A log with
 `author` or `extra` filters and no path scans its first 512 changesets
@@ -976,6 +989,19 @@ and self-approval rules for reviews. See the roadmap.
 
 Moving between stages means swapping a `MetaStore`/`BlobStore`
 implementation. Nothing above the traits changes.
+
+**Multiple repositories** (M7, designed in
+[ADR 0054](adr/0054-multiple-repositories-per-server.md), not implemented
+yet). A server will hold many repositories in one metadata store and one blob
+store. Content-addressed objects and the derived kinds that are pure
+functions of their key stay shared; refs, the ref log and a few
+policy-bearing kinds (`review-v1`, `signature-v1`, the mirror maps) gain a
+repository id; membership tables, closed under ancestry, decide which
+changesets and blobs a repository can reach, so only entry points are
+checked. Today's `/v1` paths keep serving the default repository and every
+endpoint is also served under `/v1/repos/{repo}/...`. Authorization becomes a
+function of principal and repository behind one `Authorizer` seam, and
+`derived` is not partitioned by repository.
 
 Storage is the cost that grows fastest with history: every blob and tree
 node is stored whole, so imported git/git takes 8.7 GB of objects against a

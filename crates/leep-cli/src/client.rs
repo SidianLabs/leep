@@ -43,6 +43,8 @@ pub struct LogQuery {
     pub extra: Vec<String>,
     /// Continue a file's history across renames (needs a file `path`).
     pub follow: bool,
+    /// The previous page's `next` cursor.
+    pub after: Option<String>,
 }
 
 impl LogQuery {
@@ -62,6 +64,9 @@ impl LogQuery {
         if self.follow {
             out.push(("follow", "true".into()));
         }
+        if let Some(a) = &self.after {
+            out.push(("after", a.clone()));
+        }
         out
     }
 }
@@ -75,6 +80,8 @@ pub struct SearchQuery {
     pub path: Option<String>,
     pub glob: Option<String>,
     pub limit: Option<u32>,
+    /// The previous page's `next` cursor.
+    pub after: Option<String>,
 }
 
 impl SearchQuery {
@@ -96,8 +103,29 @@ impl SearchQuery {
         if let Some(n) = self.limit {
             out.push(("limit", n.to_string()));
         }
+        if let Some(a) = &self.after {
+            out.push(("after", a.clone()));
+        }
         out
     }
+}
+
+/// Most log entries the server returns per request.
+pub const LOG_PAGE: u32 = 10_000;
+
+/// Most search matches the server returns per request.
+pub const SEARCH_PAGE: u32 = 1000;
+
+fn add_stats(total: &mut SearchStats, page: &SearchStats) {
+    total.files_considered += page.files_considered;
+    total.dirs_pruned += page.dirs_pruned;
+    total.files_pruned += page.files_pruned;
+    total.files_scanned += page.files_scanned;
+    total.files_skipped += page.files_skipped;
+    total.bytes_scanned += page.bytes_scanned;
+    total.blob_rows_derived += page.blob_rows_derived;
+    total.tree_rows_derived += page.tree_rows_derived;
+    total.indexed = page.indexed;
 }
 
 /// Percent-encode a URL path, keeping `/` so ref names like `team/x` work.
@@ -314,6 +342,18 @@ impl Client {
         before: Option<u64>,
         limit: usize,
     ) -> Result<RefLogResponse> {
+        self.ref_log_page(name, before, None, limit)
+    }
+
+    /// [`Client::ref_log`] that can also resume from a page's `next` cursor
+    /// (`after`); the server refuses `before` and `after` together.
+    pub fn ref_log_page(
+        &self,
+        name: Option<&str>,
+        before: Option<u64>,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<RefLogResponse> {
         let url = match name {
             Some(n) => self.url(&format!("/v1/reflog/{}", enc(n))),
             None => self.url("/v1/reflog"),
@@ -321,6 +361,9 @@ impl Client {
         let mut query = vec![("limit", limit.to_string())];
         if let Some(b) = before {
             query.push(("before", b.to_string()));
+        }
+        if let Some(a) = after {
+            query.push(("after", a.to_string()));
         }
         self.json(self.http.get(url).query(&query))
     }
@@ -400,6 +443,28 @@ impl Client {
         )
     }
 
+    /// Up to `want` log entries, following page cursors past the server's
+    /// per-request cap. `next` is set if the log goes on. A server without
+    /// cursors answers one page.
+    pub fn log_all(&self, id: &ChangesetId, q: &LogQuery, want: usize) -> Result<LogResponse> {
+        let mut q = q.clone();
+        let mut out = LogResponse {
+            entries: Vec::new(),
+            next: None,
+        };
+        loop {
+            let left = want - out.entries.len();
+            q.limit = Some(left.min(LOG_PAGE as usize) as u32);
+            let page = self.log(id, &q)?;
+            out.entries.extend(page.entries);
+            out.next = page.next;
+            if out.entries.len() >= want || out.next.is_none() {
+                return Ok(out);
+            }
+            q.after = out.next.clone();
+        }
+    }
+
     /// Newest change to a file or directory, from the server's path index.
     pub fn last_change(&self, id: &ChangesetId, path: &str) -> Result<LastChangeResponse> {
         self.json(
@@ -431,6 +496,32 @@ impl Client {
                 .get(self.url(&format!("/v1/search/{id}")))
                 .query(&q.params()),
         )
+    }
+
+    /// Up to `want` matches, following page cursors past the server's
+    /// per-request cap. Stats add up over the pages; `truncated` and `next`
+    /// are the last page's.
+    pub fn search_all(
+        &self,
+        id: &ChangesetId,
+        q: &SearchQuery,
+        want: usize,
+    ) -> Result<SearchResponse> {
+        let mut q = q.clone();
+        let mut out = SearchResponse::default();
+        loop {
+            let left = want - out.matches.len();
+            q.limit = Some(left.min(SEARCH_PAGE as usize) as u32);
+            let page = self.search(id, &q)?;
+            out.matches.extend(page.matches);
+            add_stats(&mut out.stats, &page.stats);
+            out.truncated = page.truncated;
+            out.next = page.next;
+            if out.matches.len() >= want || out.next.is_none() {
+                return Ok(out);
+            }
+            q.after = out.next.clone();
+        }
     }
 
     pub fn diff(
@@ -694,6 +785,7 @@ mod tests {
             path: Some("src".into()),
             glob: Some("**/*.rs".into()),
             limit: Some(7),
+            after: Some("c1".into()),
         };
         assert_eq!(
             q.params(),
@@ -704,6 +796,7 @@ mod tests {
                 ("path", "src".to_string()),
                 ("glob", "**/*.rs".to_string()),
                 ("limit", "7".to_string()),
+                ("after", "c1".to_string()),
             ]
         );
     }

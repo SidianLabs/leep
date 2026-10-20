@@ -44,6 +44,9 @@ pub struct Data {
     pub omit_merge_clean: bool,
     /// Every merge request received.
     pub merges: Vec<MergeRequest>,
+    /// Cap every log, search and ref log page at this many items and answer
+    /// `next` cursors (decimal offsets), like a server's per-request cap.
+    pub page_cap: Option<usize>,
 }
 
 pub type Shared = Arc<Mutex<Data>>;
@@ -468,20 +471,31 @@ async fn cas_ref(
 struct LogParams {
     before: Option<u64>,
     limit: Option<usize>,
+    after: Option<String>,
+}
+
+/// `items[offset..]` cut to `limit` (and the page cap), with the next
+/// offset as the cursor if more remain.
+fn page<T>(d: &Data, items: Vec<T>, limit: usize, after: Option<&str>) -> (Vec<T>, Option<String>) {
+    let offset: usize = after.map_or(0, |a| a.parse().expect("fake cursor"));
+    let size = d.page_cap.map_or(limit, |c| c.min(limit));
+    let rest = items.len().saturating_sub(offset);
+    let out: Vec<T> = items.into_iter().skip(offset).take(size).collect();
+    let next = (d.page_cap.is_some() && rest > size).then(|| (offset + size).to_string());
+    (out, next)
 }
 
 fn reflog_page(d: &Data, name: Option<&str>, q: LogParams) -> Json<RefLogResponse> {
-    Json(RefLogResponse {
-        entries: d
-            .reflog
-            .iter()
-            .rev()
-            .filter(|e| q.before.is_none_or(|b| e.seq < b))
-            .filter(|e| name.is_none_or(|n| e.name == n))
-            .take(q.limit.unwrap_or(50))
-            .cloned()
-            .collect(),
-    })
+    let all: Vec<RefLogEntry> = d
+        .reflog
+        .iter()
+        .rev()
+        .filter(|e| q.before.is_none_or(|b| e.seq < b))
+        .filter(|e| name.is_none_or(|n| e.name == n))
+        .cloned()
+        .collect();
+    let (entries, next) = page(d, all, q.limit.unwrap_or(50), q.after.as_deref());
+    Json(RefLogResponse { entries, next })
 }
 
 async fn reflog_all(State(s): State<Shared>, Query(q): Query<LogParams>) -> Json<RefLogResponse> {
@@ -946,7 +960,16 @@ async fn log(
             });
         }
     }
-    Ok(Json(LogResponse { entries }))
+    let limit = q
+        .iter()
+        .find(|(k, _)| k == "limit")
+        .map_or(100, |(_, v)| v.parse().unwrap());
+    let after = q
+        .iter()
+        .find(|(k, _)| k == "after")
+        .map(|(_, v)| v.as_str());
+    let (entries, next) = page(&d, entries, limit, after);
+    Ok(Json(LogResponse { entries, next }))
 }
 
 /// File-level diff between two changesets, with rename detection when asked,
@@ -1128,12 +1151,14 @@ async fn search(
             }
         }
     }
-    let truncated = matches.len() > limit;
-    matches.truncate(limit);
+    let total = matches.len();
+    let offset: usize = q.get("after").map_or(0, |a| a.parse().unwrap());
+    let (matches, next) = page(&d, matches, limit, q.get("after").map(String::as_str));
     Ok(Json(SearchResponse {
+        truncated: total > offset + matches.len(),
         matches,
-        truncated,
         stats: SearchStats::default(),
+        next,
     }))
 }
 

@@ -64,20 +64,21 @@ fn entry_line(e: &RefLogEntry) -> String {
 pub fn reflog(r: &Remote, args: &ReflogArgs) -> Result<i32> {
     let mut entries = Vec::new();
     let mut before = None;
+    let mut after: Option<String> = None;
     while entries.len() < args.limit {
         let want = (args.limit - entries.len()).min(PAGE);
-        let page = r
-            .client
-            .ref_log(args.refname.as_deref(), before, want)?
-            .entries;
-        let Some(last) = page.last().map(|e| e.seq) else {
-            break;
-        };
-        let full = page.len() == want;
-        entries.extend(page);
-        before = Some(last);
-        if !full {
-            break;
+        let page =
+            r.client
+                .ref_log_page(args.refname.as_deref(), before, after.as_deref(), want)?;
+        let last = page.entries.last().map(|e| e.seq);
+        let full = page.entries.len() == want;
+        entries.extend(page.entries);
+        // Follow the server's cursor; a server without cursors pages by
+        // `seq`, and a full page from it may have more behind it.
+        match (page.next, last) {
+            (Some(next), _) => (before, after) = (None, Some(next)),
+            (None, Some(last)) if full && after.is_none() => before = Some(last),
+            _ => break,
         }
     }
     if r.json {

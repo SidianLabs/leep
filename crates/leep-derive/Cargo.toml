@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 leep-core.workspace = true
 async-trait.workspace = true
+base64.workspace = true
 bytes.workspace = true
 futures-util.workspace = true
 globset.workspace = true

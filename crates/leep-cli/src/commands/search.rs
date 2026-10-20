@@ -4,7 +4,7 @@ use clap::Args;
 use leep_core::api::SearchResponse;
 
 use super::{print_json, Remote};
-use crate::client::SearchQuery;
+use crate::client::{SearchQuery, SEARCH_PAGE};
 use crate::error::{exit, Result};
 
 #[derive(Args, Debug)]
@@ -27,9 +27,14 @@ pub struct SearchArgs {
     /// crosses them (for example `**/*.rs`).
     #[arg(long)]
     pub glob: Option<String>,
-    /// Maximum matching lines (server default 100, cap 1000).
+    /// Maximum matching lines (server default 100); more than one server
+    /// page (1000) is fetched page by page.
     #[arg(short = 'n', long)]
     pub limit: Option<u32>,
+    /// Continue after the page that returned this cursor (the `next` field
+    /// of `--json` output); the query and flags must match that request's.
+    #[arg(long, value_name = "CURSOR")]
+    pub after: Option<String>,
 }
 
 impl SearchArgs {
@@ -41,6 +46,7 @@ impl SearchArgs {
             path: self.path.clone(),
             glob: self.glob.clone(),
             limit: self.limit,
+            after: self.after.clone(),
         }
     }
 }
@@ -56,7 +62,10 @@ pub fn search_lines(resp: &SearchResponse) -> Vec<String> {
 /// Exits 1 when nothing matched (text mode), like grep.
 pub fn run(r: &Remote, args: &SearchArgs) -> Result<i32> {
     let id = r.resolve_default(args.rev.as_deref())?;
-    let resp = r.client.search(&id, &args.query())?;
+    let resp = match args.limit {
+        Some(n) if n > SEARCH_PAGE => r.client.search_all(&id, &args.query(), n as usize)?,
+        _ => r.client.search(&id, &args.query())?,
+    };
     if r.json {
         print_json(&resp)?;
         return Ok(0);

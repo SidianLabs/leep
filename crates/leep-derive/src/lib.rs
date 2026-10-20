@@ -12,6 +12,7 @@ mod ancestry;
 mod batched_reads;
 mod blame;
 mod comments;
+mod cursor;
 pub mod derived;
 mod filter_log;
 pub mod gc;
@@ -42,12 +43,15 @@ mod flush_tests;
 #[cfg(test)]
 mod land_batch_tests;
 #[cfg(test)]
+mod page_tests;
+#[cfg(test)]
 mod tests;
 
 /// The comment lexer, public only so the fuzz harness can check it directly.
 #[doc(hidden)]
 pub use comments::strip_comments;
-pub use history::{ExtraMatch, LogFilter};
+pub use cursor::MAX_CURSOR_CHARS;
+pub use history::{ExtraMatch, LogFilter, LogPage, LogParams};
 pub use repo::{
     default_derive_jobs, PrefixMatch, Repo, MAX_DEFAULT_DERIVE_JOBS, MAX_PREFIX_CANDIDATES,
 };

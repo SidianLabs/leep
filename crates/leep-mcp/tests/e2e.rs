@@ -59,6 +59,21 @@ fn commit_land_and_read_back() {
     let by_path = data(&call(&s, "leep_log", json!({ "path": "src/run.sh" })));
     assert_eq!(by_path["entries"].as_array().unwrap().len(), 1);
 
+    // One entry per page: the cursor brings the next page, then the end.
+    assert!(log.get("next").is_none());
+    let page = data(&call(&s, "leep_log", json!({ "limit": 1 })));
+    assert_eq!(page["entries"][0]["id"], second_id);
+    let next = page["next"].as_str().unwrap();
+    let rest = data(&call(
+        &s,
+        "leep_log",
+        json!({ "limit": 1, "rev": page["from"], "cursor": next }),
+    ));
+    assert_eq!(rest["entries"][0]["id"], first_id);
+    assert!(rest.get("next").is_none());
+    let bad = call(&s, "leep_log", json!({ "cursor": "nonsense" }));
+    assert_eq!(bad["isError"], true);
+
     let show = data(&call(&s, "leep_show", json!({ "rev": first_id })));
     assert_eq!(show["agent"]["model"], "test-model");
     let mut changes: Vec<String> = show["changes"]
@@ -526,6 +541,20 @@ fn search_finds_lines_and_reports_errors() {
     );
     assert_eq!(found["truncated"], false);
     assert_eq!(found["stats"]["files_scanned"], 2);
+    assert!(found.get("next").is_none());
+    let page = data(&call(
+        &s,
+        "leep_search",
+        json!({ "query": "parse", "limit": 1 }),
+    ));
+    let rest = data(&call(
+        &s,
+        "leep_search",
+        json!({ "query": "parse", "limit": 1, "rev": page["rev"], "cursor": page["next"] }),
+    ));
+    assert_eq!(page["matches"][0]["path"], "src/lib.rs");
+    assert_eq!(rest["matches"][0]["path"], "src/main.rs");
+    assert!(rest.get("next").is_none());
     assert_eq!(found["rev"].as_str().unwrap().len(), 64);
 
     // Case, regex, path and glob options.
