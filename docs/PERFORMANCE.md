@@ -2499,9 +2499,14 @@ work.
 | memory, git/git-shaped, 4 / 1 | 1,340 / 1,334/s (0.6 ms CPU) | 2,285 / 1,959/s (0.4 ms CPU) | 18,977 / 4,164/s |
 | memory, Linux-shaped, 4 / 1 | 897 / 941/s (0.9 ms CPU) | 1,123 / 1,144/s (0.8 ms CPU) | 3,975 / 3,670/s |
 
+**Caveat.** These are synthetic histories, with Postgres at `fsync` off and
+1 to 3 files per changeset, each figure from a single run on a loaded VM.
+They bound the shape of the answer, not the numbers for a real repository.
+Every place that quotes them points here.
+
 What it says:
 
-- **A chain indexes at 160 to 460 a second on Postgres.** That is 3 to 10
+- **A chain indexes at 160 to 460 a second on Postgres** (synthetic). That is 3 to 10
   times the estimate from whole-history builds. A linear agent changeset
   touches a few paths and no merge, so its row is a handful of spine
   edits. CPU per changeset is 0.4 to 0.9 ms in memory and 1.3 to 3.5 ms
@@ -2519,8 +2524,10 @@ What it says:
   within noise, as the wavefront predicts. The read-ahead and write
   batching are what make catch-up fast.
 - **Against one ref's land ceiling.** ADR 0056 puts that ceiling at about
-  200 to 250 lands a second. Catch-up at 380 to 460 a second keeps up with
-  it on both shapes, with no format change and no second indexer. Follow
+  200 to 250 lands a second. On these synthetic chains, catch-up at 380 to
+  460 a second keeps up with it on both shapes, with no format change and
+  no second indexer. Whether a real history does is the open question
+  below. Follow
   alone at 160 to 190 a second would not, but a 250 ms pass at that land
   rate always has 50 or more changesets to catch up. The log filter is
   cheaper in CPU and bound by the same round trips.

@@ -249,10 +249,10 @@ The default stays `--indexing local`. Under `lease` and `off`:
 - **`last_merge-v1`** moves to the write path, so ancestry queries never
   derive.
 
-Lands never wait for indexing. A trunk built by lands is a chain, which one
-derivation follows at 380 to 460 changesets a second when catching up on
-Postgres (PERFORMANCE.md, "Hot chain rate"). That is above one ref's land
-rate. Add new kinds with the
+Lands never wait for indexing. A trunk built by lands is a chain, so one
+derivation follows it however many indexers there are. How fast has been
+measured only on synthetic chains (fsync off, 1–3 files per changeset,
+single runs on a loaded VM; see "Hot chain rate" in PERFORMANCE.md). Add new kinds with the
 [`add-derived-data-kind`](../.claude/skills/add-derived-data-kind/SKILL.md)
 skill. A new kind never requires a client change.
 
@@ -1054,10 +1054,11 @@ implementation. Nothing above the traits changes.
 moves out of the query servers to one lease holder per index group,
 sharded by repository once the chains together outgrow one process's cores
 (deferred until measured). A trunk's path history is bounded by how fast one
-derivation follows a chain (measured at 380 to 460 changesets a second
-catching up on synthetic git/git- and Linux-shaped trees, against one ref's
-200 to 250 lands a second). Splitting a chain's derivation by directory is
-the next step, if real histories fall short of that.
+derivation follows a chain. Synthetic measurements so far (fsync off, 1–3
+files per changeset, single runs on a loaded VM; see "Hot chain rate" in
+PERFORMANCE.md) are not yet compared with land rates here. That waits for
+measurements on real histories. If a chain falls short, the next step is to
+split its derivation by directory.
 
 **Multiple repositories** (M7, designed in
 [ADR 0054](adr/0054-multiple-repositories-per-server.md), not implemented

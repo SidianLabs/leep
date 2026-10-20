@@ -56,10 +56,11 @@ Facts this design rests on:
   a first-parent chain one changeset wide. The wavefront has nothing to run
   side by side on it, and one ref's index grows at the rate one derivation
   follows its own chain.
-  - **Measured** ("Hot chain rate"): 160 to 190 changesets a second
-    following one at a time on Postgres, and 380 to 460 a second catching up
-    in batches. That is above the 200 to 250 lands a second one ref accepts
-    (ADR 0056).
+  - **Measured** (synthetic, fsync off, 1–3 files per changeset, single
+    runs on a loaded VM; see "Hot chain rate" in PERFORMANCE.md): 160 to 190
+    changesets a second following one at a time on Postgres, and 380 to 460
+    a second catching up in batches. On those chains that is above the 200
+    to 250 lands a second one ref accepts (ADR 0056).
   - **Not measured:** real histories' contents, or a store loaded by a
     swarm.
 - **Derived rows are shared across repositories** (ADR 0054 section 5).
@@ -158,7 +159,9 @@ implemented steps 1 and 2.
    goes on one ADR 0050 wavefront: shared history once, different refs'
    chains side by side, rows staged and written as before, so every prefix
    stored is parent-closed. Deriving the newest head of a busy ref once per
-   pass is also what makes a chain index at the catch-up rate (section 8).
+   pass is also what makes a chain index at the catch-up rate (section 8;
+   synthetic, fsync off, 1–3 files per changeset, single runs on a loaded
+   VM; see "Hot chain rate" in PERFORMANCE.md).
 3. **Two lanes** (phase 1).
    - **Tip lane:** heads with at most 8,192 missing changesets.
    - **Backfill lane:** a fresh import, a new kind version, a restored
@@ -258,6 +261,18 @@ the `blame` result cache.
 - **No live lease for the group** (no candidate running, or every holder
   gone). Every client gets today's inline derivation at once. A missing
   indexer makes queries slower, never unavailable.
+
+**The inline-derivation rule.** Whether a query may derive an index range
+inline depends only on the lease, never on the header or on how long it has
+waited:
+
+- **A live index lease exists for the group:** inline derivation is
+  disabled. This holds after `--index-wait` runs out too: the request goes
+  on to the larger scan and then the 503, and never derives.
+- **No live lease:** the query derives inline, as in `local` mode.
+
+`leep_query_inline_derive_total` must therefore stay 0 while a lease lives,
+and the swarm acceptance run checks that.
 
 `leep_core::Error` gains `Indexing { kind, behind, retry_after }`, mapped to
 503, and CLAUDE.md's error table gains the line.
@@ -453,8 +468,9 @@ the repair tools.
 To back out, return to `local`. Leases expire in 15 s.
 
 ### 8. Expected numbers
-**Per chain** ("Hot chain rate", synthetic histories shaped like git/git's
-tree and late Linux's, Postgres 16, a shared 4-vCPU VM):
+**Per chain** (synthetic histories shaped like git/git's tree and late
+Linux's, Postgres 16 with fsync off, 1–3 files per changeset, single runs on
+a loaded 4-vCPU VM; see "Hot chain rate" in PERFORMANCE.md):
 
 | Derivation | Postgres | memory | CPU per changeset |
 |---|---|---|---|
@@ -494,8 +510,8 @@ reports the per-agent land rate it saw.
 **When one lease holder stops sufficing:**
 
 - **One chain.** A ref whose land rate exceeds its catch-up rate, about 400
-  a second on these shapes. That is above one ref's land ceiling, so it
-  does not bind today. If a real history or a loaded store says otherwise,
+  a second on the synthetic shapes. That is above one ref's land ceiling,
+  so on those chains it does not bind. If a real history or a loaded store says otherwise,
   the follow-up steps are:
   1. **Measure hot chain rate** on real histories: git/git and Linux
      contents, changesets touching many files, and a store under swarm
@@ -544,7 +560,10 @@ reports the per-agent land rate it saw.
   - `log path`, `follow`, `last-change`, `blame`, filtered `log` and
     `search` must give the fully indexed entries, order and `truncated`,
     and the scan oracle's.
-  - Pages concatenate to one walk while rows are added between pages.
+  - Pages concatenate to one walk while rows are added between pages, and
+    also when a `repair drop` of the kind removes rows between pages: the
+    next page then runs on the bounded scan and still continues the same
+    walk.
   - Stale-ok answers equal a query at `answered_at`.
   - Over budget gives `Error::Indexing` exactly when the missing part
     exceeds it.
