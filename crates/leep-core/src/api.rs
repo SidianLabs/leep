@@ -48,7 +48,18 @@
 //!
 //! Errors are `{"error": "..."}` ([`ErrorResponse`]): `Error::Invalid` → 400,
 //! `Error::NotFound` → 404, CAS loss and `Error::Conflict` (e.g. a land that
-//! kept losing to concurrent lands) → 409, anything else → 500.
+//! kept losing to concurrent lands) → 409, `Error::Indexing` → 503 with
+//! `Retry-After` and [`IndexingInfo`] (ADR 0058), anything else → 500.
+//!
+//! # Index lag (ADR 0058)
+//!
+//! Log with a path or filters, last-change, blame and search use indexes that
+//! one server per group may build behind the head. Such a server never
+//! derives them in a request: it scans what is missing up to a budget. Over
+//! the budget the request header [`INDEXING_HEADER`] decides: `retry` gets
+//! 503, `stale-ok` an answer at the newest indexed first-parent ancestor
+//! (`answered_at`, `behind`), and no header a wait, a larger scan, then 503.
+//! Successful indexed reads carry [`INDEX_SCANNED_HEADER`].
 //! Hashes and ids are lowercase hex in JSON.
 //!
 //! # Pagination

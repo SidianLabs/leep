@@ -768,6 +768,53 @@ What it suggests, to be checked on the real baseline:
   and the warmer; `pg_database_size` grew 5 to 8 KB per land, the rest
   being Postgres's own index and page overhead.
 
+### One indexer per kind (ADR 0058), local smoke test
+
+`leep-swarm` on this branch, release build, a fresh Postgres 16 database
+(fsync off) and blob directory per run, everything on one shared 4-vCPU
+host (load average 4 to 13 during the runs), generator defaults as above, 60
+s measured after a 20 s ramp, one run per configuration. **Local mode**: one
+server, `--indexing local`. **Split**: agents talk to one server in
+`--indexing off`; a second server in `--indexing lease` holds every index
+lease and warms. Header: what the agents send as `Leep-Indexing` with
+index-backed reads (none is an old client).
+
+| Run | Lands/s | Lands/s per agent | Land p50 / p99 ms | Stalled | Resends | Lag history p50 / max | Lag log filter p50 / max | Read timeouts (log / blame / search) | Indexing 503s | Inline derivations |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 500, local | 39.3 | 0.079 | 49 / 2406 | 0 | 0 | 10 / 63 | 10 / 101 | 0 / 0 / 0 | – | – |
+| 500, split, no header | 40.0 | 0.080 | 35 / 2126 | 0 | 0 | 7 / 64 | 5 / 64 | 0 / 0 / 0 | 0 | 0 |
+| 500, split, retry | 38.9 | 0.078 | 49 / 4393 | 0 | 0 | 12 / 64 | 10 / 41 | 0 / 0 / 0 | 0 | 0 |
+| 500, split, stale-ok | 40.8 | 0.082 | 28 / 1650 | 0 | 0 | 9 / 63 | 9 / 63 | 0 / 0 / 0 | 0 | 0 |
+| 2000, local | 26.0 | 0.013 | 13306 / 21847 | 143 | 0 | 1011 / 1688 | 1065 / 1742 | 1141 / 794 / 969 | – | – |
+| 2000, split, no header | 23.7 | 0.012 | 28638 / 78182 | 594 | 2186 | 0 / 63 | 0 / 63 | 0 / 0 / 0 | 0 | 0 |
+| 2000, split, retry | 27.7 | 0.014 | 28212 / 80504 | 411 | 2271 | 0 / 64 | 0 / 63 | 0 / 0 / 0 | 0 | 0 |
+
+Read p50 / p99 ms at 2000 agents: local: log 573 / 1494, blame and search
+nearly all timed out; split, no header: log 37 / 1070, blame 56 / 1098,
+search 37 / 1193.
+
+What it suggests:
+
+- **The index keeps up with one holder**: lag p50 0 and max 63 or 64
+  generations at 2000 agents (the ADR's targets are 64 and 512), against
+  1,011 / 1,688 in local mode; no read reached the 30 s timeout, against
+  2,904 in local mode. No query derived inline and none answered 503.
+- **Lands are now the bottleneck.** With reads fast, agents offer more lands
+  than one ref replays (about 25 a second on this host), so lands queue to
+  the client's 30 s timeout and are resent under their land id: the split
+  runs' land latency and resends are that queue, at about the same
+  throughput (23.7 to 27.7 lands/s against 26.0; one run each, so within
+  noise). ADR 0056's coordinator and pipelined batches are the next step for
+  that.
+- **Search is cheap again.** Building a directory's trigram filter read its
+  subdirectories' rows one round trip each; with 500 agent directories every
+  search on a new head did hundreds. Reading them in one batch took search
+  p50 at 500 agents from 1,639 ms to 39 ms in local mode (and from 4,425 ms
+  to 36 ms in the split one, whose queries compute missing rows without
+  storing them).
+- The agents' land rate, about 0.08 a second at 500 agents, is the smoke
+  test's, as section 8 of ADR 0058 warns; nothing here measures real fleets.
+
 ### On all of Linux (VPS)
 
 `leep-swarm` (#105) against `leep:34c5ea3` on the Linux store (1,484,762

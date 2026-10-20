@@ -31,6 +31,9 @@ every runbook.
 | [LeepLandCasLossesHigh](#leeplandcaslosseshigh) | ticket | more than one lost compare-and-swap per land, for 15 minutes |
 | [LeepLandForwardFailing](#leeplandforwardfailing) | ticket | servers fail to reach the server coordinating a ref's lands, for 10 minutes |
 | [LeepLandLeaseFlapping](#leeplandleaseflapping) | ticket | land leases change hands more than six times a minute, for 10 minutes |
+| [LeepIndexLagging](#leepindexlagging) | ticket | an index group trails ref moves by over 2 minutes for 10 minutes |
+| [LeepIndexerMissing](#leepindexermissing) | page | an index group has had no lease holder (queries derive inline) for 5 minutes |
+| [LeepIndexingAnswersHigh](#leepindexinganswershigh) | ticket | more than 5% of indexed reads answer 503 (index behind) for 10 minutes |
 | [LeepLandSlowP99](#leeplandslowp99) | ticket | land p99 latency above 5 seconds for 10 minutes |
 | [LeepRequestTimeouts](#leeprequesttimeouts) | ticket | more than 5 requests hit `--request-timeout` (408) in 15 minutes |
 | [LeepTokenThrottled](#leeptokenthrottled) | ticket | one token has been limited steadily for 15 minutes |
@@ -307,7 +310,9 @@ Leep returns 500 only when a store call or an internal step fails
 (`Storage`, `Encoding` and `Other` errors); user mistakes are 400, 404 and 409,
 and neither those nor 408 and 429 count here. `GET /v1/health` and
 `GET /v1/ready` are in the denominator, so busy probes dilute the ratio, and a
-failing `/v1/ready` (503) counts as a 5xx.
+failing `/v1/ready` (503) counts as a 5xx. Indexing answers (503 with
+`Leep-Indexing`, ADR 0058) are subtracted: see
+[LeepIndexingAnswersHigh](#leepindexinganswershigh).
 
 **Impact.** Agents see failed commits, lands and reads; the CLI prints the
 server's message and exits 3. Writes are idempotent, so retrying is safe, but
@@ -580,6 +585,98 @@ server (for example 1s and 4s).
 
 **Escalate / collect.** The lease metrics of every server, store latency
 graphs and the [standard bundle](#collecting-a-bug-report).
+
+## LeepIndexLagging
+
+**Meaning.** `leep_index_lag_seconds` of one index group has been above 120 s
+for 10 minutes: the lease holder's passes start on ref moves more than two
+minutes old (ADR 0058). **Ticket.**
+
+**Impact.** Queries on new heads scan more un-indexed history and are slower;
+past the budgets, CLI requests wait and retry, MCP tools answer at an older
+changeset (`answered_at`), and requests without the header get 503 after
+their wait. Lands are never slowed.
+
+**Diagnose.**
+
+1. Who holds it: `leep_index_lease_held{kind}` per server, or `SELECT holder,
+   address, epoch, meta FROM leases WHERE scope = 'index'`. `meta` holds the
+   holder's rate (changesets a second) and backlog.
+2. Is it deriving: `rate(leep_index_derived_total{kind}[5m])` on the holder,
+   and its `leep_warm_duration_seconds`. A backfill (an import, a dropped or
+   new kind) shows a large `leep_index_backlog_changesets`.
+3. Is it starved: the holder's CPU, and the metadata store's latency (a
+   changeset costs about two store round trips per group).
+4. Lease churn: `leep_index_lease_acquired_total` rising means holders keep
+   changing (restarts, failed renewals), each new holder starting cold.
+
+**Mitigate / fix.** Give the holder CPU: move query traffic off it (balancer
+weights), or run it on a host of its own with `--indexing lease` and the
+others `off`. Split groups over servers with `--index-kinds` (one server
+each for `history`, `log-filter`, `search`). For a backfill, run
+`leep-server repair rederive --kind history-tree-v4 log-filter-v1 --missing
+--jobs N` on a machine of its own; it takes the leases and waits the fence
+first.
+
+**Escalate / collect.** Lease rows, the holder's metrics and logs, store
+latency, and the [standard bundle](#collecting-a-bug-report).
+
+## LeepIndexerMissing
+
+**Meaning.** For 5 minutes an index group had no lease holder among the
+servers in `lease` mode, or queries in `lease`/`off` mode derived inline
+because no lease was live. **Page.**
+
+**Impact.** Queries derive the index inside requests again, on every query
+server (the pre-ADR 0058 behaviour): slower reads, timeouts under load,
+duplicate derivation. Answers stay correct; lands are unaffected.
+
+**Diagnose.**
+
+1. Which servers are candidates: those started with `--indexing lease` (and
+   `--index-kinds` including the group, and `--warm-interval` not 0). Are any
+   up (`LeepServerDown`)?
+2. Their logs for `took the index lease` / `lost the index lease`, and
+   `leep_index_lease_lost_total{reason}`: `store` means renewals failed.
+3. A tool holding it: `SELECT holder FROM leases WHERE scope = 'index'`
+   names `repair-...` or `upgrade-index-...` while one runs; servers wait
+   until it releases.
+
+**Mitigate / fix.** Start (or restart) a server in `--indexing lease` mode.
+If the store fails lease calls, fix the store. As a stopgap, switch query
+servers back to `--indexing local`.
+
+**Escalate / collect.** The candidates' logs and lease metrics, the lease
+rows, and the [standard bundle](#collecting-a-bug-report).
+
+## LeepIndexingAnswersHigh
+
+**Meaning.** More than 5% of index-backed reads (log, last-change, blame,
+search) answered 503 with `Retry-After` for 10 minutes because their index
+was further behind than the scan budgets (ADR 0058). **Ticket.**
+
+**Impact.** The CLI retries for up to a minute and then fails with exit code
+3 and error code `indexing`; scripts without the header wait and then fail.
+MCP tools answer at an older changeset instead.
+
+**Load balancers.** These 503s are an expected answer, not a sick backend:
+configure passive health checks and balancer retries to ignore responses
+that carry a `Leep-Indexing` response header (otherwise one lagging index
+takes every query server out of rotation, or multiplies the load by
+retrying elsewhere).
+
+**Diagnose.** First [LeepIndexLagging](#leepindexlagging) and
+[LeepIndexerMissing](#leepindexermissing). `leep_query_indexing_answers_total`
+by `route` and `mode` says which queries and clients; `leep_query_unindexed_scanned_total`
+shows how much they scan.
+
+**Mitigate / fix.** Fix the indexer's lag. If the lag is normal for the
+fleet's load, raise the budgets on the query servers (`--query-scan-budget`,
+`--blame-scan-budget`, `--search-scan-budget`, `--search-scan-bytes`):
+each scanned changeset costs a few reads.
+
+**Escalate / collect.** The metrics above, lease rows and the
+[standard bundle](#collecting-a-bug-report).
 
 ## LeepLandSlowP99
 

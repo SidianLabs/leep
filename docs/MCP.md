@@ -66,6 +66,13 @@ server) come back as results with `isError: true`.
 
 ### Search
 
+`leep_log`, `leep_blame` and `leep_search` also take `fresh?`. When the
+server's index lags behind recent lands (ADR 0058), they answer by default at
+the newest indexed changeset and add `answered_at` and `behind` (changesets of
+lag) to the result: a slightly older answer now. With `fresh: true` they ask
+for the requested revision, retry once within 5 s, and otherwise return an
+error naming the index, its lag and when to retry.
+
 `leep_search` greps a revision on the server, so an agent need not list and read
 every file. `query` is a literal by default; `regex: true` uses Rust regex syntax
 and `case_insensitive: true` ignores case. `path` limits it to a directory or

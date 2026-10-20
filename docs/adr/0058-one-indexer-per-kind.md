@@ -1,5 +1,5 @@
 # 0058. One indexer per kind, and queries that do not derive
-Status: Accepted (design; phase 0 partly implemented)
+Status: Accepted (phases 0 and 1 implemented; see "Implementation notes")
 Date: 2026-10-20
 
 ## Context
@@ -646,6 +646,51 @@ These are the differences from the first draft, made at review:
   rate per agent is stated.
 - The phase plan puts phase 0 first. The frontier table, the dedicated
   indexer and shards are deferred.
+
+## Implementation notes
+Phases 0 and 1 are built as described, with these differences, each for the
+reason given:
+
+- **`last_merge-v1` fallback.** A parent without its row is bridged by the
+  parent being a merge or a root, or by the grandparent's row (read in the
+  same batched read when the parent's skiplist is cached), not by up to 256
+  first-parent ancestors: a chain's ancestors are known only one read at a
+  time, so that walk would cost up to 256 round trips on the write path.
+  Otherwise the row is skipped and counted, as planned.
+- **`stale-ok` target.** Path logs, last-change, filtered logs and blame
+  answer at the newest *indexed* first-parent ancestor (found with skiplists
+  in a few batched reads), not at the newest one whose missing part fits the
+  budget: finding that needs a bounded walk per candidate. Search looks at up
+  to 64 first-parent ancestors for one whose tree's trigram rows are all
+  stored, since search rows are warmed only for heads.
+- **Search without rows** computes the missing trigram rows in memory, a
+  directory's from its children's as derivation would, within the budgets,
+  and stores nothing. Pruning, `files_considered`, `files_pruned`,
+  `files_scanned` and `bytes_scanned` are therefore the indexed ones too;
+  `files_unindexed` counts the files fetched for missing rows.
+- **`next` on filtered logs.** To give a fully indexed store's `next`
+  whichever way a walk got there, a filtered log page now ends at the next
+  match beyond the page (queued again, unexpanded), so it carries `next`
+  exactly when another match exists. This holds in every mode. Path walks
+  instead settle their queue at the end of a page (each queued changeset
+  without a row is examined or replaced by its parents' changes), which
+  leaves the indexed walk's queue.
+- **Rows deleted under a query** (a `repair drop` without the fence racing
+  it) answer 503 with `behind = 0`, never an inline derivation.
+- **Timing.** Candidates claim on their 3 s renewal tick, so a SIGKILLed
+  holder is replaced within the 6 s stale time plus up to one tick (measured
+  6.0 to 6.2 s in the end-to-end test). A holder trusts its view for the
+  reported time less half a renew interval (ADR 0056 subtracts a whole one;
+  here that would leave no margin between renewals), and renews on the spot
+  before giving a write up.
+- **Lease `meta`**: `{"rate", "backlog", "shards"}`, backlog being the
+  changesets the last pass derived; the two lanes are deferred, so
+  `leep_index_backlog_changesets` has `lane="tip"` only.
+- **Fence.** A tool waits `--index-fence` only when the group had a lease row
+  before (a store whose servers never ran in `lease` mode has no holder to
+  wait for). `upgrade-index --yes` takes the leases of the groups it derives.
+- **CLAUDE.md's error table** is left for the maintainer to extend with
+  `Indexing` → 503.
 
 ## Consequences
 - With leases, each index range is derived once per fleet. Without them,
