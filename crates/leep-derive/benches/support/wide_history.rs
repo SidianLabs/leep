@@ -73,6 +73,22 @@ impl Spec {
         }
     }
 
+    /// Shaped like git/git's tree: about 4,300 files, a root-like directory
+    /// of 450 and two of 725 and 1,000 (`Documentation/`, `t/`), and 48
+    /// small directories.
+    pub fn git_like(commits: usize) -> Self {
+        Spec {
+            wide_dirs: 3,
+            wide_min: 450,
+            wide_step: 275,
+            deep: (8, 6, 45),
+            commits,
+            branches: 4,
+            seed: 0x5eed,
+            old_branch: None,
+        }
+    }
+
     /// This shape ending in a merge of an old-based branch (see
     /// [`Spec::old_branch`]).
     pub fn with_old_branch(mut self, back: usize, commits: usize) -> Self {
@@ -226,8 +242,8 @@ async fn merge_into(g: &mut Gen<'_>, into: &mut Line, from: &Line) -> Vec<String
     changed
 }
 
-/// Build the history in `repo`; returns its head.
-pub async fn build(repo: &Repo, spec: &Spec) -> ChangesetId {
+/// The directories of the import and their files, wide ones first.
+fn layout(spec: &Spec) -> Vec<(String, Vec<String>)> {
     let mut dirs = Vec::new();
     for i in 0..spec.wide_dirs {
         let n = spec.wide_min + i * spec.wide_step;
@@ -244,6 +260,51 @@ pub async fn build(repo: &Repo, spec: &Spec) -> ChangesetId {
             ));
         }
     }
+    dirs
+}
+
+/// `n` changesets on one first-parent chain from `tip`, as lands of agents
+/// make: each edits 1 to 3 files of the import, in a wide directory 30% of
+/// the time, with contents no other chain has (`seed`). Returns them oldest
+/// first.
+pub async fn agent_chain(
+    repo: &Repo,
+    spec: &Spec,
+    mut tip: ChangesetId,
+    n: usize,
+    seed: u64,
+) -> Vec<ChangesetId> {
+    let mut g = Gen {
+        repo,
+        rng: Lcg(seed),
+        dirs: layout(spec),
+        wide: spec.wide_dirs,
+        seq: 10_000_000 * (1 + seed % 100),
+        next_name: 0,
+    };
+    let deep = g.dirs.len() - g.wide;
+    let mut out = Vec::with_capacity(n);
+    for k in 0..n {
+        let mut updates = BTreeMap::new();
+        for _ in 0..1 + g.rng.below(3) {
+            let d = if g.wide > 0 && g.rng.chance(30) {
+                g.rng.below(g.wide)
+            } else {
+                g.wide + g.rng.below(deep)
+            };
+            let files = &g.dirs[d].1;
+            let path = format!("{}/{}", g.dirs[d].0, files[g.rng.below(files.len())]);
+            updates.insert(path, 1_000_000 + (seed as u32 % 1000) * 100_000 + k as u32);
+        }
+        tip = g.commit(vec![tip], updates).await;
+        out.push(tip);
+    }
+    out
+}
+
+/// Build the history in `repo`; returns its head.
+pub async fn build(repo: &Repo, spec: &Spec) -> ChangesetId {
+    let dirs = layout(spec);
     let mut g = Gen {
         repo,
         rng: Lcg(spec.seed),

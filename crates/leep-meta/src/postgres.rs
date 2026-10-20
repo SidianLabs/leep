@@ -70,6 +70,10 @@ const MIGRATE_LOCK: i64 = 7164737;
 
 /// Taken after a ref changes and before its log row is inserted, so `seq`
 /// order is commit order. Nothing waits on a row lock while holding it.
+/// The index warmer's ref-log tail (`leep_derive::warm`) depends on this:
+/// it reads entries above the last `seq` it saw, which is only complete if
+/// no transaction can commit a lower `seq` after a higher one is visible.
+/// `seq` may still have gaps (a rolled-back insert consumes its value).
 const LOG_LOCK: i64 = 7164738;
 
 /// Connections reserved for lease calls of every scope: one renewal

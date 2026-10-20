@@ -54,8 +54,9 @@ measured until the response head is ready, not until the body is streamed.
 | `leep_land_routed_total` | counter | `route` = `uncoordinated` | Lands batched here with coordination on but no lease: no live lease was known and none could be taken (the store failing). They race the CAS as without coordination. |
 | `leep_derive_total` | counter | `kind` | Derived values computed (cache hits in the meta store are not counted). |
 | `leep_derive_duration_seconds` | histogram | `kind` | Time to compute one derived value. |
-| `leep_warm_refs_total` | counter | `result` = `ok`, `error` | Ref heads the background warmer derived indexes for (ADR 0028). Errors are retried on the next pass. |
-| `leep_warm_duration_seconds` | histogram | none | Time to warm one ref head. Seconds to hours after an import or a restart onto a large history; milliseconds once warm. |
+| `leep_warm_refs_total` | counter | `result` = `ok`, `error` | Ref heads the background warmer derived indexes for (ADR 0028). Errors are retried by the next full listing of refs, every 5 s. |
+| `leep_warm_duration_seconds` | histogram | none | Time to warm the heads that moved since the last pass, together (ADR 0058). Seconds to hours after an import or a restart onto a large history; milliseconds once warm. |
+| `leep_warm_delay_seconds` | histogram | none | Time from a ref move until the warmer stored that head's indexes, at **1-second resolution**: the ref log records whole seconds, so every sample is an integer and 0 means the same second. Recorded only for moves the ref-log tail found, not for refs a full listing turned up. How far the indexes trail the refs; 0 or 1 when the warmer keeps up, so read it as a count of slow warms rather than a latency below a second. |
 | `leep_search_total` | counter | `indexed` = `true`, `false` | Searches served; `false` means the query had no required trigram and scanned files directly. |
 | `leep_search_duration_seconds` | histogram | none | Whole search call, including any index rows it derived. |
 | `leep_blob_cache_hits_total` | counter | none | Blob reads served from the in-memory cache. |
@@ -1098,6 +1099,17 @@ leep-server repair rederive --kind history-tree-v4 log-filter-v1 --missing --job
 
 `rederive` prints the rows derived so far every five seconds. On a server,
 the rate of `leep_derive_total{kind}` is the warmer's derivation speed.
+
+**The warmer with several servers.** Every server runs a warmer. It reads the
+ref log every `--warm-interval` (`LEEP_WARM_INTERVAL`, default 250 ms) and
+lists every ref every 5 s. Servers do not coordinate, so with N servers on
+one metadata store, each moved head is derived N times at once. The rows
+agree and an identical write no longer rewrites a row, but the CPU and the
+reads are spent N times. Until index leases exist (ADR 0058), run the
+warmer on one server only: keep the default there and set
+`LEEP_WARM_INTERVAL=0` (`--warm-interval 0`) on all the others. Queries on
+those servers still derive whatever is missing, as before. If the warming
+server is down, the others' queries derive on their own until it returns.
 
 ## Bulk loads and planner statistics (Postgres)
 

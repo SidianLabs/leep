@@ -213,8 +213,13 @@ way.
 is created and written with it in one call (ADR 0031, see "Commit" below).
 Other kinds are derived on first read (the search kinds on the first search
 that needs them; see "Code search"), and every server also warms them in the
-background for each ref head that moved, every `--warm-interval` (ADR 0028), so
-queries on an imported or restarted history do not pay for the whole history.
+background for each ref head that moved (ADR 0028), so queries on an imported
+or restarted history do not pay for the whole history. The warmer tails the
+ref log every `--warm-interval` (250 ms; `seq` is assigned in commit order, so
+the tail misses nothing), lists every ref every 5 s as a backstop, and
+derives all moved heads of a pass as one range per kind
+(`derived::derive_heads`), so shared history is derived once and different
+refs' new changesets derive side by side (ADR 0058, phase 0).
 `derive` takes a per-kind lock once a value is missing, so concurrent requests
 and the warmer never derive the same range twice. Add new kinds with the
 [`add-derived-data-kind`](../.claude/skills/add-derived-data-kind/SKILL.md)
