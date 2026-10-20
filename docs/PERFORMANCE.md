@@ -1129,6 +1129,7 @@ took the store from 104 GB of loose objects to one 2.74 GB pack plus a
 | Leep Postgres, before path history | 8.3 GB (`changesets` 2.9 GB, skiplists 0.9 GB) |
 | Leep Postgres, before path history, changesets compressed (ADR 0053, projected) | about 7.1 GB (`changesets` about 1.6-1.75 GB; see "Changeset compression") |
 | Leep Postgres, with the full path-history index | 27 GB (`history-node-v3`: 25.4M rows, 24 GB of values) |
+| Leep Postgres, all indexes (v4, log filter, search), changesets compressed | 11 GB (`changesets` 1.86 GB; "After #93 to #98") |
 
 The path-history index costs about 16 KB per changeset on Linux against
 1.9 KB on git/git: Linux's directories hold thousands of names and its merges
@@ -1266,6 +1267,86 @@ the restart.
 
 At 64 agents with one-file changesets that is 153 lands a second against
 117 after #77 on this machine, with batches of 31 lands on average.
+
+#### After #93 to #98
+
+`leep:2d62448` (main after #95) on the same store and VPS, after the
+retired v3 rows were dropped (`repair drop --kind history-tree-v3`, 1 h 36 min
+before #93's storage-order walk, then `VACUUM FULL derived`: 33 GB to 12 GB).
+Before is `leep:dcf16c0` on that same 12 GB store, so the rows below compare
+code, not index sizes.
+
+**Upgrade plan.** `leep-server upgrade-index` (#96) reported nothing to do:
+every index this version reads is complete for the 1,484,762 changesets
+reachable from `master`, and no retired rows remain. It took 7 min 11 s, most
+of it `SELECT count(*) FROM derived WHERE kind = $1` (about 32 s per large
+kind on this disk); the counts are what a plan prints, and an estimate from
+`pg_class` would do for the plan.
+
+**Changeset compression** (ADR 0053, #94), servers stopped:
+
+| | Plain | Compressed |
+|---|---|---|
+| `compact-changesets --dry-run` | | 3.10 GB to 1.65 GB of values (1.87x) in 3 min 25 s |
+| `compact-changesets` | | 1,484,762 rows rewritten in 5 min 25 s, one 64 KiB dictionary |
+| `changesets` table after `VACUUM FULL changesets` (2 min 7 s) | 2.87 GB | 1.86 GB |
+| database | 12 GB | 11 GB |
+
+The 1.87x is above the 1.6 to 1.75 GB projected from the last 117,680
+commits: older commits are shorter and more alike.
+
+**Queries**, one cold and one warm pass each (single samples; the VPS runs
+other services):
+
+| Query | Before, cold / warm | After, cold / warm |
+|---|---|---|
+| `log` limit 100 | 0.31 s / 0.038 s | 0.31 s / 0.034 s |
+| `log` limit 10,000 | 6.2 s / 1.15 s | **4.3 s / 0.90 s** |
+| full file listing | 1.11 s / 0.19 s | 0.74 s / 0.18 s |
+| `log path=COPYING` limit 50 | 1.09 s / 0.69 s | 0.88 s / 0.59 s |
+| `blame Makefile` (rows stored earlier) | 0.48 s / 0.083 s | 0.19 s / 0.073 s |
+| diff head vs 1,000 back | 0.58 s / 0.21 s | 0.59 s / 0.21 s |
+| diff head vs 20,000 back | 0.71 s / 0.39 s | 1.15 s / 0.38 s |
+| search a common token (`strbuf_addf`, limit 100) | 1.95 s / 1.49 s | 1.94 s / **0.42 s** |
+| search a rare token | 0.57 s / 0.59 s | **0.19 s / 0.14 s** |
+| provenance, limit 10,000 | 1.04 s / 1.02 s | 0.80 s / 0.81 s |
+| `log author=Junio` limit 100 | 1.83 s / 0.55 s | 2.38 s / 0.55 s |
+
+Search is 3.5x faster warm for a common token and 3 to 4x for a rare one
+(#95). The cold common-token search is unchanged: it is spent reading the
+filters and files from a cold page cache. The 10,000-entry log is 1.4x
+faster cold and 1.3x warm, as on the sandbox; its cold time is the decoding of
+12,481 changesets, now from zstd frames. The `blame Makefile` row reads stored rows,
+so it does not measure #97's first blame (git/git, "First blame in
+stretches"). The cold deep diff and the cold author log were slower in this
+pass; a second pass right after `verify` put them at 0.63 s and 1.95 s cold
+(0.35 s and 0.53 s warm), against 0.71 s and 1.83 s before, so neither
+moved beyond the noise of single cold samples on this machine. That pass
+also had a common-token search at 1.29 s cold / 0.40 s warm, a rare token at
+0.18 s / 0.14 s, and provenance at 0.72 s.
+
+**Concurrent lands** (fresh database, `leep-land-bench`, 15 s per agent
+count), before and after:
+
+| Changesets | Agents | Lands/s before | Lands/s after | Land p50 / p99 after | 409s, CAS losses |
+|---|---|---|---|---|---|
+| 1 file | 1 | 74.1 | 68.9 | 2.3 / 6.0 ms | 0 |
+| 1 file | 8 | 109.8 | 100.7 | 41 / 71 ms | 0 |
+| 1 file | 64 | 147.8 | 141.6 | 248 / 429 ms | 0 |
+| 10 files | 1 | 21.7 | 20.9 | 2.3 / 4.4 ms | 0 |
+| 10 files | 8 | 39.1 | 38.3 | 64 / 103 ms | 0 |
+| 10 files | 64 | 47.9 | 47.6 | 260 / 589 ms | 0 |
+
+Ten-file lands are unchanged. One-file lands are 4 to 8% slower, in line with
+compressing each new changeset row before it is written; single runs on
+this machine vary by about that much.
+
+**Verify** (sample mode, 1 h 42 min against 1 h 46 min before compression)
+was clean: 1,484,762 changesets (each one read back from its zstd frame and
+its id re-hashed), 7,164,424 tree nodes and 3,194,092 blobs, and about 256
+recomputed rows per derived kind with none missing or mismatched. The 29
+missing `blame` rows are blames never asked for, which are derived on
+demand.
 
 ### Incremental repack
 
