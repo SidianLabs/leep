@@ -1319,7 +1319,11 @@ faster cold and 1.3x warm, as on the sandbox; its cold time is the decoding of
 12,481 changesets, now from zstd frames. The `blame Makefile` row reads stored rows,
 so it does not measure #97's first blame (git/git, "First blame in
 stretches"). The cold deep diff and the cold author log were slower in this
-pass; their warm times did not move. QUERY_RECHECK
+pass; a second pass right after `verify` put them at 0.63 s and 1.95 s cold
+(0.35 s and 0.53 s warm), against 0.71 s and 1.83 s before, so neither
+moved beyond the noise of single cold samples on this machine. That pass
+also had a common-token search at 1.29 s cold / 0.40 s warm, a rare token at
+0.18 s / 0.14 s, and provenance at 0.72 s.
 
 **Concurrent lands** (fresh database, `leep-land-bench`, 15 s per agent
 count), before and after:
@@ -1337,7 +1341,12 @@ Ten-file lands are unchanged. One-file lands are 4 to 8% slower, in line with
 compressing each new changeset row before it is written; single runs on
 this machine vary by about that much.
 
-**Verify** (sample mode) VERIFY_RESULT
+**Verify** (sample mode, 1 h 42 min against 1 h 46 min before compression)
+was clean: 1,484,762 changesets (each one read back from its zstd frame and
+its id re-hashed), 7,164,424 tree nodes and 3,194,092 blobs, and about 256
+recomputed rows per derived kind with none missing or mismatched. The 29
+missing `blame` rows are blames never asked for, which are derived on
+demand.
 
 ### Incremental repack
 
