@@ -20,7 +20,7 @@ use crate::derived::{self, HistoryTree, LogFilterIndex};
 use crate::Repo;
 
 /// Ref log entries read per round trip of the tail.
-const TAIL_PAGE: usize = 256;
+pub const TAIL_PAGE: usize = 256;
 /// Pages the tail reads before it gives up and lists every ref instead.
 const TAIL_PAGES: usize = 16;
 /// How often a pass lists every ref, whatever the tail found.
@@ -105,6 +105,8 @@ impl Warmer {
                 Ok(()) => {
                     metrics::counter!("leep_warm_refs_total", "result" => "ok").increment(1);
                     if let Some(at) = m.at {
+                        // 1-second resolution: ref log times are whole
+                        // seconds, so 0 means "within the same second".
                         let delay = (unix_now() - at).max(0) as f64;
                         metrics::histogram!("leep_warm_delay_seconds").record(delay);
                     }
