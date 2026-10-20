@@ -14,19 +14,19 @@
 //! | GET  | `/v1/refs` | – | [`RefsResponse`] |
 //! | GET  | `/v1/refs/{name}` | – | [`RefResponse`] |
 //! | POST | `/v1/refs/{name}` | [`CasRefRequest`] | [`CasRefResponse`] (409 if it lost) |
-//! | GET  | `/v1/reflog?before=seq&limit=n` | – | [`RefLogResponse`] (every ref move, newest first; `limit` defaults to 50, capped at 1000; `before` returns entries with a smaller `seq`) |
-//! | GET  | `/v1/reflog/{name}?before=seq&limit=n` | – | [`RefLogResponse`] (the moves of one ref; an unknown or never-moved ref is an empty list) |
+//! | GET  | `/v1/reflog?before=seq&limit=n&after=cursor` | – | [`RefLogResponse`] (every ref move, newest first; `limit` defaults to 50, capped at 1000; `before` returns entries with a smaller `seq`; `after` is a page cursor, and with `before` is 400) |
+//! | GET  | `/v1/reflog/{name}?before=seq&limit=n&after=cursor` | – | [`RefLogResponse`] (the moves of one ref; an unknown or never-moved ref is an empty list) |
 //! | GET  | `/v1/resolve/{rev}` | – | [`ResolveResponse`] (`rev` = ref name, full 64-hex id or short tag name) |
 //! | GET  | `/v1/resolve-prefix/{prefix}` | – | [`ResolvePrefixResponse`] (the one changeset whose id starts with `prefix`, 4 to 64 hex digits in any case; 404 if none; 400 [`AmbiguousPrefixResponse`] listing up to 10 `candidates` if several; 400 if the prefix is shorter than 4 digits, longer than 64 or not hex; ADR 0035) |
 //! | GET  | `/v1/tree/{id}?path=dir` | – | [`TreeResponse`] (one directory level) |
 //! | GET  | `/v1/files/{id}?prefix=dir` | – | [`FilesResponse`] (recursive listing) |
 //! | GET  | `/v1/file/{id}?path=p` | – | raw bytes + `x-leep-kind` header, or 404 |
-//! | GET  | `/v1/log/{id}?path=p&limit=n&author=a&extra=k:v` | – | [`LogResponse`] (newest first; `limit` defaults to 100, capped at 10000). `author` is a case-insensitive substring; `extra` repeats, is ANDed, and is `key:value` (exact) or `key` (present). `limit` counts matches. With `path` the walk follows the path-history index; without it, or for `author` and `extra`, a selective filter scans changesets linearly. `follow=true` (needs a file `path`; 400 otherwise) continues the history of a renamed file under its old name and marks entries with `path_at` and `renamed` (ADR 0016) |
+//! | GET  | `/v1/log/{id}?path=p&limit=n&author=a&extra=k:v` | – | [`LogResponse`] (newest first; `limit` defaults to 100, capped at 10000). `author` is a case-insensitive substring; `extra` repeats, is ANDed, and is `key:value` (exact) or `key` (present). `limit` counts matches. With `path` the walk follows the path-history index; without it, or for `author` and `extra`, a selective filter scans changesets linearly. `follow=true` (needs a file `path`; 400 otherwise) continues the history of a renamed file under its old name and marks entries with `path_at` and `renamed` (ADR 0016). `after` is a page cursor |
 //! | GET  | `/v1/last-change/{id}?path=p` | – | [`LastChangeResponse`] (the newest changeset reachable from `id` that changed file or directory `p`, answered from the path-history index; a deleted path answers with the deleting changeset; 404 if `p` never existed) |
 //! | GET  | `/v1/diff?from=a&to=b&prefix=dir&renames=bool&rename_threshold=n` | – | [`DiffResponse`] (`from` omitted = empty tree; `renames=true` adds detected renames, `rename_threshold` is 0 to 100 and defaults to 50, anything else is 400; ADR 0016) |
 //! | GET  | `/v1/blame/{id}?path=p` | – | [`BlameResponse`] (with per-changeset [`ChangesetSummary`]) |
 //! | GET  | `/v1/provenance/{id}?path=prefix&limit=n` | – | [`ProvenanceResponse`] (who and what made the changesets reachable from `id`; `limit` defaults to 10000, capped at 10000) |
-//! | GET  | `/v1/search/{rev}?q=text&regex=bool&i=bool&path=dir&glob=g&limit=n` | – | [`SearchResponse`] (`rev` = ref name or full id; `limit` defaults to 100, capped at 1000; booleans are `true` or `false`; a bad regex is 400, an unknown `rev` 404) |
+//! | GET  | `/v1/search/{rev}?q=text&regex=bool&i=bool&path=dir&glob=g&limit=n&after=cursor` | – | [`SearchResponse`] (`rev` = ref name or full id; `limit` defaults to 100, capped at 1000; booleans are `true` or `false`; a bad regex is 400, an unknown `rev` 404; `after` is a page cursor) |
 //! | GET  | `/v1/merge-base?a=x&b=y` | – | [`MergeBaseResponse`] |
 //! | POST | `/v1/changesets/{id}/signatures` | [`AddSignatureRequest`] | [`AddSignatureResponse`] (400 if the signature is bad or the key is not trusted; 404 if the changeset is unknown) |
 //! | GET  | `/v1/changesets/{id}/signatures` | – | [`SignaturesResponse`] (trusted signatures, re-verified on read) |
@@ -50,6 +50,22 @@
 //! `Error::NotFound` → 404, CAS loss and `Error::Conflict` (e.g. a land that
 //! kept losing to concurrent lands) → 409, anything else → 500.
 //! Hashes and ids are lowercase hex in JSON.
+//!
+//! # Pagination
+//!
+//! `GET /v1/log`, `/v1/search` and `/v1/reflog` answer one page of at most
+//! `limit` items. A page that stopped before the end carries `next`, an
+//! opaque cursor of at most 4096 URL-safe characters; repeating the request
+//! with the same parameters plus `after=<next>` returns the following page
+//! (`limit` may change between pages). Concatenated pages equal what one
+//! request without a cap would return. A cursor is valid only for the query
+//! that produced it: a malformed one, one from another endpoint or query, or
+//! one from a server that changed the cursor layout is 400, and the client
+//! starts over without `after`. A search cursor pins the revision the first
+//! page resolved, so later pages read the same tree if the ref moves. A log
+//! page with filters can be empty and still carry `next`; only a missing
+//! `next` means the end. Clients that never send `after` see no change except
+//! the extra field.
 //!
 //! # Ref log
 //!
@@ -307,6 +323,10 @@ pub struct CasRefResponse {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RefLogResponse {
     pub entries: Vec<RefLogEntry>,
+    /// Cursor for the next page (see "Pagination"); absent on the last page
+    /// and from older servers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -357,6 +377,10 @@ pub struct FilesResponse {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogResponse {
     pub entries: Vec<ChangesetInfo>,
+    /// Cursor for the next page (see "Pagination"); absent when the walk
+    /// ended and from older servers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
 }
 
 /// Newest change to a path, from the path-history index.
@@ -665,6 +689,10 @@ pub struct SearchResponse {
     pub truncated: bool,
     #[serde(default)]
     pub stats: SearchStats,
+    /// Cursor for the next page (see "Pagination"); absent when the search
+    /// ended and from older servers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
 }
 
 #[cfg(test)]
@@ -690,6 +718,30 @@ mod tests {
         let open: WhoAmIResponse =
             serde_json::from_value(serde_json::json!({ "name": null, "role": null })).unwrap();
         assert_eq!(open, WhoAmIResponse::default());
+    }
+
+    #[test]
+    fn page_cursors_are_optional_and_omitted_when_absent() {
+        let log: LogResponse =
+            serde_json::from_value(serde_json::json!({ "entries": [] })).unwrap();
+        assert_eq!(log.next, None);
+        assert_eq!(
+            serde_json::to_value(&log).unwrap(),
+            serde_json::json!({ "entries": [] })
+        );
+        let log = LogResponse {
+            entries: vec![],
+            next: Some("abc".into()),
+        };
+        assert_eq!(
+            serde_json::to_value(&log).unwrap(),
+            serde_json::json!({ "entries": [], "next": "abc" })
+        );
+        let reflog: RefLogResponse =
+            serde_json::from_value(serde_json::json!({ "entries": [], "next": "x" })).unwrap();
+        assert_eq!(reflog.next.as_deref(), Some("x"));
+        let search = SearchResponse::default();
+        assert!(serde_json::to_value(&search).unwrap().get("next").is_none());
     }
 
     #[test]
@@ -734,6 +786,7 @@ mod tests {
         };
         let v = serde_json::to_value(RefLogResponse {
             entries: vec![e.clone()],
+            next: None,
         })
         .unwrap();
         assert_eq!(

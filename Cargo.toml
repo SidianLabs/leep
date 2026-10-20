@@ -23,6 +23,7 @@ leep-testkit = { path = "crates/leep-testkit" }
 anyhow = "1"
 arc-swap = "1"
 async-trait = "0.1"
+base64 = "0.22"
 blake3 = "1"
 criterion = { version = "0.5", features = ["async_tokio"] }
 bytes = { version = "1", features = ["serde"] }

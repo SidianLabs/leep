@@ -38,6 +38,16 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 - Path-history index and `leep last-change` (ADR 0013).
 - Server-side code search: `leep search`, `GET /v1/search` and the MCP
   `leep_search` tool (ADR 0014).
+- Cursor pagination for `GET /v1/log`, `GET /v1/search` and `GET /v1/reflog`:
+  responses carry an optional opaque `next` cursor and requests accept
+  `after=<cursor>`, so a log longer than the 10000-entry cap, a search with
+  more than 1000 matches or a long ref log can be read page by page;
+  concatenated pages equal one uncapped answer. Malformed cursors, or cursors
+  from another query, are 400. `leep log -n`, `leep search -n` and `leep
+  reflog -n` follow cursors past one page, `leep log` and `leep search` take
+  `--after`, and the MCP `leep_log` and `leep_search` tools return `next` and
+  take `cursor`. Requests without `after` are unchanged (additive fields; see
+  docs/FORMATS.md, "Page cursors").
 
 ### Everyday workflow
 - `leep branch` lists, creates and deletes branches. `branch -d` deletes

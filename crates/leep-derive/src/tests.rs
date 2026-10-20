@@ -10,7 +10,7 @@ use leep_core::{
 
 use crate::Repo;
 
-fn repo() -> Repo {
+pub(crate) fn repo() -> Repo {
     Repo::new(
         Arc::new(MemoryBlobStore::new()),
         Arc::new(MemoryMetaStore::new()),
@@ -67,7 +67,7 @@ async fn try_commit(
     r.create_changeset(changeset(parents, changes, msg)).await
 }
 
-async fn commit(
+pub(crate) async fn commit(
     r: &Repo,
     parents: &[ChangesetId],
     files: &[(&str, Option<&str>)],

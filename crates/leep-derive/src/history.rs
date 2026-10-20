@@ -11,6 +11,9 @@ use leep_core::api::{AgentStat, ChangesetInfo, HumanStat, ProvenanceResponse};
 use leep_core::changeset::{EXTRA_AGENT_MODEL, EXTRA_AGENT_SESSION};
 use leep_core::{Changeset, ChangesetId, Error, Hash, RepoPath, Result, TreeNode};
 
+use crate::cursor::{
+    self, CursorKind, Fingerprint, FrontierEntry, LogFrom, LogPageRaw, LogResume, MAX_FRONTIER,
+};
 use crate::derived::{decode_hash, DerivedKind, RootTree};
 use crate::prefetch::ReadAhead;
 use crate::Repo;
@@ -96,12 +99,37 @@ impl Walk {
         roots: bool,
         want: usize,
     ) -> Result<Self> {
+        Walk::start_many(repo, &[id], roots, want).await
+    }
+
+    /// [`Walk::start`] from several changesets at once: a resumed page's
+    /// queue (see [`crate::cursor::LogResume`]).
+    pub(crate) async fn start_many(
+        repo: &Repo,
+        ids: &[ChangesetId],
+        roots: bool,
+        want: usize,
+    ) -> Result<Self> {
         let mut ahead = ReadAhead::new(roots);
-        ahead.ensure(repo, &[id], u64::MAX, want).await;
-        Ok(Walk {
-            seen: HashSet::from([id]),
-            heap: BinaryHeap::from([(ahead.generation(repo, id).await?, id)]),
-            ahead,
+        ahead.ensure(repo, ids, u64::MAX, want).await;
+        let (mut seen, mut heap) = (HashSet::new(), BinaryHeap::new());
+        for &id in ids {
+            if seen.insert(id) {
+                heap.push((ahead.generation(repo, id).await?, id));
+            }
+        }
+        Ok(Walk { seen, heap, ahead })
+    }
+
+    /// What is still queued, as a page cursor carries it.
+    pub(crate) fn rest(&self) -> Option<(Vec<FrontierEntry>, bool)> {
+        (!self.heap.is_empty()).then(|| {
+            let entries = self
+                .heap
+                .iter()
+                .map(|&(_, id)| FrontierEntry::id(id))
+                .collect();
+            (entries, false)
         })
     }
 
@@ -141,7 +169,45 @@ impl Walk {
     }
 }
 
-fn norm(path: Option<&str>) -> Option<&str> {
+/// What a log page asks for, besides its size and cursor.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LogParams {
+    /// Only changesets that changed this file or directory.
+    pub path: Option<String>,
+    /// Follow the file `path` across renames (needs `path`).
+    pub follow: bool,
+    pub filter: LogFilter,
+}
+
+/// One page of a log, and the cursor for the next if the walk did not end.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogPage {
+    pub entries: Vec<ChangesetInfo>,
+    pub next: Option<String>,
+}
+
+/// Everything that decides which walk a log runs and what it yields; the
+/// page size is left out, so pages may differ in size.
+pub(crate) fn log_fingerprint(id: ChangesetId, p: &LogParams) -> Fingerprint {
+    let mut extra: Vec<(&str, Option<&str>)> = p
+        .filter
+        .extra
+        .iter()
+        .map(|m| (m.key.as_str(), m.value.as_deref()))
+        .collect();
+    extra.sort_unstable();
+    extra.dedup();
+    let query = (
+        id,
+        norm(p.path.as_deref()),
+        p.follow,
+        p.filter.author.as_deref(),
+        extra,
+    );
+    Fingerprint::of(CursorKind::Log, &query)
+}
+
+pub(crate) fn norm(path: Option<&str>) -> Option<&str> {
     path.map(|p| p.trim_matches('/')).filter(|p| !p.is_empty())
 }
 
@@ -180,6 +246,123 @@ impl Repo {
             .await
     }
 
+    /// One page of the log [`LogParams`] describe, newest first, resuming
+    /// after the page that returned the cursor `after`. Concatenated pages
+    /// equal one walk of the whole log. `Invalid` if `after` is malformed,
+    /// names unknown changesets or was made for a different query.
+    pub async fn log_page(
+        &self,
+        id: ChangesetId,
+        params: &LogParams,
+        limit: usize,
+        after: Option<&str>,
+    ) -> Result<LogPage> {
+        let scan_first = crate::filter_log::SCAN_FIRST;
+        self.log_page_with(id, params, limit, after, MAX_FRONTIER, scan_first)
+            .await
+    }
+
+    /// [`Repo::log_page`] carrying at most `max_frontier` queued changesets
+    /// in a cursor (tests force the fallback with 0), and scanning
+    /// `scan_first` changesets before a filter uses its index.
+    pub(crate) async fn log_page_with(
+        &self,
+        id: ChangesetId,
+        params: &LogParams,
+        limit: usize,
+        after: Option<&str>,
+        max_frontier: usize,
+        scan_first: usize,
+    ) -> Result<LogPage> {
+        let fp = log_fingerprint(id, params);
+        let from = match after {
+            None => LogFrom::tip(),
+            Some(text) => {
+                let resume: LogResume = cursor::decode(text, CursorKind::Log, fp)?;
+                self.check_resume(&resume, params.follow).await?;
+                LogFrom::from(resume)
+            }
+        };
+        let path = norm(params.path.as_deref());
+        let filter = &params.filter;
+        let raw = if params.follow {
+            let path = path.ok_or_else(|| Error::Invalid("follow needs a file path".into()))?;
+            self.log_follow_from(id, path, limit, filter, &from).await?
+        } else {
+            match path {
+                Some(path) => {
+                    self.log_indexed_from(id, path, limit, filter, &from)
+                        .await?
+                }
+                None if filter.is_empty() => {
+                    self.log_scan_from(id, None, limit, filter, &from).await?
+                }
+                None => {
+                    self.log_by_filter_from(id, limit, filter, scan_first, &from)
+                        .await?
+                }
+            }
+        };
+        let next = match (raw.rest, raw.entries.last()) {
+            (Some((mut entries, indexed)), Some(last)) => {
+                // Heap order is arbitrary; sorted, equal walks give equal text.
+                entries.sort_by(|a, b| (a.id, &a.name).cmp(&(b.id, &b.name)));
+                let below = LogResume::Below {
+                    generation: last.generation,
+                    id: last.id,
+                };
+                let frontier = (entries.len() <= max_frontier)
+                    .then(|| {
+                        cursor::encode(
+                            CursorKind::Log,
+                            fp,
+                            &LogResume::Frontier { entries, indexed },
+                        )
+                    })
+                    .flatten();
+                Some(match frontier {
+                    Some(text) => text,
+                    None => cursor::encode(CursorKind::Log, fp, &below)
+                        .expect("a fixed-size cursor fits"),
+                })
+            }
+            _ => None,
+        };
+        Ok(LogPage {
+            entries: raw.entries,
+            next,
+        })
+    }
+
+    /// Reject a decoded log cursor that no walk of this query could have
+    /// made: unknown changesets, or parts of another walk's state.
+    async fn check_resume(&self, resume: &LogResume, follow: bool) -> Result<()> {
+        let bad = |why: &str| Error::Invalid(format!("bad cursor: {why}"));
+        let LogResume::Frontier { entries, indexed } = resume else {
+            return Ok(());
+        };
+        if entries.is_empty() || entries.len() > MAX_FRONTIER {
+            return Err(bad("wrong number of queued changesets"));
+        }
+        for e in entries {
+            if e.name.is_some() != follow {
+                return Err(bad("it belongs to a different query"));
+            }
+            if let Some(name) = &e.name {
+                RepoPath::new(name.as_str()).map_err(|_| bad("bad path"))?;
+            }
+            if e.bound.is_some() && !indexed {
+                return Err(bad("bound outside the indexed walk"));
+            }
+            match self.generation(e.id).await {
+                Ok(_) => {}
+                Err(Error::NotFound(_)) => return Err(bad("it names an unknown changeset")),
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
     /// [`Repo::log`] keeping only changesets that satisfy `filter`. `limit`
     /// counts matches, not changesets scanned.
     pub async fn log_filtered(
@@ -208,12 +391,27 @@ impl Repo {
         limit: usize,
         filter: &LogFilter,
     ) -> Result<Vec<ChangesetInfo>> {
+        Ok(self
+            .log_scan_from(id, path, limit, filter, &LogFrom::tip())
+            .await?
+            .entries)
+    }
+
+    /// [`Repo::log_scan`] from `from`, returning what is still queued.
+    pub(crate) async fn log_scan_from(
+        &self,
+        id: ChangesetId,
+        path: Option<&str>,
+        limit: usize,
+        filter: &LogFilter,
+        from: &LogFrom,
+    ) -> Result<LogPageRaw> {
         let path = norm(path);
         let mut out = Vec::new();
         // Without a filter every changeset visited is returned, so the walk
         // can read ahead exactly as far as `limit`; with one, as far as it may.
-        let want = |found: usize| match (path, filter.is_empty()) {
-            (None, true) => limit - found,
+        let want = |found: usize| match (path, filter.is_empty(), from.below) {
+            (None, true, None) => limit - found,
             _ => usize::MAX,
         };
         // A metadata filter alone may skip most changesets, so their root
@@ -221,7 +419,13 @@ impl Repo {
         // end instead.
         let read_roots = path.is_some() || filter.is_empty();
         let mut later = Vec::new();
-        let mut walk = Walk::start(self, id, read_roots, want(0)).await?;
+        let mut walk = match &from.seeds {
+            Some(seeds) => {
+                let ids: Vec<ChangesetId> = seeds.iter().map(|e| e.id).collect();
+                Walk::start_many(self, &ids, read_roots, want(0)).await?
+            }
+            None => Walk::start(self, id, read_roots, want(0)).await?,
+        };
         while out.len() < limit {
             let Some(Step {
                 generation,
@@ -233,7 +437,7 @@ impl Repo {
                 break;
             };
             // Cheap metadata test first; the path test reads trees.
-            if !filter.matches(&cs) {
+            if !from.admits(generation, cid) || !filter.matches(&cs) {
                 continue;
             }
             let root_tree = match root {
@@ -269,7 +473,10 @@ impl Repo {
         for (i, root) in later.into_iter().zip(self.root_trees(&ids).await?) {
             out[i].root_tree = root;
         }
-        Ok(out)
+        Ok(LogPageRaw {
+            entries: out,
+            rest: walk.rest(),
+        })
     }
 
     /// Root trees of `ids` with one batched read, deriving any not stored.

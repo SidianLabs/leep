@@ -24,9 +24,14 @@ pub struct LogArgs {
     /// when it was renamed (found by similarity, as in `leep diff`).
     #[arg(long, value_name = "FILE", conflicts_with = "path")]
     pub follow: Option<String>,
-    /// Maximum number of entries.
+    /// Maximum number of entries; more than one server page (10000) is
+    /// fetched page by page.
     #[arg(short = 'n', long, default_value_t = 20)]
     pub limit: u32,
+    /// Continue after the page that returned this cursor (the `next` field
+    /// of `--json` output); the other flags must match that request's.
+    #[arg(long, value_name = "CURSOR")]
+    pub after: Option<String>,
     /// Only changesets whose author contains this text (case-insensitive).
     #[arg(long)]
     pub author: Option<String>,
@@ -75,6 +80,7 @@ impl LogArgs {
             author: self.author.clone(),
             extra,
             follow: self.follow.is_some(),
+            after: self.after.clone(),
         })
     }
 }
@@ -167,7 +173,7 @@ fn follow_lines(info: &ChangesetInfo) -> Vec<String> {
 
 pub fn log(r: &Remote, args: &LogArgs) -> Result<i32> {
     let id = r.resolve_default(args.rev.as_deref())?;
-    let resp = r.client.log(&id, &args.query()?)?;
+    let resp = r.client.log_all(&id, &args.query()?, args.limit as usize)?;
     if r.json {
         print_json(&resp)?;
         return Ok(0);
@@ -454,6 +460,7 @@ mod tests {
             agent_model: None,
             agent_session: None,
             extra: vec![],
+            after: None,
         }
     }
 

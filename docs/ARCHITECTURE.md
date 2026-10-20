@@ -326,7 +326,20 @@ author, and blame responses carry a deduplicated per-changeset summary
 (author, time, first message line, `agent.*` keys). The summaries are
 attached on read, so the cached `blame` value keeps its original encoding.
 Provenance scans the newest changesets (capped at 10 000, reporting
-`truncated`).
+`truncated`); it is an aggregate, so it has no cursor.
+
+**Page cursors.** `GET /v1/log`, `/v1/search` and `/v1/reflog` answer one
+capped page and, when more remains, an opaque `next` cursor that the client
+sends back as `after` (`leep_derive::cursor`, layout in FORMATS.md). A log
+cursor carries the walk's queue: every log walk (plain, path index, `follow`,
+and the `log-filter-v1` walk with its merge-side bounds) pops in descending
+`(generation, id)` and queues only ancestors, so seeding a fresh walk with
+the queue continues it exactly, and pages cost what one long walk costs. A
+queue wider than 64 entries falls back to "restart from the tip below the
+last entry", which is correct but rescans. A search cursor pins the searched
+changeset and the last (path, line), and the walk skips directories and files
+before it. Cursors are bound to their query by a fingerprint and validated as
+untrusted input (400 on any failure).
 
 **Filtered log** ([ADR 0047](adr/0047-log-filter-index.md)). A log with
 `author` or `extra` filters and no path scans its first 512 changesets

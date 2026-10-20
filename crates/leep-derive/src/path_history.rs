@@ -13,6 +13,7 @@ use leep_core::{
     TreeEntry,
 };
 
+use crate::cursor::{FrontierEntry, LogFrom, LogPageRaw};
 use crate::derived::history_pack::{
     cache_size, decode_part, part_key, raw_cache_size, Pack, PackBuilder, Part, RawNode,
 };
@@ -33,14 +34,35 @@ struct PathWalk {
 }
 
 impl PathWalk {
-    async fn start(repo: &Repo, tip: ChangesetId, path: &str) -> Result<Self> {
+    async fn start(repo: &Repo, tip: ChangesetId, path: &str, from: &LogFrom) -> Result<Self> {
         let mut w = PathWalk {
             path: path.to_string(),
             seen: HashSet::new(),
             heap: BinaryHeap::new(),
         };
-        w.push_frontier(repo, tip).await?;
+        match &from.seeds {
+            // A page's queue: changesets that changed the path, as queued.
+            Some(seeds) => {
+                for e in seeds {
+                    if w.seen.insert(e.id) {
+                        w.heap.push((repo.generation(e.id).await?, e.id));
+                    }
+                }
+            }
+            None => w.push_frontier(repo, tip).await?,
+        }
         Ok(w)
+    }
+
+    fn rest(&self) -> Option<(Vec<FrontierEntry>, bool)> {
+        (!self.heap.is_empty()).then(|| {
+            let entries = self
+                .heap
+                .iter()
+                .map(|&(_, id)| FrontierEntry::id(id))
+                .collect();
+            (entries, false)
+        })
     }
 
     async fn push_frontier(&mut self, repo: &Repo, at: ChangesetId) -> Result<()> {
@@ -88,6 +110,21 @@ impl FollowWalk {
             }
         }
         Ok(())
+    }
+
+    fn rest(&self) -> Option<(Vec<FrontierEntry>, bool)> {
+        (!self.heap.is_empty()).then(|| {
+            let entries = self
+                .heap
+                .iter()
+                .map(|(_, id, name)| FrontierEntry {
+                    id: *id,
+                    name: Some(name.to_string()),
+                    bound: None,
+                })
+                .collect();
+            (entries, false)
+        })
     }
 
     /// Pop every name the newest changeset is queued under.
@@ -1362,13 +1399,28 @@ impl Repo {
         limit: usize,
         filter: &LogFilter,
     ) -> Result<Vec<ChangesetInfo>> {
+        Ok(self
+            .log_indexed_from(id, path, limit, filter, &LogFrom::tip())
+            .await?
+            .entries)
+    }
+
+    /// [`Repo::log_indexed`] from `from`, returning what is still queued.
+    pub(crate) async fn log_indexed_from(
+        &self,
+        id: ChangesetId,
+        path: &str,
+        limit: usize,
+        filter: &LogFilter,
+        from: &LogFrom,
+    ) -> Result<LogPageRaw> {
         let mut out = Vec::new();
-        let mut walk = PathWalk::start(self, id, path).await?;
+        let mut walk = PathWalk::start(self, id, path, from).await?;
         while out.len() < limit {
             let Some((generation, cid, cs)) = walk.next(self).await? else {
                 break;
             };
-            if !filter.matches(&cs) {
+            if !from.admits(generation, cid) || !filter.matches(&cs) {
                 continue;
             }
             out.push(ChangesetInfo {
@@ -1380,7 +1432,10 @@ impl Repo {
                 renamed: None,
             });
         }
-        Ok(out)
+        Ok(LogPageRaw {
+            entries: out,
+            rest: walk.rest(),
+        })
     }
 
     /// The rename that gave `path` its name in changeset `cid`, if `cid`
@@ -1437,6 +1492,21 @@ impl Repo {
         limit: usize,
         filter: &LogFilter,
     ) -> Result<Vec<ChangesetInfo>> {
+        Ok(self
+            .log_follow_from(id, path, limit, filter, &LogFrom::tip())
+            .await?
+            .entries)
+    }
+
+    /// [`Repo::log_follow`] from `from`, returning what is still queued.
+    pub(crate) async fn log_follow_from(
+        &self,
+        id: ChangesetId,
+        path: &str,
+        limit: usize,
+        filter: &LogFilter,
+        from: &LogFrom,
+    ) -> Result<LogPageRaw> {
         let path = path.trim_matches('/');
         RepoPath::new(path)?;
         let tip_tree = self.root_tree(id).await?;
@@ -1453,7 +1523,17 @@ impl Repo {
             seen: HashSet::new(),
             heap: BinaryHeap::new(),
         };
-        walk.push_frontier(self, id, &start).await?;
+        match &from.seeds {
+            Some(seeds) => {
+                for e in seeds {
+                    let name: Arc<str> = e.name.as_deref().unwrap_or(path).into();
+                    if walk.seen.insert((e.id, name.clone())) {
+                        walk.heap.push((self.generation(e.id).await?, e.id, name));
+                    }
+                }
+            }
+            None => walk.push_frontier(self, id, &start).await?,
+        }
         let mut out = Vec::new();
         while out.len() < limit {
             let Some((generation, cid, names)) = walk.pop_group() else {
@@ -1485,7 +1565,7 @@ impl Repo {
                     shown = Some((name, renamed));
                 }
             }
-            if !filter.matches(&cs) {
+            if !from.admits(generation, cid) || !filter.matches(&cs) {
                 continue;
             }
             let (name, renamed) = shown.expect("a group has at least one name");
@@ -1498,7 +1578,10 @@ impl Repo {
                 renamed,
             });
         }
-        Ok(out)
+        Ok(LogPageRaw {
+            entries: out,
+            rest: walk.rest(),
+        })
     }
 
     /// The newest changeset reachable from `id` that changed the file or

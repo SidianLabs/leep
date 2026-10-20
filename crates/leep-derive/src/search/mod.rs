@@ -32,6 +32,7 @@ use index::{Counters, CONCURRENCY};
 use plan::Compiled;
 use trigram::is_text;
 
+use crate::cursor::{self, CursorKind, Fingerprint, SearchPos};
 use crate::Repo;
 
 pub const DEFAULT_LIMIT: usize = 100;
@@ -90,6 +91,8 @@ struct FileRef {
     /// The file's `blob-trigrams-v1` row, when the walk read it with its
     /// directory's batch; `None` means look it up (and derive it if missing).
     row: Option<Bytes>,
+    /// Lines up to this one were shown by an earlier page.
+    skip_lines: u64,
 }
 
 enum Outcome {
@@ -112,19 +115,22 @@ impl Outcome {
     }
 }
 
-/// Path and glob restrictions.
+/// Path and glob restrictions, and where a resumed page starts.
 struct Filter {
     glob: Option<GlobMatcher>,
     /// Leading directories every match of the glob lies under.
     glob_dir: String,
+    /// A resumed page: only matches after this line of this path.
+    after: Option<(String, u64)>,
 }
 
 impl Filter {
-    fn new(glob: Option<&str>) -> Result<Self> {
+    fn new(glob: Option<&str>, after: Option<(String, u64)>) -> Result<Self> {
         let Some(g) = glob else {
             return Ok(Filter {
                 glob: None,
                 glob_dir: String::new(),
+                after,
             });
         };
         let m = GlobBuilder::new(g)
@@ -142,15 +148,36 @@ impl Filter {
         Ok(Filter {
             glob: Some(m),
             glob_dir,
+            after,
         })
     }
 
     fn accepts_file(&self, path: &str) -> bool {
-        self.glob.as_ref().is_none_or(|g| g.is_match(path))
+        let unseen = match &self.after {
+            Some((p, line)) => path > p.as_str() || (path == p && *line != u64::MAX),
+            None => true,
+        };
+        unseen && self.glob.as_ref().is_none_or(|g| g.is_match(path))
     }
 
-    /// Whether some file under `dir` could match the glob.
+    /// Lines of `path` an earlier page already covered.
+    fn skip_lines(&self, path: &str) -> u64 {
+        match &self.after {
+            Some((p, line)) if p == path => *line,
+            _ => 0,
+        }
+    }
+
+    /// Whether some file under `dir` could match the glob and come after a
+    /// resumed page's position (files are visited in path order, and every
+    /// path below `dir` starts with `dir/`).
     fn may_contain(&self, dir: &str) -> bool {
+        if let Some((p, _)) = &self.after {
+            let prefix = format!("{dir}/");
+            if prefix.as_str() < p.as_str() && !p.starts_with(&prefix) {
+                return false;
+            }
+        }
         let lp = self.glob_dir.as_str();
         lp.is_empty()
             || dir == lp
@@ -256,6 +283,7 @@ impl Opener {
                     size,
                 } => {
                     if self.filter.accepts_file(&path) {
+                        let skip_lines = self.filter.skip_lines(&path);
                         files.push((
                             i,
                             FileRef {
@@ -264,6 +292,7 @@ impl Opener {
                                 kind,
                                 size,
                                 row: None,
+                                skip_lines,
                             },
                         ));
                     }
@@ -455,9 +484,68 @@ impl Repo {
     /// the same query on the same revision always returns the same answer,
     /// with or without the index.
     pub async fn search(&self, id: ChangesetId, q: &SearchQuery) -> Result<SearchResponse> {
+        Ok(self.search_from(id, q, None).await?.0)
+    }
+
+    /// Search `rev` (a ref name or full id), one page at a time: `after` is
+    /// the `next` cursor of the previous page, which pins the revision the
+    /// first page resolved, so later pages search the same tree even if the
+    /// ref moved. `Invalid` if `after` is malformed or belongs to another
+    /// query.
+    pub async fn search_page(
+        &self,
+        rev: &str,
+        q: &SearchQuery,
+        after: Option<&str>,
+    ) -> Result<SearchResponse> {
+        let fp = Fingerprint::of(
+            CursorKind::Search,
+            &(
+                rev,
+                q.pattern.as_str(),
+                q.regex,
+                q.case_insensitive,
+                q.path.trim_matches('/'),
+                q.glob.as_deref(),
+            ),
+        );
+        let (id, pos) = match after {
+            None => (self.resolve(rev).await?, None),
+            Some(text) => {
+                let pos: SearchPos = cursor::decode(text, CursorKind::Search, fp)?;
+                match self.root_tree(pos.id).await {
+                    Ok(_) => {}
+                    Err(Error::NotFound(_)) => {
+                        return Err(Error::Invalid(
+                            "bad cursor: it names an unknown changeset".into(),
+                        ))
+                    }
+                    Err(e) => return Err(e),
+                }
+                (pos.id, Some(pos))
+            }
+        };
+        let (mut resp, resume) = self.search_from(id, q, pos.as_ref()).await?;
+        if let Some((path, line)) = resume {
+            resp.next = cursor::encode(CursorKind::Search, fp, &SearchPos { id, path, line });
+        }
+        Ok(resp)
+    }
+
+    /// [`Repo::search`] after `after`, also returning where the next page
+    /// starts when this one stopped early: after the last match it kept, or
+    /// after the last file it finished when the scan budget ran out. `None`
+    /// when the search ended, or when it could not get past a single file.
+    async fn search_from(
+        &self,
+        id: ChangesetId,
+        q: &SearchQuery,
+        after: Option<&SearchPos>,
+    ) -> Result<(SearchResponse, Option<(String, u64)>)> {
         let started = std::time::Instant::now();
         let compiled = Arc::new(Compiled::new(&q.pattern, q.regex, q.case_insensitive)?);
-        let filter = Arc::new(Filter::new(q.glob.as_deref())?);
+        let after = after.map(|p| (p.path.clone(), p.line));
+        let filter = Arc::new(Filter::new(q.glob.as_deref(), after)?);
         let limit = q.limit.clamp(1, MAX_LIMIT);
         let indexed = q.use_index && !compiled.required.is_true();
         let counters = Arc::new(Counters::default());
@@ -498,6 +586,7 @@ impl Repo {
                     kind,
                     size,
                     row: None,
+                    skip_lines: filter.skip_lines(start),
                 });
             }
             Some(TreeEntry::File { .. }) => {}
@@ -519,19 +608,27 @@ impl Repo {
             .map(|f| {
                 let (compiled, counters) = (&compiled, &counters);
                 async move {
-                    self.check_file(f?, compiled, indexed, limit + 1, counters)
-                        .await
+                    let f = f?;
+                    let path = f.path.clone();
+                    let outcome = self
+                        .check_file(f, compiled, indexed, limit + 1, counters)
+                        .await?;
+                    Ok::<_, Error>((path, outcome))
                 }
             })
             .buffered(CONCURRENCY);
         let mut outcomes = std::pin::pin!(outcomes);
 
-        let mut matches = Vec::new();
+        let mut matches: Vec<SearchMatch> = Vec::new();
         let mut truncated = false;
+        let mut resume = None;
+        // The last file finished, for a page the scan budget cut short.
+        let mut done: Option<String> = None;
         while let Some(outcome) = outcomes.next().await {
-            let outcome = outcome?;
+            let (path, outcome) = outcome?;
             if stats.bytes_scanned + outcome.fetched() > q.max_scan_bytes {
                 truncated = true;
+                resume = done.map(|p| (p, u64::MAX));
                 break;
             }
             stats.bytes_scanned += outcome.fetched();
@@ -544,10 +641,13 @@ impl Repo {
                     if matches.len() > limit {
                         matches.truncate(limit);
                         truncated = true;
+                        let last = matches.last().expect("limit is at least 1");
+                        resume = Some((last.path.as_str().to_string(), last.line_number));
                         break;
                     }
                 }
             }
+            done = Some(path);
         }
         stats.files_considered = walk_stats.considered.load(Ordering::Relaxed);
         stats.dirs_pruned = walk_stats.dirs_pruned.load(Ordering::Relaxed);
@@ -555,11 +655,15 @@ impl Repo {
         stats.tree_rows_derived = counters.tree_rows();
         metrics::counter!("leep_search_total", "indexed" => indexed.to_string()).increment(1);
         metrics::histogram!("leep_search_duration_seconds").record(started.elapsed().as_secs_f64());
-        Ok(SearchResponse {
-            matches,
-            truncated,
-            stats,
-        })
+        Ok((
+            SearchResponse {
+                matches,
+                truncated,
+                stats,
+                next: None,
+            },
+            resume,
+        ))
     }
 
     /// Compute every missing index row for the tree of `id`, so later
@@ -607,6 +711,7 @@ impl Repo {
             })?;
         let fetched = data.len() as u64;
         let path = RepoPath::new(f.path.as_str())?;
+        let skip_lines = f.skip_lines;
         // Matching is the CPU part of a search; off the async workers, files
         // in flight are matched on as many threads as the runtime allows.
         let compiled = compiled.clone();
@@ -616,7 +721,7 @@ impl Repo {
             }
             let text = std::str::from_utf8(&data).expect("checked by is_text");
             let mut matches = Vec::new();
-            compiled.scan(&path, text, max, &mut matches);
+            compiled.scan_after(&path, text, skip_lines, max, &mut matches);
             Some(matches)
         })
         .await

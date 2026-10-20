@@ -33,6 +33,7 @@ struct LogArgs {
     author: Option<String>,
     agent_model: Option<String>,
     agent_session: Option<String>,
+    cursor: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -61,6 +62,7 @@ struct SearchArgs {
     path: Option<String>,
     glob: Option<String>,
     limit: Option<u32>,
+    cursor: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -153,12 +155,19 @@ impl Server {
             author: non_empty(a.author),
             extra,
             follow,
+            after: non_empty(a.cursor),
         };
         let log = self.client.log(&id, &query)?;
         let entries: Vec<Value> = log.entries.iter().map(summary).collect();
-        Ok(ToolOutput::json(
-            json!({ "from": id.to_string(), "entries": entries }),
-        ))
+        let mut v = json!({ "from": id.to_string(), "entries": entries });
+        if let Some(next) = log.next {
+            v["next"] = json!(next);
+            v["note"] = json!(
+                "More history follows. For the next page, call again with the same arguments, \
+                 `rev` set to `from`, and `cursor` set to `next`."
+            );
+        }
+        Ok(ToolOutput::json(v))
     }
 
     pub(super) fn show(&self, args: Value) -> ToolResult {
@@ -359,6 +368,7 @@ impl Server {
                     .unwrap_or(DEFAULT_SEARCH_LIMIT)
                     .clamp(1, MAX_SEARCH_LIMIT),
             ),
+            after: non_empty(a.cursor),
         };
         let resp = self.client.search(&id, &query)?;
         let mut v = json!({
@@ -367,7 +377,13 @@ impl Server {
             "truncated": resp.truncated,
             "stats": resp.stats,
         });
-        if resp.truncated {
+        if let Some(next) = resp.next {
+            v["next"] = json!(next);
+            v["note"] = json!(
+                "More matches may follow. Narrow the query with `path` or `glob`, or call again \
+                 with the same arguments, `rev` set to `rev`, and `cursor` set to `next`."
+            );
+        } else if resp.truncated {
             v["note"] = json!(
                 "More matches exist, or the server stopped scanning. Narrow the query with \
                  `path` or `glob`, or raise `limit`."

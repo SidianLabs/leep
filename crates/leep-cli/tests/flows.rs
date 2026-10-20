@@ -415,6 +415,7 @@ fn provenance_queries_reach_the_server_and_decode() {
             agent_model: None,
             agent_session: None,
             extra: vec![],
+            after: None,
         };
         f(&mut a);
         a
@@ -531,6 +532,7 @@ fn search_sends_flags_and_decodes_matches() {
             path: None,
             glob: None,
             limit: None,
+            after: None,
         };
         f(&mut a);
         a
@@ -921,6 +923,7 @@ fn log_follow_sends_the_flag_and_decodes_path_at() {
         agent_model: None,
         agent_session: None,
         extra: vec![],
+        after: None,
     };
     let resp = r.client.log(&id, &args.query().unwrap()).unwrap();
     let q = queries(&mock, "log").pop().unwrap();
@@ -1219,4 +1222,99 @@ fn a_failed_init_leaves_no_working_copy_and_can_be_retried() {
     assert_eq!(fs::read_to_string(ctx.wc.abs("a.txt")).unwrap(), "a2\n");
     assert_eq!(fs::read_to_string(ctx.wc.abs("z.txt")).unwrap(), "z\n");
     assert!(status(&ctx.wc).unwrap().is_clean());
+}
+
+#[test]
+fn log_and_search_follow_page_cursors() {
+    let mock = Mock::start();
+    let mut tip = mock.seed(None, &[("a.txt", "needle 0\n", FileKind::Regular)], &[]);
+    for i in 1..10 {
+        let body = format!("needle {i}\nneedle again\n");
+        tip = mock.seed(
+            Some(tip),
+            &[(&format!("f{i}.txt"), &body, FileKind::Regular)],
+            &[],
+        );
+    }
+    mock.data.lock().unwrap().page_cap = Some(3);
+    let (wc_dir, cache) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let ctx = init_wc(&mock, wc_dir.path(), cache.path(), &[]).unwrap();
+    let r = ctx.remote();
+
+    let q = leep_cli::client::LogQuery::default();
+    let all = r.client.log_all(&tip, &q, 8).unwrap();
+    assert_eq!(all.entries.len(), 8);
+    assert!(all.next.is_some(), "two changesets are left");
+    let sent = queries(&mock, "log");
+    assert_eq!(sent.len(), 3, "{sent:?}");
+    assert!(
+        !sent[0].contains("after=") && sent[1].contains("after=3"),
+        "{sent:?}"
+    );
+    // Resuming from the returned cursor reaches the root.
+    let rest = r
+        .client
+        .log_all(
+            &tip,
+            &leep_cli::client::LogQuery {
+                after: all.next.clone(),
+                ..Default::default()
+            },
+            100,
+        )
+        .unwrap();
+    assert_eq!(rest.entries.len(), 2);
+    assert!(rest.next.is_none());
+    let mut ids: Vec<_> = all.entries.iter().map(|e| e.id).collect();
+    ids.extend(rest.entries.iter().map(|e| e.id));
+    let whole = r.client.log(&tip, &Default::default()).unwrap();
+    assert_eq!(whole.entries.len(), 3, "one request is one capped page");
+    assert_eq!(
+        ids[..3],
+        whole.entries.iter().map(|e| e.id).collect::<Vec<_>>()[..]
+    );
+
+    let sq = leep_cli::client::SearchQuery {
+        query: "needle".into(),
+        ..Default::default()
+    };
+    let found = r.client.search_all(&tip, &sq, 1000).unwrap();
+    assert_eq!(found.matches.len(), 19);
+    assert!(!found.truncated && found.next.is_none());
+    assert!(queries(&mock, "search").len() >= 7);
+}
+
+#[test]
+fn reflog_follows_cursors_and_falls_back_to_seq() {
+    let mock = Mock::start();
+    let mut tip = mock.seed(None, &[("a.txt", "0\n", FileKind::Regular)], &[]);
+    for i in 1..6 {
+        tip = mock.seed(
+            Some(tip),
+            &[("a.txt", &format!("{i}\n"), FileKind::Regular)],
+            &[],
+        );
+        mock.data
+            .lock()
+            .unwrap()
+            .set_ref("main", Some(tip), "cas", None);
+    }
+    let r = |cap| {
+        mock.data.lock().unwrap().page_cap = cap;
+        let c = leep_cli::client::Client::new(&mock.url);
+        let mut entries = Vec::new();
+        let mut after: Option<String> = None;
+        loop {
+            let page = c.ref_log_page(None, None, after.as_deref(), 50).unwrap();
+            entries.extend(page.entries);
+            match page.next {
+                Some(n) => after = Some(n),
+                None => break,
+            }
+        }
+        entries
+    };
+    let all = r(None);
+    assert_eq!(all.len(), 5);
+    assert_eq!(r(Some(2)), all);
 }

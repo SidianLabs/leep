@@ -195,8 +195,24 @@ impl Compiled {
 
     /// Append the matching lines of `text`, at most `max` of them.
     pub fn scan(&self, path: &RepoPath, text: &str, max: usize, out: &mut Vec<SearchMatch>) {
+        self.scan_after(path, text, 0, max, out)
+    }
+
+    /// [`Compiled::scan`] of the lines after line `skip` (1-based), which an
+    /// earlier page covered.
+    pub fn scan_after(
+        &self,
+        path: &RepoPath,
+        text: &str,
+        skip: u64,
+        max: usize,
+        out: &mut Vec<SearchMatch>,
+    ) {
         let first = out.len();
         for (i, line) in text.lines().enumerate() {
+            if (i as u64) < skip {
+                continue;
+            }
             if out.len() - first >= max {
                 break;
             }
