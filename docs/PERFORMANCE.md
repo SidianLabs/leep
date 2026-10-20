@@ -2528,6 +2528,84 @@ the serial `rederive` ran at about 45 a second (nine hours), `rederive
 --missing --jobs N` derives at the warmer's rate times about the idle
 cores, with memory near one job's. Not yet measured on Linux.
 
+## Hot chain rate
+
+ADR 0058, section 8. Lands rebase, so a ref that agents land on is a
+first-parent chain one changeset wide, and ADR 0050's wavefront has nothing
+to run beside anything else on it. However many jobs or indexers there are,
+one ref's `history-tree-v4` grows at the rate one derivation follows its own
+chain. The design review first estimated that rate from whole-history
+builds: 15.6 ms a changeset in the soak run, about 40 a second on Linux.
+Those builds are dominated by merges, cold caches and competing requests.
+`crates/leep-server/examples/chain_rate.rs` measures the case that matters
+instead. It builds a synthetic history (`wide_history.rs`) shaped like
+git/git's tree (4,335 files: directories of 450, 725 and 1,000 files and 48
+small ones) or late Linux's (83,420 files, 12 directories of 2,000 to 5,000).
+Each base has 2,000 changesets after the import, with branches and merges,
+and its index is derived first, which warms the caches as a running
+indexer's are. It then grows two chains of 2,000 changesets off the head.
+Each changeset edits 1 to 3 existing files, 30% of them in a wide directory,
+as an agent's land does. It times three derivations:
+
+- **follow:** each changeset of the first chain derived as soon as it
+  exists, one at a time. An indexer keeping up.
+- **catch-up:** the second chain derived in one derivation of its tip. An
+  indexer that fell behind.
+- **log filter, follow:** `log-filter-v1` over the first chain, one at a
+  time.
+
+```sh
+cargo run --release -p leep-server --example chain_rate -- \
+  postgres://localhost/chain file:///var/tmp/chain/blobs --shape linux --base 2000 --chain 2000 [--jobs N]
+```
+
+Local Postgres 16 over TCP (`fsync` off), filesystem blobs, release build. A
+4-vCPU VM shared with other builds (load average 3.3 to 8.3 during the
+runs). One run per row, a fresh database each. CPU is the whole process's
+user and system time per changeset; on `mem://` that includes the store's
+work.
+
+| Store, shape, jobs | History, follow | History, catch-up | Log filter, follow |
+|---|---|---|---|
+| Postgres, git/git-shaped, 4 | 158/s (6.3 ms wall, 2.9 ms CPU, 8 trips) | 434/s (2.3 ms, 1.3 ms CPU, 2 trips) | 155/s (6.5 ms, 1.8 ms CPU) |
+| Postgres, git/git-shaped, 1 | 176/s (5.7 ms, 3.2 ms CPU) | 425/s (2.4 ms, 1.6 ms CPU) | 234/s (4.3 ms, 2.1 ms CPU) |
+| Postgres, Linux-shaped, 4 | 192/s (5.2 ms, 3.5 ms CPU) | 459/s (2.2 ms, 1.8 ms CPU) | 244/s (4.1 ms, 1.9 ms CPU) |
+| Postgres, Linux-shaped, 1 | 182/s (5.5 ms, 3.2 ms CPU) | 384/s (2.6 ms, 1.9 ms CPU) | 262/s (3.8 ms, 1.9 ms CPU) |
+| memory, git/git-shaped, 4 / 1 | 1,340 / 1,334/s (0.6 ms CPU) | 2,285 / 1,959/s (0.4 ms CPU) | 18,977 / 4,164/s |
+| memory, Linux-shaped, 4 / 1 | 897 / 941/s (0.9 ms CPU) | 1,123 / 1,144/s (0.8 ms CPU) | 3,975 / 3,670/s |
+
+What it says:
+
+- **A chain indexes at 160 to 460 a second on Postgres.** That is 3 to 10
+  times the estimate from whole-history builds. A linear agent changeset
+  touches a few paths and no merge, so its row is a handful of spine
+  edits. CPU per changeset is 0.4 to 0.9 ms in memory and 1.3 to 3.5 ms
+  against Postgres (the client's encoding and decoding included). The
+  Linux shape costs about 1.5 times the git/git shape in memory, and the
+  same against Postgres, where round trips dominate.
+- **Following is round-trip bound.** One changeset at a time makes 8 store
+  round trips: the row check, the missing walk's batched reads, the
+  changeset, its prepared inputs, the write. Catching up makes 2 per
+  changeset, because reads and writes are batched 256 changesets at a time
+  (ADR 0050). So an indexer that derives the newest head once per pass,
+  as the warmer does since ADR 0058, runs at the catch-up rate whenever
+  lands arrive faster than one per pass.
+- **Jobs do not help on a chain.** One job and four give the same rate
+  within noise, as the wavefront predicts. The read-ahead and write
+  batching are what make catch-up fast.
+- **Against one ref's land ceiling.** ADR 0056 puts that ceiling at about
+  200 to 250 lands a second. Catch-up at 380 to 460 a second keeps up with
+  it on both shapes, with no format change and no second indexer. Follow
+  alone at 160 to 190 a second would not, but a 250 ms pass at that land
+  rate always has 50 or more changesets to catch up. The log filter is
+  cheaper in CPU and bound by the same round trips.
+- **Not yet measured:** a real history's chain (contents and directory
+  shapes from git/git and Linux rather than synthetic ones), changesets
+  touching many files, and a chain indexed while a swarm loads the same
+  Postgres. The next step in ADR 0058, section 8, is directory-dataflow
+  derivation, which spreads one chain over cores. It only matters if one of
+  those cases falls below the land rate.
+
 ## Garbage collection
 
 `leep-server gc` phases timed with
