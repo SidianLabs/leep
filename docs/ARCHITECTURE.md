@@ -493,9 +493,12 @@ land_batch:
 loop (≤32 attempts):
   start ← get_ref(target);  head ← start;  staging ← empty
   prefetch the lands' changesets, root trees and the head's rebase links
-           (stored rebase links an earlier attempt of the batch read are kept)
+           (stored rebase links an earlier attempt of the batch read are kept),
+    and what target's ref log recorded for the lands' land ids
   for each land, writing into staging and reading it back (dropped if its caller left before it was reached):
-    if head is None:                 move to cs
+    if its land id is recorded (or moved earlier in this batch):
+                                     that land's result (400 if the id named another cs)
+    elif head is None:               move to cs
     elif cs is an ancestor of head:  already landed
     elif head is an ancestor of cs:  move to cs                   # fast-forward
     elif head's history holds a server-made copy of cs:  already landed
@@ -540,7 +543,13 @@ a land that applied (a timeout, a killed server, an error after commit) can
 send it again and gets the copy back instead of a second one. It looks for a
 rebased copy that `Repo::rebase` recorded (`rebased-origin-v1`), not for the
 forgeable `leep.rebased_from` extra, among the head's ancestors above `cs`'s
-generation, and gives up after 1024 changesets (ADR 0021).
+generation, and gives up after 1024 changesets (ADR 0021). Past that window
+only a land id recognises the retry
+([ADR 0057](adr/0057-land-ids.md)): a client that names its land
+(`land_id`, random, the same on every retry) has the id stored in the ref
+log entry of the move, in the same transaction, and a later land with that
+id is answered from the entry at any age. `leep land` and the MCP server
+send one; the scan stays for clients that do not.
 A land onto a ref that does not exist creates it, unless the request says
 `create: false` ([ADR 0036](adr/0036-explicit-ref-creation-on-land.md)), which
 `leep land` does unless given `--create` (or landing the first changeset onto
@@ -845,7 +854,7 @@ misses and occupancy as Prometheus metrics (see [OPERATIONS.md](OPERATIONS.md)).
 |---|---|---|
 | Server instance dies mid-request (SIGKILL included) | No partial mutable state: refs move by one transaction, everything else is written idempotently, so a request leaves at most unreferenced blobs, tree nodes and derived rows | Client retries; every write is idempotent and a repeated `land` finds its earlier result |
 | Store call errors | The request fails with 500 (or 409 when the swap lost); nothing it did is rolled back, and nothing needs to be | Client retries |
-| Store call applies, then reports an error (lost commit acknowledgement, timeout after commit) | The write may exist. For a blob, changeset or derived row that is harmless. For `cas_ref` the caller cannot tell | `land` reads the ref again and recognises its own result; other ref callers must read the ref before repeating |
+| Store call applies, then reports an error (lost commit acknowledgement, timeout after commit) | The write may exist. For a blob, changeset or derived row that is harmless. For `cas_ref` the caller cannot tell | `land` reads the ref again and recognises its own result (by land id at any age, ADR 0057; otherwise within the last 1024 changesets); other ref callers must read the ref before repeating |
 | Request cancelled by `--request-timeout` or a client disconnect | Same as a dead server for the work it had done; it performs no further writes | Client retries |
 | MetaStore unavailable | Writes and uncached reads fail | Fail fast with 500; no local fallback |
 | BlobStore slow | Cache tiers absorb repeated reads | — |

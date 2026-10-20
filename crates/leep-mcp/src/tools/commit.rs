@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use leep_cli::client::new_land_id;
 use leep_cli::error::{CliError, ErrorKind};
 use leep_core::api::{Conflict, FileInfo, LandRequest, LandResponse};
 use leep_core::changeset::{
@@ -288,12 +289,26 @@ impl Server {
         target_ref: &str,
         create: bool,
     ) -> Result<LandResponse, ToolError> {
+        let key = (changeset, target_ref.to_string());
+        let land_id = self
+            .pending_lands
+            .lock()
+            .unwrap()
+            .entry(key.clone())
+            .or_insert_with(new_land_id)
+            .clone();
         let land = |create: bool| {
-            self.client.land(&LandRequest {
+            let r = self.client.land_resending(&LandRequest {
                 changeset,
                 target_ref: target_ref.to_string(),
                 create: Some(create),
-            })
+                land_id: Some(land_id.clone()),
+            });
+            // Only an error that sending again could change keeps the id.
+            if !r.as_ref().is_err_and(|e| e.is_retryable()) {
+                self.pending_lands.lock().unwrap().remove(&key);
+            }
+            r
         };
         match land(create) {
             Err(e) if missing_ref(&e) => {

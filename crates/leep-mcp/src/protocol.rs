@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use leep_cli::client::Client;
-use leep_core::ChangesetId;
+use leep_core::{ChangesetId, LandId};
 use serde_json::{json, Value};
 
 use crate::tools::{self, ToolOutput};
@@ -31,6 +31,10 @@ pub struct Server {
     /// the ref it was landing on, so a retried request lands that changeset
     /// again instead of making a second one.
     pub(crate) requests: Mutex<HashMap<String, (ChangesetId, String)>>,
+    /// `(changeset, ref)` → the land id of a land of it that got no final
+    /// answer, so the call that finishes it reuses the id and the server
+    /// answers with the earlier result instead of landing twice (ADR 0057).
+    pub(crate) pending_lands: Mutex<HashMap<(ChangesetId, String), LandId>>,
 }
 
 impl Server {
@@ -40,6 +44,7 @@ impl Server {
             client,
             cfg,
             requests: Mutex::default(),
+            pending_lands: Mutex::default(),
         }
     }
 

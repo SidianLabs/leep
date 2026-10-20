@@ -5,7 +5,7 @@
 //! |---|---|---|---|
 //! | GET  | `/v1/health` | – | `"ok"` (liveness: the process is up and serving HTTP; checks nothing else) |
 //! | GET  | `/v1/whoami` | – | [`WhoAmIResponse`] (the calling token's name, role and optional `author`; null when authentication is off) |
-//! | GET  | `/v1/ready` | – | [`ReadyResponse`] (readiness: 200 `{"status":"ready"}` when the metadata and blob stores each answered a cheap read within the server's ready timeout, else 503 with `failed` naming the stores) |
+//! | GET  | `/v1/ready` | – | [`ReadyResponse`] (readiness: 200 `{"status":"ready","features":[...]}` when the metadata and blob stores each answered a cheap read within the server's ready timeout, else 503 with `failed` naming the stores; `features` lists optional behaviours such as `land-id`, ADR 0057) |
 //! | PUT  | `/v1/blobs/{hash}` | raw bytes | 204; 400 if `Hash::of_blob(body) != hash` |
 //! | GET  | `/v1/blobs/{hash}` | – | raw bytes, or 404 |
 //! | POST | `/v1/blobs/missing` | [`MissingBlobsRequest`] | [`MissingBlobsResponse`]; 400 if over [`MAX_MISSING_BLOBS`] hashes |
@@ -35,7 +35,7 @@
 //! | GET  | `/v1/changesets/{id}/review-status?ref=main` | – | [`ReviewStatusResponse`] (`ref` defaults to `main`) |
 //! | POST | `/v1/merge` | [`MergeRequest`] | [`MergeResponse`] |
 //! | POST | `/v1/rebase` | [`RebaseRequest`] | [`RebaseResponse`] |
-//! | POST | `/v1/land` | [`LandRequest`] | [`LandResponse`] (`create: false` refuses to create a missing `target_ref` with 404; absent creates it, as before; ADR 0036) |
+//! | POST | `/v1/land` | [`LandRequest`] | [`LandResponse`] (`create: false` refuses to create a missing `target_ref` with 404; absent creates it, as before; ADR 0036. `land_id` makes retries idempotent at any age; ADR 0057) |
 //!
 //! Ref names may contain `/` (e.g. `release/1.0`); `{name}` and `{rev}` match
 //! the rest of the path. Every ref write (`POST /v1/refs/{name}` and the
@@ -115,7 +115,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::review::{Review, Verdict};
-pub use crate::store::RefLogEntry;
+pub use crate::store::{LandId, RefLogEntry};
 use crate::{Changeset, ChangesetId, FileChange, FileKind, Hash, RepoPath, TreeEntry};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -144,7 +144,16 @@ pub struct ReadyResponse {
     pub status: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub failed: Vec<ReadyFailure>,
+    /// Optional behaviours this server has, for clients that must know
+    /// before relying on one (absent from older servers): see
+    /// [`FEATURE_LAND_ID`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub features: Vec<String>,
 }
+
+/// In [`ReadyResponse::features`]: the server records [`LandRequest::land_id`]
+/// and answers a repeat of a recorded land with its result (ADR 0057).
+pub const FEATURE_LAND_ID: &str = "land-id";
 
 /// One store that failed its readiness check.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -595,6 +604,13 @@ pub struct LandRequest {
     /// [`crate::refname::MISSING_REF_MARKER`] (ADR 0036).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub create: Option<bool>,
+    /// The client's id for this logical land, the same on every retry of it
+    /// (ADR 0057). A land whose id `target_ref` already recorded answers
+    /// with that land's result, however long ago it landed, and moves
+    /// nothing; reusing an id for a different changeset is 400. Absent, a
+    /// retry is recognised only while its rebased copy is near the head.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub land_id: Option<LandId>,
 }
 
 fn default_ref() -> String {
@@ -844,11 +860,33 @@ mod tests {
             2,
             "an unset create is omitted"
         );
+        assert_eq!(req.land_id, None, "old clients send no land id");
         let req = LandRequest {
             create: Some(false),
             ..req
         };
         assert_eq!(serde_json::to_value(&req).unwrap()["create"], false);
+        let hex = "00112233445566778899aabbccddeeff";
+        let req: LandRequest = serde_json::from_value(
+            serde_json::json!({ "changeset": id.to_string(), "land_id": hex }),
+        )
+        .unwrap();
+        assert_eq!(req.land_id.as_ref().unwrap().to_string(), hex);
+        assert_eq!(serde_json::to_value(&req).unwrap()["land_id"], hex);
+        for bad in [
+            "00",
+            "zz112233445566778899aabbccddeeff",
+            &hex.to_uppercase(),
+            &"ab".repeat(33),
+        ] {
+            assert!(
+                serde_json::from_value::<LandRequest>(
+                    serde_json::json!({ "changeset": id.to_string(), "land_id": bad }),
+                )
+                .is_err(),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

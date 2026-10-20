@@ -97,7 +97,10 @@ async fn ready_with_working_stores() {
     let r = rig();
     let (status, body) = ready(&r.app).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(String::from_utf8(body).unwrap(), r#"{"status":"ready"}"#);
+    assert_eq!(
+        String::from_utf8(body).unwrap(),
+        r#"{"status":"ready","features":["land-id"]}"#
+    );
     // It really asked both stores, once each.
     assert_eq!(r.meta_plan.calls(Op::GetRef), 1);
     assert_eq!(r.blob_plan.calls(Op::Contains), 1);

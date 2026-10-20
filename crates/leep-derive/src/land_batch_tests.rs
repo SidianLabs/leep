@@ -19,6 +19,9 @@ use tokio::sync::watch;
 
 use crate::Repo;
 
+/// A ref move: from, to and its context.
+type Move = (Option<ChangesetId>, Option<ChangesetId>, RefUpdateContext);
+
 /// A memory store whose ref reads and swaps can be held shut, which lets a
 /// test queue lands in a known order, and which can let another writer move
 /// the ref just before the next swap.
@@ -36,6 +39,11 @@ struct Gate {
     single_writes: AtomicUsize,
     /// Moved in by "another server" right before the next swap.
     intruder: Mutex<Option<(Option<ChangesetId>, ChangesetId)>>,
+    /// Moves "another server" makes right before the next swap, with their
+    /// contexts (land ids included).
+    intruder_moves: Mutex<Vec<Move>>,
+    /// `find_lands` calls left to fail.
+    find_fails: AtomicUsize,
     /// Keys of every `rebased-origin-v1` row read from the store.
     origin_reads: Mutex<Vec<Hash>>,
 }
@@ -53,6 +61,8 @@ impl Gate {
             batch_writes: AtomicUsize::new(0),
             single_writes: AtomicUsize::new(0),
             intruder: Mutex::new(None),
+            intruder_moves: Mutex::new(Vec::new()),
+            find_fails: AtomicUsize::new(0),
             origin_reads: Mutex::new(Vec::new()),
         })
     }
@@ -77,6 +87,14 @@ impl Gate {
             assert!(self
                 .inner
                 .cas_ref_logged(name, from, Some(to), &ctx)
+                .await
+                .unwrap());
+        }
+        let moves = std::mem::take(&mut *self.intruder_moves.lock().unwrap());
+        for (from, to, ctx) in moves {
+            assert!(self
+                .inner
+                .cas_ref_logged(name, from, to, &ctx)
                 .await
                 .unwrap());
         }
@@ -141,6 +159,21 @@ impl MetaStore for Gate {
         self.chain_calls.fetch_add(1, Ordering::SeqCst);
         self.inner.cas_ref_logged_chain(name, expected, steps).await
     }
+    async fn find_lands(
+        &self,
+        name: &str,
+        ids: &[leep_core::LandId],
+    ) -> Result<Vec<Option<leep_core::LandRecord>>> {
+        let fail = self
+            .find_fails
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok();
+        if fail {
+            return Err(leep_core::Error::Storage("find_lands failed".into()));
+        }
+        self.inner.find_lands(name, ids).await
+    }
+
     async fn ref_log(
         &self,
         name: Option<&str>,
@@ -1057,4 +1090,211 @@ async fn a_batch_that_cannot_store_its_replays_moves_nothing() {
         stored
     );
     assert!(r.is_ancestor(base, landed).await.unwrap());
+}
+
+/// [`queue_in_order`] for lands that carry land ids.
+async fn queue_keyed(
+    r: &Repo,
+    gate: &Gate,
+    base: ChangesetId,
+    lands: &[(ChangesetId, Option<leep_core::LandId>)],
+) -> (Pending, Vec<Pending>) {
+    gate.reads.send_replace(false);
+    let blocker = {
+        let r = r.clone();
+        tokio::spawn(async move { r.land(base, "main").await })
+    };
+    wait_for(|| gate.waiting_reads.load(Ordering::SeqCst) == 1).await;
+    let mut tasks = Vec::new();
+    for (i, (cs, id)) in lands.iter().cloned().enumerate() {
+        let r2 = r.clone();
+        tasks.push(tokio::spawn(async move {
+            r2.land_keyed(cs, "main", None, true, id).await
+        }));
+        wait_for(|| r.land_queues.pending("main") == i + 1).await;
+    }
+    (blocker, tasks)
+}
+
+/// Land ids in one batch (ADR 0057): a duplicate of a land earlier in the
+/// batch is answered with that land's result once the batch commits, an id
+/// reused for another changeset is refused, an id recorded by an earlier
+/// batch answers with its result, and none of it touches the other lands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn land_ids_in_a_batch_are_settled_per_land() {
+    use leep_core::LandId;
+    use Parent::*;
+    let script = vec![
+        spec(&[Base], &[("u/1", Some("1\n"))], "u1"), // 0
+        spec(&[Base], &[("x", Some("x\n"))], "x"),    // 1: keyed
+        spec(&[Base], &[("u/2", Some("2\n"))], "u2"), // 2
+        spec(&[Base], &[("y", Some("y\n"))], "y"),    // 3: reuses x's id
+        spec(&[Base], &[("u/3", Some("3\n"))], "u3"), // 4
+        spec(&[Base], &[("k", Some("k\n"))], "k"),    // 5: landed before
+        spec(&[Base], &[("u/4", Some("4\n"))], "u4"), // 6
+    ];
+    let (r, gate) = gated_repo();
+    let (_, ids) = build(&r, &script).await;
+    let key = |n: u8| Some(LandId::from_bytes(&[n; 16]).unwrap());
+    let earlier = r
+        .land_keyed(ids[5], "main", None, true, key(5))
+        .await
+        .unwrap();
+    let base = r.meta().get_ref("main").await.unwrap().unwrap();
+    let lands = vec![
+        (ids[0], None),
+        (ids[1], key(1)),
+        (ids[2], None),
+        (ids[1], key(1)), // duplicate in the batch
+        (ids[3], key(1)), // id reused for another changeset
+        (ids[4], key(9)),
+        (ids[5], key(5)), // recorded by an earlier batch
+        (ids[6], None),
+    ];
+    let (blocker, tasks) = queue_keyed(&r, &gate, base, &lands).await;
+    release(&gate);
+    blocker.await.unwrap().unwrap();
+    let mut results = Vec::new();
+    for t in tasks {
+        results.push(t.await.unwrap());
+    }
+    let landed = |i: usize| match &results[i] {
+        Ok(LandResponse::Landed { landed, .. }) => *landed,
+        other => panic!("land {i}: {other:?}"),
+    };
+    for i in [0, 2, 5, 7] {
+        landed(i);
+    }
+    assert_eq!(
+        landed(1),
+        landed(3),
+        "the duplicate gets the original's copy"
+    );
+    assert!(
+        matches!(&results[4], Err(leep_core::Error::Invalid(m)) if m.contains("land id")),
+        "{:?}",
+        results[4]
+    );
+    match (&earlier, &results[6]) {
+        (LandResponse::Landed { landed: a, .. }, Ok(LandResponse::Landed { landed: b, .. })) => {
+            assert_eq!(a, b)
+        }
+        other => panic!("{other:?}"),
+    }
+    let batches = r.land_queues.batches.lock().unwrap().clone();
+    assert_eq!(batches.last().unwrap().len(), lands.len(), "one batch");
+    let log = r.meta().ref_log(Some("main"), None, 100).await.unwrap();
+    let moves = log.iter().filter(|e| e.seq > 2).count();
+    assert_eq!(moves, 5, "u1, x, u2, u3 (keyed 9), u4: one move each");
+    let found = r
+        .meta()
+        .find_lands("main", &[key(1).unwrap(), key(9).unwrap()])
+        .await
+        .unwrap();
+    assert_eq!(found[0].unwrap().landed, landed(1));
+    assert_eq!(found[1].unwrap().landed, landed(5));
+}
+
+/// A batch whose swap hits a land id another server recorded after the
+/// batch's lookup (that server landed it and the ref was then moved back):
+/// the swap applies nothing, the batch is redone like a lost race, and the
+/// keyed land gets the recorded result while the others land.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_land_id_recorded_after_the_lookup_redoes_the_batch() {
+    use leep_core::{LandId, LandKey};
+    use Parent::*;
+    let script = vec![
+        spec(&[Base], &[("u/1", Some("1\n"))], "u1"),
+        spec(&[Base], &[("x", Some("x\n"))], "x"),
+        spec(&[Base], &[("u/2", Some("2\n"))], "u2"),
+    ];
+    let (r, gate) = gated_repo();
+    let (base, ids) = build(&r, &script).await;
+    let id = LandId::from_bytes(&[3; 16]).unwrap();
+    // Another server lands x under the same id, then the ref is undone.
+    gate.intruder_moves.lock().unwrap().extend([
+        (
+            Some(base),
+            Some(ids[1]),
+            RefUpdateContext::new("land").land(Some(LandKey {
+                id: id.clone(),
+                changeset: ids[1],
+            })),
+        ),
+        (Some(ids[1]), Some(base), RefUpdateContext::new("undo")),
+    ]);
+    let lands = vec![(ids[0], None), (ids[1], Some(id)), (ids[2], None)];
+    let (blocker, tasks) = queue_keyed(&r, &gate, base, &lands).await;
+    release(&gate);
+    blocker.await.unwrap().unwrap();
+    let mut results = Vec::new();
+    for t in tasks {
+        results.push(t.await.unwrap().unwrap());
+    }
+    assert_eq!(
+        results[1],
+        LandResponse::Landed {
+            landed: ids[1],
+            rebased: false,
+            attempts: 2
+        },
+        "the other server's result"
+    );
+    for i in [0, 2] {
+        assert!(matches!(results[i], LandResponse::Landed { .. }), "{i}");
+    }
+    assert_eq!(gate.chain_calls.load(Ordering::SeqCst), 2, "redone once");
+    let log = r.meta().ref_log(Some("main"), None, 100).await.unwrap();
+    let lands_of_x = log
+        .iter()
+        .filter(|e| e.message.as_deref() == Some(&format!("landed {}", ids[1])))
+        .count();
+    assert_eq!(lands_of_x, 0, "the batch never moved the ref for x");
+}
+
+/// A land id lookup that fails holds back only the keyed lands, which go in
+/// the next attempt; one that keeps failing fails only them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_land_id_lookup_holds_back_only_keyed_lands() {
+    use leep_core::LandId;
+    use Parent::*;
+    for (fails, keyed_ok) in [(1, true), (100, false)] {
+        let script = vec![
+            spec(&[Base], &[("u/1", Some("1\n"))], "u1"),
+            spec(&[Base], &[("x", Some("x\n"))], "x"),
+            spec(&[Base], &[("u/2", Some("2\n"))], "u2"),
+        ];
+        let (r, gate) = gated_repo();
+        let (base, ids) = build(&r, &script).await;
+        gate.find_fails.store(fails, Ordering::SeqCst);
+        let id = Some(LandId::from_bytes(&[4; 16]).unwrap());
+        let lands = vec![(ids[0], None), (ids[1], id), (ids[2], None)];
+        let (blocker, tasks) = queue_keyed(&r, &gate, base, &lands).await;
+        release(&gate);
+        blocker.await.unwrap().unwrap();
+        let mut results = Vec::new();
+        for t in tasks {
+            results.push(t.await.unwrap());
+        }
+        for i in [0, 2] {
+            assert!(
+                matches!(results[i], Ok(LandResponse::Landed { .. })),
+                "{fails}: {i}: {:?}",
+                results[i]
+            );
+        }
+        if keyed_ok {
+            assert!(
+                matches!(results[1], Ok(LandResponse::Landed { .. })),
+                "{:?}",
+                results[1]
+            );
+        } else {
+            assert!(
+                matches!(&results[1], Err(leep_core::Error::Storage(m)) if m.contains("find_lands")),
+                "{:?}",
+                results[1]
+            );
+        }
+    }
 }

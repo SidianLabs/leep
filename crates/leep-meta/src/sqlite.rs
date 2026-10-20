@@ -6,8 +6,8 @@ use bytes::Bytes;
 use leep_core::prefix::IdPrefix;
 use leep_core::store::unix_now;
 use leep_core::{
-    check_ref_chain, Changeset, ChangesetId, DeleteStep, DerivedRow, Hash, MetaStore, RefLogEntry,
-    RefStep, RefUpdateContext, Result,
+    check_land_key, check_ref_chain, Changeset, ChangesetId, DeleteStep, DerivedRow, Hash, LandId,
+    LandRecord, MetaStore, RefLogEntry, RefStep, RefUpdateContext, Result,
 };
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Row, SqliteConnection, SqlitePool};
@@ -16,8 +16,8 @@ use crate::codec::Codec;
 use crate::drop::{self, nothing_left, Cursor, KEY_BATCH};
 use crate::migrate::{self, AppliedMigration, Migration, MigrationReport, Session};
 use crate::{
-    changesets_in_order, log_entry, placeholders, storage, to_hash, to_id, unique, values_in_order,
-    LogRow, SchemaMode, BATCH_PARAMS,
+    changesets_in_order, land_columns, lands_in_order, log_entry, log_insert_error, placeholders,
+    storage, to_hash, to_id, unique, values_in_order, LandRow, LogRow, SchemaMode, BATCH_PARAMS,
 };
 
 /// The compiled migration list (ADR 0023). Append only.
@@ -44,6 +44,12 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 4,
         name: "store_features",
         sql: include_str!("../migrations/sqlite/0004_store_features.sql"),
+        satisfied_by: &[],
+    },
+    Migration {
+        version: 5,
+        name: "land_ids",
+        sql: include_str!("../migrations/sqlite/0005_land_ids.sql"),
         satisfied_by: &[],
     },
 ];
@@ -550,11 +556,13 @@ impl MetaStore for SqliteMetaStore {
         new: Option<ChangesetId>,
         ctx: &RefUpdateContext,
     ) -> Result<bool> {
+        check_land_key(new, ctx)?;
         if expected == new {
             return Ok(self.get_ref(name).await? == expected);
         }
         let exp = expected.map(|i| i.0 .0.to_vec());
         let new = new.map(|i| i.0 .0.to_vec());
+        let (land_id, land_changeset) = land_columns(ctx);
         // The ref update is the transaction's first statement, so SQLite takes
         // the write lock up front and never has to upgrade a read lock.
         let mut tx = self.pool.begin().await.map_err(storage)?;
@@ -579,20 +587,29 @@ impl MetaStore for SqliteMetaStore {
             tx.rollback().await.map_err(storage)?;
             return Ok(false);
         }
-        sqlx::query(
+        // The land columns only when used: a move without a land id writes
+        // the row a v4 schema expects.
+        let sql = if ctx.land.is_some() {
+            "INSERT INTO ref_log (name, old_target, new_target, time, actor, operation, message, \
+             land_id, land_changeset) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        } else {
             "INSERT INTO ref_log (name, old_target, new_target, time, actor, operation, message) \
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(name)
-        .bind(exp)
-        .bind(new)
-        .bind(unix_now())
-        .bind(ctx.actor.as_deref())
-        .bind(&ctx.operation)
-        .bind(ctx.message.as_deref())
-        .execute(&mut *tx)
-        .await
-        .map_err(storage)?;
+             VALUES (?, ?, ?, ?, ?, ?, ?)"
+        };
+        let mut q = sqlx::query(sql)
+            .bind(name)
+            .bind(exp)
+            .bind(new)
+            .bind(unix_now())
+            .bind(ctx.actor.as_deref())
+            .bind(&ctx.operation)
+            .bind(ctx.message.as_deref());
+        if ctx.land.is_some() {
+            q = q.bind(land_id).bind(land_changeset);
+        }
+        q.execute(&mut *tx)
+            .await
+            .map_err(|e| log_insert_error(name, e))?;
         tx.commit().await.map_err(storage)?;
         Ok(true)
     }
@@ -633,9 +650,14 @@ impl MetaStore for SqliteMetaStore {
         // One statement; rows take increasing `seq` in the order given.
         let time = unix_now();
         let mut old = exp;
-        let mut insert = sqlx::QueryBuilder::new(
-            "INSERT INTO ref_log (name, old_target, new_target, time, actor, operation, message) ",
-        );
+        // The land columns only when used, as in `cas_ref_logged`.
+        let with_land = steps.iter().any(|s| s.ctx.land.is_some());
+        let mut insert = sqlx::QueryBuilder::new(if with_land {
+            "INSERT INTO ref_log (name, old_target, new_target, time, actor, operation, message, \
+             land_id, land_changeset) "
+        } else {
+            "INSERT INTO ref_log (name, old_target, new_target, time, actor, operation, message) "
+        });
         insert.push_values(steps, |mut row, step| {
             let new = step.new.map(|i| i.0 .0.to_vec());
             row.push_bind(name)
@@ -645,10 +667,35 @@ impl MetaStore for SqliteMetaStore {
                 .push_bind(step.ctx.actor.as_deref())
                 .push_bind(step.ctx.operation.as_str())
                 .push_bind(step.ctx.message.as_deref());
+            if with_land {
+                let (land_id, land_changeset) = land_columns(&step.ctx);
+                row.push_bind(land_id).push_bind(land_changeset);
+            }
         });
-        insert.build().execute(&mut *tx).await.map_err(storage)?;
+        insert
+            .build()
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| log_insert_error(name, e))?;
         tx.commit().await.map_err(storage)?;
         Ok(steps.len())
+    }
+
+    async fn find_lands(&self, name: &str, ids: &[LandId]) -> Result<Vec<Option<LandRecord>>> {
+        let mut rows: Vec<LandRow> = Vec::new();
+        for chunk in ids.chunks(BATCH_PARAMS - 1) {
+            let sql = format!(
+                "SELECT land_id, land_changeset, new_target, seq FROM ref_log \
+                 WHERE name = ? AND land_id IN ({}) AND land_id IS NOT NULL",
+                placeholders(chunk.len())
+            );
+            let mut q = sqlx::query_as(&sql).bind(name);
+            for id in chunk {
+                q = q.bind(id.as_bytes());
+            }
+            rows.extend(q.fetch_all(&self.pool).await.map_err(storage)?);
+        }
+        lands_in_order(ids, rows)
     }
 
     async fn ref_log(

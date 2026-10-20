@@ -572,6 +572,127 @@ and 5.3 ms against 1.3, 99 and 63 lands/s at N = 1 against 138). Batches fill on
 their own: lands arriving while a batch replays form the next one. The server
 does not linger.
 
+## Many-agent workload
+
+`leep-swarm` (in `crates/leep-soak`) simulates a team of agents rather than a
+land loop: thousands of async agents, each a cheap task with its own seeded
+choices, against one or more running servers. Each agent repeats a cycle:
+think, sync its working copy (read the ref, list its own files at the head),
+make `--reads` reads drawn from `--read-mix` (log, with a hot path half the
+time; files; blame; search; diff from its last base), think, upload
+`--files` blobs of `--blob-bytes`, create a changeset on a head up to
+`--stale` observed heads behind the newest, and land it. Before every
+operation it thinks for an exponentially distributed time with mean
+`--think-ms` (0 is a burst). A share `--hot-fraction` of the files written
+are one of `--hot-files` shared files, which is where conflicts come from.
+A land answered 409 is sent again after a short pause; one that times out,
+loses its connection or gets a 5xx is resent the way a client would, with
+its land id (ADR 0057) unless `--land-id false`.
+
+Every land writes a unique marker (its message, `swarm <run> a<agent> s<seq>`).
+After the window the generator walks the target ref's whole history and
+reports *double lands* (a marker found more than once) and *lost lands* (a
+land answered `landed` whose marker is absent); with land ids on it exits
+non-zero if either is above zero, and always if a land is lost.
+
+It reports lands per second (answered inside the window), p50 and p99 of
+every operation, conflicts, 409s, resends, the servers' CAS losses, batch
+size and lands answered from a recorded id, lands per server, *stalled
+agents* (sent a land inside the window and had none answered there) and,
+separately, *incomplete cycles* (agents that sent no land inside the window:
+still thinking, reading or building one when it closed). With
+`--database-url` pointing at the Postgres metadata store it also reports:
+
+- **Warmer lag**, sampled every `--lag-every` seconds: the head's generation
+  minus that of the newest head the run has seen (the generator keeps the
+  last 4096) that has a `history-tree-v4` row (path history) or a
+  `log-filter-v1` row. A sample is one ref read, one indexed query per kind
+  and a changeset read per generation not yet known, so it does not load the
+  server. Queries derive what they need, so the lag is the index's, not only
+  the warmer's.
+- **Bytes per land**: the growth of `pg_database_size` over the window, and
+  of the logical bytes (keys and values) of what the write path stores
+  (changesets, ref log, refs and their `root_tree`, `generation`, `skiplist`
+  and `rebased-origin-v1` rows) and of every other derived row (indexes that
+  reads and the warmer build), each divided by the lands answered `landed`.
+  Tree nodes live in the blob store and are not counted.
+
+`--json FILE` writes the same report as JSON.
+
+```sh
+cargo build --release -p leep-server -p leep-soak
+target/release/leep-server --listen 127.0.0.1:7471 --metrics-listen 127.0.0.1:7472 \
+  --meta postgres://localhost/swarm --blobs file:///var/tmp/swarm/blobs --meta-pool-size 32 &
+target/release/leep-swarm --server http://127.0.0.1:7471 --metrics http://127.0.0.1:7472 \
+  --database-url postgres://localhost/swarm \
+  --agents 2000 --think-ms 2000 --duration 60 --ramp 20 \
+  --read-mix log=3,files=3,blame=1,search=1,diff=2 --reads 4 --files 2 \
+  --hot-files 8 --hot-fraction 0.02 --stale 4
+```
+
+Several `--server` URLs (with their `--metrics`) share the agents round
+robin, as in `leep-land-bench`. The target ref is created with a 200-file
+tree and the hot files when absent.
+
+**Smoke test, not a baseline.** These numbers show the generator works and
+what it reports; they are not a performance baseline. They come from a
+shared 4-vCPU Xeon (2.8 GHz, 15 GB) on which other agents were building and
+testing: the load average was 12 before the runs and 13 to 21 during them,
+and the generator itself (thousands of tasks) shared the same four cores.
+Each configuration ran once, so differences under well over 20% mean
+nothing. The real baseline will be run on the Linux store on an idle host,
+three runs or more per configuration.
+
+Setup: one server, Postgres 16 on the same machine, blobs on ext4, release
+build of this branch, a fresh database and blob directory per run, server
+defaults (warmer every 30 s with search warming, 256 MiB blob cache) and
+`--meta-pool-size 32`. Generator defaults (`--reads 4`, the mix above,
+`--files 2` of 512 bytes, 8 hot files at 2%, `--stale 4`, 30 s request
+timeout), 2 s think time and land ids on, except where named.
+
+| Run | Lands | Lands/s | Land p50 / p99 ms | Conflicts | Resends | Batch mean | Stalled agents | Incomplete cycles | Double / lost lands | Lag path history p50 / max | Lag log filter p50 / max | DB bytes / write bytes / index bytes per land |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 500 agents, 60 s | 1420 | 23.7 | 342 / 1634 | 0 | 0 | 4.6 | 0 of 500 | 0 | 0 / 0 | 217 / 308 | 733 / 1167 | 8,166 / 1,815 / 2,822 |
+| 2000 agents, 60 s | 1313 | 21.9 | 10883 / 49927 | 48 | 381 | 64.0 | 284 of 2000 | 574 | 0 / 0 | 890 / 1448 | 1020 / 1578 | 5,143 / 1,639 / 1,121 |
+| 2000 agents, no search reads | 853 | 14.2 | 29305 / 89206 | 90 | 2164 | 53.8 | 1128 of 2000 | 0 | 0 / 0 | 434 / 617 | 845 / 1280 | 5,048 / 1,598 / 1,470 |
+| 256 agents, no think time, 30 s | 1107 | 36.9 | 249 / 1223 | 18 | 0 | 6.0 | 0 of 256 | 0 | 0 / 0 | 272 / 318 | 555 / 1127 | 7,877 / 1,790 / 2,304 |
+| same, land ids off | 832 | 27.7 | 412 / 1385 | 16 | 0 | 7.0 | 0 of 256 | 0 | 0 / 0 | 253 / 281 | 430 / 801 | 7,900 / 1,707 / 2,250 |
+
+Reads, p50 / p99 ms:
+
+| Run | sync | log | files | blame | search | diff | upload | create |
+|---|---|---|---|---|---|---|---|---|
+| 500 agents | 45 / 310 | 191 / 17492 | 24 / 283 | 657 / 17862 | 9259 / 16428 | 46 / 435 | 28 / 324 | 73 / 351 |
+| 2000 agents | 300 / 750 | 909 / 1682 | 153 / 534 | timeouts | timeouts | 310 / 731 | 160 / 365 | 472 / 852 |
+| 2000, no search | 97 / 1024 | 312 / 28794 | 30 / 535 | 8406 / 29377 | – | 71 / 1040 | 22 / 169 | 51 / 372 |
+| 256 burst | 26 / 138 | 115 / 8543 | 13 / 61 | 7313 / 8745 | 2321 / 6020 | 23 / 105 | 21 / 92 | 49 / 175 |
+
+What it suggests, to be checked on the real baseline:
+
+- **Search reads are the most expensive operation.** The head moves several
+  times a second, so most searches land on a head whose trigram index is not
+  warm and derive it (p50 9 s at 500 agents here). At 2000 agents 1,063
+  searches, 1,165 logs and 799 blames timed out at 30 s.
+- **Land throughput falls as agents rise** while batches fill to the 64
+  limit: every land of a full batch replays onto a head up to 64 lands
+  newer, on a stale base, and the batch competes with the reads for the
+  same cores. Without search reads more agents land at once and lands wait
+  longest: 2,164 timed out at the client's 30 s and were resent under their
+  land id. None landed twice; a resent land whose first request was
+  cancelled had been dropped from its batch.
+- **The indexes fall behind under load.** The warmer runs every 30 s; with
+  thousands of agents the path-history index trails the head by hundreds of
+  generations and the log-filter index by about a thousand, so path logs
+  and blames derive on the request path (the multi-second p99s).
+- **Double lands were zero in every run**, with and without land ids. No
+  run lost an answer after its commit, so this does not exercise the window
+  ADR 0057 closes; the crash and fault tests do.
+- **Bytes per land.** About 1.6 to 1.8 KB of logical data per land comes
+  from the write path (changeset rows, ref log entry, root tree, generation,
+  skiplist and rebase rows) and 1.1 to 2.8 KB from indexes built by reads
+  and the warmer; `pg_database_size` grew 5 to 8 KB per land, the rest
+  being Postgres's own index and page overhead.
+
 ## Real history: git/git
 
 The benchmarks above use synthetic, mostly linear histories. `git/git` is real

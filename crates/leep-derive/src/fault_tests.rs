@@ -14,7 +14,8 @@ use bytes::Bytes;
 use leep_core::api::LandResponse;
 use leep_core::memory::{MemoryBlobStore, MemoryMetaStore};
 use leep_core::{
-    BlobStore, Changeset, ChangesetId, Error, FileChange, FileKind, MetaStore, RepoPath, Result,
+    BlobStore, Changeset, ChangesetId, Error, FileChange, FileKind, LandId, MetaStore, RepoPath,
+    Result,
 };
 use leep_testkit::{is_injected, Fault, FaultPlan, FaultyBlobStore, FaultyMetaStore, Op, Rng};
 
@@ -219,11 +220,17 @@ async fn run_agent(seed: u64, repo: Repo, n: usize, steps: usize, per_try: Durat
         files.push((path, body));
     }
     let top = parent.expect("at least one step");
+    // Half the agents name their land (ADR 0057), the rest rely on the
+    // landed-copy scan.
+    let land_id = n
+        .is_multiple_of(2)
+        .then(|| LandId::from_bytes(&[n as u8 + 1; 16]).unwrap());
     let mut reported = Vec::new();
     for _ in 0..1000 {
         // A client that gives up after `per_try` and asks again, which also
         // cancels the request wherever it happens to be.
-        match tokio::time::timeout(per_try, repo.land(top, "main")).await {
+        let land = repo.land_keyed(top, "main", None, true, land_id.clone());
+        match tokio::time::timeout(per_try, land).await {
             Ok(Ok(LandResponse::Landed { landed, .. })) => {
                 reported.push(landed);
                 break;
@@ -388,6 +395,167 @@ async fn ambiguous_cas_is_resolved_not_replayed() {
     }
 }
 
+/// Move `main` up by `n` changesets of other servers' lands, each on the
+/// last, so a retry's rebased copy ends up `n` changesets below the head.
+async fn land_others(w: &World, n: usize) {
+    let mut head = w.meta.get_ref("main").await.unwrap();
+    for i in 0..n {
+        let next = commit_file(0, &w.clean, head, &format!("others/{i}"), "o\n", "other").await;
+        let r = w.clean.land_as(next, "main", Some("other")).await.unwrap();
+        assert!(matches!(r, LandResponse::Landed { rebased: false, .. }));
+        head = Some(next);
+    }
+}
+
+/// A land whose commit applied but whose answer never reached the client
+/// (cancelled after the commit), retried under its land id after more lands
+/// than the landed-copy scan reads (ADR 0057): the retry answers with the
+/// original result and moves nothing. The same retry without the id lands
+/// a second copy, which is the window the id closes.
+#[tokio::test(start_paused = true)]
+async fn a_late_retry_with_a_land_id_returns_the_original_result() {
+    let w = World::new(3);
+    let clean = &w.clean;
+    let base = commit_file(3, clean, None, "base.txt", "base\n", "base").await;
+    w.meta.cas_ref("main", None, Some(base)).await.unwrap();
+    let feature = commit_file(3, clean, Some(base), "f.txt", "f\n", "feature").await;
+    let other = commit_file(3, clean, Some(base), "o.txt", "o\n", "other").await;
+    w.meta
+        .cas_ref("main", Some(base), Some(other))
+        .await
+        .unwrap();
+    let id = LandId::from_bytes(&[42; 16]).unwrap();
+
+    w.plan
+        .script(Op::CasRef, 1, Fault::Stall(Duration::from_secs(3600)));
+    let server = w.server();
+    let land = server.land_keyed(feature, "main", None, true, Some(id.clone()));
+    assert!(
+        tokio::time::timeout(Duration::from_secs(30), land)
+            .await
+            .is_err(),
+        "the client never heard back"
+    );
+    let copy = w.meta.get_ref("main").await.unwrap().unwrap();
+    assert_ne!(copy, other, "the commit applied before the cancel");
+
+    land_others(&w, 1100).await;
+    let head = w.meta.get_ref("main").await.unwrap();
+    let entries = w
+        .meta
+        .ref_log(Some("main"), None, usize::MAX)
+        .await
+        .unwrap()
+        .len();
+    let again = w
+        .server()
+        .land_keyed(feature, "main", None, true, Some(id.clone()))
+        .await
+        .unwrap();
+    assert_eq!(
+        again,
+        LandResponse::Landed {
+            landed: copy,
+            rebased: true,
+            attempts: 1
+        }
+    );
+    assert_eq!(w.meta.get_ref("main").await.unwrap(), head, "nothing moved");
+    assert_eq!(
+        w.meta
+            .ref_log(Some("main"), None, usize::MAX)
+            .await
+            .unwrap()
+            .len(),
+        entries
+    );
+
+    // The id names one changeset.
+    let stranger = commit_file(3, clean, Some(base), "s.txt", "s\n", "stranger").await;
+    assert!(matches!(
+        w.server()
+            .land_keyed(stranger, "main", None, true, Some(id))
+            .await,
+        Err(Error::Invalid(_))
+    ));
+    assert_eq!(w.meta.get_ref("main").await.unwrap(), head);
+
+    // Without the id the copy is out of the scan's reach: a second copy.
+    match w.server().land(feature, "main").await.unwrap() {
+        LandResponse::Landed { landed, .. } => assert_ne!(landed, copy),
+        other => panic!("{other:?}"),
+    }
+    assert_ref_log_replays(3, &*w.meta).await;
+}
+
+/// The same land sent twice at once through two paths, as a client does
+/// when it gives up on one server while that server's leader is still
+/// landing it and sends it to another: one copy lands, and both requests
+/// are answered with it.
+#[tokio::test(start_paused = true)]
+async fn a_land_sent_twice_through_two_servers_lands_once() {
+    for delayed in [1, 2] {
+        let w = World::new(4);
+        let clean = &w.clean;
+        let base = commit_file(4, clean, None, "base.txt", "base\n", "base").await;
+        w.meta.cas_ref("main", None, Some(base)).await.unwrap();
+        let feature = commit_file(4, clean, Some(base), "f.txt", "f\n", "feature").await;
+        let other = commit_file(4, clean, Some(base), "o.txt", "o\n", "other").await;
+        w.meta
+            .cas_ref("main", Some(base), Some(other))
+            .await
+            .unwrap();
+        let id = LandId::from_bytes(&[7; 16]).unwrap();
+        let calls = w.plan.calls(Op::CasRef);
+        // Hold one path's commit until the other has landed.
+        w.plan.script(
+            Op::CasRef,
+            calls + delayed,
+            Fault::Delay(Duration::from_secs(120)),
+        );
+
+        let (leader, follower) = (w.server(), w.server());
+        let first = {
+            let id = id.clone();
+            tokio::spawn(async move {
+                leader
+                    .land_keyed(feature, "main", None, true, Some(id))
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        // Given up on the first path: the same land, elsewhere.
+        let second = follower
+            .land_keyed(feature, "main", None, true, Some(id))
+            .await
+            .unwrap();
+        let first = first.await.unwrap().unwrap();
+        let landed = |r: &LandResponse| match r {
+            LandResponse::Landed { landed, .. } => *landed,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            landed(&first),
+            landed(&second),
+            "both answered with one copy"
+        );
+        let head = w.meta.get_ref("main").await.unwrap().unwrap();
+        assert_eq!(head, landed(&first));
+        let ids = assert_ref_sound(4, clean, "main").await;
+        assert_eq!(ids.len(), 3, "base, other, one copy of feature");
+        let lands: Vec<_> = w
+            .meta
+            .ref_log(Some("main"), None, 100)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.operation == "land")
+            .collect();
+        assert_eq!(lands.len(), 1, "one move for the land");
+        assert_ref_log_replays(4, &*w.meta).await;
+    }
+}
+
 /// The request is cancelled after the commit applied (a timeout that fires
 /// during the response), and the client lands the same changeset again.
 #[tokio::test(start_paused = true)]
@@ -506,6 +674,14 @@ impl MetaStore for Tamper {
     ) -> Result<bool> {
         self.inner.cas_ref_logged(name, expected, new, ctx).await
     }
+    async fn find_lands(
+        &self,
+        name: &str,
+        ids: &[leep_core::LandId],
+    ) -> Result<Vec<Option<leep_core::LandRecord>>> {
+        self.inner.find_lands(name, ids).await
+    }
+
     async fn ref_log(
         &self,
         name: Option<&str>,

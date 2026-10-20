@@ -593,6 +593,7 @@ fn full_schema() -> BTreeSet<String> {
         "derived",
         "ref_log",
         "ref_log_name",
+        "ref_log_land_id",
     ]
     .map(String::from)
     .into()
@@ -965,6 +966,106 @@ async fn upgrade_from_v3_adds_store_features() {
             db.cleanup().await;
         }
     }
+}
+
+/// A database at v4, with a ref log written by v4 servers (no land ids),
+/// upgrades to land ids (ADR 0057): its entries read back unchanged, find no
+/// land, and new moves record and refuse land ids as the contract says.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn upgrade_from_v4_adds_land_ids() {
+    use leep_core::{LandId, LandKey};
+    for db in dbs("fromv4").await {
+        let kind = db.kind();
+        let d = data();
+        drop(
+            db.open(&db.compiled()[..4], SchemaMode::Migrate)
+                .await
+                .unwrap(),
+        );
+        load(&db, &STAGES[1], &d).await;
+        let plan = db.report(db.compiled()).await;
+        assert_eq!(plan.from, 4, "{kind}");
+        assert_eq!(
+            plan.pending.iter().map(|m| m.name).collect::<Vec<_>>(),
+            ["land_ids"],
+            "{kind}"
+        );
+        let s = db.open(db.compiled(), SchemaMode::Migrate).await.unwrap();
+        let id = LandId::from_bytes(&[3; 16]).unwrap();
+        assert_eq!(
+            s.find_lands("trunk", std::slice::from_ref(&id))
+                .await
+                .unwrap(),
+            [None],
+            "{kind}"
+        );
+        verify(&*s, &STAGES[1], &d, LATEST as u64).await;
+        assert_eq!(db.objects().await, full_schema(), "{kind}");
+        // A keyed move on the upgraded store: recorded with its entry.
+        let (head, next) = (
+            s.get_ref("trunk").await.unwrap().unwrap(),
+            d.changesets[3].id(),
+        );
+        let ctx = RefUpdateContext::new("land").land(Some(LandKey {
+            id: id.clone(),
+            changeset: next,
+        }));
+        assert!(s
+            .cas_ref_logged("trunk", Some(head), Some(next), &ctx)
+            .await
+            .unwrap());
+        let found = s.find_lands("trunk", &[id]).await.unwrap();
+        assert_eq!(found[0].unwrap().landed, next, "{kind}");
+        drop(s);
+        db.cleanup().await;
+    }
+}
+
+/// On Postgres the land id columns and index may be built by hand before
+/// migration 0005, the index CONCURRENTLY so ref moves are not blocked
+/// (OPERATIONS.md, "Upgrading"); the migration then finds them and succeeds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn land_id_index_built_by_hand_before_migration_5() {
+    use leep_core::{LandId, LandKey};
+    let Some(db) = Db::pg("v4hand").await else {
+        return;
+    };
+    let d = data();
+    drop(
+        db.open(&db.compiled()[..4], SchemaMode::Migrate)
+            .await
+            .unwrap(),
+    );
+    load(&db, &STAGES[1], &d).await;
+    db.exec_raw(&[
+        "ALTER TABLE ref_log ADD COLUMN IF NOT EXISTS land_id BYTEA",
+        "ALTER TABLE ref_log ADD COLUMN IF NOT EXISTS land_changeset BYTEA",
+        "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS ref_log_land_id \
+         ON ref_log (name, land_id) WHERE land_id IS NOT NULL",
+    ])
+    .await;
+    let s = db.open(db.compiled(), SchemaMode::Migrate).await.unwrap();
+    verify(&*s, &STAGES[1], &d, LATEST as u64).await;
+    assert_eq!(db.objects().await, full_schema());
+    let id = LandId::from_bytes(&[5; 16]).unwrap();
+    let head = s.get_ref("trunk").await.unwrap().unwrap();
+    let next = d.changesets[3].id();
+    let ctx = RefUpdateContext::new("land").land(Some(LandKey {
+        id: id.clone(),
+        changeset: next,
+    }));
+    assert!(s
+        .cas_ref_logged("trunk", Some(head), Some(next), &ctx)
+        .await
+        .unwrap());
+    assert_eq!(
+        s.find_lands("trunk", &[id]).await.unwrap()[0]
+            .unwrap()
+            .landed,
+        next
+    );
+    drop(s);
+    db.cleanup().await;
 }
 
 /// The multi-step path: an un-versioned database adopts v1 and then runs the
