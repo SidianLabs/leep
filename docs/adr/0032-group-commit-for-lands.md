@@ -70,7 +70,15 @@ committed its own CAS transaction.
 - **Shared reads.** The landed-copy scans of one batch attempt share the
   `rebased-origin-v1` rows they read, and the scan takes parents from the
   process-wide ancestry cache. The rows are per batch so a land never relies
-  on a read older than its batch.
+  on a read older than its batch. *Amended 2026-10-20:* a redone attempt
+  keeps the rows earlier attempts of the same batch read from the store, and
+  reads only those of the head's new ancestors. A stored changeset's row is
+  written with it (or, on a backend without an atomic call, before the swap
+  that makes it reachable) and never changes. Rows and changesets an attempt
+  staged itself are dropped when it ends: its swap lost or its write failed,
+  so they may never have been stored. Losing attempts against another server
+  spent most of their time re-reading these rows (`docs/PERFORMANCE.md`,
+  "Several servers on one ref").
 - **No linger.** The leader takes whatever is queued when it looks. Measured
   waits of 0.5 and 2 ms did not raise throughput beyond the noise and added
   their full length to a lone land.
