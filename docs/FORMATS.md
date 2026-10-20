@@ -429,6 +429,8 @@ a blank line and `This reverts <id>.`.
 changesets(id BYTEA PRIMARY KEY, data BYTEA NOT NULL)          -- data = Changeset::encode(), or a zstd frame of it (ADR 0053)
 changeset_dicts(id BIGINT PRIMARY KEY,                         -- SQLite: INTEGER; migration 0003
                 created_at BIGINT NOT NULL, data BYTEA NOT NULL) -- a zstd dictionary whose header id = id
+store_features(name TEXT PRIMARY KEY,                          -- migration 0004
+               added_at BIGINT NOT NULL)                       -- SQLite: INTEGER; unix seconds
 refs(name TEXT PRIMARY KEY, target BYTEA NOT NULL)
 derived(kind TEXT, key BYTEA, value BYTEA, PRIMARY KEY(kind, key))
 ref_log(seq BIGSERIAL PRIMARY KEY,                             -- SQLite: INTEGER PRIMARY KEY AUTOINCREMENT
@@ -457,6 +459,10 @@ Migration 0003 (`changeset_dicts`, ADR 0053) adds the dictionaries table,
 empty. Nothing else changes, and a server keeps writing plain changeset rows
 until the table has a row; see "Changeset rows" below.
 
+Migration 0004 (`store_features`, ADR 0055) adds the table of format
+features, and inserts `changeset-zstd-dict` if `changeset_dicts` has a row;
+see "Format features" below.
+
 ### Changeset rows (ADR 0053)
 
 `changesets.data` is one of:
@@ -466,7 +472,9 @@ until the table has a row; see "Changeset rows" below.
   empty, a changeset whose frame would not be smaller, or one over 256 MiB.
 - **Compressed**: one zstd frame (magic `28 b5 2f fd`) whose content is
   exactly the canonical bytes. The frame header records the content size
-  (required; at most 256 MiB) and the dictionary id: a `changeset_dicts.id`,
+  (required; at most 256 MiB, which bounds the decoded size; readers never
+  reserve more than 1 MiB on the header's word and decode larger frames as
+  a stream with a window of at most 8 MiB) and the dictionary id: a `changeset_dicts.id`,
   or 0 (absent) for a frame made without a dictionary. No checksum: the id
   check covers it. Written at level 9; the level is not part of the format.
 
@@ -485,6 +493,20 @@ equal the row's `id` (ids start at 1). Rows are added by `leep-server
 compact-changesets` and never changed or deleted. Rows in different stores
 of the same history are different bytes; only the decoded changesets and
 their ids compare.
+
+### Format features (ADR 0055)
+
+A `store_features` row names something the store's rows use that a reader
+must understand. Every binary that has the table reads it when it opens the
+store and refuses to start if a name is unknown to it. A tool records a
+feature before it writes the first row that needs it, and nothing removes
+one. Names so far:
+
+| Name | Meaning | Recorded by |
+|---|---|---|
+| `changeset-zstd-dict` | `changesets.data` may be a zstd frame made with a `changeset_dicts` dictionary (ADR 0053) | `compact-changesets`, before it stores or uses a dictionary; migration 0004 for a store that already has one |
+
+Binaries from before migration 0004 do not read the table.
 
 ### Schema versioning (ADR 0023)
 
@@ -717,6 +739,14 @@ small one runs the key-order batch from a cursor (`key > $after`). The cursor
 passed between steps is in memory only and never stored. No table, index,
 encoding or `/v1` shape changed.
 
+`MetaStore::estimate_derived` returns a `RowCount { rows, exact }` for
+`upgrade-index`'s plan. The default is `count_derived`. Postgres counts up
+to 100,000 rows (`SELECT count(*) FROM (SELECT 1 FROM derived WHERE kind = $1
+LIMIT 100000)`), and past that multiplies `pg_class.reltuples` of `derived`
+by the kind's frequency among `pg_stats.most_common_vals` of `kind`. If the
+kind is missing from the statistics it counts. `rows` is 0 only when there
+are none. Nothing is stored.
+
 ## Batched reads (new `MetaStore` methods, no format change)
 
 ADR 0030 adds `MetaStore::get_changesets` and `get_derived_many`. They read the
@@ -814,7 +844,8 @@ written before ADR 0039 hold no packs; both read and restore the same way.
 
 `meta.db` is a SQLite database with the schema of `schema_migrations` (ADR
 0023) at the version in the manifest, whatever backend the metadata came from:
-tables `changesets`, `changeset_dicts` (from schema 3), `refs`, `derived`,
+tables `changesets`, `changeset_dicts` (from schema 3), `store_features`
+(from schema 4), `refs`, `derived`,
 `ref_log` hold the rows of one read transaction, byte for byte, including
 every `derived` kind (signatures, reviews and GC rows too) and compressed
 changeset rows with the dictionaries they need. It is a single file (journal mode `DELETE`, no `-wal`).

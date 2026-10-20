@@ -13,8 +13,8 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use clap::Args;
 use leep_derive::integrity::{
-    self, plan_upgrade, run_upgrade, CurrentKind, DropReport, IndexStatus, UpgradeOptions,
-    UpgradePlan, UpgradeReport,
+    self, plan_upgrade_with, run_upgrade, CurrentKind, DropReport, IndexStatus, PlanOptions,
+    UpgradeOptions, UpgradePlan, UpgradeReport,
 };
 use leep_meta::space::{Backend, StorageFacts};
 use serde::Serialize;
@@ -56,6 +56,11 @@ pub struct UpgradeIndexArgs {
     /// Start even when the free disk space looks smaller than the estimate.
     #[arg(long)]
     skip_space_check: bool,
+    /// Count every index's rows. By default Postgres estimates kinds of
+    /// more than 100,000 rows from its statistics (shown with `~`), and
+    /// counts only where a decision depends on it.
+    #[arg(long)]
+    exact_counts: bool,
     #[arg(long)]
     json: bool,
 }
@@ -214,6 +219,15 @@ fn span(secs: (f64, f64)) -> String {
     }
 }
 
+/// `n`, marked `~` when it is an estimate.
+fn approx(n: u64, estimated: bool) -> String {
+    if estimated {
+        format!("~{n}")
+    } else {
+        n.to_string()
+    }
+}
+
 fn status_word(k: &CurrentKind) -> &'static str {
     match k.status {
         IndexStatus::Complete => "complete",
@@ -286,8 +300,11 @@ fn print_plan(
         println!(
             "  {:<20} {:>12} {:>12}  {}{size}",
             k.kind,
-            k.rows,
-            k.missing,
+            approx(k.rows, k.rows_estimated),
+            approx(
+                k.missing,
+                k.rows_estimated && k.status != IndexStatus::Complete
+            ),
             status_word(k)
         );
     }
@@ -299,7 +316,7 @@ fn print_plan(
             println!(
                 "  {:<20} {} rows ({}), {}",
                 r.kind,
-                r.total_rows(),
+                approx(r.total_rows(), r.rows_estimated),
                 parts.join(", "),
                 r.value_bytes.map_or("size unknown".into(), |b| format!(
                     "about {} of values",
@@ -307,6 +324,15 @@ fn print_plan(
                 ))
             );
         }
+    }
+    if plan.current.iter().any(|k| k.rows_estimated)
+        || plan.retired.iter().any(|r| r.rows_estimated)
+    {
+        println!();
+        println!(
+            "~ estimated from the database's statistics; --exact-counts counts them (slow on \
+             large stores)"
+        );
     }
     println!();
     let mut storage = Vec::new();
@@ -503,7 +529,10 @@ async fn inner(meta: &str, blobs: &str, args: UpgradeIndexArgs) -> anyhow::Resul
         .map_or_else(leep_derive::default_derive_jobs, |j| j as usize);
     let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
     let repo = open(meta, blobs).await?;
-    let plan = plan_upgrade(&repo, &Stderr)
+    let opts = PlanOptions {
+        exact_counts: args.exact_counts,
+    };
+    let plan = plan_upgrade_with(&repo, opts, &Stderr)
         .await
         .context("planning the upgrade")?;
     let facts = match leep_meta::space::storage_facts(meta).await {
@@ -608,6 +637,12 @@ mod tests {
                    /dev/vda         263174212  37748736   3355443      92% /\n";
         assert_eq!(parse_df(out), Some(3_355_443 * 1024));
         assert_eq!(parse_df("nonsense"), None);
+    }
+
+    #[test]
+    fn estimates_are_marked() {
+        assert_eq!(approx(1_484_762, true), "~1484762");
+        assert_eq!(approx(0, false), "0");
     }
 
     #[test]

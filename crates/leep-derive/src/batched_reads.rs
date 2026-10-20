@@ -289,6 +289,10 @@ impl MetaStore for BatchedMeta {
         self.inner.count_derived(kind).await
     }
 
+    async fn estimate_derived(&self, kind: &str) -> Result<leep_core::RowCount> {
+        self.inner.estimate_derived(kind).await
+    }
+
     async fn delete_derived_step(
         &self,
         kinds: &[&str],

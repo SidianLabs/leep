@@ -105,7 +105,9 @@ Migration 0003 only creates an empty table, and a server writes plain rows
 until a dictionary exists, so it tolerates old servers: a rolling upgrade
 proceeds as usual (ADR 0023). Old servers cannot read compressed rows, so
 **`compact-changesets` must not run until every server is on this version
-or later**; it is a separate, deliberate step, not part of `migrate`. After
+or later**; it is a separate, deliberate step, not part of `migrate`.
+(ADR 0055 adds a `store_features` row that servers from then on check, so
+the next such change is refused at startup by servers that cannot read it.) After
 it, Postgres keeps the old row versions as free space; `VACUUM FULL
 changesets` (or `pg_repack`) returns it to the filesystem, and SQLite's
 `VACUUM` does the same. Downgrading after a compaction means restoring a

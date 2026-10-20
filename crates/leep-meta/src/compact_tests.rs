@@ -123,9 +123,15 @@ async fn check_compaction<S: Rows + MetaStore>(a: &S, b: &S, c: &S) {
     );
     assert_eq!(a.max_dict().await.unwrap(), 0);
     assert_eq!(raw(a).await, plain);
+    assert!(a.features().await.unwrap().is_empty());
 
     let r = compact(a, CompactOptions::default()).await;
     assert_eq!((r.dictionary, r.trained), (1, true));
+    // Recorded, so servers that cannot read the rows refuse the store.
+    assert_eq!(
+        a.features().await.unwrap(),
+        [crate::features::CHANGESET_ZSTD_DICT]
+    );
     assert_eq!(r.rewritten, all.len() as u64);
     assert_eq!(r.bytes_before, dry.bytes_before);
     assert_eq!(r.bytes_after, dry.bytes_after);
@@ -228,6 +234,7 @@ async fn check_small_store_is_left_alone<S: Rows + MetaStore>(s: &S) {
     assert_eq!(r, CompactReport::default());
     assert_eq!(raw(s).await, before);
     assert_eq!(s.max_dict().await.unwrap(), 0);
+    assert!(s.features().await.unwrap().is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

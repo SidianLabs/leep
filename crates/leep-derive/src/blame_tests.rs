@@ -329,6 +329,84 @@ async fn stretches_agree_with_a_full_walk() {
     }
 }
 
+/// A file deleted and created again between two stretch cuts: the walk
+/// ends at the re-creation, and the stretches below, whose tops are before
+/// the file first existed, end at once (`absent`) or meet only the old
+/// file's history, which must not reach the answer. Every cut placement
+/// from one-generation stretches up agrees with the reference walk, and no
+/// line is blamed on a changeset before the re-creation.
+#[tokio::test]
+async fn a_file_recreated_between_cuts_agrees_with_a_full_walk() {
+    for same_text in [false, true] {
+        let r = Repo::new(
+            Arc::new(MemoryBlobStore::new()),
+            Arc::new(MemoryMetaStore::new()),
+        );
+        let mut tip = commit(&r, &[], &[("other", Some("0\n"))]).await;
+        let mut ids = vec![tip];
+        let step = |r: Repo, tip: ChangesetId, files: Vec<(String, Option<String>)>| async move {
+            let files: Vec<(&str, Option<&str>)> = files
+                .iter()
+                .map(|(p, t)| (p.as_str(), t.as_deref()))
+                .collect();
+            commit(&r, &[tip], &files).await
+        };
+        let other = |i: usize| vec![("other".to_string(), Some(format!("{i}\n")))];
+        let f = |t: &str| vec![("f".to_string(), Some(t.to_string()))];
+        for i in 1..10 {
+            tip = step(r.clone(), tip, other(i)).await;
+            ids.push(tip);
+        }
+        let old = "a\nb\nc\n";
+        tip = step(r.clone(), tip, f(old)).await;
+        ids.push(tip);
+        tip = step(r.clone(), tip, f("a\nb\nc\nd\n")).await;
+        ids.push(tip);
+        for i in 12..17 {
+            tip = step(r.clone(), tip, other(i)).await;
+            ids.push(tip);
+        }
+        tip = step(r.clone(), tip, vec![("f".to_string(), None)]).await;
+        ids.push(tip);
+        for i in 18..21 {
+            tip = step(r.clone(), tip, other(i)).await;
+            ids.push(tip);
+        }
+        let again = if same_text {
+            "a\nb\nc\nd\n"
+        } else {
+            "a\nx\nc\n"
+        };
+        tip = step(r.clone(), tip, f(again)).await;
+        let recreated = ids.len();
+        ids.push(tip);
+        tip = step(r.clone(), tip, f(&format!("{again}e\n"))).await;
+        ids.push(tip);
+        for i in 23..40 {
+            tip = step(r.clone(), tip, other(i)).await;
+            ids.push(tip);
+        }
+        let mut compared = 0;
+        for at in [tip, ids[recreated + 1], ids[recreated]] {
+            for span in [1, 2, 3, 4, 5, 7, 9, 13] {
+                assert!(agree(&r, at, "f", span, false).await);
+                compared += 1;
+            }
+            let (b, _) = r.blame_walk(at, &rp("f"), false, false).await.unwrap();
+            let before: Vec<ChangesetId> = ids[..recreated].to_vec();
+            assert!(
+                b.1.iter().all(|l| !before.contains(&l.changeset)),
+                "same text {same_text}: blamed before the re-creation"
+            );
+        }
+        // While it is deleted, there is nothing to blame either way.
+        for span in [1, 3] {
+            assert!(!agree(&r, ids[recreated - 1], "f", span, false).await);
+        }
+        assert_eq!(compared, 24);
+    }
+}
+
 /// The first blame of a file changed on most of a long history walks the
 /// stretches at once and gathers their reads: it makes fewer reads than
 /// there are changes, and with every read delayed it takes a fraction of

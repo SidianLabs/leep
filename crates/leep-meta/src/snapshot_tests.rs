@@ -290,7 +290,7 @@ async fn schema_version_rules_follow_adr_0023() {
     // From an un-versioned database (before ADR 0023): adopted, then restored.
     let older = edit(
         "older.db",
-        "DROP TABLE schema_migrations; DROP TABLE changeset_dicts",
+        "DROP TABLE schema_migrations; DROP TABLE changeset_dicts; DROP TABLE store_features",
     )
     .await;
     let dest_url = sqlite_url(dir.path(), "d2.db");
@@ -308,7 +308,8 @@ async fn schema_version_rules_follow_adr_0023() {
     // SQLite) and 3: migrated on the scratch copy, then restored.
     let v1 = edit(
         "v1.db",
-        "DROP TABLE changeset_dicts; DELETE FROM schema_migrations WHERE version > 1",
+        "DROP TABLE changeset_dicts; DROP TABLE store_features; \
+         DELETE FROM schema_migrations WHERE version > 1",
     )
     .await;
     assert_eq!(snapshot_schema_version(&v1).await.unwrap(), 1);
@@ -327,7 +328,8 @@ async fn schema_version_rules_follow_adr_0023() {
     // the scratch copy, empty, and the plain rows restore as they were.
     let v2 = edit(
         "v2.db",
-        "DROP TABLE changeset_dicts; DELETE FROM schema_migrations WHERE version > 2",
+        "DROP TABLE changeset_dicts; DROP TABLE store_features; \
+         DELETE FROM schema_migrations WHERE version > 2",
     )
     .await;
     assert_eq!(snapshot_schema_version(&v2).await.unwrap(), 2);
@@ -341,6 +343,26 @@ async fn schema_version_rules_follow_adr_0023() {
         Some(latest_schema_version())
     );
     assert_eq!(dump(&*src).await, dump(&*d5).await);
+
+    // From v3, before `store_features` (ADR 0055): created on the scratch
+    // copy; the source had no dictionary, so it names no feature.
+    let v3 = edit(
+        "v3.db",
+        "DROP TABLE store_features; DELETE FROM schema_migrations WHERE version > 3",
+    )
+    .await;
+    assert_eq!(snapshot_schema_version(&v3).await.unwrap(), 3);
+    let dest_url = sqlite_url(dir.path(), "d6.db");
+    import_snapshot(&v3, &dest_url, false, SchemaMode::Migrate)
+        .await
+        .unwrap();
+    let d6 = open_meta_store(&dest_url).await.unwrap();
+    assert_eq!(
+        d6.schema_version().await.unwrap(),
+        Some(latest_schema_version())
+    );
+    assert_eq!(dump(&*src).await, dump(&*d6).await);
+    assert!(stored_features(&dest_url).await.is_empty());
 
     // Not a snapshot at all.
     let junk = dir.path().join("junk.db");
@@ -358,6 +380,18 @@ async fn schema_version_rules_follow_adr_0023() {
 /// Every changeset row's stored bytes, in id order.
 async fn stored_rows(url: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
     let q = "SELECT id, data FROM changesets ORDER BY id";
+    if url.starts_with("sqlite:") {
+        let mut c = sqlx::SqliteConnection::connect(url).await.unwrap();
+        sqlx::query_as(q).fetch_all(&mut c).await.unwrap()
+    } else {
+        let mut c = sqlx::PgConnection::connect(url).await.unwrap();
+        sqlx::query_as(q).fetch_all(&mut c).await.unwrap()
+    }
+}
+
+/// The `store_features` rows (ADR 0055), by name.
+async fn stored_features(url: &str) -> Vec<(String, i64)> {
+    let q = "SELECT name, added_at FROM store_features ORDER BY name";
     if url.starts_with("sqlite:") {
         let mut c = sqlx::SqliteConnection::connect(url).await.unwrap();
         sqlx::query_as(q).fetch_all(&mut c).await.unwrap()
@@ -401,12 +435,19 @@ async fn compressed_changesets_and_their_dictionary_round_trip() {
     assert_eq!(info.changesets, 26 + history.len() as u64);
     let rows = stored_rows(&src_url).await;
     assert_eq!(stored_rows(&sqlite_file_url(&snap, false)).await, rows);
+    let features = stored_features(&src_url).await;
+    assert_eq!(features.len(), 1);
+    assert_eq!(
+        stored_features(&sqlite_file_url(&snap, false)).await,
+        features
+    );
 
     let dest_url = sqlite_url(dir.path(), "restored.db");
     import_snapshot(&snap, &dest_url, false, SchemaMode::Migrate)
         .await
         .unwrap();
     assert_eq!(stored_rows(&dest_url).await, rows);
+    assert_eq!(stored_features(&dest_url).await, features);
     let dest = open_meta_store(&dest_url).await.unwrap();
     assert_eq!(dump(&*src).await, dump(&*dest).await);
     for c in &history {
@@ -492,6 +533,9 @@ async fn postgres_to_sqlite_to_postgres() {
             .unwrap();
     assert_eq!(tuples, 26.0 + history.len() as f32);
     assert_eq!(stored_rows(&b.url).await, rows);
+    let features = stored_features(&a.url).await;
+    assert_eq!(features.len(), 1);
+    assert_eq!(stored_features(&b.url).await, features);
     let id = dest.put_changeset(&cs(900)).await.unwrap();
     assert!(dest.cas_ref("fresh", None, Some(id)).await.unwrap());
     assert_eq!(dest.ref_log(None, None, 1).await.unwrap()[0].seq, last + 1);
@@ -512,12 +556,14 @@ async fn postgres_to_sqlite_to_postgres() {
     let sqm = open_meta_store(&sq).await.unwrap();
     assert_eq!(dump(&*src).await, dump(&*sqm).await);
     assert_eq!(stored_rows(&sq).await, rows);
+    assert_eq!(stored_features(&sq).await, features);
     let snap2 = dir.path().join("sq.db");
     export_snapshot(&sq, &snap2).await.unwrap();
     import_snapshot(&snap2, &b.url, true, SchemaMode::Migrate)
         .await
         .unwrap();
     assert_eq!(dump(&*src).await, dump(&*dest).await);
+    assert_eq!(stored_features(&b.url).await, features);
 
     drop((src, dest));
     a.drop_db().await;

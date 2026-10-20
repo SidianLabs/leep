@@ -53,7 +53,8 @@ pub use comments::strip_comments;
 pub use cursor::MAX_CURSOR_CHARS;
 pub use history::{ExtraMatch, LogFilter, LogPage, LogParams};
 pub use repo::{
-    default_derive_jobs, PrefixMatch, Repo, MAX_DEFAULT_DERIVE_JOBS, MAX_PREFIX_CANDIDATES,
+    default_derive_jobs, PrefixMatch, Repo, DEFAULT_CACHE_BYTES, MAX_DEFAULT_DERIVE_JOBS,
+    MAX_PREFIX_CANDIDATES,
 };
 pub use search::{SearchIndexReport, SearchQuery};
 pub use signatures::{LandPolicy, PolicySet, REBASED_ORIGIN_KIND};

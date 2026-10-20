@@ -651,3 +651,41 @@ async fn quiet_fault_wrapper_passes_contract() {
         check_meta_store_contract(&store).await;
     }
 }
+
+/// Postgres counts small kinds and estimates large ones from the planner's
+/// statistics, and counts a large kind the statistics do not know yet.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn postgres_estimates_large_kinds() {
+    let Some((s, _)) = pg_store("estimate").await else {
+        return;
+    };
+    let fill = |kind: &'static str, n: i64| {
+        sqlx::query(
+            "INSERT INTO derived (kind, key, value) \
+             SELECT $1, decode(lpad(to_hex(i), 64, '0'), 'hex'), '\\x00'::bytea \
+             FROM generate_series(1, $2) AS i",
+        )
+        .bind(kind)
+        .bind(n)
+        .execute(&s.pool)
+    };
+    fill("big", 150_000).await.unwrap();
+    fill("small", 10).await.unwrap();
+    sqlx::query("ANALYZE derived")
+        .execute(&s.pool)
+        .await
+        .unwrap();
+    let big = s.estimate_derived("big").await.unwrap();
+    assert!(!big.exact);
+    assert!(
+        (120_000..=180_000).contains(&big.rows),
+        "{big:?} for 150000"
+    );
+    let exact = |rows| leep_core::RowCount { rows, exact: true };
+    assert_eq!(s.estimate_derived("small").await.unwrap(), exact(10));
+    assert_eq!(s.estimate_derived("none").await.unwrap(), exact(0));
+    // Added since the last ANALYZE: not in the statistics, so counted.
+    fill("late", 120_000).await.unwrap();
+    assert_eq!(s.estimate_derived("late").await.unwrap(), exact(120_000));
+    assert_eq!(s.count_derived("big").await.unwrap(), 150_000);
+}

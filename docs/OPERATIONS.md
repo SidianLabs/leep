@@ -700,7 +700,17 @@ leep-server upgrade-index --yes --drop-retired --old-servers-stopped   # then dr
 ```
 
 - The plan reads the history of every ref once (about the time `repair
-  rederive` takes to plan) and counts rows without reading them. For each
+  rederive` takes to plan) and counts rows without reading them. On
+  Postgres it estimates a kind of more than 100,000 rows from the planner's
+  statistics, which takes milliseconds where `count(*)` takes about 30 s a
+  kind on all of Linux. Estimates are marked `~`. It counts exactly where a
+  decision rests on the number: whether a kind has any rows (always exact),
+  and whether a kind whose ref heads all have rows is short. An estimate
+  below the reachable changesets is checked with a count before the plan
+  calls the kind partial. One case is caught only by an exact count: an
+  interrupted `repair drop` of a *current* kind that left the heads' rows,
+  before autovacuum's `ANALYZE` has seen the delete. After such a drop, run
+  `ANALYZE derived` or pass `--exact-counts`. SQLite always counts. For each
   kind this version reads it shows rows, how many reachable changesets lack
   one, and `complete`, `partial` or `missing`; then the retired kinds that
   still have rows (such as `history-tree-v3` with `history-node-v3`) and the
@@ -833,6 +843,62 @@ new dictionary (for example after the history has changed character) and
 moves every row to it; the old dictionary stays. A store with fewer than
 1,000 changesets is left alone.
 
+### Format features
+
+**Format features (schema v4, ADR 0055).** Migration 0004 adds a
+`store_features` table. Like 0003, it may be applied beside servers of the
+previous version. A row names a format the store's rows use that a server
+must understand. `compact-changesets` records `changeset-zstd-dict` before
+it stores a dictionary, and the migration records it for a store compacted
+before the table existed. A server, or any `leep-server` tool, that opens a
+store naming a feature it does not know refuses to start:
+
+```
+the metadata store uses format features this server cannot read (some-feature);
+a newer leep-server wrote them. Upgrade this server
+```
+
+Upgrade that binary. Do not delete the row: the rows it describes are
+already written, and an older binary would fail on them anyway.
+`leep-server verify` and backups behave the same way, and backups carry the
+table.
+
+The check only protects against binaries that have it. **Servers from
+before this release do not read the table**, and those from before ADR 0053
+cannot read compressed rows. So for this release the rule above still
+holds: no server, importer or tool older than ADR 0053 may use the
+database when `compact-changesets` runs. From now on, a format change that
+old servers cannot read is refused by them at startup, instead of failing
+their reads.
+
+## Connection pool and caches
+
+Two settings size a `leep-server` process. Both are global flags, so they
+apply to the server and to its tools (`verify`, `repair`, `upgrade-index`,
+`gc`, `derive-search`):
+
+| Flag / env | Default | What it bounds |
+|---|---|---|
+| `--meta-pool-size` / `LEEP_META_POOL_SIZE` | 16 | Connections this process opens to a Postgres metadata store. SQLite ignores it. |
+| `--derive-cache-bytes` / `LEEP_DERIVE_CACHE_BYTES` | 356515840 (340 MiB) | The in-memory caches of derived indexes: path-history nodes, parts and roots (148 MiB), tree nodes (32 MiB), and the filtered-log caches (160 MiB). The ancestry and skiplist caches are bounded by entries, about 100 MB together by default, and scale by the same factor. |
+
+`--cache-bytes` (256 MiB) is separate: it caches blobs.
+
+- **Pool.** A request or derivation job holds at most one connection at a
+  time. Raise the pool with `--derive-jobs` or `rederive --jobs` past 16 on
+  a machine with the cores for it. Every server and tool has its own pool,
+  so keep the sum of all pools under Postgres's `max_connections` (100 by
+  default) less what other clients need. A pool that is too small makes
+  requests wait. They do not fail unless they wait past sqlx's 30 s acquire
+  timeout.
+- **Derive caches.** Every cache gets its default share of the budget
+  times `budget / 340 MiB`. More helps derivation of very wide histories
+  and filtered logs over long ranges: `history-tree-v4` derivation re-reads
+  hot directory nodes, and `log-filter-v1` merge walks reuse fingerprints.
+  Less suits small containers. A small budget changes no answer, only how
+  often rows are read again. RSS also holds the blob cache, request
+  buffers and the derivation working set.
+
 ## Indexing a large history
 
 After importing a long history (`leep-git import`, a restore without
@@ -859,7 +925,8 @@ leep-server repair rederive --kind history-tree-v4 log-filter-v1 --missing --job
   `leep-server` process, so use about the cores the machine can spare;
   with Postgres on another host a little more (1.5 to 2 times the cores)
   hides round trips. Each job may hold a Postgres connection at a time and
-  the pool has 16, so more than 16 jobs gains nothing. Memory stays near
+  the pool has 16 (`--meta-pool-size`), so more jobs than connections gains
+  nothing; see [Connection pool and caches](#connection-pool-and-caches). Memory stays near
   that of one job (a few hundred MB on Linux-sized histories); the
   history-row and tree caches are shared.
 - Run `ANALYZE changesets, refs, derived;` first if the import did not (see
@@ -1151,6 +1218,7 @@ history, trees and blobs first, derived rows after.
 | `missing_blob` | A file blob a changeset names is gone (a bad restore, a deleted file, a GC bug). The report names the changeset and path | Not recomputable. Restore the blob from the blob store's backup; its address is in the report, `blobs/<hex[0..2]>/<hex[2..]>`. Once you have the bytes (a client's `~/.cache/leep/objects` may still hold them) `PUT /v1/blobs/{hash}` stores them again |
 | `corrupt_blob`, `blob_size_mismatch` (`--rehash`) | The bytes under a blob's address do not hash to it, or are not the declared length | Delete the file and restore from backup, as for a missing blob. Until then reads of it return the damaged bytes |
 | `derived_mismatch` | A derived row differs from its recomputation. The report gives kind, row key and changeset | `leep-server repair rederive --kind <kind>` and run `verify --full` again. Find out why (disk, restore, an old version): derived rows are only ever wrong through damage |
+| (note) `log-filter-v1 merge row(s) hold exactly what the merge brings in` | Not a problem. Past the side-walk budget (200,000 changesets) this version stores a superset in a merge's `log-filter-v1` row, and rows written before the budget (ADR 0047's code) hold the exact set. Both are valid (ADR 0051). `verify` walks such a merge again without the budget and accepts the row when it is that exact set. A row a build with a different budget wrote is not recognised and is reported as `derived_mismatch` | Nothing. `repair rederive --kind log-filter-v1` would rewrite those rows as this version writes them, which changes no answer |
 | `derived_unverifiable` | A row could not be recomputed because something it reads is damaged | Fix the damaged tree node, blob or parent, then verify again |
 | `corrupt_history_node`, `missing_history_node` | A part of a history pack fails its checksum or does not decode, a `history-node-v4` row holds another part than its key says, a split node's chunk does not fit its list, a patch does not fit its keyframe, or a `history-tree-v4` row, chunk list or patch points at nothing | `repair rederive --kind history-tree-v4` rewrites the packs. Or `repair drop --kind history-tree-v4` and let the index rebuild on the next path query (slow on a long history: it derives the whole index at once) |
 | `bad_attestation`, `invalid_signature` | A signature or review row does not decode, does not belong to any changeset, or a signature does not verify | These are not derived from history and are never rewritten by `repair`. Restore the row from a backup, or delete it with SQL if it is junk, and have the author sign again |

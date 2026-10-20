@@ -162,6 +162,12 @@ impl MetaStore for FaultyMetaStore {
             .await
     }
 
+    async fn estimate_derived(&self, kind: &str) -> Result<leep_core::RowCount> {
+        self.plan
+            .run(Op::ListDerived, self.inner.estimate_derived(kind), |_, v| v)
+            .await
+    }
+
     /// Each step is one faultable call; `delete_derived_kind` is their loop.
     async fn delete_derived_step(
         &self,

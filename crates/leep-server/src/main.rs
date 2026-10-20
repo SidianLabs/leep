@@ -54,6 +54,27 @@ struct Args {
     /// In-memory blob cache size in bytes; 0 disables it.
     #[arg(long, default_value_t = 256 * 1024 * 1024)]
     cache_bytes: usize,
+    /// Most connections this process opens to a Postgres metadata store
+    /// (SQLite ignores it). Every server and tool has its own pool, so keep
+    /// their sum under the database's max_connections.
+    #[arg(
+        long,
+        global = true,
+        env = "LEEP_META_POOL_SIZE",
+        default_value_t = leep_meta::DEFAULT_POSTGRES_POOL_SIZE,
+        value_parser = clap::value_parser!(u32).range(1..=10_000),
+    )]
+    meta_pool_size: u32,
+    /// Bytes the in-memory caches of derived indexes (path history, trees,
+    /// filtered log) may hold; the ancestry and skiplist caches scale with
+    /// it. Separate from --cache-bytes, which caches blobs.
+    #[arg(
+        long,
+        global = true,
+        env = "LEEP_DERIVE_CACHE_BYTES",
+        default_value_t = leep_derive::DEFAULT_CACHE_BYTES
+    )]
+    derive_cache_bytes: usize,
     /// Abort requests that run longer than this (0, 90s, 5m); 0 disables the
     /// bound. `gc --fence` must exceed it.
     #[arg(long, env = "LEEP_REQUEST_TIMEOUT", default_value = "5m", value_parser = parse_grace)]
@@ -281,6 +302,24 @@ enum GcPhase {
 /// Set once from `--no-migrate`; read by [`open_meta`].
 static NO_MIGRATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Set once from `--meta-pool-size`; read by [`open_meta`].
+static META_POOL_SIZE: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(leep_meta::DEFAULT_POSTGRES_POOL_SIZE);
+
+/// Set once from `--derive-cache-bytes`; read by [`new_repo`].
+static DERIVE_CACHE_BYTES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(leep_derive::DEFAULT_CACHE_BYTES);
+
+/// A repository handle with the derive cache budget from the flags.
+fn new_repo(blobs: Arc<dyn BlobStore>, meta: Arc<dyn leep_core::MetaStore>) -> Repo {
+    let budget = DERIVE_CACHE_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+    if budget == leep_derive::DEFAULT_CACHE_BYTES {
+        Repo::new(blobs, meta)
+    } else {
+        Repo::new(blobs, meta).with_cache_budget(budget)
+    }
+}
+
 /// Open the metadata store, applying pending migrations unless `--no-migrate`.
 async fn open_meta(url: &str) -> leep_core::Result<Arc<dyn leep_core::MetaStore>> {
     let mode = if NO_MIGRATE.load(std::sync::atomic::Ordering::Relaxed) {
@@ -288,7 +327,8 @@ async fn open_meta(url: &str) -> leep_core::Result<Arc<dyn leep_core::MetaStore>
     } else {
         leep_meta::SchemaMode::Migrate
     };
-    leep_meta::open_meta_store_with(url, mode).await
+    let pool = META_POOL_SIZE.load(std::sync::atomic::Ordering::Relaxed);
+    leep_meta::open_meta_store_with_pool(url, mode, pool).await
 }
 
 async fn run_migrate(meta: &str, dry_run: bool, status: bool) -> anyhow::Result<()> {
@@ -429,7 +469,7 @@ async fn run_gc(
     use leep_derive::gc;
     let blobs = leep_store::open_blob_store(blobs).context("opening blob store")?;
     let meta = open_meta(meta).await.context("opening meta store")?;
-    let repo = Repo::new(blobs, meta);
+    let repo = new_repo(blobs, meta);
     let clock = gc::SystemClock;
     let dry = opts.dry_run;
     let (condemn, collect) = match phase {
@@ -483,7 +523,7 @@ async fn run_gc(
 async fn run_derive_search(meta: &str, blobs: &str, rev: &str) -> anyhow::Result<()> {
     let blobs = leep_store::open_blob_store(blobs).context("opening blob store")?;
     let meta = open_meta(meta).await.context("opening meta store")?;
-    let repo = Repo::new(blobs, meta);
+    let repo = new_repo(blobs, meta);
     let id = repo.resolve(rev).await?;
     let started = std::time::Instant::now();
     let r = repo.derive_search(id).await?;
@@ -626,6 +666,11 @@ async fn main() -> anyhow::Result<()> {
             .init(),
     }
     NO_MIGRATE.store(args.no_migrate, std::sync::atomic::Ordering::Relaxed);
+    META_POOL_SIZE.store(args.meta_pool_size, std::sync::atomic::Ordering::Relaxed);
+    DERIVE_CACHE_BYTES.store(
+        args.derive_cache_bytes,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     match args.command {
         Some(Cmd::Migrate { dry_run, status }) => {
             return run_migrate(&args.meta, dry_run, status).await
@@ -733,7 +778,7 @@ async fn main() -> anyhow::Result<()> {
         metrics::gauge!("leep_schema_version").set(v as f64);
     }
     // The land policy comes from the reloadable config, not from the repo.
-    let mut repo = Repo::new(blobs, meta);
+    let mut repo = new_repo(blobs, meta);
     if let Some(jobs) = args.derive_jobs {
         repo = repo.with_derive_jobs(jobs as usize);
     }

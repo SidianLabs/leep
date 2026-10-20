@@ -32,7 +32,7 @@ use crate::blame::{cache_key, CachedBlame};
 use crate::derived::history_pack::{
     decode_part, decode_root, part_identity, part_key, same_part, RawNode,
 };
-use crate::derived::{DerivedKind, HistoryTree, NodeRef, StoredHistoryNode};
+use crate::derived::{DerivedKind, HistoryTree, LogFilterIndex, NodeRef, StoredHistoryNode};
 use crate::gc;
 use crate::path_history::{bad_chunk, chunk_fits, load_history_row, part_row, resolve_raw_row};
 use crate::search::index::TreeRowMemo;
@@ -238,6 +238,7 @@ pub async fn verify(
     let shadow_meta = ShadowMeta::new(repo.meta().clone());
     let shadow_blobs = ShadowBlobs::new(repo.blobs().clone());
     let shadow = Repo::new(shadow_blobs.clone(), shadow_meta.clone());
+    shadow.log_filter.copy_side_budget(&repo.log_filter);
     let mut v = Verifier {
         repo,
         opts,
@@ -250,6 +251,7 @@ pub async fn verify(
         stats: Stats::default(),
         kind_stats: BTreeMap::new(),
         notes: Vec::new(),
+        unbudgeted: 0,
         tips: HashSet::new(),
         sample_cut: u64::MAX,
         in_ref_phase: true,
@@ -263,6 +265,14 @@ pub async fn verify(
         phase: "starting",
     };
     let refs = v.run().await?;
+    if v.unbudgeted > 0 {
+        v.notes.push(format!(
+            "{} log-filter-v1 merge row(s) hold exactly what the merge brings in, as rows \
+             written before the side-walk budget did; this code writes a superset past the \
+             budget, and both are valid (ADR 0051)",
+            v.unbudgeted
+        ));
+    }
     let (problems, problems_total) = v.log.into_parts();
     Ok(VerifyReport {
         mode: if opts.full { "full" } else { "sample" },
@@ -295,6 +305,9 @@ struct Verifier<'a> {
     stats: Stats,
     kind_stats: BTreeMap<&'static str, KindStats>,
     notes: Vec<String>,
+    /// `log-filter-v1` merge rows that differ from a recomputation only
+    /// because the side walk gave up (ADR 0051).
+    unbudgeted: u64,
     tips: HashSet<ChangesetId>,
     sample_cut: u64,
     in_ref_phase: bool,
@@ -618,11 +631,25 @@ impl Verifier<'_> {
         }
         // Packs are compared by content: zstd versions may compress the same
         // pack differently (ADR 0045).
-        let same = if kind == HistoryTree::NAME {
+        let mut same = if kind == HistoryTree::NAME {
             same_part(&expected, &stored)
         } else {
             expected == stored
         };
+        if !same && kind == LogFilterIndex::NAME && cs.parents.len() > 1 {
+            // Past the side-walk budget this code stores a superset of what
+            // the merge brings in; a row of exactly that, as code before the
+            // budget wrote, is valid too (ADR 0051). Walk without the budget
+            // to tell it from damage.
+            let unbounded = self.shadow.with_unbounded_side_walks();
+            if recompute(kind, &unbounded, id, cs)
+                .await
+                .is_ok_and(|exact| exact == stored)
+            {
+                self.unbudgeted += 1;
+                same = true;
+            }
+        }
         if !same {
             self.kstats(kind).mismatched += 1;
             self.log.push(

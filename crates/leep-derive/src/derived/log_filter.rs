@@ -28,7 +28,7 @@ use leep_core::{Changeset, ChangesetId, DerivedRow, Error, Hash, Result};
 
 use super::{derive, DerivedKind, SkipEntry};
 use crate::ancestry::Reader;
-use crate::repo::{ByKey, SizedCache};
+use crate::repo::{ByKey, CacheScale, SizedCache};
 use crate::Repo;
 
 /// Per-changeset kind; see the module docs.
@@ -358,6 +358,10 @@ const SKIP_CACHE_BYTES: usize = 32 << 20;
 /// per changeset: a few hundred thousand changesets.
 const FPS_CACHE_BYTES: usize = 48 << 20;
 
+/// What the caches below hold in total at their defaults.
+pub(crate) const LOG_FILTER_CACHE_BYTES: usize =
+    ROW_CACHE_BYTES + NAME_CACHE_BYTES + SKIP_CACHE_BYTES + FPS_CACHE_BYTES;
+
 /// Author fingerprints whose name row this process has staged, so each
 /// author's row is written once per process rather than once per changeset.
 const WRITTEN_NAMES: usize = 1 << 20;
@@ -376,11 +380,21 @@ pub(crate) struct LogFilterCaches {
     /// merge.
     fps: SizedCache<Vec<u64>, FPS_CACHE_BYTES>,
     written: Mutex<HashSet<u64>>,
-    /// [`SIDE_BUDGET`] unless a test lowers it (0: the default).
+    /// [`SIDE_BUDGET`] unless set otherwise (0: the default).
     side_budget: AtomicUsize,
 }
 
 impl LogFilterCaches {
+    pub(crate) fn scaled(s: CacheScale) -> Self {
+        LogFilterCaches {
+            rows: SizedCache::scaled(s),
+            names: SizedCache::scaled(s),
+            skips: SizedCache::scaled(s),
+            fps: SizedCache::scaled(s),
+            ..Default::default()
+        }
+    }
+
     fn side_budget(&self) -> usize {
         match self.side_budget.load(Ordering::Relaxed) {
             0 => SIDE_BUDGET,
@@ -388,9 +402,16 @@ impl LogFilterCaches {
         }
     }
 
-    /// Give up on merge sides past `n` changesets, to test what happens.
-    #[cfg(test)]
+    /// Give up on merge sides past `n` changesets: tests lower it, and
+    /// `verify` lifts it to tell rows written without it from damage.
     pub(crate) fn set_side_budget(&self, n: usize) {
+        self.side_budget.store(n, Ordering::Relaxed);
+    }
+
+    /// Use `other`'s side budget: verification recomputes rows as the
+    /// repository it checks would.
+    pub(crate) fn copy_side_budget(&self, other: &LogFilterCaches) {
+        let n = other.side_budget.load(Ordering::Relaxed);
         self.side_budget.store(n, Ordering::Relaxed);
     }
 }

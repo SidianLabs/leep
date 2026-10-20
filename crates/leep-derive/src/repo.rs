@@ -120,9 +120,16 @@ type DeriveLock = Arc<tokio::sync::Mutex<()>>;
 /// step. Both are immutable, so entries never go stale. Bounded: entries live
 /// in two generations of maps, and the older one is dropped when the newer
 /// fills, so recently used entries survive.
-#[derive(Default)]
 pub(crate) struct AncestryCache {
     inner: Mutex<AncestryMaps>,
+    /// Entries per map.
+    limit: usize,
+}
+
+impl Default for AncestryCache {
+    fn default() -> Self {
+        Self::scaled(CacheScale::default())
+    }
 }
 
 #[derive(Default)]
@@ -168,6 +175,13 @@ struct AncestryEntry {
 const ANCESTRY_CACHE_ENTRIES: usize = 1 << 18;
 
 impl AncestryCache {
+    fn scaled(s: CacheScale) -> Self {
+        AncestryCache {
+            inner: Mutex::default(),
+            limit: s.of(ANCESTRY_CACHE_ENTRIES),
+        }
+    }
+
     /// `f` of the entry of `id` (an empty one if absent). Walks ask for one
     /// field of each changeset they visit, so the entry is not cloned.
     fn get<T>(&self, id: &ChangesetId, f: impl FnOnce(&AncestryEntry) -> T) -> T {
@@ -178,7 +192,7 @@ impl AncestryCache {
         match m.old.remove(id) {
             Some(e) => {
                 let out = f(&e);
-                m.insert(*id, e);
+                m.insert(*id, e, self.limit);
                 out
             }
             None => f(&AncestryEntry::default()),
@@ -193,13 +207,13 @@ impl AncestryCache {
             .or_else(|| m.old.remove(&id))
             .unwrap_or_default();
         f(&mut e);
-        m.insert(id, e);
+        m.insert(id, e, self.limit);
     }
 }
 
 impl AncestryMaps {
-    fn insert(&mut self, id: ChangesetId, e: AncestryEntry) {
-        if self.new.len() >= ANCESTRY_CACHE_ENTRIES {
+    fn insert(&mut self, id: ChangesetId, e: AncestryEntry, limit: usize) {
+        if self.new.len() >= limit {
             self.old = std::mem::take(&mut self.new);
         }
         self.new.insert(id, e);
@@ -215,9 +229,16 @@ impl AncestryMaps {
 /// hold only computed lists and never a damaged row read before its
 /// substitution. Bounded like [`AncestryCache`]; a list is 40 bytes per
 /// entry.
-#[derive(Default)]
 pub(crate) struct SkiplistCache {
     inner: Mutex<SkiplistMaps>,
+    /// Lists per map.
+    limit: usize,
+}
+
+impl Default for SkiplistCache {
+    fn default() -> Self {
+        Self::scaled(CacheScale::default())
+    }
 }
 
 #[derive(Default)]
@@ -231,24 +252,31 @@ struct SkiplistMaps {
 const SKIPLIST_CACHE_ENTRIES: usize = 1 << 14;
 
 impl SkiplistCache {
+    fn scaled(s: CacheScale) -> Self {
+        SkiplistCache {
+            inner: Mutex::default(),
+            limit: s.of(SKIPLIST_CACHE_ENTRIES),
+        }
+    }
+
     pub(crate) fn get(&self, id: &ChangesetId) -> Option<Arc<[SkipEntry]>> {
         let mut m = self.inner.lock().unwrap();
         if let Some(l) = m.new.get(id) {
             return Some(l.clone());
         }
         let l = m.old.remove(id)?;
-        m.insert(*id, l.clone());
+        m.insert(*id, l.clone(), self.limit);
         Some(l)
     }
 
     pub(crate) fn insert(&self, id: ChangesetId, list: Arc<[SkipEntry]>) {
-        self.inner.lock().unwrap().insert(id, list);
+        self.inner.lock().unwrap().insert(id, list, self.limit);
     }
 }
 
 impl SkiplistMaps {
-    fn insert(&mut self, id: ChangesetId, list: Arc<[SkipEntry]>) {
-        if self.new.len() >= SKIPLIST_CACHE_ENTRIES {
+    fn insert(&mut self, id: ChangesetId, list: Arc<[SkipEntry]>, limit: usize) {
+        if self.new.len() >= limit {
             self.old = std::mem::take(&mut self.new);
         }
         self.new.insert(id, list);
@@ -297,20 +325,16 @@ pub(crate) struct StagedNodes {
 pub(crate) type TreeCache = SizedCache<TreeView, TREE_CACHE_BYTES>;
 
 /// Content-addressed values by hash, bounded like [`AncestryCache`] but by
-/// bytes: each map holds up to half of `BUDGET`.
+/// bytes: each map holds up to half of the budget, `BUDGET` unless the
+/// `Repo`'s cache budget scales it.
 pub(crate) struct SizedCache<V, const BUDGET: usize> {
     inner: Mutex<SizedMaps<V>>,
+    budget: usize,
 }
 
 impl<V, const BUDGET: usize> Default for SizedCache<V, BUDGET> {
     fn default() -> Self {
-        SizedCache {
-            inner: Mutex::new(SizedMaps {
-                new: HashMap::default(),
-                new_bytes: 0,
-                old: HashMap::default(),
-            }),
-        }
+        Self::scaled(CacheScale::default())
     }
 }
 
@@ -329,13 +353,24 @@ const HISTORY_CACHE_BYTES: usize = 96 << 20;
 const TREE_CACHE_BYTES: usize = 32 << 20;
 
 impl<V, const BUDGET: usize> SizedCache<V, BUDGET> {
+    pub(crate) fn scaled(s: CacheScale) -> Self {
+        SizedCache {
+            inner: Mutex::new(SizedMaps {
+                new: HashMap::default(),
+                new_bytes: 0,
+                old: HashMap::default(),
+            }),
+            budget: s.of(BUDGET),
+        }
+    }
+
     pub(crate) fn get(&self, hash: &Hash) -> Option<Arc<V>> {
         let mut m = self.inner.lock().unwrap();
         if let Some((n, _)) = m.new.get(hash) {
             return Some(n.clone());
         }
         let (n, size) = m.old.remove(hash)?;
-        m.insert::<BUDGET>(*hash, n.clone(), size);
+        m.insert(*hash, n.clone(), size, self.budget);
         Some(n)
     }
 
@@ -343,19 +378,50 @@ impl<V, const BUDGET: usize> SizedCache<V, BUDGET> {
         self.inner
             .lock()
             .unwrap()
-            .insert::<BUDGET>(hash, value, 2 * encoded_len);
+            .insert(hash, value, 2 * encoded_len, self.budget);
     }
 }
 
 impl<V> SizedMaps<V> {
-    fn insert<const BUDGET: usize>(&mut self, hash: Hash, value: Arc<V>, size: usize) {
-        if self.new_bytes + size > BUDGET / 2 {
+    fn insert(&mut self, hash: Hash, value: Arc<V>, size: usize, budget: usize) {
+        if self.new_bytes + size > budget / 2 {
             self.old = std::mem::take(&mut self.new);
             self.new_bytes = 0;
         }
         if self.new.insert(hash, (value, size)).is_none() {
             self.new_bytes += size;
         }
+    }
+}
+
+/// Bytes the byte-bounded derive caches of one [`Repo`] hold by default:
+/// path-history nodes, parts, roots and patches, tree nodes, and the
+/// filtered-log caches. See [`Repo::with_cache_budget`].
+pub const DEFAULT_CACHE_BYTES: usize = HISTORY_CACHE_BYTES
+    + HISTORY_RAW_CACHE_BYTES
+    + HISTORY_PART_CACHE_BYTES
+    + HISTORY_ROOT_CACHE_BYTES
+    + TREE_CACHE_BYTES
+    + crate::derived::LOG_FILTER_CACHE_BYTES;
+
+/// Every cache's default bound times `total / DEFAULT_CACHE_BYTES`, so the
+/// default budget gives exactly the default bounds.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CacheScale {
+    total: usize,
+}
+
+impl Default for CacheScale {
+    fn default() -> Self {
+        CacheScale {
+            total: DEFAULT_CACHE_BYTES,
+        }
+    }
+}
+
+impl CacheScale {
+    pub(crate) fn of(self, default: usize) -> usize {
+        (default as u128 * self.total as u128 / DEFAULT_CACHE_BYTES as u128) as usize
     }
 }
 
@@ -410,6 +476,36 @@ impl Repo {
     pub fn with_derive_jobs(mut self, jobs: usize) -> Self {
         self.derive_jobs = jobs.max(1);
         self
+    }
+
+    /// Bound this handle's derive caches by about `bytes` in total instead
+    /// of [`DEFAULT_CACHE_BYTES`]: each byte-bounded cache gets its default
+    /// share, and the ancestry and skiplist caches, bounded by entries
+    /// (on the order of 100 MB together at their defaults), scale by the
+    /// same factor.
+    /// Call it before cloning: it replaces the caches, which clones share.
+    pub fn with_cache_budget(mut self, bytes: usize) -> Self {
+        let s = CacheScale { total: bytes };
+        self.ancestry = Arc::new(AncestryCache::scaled(s));
+        self.history_rows = Arc::new(SizedCache::scaled(s));
+        self.history_raw = Arc::new(SizedCache::scaled(s));
+        self.history_parts = Arc::new(SizedCache::scaled(s));
+        self.history_roots = Arc::new(SizedCache::scaled(s));
+        self.trees = Arc::new(SizedCache::scaled(s));
+        self.skiplists = Arc::new(SkiplistCache::scaled(s));
+        self.log_filter = Arc::new(crate::derived::LogFilterCaches::scaled(s));
+        self
+    }
+
+    /// A handle on the same stores whose `log-filter-v1` merge walks never
+    /// give up (ADR 0051), with caches of its own; for `verify`.
+    pub(crate) fn with_unbounded_side_walks(&self) -> Self {
+        let caches = crate::derived::LogFilterCaches::default();
+        caches.set_side_budget(usize::MAX);
+        Repo {
+            log_filter: Arc::new(caches),
+            ..self.clone()
+        }
     }
 
     /// Values `derived::derive` computed through this handle and its clones.
@@ -1020,5 +1116,38 @@ mod tests {
             (e.parents.as_deref(), e.generation),
             (Some(&[id(4)][..]), None)
         );
+    }
+
+    #[test]
+    fn cache_budget_scales_every_cache_from_the_defaults() {
+        let d = CacheScale::default();
+        for n in [
+            ANCESTRY_CACHE_ENTRIES,
+            SKIPLIST_CACHE_ENTRIES,
+            HISTORY_CACHE_BYTES,
+        ] {
+            assert_eq!(d.of(n), n);
+        }
+        assert_eq!(DEFAULT_CACHE_BYTES, 340 << 20);
+        let half = CacheScale {
+            total: DEFAULT_CACHE_BYTES / 2,
+        };
+        assert_eq!(half.of(TREE_CACHE_BYTES), TREE_CACHE_BYTES / 2);
+        assert_eq!(half.of(ANCESTRY_CACHE_ENTRIES), ANCESTRY_CACHE_ENTRIES / 2);
+        let huge = CacheScale { total: usize::MAX };
+        assert!(huge.of(HISTORY_CACHE_BYTES) > HISTORY_CACHE_BYTES);
+
+        // A small budget bounds the entry caches too.
+        let c = AncestryCache::scaled(CacheScale {
+            total: DEFAULT_CACHE_BYTES >> 10,
+        });
+        assert_eq!(c.limit, ANCESTRY_CACHE_ENTRIES >> 10);
+        for n in 0..10 * c.limit {
+            c.update(id(n), |e| e.generation = Some(n as u64));
+        }
+        let m = c.inner.lock().unwrap();
+        assert!(m.new.len() + m.old.len() <= 2 * c.limit);
+        let t: SizedCache<u8, TREE_CACHE_BYTES> = SizedCache::scaled(half);
+        assert_eq!(t.budget, TREE_CACHE_BYTES / 2);
     }
 }

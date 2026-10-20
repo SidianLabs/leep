@@ -410,6 +410,32 @@ async fn log_with_path_filter() {
     assert_eq!(first.generation, 4);
 }
 
+/// A tiny cache budget changes no answer, only how often rows are read: a
+/// handle with the default caches, reading the rows it derived, agrees.
+#[tokio::test]
+async fn a_tiny_cache_budget_gives_the_same_answers() {
+    let meta = Arc::new(MemoryMetaStore::new());
+    let blobs = Arc::new(MemoryBlobStore::new());
+    let r = Repo::new(blobs.clone(), meta.clone()).with_cache_budget(0);
+    let mut tip = commit(&r, &[], &[("src/a.rs", Some("0"))], "c0").await;
+    for i in 1..40 {
+        let path = format!("d{}/f{}", i % 3, i % 5);
+        tip = commit(&r, &[tip], &[(path.as_str(), Some(&i.to_string()))], "c").await;
+    }
+    let fresh = Repo::new(blobs, meta);
+    let ids =
+        |v: Vec<leep_core::api::ChangesetInfo>| v.into_iter().map(|i| i.id).collect::<Vec<_>>();
+    for path in [None, Some("d1"), Some("d2/f4"), Some("src/a.rs")] {
+        let tiny = ids(r.log(tip, path, 100).await.unwrap());
+        assert_eq!(
+            tiny,
+            ids(fresh.log(tip, path, 100).await.unwrap()),
+            "{path:?}"
+        );
+        assert!(!tiny.is_empty());
+    }
+}
+
 #[tokio::test]
 async fn log_follows_all_parents_of_merges() {
     let r = repo();

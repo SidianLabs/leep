@@ -1429,3 +1429,161 @@ async fn an_interrupted_upgrade_completes_when_run_again() {
         );
     }
 }
+
+/// A store whose row counts are estimates `scale` times the truth (never 0
+/// when rows exist), as Postgres gives for large kinds, and that counts the
+/// exact counts asked of it.
+struct Estimated {
+    inner: Arc<MemoryMetaStore>,
+    scale: f64,
+    exact: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl MetaStore for Estimated {
+    async fn put_changeset(&self, cs: &Changeset) -> leep_core::Result<ChangesetId> {
+        self.inner.put_changeset(cs).await
+    }
+    async fn get_changeset(&self, id: &ChangesetId) -> leep_core::Result<Option<Changeset>> {
+        self.inner.get_changeset(id).await
+    }
+    async fn get_changesets(
+        &self,
+        ids: &[ChangesetId],
+    ) -> leep_core::Result<Vec<Option<Changeset>>> {
+        self.inner.get_changesets(ids).await
+    }
+    async fn list_changesets(
+        &self,
+        after: Option<ChangesetId>,
+        limit: usize,
+    ) -> leep_core::Result<Vec<ChangesetId>> {
+        self.inner.list_changesets(after, limit).await
+    }
+    async fn get_ref(&self, name: &str) -> leep_core::Result<Option<ChangesetId>> {
+        self.inner.get_ref(name).await
+    }
+    async fn cas_ref_logged(
+        &self,
+        name: &str,
+        expected: Option<ChangesetId>,
+        new: Option<ChangesetId>,
+        ctx: &leep_core::RefUpdateContext,
+    ) -> leep_core::Result<bool> {
+        self.inner.cas_ref_logged(name, expected, new, ctx).await
+    }
+    async fn ref_log(
+        &self,
+        name: Option<&str>,
+        before_seq: Option<u64>,
+        limit: usize,
+    ) -> leep_core::Result<Vec<leep_core::RefLogEntry>> {
+        self.inner.ref_log(name, before_seq, limit).await
+    }
+    async fn list_refs(&self) -> leep_core::Result<BTreeMap<String, ChangesetId>> {
+        self.inner.list_refs().await
+    }
+    async fn get_derived(&self, kind: &str, key: &Hash) -> leep_core::Result<Option<Bytes>> {
+        self.inner.get_derived(kind, key).await
+    }
+    async fn get_derived_many(
+        &self,
+        kind: &str,
+        keys: &[Hash],
+    ) -> leep_core::Result<Vec<Option<Bytes>>> {
+        self.inner.get_derived_many(kind, keys).await
+    }
+    async fn put_derived(&self, kind: &str, key: &Hash, value: Bytes) -> leep_core::Result<()> {
+        self.inner.put_derived(kind, key, value).await
+    }
+    async fn delete_derived_kind(&self, kind: &str) -> leep_core::Result<u64> {
+        self.inner.delete_derived_kind(kind).await
+    }
+    async fn list_derived(
+        &self,
+        kind: &str,
+        after: Option<Hash>,
+        limit: usize,
+    ) -> leep_core::Result<Vec<(Hash, Bytes)>> {
+        self.inner.list_derived(kind, after, limit).await
+    }
+    async fn count_derived(&self, kind: &str) -> leep_core::Result<u64> {
+        self.exact
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner.count_derived(kind).await
+    }
+    async fn estimate_derived(&self, kind: &str) -> leep_core::Result<leep_core::RowCount> {
+        let n = self.inner.count_derived(kind).await?;
+        Ok(leep_core::RowCount {
+            rows: if n == 0 {
+                0
+            } else {
+                ((n as f64 * self.scale) as u64).max(1)
+            },
+            exact: false,
+        })
+    }
+}
+
+/// The plan estimates, but counts where a decision depends on it: an
+/// estimate below the reachable changesets for a kind whose heads all have
+/// rows is checked, so a lagging estimate does not invent work, while one
+/// above it is taken. Whether a kind has rows at all is never estimated.
+#[tokio::test]
+async fn upgrade_plans_count_only_where_a_decision_needs_it() {
+    use std::sync::atomic::Ordering;
+    let w = world().await;
+    put_row(&w, "history-tree-v1", &w.tip().0, vec![1; 32]).await;
+    let plan_with = |scale: f64, exact_counts: bool| {
+        let meta = Arc::new(Estimated {
+            inner: w.meta.clone(),
+            scale,
+            exact: Default::default(),
+        });
+        let repo = Repo::new(w.blobs.clone(), meta.clone());
+        async move {
+            let p = plan_upgrade_with(&repo, PlanOptions { exact_counts }, &Quiet)
+                .await
+                .unwrap();
+            (p, meta.exact.load(Ordering::Relaxed))
+        }
+    };
+
+    // Estimates above the truth: every kind complete, nothing counted.
+    let (p, counted) = plan_with(3.0, false).await;
+    assert_eq!(counted, 0, "{p:#?}");
+    assert!(p.to_derive().is_empty(), "{p:#?}");
+    assert!(p.current.iter().all(|k| k.rows_estimated));
+    assert_eq!(p.to_drop(), ["history-tree-v1"]);
+    assert!(p.retired[0].rows_estimated);
+
+    // Below it: each current kind is counted once and found complete.
+    let (p, counted) = plan_with(0.25, false).await;
+    assert!(p.to_derive().is_empty(), "{p:#?}");
+    assert_eq!(counted, p.current.len(), "{p:#?}");
+    assert!(p.current.iter().all(|k| !k.rows_estimated));
+
+    // Asked to, it counts everything.
+    let (p, counted) = plan_with(3.0, true).await;
+    assert!(counted > p.current.len());
+    assert!(p.current.iter().all(|k| !k.rows_estimated));
+    assert!(!p.retired[0].rows_estimated);
+
+    // A kind with no rows is missing whatever the estimates; one whose tip
+    // row is gone is partial without a count, and its size is estimated.
+    drop_kinds(&w.repo, &["history-tree-v4"], false, &Quiet)
+        .await
+        .unwrap();
+    let filters = rows_of(&w, "log-filter-v1").await;
+    w.meta.delete_derived_kind("log-filter-v1").await.unwrap();
+    for (k, v) in filters.iter().filter(|(k, _)| *k != w.tip().0) {
+        put_row(&w, "log-filter-v1", k, v.clone()).await;
+    }
+    let (p, _) = plan_with(3.0, false).await;
+    let tree = status(&p, "history-tree-v4");
+    assert_eq!((tree.status, tree.rows), (IndexStatus::Missing, 0));
+    let filter = status(&p, "log-filter-v1");
+    assert_eq!(filter.status, IndexStatus::Partial, "{filter:#?}");
+    assert!(filter.rows_estimated);
+    assert_eq!(p.to_derive(), ["history-tree-v4", "log-filter-v1"]);
+}

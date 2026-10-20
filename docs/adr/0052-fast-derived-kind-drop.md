@@ -89,3 +89,10 @@ the cost of reading and logging the table once; not justified now.
 - The dead rows are still there afterwards: autovacuum vacuums `derived`
   soon after a large drop (another sequential pass over the table), and only
   `VACUUM FULL` or `pg_repack` returns the space to the operating system.
+- *Amended:* `upgrade-index`'s plan counts through
+  `MetaStore::estimate_derived`, which defaults to `count_derived`. Postgres
+  counts up to 100,000 rows and estimates past that from `pg_class.reltuples`
+  and the kind's `pg_stats` frequency, because `count(*)` took about 32 s a
+  large kind on all of Linux and the plan counted every kind twice (7
+  minutes). The plan counts exactly where a decision rests on the number,
+  and `--exact-counts` counts everything.

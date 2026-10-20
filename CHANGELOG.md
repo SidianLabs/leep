@@ -673,6 +673,27 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   `blame Makefile` (1,501 changes) went from 3.0 s to 1.1 s and `diff.c`
   from 1.9 s to 0.9 s, with rarely changed files as before
   (PERFORMANCE.md, "First blame in stretches").
+- Format features (ADR 0055): schema migration 0004 adds `store_features`,
+  and `compact-changesets` records `changeset-zstd-dict` before it stores a
+  dictionary (the migration records it for a store already compacted).
+  Servers and tools refuse to open a store that names a feature they do not
+  know, so a later format change fails at startup on servers that cannot
+  read it instead of failing their reads. Servers from before this release
+  do not check: still run `compact-changesets` only after every server
+  runs ADR 0053's release or newer. Backups carry the table.
+- `--meta-pool-size` (`LEEP_META_POOL_SIZE`, default 16) sets the Postgres
+  connection pool, and `--derive-cache-bytes` (`LEEP_DERIVE_CACHE_BYTES`,
+  default 340 MiB) sets the budget of the derived-index caches, which were
+  fixed. Defaults are unchanged (OPERATIONS.md, "Connection pool and
+  caches").
+- `upgrade-index` plans in seconds on large Postgres stores: kinds over
+  100,000 rows are estimated from planner statistics (marked `~`) instead
+  of `count(*)`, which took about 32 s a kind on all of Linux. Counts are
+  exact where a decision rests on them, and `--exact-counts` counts
+  everything. New `MetaStore::estimate_derived`.
+- `verify` no longer reports `log-filter-v1` merge rows as damaged when they
+  hold exactly what the merge brings in, as rows written before the
+  side-walk budget did (ADR 0051). It notes them instead.
 - `leep-land-bench` drives several servers that share one database
   (`--server` and `--metrics` take lists) and reports lands per server and
   agents that made no progress. With 2 or 3 servers landing on one ref, one
@@ -722,6 +743,10 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
     unchanged.
 
 ### Fixes
+- A damaged compressed changeset row whose frame header claims a large size
+  no longer makes a read reserve that much memory (up to 256 MiB a row).
+  Readers reserve at most 1 MiB on the header's word and decode larger
+  frames as a stream, growing the buffer only as bytes come out.
 - `leep-git import` and `export` no longer fail with "Entry too large to fit
   in memory" on objects over 16 MiB when the git repository belongs to
   another user (as in the server container): gix's reduced-trust allocation

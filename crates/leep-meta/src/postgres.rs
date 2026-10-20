@@ -7,7 +7,7 @@ use leep_core::prefix::IdPrefix;
 use leep_core::store::unix_now;
 use leep_core::{
     check_ref_chain, Changeset, ChangesetId, DeleteStep, DerivedRow, Hash, MetaStore, RefLogEntry,
-    RefStep, RefUpdateContext, Result,
+    RefStep, RefUpdateContext, Result, RowCount,
 };
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{PgConnection, PgPool, Row};
@@ -40,6 +40,12 @@ pub const MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/postgres/0003_changeset_dicts.sql"),
         satisfied_by: &[],
     },
+    Migration {
+        version: 4,
+        name: "store_features",
+        sql: include_str!("../migrations/postgres/0004_store_features.sql"),
+        satisfied_by: &[],
+    },
 ];
 
 /// Every table a bulk load fills, for [`PostgresMetaStore::analyze`].
@@ -60,6 +66,8 @@ pub struct PostgresMetaStore {
     /// Whether the schema has `changeset_dicts`: tests open stores with
     /// shorter migration lists.
     pub(crate) has_dicts: bool,
+    /// Whether the schema has `store_features` (ADR 0055).
+    pub(crate) has_features: bool,
 }
 
 impl PostgresMetaStore {
@@ -71,7 +79,13 @@ impl PostgresMetaStore {
     /// Connect; with [`SchemaMode::RequireCurrent`] refuse instead of
     /// migrating when the schema is not current.
     pub async fn connect_with(url: &str, mode: SchemaMode) -> Result<Self> {
-        Self::open(url, None, mode, MIGRATIONS).await
+        Self::connect_with_pool(url, mode, crate::DEFAULT_POSTGRES_POOL_SIZE).await
+    }
+
+    /// [`connect_with`](Self::connect_with), opening at most `pool_size`
+    /// connections.
+    pub async fn connect_with_pool(url: &str, mode: SchemaMode, pool_size: u32) -> Result<Self> {
+        Self::open(url, None, mode, MIGRATIONS, pool_size).await
     }
 
     /// Like [`connect`](Self::connect), but keeps all tables in `schema`
@@ -82,6 +96,7 @@ impl PostgresMetaStore {
             Some(schema.to_string()),
             SchemaMode::Migrate,
             MIGRATIONS,
+            crate::DEFAULT_POSTGRES_POOL_SIZE,
         )
         .await
     }
@@ -95,7 +110,14 @@ impl PostgresMetaStore {
         mode: SchemaMode,
         migrations: &[Migration],
     ) -> Result<Self> {
-        Self::open(url, schema.map(str::to_string), mode, migrations).await
+        Self::open(
+            url,
+            schema.map(str::to_string),
+            mode,
+            migrations,
+            crate::DEFAULT_POSTGRES_POOL_SIZE,
+        )
+        .await
     }
 
     /// Apply pending migrations, or with `dry_run` only report them.
@@ -110,7 +132,12 @@ impl PostgresMetaStore {
         migrations: &[Migration],
         dry_run: bool,
     ) -> Result<MigrationReport> {
-        let pool = Self::pool(url, schema.map(str::to_string)).await?;
+        let pool = Self::pool(
+            url,
+            schema.map(str::to_string),
+            crate::DEFAULT_POSTGRES_POOL_SIZE,
+        )
+        .await?;
         let r = Self::run(&pool, migrations, !dry_run).await;
         pool.close().await;
         r
@@ -134,18 +161,20 @@ impl PostgresMetaStore {
         schema: Option<String>,
         mode: SchemaMode,
         migrations: &[Migration],
+        pool_size: u32,
     ) -> Result<Self> {
-        let pool = Self::pool(url, schema).await?;
+        let pool = Self::pool(url, schema, pool_size).await?;
         let report = Self::run(&pool, migrations, mode == SchemaMode::Migrate).await?;
         if mode == SchemaMode::RequireCurrent {
             migrate::require_current(&report)?;
         }
         let store = Self::with_pool(pool, migrations);
+        crate::features::check(&store.features().await?)?;
         store.load_dicts().await?;
         Ok(store)
     }
 
-    async fn pool(url: &str, schema: Option<String>) -> Result<PgPool> {
+    async fn pool(url: &str, schema: Option<String>, max: u32) -> Result<PgPool> {
         let opts = PgConnectOptions::from_str(url).map_err(storage)?;
         if let Some(schema) = &schema {
             let quoted = quote_ident(schema);
@@ -161,7 +190,7 @@ impl PostgresMetaStore {
             admin.close().await;
         }
         PgPoolOptions::new()
-            .max_connections(16)
+            .max_connections(max.max(1))
             .after_connect(move |conn, _| {
                 let set = schema
                     .as_ref()
@@ -192,6 +221,43 @@ impl PostgresMetaStore {
         let report = migrate::drive(&mut PgSession(&mut tx), migrations, write).await?;
         tx.commit().await.map_err(storage)?;
         Ok(report)
+    }
+}
+
+/// Kinds with fewer rows than this are counted, not estimated; counting
+/// this many takes milliseconds.
+const EXACT_UP_TO: i64 = 100_000;
+
+/// `reltuples`, and the most common values of `kind` with their frequencies.
+type StatsRow = (f64, Option<Vec<String>>, Option<Vec<f64>>);
+
+impl PostgresMetaStore {
+    /// Rows of `kind` by the last `ANALYZE`: the table's row estimate times
+    /// the kind's frequency among its most common values. `None` when the
+    /// table was never analyzed or the kind is not among them.
+    async fn planner_rows(&self, kind: &str) -> Result<Option<u64>> {
+        let row: Option<StatsRow> = sqlx::query_as(
+            "SELECT c.reltuples::float8, s.most_common_vals::text::text[], \
+                    s.most_common_freqs::float8[] \
+             FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+             LEFT JOIN pg_stats s ON s.schemaname = n.nspname AND s.tablename = c.relname \
+                 AND s.attname = 'kind' \
+             WHERE c.oid = 'derived'::regclass",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(storage)?;
+        let Some((tuples, Some(vals), Some(freqs))) = row else {
+            return Ok(None);
+        };
+        if tuples <= 0.0 {
+            return Ok(None);
+        }
+        Ok(vals
+            .iter()
+            .zip(&freqs)
+            .find(|(v, _)| v.as_str() == kind)
+            .map(|(_, f)| (tuples * f).round() as u64))
     }
 }
 
@@ -274,7 +340,40 @@ impl PostgresMetaStore {
             has_dicts: migrations
                 .iter()
                 .any(|m| m.version >= crate::compact::DICTS_SCHEMA_VERSION),
+            has_features: migrations
+                .iter()
+                .any(|m| m.version >= crate::features::FEATURES_SCHEMA_VERSION),
         }
+    }
+
+    /// The format features the store names (ADR 0055).
+    pub async fn features(&self) -> Result<Vec<String>> {
+        if !self.has_features {
+            return Ok(Vec::new());
+        }
+        sqlx::query_scalar("SELECT name FROM store_features ORDER BY name")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(storage)
+    }
+
+    /// Record that the store's rows may use `name`; idempotent.
+    pub(crate) async fn add_feature(&self, name: &str) -> Result<()> {
+        if !self.has_features {
+            return Err(leep_core::Error::Invalid(format!(
+                "the schema predates store features (v{}); run `leep-server migrate` first",
+                crate::features::FEATURES_SCHEMA_VERSION
+            )));
+        }
+        sqlx::query(
+            "INSERT INTO store_features (name, added_at) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+        )
+        .bind(name)
+        .bind(unix_now())
+        .execute(&self.pool)
+        .await
+        .map_err(storage)?;
+        Ok(())
     }
 
     /// Learn the changeset dictionaries added since this store last looked.
@@ -770,6 +869,38 @@ impl MetaStore for PostgresMetaStore {
             .await
             .map_err(storage)?;
         Ok(n as u64)
+    }
+
+    /// Up to [`EXACT_UP_TO`] rows are counted; past that, the planner's
+    /// statistics give the kind's share of the table (ADR 0052). Counting
+    /// a large kind reads its whole index: about 30 s a kind on all of
+    /// Linux.
+    async fn estimate_derived(&self, kind: &str) -> Result<RowCount> {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM (SELECT 1 FROM derived WHERE kind = $1 LIMIT $2) t",
+        )
+        .bind(kind)
+        .bind(EXACT_UP_TO)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(storage)?;
+        if n < EXACT_UP_TO {
+            return Ok(RowCount {
+                rows: n as u64,
+                exact: true,
+            });
+        }
+        match self.planner_rows(kind).await? {
+            Some(est) => Ok(RowCount {
+                rows: est.max(EXACT_UP_TO as u64),
+                exact: false,
+            }),
+            // Not analyzed since the kind grew: count.
+            None => Ok(RowCount {
+                rows: self.count_derived(kind).await?,
+                exact: true,
+            }),
+        }
     }
 
     /// See [`crate::drop`]: the first step counts the rows and the table's

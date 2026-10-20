@@ -160,6 +160,61 @@ fn workflow(stores: &Stores, dir: &std::path::Path) {
     assert!(after.iter().all(|d| is_frame(d)));
     let out = server_cmd(stores, &["verify", "--full"]);
     assert_ok(&out, "verify --full after a write");
+    refuses_unknown_features(stores);
+}
+
+/// The compaction recorded its feature (ADR 0055); a feature this binary
+/// does not know, as a newer one would record, stops the server starting.
+fn refuses_unknown_features(stores: &Stores) {
+    use sqlx::Connection;
+    let exec = |sql: &'static str| {
+        rt().block_on(async {
+            if stores.meta.starts_with("sqlite:") {
+                let mut c = sqlx::SqliteConnection::connect(&stores.meta).await.unwrap();
+                sqlx::query_scalar::<_, String>(sql)
+                    .fetch_all(&mut c)
+                    .await
+                    .unwrap()
+            } else {
+                let mut c = sqlx::PgConnection::connect(&stores.meta).await.unwrap();
+                sqlx::query_scalar::<_, String>(sql)
+                    .fetch_all(&mut c)
+                    .await
+                    .unwrap()
+            }
+        })
+    };
+    assert_eq!(
+        exec("SELECT name FROM store_features"),
+        ["changeset-zstd-dict"]
+    );
+    exec(
+        "INSERT INTO store_features (name, added_at) VALUES ('from-the-future', 1) RETURNING name",
+    );
+    let mut child = std::process::Command::new(bin("leep-server"))
+        .args(["--meta", &stores.meta, "--blobs", &stores.blobs])
+        .args(["--listen", "127.0.0.1:0"])
+        .stderr(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while child.try_wait().unwrap().is_none() {
+        if std::time::Instant::now() > deadline {
+            child.kill().unwrap();
+            panic!("leep-server started on a store with an unknown format feature");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let out = child.wait_with_output().unwrap();
+    assert!(!out.status.success());
+    let text = format!("{}{}", stdout(&out), stderr(&out));
+    assert!(text.contains("from-the-future"), "{text}");
+    let out = server_cmd(stores, &["verify"]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    exec("DELETE FROM store_features WHERE name = 'from-the-future' RETURNING name");
+    let out = server_cmd(stores, &["verify"]);
+    assert_ok(&out, "verify once the feature is gone");
 }
 
 #[test]

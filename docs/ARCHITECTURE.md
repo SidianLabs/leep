@@ -142,7 +142,17 @@ unknown one and at most a minute before a write), and plain rows until a
 dictionary exists. `leep-server compact-changesets` trains the dictionary
 and rewrites existing rows in place, beside running servers of this
 version; on git/git and Linux it halves the table (about 2.9 to 1.75 GB on
-all of Linux).
+all of Linux). A frame header's claimed size is trusted for at most 1 MiB
+of memory up front; larger frames decode as a stream.
+
+**Format features** ([ADR 0055](adr/0055-store-format-features.md)). The
+`store_features` table names what a store's rows use that a reader must
+understand (`changeset-zstd-dict` so far). A tool records a feature before
+it writes the first row that needs it (`compact-changesets` does so before
+it stores a dictionary). Every binary that has the table reads it on open
+and refuses to start on a name it does not know, so a newer format fails
+at startup rather than on the first row it cannot read. Binaries from
+before the table do not check it.
 
 ## 5. Derived data
 
@@ -254,8 +264,9 @@ starts once the patch grows past about `sqrt(128 × keyframe size)` bytes.
 Patches point only at keyframes, so a row costs at most two reads, and a
 lookup of a recently changed name is answered from the patch alone. Rows
 depend only on the content and the first parent's stored version, so every
-server derives identical bytes. Each `Repo` keeps a 64 MiB cache of decoded
-node rows, so derivation does not re-read the chunks of the root and other
+server derives identical bytes. Each `Repo` keeps a cache of decoded
+node rows (96 MiB by default; all of `Repo`'s derive caches scale with
+`leep-server --derive-cache-bytes`), so derivation does not re-read the chunks of the root and other
 hot directories for every changeset.
 
 **Blame.** Blame follows first parents and credits each line to the
@@ -416,7 +427,9 @@ physical order, a range of pages per short transaction, so each page is read
 and changed once; a small kind in key-order batches. Its dry run counts with
 `count_derived`, which reads no values. `leep-server upgrade-index`
 (`integrity::upgrade`) composes these for an upgrade: it compares each
-current kind's count and ref heads' rows with the reachable history, derives
+current kind's count (`estimate_derived`, which on Postgres estimates a
+large kind from planner statistics, counting exactly only where a decision
+depends on it) and ref heads' rows with the reachable history, derives
 what is missing through `derive` from the heads (rows are stored after their
 parents', so that finds every gap but one a stopped drop left), and drops
 retired kinds only when told no older server reads them.
@@ -837,6 +850,7 @@ misses and occupancy as Prometheus metrics (see [OPERATIONS.md](OPERATIONS.md)).
 | BlobStore slow | Cache tiers absorb repeated reads | — |
 | Land CAS contention | Bounded retries, then an error | Client retries `land` |
 | Server started on a database from a newer release, or whose applied migration was edited | The store refuses to open (`database schema vN is newer than this server`), before any write | Upgrade the server; never edit an applied migration (ADR 0023) |
+| Server started on a store whose rows use a format feature it does not know (`store_features`) | The store refuses to open, naming the feature, before any read of a row | Upgrade the server (ADR 0055). Servers from before the table cannot check it, so finish a rollout before running `compact-changesets` |
 | Migration fails or the migrating process dies mid-run | Every pending migration and its `schema_migrations` row run in one transaction: the database stays at the version it started at | Fix the cause and start again; concurrent starters wait on the lock and find the work done |
 | Data damaged at rest (bit rot, a bad restore, a hand-edited table) | Content-addressed objects fail their hash check on read; derived rows without one can answer wrongly and silently (ADR 0021) | `leep-server verify` names every damaged object and row; `repair rederive` rewrites derived rows, and blobs and changesets are restored from backup (OPERATIONS.md, "Verify and repair") |
 | Backup taken while servers and GC run | The metadata snapshot is one instant; blobs are copied after it, and a blob the snapshot needs cannot have been deleted (ADR 0012), so the backup restores. A backup whose check finds a missing blob is sealed as failed, exits 1, and `restore` refuses it | Alert on `leep_backup_last_run_ok` and the last-success age; take another backup (ADR 0026) |

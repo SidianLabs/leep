@@ -91,6 +91,15 @@ impl DerivedRow {
     }
 }
 
+/// What [`MetaStore::estimate_derived`] found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RowCount {
+    /// Rows; 0 only when there are none, even when estimated.
+    pub rows: u64,
+    /// Counted, not estimated.
+    pub exact: bool,
+}
+
 /// One bounded step of [`MetaStore::delete_derived_step`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DeleteStep {
@@ -371,6 +380,16 @@ pub trait MetaStore: Send + Sync + 'static {
             after = Some(*last);
             n += page.len() as u64;
         }
+    }
+
+    /// About how many rows of `kind` are stored, for plans and progress
+    /// that should not scan a large kind to count it. Whether there are any
+    /// is always exact. The default counts.
+    async fn estimate_derived(&self, kind: &str) -> Result<RowCount> {
+        Ok(RowCount {
+            rows: self.count_derived(kind).await?,
+            exact: true,
+        })
     }
 
     /// Delete every row of `kinds`, one bounded step at a time (ADR 0052):
