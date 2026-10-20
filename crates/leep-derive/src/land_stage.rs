@@ -136,6 +136,21 @@ impl Staging {
         }
     }
 
+    /// Drop from `origins` every entry this attempt staged: a changeset it
+    /// wrote, or a `rebased-origin-v1` row it wrote. What is left was read
+    /// from the stores, so a later attempt of the batch may keep it; a
+    /// staged entry may never have been stored (its swap lost, or its write
+    /// failed) and must not outlive the attempt.
+    pub(crate) fn retain_stored(&self, origins: &mut HashMap<ChangesetId, Option<ChangesetId>>) {
+        let s = self.lock();
+        origins.retain(|id, _| {
+            !s.changesets.contains_key(id)
+                && !s
+                    .rows
+                    .contains_key(&(REBASED_ORIGIN_KIND.to_string(), id.0))
+        });
+    }
+
     /// Store what the batch wrote, in the order a lone write keeps: blobs
     /// (through the GC rescue check) before the changesets and rows that
     /// reference them, all of it before the caller moves the ref. Stopping

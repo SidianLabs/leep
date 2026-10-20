@@ -493,6 +493,7 @@ land_batch:
 loop (≤32 attempts):
   start ← get_ref(target);  head ← start;  staging ← empty
   prefetch the lands' changesets, root trees and the head's rebase links
+           (stored rebase links an earlier attempt of the batch read are kept)
   for each land, writing into staging and reading it back (dropped if its caller left before it was reached):
     if head is None:                 move to cs
     elif cs is an ancestor of head:  already landed

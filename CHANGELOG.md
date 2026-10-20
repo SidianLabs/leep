@@ -541,6 +541,11 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   one transaction). New metrics `leep_land_batch_size` and
   `leep_land_cancelled_total`; `leep_land_lock_wait_seconds` now measures the
   time queued. `leep-land-bench` measures land throughput by number of agents.
+- A land batch redone after losing its swap keeps the rebase links it
+  already read from the store, so its search for earlier copies of its lands
+  reads only what the head gained since. Against another server landing on
+  the same ref, that search was half of each losing attempt and grew with
+  every loss.
 - A land batch stages its replays (ADR 0043): replayed copies, their tree
   nodes and rows are kept in memory and read back by the lands after them,
   then stored with one wave of blob writes and one metadata write just before
