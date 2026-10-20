@@ -352,8 +352,83 @@ changeset and derived-row write (1 to 3%) and the swap with its ref log
 rows (1 to 2%); the landed-copy scan is under 2%.
 
 As far as the bench checks, correctness held: every land was answered
-`Landed` (after the 409s above), and none conflicted or errored. Until lands are coordinated across instances,
-route each hot ref's lands to one instance (`docs/RUNBOOKS.md`).
+`Landed` (after the 409s above), and none conflicted or errored. Without
+`--land-coordination on`, route each hot ref's lands to one instance
+(`docs/RUNBOOKS.md`).
+
+**With coordination (ADR 0056).** The same bench, every server of a
+multi-server run started with `--land-coordination on --advertise-url
+http://127.0.0.1:<port>/ --peer-url-prefix http://127.0.0.1:` (1 server: off,
+as above). Same local 4-vCPU Xeon, shared with other agents' builds and tests
+(load average 3 to 12 during the rounds), Postgres 16 on the same machine,
+blobs on ext4, release build of the code review's revision (lease calls on
+their own connections, takeover at the TTL), `--agents 8,64,256 --duration
+20`, a fresh database and blob directory per run, three rounds with the
+server-count order rotated (1 2 3, 2 3 1, 3 1 2). Cells are the median of the
+three runs, range in brackets; latencies in ms. "Agents" is the total,
+spread round-robin over the servers:
+
+| Servers | Agents | Lands/s | vs 1 server | Land p50 | Land p99 | Land max | CAS losses | 409 retries | Stalled agents |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | 8 | 231 (193–238) | | 19 | 39 | 231 | 0 | 0 | 0 |
+| 1 | 64 | 316 (297–316) | | 132 | 207 | 442 | 0 | 0 | 0 |
+| 1 | 256 | 179 (179–192) | | 1297 | 1463 | 1483 | 0 | 0 | 0 |
+| 2 | 8 | 194 (170–199) | 84% | 24 | 48 | 74 | 0 | 0 | 0 |
+| 2 | 64 | 256 (251–261) | 81% | 184 | 255 | 310 | 0 | 0 | 0 |
+| 2 | 256 | 163 (147–173) | 91% | 1406 | 1563 | 1607 | 0 | 0 | 0 |
+| 3 | 8 | 174 (170–174) | 75% | 27 | 52 | 104 | 0 | 0 | 0 |
+| 3 | 64 | 251 (240–254) | 80% | 183 | 252 | 281 | 0 | 0 | 0 |
+| 3 | 256 | 157 (154–157) | 88% | 1463 | 1744 | 1798 | 0 | 0 | 0 |
+
+Starvation is gone. Not one agent stalled in any of the 18 multi-server runs,
+against 4 to 171 per run before. Land max is at most 1.2 times one server's,
+where it was 22 to 30 s. No swap was lost and no land was answered 409.
+Lands per server are even (for example `1664 / 1664`, `1032 / 1046 / 1058`),
+where before one server answered all of them.
+
+**Lease handovers.** Six more runs of 2 and 3 servers at 256 agents (169.6,
+166.4 and 160.0 lands/s with 2 servers; 176.0, 156.8 and 156.8 with 3) each
+took the lease once and ended at epoch 1: no handover. An earlier round had
+reported 2 to 4 acquisitions per run. Those were not handovers: lands that
+arrive together all claim the free lease at the start, each claim succeeded
+as the same holder at epoch 1, and each was counted. Only the first claim of
+an epoch counts now. Lease calls also use connections of their own, so a
+renewal can no longer queue behind 256 agents' uploads for the takeover
+window. Six more such runs after the lease table became the generic
+`leases` table, on a busier host (load average 8 to 26), again took the
+lease once each and lost none.
+
+**Throughput.** It is 75 to 91% of one server's at the same total number of
+agents, short of the 95% target ADR 0056 set. All the processes share one
+loaded 4-vCPU host, and each forwarded land costs two more HTTP exchanges on
+it: the follower takes the client's request, sends it to the leader and
+relays the answer, on the same CPUs as the leader's replays, which are what
+limits a ref. On one host the extra servers add work and no CPU. Whether
+coordinated servers reach 95% must be measured with the servers on separate
+hosts before `--land-coordination on` is recommended as the multi-server
+default. A direct comparison on one host: two coordinated servers, and 8
+agents landing through the leader, then through the follower, then through
+the leader again. The first run through the leader started on a new
+database:
+
+| Agents land through | Lands/s | Land p50 ms |
+|---|---|---|
+| the leader | 140 / 237 | 25.6 / 18.1 |
+| the follower | 196 | 24.6 |
+| the follower, before the fix below | 124 | 43.8 |
+
+One agent sees about 3 ms more through the follower (2.0 to 2.4 ms against
+5.3 to 5.7 ms).
+
+**Lands created on another server.** The first multi-server round ran at 54
+to 78% of one server. The leader had never seen the changesets of forwarded
+lands, which were created through other servers. So it read their parents
+and generations one at a time during the replay. Without the generations,
+it also skipped the batch's prefetch of rebase links, and the landed-copy
+scans read those row by row. A batch now first learns the parents and
+generations of the changesets it has not seen, in one round of batched
+reads. With 8 agents landing through a follower that raised throughput from
+122 lands/s to 147.
 
 **Per-directory flushes (ADR 0048).** After ADR 0044, with 64 agents and
 10-file changesets (`--files 10`) create p50 was about 25% worse than before

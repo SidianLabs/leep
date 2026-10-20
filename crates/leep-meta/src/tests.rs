@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use leep_core::memory::check_meta_store_contract;
+use leep_core::memory::{check_lease_contract, check_meta_store_contract};
 use leep_core::{Changeset, MetaStore, RefUpdateContext};
 
 use super::*;
@@ -527,6 +527,25 @@ pub(crate) async fn pg_store(name: &str) -> Option<(PostgresMetaStore, String)> 
         .await
         .unwrap();
     Some((s, url))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn postgres_leases() {
+    let Some((s, _)) = pg_store("leases").await else {
+        return;
+    };
+    check_lease_contract(&s).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sqlite_leases() {
+    let dir = std::env::temp_dir().join(format!("leep-meta-leases-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let url = format!("sqlite://{}?mode=rwc", dir.join("meta.db").display());
+    let s = SqliteMetaStore::connect(&url).await.unwrap();
+    check_lease_contract(&s).await;
+    drop(s);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -842,3 +842,169 @@ fn killed_server_and_gc_lose_nothing_postgres() {
     run_crash_rounds("postgres", Some(db.url.clone()));
     drop(db);
 }
+
+// ---------------------------------------------------------------------------
+// Several servers coordinating lands (ADR 0056)
+
+/// The lease's TTL the servers run with, and how soon after a leader's
+/// SIGKILL every agent must land again.
+const LEASE_TTL: Duration = Duration::from_secs(2);
+
+/// The live lease holder of `main`, by advertised address.
+fn lease_holder(meta_url: &str) -> Option<String> {
+    use sqlx::{Connection, Row};
+    common_block_on(async {
+        let mut c = sqlx::PgConnection::connect(meta_url).await.ok()?;
+        let row = sqlx::query(
+            "SELECT address FROM leases WHERE scope = 'land' AND name = 'main' \
+             AND expires_at > (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT",
+        )
+        .fetch_optional(&mut c)
+        .await
+        .ok()??;
+        Some(row.get::<String, _>("address"))
+    })
+}
+
+/// An HTTP agent that lands through server `n % count` and moves on to the
+/// next one whenever a request fails, like a client behind a balancer that
+/// takes a dead server out. Records when each of its lands was answered.
+fn failover_agent(
+    n: usize,
+    seed: u64,
+    addrs: &[SocketAddr],
+    shared: &Shared,
+    landed_at: &Mutex<Vec<(usize, Instant)>>,
+) {
+    let who = format!("http-{n}");
+    let mut rng = Rng::new(seed ^ ((n as u64 + 1) * 0x9E37));
+    let mut k = 0;
+    let mut at = n;
+    while !shared.stop.load(Ordering::Relaxed) {
+        let steps: Vec<Step> = (0..1 + rng.below(2))
+            .map(|_| {
+                k += 1;
+                step_for(&who, k, &mut rng)
+            })
+            .collect();
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let mut pending = None;
+        let landed = loop {
+            match http_attempt(addrs[at % addrs.len()], &steps, None, &mut pending) {
+                Ok(id) => break id,
+                Err(why) => {
+                    shared.note_retry(&why);
+                    assert!(Instant::now() < deadline, "{who} is stuck: {why}");
+                    at += 1;
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        };
+        landed_at.lock().unwrap().push((n, Instant::now()));
+        shared
+            .confirmed
+            .lock()
+            .unwrap()
+            .push(Confirmed { steps, landed });
+    }
+}
+
+/// Three servers on one Postgres coordinate the lands of `main`. Each round
+/// SIGKILLs whichever server holds the lease; another takes it once it goes
+/// stale, and every agent lands again within the lease TTL plus two seconds
+/// of the kill. Nothing is lost or landed twice, and the ref moves once per
+/// land.
+#[test]
+fn killed_land_leader_is_replaced_postgres() {
+    let Some(db) = PgDb::create() else {
+        return;
+    };
+    let _g = serial();
+    let seed = env_u64("LEEP_CRASH_SEED", DEFAULT_SEED);
+    let rounds = env_u64("LEEP_CRASH_ROUNDS", 3);
+    let agents = env_u64("LEEP_CRASH_AGENTS", 6) as usize;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let stores = Stores::with_meta(&root.join("data"), db.url.clone());
+    let ports: Vec<u16> = (0..3).map(|_| free_port()).collect();
+    let args = |port: u16| -> Vec<String> {
+        vec![
+            "--request-timeout".into(),
+            REQUEST_TIMEOUT.into(),
+            "--land-coordination".into(),
+            "on".into(),
+            "--advertise-url".into(),
+            format!("http://127.0.0.1:{port}"),
+            "--peer-url-prefix".into(),
+            "http://127.0.0.1:".into(),
+        ]
+    };
+    let start = |port: u16| {
+        let a = args(port);
+        let a: Vec<&str> = a.iter().map(String::as_str).collect();
+        Server::start_with(port, &stores, root, &a)
+    };
+    let mut servers: Vec<Server> = ports.iter().map(|p| start(*p)).collect();
+    let addrs: Vec<SocketAddr> = servers.iter().map(|s| s.addr).collect();
+    let shared = Shared::default();
+    let landed_at = Mutex::new(Vec::new());
+    let mut rng = Rng::new(seed);
+    let mut stalls = Vec::new();
+
+    std::thread::scope(|s| {
+        for n in 0..agents {
+            let (shared, landed_at, addrs) = (&shared, &landed_at, &addrs);
+            s.spawn(move || failover_agent(n, seed, addrs, shared, landed_at));
+        }
+        for round in 0..rounds {
+            let tag = format!("coordinated seed {seed:#x} round {round}");
+            std::thread::sleep(Duration::from_millis(800 + rng.below(700) as u64));
+            let holder = lease_holder(&db.url).unwrap_or_else(|| panic!("[{tag}] no lease"));
+            let i = ports
+                .iter()
+                .position(|p| holder == format!("http://127.0.0.1:{p}"))
+                .unwrap_or_else(|| panic!("[{tag}] lease names {holder}"));
+            servers[i].kill();
+            let killed = Instant::now();
+            // Every agent lands again within the TTL plus two seconds.
+            let bound = LEASE_TTL + Duration::from_secs(2);
+            std::thread::sleep(bound + Duration::from_millis(200));
+            let after = landed_at.lock().unwrap().clone();
+            let mut worst = Duration::ZERO;
+            for n in 0..agents {
+                let first = after
+                    .iter()
+                    .filter(|(a, t)| *a == n && *t > killed)
+                    .map(|(_, t)| t.duration_since(killed))
+                    .min()
+                    .unwrap_or_else(|| panic!("[{tag}] agent {n} did not land after the kill"));
+                assert!(
+                    first <= bound,
+                    "[{tag}] agent {n} first landed {first:?} after the kill"
+                );
+                worst = worst.max(first);
+            }
+            stalls.push(worst);
+            let moved = lease_holder(&db.url).unwrap_or_default();
+            assert_ne!(moved, holder, "[{tag}] the lease moved on");
+            check_store(&format!("{tag}, after SIGKILL"), &stores, &shared, true);
+            servers[i] = start(ports[i]);
+        }
+        std::thread::sleep(Duration::from_millis(400));
+        shared.stop.store(true, Ordering::Relaxed);
+    });
+
+    let tag = format!("coordinated seed {seed:#x} final");
+    eprintln!("[{tag}] longest wait for a land after each kill: {stalls:?}");
+    check_store(&tag, &stores, &shared, false);
+    let odd = shared.odd.lock().unwrap();
+    assert!(
+        odd.is_empty(),
+        "[{tag}] unexpected answers: {:?}",
+        &odd[..odd.len().min(5)]
+    );
+    drop(odd);
+    verify_exact(&tag, &stores, &shared);
+    drop(servers);
+    drop(db);
+}

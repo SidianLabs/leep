@@ -5,8 +5,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use leep_core::prefix::IdPrefix;
 use leep_core::{
-    Changeset, ChangesetId, DeleteStep, Hash, LandId, LandRecord, MetaStore, RefLogEntry, RefStep,
-    RefUpdateContext, Result,
+    Changeset, ChangesetId, DeleteStep, Hash, LandId, LandRecord, Lease, LeaseClaim, LeaseKey,
+    LeaseTiming, MetaStore, RefLogEntry, RefStep, RefUpdateContext, Result,
 };
 
 use crate::plan::{FaultPlan, Op};
@@ -89,6 +89,47 @@ impl MetaStore for FaultyMetaStore {
             .run(
                 Op::CasRef,
                 self.inner.cas_ref_logged(name, expected, new, ctx),
+                |_, v| v,
+            )
+            .await
+    }
+
+    fn supports_leases(&self) -> bool {
+        self.inner.supports_leases()
+    }
+
+    async fn lease(&self, key: &LeaseKey, timing: LeaseTiming) -> Result<Option<Lease>> {
+        self.plan
+            .run(Op::Lease, self.inner.lease(key, timing), |_, v| v)
+            .await
+    }
+
+    async fn acquire_lease(&self, claim: &LeaseClaim<'_>, timing: LeaseTiming) -> Result<Lease> {
+        self.plan
+            .run(Op::Lease, self.inner.acquire_lease(claim, timing), |_, v| v)
+            .await
+    }
+
+    async fn renew_leases(
+        &self,
+        holder: &str,
+        held: &[(LeaseKey, u64)],
+        timing: LeaseTiming,
+    ) -> Result<Vec<Option<std::time::Duration>>> {
+        self.plan
+            .run(
+                Op::Lease,
+                self.inner.renew_leases(holder, held, timing),
+                |_, v| v,
+            )
+            .await
+    }
+
+    async fn release_lease(&self, key: &LeaseKey, holder: &str, epoch: u64) -> Result<bool> {
+        self.plan
+            .run(
+                Op::Lease,
+                self.inner.release_lease(key, holder, epoch),
                 |_, v| v,
             )
             .await

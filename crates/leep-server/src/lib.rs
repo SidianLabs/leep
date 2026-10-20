@@ -3,6 +3,7 @@
 
 pub mod auth;
 pub mod backup;
+pub mod coord;
 pub mod fingerprint;
 pub mod limits;
 pub mod observe;
@@ -1069,8 +1070,11 @@ async fn land(
     State(repo): S,
     Extension(config): Cfg,
     auth::MaybePrincipal(who): auth::MaybePrincipal,
+    coordination: Option<Extension<Arc<coord::Coordination>>>,
+    from_peer: Option<Extension<coord::FromPeer>>,
+    headers: axum::http::HeaderMap,
     body: Bytes,
-) -> ApiResult<Json<LandResponse>> {
+) -> ApiResult<Response> {
     let req: LandRequest = parse_json(&body)?;
     // The policy the request arrived under, even if the body took a while or
     // a reload happened since; `land` keeps it across its retries.
@@ -1078,10 +1082,36 @@ async fn land(
     let actor = who.as_ref().map(|p| p.name.as_str());
     // Old clients send no `create` and keep the original behaviour.
     let create = req.create.unwrap_or(true);
-    Ok(Json(
-        repo.land_keyed(req.changeset, &req.target_ref, actor, create, req.land_id)
-            .await?,
-    ))
+    let Some(Extension(coordination)) = coordination.filter(|_| repo.land_coordinator().is_some())
+    else {
+        return Ok(Json(
+            repo.land_keyed(req.changeset, &req.target_ref, actor, create, req.land_id)
+                .await?,
+        )
+        .into_response());
+    };
+    // The client's body byte for byte, so fields this server does not know
+    // reach the coordinating server unchanged.
+    let forward = coord::HttpForward::new(coordination, &headers, body);
+    use leep_derive::land_coord::Coordinated;
+    Ok(
+        match repo
+            .land_coordinated(
+                req.changeset,
+                &req.target_ref,
+                actor,
+                create,
+                req.land_id,
+                from_peer.is_some(),
+                &forward,
+            )
+            .await?
+        {
+            Coordinated::Landed(r) => Json(r).into_response(),
+            Coordinated::Forwarded(relayed) => relayed.into_response(),
+            Coordinated::NotLeader => coord::not_leader(),
+        },
+    )
 }
 
 #[cfg(test)]

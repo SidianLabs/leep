@@ -73,6 +73,9 @@ impl LandStats {
 #[derive(Default)]
 pub(crate) struct LandQueues {
     queues: Mutex<HashMap<String, Arc<Mutex<RefQueue>>>>,
+    /// Leader tasks, so a test can kill a simulated server mid-batch.
+    #[cfg(test)]
+    tasks: Mutex<Vec<tokio::task::AbortHandle>>,
     /// The lands each batch took, in order, for tests to replay one by one.
     #[cfg(test)]
     pub(crate) batches: Mutex<Vec<Vec<ChangesetId>>>,
@@ -82,6 +85,22 @@ impl LandQueues {
     fn queue(&self, target_ref: &str) -> Arc<Mutex<RefQueue>> {
         let mut queues = self.queues.lock().unwrap_or_else(|e| e.into_inner());
         Arc::clone(queues.entry(target_ref.to_string()).or_default())
+    }
+
+    #[cfg(test)]
+    fn track(&self, task: tokio::task::AbortHandle) {
+        self.tasks.lock().unwrap().push(task);
+    }
+
+    #[cfg(not(test))]
+    fn track(&self, _: tokio::task::AbortHandle) {}
+
+    /// Abort every leader task, as a killed process would stop them.
+    #[cfg(test)]
+    pub(crate) fn abort_leaders(&self) {
+        for t in self.tasks.lock().unwrap().drain(..) {
+            t.abort();
+        }
     }
 
     /// Lands waiting for a batch on `target_ref`.
@@ -113,12 +132,24 @@ struct Queued {
     ctx: RefUpdateContext,
     queued: Instant,
     reply: oneshot::Sender<Answer>,
+    /// Queued because this server holds the ref's land lease (ADR 0056):
+    /// handed back to be routed again if the lease is lost.
+    led: bool,
 }
 
 struct Answer {
     result: Result<LandResponse>,
     attempts: u32,
     exhausted: bool,
+    /// This server stopped coordinating the ref before the land was
+    /// replayed; route it again.
+    rerouted: bool,
+}
+
+/// How a queued land left its queue.
+enum Settled {
+    Answered(Result<LandResponse>),
+    Rerouted,
 }
 
 /// A land in a batch, kept across the batch's attempts.
@@ -136,6 +167,16 @@ impl InFlight {
             result,
             attempts,
             exhausted,
+            rerouted: false,
+        });
+    }
+
+    fn reroute(self) {
+        let _ = self.q.reply.send(Answer {
+            result: Err(Error::Other("rerouted".into())),
+            attempts: 0,
+            exhausted: false,
+            rerouted: true,
         });
     }
 }
@@ -291,17 +332,55 @@ impl Repo {
         create: bool,
         land_id: Option<LandId>,
     ) -> Result<LandResponse> {
+        self.land_queued(cs, target_ref, actor, create, land_id, false)
+            .await
+            .unwrap_or_else(|| {
+                Err(Error::Other(
+                    "land was handed back unexpectedly; retry".into(),
+                ))
+            })
+    }
+
+    /// [`land_keyed`](Self::land_keyed) for a server holding `target_ref`'s
+    /// land lease (ADR 0056): `None` when it lost the lease before the land
+    /// was replayed, and the caller must route the land again.
+    pub(crate) async fn land_led(
+        &self,
+        cs: ChangesetId,
+        target_ref: &str,
+        actor: Option<&str>,
+        create: bool,
+        land_id: Option<LandId>,
+    ) -> Option<Result<LandResponse>> {
+        self.land_queued(cs, target_ref, actor, create, land_id, true)
+            .await
+    }
+
+    async fn land_queued(
+        &self,
+        cs: ChangesetId,
+        target_ref: &str,
+        actor: Option<&str>,
+        create: bool,
+        land_id: Option<LandId>,
+        led: bool,
+    ) -> Option<Result<LandResponse>> {
         let started = Instant::now();
         let mut stats = LandStats::default();
         let ctx = RefUpdateContext::new("land")
             .actor(actor)
             .message(format!("landed {cs}"))
             .land(land_id.map(|id| LandKey { id, changeset: cs }));
-        let result = self
-            .land_inner(cs, target_ref, create, ctx, &mut stats)
-            .await;
-        stats.record(&result, started.elapsed());
-        result
+        match self
+            .land_inner(cs, target_ref, create, ctx, &mut stats, led)
+            .await
+        {
+            Settled::Answered(result) => {
+                stats.record(&result, started.elapsed());
+                Some(result)
+            }
+            Settled::Rerouted => None,
+        }
     }
 
     async fn land_inner(
@@ -311,7 +390,27 @@ impl Repo {
         create: bool,
         ctx: RefUpdateContext,
         stats: &mut LandStats,
-    ) -> Result<LandResponse> {
+        led: bool,
+    ) -> Settled {
+        match self
+            .land_enqueue(cs, target_ref, create, ctx, stats, led)
+            .await
+        {
+            Ok(Some(answer)) => Settled::Answered(answer),
+            Ok(None) => Settled::Rerouted,
+            Err(e) => Settled::Answered(Err(e)),
+        }
+    }
+
+    async fn land_enqueue(
+        &self,
+        cs: ChangesetId,
+        target_ref: &str,
+        create: bool,
+        ctx: RefUpdateContext,
+        stats: &mut LandStats,
+        led: bool,
+    ) -> Result<Option<Result<LandResponse>>> {
         refname::validate(target_ref)?;
         if refname::is_tag(target_ref) {
             return Err(Error::Invalid(format!(
@@ -330,20 +429,25 @@ impl Repo {
                 ctx,
                 queued: Instant::now(),
                 reply,
+                led,
             });
             !std::mem::replace(&mut q.leading, true)
         };
         if start_leader {
-            tokio::spawn(lead(self.clone(), target_ref.to_string(), queue));
+            let task = tokio::spawn(lead(self.clone(), target_ref.to_string(), queue));
+            self.land_queues.track(task.abort_handle());
         }
         let answer = answer.await.map_err(|_| {
             Error::Other(format!(
                 "land onto {target_ref:?} was abandoned before it finished; retry"
             ))
         })?;
+        if answer.rerouted {
+            return Ok(None);
+        }
         stats.attempts = answer.attempts;
         stats.exhausted = answer.exhausted;
-        answer.result
+        Ok(Some(answer.result))
     }
 
     /// Land a batch: replay each land onto the head the previous one left,
@@ -361,6 +465,8 @@ impl Repo {
                 }
             })
             .collect();
+        self.learn_ancestry(&lands.iter().map(|l| l.q.cs).collect::<Vec<_>>())
+            .await;
         let mut commit_errors = 0;
         let mut lookup_errors = 0;
         let mut last_error = None;
@@ -371,6 +477,22 @@ impl Repo {
         // head's new ancestors instead of scanning the whole stretch again.
         let mut carried: HashMap<ChangesetId, Option<ChangesetId>> = HashMap::new();
         for attempt in 1..=MAX_LAND_ATTEMPTS {
+            // A server that lost the ref's lease stops retrying: the lands
+            // it was coordinating go back to be routed to the new holder.
+            if let Some(coord) = &self.land_coordinator {
+                if lands.iter().any(|l| l.q.led) && !coord.still_leading(target_ref).await {
+                    let (gone, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut lands)
+                        .into_iter()
+                        .partition(|l| l.q.led);
+                    for l in gone {
+                        l.reroute();
+                    }
+                    lands = keep;
+                    if lands.is_empty() {
+                        return;
+                    }
+                }
+            }
             let start = match self.meta().get_ref(target_ref).await {
                 Ok(h) => h,
                 Err(e) => {
@@ -580,6 +702,48 @@ impl Repo {
             .zip(found)
             .filter_map(|(id, r)| r.map(|r| (id, r)))
             .collect())
+    }
+
+    /// Learn the parents and generations of a batch's changesets this
+    /// process has not seen, in one round of batched reads. A land created
+    /// through another server (forwarded to this one, ADR 0056, or landed
+    /// after a restart) would otherwise read them one at a time in its
+    /// replay, and the batch's prefetch of rebase links, which needs the
+    /// generations, would read nothing. A failed read is left to the
+    /// replays, which read singly.
+    async fn learn_ancestry(&self, ids: &[ChangesetId]) {
+        let missing: Vec<ChangesetId> = ids
+            .iter()
+            .copied()
+            .filter(|id| {
+                self.cached_generation(*id).is_none() || self.cached_parents(*id).is_none()
+            })
+            .collect();
+        if missing.is_empty() {
+            return;
+        }
+        let keys: Vec<_> = missing.iter().map(|id| id.0).collect();
+        let (changesets, generations) = tokio::join!(
+            self.meta().get_changesets(&missing),
+            self.meta().get_derived_many(
+                <crate::derived::Generation as crate::derived::DerivedKind>::NAME,
+                &keys
+            )
+        );
+        if let Ok(changesets) = changesets {
+            for (id, cs) in missing.iter().zip(changesets) {
+                if let Some(cs) = cs {
+                    self.remember_parents(*id, cs.parents.into());
+                }
+            }
+        }
+        if let Ok(generations) = generations {
+            for (id, g) in missing.iter().zip(generations) {
+                if let Some(g) = g.and_then(|g| crate::derived::decode_u64(&g).ok()) {
+                    self.remember_generation(*id, g);
+                }
+            }
+        }
     }
 
     /// One land the way it ran before batches were staged: replayed straight

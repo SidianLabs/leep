@@ -74,6 +74,9 @@ pub struct Repo {
     /// Per-ref queues that group concurrent lands into batches (see `land`).
     pub(crate) land_queues: Arc<crate::land::LandQueues>,
     pub(crate) land_policy: Option<Arc<dyn LandPolicy>>,
+    /// Batches this server's lands with every other server's on the same ref
+    /// (ADR 0056); `None` batches only the lands this process receives.
+    pub(crate) land_coordinator: Option<Arc<crate::land_coord::LandCoordinator>>,
     /// Parents and generations of changesets seen by history walks.
     pub(crate) ancestry: Arc<AncestryCache>,
     /// Decoded path-history nodes, keyed by `NodeRef::cache_key` (see
@@ -444,6 +447,7 @@ impl Repo {
             meta,
             land_queues: Arc::default(),
             land_policy: None,
+            land_coordinator: None,
             ancestry: Arc::default(),
             history_rows: Arc::default(),
             history_raw: Arc::default(),
@@ -468,6 +472,21 @@ impl Repo {
             Some(prev) => Arc::new(PolicySet::new(vec![prev, policy])),
         });
         self
+    }
+
+    /// Coordinate lands with other servers through `coordinator`'s leases
+    /// (ADR 0056), for callers of [`Repo::land_coordinated`].
+    pub fn with_land_coordinator(
+        mut self,
+        coordinator: Arc<crate::land_coord::LandCoordinator>,
+    ) -> Self {
+        self.land_coordinator = Some(coordinator);
+        self
+    }
+
+    /// See [`Repo::with_land_coordinator`].
+    pub fn land_coordinator(&self) -> Option<&Arc<crate::land_coord::LandCoordinator>> {
+        self.land_coordinator.as_ref()
     }
 
     /// Derive missing ranges `jobs` changesets at a time (at least one).

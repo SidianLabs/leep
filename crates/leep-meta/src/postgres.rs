@@ -53,6 +53,12 @@ pub const MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/postgres/0005_land_ids.sql"),
         satisfied_by: &[],
     },
+    Migration {
+        version: 6,
+        name: "leases",
+        sql: include_str!("../migrations/postgres/0006_leases.sql"),
+        satisfied_by: &[],
+    },
 ];
 
 /// Every table a bulk load fills, for [`PostgresMetaStore::analyze`].
@@ -66,8 +72,17 @@ const MIGRATE_LOCK: i64 = 7164737;
 /// order is commit order. Nothing waits on a row lock while holding it.
 const LOG_LOCK: i64 = 7164738;
 
+/// Connections reserved for lease calls of every scope: one renewal
+/// statement per process and scope every renew interval, plus the odd
+/// claim or release.
+const LEASE_POOL_SIZE: u32 = 2;
+
 pub struct PostgresMetaStore {
     pub(crate) pool: PgPool,
+    /// Lease calls only (ADR 0056), every scope, so a renewal never waits
+    /// for a connection behind data traffic: a lease not renewed in time is
+    /// taken over. Connects on first use.
+    pub(crate) lease_pool: PgPool,
     /// Changeset dictionaries (ADR 0053).
     pub(crate) codec: Codec,
     /// Whether the schema has `changeset_dicts`: tests open stores with
@@ -170,12 +185,14 @@ impl PostgresMetaStore {
         migrations: &[Migration],
         pool_size: u32,
     ) -> Result<Self> {
-        let pool = Self::pool(url, schema, pool_size).await?;
+        let pool = Self::pool(url, schema.clone(), pool_size).await?;
         let report = Self::run(&pool, migrations, mode == SchemaMode::Migrate).await?;
         if mode == SchemaMode::RequireCurrent {
             migrate::require_current(&report)?;
         }
-        let store = Self::with_pool(pool, migrations);
+        let lease_pool = Self::options(schema, LEASE_POOL_SIZE)
+            .connect_lazy_with(PgConnectOptions::from_str(url).map_err(storage)?);
+        let store = Self::with_pool(pool, lease_pool, migrations);
         crate::features::check(&store.features().await?)?;
         store.load_dicts().await?;
         Ok(store)
@@ -196,6 +213,13 @@ impl PostgresMetaStore {
                 .map_err(storage)?;
             admin.close().await;
         }
+        Self::options(schema, max)
+            .connect_with(opts)
+            .await
+            .map_err(storage)
+    }
+
+    fn options(schema: Option<String>, max: u32) -> PgPoolOptions {
         PgPoolOptions::new()
             .max_connections(max.max(1))
             .after_connect(move |conn, _| {
@@ -209,9 +233,6 @@ impl PostgresMetaStore {
                     Ok(())
                 })
             })
-            .connect_with(opts)
-            .await
-            .map_err(storage)
     }
 
     /// One transaction under the advisory lock, so servers starting together
@@ -340,9 +361,10 @@ fn quote_ident(s: &str) -> String {
 }
 
 impl PostgresMetaStore {
-    fn with_pool(pool: PgPool, migrations: &[Migration]) -> Self {
+    fn with_pool(pool: PgPool, lease_pool: PgPool, migrations: &[Migration]) -> Self {
         Self {
             pool,
+            lease_pool,
             codec: Codec::default(),
             has_dicts: migrations
                 .iter()
@@ -725,6 +747,44 @@ impl MetaStore for PostgresMetaStore {
             .map_err(|e| log_insert_error(name, e))?;
         tx.commit().await.map_err(storage)?;
         Ok(true)
+    }
+
+    fn supports_leases(&self) -> bool {
+        true
+    }
+
+    async fn lease(
+        &self,
+        key: &leep_core::LeaseKey,
+        timing: leep_core::LeaseTiming,
+    ) -> Result<Option<leep_core::Lease>> {
+        crate::leases::pg_get(&self.lease_pool, key, timing).await
+    }
+
+    async fn acquire_lease(
+        &self,
+        claim: &leep_core::LeaseClaim<'_>,
+        timing: leep_core::LeaseTiming,
+    ) -> Result<leep_core::Lease> {
+        crate::leases::pg_acquire(&self.lease_pool, claim, timing).await
+    }
+
+    async fn renew_leases(
+        &self,
+        holder: &str,
+        held: &[(leep_core::LeaseKey, u64)],
+        timing: leep_core::LeaseTiming,
+    ) -> Result<Vec<Option<std::time::Duration>>> {
+        crate::leases::pg_renew(&self.lease_pool, holder, held, timing).await
+    }
+
+    async fn release_lease(
+        &self,
+        key: &leep_core::LeaseKey,
+        holder: &str,
+        epoch: u64,
+    ) -> Result<bool> {
+        crate::leases::pg_release(&self.lease_pool, key, holder, epoch).await
     }
 
     async fn cas_ref_logged_chain(
