@@ -306,3 +306,95 @@ async fn last_merge_is_written_with_each_changeset() {
     let c3 = commit(&r, &[c1], "c", "5").await;
     assert_eq!(value(r.clone(), c3).await, Some(gm));
 }
+
+/// The search group too: a holder that loses its lease while building a
+/// tree's filters stops at its next directory, so it never writes a
+/// directory's filter after the lease moved on (a tool's fence and drop
+/// may have removed the rows below it), and every filter it did write has
+/// its subdirectories' and files' rows.
+#[tokio::test(start_paused = true)]
+async fn a_search_holder_that_loses_its_lease_stops_at_the_next_directory() {
+    use crate::search::{BLOB_KIND, TREE_KIND};
+    use leep_core::{TreeEntry, TreeNode};
+    use leep_testkit::{Fault, FaultPlan, FaultyMetaStore, Op};
+    let meta = clocked();
+    let blobs = Arc::new(MemoryBlobStore::new());
+    let clean = Repo::new(blobs.clone(), meta.clone());
+    let mut tip = commit(&clean, &[], "d0/f", "0").await;
+    for i in 1..40 {
+        tip = commit(&clean, &[tip], &format!("d{i}/e/f"), &format!("text {i}")).await;
+    }
+    meta.cas_ref("main", None, Some(tip)).await.unwrap();
+    // `a`'s first row reaches the store 8 s late; meanwhile `b` takes the
+    // search lease.
+    let plan = FaultPlan::new(4);
+    plan.script(Op::PutDerived, 1, Fault::Delay(Duration::from_secs(8)));
+    let faulty: Arc<dyn MetaStore> = Arc::new(FaultyMetaStore::new(meta.clone(), plan.clone()));
+    let la = IndexLeases::new(
+        faulty.clone(),
+        IndexLeaseConfig::new("a", "").with_candidates(vec![IndexGroup::Search]),
+    );
+    la.tick().await;
+    let mut wa = Warmer::new(Repo::new(blobs.clone(), faulty), true).with_leases(la.clone());
+    let (_, lb, mut wb) = server(&meta, &blobs, "b");
+    let pass = tokio::spawn(async move { wa.pass().await });
+    while plan.calls(Op::PutDerived) == 0 {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::advance(Duration::from_secs(7)).await;
+    lb.tick().await;
+    assert!(lb.holds(IndexGroup::Search));
+    let _ = pass.await.unwrap();
+    let root = clean.root_tree(tip).await.unwrap();
+    assert!(
+        meta.get_derived(TREE_KIND, &root).await.unwrap().is_none(),
+        "the root filter was not written after the lease moved"
+    );
+    let written = meta
+        .list_derived(TREE_KIND, None, usize::MAX)
+        .await
+        .unwrap();
+    for (dir, _) in &written {
+        let node: TreeNode = clean.read_tree(*dir).await.unwrap();
+        for e in node.entries.values() {
+            match e {
+                TreeEntry::Dir { tree } => {
+                    assert!(meta.get_derived(TREE_KIND, tree).await.unwrap().is_some())
+                }
+                TreeEntry::File { content, .. } => {
+                    assert!(meta
+                        .get_derived(BLOB_KIND, content)
+                        .await
+                        .unwrap()
+                        .is_some())
+                }
+            }
+        }
+    }
+    wb.pass().await.unwrap();
+    assert!(meta.get_derived(TREE_KIND, &root).await.unwrap().is_some());
+}
+
+/// A tool refused one group's lease gives back the ones it already took.
+#[tokio::test(start_paused = true)]
+async fn a_refused_tool_gives_back_what_it_took() {
+    let meta = clocked();
+    let la = IndexLeases::new(
+        meta.clone(),
+        IndexLeaseConfig::new("a", "").with_candidates(vec![IndexGroup::History]),
+    );
+    la.tick().await;
+    let say = |_: &str| {};
+    let both = [IndexGroup::Search, IndexGroup::History];
+    let refused = ToolLease::take(meta.clone(), "tool", &both, false, Duration::ZERO, &say).await;
+    assert!(matches!(refused, Err(leep_core::Error::Invalid(_))));
+    let lb = IndexLeases::new(
+        meta.clone(),
+        IndexLeaseConfig::new("b", "").with_candidates(vec![IndexGroup::Search]),
+    );
+    lb.tick().await;
+    assert!(
+        lb.holds(IndexGroup::Search),
+        "the search lease was given back"
+    );
+}

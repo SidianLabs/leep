@@ -231,6 +231,14 @@ impl Repo {
                 continue;
             }
             let mut done = stack.pop().expect("stack is non-empty");
+            // The warmer's index lease (ADR 0058), asked before each
+            // directory's rows are written: a holder that lost it stops
+            // before writing a filter whose blob rows a drop may remove.
+            if c.scan.is_none() && !self.write_allowed().await {
+                return Err(Error::Other(
+                    "stopped deriving: the index lease was lost".into(),
+                ));
+            }
             let files = std::mem::take(&mut done.files);
             for row in self.blob_rows_of(files, c).await? {
                 if let BlobRow::Trigrams(set) = row {
