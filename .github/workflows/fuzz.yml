@@ -25,7 +25,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # The fuzz crate is outside the workspace, so rust-toolchain.toml (the
       # stable pin) does not apply to it; `cargo +nightly` picks nightly.
       - run: rustup toolchain install nightly --profile minimal

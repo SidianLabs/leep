@@ -48,7 +48,7 @@ jobs:
     env:
       LEEP_SOAK_POSTGRES_URL: postgres://postgres:leep@localhost:5432/postgres
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release -p leep-soak -p leep-server -p leep-cli
