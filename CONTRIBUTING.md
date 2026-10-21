@@ -8,7 +8,8 @@
    --all-targets -- -D warnings` and `cargo test --workspace`.
    If you add or rename an alert in [docs/OPERATIONS.md](docs/OPERATIONS.md),
    give it a `## <AlertName>` runbook in [docs/RUNBOOKS.md](docs/RUNBOOKS.md) and
-   run `scripts/check-runbooks.sh`, which CI runs too.
+   run `scripts/check-runbooks.sh`, which CI runs too. If you change
+   dependencies, also run `cargo deny check` (see "Supply-chain checks").
 4. Keep PRs to one logical change. Follow the commit, branch and PR
    conventions in [`.claude/skills/commit-and-pr/SKILL.md`](.claude/skills/commit-and-pr/SKILL.md).
    Commits and PRs credit human authors only, never AI tools.
@@ -27,3 +28,27 @@ before their first PR is merged. The maintainer reviews and merges every
 PR.
 
 Licensed under Apache-2.0; see [LICENSE](LICENSE).
+
+## Supply-chain checks
+
+CI runs [cargo-deny](https://github.com/EmbarkStudios/cargo-deny) with
+[`deny.toml`](deny.toml) on every push and pull request
+(`.github/workflows/supply-chain.yml`), and the advisory check again every
+Monday. To run it locally: `cargo install cargo-deny --locked`, then
+`cargo deny check`.
+
+- **advisories:** any RustSec vulnerability or yanked version fails. An
+  unmaintained crate fails only when a workspace crate depends on it
+  directly. Fix with `cargo update -p <crate>` where that is enough. An
+  `ignore` entry needs a reason and a remove-by date in `deny.toml`.
+- **licenses:** dependencies must be under a license on the `allow` list.
+  Adding a license there needs a check that it is compatible with Apache-2.0.
+- **bans:** no wildcard (`*`) requirements. Internal crates carry the
+  workspace version in `[workspace.dependencies]`, so a version bump moves
+  those lines too. Duplicate versions of a crate only warn.
+- **sources:** crates.io only; a git dependency needs an entry in `deny.toml`.
+
+Dependabot (`.github/dependabot.yml`) opens grouped minor and patch updates
+for Cargo and GitHub Actions weekly. The MSRV, `rust-version` in the root
+`Cargo.toml`, equals the toolchain in `rust-toolchain.toml`; bump both
+together.

@@ -3,6 +3,7 @@ name = "leep-testkit"
 description = "Fault injection for Leep's storage traits, for tests only"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 publish = false
 
