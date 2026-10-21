@@ -114,6 +114,16 @@ fn commit_land_and_read_back() {
     let r = call(&s, "leep_read_file", json!({ "path": "missing.txt" }));
     assert_eq!(r["isError"], true);
     assert!(text(&r).contains("404"), "{}", text(&r));
+    // The server's id for the failed request, for its logs; a new one per call.
+    let id_of = |r: &Value| {
+        let t = text(r);
+        let (_, rest) = t
+            .split_once("(server request id: ")
+            .unwrap_or_else(|| panic!("no request id in {t}"));
+        rest[..32].to_string()
+    };
+    let again = call(&s, "leep_read_file", json!({ "path": "missing.txt" }));
+    assert_ne!(id_of(&r), id_of(&again));
     let r = call(
         &s,
         "leep_read_file",

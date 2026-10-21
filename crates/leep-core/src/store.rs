@@ -262,6 +262,8 @@ pub struct RefStep {
 }
 
 /// One recorded ref move. `old = None` is a create, `new = None` a delete.
+/// JSON on the wire (`GET /v1/reflog`) and SQL columns at rest; never hashed
+/// or encoded with postcard, so it may grow optional fields.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RefLogEntry {
     /// Increases with every entry in the store, so it orders moves across refs.
@@ -275,6 +277,14 @@ pub struct RefLogEntry {
     pub operation: String,
     #[serde(default)]
     pub message: Option<String>,
+    /// The client's id for the land this move completed (ADR 0057), when it
+    /// named one. Absent otherwise and from older servers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub land_id: Option<LandId>,
+    /// The changeset that land asked for; `new` is it or its rebased copy.
+    /// Set exactly when `land_id` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub land_changeset: Option<ChangesetId>,
 }
 
 /// One derived row to write: `(kind, key) -> value`, as in

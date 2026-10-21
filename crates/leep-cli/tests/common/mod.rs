@@ -47,6 +47,10 @@ pub struct Data {
     /// Cap every log, search and ref log page at this many items and answer
     /// `next` cursors (decimal offsets), like a server's per-request cap.
     pub page_cap: Option<usize>,
+    /// Refuse an unsigned land with an error `code` and a message without
+    /// the marker text, so only the code can tell why. Off, the mock is a
+    /// server from before codes.
+    pub codes: bool,
 }
 
 pub type Shared = Arc<Mutex<Data>>;
@@ -129,6 +133,8 @@ impl Data {
             actor: Some("mock".into()),
             operation: op.to_string(),
             message,
+            land_id: None,
+            land_changeset: None,
         });
     }
 
@@ -547,6 +553,7 @@ async fn resolve_prefix(
                 ),
                 candidates: found,
                 truncated: false,
+                code: None,
             }),
         )
             .into_response(),
@@ -817,6 +824,15 @@ async fn land(State(s): State<Shared>, Json(r): Json<LandRequest>) -> Resp<LandR
     if d.require_signed.contains(&r.target_ref)
         && !d.signatures.iter().any(|(c, _)| *c == r.changeset)
     {
+        if d.codes {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(
+                    ErrorResponse::new(format!("changeset {} lacks a signature", r.changeset))
+                        .with_code(error_code::NOT_SIGNED),
+                ),
+            ));
+        }
         return Err(err(
             StatusCode::BAD_REQUEST,
             &format!("changeset {} is not signed by a trusted key", r.changeset),

@@ -810,8 +810,8 @@ impl MetaStore for SqliteMetaStore {
     ) -> Result<Vec<RefLogEntry>> {
         let before = before_seq.map(|s| i64::try_from(s).unwrap_or(i64::MAX));
         let rows: Vec<LogRow> = sqlx::query_as(
-            "SELECT seq, name, old_target, new_target, time, actor, operation, message \
-             FROM ref_log WHERE (? IS NULL OR name = ?) AND (? IS NULL OR seq < ?) \
+            "SELECT seq, name, old_target, new_target, time, actor, operation, message, \
+             land_id, land_changeset FROM ref_log WHERE (? IS NULL OR name = ?) AND (? IS NULL OR seq < ?) \
              ORDER BY seq DESC LIMIT ?",
         )
         .bind(name)

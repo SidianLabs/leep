@@ -186,6 +186,8 @@ impl Refs {
             actor: ctx.actor.clone(),
             operation: ctx.operation.clone(),
             message: ctx.message.clone(),
+            land_id: ctx.land.as_ref().map(|l| l.id.clone()),
+            land_changeset: ctx.land.as_ref().map(|l| l.changeset),
         });
         if let (Some(land), Some(landed)) = (&ctx.land, new) {
             self.lands.insert(

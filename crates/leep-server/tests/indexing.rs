@@ -171,6 +171,7 @@ async fn retry_gets_503_with_retry_after_and_stale_ok_an_older_answer() {
             "{hint}"
         );
         let e: ErrorResponse = json(&r);
+        assert_eq!(e.code.as_deref(), Some("indexing"), "{uri}");
         let info = e.indexing.expect("indexing details");
         assert!(e.error.starts_with("indexing: "), "{}", e.error);
         assert_eq!(info.retry_after_ms, retry * 1000);

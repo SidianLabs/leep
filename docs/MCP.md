@@ -62,7 +62,11 @@ Logs go to stderr; stdout carries protocol messages only.
 
 Data tools return JSON as text and as `structuredContent`; file and diff
 tools return plain text. Failures (bad arguments, 401, 403, 404, unreachable
-server) come back as results with `isError: true`.
+server) come back as results with `isError: true`. A failure from a server
+request ends with `(server request id: ID)`: each tool call sends its own
+`X-Request-Id`, and the server logs the request under that id (see
+[RUNBOOKS.md](RUNBOOKS.md#collecting-a-bug-report)). It is unrelated to the
+`request_id` argument of `leep_commit_and_land`.
 
 ### Search
 

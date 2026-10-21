@@ -26,6 +26,13 @@ impl Reply {
         serde_json::from_slice(&self.body)
             .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&self.body)))
     }
+
+    /// The `code` of an error body, which every error must have.
+    fn code(&self) -> String {
+        self.json::<ErrorResponse>()
+            .code
+            .unwrap_or_else(|| panic!("no code: {}", String::from_utf8_lossy(&self.body)))
+    }
 }
 
 impl Client {
@@ -269,6 +276,8 @@ async fn body_limit() {
         .raw(Method::PUT, &format!("/v1/blobs/{h}"), b"too big".to_vec())
         .await;
     assert_eq!(r.status, StatusCode::PAYLOAD_TOO_LARGE);
+    // The body cap answers in plain text; clients still get a JSON error.
+    assert_eq!(r.code(), "too_large");
 }
 
 #[tokio::test]
@@ -1248,6 +1257,7 @@ async fn ref_writes_validate_names() {
             .post(&format!("/v1/refs/{bad}"), &cas(None, Some(a)))
             .await;
         assert_eq!(r.status, StatusCode::BAD_REQUEST, "{bad}");
+        assert_eq!(r.code(), "invalid_name", "{bad}");
         let r = c
             .post(
                 "/v1/land",
@@ -1263,6 +1273,7 @@ async fn ref_writes_validate_names() {
             )
             .await;
         assert_eq!(r.status, StatusCode::BAD_REQUEST, "land {bad}");
+        assert_eq!(r.code(), "invalid_name", "land {bad}");
     }
     let r = c.post("/v1/refs/a..b", &cas(None, Some(a))).await;
     let msg = r.json::<ErrorResponse>().error;
@@ -1288,8 +1299,11 @@ async fn tags_are_created_and_deleted_but_never_moved() {
     let r = c.post("/v1/refs/tags/v1", &cas(Some(a), Some(b))).await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST);
     assert!(r.json::<ErrorResponse>().error.contains("immutable"));
+    assert_eq!(r.code(), "tag_immutable");
+    // A lost swap is a `CasRefResponse`, not an error body.
     let r = c.post("/v1/refs/tags/v1", &cas(None, Some(b))).await;
     assert_eq!(r.status, StatusCode::CONFLICT);
+    assert!(!r.json::<CasRefResponse>().ok);
     let t: RefResponse = c.get("/v1/refs/tags/v1").await.json();
     assert_eq!(t.target, Some(a));
 
@@ -1307,6 +1321,7 @@ async fn tags_are_created_and_deleted_but_never_moved() {
             )
             .await;
         assert_eq!(r.status, StatusCode::BAD_REQUEST, "{name}");
+        assert_eq!(r.code(), "tag_immutable", "{name}");
     }
 
     // A tag resolves by full ref and by short name; a branch of that name wins.
@@ -1496,6 +1511,7 @@ async fn resolve_prefix_finds_one_lists_many_and_rejects_bad_input() {
     assert_eq!(amb.candidates, [a, b]);
     assert!(!amb.truncated);
     assert!(amb.error.contains("ambiguous"), "{}", amb.error);
+    assert_eq!(amb.code.as_deref(), Some("ambiguous_prefix"));
     // Clients that know only ErrorResponse still read the message.
     assert!(r.json::<ErrorResponse>().error.contains("ambiguous"));
 
@@ -1527,6 +1543,7 @@ async fn land_creates_a_missing_ref_only_when_allowed() {
 
     let r = c.post("/v1/land", &land("typo", Some(false))).await;
     assert_eq!(r.status, StatusCode::NOT_FOUND);
+    assert_eq!(r.code(), "ref_missing");
     let e: ErrorResponse = r.json();
     assert!(
         e.error.contains(leep_core::refname::MISSING_REF_MARKER),
@@ -1783,4 +1800,164 @@ async fn list_endpoints_page_with_cursors() {
         ))
         .await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn every_error_has_a_code() {
+    let c = Client::new();
+    let a = c.commit(&[], &[("a", Some("1"))], "a").await;
+    let cases = [
+        (
+            c.get(&format!(
+                "/v1/changesets/{}",
+                ChangesetId(Hash::of_blob(b"none"))
+            ))
+            .await,
+            StatusCode::NOT_FOUND,
+            "not_found",
+        ),
+        (
+            c.get("/v1/resolve/nope").await,
+            StatusCode::NOT_FOUND,
+            "not_found",
+        ),
+        (
+            c.get("/v1/blobs/zz").await,
+            StatusCode::BAD_REQUEST,
+            "invalid",
+        ),
+        (
+            c.get(&format!("/v1/log/{a}?limit=many")).await,
+            StatusCode::BAD_REQUEST,
+            "invalid",
+        ),
+        (
+            c.raw(Method::POST, "/v1/land", b"{".to_vec()).await,
+            StatusCode::BAD_REQUEST,
+            "invalid",
+        ),
+        // Routing answers without a handler; still a JSON error.
+        (
+            c.get("/v1/no-such-endpoint").await,
+            StatusCode::NOT_FOUND,
+            "not_found",
+        ),
+        (
+            c.raw(Method::DELETE, "/v1/land", vec![]).await,
+            StatusCode::METHOD_NOT_ALLOWED,
+            "invalid",
+        ),
+    ];
+    for (r, status, code) in cases {
+        assert_eq!((r.status, r.code().as_str()), (status, code));
+        assert!(error_code::ALL.contains(&code));
+        assert!(!r.json::<ErrorResponse>().error.is_empty());
+    }
+
+    // A plain-text 503 from below the handlers (a load shedder, say) is
+    // `unavailable`, not `internal`, and keeps its Retry-After.
+    let busy = Client(
+        Router::new()
+            .route(
+                "/busy",
+                axum::routing::get(|| async {
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        [("retry-after", "2")],
+                        "overloaded",
+                    )
+                }),
+            )
+            .layer(axum::middleware::from_fn(leep_server::errors::json_errors)),
+    );
+    let r = busy.get("/busy").await;
+    assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(r.code(), "unavailable");
+    assert_eq!(r.headers["retry-after"], "2");
+    assert_eq!(r.json::<ErrorResponse>().error, "overloaded");
+}
+
+#[tokio::test]
+async fn a_reused_land_id_has_its_own_code() {
+    let c = Client::new();
+    let a = c.commit(&[], &[("a", Some("1"))], "a").await;
+    let b = c.commit(&[a], &[("a", Some("2"))], "b").await;
+    let id: LandId = "00112233445566778899aabbccddeeff".parse().unwrap();
+    let land = |changeset| LandRequest {
+        changeset,
+        target_ref: "main".into(),
+        create: None,
+        land_id: Some(id.clone()),
+    };
+    assert_eq!(c.post("/v1/land", &land(a)).await.status, StatusCode::OK);
+    let r = c.post("/v1/land", &land(b)).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert_eq!(r.code(), "land_id_reused");
+}
+
+async fn with_request_id(c: &Client, uri: &str, id: Option<&str>) -> Reply {
+    let mut req = Request::builder().uri(uri);
+    if let Some(id) = id {
+        req = req.header(REQUEST_ID_HEADER, id);
+    }
+    let resp =
+        c.0.clone()
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+    let (parts, body) = resp.into_parts();
+    Reply {
+        status: parts.status,
+        headers: parts.headers,
+        body: body.collect().await.unwrap().to_bytes().to_vec(),
+    }
+}
+
+fn echoed(r: &Reply) -> String {
+    r.headers[REQUEST_ID_HEADER].to_str().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn request_ids_are_kept_or_made_and_echoed() {
+    let c = Client::new();
+    // A valid client id is kept, echoed and named in the error body.
+    let r = with_request_id(&c, "/v1/resolve/nope", Some("agent-7:run/42")).await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
+    assert_eq!(echoed(&r), "agent-7:run/42");
+    let e: ErrorResponse = r.json();
+    assert_eq!(e.request_id.as_deref(), Some("agent-7:run/42"));
+    assert_eq!(e.code.as_deref(), Some("not_found"));
+
+    // Without one, or with one that is too long or outside the charset
+    // (spaces, `=`, non-ASCII), the server makes its own.
+    let long = "x".repeat(129);
+    for id in [
+        None,
+        Some(long.as_str()),
+        Some("caf\u{e9}"),
+        Some("with space"),
+        Some("x status=200 route=/v1/land"),
+    ] {
+        let r = with_request_id(&c, "/v1/resolve/nope", id).await;
+        let made = echoed(&r);
+        assert_eq!(made.len(), 32, "{made}");
+        assert!(made.bytes().all(|b| b.is_ascii_hexdigit()), "{made}");
+        assert_eq!(r.json::<ErrorResponse>().request_id, Some(made));
+    }
+    let a = echoed(&with_request_id(&c, "/v1/refs", None).await);
+    let b = echoed(&with_request_id(&c, "/v1/refs", None).await);
+    assert_ne!(a, b, "one id per request");
+
+    // Successes carry the header; their bodies are untouched.
+    let r = with_request_id(&c, "/v1/refs", Some("ok-1")).await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert_eq!(echoed(&r), "ok-1");
+    assert!(r.json::<serde_json::Value>().get("request_id").is_none());
+
+    // Errors that start as plain text get it too.
+    let r = with_request_id(&c, "/v1/no-such-endpoint", Some("t-404")).await;
+    assert_eq!(
+        r.json::<ErrorResponse>().request_id.as_deref(),
+        Some("t-404")
+    );
 }

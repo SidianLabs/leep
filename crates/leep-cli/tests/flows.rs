@@ -694,6 +694,33 @@ mod signing {
     }
 
     #[test]
+    fn land_goes_by_the_error_code_when_the_server_sends_one() {
+        let mock = Mock::start();
+        {
+            let mut d = mock.data.lock().unwrap();
+            d.require_signed.insert("main".into());
+            d.codes = true;
+        }
+        let (wc_dir, cache) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let mut ctx = init_wc(&mock, wc_dir.path(), cache.path(), &[]).unwrap();
+        write(&ctx, "a.txt", "one\n");
+        commit::run(&mut ctx, &commit_args("unsigned")).unwrap();
+        let e = land::run(
+            &mut ctx,
+            &LandArgs {
+                target_ref: None,
+                create: false,
+            },
+        )
+        .unwrap_err();
+        let msg = e.to_string();
+        assert!(!msg.contains("is not signed by a trusted key"), "{msg}");
+        assert!(msg.contains("leep commit --sign"), "{msg}");
+        assert_eq!(e.server_code(), Some("not_signed"));
+        assert_eq!(e.to_json()["error"]["server_code"], "not_signed");
+    }
+
+    #[test]
     fn land_onto_a_signature_required_ref_explains_what_to_do() {
         let mock = Mock::start();
         mock.data
@@ -719,9 +746,12 @@ mod signing {
             },
         )
         .unwrap_err();
+        // The mock sends no error code, like a server from before codes: the
+        // marker text in the message is what names the reason.
         let msg = e.to_string();
         assert!(msg.contains("is not signed by a trusted key"), "{msg}");
         assert!(msg.contains("leep commit --sign"), "{msg}");
+        assert_eq!(e.server_code(), None);
         assert_eq!(e.exit_code(), 1);
         assert!(!mock.data.lock().unwrap().refs.contains_key("main"));
 
