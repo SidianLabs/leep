@@ -26,6 +26,6 @@ pub use path::RepoPath;
 pub use store::{
     check_land_key, check_ref_chain, land_id_taken, BlobMeta, BlobStore, DeleteStep, DerivedRow,
     LandId, LandKey, LandRecord, Lease, LeaseClaim, LeaseKey, LeaseTiming, MetaStore, RefLogEntry,
-    RefStep, RefUpdateContext, RowCount, LAND_LEASE_SCOPE,
+    RefStep, RefUpdateContext, RowCount, INDEX_LEASE_SCOPE, LAND_LEASE_SCOPE,
 };
 pub use tree::{TreeEntry, TreeNode};

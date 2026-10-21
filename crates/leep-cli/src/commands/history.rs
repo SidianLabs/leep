@@ -48,6 +48,10 @@ pub struct LogArgs {
     /// value); repeatable, all must match.
     #[arg(long, value_name = "KEY[=VALUE]")]
     pub extra: Vec<String>,
+    /// When the server's index lags, answer at the newest indexed changeset
+    /// instead of waiting for it (says which on stderr).
+    #[arg(long)]
+    pub stale_ok: bool,
 }
 
 impl LogArgs {
@@ -104,6 +108,9 @@ pub struct LastChangeArgs {
     /// Revision to look from (default: working copy base, else target ref).
     #[arg(long)]
     pub rev: Option<String>,
+    /// See `leep log --stale-ok`.
+    #[arg(long)]
+    pub stale_ok: bool,
 }
 
 #[derive(Args, Debug)]
@@ -129,6 +136,21 @@ pub struct BlameArgs {
     /// changeset id alone.
     #[arg(long)]
     pub who: bool,
+    /// See `leep log --stale-ok`.
+    #[arg(long)]
+    pub stale_ok: bool,
+}
+
+/// Say on stderr that an answer is for an older changeset than asked
+/// (`--stale-ok`, ADR 0058).
+pub fn note_stale(answered_at: Option<leep_core::ChangesetId>, behind: Option<u64>) {
+    if let Some(at) = answered_at {
+        eprintln!(
+            "(answered at {}, {} behind)",
+            short(at),
+            behind.unwrap_or(0)
+        );
+    }
 }
 
 /// `abbreviate` prints the 12-digit short id, which every command accepts
@@ -173,7 +195,9 @@ fn follow_lines(info: &ChangesetInfo) -> Vec<String> {
 
 pub fn log(r: &Remote, args: &LogArgs) -> Result<i32> {
     let id = r.resolve_default(args.rev.as_deref())?;
-    let resp = r.client.log_all(&id, &args.query()?, args.limit as usize)?;
+    let client = r.client.clone().with_stale_ok(args.stale_ok);
+    let resp = client.log_all(&id, &args.query()?, args.limit as usize)?;
+    note_stale(resp.answered_at, resp.behind);
     if r.json {
         print_json(&resp)?;
         return Ok(0);
@@ -189,7 +213,9 @@ pub fn log(r: &Remote, args: &LogArgs) -> Result<i32> {
 
 pub fn last_change(r: &Remote, args: &LastChangeArgs) -> Result<i32> {
     let id = r.resolve_default(args.rev.as_deref())?;
-    let resp = r.client.last_change(&id, &args.path)?;
+    let client = r.client.clone().with_stale_ok(args.stale_ok);
+    let resp = client.last_change(&id, &args.path)?;
+    note_stale(resp.answered_at, resp.behind);
     if r.json {
         print_json(&resp)?;
         return Ok(0);
@@ -266,7 +292,9 @@ pub fn blame(r: &Remote, args: &BlameArgs) -> Result<i32> {
         _ => return Err(CliError::user("usage: leep blame [REV] PATH")),
     };
     let id = r.resolve_default(rev)?;
-    let resp = r.client.blame(&id, path)?;
+    let client = r.client.clone().with_stale_ok(args.stale_ok);
+    let resp = client.blame(&id, path)?;
+    note_stale(resp.answered_at, resp.behind);
     if r.json {
         print_json(&resp)?;
         return Ok(0);
@@ -451,6 +479,7 @@ mod tests {
 
     fn log_args() -> LogArgs {
         LogArgs {
+            stale_ok: false,
             rev: None,
             path: None,
             follow: None,
@@ -588,6 +617,8 @@ mod tests {
                 .unwrap_or_default(),
         };
         let resp = BlameResponse {
+            answered_at: None,
+            behind: None,
             path: RepoPath::new("f").unwrap(),
             lines: vec![line(human, "a"), line(bot, "b")],
             changesets: BTreeMap::from([

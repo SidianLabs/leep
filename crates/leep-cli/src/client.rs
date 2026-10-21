@@ -9,6 +9,13 @@
 //! A 429 from the server's request limits (ADR 0020) is retried for GET
 //! requests only, honoring `Retry-After`; anything else fails at once, since a
 //! blind retry of a write could repeat it.
+//!
+//! Index-backed queries (log, last-change, blame, search) send
+//! `Leep-Indexing: retry` (ADR 0058): a server whose index lags answers 503
+//! with `Retry-After`, which is retried, saying so on stderr, for up to
+//! `LEEP_INDEX_WAIT` seconds (60) in all, then reported as `indexing`.
+//! With `--stale-ok` they send `stale-ok` and take an answer at an older
+//! changeset instead.
 
 use std::time::Duration;
 
@@ -35,6 +42,22 @@ pub struct Client {
     base: String,
     http: Http,
     has_token: bool,
+    /// Index-backed queries accept an answer at an older changeset.
+    stale_ok: bool,
+    /// How long, and how many times, index-backed queries retry an
+    /// indexing 503: `LEEP_INDEX_WAIT` and unlimited unless set.
+    index_retry: Option<(Duration, u32)>,
+}
+
+/// How long index-backed queries keep retrying an indexing 503, unless
+/// `LEEP_INDEX_WAIT` (seconds) says otherwise.
+const INDEX_WAIT: Duration = Duration::from_secs(60);
+
+fn index_wait() -> Duration {
+    std::env::var("LEEP_INDEX_WAIT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map_or(INDEX_WAIT, Duration::from_secs)
 }
 
 /// Parameters of `GET /v1/log/{id}`; `extra` entries are `key:value` or `key`.
@@ -166,6 +189,55 @@ impl Client {
             base: server.trim_end_matches('/').to_string(),
             http: builder.build().expect("http client builds"),
             has_token: token.is_some(),
+            stale_ok: false,
+            index_retry: None,
+        }
+    }
+
+    /// Retry an indexing 503 at most `retries` times within `within`.
+    pub fn with_index_retries(mut self, within: Duration, retries: u32) -> Self {
+        self.index_retry = Some((within, retries));
+        self
+    }
+
+    /// Ask index-backed queries for an answer at the newest indexed
+    /// changeset when the index lags (`Leep-Indexing: stale-ok`), instead
+    /// of waiting for it.
+    pub fn with_stale_ok(mut self, yes: bool) -> Self {
+        self.stale_ok = yes;
+        self
+    }
+
+    /// An index-backed query: sent with `Leep-Indexing`, and retried while
+    /// the server answers that its index is behind, for at most
+    /// `LEEP_INDEX_WAIT` in all.
+    fn indexed<T: DeserializeOwned>(&self, make: impl Fn() -> RequestBuilder) -> Result<T> {
+        let value = if self.stale_ok {
+            INDEXING_STALE_OK
+        } else {
+            INDEXING_RETRY
+        };
+        let started = std::time::Instant::now();
+        let (limit, mut retries) = self.index_retry.unwrap_or((index_wait(), u32::MAX));
+        loop {
+            match self.json(make().header(INDEXING_HEADER, value)) {
+                Err(e) if e.kind() == ErrorKind::Indexing => {
+                    let wait = Duration::from_millis(e.retry_after_ms().unwrap_or(1000))
+                        .clamp(Duration::from_millis(100), MAX_RETRY_WAIT)
+                        .min(limit.saturating_sub(started.elapsed()));
+                    if retries == 0 || wait.is_zero() {
+                        return Err(e);
+                    }
+                    retries -= 1;
+                    eprintln!(
+                        "{}, retrying in {}s",
+                        e.message(),
+                        wait.as_secs_f64().ceil()
+                    );
+                    std::thread::sleep(wait);
+                }
+                r => return r,
+            }
         }
     }
 
@@ -458,11 +530,11 @@ impl Client {
     }
 
     pub fn log(&self, id: &ChangesetId, q: &LogQuery) -> Result<LogResponse> {
-        self.json(
+        self.indexed(|| {
             self.http
                 .get(self.url(&format!("/v1/log/{id}")))
-                .query(&q.params()),
-        )
+                .query(&q.params())
+        })
     }
 
     /// Up to `want` log entries, following page cursors past the server's
@@ -473,6 +545,8 @@ impl Client {
         let mut out = LogResponse {
             entries: Vec::new(),
             next: None,
+            answered_at: None,
+            behind: None,
         };
         loop {
             let left = want - out.entries.len();
@@ -480,6 +554,11 @@ impl Client {
             let page = self.log(id, &q)?;
             out.entries.extend(page.entries);
             out.next = page.next;
+            // Later pages continue the walk the first one pinned.
+            if out.answered_at.is_none() {
+                out.answered_at = page.answered_at;
+                out.behind = page.behind;
+            }
             if out.entries.len() >= want || out.next.is_none() {
                 return Ok(out);
             }
@@ -489,11 +568,11 @@ impl Client {
 
     /// Newest change to a file or directory, from the server's path index.
     pub fn last_change(&self, id: &ChangesetId, path: &str) -> Result<LastChangeResponse> {
-        self.json(
+        self.indexed(|| {
             self.http
                 .get(self.url(&format!("/v1/last-change/{id}")))
-                .query(&[("path", path)]),
-        )
+                .query(&[("path", path)])
+        })
     }
 
     pub fn provenance(
@@ -513,11 +592,11 @@ impl Client {
     }
 
     pub fn search(&self, id: &ChangesetId, q: &SearchQuery) -> Result<SearchResponse> {
-        self.json(
+        self.indexed(|| {
             self.http
                 .get(self.url(&format!("/v1/search/{id}")))
-                .query(&q.params()),
-        )
+                .query(&q.params())
+        })
     }
 
     /// Up to `want` matches, following page cursors past the server's
@@ -539,6 +618,10 @@ impl Client {
             add_stats(&mut out.stats, &page.stats);
             out.truncated = page.truncated;
             out.next = page.next;
+            if out.answered_at.is_none() {
+                out.answered_at = page.answered_at;
+                out.behind = page.behind;
+            }
             if out.matches.len() >= want || out.next.is_none() {
                 return Ok(out);
             }
@@ -591,11 +674,11 @@ impl Client {
     }
 
     pub fn blame(&self, id: &ChangesetId, path: &str) -> Result<BlameResponse> {
-        self.json(
+        self.indexed(|| {
             self.http
                 .get(self.url(&format!("/v1/blame/{id}")))
-                .query(&[("path", path)]),
-        )
+                .query(&[("path", path)])
+        })
     }
 
     pub fn merge_base(&self, a: &ChangesetId, b: &ChangesetId) -> Result<MergeBaseResponse> {
@@ -702,9 +785,23 @@ fn error_from(resp: Response, has_token: bool) -> CliError {
                 .with_hint("give more digits of the id; the candidates are listed above");
         }
     }
-    let msg = serde_json::from_str::<ErrorResponse>(&body)
+    let parsed = serde_json::from_str::<ErrorResponse>(&body).ok();
+    if let Some(info) = parsed.as_ref().and_then(|e| e.indexing.clone()) {
+        if status == StatusCode::SERVICE_UNAVAILABLE {
+            return CliError::new(
+                ErrorKind::Indexing,
+                format!(
+                    "indexing: {} changesets behind ({})",
+                    info.behind, info.kind
+                ),
+            )
+            .with_retry_after_ms(info.retry_after_ms)
+            .with_hint("the server's index is catching up; run the command again later, or pass --stale-ok");
+        }
+    }
+    let msg = parsed
         .map(|e| e.error)
-        .unwrap_or_else(|_| body.trim().to_string());
+        .unwrap_or_else(|| body.trim().to_string());
     let msg = if msg.is_empty() {
         format!("server returned {status}")
     } else {
@@ -765,6 +862,94 @@ mod tests {
             }
         });
         (url, seen)
+    }
+
+    /// [`stub`], also keeping each request's head.
+    fn recording_stub(responses: Vec<String>) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let heads = seen.clone();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let mut conn = conn.unwrap();
+                let mut buf = [0u8; 4096];
+                let mut got = Vec::new();
+                while !got.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let n = conn.read(&mut buf).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    got.extend_from_slice(&buf[..n]);
+                }
+                let i = {
+                    let mut h = heads.lock().unwrap();
+                    h.push(String::from_utf8_lossy(&got).to_lowercase());
+                    (h.len() - 1).min(responses.len() - 1)
+                };
+                conn.write_all(responses[i].as_bytes()).unwrap();
+            }
+        });
+        (url, seen)
+    }
+
+    fn reply(status: &str, extra: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\n{extra}content-type: application/json\r\ncontent-length: {}\r\n\
+             connection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn indexing_503() -> String {
+        reply(
+            "503 Service Unavailable",
+            "retry-after: 1\r\nleep-indexing: kind=history-tree-v4; behind=5210\r\n",
+            r#"{"error":"indexing: history-tree-v4 is 5210 changesets behind; retry in 1s","indexing":{"kind":"history-tree-v4","behind":5210,"retry_after_ms":100}}"#,
+        )
+    }
+
+    #[test]
+    fn indexed_queries_send_the_header_and_retry_an_indexing_503() {
+        let ok = reply("200 OK", "", r#"{"entries":[]}"#);
+        let (url, heads) = recording_stub(vec![indexing_503(), ok]);
+        let id = ChangesetId(Hash::of_blob(b"x"));
+        let log = Client::new(&url).log(&id, &LogQuery::default()).unwrap();
+        assert!(log.entries.is_empty());
+        let heads = heads.lock().unwrap().clone();
+        assert_eq!(heads.len(), 2, "one retry");
+        assert!(
+            heads.iter().all(|h| h.contains("leep-indexing: retry")),
+            "{heads:?}"
+        );
+
+        let (url, heads) = recording_stub(vec![reply("200 OK", "", r#"{"entries":[]}"#)]);
+        Client::new(&url)
+            .with_stale_ok(true)
+            .log(&id, &LogQuery::default())
+            .unwrap();
+        assert!(heads.lock().unwrap()[0].contains("leep-indexing: stale-ok"));
+    }
+
+    #[test]
+    fn an_indexing_503_past_the_wait_is_an_indexing_error() {
+        let (url, heads) = recording_stub(vec![indexing_503()]);
+        let id = ChangesetId(Hash::of_blob(b"x"));
+        let e = Client::new(&url)
+            .with_index_retries(Duration::from_secs(5), 1)
+            .blame(&id, "f")
+            .unwrap_err();
+        assert_eq!(heads.lock().unwrap().len(), 2, "one retry within the wait");
+        assert_eq!(e.kind(), ErrorKind::Indexing);
+        assert!(e.is_retryable());
+        assert_eq!(e.exit_code(), crate::error::exit::SERVER);
+        assert_eq!(e.retry_after_ms(), Some(100));
+        assert_eq!(e.to_json()["error"]["retry_after_ms"], 100);
+        assert!(
+            e.message().contains("5210 changesets behind"),
+            "{}",
+            e.message()
+        );
     }
 
     const LIMITED_NOW: &str = "HTTP/1.1 429 Too Many Requests\r\nretry-after: 0\r\n\

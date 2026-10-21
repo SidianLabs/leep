@@ -7,6 +7,60 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 ## [Unreleased]
 
+### One indexer per index group (ADR 0058)
+- `leep-server --indexing local|lease|off` (default `local`, unchanged). In
+  `lease` mode each index group (path history, log filter, code search) is
+  warmed only by the server holding its index lease (scope `index` of the
+  `leases` table; 15 s TTL, renewed every 3 s, taken over 6 s after the last
+  renewal); `off` never warms. `--index-kinds` limits the groups a server
+  competes for.
+- In `lease` and `off` modes, while an index lease is live, path logs
+  (`follow` too), `last-change`, blame, filtered logs and search never derive
+  an index: they examine the un-indexed part directly within
+  `--query-scan-budget` (1,024 changesets), `--blame-scan-budget` (128),
+  `--search-scan-budget` (512 files) and `--search-scan-bytes` (16 MiB), with
+  the answers a fully indexed store gives. Over budget a request with
+  `Leep-Indexing: retry` gets `503` with `Retry-After` and an `indexing` error
+  body, one with `stale-ok` an answer at the newest indexed first-parent
+  ancestor (`answered_at`, `behind`), and one without the header waits for
+  the indexer (`--index-wait` 10 s, `--index-waiters` 64), then scans with 8
+  times the budgets (`--legacy-scan-factor`), then gets the 503. Without a
+  live lease queries derive inline as before.
+- Additive API: request header `Leep-Indexing`, response headers
+  `Leep-Indexing` (on the 503) and `Leep-Index-Scanned`, `indexing` on error
+  bodies, `answered_at` and `behind` on log, last-change, blame and search
+  responses, `stats.files_unindexed` on search, ready feature
+  `indexing-retry`.
+- A filtered log page (`author`, `extra`) now carries `next` only when
+  another match follows, so it is never empty with `next`. To know that, a
+  full page walks on to the next match, so a page whose filter matches
+  rarely costs about what the following page used to.
+- `leep log`, `last-change`, `blame` and `search` send `Leep-Indexing:
+  retry`, retry an indexing 503 for up to `LEEP_INDEX_WAIT` seconds (60), then
+  fail with error code `indexing` (exit 3, `retry_after_ms` in `--json`);
+  `--stale-ok` takes the older answer. MCP read tools take it by default
+  and report `answered_at`/`behind`; `fresh: true` insists on the head.
+- `repair drop`, `repair rederive --missing` and `upgrade-index --yes` take
+  the index leases of the groups they touch and wait `--index-fence` (60 s)
+  before touching rows; a live holder is refused unless `--ignore-lease`,
+  which `repair drop` and `upgrade-index --drop-first` refuse.
+- `last_merge-v1` is written with each changeset.
+- In `local` mode the warmer now warms code search side by side with path
+  history and the log filter in each pass, instead of after them.
+- New metrics: `leep_index_lease_held`, `leep_index_lease_acquired_total`,
+  `leep_index_lease_lost_total`, `leep_index_derived_total`,
+  `leep_index_backlog_changesets`, `leep_index_lag_seconds`,
+  `leep_query_unindexed_scanned_total`, `leep_query_indexing_answers_total`,
+  `leep_query_stale_answers_total`, `leep_query_inline_derive_total`,
+  `leep_query_index_wait_seconds`, `leep_query_index_waiters`,
+  `leep_create_last_merge_skipped_total`; alerts `LeepIndexLagging`,
+  `LeepIndexerMissing`, `LeepIndexingAnswersHigh`.
+- Code search builds a directory's filter with one batched read of its
+  subdirectories' and files' rows (a directory of 500 agent directories
+  made every search on a new head do 500 round trips).
+- `leep-swarm --indexing-header` and indexing, stale and inline-derivation
+  counts in its report.
+
 ### Core loop (M1)
 - Content-addressed data model (BLAKE3, postcard), storage traits and API
   types.

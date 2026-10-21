@@ -782,3 +782,94 @@ fn retried_commit_and_land_lands_once() {
     );
     assert_eq!(r["isError"], true);
 }
+
+/// ADR 0058: read tools take an answer at the newest indexed changeset when
+/// the server's index lags (`answered_at`, `behind`), unless `fresh`, which
+/// gets an error naming the index, the lag and when to retry.
+#[test]
+fn read_tools_take_stale_answers_unless_fresh() {
+    use leep_core::{LeaseClaim, LeaseKey, LeaseTiming, MetaStore};
+    use leep_derive::indexing::{
+        Budgets, IndexGroup, IndexLeaseConfig, IndexLeases, IndexMode, IndexPolicy,
+    };
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let meta =
+        Arc::new(leep_core::memory::MemoryMetaStore::new().with_lease_clock(Arc::new(|| 1_000)));
+    let repo = leep_derive::Repo::new(
+        Arc::new(leep_core::memory::MemoryBlobStore::new()),
+        meta.clone(),
+    );
+    let leases = IndexLeases::new(meta.clone(), IndexLeaseConfig::new("query", ""));
+    let policy = IndexPolicy::new(IndexMode::Off, leases)
+        .with_budgets(Budgets {
+            scan: 0,
+            blame: 0,
+            search_files: 0,
+            ..Budgets::default()
+        })
+        .with_index_wait(Duration::ZERO, 1);
+    let url = serve(leep_server::router(
+        repo.clone().with_index_policy(Arc::new(policy)),
+    ));
+    let s = Server::new(config(&url));
+    let first = data(&commit(
+        &s,
+        json!({ "message": "one", "changes": [{ "path": "a.txt", "content": "one\n" }] }),
+    ))["landed"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let id: leep_core::ChangesetId = first.parse().unwrap();
+        leep_derive::derived::derive::<leep_derive::derived::HistoryTree>(&repo, id)
+            .await
+            .unwrap();
+        repo.derive_search(id).await.unwrap();
+        for g in IndexGroup::ALL {
+            let key = LeaseKey::index(g.lease_name());
+            meta.acquire_lease(
+                &LeaseClaim {
+                    key: &key,
+                    holder: "indexer",
+                    address: "",
+                    protocol: 1,
+                    meta: "",
+                },
+                LeaseTiming {
+                    ttl: Duration::from_secs(15),
+                    stale_after: Duration::from_secs(6),
+                },
+            )
+            .await
+            .unwrap();
+        }
+    });
+    for i in 0..3 {
+        data(&commit(
+            &s,
+            json!({ "message": format!("m{i}"), "changes": [{ "path": "a.txt", "content": format!("one\n{i}\n") }] }),
+        ));
+    }
+    let log = data(&call(&s, "leep_log", json!({ "path": "a.txt" })));
+    assert_eq!(log["answered_at"], first);
+    assert_eq!(log["behind"], 3);
+    assert_eq!(log["entries"].as_array().unwrap().len(), 1);
+    let found = data(&call(&s, "leep_search", json!({ "query": "one" })));
+    assert_eq!(found["answered_at"], first);
+    let blame = call(&s, "leep_blame", json!({ "path": "a.txt" }));
+    assert_eq!(blame["isError"], false, "{}", text(&blame));
+    assert!(text(&blame).contains("answered_at"), "{}", text(&blame));
+
+    let fresh = call(&s, "leep_log", json!({ "path": "a.txt", "fresh": true }));
+    assert_eq!(fresh["isError"], true);
+    let msg = text(&fresh);
+    assert!(
+        msg.contains("history-tree-v4")
+            && msg.contains("3 changesets behind")
+            && msg.contains("retry in"),
+        "{msg}"
+    );
+}

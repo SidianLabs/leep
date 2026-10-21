@@ -17,6 +17,7 @@ pub mod derived;
 mod filter_log;
 pub mod gc;
 mod history;
+pub mod indexing;
 pub mod integrity;
 mod land;
 pub mod land_coord;
@@ -38,9 +39,13 @@ pub mod warm;
 #[cfg(test)]
 mod blame_tests;
 #[cfg(test)]
+mod bounded_tests;
+#[cfg(test)]
 mod fault_tests;
 #[cfg(test)]
 mod flush_tests;
+#[cfg(test)]
+mod index_lease_tests;
 #[cfg(test)]
 mod land_batch_tests;
 #[cfg(test)]

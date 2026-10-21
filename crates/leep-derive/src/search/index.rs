@@ -4,12 +4,14 @@
 
 use std::collections::btree_map;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use bytes::Bytes;
 use futures_util::{stream, StreamExt};
 use leep_core::{Error, FileKind, Hash, Result, TreeEntry};
 
 use super::trigram::{BlobRow, Bloom, Skip, MAX_INDEXED_BYTES};
+use crate::indexing::bounded::SearchScan;
 use crate::Repo;
 
 /// Per-blob trigram set, keyed by blob hash.
@@ -22,12 +24,23 @@ pub(super) const CONCURRENCY: usize = 16;
 
 /// Rows computed (not read) during one operation.
 #[derive(Default)]
-pub(super) struct Counters {
+pub(crate) struct Counters {
     pub blob_rows: AtomicU64,
     pub tree_rows: AtomicU64,
+    /// A bounded query (ADR 0058): rows are computed into this, never
+    /// stored, within its budget.
+    pub(crate) scan: Option<Arc<SearchScan>>,
 }
 
 impl Counters {
+    /// Counters for a bounded query that computes missing rows into `scan`.
+    pub(crate) fn scanning(scan: Arc<SearchScan>) -> Self {
+        Counters {
+            scan: Some(scan),
+            ..Counters::default()
+        }
+    }
+
     pub fn blob_rows(&self) -> u64 {
         self.blob_rows.load(Ordering::Relaxed)
     }
@@ -47,6 +60,8 @@ struct Frame {
     entries: btree_map::IntoIter<String, TreeEntry>,
     files: Vec<(Hash, u64)>,
     bloom: Bloom,
+    /// Stored filters of the subdirectories, read in one batch.
+    rows: std::collections::HashMap<Hash, Bytes>,
 }
 
 impl Repo {
@@ -54,6 +69,9 @@ impl Repo {
     /// oversize blob is recorded without being fetched.
     async fn blob_row_raw(&self, hash: Hash, size: u64, c: &Counters) -> Result<RawRow> {
         if let Some(v) = self.meta().get_derived(BLOB_KIND, &hash).await? {
+            return Ok(RawRow::Stored(v));
+        }
+        if let Some(v) = c.scan.as_ref().and_then(|s| s.get(false, &hash)) {
             return Ok(RawRow::Stored(v));
         }
         let row = if size > MAX_INDEXED_BYTES {
@@ -64,8 +82,16 @@ impl Repo {
                 .get(&hash)
                 .await?
                 .ok_or_else(|| Error::Storage(format!("blob {hash} missing while indexing")))?;
+            if let Some(scan) = &c.scan {
+                scan.fetched(data.len() as u64)?;
+            }
             BlobRow::of(&data)
         };
+        if let Some(scan) = &c.scan {
+            let bytes = Bytes::from(row.encode());
+            scan.put(false, hash, bytes.clone());
+            return Ok(RawRow::Stored(bytes));
+        }
         self.meta()
             .put_derived(BLOB_KIND, &hash, Bytes::from(row.encode()))
             .await?;
@@ -82,7 +108,7 @@ impl Repo {
     }
 
     /// The encoded row, for probing without decoding it.
-    pub(super) async fn blob_row_bytes(
+    pub(crate) async fn blob_row_bytes(
         &self,
         hash: Hash,
         size: u64,
@@ -100,7 +126,67 @@ impl Repo {
             entries: self.read_tree(hash).await?.entries.into_iter(),
             files: Vec::new(),
             bloom: Bloom::default(),
+            rows: Default::default(),
         })
+    }
+
+    /// [`Repo::frame`] with its subdirectories' stored filters read in one
+    /// batch: a directory of hundreds of subdirectories (one per agent)
+    /// otherwise costs a round trip each.
+    async fn frame_with_rows(&self, hash: Hash) -> Result<Frame> {
+        let node = self.read_tree(hash).await?;
+        let dirs: Vec<Hash> = node
+            .entries
+            .values()
+            .filter_map(|e| match e {
+                TreeEntry::Dir { tree } => Some(*tree),
+                TreeEntry::File { .. } => None,
+            })
+            .collect();
+        let mut rows = std::collections::HashMap::new();
+        if !dirs.is_empty() {
+            let found = self.meta().get_derived_many(TREE_KIND, &dirs).await?;
+            for (h, row) in dirs.into_iter().zip(found) {
+                if let Some(row) = row {
+                    rows.insert(h, row);
+                }
+            }
+        }
+        Ok(Frame {
+            hash,
+            entries: node.entries.into_iter(),
+            files: Vec::new(),
+            bloom: Bloom::default(),
+            rows,
+        })
+    }
+
+    /// Blob rows of `files` in one batched read, computing the missing ones.
+    async fn blob_rows_of(&self, files: Vec<(Hash, u64)>, c: &Counters) -> Result<Vec<BlobRow>> {
+        let keys: Vec<Hash> = files.iter().map(|f| f.0).collect();
+        let stored = if keys.is_empty() {
+            Vec::new()
+        } else {
+            self.meta().get_derived_many(BLOB_KIND, &keys).await?
+        };
+        let stored = if stored.len() == keys.len() {
+            stored
+        } else {
+            vec![None; keys.len()]
+        };
+        let mut rows = stream::iter(files.into_iter().zip(stored))
+            .map(|((h, size), row)| async move {
+                match row {
+                    Some(b) => BlobRow::decode(&b),
+                    None => self.blob_row(h, size, c).await,
+                }
+            })
+            .buffered(CONCURRENCY);
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await {
+            out.push(row?);
+        }
+        Ok(out)
     }
 
     /// The encoded filter of the tree node `root`. Missing rows below it are
@@ -108,24 +194,30 @@ impl Repo {
     /// overflow the call stack, and existing rows stop the descent: a
     /// revision that changed one file derives one row per directory on its
     /// path.
-    pub(super) async fn tree_row(&self, root: Hash, c: &Counters) -> Result<Bytes> {
+    pub(crate) async fn tree_row(&self, root: Hash, c: &Counters) -> Result<Bytes> {
         let meta = self.meta();
         if let Some(v) = meta.get_derived(TREE_KIND, &root).await? {
             return Ok(v);
         }
-        let mut stack = vec![self.frame(root).await?];
+        let memo = |h: &Hash| c.scan.as_ref().and_then(|s| s.get(true, h));
+        if let Some(v) = memo(&root) {
+            return Ok(v);
+        }
+        let mut stack = vec![self.frame_with_rows(root).await?];
         loop {
             let top = stack.last_mut().expect("stack is non-empty");
             let mut missing = None;
             for (_, entry) in top.entries.by_ref() {
                 match entry {
-                    TreeEntry::Dir { tree } => match meta.get_derived(TREE_KIND, &tree).await? {
-                        Some(row) => top.bloom.or_encoded(&row)?,
-                        None => {
-                            missing = Some(tree);
-                            break;
+                    TreeEntry::Dir { tree } => {
+                        match top.rows.get(&tree).cloned().or_else(|| memo(&tree)) {
+                            Some(row) => top.bloom.or_encoded(&row)?,
+                            None => {
+                                missing = Some(tree);
+                                break;
+                            }
                         }
-                    },
+                    }
                     TreeEntry::File {
                         content,
                         kind,
@@ -135,26 +227,35 @@ impl Repo {
                 }
             }
             if let Some(tree) = missing {
-                stack.push(self.frame(tree).await?);
+                stack.push(self.frame_with_rows(tree).await?);
                 continue;
             }
             let mut done = stack.pop().expect("stack is non-empty");
+            // The warmer's index lease (ADR 0058), asked before each
+            // directory's rows are written: a holder that lost it stops
+            // before writing a filter whose blob rows a drop may remove.
+            if c.scan.is_none() && !self.write_allowed().await {
+                return Err(Error::Other(
+                    "stopped deriving: the index lease was lost".into(),
+                ));
+            }
             let files = std::mem::take(&mut done.files);
-            let mut rows = stream::iter(files)
-                .map(|(h, size)| self.blob_row(h, size, c))
-                .buffered(CONCURRENCY);
-            while let Some(row) = rows.next().await {
-                if let BlobRow::Trigrams(set) = row? {
+            for row in self.blob_rows_of(files, c).await? {
+                if let BlobRow::Trigrams(set) = row {
                     for t in set {
                         done.bloom.insert(t);
                     }
                 }
             }
-            drop(rows);
             let row = Bytes::from(done.bloom.encode());
-            meta.put_derived(TREE_KIND, &done.hash, row.clone()).await?;
-            c.tree_rows.fetch_add(1, Ordering::Relaxed);
-            metrics::counter!("leep_derive_total", "kind" => TREE_KIND).increment(1);
+            match &c.scan {
+                Some(scan) => scan.put(true, done.hash, row.clone()),
+                None => {
+                    meta.put_derived(TREE_KIND, &done.hash, row.clone()).await?;
+                    c.tree_rows.fetch_add(1, Ordering::Relaxed);
+                    metrics::counter!("leep_derive_total", "kind" => TREE_KIND).increment(1);
+                }
+            }
             match stack.last_mut() {
                 Some(parent) => parent.bloom.or_encoded(&row)?,
                 None => return Ok(row),

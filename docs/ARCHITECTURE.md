@@ -209,8 +209,10 @@ way.
 | `blob-trigrams-v1` | per blob hash: sorted trigram set of a UTF-8 text blob up to 1 MiB (delta varints), or a "not indexed" marker (ADR 0014) | code search |
 | `tree-trigrams-v1` | per tree node hash: fixed-size bloom filter (2^19 bits) over every trigram below the directory, the OR of its children's filters; shared by every revision with the same subtree (ADR 0014) | code search directory pruning |
 
-`root_tree`, `generation` and `skiplist` are computed eagerly when a changeset
-is created and written with it in one call (ADR 0031, see "Commit" below).
+`root_tree`, `generation`, `skiplist` and `last_merge-v1` are computed
+eagerly when a changeset is created and written with it in one call (ADR
+0031, see "Commit" below; `last_merge-v1` from the parents' rows only, never
+by deriving, and skipped when they lack one, ADR 0058).
 Other kinds are derived on first read (the search kinds on the first search
 that needs them; see "Code search"), and every server also warms them in the
 background for each ref head that moved (ADR 0028), so queries on an imported
@@ -221,7 +223,30 @@ derives all moved heads of a pass as one range per kind
 (`derived::derive_heads`), so shared history is derived once and different
 refs' new changesets derive side by side (ADR 0058, phase 0).
 `derive` takes a per-kind lock once a value is missing, so concurrent requests
-and the warmer never derive the same range twice. Add new kinds with the
+and the warmer never derive the same range twice.
+
+**Who builds indexes (ADR 0058).** `--indexing local` (the default) is the
+above, on every server. With `--indexing lease`, each index group (path
+history, log filter, code search) has a lease in the `index` scope of the
+`leases` table (repository 0, the group's primary kind as name, shard 0;
+`leep_derive::indexing::IndexLeases`), and only its holder warms that group;
+the holder checks the lease before each staged write and stops a derivation
+once it is lost, so a stale holder wastes work but never writes a wrong row.
+`--indexing off` never warms. In `lease` and `off` modes queries never derive
+an index while a lease lives (`indexing::bounded`): rows are parent-closed,
+so a query's un-indexed part is the changesets above a set of indexed
+ancestors. It finds that part (stopping at a budget) and runs on a handle
+that knows it: the path walk examines an un-indexed changeset the way
+`log_scan` does and queues its parents, then settles its queue so the page's
+`next` is the indexed walk's; last-change computes the newest changes bottom
+up over the part; blame walks un-indexed first-parent steps one by one;
+the filtered log scans the part; search computes missing trigram rows in
+memory. A request over the budget gets `Error::Indexing` (503) with
+`Leep-Indexing: retry`, an answer at the newest indexed first-parent
+ancestor with `stale-ok`, and without the header waits, scans more, then
+gets the 503. With no live lease queries derive inline. `repair drop`,
+`rederive --missing` and `upgrade-index --yes` take the leases and wait a
+fence before touching rows (`ToolLease`). Add new kinds with the
 [`add-derived-data-kind`](../.claude/skills/add-derived-data-kind/SKILL.md)
 skill. A new kind never requires a client change.
 

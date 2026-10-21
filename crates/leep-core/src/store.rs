@@ -114,6 +114,11 @@ pub struct LeaseTiming {
 /// The scope of land coordination leases (ADR 0056): one per ref, shard 0.
 pub const LAND_LEASE_SCOPE: &str = "land";
 
+/// The scope of index leases (ADR 0058): one per index group, named by its
+/// primary kind, in repository 0 because index rows are shared by every
+/// repository of a store (ADR 0054).
+pub const INDEX_LEASE_SCOPE: &str = "index";
+
 /// Names one lease: what kind of work it coordinates (`scope`), in which
 /// repository (1 until ADR 0054), over what (`name`, for example a ref) and
 /// which part of it (`shard`).
@@ -139,6 +144,17 @@ impl LeaseKey {
     /// The land coordination lease of `ref_name`.
     pub fn land(ref_name: impl Into<String>) -> Self {
         Self::new(LAND_LEASE_SCOPE, ref_name)
+    }
+
+    /// The index lease of the group whose primary kind is `kind` (ADR 0058):
+    /// store-wide, so repository 0, and shard 0 until shards are needed.
+    pub fn index(kind: impl Into<String>) -> Self {
+        LeaseKey {
+            scope: INDEX_LEASE_SCOPE.into(),
+            repo_id: 0,
+            name: kind.into(),
+            shard: 0,
+        }
     }
 
     pub fn with_shard(mut self, shard: i32) -> Self {

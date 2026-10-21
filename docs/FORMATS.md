@@ -612,6 +612,46 @@ On the wire nothing a client sends or reads changed. Between servers:
 - With coordination on, `GET /v1/health` carries `Leep-Instance: <holder>`,
   which a server uses to check that its `--advertise-url` reaches itself.
 
+## Index leases and bounded queries (additive, ADR 0058)
+
+No table, column or stored encoding changed.
+
+- **Index leases** are `leases` rows with `scope = 'index'`, `repo_id = 0`
+  (index rows are shared by every repository), `name` the group's primary
+  kind (`history-tree-v4`, `log-filter-v1`, `tree-trigrams-v1`) and `shard =
+  0`, taken with a 15 s TTL and taken over 6 s after the last renewal.
+  `meta` is a JSON object the holder rewrites on each renewal:
+  `{"rate": <changesets a second over the last minute>, "backlog": <changesets
+  its last pass derived>, "shards": 1}`; readers ignore fields they do not
+  know and treat a missing or unreadable one as unknown. `address` is the
+  holder's `--advertise-url` (informational), `protocol` is 1.
+- **`last_merge-v1`** rows are now written with the changeset (same value as
+  before); a changeset whose first parent has no row and is neither a merge
+  nor a root, and whose grandparent's row is not known, is stored without
+  one and the row stays derived lazily.
+- **Request header** `Leep-Indexing: retry | stale-ok` on `GET /v1/log`,
+  `/v1/last-change`, `/v1/blame` and `/v1/search`; unknown values count as
+  absent. Servers that honour it list the ready feature `indexing-retry`.
+- **503 answer** to a query whose index is too far behind: `Retry-After`
+  (seconds, 1 to 30), `Leep-Indexing: kind=<group>; behind=<n>`, and the usual
+  `ErrorResponse` with an optional `indexing: {kind, behind, retry_after_ms}`
+  (omitted on every other error). `behind` is generations between the
+  requested changeset and the newest indexed first-parent ancestor (for
+  search, at most 64 are looked at).
+- **Optional response fields** `answered_at` (changeset id) and `behind`
+  (generations) on `LogResponse`, `LastChangeResponse`, `BlameResponse` and
+  `SearchResponse`, present only when a `stale-ok` answer is for an older
+  changeset than asked; `SearchStats.files_unindexed` (omitted when 0): files
+  fetched to stand in for missing trigram rows. Successful indexed reads carry
+  `Leep-Index-Scanned: <n>`, the changesets (files, for search) examined
+  without index rows.
+- Answers are the same with or without index rows: entries, order,
+  `truncated` and whether `next` is given. Cursor text may differ, and search
+  `stats` other than `files_considered`, `files_skipped` and `indexed`
+  describe the work done (`blob_rows_derived` and `tree_rows_derived` are 0
+  for a bounded search). A filtered log page now has `next` only when another
+  match follows.
+
 ## Blob storage layout (leep-store)
 
 - Filesystem: loose objects at `<root>/<hex[0..2]>/<hex[2..]>`, and packs in
@@ -983,7 +1023,10 @@ answer, but not `limit`) | postcard body`:
   }` of the last entry, which restarts from the tip and skips what ranks at or
   above it. Every log walk pops changesets in descending `(generation, id)` and
   queues only ancestors of what it popped, so a walk seeded with the queue
-  yields exactly the rest of the original walk.
+  yields exactly the rest of the original walk. A page answered at an older
+  changeset under `Leep-Indexing: stale-ok` wraps either in `Pinned { at,
+  inner }` (ADR 0058), so later pages continue the walk of `at`; servers
+  without it refuse such a cursor as malformed.
 - search: the changeset searched (pinned, so later pages read the same tree
   even if `rev` moved) and the position after the last match kept (`path`,
   `line`), or after the last file finished (`line = u64::MAX`) when the scan
