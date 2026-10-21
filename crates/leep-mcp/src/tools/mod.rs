@@ -3,6 +3,7 @@
 //! on them.
 
 mod commit;
+mod history;
 mod read;
 mod resolve;
 
@@ -51,10 +52,18 @@ pub(crate) fn request_note(e: &CliError) -> String {
         .unwrap_or_default()
 }
 
-/// The error's message with its request id, which an operator can find in
-/// the server's logs.
+/// The error's message with the ids an ambiguous short id matched, the
+/// server's error code (a stable name of the condition), and its request id,
+/// which an operator can find in the server's logs.
 pub(crate) fn describe(e: &CliError) -> String {
-    format!("{e}{}", request_note(e))
+    let mut s = e.to_string();
+    if !e.candidates().is_empty() {
+        s.push_str(&format!(" (candidates: {})", e.candidates().join(", ")));
+    }
+    if let Some(code) = e.server_code() {
+        s.push_str(&format!(" [code: {code}]"));
+    }
+    s + &request_note(e)
 }
 
 impl From<leep_core::Error> for ToolError {
@@ -191,6 +200,10 @@ impl Server {
             "leep_blame" => self.blame(args),
             "leep_search" => self.search(args),
             "leep_review_status" => self.review_status(args),
+            "leep_reflog" => self.reflog(args),
+            "leep_resolve" => self.resolve(args),
+            "leep_merge_base" => self.merge_base(args),
+            "leep_provenance" => self.provenance(args),
             "leep_commit_and_land" => self.commit_and_land(args),
             "leep_resolve_and_land" => self.resolve_and_land(args),
             _ => return None,
@@ -380,6 +393,82 @@ pub fn definitions() -> Vec<Value> {
                     "ref": { "type": "string", "description": "Ref whose owners and head to judge against (default `main`)." }
                 },
                 "required": ["rev"],
+                "additionalProperties": false
+            }),
+            true,
+        ),
+        tool(
+            "leep_reflog",
+            "Show ref moves",
+            "The moves of a ref (default `main`), newest first: each with `seq`, `op` (land, \
+             cas, undo, ...), `old` and `new` ids (12-digit prefixes unless `full_ids`), `time` \
+             (unix seconds), `actor`, and for a land that named itself its `land_id` (and \
+             `land_changeset` when the ref took a rebased copy of it). Use it to see what \
+             landed recently, or whether your land (by land_id) happened. `all: true` lists \
+             every ref's moves with a `ref` field. When more follow, the result has `next`: \
+             pass it back as `cursor`.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "ref": { "type": "string", "description": "Ref whose moves to list (default `main`)." },
+                    "all": { "type": "boolean", "description": "Moves of every ref instead (default false)." },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 200, "description": "Max entries (default 20)." },
+                    "cursor": { "type": "string", "description": "The `next` value of the previous page, to continue it (repeat the other arguments)." },
+                    "full_ids": { "type": "boolean", "description": "Full 64-hex ids instead of 12-digit prefixes (default false)." }
+                },
+                "additionalProperties": false
+            }),
+            true,
+        ),
+        tool(
+            "leep_resolve",
+            "Resolve a revision",
+            "Turn a rev (ref name, tag, full id or unique id prefix) into its full changeset id, \
+             with `via`: `ref`, `id` or `prefix`. An ambiguous prefix lists the candidates.",
+            json!({
+                "type": "object",
+                "properties": { "rev": { "type": "string", "description": "Ref name, tag, changeset id or unique prefix of one (required)." } },
+                "required": ["rev"],
+                "additionalProperties": false
+            }),
+            true,
+        ),
+        tool(
+            "leep_merge_base",
+            "Find the merge base",
+            "The newest common ancestor of two revisions (`base`, null when the histories are \
+             unrelated), and whether either contains the other (`a_is_ancestor_of_b`: b already \
+             has everything a has). Use it to choose the `base` for leep_diff or to check \
+             whether a change is already on a ref.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "a": { "type": "string", "description": REV_DOC },
+                    "b": { "type": "string", "description": REV_DOC }
+                },
+                "required": ["a", "b"],
+                "additionalProperties": false
+            }),
+            true,
+        ),
+        tool(
+            "leep_provenance",
+            "Summarize provenance",
+            "Who made the history reachable from a revision: per agent model and session, and \
+             per human author (changesets with no agent metadata), the number of changesets, \
+             distinct files touched, and the first and last timestamps, largest first. Scans the \
+             newest `limit` changesets (`truncated` says more were left); `path` counts only \
+             changesets that touched it. Totals are in `agent_changesets` and \
+             `human_changesets`; rows past `top` are counted in `agents_omitted` / \
+             `humans_omitted`.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "rev": { "type": "string", "description": REV_DOC },
+                    "path": { "type": "string", "description": "Only changesets touching this file or directory." },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 10000, "description": "Changesets to scan, newest first (default 1000)." },
+                    "top": { "type": "integer", "minimum": 1, "maximum": 100, "description": "Rows listed per group (default 10)." }
+                },
                 "additionalProperties": false
             }),
             true,

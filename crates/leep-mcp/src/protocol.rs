@@ -19,7 +19,8 @@ const INVALID_PARAMS: i64 = -32602;
 
 const INSTRUCTIONS: &str = "Leep is a server-centric version control system. Read tools \
 (leep_refs, leep_log, leep_show, leep_list_files, leep_read_file, leep_diff, leep_blame, \
-leep_review_status) take an optional rev: a ref name (default `main`) or a full 64-hex changeset id. There is no working copy: \
+leep_search, leep_review_status, leep_reflog, leep_resolve, leep_merge_base, leep_provenance) \
+take an optional rev: a ref name (default `main`), a changeset id or a unique prefix of one. There is no working copy: \
 leep_commit_and_land sends complete file contents, creates one changeset and lands it. If it \
 reports conflicts, nothing landed; call leep_resolve_and_land with the report's conflict_id and \
 resolved content for the conflicting paths only.";

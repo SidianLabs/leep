@@ -58,13 +58,21 @@ Logs go to stderr; stdout carries protocol messages only.
 | `leep_blame` | `rev?`, `path` | per-line changeset and author |
 | `leep_search` | `query`, `rev?`, `regex?`, `case_insensitive?`, `path?`, `glob?`, `limit?` (default 50, max 200), `cursor?` | matching lines `{path, line_number, line, ranges}` ordered by path then line, `truncated`, `stats`, and `next` when the page stopped early (pass it back as `cursor`, with `rev` set to the result's `rev`); per line, UTF-8 text files up to 1 MiB (others counted in `stats.files_skipped`) |
 | `leep_review_status` | `rev`, `ref?` (default `main`) | per changed path: the rule that satisfies it (`auto:*`, `owner`, `merge_parent`) or `pending` / `rejected`, with owners and who approved or rejected, plus `approved`, `blocked_paths` and `next_step`; needs a server with authentication |
+| `leep_reflog` | `ref?` (default `main`) or `all?`, `limit?` (default 20, max 200), `cursor?`, `full_ids?` | the ref's moves newest first: `seq`, `op`, `old`, `new` (12-digit id prefixes unless `full_ids`), `time`, `actor`, `message`, and `land_id` for a land that named itself (`land_changeset` when the ref took a rebased copy); `ref` per entry with `all`; `next` when older entries follow (pass it back as `cursor`) |
+| `leep_resolve` | `rev` | `{rev, id, via}`: the full id and whether it came from a ref (or tag), a full `id` or a `prefix`; an ambiguous prefix is an error listing the candidates |
+| `leep_merge_base` | `a`, `b` | `base` (the newest common ancestor, null if unrelated) and `a_is_ancestor_of_b` / `b_is_ancestor_of_a` |
+| `leep_provenance` | `rev?`, `path?`, `limit?` (changesets scanned, default 1000, max 10000), `top?` (rows per group, default 10, max 100) | per agent model and session, and per human author: changesets, distinct files touched, first and last timestamps; `agent_changesets` / `human_changesets` totals, `*_omitted` counts past `top`, `scanned` and `truncated` |
 | `leep_commit_and_land` | `message`, `changes[]`, `base?`, `target_ref?`, `create_ref?`, `prompt?`, `tests?`, `request_id?`; or `changeset` alone | landed id, or a conflict report |
 | `leep_resolve_and_land` | `conflict_id` (or `onto`), `resolutions[]` (`{path, content}` or `{path, delete: true}`, `executable?`), `message?` | finishes a conflict report sending only the conflicting files; same result shape as `leep_commit_and_land` |
 
 Data tools return JSON as text and as `structuredContent`; file and diff
 tools return plain text. Failures (bad arguments, 401, 403, 404, unreachable
 server) come back as results with `isError: true`. A failure from a server
-request ends with `(server request id: ID)`: each tool call sends its own
+request ends with `(server request id: ID)`, after the server's stable error code as
+`[code: CODE]` when it sent one (`not_found`, `ref_missing`,
+`ambiguous_prefix`, ...; FORMATS.md, "Error codes"), so an agent can tell
+conditions apart without matching text. An ambiguous short id also lists
+`(candidates: ...)`. Each tool call sends its own
 `X-Request-Id`, and the server logs the request under that id (see
 [RUNBOOKS.md](RUNBOOKS.md#collecting-a-bug-report)). It is unrelated to the
 `request_id` argument of `leep_commit_and_land`.

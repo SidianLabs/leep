@@ -28,6 +28,15 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 - The conflict guidance now points to `leep_resolve_and_land` instead of
   asking for every file again.
 
+### MCP: history read tools
+- `leep_reflog` (a ref's moves, or every ref's, with land ids, short ids by
+  default and cursor paging), `leep_resolve` (rev or id prefix to a full id),
+  `leep_merge_base` (common ancestor and ancestry of two revs) and
+  `leep_provenance` (changesets and files touched per agent model and session
+  and per human author, capped to the top rows).
+- MCP tool errors from the server now carry its error code as
+  `[code: CODE]`, and an ambiguous short id lists its candidates.
+
 ### Request ids
 - The server accepts a client's `X-Request-Id` (1 to 128 characters of
   `A-Z a-z 0-9 . _ : / -`; anything else is replaced) or makes one, answers

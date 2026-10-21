@@ -1246,3 +1246,165 @@ fn resolve_and_land_by_onto_and_conflicting_again() {
         "y, resolved"
     );
 }
+
+/// `leep_reflog` pages through a ref's moves, compactly, with land ids.
+#[test]
+fn reflog_lists_moves_with_land_ids_and_pages() {
+    let s = Server::new(config(&start_server()));
+    let mut landed = Vec::new();
+    for i in 0..3 {
+        let r = data(&commit(
+            &s,
+            json!({ "message": format!("m{i}"), "changes": [{ "path": "a.txt", "content": format!("{i}\n") }],
+                    "request_id": format!("req-{i}") }),
+        ));
+        landed.push(r["landed"].as_str().unwrap().to_string());
+    }
+    data(&commit(
+        &s,
+        json!({ "message": "side", "changes": [{ "path": "b.txt", "content": "b\n" }],
+                "target_ref": "side", "create_ref": true }),
+    ));
+
+    let log = data(&call(&s, "leep_reflog", json!({})));
+    assert_eq!(log["ref"], "main");
+    let entries = log["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 3);
+    assert!(log.get("next").is_none());
+    let newest = &entries[0];
+    assert_eq!(newest["op"], "land");
+    assert_eq!(newest["new"], landed[2][..12]);
+    assert_eq!(newest["old"], landed[1][..12]);
+    assert!(newest.get("ref").is_none());
+    assert_eq!(
+        newest["land_id"],
+        leep_mcp::tools::request_land_id("main", "req-2").to_string()
+    );
+    // Fast-forwards: the ref took the changeset itself.
+    assert!(newest.get("land_changeset").is_none());
+    assert_eq!(entries[2]["old"], Value::Null);
+    // The short ids work as revs.
+    let shown = data(&call(&s, "leep_show", json!({ "rev": newest["new"] })));
+    assert_eq!(shown["id"], landed[2]);
+
+    // Pages of one, then the end.
+    let p1 = data(&call(
+        &s,
+        "leep_reflog",
+        json!({ "limit": 1, "full_ids": true }),
+    ));
+    assert_eq!(p1["entries"][0]["new"], landed[2]);
+    let p2 = data(&call(
+        &s,
+        "leep_reflog",
+        json!({ "limit": 2, "full_ids": true, "cursor": p1["next"] }),
+    ));
+    let ids: Vec<&Value> = p2["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| &e["new"])
+        .collect();
+    assert_eq!(ids, [&json!(landed[1]), &json!(landed[0])]);
+    assert!(p2.get("next").is_none());
+
+    let all = data(&call(&s, "leep_reflog", json!({ "all": true })));
+    let all = all["entries"].as_array().unwrap();
+    assert_eq!(all.len(), 4);
+    assert_eq!(all[0]["ref"], "side");
+    let none = data(&call(&s, "leep_reflog", json!({ "ref": "nosuch" })));
+    assert_eq!(none["entries"], json!([]));
+    let bad = call(&s, "leep_reflog", json!({ "cursor": "garbage" }));
+    assert_eq!(bad["isError"], true);
+    assert!(text(&bad).contains("[code: invalid]"), "{}", text(&bad));
+}
+
+#[test]
+fn resolve_merge_base_and_provenance() {
+    let url = start_server();
+    let s = Server::new(config(&url));
+    let root = data(&commit(
+        &s,
+        json!({ "message": "root", "changes": [{ "path": "a.txt", "content": "a\n" }] }),
+    ))["landed"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let on_main = data(&commit(
+        &s,
+        json!({ "message": "m", "changes": [{ "path": "src/m.rs", "content": "m\n" }] }),
+    ))["landed"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut human = common::config(&url);
+    human.author = "alice".into();
+    human.agent_model = None;
+    human.agent_session = None;
+    let side = data(&commit(
+        &Server::new(human),
+        json!({ "base": root, "message": "s", "changes": [{ "path": "docs/s.md", "content": "s\n" }],
+                "target_ref": "side", "create_ref": true }),
+    ))["landed"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // leep_resolve: ref, full id, prefix, and errors.
+    let r = data(&call(&s, "leep_resolve", json!({ "rev": "main" })));
+    assert_eq!(r["id"], on_main);
+    assert_eq!(r["via"], "ref");
+    let r = data(&call(&s, "leep_resolve", json!({ "rev": root })));
+    assert_eq!(
+        (r["id"].clone(), r["via"].clone()),
+        (json!(root), json!("id"))
+    );
+    let r = data(&call(&s, "leep_resolve", json!({ "rev": &side[..8] })));
+    assert_eq!(
+        (r["id"].clone(), r["via"].clone()),
+        (json!(side), json!("prefix"))
+    );
+    let r = call(&s, "leep_resolve", json!({ "rev": "nosuch" }));
+    assert_eq!(r["isError"], true);
+    assert!(text(&r).contains("[code: not_found]"), "{}", text(&r));
+
+    // leep_merge_base.
+    let mb = data(&call(
+        &s,
+        "leep_merge_base",
+        json!({ "a": "main", "b": "side" }),
+    ));
+    assert_eq!(mb["base"], root);
+    assert_eq!(mb["a_is_ancestor_of_b"], false);
+    assert_eq!(mb["b_is_ancestor_of_a"], false);
+    let mb = data(&call(
+        &s,
+        "leep_merge_base",
+        json!({ "a": root, "b": "main" }),
+    ));
+    assert_eq!(mb["base"], root);
+    assert_eq!(mb["a_is_ancestor_of_b"], true);
+    let r = call(&s, "leep_merge_base", json!({ "a": "main", "b": "nosuch" }));
+    assert_eq!(r["isError"], true);
+
+    // leep_provenance.
+    let p = data(&call(&s, "leep_provenance", json!({ "rev": "side" })));
+    assert_eq!(p["scanned"], 2);
+    assert_eq!(p["truncated"], false);
+    assert_eq!(p["agent_changesets"], 1);
+    assert_eq!(p["human_changesets"], 1);
+    assert_eq!(p["agents"][0]["model"], "test-model");
+    assert_eq!(p["agents"][0]["session"], "sess-1");
+    assert_eq!(p["humans"][0]["author"], "alice");
+    let p = data(&call(
+        &s,
+        "leep_provenance",
+        json!({ "rev": "main", "path": "src" }),
+    ));
+    assert_eq!(p["agent_changesets"], 1);
+    assert_eq!(p["agents"][0]["files_touched"], 1);
+    assert_eq!(p["humans"], json!([]));
+    let p = data(&call(&s, "leep_provenance", json!({ "limit": 1 })));
+    assert_eq!(p["truncated"], true);
+    assert!(p["note"].as_str().unwrap().contains("limit"));
+}

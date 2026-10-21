@@ -55,6 +55,10 @@ fn tools_list_schemas_are_sane() {
         "leep_review_status",
         "leep_commit_and_land",
         "leep_resolve_and_land",
+        "leep_reflog",
+        "leep_resolve",
+        "leep_merge_base",
+        "leep_provenance",
     ] {
         assert!(names.contains(&expected), "missing {expected}");
     }
