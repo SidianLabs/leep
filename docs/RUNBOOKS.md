@@ -38,6 +38,7 @@ every runbook.
 | [LeepRequestTimeouts](#leeprequesttimeouts) | ticket | more than 5 requests hit `--request-timeout` (408) in 15 minutes |
 | [LeepTokenThrottled](#leeptokenthrottled) | ticket | one token has been limited steadily for 15 minutes |
 | [LeepBroadThrottling](#leepbroadthrottling) | ticket | more than 5% of all requests are 429 for 15 minutes |
+| [LeepBodyBudgetExhausted](#leepbodybudgetexhausted) | ticket | requests are refused because request bodies in flight fill `--max-inflight-bytes`, for 10 minutes |
 | [LeepBlobCacheColdHitRatio](#leepblobcachecoldhitratio) | ticket | blob cache hit ratio below 50% for 30 minutes |
 | [LeepConfigReloadFailed](#leepconfigreloadfailed) | page | a SIGHUP reload was refused |
 | [LeepConfigSkew](#leepconfigskew) | ticket | servers report different config fingerprints for 15 minutes |
@@ -877,6 +878,64 @@ rest.
 
 **Escalate / collect.** The 429 breakdown by route, token and reason, the limit
 flags, the agent count, and the [standard bundle](#collecting-a-bug-report).
+
+## LeepBodyBudgetExhausted
+
+**Meaning.** More than 0.05 requests a second (3 a minute) on one server were
+refused with `503` because the bodies of the requests already in flight fill
+`--max-inflight-bytes` (default 1 GiB), for 10 minutes. **Ticket.** Each request
+with a body holds its `Content-Length` of the budget (its route's cap,
+`--max-blob-bytes` or `--max-json-body-bytes`, when it declares none) until its
+handler finishes. These refusals also count as 5xx in
+[LeepServerErrors](#leepservererrors).
+
+**Impact.** Uploads, commits, lands and other requests with a body fail with
+`server busy: the request bodies in flight are at this server's limit; retry
+after 1s`; the CLI exits 3 and running the command again works once the budget
+frees up. Reads without a body are unaffected.
+
+**Diagnose.**
+
+1. How full: `leep_request_body_bytes_in_flight / leep_request_body_budget_bytes`
+   per instance. Pinned near 1 is a real shortage; spikes are bursts.
+2. Who holds it: `sum by (token) (leep_requests_in_flight)` (tokens with a limit
+   only) and `sum by (route) (rate(leep_http_requests_total{route=~"/v1/blobs/.*|/v1/changesets"}[5m]))`.
+3. Slow or fast: upload latency, `histogram_quantile(0.99, sum by (le) (rate(leep_http_request_duration_seconds_bucket{route="/v1/blobs/{hash}"}[10m])))`.
+   Many slow uploads with a low request rate mean clients trickle their bodies.
+4. Bodies with no declared length are charged the whole route cap. A client
+   that streams (`Transfer-Encoding: chunked`) holds 64 MiB per blob upload
+   however small the blob is.
+5. The settings: `--max-inflight-bytes`, `--max-blob-bytes`,
+   `--max-json-body-bytes` (logged at startup as `request body limits`), and
+   the memory the container has.
+
+**Likely causes.**
+
+1. A burst of large uploads: an agent swarm committing generated or binary
+   files, or a git mirror importing a large push. Confirm: step 2, many PUTs at
+   once, and a budget that drains within minutes.
+2. Slow uploaders holding their share, including a client declaring large
+   bodies and sending them slowly. Confirm: step 3, few requests per second with
+   the gauge high.
+3. Clients that stream bodies without a length. Confirm: step 4, the gauge
+   rising by the route cap per upload.
+4. A budget too small for the fleet. Confirm: steady legitimate traffic and the
+   container's memory well above what the server uses.
+
+**Mitigate / fix.**
+
+- A runaway or slow client: give its token a `concurrency` limit (tokens file,
+  SIGHUP) so it cannot hold more than that many shares, or revoke it.
+- Legitimate load with memory to spare: raise `--max-inflight-bytes` (a flag, so
+  a restart of each server). Keep cache sizes plus budget within the container.
+- Large files that do not belong in the repository: lower `--max-blob-bytes`, or
+  keep them out of the tree.
+- Do not set the budget far above the container's memory to quiet the alert: it
+  is what stops many uploads at once from getting the process killed.
+
+**Escalate / collect.** The gauge and refusal graphs per instance, upload
+latency, the three flags, the container memory limit, and the
+[standard bundle](#collecting-a-bug-report).
 
 ## LeepBlobCacheColdHitRatio
 

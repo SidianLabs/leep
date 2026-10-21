@@ -1039,9 +1039,14 @@ lists verdicts (with `via` for rebased copies), and `leep review ...` and the
 **Request path and limits** ([ADR 0020](adr/0020-request-limits.md)). A
 request passes, outermost first, through metrics, tracing, the request timeout,
 the global body cap, the config snapshot, authentication (which names the
-`Principal`), the per-principal limiter and then the handler. The limiter is an
-axum middleware (`leep_server::limits`) that does nothing unless the request's
-config has limits. For a principal with limits it checks the declared body
+`Principal`), the body limits and the per-principal limiter, and then the
+handler. The body limits are always on: the route's cap (`--max-blob-bytes` for
+blob uploads, `--max-json-body-bytes` for the rest; 413) and a share of the
+server-wide in-flight byte budget (`BodyBudget`, a semaphore of KiB;
+`--max-inflight-bytes`), taken from the declared length, or the route's cap
+when there is none, and held until the handler returns (503 when spent). The
+limiter is the same axum middleware (`leep_server::limits`) and does nothing
+unless the request's config has limits. For a principal with limits it checks the declared body
 size, takes a token from the read or write bucket, and `try_acquire`s a
 concurrency permit, refusing with 413 or 429 (never queueing). The permit
 lives in a guard attached to the response body, so it is released when the body

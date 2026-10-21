@@ -187,6 +187,30 @@ body. `GET /v1/health` and `GET /v1/ready` are never limited. The `leep` CLI ret
 `GET` a few times and then prints the server's message. Tuning and metrics are
 in [OPERATIONS.md](OPERATIONS.md#request-limits).
 
+### Body limits
+
+These are always on, tokens file or not:
+
+| Flag / variable | Default | Meaning |
+|---|---|---|
+| `--max-blob-bytes` / `LEEP_MAX_BLOB_BYTES` | 64 MiB | Largest blob upload (`PUT /v1/blobs/{hash}`): the largest file a commit can contain. |
+| `--max-json-body-bytes` / `LEEP_MAX_JSON_BODY_BYTES` | 32 MiB | Largest body of every other request. The largest is a changeset: about 150 bytes per changed path, so some 200,000 paths. |
+| `--max-inflight-bytes` / `LEEP_MAX_INFLIGHT_BYTES` | 1 GiB | Body bytes all requests in flight may hold together; a request that would go over gets `503` with `Retry-After: 1`. |
+| `--max-body-bytes` / `LEEP_MAX_BODY_BYTES` | 512 MiB | Ceiling on every body; the caps above apply first. |
+
+A body over its cap gets `413` with a JSON error naming the flag; `leep` prints
+it with a hint and does not retry. **Upgrading from a version without these
+limits:** blob uploads used to be capped only by `--max-body-bytes` (512 MiB),
+so a file between 64 MiB and 512 MiB that committed before is now refused, by
+`leep commit` and by the git mirror importing a push. Raise `--max-blob-bytes`
+(and `--max-inflight-bytes`, which must be at least as large) if your
+repositories hold such files. Bodies are held in memory while they are hashed
+and stored, so size the budget with the container: memory use is about
+`--cache-bytes` plus `--derive-cache-bytes` plus `--max-inflight-bytes` plus a
+few hundred MB. `leep-git import` writes the stores directly and is not
+limited. Tuning and the alert are in
+[OPERATIONS.md](OPERATIONS.md#body-limits-and-the-in-flight-budget).
+
 Without a tokens file the rate and concurrency defaults apply per client IP
 address (IPv6 per /64). Behind a reverse proxy every request arrives from the
 proxy's address, so those limits become one bucket shared by everybody; use
@@ -285,7 +309,7 @@ What a reload covers:
 | Reloaded | Not reloaded (restart) |
 |---|---|
 | Tokens: added, revoked, rotated, role changes | Listen and metrics addresses, stores, cache size |
-| Per-token limits (`rate`, `burst`, `concurrency`, `max_body`) | `--request-timeout`, `--max-body-bytes`, and the server-wide limit defaults |
+| Per-token limits (`rate`, `burst`, `concurrency`, `max_body`) | `--request-timeout`, the body limits (`--max-body-bytes`, `--max-blob-bytes`, `--max-json-body-bytes`, `--max-inflight-bytes`), and the server-wide limit defaults |
 | Trusted signing keys | `--require-signatures` and `--require-review` refs |
 | Review policy: `refs`, auto-approval rules, docs globs | Which files are configured at all (a server started without `--tokens-file` stays open) |
 
@@ -335,6 +359,10 @@ a reload is refused.
 | `LEEP_RATE_LIMIT`, `LEEP_RATE_BURST` | none | Per-token request rate and burst; see [Request limits](#request-limits). |
 | `LEEP_MAX_CONCURRENT_PER_TOKEN` | none | Requests in flight per token. |
 | `LEEP_READ_MAX_BODY_BYTES` | 1 MiB with a tokens file | Body size cap for read tokens; needs the tokens file. |
+| `LEEP_MAX_BLOB_BYTES` | 64 MiB | Largest blob upload; see [Body limits](#body-limits). |
+| `LEEP_MAX_JSON_BODY_BYTES` | 32 MiB | Largest body of any other request. |
+| `LEEP_MAX_INFLIGHT_BYTES` | 1 GiB | Body bytes all requests in flight may hold together. |
+| `LEEP_MAX_BODY_BYTES` | 512 MiB | Ceiling on every request body. |
 | `LEEP_NO_MIGRATE` | off | `1` makes the server (and `gc`, `derive-search`) refuse to start while metadata schema migrations are pending instead of applying them; see [Upgrades](#upgrades). |
 | `LEEP_REQUEST_TIMEOUT` | `5m` | Abort any request that runs longer (`90s`, `5m`; `0` disables). `leep-server gc --fence` must exceed it; see [OPERATIONS.md](OPERATIONS.md#blob-garbage-collection). |
 | `LEEP_WARM_INTERVAL` | `250ms` | How often the background warmer reads the ref log for moved refs and derives their path-history, log-filter and search indexes (ADR 0028, ADR 0058); every ref is also listed every 5 s. Accepts `ms`. `0` turns it off. With several servers on one metadata store, set `0` on all but one (see OPERATIONS.md, "Indexing a large history"). |

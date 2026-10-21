@@ -144,3 +144,42 @@ See [SECURITY-REVIEW.md](../SECURITY-REVIEW.md).
   also keeps a read token under its 1 MiB default. That endpoint gets no
   larger read limit of its own: chunking is enough, and a read token that
   needs more can be given `max_body`.
+
+## Server-wide body limits, 2026-10-21
+The per-token caps are off by default, and the one global cap was 512 MiB on
+every route, so nothing bounded the memory request bodies take together: the
+blob and changeset handlers read the whole body into memory, and sixteen
+concurrent 512 MiB uploads from any writers would ask for 8 GiB.
+- **Per-route caps, always on.** `PUT /v1/blobs/{hash}` takes at most
+  `--max-blob-bytes` (64 MiB); every other route, all JSON, at most
+  `--max-json-body-bytes` (32 MiB, about 200,000 changed paths in a
+  changeset). `--max-body-bytes` stays as a ceiling over both. Over the cap is
+  `413` with a JSON body naming the flag: before the body is read when its
+  length is declared, while it streams when not.
+- **An in-flight byte budget.** A semaphore of `--max-inflight-bytes` (1 GiB),
+  counted in KiB. In the limits middleware, so after authentication (a request
+  without a valid token holds nothing), each request with a body takes its
+  `Content-Length`, or its route's cap when it declares none, and holds it until
+  its handler returns, which is when the body's memory is released. A request
+  that does not fit is refused at once with `503` and `Retry-After: 1`, not
+  queued, for the reason concurrency is refused rather than queued. A cap above
+  the budget fails startup.
+- **Why 1 GiB, fixed.** It bounds request-body memory on its own scale, next to
+  the 256 MiB blob cache and the derive cache, and fits the 2 to 4 GiB
+  containers the deployment examples assume, while allowing 16 maximum-size
+  uploads or thousands of ordinary ones at once. Deriving it from the host's
+  memory would make two servers with the same flags behave differently and
+  would need cgroup parsing to be right in containers; operators with more
+  memory raise it.
+- **Behaviour change.** Files between 64 MiB and 512 MiB, which committed
+  before, are now refused (413) until the operator raises `--max-blob-bytes`.
+  The CLI reports the 413 with a hint naming the flag and does not retry; the
+  git mirror reports the server's message on the ref. `leep-git import` writes
+  the stores directly and is not limited.
+- **Trade-off.** A slow client holds its declared share for up to
+  `--request-timeout`, so a writer that declares large bodies and trickles them
+  can hold the budget; per-token `concurrency` bounds how many shares one token
+  holds. Metrics `leep_request_body_bytes_in_flight`,
+  `leep_request_body_budget_bytes` and
+  `leep_request_body_refused_total{reason,class}`, and the alert
+  `LeepBodyBudgetExhausted`.

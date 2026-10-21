@@ -916,6 +916,12 @@ fn error_from(resp: Response, has_token: bool) -> CliError {
             ),
         ),
         StatusCode::TOO_MANY_REQUESTS => CliError::new(ErrorKind::RateLimited, msg),
+        // A server cap, not a passing condition: the same request fails again.
+        StatusCode::PAYLOAD_TOO_LARGE => CliError::user(msg).with_hint(
+            "the server caps request bodies (--max-blob-bytes for a file's contents, \
+             --max-json-body-bytes for other requests); keep files this large out of the \
+             repository or ask the server's operator to raise the limit",
+        ),
         StatusCode::NOT_FOUND => CliError::not_found(msg),
         // Only concurrent updates answer 409 (a land that kept losing, a ref
         // that moved); content conflicts are a normal land answer.
@@ -1082,6 +1088,21 @@ mod tests {
         let (url, seen) = stub(&[LIMITED_LONG, OK]);
         let e = Client::new(&url).refs().unwrap_err();
         assert!(e.to_string().contains("retry after 60s"), "{e}");
+        assert_eq!(seen.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_body_over_the_servers_cap_says_which_limit_and_is_not_retried() {
+        const TOO_LARGE: &str = "HTTP/1.1 413 Payload Too Large\r\ncontent-type: application/json\r\n\
+            content-length: 104\r\nconnection: close\r\n\r\n\
+            {\"error\":\"request body exceeds the limit of 67108864 bytes for a blob upload (server --max-blob-bytes)\"}";
+        let (url, seen) = stub(&[TOO_LARGE, OK]);
+        let h = Hash::of_blob(b"x");
+        let e = Client::new(&url).put_blob(&h, b"x".to_vec()).unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::User, "{e}");
+        assert!(e.to_string().contains("67108864 bytes"), "{e}");
+        assert!(e.hint().unwrap().contains("--max-blob-bytes"), "{e:?}");
+        assert!(!e.is_retryable());
         assert_eq!(seen.load(Ordering::SeqCst), 1);
     }
 
