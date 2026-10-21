@@ -503,6 +503,55 @@ mod tests {
         assert_eq!(codec.decode_checked(&c.id(), &row).unwrap(), c);
     }
 
+    /// Rows a server wrote with zstd 0.13.3 (in `testdata/`, made with that
+    /// version and never regenerated). Frame bytes change between zstd
+    /// versions, but stored rows don't: every later reader must decode these,
+    /// so a change in dictionary-id parsing or in the streamed window bound
+    /// shows up here rather than in a database.
+    #[test]
+    fn zstd_0_13_dictionary_rows_still_decode() {
+        const DICT: &[u8] = include_bytes!("../testdata/changeset-dict-1.zdict");
+        // One-shot path: a few hundred bytes of canonical changeset.
+        const SMALL: &[u8] = include_bytes!("../testdata/changeset-row-small.zst");
+        // Streamed path: claims more than `ONE_SHOT_MAX`, single segment, so
+        // its window is its 1.4 MB content size, under `WINDOW_LOG_MAX`.
+        const LARGE: &[u8] = include_bytes!("../testdata/changeset-row-large.zst");
+
+        let small = cs(5, vec![]);
+        let mut large = cs(11, vec![]);
+        large.message = (0..40_000)
+            .map(|i| format!("line {}: refactor module{} in place\n", i % 100, i % 7))
+            .collect();
+        let pinned = [
+            (
+                SMALL,
+                &small,
+                "b5e6844179a275afe5b981234bde5e4c1704a998c2b8da953a41b2cdb450ad7c",
+            ),
+            (
+                LARGE,
+                &large,
+                "818c751f84264c8cbb37262f41d2c84cd3612eb26d3fe5e7f6f3c7b1d5219fa2",
+            ),
+        ];
+        assert!(large.encode().len() > ONE_SHOT_MAX);
+
+        let reader = Codec::default();
+        for (row, _, id) in pinned {
+            let id: ChangesetId = id.parse().unwrap();
+            assert_eq!(frame_dict_id(row), Some(1));
+            let err = reader.decode_checked(&id, row).unwrap_err();
+            assert!(err.to_string().contains("needs dictionary 1"), "{err}");
+        }
+        reader.add(vec![(1, DICT.to_vec())]).unwrap();
+        for (row, want, id) in pinned {
+            let id: ChangesetId = id.parse().unwrap();
+            assert_eq!(want.id(), id);
+            assert!(Codec::uses(row, 1));
+            assert_eq!(&reader.decode_checked(&id, row).unwrap(), want);
+        }
+    }
+
     #[test]
     fn dictionaries_must_carry_their_id() {
         let codec = Codec::default();
