@@ -16,6 +16,9 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   byte for byte; other values are 400.
 - `leep log --oneline` prints the short id and the message's first line from
   summary entries (`--json` prints them).
+- The MCP `leep_log` tool reads summary entries: an entry's `message` is
+  now its first line and non-agent `extra` is no longer listed (`leep_show`
+  has both).
 
 ### Faster path logs
 - Path logs without a filter no longer read each changeset and root tree one

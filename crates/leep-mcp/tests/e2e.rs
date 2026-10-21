@@ -50,6 +50,7 @@ fn commit_land_and_read_back() {
     assert_eq!(entries.len(), 2);
     assert_eq!(entries[0]["id"], second_id);
     assert_eq!(entries[0]["message"], "shout");
+    assert_eq!(entries[0]["files_changed"], 1);
     assert_eq!(entries[0]["author"], "tester");
     assert_eq!(entries[1]["agent"]["model"], "test-model");
     assert_eq!(entries[1]["agent"]["session"], "sess-1");

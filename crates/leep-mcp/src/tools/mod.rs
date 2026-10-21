@@ -207,8 +207,8 @@ pub fn definitions() -> Vec<Value> {
             "Show history",
             "Show history newest first. Filters (all optional, combined with AND): a path the \
              change touched, author text, agent model, agent session. Each entry has id, author, \
-             message and `agent` metadata (model, session, prompt, tests) when an agent made the \
-             change. With `follow` and a file `path`, history continues under the file's old name \
+             message (its first line; `leep_show` has the whole message), files_changed and \
+             `agent` metadata (model, session, prompt, tests) when an agent made the change. With `follow` and a file `path`, history continues under the file's old name \
              when it was renamed (each entry then has `path_at`, and `renamed` where the rename \
              happened). When more history follows, the result has `next`: pass it back as \
              `cursor` for the next page.",
