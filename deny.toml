@@ -1,0 +1,67 @@
+# Supply-chain policy, checked by `cargo deny check` in CI
+# (.github/workflows/supply-chain.yml). See CONTRIBUTING.md, "Supply-chain
+# checks".
+
+[graph]
+# Vet dependencies behind optional features too. No `targets` list, so
+# dependencies for every platform are checked, not just the host's.
+all-features = true
+
+[advisories]
+version = 2
+db-urls = ["https://github.com/rustsec/advisory-db"]
+# Vulnerabilities always fail. An unmaintained crate is a risk, not a bug:
+# fail only when a workspace crate depends on it directly (we chose it and
+# can replace it); unmaintained transitive deps are tracked upstream.
+unmaintained = "workspace"
+# A yanked version is usually yanked for a reason (soundness, a bad
+# release) and `cargo update -p` fixes it, so fail.
+yanked = "deny"
+# Every ignore needs a reason and a date to remove it by. cargo-deny has
+# no expiry, so the date is a promise: past it, fix or re-justify.
+ignore = [
+    # quick-xml 0.38 (via object_store 0.12, leep-store's S3 backend):
+    # quadratic attribute checks and unbounded namespace allocation on
+    # crafted XML. The only XML parsed is S3 responses from the endpoint
+    # the operator configured, not user input. The fix (quick-xml 0.41)
+    # needs object_store 0.14, a breaking upgrade of leep-store.
+    # Remove by 2027-01-31.
+    { id = "RUSTSEC-2026-0194", reason = "quick-xml via object_store 0.12; parses only the configured S3 endpoint's responses; fixed by object_store 0.14 upgrade, remove by 2027-01-31" },
+    { id = "RUSTSEC-2026-0195", reason = "quick-xml via object_store 0.12; parses only the configured S3 endpoint's responses; fixed by object_store 0.14 upgrade, remove by 2027-01-31" },
+]
+
+[bans]
+# Two semver-incompatible versions of a crate are common and usually
+# harmless while the ecosystem migrates; surface them without failing.
+multiple-versions = "warn"
+# `*` requirements make builds unreproducible from the manifest alone.
+# Path dependencies inside the workspace have no version and are exempt.
+wildcards = "deny"
+allow-wildcard-paths = true
+highlight = "all"
+
+[licenses]
+version = 2
+# Permissive licenses compatible with distributing Leep under Apache-2.0.
+# Add to this list only after checking the new license is compatible.
+allow = [
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.9
+# Workspace crates are Apache-2.0 via [workspace.package]; unpublished ones
+# are still checked.
+private = { ignore = false }
+
+[sources]
+# Only crates.io. A git or alternate-registry dependency needs a deliberate
+# entry here.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

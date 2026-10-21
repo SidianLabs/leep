@@ -3,6 +3,7 @@ name = "leep-git"
 description = "Import, export and live mirroring between git repositories and Leep"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [[bin]]
@@ -14,7 +15,7 @@ leep-core.workspace = true
 leep-derive.workspace = true
 leep-store.workspace = true
 leep-meta.workspace = true
-leep-cli = { path = "../leep-cli" }
+leep-cli.workspace = true
 anyhow.workspace = true
 bytes.workspace = true
 futures-util.workspace = true

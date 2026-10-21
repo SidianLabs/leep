@@ -3,6 +3,7 @@ name = "leep-core"
 description = "Core data model and storage traits for Leep"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
