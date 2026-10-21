@@ -283,6 +283,11 @@ pub fn search_plan(data: &[u8]) {
         let row = BlobRow::of(text.as_bytes()).encode();
         let present = c.probe.blob(&row).unwrap().unwrap();
         assert!(c.required.eval(&|t| present.has(t)), "blob row of {pat:?}");
+        assert_eq!(
+            c.admits_blob(&row).unwrap(),
+            Some(true),
+            "early stop, blob row of {pat:?}"
+        );
     }
     let mut bloom = Bloom::default();
     codes.iter().for_each(|&t| bloom.insert(t));
@@ -290,6 +295,10 @@ pub fn search_plan(data: &[u8]) {
     assert!(
         c.required.eval(&|t| present.has(t)),
         "tree filter of {pat:?}"
+    );
+    assert!(
+        c.admits_tree(&bloom.encode()).unwrap(),
+        "early stop, tree filter of {pat:?}"
     );
 }
 

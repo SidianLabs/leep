@@ -5,6 +5,7 @@
 //! constraints but never add one.
 
 use std::collections::BTreeSet;
+use std::ops::ControlFlow;
 
 use leep_core::api::{SearchMatch, SearchRange};
 use leep_core::{Error, RepoPath, Result};
@@ -114,6 +115,136 @@ impl Expr {
     }
 }
 
+/// No parent: the root of a [`Gate`].
+const ROOT: u32 = u32::MAX;
+
+/// An [`Expr`] flattened so it can be told one absent trigram at a time and
+/// say as soon as it has become false.
+///
+/// Sound because `Expr` has no negation: `eval` is monotone in `has`, so
+/// evaluating with every trigram not yet known absent counted as present is
+/// an upper bound on the full evaluation. Once that bound is false, no
+/// later value can make it true, and the rest of the row need not be read.
+#[derive(Clone, Debug, Default)]
+pub struct Gate {
+    /// Parent node of each node, or [`ROOT`].
+    parent: Vec<u32>,
+    /// False children that make each node false: 1 for `And` and for a leaf
+    /// (whose one "child" is its trigram), the child count for `Or` (0 for
+    /// an empty `Or`, false from the start), never for `True` or an empty
+    /// `And`.
+    need: Vec<u32>,
+    /// False children of each node before anything is known: nonzero only
+    /// above an empty `Or`.
+    start: Vec<u32>,
+    /// Whether the root is false before anything is known.
+    false_at_start: bool,
+    /// Leaf nodes of each probed code, by its index in [`Probe::codes`].
+    leaves: Vec<Vec<u32>>,
+}
+
+impl Gate {
+    pub fn new(expr: &Expr, probe: &Probe) -> Gate {
+        let mut g = Gate {
+            leaves: vec![Vec::new(); probe.codes().len()],
+            ..Gate::default()
+        };
+        let mut stack = vec![(expr, ROOT)];
+        while let Some((e, parent)) = stack.pop() {
+            let id = g.parent.len() as u32;
+            g.parent.push(parent);
+            g.start.push(0);
+            match e {
+                Expr::True => g.need.push(u32::MAX),
+                Expr::Tri(t) => {
+                    g.need.push(1);
+                    // An unprobed code stays present, as in `Present::has`:
+                    // its leaf is never told it is absent.
+                    if let Ok(i) = probe.codes().binary_search(t) {
+                        g.leaves[i].push(id);
+                    }
+                }
+                Expr::And(v) => {
+                    g.need.push(if v.is_empty() { u32::MAX } else { 1 });
+                    stack.extend(v.iter().map(|c| (c, id)));
+                }
+                Expr::Or(v) => {
+                    g.need.push(v.len() as u32);
+                    stack.extend(v.iter().map(|c| (c, id)));
+                }
+            }
+        }
+        // Children come after their parent, so one backward pass carries
+        // every empty `Or` up as far as it reaches.
+        for n in (0..g.parent.len()).rev() {
+            // `>=`: an `And` may have several children false from the start
+            // and still counts once in its parent.
+            if g.start[n] >= g.need[n] {
+                match g.parent[n] {
+                    ROOT => g.false_at_start = true,
+                    p => g.start[p as usize] += 1,
+                }
+            }
+        }
+        g
+    }
+
+    /// Evaluate against a row whose absent codes `report` passes on, one at
+    /// a time; it stops reading the row once the expression is false.
+    fn admits(
+        &self,
+        report: impl FnOnce(&mut dyn FnMut(usize) -> ControlFlow<()>) -> Result<()>,
+    ) -> Result<bool> {
+        let mut falses = self.start.clone();
+        let mut root_false = self.false_at_start;
+        report(&mut |code| {
+            if root_false {
+                return ControlFlow::Break(());
+            }
+            for &leaf in &self.leaves[code] {
+                let mut n = leaf as usize;
+                loop {
+                    falses[n] += 1;
+                    if falses[n] != self.need[n] {
+                        break;
+                    }
+                    match self.parent[n] {
+                        ROOT => {
+                            root_false = true;
+                            return ControlFlow::Break(());
+                        }
+                        p => n = p as usize,
+                    }
+                }
+            }
+            ControlFlow::Continue(())
+        })?;
+        Ok(!root_false)
+    }
+
+    /// Whether a directory filter row admits the expression.
+    ///
+    /// Stopping early also skips validating the rest of the row, so a row
+    /// whose corrupt tail lies past the deciding values now prunes on its
+    /// prefix instead of failing the search. `verify` still finds it: it
+    /// recomputes every row and compares the bytes.
+    pub fn tree(&self, probe: &Probe, row: &[u8]) -> Result<bool> {
+        self.admits(|absent| probe.tree_absent(row, absent))
+    }
+
+    /// Whether a blob row admits the expression; `None` for a row that
+    /// records "not indexed". Stops early like [`Gate::tree`], with the same
+    /// caveat about a corrupt tail.
+    pub fn blob(&self, probe: &Probe, row: &[u8]) -> Result<Option<bool>> {
+        let mut unindexed = false;
+        let admitted = self.admits(|absent| {
+            unindexed = probe.blob_absent(row, absent)?.is_none();
+            Ok(())
+        })?;
+        Ok((!unindexed).then_some(admitted))
+    }
+}
+
 fn dedup_in_place(v: &mut Vec<Expr>) {
     let mut seen: Vec<Expr> = Vec::with_capacity(v.len());
     v.retain(|e| {
@@ -153,6 +284,8 @@ pub struct Compiled {
     pub required: Expr,
     /// Reads the trigrams of `required` out of index rows.
     pub probe: Probe,
+    /// `required`, evaluated while the probe reads a row.
+    gate: Gate,
 }
 
 impl Compiled {
@@ -186,11 +319,24 @@ impl Compiled {
             literal_requirement(pattern, case_insensitive)
         };
         let required = required.limited();
+        let probe = Probe::new(required.trigrams());
         Ok(Compiled {
             regex: re,
-            probe: Probe::new(required.trigrams()),
+            gate: Gate::new(&required, &probe),
+            probe,
             required,
         })
+    }
+
+    /// Whether a `tree-trigrams-v1` row admits the query; see [`Gate::tree`].
+    pub fn admits_tree(&self, row: &[u8]) -> Result<bool> {
+        self.gate.tree(&self.probe, row)
+    }
+
+    /// Whether a `blob-trigrams-v1` row admits the query, `None` if the row
+    /// records "not indexed"; see [`Gate::blob`].
+    pub fn admits_blob(&self, row: &[u8]) -> Result<Option<bool>> {
+        self.gate.blob(&self.probe, row)
     }
 
     /// Append the matching lines of `text`, at most `max` of them.

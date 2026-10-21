@@ -253,8 +253,7 @@ struct Opener {
 impl Opener {
     /// Whether a directory filter admits the query.
     fn admits(&self, row: &[u8]) -> Result<bool> {
-        let present = self.compiled.probe.tree(row)?;
-        Ok(self.compiled.required.eval(&|t| present.has(t)))
+        self.compiled.admits_tree(row)
     }
 
     /// The children of the directory `dir` (node `node`) that the walk will
@@ -321,7 +320,7 @@ impl Opener {
             let tree_keys: Vec<Hash> = dirs.iter().map(|d| d.2).collect();
             let meta = self.repo.meta();
             let (tree_rows, blob_rows) = futures_util::try_join!(
-                many(meta.as_ref(), TREE_KIND, &tree_keys),
+                self.repo.search_tree_rows(&tree_keys),
                 many(meta.as_ref(), BLOB_KIND, &blob_keys),
             )?;
             for (k, row) in wanted.into_iter().zip(blob_rows) {
@@ -333,7 +332,7 @@ impl Opener {
                     Some(row) => row,
                     // A cold filter is derived under the pool permit; the
                     // class limit already bounds how many searches do this.
-                    None => self.repo.tree_row(d.2, &self.counters).await?,
+                    None => self.repo.search_tree_row(d.2, &self.counters).await?,
                 };
                 if self.admits(&row)? {
                     kept.push(d);
@@ -429,7 +428,17 @@ impl Walk {
         if let Some((path, tree)) = self.start.take() {
             let o = &self.opener;
             let admitted = !o.indexed || {
-                let row = o.repo.tree_row(tree, &o.counters).await?;
+                // The root's filter is a metadata read like `open`'s, so it
+                // takes a pool permit too; no `ahead` permit is held here.
+                let _pool = match &o.repo.search_pool {
+                    Some(pool) => Some(
+                        pool.acquire()
+                            .await
+                            .map_err(|e| Error::Other(format!("search pool: {e}")))?,
+                    ),
+                    None => None,
+                };
+                let row = o.repo.search_tree_row(tree, &o.counters).await?;
                 o.admits(&row)?
             };
             if admitted {
@@ -754,13 +763,10 @@ impl Repo {
                 Some(row) => row,
                 None => self.blob_row_bytes(f.content, f.size, counters).await?,
             };
-            match compiled.probe.blob(&row)? {
+            match compiled.admits_blob(&row)? {
                 None => return Ok(Outcome::Skipped { fetched: 0 }),
-                Some(present) => {
-                    if !compiled.required.eval(&|t| present.has(t)) {
-                        return Ok(Outcome::Pruned);
-                    }
-                }
+                Some(false) => return Ok(Outcome::Pruned),
+                Some(true) => {}
             }
         }
         let data =

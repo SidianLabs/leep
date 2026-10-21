@@ -728,6 +728,60 @@ async fn bounded_search_matches_the_indexed_answers() {
     }
 }
 
+/// A bounded search computes missing directory filters into its own
+/// `SearchScan`; only filters read from the store reach the shared cache,
+/// so a computed row never outlives its query.
+#[tokio::test]
+async fn bounded_search_caches_only_stored_filters() {
+    let mut unstored_roots = 0;
+    for seed in 60..=67u64 {
+        let n = 40;
+        let (a, ids) = full(seed, n).await;
+        let (b, meta) = partial(seed, &ids, n).await;
+        hold_leases(meta.as_ref()).await;
+        let q = bounded(
+            &b,
+            Budgets {
+                search_files: 10_000,
+                ..Budgets::default()
+            },
+        );
+        for &tip in ids.iter().rev().take(10) {
+            let root = a.root_tree(tip).await.unwrap();
+            let stored = meta
+                .get_derived(crate::search::TREE_KIND, &root)
+                .await
+                .unwrap()
+                .is_some();
+            let got = q
+                .search_page_indexed(
+                    &tip.to_string(),
+                    &SearchQuery::new("line 3"),
+                    None,
+                    Freshness::Retry,
+                )
+                .await
+                .unwrap();
+            assert_eq!(got.value.stats.tree_rows_derived, 0);
+            if !stored {
+                unstored_roots += 1;
+                assert!(b.search_trees.entries().iter().all(|e| e.0 != root));
+            }
+        }
+        for (h, row, _) in b.search_trees.entries() {
+            let stored = meta
+                .get_derived(crate::search::TREE_KIND, &h)
+                .await
+                .unwrap();
+            assert_eq!(stored.as_ref(), Some(&*row), "seed {seed}");
+        }
+    }
+    assert!(
+        unstored_roots > 0,
+        "some searches computed their root's filter"
+    );
+}
+
 /// Pages concatenate to one walk while the index grows between pages, and
 /// after a `repair drop` of the kind between pages.
 #[tokio::test]

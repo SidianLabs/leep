@@ -16,6 +16,7 @@ use leep_core::memory::{MemoryBlobStore, MemoryMetaStore};
 use leep_core::{BlobStore, Changeset, ChangesetId, FileChange, FileKind, RepoPath};
 use leep_derive::search::{BLOB_KIND, TREE_KIND};
 use leep_derive::{Repo, SearchQuery};
+use leep_testkit::{FaultPlan, FaultyMetaStore, Op};
 use tokio::runtime::Runtime;
 
 const DIRS: usize = 400;
@@ -148,6 +149,28 @@ fn index_size(rt: &Runtime, repo: &Repo, id: ChangesetId, files: &[(String, Vec<
     });
 }
 
+/// Index rows one search reads from the metadata store, on a handle with
+/// cold caches and then again: the second search finds the directory
+/// filters it read in `Repo`'s cache. Counted through a store wrapper that
+/// reads rows one call at a time, outside the timed runs.
+fn store_reads(rt: &Runtime, repo: &Repo, id: ChangesetId, cases: &[(&str, SearchQuery)]) {
+    for (name, q) in cases {
+        let plan = FaultPlan::new(0);
+        let meta = FaultyMetaStore::new(repo.meta().clone(), plan.clone());
+        let counted = Repo::new(repo.blobs().clone(), Arc::new(meta));
+        let mut reads = Vec::new();
+        for _ in 0..2 {
+            let before = plan.calls(Op::GetDerived);
+            rt.block_on(counted.search(id, q)).unwrap();
+            reads.push(plan.calls(Op::GetDerived) - before);
+        }
+        eprintln!(
+            "{name}: index rows read from the store: {} first, {} repeated",
+            reads[0], reads[1]
+        );
+    }
+}
+
 fn search(c: &mut Criterion) {
     let n: usize = std::env::var("LEEP_BENCH_SEARCH_FILES")
         .ok()
@@ -210,6 +233,8 @@ fn search(c: &mut Criterion) {
             regex("^[a-z]+_[a-z]+\\(\\d\\d\\);$".into()),
         ),
     ];
+
+    store_reads(&rt, &repo, id, &cases);
 
     let mut g = c.benchmark_group("search");
     g.sample_size(10).measurement_time(Duration::from_secs(5));

@@ -1,6 +1,8 @@
 //! Trigram sets and the directory summary filter. Both encodings are
 //! persisted, so changing one means a new kind name (FORMATS.md).
 
+use std::ops::ControlFlow;
+
 use leep_core::{Error, Result};
 
 /// Files above this size are not indexed and not searched. Bounds the cost of
@@ -287,6 +289,9 @@ pub struct Probe {
     positions: Vec<u32>,
     /// For each code, the indexes of its bits in `positions`.
     code_bits: Vec<[u32; HASHES as usize]>,
+    /// For each entry of `positions`, the indexes of the codes that set it:
+    /// one absent bit rules out each of them.
+    position_codes: Vec<Vec<u32>>,
 }
 
 /// What a row holds of the probed trigrams.
@@ -324,6 +329,48 @@ fn find_sorted(b: &[u8], needed: &[u32], found: &mut [bool]) -> Result<()> {
     Ok(())
 }
 
+/// [`find_sorted`] that reports each absent `needed[i]` to `absent` as soon
+/// as the decoding passes it, or when the row ends before it, and stops
+/// decoding when `absent` breaks. Values past the stop are never decoded, so
+/// they are not validated either.
+fn absent_sorted(
+    b: &[u8],
+    needed: &[u32],
+    mut absent: impl FnMut(usize) -> ControlFlow<()>,
+) -> Result<()> {
+    let (mut at, mut j, mut prev) = (0usize, 0usize, 0u32);
+    let mut first = true;
+    while at < b.len() && j < needed.len() {
+        let d = get_varint(b, &mut at)?;
+        let v = if first {
+            d
+        } else if d == 0 {
+            return Err(Error::Encoding("values not strictly increasing".into()));
+        } else {
+            prev.checked_add(d)
+                .ok_or_else(|| Error::Encoding("delta overflows".into()))?
+        };
+        (first, prev) = (false, v);
+        while j < needed.len() && needed[j] < v {
+            if absent(j).is_break() {
+                return Ok(());
+            }
+            j += 1;
+        }
+        if j < needed.len() && needed[j] == v {
+            j += 1;
+        }
+    }
+    // The row ended: every value not reached is absent.
+    while j < needed.len() {
+        if absent(j).is_break() {
+            return Ok(());
+        }
+        j += 1;
+    }
+    Ok(())
+}
+
 impl Probe {
     pub fn new(mut codes: Vec<u32>) -> Probe {
         codes.sort_unstable();
@@ -335,14 +382,79 @@ impl Probe {
             .collect();
         bits.sort_unstable();
         bits.dedup();
-        let code_bits = codes
+        let code_bits: Vec<[u32; HASHES as usize]> = codes
             .iter()
             .map(|&c| positions(c).map(|p| positions_index(&bits, p as u32)))
             .collect();
+        let mut position_codes = vec![Vec::new(); bits.len()];
+        for (i, cb) in code_bits.iter().enumerate() {
+            for &b in cb {
+                let codes = &mut position_codes[b as usize];
+                // A code's own positions may coincide.
+                if codes.last() != Some(&(i as u32)) {
+                    codes.push(i as u32);
+                }
+            }
+        }
         Probe {
             codes,
             positions: bits,
             code_bits,
+            position_codes,
+        }
+    }
+
+    /// Codes probed, sorted and distinct; [`Probe::blob_absent`] and
+    /// [`Probe::tree_absent`] name them by index in this list.
+    pub fn codes(&self) -> &[u32] {
+        &self.codes
+    }
+
+    /// Reports to `absent` the index of each probed code a blob row lacks,
+    /// stopping when it breaks. `None` for a row that records "not indexed".
+    pub fn blob_absent(
+        &self,
+        row: &[u8],
+        absent: impl FnMut(usize) -> ControlFlow<()>,
+    ) -> Result<Option<()>> {
+        match row {
+            [NOT_INDEXED, 1 | 2] => Ok(None),
+            [INDEXED, rest @ ..] => absent_sorted(rest, &self.codes, absent).map(Some),
+            _ => Err(Error::Encoding("bad blob-trigrams row".into())),
+        }
+    }
+
+    /// Reports to `absent`, once each, the index of each probed code a
+    /// directory filter rules out (any of its bits is clear), stopping when
+    /// it breaks.
+    pub fn tree_absent(
+        &self,
+        row: &[u8],
+        mut absent: impl FnMut(usize) -> ControlFlow<()>,
+    ) -> Result<()> {
+        let mut out = vec![false; self.codes.len()];
+        let mut bit_clear = |j: usize| {
+            for &c in &self.position_codes[j] {
+                if !std::mem::replace(&mut out[c as usize], true) {
+                    absent(c as usize)?;
+                }
+            }
+            ControlFlow::Continue(())
+        };
+        match row {
+            [DENSE, rest @ ..] => {
+                if rest.len() != WORDS * 8 {
+                    return Err(Error::Encoding("bad dense filter length".into()));
+                }
+                for (j, &p) in self.positions.iter().enumerate() {
+                    if rest[p as usize / 8] >> (p % 8) & 1 == 0 && bit_clear(j).is_break() {
+                        break;
+                    }
+                }
+                Ok(())
+            }
+            [SPARSE, rest @ ..] => absent_sorted(rest, &self.positions, bit_clear),
+            _ => Err(Error::Encoding("bad tree-trigrams row".into())),
         }
     }
 
@@ -579,5 +691,298 @@ mod tests {
         assert!(probe.blob(&[INDEXED, 0x01, 0x00]).is_err());
         assert!(probe.tree(&[DENSE]).is_err());
         assert!(probe.blob(&[9]).is_err());
+    }
+
+    mod early_stop {
+        use super::*;
+        use crate::search::plan::{Compiled, Expr, Gate};
+
+        /// Seeded so a failure reproduces; the case number is in the message.
+        struct Lcg(u64);
+
+        impl Lcg {
+            fn next(&mut self) -> u64 {
+                self.0 = self
+                    .0
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                self.0 >> 33
+            }
+
+            fn below(&mut self, n: usize) -> usize {
+                self.next() as usize % n
+            }
+
+            fn chance(&mut self, percent: usize) -> bool {
+                self.below(100) < percent
+            }
+        }
+
+        /// Codes for expressions: random ones, the ends of the range, and
+        /// pairs that share a bloom position, so one clear bit rules out
+        /// several codes at once.
+        fn pool(rng: &mut Lcg) -> Vec<u32> {
+            let mut by_pos: std::collections::HashMap<usize, u32> = Default::default();
+            let mut shared = Vec::new();
+            for c in 0..400_000u32 {
+                for p in positions(c) {
+                    if let Some(&other) = by_pos.get(&p) {
+                        if other != c {
+                            shared.extend([other, c]);
+                        }
+                    }
+                    by_pos.insert(p, c);
+                }
+                if shared.len() >= 40 {
+                    break;
+                }
+            }
+            assert!(shared.len() >= 40, "found codes sharing positions");
+            let mut pool: Vec<u32> = (0..40).map(|_| rng.below(1 << 24) as u32).collect();
+            pool.extend([0, 1, 2, 0xff_fffe, 0xff_ffff]);
+            pool.extend(shared);
+            pool
+        }
+
+        fn expr(rng: &mut Lcg, pool: &[u32], depth: usize) -> Expr {
+            let leaf = depth == 0 || rng.chance(30);
+            if leaf {
+                return if rng.chance(5) {
+                    Expr::True
+                } else {
+                    Expr::Tri(pool[rng.below(pool.len())])
+                };
+            }
+            // Empty `And` and `Or` included: `Expr::eval` gives them meaning
+            // even though the planner never builds them.
+            let kids = (0..rng.below(5))
+                .map(|_| expr(rng, pool, depth - 1))
+                .collect();
+            if rng.chance(50) {
+                Expr::And(kids)
+            } else {
+                Expr::Or(kids)
+            }
+        }
+
+        /// A sparse delta-varint row (blob or tree) over `values`.
+        fn sparse(tag: u8, values: &std::collections::BTreeSet<u32>) -> Vec<u8> {
+            let mut out = vec![tag];
+            put_deltas(&mut out, values.iter().copied());
+            out
+        }
+
+        /// A dense filter with about three bits in four set.
+        fn busy(rng: &mut Lcg) -> Vec<u8> {
+            let mut out = vec![DENSE];
+            out.extend((0..WORDS * 8).map(|_| (rng.next() | rng.next() >> 8) as u8));
+            out
+        }
+
+        fn dense(values: &std::collections::BTreeSet<u32>) -> Vec<u8> {
+            let mut out = vec![0u8; 1 + WORDS * 8];
+            out[0] = DENSE;
+            for &p in values {
+                out[1 + p as usize / 8] |= 1 << (p % 8);
+            }
+            out
+        }
+
+        /// Values of a row: each needed value with probability `keep`, plus
+        /// noise, all below `cap` (a short row ends before the larger
+        /// needed values).
+        fn row_values(
+            rng: &mut Lcg,
+            needed: &[u32],
+            keep: usize,
+            noise: usize,
+            limit: u32,
+            cap: u32,
+        ) -> std::collections::BTreeSet<u32> {
+            let mut v: std::collections::BTreeSet<u32> = needed
+                .iter()
+                .copied()
+                .filter(|_| rng.chance(keep))
+                .collect();
+            v.extend((0..noise).map(|_| rng.below(limit as usize) as u32));
+            v.retain(|&x| x < cap);
+            v
+        }
+
+        fn full_tree(expr: &Expr, probe: &Probe, row: &[u8]) -> bool {
+            let present = probe.tree(row).unwrap();
+            expr.eval(&|t| present.has(t))
+        }
+
+        fn full_blob(expr: &Expr, probe: &Probe, row: &[u8]) -> Option<bool> {
+            let present = probe.blob(row).unwrap()?;
+            Some(expr.eval(&|t| present.has(t)))
+        }
+
+        /// One expression against many rows of each shape.
+        fn check(rng: &mut Lcg, busy: &[u8], case: usize, e: &Expr) {
+            let probe = Probe::new(e.trigrams());
+            let gate = Gate::new(e, &probe);
+            for r in 0..12 {
+                let keep = [0, 50, 90, 100][r % 4];
+                let cap = if r % 3 == 0 {
+                    rng.below(BLOOM_BITS) as u32
+                } else {
+                    u32::MAX
+                };
+                let pos = row_values(rng, &probe.positions, keep, 20, BLOOM_BITS as u32, cap);
+                for row in [sparse(SPARSE, &pos), dense(&pos)] {
+                    assert_eq!(
+                        gate.tree(&probe, &row).unwrap(),
+                        full_tree(e, &probe, &row),
+                        "case {case} row {r} tag {}: {e:?}",
+                        row[0]
+                    );
+                }
+                // A dense row with most bits set, like a large directory.
+                let mut row = busy.to_vec();
+                for &p in &probe.positions {
+                    let bit = 1 << (p % 8);
+                    if rng.chance(keep) {
+                        row[1 + p as usize / 8] |= bit;
+                    } else {
+                        row[1 + p as usize / 8] &= !bit;
+                    }
+                }
+                assert_eq!(
+                    gate.tree(&probe, &row).unwrap(),
+                    full_tree(e, &probe, &row),
+                    "case {case} row {r} busy: {e:?}"
+                );
+                let cap = if r % 3 == 0 {
+                    rng.below(1 << 24) as u32
+                } else {
+                    u32::MAX
+                };
+                let codes = row_values(rng, &probe.codes, keep, 20, 1 << 24, cap);
+                let row = sparse(INDEXED, &codes);
+                assert_eq!(
+                    gate.blob(&probe, &row).unwrap(),
+                    full_blob(e, &probe, &row),
+                    "case {case} row {r} blob: {e:?}"
+                );
+            }
+            // Empty rows: every needed value is absent.
+            assert_eq!(
+                gate.blob(&probe, &[INDEXED]).unwrap(),
+                full_blob(e, &probe, &[INDEXED])
+            );
+            assert_eq!(
+                gate.tree(&probe, &[SPARSE]).unwrap(),
+                full_tree(e, &probe, &[SPARSE])
+            );
+            assert_eq!(
+                gate.blob(&probe, &BlobRow::NotIndexed(Skip::Binary).encode())
+                    .unwrap(),
+                None
+            );
+        }
+
+        #[test]
+        fn early_stop_agrees_with_full_evaluation() {
+            let mut rng = Lcg(0x5eed);
+            let busy = busy(&mut rng);
+            let pool = pool(&mut rng);
+            for case in 0..600 {
+                let e = expr(&mut rng, &pool, 4);
+                check(&mut rng, &busy, case, &e);
+            }
+        }
+
+        /// What `limited()` can leave of a case-insensitive query: one
+        /// conjunct, an `Or` of up to 8 * 8 * 8 spellings.
+        #[test]
+        fn early_stop_agrees_on_wide_case_insensitive_requirements() {
+            let mut rng = Lcg(0x1ca5e);
+            let busy = busy(&mut rng);
+            for case in 0..20 {
+                let alts: Vec<Expr> = (0..512)
+                    .map(|_| Expr::Tri(rng.below(1 << 24) as u32))
+                    .collect();
+                let e = if case % 2 == 0 {
+                    Expr::And(vec![Expr::Or(alts)])
+                } else {
+                    Expr::And(vec![
+                        Expr::Or(alts[..256].to_vec()),
+                        Expr::Or(alts[256..].to_vec()),
+                    ])
+                };
+                check(&mut rng, &busy, case, &e);
+            }
+        }
+
+        /// The planner's own case-insensitive requirements, against rows of
+        /// text in mixed case.
+        #[test]
+        fn early_stop_agrees_on_case_insensitive_queries() {
+            let mut rng = Lcg(7);
+            let busy = busy(&mut rng);
+            let words = [
+                "Hello",
+                "kitten",
+                "STATUS",
+                "θιθκσ",
+                "Ωμέγα",
+                "ſtraße",
+                "handler_05_123_",
+            ];
+            for (case, w) in words.iter().enumerate() {
+                let c = Compiled::new(w, false, true).unwrap();
+                check(&mut rng, &busy, case, &c.required);
+                let texts = [
+                    w.to_string(),
+                    w.to_uppercase(),
+                    w.to_lowercase(),
+                    format!("x {} y", w.chars().rev().collect::<String>()),
+                    "unrelated text".to_string(),
+                ];
+                for text in texts {
+                    let set = extract(text.as_bytes());
+                    let mut bloom = Bloom::default();
+                    set.iter().for_each(|&t| bloom.insert(t));
+                    let tree = bloom.encode();
+                    let blob = BlobRow::Trigrams(set).encode();
+                    assert_eq!(
+                        c.admits_tree(&tree).unwrap(),
+                        full_tree(&c.required, &c.probe, &tree),
+                        "{w:?} in {text:?}"
+                    );
+                    assert_eq!(
+                        c.admits_blob(&blob).unwrap(),
+                        full_blob(&c.required, &c.probe, &blob),
+                        "{w:?} in {text:?}"
+                    );
+                }
+            }
+        }
+
+        /// Stopping early skips the rest of the row, so a corrupt tail past
+        /// the deciding value no longer fails the probe (verify finds it).
+        #[test]
+        fn early_stop_does_not_read_past_the_decision() {
+            let (a, z) = (code(b'a', b'a', b'a'), code(b'z', b'z', b'z'));
+            // `a` is absent, then a varint is cut off before `z` is reached.
+            let mut corrupt = vec![INDEXED];
+            put_deltas(&mut corrupt, [a + 1].into_iter());
+            corrupt.push(0x80);
+            let both = Expr::And(vec![Expr::Tri(a), Expr::Tri(z)]);
+            let either = Expr::Or(vec![Expr::Tri(a), Expr::Tri(z)]);
+            let probe = Probe::new(both.trigrams());
+            assert!(probe.blob(&corrupt).is_err());
+            assert_eq!(
+                Gate::new(&both, &probe).blob(&probe, &corrupt).unwrap(),
+                Some(false),
+                "decided by the prefix"
+            );
+            assert!(
+                Gate::new(&either, &probe).blob(&probe, &corrupt).is_err(),
+                "not decided by the prefix"
+            );
+        }
     }
 }

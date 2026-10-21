@@ -30,6 +30,20 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 - A follower relays `Leep-Refused` with a forwarded land's answer.
   `leep-swarm` reports shed reads apart from errors.
 
+### Search reads less of the index
+- An indexed search stops reading a directory filter or a file's trigram
+  row as soon as the query can no longer match it, instead of decoding the
+  whole row. Results are unchanged. A row whose damage lies past the point
+  where the query was decided no longer fails the search; `leep-server
+  verify` still reports it.
+- Each server keeps the directory filters (`tree-trigrams-v1` rows) its
+  searches read in memory, so repeated searches stop reading the upper
+  directories' filters from the metadata store. The cache takes 64 MiB of
+  `--derive-cache-bytes`, whose default grows from 340 MiB to 404 MiB; a
+  server started with an explicit budget gives every derive cache a
+  slightly smaller share of it. Restart servers after `repair` of
+  `tree-trigrams-v1` (OPERATIONS.md, "Repair").
+
 ### File listings and diffs answer in pages
 - `GET /v1/files/{id}` and `GET /v1/diff` take `limit` and `after` and
   answer `next` when more remain, like log, search and the ref log. Paths
