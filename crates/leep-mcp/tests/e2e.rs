@@ -1575,3 +1575,67 @@ fn land_id_refusal_is_read_from_the_record_then_text_then_ref_log() {
         head
     );
 }
+
+/// A search the server sheds (ADR 0060) comes back at once as a retryable
+/// tool error carrying `retry_after`: the tool asks once and never sleeps,
+/// whatever the `Retry-After`.
+#[test]
+fn a_shed_search_is_a_retryable_tool_error_without_waiting() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use axum::http::{header, HeaderValue, StatusCode};
+    use axum::response::IntoResponse;
+    use axum::routing::get;
+
+    let id = "ab".repeat(32);
+    let searches = Arc::new(AtomicUsize::new(0));
+    let seen = searches.clone();
+    let resolved = id.clone();
+    let app = axum::Router::new()
+        .route(
+            "/v1/resolve/{*rev}",
+            get(move || {
+                let id = resolved.clone();
+                async move { axum::Json(json!({ "id": id })) }
+            }),
+        )
+        .route(
+            "/v1/search/{*rev}",
+            get(move || {
+                seen.fetch_add(1, Ordering::SeqCst);
+                async {
+                    let body = json!({
+                        "error": "server busy: all 1 of this server's search permits are in use \
+                                  (--read-concurrency); nothing was done, retry after 7s",
+                        "code": "unavailable",
+                    });
+                    let mut resp =
+                        (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body)).into_response();
+                    let h = resp.headers_mut();
+                    h.insert(header::RETRY_AFTER, HeaderValue::from_static("7"));
+                    h.insert("leep-refused", HeaderValue::from_static("read-class"));
+                    resp
+                }
+            }),
+        );
+    let s = Server::new(config(&serve(app)));
+    let started = std::time::Instant::now();
+    let r = call(&s, "leep_search", json!({ "query": "parse" }));
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "the tool slept"
+    );
+    assert_eq!(searches.load(Ordering::SeqCst), 1, "asked once");
+    assert_eq!(r["isError"], true);
+    let t = text(&r);
+    for want in [
+        "server busy",
+        "Leep-Refused: read-class",
+        "unavailable",
+        "retryable",
+        "retry_after: 7",
+    ] {
+        assert!(t.contains(want), "{want:?} in {t}");
+    }
+}
