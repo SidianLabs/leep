@@ -14,13 +14,17 @@ license = "Apache-2.0"
 repository = "https://github.com/bhaweshbhaskar/leep"
 
 [workspace.dependencies]
-leep-core = { path = "crates/leep-core" }
-leep-store = { path = "crates/leep-store" }
-leep-meta = { path = "crates/leep-meta" }
-leep-derive = { path = "crates/leep-derive" }
-leep-git = { path = "crates/leep-git" }
-leep-server = { path = "crates/leep-server" }
-leep-testkit = { path = "crates/leep-testkit" }
+# Internal crates carry a version as well as a path so no dependency is a
+# wildcard (deny.toml, [bans]). Keep it equal to workspace.package.version;
+# cargo refuses to resolve if the two drift apart.
+leep-core = { path = "crates/leep-core", version = "0.0.1" }
+leep-store = { path = "crates/leep-store", version = "0.0.1" }
+leep-meta = { path = "crates/leep-meta", version = "0.0.1" }
+leep-derive = { path = "crates/leep-derive", version = "0.0.1" }
+leep-cli = { path = "crates/leep-cli", version = "0.0.1" }
+leep-git = { path = "crates/leep-git", version = "0.0.1" }
+leep-server = { path = "crates/leep-server", version = "0.0.1" }
+leep-testkit = { path = "crates/leep-testkit", version = "0.0.1" }
 
 anyhow = "1"
 arc-swap = "1"

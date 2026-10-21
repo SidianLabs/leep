@@ -15,7 +15,7 @@ leep-core.workspace = true
 leep-derive.workspace = true
 leep-store.workspace = true
 leep-meta.workspace = true
-leep-cli = { path = "../leep-cli" }
+leep-cli.workspace = true
 anyhow.workspace = true
 bytes.workspace = true
 futures-util.workspace = true
