@@ -87,13 +87,15 @@ async fn dump(store: &dyn MetaStore) -> Dump {
         .into_iter()
         .map(|(n, t)| format!("{n} {t:?}"))
         .collect();
-    let log = store
-        .ref_log(None, None, 10_000)
-        .await
-        .unwrap()
-        .into_iter()
-        .map(|e| format!("{e:?}"))
-        .collect();
+    // Land ids go with the other land data, so `without_lands` drops them.
+    let mut log = Vec::new();
+    let mut log_lands = Vec::new();
+    for mut e in store.ref_log(None, None, 10_000).await.unwrap() {
+        if let Some(id) = e.land_id.take() {
+            log_lands.push(format!("{} {id} {:?}", e.seq, e.land_changeset.take()));
+        }
+        log.push(format!("{e:?}"));
+    }
     let mut derived = Vec::new();
     for kind in ["gen", "blob-claim-v1"] {
         let mut after = None;
@@ -109,13 +111,14 @@ async fn dump(store: &dyn MetaStore) -> Dump {
         }
     }
     let want: Vec<LandId> = (0..25).map(land_id).collect();
-    let lands = store
+    let mut lands: Vec<String> = store
         .find_lands("main", &want)
         .await
         .unwrap()
         .into_iter()
         .map(|l| format!("{l:?}"))
         .collect();
+    lands.extend(log_lands);
     (ids, refs, log, derived, lands)
 }
 

@@ -41,8 +41,9 @@ fn side(id: Option<ChangesetId>) -> String {
     id.map_or_else(|| "-".to_string(), short)
 }
 
-/// `seq  time  actor  operation  ref  old -> new  message`; `-` stands for a
-/// missing actor or id (a create has no old value, a delete no new one).
+/// `seq  time  actor  operation  ref  old -> new  [land=ID]  message`; `-`
+/// stands for a missing actor or id (a create has no old value, a delete no
+/// new one). `land=` names the land id of a land that carried one.
 fn entry_line(e: &RefLogEntry) -> String {
     let mut line = format!(
         "{}  {}  {}  {}  {}  {} -> {}",
@@ -54,6 +55,9 @@ fn entry_line(e: &RefLogEntry) -> String {
         side(e.old),
         side(e.new),
     );
+    if let Some(id) = &e.land_id {
+        line.push_str(&format!("  land={id}"));
+    }
     if let Some(m) = &e.message {
         line.push_str("  ");
         line.push_str(m);
@@ -219,12 +223,23 @@ mod tests {
             actor: None,
             operation: "land".into(),
             message: None,
+            land_id: None,
+            land_changeset: None,
         };
         let a = short(id(b"a"));
         assert_eq!(
             entry_line(&e),
             format!("7  1970-01-01 00:00:00  -  land  main  - -> {a}")
         );
+        let land = "00112233445566778899aabbccddeeff";
+        e.land_id = Some(land.parse().unwrap());
+        e.land_changeset = e.new;
+        assert_eq!(
+            entry_line(&e),
+            format!("7  1970-01-01 00:00:00  -  land  main  - -> {a}  land={land}")
+        );
+        e.land_id = None;
+        e.land_changeset = None;
         e.old = e.new;
         e.new = None;
         e.actor = Some("ci".into());

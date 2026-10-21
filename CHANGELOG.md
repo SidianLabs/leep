@@ -7,6 +7,12 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 ## [Unreleased]
 
+### Land ids in the ref log
+- `GET /v1/reflog` entries carry `land_id` and `land_changeset` for lands
+  that named themselves (ADR 0057); they were stored since migration 0005
+  but not returned. `leep reflog` prints `land=ID`, and `--json` has both
+  fields. Entries without a land id are unchanged.
+
 ### Error codes
 - Every error body from the server carries a stable, machine-readable
   `code` (`needs_review`, `not_signed`, `not_forward`, `tag_immutable`,

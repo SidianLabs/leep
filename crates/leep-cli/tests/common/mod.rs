@@ -133,6 +133,8 @@ impl Data {
             actor: Some("mock".into()),
             operation: op.to_string(),
             message,
+            land_id: None,
+            land_changeset: None,
         });
     }
 

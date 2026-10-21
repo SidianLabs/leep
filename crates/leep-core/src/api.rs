@@ -120,7 +120,9 @@
 //! from the body, or null when authentication is off. A client may label its
 //! own moves with `operation` and `message` (`leep undo` sends `undo`); the
 //! server-owned labels `land` and `import` are 400. Refused and lost moves
-//! write nothing. Entries are never removed.
+//! write nothing. Entries are never removed. An entry of a land that carried
+//! a `land_id` (ADR 0057) has `land_id` and `land_changeset` (the changeset
+//! the land asked for); both are omitted otherwise and by older servers.
 //!
 //! # Authentication
 //!
@@ -1121,6 +1123,8 @@ mod tests {
             actor: None,
             operation: "undo".into(),
             message: Some("undo of 3".into()),
+            land_id: None,
+            land_changeset: None,
         };
         let v = serde_json::to_value(RefLogResponse {
             entries: vec![e.clone()],
@@ -1136,7 +1140,21 @@ mod tests {
             }]})
         );
         let back: RefLogResponse = serde_json::from_value(v).unwrap();
-        assert_eq!(back.entries, [e]);
+        assert_eq!(back.entries, std::slice::from_ref(&e));
+
+        // A land that named itself carries its id and changeset.
+        let land = RefLogEntry {
+            operation: "land".into(),
+            message: None,
+            new: Some(id),
+            land_id: Some("00112233445566778899aabbccddeeff".parse().unwrap()),
+            land_changeset: Some(id),
+            ..e
+        };
+        let v = serde_json::to_value(&land).unwrap();
+        assert_eq!(v["land_id"], "00112233445566778899aabbccddeeff");
+        assert_eq!(v["land_changeset"], id.to_string());
+        assert_eq!(serde_json::from_value::<RefLogEntry>(v).unwrap(), land);
     }
 
     #[test]

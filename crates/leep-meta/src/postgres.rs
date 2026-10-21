@@ -888,8 +888,8 @@ impl MetaStore for PostgresMetaStore {
     ) -> Result<Vec<RefLogEntry>> {
         let before = before_seq.map(|s| i64::try_from(s).unwrap_or(i64::MAX));
         let rows: Vec<LogRow> = sqlx::query_as(
-            "SELECT seq, name, old_target, new_target, time, actor, operation, message \
-             FROM ref_log WHERE ($1::text IS NULL OR name = $1) \
+            "SELECT seq, name, old_target, new_target, time, actor, operation, message, \
+             land_id, land_changeset FROM ref_log WHERE ($1::text IS NULL OR name = $1) \
              AND ($2::bigint IS NULL OR seq < $2) ORDER BY seq DESC LIMIT $3",
         )
         .bind(name)
