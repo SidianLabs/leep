@@ -79,6 +79,13 @@ struct Args {
     /// bound. `gc --fence` must exceed it.
     #[arg(long, env = "LEEP_REQUEST_TIMEOUT", default_value = "5m", value_parser = parse_grace)]
     request_timeout: std::time::Duration,
+    /// Bound on each statement the server sends to a Postgres metadata store
+    /// (its `statement_timeout`), so a query whose request was cut off by
+    /// --request-timeout does not run on in the database (0, 30s, 5m). Lease
+    /// calls and migrations are not bounded; SQLite ignores it. Default:
+    /// --request-timeout plus 5s, none when that is 0; 0 turns it off.
+    #[arg(long, env = "LEEP_META_STATEMENT_TIMEOUT", value_parser = parse_grace)]
+    meta_statement_timeout: Option<std::time::Duration>,
     /// How long `GET /v1/ready` waits for each store (metadata and blobs,
     /// checked concurrently) before reporting it down (500ms, 2s).
     #[arg(long, env = "LEEP_READY_TIMEOUT", default_value = "2s", value_parser = parse_ready_timeout)]
@@ -418,13 +425,39 @@ fn new_repo(blobs: Arc<dyn BlobStore>, meta: Arc<dyn leep_core::MetaStore>) -> R
 
 /// Open the metadata store, applying pending migrations unless `--no-migrate`.
 async fn open_meta(url: &str) -> leep_core::Result<Arc<dyn leep_core::MetaStore>> {
+    open_meta_bounded(url, None).await
+}
+
+/// [`open_meta`], with each Postgres data statement bounded by
+/// `statement_timeout`.
+async fn open_meta_bounded(
+    url: &str,
+    statement_timeout: Option<std::time::Duration>,
+) -> leep_core::Result<Arc<dyn leep_core::MetaStore>> {
     let mode = if NO_MIGRATE.load(std::sync::atomic::Ordering::Relaxed) {
         leep_meta::SchemaMode::RequireCurrent
     } else {
         leep_meta::SchemaMode::Migrate
     };
     let pool = META_POOL_SIZE.load(std::sync::atomic::Ordering::Relaxed);
-    leep_meta::open_meta_store_with_pool(url, mode, pool).await
+    leep_meta::open_meta_store_with_options(url, mode, pool, statement_timeout).await
+}
+
+/// Added to --request-timeout for the default statement bound, so a request
+/// that runs out of time is ended by its own timeout (408), not by a
+/// statement failing first.
+const STATEMENT_TIMEOUT_MARGIN: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The `--meta-statement-timeout` in force: the flag, or the request
+/// timeout plus [`STATEMENT_TIMEOUT_MARGIN`]; `None` for no bound.
+fn statement_timeout(
+    flag: Option<std::time::Duration>,
+    request_timeout: std::time::Duration,
+) -> Option<std::time::Duration> {
+    match flag {
+        Some(d) => (!d.is_zero()).then_some(d),
+        None => (!request_timeout.is_zero()).then(|| request_timeout + STATEMENT_TIMEOUT_MARGIN),
+    }
 }
 
 async fn run_migrate(meta: &str, dry_run: bool, status: bool) -> anyhow::Result<()> {
@@ -881,7 +914,22 @@ async fn main() -> anyhow::Result<()> {
         blobs =
             Arc::new(CachedBlobStore::new(ArcBlobs(blobs), args.cache_bytes)) as Arc<dyn BlobStore>;
     }
-    let meta = open_meta(&args.meta).await.context("opening meta store")?;
+    let bound = statement_timeout(args.meta_statement_timeout, args.request_timeout);
+    if args.meta.starts_with("postgres") {
+        match bound {
+            Some(t) => tracing::info!(
+                statement_timeout_s = t.as_secs_f64(),
+                "metadata statements are bounded"
+            ),
+            None => tracing::warn!(
+                "metadata statements are unbounded: a query whose request timed out runs on in \
+                 Postgres until it ends"
+            ),
+        }
+    }
+    let meta = open_meta_bounded(&args.meta, bound)
+        .await
+        .context("opening meta store")?;
     if let Some(v) = meta.schema_version().await? {
         metrics::gauge!("leep_schema_version").set(v as f64);
     }
@@ -957,7 +1005,10 @@ async fn main() -> anyhow::Result<()> {
         body_limits,
         args.request_timeout,
         config,
-        args.ready_timeout,
+        leep_server::ReadyOptions {
+            timeout: args.ready_timeout,
+            ..Default::default()
+        },
     );
     if let Some((_, http)) = &coordination {
         app = leep_server::coord::layer(app, http.clone());
@@ -1222,5 +1273,27 @@ impl BlobStore for ArcBlobs {
     }
     async fn delete(&self, hash: &leep_core::Hash) -> leep_core::Result<()> {
         self.0.delete(hash).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn the_statement_bound_follows_the_request_timeout_unless_set() {
+        let m = Duration::from_secs(60);
+        assert_eq!(
+            statement_timeout(None, 5 * m),
+            Some(5 * m + STATEMENT_TIMEOUT_MARGIN)
+        );
+        assert_eq!(statement_timeout(None, Duration::ZERO), None);
+        assert_eq!(
+            statement_timeout(Some(Duration::from_secs(30)), 5 * m),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(statement_timeout(Some(Duration::ZERO), 5 * m), None);
+        assert_eq!(statement_timeout(Some(m), Duration::ZERO), Some(m));
     }
 }

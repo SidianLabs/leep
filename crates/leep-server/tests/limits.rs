@@ -756,7 +756,7 @@ fn budget_rig() -> Router {
         limits,
         Duration::from_secs(60),
         leep_server::reload::ConfigHandle::fixed(config),
-        Duration::from_secs(2),
+        leep_server::ReadyOptions::default(),
     )
 }
 

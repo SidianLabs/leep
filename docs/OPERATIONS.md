@@ -86,7 +86,7 @@ measured until the response head is ready, not until the body is streamed.
 | `leep_config_reload_total` | counter | `result` = `ok`, `error` | Config reloads (SIGHUP) by result; both series exist from startup (ADR 0024). |
 | `leep_config_generation` | gauge | none | **Per process:** 1 at startup, plus one per successful reload, even when nothing changed. It resets on restart, so it differs between healthy servers that run identical config; do not alert on it. Use `leep_config_info` to compare servers. |
 | `leep_config_info` | gauge | `fingerprint` | 1 for the fingerprint of the config in force, 0 for the ones this process ran before, so `leep_config_info == 1` has exactly one series per server. The fingerprint is 16 hex characters of a BLAKE3 over the parsed config (tokens with their authors and limits, trusted keys, review policy, `--require-signatures` and review refs, and the server-wide limit defaults), so it is the same on every server that runs the same config, across restarts, and does not change when a file is only reformatted or reordered. It holds no secret: tokens are already digests, keys are public, and the hash is truncated. It is also logged at startup and on every reload. |
-| `leep_ready_checks_total` | counter | `store` = `meta`, `blobs`; `result` = `ok`, `error`, `timeout` | Checks made by `GET /v1/ready`, one per store per call; all six series exist from startup. |
+| `leep_ready_checks_total` | counter | `store` = `meta`, `blobs`; `result` = `ok`, `error`, `timeout` | Checks made by `GET /v1/ready`, one per store per check. A check's answer is reused for 1 s, so calls within that second add nothing; all six series exist from startup. |
 | `leep_config_last_reload_timestamp_seconds` | gauge | none | Unix time of the last successful load, including startup. |
 | `leep_build_info` | gauge | `version` | Always 1; carries the server version. |
 | `leep_schema_version` | gauge | none | Newest metadata schema migration applied (ADR 0023), read when the server opened the store. Servers sharing a database report the same value once all are upgraded. |
@@ -1134,6 +1134,20 @@ apply to the server and to its tools (`verify`, `repair`, `upgrade-index`,
   default) less what other clients need. A pool that is too small makes
   requests wait. They do not fail unless they wait past sqlx's 30 s acquire
   timeout.
+- **Statement bound.** sqlx sends Postgres no cancel request when a query's
+  future is dropped, which is what `--request-timeout` does to a request that
+  runs too long: the request answers 408 but its statement runs on in the
+  database, holding a pool connection, locks and CPU, until it ends. The
+  server therefore sets `statement_timeout` on its data connections to
+  `--meta-statement-timeout` (default `--request-timeout` plus 5 s; `0` turns
+  it off), so Postgres cancels such a statement within that bound. The margin
+  lets the request's own timeout fire first. Lease connections (renewals must
+  not be cancelled under load) and migrations are not bounded, and the
+  command-line tools (`gc`, `backup`, `repair`, ...) set no bound. The server
+  also uses the data pool for background index warming, whose statements are
+  batches of milliseconds to seconds. A statement that hits the bound fails
+  with `canceling statement due to statement timeout` in the ERROR log; if a
+  legitimate one does, raise the flag rather than turning it off.
 - **Derive caches.** Every cache gets its default share of the budget
   times `budget / 340 MiB`. More helps derivation of very wide histories
   and filtered logs over long ranges: `history-tree-v4` derivation re-reads

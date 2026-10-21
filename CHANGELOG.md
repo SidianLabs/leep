@@ -7,6 +7,33 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 ## [Unreleased]
 
+### Probe cost and statement bound
+- `GET /v1/ready` reuses its answer for one second and runs one check at a
+  time, so the public probe reads the stores at most once a second.
+  `leep_ready_checks_total` now counts checks, not calls.
+- The server bounds each Postgres data statement with `statement_timeout`
+  (`--meta-statement-timeout`, `LEEP_META_STATEMENT_TIMEOUT`; default
+  `--request-timeout` plus 5 s, `0` turns it off). Before, a query whose
+  request hit `--request-timeout` ran on in the database to its end, because
+  dropping a query does not cancel it. Lease calls and migrations are not
+  bounded (ADR 0012).
+
+### Reviewer capability
+- A tokens-file entry may say `"review": false` (`leep-server gen-token
+  --no-review`): the token cannot post reviews (403) and its reviews, old or
+  new, do not count. Absent means true, as before. Recommended for agent
+  tokens (ADR 0011).
+- `leep` prints the server's reason for a 403 instead of always "token lacks
+  write access".
+
+### Token expiry
+- A tokens-file entry may carry `expires` (RFC 3339, e.g.
+  `2027-01-31T00:00:00Z`); after it the token gets 401 `token expired at
+  ...`, which `leep` reports with a hint. `leep-server gen-token
+  --expires-in 30d` writes it. Gauges `leep_tokens_expiring_soon` and
+  `leep_tokens_expired`, counter `leep_token_expired_requests_total`, and the
+  alert `LeepTokensExpiringSoon` (ADR 0007).
+
 ### Server-wide body limits
 - **Behaviour change:** blob uploads (`PUT /v1/blobs/{hash}`) are capped at
   64 MiB by default (`--max-blob-bytes`, `LEEP_MAX_BLOB_BYTES`), down from

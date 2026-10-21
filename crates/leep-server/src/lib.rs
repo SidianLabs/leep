@@ -45,6 +45,28 @@ pub const DEFAULT_READ_MAX_BODY_BYTES: usize = 1024 * 1024;
 /// probe fails fast instead of piling up behind a hung database.
 pub const DEFAULT_READY_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// How long one `GET /v1/ready` answer is reused. The endpoint is public, so
+/// without it every caller could make the server read both stores at will.
+pub const DEFAULT_READY_CACHE: Duration = Duration::from_secs(1);
+
+/// How `GET /v1/ready` checks the stores.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReadyOptions {
+    /// Bound on each store's check.
+    pub timeout: Duration,
+    /// How long an answer is reused; zero checks on every call.
+    pub cache: Duration,
+}
+
+impl Default for ReadyOptions {
+    fn default() -> Self {
+        ReadyOptions {
+            timeout: DEFAULT_READY_TIMEOUT,
+            cache: DEFAULT_READY_CACHE,
+        }
+    }
+}
+
 /// A ref name no client is expected to write; `get_ref` on it is one indexed
 /// read that proves the metadata store answers.
 const READY_PROBE_REF: &str = "leep-ready-probe";
@@ -174,7 +196,8 @@ pub fn router_with_config(
 }
 
 /// Like [`router_with_config`], with the bound on each store check behind
-/// `GET /v1/ready` (default [`DEFAULT_READY_TIMEOUT`]).
+/// `GET /v1/ready` (default [`DEFAULT_READY_TIMEOUT`]); answers are reused for
+/// [`DEFAULT_READY_CACHE`].
 pub fn router_with_ready_timeout(
     repo: Repo,
     max_body_bytes: usize,
@@ -188,7 +211,10 @@ pub fn router_with_ready_timeout(
         limits::BodyLimits::under(max_body_bytes),
         request_timeout,
         config,
-        ready_timeout,
+        ReadyOptions {
+            timeout: ready_timeout,
+            ..Default::default()
+        },
     )
 }
 
@@ -201,12 +227,16 @@ pub fn router_with_body_limits(
     body_limits: limits::BodyLimits,
     request_timeout: Duration,
     config: Arc<reload::ConfigHandle>,
-    ready_timeout: Duration,
+    ready_options: ReadyOptions,
 ) -> Router {
     register_ready_metrics();
     let budget = limits::BodyBudget::new(body_limits);
     let repo = Arc::new(repo);
-    let ready_state = (repo.clone(), ready_timeout);
+    let ready_state = Arc::new(ReadyProbe {
+        repo: repo.clone(),
+        options: ready_options,
+        last: tokio::sync::Mutex::new(None),
+    });
     let router = Router::new()
         .route("/v1/health", get(health))
         .route("/v1/ready", get(ready).with_state(ready_state))
@@ -561,24 +591,57 @@ where
     })
 }
 
+/// The state behind `GET /v1/ready`: the stores, and the last answer.
+struct ReadyProbe {
+    repo: Arc<Repo>,
+    options: ReadyOptions,
+    /// When the last check finished and what failed. Held across a check, so
+    /// callers that arrive meanwhile wait for its answer instead of starting
+    /// their own: at most one check per cache period, whatever the load.
+    last: tokio::sync::Mutex<Option<(tokio::time::Instant, Vec<ReadyFailure>)>>,
+}
+
+impl ReadyProbe {
+    async fn failures(&self) -> Vec<ReadyFailure> {
+        if self.options.cache.is_zero() {
+            return self.check().await;
+        }
+        let mut last = self.last.lock().await;
+        if let Some((at, failed)) = &*last {
+            if at.elapsed() < self.options.cache {
+                return failed.clone();
+            }
+        }
+        let failed = self.check().await;
+        *last = Some((tokio::time::Instant::now(), failed.clone()));
+        failed
+    }
+
+    async fn check(&self) -> Vec<ReadyFailure> {
+        let limit = self.options.timeout;
+        let meta = self.repo.meta().clone();
+        let blobs = self.repo.blobs().clone();
+        let (m, b) = tokio::join!(
+            check_store("meta", limit, async move {
+                meta.get_ref(READY_PROBE_REF).await.map(|_| ())
+            }),
+            check_store("blobs", limit, async move {
+                blobs
+                    .contains(&Hash::of_blob(READY_PROBE_BLOB))
+                    .await
+                    .map(|_| ())
+            }),
+        );
+        [m, b].into_iter().flatten().collect()
+    }
+}
+
 /// Readiness: both stores answer a cheap real read, concurrently, each within
 /// the ready timeout. 200 `{"status":"ready","features":[...]}`, or 503 naming the failed
-/// stores. Public and unlimited like `/v1/health` (see [`is_probe`]).
-async fn ready(State((repo, limit)): State<(Arc<Repo>, Duration)>) -> Response {
-    let meta = repo.meta().clone();
-    let blobs = repo.blobs().clone();
-    let (m, b) = tokio::join!(
-        check_store("meta", limit, async move {
-            meta.get_ref(READY_PROBE_REF).await.map(|_| ())
-        }),
-        check_store("blobs", limit, async move {
-            blobs
-                .contains(&Hash::of_blob(READY_PROBE_BLOB))
-                .await
-                .map(|_| ())
-        }),
-    );
-    let failed: Vec<ReadyFailure> = [m, b].into_iter().flatten().collect();
+/// stores. An answer is reused for the cache period (1 s by default). Public
+/// and unlimited like `/v1/health` (see [`is_probe`]).
+async fn ready(State(probe): State<Arc<ReadyProbe>>) -> Response {
+    let failed = probe.failures().await;
     let (status, body) = if failed.is_empty() {
         (
             StatusCode::OK,

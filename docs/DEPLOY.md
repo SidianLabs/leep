@@ -91,8 +91,9 @@ file says):
 it as `readiness check failed`). Restart on liveness, and take a server out of
 rotation on readiness. Do not use `/v1/ready` as a liveness probe: when a
 shared database blips, every server would be restarted at once for no gain.
-Each readiness call does two small store reads, so probe it every few seconds,
-not every few milliseconds. The checks are counted in
+A check does two small store reads, and its answer is reused for one second,
+so however many callers probe the public endpoint a server checks its stores
+at most once a second; an outage or a recovery shows up to a second late. The checks are counted in
 `leep_ready_checks_total{store,result}`, and the
 [LeepNotReady](RUNBOOKS.md#leepnotready) alert fires on failures.
 
@@ -364,6 +365,7 @@ a reload is refused.
 | `LEEP_MAX_INFLIGHT_BYTES` | 1 GiB | Body bytes all requests in flight may hold together. |
 | `LEEP_MAX_BODY_BYTES` | 512 MiB | Ceiling on every request body. |
 | `LEEP_NO_MIGRATE` | off | `1` makes the server (and `gc`, `derive-search`) refuse to start while metadata schema migrations are pending instead of applying them; see [Upgrades](#upgrades). |
+| `LEEP_META_STATEMENT_TIMEOUT` | `--request-timeout` + 5s | Bound on each statement the server sends to Postgres (`statement_timeout`), so a query whose request timed out does not run on in the database; `0` turns it off. Not applied to lease calls or migrations; SQLite ignores it. |
 | `LEEP_REQUEST_TIMEOUT` | `5m` | Abort any request that runs longer (`90s`, `5m`; `0` disables). `leep-server gc --fence` must exceed it; see [OPERATIONS.md](OPERATIONS.md#blob-garbage-collection). |
 | `LEEP_WARM_INTERVAL` | `250ms` | How often the background warmer reads the ref log for moved refs and derives their path-history, log-filter and search indexes (ADR 0028, ADR 0058); every ref is also listed every 5 s. Accepts `ms`. `0` turns it off. With several servers on one metadata store, set `0` on all but one (see OPERATIONS.md, "Indexing a large history"). |
 | `LEEP_WARM_SEARCH` | `true` | Whether the warmer also derives the code-search index of each ref head. |
