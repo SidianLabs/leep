@@ -190,13 +190,18 @@ impl Repo {
         // with every descendant, so a condemned changeset's live parents end
         // the walk.
         let mut order = Vec::new();
+        let mut gone = HashSet::new();
         while let Some(id) = stack.pop() {
-            order.push(id);
             let parents = match self.meta().get_changeset(&id).await? {
                 Some(cs) => cs.parents,
-                // Deleted: the caller's existence check reports it.
-                None => continue,
+                // Deleted: the caller's existence check reports it, and a
+                // rescue row would only be an orphan for the tombstone pass.
+                None => {
+                    gone.insert(id);
+                    continue;
+                }
             };
+            order.push(id);
             let fresh: Vec<ChangesetId> = parents.into_iter().filter(|p| seen.insert(*p)).collect();
             if fresh.is_empty() {
                 continue;
@@ -225,6 +230,7 @@ impl Repo {
                 .increment(rows.len() as u64);
         }
         check.extend(order);
+        check.extend(gone);
         self.wait_for_doom(&check).await
     }
 

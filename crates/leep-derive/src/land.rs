@@ -562,12 +562,6 @@ impl Repo {
         // head's new ancestors instead of scanning the whole stretch again.
         let mut carried: HashMap<ChangesetId, Option<ChangesetId>> = HashMap::new();
         for attempt in 1..=MAX_LAND_ATTEMPTS {
-            if started.elapsed() >= MAX_BATCH_LIFETIME {
-                for l in lands {
-                    l.answer(Err(past_deadline(target_ref)), attempt, false);
-                }
-                return;
-            }
             // A server that lost the ref's lease stops retrying: the lands
             // it was coordinating go back to be routed to the new holder.
             if let Some(coord) = &self.land_coordinator {
@@ -583,6 +577,14 @@ impl Repo {
                         return;
                     }
                 }
+            }
+            // After the lease check, so lands a lost lease reroutes go to the
+            // new holder instead of failing.
+            if started.elapsed() >= MAX_BATCH_LIFETIME {
+                for l in lands {
+                    l.answer(Err(past_deadline(target_ref)), attempt, false);
+                }
+                return;
             }
             let start = match self.meta().get_ref(target_ref).await {
                 Ok(h) => h,
@@ -734,7 +736,10 @@ impl Repo {
                 continue;
             }
             // The fence read of this attempt bounds how late its move may
-            // come; past the batch's lifetime it must not come at all.
+            // come; past the batch's lifetime it must not come at all. Every
+            // waiting result follows a move of this attempt and may rest on
+            // it (a duplicate answered with that move, a stack found in or
+            // conflicting with replayed history), so none is answered as is.
             if started.elapsed() >= MAX_BATCH_LIFETIME {
                 for l in waiting.into_iter().map(|(l, _)| l).chain(lands) {
                     l.answer(Err(past_deadline(target_ref)), attempt, false);

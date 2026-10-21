@@ -2367,6 +2367,81 @@ async fn ref_move_to_condemned_changeset_rescues() {
     }
 }
 
+/// The other writers that name an existing changeset rescue it, and its
+/// condemned ancestors, before they store anything: a merge of it, a rebase
+/// of it, and a signature or review of it.
+#[tokio::test(start_paused = true)]
+async fn other_writers_naming_a_condemned_changeset_rescue_it() {
+    use leep_core::api::{Authorship, MergeRequest, MergeResponse, RebaseResponse};
+    use leep_core::review::{Review, Verdict};
+    use leep_core::signature::{key_id, Signature};
+
+    #[derive(Clone, Copy, Debug)]
+    enum Hook {
+        Merge,
+        Rebase,
+        Sign,
+        Review,
+    }
+    for seed in seeds() {
+        for hook in [Hook::Merge, Hook::Rebase, Hook::Sign, Hook::Review] {
+            let w = World::new(seed);
+            let (base, a, b) = condemned_stack(seed, &w).await;
+            let other = commit_file(seed, &w.clean, Some(base), "o.txt", "o\n", "o").await;
+            rescue_faults(&w.plan);
+            let server = w.server();
+            let what = format!("{hook:?}");
+            match hook {
+                Hook::Merge => {
+                    let r = retry(seed, &what, || {
+                        server.merge(MergeRequest {
+                            parents: [b, other],
+                            message: "merge".into(),
+                            authorship: Authorship {
+                                author: "m".into(),
+                                timestamp: Some(5),
+                            },
+                            extra: BTreeMap::new(),
+                        })
+                    })
+                    .await;
+                    assert!(
+                        matches!(r, MergeResponse::Merged { .. }),
+                        "seed {seed}: {r:?}"
+                    );
+                }
+                Hook::Rebase => {
+                    let r = retry(seed, &what, || server.rebase(b, other)).await;
+                    assert!(
+                        matches!(r, RebaseResponse::Rebased { .. }),
+                        "seed {seed}: {r:?}"
+                    );
+                }
+                Hook::Sign => {
+                    let key = [9; 32];
+                    let sig = Signature {
+                        key_id: key_id(&key),
+                        public_key: key,
+                        sig: [1; 64],
+                    };
+                    retry(seed, &what, || server.put_signature(b, &sig)).await;
+                }
+                Hook::Review => {
+                    let review = Review {
+                        reviewer: "alice".into(),
+                        verdict: Verdict::Approve,
+                        comment: String::new(),
+                        timestamp: 1,
+                    };
+                    retry(seed, &what, || server.put_review(b, &review)).await;
+                }
+            }
+            w.plan.pause();
+            assert_rescued(seed, &w, &[a, b]).await;
+        }
+    }
+}
+
 /// The client's request is cancelled after its batch's first attempt, a
 /// sweep condemns the land's stack, and the batch commits on a later
 /// attempt: the attempt's own fence read, not the request's, rescues it.
