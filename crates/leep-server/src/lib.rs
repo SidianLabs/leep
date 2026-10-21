@@ -8,6 +8,7 @@ pub mod errors;
 pub mod fingerprint;
 pub mod limits;
 pub mod observe;
+pub mod protect;
 pub mod reload;
 pub mod review;
 pub mod signing;
@@ -249,8 +250,8 @@ pub fn router_with_ready_timeout(
         .with_state(repo)
 }
 
-/// Check the ref names a land policy protects (`--require-signatures`,
-/// `--require-review`, a review policy's `refs`). Protection matches names
+/// Check the ref names a land policy protects (`--protect-ref`,
+/// `--require-signatures`, `--require-review`, a review policy's `refs`). Protection matches names
 /// exactly, so a name no ref can have, such as one with a stray space from a
 /// comma-separated environment variable, would leave the intended ref
 /// unprotected without a word.

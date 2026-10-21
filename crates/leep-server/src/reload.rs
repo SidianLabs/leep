@@ -25,6 +25,7 @@ use leep_derive::{LandPolicy, PolicySet};
 use crate::auth::{Auth, AuthChange};
 use crate::fingerprint::Canon;
 use crate::limits::{Defaults, Limiter, LimiterChange};
+use crate::protect::ProtectOnly;
 use crate::review::{RequireReview, ReviewPolicy, ReviewService};
 use crate::signing::{RequireSignatures, SigningKeys};
 
@@ -41,6 +42,8 @@ pub struct ReloadSources {
     pub require_signatures: Vec<String>,
     /// `--require-review`; the policy file's `refs` are added to it.
     pub require_review: Vec<String>,
+    /// `--protect-ref`: forward-only and undeletable, with no other check.
+    pub protect_refs: Vec<String>,
 }
 
 /// One consistent configuration. Never mutated after it is built.
@@ -56,8 +59,8 @@ pub struct RuntimeConfig {
     pub limiter: Option<Arc<Limiter>>,
     pub signing: Option<Arc<SigningKeys>>,
     pub review: Option<Arc<ReviewService>>,
-    /// Signatures and review composed, so the forward-only and protected
-    /// delete rules and `land` all read the same refs.
+    /// Signatures, review and `--protect-ref` composed, so the forward-only
+    /// and protected delete rules and `land` all read the same refs.
     pub land_policy: Option<Arc<dyn LandPolicy>>,
     protected_refs: Vec<String>,
     review_rules: (Vec<String>, Vec<String>),
@@ -192,6 +195,7 @@ impl ReloadSources {
             None => ReviewPolicy::parse("{}")?,
         };
         let review_refs = sorted_union(&self.require_review, &policy.refs);
+        crate::check_protected_refs("--protect-ref", &self.protect_refs)?;
         crate::check_protected_refs("--require-signatures", &self.require_signatures)?;
         crate::check_protected_refs("--require-review or the review policy", &review_refs)?;
         let review = match &auth {
@@ -215,6 +219,9 @@ impl ReloadSources {
                 review_refs.clone(),
             )));
         }
+        if !self.protect_refs.is_empty() {
+            policies.push(Arc::new(ProtectOnly::new(self.protect_refs.clone())));
+        }
         let land_policy: Option<Arc<dyn LandPolicy>> = match policies.len() {
             0 => None,
             1 => policies.pop(),
@@ -233,6 +240,10 @@ impl ReloadSources {
             .set("docs_globs", &policy.docs_globs)
             .set("require_review", &review_refs)
             .set("require_signatures", &self.require_signatures);
+        // Only when set, so configs without it keep their fingerprint.
+        if !self.protect_refs.is_empty() {
+            canon.set("protect_refs", &self.protect_refs);
+        }
         Ok(Loaded {
             config: RuntimeConfig {
                 generation: prev.map_or(1, |p| p.generation + 1),
@@ -242,7 +253,10 @@ impl ReloadSources {
                 signing,
                 review,
                 land_policy,
-                protected_refs: sorted_union(&self.require_signatures, &review_refs),
+                protected_refs: sorted_union(
+                    &sorted_union(&self.require_signatures, &review_refs),
+                    &self.protect_refs,
+                ),
                 review_rules: (policy.auto_approve, policy.docs_globs),
             },
             limiter: limiter_change,
@@ -669,6 +683,43 @@ mod tests {
     }
 
     #[test]
+    fn protect_refs_alone_make_a_policy_that_covers_them() {
+        let sources = ReloadSources {
+            protect_refs: vec!["main".into(), "release".into()],
+            ..Default::default()
+        };
+        let h = ConfigHandle::load(sources.clone()).unwrap();
+        let c = h.current();
+        assert_eq!(c.protected_refs(), ["main", "release"]);
+        let p = c.land_policy.as_ref().expect("a policy");
+        assert!(p.applies_to("main") && p.applies_to("release"));
+        assert!(!p.applies_to("dev"));
+        // No tokens, keys or review: protection needs none of them.
+        assert!(c.auth.is_none() && c.signing.is_none() && c.review.is_none());
+
+        // Composed with the others, every ref stays covered.
+        let f = files();
+        let mut s = f.sources.clone();
+        s.protect_refs = vec!["stable".into()];
+        let c = ConfigHandle::load(s).unwrap().current();
+        assert_eq!(c.protected_refs(), ["main", "release", "stable"]);
+        let p = c.land_policy.as_ref().unwrap();
+        assert!(p.applies_to("stable") && p.applies_to("main") && p.applies_to("release"));
+    }
+
+    #[test]
+    fn protect_ref_names_are_checked() {
+        for bad in ["main ", " release", "", "a..b"] {
+            let sources = ReloadSources {
+                protect_refs: vec![bad.into()],
+                ..Default::default()
+            };
+            let e = ConfigHandle::load(sources).err().expect(bad);
+            assert!(e.contains("--protect-ref"), "{bad:?}: {e}");
+        }
+    }
+
+    #[test]
     fn an_unchanged_reload_reports_nothing() {
         let f = files();
         let h = f.handle();
@@ -812,6 +863,10 @@ mod tests {
         let mut f = files();
         f.sources.require_review.push("dev".into());
         check("a --require-review ref added", f);
+
+        let mut f = files();
+        f.sources.protect_refs.push("stable".into());
+        check("a --protect-ref ref added", f);
 
         let f = files();
         f.put(
