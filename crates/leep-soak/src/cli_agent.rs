@@ -168,6 +168,10 @@ impl CliAgent {
             if low.contains("429 too many") || low.contains("too many requests") {
                 self.sh.stats.inc("throttled_429");
                 tokio::time::sleep(Duration::from_millis(300)).await;
+            } else if low.contains("server busy") && low.contains("nothing was done") {
+                // A read shed on each of `leep`'s own tries (ADR 0060).
+                self.sh.stats.inc("shed_503");
+                tokio::time::sleep(Duration::from_millis(300)).await;
             } else if o.code == 3
                 || low.contains("error sending request")
                 || low.contains("connection")

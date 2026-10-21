@@ -185,7 +185,10 @@ pub fn write(i: Inputs) -> Result<bool> {
     if args.duration.as_secs() >= 10 && acks == 0 {
         push_violation(sh, "no_progress", "no land was acknowledged".into());
     }
-    let server_5xx = server.requests_by_class.get("5xx").copied().unwrap_or(0.0);
+    // Shed reads are 503s the clients saw and counted apart (ADR 0060).
+    let server_5xx = (server.requests_by_class.get("5xx").copied().unwrap_or(0.0)
+        - c("shed_503") as f64)
+        .max(0.0);
     let client_5xx = c("server_errors_5xx");
     if restarts == 0 && server_5xx > 0.0 && client_5xx == 0 && !args.chaos {
         push_violation(
@@ -342,6 +345,7 @@ pub fn write(i: Inputs) -> Result<bool> {
             "attributed_to_restart": c("attributed_to_restart"),
             "transport_errors": c("transport_errors"),
             "throttled_429": c("throttled_429"),
+            "shed_503": c("shed_503"),
             "timeouts_408": c("timeouts_408"),
             "land_409": c("land_409"),
             "missing_blob_retries": c("missing_blob_retries"),
@@ -423,9 +427,9 @@ pub fn write(i: Inputs) -> Result<bool> {
         c("branches_merged"), c("branches_retired"), c("tags_created"), c("release_lands"), c("policy_refusals"),
     ));
     s.push_str(&format!(
-        "errors  5xx {}  attributed to restarts {}  transport {}  429 {}  408 {}  land 409 {}  missing-blob retries {}\n",
+        "errors  5xx {}  attributed to restarts {}  transport {}  429 {}  shed 503 {}  408 {}  land 409 {}  missing-blob retries {}\n",
         client_5xx, c("attributed_to_restart"), c("transport_errors"), c("throttled_429"),
-        c("timeouts_408"), c("land_409"), c("missing_blob_retries"),
+        c("shed_503"), c("timeouts_408"), c("land_409"), c("missing_blob_retries"),
     ));
     s.push_str(&format!(
         "server  RSS {} -> {} MiB (max {}), slope {} MiB/h over {:.0}s ({}), CPU {} cores, cache hit {}\n",

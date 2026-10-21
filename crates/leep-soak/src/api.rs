@@ -34,6 +34,8 @@ pub struct Resp {
     pub status: u16,
     pub body: Vec<u8>,
     pub retry_after: Option<Duration>,
+    /// Carried `Leep-Refused`: refused before any work (ADR 0060).
+    pub refused: bool,
     /// Exchanges it took, retries included.
     pub tries: u32,
 }
@@ -133,6 +135,7 @@ impl Api {
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.trim().parse::<f64>().ok())
             .map(Duration::from_secs_f64);
+        let refused = res.headers().contains_key(leep_core::api::REFUSED_HEADER);
         let bytes = res.bytes().await.map_err(|e| describe(&e))?;
         let dt = t0.elapsed();
         self.sh.stats.record(
@@ -145,6 +148,7 @@ impl Api {
             status,
             body: bytes.to_vec(),
             retry_after,
+            refused,
             tries: 1,
         })
     }
@@ -171,7 +175,8 @@ impl Api {
     }
 
     /// Send until the server gives an answer a caller can act on: throttling
-    /// (429), request timeouts (408), transport failures and 5xx are waited
+    /// (429), shed reads (503 with `Leep-Refused`), request timeouts (408),
+    /// transport failures and other 5xx are waited
     /// out and counted. A transport failure or 5xx outside a restart is a
     /// violation (the retry still happens, so the run can show what follows).
     pub async fn call(
@@ -212,6 +217,16 @@ impl Api {
                     match r.status {
                         429 => {
                             self.sh.stats.inc("throttled_429");
+                            let wait = r
+                                .retry_after
+                                .unwrap_or(Duration::from_millis(100))
+                                .clamp(Duration::from_millis(20), Duration::from_secs(2));
+                            self.pause(wait).await?;
+                        }
+                        // A read shed because its class is full (ADR 0060):
+                        // expected under load, waited out like a 429.
+                        503 if r.refused => {
+                            self.sh.stats.inc("shed_503");
                             let wait = r
                                 .retry_after
                                 .unwrap_or(Duration::from_millis(100))
