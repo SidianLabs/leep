@@ -878,10 +878,11 @@ misses and occupancy as Prometheus metrics (see [OPERATIONS.md](OPERATIONS.md)).
   only grows and ref moves never force a full walk; `gc --full` walks
   everything anyway.
   Proposed in [ADR 0059](adr/0059-unreachable-changeset-gc.md): deleting
-  changesets no root reaches (refs, retained ref log entries, land ids,
-  landed-copy scan windows, attestations, mirror maps, a grace period) by
-  the same condemn, fence and collect protocol, with optional ref log
-  retention. `gc --unreachable --dry-run` measures what that would reclaim.
+  changesets no root reaches (refs, every ref log entry, landed-copy scan
+  windows, attestations, mirror maps, a grace period) by the same condemn,
+  fence and collect protocol. A keyed land retry whose original was deleted
+  is answered from its land id. `gc --unreachable --dry-run` measures what
+  that would reclaim.
 
 ## 9. Failure model
 
