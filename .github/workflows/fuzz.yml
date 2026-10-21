@@ -25,7 +25,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # The fuzz crate is outside the workspace, so rust-toolchain.toml (the
       # stable pin) does not apply to it; `cargo +nightly` picks nightly.
       - run: rustup toolchain install nightly --profile minimal
@@ -35,7 +35,7 @@ jobs:
       - run: cargo install cargo-fuzz --locked
       # Inputs that found new coverage in earlier runs. The checked-in seeds
       # stay read-only in fuzz/corpus; new inputs land in ci-corpus.
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: fuzz/ci-corpus
           key: fuzz-corpus-${{ github.run_id }}
@@ -64,7 +64,7 @@ jobs:
             echo "failing targets:$failed"
             exit 1
           fi
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: failure()
         with:
           name: fuzz-crashes
