@@ -7,6 +7,14 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 ## [Unreleased]
 
+### Token expiry
+- A tokens-file entry may carry `expires` (RFC 3339, e.g.
+  `2027-01-31T00:00:00Z`); after it the token gets 401 `token expired at
+  ...`, which `leep` reports with a hint. `leep-server gen-token
+  --expires-in 30d` writes it. Gauges `leep_tokens_expiring_soon` and
+  `leep_tokens_expired`, counter `leep_token_expired_requests_total`, and the
+  alert `LeepTokensExpiringSoon` (ADR 0007).
+
 ### Server-wide body limits
 - **Behaviour change:** blob uploads (`PUT /v1/blobs/{hash}`) are capped at
   64 MiB by default (`--max-blob-bytes`, `LEEP_MAX_BLOB_BYTES`), down from

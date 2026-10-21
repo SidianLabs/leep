@@ -366,6 +366,100 @@ fn gen_token_subcommand() {
     assert!(!bad.status.success());
 }
 
+#[test]
+fn gen_token_expires_in_sets_an_expiry_the_server_accepts() {
+    let out = server_bin()
+        .args([
+            "gen-token",
+            "--name",
+            "agent-9",
+            "--role",
+            "write",
+            "--expires-in",
+            "30d",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8(out.stdout).unwrap();
+    let entry: serde_json::Value = serde_json::from_str(
+        text.lines()
+            .nth(1)
+            .unwrap()
+            .strip_prefix("entry: ")
+            .unwrap(),
+    )
+    .unwrap();
+    let expires = entry["expires"].as_str().unwrap();
+    assert!(
+        expires.ends_with('Z') && !expires.contains('.'),
+        "{expires}"
+    );
+    let file = serde_json::json!({ "tokens": [entry] }).to_string();
+    let a = Auth::parse(&file).unwrap();
+    // 30 days out: neither expired nor within the 7-day warning.
+    let r = a.expiry_report(jiff::Timestamp::now());
+    assert!(r.expired.is_empty() && r.soon.is_empty(), "{r:?}");
+
+    let bad = server_bin()
+        .args([
+            "gen-token",
+            "--name",
+            "x",
+            "--role",
+            "read",
+            "--expires-in",
+            "0",
+        ])
+        .output()
+        .unwrap();
+    assert!(!bad.status.success());
+}
+
+fn expiring_app(expires: &str) -> Router {
+    let text = serde_json::json!({ "tokens": [
+        { "name": "agent", "role": "write", "hash": hash_token(WRITE), "expires": expires },
+        { "name": "viewer", "role": "read", "hash": hash_token(READ) },
+    ]})
+    .to_string();
+    leep_server::router_with_auth(repo(), 1 << 20, Some(Auth::parse(&text).unwrap()))
+}
+
+#[tokio::test]
+async fn an_expired_token_is_refused_with_401_saying_so() {
+    let app = expiring_app("2020-01-01T00:00:00Z");
+    for (method, uri) in [(Method::GET, "/v1/refs"), (Method::GET, "/v1/whoami")] {
+        let r = call(&app, method, uri, Some(WRITE), vec![]).await;
+        assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{uri}");
+        assert_eq!(r.www.as_deref(), Some("Bearer"));
+        let e: ErrorResponse = serde_json::from_slice(&r.body).unwrap();
+        assert!(
+            e.error.contains("token expired at 2020-01-01T00:00:00Z"),
+            "{}",
+            e.error
+        );
+    }
+    // Other tokens are unaffected, and probes stay public.
+    let r = call(&app, Method::GET, "/v1/refs", Some(READ), vec![]).await;
+    assert_eq!(r.status, StatusCode::OK);
+    let r = call(&app, Method::GET, "/v1/health", Some(WRITE), vec![]).await;
+    assert_eq!(r.status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn a_token_works_until_it_expires() {
+    let later = (jiff::Timestamp::now() + std::time::Duration::from_secs(3600)).to_string();
+    let app = expiring_app(&later);
+    let r = call(&app, Method::GET, "/v1/whoami", Some(WRITE), vec![]).await;
+    assert_eq!(r.status, StatusCode::OK);
+    let who: WhoAmIResponse = serde_json::from_slice(&r.body).unwrap();
+    assert_eq!(who.name.as_deref(), Some("agent"));
+}
+
 /// Without tokens, a server reachable from other hosts would let anyone
 /// rewrite every ref, so it needs an explicit opt-in.
 #[test]

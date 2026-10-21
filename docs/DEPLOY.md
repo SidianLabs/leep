@@ -134,6 +134,13 @@ docker run -d -p 127.0.0.1:7070:7070 -v leep-data:/var/lib/leep \
 ```
 
 In compose, add the same volume and `LEEP_TOKENS_FILE` to `leep-server`.
+An entry may carry `"expires": "2027-01-31T00:00:00Z"` (an RFC 3339 time with
+an offset; `gen-token --expires-in 30d` writes one), after which the token gets
+401 `token expired at ...`. Give agent tokens an expiry so a forgotten one ends
+by itself, and rotate the ones still needed before then: the
+`LeepTokensExpiringSoon` alert fires 7 days ahead
+([OPERATIONS.md](OPERATIONS.md#metrics)). Changing `expires` takes effect on
+SIGHUP like any other edit; a request admitted before the time passes finishes.
 An entry may also carry `"author": "Name <email>"` (or `gen-token --author`).
 When a client names no author itself (no `--author`, `LEEP_AUTHOR` or login
 name, as in most containers), `leep` stamps that on its changesets, falling
@@ -336,7 +343,7 @@ What a reload covers:
 
 | Reloaded | Not reloaded (restart) |
 |---|---|
-| Tokens: added, revoked, rotated, role changes | Listen and metrics addresses, stores, cache size |
+| Tokens: added, revoked, rotated, role changes, `expires` | Listen and metrics addresses, stores, cache size |
 | Per-token limits (`rate`, `burst`, `concurrency`, `max_body`) | `--request-timeout`, the body limits (`--max-body-bytes`, `--max-blob-bytes`, `--max-json-body-bytes`, `--max-inflight-bytes`), and the server-wide limit defaults |
 | Trusted signing keys | `--require-signatures`, `--require-review` and `--protect-ref` refs |
 | Review policy: `refs`, auto-approval rules, docs globs | Which files are configured at all (a server started without `--tokens-file` stays open) |
