@@ -1158,12 +1158,12 @@ client treats an unknown or absent code by its HTTP status.
 | 408 | `timeout` | the request timeout ran out; the request may or may not have applied |
 | 409 | `cas_lost` | a concurrent update won repeatedly (a land that kept losing); read again and retry |
 | 409 | `forward_failed` | the land could not reach the server coordinating its ref; nothing landed here, retry (ADR 0056) |
-| 413 | `too_large` | the body is over the server's or the token's limit |
-| 429 | `rate_limited` | a rate or concurrency limit; see `Retry-After` |
+| 413 | `too_large` | the body is over the server's or the token's limit (`--max-body-bytes`, `--max-blob-bytes`, `--max-json-body-bytes`, `max_body`) |
+| 429 | `rate_limited` | a rate or concurrency limit, or a token over its share of the body budget; see `Retry-After` |
 | 500 | `internal` | the server failed |
 | 503 | `indexing` | the index is too far behind; see `indexing` and `Retry-After` (ADR 0058) |
 | 503 | `not_leader` | the server no longer coordinates lands on that ref; send the land again (ADR 0056) |
-| 503 | `unavailable` | overloaded or busy (with `Retry-After` when known): back off and retry |
+| 503 | `unavailable` | overloaded or busy, including request bodies in flight at the server's limit (`--max-inflight-bytes`), with `Retry-After` when known: back off and retry |
 
 A lost `POST /v1/refs/{name}` swap is unchanged: `409` with `CasRefResponse`
 (`ok: false`), not an error body. The marker texts (`NEEDS_REVIEW_MARKER`,

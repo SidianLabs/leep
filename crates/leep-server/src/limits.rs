@@ -2,6 +2,10 @@
 //! in-flight requests and a cap on body size, so one runaway agent cannot
 //! starve the rest. Everything is off unless configured.
 //!
+//! Server-wide body limits ([`BodyLimits`]) are always on: a cap per kind of
+//! route, and a budget of body bytes all requests in flight hold together, so
+//! many large uploads at once cannot exhaust the server's memory.
+//!
 //! A principal is a token name, or in anonymous mode (no tokens file) the
 //! client address. State lives in memory per server instance, so with several
 //! instances behind a balancer each one enforces its own limits. A config
@@ -12,7 +16,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use axum::body::Body;
+use axum::body::{Body, HttpBody};
 use axum::extract::{ConnectInfo, Request};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::middleware::Next;
@@ -619,14 +623,37 @@ fn too_large(slot: &Slot, max: usize) -> Response {
     )
 }
 
-/// Axum middleware enforcing the [`Limiter`] of the request's config snapshot.
-/// Layer it inside authentication, which supplies the [`Principal`], and inside
-/// the timeout and global body limit. `GET /v1/health` and `GET /v1/ready` are never limited, so
-/// probes keep working.
+/// Axum middleware enforcing the [`BodyBudget`] in the request's extensions,
+/// then the [`Limiter`] of the request's config snapshot. Layer it inside
+/// authentication, which supplies the [`Principal`] (so a request without a
+/// valid token never holds budget), and inside the timeout and global body
+/// limit. `GET /v1/health` and `GET /v1/ready` are never limited, so probes
+/// keep working.
 pub async fn enforce(req: Request, next: Next) -> Response {
     if crate::is_probe(req.method(), req.uri().path()) {
         return next.run(req).await;
     }
+    let budget = req.extensions().get::<Arc<BodyBudget>>().cloned();
+    let Some(budget) = budget else {
+        return limit_principal(req, next, usize::MAX).await;
+    };
+    let (req, charge, class, cap) = match budget.admit(req) {
+        Ok(admitted) => admitted,
+        Err(refused) => return refused,
+    };
+    let resp = limit_principal(req, next, cap).await;
+    drop(charge);
+    // A 413 that is not ours already is the route cap, which the body
+    // extractor reports as plain text.
+    if resp.status() == StatusCode::PAYLOAD_TOO_LARGE && !crate::errors::is_json(&resp) {
+        return route_too_large(class, cap);
+    }
+    resp
+}
+
+/// The per-principal half of [`enforce`]. `route_cap` is the server-wide
+/// cap of the route, which wins over a larger token `max_body`.
+async fn limit_principal(req: Request, next: Next, route_cap: usize) -> Response {
     let config = req.extensions().get::<Arc<RuntimeConfig>>().cloned();
     let Some(limiter) = config.as_ref().and_then(|c| c.limiter.as_ref()) else {
         return next.run(req).await;
@@ -678,7 +705,9 @@ pub async fn enforce(req: Request, next: Next) -> Response {
     let resp = match max_body {
         // Handlers never answer 413 themselves; it is the body cap, which the
         // body extractor reports as plain text.
-        Some(max) if resp.status() == StatusCode::PAYLOAD_TOO_LARGE => too_large(&slot, max),
+        Some(max) if resp.status() == StatusCode::PAYLOAD_TOO_LARGE && max <= route_cap => {
+            too_large(&slot, max)
+        }
         _ => resp,
     };
     let (parts, body) = resp.into_parts();
@@ -689,9 +718,304 @@ pub async fn enforce(req: Request, next: Next) -> Response {
     Response::from_parts(parts, Body::new(body))
 }
 
+/// Default cap on `PUT /v1/blobs/{hash}` bodies: one file's contents.
+pub const DEFAULT_MAX_BLOB_BYTES: usize = 256 << 20;
+/// Default cap on every other body, all JSON. The largest is a changeset:
+/// about 150 bytes per changed path, so this is some 200,000 paths.
+pub const DEFAULT_MAX_JSON_BODY_BYTES: usize = 32 << 20;
+/// Default budget of body bytes all requests in flight hold together: four
+/// largest uploads at once, or thousands of ordinary ones.
+pub const DEFAULT_MAX_INFLIGHT_BYTES: usize = 1 << 30;
+
+/// What a JSON body without a declared length holds of the budget. Charging
+/// it the route's cap would let a client that streams small JSON bodies hold
+/// the budget for nothing; the cap still bounds what it may send.
+pub const UNDECLARED_JSON_CHARGE: u64 = 1 << 20;
+
+/// The budget is counted in KiB so one request's share fits the semaphore's
+/// `u32` and a budget of terabytes still fits its permit count.
+const BUDGET_UNIT: u64 = 1024;
+
+/// Server-wide body limits. Flags, so they do not reload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BodyLimits {
+    /// Largest `PUT /v1/blobs/{hash}` body.
+    pub max_blob_bytes: usize,
+    /// Largest body of every other route.
+    pub max_json_bytes: usize,
+    /// Bytes the bodies of all requests in flight may add up to.
+    pub max_inflight_bytes: usize,
+}
+
+impl Default for BodyLimits {
+    fn default() -> Self {
+        BodyLimits {
+            max_blob_bytes: DEFAULT_MAX_BLOB_BYTES,
+            max_json_bytes: DEFAULT_MAX_JSON_BODY_BYTES,
+            max_inflight_bytes: DEFAULT_MAX_INFLIGHT_BYTES,
+        }
+    }
+}
+
+impl BodyLimits {
+    /// The defaults with every cap at most `max_body`, for callers that set
+    /// only the overall cap.
+    pub fn under(max_body: usize) -> BodyLimits {
+        let d = BodyLimits::default();
+        BodyLimits {
+            max_blob_bytes: d.max_blob_bytes.min(max_body),
+            max_json_bytes: d.max_json_bytes.min(max_body),
+            ..d
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        for (flag, n) in [
+            ("--max-blob-bytes", self.max_blob_bytes),
+            ("--max-json-body-bytes", self.max_json_bytes),
+            ("--max-inflight-bytes", self.max_inflight_bytes),
+        ] {
+            if n == 0 {
+                return Err(format!("{flag} must be at least 1"));
+            }
+            if n as u64 > u64::from(u32::MAX) * BUDGET_UNIT {
+                return Err(format!("{flag} must be at most 4 TiB"));
+            }
+        }
+        for (flag, n) in [
+            ("--max-blob-bytes", self.max_blob_bytes),
+            ("--max-json-body-bytes", self.max_json_bytes),
+        ] {
+            if n > self.max_inflight_bytes {
+                return Err(format!(
+                    "{flag} ({n}) must not exceed --max-inflight-bytes ({}): such a request \
+                     could never be admitted",
+                    self.max_inflight_bytes
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The in-flight byte budget: a semaphore whose permits are KiB of body.
+/// A request takes its declared length before its body is read (without one,
+/// a blob upload takes the route's cap and a JSON body
+/// [`UNDECLARED_JSON_CHARGE`]) and holds it until its handler is done. When
+/// the budget is spent a request is refused (503, `Retry-After`), never
+/// queued: waiting would hold the connection and its socket buffers anyway.
+///
+/// With tokens, one token may hold at most [`BodyBudget::per_principal`] of
+/// it (429 beyond), so a client that declares large bodies and sends them
+/// slowly cannot hold the whole budget until its requests time out.
+pub struct BodyBudget {
+    limits: BodyLimits,
+    permits: Arc<Semaphore>,
+    /// Bytes each token holds now; entries leave at zero.
+    held: Mutex<HashMap<String, u64>>,
+}
+
+/// A request's share of the [`BodyBudget`].
+struct BodyCharge {
+    bytes: u64,
+    /// The token it is counted against, if any.
+    principal: Option<(Arc<BodyBudget>, String)>,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl Drop for BodyCharge {
+    fn drop(&mut self) {
+        metrics::gauge!("leep_request_body_bytes_in_flight").decrement(self.bytes as f64);
+        if let Some((budget, name)) = &self.principal {
+            budget.release(name, self.bytes);
+        }
+    }
+}
+
+const BODY_CLASSES: [&str; 2] = ["blob", "json"];
+const BODY_REFUSALS: [&str; 3] = ["budget", "principal", "size"];
+
+impl BodyBudget {
+    pub fn new(limits: BodyLimits) -> Arc<BodyBudget> {
+        let units = (limits.max_inflight_bytes as u64).div_ceil(BUDGET_UNIT) as usize;
+        metrics::gauge!("leep_request_body_budget_bytes").set(limits.max_inflight_bytes as f64);
+        metrics::gauge!("leep_request_body_bytes_in_flight").increment(0.0);
+        for class in BODY_CLASSES {
+            for reason in BODY_REFUSALS {
+                metrics::counter!("leep_request_body_refused_total", "reason" => reason, "class" => class)
+                    .increment(0);
+            }
+        }
+        Arc::new(BodyBudget {
+            limits,
+            permits: Arc::new(Semaphore::new(units.min(Semaphore::MAX_PERMITS))),
+            held: Mutex::new(HashMap::new()),
+        })
+    }
+
+    pub fn limits(&self) -> &BodyLimits {
+        &self.limits
+    }
+
+    /// Most of the budget one token may hold: a quarter, or one request of
+    /// the largest route cap if that is more, so every request stays
+    /// admissible on its own.
+    pub fn per_principal(&self) -> u64 {
+        let l = &self.limits;
+        (l.max_inflight_bytes as u64 / 4)
+            .max(l.max_blob_bytes as u64)
+            .max(l.max_json_bytes as u64)
+    }
+
+    /// Count `bytes` against `name`, unless that would take it over its share.
+    fn hold(&self, name: &str, bytes: u64) -> bool {
+        let mut held = lock(&self.held);
+        let now = held.get(name).copied().unwrap_or(0);
+        if now + bytes > self.per_principal() {
+            return false;
+        }
+        held.insert(name.to_string(), now + bytes);
+        true
+    }
+
+    fn release(&self, name: &str, bytes: u64) {
+        let mut held = lock(&self.held);
+        if let Some(n) = held.get_mut(name) {
+            *n = n.saturating_sub(bytes);
+            if *n == 0 {
+                held.remove(name);
+            }
+        }
+    }
+
+    /// The route's class and cap.
+    fn route(&self, req: &Request) -> (&'static str, usize) {
+        let path = req.uri().path();
+        if req.method() == axum::http::Method::PUT
+            && path.starts_with("/v1/blobs/")
+            && path != "/v1/blobs/missing"
+        {
+            ("blob", self.limits.max_blob_bytes)
+        } else {
+            ("json", self.limits.max_json_bytes)
+        }
+    }
+
+    /// Check the declared size against the route's cap, take the request's
+    /// share of the budget and bound its body; or the response refusing it.
+    // Called once per request and unwrapped at once: boxing would buy nothing.
+    #[allow(clippy::result_large_err)]
+    fn admit(
+        self: &Arc<Self>,
+        req: Request,
+    ) -> Result<(Request, Option<BodyCharge>, &'static str, usize), Response> {
+        let (class, cap) = self.route(&req);
+        let declared = content_length(&req);
+        if declared.is_some_and(|n| n > cap as u64) {
+            return Err(route_too_large(class, cap));
+        }
+        let undeclared = match class {
+            "blob" => cap as u64,
+            _ => UNDECLARED_JSON_CHARGE,
+        };
+        let bytes = match declared {
+            Some(n) => n,
+            None if req.body().is_end_stream() => 0,
+            None => req.body().size_hint().exact().unwrap_or(undeclared),
+        }
+        .min(cap as u64);
+        let charge = if bytes == 0 {
+            None
+        } else {
+            let principal = req
+                .extensions()
+                .get::<Principal>()
+                .map(|p| (self.clone(), p.name.clone()));
+            if let Some((_, name)) = &principal {
+                if !self.hold(name, bytes) {
+                    metrics::counter!("leep_request_body_refused_total", "reason" => "principal", "class" => class)
+                        .increment(1);
+                    tracing::debug!(token = %name, class, bytes, "request refused: token's body share spent");
+                    return Err(refuse(
+                        StatusCode::TOO_MANY_REQUESTS,
+                        leep_core::api::error_code::RATE_LIMITED,
+                        "too many request bodies in flight for this token; retry after 1s",
+                        Some(1),
+                    ));
+                }
+            }
+            let units = bytes.div_ceil(BUDGET_UNIT) as u32;
+            let Ok(permit) = self.permits.clone().try_acquire_many_owned(units) else {
+                if let Some((_, name)) = &principal {
+                    self.release(name, bytes);
+                }
+                metrics::counter!("leep_request_body_refused_total", "reason" => "budget", "class" => class)
+                    .increment(1);
+                tracing::debug!(class, bytes, "request refused: body budget spent");
+                return Err(refuse(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    leep_core::api::error_code::UNAVAILABLE,
+                    "server busy: the request bodies in flight are at this server's limit; \
+                     retry after 1s",
+                    Some(1),
+                ));
+            };
+            metrics::gauge!("leep_request_body_bytes_in_flight").increment(bytes as f64);
+            Some(BodyCharge {
+                bytes,
+                principal,
+                _permit: permit,
+            })
+        };
+        // The declared length was checked above; this catches undeclared ones.
+        let req = req.map(|b| Body::new(Limited::new(b, cap)));
+        Ok((req, charge, class, cap))
+    }
+}
+
+fn route_too_large(class: &'static str, cap: usize) -> Response {
+    metrics::counter!("leep_request_body_refused_total", "reason" => "size", "class" => class)
+        .increment(1);
+    let (what, flag) = match class {
+        "blob" => ("a blob upload", "--max-blob-bytes"),
+        _ => ("this request", "--max-json-body-bytes"),
+    };
+    refuse(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        leep_core::api::error_code::TOO_LARGE,
+        &format!("request body exceeds the limit of {cap} bytes for {what} (server {flag})"),
+        None,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn body_limits_are_validated() {
+        assert!(BodyLimits::default().validate().is_ok());
+        let bad = |l: BodyLimits| l.validate().unwrap_err();
+        let d = BodyLimits::default();
+        assert!(bad(BodyLimits {
+            max_blob_bytes: 0,
+            ..d
+        })
+        .contains("--max-blob-bytes"));
+        let e = bad(BodyLimits {
+            max_blob_bytes: 2 << 30,
+            ..d
+        });
+        assert!(e.contains("--max-inflight-bytes"), "{e}");
+        let e = bad(BodyLimits {
+            max_json_bytes: 2 << 30,
+            ..d
+        });
+        assert!(e.contains("--max-json-body-bytes"), "{e}");
+        let u = BodyLimits::under(4);
+        assert_eq!((u.max_blob_bytes, u.max_json_bytes), (4, 4));
+        assert!(u.validate().is_ok());
+    }
 
     const fn rate(per_sec: f64, burst: u32) -> Rate {
         Rate { per_sec, burst }

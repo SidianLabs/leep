@@ -76,9 +76,17 @@ struct Args {
     )]
     derive_cache_bytes: usize,
     /// Abort requests that run longer than this (0, 90s, 5m); 0 disables the
-    /// bound. `gc --fence` must exceed it.
-    #[arg(long, env = "LEEP_REQUEST_TIMEOUT", default_value = "5m", value_parser = parse_grace)]
+    /// bound. `gc --fence` must exceed it plus --meta-statement-timeout; `gc`
+    /// warns when the values it is given do not.
+    #[arg(long, global = true, env = "LEEP_REQUEST_TIMEOUT", default_value = "5m", value_parser = parse_grace)]
     request_timeout: std::time::Duration,
+    /// Bound on each statement the server sends to a Postgres metadata store
+    /// (its `statement_timeout`), so a query whose request was cut off by
+    /// --request-timeout does not run on in the database (0, 30s, 5m). Lease
+    /// calls and migrations are not bounded; SQLite ignores it. Default:
+    /// --request-timeout plus 5s, none when that is 0; 0 turns it off.
+    #[arg(long, global = true, env = "LEEP_META_STATEMENT_TIMEOUT", value_parser = parse_grace)]
+    meta_statement_timeout: Option<std::time::Duration>,
     /// How long `GET /v1/ready` waits for each store (metadata and blobs,
     /// checked concurrently) before reporting it down (500ms, 2s).
     #[arg(long, env = "LEEP_READY_TIMEOUT", default_value = "2s", value_parser = parse_ready_timeout)]
@@ -103,9 +111,23 @@ struct Args {
     /// Default: the cores, up to 8.
     #[arg(long, env = "LEEP_DERIVE_JOBS", value_parser = clap::value_parser!(u32).range(1..=256))]
     derive_jobs: Option<u32>,
-    /// Maximum request body size in bytes.
-    #[arg(long, default_value_t = leep_server::DEFAULT_MAX_BODY_BYTES)]
+    /// Ceiling on every request body, in bytes; --max-blob-bytes and
+    /// --max-json-body-bytes are lower and apply first.
+    #[arg(long, env = "LEEP_MAX_BODY_BYTES", default_value_t = leep_server::DEFAULT_MAX_BODY_BYTES)]
     max_body_bytes: usize,
+    /// Largest blob upload (`PUT /v1/blobs/{hash}`, one file's contents) in
+    /// bytes; larger is 413.
+    #[arg(long, env = "LEEP_MAX_BLOB_BYTES", default_value_t = leep_server::limits::DEFAULT_MAX_BLOB_BYTES)]
+    max_blob_bytes: usize,
+    /// Largest body of every other request (JSON: changesets, lands, ref
+    /// updates) in bytes; larger is 413.
+    #[arg(long, env = "LEEP_MAX_JSON_BODY_BYTES", default_value_t = leep_server::limits::DEFAULT_MAX_JSON_BODY_BYTES)]
+    max_json_body_bytes: usize,
+    /// Bytes of request body all requests in flight may hold together; a
+    /// request that would go over is refused with 503 and Retry-After. A
+    /// request counts its Content-Length, or its route's cap without one.
+    #[arg(long, env = "LEEP_MAX_INFLIGHT_BYTES", default_value_t = leep_server::limits::DEFAULT_MAX_INFLIGHT_BYTES)]
+    max_inflight_bytes: usize,
     /// Requests per second each token may make, counted separately for reads
     /// and writes (anonymous mode: per client address). Off when unset; a
     /// token entry's `rate` overrides it.
@@ -301,9 +323,11 @@ enum Cmd {
         /// upload to commit.
         #[arg(long, global = true, default_value = "24h", value_parser = parse_grace)]
         grace: std::time::Duration,
-        /// Delete only blobs condemned at least this long ago. Must exceed
-        /// the servers' --request-timeout plus clock skew.
-        #[arg(long, global = true, default_value = "10m", value_parser = parse_grace)]
+        /// Delete only blobs condemned at least this long ago. Must exceed the
+        /// servers' --request-timeout plus their --meta-statement-timeout
+        /// (Postgres) plus clock skew; give `gc` the servers' values of those
+        /// flags (or their LEEP_ variables) and it warns when it does not.
+        #[arg(long, global = true, default_value = "15m", value_parser = parse_grace)]
         fence: std::time::Duration,
         /// Allow --fence 0. Only safe while no server is running.
         #[arg(long, global = true)]
@@ -437,13 +461,85 @@ fn new_repo(blobs: Arc<dyn BlobStore>, meta: Arc<dyn leep_core::MetaStore>) -> R
 
 /// Open the metadata store, applying pending migrations unless `--no-migrate`.
 async fn open_meta(url: &str) -> leep_core::Result<Arc<dyn leep_core::MetaStore>> {
+    open_meta_bounded(url, None).await
+}
+
+/// [`open_meta`], with each Postgres data statement bounded by
+/// `statement_timeout`.
+async fn open_meta_bounded(
+    url: &str,
+    statement_timeout: Option<std::time::Duration>,
+) -> leep_core::Result<Arc<dyn leep_core::MetaStore>> {
     let mode = if NO_MIGRATE.load(std::sync::atomic::Ordering::Relaxed) {
         leep_meta::SchemaMode::RequireCurrent
     } else {
         leep_meta::SchemaMode::Migrate
     };
     let pool = META_POOL_SIZE.load(std::sync::atomic::Ordering::Relaxed);
-    leep_meta::open_meta_store_with_pool(url, mode, pool).await
+    leep_meta::open_meta_store_with_options(url, mode, pool, statement_timeout).await
+}
+
+/// Added to --request-timeout for the default statement bound, so a request
+/// that runs out of time is ended by its own timeout (408), not by a
+/// statement failing first.
+const STATEMENT_TIMEOUT_MARGIN: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Clock skew between servers and the GC host that the fence check allows for.
+const FENCE_SKEW_ALLOWANCE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Why `fence` does not cover the latest a request's write can commit after
+/// the request read a blob's GC state (ADR 0012: `fence > request timeout +
+/// statement timeout + skew`, the statement term on Postgres only), or
+/// `None` when it does.
+fn fence_shortfall(
+    fence: std::time::Duration,
+    request_timeout: std::time::Duration,
+    statement_timeout: Option<std::time::Duration>,
+    postgres: bool,
+) -> Option<String> {
+    if request_timeout.is_zero() {
+        return Some(
+            "--request-timeout is 0 (off): a request can write at any time after it read a \
+             blob's state, so no --fence is safe; give gc the servers' --request-timeout"
+                .into(),
+        );
+    }
+    let statement = match (postgres, statement_timeout) {
+        (false, _) => std::time::Duration::ZERO,
+        (true, Some(t)) => t,
+        (true, None) => {
+            return Some(
+                "--meta-statement-timeout is 0 (off): a statement of a timed-out request can \
+                 commit at any time later, so no --fence is safe"
+                    .into(),
+            )
+        }
+    };
+    let needed = request_timeout + statement + FENCE_SKEW_ALLOWANCE;
+    (fence <= needed).then(|| {
+        format!(
+            "--fence {}s does not exceed --request-timeout {}s + --meta-statement-timeout {}s + \
+             {}s of clock skew = {}s: a request's write can commit after the fence (ADR 0012); \
+             raise --fence",
+            fence.as_secs(),
+            request_timeout.as_secs(),
+            statement.as_secs(),
+            FENCE_SKEW_ALLOWANCE.as_secs(),
+            needed.as_secs()
+        )
+    })
+}
+
+/// The `--meta-statement-timeout` in force: the flag, or the request
+/// timeout plus [`STATEMENT_TIMEOUT_MARGIN`]; `None` for no bound.
+fn statement_timeout(
+    flag: Option<std::time::Duration>,
+    request_timeout: std::time::Duration,
+) -> Option<std::time::Duration> {
+    match flag {
+        Some(d) => (!d.is_zero()).then_some(d),
+        None => (!request_timeout.is_zero()).then(|| request_timeout + STATEMENT_TIMEOUT_MARGIN),
+    }
 }
 
 async fn run_migrate(meta: &str, dry_run: bool, status: bool) -> anyhow::Result<()> {
@@ -1049,6 +1145,17 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 leep_derive::gc::Mark::Incremental
             };
+            if !unsafe_no_fence {
+                let bound = statement_timeout(args.meta_statement_timeout, args.request_timeout);
+                if let Some(why) = fence_shortfall(
+                    fence,
+                    args.request_timeout,
+                    bound,
+                    args.meta.starts_with("postgres"),
+                ) {
+                    tracing::warn!("{why}");
+                }
+            }
             return run_gc(
                 &args.meta,
                 &args.blobs,
@@ -1107,6 +1214,12 @@ async fn main() -> anyhow::Result<()> {
         args.insecure_no_auth,
     )?;
     let metrics_app = args.metrics_listen.map(|_| install_metrics()).transpose()?;
+    let body_limits = leep_server::limits::BodyLimits {
+        max_blob_bytes: args.max_blob_bytes.min(args.max_body_bytes),
+        max_json_bytes: args.max_json_body_bytes.min(args.max_body_bytes),
+        max_inflight_bytes: args.max_inflight_bytes,
+    };
+    body_limits.validate().map_err(anyhow::Error::msg)?;
     let read_max_body = match (args.read_max_body_bytes, &args.tokens_file) {
         (Some(n), _) => Some(n),
         (None, Some(_)) => Some(leep_server::DEFAULT_READ_MAX_BODY_BYTES),
@@ -1135,7 +1248,22 @@ async fn main() -> anyhow::Result<()> {
         blobs =
             Arc::new(CachedBlobStore::new(ArcBlobs(blobs), args.cache_bytes)) as Arc<dyn BlobStore>;
     }
-    let meta = open_meta(&args.meta).await.context("opening meta store")?;
+    let bound = statement_timeout(args.meta_statement_timeout, args.request_timeout);
+    if args.meta.starts_with("postgres") {
+        match bound {
+            Some(t) => tracing::info!(
+                statement_timeout_s = t.as_secs_f64(),
+                "metadata statements are bounded"
+            ),
+            None => tracing::warn!(
+                "metadata statements are unbounded: a query whose request timed out runs on in \
+                 Postgres until it ends"
+            ),
+        }
+    }
+    let meta = open_meta_bounded(&args.meta, bound)
+        .await
+        .context("opening meta store")?;
     if let Some(v) = meta.schema_version().await? {
         metrics::gauge!("leep_schema_version").set(v as f64);
     }
@@ -1203,12 +1331,22 @@ async fn main() -> anyhow::Result<()> {
     if let Some((coordinator, _)) = &coordination {
         repo = repo.with_land_coordinator(coordinator.clone());
     }
-    let mut app = leep_server::router_with_ready_timeout(
+    tracing::info!(
+        max_blob_bytes = body_limits.max_blob_bytes,
+        max_json_body_bytes = body_limits.max_json_bytes,
+        max_inflight_bytes = body_limits.max_inflight_bytes,
+        "request body limits"
+    );
+    let mut app = leep_server::router_with_body_limits(
         repo,
         args.max_body_bytes,
+        body_limits,
         args.request_timeout,
         config,
-        args.ready_timeout,
+        leep_server::ReadyOptions {
+            timeout: args.ready_timeout,
+            ..Default::default()
+        },
     );
     if let Some((_, http)) = &coordination {
         app = leep_server::coord::layer(app, http.clone());
@@ -1474,5 +1612,47 @@ impl BlobStore for ArcBlobs {
     }
     async fn delete(&self, hash: &leep_core::Hash) -> leep_core::Result<()> {
         self.0.delete(hash).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn the_statement_bound_follows_the_request_timeout_unless_set() {
+        let m = Duration::from_secs(60);
+        assert_eq!(
+            statement_timeout(None, 5 * m),
+            Some(5 * m + STATEMENT_TIMEOUT_MARGIN)
+        );
+        assert_eq!(statement_timeout(None, Duration::ZERO), None);
+        assert_eq!(
+            statement_timeout(Some(Duration::from_secs(30)), 5 * m),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(statement_timeout(Some(Duration::ZERO), 5 * m), None);
+        assert_eq!(statement_timeout(Some(m), Duration::ZERO), Some(m));
+    }
+
+    #[test]
+    fn gc_warns_when_the_fence_does_not_cover_requests_and_statements() {
+        let m = Duration::from_secs(60);
+        let st = statement_timeout(None, 5 * m);
+        // The defaults hold: 15m > 5m + 5m 5s + 1m.
+        assert_eq!(fence_shortfall(15 * m, 5 * m, st, true), None);
+        // The old 10m default does not, on Postgres.
+        let e = fence_shortfall(10 * m, 5 * m, st, true).unwrap();
+        assert!(e.contains("raise --fence") && e.contains("665s"), "{e}");
+        // Without Postgres there is no statement term.
+        assert_eq!(fence_shortfall(10 * m, 5 * m, st, false), None);
+        // A short statement bound fixes it too.
+        assert_eq!(
+            fence_shortfall(10 * m, 5 * m, Some(Duration::from_secs(30)), true),
+            None
+        );
+        assert!(fence_shortfall(15 * m, Duration::ZERO, None, true).is_some());
+        assert!(fence_shortfall(15 * m, 5 * m, None, true).is_some());
     }
 }

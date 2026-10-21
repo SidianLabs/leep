@@ -617,7 +617,9 @@ only a land id recognises the retry
 (`land_id`, random, the same on every retry) has the id stored in the ref
 log entry of the move, in the same transaction, and a later land with that
 id is answered from the entry at any age. `leep land` and the MCP server
-send one; the scan stays for clients that do not.
+send one (the MCP server derives it from the agent's `request_id`, the ref,
+the author and the agent session when there is one, so a retry from a restarted MCP process is answered
+too; docs/MCP.md); the scan stays for clients that do not.
 A land onto a ref that does not exist creates it, unless the request says
 `create: false` ([ADR 0036](adr/0036-explicit-ref-creation-on-land.md)), which
 `leep land` does unless given `--create` (or landing the first changeset onto
@@ -906,7 +908,8 @@ misses and occupancy as Prometheus metrics (see [OPERATIONS.md](OPERATIONS.md)).
   it marks everything reachable from every stored changeset (not only refs, so
   unlanded changesets survive), *condemns* unmarked blobs older than a grace
   window (default 24h) by writing `blob-condemned-v1`, waits a fence (default
-  10m, longer than the server's `--request-timeout`), re-marks, and deletes the
+  15m, longer than the servers' `--request-timeout` plus their statement
+  bound), re-marks, and deletes the
   blobs still condemned. A condemned blob is reported missing by
   `POST /v1/blobs/missing` and rejected by `POST /v1/changesets`, so clients
   re-upload it, and an upload rescues it; collect orders its delete against
@@ -946,7 +949,7 @@ misses and occupancy as Prometheus metrics (see [OPERATIONS.md](OPERATIONS.md)).
 | The server coordinating a ref's lands dies or stalls (`--land-coordination on`) | Its lease is not renewed; lands forwarded to it get no answer and are asked again, never batched elsewhere while the lease is live | Another server takes the lease once its last renewal is a TTL (2 s) old; the crash test checks every agent lands again within the TTL plus 2 s of a SIGKILL; a stalled leader resuming finds its lease gone and hands its lands back. A graceful shutdown releases leases at once (ADR 0056) |
 | Store call errors | The request fails with 500 (or 409 when the swap lost); nothing it did is rolled back, and nothing needs to be | Client retries |
 | Store call applies, then reports an error (lost commit acknowledgement, timeout after commit) | The write may exist. For a blob, changeset or derived row that is harmless. For `cas_ref` the caller cannot tell | `land` reads the ref again and recognises its own result (by land id at any age, ADR 0057; otherwise within the last 1024 changesets); other ref callers must read the ref before repeating |
-| Request cancelled by `--request-timeout` or a client disconnect | Same as a dead server for the work it had done; it performs no further writes | Client retries |
+| Request cancelled by `--request-timeout` or a client disconnect | Same as a dead server for the work it had done; it performs no further writes, though a Postgres statement already sent runs on until it ends or `--meta-statement-timeout` (the request timeout plus 5 s by default) cancels it | Client retries |
 | MetaStore unavailable | Writes and uncached reads fail | Fail fast with 500; no local fallback |
 | BlobStore slow | Cache tiers absorb repeated reads | — |
 | Land CAS contention | Bounded retries, then an error | Client retries `land` |
@@ -1066,9 +1069,14 @@ lists verdicts (with `via` for rebased copies), and `leep review ...` and the
 **Request path and limits** ([ADR 0020](adr/0020-request-limits.md)). A
 request passes, outermost first, through metrics, tracing, the request timeout,
 the global body cap, the config snapshot, authentication (which names the
-`Principal`), the per-principal limiter and then the handler. The limiter is an
-axum middleware (`leep_server::limits`) that does nothing unless the request's
-config has limits. For a principal with limits it checks the declared body
+`Principal`), the body limits and the per-principal limiter, and then the
+handler. The body limits are always on: the route's cap (`--max-blob-bytes` for
+blob uploads, `--max-json-body-bytes` for the rest; 413) and a share of the
+server-wide in-flight byte budget (`BodyBudget`, a semaphore of KiB;
+`--max-inflight-bytes`), taken from the declared length, or the route's cap
+when there is none, and held until the handler returns (503 when spent). The
+limiter is the same axum middleware (`leep_server::limits`) and does nothing
+unless the request's config has limits. For a principal with limits it checks the declared body
 size, takes a token from the read or write bucket, and `try_acquire`s a
 concurrency permit, refusing with 413 or 429 (never queueing). The permit
 lives in a guard attached to the response body, so it is released when the body

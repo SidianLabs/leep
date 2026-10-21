@@ -936,3 +936,622 @@ fn log_lists_summaries_unless_full() {
         .collect();
     assert_eq!(ids, [&fe[1]["id"], &fe[2]["id"]]);
 }
+
+/// The land id of a `request_id` is derived from it, not kept in memory, so
+/// a second MCP server process (a restart between the send and the answer)
+/// given the same request is answered from the server's record and lands
+/// nothing (ADR 0057).
+#[test]
+fn request_id_lands_once_across_mcp_restarts() {
+    let url = start_server();
+    let args = json!({
+        "message": "feature",
+        "changes": [{ "path": "f.txt", "content": "feature\n" }],
+        "request_id": "req-restart",
+    });
+    let first = data(&commit(&Server::new(config(&url)), args.clone()));
+    assert_eq!(first["status"], "landed");
+
+    // Other lands move main on in between.
+    let other = Server::new(config(&url));
+    for i in 0..3 {
+        data(&commit(
+            &other,
+            json!({ "message": format!("o{i}"), "changes": [{ "path": "o.txt", "content": format!("{i}\n") }] }),
+        ));
+    }
+    let head = data(&call(&other, "leep_refs", json!({})))["refs"]["main"].clone();
+
+    // A fresh process: nothing in memory about req-restart.
+    let again = data(&commit(&Server::new(config(&url)), args.clone()));
+    assert_eq!(again["status"], "landed");
+    assert_eq!(again["from_record"], true);
+    assert_eq!(again["changeset"], first["changeset"]);
+    assert_eq!(again["landed"], first["landed"]);
+    assert_eq!(again["files_changed"], 1);
+    let refs = data(&call(&other, "leep_refs", json!({})));
+    assert_eq!(refs["refs"]["main"], head, "nothing new landed");
+    let log = data(&call(&other, "leep_log", json!({ "limit": 50 })));
+    assert_eq!(log["entries"].as_array().unwrap().len(), 4);
+
+    // The ref log names the land by the derived id.
+    let id = leep_mcp::tools::request_land_id("tester", Some("sess-1"), "main", "req-restart")
+        .to_string();
+    assert_eq!(id.len(), 32);
+    let reflog = leep_cli::client::Client::new(&url)
+        .ref_log(Some("main"), None, 10)
+        .unwrap();
+    let keyed = reflog
+        .entries
+        .iter()
+        .filter(|e| e.land_id.as_ref().map(|l| l.to_string()) == Some(id.clone()))
+        .count();
+    assert_eq!(keyed, 1, "{:?}", reflog.entries);
+
+    // The same id with other changes is a mistake: reported, not landed.
+    let wrong = commit(
+        &Server::new(config(&url)),
+        json!({
+            "message": "another",
+            "changes": [{ "path": "f.txt", "content": "different\n" }],
+            "request_id": "req-restart",
+        }),
+    );
+    assert_eq!(wrong["isError"], true);
+    let w = &wrong["structuredContent"];
+    assert_eq!(w["status"], "already_landed");
+    assert_eq!(w["changeset"], first["changeset"]);
+    assert_eq!(w["differing_paths"], json!(["f.txt"]));
+    let refs = data(&call(&other, "leep_refs", json!({})));
+    assert_eq!(refs["refs"]["main"], head);
+
+    // Another ref derives another id: the request is new there.
+    let elsewhere = data(&commit(
+        &Server::new(config(&url)),
+        json!({
+            "message": "feature",
+            "changes": [{ "path": "f.txt", "content": "feature\n" }],
+            "request_id": "req-restart",
+            "target_ref": "side",
+            "create_ref": true,
+        }),
+    ));
+    assert_eq!(elsewhere["status"], "landed");
+    assert!(elsewhere.get("from_record").is_none());
+}
+
+/// Bytes of the `tools/call` request an agent sends for `args`.
+fn request_bytes(name: &str, args: &Value) -> usize {
+    json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": name, "arguments": args } })
+    .to_string()
+    .len()
+}
+
+/// A conflict on one file of a 20-file change is finished by sending that
+/// one file: the clean 19 come from the server's `clean` map, kept by the
+/// MCP server. Compares the bytes the agent sends with the old way (every
+/// file again).
+#[test]
+fn resolve_and_land_sends_only_the_conflicting_files() {
+    let url = start_server();
+    let s = Server::new(config(&url));
+    // 20 files of 60 lines, about 2.4 KB each.
+    let file = |i: usize, tag: &str| -> String {
+        (0..60)
+            .map(|l| format!("{tag} file {i:02} line {l:02}: some code here\n"))
+            .collect()
+    };
+    let path = |i: usize| format!("src/f{i:02}.rs");
+    let base_changes: Vec<Value> = (0..20)
+        .map(|i| json!({ "path": path(i), "content": file(i, "base") }))
+        .collect();
+    let base = data(&commit(
+        &s,
+        json!({ "message": "base", "changes": base_changes }),
+    ))["landed"]
+        .clone();
+
+    // Another agent edits the first line of f00 and the last line of f01.
+    let mut theirs01 = file(1, "base");
+    theirs01 = theirs01.replace(
+        "base file 01 line 59: some code here",
+        "base file 01 line 59: edited by A",
+    );
+    let a = data(&commit(
+        &s,
+        json!({ "base": base, "message": "a", "changes": [
+            { "path": path(0), "content": file(0, "base").replacen("base", "A", 1) },
+            { "path": path(1), "content": theirs01 } ] }),
+    ));
+    let head = a["landed"].as_str().unwrap().to_string();
+
+    // This agent rewrites the first line of all 20 files from `base`.
+    let ours = |i: usize| file(i, "base").replacen("base", "B", 1);
+    let changes: Vec<Value> = (0..20)
+        .map(|i| json!({ "path": path(i), "content": ours(i) }))
+        .collect();
+    let r = commit(
+        &s,
+        json!({ "base": base, "message": "rename things", "changes": changes,
+                "request_id": "req-20", "prompt": "rename" }),
+    );
+    assert_eq!(r["isError"], true);
+    let v = r["structuredContent"].clone();
+    assert_eq!(v["status"], "conflict");
+    assert_eq!(v["conflicts"].as_array().unwrap().len(), 1);
+    assert_eq!(v["clean_paths"].as_array().unwrap().len(), 19);
+    let conflict_id = v["conflict_id"].as_str().unwrap().to_string();
+    assert!(v["guidance"].as_str().unwrap().contains(&conflict_id));
+    let resolved = file(0, "base").replacen("base", "A+B", 1);
+
+    // Old way: every file again, on the new head.
+    let old_args = json!({
+        "base": head, "message": "rename things", "request_id": "req-20", "prompt": "rename",
+        "changes": (0..20).map(|i| json!({
+            "path": path(i),
+            "content": if i == 0 { resolved.clone() } else if i == 1 {
+                // The agent must merge A's edit itself, too.
+                ours(1).replace("base file 01 line 59: some code here", "base file 01 line 59: edited by A")
+            } else { ours(i) },
+        })).collect::<Vec<_>>(),
+    });
+    let new_args = json!({
+        "conflict_id": conflict_id,
+        "resolutions": [{ "path": path(0), "content": resolved }],
+    });
+    let (old_bytes, new_bytes) = (
+        request_bytes("leep_commit_and_land", &old_args),
+        request_bytes("leep_resolve_and_land", &new_args),
+    );
+    eprintln!(
+        "conflict retry, 20 files / 1 conflicting: leep_commit_and_land {old_bytes} bytes, \
+         leep_resolve_and_land {new_bytes} bytes ({:.1}x less)",
+        old_bytes as f64 / new_bytes as f64
+    );
+    assert!(new_bytes * 10 < old_bytes, "{old_bytes} vs {new_bytes}");
+
+    // Missing a conflicting path: refused, nothing landed.
+    let r = call(
+        &s,
+        "leep_resolve_and_land",
+        json!({ "conflict_id": conflict_id, "resolutions": [{ "path": path(5), "content": "x\n" }] }),
+    );
+    assert_eq!(r["isError"], true);
+    assert!(text(&r).contains("src/f00.rs"), "{}", text(&r));
+    // Another MCP process does not know the conflict: it says what to do.
+    let r = call(
+        &Server::new(config(&url)),
+        "leep_resolve_and_land",
+        new_args.clone(),
+    );
+    assert_eq!(r["isError"], true);
+    assert!(
+        text(&r).contains("leep_commit_and_land") && text(&r).contains("ALL files"),
+        "{}",
+        text(&r)
+    );
+
+    let landed = data(&call(&s, "leep_resolve_and_land", new_args.clone()));
+    assert_eq!(landed["status"], "landed");
+    assert_eq!(landed["rebased"], false);
+    assert_eq!(landed["files_changed"], 20);
+    let read = |p: &str| text(&call(&s, "leep_read_file", json!({ "path": p })));
+    assert_eq!(
+        read("src/f00.rs"),
+        file(0, "base").replacen("base", "A+B", 1)
+    );
+    // f01 merged cleanly on the server: both edits.
+    let f01 = read("src/f01.rs");
+    assert!(
+        f01.starts_with("B file 01 line 00") && f01.contains("line 59: edited by A"),
+        "{f01}"
+    );
+    for i in 2..20 {
+        assert_eq!(read(&path(i)), ours(i));
+    }
+    let show = data(&call(&s, "leep_show", json!({ "rev": "main" })));
+    assert_eq!(show["message"], "rename things");
+    assert_eq!(show["parents"], json!([head]));
+    assert_eq!(show["agent"]["request_id"], "req-20");
+    assert_eq!(show["agent"]["prompt"], "rename");
+
+    // Resolved and landed: forgotten here. A retry of the request from any
+    // process is answered from the record.
+    let again = call(&s, "leep_resolve_and_land", new_args);
+    assert_eq!(again["isError"], true);
+    // (Within the same second the rebuilt changeset is the same one, so
+    // `from_record` is not asserted.)
+    let retry = data(&commit(&Server::new(config(&url)), old_args));
+    assert_eq!(retry["changeset"], landed["changeset"]);
+    assert_eq!(retry["landed"], landed["landed"]);
+    let refs = data(&call(&s, "leep_refs", json!({})));
+    assert_eq!(refs["refs"]["main"], landed["landed"]);
+}
+
+/// `onto` finds the remembered conflict too, and a resolution that conflicts
+/// again (the ref moved on) reports a new conflict to resolve.
+#[test]
+fn resolve_and_land_by_onto_and_conflicting_again() {
+    let s = Server::new(config(&start_server()));
+    let base = data(&commit(
+        &s,
+        json!({ "message": "base", "changes": [{ "path": "a.txt", "content": "1\n" },
+                                               { "path": "run.sh", "content": "#!/bin/sh\n", "executable": true }] }),
+    ))["landed"]
+        .clone();
+    let head1 = data(&commit(
+        &s,
+        json!({ "base": base, "message": "x", "changes": [{ "path": "a.txt", "content": "x\n" }] }),
+    ))["landed"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // No request_id: the resolution is still landed at most once.
+    let r = commit(
+        &s,
+        json!({ "base": base, "message": "y", "changes": [
+            { "path": "a.txt", "content": "y\n" },
+            { "path": "run.sh", "content": "#!/bin/sh\necho\n" } ] }),
+    );
+    assert_eq!(r["structuredContent"]["status"], "conflict");
+    let first_id = r["structuredContent"]["conflict_id"].clone();
+
+    // The ref moves again before the agent answers.
+    let head2 = data(&commit(
+        &s,
+        json!({ "message": "z", "changes": [{ "path": "a.txt", "content": "z\n" }] }),
+    ))["landed"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let again = call(
+        &s,
+        "leep_resolve_and_land",
+        json!({ "onto": &head1[..10], "resolutions": [{ "path": "a.txt", "content": "xy\n" }] }),
+    );
+    let v = &again["structuredContent"];
+    assert_eq!(v["status"], "conflict", "{}", text(&again));
+    assert_eq!(v["onto"], head2);
+    assert_ne!(v["conflict_id"], first_id);
+    // The first conflict was replaced.
+    let stale = call(
+        &s,
+        "leep_resolve_and_land",
+        json!({ "conflict_id": first_id, "resolutions": [{ "path": "a.txt", "content": "xy\n" }] }),
+    );
+    assert_eq!(stale["isError"], true);
+
+    let done = data(&call(
+        &s,
+        "leep_resolve_and_land",
+        json!({ "conflict_id": v["conflict_id"], "resolutions": [{ "path": "a.txt", "content": "xyz\n" }],
+                "message": "y, resolved" }),
+    ));
+    assert_eq!(done["status"], "landed");
+    let files = data(&call(&s, "leep_list_files", json!({})));
+    let run = files["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["path"] == "run.sh")
+        .unwrap()
+        .clone();
+    assert_eq!(run["kind"], "executable", "the clean change keeps +x");
+    assert_eq!(
+        text(&call(&s, "leep_read_file", json!({ "path": "a.txt" }))),
+        "xyz\n"
+    );
+    let shown = data(&call(&s, "leep_show", json!({ "rev": "main" })));
+    assert_eq!(shown["message"], "y, resolved");
+    // No request_id: the first conflict's key names the land through every
+    // later conflict of it, and the changeset says so.
+    assert_eq!(
+        shown["agent"]["request_id"],
+        format!("conflict:{}", first_id.as_str().unwrap())
+    );
+}
+
+/// `leep_reflog` pages through a ref's moves, compactly, with land ids.
+#[test]
+fn reflog_lists_moves_with_land_ids_and_pages() {
+    let s = Server::new(config(&start_server()));
+    let mut landed = Vec::new();
+    for i in 0..3 {
+        let r = data(&commit(
+            &s,
+            json!({ "message": format!("m{i}"), "changes": [{ "path": "a.txt", "content": format!("{i}\n") }],
+                    "request_id": format!("req-{i}") }),
+        ));
+        landed.push(r["landed"].as_str().unwrap().to_string());
+    }
+    data(&commit(
+        &s,
+        json!({ "message": "side", "changes": [{ "path": "b.txt", "content": "b\n" }],
+                "target_ref": "side", "create_ref": true }),
+    ));
+
+    let log = data(&call(&s, "leep_reflog", json!({})));
+    assert_eq!(log["ref"], "main");
+    let entries = log["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 3);
+    assert!(log.get("next").is_none());
+    let newest = &entries[0];
+    assert_eq!(newest["op"], "land");
+    assert_eq!(newest["new"], landed[2][..12]);
+    assert_eq!(newest["old"], landed[1][..12]);
+    assert!(newest.get("ref").is_none());
+    assert_eq!(
+        newest["land_id"],
+        leep_mcp::tools::request_land_id("tester", Some("sess-1"), "main", "req-2").to_string()
+    );
+    // Fast-forwards: the ref took the changeset itself.
+    assert!(newest.get("land_changeset").is_none());
+    assert_eq!(entries[2]["old"], Value::Null);
+    // The short ids work as revs.
+    let shown = data(&call(&s, "leep_show", json!({ "rev": newest["new"] })));
+    assert_eq!(shown["id"], landed[2]);
+
+    // Pages of one, then the end.
+    let p1 = data(&call(
+        &s,
+        "leep_reflog",
+        json!({ "limit": 1, "full_ids": true }),
+    ));
+    assert_eq!(p1["entries"][0]["new"], landed[2]);
+    let p2 = data(&call(
+        &s,
+        "leep_reflog",
+        json!({ "limit": 2, "full_ids": true, "cursor": p1["next"] }),
+    ));
+    let ids: Vec<&Value> = p2["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| &e["new"])
+        .collect();
+    assert_eq!(ids, [&json!(landed[1]), &json!(landed[0])]);
+    assert!(p2.get("next").is_none());
+
+    let all = data(&call(&s, "leep_reflog", json!({ "all": true })));
+    let all = all["entries"].as_array().unwrap();
+    assert_eq!(all.len(), 4);
+    assert_eq!(all[0]["ref"], "side");
+    let none = data(&call(&s, "leep_reflog", json!({ "ref": "nosuch" })));
+    assert_eq!(none["entries"], json!([]));
+    let bad = call(&s, "leep_reflog", json!({ "cursor": "garbage" }));
+    assert_eq!(bad["isError"], true);
+    assert!(text(&bad).contains("[code: invalid]"), "{}", text(&bad));
+}
+
+#[test]
+fn resolve_merge_base_and_provenance() {
+    let url = start_server();
+    let s = Server::new(config(&url));
+    let root = data(&commit(
+        &s,
+        json!({ "message": "root", "changes": [{ "path": "a.txt", "content": "a\n" }] }),
+    ))["landed"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let on_main = data(&commit(
+        &s,
+        json!({ "message": "m", "changes": [{ "path": "src/m.rs", "content": "m\n" }] }),
+    ))["landed"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut human = common::config(&url);
+    human.author = "alice".into();
+    human.agent_model = None;
+    human.agent_session = None;
+    let side = data(&commit(
+        &Server::new(human),
+        json!({ "base": root, "message": "s", "changes": [{ "path": "docs/s.md", "content": "s\n" }],
+                "target_ref": "side", "create_ref": true }),
+    ))["landed"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // leep_resolve: ref, full id, prefix, and errors.
+    let r = data(&call(&s, "leep_resolve", json!({ "rev": "main" })));
+    assert_eq!(r["id"], on_main);
+    assert_eq!(r["via"], "ref");
+    let r = data(&call(&s, "leep_resolve", json!({ "rev": root })));
+    assert_eq!(
+        (r["id"].clone(), r["via"].clone()),
+        (json!(root), json!("id"))
+    );
+    let r = data(&call(&s, "leep_resolve", json!({ "rev": &side[..8] })));
+    assert_eq!(
+        (r["id"].clone(), r["via"].clone()),
+        (json!(side), json!("prefix"))
+    );
+    let r = call(&s, "leep_resolve", json!({ "rev": "nosuch" }));
+    assert_eq!(r["isError"], true);
+    assert!(text(&r).contains("[code: not_found]"), "{}", text(&r));
+
+    // leep_merge_base.
+    let mb = data(&call(
+        &s,
+        "leep_merge_base",
+        json!({ "a": "main", "b": "side" }),
+    ));
+    assert_eq!(mb["base"], root);
+    assert_eq!(mb["a_is_ancestor_of_b"], false);
+    assert_eq!(mb["b_is_ancestor_of_a"], false);
+    let mb = data(&call(
+        &s,
+        "leep_merge_base",
+        json!({ "a": root, "b": "main" }),
+    ));
+    assert_eq!(mb["base"], root);
+    assert_eq!(mb["a_is_ancestor_of_b"], true);
+    let r = call(&s, "leep_merge_base", json!({ "a": "main", "b": "nosuch" }));
+    assert_eq!(r["isError"], true);
+
+    // leep_provenance.
+    let p = data(&call(&s, "leep_provenance", json!({ "rev": "side" })));
+    assert_eq!(p["scanned"], 2);
+    assert_eq!(p["truncated"], false);
+    assert_eq!(p["agent_changesets"], 1);
+    assert_eq!(p["human_changesets"], 1);
+    assert_eq!(p["agents"][0]["model"], "test-model");
+    assert_eq!(p["agents"][0]["session"], "sess-1");
+    assert_eq!(p["humans"][0]["author"], "alice");
+    let p = data(&call(
+        &s,
+        "leep_provenance",
+        json!({ "rev": "main", "path": "/src/" }),
+    ));
+    assert_eq!(p["path"], "src");
+    assert_eq!(p["agent_changesets"], 1);
+    assert_eq!(p["agents"][0]["files_touched"], 1);
+    assert_eq!(p["humans"], json!([]));
+    // Only slashes: no filter at all.
+    let p = data(&call(
+        &s,
+        "leep_provenance",
+        json!({ "rev": "main", "path": "/" }),
+    ));
+    assert!(p.get("path").is_none());
+    assert_eq!(p["scanned"], 2);
+    let p = data(&call(&s, "leep_provenance", json!({ "limit": 1 })));
+    assert_eq!(p["truncated"], true);
+    assert!(p["note"].as_str().unwrap().contains("limit"));
+}
+
+/// The derived land id is namespaced by author and session: two agents that
+/// happen to pick the same `request_id` land independently.
+#[test]
+fn same_request_id_from_two_authors_lands_twice() {
+    let url = start_server();
+    let mut bob = config(&url);
+    bob.author = "bob".into();
+    bob.agent_session = None;
+    let mut carol = config(&url);
+    carol.author = "carol".into();
+    carol.agent_session = None;
+    let args = |who: &str| {
+        json!({
+            "message": format!("{who}'s change"),
+            "changes": [{ "path": format!("{who}.txt"), "content": "x\n" }],
+            "request_id": "task-1",
+        })
+    };
+    let b = data(&commit(&Server::new(bob), args("bob")));
+    let c = data(&commit(&Server::new(carol), args("carol")));
+    assert_eq!(b["status"], "landed");
+    assert_eq!(c["status"], "landed");
+    assert!(c.get("from_record").is_none());
+    assert_ne!(b["landed"], c["landed"]);
+    let s = Server::new(config(&url));
+    let log = data(&call(&s, "leep_log", json!({})));
+    assert_eq!(log["entries"].as_array().unwrap().len(), 2);
+    // A session, when set, namespaces too.
+    use leep_mcp::tools::request_land_id;
+    let ids = [
+        request_land_id("bob", None, "main", "task-1"),
+        request_land_id("carol", None, "main", "task-1"),
+        request_land_id("bob", Some("s1"), "main", "task-1"),
+        request_land_id("bob", None, "side", "task-1"),
+    ];
+    for (i, a) in ids.iter().enumerate() {
+        for b in &ids[i + 1..] {
+            assert_ne!(a, b);
+        }
+    }
+}
+
+mod rewriting {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    use std::sync::Arc;
+
+    use axum::body::Body;
+    use axum::extract::{Request, State};
+    use axum::middleware::{from_fn_with_state, Next};
+    use axum::response::Response;
+    use serde_json::{json, Value};
+
+    /// 0: pass through. 1: `land_id_reused` refusals lose the changeset id
+    /// (as an older or reworded server might send them). 2: also drop land
+    /// ids from the ref log, so the record cannot be found.
+    async fn rewrite(State(mode): State<Arc<AtomicU8>>, req: Request, next: Next) -> Response {
+        let reflog = req.uri().path().starts_with("/v1/reflog");
+        let resp = next.run(req).await;
+        let m = mode.load(Ordering::SeqCst);
+        if m == 0 {
+            return resp;
+        }
+        let (mut parts, body) = resp.into_parts();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let mut out = bytes.to_vec();
+        if let Ok(mut v) = serde_json::from_slice::<Value>(&bytes) {
+            if v["code"] == "land_id_reused" {
+                v["error"] = json!("this land id was used before; use a new land id");
+            }
+            if m == 2 && reflog {
+                for e in v["entries"].as_array_mut().into_iter().flatten() {
+                    e.as_object_mut().unwrap().remove("land_id");
+                    e.as_object_mut().unwrap().remove("land_changeset");
+                }
+            }
+            out = serde_json::to_vec(&v).unwrap();
+        }
+        parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+        Response::from_parts(parts, Body::from(out))
+    }
+
+    pub fn server(mode: Arc<AtomicU8>) -> String {
+        super::common::serve(
+            leep_server::router(super::common::repo()).layer(from_fn_with_state(mode, rewrite)),
+        )
+    }
+}
+
+/// A `land_id_reused` refusal that does not name the earlier changeset is
+/// answered from the ref log; when the log cannot say either, the tool
+/// reports that the request landed before and lands nothing.
+#[test]
+fn land_id_refusal_without_an_id_falls_back_to_the_ref_log() {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    use std::sync::Arc;
+
+    let mode = Arc::new(AtomicU8::new(0));
+    let url = rewriting::server(mode.clone());
+    let args = json!({
+        "message": "feature",
+        "changes": [{ "path": "f.txt", "content": "f\n" }],
+        "request_id": "req-scan",
+    });
+    let first = data(&commit(&Server::new(config(&url)), args.clone()));
+    // Move main so a retry's fresh changeset differs from the first.
+    data(&commit(
+        &Server::new(config(&url)),
+        json!({ "message": "o", "changes": [{ "path": "o.txt", "content": "o\n" }] }),
+    ));
+
+    mode.store(1, Ordering::SeqCst);
+    let again = data(&commit(&Server::new(config(&url)), args.clone()));
+    assert_eq!(again["from_record"], true);
+    assert_eq!(again["changeset"], first["changeset"]);
+    assert_eq!(again["landed"], first["landed"]);
+
+    mode.store(2, Ordering::SeqCst);
+    let s = Server::new(config(&url));
+    let head = data(&call(&s, "leep_refs", json!({})))["refs"]["main"].clone();
+    let lost = commit(&s, args);
+    assert_eq!(lost["isError"], true);
+    let t = text(&lost);
+    assert!(
+        t.contains("already landed something") && t.contains("leep_reflog"),
+        "{t}"
+    );
+    assert!(!t.contains("changeset:"), "{t}");
+    assert_eq!(
+        data(&call(&s, "leep_refs", json!({})))["refs"]["main"],
+        head
+    );
+}

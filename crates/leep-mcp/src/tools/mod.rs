@@ -3,7 +3,12 @@
 //! on them.
 
 mod commit;
+mod history;
 mod read;
+mod resolve;
+
+pub use commit::request_land_id;
+pub(crate) use resolve::Conflicts;
 
 use leep_cli::error::{CliError, ErrorKind};
 use leep_core::prefix::looks_like_prefix;
@@ -47,10 +52,18 @@ pub(crate) fn request_note(e: &CliError) -> String {
         .unwrap_or_default()
 }
 
-/// The error's message with its request id, which an operator can find in
-/// the server's logs.
+/// The error's message with the ids an ambiguous short id matched, the
+/// server's error code (a stable name of the condition), and its request id,
+/// which an operator can find in the server's logs.
 pub(crate) fn describe(e: &CliError) -> String {
-    format!("{e}{}", request_note(e))
+    let mut s = e.to_string();
+    if !e.candidates().is_empty() {
+        s.push_str(&format!(" (candidates: {})", e.candidates().join(", ")));
+    }
+    if let Some(code) = e.server_code() {
+        s.push_str(&format!(" [code: {code}]"));
+    }
+    s + &request_note(e)
 }
 
 impl From<leep_core::Error> for ToolError {
@@ -187,7 +200,12 @@ impl Server {
             "leep_blame" => self.blame(args),
             "leep_search" => self.search(args),
             "leep_review_status" => self.review_status(args),
+            "leep_reflog" => self.reflog(args),
+            "leep_resolve" => self.resolve(args),
+            "leep_merge_base" => self.merge_base(args),
+            "leep_provenance" => self.provenance(args),
             "leep_commit_and_land" => self.commit_and_land(args),
+            "leep_resolve_and_land" => self.resolve_and_land(args),
             _ => return None,
         })
     }
@@ -380,6 +398,82 @@ pub fn definitions() -> Vec<Value> {
             true,
         ),
         tool(
+            "leep_reflog",
+            "Show ref moves",
+            "The moves of a ref (default `main`), newest first: each with `seq`, `op` (land, \
+             cas, undo, ...), `old` and `new` ids (12-digit prefixes unless `full_ids`), `time` \
+             (unix seconds), `actor`, and for a land that named itself its `land_id` (and \
+             `land_changeset` when the ref took a rebased copy of it). Use it to see what \
+             landed recently, or whether your land (by land_id) happened. `all: true` lists \
+             every ref's moves with a `ref` field. When more follow, the result has `next`: \
+             pass it back as `cursor`.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "ref": { "type": "string", "description": "Ref whose moves to list (default `main`)." },
+                    "all": { "type": "boolean", "description": "Moves of every ref instead (default false)." },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 200, "description": "Max entries (default 20)." },
+                    "cursor": { "type": "string", "description": "The `next` value of the previous page, to continue it (repeat the other arguments)." },
+                    "full_ids": { "type": "boolean", "description": "Full 64-hex ids instead of 12-digit prefixes (default false)." }
+                },
+                "additionalProperties": false
+            }),
+            true,
+        ),
+        tool(
+            "leep_resolve",
+            "Resolve a revision",
+            "Turn a rev (ref name, tag, full id or unique id prefix) into its full changeset id, \
+             with `via`: `ref`, `id` or `prefix`. An ambiguous prefix lists the candidates.",
+            json!({
+                "type": "object",
+                "properties": { "rev": { "type": "string", "description": "Ref name, tag, changeset id or unique prefix of one (required)." } },
+                "required": ["rev"],
+                "additionalProperties": false
+            }),
+            true,
+        ),
+        tool(
+            "leep_merge_base",
+            "Find the merge base",
+            "The newest common ancestor of two revisions (`base`, null when the histories are \
+             unrelated), and whether either contains the other (`a_is_ancestor_of_b`: b already \
+             has everything a has). Use it to choose the `base` for leep_diff or to check \
+             whether a change is already on a ref.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "a": { "type": "string", "description": REV_DOC },
+                    "b": { "type": "string", "description": REV_DOC }
+                },
+                "required": ["a", "b"],
+                "additionalProperties": false
+            }),
+            true,
+        ),
+        tool(
+            "leep_provenance",
+            "Summarize provenance",
+            "Who made the history reachable from a revision: per agent model and session, and \
+             per human author (changesets with no agent metadata), the number of changesets, \
+             distinct files touched, and the first and last timestamps, largest first. Scans the \
+             newest `limit` changesets (`truncated` says more were left); `path` counts only \
+             changesets that touched it. Totals are in `agent_changesets` and \
+             `human_changesets`; rows past `top` are counted in `agents_omitted` / \
+             `humans_omitted`.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "rev": { "type": "string", "description": REV_DOC },
+                    "path": { "type": "string", "description": "Only changesets touching this file or directory." },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 10000, "description": "Changesets to scan, newest first (default 1000)." },
+                    "top": { "type": "integer", "minimum": 1, "maximum": 100, "description": "Rows listed per group (default 10)." }
+                },
+                "additionalProperties": false
+            }),
+            true,
+        ),
+        tool(
             "leep_commit_and_land",
             "Commit and land changes",
             "Write changes to the repository without a working copy: give the full new content of \
@@ -387,9 +481,8 @@ pub fn definitions() -> Vec<Value> {
              (recording agent provenance) and lands it on target_ref. `base` is the revision you \
              read the files from (default: current head of target_ref); if the ref has moved, \
              non-overlapping changes are merged automatically. On conflict NOTHING is landed and the \
-             result lists each conflicting path with base/ours/theirs text; resolve them and call \
-             again with base set to the reported `onto` id, including all your changes (clean \
-             paths too). Landing onto a ref that does not exist needs create_ref:true. Text \
+             result lists each conflicting path with base/ours/theirs text and a `conflict_id`; \
+             finish it with leep_resolve_and_land, sending only the conflicting files. Landing onto a ref that does not exist needs create_ref:true. Text \
              files only. If a call fails without an answer (timeout, lost connection), it may \
              have landed: call again with `changeset` set to the id the error names, or with \
              the same `request_id`; that never lands the change twice.",
@@ -419,11 +512,52 @@ pub fn definitions() -> Vec<Value> {
                     "prompt": { "type": "string", "description": "The request that led to this change, recorded as provenance." },
                     "tests": { "type": "string", "description": "Tests run and their results, recorded as provenance." },
                     "changeset": { "type": "string", "description": "Land this existing changeset (id or unique prefix) instead of creating one, e.g. to finish a call that timed out. Give no changes with it." },
-                    "request_id": { "type": "string", "description": "Your own id for this request, unique per change. A retry with the same id lands the changeset the first call made instead of making another. Use a new id after a conflict." }
+                    "request_id": { "type": "string", "description": "Your own id for this request, unique per change (among your own requests; another agent may use the same id). A retry with the same id and target_ref lands at most once, at any age and even from a restarted MCP server: if the first call landed, the result is that land (`from_record: true`). Keep it when you retry after a conflict." }
                 },
                 // `message` and `changes` are required unless `changeset` is
                 // given. Not expressed with a top-level `anyOf`, which some
                 // model APIs refuse in a tool schema; the tool checks it.
+                "additionalProperties": false
+            }),
+            false,
+        ),
+        tool(
+            "leep_resolve_and_land",
+            "Resolve a conflict and land",
+            "Finish a leep_commit_and_land (or leep_resolve_and_land) that reported conflicts, \
+             sending only the conflicting files. Give the report's `conflict_id` and, for EVERY \
+             conflicting path, its full resolved content or delete:true. The clean part of your \
+             change is kept by the MCP server, so do not resend it; you may add other paths to \
+             change them too. Lands one new changeset on the reported `onto` with your original \
+             message and provenance, under the same request_id, so a retry lands at most once. \
+             The result is like leep_commit_and_land's: landed, or a new conflict report with a \
+             new conflict_id if the ref moved again. If the conflict is not remembered (the MCP \
+             server restarted), call leep_commit_and_land again with base set to `onto` and ALL \
+             files you meant to change.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "conflict_id": { "type": "string", "description": "The `conflict_id` of the conflict report." },
+                    "onto": { "type": "string", "description": "Instead of conflict_id: the report's `onto` id (or a unique prefix), when only one remembered conflict is onto it." },
+                    "resolutions": {
+                        "type": "array",
+                        "description": "One entry per conflicting path (required), plus any other path you want to change.",
+                        "minItems": 1,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": { "type": "string", "description": "Repo-relative file path." },
+                                "content": { "type": "string", "description": "Entire resolved file content (UTF-8 text)." },
+                                "delete": { "type": "boolean", "description": "Delete the file instead." },
+                                "executable": { "type": "boolean", "description": "Set the executable bit. Omit to keep your side's kind." }
+                            },
+                            "required": ["path"],
+                            "additionalProperties": false
+                        }
+                    },
+                    "message": { "type": "string", "description": "Commit message; default: the conflicted change's message." }
+                },
+                "required": ["resolutions"],
                 "additionalProperties": false
             }),
             false,

@@ -11,15 +11,49 @@ use leep_core::changeset::{
     EXTRA_AGENT_TESTS,
 };
 use leep_core::refname::MISSING_REF_MARKER;
-use leep_core::{Changeset, ChangesetId, FileChange, FileKind, Hash, RepoPath};
+use leep_core::{Changeset, ChangesetId, FileChange, FileKind, Hash, LandId, RepoPath};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use super::resolve::conflict_request;
 use super::{as_text, parse_args, truncate, ToolError, ToolOutput, ToolResult, DEFAULT_REF};
 use crate::Server;
 
 /// Per-side cap for text shown in a conflict report.
 const MAX_CONFLICT_TEXT: usize = 64 * 1024;
+/// Ref log pages read, at most, to find which changeset a land id landed
+/// when the server's refusal does not name it.
+const RECORD_SCAN_PAGES: usize = 10;
+const RECORD_SCAN_PAGE: usize = 1000;
+/// Text of a `land_id_reused` refusal from servers that send no code.
+const LAND_ID_REUSED_MARKER: &str = "; use a new land id";
+
+/// The land id of `request_id` on `target_ref` (ADR 0057), namespaced by
+/// the author and, when set, the agent session. Derived, not random, so
+/// every MCP process of the same agent sends the same one: a retry after a
+/// restart, at any age, is answered from the server's record instead of
+/// landing again, while two agents that pick the same `request_id` land
+/// independently.
+///
+/// The NUL separators cannot be forged: `author` and `session` come from
+/// environment variables, which cannot hold NUL, `refname::validate` refuses
+/// control characters in `target_ref`, and `request_id` goes last.
+pub fn request_land_id(
+    author: &str,
+    session: Option<&str>,
+    target_ref: &str,
+    request_id: &str,
+) -> LandId {
+    let mut h = blake3::Hasher::new();
+    h.update(b"leep-mcp-land-id\0");
+    for part in [author, session.unwrap_or(""), target_ref] {
+        h.update(part.as_bytes());
+        h.update(b"\0");
+    }
+    h.update(request_id.as_bytes());
+    LandId::from_bytes(&h.finalize().as_bytes()[..LandId::MIN_LEN])
+        .expect("16 bytes is a valid land id")
+}
 
 #[derive(Deserialize)]
 struct Args {
@@ -36,24 +70,63 @@ struct Args {
     /// Land this existing changeset instead of making one: the retry of a
     /// call whose answer was lost.
     changeset: Option<String>,
-    /// Client-chosen id of this request. A second call with the same id in
-    /// this process lands the changeset the first one made.
+    /// Client-chosen id of this request. A second call with the same id
+    /// lands at most once: in this process it lands the changeset the first
+    /// call made, and in any process the server answers the land id derived
+    /// from it with the first land's result.
     request_id: Option<String>,
 }
 
-fn non_empty(s: Option<&str>) -> Option<&str> {
+pub(super) fn non_empty(s: Option<&str>) -> Option<&str> {
     s.map(str::trim).filter(|s| !s.is_empty())
 }
 
 #[derive(Deserialize)]
-struct Edit {
-    path: String,
+pub(super) struct Edit {
+    pub path: String,
     content: Option<String>,
     #[serde(default)]
     delete: bool,
     /// `None` keeps the file's existing kind (executable bit, symlink), so an
     /// agent editing a script doesn't silently strip `+x`.
-    executable: Option<bool>,
+    pub executable: Option<bool>,
+}
+
+impl Edit {
+    /// The change this edit makes, its content added to `blobs`. Without
+    /// `executable` the kind is `Regular`, for the caller to replace with the
+    /// file's existing kind.
+    pub(super) fn change(
+        &self,
+        blobs: &mut BTreeMap<Hash, Vec<u8>>,
+    ) -> Result<FileChange, ToolError> {
+        match (&self.content, self.delete) {
+            (Some(_), true) => Err(ToolError(format!(
+                "{}: give either content or delete:true, not both",
+                self.path
+            ))),
+            (None, false) => Err(ToolError(format!(
+                "{}: give content (new file text) or delete:true",
+                self.path
+            ))),
+            (None, true) => Ok(FileChange::Delete),
+            (Some(text), false) => {
+                let data = text.as_bytes().to_vec();
+                let hash = Hash::of_blob(&data);
+                let size = data.len() as u64;
+                blobs.insert(hash, data);
+                let kind = match self.executable {
+                    Some(true) => FileKind::Executable,
+                    _ => FileKind::Regular,
+                };
+                Ok(FileChange::Modify {
+                    content: hash,
+                    kind,
+                    size,
+                })
+            }
+        }
+    }
 }
 
 impl Server {
@@ -102,40 +175,10 @@ impl Server {
         for e in &a.changes {
             let path = RepoPath::new(e.path.as_str())
                 .map_err(|err| ToolError(format!("bad path `{}`: {err}", e.path)))?;
-            let change = match (&e.content, e.delete) {
-                (Some(_), true) => {
-                    return Err(ToolError(format!(
-                        "{}: give either content or delete:true, not both",
-                        e.path
-                    )))
-                }
-                (None, false) => {
-                    return Err(ToolError(format!(
-                        "{}: give content (new file text) or delete:true",
-                        e.path
-                    )))
-                }
-                (None, true) => FileChange::Delete,
-                (Some(text), false) => {
-                    let data = text.as_bytes().to_vec();
-                    let hash = Hash::of_blob(&data);
-                    let size = data.len() as u64;
-                    blobs.insert(hash, data);
-                    let kind = match e.executable {
-                        Some(true) => FileKind::Executable,
-                        Some(false) => FileKind::Regular,
-                        None => {
-                            inherit_kind.push(path.clone());
-                            FileKind::Regular
-                        }
-                    };
-                    FileChange::Modify {
-                        content: hash,
-                        kind,
-                        size,
-                    }
-                }
-            };
+            let change = e.change(&mut blobs)?;
+            if e.executable.is_none() && matches!(change, FileChange::Modify { .. }) {
+                inherit_kind.push(path.clone());
+            }
             if changes.insert(path, change).is_some() {
                 return Err(ToolError(format!("{}: listed more than once", e.path)));
             }
@@ -153,17 +196,7 @@ impl Server {
                 }
             }
         }
-        let hashes: Vec<Hash> = blobs.keys().copied().collect();
-        let missing: BTreeSet<Hash> = if hashes.is_empty() {
-            BTreeSet::new()
-        } else {
-            self.client.missing_blobs(hashes)?.into_iter().collect()
-        };
-        for (hash, data) in blobs {
-            if missing.contains(&hash) {
-                self.client.put_blob(&hash, data)?;
-            }
-        }
+        self.upload(blobs)?;
 
         let mut extra = BTreeMap::new();
         for (k, arg, default) in [
@@ -211,6 +244,21 @@ impl Server {
         )
     }
 
+    /// Upload the blobs the server lacks.
+    pub(super) fn upload(&self, blobs: BTreeMap<Hash, Vec<u8>>) -> Result<(), ToolError> {
+        let hashes: Vec<Hash> = blobs.keys().copied().collect();
+        if hashes.is_empty() {
+            return Ok(());
+        }
+        let missing: BTreeSet<Hash> = self.client.missing_blobs(hashes)?.into_iter().collect();
+        for (hash, data) in blobs {
+            if missing.contains(&hash) {
+                self.client.put_blob(&hash, data)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Land a changeset that already exists. Safe to repeat: one already on
     /// the ref, or landed there as a rebased copy, is reported as landed
     /// rather than added again.
@@ -225,9 +273,10 @@ impl Server {
         self.land_and_report(id, target_ref, create, files, request_id)
     }
 
-    /// Land `created` and report the outcome. A conflict forgets
-    /// `request_id`, since the retry that resolves it carries new content.
-    fn land_and_report(
+    /// Land `created` and report the outcome. A conflict forgets the
+    /// changeset made for `request_id`, since the retry that resolves it
+    /// carries new content, and is remembered for `leep_resolve_and_land`.
+    pub(super) fn land_and_report(
         &self,
         created: ChangesetId,
         target_ref: &str,
@@ -235,21 +284,68 @@ impl Server {
         files_changed: usize,
         request_id: Option<&str>,
     ) -> ToolResult {
-        let resp = self.land_creating(created, target_ref, create)?;
+        let fixed = request_id.map(|r| (r, self.request_land_id(target_ref, r)));
+        let (landed_cs, resp) = self.land_creating(created, target_ref, create, fixed)?;
         match resp {
             LandResponse::Landed {
                 landed,
                 rebased,
                 attempts,
-            } => Ok(ToolOutput::json(json!({
-                "status": "landed",
-                "landed": landed.to_string(),
-                "changeset": created.to_string(),
-                "target_ref": target_ref,
-                "rebased": rebased,
-                "attempts": attempts,
-                "files_changed": files_changed,
-            }))),
+            } => {
+                let mut v = json!({
+                    "status": "landed",
+                    "landed": landed.to_string(),
+                    "changeset": landed_cs.to_string(),
+                    "target_ref": target_ref,
+                    "rebased": rebased,
+                    "attempts": attempts,
+                    "files_changed": files_changed,
+                });
+                if landed_cs == created {
+                    return Ok(ToolOutput::json(v));
+                }
+                // The request landed before, from another call or process.
+                let r = request_id.unwrap_or_default();
+                self.requests
+                    .lock()
+                    .unwrap()
+                    .insert(r.to_string(), (landed_cs, target_ref.to_string()));
+                v["from_record"] = json!(true);
+                let earlier = match self.client.get_changeset(&landed_cs) {
+                    Ok(info) => info.changeset.changes,
+                    // Reclaimed since it landed (ADR 0059): the record still
+                    // stands, there is just nothing left to compare.
+                    Err(e) if e.kind() == ErrorKind::NotFound => {
+                        v["note"] = json!(format!(
+                            "request_id `{r}` had already landed changeset {landed_cs} on \
+                             {target_ref}; it was not landed again. That changeset is no longer \
+                             stored, so this call's changes were not compared with it."
+                        ));
+                        return Ok(ToolOutput::json(v));
+                    }
+                    Err(e) => return Err(e.into()),
+                };
+                let now = self.client.get_changeset(&created)?.changeset.changes;
+                v["files_changed"] = json!(earlier.len());
+                let differ = differing_paths(&earlier, &now);
+                if differ.is_empty() {
+                    v["note"] = json!(format!(
+                        "request_id `{r}` had already landed changeset {landed_cs} on \
+                         {target_ref}; it was not landed again."
+                    ));
+                    return Ok(ToolOutput::json(v));
+                }
+                v["status"] = json!("already_landed");
+                v["differing_paths"] = json!(differ);
+                v["note"] = json!(format!(
+                    "request_id `{r}` already landed changeset {landed_cs} on {target_ref}, \
+                     whose changes differ from this call's at `differing_paths`. Nothing new \
+                     landed. If this is a different change, call again with a new request_id."
+                ));
+                let mut out = ToolOutput::json(v);
+                out.is_error = true;
+                Ok(out)
+            }
             LandResponse::Conflicts {
                 onto,
                 conflicts,
@@ -258,13 +354,29 @@ impl Server {
                 if let Some(r) = request_id {
                     self.requests.lock().unwrap().remove(r);
                 }
-                self.conflict_report(target_ref, created, onto, &conflicts, &clean)
+                let request = request_id
+                    .map(str::to_string)
+                    .unwrap_or_else(|| conflict_request(&created, &onto));
+                let id = self.remember_conflict(
+                    target_ref, created, onto, &conflicts, &clean, &request, create,
+                );
+                self.conflict_report(target_ref, created, onto, &id, &conflicts, &clean)
             }
         }
     }
 
+    /// [`request_land_id`] for this server's author and agent session.
+    pub(super) fn request_land_id(&self, target_ref: &str, request_id: &str) -> LandId {
+        request_land_id(
+            &self.cfg.author,
+            self.cfg.agent_session.as_deref().filter(|s| !s.is_empty()),
+            target_ref,
+            request_id,
+        )
+    }
+
     /// Kind of `path` at `parent`, if the file exists there.
-    fn existing_kind(
+    pub(super) fn existing_kind(
         &self,
         parent: Option<ChangesetId>,
         path: &RepoPath,
@@ -282,44 +394,82 @@ impl Server {
     }
 
     /// Land, creating the ref only when asked to or on the first land onto
-    /// `main` of an empty repository, like `leep land` (ADR 0036).
+    /// `main` of an empty repository, like `leep land` (ADR 0036). `fixed`
+    /// is a land id derived from a request id; without one, the land gets a
+    /// random id kept until it is answered. Answers the changeset that
+    /// landed: a land id the ref already recorded for another changeset
+    /// (the same request, landed by an earlier call) is answered for that
+    /// one.
     fn land_creating(
         &self,
         changeset: ChangesetId,
         target_ref: &str,
         create: bool,
-    ) -> Result<LandResponse, ToolError> {
+        fixed: Option<(&str, LandId)>,
+    ) -> Result<(ChangesetId, LandResponse), ToolError> {
         let key = (changeset, target_ref.to_string());
-        let land_id = self
-            .pending_lands
-            .lock()
-            .unwrap()
-            .entry(key.clone())
-            .or_insert_with(new_land_id)
-            .clone();
-        let land = |create: bool| {
-            let r = self.client.land_resending(&LandRequest {
-                changeset,
+        let land_id = match &fixed {
+            Some((_, id)) => id.clone(),
+            None => self
+                .pending_lands
+                .lock()
+                .unwrap()
+                .entry(key.clone())
+                .or_insert_with(new_land_id)
+                .clone(),
+        };
+        let send = |cs: ChangesetId, create: bool| {
+            self.client.land_resending(&LandRequest {
+                changeset: cs,
                 target_ref: target_ref.to_string(),
                 create: Some(create),
                 land_id: Some(land_id.clone()),
-            });
+            })
+        };
+        // An error names the changeset last sent, the one a retry must land.
+        let land = |create: bool| {
+            let mut sent = changeset;
+            let mut r = send(changeset, create);
+            if let Err(e) = &r {
+                let request = fixed.as_ref().map(|(r, _)| *r);
+                if let (Some(request), true) = (
+                    request,
+                    e.is_server(error_code::LAND_ID_REUSED, LAND_ID_REUSED_MARKER),
+                ) {
+                    match self.recorded_changeset(e, target_ref, &land_id) {
+                        Ok(Some(earlier)) => {
+                            sent = earlier;
+                            r = send(earlier, create);
+                        }
+                        Ok(None) => {
+                            r = Err(CliError::user(format!(
+                                "request_id `{request}` already landed something on \
+                                 `{target_ref}` (land id {land_id}), and it was not landed \
+                                 again; see leep_reflog for what. Use a new request_id for a \
+                                 new change."
+                            )))
+                        }
+                        Err(e) => r = Err(e),
+                    }
+                }
+            }
             // Only an error that sending again could change keeps the id.
             if !r.as_ref().is_err_and(|e| e.is_retryable()) {
                 self.pending_lands.lock().unwrap().remove(&key);
             }
-            r
+            r.map(|resp| (sent, resp)).map_err(|e| (sent, Box::new(e)))
         };
+        let fail = |(sent, e): (ChangesetId, Box<CliError>)| land_error(*e, sent);
         match land(create) {
-            Err(e) if missing_ref(&e) => {
+            Err((_, e)) if missing_ref(&e) => {
                 if target_ref == DEFAULT_REF {
                     let refs = self.client.refs()?.refs;
                     if refs.is_empty() {
-                        return land(true).map_err(|e| land_error(e, changeset));
+                        return land(true).map_err(fail);
                     }
                     // Another client's first land got there in between.
                     if refs.contains_key(DEFAULT_REF) {
-                        return land(false).map_err(|e| land_error(e, changeset));
+                        return land(false).map_err(fail);
                     }
                 }
                 Err(ToolError(format!(
@@ -327,8 +477,47 @@ impl Server {
                      with leep_refs, or call again with create_ref:true to create it."
                 )))
             }
-            other => other.map_err(|e| land_error(e, changeset)),
+            other => other.map_err(fail),
         }
+    }
+
+    /// The changeset `target_ref` recorded for `land_id`: named by the
+    /// server's refusal, or else found in the ref's log.
+    fn recorded_changeset(
+        &self,
+        refusal: &CliError,
+        target_ref: &str,
+        land_id: &LandId,
+    ) -> Result<Option<ChangesetId>, CliError> {
+        let named = refusal
+            .message()
+            .split_once("already landed ")
+            .and_then(|(_, rest)| rest.get(..64))
+            .and_then(|hex| hex.parse::<ChangesetId>().ok());
+        if named.is_some() {
+            return Ok(named);
+        }
+        let mut after: Option<String> = None;
+        for _ in 0..RECORD_SCAN_PAGES {
+            let page = self.client.ref_log_page(
+                Some(target_ref),
+                None,
+                after.as_deref(),
+                RECORD_SCAN_PAGE,
+            )?;
+            if let Some(e) = page
+                .entries
+                .iter()
+                .find(|e| e.land_id.as_ref() == Some(land_id))
+            {
+                return Ok(e.land_changeset);
+            }
+            match page.next {
+                Some(n) => after = Some(n),
+                None => break,
+            }
+        }
+        Ok(None)
     }
 
     fn conflict_report(
@@ -336,6 +525,7 @@ impl Server {
         target_ref: &str,
         created: ChangesetId,
         onto: ChangesetId,
+        conflict_id: &str,
         conflicts: &[Conflict],
         clean: &BTreeMap<RepoPath, FileChange>,
     ) -> ToolResult {
@@ -361,13 +551,17 @@ impl Server {
         let guidance = format!(
             "Nothing was landed: {target_ref} is unchanged. `ours` is what {target_ref} now has \
              (at {onto}), `theirs` is your change, `base` is the common ancestor. Decide the \
-             correct final content for each conflicting path, then call leep_commit_and_land again \
-             with base set to {onto} and include ALL files you meant to change: the resolved \
-             content for the conflicting paths, and your original content (or delete:true) for the \
-             clean paths listed in `clean_paths`."
+             correct final content for each conflicting path, then call leep_resolve_and_land \
+             with conflict_id \"{conflict_id}\" and `resolutions` holding ONLY the conflicting \
+             paths (full resolved content, or delete:true). Your changes to the paths in \
+             `clean_paths` are kept for you; do not resend them. If leep_resolve_and_land says \
+             the conflict is not remembered (the MCP server restarted), call \
+             leep_commit_and_land again with base set to {onto} and ALL files you meant to \
+             change, keeping {target_ref}'s edits to any of them."
         );
         let v = json!({
             "status": "conflict",
+            "conflict_id": conflict_id,
             "target_ref": target_ref,
             "onto": onto.to_string(),
             "changeset": created.to_string(),
@@ -395,6 +589,25 @@ impl Server {
             }
         })
     }
+}
+
+/// Paths whose change differs between two change maps (content or delete;
+/// the kind is ignored, since a retry may infer it differently).
+fn differing_paths(
+    a: &BTreeMap<RepoPath, FileChange>,
+    b: &BTreeMap<RepoPath, FileChange>,
+) -> Vec<String> {
+    let content = |c: Option<&FileChange>| match c {
+        None => None,
+        Some(FileChange::Delete) => Some(None),
+        Some(FileChange::Modify { content, .. }) => Some(Some(*content)),
+    };
+    let paths: BTreeSet<&RepoPath> = a.keys().chain(b.keys()).collect();
+    paths
+        .into_iter()
+        .filter(|p| content(a.get(*p)) != content(b.get(*p)))
+        .map(|p| p.to_string())
+        .collect()
 }
 
 /// A failed land, with how to finish it safely when it may have applied: the

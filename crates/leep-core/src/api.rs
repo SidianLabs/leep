@@ -77,12 +77,12 @@
 //! | 408 | `timeout` | the request timeout ran out; the request may or may not have applied |
 //! | 409 | `cas_lost` | a concurrent update won repeatedly; read again and retry |
 //! | 409 | `forward_failed` | the land could not reach the server coordinating its ref; retry (ADR 0056) |
-//! | 413 | `too_large` | the body is over the server's or the token's limit |
-//! | 429 | `rate_limited` | a request limit (rate or concurrency); see `Retry-After` |
+//! | 413 | `too_large` | the body is over the server's or the token's limit (`--max-body-bytes`, `--max-blob-bytes`, `--max-json-body-bytes`, `max_body`) |
+//! | 429 | `rate_limited` | a request limit (rate or concurrency), or a token over its share of the body budget; see `Retry-After` |
 //! | 500 | `internal` | the server failed |
 //! | 503 | `indexing` | the index is too far behind; see `indexing` and `Retry-After` (ADR 0058) |
 //! | 503 | `not_leader` | the server no longer coordinates lands on that ref; send again (ADR 0056) |
-//! | 503 | `unavailable` | overloaded or busy (with `Retry-After` when known): back off and retry |
+//! | 503 | `unavailable` | overloaded or busy, including request bodies in flight at the server's limit (`--max-inflight-bytes`), with `Retry-After` when known: back off and retry |
 //!
 //! A lost `POST /v1/refs/{name}` swap is not an error body: it is 409 with
 //! [`CasRefResponse`] (`ok: false`). The constants are in [`error_code`].
@@ -284,9 +284,11 @@ pub mod error_code {
     /// ([`super::FORWARD_FAILED_MARKER`], ADR 0056). Nothing landed here;
     /// retrying can succeed once that server answers or another takes over.
     pub const FORWARD_FAILED: &str = "forward_failed";
-    /// 413: the request body is over the server's or the token's limit.
+    /// 413: the request body is over the server's limit for its route or
+    /// the token's `max_body`.
     pub const TOO_LARGE: &str = "too_large";
-    /// 429: a request limit (rate or concurrency); see `Retry-After`.
+    /// 429: a request limit (rate or concurrency), or a token over its share
+    /// of the body budget; see `Retry-After`.
     pub const RATE_LIMITED: &str = "rate_limited";
     /// 503 with [`super::IndexingInfo`]: the index is too far behind
     /// (ADR 0058).
@@ -294,8 +296,9 @@ pub mod error_code {
     /// 503: the server no longer coordinates lands on the ref; send the land
     /// again (ADR 0056).
     pub const NOT_LEADER: &str = "not_leader";
-    /// 503 (with `Retry-After` when the server knows): overloaded or busy.
-    /// Back off and retry.
+    /// 503 (with `Retry-After` when the server knows): overloaded or busy,
+    /// including request bodies in flight at the server's limit
+    /// (`--max-inflight-bytes`). Back off and retry.
     pub const UNAVAILABLE: &str = "unavailable";
     /// 500: the server failed.
     pub const INTERNAL: &str = "internal";

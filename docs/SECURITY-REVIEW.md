@@ -64,6 +64,7 @@ change with a regression test.
 | S-17 | Signing | Info | No issue found | Note in ADR 0010 |
 | S-18 | Refs | Info | No issue found in name validation, tag immutability, protected delete or ref log attribution | — |
 | S-19 | Refs | Medium | Refs no signature or review policy names could be rewound or deleted by any writer, so `main` was unprotected on most servers | Fixed 2026-10-21, `--protect-ref`, ADR 0015 |
+| S-20 | Resource use | Medium | Request bodies were read whole into memory with one 512 MiB cap per request and no bound on bodies in flight; a statement of a timed-out request ran on in Postgres | Fixed 2026-10-21, per-route caps, in-flight budget, statement timeout, ADR 0020 and 0012 |
 | S-21 | Auth | Low | Tokens had no time bound, so a token made for a short-lived agent stayed valid until removed by hand | Fixed 2026-10-21, `expires`, ADR 0007 |
 | S-22 | Review | Medium | Every write token was a reviewer, so one agent could approve another's change, or its own on unowned paths | Fixed 2026-10-21, `"review": false`, ADR 0011 |
 
@@ -309,7 +310,9 @@ closes the gap. Recorded in ADR 0011.
 - **Rename detection and auto rules** have pair, byte and per-file caps
   (1 MiB similarity, 2 MiB for `comment_only` and `whitespace_only`).
 - **Uploads.** There is no request decompression, so there is no
-  decompression bomb; body sizes are capped globally and per token.
+  decompression bomb. Since S-20 every body is capped per route (256 MiB for
+  a blob, 32 MiB for JSON) and all bodies in flight share a 1 GiB budget, a
+  quarter of which one token may hold; per-token caps can lower that further.
 - **Signing keys on the client** are created 0600 and refused if group or
   world readable.
 
@@ -329,6 +332,31 @@ unchanged. It composes with `--require-review` and `--require-signatures` (all
 apply), protects tags by exact name too (a protected tag cannot be deleted and
 recreated elsewhere, narrowing S-12), and, like the other policy flags, is read
 at startup only. Tests: `crates/leep-server/tests/protect.rs`.
+
+### S-20: request body memory and orphaned statements (Medium, fixed)
+
+The blob and changeset handlers read whole bodies into memory. The only cap was
+`--max-body-bytes`, 512 MiB per request on every route, and per-token limits
+are off by default, so a handful of writers uploading at once could ask for
+gigabytes and get the process killed. Separately, sqlx sends no cancel request
+when a query is dropped, so a statement of a request cut off by
+`--request-timeout` ran on in Postgres, holding a connection and its locks.
+
+*Fix.* Bodies are capped per route (`--max-blob-bytes` 256 MiB,
+`--max-json-body-bytes` 32 MiB; 413 with the flag named). All bodies in flight
+share `--max-inflight-bytes` (1 GiB; 503 with `Retry-After` when spent),
+charged from the declared length after authentication, or without one the blob
+cap or 1 MiB for JSON. With tokens, one token may hold at most a quarter of it
+(429 beyond), so slow uploads from one token cannot hold all of it. The data
+pool sets Postgres `statement_timeout` (`--meta-statement-timeout`, default the
+request timeout plus 5 s), and the GC fence default rises to 15m to keep
+`fence > request timeout + statement timeout + skew`, which `gc` now checks.
+`GET /v1/ready`, public and unlimited, reuses its answer for a second, so
+probes cannot make the server read its stores at will. Residual: anonymous
+servers have no per-client share of the budget. Tests: the body-limit tests in
+`crates/leep-server/tests/limits.rs`,
+`postgres_statement_timeout_bounds_the_data_pool_only`,
+`answers_are_reused_for_a_second`.
 
 ### S-21: tokens without expiry (Low, fixed)
 

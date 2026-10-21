@@ -1927,6 +1927,108 @@ async fn every_error_has_a_code() {
         assert!(!r.json::<ErrorResponse>().error.is_empty());
     }
 
+    // The body budget's refusals: the route cap (413), a token over its share
+    // (429) and the server's budget spent (503), the last two with
+    // Retry-After. Blobs up to 64 KiB, 100 KiB in flight, so a share is
+    // 64 KiB.
+    const KIB: usize = 1024;
+    let tokens = serde_json::json!({ "tokens": [
+        { "name": "a", "role": "write", "hash": hash_token("a") },
+        { "name": "b", "role": "write", "hash": hash_token("b") },
+    ]});
+    let config = leep_server::reload::RuntimeConfig::fixed(
+        Some(Auth::parse(&tokens.to_string()).unwrap()),
+        None,
+        None,
+        None,
+        None,
+    );
+    let budget = Client(leep_server::router_with_body_limits(
+        Repo::new(
+            Arc::new(MemoryBlobStore::new()),
+            Arc::new(MemoryMetaStore::new()),
+        ),
+        1 << 30,
+        leep_server::limits::BodyLimits {
+            max_blob_bytes: 64 * KIB,
+            max_json_bytes: 8 * KIB,
+            max_inflight_bytes: 100 * KIB,
+        },
+        std::time::Duration::from_secs(60),
+        leep_server::reload::ConfigHandle::fixed(config),
+        leep_server::ReadyOptions::default(),
+    ));
+    let upload = |token: &str, uri: String, body: Body, len: Option<usize>| {
+        let mut req = Request::builder()
+            .method(Method::PUT)
+            .uri(uri)
+            .header("authorization", format!("Bearer {token}"));
+        if let Some(n) = len {
+            req = req.header("content-length", n);
+        }
+        req.body(body).unwrap()
+    };
+    let put = |token: &'static str, n: usize| {
+        let data = vec![b'x'; n];
+        let uri = format!("/v1/blobs/{}", Hash::of_blob(&data));
+        let req = upload(token, uri, Body::from(data), Some(n));
+        let app = budget.0.clone();
+        async move {
+            let resp = app.oneshot(req).await.unwrap();
+            let (parts, body) = resp.into_parts();
+            Reply {
+                status: parts.status,
+                headers: parts.headers,
+                body: body.collect().await.unwrap().to_bytes().to_vec(),
+            }
+        }
+    };
+    // `a` holds 64 KiB with an upload that declares no length and stalls.
+    let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(1);
+    let stalled = futures_util::stream::unfold(rx, |mut rx| async move {
+        rx.recv()
+            .await
+            .map(|c| (Ok::<_, std::convert::Infallible>(c), rx))
+    });
+    let uri = format!("/v1/blobs/{}", Hash::of_blob(b"never sent"));
+    let held = tokio::spawn(budget.0.clone().oneshot(upload(
+        "a",
+        uri,
+        Body::from_stream(stalled),
+        None,
+    )));
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    let cases = [
+        (
+            put("a", 65 * KIB).await,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "too_large",
+            None,
+        ),
+        (
+            put("a", KIB).await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limited",
+            Some("1"),
+        ),
+        (
+            put("b", 40 * KIB).await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable",
+            Some("1"),
+        ),
+    ];
+    for (r, status, code, retry_after) in cases {
+        assert_eq!((r.status, r.code().as_str()), (status, code));
+        let retry = r.headers.get("retry-after").map(|v| v.to_str().unwrap());
+        assert_eq!(retry, retry_after, "{code}");
+        assert!(!r.json::<ErrorResponse>().error.is_empty());
+    }
+    drop(tx);
+    held.await.unwrap().unwrap();
+
     // A plain-text 503 from below the handlers (a load shedder, say) is
     // `unavailable`, not `internal`, and keeps its Retry-After.
     let busy = Client(
