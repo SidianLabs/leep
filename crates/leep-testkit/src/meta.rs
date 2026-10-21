@@ -157,6 +157,17 @@ impl MetaStore for FaultyMetaStore {
             .await
     }
 
+    /// Faults as for `get_changeset`: a read of the changesets table.
+    async fn changesets_stored_at(&self, ids: &[ChangesetId]) -> Result<Vec<Option<u64>>> {
+        self.plan
+            .run(
+                Op::GetChangeset,
+                self.inner.changesets_stored_at(ids),
+                |_, v| v,
+            )
+            .await
+    }
+
     async fn ref_log(
         &self,
         name: Option<&str>,

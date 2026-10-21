@@ -597,3 +597,79 @@ async fn long_history_with_repeated_blobs_matches_git() {
     .unwrap();
     assert_eq!((again.commits_imported, again.head), (0, Some(head)));
 }
+
+/// Exporting changesets a changeset sweep condemned rescues them before
+/// their mirror map rows name them (ADR 0059).
+#[tokio::test]
+async fn export_rescues_condemned_changesets_before_mapping_them() {
+    use leep_core::MetaStore;
+    use leep_derive::changeset_gc::{fence_flag_key, CS_CONDEMNED, CS_RESCUE, GC_FENCE_ACTIVE};
+
+    let blobs = Arc::new(MemoryBlobStore::new());
+    let meta = Arc::new(MemoryMetaStore::new());
+    let repo = Repo::new(blobs.clone(), meta.clone());
+    let mut parent = None;
+    let mut ids = Vec::new();
+    for (i, name) in ["base", "a", "b"].into_iter().enumerate() {
+        let data = Bytes::from(format!("{name}\n"));
+        let content = repo.put_blob(data.clone()).await.unwrap();
+        let id = repo
+            .create_changeset(Changeset {
+                parents: parent.into_iter().collect(),
+                author: "agent".into(),
+                timestamp: i as i64,
+                message: name.into(),
+                changes: BTreeMap::from([(
+                    RepoPath::new(format!("{name}.txt")).unwrap(),
+                    FileChange::Modify {
+                        content,
+                        kind: FileKind::Regular,
+                        size: data.len() as u64,
+                    },
+                )]),
+                extra: BTreeMap::new(),
+            })
+            .await
+            .unwrap();
+        ids.push(id);
+        parent = Some(id);
+    }
+    let (a, b) = (ids[1], ids[2]);
+    // Condemn the stack and raise the flag, as a sweep's condemn would.
+    let at = Bytes::copy_from_slice(&1_000i64.to_be_bytes());
+    for id in [a, b] {
+        meta.put_derived(CS_CONDEMNED, &id.0, at.clone())
+            .await
+            .unwrap();
+    }
+    meta.put_derived(GC_FENCE_ACTIVE, &fence_flag_key(), at.clone())
+        .await
+        .unwrap();
+
+    // A process that has not read the flag yet; `repo` cached it down
+    // while creating the stack.
+    let repo = Repo::new(blobs, meta.clone());
+    let out = tempfile::tempdir().unwrap();
+    let r = export(
+        &repo,
+        b,
+        &out.path().join("out.git"),
+        "main",
+        &ExportOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(r.commits_written, 3);
+    for id in [a, b] {
+        assert_eq!(
+            meta.get_derived(CS_RESCUE, &id.0).await.unwrap(),
+            Some(at.clone()),
+            "{id} rescued"
+        );
+    }
+    assert_eq!(
+        meta.get_derived(CS_RESCUE, &ids[0].0).await.unwrap(),
+        None,
+        "a live changeset needs no rescue"
+    );
+}

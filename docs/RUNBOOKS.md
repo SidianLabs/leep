@@ -28,6 +28,7 @@ every runbook.
 | [LeepServerErrors](#leepservererrors) | page | more than 1% of requests answer 5xx for 5 minutes |
 | [LeepLandErrors](#leeplanderrors) | page | `POST /v1/land` answered 5xx in the last 10 minutes |
 | [LeepLandExhausted](#leeplandexhausted) | ticket | a land lost the ref compare-and-swap on all 32 attempts |
+| [LeepLandBatchDeadline](#leeplandbatchdeadline) | ticket | a land batch gave up after retrying for 60 seconds |
 | [LeepLandCasLossesHigh](#leeplandcaslosseshigh) | ticket | more than one lost compare-and-swap per land, for 15 minutes |
 | [LeepLandForwardFailing](#leeplandforwardfailing) | ticket | servers fail to reach the server coordinating a ref's lands, for 10 minutes |
 | [LeepLandLeaseFlapping](#leeplandleaseflapping) | ticket | land leases change hands more than six times a minute, for 10 minutes |
@@ -128,7 +129,7 @@ whenever the process is serving HTTP and touches no store, so an `"ok"` with
 failing requests means a store problem, not a dead server. `GET /v1/ready` is
 readiness: it reads one ref from the metadata store and asks the blob store
 about one fixed hash, concurrently, each under `--ready-timeout` (default 2 s).
-It answers 200 `{"status":"ready","features":["land-id","indexing-retry"]}`, or 503 with the failed store named:
+It answers 200 `{"status":"ready","features":["land-id","indexing-retry","changeset-rescue"]}`, or 503 with the failed store named:
 `{"status":"not ready","failed":[{"store":"meta","reason":"timed out after
 2000ms"}]}` (`reason` is `unavailable` or a timeout, never the driver's
 message; that is in the server log as `readiness check failed`). Neither needs
@@ -487,6 +488,51 @@ nothing is half done. Retrying is safe.
 **Escalate / collect.** `leep reflog` excerpt (100 entries), the per-instance
 attempts and CAS-loss graphs, the number of instances, which clients write the
 ref, and the [standard bundle](#collecting-a-bug-report).
+
+## LeepLandBatchDeadline
+
+**Meaning.** A land batch was still retrying 60 s after its first attempt
+(`MAX_BATCH_LIFETIME`, ADR 0059) and answered every land in it with HTTP 409
+`conflict: land onto "main" did not finish within 60s; retry`
+(`leep_land_batch_deadline_total`, one per land). **Ticket.** The bound
+exists so that a changeset sweep's fence outlasts any batch that checked
+for condemned changesets before it; it is not tunable.
+
+**Impact.** The agents' lands fail with a 409 (CLI exit 5) and must be
+repeated. The 409 does not always mean the ref did not move: an attempt
+whose swap failed with an ambiguous store error may have applied before
+the batch ran out of time. Repeating the land is still safe: a keyed land
+(the CLI sends one) is answered from its land id record, and an unkeyed one
+is found on the ref by the landed-copy scan while the copy is within its
+window, so neither lands twice.
+
+**Diagnose.**
+
+1. Whether attempts or single steps are slow: land p99
+   (`leep_land_duration_seconds`), mean attempts per land
+   (`leep_land_attempts`), and `leep_land_cas_losses_total`. Many attempts
+   point at contention ([LeepLandCasLossesHigh](#leeplandcaslosseshigh)); few
+   but slow ones at the store.
+2. Store health: request latencies on every route and the metadata store's
+   own latency ([LeepServerErrors](#leepservererrors)). A batch that keeps
+   failing on store errors also retries until the deadline.
+3. Batch sizes (`leep_land_batch_size`) and stack lengths: a batch of 64
+   long stacks replays a lot on every lost swap.
+
+**Likely causes.**
+
+1. A slow or overloaded metadata store. Confirm: step 2.
+2. Several writers racing one hot ref. Confirm: as in
+   [LeepLandExhausted](#leeplandexhausted).
+3. Very long stacks landed together. Confirm: step 3.
+
+**Mitigate / fix.** As in [LeepLandExhausted](#leeplandexhausted): agents
+repeat the land, turn on `--land-coordination`, find looping writers, fix
+the store. Do not restart servers to clear it.
+
+**Escalate / collect.** Land latency, attempts and CAS-loss graphs per
+instance, metadata store latency, and the
+[standard bundle](#collecting-a-bug-report).
 
 ## LeepLandCasLossesHigh
 
