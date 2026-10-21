@@ -88,10 +88,16 @@ fn sql(stores: &Stores, statement: &str) {
     rt().block_on(async {
         if stores.meta.starts_with("sqlite:") {
             let mut c = sqlx::SqliteConnection::connect(&stores.meta).await.unwrap();
-            sqlx::query(statement).execute(&mut c).await.unwrap();
+            sqlx::query(sqlx::AssertSqlSafe(statement))
+                .execute(&mut c)
+                .await
+                .unwrap();
         } else {
             let mut c = sqlx::PgConnection::connect(&stores.meta).await.unwrap();
-            sqlx::query(statement).execute(&mut c).await.unwrap();
+            sqlx::query(sqlx::AssertSqlSafe(statement))
+                .execute(&mut c)
+                .await
+                .unwrap();
         }
     });
 }

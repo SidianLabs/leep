@@ -16,4 +16,4 @@ leep-testkit.workspace = true
 serde_json.workspace = true
 tempfile = "3"
 tokio.workspace = true
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "sqlite"] }
+sqlx = { workspace = true, features = ["postgres", "sqlite"] }
