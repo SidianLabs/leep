@@ -1215,6 +1215,10 @@ async fn multi_step_upgrades() {
         let kind = db.kind();
         let list = with(db.compiled(), &[ONCE, WIDGETS]);
         for from in 1..list.len() {
+            // A fresh database per step: a dropped SQLite pool closes its
+            // connections in the background, so deleting and reopening the
+            // same file can race them.
+            let db = db.fresh(&format!("steps2_{from}")).await;
             let d = data();
             let s = db.open(&list[..from], SchemaMode::Migrate).await.unwrap();
             for cs in &d.changesets {
@@ -1236,26 +1240,18 @@ async fn multi_step_upgrades() {
                 assert_eq!(s.get_changeset(&cs.id()).await.unwrap().as_ref(), Some(cs));
             }
             drop(s);
-            db.cleanup_data(&list).await;
+            db.cleanup().await;
         }
         db.cleanup().await;
     }
 }
 
 impl Db {
-    /// Back to an empty database, keeping the backend.
-    async fn cleanup_data(&self, _list: &[Migration]) {
+    /// An empty database of the same backend under its own name.
+    async fn fresh(&self, name: &str) -> Db {
         match self {
-            Db::Sqlite { dir, .. } => {
-                for e in std::fs::read_dir(dir).unwrap() {
-                    std::fs::remove_file(e.unwrap().path()).ok();
-                }
-            }
-            Db::Pg { .. } => {
-                let q = self.quoted();
-                self.exec_raw(&[&format!("DROP SCHEMA IF EXISTS {q} CASCADE")])
-                    .await;
-            }
+            Db::Sqlite { .. } => Db::sqlite(name),
+            Db::Pg { .. } => Db::pg(name).await.expect("Postgres is configured"),
         }
     }
 }
