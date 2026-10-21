@@ -65,7 +65,7 @@ jobs:
             --duration "$DURATION" --agents "$AGENTS" --think "$THINK" --seed "$SEED" $CHAOS \
             --out soak-out
       # The report and the server's log are what a failure is diagnosed from.
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: soak-${{ github.run_number }}
