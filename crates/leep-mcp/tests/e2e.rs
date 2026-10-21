@@ -50,6 +50,7 @@ fn commit_land_and_read_back() {
     assert_eq!(entries.len(), 2);
     assert_eq!(entries[0]["id"], second_id);
     assert_eq!(entries[0]["message"], "shout");
+    assert_eq!(entries[0]["files_changed"], 1);
     assert_eq!(entries[0]["author"], "tester");
     assert_eq!(entries[1]["agent"]["model"], "test-model");
     assert_eq!(entries[1]["agent"]["session"], "sess-1");
@@ -872,4 +873,56 @@ fn read_tools_take_stale_answers_unless_fresh() {
             && msg.contains("retry in"),
         "{msg}"
     );
+}
+
+/// `leep_log` lists summaries by default (the message's first line);
+/// `full` gives the whole message, with the same entries and pages.
+#[test]
+fn log_lists_summaries_unless_full() {
+    let s = Server::new(config(&start_server()));
+    for i in 0..3 {
+        let r = commit(
+            &s,
+            json!({
+                "message": format!("subject {i}\n\nbody {i}\n"),
+                "changes": [{ "path": format!("f{i}.txt"), "content": "x\n" }],
+                "prompt": "p",
+            }),
+        );
+        assert_eq!(data(&r)["status"], "landed");
+    }
+    let short = data(&call(&s, "leep_log", json!({})));
+    let full = data(&call(&s, "leep_log", json!({ "full": true })));
+    let (se, fe) = (
+        short["entries"].as_array().unwrap(),
+        full["entries"].as_array().unwrap(),
+    );
+    assert_eq!(se.len(), 3);
+    assert_eq!(fe.len(), 3);
+    for (i, (a, b)) in se.iter().zip(fe).enumerate() {
+        let n = 2 - i;
+        assert_eq!(a["id"], b["id"]);
+        assert_eq!(a["parents"], b["parents"]);
+        assert_eq!(a["files_changed"], 1);
+        assert_eq!(b["files_changed"], 1);
+        assert_eq!(a["agent"], b["agent"]);
+        assert_eq!(a["agent"]["prompt"], "p");
+        assert_eq!(a["message"], format!("subject {n}"));
+        assert_eq!(b["message"], format!("subject {n}\n\nbody {n}\n"));
+    }
+
+    // Pages: `full` with a cursor from a summary page continues it.
+    let page = data(&call(&s, "leep_log", json!({ "limit": 1 })));
+    let rest = data(&call(
+        &s,
+        "leep_log",
+        json!({ "limit": 5, "full": true, "rev": page["from"], "cursor": page["next"] }),
+    ));
+    let ids: Vec<&Value> = rest["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| &e["id"])
+        .collect();
+    assert_eq!(ids, [&fe[1]["id"], &fe[2]["id"]]);
 }

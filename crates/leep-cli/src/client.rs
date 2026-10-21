@@ -95,6 +95,85 @@ impl LogQuery {
         }
         out
     }
+
+    /// [`LogQuery::params`] plus the entry shape: only [`Client::log`] and
+    /// [`Client::log_summary`] choose it, so each always gets the shape it
+    /// decodes.
+    fn params_for(&self, summary: bool) -> Vec<(&'static str, String)> {
+        let mut out = self.params();
+        if summary {
+            out.push(("fields", "summary".into()));
+        }
+        out
+    }
+}
+
+/// A summary log as either shape decodes: servers from before
+/// `fields=summary` ignore it and send full entries, which are projected.
+#[derive(serde::Deserialize)]
+struct AnyLog {
+    entries: Vec<AnyEntry>,
+    #[serde(default)]
+    next: Option<String>,
+    #[serde(default)]
+    answered_at: Option<ChangesetId>,
+    #[serde(default)]
+    behind: Option<u64>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum AnyEntry {
+    Summary(LogSummaryEntry),
+    Full(ChangesetInfo),
+}
+
+impl From<AnyLog> for LogSummaryResponse {
+    fn from(log: AnyLog) -> Self {
+        LogSummaryResponse {
+            entries: log
+                .entries
+                .into_iter()
+                .map(|e| match e {
+                    AnyEntry::Summary(s) => s,
+                    AnyEntry::Full(f) => f.into(),
+                })
+                .collect(),
+            next: log.next,
+            answered_at: log.answered_at,
+            behind: log.behind,
+        }
+    }
+}
+
+/// One log page: entries, `next`, `answered_at`, `behind`.
+type LogPageParts<E> = (Vec<E>, Option<String>, Option<ChangesetId>, Option<u64>);
+
+/// Up to `want` entries of the log `q` asks for, from pages that `fetch`
+/// reads, each continuing at the previous one's cursor.
+fn pages<E>(
+    q: &LogQuery,
+    want: usize,
+    fetch: impl Fn(&LogQuery) -> Result<LogPageParts<E>>,
+) -> Result<LogPageParts<E>> {
+    let mut q = q.clone();
+    let mut out: LogPageParts<E> = (Vec::new(), None, None, None);
+    loop {
+        let left = want - out.0.len();
+        q.limit = Some(left.min(LOG_PAGE as usize) as u32);
+        let (entries, next, answered_at, behind) = fetch(&q)?;
+        out.0.extend(entries);
+        out.1 = next;
+        // Later pages continue the walk the first one pinned.
+        if out.2.is_none() {
+            out.2 = answered_at;
+            out.3 = behind;
+        }
+        if out.0.len() >= want || out.1.is_none() {
+            return Ok(out);
+        }
+        q.after = out.1.clone();
+    }
 }
 
 /// Parameters of `GET /v1/search/{rev}`.
@@ -530,40 +609,59 @@ impl Client {
     }
 
     pub fn log(&self, id: &ChangesetId, q: &LogQuery) -> Result<LogResponse> {
+        let params = q.params_for(false);
         self.indexed(|| {
             self.http
                 .get(self.url(&format!("/v1/log/{id}")))
-                .query(&q.params())
+                .query(&params)
         })
+    }
+
+    /// [`Client::log`] without each changeset's changed paths, which a
+    /// listing does not show and which make most of a full log's bytes.
+    pub fn log_summary(&self, id: &ChangesetId, q: &LogQuery) -> Result<LogSummaryResponse> {
+        let params = q.params_for(true);
+        let any: AnyLog = self.indexed(|| {
+            self.http
+                .get(self.url(&format!("/v1/log/{id}")))
+                .query(&params)
+        })?;
+        Ok(any.into())
     }
 
     /// Up to `want` log entries, following page cursors past the server's
     /// per-request cap. `next` is set if the log goes on. A server without
     /// cursors answers one page.
     pub fn log_all(&self, id: &ChangesetId, q: &LogQuery, want: usize) -> Result<LogResponse> {
-        let mut q = q.clone();
-        let mut out = LogResponse {
-            entries: Vec::new(),
-            next: None,
-            answered_at: None,
-            behind: None,
-        };
-        loop {
-            let left = want - out.entries.len();
-            q.limit = Some(left.min(LOG_PAGE as usize) as u32);
-            let page = self.log(id, &q)?;
-            out.entries.extend(page.entries);
-            out.next = page.next;
-            // Later pages continue the walk the first one pinned.
-            if out.answered_at.is_none() {
-                out.answered_at = page.answered_at;
-                out.behind = page.behind;
-            }
-            if out.entries.len() >= want || out.next.is_none() {
-                return Ok(out);
-            }
-            q.after = out.next.clone();
-        }
+        let (entries, next, answered_at, behind) = pages(q, want, |q| {
+            let p = self.log(id, q)?;
+            Ok((p.entries, p.next, p.answered_at, p.behind))
+        })?;
+        Ok(LogResponse {
+            entries,
+            next,
+            answered_at,
+            behind,
+        })
+    }
+
+    /// [`Client::log_all`] with summary entries.
+    pub fn log_summary_all(
+        &self,
+        id: &ChangesetId,
+        q: &LogQuery,
+        want: usize,
+    ) -> Result<LogSummaryResponse> {
+        let (entries, next, answered_at, behind) = pages(q, want, |q| {
+            let p = self.log_summary(id, q)?;
+            Ok((p.entries, p.next, p.answered_at, p.behind))
+        })?;
+        Ok(LogSummaryResponse {
+            entries,
+            next,
+            answered_at,
+            behind,
+        })
     }
 
     /// Newest change to a file or directory, from the server's path index.

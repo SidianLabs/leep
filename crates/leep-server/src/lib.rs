@@ -29,7 +29,7 @@ use leep_core::{Changeset, ChangesetId, Error, FileKind, Hash, RefUpdateContext,
 use leep_derive::indexing::{Answered, Freshness};
 use leep_derive::{search, ExtraMatch, LogFilter, LogParams, PrefixMatch, Repo, SearchQuery};
 use serde::de::DeserializeOwned;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
 
@@ -392,6 +392,7 @@ struct LogQuery {
     filter: LogFilter,
     /// The previous page's `next` cursor.
     after: Option<String>,
+    fields: LogFields,
 }
 
 impl LogQuery {
@@ -408,6 +409,7 @@ impl LogQuery {
                 }
                 "follow" => q.follow = parse_bool("follow", &v)?,
                 "after" => q.after = Some(v),
+                "fields" => q.fields = LogFields::parse(&v)?,
                 "author" => q.filter.author = Some(v),
                 "extra" => q.filter.extra.push(ExtraMatch::parse(&v)?),
                 _ => {}
@@ -957,43 +959,48 @@ async fn log(
             freshness(&headers),
         )
         .await?;
-    let resp = log_json(LogResponse {
-        entries: page.entries,
+    let tail = LogTail {
         next: page.next,
         answered_at,
         behind,
-    });
+    };
+    let resp = match q.fields {
+        LogFields::Full => log_json(page.entries, tail),
+        LogFields::Summary => {
+            let entries: Vec<LogSummaryEntry> = page.entries.into_iter().map(Into::into).collect();
+            log_json(entries, tail)
+        }
+    };
     Ok(with_scanned(resp, scanned))
 }
 
 /// Entries one task encodes of a long log.
 const LOG_CHUNK_ENTRIES: usize = 512;
 
-/// `Json(log)`, byte for byte, for a long log: chunks of entries are
+/// `Json` of a [`LogResponse`] (or, for summary entries, a
+/// [`LogSummaryResponse`]) made of `entries` and `tail`, byte for byte. For a long log chunks of entries are
 /// encoded on blocking threads, several at once, and streamed in order, so
 /// the first bytes leave while later entries are encoded. 10,000 entries
 /// are tens of megabytes of JSON. The walk has finished, so a failure of
 /// the store still answers with an error status; encoding these types
 /// cannot fail.
-fn log_json(log: LogResponse) -> Response {
-    if log.entries.len() <= LOG_CHUNK_ENTRIES {
-        return Json(log).into_response();
+fn log_json<E>(entries: Vec<E>, tail: LogTail) -> Response
+where
+    E: Serialize + Send + 'static,
+{
+    if entries.len() <= LOG_CHUNK_ENTRIES {
+        return Json(LogBody {
+            entries,
+            next: tail.next,
+            answered_at: tail.answered_at,
+            behind: tail.behind,
+        })
+        .into_response();
     }
-    let LogResponse {
-        entries,
-        next,
-        answered_at,
-        behind,
-    } = log;
-    let tail = LogTail {
-        next,
-        answered_at,
-        behind,
-    };
     let mut chunks = Vec::with_capacity(entries.len().div_ceil(LOG_CHUNK_ENTRIES));
     let mut rest = entries.into_iter();
     loop {
-        let chunk: Vec<ChangesetInfo> = rest.by_ref().take(LOG_CHUNK_ENTRIES).collect();
+        let chunk: Vec<E> = rest.by_ref().take(LOG_CHUNK_ENTRIES).collect();
         if chunk.is_empty() {
             break;
         }
@@ -1019,6 +1026,19 @@ fn log_json(log: LogResponse) -> Response {
         .into_response()
 }
 
+/// The shape of [`LogResponse`] and [`LogSummaryResponse`], whichever
+/// entries it holds.
+#[derive(Serialize)]
+struct LogBody<E> {
+    entries: Vec<E>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    answered_at: Option<ChangesetId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    behind: Option<u64>,
+}
+
 /// The fields of a `LogResponse` after its entries.
 #[derive(Clone)]
 struct LogTail {
@@ -1030,8 +1050,8 @@ struct LogTail {
 /// Part of a `LogResponse` body: `chunk`'s entries, comma separated, opened
 /// by the object's head if `first` or by a comma if not, closed (with the
 /// fields after the entries, if any) with `tail` on the last chunk.
-fn encode_log_chunk(
-    chunk: &[ChangesetInfo],
+fn encode_log_chunk<E: Serialize>(
+    chunk: &[E],
     first: bool,
     tail: Option<LogTail>,
 ) -> serde_json::Result<Bytes> {
@@ -1292,10 +1312,21 @@ mod tests {
                     behind: stale.map(|s| s.1),
                 };
                 let want = serde_json::to_vec(&log).unwrap();
-                let resp = log_json(log);
+                let tail = LogTail {
+                    next: log.next.clone(),
+                    answered_at: log.answered_at,
+                    behind: log.behind,
+                };
+                let resp = log_json(log.entries.clone(), tail.clone());
                 assert_eq!(resp.headers()[header::CONTENT_TYPE], "application/json");
                 let got = resp.into_body().collect().await.unwrap().to_bytes();
                 assert_eq!(got, want, "{len} entries, next {next:?}");
+                // Summary entries: the same, for `LogSummaryResponse`.
+                let summary = LogSummaryResponse::from(log);
+                let want = serde_json::to_vec(&summary).unwrap();
+                let resp = log_json(summary.entries, tail);
+                let got = resp.into_body().collect().await.unwrap().to_bytes();
+                assert_eq!(got, want, "summary: {len} entries, next {next:?}");
             }
         }
     }
@@ -1325,6 +1356,18 @@ mod tests {
                 }
             ]
         );
+    }
+
+    #[test]
+    fn log_query_reads_fields() {
+        assert_eq!(LogQuery::parse(pairs(&[])).unwrap().fields, LogFields::Full);
+        for (v, want) in [("full", LogFields::Full), ("summary", LogFields::Summary)] {
+            assert_eq!(
+                LogQuery::parse(pairs(&[("fields", v)])).unwrap().fields,
+                want
+            );
+        }
+        assert!(LogQuery::parse(pairs(&[("fields", "changes")])).is_err());
     }
 
     #[test]

@@ -4,9 +4,9 @@ use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
 use std::fmt::Write;
 
-use leep_core::api::{ChangesetInfo, FileInfo};
+use leep_core::api::{ChangesetInfo, FileInfo, LogSummaryEntry, RenameEntry};
 use leep_core::changeset::{EXTRA_AGENT_MODEL, EXTRA_AGENT_SESSION};
-use leep_core::{ChangesetId, FileKind};
+use leep_core::{ChangesetId, FileKind, RepoPath};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use similar::TextDiff;
@@ -35,6 +35,8 @@ struct LogArgs {
     agent_session: Option<String>,
     cursor: Option<String>,
     fresh: Option<bool>,
+    /// Whole messages and all of `extra`, from full log entries.
+    full: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -115,10 +117,40 @@ fn summary(info: &ChangesetInfo) -> Value {
     if !extra.is_empty() {
         v["extra"] = Value::Object(extra);
     }
-    if let Some(p) = &info.path_at {
+    follow_fields(&mut v, info.path_at.as_ref(), info.renamed.as_ref());
+    v
+}
+
+/// A log entry: [`summary`]'s shape from a summary entry, so `message` is
+/// the first line and only `agent.*` metadata is kept (`leep_show` has the
+/// rest).
+fn log_entry(e: &LogSummaryEntry) -> Value {
+    let agent: Map<String, Value> = e
+        .agent
+        .iter()
+        .filter_map(|(k, v)| Some((k.strip_prefix("agent.")?.to_string(), json!(v))))
+        .collect();
+    let mut v = json!({
+        "id": e.id.to_string(),
+        "parents": e.parents.iter().map(|p| p.to_string()).collect::<Vec<_>>(),
+        "author": e.author,
+        "timestamp": e.timestamp,
+        "message": e.message_first_line,
+        "files_changed": e.files_changed,
+    });
+    if !agent.is_empty() {
+        v["agent"] = Value::Object(agent);
+    }
+    follow_fields(&mut v, e.path_at.as_ref(), e.renamed.as_ref());
+    v
+}
+
+/// What a `follow` log adds to an entry.
+fn follow_fields(v: &mut Value, path_at: Option<&RepoPath>, renamed: Option<&RenameEntry>) {
+    if let Some(p) = path_at {
         v["path_at"] = json!(p.as_str());
     }
-    if let Some(r) = &info.renamed {
+    if let Some(r) = renamed {
         v["renamed"] = json!({
             "from": r.from.as_str(),
             "to": r.to.as_str(),
@@ -126,7 +158,6 @@ fn summary(info: &ChangesetInfo) -> Value {
             "exact": r.exact,
         });
     }
-    v
 }
 
 /// Add `answered_at` and `behind` when the answer is for an older changeset
@@ -189,13 +220,20 @@ impl Server {
             follow,
             after: non_empty(a.cursor),
         };
-        let log = self
-            .index_client(a.fresh.unwrap_or(false))
-            .log(&id, &query)?;
-        let entries: Vec<Value> = log.entries.iter().map(summary).collect();
+        let client = self.index_client(a.fresh.unwrap_or(false));
+        let (entries, next, answered_at, behind): (Vec<Value>, _, _, _) = if a.full.unwrap_or(false)
+        {
+            let log = client.log(&id, &query)?;
+            let entries = log.entries.iter().map(summary).collect();
+            (entries, log.next, log.answered_at, log.behind)
+        } else {
+            let log = client.log_summary(&id, &query)?;
+            let entries = log.entries.iter().map(log_entry).collect();
+            (entries, log.next, log.answered_at, log.behind)
+        };
         let mut v = json!({ "from": id.to_string(), "entries": entries });
-        mark_stale(&mut v, log.answered_at, log.behind);
-        if let Some(next) = log.next {
+        mark_stale(&mut v, answered_at, behind);
+        if let Some(next) = next {
             v["next"] = json!(next);
             v["note"] = json!(
                 "More history follows. For the next page, call again with the same arguments, \

@@ -1561,6 +1561,97 @@ async fn land_creates_a_missing_ref_only_when_allowed() {
     assert!(matches!(r.json(), LandResponse::Landed { landed, .. } if landed == b));
 }
 
+/// `fields=summary`: the same entries without their changes, paged with the
+/// same cursors (either shape continues the other); without it, or with
+/// `fields=full`, the body is the full log byte for byte.
+#[tokio::test]
+async fn log_summary_is_a_projection_of_the_full_log() {
+    let c = Client::new();
+    let base = c
+        .commit(&[], &[("a/x", Some("0")), ("b", Some("0"))], "root")
+        .await;
+    let mut left = base;
+    let mut right = base;
+    for i in 0..12 {
+        let text = format!("{i}");
+        left = c
+            .commit(
+                &[left],
+                &[("a/x", Some(&text)), ("c", Some(&text))],
+                &format!("l{i}\nbody"),
+            )
+            .await;
+        right = c
+            .commit(&[right], &[("b", Some(&text))], &format!("r{i}"))
+            .await;
+    }
+    let tip = c
+        .commit(&[left, right], &[("b", Some("merged"))], "merge")
+        .await;
+    c.set_ref("main", tip).await;
+
+    for query in [
+        "",
+        "&path=a",
+        "&path=a/x",
+        "&path=b",
+        "&author=t",
+        "&path=a/x&follow=true",
+    ] {
+        let uri = format!("/v1/log/{tip}?limit=100{query}");
+        let full = c.get(&uri).await;
+        assert_eq!(full.status, StatusCode::OK, "{uri}");
+        let explicit = c.get(&format!("{uri}&fields=full")).await;
+        assert_eq!(explicit.body, full.body, "{uri}");
+        let parsed: LogResponse = full.json();
+        assert_eq!(serde_json::to_vec(&parsed).unwrap(), full.body, "{uri}");
+        assert!(!parsed.entries.is_empty(), "{uri}");
+
+        let summary = c.get(&format!("{uri}&fields=summary")).await;
+        assert_eq!(summary.status, StatusCode::OK, "{uri}");
+        let got: LogSummaryResponse = summary.json();
+        assert_eq!(got, LogSummaryResponse::from(parsed.clone()), "{uri}");
+        assert!(summary.body.len() < full.body.len(), "{uri}");
+        let v: serde_json::Value = summary.json();
+        assert!(v["entries"][0].get("changes").is_none());
+        assert!(v["entries"][0].get("changeset").is_none());
+
+        // Pages of 3, alternating shapes, concatenate to the whole log.
+        let mut ids = Vec::new();
+        let mut after: Option<String> = None;
+        for page in 0.. {
+            let mut u = format!("/v1/log/{tip}?limit=3{query}");
+            if page % 2 == 1 {
+                u.push_str("&fields=summary");
+            }
+            if let Some(a) = &after {
+                u.push_str(&format!("&after={a}"));
+            }
+            let r = c.get(&u).await;
+            assert_eq!(r.status, StatusCode::OK, "{u}");
+            let next = if page % 2 == 1 {
+                let p: LogSummaryResponse = r.json();
+                ids.extend(p.entries.iter().map(|e| e.id));
+                p.next
+            } else {
+                let p: LogResponse = r.json();
+                ids.extend(p.entries.iter().map(|e| e.id));
+                p.next
+            };
+            match next {
+                Some(n) => after = Some(n),
+                None => break,
+            }
+        }
+        let want: Vec<ChangesetId> = parsed.entries.iter().map(|e| e.id).collect();
+        assert_eq!(ids, want, "{query}");
+    }
+
+    let r = c.get(&format!("/v1/log/{tip}?fields=changes")).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert!(r.json::<ErrorResponse>().error.contains("fields"));
+}
+
 /// `?after=` pages through log, search and the ref log over HTTP; requests
 /// without it answer as before, plus `next` only when they stopped early.
 #[tokio::test]
