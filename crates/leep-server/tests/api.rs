@@ -26,6 +26,13 @@ impl Reply {
         serde_json::from_slice(&self.body)
             .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&self.body)))
     }
+
+    /// The `code` of an error body, which every error must have.
+    fn code(&self) -> String {
+        self.json::<ErrorResponse>()
+            .code
+            .unwrap_or_else(|| panic!("no code: {}", String::from_utf8_lossy(&self.body)))
+    }
 }
 
 impl Client {
@@ -269,6 +276,8 @@ async fn body_limit() {
         .raw(Method::PUT, &format!("/v1/blobs/{h}"), b"too big".to_vec())
         .await;
     assert_eq!(r.status, StatusCode::PAYLOAD_TOO_LARGE);
+    // The body cap answers in plain text; clients still get a JSON error.
+    assert_eq!(r.code(), "too_large");
 }
 
 #[tokio::test]
@@ -1248,6 +1257,7 @@ async fn ref_writes_validate_names() {
             .post(&format!("/v1/refs/{bad}"), &cas(None, Some(a)))
             .await;
         assert_eq!(r.status, StatusCode::BAD_REQUEST, "{bad}");
+        assert_eq!(r.code(), "invalid_name", "{bad}");
         let r = c
             .post(
                 "/v1/land",
@@ -1263,6 +1273,7 @@ async fn ref_writes_validate_names() {
             )
             .await;
         assert_eq!(r.status, StatusCode::BAD_REQUEST, "land {bad}");
+        assert_eq!(r.code(), "invalid_name", "land {bad}");
     }
     let r = c.post("/v1/refs/a..b", &cas(None, Some(a))).await;
     let msg = r.json::<ErrorResponse>().error;
@@ -1288,8 +1299,11 @@ async fn tags_are_created_and_deleted_but_never_moved() {
     let r = c.post("/v1/refs/tags/v1", &cas(Some(a), Some(b))).await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST);
     assert!(r.json::<ErrorResponse>().error.contains("immutable"));
+    assert_eq!(r.code(), "tag_immutable");
+    // A lost swap is a `CasRefResponse`, not an error body.
     let r = c.post("/v1/refs/tags/v1", &cas(None, Some(b))).await;
     assert_eq!(r.status, StatusCode::CONFLICT);
+    assert!(!r.json::<CasRefResponse>().ok);
     let t: RefResponse = c.get("/v1/refs/tags/v1").await.json();
     assert_eq!(t.target, Some(a));
 
@@ -1307,6 +1321,7 @@ async fn tags_are_created_and_deleted_but_never_moved() {
             )
             .await;
         assert_eq!(r.status, StatusCode::BAD_REQUEST, "{name}");
+        assert_eq!(r.code(), "tag_immutable", "{name}");
     }
 
     // A tag resolves by full ref and by short name; a branch of that name wins.
@@ -1496,6 +1511,7 @@ async fn resolve_prefix_finds_one_lists_many_and_rejects_bad_input() {
     assert_eq!(amb.candidates, [a, b]);
     assert!(!amb.truncated);
     assert!(amb.error.contains("ambiguous"), "{}", amb.error);
+    assert_eq!(amb.code.as_deref(), Some("ambiguous_prefix"));
     // Clients that know only ErrorResponse still read the message.
     assert!(r.json::<ErrorResponse>().error.contains("ambiguous"));
 
@@ -1527,6 +1543,7 @@ async fn land_creates_a_missing_ref_only_when_allowed() {
 
     let r = c.post("/v1/land", &land("typo", Some(false))).await;
     assert_eq!(r.status, StatusCode::NOT_FOUND);
+    assert_eq!(r.code(), "ref_missing");
     let e: ErrorResponse = r.json();
     assert!(
         e.error.contains(leep_core::refname::MISSING_REF_MARKER),
@@ -1783,4 +1800,74 @@ async fn list_endpoints_page_with_cursors() {
         ))
         .await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn every_error_has_a_code() {
+    let c = Client::new();
+    let a = c.commit(&[], &[("a", Some("1"))], "a").await;
+    let cases = [
+        (
+            c.get(&format!(
+                "/v1/changesets/{}",
+                ChangesetId(Hash::of_blob(b"none"))
+            ))
+            .await,
+            StatusCode::NOT_FOUND,
+            "not_found",
+        ),
+        (
+            c.get("/v1/resolve/nope").await,
+            StatusCode::NOT_FOUND,
+            "not_found",
+        ),
+        (
+            c.get("/v1/blobs/zz").await,
+            StatusCode::BAD_REQUEST,
+            "invalid",
+        ),
+        (
+            c.get(&format!("/v1/log/{a}?limit=many")).await,
+            StatusCode::BAD_REQUEST,
+            "invalid",
+        ),
+        (
+            c.raw(Method::POST, "/v1/land", b"{".to_vec()).await,
+            StatusCode::BAD_REQUEST,
+            "invalid",
+        ),
+        // Routing answers without a handler; still a JSON error.
+        (
+            c.get("/v1/no-such-endpoint").await,
+            StatusCode::NOT_FOUND,
+            "not_found",
+        ),
+        (
+            c.raw(Method::DELETE, "/v1/land", vec![]).await,
+            StatusCode::METHOD_NOT_ALLOWED,
+            "invalid",
+        ),
+    ];
+    for (r, status, code) in cases {
+        assert_eq!((r.status, r.code().as_str()), (status, code));
+        assert!(!r.json::<ErrorResponse>().error.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn a_reused_land_id_has_its_own_code() {
+    let c = Client::new();
+    let a = c.commit(&[], &[("a", Some("1"))], "a").await;
+    let b = c.commit(&[a], &[("a", Some("2"))], "b").await;
+    let id: LandId = "00112233445566778899aabbccddeeff".parse().unwrap();
+    let land = |changeset| LandRequest {
+        changeset,
+        target_ref: "main".into(),
+        create: None,
+        land_id: Some(id.clone()),
+    };
+    assert_eq!(c.post("/v1/land", &land(a)).await.status, StatusCode::OK);
+    let r = c.post("/v1/land", &land(b)).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert_eq!(r.code(), "land_id_reused");
 }

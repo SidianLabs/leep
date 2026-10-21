@@ -7,7 +7,7 @@
 //! of being overwritten. The working copy is never touched.
 
 use clap::Args;
-use leep_core::api::CasRefRequest;
+use leep_core::api::{error_code, CasRefRequest};
 use leep_core::refname::NOT_FORWARD_MARKER;
 use leep_core::{ChangesetId, RefLogEntry};
 
@@ -146,7 +146,9 @@ pub fn undo(r: &Remote, args: &UndoArgs) -> Result<i32> {
         .map_err(|e| {
             // A protected ref never moves back, so the change has to be undone
             // by a new change that goes through review and signing.
-            if e.kind() != ErrorKind::User || !e.message().contains(NOT_FORWARD_MARKER) {
+            if e.kind() != ErrorKind::User
+                || !e.is_server(error_code::NOT_FORWARD, NOT_FORWARD_MARKER)
+            {
                 return e;
             }
             let undone = entry.new.map_or_else(|| "<id>".into(), |id| id.to_string());

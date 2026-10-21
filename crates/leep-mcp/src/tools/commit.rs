@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use leep_cli::client::new_land_id;
 use leep_cli::error::{CliError, ErrorKind};
-use leep_core::api::{Conflict, FileInfo, LandRequest, LandResponse};
+use leep_core::api::{error_code, Conflict, FileInfo, LandRequest, LandResponse};
 use leep_core::changeset::{
     EXTRA_AGENT_MODEL, EXTRA_AGENT_PROMPT, EXTRA_AGENT_REQUEST_ID, EXTRA_AGENT_SESSION,
     EXTRA_AGENT_TESTS,
@@ -412,5 +412,5 @@ fn land_error(e: CliError, changeset: ChangesetId) -> ToolError {
 
 /// A land refused because the ref does not exist and may not be created.
 fn missing_ref(e: &CliError) -> bool {
-    e.kind() == ErrorKind::NotFound && e.message().contains(MISSING_REF_MARKER)
+    e.kind() == ErrorKind::NotFound && e.is_server(error_code::REF_MISSING, MISSING_REF_MARKER)
 }

@@ -4,6 +4,7 @@
 pub mod auth;
 pub mod backup;
 pub mod coord;
+pub mod errors;
 pub mod fingerprint;
 pub mod limits;
 pub mod observe;
@@ -239,6 +240,8 @@ pub fn router_with_ready_timeout(
         ))
     };
     router
+        // Outside the body cap and the timeout, whose answers are plain text.
+        .layer(middleware::from_fn(errors::json_errors))
         .layer(observe::trace_layer())
         .layer(middleware::from_fn(observe::track_metrics))
         .with_state(repo)
@@ -336,6 +339,7 @@ impl IntoResponse for ApiError {
                     behind: *behind,
                     retry_after_ms: *retry_after_ms,
                 }),
+                code: Some(error_code::INDEXING.into()),
             };
             let mut resp = (status, Json(body)).into_response();
             let h = resp.headers_mut();
@@ -351,7 +355,8 @@ impl IntoResponse for ApiError {
         if status.is_server_error() {
             tracing::error!(error = %self.0, "request failed");
         }
-        (status, Json(ErrorResponse::new(self.0.to_string()))).into_response()
+        let body = ErrorResponse::new(self.0.to_string()).with_code(errors::code_of(&self.0));
+        (status, Json(body)).into_response()
     }
 }
 
@@ -889,6 +894,7 @@ async fn resolve_prefix(State(repo): S, Path(prefix): Path<String>) -> ApiResult
                 ),
                 candidates,
                 truncated,
+                code: Some(error_code::AMBIGUOUS_PREFIX.into()),
             };
             (StatusCode::BAD_REQUEST, Json(body)).into_response()
         }

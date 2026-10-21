@@ -1073,3 +1073,43 @@ still refused. New flags and variables: `--rate-limit`/`LEEP_RATE_LIMIT`,
 `--rate-burst`/`LEEP_RATE_BURST`,
 `--max-concurrent-per-token`/`LEEP_MAX_CONCURRENT_PER_TOKEN`,
 `--read-max-body-bytes`/`LEEP_READ_MAX_BODY_BYTES`.
+
+## Error codes (additive API field, no persisted change)
+
+`ErrorResponse` gains `code`, and `AmbiguousPrefixResponse` too: a string
+omitted when unset and absent from older servers. Every error body a server
+of this version sends carries one, including the answers that used to be
+plain text or empty (the global body cap's `413`, the request timeout's
+`408`, an unknown route's `404`, a `405`), which are now `ErrorResponse`
+JSON with the same status. `error` stays as before. The codes are a stable
+contract: a code keeps its meaning forever, new ones may be added, and a
+client treats an unknown or absent code by its HTTP status.
+
+| Status | `code` | Condition |
+|---|---|---|
+| 400 | `needs_review` | a land or ref move onto a ref whose review policy some changeset does not meet |
+| 400 | `not_signed` | a land or ref move onto a ref that needs every changeset signed by a trusted key |
+| 400 | `not_forward` | a move of a land-policy-protected ref that is not a fast-forward |
+| 400 | `tag_immutable` | a move of a tag, or a land onto one |
+| 400 | `land_id_reused` | a land id the ref already recorded for another changeset (ADR 0057) |
+| 400 | `invalid_name` | a ref name the validator refuses |
+| 400 | `ambiguous_prefix` | a short id matching several changesets (`AmbiguousPrefixResponse`) |
+| 400 | `invalid` | any other bad request (also `405`) |
+| 401 | `unauthorized` | no token, or an unknown one |
+| 403 | `forbidden` | a `read` token on a request that writes |
+| 404 | `ref_missing` | a land onto a missing ref with `create: false` (ADR 0036) |
+| 404 | `not_found` | anything else that does not exist |
+| 408 | `timeout` | the request timeout ran out; the request may or may not have applied |
+| 409 | `cas_lost` | a concurrent update won repeatedly (a land that kept losing); read again and retry |
+| 413 | `too_large` | the body is over the server's or the token's limit |
+| 429 | `rate_limited` | a rate or concurrency limit; see `Retry-After` |
+| 500 | `internal` | the server failed |
+| 503 | `indexing` | the index is too far behind; see `indexing` and `Retry-After` (ADR 0058) |
+| 503 | `not_leader` | the server no longer coordinates lands on that ref; send the land again (ADR 0056) |
+
+A lost `POST /v1/refs/{name}` swap is unchanged: `409` with `CasRefResponse`
+(`ok: false`), not an error body. The marker texts (`NEEDS_REVIEW_MARKER`,
+`NOT_SIGNED_MARKER`, `NOT_FORWARD_MARKER`, `MISSING_REF_MARKER`) stay in the
+messages, so clients that match them keep working; the CLI and the MCP server
+go by `code` when it is present and by the markers otherwise. The constants
+are `leep_core::api::error_code`.

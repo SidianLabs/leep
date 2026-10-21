@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::fs;
 
 use clap::Args;
-use leep_core::api::{Conflict, LandId, LandRequest, LandResponse, FEATURE_LAND_ID};
+use leep_core::api::{error_code, Conflict, LandId, LandRequest, LandResponse, FEATURE_LAND_ID};
 use leep_core::refname::MISSING_REF_MARKER;
 use leep_core::review::NEEDS_REVIEW_MARKER;
 use leep_core::signature::NOT_SIGNED_MARKER;
@@ -251,7 +251,7 @@ fn landed(resp: &LandResponse) -> bool {
 
 /// A land refused because the ref does not exist and may not be created.
 fn missing_ref(e: &CliError) -> bool {
-    e.kind() == ErrorKind::NotFound && e.message().contains(MISSING_REF_MARKER)
+    e.kind() == ErrorKind::NotFound && e.is_server(error_code::REF_MISSING, MISSING_REF_MARKER)
 }
 
 /// The server names the changeset a policy refused; add what to do about it.
@@ -259,13 +259,13 @@ fn hint_policy(e: CliError, target_ref: &str) -> CliError {
     if e.kind() != ErrorKind::User {
         return e;
     }
-    if e.message().contains(NEEDS_REVIEW_MARKER) {
+    if e.is_server(error_code::NEEDS_REVIEW, NEEDS_REVIEW_MARKER) {
         return e.map_message(|m| format!(
             "{m}\n{target_ref} needs approval from the owners of the paths a changeset changes: \
              ask one to run `leep review approve <changeset>`; `leep review status <changeset> --ref {target_ref}` shows what is missing."
         ));
     }
-    if e.message().contains(NOT_SIGNED_MARKER) {
+    if e.is_server(error_code::NOT_SIGNED, NOT_SIGNED_MARKER) {
         return e.map_message(|m| format!(
             "{m}\n{target_ref} only accepts signed changesets: every changeset being landed needs a signature. \
              Commit with `leep commit --sign KEYFILE` (or set LEEP_SIGNING_KEY); create a key with `leep keygen`."

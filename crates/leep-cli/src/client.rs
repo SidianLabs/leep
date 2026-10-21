@@ -879,11 +879,13 @@ fn error_from(resp: Response, has_token: bool) -> CliError {
                 candidates.push("...".into());
             }
             return CliError::new(ErrorKind::Ambiguous, format!("server: {}", amb.error))
+                .with_server_code(amb.code)
                 .with_candidates(candidates)
                 .with_hint("give more digits of the id; the candidates are listed above");
         }
     }
     let parsed = serde_json::from_str::<ErrorResponse>(&body).ok();
+    let code = parsed.as_ref().and_then(|e| e.code.clone());
     if let Some(info) = parsed.as_ref().and_then(|e| e.indexing.clone()) {
         if status == StatusCode::SERVICE_UNAVAILABLE {
             return CliError::new(
@@ -894,6 +896,7 @@ fn error_from(resp: Response, has_token: bool) -> CliError {
                 ),
             )
             .with_retry_after_ms(info.retry_after_ms)
+            .with_server_code(code)
             .with_hint("the server's index is catching up; run the command again later, or pass --stale-ok");
         }
     }
@@ -905,7 +908,7 @@ fn error_from(resp: Response, has_token: bool) -> CliError {
     } else {
         format!("server: {msg} ({status})")
     };
-    match status {
+    let e = match status {
         // The server's request timeout cancels a request at any point,
         // possibly after it took effect: like a lost connection, the outcome
         // is unknown and running the command again is the answer.
@@ -922,7 +925,8 @@ fn error_from(resp: Response, has_token: bool) -> CliError {
         StatusCode::CONFLICT => CliError::lost_race(msg),
         s if s.is_server_error() => CliError::server(msg),
         _ => CliError::user(msg),
-    }
+    };
+    e.with_server_code(code)
 }
 
 #[cfg(test)]

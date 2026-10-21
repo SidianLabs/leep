@@ -289,9 +289,12 @@ pub fn layer(app: axum::Router, coordination: Arc<Coordination>) -> axum::Router
 pub fn not_leader() -> Response {
     let mut resp = (
         StatusCode::SERVICE_UNAVAILABLE,
-        Json(ErrorResponse::new(
-            "this server no longer coordinates lands on that ref; send it again",
-        )),
+        Json(
+            ErrorResponse::new(
+                "this server no longer coordinates lands on that ref; send it again",
+            )
+            .with_code(leep_core::api::error_code::NOT_LEADER),
+        ),
     )
         .into_response();
     resp.headers_mut()

@@ -7,6 +7,18 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 ## [Unreleased]
 
+### Error codes
+- Every error body from the server carries a stable, machine-readable
+  `code` (`needs_review`, `not_signed`, `not_forward`, `tag_immutable`,
+  `land_id_reused`, `invalid_name`, `ref_missing`, `cas_lost`, `indexing`,
+  `rate_limited`, ...; full list in docs/FORMATS.md, "Error codes"), so
+  clients need not match message text. The global body cap's 413, the
+  request timeout's 408 and unknown routes now answer `ErrorResponse` JSON
+  instead of plain text or an empty body.
+- The CLI and the MCP server go by `code` when the server sends one and fall
+  back to the message markers for older servers. `--json` errors gain
+  `server_code`.
+
 ### Summary log entries
 - `GET /v1/log/{id}?fields=summary` answers the same entries, order and
   cursors as listings need them: id, parents, author, timestamp,

@@ -142,6 +142,10 @@ line, in addition to the usual text on stderr:
 | `conflict` | 5 | Conflicts to resolve, or (with `retryable: true`) a concurrent update that won. |
 | `nothing_to_do` | 6 | Nothing to record. |
 
+When the server named the error (servers since error codes; see
+[FORMATS.md](FORMATS.md), "Error codes"), the object also carries
+`server_code`, such as `not_signed`, `needs_review` or `ref_missing`.
+
 `code` values are stable; new ones may be added. `retryable` says whether
 running the same command again can succeed. Commands that finish with
 conflicts (`land`, `sync`, `merge`, `cherry-pick`, `revert`, `stash apply`)

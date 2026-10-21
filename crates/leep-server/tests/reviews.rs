@@ -962,6 +962,10 @@ async fn raw_ref_cas_cannot_rewind_a_protected_ref() {
     for who in ["mallory", "alice"] {
         let r = api.post("/v1/refs/main", who, &cas(fix, old)).await;
         assert_eq!(r.status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            r.json::<ErrorResponse>().code.as_deref(),
+            Some("not_forward")
+        );
         assert!(
             r.error().contains(leep_core::refname::NOT_FORWARD_MARKER),
             "{}",
@@ -998,6 +1002,10 @@ async fn raw_ref_cas_cannot_skip_review() {
     let r = api.post("/v1/refs/main", "bob", &cas(c)).await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST);
     assert!(r.error().contains(NEEDS_REVIEW_MARKER), "{}", r.error());
+    assert_eq!(
+        r.json::<ErrorResponse>().code.as_deref(),
+        Some("needs_review")
+    );
     assert_eq!(api.main_ref().await, None);
     // Unprotected refs are unaffected.
     assert_eq!(
