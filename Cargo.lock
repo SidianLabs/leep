@@ -2443,6 +2443,7 @@ name = "leep-mcp"
 version = "0.0.1"
 dependencies = [
  "axum",
+ "blake3",
  "leep-cli",
  "leep-core",
  "leep-derive",

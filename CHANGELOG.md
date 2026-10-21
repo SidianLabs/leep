@@ -7,6 +7,38 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 ## [Unreleased]
 
+### MCP: request ids land once across restarts
+- `leep_commit_and_land` sends a land id derived from `request_id`,
+  `target_ref`, the author and the agent session (ADR 0057) instead of a
+  random one. A retry with the same `request_id` is answered from the server's record even after the MCP
+  server restarted, at any age. Before, only the MCP process that made the
+  first call remembered the request. Such an answer has `from_record: true`;
+  reusing a `request_id` for different changes is reported as
+  `status: "already_landed"` with `differing_paths` and lands nothing. A
+  `request_id` need only be unique per author (and agent session, when
+  set).
+
+### MCP: resolve a conflict by sending only the conflicting files
+- New tool `leep_resolve_and_land {conflict_id | onto, resolutions[], message?}`:
+  after `leep_commit_and_land` reports conflicts (now with a `conflict_id`),
+  the agent sends only the resolved content of the conflicting paths; the MCP
+  server rebuilds the changeset on `onto` from the conflict's clean changes
+  plus the resolutions and lands it under the same request id. For one
+  conflicting file in a 20-file change the agent sends about 2.5 KB instead
+  of 46 KB. Conflicts are remembered per MCP process; after a restart the
+  tool says to call `leep_commit_and_land` with every file, as before.
+- The conflict guidance now points to `leep_resolve_and_land` instead of
+  asking for every file again.
+
+### MCP: history read tools
+- `leep_reflog` (a ref's moves, or every ref's, with land ids, short ids by
+  default and cursor paging), `leep_resolve` (rev or id prefix to a full id),
+  `leep_merge_base` (common ancestor and ancestry of two revs) and
+  `leep_provenance` (changesets and files touched per agent model and session
+  and per human author, capped to the top rows).
+- MCP tool errors from the server now carry its error code as
+  `[code: CODE]`, and an ambiguous short id lists its candidates.
+
 ### Request ids
 - The server accepts a client's `X-Request-Id` (1 to 128 characters of
   `A-Z a-z 0-9 . _ : / -`; anything else is replaced) or makes one, answers

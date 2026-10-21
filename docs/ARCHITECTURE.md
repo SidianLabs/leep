@@ -615,7 +615,9 @@ only a land id recognises the retry
 (`land_id`, random, the same on every retry) has the id stored in the ref
 log entry of the move, in the same transaction, and a later land with that
 id is answered from the entry at any age. `leep land` and the MCP server
-send one; the scan stays for clients that do not.
+send one (the MCP server derives it from the agent's `request_id`, the ref,
+the author and the agent session when there is one, so a retry from a restarted MCP process is answered
+too; docs/MCP.md); the scan stays for clients that do not.
 A land onto a ref that does not exist creates it, unless the request says
 `create: false` ([ADR 0036](adr/0036-explicit-ref-creation-on-land.md)), which
 `leep land` does unless given `--create` (or landing the first changeset onto
