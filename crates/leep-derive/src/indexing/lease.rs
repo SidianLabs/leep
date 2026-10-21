@@ -447,15 +447,29 @@ impl ToolLease {
         let mut had_holder = false;
         for &g in groups {
             let key = LeaseKey::index(g.lease_name());
-            let before = meta.lease(&key, leases.cfg.timing()).await?;
+            let before = match meta.lease(&key, leases.cfg.timing()).await {
+                Ok(l) => l,
+                Err(e) => {
+                    leases.shutdown().await;
+                    return Err(e);
+                }
+            };
             had_holder |= before.is_some();
             if leases.claim(g).await {
                 held.push(g);
                 continue;
             }
-            let current = meta.lease(&key, leases.cfg.timing()).await?;
+            let current = match meta.lease(&key, leases.cfg.timing()).await {
+                Ok(l) => l,
+                Err(e) => {
+                    leases.shutdown().await;
+                    return Err(e);
+                }
+            };
             match current.filter(Lease::is_live) {
                 Some(l) if !ignore_live => {
+                    // Give back what this call took before refusing.
+                    leases.shutdown().await;
                     return Err(Error::Invalid(format!(
                         "the {} index lease is held by {} ({}); stop it, switch it to \
                          `--indexing off`, or pass --ignore-lease to work beside it",
@@ -474,6 +488,7 @@ impl ToolLease {
                     l.holder
                 )),
                 None => {
+                    leases.shutdown().await;
                     return Err(Error::Storage(format!(
                         "could not take the {} index lease",
                         g.lease_name()
@@ -499,6 +514,7 @@ impl ToolLease {
             tokio::time::sleep(fence).await;
             for &g in &tool.groups {
                 if !tool.leases.check(g).await {
+                    tool.leases.shutdown().await;
                     return Err(Error::Storage(format!(
                         "lost the {} index lease while waiting the fence",
                         g.lease_name()

@@ -584,12 +584,18 @@ async fn inner(meta: &str, blobs: &str, args: UpgradeIndexArgs) -> anyhow::Resul
              free space, use --drop-first, or pass --skip-space-check"
         );
     }
+    if args.fence.ignore_lease && args.drop_first {
+        anyhow::bail!(
+            "--ignore-lease is not allowed with --drop-first: dropping rows while a server \
+             derives them can leave rows whose parents' rows are gone"
+        );
+    }
     // The indexes it derives are what their lease holders derive (ADR
     // 0058): hold those leases while it runs.
     let lease =
         crate::repair::fence_indexes(&repo, &plan.to_derive(), &args.fence, "upgrade-index")
             .await?;
-    let result = run_plan(meta, &repo, &plan, &args, jobs).await;
+    let result = run_plan(meta, &repo, &plan, &args, jobs, lease.as_ref()).await;
     crate::repair::release_fence(lease, "upgrade-index").await;
     let (dropped_first, vacuumed, report) = result?;
     let code = if report.after.to_derive().is_empty() {
@@ -629,6 +635,7 @@ async fn run_plan(
     plan: &leep_derive::integrity::UpgradePlan,
     args: &UpgradeIndexArgs,
     jobs: usize,
+    lease: Option<&leep_derive::indexing::ToolLease>,
 ) -> anyhow::Result<(
     Option<leep_derive::integrity::DropReport>,
     bool,
@@ -638,6 +645,11 @@ async fn run_plan(
     let mut dropped_first = None;
     let mut vacuumed = false;
     if args.drop_retired && args.drop_first && !plan.to_drop().is_empty() {
+        if let Some(l) = lease {
+            if !l.still_held().await {
+                anyhow::bail!("lost the index lease before dropping; nothing was deleted");
+            }
+        }
         dropped_first = Some(integrity::drop_kinds(&repo, &plan.to_drop(), false, &Stderr).await?);
         if args.vacuum {
             vacuumed |= leep_meta::space::vacuum_analyze_derived(meta).await?;

@@ -26,7 +26,9 @@ use serde::Serialize;
 #[derive(Args, Clone)]
 pub struct IndexFenceArgs {
     /// Go ahead although a server holds the lease of an index this touches
-    /// (duplicate work, correct rows). Without it the tool refuses.
+    /// (duplicate work, correct rows). Without it the tool refuses. Not
+    /// allowed with `repair drop` or `upgrade-index --drop-first`: a drop
+    /// beside a deriving server is the race the lease and fence prevent.
     #[arg(long)]
     pub ignore_lease: bool,
     /// After taking the index leases, wait this long before touching rows,
@@ -519,11 +521,24 @@ async fn repair_inner(meta: &str, blobs: &str, args: RepairArgs) -> anyhow::Resu
             let names: Vec<&str> = names.iter().map(String::as_str).collect();
             // A drop racing derivation could leave rows whose ancestors'
             // nodes are gone: hold the index leases, after the fence.
+            if fence.ignore_lease && !dry_run {
+                anyhow::bail!(
+                    "--ignore-lease is not allowed with repair drop: dropping rows while a \
+                     server derives them can leave rows whose parents' rows are gone; stop the \
+                     server or switch it to --indexing off"
+                );
+            }
             let lease = if dry_run {
                 None
             } else {
                 fence_indexes(&repo, &names, &fence, "repair drop").await?
             };
+            if let Some(l) = &lease {
+                if !l.still_held().await {
+                    release_fence(lease, "repair drop").await;
+                    anyhow::bail!("lost the index lease before dropping; nothing was deleted");
+                }
+            }
             let report = integrity::drop_kinds(&repo, &names, dry_run, &Stderr).await;
             release_fence(lease, "repair drop").await;
             let report = report?;
