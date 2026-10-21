@@ -84,7 +84,10 @@ fn is_postgres(url: &str) -> bool {
     url.starts_with("postgres://") || url.starts_with("postgresql://")
 }
 
-type Pair = (Vec<u8>, Vec<u8>);
+/// `changesets`: id, data, stored_at (ADR 0059). A row from before
+/// migration 0007 is read with the migration's `applied_at`, so its age
+/// survives a restore, whose own migrations run at another time.
+type ChangesetRow = (Vec<u8>, Vec<u8>, Option<i64>);
 type DerivedRow = (String, Vec<u8>, Vec<u8>);
 /// `changeset_dicts`: id, created_at, data.
 type DictRow = (i64, i64, Vec<u8>);
@@ -108,7 +111,7 @@ type SnapLogRow = (
 #[async_trait]
 trait Source: Send {
     async fn schema_version(&mut self) -> Result<u64>;
-    async fn changesets(&mut self, after: &[u8], limit: usize) -> Result<Vec<Pair>>;
+    async fn changesets(&mut self, after: &[u8], limit: usize) -> Result<Vec<ChangesetRow>>;
     async fn changeset_dicts(&mut self) -> Result<Vec<DictRow>>;
     async fn store_features(&mut self) -> Result<Vec<FeatureRow>>;
     async fn refs(&mut self) -> Result<Vec<(String, Vec<u8>)>>;
@@ -123,7 +126,7 @@ trait Source: Send {
 trait Sink: Send {
     async fn is_empty(&mut self) -> Result<bool>;
     async fn clear(&mut self) -> Result<()>;
-    async fn put_changesets(&mut self, rows: &[Pair]) -> Result<()>;
+    async fn put_changesets(&mut self, rows: &[ChangesetRow]) -> Result<()>;
     async fn put_changeset_dicts(&mut self, rows: &[DictRow]) -> Result<()>;
     async fn put_store_features(&mut self, rows: &[FeatureRow]) -> Result<()>;
     async fn put_refs(&mut self, rows: &[(String, Vec<u8>)]) -> Result<()>;
@@ -467,14 +470,21 @@ impl Source for SqliteSource {
             .map_err(storage)
     }
 
-    async fn changesets(&mut self, after: &[u8], limit: usize) -> Result<Vec<Pair>> {
-        let rows = sqlx::query("SELECT id, data FROM changesets WHERE id > ? ORDER BY id LIMIT ?")
-            .bind(after)
-            .bind(limit as i64)
-            .fetch_all(&mut *self.0)
-            .await
-            .map_err(storage)?;
-        Ok(rows.into_iter().map(|r| (r.get(0), r.get(1))).collect())
+    async fn changesets(&mut self, after: &[u8], limit: usize) -> Result<Vec<ChangesetRow>> {
+        let rows = sqlx::query(
+            "SELECT id, data, COALESCE(stored_at, (SELECT applied_at FROM schema_migrations \
+             WHERE version = ?)) FROM changesets WHERE id > ? ORDER BY id LIMIT ?",
+        )
+        .bind(crate::STORED_AT_SCHEMA_VERSION)
+        .bind(after)
+        .bind(limit as i64)
+        .fetch_all(&mut *self.0)
+        .await
+        .map_err(storage)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.get(0), r.get(1), r.get(2)))
+            .collect())
     }
 
     async fn refs(&mut self) -> Result<Vec<(String, Vec<u8>)>> {
@@ -601,10 +611,10 @@ impl Sink for SqliteSink {
         Ok(())
     }
 
-    async fn put_changesets(&mut self, rows: &[Pair]) -> Result<()> {
-        let mut q = QueryBuilder::<Sqlite>::new("INSERT INTO changesets (id, data) ");
-        q.push_values(rows, |mut b, (id, data)| {
-            b.push_bind(id).push_bind(data);
+    async fn put_changesets(&mut self, rows: &[ChangesetRow]) -> Result<()> {
+        let mut q = QueryBuilder::<Sqlite>::new("INSERT INTO changesets (id, data, stored_at) ");
+        q.push_values(rows, |mut b, (id, data, at)| {
+            b.push_bind(id).push_bind(data).push_bind(at);
         });
         q.build().execute(&mut *self.0).await.map_err(storage)?;
         Ok(())
@@ -715,15 +725,21 @@ impl Source for PgSource {
             .map_err(storage)
     }
 
-    async fn changesets(&mut self, after: &[u8], limit: usize) -> Result<Vec<Pair>> {
-        let rows =
-            sqlx::query("SELECT id, data FROM changesets WHERE id > $1 ORDER BY id LIMIT $2")
-                .bind(after)
-                .bind(limit as i64)
-                .fetch_all(&mut *self.0)
-                .await
-                .map_err(storage)?;
-        Ok(rows.into_iter().map(|r| (r.get(0), r.get(1))).collect())
+    async fn changesets(&mut self, after: &[u8], limit: usize) -> Result<Vec<ChangesetRow>> {
+        let rows = sqlx::query(
+            "SELECT id, data, COALESCE(stored_at, (SELECT applied_at FROM schema_migrations \
+             WHERE version = $3)) FROM changesets WHERE id > $1 ORDER BY id LIMIT $2",
+        )
+        .bind(after)
+        .bind(limit as i64)
+        .bind(crate::STORED_AT_SCHEMA_VERSION)
+        .fetch_all(&mut *self.0)
+        .await
+        .map_err(storage)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.get(0), r.get(1), r.get(2)))
+            .collect())
     }
 
     async fn refs(&mut self) -> Result<Vec<(String, Vec<u8>)>> {
@@ -863,10 +879,10 @@ impl Sink for PgSink {
         Ok(())
     }
 
-    async fn put_changesets(&mut self, rows: &[Pair]) -> Result<()> {
-        let mut q = QueryBuilder::<Postgres>::new("INSERT INTO changesets (id, data) ");
-        q.push_values(rows, |mut b, (id, data)| {
-            b.push_bind(id).push_bind(data);
+    async fn put_changesets(&mut self, rows: &[ChangesetRow]) -> Result<()> {
+        let mut q = QueryBuilder::<Postgres>::new("INSERT INTO changesets (id, data, stored_at) ");
+        q.push_values(rows, |mut b, (id, data, at)| {
+            b.push_bind(id).push_bind(data).push_bind(at);
         });
         q.build().execute(&mut *self.0).await.map_err(storage)?;
         Ok(())

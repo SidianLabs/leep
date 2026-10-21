@@ -11,6 +11,8 @@
 mod ancestry;
 mod batched_reads;
 mod blame;
+pub mod changeset_gc;
+pub mod changeset_reach;
 mod comments;
 mod cursor;
 pub mod derived;

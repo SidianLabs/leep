@@ -6,8 +6,9 @@
 //! roots are ADR 0059's (refs, every ref log entry, scan windows,
 //! attestations, mirror maps, grace; land ids are not roots), and a second
 //! policy keeps the ref log only for a retention, to size the follow-up ADR
-//! on ref log retention. Changeset age is the client's `timestamp`, since
-//! the design's `stored_at` does not exist yet.
+//! on ref log retention. Changeset age is when the store first stored it
+//! (`stored_at`, migration 0007), never the client's `timestamp`; rows from
+//! before that migration count as stored when it was applied.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::Duration;
@@ -230,9 +231,13 @@ async fn load_graph(repo: &Repo) -> Result<(Graph, u64)> {
     let mut missing = 0u64;
     for chunk in (0..n).step_by(PAGE) {
         let ids = &g.ids[chunk..(chunk + PAGE).min(n)];
-        let found = repo.meta().get_changesets(ids).await?;
+        let (found, stored_at) = tokio::join!(
+            repo.meta().get_changesets(ids),
+            repo.meta().changesets_stored_at(ids)
+        );
+        let (found, stored_at) = (found?, stored_at?);
         let mut rows: Vec<(Vec<u32>, i64, u32, bool)> = Vec::with_capacity(ids.len());
-        for cs in found {
+        for (cs, at) in found.into_iter().zip(stored_at) {
             let Some(cs) = cs else {
                 rows.push((Vec::new(), i64::MIN, 0, false));
                 continue;
@@ -248,12 +253,9 @@ async fn load_graph(repo: &Repo) -> Result<(Graph, u64)> {
                 }
             }
             let bytes = u32::try_from(cs.encode().len()).unwrap_or(u32::MAX);
-            rows.push((
-                ps,
-                cs.timestamp,
-                bytes,
-                cs.extra.contains_key(EXTRA_SNAPSHOT),
-            ));
+            // Listed, so stored; a time it cannot tell counts as now.
+            let at = at.map_or(i64::MAX, |t| i64::try_from(t).unwrap_or(i64::MAX));
+            rows.push((ps, at, bytes, cs.extra.contains_key(EXTRA_SNAPSHOT)));
         }
         for (ps, time, bytes, snap) in rows {
             g.first_parent.push(ps.first().copied().unwrap_or(NONE));
@@ -796,9 +798,10 @@ mod tests {
     use leep_core::api::LandResponse;
     use leep_core::RefUpdateContext;
 
+    /// Ten days after the changesets of a test were stored.
     fn opts() -> UnreachableOptions {
         UnreachableOptions {
-            now: 10 * 86_400,
+            now: leep_core::store::unix_now() + 10 * 86_400,
             grace: Duration::from_secs(86_400),
             ref_log_retention: Duration::from_secs(86_400),
             exact_trees: true,
@@ -911,7 +914,11 @@ mod tests {
 
     #[tokio::test]
     async fn grace_keeps_young_changesets_and_their_ancestry() {
-        let r = repo();
+        let meta = std::sync::Arc::new(leep_core::memory::MemoryMetaStore::new());
+        let r = Repo::new(
+            std::sync::Arc::new(leep_core::memory::MemoryBlobStore::new()),
+            meta.clone(),
+        );
         let base = commit(&r, &[], &[("f", Some("0"))], "base").await;
         r.meta()
             .cas_ref_logged("main", None, Some(base), &RefUpdateContext::new("cas"))
@@ -921,11 +928,14 @@ mod tests {
         // A young child keeps its old parent.
         let mut cs = r.get_changeset(old).await.unwrap();
         cs.parents = vec![old];
-        cs.timestamp = opts().now;
+        // The client's clock says long ago; only the store's counts.
+        cs.timestamp = 0;
         cs.message = "young".into();
         cs.changes.clear();
-        r.create_changeset(cs).await.unwrap();
-        let rep = report(&r, &opts()).await.unwrap();
+        let young = r.create_changeset(cs).await.unwrap();
+        let o = opts();
+        assert!(meta.set_stored_at(&young, o.now as u64 - 5));
+        let rep = report(&r, &o).await.unwrap();
         assert_eq!(rep.log_kept.unreachable, 2);
         // One a few seconds old, one about ten days old.
         assert_eq!(rep.log_kept.by_age, [1, 0, 1, 0]);

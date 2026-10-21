@@ -7,6 +7,25 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 ## [Unreleased]
 
+### Changeset garbage collection, phase 1 (ADR 0059)
+- Migration 0007 adds `changesets.stored_at`, the unix time a changeset was
+  first stored, written by every new changeset. A catalog-only `ADD COLUMN`
+  on Postgres and SQLite that tolerates servers of the previous version;
+  older rows read as stored when the migration ran. Backups carry it.
+- Servers now rescue changesets a changeset sweep has condemned before
+  storing anything that names them (children, lands, rebases, merges, ref
+  moves including `leep undo`, signatures, reviews, `leep-git export` mirror
+  maps). Nothing condemns yet; while no sweep runs this costs one cached
+  read every 10 s per server. `GET /v1/ready` lists `changeset-rescue`.
+- A land batch reads the sweep's flag on every attempt and gives up with a
+  retryable 409 after 60 s instead of retrying up to 32 times without a
+  time bound (`leep_land_batch_deadline_total`).
+- A keyed land retry whose changeset is no longer stored is answered from
+  its land id record instead of 404
+  (`leep_land_answered_from_record_total`).
+- `gc --unreachable --dry-run` ages changesets by `stored_at` instead of
+  the client's timestamp, and needs schema v7.
+
 ### One indexer per index group (ADR 0058)
 - `leep-server --indexing local|lease|off` (default `local`, unchanged). In
   `lease` mode each index group (path history, log filter, code search) is

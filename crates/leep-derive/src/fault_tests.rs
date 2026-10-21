@@ -519,11 +519,12 @@ async fn a_land_sent_twice_through_two_servers_lands_once() {
             .unwrap();
         let id = LandId::from_bytes(&[7; 16]).unwrap();
         let calls = w.plan.calls(Op::CasRef);
-        // Hold one path's commit until the other has landed.
+        // Hold one path's commit until the other has landed, within the
+        // batch's lifetime (a batch past it answers retryably).
         w.plan.script(
             Op::CasRef,
             calls + delayed,
-            Fault::Delay(Duration::from_secs(120)),
+            Fault::Delay(Duration::from_secs(45)),
         );
 
         let (leader, follower) = (w.server(), w.server());
@@ -2075,5 +2076,506 @@ async fn a_fence_holds_a_drop_back_until_a_paused_holder_write_lands() {
         } else {
             assert_eq!(left.len(), 0, "the late write landed before the drop");
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Changeset garbage collection, the writers' side (ADR 0059, phase 1)
+
+/// Faults on every call for the servers of the changeset GC tests: failures
+/// before and after writes apply, and failed and slow reads.
+fn rescue_faults(plan: &FaultPlan) {
+    plan.jitter(2)
+        .rate(Op::WRITES, 60, Fault::FailAfter)
+        .rate(Op::WRITES, 60, Fault::Fail)
+        .rate(Op::META, 40, Fault::Fail)
+        .rate(Op::BLOB, 20, Fault::Fail)
+        .rate(Op::META, 20, Fault::Delay(Duration::from_millis(5)));
+}
+
+/// `ids` are all rescued (not condemned any more) and readable.
+async fn assert_rescued(seed: u64, w: &World, ids: &[ChangesetId]) {
+    for id in ids {
+        assert!(
+            !crate::changeset_gc::is_condemned_for_test(&w.clean, *id).await,
+            "seed {seed}: {id} is still condemned"
+        );
+        w.clean.get_changeset(*id).await.unwrap();
+    }
+}
+
+/// A chain `base <- a <- b` with `main` at `base`, and `a` and `b`
+/// condemned, as a sweep finds an abandoned stack.
+async fn condemned_stack(seed: u64, w: &World) -> (ChangesetId, ChangesetId, ChangesetId) {
+    let base = commit_file(seed, &w.clean, None, "base.txt", "base\n", "base").await;
+    w.meta.cas_ref("main", None, Some(base)).await.unwrap();
+    let a = commit_file(seed, &w.clean, Some(base), "s/a.txt", "a\n", "a").await;
+    let b = commit_file(seed, &w.clean, Some(a), "s/b.txt", "b\n", "b").await;
+    crate::changeset_gc::condemn_for_test(&w.clean, &[a, b], 1_000).await;
+    (base, a, b)
+}
+
+/// A changeset created on a condemned parent rescues the parent and its
+/// condemned ancestors before it reads them, and only those; with a delete
+/// of the parent announced, the create waits and then answers 409, and goes
+/// through once collect abandons the delete.
+#[tokio::test(start_paused = true)]
+async fn create_on_condemned_parent_rescues_its_ancestry() {
+    use crate::gc::Doom;
+    for seed in seeds() {
+        let w = World::new(seed);
+        let (base, a, b) = condemned_stack(seed, &w).await;
+        let unrelated = commit_file(seed, &w.clean, Some(base), "u.txt", "u\n", "u").await;
+        crate::changeset_gc::condemn_for_test(&w.clean, &[unrelated], 1_000).await;
+        rescue_faults(&w.plan);
+        let server = w.server();
+        let child = commit_file(seed, &server, Some(b), "s/c.txt", "c\n", "c").await;
+        w.plan.pause();
+        assert_rescued(seed, &w, &[a, b, child]).await;
+        assert!(
+            crate::changeset_gc::is_condemned_for_test(&w.clean, unrelated).await,
+            "seed {seed}: a changeset off the child's ancestry was rescued"
+        );
+        for id in [a, b] {
+            let row = w
+                .meta
+                .get_derived(crate::changeset_gc::CS_RESCUE, &id.0)
+                .await
+                .unwrap();
+            assert_eq!(
+                row.as_deref(),
+                Some(&1_000i64.to_be_bytes()[..]),
+                "seed {seed}: the rescue names the condemnation it answers"
+            );
+        }
+    }
+
+    let w = World::new(1);
+    let (_, _, b) = condemned_stack(1, &w).await;
+    crate::changeset_gc::doom_for_test(&w.clean, b, Doom::Deleting).await;
+    let server = w.server();
+    let data = Bytes::from_static(b"c\n");
+    let content = server.put_blob(data.clone()).await.unwrap();
+    let cs = Changeset {
+        parents: vec![b],
+        author: "agent".into(),
+        timestamp: 7,
+        message: "c".into(),
+        changes: BTreeMap::from([(
+            rp("s/c.txt"),
+            FileChange::Modify {
+                content,
+                kind: FileKind::Regular,
+                size: 2,
+            },
+        )]),
+        extra: BTreeMap::new(),
+    };
+    let started = tokio::time::Instant::now();
+    let err = server.create_changeset(cs.clone()).await.unwrap_err();
+    assert!(matches!(err, Error::Conflict(_)), "{err}");
+    assert!(started.elapsed() >= Duration::from_secs(30), "waited first");
+    crate::changeset_gc::doom_for_test(&w.clean, b, Doom::Abandoned).await;
+    let id = server.create_changeset(cs).await.unwrap();
+    assert_rescued(1, &w, &[b, id]).await;
+}
+
+/// Landing a condemned changeset, rebased or fast-forwarded, rescues it
+/// and its whole unlanded stack before the ref moves.
+#[tokio::test(start_paused = true)]
+async fn land_of_condemned_original_is_rescued() {
+    for seed in seeds() {
+        for rebased in [false, true] {
+            let w = World::new(seed);
+            let (base, a, b) = condemned_stack(seed, &w).await;
+            if rebased {
+                let other = commit_file(seed, &w.clean, Some(base), "o.txt", "o\n", "o").await;
+                w.meta
+                    .cas_ref("main", Some(base), Some(other))
+                    .await
+                    .unwrap();
+            }
+            rescue_faults(&w.plan);
+            let server = w.server();
+            let id = LandId::from_bytes(&[seed as u8; 16]).unwrap();
+            let landed = retry(seed, "land", || {
+                server.land_keyed(b, "main", None, true, Some(id.clone()))
+            })
+            .await;
+            w.plan.pause();
+            let LandResponse::Landed {
+                landed, rebased: r, ..
+            } = landed
+            else {
+                panic!("seed {seed}: {landed:?}");
+            };
+            assert_eq!(r, rebased, "seed {seed}");
+            assert_eq!(w.meta.get_ref("main").await.unwrap(), Some(landed));
+            assert_rescued(seed, &w, &[a, b]).await;
+            let ids = assert_ref_sound(seed, &w.clean, "main").await;
+            assert_eq!(ids.len(), if rebased { 4 } else { 3 }, "seed {seed}");
+            assert_ref_log_replays(seed, &*w.meta).await;
+        }
+    }
+}
+
+/// A keyed land retried after its original was reclaimed (ADR 0059 section
+/// 5) is answered from its record and moves nothing; an id that never
+/// landed, or a retry without an id, finds nothing to land (404), and an id
+/// recorded for another changeset is refused (400).
+#[tokio::test(start_paused = true)]
+async fn keyed_retry_of_reclaimed_original_is_answered_from_its_record() {
+    for seed in seeds() {
+        let w = World::new(seed);
+        let clean = &w.clean;
+        let base = commit_file(seed, clean, None, "base.txt", "base\n", "base").await;
+        w.meta.cas_ref("main", None, Some(base)).await.unwrap();
+        let feature = commit_file(seed, clean, Some(base), "f.txt", "f\n", "feature").await;
+        let other = commit_file(seed, clean, Some(base), "o.txt", "o\n", "other").await;
+        w.meta
+            .cas_ref("main", Some(base), Some(other))
+            .await
+            .unwrap();
+        let id = LandId::from_bytes(&[seed as u8; 16]).unwrap();
+        let first = clean
+            .land_keyed(feature, "main", None, true, Some(id.clone()))
+            .await
+            .unwrap();
+        let LandResponse::Landed { landed: copy, .. } = first else {
+            panic!("{first:?}");
+        };
+        assert_ne!(copy, feature, "rebased");
+        land_others(&w, 3).await;
+        // A sweep reclaims the original once the copy is past its scan
+        // window; here it is simply gone.
+        assert!(w.meta.remove_changeset(&feature));
+        let head = w.meta.get_ref("main").await.unwrap();
+        let entries = w.meta.ref_log(None, None, usize::MAX).await.unwrap().len();
+
+        rescue_faults(&w.plan);
+        let server = w.server();
+        let again = retry(seed, "retry", || {
+            server.land_keyed(feature, "main", None, true, Some(id.clone()))
+        })
+        .await;
+        assert_eq!(
+            again,
+            LandResponse::Landed {
+                landed: copy,
+                rebased: true,
+                attempts: 1
+            },
+            "seed {seed}"
+        );
+        let refused = |what: &str, r: Result<LandResponse>, want: fn(&Error) -> bool| match r {
+            Err(e) if want(&e) => {}
+            other => panic!("seed {seed}: {what}: {other:?}"),
+        };
+        // 20 bytes: no seed's 16-byte id.
+        let unknown = LandId::from_bytes(&[0xEE; 20]).unwrap();
+        let not_found = |e: &Error| matches!(e, Error::NotFound(_));
+        let invalid = |e: &Error| matches!(e, Error::Invalid(_));
+        loop {
+            match server
+                .land_keyed(feature, "main", None, true, Some(unknown.clone()))
+                .await
+            {
+                Err(e) if is_injected(&e) => continue,
+                r => {
+                    refused("an id never recorded", r, not_found);
+                    break;
+                }
+            }
+        }
+        loop {
+            match server.land(feature, "main").await {
+                Err(e) if is_injected(&e) => continue,
+                r => {
+                    refused("no id", r, not_found);
+                    break;
+                }
+            }
+        }
+        // The same id, asked for a changeset that is gone too.
+        let gone = commit_file(seed, clean, Some(base), "g.txt", "g\n", "gone").await;
+        assert!(w.meta.remove_changeset(&gone));
+        loop {
+            match server
+                .land_keyed(gone, "main", None, true, Some(id.clone()))
+                .await
+            {
+                Err(e) if is_injected(&e) => continue,
+                r => {
+                    refused("the id of another land", r, invalid);
+                    break;
+                }
+            }
+        }
+        w.plan.pause();
+        assert_eq!(w.meta.get_ref("main").await.unwrap(), head, "seed {seed}");
+        assert_eq!(
+            w.meta.ref_log(None, None, usize::MAX).await.unwrap().len(),
+            entries,
+            "seed {seed}: nothing moved"
+        );
+    }
+}
+
+/// Every way of moving a ref to a condemned changeset rescues it first:
+/// creating a ref at it, and moving one back to it as `leep undo` does.
+#[tokio::test(start_paused = true)]
+async fn ref_move_to_condemned_changeset_rescues() {
+    for seed in seeds() {
+        let w = World::new(seed);
+        let (base, a, b) = condemned_stack(seed, &w).await;
+        rescue_faults(&w.plan);
+        let server = w.server();
+        let ctx = leep_core::RefUpdateContext::new("cas");
+        let moved = retry(seed, "create ref", || {
+            server.cas_ref_checked("feature", None, Some(b), &ctx)
+        })
+        .await;
+        // A retry after an applied-then-failed swap loses to its own move.
+        assert!(moved || w.meta.get_ref("feature").await.unwrap() == Some(b));
+        w.plan.pause();
+        assert_rescued(seed, &w, &[a, b]).await;
+
+        // Undo: `main` moved off `base`, which a sweep then condemned (it
+        // stays a log root in the real sweep; the rescue is what matters).
+        w.plan.clear();
+        let next = commit_file(seed, &w.clean, Some(base), "n.txt", "n\n", "n").await;
+        w.meta
+            .cas_ref("main", Some(base), Some(next))
+            .await
+            .unwrap();
+        crate::changeset_gc::condemn_for_test(&w.clean, &[base], 2_000).await;
+        rescue_faults(&w.plan);
+        w.plan.resume();
+        let server = w.server();
+        let undo = leep_core::RefUpdateContext::new("undo");
+        let (meta, srv, undo) = (&w.meta, &server, &undo);
+        retry(seed, "undo", move || async move {
+            match meta.get_ref("main").await? {
+                Some(h) if h == base => Ok(true),
+                cur => srv.cas_ref_checked("main", cur, Some(base), undo).await,
+            }
+        })
+        .await;
+        w.plan.pause();
+        assert_rescued(seed, &w, &[base]).await;
+        assert_ref_log_replays(seed, &*w.meta).await;
+    }
+}
+
+/// The client's request is cancelled after its batch's first attempt, a
+/// sweep condemns the land's stack, and the batch commits on a later
+/// attempt: the attempt's own fence read, not the request's, rescues it.
+#[tokio::test(start_paused = true)]
+async fn cancelled_land_whose_batch_commits_later_is_fenced() {
+    let w = World::new(5);
+    let clean = &w.clean;
+    let base = commit_file(5, clean, None, "base.txt", "base\n", "base").await;
+    w.meta.cas_ref("main", None, Some(base)).await.unwrap();
+    let a = commit_file(5, clean, Some(base), "s/a.txt", "a\n", "a").await;
+    let b = commit_file(5, clean, Some(a), "s/b.txt", "b\n", "b").await;
+    let server = w.server();
+    // The request reads the flag (down) and caches it, as a request does.
+    assert!(!server.changeset_fence_active(false).await.unwrap());
+    // The first attempt's swap is held, and loses to another writer.
+    let calls = w.plan.calls(Op::CasRef);
+    w.plan
+        .script(Op::CasRef, calls + 1, Fault::Delay(Duration::from_secs(5)));
+    let land = {
+        let server = server.clone();
+        tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(1), server.land(b, "main")).await
+        })
+    };
+    while w.plan.calls(Op::CasRef) == calls {
+        tokio::task::yield_now().await;
+    }
+    assert!(land.await.unwrap().is_err(), "the client gave up");
+    let other = commit_file(5, clean, Some(base), "o.txt", "o\n", "other").await;
+    w.meta
+        .cas_ref("main", Some(base), Some(other))
+        .await
+        .unwrap();
+    crate::changeset_gc::condemn_for_test(clean, &[a, b], 3_000).await;
+    // The batch goes on: its next attempt rescues, then lands.
+    let landed = loop {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let head = w.meta.get_ref("main").await.unwrap().unwrap();
+        if head != other {
+            break head;
+        }
+    };
+    assert_eq!(
+        clean.rebased_origin(landed).await.unwrap(),
+        Some(b),
+        "the batch landed the cancelled land"
+    );
+    assert_rescued(5, &w, &[a, b]).await;
+    assert_eq!(assert_ref_sound(5, clean, "main").await.len(), 4);
+    assert_ref_log_replays(5, &*w.meta).await;
+}
+
+/// A batch still trying past `MAX_BATCH_LIFETIME` answers its lands with a
+/// retryable conflict and moves nothing; the keyed resend lands once.
+#[tokio::test(start_paused = true)]
+async fn batch_past_its_deadline_answers_retryably() {
+    let w = World::new(6);
+    let clean = &w.clean;
+    let base = commit_file(6, clean, None, "base.txt", "base\n", "base").await;
+    w.meta.cas_ref("main", None, Some(base)).await.unwrap();
+    let feature = commit_file(6, clean, Some(base), "f.txt", "f\n", "feature").await;
+    let server = w.server();
+    let id = LandId::from_bytes(&[6; 16]).unwrap();
+    // The first attempt's swap is held past the lifetime and loses.
+    let calls = w.plan.calls(Op::CasRef);
+    w.plan.script(
+        Op::CasRef,
+        calls + 1,
+        Fault::Delay(crate::land::MAX_BATCH_LIFETIME + Duration::from_secs(1)),
+    );
+    let land = {
+        let (server, id) = (server.clone(), id.clone());
+        tokio::spawn(async move {
+            server
+                .land_keyed(feature, "main", None, true, Some(id))
+                .await
+        })
+    };
+    while w.plan.calls(Op::CasRef) == calls {
+        tokio::task::yield_now().await;
+    }
+    let other = commit_file(6, clean, Some(base), "o.txt", "o\n", "other").await;
+    w.meta
+        .cas_ref("main", Some(base), Some(other))
+        .await
+        .unwrap();
+    let err = land.await.unwrap().unwrap_err();
+    assert!(matches!(err, Error::Conflict(_)), "{err}");
+    assert!(err.to_string().contains("retry"), "{err}");
+    assert_eq!(w.meta.get_ref("main").await.unwrap(), Some(other));
+    // The resend, under the same id, lands once.
+    let again = server
+        .land_keyed(feature, "main", None, true, Some(id.clone()))
+        .await
+        .unwrap();
+    let LandResponse::Landed { landed, .. } = again else {
+        panic!("{again:?}");
+    };
+    let resent = server
+        .land_keyed(feature, "main", None, true, Some(id))
+        .await
+        .unwrap();
+    assert!(matches!(resent, LandResponse::Landed { landed: l, .. } if l == landed));
+    assert_eq!(assert_ref_sound(6, clean, "main").await.len(), 3);
+    assert_ref_log_replays(6, &*w.meta).await;
+}
+
+/// A store whose history keeps changing (commits, keyed and unkeyed lands,
+/// branches made and deleted, changesets ageing past grace and young again),
+/// marked by runs that fail and are killed at random points: the rows only
+/// ever claim closures that are stored, and every completed run, and a full
+/// one, finds exactly what reachability from scratch finds.
+async fn reach_under_faults(seed: u64) {
+    use crate::changeset_reach::{check_reach_rows, mark, unreachable_oracle, ReachOptions};
+    let w = World::new(seed);
+    let clean = &w.clean;
+    let base = commit_file(seed, clean, None, "base.txt", "base\n", "base").await;
+    w.meta.cas_ref("main", None, Some(base)).await.unwrap();
+    let opts = ReachOptions {
+        now: leep_core::store::unix_now() + 30 * 86_400,
+        grace: Duration::from_secs(7 * 86_400),
+        full: false,
+    };
+    let plan = FaultPlan::new(seed ^ 59);
+    plan.jitter(2)
+        .rate(&[Op::PutDerived], 40, Fault::FailAfter)
+        .rate(&[Op::PutDerived], 40, Fault::Fail)
+        .rate(Op::META, 15, Fault::Fail)
+        .rate(&[Op::GetDerived], 5, Fault::Corrupt);
+    let gc = w.server_with(&plan);
+    let mut rng = Rng::new(seed ^ 0x59);
+    let mut tips = vec![base];
+    let mut n = 0;
+    for round in 0..12 {
+        for _ in 0..1 + rng.below(4) {
+            n += 1;
+            let tip = tips[rng.below(tips.len())];
+            match rng.below(7) {
+                0..=2 => {
+                    let path = format!("r{round}/f{n}.txt");
+                    let c =
+                        commit_file(seed, clean, Some(tip), &path, "x\n", &format!("c{n}")).await;
+                    tips.push(c);
+                }
+                3 | 4 => {
+                    let id = (n % 2 == 0).then(|| LandId::from_bytes(&[n as u8; 16]).unwrap());
+                    match clean.land_keyed(tip, "main", None, true, id).await.unwrap() {
+                        LandResponse::Landed { landed, .. } => tips.push(landed),
+                        other => panic!("seed {seed}: {other:?}"),
+                    }
+                }
+                5 => {
+                    let name = format!("b{}", rng.below(3));
+                    let cur = w.meta.get_ref(&name).await.unwrap();
+                    let new = (cur.is_none() || rng.below(2) == 0).then_some(tip);
+                    w.meta.cas_ref(&name, cur, new).await.unwrap();
+                }
+                _ => {
+                    let at = if rng.below(2) == 0 {
+                        opts.now as u64
+                    } else {
+                        0
+                    };
+                    w.meta.set_stored_at(&tip, at);
+                }
+            }
+        }
+        let kill_after = if rng.below(3) == 0 {
+            usize::MAX
+        } else {
+            rng.below(60)
+        };
+        // Dying mid-run is the point; the result is not.
+        let _ = leep_testkit::cancel_after_polls(mark(&gc, &opts), kill_after).await;
+        if let Err(e) = check_reach_rows(clean).await {
+            panic!("seed {seed} round {round}: {e}");
+        }
+        if rng.below(2) == 0 {
+            let run = mark(clean, &opts).await.unwrap();
+            assert_eq!(
+                run.unreachable,
+                unreachable_oracle(clean, &opts).await,
+                "seed {seed} round {round}"
+            );
+        }
+    }
+    let want = unreachable_oracle(clean, &opts).await;
+    assert!(
+        !want.is_empty() || tips.len() < 4,
+        "seed {seed}: the history left nothing unreachable to check against"
+    );
+    let run = mark(clean, &opts).await.unwrap();
+    assert_eq!(run.unreachable, want, "seed {seed}: incremental");
+    let full = mark(
+        clean,
+        &ReachOptions {
+            full: true,
+            ..opts.clone()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(full.unreachable, want, "seed {seed}: full");
+    check_reach_rows(clean).await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn incremental_reach_rows_agree_with_full_reachability() {
+    for seed in seeds() {
+        reach_under_faults(seed).await;
     }
 }

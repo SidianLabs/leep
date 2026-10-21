@@ -11,6 +11,7 @@ use leep_core::{
     TreeNode,
 };
 
+use crate::changeset_gc::RescueBy;
 use crate::Repo;
 
 /// Result of merging `theirs` into `ours`: `changes` are relative to `ours`.
@@ -239,6 +240,8 @@ impl Repo {
     /// parents `[ours, theirs]`, or the list of conflicts.
     pub async fn merge(&self, req: MergeRequest) -> Result<MergeResponse> {
         let [ours, theirs] = req.parents;
+        self.rescue_changesets(&[ours, theirs], RescueBy::Create)
+            .await?;
         let base = self.merge_base(ours, theirs).await?;
         let m = self
             .merge_trees(
@@ -268,6 +271,9 @@ impl Repo {
 
     /// Replay `cs`'s changes (relative to its first parent) onto `onto`.
     pub async fn rebase(&self, cs: ChangesetId, onto: ChangesetId) -> Result<RebaseResponse> {
+        // The copy's link names `cs`, and its parent is `onto`.
+        self.rescue_changesets(&[cs, onto], RescueBy::Create)
+            .await?;
         let orig = self.get_changeset(cs).await?;
         if orig.parents.len() > 1 {
             return Err(Error::Invalid("cannot rebase a merge changeset".into()));

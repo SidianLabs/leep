@@ -122,6 +122,31 @@ fn to_hash(bytes: &[u8]) -> Result<leep_core::Hash> {
     Ok(leep_core::Hash(arr))
 }
 
+/// The migration that added `changesets.stored_at` (ADR 0059). Rows stored
+/// before it have none and read as stored when it was applied.
+pub const STORED_AT_SCHEMA_VERSION: i64 = 7;
+
+/// Unix seconds now, for `changesets.stored_at`.
+fn stored_now() -> i64 {
+    leep_core::store::unix_now()
+}
+
+/// Answer a batched store-time read in request order from `(id, stored_at)`
+/// rows.
+fn stored_at_in_order(
+    ids: &[leep_core::ChangesetId],
+    rows: impl Iterator<Item = (Vec<u8>, Option<i64>)>,
+) -> Result<Vec<Option<u64>>> {
+    let mut found = std::collections::HashMap::new();
+    for (id, at) in rows {
+        let at = at.ok_or_else(|| {
+            storage("changeset stored before migration 0007 and no applied_at for it")
+        })?;
+        found.insert(to_id(&id)?, u64::try_from(at).unwrap_or(0));
+    }
+    Ok(ids.iter().map(|id| found.get(id).copied()).collect())
+}
+
 /// Distinct keys per SQLite batched read: well below its bound-parameter
 /// limit (32,766 since 3.32, 999 before), with room for the other binds.
 const BATCH_PARAMS: usize = 500;

@@ -15,6 +15,7 @@ use leep_core::{
 };
 use tokio::sync::oneshot;
 
+use crate::changeset_gc::RescueBy;
 use crate::land_stage::Staging;
 use crate::Repo;
 
@@ -31,6 +32,22 @@ pub(crate) const LANDED_COPY_SCAN: usize = 1024;
 /// land) and how long a land waits behind replays of the lands queued before
 /// it; the next batch starts as soon as this one commits.
 pub(crate) const MAX_BATCH: usize = 64;
+/// How long a batch may keep trying, from its first attempt. A batch runs
+/// detached from the requests that asked for it, so this bounds how long
+/// after its last fence read it can still move a ref, which the changeset
+/// sweep's fence must outlast (ADR 0059 section 3). A batch past it answers
+/// its lands with a retryable error; keyed ones are then answered from their
+/// record, so none lands twice.
+pub(crate) const MAX_BATCH_LIFETIME: Duration = Duration::from_secs(60);
+
+/// The answer for the lands of a batch past [`MAX_BATCH_LIFETIME`].
+fn past_deadline(target_ref: &str) -> Error {
+    metrics::counter!("leep_land_batch_deadline_total").increment(1);
+    Error::Conflict(format!(
+        "land onto {target_ref:?} did not finish within {}s; retry",
+        MAX_BATCH_LIFETIME.as_secs()
+    ))
+}
 
 /// Full-jitter exponential backoff, so racing servers spread out instead of
 /// colliding again in lockstep.
@@ -210,6 +227,7 @@ fn recorded_step(
         ))));
     }
     metrics::counter!("leep_land_recorded_total").increment(1);
+    metrics::counter!("leep_land_answered_from_record_total", "original" => "present").increment(1);
     Some(Ok(Step::Done(LandResponse::Landed {
         landed: found.landed,
         rebased: found.landed != key.changeset,
@@ -426,7 +444,19 @@ impl Repo {
                 "cannot land onto {target_ref:?}: tags are immutable"
             )));
         }
-        self.get_changeset(cs).await?;
+        match self.get_changeset(cs).await {
+            Ok(_) => {}
+            // A keyed retry whose original was garbage collected (ADR 0059
+            // section 5): its record answers it. Present changesets, the
+            // usual case, read nothing more.
+            Err(Error::NotFound(m)) => {
+                return match self.answer_from_record(cs, target_ref, &ctx).await? {
+                    Some(answer) => Ok(Some(Ok(answer))),
+                    None => Err(Error::NotFound(m)),
+                }
+            }
+            Err(e) => return Err(e),
+        }
         let (reply, answer) = oneshot::channel();
         let queue = self.land_queues.queue(target_ref);
         let start_leader = {
@@ -459,6 +489,50 @@ impl Repo {
         Ok(Some(answer.result))
     }
 
+    /// The result recorded for `ctx`'s land id, for a land whose changeset
+    /// is not stored: `Ok(None)` without an id or a record, `Invalid` when
+    /// the id landed another changeset. Moves nothing.
+    async fn answer_from_record(
+        &self,
+        cs: ChangesetId,
+        target_ref: &str,
+        ctx: &RefUpdateContext,
+    ) -> Result<Option<LandResponse>> {
+        let Some(key) = &ctx.land else {
+            return Ok(None);
+        };
+        let found = self
+            .meta()
+            .find_lands(target_ref, std::slice::from_ref(&key.id))
+            .await?;
+        let Some(record) = found.into_iter().next().flatten() else {
+            return Ok(None);
+        };
+        if record.changeset != cs {
+            return Err(Error::Invalid(format!(
+                "land id {} already landed {}; use a new land id to land {cs}",
+                key.id, record.changeset
+            )));
+        }
+        metrics::counter!("leep_land_answered_from_record_total", "original" => "missing")
+            .increment(1);
+        Ok(Some(LandResponse::Landed {
+            landed: record.landed,
+            rebased: record.landed != cs,
+            attempts: 1,
+        }))
+    }
+
+    /// Before an attempt replays a land, while a changeset sweep may have
+    /// condemned something (ADR 0059): rescue the land's changeset and its
+    /// unlanded stack, which the move will make reachable. The fence state
+    /// of `cs` is read before anything else of it.
+    async fn rescue_land(&self, cs: ChangesetId, head: Option<ChangesetId>) -> Result<()> {
+        self.rescue_condemned(&[cs], RescueBy::Land).await?;
+        let stack = self.new_history(cs, head).await?;
+        self.rescue_condemned(&stack, RescueBy::Land).await
+    }
+
     /// Land a batch: replay each land onto the head the previous one left,
     /// then move the ref once. Lands answered before anything in the batch
     /// moved the ref are answered at once, as a lone land would be.
@@ -476,8 +550,10 @@ impl Repo {
             .collect();
         self.learn_ancestry(&lands.iter().map(|l| l.q.cs).collect::<Vec<_>>())
             .await;
+        let started = tokio::time::Instant::now();
         let mut commit_errors = 0;
         let mut lookup_errors = 0;
+        let mut fence_errors = 0;
         let mut last_error = None;
         // `rebased-origin-v1` rows read by earlier attempts of this batch,
         // stored ones only (see `Staging::retain_stored`). A stored
@@ -486,6 +562,12 @@ impl Repo {
         // head's new ancestors instead of scanning the whole stretch again.
         let mut carried: HashMap<ChangesetId, Option<ChangesetId>> = HashMap::new();
         for attempt in 1..=MAX_LAND_ATTEMPTS {
+            if started.elapsed() >= MAX_BATCH_LIFETIME {
+                for l in lands {
+                    l.answer(Err(past_deadline(target_ref)), attempt, false);
+                }
+                return;
+            }
             // A server that lost the ref's lease stops retrying: the lands
             // it was coordinating go back to be routed to the new holder.
             if let Some(coord) = &self.land_coordinator {
@@ -518,7 +600,10 @@ impl Repo {
             let staged = staging.repo(self);
             // Origins read by this attempt's landed-copy scans: the lands
             // of a batch walk the same stretch of history.
-            let (mut recorded, _, mut origins) = tokio::join!(
+            let (fenced, mut recorded, _, mut origins) = tokio::join!(
+                // Every attempt reads the sweep's flag afresh: the batch may
+                // outlive the requests that read it (ADR 0059).
+                self.changeset_fence_active(true),
                 // After the head: a land recorded since would have moved it,
                 // so the swap from `start` cannot repeat it.
                 self.recorded_lands(target_ref, &lands),
@@ -536,6 +621,26 @@ impl Repo {
                     origins
                 }
             );
+            // A failed flag read holds back the whole attempt, until it has
+            // failed as often as a commit may.
+            let fenced = match fenced {
+                Ok(f) => {
+                    fence_errors = 0;
+                    f
+                }
+                Err(e) => {
+                    fence_errors += 1;
+                    if fence_errors >= MAX_COMMIT_ERRORS {
+                        for l in lands {
+                            l.answer(Err(duplicate(&e)), attempt, false);
+                        }
+                        return;
+                    }
+                    carried = origins;
+                    tokio::time::sleep(backoff(attempt)).await;
+                    continue;
+                }
+            };
             // A failed land id lookup holds back only the lands with ids, to
             // the next attempt, until it has failed as often as a commit may.
             match &recorded {
@@ -559,6 +664,21 @@ impl Repo {
                 let repo = staging.repo(&l.q.repo);
                 let step = match recorded_step(&l.q, &recorded, attempt) {
                     Some(step) => step,
+                    None if fenced => match self.rescue_land(l.q.cs, start).await {
+                        Ok(()) => {
+                            repo.land_step(
+                                l.q.cs,
+                                l.q.create,
+                                head,
+                                target_ref,
+                                attempt,
+                                &mut l.checked,
+                                &mut origins,
+                            )
+                            .await
+                        }
+                        Err(e) => Err(e),
+                    },
                     None => {
                         repo.land_step(
                             l.q.cs,
@@ -612,6 +732,14 @@ impl Repo {
                 }
                 tokio::time::sleep(backoff(attempt)).await;
                 continue;
+            }
+            // The fence read of this attempt bounds how late its move may
+            // come; past the batch's lifetime it must not come at all.
+            if started.elapsed() >= MAX_BATCH_LIFETIME {
+                for l in waiting.into_iter().map(|(l, _)| l).chain(lands) {
+                    l.answer(Err(past_deadline(target_ref)), attempt, false);
+                }
+                return;
             }
             // Whether an error came from the swap itself.
             let applied = match staging.flush(self).await {
@@ -998,8 +1126,9 @@ impl Repo {
     ) -> Result<bool> {
         // Deletes skip the name check so a ref that predates the validator
         // can still be removed.
-        if new.is_some() {
+        if let Some(new) = new {
             refname::validate(name)?;
+            self.rescue_changesets(&[new], RescueBy::Ref).await?;
         }
         if refname::is_tag(name) && expected.is_some() && new.is_some() {
             return Err(Error::Invalid(format!(

@@ -465,8 +465,8 @@ nice -n 19 leep-server --meta-pool-size 4 \
   gc --dry-run --unreachable --grace 0 --ref-log-retention 0
 ```
 
-The `stored_at` column does not exist yet, so the dry run ages changesets
-by their `timestamp`, which is set by the client.
+Before phase 1 the dry run aged changesets by their `timestamp`, which is
+set by the client. Since phase 1 it ages them by `stored_at`.
 
 **Decision rule.** Build phase 2 if the reclaimable metadata exceeds about
 20% of the logical growth per land. Otherwise the effort goes first to the

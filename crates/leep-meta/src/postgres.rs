@@ -59,6 +59,12 @@ pub const MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/postgres/0006_leases.sql"),
         satisfied_by: &[],
     },
+    Migration {
+        version: 7,
+        name: "changeset_stored_at",
+        sql: include_str!("../migrations/postgres/0007_changeset_stored_at.sql"),
+        satisfied_by: &[],
+    },
 ];
 
 /// Every table a bulk load fills, for [`PostgresMetaStore::analyze`].
@@ -92,6 +98,8 @@ pub struct PostgresMetaStore {
     /// Whether the schema has `changeset_dicts`: tests open stores with
     /// shorter migration lists.
     pub(crate) has_dicts: bool,
+    /// Whether `changesets` has `stored_at` (ADR 0059).
+    pub(crate) has_stored_at: bool,
     /// Whether the schema has `store_features` (ADR 0055).
     pub(crate) has_features: bool,
 }
@@ -376,6 +384,9 @@ impl PostgresMetaStore {
             has_features: migrations
                 .iter()
                 .any(|m| m.version >= crate::features::FEATURES_SCHEMA_VERSION),
+            has_stored_at: migrations
+                .iter()
+                .any(|m| m.version >= crate::STORED_AT_SCHEMA_VERSION),
         }
     }
 
@@ -597,13 +608,46 @@ impl MetaStore for PostgresMetaStore {
     async fn put_changeset(&self, cs: &Changeset) -> Result<ChangesetId> {
         let id = cs.id();
         let data = self.encode(cs).await?;
-        sqlx::query("INSERT INTO changesets (id, data) VALUES ($1, $2) ON CONFLICT DO NOTHING")
+        let q = if self.has_stored_at {
+            sqlx::query(
+                "INSERT INTO changesets (id, data, stored_at) VALUES ($1, $2, $3) \
+                 ON CONFLICT DO NOTHING",
+            )
             .bind(id.0.as_bytes().as_slice())
             .bind(data)
-            .execute(&self.pool)
-            .await
-            .map_err(storage)?;
+            .bind(crate::stored_now())
+        } else {
+            sqlx::query("INSERT INTO changesets (id, data) VALUES ($1, $2) ON CONFLICT DO NOTHING")
+                .bind(id.0.as_bytes().as_slice())
+                .bind(data)
+        };
+        q.execute(&self.pool).await.map_err(storage)?;
         Ok(id)
+    }
+
+    /// One `= ANY($1)` query whatever the number of ids; rows from before
+    /// migration 0007 read as stored when it was applied.
+    async fn changesets_stored_at(&self, ids: &[ChangesetId]) -> Result<Vec<Option<u64>>> {
+        if !self.has_stored_at {
+            return Err(leep_core::Error::Invalid(
+                "the schema predates changesets.stored_at (v7); run `leep-server migrate` first"
+                    .into(),
+            ));
+        }
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let keys: Vec<&[u8]> = unique(ids.iter().map(|i| i.0.as_bytes().as_slice()));
+        let rows = sqlx::query(
+            "SELECT id, COALESCE(stored_at, (SELECT applied_at FROM schema_migrations \
+             WHERE version = $2)) FROM changesets WHERE id = ANY($1)",
+        )
+        .bind(keys)
+        .bind(crate::STORED_AT_SCHEMA_VERSION)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(storage)?;
+        crate::stored_at_in_order(ids, rows.iter().map(|r| (r.get(0), r.get(1))))
     }
 
     async fn get_changeset(&self, id: &ChangesetId) -> Result<Option<Changeset>> {
@@ -1103,21 +1147,28 @@ impl MetaStore for PostgresMetaStore {
         let id = cs.id();
         let data = self.encode(cs).await?;
         let (kinds, keys, values) = derived_columns(rows);
-        sqlx::query(
-            "WITH c AS (INSERT INTO changesets (id, data) VALUES ($1, $2) ON CONFLICT DO NOTHING) \
+        let insert = if self.has_stored_at {
+            "INSERT INTO changesets (id, data, stored_at) VALUES ($1, $2, $6)"
+        } else {
+            "INSERT INTO changesets (id, data) VALUES ($1, $2)"
+        };
+        let sql = format!(
+            "WITH c AS ({insert} ON CONFLICT DO NOTHING) \
              INSERT INTO derived (kind, key, value) \
              SELECT * FROM UNNEST($3::text[], $4::bytea[], $5::bytea[]) ORDER BY 1, 2 \
              ON CONFLICT (kind, key) DO UPDATE SET value = excluded.value \
-             WHERE derived.value IS DISTINCT FROM excluded.value",
-        )
-        .bind(id.0.as_bytes().as_slice())
-        .bind(data)
-        .bind(kinds)
-        .bind(keys)
-        .bind(values)
-        .execute(&self.pool)
-        .await
-        .map_err(storage)?;
+             WHERE derived.value IS DISTINCT FROM excluded.value"
+        );
+        let mut q = sqlx::query(&sql)
+            .bind(id.0.as_bytes().as_slice())
+            .bind(data)
+            .bind(kinds)
+            .bind(keys)
+            .bind(values);
+        if self.has_stored_at {
+            q = q.bind(crate::stored_now());
+        }
+        q.execute(&self.pool).await.map_err(storage)?;
         Ok(id)
     }
 
@@ -1141,22 +1192,30 @@ impl MetaStore for PostgresMetaStore {
             .collect();
         let data: Vec<&[u8]> = encoded.iter().map(|(_, d)| d.as_slice()).collect();
         let (kinds, keys, values) = derived_columns(rows);
-        sqlx::query(
-            "WITH c AS (INSERT INTO changesets (id, data) \
-             SELECT * FROM UNNEST($1::bytea[], $2::bytea[]) ORDER BY 1 ON CONFLICT DO NOTHING) \
+        let insert = if self.has_stored_at {
+            "INSERT INTO changesets (id, data, stored_at) \
+             SELECT i, d, $6 FROM UNNEST($1::bytea[], $2::bytea[]) AS u (i, d) ORDER BY 1"
+        } else {
+            "INSERT INTO changesets (id, data) \
+             SELECT * FROM UNNEST($1::bytea[], $2::bytea[]) ORDER BY 1"
+        };
+        let sql = format!(
+            "WITH c AS ({insert} ON CONFLICT DO NOTHING) \
              INSERT INTO derived (kind, key, value) \
              SELECT * FROM UNNEST($3::text[], $4::bytea[], $5::bytea[]) ORDER BY 1, 2 \
              ON CONFLICT (kind, key) DO UPDATE SET value = excluded.value \
-             WHERE derived.value IS DISTINCT FROM excluded.value",
-        )
-        .bind(ids)
-        .bind(data)
-        .bind(kinds)
-        .bind(keys)
-        .bind(values)
-        .execute(&self.pool)
-        .await
-        .map_err(storage)?;
+             WHERE derived.value IS DISTINCT FROM excluded.value"
+        );
+        let mut q = sqlx::query(&sql)
+            .bind(ids)
+            .bind(data)
+            .bind(kinds)
+            .bind(keys)
+            .bind(values);
+        if self.has_stored_at {
+            q = q.bind(crate::stored_now());
+        }
+        q.execute(&self.pool).await.map_err(storage)?;
         Ok(())
     }
 
