@@ -10,7 +10,9 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use http_body_util::{BodyExt, Limited};
-use leep_core::api::{error_code, ErrorResponse, FORWARD_FAILED_MARKER};
+use leep_core::api::{
+    error_code, ErrorResponse, CURSOR_UNREPRESENTABLE_MARKER, FORWARD_FAILED_MARKER,
+};
 use leep_core::refname::{MISSING_REF_MARKER, NOT_FORWARD_MARKER};
 use leep_core::review::NEEDS_REVIEW_MARKER;
 use leep_core::signature::NOT_SIGNED_MARKER;
@@ -35,7 +37,10 @@ const MAX_TEXT_ERROR: usize = 4096;
 pub(crate) fn code_of(e: &Error) -> &'static str {
     match e {
         Error::Invalid(m) => {
-            if m.contains(NEEDS_REVIEW_MARKER) {
+            // First: this message quotes a path, which may hold other markers.
+            if m.ends_with(CURSOR_UNREPRESENTABLE_MARKER) {
+                error_code::CURSOR_UNREPRESENTABLE
+            } else if m.contains(NEEDS_REVIEW_MARKER) {
                 error_code::NEEDS_REVIEW
             } else if m.contains(NOT_SIGNED_MARKER) {
                 error_code::NOT_SIGNED
@@ -162,6 +167,16 @@ mod tests {
         );
         assert_eq!(inv("invalid ref name \"a..b\": has .."), "invalid_name");
         assert_eq!(inv("bad json: eof"), "invalid");
+        assert_eq!(
+            inv(&format!(
+                "path \"tags are immutable\" {CURSOR_UNREPRESENTABLE_MARKER}"
+            )),
+            "cursor_unrepresentable"
+        );
+        assert_eq!(
+            inv(&format!("ref \"{CURSOR_UNREPRESENTABLE_MARKER}\" bad")),
+            "invalid"
+        );
         assert_eq!(
             code_of(&Error::NotFound(format!("ref \"x\" {MISSING_REF_MARKER}"))),
             "ref_missing"

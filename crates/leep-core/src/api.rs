@@ -68,6 +68,7 @@
 //! | 400 | `land_id_reused` | a land id the ref already recorded for another changeset (ADR 0057); `land` ([`LandRefusal`]) carries the record |
 //! | 400 | `invalid_name` | a ref name [`crate::refname::validate`] refuses |
 //! | 400 | `ambiguous_prefix` | a short id matching several changesets ([`AmbiguousPrefixResponse`]) |
+//! | 400 | `cursor_unrepresentable` | a paged `GET /v1/files` or `/v1/diff` whose page ends at a path too long for a cursor: repeat the request without `limit` |
 //! | 400 | `invalid` | any other bad request |
 //! | 401 | `unauthorized` | no token, or an unknown one |
 //! | 401 | `token_expired` | a known token past its `expires` (ADR 0007): fetch a new one; retrying will not help |
@@ -260,6 +261,10 @@ pub mod error_code {
     /// 400: a short id that matches several changesets
     /// ([`super::AmbiguousPrefixResponse`]).
     pub const AMBIGUOUS_PREFIX: &str = "ambiguous_prefix";
+    /// 400: a paged file listing or diff whose page would end at a path too
+    /// long to fit a cursor ([`super::CURSOR_UNREPRESENTABLE_MARKER`]). The
+    /// same request without `limit` answers the whole list.
+    pub const CURSOR_UNREPRESENTABLE: &str = "cursor_unrepresentable";
     /// 400: any other bad request.
     pub const INVALID: &str = "invalid";
     /// 401: no token, or an unknown one.
@@ -313,6 +318,7 @@ pub mod error_code {
         LAND_ID_REUSED,
         INVALID_NAME,
         AMBIGUOUS_PREFIX,
+        CURSOR_UNREPRESENTABLE,
         INVALID,
         UNAUTHORIZED,
         TOKEN_EXPIRED,
@@ -335,6 +341,12 @@ pub mod error_code {
 /// coordinating its ref (ADR 0056); the server maps it to
 /// [`error_code::FORWARD_FAILED`].
 pub const FORWARD_FAILED_MARKER: &str = "could not reach the server coordinating that ref";
+
+/// Stable end of the 400 for a page that would end at a path too long for a
+/// cursor; the server maps it to [`error_code::CURSOR_UNREPRESENTABLE`]. The
+/// message ends with it, after the quoted path, so a path cannot fake it.
+pub const CURSOR_UNREPRESENTABLE_MARKER: &str =
+    "is too long for a page cursor; repeat the request without `limit`";
 
 #[cfg(test)]
 mod error_code_tests {

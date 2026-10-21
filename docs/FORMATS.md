@@ -1094,7 +1094,8 @@ answer, but not `limit`) | postcard body`:
   changeset id and the prefix with its `/`s trimmed (files), or `from`, `to`,
   the trimmed prefix and the rename threshold when `renames=true`, else none
   (diff). A path too long to fit a cursor cannot be paged past: that page is
-  400 and the client repeats the request without `limit`.
+  400 with code `cursor_unrepresentable` (`CURSOR_UNREPRESENTABLE_MARKER`
+  ends its `error`), and the client repeats the request without `limit`.
 
 `GET /v1/files/{id}` and `GET /v1/diff` (added later than the others) page
 only when the request has `limit`; without it they answer the whole list in
@@ -1168,6 +1169,7 @@ client treats an unknown or absent code by its HTTP status.
 | 400 | `land_id_reused` | a land id the ref already recorded for another changeset (ADR 0057); `land` carries the record |
 | 400 | `invalid_name` | a ref name the validator refuses |
 | 400 | `ambiguous_prefix` | a short id matching several changesets (`AmbiguousPrefixResponse`) |
+| 400 | `cursor_unrepresentable` | a paged `GET /v1/files` or `/v1/diff` whose page would end at a path too long for a cursor (added with file and diff paging): repeat the request without `limit` |
 | 400 | `invalid` | any other bad request (also `405`) |
 | 401 | `unauthorized` | no token, or an unknown one |
 | 401 | `token_expired` | a known token past its `expires` (ADR 0007): fetch a new one; retrying will not help |

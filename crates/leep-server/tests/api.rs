@@ -1332,6 +1332,32 @@ async fn files_and_diff_page_with_limit_and_after() {
     );
 }
 
+/// A page that would end at a path too long for a cursor is 400
+/// `cursor_unrepresentable`, and the same request without `limit` answers.
+#[tokio::test]
+async fn page_ending_at_a_long_path_is_cursor_unrepresentable() {
+    let c = Client::new();
+    let long = format!("d/{}", "n".repeat(4000));
+    let tip = c
+        .commit(&[], &[(long.as_str(), Some("1")), ("e", Some("2"))], "long")
+        .await;
+    for (uri, list) in [
+        (format!("/v1/files/{tip}"), "files"),
+        (format!("/v1/diff?to={tip}"), "entries"),
+        (format!("/v1/diff?to={tip}&renames=true"), "entries"),
+    ] {
+        let r = c.get(&with(&uri, "limit=1")).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{uri}");
+        assert_eq!(r.code(), error_code::CURSOR_UNREPRESENTABLE, "{uri}");
+        assert!(r.json::<ErrorResponse>().error.contains("without `limit`"));
+        // A page that ends before it pages fine; no limit answers all.
+        let (paths, _) = path_page(&c, &with(&uri, "limit=2"), list).await;
+        assert_eq!(paths, [long.clone(), "e".into()]);
+        let (paths, next) = path_page(&c, &uri, list).await;
+        assert_eq!((paths.len(), next), (2, None));
+    }
+}
+
 fn to_strings(s: &[&str]) -> Vec<String> {
     s.iter().map(|s| s.to_string()).collect()
 }

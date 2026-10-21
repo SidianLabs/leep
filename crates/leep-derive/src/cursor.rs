@@ -219,7 +219,8 @@ pub(crate) struct PathPos {
 }
 
 /// The cursor after `path`. A path too long to fit a cursor cannot be paged
-/// past, which is `Invalid` rather than a silently shorter answer.
+/// past, which is `Invalid` (code `cursor_unrepresentable`) rather than a
+/// silently shorter answer.
 pub(crate) fn path_cursor(kind: CursorKind, fp: Fingerprint, path: &str) -> Result<String> {
     encode(
         kind,
@@ -230,7 +231,8 @@ pub(crate) fn path_cursor(kind: CursorKind, fp: Fingerprint, path: &str) -> Resu
     )
     .ok_or_else(|| {
         Error::Invalid(format!(
-            "path {path:?} is too long for a page cursor; repeat the request without `limit`"
+            "path {path:?} {}",
+            leep_core::api::CURSOR_UNREPRESENTABLE_MARKER
         ))
     })
 }
