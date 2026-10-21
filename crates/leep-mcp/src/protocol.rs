@@ -120,6 +120,9 @@ impl Server {
             "tools/call needs a string `name`".to_string(),
         ))?;
         let args = params.get("arguments").cloned().unwrap_or(Value::Null);
+        // One request id per tool call, so an error names the server's log
+        // lines for that call alone.
+        self.client.new_request_id();
         let out = match self.call_tool(name, args) {
             None => return Err((INVALID_PARAMS, format!("unknown tool: {name}"))),
             Some(Ok(o)) => o,

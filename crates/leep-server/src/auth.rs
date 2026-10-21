@@ -27,7 +27,7 @@ use axum::http::{header, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use leep_core::api::ErrorResponse;
+use leep_core::api::{error_code, ErrorResponse};
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 use tracing::Instrument;
@@ -442,8 +442,11 @@ pub(crate) fn needs_write(method: &Method, path: &str) -> bool {
     }
 }
 
-pub(crate) fn reject(status: StatusCode, msg: &str) -> Response {
-    let mut resp = (status, Json(ErrorResponse::new(msg.to_string()))).into_response();
+/// An [`ErrorResponse`] refusal; `code` is one of `error_code`, named by
+/// the caller so no refusal is left to a status default.
+pub(crate) fn reject(status: StatusCode, code: &str, msg: &str) -> Response {
+    let body = ErrorResponse::new(msg.to_string()).with_code(code);
+    let mut resp = (status, Json(body)).into_response();
     if status == StatusCode::UNAUTHORIZED {
         resp.headers_mut()
             .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
@@ -469,7 +472,11 @@ pub async fn require_token(mut req: Request, next: Next) -> Response {
     }
     let Some(config) = req.extensions().get::<Arc<RuntimeConfig>>().cloned() else {
         // Layered without the snapshot middleware: refuse rather than serve open.
-        return reject(StatusCode::INTERNAL_SERVER_ERROR, "server misconfigured");
+        return reject(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_code::INTERNAL,
+            "server misconfigured",
+        );
     };
     let Some(auth) = &config.auth else {
         return next.run(req).await;
@@ -477,6 +484,7 @@ pub async fn require_token(mut req: Request, next: Next) -> Response {
     let Some(known) = bearer(&req).and_then(|t| auth.lookup(t)) else {
         return reject(
             StatusCode::UNAUTHORIZED,
+            error_code::UNAUTHORIZED,
             "authentication required: missing or invalid bearer token",
         );
     };
@@ -487,6 +495,7 @@ pub async fn require_token(mut req: Request, next: Next) -> Response {
             .increment(1);
         return reject(
             StatusCode::UNAUTHORIZED,
+            error_code::TOKEN_EXPIRED,
             &format!("authentication required: token expired at {at}; ask for a new one"),
         );
     }
@@ -500,7 +509,11 @@ pub async fn require_token(mut req: Request, next: Next) -> Response {
     let role = *role;
     if role == Role::Read && needs_write(req.method(), req.uri().path()) {
         tracing::debug!(token = name, "read token refused on a mutating request");
-        return reject(StatusCode::FORBIDDEN, "token lacks write access");
+        return reject(
+            StatusCode::FORBIDDEN,
+            error_code::FORBIDDEN,
+            "token lacks write access",
+        );
     }
     let span = tracing::debug_span!("auth", token = name, role = role.as_str());
     req.extensions_mut().insert(Principal {

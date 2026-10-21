@@ -9,11 +9,24 @@ object per line.
 
 Every HTTP request produces one INFO line, `request completed`, inside a
 `request` span. The span carries `method`, `route` (the matched template such
-as `/v1/blobs/{hash}`, or `unmatched`), `status` and `latency_ms`:
+as `/v1/blobs/{hash}`, or `unmatched`), `request_id`, `status` and
+`latency_ms`:
 
 ```json
-{"timestamp":"...","level":"INFO","fields":{"message":"request completed","status":404,"latency_ms":0.39},"target":"leep_server::observe","span":{"method":"GET","route":"/v1/blobs/{hash}","status":404,"latency_ms":0.39,"name":"request"}}
+{"timestamp":"...","level":"INFO","fields":{"message":"request completed","status":404,"latency_ms":0.39},"target":"leep_server::observe","span":{"method":"GET","route":"/v1/blobs/{hash}","request_id":"5f0c9e2a41d34b7a9c1e0f6b2d8a7c35","status":404,"latency_ms":0.39,"name":"request"}}
 ```
+
+`request_id` is the client's `X-Request-Id` when it is 1 to 128 characters
+of `A-Z a-z 0-9 . _ : / -`, else 32 random hex digits the server picks. The
+charset has no space, `=` or quote, so an id cannot pose as another field,
+and text logs print it quoted (`request_id="..."`). The server
+answers with it in `X-Request-Id`, and every JSON error body carries it as
+`request_id`, so a user's error message leads to the log line. `leep` sends
+one id per invocation and prints it as the last line of an error; `leep-mcp`
+sends one per tool call. A land forwarded to the server that coordinates its
+ref (ADR 0056) keeps the id, so both servers log it under the same one. A
+load balancer that sets `X-Request-Id` makes its logs and the server's share
+the id.
 
 Headers are never logged, so `Authorization` values cannot appear. The
 authentication span (DEBUG) records the token's name, never its value.
@@ -624,9 +637,25 @@ landing twice, so the ids are kept with the log: about 120 more bytes per
 keyed land, index included. Never prune or rewrite `ref_log` by hand; a
 removed entry takes its id with it, and a retry older than that falls back
 to the landed-copy scan, which only sees the last 1024 changesets.
+`GET /v1/reflog` shows the id as `land_id`, with `land_changeset` (the
+changeset the land asked for; `new` is it or its rebased copy), and
+`leep reflog` prints it as `land=ID`, so a client's land can be found in the
+log by the id it sent.
 `leep_land_recorded_total` counts lands answered from a recorded id: a
 steady rate means clients are retrying lands that had already applied
 (timeouts, restarts), which is expected in small numbers.
+
+### Protected refs and the log
+
+The log records how a ref moved; it does not stop a move. A write token can
+reset or delete any ref no land policy covers, and the log is then the way to
+find and undo it. Refs that must never go backwards (`main`, release branches)
+belong in `--protect-ref` (`LEEP_PROTECT_REFS`) if no signature or review
+policy names them already ([DEPLOY.md](DEPLOY.md#protected-refs)): such a ref
+only moves forward and cannot be deleted through the API, and a refused move
+writes no entry. The startup line `land policy protects refs` lists every
+protected ref, whichever flag or file protects it. Moving a protected ref back
+by hand needs the metadata store itself; prefer `leep revert` and a land.
 
 ## Git mirror
 

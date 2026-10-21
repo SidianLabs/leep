@@ -294,10 +294,12 @@ type LogRow = (
     Option<String>,
     String,
     Option<String>,
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
 );
 
 fn log_entry(row: LogRow) -> Result<leep_core::RefLogEntry> {
-    let (seq, name, old, new, time, actor, operation, message) = row;
+    let (seq, name, old, new, time, actor, operation, message, land_id, land_changeset) = row;
     Ok(leep_core::RefLogEntry {
         seq: u64::try_from(seq).map_err(|_| storage("negative ref log seq in db"))?,
         name,
@@ -307,6 +309,11 @@ fn log_entry(row: LogRow) -> Result<leep_core::RefLogEntry> {
         actor,
         operation,
         message,
+        land_id: land_id
+            .map(|b| leep_core::LandId::from_bytes(&b))
+            .transpose()
+            .map_err(|_| storage("bad land id in ref log"))?,
+        land_changeset: land_changeset.map(|b| to_id(&b)).transpose()?,
     })
 }
 

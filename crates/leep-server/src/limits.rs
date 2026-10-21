@@ -600,8 +600,8 @@ fn content_length(req: &Request) -> Option<u64> {
         .ok()
 }
 
-fn refuse(status: StatusCode, msg: &str, retry_after: Option<u64>) -> Response {
-    let mut resp = auth::reject(status, msg);
+fn refuse(status: StatusCode, code: &str, msg: &str, retry_after: Option<u64>) -> Response {
+    let mut resp = auth::reject(status, code, msg);
     if let Some(s) = retry_after {
         resp.headers_mut()
             .insert(header::RETRY_AFTER, HeaderValue::from(s));
@@ -613,6 +613,7 @@ fn too_large(slot: &Slot, max: usize) -> Response {
     slot.limited("size");
     refuse(
         StatusCode::PAYLOAD_TOO_LARGE,
+        leep_core::api::error_code::TOO_LARGE,
         &format!("request body exceeds the limit of {max} bytes for this token"),
         None,
     )
@@ -645,6 +646,7 @@ pub async fn enforce(req: Request, next: Next) -> Response {
         let secs = wait.as_secs_f64().ceil().max(1.0) as u64;
         return refuse(
             StatusCode::TOO_MANY_REQUESTS,
+            leep_core::api::error_code::RATE_LIMITED,
             &format!("rate limit exceeded; retry after {secs}s"),
             Some(secs),
         );
@@ -660,6 +662,7 @@ pub async fn enforce(req: Request, next: Next) -> Response {
             slot.limited("concurrency");
             return refuse(
                 StatusCode::TOO_MANY_REQUESTS,
+                leep_core::api::error_code::RATE_LIMITED,
                 "too many concurrent requests; retry after 1s",
                 Some(1),
             );

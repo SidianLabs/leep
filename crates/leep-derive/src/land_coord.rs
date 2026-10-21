@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use leep_core::api::LandResponse;
+use leep_core::api::{LandResponse, FORWARD_FAILED_MARKER};
 use leep_core::refname;
 use leep_core::{
     ChangesetId, Error, LandId, Lease, LeaseClaim, LeaseKey, LeaseTiming, MetaStore, Result,
@@ -640,7 +640,7 @@ impl Repo {
             if started.elapsed() >= coord.config().forward_wait {
                 metrics::counter!("leep_land_forward_gave_up_total").increment(1);
                 return Err(Error::Conflict(format!(
-                    "land onto {target_ref:?} could not reach the server coordinating that ref; retry"
+                    "land onto {target_ref:?} {FORWARD_FAILED_MARKER}; retry"
                 )));
             }
         }

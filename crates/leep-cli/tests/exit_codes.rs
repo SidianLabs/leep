@@ -175,6 +175,7 @@ fn json_error(out: &Output) -> serde_json::Value {
         .unwrap()
         .keys()
         .map(String::as_str)
+        .filter(|k| !["request_id", "server_code"].contains(k))
         .collect();
     assert_eq!(keys, ["code", "hint", "message", "retryable"], "{v}");
     assert!(err["message"].as_str().is_some_and(|m| !m.is_empty()));
@@ -216,7 +217,19 @@ fn json_errors_go_to_stdout_with_a_stable_code() {
         assert_eq!(err["code"], code, "{args:?}: {err}");
         assert_eq!(err["retryable"], retryable, "{args:?}: {err}");
         // The human line still goes to stderr.
-        assert!(text(&out.stderr).starts_with("leep: "), "{args:?}");
+        let stderr = text(&out.stderr);
+        assert!(stderr.starts_with("leep: "), "{args:?}");
+        // A request that went out names its id, last on stderr.
+        match err["request_id"].as_str() {
+            Some(id) => assert_eq!(
+                stderr.lines().last(),
+                Some(format!("request id: {id}").as_str()),
+                "{args:?}"
+            ),
+            None => assert!(!stderr.contains("request id:"), "{args:?}"),
+        }
+        let reached = matches!(code, "not_found" | "unreachable");
+        assert_eq!(err["request_id"].is_string(), reached, "{args:?}: {err}");
     }
 
     // Without --json, stdout stays empty.

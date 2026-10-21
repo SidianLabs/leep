@@ -156,6 +156,14 @@ struct Args {
     /// environment variable takes a comma-separated list. Needs --tokens-file.
     #[arg(long, env = "LEEP_REQUIRE_REVIEW", value_delimiter = ',')]
     require_review: Vec<String>,
+    /// Protect this ref without requiring signatures or review: it only
+    /// moves forward (a land, or a fast-forward through `POST /v1/refs`)
+    /// and cannot be deleted through the API. Refs listed in
+    /// --require-signatures, --require-review or the review policy are
+    /// already protected. Repeatable; the environment variable takes a
+    /// comma-separated list.
+    #[arg(long = "protect-ref", env = "LEEP_PROTECT_REFS", value_delimiter = ',')]
+    protect_refs: Vec<String>,
     /// Serve Prometheus metrics on this address (`GET /metrics`, no auth, keep
     /// it private). Off when unset.
     #[arg(long, env = "LEEP_METRICS_LISTEN")]
@@ -1116,6 +1124,7 @@ async fn main() -> anyhow::Result<()> {
         },
         require_signatures: args.require_signatures.clone(),
         require_review: args.require_review.clone(),
+        protect_refs: args.protect_refs.clone(),
     })
     .map_err(anyhow::Error::msg)?;
     log_config(&config.current());

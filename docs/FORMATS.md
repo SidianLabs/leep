@@ -947,6 +947,15 @@ The CLI's `.leep/state.json` gains the optional `pending_land` (`changeset`,
 `target_ref`, `land_id`), present only while a land waits for a final
 answer; older CLIs ignore it.
 
+`RefLogEntry` (`GET /v1/reflog`, `GET /v1/reflog/{name}`) later gained the
+optional `land_id` (the same lowercase hex as `LandRequest.land_id`) and
+`land_changeset` (a changeset id), read from the columns above. Both are
+omitted when the move carried no land id, so entries without one serialize
+exactly as before, and older servers never send them. `RefLogEntry` is JSON
+on the wire and SQL columns at rest; it is not hashed and not encoded with
+postcard, and backups already carried the columns (`SnapLogRow`), so no
+stored format changed.
+
 ## Fenced garbage collection (new derived kinds, no other format change)
 
 ADR 0012 adds the three GC kinds in the table above (`blob-claim-v1` already
@@ -1111,3 +1120,57 @@ still refused. New flags and variables: `--rate-limit`/`LEEP_RATE_LIMIT`,
 `--rate-burst`/`LEEP_RATE_BURST`,
 `--max-concurrent-per-token`/`LEEP_MAX_CONCURRENT_PER_TOKEN`,
 `--read-max-body-bytes`/`LEEP_READ_MAX_BODY_BYTES`.
+
+## Error codes (additive API field, no persisted change)
+
+`ErrorResponse` gains `code`, and `AmbiguousPrefixResponse` too: a string
+omitted when unset and absent from older servers. Every error body a server
+of this version sends carries one, including the answers that used to be
+plain text or empty (the global body cap's `413`, the request timeout's
+`408`, an unknown route's `404`, a `405`), which are now `ErrorResponse`
+JSON with the same status. `error` stays as before. The codes are a stable
+contract: a code keeps its meaning forever, new ones may be added, and a
+client treats an unknown or absent code by its HTTP status.
+
+| Status | `code` | Condition |
+|---|---|---|
+| 400 | `needs_review` | a land or ref move onto a ref whose review policy some changeset does not meet |
+| 400 | `not_signed` | a land or ref move onto a ref that needs every changeset signed by a trusted key |
+| 400 | `not_forward` | a move of a land-policy-protected ref, or of a protected ref (`--protect-ref`), that is not a fast-forward |
+| 400 | `tag_immutable` | a move of a tag, or a land onto one |
+| 400 | `land_id_reused` | a land id the ref already recorded for another changeset (ADR 0057) |
+| 400 | `invalid_name` | a ref name the validator refuses |
+| 400 | `ambiguous_prefix` | a short id matching several changesets (`AmbiguousPrefixResponse`) |
+| 400 | `invalid` | any other bad request (also `405`) |
+| 401 | `unauthorized` | no token, or an unknown one |
+| 401 | `token_expired` | a known token that has expired: fetch a new one; retrying will not help |
+| 403 | `forbidden` | a `read` token on a request that writes |
+| 404 | `ref_missing` | a land onto a missing ref with `create: false` (ADR 0036) |
+| 404 | `not_found` | anything else that does not exist |
+| 408 | `timeout` | the request timeout ran out; the request may or may not have applied |
+| 409 | `cas_lost` | a concurrent update won repeatedly (a land that kept losing); read again and retry |
+| 409 | `forward_failed` | the land could not reach the server coordinating its ref; nothing landed here, retry (ADR 0056) |
+| 413 | `too_large` | the body is over the server's or the token's limit |
+| 429 | `rate_limited` | a rate or concurrency limit; see `Retry-After` |
+| 500 | `internal` | the server failed |
+| 503 | `indexing` | the index is too far behind; see `indexing` and `Retry-After` (ADR 0058) |
+| 503 | `not_leader` | the server no longer coordinates lands on that ref; send the land again (ADR 0056) |
+| 503 | `unavailable` | overloaded or busy (with `Retry-After` when known): back off and retry |
+
+A lost `POST /v1/refs/{name}` swap is unchanged: `409` with `CasRefResponse`
+(`ok: false`), not an error body. The marker texts (`NEEDS_REVIEW_MARKER`,
+`NOT_SIGNED_MARKER`, `NOT_FORWARD_MARKER`, `MISSING_REF_MARKER`) stay in the
+messages, so clients that match them keep working; the CLI and the MCP server
+go by `code` when it is present and by the markers otherwise. The constants
+are `leep_core::api::error_code`.
+
+## Request ids (additive header and API field, no persisted change)
+
+Every request may carry `X-Request-Id`. The server keeps it when it is 1 to
+128 characters of `A-Z a-z 0-9 . _ : / -`, else it replaces it with 32 random lowercase hex digits; a request without one gets a
+random one too. Every response carries the id it used in `X-Request-Id`, and
+every JSON error body (`ErrorResponse`, `AmbiguousPrefixResponse`) gains
+`request_id`, omitted by older servers. The server logs each request under it
+(OPERATIONS.md, "Logs") and passes it on when it forwards a land to the
+server coordinating the ref. Success bodies are unchanged. Clients that send
+nothing see only the new header and field.

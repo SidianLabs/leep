@@ -17,6 +17,7 @@
 //! With `--stale-ok` they send `stale-ok` and take an answer at an older
 //! changeset instead.
 
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use leep_core::api::*;
@@ -42,6 +43,9 @@ pub struct Client {
     base: String,
     http: Http,
     has_token: bool,
+    /// Sent as `X-Request-Id` on every request; shared by clones, so
+    /// [`Client::new_request_id`] renames all of them.
+    request_id: Arc<Mutex<String>>,
     /// Index-backed queries accept an answer at an older changeset.
     stale_ok: bool,
     /// How long, and how many times, index-backed queries retry an
@@ -268,6 +272,7 @@ impl Client {
             base: server.trim_end_matches('/').to_string(),
             http: builder.build().expect("http client builds"),
             has_token: token.is_some(),
+            request_id: Arc::new(Mutex::new(invocation_request_id().to_string())),
             stale_ok: false,
             index_retry: None,
         }
@@ -324,12 +329,28 @@ impl Client {
         &self.base
     }
 
+    /// The `X-Request-Id` this client sends: one per process (a CLI
+    /// invocation) unless [`Client::new_request_id`] changed it.
+    pub fn request_id(&self) -> String {
+        self.request_id.lock().unwrap().clone()
+    }
+
+    /// Send a fresh request id from now on, in this client and its clones:
+    /// for a long-running process that makes one call after another.
+    pub fn new_request_id(&self) {
+        *self.request_id.lock().unwrap() = random_request_id();
+    }
+
+    fn named(&self, req: RequestBuilder) -> RequestBuilder {
+        req.header(REQUEST_ID_HEADER, self.request_id())
+    }
+
     fn url(&self, path: &str) -> String {
         format!("{}{}", self.base, path)
     }
 
     fn send(&self, req: RequestBuilder) -> Result<Response> {
-        let (http, built) = req.build_split();
+        let (http, built) = self.named(req).build_split();
         let built = built.map_err(|e| CliError::user(format!("bad request: {e}")))?;
         let idempotent = built.method() == reqwest::Method::GET;
         let mut current = built;
@@ -355,8 +376,13 @@ impl Client {
                     continue;
                 }
             }
-            return Err(error_from(resp, self.has_token));
+            return Err(self.error_from(resp));
         }
+    }
+
+    fn error_from(&self, resp: Response) -> CliError {
+        let sent = self.request_id();
+        error_from(resp, self.has_token, &sent)
     }
 
     /// A request that never got an answer. A timeout may have taken effect;
@@ -367,10 +393,12 @@ impl Client {
         } else {
             ErrorKind::Unreachable
         };
-        CliError::new(kind, format!("cannot reach {}: {e}", self.base)).with_hint(
-            "check that leep-server runs at that URL; it comes from --server, \
-             LEEP_SERVER or .leep/config.json",
-        )
+        CliError::new(kind, format!("cannot reach {}: {e}", self.base))
+            .with_hint(
+                "check that leep-server runs at that URL; it comes from --server, \
+                 LEEP_SERVER or .leep/config.json",
+            )
+            .with_request_id(Some(self.request_id()))
     }
 
     fn json<T: DeserializeOwned>(&self, req: RequestBuilder) -> Result<T> {
@@ -384,8 +412,7 @@ impl Client {
     /// never mistakes an outage for an old server.
     pub fn server_features(&self) -> Result<Vec<String>> {
         let resp = self
-            .http
-            .get(self.url("/v1/ready"))
+            .named(self.http.get(self.url("/v1/ready")))
             .send()
             .map_err(|e| self.unreachable(e))?;
         match resp.status() {
@@ -393,7 +420,7 @@ impl Client {
                 .json::<ReadyResponse>()
                 .map_or_else(|_| Vec::new(), |r| r.features)),
             StatusCode::NOT_FOUND => Ok(Vec::new()),
-            _ => Err(error_from(resp, self.has_token)),
+            _ => Err(self.error_from(resp)),
         }
     }
 
@@ -544,15 +571,17 @@ impl Client {
     /// Compare-and-swap a ref. A lost race (409) is `ok: false`, not an error.
     pub fn cas_ref(&self, name: &str, req: &CasRefRequest) -> Result<CasRefResponse> {
         let resp = self
-            .http
-            .post(self.url(&format!("/v1/refs/{}", enc(name))))
-            .json(req)
+            .named(
+                self.http
+                    .post(self.url(&format!("/v1/refs/{}", enc(name))))
+                    .json(req),
+            )
             .send()
             .map_err(|e| self.unreachable(e))?;
         if resp.status().is_success() || resp.status() == StatusCode::CONFLICT {
             return resp.json().map_err(bad_response);
         }
-        Err(error_from(resp, self.has_token))
+        Err(self.error_from(resp))
     }
 
     pub fn resolve(&self, rev: &str) -> Result<ChangesetId> {
@@ -830,6 +859,21 @@ fn resend_land(e: &CliError) -> bool {
 
 /// A new random land id (ADR 0057): one per logical land, reused on every
 /// retry of it.
+/// A new random request id: 32 lowercase hex digits.
+fn random_request_id() -> String {
+    let mut b = [0u8; 16];
+    getrandom::fill(&mut b).expect("the OS random source is available");
+    hex::encode(b)
+}
+
+/// The request id of this process, made on first use: every request of one
+/// CLI invocation carries it, so the server's log lines for the invocation
+/// share it.
+pub fn invocation_request_id() -> &'static str {
+    static ID: OnceLock<String> = OnceLock::new();
+    ID.get_or_init(random_request_id)
+}
+
 pub fn new_land_id() -> LandId {
     let mut b = [0u8; 16];
     getrandom::fill(&mut b).expect("the OS random source is available");
@@ -852,7 +896,19 @@ fn bad_response(e: reqwest::Error) -> CliError {
     CliError::server(format!("bad response from server: {e}")).retryable(false)
 }
 
-fn error_from(resp: Response, has_token: bool) -> CliError {
+/// The error a non-success answer means, naming the request: by the id
+/// the server echoed, else the one `sent`.
+fn error_from(resp: Response, has_token: bool, sent: &str) -> CliError {
+    let echoed = resp
+        .headers()
+        .get(REQUEST_ID_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let id = Some(echoed.unwrap_or_else(|| sent.to_string()));
+    classify(resp, has_token).with_request_id(id)
+}
+
+fn classify(resp: Response, has_token: bool) -> CliError {
     let status = resp.status();
     match status {
         StatusCode::UNAUTHORIZED if has_token => {
@@ -904,11 +960,13 @@ fn error_from(resp: Response, has_token: bool) -> CliError {
                 candidates.push("...".into());
             }
             return CliError::new(ErrorKind::Ambiguous, format!("server: {}", amb.error))
+                .with_server_code(amb.code)
                 .with_candidates(candidates)
                 .with_hint("give more digits of the id; the candidates are listed above");
         }
     }
     let parsed = serde_json::from_str::<ErrorResponse>(&body).ok();
+    let code = parsed.as_ref().and_then(|e| e.code.clone());
     if let Some(info) = parsed.as_ref().and_then(|e| e.indexing.clone()) {
         if status == StatusCode::SERVICE_UNAVAILABLE {
             return CliError::new(
@@ -919,6 +977,7 @@ fn error_from(resp: Response, has_token: bool) -> CliError {
                 ),
             )
             .with_retry_after_ms(info.retry_after_ms)
+            .with_server_code(code)
             .with_hint("the server's index is catching up; run the command again later, or pass --stale-ok");
         }
     }
@@ -930,7 +989,7 @@ fn error_from(resp: Response, has_token: bool) -> CliError {
     } else {
         format!("server: {msg} ({status})")
     };
-    match status {
+    let e = match status {
         // The server's request timeout cancels a request at any point,
         // possibly after it took effect: like a lost connection, the outcome
         // is unknown and running the command again is the answer.
@@ -947,7 +1006,8 @@ fn error_from(resp: Response, has_token: bool) -> CliError {
         StatusCode::CONFLICT => CliError::lost_race(msg),
         s if s.is_server_error() => CliError::server(msg),
         _ => CliError::user(msg),
-    }
+    };
+    e.with_server_code(code)
 }
 
 #[cfg(test)]
@@ -1083,6 +1143,42 @@ mod tests {
         {\"error\":\"rate limit exceeded; retry after 60s    \"}";
     const OK: &str = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
         content-length: 17\r\nconnection: close\r\n\r\n{\"refs\":{}}      ";
+
+    #[test]
+    fn every_request_names_the_invocation_and_errors_carry_the_id() {
+        // A server from before codes and request ids: no echo, no code.
+        let old = reply("404 Not Found", "", r#"{"error":"not found: x"}"#);
+        let (url, heads) = recording_stub(vec![old]);
+        let c = Client::new(&url);
+        assert_eq!(c.request_id(), invocation_request_id());
+        let e = c.resolve("x").unwrap_err();
+        let sent = c.request_id();
+        assert!(
+            heads.lock().unwrap()[0].contains(&format!("x-request-id: {sent}")),
+            "{:?}",
+            heads.lock().unwrap()
+        );
+        assert_eq!(e.request_id(), Some(sent.as_str()));
+        assert_eq!(e.server_code(), None);
+        assert_eq!(e.kind(), ErrorKind::NotFound);
+
+        // A newer server echoes the id it used and names the error.
+        let new = reply(
+            "404 Not Found",
+            "x-request-id: srv-1\r\n",
+            r#"{"error":"not found: x","code":"not_found","request_id":"srv-1"}"#,
+        );
+        let (url, heads) = recording_stub(vec![new]);
+        let c = Client::new(&url);
+        c.new_request_id();
+        assert_ne!(c.request_id(), invocation_request_id());
+        let clone = c.clone();
+        let e = clone.resolve("x").unwrap_err();
+        assert!(heads.lock().unwrap()[0].contains(&format!("x-request-id: {}", c.request_id())));
+        assert_eq!(e.request_id(), Some("srv-1"));
+        assert_eq!(e.server_code(), Some("not_found"));
+        assert_eq!(e.to_json()["error"]["request_id"], "srv-1");
+    }
 
     #[test]
     fn a_limited_get_is_retried_after_the_pause_the_server_asks_for() {

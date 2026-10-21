@@ -433,6 +433,10 @@ async fn require_signatures_end_to_end() {
         r.error(),
         format!("invalid input: changeset {c} {NOT_SIGNED_MARKER}")
     );
+    assert_eq!(
+        r.json::<ErrorResponse>().code.as_deref(),
+        Some("not_signed")
+    );
     let refs: RefsResponse = api.get("/v1/refs").await.json();
     assert!(refs.refs.is_empty(), "ref must not move");
 

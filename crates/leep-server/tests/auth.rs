@@ -126,6 +126,7 @@ async fn missing_token_is_401_with_challenge() {
     assert_eq!(r.www.as_deref(), Some("Bearer"));
     let e: ErrorResponse = serde_json::from_slice(&r.body).unwrap();
     assert!(e.error.contains("authentication required"), "{}", e.error);
+    assert_eq!(e.code.as_deref(), Some("unauthorized"));
 }
 
 #[tokio::test]
@@ -189,6 +190,7 @@ async fn read_token_reads_but_cannot_mutate() {
         assert!(r.www.is_none());
         let e: ErrorResponse = serde_json::from_slice(&r.body).unwrap();
         assert!(e.error.contains("write access"), "{}", e.error);
+        assert_eq!(e.code.as_deref(), Some("forbidden"));
     }
 }
 
