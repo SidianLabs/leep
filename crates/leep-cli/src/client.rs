@@ -71,9 +71,6 @@ pub struct LogQuery {
     pub follow: bool,
     /// The previous page's `next` cursor.
     pub after: Option<String>,
-    /// Ask for summary entries (`fields=summary`). Set by
-    /// [`Client::log_summary`]; [`Client::log`] always asks for full ones.
-    pub summary: bool,
 }
 
 impl LogQuery {
@@ -96,7 +93,15 @@ impl LogQuery {
         if let Some(a) = &self.after {
             out.push(("after", a.clone()));
         }
-        if self.summary {
+        out
+    }
+
+    /// [`LogQuery::params`] plus the entry shape: only [`Client::log`] and
+    /// [`Client::log_summary`] choose it, so each always gets the shape it
+    /// decodes.
+    fn params_for(&self, summary: bool) -> Vec<(&'static str, String)> {
+        let mut out = self.params();
+        if summary {
             out.push(("fields", "summary".into()));
         }
         out
@@ -604,28 +609,22 @@ impl Client {
     }
 
     pub fn log(&self, id: &ChangesetId, q: &LogQuery) -> Result<LogResponse> {
-        let q = LogQuery {
-            summary: false,
-            ..q.clone()
-        };
+        let params = q.params_for(false);
         self.indexed(|| {
             self.http
                 .get(self.url(&format!("/v1/log/{id}")))
-                .query(&q.params())
+                .query(&params)
         })
     }
 
     /// [`Client::log`] without each changeset's changed paths, which a
     /// listing does not show and which make most of a full log's bytes.
     pub fn log_summary(&self, id: &ChangesetId, q: &LogQuery) -> Result<LogSummaryResponse> {
-        let q = LogQuery {
-            summary: true,
-            ..q.clone()
-        };
+        let params = q.params_for(true);
         let any: AnyLog = self.indexed(|| {
             self.http
                 .get(self.url(&format!("/v1/log/{id}")))
-                .query(&q.params())
+                .query(&params)
         })?;
         Ok(any.into())
     }

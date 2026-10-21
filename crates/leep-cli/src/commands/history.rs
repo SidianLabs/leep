@@ -92,7 +92,6 @@ impl LogArgs {
             extra,
             follow: self.follow.is_some(),
             after: self.after.clone(),
-            summary: false,
         })
     }
 }

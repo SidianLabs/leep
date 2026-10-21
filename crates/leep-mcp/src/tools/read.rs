@@ -217,7 +217,6 @@ impl Server {
             extra,
             follow,
             after: non_empty(a.cursor),
-            summary: true,
         };
         let log = self
             .index_client(a.fresh.unwrap_or(false))
