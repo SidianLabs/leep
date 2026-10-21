@@ -934,3 +934,138 @@ async fn opening_directories_ahead_keeps_the_answer() {
         assert_eq!(r.search(c, &q).await.unwrap().stats, res.stats);
     }
 }
+
+/// Counts the batched row reads in flight, and stalls each briefly so
+/// concurrent ones overlap.
+struct CountingReads {
+    inner: Arc<dyn leep_core::MetaStore>,
+    now: std::sync::atomic::AtomicUsize,
+    most: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl leep_core::MetaStore for CountingReads {
+    async fn put_changeset(&self, cs: &Changeset) -> leep_core::Result<ChangesetId> {
+        self.inner.put_changeset(cs).await
+    }
+    async fn get_changeset(&self, id: &ChangesetId) -> leep_core::Result<Option<Changeset>> {
+        self.inner.get_changeset(id).await
+    }
+    async fn list_changesets(
+        &self,
+        after: Option<ChangesetId>,
+        limit: usize,
+    ) -> leep_core::Result<Vec<ChangesetId>> {
+        self.inner.list_changesets(after, limit).await
+    }
+    async fn get_ref(&self, name: &str) -> leep_core::Result<Option<ChangesetId>> {
+        self.inner.get_ref(name).await
+    }
+    async fn cas_ref_logged(
+        &self,
+        name: &str,
+        expected: Option<ChangesetId>,
+        new: Option<ChangesetId>,
+        ctx: &leep_core::RefUpdateContext,
+    ) -> leep_core::Result<bool> {
+        self.inner.cas_ref_logged(name, expected, new, ctx).await
+    }
+    async fn find_lands(
+        &self,
+        name: &str,
+        ids: &[leep_core::LandId],
+    ) -> leep_core::Result<Vec<Option<leep_core::LandRecord>>> {
+        self.inner.find_lands(name, ids).await
+    }
+    async fn ref_log(
+        &self,
+        name: Option<&str>,
+        before_seq: Option<u64>,
+        limit: usize,
+    ) -> leep_core::Result<Vec<leep_core::RefLogEntry>> {
+        self.inner.ref_log(name, before_seq, limit).await
+    }
+    async fn list_refs(&self) -> leep_core::Result<BTreeMap<String, ChangesetId>> {
+        self.inner.list_refs().await
+    }
+    async fn get_derived(&self, kind: &str, key: &Hash) -> leep_core::Result<Option<Bytes>> {
+        self.inner.get_derived(kind, key).await
+    }
+    async fn get_derived_many(
+        &self,
+        kind: &str,
+        keys: &[Hash],
+    ) -> leep_core::Result<Vec<Option<Bytes>>> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let now = self.now.fetch_add(1, SeqCst) + 1;
+        self.most.fetch_max(now, SeqCst);
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        let rows = self.inner.get_derived_many(kind, keys).await;
+        self.now.fetch_sub(1, SeqCst);
+        rows
+    }
+    async fn put_derived(&self, kind: &str, key: &Hash, value: Bytes) -> leep_core::Result<()> {
+        self.inner.put_derived(kind, key, value).await
+    }
+    async fn put_derived_many(&self, rows: &[leep_core::DerivedRow]) -> leep_core::Result<()> {
+        self.inner.put_derived_many(rows).await
+    }
+}
+
+/// The most batched row reads that many concurrent searches had in flight
+/// at once, over a wide tree, with `permits` search pool permits.
+async fn most_rows_reads_at_once(permits: Option<usize>) -> usize {
+    let store = Arc::new(CountingReads {
+        inner: Arc::new(MemoryMetaStore::new()),
+        now: Default::default(),
+        most: Default::default(),
+    });
+    let r = Repo::new(Arc::new(MemoryBlobStore::new()), store.clone())
+        .with_search_pool_permits(permits);
+    let mut files: Vec<(String, Vec<u8>)> = Vec::new();
+    for a in 0..8 {
+        for b in 0..8 {
+            files.push((format!("d{a}/e{b}/f.txt"), format!("hay {a} {b}\n").into()));
+        }
+    }
+    let refs: Vec<File> = files
+        .iter()
+        .map(|(p, b)| (p.as_str(), Some(b.as_slice())))
+        .collect();
+    let c = commit(&r, &[], &refs).await;
+    // Rows first, so the searches below only read them.
+    r.search(c, &SearchQuery::new("hay")).await.unwrap();
+    store.most.store(0, std::sync::atomic::Ordering::SeqCst);
+    let searches: Vec<_> = (0..8)
+        .map(|i| {
+            let r = r.clone();
+            tokio::spawn(async move {
+                let q = SearchQuery {
+                    limit: MAX_LIMIT,
+                    ..SearchQuery::new(format!("hay {i}"))
+                };
+                r.search(c, &q).await.unwrap()
+            })
+        })
+        .collect();
+    let done = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        futures_util::future::join_all(searches),
+    )
+    .await
+    .expect("searches finish: the pool and ahead permits never wait on each other");
+    for (i, s) in done.into_iter().enumerate() {
+        assert_eq!(s.unwrap().matches.len(), 8, "search {i}");
+    }
+    store.most.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Searches together hold at most two metadata reads per search pool permit
+/// (a directory open joins its filter and row reads), however many run and
+/// however far ahead each opens directories; without permits they hold more.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn search_pool_permits_bound_the_reads_of_all_searches() {
+    assert!(most_rows_reads_at_once(Some(1)).await <= 2);
+    assert!(most_rows_reads_at_once(Some(2)).await <= 4);
+    assert!(most_rows_reads_at_once(None).await > 4);
+}

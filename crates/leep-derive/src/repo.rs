@@ -133,6 +133,10 @@ pub struct Repo {
     /// (ADR 0059). Off for a land batch's staged handle, whose batch rescues
     /// before it moves the ref.
     pub(crate) rescues_on_write: bool,
+    /// Permits for the metadata reads of a search's directory opens, shared
+    /// by every search through this handle and its clones; `None` leaves
+    /// them unbounded. See [`Repo::with_search_pool_permits`].
+    pub(crate) search_pool: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 /// Whether a derivation may go on writing rows: the index lease it derives
@@ -493,6 +497,7 @@ impl Repo {
             write_guard: None,
             fence_flag: Arc::default(),
             rescues_on_write: true,
+            search_pool: None,
         }
     }
 
@@ -553,6 +558,16 @@ impl Repo {
     /// concurrent store requests.
     pub fn with_derive_jobs(mut self, jobs: usize) -> Self {
         self.derive_jobs = jobs.max(1);
+        self
+    }
+
+    /// Let at most `permits` directory opens of all searches read the
+    /// metadata store at once (`None`: no bound). Each holds up to two
+    /// connections, so searches together hold at most `2 * permits` of the
+    /// pool and lands and ref reads keep the rest. Call it before cloning:
+    /// clones share the permits.
+    pub fn with_search_pool_permits(mut self, permits: Option<usize>) -> Self {
+        self.search_pool = permits.map(|n| Arc::new(tokio::sync::Semaphore::new(n.max(1))));
         self
     }
 
