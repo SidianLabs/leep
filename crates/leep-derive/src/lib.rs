@@ -11,11 +11,14 @@
 mod ancestry;
 mod batched_reads;
 mod blame;
+pub mod changeset_gc;
+pub mod changeset_reach;
 mod comments;
 mod cursor;
 pub mod derived;
 mod filter_log;
 pub mod gc;
+pub mod gc_unreachable;
 mod history;
 pub mod indexing;
 pub mod integrity;

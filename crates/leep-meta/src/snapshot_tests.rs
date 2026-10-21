@@ -57,10 +57,11 @@ type Dump = (
     Vec<String>,
     Vec<String>,
     Vec<String>,
+    Vec<Option<u64>>,
 );
 
-/// A dump without its land ids, for a copy that went through a schema from
-/// before them (ADR 0057).
+/// A dump without its land ids and store times, for a copy that went
+/// through a schema from before them (ADR 0057, ADR 0059).
 fn without_lands(d: Dump) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
     (d.0, d.1, d.2, d.3)
 }
@@ -68,6 +69,7 @@ fn without_lands(d: Dump) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>
 /// Everything a store holds, in comparable form.
 async fn dump(store: &dyn MetaStore) -> Dump {
     let mut ids = Vec::new();
+    let mut stored = Vec::new();
     let mut after = None;
     loop {
         let page = store.list_changesets(after, 7).await.unwrap();
@@ -75,6 +77,7 @@ async fn dump(store: &dyn MetaStore) -> Dump {
             break;
         };
         after = Some(last);
+        stored.extend(store.changesets_stored_at(&page).await.unwrap());
         for id in page {
             let c = store.get_changeset(&id).await.unwrap().unwrap();
             ids.push(format!("{id:?} {}", c.message));
@@ -119,7 +122,7 @@ async fn dump(store: &dyn MetaStore) -> Dump {
         .map(|l| format!("{l:?}"))
         .collect();
     lands.extend(log_lands);
-    (ids, refs, log, derived, lands)
+    (ids, refs, log, derived, lands, stored)
 }
 
 fn sqlite_url(dir: &std::path::Path, name: &str) -> String {
@@ -135,14 +138,30 @@ async fn sqlite_round_trip_keeps_everything_and_the_ref_log_sequence() {
     populate(&*src).await;
     // The newest log entry is gone (as if pruned): `seq` must still not be reused.
     let last = src.ref_log(None, None, 1).await.unwrap()[0].seq;
-    sqlx::query(&format!("DELETE FROM ref_log WHERE seq = {last}"))
-        .execute(
-            &mut sqlx::SqliteConnection::connect(&sqlite_url(dir.path(), "src.db"))
-                .await
-                .unwrap(),
-        )
+    let mut c = sqlx::SqliteConnection::connect(&sqlite_url(dir.path(), "src.db"))
         .await
         .unwrap();
+    sqlx::query(&format!("DELETE FROM ref_log WHERE seq = {last}"))
+        .execute(&mut c)
+        .await
+        .unwrap();
+    // A row an older server stored, without a store time (ADR 0059): it
+    // keeps its age, migration 0007's `applied_at`, through the restore.
+    let old = cs(3).id();
+    sqlx::query("UPDATE changesets SET stored_at = NULL WHERE id = ?")
+        .bind(old.0.as_bytes().as_slice())
+        .execute(&mut c)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE schema_migrations SET applied_at = 1000 WHERE version = 7")
+        .execute(&mut c)
+        .await
+        .unwrap();
+    drop(c);
+    assert_eq!(
+        src.changesets_stored_at(&[old]).await.unwrap(),
+        vec![Some(1000)]
+    );
 
     let snap = dir.path().join("snap.db");
     let info = export_snapshot(&sqlite_url(dir.path(), "src.db"), &snap)
@@ -171,6 +190,10 @@ async fn sqlite_round_trip_keeps_everything_and_the_ref_log_sequence() {
     assert_eq!(imported.ref_log, info.ref_log);
     let dest = open_meta_store(&dest_url).await.unwrap();
     assert_eq!(dump(&*src).await, dump(&*dest).await);
+    assert_eq!(
+        dest.changesets_stored_at(&[old]).await.unwrap(),
+        vec![Some(1000)]
+    );
     // The next ref move gets the next sequence number, never a reused one.
     let id = dest.put_changeset(&cs(900)).await.unwrap();
     assert!(dest.cas_ref("fresh", None, Some(id)).await.unwrap());
@@ -326,7 +349,7 @@ async fn schema_version_rules_follow_adr_0023() {
         "DROP TABLE schema_migrations; DROP TABLE changeset_dicts; DROP TABLE store_features; \
          DROP INDEX ref_log_land_id; ALTER TABLE ref_log DROP COLUMN land_changeset; \
          ALTER TABLE ref_log DROP COLUMN land_id; \
-         DROP TABLE leases",
+         DROP TABLE leases; ALTER TABLE changesets DROP COLUMN stored_at",
     )
     .await;
     let dest_url = sqlite_url(dir.path(), "d2.db");
@@ -348,7 +371,7 @@ async fn schema_version_rules_follow_adr_0023() {
     let v1 = edit(
         "v1.db",
         "DROP TABLE changeset_dicts; DROP TABLE store_features; DROP TABLE leases; DROP INDEX ref_log_land_id; ALTER TABLE ref_log DROP COLUMN land_changeset; \
-         ALTER TABLE ref_log DROP COLUMN land_id; \
+         ALTER TABLE ref_log DROP COLUMN land_id; ALTER TABLE changesets DROP COLUMN stored_at; \
          DELETE FROM schema_migrations WHERE version > 1",
     )
     .await;
@@ -372,7 +395,7 @@ async fn schema_version_rules_follow_adr_0023() {
     let v2 = edit(
         "v2.db",
         "DROP TABLE changeset_dicts; DROP TABLE store_features; DROP TABLE leases; DROP INDEX ref_log_land_id; ALTER TABLE ref_log DROP COLUMN land_changeset; \
-         ALTER TABLE ref_log DROP COLUMN land_id; \
+         ALTER TABLE ref_log DROP COLUMN land_id; ALTER TABLE changesets DROP COLUMN stored_at; \
          DELETE FROM schema_migrations WHERE version > 2",
     )
     .await;
@@ -396,7 +419,7 @@ async fn schema_version_rules_follow_adr_0023() {
     let v3 = edit(
         "v3.db",
         "DROP TABLE store_features; DROP TABLE leases; DROP INDEX ref_log_land_id; ALTER TABLE ref_log DROP COLUMN land_changeset; \
-         ALTER TABLE ref_log DROP COLUMN land_id; \
+         ALTER TABLE ref_log DROP COLUMN land_id; ALTER TABLE changesets DROP COLUMN stored_at; \
          DELETE FROM schema_migrations WHERE version > 3",
     )
     .await;
@@ -422,6 +445,7 @@ async fn schema_version_rules_follow_adr_0023() {
         "v4.db",
         "DROP INDEX ref_log_land_id; ALTER TABLE ref_log DROP COLUMN land_changeset; \
          ALTER TABLE ref_log DROP COLUMN land_id; DROP TABLE leases; \
+         ALTER TABLE changesets DROP COLUMN stored_at; \
          DELETE FROM schema_migrations WHERE version > 4",
     )
     .await;
@@ -441,6 +465,33 @@ async fn schema_version_rules_follow_adr_0023() {
     );
     assert!(dump(&*d7).await.4.iter().all(|l| l == "None"));
     assert!(dump(&*src).await.4.iter().any(|l| l != "None"));
+
+    // From v6, before `changesets.stored_at` (ADR 0059): the column is added
+    // on the scratch copy, and every restored row reads as stored when that
+    // migration ran.
+    let v6 = edit(
+        "v6.db",
+        "ALTER TABLE changesets DROP COLUMN stored_at; \
+         DELETE FROM schema_migrations WHERE version > 6",
+    )
+    .await;
+    assert_eq!(snapshot_schema_version(&v6).await.unwrap(), 6);
+    let dest_url = sqlite_url(dir.path(), "d8.db");
+    let before = leep_core::store::unix_now() as u64;
+    import_snapshot(&v6, &dest_url, false, SchemaMode::Migrate)
+        .await
+        .unwrap();
+    let d8 = open_meta_store(&dest_url).await.unwrap();
+    assert_eq!(
+        d8.schema_version().await.unwrap(),
+        Some(latest_schema_version())
+    );
+    let (d, src_dump) = (dump(&*d8).await, dump(&*src).await);
+    assert_eq!(d.4, src_dump.4, "land ids survive");
+    assert_eq!(without_lands(d.clone()), without_lands(src_dump));
+    let first = d.5[0].unwrap();
+    assert!(first >= before, "{first} < {before}");
+    assert!(d.5.iter().all(|t| *t == Some(first)), "{:?}", d.5);
 
     // Not a snapshot at all.
     let junk = dir.path().join("junk.db");

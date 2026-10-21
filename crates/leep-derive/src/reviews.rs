@@ -23,6 +23,8 @@ pub(crate) fn storage_key(id: ChangesetId, reviewer: &str) -> Hash {
 impl Repo {
     /// Store `review` for `id`, replacing the reviewer's earlier verdict.
     pub async fn put_review(&self, id: ChangesetId, review: &Review) -> Result<()> {
+        self.rescue_changesets(&[id], crate::changeset_gc::RescueBy::Attest)
+            .await?;
         self.get_changeset(id).await?;
         check_comment(&review.comment)?;
         self.meta()

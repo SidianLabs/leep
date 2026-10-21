@@ -101,6 +101,9 @@ impl BlobStore for MemoryBlobStore {
 #[derive(Default)]
 pub struct MemoryMetaStore {
     changesets: Mutex<BTreeMap<ChangesetId, Changeset>>,
+    /// When each changeset was first stored; written under the
+    /// `changesets` lock.
+    stored_at: Mutex<HashMap<ChangesetId, u64>>,
     refs: Mutex<Refs>,
     derived: Mutex<BTreeMap<(String, Hash), Bytes>>,
     leases: Mutex<BTreeMap<LeaseKey, LeaseRow>>,
@@ -251,7 +254,34 @@ impl MemoryMetaStore {
     /// of verification and repair only.
     #[doc(hidden)]
     pub fn remove_changeset(&self, id: &ChangesetId) -> bool {
-        self.changesets.lock().unwrap().remove(id).is_some()
+        let mut changesets = self.changesets.lock().unwrap();
+        self.stored_at.lock().unwrap().remove(id);
+        changesets.remove(id).is_some()
+    }
+
+    /// Set when a stored changeset reads as stored (unix seconds), for tests
+    /// of age-based behaviour. Returns false if the changeset is absent.
+    #[doc(hidden)]
+    pub fn set_stored_at(&self, id: &ChangesetId, at: u64) -> bool {
+        let changesets = self.changesets.lock().unwrap();
+        if !changesets.contains_key(id) {
+            return false;
+        }
+        self.stored_at.lock().unwrap().insert(*id, at);
+        true
+    }
+
+    /// Store `cs` unless it is stored, recording the time on the first store.
+    /// The caller holds the `changesets` lock.
+    fn insert_changeset(&self, changesets: &mut BTreeMap<ChangesetId, Changeset>, cs: &Changeset) {
+        let id = cs.id();
+        if let std::collections::btree_map::Entry::Vacant(v) = changesets.entry(id) {
+            v.insert(cs.clone());
+            self.stored_at
+                .lock()
+                .unwrap()
+                .insert(id, unix_now().max(0) as u64);
+        }
     }
 }
 
@@ -326,13 +356,14 @@ impl MetaStore for MemoryMetaStore {
     }
 
     async fn put_changeset(&self, cs: &Changeset) -> Result<ChangesetId> {
-        let id = cs.id();
-        self.changesets
-            .lock()
-            .unwrap()
-            .entry(id)
-            .or_insert_with(|| cs.clone());
-        Ok(id)
+        self.insert_changeset(&mut self.changesets.lock().unwrap(), cs);
+        Ok(cs.id())
+    }
+
+    async fn changesets_stored_at(&self, ids: &[ChangesetId]) -> Result<Vec<Option<u64>>> {
+        let _changesets = self.changesets.lock().unwrap();
+        let at = self.stored_at.lock().unwrap();
+        Ok(ids.iter().map(|id| at.get(id).copied()).collect())
     }
 
     async fn get_changeset(&self, id: &ChangesetId) -> Result<Option<Changeset>> {
@@ -555,7 +586,7 @@ impl MetaStore for MemoryMetaStore {
         let id = cs.id();
         let mut changesets = self.changesets.lock().unwrap();
         let mut all = self.derived.lock().unwrap();
-        changesets.entry(id).or_insert_with(|| cs.clone());
+        self.insert_changeset(&mut changesets, cs);
         for r in rows {
             all.insert((r.kind.clone(), r.key), r.value.clone());
         }
@@ -570,7 +601,7 @@ impl MetaStore for MemoryMetaStore {
         let mut stored = self.changesets.lock().unwrap();
         let mut all = self.derived.lock().unwrap();
         for cs in changesets {
-            stored.entry(cs.id()).or_insert_with(|| cs.clone());
+            self.insert_changeset(&mut stored, cs);
         }
         for r in rows {
             all.insert((r.kind.clone(), r.key), r.value.clone());
@@ -860,6 +891,7 @@ pub async fn check_meta_store_contract(store: &dyn MetaStore) {
     check_ref_log(store).await;
     check_ref_chain_log(store).await;
     check_land_ids(store).await;
+    check_stored_at(store, &cs).await;
 
     let key = Hash::of_blob(b"k");
     assert!(store.get_derived("kind", &key).await.unwrap().is_none());
@@ -1736,6 +1768,72 @@ async fn check_ref_chain_log(store: &dyn MetaStore) {
             (Some(c), None)
         ]
     );
+}
+
+/// Store times (ADR 0059): recorded by every way of storing a changeset,
+/// kept by a repeated store, `None` for an absent id, one slot per id in
+/// order.
+async fn check_stored_at(store: &dyn MetaStore, first: &Changeset) {
+    let before = unix_now() as u64;
+    let cs = |n: u8| Changeset {
+        parents: vec![],
+        author: "stored-at".into(),
+        timestamp: 0,
+        message: format!("stored-at {n}"),
+        changes: BTreeMap::new(),
+        extra: BTreeMap::new(),
+    };
+    let row = |n: u8| {
+        DerivedRow::new(
+            "stored-at-kind",
+            Hash::of_blob(&[n]),
+            Bytes::from_static(b"v"),
+        )
+    };
+    let one = store.put_changeset(&cs(1)).await.unwrap();
+    let two = store
+        .put_changeset_with_derived(&cs(2), &[row(2)])
+        .await
+        .unwrap();
+    store
+        .put_changesets_with_derived(&[cs(3), cs(4)], &[row(3)])
+        .await
+        .unwrap();
+    let (three, four) = (cs(3).id(), cs(4).id());
+    let missing = ChangesetId(Hash::of_blob(b"never stored"));
+    let ids = [first.id(), one, missing, two, three, four, one];
+    let got = store.changesets_stored_at(&ids).await.unwrap();
+    assert_eq!(got.len(), ids.len(), "one slot per id");
+    assert!(got[2].is_none(), "an absent changeset has no store time");
+    let after = unix_now() as u64;
+    for (id, at) in ids.iter().zip(&got) {
+        if *id == missing {
+            continue;
+        }
+        let at = at.unwrap_or_else(|| panic!("{id} has no store time"));
+        // `first` was stored a little earlier in the contract run.
+        assert!(at <= after, "{id} stored at {at}, after {after}");
+        if *id != first.id() {
+            assert!(at + 1 >= before, "{id} stored at {at}, before {before}");
+        }
+    }
+    assert_eq!(got[1], got[6], "a repeated id gets the same answer");
+    assert!(store.changesets_stored_at(&[]).await.unwrap().is_empty());
+
+    // Storing again, by any path, keeps the first time.
+    let earlier = got.clone();
+    // Whole seconds: wait long enough for an overwrite to show.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    store.put_changeset(&cs(1)).await.unwrap();
+    store
+        .put_changeset_with_derived(&cs(2), &[row(2)])
+        .await
+        .unwrap();
+    store
+        .put_changesets_with_derived(&[cs(3), cs(4)], &[])
+        .await
+        .unwrap();
+    assert_eq!(store.changesets_stored_at(&ids).await.unwrap(), earlier);
 }
 
 /// Paging over changesets: ascending, exclusive cursor, complete, no overlap.

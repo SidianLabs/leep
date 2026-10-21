@@ -42,6 +42,11 @@ skill.
 | derived `blob-rescue-v1` | — | `MetaStore.derived`, key = blob hash, value = the condemnation time the writer observed, 8-byte big-endian `i64` |
 | derived `blob-doom-v1` | — | `MetaStore.derived`, key = blob hash, value = condemnation time (8-byte big-endian `i64`) then one state byte: 0 deleting, 1 abandoned, 2 deleted |
 | derived `gc-mark-v1` | — | `MetaStore.derived`, key = changeset id, tree node hash or blob hash, value = the single byte `0x01` (anything else reads as absent). Written by GC marks in post-order, so a row exists only after the rows of everything below it (ADR 0033) |
+| derived `cs-condemned-v1` | — | `MetaStore.derived`, key = changeset id, value = condemnation time, unix seconds as 8-byte big-endian `i64`, from the sweep host's clock (ADR 0059) |
+| derived `cs-rescue-v1` | — | `MetaStore.derived`, key = changeset id, value = the condemnation time the writer observed, 8-byte big-endian `i64` |
+| derived `cs-doom-v1` | — | `MetaStore.derived`, key = changeset id, value = condemnation time (8-byte big-endian `i64`) then one state byte: 0 deleting, 1 abandoned, 2 deleted |
+| derived `gc-fence-active-v1` | — | `MetaStore.derived`, one row, key = 32 zero bytes, value = unix seconds the current changeset condemnation round began, 8-byte big-endian `i64`, or 0 when none is under way |
+| derived `cs-reach-v1` | — | `MetaStore.derived`, key = changeset id, value = the single byte `0x01` (anything else reads as absent): a ref or ref log entry reaches the changeset, and every parent has a row. Written parents first (ADR 0059). One more row, key = 32 zero bytes, holds the `seq` of the newest ref log entry the rows cover (8-byte big-endian) |
 | derived `blob-trigrams-v1` | — | `MetaStore.derived`, key = blob hash, value = see "Code search index" below |
 | derived `tree-trigrams-v1` | — | `MetaStore.derived`, key = tree node hash (`TreeNode::hash()`), value = see "Code search index" below |
 | derived `history-tree-v4` | — | `MetaStore.derived`, key = changeset id, value = part 0 of the changeset's history pack (ADR 0045): the history nodes its derivation wrote, and its root node's address |
@@ -426,7 +431,8 @@ a blank line and `This reverts <id>.`.
 ## SQL schema (leep-meta)
 
 ```
-changesets(id BYTEA PRIMARY KEY, data BYTEA NOT NULL)          -- data = Changeset::encode(), or a zstd frame of it (ADR 0053)
+changesets(id BYTEA PRIMARY KEY, data BYTEA NOT NULL,          -- data = Changeset::encode(), or a zstd frame of it (ADR 0053)
+           stored_at BIGINT)                                   -- migration 0007; SQLite: INTEGER; unix seconds of the first store
 changeset_dicts(id BIGINT PRIMARY KEY,                         -- SQLite: INTEGER; migration 0003
                 created_at BIGINT NOT NULL, data BYTEA NOT NULL) -- a zstd dictionary whose header id = id
 store_features(name TEXT PRIMARY KEY,                          -- migration 0004
@@ -486,6 +492,19 @@ Migration 0006 (`leases`, ADR 0056) adds the lease table, empty. Servers
 write it only with `--land-coordination on` (and, later, for the indexer
 scope of ADR 0058); older servers never read it, so the migration tolerates
 them. See "Leases" below.
+
+Migration 0007 (`changeset_stored_at`, ADR 0059) adds the nullable
+`changesets.stored_at`: unix seconds, by the clock of the server that first
+stored the changeset. Every `put_changeset*` writes it on insert and a
+repeated store keeps the first value; `compact-changesets` rewrites `data`
+only. With no default it is a catalog-only change on both backends: no row
+is rewritten. Rows stored before the migration, and rows a v6 server stores
+after it (v6 never names the column), stay NULL and read through
+`MetaStore::changesets_stored_at` as the migration's
+`schema_migrations.applied_at`. Changeset garbage collection ages changesets
+by it, never by the client's `Changeset::timestamp`. Backups (ADR 0026) copy
+the column with that substitution already made, so a restore, whose own
+migrations run later, keeps every row's age.
 
 ### Changeset rows (ADR 0053)
 
@@ -953,6 +972,25 @@ means a new kind name (`-v2`).
 "missing blob" for it, exactly as for an absent blob. `PUT /v1/blobs/{hash}`
 may answer 408 (request timeout) or 409 (blob being collected, retry). New
 server flag `--request-timeout` / `LEEP_REQUEST_TIMEOUT`.
+
+## Changeset garbage collection, phase 1 (new column, derived kinds and `MetaStore` method, ADR 0059)
+
+Persisted: `changesets.stored_at` (migration 0007 above) and the derived
+kinds `cs-condemned-v1`, `cs-rescue-v1`, `cs-doom-v1`, `gc-fence-active-v1`
+and `cs-reach-v1` in the table above. The first three have exactly the
+encodings and rules of their `blob-*-v1` counterparts (ADR 0012), keyed by
+changeset id: a changeset is condemned iff `condemned > rescue`. Golden
+bytes are asserted in `leep-derive` (`cs_row_encodings_are_stable`).
+`MetaStore` gains `changesets_stored_at(ids)`, whose default is an error
+(like `find_lands`), so a wrapper that does not forward it fails loudly.
+
+Wire: `GET /v1/ready` lists `changeset-rescue` in `features` (a server that
+rescues condemned changesets before writing anything that names them). A
+keyed `POST /v1/land` whose changeset is not stored is answered from its
+land id record, when there is one, with the `Landed` it got the first time,
+instead of 404. A land batch that runs past 60 s answers its lands 409
+(retry). No `/v1` field, `Changeset`, `TreeNode`, hash or other encoding
+changed.
 
 ## Backup directory (new, ADR 0026; no change to stored objects)
 Written and read by `leep-server backup`, `restore` and `backup-verify`.

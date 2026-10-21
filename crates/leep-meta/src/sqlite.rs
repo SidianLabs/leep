@@ -58,6 +58,12 @@ pub const MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/sqlite/0006_leases.sql"),
         satisfied_by: &[],
     },
+    Migration {
+        version: 7,
+        name: "changeset_stored_at",
+        sql: include_str!("../migrations/sqlite/0007_changeset_stored_at.sql"),
+        satisfied_by: &[],
+    },
 ];
 
 pub struct SqliteMetaStore {
@@ -69,6 +75,8 @@ pub struct SqliteMetaStore {
     pub(crate) has_dicts: bool,
     /// Whether the schema has `store_features` (ADR 0055).
     pub(crate) has_features: bool,
+    /// Whether `changesets` has `stored_at` (ADR 0059).
+    pub(crate) has_stored_at: bool,
 }
 
 impl SqliteMetaStore {
@@ -273,7 +281,35 @@ impl SqliteMetaStore {
             has_features: migrations
                 .iter()
                 .any(|m| m.version >= crate::features::FEATURES_SCHEMA_VERSION),
+            has_stored_at: migrations
+                .iter()
+                .any(|m| m.version >= crate::STORED_AT_SCHEMA_VERSION),
         }
+    }
+
+    /// Store one encoded changeset unless it is stored, with its store time
+    /// on schemas that have the column.
+    async fn insert_changeset(
+        &self,
+        conn: &mut SqliteConnection,
+        id: &ChangesetId,
+        data: &[u8],
+    ) -> Result<()> {
+        let q = if self.has_stored_at {
+            sqlx::query(
+                "INSERT INTO changesets (id, data, stored_at) VALUES (?, ?, ?) \
+                 ON CONFLICT DO NOTHING",
+            )
+            .bind(id.0.as_bytes().as_slice())
+            .bind(data)
+            .bind(crate::stored_now())
+        } else {
+            sqlx::query("INSERT INTO changesets (id, data) VALUES (?, ?) ON CONFLICT DO NOTHING")
+                .bind(id.0.as_bytes().as_slice())
+                .bind(data)
+        };
+        q.execute(conn).await.map_err(storage)?;
+        Ok(())
     }
 
     /// The format features the store names (ADR 0055).
@@ -464,13 +500,37 @@ impl MetaStore for SqliteMetaStore {
     async fn put_changeset(&self, cs: &Changeset) -> Result<ChangesetId> {
         let id = cs.id();
         let data = self.encode(cs).await?;
-        sqlx::query("INSERT INTO changesets (id, data) VALUES (?, ?) ON CONFLICT DO NOTHING")
-            .bind(id.0.as_bytes().as_slice())
-            .bind(data)
-            .execute(&self.pool)
-            .await
-            .map_err(storage)?;
+        let mut conn = self.pool.acquire().await.map_err(storage)?;
+        self.insert_changeset(&mut conn, &id, &data).await?;
         Ok(id)
+    }
+
+    /// One `IN (...)` query per [`BATCH_PARAMS`] distinct ids; rows from
+    /// before migration 0007 read as stored when it was applied.
+    async fn changesets_stored_at(&self, ids: &[ChangesetId]) -> Result<Vec<Option<u64>>> {
+        if !self.has_stored_at {
+            return Err(leep_core::Error::Invalid(
+                "the schema predates changesets.stored_at (v7); run `leep-server migrate` first"
+                    .into(),
+            ));
+        }
+        let keys: Vec<&[u8]> = unique(ids.iter().map(|i| i.0.as_bytes().as_slice()));
+        let mut found: Vec<(Vec<u8>, Option<i64>)> = Vec::with_capacity(keys.len());
+        for chunk in keys.chunks(BATCH_PARAMS) {
+            let sql = format!(
+                "SELECT id, CASE WHEN stored_at >= 0 THEN stored_at ELSE (SELECT applied_at \
+                 FROM schema_migrations WHERE version = {}) END FROM changesets WHERE id IN ({})",
+                crate::STORED_AT_SCHEMA_VERSION,
+                placeholders(chunk.len())
+            );
+            let mut q = sqlx::query(&sql);
+            for k in chunk {
+                q = q.bind(*k);
+            }
+            let rows = q.fetch_all(&self.pool).await.map_err(storage)?;
+            found.extend(rows.iter().map(|r| (r.get(0), r.get(1))));
+        }
+        crate::stored_at_in_order(ids, found.into_iter())
     }
 
     async fn get_changeset(&self, id: &ChangesetId) -> Result<Option<Changeset>> {
@@ -911,12 +971,7 @@ impl MetaStore for SqliteMetaStore {
         let id = cs.id();
         let data = self.encode(cs).await?;
         let mut tx = self.pool.begin().await.map_err(storage)?;
-        sqlx::query("INSERT INTO changesets (id, data) VALUES (?, ?) ON CONFLICT DO NOTHING")
-            .bind(id.0.as_bytes().as_slice())
-            .bind(data)
-            .execute(&mut *tx)
-            .await
-            .map_err(storage)?;
+        self.insert_changeset(&mut tx, &id, &data).await?;
         put_rows(&mut tx, rows).await?;
         tx.commit().await.map_err(storage)?;
         Ok(id)
@@ -937,12 +992,7 @@ impl MetaStore for SqliteMetaStore {
         }
         let mut tx = self.pool.begin().await.map_err(storage)?;
         for (id, data) in &encoded {
-            sqlx::query("INSERT INTO changesets (id, data) VALUES (?, ?) ON CONFLICT DO NOTHING")
-                .bind(id.0.as_bytes().as_slice())
-                .bind(data.as_slice())
-                .execute(&mut *tx)
-                .await
-                .map_err(storage)?;
+            self.insert_changeset(&mut tx, id, data).await?;
         }
         put_rows(&mut tx, rows).await?;
         tx.commit().await.map_err(storage)

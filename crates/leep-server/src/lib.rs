@@ -289,6 +289,7 @@ fn features() -> Vec<String> {
     vec![
         leep_core::api::FEATURE_LAND_ID.into(),
         leep_core::api::FEATURE_INDEXING_RETRY.into(),
+        leep_core::api::FEATURE_CHANGESET_RESCUE.into(),
     ]
 }
 
