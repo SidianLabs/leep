@@ -114,6 +114,11 @@ pub struct LeaseTiming {
 /// The scope of land coordination leases (ADR 0056): one per ref, shard 0.
 pub const LAND_LEASE_SCOPE: &str = "land";
 
+/// The scope of index leases (ADR 0058): one per index group, named by its
+/// primary kind, in repository 0 because index rows are shared by every
+/// repository of a store (ADR 0054).
+pub const INDEX_LEASE_SCOPE: &str = "index";
+
 /// Names one lease: what kind of work it coordinates (`scope`), in which
 /// repository (1 until ADR 0054), over what (`name`, for example a ref) and
 /// which part of it (`shard`).
@@ -139,6 +144,17 @@ impl LeaseKey {
     /// The land coordination lease of `ref_name`.
     pub fn land(ref_name: impl Into<String>) -> Self {
         Self::new(LAND_LEASE_SCOPE, ref_name)
+    }
+
+    /// The index lease of the group whose primary kind is `kind` (ADR 0058):
+    /// store-wide, so repository 0, and shard 0 until shards are needed.
+    pub fn index(kind: impl Into<String>) -> Self {
+        LeaseKey {
+            scope: INDEX_LEASE_SCOPE.into(),
+            repo_id: 0,
+            name: kind.into(),
+            shard: 0,
+        }
     }
 
     pub fn with_shard(mut self, shard: i32) -> Self {
@@ -463,6 +479,24 @@ pub trait MetaStore: Send + Sync + 'static {
             .into_iter()
             .take_while(|id| prefix.matches(id))
             .collect())
+    }
+
+    /// When each of `ids` was first stored, in unix seconds by the store's
+    /// writer (one slot per id, in order; `None` for an absent id). It ages
+    /// changesets for garbage collection (ADR 0059), which must not trust
+    /// `Changeset::timestamp`: the client sets that. Every `put_changeset*`
+    /// records the time on the first store and keeps it on later ones. A
+    /// changeset stored before a backend recorded times reads as stored when
+    /// the backend started recording them (its migration's `applied_at`).
+    ///
+    /// Every backend must implement this (see
+    /// [`list_derived`](Self::list_derived)): a wrapper that does not forward
+    /// it fails loudly instead of making every changeset look new or old.
+    async fn changesets_stored_at(&self, ids: &[ChangesetId]) -> Result<Vec<Option<u64>>> {
+        let _ = ids;
+        Err(Error::Invalid(
+            "this metadata store cannot report when changesets were stored".into(),
+        ))
     }
 
     async fn get_ref(&self, name: &str) -> Result<Option<ChangesetId>>;

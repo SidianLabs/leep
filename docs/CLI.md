@@ -66,6 +66,12 @@ other flags and revision (use the full id the first page started from if a ref
 may move), continue from there. An older server without cursors answers one
 page.
 
+`leep log --oneline` prints one line per changeset, the short id and the
+message's first line. It asks the server for summary entries
+(`fields=summary`: no changed paths, the message's first line, `agent.*`
+metadata), about a quarter of the bytes of full ones on git/git; with
+`--json` it prints them. `leep log` and `leep log --json` are unchanged.
+
 ## Landing onto a new ref
 
 `leep land` moves the working copy's target ref, or the ref given with
@@ -131,6 +137,7 @@ line, in addition to the usual text on stderr:
 | `server` | 3 | A 5xx answer, an answer that does not decode, or data that fails its hash check. |
 | `timeout` | 3 | The request timed out; it may or may not have taken effect. |
 | `rate_limited` | 3 | 429 after the client's own retries. |
+| `indexing` | 3 | The server's index lags too far behind and it answered 503 after `LEEP_INDEX_WAIT` seconds (60) of retries; `retry_after_ms` says when to try again (ADR 0058). `log`, `last-change`, `blame` and `search` print `indexing: N changesets behind ..., retrying in Ss` while they retry, and `--stale-ok` takes an answer at the newest indexed changeset instead, printing `(answered at X, N behind)` on stderr. |
 | `not_found` | 4 | Something named does not exist. |
 | `conflict` | 5 | Conflicts to resolve, or (with `retryable: true`) a concurrent update that won. |
 | `nothing_to_do` | 6 | Nothing to record. |

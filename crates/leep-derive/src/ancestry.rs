@@ -693,6 +693,11 @@ mod tests {
         singles: AtomicUsize,
         batches: AtomicUsize,
         cs_ids: AtomicUsize,
+        /// `get_changeset` and `get_changesets` calls.
+        cs_singles: AtomicUsize,
+        cs_batches: AtomicUsize,
+        /// The kind of each `get_derived_many` call.
+        derived_many: std::sync::Mutex<Vec<String>>,
     }
 
     impl Counter {
@@ -724,6 +729,7 @@ mod tests {
         }
         async fn get_changeset(&self, id: &ChangesetId) -> leep_core::Result<Option<Changeset>> {
             self.call(false).await?;
+            self.cs_singles.fetch_add(1, Ordering::Relaxed);
             self.inner.get_changeset(id).await
         }
         async fn get_changesets(
@@ -731,6 +737,7 @@ mod tests {
             ids: &[ChangesetId],
         ) -> leep_core::Result<Vec<Option<Changeset>>> {
             self.call(true).await?;
+            self.cs_batches.fetch_add(1, Ordering::Relaxed);
             self.cs_ids.fetch_add(ids.len(), Ordering::Relaxed);
             self.inner.get_changesets(ids).await
         }
@@ -774,6 +781,7 @@ mod tests {
             keys: &[Hash],
         ) -> leep_core::Result<Vec<Option<Bytes>>> {
             self.call(true).await?;
+            self.derived_many.lock().unwrap().push(kind.to_string());
             self.inner.get_derived_many(kind, keys).await
         }
         async fn put_derived(&self, kind: &str, key: &Hash, value: Bytes) -> leep_core::Result<()> {
@@ -782,6 +790,82 @@ mod tests {
         async fn delete_derived_kind(&self, kind: &str) -> leep_core::Result<u64> {
             self.inner.delete_derived_kind(kind).await
         }
+    }
+
+    /// A plain path log on a warm `Repo` makes no read per entry: the walk
+    /// takes parents from the ancestry cache, and the page's changesets and
+    /// root trees come in one batch each. A changeset the walk must examine
+    /// (un-indexed in a bounded query) is still read on the way.
+    #[tokio::test]
+    async fn warm_path_log_reads_its_entries_in_one_batch() {
+        use leep_core::{FileChange, FileKind, RepoPath};
+
+        use crate::derived::RootTree;
+        use crate::indexing::bounded::Bounded;
+
+        let meta = Arc::new(Counter::default());
+        let r = Repo::new(Arc::new(MemoryBlobStore::new()), meta.clone());
+        let mut tip: Option<ChangesetId> = None;
+        for i in 0..40 {
+            let mut changes = BTreeMap::new();
+            let touch = |path: &str, text: String| {
+                let size = text.len() as u64;
+                (path.to_string(), Bytes::from(text), size)
+            };
+            let mut files = vec![touch("b", format!("b{i}"))];
+            if i % 3 == 0 {
+                files.push(touch("a", format!("a{i}")));
+            }
+            for (path, data, size) in files {
+                let content = r.put_blob(data).await.unwrap();
+                changes.insert(
+                    RepoPath::new(path).unwrap(),
+                    FileChange::Modify {
+                        content,
+                        kind: FileKind::Regular,
+                        size,
+                    },
+                );
+            }
+            let cs = Changeset {
+                parents: tip.into_iter().collect(),
+                author: "t".into(),
+                timestamp: i,
+                message: format!("c{i}"),
+                changes,
+                extra: BTreeMap::new(),
+            };
+            tip = Some(r.create_changeset(cs).await.unwrap());
+        }
+        let tip = tip.unwrap();
+        let first = r.log(tip, Some("a"), 100).await.unwrap();
+        assert_eq!(first.len(), 14);
+
+        let reset = || {
+            meta.cs_singles.store(0, Ordering::Relaxed);
+            meta.cs_batches.store(0, Ordering::Relaxed);
+            meta.derived_many.lock().unwrap().clear();
+        };
+        reset();
+        let again = r.log(tip, Some("a"), 100).await.unwrap();
+        assert_eq!(again, first);
+        assert_eq!(meta.cs_singles.load(Ordering::Relaxed), 0);
+        assert_eq!(meta.cs_batches.load(Ordering::Relaxed), 1);
+        let kinds = meta.derived_many.lock().unwrap().clone();
+        let roots = kinds.iter().filter(|k| *k == RootTree::NAME).count();
+        assert_eq!(roots, 1, "{kinds:?}");
+
+        // The tip as the un-indexed part of a bounded query: examined, so
+        // read on the walk, with the same answer.
+        let mut bounded = r.clone();
+        bounded.bounded = Some(Arc::new(Bounded {
+            unindexed: [tip].into(),
+            ..Default::default()
+        }));
+        reset();
+        let examined = bounded.log(tip, Some("a"), 100).await.unwrap();
+        assert_eq!(examined, first);
+        assert_eq!(meta.cs_singles.load(Ordering::Relaxed), 1);
     }
 
     struct Lcg(u64);

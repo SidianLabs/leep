@@ -26,7 +26,7 @@ docker build -t leep:dev .
 docker run -d --name leep -p 127.0.0.1:7070:7070 \
   -e LEEP_INSECURE_NO_AUTH=1 -v leep-data:/var/lib/leep leep:dev
 curl -s localhost:7070/v1/health      # "ok": the process is up
-curl -s localhost:7070/v1/ready       # {"status":"ready","features":["land-id"]}: it can reach its stores
+curl -s localhost:7070/v1/ready       # {"status":"ready","features":["land-id","indexing-retry","changeset-rescue"]}: it can reach its stores
 ```
 
 Drive it with the CLI from the host or from the same image:
@@ -84,7 +84,7 @@ file says):
 | Endpoint | Question | Checks | Answer |
 |---|---|---|---|
 | `GET /v1/health` | Is the process alive? (liveness) | nothing but that HTTP is served | 200 `"ok"` |
-| `GET /v1/ready` | Can it serve right now? (readiness) | reads one ref from the metadata store and asks the blob store about one fixed hash, concurrently, each under `--ready-timeout` (default 2 s) | 200 `{"status":"ready","features":["land-id"]}`, or 503 `{"status":"not ready","failed":[{"store":"meta","reason":"unavailable"}],"features":["land-id"]}` (`features`: optional behaviours clients may check for, ADR 0057) |
+| `GET /v1/ready` | Can it serve right now? (readiness) | reads one ref from the metadata store and asks the blob store about one fixed hash, concurrently, each under `--ready-timeout` (default 2 s) | 200 `{"status":"ready","features":["land-id","indexing-retry","changeset-rescue"]}`, or 503 `{"status":"not ready","failed":[{"store":"meta","reason":"unavailable"}],"features":["land-id","indexing-retry","changeset-rescue"]}` (`features`: optional behaviours clients may check for, ADR 0057) |
 
 `store` is `meta` or `blobs`; `reason` is `unavailable` or `timed out after
 2000ms`, never the driver's message (it can carry a host name; the server logs
@@ -194,6 +194,34 @@ tokens when you need fairness between agents, and keep the proxy's own limits
 as the first line against anonymous floods. Limit state is per server process,
 so with N servers behind a balancer a token can use up to N times its rate.
 
+## Protected refs
+
+Protect the refs everyone builds on, such as `main`, even when you require
+neither signatures nor review:
+
+```sh
+docker run -d -p 127.0.0.1:7070:7070 -v leep-data:/var/lib/leep \
+  -v "$PWD/tokens.json:/etc/leep/tokens.json:ro" \
+  -e LEEP_TOKENS_FILE=/etc/leep/tokens.json \
+  -e LEEP_PROTECT_REFS=main,release leep:dev
+```
+
+`--protect-ref REF` (repeatable; `LEEP_PROTECT_REFS` is comma-separated) makes
+`REF` move only forward and refuses to delete it: `land` works as before and
+`POST /v1/refs/{name}` may fast-forward it (the git mirror's imports do), but a
+rewind (a raw compare-and-swap, or `leep undo` of a land), a sideways move or a
+delete (`leep branch -d`) is a 400. Any write token can still land on it; add `--require-signatures` or
+`--require-review` for that. Refs listed there, or in a review policy's
+`refs`, are protected the same way already, so `--protect-ref` is for refs
+without such a policy. Without it, a write token could reset `main` to an old
+changeset or delete it with one raw compare-and-swap.
+
+The names are exact and checked at startup like the other policy flags: a name
+that is not a valid ref name stops the server, and one with no ref yet is
+logged as a warning. The flag is read once; changing it needs a restart.
+`leep-git import` writes the stores directly and is not covered. To take a
+change back on a protected ref, `leep revert` it and land the revert.
+
 ## Signed changesets
 
 Optional. Authors sign changesets with Ed25519 keys; the server trusts only the
@@ -286,7 +314,7 @@ What a reload covers:
 |---|---|
 | Tokens: added, revoked, rotated, role changes | Listen and metrics addresses, stores, cache size |
 | Per-token limits (`rate`, `burst`, `concurrency`, `max_body`) | `--request-timeout`, `--max-body-bytes`, and the server-wide limit defaults |
-| Trusted signing keys | `--require-signatures` and `--require-review` refs |
+| Trusted signing keys | `--require-signatures`, `--require-review` and `--protect-ref` refs |
 | Review policy: `refs`, auto-approval rules, docs globs | Which files are configured at all (a server started without `--tokens-file` stays open) |
 
 Write each file atomically (save beside it, then `mv` over it) so a reload never
@@ -328,6 +356,7 @@ a reload is refused.
 | `LEEP_REQUIRE_SIGNATURES` | none | Comma-separated refs that only accept signed lands; needs the keys file. |
 | `LEEP_REVIEW_POLICY_FILE` | none | Review policy JSON (auto-approval rules, refs that require review); needs the tokens file. |
 | `LEEP_REQUIRE_REVIEW` | none | Comma-separated refs that only accept reviewed lands; needs the tokens file. |
+| `LEEP_PROTECT_REFS` | none | Comma-separated refs that only move forward and cannot be deleted; see [Protected refs](#protected-refs). |
 | `LEEP_SERVER` | none | CLI only: server URL. |
 | `LEEP_SIGNING_KEY` | none | CLI only: private key file for `leep commit --sign`. |
 | `LEEP_TOKEN` | none | CLI only: bearer token. |

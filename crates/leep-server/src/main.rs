@@ -156,6 +156,14 @@ struct Args {
     /// environment variable takes a comma-separated list. Needs --tokens-file.
     #[arg(long, env = "LEEP_REQUIRE_REVIEW", value_delimiter = ',')]
     require_review: Vec<String>,
+    /// Protect this ref without requiring signatures or review: it only
+    /// moves forward (a land, or a fast-forward through `POST /v1/refs`)
+    /// and cannot be deleted through the API. Refs listed in
+    /// --require-signatures, --require-review or the review policy are
+    /// already protected. Repeatable; the environment variable takes a
+    /// comma-separated list.
+    #[arg(long = "protect-ref", env = "LEEP_PROTECT_REFS", value_delimiter = ',')]
+    protect_refs: Vec<String>,
     /// Serve Prometheus metrics on this address (`GET /metrics`, no auth, keep
     /// it private). Off when unset.
     #[arg(long, env = "LEEP_METRICS_LISTEN")]
@@ -195,6 +203,42 @@ struct Args {
     /// How often held land leases are renewed.
     #[arg(long, env = "LEEP_LAND_LEASE_RENEW", default_value = "500ms", value_parser = parse_ready_timeout)]
     land_lease_renew: std::time::Duration,
+    /// Who builds the indexes (ADR 0058). `local`: this server warms every
+    /// index and queries derive what they miss. `lease`: one server per
+    /// index group, the holder of the group's lease in the metadata store,
+    /// warms it. `off`: never warm. In `lease` and `off` modes queries never
+    /// derive an index while a lease lives: they scan a bounded amount of
+    /// un-indexed history and otherwise answer 503 with Retry-After.
+    #[arg(long, env = "LEEP_INDEXING", value_enum, default_value_t = Indexing::Local)]
+    indexing: Indexing,
+    /// Index groups this server competes for in `lease` mode: `history`,
+    /// `log-filter`, `search` or their lease names. Default: all.
+    #[arg(long, env = "LEEP_INDEX_KINDS", value_delimiter = ',')]
+    index_kinds: Vec<String>,
+    /// Un-indexed changesets a path log, last-change or filtered log examines
+    /// before answering that its index is behind (`lease` and `off` modes).
+    #[arg(long, env = "LEEP_QUERY_SCAN_BUDGET", default_value_t = 1024)]
+    query_scan_budget: usize,
+    /// Un-indexed first-parent steps (file reads) a blame walks.
+    #[arg(long, env = "LEEP_BLAME_SCAN_BUDGET", default_value_t = 128)]
+    blame_scan_budget: usize,
+    /// Files without a code-search row a search fetches.
+    #[arg(long, env = "LEEP_SEARCH_SCAN_BUDGET", default_value_t = 512)]
+    search_scan_budget: usize,
+    /// Bytes of files without a code-search row a search fetches.
+    #[arg(long, env = "LEEP_SEARCH_SCAN_BYTES", default_value_t = 16 << 20)]
+    search_scan_bytes: u64,
+    /// Requests without a `Leep-Indexing` header scan this many times the
+    /// budgets once their wait for the indexer is over.
+    #[arg(long, env = "LEEP_LEGACY_SCAN_FACTOR", default_value_t = 8, value_parser = clap::value_parser!(u32).range(1..=1024))]
+    legacy_scan_factor: u32,
+    /// How long a request without a `Leep-Indexing` header waits for the
+    /// indexer to catch up, at most (also bounded by its remaining time).
+    #[arg(long, env = "LEEP_INDEX_WAIT", default_value = "10s", value_parser = parse_grace)]
+    index_wait: std::time::Duration,
+    /// Requests that may wait for the indexer at once; others do not wait.
+    #[arg(long, env = "LEEP_INDEX_WAITERS", default_value_t = 64)]
+    index_waiters: usize,
     #[command(subcommand)]
     command: Option<Cmd>,
 }
@@ -202,6 +246,13 @@ struct Args {
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum Coordination {
     On,
+    Off,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum Indexing {
+    Local,
+    Lease,
     Off,
 }
 
@@ -253,6 +304,23 @@ enum Cmd {
         /// runs did not mark (ADR 0033), and rewrite their record.
         #[arg(long, global = true)]
         full: bool,
+        /// With --dry-run only: count the changesets ADR 0059 would delete
+        /// (unreachable from refs, the ref log, scan windows, attestations
+        /// and mirror maps, and older than --grace), their rows and tree
+        /// nodes, beside the store's write-path and index bytes per land.
+        /// Strictly read-only: Postgres sessions are read-only and SQLite
+        /// opens with mode=ro.
+        #[arg(long, requires = "dry_run", conflicts_with = "full")]
+        unreachable: bool,
+        /// With --unreachable: ref log retention to compare against keeping
+        /// it forever (sizes the follow-up ADR on ref log retention).
+        #[arg(long, default_value = "30d", value_parser = parse_grace, requires = "unreachable")]
+        ref_log_retention: std::time::Duration,
+        /// With --unreachable: walk every reachable tree, so tree counts are
+        /// exact rather than an upper bound. Costs a full GC mark: not on a
+        /// small host beside live servers.
+        #[arg(long, requires = "unreachable")]
+        exact_trees: bool,
     },
     /// Pack every live blob and tree node of a filesystem or s3:// blob store
     /// into one delta-compressed pack (ADR 0029, ADR 0040; uses --meta and
@@ -565,6 +633,195 @@ async fn run_gc(
     Ok(())
 }
 
+/// The store URL opened so that the database itself refuses writes, so the
+/// dry run cannot change the store whatever it calls: Postgres sessions with
+/// `default_transaction_read_only`, SQLite with `mode=ro`. A URL that
+/// already sets the parameter is refused rather than given a second one.
+fn read_only_meta_url(url: &str) -> anyhow::Result<String> {
+    let sep = if url.contains('?') { '&' } else { '?' };
+    let has = |param: &str| {
+        url.split_once('?').is_some_and(|(_, q)| {
+            q.split('&').any(|kv| {
+                kv.split('=').next() == Some(param) || kv.starts_with(&format!("{param}["))
+            })
+        })
+    };
+    if url.starts_with("postgres://") || url.starts_with("postgresql://") {
+        if has("options") {
+            anyhow::bail!(
+                "--unreachable opens Postgres read-only with its own options=; \
+                 remove options= from the --meta URL"
+            );
+        }
+        Ok(format!(
+            "{url}{sep}options=-c%20default_transaction_read_only%3Don"
+        ))
+    } else if url.starts_with("sqlite:") {
+        if has("mode") {
+            anyhow::bail!(
+                "--unreachable opens SQLite with mode=ro; remove mode= from the --meta URL"
+            );
+        }
+        Ok(format!("{url}{sep}mode=ro"))
+    } else {
+        anyhow::bail!("--unreachable needs a postgres:// or sqlite: --meta URL")
+    }
+}
+
+async fn run_unreachable_report(
+    meta: &str,
+    blobs: &str,
+    opts: leep_derive::gc_unreachable::UnreachableOptions,
+) -> anyhow::Result<()> {
+    use leep_derive::gc_unreachable::{report, PolicyReport, AGE_BUCKETS_DAYS, WRITE_PATH_KINDS};
+    let url = read_only_meta_url(meta)?;
+    let blobs = leep_store::open_blob_store(blobs).context("opening blob store")?;
+    let pool = META_POOL_SIZE.load(std::sync::atomic::Ordering::Relaxed);
+    let meta =
+        leep_meta::open_meta_store_with_pool(&url, leep_meta::SchemaMode::RequireCurrent, pool)
+            .await
+            .context("opening meta store")?;
+    let repo = new_repo(blobs, meta);
+    let started = std::time::Instant::now();
+    let r = report(&repo, &opts).await?;
+    let sizes = leep_meta::space::logical_sizes(&url)
+        .await
+        .context("reading logical sizes")?;
+    let per = |b: u64| {
+        if r.lands == 0 {
+            "-".to_string()
+        } else {
+            format!("{:.0}", b as f64 / r.lands as f64)
+        }
+    };
+    println!("changesets stored: {}", r.changesets);
+    println!("parents named but not stored: {}", r.missing_parents);
+    println!("refs: {}", r.refs);
+    println!("ref log entries: {} ({} lands)", r.ref_log_entries, r.lands);
+    println!("rebased-origin links: {}", r.rebased_links);
+    println!("originals in a scan window: {}", r.window_originals);
+    println!("unreachable but attested: {}", r.attested);
+    println!("unreachable but mirrored: {}", r.mirrored);
+    println!(
+        "ref log entries older than {}s (kept: each ref's newest): {} entries, ~{} bytes, ~{} per land",
+        opts.ref_log_retention.as_secs(),
+        r.ref_log_prunable_entries,
+        r.ref_log_prunable_bytes,
+        per(r.ref_log_prunable_bytes)
+    );
+    let show = |name: &str, p: &PolicyReport| {
+        let t = &p.reclaimable;
+        println!("[{name}]");
+        println!("  reachable: {}", p.reachable);
+        println!("  unreachable before grace: {}", p.unreachable);
+        println!(
+            "  by age (<{}d, <{}d, <{}d, older): {:?}",
+            AGE_BUCKETS_DAYS[0], AGE_BUCKETS_DAYS[1], AGE_BUCKETS_DAYS[2], p.by_age
+        );
+        println!(
+            "  reclaimable changesets (older than {}s): {} (originals {}, snapshots {}, other {})",
+            opts.grace.as_secs(),
+            t.changesets,
+            t.originals,
+            t.snapshots,
+            t.other
+        );
+        println!(
+            "  changeset bytes (uncompressed encoding): {} ({} per land)",
+            t.changeset_bytes,
+            per(t.changeset_bytes)
+        );
+        for (kind, (rows, bytes)) in &t.rows {
+            println!("  rows {kind}: {rows} rows, {bytes} bytes");
+        }
+        println!(
+            "  metadata bytes (logical): {} ({} per land)",
+            t.meta_bytes(),
+            per(t.meta_bytes())
+        );
+        let bound = if p.exact_trees {
+            "exact"
+        } else {
+            "upper bound"
+        };
+        println!(
+            "  tree nodes ({bound}): {} nodes, {} bytes ({} per land)",
+            t.tree_nodes,
+            t.tree_node_bytes,
+            per(t.tree_node_bytes)
+        );
+        println!(
+            "  file contents ({bound}): {} blobs, {} bytes ({} per land)",
+            t.contents,
+            t.content_bytes,
+            per(t.content_bytes)
+        );
+    };
+    show("as designed: ref log kept forever", &r.log_kept);
+    show(
+        "ref log kept for --ref-log-retention (follow-up ADR)",
+        &r.log_pruned,
+    );
+    let mut index_bytes = None;
+    if let Some(z) = &sizes {
+        println!("[store, logical: keys and values, not pages]");
+        println!(
+            "  changesets: {} rows, {} bytes (as stored)",
+            z.changesets.0, z.changesets.1
+        );
+        println!("  ref log: {} rows, {} bytes", z.ref_log.0, z.ref_log.1);
+        println!("  refs: {} rows, {} bytes", z.refs.0, z.refs.1);
+        let mut index = 0;
+        for (kind, rows, bytes) in &z.derived {
+            let class = if WRITE_PATH_KINDS.contains(&kind.as_str()) {
+                "write path"
+            } else {
+                index += bytes;
+                "index"
+            };
+            println!("  derived {kind} ({class}): {rows} rows, {bytes} bytes");
+        }
+        index_bytes = Some(index);
+        if let Some(p) = z.physical_bytes {
+            println!(
+                "  physical database size: {p} bytes (pages, not logical bytes; on \
+                 Postgres pg_database_size runs 2.5 to 3.5 times the logical bytes)"
+            );
+        }
+    }
+    println!("[per land, logical bytes, side by side]");
+    println!(
+        "  write path (the lands' copies, originals, their {} rows and log entries): {}",
+        WRITE_PATH_KINDS.join(", "),
+        per(r.land_write.bytes())
+    );
+    println!(
+        "  index rows (all non-write-path derived rows in the store / lands; \
+         includes any imported history's): {}",
+        index_bytes.map_or("-".to_string(), per)
+    );
+    println!(
+        "  unreachable, reclaimable as designed: {}",
+        per(r.log_kept.reclaimable.meta_bytes())
+    );
+    println!(
+        "  unreachable, reclaimable with ref log retention (follow-up ADR): {} (+{} of log entries)",
+        per(r.log_pruned.reclaimable.meta_bytes()),
+        per(r.ref_log_prunable_bytes)
+    );
+    println!("  (changesets count by their canonical encoding; stored rows may be compressed)");
+    println!(
+        "reclaimable without a root_tree row (trees not counted): {}",
+        r.without_root_tree
+    );
+    println!(
+        "tree nodes missing from the blob store: {}",
+        r.missing_nodes
+    );
+    println!("elapsed: {:.1}s", started.elapsed().as_secs_f64());
+    Ok(())
+}
+
 async fn run_derive_search(meta: &str, blobs: &str, rev: &str) -> anyhow::Result<()> {
     let blobs = leep_store::open_blob_store(blobs).context("opening blob store")?;
     let meta = open_meta(meta).await.context("opening meta store")?;
@@ -722,11 +979,37 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Cmd::Gc {
             phase,
+            grace,
+            unreachable: true,
+            ref_log_retention,
+            exact_trees,
+            ..
+        }) => {
+            if phase.is_some() {
+                anyhow::bail!("--unreachable takes no phase");
+            }
+            return run_unreachable_report(
+                &args.meta,
+                &args.blobs,
+                leep_derive::gc_unreachable::UnreachableOptions {
+                    now: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_secs() as i64),
+                    grace,
+                    ref_log_retention,
+                    exact_trees,
+                },
+            )
+            .await;
+        }
+        Some(Cmd::Gc {
+            phase,
             dry_run,
             grace,
             fence,
             unsafe_no_fence,
             full,
+            ..
         }) => {
             let mark = if full {
                 leep_derive::gc::Mark::Full
@@ -808,6 +1091,7 @@ async fn main() -> anyhow::Result<()> {
         },
         require_signatures: args.require_signatures.clone(),
         require_review: args.require_review.clone(),
+        protect_refs: args.protect_refs.clone(),
     })
     .map_err(anyhow::Error::msg)?;
     log_config(&config.current());
@@ -836,15 +1120,46 @@ async fn main() -> anyhow::Result<()> {
         .context("installing the SIGHUP handler")?;
     // Experiment branch only: builds the leader runtime up front.
     tracing::info!(exp = %leep_derive::exp::describe(), "land leader experiment");
-    if args.warm_interval.is_zero() {
-        tracing::info!("index warming off: the first query on new history derives its indexes");
-    } else {
-        tracing::info!(
-            interval_s = args.warm_interval.as_secs_f64(),
-            search = args.warm_search,
-            "warming indexes of moved refs in the background"
-        );
-        leep_derive::warm::Warmer::new(repo.clone(), args.warm_search).spawn(args.warm_interval);
+    let index_leases = index_policy(&args, &mut repo)?;
+    let warm = match (args.indexing, &index_leases) {
+        (Indexing::Off, _) => {
+            tracing::info!(
+                "index warming off (--indexing off): the index lease holders build the indexes"
+            );
+            None
+        }
+        _ if args.warm_interval.is_zero() => {
+            tracing::info!("index warming off: the first query on new history derives its indexes");
+            None
+        }
+        (Indexing::Lease, Some(leases)) => {
+            tracing::info!(
+                interval_s = args.warm_interval.as_secs_f64(),
+                kinds = ?leases.config().candidate,
+                "warming the indexes whose lease this server holds"
+            );
+            Some(
+                leep_derive::warm::Warmer::new(repo.clone(), args.warm_search)
+                    .with_leases(leases.clone()),
+            )
+        }
+        _ => {
+            tracing::info!(
+                interval_s = args.warm_interval.as_secs_f64(),
+                search = args.warm_search,
+                "warming indexes of moved refs in the background"
+            );
+            Some(leep_derive::warm::Warmer::new(
+                repo.clone(),
+                args.warm_search,
+            ))
+        }
+    };
+    if let (Indexing::Lease, Some(leases)) = (args.indexing, &index_leases) {
+        leases.start();
+    }
+    if let Some(w) = warm {
+        w.spawn(args.warm_interval);
     }
     let coordination = match args.land_coordination {
         Coordination::Off => None,
@@ -879,8 +1194,17 @@ async fn main() -> anyhow::Result<()> {
             }
         });
     }
+    // Index leases are given up as soon as shutdown starts, so another
+    // server takes the groups at once.
+    let releasing = index_leases.clone();
     let Some((coordinator, http)) = coordination else {
-        leep_server::serve(listener, app, shutdown_signal()).await?;
+        leep_server::serve(listener, app, async move {
+            shutdown_signal().await;
+            if let Some(l) = releasing {
+                l.shutdown().await;
+            }
+        })
+        .await?;
         return Ok(());
     };
     // Leases are given up as soon as shutdown starts, so another server
@@ -889,6 +1213,9 @@ async fn main() -> anyhow::Result<()> {
     let server = tokio::spawn(leep_server::serve(listener, app, async move {
         shutdown_signal().await;
         stopping.shutdown().await;
+        if let Some(l) = releasing {
+            l.shutdown().await;
+        }
     }));
     let address = coordinator.config().address.clone();
     if let Err(e) = http.check_self(&address).await {
@@ -903,6 +1230,79 @@ async fn main() -> anyhow::Result<()> {
     );
     server.await.context("server task")??;
     Ok(())
+}
+
+/// The index leases and query policy of `--indexing lease|off` (ADR 0058),
+/// set on `repo`; `None` in `local` mode.
+fn index_policy(
+    args: &Args,
+    repo: &mut Repo,
+) -> anyhow::Result<Option<Arc<leep_derive::indexing::IndexLeases>>> {
+    use leep_derive::indexing::{
+        Budgets, IndexGroup, IndexLeaseConfig, IndexLeases, IndexMode, IndexPolicy,
+    };
+    let mode = match args.indexing {
+        Indexing::Local => {
+            if !args.index_kinds.is_empty() {
+                tracing::warn!("--index-kinds has no effect in --indexing local");
+            }
+            return Ok(None);
+        }
+        Indexing::Lease => IndexMode::Lease,
+        Indexing::Off => IndexMode::Off,
+    };
+    if !repo.meta().supports_leases() {
+        anyhow::bail!(
+            "--indexing lease and off need a metadata store with leases (Postgres, SQLite)"
+        );
+    }
+    let mut groups = Vec::new();
+    for k in &args.index_kinds {
+        let g = IndexGroup::parse(k.trim()).ok_or_else(|| {
+            anyhow::anyhow!("--index-kinds: unknown index {k:?}; use history, log-filter or search")
+        })?;
+        if !groups.contains(&g) {
+            groups.push(g);
+        }
+    }
+    if groups.is_empty() {
+        groups = IndexGroup::ALL.to_vec();
+    }
+    if !args.warm_search {
+        groups.retain(|g| *g != IndexGroup::Search);
+    }
+    let mut id = [0u8; 16];
+    getrandom::fill(&mut id).map_err(|e| anyhow::anyhow!("random holder id: {e}"))?;
+    let cfg = IndexLeaseConfig::new(
+        hex::encode(id),
+        args.advertise_url.clone().unwrap_or_default(),
+    )
+    .with_candidates(
+        if mode == IndexMode::Lease && !args.warm_interval.is_zero() {
+            groups
+        } else {
+            Vec::new()
+        },
+    );
+    let leases = IndexLeases::new(repo.meta().clone(), cfg);
+    let budgets = Budgets {
+        scan: args.query_scan_budget,
+        blame: args.blame_scan_budget,
+        search_files: args.search_scan_budget,
+        search_bytes: args.search_scan_bytes,
+        legacy_factor: args.legacy_scan_factor as usize,
+    };
+    let policy = IndexPolicy::new(mode, leases.clone())
+        .with_budgets(budgets)
+        .with_index_wait(args.index_wait, args.index_waiters)
+        .with_request_timeout(args.request_timeout);
+    *repo = repo.clone().with_index_policy(Arc::new(policy));
+    tracing::info!(
+        mode = if mode == IndexMode::Lease { "lease" } else { "off" },
+        holder = %leases.config().holder,
+        "queries never derive an index while its lease lives (ADR 0058)"
+    );
+    Ok(Some(leases))
 }
 
 /// The land coordinator and its HTTP side, from the flags (ADR 0056).

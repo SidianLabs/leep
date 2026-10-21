@@ -205,12 +205,16 @@ way.
 | `history-tree-v4` | the changeset's history pack (ADR 0045): the nodes of a tree parallel to `root_tree` recording for each path (including deleted ones) the newest changesets that changed it, as written by this changeset's derivation, and the address of its root. A pack is cut into parts of about 16 KB; this value is part 0 and `history-node-v4` rows hold the rest. Nodes are addressed by (writer, part, index) and name changesets through a table per part, so the hundreds of nodes a merge rewrites name its few dozen ids once; nodes of more than 64 entries are stored as content-defined chunks so an edit rewrites one chunk (ADR 0027), and a changed node, chunk or chunk list is stored as a patch on an earlier whole version that names the entries it replaces by position (ADR 0037). Built from the first parent's tree plus the spines of changed paths, and at merges the paths where the second parent's history differs from the merge base's (another parent's from the first's, for octopus or unrelated merges) (ADR 0013) | path log, `last-change` |
 | `log-filter-v1` | per changeset at first-parent depth `d`: for each level `j ≤ tz(d)`, the 64-bit fingerprints of the authors, `extra` keys and `agent.model`/`agent.session` values of everything reachable from it but not from its first-parent ancestor `2^j` up (side branches included); lower-cased author names by fingerprint in `log-filter-name-v1` (ADR 0047) | `log` with `author`/`extra` filters and no path |
 | `blame` | per (changeset, path), keyed `Hash::of_object("blame", id‖path)` | blame |
+| `cs-condemned-v1` / `cs-rescue-v1` / `cs-doom-v1` / `gc-fence-active-v1` | per changeset id (the flag: one row), the encodings of their `blob-*-v1` counterparts; the fence of changeset GC (ADR 0059): rescues by every writer that names a condemned changeset; condemnation, doom and the flag by the sweep (phase 2, not built yet) | changeset garbage collection, and the rescue checks of creates, lands, ref moves, rebases, merges, attestations and mirror maps |
+| `cs-reach-v1` | per changeset id, one byte: "a ref or ref log entry reaches it, and every parent has a row"; written parents first, plus a progress row at the zero key (ADR 0059 section 4) | the changeset sweep's incremental reachability mark |
 | `gc-mark-v1` | per changeset id, tree node hash or blob hash, one byte: "referenced by a stored changeset, and everything below has a row"; written by GC marks in post-order (ADR 0033) | incremental GC marks, which skip covered changesets and stop at marked tree nodes |
 | `blob-trigrams-v1` | per blob hash: sorted trigram set of a UTF-8 text blob up to 1 MiB (delta varints), or a "not indexed" marker (ADR 0014) | code search |
 | `tree-trigrams-v1` | per tree node hash: fixed-size bloom filter (2^19 bits) over every trigram below the directory, the OR of its children's filters; shared by every revision with the same subtree (ADR 0014) | code search directory pruning |
 
-`root_tree`, `generation` and `skiplist` are computed eagerly when a changeset
-is created and written with it in one call (ADR 0031, see "Commit" below).
+`root_tree`, `generation`, `skiplist` and `last_merge-v1` are computed
+eagerly when a changeset is created and written with it in one call (ADR
+0031, see "Commit" below; `last_merge-v1` from the parents' rows only, never
+by deriving, and skipped when they lack one, ADR 0058).
 Other kinds are derived on first read (the search kinds on the first search
 that needs them; see "Code search"), and every server also warms them in the
 background for each ref head that moved (ADR 0028), so queries on an imported
@@ -221,7 +225,30 @@ derives all moved heads of a pass as one range per kind
 (`derived::derive_heads`), so shared history is derived once and different
 refs' new changesets derive side by side (ADR 0058, phase 0).
 `derive` takes a per-kind lock once a value is missing, so concurrent requests
-and the warmer never derive the same range twice. Add new kinds with the
+and the warmer never derive the same range twice.
+
+**Who builds indexes (ADR 0058).** `--indexing local` (the default) is the
+above, on every server. With `--indexing lease`, each index group (path
+history, log filter, code search) has a lease in the `index` scope of the
+`leases` table (repository 0, the group's primary kind as name, shard 0;
+`leep_derive::indexing::IndexLeases`), and only its holder warms that group;
+the holder checks the lease before each staged write and stops a derivation
+once it is lost, so a stale holder wastes work but never writes a wrong row.
+`--indexing off` never warms. In `lease` and `off` modes queries never derive
+an index while a lease lives (`indexing::bounded`): rows are parent-closed,
+so a query's un-indexed part is the changesets above a set of indexed
+ancestors. It finds that part (stopping at a budget) and runs on a handle
+that knows it: the path walk examines an un-indexed changeset the way
+`log_scan` does and queues its parents, then settles its queue so the page's
+`next` is the indexed walk's; last-change computes the newest changes bottom
+up over the part; blame walks un-indexed first-parent steps one by one;
+the filtered log scans the part; search computes missing trigram rows in
+memory. A request over the budget gets `Error::Indexing` (503) with
+`Leep-Indexing: retry`, an answer at the newest indexed first-parent
+ancestor with `stale-ok`, and without the header waits, scans more, then
+gets the 503. With no live lease queries derive inline. `repair drop`,
+`rederive --missing` and `upgrade-index --yes` take the leases and wait a
+fence before touching rows (`ToolLease`). Add new kinds with the
 [`add-derived-data-kind`](../.claude/skills/add-derived-data-kind/SKILL.md)
 skill. A new kind never requires a client change.
 
@@ -256,7 +283,12 @@ of its parents' entries, so a side branch's changes are never lost. The index
 is derived oldest first, by the warmer or by the first path query, whichever
 comes first. `author` and
 `extra` filters apply to the changesets the walk yields, so a selective filter
-on a frequently changed path still reads each of them.
+on a frequently changed path still reads each of them. In a plain path log
+(not `follow`, which still reads each changeset to look for renames) without
+a filter, the walk reads a changeset only when the ancestry cache lacks its
+parents or a bounded query must examine it, and the page's changesets and
+root trees are read afterwards in one batch each, so a warm path log makes
+no round trip per entry.
 Directory nodes keep deleted entries, so a busy directory's node grows with
 every name it ever held. Nodes of more than 64 entries are therefore stored as
 chunks of about 32 entries whose boundaries depend only on the names (ADR
@@ -355,7 +387,11 @@ queue wider than 64 entries falls back to "restart from the tip below the
 last entry", which is correct but rescans. A search cursor pins the searched
 changeset and the last (path, line), and the walk skips directories and files
 before it. Cursors are bound to their query by a fingerprint and validated as
-untrusted input (400 on any failure).
+untrusted input (400 on any failure). `fields=summary` returns the same log entries
+as listings need them (no changed paths, the message's first line,
+`agent.*` metadata), projected after the walk, so cursors and order are
+shared with full pages and either shape continues the other; `leep log
+--oneline` and the MCP `leep_log` tool ask for it.
 
 **Filtered log** ([ADR 0047](adr/0047-log-filter-index.md)). A log with
 `author` or `extra` filters and no path scans its first 512 changesets
@@ -599,7 +635,9 @@ branches, except those under `tags/`, which are tags. `cas_ref_checked` and
 (`leep_core::refname`), tags are created or deleted but never moved, `land`
 refuses `tags/`, and a ref a land policy covers cannot be deleted and only
 moves forward (a swap to a value that does not descend from the current one
-is a 400). The CLI has no special server API for this: `leep branch`,
+is a 400). `--protect-ref` covers a ref with a policy that checks nothing
+else (`ProtectOnly` in `leep-server`), for protection without signatures or
+review. The CLI has no special server API for this: `leep branch`,
 `leep switch` and `leep tag` are compare-and-swap calls on `/v1/refs/{name}`. `branch -d` deletes only if
 `merge_base(head, target) == head`, reading the head once and passing it as
 `expected` so a concurrent move fails with 409. `leep switch` needs a clean
@@ -877,6 +915,25 @@ misses and occupancy as Prometheus metrics (see [OPERATIONS.md](OPERATIONS.md)).
   and stops at marked tree nodes. Changesets are never deleted, so liveness
   only grows and ref moves never force a full walk; `gc --full` walks
   everything anyway.
+  [ADR 0059](adr/0059-unreachable-changeset-gc.md) (proposed; phase 1
+  built) will delete changesets no root reaches (refs, every ref log entry,
+  landed-copy scan windows, attestations, mirror maps, a grace period) by
+  the same condemn, fence and collect protocol. Phase 1 is everything a
+  server must do before a sweep may run beside it, and deletes nothing:
+  `changesets.stored_at` (migration 0007) ages changesets by the store's
+  clock; every writer that is about to make durable something naming an
+  existing changeset (a child, a land, a rebase or merge, a ref move, a
+  signature or review, a git mirror map) first reads its fence state and
+  rescues it and its condemned ancestors (`Repo::rescue_changesets`),
+  reading the `gc-fence-active-v1` flag at most every 10 s, so the check
+  costs nothing while no sweep runs. Land batches run detached from their
+  requests, so each attempt reads the flag uncached before its swap, and a
+  batch gives up with a retryable 409 after `MAX_BATCH_LIFETIME` (60 s),
+  which bounds how late it can move a ref after its fence read. A keyed
+  land retry whose original is not stored is answered from its land id
+  record. `changeset_reach::mark` keeps `cs-reach-v1` rows, the incremental
+  reachability the sweep will use. `/v1/ready` lists `changeset-rescue`.
+  `gc --unreachable --dry-run` measures what the sweep would reclaim.
 
 ## 9. Failure model
 

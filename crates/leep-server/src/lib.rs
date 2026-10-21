@@ -7,6 +7,7 @@ pub mod coord;
 pub mod fingerprint;
 pub mod limits;
 pub mod observe;
+pub mod protect;
 pub mod reload;
 pub mod review;
 pub mod signing;
@@ -17,7 +18,7 @@ use std::time::Duration;
 
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
-use axum::http::{header, HeaderValue, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -26,9 +27,10 @@ use futures_util::StreamExt;
 use leep_core::api::*;
 use leep_core::rename::RenameOptions;
 use leep_core::{Changeset, ChangesetId, Error, FileKind, Hash, RefUpdateContext, RepoPath};
+use leep_derive::indexing::{Answered, Freshness};
 use leep_derive::{search, ExtraMatch, LogFilter, LogParams, PrefixMatch, Repo, SearchQuery};
 use serde::de::DeserializeOwned;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
 
@@ -243,8 +245,8 @@ pub fn router_with_ready_timeout(
         .with_state(repo)
 }
 
-/// Check the ref names a land policy protects (`--require-signatures`,
-/// `--require-review`, a review policy's `refs`). Protection matches names
+/// Check the ref names a land policy protects (`--protect-ref`,
+/// `--require-signatures`, `--require-review`, a review policy's `refs`). Protection matches names
 /// exactly, so a name no ref can have, such as one with a stray space from a
 /// comma-separated environment variable, would leave the intended ref
 /// unprotected without a word.
@@ -280,7 +282,24 @@ type ApiResult<T> = Result<T, ApiError>;
 
 /// What `GET /v1/ready` advertises.
 fn features() -> Vec<String> {
-    vec![leep_core::api::FEATURE_LAND_ID.into()]
+    vec![
+        leep_core::api::FEATURE_LAND_ID.into(),
+        leep_core::api::FEATURE_INDEXING_RETRY.into(),
+        leep_core::api::FEATURE_CHANGESET_RESCUE.into(),
+    ]
+}
+
+/// The request's `Leep-Indexing` (ADR 0058).
+fn freshness(headers: &HeaderMap) -> Freshness {
+    Freshness::from_header(headers.get(INDEXING_HEADER).and_then(|v| v.to_str().ok()))
+}
+
+/// `resp` with `Leep-Index-Scanned`: the changesets (files, for search)
+/// without index rows the answer examined.
+fn with_scanned(mut resp: Response, scanned: u64) -> Response {
+    resp.headers_mut()
+        .insert(INDEX_SCANNED_HEADER, HeaderValue::from(scanned));
+    resp
 }
 
 /// The single place `leep_core::Error` becomes an HTTP status.
@@ -301,15 +320,40 @@ impl IntoResponse for ApiError {
             }
             Error::NotFound(_) => StatusCode::NOT_FOUND,
             Error::Conflict(_) => StatusCode::CONFLICT,
+            Error::Indexing { .. } => StatusCode::SERVICE_UNAVAILABLE,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
+        if let Error::Indexing {
+            kind,
+            behind,
+            retry_after_ms,
+        } = &self.0
+        {
+            // An expected answer, not a failure: a client retries it later
+            // (ADR 0058). Balancers should not count it against the backend.
+            let body = ErrorResponse {
+                error: self.0.to_string(),
+                indexing: Some(IndexingInfo {
+                    kind: kind.clone(),
+                    behind: *behind,
+                    retry_after_ms: *retry_after_ms,
+                }),
+            };
+            let mut resp = (status, Json(body)).into_response();
+            let h = resp.headers_mut();
+            h.insert(
+                header::RETRY_AFTER,
+                HeaderValue::from(retry_after_ms.div_ceil(1000).max(1)),
+            );
+            if let Ok(v) = HeaderValue::from_str(&format!("kind={kind}; behind={behind}")) {
+                h.insert(INDEXING_HEADER, v);
+            }
+            return resp;
+        }
         if status.is_server_error() {
             tracing::error!(error = %self.0, "request failed");
         }
-        let body = ErrorResponse {
-            error: self.0.to_string(),
-        };
-        (status, Json(body)).into_response()
+        (status, Json(ErrorResponse::new(self.0.to_string()))).into_response()
     }
 }
 
@@ -350,6 +394,7 @@ struct LogQuery {
     filter: LogFilter,
     /// The previous page's `next` cursor.
     after: Option<String>,
+    fields: LogFields,
 }
 
 impl LogQuery {
@@ -366,6 +411,7 @@ impl LogQuery {
                 }
                 "follow" => q.follow = parse_bool("follow", &v)?,
                 "after" => q.after = Some(v),
+                "fields" => q.fields = LogFields::parse(&v)?,
                 "author" => q.filter.author = Some(v),
                 "extra" => q.filter.extra.push(ExtraMatch::parse(&v)?),
                 _ => {}
@@ -891,6 +937,7 @@ async fn file(
 async fn log(
     State(repo): S,
     Path(id): Path<String>,
+    headers: HeaderMap,
     Query(pairs): Query<Vec<(String, String)>>,
 ) -> ApiResult<Response> {
     let q = LogQuery::parse(pairs)?;
@@ -900,29 +947,62 @@ async fn log(
         follow: q.follow,
         filter: q.filter,
     };
-    let page = repo
-        .log_page(cid(&id)?, &params, limit, q.after.as_deref())
+    let Answered {
+        value: page,
+        answered_at,
+        behind,
+        scanned,
+    } = repo
+        .log_page_indexed(
+            cid(&id)?,
+            &params,
+            limit,
+            q.after.as_deref(),
+            freshness(&headers),
+        )
         .await?;
-    Ok(log_json(page.entries, page.next))
+    let tail = LogTail {
+        next: page.next,
+        answered_at,
+        behind,
+    };
+    let resp = match q.fields {
+        LogFields::Full => log_json(page.entries, tail),
+        LogFields::Summary => {
+            let entries: Vec<LogSummaryEntry> = page.entries.into_iter().map(Into::into).collect();
+            log_json(entries, tail)
+        }
+    };
+    Ok(with_scanned(resp, scanned))
 }
 
 /// Entries one task encodes of a long log.
 const LOG_CHUNK_ENTRIES: usize = 512;
 
-/// `Json(LogResponse { entries, next })`, byte for byte, for a long log: chunks of
-/// entries are encoded on blocking threads, several at once, and streamed in
-/// order, so the first bytes leave while later entries are encoded. 10,000
-/// entries are tens of megabytes of JSON. The walk has finished, so a failure
-/// of the store still answers with an error status; encoding these types
+/// `Json` of a [`LogResponse`] (or, for summary entries, a
+/// [`LogSummaryResponse`]) made of `entries` and `tail`, byte for byte. For a long log chunks of entries are
+/// encoded on blocking threads, several at once, and streamed in order, so
+/// the first bytes leave while later entries are encoded. 10,000 entries
+/// are tens of megabytes of JSON. The walk has finished, so a failure of
+/// the store still answers with an error status; encoding these types
 /// cannot fail.
-fn log_json(entries: Vec<ChangesetInfo>, next: Option<String>) -> Response {
+fn log_json<E>(entries: Vec<E>, tail: LogTail) -> Response
+where
+    E: Serialize + Send + 'static,
+{
     if entries.len() <= LOG_CHUNK_ENTRIES {
-        return Json(LogResponse { entries, next }).into_response();
+        return Json(LogBody {
+            entries,
+            next: tail.next,
+            answered_at: tail.answered_at,
+            behind: tail.behind,
+        })
+        .into_response();
     }
     let mut chunks = Vec::with_capacity(entries.len().div_ceil(LOG_CHUNK_ENTRIES));
     let mut rest = entries.into_iter();
     loop {
-        let chunk: Vec<ChangesetInfo> = rest.by_ref().take(LOG_CHUNK_ENTRIES).collect();
+        let chunk: Vec<E> = rest.by_ref().take(LOG_CHUNK_ENTRIES).collect();
         if chunk.is_empty() {
             break;
         }
@@ -932,8 +1012,8 @@ fn log_json(entries: Vec<ChangesetInfo>, next: Option<String>) -> Response {
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get().min(4));
     let body = futures_util::stream::iter(chunks.into_iter().enumerate())
         .map(move |(i, chunk)| {
-            let next = (i == last).then(|| next.clone()).flatten();
-            tokio::task::spawn_blocking(move || encode_log_chunk(&chunk, i == 0, i == last, next))
+            let tail = (i == last).then(|| tail.clone());
+            tokio::task::spawn_blocking(move || encode_log_chunk(&chunk, i == 0, tail))
         })
         .buffered(threads)
         .map(|r| match r {
@@ -948,14 +1028,34 @@ fn log_json(entries: Vec<ChangesetInfo>, next: Option<String>) -> Response {
         .into_response()
 }
 
-/// Part of a `LogResponse` body: `chunk`'s entries, comma separated, opened
-/// by the object's head if `first` or by a comma if not, closed (with `next`,
-/// if any) if `last`.
-fn encode_log_chunk(
-    chunk: &[ChangesetInfo],
-    first: bool,
-    last: bool,
+/// The shape of [`LogResponse`] and [`LogSummaryResponse`], whichever
+/// entries it holds.
+#[derive(Serialize)]
+struct LogBody<E> {
+    entries: Vec<E>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     next: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    answered_at: Option<ChangesetId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    behind: Option<u64>,
+}
+
+/// The fields of a `LogResponse` after its entries.
+#[derive(Clone)]
+struct LogTail {
+    next: Option<String>,
+    answered_at: Option<ChangesetId>,
+    behind: Option<u64>,
+}
+
+/// Part of a `LogResponse` body: `chunk`'s entries, comma separated, opened
+/// by the object's head if `first` or by a comma if not, closed (with the
+/// fields after the entries, if any) with `tail` on the last chunk.
+fn encode_log_chunk<E: Serialize>(
+    chunk: &[E],
+    first: bool,
+    tail: Option<LogTail>,
 ) -> serde_json::Result<Bytes> {
     let mut out = Vec::with_capacity(chunk.len() * 1024);
     out.extend_from_slice(if first { &b"{\"entries\":["[..] } else { b"," });
@@ -965,11 +1065,19 @@ fn encode_log_chunk(
         }
         serde_json::to_writer(&mut out, entry)?;
     }
-    if last {
+    if let Some(tail) = tail {
         out.push(b']');
-        if let Some(next) = next {
+        if let Some(next) = tail.next {
             out.extend_from_slice(b",\"next\":");
             serde_json::to_writer(&mut out, &next)?;
+        }
+        if let Some(at) = tail.answered_at {
+            out.extend_from_slice(b",\"answered_at\":");
+            serde_json::to_writer(&mut out, &at)?;
+        }
+        if let Some(behind) = tail.behind {
+            out.extend_from_slice(b",\"behind\":");
+            serde_json::to_writer(&mut out, &behind)?;
         }
         out.push(b'}');
     }
@@ -979,15 +1087,27 @@ fn encode_log_chunk(
 async fn last_change(
     State(repo): S,
     Path(id): Path<String>,
+    headers: HeaderMap,
     Query(q): Query<PathQuery>,
-) -> ApiResult<Json<LastChangeResponse>> {
+) -> ApiResult<Response> {
     let path = RepoPath::new(q.path.trim_matches('/'))?;
-    let (changeset, concurrent) = repo.last_change(cid(&id)?, path.as_str()).await?;
-    Ok(Json(LastChangeResponse {
+    let Answered {
+        value: (changeset, concurrent),
+        answered_at,
+        behind,
+        scanned,
+    } = repo
+        .last_change_indexed(cid(&id)?, path.as_str(), freshness(&headers))
+        .await?;
+    let resp = Json(LastChangeResponse {
         path: path.as_str().to_string(),
         changeset,
         concurrent,
-    }))
+        answered_at,
+        behind,
+    })
+    .into_response();
+    Ok(with_scanned(resp, scanned))
 }
 
 async fn provenance(
@@ -1007,8 +1127,9 @@ async fn provenance(
 async fn search_rev(
     State(repo): S,
     Path(rev): Path<String>,
+    headers: HeaderMap,
     Query(p): Query<SearchParams>,
-) -> ApiResult<Json<SearchResponse>> {
+) -> ApiResult<Response> {
     let q = SearchQuery {
         regex: p.regex.unwrap_or(false),
         case_insensitive: p.i.unwrap_or(false),
@@ -1020,7 +1141,13 @@ async fn search_rev(
             .clamp(1, search::MAX_LIMIT),
         ..SearchQuery::new(p.q)
     };
-    Ok(Json(repo.search_page(&rev, &q, p.after.as_deref()).await?))
+    let answered = repo
+        .search_page_indexed(&rev, &q, p.after.as_deref(), freshness(&headers))
+        .await?;
+    Ok(with_scanned(
+        Json(answered.value).into_response(),
+        answered.scanned,
+    ))
 }
 
 async fn diff(State(repo): S, Query(q): Query<DiffQuery>) -> ApiResult<Json<DiffResponse>> {
@@ -1043,10 +1170,21 @@ async fn diff(State(repo): S, Query(q): Query<DiffQuery>) -> ApiResult<Json<Diff
 async fn blame(
     State(repo): S,
     Path(id): Path<String>,
+    headers: HeaderMap,
     Query(q): Query<PathQuery>,
-) -> ApiResult<Json<BlameResponse>> {
+) -> ApiResult<Response> {
     let path = RepoPath::new(q.path)?;
-    Ok(Json(repo.blame(cid(&id)?, &path).await?))
+    let Answered {
+        mut value,
+        answered_at,
+        behind,
+        scanned,
+    } = repo
+        .blame_indexed(cid(&id)?, &path, freshness(&headers))
+        .await?;
+    value.answered_at = answered_at;
+    value.behind = behind;
+    Ok(with_scanned(Json(value).into_response(), scanned))
 }
 
 async fn merge_base(
@@ -1159,17 +1297,38 @@ mod tests {
         };
         let n = LOG_CHUNK_ENTRIES;
         for len in [0, 1, n - 1, n, n + 1, 2 * n, 2 * n + 1, 5 * n + 17] {
-            for next in [None, Some("AQE-_x".to_string())] {
+            for (next, stale) in [
+                (None, None),
+                (Some("AQE-_x".to_string()), None),
+                (None, Some((ChangesetId(Hash::of_blob(b"at")), 3))),
+                (
+                    Some("AQE-_y".to_string()),
+                    Some((ChangesetId(Hash::of_blob(b"at")), 9)),
+                ),
+            ] {
                 let entries: Vec<ChangesetInfo> = (0..len).map(entry).collect();
-                let want = serde_json::to_vec(&LogResponse {
+                let log = LogResponse {
                     entries: entries.clone(),
                     next: next.clone(),
-                })
-                .unwrap();
-                let resp = log_json(entries, next.clone());
+                    answered_at: stale.map(|s| s.0),
+                    behind: stale.map(|s| s.1),
+                };
+                let want = serde_json::to_vec(&log).unwrap();
+                let tail = LogTail {
+                    next: log.next.clone(),
+                    answered_at: log.answered_at,
+                    behind: log.behind,
+                };
+                let resp = log_json(log.entries.clone(), tail.clone());
                 assert_eq!(resp.headers()[header::CONTENT_TYPE], "application/json");
                 let got = resp.into_body().collect().await.unwrap().to_bytes();
                 assert_eq!(got, want, "{len} entries, next {next:?}");
+                // Summary entries: the same, for `LogSummaryResponse`.
+                let summary = LogSummaryResponse::from(log);
+                let want = serde_json::to_vec(&summary).unwrap();
+                let resp = log_json(summary.entries, tail);
+                let got = resp.into_body().collect().await.unwrap().to_bytes();
+                assert_eq!(got, want, "summary: {len} entries, next {next:?}");
             }
         }
     }
@@ -1199,6 +1358,18 @@ mod tests {
                 }
             ]
         );
+    }
+
+    #[test]
+    fn log_query_reads_fields() {
+        assert_eq!(LogQuery::parse(pairs(&[])).unwrap().fields, LogFields::Full);
+        for (v, want) in [("full", LogFields::Full), ("summary", LogFields::Summary)] {
+            assert_eq!(
+                LogQuery::parse(pairs(&[("fields", v)])).unwrap().fields,
+                want
+            );
+        }
+        assert!(LogQuery::parse(pairs(&[("fields", "changes")])).is_err());
     }
 
     #[test]

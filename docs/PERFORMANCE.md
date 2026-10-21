@@ -768,6 +768,53 @@ What it suggests, to be checked on the real baseline:
   and the warmer; `pg_database_size` grew 5 to 8 KB per land, the rest
   being Postgres's own index and page overhead.
 
+### One indexer per kind (ADR 0058), local smoke test
+
+`leep-swarm` on this branch, release build, a fresh Postgres 16 database
+(fsync off) and blob directory per run, everything on one shared 4-vCPU
+host (load average 4 to 13 during the runs), generator defaults as above, 60
+s measured after a 20 s ramp, one run per configuration. **Local mode**: one
+server, `--indexing local`. **Split**: agents talk to one server in
+`--indexing off`; a second server in `--indexing lease` holds every index
+lease and warms. Header: what the agents send as `Leep-Indexing` with
+index-backed reads (none is an old client).
+
+| Run | Lands/s | Lands/s per agent | Land p50 / p99 ms | Stalled | Resends | Lag history p50 / max | Lag log filter p50 / max | Read timeouts (log / blame / search) | Indexing 503s | Inline derivations |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 500, local | 39.3 | 0.079 | 49 / 2406 | 0 | 0 | 10 / 63 | 10 / 101 | 0 / 0 / 0 | – | – |
+| 500, split, no header | 40.0 | 0.080 | 35 / 2126 | 0 | 0 | 7 / 64 | 5 / 64 | 0 / 0 / 0 | 0 | 0 |
+| 500, split, retry | 38.9 | 0.078 | 49 / 4393 | 0 | 0 | 12 / 64 | 10 / 41 | 0 / 0 / 0 | 0 | 0 |
+| 500, split, stale-ok | 40.8 | 0.082 | 28 / 1650 | 0 | 0 | 9 / 63 | 9 / 63 | 0 / 0 / 0 | 0 | 0 |
+| 2000, local | 26.0 | 0.013 | 13306 / 21847 | 143 | 0 | 1011 / 1688 | 1065 / 1742 | 1141 / 794 / 969 | – | – |
+| 2000, split, no header | 23.7 | 0.012 | 28638 / 78182 | 594 | 2186 | 0 / 63 | 0 / 63 | 0 / 0 / 0 | 0 | 0 |
+| 2000, split, retry | 27.7 | 0.014 | 28212 / 80504 | 411 | 2271 | 0 / 64 | 0 / 63 | 0 / 0 / 0 | 0 | 0 |
+
+Read p50 / p99 ms at 2000 agents: local: log 573 / 1494, blame and search
+nearly all timed out; split, no header: log 37 / 1070, blame 56 / 1098,
+search 37 / 1193.
+
+What it suggests:
+
+- **The index keeps up with one holder**: lag p50 0 and max 63 or 64
+  generations at 2000 agents (the ADR's targets are 64 and 512), against
+  1,011 / 1,688 in local mode; no read reached the 30 s timeout, against
+  2,904 in local mode. No query derived inline and none answered 503.
+- **Lands are now the bottleneck.** With reads fast, agents offer more lands
+  than one ref replays (about 25 a second on this host), so lands queue to
+  the client's 30 s timeout and are resent under their land id: the split
+  runs' land latency and resends are that queue, at about the same
+  throughput (23.7 to 27.7 lands/s against 26.0; one run each, so within
+  noise). ADR 0056's coordinator and pipelined batches are the next step for
+  that.
+- **Search is cheap again.** Building a directory's trigram filter read its
+  subdirectories' rows one round trip each; with 500 agent directories every
+  search on a new head did hundreds. Reading them in one batch took search
+  p50 at 500 agents from 1,639 ms to 39 ms in local mode (and from 4,425 ms
+  to 36 ms in the split one, whose queries compute missing rows without
+  storing them).
+- The agents' land rate, about 0.08 a second at 500 agents, is the smoke
+  test's, as section 8 of ADR 0058 warns; nothing here measures real fleets.
+
 ### On all of Linux (VPS)
 
 `leep-swarm` (#105) against `leep:34c5ea3` on the Linux store (1,484,762
@@ -1002,7 +1049,9 @@ while the skiplists double the known window. On the full git/git history (below)
 Path logs (`log --path`) are unchanged: each changeset the path walk yields is
 found in the index at the previous one's parents, so batches would hold one
 changeset. Reading those with the batched calls was tried and was slower
-(`path=Documentation`, 711 entries: 0.27 s before, 0.35 s with batches of one).
+(`path=Documentation`, 711 entries: 0.27 s before, 0.35 s with batches of one). What
+helped instead was taking the reads off the walk's path ("Summary log entries
+and batched path logs" below).
 
 The in-memory benchmark rows above go the other way: there a read costs well
 under a microsecond, so the read-ahead's bookkeeping (a map of known ids, a
@@ -1947,6 +1996,66 @@ overlap the round trips, but decoding is the larger part and two threads is
 all the VPS has. Its first byte arrives sooner than the whole body did
 (470 to 319 ms warm in another interleaved run). The next step for the log is the store's decoding: every changeset
 is decoded, re-encoded and hashed to check its id.
+
+### Summary log entries and batched path logs
+
+All of git/git (82,542 commits, `main` at generation 26,499) imported with
+`leep-git import` in six stages with a repack after each (1,050 s of import
+in all, then one 188 MB pack), into Postgres 16 in a private cluster
+(`fsync` off, over TCP on loopback); the warmer derived the path-history and
+log-filter indexes in 144 s. Release builds on a 4-vCPU sandbox shared with
+other builds (load average 6 to 7). Each query on a freshly started server
+(`--warm-interval 0`): the first request, then the median of 7 repeats, in
+two rounds with base and new servers interleaved (both rounds shown).
+
+**What a log entry holds.** A full entry averages 1.95 KB of JSON here, not
+mostly changed paths: of `log` 10,000's 19.5 MB, `changes` are 6.8 MB (35%),
+messages 7.1 MB (37%) and `extra` 1.8 MB (9%, the importer's `git.*` keys).
+Dropping only `changes` (an experimental entry keeping the whole message and
+`extra`) gave 12.6 MB, 1.5 times less. `fields=summary` keeps the message's
+first line and the `agent.*` keys, as blame's per-changeset summary does:
+4.4 MB, 4.4 times less.
+
+| `GET /v1/log/{main}` | Bytes | First | Repeat |
+|---|---|---|---|
+| `limit=100`, before | 197,683 | 60 / 66 ms | 23 / 16 ms |
+| `limit=100`, after (full, unchanged bytes) | 197,683 | 55 / 42 ms | 17 / 20 ms |
+| `limit=100&fields=summary` | 47,865 | 46 / 54 ms | 17 / 24 ms |
+| `limit=10000`, before | 19,492,145 | 0.54 / 0.59 s | 0.40 / 0.36 s |
+| `limit=10000`, after (full) | 19,492,145 | 0.41 / 0.53 s | 0.34 / 0.39 s |
+| `limit=10000`, `changes` dropped only (experiment) | 12,635,018 | 0.57 / 0.42 s | 0.37 / 0.36 s |
+| `limit=10000&fields=summary` | 4,390,601 | 0.48 / 0.51 s | 0.35 / 0.34 s |
+
+The server's time hardly moves: it is the walk, not encoding. Decoding is
+part of the walk: a stored row (939 bytes on average) takes 2.3 us to
+decode and 3.6 us more for the id check (2.4 us re-encoding, 1.2 us
+hashing), about 45 ms of one thread for the 12,481 rows a 10,000-entry log
+reads. Skipping the check for rows known to have been hashed on write would
+need a mark on the row that the schema does not have (a format change), so
+it was left alone; hashing a plain row's stored bytes instead of re-encoding
+the decoded changeset would save the 2.4 us without one. The bytes are what the client saves: `leep log -n 10000 --oneline`
+took 0.36 to 0.43 s and 17 MB of memory, against 0.54 to 0.63 s and 61 MB
+for the plain `leep log` and 0.59 to 0.71 s and 84 MB for `--json`.
+
+**Path logs.** Each entry used to cost a changeset read and a root-tree read
+one after another; the changeset was needed only for its parents, which the
+ancestry cache usually holds. Now a path log without a filter reads a
+changeset on the way only when its parents are not cached, and reads the
+page's changesets and root trees afterwards in one batch each. Bodies of
+12 path queries (files, directories, a path that never existed, a `follow`
+log, an author filter, pages with `next`) were byte-identical to the old
+server's.
+
+| `GET /v1/log/{main}?path=...` | First, before / after | Repeat, before / after |
+|---|---|---|
+| `Makefile&limit=50` | 139, 102 / 99, 79 ms | 42, 29 / 5, 5 ms |
+| `Documentation&limit=711` | 1.05, 1.01 / 0.86, 0.68 s | 0.36, 0.48 s / 32, 26 ms |
+| `Documentation&limit=1000` (another run) | 1.78, 1.49 / 1.33, 0.94 s | 0.59, 0.42 s / 41, 41 ms |
+
+The first request still walks the index one step at a time while it fills
+the caches; repeats make no round trip per entry. `Documentation` had 711
+entries in all on the 3,795-commit slice above; here `limit=711` is the
+newest 711 of more than 1,000.
 
 ### First blame in stretches
 

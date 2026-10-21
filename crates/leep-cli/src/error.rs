@@ -48,6 +48,9 @@ pub enum ErrorKind {
     NotFound,
     Conflict,
     NothingToDo,
+    /// 503 from a query whose index is too far behind, after the client's
+    /// own retries (ADR 0058).
+    Indexing,
 }
 
 impl ErrorKind {
@@ -65,6 +68,7 @@ impl ErrorKind {
             ErrorKind::NotFound => "not_found",
             ErrorKind::Conflict => "conflict",
             ErrorKind::NothingToDo => "nothing_to_do",
+            ErrorKind::Indexing => "indexing",
         }
     }
 
@@ -75,7 +79,8 @@ impl ErrorKind {
             ErrorKind::Unreachable
             | ErrorKind::Server
             | ErrorKind::Timeout
-            | ErrorKind::RateLimited => exit::SERVER,
+            | ErrorKind::RateLimited
+            | ErrorKind::Indexing => exit::SERVER,
             ErrorKind::NotFound => exit::NOT_FOUND,
             ErrorKind::Conflict => exit::CONFLICT,
             ErrorKind::NothingToDo => exit::NOTHING_TO_DO,
@@ -89,6 +94,7 @@ impl ErrorKind {
                 | ErrorKind::Server
                 | ErrorKind::Timeout
                 | ErrorKind::RateLimited
+                | ErrorKind::Indexing
         )
     }
 }
@@ -101,6 +107,8 @@ pub struct CliError {
     retryable: bool,
     /// Full ids an ambiguous short id matched.
     candidates: Vec<String>,
+    /// When the server said to retry (an indexing 503).
+    retry_after_ms: Option<u64>,
 }
 
 pub type Result<T, E = CliError> = std::result::Result<T, E>;
@@ -113,7 +121,18 @@ impl CliError {
             hint: None,
             retryable: kind.retryable_by_default(),
             candidates: Vec::new(),
+            retry_after_ms: None,
         }
+    }
+
+    /// When the server asked to be asked again.
+    pub fn with_retry_after_ms(mut self, ms: u64) -> Self {
+        self.retry_after_ms = Some(ms);
+        self
+    }
+
+    pub fn retry_after_ms(&self) -> Option<u64> {
+        self.retry_after_ms
     }
 
     pub fn user(msg: impl Into<String>) -> Self {
@@ -200,6 +219,9 @@ impl CliError {
         if !self.candidates.is_empty() {
             e["candidates"] = serde_json::json!(self.candidates);
         }
+        if let Some(ms) = self.retry_after_ms {
+            e["retry_after_ms"] = serde_json::json!(ms);
+        }
         serde_json::json!({ "error": e })
     }
 
@@ -269,6 +291,7 @@ mod tests {
             (ErrorKind::NotFound, "not_found", 4, false),
             (ErrorKind::Conflict, "conflict", 5, false),
             (ErrorKind::NothingToDo, "nothing_to_do", 6, false),
+            (ErrorKind::Indexing, "indexing", 3, true),
         ];
         for (kind, code, exit, retry) in table {
             let e = CliError::new(kind, "m");
@@ -299,5 +322,11 @@ mod tests {
             CliError::lost_race("m").to_json()["error"]["retryable"],
             true
         );
+        let e = CliError::new(ErrorKind::Indexing, "m").with_retry_after_ms(4000);
+        assert_eq!(e.to_json()["error"]["retry_after_ms"], 4000);
+        assert_eq!(e.to_json()["error"]["code"], "indexing");
+        assert!(CliError::user("m").to_json()["error"]
+            .get("retry_after_ms")
+            .is_none());
     }
 }

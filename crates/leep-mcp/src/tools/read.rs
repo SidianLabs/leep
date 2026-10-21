@@ -4,9 +4,9 @@ use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
 use std::fmt::Write;
 
-use leep_core::api::{ChangesetInfo, FileInfo};
+use leep_core::api::{ChangesetInfo, FileInfo, LogSummaryEntry, RenameEntry};
 use leep_core::changeset::{EXTRA_AGENT_MODEL, EXTRA_AGENT_SESSION};
-use leep_core::{ChangesetId, FileKind};
+use leep_core::{ChangesetId, FileKind, RepoPath};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use similar::TextDiff;
@@ -34,6 +34,9 @@ struct LogArgs {
     agent_model: Option<String>,
     agent_session: Option<String>,
     cursor: Option<String>,
+    fresh: Option<bool>,
+    /// Whole messages and all of `extra`, from full log entries.
+    full: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -54,6 +57,13 @@ struct PathArgs {
 }
 
 #[derive(Deserialize)]
+struct BlameArgs {
+    rev: Option<String>,
+    path: String,
+    fresh: Option<bool>,
+}
+
+#[derive(Deserialize)]
 struct SearchArgs {
     query: String,
     rev: Option<String>,
@@ -63,6 +73,7 @@ struct SearchArgs {
     glob: Option<String>,
     limit: Option<u32>,
     cursor: Option<String>,
+    fresh: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -106,10 +117,40 @@ fn summary(info: &ChangesetInfo) -> Value {
     if !extra.is_empty() {
         v["extra"] = Value::Object(extra);
     }
-    if let Some(p) = &info.path_at {
+    follow_fields(&mut v, info.path_at.as_ref(), info.renamed.as_ref());
+    v
+}
+
+/// A log entry: [`summary`]'s shape from a summary entry, so `message` is
+/// the first line and only `agent.*` metadata is kept (`leep_show` has the
+/// rest).
+fn log_entry(e: &LogSummaryEntry) -> Value {
+    let agent: Map<String, Value> = e
+        .agent
+        .iter()
+        .filter_map(|(k, v)| Some((k.strip_prefix("agent.")?.to_string(), json!(v))))
+        .collect();
+    let mut v = json!({
+        "id": e.id.to_string(),
+        "parents": e.parents.iter().map(|p| p.to_string()).collect::<Vec<_>>(),
+        "author": e.author,
+        "timestamp": e.timestamp,
+        "message": e.message_first_line,
+        "files_changed": e.files_changed,
+    });
+    if !agent.is_empty() {
+        v["agent"] = Value::Object(agent);
+    }
+    follow_fields(&mut v, e.path_at.as_ref(), e.renamed.as_ref());
+    v
+}
+
+/// What a `follow` log adds to an entry.
+fn follow_fields(v: &mut Value, path_at: Option<&RepoPath>, renamed: Option<&RenameEntry>) {
+    if let Some(p) = path_at {
         v["path_at"] = json!(p.as_str());
     }
-    if let Some(r) = &info.renamed {
+    if let Some(r) = renamed {
         v["renamed"] = json!({
             "from": r.from.as_str(),
             "to": r.to.as_str(),
@@ -117,7 +158,15 @@ fn summary(info: &ChangesetInfo) -> Value {
             "exact": r.exact,
         });
     }
-    v
+}
+
+/// Add `answered_at` and `behind` when the answer is for an older changeset
+/// than asked (ADR 0058).
+fn mark_stale(v: &mut Value, answered_at: Option<ChangesetId>, behind: Option<u64>) {
+    if let Some(at) = answered_at {
+        v["answered_at"] = json!(at.to_string());
+        v["behind"] = json!(behind.unwrap_or(0));
+    }
 }
 
 fn file_json(f: &FileInfo) -> Value {
@@ -125,6 +174,20 @@ fn file_json(f: &FileInfo) -> Value {
 }
 
 impl Server {
+    /// The client for an index-backed query: `stale-ok` by default, so an
+    /// agent gets a slightly older answer now; with `fresh`, `retry`, with
+    /// one retry within 5 s (ADR 0058).
+    fn index_client(&self, fresh: bool) -> leep_cli::client::Client {
+        if fresh {
+            self.client
+                .clone()
+                .with_stale_ok(false)
+                .with_index_retries(std::time::Duration::from_secs(5), 1)
+        } else {
+            self.client.clone().with_stale_ok(true)
+        }
+    }
+
     pub(super) fn refs(&self) -> ToolResult {
         let refs = self.client.refs()?.refs;
         let map: BTreeMap<String, String> =
@@ -157,10 +220,20 @@ impl Server {
             follow,
             after: non_empty(a.cursor),
         };
-        let log = self.client.log(&id, &query)?;
-        let entries: Vec<Value> = log.entries.iter().map(summary).collect();
+        let client = self.index_client(a.fresh.unwrap_or(false));
+        let (entries, next, answered_at, behind): (Vec<Value>, _, _, _) = if a.full.unwrap_or(false)
+        {
+            let log = client.log(&id, &query)?;
+            let entries = log.entries.iter().map(summary).collect();
+            (entries, log.next, log.answered_at, log.behind)
+        } else {
+            let log = client.log_summary(&id, &query)?;
+            let entries = log.entries.iter().map(log_entry).collect();
+            (entries, log.next, log.answered_at, log.behind)
+        };
         let mut v = json!({ "from": id.to_string(), "entries": entries });
-        if let Some(next) = log.next {
+        mark_stale(&mut v, answered_at, behind);
+        if let Some(next) = next {
             v["next"] = json!(next);
             v["note"] = json!(
                 "More history follows. For the next page, call again with the same arguments, \
@@ -370,13 +443,16 @@ impl Server {
             ),
             after: non_empty(a.cursor),
         };
-        let resp = self.client.search(&id, &query)?;
+        let resp = self
+            .index_client(a.fresh.unwrap_or(false))
+            .search(&id, &query)?;
         let mut v = json!({
             "rev": id.to_string(),
             "matches": resp.matches,
             "truncated": resp.truncated,
             "stats": resp.stats,
         });
+        mark_stale(&mut v, resp.answered_at, resp.behind);
         if let Some(next) = resp.next {
             v["next"] = json!(next);
             v["note"] = json!(
@@ -421,9 +497,11 @@ impl Server {
     }
 
     pub(super) fn blame(&self, args: Value) -> ToolResult {
-        let a: PathArgs = parse_args(args)?;
+        let a: BlameArgs = parse_args(args)?;
         let id = self.resolve_rev(a.rev.as_deref())?;
-        let blame = self.client.blame(&id, &a.path)?;
+        let blame = self
+            .index_client(a.fresh.unwrap_or(false))
+            .blame(&id, &a.path)?;
         let mut authors: BTreeMap<ChangesetId, String> = BTreeMap::new();
         let mut out = String::new();
         for (n, line) in blame.lines.iter().enumerate() {
@@ -448,11 +526,22 @@ impl Server {
                 line.text.trim_end_matches(['\n', '\r'])
             );
         }
-        let mut header = format!(
-            "blame of {} at {} (changeset, author, line: text)\n",
-            a.path,
-            short(&id)
-        );
+        let mut header = match blame.answered_at {
+            Some(at) => format!(
+                "blame of {} at {} (answered_at {}, {} behind the requested {}; changeset, \
+                 author, line: text)\n",
+                a.path,
+                short(&at),
+                at,
+                blame.behind.unwrap_or(0),
+                short(&id)
+            ),
+            None => format!(
+                "blame of {} at {} (changeset, author, line: text)\n",
+                a.path,
+                short(&id)
+            ),
+        };
         header.push_str(&out);
         Ok(ToolOutput::text(header))
     }

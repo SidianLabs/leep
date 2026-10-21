@@ -70,8 +70,8 @@ pub const BLOB_DOOM: &str = "blob-doom-v1";
 
 /// How long an upload waits for an in-progress delete of the same blob before
 /// giving up with a retryable conflict.
-const DOOM_WAIT: Duration = Duration::from_secs(30);
-const DOOM_POLL: Duration = Duration::from_millis(25);
+pub(crate) const DOOM_WAIT: Duration = Duration::from_secs(30);
+pub(crate) const DOOM_POLL: Duration = Duration::from_millis(25);
 
 fn unix_now() -> i64 {
     SystemTime::now()
@@ -101,7 +101,7 @@ impl Clock for SystemClock {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Doom {
+pub(crate) enum Doom {
     Deleting = 0,
     Abandoned = 1,
     Deleted = 2,
@@ -138,18 +138,24 @@ impl BlobFence {
     }
 }
 
-fn time_value(t: i64) -> Bytes {
+pub(crate) fn time_value(t: i64) -> Bytes {
     Bytes::copy_from_slice(&t.to_be_bytes())
 }
 
-fn decode_time(kind: &str, v: &[u8]) -> Result<i64> {
+pub(crate) fn decode_time(kind: &str, v: &[u8]) -> Result<i64> {
     <[u8; 8]>::try_from(v)
         .map(i64::from_be_bytes)
         .map_err(|_| Error::Other(format!("corrupt {kind} row")))
 }
 
 fn decode_doom(v: &[u8]) -> Result<(i64, Doom)> {
-    let bad = || Error::Other(format!("corrupt {BLOB_DOOM} row"));
+    decode_doom_of(BLOB_DOOM, v)
+}
+
+/// A doom row of `kind` (`blob-doom-v1` or `cs-doom-v1`): the condemnation
+/// time it answers and its state.
+pub(crate) fn decode_doom_of(kind: &str, v: &[u8]) -> Result<(i64, Doom)> {
+    let bad = || Error::Other(format!("corrupt {kind} row"));
     let (t, state) = v.split_at_checked(8).ok_or_else(bad)?;
     let doom = match state {
         [0] => Doom::Deleting,
@@ -157,22 +163,22 @@ fn decode_doom(v: &[u8]) -> Result<(i64, Doom)> {
         [2] => Doom::Deleted,
         _ => return Err(bad()),
     };
-    Ok((decode_time(BLOB_DOOM, t)?, doom))
+    Ok((decode_time(kind, t)?, doom))
 }
 
 /// Decode a GC row of `kind` into its time and, for `blob-doom-v1`, its state
 /// byte. Public only so the fuzz harness can reach the private decoders.
 #[doc(hidden)]
 pub fn decode_row(kind: &str, v: &[u8]) -> Result<(i64, Option<u8>)> {
-    if kind == BLOB_DOOM {
-        let (t, d) = decode_doom(v)?;
+    if kind == BLOB_DOOM || kind == crate::changeset_gc::CS_DOOM {
+        let (t, d) = decode_doom_of(kind, v)?;
         Ok((t, Some(d as u8)))
     } else {
         Ok((decode_time(kind, v)?, None))
     }
 }
 
-fn doom_value(epoch: i64, state: Doom) -> Bytes {
+pub(crate) fn doom_value(epoch: i64, state: Doom) -> Bytes {
     let mut v = epoch.to_be_bytes().to_vec();
     v.push(state as u8);
     Bytes::from(v)

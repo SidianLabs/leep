@@ -7,6 +7,110 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 ## [Unreleased]
 
+### Protected refs without a policy
+- `leep-server --protect-ref REF` (repeatable; `LEEP_PROTECT_REFS`
+  comma-separated): `REF` only moves forward and cannot be deleted through
+  the API, without requiring signatures or review. Before, only refs named by
+  `--require-signatures`, `--require-review` or a review policy were
+  protected, so any write token could rewind or delete `main` with a raw
+  compare-and-swap (ADR 0015).
+
+### Summary log entries
+- `GET /v1/log/{id}?fields=summary` answers the same entries, order and
+  cursors as listings need them: id, parents, author, timestamp,
+  `message_first_line`, `agent` (the `agent.*` keys), `files_changed`,
+  generation and root tree (plus `path_at`/`renamed` on `follow` logs), a
+  quarter of the bytes on git/git. The default (`fields=full`) is unchanged
+  byte for byte; other values are 400.
+- `leep log --oneline` prints the short id and the message's first line from
+  summary entries (`--json` prints them).
+- Behaviour change: the MCP `leep_log` tool reads summary entries by
+  default, so an entry's `message` is now its first line and non-agent
+  `extra` is no longer listed (`leep_show` has both). `full: true` restores
+  the previous entries.
+
+### Faster path logs
+- Path logs without a filter no longer read each changeset and root tree one
+  after another along the path's history: they read them in one batch per
+  page.
+
+### Changeset garbage collection, phase 1 (ADR 0059)
+- Migration 0007 adds `changesets.stored_at`, the unix time a changeset was
+  first stored, written by every new changeset. A catalog-only `ADD COLUMN`
+  on Postgres and SQLite that tolerates servers of the previous version;
+  older rows read as stored when the migration ran. Backups carry it.
+- Postgres migrations wait at most 5 s for a table lock (`lock_timeout`)
+  and then fail, changing nothing, instead of queueing every reader and
+  writer behind a long transaction such as a backup. Rerun
+  `leep-server migrate` once it has finished.
+- Servers now rescue changesets a changeset sweep has condemned before
+  storing anything that names them (children, lands, rebases, merges, ref
+  moves including `leep undo`, signatures, reviews, `leep-git export` mirror
+  maps). Nothing condemns yet; while no sweep runs this costs one cached
+  read every 10 s per server. `GET /v1/ready` lists `changeset-rescue`.
+- A land batch reads the sweep's flag on every attempt and gives up with a
+  retryable 409 after 60 s instead of retrying up to 32 times without a
+  time bound (`leep_land_batch_deadline_total`).
+- A keyed land retry whose changeset is no longer stored is answered from
+  its land id record instead of 404
+  (`leep_land_answered_from_record_total`).
+- `gc --unreachable --dry-run` ages changesets by `stored_at` instead of
+  the client's timestamp, and needs schema v7.
+
+### One indexer per index group (ADR 0058)
+- `leep-server --indexing local|lease|off` (default `local`, unchanged). In
+  `lease` mode each index group (path history, log filter, code search) is
+  warmed only by the server holding its index lease (scope `index` of the
+  `leases` table; 15 s TTL, renewed every 3 s, taken over 6 s after the last
+  renewal); `off` never warms. `--index-kinds` limits the groups a server
+  competes for.
+- In `lease` and `off` modes, while an index lease is live, path logs
+  (`follow` too), `last-change`, blame, filtered logs and search never derive
+  an index: they examine the un-indexed part directly within
+  `--query-scan-budget` (1,024 changesets), `--blame-scan-budget` (128),
+  `--search-scan-budget` (512 files) and `--search-scan-bytes` (16 MiB), with
+  the answers a fully indexed store gives. Over budget a request with
+  `Leep-Indexing: retry` gets `503` with `Retry-After` and an `indexing` error
+  body, one with `stale-ok` an answer at the newest indexed first-parent
+  ancestor (`answered_at`, `behind`), and one without the header waits for
+  the indexer (`--index-wait` 10 s, `--index-waiters` 64), then scans with 8
+  times the budgets (`--legacy-scan-factor`), then gets the 503. Without a
+  live lease queries derive inline as before.
+- Additive API: request header `Leep-Indexing`, response headers
+  `Leep-Indexing` (on the 503) and `Leep-Index-Scanned`, `indexing` on error
+  bodies, `answered_at` and `behind` on log, last-change, blame and search
+  responses, `stats.files_unindexed` on search, ready feature
+  `indexing-retry`.
+- A filtered log page (`author`, `extra`) now carries `next` only when
+  another match follows, so it is never empty with `next`. To know that, a
+  full page walks on to the next match, so a page whose filter matches
+  rarely costs about what the following page used to.
+- `leep log`, `last-change`, `blame` and `search` send `Leep-Indexing:
+  retry`, retry an indexing 503 for up to `LEEP_INDEX_WAIT` seconds (60), then
+  fail with error code `indexing` (exit 3, `retry_after_ms` in `--json`);
+  `--stale-ok` takes the older answer. MCP read tools take it by default
+  and report `answered_at`/`behind`; `fresh: true` insists on the head.
+- `repair drop`, `repair rederive --missing` and `upgrade-index --yes` take
+  the index leases of the groups they touch and wait `--index-fence` (60 s)
+  before touching rows; a live holder is refused unless `--ignore-lease`,
+  which `repair drop` and `upgrade-index --drop-first` refuse.
+- `last_merge-v1` is written with each changeset.
+- In `local` mode the warmer now warms code search side by side with path
+  history and the log filter in each pass, instead of after them.
+- New metrics: `leep_index_lease_held`, `leep_index_lease_acquired_total`,
+  `leep_index_lease_lost_total`, `leep_index_derived_total`,
+  `leep_index_backlog_changesets`, `leep_index_lag_seconds`,
+  `leep_query_unindexed_scanned_total`, `leep_query_indexing_answers_total`,
+  `leep_query_stale_answers_total`, `leep_query_inline_derive_total`,
+  `leep_query_index_wait_seconds`, `leep_query_index_waiters`,
+  `leep_create_last_merge_skipped_total`; alerts `LeepIndexLagging`,
+  `LeepIndexerMissing`, `LeepIndexingAnswersHigh`.
+- Code search builds a directory's filter with one batched read of its
+  subdirectories' and files' rows (a directory of 500 agent directories
+  made every search on a new head do 500 round trips).
+- `leep-swarm --indexing-header` and indexing, stale and inline-derivation
+  counts in its report.
+
 ### Core loop (M1)
 - Content-addressed data model (BLAKE3, postcard), storage traits and API
   types.
@@ -621,6 +725,13 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   59 s (packed store). `gc --full` walks everything and rewrites the record;
   `repair drop` refuses the kind, and `verify` checks its rows. New example
   `gc_profile` times GC phases and counts store calls.
+- `leep-server gc --unreachable --dry-run` counts what garbage collection of
+  unreachable changesets (ADR 0059, proposed) would reclaim: changesets no
+  ref, ref log entry, scan window, attestation or mirror map reaches, their
+  per-changeset rows and the tree nodes and contents only they introduced,
+  beside the store's logical write-path and index bytes per land and, for a
+  later ADR, what a `--ref-log-retention` would add. Read-only: Postgres
+  sessions refuse writes and SQLite opens with `mode=ro`.
 - Filtered logs use an index (ADR 0047). `GET /v1/log` with `author=` or
   `extra=` and no path (`leep log --author`, `--agent`, `--agent-model`,
   `--agent-session`) used to test every ancestor, so a rare value read the
@@ -872,10 +983,18 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   300,000-row kind and minutes for a full one; each batch now takes 30-50 ms
   whatever the statistics. Servers older than this change refuse the
   migrated database, as for any migration.
+- The S3 client's TLS verification no longer trusts certificate chains
+  through distrusted intermediates: rustls-webpki 0.103.16 and webpki-roots
+  1.0.10 (RUSTSEC-2026-0382, RUSTSEC-2026-0381).
 
 ### Project
 - Workspace version set to 0.0.1, with a CI check that keeps it below
   0.1.0.
+- Supply-chain checks: CI runs cargo-deny (`deny.toml`) for RustSec
+  advisories, licenses, wildcard dependencies and sources on every push and
+  pull request, and for advisories weekly. Dependabot opens grouped weekly
+  Cargo and GitHub Actions updates. The workspace declares its MSRV
+  (`rust-version = "1.97.0"`, matching `rust-toolchain.toml`).
 - Apache-2.0 license text, security policy and this changelog.
 - Product direction (`docs/PRODUCT.md`) and a draft contributor license
   agreement (`CLA.md`). Pull requests are merged by the maintainer only.

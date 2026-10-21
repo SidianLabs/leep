@@ -42,6 +42,10 @@ pub(crate) const SCAN_RATIO: usize = 150;
 /// a broader substring is frequent enough for the scan.
 pub(crate) const MAX_AUTHOR_CANDIDATES: usize = 4096;
 
+/// Most indexed changesets a bounded query gathers author candidates from;
+/// past that the author part of the filter is scanned.
+const MAX_CANDIDATE_ROOTS: usize = 256;
+
 /// What a stretch must contain to hold a match: per part of the filter, one
 /// of a set of fingerprints of one class.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -132,17 +136,18 @@ impl Repo {
         // Keep scanning while matches come often enough that the scan is the
         // cheaper way to the limit (see `SCAN_RATIO`).
         let mut budget = scan_first;
-        while out.len() < limit && scanned < budget {
+        let mut full = false;
+        while !full && scanned < budget {
             let Some(step) = walk.next(self, usize::MAX).await? else {
                 break;
             };
             scanned += 1;
-            push_match(out, step, filter, from);
+            full = push_match(out, &mut walk, step, filter, from, limit);
             if scanned == budget && out.len() * SCAN_RATIO >= scanned {
                 budget += scan_first;
             }
         }
-        if out.len() < limit && !walk.is_done() {
+        if !full && !walk.is_done() {
             match self.filter_probe(id, filter).await? {
                 Some(probe) => {
                     let mut st = Indexed {
@@ -155,11 +160,11 @@ impl Repo {
                     return Ok(st.rest());
                 }
                 None => {
-                    while out.len() < limit {
+                    while !full {
                         let Some(step) = walk.next(self, usize::MAX).await? else {
                             break;
                         };
-                        push_match(out, step, filter, from);
+                        full = push_match(out, &mut walk, step, filter, from, limit);
                     }
                 }
             }
@@ -230,10 +235,7 @@ impl Repo {
         let Indexed { seen, heap, bounds } = st;
         let mut ahead = Ahead::default();
         let mut pops = 0;
-        while out.len() < limit {
-            let Some((generation, x)) = heap.pop() else {
-                break;
-            };
+        while let Some((generation, x)) = heap.pop() {
             pops += 1;
             #[cfg(test)]
             tests::POPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -242,21 +244,32 @@ impl Repo {
                 seen.remove(&x);
                 continue;
             }
-            if !ahead.has_rows(x) {
-                ahead.read_rows(self, x, heap).await?;
-            }
-            let (row, sk) = ahead.take(x);
-            // Levels nest, so the widest stretch without a match is the
-            // highest level that rules one out.
-            if let Some(j) = (0..row.levels.len())
-                .rev()
-                .find(|&j| !probe.may_match(&row.levels[j]))
-            {
-                if let Some(e) = sk.get(j) {
-                    queue(seen, heap, bounds, e.generation, e.id, bound);
+            // Without a row in a bounded query (ADR 0058): scanned like the
+            // plain walk, every parent queued.
+            let unindexed = self.unindexed(x);
+            let row = if unindexed {
+                if let Some(b) = &self.bounded {
+                    b.examined(1);
                 }
-                continue;
-            }
+                None
+            } else {
+                if !ahead.has_rows(x) {
+                    ahead.read_rows(self, x, heap).await?;
+                }
+                let (row, sk) = ahead.take(x);
+                // Levels nest, so the widest stretch without a match is the
+                // highest level that rules one out.
+                if let Some(j) = (0..row.levels.len())
+                    .rev()
+                    .find(|&j| !probe.may_match(&row.levels[j]))
+                {
+                    if let Some(e) = sk.get(j) {
+                        queue(seen, heap, bounds, e.generation, e.id, bound);
+                    }
+                    continue;
+                }
+                Some((row, sk))
+            };
             if !ahead.css.contains_key(&x) {
                 ahead.read_changesets(self, x, heap, probe).await?;
             }
@@ -264,30 +277,53 @@ impl Repo {
                 Some(cs) => cs,
                 None => self.get_changeset(x).await?,
             };
-            for (i, &p) in cs.parents.iter().enumerate() {
-                let g = match sk.first() {
-                    Some(e) if i == 0 => e.generation,
-                    _ if seen.contains(&p) && !bounds.contains_key(&p) => continue,
-                    _ => self.generation(p).await?,
-                };
-                let b = if i == 0 {
-                    bound
-                } else {
-                    // A side this walk's own bound already reaches (a
-                    // branch merging mainline back) is not its business.
-                    if let Some(outer) = bound {
-                        if self.on_chain(p, g, outer.first).await? {
+            let matched = from.admits(generation, x) && filter.matches(&cs);
+            if matched && out.len() >= limit {
+                // The page is full and another match exists: leave it
+                // queued, unexpanded, so the cursor resumes with it.
+                heap.push((generation, x));
+                if let Some(b) = bound {
+                    bounds.insert(x, b);
+                }
+                break;
+            }
+            match &row {
+                None => {
+                    for &p in &cs.parents {
+                        if seen.contains(&p) && !bounds.contains_key(&p) {
                             continue;
                         }
+                        let g = self.generation(p).await?;
+                        queue(seen, heap, bounds, g, p, None);
                     }
-                    row.stops.get(i - 1).copied().flatten().map(|stop| Bound {
-                        stop,
-                        first: cs.parents[0],
-                    })
-                };
-                queue(seen, heap, bounds, g, p, b);
+                }
+                Some((row, sk)) => {
+                    for (i, &p) in cs.parents.iter().enumerate() {
+                        let g = match sk.first() {
+                            Some(e) if i == 0 => e.generation,
+                            _ if seen.contains(&p) && !bounds.contains_key(&p) => continue,
+                            _ => self.generation(p).await?,
+                        };
+                        let b = if i == 0 {
+                            bound
+                        } else {
+                            // A side this walk's own bound already reaches (a
+                            // branch merging mainline back) is not its business.
+                            if let Some(outer) = bound {
+                                if self.on_chain(p, g, outer.first).await? {
+                                    continue;
+                                }
+                            }
+                            row.stops.get(i - 1).copied().flatten().map(|stop| Bound {
+                                stop,
+                                first: cs.parents[0],
+                            })
+                        };
+                        queue(seen, heap, bounds, g, p, b);
+                    }
+                }
             }
-            if from.admits(generation, x) && filter.matches(&cs) {
+            if matched {
                 out.push(ChangesetInfo {
                     id: x,
                     changeset: cs,
@@ -346,7 +382,21 @@ impl Repo {
             });
         }
         if let Some(a) = &filter.author {
-            if let Some(fps) = self.author_candidates(head, a).await? {
+            // In a bounded query the head may have no row: the authors the
+            // index can rule out are those below the indexed frontier.
+            let head_indexed = match &self.bounded {
+                None => true,
+                Some(_) => self
+                    .meta()
+                    .get_derived(LogFilterIndex::NAME, &head.0)
+                    .await?
+                    .is_some(),
+            };
+            let roots = match &self.bounded {
+                Some(b) if !head_indexed => b.frontier.clone(),
+                _ => vec![head],
+            };
+            if let Some(fps) = self.author_candidates_of(&roots, a).await? {
                 parts.push((CLASS_AUTHOR, fps));
             }
         }
@@ -360,27 +410,33 @@ impl Repo {
     /// The widest levels down `head`'s first-parent chain cover all of its
     /// ancestors, so their author sets together name every author it can
     /// reach. An author whose name row is missing is kept: it may match.
-    async fn author_candidates(&self, head: ChangesetId, query: &str) -> Result<Option<Vec<u64>>> {
+    async fn author_candidates_of(
+        &self,
+        heads: &[ChangesetId],
+        query: &str,
+    ) -> Result<Option<Vec<u64>>> {
         let query = query.to_lowercase();
-        if query.is_empty() {
+        if query.is_empty() || heads.len() > MAX_CANDIDATE_ROOTS {
             return Ok(None);
         }
         let exact = author_fingerprint(&query);
         let mut all: Vec<u64> = Vec::new();
-        let mut x = head;
-        loop {
-            let row = self.filter_row(x).await?;
-            let Some(j) = (0..row.levels.len())
-                .rev()
-                .find(|&j| row.levels[j].class(CLASS_AUTHOR).is_some())
-            else {
-                return Ok(None);
-            };
-            all.extend_from_slice(row.levels[j].class(CLASS_AUTHOR).expect("found above"));
-            if row.depth == 0 {
-                break;
+        for &head in heads {
+            let mut x = head;
+            loop {
+                let row = self.filter_row(x).await?;
+                let Some(j) = (0..row.levels.len())
+                    .rev()
+                    .find(|&j| row.levels[j].class(CLASS_AUTHOR).is_some())
+                else {
+                    return Ok(None);
+                };
+                all.extend_from_slice(row.levels[j].class(CLASS_AUTHOR).expect("found above"));
+                if row.depth == 0 {
+                    break;
+                }
+                x = self.skiplist(x).await?[j].id;
             }
-            x = self.skiplist(x).await?[j].id;
         }
         all.sort_unstable();
         all.dedup();
@@ -452,7 +508,7 @@ impl Ahead {
             return Ok(());
         }
         let ids = Self::nearest(first, heap, |id| {
-            !(self.rows.contains_key(&id) && self.sks.contains_key(&id))
+            !(self.rows.contains_key(&id) && self.sks.contains_key(&id)) && !repo.unindexed(id)
         });
         let keys: Vec<Hash> = ids.iter().map(|id| id.0).collect();
         let meta = repo.meta();
@@ -507,10 +563,11 @@ impl Ahead {
     ) -> Result<()> {
         let ids = Self::nearest(first, heap, |id| {
             !self.css.contains_key(&id)
-                && self
-                    .rows
-                    .get(&id)
-                    .is_some_and(|r| r.levels.iter().all(|l| probe.may_match(l)))
+                && (repo.unindexed(id)
+                    || self
+                        .rows
+                        .get(&id)
+                        .is_some_and(|r| r.levels.iter().all(|l| probe.may_match(l))))
         });
         let Ok(found) = repo.meta().get_changesets(&ids).await else {
             return Ok(());
@@ -589,9 +646,23 @@ fn queue(
 }
 
 /// Keep `step` if it matches; its root tree is filled in at the end, in one
-/// batch for all matches.
-fn push_match(out: &mut Vec<ChangesetInfo>, step: Step, filter: &LogFilter, from: &LogFrom) {
+/// batch for all matches. A match past a full page is queued again instead,
+/// unexpanded parents and all, and `true` says the page ends: a page carries
+/// a `next` cursor exactly when another match exists, whichever way the
+/// walk got there (ADR 0058).
+fn push_match(
+    out: &mut Vec<ChangesetInfo>,
+    walk: &mut Walk,
+    step: Step,
+    filter: &LogFilter,
+    from: &LogFrom,
+    limit: usize,
+) -> bool {
     if from.admits(step.generation, step.id) && filter.matches(&step.cs) {
+        if out.len() >= limit {
+            walk.heap.push((step.generation, step.id));
+            return true;
+        }
         out.push(ChangesetInfo {
             id: step.id,
             changeset: step.cs,
@@ -601,6 +672,7 @@ fn push_match(out: &mut Vec<ChangesetInfo>, step: Step, filter: &LogFilter, from
             renamed: None,
         });
     }
+    false
 }
 
 #[cfg(test)]

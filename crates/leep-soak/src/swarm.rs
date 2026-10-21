@@ -113,6 +113,11 @@ struct Args {
     /// Seed of the agents' choices.
     #[arg(long, default_value_t = 1)]
     seed: u64,
+    /// Send `Leep-Indexing: retry` or `stale-ok` with index-backed reads
+    /// (log with a path, blame, search; ADR 0058). Without it reads go as
+    /// old clients send them.
+    #[arg(long, value_parser = ["retry", "stale-ok"])]
+    indexing_header: Option<String>,
 }
 
 /// xorshift64*: cheap, seeded, good enough for workload choices.
@@ -249,6 +254,10 @@ struct Tally {
     answered_in_window: bool,
     /// Markers of lands answered `Landed`.
     landed: Vec<String>,
+    /// Index-backed reads answered 503 because the index lagged, by route.
+    indexing: BTreeMap<&'static str, u64>,
+    /// Reads answered at an older changeset (`stale-ok`), by route.
+    stale: BTreeMap<&'static str, u64>,
     /// Logical lands (a change, through its re-lands after conflicts) whose
     /// first land was sent inside the window, and what they took.
     logical: LogicalTally,
@@ -288,6 +297,18 @@ enum Answer<T> {
     Ok(T),
     Status(u16),
     /// Timeout or a lost connection: the request may have applied.
+    Lost(String),
+}
+
+/// How an index-backed read was answered.
+enum ReadAnswer {
+    /// 200; `stale` when at an older changeset than asked.
+    Ok {
+        stale: bool,
+    },
+    /// 503 because the index lags (ADR 0058).
+    Indexing,
+    Status(u16),
     Lost(String),
 }
 
@@ -339,6 +360,34 @@ impl Shared {
         }
     }
 
+    /// A read, with `--indexing-header` when it is index-backed.
+    async fn read(&self, server: usize, path: &str, indexed: bool) -> ReadAnswer {
+        let url = format!("{}{path}", self.servers[server]);
+        let mut rq = self.client.get(url);
+        if let (true, Some(h)) = (indexed, &self.args.indexing_header) {
+            rq = rq.header("leep-indexing", h.as_str());
+        }
+        match rq.send().await {
+            Err(e) => ReadAnswer::Lost(short_err(&e)),
+            Ok(r) => {
+                let s = r.status();
+                match r.bytes().await {
+                    Err(e) => ReadAnswer::Lost(short_err(&e)),
+                    Ok(b) if s == StatusCode::OK => ReadAnswer::Ok {
+                        stale: indexed && contains(&b, b"\"answered_at\""),
+                    },
+                    Ok(b)
+                        if s == StatusCode::SERVICE_UNAVAILABLE
+                            && contains(&b, b"\"indexing\"") =>
+                    {
+                        ReadAnswer::Indexing
+                    }
+                    Ok(_) => ReadAnswer::Status(s.as_u16()),
+                }
+            }
+        }
+    }
+
     async fn put_blob(&self, server: usize, data: Vec<u8>) -> Answer<Hash> {
         let h = Hash::of_blob(&data);
         let url = format!("{}/v1/blobs/{h}", self.servers[server]);
@@ -348,6 +397,10 @@ impl Shared {
             Ok(r) => Answer::Status(r.status().as_u16()),
         }
     }
+}
+
+fn contains(hay: &[u8], needle: &[u8]) -> bool {
+    hay.windows(needle.len()).any(|w| w == needle)
 }
 
 fn short_err(e: &reqwest::Error) -> String {
@@ -454,11 +507,26 @@ async fn agent(s: Arc<Shared>, who: usize, start_after: Duration) -> Tally {
                 Read::Search => "search",
                 Read::Diff => "diff",
             };
+            let indexed = match kind {
+                Read::Log => path.contains("path="),
+                Read::Blame | Read::Search => true,
+                Read::Files | Read::Diff => false,
+            };
             let t0 = Instant::now();
-            match s.get_raw(server, &path).await {
-                Answer::Ok(()) => t.time(measuring, op, t0),
-                Answer::Status(c) => t.error(format!("{op} {c}")),
-                Answer::Lost(e) => t.error(format!("{op} {e}")),
+            match s.read(server, &path, indexed).await {
+                ReadAnswer::Ok { stale } => {
+                    t.time(measuring, op, t0);
+                    if stale && measuring {
+                        *t.stale.entry(op).or_default() += 1;
+                    }
+                }
+                ReadAnswer::Indexing => {
+                    if measuring {
+                        *t.indexing.entry(op).or_default() += 1;
+                    }
+                }
+                ReadAnswer::Status(c) => t.error(format!("{op} {c}")),
+                ReadAnswer::Lost(e) => t.error(format!("{op} {e}")),
             }
         }
         if s.stop.load(Ordering::Relaxed) {
@@ -678,6 +746,27 @@ fn metric(page: &str, name: &str) -> f64 {
         .sum()
 }
 
+/// [`metric`], only samples whose labels contain `label`.
+fn metric_labeled(page: &str, name: &str, label: &str) -> f64 {
+    page.lines()
+        .filter(|l| !l.starts_with('#'))
+        .filter(|l| {
+            l.strip_prefix(name)
+                .is_some_and(|r| r.starts_with('{') && r.contains(label))
+        })
+        .filter_map(|l| l.rsplit(' ').next()?.parse::<f64>().ok())
+        .sum()
+}
+
+/// Rows of the path-history index.
+async fn history_rows(pool: &sqlx::PgPool) -> Result<i64> {
+    let (n,): (i64,) =
+        sqlx::query_as("SELECT count(*) FROM derived WHERE kind = 'history-tree-v4'")
+            .fetch_one(pool)
+            .await?;
+    Ok(n)
+}
+
 async fn scrape(client: &Client, metrics: &[String]) -> String {
     let mut all = String::new();
     for m in metrics {
@@ -758,7 +847,13 @@ async fn generation(
 
 /// Derived kinds the write path stores (create and land); every other kind
 /// is an index built by reads or the warmer.
-const WRITE_KINDS: &[&str] = &["root_tree", "generation", "skiplist", "rebased-origin-v1"];
+const WRITE_KINDS: &[&str] = &[
+    "root_tree",
+    "generation",
+    "skiplist",
+    "last_merge-v1",
+    "rebased-origin-v1",
+];
 
 /// Logical bytes in the database: changesets, ref log and refs plus the
 /// write path's derived rows, and the other derived rows.
@@ -949,6 +1044,21 @@ struct Report {
     land_recorded: f64,
     warmer_lag_history: Option<(u64, u64)>,
     warmer_lag_log_filter: Option<(u64, u64)>,
+    /// `--indexing-header`, if any.
+    indexing_header: Option<String>,
+    /// Lands a second per agent, the rate ADR 0058's sizing rests on.
+    lands_per_agent_s: f64,
+    /// Index-backed reads answered 503 (index behind), by route.
+    indexing_answers: BTreeMap<String, u64>,
+    /// Reads answered at an older changeset, by route.
+    stale_answers: BTreeMap<String, u64>,
+    /// Queries that derived an index inline in `lease` or `off` mode
+    /// (`leep_query_inline_derive_total`; 0 while a lease lives).
+    inline_derives: f64,
+    /// Path-history values computed, over every server, and rows added: the
+    /// excess is derivation done twice.
+    history_derived: f64,
+    history_rows_added: Option<i64>,
     db_bytes_per_land: Option<f64>,
     /// Logical bytes per land written by the write path (changesets, ref
     /// log, refs and their derived rows), and by indexes reads and the
@@ -1051,6 +1161,10 @@ async fn main() -> Result<()> {
         Some(p) => Some((db_bytes(p).await?, logical_bytes(p).await?)),
         None => None,
     };
+    let history_before = match &pool {
+        Some(p) => Some(history_rows(p).await?),
+        None => None,
+    };
     s.measuring.store(true, Ordering::Relaxed);
     let started = Instant::now();
     let lags = Arc::new(Mutex::new((Vec::new(), Vec::new())));
@@ -1103,6 +1217,12 @@ async fn main() -> Result<()> {
         l.resends += m.resends;
         l.status_409 += m.status_409;
         l.time_to_landed.extend(m.time_to_landed);
+        for (k, v) in a.indexing {
+            *tally.indexing.entry(k).or_default() += v;
+        }
+        for (k, v) in a.stale {
+            *tally.stale.entry(k).or_default() += v;
+        }
     }
     tally.logical.time_to_landed.sort_unstable();
     let lg = &tally.logical;
@@ -1126,6 +1246,10 @@ async fn main() -> Result<()> {
     }
     let bytes_after = match &pool {
         Some(p) => Some((db_bytes(p).await?, logical_bytes(p).await?)),
+        None => None,
+    };
+    let history_after = match &pool {
+        Some(p) => Some(history_rows(p).await?),
         None => None,
     };
     let (doubles, lost) = if args.no_history_check {
@@ -1187,6 +1311,25 @@ async fn main() -> Result<()> {
         land_recorded: d("leep_land_recorded_total"),
         warmer_lag_history: lag_summary(&mut lh),
         warmer_lag_log_filter: lag_summary(&mut ll),
+        indexing_header: args.indexing_header.clone(),
+        lands_per_agent_s: tally.lands_in_window as f64 / elapsed / args.agents.max(1) as f64,
+        indexing_answers: tally
+            .indexing
+            .iter()
+            .map(|(k, v)| (k.to_string(), *v))
+            .collect(),
+        stale_answers: tally
+            .stale
+            .iter()
+            .map(|(k, v)| (k.to_string(), *v))
+            .collect(),
+        inline_derives: d("leep_query_inline_derive_total"),
+        history_derived: metric_labeled(&after, "leep_derive_total", "kind=\"history-tree-v4\"")
+            - metric_labeled(&before, "leep_derive_total", "kind=\"history-tree-v4\""),
+        history_rows_added: match (history_before, history_after) {
+            (Some(b), Some(a)) => Some(a - b),
+            _ => None,
+        },
         db_bytes_per_land: per_land(bytes_before.map(|b| b.0), bytes_after.map(|a| a.0)),
         write_bytes_per_land: per_land(bytes_before.map(|b| b.1 .0), bytes_after.map(|a| a.1 .0)),
         index_bytes_per_land: per_land(bytes_before.map(|b| b.1 .1), bytes_after.map(|a| a.1 .1)),
@@ -1295,6 +1438,16 @@ fn print_report(r: &Report) {
     for (k, v) in &r.ops {
         println!("| {k} | {} | {:.1} | {:.1} |", v.count, v.p50_ms, v.p99_ms);
     }
+    println!(
+        "indexing header {} | lands/s per agent {:.4} | indexing answers {:?} | stale answers {:?} | inline derivations {} | history derived {} for {} rows",
+        r.indexing_header.as_deref().unwrap_or("none"),
+        r.lands_per_agent_s,
+        r.indexing_answers,
+        r.stale_answers,
+        r.inline_derives,
+        r.history_derived,
+        r.history_rows_added.map_or("-".into(), |n| n.to_string()),
+    );
     if !r.errors.is_empty() {
         println!("errors: {:?}", r.errors);
     }

@@ -42,6 +42,11 @@ skill.
 | derived `blob-rescue-v1` | — | `MetaStore.derived`, key = blob hash, value = the condemnation time the writer observed, 8-byte big-endian `i64` |
 | derived `blob-doom-v1` | — | `MetaStore.derived`, key = blob hash, value = condemnation time (8-byte big-endian `i64`) then one state byte: 0 deleting, 1 abandoned, 2 deleted |
 | derived `gc-mark-v1` | — | `MetaStore.derived`, key = changeset id, tree node hash or blob hash, value = the single byte `0x01` (anything else reads as absent). Written by GC marks in post-order, so a row exists only after the rows of everything below it (ADR 0033) |
+| derived `cs-condemned-v1` | — | `MetaStore.derived`, key = changeset id, value = condemnation time, unix seconds as 8-byte big-endian `i64`, from the sweep host's clock (ADR 0059) |
+| derived `cs-rescue-v1` | — | `MetaStore.derived`, key = changeset id, value = the condemnation time the writer observed, 8-byte big-endian `i64` |
+| derived `cs-doom-v1` | — | `MetaStore.derived`, key = changeset id, value = condemnation time (8-byte big-endian `i64`) then one state byte: 0 deleting, 1 abandoned, 2 deleted |
+| derived `gc-fence-active-v1` | — | `MetaStore.derived`, one row, key = 32 zero bytes, value = unix seconds the current changeset condemnation round began, 8-byte big-endian `i64`, or 0 when none is under way |
+| derived `cs-reach-v1` | — | `MetaStore.derived`, key = changeset id, value = the single byte `0x01` (anything else reads as absent): a ref or ref log entry reaches the changeset, and every parent has a row. Written parents first (ADR 0059). One more row, key = 32 zero bytes, holds the `seq` of the newest ref log entry the rows cover (8-byte big-endian) |
 | derived `blob-trigrams-v1` | — | `MetaStore.derived`, key = blob hash, value = see "Code search index" below |
 | derived `tree-trigrams-v1` | — | `MetaStore.derived`, key = tree node hash (`TreeNode::hash()`), value = see "Code search index" below |
 | derived `history-tree-v4` | — | `MetaStore.derived`, key = changeset id, value = part 0 of the changeset's history pack (ADR 0045): the history nodes its derivation wrote, and its root node's address |
@@ -426,7 +431,8 @@ a blank line and `This reverts <id>.`.
 ## SQL schema (leep-meta)
 
 ```
-changesets(id BYTEA PRIMARY KEY, data BYTEA NOT NULL)          -- data = Changeset::encode(), or a zstd frame of it (ADR 0053)
+changesets(id BYTEA PRIMARY KEY, data BYTEA NOT NULL,          -- data = Changeset::encode(), or a zstd frame of it (ADR 0053)
+           stored_at BIGINT)                                   -- migration 0007; SQLite: INTEGER; unix seconds of the first store
 changeset_dicts(id BIGINT PRIMARY KEY,                         -- SQLite: INTEGER; migration 0003
                 created_at BIGINT NOT NULL, data BYTEA NOT NULL) -- a zstd dictionary whose header id = id
 store_features(name TEXT PRIMARY KEY,                          -- migration 0004
@@ -486,6 +492,19 @@ Migration 0006 (`leases`, ADR 0056) adds the lease table, empty. Servers
 write it only with `--land-coordination on` (and, later, for the indexer
 scope of ADR 0058); older servers never read it, so the migration tolerates
 them. See "Leases" below.
+
+Migration 0007 (`changeset_stored_at`, ADR 0059) adds the nullable
+`changesets.stored_at`: unix seconds, by the clock of the server that first
+stored the changeset. Every `put_changeset*` writes it on insert and a
+repeated store keeps the first value; `compact-changesets` rewrites `data`
+only. With no default it is a catalog-only change on both backends: no row
+is rewritten. Rows stored before the migration, and rows a v6 server stores
+after it (v6 never names the column), stay NULL and read through
+`MetaStore::changesets_stored_at` as the migration's
+`schema_migrations.applied_at`. Changeset garbage collection ages changesets
+by it, never by the client's `Changeset::timestamp`. Backups (ADR 0026) copy
+the column with that substitution already made, so a restore, whose own
+migrations run later, keeps every row's age.
 
 ### Changeset rows (ADR 0053)
 
@@ -611,6 +630,46 @@ On the wire nothing a client sends or reads changed. Between servers:
   land again. Clients never see it.
 - With coordination on, `GET /v1/health` carries `Leep-Instance: <holder>`,
   which a server uses to check that its `--advertise-url` reaches itself.
+
+## Index leases and bounded queries (additive, ADR 0058)
+
+No table, column or stored encoding changed.
+
+- **Index leases** are `leases` rows with `scope = 'index'`, `repo_id = 0`
+  (index rows are shared by every repository), `name` the group's primary
+  kind (`history-tree-v4`, `log-filter-v1`, `tree-trigrams-v1`) and `shard =
+  0`, taken with a 15 s TTL and taken over 6 s after the last renewal.
+  `meta` is a JSON object the holder rewrites on each renewal:
+  `{"rate": <changesets a second over the last minute>, "backlog": <changesets
+  its last pass derived>, "shards": 1}`; readers ignore fields they do not
+  know and treat a missing or unreadable one as unknown. `address` is the
+  holder's `--advertise-url` (informational), `protocol` is 1.
+- **`last_merge-v1`** rows are now written with the changeset (same value as
+  before); a changeset whose first parent has no row and is neither a merge
+  nor a root, and whose grandparent's row is not known, is stored without
+  one and the row stays derived lazily.
+- **Request header** `Leep-Indexing: retry | stale-ok` on `GET /v1/log`,
+  `/v1/last-change`, `/v1/blame` and `/v1/search`; unknown values count as
+  absent. Servers that honour it list the ready feature `indexing-retry`.
+- **503 answer** to a query whose index is too far behind: `Retry-After`
+  (seconds, 1 to 30), `Leep-Indexing: kind=<group>; behind=<n>`, and the usual
+  `ErrorResponse` with an optional `indexing: {kind, behind, retry_after_ms}`
+  (omitted on every other error). `behind` is generations between the
+  requested changeset and the newest indexed first-parent ancestor (for
+  search, at most 64 are looked at).
+- **Optional response fields** `answered_at` (changeset id) and `behind`
+  (generations) on `LogResponse`, `LastChangeResponse`, `BlameResponse` and
+  `SearchResponse`, present only when a `stale-ok` answer is for an older
+  changeset than asked; `SearchStats.files_unindexed` (omitted when 0): files
+  fetched to stand in for missing trigram rows. Successful indexed reads carry
+  `Leep-Index-Scanned: <n>`, the changesets (files, for search) examined
+  without index rows.
+- Answers are the same with or without index rows: entries, order,
+  `truncated` and whether `next` is given. Cursor text may differ, and search
+  `stats` other than `files_considered`, `files_skipped` and `indexed`
+  describe the work done (`blob_rows_derived` and `tree_rows_derived` are 0
+  for a bounded search). A filtered log page now has `next` only when another
+  match follows.
 
 ## Blob storage layout (leep-store)
 
@@ -905,6 +964,25 @@ means a new kind name (`-v2`).
 may answer 408 (request timeout) or 409 (blob being collected, retry). New
 server flag `--request-timeout` / `LEEP_REQUEST_TIMEOUT`.
 
+## Changeset garbage collection, phase 1 (new column, derived kinds and `MetaStore` method, ADR 0059)
+
+Persisted: `changesets.stored_at` (migration 0007 above) and the derived
+kinds `cs-condemned-v1`, `cs-rescue-v1`, `cs-doom-v1`, `gc-fence-active-v1`
+and `cs-reach-v1` in the table above. The first three have exactly the
+encodings and rules of their `blob-*-v1` counterparts (ADR 0012), keyed by
+changeset id: a changeset is condemned iff `condemned > rescue`. Golden
+bytes are asserted in `leep-derive` (`cs_row_encodings_are_stable`).
+`MetaStore` gains `changesets_stored_at(ids)`, whose default is an error
+(like `find_lands`), so a wrapper that does not forward it fails loudly.
+
+Wire: `GET /v1/ready` lists `changeset-rescue` in `features` (a server that
+rescues condemned changesets before writing anything that names them). A
+keyed `POST /v1/land` whose changeset is not stored is answered from its
+land id record, when there is one, with the `Landed` it got the first time,
+instead of 404. A land batch that runs past 60 s answers its lands 409
+(retry). No `/v1` field, `Changeset`, `TreeNode`, hash or other encoding
+changed.
+
 ## Backup directory (new, ADR 0026; no change to stored objects)
 Written and read by `leep-server backup`, `restore` and `backup-verify`.
 Nothing persisted by the server or sent over `/v1` changes.
@@ -983,7 +1061,10 @@ answer, but not `limit`) | postcard body`:
   }` of the last entry, which restarts from the tip and skips what ranks at or
   above it. Every log walk pops changesets in descending `(generation, id)` and
   queues only ancestors of what it popped, so a walk seeded with the queue
-  yields exactly the rest of the original walk.
+  yields exactly the rest of the original walk. A page answered at an older
+  changeset under `Leep-Indexing: stale-ok` wraps either in `Pinned { at,
+  inner }` (ADR 0058), so later pages continue the walk of `at`; servers
+  without it refuse such a cursor as malformed.
 - search: the changeset searched (pinned, so later pages read the same tree
   even if `rev` moved) and the position after the last match kept (`path`,
   `line`), or after the last file finished (`line = u64::MAX`) when the scan
@@ -999,6 +1080,20 @@ with `follow`, bounds only from the indexed walk). Any failure is 400 with an
 change to the layout bumps the version byte, so cursors from an older server
 are refused rather than misread. `before` and `after` together on the ref log
 are 400.
+
+## Log summary entries (additive API parameter, no persisted change)
+
+`GET /v1/log/{id}` accepts `fields=full` (the default, unchanged byte for
+byte) or `fields=summary`; any other value is 400. A summary answers
+`LogSummaryResponse`, `LogResponse` with each entry a `LogSummaryEntry`:
+`{"id", "parents", "author", "timestamp", "message_first_line", "agent",
+"files_changed", "generation", "root_tree"}` plus `path_at` and `renamed`
+when a full entry would have them. `message_first_line` and `agent` (only the
+`agent.*` keys of `extra`) are as in blame's `ChangesetSummary`;
+`files_changed` is the number of paths in `changes`. `next`, `answered_at` and `behind`
+are as in `LogResponse`, and a cursor from either shape continues the other
+(`fields` is not part of the cursor fingerprint). Servers that predate the
+parameter ignore it and send full entries, which clients project.
 
 ## Request limits (additive, ADR 0020)
 

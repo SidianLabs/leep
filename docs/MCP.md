@@ -50,7 +50,7 @@ Logs go to stderr; stdout carries protocol messages only.
 | Tool | Arguments | Result |
 |---|---|---|
 | `leep_refs` | none | refs and their changeset ids; tags are the names under `tags/` |
-| `leep_log` | `rev?`, `path?`, `follow?`, `limit?` (default 20, max 200), `author?`, `agent_model?`, `agent_session?` (filters combine with AND), `cursor?` | entries with author, message, `agent` metadata, and `next` when more history follows (call again with the same arguments, `rev` set to the result's `from` and `cursor` set to `next`); with `follow` (needs a file `path`) history continues under the file's old name across renames, and entries carry `path_at` and, where the rename happened, `renamed {from, to, similarity, exact}` |
+| `leep_log` | `rev?`, `path?`, `follow?`, `limit?` (default 20, max 200), `author?`, `agent_model?`, `agent_session?` (filters combine with AND), `cursor?`, `full?` | entries with author, the message's first line (`leep_show` has the whole message), `files_changed`, `agent` metadata, and `next` when more history follows (call again with the same arguments, `rev` set to the result's `from` and `cursor` set to `next`); with `follow` (needs a file `path`) history continues under the file's old name across renames, and entries carry `path_at` and, where the rename happened, `renamed {from, to, similarity, exact}`; `full: true` gives each entry the whole message and its non-agent metadata as `extra`, as before summaries |
 | `leep_show` | `rev` | one changeset and its changed paths (A/M/D) |
 | `leep_list_files` | `rev?`, `prefix?` | recursive file list with sizes |
 | `leep_read_file` | `rev?`, `path` | text content; capped at 256 KiB; binary is reported, not returned |
@@ -65,6 +65,13 @@ tools return plain text. Failures (bad arguments, 401, 403, 404, unreachable
 server) come back as results with `isError: true`.
 
 ### Search
+
+`leep_log`, `leep_blame` and `leep_search` also take `fresh?`. When the
+server's index lags behind recent lands (ADR 0058), they answer by default at
+the newest indexed changeset and add `answered_at` and `behind` (changesets of
+lag) to the result: a slightly older answer now. With `fresh: true` they ask
+for the requested revision, retry once within 5 s, and otherwise return an
+error naming the index, its lag and when to retry.
 
 `leep_search` greps a revision on the server, so an agent need not list and read
 every file. `query` is a literal by default; `regex: true` uses Rust regex syntax

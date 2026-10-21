@@ -122,6 +122,13 @@ pub(crate) enum LogResume {
     /// Restart from the tip and skip every changeset ranking at or above
     /// this one. The fallback for a queue too wide to carry.
     Below { generation: u64, id: ChangesetId },
+    /// The walk is of `at`, not of the changeset the query names: the first
+    /// page was answered there under `Leep-Indexing: stale-ok` (ADR 0058),
+    /// and later pages continue the same walk.
+    Pinned {
+        at: ChangesetId,
+        inner: Box<LogResume>,
+    },
 }
 
 /// One queued changeset of a log walk.
@@ -179,6 +186,8 @@ impl From<LogResume> for LogFrom {
                 indexed: false,
                 below: Some((generation, id)),
             },
+            // Unwrapped by `Repo::log_resume` before it gets here.
+            LogResume::Pinned { inner, .. } => LogFrom::from(*inner),
         }
     }
 }

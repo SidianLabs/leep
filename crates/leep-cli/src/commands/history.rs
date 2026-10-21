@@ -3,7 +3,9 @@
 use std::io::Write;
 
 use clap::Args;
-use leep_core::api::{BlameResponse, ChangesetInfo, ProvenanceResponse, SignaturesResponse};
+use leep_core::api::{
+    BlameResponse, ChangesetInfo, LogSummaryEntry, ProvenanceResponse, SignaturesResponse,
+};
 use leep_core::changeset::{EXTRA_AGENT_MODEL, EXTRA_AGENT_SESSION};
 
 use super::{print_json, Remote};
@@ -48,6 +50,15 @@ pub struct LogArgs {
     /// value); repeatable, all must match.
     #[arg(long, value_name = "KEY[=VALUE]")]
     pub extra: Vec<String>,
+    /// When the server's index lags, answer at the newest indexed changeset
+    /// instead of waiting for it (says which on stderr).
+    #[arg(long)]
+    pub stale_ok: bool,
+    /// One line per changeset: short id and the message's first line. Asks
+    /// the server for summary entries (no changed paths, first message line,
+    /// `agent.*` metadata), which `--json` prints.
+    #[arg(long)]
+    pub oneline: bool,
 }
 
 impl LogArgs {
@@ -104,6 +115,9 @@ pub struct LastChangeArgs {
     /// Revision to look from (default: working copy base, else target ref).
     #[arg(long)]
     pub rev: Option<String>,
+    /// See `leep log --stale-ok`.
+    #[arg(long)]
+    pub stale_ok: bool,
 }
 
 #[derive(Args, Debug)]
@@ -129,6 +143,21 @@ pub struct BlameArgs {
     /// changeset id alone.
     #[arg(long)]
     pub who: bool,
+    /// See `leep log --stale-ok`.
+    #[arg(long)]
+    pub stale_ok: bool,
+}
+
+/// Say on stderr that an answer is for an older changeset than asked
+/// (`--stale-ok`, ADR 0058).
+pub fn note_stale(answered_at: Option<leep_core::ChangesetId>, behind: Option<u64>) {
+    if let Some(at) = answered_at {
+        eprintln!(
+            "(answered at {}, {} behind)",
+            short(at),
+            behind.unwrap_or(0)
+        );
+    }
 }
 
 /// `abbreviate` prints the 12-digit short id, which every command accepts
@@ -158,6 +187,15 @@ fn header(info: &ChangesetInfo, abbreviate: bool) -> String {
     out
 }
 
+/// `leep log --oneline`: short id and the message's first line.
+fn oneline(info: &LogSummaryEntry) -> String {
+    format!(
+        "{} {}\n",
+        term::paint(&short(info.id), Style::Yellow),
+        info.message_first_line
+    )
+}
+
 /// What `log --follow` adds to an entry: the file's name there, and the
 /// rename that gave it that name.
 fn follow_lines(info: &ChangesetInfo) -> Vec<String> {
@@ -173,12 +211,28 @@ fn follow_lines(info: &ChangesetInfo) -> Vec<String> {
 
 pub fn log(r: &Remote, args: &LogArgs) -> Result<i32> {
     let id = r.resolve_default(args.rev.as_deref())?;
-    let resp = r.client.log_all(&id, &args.query()?, args.limit as usize)?;
+    let client = r.client.clone().with_stale_ok(args.stale_ok);
+    let (q, want) = (args.query()?, args.limit as usize);
+    let mut out = String::new();
+    if args.oneline {
+        let resp = client.log_summary_all(&id, &q, want)?;
+        note_stale(resp.answered_at, resp.behind);
+        if r.json {
+            print_json(&resp)?;
+            return Ok(0);
+        }
+        for info in &resp.entries {
+            out.push_str(&oneline(info));
+        }
+        term::page(&out, false)?;
+        return Ok(0);
+    }
+    let resp = client.log_all(&id, &q, want)?;
+    note_stale(resp.answered_at, resp.behind);
     if r.json {
         print_json(&resp)?;
         return Ok(0);
     }
-    let mut out = String::new();
     for info in &resp.entries {
         out.push_str(&header(info, true));
         out.push('\n');
@@ -189,7 +243,9 @@ pub fn log(r: &Remote, args: &LogArgs) -> Result<i32> {
 
 pub fn last_change(r: &Remote, args: &LastChangeArgs) -> Result<i32> {
     let id = r.resolve_default(args.rev.as_deref())?;
-    let resp = r.client.last_change(&id, &args.path)?;
+    let client = r.client.clone().with_stale_ok(args.stale_ok);
+    let resp = client.last_change(&id, &args.path)?;
+    note_stale(resp.answered_at, resp.behind);
     if r.json {
         print_json(&resp)?;
         return Ok(0);
@@ -266,7 +322,9 @@ pub fn blame(r: &Remote, args: &BlameArgs) -> Result<i32> {
         _ => return Err(CliError::user("usage: leep blame [REV] PATH")),
     };
     let id = r.resolve_default(rev)?;
-    let resp = r.client.blame(&id, path)?;
+    let client = r.client.clone().with_stale_ok(args.stale_ok);
+    let resp = client.blame(&id, path)?;
+    note_stale(resp.answered_at, resp.behind);
     if r.json {
         print_json(&resp)?;
         return Ok(0);
@@ -451,6 +509,7 @@ mod tests {
 
     fn log_args() -> LogArgs {
         LogArgs {
+            stale_ok: false,
             rev: None,
             path: None,
             follow: None,
@@ -461,6 +520,7 @@ mod tests {
             agent_session: None,
             extra: vec![],
             after: None,
+            oneline: false,
         }
     }
 
@@ -557,6 +617,29 @@ mod tests {
     }
 
     #[test]
+    fn oneline_is_the_short_id_and_the_subject() {
+        let entry = |message: &str| LogSummaryEntry {
+            id: cid(1),
+            parents: vec![],
+            author: "a".into(),
+            timestamp: 0,
+            message_first_line: message.lines().next().unwrap_or("").into(),
+            agent: BTreeMap::new(),
+            files_changed: 0,
+            generation: 1,
+            root_tree: Hash::of_blob(b""),
+            path_at: None,
+            renamed: None,
+        };
+        let id = short(cid(1));
+        assert_eq!(
+            oneline(&entry("subject\n\nbody")),
+            format!("{id} subject\n")
+        );
+        assert_eq!(oneline(&entry("")), format!("{id} \n"));
+    }
+
+    #[test]
     fn empty_extra_key_is_a_user_error() {
         for bad in ["=x", ""] {
             let a = LogArgs {
@@ -588,6 +671,8 @@ mod tests {
                 .unwrap_or_default(),
         };
         let resp = BlameResponse {
+            answered_at: None,
+            behind: None,
             path: RepoPath::new("f").unwrap(),
             lines: vec![line(human, "a"), line(bot, "b")],
             changesets: BTreeMap::from([

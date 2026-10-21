@@ -519,11 +519,12 @@ async fn a_land_sent_twice_through_two_servers_lands_once() {
             .unwrap();
         let id = LandId::from_bytes(&[7; 16]).unwrap();
         let calls = w.plan.calls(Op::CasRef);
-        // Hold one path's commit until the other has landed.
+        // Hold one path's commit until the other has landed, within the
+        // batch's lifetime (a batch past it answers retryably).
         w.plan.script(
             Op::CasRef,
             calls + delayed,
-            Fault::Delay(Duration::from_secs(120)),
+            Fault::Delay(Duration::from_secs(45)),
         );
 
         let (leader, follower) = (w.server(), w.server());
@@ -636,7 +637,7 @@ async fn land_reports_a_commit_that_keeps_failing() {
 /// A meta store that remembers every derived row written through it and can
 /// flip one bit of one row on read. Sits below the fault injector so it sees
 /// what really reached storage.
-struct Tamper {
+pub(crate) struct Tamper {
     inner: Arc<dyn MetaStore>,
     written: std::sync::Mutex<BTreeMap<(String, leep_core::Hash), Bytes>>,
     /// A key written twice with different values, which derived data forbids.
@@ -730,6 +731,43 @@ impl MetaStore for Tamper {
             }
         }
         self.inner.put_derived(kind, key, value).await
+    }
+    async fn delete_derived_kind(&self, kind: &str) -> Result<u64> {
+        self.written.lock().unwrap().retain(|(k, _), _| k != kind);
+        self.inner.delete_derived_kind(kind).await
+    }
+    fn supports_leases(&self) -> bool {
+        self.inner.supports_leases()
+    }
+    async fn lease(
+        &self,
+        key: &leep_core::LeaseKey,
+        timing: leep_core::LeaseTiming,
+    ) -> Result<Option<leep_core::Lease>> {
+        self.inner.lease(key, timing).await
+    }
+    async fn acquire_lease(
+        &self,
+        claim: &leep_core::LeaseClaim<'_>,
+        timing: leep_core::LeaseTiming,
+    ) -> Result<leep_core::Lease> {
+        self.inner.acquire_lease(claim, timing).await
+    }
+    async fn renew_leases(
+        &self,
+        holder: &str,
+        held: &[(leep_core::LeaseKey, u64)],
+        timing: leep_core::LeaseTiming,
+    ) -> Result<Vec<Option<Duration>>> {
+        self.inner.renew_leases(holder, held, timing).await
+    }
+    async fn release_lease(
+        &self,
+        key: &leep_core::LeaseKey,
+        holder: &str,
+        epoch: u64,
+    ) -> Result<bool> {
+        self.inner.release_lease(key, holder, epoch).await
     }
 }
 
@@ -1716,5 +1754,903 @@ async fn incremental_mark_under_faults(seed: u64) {
 async fn incremental_mark_survives_being_killed_anywhere() {
     for seed in seeds() {
         incremental_mark_under_faults(seed).await;
+    }
+}
+
+/// A store whose lease clock follows tokio's, so a paused test moves both.
+fn clocked_meta() -> MemoryMetaStore {
+    let base = tokio::time::Instant::now();
+    MemoryMetaStore::new().with_lease_clock(Arc::new(move || {
+        1_000_000 + base.elapsed().as_millis() as i64
+    }))
+}
+
+/// A copy of `src`'s changesets with no derived rows, on a lease clock that
+/// follows tokio's.
+async fn clocked_copy(src: &Repo) -> Arc<MemoryMetaStore> {
+    let meta = Arc::new(clocked_meta());
+    for id in src.meta().list_changesets(None, usize::MAX).await.unwrap() {
+        meta.put_changeset(&src.get_changeset(id).await.unwrap())
+            .await
+            .unwrap();
+    }
+    meta
+}
+
+/// One index server of [`index_holders_under_faults`]: a candidate for the
+/// path-history and log-filter leases, warming in `lease` mode.
+struct IndexServer {
+    leases: Arc<crate::indexing::IndexLeases>,
+    warmer: crate::warm::Warmer,
+    plan: Arc<FaultPlan>,
+}
+
+impl IndexServer {
+    fn new(blobs: &Arc<MemoryBlobStore>, meta: &Arc<Tamper>, seed: u64, n: u64) -> IndexServer {
+        use crate::indexing::{IndexGroup, IndexLeaseConfig, IndexLeases};
+        let plan = FaultPlan::new(seed * 1000 + n);
+        plan.rate(Op::META, 2, Fault::Fail)
+            .rate(&[Op::PutDerived], 4, Fault::FailAfter)
+            .rate(&[Op::Lease], 60, Fault::Fail)
+            .rate(&[Op::Lease], 20, Fault::FailAfter);
+        let faulty: Arc<dyn MetaStore> = Arc::new(FaultyMetaStore::new(meta.clone(), plan.clone()));
+        let repo = Repo::new(
+            Arc::new(FaultyBlobStore::new(blobs.clone(), plan.clone())),
+            faulty.clone(),
+        )
+        .with_derive_jobs(3);
+        let cfg = IndexLeaseConfig::new(format!("server-{n}"), "")
+            .with_candidates(vec![IndexGroup::History, IndexGroup::LogFilter]);
+        let leases = IndexLeases::new(faulty, cfg);
+        let warmer = crate::warm::Warmer::new(repo, false)
+            .with_leases(leases.clone())
+            .with_full_listing_every(Duration::ZERO);
+        IndexServer {
+            leases,
+            warmer,
+            plan,
+        }
+    }
+}
+
+/// ADR 0058's lease fault sweep. Index servers in `lease` mode take turns
+/// at random: renewing (or taking) leases, warming, warming while another
+/// warms, being killed at a random point of a wavefront (their lease left
+/// to go stale), and being paused past the stale time (the store's clock
+/// jumps), all under store faults, lease calls included. After every step
+/// each stored row is the fault-free row and has its parents' rows, and in
+/// the end the rows are the fault-free run's.
+async fn index_holders_under_faults(
+    seed: u64,
+    truth: &Repo,
+    truth_rows: &RowsByKey,
+    parents: &HashMap<leep_core::Hash, Vec<ChangesetId>>,
+    heads: &[ChangesetId],
+) {
+    use crate::derived::{
+        DerivedKind, HistoryTree, LogFilterIndex, HISTORY_NODE_KIND, LOG_FILTER_NAME_KIND,
+    };
+    let bare = clocked_copy(truth).await;
+    for (i, h) in heads.iter().enumerate() {
+        bare.cas_ref(&format!("lane{i}"), None, Some(*h))
+            .await
+            .unwrap();
+    }
+    let spy = Tamper::new(bare);
+    let blobs = Arc::new(MemoryBlobStore::new());
+    for id in truth
+        .meta()
+        .list_changesets(None, usize::MAX)
+        .await
+        .unwrap()
+    {
+        for (_, change) in truth.get_changeset(id).await.unwrap().changes {
+            if let FileChange::Modify { content, .. } = change {
+                let data = truth.blobs().get(&content).await.unwrap().unwrap();
+                blobs.put(data).await.unwrap();
+            }
+        }
+    }
+    let mut rng = Rng::new(seed);
+    let mut servers = vec![
+        IndexServer::new(&blobs, &spy, seed, 0),
+        IndexServer::new(&blobs, &spy, seed, 1),
+    ];
+    let mut next = 2;
+    let chained = [HistoryTree::NAME, LogFilterIndex::NAME];
+    let compared = [
+        HistoryTree::NAME,
+        HISTORY_NODE_KIND,
+        LogFilterIndex::NAME,
+        LOG_FILTER_NAME_KIND,
+    ];
+    let check = |step: usize| {
+        let rows = spy.rows();
+        for ((kind, key), row) in &rows {
+            assert_eq!(
+                truth_rows.get(&(kind.clone(), *key)),
+                Some(row),
+                "seed {seed}, step {step}: wrong row {kind} {key}"
+            );
+            if chained.contains(&kind.as_str()) {
+                for p in &parents[key] {
+                    assert!(
+                        rows.contains_key(&(kind.clone(), p.0)),
+                        "seed {seed}, step {step}: the {kind} row of {key} without its parent {p}'s"
+                    );
+                }
+            }
+        }
+        assert!(spy.conflicts.lock().unwrap().is_empty(), "seed {seed}");
+        compared.iter().all(|kind| {
+            let of = |m: &RowsByKey| {
+                m.iter()
+                    .filter(|((k, _), _)| k == kind)
+                    .map(|((_, h), v)| (*h, v.clone()))
+                    .collect::<Vec<_>>()
+            };
+            of(&rows) == of(truth_rows)
+        })
+    };
+    let mut kills = 0;
+    for step in 0..600 {
+        let i = rng.below(servers.len());
+        match rng.below(10) {
+            0..=2 => servers[i].leases.tick().await,
+            3..=5 => {
+                let _ = servers[i].warmer.pass().await;
+            }
+            6 => {
+                // Both warm at once: whoever holds a group derives it.
+                let (a, b) = servers.split_at_mut(1);
+                let _ = futures_util::join!(a[0].warmer.pass(), b[0].warmer.pass());
+            }
+            7 => {
+                // Killed at a random point of a pass: the pass is dropped
+                // once the store has seen a random number more reads, and
+                // the lease is left to go stale.
+                let target = servers[i].plan.calls(Op::GetDerived) + 1 + rng.below(400) as u64;
+                let plan = servers[i].plan.clone();
+                let killer = async move {
+                    while plan.calls(Op::GetDerived) < target {
+                        tokio::task::yield_now().await;
+                    }
+                };
+                tokio::select! {
+                    _ = servers[i].warmer.pass() => {}
+                    () = killer => {}
+                }
+                servers[i].leases.halt();
+                servers[i] = IndexServer::new(&blobs, &spy, seed, next);
+                next += 1;
+                kills += 1;
+            }
+            8 => {
+                // Paused past the stale time: another may take over while
+                // this one still trusts its view for a moment.
+                tokio::time::advance(Duration::from_secs(7)).await;
+            }
+            _ => tokio::time::advance(Duration::from_millis(1500)).await,
+        }
+        if check(step) && step > 40 {
+            break;
+        }
+    }
+    // Then a calm finish: faults off, and the leases settle.
+    for s in &servers {
+        s.plan.clear();
+    }
+    for round in 0..20 {
+        tokio::time::advance(Duration::from_secs(7)).await;
+        for s in &mut servers {
+            s.leases.tick().await;
+            let _ = s.warmer.pass().await;
+        }
+        if check(10_000 + round) {
+            let epoch = spy
+                .lease(
+                    &leep_core::LeaseKey::index(HistoryTree::NAME),
+                    leep_core::LeaseTiming {
+                        ttl: Duration::from_secs(15),
+                        stale_after: Duration::from_secs(6),
+                    },
+                )
+                .await
+                .unwrap()
+                .map_or(0, |l| l.epoch);
+            eprintln!("seed {seed}: {kills} kills, history lease epoch {epoch}");
+            return;
+        }
+    }
+    panic!("seed {seed}: the indexes never completed");
+}
+
+type RowsByKey = BTreeMap<(String, leep_core::Hash), Bytes>;
+
+#[tokio::test(start_paused = true)]
+async fn index_holders_killed_paused_and_racing_store_the_fault_free_rows() {
+    use crate::derived::{derive, HistoryTree, LogFilterIndex};
+    let blobs = Arc::new(MemoryBlobStore::new());
+    let truth_meta = Tamper::new(Arc::new(MemoryMetaStore::new()));
+    let truth = Repo::new(blobs.clone(), truth_meta.clone()).with_derive_jobs(1);
+    let ids = lanes_history(&truth, 160).await;
+    let tip = *ids.last().unwrap();
+    // Heads: the octopus and a few older lane tips, so passes have several.
+    let heads = vec![tip, ids[40], ids[97], ids[133]];
+    for h in &heads {
+        derive::<HistoryTree>(&truth, *h).await.unwrap();
+        derive::<LogFilterIndex>(&truth, *h).await.unwrap();
+    }
+    let truth_rows = truth_meta.rows();
+    let mut parents: HashMap<leep_core::Hash, Vec<ChangesetId>> = HashMap::new();
+    for id in &ids {
+        parents.insert(id.0, truth.get_changeset(*id).await.unwrap().parents);
+    }
+    for seed in seeds().step_by(5) {
+        index_holders_under_faults(seed, &truth, &truth_rows, &parents, &heads).await;
+    }
+}
+
+/// ADR 0058 section 6: a tool that drops an index takes its lease and waits
+/// the fence before deleting, so a write a paused former holder still had
+/// in flight lands before the drop, not after it. Without the fence the
+/// late write leaves rows whose parents' rows the drop removed.
+#[tokio::test(start_paused = true)]
+async fn a_fence_holds_a_drop_back_until_a_paused_holder_write_lands() {
+    use crate::derived::{derive, DerivedKind, HistoryTree, HISTORY_NODE_KIND};
+    use crate::indexing::{IndexGroup, IndexLeaseConfig, IndexLeases, ToolLease};
+    for fence in [Duration::from_secs(5), Duration::ZERO] {
+        let blobs = Arc::new(MemoryBlobStore::new());
+        let meta = Arc::new(clocked_meta());
+        let clean = Repo::new(blobs.clone(), meta.clone());
+        let ids = lanes_history(&clean, 200).await;
+        let tip = *ids.last().unwrap();
+        // The lower part is indexed already; the holder derives the rest.
+        derive::<HistoryTree>(&clean, ids[100]).await.unwrap();
+        meta.cas_ref("main", None, Some(tip)).await.unwrap();
+        // The holder's writes reach the store 8 s late.
+        let plan = FaultPlan::new(1);
+        plan.script(Op::PutDerived, 1, Fault::Delay(Duration::from_secs(8)));
+        let faulty: Arc<dyn MetaStore> = Arc::new(FaultyMetaStore::new(meta.clone(), plan.clone()));
+        let holder = Repo::new(blobs.clone(), faulty.clone());
+        let leases = IndexLeases::new(
+            faulty,
+            IndexLeaseConfig::new("holder", "").with_candidates(vec![IndexGroup::History]),
+        );
+        leases.tick().await;
+        assert!(leases.holds(IndexGroup::History));
+        let mut warmer = crate::warm::Warmer::new(holder, false).with_leases(leases.clone());
+        let warming = tokio::spawn(async move {
+            let _ = warmer.pass().await;
+        });
+        // The holder reaches its delayed write, then pauses (no renewals);
+        // once its lease is stale the tool takes it, waits the fence, and
+        // drops the kind.
+        while plan.calls(Op::PutDerived) == 0 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(Duration::from_secs(7)).await;
+        let say = |_: &str| {};
+        let tool = ToolLease::take(
+            meta.clone(),
+            "repair-drop",
+            &[IndexGroup::History],
+            false,
+            fence,
+            &say,
+        )
+        .await
+        .unwrap();
+        for k in [HistoryTree::NAME, HISTORY_NODE_KIND] {
+            meta.delete_derived_kind(k).await.unwrap();
+        }
+        warming.await.unwrap();
+        let left = meta
+            .list_derived(HistoryTree::NAME, None, usize::MAX)
+            .await
+            .unwrap();
+        let mut orphans = 0;
+        for (key, _) in &left {
+            for p in clean
+                .get_changeset(ChangesetId(*key))
+                .await
+                .unwrap()
+                .parents
+            {
+                if meta
+                    .get_derived(HistoryTree::NAME, &p.0)
+                    .await
+                    .unwrap()
+                    .is_none()
+                {
+                    orphans += 1;
+                }
+            }
+        }
+        tool.release().await;
+        if fence.is_zero() {
+            assert!(
+                orphans > 0,
+                "without a fence the late write leaves orphaned rows"
+            );
+        } else {
+            assert_eq!(left.len(), 0, "the late write landed before the drop");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Changeset garbage collection, the writers' side (ADR 0059, phase 1)
+
+/// Faults on every call for the servers of the changeset GC tests: failures
+/// before and after writes apply, and failed and slow reads.
+fn rescue_faults(plan: &FaultPlan) {
+    plan.jitter(2)
+        .rate(Op::WRITES, 60, Fault::FailAfter)
+        .rate(Op::WRITES, 60, Fault::Fail)
+        .rate(Op::META, 40, Fault::Fail)
+        .rate(Op::BLOB, 20, Fault::Fail)
+        .rate(Op::META, 20, Fault::Delay(Duration::from_millis(5)));
+}
+
+/// `ids` are all rescued (not condemned any more) and readable.
+async fn assert_rescued(seed: u64, w: &World, ids: &[ChangesetId]) {
+    for id in ids {
+        assert!(
+            !crate::changeset_gc::is_condemned_for_test(&w.clean, *id).await,
+            "seed {seed}: {id} is still condemned"
+        );
+        w.clean.get_changeset(*id).await.unwrap();
+    }
+}
+
+/// A chain `base <- a <- b` with `main` at `base`, and `a` and `b`
+/// condemned, as a sweep finds an abandoned stack.
+async fn condemned_stack(seed: u64, w: &World) -> (ChangesetId, ChangesetId, ChangesetId) {
+    let base = commit_file(seed, &w.clean, None, "base.txt", "base\n", "base").await;
+    w.meta.cas_ref("main", None, Some(base)).await.unwrap();
+    let a = commit_file(seed, &w.clean, Some(base), "s/a.txt", "a\n", "a").await;
+    let b = commit_file(seed, &w.clean, Some(a), "s/b.txt", "b\n", "b").await;
+    crate::changeset_gc::condemn_for_test(&w.clean, &[a, b], 1_000).await;
+    (base, a, b)
+}
+
+/// A changeset created on a condemned parent rescues the parent and its
+/// condemned ancestors before it reads them, and only those; with a delete
+/// of the parent announced, the create waits and then answers 409, and goes
+/// through once collect abandons the delete.
+#[tokio::test(start_paused = true)]
+async fn create_on_condemned_parent_rescues_its_ancestry() {
+    use crate::gc::Doom;
+    for seed in seeds() {
+        let w = World::new(seed);
+        let (base, a, b) = condemned_stack(seed, &w).await;
+        let unrelated = commit_file(seed, &w.clean, Some(base), "u.txt", "u\n", "u").await;
+        crate::changeset_gc::condemn_for_test(&w.clean, &[unrelated], 1_000).await;
+        rescue_faults(&w.plan);
+        let server = w.server();
+        let child = commit_file(seed, &server, Some(b), "s/c.txt", "c\n", "c").await;
+        w.plan.pause();
+        assert_rescued(seed, &w, &[a, b, child]).await;
+        assert!(
+            crate::changeset_gc::is_condemned_for_test(&w.clean, unrelated).await,
+            "seed {seed}: a changeset off the child's ancestry was rescued"
+        );
+        for id in [a, b] {
+            let row = w
+                .meta
+                .get_derived(crate::changeset_gc::CS_RESCUE, &id.0)
+                .await
+                .unwrap();
+            assert_eq!(
+                row.as_deref(),
+                Some(&1_000i64.to_be_bytes()[..]),
+                "seed {seed}: the rescue names the condemnation it answers"
+            );
+        }
+    }
+
+    let w = World::new(1);
+    let (_, _, b) = condemned_stack(1, &w).await;
+    crate::changeset_gc::doom_for_test(&w.clean, b, Doom::Deleting).await;
+    let server = w.server();
+    let data = Bytes::from_static(b"c\n");
+    let content = server.put_blob(data.clone()).await.unwrap();
+    let cs = Changeset {
+        parents: vec![b],
+        author: "agent".into(),
+        timestamp: 7,
+        message: "c".into(),
+        changes: BTreeMap::from([(
+            rp("s/c.txt"),
+            FileChange::Modify {
+                content,
+                kind: FileKind::Regular,
+                size: 2,
+            },
+        )]),
+        extra: BTreeMap::new(),
+    };
+    let started = tokio::time::Instant::now();
+    let err = server.create_changeset(cs.clone()).await.unwrap_err();
+    assert!(matches!(err, Error::Conflict(_)), "{err}");
+    assert!(started.elapsed() >= Duration::from_secs(30), "waited first");
+    crate::changeset_gc::doom_for_test(&w.clean, b, Doom::Abandoned).await;
+    let id = server.create_changeset(cs).await.unwrap();
+    assert_rescued(1, &w, &[b, id]).await;
+}
+
+/// Landing a condemned changeset, rebased or fast-forwarded, rescues it
+/// and its whole unlanded stack before the ref moves.
+#[tokio::test(start_paused = true)]
+async fn land_of_condemned_original_is_rescued() {
+    for seed in seeds() {
+        for rebased in [false, true] {
+            let w = World::new(seed);
+            let (base, a, b) = condemned_stack(seed, &w).await;
+            if rebased {
+                let other = commit_file(seed, &w.clean, Some(base), "o.txt", "o\n", "o").await;
+                w.meta
+                    .cas_ref("main", Some(base), Some(other))
+                    .await
+                    .unwrap();
+            }
+            rescue_faults(&w.plan);
+            let server = w.server();
+            let id = LandId::from_bytes(&[seed as u8; 16]).unwrap();
+            let landed = retry(seed, "land", || {
+                server.land_keyed(b, "main", None, true, Some(id.clone()))
+            })
+            .await;
+            w.plan.pause();
+            let LandResponse::Landed {
+                landed, rebased: r, ..
+            } = landed
+            else {
+                panic!("seed {seed}: {landed:?}");
+            };
+            assert_eq!(r, rebased, "seed {seed}");
+            assert_eq!(w.meta.get_ref("main").await.unwrap(), Some(landed));
+            assert_rescued(seed, &w, &[a, b]).await;
+            let ids = assert_ref_sound(seed, &w.clean, "main").await;
+            assert_eq!(ids.len(), if rebased { 4 } else { 3 }, "seed {seed}");
+            assert_ref_log_replays(seed, &*w.meta).await;
+        }
+    }
+}
+
+/// A keyed land retried after its original was reclaimed (ADR 0059 section
+/// 5) is answered from its record and moves nothing; an id that never
+/// landed, or a retry without an id, finds nothing to land (404), and an id
+/// recorded for another changeset is refused (400).
+#[tokio::test(start_paused = true)]
+async fn keyed_retry_of_reclaimed_original_is_answered_from_its_record() {
+    for seed in seeds() {
+        let w = World::new(seed);
+        let clean = &w.clean;
+        let base = commit_file(seed, clean, None, "base.txt", "base\n", "base").await;
+        w.meta.cas_ref("main", None, Some(base)).await.unwrap();
+        let feature = commit_file(seed, clean, Some(base), "f.txt", "f\n", "feature").await;
+        let other = commit_file(seed, clean, Some(base), "o.txt", "o\n", "other").await;
+        w.meta
+            .cas_ref("main", Some(base), Some(other))
+            .await
+            .unwrap();
+        let id = LandId::from_bytes(&[seed as u8; 16]).unwrap();
+        let first = clean
+            .land_keyed(feature, "main", None, true, Some(id.clone()))
+            .await
+            .unwrap();
+        let LandResponse::Landed { landed: copy, .. } = first else {
+            panic!("{first:?}");
+        };
+        assert_ne!(copy, feature, "rebased");
+        land_others(&w, 3).await;
+        // A sweep reclaims the original once the copy is past its scan
+        // window; here it is simply gone.
+        assert!(w.meta.remove_changeset(&feature));
+        let head = w.meta.get_ref("main").await.unwrap();
+        let entries = w.meta.ref_log(None, None, usize::MAX).await.unwrap().len();
+
+        rescue_faults(&w.plan);
+        let server = w.server();
+        let again = retry(seed, "retry", || {
+            server.land_keyed(feature, "main", None, true, Some(id.clone()))
+        })
+        .await;
+        assert_eq!(
+            again,
+            LandResponse::Landed {
+                landed: copy,
+                rebased: true,
+                attempts: 1
+            },
+            "seed {seed}"
+        );
+        let refused = |what: &str, r: Result<LandResponse>, want: fn(&Error) -> bool| match r {
+            Err(e) if want(&e) => {}
+            other => panic!("seed {seed}: {what}: {other:?}"),
+        };
+        // 20 bytes: no seed's 16-byte id.
+        let unknown = LandId::from_bytes(&[0xEE; 20]).unwrap();
+        let not_found = |e: &Error| matches!(e, Error::NotFound(_));
+        let invalid = |e: &Error| matches!(e, Error::Invalid(_));
+        loop {
+            match server
+                .land_keyed(feature, "main", None, true, Some(unknown.clone()))
+                .await
+            {
+                Err(e) if is_injected(&e) => continue,
+                r => {
+                    refused("an id never recorded", r, not_found);
+                    break;
+                }
+            }
+        }
+        loop {
+            match server.land(feature, "main").await {
+                Err(e) if is_injected(&e) => continue,
+                r => {
+                    refused("no id", r, not_found);
+                    break;
+                }
+            }
+        }
+        // The same id, asked for a changeset that is gone too.
+        let gone = commit_file(seed, clean, Some(base), "g.txt", "g\n", "gone").await;
+        assert!(w.meta.remove_changeset(&gone));
+        loop {
+            match server
+                .land_keyed(gone, "main", None, true, Some(id.clone()))
+                .await
+            {
+                Err(e) if is_injected(&e) => continue,
+                r => {
+                    refused("the id of another land", r, invalid);
+                    break;
+                }
+            }
+        }
+        w.plan.pause();
+        assert_eq!(w.meta.get_ref("main").await.unwrap(), head, "seed {seed}");
+        assert_eq!(
+            w.meta.ref_log(None, None, usize::MAX).await.unwrap().len(),
+            entries,
+            "seed {seed}: nothing moved"
+        );
+    }
+}
+
+/// Every way of moving a ref to a condemned changeset rescues it first:
+/// creating a ref at it, and moving one back to it as `leep undo` does.
+#[tokio::test(start_paused = true)]
+async fn ref_move_to_condemned_changeset_rescues() {
+    for seed in seeds() {
+        let w = World::new(seed);
+        let (base, a, b) = condemned_stack(seed, &w).await;
+        rescue_faults(&w.plan);
+        let server = w.server();
+        let ctx = leep_core::RefUpdateContext::new("cas");
+        let moved = retry(seed, "create ref", || {
+            server.cas_ref_checked("feature", None, Some(b), &ctx)
+        })
+        .await;
+        // A retry after an applied-then-failed swap loses to its own move.
+        assert!(moved || w.meta.get_ref("feature").await.unwrap() == Some(b));
+        w.plan.pause();
+        assert_rescued(seed, &w, &[a, b]).await;
+
+        // Undo: `main` moved off `base`, which a sweep then condemned (it
+        // stays a log root in the real sweep; the rescue is what matters).
+        w.plan.clear();
+        let next = commit_file(seed, &w.clean, Some(base), "n.txt", "n\n", "n").await;
+        w.meta
+            .cas_ref("main", Some(base), Some(next))
+            .await
+            .unwrap();
+        crate::changeset_gc::condemn_for_test(&w.clean, &[base], 2_000).await;
+        rescue_faults(&w.plan);
+        w.plan.resume();
+        let server = w.server();
+        let undo = leep_core::RefUpdateContext::new("undo");
+        let (meta, srv, undo) = (&w.meta, &server, &undo);
+        retry(seed, "undo", move || async move {
+            match meta.get_ref("main").await? {
+                Some(h) if h == base => Ok(true),
+                cur => srv.cas_ref_checked("main", cur, Some(base), undo).await,
+            }
+        })
+        .await;
+        w.plan.pause();
+        assert_rescued(seed, &w, &[base]).await;
+        assert_ref_log_replays(seed, &*w.meta).await;
+    }
+}
+
+/// The other writers that name an existing changeset rescue it, and its
+/// condemned ancestors, before they store anything: a merge of it, a rebase
+/// of it, and a signature or review of it.
+#[tokio::test(start_paused = true)]
+async fn other_writers_naming_a_condemned_changeset_rescue_it() {
+    use leep_core::api::{Authorship, MergeRequest, MergeResponse, RebaseResponse};
+    use leep_core::review::{Review, Verdict};
+    use leep_core::signature::{key_id, Signature};
+
+    #[derive(Clone, Copy, Debug)]
+    enum Hook {
+        Merge,
+        Rebase,
+        Sign,
+        Review,
+    }
+    for seed in seeds() {
+        for hook in [Hook::Merge, Hook::Rebase, Hook::Sign, Hook::Review] {
+            let w = World::new(seed);
+            let (base, a, b) = condemned_stack(seed, &w).await;
+            let other = commit_file(seed, &w.clean, Some(base), "o.txt", "o\n", "o").await;
+            rescue_faults(&w.plan);
+            let server = w.server();
+            let what = format!("{hook:?}");
+            match hook {
+                Hook::Merge => {
+                    let r = retry(seed, &what, || {
+                        server.merge(MergeRequest {
+                            parents: [b, other],
+                            message: "merge".into(),
+                            authorship: Authorship {
+                                author: "m".into(),
+                                timestamp: Some(5),
+                            },
+                            extra: BTreeMap::new(),
+                        })
+                    })
+                    .await;
+                    assert!(
+                        matches!(r, MergeResponse::Merged { .. }),
+                        "seed {seed}: {r:?}"
+                    );
+                }
+                Hook::Rebase => {
+                    let r = retry(seed, &what, || server.rebase(b, other)).await;
+                    assert!(
+                        matches!(r, RebaseResponse::Rebased { .. }),
+                        "seed {seed}: {r:?}"
+                    );
+                }
+                Hook::Sign => {
+                    let key = [9; 32];
+                    let sig = Signature {
+                        key_id: key_id(&key),
+                        public_key: key,
+                        sig: [1; 64],
+                    };
+                    retry(seed, &what, || server.put_signature(b, &sig)).await;
+                }
+                Hook::Review => {
+                    let review = Review {
+                        reviewer: "alice".into(),
+                        verdict: Verdict::Approve,
+                        comment: String::new(),
+                        timestamp: 1,
+                    };
+                    retry(seed, &what, || server.put_review(b, &review)).await;
+                }
+            }
+            w.plan.pause();
+            assert_rescued(seed, &w, &[a, b]).await;
+        }
+    }
+}
+
+/// The client's request is cancelled after its batch's first attempt, a
+/// sweep condemns the land's stack, and the batch commits on a later
+/// attempt: the attempt's own fence read, not the request's, rescues it.
+#[tokio::test(start_paused = true)]
+async fn cancelled_land_whose_batch_commits_later_is_fenced() {
+    let w = World::new(5);
+    let clean = &w.clean;
+    let base = commit_file(5, clean, None, "base.txt", "base\n", "base").await;
+    w.meta.cas_ref("main", None, Some(base)).await.unwrap();
+    let a = commit_file(5, clean, Some(base), "s/a.txt", "a\n", "a").await;
+    let b = commit_file(5, clean, Some(a), "s/b.txt", "b\n", "b").await;
+    let server = w.server();
+    // The request reads the flag (down) and caches it, as a request does.
+    assert!(!server.changeset_fence_active(false).await.unwrap());
+    // The first attempt's swap is held, and loses to another writer.
+    let calls = w.plan.calls(Op::CasRef);
+    w.plan
+        .script(Op::CasRef, calls + 1, Fault::Delay(Duration::from_secs(5)));
+    let land = {
+        let server = server.clone();
+        tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(1), server.land(b, "main")).await
+        })
+    };
+    while w.plan.calls(Op::CasRef) == calls {
+        tokio::task::yield_now().await;
+    }
+    assert!(land.await.unwrap().is_err(), "the client gave up");
+    let other = commit_file(5, clean, Some(base), "o.txt", "o\n", "other").await;
+    w.meta
+        .cas_ref("main", Some(base), Some(other))
+        .await
+        .unwrap();
+    crate::changeset_gc::condemn_for_test(clean, &[a, b], 3_000).await;
+    // The batch goes on: its next attempt rescues, then lands.
+    let landed = loop {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let head = w.meta.get_ref("main").await.unwrap().unwrap();
+        if head != other {
+            break head;
+        }
+    };
+    assert_eq!(
+        clean.rebased_origin(landed).await.unwrap(),
+        Some(b),
+        "the batch landed the cancelled land"
+    );
+    assert_rescued(5, &w, &[a, b]).await;
+    assert_eq!(assert_ref_sound(5, clean, "main").await.len(), 4);
+    assert_ref_log_replays(5, &*w.meta).await;
+}
+
+/// A batch still trying past `MAX_BATCH_LIFETIME` answers its lands with a
+/// retryable conflict and moves nothing; the keyed resend lands once.
+#[tokio::test(start_paused = true)]
+async fn batch_past_its_deadline_answers_retryably() {
+    let w = World::new(6);
+    let clean = &w.clean;
+    let base = commit_file(6, clean, None, "base.txt", "base\n", "base").await;
+    w.meta.cas_ref("main", None, Some(base)).await.unwrap();
+    let feature = commit_file(6, clean, Some(base), "f.txt", "f\n", "feature").await;
+    let server = w.server();
+    let id = LandId::from_bytes(&[6; 16]).unwrap();
+    // The first attempt's swap is held past the lifetime and loses.
+    let calls = w.plan.calls(Op::CasRef);
+    w.plan.script(
+        Op::CasRef,
+        calls + 1,
+        Fault::Delay(crate::land::MAX_BATCH_LIFETIME + Duration::from_secs(1)),
+    );
+    let land = {
+        let (server, id) = (server.clone(), id.clone());
+        tokio::spawn(async move {
+            server
+                .land_keyed(feature, "main", None, true, Some(id))
+                .await
+        })
+    };
+    while w.plan.calls(Op::CasRef) == calls {
+        tokio::task::yield_now().await;
+    }
+    let other = commit_file(6, clean, Some(base), "o.txt", "o\n", "other").await;
+    w.meta
+        .cas_ref("main", Some(base), Some(other))
+        .await
+        .unwrap();
+    let err = land.await.unwrap().unwrap_err();
+    assert!(matches!(err, Error::Conflict(_)), "{err}");
+    assert!(err.to_string().contains("retry"), "{err}");
+    assert_eq!(w.meta.get_ref("main").await.unwrap(), Some(other));
+    // The resend, under the same id, lands once.
+    let again = server
+        .land_keyed(feature, "main", None, true, Some(id.clone()))
+        .await
+        .unwrap();
+    let LandResponse::Landed { landed, .. } = again else {
+        panic!("{again:?}");
+    };
+    let resent = server
+        .land_keyed(feature, "main", None, true, Some(id))
+        .await
+        .unwrap();
+    assert!(matches!(resent, LandResponse::Landed { landed: l, .. } if l == landed));
+    assert_eq!(assert_ref_sound(6, clean, "main").await.len(), 3);
+    assert_ref_log_replays(6, &*w.meta).await;
+}
+
+/// A store whose history keeps changing (commits, keyed and unkeyed lands,
+/// branches made and deleted, changesets ageing past grace and young again),
+/// marked by runs that fail and are killed at random points: the rows only
+/// ever claim closures that are stored, and every completed run, and a full
+/// one, finds exactly what reachability from scratch finds.
+async fn reach_under_faults(seed: u64) {
+    use crate::changeset_reach::{check_reach_rows, mark, unreachable_oracle, ReachOptions};
+    let w = World::new(seed);
+    let clean = &w.clean;
+    let base = commit_file(seed, clean, None, "base.txt", "base\n", "base").await;
+    w.meta.cas_ref("main", None, Some(base)).await.unwrap();
+    let opts = ReachOptions {
+        now: leep_core::store::unix_now() + 30 * 86_400,
+        grace: Duration::from_secs(7 * 86_400),
+        full: false,
+    };
+    let plan = FaultPlan::new(seed ^ 59);
+    plan.jitter(2)
+        .rate(&[Op::PutDerived], 40, Fault::FailAfter)
+        .rate(&[Op::PutDerived], 40, Fault::Fail)
+        .rate(Op::META, 15, Fault::Fail)
+        .rate(&[Op::GetDerived], 5, Fault::Corrupt);
+    let gc = w.server_with(&plan);
+    let mut rng = Rng::new(seed ^ 0x59);
+    let mut tips = vec![base];
+    let mut n = 0;
+    for round in 0..12 {
+        for _ in 0..1 + rng.below(4) {
+            n += 1;
+            let tip = tips[rng.below(tips.len())];
+            match rng.below(7) {
+                0..=2 => {
+                    let path = format!("r{round}/f{n}.txt");
+                    let c =
+                        commit_file(seed, clean, Some(tip), &path, "x\n", &format!("c{n}")).await;
+                    tips.push(c);
+                }
+                3 | 4 => {
+                    let id = (n % 2 == 0).then(|| LandId::from_bytes(&[n as u8; 16]).unwrap());
+                    match clean.land_keyed(tip, "main", None, true, id).await.unwrap() {
+                        LandResponse::Landed { landed, .. } => tips.push(landed),
+                        other => panic!("seed {seed}: {other:?}"),
+                    }
+                }
+                5 => {
+                    let name = format!("b{}", rng.below(3));
+                    let cur = w.meta.get_ref(&name).await.unwrap();
+                    let new = (cur.is_none() || rng.below(2) == 0).then_some(tip);
+                    w.meta.cas_ref(&name, cur, new).await.unwrap();
+                }
+                _ => {
+                    let at = if rng.below(2) == 0 {
+                        opts.now as u64
+                    } else {
+                        0
+                    };
+                    w.meta.set_stored_at(&tip, at);
+                }
+            }
+        }
+        let kill_after = if rng.below(3) == 0 {
+            usize::MAX
+        } else {
+            rng.below(60)
+        };
+        // Dying mid-run is the point; the result is not.
+        let _ = leep_testkit::cancel_after_polls(mark(&gc, &opts), kill_after).await;
+        if let Err(e) = check_reach_rows(clean).await {
+            panic!("seed {seed} round {round}: {e}");
+        }
+        if rng.below(2) == 0 {
+            let run = mark(clean, &opts).await.unwrap();
+            assert_eq!(
+                run.unreachable,
+                unreachable_oracle(clean, &opts).await,
+                "seed {seed} round {round}"
+            );
+        }
+    }
+    let want = unreachable_oracle(clean, &opts).await;
+    assert!(
+        !want.is_empty() || tips.len() < 4,
+        "seed {seed}: the history left nothing unreachable to check against"
+    );
+    let run = mark(clean, &opts).await.unwrap();
+    assert_eq!(run.unreachable, want, "seed {seed}: incremental");
+    let full = mark(
+        clean,
+        &ReachOptions {
+            full: true,
+            ..opts.clone()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(full.unreachable, want, "seed {seed}: full");
+    check_reach_rows(clean).await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn incremental_reach_rows_agree_with_full_reachability() {
+    for seed in seeds() {
+        reach_under_faults(seed).await;
     }
 }

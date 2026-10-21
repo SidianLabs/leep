@@ -43,6 +43,9 @@ measured until the response head is ready, not until the body is streamed.
 | `leep_land_lock_wait_seconds` | histogram | none | Time a land waited in its ref's in-process queue before its batch started (the name dates from the per-ref lock that batching replaced). |
 | `leep_land_batch_size` | histogram | none | Lands taken by each batch (group commit, ADR 0032), cancelled ones excluded. 1 means no contention; under load it approaches the number of lands queued behind one batch, at most 64. |
 | `leep_land_cancelled_total` | counter | none | Lands whose caller went away (timeout, disconnect) while queued, dropped before their batch replayed them. |
+| `leep_land_batch_deadline_total` | counter | none | Lands answered 409 because their batch was still retrying 60 s after its first attempt (`MAX_BATCH_LIFETIME`, ADR 0059) and gave up instead of moving the ref. Clients resend; keyed lands are then answered from their record. Anything but rare means a store so slow, or a ref so contended, that lands do not finish. |
+| `leep_land_answered_from_record_total` | counter | `original` = `present`, `missing` | Keyed lands answered from their land id record instead of landing again (ADR 0057). `missing`: the changeset was no longer stored (garbage collected, ADR 0059) and the record answered without reading it. |
+| `leep_gc_changesets_rescued_total` | counter | `by` = `create`, `land`, `ref`, `attest`, `mirror` | Condemned changesets a writer rescued because it was about to store something naming them (ADR 0059): a child, a land, a ref move, a signature or review, a git mirror map. 0 until a changeset sweep condemns; a steady rate means agents build on changesets the sweep found unreachable. |
 | `leep_land_leases_held` | gauge | none | Refs whose land lease this server holds ([Several servers on one ref](#several-servers-on-one-ref), ADR 0056). |
 | `leep_land_lease_acquired_total` | counter | none | Land leases this server took. Under steady traffic about one per hot ref per server restart; more means leases change hands. |
 | `leep_land_lease_lost_total` | counter | `reason` = `taken`, `idle` | Leases this server stopped holding: another server took it after this one failed to renew it for the TTL (`taken`), or it released it after 30 s without a land (`idle`). |
@@ -57,6 +60,21 @@ measured until the response head is ready, not until the body is streamed.
 | `leep_warm_refs_total` | counter | `result` = `ok`, `error` | Ref heads the background warmer derived indexes for (ADR 0028). Errors are retried by the next full listing of refs, every 5 s. |
 | `leep_warm_duration_seconds` | histogram | none | Time to warm the heads that moved since the last pass, together (ADR 0058). Seconds to hours after an import or a restart onto a large history; milliseconds once warm. |
 | `leep_warm_delay_seconds` | histogram | none | Time from a ref move until the warmer stored that head's indexes, at **1-second resolution**: the ref log records whole seconds, so every sample is an integer and 0 means the same second. Recorded only for moves the ref-log tail found, not for refs a full listing turned up. How far the indexes trail the refs; 0 or 1 when the warmer keeps up, so read it as a count of slow warms rather than a latency below a second. |
+| `leep_index_lease_held` | gauge | `kind` | 1 while this server holds the index lease of the group named by its primary kind (`history-tree-v4`, `log-filter-v1`, `tree-trigrams-v1`), `--indexing lease` only (ADR 0058). |
+| `leep_index_lease_acquired_total` | counter | `kind` | Index leases this server took (a new epoch). |
+| `leep_index_lease_lost_total` | counter | `kind`; `reason` = `taken`, `store` | Index leases lost: another server took it after renewals stopped (`taken`), or renewals failed until the view ran out (`store`). |
+| `leep_index_derived_total` | counter | `kind` | Changesets (heads, for search) the lease holder's passes indexed. |
+| `leep_index_backlog_changesets` | gauge | `kind`, `lane` = `tip` | Changesets the holder's last pass found missing. |
+| `leep_index_lag_seconds` | gauge | `kind` | Age, by the ref log's whole seconds, of the oldest ref move a pass started on and had not indexed; 0 once a pass completes. |
+| `leep_query_unindexed_scanned_total` | counter | `route` = `log`, `log_filter`, `last_change`, `blame`, `search` | Changesets (files, for search) a bounded query examined without index rows. |
+| `leep_query_indexing_answers_total` | counter | `route`; `mode` = `retry`, `legacy` | Queries answered 503 because their index was over budget behind (`legacy`: requests without `Leep-Indexing`, after their wait and larger scan). Subtracted by `LeepServerErrors`. |
+| `leep_query_stale_answers_total` | counter | `route` | `stale-ok` queries answered at an older changeset. |
+| `leep_query_inline_derive_total` | counter | `route` | Queries in `lease` or `off` mode that found no live index lease and derived inline. Stays 0 while an indexer runs. |
+| `leep_query_index_wait_seconds` | histogram | none | Time requests without the header waited for the indexer. |
+| `leep_query_index_waiters` | gauge | none | Requests waiting for the indexer now (at most `--index-waiters`). |
+| `leep_query_index_wait_refused_total` | counter | none | Requests that found every waiter's place taken and did not wait. |
+| `leep_query_rows_vanished_total` | counter | `kind` | Bounded queries that met index rows deleted under them (a `repair drop` racing them) and answered 503. |
+| `leep_create_last_merge_skipped_total` | counter | none | Changesets stored without their `last_merge-v1` row because the parent's was missing; `upgrade-index` backfills them. |
 | `leep_search_total` | counter | `indexed` = `true`, `false` | Searches served; `false` means the query had no required trigram and scanned files directly. |
 | `leep_search_duration_seconds` | histogram | none | Whole search call, including any index rows it derived. |
 | `leep_blob_cache_hits_total` | counter | none | Blob reads served from the in-memory cache. |
@@ -109,7 +127,8 @@ groups:
       summary: "A leep-server's /metrics cannot be scraped: the process is down, or only its metrics listener is."
       runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepserverdown
   - alert: LeepServerErrors
-    expr: sum(rate(leep_http_requests_total{status=~"5.."}[5m])) / sum(rate(leep_http_requests_total[5m])) > 0.01
+    # Indexing answers (503 with Retry-After, ADR 0058) are not failures.
+    expr: (sum(rate(leep_http_requests_total{status=~"5.."}[5m])) - (sum(rate(leep_query_indexing_answers_total[5m])) or vector(0))) / sum(rate(leep_http_requests_total[5m])) > 0.01
     for: 5m
     labels: {severity: page}
     annotations:
@@ -135,6 +154,15 @@ groups:
     annotations:
       summary: "A land lost the ref compare-and-swap on all 32 attempts; other writers are racing it for the same ref."
       runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leeplandexhausted
+  - alert: LeepLandBatchDeadline
+    expr: |
+      sum(increase(leep_land_batch_deadline_total[10m])) > 0
+      or
+      sum(leep_land_batch_deadline_total unless leep_land_batch_deadline_total offset 10m) > 0
+    labels: {severity: ticket}
+    annotations:
+      summary: "A land batch was still retrying 60 s after it started and answered its lands 409: the metadata store is very slow, or the ref is badly contended."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leeplandbatchdeadline
   - alert: LeepLandCasLossesHigh
     expr: sum(rate(leep_land_cas_losses_total[15m])) / sum(rate(leep_land_total[15m])) > 1
     for: 15m
@@ -156,6 +184,34 @@ groups:
     annotations:
       summary: "Land leases change hands more than six times a minute: servers fail to renew them (slow or overloaded metadata store, restarts)."
       runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leeplandleaseflapping
+  - alert: LeepIndexLagging
+    expr: max by (kind) (leep_index_lag_seconds) > 120
+    for: 10m
+    labels: {severity: ticket}
+    annotations:
+      summary: "An index group trails ref moves by more than 2 minutes: its lease holder is slow, overloaded or backfilling (ADR 0058)."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepindexlagging
+  - alert: LeepIndexerMissing
+    # Only fleets with servers in --indexing lease or off mode export the
+    # lease gauge; no holder means queries fell back to inline derivation.
+    expr: |
+      (max by (kind) (leep_index_lease_held) == 0)
+      or
+      (sum(rate(leep_query_inline_derive_total[5m])) > 0)
+    for: 5m
+    labels: {severity: page}
+    annotations:
+      summary: "An index group has no lease holder: queries derive inline again and the index stops keeping up."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepindexermissing
+  - alert: LeepIndexingAnswersHigh
+    expr: |
+      sum(rate(leep_query_indexing_answers_total[10m]))
+        / sum(rate(leep_http_requests_total{route=~"/v1/(log|last-change|blame|search)/.*"}[10m])) > 0.05
+    for: 10m
+    labels: {severity: ticket}
+    annotations:
+      summary: "More than 5% of indexed reads answer 503 because their index is too far behind."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepindexinganswershigh
   - alert: LeepLandSlowP99
     expr: histogram_quantile(0.99, sum by (le) (rate(leep_land_duration_seconds_bucket[5m]))) > 5
     for: 10m
@@ -562,6 +618,18 @@ to the landed-copy scan, which only sees the last 1024 changesets.
 steady rate means clients are retrying lands that had already applied
 (timeouts, restarts), which is expected in small numbers.
 
+### Protected refs and the log
+
+The log records how a ref moved; it does not stop a move. A write token can
+reset or delete any ref no land policy covers, and the log is then the way to
+find and undo it. Refs that must never go backwards (`main`, release branches)
+belong in `--protect-ref` (`LEEP_PROTECT_REFS`) if no signature or review
+policy names them already ([DEPLOY.md](DEPLOY.md#protected-refs)): such a ref
+only moves forward and cannot be deleted through the API, and a refused move
+writes no entry. The startup line `land policy protects refs` lists every
+protected ref, whichever flag or file protects it. Moving a protected ref back
+by hand needs the metadata store itself; prefer `leep revert` and a land.
+
 ## Git mirror
 
 `leep-git mirror run` keeps a git remote (GitHub, GitLab, any server git
@@ -846,6 +914,20 @@ server whose `GET /v1/ready` lists `land-id` in `features`; against an
 older server it stops and says the land may have applied (check `leep
 reflog REF`). Other clients that resend across runs should do the same.
 
+**Migration 7 (`changesets.stored_at`, ADR 0059).** Adds one nullable
+column with no default: on Postgres and SQLite a catalog change that
+rewrites no row, so once it has its lock it is instant on any size, and it
+may run beside servers of the previous version. On Postgres that lock is
+ACCESS EXCLUSIVE on `changesets` and waits for every open transaction that
+read the table, while every new reader and writer queues behind it. **Do
+not run it while a backup or `gc --unreachable --dry-run` is in flight.**
+On Postgres, Leep's migrations wait at most 5 s for a table lock (`lock_timeout`) and
+then fail without changing anything (`could not lock a table within 5s`);
+run `leep-server migrate` again when the long transaction has finished. They keep storing changesets without the column,
+which read as stored when the migration ran; finish the rollout before the
+first changeset condemnation (see [Changeset garbage
+collection](#changeset-garbage-collection)).
+
 **Derived kinds that change encoding.** A release that changes how a derived
 kind is stored gives it a new name, so old and new servers never read each
 other's rows; nothing to migrate. The new kind derives on first use, which on
@@ -1100,16 +1182,56 @@ leep-server repair rederive --kind history-tree-v4 log-filter-v1 --missing --job
 `rederive` prints the rows derived so far every five seconds. On a server,
 the rate of `leep_derive_total{kind}` is the warmer's derivation speed.
 
-**The warmer with several servers.** Every server runs a warmer. It reads the
-ref log every `--warm-interval` (`LEEP_WARM_INTERVAL`, default 250 ms) and
-lists every ref every 5 s. Servers do not coordinate, so with N servers on
-one metadata store, each moved head is derived N times at once. The rows
-agree and an identical write no longer rewrites a row, but the CPU and the
-reads are spent N times. Until index leases exist (ADR 0058), run the
-warmer on one server only: keep the default there and set
-`LEEP_WARM_INTERVAL=0` (`--warm-interval 0`) on all the others. Queries on
-those servers still derive whatever is missing, as before. If the warming
-server is down, the others' queries derive on their own until it returns.
+**The warmer with several servers.** In `--indexing local` (the default)
+every server runs a warmer: it reads the ref log every `--warm-interval`
+(`LEEP_WARM_INTERVAL`, default 250 ms) and lists every ref every 5 s, and
+with N servers on one metadata store each moved head is derived N times.
+Use index leases instead (ADR 0058):
+
+| Mode (`--indexing`, `LEEP_INDEXING`) | Warms | Queries |
+|---|---|---|
+| `local` (default) | every group, on this server | derive what they miss, as before |
+| `lease` | the groups whose lease it holds (`--index-kinds`, default all) | bounded while a lease lives |
+| `off` | nothing | bounded while a lease lives |
+
+- **Leases** are rows of the `leases` table in scope `index`, one per group
+  (`history-tree-v4`, `log-filter-v1`, `tree-trigrams-v1`). Candidates take a
+  free lease on their 3 s renewal tick, never a live one, and release on
+  shutdown; a killed holder's lease is taken 6 s after its last renewal.
+  They need Postgres or SQLite (SQLite: one process, which holds every
+  lease). `leep_index_lease_held` shows who holds what; the lease row's
+  `address` is the holder's `--advertise-url`.
+- **Bounded queries.** In `lease` and `off` modes, while a lease lives, path
+  logs, last-change, blame, filtered logs and search never derive. They scan
+  what is missing up to `--query-scan-budget` (1,024 changesets),
+  `--blame-scan-budget` (128 first-parent steps), `--search-scan-budget`
+  (512 files) and `--search-scan-bytes` (16 MiB), with the same answers as
+  a fully indexed store. Further behind, clients sending `Leep-Indexing:
+  retry` (the CLI) get 503 with `Retry-After`, `stale-ok` (MCP) an older
+  answer, and requests without the header wait up to `--index-wait` (10 s,
+  at most `--index-waiters` of them at once, 64), then scan `--legacy-scan-factor`
+  (8) times the budgets, then get the 503. With no live lease for a group,
+  queries derive inline (`leep_query_inline_derive_total`).
+- **Rollout.** Run `leep-server upgrade-index --yes` (it backfills
+  `last_merge-v1` too), switch the servers that should build indexes to
+  `lease`, then the query-only servers to `off`. Servers still in `local`
+  keep warming meanwhile, which costs duplicate work only. To back out,
+  return to `local`; leases expire in 15 s.
+- **Balancers** must not count a 503 that carries a `Leep-Indexing` header
+  against a backend or retry it elsewhere: see
+  [RUNBOOKS.md](RUNBOOKS.md#leepindexinganswershigh).
+- **Tools that delete or rebuild rows.** `repair drop`, `repair rederive
+  --missing` and `upgrade-index --yes` take the index leases of the groups
+  they touch, refuse when a live server holds one (stop it, set it to `off`,
+  or pass `--ignore-lease`, which allows duplicate work and is refused for
+  `repair drop` and `upgrade-index --drop-first`, where it would allow the
+  race the fence prevents), wait
+  `--index-fence` (60 s; the 6 s stale time plus more than the longest
+  staged write) before touching rows, so a former holder's late write lands
+  first. They keep the leases while they run, so no server warms meanwhile,
+  and a drop checks them once more right before it deletes.
+  Servers in `local` mode take no leases: a drop of a current kind still
+  needs them stopped, or not deriving that kind.
 
 ## Bulk loads and planner statistics (Postgres)
 
@@ -1190,6 +1312,85 @@ means a request exceeded `--request-timeout`.
 
 Upgrade note: servers built before ADR 0012 ignore condemnations. Upgrade every
 server before the first `condemn`.
+
+### Sizing what unreachable changesets cost
+
+Changesets are never deleted, so originals of rebased lands, abandoned work
+and `leep sync` snapshots stay forever. ADR 0059 (proposed) would collect
+them; see [Changeset garbage collection](#changeset-garbage-collection). To
+measure what it would reclaim on a store, run the read-only count:
+
+```sh
+nice -n 19 leep-server --meta-pool-size 4 --meta "$LEEP_META" --blobs "$LEEP_BLOBS" \
+  gc --dry-run --unreachable --grace 0 --ref-log-retention 0
+```
+
+It writes nothing. Postgres sessions refuse writes
+(`default_transaction_read_only`), and SQLite opens with `mode=ro`; a
+`--meta` URL that already sets `options=` or `mode=` is refused. It
+reports:
+
+- the unreachable changesets by age and kind;
+- the changesets and per-changeset rows older than `--grace`, with their
+  logical bytes;
+- the tree nodes and contents only those changesets introduced;
+- the store's logical sizes (rows and bytes per derived kind, changesets,
+  ref log, refs);
+- per land, side by side: write-path bytes, index bytes and reclaimable
+  bytes. All are logical; the physical database size is printed apart and
+  runs 2.5 to 3.5 times larger on Postgres.
+
+A second column shows what keeping the ref log only `--ref-log-retention`
+would add, for a later decision. Use `--grace 0` on a store whose lands
+are all recent. Ages come from when the store first stored each changeset
+(`changesets.stored_at`, schema v7), never from the client's timestamp; a
+changeset stored before migration 0007 counts as stored when it was
+applied. The count needs a v7 schema: run `leep-server migrate` first.
+
+Tree counts are an upper bound. `--exact-trees` makes them exact by walking
+every reachable tree, which costs as much as `gc --full`. **Do not use it
+on a small host beside live servers, such as the 2-core VPS.** Memory is
+about 60 bytes per changeset, plus one hash per live object with
+`--exact-trees`.
+
+## Changeset garbage collection
+
+ADR 0059 will delete changesets that nothing reaches (refs, every ref log
+entry, the landed-copy scan window of every head, attestations, git mirror
+maps, and a grace period) with the condemn, fence and collect protocol
+blob GC uses. **Phase 1 is built: nothing condemns or deletes yet.** It is
+what every server must run before a sweep may run beside it. Deleting
+(`MetaStore::delete_changesets`) and the sweep itself come with phase 2.
+Phase 1 is:
+
+- **Store times.** Migration 0007 adds `changesets.stored_at`, written on
+  every new changeset; sweeps and the dry run age changesets by it. It is
+  a catalog-only `ADD COLUMN` on both backends and tolerates servers of
+  the previous version, which leave it NULL (read as the migration's
+  time).
+- **Rescues.** Before a server stores anything that names an existing
+  changeset (a child, a land, a rebase or merge, a ref move including
+  `leep undo`, a signature or review), and `leep-git export` before it
+  writes a mirror map, it checks whether a sweep condemned that changeset,
+  and if so rescues it and its condemned ancestors
+  (`leep_gc_changesets_rescued_total`). The check reads one row
+  (`gc-fence-active-v1`) at most every 10 s per server while no sweep runs.
+- **Land batches** read that row on every attempt, and give up with a
+  retryable 409 after 60 s (`leep_land_batch_deadline_total`), which bounds
+  how long after its check a batch can still move a ref.
+- **Land ids outlive originals.** A keyed land retry whose changeset is no
+  longer stored is answered from its land id record
+  (`leep_land_answered_from_record_total{original="missing"}`).
+- **Metrics and alert:** `leep_gc_changesets_rescued_total`,
+  `leep_land_batch_deadline_total` and
+  `leep_land_answered_from_record_total` (see [Metrics](#metrics)), and
+  [LeepLandBatchDeadline](RUNBOOKS.md#leeplandbatchdeadline).
+- `GET /v1/ready` lists `changeset-rescue`.
+
+**Before the first condemnation** (phase 2), upgrade every server, importer
+and tool that writes to the store to a release that lists
+`changeset-rescue`: an older one neither rescues nor re-checks, exactly as
+servers from before ADR 0012 did for blobs.
 
 ## Packing blobs
 

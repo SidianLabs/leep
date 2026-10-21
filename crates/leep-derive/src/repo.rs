@@ -15,7 +15,7 @@ use leep_core::{
 use crate::derived::{
     self,
     history_pack::{Part, RawNode},
-    DerivedKind, Generation, NodeRef, RootTree, SkipEntry, Skiplist, StoredHistoryNode,
+    DerivedKind, Generation, LastMerge, NodeRef, RootTree, SkipEntry, Skiplist, StoredHistoryNode,
 };
 use crate::signatures::{LandPolicy, PolicySet};
 use crate::tree_ops::{apply_changes, TreeView};
@@ -64,6 +64,11 @@ struct CreateInputs {
     parent_generations: Vec<Option<u64>>,
     base_tree: Option<Hash>,
     parent_skiplist: Option<Arc<[SkipEntry]>>,
+    /// The first parent's changeset, when it was read.
+    first_parent: Option<Changeset>,
+    /// The `last_merge-v1` values of the first parent and of its first
+    /// parent, when stored.
+    last_merges: [Option<u64>; 2],
 }
 
 /// A repository: content-addressed blobs plus changeset metadata.
@@ -113,6 +118,28 @@ pub struct Repo {
     /// Values computed by `derived::derive`, any kind: what `repair
     /// rederive --missing` reports, and tests check for duplicated work.
     pub(crate) derive_calls: Arc<std::sync::atomic::AtomicUsize>,
+    /// What queries do about lagging indexes (ADR 0058); `None` is `local`
+    /// mode.
+    pub(crate) index_policy: Option<Arc<crate::indexing::IndexPolicy>>,
+    /// Set on the handle of one bounded query: the changesets it examines
+    /// directly, and that it may not derive an index range.
+    pub(crate) bounded: Option<Arc<crate::indexing::bounded::Bounded>>,
+    /// Asked before each write of a derivation: the warmer's lease (ADR
+    /// 0058).
+    pub(crate) write_guard: Option<Arc<dyn WriteGuard>>,
+    /// The last read of `gc-fence-active-v1` (ADR 0059), shared by clones.
+    pub(crate) fence_flag: Arc<crate::changeset_gc::FenceFlag>,
+    /// Whether writes through this handle rescue the changesets they name
+    /// (ADR 0059). Off for a land batch's staged handle, whose batch rescues
+    /// before it moves the ref.
+    pub(crate) rescues_on_write: bool,
+}
+
+/// Whether a derivation may go on writing rows: the index lease it derives
+/// under is still held.
+#[async_trait::async_trait]
+pub(crate) trait WriteGuard: Send + Sync {
+    async fn allowed(&self) -> bool;
 }
 
 type DeriveLock = Arc<tokio::sync::Mutex<()>>;
@@ -461,6 +488,38 @@ impl Repo {
             staged_values: Arc::default(),
             derive_jobs: default_derive_jobs(),
             derive_calls: Arc::default(),
+            index_policy: None,
+            bounded: None,
+            write_guard: None,
+            fence_flag: Arc::default(),
+            rescues_on_write: true,
+        }
+    }
+
+    /// Bound queries by `policy` (ADR 0058, modes `lease` and `off`).
+    pub fn with_index_policy(mut self, policy: Arc<crate::indexing::IndexPolicy>) -> Self {
+        self.index_policy = Some(policy);
+        self
+    }
+
+    /// See [`Repo::with_index_policy`].
+    pub fn index_policy(&self) -> Option<&Arc<crate::indexing::IndexPolicy>> {
+        self.index_policy.as_ref()
+    }
+
+    /// A handle whose derivations stop writing once `guard` says so.
+    pub(crate) fn with_write_guard(&self, guard: Arc<dyn WriteGuard>) -> Self {
+        Repo {
+            write_guard: Some(guard),
+            ..self.clone()
+        }
+    }
+
+    /// Whether a derivation through this handle may write.
+    pub(crate) async fn write_allowed(&self) -> bool {
+        match &self.write_guard {
+            Some(g) => g.allowed().await,
+            None => true,
         }
     }
 
@@ -614,6 +673,7 @@ impl Repo {
     /// generation and skiplist rows and `extra` in one write (ADR 0031). What
     /// it reads first (parents, their rows, blob condemnations) is read in one
     /// round of batched queries; anything those miss is derived as before.
+    /// Condemned parents are rescued before they are read (ADR 0059).
     async fn store_changeset(
         &self,
         cs: Changeset,
@@ -624,6 +684,8 @@ impl Repo {
         if client_blobs {
             check_path_bounds(cs.changes.keys())?;
         }
+        self.rescue_changesets(&cs.parents, crate::changeset_gc::RescueBy::Create)
+            .await?;
         let mut seen = HashSet::new();
         let contents: Vec<(&RepoPath, Hash, u64)> = cs
             .changes
@@ -691,6 +753,7 @@ impl Repo {
         }
         let generation = parent_generations.iter().max().map_or(1, |g| g + 1);
         derived::record_derivation(Generation::NAME, started);
+        let last_merge = Self::write_path_last_merge(&cs, generation, &parent_generations, &pre);
         let started = std::time::Instant::now();
         let skiplist: Arc<[SkipEntry]> = match cs.parents.first() {
             Some(&p) => {
@@ -719,6 +782,14 @@ impl Repo {
             ),
             DerivedRow::new(Skiplist::NAME, id.0, Skiplist::encode(&skiplist)),
         ];
+        match last_merge {
+            Some(v) => rows.push(DerivedRow::new(
+                LastMerge::NAME,
+                id.0,
+                Bytes::copy_from_slice(&v.to_be_bytes()),
+            )),
+            None => metrics::counter!("leep_create_last_merge_skipped_total").increment(1),
+        }
         rows.extend(extra);
         self.meta.put_changeset_with_derived(&cs, &rows).await?;
         self.skiplists.insert(id, skiplist);
@@ -728,6 +799,36 @@ impl Repo {
             e.generation = Some(generation);
         });
         Ok(id)
+    }
+
+    /// The `last_merge-v1` value of a new changeset (ADR 0058 section 1),
+    /// written with it so ancestry queries never derive it: the generation
+    /// of the nearest merge on its first-parent chain. From what the batched
+    /// read found, and never by deriving: the first parent's row, or the
+    /// first parent itself being a merge or a root, or the first parent's
+    /// first parent's row. `None` stores the changeset without the row,
+    /// which stays derived lazily until `upgrade-index` or the history
+    /// index holder fills it.
+    fn write_path_last_merge(
+        cs: &Changeset,
+        generation: u64,
+        parent_generations: &[u64],
+        pre: &CreateInputs,
+    ) -> Option<u64> {
+        match cs.parents.len() {
+            0 => return Some(0),
+            1 => {}
+            _ => return Some(generation),
+        }
+        if let Some(v) = pre.last_merges[0] {
+            return Some(v);
+        }
+        let parent = pre.first_parent.as_ref()?;
+        match parent.parents.len() {
+            0 => Some(0),
+            1 => pre.last_merges[1],
+            _ => Some(parent_generations[0]),
+        }
     }
 
     /// The stored state `store_changeset` starts from, read in one round:
@@ -760,8 +861,13 @@ impl Repo {
             .map(|(p, _)| p.0)
             .collect();
         let cached_list = first.and_then(|p| self.skiplists.get(&p));
+        // The first parent's and, from its cached list, its own first
+        // parent's last merges; the list read below can name the latter
+        // too late, so without a cached list only the parent's is read.
+        let grandparent = cached_list.as_ref().and_then(|l| l.first()).map(|e| e.id);
+        let merge_keys: Vec<Hash> = first.into_iter().chain(grandparent).map(|p| p.0).collect();
         let content_keys: Vec<Hash> = contents.iter().map(|(_, h, _)| *h).collect();
-        let (stored, condemned, gens, tree, list) = tokio::join!(
+        let (stored, condemned, gens, tree, list, merges) = tokio::join!(
             async {
                 if cs.parents.is_empty() {
                     return Ok(Vec::new());
@@ -795,7 +901,20 @@ impl Repo {
                     _ => Ok(None),
                 }
             },
+            async {
+                if cs.parents.len() != 1 {
+                    return Ok(Vec::new());
+                }
+                meta.get_derived_many(LastMerge::NAME, &merge_keys).await
+            },
         );
+        let mut merges = merges
+            .ok()
+            .filter(|m| m.len() == merge_keys.len())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|v| v.and_then(|v| derived::decode_u64(&v).ok()));
+        let last_merges = [merges.next().flatten(), merges.next().flatten()];
         let mut gens = gens.ok().into_iter().flatten();
         let parent_generations = cached
             .into_iter()
@@ -807,8 +926,12 @@ impl Repo {
                 })
             })
             .collect();
+        let stored = stored.ok();
+        let first_parent = stored.as_ref().and_then(|s| s.first().cloned().flatten());
         CreateInputs {
-            parents_stored: stored.ok().map(|s| s.iter().map(Option::is_some).collect()),
+            first_parent,
+            last_merges,
+            parents_stored: stored.map(|s| s.iter().map(Option::is_some).collect()),
             condemned: condemned.ok(),
             parent_generations,
             base_tree: tree

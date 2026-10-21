@@ -31,6 +31,8 @@ struct PathWalk {
     path: String,
     seen: HashSet<ChangesetId>,
     heap: BinaryHeap<(u64, ChangesetId)>,
+    /// Changesets without a row found to have changed the path.
+    known: HashSet<ChangesetId>,
 }
 
 impl PathWalk {
@@ -39,6 +41,7 @@ impl PathWalk {
             path: path.to_string(),
             seen: HashSet::new(),
             heap: BinaryHeap::new(),
+            known: HashSet::new(),
         };
         match &from.seeds {
             // A page's queue: changesets that changed the path, as queued.
@@ -65,7 +68,16 @@ impl PathWalk {
         })
     }
 
+    /// Queue what changed the path at or below `at`: its index entry's
+    /// newest changes, or, in a bounded query (ADR 0058), `at` itself when
+    /// it has no row, to be examined directly.
     async fn push_frontier(&mut self, repo: &Repo, at: ChangesetId) -> Result<()> {
+        if repo.unindexed(at) {
+            if self.seen.insert(at) {
+                self.heap.push((repo.generation(at).await?, at));
+            }
+            return Ok(());
+        }
         let Some(entry) = repo.history_entry(at, &self.path).await? else {
             return Ok(());
         };
@@ -77,15 +89,83 @@ impl PathWalk {
         Ok(())
     }
 
-    async fn next(&mut self, repo: &Repo) -> Result<Option<(u64, ChangesetId, Changeset)>> {
-        let Some((generation, cid)) = self.heap.pop() else {
-            return Ok(None);
-        };
-        let cs = repo.get_changeset(cid).await?;
-        for &p in &cs.parents {
-            self.push_frontier(repo, p).await?;
+    /// The next changeset that changed the path. One without a row is
+    /// examined (changed relative to its first parent at the path, as in
+    /// `log_scan`) and its parents queued either way, so the walk yields
+    /// what the indexed walk yields, in the same order.
+    ///
+    /// The changeset itself is read only if `body` asks for it, the walk
+    /// needs it, or its parents are not cached; otherwise it is `None`, for
+    /// the caller to read with the others it yields in one batch. A path's
+    /// history is a chain of index lookups, each at the previous change's
+    /// parents, so reading every changeset on the way made one round trip
+    /// per entry that nothing could overlap.
+    async fn next(
+        &mut self,
+        repo: &Repo,
+        body: bool,
+    ) -> Result<Option<(u64, ChangesetId, Option<Changeset>)>> {
+        loop {
+            let Some((generation, cid)) = self.heap.pop() else {
+                return Ok(None);
+            };
+            let unindexed = repo.unindexed(cid);
+            let cached = repo.cached_parents(cid);
+            let cs = match cached {
+                Some(_) if !body && !unindexed => None,
+                _ => Some(repo.get_changeset(cid).await?),
+            };
+            let parents: Arc<[ChangesetId]> = match (&cs, cached) {
+                (_, Some(p)) => p,
+                (Some(cs), None) => {
+                    let p: Arc<[ChangesetId]> = cs.parents.as_slice().into();
+                    repo.remember_parents(cid, p.clone());
+                    p
+                }
+                (None, None) => unreachable!("read when its parents are not cached"),
+            };
+            for &p in parents.iter() {
+                self.push_frontier(repo, p).await?;
+            }
+            if unindexed && !self.known.contains(&cid) {
+                let cs = cs.as_ref().expect("read when unindexed");
+                if !repo.examine_path(cid, cs, &self.path).await? {
+                    continue;
+                }
+            }
+            return Ok(Some((generation, cid, cs)));
         }
-        Ok(Some((generation, cid, cs)))
+    }
+
+    /// Replace every queued changeset without a row by what it stands for:
+    /// itself if it changed the path, else its parents' frontier. The queue
+    /// then holds only changesets that changed the path, as the indexed
+    /// walk's does, so a page carries a `next` cursor exactly when the
+    /// indexed walk's would, and the cursor needs no marks.
+    async fn settle(&mut self, repo: &Repo) -> Result<()> {
+        if repo.bounded.is_none() {
+            return Ok(());
+        }
+        loop {
+            let (todo, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut self.heap)
+                .into_iter()
+                .partition(|(_, id)| repo.unindexed(*id) && !self.known.contains(id));
+            self.heap = keep.into_iter().collect();
+            if todo.is_empty() {
+                return Ok(());
+            }
+            for (generation, cid) in todo {
+                let cs = repo.get_changeset(cid).await?;
+                if repo.examine_path(cid, &cs, &self.path).await? {
+                    self.known.insert(cid);
+                    self.heap.push((generation, cid));
+                } else {
+                    for &p in &cs.parents {
+                        self.push_frontier(repo, p).await?;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -97,10 +177,19 @@ impl PathWalk {
 struct FollowWalk {
     seen: HashSet<(ChangesetId, Arc<str>)>,
     heap: BinaryHeap<(u64, ChangesetId, Arc<str>)>,
+    /// Changesets without a row found to have changed the name queued.
+    known: HashSet<(ChangesetId, Arc<str>)>,
 }
 
 impl FollowWalk {
     async fn push_frontier(&mut self, repo: &Repo, at: ChangesetId, path: &Arc<str>) -> Result<()> {
+        if repo.unindexed(at) {
+            if self.seen.insert((at, path.clone())) {
+                self.heap
+                    .push((repo.generation(at).await?, at, path.clone()));
+            }
+            return Ok(());
+        }
         let Some(entry) = repo.history_entry(at, path).await? else {
             return Ok(());
         };
@@ -125,6 +214,35 @@ impl FollowWalk {
                 .collect();
             (entries, false)
         })
+    }
+
+    /// [`PathWalk::settle`] for the names queued.
+    async fn settle(&mut self, repo: &Repo) -> Result<()> {
+        if repo.bounded.is_none() {
+            return Ok(());
+        }
+        loop {
+            let (todo, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut self.heap)
+                .into_iter()
+                .partition(|(_, id, name)| {
+                    repo.unindexed(*id) && !self.known.contains(&(*id, name.clone()))
+                });
+            self.heap = keep.into_iter().collect();
+            if todo.is_empty() {
+                return Ok(());
+            }
+            for (generation, cid, name) in todo {
+                let cs = repo.get_changeset(cid).await?;
+                if repo.examine_path(cid, &cs, &name).await? {
+                    self.known.insert((cid, name.clone()));
+                    self.heap.push((generation, cid, name));
+                } else {
+                    for &p in &cs.parents {
+                        self.push_frontier(repo, p, &name).await?;
+                    }
+                }
+            }
+        }
     }
 
     /// Pop every name the newest changeset is queued under.
@@ -433,6 +551,14 @@ impl Repo {
             Some(p) => p,
             None => {
                 let Some(bytes) = self.meta().get_derived(kind, &key).await? else {
+                    // A bounded query (ADR 0058) whose rows were dropped
+                    // under it answers that the index is behind, as when a
+                    // row it looks up first is gone.
+                    if self.bounded.is_some() {
+                        return Err(crate::indexing::bounded::rows_vanished(
+                            crate::indexing::IndexGroup::History,
+                        ));
+                    }
                     return Err(missing(r));
                 };
                 self.cache_part(r.cs, r.part, &bytes)?
@@ -1414,20 +1540,42 @@ impl Repo {
         filter: &LogFilter,
         from: &LogFrom,
     ) -> Result<LogPageRaw> {
-        let mut out = Vec::new();
+        let mut found = Vec::new();
         let mut walk = PathWalk::start(self, id, path, from).await?;
-        while out.len() < limit {
-            let Some((generation, cid, cs)) = walk.next(self).await? else {
+        // A filter tests each changeset, so it reads them on the way.
+        let body = !filter.is_empty();
+        while found.len() < limit {
+            let Some((generation, cid, cs)) = walk.next(self, body).await? else {
                 break;
             };
-            if !from.admits(generation, cid) || !filter.matches(&cs) {
+            if !from.admits(generation, cid) || cs.as_ref().is_some_and(|cs| !filter.matches(cs)) {
                 continue;
             }
+            found.push((generation, cid, cs));
+        }
+        walk.settle(self).await?;
+        let ids: Vec<ChangesetId> = found.iter().map(|f| f.1).collect();
+        let unread: Vec<ChangesetId> = found
+            .iter()
+            .filter(|f| f.2.is_none())
+            .map(|f| f.1)
+            .collect();
+        let (roots, read) = futures_util::try_join!(
+            self.root_trees(&ids),
+            derived::get_changesets(self, &unread)
+        )?;
+        let mut read = read.into_iter();
+        let mut out = Vec::with_capacity(found.len());
+        for ((generation, cid, cs), root_tree) in found.into_iter().zip(roots) {
+            let changeset = match cs {
+                Some(cs) => cs,
+                None => read.next().expect("one read per unread entry"),
+            };
             out.push(ChangesetInfo {
                 id: cid,
-                changeset: cs,
+                changeset,
                 generation,
-                root_tree: self.root_tree(cid).await?,
+                root_tree,
                 path_at: None,
                 renamed: None,
             });
@@ -1522,6 +1670,7 @@ impl Repo {
         let mut walk = FollowWalk {
             seen: HashSet::new(),
             heap: BinaryHeap::new(),
+            known: HashSet::new(),
         };
         match &from.seeds {
             Some(seeds) => {
@@ -1536,10 +1685,30 @@ impl Repo {
         }
         let mut out = Vec::new();
         while out.len() < limit {
-            let Some((generation, cid, names)) = walk.pop_group() else {
+            let Some((generation, cid, mut names)) = walk.pop_group() else {
                 break;
             };
             let cs = self.get_changeset(cid).await?;
+            if self.unindexed(cid) {
+                // Without a row: keep the names it changed, and follow the
+                // others into its parents unchanged.
+                let mut changed = Vec::with_capacity(names.len());
+                for name in names {
+                    if walk.known.contains(&(cid, name.clone()))
+                        || self.examine_path(cid, &cs, &name).await?
+                    {
+                        changed.push(name);
+                    } else {
+                        for &p in &cs.parents {
+                            walk.push_frontier(self, p, &name).await?;
+                        }
+                    }
+                }
+                if changed.is_empty() {
+                    continue;
+                }
+                names = changed;
+            }
             let mut renames = None;
             let mut shown: Option<(Arc<str>, Option<RenameEntry>)> = None;
             for name in names {
@@ -1578,6 +1747,7 @@ impl Repo {
                 renamed,
             });
         }
+        walk.settle(self).await?;
         Ok(LogPageRaw {
             entries: out,
             rest: walk.rest(),

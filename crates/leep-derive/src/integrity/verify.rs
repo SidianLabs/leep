@@ -1116,6 +1116,11 @@ impl Verifier<'_> {
             gc::BLOB_RESCUE,
             gc::BLOB_DOOM,
             gc::GC_MARK,
+            crate::changeset_gc::CS_CONDEMNED,
+            crate::changeset_gc::CS_RESCUE,
+            crate::changeset_gc::CS_DOOM,
+            crate::changeset_gc::GC_FENCE_ACTIVE,
+            crate::changeset_reach::CS_REACH,
         ] {
             if !self.has(kind) {
                 continue;
@@ -1126,6 +1131,8 @@ impl Verifier<'_> {
                     self.kstats(kind).checked += 1;
                     let decoded = if kind == gc::GC_MARK {
                         gc::decode_mark(&value)
+                    } else if kind == crate::changeset_reach::CS_REACH {
+                        crate::changeset_reach::decode_reach_row(&key, &value)
                     } else {
                         gc::decode_row(kind, &value).map(|_| ())
                     };
