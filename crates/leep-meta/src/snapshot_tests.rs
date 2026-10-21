@@ -141,10 +141,12 @@ async fn sqlite_round_trip_keeps_everything_and_the_ref_log_sequence() {
     let mut c = sqlx::SqliteConnection::connect(&sqlite_url(dir.path(), "src.db"))
         .await
         .unwrap();
-    sqlx::query(&format!("DELETE FROM ref_log WHERE seq = {last}"))
-        .execute(&mut c)
-        .await
-        .unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DELETE FROM ref_log WHERE seq = {last}"
+    )))
+    .execute(&mut c)
+    .await
+    .unwrap();
     // A row an older server stored, without a store time (ADR 0059): it
     // keeps its age, migration 0007's `applied_at`, through the restore.
     let old = cs(3).id();
@@ -322,7 +324,10 @@ async fn schema_version_rules_follow_adr_0023() {
         async move {
             let mut c = sqlx::SqliteConnection::connect(&url).await.unwrap();
             for stmt in sql.split(';') {
-                sqlx::query(stmt).execute(&mut c).await.unwrap();
+                sqlx::query(sqlx::AssertSqlSafe(stmt))
+                    .execute(&mut c)
+                    .await
+                    .unwrap();
             }
             path
         }
@@ -603,11 +608,13 @@ impl PgDb {
         let admin = pg_url()?;
         let name = format!("leep_snap_{tag}_{}", std::process::id());
         let mut c = sqlx::PgConnection::connect(&admin).await.unwrap();
-        sqlx::query(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
-            .execute(&mut c)
-            .await
-            .unwrap();
-        sqlx::query(&format!("CREATE DATABASE {name}"))
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP DATABASE IF EXISTS {name} WITH (FORCE)"
+        )))
+        .execute(&mut c)
+        .await
+        .unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}")))
             .execute(&mut c)
             .await
             .unwrap();
@@ -618,10 +625,10 @@ impl PgDb {
 
     async fn drop_db(self) {
         let mut c = sqlx::PgConnection::connect(&self.admin).await.unwrap();
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "DROP DATABASE IF EXISTS {} WITH (FORCE)",
             self.name
-        ))
+        )))
         .execute(&mut c)
         .await
         .unwrap();

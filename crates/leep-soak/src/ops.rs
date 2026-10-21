@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Serialize;
-use sqlx::{Connection, PgConnection};
+use sqlx::{AssertSqlSafe, Connection, PgConnection};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
@@ -52,10 +52,12 @@ impl PgDb {
         let mut c = PgConnection::connect(admin_url)
             .await
             .context("connecting to postgres")?;
-        sqlx::query(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
-            .execute(&mut c)
-            .await?;
-        sqlx::query(&format!("CREATE DATABASE {name}"))
+        sqlx::query(AssertSqlSafe(format!(
+            "DROP DATABASE IF EXISTS {name} WITH (FORCE)"
+        )))
+        .execute(&mut c)
+        .await?;
+        sqlx::query(AssertSqlSafe(format!("CREATE DATABASE {name}")))
             .execute(&mut c)
             .await?;
         Ok(PgDb {
@@ -67,10 +69,10 @@ impl PgDb {
 
     pub async fn drop_db(&self) -> Result<()> {
         let mut c = PgConnection::connect(&self.admin_url).await?;
-        sqlx::query(&format!(
+        sqlx::query(AssertSqlSafe(format!(
             "DROP DATABASE IF EXISTS {} WITH (FORCE)",
             self.name
-        ))
+        )))
         .execute(&mut c)
         .await?;
         Ok(())

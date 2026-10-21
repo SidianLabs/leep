@@ -495,6 +495,9 @@ fn run_sql(url: &str, sql: &str) {
         let mut c = sqlx::PgConnection::connect(url)
             .await
             .expect("connect to postgres");
-        sqlx::query(sql).execute(&mut c).await.expect("run sql");
+        sqlx::query(sqlx::AssertSqlSafe(sql))
+            .execute(&mut c)
+            .await
+            .expect("run sql");
     });
 }

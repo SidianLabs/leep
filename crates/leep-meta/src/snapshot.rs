@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use leep_core::{ChangesetId, Error, Result};
-use sqlx::{PgPool, Postgres, QueryBuilder, Row, Sqlite, SqlitePool, Transaction};
+use sqlx::{AssertSqlSafe, PgPool, Postgres, QueryBuilder, Row, Sqlite, SqlitePool, Transaction};
 
 use crate::{
     migrate, storage, to_id, PostgresMetaStore, SchemaMode, SqliteMetaStore, POSTGRES_MIGRATIONS,
@@ -578,7 +578,7 @@ impl Sink for SqliteSink {
             // Leases name servers of the old store; never restored.
             "leases",
         ] {
-            sqlx::query(&format!("DELETE FROM {t}"))
+            sqlx::query(AssertSqlSafe(format!("DELETE FROM {t}")))
                 .execute(&mut *self.0)
                 .await
                 .map_err(storage)?;
@@ -791,10 +791,12 @@ impl Source for PgSource {
                 .map_err(storage)?;
         let Some(seq) = seq else { return Ok(0) };
         // The name comes from the catalog, already quoted where it needs to be.
-        let row = sqlx::query(&format!("SELECT last_value, is_called FROM {seq}"))
-            .fetch_one(&mut *self.0)
-            .await
-            .map_err(storage)?;
+        let row = sqlx::query(AssertSqlSafe(format!(
+            "SELECT last_value, is_called FROM {seq}"
+        )))
+        .fetch_one(&mut *self.0)
+        .await
+        .map_err(storage)?;
         let (last, called): (i64, bool) = (row.get(0), row.get(1));
         Ok(if called { last } else { 0 })
     }
@@ -846,7 +848,7 @@ impl Sink for PgSink {
             // Leases name servers of the old store; never restored.
             "leases",
         ] {
-            sqlx::query(&format!("DELETE FROM {t}"))
+            sqlx::query(AssertSqlSafe(format!("DELETE FROM {t}")))
                 .execute(&mut *self.0)
                 .await
                 .map_err(storage)?;

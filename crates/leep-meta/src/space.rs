@@ -265,11 +265,11 @@ pub async fn logical_sizes(url: &str) -> Result<Option<LogicalSizes>> {
     }
 }
 
-async fn sizes<DB>(pool: &sqlx::Pool<DB>, q: [&str; 5]) -> Result<LogicalSizes>
+async fn sizes<DB>(pool: &sqlx::Pool<DB>, q: [&'static str; 5]) -> Result<LogicalSizes>
 where
     DB: sqlx::Database,
     for<'c> &'c sqlx::Pool<DB>: sqlx::Executor<'c, Database = DB>,
-    for<'q> <DB as sqlx::Database>::Arguments<'q>: sqlx::IntoArguments<'q, DB>,
+    <DB as sqlx::Database>::Arguments: sqlx::IntoArguments<DB>,
     i64: sqlx::Type<DB> + for<'r> sqlx::Decode<'r, DB>,
     String: sqlx::Type<DB> + for<'r> sqlx::Decode<'r, DB>,
     usize: sqlx::ColumnIndex<DB::Row>,
