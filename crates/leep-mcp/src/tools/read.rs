@@ -35,6 +35,8 @@ struct LogArgs {
     agent_session: Option<String>,
     cursor: Option<String>,
     fresh: Option<bool>,
+    /// Whole messages and all of `extra`, from full log entries.
+    full: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -218,13 +220,20 @@ impl Server {
             follow,
             after: non_empty(a.cursor),
         };
-        let log = self
-            .index_client(a.fresh.unwrap_or(false))
-            .log_summary(&id, &query)?;
-        let entries: Vec<Value> = log.entries.iter().map(log_entry).collect();
+        let client = self.index_client(a.fresh.unwrap_or(false));
+        let (entries, next, answered_at, behind): (Vec<Value>, _, _, _) = if a.full.unwrap_or(false)
+        {
+            let log = client.log(&id, &query)?;
+            let entries = log.entries.iter().map(summary).collect();
+            (entries, log.next, log.answered_at, log.behind)
+        } else {
+            let log = client.log_summary(&id, &query)?;
+            let entries = log.entries.iter().map(log_entry).collect();
+            (entries, log.next, log.answered_at, log.behind)
+        };
         let mut v = json!({ "from": id.to_string(), "entries": entries });
-        mark_stale(&mut v, log.answered_at, log.behind);
-        if let Some(next) = log.next {
+        mark_stale(&mut v, answered_at, behind);
+        if let Some(next) = next {
             v["next"] = json!(next);
             v["note"] = json!(
                 "More history follows. For the next page, call again with the same arguments, \

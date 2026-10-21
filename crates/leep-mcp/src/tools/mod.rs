@@ -207,8 +207,9 @@ pub fn definitions() -> Vec<Value> {
             "Show history",
             "Show history newest first. Filters (all optional, combined with AND): a path the \
              change touched, author text, agent model, agent session. Each entry has id, author, \
-             message (its first line; `leep_show` has the whole message), files_changed and \
-             `agent` metadata (model, session, prompt, tests) when an agent made the change. With `follow` and a file `path`, history continues under the file's old name \
+             message (its first line; `leep_show` or `full` give the whole message), files_changed \
+             and `agent` metadata (model, session, prompt, tests) when an agent made the change. \
+             With `full`, entries carry the whole message and any other `extra` metadata. With `follow` and a file `path`, history continues under the file's old name \
              when it was renamed (each entry then has `path_at`, and `renamed` where the rename \
              happened). When more history follows, the result has `next`: pass it back as \
              `cursor` for the next page.",
@@ -223,7 +224,8 @@ pub fn definitions() -> Vec<Value> {
                     "agent_model": { "type": "string", "description": "Only changesets made by this agent model (exact match on agent.model)." },
                     "agent_session": { "type": "string", "description": "Only changesets from this agent session (exact match on agent.session)." },
                     "cursor": { "type": "string", "description": "The `next` value of the previous page, to continue it (repeat the other arguments, with `rev` set to that page's `from`)." },
-                    "fresh": { "type": "boolean", "description": FRESH_DOC }
+                    "fresh": { "type": "boolean", "description": FRESH_DOC },
+                    "full": { "type": "boolean", "description": "Whole messages and all `extra` metadata in each entry (default false: the message's first line and `agent` metadata only)." }
                 },
                 "additionalProperties": false
             }),
