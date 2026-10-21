@@ -518,8 +518,8 @@ impl MetaStore for SqliteMetaStore {
         let mut found: Vec<(Vec<u8>, Option<i64>)> = Vec::with_capacity(keys.len());
         for chunk in keys.chunks(BATCH_PARAMS) {
             let sql = format!(
-                "SELECT id, COALESCE(stored_at, (SELECT applied_at FROM schema_migrations \
-                 WHERE version = {})) FROM changesets WHERE id IN ({})",
+                "SELECT id, CASE WHEN stored_at >= 0 THEN stored_at ELSE (SELECT applied_at \
+                 FROM schema_migrations WHERE version = {}) END FROM changesets WHERE id IN ({})",
                 crate::STORED_AT_SCHEMA_VERSION,
                 placeholders(chunk.len())
             );

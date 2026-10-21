@@ -472,8 +472,8 @@ impl Source for SqliteSource {
 
     async fn changesets(&mut self, after: &[u8], limit: usize) -> Result<Vec<ChangesetRow>> {
         let rows = sqlx::query(
-            "SELECT id, data, COALESCE(stored_at, (SELECT applied_at FROM schema_migrations \
-             WHERE version = ?)) FROM changesets WHERE id > ? ORDER BY id LIMIT ?",
+            "SELECT id, data, CASE WHEN stored_at >= 0 THEN stored_at ELSE (SELECT applied_at \
+             FROM schema_migrations WHERE version = ?) END FROM changesets WHERE id > ? ORDER BY id LIMIT ?",
         )
         .bind(crate::STORED_AT_SCHEMA_VERSION)
         .bind(after)
@@ -727,8 +727,8 @@ impl Source for PgSource {
 
     async fn changesets(&mut self, after: &[u8], limit: usize) -> Result<Vec<ChangesetRow>> {
         let rows = sqlx::query(
-            "SELECT id, data, COALESCE(stored_at, (SELECT applied_at FROM schema_migrations \
-             WHERE version = $3)) FROM changesets WHERE id > $1 ORDER BY id LIMIT $2",
+            "SELECT id, data, CASE WHEN stored_at >= 0 THEN stored_at ELSE (SELECT applied_at \
+             FROM schema_migrations WHERE version = $3) END FROM changesets WHERE id > $1 ORDER BY id LIMIT $2",
         )
         .bind(after)
         .bind(limit as i64)

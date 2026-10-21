@@ -1100,6 +1100,19 @@ async fn upgrade_from_v6_adds_stored_at() {
         let now = leep_core::store::unix_now() as u64;
         let at = s.changesets_stored_at(&[fresh]).await.unwrap()[0].unwrap();
         assert!(at >= applied_at && at <= now, "{kind}: {at}");
+        // A writer whose clock read before 1970 cannot make a row look
+        // older than the column: it reads as the migration's time.
+        let skewed = s.put_changeset(&crate::tests::cs(636363)).await.unwrap();
+        db.exec(
+            "UPDATE changesets SET stored_at = -5 WHERE id = ?",
+            vec![Arg::Bytes(skewed.0.as_bytes().to_vec())],
+        )
+        .await;
+        assert_eq!(
+            s.changesets_stored_at(&[skewed]).await.unwrap(),
+            [Some(applied_at)],
+            "{kind}"
+        );
         assert_eq!(db.objects().await, full_schema(), "{kind}");
         drop(s);
         db.cleanup().await;
@@ -1392,6 +1405,65 @@ async fn failed_migration_rolls_back_fully() {
         drop(s);
         db.cleanup().await;
     }
+}
+
+/// On Postgres, a migration whose `ALTER TABLE` cannot get its lock (a long
+/// transaction, such as a backup snapshot, holds the table) gives up after
+/// the lock timeout with a retry message instead of queueing every reader
+/// and writer behind it, and changes nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn migration_blocked_by_a_long_transaction_times_out() {
+    let Some(db) = Db::pg("locktimeout").await else {
+        return;
+    };
+    let Db::Pg { url, schema } = &db else {
+        unreachable!()
+    };
+    let s = db.open(db.compiled(), SchemaMode::Migrate).await.unwrap();
+    drop(s);
+    const ALTER: Migration = Migration {
+        version: LATEST + 1,
+        name: "alter",
+        sql: "ALTER TABLE changesets ADD COLUMN extra BIGINT;",
+        satisfied_by: &[],
+    };
+    let holder = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(url)
+        .await
+        .unwrap();
+    let mut tx = holder.begin().await.unwrap();
+    sqlx::query(&format!(
+        "LOCK TABLE \"{schema}\".changesets IN ACCESS SHARE MODE"
+    ))
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    let started = std::time::Instant::now();
+    let err = db
+        .migrate(&with(db.compiled(), &[ALTER]), false)
+        .await
+        .expect_err("times out");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(30),
+        "{:?}",
+        started.elapsed()
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("could not lock a table") && msg.contains("retry"),
+        "{msg}"
+    );
+    tx.rollback().await.unwrap();
+    holder.close().await;
+    assert_eq!(db.report(db.compiled()).await.from, LATEST as u64);
+    // Once the transaction ends, the same migration applies.
+    let r = db
+        .migrate(&with(db.compiled(), &[ALTER]), false)
+        .await
+        .unwrap();
+    assert_eq!(r.to, LATEST as u64 + 1);
+    db.cleanup().await;
 }
 
 /// Many migrators at once (separate pools, as separate servers would be)

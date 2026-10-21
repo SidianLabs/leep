@@ -132,7 +132,9 @@ fn stored_now() -> i64 {
 }
 
 /// Answer a batched store-time read in request order from `(id, stored_at)`
-/// rows.
+/// rows. The queries already read a NULL or negative `stored_at` (a writer
+/// with a clock before 1970) as the migration's `applied_at`, so a bad clock
+/// cannot make a changeset look older than the column.
 fn stored_at_in_order(
     ids: &[leep_core::ChangesetId],
     rows: impl Iterator<Item = (Vec<u8>, Option<i64>)>,

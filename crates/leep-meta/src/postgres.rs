@@ -74,6 +74,12 @@ pub(crate) const ANALYZE_TABLES: &str = "ANALYZE changesets, refs, derived, ref_
 /// their `CREATE TABLE IF NOT EXISTS`.
 const MIGRATE_LOCK: i64 = 7164737;
 
+/// How long a migration waits for a table lock. `ALTER TABLE` takes ACCESS
+/// EXCLUSIVE and queues behind any open transaction on the table (a backup
+/// snapshot, `gc --unreachable --dry-run`); while it waits, every reader and
+/// writer queues behind it. Failing fast keeps the store serving.
+const MIGRATION_LOCK_TIMEOUT: &str = "5s";
+
 /// Taken after a ref changes and before its log row is inserted, so `seq`
 /// order is commit order. Nothing waits on a row lock while holding it.
 /// The index warmer's ref-log tail (`leep_derive::warm`) depends on this:
@@ -257,6 +263,14 @@ impl PostgresMetaStore {
                 .execute(&mut *tx)
                 .await
                 .map_err(storage)?;
+            // After the advisory lock, which may rightly wait for another
+            // migrator.
+            sqlx::query(&format!(
+                "SET LOCAL lock_timeout = '{MIGRATION_LOCK_TIMEOUT}'"
+            ))
+            .execute(&mut *tx)
+            .await
+            .map_err(storage)?;
         }
         let report = migrate::drive(&mut PgSession(&mut tx), migrations, write).await?;
         tx.commit().await.map_err(storage)?;
@@ -349,7 +363,18 @@ impl Session for PgSession<'_> {
     async fn execute(&mut self, sql: &'static str) -> Result<()> {
         use sqlx::Executor;
         // A bare string takes the multi-statement path.
-        self.0.execute(sql).await.map(|_| ()).map_err(storage)
+        self.0.execute(sql).await.map(|_| ()).map_err(|e| {
+            // 55P03 lock_not_available: `lock_timeout` expired.
+            if e.as_database_error().and_then(|d| d.code()).as_deref() == Some("55P03") {
+                storage(format!(
+                    "could not lock a table within {MIGRATION_LOCK_TIMEOUT}: a long \
+                     transaction holds it (a backup, gc --unreachable --dry-run?). \
+                     Nothing was changed; retry when it has finished ({e})"
+                ))
+            } else {
+                storage(e)
+            }
+        })
     }
 
     async fn record(&mut self, m: &AppliedMigration) -> Result<()> {
@@ -639,8 +664,8 @@ impl MetaStore for PostgresMetaStore {
         }
         let keys: Vec<&[u8]> = unique(ids.iter().map(|i| i.0.as_bytes().as_slice()));
         let rows = sqlx::query(
-            "SELECT id, COALESCE(stored_at, (SELECT applied_at FROM schema_migrations \
-             WHERE version = $2)) FROM changesets WHERE id = ANY($1)",
+            "SELECT id, CASE WHEN stored_at >= 0 THEN stored_at ELSE (SELECT applied_at \
+             FROM schema_migrations WHERE version = $2) END FROM changesets WHERE id = ANY($1)",
         )
         .bind(keys)
         .bind(crate::STORED_AT_SCHEMA_VERSION)

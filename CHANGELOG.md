@@ -12,6 +12,10 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   first stored, written by every new changeset. A catalog-only `ADD COLUMN`
   on Postgres and SQLite that tolerates servers of the previous version;
   older rows read as stored when the migration ran. Backups carry it.
+- Postgres migrations wait at most 5 s for a table lock (`lock_timeout`)
+  and then fail, changing nothing, instead of queueing every reader and
+  writer behind a long transaction such as a backup. Rerun
+  `leep-server migrate` once it has finished.
 - Servers now rescue changesets a changeset sweep has condemned before
   storing anything that names them (children, lands, rebases, merges, ref
   moves including `leep undo`, signatures, reviews, `leep-git export` mirror
