@@ -144,7 +144,10 @@ line, in addition to the usual text on stderr:
 
 When the server named the error (servers since error codes; see
 [FORMATS.md](FORMATS.md), "Error codes"), the object also carries
-`server_code`, such as `not_signed`, `needs_review` or `ref_missing`.
+`server_code`, such as `not_signed`, `needs_review` or `ref_missing`. A
+`land_id_reused` refusal also carries `land`: the server's record of that
+land id (`land_id`, the `changeset` it was recorded for and the changeset
+the ref `landed` on), from servers that send it.
 
 Every request of one `leep` invocation carries the same random
 `X-Request-Id`. An error from a request carries it as `request_id` (the id

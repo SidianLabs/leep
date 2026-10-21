@@ -161,6 +161,10 @@ fn copy(e: &Error) -> Error {
         Error::InvalidHash(m) => Error::InvalidHash(m.clone()),
         Error::Invalid(m) => Error::Invalid(m.clone()),
         Error::Conflict(m) => Error::Conflict(m.clone()),
+        Error::LandIdReused { refusal, requested } => Error::LandIdReused {
+            refusal: refusal.clone(),
+            requested: *requested,
+        },
         Error::NotFound(m) => Error::NotFound(m.clone()),
         Error::Encoding(m) => Error::Encoding(m.clone()),
         Error::Storage(m) => Error::Storage(m.clone()),

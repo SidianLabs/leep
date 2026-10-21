@@ -999,16 +999,14 @@ async fn diff(State(s): State<Shared>, RawQuery(raw): RawQuery) -> Resp<DiffResp
     let mut d = s.lock().unwrap();
     record(&mut d, "diff", &raw);
     let q: HashMap<String, String> = pairs(&raw).into_iter().collect();
-    let id = |k: &str| -> Result<Option<ChangesetId>, (StatusCode, Json<ErrorResponse>)> {
-        q.get(k)
-            .map(|v| {
-                v.parse()
-                    .map_err(|_| err(StatusCode::BAD_REQUEST, "bad id"))
-            })
-            .transpose()
+    let id = |k: &str| -> Result<Option<ChangesetId>, ()> {
+        q.get(k).map(|v| v.parse().map_err(|_| ())).transpose()
     };
-    let from = id("from")?;
-    let to = id("to")?.ok_or_else(|| err(StatusCode::BAD_REQUEST, "missing to"))?;
+    let bad_id = |()| err(StatusCode::BAD_REQUEST, "bad id");
+    let from = id("from").map_err(bad_id)?;
+    let to = id("to")
+        .map_err(bad_id)?
+        .ok_or_else(|| err(StatusCode::BAD_REQUEST, "missing to"))?;
     let none = BTreeMap::new();
     let old = from.map_or(&none, |f| &d.files[&f]);
     let new = d

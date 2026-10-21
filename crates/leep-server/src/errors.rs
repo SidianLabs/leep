@@ -51,6 +51,7 @@ pub(crate) fn code_of(e: &Error) -> &'static str {
                 error_code::INVALID
             }
         }
+        Error::LandIdReused { .. } => error_code::LAND_ID_REUSED,
         Error::InvalidPath(..) | Error::InvalidHash(_) => error_code::INVALID,
         Error::NotFound(m) if m.contains(MISSING_REF_MARKER) => error_code::REF_MISSING,
         Error::NotFound(_) => error_code::NOT_FOUND,
@@ -146,6 +147,17 @@ mod tests {
         );
         assert_eq!(
             inv("land id ab already landed cd; use a new land id to land ef"),
+            "land_id_reused"
+        );
+        assert_eq!(
+            code_of(&Error::LandIdReused {
+                refusal: Box::new(leep_core::api::LandRefusal {
+                    land_id: "00112233445566778899aabbccddeeff".parse().unwrap(),
+                    changeset: leep_core::ChangesetId(leep_core::Hash([1; 32])),
+                    landed: None,
+                }),
+                requested: leep_core::ChangesetId(leep_core::Hash([2; 32])),
+            }),
             "land_id_reused"
         );
         assert_eq!(inv("invalid ref name \"a..b\": has .."), "invalid_name");

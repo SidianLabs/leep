@@ -111,7 +111,18 @@ async fn land_ids(meta: Arc<dyn MetaStore>) {
         .land_keyed(stranger, "main", None, true, Some(id.clone()))
         .await
         .unwrap_err();
-    assert!(matches!(e, Error::Invalid(_)), "{e}");
+    // The refusal carries the record: the changeset the id landed, and the
+    // copy the ref moved to for it, read back from this backend.
+    match &e {
+        Error::LandIdReused { refusal, requested } => {
+            assert_eq!(*requested, stranger);
+            assert_eq!(
+                (&refusal.land_id, refusal.changeset, refusal.landed),
+                (&id, feature, Some(copy))
+            );
+        }
+        other => panic!("{other}"),
+    }
 
     // Ids are per ref: the same id lands on another ref.
     let on_dev = r

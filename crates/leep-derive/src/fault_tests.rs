@@ -488,7 +488,7 @@ async fn a_late_retry_with_a_land_id_returns_the_original_result() {
         w.server()
             .land_keyed(stranger, "main", None, true, Some(id))
             .await,
-        Err(Error::Invalid(_))
+        Err(Error::LandIdReused { requested, .. }) if requested == stranger
     ));
     assert_eq!(w.meta.get_ref("main").await.unwrap(), head);
 
@@ -2274,7 +2274,7 @@ async fn keyed_retry_of_reclaimed_original_is_answered_from_its_record() {
         // 20 bytes: no seed's 16-byte id.
         let unknown = LandId::from_bytes(&[0xEE; 20]).unwrap();
         let not_found = |e: &Error| matches!(e, Error::NotFound(_));
-        let invalid = |e: &Error| matches!(e, Error::Invalid(_));
+        let reused = |e: &Error| matches!(e, Error::LandIdReused { .. });
         loop {
             match server
                 .land_keyed(feature, "main", None, true, Some(unknown.clone()))
@@ -2306,7 +2306,7 @@ async fn keyed_retry_of_reclaimed_original_is_answered_from_its_record() {
             {
                 Err(e) if is_injected(&e) => continue,
                 r => {
-                    refused("the id of another land", r, invalid);
+                    refused("the id of another land", r, reused);
                     break;
                 }
             }

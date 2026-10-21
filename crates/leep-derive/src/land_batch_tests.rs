@@ -1171,7 +1171,11 @@ async fn land_ids_in_a_batch_are_settled_per_land() {
         "the duplicate gets the original's copy"
     );
     assert!(
-        matches!(&results[4], Err(leep_core::Error::Invalid(m)) if m.contains("land id")),
+        matches!(
+            &results[4],
+            Err(e @ leep_core::Error::LandIdReused { refusal, .. })
+                if refusal.changeset == ids[1] && e.to_string().contains("land id")
+        ),
         "{:?}",
         results[4]
     );

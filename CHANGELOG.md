@@ -25,6 +25,13 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   and appends `(server request id: ...)` to tool errors. See RUNBOOKS.md,
   "Collecting a bug report".
 
+### Structured land id refusals
+- A land refused with `land_id_reused` carries `land` in its error body: the
+  land id, the changeset the ref recorded for it and the changeset the ref
+  moved to, so clients no longer parse them out of the message (whose text
+  is unchanged). `leep --json` errors include it as `land`. Older servers
+  omit it.
+
 ### Land ids in the ref log
 - `GET /v1/reflog` entries carry `land_id` and `land_changeset` for lands
   that named themselves (ADR 0057); they were stored since migration 0005

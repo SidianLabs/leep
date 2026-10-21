@@ -8,7 +8,7 @@ use std::hash::BuildHasher;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use leep_core::api::{LandResponse, RebaseResponse};
+use leep_core::api::{LandRefusal, LandResponse, RebaseResponse};
 use leep_core::refname::{self, MISSING_REF_MARKER, NOT_FORWARD_MARKER};
 use leep_core::{
     ChangesetId, Error, FileChange, Hash, LandId, LandKey, LandRecord, RefStep, RefUpdateContext,
@@ -222,10 +222,7 @@ fn recorded_step(
         Err(e) => return Some(Err(duplicate(e))),
     };
     if found.changeset != key.changeset {
-        return Some(Err(Error::Invalid(format!(
-            "land id {} already landed {}; use a new land id to land {}",
-            key.id, found.changeset, key.changeset
-        ))));
+        return Some(Err(land_id_reused(&key.id, found, key.changeset)));
     }
     metrics::counter!("leep_land_recorded_total").increment(1);
     metrics::counter!("leep_land_answered_from_record_total", "original" => "present").increment(1);
@@ -234,6 +231,18 @@ fn recorded_step(
         rebased: found.landed != key.changeset,
         attempts: attempt,
     })))
+}
+
+/// The refusal of a land whose `id` the ref recorded for another changeset.
+fn land_id_reused(id: &LandId, record: &LandRecord, requested: ChangesetId) -> Error {
+    Error::LandIdReused {
+        refusal: Box::new(LandRefusal {
+            land_id: id.clone(),
+            changeset: record.changeset,
+            landed: Some(record.landed),
+        }),
+        requested,
+    }
 }
 
 fn is_move(step: &Result<Step>) -> bool {
@@ -247,6 +256,10 @@ fn duplicate(e: &Error) -> Error {
         Error::InvalidHash(m) => Error::InvalidHash(m.clone()),
         Error::Invalid(m) => Error::Invalid(m.clone()),
         Error::Conflict(m) => Error::Conflict(m.clone()),
+        Error::LandIdReused { refusal, requested } => Error::LandIdReused {
+            refusal: refusal.clone(),
+            requested: *requested,
+        },
         Error::NotFound(m) => Error::NotFound(m.clone()),
         Error::Encoding(m) => Error::Encoding(m.clone()),
         Error::Storage(m) => Error::Storage(m.clone()),
@@ -510,10 +523,7 @@ impl Repo {
             return Ok(None);
         };
         if record.changeset != cs {
-            return Err(Error::Invalid(format!(
-                "land id {} already landed {}; use a new land id to land {cs}",
-                key.id, record.changeset
-            )));
+            return Err(land_id_reused(&key.id, &record, cs));
         }
         metrics::counter!("leep_land_answered_from_record_total", "original" => "missing")
             .increment(1);

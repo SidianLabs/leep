@@ -1,5 +1,8 @@
 use thiserror::Error;
 
+use crate::api::LandRefusal;
+use crate::ChangesetId;
+
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("invalid path {0:?}: {1}")]
@@ -13,6 +16,19 @@ pub enum Error {
     /// to HTTP 409.
     #[error("conflict: {0}")]
     Conflict(String),
+    /// A land id the ref already recorded for another changeset (ADR 0057).
+    /// Maps to HTTP 400 like `Invalid`, with the same text, and carries the
+    /// record so clients get it as data ([`LandRefusal`]).
+    #[error(
+        "invalid input: land id {} already landed {}; use a new land id to land {requested}",
+        .refusal.land_id,
+        .refusal.changeset
+    )]
+    LandIdReused {
+        refusal: Box<LandRefusal>,
+        /// The changeset this land asked for.
+        requested: ChangesetId,
+    },
     #[error("not found: {0}")]
     NotFound(String),
     /// The index a query needs is further behind than the query may scan
