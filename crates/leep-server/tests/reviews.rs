@@ -1231,6 +1231,10 @@ async fn tokens_without_review_cannot_review_and_their_old_reviews_stop_counting
     let r = after.review(c, "agent", Verdict::Approve).await;
     assert_eq!(r.status, StatusCode::FORBIDDEN);
     assert!(r.error().contains("\"review\": false"), "{}", r.error());
+    assert_eq!(
+        r.json::<ErrorResponse>().code.as_deref(),
+        Some(leep_core::api::error_code::FORBIDDEN)
+    );
     // Its earlier approval is no longer listed and no longer counts.
     let listed = after.reviews(c).await;
     assert!(listed.reviews.is_empty(), "{:?}", listed.reviews);

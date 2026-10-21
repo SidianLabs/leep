@@ -1053,9 +1053,9 @@ short-lived agent credentials end by themselves; this is the reminder to rotate
 the ones still needed and to remove the rest.
 
 **Impact.** None yet for a token expiring soon. Once it expires, every request
-with it gets 401 `authentication required: token expired at <time>`, which `leep`
-reports with a hint to get a new token; the agent stops working. Other tokens
-are unaffected.
+with it gets 401 with code `token_expired` (`authentication required: token
+expired at <time>`), which `leep` reports with a hint to get a new token; the
+agent stops working. Other tokens are unaffected.
 
 **Diagnose.**
 

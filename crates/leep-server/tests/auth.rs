@@ -439,6 +439,7 @@ async fn an_expired_token_is_refused_with_401_saying_so() {
         assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{uri}");
         assert_eq!(r.www.as_deref(), Some("Bearer"));
         let e: ErrorResponse = serde_json::from_slice(&r.body).unwrap();
+        assert_eq!(e.code.as_deref(), Some(error_code::TOKEN_EXPIRED));
         assert!(
             e.error.contains("token expired at 2020-01-01T00:00:00Z"),
             "{}",

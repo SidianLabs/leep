@@ -908,48 +908,57 @@ fn error_from(resp: Response, has_token: bool, sent: &str) -> CliError {
     classify(resp, has_token).with_request_id(id)
 }
 
+/// 401 and 403. The server explains a 401 only for a known token that has
+/// expired: by `code` `token_expired`, or by message text on servers older
+/// than error codes.
+fn classify_auth(status: StatusCode, resp: Response, has_token: bool) -> CliError {
+    let parsed = resp
+        .text()
+        .ok()
+        .and_then(|b| serde_json::from_str::<ErrorResponse>(&b).ok());
+    let code = parsed.as_ref().and_then(|e| e.code.clone());
+    let said = parsed.map(|e| e.error).filter(|e| !e.is_empty());
+    if status == StatusCode::FORBIDDEN {
+        // The server's reason (no write access, or not a reviewer).
+        return CliError::new(
+            ErrorKind::Auth,
+            said.unwrap_or_else(|| "token lacks write access".into()),
+        )
+        .with_server_code(code);
+    }
+    if !has_token {
+        return CliError::new(
+            ErrorKind::Auth,
+            "authentication required: set LEEP_TOKEN (or pass --token)",
+        )
+        .with_server_code(code);
+    }
+    let expired = match code.as_deref() {
+        Some(c) => c == error_code::TOKEN_EXPIRED,
+        None => said.as_deref().is_some_and(|e| e.contains("token expired")),
+    };
+    let e = if expired {
+        CliError::new(
+            ErrorKind::Auth,
+            said.unwrap_or_else(|| "authentication required: token expired".into()),
+        )
+        .with_hint(
+            "ask the server's operator for a new token, then set LEEP_TOKEN \
+             (or `leep init --token`)",
+        )
+    } else {
+        CliError::new(
+            ErrorKind::Auth,
+            "authentication required: the server rejected the token; check LEEP_TOKEN",
+        )
+    };
+    e.with_server_code(code)
+}
+
 fn classify(resp: Response, has_token: bool) -> CliError {
     let status = resp.status();
-    match status {
-        StatusCode::UNAUTHORIZED if has_token => {
-            // The server says why only when the token is known: it expired.
-            let said = resp
-                .text()
-                .ok()
-                .and_then(|b| serde_json::from_str::<ErrorResponse>(&b).ok())
-                .map(|e| e.error)
-                .filter(|e| e.contains("token expired"));
-            return match said {
-                Some(msg) => CliError::new(ErrorKind::Auth, msg).with_hint(
-                    "ask the server's operator for a new token, then set LEEP_TOKEN \
-                     (or `leep init --token`)",
-                ),
-                None => CliError::new(
-                    ErrorKind::Auth,
-                    "authentication required: the server rejected the token; check LEEP_TOKEN",
-                ),
-            };
-        }
-        StatusCode::UNAUTHORIZED => {
-            return CliError::new(
-                ErrorKind::Auth,
-                "authentication required: set LEEP_TOKEN (or pass --token)",
-            )
-        }
-        StatusCode::FORBIDDEN => {
-            // The server's reason (no write access, or not a reviewer).
-            let said = resp
-                .text()
-                .ok()
-                .and_then(|b| serde_json::from_str::<ErrorResponse>(&b).ok())
-                .map(|e| e.error)
-                .filter(|e| !e.is_empty());
-            return CliError::new(
-                ErrorKind::Auth,
-                said.unwrap_or_else(|| "token lacks write access".into()),
-            );
-        }
-        _ => {}
+    if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+        return classify_auth(status, resp, has_token);
     }
     let body = resp.text().unwrap_or_default();
     if status == StatusCode::BAD_REQUEST {
@@ -1220,6 +1229,27 @@ mod tests {
         let (url, _) = stub(&[EXPIRED.replace("token expired", "token unknown").leak()]);
         let e = Client::with_token(&url, Some("t")).refs().unwrap_err();
         assert!(e.to_string().contains("rejected the token"), "{e}");
+    }
+
+    #[test]
+    fn an_expired_token_is_known_by_its_code() {
+        const CODED: &str = "HTTP/1.1 401 Unauthorized\r\nwww-authenticate: Bearer\r\n\
+            content-type: application/json\r\ncontent-length: 59\r\nconnection: close\r\n\r\n\
+            {\"error\":\"token is past its expiry\",\"code\":\"token_expired\"}";
+        let (url, _) = stub(&[CODED]);
+        let e = Client::with_token(&url, Some("t")).refs().unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Auth);
+        assert_eq!(e.server_code(), Some("token_expired"));
+        assert!(e.to_string().contains("past its expiry"), "{e}");
+        assert!(e.hint().unwrap().contains("new token"), "{e:?}");
+        // A code other than token_expired wins over the message text.
+        const UNKNOWN: &str = "HTTP/1.1 401 Unauthorized\r\nwww-authenticate: Bearer\r\n\
+            content-type: application/json\r\ncontent-length: 52\r\nconnection: close\r\n\r\n\
+            {\"error\":\"token expired at x\",\"code\":\"unauthorized\"}";
+        let (url, _) = stub(&[UNKNOWN]);
+        let e = Client::with_token(&url, Some("t")).refs().unwrap_err();
+        assert!(e.to_string().contains("rejected the token"), "{e}");
+        assert!(e.hint().is_none(), "{e:?}");
     }
 
     #[test]

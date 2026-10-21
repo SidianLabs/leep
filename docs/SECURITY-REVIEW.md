@@ -334,8 +334,8 @@ at startup only. Tests: `crates/leep-server/tests/protect.rs`.
 
 A token was valid until someone removed its entry, so credentials made for an
 agent that ran for an afternoon stayed usable indefinitely. An entry may now
-carry `expires` (RFC 3339); a matching token past it gets 401 `token expired at
-...`. The match is unchanged (constant time over every entry), and saying
+carry `expires` (RFC 3339); a matching token past it gets 401 `token_expired`
+(`token expired at ...`). The match is unchanged (constant time over every entry), and saying
 "expired" tells nothing to a caller without the token. `gen-token --expires-in`
 writes the field; `leep_tokens_expiring_soon`, `leep_tokens_expired` and the
 `LeepTokensExpiringSoon` alert surface tokens to rotate. Expiry reads the

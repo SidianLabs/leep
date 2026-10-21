@@ -136,7 +136,7 @@ docker run -d -p 127.0.0.1:7070:7070 -v leep-data:/var/lib/leep \
 In compose, add the same volume and `LEEP_TOKENS_FILE` to `leep-server`.
 An entry may carry `"expires": "2027-01-31T00:00:00Z"` (an RFC 3339 time with
 an offset; `gen-token --expires-in 30d` writes one), after which the token gets
-401 `token expired at ...`. Give agent tokens an expiry so a forgotten one ends
+401 with code `token_expired` (`token expired at ...`). Give agent tokens an expiry so a forgotten one ends
 by itself, and rotate the ones still needed before then: the
 `LeepTokensExpiringSoon` alert fires 7 days ahead
 ([OPERATIONS.md](OPERATIONS.md#metrics)). Changing `expires` takes effect on

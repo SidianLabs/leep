@@ -74,8 +74,8 @@ file or that variable.
 Tokens never ended unless someone removed them, so a token made for a
 short-lived agent stayed valid long after the agent was gone. An entry may now
 carry `expires`, an RFC 3339 time with an offset. `require_token` refuses a
-matching token whose time has passed with 401 and the message `token expired
-at <time>`. The match itself is unchanged (constant time over every entry), and
+matching token whose time has passed with 401, code `token_expired` and the
+message `token expired at <time>`. The match itself is unchanged (constant time over every entry), and
 saying "expired" reveals nothing to a caller who does not hold the token.
 `leep-server gen-token --expires-in <duration>` writes the field, rounded to
 the second. An expired entry is not an error in the file, so expiry needs no
