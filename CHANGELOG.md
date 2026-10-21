@@ -7,6 +7,14 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 ## [Unreleased]
 
+### Protected refs without a policy
+- `leep-server --protect-ref REF` (repeatable; `LEEP_PROTECT_REFS`
+  comma-separated): `REF` only moves forward and cannot be deleted through
+  the API, without requiring signatures or review. Before, only refs named by
+  `--require-signatures`, `--require-review` or a review policy were
+  protected, so any write token could rewind or delete `main` with a raw
+  compare-and-swap (ADR 0015).
+
 ### Summary log entries
 - `GET /v1/log/{id}?fields=summary` answers the same entries, order and
   cursors as listings need them: id, parents, author, timestamp,

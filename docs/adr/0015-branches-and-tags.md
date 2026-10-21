@@ -46,3 +46,17 @@ which also makes them undeletable. Pattern-based protection (`tags/*`,
 A ref a land policy covers now also only moves forward through
 `POST /v1/refs/{name}` (S-09): besides the delete-and-recreate rule above, a
 rewind or sideways move would have dropped reviewed or signed history.
+
+## Protection without a policy, 2026-10-21
+Forward-only and no-delete applied only to refs a signature or review policy
+covers, so on a server with neither any write token could rewind or delete
+`main` with one raw compare-and-swap. `leep-server --protect-ref REF`
+(repeatable, `LEEP_PROTECT_REFS` comma-separated) protects a ref on its own. It
+is a `LandPolicy` in `leep-server` (`ProtectOnly`) that covers the listed refs
+and accepts every land; it is composed with the other policies in the
+reloadable config (ADR 0024), so `cas_ref_checked` applies the same
+forward-only and protected-delete rules through the same code path and `land`
+is unchanged. The names are validated like the other policy refs (S-06) and
+join the startup warning for refs that do not exist. The cost is that a land
+onto a covered ref computes the history it adds, as for any policy, before
+the policy accepts it. No `/v1` shape or stored format changes.
