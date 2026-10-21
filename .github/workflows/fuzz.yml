@@ -35,7 +35,7 @@ jobs:
       - run: cargo install cargo-fuzz --locked
       # Inputs that found new coverage in earlier runs. The checked-in seeds
       # stay read-only in fuzz/corpus; new inputs land in ci-corpus.
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: fuzz/ci-corpus
           key: fuzz-corpus-${{ github.run_id }}
