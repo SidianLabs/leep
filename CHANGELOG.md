@@ -933,6 +933,11 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 ### Project
 - Workspace version set to 0.0.1, with a CI check that keeps it below
   0.1.0.
+- Supply-chain checks: CI runs cargo-deny (`deny.toml`) for RustSec
+  advisories, licenses, wildcard dependencies and sources on every push and
+  pull request, and for advisories weekly. Dependabot opens grouped weekly
+  Cargo and GitHub Actions updates. The workspace declares its MSRV
+  (`rust-version = "1.97.0"`, matching `rust-toolchain.toml`).
 - Apache-2.0 license text, security policy and this changelog.
 - Product direction (`docs/PRODUCT.md`) and a draft contributor license
   agreement (`CLA.md`). Pull requests are merged by the maintainer only.
