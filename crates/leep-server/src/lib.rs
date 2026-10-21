@@ -34,7 +34,8 @@ use serde::Deserialize;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
 
-/// Default cap on request bodies (blob uploads), in bytes.
+/// Default ceiling on every request body, in bytes. The per-route caps of
+/// [`limits::BodyLimits`] are lower and apply first.
 pub const DEFAULT_MAX_BODY_BYTES: usize = 512 * 1024 * 1024;
 
 /// Default cap on request bodies from `read` tokens, which cannot upload: the
@@ -182,7 +183,29 @@ pub fn router_with_ready_timeout(
     config: Arc<reload::ConfigHandle>,
     ready_timeout: Duration,
 ) -> Router {
+    router_with_body_limits(
+        repo,
+        max_body_bytes,
+        limits::BodyLimits::under(max_body_bytes),
+        request_timeout,
+        config,
+        ready_timeout,
+    )
+}
+
+/// Like [`router_with_ready_timeout`], with the server-wide body limits:
+/// per-route caps and the in-flight byte budget. `max_body_bytes` stays a
+/// ceiling on every body.
+pub fn router_with_body_limits(
+    repo: Repo,
+    max_body_bytes: usize,
+    body_limits: limits::BodyLimits,
+    request_timeout: Duration,
+    config: Arc<reload::ConfigHandle>,
+    ready_timeout: Duration,
+) -> Router {
     register_ready_metrics();
+    let budget = limits::BodyBudget::new(body_limits);
     let repo = Arc::new(repo);
     let ready_state = (repo.clone(), ready_timeout);
     let router = Router::new()
@@ -223,7 +246,9 @@ pub fn router_with_ready_timeout(
         .route("/v1/land", post(land));
     // Just inside authentication, which names the principal, and still before
     // any body is read.
-    let router = router.layer(middleware::from_fn(limits::enforce));
+    let router = router
+        .layer(middleware::from_fn(limits::enforce))
+        .layer(Extension(budget));
     // Next in, so a rejected request never has its body read.
     let router = router.layer(middleware::from_fn(auth::require_token));
     // Outside both: the request keeps this config snapshot to its end.

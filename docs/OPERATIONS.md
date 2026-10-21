@@ -80,6 +80,9 @@ measured until the response head is ready, not until the body is streamed.
 | `leep_blob_cache_entries` | gauge | none | Blobs held in the cache. |
 | `leep_requests_limited_total` | counter | `reason` = `rate`, `concurrency`, `size`; `token` | Requests refused by a request limit (ADR 0020). `token` is the token's name, or `anonymous` for every client address when there is no tokens file. |
 | `leep_requests_in_flight` | gauge | `token` | Requests in progress, until their response body has been sent. Only tokens that have a limit are tracked. |
+| `leep_request_body_bytes_in_flight` | gauge | none | Body bytes the requests in flight hold of the `--max-inflight-bytes` budget: each request's `Content-Length`, or its route's cap when it declares none, from admission until its handler finishes. |
+| `leep_request_body_budget_bytes` | gauge | none | The `--max-inflight-bytes` budget, for ratios. |
+| `leep_request_body_refused_total` | counter | `reason` = `budget`, `size`; `class` = `blob`, `json` | Requests refused by the server-wide body limits: `budget` is a 503 because the budget was spent, `size` a 413 over `--max-blob-bytes` (`class="blob"`) or `--max-json-body-bytes` (`class="json"`). All four series exist from startup. |
 | `leep_config_reload_total` | counter | `result` = `ok`, `error` | Config reloads (SIGHUP) by result; both series exist from startup (ADR 0024). |
 | `leep_config_generation` | gauge | none | **Per process:** 1 at startup, plus one per successful reload, even when nothing changed. It resets on restart, so it differs between healthy servers that run identical config; do not alert on it. Use `leep_config_info` to compare servers. |
 | `leep_config_info` | gauge | `fingerprint` | 1 for the fingerprint of the config in force, 0 for the ones this process ran before, so `leep_config_info == 1` has exactly one series per server. The fingerprint is 16 hex characters of a BLAKE3 over the parsed config (tokens with their authors and limits, trusted keys, review policy, `--require-signatures` and review refs, and the server-wide limit defaults), so it is the same on every server that runs the same config, across restarts, and does not change when a file is only reformatted or reordered. It holds no secret: tokens are already digests, keys are public, and the hash is truncated. It is also logged at startup and on every reload. |
@@ -227,6 +230,13 @@ groups:
     annotations:
       summary: "More than 5% of all requests are throttled (429): limits too low for the fleet, or one shared anonymous bucket."
       runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepbroadthrottling
+  - alert: LeepBodyBudgetExhausted
+    expr: sum by (instance) (rate(leep_request_body_refused_total{reason="budget"}[10m])) > 0.05
+    for: 10m
+    labels: {severity: ticket}
+    annotations:
+      summary: "Requests are refused with 503 because the request bodies in flight fill --max-inflight-bytes: a burst of large uploads, slow uploaders holding budget, or a budget too small for the fleet."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepbodybudgetexhausted
   - alert: LeepBlobCacheColdHitRatio
     expr: |
       sum(rate(leep_blob_cache_hits_total[15m]))
@@ -536,6 +546,34 @@ Tuning:
 - Limits do not apply to `GET /v1/health`, `GET /v1/ready` or to unauthenticated requests
   (which fail with 401 without costing a token anything); rate-limit those at
   the proxy.
+
+### Body limits and the in-flight budget
+
+Unlike the per-token limits these are always on (ADR 0020, "Server-wide body
+limits"). A blob upload over `--max-blob-bytes` (default 64 MiB) or any other
+body over `--max-json-body-bytes` (32 MiB) is a `413`, before anything is read
+when the length is declared and as soon as it is exceeded when it is not. Every
+request with a body also holds its `Content-Length` (its route's cap if it
+declares none) of `--max-inflight-bytes` (1 GiB) until its handler is done; one
+that would go over is a `503` with `Retry-After: 1`. Bodies are held in memory
+while they are hashed and stored, so the budget bounds that memory whatever the
+number of clients. Requests without a valid token are refused before they hold
+anything.
+
+- Memory: plan for `--cache-bytes` plus `--derive-cache-bytes` plus
+  `--max-inflight-bytes` plus a few hundred MB, and set the budget to fit the
+  container. With 1 GiB of budget, 16 maximum-size uploads run at once; real
+  uploads are mostly a few KB, so thousands do.
+- `leep_request_body_bytes_in_flight` near `leep_request_body_budget_bytes`
+  means uploads are queuing for memory. If it sits there with few requests per
+  second, clients are uploading slowly (a slow link, or a client trickling a
+  large declared body) and holding their share for up to `--request-timeout`;
+  per-token `concurrency` bounds how much of the budget one token can hold.
+- The CLI reports a 503 refusal as a server error (exit status 3) and does not
+  resend the upload; running the command again uploads only what is missing.
+- `--max-body-bytes` (512 MiB) stays a ceiling on every route; a cap above it
+  has no effect. A cap above the budget stops the server at startup, since
+  such a request could never be admitted.
 
 ## Config reload
 

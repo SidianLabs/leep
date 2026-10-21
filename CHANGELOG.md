@@ -7,6 +7,21 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 ## [Unreleased]
 
+### Server-wide body limits
+- **Behaviour change:** blob uploads (`PUT /v1/blobs/{hash}`) are capped at
+  64 MiB by default (`--max-blob-bytes`, `LEEP_MAX_BLOB_BYTES`), down from
+  the 512 MiB of `--max-body-bytes`, so a file larger than that is refused
+  with 413 until the operator raises the cap. Other bodies, all JSON, are
+  capped at 32 MiB (`--max-json-body-bytes`). `--max-body-bytes` stays a
+  ceiling and gains `LEEP_MAX_BODY_BYTES`.
+- `--max-inflight-bytes` (`LEEP_MAX_INFLIGHT_BYTES`, default 1 GiB) bounds
+  the body bytes all requests in flight hold together; a request that would
+  go over gets 503 with `Retry-After: 1`. Metrics
+  `leep_request_body_bytes_in_flight`, `leep_request_body_budget_bytes` and
+  `leep_request_body_refused_total`, and the alert `LeepBodyBudgetExhausted`
+  (ADR 0020).
+- `leep` explains a 413 with a hint naming the server's limit.
+
 ### Protected refs without a policy
 - `leep-server --protect-ref REF` (repeatable; `LEEP_PROTECT_REFS`
   comma-separated): `REF` only moves forward and cannot be deleted through

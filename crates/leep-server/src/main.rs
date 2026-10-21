@@ -103,9 +103,23 @@ struct Args {
     /// Default: the cores, up to 8.
     #[arg(long, env = "LEEP_DERIVE_JOBS", value_parser = clap::value_parser!(u32).range(1..=256))]
     derive_jobs: Option<u32>,
-    /// Maximum request body size in bytes.
-    #[arg(long, default_value_t = leep_server::DEFAULT_MAX_BODY_BYTES)]
+    /// Ceiling on every request body, in bytes; --max-blob-bytes and
+    /// --max-json-body-bytes are lower and apply first.
+    #[arg(long, env = "LEEP_MAX_BODY_BYTES", default_value_t = leep_server::DEFAULT_MAX_BODY_BYTES)]
     max_body_bytes: usize,
+    /// Largest blob upload (`PUT /v1/blobs/{hash}`, one file's contents) in
+    /// bytes; larger is 413.
+    #[arg(long, env = "LEEP_MAX_BLOB_BYTES", default_value_t = leep_server::limits::DEFAULT_MAX_BLOB_BYTES)]
+    max_blob_bytes: usize,
+    /// Largest body of every other request (JSON: changesets, lands, ref
+    /// updates) in bytes; larger is 413.
+    #[arg(long, env = "LEEP_MAX_JSON_BODY_BYTES", default_value_t = leep_server::limits::DEFAULT_MAX_JSON_BODY_BYTES)]
+    max_json_body_bytes: usize,
+    /// Bytes of request body all requests in flight may hold together; a
+    /// request that would go over is refused with 503 and Retry-After. A
+    /// request counts its Content-Length, or its route's cap without one.
+    #[arg(long, env = "LEEP_MAX_INFLIGHT_BYTES", default_value_t = leep_server::limits::DEFAULT_MAX_INFLIGHT_BYTES)]
+    max_inflight_bytes: usize,
     /// Requests per second each token may make, counted separately for reads
     /// and writes (anonymous mode: per client address). Off when unset; a
     /// token entry's `rate` overrides it.
@@ -842,6 +856,12 @@ async fn main() -> anyhow::Result<()> {
         args.insecure_no_auth,
     )?;
     let metrics_app = args.metrics_listen.map(|_| install_metrics()).transpose()?;
+    let body_limits = leep_server::limits::BodyLimits {
+        max_blob_bytes: args.max_blob_bytes.min(args.max_body_bytes),
+        max_json_bytes: args.max_json_body_bytes.min(args.max_body_bytes),
+        max_inflight_bytes: args.max_inflight_bytes,
+    };
+    body_limits.validate().map_err(anyhow::Error::msg)?;
     let read_max_body = match (args.read_max_body_bytes, &args.tokens_file) {
         (Some(n), _) => Some(n),
         (None, Some(_)) => Some(leep_server::DEFAULT_READ_MAX_BODY_BYTES),
@@ -934,9 +954,16 @@ async fn main() -> anyhow::Result<()> {
     if let Some((coordinator, _)) = &coordination {
         repo = repo.with_land_coordinator(coordinator.clone());
     }
-    let mut app = leep_server::router_with_ready_timeout(
+    tracing::info!(
+        max_blob_bytes = body_limits.max_blob_bytes,
+        max_json_body_bytes = body_limits.max_json_bytes,
+        max_inflight_bytes = body_limits.max_inflight_bytes,
+        "request body limits"
+    );
+    let mut app = leep_server::router_with_body_limits(
         repo,
         args.max_body_bytes,
+        body_limits,
         args.request_timeout,
         config,
         args.ready_timeout,

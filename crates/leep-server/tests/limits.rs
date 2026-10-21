@@ -708,7 +708,7 @@ fn invalid_limit_settings_fail_startup_with_a_clear_error() {
             hash_token("x")
         )
     };
-    let cases: [(&[&str], Option<String>, &str); 6] = [
+    let cases: [(&[&str], Option<String>, &str); 8] = [
         (&["--rate-limit", "0"], None, "--rate-limit"),
         (&["--rate-limit=-3"], None, "--rate-limit"),
         (
@@ -723,6 +723,12 @@ fn invalid_limit_settings_fail_startup_with_a_clear_error() {
         ),
         (&["--read-max-body-bytes", "10"], None, "--tokens-file"),
         (&[], Some(entry(r#","burst":3"#)), "burst needs a rate"),
+        (&["--max-blob-bytes", "0"], None, "--max-blob-bytes"),
+        (
+            &["--max-blob-bytes", "2000", "--max-inflight-bytes", "1000"],
+            None,
+            "must not exceed --max-inflight-bytes",
+        ),
     ];
     for (args, tokens, want) in cases {
         let out = start(args, tokens.as_deref());
@@ -730,4 +736,150 @@ fn invalid_limit_settings_fail_startup_with_a_clear_error() {
         let err = String::from_utf8_lossy(&out.stderr);
         assert!(err.contains(want), "{args:?}: {err}");
     }
+}
+
+// Server-wide body limits: per-route caps and the in-flight byte budget.
+
+const KIB: usize = 1024;
+
+/// Blobs up to 64 KiB, JSON up to 8 KiB, 100 KiB in flight in all.
+fn budget_rig() -> Router {
+    let limits = leep_server::limits::BodyLimits {
+        max_blob_bytes: 64 * KIB,
+        max_json_bytes: 8 * KIB,
+        max_inflight_bytes: 100 * KIB,
+    };
+    let config = leep_server::reload::RuntimeConfig::fixed(Some(auth(&[])), None, None, None, None);
+    leep_server::router_with_body_limits(
+        repo(),
+        1 << 30,
+        limits,
+        Duration::from_secs(60),
+        leep_server::reload::ConfigHandle::fixed(config),
+        Duration::from_secs(2),
+    )
+}
+
+/// A body that sends nothing until its sender is dropped, so the request
+/// stays in flight with no declared length.
+fn held_body() -> (mpsc::Sender<Bytes>, Body) {
+    let (tx, rx) = mpsc::channel::<Bytes>(1);
+    let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|c| (Ok::<_, Infallible>(c), rx))
+    });
+    (tx, Body::from_stream(stream))
+}
+
+fn put_declared(token: &str, data: &[u8]) -> Request<Body> {
+    Request::builder()
+        .method(Method::PUT)
+        .uri(blob_uri(data))
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_LENGTH, data.len())
+        .body(Body::from(data.to_vec()))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn each_route_class_has_its_own_body_cap() {
+    let app = budget_rig();
+    let at_cap = vec![b'x'; 64 * KIB];
+    assert_eq!(put(&app, A, &at_cap).await.status, StatusCode::NO_CONTENT);
+    let over = vec![b'x'; 64 * KIB + 1];
+    let r = send(&app, put_declared(A, &over)).await;
+    assert_eq!(r.status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(r.error().contains("--max-blob-bytes"), "{}", r.error());
+
+    // JSON routes have the smaller cap: a body a blob may have is refused.
+    let big_json = serde_json::json!({ "hashes": [], "pad": "x".repeat(9 * KIB) }).to_string();
+    let req = request(Method::POST, "/v1/blobs/missing", A, Body::from(big_json));
+    let r = send(&app, req).await;
+    assert_eq!(r.status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(r.error().contains("--max-json-body-bytes"), "{}", r.error());
+}
+
+#[tokio::test]
+async fn a_body_without_a_declared_length_is_capped_while_it_streams() {
+    let app = budget_rig();
+    let chunks = futures_util::stream::iter(
+        (0..9).map(|_| Ok::<_, Infallible>(Bytes::from(vec![b'{'; KIB]))),
+    );
+    let req = request(Method::POST, "/v1/changesets", A, Body::from_stream(chunks));
+    let r = send(&app, req).await;
+    assert_eq!(r.status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(r.error().contains("8192 bytes"), "{}", r.error());
+}
+
+#[tokio::test]
+async fn a_spent_budget_answers_503_with_retry_after_until_bodies_finish() {
+    let app = budget_rig();
+    // An upload with no declared length holds the blob cap, 64 KiB.
+    let (tx, body) = held_body();
+    let held =
+        tokio::spawn(
+            app.clone()
+                .oneshot(request(Method::PUT, &blob_uri(b"never sent"), A, body)),
+        );
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+
+    // 64 + 40 KiB would exceed the 100 KiB budget.
+    let forty = vec![b'y'; 40 * KIB];
+    let r = send(&app, put_declared(B, &forty)).await;
+    assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(r.retry_after.as_deref(), Some("1"));
+    assert!(r.error().contains("retry"), "{}", r.error());
+    // A smaller one still fits, and requests without a body cost nothing.
+    let thirty = vec![b'z'; 30 * KIB];
+    assert_eq!(
+        send(&app, put_declared(B, &thirty)).await.status,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(get(&app, B).await.status, StatusCode::OK);
+    // Without a valid token nothing is charged and the answer is 401.
+    let r = send(&app, put_declared("wrong", &forty)).await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+
+    // The held upload ends (its client went away): its share comes back.
+    drop(tx);
+    let resp = held.await.unwrap().unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "hash mismatch");
+    assert_eq!(
+        send(&app, put_declared(B, &forty)).await.status,
+        StatusCode::NO_CONTENT
+    );
+}
+
+#[test]
+fn body_refusals_are_counted_and_the_gauge_returns_to_zero() {
+    let text = with_metrics(async {
+        let app = budget_rig();
+        let (tx, body) = held_body();
+        let held =
+            tokio::spawn(
+                app.clone()
+                    .oneshot(request(Method::PUT, &blob_uri(b"held"), A, body)),
+            );
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        send(&app, put_declared(B, &vec![b'y'; 40 * KIB])).await; // budget
+        send(&app, put_declared(B, &vec![b'y'; 65 * KIB])).await; // size
+        drop(tx);
+        held.await.unwrap().unwrap();
+    });
+    let refused = |reason: &str| {
+        value(series(
+            &text,
+            "leep_request_body_refused_total",
+            &[&format!("reason=\"{reason}\""), "class=\"blob\""],
+        ))
+    };
+    assert_eq!(refused("budget"), 1.0);
+    assert_eq!(refused("size"), 1.0);
+    let g = series(&text, "leep_request_body_bytes_in_flight", &[]);
+    assert_eq!(value(g), 0.0, "{text}");
+    let b = series(&text, "leep_request_body_budget_bytes", &[]);
+    assert_eq!(value(b), (100 * KIB) as f64);
 }
