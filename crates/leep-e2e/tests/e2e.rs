@@ -298,6 +298,47 @@ fn run_import_swarm_export(stores: &Stores, work: &Path) {
             None => assert!(parents.is_empty(), "oldest entry should be the git root"),
         }
     }
+
+    // Summary entries: the same history without changed paths, and
+    // `--oneline` is one line per entry, the short id then the subject.
+    let summary = client.json(&verify, &["log", "main", "-n", "200", "--oneline"]);
+    let sums = summary["entries"].as_array().expect("summary entries");
+    assert_eq!(sums.len(), entries.len());
+    for (s, e) in sums.iter().zip(entries) {
+        assert_eq!(s["id"], e["id"]);
+        assert_eq!(s["parents"], e["changeset"]["parents"]);
+        let message = e["changeset"]["message"].as_str().unwrap();
+        assert_eq!(
+            s["message_first_line"],
+            message.lines().next().unwrap_or("")
+        );
+        assert_eq!(s["generation"], e["generation"]);
+        assert_eq!(s["root_tree"], e["root_tree"]);
+        let changed = e["changeset"]["changes"].as_object().unwrap().len();
+        assert_eq!(s["files_changed"], changed);
+        assert!(s.get("changeset").is_none() && s.get("changes").is_none());
+        let agent: serde_json::Map<String, serde_json::Value> = e["changeset"]["extra"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .filter(|(k, _)| k.starts_with("agent."))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        assert_eq!(s["agent"], serde_json::Value::Object(agent));
+    }
+    let text = client.ok(&verify, &["log", "main", "-n", "200", "--oneline"]);
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), entries.len(), "{text}");
+    for (line, e) in lines.iter().zip(entries) {
+        let id = e["id"].as_str().unwrap();
+        let subject = e["changeset"]["message"]
+            .as_str()
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap_or("");
+        assert_eq!(*line, format!("{} {subject}", &id[..12]));
+    }
     assert_eq!(
         entries[AGENTS]["id"].as_str().unwrap(),
         imported_head,

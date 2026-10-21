@@ -283,7 +283,12 @@ of its parents' entries, so a side branch's changes are never lost. The index
 is derived oldest first, by the warmer or by the first path query, whichever
 comes first. `author` and
 `extra` filters apply to the changesets the walk yields, so a selective filter
-on a frequently changed path still reads each of them.
+on a frequently changed path still reads each of them. In a plain path log
+(not `follow`, which still reads each changeset to look for renames) without
+a filter, the walk reads a changeset only when the ancestry cache lacks its
+parents or a bounded query must examine it, and the page's changesets and
+root trees are read afterwards in one batch each, so a warm path log makes
+no round trip per entry.
 Directory nodes keep deleted entries, so a busy directory's node grows with
 every name it ever held. Nodes of more than 64 entries are therefore stored as
 chunks of about 32 entries whose boundaries depend only on the names (ADR
@@ -382,7 +387,11 @@ queue wider than 64 entries falls back to "restart from the tip below the
 last entry", which is correct but rescans. A search cursor pins the searched
 changeset and the last (path, line), and the walk skips directories and files
 before it. Cursors are bound to their query by a fingerprint and validated as
-untrusted input (400 on any failure).
+untrusted input (400 on any failure). `fields=summary` returns the same log entries
+as listings need them (no changed paths, the message's first line,
+`agent.*` metadata), projected after the walk, so cursors and order are
+shared with full pages and either shape continues the other; `leep log
+--oneline` and the MCP `leep_log` tool ask for it.
 
 **Filtered log** ([ADR 0047](adr/0047-log-filter-index.md)). A log with
 `author` or `extra` filters and no path scans its first 512 changesets

@@ -1081,6 +1081,20 @@ change to the layout bumps the version byte, so cursors from an older server
 are refused rather than misread. `before` and `after` together on the ref log
 are 400.
 
+## Log summary entries (additive API parameter, no persisted change)
+
+`GET /v1/log/{id}` accepts `fields=full` (the default, unchanged byte for
+byte) or `fields=summary`; any other value is 400. A summary answers
+`LogSummaryResponse`, `LogResponse` with each entry a `LogSummaryEntry`:
+`{"id", "parents", "author", "timestamp", "message_first_line", "agent",
+"files_changed", "generation", "root_tree"}` plus `path_at` and `renamed`
+when a full entry would have them. `message_first_line` and `agent` (only the
+`agent.*` keys of `extra`) are as in blame's `ChangesetSummary`;
+`files_changed` is the number of paths in `changes`. `next`, `answered_at` and `behind`
+are as in `LogResponse`, and a cursor from either shape continues the other
+(`fields` is not part of the cursor fingerprint). Servers that predate the
+parameter ignore it and send full entries, which clients project.
+
 ## Request limits (additive, ADR 0020)
 
 Nothing persisted changed. On the wire, any endpoint may now answer `429` with

@@ -66,6 +66,12 @@ other flags and revision (use the full id the first page started from if a ref
 may move), continue from there. An older server without cursors answers one
 page.
 
+`leep log --oneline` prints one line per changeset, the short id and the
+message's first line. It asks the server for summary entries
+(`fields=summary`: no changed paths, the message's first line, `agent.*`
+metadata), about a quarter of the bytes of full ones on git/git; with
+`--json` it prints them. `leep log` and `leep log --json` are unchanged.
+
 ## Landing onto a new ref
 
 `leep land` moves the working copy's target ref, or the ref given with

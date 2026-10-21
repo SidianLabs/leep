@@ -93,20 +93,45 @@ impl PathWalk {
     /// examined (changed relative to its first parent at the path, as in
     /// `log_scan`) and its parents queued either way, so the walk yields
     /// what the indexed walk yields, in the same order.
-    async fn next(&mut self, repo: &Repo) -> Result<Option<(u64, ChangesetId, Changeset)>> {
+    ///
+    /// The changeset itself is read only if `body` asks for it, the walk
+    /// needs it, or its parents are not cached; otherwise it is `None`, for
+    /// the caller to read with the others it yields in one batch. A path's
+    /// history is a chain of index lookups, each at the previous change's
+    /// parents, so reading every changeset on the way made one round trip
+    /// per entry that nothing could overlap.
+    async fn next(
+        &mut self,
+        repo: &Repo,
+        body: bool,
+    ) -> Result<Option<(u64, ChangesetId, Option<Changeset>)>> {
         loop {
             let Some((generation, cid)) = self.heap.pop() else {
                 return Ok(None);
             };
-            let cs = repo.get_changeset(cid).await?;
-            for &p in &cs.parents {
+            let unindexed = repo.unindexed(cid);
+            let cached = repo.cached_parents(cid);
+            let cs = match cached {
+                Some(_) if !body && !unindexed => None,
+                _ => Some(repo.get_changeset(cid).await?),
+            };
+            let parents: Arc<[ChangesetId]> = match (&cs, cached) {
+                (_, Some(p)) => p,
+                (Some(cs), None) => {
+                    let p: Arc<[ChangesetId]> = cs.parents.as_slice().into();
+                    repo.remember_parents(cid, p.clone());
+                    p
+                }
+                (None, None) => unreachable!("read when its parents are not cached"),
+            };
+            for &p in parents.iter() {
                 self.push_frontier(repo, p).await?;
             }
-            if repo.unindexed(cid)
-                && !self.known.contains(&cid)
-                && !repo.examine_path(cid, &cs, &self.path).await?
-            {
-                continue;
+            if unindexed && !self.known.contains(&cid) {
+                let cs = cs.as_ref().expect("read when unindexed");
+                if !repo.examine_path(cid, cs, &self.path).await? {
+                    continue;
+                }
             }
             return Ok(Some((generation, cid, cs)));
         }
@@ -1515,25 +1540,46 @@ impl Repo {
         filter: &LogFilter,
         from: &LogFrom,
     ) -> Result<LogPageRaw> {
-        let mut out = Vec::new();
+        let mut found = Vec::new();
         let mut walk = PathWalk::start(self, id, path, from).await?;
-        while out.len() < limit {
-            let Some((generation, cid, cs)) = walk.next(self).await? else {
+        // A filter tests each changeset, so it reads them on the way.
+        let body = !filter.is_empty();
+        while found.len() < limit {
+            let Some((generation, cid, cs)) = walk.next(self, body).await? else {
                 break;
             };
-            if !from.admits(generation, cid) || !filter.matches(&cs) {
+            if !from.admits(generation, cid) || cs.as_ref().is_some_and(|cs| !filter.matches(cs)) {
                 continue;
             }
+            found.push((generation, cid, cs));
+        }
+        walk.settle(self).await?;
+        let ids: Vec<ChangesetId> = found.iter().map(|f| f.1).collect();
+        let unread: Vec<ChangesetId> = found
+            .iter()
+            .filter(|f| f.2.is_none())
+            .map(|f| f.1)
+            .collect();
+        let (roots, read) = futures_util::try_join!(
+            self.root_trees(&ids),
+            derived::get_changesets(self, &unread)
+        )?;
+        let mut read = read.into_iter();
+        let mut out = Vec::with_capacity(found.len());
+        for ((generation, cid, cs), root_tree) in found.into_iter().zip(roots) {
+            let changeset = match cs {
+                Some(cs) => cs,
+                None => read.next().expect("one read per unread entry"),
+            };
             out.push(ChangesetInfo {
                 id: cid,
-                changeset: cs,
+                changeset,
                 generation,
-                root_tree: self.root_tree(cid).await?,
+                root_tree,
                 path_at: None,
                 renamed: None,
             });
         }
-        walk.settle(self).await?;
         Ok(LogPageRaw {
             entries: out,
             rest: walk.rest(),

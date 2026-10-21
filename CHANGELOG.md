@@ -7,6 +7,25 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 ## [Unreleased]
 
+### Summary log entries
+- `GET /v1/log/{id}?fields=summary` answers the same entries, order and
+  cursors as listings need them: id, parents, author, timestamp,
+  `message_first_line`, `agent` (the `agent.*` keys), `files_changed`,
+  generation and root tree (plus `path_at`/`renamed` on `follow` logs), a
+  quarter of the bytes on git/git. The default (`fields=full`) is unchanged
+  byte for byte; other values are 400.
+- `leep log --oneline` prints the short id and the message's first line from
+  summary entries (`--json` prints them).
+- Behaviour change: the MCP `leep_log` tool reads summary entries by
+  default, so an entry's `message` is now its first line and non-agent
+  `extra` is no longer listed (`leep_show` has both). `full: true` restores
+  the previous entries.
+
+### Faster path logs
+- Path logs without a filter no longer read each changeset and root tree one
+  after another along the path's history: they read them in one batch per
+  page.
+
 ### Changeset garbage collection, phase 1 (ADR 0059)
 - Migration 0007 adds `changesets.stored_at`, the unix time a changeset was
   first stored, written by every new changeset. A catalog-only `ADD COLUMN`
