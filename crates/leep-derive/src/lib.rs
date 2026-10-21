@@ -56,6 +56,8 @@ mod land_coord_tests;
 #[cfg(test)]
 mod page_tests;
 #[cfg(test)]
+mod path_page_tests;
+#[cfg(test)]
 mod tests;
 
 /// The comment lexer, public only so the fuzz harness can check it directly.

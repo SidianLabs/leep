@@ -1,5 +1,5 @@
-//! Opaque page cursors for the list endpoints: log, code search and the ref
-//! log. A page that stops short of the end carries a `next` cursor; sending it
+//! Opaque page cursors for the list endpoints: log, code search, the ref
+//! log, file listings and diffs. A page that stops short of the end carries a `next` cursor; sending it
 //! back as `after` with the same query resumes exactly where the page ended.
 //!
 //! The text is `base64url(version | kind | fingerprint | postcard(body))`.
@@ -37,6 +37,8 @@ pub(crate) enum CursorKind {
     Log = 1,
     Search = 2,
     RefLog = 3,
+    Files = 4,
+    Diff = 5,
 }
 
 /// Digest of the query that made a cursor. A cursor sent with different
@@ -206,6 +208,31 @@ pub(crate) struct SearchPos {
     pub(crate) id: ChangesetId,
     pub(crate) path: String,
     pub(crate) line: u64,
+}
+
+/// Where the next file listing or diff page starts: paths after `path`, the
+/// last one the previous page returned. Both walks yield paths in byte
+/// order, so this is all a page needs to resume.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PathPos {
+    pub(crate) path: String,
+}
+
+/// The cursor after `path`. A path too long to fit a cursor cannot be paged
+/// past, which is `Invalid` rather than a silently shorter answer.
+pub(crate) fn path_cursor(kind: CursorKind, fp: Fingerprint, path: &str) -> Result<String> {
+    encode(
+        kind,
+        fp,
+        &PathPos {
+            path: path.to_string(),
+        },
+    )
+    .ok_or_else(|| {
+        Error::Invalid(format!(
+            "path {path:?} is too long for a page cursor; repeat the request without `limit`"
+        ))
+    })
 }
 
 /// Where the next ref log page starts: entries with a smaller `seq`.
