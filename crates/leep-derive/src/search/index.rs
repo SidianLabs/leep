@@ -19,6 +19,10 @@ pub const BLOB_KIND: &str = "blob-trigrams-v1";
 /// Per-directory filter over every trigram below it, keyed by tree node hash.
 pub const TREE_KIND: &str = "tree-trigrams-v1";
 
+/// Bytes a cached filter costs beyond its own: the map entry (key, `Arc`,
+/// size), the `Arc`'s counts and the `Bytes` handle.
+pub(super) const CACHE_ENTRY_OVERHEAD: usize = 96;
+
 /// Row lookups and blob fetches in flight at once.
 pub(super) const CONCURRENCY: usize = 16;
 
@@ -195,10 +199,69 @@ impl Repo {
     /// revision that changed one file derives one row per directory on its
     /// path.
     pub(crate) async fn tree_row(&self, root: Hash, c: &Counters) -> Result<Bytes> {
-        let meta = self.meta();
-        if let Some(v) = meta.get_derived(TREE_KIND, &root).await? {
+        if let Some(v) = self.meta().get_derived(TREE_KIND, &root).await? {
             return Ok(v);
         }
+        self.tree_row_unstored(root, c).await
+    }
+
+    /// The filter of `tree` for a search: from the shared cache, else from
+    /// the store (and then cached), else computed by [`Repo::tree_row`]'s
+    /// rules. A computed row is not cached: under a bounded query it lives
+    /// only in that query's [`SearchScan`].
+    pub(crate) async fn search_tree_row(&self, tree: Hash, c: &Counters) -> Result<Bytes> {
+        match self.search_tree_rows(&[tree]).await?.pop().flatten() {
+            Some(row) => Ok(row),
+            None => self.tree_row_unstored(tree, c).await,
+        }
+    }
+
+    /// The stored filters of `trees`, in order, reading from the store only
+    /// those the shared cache does not hold, in one batch, and caching what
+    /// it returns. `None` for a row not stored.
+    pub(crate) async fn search_tree_rows(&self, trees: &[Hash]) -> Result<Vec<Option<Bytes>>> {
+        let mut rows: Vec<Option<Bytes>> = trees
+            .iter()
+            .map(|h| self.search_trees.get(h).map(|b| Bytes::clone(&b)))
+            .collect();
+        let missing: Vec<Hash> = trees
+            .iter()
+            .zip(&rows)
+            .filter(|(_, r)| r.is_none())
+            .map(|(h, _)| *h)
+            .collect();
+        if missing.is_empty() {
+            return Ok(rows);
+        }
+        let read = self.meta().get_derived_many(TREE_KIND, &missing).await?;
+        if read.len() != missing.len() {
+            return Err(Error::Storage(format!(
+                "get_derived_many answered {} of {} {TREE_KIND} rows",
+                read.len(),
+                missing.len()
+            )));
+        }
+        let mut read = read.into_iter();
+        for (h, slot) in trees.iter().zip(&mut rows) {
+            if slot.is_some() {
+                continue;
+            }
+            *slot = read.next().expect("one row per missing key");
+            if let Some(row) = slot {
+                // A copy, so the entry holds exactly the bytes it counts
+                // even if the store answered with a slice of a larger
+                // buffer.
+                let owned = Bytes::copy_from_slice(row);
+                let size = owned.len() + CACHE_ENTRY_OVERHEAD;
+                self.search_trees.insert_sized(*h, Arc::new(owned), size);
+            }
+        }
+        Ok(rows)
+    }
+
+    /// [`Repo::tree_row`] for a row the store does not hold.
+    async fn tree_row_unstored(&self, root: Hash, c: &Counters) -> Result<Bytes> {
+        let meta = self.meta();
         let memo = |h: &Hash| c.scan.as_ref().and_then(|s| s.get(true, h));
         if let Some(v) = memo(&root) {
             return Ok(v);

@@ -1193,7 +1193,7 @@ apply to the server and to its tools (`verify`, `repair`, `upgrade-index`,
 | Flag / env | Default | What it bounds |
 |---|---|---|
 | `--meta-pool-size` / `LEEP_META_POOL_SIZE` | 16 | Connections this process opens to a Postgres metadata store. SQLite ignores it. |
-| `--derive-cache-bytes` / `LEEP_DERIVE_CACHE_BYTES` | 356515840 (340 MiB) | The in-memory caches of derived indexes: path-history nodes, parts and roots (148 MiB), tree nodes (32 MiB), and the filtered-log caches (160 MiB). The ancestry and skiplist caches are bounded by entries, about 100 MB together by default, and scale by the same factor. |
+| `--derive-cache-bytes` / `LEEP_DERIVE_CACHE_BYTES` | 423624704 (404 MiB) | The in-memory caches of derived indexes: path-history nodes, parts and roots (148 MiB), tree nodes (32 MiB), search's directory filters (64 MiB), and the filtered-log caches (160 MiB). The ancestry and skiplist caches are bounded by entries, about 100 MB together by default, and scale by the same factor. |
 
 `--cache-bytes` (256 MiB) is separate: it caches blobs.
 
@@ -1219,9 +1219,12 @@ apply to the server and to its tools (`verify`, `repair`, `upgrade-index`,
   with `canceling statement due to statement timeout` in the ERROR log; if a
   legitimate one does, raise the flag rather than turning it off.
 - **Derive caches.** Every cache gets its default share of the budget
-  times `budget / 340 MiB`. More helps derivation of very wide histories
+  times `budget / 404 MiB`. More helps derivation of very wide histories
   and filtered logs over long ranges: `history-tree-v4` derivation re-reads
   hot directory nodes, and `log-filter-v1` merge walks reuse fingerprints.
+  Search keeps the `tree-trigrams-v1` rows it reads from the store (64 MiB
+  by default, about 1,000 dense filters), so repeated searches stop moving
+  the upper directories' filters out of the metadata store each time.
   Less suits small containers. A small budget changes no answer, only how
   often rows are read again. RSS also holds the blob cache, request
   buffers and the derivation working set.
@@ -1750,6 +1753,16 @@ on it), `blob-claim-v1`, `blob-condemned-v1`, `blob-rescue-v1`, `blob-doom-v1`, 
 fence, ADR 0012), `history-node-v4` (or `-v3`, `-v2`, `-v1`) on its own, and the ref log. The full table
 with reasons is in ADR 0025. `blame` can be dropped but not rederived: its rows
 are keyed by a hash of (changeset, path) and cannot be listed.
+
+**Restart servers after a repair of the search kinds.** A running server
+keeps the `tree-trigrams-v1` rows its searches read in memory (see
+[Connection pool and caches](#connection-pool-and-caches)). `repair rederive`
+overwrites a damaged row in place and `repair drop --kind tree-trigrams-v1`
+deletes them, but both run in their own process, so a server that cached a
+damaged row before the repair keeps using it until it restarts. Rows are keyed
+by content, so a correct row is never stale; only a damaged one outlives the
+repair this way. After repairing or dropping `tree-trigrams-v1`, restart each
+`leep-server` (a rolling restart is enough).
 
 Everything `repair` changes is derived data. If a repair makes things worse
 (it cannot, short of a bug), `repair drop` of the same kind returns the store

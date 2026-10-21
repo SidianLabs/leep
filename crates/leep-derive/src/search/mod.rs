@@ -308,7 +308,7 @@ impl Opener {
             let tree_keys: Vec<Hash> = dirs.iter().map(|d| d.2).collect();
             let meta = self.repo.meta();
             let (tree_rows, blob_rows) = futures_util::try_join!(
-                many(meta.as_ref(), TREE_KIND, &tree_keys),
+                self.repo.search_tree_rows(&tree_keys),
                 many(meta.as_ref(), BLOB_KIND, &blob_keys),
             )?;
             for (k, row) in wanted.into_iter().zip(blob_rows) {
@@ -318,7 +318,7 @@ impl Opener {
             for (d, row) in dirs.into_iter().zip(tree_rows) {
                 let row = match row {
                     Some(row) => row,
-                    None => self.repo.tree_row(d.2, &self.counters).await?,
+                    None => self.repo.search_tree_row(d.2, &self.counters).await?,
                 };
                 if self.admits(&row)? {
                     kept.push(d);
@@ -414,7 +414,7 @@ impl Walk {
         if let Some((path, tree)) = self.start.take() {
             let o = &self.opener;
             let admitted = !o.indexed || {
-                let row = o.repo.tree_row(tree, &o.counters).await?;
+                let row = o.repo.search_tree_row(tree, &o.counters).await?;
                 o.admits(&row)?
             };
             if admitted {

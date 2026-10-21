@@ -124,6 +124,40 @@ What the numbers say:
   rows, with 16 blob fetches in flight). It is paid once per distinct blob and
   directory, by the first search that needs it or by `leep-server derive-search`.
 
+### Early stop and the directory filter cache
+
+From [research/search-cost.md](research/search-cost.md), fixes 2 and 3.
+Probing a row now stops once the requirement is false, and each `Repo`
+caches the `tree-trigrams-v1` rows its searches read from the store. Same
+bench, indexed cases only, run one after another on the three commits on a
+4-vCPU host that was also running another build (load 4 to 8), so
+differences under about 15% are noise and the absolute numbers are slower
+than the table above:
+
+| Query | `main` | early stop | early stop + cache |
+|---|---|---|---|
+| word in no file | 12.8 ms | 6.9 ms | 5.2 ms |
+| token in 3 files | 12.6 ms | 4.1 ms | 3.7 ms |
+| word of one directory | 22.7 ms | 16.3 ms | 16.0 ms |
+| same, ignore case | 25.1 ms | 21.1 ms | 18.6 ms |
+| regex `word_[a-z]+\(\d+\)` | 30.6 ms | 21.2 ms | 24.3 ms |
+| regex `(word\|quux_needle)` | 24.9 ms | 21.5 ms | 17.0 ms |
+| common word in every file, limit 100 | 13.9 ms | 16.6 ms | 12.0 ms |
+| regex whose trigrams are in every file | 570 ms | 633 ms | 478 ms |
+| regex with no required trigram | 485 ms | 491 ms | 493 ms |
+
+- Early stop helps most where most rows are ruled out: the 3-file token is
+  3x faster and the absent word 2x. Where every row passes, nothing stops
+  early and the times are within noise.
+- In memory stores a cached filter saves only a pointer copy, so the cache
+  barely shows in time here. What it saves is store reads, which the bench
+  prints (index rows read by one search on a handle with cold caches, then
+  by the same search again): absent word 72 then 1, 3-file token 199 then
+  151, word of one directory 339 then 201, the unselective regex 20 522
+  then 20 001. Every search on `main` pays the first number. The rows left
+  are blob rows and the changeset's root tree. On Postgres the filters
+  were 36.6 of the 45 MB a swarm search read.
+
 ## Verify
 
 `leep-server verify` (ADR 0025, `docs/OPERATIONS.md`) over a store of 10 000

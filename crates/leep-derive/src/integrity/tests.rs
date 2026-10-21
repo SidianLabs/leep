@@ -717,7 +717,12 @@ async fn search_rows_are_recomputed_from_blobs_and_trees() {
     let fixed = rederive_kinds(&w, &["tree-trigrams-v1"], false).await;
     assert_eq!(fixed.changed(), 1);
     assert_eq!(row(&w, "tree-trigrams-v1", &root).await, good);
-    assert_eq!(w.repo.search(w.tip(), &q).await.unwrap().matches.len(), 1);
+    // The handle that searched before the repair still holds the damaged
+    // filter in its cache, as a running server would until it restarts
+    // (OPERATIONS.md, "Repair"); a fresh handle sees the repaired row.
+    assert!(w.repo.search(w.tip(), &q).await.unwrap().matches.is_empty());
+    let restarted = Repo::new(w.repo.blobs().clone(), w.repo.meta().clone());
+    assert_eq!(restarted.search(w.tip(), &q).await.unwrap().matches.len(), 1);
     assert_clean(&w).await;
 }
 

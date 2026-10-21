@@ -438,7 +438,14 @@ required trigram and files whose `blob-trigrams-v1` set does, then fetches the
 survivors (16 at a time, order preserved) and runs the matcher on blocking
 threads. A directory's children's rows and surviving nodes are read in batches
 when it is opened, and the subdirectories of the directory the walk is in are
-opened ahead of it, four at a time. Output is ordered
+opened ahead of it, four at a time. Probing a row stops decoding as soon as
+the requirement is false with every value not yet read counted as present
+(the requirement has no negation, so that bound only falls). Each `Repo`
+keeps the encoded `tree-trigrams-v1` rows its searches read from the store
+(64 MiB of the derive cache budget by default), so the upper directories'
+filters, shared by every query and every revision that did not change them,
+are not read again; rows a bounded query computes are never cached, and a
+row repaired by another process is seen after a restart. Output is ordered
 by path then line and is identical with or without the index, which a property
 test checks; the walk is lazy, so a search that has enough matches stops early.
 Limits: 100 matches by default, 1000 at most, 256 MiB of blob content scanned,

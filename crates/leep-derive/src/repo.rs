@@ -101,6 +101,9 @@ pub struct Repo {
     pub(crate) history_roots: Arc<HistoryRootCache>,
     /// Tree nodes viewed for lookups (see `read_tree_view`).
     pub(crate) trees: Arc<TreeCache>,
+    /// Encoded `tree-trigrams-v1` rows read from the store by searches
+    /// (see `Repo::search_tree_rows`).
+    pub(crate) search_trees: Arc<SearchTreeCache>,
     /// Skiplists computed, or read while creating changesets (see
     /// `SkiplistCache`).
     pub(crate) skiplists: Arc<SkiplistCache>,
@@ -354,6 +357,21 @@ pub(crate) struct StagedNodes {
 /// delta chain first. Checked against their hash before they are cached.
 pub(crate) type TreeCache = SizedCache<TreeView, TREE_CACHE_BYTES>;
 
+/// Directory filters (`tree-trigrams-v1` rows) as stored, by tree hash. A
+/// search reads the filter of every directory it opens, and the upper levels
+/// are the same for every query and for every revision that did not change
+/// them, so without this each search moves most of its index bytes from the
+/// store again. Rows are keyed by content and the kind name carries the
+/// encoding's version, so an entry is never stale for a correct row; one
+/// damaged in the store and then repaired by another process stays cached
+/// until this process restarts (OPERATIONS.md, "Repair").
+pub(crate) type SearchTreeCache = SizedCache<Bytes, SEARCH_TREE_CACHE_BYTES>;
+
+/// Bytes [`SearchTreeCache`] may hold: about 1,000 dense 64 KiB filters, or
+/// many more sparse ones, which covers the directories one search over a
+/// Linux-sized tree opens.
+const SEARCH_TREE_CACHE_BYTES: usize = 64 << 20;
+
 /// Content-addressed values by hash, bounded like [`AncestryCache`] but by
 /// bytes: each map holds up to half of the budget, `BUDGET` unless the
 /// `Repo`'s cache budget scales it.
@@ -410,6 +428,43 @@ impl<V, const BUDGET: usize> SizedCache<V, BUDGET> {
             .unwrap()
             .insert(hash, value, 2 * encoded_len, self.budget);
     }
+
+    /// [`SizedCache::insert`] of a value that holds `size` bytes in all, for
+    /// values whose size is known rather than estimated from an encoding.
+    /// A value over half the budget is not kept, so the cache never holds
+    /// more than its budget.
+    pub(crate) fn insert_sized(&self, hash: Hash, value: Arc<V>, size: usize) {
+        if size > self.budget / 2 {
+            return;
+        }
+        self.inner
+            .lock()
+            .unwrap()
+            .insert(hash, value, size, self.budget);
+    }
+
+    /// Bytes the entries hold, as counted when they were inserted.
+    #[cfg(test)]
+    pub(crate) fn held_bytes(&self) -> usize {
+        let m = self.inner.lock().unwrap();
+        m.new.values().chain(m.old.values()).map(|(_, s)| s).sum()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn budget(&self) -> usize {
+        self.budget
+    }
+
+    /// Every entry, with the size it was counted at.
+    #[cfg(test)]
+    pub(crate) fn entries(&self) -> Vec<(Hash, Arc<V>, usize)> {
+        let m = self.inner.lock().unwrap();
+        m.new
+            .iter()
+            .chain(m.old.iter())
+            .map(|(h, (v, s))| (*h, v.clone(), *s))
+            .collect()
+    }
 }
 
 impl<V> SizedMaps<V> {
@@ -425,13 +480,15 @@ impl<V> SizedMaps<V> {
 }
 
 /// Bytes the byte-bounded derive caches of one [`Repo`] hold by default:
-/// path-history nodes, parts, roots and patches, tree nodes, and the
-/// filtered-log caches. See [`Repo::with_cache_budget`].
+/// path-history nodes, parts, roots and patches, tree nodes, search's
+/// directory filters, and the filtered-log caches. See
+/// [`Repo::with_cache_budget`].
 pub const DEFAULT_CACHE_BYTES: usize = HISTORY_CACHE_BYTES
     + HISTORY_RAW_CACHE_BYTES
     + HISTORY_PART_CACHE_BYTES
     + HISTORY_ROOT_CACHE_BYTES
     + TREE_CACHE_BYTES
+    + SEARCH_TREE_CACHE_BYTES
     + crate::derived::LOG_FILTER_CACHE_BYTES;
 
 /// Every cache's default bound times `total / DEFAULT_CACHE_BYTES`, so the
@@ -482,6 +539,7 @@ impl Repo {
             history_parts: Arc::default(),
             history_roots: Arc::default(),
             trees: Arc::default(),
+            search_trees: Arc::default(),
             skiplists: Arc::default(),
             log_filter: Arc::default(),
             derive_locks: Arc::default(),
@@ -570,6 +628,7 @@ impl Repo {
         self.history_parts = Arc::new(SizedCache::scaled(s));
         self.history_roots = Arc::new(SizedCache::scaled(s));
         self.trees = Arc::new(SizedCache::scaled(s));
+        self.search_trees = Arc::new(SizedCache::scaled(s));
         self.skiplists = Arc::new(SkiplistCache::scaled(s));
         self.log_filter = Arc::new(crate::derived::LogFilterCaches::scaled(s));
         self
@@ -1270,11 +1329,12 @@ mod tests {
         ] {
             assert_eq!(d.of(n), n);
         }
-        assert_eq!(DEFAULT_CACHE_BYTES, 340 << 20);
+        assert_eq!(DEFAULT_CACHE_BYTES, 404 << 20);
         let half = CacheScale {
             total: DEFAULT_CACHE_BYTES / 2,
         };
         assert_eq!(half.of(TREE_CACHE_BYTES), TREE_CACHE_BYTES / 2);
+        assert_eq!(half.of(SEARCH_TREE_CACHE_BYTES), 32 << 20);
         assert_eq!(half.of(ANCESTRY_CACHE_ENTRIES), ANCESTRY_CACHE_ENTRIES / 2);
         let huge = CacheScale { total: usize::MAX };
         assert!(huge.of(HISTORY_CACHE_BYTES) > HISTORY_CACHE_BYTES);

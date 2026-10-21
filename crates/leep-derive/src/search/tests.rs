@@ -934,3 +934,95 @@ async fn opening_directories_ahead_keeps_the_answer() {
         assert_eq!(r.search(c, &q).await.unwrap().stats, res.stats);
     }
 }
+
+/// A tree of `dirs` directories `d{i}/s`, each file with its own words, so
+/// every directory has a filter of a few kilobytes.
+async fn wide_tree(r: &Repo, dirs: usize) -> ChangesetId {
+    let files: Vec<(String, Vec<u8>)> = (0..dirs)
+        .map(|d| {
+            let words: String = (0..60)
+                .map(|w| format!("w{}x{} ", d * 977 + w * 31, w))
+                .collect();
+            (
+                format!("d{d}/s/f.txt"),
+                format!("only_in_{d}_here {words}\n").into_bytes(),
+            )
+        })
+        .collect();
+    let refs: Vec<File> = files
+        .iter()
+        .map(|(p, c)| (p.as_str(), Some(c.as_slice())))
+        .collect();
+    commit(r, &[], &refs).await
+}
+
+#[tokio::test]
+async fn repeated_searches_read_directory_filters_from_the_cache() {
+    let r = repo();
+    let c = wide_tree(&r, 20).await;
+    r.derive_search(c).await.unwrap();
+    assert!(
+        r.search_trees.entries().is_empty(),
+        "derivation does not fill it"
+    );
+    let q = SearchQuery::new("only_in_7_here");
+    let first = r.search(c, &q).await.unwrap();
+    assert_eq!(hits(&first), [("d7/s/f.txt".into(), 1)]);
+    assert_eq!(first.stats.dirs_pruned, 19);
+
+    // Root, the 20 `d*` filters (19 of them pruned) and `d7/s`, each the
+    // stored row, counted at its length plus the entry's overhead.
+    let cached = r.search_trees.entries();
+    assert_eq!(cached.len(), 22);
+    let mut total = 0;
+    for (h, row, size) in &cached {
+        let stored = r.meta().get_derived(TREE_KIND, h).await.unwrap().unwrap();
+        assert_eq!(**row, stored);
+        assert_eq!(*size, stored.len() + super::index::CACHE_ENTRY_OVERHEAD);
+        total += size;
+    }
+    assert_eq!(r.search_trees.held_bytes(), total);
+
+    // Replace every stored filter with one that admits nothing: a handle
+    // with its own caches now finds nothing, and this one, whose cache
+    // serves the filters, answers as before without touching them.
+    for (h, ..) in &cached {
+        r.meta()
+            .put_derived(TREE_KIND, h, Bytes::from_static(&[2]))
+            .await
+            .unwrap();
+    }
+    let again = r.search(c, &q).await.unwrap();
+    assert_eq!(again.matches, first.matches);
+    assert_eq!(again.stats, first.stats);
+    let fresh = Repo::new(r.blobs().clone(), r.meta().clone());
+    let res = fresh.search(c, &q).await.unwrap();
+    assert!(res.matches.is_empty() && res.stats.dirs_pruned == 1);
+}
+
+#[tokio::test]
+async fn the_directory_filter_cache_stays_within_its_budget() {
+    let r = repo();
+    let c = wide_tree(&r, 60).await;
+    r.derive_search(c).await.unwrap();
+    let small = Repo::new(r.blobs().clone(), r.meta().clone())
+        .with_cache_budget(crate::DEFAULT_CACHE_BYTES >> 12);
+    let budget = small.search_trees.budget();
+    assert_eq!(budget, 16 << 10);
+    let mut stored = 0;
+    for (_, row) in r.meta().list_derived(TREE_KIND, None, 1000).await.unwrap() {
+        stored += row.len();
+    }
+    assert!(stored > 4 * budget, "{stored} bytes of filters");
+    for round in 0..3 {
+        for d in [3, 59, 0, 31, 17, 44] {
+            let q = SearchQuery::new(format!("only_in_{d}_here"));
+            let got = small.search(c, &q).await.unwrap();
+            assert_eq!(got.matches, r.search(c, &q).await.unwrap().matches);
+            assert_eq!(hits(&got), [(format!("d{d}/s/f.txt"), 1)], "round {round}");
+            let held = small.search_trees.held_bytes();
+            assert!(held <= budget, "{held} > {budget}");
+            assert!(!small.search_trees.entries().is_empty());
+        }
+    }
+}

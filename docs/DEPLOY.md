@@ -418,7 +418,7 @@ a reload is refused.
 | `LEEP_WARM_SEARCH` | `true` | Whether the warmer also derives the code-search index of each ref head. |
 | `LEEP_DERIVE_JOBS` | the cores, up to 8 | Changesets the warmer's catch-up, or a query over un-derived history, derives at once (ADR 0050). Lower it to leave cores for requests while a large import is being indexed. |
 | `LEEP_META_POOL_SIZE` | 16 | Most connections to a Postgres metadata store per process; keep the sum over every server and tool under `max_connections` (OPERATIONS.md, "Connection pool and caches"). |
-| `LEEP_DERIVE_CACHE_BYTES` | 340 MiB | Budget of the in-memory derived-index caches (path history, trees, filtered log); separate from `--cache-bytes`, the blob cache. |
+| `LEEP_DERIVE_CACHE_BYTES` | 404 MiB | Budget of the in-memory derived-index caches (path history, trees, search's directory filters, filtered log); separate from `--cache-bytes`, the blob cache. |
 | `LEEP_READY_TIMEOUT` | `2s` | Bound on each store check behind `GET /v1/ready` (`500ms`, `2s`; not zero). See [Probes](#probes). |
 | `LEEP_METRICS_LISTEN` | off | Address for a separate, unauthenticated `GET /metrics` listener; keep it private. See [OPERATIONS.md](OPERATIONS.md). |
 | `LEEP_LOG_FORMAT` | `text` | `text` or `json` (one object per line). |

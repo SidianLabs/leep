@@ -66,8 +66,9 @@ struct Args {
     )]
     meta_pool_size: u32,
     /// Bytes the in-memory caches of derived indexes (path history, trees,
-    /// filtered log) may hold; the ancestry and skiplist caches scale with
-    /// it. Separate from --cache-bytes, which caches blobs.
+    /// search's directory filters, filtered log) may hold; the ancestry and
+    /// skiplist caches scale with it. Separate from --cache-bytes, which
+    /// caches blobs.
     #[arg(
         long,
         global = true,
