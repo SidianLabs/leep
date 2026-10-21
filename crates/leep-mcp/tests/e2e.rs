@@ -1018,3 +1018,231 @@ fn request_id_lands_once_across_mcp_restarts() {
     assert_eq!(elsewhere["status"], "landed");
     assert!(elsewhere.get("from_record").is_none());
 }
+
+/// Bytes of the `tools/call` request an agent sends for `args`.
+fn request_bytes(name: &str, args: &Value) -> usize {
+    json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": name, "arguments": args } })
+    .to_string()
+    .len()
+}
+
+/// A conflict on one file of a 20-file change is finished by sending that
+/// one file: the clean 19 come from the server's `clean` map, kept by the
+/// MCP server. Compares the bytes the agent sends with the old way (every
+/// file again).
+#[test]
+fn resolve_and_land_sends_only_the_conflicting_files() {
+    let url = start_server();
+    let s = Server::new(config(&url));
+    // 20 files of 60 lines, about 2.4 KB each.
+    let file = |i: usize, tag: &str| -> String {
+        (0..60)
+            .map(|l| format!("{tag} file {i:02} line {l:02}: some code here\n"))
+            .collect()
+    };
+    let path = |i: usize| format!("src/f{i:02}.rs");
+    let base_changes: Vec<Value> = (0..20)
+        .map(|i| json!({ "path": path(i), "content": file(i, "base") }))
+        .collect();
+    let base = data(&commit(
+        &s,
+        json!({ "message": "base", "changes": base_changes }),
+    ))["landed"]
+        .clone();
+
+    // Another agent edits the first line of f00 and the last line of f01.
+    let mut theirs01 = file(1, "base");
+    theirs01 = theirs01.replace(
+        "base file 01 line 59: some code here",
+        "base file 01 line 59: edited by A",
+    );
+    let a = data(&commit(
+        &s,
+        json!({ "base": base, "message": "a", "changes": [
+            { "path": path(0), "content": file(0, "base").replacen("base", "A", 1) },
+            { "path": path(1), "content": theirs01 } ] }),
+    ));
+    let head = a["landed"].as_str().unwrap().to_string();
+
+    // This agent rewrites the first line of all 20 files from `base`.
+    let ours = |i: usize| file(i, "base").replacen("base", "B", 1);
+    let changes: Vec<Value> = (0..20)
+        .map(|i| json!({ "path": path(i), "content": ours(i) }))
+        .collect();
+    let r = commit(
+        &s,
+        json!({ "base": base, "message": "rename things", "changes": changes,
+                "request_id": "req-20", "prompt": "rename" }),
+    );
+    assert_eq!(r["isError"], true);
+    let v = r["structuredContent"].clone();
+    assert_eq!(v["status"], "conflict");
+    assert_eq!(v["conflicts"].as_array().unwrap().len(), 1);
+    assert_eq!(v["clean_paths"].as_array().unwrap().len(), 19);
+    let conflict_id = v["conflict_id"].as_str().unwrap().to_string();
+    assert!(v["guidance"].as_str().unwrap().contains(&conflict_id));
+    let resolved = file(0, "base").replacen("base", "A+B", 1);
+
+    // Old way: every file again, on the new head.
+    let old_args = json!({
+        "base": head, "message": "rename things", "request_id": "req-20", "prompt": "rename",
+        "changes": (0..20).map(|i| json!({
+            "path": path(i),
+            "content": if i == 0 { resolved.clone() } else if i == 1 {
+                // The agent must merge A's edit itself, too.
+                ours(1).replace("base file 01 line 59: some code here", "base file 01 line 59: edited by A")
+            } else { ours(i) },
+        })).collect::<Vec<_>>(),
+    });
+    let new_args = json!({
+        "conflict_id": conflict_id,
+        "resolutions": [{ "path": path(0), "content": resolved }],
+    });
+    let (old_bytes, new_bytes) = (
+        request_bytes("leep_commit_and_land", &old_args),
+        request_bytes("leep_resolve_and_land", &new_args),
+    );
+    eprintln!(
+        "conflict retry, 20 files / 1 conflicting: leep_commit_and_land {old_bytes} bytes, \
+         leep_resolve_and_land {new_bytes} bytes ({:.1}x less)",
+        old_bytes as f64 / new_bytes as f64
+    );
+    assert!(new_bytes * 10 < old_bytes, "{old_bytes} vs {new_bytes}");
+
+    // Missing a conflicting path: refused, nothing landed.
+    let r = call(
+        &s,
+        "leep_resolve_and_land",
+        json!({ "conflict_id": conflict_id, "resolutions": [{ "path": path(5), "content": "x\n" }] }),
+    );
+    assert_eq!(r["isError"], true);
+    assert!(text(&r).contains("src/f00.rs"), "{}", text(&r));
+    // Another MCP process does not know the conflict: it says what to do.
+    let r = call(
+        &Server::new(config(&url)),
+        "leep_resolve_and_land",
+        new_args.clone(),
+    );
+    assert_eq!(r["isError"], true);
+    assert!(
+        text(&r).contains("leep_commit_and_land") && text(&r).contains("ALL files"),
+        "{}",
+        text(&r)
+    );
+
+    let landed = data(&call(&s, "leep_resolve_and_land", new_args.clone()));
+    assert_eq!(landed["status"], "landed");
+    assert_eq!(landed["rebased"], false);
+    assert_eq!(landed["files_changed"], 20);
+    let read = |p: &str| text(&call(&s, "leep_read_file", json!({ "path": p })));
+    assert_eq!(
+        read("src/f00.rs"),
+        file(0, "base").replacen("base", "A+B", 1)
+    );
+    // f01 merged cleanly on the server: both edits.
+    let f01 = read("src/f01.rs");
+    assert!(
+        f01.starts_with("B file 01 line 00") && f01.contains("line 59: edited by A"),
+        "{f01}"
+    );
+    for i in 2..20 {
+        assert_eq!(read(&path(i)), ours(i));
+    }
+    let show = data(&call(&s, "leep_show", json!({ "rev": "main" })));
+    assert_eq!(show["message"], "rename things");
+    assert_eq!(show["parents"], json!([head]));
+    assert_eq!(show["agent"]["request_id"], "req-20");
+    assert_eq!(show["agent"]["prompt"], "rename");
+
+    // Resolved and landed: forgotten here. A retry of the request from any
+    // process is answered from the record.
+    let again = call(&s, "leep_resolve_and_land", new_args);
+    assert_eq!(again["isError"], true);
+    // (Within the same second the rebuilt changeset is the same one, so
+    // `from_record` is not asserted.)
+    let retry = data(&commit(&Server::new(config(&url)), old_args));
+    assert_eq!(retry["changeset"], landed["changeset"]);
+    assert_eq!(retry["landed"], landed["landed"]);
+    let refs = data(&call(&s, "leep_refs", json!({})));
+    assert_eq!(refs["refs"]["main"], landed["landed"]);
+}
+
+/// `onto` finds the remembered conflict too, and a resolution that conflicts
+/// again (the ref moved on) reports a new conflict to resolve.
+#[test]
+fn resolve_and_land_by_onto_and_conflicting_again() {
+    let s = Server::new(config(&start_server()));
+    let base = data(&commit(
+        &s,
+        json!({ "message": "base", "changes": [{ "path": "a.txt", "content": "1\n" },
+                                               { "path": "run.sh", "content": "#!/bin/sh\n", "executable": true }] }),
+    ))["landed"]
+        .clone();
+    let head1 = data(&commit(
+        &s,
+        json!({ "base": base, "message": "x", "changes": [{ "path": "a.txt", "content": "x\n" }] }),
+    ))["landed"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // No request_id: the resolution is still landed at most once.
+    let r = commit(
+        &s,
+        json!({ "base": base, "message": "y", "changes": [
+            { "path": "a.txt", "content": "y\n" },
+            { "path": "run.sh", "content": "#!/bin/sh\necho\n" } ] }),
+    );
+    assert_eq!(r["structuredContent"]["status"], "conflict");
+    let first_id = r["structuredContent"]["conflict_id"].clone();
+
+    // The ref moves again before the agent answers.
+    let head2 = data(&commit(
+        &s,
+        json!({ "message": "z", "changes": [{ "path": "a.txt", "content": "z\n" }] }),
+    ))["landed"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let again = call(
+        &s,
+        "leep_resolve_and_land",
+        json!({ "onto": &head1[..10], "resolutions": [{ "path": "a.txt", "content": "xy\n" }] }),
+    );
+    let v = &again["structuredContent"];
+    assert_eq!(v["status"], "conflict", "{}", text(&again));
+    assert_eq!(v["onto"], head2);
+    assert_ne!(v["conflict_id"], first_id);
+    // The first conflict was replaced.
+    let stale = call(
+        &s,
+        "leep_resolve_and_land",
+        json!({ "conflict_id": first_id, "resolutions": [{ "path": "a.txt", "content": "xy\n" }] }),
+    );
+    assert_eq!(stale["isError"], true);
+
+    let done = data(&call(
+        &s,
+        "leep_resolve_and_land",
+        json!({ "conflict_id": v["conflict_id"], "resolutions": [{ "path": "a.txt", "content": "xyz\n" }],
+                "message": "y, resolved" }),
+    ));
+    assert_eq!(done["status"], "landed");
+    let files = data(&call(&s, "leep_list_files", json!({})));
+    let run = files["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["path"] == "run.sh")
+        .unwrap()
+        .clone();
+    assert_eq!(run["kind"], "executable", "the clean change keeps +x");
+    assert_eq!(
+        text(&call(&s, "leep_read_file", json!({ "path": "a.txt" }))),
+        "xyz\n"
+    );
+    assert_eq!(
+        data(&call(&s, "leep_show", json!({ "rev": "main" })))["message"],
+        "y, resolved"
+    );
+}

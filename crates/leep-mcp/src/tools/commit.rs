@@ -15,6 +15,7 @@ use leep_core::{Changeset, ChangesetId, FileChange, FileKind, Hash, LandId, Repo
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use super::resolve::conflict_request;
 use super::{as_text, parse_args, truncate, ToolError, ToolOutput, ToolResult, DEFAULT_REF};
 use crate::Server;
 
@@ -62,19 +63,56 @@ struct Args {
     request_id: Option<String>,
 }
 
-fn non_empty(s: Option<&str>) -> Option<&str> {
+pub(super) fn non_empty(s: Option<&str>) -> Option<&str> {
     s.map(str::trim).filter(|s| !s.is_empty())
 }
 
 #[derive(Deserialize)]
-struct Edit {
-    path: String,
+pub(super) struct Edit {
+    pub path: String,
     content: Option<String>,
     #[serde(default)]
     delete: bool,
     /// `None` keeps the file's existing kind (executable bit, symlink), so an
     /// agent editing a script doesn't silently strip `+x`.
-    executable: Option<bool>,
+    pub executable: Option<bool>,
+}
+
+impl Edit {
+    /// The change this edit makes, its content added to `blobs`. Without
+    /// `executable` the kind is `Regular`, for the caller to replace with the
+    /// file's existing kind.
+    pub(super) fn change(
+        &self,
+        blobs: &mut BTreeMap<Hash, Vec<u8>>,
+    ) -> Result<FileChange, ToolError> {
+        match (&self.content, self.delete) {
+            (Some(_), true) => Err(ToolError(format!(
+                "{}: give either content or delete:true, not both",
+                self.path
+            ))),
+            (None, false) => Err(ToolError(format!(
+                "{}: give content (new file text) or delete:true",
+                self.path
+            ))),
+            (None, true) => Ok(FileChange::Delete),
+            (Some(text), false) => {
+                let data = text.as_bytes().to_vec();
+                let hash = Hash::of_blob(&data);
+                let size = data.len() as u64;
+                blobs.insert(hash, data);
+                let kind = match self.executable {
+                    Some(true) => FileKind::Executable,
+                    _ => FileKind::Regular,
+                };
+                Ok(FileChange::Modify {
+                    content: hash,
+                    kind,
+                    size,
+                })
+            }
+        }
+    }
 }
 
 impl Server {
@@ -123,40 +161,10 @@ impl Server {
         for e in &a.changes {
             let path = RepoPath::new(e.path.as_str())
                 .map_err(|err| ToolError(format!("bad path `{}`: {err}", e.path)))?;
-            let change = match (&e.content, e.delete) {
-                (Some(_), true) => {
-                    return Err(ToolError(format!(
-                        "{}: give either content or delete:true, not both",
-                        e.path
-                    )))
-                }
-                (None, false) => {
-                    return Err(ToolError(format!(
-                        "{}: give content (new file text) or delete:true",
-                        e.path
-                    )))
-                }
-                (None, true) => FileChange::Delete,
-                (Some(text), false) => {
-                    let data = text.as_bytes().to_vec();
-                    let hash = Hash::of_blob(&data);
-                    let size = data.len() as u64;
-                    blobs.insert(hash, data);
-                    let kind = match e.executable {
-                        Some(true) => FileKind::Executable,
-                        Some(false) => FileKind::Regular,
-                        None => {
-                            inherit_kind.push(path.clone());
-                            FileKind::Regular
-                        }
-                    };
-                    FileChange::Modify {
-                        content: hash,
-                        kind,
-                        size,
-                    }
-                }
-            };
+            let change = e.change(&mut blobs)?;
+            if e.executable.is_none() && matches!(change, FileChange::Modify { .. }) {
+                inherit_kind.push(path.clone());
+            }
             if changes.insert(path, change).is_some() {
                 return Err(ToolError(format!("{}: listed more than once", e.path)));
             }
@@ -174,17 +182,7 @@ impl Server {
                 }
             }
         }
-        let hashes: Vec<Hash> = blobs.keys().copied().collect();
-        let missing: BTreeSet<Hash> = if hashes.is_empty() {
-            BTreeSet::new()
-        } else {
-            self.client.missing_blobs(hashes)?.into_iter().collect()
-        };
-        for (hash, data) in blobs {
-            if missing.contains(&hash) {
-                self.client.put_blob(&hash, data)?;
-            }
-        }
+        self.upload(blobs)?;
 
         let mut extra = BTreeMap::new();
         for (k, arg, default) in [
@@ -232,6 +230,21 @@ impl Server {
         )
     }
 
+    /// Upload the blobs the server lacks.
+    pub(super) fn upload(&self, blobs: BTreeMap<Hash, Vec<u8>>) -> Result<(), ToolError> {
+        let hashes: Vec<Hash> = blobs.keys().copied().collect();
+        if hashes.is_empty() {
+            return Ok(());
+        }
+        let missing: BTreeSet<Hash> = self.client.missing_blobs(hashes)?.into_iter().collect();
+        for (hash, data) in blobs {
+            if missing.contains(&hash) {
+                self.client.put_blob(&hash, data)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Land a changeset that already exists. Safe to repeat: one already on
     /// the ref, or landed there as a rebased copy, is reported as landed
     /// rather than added again.
@@ -246,9 +259,10 @@ impl Server {
         self.land_and_report(id, target_ref, create, files, request_id)
     }
 
-    /// Land `created` and report the outcome. A conflict forgets
-    /// `request_id`, since the retry that resolves it carries new content.
-    fn land_and_report(
+    /// Land `created` and report the outcome. A conflict forgets the
+    /// changeset made for `request_id`, since the retry that resolves it
+    /// carries new content, and is remembered for `leep_resolve_and_land`.
+    pub(super) fn land_and_report(
         &self,
         created: ChangesetId,
         target_ref: &str,
@@ -313,13 +327,19 @@ impl Server {
                 if let Some(r) = request_id {
                     self.requests.lock().unwrap().remove(r);
                 }
-                self.conflict_report(target_ref, created, onto, &conflicts, &clean)
+                let request = request_id
+                    .map(str::to_string)
+                    .unwrap_or_else(|| conflict_request(&created, &onto));
+                let id = self.remember_conflict(
+                    target_ref, created, onto, &conflicts, &clean, &request, create,
+                );
+                self.conflict_report(target_ref, created, onto, &id, &conflicts, &clean)
             }
         }
     }
 
     /// Kind of `path` at `parent`, if the file exists there.
-    fn existing_kind(
+    pub(super) fn existing_kind(
         &self,
         parent: Option<ChangesetId>,
         path: &RepoPath,
@@ -458,6 +478,7 @@ impl Server {
         target_ref: &str,
         created: ChangesetId,
         onto: ChangesetId,
+        conflict_id: &str,
         conflicts: &[Conflict],
         clean: &BTreeMap<RepoPath, FileChange>,
     ) -> ToolResult {
@@ -483,13 +504,17 @@ impl Server {
         let guidance = format!(
             "Nothing was landed: {target_ref} is unchanged. `ours` is what {target_ref} now has \
              (at {onto}), `theirs` is your change, `base` is the common ancestor. Decide the \
-             correct final content for each conflicting path, then call leep_commit_and_land again \
-             with base set to {onto} and include ALL files you meant to change: the resolved \
-             content for the conflicting paths, and your original content (or delete:true) for the \
-             clean paths listed in `clean_paths`."
+             correct final content for each conflicting path, then call leep_resolve_and_land \
+             with conflict_id \"{conflict_id}\" and `resolutions` holding ONLY the conflicting \
+             paths (full resolved content, or delete:true). Your changes to the paths in \
+             `clean_paths` are kept for you; do not resend them. If leep_resolve_and_land says \
+             the conflict is not remembered (the MCP server restarted), call \
+             leep_commit_and_land again with base set to {onto} and ALL files you meant to \
+             change, keeping {target_ref}'s edits to any of them."
         );
         let v = json!({
             "status": "conflict",
+            "conflict_id": conflict_id,
             "target_ref": target_ref,
             "onto": onto.to_string(),
             "changeset": created.to_string(),

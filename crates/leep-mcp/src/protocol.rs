@@ -21,8 +21,8 @@ const INSTRUCTIONS: &str = "Leep is a server-centric version control system. Rea
 (leep_refs, leep_log, leep_show, leep_list_files, leep_read_file, leep_diff, leep_blame, \
 leep_review_status) take an optional rev: a ref name (default `main`) or a full 64-hex changeset id. There is no working copy: \
 leep_commit_and_land sends complete file contents, creates one changeset and lands it. If it \
-reports conflicts, nothing landed; retry with base set to the reported `onto` id and resolved \
-content for every file you changed.";
+reports conflicts, nothing landed; call leep_resolve_and_land with the report's conflict_id and \
+resolved content for the conflicting paths only.";
 
 pub struct Server {
     pub(crate) client: Client,
@@ -35,6 +35,8 @@ pub struct Server {
     /// answer, so the call that finishes it reuses the id and the server
     /// answers with the earlier result instead of landing twice (ADR 0057).
     pub(crate) pending_lands: Mutex<HashMap<(ChangesetId, String), LandId>>,
+    /// Conflict reports `leep_resolve_and_land` can still finish.
+    pub(crate) conflicts: Mutex<tools::Conflicts>,
 }
 
 impl Server {
@@ -45,6 +47,7 @@ impl Server {
             cfg,
             requests: Mutex::default(),
             pending_lands: Mutex::default(),
+            conflicts: Mutex::default(),
         }
     }
 

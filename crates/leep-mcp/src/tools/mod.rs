@@ -4,8 +4,10 @@
 
 mod commit;
 mod read;
+mod resolve;
 
 pub use commit::request_land_id;
+pub(crate) use resolve::Conflicts;
 
 use leep_cli::error::{CliError, ErrorKind};
 use leep_core::prefix::looks_like_prefix;
@@ -190,6 +192,7 @@ impl Server {
             "leep_search" => self.search(args),
             "leep_review_status" => self.review_status(args),
             "leep_commit_and_land" => self.commit_and_land(args),
+            "leep_resolve_and_land" => self.resolve_and_land(args),
             _ => return None,
         })
     }
@@ -389,9 +392,8 @@ pub fn definitions() -> Vec<Value> {
              (recording agent provenance) and lands it on target_ref. `base` is the revision you \
              read the files from (default: current head of target_ref); if the ref has moved, \
              non-overlapping changes are merged automatically. On conflict NOTHING is landed and the \
-             result lists each conflicting path with base/ours/theirs text; resolve them and call \
-             again with base set to the reported `onto` id, including all your changes (clean \
-             paths too). Landing onto a ref that does not exist needs create_ref:true. Text \
+             result lists each conflicting path with base/ours/theirs text and a `conflict_id`; \
+             finish it with leep_resolve_and_land, sending only the conflicting files. Landing onto a ref that does not exist needs create_ref:true. Text \
              files only. If a call fails without an answer (timeout, lost connection), it may \
              have landed: call again with `changeset` set to the id the error names, or with \
              the same `request_id`; that never lands the change twice.",
@@ -426,6 +428,47 @@ pub fn definitions() -> Vec<Value> {
                 // `message` and `changes` are required unless `changeset` is
                 // given. Not expressed with a top-level `anyOf`, which some
                 // model APIs refuse in a tool schema; the tool checks it.
+                "additionalProperties": false
+            }),
+            false,
+        ),
+        tool(
+            "leep_resolve_and_land",
+            "Resolve a conflict and land",
+            "Finish a leep_commit_and_land (or leep_resolve_and_land) that reported conflicts, \
+             sending only the conflicting files. Give the report's `conflict_id` and, for EVERY \
+             conflicting path, its full resolved content or delete:true. The clean part of your \
+             change is kept by the MCP server, so do not resend it; you may add other paths to \
+             change them too. Lands one new changeset on the reported `onto` with your original \
+             message and provenance, under the same request_id, so a retry lands at most once. \
+             The result is like leep_commit_and_land's: landed, or a new conflict report with a \
+             new conflict_id if the ref moved again. If the conflict is not remembered (the MCP \
+             server restarted), call leep_commit_and_land again with base set to `onto` and ALL \
+             files you meant to change.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "conflict_id": { "type": "string", "description": "The `conflict_id` of the conflict report." },
+                    "onto": { "type": "string", "description": "Instead of conflict_id: the report's `onto` id (or a unique prefix), when only one remembered conflict is onto it." },
+                    "resolutions": {
+                        "type": "array",
+                        "description": "One entry per conflicting path (required), plus any other path you want to change.",
+                        "minItems": 1,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": { "type": "string", "description": "Repo-relative file path." },
+                                "content": { "type": "string", "description": "Entire resolved file content (UTF-8 text)." },
+                                "delete": { "type": "boolean", "description": "Delete the file instead." },
+                                "executable": { "type": "boolean", "description": "Set the executable bit. Omit to keep your side's kind." }
+                            },
+                            "required": ["path"],
+                            "additionalProperties": false
+                        }
+                    },
+                    "message": { "type": "string", "description": "Commit message; default: the conflicted change's message." }
+                },
+                "required": ["resolutions"],
                 "additionalProperties": false
             }),
             false,

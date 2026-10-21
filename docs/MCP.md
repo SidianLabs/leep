@@ -59,6 +59,7 @@ Logs go to stderr; stdout carries protocol messages only.
 | `leep_search` | `query`, `rev?`, `regex?`, `case_insensitive?`, `path?`, `glob?`, `limit?` (default 50, max 200), `cursor?` | matching lines `{path, line_number, line, ranges}` ordered by path then line, `truncated`, `stats`, and `next` when the page stopped early (pass it back as `cursor`, with `rev` set to the result's `rev`); per line, UTF-8 text files up to 1 MiB (others counted in `stats.files_skipped`) |
 | `leep_review_status` | `rev`, `ref?` (default `main`) | per changed path: the rule that satisfies it (`auto:*`, `owner`, `merge_parent`) or `pending` / `rejected`, with owners and who approved or rejected, plus `approved`, `blocked_paths` and `next_step`; needs a server with authentication |
 | `leep_commit_and_land` | `message`, `changes[]`, `base?`, `target_ref?`, `create_ref?`, `prompt?`, `tests?`, `request_id?`; or `changeset` alone | landed id, or a conflict report |
+| `leep_resolve_and_land` | `conflict_id` (or `onto`), `resolutions[]` (`{path, content}` or `{path, delete: true}`, `executable?`), `message?` | finishes a conflict report sending only the conflicting files; same result shape as `leep_commit_and_land` |
 
 Data tools return JSON as text and as `structuredContent`; file and diff
 tools return plain text. Failures (bad arguments, 401, 403, 404, unreachable
@@ -125,7 +126,8 @@ happened, however many lands came between, and whether or not the MCP server
 restarted in between (a new process makes a fresh changeset, the server
 refuses its id as already landed, and the tool answers with the recorded land
 instead). Such an answer carries `from_record: true` and the original
-`changeset`. Within one process the tool also remembers the changeset a
+`changeset` (unless the new changeset came out identical to the original,
+which then simply lands nothing new). Within one process the tool also remembers the changeset a
 `request_id` made and lands that one again without building another.
 
 - The guarantee is per `target_ref`: the same `request_id` on another ref is
@@ -148,13 +150,40 @@ it without the flag, as `leep land` does.
 On overlapping edits nothing lands, `main` is unchanged, and the result
 (`isError: true`, `status: "conflict"`) contains:
 
+- `conflict_id`: names this conflict for `leep_resolve_and_land`;
 - `onto`: the current head the change must be based on;
 - `conflicts[]`: `path`, `base`, `ours` (what `main` has), `theirs` (the
   agent's version) as text, and `merged_with_markers` when available;
 - `clean_paths`: paths that merged cleanly;
 - `guidance`.
 
-The agent resolves each conflict itself, then calls the tool again with
-`base` set to `onto` and the resolved content for the conflicting paths plus
-its original changes for every other file. Leep never resolves conflicts for
-you.
+The agent resolves each conflict itself and calls `leep_resolve_and_land`
+with the `conflict_id` and `resolutions`: the full resolved content (or
+`delete: true`) of every conflicting path, and nothing else. The MCP server
+remembers the rest from the conflict: the server's `clean` changes, relative
+to `onto`, for every path that merged cleanly (including paths both sides
+changed in different places, whose merged text keeps the other side's
+edits). It builds one changeset on `onto` from those plus the resolutions,
+with the conflicted change's message (or `message`) and `agent.*`
+provenance, and lands it under the same `request_id`, so a retried
+resolution lands at most once (without a `request_id`, the conflict itself
+names the land). A resolution may also list other paths to change them. If
+the ref moved again and the resolution conflicts, the result is a new
+conflict report with a new `conflict_id`. `onto` instead of `conflict_id`
+picks the one remembered conflict onto that id.
+
+Conflicts are remembered in the MCP server process only (the last 64, one
+per request). If it restarted, `leep_resolve_and_land` fails with an error
+saying so and nothing lands: call `leep_commit_and_land` again with `base`
+set to `onto` and every file the change touches, the resolved content for
+the conflicting paths and the clean paths' content as they should end up,
+keeping the `request_id`.
+
+For a 20-file change (files of about 2.4 KB) with one conflicting file, the
+agent's second call is 2,465 bytes with `leep_resolve_and_land` against
+46,492 bytes resending every file to `leep_commit_and_land` (test
+`resolve_and_land_sends_only_the_conflicting_files`). Resending also risks
+undoing the other side's edits to a path that merged cleanly, if the agent
+sends its own version of it.
+
+Leep never resolves conflicts for you.

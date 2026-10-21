@@ -16,6 +16,18 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   reusing a `request_id` for different changes is reported as
   `status: "already_landed"` with `differing_paths` and lands nothing.
 
+### MCP: resolve a conflict by sending only the conflicting files
+- New tool `leep_resolve_and_land {conflict_id | onto, resolutions[], message?}`:
+  after `leep_commit_and_land` reports conflicts (now with a `conflict_id`),
+  the agent sends only the resolved content of the conflicting paths; the MCP
+  server rebuilds the changeset on `onto` from the conflict's clean changes
+  plus the resolutions and lands it under the same request id. For one
+  conflicting file in a 20-file change the agent sends about 2.5 KB instead
+  of 46 KB. Conflicts are remembered per MCP process; after a restart the
+  tool says to call `leep_commit_and_land` with every file, as before.
+- The conflict guidance now points to `leep_resolve_and_land` instead of
+  asking for every file again.
+
 ### Request ids
 - The server accepts a client's `X-Request-Id` (1 to 128 characters of
   `A-Z a-z 0-9 . _ : / -`; anything else is replaced) or makes one, answers

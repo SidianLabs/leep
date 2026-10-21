@@ -46,7 +46,7 @@ fn binary_speaks_mcp_over_stdio() {
     send(json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }));
 
     let list = send(json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" })).unwrap();
-    assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 10);
+    assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 11);
 
     let r = send(json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
         "name": "leep_commit_and_land",
