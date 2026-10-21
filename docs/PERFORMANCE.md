@@ -842,10 +842,14 @@ s, diff 0.13–0.28 s, log 0.4–0.8 s, create 0.19–0.28 s, upload 0.08–0.12
 Search almost never finished: 2 to 30 searches per run answered (p50 22–29
 s) against 328 to 1,301 timeouts. Logs timed out 0 to 1,569 times per run.
 
-- **Reads saturate the server first.** Search over Linux's ~90k files on a
-  head whose search index is not warm derives it inline; at two cores that
-  takes the CPU the lands need, and lands queue behind it (2,000 agents:
-  land p50 56 s, 6,126 to 7,280 lands timed out at 30 s and were resent).
+- **Reads saturate the server first.** Search over Linux's ~90k files takes
+  the CPU the lands need at two cores, and lands queue behind it (2,000
+  agents: land p50 56 s, 6,126 to 7,280 lands timed out at 30 s and were
+  resent). This bullet first blamed the search index being derived inline
+  on heads that were not warm. Measurement corrected that: in "Indexing
+  split on one host (E1b)" no query derived anything inline, because
+  Linux's search index was already warm, and the cost is running the
+  search itself, about 20 to 30 s per search.
 - **Index lag is the second cause.** The warmer runs every 30 s and the
   path-history index trailed the head by about 900 to 1,500 generations, so
   path logs and blames derived on the request path. Both are what ADR 0058
@@ -876,10 +880,165 @@ every 250 ms instead of every 30 s; everything else unchanged.
   throughput limit, not a polling delay.
 - Throughput, land latency and timeouts are unchanged within noise; search
   still times out hundreds of times per run.
-- What helps is taking derivation off the request path entirely (ADR 0058
-  phase 1: one indexer per kind, queries that answer from what is indexed
-  instead of deriving inline), so reads stop competing with the indexer
-  for the same cores, and running the indexer on its own host.
+- What helps the lag is taking derivation off the request path entirely
+  (ADR 0058 phase 1: one indexer per kind, queries that answer from what is
+  indexed instead of deriving inline), so reads stop competing with the
+  indexer for the same cores, and running the indexer on its own host. It
+  does not help land throughput on this host: E1 and E1b below found that
+  search execution, not derivation, is what takes the cores from the lands.
+
+#### Land leader on its own runtime (E1)
+
+Does giving the land leader CPU of its own recover land throughput under
+read load? An experiment build (branch `soak/e1-leader-runtime`, `d9f2366`,
+not merged) can run every per-ref land leader on a dedicated tokio runtime
+of two worker threads (`LEEP_EXP_LEADER_RUNTIME=1`), so batches never share
+workers with request handlers. Arms: **shared** (the normal server) and
+**own** (the leader's runtime), each with the generator's default read mix
+(**reads**) and with search left out of it (**no search**). Same two-core
+VPS and Linux store (about 1.48 million changesets) as above, one test
+server with `--indexing local`, a fresh server and a fresh ref at Linux's
+`master` per run, 2 s think time, 120 s measured after a 30 s ramp, three
+rounds with the arm order rotated. First, the ceiling without reads:
+`leep-land-bench` on one ref.
+
+Medians of three rounds (range):
+
+| Bench, agents | Shared lands/s | Own runtime lands/s |
+|---|---|---|
+| `leep-land-bench`, 64 | 75.6 (65.6–76.6) | 70.4 (60.9–76.8) |
+| `leep-land-bench`, 256 | 60.8 (54.4–67.2) | 60.9 (60.8–64.0) |
+
+| Swarm, agents | Runtime | Lands/s, reads | Land p50, reads | Lands/s, no search | Land p50, no search |
+|---|---|---|---|---|---|
+| 500 | shared | 3.1 (2.4–3.6) | 57.6 s (54.8–57.7) | 30.4 (29.5–31.0) | 3.9 s (3.7–4.0) |
+| 500 | own | 3.8 (3.3–4.3) | 66.0 s (56.4–72.3) | 28.2 (27.7–28.7) | 5.3 s (4.6–5.3) |
+| 2,000 | shared | 1.6 (1.5–2.9) | 79.1 s (74.5–90.3) | 18.8 (17.8–19.0) | 28.2 s (28.1–29.9) |
+| 2,000 | own | 2.1 (1.6–2.8) | 79.6 s (76.0–110.7) | 16.0, 18.4 ¹ | 27.6, 30.0 s ¹ |
+
+¹ Two rounds; the third did not complete.
+
+- **The leader's own runtime does not help.** Without reads the two arms
+  land 61 to 77 lands/s at 64 agents, and their ranges overlap at both
+  agent counts. In the swarm with reads the arms' ranges overlap too, and
+  without search the own runtime is slightly lower. Tokio scheduling is not what
+  starves the leader: two cores are, and a second runtime adds threads,
+  not cores.
+- **Leaving search out multiplies lands/s by about ten** (7 to 12 times,
+  by arm and agent count), and land p50 falls from about a minute to 4 to
+  5 s at 500 agents. Search is what takes the CPU from the lands here.
+- **Even without search the swarm is far below the bench's ceiling** (16
+  to 31 lands/s against 61 to 77): the other reads (log, blame, files,
+  diff, sync) still share the two cores.
+- **No double or lost lands in any run.**
+
+#### Indexing split on one host (E1b)
+
+E1's reads arm ran with `--indexing local`, in which a query may derive a
+missing index row inline. Was the cost derivation, which ADR 0058's split
+moves off the request path? Build `c3dd3a8` (same branch), search on, same
+host and settings as E1 with the leader on the shared runtime. **Local**:
+one server, `--indexing local`. **Split**: agents talk to a query server in
+`--indexing off` and send `stale-ok`; an indexer in `--indexing lease` runs
+beside it on the same host. Three rounds per arm.
+
+| Agents | Local lands/s | Split lands/s |
+|---|---|---|
+| 500 | 1.8 (1.5–2.4) | 1.5 (1.2–3.2) |
+| 2,000 | 2.6 (2.2–2.6) | 2.2 (2.1–2.6) |
+
+- **Inline derivations were 0 in every run, local ones included.** Linux's
+  search index was already warm, so nothing was left to derive: the cost
+  is executing the search, about 20 to 30 s per search over ~90k files,
+  not deriving its index. The earlier reading in "On all of Linux (VPS)",
+  that search derived the index inline, was wrong; measurement corrected
+  it.
+- **The split cannot help on one two-core host,** and did not: the arms
+  are within each other's spread. It moves indexing to another process,
+  and here there is no idle core for that process to use. Its benefit is
+  for multi-host deployments, where the indexer and the query servers have
+  CPUs of their own.
+
+#### Conflicts per land (E3)
+
+Lands under realistic conflict pressure. The generator (same branch) makes
+each change on the head it saw a uniform 0 to 2 minutes earlier (an agent
+that synced, worked for minutes, then landed), writes 8 hot files at 2% or
+10% of its writes, and after a conflict resolves onto the conflicting head
+and lands again, up to 5 times. Leader on its own runtime, search reads on,
+`--indexing local`, otherwise as E1. Per logical change it reports
+conflicts per landed change, re-lands plus resends per landed change, and
+time from the first send to landed. Values are per run.
+
+| Agents, hot share | Conflicts per landed change | (Re-lands + resends) per landed change | Time to landed p50 |
+|---|---|---|---|
+| 500, 2% | 1.22, 1.27 | 2.4, 3.1 | 56–61 s |
+| 500, 10% | 1.39 | 2.7 | 60 s |
+| 2,000, 2% | 0.82, 0.91 | 3.6–4.1 | 115 s |
+| 2,000, 10% | 0.97, 1.39 | 3.5–6.4 | 71–142 s |
+| 5,000 | 0.04–0.24 | 5.8–7.9 (21k–26k resends) | 203–231 s (p99 285–326 s) |
+| 2,000, 2%, E1b local | 1.03 | 4.70 | 87 s (p99 150 s) |
+| 2,000, 2%, E1b split | 1.49 | 4.73 | 74 s (p99 164 s) |
+
+At 5,000 agents 3,000 to 3,800 of the about 3,700 to 4,100 changes started
+landed, and lands per second inside the window were about 0: the box was
+saturated.
+
+- **About one conflict per landed change at 500 to 2,000 agents** (0.82 to
+  1.49), and 2.4 to 6.4 extra sends per change (re-lands after conflicts
+  plus resends after timeouts).
+- **5,000 agents still land, slowly:** about 3.5 minutes per change on this
+  box. Their few conflicts (0.04 to 0.24) are a symptom, not good news:
+  with 6 to 8 sends per change, most sends likely time out queued, so few
+  get as far as a replay that could conflict. That is an inference; the
+  swarm rerun will confirm it from the `leep_land_lock_wait_seconds`
+  histogram.
+- **Confounded by search load.** Every run had search reads on, which E1
+  showed cost about ten times the land throughput, so these times say as
+  much about search as about conflicts. E1b's conflict arms (one run
+  each, local and split) fall in the same range.
+- **No double or lost lands** in any run, through tens of thousands of
+  resends under land ids (ADR 0057).
+
+#### Unreachable changesets (E4)
+
+`leep-server gc --unreachable --dry-run` (ADR 0059, section 8) on the Linux
+test store (1,768,076 changesets, 140,882 lands), `--grace 0`, two runs (741 s and 697 s). Logical bytes per land:
+
+| Part | Bytes per land | Where |
+|---|---|---|
+| Write path (changesets, ref log, refs, `root_tree`, `generation`, `skiplist`, rebase rows) | 2,329 | metadata |
+| Reclaimable metadata: unreachable changesets (113) and their `generation`, `root_tree` and `skiplist` rows | 653 | metadata |
+| Ref log, if retention were added | +252 | metadata |
+| Unreachable tree nodes, upper bound (197,027 nodes, 1.48 GB) | 10,532 | blob store |
+| Unreachable file contents | 53 | blob store |
+
+Of the 92 MB of reclaimable metadata, 66 MB is `skiplist` rows. The dry run
+also puts index bytes at 46,421 per land, inflated by the imported Linux
+history those indexes cover; the swarm measured 2 to 9 KB per land. The
+largest kinds in the store, logical: `history-node-v4` 2.81 GB,
+`history-tree-v4` 1.93 GB, `skiplist` 1.20 GB, `log-filter` 0.74 GB,
+`tree-trigrams` 0.41 GB, `blob-trigrams` 0.26 GB; the database is 13.2 GB
+on disk.
+
+Against [ADR 0059](adr/0059-unreachable-changeset-gc.md)'s decision rule
+(build phase 2 if reclaimable metadata exceeds about 20% of the logical
+growth per land):
+
+- **Metadata alone is below the threshold.** 653 bytes against 2,329 of
+  write path plus 2 to 9 KB of index is 6 to 15%, about 9% at 5 KB of
+  index. (Against the write path alone it would be 28%, but the rule counts
+  all logical growth.)
+- **With ref-log retention the reclaimable share is 905 B, 8 to 21%,** so
+  the rule is met only at the low end of index growth; the decision waits
+  on `--exact-trees`.
+- **Tree nodes may dominate.** Their upper bound, 10.5 KB per land, is 16
+  times the reclaimable metadata, but it lives in the blob store and only
+  `gc --full` frees it. The exact count needs `--exact-trees`, a full mark
+  that should not run on the two-core VPS; it is pending on a larger host.
+- **Index and skiplist compaction is the bigger lever.** The index kinds
+  above and `skiplist` hold most of the store, against 92 MB reclaimable
+  by changeset GC.
 
 ## Real history: git/git
 

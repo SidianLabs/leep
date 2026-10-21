@@ -633,6 +633,17 @@ of `a`, or a false conflict when the ref changed `a`'s files since. On conflict 
 `clean` (every blob it names is stored before the answer, even when the batch
 moves nothing; `/v1/ready` lists `land-clean-blobs`), resolves `conflicts` on top of `onto`, commits once and lands again,
 which is then a fast-forward. Stacks containing merges are rejected.
+Proposed, not built
+([ADR 0060](adr/0060-land-admission-and-read-limits.md)): the server that
+batches a ref's lands may bound its queue in batches
+(`--land-queue-batches`, off by default) and refuse a land with 503
+`unavailable`, `Retry-After` and `Leep-Refused: admission` before it reads
+the changeset (a keyed land whose id is already recorded gets its recorded
+answer instead), counting forwarded lands against the leader's bound; the
+header, not the status, tells clients that nothing was done, so even an
+unkeyed land may be resent; and `POST /v1/land/check`
+runs one land's step onto the current head in a staging layer that is never
+flushed, outside the queue and the lease, to answer whether it would land.
 
 **Branches and tags** ([ADR 0015](adr/0015-branches-and-tags.md)). Refs are
 branches, except those under `tags/`, which are tags. `cas_ref_checked` and
@@ -1083,6 +1094,11 @@ lives in a guard attached to the response body, so it is released when the body
 ends, the client goes away or the timeout drops the request. Token names bound
 the state; in anonymous mode state is keyed by client address in a size-capped
 table. State is per process.
+Proposed in ADR 0060, not built: a semaphore per class of expensive read
+(search and land checks on by default at half the cores; blame, filtered log
+and large diffs off), refused with 503 `unavailable`, `Retry-After` and
+`Leep-Refused: read-class`, so lands and cheap reads keep the cores on
+small hosts, and balancers can tell the refusals from failures.
 
 **Config reload** ([ADR 0024](adr/0024-config-reload.md)). The tokens, their
 limits, the trusted signing keys, the review service and the composed land
