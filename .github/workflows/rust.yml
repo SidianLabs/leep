@@ -22,7 +22,7 @@ jobs:
     env:
       LEEP_TEST_POSTGRES_URL: postgres://postgres:leep@localhost:5432/postgres
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Installs the version pinned in rust-toolchain.toml.
       - run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
@@ -40,5 +40,5 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: docker build .
