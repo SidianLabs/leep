@@ -623,11 +623,11 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   `gc_profile` times GC phases and counts store calls.
 - `leep-server gc --unreachable --dry-run` counts what garbage collection of
   unreachable changesets (ADR 0059, proposed) would reclaim: changesets no
-  ref, ref log entry, land id, scan window, attestation or mirror map
-  reaches, their per-changeset rows and the tree nodes and contents only
-  they introduced, with the ref log kept and pruned to
-  `--ref-log-retention`, in total and per land. Read-only; a Postgres
-  connection is opened with `default_transaction_read_only`.
+  ref, ref log entry, scan window, attestation or mirror map reaches, their
+  per-changeset rows and the tree nodes and contents only they introduced,
+  beside the store's logical write-path and index bytes per land and, for a
+  later ADR, what a `--ref-log-retention` would add. Read-only: Postgres
+  sessions refuse writes and SQLite opens with `mode=ro`.
 - Filtered logs use an index (ADR 0047). `GET /v1/log` with `author=` or
   `extra=` and no path (`leep log --author`, `--agent`, `--agent-model`,
   `--agent-session`) used to test every ancestor, so a rare value read the

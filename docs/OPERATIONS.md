@@ -1198,20 +1198,34 @@ and `leep sync` snapshots stay forever. ADR 0059 (proposed) would collect
 them. To measure what it would reclaim on a store, run the read-only count:
 
 ```sh
-leep-server --meta "$LEEP_META" --blobs "$LEEP_BLOBS" \
-  gc --dry-run --unreachable --grace 7d --ref-log-retention 30d
+nice -n 19 leep-server --meta-pool-size 4 --meta "$LEEP_META" --blobs "$LEEP_BLOBS" \
+  gc --dry-run --unreachable --grace 0 --ref-log-retention 0
 ```
 
-It writes nothing, and on Postgres its connections refuse writes
-(`default_transaction_read_only`). It reports, with the ref log kept forever
-and with it kept `--ref-log-retention`, the unreachable changesets by age and
-kind, the changesets and per-changeset rows older than `--grace` with their
-logical bytes, the ref log entries a retention would drop, and the tree nodes
-and contents only those changesets introduced, each in total and per land.
-Tree counts are an upper bound. `--exact-trees` makes them exact for the
-retention policy by walking every reachable tree, which costs as much as
-`gc --full`. Ages come from the changesets' own timestamps. Memory is about
-60 bytes per changeset, plus one hash per live object with `--exact-trees`.
+It writes nothing. Postgres sessions refuse writes
+(`default_transaction_read_only`), and SQLite opens with `mode=ro`; a
+`--meta` URL that already sets `options=` or `mode=` is refused. It
+reports:
+
+- the unreachable changesets by age and kind;
+- the changesets and per-changeset rows older than `--grace`, with their
+  logical bytes;
+- the tree nodes and contents only those changesets introduced;
+- the store's logical sizes (rows and bytes per derived kind, changesets,
+  ref log, refs);
+- per land, side by side: write-path bytes, index bytes and reclaimable
+  bytes. All are logical; the physical database size is printed apart and
+  runs 2.5 to 3.5 times larger on Postgres.
+
+A second column shows what keeping the ref log only `--ref-log-retention`
+would add, for a later decision. Use `--grace 0` on a store whose lands
+are all recent. Ages come from the changesets' own timestamps.
+
+Tree counts are an upper bound. `--exact-trees` makes them exact by walking
+every reachable tree, which costs as much as `gc --full`. **Do not use it
+on a small host beside live servers, such as the 2-core VPS.** Memory is
+about 60 bytes per changeset, plus one hash per live object with
+`--exact-trees`.
 
 ## Packing blobs
 

@@ -3,12 +3,11 @@
 //!
 //! Read-only by construction: it lists and reads changesets, refs, the ref
 //! log, derived rows and tree nodes, and never derives a missing row. The
-//! roots are ADR 0059's, under two ref log policies at once (kept forever,
-//! and kept for a retention), so one run answers how much a retention would
-//! buy. Two approximations, both keeping more than the design would:
-//! changeset age is the client's `timestamp` (the design's `stored_at` does
-//! not exist yet), and a land entry's `land_changeset` is taken to be the
-//! `rebased-origin-v1` origin of its target, which also counts unkeyed lands.
+//! roots are ADR 0059's (refs, every ref log entry, scan windows,
+//! attestations, mirror maps, grace; land ids are not roots), and a second
+//! policy keeps the ref log only for a retention, to size the follow-up ADR
+//! on ref log retention. Changeset age is the client's `timestamp`, since
+//! the design's `stored_at` does not exist yet.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::Duration;
@@ -125,10 +124,35 @@ pub struct UnreachableReport {
     pub without_root_tree: u64,
     /// Tree nodes a walk needed but the blob store lacked.
     pub missing_nodes: u64,
-    /// Ref log kept forever: every land id is answerable at any age.
+    /// What the lands recorded in the ref log wrote themselves: their copies
+    /// and originals with the write path's rows, and their log entries.
+    pub land_write: LandWrite,
+    /// ADR 0059 as designed: the ref log is kept forever.
     pub log_kept: PolicyReport,
-    /// Ref log kept for `ref_log_retention`.
+    /// The same with the ref log kept only for `ref_log_retention` (each
+    /// ref's newest entry always), for the follow-up ADR.
     pub log_pruned: PolicyReport,
+}
+
+/// Derived kinds the write path stores, as `leep-swarm` counts them.
+pub const WRITE_PATH_KINDS: &[&str] = &["root_tree", "generation", "skiplist", REBASED_ORIGIN_KIND];
+
+/// Logical bytes the lands themselves wrote, encoded like [`Tally`].
+#[derive(Clone, Debug, Default)]
+pub struct LandWrite {
+    /// The changesets a land entry moved its ref to, and their originals.
+    pub changesets: u64,
+    pub changeset_bytes: u64,
+    /// Their rows of [`WRITE_PATH_KINDS`].
+    pub row_bytes: u64,
+    /// Estimate of the land entries themselves.
+    pub log_bytes: u64,
+}
+
+impl LandWrite {
+    pub fn bytes(&self) -> u64 {
+        self.changeset_bytes + self.row_bytes + self.log_bytes
+    }
 }
 
 /// Changesets as an in-memory graph indexed by position in id order.
@@ -326,6 +350,7 @@ pub async fn report(repo: &Repo, opts: &UnreachableOptions) -> Result<Unreachabl
     let mut log_kept: Vec<u32> = Vec::new();
     let mut log_retained: Vec<u32> = Vec::new();
     let mut newest_seen: HashSet<String> = HashSet::new();
+    let mut landed: HashSet<u32> = HashSet::new();
     let mut before = None;
     loop {
         let page = repo.meta().ref_log(None, before, PAGE).await?;
@@ -338,35 +363,34 @@ pub async fn report(repo: &Repo, opts: &UnreachableOptions) -> Result<Unreachabl
             let land = e.operation == "land";
             let newest = newest_seen.insert(e.name.clone());
             let retained = newest || e.time >= cutoff;
+            let entry_bytes = 8
+                + 8
+                + e.name.len() as u64
+                + 32 * (u64::from(e.old.is_some()) + u64::from(e.new.is_some()))
+                + e.actor.as_ref().map_or(0, |a| a.len() as u64)
+                + e.operation.len() as u64
+                + e.message.as_ref().map_or(0, |m| m.len() as u64)
+                + if land { 64 } else { 0 };
             if land {
                 r.lands += 1;
+                r.land_write.log_bytes += entry_bytes;
+                if let Some(c) = e.new.and_then(|c| g.idx(&c)) {
+                    landed.insert(c);
+                    if let Some(o) = origin_of.get(&c) {
+                        landed.insert(*o);
+                    }
+                }
             }
             if !retained {
                 r.ref_log_prunable_entries += 1;
-                r.ref_log_prunable_bytes += 8
-                    + 8
-                    + e.name.len() as u64
-                    + 32 * (u64::from(e.old.is_some()) + u64::from(e.new.is_some()))
-                    + e.actor.as_ref().map_or(0, |a| a.len() as u64)
-                    + e.operation.len() as u64
-                    + e.message.as_ref().map_or(0, |m| m.len() as u64)
-                    + if land { 64 } else { 0 };
+                r.ref_log_prunable_bytes += entry_bytes;
             }
-            let mut named: Vec<u32> = [e.old, e.new]
+            // Land ids are not roots (ADR 0059 §5): only the targets are.
+            let named: Vec<u32> = [e.old, e.new]
                 .iter()
                 .flatten()
                 .filter_map(|id| g.idx(id))
                 .collect();
-            if land {
-                // The original this land's id would name (root 3).
-                if let Some(o) = e
-                    .new
-                    .and_then(|c| g.idx(&c))
-                    .and_then(|c| origin_of.get(&c))
-                {
-                    named.push(*o);
-                }
-            }
             if retained {
                 log_retained.extend(&named);
             }
@@ -374,8 +398,27 @@ pub async fn report(repo: &Repo, opts: &UnreachableOptions) -> Result<Unreachabl
         }
     }
 
-    // The landed-copy scan window of every head (root 4): ancestors at most
-    // LANDED_COPY_SCAN generations below, a superset of what a scan visits.
+    let landed: Vec<u32> = landed.into_iter().collect();
+    r.land_write.changesets = landed.len() as u64;
+    r.land_write.changeset_bytes = landed.iter().map(|&i| u64::from(g.bytes[i as usize])).sum();
+    for kind in WRITE_PATH_KINDS {
+        for chunk in landed.chunks(PAGE) {
+            let keys: Vec<Hash> = chunk.iter().map(|&i| g.ids[i as usize].0).collect();
+            for v in repo
+                .meta()
+                .get_derived_many(kind, &keys)
+                .await?
+                .into_iter()
+                .flatten()
+            {
+                r.land_write.row_bytes += 32 + v.len() as u64;
+            }
+        }
+    }
+
+    // The landed-copy scan window of every head (root 3): the scan's stack
+    // walk visits at most LANDED_COPY_SCAN changesets, each within
+    // LANDED_COPY_SCAN - 1 parent hops of the head, which this covers.
     let mut window: HashSet<u32> = HashSet::new();
     for &h in &heads {
         let mut depth: HashMap<u32, usize> = HashMap::from([(h, 0)]);
@@ -385,7 +428,7 @@ pub async fn report(repo: &Repo, opts: &UnreachableOptions) -> Result<Unreachabl
                 window.insert(*o);
             }
             let d = depth[&i];
-            if d >= crate::land::LANDED_COPY_SCAN {
+            if d + 1 >= crate::land::LANDED_COPY_SCAN {
                 continue;
             }
             for &p in g.parents(i) {
@@ -816,10 +859,10 @@ mod tests {
         }
     }
 
-    /// Past the scan window, an original is kept only by its land entry, so
-    /// pruning the log is what frees it.
+    /// Past the scan window an original is reclaimable, keyed or not: its
+    /// land id is answered from the record, so it is not a root.
     #[tokio::test]
-    async fn ref_log_retention_frees_originals_past_the_scan_window() {
+    async fn originals_past_the_scan_window_are_reclaimable() {
         let r = repo();
         let base = commit(&r, &[], &[("a/x", Some("0")), ("b/y", Some("0"))], "base").await;
         r.meta()
@@ -854,12 +897,15 @@ mod tests {
         };
         let rep = report(&r, &o).await.unwrap();
         assert_eq!(rep.window_originals, 0);
-        assert_eq!(rep.log_kept.reclaimable.changesets, 0);
-        let t = &rep.log_pruned.reclaimable;
-        assert_eq!((t.changesets, t.originals), (1, 1));
-        // Its `b/` node and contents are the copy's too; only its root is
-        // its own.
-        assert_eq!((t.tree_nodes, t.contents), (1, 0));
+        for t in [&rep.log_kept.reclaimable, &rep.log_pruned.reclaimable] {
+            assert_eq!((t.changesets, t.originals), (1, 1));
+            // Its `b/` node and contents are the copy's too; only its root
+            // is its own.
+            assert_eq!((t.tree_nodes, t.contents), (1, 0));
+        }
+        // Both lands' copies and the rebased one's original.
+        assert_eq!(rep.land_write.changesets, 3);
+        assert!(rep.land_write.row_bytes > 0 && rep.land_write.log_bytes > 0);
         assert!(rep.ref_log_prunable_entries > crate::land::LANDED_COPY_SCAN as u64);
     }
 

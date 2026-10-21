@@ -254,18 +254,20 @@ enum Cmd {
         #[arg(long, global = true)]
         full: bool,
         /// With --dry-run only: count the changesets ADR 0059 would delete
-        /// (unreachable from refs, the ref log, land ids, scan windows,
-        /// attestations and mirror maps, and older than --grace), their
-        /// rows and tree nodes, under the ref log kept and pruned. Strictly
-        /// read-only; a Postgres connection is opened read-only.
+        /// (unreachable from refs, the ref log, scan windows, attestations
+        /// and mirror maps, and older than --grace), their rows and tree
+        /// nodes, beside the store's write-path and index bytes per land.
+        /// Strictly read-only: Postgres sessions are read-only and SQLite
+        /// opens with mode=ro.
         #[arg(long, requires = "dry_run", conflicts_with = "full")]
         unreachable: bool,
         /// With --unreachable: ref log retention to compare against keeping
-        /// it forever.
+        /// it forever (sizes the follow-up ADR on ref log retention).
         #[arg(long, default_value = "30d", value_parser = parse_grace, requires = "unreachable")]
         ref_log_retention: std::time::Duration,
         /// With --unreachable: walk every reachable tree, so tree counts are
-        /// exact rather than an upper bound (costs a full GC mark).
+        /// exact rather than an upper bound. Costs a full GC mark: not on a
+        /// small host beside live servers.
         #[arg(long, requires = "unreachable")]
         exact_trees: bool,
     },
@@ -580,14 +582,39 @@ async fn run_gc(
     Ok(())
 }
 
-/// A Postgres URL whose sessions refuse every write, so the dry run cannot
-/// change the store whatever it calls.
-fn read_only_meta_url(url: &str) -> String {
-    if !(url.starts_with("postgres://") || url.starts_with("postgresql://")) {
-        return url.to_string();
-    }
+/// The store URL opened so that the database itself refuses writes, so the
+/// dry run cannot change the store whatever it calls: Postgres sessions with
+/// `default_transaction_read_only`, SQLite with `mode=ro`. A URL that
+/// already sets the parameter is refused rather than given a second one.
+fn read_only_meta_url(url: &str) -> anyhow::Result<String> {
     let sep = if url.contains('?') { '&' } else { '?' };
-    format!("{url}{sep}options=-c%20default_transaction_read_only%3Don")
+    let has = |param: &str| {
+        url.split_once('?').is_some_and(|(_, q)| {
+            q.split('&').any(|kv| {
+                kv.split('=').next() == Some(param) || kv.starts_with(&format!("{param}["))
+            })
+        })
+    };
+    if url.starts_with("postgres://") || url.starts_with("postgresql://") {
+        if has("options") {
+            anyhow::bail!(
+                "--unreachable opens Postgres read-only with its own options=; \
+                 remove options= from the --meta URL"
+            );
+        }
+        Ok(format!(
+            "{url}{sep}options=-c%20default_transaction_read_only%3Don"
+        ))
+    } else if url.starts_with("sqlite:") {
+        if has("mode") {
+            anyhow::bail!(
+                "--unreachable opens SQLite with mode=ro; remove mode= from the --meta URL"
+            );
+        }
+        Ok(format!("{url}{sep}mode=ro"))
+    } else {
+        anyhow::bail!("--unreachable needs a postgres:// or sqlite: --meta URL")
+    }
 }
 
 async fn run_unreachable_report(
@@ -595,19 +622,20 @@ async fn run_unreachable_report(
     blobs: &str,
     opts: leep_derive::gc_unreachable::UnreachableOptions,
 ) -> anyhow::Result<()> {
-    use leep_derive::gc_unreachable::{report, PolicyReport, AGE_BUCKETS_DAYS};
+    use leep_derive::gc_unreachable::{report, PolicyReport, AGE_BUCKETS_DAYS, WRITE_PATH_KINDS};
+    let url = read_only_meta_url(meta)?;
     let blobs = leep_store::open_blob_store(blobs).context("opening blob store")?;
     let pool = META_POOL_SIZE.load(std::sync::atomic::Ordering::Relaxed);
-    let meta = leep_meta::open_meta_store_with_pool(
-        &read_only_meta_url(meta),
-        leep_meta::SchemaMode::RequireCurrent,
-        pool,
-    )
-    .await
-    .context("opening meta store")?;
+    let meta =
+        leep_meta::open_meta_store_with_pool(&url, leep_meta::SchemaMode::RequireCurrent, pool)
+            .await
+            .context("opening meta store")?;
     let repo = new_repo(blobs, meta);
     let started = std::time::Instant::now();
     let r = report(&repo, &opts).await?;
+    let sizes = leep_meta::space::logical_sizes(&url)
+        .await
+        .context("reading logical sizes")?;
     let per = |b: u64| {
         if r.lands == 0 {
             "-".to_string()
@@ -678,8 +706,59 @@ async fn run_unreachable_report(
             per(t.content_bytes)
         );
     };
-    show("ref log kept forever", &r.log_kept);
-    show("ref log kept for --ref-log-retention", &r.log_pruned);
+    show("as designed: ref log kept forever", &r.log_kept);
+    show(
+        "ref log kept for --ref-log-retention (follow-up ADR)",
+        &r.log_pruned,
+    );
+    let mut index_bytes = None;
+    if let Some(z) = &sizes {
+        println!("[store, logical: keys and values, not pages]");
+        println!(
+            "  changesets: {} rows, {} bytes (as stored)",
+            z.changesets.0, z.changesets.1
+        );
+        println!("  ref log: {} rows, {} bytes", z.ref_log.0, z.ref_log.1);
+        println!("  refs: {} rows, {} bytes", z.refs.0, z.refs.1);
+        let mut index = 0;
+        for (kind, rows, bytes) in &z.derived {
+            let class = if WRITE_PATH_KINDS.contains(&kind.as_str()) {
+                "write path"
+            } else {
+                index += bytes;
+                "index"
+            };
+            println!("  derived {kind} ({class}): {rows} rows, {bytes} bytes");
+        }
+        index_bytes = Some(index);
+        if let Some(p) = z.physical_bytes {
+            println!(
+                "  physical database size: {p} bytes (pages, not logical bytes; on \
+                 Postgres pg_database_size runs 2.5 to 3.5 times the logical bytes)"
+            );
+        }
+    }
+    println!("[per land, logical bytes, side by side]");
+    println!(
+        "  write path (the lands' copies, originals, their {} rows and log entries): {}",
+        WRITE_PATH_KINDS.join(", "),
+        per(r.land_write.bytes())
+    );
+    println!(
+        "  index rows (all non-write-path derived rows in the store / lands; \
+         includes any imported history's): {}",
+        index_bytes.map_or("-".to_string(), per)
+    );
+    println!(
+        "  unreachable, reclaimable as designed: {}",
+        per(r.log_kept.reclaimable.meta_bytes())
+    );
+    println!(
+        "  unreachable, reclaimable with ref log retention (follow-up ADR): {} (+{} of log entries)",
+        per(r.log_pruned.reclaimable.meta_bytes()),
+        per(r.ref_log_prunable_bytes)
+    );
+    println!("  (changesets count by their canonical encoding; stored rows may be compressed)");
     println!(
         "reclaimable without a root_tree row (trees not counted): {}",
         r.without_root_tree
