@@ -16,6 +16,10 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   `renames=true` each rename is on the page of its `to` entry.
 - Requests without `limit` answer the whole list exactly as before, so older
   clients are unaffected; capping them too is left for later.
+- The CLI and MCP server fetch listings and diffs (checkout, `diff`, `show`,
+  `merge`, `stash` and every other caller) in pages of 10,000, so no one
+  response is unbounded. Against an older server they get one full answer,
+  as before.
 
 ### Land conflicts name only stored blobs
 - A land answered with conflicts now stores the merged text its `clean`

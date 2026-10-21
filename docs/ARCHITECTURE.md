@@ -739,7 +739,7 @@ unbounded; entries name changesets, which are never deleted, so GC is
 unaffected.
 
 **Checkout** (`leep checkout`): the client resolves a rev to an id and lists
-files under the requested prefixes (`GET /v1/files`). It then fetches the
+files under the requested prefixes (`GET /v1/files`, in pages of 10,000). It then fetches the
 missing blobs through its local content-addressed cache and writes them. Only
 requested prefixes are materialized; other files are fetched on demand with
 `leep cat`.

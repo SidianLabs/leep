@@ -596,28 +596,39 @@ async fn merge_base(
     Ok(Json(MergeBaseResponse { base }))
 }
 
+/// `limit` and `after` of a files or diff request; pages only under
+/// `page_cap`, with offsets as cursors.
+fn path_page_params(q: &HashMap<String, String>) -> (usize, Option<&str>) {
+    let limit = q
+        .get("limit")
+        .map_or(usize::MAX, |l| l.parse().expect("numeric limit"));
+    (limit, q.get("after").map(String::as_str))
+}
+
 async fn files(
     State(s): State<Shared>,
     Path(id): Path<String>,
+    RawQuery(raw): RawQuery,
     Query(q): Query<HashMap<String, String>>,
 ) -> Resp<FilesResponse> {
     let id: ChangesetId = id
         .parse()
         .map_err(|_| err(StatusCode::BAD_REQUEST, "bad id"))?;
-    let d = s.lock().unwrap();
+    let mut d = s.lock().unwrap();
+    record(&mut d, "files", &raw);
     let all = d
         .files
         .get(&id)
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "no such changeset"))?;
     let prefix = q.get("prefix").map(String::as_str).unwrap_or("");
-    Ok(Json(FilesResponse {
-        files: all
-            .values()
-            .filter(|f| f.path.is_within(prefix))
-            .cloned()
-            .collect(),
-        next: None,
-    }))
+    let matching: Vec<FileInfo> = all
+        .values()
+        .filter(|f| f.path.is_within(prefix))
+        .cloned()
+        .collect();
+    let (limit, after) = path_page_params(&q);
+    let (files, next) = page(&d, matching, limit, after);
+    Ok(Json(FilesResponse { files, next }))
 }
 
 fn generation(d: &Data, id: ChangesetId) -> u64 {
@@ -1046,6 +1057,13 @@ async fn diff(State(s): State<Shared>, RawQuery(raw): RawQuery) -> Resp<DiffResp
         resp.renames = found.renames;
         resp.renames_truncated = found.truncated;
     }
+    // Like the server: page the entries, each rename on its `to` entry's page.
+    let (limit, after) = path_page_params(&q);
+    let (entries, next) = page(&d, std::mem::take(&mut resp.entries), limit, after);
+    resp.renames
+        .retain(|r| entries.iter().any(|e| e.path == r.to));
+    resp.entries = entries;
+    resp.next = next;
     Ok(Json(resp))
 }
 

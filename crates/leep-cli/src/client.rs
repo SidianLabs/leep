@@ -231,6 +231,33 @@ pub const LOG_PAGE: u32 = 10_000;
 /// Most search matches the server returns per request.
 pub const SEARCH_PAGE: u32 = 1000;
 
+/// `limit` and `after` of a paged request, when set.
+fn page_params(limit: Option<usize>, after: Option<&str>) -> Vec<(&'static str, String)> {
+    let mut out = Vec::new();
+    if let Some(l) = limit {
+        out.push(("limit", l.to_string()));
+    }
+    if let Some(a) = after {
+        out.push(("after", a.to_string()));
+    }
+    out
+}
+
+/// Every item of a paged list: `fetch` gets the previous page's `next` and
+/// answers a page's items and its `next`. A server that predates paging
+/// sends everything and no `next`, so that is one request.
+fn all_pages<T>(
+    mut fetch: impl FnMut(Option<&str>) -> Result<(Vec<T>, Option<String>)>,
+) -> Result<Vec<T>> {
+    let (mut out, mut next) = fetch(None)?;
+    while let Some(after) = next {
+        let (items, n) = fetch(Some(&after))?;
+        out.extend(items);
+        next = n;
+    }
+    Ok(out)
+}
+
 fn add_stats(total: &mut SearchStats, page: &SearchStats) {
     total.files_considered += page.files_considered;
     total.dirs_pruned += page.dirs_pruned;
@@ -639,12 +666,35 @@ impl Client {
     }
 
     /// Recursive listing; an empty `prefix` lists the whole repository.
+    /// Fetched in pages of [`MAX_PATHS_LIMIT`] paths, so no one answer is
+    /// unbounded; a server without paging answers everything at once.
     pub fn files(&self, id: &ChangesetId, prefix: &str) -> Result<FilesResponse> {
-        let mut req = self.http.get(self.url(&format!("/v1/files/{id}")));
+        let files = all_pages(|after| {
+            let p = self.files_page(id, prefix, Some(MAX_PATHS_LIMIT), after)?;
+            Ok((p.files, p.next))
+        })?;
+        Ok(FilesResponse { files, next: None })
+    }
+
+    /// One page of [`Client::files`]: at most `limit` files after the
+    /// previous page's `next` cursor (`after`).
+    pub fn files_page(
+        &self,
+        id: &ChangesetId,
+        prefix: &str,
+        limit: Option<usize>,
+        after: Option<&str>,
+    ) -> Result<FilesResponse> {
+        let mut query: Vec<(&str, String)> = Vec::new();
         if !prefix.is_empty() {
-            req = req.query(&[("prefix", prefix)]);
+            query.push(("prefix", prefix.to_string()));
         }
-        self.json(req)
+        query.extend(page_params(limit, after));
+        self.json(
+            self.http
+                .get(self.url(&format!("/v1/files/{id}")))
+                .query(&query),
+        )
     }
 
     /// File bytes plus the `x-leep-kind` header, if the server sent one.
@@ -784,23 +834,14 @@ impl Client {
         }
     }
 
+    /// The whole diff, fetched in pages like [`Client::files`].
     pub fn diff(
         &self,
         from: Option<&ChangesetId>,
         to: &ChangesetId,
         prefix: Option<&str>,
     ) -> Result<DiffResponse> {
-        let mut req = self
-            .http
-            .get(self.url("/v1/diff"))
-            .query(&[("to", to.to_string())]);
-        if let Some(f) = from {
-            req = req.query(&[("from", f.to_string())]);
-        }
-        if let Some(p) = prefix {
-            req = req.query(&[("prefix", p)]);
-        }
-        self.json(req)
+        self.diff_all(from, to, prefix, None)
     }
 
     /// [`Client::diff`] asking the server to detect renames. `threshold` is
@@ -812,20 +853,61 @@ impl Client {
         prefix: Option<&str>,
         threshold: Option<u8>,
     ) -> Result<DiffResponse> {
-        let mut req = self
-            .http
-            .get(self.url("/v1/diff"))
-            .query(&[("to", to.to_string()), ("renames", "true".into())]);
+        self.diff_all(from, to, prefix, Some(threshold))
+    }
+
+    /// Every page of a diff. Renames are detected over the whole diff on
+    /// each page, and each comes with its `to` entry, so concatenated pages
+    /// are the unpaged answer.
+    fn diff_all(
+        &self,
+        from: Option<&ChangesetId>,
+        to: &ChangesetId,
+        prefix: Option<&str>,
+        renames: Option<Option<u8>>,
+    ) -> Result<DiffResponse> {
+        let (mut found, mut truncated) = (Vec::new(), false);
+        let entries = all_pages(|after| {
+            let p = self.diff_page(from, to, prefix, renames, Some(MAX_PATHS_LIMIT), after)?;
+            found.extend(p.renames);
+            truncated |= p.renames_truncated;
+            Ok((p.entries, p.next))
+        })?;
+        Ok(DiffResponse {
+            entries,
+            renames: found,
+            renames_truncated: truncated,
+            next: None,
+        })
+    }
+
+    /// One page of a diff: at most `limit` entries after the previous
+    /// page's `next` cursor (`after`). `renames` is `None` for none, or
+    /// `Some(threshold)` as in [`Client::diff_renames`].
+    pub fn diff_page(
+        &self,
+        from: Option<&ChangesetId>,
+        to: &ChangesetId,
+        prefix: Option<&str>,
+        renames: Option<Option<u8>>,
+        limit: Option<usize>,
+        after: Option<&str>,
+    ) -> Result<DiffResponse> {
+        let mut query: Vec<(&str, String)> = vec![("to", to.to_string())];
+        if let Some(threshold) = renames {
+            query.push(("renames", "true".into()));
+            if let Some(t) = threshold {
+                query.push(("rename_threshold", t.to_string()));
+            }
+        }
         if let Some(f) = from {
-            req = req.query(&[("from", f.to_string())]);
+            query.push(("from", f.to_string()));
         }
         if let Some(p) = prefix {
-            req = req.query(&[("prefix", p)]);
+            query.push(("prefix", p.to_string()));
         }
-        if let Some(t) = threshold {
-            req = req.query(&[("rename_threshold", t.to_string())]);
-        }
-        self.json(req)
+        query.extend(page_params(limit, after));
+        self.json(self.http.get(self.url("/v1/diff")).query(&query))
     }
 
     pub fn blame(&self, id: &ChangesetId, path: &str) -> Result<BlameResponse> {
