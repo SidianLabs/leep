@@ -411,6 +411,12 @@ pub const FEATURE_INDEXING_RETRY: &str = "indexing-retry";
 /// collection may run beside it (ADR 0059).
 pub const FEATURE_CHANGESET_RESCUE: &str = "changeset-rescue";
 
+/// In [`ReadyResponse::features`]: every blob named in the `clean` changes of
+/// a [`LandResponse::Conflicts`] is stored before the answer, so a client may
+/// apply them as they are. Older servers could answer with merged text they
+/// never stored.
+pub const FEATURE_LAND_CLEAN_BLOBS: &str = "land-clean-blobs";
+
 /// One store that failed its readiness check.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReadyFailure {

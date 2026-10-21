@@ -7,6 +7,14 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 ## [Unreleased]
 
+### Land conflicts name only stored blobs
+- A land answered with conflicts now stores the merged text its `clean`
+  changes name before answering. Before, a land that moved nothing never
+  stored it, so a client applying `clean` (`leep land`'s conflict path,
+  `leep_resolve_and_land`) could fail with `missing blob` unless another
+  land in the same batch happened to move the ref. `GET /v1/ready` lists
+  `land-clean-blobs`.
+
 ### Request ids
 - The server accepts a client's `X-Request-Id` (1 to 128 characters of
   `A-Z a-z 0-9 . _ : / -`; anything else is replaced) or makes one, answers

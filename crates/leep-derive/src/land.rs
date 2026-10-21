@@ -11,12 +11,13 @@ use std::time::{Duration, Instant};
 use leep_core::api::{LandResponse, RebaseResponse};
 use leep_core::refname::{self, MISSING_REF_MARKER, NOT_FORWARD_MARKER};
 use leep_core::{
-    ChangesetId, Error, LandId, LandKey, LandRecord, RefStep, RefUpdateContext, Result,
+    ChangesetId, Error, FileChange, Hash, LandId, LandKey, LandRecord, RefStep, RefUpdateContext,
+    Result,
 };
 use tokio::sync::oneshot;
 
 use crate::changeset_gc::RescueBy;
-use crate::land_stage::Staging;
+use crate::land_stage::{Staging, FLUSH_WRITES_IN_FLIGHT};
 use crate::Repo;
 
 /// Lands within one process are batched per ref, so losses only come from
@@ -716,7 +717,10 @@ impl Repo {
                         head = Some(new);
                         waiting.push((l, Ok(Step::Move(new))));
                     }
-                    Ok(Step::Done(resp)) if steps.is_empty() => l.answer(Ok(resp), attempt, false),
+                    Ok(Step::Done(resp)) if steps.is_empty() => {
+                        let result = self.store_clean(&staging, resp).await;
+                        l.answer(result, attempt, false)
+                    }
                     Err(e) if steps.is_empty() => l.answer(Err(e), attempt, false),
                     other => waiting.push((l, other)),
                 }
@@ -771,6 +775,8 @@ impl Repo {
                             continue;
                         }
                         let cs = l.q.cs;
+                        // A conflict's merged text was stored with the
+                        // batch, by `staging.flush` above.
                         let result = step.map(|s| match s {
                             Step::Done(resp) => resp,
                             Step::Move(new) => LandResponse::Landed {
@@ -822,6 +828,29 @@ impl Repo {
                 ),
             }
         }
+    }
+
+    /// Store the merged text a conflict answer's `clean` changes name, which
+    /// the replay staged: the client applies them, and a land that moves
+    /// nothing never flushes its staging. Written through the GC rescue
+    /// check and made durable before the answer; a failure is the land's
+    /// answer (nothing moved, so the client may retry).
+    async fn store_clean(&self, staging: &Staging, resp: LandResponse) -> Result<LandResponse> {
+        if let LandResponse::Conflicts { clean, .. } = &resp {
+            let hashes: Vec<Hash> = clean
+                .values()
+                .filter_map(|c| match c {
+                    FileChange::Modify { content, .. } => Some(*content),
+                    FileChange::Delete => None,
+                })
+                .collect();
+            let blobs = staging.staged_blobs(&hashes);
+            if !blobs.is_empty() {
+                self.put_rescuing_many_in_flight(blobs, FLUSH_WRITES_IN_FLIGHT, &[])
+                    .await?;
+            }
+        }
+        Ok(resp)
     }
 
     /// What `target_ref` recorded for the land ids in `lands`; nothing is read

@@ -956,6 +956,14 @@ on the wire and SQL columns at rest; it is not hashed and not encoded with
 postcard, and backups already carried the columns (`SnapLogRow`), so no
 stored format changed.
 
+## Stored `clean` blobs of a land conflict (`land-clean-blobs`)
+
+`GET /v1/ready` lists `land-clean-blobs` in `features`: every blob a
+`LandResponse::Conflicts` names in `clean` is stored before the answer. An
+older server could name merged text it had only staged in memory, so a
+client that applied `clean` from it could hit `missing blob`. No `/v1`
+field, stored object or encoding changed.
+
 ## Fenced garbage collection (new derived kinds, no other format change)
 
 ADR 0012 adds the three GC kinds in the table above (`blob-claim-v1` already
