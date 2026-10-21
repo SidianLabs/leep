@@ -7,6 +7,11 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 ## [Unreleased]
 
+### Faster path logs
+- Path logs without a filter no longer read each changeset and root tree one
+  after another along the path's history: they read them in one batch per
+  page.
+
 ### One indexer per index group (ADR 0058)
 - `leep-server --indexing local|lease|off` (default `local`, unchanged). In
   `lease` mode each index group (path history, log filter, code search) is
