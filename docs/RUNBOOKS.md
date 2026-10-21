@@ -498,8 +498,12 @@ exists so that a changeset sweep's fence outlasts any batch that checked
 for condemned changesets before it; it is not tunable.
 
 **Impact.** The agents' lands fail with a 409 (CLI exit 5) and must be
-repeated; nothing is half done. A keyed land that is resent is answered
-from its land id record if an earlier attempt did land, so none lands twice.
+repeated. The 409 does not always mean the ref did not move: an attempt
+whose swap failed with an ambiguous store error may have applied before
+the batch ran out of time. Repeating the land is still safe: a keyed land
+(the CLI sends one) is answered from its land id record, and an unkeyed one
+is found on the ref by the landed-copy scan while the copy is within its
+window, so neither lands twice.
 
 **Diagnose.**
 

@@ -904,8 +904,14 @@ reflog REF`). Other clients that resend across runs should do the same.
 
 **Migration 7 (`changesets.stored_at`, ADR 0059).** Adds one nullable
 column with no default: on Postgres and SQLite a catalog change that
-rewrites no row, so it is instant on any size and may run beside servers of
-the previous version. They keep storing changesets without the column,
+rewrites no row, so once it has its lock it is instant on any size, and it
+may run beside servers of the previous version. On Postgres that lock is
+ACCESS EXCLUSIVE on `changesets` and waits for every open transaction that
+read the table, while every new reader and writer queues behind it. **Do
+not run it while a backup or `gc --unreachable --dry-run` is in flight.**
+On Postgres, Leep's migrations wait at most 5 s for a table lock (`lock_timeout`) and
+then fail without changing anything (`could not lock a table within 5s`);
+run `leep-server migrate` again when the long transaction has finished. They keep storing changesets without the column,
 which read as stored when the migration ran; finish the rollout before the
 first changeset condemnation (see [Changeset garbage
 collection](#changeset-garbage-collection)).

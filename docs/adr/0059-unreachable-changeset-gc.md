@@ -243,6 +243,12 @@ it. Therefore:
   bounds a batch from its first attempt. A batch past it answers its lands
   with a retryable error. They are then resent with their land ids, so
   this never causes a double land.
+  - While a sweep deletes, a batch whose rescue meets a changeset being
+    collected waits for its doom to settle (`wait_for_doom`, up to 30 s per
+    rescue call) and replays, so it can hold its ref's queue until the
+    deadline fires. Lands on that ref wait meanwhile, then get 409 and
+    retry. This is acceptable for phase 1, where nothing condemns; phase 2
+    revisits it with measured collect times.
 - **Other detached writers re-check too.** The same applies to the ADR 0058
   indexer and to any other detached task that writes something naming a
   changeset: it re-checks before each write batch.
@@ -263,15 +269,17 @@ ref, a log entry, a link, an attestation). Let *W* be the longest time from
 a writer's last fence read to its durable write:
 
 - for requests, the request timeout plus the flag TTL (10 s);
-- for land batches, one attempt (the fence is re-read per attempt), which
-  is at most `MAX_BATCH_LIFETIME`;
+- for land batches, `MAX_BATCH_LIFETIME` plus one flush and
+  compare-and-swap: no attempt starts its swap after the batch's first
+  attempt plus 60 s, but a swap already started can take the store's
+  latency to complete;
 - for the indexer, one staged write batch.
 
 Assume:
 
 - **`fence > max(request timeout + TTL, MAX_BATCH_LIFETIME, index write
   window) + skew + margin`.** The default is 10 minutes, against a 5 minute
-  timeout, a 60 s batch and a 60 s index fence.
+  timeout, a 60 s batch (plus one swap) and a 60 s index fence.
 - **`grace > fence`.**
 - **No two GC runs at once.** This is now enforced (section 6).
 
@@ -529,12 +537,16 @@ garbage collection".
   - `land_of_condemned_original_is_rescued`;
   - `keyed_retry_of_reclaimed_original_is_answered_from_its_record`;
   - `ref_move_to_condemned_changeset_rescues`;
+  - `other_writers_naming_a_condemned_changeset_rescue_it`: merge,
+    rebase, signature and review, each on a condemned stack (and, in
+    `leep-git`, `export_rescues_condemned_changesets_before_mapping_them`);
   - `cancelled_land_whose_batch_commits_later_is_fenced`: the client's
     request is cancelled after the batch's first attempt, condemn runs, and
     the batch commits on a later attempt. The batch's re-check rescues the
     subject, or the collect leaves it alone;
   - `batch_past_its_deadline_answers_retryably`;
-  - `sweep_racing_a_forwarded_land`: ADR 0056, two simulated servers. The
+  - `sweep_racing_a_forwarded_land` (phase 2: it needs collect): ADR 0056,
+    two simulated servers. The
     land is forwarded to the leader while condemn and collect run, and no
     ref ever points at a deleted changeset;
   - `indexer_write_after_delete_is_removed_by_the_tombstone_pass`;
