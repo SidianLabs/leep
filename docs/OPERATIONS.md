@@ -1185,10 +1185,13 @@ Use index leases instead (ADR 0058):
 - **Tools that delete or rebuild rows.** `repair drop`, `repair rederive
   --missing` and `upgrade-index --yes` take the index leases of the groups
   they touch, refuse when a live server holds one (stop it, set it to `off`,
-  or pass `--ignore-lease`, which allows duplicate work), and then wait
+  or pass `--ignore-lease`, which allows duplicate work and is refused for
+  `repair drop` and `upgrade-index --drop-first`, where it would allow the
+  race the fence prevents), wait
   `--index-fence` (60 s; the 6 s stale time plus more than the longest
   staged write) before touching rows, so a former holder's late write lands
-  first. They keep the leases while they run, so no server warms meanwhile.
+  first. They keep the leases while they run, so no server warms meanwhile,
+  and a drop checks them once more right before it deletes.
   Servers in `local` mode take no leases: a drop of a current kind still
   needs them stopped, or not deriving that kind.
 

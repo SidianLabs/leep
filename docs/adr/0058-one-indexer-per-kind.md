@@ -391,7 +391,7 @@ that, `shard` stays 0.
 - **Fence for tools that delete or rebuild rows.** `repair drop`, `repair
   rederive --missing` and `upgrade-index --yes` take the group's lease for
   every shard. They refuse when a live holder has it, unless
-  `--ignore-lease`, which allows duplicate work and correct rows. They keep
+  `--ignore-lease`, which allows duplicate work and correct rows (not for a drop; see "Implementation notes"). They keep
   the lease while they run.
   - **The fence.** Having taken the lease, a tool waits `--index-fence`
     before touching rows. The default is 60 s: the 6 s stale time, plus
@@ -686,6 +686,12 @@ reason given:
 - **Lease `meta`**: `{"rate", "backlog", "shards"}`, backlog being the
   changesets the last pass derived; the two lanes are deferred, so
   `leep_index_backlog_changesets` has `lane="tip"` only.
+- **`--ignore-lease`** is refused for `repair drop` and `upgrade-index
+  --drop-first`: a drop beside a deriving holder is the race the fence
+  exists for, so "duplicate work, correct rows" holds only for the tools that
+  derive. A drop also checks its leases right before deleting.
+- **Search warming** checks the lease before each directory's rows are
+  written, as the other groups check it before each staged write.
 - **Fence.** A tool waits `--index-fence` only when the group had a lease row
   before (a store whose servers never ran in `lease` mode has no holder to
   wait for). `upgrade-index --yes` takes the leases of the groups it derives.

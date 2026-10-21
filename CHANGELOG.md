@@ -32,7 +32,9 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   responses, `stats.files_unindexed` on search, ready feature
   `indexing-retry`.
 - A filtered log page (`author`, `extra`) now carries `next` only when
-  another match follows, so it is never empty with `next`.
+  another match follows, so it is never empty with `next`. To know that, a
+  full page walks on to the next match, so a page whose filter matches
+  rarely costs about what the following page used to.
 - `leep log`, `last-change`, `blame` and `search` send `Leep-Indexing:
   retry`, retry an indexing 503 for up to `LEEP_INDEX_WAIT` seconds (60), then
   fail with error code `indexing` (exit 3, `retry_after_ms` in `--json`);
@@ -40,8 +42,11 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   and report `answered_at`/`behind`; `fresh: true` insists on the head.
 - `repair drop`, `repair rederive --missing` and `upgrade-index --yes` take
   the index leases of the groups they touch and wait `--index-fence` (60 s)
-  before touching rows; a live holder is refused unless `--ignore-lease`.
+  before touching rows; a live holder is refused unless `--ignore-lease`,
+  which `repair drop` and `upgrade-index --drop-first` refuse.
 - `last_merge-v1` is written with each changeset.
+- In `local` mode the warmer now warms code search side by side with path
+  history and the log filter in each pass, instead of after them.
 - New metrics: `leep_index_lease_held`, `leep_index_lease_acquired_total`,
   `leep_index_lease_lost_total`, `leep_index_derived_total`,
   `leep_index_backlog_changesets`, `leep_index_lag_seconds`,

@@ -9,7 +9,10 @@ use common::*;
 fn check_ready(server: &Server) {
     let (status, _, body) = http_get(server.addr, "/v1/ready", None);
     assert_eq!(status, 200, "{body}\nlog:\n{}", server.log_text());
-    assert_eq!(body.trim(), r#"{"status":"ready","features":["land-id","indexing-retry"]}"#);
+    assert_eq!(
+        body.trim(),
+        r#"{"status":"ready","features":["land-id","indexing-retry"]}"#
+    );
     // Liveness is unchanged.
     let (status, _, body) = http_get(server.addr, "/v1/health", None);
     assert_eq!((status, body.trim()), (200, r#""ok""#));
