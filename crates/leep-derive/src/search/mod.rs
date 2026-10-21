@@ -331,6 +331,8 @@ impl Opener {
             for (d, row) in dirs.into_iter().zip(tree_rows) {
                 let row = match row {
                     Some(row) => row,
+                    // A cold filter is derived under the pool permit; the
+                    // class limit already bounds how many searches do this.
                     None => self.repo.tree_row(d.2, &self.counters).await?,
                 };
                 if self.admits(&row)? {

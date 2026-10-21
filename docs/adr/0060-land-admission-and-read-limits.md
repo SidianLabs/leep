@@ -1,5 +1,5 @@
 # 0060. Protect lands from expensive reads, and admit lands per ref
-Status: Accepted for section 1's `search` class (built; see "Implementation notes"); the other read classes, land admission (section 2) and the dry run (section 3) are still proposed
+Status: Accepted (section 1, `search` class; see "Implementation notes"); other read classes and sections 2–3 proposed
 Date: 2026-10-21
 
 ## Context

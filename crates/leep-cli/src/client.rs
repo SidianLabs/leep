@@ -451,10 +451,13 @@ impl Client {
             {
                 // Refused before any work, so trying again is safe. A
                 // longer pause than MAX_RETRY_WAIT is reported, not waited.
-                if let (Some(next), Some(wait)) =
-                    (spare, retry_after(&resp).filter(|w| *w <= MAX_RETRY_WAIT))
-                {
-                    std::thread::sleep(jittered(wait));
+                if let (Some(next), Some(wait)) = (
+                    spare,
+                    retry_after(&resp)
+                        .filter(|w| *w <= MAX_RETRY_WAIT)
+                        .map(|w| jittered(w).min(MAX_RETRY_WAIT)),
+                ) {
+                    std::thread::sleep(wait);
                     attempt += 1;
                     current = next;
                     continue;

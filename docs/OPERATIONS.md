@@ -651,7 +651,10 @@ to 30 s searches were CPU queueing.
   times with up to 50% jitter, and the MCP server hands the refusal back to
   the agent as a retryable error without waiting.
 - The permit is held until the response body is sent, or the client goes
-  away or `--request-timeout` drops the request. Cores are the limit: the
+  away or `--request-timeout` drops the request. A UI that searches as the
+  user types should cancel the request it replaces (the permit is released
+  on cancel) or debounce, rather than raise the class: an overlapping
+  request is refused for at least 1 s. Cores are the limit: the
   count is `available_parallelism`, which follows the container's CPU quota
   on Linux.
 - Never limited: lands, ref reads (`/v1/refs`, `/v1/resolve`, `/v1/reflog`),
