@@ -1,9 +1,9 @@
-# Shared by scripts/exp/e1.sh and e3.sh (soak/e1-leader-runtime experiment
+# Shared by scripts/exp/e1.sh, e1b.sh and e3.sh (soak/e1-leader-runtime experiment
 # branch, never merged). Runs on the VPS test stack only: it restarts the
 # test server container leep-scale-server-linux and never touches the live
 # stack (/data/leep, leep-leep-server-1, leep-postgres-1, leep-tunnel-1).
 #
-# Callers set EXP (e1 or e3) before sourcing.
+# Callers set EXP (e1, e1b or e3) before sourcing.
 
 S=${S:-/data/leep-scale}
 R=$S/run
@@ -19,7 +19,7 @@ LEADER_THREADS=${LEADER_THREADS:-2}
 mkdir -p "$OUT"
 log() { echo "$(date -u +%FT%TZ) [$EXP] $*" >> "$L"; }
 
-# One experiment at a time: E1 and E3 share the lock, and neither waits.
+# One experiment at a time: E1, E1b and E3 share the lock, and none waits.
 take_lock() {
   exec 9>>"$LOCK"
   if ! flock -n 9; then
@@ -71,11 +71,13 @@ build() {
   [ -n "$DBURL" ] || { log "no LEEP_META in $R/linux.env"; exit 1; }
 }
 
-# start_server ARM: shared (baseline), own (leader on its own runtime) or
-# own-blocking (also replays on blocking threads). Restarts the test server
+# start_server ARM [SERVER-FLAGS...]: shared (baseline), own (leader on its
+# own runtime) or own-blocking (also replays on blocking threads); further
+# arguments go to leep-server after the usual flags. Restarts the test server
 # and waits for /v1/ready; checks the startup line names the arm.
 start_server() {
   local arm=$1 extra=() want
+  shift
   case $arm in
     shared) want="leader_runtime=false leader_threads=[0-9]* replay_blocking=false" ;;
     own)
@@ -95,7 +97,7 @@ start_server() {
     -e LEEP_LISTEN=0.0.0.0:7070 -e LEEP_BLOBS=file:///blobs -e LEEP_INSECURE_NO_AUTH=1 \
     "${extra[@]}" --entrypoint leep-server "$IMG" \
     --request-timeout 0 --cache-bytes 536870912 --warm-interval 250ms \
-    --metrics-listen 0.0.0.0:7071 --meta-pool-size 32 >> "$L" 2>&1 \
+    --metrics-listen 0.0.0.0:7071 --meta-pool-size 32 "$@" >> "$L" 2>&1 \
     || { log "server start failed ($arm)"; return 1; }
   local i
   for i in $(seq 1 900); do
