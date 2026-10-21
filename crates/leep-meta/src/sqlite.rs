@@ -10,7 +10,7 @@ use leep_core::{
     LandRecord, MetaStore, RefLogEntry, RefStep, RefUpdateContext, Result,
 };
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
-use sqlx::{Row, SqliteConnection, SqlitePool};
+use sqlx::{AssertSqlSafe, Row, SqliteConnection, SqlitePool};
 
 use crate::codec::Codec;
 use crate::drop::{self, nothing_left, Cursor, KEY_BATCH};
@@ -423,7 +423,7 @@ impl SqliteMetaStore {
             "DELETE FROM derived WHERE rowid >= ? AND rowid < ? AND +kind IN ({}) RETURNING kind",
             placeholders(kinds.len())
         );
-        let mut q = sqlx::query_scalar::<_, String>(&sql)
+        let mut q = sqlx::query_scalar::<_, String>(AssertSqlSafe(sql))
             .bind(at as i64)
             .bind(end as i64);
         for k in kinds {
@@ -523,7 +523,7 @@ impl MetaStore for SqliteMetaStore {
                 crate::STORED_AT_SCHEMA_VERSION,
                 placeholders(chunk.len())
             );
-            let mut q = sqlx::query(&sql);
+            let mut q = sqlx::query(AssertSqlSafe(sql));
             for k in chunk {
                 q = q.bind(*k);
             }
@@ -558,7 +558,7 @@ impl MetaStore for SqliteMetaStore {
                 "SELECT id, data FROM changesets WHERE id IN ({})",
                 placeholders(chunk.len())
             );
-            let mut q = sqlx::query(&sql);
+            let mut q = sqlx::query(AssertSqlSafe(sql));
             for k in chunk {
                 q = q.bind(*k);
             }
@@ -793,7 +793,7 @@ impl MetaStore for SqliteMetaStore {
                  WHERE name = ? AND land_id IN ({}) AND land_id IS NOT NULL",
                 placeholders(chunk.len())
             );
-            let mut q = sqlx::query_as(&sql).bind(name);
+            let mut q = sqlx::query_as(AssertSqlSafe(sql)).bind(name);
             for id in chunk {
                 q = q.bind(id.as_bytes());
             }
@@ -854,7 +854,7 @@ impl MetaStore for SqliteMetaStore {
                 "SELECT key, value FROM derived WHERE kind = ? AND key IN ({})",
                 placeholders(chunk.len())
             );
-            let mut q = sqlx::query(&sql).bind(kind);
+            let mut q = sqlx::query(AssertSqlSafe(sql)).bind(kind);
             for k in chunk {
                 q = q.bind(*k);
             }
@@ -914,7 +914,7 @@ impl MetaStore for SqliteMetaStore {
                     "SELECT count(*) FROM derived WHERE kind IN ({})",
                     placeholders(kinds.len())
                 );
-                let mut q = sqlx::query_scalar::<_, i64>(&sql);
+                let mut q = sqlx::query_scalar::<_, i64>(AssertSqlSafe(sql));
                 for k in kinds {
                     q = q.bind(*k);
                 }

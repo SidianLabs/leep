@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use leep_core::store::lease_remaining_ms;
 use leep_core::{Lease, LeaseClaim, LeaseKey, LeaseTiming, Result};
-use sqlx::{PgPool, Row, SqlitePool};
+use sqlx::{AssertSqlSafe, PgPool, Row, SqlitePool};
 
 use crate::storage;
 
@@ -87,10 +87,10 @@ pub(crate) async fn pg_get(
     key: &LeaseKey,
     timing: LeaseTiming,
 ) -> Result<Option<Lease>> {
-    let row = sqlx::query(&format!(
+    let row = sqlx::query(AssertSqlSafe(format!(
         "SELECT {COLUMNS}, {PG_NOW} AS now FROM leases \
          WHERE scope = $1 AND repo_id = $2 AND name = $3 AND shard = $4"
-    ))
+    )))
     .bind(&key.scope)
     .bind(key.repo_id)
     .bind(&key.name)
@@ -107,7 +107,7 @@ pub(crate) async fn pg_acquire(
     timing: LeaseTiming,
 ) -> Result<Lease> {
     let key = claim.key;
-    sqlx::query(&format!(
+    sqlx::query(AssertSqlSafe(format!(
         "WITH now AS (SELECT {PG_NOW} AS ms) \
          INSERT INTO leases AS l (scope, repo_id, name, shard, {COLUMNS}) \
          SELECT $1, $2, $3, $4, $5, $6, $7, $8, 1, now.ms, now.ms + $9 FROM now \
@@ -118,7 +118,7 @@ pub(crate) async fn pg_acquire(
            renewed_at = EXCLUDED.renewed_at, expires_at = EXCLUDED.expires_at \
          WHERE l.holder = EXCLUDED.holder OR l.expires_at <= EXCLUDED.renewed_at \
            OR l.renewed_at + $10 <= EXCLUDED.renewed_at"
-    ))
+    )))
     .bind(&key.scope)
     .bind(key.repo_id)
     .bind(&key.name)
@@ -151,7 +151,7 @@ pub(crate) async fn pg_renew(
     let names: Vec<&str> = held.iter().map(|(k, _)| k.name.as_str()).collect();
     let shards: Vec<i32> = held.iter().map(|(k, _)| k.shard).collect();
     let epochs: Vec<i64> = held.iter().map(|(_, e)| epoch(*e)).collect();
-    let rows = sqlx::query(&format!(
+    let rows = sqlx::query(AssertSqlSafe(format!(
         "WITH now AS (SELECT {PG_NOW} AS ms), \
               want AS (SELECT * FROM UNNEST($2::TEXT[], $3::BIGINT[], $4::TEXT[], \
                        $5::INTEGER[], $6::BIGINT[]) AS w(scope, repo_id, name, shard, epoch)) \
@@ -161,7 +161,7 @@ pub(crate) async fn pg_renew(
            AND l.name = want.name AND l.shard = want.shard AND l.epoch = want.epoch \
          RETURNING l.scope, l.repo_id, l.name, l.shard, l.holder, l.address, l.protocol, \
            l.meta, l.epoch, l.renewed_at, l.expires_at, now.ms AS now"
-    ))
+    )))
     .bind(holder)
     .bind(&scopes)
     .bind(&repos)
@@ -221,10 +221,10 @@ pub(crate) async fn sqlite_get(
     key: &LeaseKey,
     timing: LeaseTiming,
 ) -> Result<Option<Lease>> {
-    let row = sqlx::query(&format!(
+    let row = sqlx::query(AssertSqlSafe(format!(
         "SELECT {COLUMNS} FROM leases \
          WHERE scope = ? AND repo_id = ? AND name = ? AND shard = ?"
-    ))
+    )))
     .bind(&key.scope)
     .bind(key.repo_id)
     .bind(&key.name)
@@ -242,7 +242,7 @@ pub(crate) async fn sqlite_acquire(
 ) -> Result<Lease> {
     let key = claim.key;
     let now = now_ms();
-    sqlx::query(&format!(
+    sqlx::query(AssertSqlSafe(format!(
         "INSERT INTO leases (scope, repo_id, name, shard, {COLUMNS}) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9, ?9 + ?10) \
          ON CONFLICT (scope, repo_id, name, shard) DO UPDATE SET \
@@ -254,7 +254,7 @@ pub(crate) async fn sqlite_acquire(
          WHERE leases.holder = excluded.holder \
            OR leases.expires_at <= excluded.renewed_at \
            OR leases.renewed_at + ?11 <= excluded.renewed_at"
-    ))
+    )))
     .bind(&key.scope)
     .bind(key.repo_id)
     .bind(&key.name)

@@ -11,7 +11,7 @@ use leep_core::{
     LandRecord, MetaStore, RefLogEntry, RefStep, RefUpdateContext, Result, RowCount,
 };
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
-use sqlx::{PgConnection, PgPool, Row};
+use sqlx::{AssertSqlSafe, PgConnection, PgPool, Row};
 
 use crate::codec::Codec;
 use crate::drop::{self, nothing_left, Cursor, KEY_BATCH};
@@ -269,10 +269,12 @@ impl PostgresMetaStore {
                 .connect_with(opts.clone())
                 .await
                 .map_err(storage)?;
-            sqlx::query(&format!("CREATE SCHEMA IF NOT EXISTS {quoted}"))
-                .execute(&admin)
-                .await
-                .map_err(storage)?;
+            sqlx::query(AssertSqlSafe(format!(
+                "CREATE SCHEMA IF NOT EXISTS {quoted}"
+            )))
+            .execute(&admin)
+            .await
+            .map_err(storage)?;
             admin.close().await;
         }
         Self::options(schema, max, statement_timeout)
@@ -302,10 +304,12 @@ impl PostgresMetaStore {
                 let timeout = timeout.clone();
                 Box::pin(async move {
                     if let Some(set) = set {
-                        sqlx::query(&set).execute(&mut *conn).await?;
+                        sqlx::query(AssertSqlSafe(set)).execute(&mut *conn).await?;
                     }
                     if let Some(timeout) = timeout {
-                        sqlx::query(&timeout).execute(&mut *conn).await?;
+                        sqlx::query(AssertSqlSafe(timeout))
+                            .execute(&mut *conn)
+                            .await?;
                     }
                     Ok(())
                 })
@@ -330,9 +334,9 @@ impl PostgresMetaStore {
                 .map_err(storage)?;
             // After the advisory lock, which may rightly wait for another
             // migrator.
-            sqlx::query(&format!(
+            sqlx::query(AssertSqlSafe(format!(
                 "SET LOCAL lock_timeout = '{MIGRATION_LOCK_TIMEOUT}'"
-            ))
+            )))
             .execute(&mut *tx)
             .await
             .map_err(storage)?;
@@ -1249,7 +1253,7 @@ impl MetaStore for PostgresMetaStore {
              ON CONFLICT (kind, key) DO UPDATE SET value = excluded.value \
              WHERE derived.value IS DISTINCT FROM excluded.value"
         );
-        let mut q = sqlx::query(&sql)
+        let mut q = sqlx::query(AssertSqlSafe(sql))
             .bind(id.0.as_bytes().as_slice())
             .bind(data)
             .bind(kinds)
@@ -1296,7 +1300,7 @@ impl MetaStore for PostgresMetaStore {
              ON CONFLICT (kind, key) DO UPDATE SET value = excluded.value \
              WHERE derived.value IS DISTINCT FROM excluded.value"
         );
-        let mut q = sqlx::query(&sql)
+        let mut q = sqlx::query(AssertSqlSafe(sql))
             .bind(ids)
             .bind(data)
             .bind(kinds)
