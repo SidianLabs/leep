@@ -57,6 +57,9 @@ and accepts every land; it is composed with the other policies in the
 reloadable config (ADR 0024), so `cas_ref_checked` applies the same
 forward-only and protected-delete rules through the same code path and `land`
 is unchanged. The names are validated like the other policy refs (S-06) and
-join the startup warning for refs that do not exist. The cost is that a land
+join the startup warning for refs that do not exist. Like
+`--require-signatures` and `--require-review` it is a flag: a SIGHUP reload
+(ADR 0024) keeps the list the server started with. Listing a tag protects it
+from the delete-and-recreate of S-12. The cost is that a land
 onto a covered ref computes the history it adds, as for any policy, before
 the policy accepts it. No `/v1` shape or stored format changes.

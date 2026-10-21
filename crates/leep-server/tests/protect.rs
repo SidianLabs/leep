@@ -200,3 +200,164 @@ async fn unprotected_refs_are_unaffected() {
     assert_eq!(api.cas("main2", None, Some(b)).await.status, StatusCode::OK);
     assert_eq!(api.cas("main2", Some(b), None).await.status, StatusCode::OK);
 }
+
+#[tokio::test]
+async fn a_protected_tag_cannot_be_deleted() {
+    let config = ConfigHandle::load(ReloadSources {
+        protect_refs: vec!["tags/v1".into()],
+        ..Default::default()
+    })
+    .unwrap();
+    let repo = Repo::new(
+        Arc::new(MemoryBlobStore::new()),
+        Arc::new(MemoryMetaStore::new()),
+    );
+    let api = Api(leep_server::router_with_config(
+        repo,
+        1 << 20,
+        Duration::from_secs(60),
+        config,
+    ));
+    let a = api.commit(&[], "f", "1\n").await;
+    let b = api.commit(&[a], "f", "2\n").await;
+    // Creating it is allowed; tags never move, protected or not.
+    assert_eq!(
+        api.cas("tags/v1", None, Some(a)).await.status,
+        StatusCode::OK
+    );
+    let r = api.cas("tags/v1", Some(a), Some(b)).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.body);
+    // Unlike an unprotected tag, it cannot be deleted and recreated elsewhere.
+    let r = api.cas("tags/v1", Some(a), None).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.body);
+    assert!(error(&r).contains("cannot delete"), "{}", r.body);
+    assert_eq!(api.head("tags/v1").await, Some(a));
+    // Other tags keep the old rule.
+    assert_eq!(
+        api.cas("tags/v2", None, Some(a)).await.status,
+        StatusCode::OK
+    );
+    assert_eq!(
+        api.cas("tags/v2", Some(a), None).await.status,
+        StatusCode::OK
+    );
+}
+
+/// `--protect-ref main` beside `--require-review main`: protection adds no
+/// way around review.
+#[tokio::test]
+async fn protecting_a_reviewed_ref_still_requires_review() {
+    let dir = tempfile::tempdir().unwrap();
+    let tokens = dir.path().join("tokens.json");
+    std::fs::write(
+        &tokens,
+        serde_json::json!({ "tokens": [
+            { "name": "alice", "role": "write", "hash": leep_server::auth::hash_token("tok-alice") },
+            { "name": "bob", "role": "write", "hash": leep_server::auth::hash_token("tok-bob") },
+        ]})
+        .to_string(),
+    )
+    .unwrap();
+    let config = ConfigHandle::load(ReloadSources {
+        tokens_file: Some(tokens),
+        require_review: vec!["main".into()],
+        protect_refs: vec!["main".into()],
+        ..Default::default()
+    })
+    .unwrap();
+    let repo = Repo::new(
+        Arc::new(MemoryBlobStore::new()),
+        Arc::new(MemoryMetaStore::new()),
+    );
+    let app = leep_server::router_with_config(repo, 1 << 20, Duration::from_secs(60), config);
+    let call = |method: Method, uri: String, tok: &'static str, body: Vec<u8>| {
+        let app = app.clone();
+        async move {
+            let req = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("authorization", format!("Bearer {tok}"))
+                .body(Body::from(body))
+                .unwrap();
+            let resp = app.oneshot(req).await.unwrap();
+            let status = resp.status();
+            let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+            (
+                status,
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap_or_default(),
+            )
+        }
+    };
+    let text = "1\n";
+    let h = Hash::of_blob(text.as_bytes());
+    let (s, _) = call(
+        Method::PUT,
+        format!("/v1/blobs/{h}"),
+        "tok-bob",
+        text.into(),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let cs = Changeset {
+        parents: vec![],
+        author: "t".into(),
+        timestamp: 1,
+        message: "m".into(),
+        changes: BTreeMap::from([(
+            RepoPath::new("f").unwrap(),
+            FileChange::Modify {
+                content: h,
+                kind: FileKind::Regular,
+                size: 2,
+            },
+        )]),
+        extra: BTreeMap::new(),
+    };
+    let (s, v) = call(
+        Method::POST,
+        "/v1/changesets".into(),
+        "tok-bob",
+        serde_json::to_vec(&cs).unwrap(),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let id = serde_json::from_value::<CreateChangesetResponse>(v)
+        .unwrap()
+        .id;
+    let land = serde_json::to_vec(&LandRequest {
+        changeset: id,
+        target_ref: "main".into(),
+        create: None,
+        land_id: None,
+    })
+    .unwrap();
+    let cas = serde_json::to_vec(&CasRefRequest {
+        expected: None,
+        new: Some(id),
+        ..Default::default()
+    })
+    .unwrap();
+    for (uri, body) in [("/v1/land", land.clone()), ("/v1/refs/main", cas)] {
+        let (s, v) = call(Method::POST, uri.into(), "tok-bob", body).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{uri}: {v}");
+        assert!(
+            v["error"]
+                .as_str()
+                .unwrap()
+                .contains(leep_core::review::NEEDS_REVIEW_MARKER),
+            "{uri}: {v}"
+        );
+    }
+    let approve = serde_json::json!({ "verdict": "approve" }).to_string();
+    let (s, v) = call(
+        Method::POST,
+        format!("/v1/changesets/{id}/reviews"),
+        "tok-alice",
+        approve.into(),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let (s, v) = call(Method::POST, "/v1/land".into(), "tok-bob", land).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["status"], "landed", "{v}");
+}
