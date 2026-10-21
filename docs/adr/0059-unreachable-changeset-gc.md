@@ -386,8 +386,8 @@ example with partitioning and a compact id table.
   - **Without `--backups`,** an explicit `--backup-fence` is required.
   - **There is no measured figure for a large store.** PERFORMANCE.md,
     "Backup and restore", measures a 5,000-changeset store only (8 to
-    16 s). Phase 1 measures a backup of the Linux store on the VPS and
-    records it there.
+    16 s). A backup of the Linux store on the VPS is pending: it is
+    measured and recorded there before phase 2.
   - **A slower backup fails loudly.** One that runs longer than the fence
     still finds the blob missing and is sealed failed (exit 1), which is
     loud, not corrupting. `LeepBackupSlow` already alerts on backup
@@ -476,8 +476,8 @@ index rows (see "Not addressed").
 | Phase | What | Default |
 |---|---|---|
 | 0 | E4 dry run (this branch) | read-only tool |
-| 1 | Migration 0007 (`stored_at`); `cs-reach-v1`; `delete_changesets` with contract tests; servers rescue (flag read, handshake, per-attempt batch re-check, `MAX_BATCH_LIFETIME`); `land_enqueue`'s land-id miss path; a measured Linux backup duration. The dry run switches to `stored_at` | rescue code active, nothing condemns |
-| 2 | `gc --unreachable` condemn, collect and tombstone pass; `gc --full` honours `--backup-fence` | off; `--dry-run` first, on staging, then production |
+| 1 | Migration 0007 (`stored_at`); `cs-reach-v1`; servers rescue (flag read, handshake, per-attempt batch re-check, `MAX_BATCH_LIFETIME`); `land_enqueue`'s land-id miss path. The dry run switches to `stored_at`. Pending, measured on the VPS before phase 2: the Linux store's backup duration | rescue code active, nothing condemns |
+| 2 | `MetaStore::delete_changesets` with its contract tests (the delete path gets its own review gate); `gc --unreachable` condemn, collect and tombstone pass; `gc --full` honours `--backup-fence` | off; `--dry-run` first, on staging, then production |
 
 Upgrade every server to phase 1 before the first condemnation. Servers
 built earlier do not rescue, exactly as ADR 0012 required for blobs.

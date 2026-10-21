@@ -1341,7 +1341,9 @@ ADR 0059 will delete changesets that nothing reaches (refs, every ref log
 entry, the landed-copy scan window of every head, attestations, git mirror
 maps, and a grace period) with the condemn, fence and collect protocol
 blob GC uses. **Phase 1 is built: nothing condemns or deletes yet.** It is
-what every server must run before a sweep may run beside it:
+what every server must run before a sweep may run beside it. Deleting
+(`MetaStore::delete_changesets`) and the sweep itself come with phase 2.
+Phase 1 is:
 
 - **Store times.** Migration 0007 adds `changesets.stored_at`, written on
   every new changeset; sweeps and the dry run age changesets by it. It is
@@ -1361,6 +1363,10 @@ what every server must run before a sweep may run beside it:
 - **Land ids outlive originals.** A keyed land retry whose changeset is no
   longer stored is answered from its land id record
   (`leep_land_answered_from_record_total{original="missing"}`).
+- **Metrics and alert:** `leep_gc_changesets_rescued_total`,
+  `leep_land_batch_deadline_total` and
+  `leep_land_answered_from_record_total` (see [Metrics](#metrics)), and
+  [LeepLandBatchDeadline](RUNBOOKS.md#leeplandbatchdeadline).
 - `GET /v1/ready` lists `changeset-rescue`.
 
 **Before the first condemnation** (phase 2), upgrade every server, importer
