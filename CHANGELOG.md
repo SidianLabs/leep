@@ -7,6 +7,12 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 ## [Unreleased]
 
+### zstd 0.14
+- zstd is upgraded from 0.13 to 0.14 (Refs #122). Stored packs and changeset
+  rows read as before. **Operators:** pack ids hash the compressed bytes, so
+  the first full repack after this upgrade rewrites every pack once. That is
+  expected.
+
 ### Searches are limited per server, so lands keep their cores
 - The server runs at most `--read-concurrency search=N` searches at once
   (default: half the cores, at least 1) and refuses the next one at once with

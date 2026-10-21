@@ -693,8 +693,12 @@ first, then packs. Hashes, `TreeNode`, the API and clients do not change.
 | `packs/.tmp-*` | a write in progress, or garbage of a killed repack |
 | `<shard>/.repack-<rest of hex>` | a loose copy a repack moved aside; a whole object |
 
-`<id>` is the lowercase hex BLAKE3 of the whole `.idx` file. All integers are
-big-endian.
+`<id>` is the lowercase hex BLAKE3 of the whole `.idx` file. The id is
+therefore a function of the compressed bytes: the same objects packed by a
+different zstd version, level or build get a different id, and a full repack
+after a zstd upgrade rewrites every pack once. Nothing relies on the reverse;
+one id names one set of bytes, which is all repack, backup and sync assume.
+All integers are big-endian.
 
 **`.pack`**: the 8 bytes `LEEPPAK1`, then the entries back to back with no
 separators or padding. Each entry is one standard zstd frame (with its

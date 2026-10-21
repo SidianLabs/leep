@@ -48,6 +48,6 @@ serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
-zstd = "0.13"
+zstd = "0.14.3"
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
