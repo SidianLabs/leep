@@ -1153,6 +1153,31 @@ still refused. New flags and variables: `--rate-limit`/`LEEP_RATE_LIMIT`,
 `--max-concurrent-per-token`/`LEEP_MAX_CONCURRENT_PER_TOKEN`,
 `--read-max-body-bytes`/`LEEP_READ_MAX_BODY_BYTES`.
 
+## Read class refusals (additive header, ADR 0060)
+
+Nothing persisted changed, and no field, code or route was added. A server
+may refuse `GET /v1/search/{rev}` when the search class is at its
+concurrency limit (`--read-concurrency`): `503`, code `unavailable`, the
+usual `ErrorResponse` body, `Retry-After` (whole seconds, 1 to 10), and the
+new response header `Leep-Refused: <reason>`.
+
+- `Leep-Refused` means a Leep server refused the request before doing any
+  work, so it may be sent again unchanged, even a request that is not
+  idempotent. Only a Leep server sets it, and only on such a refusal; a
+  `503` without it, which a proxy or balancer may also send, promises
+  nothing.
+- Values: `read-class` (an expensive read whose class is full). ADR 0060
+  reserves `admission` (a land refused by a full ref queue) and
+  `body-budget` (the in-flight body budget's `503`); servers do not send
+  those yet. Clients should treat any value as "refused before any work"
+  and must not depend on the list being closed.
+- A follower that relays a forwarded land's answer (ADR 0056) copies
+  `Leep-Refused` along with `Content-Type` and `Retry-After`.
+- `leep` retries a `GET` answered this way like a `429`: at most four tries,
+  waiting `Retry-After` plus up to 50% jitter, and reporting a wait over
+  10 s instead of sleeping. Older clients report the `503` as a server
+  error, whose message says to retry.
+
 ## Error codes (additive API field, no persisted change)
 
 `ErrorResponse` gains `code`, and `AmbiguousPrefixResponse` too: a string
@@ -1188,7 +1213,7 @@ client treats an unknown or absent code by its HTTP status.
 | 500 | `internal` | the server failed |
 | 503 | `indexing` | the index is too far behind; see `indexing` and `Retry-After` (ADR 0058) |
 | 503 | `not_leader` | the server no longer coordinates lands on that ref; send the land again (ADR 0056) |
-| 503 | `unavailable` | overloaded or busy, including request bodies in flight at the server's limit (`--max-inflight-bytes`), with `Retry-After` when known: back off and retry |
+| 503 | `unavailable` | overloaded or busy, including request bodies in flight at the server's limit (`--max-inflight-bytes`) and an expensive read whose class is full (`--read-concurrency`, ADR 0060), with `Retry-After` when known: back off and retry. With `Leep-Refused` the request was refused before any work and may be sent again, an unkeyed land included; without it nothing is promised |
 
 A lost `POST /v1/refs/{name}` swap is unchanged: `409` with `CasRefResponse`
 (`ok: false`), not an error body. The marker texts (`NEEDS_REVIEW_MARKER`,

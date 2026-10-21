@@ -42,7 +42,10 @@ pub struct Server {
 
 impl Server {
     pub fn new(cfg: Config) -> Self {
-        let client = Client::with_token(&cfg.server, cfg.token.as_deref());
+        // A tool call never sleeps: a read the server refused for being busy
+        // goes back to the agent with when to ask again (ADR 0060).
+        let client =
+            Client::with_token(&cfg.server, cfg.token.as_deref()).with_refusal_retries(false);
         Server {
             client,
             cfg,

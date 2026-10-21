@@ -39,6 +39,19 @@ impl From<CliError> for ToolError {
                 request_note(&e)
             ));
         }
+        if let Some(refused) = e.refused() {
+            // ADR 0060: refused before any work, so calling again is safe.
+            let secs = e.retry_after_ms().unwrap_or(1000).div_ceil(1000).max(1);
+            return ToolError(format!(
+                "{} [code: {}; Leep-Refused: {refused}]. Nothing was done; this error is \
+                 retryable: call the tool again with the same arguments in about {secs}s \
+                 (retry_after: {secs}){}",
+                e.message().trim_start_matches("server: "),
+                e.server_code()
+                    .unwrap_or(leep_core::api::error_code::UNAVAILABLE),
+                request_note(&e)
+            ));
+        }
         ToolError(describe(&e))
     }
 }

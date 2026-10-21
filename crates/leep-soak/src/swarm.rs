@@ -227,6 +227,9 @@ struct Tally {
     indexing: BTreeMap<&'static str, u64>,
     /// Reads answered at an older changeset (`stale-ok`), by route.
     stale: BTreeMap<&'static str, u64>,
+    /// Reads the server refused because their class was full (503 with
+    /// `Leep-Refused`, ADR 0060), by route: shed, not failed or timed out.
+    shed: BTreeMap<&'static str, u64>,
 }
 
 impl Tally {
@@ -258,6 +261,8 @@ enum ReadAnswer {
     },
     /// 503 because the index lags (ADR 0058).
     Indexing,
+    /// 503 with `Leep-Refused`: refused before any work (ADR 0060).
+    Shed,
     Status(u16),
     Lost(String),
 }
@@ -321,6 +326,11 @@ impl Shared {
             Err(e) => ReadAnswer::Lost(short_err(&e)),
             Ok(r) => {
                 let s = r.status();
+                if s == StatusCode::SERVICE_UNAVAILABLE
+                    && r.headers().contains_key(leep_core::api::REFUSED_HEADER)
+                {
+                    return ReadAnswer::Shed;
+                }
                 match r.bytes().await {
                     Err(e) => ReadAnswer::Lost(short_err(&e)),
                     Ok(b) if s == StatusCode::OK => ReadAnswer::Ok {
@@ -473,6 +483,11 @@ async fn agent(s: Arc<Shared>, who: usize, start_after: Duration) -> Tally {
                 ReadAnswer::Indexing => {
                     if measuring {
                         *t.indexing.entry(op).or_default() += 1;
+                    }
+                }
+                ReadAnswer::Shed => {
+                    if measuring {
+                        *t.shed.entry(op).or_default() += 1;
                     }
                 }
                 ReadAnswer::Status(c) => t.error(format!("{op} {c}")),
@@ -958,6 +973,8 @@ struct Report {
     indexing_answers: BTreeMap<String, u64>,
     /// Reads answered at an older changeset, by route.
     stale_answers: BTreeMap<String, u64>,
+    /// Reads refused because their class was full (ADR 0060), by route.
+    shed_reads: BTreeMap<String, u64>,
     /// Queries that derived an index inline in `lease` or `off` mode
     /// (`leep_query_inline_derive_total`; 0 while a lease lives).
     inline_derives: f64,
@@ -1094,6 +1111,9 @@ async fn main() -> Result<()> {
         for (k, v) in a.stale {
             *tally.stale.entry(k).or_default() += v;
         }
+        for (k, v) in a.shed {
+            *tally.shed.entry(k).or_default() += v;
+        }
     }
     if let Some(t) = lag_task {
         t.await?;
@@ -1174,6 +1194,11 @@ async fn main() -> Result<()> {
             .collect(),
         stale_answers: tally
             .stale
+            .iter()
+            .map(|(k, v)| (k.to_string(), *v))
+            .collect(),
+        shed_reads: tally
+            .shed
             .iter()
             .map(|(k, v)| (k.to_string(), *v))
             .collect(),
@@ -1259,11 +1284,12 @@ fn print_report(r: &Report) {
         println!("| {k} | {} | {:.1} | {:.1} |", v.count, v.p50_ms, v.p99_ms);
     }
     println!(
-        "indexing header {} | lands/s per agent {:.4} | indexing answers {:?} | stale answers {:?} | inline derivations {} | history derived {} for {} rows",
+        "indexing header {} | lands/s per agent {:.4} | indexing answers {:?} | stale answers {:?} | shed reads {:?} | inline derivations {} | history derived {} for {} rows",
         r.indexing_header.as_deref().unwrap_or("none"),
         r.lands_per_agent_s,
         r.indexing_answers,
         r.stale_answers,
+        r.shed_reads,
         r.inline_derives,
         r.history_derived,
         r.history_rows_added.map_or("-".into(), |n| n.to_string()),
