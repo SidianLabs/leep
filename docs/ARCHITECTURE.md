@@ -281,10 +281,12 @@ of its parents' entries, so a side branch's changes are never lost. The index
 is derived oldest first, by the warmer or by the first path query, whichever
 comes first. `author` and
 `extra` filters apply to the changesets the walk yields, so a selective filter
-on a frequently changed path still reads each of them. Without a filter the
-walk reads a changeset only when the ancestry cache lacks its parents, and the
-page's changesets and root trees are read afterwards in one batch each, so a
-warm path log makes no round trip per entry.
+on a frequently changed path still reads each of them. In a plain path log
+(not `follow`, which still reads each changeset to look for renames) without
+a filter, the walk reads a changeset only when the ancestry cache lacks its
+parents or a bounded query must examine it, and the page's changesets and
+root trees are read afterwards in one batch each, so a warm path log makes
+no round trip per entry.
 Directory nodes keep deleted entries, so a busy directory's node grows with
 every name it ever held. Nodes of more than 64 entries are therefore stored as
 chunks of about 32 entries whose boundaries depend only on the names (ADR
