@@ -981,7 +981,8 @@ auth is off and the server warns, and it refuses a non-loopback `--listen`
 unless `--insecure-no-auth` is given.
 With it, an axum middleware requires `Authorization: Bearer <token>` on every
 endpoint except `GET /v1/health`: 401 (with `WWW-Authenticate: Bearer`) when the
-token is missing or unknown, 403 when a `read` token makes a mutating request.
+token is missing, unknown or past the entry's optional `expires` time, 403
+when a `read` token makes a mutating request.
 `POST /v1/blobs/missing` counts as read because it only queries; it takes at
 most 100,000 hashes (the CLI sends 10,000 at a time), and read tokens' bodies are capped at 1 MiB by default. Digests are
 compared in constant time, and only the token name is logged. Use

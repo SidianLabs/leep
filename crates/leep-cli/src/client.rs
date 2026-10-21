@@ -856,10 +856,23 @@ fn error_from(resp: Response, has_token: bool) -> CliError {
     let status = resp.status();
     match status {
         StatusCode::UNAUTHORIZED if has_token => {
-            return CliError::new(
-                ErrorKind::Auth,
-                "authentication required: the server rejected the token; check LEEP_TOKEN",
-            )
+            // The server says why only when the token is known: it expired.
+            let said = resp
+                .text()
+                .ok()
+                .and_then(|b| serde_json::from_str::<ErrorResponse>(&b).ok())
+                .map(|e| e.error)
+                .filter(|e| e.contains("token expired"));
+            return match said {
+                Some(msg) => CliError::new(ErrorKind::Auth, msg).with_hint(
+                    "ask the server's operator for a new token, then set LEEP_TOKEN \
+                     (or `leep init --token`)",
+                ),
+                None => CliError::new(
+                    ErrorKind::Auth,
+                    "authentication required: the server rejected the token; check LEEP_TOKEN",
+                ),
+            };
         }
         StatusCode::UNAUTHORIZED => {
             return CliError::new(
@@ -1083,6 +1096,22 @@ mod tests {
         let e = Client::new(&url).refs().unwrap_err();
         assert!(e.to_string().contains("retry after 60s"), "{e}");
         assert_eq!(seen.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn an_expired_token_is_named_as_such() {
+        const EXPIRED: &str = "HTTP/1.1 401 Unauthorized\r\nwww-authenticate: Bearer\r\n\
+            content-type: application/json\r\ncontent-length: 93\r\nconnection: close\r\n\r\n\
+            {\"error\":\"authentication required: token expired at 2020-01-01T00:00:00Z; ask for a new one\"}";
+        let (url, _) = stub(&[EXPIRED]);
+        let e = Client::with_token(&url, Some("t")).refs().unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Auth);
+        assert!(e.to_string().contains("expired at 2020-01-01"), "{e}");
+        assert!(e.hint().unwrap().contains("new token"), "{e:?}");
+        // Any other 401 keeps the fixed text.
+        let (url, _) = stub(&[EXPIRED.replace("token expired", "token unknown").leak()]);
+        let e = Client::with_token(&url, Some("t")).refs().unwrap_err();
+        assert!(e.to_string().contains("rejected the token"), "{e}");
     }
 
     #[test]
