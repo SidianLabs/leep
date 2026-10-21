@@ -296,6 +296,10 @@ enum Cmd {
         /// the entry gets an `expires` time. Never expires when unset.
         #[arg(long, value_parser = parse_ready_timeout)]
         expires_in: Option<std::time::Duration>,
+        /// Keep this token from posting reviews (`"review": false`); its
+        /// reviews never count. For agent tokens.
+        #[arg(long)]
+        no_review: bool,
     },
     /// Delete blobs no changeset references (uses --meta and --blobs; safe
     /// beside running servers). Without a phase: condemn, wait --fence, then
@@ -676,9 +680,11 @@ fn run_command(cmd: Cmd) -> anyhow::Result<()> {
             role,
             author,
             expires_in,
+            no_review,
         } => {
             let (token, mut entry) = auth::generate(&name, role).map_err(anyhow::Error::msg)?;
             entry.author = author;
+            entry.review = no_review.then_some(false);
             if let Some(d) = expires_in {
                 let at = jiff::Timestamp::now()
                     .checked_add(d)

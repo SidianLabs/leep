@@ -782,7 +782,19 @@ fn error_from(resp: Response, has_token: bool) -> CliError {
                 "authentication required: set LEEP_TOKEN (or pass --token)",
             )
         }
-        StatusCode::FORBIDDEN => return CliError::new(ErrorKind::Auth, "token lacks write access"),
+        StatusCode::FORBIDDEN => {
+            // The server's reason (no write access, or not a reviewer).
+            let said = resp
+                .text()
+                .ok()
+                .and_then(|b| serde_json::from_str::<ErrorResponse>(&b).ok())
+                .map(|e| e.error)
+                .filter(|e| !e.is_empty());
+            return CliError::new(
+                ErrorKind::Auth,
+                said.unwrap_or_else(|| "token lacks write access".into()),
+            );
+        }
         _ => {}
     }
     let body = resp.text().unwrap_or_default();

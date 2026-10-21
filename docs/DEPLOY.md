@@ -316,6 +316,15 @@ owner may have rejected it. Reviewers use `leep review approve|reject REV`;
 Review endpoints answer 400 on a server without a tokens file. Reviews are
 looked up once per write token, so removing a token drops its reviews.
 
+Every write token is a reviewer unless its entry says `"review": false`
+(`gen-token --no-review` writes it). **Give agent tokens `"review": false`**,
+and keep review for the tokens of people who own code: otherwise one agent can
+approve another agent's change, or its own wherever no `OWNERS` file applies,
+and the policy checks nothing. Such a token can still commit, land and
+move refs like any write token; posting a review is a 403 (`token may not
+review`), and reviews it posted before are ignored from the next request on
+(the field reloads on SIGHUP).
+
 ## Reloading config
 
 Send SIGHUP to the server to re-read the tokens file, the signing keys file and

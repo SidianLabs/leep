@@ -12,8 +12,9 @@
 //! ```
 //!
 //! An entry may also carry request limits (`rate`, `burst`, `concurrency`,
-//! `max_body`; ADR 0020), see [`crate::limits`], and `expires`, an RFC 3339
-//! time after which the token is refused.
+//! `max_body`; ADR 0020), see [`crate::limits`], `expires`, an RFC 3339
+//! time after which the token is refused, and `"review": false`, which takes
+//! a write token out of the reviewers (ADR 0011).
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -76,6 +77,8 @@ pub struct Principal {
     pub role: Role,
     /// The token entry's `author`, for clients to stamp on changesets.
     pub author: Option<String>,
+    /// Whether the token may post reviews (`"review": false` says no).
+    pub review: bool,
 }
 
 /// The request's [`Principal`], or `None` when authentication is off.
@@ -116,6 +119,10 @@ pub struct TokenEntry {
     /// as `2027-01-31T00:00:00Z`. Absent, it never expires.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires: Option<String>,
+    /// Whether a write token may post reviews and its reviews count.
+    /// Absent means yes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review: Option<bool>,
 }
 
 /// How far ahead `leep_tokens_expiring_soon` looks.
@@ -134,6 +141,7 @@ struct Known {
     digest: [u8; 32],
     limits: TokenLimits,
     expires: Option<jiff::Timestamp>,
+    review: bool,
 }
 
 impl Known {
@@ -171,6 +179,8 @@ pub struct AuthChange {
     pub role_changed: Vec<String>,
     pub limits_changed: Vec<String>,
     pub expiry_changed: Vec<String>,
+    /// Gained or lost the right to review.
+    pub review_changed: Vec<String>,
 }
 
 impl AuthChange {
@@ -208,6 +218,7 @@ pub fn generate(name: &str, role: Role) -> Result<(String, TokenEntry), String> 
         concurrency: None,
         max_body: None,
         expires: None,
+        review: None,
     };
     Ok((token, entry))
 }
@@ -272,6 +283,7 @@ impl Auth {
                 digest,
                 limits,
                 expires,
+                review: t.review.unwrap_or(true),
             });
         }
         Ok(Auth { tokens })
@@ -291,12 +303,12 @@ impl Auth {
         self.tokens.is_empty()
     }
 
-    /// Names of the tokens that may write, in file order: the principals whose
-    /// reviews count.
+    /// Names of the tokens that may write and review, in file order: the
+    /// principals whose reviews count.
     pub fn reviewers(&self) -> Vec<String> {
         self.tokens
             .iter()
-            .filter(|k| k.role == Role::Write)
+            .filter(|k| k.role == Role::Write && k.review)
             .map(|k| k.name.clone())
             .collect()
     }
@@ -354,6 +366,10 @@ impl Auth {
                     .opt_str(k.expires.map(|e| e.to_string()).as_deref());
             }
         }
+        let barred: Vec<&String> = all.iter().filter(|k| !k.review).map(|k| &k.name).collect();
+        if !barred.is_empty() {
+            c.set("token-no-review", barred);
+        }
     }
 
     /// What `newer` changes relative to `self`, each list sorted by name.
@@ -379,6 +395,9 @@ impl Auth {
             if o.expires != k.expires {
                 c.expiry_changed.push(name.to_string());
             }
+            if o.review != k.review {
+                c.review_changed.push(name.to_string());
+            }
         }
         c.removed = old
             .keys()
@@ -392,6 +411,7 @@ impl Auth {
             &mut c.role_changed,
             &mut c.limits_changed,
             &mut c.expiry_changed,
+            &mut c.review_changed,
         ] {
             list.sort();
         }
@@ -471,7 +491,11 @@ pub async fn require_token(mut req: Request, next: Next) -> Response {
         );
     }
     let Known {
-        name, role, author, ..
+        name,
+        role,
+        author,
+        review,
+        ..
     } = known;
     let role = *role;
     if role == Role::Read && needs_write(req.method(), req.uri().path()) {
@@ -483,6 +507,7 @@ pub async fn require_token(mut req: Request, next: Next) -> Response {
         name: name.to_string(),
         role,
         author: author.clone(),
+        review: *review,
     });
     next.run(req).instrument(span).await
 }
@@ -547,6 +572,24 @@ mod tests {
     }
 
     #[test]
+    fn tokens_with_review_false_are_not_reviewers() {
+        let text = serde_json::json!({ "tokens": [
+            { "name": "agent-1", "role": "write", "hash": hash_token("a"), "review": false },
+            { "name": "alice", "role": "write", "hash": hash_token("b"), "review": true },
+            { "name": "bob", "role": "write", "hash": hash_token("c") },
+        ]})
+        .to_string();
+        let a = Auth::parse(&text).unwrap();
+        assert_eq!(a.reviewers(), ["alice", "bob"]);
+        assert!(!a.lookup("a").unwrap().review);
+        assert!(a.lookup("c").unwrap().review);
+        let bad =
+            r#"{ "tokens": [{ "name": "x", "role": "write", "hash": "HASH", "review": "no" }] }"#
+                .replace("HASH", &hash_token("a"));
+        assert!(Auth::parse(&bad).is_err());
+    }
+
+    #[test]
     fn write_classification() {
         assert!(!needs_write(&Method::GET, "/v1/refs"));
         assert!(!needs_write(&Method::GET, "/v1/search/main"));
@@ -576,6 +619,7 @@ mod tests {
             { "name": "throttled", "role": "write", "hash": hash_token("4") },
             { "name": "gone", "role": "write", "hash": hash_token("5") },
             { "name": "same2", "role": "write", "hash": hash_token("7") },
+            { "name": "agent", "role": "write", "hash": hash_token("8") },
         ]));
         let new = parse(serde_json::json!([
             { "name": "same", "role": "write", "hash": hash_token("1") },
@@ -584,6 +628,7 @@ mod tests {
             { "name": "throttled", "role": "write", "hash": hash_token("4"), "rate": 2 },
             { "name": "fresh", "role": "read", "hash": hash_token("6") },
             { "name": "same2", "role": "write", "hash": hash_token("7"), "expires": "2030-01-01T00:00:00Z" },
+            { "name": "agent", "role": "write", "hash": hash_token("8"), "review": false },
         ]));
         assert!(old.diff(&old).is_empty());
         let c = old.diff(&new);
@@ -593,5 +638,6 @@ mod tests {
         assert_eq!(c.role_changed, ["promoted"]);
         assert_eq!(c.limits_changed, ["throttled"]);
         assert_eq!(c.expiry_changed, ["same2"]);
+        assert_eq!(c.review_changed, ["agent"]);
     }
 }
