@@ -96,6 +96,9 @@ measured until the response head is ready, not until the body is streamed.
 | `leep_blob_cache_entries` | gauge | none | Blobs held in the cache. |
 | `leep_requests_limited_total` | counter | `reason` = `rate`, `concurrency`, `size`; `token` | Requests refused by a request limit (ADR 0020). `token` is the token's name, or `anonymous` for every client address when there is no tokens file. |
 | `leep_requests_in_flight` | gauge | `token` | Requests in progress, until their response body has been sent. Only tokens that have a limit are tracked. |
+| `leep_tokens_expiring_soon` | gauge | none | Tokens in the tokens file whose `expires` is within 7 days and not yet past. Refreshed every minute and on every load. |
+| `leep_tokens_expired` | gauge | none | Tokens still in the tokens file whose `expires` has passed; requests with them get 401. |
+| `leep_token_expired_requests_total` | counter | `token` | Requests refused because their token had expired: an agent still using a token that ran out. |
 | `leep_config_reload_total` | counter | `result` = `ok`, `error` | Config reloads (SIGHUP) by result; both series exist from startup (ADR 0024). |
 | `leep_config_generation` | gauge | none | **Per process:** 1 at startup, plus one per successful reload, even when nothing changed. It resets on restart, so it differs between healthy servers that run identical config; do not alert on it. Use `leep_config_info` to compare servers. |
 | `leep_config_info` | gauge | `fingerprint` | 1 for the fingerprint of the config in force, 0 for the ones this process ran before, so `leep_config_info == 1` has exactly one series per server. The fingerprint is 16 hex characters of a BLAKE3 over the parsed config (tokens with their authors and limits, trusted keys, review policy, `--require-signatures` and review refs, and the server-wide limit defaults), so it is the same on every server that runs the same config, across restarts, and does not change when a file is only reformatted or reordered. It holds no secret: tokens are already digests, keys are public, and the hash is truncated. It is also logged at startup and on every reload. |
@@ -276,6 +279,13 @@ groups:
     annotations:
       summary: "A SIGHUP reload was refused; the server runs the previous config. This alert clears after 10 minutes even if the file is still bad: read the ERROR log line, fix the file, signal again, and confirm."
       runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepconfigreloadfailed
+  - alert: LeepTokensExpiringSoon
+    expr: max(leep_tokens_expiring_soon) > 0 or max(leep_tokens_expired) > 0
+    for: 1h
+    labels: {severity: ticket}
+    annotations:
+      summary: "A token in the tokens file expires within 7 days, or has expired and is still listed: rotate it before its agent starts getting 401."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leeptokensexpiringsoon
   - alert: LeepConfigSkew
     # One series per server is 1; two different fingerprints means two different configs.
     expr: count(count by (fingerprint) (leep_config_info == 1)) > 1

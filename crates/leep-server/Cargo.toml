@@ -20,6 +20,7 @@ anyhow.workspace = true
 arc-swap.workspace = true
 blake3.workspace = true
 hex.workspace = true
+jiff.workspace = true
 ed25519-dalek.workspace = true
 getrandom.workspace = true
 async-trait.workspace = true
