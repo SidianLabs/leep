@@ -272,7 +272,7 @@ enum Cmd {
         author: Option<String>,
         /// Make the token stop working this long from now (30m, 24h, 90d);
         /// the entry gets an `expires` time. Never expires when unset.
-        #[arg(long, value_parser = parse_ready_timeout)]
+        #[arg(long, value_parser = parse_expires_in)]
         expires_in: Option<std::time::Duration>,
         /// Keep this token from posting reviews (`"review": false`); its
         /// reviews never count. For agent tokens.
@@ -547,6 +547,15 @@ fn parse_ready_timeout(s: &str) -> Result<std::time::Duration, String> {
     let d = parse_interval(s)?;
     if d.is_zero() {
         return Err("must be greater than zero".into());
+    }
+    Ok(d)
+}
+
+/// `gen-token --expires-in`: a lifetime, so zero (expired at birth) is refused.
+fn parse_expires_in(s: &str) -> Result<std::time::Duration, String> {
+    let d = parse_grace(s)?;
+    if d.is_zero() {
+        return Err("must be greater than zero, e.g. 30d".into());
     }
     Ok(d)
 }

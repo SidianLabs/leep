@@ -59,10 +59,12 @@ change with a regression test.
 | S-12 | Refs | Low | Any writer can delete and recreate an unprotected tag; protection is by exact name | Accepted risk, ADR 0015 |
 | S-13 | Resource use | Low | A filtered `log` scans history until it finds `limit` matches | Accepted risk, ADR 0020 |
 | S-14 | Review | Low | Owner matching is byte-exact; case or Unicode variants of a directory are other directories | Accepted risk, ADR 0011 |
-| S-15 | Review | Info | Unowned paths accept any approval, including the pusher's own | Already documented, ADR 0011 |
+| S-15 | Review | Info | Unowned paths accept any approval, including the pusher's own | Mitigated 2026-10-21 by `"review": false` on agent tokens (S-22), ADR 0011 |
 | S-16 | Auth | Info | No issue found; the metrics listener shows token names | Note in ADR 0007 |
 | S-17 | Signing | Info | No issue found | Note in ADR 0010 |
 | S-18 | Refs | Info | No issue found in name validation, tag immutability, protected delete or ref log attribution | — |
+| S-21 | Auth | Low | Tokens had no time bound, so a token made for a short-lived agent stayed valid until removed by hand | Fixed 2026-10-21, `expires`, ADR 0007 |
+| S-22 | Review | Medium | Every write token was a reviewer, so one agent could approve another's change, or its own on unowned paths | Fixed 2026-10-21, `"review": false`, ADR 0011 |
 
 ### S-01: merge-parent laundering (High, fixed)
 
@@ -265,6 +267,8 @@ closes the gap. Recorded in ADR 0011.
 - **Self-approval (S-15).** Where no `OWNERS` file applies, any principal,
   including the token that pushed the change, can approve it. This is ADR
   0011's documented opt-in model; use a root `OWNERS` file on protected refs.
+  Since S-22, giving agent tokens `"review": false` keeps agents from
+  approving at all, which closes the agent-approves-itself case.
 - **Authentication (S-16).** Tokens are hashed and compared in constant time
   against every entry without early exit, so known and unknown tokens take the
   same time. Only `GET`, `HEAD` and the exact path `POST /v1/blobs/missing`
@@ -307,3 +311,27 @@ closes the gap. Recorded in ADR 0011.
   decompression bomb; body sizes are capped globally and per token.
 - **Signing keys on the client** are created 0600 and refused if group or
   world readable.
+
+## Follow-up, 2026-10-21
+
+### S-21: tokens without expiry (Low, fixed)
+
+A token was valid until someone removed its entry, so credentials made for an
+agent that ran for an afternoon stayed usable indefinitely. An entry may now
+carry `expires` (RFC 3339); a matching token past it gets 401 `token expired at
+...`. The match is unchanged (constant time over every entry), and saying
+"expired" tells nothing to a caller without the token. `gen-token --expires-in`
+writes the field; `leep_tokens_expiring_soon`, `leep_tokens_expired` and the
+`LeepTokensExpiringSoon` alert surface tokens to rotate. Expiry reads the
+server's clock. Tests: `an_expired_token_is_refused_with_401_saying_so`,
+`expires_is_parsed_checked_and_reported`.
+
+### S-22: every write token a reviewer (Medium, fixed)
+
+Reviewers were all write tokens. Where most writers are agents, any agent could
+approve any other agent's change, and on paths without `OWNERS` its own (S-15),
+so a review policy checked little. A token entry may now say `"review": false`:
+it cannot post reviews (403) and its reviews are neither listed nor counted.
+Deployment guidance is to set it on every agent token. Turning it off hides the
+token's existing rows rather than deleting them, so turning it back on restores
+them. Test: `tokens_without_review_cannot_review_and_their_old_reviews_stop_counting`.

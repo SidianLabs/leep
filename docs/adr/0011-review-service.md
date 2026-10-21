@@ -257,3 +257,8 @@ and is reported as `review_changed` in the reload log. `gen-token
 --no-review` writes it, and DEPLOY.md recommends it for every agent token. The
 CLI now prints the server's 403 reason instead of always saying the token
 lacks write access. The tokens file only gains an optional field.
+Turning review off deletes nothing: the token's `review-v1` rows stay in the
+store, unlisted and uncounted, and setting the field back to true (or removing
+it) makes them list and count again from the next request, approvals included.
+To withdraw such a token's past approvals for good, have it post a `reject` (or
+another verdict) while it may still review, or rotate it to a new name.
