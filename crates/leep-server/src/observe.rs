@@ -45,7 +45,7 @@ pub async fn request_id(mut req: Request, next: Next) -> Response {
         .filter(|v| valid_request_id(v))
         .map_or_else(new_request_id, str::to_string);
     // Printable ASCII, so always a valid header value.
-    let value = HeaderValue::from_str(&id).expect("request ids are printable ASCII");
+    let value = HeaderValue::from_str(&id).expect("request ids are header-safe ASCII");
     req.headers_mut().insert(REQUEST_ID_HEADER, value.clone());
     req.extensions_mut().insert(RequestId(id.clone()));
     let resp = next.run(req).await;
@@ -56,7 +56,9 @@ pub async fn request_id(mut req: Request, next: Next) -> Response {
 
 /// `resp` with `request_id` in its body when it is a JSON error object
 /// without one (a body relayed from a peer already has it). A body over
-/// [`MAX_ERROR_BODY`] is passed on unread past that point.
+/// [`MAX_ERROR_BODY`] is passed on unread past that point. A rewritten body
+/// is re-serialized, so its keys come out in alphabetical order; JSON key
+/// order carries no meaning, and no test should compare error bytes.
 async fn with_request_id(resp: Response, id: &str) -> Response {
     let status = resp.status();
     if !(status.is_client_error() || status.is_server_error()) || !crate::errors::is_json(&resp) {
@@ -66,6 +68,7 @@ async fn with_request_id(resp: Response, id: &str) -> Response {
     let mut buf = Vec::new();
     while let Some(frame) = body.frame().await {
         let Ok(frame) = frame else {
+            parts.headers.remove(header::CONTENT_LENGTH);
             return Response::from_parts(parts, Body::empty());
         };
         let Ok(data) = frame.into_data() else {
@@ -154,7 +157,8 @@ pub fn trace_layer() -> TraceLayer<
                 "request",
                 method = %req.method(),
                 route = %route_of(req),
-                request_id = %request_id_of(req),
+                // Debug quotes it: a log line shows where the id ends.
+                request_id = ?request_id_of(req),
                 status = tracing::field::Empty,
                 latency_ms = tracing::field::Empty,
             )

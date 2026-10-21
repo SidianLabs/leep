@@ -1143,16 +1143,19 @@ client treats an unknown or absent code by its HTTP status.
 | 400 | `ambiguous_prefix` | a short id matching several changesets (`AmbiguousPrefixResponse`) |
 | 400 | `invalid` | any other bad request (also `405`) |
 | 401 | `unauthorized` | no token, or an unknown one |
+| 401 | `token_expired` | a known token that has expired: fetch a new one; retrying will not help |
 | 403 | `forbidden` | a `read` token on a request that writes |
 | 404 | `ref_missing` | a land onto a missing ref with `create: false` (ADR 0036) |
 | 404 | `not_found` | anything else that does not exist |
 | 408 | `timeout` | the request timeout ran out; the request may or may not have applied |
 | 409 | `cas_lost` | a concurrent update won repeatedly (a land that kept losing); read again and retry |
+| 409 | `forward_failed` | the land could not reach the server coordinating its ref; nothing landed here, retry (ADR 0056) |
 | 413 | `too_large` | the body is over the server's or the token's limit |
 | 429 | `rate_limited` | a rate or concurrency limit; see `Retry-After` |
 | 500 | `internal` | the server failed |
 | 503 | `indexing` | the index is too far behind; see `indexing` and `Retry-After` (ADR 0058) |
 | 503 | `not_leader` | the server no longer coordinates lands on that ref; send the land again (ADR 0056) |
+| 503 | `unavailable` | overloaded or busy (with `Retry-After` when known): back off and retry |
 
 A lost `POST /v1/refs/{name}` swap is unchanged: `409` with `CasRefResponse`
 (`ok: false`), not an error body. The marker texts (`NEEDS_REVIEW_MARKER`,
@@ -1164,8 +1167,7 @@ are `leep_core::api::error_code`.
 ## Request ids (additive header and API field, no persisted change)
 
 Every request may carry `X-Request-Id`. The server keeps it when it is 1 to
-128 printable ASCII characters (space to `~`, not only spaces), else it
-replaces it with 32 random lowercase hex digits; a request without one gets a
+128 characters of `A-Z a-z 0-9 . _ : / -`, else it replaces it with 32 random lowercase hex digits; a request without one gets a
 random one too. Every response carries the id it used in `X-Request-Id`, and
 every JSON error body (`ErrorResponse`, `AmbiguousPrefixResponse`) gains
 `request_id`, omitted by older servers. The server logs each request under it

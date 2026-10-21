@@ -10,7 +10,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use http_body_util::{BodyExt, Limited};
-use leep_core::api::{error_code, ErrorResponse};
+use leep_core::api::{error_code, ErrorResponse, FORWARD_FAILED_MARKER};
 use leep_core::refname::{MISSING_REF_MARKER, NOT_FORWARD_MARKER};
 use leep_core::review::NEEDS_REVIEW_MARKER;
 use leep_core::signature::NOT_SIGNED_MARKER;
@@ -54,6 +54,7 @@ pub(crate) fn code_of(e: &Error) -> &'static str {
         Error::InvalidPath(..) | Error::InvalidHash(_) => error_code::INVALID,
         Error::NotFound(m) if m.contains(MISSING_REF_MARKER) => error_code::REF_MISSING,
         Error::NotFound(_) => error_code::NOT_FOUND,
+        Error::Conflict(m) if m.contains(FORWARD_FAILED_MARKER) => error_code::FORWARD_FAILED,
         Error::Conflict(_) => error_code::CAS_LOST,
         Error::Indexing { .. } => error_code::INDEXING,
         Error::Encoding(_) | Error::Storage(_) | Error::Other(_) => error_code::INTERNAL,
@@ -70,6 +71,7 @@ pub(crate) fn code_of_status(status: StatusCode) -> &'static str {
         StatusCode::CONFLICT => error_code::CAS_LOST,
         StatusCode::PAYLOAD_TOO_LARGE => error_code::TOO_LARGE,
         StatusCode::TOO_MANY_REQUESTS => error_code::RATE_LIMITED,
+        StatusCode::SERVICE_UNAVAILABLE => error_code::UNAVAILABLE,
         s if s.is_server_error() => error_code::INTERNAL,
         _ => error_code::INVALID,
     }
@@ -154,6 +156,17 @@ mod tests {
         );
         assert_eq!(code_of(&Error::NotFound("x".into())), "not_found");
         assert_eq!(code_of(&Error::Conflict("x".into())), "cas_lost");
+        assert_eq!(
+            code_of(&Error::Conflict(format!(
+                "land onto \"main\" {FORWARD_FAILED_MARKER}; retry"
+            ))),
+            "forward_failed"
+        );
+        assert_eq!(
+            code_of_status(StatusCode::SERVICE_UNAVAILABLE),
+            "unavailable"
+        );
+        assert_eq!(code_of_status(StatusCode::BAD_GATEWAY), "internal");
         assert_eq!(code_of(&Error::Storage("x".into())), "internal");
         assert_eq!(code_of(&Error::InvalidPath("p".into(), "why")), "invalid");
         for s in [

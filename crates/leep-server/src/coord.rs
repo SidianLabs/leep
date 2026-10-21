@@ -417,6 +417,66 @@ fn send_failure(e: &reqwest::Error) -> &'static str {
 mod tests {
     use super::*;
 
+    /// A land forwarded to the lease holder keeps the client's request id:
+    /// the holder answers (and logs) under it, so both servers' lines match.
+    #[tokio::test]
+    async fn a_forwarded_land_keeps_the_request_id() {
+        use leep_core::memory::{MemoryBlobStore, MemoryMetaStore};
+        use leep_core::{ChangesetId, Hash, LeaseKey};
+
+        let holder_repo = leep_derive::Repo::new(
+            Arc::new(MemoryBlobStore::new()),
+            Arc::new(MemoryMetaStore::new()),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(crate::serve(
+            listener,
+            crate::router(holder_repo),
+            std::future::pending(),
+        ));
+
+        let coord = Coordination::new(
+            PeerPolicy {
+                prefixes: vec!["http://127.0.0.1:".into()],
+                ..PeerPolicy::default()
+            },
+            "sender".into(),
+        )
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            leep_core::api::REQUEST_ID_HEADER,
+            HeaderValue::from_static("client-run:42"),
+        );
+        // A land the holder refuses (unknown changeset), so it answers with
+        // an error body naming the request.
+        let body = serde_json::to_vec(&leep_core::api::LandRequest {
+            changeset: ChangesetId(Hash::of_blob(b"never stored")),
+            target_ref: "main".into(),
+            create: None,
+            land_id: None,
+        })
+        .unwrap();
+        let forward = HttpForward::new(coord, &headers, Bytes::from(body));
+        let lease = Lease {
+            key: LeaseKey::new("land", "main"),
+            holder: "holder".into(),
+            address: format!("http://{addr}/"),
+            protocol: LAND_FORWARD_PROTOCOL,
+            meta: String::new(),
+            epoch: 1,
+            remaining: Duration::from_secs(2),
+        };
+        let Forwarded::Answered(relayed) = forward.forward(&lease).await else {
+            panic!("the holder did not answer");
+        };
+        assert_eq!(relayed.status, StatusCode::NOT_FOUND);
+        let e: ErrorResponse = serde_json::from_slice(&relayed.body).unwrap();
+        assert_eq!(e.request_id.as_deref(), Some("client-run:42"));
+        assert_eq!(e.code.as_deref(), Some("not_found"));
+    }
+
     fn policy(prefixes: &[&str], cidrs: &[&str], plain: bool) -> PeerPolicy {
         PeerPolicy {
             prefixes: prefixes.iter().map(|s| s.to_string()).collect(),

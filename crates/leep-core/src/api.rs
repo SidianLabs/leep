@@ -70,16 +70,19 @@
 //! | 400 | `ambiguous_prefix` | a short id matching several changesets ([`AmbiguousPrefixResponse`]) |
 //! | 400 | `invalid` | any other bad request |
 //! | 401 | `unauthorized` | no token, or an unknown one |
+//! | 401 | `token_expired` | a known token that has expired: fetch a new one; retrying will not help |
 //! | 403 | `forbidden` | a `read` token on a request that writes |
 //! | 404 | `ref_missing` | a land onto a missing ref with `create: false` (ADR 0036) |
 //! | 404 | `not_found` | anything else that does not exist |
 //! | 408 | `timeout` | the request timeout ran out; the request may or may not have applied |
 //! | 409 | `cas_lost` | a concurrent update won repeatedly; read again and retry |
+//! | 409 | `forward_failed` | the land could not reach the server coordinating its ref; retry (ADR 0056) |
 //! | 413 | `too_large` | the body is over the server's or the token's limit |
 //! | 429 | `rate_limited` | a request limit (rate or concurrency); see `Retry-After` |
 //! | 500 | `internal` | the server failed |
 //! | 503 | `indexing` | the index is too far behind; see `indexing` and `Retry-After` (ADR 0058) |
 //! | 503 | `not_leader` | the server no longer coordinates lands on that ref; send again (ADR 0056) |
+//! | 503 | `unavailable` | overloaded or busy (with `Retry-After` when known): back off and retry |
 //!
 //! A lost `POST /v1/refs/{name}` swap is not an error body: it is 409 with
 //! [`CasRefResponse`] (`ok: false`). The constants are in [`error_code`].
@@ -87,8 +90,8 @@
 //! # Request ids
 //!
 //! A client may send [`REQUEST_ID_HEADER`] (`X-Request-Id`). The server keeps
-//! a value that passes [`valid_request_id`] (1 to 128 printable ASCII
-//! characters) and otherwise picks 32 random hex digits, logs the request
+//! a value that passes [`valid_request_id`] (1 to 128 characters of
+//! `A-Z a-z 0-9 . _ : / -`) and otherwise picks 32 random hex digits, logs the request
 //! under it, answers with it in the same header on every response, and adds
 //! it to JSON error bodies as `request_id`.
 //!
@@ -238,6 +241,9 @@ pub mod error_code {
     pub const INVALID: &str = "invalid";
     /// 401: no token, or an unknown one.
     pub const UNAUTHORIZED: &str = "unauthorized";
+    /// 401: the token is known but has expired. Fetch a new token; retrying
+    /// with this one will not help.
+    pub const TOKEN_EXPIRED: &str = "token_expired";
     /// 403: a `read` token on a request that writes.
     pub const FORBIDDEN: &str = "forbidden";
     /// 404: a land onto a missing ref with `create: false`
@@ -251,6 +257,10 @@ pub mod error_code {
     /// 409: a concurrent update won (a land that kept losing its ref swap);
     /// reading again and retrying can succeed.
     pub const CAS_LOST: &str = "cas_lost";
+    /// 409: the land could not reach the server coordinating its ref
+    /// ([`super::FORWARD_FAILED_MARKER`], ADR 0056). Nothing landed here;
+    /// retrying can succeed once that server answers or another takes over.
+    pub const FORWARD_FAILED: &str = "forward_failed";
     /// 413: the request body is over the server's or the token's limit.
     pub const TOO_LARGE: &str = "too_large";
     /// 429: a request limit (rate or concurrency); see `Retry-After`.
@@ -261,6 +271,9 @@ pub mod error_code {
     /// 503: the server no longer coordinates lands on the ref; send the land
     /// again (ADR 0056).
     pub const NOT_LEADER: &str = "not_leader";
+    /// 503 (with `Retry-After` when the server knows): overloaded or busy.
+    /// Back off and retry.
+    pub const UNAVAILABLE: &str = "unavailable";
     /// 500: the server failed.
     pub const INTERNAL: &str = "internal";
 
@@ -275,17 +288,40 @@ pub mod error_code {
         AMBIGUOUS_PREFIX,
         INVALID,
         UNAUTHORIZED,
+        TOKEN_EXPIRED,
         FORBIDDEN,
         REF_MISSING,
         NOT_FOUND,
         TIMEOUT,
         CAS_LOST,
+        FORWARD_FAILED,
         TOO_LARGE,
         RATE_LIMITED,
         INDEXING,
         NOT_LEADER,
+        UNAVAILABLE,
         INTERNAL,
     ];
+}
+
+/// Stable text in the 409 of a land that could not reach the server
+/// coordinating its ref (ADR 0056); the server maps it to
+/// [`error_code::FORWARD_FAILED`].
+pub const FORWARD_FAILED_MARKER: &str = "could not reach the server coordinating that ref";
+
+#[cfg(test)]
+mod error_code_tests {
+    #[test]
+    fn codes_are_unique_snake_case() {
+        let mut seen = std::collections::BTreeSet::new();
+        for c in super::error_code::ALL {
+            assert!(
+                c.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'),
+                "{c}"
+            );
+            assert!(seen.insert(c), "{c} twice");
+        }
+    }
 }
 
 /// Why a query was answered `503` with `Retry-After` (ADR 0058): its index
@@ -309,12 +345,13 @@ pub const REQUEST_ID_HEADER: &str = "x-request-id";
 pub const MAX_REQUEST_ID_LEN: usize = 128;
 
 /// Whether a client's request id is kept as sent: 1 to
-/// [`MAX_REQUEST_ID_LEN`] printable ASCII characters (space to `~`), which
-/// cannot break a log line.
+/// [`MAX_REQUEST_ID_LEN`] characters of `A-Z a-z 0-9 . _ : / -`. No spaces,
+/// `=` or quotes, so an id cannot pose as another field of a log line.
 pub fn valid_request_id(id: &str) -> bool {
-    !id.trim().is_empty()
-        && id.len() <= MAX_REQUEST_ID_LEN
-        && id.bytes().all(|b| (b' '..=b'~').contains(&b))
+    (1..=MAX_REQUEST_ID_LEN).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b".-_:/".contains(&b))
 }
 
 /// Request header choosing what a query does when its index is behind
@@ -1193,19 +1230,17 @@ mod tests {
     }
 
     #[test]
-    fn request_ids_are_printable_ascii_up_to_128_bytes() {
-        for ok in [
-            "a",
-            "0123-abc_DEF.x",
-            "with space",
-            &"x".repeat(128),
-            "~!@#$%^&*()",
-        ] {
+    fn request_ids_are_a_safe_charset_up_to_128_bytes() {
+        for ok in ["a", "0123-abc_DEF.x", "run:7/step.2", &"x".repeat(128)] {
             assert!(valid_request_id(ok), "{ok:?}");
         }
         for bad in [
             "",
-            "   ",
+            " ",
+            "with space",
+            "x status=200 route=/v1/land",
+            "q\"uote",
+            "a=b",
             &"x".repeat(129),
             "tab\there",
             "new\nline",

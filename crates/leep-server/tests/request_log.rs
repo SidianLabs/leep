@@ -26,8 +26,8 @@ impl std::io::Write for Captured {
     }
 }
 
-#[test]
-fn the_request_log_line_names_the_request_id() {
+/// The text log lines of one request per id in `ids`, in order.
+fn request_lines(ids: &[&str]) -> Vec<String> {
     let out = Captured::default();
     let writer = out.clone();
     let subscriber = tracing_subscriber::fmt()
@@ -44,20 +44,40 @@ fn the_request_log_line_names_the_request_id() {
                     Arc::new(MemoryBlobStore::new()),
                     Arc::new(MemoryMetaStore::new()),
                 );
-                let req = Request::builder()
-                    .uri("/v1/resolve/nope")
-                    .header(leep_core::api::REQUEST_ID_HEADER, "bug-1234")
-                    .body(Body::empty())
-                    .unwrap();
-                let resp = leep_server::router(repo).oneshot(req).await.unwrap();
-                assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-                let _ = resp.into_body().collect().await;
+                let app = leep_server::router(repo);
+                for id in ids {
+                    let req = Request::builder()
+                        .uri("/v1/resolve/nope")
+                        .header(leep_core::api::REQUEST_ID_HEADER, *id)
+                        .body(Body::empty())
+                        .unwrap();
+                    let resp = app.clone().oneshot(req).await.unwrap();
+                    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+                    let _ = resp.into_body().collect().await;
+                }
             })
     });
     let text = String::from_utf8(out.0.lock().unwrap().clone()).unwrap();
-    let line = text
+    let lines: Vec<String> = text
         .lines()
-        .find(|l| l.contains("request completed"))
-        .unwrap_or_else(|| panic!("no request line in:\n{text}"));
-    assert!(line.contains("request_id=bug-1234"), "{line}");
+        .filter(|l| l.contains("request completed"))
+        .map(str::to_string)
+        .collect();
+    assert_eq!(lines.len(), ids.len(), "{text}");
+    lines
+}
+
+#[test]
+fn the_request_log_line_names_the_request_id_and_cannot_be_spoofed() {
+    let spoof = "x status=200 route=/v1/land";
+    let lines = request_lines(&["bug-1234", spoof]);
+    // Quoted, so the line shows where the id ends.
+    assert!(lines[0].contains("request_id=\"bug-1234\""), "{}", lines[0]);
+    // An id that could pose as other fields is replaced, not logged.
+    assert!(!lines[1].contains("status=200"), "{}", lines[1]);
+    assert!(!lines[1].contains("/v1/land"), "{}", lines[1]);
+    let (_, rest) = lines[1].split_once("request_id=\"").expect("an id");
+    let made = &rest[..32];
+    assert!(made.bytes().all(|b| b.is_ascii_hexdigit()), "{}", lines[1]);
+    assert_eq!(rest.as_bytes()[32], b'"', "{}", lines[1]);
 }

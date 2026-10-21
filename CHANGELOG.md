@@ -8,8 +8,8 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 ## [Unreleased]
 
 ### Request ids
-- The server accepts a client's `X-Request-Id` (1 to 128 printable ASCII
-  characters; anything else is replaced) or makes one, answers with it in
+- The server accepts a client's `X-Request-Id` (1 to 128 characters of
+  `A-Z a-z 0-9 . _ : / -`; anything else is replaced) or makes one, answers with it in
   `X-Request-Id`, logs it as `request_id` on the request's log line, and adds
   `request_id` to JSON error bodies.
 - `leep` sends one id per invocation and prints it as the last line of an
@@ -26,11 +26,12 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 ### Error codes
 - Every error body from the server carries a stable, machine-readable
   `code` (`needs_review`, `not_signed`, `not_forward`, `tag_immutable`,
-  `land_id_reused`, `invalid_name`, `ref_missing`, `cas_lost`, `indexing`,
-  `rate_limited`, ...; full list in docs/FORMATS.md, "Error codes"), so
+  `land_id_reused`, `invalid_name`, `ref_missing`, `cas_lost`,
+  `forward_failed`, `indexing`, `rate_limited`, `unavailable`, ...; full list in docs/FORMATS.md, "Error codes"), so
   clients need not match message text. The global body cap's 413, the
   request timeout's 408 and unknown routes now answer `ErrorResponse` JSON
-  instead of plain text or an empty body.
+  instead of plain text or an empty body. `token_expired` (401) is reserved
+  for token expiry; nothing sends it yet.
 - The CLI and the MCP server go by `code` when the server sends one and fall
   back to the message markers for older servers. `--json` errors gain
   `server_code`.

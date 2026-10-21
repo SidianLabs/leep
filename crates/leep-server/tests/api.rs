@@ -1850,8 +1850,31 @@ async fn every_error_has_a_code() {
     ];
     for (r, status, code) in cases {
         assert_eq!((r.status, r.code().as_str()), (status, code));
+        assert!(error_code::ALL.contains(&code));
         assert!(!r.json::<ErrorResponse>().error.is_empty());
     }
+
+    // A plain-text 503 from below the handlers (a load shedder, say) is
+    // `unavailable`, not `internal`, and keeps its Retry-After.
+    let busy = Client(
+        Router::new()
+            .route(
+                "/busy",
+                axum::routing::get(|| async {
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        [("retry-after", "2")],
+                        "overloaded",
+                    )
+                }),
+            )
+            .layer(axum::middleware::from_fn(leep_server::errors::json_errors)),
+    );
+    let r = busy.get("/busy").await;
+    assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(r.code(), "unavailable");
+    assert_eq!(r.headers["retry-after"], "2");
+    assert_eq!(r.json::<ErrorResponse>().error, "overloaded");
 }
 
 #[tokio::test]
@@ -1898,17 +1921,23 @@ fn echoed(r: &Reply) -> String {
 async fn request_ids_are_kept_or_made_and_echoed() {
     let c = Client::new();
     // A valid client id is kept, echoed and named in the error body.
-    let r = with_request_id(&c, "/v1/resolve/nope", Some("agent-7 run/42")).await;
+    let r = with_request_id(&c, "/v1/resolve/nope", Some("agent-7:run/42")).await;
     assert_eq!(r.status, StatusCode::NOT_FOUND);
-    assert_eq!(echoed(&r), "agent-7 run/42");
+    assert_eq!(echoed(&r), "agent-7:run/42");
     let e: ErrorResponse = r.json();
-    assert_eq!(e.request_id.as_deref(), Some("agent-7 run/42"));
+    assert_eq!(e.request_id.as_deref(), Some("agent-7:run/42"));
     assert_eq!(e.code.as_deref(), Some("not_found"));
 
-    // Without one, or with one that is too long or not printable ASCII,
-    // the server makes its own.
+    // Without one, or with one that is too long or outside the charset
+    // (spaces, `=`, non-ASCII), the server makes its own.
     let long = "x".repeat(129);
-    for id in [None, Some(long.as_str()), Some("caf\u{e9}")] {
+    for id in [
+        None,
+        Some(long.as_str()),
+        Some("caf\u{e9}"),
+        Some("with space"),
+        Some("x status=200 route=/v1/land"),
+    ] {
         let r = with_request_id(&c, "/v1/resolve/nope", id).await;
         let made = echoed(&r);
         assert_eq!(made.len(), 32, "{made}");
