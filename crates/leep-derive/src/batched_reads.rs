@@ -165,6 +165,15 @@ fn copy(e: &Error) -> Error {
         Error::Encoding(m) => Error::Encoding(m.clone()),
         Error::Storage(m) => Error::Storage(m.clone()),
         Error::Other(m) => Error::Other(m.clone()),
+        Error::Indexing {
+            kind,
+            behind,
+            retry_after_ms,
+        } => Error::Indexing {
+            kind: kind.clone(),
+            behind: *behind,
+            retry_after_ms: *retry_after_ms,
+        },
     }
 }
 

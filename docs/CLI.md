@@ -131,6 +131,7 @@ line, in addition to the usual text on stderr:
 | `server` | 3 | A 5xx answer, an answer that does not decode, or data that fails its hash check. |
 | `timeout` | 3 | The request timed out; it may or may not have taken effect. |
 | `rate_limited` | 3 | 429 after the client's own retries. |
+| `indexing` | 3 | The server's index lags too far behind and it answered 503 after `LEEP_INDEX_WAIT` seconds (60) of retries; `retry_after_ms` says when to try again (ADR 0058). `log`, `last-change`, `blame` and `search` print `indexing: N changesets behind ..., retrying in Ss` while they retry, and `--stale-ok` takes an answer at the newest indexed changeset instead, printing `(answered at X, N behind)` on stderr. |
 | `not_found` | 4 | Something named does not exist. |
 | `conflict` | 5 | Conflicts to resolve, or (with `retryable: true`) a concurrent update that won. |
 | `nothing_to_do` | 6 | Nothing to record. |

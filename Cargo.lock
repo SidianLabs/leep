@@ -2379,6 +2379,7 @@ dependencies = [
  "regex",
  "regex-syntax",
  "serde",
+ "serde_json",
  "similar",
  "tokio",
  "tracing",

@@ -15,6 +15,18 @@ pub enum Error {
     Conflict(String),
     #[error("not found: {0}")]
     NotFound(String),
+    /// The index a query needs is further behind than the query may scan
+    /// without it (ADR 0058); retrying after `retry_after_ms` can succeed.
+    /// Maps to HTTP 503 with `Retry-After`.
+    #[error("indexing: {kind} is {behind} changesets behind; retry in {}s", retry_after_ms.div_ceil(1000))]
+    Indexing {
+        /// The index group's lease name, such as `history-tree-v4`.
+        kind: String,
+        /// Generations between the requested changeset and the newest one
+        /// indexed (a lower bound when that was too far to find).
+        behind: u64,
+        retry_after_ms: u64,
+    },
     #[error("encoding error: {0}")]
     Encoding(String),
     #[error("storage error: {0}")]

@@ -274,32 +274,85 @@ impl Repo {
         max_frontier: usize,
         scan_first: usize,
     ) -> Result<LogPage> {
+        let (at, from) = self.log_resume(id, params, after).await?;
+        self.log_page_at(id, at, params, limit, &from, max_frontier, scan_first)
+            .await
+    }
+
+    /// Where a log page of `id` starts: the changeset the walk is of (`id`,
+    /// unless an earlier page answered at another and its cursor pins it,
+    /// ADR 0058) and the walk's queue.
+    pub(crate) async fn log_resume(
+        &self,
+        id: ChangesetId,
+        params: &LogParams,
+        after: Option<&str>,
+    ) -> Result<(ChangesetId, LogFrom)> {
         let fp = log_fingerprint(id, params);
-        let from = match after {
-            None => LogFrom::tip(),
-            Some(text) => {
-                let resume: LogResume = cursor::decode(text, CursorKind::Log, fp)?;
-                self.check_resume(&resume, params.follow).await?;
-                LogFrom::from(resume)
-            }
+        let Some(text) = after else {
+            return Ok((id, LogFrom::tip()));
         };
+        let resume: LogResume = cursor::decode(text, CursorKind::Log, fp)?;
+        let (at, resume) = match resume {
+            LogResume::Pinned { at, inner } => {
+                if matches!(*inner, LogResume::Pinned { .. }) {
+                    return Err(Error::Invalid("bad cursor: pinned twice".into()));
+                }
+                match self.generation(at).await {
+                    Ok(_) => {}
+                    Err(Error::NotFound(_)) => {
+                        return Err(Error::Invalid(
+                            "bad cursor: it names an unknown changeset".into(),
+                        ))
+                    }
+                    Err(e) => return Err(e),
+                }
+                (at, *inner)
+            }
+            r => (id, r),
+        };
+        self.check_resume(&resume, params.follow).await?;
+        Ok((at, LogFrom::from(resume)))
+    }
+
+    /// One page of the log of `at`, from `from`, whose cursor is made for
+    /// the query on `id` (pinning `at` when it differs).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn log_page_at(
+        &self,
+        id: ChangesetId,
+        at: ChangesetId,
+        params: &LogParams,
+        limit: usize,
+        from: &LogFrom,
+        max_frontier: usize,
+        scan_first: usize,
+    ) -> Result<LogPage> {
+        let fp = log_fingerprint(id, params);
         let path = norm(params.path.as_deref());
         let filter = &params.filter;
         let raw = if params.follow {
             let path = path.ok_or_else(|| Error::Invalid("follow needs a file path".into()))?;
-            self.log_follow_from(id, path, limit, filter, &from).await?
+            self.log_follow_from(at, path, limit, filter, from).await?
         } else {
             match path {
-                Some(path) => {
-                    self.log_indexed_from(id, path, limit, filter, &from)
-                        .await?
-                }
+                Some(path) => self.log_indexed_from(at, path, limit, filter, from).await?,
                 None if filter.is_empty() => {
-                    self.log_scan_from(id, None, limit, filter, &from).await?
+                    self.log_scan_from(at, None, limit, filter, from).await?
                 }
                 None => {
-                    self.log_by_filter_from(id, limit, filter, scan_first, &from)
+                    self.log_by_filter_from(at, limit, filter, scan_first, from)
                         .await?
+                }
+            }
+        };
+        let pin = |r: LogResume| {
+            if at == id {
+                r
+            } else {
+                LogResume::Pinned {
+                    at,
+                    inner: Box::new(r),
                 }
             }
         };
@@ -316,13 +369,13 @@ impl Repo {
                         cursor::encode(
                             CursorKind::Log,
                             fp,
-                            &LogResume::Frontier { entries, indexed },
+                            &pin(LogResume::Frontier { entries, indexed }),
                         )
                     })
                     .flatten();
                 Some(match frontier {
                     Some(text) => text,
-                    None => cursor::encode(CursorKind::Log, fp, &below)
+                    None => cursor::encode(CursorKind::Log, fp, &pin(below))
                         .expect("a fixed-size cursor fits"),
                 })
             }

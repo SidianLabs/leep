@@ -26,7 +26,7 @@ docker build -t leep:dev .
 docker run -d --name leep -p 127.0.0.1:7070:7070 \
   -e LEEP_INSECURE_NO_AUTH=1 -v leep-data:/var/lib/leep leep:dev
 curl -s localhost:7070/v1/health      # "ok": the process is up
-curl -s localhost:7070/v1/ready       # {"status":"ready","features":["land-id"]}: it can reach its stores
+curl -s localhost:7070/v1/ready       # {"status":"ready","features":["land-id","indexing-retry"]}: it can reach its stores
 ```
 
 Drive it with the CLI from the host or from the same image:
@@ -84,7 +84,7 @@ file says):
 | Endpoint | Question | Checks | Answer |
 |---|---|---|---|
 | `GET /v1/health` | Is the process alive? (liveness) | nothing but that HTTP is served | 200 `"ok"` |
-| `GET /v1/ready` | Can it serve right now? (readiness) | reads one ref from the metadata store and asks the blob store about one fixed hash, concurrently, each under `--ready-timeout` (default 2 s) | 200 `{"status":"ready","features":["land-id"]}`, or 503 `{"status":"not ready","failed":[{"store":"meta","reason":"unavailable"}],"features":["land-id"]}` (`features`: optional behaviours clients may check for, ADR 0057) |
+| `GET /v1/ready` | Can it serve right now? (readiness) | reads one ref from the metadata store and asks the blob store about one fixed hash, concurrently, each under `--ready-timeout` (default 2 s) | 200 `{"status":"ready","features":["land-id","indexing-retry"]}`, or 503 `{"status":"not ready","failed":[{"store":"meta","reason":"unavailable"}],"features":["land-id","indexing-retry"]}` (`features`: optional behaviours clients may check for, ADR 0057) |
 
 `store` is `meta` or `blobs`; `reason` is `unavailable` or `timed out after
 2000ms`, never the driver's message (it can carry a host name; the server logs

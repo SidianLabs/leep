@@ -21,6 +21,71 @@ use leep_derive::integrity::{
 use leep_derive::Repo;
 use serde::Serialize;
 
+/// The index-lease fence of tools that delete or rebuild index rows (ADR
+/// 0058 section 6).
+#[derive(Args, Clone)]
+pub struct IndexFenceArgs {
+    /// Go ahead although a server holds the lease of an index this touches
+    /// (duplicate work, correct rows). Without it the tool refuses. Not
+    /// allowed with `repair drop` or `upgrade-index --drop-first`: a drop
+    /// beside a deriving server is the race the lease and fence prevent.
+    #[arg(long)]
+    pub ignore_lease: bool,
+    /// After taking the index leases, wait this long before touching rows,
+    /// so a former holder's write still in flight lands first (0, 30s, 2m).
+    /// Must exceed the stale time (6 s) plus the longest staged write.
+    #[arg(long, default_value = "60s", value_parser = crate::parse_grace)]
+    pub index_fence: std::time::Duration,
+}
+
+/// Take the index leases of the groups `kinds` belong to, for a tool, and
+/// wait the fence. `None` when no kind is an index or the store has no
+/// leases (servers on it run in `local` mode, which takes none).
+pub(crate) async fn fence_indexes(
+    repo: &Repo,
+    kinds: &[&str],
+    fence: &IndexFenceArgs,
+    tool: &str,
+) -> anyhow::Result<Option<leep_derive::indexing::ToolLease>> {
+    use leep_derive::indexing::IndexGroup;
+    let mut groups: Vec<IndexGroup> = kinds
+        .iter()
+        .filter_map(|k| IndexGroup::of_kind(k))
+        .collect();
+    groups.sort();
+    groups.dedup();
+    if groups.is_empty() || !repo.meta().supports_leases() {
+        return Ok(None);
+    }
+    let mut id = [0u8; 8];
+    getrandom::fill(&mut id).map_err(|e| anyhow::anyhow!("random holder id: {e}"))?;
+    let holder = format!("{tool}-{}", hex::encode(id));
+    let say = |m: &str| eprintln!("{tool}: {m}");
+    let lease = leep_derive::indexing::ToolLease::take(
+        repo.meta().clone(),
+        &holder,
+        &groups,
+        fence.ignore_lease,
+        fence.index_fence,
+        &say,
+    )
+    .await?;
+    Ok(Some(lease))
+}
+
+/// Give a tool's index leases up, saying so if one was lost meanwhile.
+pub(crate) async fn release_fence(lease: Option<leep_derive::indexing::ToolLease>, tool: &str) {
+    if let Some(l) = lease {
+        if !l.still_held().await {
+            eprintln!(
+                "{tool}: warning: lost an index lease while running; another server may have \
+                 derived beside it (rows stay correct)"
+            );
+        }
+        l.release().await;
+    }
+}
+
 pub const EXIT_CLEAN: i32 = 0;
 pub const EXIT_PROBLEMS: i32 = 1;
 pub const EXIT_COULD_NOT_RUN: i32 = 2;
@@ -91,6 +156,8 @@ enum RepairCmd {
         missing: bool,
         #[arg(long)]
         json: bool,
+        #[command(flatten)]
+        fence: IndexFenceArgs,
     },
     /// Delete every row of a kind so it derives again on demand. Refused for
     /// kinds that history cannot regenerate.
@@ -102,6 +169,8 @@ enum RepairCmd {
         dry_run: bool,
         #[arg(long)]
         json: bool,
+        #[command(flatten)]
+        fence: IndexFenceArgs,
     },
 }
 
@@ -404,9 +473,17 @@ async fn repair_inner(meta: &str, blobs: &str, args: RepairArgs) -> anyhow::Resu
             jobs,
             missing,
             json,
+            fence,
         } => {
             let kinds = parse_kinds(&names, Which::Rederivable)?;
             let repo = open(meta, blobs).await?;
+            // `--missing` derives what a lease holder would: take its
+            // lease, so the two do not derive the same rows (ADR 0058).
+            let lease = if missing {
+                fence_indexes(&repo, &kinds, &fence, "repair rederive").await?
+            } else {
+                None
+            };
             let opts = RederiveOptions {
                 kinds,
                 scope: if refs.is_empty() {
@@ -419,7 +496,9 @@ async fn repair_inner(meta: &str, blobs: &str, args: RepairArgs) -> anyhow::Resu
                 jobs: jobs.map_or_else(leep_derive::default_derive_jobs, |j| j as usize),
                 missing_only: missing,
             };
-            let report = integrity::rederive(&repo, &opts, &Stderr).await?;
+            let report = integrity::rederive(&repo, &opts, &Stderr).await;
+            release_fence(lease, "repair rederive").await;
+            let report = report?;
             let bad = report.failed() > 0 || (dry_run && report.changed() > 0);
             let code = if bad { EXIT_PROBLEMS } else { EXIT_CLEAN };
             if json {
@@ -433,13 +512,36 @@ async fn repair_inner(meta: &str, blobs: &str, args: RepairArgs) -> anyhow::Resu
             kinds: names,
             dry_run,
             json,
+            fence,
         } => {
             // Dropping needs only metadata; the blob store is never read.
             check_exists(meta, None)?;
             let meta = crate::open_meta(meta).await.context("opening meta store")?;
             let repo = Repo::new(Arc::new(leep_core::memory::MemoryBlobStore::new()), meta);
             let names: Vec<&str> = names.iter().map(String::as_str).collect();
-            let report = integrity::drop_kinds(&repo, &names, dry_run, &Stderr).await?;
+            // A drop racing derivation could leave rows whose ancestors'
+            // nodes are gone: hold the index leases, after the fence.
+            if fence.ignore_lease && !dry_run {
+                anyhow::bail!(
+                    "--ignore-lease is not allowed with repair drop: dropping rows while a \
+                     server derives them can leave rows whose parents' rows are gone; stop the \
+                     server or switch it to --indexing off"
+                );
+            }
+            let lease = if dry_run {
+                None
+            } else {
+                fence_indexes(&repo, &names, &fence, "repair drop").await?
+            };
+            if let Some(l) = &lease {
+                if !l.still_held().await {
+                    release_fence(lease, "repair drop").await;
+                    anyhow::bail!("lost the index lease before dropping; nothing was deleted");
+                }
+            }
+            let report = integrity::drop_kinds(&repo, &names, dry_run, &Stderr).await;
+            release_fence(lease, "repair drop").await;
+            let report = report?;
             if json {
                 print_json(true, EXIT_CLEAN, &report)?;
             } else {

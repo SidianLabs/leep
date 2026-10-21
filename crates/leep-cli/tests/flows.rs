@@ -406,6 +406,7 @@ fn provenance_queries_reach_the_server_and_decode() {
 
     let log_args = |f: &dyn Fn(&mut LogArgs)| {
         let mut a = LogArgs {
+            stale_ok: false,
             rev: None,
             path: None,
             follow: None,
@@ -473,6 +474,7 @@ fn provenance_queries_reach_the_server_and_decode() {
     assert_eq!(p.scanned, 3);
     assert!(p.humans.iter().any(|h| h.author == "robot"));
     let lc = LastChangeArgs {
+        stale_ok: false,
         path: "src".into(),
         rev: None,
     };
@@ -483,6 +485,7 @@ fn provenance_queries_reach_the_server_and_decode() {
     assert_eq!((resp.path.as_str(), resp.changeset.id), ("src/a.rs", tip));
     assert!(resp.concurrent.is_empty());
     let blame = BlameArgs {
+        stale_ok: false,
         args: vec!["a.txt".into()],
         who: true,
     };
@@ -525,6 +528,7 @@ fn search_sends_flags_and_decodes_matches() {
     };
     let args = |f: &dyn Fn(&mut SearchArgs)| {
         let mut a = SearchArgs {
+            stale_ok: false,
             query: "needle".into(),
             rev: None,
             ignore_case: false,
@@ -914,6 +918,7 @@ fn log_follow_sends_the_flag_and_decodes_path_at() {
     let r = ctx.remote();
     let id = r.resolve("main").unwrap();
     let args = LogArgs {
+        stale_ok: false,
         rev: None,
         path: None,
         follow: Some("a.txt".into()),

@@ -195,6 +195,42 @@ struct Args {
     /// How often held land leases are renewed.
     #[arg(long, env = "LEEP_LAND_LEASE_RENEW", default_value = "500ms", value_parser = parse_ready_timeout)]
     land_lease_renew: std::time::Duration,
+    /// Who builds the indexes (ADR 0058). `local`: this server warms every
+    /// index and queries derive what they miss. `lease`: one server per
+    /// index group, the holder of the group's lease in the metadata store,
+    /// warms it. `off`: never warm. In `lease` and `off` modes queries never
+    /// derive an index while a lease lives: they scan a bounded amount of
+    /// un-indexed history and otherwise answer 503 with Retry-After.
+    #[arg(long, env = "LEEP_INDEXING", value_enum, default_value_t = Indexing::Local)]
+    indexing: Indexing,
+    /// Index groups this server competes for in `lease` mode: `history`,
+    /// `log-filter`, `search` or their lease names. Default: all.
+    #[arg(long, env = "LEEP_INDEX_KINDS", value_delimiter = ',')]
+    index_kinds: Vec<String>,
+    /// Un-indexed changesets a path log, last-change or filtered log examines
+    /// before answering that its index is behind (`lease` and `off` modes).
+    #[arg(long, env = "LEEP_QUERY_SCAN_BUDGET", default_value_t = 1024)]
+    query_scan_budget: usize,
+    /// Un-indexed first-parent steps (file reads) a blame walks.
+    #[arg(long, env = "LEEP_BLAME_SCAN_BUDGET", default_value_t = 128)]
+    blame_scan_budget: usize,
+    /// Files without a code-search row a search fetches.
+    #[arg(long, env = "LEEP_SEARCH_SCAN_BUDGET", default_value_t = 512)]
+    search_scan_budget: usize,
+    /// Bytes of files without a code-search row a search fetches.
+    #[arg(long, env = "LEEP_SEARCH_SCAN_BYTES", default_value_t = 16 << 20)]
+    search_scan_bytes: u64,
+    /// Requests without a `Leep-Indexing` header scan this many times the
+    /// budgets once their wait for the indexer is over.
+    #[arg(long, env = "LEEP_LEGACY_SCAN_FACTOR", default_value_t = 8, value_parser = clap::value_parser!(u32).range(1..=1024))]
+    legacy_scan_factor: u32,
+    /// How long a request without a `Leep-Indexing` header waits for the
+    /// indexer to catch up, at most (also bounded by its remaining time).
+    #[arg(long, env = "LEEP_INDEX_WAIT", default_value = "10s", value_parser = parse_grace)]
+    index_wait: std::time::Duration,
+    /// Requests that may wait for the indexer at once; others do not wait.
+    #[arg(long, env = "LEEP_INDEX_WAITERS", default_value_t = 64)]
+    index_waiters: usize,
     #[command(subcommand)]
     command: Option<Cmd>,
 }
@@ -202,6 +238,13 @@ struct Args {
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum Coordination {
     On,
+    Off,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum Indexing {
+    Local,
+    Lease,
     Off,
 }
 
@@ -1066,15 +1109,46 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(unix)]
     leep_server::reload::spawn_sighup_reload(config.clone(), repo.meta().clone())
         .context("installing the SIGHUP handler")?;
-    if args.warm_interval.is_zero() {
-        tracing::info!("index warming off: the first query on new history derives its indexes");
-    } else {
-        tracing::info!(
-            interval_s = args.warm_interval.as_secs_f64(),
-            search = args.warm_search,
-            "warming indexes of moved refs in the background"
-        );
-        leep_derive::warm::Warmer::new(repo.clone(), args.warm_search).spawn(args.warm_interval);
+    let index_leases = index_policy(&args, &mut repo)?;
+    let warm = match (args.indexing, &index_leases) {
+        (Indexing::Off, _) => {
+            tracing::info!(
+                "index warming off (--indexing off): the index lease holders build the indexes"
+            );
+            None
+        }
+        _ if args.warm_interval.is_zero() => {
+            tracing::info!("index warming off: the first query on new history derives its indexes");
+            None
+        }
+        (Indexing::Lease, Some(leases)) => {
+            tracing::info!(
+                interval_s = args.warm_interval.as_secs_f64(),
+                kinds = ?leases.config().candidate,
+                "warming the indexes whose lease this server holds"
+            );
+            Some(
+                leep_derive::warm::Warmer::new(repo.clone(), args.warm_search)
+                    .with_leases(leases.clone()),
+            )
+        }
+        _ => {
+            tracing::info!(
+                interval_s = args.warm_interval.as_secs_f64(),
+                search = args.warm_search,
+                "warming indexes of moved refs in the background"
+            );
+            Some(leep_derive::warm::Warmer::new(
+                repo.clone(),
+                args.warm_search,
+            ))
+        }
+    };
+    if let (Indexing::Lease, Some(leases)) = (args.indexing, &index_leases) {
+        leases.start();
+    }
+    if let Some(w) = warm {
+        w.spawn(args.warm_interval);
     }
     let coordination = match args.land_coordination {
         Coordination::Off => None,
@@ -1109,8 +1183,17 @@ async fn main() -> anyhow::Result<()> {
             }
         });
     }
+    // Index leases are given up as soon as shutdown starts, so another
+    // server takes the groups at once.
+    let releasing = index_leases.clone();
     let Some((coordinator, http)) = coordination else {
-        leep_server::serve(listener, app, shutdown_signal()).await?;
+        leep_server::serve(listener, app, async move {
+            shutdown_signal().await;
+            if let Some(l) = releasing {
+                l.shutdown().await;
+            }
+        })
+        .await?;
         return Ok(());
     };
     // Leases are given up as soon as shutdown starts, so another server
@@ -1119,6 +1202,9 @@ async fn main() -> anyhow::Result<()> {
     let server = tokio::spawn(leep_server::serve(listener, app, async move {
         shutdown_signal().await;
         stopping.shutdown().await;
+        if let Some(l) = releasing {
+            l.shutdown().await;
+        }
     }));
     let address = coordinator.config().address.clone();
     if let Err(e) = http.check_self(&address).await {
@@ -1133,6 +1219,79 @@ async fn main() -> anyhow::Result<()> {
     );
     server.await.context("server task")??;
     Ok(())
+}
+
+/// The index leases and query policy of `--indexing lease|off` (ADR 0058),
+/// set on `repo`; `None` in `local` mode.
+fn index_policy(
+    args: &Args,
+    repo: &mut Repo,
+) -> anyhow::Result<Option<Arc<leep_derive::indexing::IndexLeases>>> {
+    use leep_derive::indexing::{
+        Budgets, IndexGroup, IndexLeaseConfig, IndexLeases, IndexMode, IndexPolicy,
+    };
+    let mode = match args.indexing {
+        Indexing::Local => {
+            if !args.index_kinds.is_empty() {
+                tracing::warn!("--index-kinds has no effect in --indexing local");
+            }
+            return Ok(None);
+        }
+        Indexing::Lease => IndexMode::Lease,
+        Indexing::Off => IndexMode::Off,
+    };
+    if !repo.meta().supports_leases() {
+        anyhow::bail!(
+            "--indexing lease and off need a metadata store with leases (Postgres, SQLite)"
+        );
+    }
+    let mut groups = Vec::new();
+    for k in &args.index_kinds {
+        let g = IndexGroup::parse(k.trim()).ok_or_else(|| {
+            anyhow::anyhow!("--index-kinds: unknown index {k:?}; use history, log-filter or search")
+        })?;
+        if !groups.contains(&g) {
+            groups.push(g);
+        }
+    }
+    if groups.is_empty() {
+        groups = IndexGroup::ALL.to_vec();
+    }
+    if !args.warm_search {
+        groups.retain(|g| *g != IndexGroup::Search);
+    }
+    let mut id = [0u8; 16];
+    getrandom::fill(&mut id).map_err(|e| anyhow::anyhow!("random holder id: {e}"))?;
+    let cfg = IndexLeaseConfig::new(
+        hex::encode(id),
+        args.advertise_url.clone().unwrap_or_default(),
+    )
+    .with_candidates(
+        if mode == IndexMode::Lease && !args.warm_interval.is_zero() {
+            groups
+        } else {
+            Vec::new()
+        },
+    );
+    let leases = IndexLeases::new(repo.meta().clone(), cfg);
+    let budgets = Budgets {
+        scan: args.query_scan_budget,
+        blame: args.blame_scan_budget,
+        search_files: args.search_scan_budget,
+        search_bytes: args.search_scan_bytes,
+        legacy_factor: args.legacy_scan_factor as usize,
+    };
+    let policy = IndexPolicy::new(mode, leases.clone())
+        .with_budgets(budgets)
+        .with_index_wait(args.index_wait, args.index_waiters)
+        .with_request_timeout(args.request_timeout);
+    *repo = repo.clone().with_index_policy(Arc::new(policy));
+    tracing::info!(
+        mode = if mode == IndexMode::Lease { "lease" } else { "off" },
+        holder = %leases.config().holder,
+        "queries never derive an index while its lease lives (ADR 0058)"
+    );
+    Ok(Some(leases))
 }
 
 /// The land coordinator and its HTTP side, from the flags (ADR 0056).
