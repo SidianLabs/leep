@@ -973,3 +973,62 @@ async fn old_clients_wait_within_the_cap_and_their_time() {
         "{took:?}"
     );
 }
+
+/// History nodes deleted under a bounded query (a drop racing it) answer
+/// `Indexing` (503), as a vanished `history-tree-v4` row does, not a
+/// storage error.
+#[tokio::test]
+async fn vanished_history_nodes_answer_indexing() {
+    let (r, meta) = memory_repo();
+    let mut changes = BTreeMap::new();
+    for i in 0..3000 {
+        let body = format!("file {i}\n");
+        let content = r.blobs().put(Bytes::from(body.clone())).await.unwrap();
+        changes.insert(
+            RepoPath::new(format!("d{}/e{}/f{i}", i % 40, i % 7)).unwrap(),
+            FileChange::Modify {
+                content,
+                kind: FileKind::Regular,
+                size: body.len() as u64,
+            },
+        );
+    }
+    let cs = Changeset {
+        parents: vec![],
+        author: "a".into(),
+        timestamp: 1,
+        message: "wide".into(),
+        changes,
+        extra: BTreeMap::new(),
+    };
+    let tip = r.create_changeset(cs).await.unwrap();
+    derived::derive::<HistoryTree>(&r, tip).await.unwrap();
+    let nodes = meta
+        .list_derived(derived::HISTORY_NODE_KIND, None, usize::MAX)
+        .await
+        .unwrap();
+    assert!(!nodes.is_empty(), "the pack has more than one part");
+    meta.delete_derived_kind(derived::HISTORY_NODE_KIND)
+        .await
+        .unwrap();
+    hold_leases(meta.as_ref()).await;
+    // A fresh handle: nothing cached.
+    let fresh = Repo::new(r.blobs().clone(), meta.clone());
+    let q = bounded(&fresh, Budgets::default());
+    let mut indexing = 0;
+    for i in 0..40 {
+        let params = LogParams {
+            path: Some(format!("d{i}/e{}/f{i}", i % 7)),
+            ..Default::default()
+        };
+        match q
+            .log_page_indexed(tip, &params, 10, None, Freshness::Retry)
+            .await
+        {
+            Ok(_) => {}
+            Err(Error::Indexing { .. }) => indexing += 1,
+            Err(e) => panic!("{e}"),
+        }
+    }
+    assert!(indexing > 0);
+}

@@ -526,6 +526,14 @@ impl Repo {
             Some(p) => p,
             None => {
                 let Some(bytes) = self.meta().get_derived(kind, &key).await? else {
+                    // A bounded query (ADR 0058) whose rows were dropped
+                    // under it answers that the index is behind, as when a
+                    // row it looks up first is gone.
+                    if self.bounded.is_some() {
+                        return Err(crate::indexing::bounded::rows_vanished(
+                            crate::indexing::IndexGroup::History,
+                        ));
+                    }
                     return Err(missing(r));
                 };
                 self.cache_part(r.cs, r.part, &bytes)?

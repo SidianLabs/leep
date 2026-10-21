@@ -198,15 +198,7 @@ fn refuse_in_bounded_query(repo: &Repo, kind: &'static str) -> Result<()> {
         return Ok(());
     }
     match crate::indexing::IndexGroup::of_kind(kind) {
-        Some(g) => {
-            metrics::counter!("leep_query_rows_vanished_total", "kind" => g.lease_name())
-                .increment(1);
-            Err(Error::Indexing {
-                kind: g.lease_name().into(),
-                behind: 0,
-                retry_after_ms: 1000,
-            })
-        }
+        Some(g) => Err(crate::indexing::bounded::rows_vanished(g)),
         None => Ok(()),
     }
 }
