@@ -19,11 +19,11 @@
 //! | GET  | `/v1/resolve/{rev}` | – | [`ResolveResponse`] (`rev` = ref name, full 64-hex id or short tag name) |
 //! | GET  | `/v1/resolve-prefix/{prefix}` | – | [`ResolvePrefixResponse`] (the one changeset whose id starts with `prefix`, 4 to 64 hex digits in any case; 404 if none; 400 [`AmbiguousPrefixResponse`] listing up to 10 `candidates` if several; 400 if the prefix is shorter than 4 digits, longer than 64 or not hex; ADR 0035) |
 //! | GET  | `/v1/tree/{id}?path=dir` | – | [`TreeResponse`] (one directory level) |
-//! | GET  | `/v1/files/{id}?prefix=dir` | – | [`FilesResponse`] (recursive listing) |
+//! | GET  | `/v1/files/{id}?prefix=dir&limit=n&after=cursor` | – | [`FilesResponse`] (recursive listing, sorted by path; without `limit` the whole listing, as before; `limit` is capped at [`MAX_PATHS_LIMIT`], 0 or not a number is 400; `after` is a page cursor) |
 //! | GET  | `/v1/file/{id}?path=p` | – | raw bytes + `x-leep-kind` header, or 404 |
 //! | GET  | `/v1/log/{id}?path=p&limit=n&author=a&extra=k:v` | – | [`LogResponse`] (newest first; `limit` defaults to 100, capped at 10000). `author` is a case-insensitive substring; `extra` repeats, is ANDed, and is `key:value` (exact) or `key` (present). `limit` counts matches. With `path` the walk follows the path-history index; without it, or for `author` and `extra`, a selective filter scans changesets linearly. `follow=true` (needs a file `path`; 400 otherwise) continues the history of a renamed file under its old name and marks entries with `path_at` and `renamed` (ADR 0016). `after` is a page cursor. `fields=summary` answers [`LogSummaryResponse`] instead: the same entries, cursors and fields, each entry a [`LogSummaryEntry`] (the message's first line, `agent.*` keys, the number of changed paths, no paths); `fields=full` is the default; anything else is 400 |
 //! | GET  | `/v1/last-change/{id}?path=p` | – | [`LastChangeResponse`] (the newest changeset reachable from `id` that changed file or directory `p`, answered from the path-history index; a deleted path answers with the deleting changeset; 404 if `p` never existed) |
-//! | GET  | `/v1/diff?from=a&to=b&prefix=dir&renames=bool&rename_threshold=n` | – | [`DiffResponse`] (`from` omitted = empty tree; `renames=true` adds detected renames, `rename_threshold` is 0 to 100 and defaults to 50, anything else is 400; ADR 0016) |
+//! | GET  | `/v1/diff?from=a&to=b&prefix=dir&renames=bool&rename_threshold=n&limit=n&after=cursor` | – | [`DiffResponse`] (`from` omitted = empty tree; `renames=true` adds detected renames, `rename_threshold` is 0 to 100 and defaults to 50, anything else is 400; ADR 0016. `limit` and `after` page `entries` as for `/v1/files`; each rename rides on the page holding its `to` entry) |
 //! | GET  | `/v1/blame/{id}?path=p` | – | [`BlameResponse`] (with per-changeset [`ChangesetSummary`]) |
 //! | GET  | `/v1/provenance/{id}?path=prefix&limit=n` | – | [`ProvenanceResponse`] (who and what made the changesets reachable from `id`; `limit` defaults to 10000, capped at 10000) |
 //! | GET  | `/v1/search/{rev}?q=text&regex=bool&i=bool&path=dir&glob=g&limit=n&after=cursor` | – | [`SearchResponse`] (`rev` = ref name or full id; `limit` defaults to 100, capped at 1000; booleans are `true` or `false`; a bad regex is 400, an unknown `rev` 404; `after` is a page cursor) |
@@ -109,7 +109,8 @@
 //! # Pagination
 //!
 //! `GET /v1/log`, `/v1/search` and `/v1/reflog` answer one page of at most
-//! `limit` items. A page that stopped before the end carries `next`, an
+//! `limit` items. `GET /v1/files` and `/v1/diff` do too when the request
+//! has `limit`; without it they answer the whole list, as they always have. A page that stopped before the end carries `next`, an
 //! opaque cursor of at most 4096 URL-safe characters; repeating the request
 //! with the same parameters plus `after=<next>` returns the following page
 //! (`limit` may change between pages). Concatenated pages equal what one
@@ -667,9 +668,21 @@ pub struct FileInfo {
     pub size: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// Most paths one page of `GET /v1/files` or `GET /v1/diff` holds; a larger
+/// `limit` is lowered to it. A request without `limit` is not capped: older
+/// clients expect the whole list in one answer, so capping it would silently
+/// truncate them. Capping it too, once clients that page are the norm, is a
+/// follow-up.
+pub const MAX_PATHS_LIMIT: usize = 10_000;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FilesResponse {
+    /// Sorted by path.
     pub files: Vec<FileInfo>,
+    /// Cursor for the next page (see "Pagination"); absent on the last page,
+    /// without `limit`, and from older servers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -836,17 +849,27 @@ pub struct RenameEntry {
 /// `entries` is unchanged by rename detection: a rename still appears as a
 /// deleted and an added entry, so clients that ignore `renames` see what they
 /// always saw.
+///
+/// Paged (`limit`), renames are still detected over the whole diff, so
+/// pairing does not depend on page size, and each rename is on the page
+/// that holds its `to` entry: its `from` entry may be on another page.
+/// Concatenated pages equal the unpaged answer.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiffResponse {
+    /// Sorted by path.
     pub entries: Vec<DiffEntry>,
     /// Only with `renames=true`; sorted by `to`. Each path of `entries`
     /// appears in at most one rename.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub renames: Vec<RenameEntry>,
     /// Similarity matching was skipped because there were too many candidate
-    /// pairs; exact renames are still reported.
+    /// pairs; exact renames are still reported. The same on every page.
     #[serde(default, skip_serializing_if = "is_false")]
     pub renames_truncated: bool,
+    /// Cursor for the next page (see "Pagination"); absent on the last page,
+    /// without `limit`, and from older servers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -1620,5 +1643,39 @@ mod tests {
         assert_eq!(v["renames"][0]["to"], "b");
         assert_eq!(v["renames_truncated"], true);
         assert_eq!(serde_json::from_value::<DiffResponse>(v).unwrap(), new);
+    }
+
+    #[test]
+    fn files_and_diff_pages_add_only_an_optional_next() {
+        // Old bodies decode, and an unpaged answer keeps the old shape.
+        let files: FilesResponse =
+            serde_json::from_value(serde_json::json!({ "files": [] })).unwrap();
+        assert_eq!(files.next, None);
+        assert_eq!(
+            serde_json::to_value(&files).unwrap(),
+            serde_json::json!({ "files": [] })
+        );
+        let diff: DiffResponse =
+            serde_json::from_value(serde_json::json!({ "entries": [] })).unwrap();
+        assert_eq!(diff.next, None);
+        assert_eq!(
+            serde_json::to_value(&diff).unwrap(),
+            serde_json::json!({ "entries": [] })
+        );
+
+        let files = FilesResponse {
+            next: Some("c".into()),
+            ..files
+        };
+        let v = serde_json::to_value(&files).unwrap();
+        assert_eq!(v, serde_json::json!({ "files": [], "next": "c" }));
+        assert_eq!(serde_json::from_value::<FilesResponse>(v).unwrap(), files);
+        let diff = DiffResponse {
+            next: Some("d".into()),
+            ..diff
+        };
+        let v = serde_json::to_value(&diff).unwrap();
+        assert_eq!(v, serde_json::json!({ "entries": [], "next": "d" }));
+        assert_eq!(serde_json::from_value::<DiffResponse>(v).unwrap(), diff);
     }
 }

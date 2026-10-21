@@ -250,6 +250,7 @@ mod tests {
                 },
             ],
             renames_truncated: false,
+            next: None,
         };
         let blocks = render(&resp, fetch_from(&["x\ny\n", "x\ny\nz\n", "1\n", "e\n"])).unwrap();
         assert_eq!(blocks.len(), 3);

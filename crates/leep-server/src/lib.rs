@@ -1024,7 +1024,7 @@ async fn files(
 ) -> ApiResult<Json<FilesResponse>> {
     let prefix = q.prefix.unwrap_or_default();
     let files = repo.list_files(cid(&id)?, &prefix).await?;
-    Ok(Json(FilesResponse { files }))
+    Ok(Json(FilesResponse { files, next: None }))
 }
 
 async fn file(
@@ -1275,6 +1275,7 @@ async fn diff(State(repo): S, Query(q): Query<DiffQuery>) -> ApiResult<Json<Diff
         entries,
         renames: found.renames,
         renames_truncated: found.truncated,
+        next: None,
     }))
 }
 

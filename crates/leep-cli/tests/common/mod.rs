@@ -616,6 +616,7 @@ async fn files(
             .filter(|f| f.path.is_within(prefix))
             .cloned()
             .collect(),
+        next: None,
     }))
 }
 
