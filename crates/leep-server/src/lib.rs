@@ -697,7 +697,13 @@ async fn add_review(
     auth::MaybePrincipal(who): auth::MaybePrincipal,
     Path(id): Path<String>,
     body: Bytes,
-) -> ApiResult<Json<AddReviewResponse>> {
+) -> ApiResult<Response> {
+    if who.as_ref().is_some_and(|p| !p.review) {
+        return Ok(auth::reject(
+            StatusCode::FORBIDDEN,
+            "token may not review: its tokens-file entry has \"review\": false",
+        ));
+    }
     let id = cid(&id)?;
     let req: AddReviewRequest = parse_json(&body)?;
     repo.get_changeset(id).await?;
@@ -718,7 +724,8 @@ async fn add_review(
     Ok(Json(AddReviewResponse {
         reviewer: who.name,
         verdict: req.verdict,
-    }))
+    })
+    .into_response())
 }
 
 async fn get_reviews(

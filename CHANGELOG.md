@@ -7,6 +7,14 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 ## [Unreleased]
 
+### Reviewer capability
+- A tokens-file entry may say `"review": false` (`leep-server gen-token
+  --no-review`): the token cannot post reviews (403) and its reviews, old or
+  new, do not count. Absent means true, as before. Recommended for agent
+  tokens (ADR 0011).
+- `leep` prints the server's reason for a 403 instead of always "token lacks
+  write access".
+
 ### Token expiry
 - A tokens-file entry may carry `expires` (RFC 3339, e.g.
   `2027-01-31T00:00:00Z`); after it the token gets 401 `token expired at

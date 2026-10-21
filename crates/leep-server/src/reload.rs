@@ -321,6 +321,7 @@ impl ReloadReport {
                 role_changed = ?t.role_changed,
                 limits_changed = ?t.limits_changed,
                 expiry_changed = ?t.expiry_changed,
+                review_changed = ?t.review_changed,
                 "tokens changed"
             );
         }
@@ -729,6 +730,21 @@ mod tests {
     }
 
     #[test]
+    fn review_true_is_the_same_config_as_no_field() {
+        let f = files();
+        let base = fp(&f);
+        f.put(
+            "tokens.json",
+            &serde_json::json!({ "tokens": [
+                { "name": "ci", "role": "write", "hash": hash_token("t1"), "review": true },
+                { "name": "viewer", "role": "read", "hash": hash_token("t2") },
+            ] })
+            .to_string(),
+        );
+        assert_eq!(fp(&f), base);
+    }
+
+    #[test]
     fn order_and_formatting_do_not_change_the_fingerprint() {
         let f = files();
         let base = fp(&f);
@@ -833,6 +849,17 @@ mod tests {
             .to_string(),
         );
         check("a token expiry set", f);
+
+        let f = files();
+        f.put(
+            "tokens.json",
+            &serde_json::json!({ "tokens": [
+                { "name": "ci", "role": "write", "hash": hash_token("t1"), "review": false },
+                { "name": "viewer", "role": "read", "hash": hash_token("t2") },
+            ] })
+            .to_string(),
+        );
+        check("a token barred from review", f);
 
         let f = files();
         f.put("keys.json", &keys(&[("alice", &key(1)), ("bob", &key(2))]));
