@@ -926,6 +926,9 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   300,000-row kind and minutes for a full one; each batch now takes 30-50 ms
   whatever the statistics. Servers older than this change refuse the
   migrated database, as for any migration.
+- The S3 client's TLS verification no longer trusts certificate chains
+  through distrusted intermediates: rustls-webpki 0.103.16 and webpki-roots
+  1.0.10 (RUSTSEC-2026-0382, RUSTSEC-2026-0381).
 
 ### Project
 - Workspace version set to 0.0.1, with a CI check that keeps it below
