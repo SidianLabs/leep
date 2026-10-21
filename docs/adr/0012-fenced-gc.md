@@ -192,3 +192,27 @@ derived indexes live in metadata, not the blob store. No client can block a
 collect; an upload waits at most 30 s and then gets 409. Read tokens can
 write claims through `POST /v1/blobs/missing` and so keep known orphans for
 as long as they keep asking (S-11, accepted; see ADR 0007's note).
+
+## Statement bound, 2026-10-21
+"A statement already sent to Postgres when a request is aborted can still
+commit shortly afterwards" understated it: sqlx sends no cancel request when a
+query's future is dropped, and Postgres does not notice the client leaving, so
+the statement ran to its end however long that took (a test in `leep-meta`,
+`postgres_a_dropped_query_keeps_running_without_a_statement_timeout`, shows it).
+The server now sets `statement_timeout` on its data pool to
+`--meta-statement-timeout`, by default `--request-timeout` plus 5 s (the margin
+lets the request's own 408 come first), so Postgres cancels such a statement.
+Lease connections, migrations (`SET LOCAL statement_timeout = 0`) and the
+command-line tools are not bounded.
+
+For case (b) this turns an unbounded tail into a bound: a write sent before the
+request's deadline commits at most `request timeout + statement timeout` after
+the request's fence read. The fence covers that worst case when
+`fence > request timeout + statement timeout + skew`. With the defaults (5m and
+5m 5s) that is about 10m 5s plus skew, a little over the default 10m fence, so a
+deployment that wants the proof to hold for a statement that starts in the last
+moments of its request and then runs for minutes should either run `gc` with
+`--fence 15m` or set a shorter `--meta-statement-timeout` (statements of a
+request take milliseconds; `30s` gives `fence > 5m 30s + skew`). The default
+fence still covers every request whose statements finish within the remaining
+five minutes, as before.

@@ -7,6 +7,17 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 ## [Unreleased]
 
+### Probe cost and statement bound
+- `GET /v1/ready` reuses its answer for one second and runs one check at a
+  time, so the public probe reads the stores at most once a second.
+  `leep_ready_checks_total` now counts checks, not calls.
+- The server bounds each Postgres data statement with `statement_timeout`
+  (`--meta-statement-timeout`, `LEEP_META_STATEMENT_TIMEOUT`; default
+  `--request-timeout` plus 5 s, `0` turns it off). Before, a query whose
+  request hit `--request-timeout` ran on in the database to its end, because
+  dropping a query does not cancel it. Lease calls and migrations are not
+  bounded (ADR 0012).
+
 ### Reviewer capability
 - A tokens-file entry may say `"review": false` (`leep-server gen-token
   --no-review`): the token cannot post reviews (403) and its reviews, old or

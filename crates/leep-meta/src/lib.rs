@@ -60,11 +60,24 @@ pub async fn open_meta_store_with_pool(
     mode: SchemaMode,
     pool_size: u32,
 ) -> Result<Arc<dyn MetaStore>> {
+    open_meta_store_with_options(url, mode, pool_size, None).await
+}
+
+/// [`open_meta_store_with_pool`], with each Postgres data statement bounded
+/// by `statement_timeout`; see [`PostgresMetaStore::connect_with_options`].
+/// SQLite and `mem://` ignore it.
+pub async fn open_meta_store_with_options(
+    url: &str,
+    mode: SchemaMode,
+    pool_size: u32,
+    statement_timeout: Option<std::time::Duration>,
+) -> Result<Arc<dyn MetaStore>> {
     if url.starts_with("sqlite:") {
         Ok(Arc::new(SqliteMetaStore::connect_with(url, mode).await?))
     } else if url.starts_with("postgres://") || url.starts_with("postgresql://") {
         Ok(Arc::new(
-            PostgresMetaStore::connect_with_pool(url, mode, pool_size).await?,
+            PostgresMetaStore::connect_with_options(url, mode, pool_size, statement_timeout)
+                .await?,
         ))
     } else if url.starts_with("mem://") {
         Ok(Arc::new(leep_core::memory::MemoryMetaStore::new()))

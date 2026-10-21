@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -111,7 +112,39 @@ impl PostgresMetaStore {
     /// [`connect_with`](Self::connect_with), opening at most `pool_size`
     /// connections.
     pub async fn connect_with_pool(url: &str, mode: SchemaMode, pool_size: u32) -> Result<Self> {
-        Self::open(url, None, mode, MIGRATIONS, pool_size).await
+        Self::open(url, None, mode, MIGRATIONS, pool_size, None).await
+    }
+
+    /// [`connect_with_pool`](Self::connect_with_pool), with every statement
+    /// on the data pool bounded by `statement_timeout` (Postgres cancels it
+    /// and the call fails). Lease calls, migrations and schema creation are
+    /// not bounded.
+    pub async fn connect_with_options(
+        url: &str,
+        mode: SchemaMode,
+        pool_size: u32,
+        statement_timeout: Option<Duration>,
+    ) -> Result<Self> {
+        Self::open(url, None, mode, MIGRATIONS, pool_size, statement_timeout).await
+    }
+
+    /// A store in `schema` whose data pool bounds statements, for tests of
+    /// that bound.
+    #[doc(hidden)]
+    pub async fn connect_with_schema_and_timeout(
+        url: &str,
+        schema: &str,
+        statement_timeout: Duration,
+    ) -> Result<Self> {
+        Self::open(
+            url,
+            Some(schema.to_string()),
+            SchemaMode::Migrate,
+            MIGRATIONS,
+            crate::DEFAULT_POSTGRES_POOL_SIZE,
+            Some(statement_timeout),
+        )
+        .await
     }
 
     /// Like [`connect`](Self::connect), but keeps all tables in `schema`
@@ -123,6 +156,7 @@ impl PostgresMetaStore {
             SchemaMode::Migrate,
             MIGRATIONS,
             crate::DEFAULT_POSTGRES_POOL_SIZE,
+            None,
         )
         .await
     }
@@ -142,6 +176,7 @@ impl PostgresMetaStore {
             mode,
             migrations,
             crate::DEFAULT_POSTGRES_POOL_SIZE,
+            None,
         )
         .await
     }
@@ -162,6 +197,7 @@ impl PostgresMetaStore {
             url,
             schema.map(str::to_string),
             crate::DEFAULT_POSTGRES_POOL_SIZE,
+            None,
         )
         .await?;
         let r = Self::run(&pool, migrations, !dry_run).await;
@@ -188,13 +224,16 @@ impl PostgresMetaStore {
         mode: SchemaMode,
         migrations: &[Migration],
         pool_size: u32,
+        statement_timeout: Option<Duration>,
     ) -> Result<Self> {
-        let pool = Self::pool(url, schema.clone(), pool_size).await?;
+        let pool = Self::pool(url, schema.clone(), pool_size, statement_timeout).await?;
         let report = Self::run(&pool, migrations, mode == SchemaMode::Migrate).await?;
         if mode == SchemaMode::RequireCurrent {
             migrate::require_current(&report)?;
         }
-        let lease_pool = Self::options(schema, LEASE_POOL_SIZE)
+        // Never bounded: a renewal that waits on a busy database should be
+        // late, not cancelled, and the lease TTL already bounds it.
+        let lease_pool = Self::options(schema, LEASE_POOL_SIZE, None)
             .connect_lazy_with(PgConnectOptions::from_str(url).map_err(storage)?);
         let store = Self::with_pool(pool, lease_pool, migrations);
         crate::features::check(&store.features().await?)?;
@@ -202,7 +241,12 @@ impl PostgresMetaStore {
         Ok(store)
     }
 
-    async fn pool(url: &str, schema: Option<String>, max: u32) -> Result<PgPool> {
+    async fn pool(
+        url: &str,
+        schema: Option<String>,
+        max: u32,
+        statement_timeout: Option<Duration>,
+    ) -> Result<PgPool> {
         let opts = PgConnectOptions::from_str(url).map_err(storage)?;
         if let Some(schema) = &schema {
             let quoted = quote_ident(schema);
@@ -217,22 +261,37 @@ impl PostgresMetaStore {
                 .map_err(storage)?;
             admin.close().await;
         }
-        Self::options(schema, max)
+        Self::options(schema, max, statement_timeout)
             .connect_with(opts)
             .await
             .map_err(storage)
     }
 
-    fn options(schema: Option<String>, max: u32) -> PgPoolOptions {
+    /// `statement_timeout` is set per connection because sqlx never cancels
+    /// a statement whose future is dropped: without it, a query of a request
+    /// cut off by the server's request timeout runs on in Postgres to the
+    /// end, holding its connection and locks.
+    fn options(
+        schema: Option<String>,
+        max: u32,
+        statement_timeout: Option<Duration>,
+    ) -> PgPoolOptions {
+        let timeout = statement_timeout
+            .filter(|t| !t.is_zero())
+            .map(|t| format!("SET statement_timeout = {}", t.as_millis().max(1)));
         PgPoolOptions::new()
             .max_connections(max.max(1))
             .after_connect(move |conn, _| {
                 let set = schema
                     .as_ref()
                     .map(|s| format!("SET search_path TO {}", quote_ident(s)));
+                let timeout = timeout.clone();
                 Box::pin(async move {
                     if let Some(set) = set {
                         sqlx::query(&set).execute(&mut *conn).await?;
+                    }
+                    if let Some(timeout) = timeout {
+                        sqlx::query(&timeout).execute(&mut *conn).await?;
                     }
                     Ok(())
                 })
@@ -243,6 +302,12 @@ impl PostgresMetaStore {
     /// migrate once and the rest find it done. A read-only look takes no lock.
     async fn run(pool: &PgPool, migrations: &[Migration], write: bool) -> Result<MigrationReport> {
         let mut tx = pool.begin().await.map_err(storage)?;
+        // A migration may rewrite a large table, and waits for another
+        // server's; the data pool's statement bound is not meant for it.
+        sqlx::query("SET LOCAL statement_timeout = 0")
+            .execute(&mut *tx)
+            .await
+            .map_err(storage)?;
         if write {
             sqlx::query("SELECT pg_advisory_xact_lock($1)")
                 .bind(MIGRATE_LOCK)

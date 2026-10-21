@@ -741,7 +741,8 @@ kind, lands per second, and the [standard bundle](#collecting-a-bug-report).
 **Meaning.** More than 5 requests were aborted with 408 by `--request-timeout`
 (default 5 minutes) within 15 minutes. **Ticket.** A timed-out request stops and
 writes nothing further, but a statement already sent to Postgres can still commit
-shortly afterwards (ADR 0012).
+afterwards, until Postgres cancels it at `--meta-statement-timeout` (default the
+request timeout plus 5 s; ADR 0012).
 
 **Impact.** Those requests fail (CLI exit 3). Repeating is safe, but if the cause
 is structural (an upload that can never finish in time) it fails again.

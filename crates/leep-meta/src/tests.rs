@@ -805,3 +805,109 @@ async fn sqlite_identical_upserts_do_not_update_rows() {
         bytes::Bytes::from_static(b"b 3")
     );
 }
+
+/// Statements of `pool` whose text contains `tag` that Postgres is running.
+async fn running(url: &str, tag: &str) -> i64 {
+    let observer = sqlx::PgPool::connect(url).await.unwrap();
+    let n: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_stat_activity WHERE state = 'active' AND query LIKE $1",
+    )
+    .bind(format!("%{tag}%"))
+    .fetch_one(&observer)
+    .await
+    .unwrap();
+    observer.close().await;
+    n
+}
+
+async fn cancel(url: &str, tag: &str) {
+    let observer = sqlx::PgPool::connect(url).await.unwrap();
+    sqlx::query("SELECT pg_cancel_backend(pid) FROM pg_stat_activity WHERE query LIKE $1")
+        .bind(format!("%{tag}%"))
+        .execute(&observer)
+        .await
+        .unwrap();
+    observer.close().await;
+}
+
+/// Why the data pool needs `statement_timeout`: sqlx sends no cancel request
+/// when a query's future is dropped (as the server's request timeout does),
+/// so Postgres runs the statement to its end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_a_dropped_query_keeps_running_without_a_statement_timeout() {
+    let Some((s, url)) = pg_store("orphan").await else {
+        return;
+    };
+    let tag = format!("leep-orphan-{}", std::process::id());
+    let q = format!("SELECT pg_sleep(20) /* {tag} */");
+    let dropped = tokio::time::timeout(
+        std::time::Duration::from_millis(300),
+        sqlx::query(&q).execute(&s.pool),
+    )
+    .await;
+    assert!(dropped.is_err(), "the query should still be running");
+    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+    let n = running(&url, &tag).await;
+    cancel(&url, &tag).await;
+    assert_eq!(n, 1, "the dropped statement still runs in Postgres");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_statement_timeout_bounds_the_data_pool_only() {
+    let Some(url) = pg_url() else {
+        return;
+    };
+    let s = PostgresMetaStore::connect_with_schema_and_timeout(
+        &url,
+        &schema("stmt_timeout"),
+        std::time::Duration::from_millis(1500),
+    )
+    .await
+    .unwrap();
+    let show = |pool: &sqlx::PgPool| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, String>("SHOW statement_timeout")
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        }
+    };
+    assert_eq!(show(&s.pool).await, "1500ms");
+    assert_eq!(
+        show(&s.lease_pool).await,
+        "0",
+        "lease calls are never bounded"
+    );
+
+    // A statement over the bound fails instead of running on.
+    let e = sqlx::query("SELECT pg_sleep(5)")
+        .execute(&s.pool)
+        .await
+        .unwrap_err();
+    assert!(e.to_string().contains("statement timeout"), "{e}");
+
+    // One whose request was dropped is cancelled by Postgres at the bound.
+    let tag = format!("leep-bounded-{}", std::process::id());
+    let q = format!("SELECT pg_sleep(20) /* {tag} */");
+    let dropped = tokio::time::timeout(
+        std::time::Duration::from_millis(300),
+        sqlx::query(&q).execute(&s.pool),
+    )
+    .await;
+    assert!(dropped.is_err());
+    tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+    let n = running(&url, &tag).await;
+    cancel(&url, &tag).await;
+    assert_eq!(n, 0, "Postgres ended the orphaned statement");
+
+    // Ordinary work is unaffected, and reopening (migrations) still works.
+    check_meta_store_contract(&s).await;
+    PostgresMetaStore::connect_with_schema_and_timeout(
+        &url,
+        &schema("stmt_timeout"),
+        std::time::Duration::from_millis(1500),
+    )
+    .await
+    .unwrap();
+}

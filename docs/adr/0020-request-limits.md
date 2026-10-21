@@ -183,3 +183,12 @@ concurrent 512 MiB uploads from any writers would ask for 8 GiB.
   `leep_request_body_budget_bytes` and
   `leep_request_body_refused_total{reason,class}`, and the alert
   `LeepBodyBudgetExhausted`.
+
+## Probe cost, 2026-10-21
+`GET /v1/ready` is public and unlimited, so anyone who can reach the server
+could make it read both stores on every call. Its answer is now reused for one
+second (`DEFAULT_READY_CACHE`), and callers that arrive while a check runs wait
+for that check instead of starting their own, so a server checks its stores at
+most once a second whatever the probe rate. Readiness changes show up to a
+second late, well inside any orchestrator's probe period.
+`leep_ready_checks_total` counts checks, not calls.
