@@ -618,6 +618,18 @@ to the landed-copy scan, which only sees the last 1024 changesets.
 steady rate means clients are retrying lands that had already applied
 (timeouts, restarts), which is expected in small numbers.
 
+### Protected refs and the log
+
+The log records how a ref moved; it does not stop a move. A write token can
+reset or delete any ref no land policy covers, and the log is then the way to
+find and undo it. Refs that must never go backwards (`main`, release branches)
+belong in `--protect-ref` (`LEEP_PROTECT_REFS`) if no signature or review
+policy names them already ([DEPLOY.md](DEPLOY.md#protected-refs)): such a ref
+only moves forward and cannot be deleted through the API, and a refused move
+writes no entry. The startup line `land policy protects refs` lists every
+protected ref, whichever flag or file protects it. Moving a protected ref back
+by hand needs the metadata store itself; prefer `leep revert` and a land.
+
 ## Git mirror
 
 `leep-git mirror run` keeps a git remote (GitHub, GitLab, any server git
