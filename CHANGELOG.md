@@ -63,6 +63,9 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   moved to, so clients no longer parse them out of the message (whose text
   is unchanged). `leep --json` errors include it as `land`. Older servers
   omit it.
+- `leep_commit_and_land` reads the earlier changeset of a reused
+  `request_id` from that `land` record, and falls back to the message text,
+  then the ref log, only for servers that omit it. Tool output is unchanged.
 
 ### Land ids in the ref log
 - `GET /v1/reflog` entries carry `land_id` and `land_changeset` for lands
