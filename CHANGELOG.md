@@ -7,6 +7,16 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 ## [Unreleased]
 
+### File listings and diffs answer in pages
+- `GET /v1/files/{id}` and `GET /v1/diff` take `limit` and `after` and
+  answer `next` when more remain, like log, search and the ref log. Paths
+  come in byte order and a page reads only the trees it needs, so the first
+  page of a 90k-file listing no longer walks the whole tree. `limit` is
+  capped at 10,000 (`MAX_PATHS_LIMIT`); 0 or a non-number is 400. With
+  `renames=true` each rename is on the page of its `to` entry.
+- Requests without `limit` answer the whole list exactly as before, so older
+  clients are unaffected; capping them too is left for later.
+
 ### Land conflicts name only stored blobs
 - A land answered with conflicts now stores the merged text its `clean`
   changes name before answering. Before, a land that moved nothing never

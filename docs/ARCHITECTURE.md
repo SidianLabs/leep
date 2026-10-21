@@ -378,7 +378,17 @@ Provenance scans the newest changesets (capped at 10 000, reporting
 
 **Page cursors.** `GET /v1/log`, `/v1/search` and `/v1/reflog` answer one
 capped page and, when more remains, an opaque `next` cursor that the client
-sends back as `after` (`leep_derive::cursor`, layout in FORMATS.md). A log
+sends back as `after` (`leep_derive::cursor`, layout in FORMATS.md).
+`GET /v1/files` and `/v1/diff` do the same when asked with `limit` (capped
+at `MAX_PATHS_LIMIT`, 10,000); without it they answer everything, as older
+clients expect. Their cursor is the last path. The walk keeps pending files
+and unread directories in one order, a directory keyed by its path plus `/`
+so it sorts with its contents (`a.txt` before `a/b`), and reads the smallest
+directories in batches; it yields in path order without sorting at the end,
+stops once the page is full, and never reads a directory that ends before
+the cursor. A diff with `renames=true` still walks and pairs the whole diff
+on each page, so pairs never depend on page size, and keeps the renames
+whose `to` is on the page. A log
 cursor carries the walk's queue: every log walk (plain, path index, `follow`,
 and the `log-filter-v1` walk with its merge-side bounds) pops in descending
 `(generation, id)` and queues only ancestors, so seeding a fresh walk with

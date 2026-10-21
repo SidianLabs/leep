@@ -44,6 +44,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 
 [dev-dependencies]
 leep-testkit.workspace = true
+base64.workspace = true
 tempfile = "3"
 bytes.workspace = true
 zstd.workspace = true
