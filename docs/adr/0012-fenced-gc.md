@@ -48,9 +48,9 @@ no part in the fence.
    `started_at - grace` with no claim at or after that cutoff, write
    `blob-condemned-v1` unless it is already condemned (its earlier time
    stands). Deletes nothing. `--dry-run` writes nothing.
-2. **Fence.** Wait `--fence` (default 10m). `leep-server gc` sleeps; operators
+2. **Fence.** Wait `--fence` (default 10m; 15m since 2026-10-21, below). `leep-server gc` sleeps; operators
    who prefer short processes run `gc condemn` and, later, `gc collect`.
-3. **Collect** (`leep-server gc collect --fence 10m`). Record `started_at`,
+3. **Collect** (`leep-server gc collect --fence 15m`). Record `started_at`,
    mark again, then for each blob with a condemnation row whose time is at
    most `started_at - fence` (younger rows are left for a later run):
    - not condemned any more (rescued): skip;
@@ -151,7 +151,8 @@ Clock skew. The fence compares only GC-host timestamps: condemnation times
 not enter the comparison. Skew enters through the real-time bound in (b): the
 request timeout is measured on the servers, the fence on the GC host, so run
 with `fence >= timeout + skew + margin`; the default 10m against 5m leaves five
-minutes. The store modification time check compares the blob store's clock with
+minutes. (Superseded for Postgres by "Statement bound" below: the fence must
+also cover the statement timeout, and the default is 15m.) The store modification time check compares the blob store's clock with
 the GC clock and is a second line of defence only: a skewed result keeps a
 blob or defers to the rescue rows, and never deletes a blob a rescue protects.
 Condemnation times never go backwards for one blob, even if the GC host's clock
@@ -192,3 +193,35 @@ derived indexes live in metadata, not the blob store. No client can block a
 collect; an upload waits at most 30 s and then gets 409. Read tokens can
 write claims through `POST /v1/blobs/missing` and so keep known orphans for
 as long as they keep asking (S-11, accepted; see ADR 0007's note).
+
+## Statement bound, 2026-10-21
+"A statement already sent to Postgres when a request is aborted can still
+commit shortly afterwards" understated it: sqlx sends no cancel request when a
+query's future is dropped, and Postgres does not notice the client leaving, so
+the statement ran to its end however long that took (a test in `leep-meta`,
+`postgres_a_dropped_query_keeps_running_without_a_statement_timeout`, shows it).
+The server now sets `statement_timeout` on its data pool to
+`--meta-statement-timeout`, by default `--request-timeout` plus 5 s (the margin
+lets the request's own 408 come first), so Postgres cancels such a statement.
+Lease connections, migrations (`SET LOCAL statement_timeout = 0`) and the
+command-line tools are not bounded.
+
+For case (b) this turns an unbounded tail into a bound: a write sent before the
+request's deadline commits at most `request timeout + statement timeout` after
+the request's fence read. The invariant GC now relies on is therefore
+
+    fence > request timeout + statement timeout + clock skew
+
+with the statement term on Postgres only (SQLite statements run in-process and
+end with the request). With the defaults that is 5m + 5m 5s + skew, so the
+default `--fence` is now **15m** (it was 10m, which held only for statements
+that finish within the request). `gc` evaluates the invariant with the
+`--request-timeout` and `--meta-statement-timeout` it is given (the flags are
+global, and their `LEEP_` variables apply, so run it with the servers'
+environment), allowing one minute of skew, and logs a WARN naming the numbers
+when `--fence` does not exceed them, or when either bound is off, since then no
+fence is safe. It warns rather than refuses because those are the servers'
+settings, which `gc` can only be told. Deployments that want a shorter fence can
+set a short `--meta-statement-timeout` instead (a request's statements take
+milliseconds; `30s` gives `fence > 5m 30s + skew`). `repack --fence` keeps its
+10m default: it guards reads of loose copies, which statements do not make.

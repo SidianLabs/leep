@@ -40,12 +40,17 @@ fn rig_with(timeout: Duration, auth: Option<Auth>, limiter: Option<Arc<Limiter>>
         )),
     );
     let config = ConfigHandle::fixed(RuntimeConfig::fixed(auth, None, None, limiter, None));
-    let app = leep_server::router_with_ready_timeout(
+    // Uncached, so every call checks the stores; caching has its own tests.
+    let app = leep_server::router_with_body_limits(
         repo,
         1 << 20,
+        leep_server::limits::BodyLimits::under(1 << 20),
         Duration::from_secs(60),
         config,
-        timeout,
+        leep_server::ReadyOptions {
+            timeout,
+            cache: Duration::ZERO,
+        },
     );
     Rig {
         app,
@@ -316,4 +321,76 @@ fn checks_are_counted_by_store_and_result() {
     assert_eq!(n("blobs", "ok"), 2.0);
     assert_eq!(n("blobs", "timeout"), 1.0);
     assert_eq!(n("blobs", "error"), 0.0);
+}
+
+/// The default router, whose answers are reused for a second.
+fn cached_rig() -> Rig {
+    let meta_plan = FaultPlan::new(1);
+    let blob_plan = FaultPlan::new(2);
+    let repo = Repo::new(
+        Arc::new(FaultyBlobStore::new(
+            Arc::new(MemoryBlobStore::new()),
+            blob_plan.clone(),
+        )),
+        Arc::new(FaultyMetaStore::new(
+            Arc::new(MemoryMetaStore::new()),
+            meta_plan.clone(),
+        )),
+    );
+    let config = ConfigHandle::fixed(RuntimeConfig::fixed(None, None, None, None, None));
+    let app = leep_server::router_with_ready_timeout(
+        repo,
+        1 << 20,
+        Duration::from_secs(60),
+        config,
+        leep_server::DEFAULT_READY_TIMEOUT,
+    );
+    Rig {
+        app,
+        meta_plan,
+        blob_plan,
+    }
+}
+
+#[tokio::test]
+async fn answers_are_reused_for_a_second() {
+    let a_second = leep_server::DEFAULT_READY_CACHE + Duration::from_millis(50);
+    let r = cached_rig();
+    for _ in 0..5 {
+        assert_eq!(ready(&r.app).await.0, StatusCode::OK);
+    }
+    assert_eq!(r.meta_plan.calls(Op::GetRef), 1);
+    assert_eq!(r.blob_plan.calls(Op::Contains), 1);
+
+    // A failure is reused too, and so is the recovery, each for a second.
+    tokio::time::sleep(a_second).await;
+    r.meta_plan.rate(&[Op::GetRef], 1000, Fault::Fail);
+    assert_eq!(ready(&r.app).await.0, StatusCode::SERVICE_UNAVAILABLE);
+    r.meta_plan.clear();
+    assert_eq!(ready(&r.app).await.0, StatusCode::SERVICE_UNAVAILABLE);
+    tokio::time::sleep(a_second).await;
+    assert_eq!(ready(&r.app).await.0, StatusCode::OK);
+    assert_eq!(r.meta_plan.calls(Op::GetRef), 3);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_probes_share_one_check() {
+    let r = cached_rig();
+    // Slow enough that every probe below arrives while the first one checks.
+    r.meta_plan.rate(
+        &[Op::GetRef],
+        1000,
+        Fault::Delay(Duration::from_millis(300)),
+    );
+    let probes: Vec<_> = (0..16)
+        .map(|_| {
+            let app = r.app.clone();
+            tokio::spawn(async move { ready(&app).await.0 })
+        })
+        .collect();
+    for p in probes {
+        assert_eq!(p.await.unwrap(), StatusCode::OK);
+    }
+    assert_eq!(r.meta_plan.calls(Op::GetRef), 1);
+    assert_eq!(r.blob_plan.calls(Op::Contains), 1);
 }
