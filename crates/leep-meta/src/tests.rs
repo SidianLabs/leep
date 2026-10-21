@@ -336,14 +336,16 @@ async fn postgres_walk_plan_ignores_stale_estimates() {
                     .await
                     .unwrap();
             }
-            let plan: Vec<String> =
-                sqlx::query_scalar(&format!("EXPLAIN {}", crate::postgres::WALK_DELETE))
-                    .bind(vec!["wp-new"])
-                    .bind("(0,0)")
-                    .bind("(64,0)")
-                    .fetch_all(&mut *tx)
-                    .await
-                    .unwrap();
+            let plan: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "EXPLAIN {}",
+                crate::postgres::WALK_DELETE
+            )))
+            .bind(vec!["wp-new"])
+            .bind("(0,0)")
+            .bind("(64,0)")
+            .fetch_all(&mut *tx)
+            .await
+            .unwrap();
             tx.rollback().await.unwrap();
             plan.join("\n")
         }
@@ -842,7 +844,7 @@ async fn postgres_a_dropped_query_keeps_running_without_a_statement_timeout() {
     let q = format!("SELECT pg_sleep(20) /* {tag} */");
     let dropped = tokio::time::timeout(
         std::time::Duration::from_millis(300),
-        sqlx::query(&q).execute(&s.pool),
+        sqlx::query(sqlx::AssertSqlSafe(q)).execute(&s.pool),
     )
     .await;
     assert!(dropped.is_err(), "the query should still be running");
@@ -892,7 +894,7 @@ async fn postgres_statement_timeout_bounds_the_data_pool_only() {
     let q = format!("SELECT pg_sleep(20) /* {tag} */");
     let dropped = tokio::time::timeout(
         std::time::Duration::from_millis(300),
-        sqlx::query(&q).execute(&s.pool),
+        sqlx::query(sqlx::AssertSqlSafe(q)).execute(&s.pool),
     )
     .await;
     assert!(dropped.is_err());

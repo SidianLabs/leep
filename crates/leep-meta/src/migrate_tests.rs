@@ -125,7 +125,7 @@ impl Db {
             Db::Sqlite { url, .. } => {
                 let opts = sqlx::sqlite::SqliteConnectOptions::from_str(url).unwrap();
                 let pool = sqlx::SqlitePool::connect_with(opts).await.unwrap();
-                let mut q = sqlx::query(sql);
+                let mut q = sqlx::query(sqlx::AssertSqlSafe(sql));
                 for a in args {
                     q = match a {
                         Arg::Bytes(b) => q.bind(b),
@@ -156,14 +156,16 @@ impl Db {
                     .after_connect(move |conn, _| {
                         let set = format!("SET search_path TO \"{schema}\"");
                         Box::pin(async move {
-                            sqlx::query(&set).execute(&mut *conn).await?;
+                            sqlx::query(sqlx::AssertSqlSafe(set))
+                                .execute(&mut *conn)
+                                .await?;
                             Ok(())
                         })
                     })
                     .connect_with(opts)
                     .await
                     .unwrap();
-                let mut q = sqlx::query(&numbered);
+                let mut q = sqlx::query(sqlx::AssertSqlSafe(numbered));
                 for a in args {
                     q = match a {
                         Arg::Bytes(b) => q.bind(b),
@@ -186,7 +188,10 @@ impl Db {
                 Db::Pg { url, .. } if s.contains("SCHEMA") => {
                     let opts = sqlx::postgres::PgConnectOptions::from_str(url).unwrap();
                     let pool = sqlx::PgPool::connect_with(opts).await.unwrap();
-                    sqlx::query(s).execute(&pool).await.unwrap();
+                    sqlx::query(sqlx::AssertSqlSafe(*s))
+                        .execute(&pool)
+                        .await
+                        .unwrap();
                     pool.close().await;
                 }
                 Db::Pg { .. } => self.exec(s, vec![]).await,
@@ -1433,9 +1438,9 @@ async fn migration_blocked_by_a_long_transaction_times_out() {
         .await
         .unwrap();
     let mut tx = holder.begin().await.unwrap();
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "LOCK TABLE \"{schema}\".changesets IN ACCESS SHARE MODE"
-    ))
+    )))
     .execute(&mut *tx)
     .await
     .unwrap();
