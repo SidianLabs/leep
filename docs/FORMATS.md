@@ -1136,7 +1136,7 @@ client treats an unknown or absent code by its HTTP status.
 |---|---|---|
 | 400 | `needs_review` | a land or ref move onto a ref whose review policy some changeset does not meet |
 | 400 | `not_signed` | a land or ref move onto a ref that needs every changeset signed by a trusted key |
-| 400 | `not_forward` | a move of a land-policy-protected ref that is not a fast-forward |
+| 400 | `not_forward` | a move of a land-policy-protected ref, or of a protected ref (`--protect-ref`), that is not a fast-forward |
 | 400 | `tag_immutable` | a move of a tag, or a land onto one |
 | 400 | `land_id_reused` | a land id the ref already recorded for another changeset (ADR 0057) |
 | 400 | `invalid_name` | a ref name the validator refuses |

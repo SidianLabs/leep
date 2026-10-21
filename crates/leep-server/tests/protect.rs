@@ -159,6 +159,7 @@ async fn a_protected_ref_only_moves_forward_and_cannot_be_deleted() {
         let r = api.cas("main", Some(b), Some(to)).await;
         assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.body);
         assert!(error(&r).contains(NOT_FORWARD_MARKER), "{}", r.body);
+        assert_eq!(r.body["code"], "not_forward", "{}", r.body);
     }
     // So is a delete.
     let r = api.cas("main", Some(b), None).await;

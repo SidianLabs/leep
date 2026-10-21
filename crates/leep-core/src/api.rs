@@ -63,7 +63,7 @@
 //! |---|---|---|
 //! | 400 | `needs_review` | a land onto a ref whose review policy some changeset does not meet |
 //! | 400 | `not_signed` | a land onto a ref that needs every changeset signed by a trusted key |
-//! | 400 | `not_forward` | a move of a land-policy-protected ref that is not a fast-forward |
+//! | 400 | `not_forward` | a move of a land-policy-protected ref, or of a protected ref (`--protect-ref`), that is not a fast-forward |
 //! | 400 | `tag_immutable` | a move of a tag, or a land onto one |
 //! | 400 | `land_id_reused` | a land id the ref already recorded for another changeset (ADR 0057) |
 //! | 400 | `invalid_name` | a ref name [`crate::refname::validate`] refuses |
@@ -223,7 +223,8 @@ pub mod error_code {
     /// 400: a land onto a ref that only accepts changesets signed by a
     /// trusted key ([`crate::signature::NOT_SIGNED_MARKER`]).
     pub const NOT_SIGNED: &str = "not_signed";
-    /// 400: a move of a protected ref that is not a fast-forward
+    /// 400: a move of a land-policy-protected ref, or of a protected ref
+    /// (`--protect-ref`), that is not a fast-forward
     /// ([`crate::refname::NOT_FORWARD_MARKER`]).
     pub const NOT_FORWARD: &str = "not_forward";
     /// 400: a tag move, or a land onto a tag. Tags are created and deleted,
