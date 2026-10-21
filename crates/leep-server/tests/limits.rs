@@ -151,6 +151,7 @@ async fn rate_limit_answers_429_with_retry_after_and_a_json_body() {
     assert_eq!(limited.status, StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(limited.retry_after.as_deref(), Some("1"));
     assert_eq!(limited.code().as_deref(), Some("rate_limited"));
+    assert!(limited.json().request_id.is_some());
     assert!(
         limited.error().contains("rate limit"),
         "{}",
@@ -159,6 +160,20 @@ async fn rate_limit_answers_429_with_retry_after_and_a_json_body() {
 
     r.clock.advance(Duration::from_secs(1));
     assert_eq!(statuses(&r.app, A, 2).await, [200, 429]);
+}
+
+#[tokio::test]
+async fn handler_errors_under_limits_carry_the_request_id() {
+    let r = rig_with(&[("a", serde_json::json!({ "rate": 100, "burst": 10 }))]);
+    let reply = send(
+        &r.app,
+        request(Method::GET, "/v1/resolve/nope", A, Body::empty()),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::NOT_FOUND);
+    let e = reply.json();
+    assert_eq!(e.code.as_deref(), Some("not_found"));
+    assert_eq!(e.request_id.map(|i| i.len()), Some(32));
 }
 
 #[tokio::test]

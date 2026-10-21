@@ -327,6 +327,8 @@ pub struct HttpForward {
     pub coord: Arc<Coordination>,
     pub body: Bytes,
     pub authorization: Option<HeaderValue>,
+    /// The client request's id, so the holder logs the land under it too.
+    pub request_id: Option<HeaderValue>,
 }
 
 impl HttpForward {
@@ -335,6 +337,7 @@ impl HttpForward {
             coord,
             body,
             authorization: headers.get(header::AUTHORIZATION).cloned(),
+            request_id: headers.get(leep_core::api::REQUEST_ID_HEADER).cloned(),
         }
     }
 }
@@ -368,6 +371,9 @@ impl LandForward<Relayed> for HttpForward {
             .body(self.body.clone());
         if let Some(a) = &self.authorization {
             req = req.header(header::AUTHORIZATION, a.clone());
+        }
+        if let Some(id) = &self.request_id {
+            req = req.header(leep_core::api::REQUEST_ID_HEADER, id.clone());
         }
         let resp = match req.send().await {
             Ok(r) => r,

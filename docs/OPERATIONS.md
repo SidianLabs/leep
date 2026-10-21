@@ -9,11 +9,22 @@ object per line.
 
 Every HTTP request produces one INFO line, `request completed`, inside a
 `request` span. The span carries `method`, `route` (the matched template such
-as `/v1/blobs/{hash}`, or `unmatched`), `status` and `latency_ms`:
+as `/v1/blobs/{hash}`, or `unmatched`), `request_id`, `status` and
+`latency_ms`:
 
 ```json
-{"timestamp":"...","level":"INFO","fields":{"message":"request completed","status":404,"latency_ms":0.39},"target":"leep_server::observe","span":{"method":"GET","route":"/v1/blobs/{hash}","status":404,"latency_ms":0.39,"name":"request"}}
+{"timestamp":"...","level":"INFO","fields":{"message":"request completed","status":404,"latency_ms":0.39},"target":"leep_server::observe","span":{"method":"GET","route":"/v1/blobs/{hash}","request_id":"5f0c9e2a41d34b7a9c1e0f6b2d8a7c35","status":404,"latency_ms":0.39,"name":"request"}}
 ```
+
+`request_id` is the client's `X-Request-Id` when it is 1 to 128 printable
+ASCII characters, else 32 random hex digits the server picks. The server
+answers with it in `X-Request-Id`, and every JSON error body carries it as
+`request_id`, so a user's error message leads to the log line. `leep` sends
+one id per invocation and prints it as the last line of an error; `leep-mcp`
+sends one per tool call. A land forwarded to the server that coordinates its
+ref (ADR 0056) keeps the id, so both servers log it under the same one. A
+load balancer that sets `X-Request-Id` makes its logs and the server's share
+the id.
 
 Headers are never logged, so `Authorization` values cannot appear. The
 authentication span (DEBUG) records the token's name, never its value.

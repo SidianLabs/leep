@@ -75,7 +75,7 @@ pub(crate) fn code_of_status(status: StatusCode) -> &'static str {
     }
 }
 
-fn is_json(resp: &Response) -> bool {
+pub(crate) fn is_json(resp: &Response) -> bool {
     resp.headers()
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())

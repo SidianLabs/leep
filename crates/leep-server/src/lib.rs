@@ -244,6 +244,8 @@ pub fn router_with_ready_timeout(
         .layer(middleware::from_fn(errors::json_errors))
         .layer(observe::trace_layer())
         .layer(middleware::from_fn(observe::track_metrics))
+        // Outermost, so the log span, every handler and every answer see it.
+        .layer(middleware::from_fn(observe::request_id))
         .with_state(repo)
 }
 
@@ -340,6 +342,7 @@ impl IntoResponse for ApiError {
                     retry_after_ms: *retry_after_ms,
                 }),
                 code: Some(error_code::INDEXING.into()),
+                request_id: None,
             };
             let mut resp = (status, Json(body)).into_response();
             let h = resp.headers_mut();

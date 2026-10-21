@@ -1871,3 +1871,64 @@ async fn a_reused_land_id_has_its_own_code() {
     assert_eq!(r.status, StatusCode::BAD_REQUEST);
     assert_eq!(r.code(), "land_id_reused");
 }
+
+async fn with_request_id(c: &Client, uri: &str, id: Option<&str>) -> Reply {
+    let mut req = Request::builder().uri(uri);
+    if let Some(id) = id {
+        req = req.header(REQUEST_ID_HEADER, id);
+    }
+    let resp =
+        c.0.clone()
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+    let (parts, body) = resp.into_parts();
+    Reply {
+        status: parts.status,
+        headers: parts.headers,
+        body: body.collect().await.unwrap().to_bytes().to_vec(),
+    }
+}
+
+fn echoed(r: &Reply) -> String {
+    r.headers[REQUEST_ID_HEADER].to_str().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn request_ids_are_kept_or_made_and_echoed() {
+    let c = Client::new();
+    // A valid client id is kept, echoed and named in the error body.
+    let r = with_request_id(&c, "/v1/resolve/nope", Some("agent-7 run/42")).await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
+    assert_eq!(echoed(&r), "agent-7 run/42");
+    let e: ErrorResponse = r.json();
+    assert_eq!(e.request_id.as_deref(), Some("agent-7 run/42"));
+    assert_eq!(e.code.as_deref(), Some("not_found"));
+
+    // Without one, or with one that is too long or not printable ASCII,
+    // the server makes its own.
+    let long = "x".repeat(129);
+    for id in [None, Some(long.as_str()), Some("caf\u{e9}")] {
+        let r = with_request_id(&c, "/v1/resolve/nope", id).await;
+        let made = echoed(&r);
+        assert_eq!(made.len(), 32, "{made}");
+        assert!(made.bytes().all(|b| b.is_ascii_hexdigit()), "{made}");
+        assert_eq!(r.json::<ErrorResponse>().request_id, Some(made));
+    }
+    let a = echoed(&with_request_id(&c, "/v1/refs", None).await);
+    let b = echoed(&with_request_id(&c, "/v1/refs", None).await);
+    assert_ne!(a, b, "one id per request");
+
+    // Successes carry the header; their bodies are untouched.
+    let r = with_request_id(&c, "/v1/refs", Some("ok-1")).await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert_eq!(echoed(&r), "ok-1");
+    assert!(r.json::<serde_json::Value>().get("request_id").is_none());
+
+    // Errors that start as plain text get it too.
+    let r = with_request_id(&c, "/v1/no-such-endpoint", Some("t-404")).await;
+    assert_eq!(
+        r.json::<ErrorResponse>().request_id.as_deref(),
+        Some("t-404")
+    );
+}

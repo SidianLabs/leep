@@ -146,6 +146,12 @@ When the server named the error (servers since error codes; see
 [FORMATS.md](FORMATS.md), "Error codes"), the object also carries
 `server_code`, such as `not_signed`, `needs_review` or `ref_missing`.
 
+Every request of one `leep` invocation carries the same random
+`X-Request-Id`. An error from a request carries it as `request_id` (the id
+the server answered with, when it echoed one), and the text on stderr ends
+with `request id: ID`. Quote it in a bug report: the server logs every
+request under its id.
+
 `code` values are stable; new ones may be added. `retryable` says whether
 running the same command again can succeed. Commands that finish with
 conflicts (`land`, `sync`, `merge`, `cherry-pick`, `revert`, `stash apply`)

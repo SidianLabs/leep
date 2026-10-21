@@ -1122,3 +1122,15 @@ A lost `POST /v1/refs/{name}` swap is unchanged: `409` with `CasRefResponse`
 messages, so clients that match them keep working; the CLI and the MCP server
 go by `code` when it is present and by the markers otherwise. The constants
 are `leep_core::api::error_code`.
+
+## Request ids (additive header and API field, no persisted change)
+
+Every request may carry `X-Request-Id`. The server keeps it when it is 1 to
+128 printable ASCII characters (space to `~`, not only spaces), else it
+replaces it with 32 random lowercase hex digits; a request without one gets a
+random one too. Every response carries the id it used in `X-Request-Id`, and
+every JSON error body (`ErrorResponse`, `AmbiguousPrefixResponse`) gains
+`request_id`, omitted by older servers. The server logs each request under it
+(OPERATIONS.md, "Logs") and passes it on when it forwards a land to the
+server coordinating the ref. Success bodies are unchanged. Clients that send
+nothing see only the new header and field.

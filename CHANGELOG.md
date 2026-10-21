@@ -7,6 +7,16 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 ## [Unreleased]
 
+### Request ids
+- The server accepts a client's `X-Request-Id` (1 to 128 printable ASCII
+  characters; anything else is replaced) or makes one, answers with it in
+  `X-Request-Id`, logs it as `request_id` on the request's log line, and adds
+  `request_id` to JSON error bodies.
+- `leep` sends one id per invocation and prints it as the last line of an
+  error (`request_id` in `--json` errors); `leep-mcp` sends one per tool call
+  and appends `(server request id: ...)` to tool errors. See RUNBOOKS.md,
+  "Collecting a bug report".
+
 ### Land ids in the ref log
 - `GET /v1/reflog` entries carry `land_id` and `land_changeset` for lands
   that named themselves (ADR 0057); they were stored since migration 0005

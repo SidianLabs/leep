@@ -157,6 +157,12 @@ digests, but `LEEP_META` may hold a database password: redact it.
    `manifest.json` of the newest snapshot, and `ls -l` of `snapshots/`.
 8. What changed in the last day: deploys, config edits, new agents, a restore,
    a migration, a store maintenance job.
+9. For a failed client command: its `request id` (the last line of `leep`'s
+   error, `request_id` in `--json` errors, `(server request id: ...)` in an
+   MCP tool error, or the `X-Request-Id` response header), its time, and the
+   server log lines whose `request_id` matches:
+   `jq -c 'select(.span.request_id == "ID")' server.log`. The id is random and
+   says nothing about the request, so it is safe to share.
 
 Never attach the tokens file, signing keys file, backup directory or database
 dump: they hold repository content and credentials.

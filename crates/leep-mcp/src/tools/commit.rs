@@ -402,9 +402,10 @@ impl Server {
 fn land_error(e: CliError, changeset: ChangesetId) -> ToolError {
     match e.kind() {
         ErrorKind::Timeout | ErrorKind::Unreachable | ErrorKind::Server => ToolError(format!(
-            "{e}. The land of changeset {changeset} may have applied. Call \
+            "{}. The land of changeset {changeset} may have applied. Call \
              leep_commit_and_land again with changeset: \"{changeset}\" (or the same \
-             request_id) to finish it; a changeset that already landed is not landed twice."
+             request_id) to finish it; a changeset that already landed is not landed twice.",
+            super::describe(&e)
         )),
         _ => e.into(),
     }

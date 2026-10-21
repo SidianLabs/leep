@@ -84,6 +84,14 @@
 //! A lost `POST /v1/refs/{name}` swap is not an error body: it is 409 with
 //! [`CasRefResponse`] (`ok: false`). The constants are in [`error_code`].
 //!
+//! # Request ids
+//!
+//! A client may send [`REQUEST_ID_HEADER`] (`X-Request-Id`). The server keeps
+//! a value that passes [`valid_request_id`] (1 to 128 printable ASCII
+//! characters) and otherwise picks 32 random hex digits, logs the request
+//! under it, answers with it in the same header on every response, and adds
+//! it to JSON error bodies as `request_id`.
+//!
 //! # Index lag (ADR 0058)
 //!
 //! Log with a path or filters, last-change, blame and search use indexes that
@@ -177,6 +185,10 @@ pub struct ErrorResponse {
     /// clients may meet codes they do not know and must then go by status.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
+    /// The request's id ([`REQUEST_ID_HEADER`]), which the server's log line
+    /// for it carries too. Absent from older servers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
 }
 
 impl ErrorResponse {
@@ -185,6 +197,7 @@ impl ErrorResponse {
             error: error.into(),
             indexing: None,
             code: None,
+            request_id: None,
         }
     }
 
@@ -285,6 +298,23 @@ pub struct IndexingInfo {
     pub kind: String,
     pub behind: u64,
     pub retry_after_ms: u64,
+}
+
+/// Request and response header naming one request, to find it in the
+/// server's logs. A client may send one; the server keeps it if it passes
+/// [`valid_request_id`], else makes its own, and answers with the id it used.
+pub const REQUEST_ID_HEADER: &str = "x-request-id";
+
+/// Longest request id a server keeps, in bytes.
+pub const MAX_REQUEST_ID_LEN: usize = 128;
+
+/// Whether a client's request id is kept as sent: 1 to
+/// [`MAX_REQUEST_ID_LEN`] printable ASCII characters (space to `~`), which
+/// cannot break a log line.
+pub fn valid_request_id(id: &str) -> bool {
+    !id.trim().is_empty()
+        && id.len() <= MAX_REQUEST_ID_LEN
+        && id.bytes().all(|b| (b' '..=b'~').contains(&b))
 }
 
 /// Request header choosing what a query does when its index is behind
@@ -1158,6 +1188,30 @@ mod tests {
     }
 
     #[test]
+    fn request_ids_are_printable_ascii_up_to_128_bytes() {
+        for ok in [
+            "a",
+            "0123-abc_DEF.x",
+            "with space",
+            &"x".repeat(128),
+            "~!@#$%^&*()",
+        ] {
+            assert!(valid_request_id(ok), "{ok:?}");
+        }
+        for bad in [
+            "",
+            "   ",
+            &"x".repeat(129),
+            "tab\there",
+            "new\nline",
+            "caf\u{e9}",
+            "\u{7f}",
+        ] {
+            assert!(!valid_request_id(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
     fn prefix_shapes_are_stable() {
         let id = ChangesetId(Hash::of_blob(b"p"));
         let v = serde_json::to_value(ResolvePrefixResponse { id }).unwrap();
@@ -1390,6 +1444,7 @@ mod tests {
                 retry_after_ms: 4000,
             }),
             code: Some(error_code::INDEXING.into()),
+            request_id: None,
         };
         assert_eq!(
             serde_json::to_value(&err).unwrap(),
@@ -1398,6 +1453,12 @@ mod tests {
                 "indexing": { "kind": "history-tree-v4", "behind": 5210, "retry_after_ms": 4000 },
                 "code": "indexing"
             })
+        );
+        let mut with_id = ErrorResponse::new("x").with_code(error_code::NOT_FOUND);
+        with_id.request_id = Some("r-1".into());
+        assert_eq!(
+            serde_json::to_value(&with_id).unwrap(),
+            serde_json::json!({ "error": "x", "code": "not_found", "request_id": "r-1" })
         );
         let old: ErrorResponse =
             serde_json::from_value(serde_json::json!({ "error": "e" })).unwrap();
