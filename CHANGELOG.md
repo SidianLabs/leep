@@ -7,6 +7,14 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 ## [Unreleased]
 
+### Land conflicts name only stored blobs
+- A land answered with conflicts now stores the merged text its `clean`
+  changes name before answering. Before, a land that moved nothing never
+  stored it, so a client applying `clean` (`leep land`'s conflict path,
+  `leep_resolve_and_land`) could fail with `missing blob` unless another
+  land in the same batch happened to move the ref. `GET /v1/ready` lists
+  `land-clean-blobs`.
+
 ### MCP: request ids land once across restarts
 - `leep_commit_and_land` sends a land id derived from `request_id`,
   `target_ref`, the author and the agent session (ADR 0057) instead of a
@@ -48,6 +56,13 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   error (`request_id` in `--json` errors); `leep-mcp` sends one per tool call
   and appends `(server request id: ...)` to tool errors. See RUNBOOKS.md,
   "Collecting a bug report".
+
+### Structured land id refusals
+- A land refused with `land_id_reused` carries `land` in its error body: the
+  land id, the changeset the ref recorded for it and the changeset the ref
+  moved to, so clients no longer parse them out of the message (whose text
+  is unchanged). `leep --json` errors include it as `land`. Older servers
+  omit it.
 
 ### Land ids in the ref log
 - `GET /v1/reflog` entries carry `land_id` and `land_changeset` for lands

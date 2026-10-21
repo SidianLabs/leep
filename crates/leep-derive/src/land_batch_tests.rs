@@ -1035,7 +1035,7 @@ impl leep_core::BlobStore for FailingBlobs {
 /// counts as a failed commit, so the batch is redone from a fresh read and
 /// lands once storing works, or answers the error after three failures with
 /// the ref and the changesets untouched. A batch that only conflicts stores
-/// nothing.
+/// no changeset.
 #[tokio::test]
 async fn a_batch_that_cannot_store_its_replays_moves_nothing() {
     use Parent::*;
@@ -1081,7 +1081,7 @@ async fn a_batch_that_cannot_store_its_replays_moves_nothing() {
     let log = r.meta().ref_log(Some("main"), None, 10).await.unwrap();
     assert_eq!(log.len(), 3, "base, a and b, each once");
 
-    // A conflict writes nothing at all.
+    // A conflict stores no changeset.
     let stored = meta.list_changesets(None, 1000).await.unwrap().len();
     let resp = r.land(ids[2], "main").await.unwrap();
     assert!(matches!(resp, LandResponse::Conflicts { .. }), "{resp:?}");
@@ -1171,7 +1171,11 @@ async fn land_ids_in_a_batch_are_settled_per_land() {
         "the duplicate gets the original's copy"
     );
     assert!(
-        matches!(&results[4], Err(leep_core::Error::Invalid(m)) if m.contains("land id")),
+        matches!(
+            &results[4],
+            Err(e @ leep_core::Error::LandIdReused { refusal, .. })
+                if refusal.changeset == ids[1] && e.to_string().contains("land id")
+        ),
         "{:?}",
         results[4]
     );
@@ -1297,4 +1301,147 @@ async fn a_failed_land_id_lookup_holds_back_only_keyed_lands() {
             );
         }
     }
+}
+
+/// Changesets whose lands conflict on `x` while `y` merges into new text:
+/// 0 is the fork, 1 lands on it, 2 conflicts with 1, and 3 lands cleanly.
+fn clean_merge_script() -> Vec<Spec> {
+    use Parent::*;
+    vec![
+        spec(
+            &[Base],
+            &[("x", Some("x\n")), ("y", Some("a\nb\nc\nd\ne\n"))],
+            "fork",
+        ),
+        spec(
+            &[Script(0)],
+            &[("x", Some("1\n")), ("y", Some("A\nb\nc\nd\ne\n"))],
+            "ours",
+        ),
+        spec(
+            &[Script(0)],
+            &[("x", Some("2\n")), ("y", Some("a\nb\nc\nd\nE\n"))],
+            "theirs",
+        ),
+        spec(&[Script(0)], &[("z", Some("z\n"))], "unrelated"),
+    ]
+}
+
+/// Every blob a conflict answer names in `clean` is in the blob store, and
+/// `y` is the server's merged text, which no client uploaded.
+async fn assert_clean_stored(r: &Repo, resp: &Result<LandResponse>) {
+    let Ok(LandResponse::Conflicts {
+        conflicts, clean, ..
+    }) = resp
+    else {
+        panic!("expected conflicts: {resp:?}");
+    };
+    assert_eq!(conflicts.len(), 1, "{conflicts:?}");
+    let y = RepoPath::new("y").unwrap();
+    let Some(FileChange::Modify { content, .. }) = clean.get(&y) else {
+        panic!("y merged cleanly: {clean:?}");
+    };
+    assert_eq!(
+        r.blobs().get(content).await.unwrap().as_deref(),
+        Some(&b"A\nb\nc\nd\nE\n"[..])
+    );
+    for change in clean.values() {
+        if let FileChange::Modify { content, .. } = change {
+            assert!(r.blobs().contains(content).await.unwrap(), "{content}");
+        }
+    }
+}
+
+/// A land answered with conflicts moves nothing, so its batch never stores
+/// its staging; the merged text its `clean` changes name is stored anyway.
+#[tokio::test]
+async fn a_lone_conflicting_land_stores_its_clean_blobs() {
+    let r = plain_repo();
+    let (_, ids) = build(&r, &clean_merge_script()).await;
+    r.land(ids[0], "main").await.unwrap();
+    r.land(ids[1], "main").await.unwrap();
+    let head = r.meta().get_ref("main").await.unwrap();
+    let resp = r.land(ids[2], "main").await;
+    assert_clean_stored(&r, &resp).await;
+    assert_eq!(r.meta().get_ref("main").await.unwrap(), head);
+}
+
+/// In a batch, a conflict answered before any move and one answered after
+/// the batch's move both name only stored blobs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_conflict_in_a_batch_names_only_stored_blobs() {
+    for conflict_first in [true, false] {
+        let (r, gate) = gated_repo();
+        let (_, ids) = build(&r, &clean_merge_script()).await;
+        r.land(ids[0], "main").await.unwrap();
+        r.land(ids[1], "main").await.unwrap();
+        let head = r.meta().get_ref("main").await.unwrap().unwrap();
+        let lands = if conflict_first {
+            vec![(ids[2], None), (ids[3], None)]
+        } else {
+            vec![(ids[3], None), (ids[2], None)]
+        };
+        let (blocker, tasks) = queue_in_order(&r, &gate, head, &lands).await;
+        release(&gate);
+        blocker.await.unwrap().unwrap();
+        let mut results = Vec::new();
+        for t in tasks {
+            results.push(t.await.unwrap());
+        }
+        let (conflict, landed) = if conflict_first {
+            (&results[0], &results[1])
+        } else {
+            (&results[1], &results[0])
+        };
+        assert_clean_stored(&r, conflict).await;
+        let Ok(LandResponse::Landed { landed, .. }) = landed else {
+            panic!("{conflict_first}: {landed:?}");
+        };
+        assert_eq!(r.meta().get_ref("main").await.unwrap(), Some(*landed));
+        let batches = r.land_queues.batches.lock().unwrap().clone();
+        assert_eq!(batches.last().unwrap().len(), 2, "one batch");
+    }
+}
+
+/// A conflict whose merged text cannot be stored is answered with the
+/// error and moves nothing; the retry stores it and answers the conflict.
+#[tokio::test]
+async fn a_conflict_whose_clean_blobs_cannot_be_stored_answers_the_error() {
+    let blobs = Arc::new(FailingBlobs {
+        inner: MemoryBlobStore::new(),
+        failures: AtomicUsize::new(0),
+    });
+    let r = Repo::new(blobs.clone(), Arc::new(MemoryMetaStore::new()));
+    let (_, ids) = build(&r, &clean_merge_script()).await;
+    r.land(ids[0], "main").await.unwrap();
+    r.land(ids[1], "main").await.unwrap();
+    let head = r.meta().get_ref("main").await.unwrap();
+    let log = r
+        .meta()
+        .ref_log(Some("main"), None, 100)
+        .await
+        .unwrap()
+        .len();
+
+    blobs.failures.store(1, Ordering::SeqCst);
+    let err = r.land(ids[2], "main").await.unwrap_err();
+    assert!(matches!(err, leep_core::Error::Storage(_)), "{err}");
+    assert_eq!(
+        blobs.failures.load(Ordering::SeqCst),
+        0,
+        "the write was tried"
+    );
+    assert_eq!(r.meta().get_ref("main").await.unwrap(), head);
+    assert_eq!(
+        r.meta()
+            .ref_log(Some("main"), None, 100)
+            .await
+            .unwrap()
+            .len(),
+        log
+    );
+
+    let resp = r.land(ids[2], "main").await;
+    assert_clean_stored(&r, &resp).await;
+    assert_eq!(r.meta().get_ref("main").await.unwrap(), head);
 }

@@ -130,7 +130,7 @@ whenever the process is serving HTTP and touches no store, so an `"ok"` with
 failing requests means a store problem, not a dead server. `GET /v1/ready` is
 readiness: it reads one ref from the metadata store and asks the blob store
 about one fixed hash, concurrently, each under `--ready-timeout` (default 2 s).
-It answers 200 `{"status":"ready","features":["land-id","indexing-retry","changeset-rescue"]}`, or 503 with the failed store named:
+It answers 200 `{"status":"ready","features":["land-id","indexing-retry","changeset-rescue","land-clean-blobs"]}`, or 503 with the failed store named:
 `{"status":"not ready","failed":[{"store":"meta","reason":"timed out after
 2000ms"}]}` (`reason` is `unavailable` or a timeout, never the driver's
 message; that is in the server log as `readiness check failed`). Neither needs

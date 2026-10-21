@@ -65,7 +65,7 @@
 //! | 400 | `not_signed` | a land onto a ref that needs every changeset signed by a trusted key |
 //! | 400 | `not_forward` | a move of a land-policy-protected ref, or of a protected ref (`--protect-ref`), that is not a fast-forward |
 //! | 400 | `tag_immutable` | a move of a tag, or a land onto one |
-//! | 400 | `land_id_reused` | a land id the ref already recorded for another changeset (ADR 0057) |
+//! | 400 | `land_id_reused` | a land id the ref already recorded for another changeset (ADR 0057); `land` ([`LandRefusal`]) carries the record |
 //! | 400 | `invalid_name` | a ref name [`crate::refname::validate`] refuses |
 //! | 400 | `ambiguous_prefix` | a short id matching several changesets ([`AmbiguousPrefixResponse`]) |
 //! | 400 | `invalid` | any other bad request |
@@ -192,6 +192,11 @@ pub struct ErrorResponse {
     /// for it carries too. Absent from older servers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
+    /// Set on a 400 `land_id_reused`: what the land id already recorded, so
+    /// a client need not parse `error`. Absent otherwise and from older
+    /// servers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub land: Option<Box<LandRefusal>>,
 }
 
 impl ErrorResponse {
@@ -201,6 +206,7 @@ impl ErrorResponse {
             indexing: None,
             code: None,
             request_id: None,
+            land: None,
         }
     }
 
@@ -209,6 +215,21 @@ impl ErrorResponse {
         self.code = Some(code.to_string());
         self
     }
+}
+
+/// [`ErrorResponse::land`]: a land refused because its `land_id` was already
+/// recorded on the ref for another changeset ([`error_code::LAND_ID_REUSED`],
+/// ADR 0057).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LandRefusal {
+    pub land_id: LandId,
+    /// The changeset recorded for `land_id`: what the earlier land asked to
+    /// land.
+    pub changeset: ChangesetId,
+    /// The changeset the ref moved to for that land (`changeset` itself or
+    /// its rebased copy), when the server knows it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub landed: Option<ChangesetId>,
 }
 
 /// The `code` of an error body ([`ErrorResponse`],
@@ -413,6 +434,12 @@ pub const FEATURE_INDEXING_RETRY: &str = "indexing-retry";
 /// before it writes anything that names them, so a changeset garbage
 /// collection may run beside it (ADR 0059).
 pub const FEATURE_CHANGESET_RESCUE: &str = "changeset-rescue";
+
+/// In [`ReadyResponse::features`]: every blob named in the `clean` changes of
+/// a [`LandResponse::Conflicts`] is stored before the answer, so a client may
+/// apply them as they are. Older servers could answer with merged text they
+/// never stored.
+pub const FEATURE_LAND_CLEAN_BLOBS: &str = "land-clean-blobs";
 
 /// One store that failed its readiness check.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1490,6 +1517,7 @@ mod tests {
             }),
             code: Some(error_code::INDEXING.into()),
             request_id: None,
+            land: None,
         };
         assert_eq!(
             serde_json::to_value(&err).unwrap(),
@@ -1499,6 +1527,23 @@ mod tests {
                 "code": "indexing"
             })
         );
+        let land_id: LandId = "00112233445566778899aabbccddeeff".parse().unwrap();
+        let mut reused = ErrorResponse::new("x").with_code(error_code::LAND_ID_REUSED);
+        reused.land = Some(Box::new(LandRefusal {
+            land_id: land_id.clone(),
+            changeset: id,
+            landed: None,
+        }));
+        let v = serde_json::to_value(&reused).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "error": "x",
+                "code": "land_id_reused",
+                "land": { "land_id": land_id.to_string(), "changeset": id.to_string() }
+            })
+        );
+        assert_eq!(serde_json::from_value::<ErrorResponse>(v).unwrap(), reused);
         let mut with_id = ErrorResponse::new("x").with_code(error_code::NOT_FOUND);
         with_id.request_id = Some("r-1".into());
         assert_eq!(

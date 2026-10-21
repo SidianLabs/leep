@@ -15,10 +15,7 @@ use super::commit::{non_empty, Edit};
 use super::{parse_args, ToolError, ToolResult};
 use crate::Server;
 
-/// In `GET /v1/ready` features: the server stores the blobs a land's
-/// conflict answer names in `clean` before it answers. Not yet in
-/// `leep_core::api`; the server fix that adds it will export it there.
-const FEATURE_LAND_CLEAN_BLOBS: &str = "land-clean-blobs";
+use leep_core::api::FEATURE_LAND_CLEAN_BLOBS;
 
 /// Conflicts remembered per MCP process; the oldest is forgotten first.
 const MAX_REMEMBERED: usize = 64;

@@ -1002,8 +1002,9 @@ fn classify(resp: Response, has_token: bool) -> CliError {
                 .with_hint("give more digits of the id; the candidates are listed above");
         }
     }
-    let parsed = serde_json::from_str::<ErrorResponse>(&body).ok();
+    let mut parsed = serde_json::from_str::<ErrorResponse>(&body).ok();
     let code = parsed.as_ref().and_then(|e| e.code.clone());
+    let land = parsed.as_mut().and_then(|e| e.land.take());
     if let Some(info) = parsed.as_ref().and_then(|e| e.indexing.clone()) {
         if status == StatusCode::SERVICE_UNAVAILABLE {
             return CliError::new(
@@ -1050,7 +1051,7 @@ fn classify(resp: Response, has_token: bool) -> CliError {
         s if s.is_server_error() => CliError::server(msg),
         _ => CliError::user(msg),
     };
-    e.with_server_code(code)
+    e.with_server_code(code).with_land_refusal(land)
 }
 
 #[cfg(test)]
@@ -1125,6 +1126,39 @@ mod tests {
              connection: close\r\n\r\n{body}",
             body.len()
         )
+    }
+
+    #[test]
+    fn a_reused_land_id_carries_the_record() {
+        let (a, b, c) = ("a".repeat(64), "b".repeat(64), "c".repeat(64));
+        let id = "00112233445566778899aabbccddeeff";
+        let body = format!(
+            r#"{{"error":"invalid input: land id {id} already landed {a}; use a new land id to land {c}","code":"land_id_reused","land":{{"land_id":"{id}","changeset":"{a}","landed":"{b}"}}}}"#
+        );
+        let (url, _) = recording_stub(vec![reply("400 Bad Request", "", &body)]);
+        let req = LandRequest {
+            changeset: c.parse().unwrap(),
+            target_ref: "main".into(),
+            create: None,
+            land_id: Some(id.parse().unwrap()),
+        };
+        let e = Client::new(&url).land(&req).unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::User);
+        assert_eq!(e.server_code(), Some("land_id_reused"));
+        let land = e.land_refusal().expect("the record");
+        assert_eq!(land.land_id.to_string(), id);
+        assert_eq!(land.changeset.to_string(), a);
+        assert_eq!(land.landed.map(|l| l.to_string()), Some(b.clone()));
+        assert_eq!(e.to_json()["error"]["land"]["landed"], b);
+
+        // An older server sends only the text.
+        let old = format!(
+            r#"{{"error":"invalid input: land id {id} already landed {a}; use a new land id to land {c}"}}"#
+        );
+        let (url, _) = recording_stub(vec![reply("400 Bad Request", "", &old)]);
+        let e = Client::new(&url).land(&req).unwrap_err();
+        assert!(e.land_refusal().is_none());
+        assert!(e.to_json()["error"].get("land").is_none());
     }
 
     fn indexing_503() -> String {

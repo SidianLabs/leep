@@ -19,7 +19,7 @@ use crate::Repo;
 /// Blobs written at once when a batch is stored. A batch rewrites a few
 /// directories per land, so a full batch of shallow paths is one wave: the
 /// filesystem then commits the writes' syncs together.
-const FLUSH_WRITES_IN_FLIGHT: usize = 256;
+pub(crate) const FLUSH_WRITES_IN_FLIGHT: usize = 256;
 
 /// What the replays of one batch attempt wrote, plus the immutable rows they
 /// read, so a land does not read again what the land before it read.
@@ -153,6 +153,19 @@ impl Staging {
                     .rows
                     .contains_key(&(REBASED_ORIGIN_KIND.to_string(), id.0))
         });
+    }
+
+    /// Copies of the blobs among `hashes` that this attempt staged; blobs a
+    /// replay only read are not staged. They stay staged, since a replayed
+    /// tree of the batch may name the same content.
+    pub(crate) fn staged_blobs(&self, hashes: &[Hash]) -> Vec<(Hash, Bytes)> {
+        let s = self.lock();
+        let mut seen = HashSet::new();
+        hashes
+            .iter()
+            .filter(|h| seen.insert(**h))
+            .filter_map(|h| s.blobs.get(h).map(|b| (*h, b.clone())))
+            .collect()
     }
 
     /// Store what the batch wrote, in the order a lone write keeps: blobs

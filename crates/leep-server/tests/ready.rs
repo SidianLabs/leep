@@ -104,7 +104,7 @@ async fn ready_with_working_stores() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         String::from_utf8(body).unwrap(),
-        r#"{"status":"ready","features":["land-id","indexing-retry","changeset-rescue"]}"#
+        r#"{"status":"ready","features":["land-id","indexing-retry","changeset-rescue","land-clean-blobs"]}"#
     );
     // It really asked both stores, once each.
     assert_eq!(r.meta_plan.calls(Op::GetRef), 1);

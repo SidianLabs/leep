@@ -346,6 +346,7 @@ fn features() -> Vec<String> {
         leep_core::api::FEATURE_LAND_ID.into(),
         leep_core::api::FEATURE_INDEXING_RETRY.into(),
         leep_core::api::FEATURE_CHANGESET_RESCUE.into(),
+        leep_core::api::FEATURE_LAND_CLEAN_BLOBS.into(),
     ]
 }
 
@@ -375,9 +376,10 @@ impl From<Error> for ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = match &self.0 {
-            Error::Invalid(_) | Error::InvalidPath(..) | Error::InvalidHash(_) => {
-                StatusCode::BAD_REQUEST
-            }
+            Error::Invalid(_)
+            | Error::InvalidPath(..)
+            | Error::InvalidHash(_)
+            | Error::LandIdReused { .. } => StatusCode::BAD_REQUEST,
             Error::NotFound(_) => StatusCode::NOT_FOUND,
             Error::Conflict(_) => StatusCode::CONFLICT,
             Error::Indexing { .. } => StatusCode::SERVICE_UNAVAILABLE,
@@ -400,6 +402,7 @@ impl IntoResponse for ApiError {
                 }),
                 code: Some(error_code::INDEXING.into()),
                 request_id: None,
+                land: None,
             };
             let mut resp = (status, Json(body)).into_response();
             let h = resp.headers_mut();
@@ -415,7 +418,10 @@ impl IntoResponse for ApiError {
         if status.is_server_error() {
             tracing::error!(error = %self.0, "request failed");
         }
-        let body = ErrorResponse::new(self.0.to_string()).with_code(errors::code_of(&self.0));
+        let mut body = ErrorResponse::new(self.0.to_string()).with_code(errors::code_of(&self.0));
+        if let Error::LandIdReused { refusal, .. } = self.0 {
+            body.land = Some(refusal);
+        }
         (status, Json(body)).into_response()
     }
 }

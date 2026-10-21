@@ -552,6 +552,8 @@ loop (≤32 attempts):
                    never auto-resolved on the server)
       move to replayed top
     a move sets head; answers that precede every move are sent at once
+      (a Conflicts answer first stores the merged text its clean changes
+       name: GC rescue check, flush; an error is that land's answer)
   no moves → done (staging dropped)
   store staging: blobs (one wave, GC rescue check, flush), then changesets
                  and rows (one atomic write); an error counts as a CAS error below
@@ -628,7 +630,8 @@ changes of unlanded changesets below it. The stack also stops at an entry
 whose rebased copy already landed: an agent that landed `a` (landed as `a'`)
 and built `b` on its own `a` lands only `b`, instead of a second, empty copy
 of `a`, or a false conflict when the ref changed `a`'s files since. On conflict the client applies
-`clean`, resolves `conflicts` on top of `onto`, commits once and lands again,
+`clean` (every blob it names is stored before the answer, even when the batch
+moves nothing; `/v1/ready` lists `land-clean-blobs`), resolves `conflicts` on top of `onto`, commits once and lands again,
 which is then a fast-forward. Stacks containing merges are rejected.
 
 **Branches and tags** ([ADR 0015](adr/0015-branches-and-tags.md)). Refs are

@@ -956,6 +956,14 @@ on the wire and SQL columns at rest; it is not hashed and not encoded with
 postcard, and backups already carried the columns (`SnapLogRow`), so no
 stored format changed.
 
+## Stored `clean` blobs of a land conflict (`land-clean-blobs`)
+
+`GET /v1/ready` lists `land-clean-blobs` in `features`: every blob a
+`LandResponse::Conflicts` names in `clean` is stored before the answer. An
+older server could name merged text it had only staged in memory, so a
+client that applied `clean` from it could hit `missing blob`. No `/v1`
+field, stored object or encoding changed.
+
 ## Fenced garbage collection (new derived kinds, no other format change)
 
 ADR 0012 adds the three GC kinds in the table above (`blob-claim-v1` already
@@ -1138,7 +1146,7 @@ client treats an unknown or absent code by its HTTP status.
 | 400 | `not_signed` | a land or ref move onto a ref that needs every changeset signed by a trusted key |
 | 400 | `not_forward` | a move of a land-policy-protected ref, or of a protected ref (`--protect-ref`), that is not a fast-forward |
 | 400 | `tag_immutable` | a move of a tag, or a land onto one |
-| 400 | `land_id_reused` | a land id the ref already recorded for another changeset (ADR 0057) |
+| 400 | `land_id_reused` | a land id the ref already recorded for another changeset (ADR 0057); `land` carries the record |
 | 400 | `invalid_name` | a ref name the validator refuses |
 | 400 | `ambiguous_prefix` | a short id matching several changesets (`AmbiguousPrefixResponse`) |
 | 400 | `invalid` | any other bad request (also `405`) |
@@ -1163,6 +1171,14 @@ A lost `POST /v1/refs/{name}` swap is unchanged: `409` with `CasRefResponse`
 messages, so clients that match them keep working; the CLI and the MCP server
 go by `code` when it is present and by the markers otherwise. The constants
 are `leep_core::api::error_code`.
+
+`ErrorResponse` later gained `land` (`LandRefusal`), set only on a 400
+`land_id_reused` and omitted otherwise: `{"land_id": "<hex>", "changeset":
+"<id>", "landed": "<id>"}`, the land id, the changeset the ref recorded for
+it, and the changeset the ref moved to for that land (omitted when unknown).
+Clients read it instead of parsing `error`, whose text is unchanged; older
+servers never send it, and older clients ignore it. Nothing persisted
+changed.
 
 ## Request ids (additive header and API field, no persisted change)
 

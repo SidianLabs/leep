@@ -8,15 +8,16 @@ use std::hash::BuildHasher;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use leep_core::api::{LandResponse, RebaseResponse};
+use leep_core::api::{LandRefusal, LandResponse, RebaseResponse};
 use leep_core::refname::{self, MISSING_REF_MARKER, NOT_FORWARD_MARKER};
 use leep_core::{
-    ChangesetId, Error, LandId, LandKey, LandRecord, RefStep, RefUpdateContext, Result,
+    ChangesetId, Error, FileChange, Hash, LandId, LandKey, LandRecord, RefStep, RefUpdateContext,
+    Result,
 };
 use tokio::sync::oneshot;
 
 use crate::changeset_gc::RescueBy;
-use crate::land_stage::Staging;
+use crate::land_stage::{Staging, FLUSH_WRITES_IN_FLIGHT};
 use crate::Repo;
 
 /// Lands within one process are batched per ref, so losses only come from
@@ -221,10 +222,7 @@ fn recorded_step(
         Err(e) => return Some(Err(duplicate(e))),
     };
     if found.changeset != key.changeset {
-        return Some(Err(Error::Invalid(format!(
-            "land id {} already landed {}; use a new land id to land {}",
-            key.id, found.changeset, key.changeset
-        ))));
+        return Some(Err(land_id_reused(&key.id, found, key.changeset)));
     }
     metrics::counter!("leep_land_recorded_total").increment(1);
     metrics::counter!("leep_land_answered_from_record_total", "original" => "present").increment(1);
@@ -233,6 +231,18 @@ fn recorded_step(
         rebased: found.landed != key.changeset,
         attempts: attempt,
     })))
+}
+
+/// The refusal of a land whose `id` the ref recorded for another changeset.
+fn land_id_reused(id: &LandId, record: &LandRecord, requested: ChangesetId) -> Error {
+    Error::LandIdReused {
+        refusal: Box::new(LandRefusal {
+            land_id: id.clone(),
+            changeset: record.changeset,
+            landed: Some(record.landed),
+        }),
+        requested,
+    }
 }
 
 fn is_move(step: &Result<Step>) -> bool {
@@ -246,6 +256,10 @@ fn duplicate(e: &Error) -> Error {
         Error::InvalidHash(m) => Error::InvalidHash(m.clone()),
         Error::Invalid(m) => Error::Invalid(m.clone()),
         Error::Conflict(m) => Error::Conflict(m.clone()),
+        Error::LandIdReused { refusal, requested } => Error::LandIdReused {
+            refusal: refusal.clone(),
+            requested: *requested,
+        },
         Error::NotFound(m) => Error::NotFound(m.clone()),
         Error::Encoding(m) => Error::Encoding(m.clone()),
         Error::Storage(m) => Error::Storage(m.clone()),
@@ -509,10 +523,7 @@ impl Repo {
             return Ok(None);
         };
         if record.changeset != cs {
-            return Err(Error::Invalid(format!(
-                "land id {} already landed {}; use a new land id to land {cs}",
-                key.id, record.changeset
-            )));
+            return Err(land_id_reused(&key.id, &record, cs));
         }
         metrics::counter!("leep_land_answered_from_record_total", "original" => "missing")
             .increment(1);
@@ -716,7 +727,10 @@ impl Repo {
                         head = Some(new);
                         waiting.push((l, Ok(Step::Move(new))));
                     }
-                    Ok(Step::Done(resp)) if steps.is_empty() => l.answer(Ok(resp), attempt, false),
+                    Ok(Step::Done(resp)) if steps.is_empty() => {
+                        let result = self.store_clean(&staging, resp).await;
+                        l.answer(result, attempt, false)
+                    }
                     Err(e) if steps.is_empty() => l.answer(Err(e), attempt, false),
                     other => waiting.push((l, other)),
                 }
@@ -771,6 +785,8 @@ impl Repo {
                             continue;
                         }
                         let cs = l.q.cs;
+                        // A conflict's merged text was stored with the
+                        // batch, by `staging.flush` above.
                         let result = step.map(|s| match s {
                             Step::Done(resp) => resp,
                             Step::Move(new) => LandResponse::Landed {
@@ -822,6 +838,29 @@ impl Repo {
                 ),
             }
         }
+    }
+
+    /// Store the merged text a conflict answer's `clean` changes name, which
+    /// the replay staged: the client applies them, and a land that moves
+    /// nothing never flushes its staging. Written through the GC rescue
+    /// check and made durable before the answer; a failure is the land's
+    /// answer (nothing moved, so the client may retry).
+    async fn store_clean(&self, staging: &Staging, resp: LandResponse) -> Result<LandResponse> {
+        if let LandResponse::Conflicts { clean, .. } = &resp {
+            let hashes: Vec<Hash> = clean
+                .values()
+                .filter_map(|c| match c {
+                    FileChange::Modify { content, .. } => Some(*content),
+                    FileChange::Delete => None,
+                })
+                .collect();
+            let blobs = staging.staged_blobs(&hashes);
+            if !blobs.is_empty() {
+                self.put_rescuing_many_in_flight(blobs, FLUSH_WRITES_IN_FLIGHT, &[])
+                    .await?;
+            }
+        }
+        Ok(resp)
     }
 
     /// What `target_ref` recorded for the land ids in `lands`; nothing is read

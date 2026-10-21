@@ -2064,10 +2064,50 @@ async fn a_reused_land_id_has_its_own_code() {
         create: None,
         land_id: Some(id.clone()),
     };
-    assert_eq!(c.post("/v1/land", &land(a)).await.status, StatusCode::OK);
+    let first = c.post("/v1/land", &land(a)).await;
+    assert_eq!(first.status, StatusCode::OK);
+    let LandResponse::Landed { landed, .. } = first.json::<LandResponse>() else {
+        panic!("not landed");
+    };
     let r = c.post("/v1/land", &land(b)).await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST);
     assert_eq!(r.code(), "land_id_reused");
+    let body = r.json::<ErrorResponse>();
+    // The text is what it was before the structured record.
+    assert_eq!(
+        body.error,
+        format!("invalid input: land id {id} already landed {a}; use a new land id to land {b}")
+    );
+    assert_eq!(
+        body.land.as_deref(),
+        Some(&LandRefusal {
+            land_id: id.clone(),
+            changeset: a,
+            landed: Some(landed),
+        })
+    );
+    // On the wire: hex strings, under `land`.
+    let raw: serde_json::Value = r.json();
+    assert_eq!(
+        raw["land"],
+        serde_json::json!({
+            "land_id": id.to_string(),
+            "changeset": a.to_string(),
+            "landed": landed.to_string(),
+        })
+    );
+    // Other errors carry no `land`.
+    let other = c
+        .post(
+            "/v1/land",
+            &LandRequest {
+                land_id: None,
+                ..land(b)
+            },
+        )
+        .await;
+    let raw: serde_json::Value = other.json();
+    assert!(raw.get("land").is_none(), "{raw}");
 }
 
 async fn with_request_id(c: &Client, uri: &str, id: Option<&str>) -> Reply {

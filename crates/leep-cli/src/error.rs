@@ -123,6 +123,8 @@ struct Origin {
     /// The `X-Request-Id` of the request that failed: the server's echo, or
     /// what the client sent. Names the server's log line for it.
     request_id: Option<String>,
+    /// What a `land_id_reused` refusal's land id had recorded.
+    land: Option<Box<leep_core::api::LandRefusal>>,
 }
 
 pub type Result<T, E = CliError> = std::result::Result<T, E>;
@@ -160,6 +162,20 @@ impl CliError {
 
     pub fn server_code(&self) -> Option<&str> {
         self.origin.as_ref()?.server_code.as_deref()
+    }
+
+    pub fn with_land_refusal(mut self, land: Option<Box<leep_core::api::LandRefusal>>) -> Self {
+        if let Some(land) = land {
+            self.origin_mut().land = Some(land);
+        }
+        self
+    }
+
+    /// For a land refused because its land id was already recorded for
+    /// another changeset (`land_id_reused`): what that id recorded. None
+    /// from servers older than the field; the message still says it.
+    pub fn land_refusal(&self) -> Option<&leep_core::api::LandRefusal> {
+        self.origin.as_ref()?.land.as_deref()
     }
 
     /// Whether the server refused for the reason `code` names. A server that
@@ -256,7 +272,8 @@ impl CliError {
 
     /// The `--json` form: `{"error":{"code","message","hint","retryable"}}`,
     /// plus `candidates` for an ambiguous short id, `server_code` when the
-    /// server named the error and `request_id` when a request failed.
+    /// server named the error, `request_id` when a request failed and `land`
+    /// for a reused land id.
     pub fn to_json(&self) -> serde_json::Value {
         let mut e = serde_json::json!({
             "code": self.kind.code(),
@@ -275,6 +292,9 @@ impl CliError {
         }
         if let Some(id) = self.request_id() {
             e["request_id"] = serde_json::json!(id);
+        }
+        if let Some(land) = self.land_refusal() {
+            e["land"] = serde_json::json!(land);
         }
         serde_json::json!({ "error": e })
     }
