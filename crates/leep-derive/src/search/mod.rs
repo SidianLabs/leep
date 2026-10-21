@@ -252,8 +252,7 @@ struct Opener {
 impl Opener {
     /// Whether a directory filter admits the query.
     fn admits(&self, row: &[u8]) -> Result<bool> {
-        let present = self.compiled.probe.tree(row)?;
-        Ok(self.compiled.required.eval(&|t| present.has(t)))
+        self.compiled.admits_tree(row)
     }
 
     /// The children of the directory `dir` (node `node`) that the walk will
@@ -740,13 +739,10 @@ impl Repo {
                 Some(row) => row,
                 None => self.blob_row_bytes(f.content, f.size, counters).await?,
             };
-            match compiled.probe.blob(&row)? {
+            match compiled.admits_blob(&row)? {
                 None => return Ok(Outcome::Skipped { fetched: 0 }),
-                Some(present) => {
-                    if !compiled.required.eval(&|t| present.has(t)) {
-                        return Ok(Outcome::Pruned);
-                    }
-                }
+                Some(false) => return Ok(Outcome::Pruned),
+                Some(true) => {}
             }
         }
         let data =

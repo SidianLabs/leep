@@ -7,6 +7,13 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 ## [Unreleased]
 
+### Search does less work per index row
+- An indexed search stops reading a directory filter or a file's trigram
+  row as soon as the query can no longer match it, instead of decoding the
+  whole row. Results are unchanged. A row whose damage lies past the point
+  where the query was decided no longer fails the search; `leep-server
+  verify` still reports it.
+
 ### File listings and diffs answer in pages
 - `GET /v1/files/{id}` and `GET /v1/diff` take `limit` and `after` and
   answer `next` when more remain, like log, search and the ref log. Paths
