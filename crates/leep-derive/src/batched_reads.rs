@@ -282,6 +282,10 @@ impl MetaStore for BatchedMeta {
         self.inner.find_lands(name, ids).await
     }
 
+    async fn changesets_stored_at(&self, ids: &[ChangesetId]) -> Result<Vec<Option<u64>>> {
+        self.inner.changesets_stored_at(ids).await
+    }
+
     async fn ref_log(
         &self,
         name: Option<&str>,

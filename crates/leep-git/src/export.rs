@@ -334,6 +334,10 @@ pub async fn export(
         report.commits_written += 1;
 
         if lookup_git(&**meta, &id).await?.is_none() {
+            // The map names `id`, which a changeset sweep may have condemned
+            // since it was read (ADR 0059).
+            repo.rescue_changesets(&[id], leep_derive::changeset_gc::RescueBy::Mirror)
+                .await?;
             meta.put_derived(
                 LEEP_TO_GIT,
                 &id.0,

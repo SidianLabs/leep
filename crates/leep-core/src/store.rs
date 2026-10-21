@@ -481,6 +481,24 @@ pub trait MetaStore: Send + Sync + 'static {
             .collect())
     }
 
+    /// When each of `ids` was first stored, in unix seconds by the store's
+    /// writer (one slot per id, in order; `None` for an absent id). It ages
+    /// changesets for garbage collection (ADR 0059), which must not trust
+    /// `Changeset::timestamp`: the client sets that. Every `put_changeset*`
+    /// records the time on the first store and keeps it on later ones. A
+    /// changeset stored before a backend recorded times reads as stored when
+    /// the backend started recording them (its migration's `applied_at`).
+    ///
+    /// Every backend must implement this (see
+    /// [`list_derived`](Self::list_derived)): a wrapper that does not forward
+    /// it fails loudly instead of making every changeset look new or old.
+    async fn changesets_stored_at(&self, ids: &[ChangesetId]) -> Result<Vec<Option<u64>>> {
+        let _ = ids;
+        Err(Error::Invalid(
+            "this metadata store cannot report when changesets were stored".into(),
+        ))
+    }
+
     async fn get_ref(&self, name: &str) -> Result<Option<ChangesetId>>;
 
     /// [`cas_ref_logged`](Self::cas_ref_logged) with no actor and the
