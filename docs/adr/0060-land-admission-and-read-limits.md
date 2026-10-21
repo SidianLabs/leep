@@ -42,7 +42,8 @@ Each class of expensive read gets a semaphore of its own, taken with
 ADR 0020. A request that finds its class full is refused at once, never
 queued, for the reason ADR 0020 gives: a queue only moves the pile-up into
 server memory. It gets `503`, code `unavailable` (FORMATS.md, "Error
-codes"), with `Retry-After`. The permit rides in the response body like
+codes"), with `Retry-After` and `Leep-Refused: read-class` (section 2,
+"Answer", says why the header). The permit rides in the response body like
 ADR 0020's concurrency guard, so it is released when the body ends or the
 request is dropped.
 
@@ -72,8 +73,11 @@ request is dropped.
   `/v1/health` and `/v1/ready`. Their cost is small and bounded, and
   starving them is what this ADR prevents.
 - **`Retry-After`** is the class's recent median request time divided by
-  its permits, rounded up, between 1 and 30 s. A client that waits that
-  long finds a permit about as often as one frees.
+  its permits, rounded up, between 1 and 10 s. A client that waits that
+  long finds a permit about as often as one frees. The 10 s ceiling is the
+  CLI's `MAX_RETRY_WAIT`: `leep` reports a longer wait instead of sleeping,
+  so a higher clamp would fail `leep search` on every shed. Both bounds are
+  starting values that the Testing runs will set.
 - **Configuration.** `--read-concurrency CLASS=N|off`, repeatable
   (`LEEP_READ_CONCURRENCY`, comma-separated), and
   `--diff-large-generations` (1,024). It applies to every token, including
@@ -84,16 +88,28 @@ request is dropped.
 - **Metrics:** `leep_read_class_permits{class}`,
   `leep_read_class_in_flight{class}` and `leep_read_class_shed_total{class}`.
   Refusals also count in `leep_http_requests_total` as 503.
+  `LeepServerErrors` subtracts `leep_read_class_shed_total`, as it does
+  indexing answers, because a shed read is not a failure.
 - **Alert:** `LeepReadsShedding`, a ticket, when a class sheds more than
-  half its requests for 15 minutes. Expensive reads are then wanted faster
-  than the host can serve them: add hosts (ADR 0058's split) or raise the
-  class. It has a runbook in `docs/RUNBOOKS.md` when this is built.
-- **Clients.** `leep` retries a `GET` answered `503` `unavailable` with
-  `Retry-After` the way it already retries a 429: at most four tries, and
-  it reports a wait over 10 seconds. The MCP server returns the refusal to
-  the agent as a retryable tool error that carries `retry_after`, rather
-  than sleeping inside the tool call. `leep-swarm` counts shed reads apart
-  from timeouts.
+  half its requests for 15 minutes (starting values). Expensive reads are
+  then wanted faster than the host can serve them: add hosts (ADR 0058's
+  split) or raise the class. It has a runbook in `docs/RUNBOOKS.md` when
+  this is built.
+- **Clients.** `leep` retries a `GET`, or a `POST /v1/land/check`,
+  answered `503` `unavailable` with `Leep-Refused`, the way it already
+  retries a 429 on a `GET`: at most four tries (`MAX_ATTEMPTS`), and it
+  reports a `Retry-After` over `MAX_RETRY_WAIT` instead of waiting. It adds
+  up to 50% random jitter to each wait, so shed clients do not return
+  together. A dry run is safe to resend because it moves and records
+  nothing (section 3); today's client resends only `GET`s, so the route is
+  named explicitly. The MCP server returns the refusal to the agent as a
+  retryable tool error that carries `retry_after`, and never sleeps inside
+  the tool call. `leep-swarm` counts shed reads apart from timeouts.
+- **Fairness.** `try_acquire` is not fair: a client that retries can lose
+  each time to requests that arrive just as a permit frees. Jitter spreads
+  the retries but does not prevent this. Starvation of a single search is
+  an accepted risk; the client gives up after its tries and reports the
+  refusal, and the shed metric shows the pressure.
 
 ### 2. Land admission per ref
 The server that batches a ref's lands bounds that ref's queue. This is the
@@ -109,43 +125,69 @@ server otherwise. The bound is measured in batches, not lands:
   ones. As a starting point, `N` times a full batch's time should be under
   half the clients' request timeout. The swarm runs in Testing set the
   default.
-- **Where.** The check runs in `land_enqueue`, before `get_changeset`. It
-  is one look at the in-memory `RefQueue` under the lock that enqueueing
-  already takes. A refused land costs no store read, no batch slot, and no
-  lease work. Lands already queued are never dropped to make room.
-- **Answer.** `503`, code `unavailable`, with `Retry-After`: the number of
-  batches ahead times the ref's recent batch time (a moving average),
-  rounded up, between 1 and 30 s. On `POST /v1/land`, a 503 `unavailable`
-  now also means the land was not admitted and nothing was done. That is
-  already true of the body budget's 503, the only other source of the code
-  on this route, because it refuses before the handler. FORMATS.md's
-  condition text says so. No new code is added.
+- **Where.** The check runs in `land_enqueue`, after the name checks and
+  before `get_changeset`. It is one look at the in-memory `RefQueue` under
+  the lock that enqueueing already takes. A refused unkeyed land costs no
+  store read, no batch slot, and no lease work. A keyed land that finds the
+  queue full first reads its id with one `find_lands`, outside the lock,
+  the point read `answer_from_record` already makes for a collected
+  original. If the id is recorded, the land gets the recorded answer, or
+  400 `land_id_reused` for another changeset, instead of a 503. Without
+  that read, a client whose first send landed but lost its answer would be
+  refused on every resend while the queue stays full and spend its budget
+  on a land that is done. The read is one indexed lookup by key, far
+  cheaper than the changeset read and replay the refusal saves, and it
+  happens only when refusing.
+- **Queued lands.** Lands already queued are never dropped to make room.
+  That holds per leader. When a leader loses its lease, its queued lands
+  are rerouted (ADR 0056) and go through the new leader's admission like
+  new arrivals, so they can be refused there.
+- **Answer.** `503`, code `unavailable`, with `Retry-After` and
+  `Leep-Refused: admission`. `Retry-After` is the number of batches ahead
+  times the ref's recent batch time (a moving average), rounded up, between
+  1 and 30 s (starting values). The header, not the status, carries the
+  guarantee that the land was not admitted and nothing was done: a proxy or
+  balancer can answer 503 on its own, before or after the land reached a
+  server. Like `Leep-Land-Not-Leader` (ADR 0056), only a Leep server sets
+  it, and only on a refusal made before any work. The body budget's 503
+  refuses before the handler too, so it gets `Leep-Refused: body-budget`.
+  A 503 `unavailable` without the header promises nothing.
 - **Forwarded lands (ADR 0056).** A forwarded land counts against the
   leader's bound like a land that arrived there directly. The leader
   answers the refusal, and the follower relays it unchanged, `Retry-After`
-  included, as an answered forward
-  (`leep_land_forwarded_total{outcome=answered}`). The follower never
+  and `Leep-Refused` included, as an answered forward
+  (`leep_land_forwarded_total{outcome=answered}`). The relay copies only
+  `Content-Type` and `Retry-After` today, so `Leep-Refused` joins that
+  list; without it the client could not resend an unkeyed land. The
+  follower never
   batches it locally (H1), and does not route it again or count it as a
   failed forward. A follower has no queue for a ref it does not lead, so
   only the leader can judge the bound.
-- **Clients.** `leep land` and the MCP server treat a 503 `unavailable`
-  from `/v1/land` as "not admitted". They wait the `Retry-After` plus up to
-  50% random jitter, so refused agents do not return together, and send
-  the land again under the same land id. The resend is safe twice over.
+- **Clients.** A 503 `unavailable` with `Leep-Refused` from `/v1/land`
+  means "not admitted". `leep land` waits the `Retry-After` plus up to 50%
+  random jitter, so refused agents do not return together, and sends the
+  land again under the same land id. The resend is safe twice over.
   Nothing was queued, and if an earlier send of the same id did land, the
-  record answers it (ADR 0057). Because admission guarantees that nothing
+  record answers it (ADR 0057). Because the header guarantees that nothing
   happened, `leep land` also resends an unkeyed land after this answer,
-  which it never does after a timeout. Resends after admission refusals
-  have their own budget (five, or 60 s of waiting) beside the
-  `LAND_RESENDS` for timeouts and 5xx.
+  and only after it: a 503 without the header is a 5xx, and an unkeyed
+  land is never resent after a 5xx or a timeout. Resends after admission
+  refusals have their own budget (five, or 60 s of waiting; starting
+  values) beside the `LAND_RESENDS` for timeouts and 5xx. The MCP server
+  follows section 1: it returns the refusal as a retryable tool error with
+  `retry_after` and does not sleep inside the tool call. The agent resends
+  under the same land id.
 - **Metrics** (no ref label, as in ADR 0056):
   `leep_land_admission_refused_total{route=direct|forwarded}` and
   `leep_land_queue_batches`, the largest queue in batches over the refs
-  this server leads.
+  this server leads. `LeepServerErrors` must not count these refusals
+  either, including the follower's relayed copy, which its
+  `leep_http_requests_total` also records as a 503.
 - **Alert:** `LeepLandAdmissionRefusing`, a ticket, when more than 10% of
-  lands are refused for 15 minutes. The ref is offered more lands than it
-  can replay, which needs ADR 0056's next steps (pipelined or parallel
-  replay), not a larger queue. It has a runbook when this is built.
+  lands are refused for 15 minutes (starting values). The ref is offered
+  more lands than it can replay, which needs ADR 0056's next steps
+  (pipelined or parallel replay), not a larger queue. It has a runbook
+  when this is built.
 
 ### 3. A land dry run: `POST /v1/land/check`
 Agents with stale bases mostly ask "does this still land?". Today the only
@@ -167,19 +209,25 @@ answers that question without the queue:
   ancestor and fast-forward tests, the landed-copy scan, the land policy,
   and the stack replay onto the head the server reads with `get_ref`. The
   replay goes into a `Staging` layer (ADR 0043) that is never flushed and
-  is dropped with the request, so it writes no blob, changeset, row or ref
-  log entry. It never enters a `RefQueue` or takes a batch slot. It never
-  takes, holds or asks for the land lease, and it is never forwarded. It
-  runs on whichever server receives it, which spreads dry runs over every
-  server instead of the leader. It rescues nothing from changeset GC (ADR
-  0059), because it makes nothing reachable.
+  is dropped with the request. So it writes no changeset, blob, ref,
+  ref-log entry or land record. It writes derived rows only as any read
+  may, for example under `--indexing local`, and `enforce_land_policy` may
+  also call the review service. It never enters a `RefQueue` or takes a
+  batch slot. It never takes, holds or asks for the land lease, and it is
+  never forwarded. It runs on whichever server receives it, which spreads
+  dry runs over every server instead of the leader. It rescues nothing
+  from changeset GC (ADR 0059), because it makes nothing reachable.
 - **Answer.** `Conflicts { onto, conflicts, clean }` is exactly what a land
   on that head would answer. `Landed { landed, rebased, attempts: 0 }`
   means it would land. `landed` is the copy the replay computed: it is not
   stored, and the real land usually makes a different copy because the
   head moves. `attempts: 0` marks a dry run. A land policy refusal is the
-  same 400 (`needs_review`, `not_signed`, ...) that the land would get. The
-  answer holds for the head it read. A land sent afterwards can still
+  same 400 (`needs_review`, `not_signed`, ...) that the land would get.
+  When `find_lands` already holds the land id, the dry run answers the
+  recorded result, as a resend of the land does (`recorded_step`):
+  `Landed` with the recorded copy and `attempts: 0`, or 400
+  `land_id_reused` if the id landed another changeset. The answer holds
+  for the head it read. A land sent afterwards can still
   conflict.
 - **Authorization and limits.** It needs a write token, like `land`, and
   charges the write bucket. It is the `land_check` class of section 1, so
@@ -209,9 +257,15 @@ answers that question without the queue:
 - A land's longest wait in the queue is bounded by the admission bound
   instead of growing until clients time out and resend into the same
   queue.
-- `/v1` gains one route and one feature string. No field, endpoint or code
-  is removed or renamed. No persisted format, schema or hash changes, and
-  there is no migration.
+- `/v1` gains one route, one feature string and one response header,
+  `Leep-Refused` (`read-class`, `admission`, `body-budget`). No field,
+  endpoint or code is added, removed or renamed. No persisted format,
+  schema or hash changes, and there is no migration.
+- FORMATS.md gains the `Leep-Refused` header, and the `unavailable` row
+  says that with the header the request was refused before any work and
+  may be sent again, an unkeyed land included; without it, nothing is
+  promised. Clients older than the header never resend an unkeyed land
+  after a 503, which stays safe.
 - New flags (`--read-concurrency`, `--diff-large-generations`,
   `--land-queue-batches`), five metrics and two alerts with runbooks.
 - Limits are per server process. N servers run up to N times a class's
@@ -230,7 +284,8 @@ answers that question without the queue:
 
 ## Not changed
 - Refs move only through `cas_ref` and its logged variants. Admission and
-  the dry run never move a ref, and the dry run never writes.
+  the dry run never move a ref, and the dry run never writes a changeset,
+  blob, ref-log entry or land record.
 - One ref log entry per land that moves the ref, with its actor, written
   in the same transaction as the move (ADR 0032).
 - Conflicts are answered, never resolved by the server. The dry run
@@ -248,20 +303,25 @@ answers that question without the queue:
   - `admission_refused_lands_nothing`: lands refused at a full queue, then
     resent under their ids, interleaved with batches that lose CAS races
     and fail commits;
-  - `forwarded_land_refused_by_full_leader`: the follower relays the 503,
-    never batches locally and never counts a failed forward;
+  - `forwarded_land_refused_by_full_leader`: the follower relays the 503
+    with `Leep-Refused` and `Retry-After`, never batches locally and
+    never counts a failed forward;
   - `leader_killed_with_full_queue`: the leader killed or paused with its
     queue at the bound; every agent lands within TTL + 2 s of the takeover;
   - `land_check_writes_nothing`: dry runs racing lands under a wrapper
-    store that counts writes. No dry run writes or moves anything, and the
-    ref log equals a run without them;
+    store that counts writes of changesets, blobs, refs, ref-log entries
+    and land records. No dry run writes any of them, and the ref log
+    equals a run without them. Derived rows are not counted;
+  - `admission_answers_recorded_land`: a keyed land refused at a full
+    queue whose first send landed gets the recorded answer, not a 503;
   - `land_check_matches_land`: on a fixed head, a dry run's answer equals
     what `land_unstaged` answers (the same conflicts and `clean`; `Landed`
     where the land moves).
 - **Read classes.** With a gated search on memory stores: a full class
-  refuses at once with 503 and `Retry-After`, the permit is released when
-  a request is cancelled or times out, and lands, ref reads and file reads
-  go through while every search permit is held.
+  refuses at once with 503, `Retry-After` and `Leep-Refused: read-class`,
+  `leep search` retries it within `MAX_RETRY_WAIT`, the permit is released
+  when a request is cancelled or times out, and lands, ref reads and file
+  reads go through while every search permit is held.
 - **Crash test.** `cargo test -p leep-e2e --test crash` with
   `--land-queue-batches` set low enough that agents are refused. Agents
   resend after 503s, the server is SIGKILLed with a full queue, and the
@@ -274,14 +334,18 @@ answers that question without the queue:
   the admitted searches' p50. Then E3 with `--land-queue-batches` at a few
   values, to choose the default and to show whether sends per change fall.
   Each run also reports blame, filtered log and large diff times, to
-  decide whether those classes need defaults.
+  decide whether those classes need defaults, and the
+  `leep_land_lock_wait_seconds` histogram, to show how many sends time out
+  queued. These runs set the starting values above: permits, `Retry-After`
+  clamps, resend budgets and alert thresholds.
 
 ## Rollout
 - **Search and `land_check` limits are on by default.** A refused search
   costs one client a retry. An unlimited one costs every land on the host
   (E1: about ten times the lands/s), and that is today's default, not an
   edge case. The limit is a read limit, so correctness cannot depend on it.
-  The `unavailable` code already tells clients to back off and retry. On
+  The `unavailable` code already tells clients to back off and retry.
+  Permit counts are starting values that the swarm rerun will set. On
   large hosts, half the cores rarely binds unless searches are already
   crowding out everything else. `land_check` is a new route with no
   existing clients to surprise.
@@ -295,6 +359,13 @@ answers that question without the queue:
   lost lands. This is the rule ADR 0056 used for `--land-coordination`.
   Clients that honour the 503 ship first. Operators then turn the bound on
   per deployment.
+- **Balancers.** A balancer that counts 503s against a backend's health
+  would pull a shedding server out of rotation and push its load onto the
+  others, which then shed too. `Leep-Refused` lets it tell these refusals
+  from failures. OPERATIONS.md's balancer rule for `Leep-Indexing` gains
+  `Leep-Refused`: a balancer must not count a 503 carrying either header
+  against a backend. This ships with the limits, since search shedding is
+  on by default.
 - To back out, set `--read-concurrency search=off` or
   `--land-queue-batches off` and restart. Nothing persisted depends on
   either.

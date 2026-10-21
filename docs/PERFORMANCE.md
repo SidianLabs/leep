@@ -989,8 +989,10 @@ saturated.
   plus resends after timeouts).
 - **5,000 agents still land, slowly:** about 3.5 minutes per change on this
   box. Their few conflicts (0.04 to 0.24) are a symptom, not good news:
-  with 6 to 8 sends per change, most sends probably time out queued, so few
-  get as far as a replay that could conflict.
+  with 6 to 8 sends per change, most sends likely time out queued, so few
+  get as far as a replay that could conflict. That is an inference; the
+  swarm rerun will confirm it from the `leep_land_lock_wait_seconds`
+  histogram.
 - **Confounded by search load.** Every run had search reads on, which E1
   showed cost about ten times the land throughput, so these times say as
   much about search as about conflicts. E1b's conflict arms (one run
@@ -1027,6 +1029,9 @@ growth per land):
   write path plus 2 to 9 KB of index is 6 to 15%, about 9% at 5 KB of
   index. (Against the write path alone it would be 28%, but the rule counts
   all logical growth.)
+- **With ref-log retention the reclaimable share is 905 B, 8 to 21%,** so
+  the rule is met only at the low end of index growth; the decision waits
+  on `--exact-trees`.
 - **Tree nodes may dominate.** Their upper bound, 10.5 KB per land, is 16
   times the reclaimable metadata, but it lives in the blob store and only
   `gc --full` frees it. The exact count needs `--exact-trees`, a full mark
