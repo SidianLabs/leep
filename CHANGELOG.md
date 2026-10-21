@@ -65,8 +65,8 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   ceiling and gains `LEEP_MAX_BODY_BYTES`.
 - `--max-inflight-bytes` (`LEEP_MAX_INFLIGHT_BYTES`, default 1 GiB) bounds
   the body bytes all requests in flight hold together; a request that would
-  go over gets 503 with `Retry-After: 1`. With a tokens file one token may
-  hold at most a quarter of it (429 beyond). A JSON body without a declared
+  go over gets 503 `unavailable` with `Retry-After: 1`. With a tokens file
+  one token may hold at most a quarter of it (429 `rate_limited` beyond). A JSON body without a declared
   length holds 1 MiB of it. Metrics
   `leep_request_body_bytes_in_flight`, `leep_request_body_budget_bytes` and
   `leep_request_body_refused_total`, and the alert `LeepBodyBudgetExhausted`

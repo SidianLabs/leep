@@ -581,9 +581,9 @@ when the length is declared and as soon as it is exceeded when it is not. Every
 request with a body also holds its `Content-Length` of `--max-inflight-bytes`
 (1 GiB) until its handler is done; one that declares no length holds the blob
 cap for a blob upload and 1 MiB for anything else. One that would go over is a
-`503` with `Retry-After: 1`. With a tokens file, one token may hold at most a
+`503` (code `unavailable`) with `Retry-After: 1`. With a tokens file, one token may hold at most a
 quarter of the budget (or one request of the largest cap, if that is more);
-past its share it gets `429`, while other tokens go on. Bodies are held in memory
+past its share it gets `429` (`rate_limited`), while other tokens go on. Bodies are held in memory
 while they are hashed and stored, so the budget bounds that memory whatever the
 number of clients. Requests without a valid token are refused before they hold
 anything.

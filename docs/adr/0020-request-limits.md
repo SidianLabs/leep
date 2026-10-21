@@ -157,8 +157,8 @@ undeclared JSON; bounded CLI retry. The text below is current.)
   keep committing); every other route, all JSON, at most
   `--max-json-body-bytes` (32 MiB, about 200,000 changed paths in a
   changeset). `--max-body-bytes` stays as a ceiling over both. Over the cap is
-  `413` with a JSON body naming the flag: before the body is read when its
-  length is declared, while it streams when not.
+  `413` (`too_large`) with a JSON body naming the flag: before the body is
+  read when its length is declared, while it streams when not.
 - **An in-flight byte budget.** A semaphore of `--max-inflight-bytes` (1 GiB),
   counted in KiB. In the limits middleware, so after authentication (a request
   without a valid token holds nothing), each request with a body takes its
@@ -167,13 +167,13 @@ undeclared JSON; bounded CLI retry. The text below is current.)
   small bodies hold the budget for nothing, and the cap still bounds what it
   sends), and holds it until
   its handler returns, which is when the body's memory is released. A request
-  that does not fit is refused at once with `503` and `Retry-After: 1`, not
-  queued, for the reason concurrency is refused rather than queued. A cap above
+  that does not fit is refused at once with `503`, code `unavailable`, and
+  `Retry-After: 1`, not queued, for the reason concurrency is refused rather than queued. A cap above
   the budget fails startup.
 - **A share per token.** With a tokens file, one token may hold at most a
   quarter of the budget, or one request of the largest cap if that is more, so
-  every request stays admissible alone. Past it the token gets `429` with
-  `Retry-After: 1` (`reason="principal"`) and other tokens are unaffected. A
+  every request stays admissible alone. Past it the token gets `429`, code
+  `rate_limited`, with `Retry-After: 1` (`reason="principal"`) and other tokens are unaffected. A
   writer that declares large bodies and sends them slowly could otherwise hold
   the whole budget until its requests time out.
 - **Client.** `leep` sends a blob upload refused with `503` and a

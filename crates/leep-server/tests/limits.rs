@@ -814,6 +814,7 @@ async fn each_route_class_has_its_own_body_cap() {
     let over = vec![b'x'; 64 * KIB + 1];
     let r = send(&app, put_declared(A, &over)).await;
     assert_eq!(r.status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(r.code().as_deref(), Some("too_large"));
     assert!(r.error().contains("--max-blob-bytes"), "{}", r.error());
 
     // JSON routes have the smaller cap: a body a blob may have is refused.
@@ -821,6 +822,7 @@ async fn each_route_class_has_its_own_body_cap() {
     let req = request(Method::POST, "/v1/blobs/missing", A, Body::from(big_json));
     let r = send(&app, req).await;
     assert_eq!(r.status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(r.code().as_deref(), Some("too_large"));
     assert!(r.error().contains("--max-json-body-bytes"), "{}", r.error());
 }
 
@@ -833,6 +835,7 @@ async fn a_body_without_a_declared_length_is_capped_while_it_streams() {
     let req = request(Method::POST, "/v1/changesets", A, Body::from_stream(chunks));
     let r = send(&app, req).await;
     assert_eq!(r.status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(r.code().as_deref(), Some("too_large"));
     assert!(r.error().contains("8192 bytes"), "{}", r.error());
 }
 
@@ -854,6 +857,7 @@ async fn a_spent_budget_answers_503_with_retry_after_until_bodies_finish() {
     let forty = vec![b'y'; 40 * KIB];
     let r = send(&app, put_declared(B, &forty)).await;
     assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(r.code().as_deref(), Some("unavailable"));
     assert_eq!(r.retry_after.as_deref(), Some("1"));
     assert!(r.error().contains("retry"), "{}", r.error());
     // A smaller one still fits, and requests without a body cost nothing.
@@ -942,6 +946,7 @@ async fn one_token_cannot_hold_more_than_its_share_of_the_budget() {
     let forty = vec![b'y'; 40 * KIB];
     let r = send(&app, put_declared(A, &forty)).await;
     assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(r.code().as_deref(), Some("rate_limited"));
     assert_eq!(r.retry_after.as_deref(), Some("1"));
     assert!(r.error().contains("this token"), "{}", r.error());
     // The budget is far from spent, so another token is unaffected, and `a`
