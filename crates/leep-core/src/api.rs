@@ -83,7 +83,7 @@
 //! | 500 | `internal` | the server failed |
 //! | 503 | `indexing` | the index is too far behind; see `indexing` and `Retry-After` (ADR 0058) |
 //! | 503 | `not_leader` | the server no longer coordinates lands on that ref; send again (ADR 0056) |
-//! | 503 | `unavailable` | overloaded or busy, including request bodies in flight at the server's limit (`--max-inflight-bytes`), with `Retry-After` when known: back off and retry |
+//! | 503 | `unavailable` | overloaded or busy, including request bodies in flight at the server's limit (`--max-inflight-bytes`), with `Retry-After` when known: back off and retry. With [`REFUSED_HEADER`] the server refused before any work and the request may be sent again; without it nothing is promised |
 //!
 //! A lost `POST /v1/refs/{name}` swap is not an error body: it is 409 with
 //! [`CasRefResponse`] (`ok: false`). The constants are in [`error_code`].
@@ -304,7 +304,9 @@ pub mod error_code {
     pub const NOT_LEADER: &str = "not_leader";
     /// 503 (with `Retry-After` when the server knows): overloaded or busy,
     /// including request bodies in flight at the server's limit
-    /// (`--max-inflight-bytes`). Back off and retry.
+    /// (`--max-inflight-bytes`) and an expensive read whose class is full
+    /// (ADR 0060). Back off and retry. With [`super::REFUSED_HEADER`] the
+    /// request was refused before any work.
     pub const UNAVAILABLE: &str = "unavailable";
     /// 500: the server failed.
     pub const INTERNAL: &str = "internal";
@@ -406,6 +408,16 @@ pub const INDEXING_STALE_OK: &str = "stale-ok";
 /// Response header of an indexed read: changesets (or, for search, files)
 /// without index rows that the answer examined directly.
 pub const INDEX_SCANNED_HEADER: &str = "leep-index-scanned";
+
+/// Response header of a `503` `unavailable` that a Leep server answered
+/// before doing any work (ADR 0060), so the request may be sent again as it
+/// was. The value names the limit, such as [`REFUSED_READ_CLASS`]. Only a
+/// Leep server sets it: a `503` without it, which a proxy may also send,
+/// promises nothing.
+pub const REFUSED_HEADER: &str = "leep-refused";
+/// [`REFUSED_HEADER`] value: an expensive read (a search) whose class was
+/// at its concurrency limit (`--read-concurrency`).
+pub const REFUSED_READ_CLASS: &str = "read-class";
 
 /// Body of `GET /v1/whoami`. Lets a client name the author of its changesets
 /// after the token when nothing local names one.
