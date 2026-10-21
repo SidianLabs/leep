@@ -834,6 +834,8 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(unix)]
     leep_server::reload::spawn_sighup_reload(config.clone(), repo.meta().clone())
         .context("installing the SIGHUP handler")?;
+    // Experiment branch only: builds the leader runtime up front.
+    tracing::info!(exp = %leep_derive::exp::describe(), "land leader experiment");
     if args.warm_interval.is_zero() {
         tracing::info!("index warming off: the first query on new history derives its indexes");
     } else {

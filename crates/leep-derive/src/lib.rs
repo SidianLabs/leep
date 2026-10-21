@@ -14,6 +14,7 @@ mod blame;
 mod comments;
 mod cursor;
 pub mod derived;
+pub mod exp;
 mod filter_log;
 pub mod gc;
 mod history;

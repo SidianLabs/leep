@@ -434,7 +434,11 @@ impl Repo {
             !std::mem::replace(&mut q.leading, true)
         };
         if start_leader {
-            let task = tokio::spawn(lead(self.clone(), target_ref.to_string(), queue));
+            let leader = lead(self.clone(), target_ref.to_string(), queue);
+            let task = match crate::exp::leader_runtime() {
+                Some(rt) => rt.spawn(leader),
+                None => tokio::spawn(leader),
+            };
             self.land_queues.track(task.abort_handle());
         }
         let answer = answer.await.map_err(|_| {
@@ -550,6 +554,35 @@ impl Repo {
                 let repo = staging.repo(&l.q.repo);
                 let step = match recorded_step(&l.q, &recorded, attempt) {
                     Some(step) => step,
+                    None if crate::exp::replay_blocking() => {
+                        // Experiment: drive the replay on a blocking thread,
+                        // moving its state in and back out.
+                        let (cs, create, tr) = (l.q.cs, l.q.create, target_ref.to_string());
+                        let mut checked = std::mem::take(&mut l.checked);
+                        let mut o = std::mem::take(&mut origins);
+                        let rt = tokio::runtime::Handle::current();
+                        let joined = tokio::task::spawn_blocking(move || {
+                            let step = rt.block_on(repo.land_step(
+                                cs,
+                                create,
+                                head,
+                                &tr,
+                                attempt,
+                                &mut checked,
+                                &mut o,
+                            ));
+                            (step, checked, o)
+                        })
+                        .await;
+                        match joined {
+                            Ok((step, checked, o)) => {
+                                l.checked = checked;
+                                origins = o;
+                                step
+                            }
+                            Err(e) => Err(Error::Other(format!("replay task failed: {e}"))),
+                        }
+                    }
                     None => {
                         repo.land_step(
                             l.q.cs,
