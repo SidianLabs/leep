@@ -253,6 +253,21 @@ enum Cmd {
         /// runs did not mark (ADR 0033), and rewrite their record.
         #[arg(long, global = true)]
         full: bool,
+        /// With --dry-run only: count the changesets ADR 0059 would delete
+        /// (unreachable from refs, the ref log, land ids, scan windows,
+        /// attestations and mirror maps, and older than --grace), their
+        /// rows and tree nodes, under the ref log kept and pruned. Strictly
+        /// read-only; a Postgres connection is opened read-only.
+        #[arg(long, requires = "dry_run", conflicts_with = "full")]
+        unreachable: bool,
+        /// With --unreachable: ref log retention to compare against keeping
+        /// it forever.
+        #[arg(long, default_value = "30d", value_parser = parse_grace, requires = "unreachable")]
+        ref_log_retention: std::time::Duration,
+        /// With --unreachable: walk every reachable tree, so tree counts are
+        /// exact rather than an upper bound (costs a full GC mark).
+        #[arg(long, requires = "unreachable")]
+        exact_trees: bool,
     },
     /// Pack every live blob and tree node of a filesystem or s3:// blob store
     /// into one delta-compressed pack (ADR 0029, ADR 0040; uses --meta and
@@ -565,6 +580,118 @@ async fn run_gc(
     Ok(())
 }
 
+/// A Postgres URL whose sessions refuse every write, so the dry run cannot
+/// change the store whatever it calls.
+fn read_only_meta_url(url: &str) -> String {
+    if !(url.starts_with("postgres://") || url.starts_with("postgresql://")) {
+        return url.to_string();
+    }
+    let sep = if url.contains('?') { '&' } else { '?' };
+    format!("{url}{sep}options=-c%20default_transaction_read_only%3Don")
+}
+
+async fn run_unreachable_report(
+    meta: &str,
+    blobs: &str,
+    opts: leep_derive::gc_unreachable::UnreachableOptions,
+) -> anyhow::Result<()> {
+    use leep_derive::gc_unreachable::{report, PolicyReport, AGE_BUCKETS_DAYS};
+    let blobs = leep_store::open_blob_store(blobs).context("opening blob store")?;
+    let pool = META_POOL_SIZE.load(std::sync::atomic::Ordering::Relaxed);
+    let meta = leep_meta::open_meta_store_with_pool(
+        &read_only_meta_url(meta),
+        leep_meta::SchemaMode::RequireCurrent,
+        pool,
+    )
+    .await
+    .context("opening meta store")?;
+    let repo = new_repo(blobs, meta);
+    let started = std::time::Instant::now();
+    let r = report(&repo, &opts).await?;
+    let per = |b: u64| {
+        if r.lands == 0 {
+            "-".to_string()
+        } else {
+            format!("{:.0}", b as f64 / r.lands as f64)
+        }
+    };
+    println!("changesets stored: {}", r.changesets);
+    println!("parents named but not stored: {}", r.missing_parents);
+    println!("refs: {}", r.refs);
+    println!("ref log entries: {} ({} lands)", r.ref_log_entries, r.lands);
+    println!("rebased-origin links: {}", r.rebased_links);
+    println!("originals in a scan window: {}", r.window_originals);
+    println!("unreachable but attested: {}", r.attested);
+    println!("unreachable but mirrored: {}", r.mirrored);
+    println!(
+        "ref log entries older than {}s (kept: each ref's newest): {} entries, ~{} bytes, ~{} per land",
+        opts.ref_log_retention.as_secs(),
+        r.ref_log_prunable_entries,
+        r.ref_log_prunable_bytes,
+        per(r.ref_log_prunable_bytes)
+    );
+    let show = |name: &str, p: &PolicyReport| {
+        let t = &p.reclaimable;
+        println!("[{name}]");
+        println!("  reachable: {}", p.reachable);
+        println!("  unreachable before grace: {}", p.unreachable);
+        println!(
+            "  by age (<{}d, <{}d, <{}d, older): {:?}",
+            AGE_BUCKETS_DAYS[0], AGE_BUCKETS_DAYS[1], AGE_BUCKETS_DAYS[2], p.by_age
+        );
+        println!(
+            "  reclaimable changesets (older than {}s): {} (originals {}, snapshots {}, other {})",
+            opts.grace.as_secs(),
+            t.changesets,
+            t.originals,
+            t.snapshots,
+            t.other
+        );
+        println!(
+            "  changeset bytes (uncompressed encoding): {} ({} per land)",
+            t.changeset_bytes,
+            per(t.changeset_bytes)
+        );
+        for (kind, (rows, bytes)) in &t.rows {
+            println!("  rows {kind}: {rows} rows, {bytes} bytes");
+        }
+        println!(
+            "  metadata bytes (logical): {} ({} per land)",
+            t.meta_bytes(),
+            per(t.meta_bytes())
+        );
+        let bound = if p.exact_trees {
+            "exact"
+        } else {
+            "upper bound"
+        };
+        println!(
+            "  tree nodes ({bound}): {} nodes, {} bytes ({} per land)",
+            t.tree_nodes,
+            t.tree_node_bytes,
+            per(t.tree_node_bytes)
+        );
+        println!(
+            "  file contents ({bound}): {} blobs, {} bytes ({} per land)",
+            t.contents,
+            t.content_bytes,
+            per(t.content_bytes)
+        );
+    };
+    show("ref log kept forever", &r.log_kept);
+    show("ref log kept for --ref-log-retention", &r.log_pruned);
+    println!(
+        "reclaimable without a root_tree row (trees not counted): {}",
+        r.without_root_tree
+    );
+    println!(
+        "tree nodes missing from the blob store: {}",
+        r.missing_nodes
+    );
+    println!("elapsed: {:.1}s", started.elapsed().as_secs_f64());
+    Ok(())
+}
+
 async fn run_derive_search(meta: &str, blobs: &str, rev: &str) -> anyhow::Result<()> {
     let blobs = leep_store::open_blob_store(blobs).context("opening blob store")?;
     let meta = open_meta(meta).await.context("opening meta store")?;
@@ -722,11 +849,37 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Cmd::Gc {
             phase,
+            grace,
+            unreachable: true,
+            ref_log_retention,
+            exact_trees,
+            ..
+        }) => {
+            if phase.is_some() {
+                anyhow::bail!("--unreachable takes no phase");
+            }
+            return run_unreachable_report(
+                &args.meta,
+                &args.blobs,
+                leep_derive::gc_unreachable::UnreachableOptions {
+                    now: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_secs() as i64),
+                    grace,
+                    ref_log_retention,
+                    exact_trees,
+                },
+            )
+            .await;
+        }
+        Some(Cmd::Gc {
+            phase,
             dry_run,
             grace,
             fence,
             unsafe_no_fence,
             full,
+            ..
         }) => {
             let mark = if full {
                 leep_derive::gc::Mark::Full

@@ -1191,6 +1191,28 @@ means a request exceeded `--request-timeout`.
 Upgrade note: servers built before ADR 0012 ignore condemnations. Upgrade every
 server before the first `condemn`.
 
+### Sizing what unreachable changesets cost
+
+Changesets are never deleted, so originals of rebased lands, abandoned work
+and `leep sync` snapshots stay forever. ADR 0059 (proposed) would collect
+them. To measure what it would reclaim on a store, run the read-only count:
+
+```sh
+leep-server --meta "$LEEP_META" --blobs "$LEEP_BLOBS" \
+  gc --dry-run --unreachable --grace 7d --ref-log-retention 30d
+```
+
+It writes nothing, and on Postgres its connections refuse writes
+(`default_transaction_read_only`). It reports, with the ref log kept forever
+and with it kept `--ref-log-retention`, the unreachable changesets by age and
+kind, the changesets and per-changeset rows older than `--grace` with their
+logical bytes, the ref log entries a retention would drop, and the tree nodes
+and contents only those changesets introduced, each in total and per land.
+Tree counts are an upper bound. `--exact-trees` makes them exact for the
+retention policy by walking every reachable tree, which costs as much as
+`gc --full`. Ages come from the changesets' own timestamps. Memory is about
+60 bytes per changeset, plus one hash per live object with `--exact-trees`.
+
 ## Packing blobs
 
 A blob store keeps every object whole in its own file (or bucket object)

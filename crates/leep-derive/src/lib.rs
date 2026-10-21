@@ -16,6 +16,7 @@ mod cursor;
 pub mod derived;
 mod filter_log;
 pub mod gc;
+pub mod gc_unreachable;
 mod history;
 pub mod integrity;
 mod land;

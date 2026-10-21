@@ -26,7 +26,7 @@ const BACKOFF_CAP_MS: u64 = 200;
 /// re-driven from a fresh read, which resolves an ambiguous commit.
 const MAX_COMMIT_ERRORS: u32 = 3;
 /// Changesets examined when looking for an earlier landing of the same stack.
-const LANDED_COPY_SCAN: usize = 1024;
+pub(crate) const LANDED_COPY_SCAN: usize = 1024;
 /// Lands one batch takes at most. It bounds the commit (one ref log row per
 /// land) and how long a land waits behind replays of the lands queued before
 /// it; the next batch starts as soon as this one commits.
