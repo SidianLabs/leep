@@ -29,12 +29,28 @@ impl From<CliError> for ToolError {
             let secs = e.retry_after_ms().unwrap_or(1000).div_ceil(1000);
             return ToolError(format!(
                 "{}; retry in about {secs}s, or call again without `fresh` for an answer at the \
-                 newest indexed changeset",
-                e.message().trim_start_matches("server: ")
+                 newest indexed changeset{}",
+                e.message().trim_start_matches("server: "),
+                request_note(&e)
             ));
         }
-        ToolError(e.to_string())
+        ToolError(describe(&e))
     }
+}
+
+/// ` (server request id: X)` when the error came from a request, else
+/// nothing. "server" keeps it apart from `leep_commit_and_land`'s own
+/// `request_id`.
+pub(crate) fn request_note(e: &CliError) -> String {
+    e.request_id()
+        .map(|id| format!(" (server request id: {id})"))
+        .unwrap_or_default()
+}
+
+/// The error's message with its request id, which an operator can find in
+/// the server's logs.
+pub(crate) fn describe(e: &CliError) -> String {
+    format!("{e}{}", request_note(e))
 }
 
 impl From<leep_core::Error> for ToolError {
@@ -136,8 +152,9 @@ impl Server {
             .unwrap_or(DEFAULT_REF);
         let fail = |e: CliError| {
             ToolError(format!(
-                "cannot resolve rev `{rev}`: {e}. Use a ref name from leep_refs, a changeset id, \
-                 or a unique prefix of one (at least 4 hex digits)."
+                "cannot resolve rev `{rev}`: {}. Use a ref name from leep_refs, a changeset id, \
+                 or a unique prefix of one (at least 4 hex digits).",
+                describe(&e)
             ))
         };
         match self.client.resolve(rev) {

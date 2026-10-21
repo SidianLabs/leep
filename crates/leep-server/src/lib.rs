@@ -4,9 +4,11 @@
 pub mod auth;
 pub mod backup;
 pub mod coord;
+pub mod errors;
 pub mod fingerprint;
 pub mod limits;
 pub mod observe;
+pub mod protect;
 pub mod reload;
 pub mod review;
 pub mod signing;
@@ -294,13 +296,17 @@ pub fn router_with_body_limits(
         ))
     };
     router
+        // Outside the body cap and the timeout, whose answers are plain text.
+        .layer(middleware::from_fn(errors::json_errors))
         .layer(observe::trace_layer())
         .layer(middleware::from_fn(observe::track_metrics))
+        // Outermost, so the log span, every handler and every answer see it.
+        .layer(middleware::from_fn(observe::request_id))
         .with_state(repo)
 }
 
-/// Check the ref names a land policy protects (`--require-signatures`,
-/// `--require-review`, a review policy's `refs`). Protection matches names
+/// Check the ref names a land policy protects (`--protect-ref`,
+/// `--require-signatures`, `--require-review`, a review policy's `refs`). Protection matches names
 /// exactly, so a name no ref can have, such as one with a stray space from a
 /// comma-separated environment variable, would leave the intended ref
 /// unprotected without a word.
@@ -392,6 +398,8 @@ impl IntoResponse for ApiError {
                     behind: *behind,
                     retry_after_ms: *retry_after_ms,
                 }),
+                code: Some(error_code::INDEXING.into()),
+                request_id: None,
             };
             let mut resp = (status, Json(body)).into_response();
             let h = resp.headers_mut();
@@ -407,7 +415,8 @@ impl IntoResponse for ApiError {
         if status.is_server_error() {
             tracing::error!(error = %self.0, "request failed");
         }
-        (status, Json(ErrorResponse::new(self.0.to_string()))).into_response()
+        let body = ErrorResponse::new(self.0.to_string()).with_code(errors::code_of(&self.0));
+        (status, Json(body)).into_response()
     }
 }
 
@@ -978,6 +987,7 @@ async fn resolve_prefix(State(repo): S, Path(prefix): Path<String>) -> ApiResult
                 ),
                 candidates,
                 truncated,
+                code: Some(error_code::AMBIGUOUS_PREFIX.into()),
             };
             (StatusCode::BAD_REQUEST, Json(body)).into_response()
         }

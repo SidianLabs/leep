@@ -604,8 +604,8 @@ fn content_length(req: &Request) -> Option<u64> {
         .ok()
 }
 
-fn refuse(status: StatusCode, msg: &str, retry_after: Option<u64>) -> Response {
-    let mut resp = auth::reject(status, msg);
+fn refuse(status: StatusCode, code: &str, msg: &str, retry_after: Option<u64>) -> Response {
+    let mut resp = auth::reject(status, code, msg);
     if let Some(s) = retry_after {
         resp.headers_mut()
             .insert(header::RETRY_AFTER, HeaderValue::from(s));
@@ -617,6 +617,7 @@ fn too_large(slot: &Slot, max: usize) -> Response {
     slot.limited("size");
     refuse(
         StatusCode::PAYLOAD_TOO_LARGE,
+        leep_core::api::error_code::TOO_LARGE,
         &format!("request body exceeds the limit of {max} bytes for this token"),
         None,
     )
@@ -644,16 +645,10 @@ pub async fn enforce(req: Request, next: Next) -> Response {
     drop(charge);
     // A 413 that is not ours already is the route cap, which the body
     // extractor reports as plain text.
-    if resp.status() == StatusCode::PAYLOAD_TOO_LARGE && !is_json(&resp) {
+    if resp.status() == StatusCode::PAYLOAD_TOO_LARGE && !crate::errors::is_json(&resp) {
         return route_too_large(class, cap);
     }
     resp
-}
-
-fn is_json(resp: &Response) -> bool {
-    resp.headers()
-        .get(header::CONTENT_TYPE)
-        .is_some_and(|v| v.as_bytes().starts_with(b"application/json"))
 }
 
 /// The per-principal half of [`enforce`]. `route_cap` is the server-wide
@@ -678,6 +673,7 @@ async fn limit_principal(req: Request, next: Next, route_cap: usize) -> Response
         let secs = wait.as_secs_f64().ceil().max(1.0) as u64;
         return refuse(
             StatusCode::TOO_MANY_REQUESTS,
+            leep_core::api::error_code::RATE_LIMITED,
             &format!("rate limit exceeded; retry after {secs}s"),
             Some(secs),
         );
@@ -693,6 +689,7 @@ async fn limit_principal(req: Request, next: Next, route_cap: usize) -> Response
             slot.limited("concurrency");
             return refuse(
                 StatusCode::TOO_MANY_REQUESTS,
+                leep_core::api::error_code::RATE_LIMITED,
                 "too many concurrent requests; retry after 1s",
                 Some(1),
             );
@@ -941,6 +938,7 @@ impl BodyBudget {
                     tracing::debug!(token = %name, class, bytes, "request refused: token's body share spent");
                     return Err(refuse(
                         StatusCode::TOO_MANY_REQUESTS,
+                        leep_core::api::error_code::RATE_LIMITED,
                         "too many request bodies in flight for this token; retry after 1s",
                         Some(1),
                     ));
@@ -956,6 +954,7 @@ impl BodyBudget {
                 tracing::debug!(class, bytes, "request refused: body budget spent");
                 return Err(refuse(
                     StatusCode::SERVICE_UNAVAILABLE,
+                    leep_core::api::error_code::UNAVAILABLE,
                     "server busy: the request bodies in flight are at this server's limit; \
                      retry after 1s",
                     Some(1),
@@ -983,6 +982,7 @@ fn route_too_large(class: &'static str, cap: usize) -> Response {
     };
     refuse(
         StatusCode::PAYLOAD_TOO_LARGE,
+        leep_core::api::error_code::TOO_LARGE,
         &format!("request body exceeds the limit of {cap} bytes for {what} (server {flag})"),
         None,
     )

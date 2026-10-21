@@ -46,10 +46,54 @@
 //! that a land policy protects is 400. `{rev}` tries a ref, then a full id,
 //! then `tags/{rev}`.
 //!
-//! Errors are `{"error": "..."}` ([`ErrorResponse`]): `Error::Invalid` → 400,
-//! `Error::NotFound` → 404, CAS loss and `Error::Conflict` (e.g. a land that
-//! kept losing to concurrent lands) → 409, `Error::Indexing` → 503 with
-//! `Retry-After` and [`IndexingInfo`] (ADR 0058), anything else → 500.
+//! Errors are `{"error": "...", "code": "..."}` ([`ErrorResponse`]):
+//! `Error::Invalid` → 400, `Error::NotFound` → 404, CAS loss and
+//! `Error::Conflict` (e.g. a land that kept losing to concurrent lands) →
+//! 409, `Error::Indexing` → 503 with `Retry-After` and [`IndexingInfo`]
+//! (ADR 0058), anything else → 500.
+//!
+//! # Error codes
+//!
+//! `code` names the condition so clients need not match `error` text. The
+//! list is a stable contract: a code keeps its meaning, new codes may be
+//! added, and a client treats an unknown or absent code (older servers send
+//! none) by its HTTP status. `error` stays human-readable and may change.
+//!
+//! | Status | `code` | Condition |
+//! |---|---|---|
+//! | 400 | `needs_review` | a land onto a ref whose review policy some changeset does not meet |
+//! | 400 | `not_signed` | a land onto a ref that needs every changeset signed by a trusted key |
+//! | 400 | `not_forward` | a move of a land-policy-protected ref, or of a protected ref (`--protect-ref`), that is not a fast-forward |
+//! | 400 | `tag_immutable` | a move of a tag, or a land onto one |
+//! | 400 | `land_id_reused` | a land id the ref already recorded for another changeset (ADR 0057) |
+//! | 400 | `invalid_name` | a ref name [`crate::refname::validate`] refuses |
+//! | 400 | `ambiguous_prefix` | a short id matching several changesets ([`AmbiguousPrefixResponse`]) |
+//! | 400 | `invalid` | any other bad request |
+//! | 401 | `unauthorized` | no token, or an unknown one |
+//! | 401 | `token_expired` | a known token that has expired: fetch a new one; retrying will not help |
+//! | 403 | `forbidden` | a `read` token on a request that writes |
+//! | 404 | `ref_missing` | a land onto a missing ref with `create: false` (ADR 0036) |
+//! | 404 | `not_found` | anything else that does not exist |
+//! | 408 | `timeout` | the request timeout ran out; the request may or may not have applied |
+//! | 409 | `cas_lost` | a concurrent update won repeatedly; read again and retry |
+//! | 409 | `forward_failed` | the land could not reach the server coordinating its ref; retry (ADR 0056) |
+//! | 413 | `too_large` | the body is over the server's or the token's limit |
+//! | 429 | `rate_limited` | a request limit (rate or concurrency); see `Retry-After` |
+//! | 500 | `internal` | the server failed |
+//! | 503 | `indexing` | the index is too far behind; see `indexing` and `Retry-After` (ADR 0058) |
+//! | 503 | `not_leader` | the server no longer coordinates lands on that ref; send again (ADR 0056) |
+//! | 503 | `unavailable` | overloaded or busy (with `Retry-After` when known): back off and retry |
+//!
+//! A lost `POST /v1/refs/{name}` swap is not an error body: it is 409 with
+//! [`CasRefResponse`] (`ok: false`). The constants are in [`error_code`].
+//!
+//! # Request ids
+//!
+//! A client may send [`REQUEST_ID_HEADER`] (`X-Request-Id`). The server keeps
+//! a value that passes [`valid_request_id`] (1 to 128 characters of
+//! `A-Z a-z 0-9 . _ : / -`) and otherwise picks 32 random hex digits, logs the request
+//! under it, answers with it in the same header on every response, and adds
+//! it to JSON error bodies as `request_id`.
 //!
 //! # Index lag (ADR 0058)
 //!
@@ -87,7 +131,9 @@
 //! from the body, or null when authentication is off. A client may label its
 //! own moves with `operation` and `message` (`leep undo` sends `undo`); the
 //! server-owned labels `land` and `import` are 400. Refused and lost moves
-//! write nothing. Entries are never removed.
+//! write nothing. Entries are never removed. An entry of a land that carried
+//! a `land_id` (ADR 0057) has `land_id` and `land_changeset` (the changeset
+//! the land asked for); both are omitted otherwise and by older servers.
 //!
 //! # Authentication
 //!
@@ -137,6 +183,15 @@ pub struct ErrorResponse {
     /// servers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub indexing: Option<IndexingInfo>,
+    /// What went wrong, as one of the stable [`error_code`] strings, so
+    /// clients need not match `error` text. Absent from older servers;
+    /// clients may meet codes they do not know and must then go by status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    /// The request's id ([`REQUEST_ID_HEADER`]), which the server's log line
+    /// for it carries too. Absent from older servers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
 }
 
 impl ErrorResponse {
@@ -144,6 +199,128 @@ impl ErrorResponse {
         ErrorResponse {
             error: error.into(),
             indexing: None,
+            code: None,
+            request_id: None,
+        }
+    }
+
+    /// The same error with `code` set (one of [`error_code`]).
+    pub fn with_code(mut self, code: &str) -> Self {
+        self.code = Some(code.to_string());
+        self
+    }
+}
+
+/// The `code` of an error body ([`ErrorResponse`],
+/// [`AmbiguousPrefixResponse`]). A stable contract: a code keeps its meaning
+/// forever and new ones may be added, so clients treat an unknown code like
+/// an absent one and go by the HTTP status. Older servers send no code;
+/// clients then fall back to the status and the `*_MARKER` texts.
+pub mod error_code {
+    /// 400: a land onto a ref whose policy needs review that some changeset
+    /// lacks ([`crate::review::NEEDS_REVIEW_MARKER`]).
+    pub const NEEDS_REVIEW: &str = "needs_review";
+    /// 400: a land onto a ref that only accepts changesets signed by a
+    /// trusted key ([`crate::signature::NOT_SIGNED_MARKER`]).
+    pub const NOT_SIGNED: &str = "not_signed";
+    /// 400: a move of a land-policy-protected ref, or of a protected ref
+    /// (`--protect-ref`), that is not a fast-forward
+    /// ([`crate::refname::NOT_FORWARD_MARKER`]).
+    pub const NOT_FORWARD: &str = "not_forward";
+    /// 400: a tag move, or a land onto a tag. Tags are created and deleted,
+    /// never moved.
+    pub const TAG_IMMUTABLE: &str = "tag_immutable";
+    /// 400: a land id the ref already recorded for another changeset
+    /// (ADR 0057).
+    pub const LAND_ID_REUSED: &str = "land_id_reused";
+    /// 400: a ref name that [`crate::refname::validate`] refuses.
+    pub const INVALID_NAME: &str = "invalid_name";
+    /// 400: a short id that matches several changesets
+    /// ([`super::AmbiguousPrefixResponse`]).
+    pub const AMBIGUOUS_PREFIX: &str = "ambiguous_prefix";
+    /// 400: any other bad request.
+    pub const INVALID: &str = "invalid";
+    /// 401: no token, or an unknown one.
+    pub const UNAUTHORIZED: &str = "unauthorized";
+    /// 401: the token is known but has expired. Fetch a new token; retrying
+    /// with this one will not help.
+    pub const TOKEN_EXPIRED: &str = "token_expired";
+    /// 403: a `read` token on a request that writes.
+    pub const FORBIDDEN: &str = "forbidden";
+    /// 404: a land onto a missing ref with `create: false`
+    /// ([`crate::refname::MISSING_REF_MARKER`]).
+    pub const REF_MISSING: &str = "ref_missing";
+    /// 404: anything else that does not exist.
+    pub const NOT_FOUND: &str = "not_found";
+    /// 408: the server's request timeout ran out; the request may or may not
+    /// have taken effect.
+    pub const TIMEOUT: &str = "timeout";
+    /// 409: a concurrent update won (a land that kept losing its ref swap);
+    /// reading again and retrying can succeed.
+    pub const CAS_LOST: &str = "cas_lost";
+    /// 409: the land could not reach the server coordinating its ref
+    /// ([`super::FORWARD_FAILED_MARKER`], ADR 0056). Nothing landed here;
+    /// retrying can succeed once that server answers or another takes over.
+    pub const FORWARD_FAILED: &str = "forward_failed";
+    /// 413: the request body is over the server's or the token's limit.
+    pub const TOO_LARGE: &str = "too_large";
+    /// 429: a request limit (rate or concurrency); see `Retry-After`.
+    pub const RATE_LIMITED: &str = "rate_limited";
+    /// 503 with [`super::IndexingInfo`]: the index is too far behind
+    /// (ADR 0058).
+    pub const INDEXING: &str = "indexing";
+    /// 503: the server no longer coordinates lands on the ref; send the land
+    /// again (ADR 0056).
+    pub const NOT_LEADER: &str = "not_leader";
+    /// 503 (with `Retry-After` when the server knows): overloaded or busy.
+    /// Back off and retry.
+    pub const UNAVAILABLE: &str = "unavailable";
+    /// 500: the server failed.
+    pub const INTERNAL: &str = "internal";
+
+    /// Every code, for documentation tests.
+    pub const ALL: &[&str] = &[
+        NEEDS_REVIEW,
+        NOT_SIGNED,
+        NOT_FORWARD,
+        TAG_IMMUTABLE,
+        LAND_ID_REUSED,
+        INVALID_NAME,
+        AMBIGUOUS_PREFIX,
+        INVALID,
+        UNAUTHORIZED,
+        TOKEN_EXPIRED,
+        FORBIDDEN,
+        REF_MISSING,
+        NOT_FOUND,
+        TIMEOUT,
+        CAS_LOST,
+        FORWARD_FAILED,
+        TOO_LARGE,
+        RATE_LIMITED,
+        INDEXING,
+        NOT_LEADER,
+        UNAVAILABLE,
+        INTERNAL,
+    ];
+}
+
+/// Stable text in the 409 of a land that could not reach the server
+/// coordinating its ref (ADR 0056); the server maps it to
+/// [`error_code::FORWARD_FAILED`].
+pub const FORWARD_FAILED_MARKER: &str = "could not reach the server coordinating that ref";
+
+#[cfg(test)]
+mod error_code_tests {
+    #[test]
+    fn codes_are_unique_snake_case() {
+        let mut seen = std::collections::BTreeSet::new();
+        for c in super::error_code::ALL {
+            assert!(
+                c.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'),
+                "{c}"
+            );
+            assert!(seen.insert(c), "{c} twice");
         }
     }
 }
@@ -158,6 +335,24 @@ pub struct IndexingInfo {
     pub kind: String,
     pub behind: u64,
     pub retry_after_ms: u64,
+}
+
+/// Request and response header naming one request, to find it in the
+/// server's logs. A client may send one; the server keeps it if it passes
+/// [`valid_request_id`], else makes its own, and answers with the id it used.
+pub const REQUEST_ID_HEADER: &str = "x-request-id";
+
+/// Longest request id a server keeps, in bytes.
+pub const MAX_REQUEST_ID_LEN: usize = 128;
+
+/// Whether a client's request id is kept as sent: 1 to
+/// [`MAX_REQUEST_ID_LEN`] characters of `A-Z a-z 0-9 . _ : / -`. No spaces,
+/// `=` or quotes, so an id cannot pose as another field of a log line.
+pub fn valid_request_id(id: &str) -> bool {
+    (1..=MAX_REQUEST_ID_LEN).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b".-_:/".contains(&b))
 }
 
 /// Request header choosing what a query does when its index is behind
@@ -421,6 +616,9 @@ pub struct AmbiguousPrefixResponse {
     /// More changesets match than `candidates` lists.
     #[serde(default)]
     pub truncated: bool,
+    /// [`error_code::AMBIGUOUS_PREFIX`]; absent from older servers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -998,6 +1196,8 @@ mod tests {
             actor: None,
             operation: "undo".into(),
             message: Some("undo of 3".into()),
+            land_id: None,
+            land_changeset: None,
         };
         let v = serde_json::to_value(RefLogResponse {
             entries: vec![e.clone()],
@@ -1013,7 +1213,43 @@ mod tests {
             }]})
         );
         let back: RefLogResponse = serde_json::from_value(v).unwrap();
-        assert_eq!(back.entries, [e]);
+        assert_eq!(back.entries, std::slice::from_ref(&e));
+
+        // A land that named itself carries its id and changeset.
+        let land = RefLogEntry {
+            operation: "land".into(),
+            message: None,
+            new: Some(id),
+            land_id: Some("00112233445566778899aabbccddeeff".parse().unwrap()),
+            land_changeset: Some(id),
+            ..e
+        };
+        let v = serde_json::to_value(&land).unwrap();
+        assert_eq!(v["land_id"], "00112233445566778899aabbccddeeff");
+        assert_eq!(v["land_changeset"], id.to_string());
+        assert_eq!(serde_json::from_value::<RefLogEntry>(v).unwrap(), land);
+    }
+
+    #[test]
+    fn request_ids_are_a_safe_charset_up_to_128_bytes() {
+        for ok in ["a", "0123-abc_DEF.x", "run:7/step.2", &"x".repeat(128)] {
+            assert!(valid_request_id(ok), "{ok:?}");
+        }
+        for bad in [
+            "",
+            " ",
+            "with space",
+            "x status=200 route=/v1/land",
+            "q\"uote",
+            "a=b",
+            &"x".repeat(129),
+            "tab\there",
+            "new\nline",
+            "caf\u{e9}",
+            "\u{7f}",
+        ] {
+            assert!(!valid_request_id(bad), "{bad:?}");
+        }
     }
 
     #[test]
@@ -1025,6 +1261,7 @@ mod tests {
             error: "ambiguous".into(),
             candidates: vec![id],
             truncated: false,
+            code: None,
         };
         let v = serde_json::to_value(&amb).unwrap();
         assert_eq!(
@@ -1247,17 +1484,31 @@ mod tests {
                 behind: 5210,
                 retry_after_ms: 4000,
             }),
+            code: Some(error_code::INDEXING.into()),
+            request_id: None,
         };
         assert_eq!(
             serde_json::to_value(&err).unwrap(),
             serde_json::json!({
                 "error": "indexing: ...",
-                "indexing": { "kind": "history-tree-v4", "behind": 5210, "retry_after_ms": 4000 }
+                "indexing": { "kind": "history-tree-v4", "behind": 5210, "retry_after_ms": 4000 },
+                "code": "indexing"
             })
+        );
+        let mut with_id = ErrorResponse::new("x").with_code(error_code::NOT_FOUND);
+        with_id.request_id = Some("r-1".into());
+        assert_eq!(
+            serde_json::to_value(&with_id).unwrap(),
+            serde_json::json!({ "error": "x", "code": "not_found", "request_id": "r-1" })
         );
         let old: ErrorResponse =
             serde_json::from_value(serde_json::json!({ "error": "e" })).unwrap();
         assert_eq!(old.indexing, None);
+        assert_eq!(old.code, None);
+        assert_eq!(
+            serde_json::to_value(ErrorResponse::new("x").with_code(error_code::CAS_LOST)).unwrap(),
+            serde_json::json!({ "error": "x", "code": "cas_lost" })
+        );
         let stats = SearchStats::default();
         assert!(serde_json::to_value(&stats)
             .unwrap()

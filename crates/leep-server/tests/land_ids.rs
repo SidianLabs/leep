@@ -6,14 +6,18 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use axum::body::Body;
+use axum::http::Request;
 use bytes::Bytes;
-use leep_core::api::LandResponse;
+use http_body_util::BodyExt;
+use leep_core::api::{LandResponse, RefLogResponse};
 use leep_core::memory::{MemoryBlobStore, MemoryMetaStore};
 use leep_core::{
     BlobStore, Changeset, ChangesetId, Error, FileChange, FileKind, LandId, MetaStore, RepoPath,
 };
 use leep_derive::Repo;
 use leep_meta::{PostgresMetaStore, SqliteMetaStore};
+use tower::ServiceExt;
 
 /// Above `land`'s landed-copy scan (1024 changesets).
 const INTERVENING: usize = 1100;
@@ -63,6 +67,12 @@ async fn land_ids(meta: Arc<dyn MetaStore>) {
         .unwrap();
     let copy = landed(&first);
     assert_ne!(copy, feature, "rebased onto other");
+    // The log entry names the land and the changeset it asked for.
+    let newest = meta.ref_log(Some("main"), None, 1).await.unwrap().remove(0);
+    assert_eq!(
+        (newest.new, newest.land_id.as_ref(), newest.land_changeset),
+        (Some(copy), Some(&id), Some(feature))
+    );
 
     let mut head = copy;
     for i in 0..INTERVENING {
@@ -105,10 +115,31 @@ async fn land_ids(meta: Arc<dyn MetaStore>) {
 
     // Ids are per ref: the same id lands on another ref.
     let on_dev = r
-        .land_keyed(stranger, "dev", None, true, Some(id))
+        .land_keyed(stranger, "dev", None, true, Some(id.clone()))
         .await
         .unwrap();
     assert_eq!(landed(&on_dev), stranger);
+
+    // `GET /v1/reflog` carries them; moves without an id omit both fields.
+    let resp = leep_server::router(server())
+        .oneshot(Request::get("/v1/reflog/dev").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let entry = &json["entries"][0];
+    assert_eq!(entry["land_id"], id.to_string());
+    assert_eq!(entry["land_changeset"], stranger.to_string());
+    let log: RefLogResponse = serde_json::from_slice(&body).unwrap();
+    assert_eq!(log.entries[0].land_id, Some(id));
+    let base_entry = meta.ref_log(Some("main"), None, usize::MAX).await.unwrap();
+    let base_entry = base_entry.last().unwrap();
+    assert_eq!(
+        (base_entry.land_id.as_ref(), base_entry.land_changeset),
+        (None, None)
+    );
+    let v = serde_json::to_value(base_entry).unwrap();
+    assert!(v.get("land_id").is_none() && v.get("land_changeset").is_none());
 
     // The same land sent at once through several servers lands once, and
     // every request is answered with that one copy.

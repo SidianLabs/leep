@@ -109,6 +109,20 @@ pub struct CliError {
     candidates: Vec<String>,
     /// When the server said to retry (an indexing 503).
     retry_after_ms: Option<u64>,
+    /// What the server said about a failed request; boxed so `Result`s
+    /// stay small.
+    origin: Option<Box<Origin>>,
+}
+
+/// The server-side names of a failed request.
+#[derive(Debug, Default)]
+struct Origin {
+    /// The server's `code` for the error (`leep_core::api::error_code`);
+    /// none from older servers.
+    server_code: Option<String>,
+    /// The `X-Request-Id` of the request that failed: the server's echo, or
+    /// what the client sent. Names the server's log line for it.
+    request_id: Option<String>,
 }
 
 pub type Result<T, E = CliError> = std::result::Result<T, E>;
@@ -122,6 +136,39 @@ impl CliError {
             retryable: kind.retryable_by_default(),
             candidates: Vec::new(),
             retry_after_ms: None,
+            origin: None,
+        }
+    }
+
+    fn origin_mut(&mut self) -> &mut Origin {
+        self.origin.get_or_insert_with(Box::default)
+    }
+
+    pub fn with_request_id(mut self, id: Option<String>) -> Self {
+        self.origin_mut().request_id = id;
+        self
+    }
+
+    pub fn request_id(&self) -> Option<&str> {
+        self.origin.as_ref()?.request_id.as_deref()
+    }
+
+    pub fn with_server_code(mut self, code: Option<String>) -> Self {
+        self.origin_mut().server_code = code;
+        self
+    }
+
+    pub fn server_code(&self) -> Option<&str> {
+        self.origin.as_ref()?.server_code.as_deref()
+    }
+
+    /// Whether the server refused for the reason `code` names. A server that
+    /// sends codes is asked by code; an older one by the stable `marker`
+    /// text its message carries for that reason.
+    pub fn is_server(&self, code: &str, marker: &str) -> bool {
+        match self.server_code() {
+            Some(c) => c == code,
+            None => self.message.contains(marker),
         }
     }
 
@@ -208,7 +255,8 @@ impl CliError {
     }
 
     /// The `--json` form: `{"error":{"code","message","hint","retryable"}}`,
-    /// plus `candidates` for an ambiguous short id.
+    /// plus `candidates` for an ambiguous short id, `server_code` when the
+    /// server named the error and `request_id` when a request failed.
     pub fn to_json(&self) -> serde_json::Value {
         let mut e = serde_json::json!({
             "code": self.kind.code(),
@@ -222,12 +270,19 @@ impl CliError {
         if let Some(ms) = self.retry_after_ms {
             e["retry_after_ms"] = serde_json::json!(ms);
         }
+        if let Some(c) = self.server_code() {
+            e["server_code"] = serde_json::json!(c);
+        }
+        if let Some(id) = self.request_id() {
+            e["request_id"] = serde_json::json!(id);
+        }
         serde_json::json!({ "error": e })
     }
 
     /// Print `leep: message` plus any candidates and hint on stderr, and
     /// with `json` also the [`to_json`](Self::to_json) document on stdout,
-    /// where agents read results (ADR 0034).
+    /// where agents read results (ADR 0034). The last line names the request
+    /// id, for a bug report to quote.
     pub fn report(&self, json: bool) {
         if json {
             println!("{}", self.to_json());
@@ -238,6 +293,9 @@ impl CliError {
         }
         if let Some(h) = &self.hint {
             eprintln!("hint: {h}");
+        }
+        if let Some(id) = self.request_id() {
+            eprintln!("request id: {id}");
         }
     }
 }
@@ -328,5 +386,25 @@ mod tests {
         assert!(CliError::user("m").to_json()["error"]
             .get("retry_after_ms")
             .is_none());
+        assert!(CliError::user("m").to_json()["error"]
+            .get("server_code")
+            .is_none());
+        let e = CliError::user("m").with_server_code(Some("not_signed".into()));
+        assert_eq!(e.to_json()["error"]["server_code"], "not_signed");
+        assert!(e.to_json()["error"].get("request_id").is_none());
+        let e = e.with_request_id(Some("r1".into()));
+        assert_eq!(e.to_json()["error"]["request_id"], "r1");
+    }
+
+    #[test]
+    fn server_reasons_go_by_code_then_by_marker() {
+        let new = CliError::user("changeset x needs review")
+            .with_server_code(Some("needs_review".into()));
+        assert!(new.is_server("needs_review", "needs review"));
+        assert!(!new.is_server("not_signed", "needs review"));
+        // An older server sends no code: the marker decides.
+        let old = CliError::user("changeset x needs review");
+        assert!(old.is_server("needs_review", "needs review"));
+        assert!(!old.is_server("not_signed", "is not signed"));
     }
 }

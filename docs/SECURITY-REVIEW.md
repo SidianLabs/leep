@@ -28,7 +28,7 @@ Report new problems as described in [SECURITY.md](../SECURITY.md).
 | Actor | Can | Must not be able to |
 |---|---|---|
 | Holder of a `read` token | every `GET`, `POST /v1/blobs/missing` | write refs, reviews, signatures or changesets; deny service to others beyond its limits |
-| Holder of a `write` token who is not an owner, reviewer or signer | create changesets, land on unprotected refs, review as itself | land on a protected ref without the policy passing; delete or rewrite protected history unnoticed; crash the server |
+| Holder of a `write` token who is not an owner, reviewer or signer | create changesets, land on unprotected refs, and move or delete any unprotected ref (the ref log records it; `--protect-ref` makes a ref forward-only and undeletable without a policy, S-19), review as itself | land on a protected ref without the policy passing; delete or rewrite protected history unnoticed; crash the server |
 | Malicious client | send any request body, path, header or ref name | the same as its token's role |
 | Malicious repository content author | put any file contents, paths, `OWNERS` files and ref names into history | get code past review as a "comment" or "merge"; make a checkout write outside the working copy |
 | Malicious or compromised server (for the CLI) | answer anything | make the CLI write outside the working copy or into `.leep` or `.git` |
@@ -63,6 +63,7 @@ change with a regression test.
 | S-16 | Auth | Info | No issue found; the metrics listener shows token names | Note in ADR 0007 |
 | S-17 | Signing | Info | No issue found | Note in ADR 0010 |
 | S-18 | Refs | Info | No issue found in name validation, tag immutability, protected delete or ref log attribution | — |
+| S-19 | Refs | Medium | Refs no signature or review policy names could be rewound or deleted by any writer, so `main` was unprotected on most servers | Fixed 2026-10-21, `--protect-ref`, ADR 0015 |
 | S-20 | Resource use | Medium | Request bodies were read whole into memory with one 512 MiB cap per request and no bound on bodies in flight; a statement of a timed-out request ran on in Postgres | Fixed 2026-10-21, per-route caps, in-flight budget, statement timeout, ADR 0020 and 0012 |
 
 ### S-01: merge-parent laundering (High, fixed)
@@ -312,6 +313,21 @@ closes the gap. Recorded in ADR 0011.
   world readable.
 
 ## Follow-up, 2026-10-21
+
+### S-19: refs unprotected without a policy (Medium, fixed)
+
+Forward-only and no-delete (S-09, ADR 0015) applied only to refs a signature or
+review policy covered. A server that requires neither, which is most of them,
+let any write token reset `main` to an old changeset or delete it with one raw
+compare-and-swap; the ref log recorded it but nothing refused it.
+
+*Fix.* `--protect-ref REF` (`LEEP_PROTECT_REFS`) covers a ref with a land policy
+that checks nothing else (`ProtectOnly`), composed with the other policies, so
+the existing rules apply through the same `cas_ref_checked` path and `land` is
+unchanged. It composes with `--require-review` and `--require-signatures` (all
+apply), protects tags by exact name too (a protected tag cannot be deleted and
+recreated elsewhere, narrowing S-12), and, like the other policy flags, is read
+at startup only. Tests: `crates/leep-server/tests/protect.rs`.
 
 ### S-20: request body memory and orphaned statements (Medium, fixed)
 
