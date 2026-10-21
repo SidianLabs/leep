@@ -73,6 +73,19 @@ struct Args {
     /// many observed heads behind the newest (uniform), so it is replayed.
     #[arg(long, default_value_t = 4)]
     stale: usize,
+    /// Time-based stale base, in ms: a change is made on the head this run
+    /// observed a uniform 0..=stale-ms ago, modelling an agent that synced,
+    /// worked for minutes, then landed. Overrides `--stale` when set.
+    #[arg(long)]
+    stale_ms: Option<u64>,
+    /// Drop search from the read mix.
+    #[arg(long)]
+    no_search: bool,
+    /// After a land answered `conflicts`, resolve (keep this agent's
+    /// version of every file) on the conflicting head and land again, up to
+    /// this many times per logical land. 0 gives up at the first conflict.
+    #[arg(long, default_value_t = 0)]
+    reland_max: u32,
     /// Send a land id with every land (ADR 0057) and resend under it after
     /// errors; `false` resends without one, as old clients do.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
@@ -159,28 +172,46 @@ fn parse_mix(s: &str) -> Result<Vec<(Read, u32)>> {
     Ok(out)
 }
 
-/// Heads seen lately, newest last; bases are picked from here.
+/// Heads seen lately with when they were first seen, newest last; bases are
+/// picked from here. Large enough to hold minutes of heads at hundreds of
+/// lands a second, for `--stale-ms`.
 struct Heads {
-    ring: Mutex<VecDeque<ChangesetId>>,
+    ring: Mutex<VecDeque<(Instant, ChangesetId)>>,
 }
+
+const HEADS_KEPT: usize = 1 << 17;
 
 impl Heads {
     fn push(&self, id: ChangesetId) {
         let mut r = self.ring.lock().unwrap();
-        if r.back() != Some(&id) {
-            r.push_back(id);
-            if r.len() > 4096 {
+        if r.back().map(|e| e.1) != Some(id) {
+            r.push_back((Instant::now(), id));
+            if r.len() > HEADS_KEPT {
                 r.pop_front();
             }
         }
     }
     fn newest(&self) -> Option<ChangesetId> {
-        self.ring.lock().unwrap().back().copied()
+        self.ring.lock().unwrap().back().map(|e| e.1)
     }
     fn back(&self, d: usize) -> Option<ChangesetId> {
         let r = self.ring.lock().unwrap();
         let i = r.len().checked_sub(1 + d.min(r.len().saturating_sub(1)))?;
-        r.get(i).copied()
+        r.get(i).map(|e| e.1)
+    }
+    /// The newest head first seen at least `age` ago, else the oldest kept.
+    fn aged(&self, age: Duration) -> Option<ChangesetId> {
+        let r = self.ring.lock().unwrap();
+        let Some(cutoff) = Instant::now().checked_sub(age) else {
+            return r.front().map(|e| e.1);
+        };
+        let i = r.partition_point(|e| e.0 <= cutoff);
+        r.get(i.saturating_sub(1)).map(|e| e.1)
+    }
+    /// The newest `n` heads, newest first.
+    fn newest_n(&self, n: usize) -> Vec<ChangesetId> {
+        let r = self.ring.lock().unwrap();
+        r.iter().rev().take(n).map(|e| e.1).collect()
     }
 }
 
@@ -218,6 +249,25 @@ struct Tally {
     answered_in_window: bool,
     /// Markers of lands answered `Landed`.
     landed: Vec<String>,
+    /// Logical lands (a change, through its re-lands after conflicts) whose
+    /// first land was sent inside the window, and what they took.
+    logical: LogicalTally,
+}
+
+#[derive(Default)]
+struct LogicalTally {
+    started: u64,
+    landed: u64,
+    /// Ended on a conflict after `--reland-max` re-lands, or at the stop.
+    gave_up: u64,
+    /// Ended without an answer (create failed, land refused or gave up).
+    failed: u64,
+    conflicts: u64,
+    relands: u64,
+    resends: u64,
+    status_409: u64,
+    /// Microseconds from the first land request to the `landed` answer.
+    time_to_landed: Vec<u64>,
 }
 
 impl Tally {
@@ -450,120 +500,167 @@ async fn agent(s: Arc<Shared>, who: usize, start_after: Duration) -> Tally {
         if upload_failed {
             continue;
         }
-        let d = if s.args.stale == 0 {
-            0
-        } else {
-            rng.below(s.args.stale + 1)
+        let mut base = match s.args.stale_ms {
+            Some(ms) if ms > 0 => {
+                let age = Duration::from_millis(rng.below(ms as usize + 1) as u64);
+                s.heads.aged(age).unwrap_or(head)
+            }
+            _ => {
+                let d = if s.args.stale == 0 {
+                    0
+                } else {
+                    rng.below(s.args.stale + 1)
+                };
+                s.heads.back(d).unwrap_or(head)
+            }
         };
-        let base = s.heads.back(d).unwrap_or(head);
         last_base = Some(base);
-        let cs = Changeset {
-            parents: vec![base],
-            author: format!("swarm-agent-{who}"),
-            timestamp: 1_700_000_000 + seq as i64,
-            message: marker.clone(),
-            changes,
-            extra: BTreeMap::new(),
-        };
-        let t0 = Instant::now();
-        let id = match s
-            .call::<CreateChangesetResponse>(
-                server,
-                Method::POST,
-                "/v1/changesets",
-                Some(serde_json::to_vec(&cs).expect("encodes")),
-            )
-            .await
-        {
-            Answer::Ok(r) => r.id,
-            Answer::Status(c) => {
-                t.error(format!("create {c}"));
-                continue;
-            }
-            Answer::Lost(e) => {
-                t.error(format!("create {e}"));
-                continue;
-            }
-        };
-        t.time(measuring, "create", t0);
-
-        let land_id = s.args.land_id.then(|| {
-            let h = blake3::hash(marker.as_bytes());
-            LandId::from_bytes(&h.as_bytes()[..16]).expect("16 bytes")
-        });
-        if land_id.is_some() {
-            s.land_ids_sent.fetch_add(1, Ordering::Relaxed);
-        }
-        let req = serde_json::to_vec(&LandRequest {
-            changeset: id,
-            target_ref: target.clone(),
-            create: None,
-            land_id,
-        })
-        .expect("encodes");
-        if s.measuring.load(Ordering::Relaxed) && !s.stop.load(Ordering::Relaxed) {
-            t.sent_in_window = true;
-        }
-        let t0 = Instant::now();
-        let mut tries = 0;
-        let answer = loop {
-            tries += 1;
-            match s
-                .call::<LandResponse>(server, Method::POST, "/v1/land", Some(req.clone()))
+        // One logical land: create on `base`, land, and after a conflict
+        // resolve onto the conflicting head and land again.
+        let first_sent = Instant::now();
+        let logical_in_window =
+            s.measuring.load(Ordering::Relaxed) && !s.stop.load(Ordering::Relaxed);
+        let (mut relands, mut conflicts, mut resends, mut s409) = (0u32, 0u64, 0u64, 0u64);
+        // Some(true) landed, Some(false) gave up on a conflict, None failed.
+        let outcome: Option<bool> = loop {
+            let cs = Changeset {
+                parents: vec![base],
+                author: format!("swarm-agent-{who}"),
+                timestamp: 1_700_000_000 + seq as i64 + i64::from(relands),
+                message: marker.clone(),
+                changes: changes.clone(),
+                extra: BTreeMap::new(),
+            };
+            let t0 = Instant::now();
+            let id = match s
+                .call::<CreateChangesetResponse>(
+                    server,
+                    Method::POST,
+                    "/v1/changesets",
+                    Some(serde_json::to_vec(&cs).expect("encodes")),
+                )
                 .await
             {
-                Answer::Ok(r) => break Some(r),
-                Answer::Status(409) => {
-                    t.status_409 += 1;
-                    tokio::time::sleep(Duration::from_millis(20 + rng.below(80) as u64)).await;
-                }
-                // The land may have applied: send it again, as a client would.
-                Answer::Status(c) if c >= 500 || c == 408 => {
-                    t.error(format!("land {c}"));
-                    t.resends += 1;
-                    tokio::time::sleep(Duration::from_millis(200)).await;
-                }
-                Answer::Lost(e) => {
-                    t.error(format!("land {e}"));
-                    t.resends += 1;
-                    tokio::time::sleep(Duration::from_millis(200)).await;
-                }
+                Answer::Ok(r) => r.id,
                 Answer::Status(c) => {
-                    t.error(format!("land {c}"));
+                    t.error(format!("create {c}"));
                     break None;
                 }
+                Answer::Lost(e) => {
+                    t.error(format!("create {e}"));
+                    break None;
+                }
+            };
+            t.time(measuring, "create", t0);
+
+            let land_id = s.args.land_id.then(|| {
+                let h = blake3::hash(format!("{marker} r{relands}").as_bytes());
+                LandId::from_bytes(&h.as_bytes()[..16]).expect("16 bytes")
+            });
+            if land_id.is_some() {
+                s.land_ids_sent.fetch_add(1, Ordering::Relaxed);
             }
-            if tries >= 50 {
-                t.error("land gave up");
-                break None;
+            let req = serde_json::to_vec(&LandRequest {
+                changeset: id,
+                target_ref: target.clone(),
+                create: None,
+                land_id,
+            })
+            .expect("encodes");
+            if s.measuring.load(Ordering::Relaxed) && !s.stop.load(Ordering::Relaxed) {
+                t.sent_in_window = true;
+            }
+            let t0 = Instant::now();
+            let mut tries = 0;
+            let answer = loop {
+                tries += 1;
+                match s
+                    .call::<LandResponse>(server, Method::POST, "/v1/land", Some(req.clone()))
+                    .await
+                {
+                    Answer::Ok(r) => break Some(r),
+                    Answer::Status(409) => {
+                        t.status_409 += 1;
+                        s409 += 1;
+                        tokio::time::sleep(Duration::from_millis(20 + rng.below(80) as u64)).await;
+                    }
+                    // The land may have applied: send it again, as a client would.
+                    Answer::Status(c) if c >= 500 || c == 408 => {
+                        t.error(format!("land {c}"));
+                        t.resends += 1;
+                        resends += 1;
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                    }
+                    Answer::Lost(e) => {
+                        t.error(format!("land {e}"));
+                        t.resends += 1;
+                        resends += 1;
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                    }
+                    Answer::Status(c) => {
+                        t.error(format!("land {c}"));
+                        break None;
+                    }
+                }
+                if tries >= 50 {
+                    t.error("land gave up");
+                    break None;
+                }
+            };
+            let in_window = s.measuring.load(Ordering::Relaxed) && !s.stop.load(Ordering::Relaxed);
+            if measuring || in_window {
+                t.time(true, "land", t0);
+            }
+            match answer {
+                Some(LandResponse::Landed {
+                    landed, rebased, ..
+                }) => {
+                    s.heads.push(landed);
+                    t.landed.push(marker.clone());
+                    t.rebased += u64::from(rebased);
+                    if in_window {
+                        t.lands_in_window += 1;
+                        t.answered_in_window = true;
+                    } else {
+                        t.landed_after += 1;
+                    }
+                    break Some(true);
+                }
+                Some(LandResponse::Conflicts { onto, .. }) => {
+                    s.heads.push(onto);
+                    t.conflicts += 1;
+                    conflicts += 1;
+                    if in_window {
+                        t.answered_in_window = true;
+                    }
+                    if relands >= s.args.reland_max || s.stop.load(Ordering::Relaxed) {
+                        break Some(false);
+                    }
+                    // Resolved by keeping this agent's files, on the head
+                    // the conflict was found against.
+                    relands += 1;
+                    base = onto;
+                    last_base = Some(base);
+                }
+                None => break None,
             }
         };
-        let in_window = s.measuring.load(Ordering::Relaxed) && !s.stop.load(Ordering::Relaxed);
-        if measuring || in_window {
-            t.time(true, "land", t0);
-        }
-        match answer {
-            Some(LandResponse::Landed {
-                landed, rebased, ..
-            }) => {
-                s.heads.push(landed);
-                t.landed.push(marker);
-                t.rebased += u64::from(rebased);
-                if in_window {
-                    t.lands_in_window += 1;
-                    t.answered_in_window = true;
-                } else {
-                    t.landed_after += 1;
+        if logical_in_window {
+            let l = &mut t.logical;
+            l.started += 1;
+            l.conflicts += conflicts;
+            l.relands += u64::from(relands);
+            l.resends += resends;
+            l.status_409 += s409;
+            match outcome {
+                Some(true) => {
+                    l.landed += 1;
+                    l.time_to_landed
+                        .push(first_sent.elapsed().as_micros() as u64);
                 }
+                Some(false) => l.gave_up += 1,
+                None => l.failed += 1,
             }
-            Some(LandResponse::Conflicts { onto, .. }) => {
-                s.heads.push(onto);
-                t.conflicts += 1;
-                if in_window {
-                    t.answered_in_window = true;
-                }
-            }
-            None => {}
         }
     }
     t
@@ -616,10 +713,7 @@ async fn lag_sample(
         bail!("reading the ref");
     };
     let head = r.target.context("no head")?;
-    let ring: Vec<ChangesetId> = {
-        let r = s.heads.ring.lock().unwrap();
-        r.iter().rev().copied().collect()
-    };
+    let ring = s.heads.newest_n(4096);
     let keys: Vec<Vec<u8>> = ring.iter().map(|id| id.0.as_bytes().to_vec()).collect();
     let head_gen = generation(s, head, generations).await?;
     let mut out = [0u64; 2];
@@ -862,6 +956,28 @@ struct Report {
     write_bytes_per_land: Option<f64>,
     index_bytes_per_land: Option<f64>,
     load_average: String,
+    stale: String,
+    no_search: bool,
+    reland_max: u32,
+    logical: LogicalReport,
+}
+
+/// Logical lands whose first land was sent inside the window; ratios are
+/// per logical land that landed.
+#[derive(Serialize)]
+struct LogicalReport {
+    started: u64,
+    landed: u64,
+    gave_up: u64,
+    failed: u64,
+    conflicts: u64,
+    relands: u64,
+    resends: u64,
+    status_409: u64,
+    conflicts_per_land: Option<f64>,
+    relands_resends_per_land: Option<f64>,
+    time_to_landed_p50_ms: f64,
+    time_to_landed_p99_ms: f64,
 }
 
 fn lag_summary(v: &mut [u64]) -> Option<(u64, u64)> {
@@ -893,7 +1009,10 @@ async fn main() -> Result<()> {
             .iter()
             .map(|s| s.trim_end_matches('/').to_string())
             .collect(),
-        mix: parse_mix(&args.read_mix)?,
+        mix: parse_mix(&args.read_mix)?
+            .into_iter()
+            .filter(|m| !(args.no_search && m.0 == Read::Search))
+            .collect(),
         args: args.clone(),
         run,
         client: client.clone(),
@@ -974,7 +1093,34 @@ async fn main() -> Result<()> {
         tally.resends += a.resends;
         tally.rebased += a.rebased;
         tally.landed.extend(a.landed);
+        let (l, m) = (&mut tally.logical, a.logical);
+        l.started += m.started;
+        l.landed += m.landed;
+        l.gave_up += m.gave_up;
+        l.failed += m.failed;
+        l.conflicts += m.conflicts;
+        l.relands += m.relands;
+        l.resends += m.resends;
+        l.status_409 += m.status_409;
+        l.time_to_landed.extend(m.time_to_landed);
     }
+    tally.logical.time_to_landed.sort_unstable();
+    let lg = &tally.logical;
+    let per = |n: u64| (lg.landed > 0).then(|| n as f64 / lg.landed as f64);
+    let logical = LogicalReport {
+        started: lg.started,
+        landed: lg.landed,
+        gave_up: lg.gave_up,
+        failed: lg.failed,
+        conflicts: lg.conflicts,
+        relands: lg.relands,
+        resends: lg.resends,
+        status_409: lg.status_409,
+        conflicts_per_land: per(lg.conflicts),
+        relands_resends_per_land: per(lg.relands + lg.resends),
+        time_to_landed_p50_ms: pct(&lg.time_to_landed, 0.5),
+        time_to_landed_p99_ms: pct(&lg.time_to_landed, 0.99),
+    };
     if let Some(t) = lag_task {
         t.await?;
     }
@@ -1047,6 +1193,13 @@ async fn main() -> Result<()> {
         load_average: std::fs::read_to_string("/proc/loadavg")
             .map(|l| l.split_whitespace().take(3).collect::<Vec<_>>().join(" "))
             .unwrap_or_default(),
+        stale: match args.stale_ms {
+            Some(ms) if ms > 0 => format!("{ms} ms"),
+            _ => format!("{} heads", args.stale),
+        },
+        no_search: args.no_search,
+        reland_max: args.reland_max,
+        logical,
     };
     print_report(&report);
     if let Some(p) = &args.json {
@@ -1109,6 +1262,33 @@ fn print_report(r: &Report) {
         r.db_bytes_per_land.map_or("-".into(), |b| format!("{b:.0}")),
         r.write_bytes_per_land.map_or("-".into(), |b| format!("{b:.0}")),
         r.index_bytes_per_land.map_or("-".into(), |b| format!("{b:.0}")),
+    );
+    let l = &r.logical;
+    let ratio = |v: Option<f64>| v.map_or("-".into(), |v| format!("{v:.3}"));
+    println!(
+        "logical lands (first sent in window) | stale {} | search {} | reland max {}",
+        r.stale,
+        if r.no_search { "off" } else { "on" },
+        r.reland_max
+    );
+    println!(
+        "| started | landed | gave up | failed | conflicts | relands | resends | 409s | conflicts/land | (relands+resends)/land | time-to-landed p50 ms | p99 ms |"
+    );
+    println!("|---|---|---|---|---|---|---|---|---|---|---|---|");
+    println!(
+        "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {:.1} | {:.1} |",
+        l.started,
+        l.landed,
+        l.gave_up,
+        l.failed,
+        l.conflicts,
+        l.relands,
+        l.resends,
+        l.status_409,
+        ratio(l.conflicts_per_land),
+        ratio(l.relands_resends_per_land),
+        l.time_to_landed_p50_ms,
+        l.time_to_landed_p99_ms,
     );
     println!("| op | count | p50 ms | p99 ms |");
     println!("|---|---|---|---|");
