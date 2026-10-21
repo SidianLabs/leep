@@ -20,7 +20,7 @@ pub const BLOB_KIND: &str = "blob-trigrams-v1";
 pub const TREE_KIND: &str = "tree-trigrams-v1";
 
 /// Bytes a cached filter costs beyond its own: the map entry (key, `Arc`,
-/// size), the `Arc`'s counts and the `Bytes` handle.
+/// size; about 48) plus the `Arc`'s counts and the `Bytes` handle (about 48).
 pub(super) const CACHE_ENTRY_OVERHEAD: usize = 96;
 
 /// Row lookups and blob fetches in flight at once.

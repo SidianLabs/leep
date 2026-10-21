@@ -158,11 +158,11 @@ impl Gate {
                 Expr::True => g.need.push(u32::MAX),
                 Expr::Tri(t) => {
                     g.need.push(1);
-                    let i = probe
-                        .codes()
-                        .binary_search(t)
-                        .expect("the probe holds every trigram of the expression");
-                    g.leaves[i].push(id);
+                    // An unprobed code stays present, as in `Present::has`:
+                    // its leaf is never told it is absent.
+                    if let Ok(i) = probe.codes().binary_search(t) {
+                        g.leaves[i].push(id);
+                    }
                 }
                 Expr::And(v) => {
                     g.need.push(if v.is_empty() { u32::MAX } else { 1 });

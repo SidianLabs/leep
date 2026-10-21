@@ -722,7 +722,10 @@ async fn search_rows_are_recomputed_from_blobs_and_trees() {
     // (OPERATIONS.md, "Repair"); a fresh handle sees the repaired row.
     assert!(w.repo.search(w.tip(), &q).await.unwrap().matches.is_empty());
     let restarted = Repo::new(w.repo.blobs().clone(), w.repo.meta().clone());
-    assert_eq!(restarted.search(w.tip(), &q).await.unwrap().matches.len(), 1);
+    assert_eq!(
+        restarted.search(w.tip(), &q).await.unwrap().matches.len(),
+        1
+    );
     assert_clean(&w).await;
 }
 
