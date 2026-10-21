@@ -1107,6 +1107,10 @@ lowered to it, and 0 or a non-number is 400 `invalid`. `files` and diff
 each one is on the page that holds its `to` entry, so concatenated pages
 (entries, renames, and `renames_truncated`, which every page repeats) equal
 the unpaged answer.
+Each such page therefore costs a full walk and rename detection of the
+whole diff, so paging a renames diff of N pages costs about N unpaged
+requests; the CLI and MCP server ask for renames diffs without `limit`, and
+paging them is for UIs that want the first page early.
 
 The server treats a cursor as untrusted: it checks the length before
 decoding, then the version, kind and fingerprint, decodes the body strictly

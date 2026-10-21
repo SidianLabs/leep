@@ -20,6 +20,13 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   `merge`, `stash` and every other caller) in pages of 10,000, so no one
   response is unbounded. Against an older server they get one full answer,
   as before.
+- A page that would end at a path too long for a cursor is 400 with the new
+  error code `cursor_unrepresentable`; the CLI and MCP server then fetch the
+  whole list in one request, so repositories with very long paths still
+  check out, diff, merge and stash.
+- Diffs with rename detection (`leep diff --renames`) stay one request:
+  the server detects renames over the whole diff for every page, so paging
+  them would repeat that work.
 
 ### Land conflicts name only stored blobs
 - A land answered with conflicts now stores the merged text its `clean`

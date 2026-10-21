@@ -504,12 +504,18 @@ impl Repo {
             }
             Some(opts) => {
                 let all = self.diff_trees(from_tree, to_tree, prefix).await?;
-                let found = self.detect_renames(&all, opts).await?;
-                let page = all
-                    .into_iter()
+                let page: Vec<DiffEntry> = all
+                    .iter()
                     .filter(|e| after.as_deref().is_none_or(|a| e.path.as_str() > a))
                     .take(want)
+                    .cloned()
                     .collect();
+                // A page past the end has no renames to keep.
+                let found = if page.is_empty() {
+                    Detected::default()
+                } else {
+                    self.detect_renames(&all, opts).await?
+                };
                 (page, found)
             }
         };

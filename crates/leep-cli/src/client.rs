@@ -243,19 +243,33 @@ fn page_params(limit: Option<usize>, after: Option<&str>) -> Vec<(&'static str, 
     out
 }
 
-/// Every item of a paged list: `fetch` gets the previous page's `next` and
-/// answers a page's items and its `next`. A server that predates paging
-/// sends everything and no `next`, so that is one request.
-fn all_pages<T>(
-    mut fetch: impl FnMut(Option<&str>) -> Result<(Vec<T>, Option<String>)>,
-) -> Result<Vec<T>> {
-    let (mut out, mut next) = fetch(None)?;
-    while let Some(after) = next {
-        let (items, n) = fetch(Some(&after))?;
-        out.extend(items);
-        next = n;
+/// Every page of a paged list. `fetch` gets a `limit` and the previous
+/// page's `next` and answers that page; `next_of` reads its cursor. A server
+/// that predates paging sends everything and no `next`, so that is one
+/// request. A page that would end at a path too long for a cursor
+/// (`cursor_unrepresentable`) cannot be paged past, so the list is asked
+/// for once more without `limit` and that whole answer is used instead.
+fn all_pages<P>(
+    mut fetch: impl FnMut(Option<usize>, Option<&str>) -> Result<P>,
+    next_of: impl Fn(&P) -> Option<String>,
+) -> Result<Vec<P>> {
+    let mut pages = Vec::new();
+    let mut after: Option<String> = None;
+    loop {
+        match fetch(Some(MAX_PATHS_LIMIT), after.as_deref()) {
+            Ok(p) => {
+                after = next_of(&p);
+                pages.push(p);
+                if after.is_none() {
+                    return Ok(pages);
+                }
+            }
+            Err(e) if e.server_code() == Some(error_code::CURSOR_UNREPRESENTABLE) => {
+                return Ok(vec![fetch(None, None)?]);
+            }
+            Err(e) => return Err(e),
+        }
     }
-    Ok(out)
 }
 
 fn add_stats(total: &mut SearchStats, page: &SearchStats) {
@@ -669,10 +683,11 @@ impl Client {
     /// Fetched in pages of [`MAX_PATHS_LIMIT`] paths, so no one answer is
     /// unbounded; a server without paging answers everything at once.
     pub fn files(&self, id: &ChangesetId, prefix: &str) -> Result<FilesResponse> {
-        let files = all_pages(|after| {
-            let p = self.files_page(id, prefix, Some(MAX_PATHS_LIMIT), after)?;
-            Ok((p.files, p.next))
-        })?;
+        let pages = all_pages(
+            |limit, after| self.files_page(id, prefix, limit, after),
+            |p| p.next.clone(),
+        )?;
+        let files = pages.into_iter().flat_map(|p| p.files).collect();
         Ok(FilesResponse { files, next: None })
     }
 
@@ -841,11 +856,17 @@ impl Client {
         to: &ChangesetId,
         prefix: Option<&str>,
     ) -> Result<DiffResponse> {
-        self.diff_all(from, to, prefix, None)
+        self.diff_all(from, to, prefix)
     }
 
     /// [`Client::diff`] asking the server to detect renames. `threshold` is
     /// 0 to 100; `None` leaves the server's default of 50.
+    ///
+    /// One request without `limit`, not pages: pairing needs the whole
+    /// diff, so the server walks and pairs all of it for every page, and
+    /// paging a large diff would repeat that work once per page.
+    /// [`Client::diff_page`] still pages it for a caller that wants one
+    /// page at a time.
     pub fn diff_renames(
         &self,
         from: Option<&ChangesetId>,
@@ -853,30 +874,24 @@ impl Client {
         prefix: Option<&str>,
         threshold: Option<u8>,
     ) -> Result<DiffResponse> {
-        self.diff_all(from, to, prefix, Some(threshold))
+        self.diff_page(from, to, prefix, Some(threshold), None, None)
     }
 
-    /// Every page of a diff. Renames are detected over the whole diff on
-    /// each page, and each comes with its `to` entry, so concatenated pages
-    /// are the unpaged answer.
+    /// Every page of a diff without renames.
     fn diff_all(
         &self,
         from: Option<&ChangesetId>,
         to: &ChangesetId,
         prefix: Option<&str>,
-        renames: Option<Option<u8>>,
     ) -> Result<DiffResponse> {
-        let (mut found, mut truncated) = (Vec::new(), false);
-        let entries = all_pages(|after| {
-            let p = self.diff_page(from, to, prefix, renames, Some(MAX_PATHS_LIMIT), after)?;
-            found.extend(p.renames);
-            truncated |= p.renames_truncated;
-            Ok((p.entries, p.next))
-        })?;
+        let pages = all_pages(
+            |limit, after| self.diff_page(from, to, prefix, None, limit, after),
+            |p| p.next.clone(),
+        )?;
         Ok(DiffResponse {
-            entries,
-            renames: found,
-            renames_truncated: truncated,
+            entries: pages.into_iter().flat_map(|p| p.entries).collect(),
+            renames: Vec::new(),
+            renames_truncated: false,
             next: None,
         })
     }
