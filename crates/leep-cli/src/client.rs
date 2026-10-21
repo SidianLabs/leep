@@ -8,7 +8,10 @@
 //!
 //! A 429 from the server's request limits (ADR 0020) is retried for GET
 //! requests only, honoring `Retry-After`; anything else fails at once, since a
-//! blind retry of a write could repeat it.
+//! blind retry of a write could repeat it. So is a 503 that carries
+//! `Leep-Refused` (an expensive read refused before any work, ADR 0060),
+//! with up to 50% random jitter added to each wait so refused clients do not
+//! return together.
 //!
 //! Index-backed queries (log, last-change, blame, search) send
 //! `Leep-Indexing: retry` (ADR 0058): a server whose index lags answers 503
@@ -29,7 +32,7 @@ use serde::de::DeserializeOwned;
 
 use crate::error::{CliError, ErrorKind, Result};
 
-/// Tries per GET before a 429 is reported.
+/// Tries per GET before a 429, or a 503 with `Leep-Refused`, is reported.
 const MAX_ATTEMPTS: u32 = 4;
 /// Times a land with a land id is sent again after an answer that may not
 /// have been the server's last word (ADR 0057).
@@ -57,6 +60,9 @@ pub struct Client {
     /// How long, and how many times, index-backed queries retry an
     /// indexing 503: `LEEP_INDEX_WAIT` and unlimited unless set.
     index_retry: Option<(Duration, u32)>,
+    /// Whether a GET refused with `Leep-Refused` is retried here, sleeping
+    /// between tries, or reported at once.
+    refusal_retries: bool,
 }
 
 /// How long index-backed queries keep retrying an indexing 503, unless
@@ -322,7 +328,17 @@ impl Client {
             request_id: Arc::new(Mutex::new(invocation_request_id().to_string())),
             stale_ok: false,
             index_retry: None,
+            refusal_retries: true,
         }
+    }
+
+    /// Report a GET the server refused before doing any work (`503` with
+    /// `Leep-Refused`, ADR 0060) at once instead of waiting and trying
+    /// again: for a caller that must not sleep, such as the MCP server,
+    /// which hands the refusal and its `retry_after_ms` to the agent.
+    pub fn with_refusal_retries(mut self, yes: bool) -> Self {
+        self.refusal_retries = yes;
+        self
     }
 
     /// Retry an indexing 503 at most `retries` times within `within`.
@@ -421,6 +437,24 @@ impl Client {
                     (spare, retry_after(&resp).filter(|w| *w <= MAX_RETRY_WAIT))
                 {
                     std::thread::sleep(wait);
+                    attempt += 1;
+                    current = next;
+                    continue;
+                }
+                return Err(self.error_from(resp));
+            }
+            if status == StatusCode::SERVICE_UNAVAILABLE
+                && idempotent
+                && self.refusal_retries
+                && attempt < MAX_ATTEMPTS
+                && resp.headers().contains_key(REFUSED_HEADER)
+            {
+                // Refused before any work, so trying again is safe. A
+                // longer pause than MAX_RETRY_WAIT is reported, not waited.
+                if let (Some(next), Some(wait)) =
+                    (spare, retry_after(&resp).filter(|w| *w <= MAX_RETRY_WAIT))
+                {
+                    std::thread::sleep(jittered(wait));
                     attempt += 1;
                     current = next;
                     continue;
@@ -1015,6 +1049,17 @@ fn retry_after(resp: &Response) -> Option<Duration> {
     Some(Duration::from_secs(secs))
 }
 
+/// `wait` plus up to half of it again, at random, so clients refused at the
+/// same moment do not all come back at the same moment.
+fn jittered(wait: Duration) -> Duration {
+    let mut b = [0u8; 4];
+    let r = match getrandom::fill(&mut b) {
+        Ok(()) => f64::from(u32::from_le_bytes(b)) / f64::from(u32::MAX),
+        Err(_) => 0.5,
+    };
+    wait.mul_f64(1.0 + r / 2.0)
+}
+
 /// An answer that does not decode: a version mismatch or a broken proxy, so
 /// running the command again will not help.
 fn bad_response(e: reqwest::Error) -> CliError {
@@ -1085,6 +1130,16 @@ fn classify(resp: Response, has_token: bool) -> CliError {
     if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
         return classify_auth(status, resp, has_token);
     }
+    // Only a 503 promises with this header that nothing was done.
+    let refused = (status == StatusCode::SERVICE_UNAVAILABLE)
+        .then(|| resp.headers().get(REFUSED_HEADER))
+        .flatten()
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let refused_wait = refused
+        .as_ref()
+        .and_then(|_| retry_after(&resp))
+        .map(|w| w.as_millis() as u64);
     let body = resp.text().unwrap_or_default();
     if status == StatusCode::BAD_REQUEST {
         if let Ok(amb) = serde_json::from_str::<AmbiguousPrefixResponse>(&body) {
@@ -1145,10 +1200,22 @@ fn classify(resp: Response, has_token: bool) -> CliError {
         // Only concurrent updates answer 409 (a land that kept losing, a ref
         // that moved); content conflicts are a normal land answer.
         StatusCode::CONFLICT => CliError::lost_race(msg),
+        s if s.is_server_error() && refused.is_some() => {
+            let e = CliError::server(msg).with_hint(
+                "the server refused the request before doing anything because it is busy; \
+                 run the command again in a few seconds",
+            );
+            match refused_wait {
+                Some(ms) => e.with_retry_after_ms(ms),
+                None => e,
+            }
+        }
         s if s.is_server_error() => CliError::server(msg),
         _ => CliError::user(msg),
     };
-    e.with_server_code(code).with_land_refusal(land)
+    e.with_server_code(code)
+        .with_land_refusal(land)
+        .with_refused(refused)
 }
 
 #[cfg(test)]
@@ -1591,5 +1658,112 @@ mod tests {
     fn encodes_paths() {
         assert_eq!(enc("team/x y"), "team/x%20y");
         assert_eq!(enc("main"), "main");
+    }
+
+    fn shed(retry_after: u32) -> String {
+        reply(
+            "503 Service Unavailable",
+            &format!("retry-after: {retry_after}\r\nleep-refused: read-class\r\n"),
+            r#"{"error":"server busy: all 1 of this server's search permits are in use (--read-concurrency); nothing was done, retry after 1s","code":"unavailable"}"#,
+        )
+    }
+
+    fn found() -> String {
+        reply(
+            "200 OK",
+            "",
+            r#"{"matches":[{"path":"a.txt","line_number":1,"line":"needle"}],"truncated":false}"#,
+        )
+    }
+
+    fn search_query() -> SearchQuery {
+        SearchQuery {
+            query: "needle".into(),
+            ..SearchQuery::default()
+        }
+    }
+
+    #[test]
+    fn a_shed_search_is_retried_until_it_is_admitted() {
+        let (url, heads) = recording_stub(vec![shed(0), shed(0), found()]);
+        let id = ChangesetId(Hash::of_blob(b"x"));
+        let got = Client::new(&url).search(&id, &search_query()).unwrap();
+        assert_eq!(got.matches.len(), 1);
+        assert_eq!(heads.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn a_shed_search_waits_the_retry_after_plus_some_jitter() {
+        let (url, heads) = recording_stub(vec![shed(1), found()]);
+        let id = ChangesetId(Hash::of_blob(b"x"));
+        let started = std::time::Instant::now();
+        Client::new(&url).search(&id, &search_query()).unwrap();
+        let took = started.elapsed();
+        assert_eq!(heads.lock().unwrap().len(), 2);
+        assert!(took >= Duration::from_secs(1), "{took:?}");
+        assert!(took < Duration::from_millis(1500 + 500), "{took:?}");
+    }
+
+    #[test]
+    fn jitter_adds_up_to_half_the_wait() {
+        let wait = Duration::from_secs(2);
+        let waits: Vec<Duration> = (0..200).map(|_| jittered(wait)).collect();
+        assert!(waits.iter().all(|w| *w >= wait && *w <= wait.mul_f64(1.5)));
+        assert!(waits.iter().any(|w| *w != waits[0]), "the waits vary");
+    }
+
+    #[test]
+    fn a_search_shed_on_every_try_is_reported_as_a_retryable_refusal() {
+        let (url, heads) = recording_stub(vec![shed(0)]);
+        let id = ChangesetId(Hash::of_blob(b"x"));
+        let e = Client::new(&url).search(&id, &search_query()).unwrap_err();
+        assert_eq!(heads.lock().unwrap().len(), MAX_ATTEMPTS as usize);
+        assert_eq!(e.kind(), ErrorKind::Server);
+        assert_eq!(e.exit_code(), crate::error::exit::SERVER);
+        assert!(e.is_retryable());
+        assert_eq!(e.refused(), Some("read-class"));
+        assert_eq!(e.server_code(), Some("unavailable"));
+        assert!(e.message().contains("server busy"), "{}", e.message());
+        assert!(e.hint().unwrap().contains("again"), "{e:?}");
+        assert_eq!(e.to_json()["error"]["refused"], "read-class");
+    }
+
+    #[test]
+    fn a_shed_with_a_long_retry_after_is_reported_instead_of_waited_out() {
+        let (url, heads) = recording_stub(vec![shed(60), found()]);
+        let id = ChangesetId(Hash::of_blob(b"x"));
+        let e = Client::new(&url).search(&id, &search_query()).unwrap_err();
+        assert_eq!(heads.lock().unwrap().len(), 1);
+        assert_eq!(e.refused(), Some("read-class"));
+        assert_eq!(e.retry_after_ms(), Some(60_000));
+    }
+
+    #[test]
+    fn without_refusal_retries_a_shed_is_reported_at_once() {
+        let (url, heads) = recording_stub(vec![shed(3), found()]);
+        let id = ChangesetId(Hash::of_blob(b"x"));
+        let e = Client::new(&url)
+            .with_refusal_retries(false)
+            .search(&id, &search_query())
+            .unwrap_err();
+        assert_eq!(heads.lock().unwrap().len(), 1);
+        assert_eq!(e.refused(), Some("read-class"));
+        assert_eq!(e.retry_after_ms(), Some(3000));
+    }
+
+    #[test]
+    fn a_503_without_leep_refused_is_not_retried() {
+        let bare = reply(
+            "503 Service Unavailable",
+            "retry-after: 0\r\n",
+            r#"{"error":"proxy says no"}"#,
+        );
+        let (url, heads) = recording_stub(vec![bare, found()]);
+        let id = ChangesetId(Hash::of_blob(b"x"));
+        let e = Client::new(&url).search(&id, &search_query()).unwrap_err();
+        assert_eq!(heads.lock().unwrap().len(), 1);
+        assert_eq!(e.kind(), ErrorKind::Server);
+        assert_eq!(e.refused(), None);
+        assert_eq!(e.retry_after_ms(), None);
     }
 }
