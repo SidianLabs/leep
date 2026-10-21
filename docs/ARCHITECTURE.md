@@ -383,7 +383,11 @@ queue wider than 64 entries falls back to "restart from the tip below the
 last entry", which is correct but rescans. A search cursor pins the searched
 changeset and the last (path, line), and the walk skips directories and files
 before it. Cursors are bound to their query by a fingerprint and validated as
-untrusted input (400 on any failure).
+untrusted input (400 on any failure). `fields=summary` returns the same log entries
+as listings need them (no changed paths, the message's first line,
+`agent.*` metadata), projected after the walk, so cursors and order are
+shared with full pages and either shape continues the other; `leep log
+--oneline` and the MCP `leep_log` tool ask for it.
 
 **Filtered log** ([ADR 0047](adr/0047-log-filter-index.md)). A log with
 `author` or `extra` filters and no path scans its first 512 changesets

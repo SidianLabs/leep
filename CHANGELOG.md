@@ -7,6 +7,14 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 ## [Unreleased]
 
+### Summary log entries
+- `GET /v1/log/{id}?fields=summary` answers the same entries, order and
+  cursors as listings need them: id, parents, author, timestamp,
+  `message_first_line`, `agent` (the `agent.*` keys), `files_changed`,
+  generation and root tree (plus `path_at`/`renamed` on `follow` logs), a
+  quarter of the bytes on git/git. The default (`fields=full`) is unchanged
+  byte for byte; other values are 400.
+
 ### Faster path logs
 - Path logs without a filter no longer read each changeset and root tree one
   after another along the path's history: they read them in one batch per
