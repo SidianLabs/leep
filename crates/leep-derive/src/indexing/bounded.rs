@@ -493,25 +493,102 @@ impl Repo {
             metrics::counter!("leep_query_index_wait_refused_total").increment(1);
             return Ok(None);
         };
-        let gauge = metrics::gauge!("leep_query_index_waiters");
-        gauge.increment(1.0);
+        let _waiting = Waiting::new();
         let waited = Instant::now();
         let deadline = waited + limit;
         let mut found = None;
+        // What the last full check found missing: while enough of it still
+        // lacks rows, the need is still over budget, which one batched read
+        // tells without walking history again.
+        let mut last: Option<Vec<ChangesetId>> = None;
         loop {
             let next = (Instant::now() + Duration::from_secs(1)).min(deadline);
             tokio::time::sleep_until(next).await;
-            if let Some(b) = self.fits(group, need, &policy.budgets).await? {
-                found = Some(b);
-                break;
+            if self.still_over(group, need, &policy.budgets, &last).await? {
+                if Instant::now() >= deadline {
+                    break;
+                }
+                continue;
+            }
+            match need {
+                Need::Reachable(starts) => {
+                    let m =
+                        find_missing(self, group_kind(group), starts, policy.budgets.scan).await?;
+                    if !m.over {
+                        found = Some(Bounded {
+                            unindexed: m.set,
+                            parents: m.parents,
+                            frontier: m.frontier,
+                            ..Default::default()
+                        });
+                        break;
+                    }
+                    last = Some(m.set.into_iter().collect());
+                }
+                _ => {
+                    if let Some(b) = self.fits(group, need, &policy.budgets).await? {
+                        found = Some(b);
+                        break;
+                    }
+                }
             }
             if Instant::now() >= deadline {
                 break;
             }
         }
-        gauge.decrement(1.0);
         metrics::histogram!("leep_query_index_wait_seconds").record(waited.elapsed().as_secs_f64());
         Ok(found)
+    }
+
+    /// A cheap test that `need` is still over `budgets` while waiting: a
+    /// search whose starting directory has no stored row yet (computing it
+    /// fetches up to the budget from the blob store, so it is done only once
+    /// the row exists or the wait is over), or a walk of which more than the
+    /// budget of what the last check found missing still lacks rows. Rows
+    /// are never removed by an indexer, so those are still missing now.
+    async fn still_over(
+        &self,
+        group: IndexGroup,
+        need: &Need,
+        budgets: &Budgets,
+        last: &Option<Vec<ChangesetId>>,
+    ) -> Result<bool> {
+        match need {
+            Need::Search { start, .. } => Ok(!self.search_start_stored(start).await?),
+            Need::Reachable(_) => {
+                let Some(ids) = last else {
+                    return Ok(false);
+                };
+                let mut lacking = 0;
+                for chunk in ids.chunks(derived::BATCH) {
+                    let rows =
+                        derived::get_derived_many(self.meta().as_ref(), group_kind(group), chunk)
+                            .await?;
+                    lacking += rows.iter().filter(|r| r.is_none()).count();
+                }
+                Ok(lacking > budgets.scan)
+            }
+            Need::Chain(_) => Ok(false),
+        }
+    }
+
+    /// Whether the rows of a search's start are stored.
+    async fn search_start_stored(&self, start: &Option<SearchStart>) -> Result<bool> {
+        let meta = self.meta();
+        Ok(match start {
+            None => true,
+            Some(SearchStart::Dir(tree)) => meta
+                .get_derived(crate::search::TREE_KIND, tree)
+                .await?
+                .is_some(),
+            Some(SearchStart::File { content, size }) => {
+                *size > crate::search::MAX_INDEXED_BYTES
+                    || meta
+                        .get_derived(crate::search::BLOB_KIND, content)
+                        .await?
+                        .is_some()
+            }
+        })
     }
 
     /// The newest first-parent ancestor of `at` the index covers, and the
@@ -576,21 +653,8 @@ impl Repo {
 
     /// Whether the search index of `path` at `at` is stored whole.
     async fn search_indexed(&self, at: ChangesetId, path: &str) -> Result<bool> {
-        let meta = self.meta();
-        Ok(match self.search_start(at, path).await? {
-            None => true,
-            Some(SearchStart::Dir(tree)) => meta
-                .get_derived(crate::search::TREE_KIND, &tree)
-                .await?
-                .is_some(),
-            Some(SearchStart::File { content, size }) => {
-                size > crate::search::MAX_INDEXED_BYTES
-                    || meta
-                        .get_derived(crate::search::BLOB_KIND, &content)
-                        .await?
-                        .is_some()
-            }
-        })
+        let start = self.search_start(at, path).await?;
+        self.search_start_stored(&start).await
     }
 
     /// The 503 for a query over every budget: how far behind its index is,
@@ -628,6 +692,42 @@ impl Repo {
             behind,
             retry_after_ms: retry_after(behind, &parse_holder_meta(&lease.meta)).as_millis() as u64,
         }
+    }
+}
+
+/// The kind whose rows say whether a changeset is indexed for `g`'s walks.
+fn group_kind(g: IndexGroup) -> &'static str {
+    match g {
+        IndexGroup::LogFilter => LogFilterIndex::NAME,
+        _ => HistoryTree::NAME,
+    }
+}
+
+/// What a bounded query answers when index rows it relied on were deleted
+/// under it (a `repair drop` racing it): the index is behind; retry.
+pub(crate) fn rows_vanished(g: IndexGroup) -> Error {
+    metrics::counter!("leep_query_rows_vanished_total", "kind" => g.lease_name()).increment(1);
+    Error::Indexing {
+        kind: g.lease_name().into(),
+        behind: 0,
+        retry_after_ms: 1000,
+    }
+}
+
+/// Keeps `leep_query_index_waiters` right however a wait ends.
+struct Waiting(metrics::Gauge);
+
+impl Waiting {
+    fn new() -> Self {
+        let g = metrics::gauge!("leep_query_index_waiters");
+        g.increment(1.0);
+        Waiting(g)
+    }
+}
+
+impl Drop for Waiting {
+    fn drop(&mut self) {
+        self.0.decrement(1.0);
     }
 }
 
