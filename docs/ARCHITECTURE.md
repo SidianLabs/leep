@@ -378,7 +378,11 @@ Provenance scans the newest changesets (capped at 10 000, reporting
 
 **Page cursors.** `GET /v1/log`, `/v1/search` and `/v1/reflog` answer one
 capped page and, when more remains, an opaque `next` cursor that the client
-sends back as `after` (`leep_derive::cursor`, layout in FORMATS.md). A log
+sends back as `after` (`leep_derive::cursor`, layout in FORMATS.md).
+`GET /v1/files` and `/v1/diff` do the same when asked with `limit` (at most
+10,000; without it they answer everything), with the last path as the
+cursor; `tree_ops::PathQueue` walks in path order and reads only the trees a
+page needs. A log
 cursor carries the walk's queue: every log walk (plain, path index, `follow`,
 and the `log-filter-v1` walk with its merge-side bounds) pops in descending
 `(generation, id)` and queues only ancestors, so seeding a fresh walk with
@@ -729,7 +733,7 @@ unbounded; entries name changesets, which are never deleted, so GC is
 unaffected.
 
 **Checkout** (`leep checkout`): the client resolves a rev to an id and lists
-files under the requested prefixes (`GET /v1/files`). It then fetches the
+files under the requested prefixes (`GET /v1/files`, in pages of 10,000). It then fetches the
 missing blobs through its local content-addressed cache and writes them. Only
 requested prefixes are materialized; other files are fetched on demand with
 `leep cat`.

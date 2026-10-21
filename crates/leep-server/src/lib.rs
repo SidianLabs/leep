@@ -449,8 +449,29 @@ struct DirQuery {
 }
 
 #[derive(Deserialize)]
-struct PrefixQuery {
+struct FilesQuery {
     prefix: Option<String>,
+    /// Text, so a bad value is our 400 and not the extractor's.
+    #[serde(default)]
+    limit: Option<String>,
+    #[serde(default)]
+    after: Option<String>,
+}
+
+/// `limit` of `GET /v1/files` and `/v1/diff`: absent is the whole list (what
+/// older clients expect, so it is not capped; see [`MAX_PATHS_LIMIT`]),
+/// above [`MAX_PATHS_LIMIT`] is lowered to it, and 0 or not a number is 400.
+fn paths_limit(limit: Option<&str>) -> ApiResult<Option<usize>> {
+    let Some(v) = limit else {
+        return Ok(None);
+    };
+    match v.parse::<usize>() {
+        Ok(0) | Err(_) => Err(Error::Invalid(format!(
+            "bad limit {v:?}: expected a number from 1 to {MAX_PATHS_LIMIT}"
+        ))
+        .into()),
+        Ok(n) => Ok(Some(n.min(MAX_PATHS_LIMIT))),
+    }
 }
 
 /// `extra` may repeat, which a plain struct can't express, so the log query is
@@ -523,6 +544,10 @@ struct DiffQuery {
     renames: Option<bool>,
     /// Text, so a bad value is our 400 and not the extractor's.
     rename_threshold: Option<String>,
+    #[serde(default)]
+    limit: Option<String>,
+    #[serde(default)]
+    after: Option<String>,
 }
 
 impl DiffQuery {
@@ -1020,11 +1045,14 @@ async fn tree(
 async fn files(
     State(repo): S,
     Path(id): Path<String>,
-    Query(q): Query<PrefixQuery>,
+    Query(q): Query<FilesQuery>,
 ) -> ApiResult<Json<FilesResponse>> {
+    let limit = paths_limit(q.limit.as_deref())?;
     let prefix = q.prefix.unwrap_or_default();
-    let files = repo.list_files(cid(&id)?, &prefix).await?;
-    Ok(Json(FilesResponse { files }))
+    Ok(Json(
+        repo.list_files_page(cid(&id)?, &prefix, limit, q.after.as_deref())
+            .await?,
+    ))
 }
 
 async fn file(
@@ -1264,18 +1292,19 @@ async fn search_rev(
 async fn diff(State(repo): S, Query(q): Query<DiffQuery>) -> ApiResult<Json<DiffResponse>> {
     let from = q.from.as_deref().map(cid).transpose()?;
     let opts = q.rename_options()?;
-    let entries = repo
-        .diff(from, cid(&q.to)?, q.prefix.as_deref().unwrap_or_default())
-        .await?;
-    let found = match q.renames {
-        Some(true) => repo.detect_renames(&entries, &opts).await?,
-        _ => Default::default(),
-    };
-    Ok(Json(DiffResponse {
-        entries,
-        renames: found.renames,
-        renames_truncated: found.truncated,
-    }))
+    let limit = paths_limit(q.limit.as_deref())?;
+    let renames = (q.renames == Some(true)).then_some(&opts);
+    Ok(Json(
+        repo.diff_page(
+            from,
+            cid(&q.to)?,
+            q.prefix.as_deref().unwrap_or_default(),
+            renames,
+            limit,
+            q.after.as_deref(),
+        )
+        .await?,
+    ))
 }
 
 async fn blame(
@@ -1505,6 +1534,8 @@ mod tests {
             prefix: None,
             renames: None,
             rename_threshold: threshold.map(String::from),
+            limit: None,
+            after: None,
         }
     }
 

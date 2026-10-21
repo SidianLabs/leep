@@ -4,12 +4,14 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use bytes::Bytes;
-use leep_core::api::{DiffEntry, FileInfo, TreeResponse};
+use leep_core::api::{DiffEntry, DiffResponse, FileInfo, FilesResponse, TreeResponse};
+use leep_core::rename::{Detected, RenameOptions};
 use leep_core::{ChangesetId, Error, FileChange, Hash, RepoPath, Result, TreeEntry, TreeNode};
 
+use crate::cursor::{self, path_cursor, CursorKind, Fingerprint, PathPos};
 use crate::Repo;
 
-/// Most tree nodes one [`Repo::read_trees`] of a breadth-first walk asks
+/// Most tree nodes one [`Repo::read_trees`] of a listing or diff walk asks
 /// for, bounding the bytes held at once.
 const TREE_BATCH: usize = 1024;
 
@@ -235,49 +237,89 @@ impl Repo {
 
     /// Recursive file listing under `prefix`, sorted by path.
     pub async fn list_files(&self, id: ChangesetId, prefix: &str) -> Result<Vec<FileInfo>> {
-        let prefix = prefix.trim_matches('/');
-        let root = self.root_tree(id).await?;
-        let mut out = Vec::new();
-        self.collect_files(prefix, self.entry_at(root, prefix).await?, &mut out)
-            .await?;
-        out.sort_by(|a, b| a.path.cmp(&b.path));
-        Ok(out)
+        self.files_after(id, prefix, None, usize::MAX).await
     }
 
-    /// Breadth first, one [`Repo::read_trees`] per level, so a cold listing
-    /// waits on the store about once per level of depth rather than once per
-    /// directory.
-    async fn collect_files(
+    /// One page of [`Repo::list_files`]: at most `limit` files after the
+    /// `after` cursor, with `next` when more remain. `limit: None` is the
+    /// whole rest of the listing; `Some(0)` is `Invalid`.
+    pub async fn list_files_page(
         &self,
-        path: &str,
-        entry: Option<TreeEntry>,
-        out: &mut Vec<FileInfo>,
-    ) -> Result<()> {
-        let mut level = match entry {
-            None => return Ok(()),
-            Some(TreeEntry::Dir { tree }) => vec![(path.to_string(), tree)],
-            Some(f) => {
-                out.extend(file_info(RepoPath::new(path.to_string())?, &f));
-                return Ok(());
+        id: ChangesetId,
+        prefix: &str,
+        limit: Option<usize>,
+        after: Option<&str>,
+    ) -> Result<FilesResponse> {
+        let fp = Fingerprint::of(CursorKind::Files, &(id, prefix.trim_matches('/')));
+        let after = page_start(limit, after, CursorKind::Files, fp)?;
+        // One more than the page, to tell a full last page from a middle one.
+        let want = limit.map_or(usize::MAX, |l| l.saturating_add(1));
+        let mut files = self.files_after(id, prefix, after.as_deref(), want).await?;
+        let next = match limit {
+            Some(l) if files.len() > l => {
+                files.truncate(l);
+                Some(path_cursor(
+                    CursorKind::Files,
+                    fp,
+                    files[l - 1].path.as_str(),
+                )?)
             }
+            _ => None,
         };
-        while !level.is_empty() {
-            let mut next = Vec::new();
-            for batch in level.chunks(TREE_BATCH) {
-                let hashes: Vec<Hash> = batch.iter().map(|(_, t)| *t).collect();
-                let nodes = self.read_trees(&hashes).await?;
-                for ((p, _), node) in batch.iter().zip(nodes) {
-                    for (name, child) in node.entries {
-                        match child {
-                            TreeEntry::Dir { tree } => next.push((join(p, &name), tree)),
-                            f => out.extend(file_info(RepoPath::new(join(p, &name))?, &f)),
+        Ok(FilesResponse { files, next })
+    }
+
+    /// Up to `want` files under `prefix` whose paths sort after `after`, in
+    /// path order. The walk keeps the pending files and unread directories
+    /// ordered by [`dir_key`], so it yields in order without collecting the
+    /// whole tree and stops once it has `want`. It reads up to
+    /// [`TREE_BATCH`] directories per [`Repo::read_trees`] (fewer when close
+    /// to `want`), so a cold listing waits on the store about once per level
+    /// of depth, as a breadth-first walk would. Directories that hold only
+    /// paths at or before `after` are never read.
+    async fn files_after(
+        &self,
+        id: ChangesetId,
+        prefix: &str,
+        after: Option<&str>,
+        want: usize,
+    ) -> Result<Vec<FileInfo>> {
+        let prefix = prefix.trim_matches('/');
+        let root = self.root_tree(id).await?;
+        let mut q: PathQueue<FileInfo, Hash> = PathQueue::new(after);
+        let add = |q: &mut PathQueue<FileInfo, Hash>, path: String, e: TreeEntry| -> Result<()> {
+            match e {
+                TreeEntry::Dir { tree } => q.dir(path, tree),
+                f => {
+                    if q.wants(&path) {
+                        let info = file_info(RepoPath::new(path.clone())?, &f);
+                        q.ready.extend(info.map(|i| (path, i)));
+                    }
+                }
+            }
+            Ok(())
+        };
+        if let Some(e) = self.entry_at(root, prefix).await? {
+            add(&mut q, prefix.to_string(), e)?;
+        }
+        let mut out = Vec::new();
+        while out.len() < want {
+            match q.next() {
+                Next::Done => break,
+                Next::Ready(f) => out.push(f),
+                Next::Read => {
+                    let batch = q.take_dirs((want - out.len()).min(TREE_BATCH));
+                    let hashes: Vec<Hash> = batch.iter().map(|(_, t)| *t).collect();
+                    let nodes = self.read_trees(&hashes).await?;
+                    for ((p, _), node) in batch.iter().zip(nodes) {
+                        for (name, child) in node.entries {
+                            add(&mut q, join(p, &name), child)?;
                         }
                     }
                 }
             }
-            level = next;
         }
-        Ok(())
+        Ok(out)
     }
 
     pub async fn lookup_file(&self, id: ChangesetId, path: &RepoPath) -> Result<Option<FileInfo>> {
@@ -308,76 +350,103 @@ impl Repo {
         to: Hash,
         prefix: &str,
     ) -> Result<Vec<DiffEntry>> {
+        self.diff_trees_after(from, to, prefix, None, usize::MAX)
+            .await
+    }
+
+    /// Up to `want` entries of [`Repo::diff_trees`] whose paths sort after
+    /// `after`, walked in path order like [`Repo::files_after`] so it stops
+    /// once it has them. Each read takes up to `TREE_BATCH / 2` directory
+    /// pairs, so a cold diff waits on the store about once per level of
+    /// depth rather than once per changed directory.
+    async fn diff_trees_after(
+        &self,
+        from: Hash,
+        to: Hash,
+        prefix: &str,
+        after: Option<&str>,
+        want: usize,
+    ) -> Result<Vec<DiffEntry>> {
+        type Pair = (Option<Hash>, Option<Hash>);
         let prefix = prefix.trim_matches('/');
-        // Breadth first: every directory pair of one level is read in one
-        // `read_trees`, so a cold diff waits on the store once per level and
-        // batch rather than once per changed directory.
-        let mut level = vec![(
-            prefix.to_string(),
-            self.entry_at(from, prefix).await?,
-            self.entry_at(to, prefix).await?,
-        )];
-        let mut out = Vec::new();
+        let mut q: PathQueue<DiffEntry, Pair> = PathQueue::new(after);
         let dir_of = |e: &Option<TreeEntry>| match e {
             Some(TreeEntry::Dir { tree }) => Some(*tree),
             _ => None,
         };
         let is_file = |e: &Option<TreeEntry>| matches!(e, Some(TreeEntry::File { .. }));
-        while !level.is_empty() {
-            let mut dirs = Vec::new();
-            for (path, old, new) in level {
-                if old == new {
-                    continue;
-                }
-                let (old_dir, new_dir) = (dir_of(&old), dir_of(&new));
-                // A file opposite a directory (or nothing) is a one-sided
-                // file change; a directory is expanded below.
-                if is_file(&old) || is_file(&new) || (old_dir.is_none() && new_dir.is_none()) {
-                    let rp = RepoPath::new(path.clone())?;
-                    out.push(DiffEntry {
-                        old: old.as_ref().and_then(|e| file_info(rp.clone(), e)),
-                        new: new.as_ref().and_then(|e| file_info(rp.clone(), e)),
-                        path: rp,
-                    });
-                }
-                if old_dir.is_some() || new_dir.is_some() {
-                    dirs.push((path, old_dir, new_dir));
-                }
+        let add = |q: &mut PathQueue<DiffEntry, Pair>,
+                   path: String,
+                   old: Option<TreeEntry>,
+                   new: Option<TreeEntry>|
+         -> Result<()> {
+            if old == new {
+                return Ok(());
             }
-            let mut next = Vec::new();
-            for batch in dirs.chunks(TREE_BATCH / 2) {
-                let hashes: Vec<Hash> = batch
-                    .iter()
-                    .flat_map(|(_, a, b)| [*a, *b])
-                    .flatten()
-                    .collect();
-                // The same node can be on both sides of different pairs.
-                let nodes: HashMap<Hash, Arc<TreeNode>> = hashes
-                    .iter()
-                    .copied()
-                    .zip(self.read_trees(&hashes).await?.into_iter().map(Arc::new))
-                    .collect();
-                let empty = Arc::new(TreeNode::default());
-                let take = |t: Option<Hash>| match t.and_then(|t| nodes.get(&t)) {
-                    Some(n) => n.clone(),
-                    None => empty.clone(),
+            let (old_dir, new_dir) = (dir_of(&old), dir_of(&new));
+            // A file opposite a directory (or nothing) is a one-sided file
+            // change, and the directory is walked too.
+            if (is_file(&old) || is_file(&new) || (old_dir.is_none() && new_dir.is_none()))
+                && q.wants(&path)
+            {
+                let rp = RepoPath::new(path.clone())?;
+                let entry = DiffEntry {
+                    old: old.as_ref().and_then(|e| file_info(rp.clone(), e)),
+                    new: new.as_ref().and_then(|e| file_info(rp.clone(), e)),
+                    path: rp,
                 };
-                for (path, old_dir, new_dir) in batch {
-                    let (a, b) = (take(*old_dir), take(*new_dir));
-                    let names: BTreeSet<&String> =
-                        a.entries.keys().chain(b.entries.keys()).collect();
-                    for name in names {
-                        next.push((
-                            join(path, name),
-                            a.entries.get(name).cloned(),
-                            b.entries.get(name).cloned(),
-                        ));
+                q.ready.insert(path.clone(), entry);
+            }
+            if old_dir.is_some() || new_dir.is_some() {
+                q.dir(path, (old_dir, new_dir));
+            }
+            Ok(())
+        };
+        add(
+            &mut q,
+            prefix.to_string(),
+            self.entry_at(from, prefix).await?,
+            self.entry_at(to, prefix).await?,
+        )?;
+        let mut out = Vec::new();
+        while out.len() < want {
+            match q.next() {
+                Next::Done => break,
+                Next::Ready(e) => out.push(e),
+                Next::Read => {
+                    let batch = q.take_dirs((want - out.len()).min(TREE_BATCH / 2));
+                    let hashes: Vec<Hash> = batch
+                        .iter()
+                        .flat_map(|(_, (a, b))| [*a, *b])
+                        .flatten()
+                        .collect();
+                    // The same node can be on both sides of different pairs.
+                    let nodes: HashMap<Hash, Arc<TreeNode>> = hashes
+                        .iter()
+                        .copied()
+                        .zip(self.read_trees(&hashes).await?.into_iter().map(Arc::new))
+                        .collect();
+                    let empty = Arc::new(TreeNode::default());
+                    let take = |t: Option<Hash>| match t.and_then(|t| nodes.get(&t)) {
+                        Some(n) => n.clone(),
+                        None => empty.clone(),
+                    };
+                    for (path, (old_dir, new_dir)) in batch {
+                        let (a, b) = (take(old_dir), take(new_dir));
+                        let names: BTreeSet<&String> =
+                            a.entries.keys().chain(b.entries.keys()).collect();
+                        for name in names {
+                            add(
+                                &mut q,
+                                join(&path, name),
+                                a.entries.get(name).cloned(),
+                                b.entries.get(name).cloned(),
+                            )?;
+                        }
                     }
                 }
             }
-            level = next;
         }
-        out.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(out)
     }
 
@@ -394,6 +463,185 @@ impl Repo {
         };
         let to_tree = self.root_tree(to).await?;
         self.diff_trees(from_tree, to_tree, prefix).await
+    }
+
+    /// One page of [`Repo::diff`], with renames detected when `renames` is
+    /// set: at most `limit` entries after the `after` cursor, with `next`
+    /// when more remain. `limit: None` is the whole rest of the diff;
+    /// `Some(0)` is `Invalid`.
+    ///
+    /// Without renames the walk stops after the page. With them, pairing
+    /// needs every deleted and added file, so each page walks the whole diff
+    /// and detects over all of it (pairs never depend on page size), then
+    /// keeps the renames whose `to` is on the page.
+    pub async fn diff_page(
+        &self,
+        from: Option<ChangesetId>,
+        to: ChangesetId,
+        prefix: &str,
+        renames: Option<&RenameOptions>,
+        limit: Option<usize>,
+        after: Option<&str>,
+    ) -> Result<DiffResponse> {
+        let prefix = prefix.trim_matches('/');
+        let fp = Fingerprint::of(
+            CursorKind::Diff,
+            &(from, to, prefix, renames.map(|o| o.threshold)),
+        );
+        let after = page_start(limit, after, CursorKind::Diff, fp)?;
+        let from_tree = match from {
+            Some(f) => self.root_tree(f).await?,
+            None => TreeNode::empty_hash(),
+        };
+        let to_tree = self.root_tree(to).await?;
+        let want = limit.map_or(usize::MAX, |l| l.saturating_add(1));
+        let (mut entries, found) = match renames {
+            None => {
+                let page = self
+                    .diff_trees_after(from_tree, to_tree, prefix, after.as_deref(), want)
+                    .await?;
+                (page, Detected::default())
+            }
+            Some(opts) => {
+                let all = self.diff_trees(from_tree, to_tree, prefix).await?;
+                let page: Vec<DiffEntry> = all
+                    .iter()
+                    .filter(|e| after.as_deref().is_none_or(|a| e.path.as_str() > a))
+                    .take(want)
+                    .cloned()
+                    .collect();
+                // A page past the end has no renames to keep.
+                let found = if page.is_empty() {
+                    Detected::default()
+                } else {
+                    self.detect_renames(&all, opts).await?
+                };
+                (page, found)
+            }
+        };
+        let next = match limit {
+            Some(l) if entries.len() > l => {
+                entries.truncate(l);
+                Some(path_cursor(
+                    CursorKind::Diff,
+                    fp,
+                    entries[l - 1].path.as_str(),
+                )?)
+            }
+            _ => None,
+        };
+        let on_page: BTreeSet<&RepoPath> = entries.iter().map(|e| &e.path).collect();
+        let renames = found
+            .renames
+            .into_iter()
+            .filter(|r| on_page.contains(&r.to))
+            .collect();
+        Ok(DiffResponse {
+            renames,
+            renames_truncated: found.truncated,
+            entries,
+            next,
+        })
+    }
+}
+
+/// Where a page of a path-ordered listing starts: `after`'s path, or the
+/// start. A `limit` of 0 would page forever, so it is `Invalid`.
+fn page_start(
+    limit: Option<usize>,
+    after: Option<&str>,
+    kind: CursorKind,
+    fp: Fingerprint,
+) -> Result<Option<String>> {
+    if limit == Some(0) {
+        return Err(Error::Invalid("limit must be at least 1".into()));
+    }
+    Ok(after
+        .map(|t| cursor::decode::<PathPos>(t, kind, fp))
+        .transpose()?
+        .map(|p| p.path))
+}
+
+/// Where a directory sorts among paths: its path and `/`, so it sorts with
+/// its descendants. A name never contains `/`, so between two children of
+/// one directory, everything under the smaller key sorts before everything
+/// under the larger (`a.txt` < `a/b`, as `.` < `/`). The walk's root is `""`
+/// and sorts first.
+fn dir_key(path: &str) -> String {
+    if path.is_empty() {
+        String::new()
+    } else {
+        format!("{path}/")
+    }
+}
+
+/// Whether the directory with key `key` holds any path after `after`: its
+/// paths all start with `key`, so only when `after` sorts before `key` or
+/// lies inside it.
+fn dir_follows(key: &str, after: Option<&str>) -> bool {
+    after.is_none_or(|a| a < key || a.starts_with(key))
+}
+
+/// The pending work of a walk that yields in path order: items ready to
+/// yield, keyed by path, and directories not yet read, keyed by
+/// [`dir_key`]. Whatever is smallest across both comes next, so the walk
+/// never sorts at the end and can stop as soon as it has enough. Items and
+/// directories that hold nothing after `after` are dropped on insert.
+struct PathQueue<T, D> {
+    ready: BTreeMap<String, T>,
+    dirs: BTreeMap<String, (String, D)>,
+    after: Option<String>,
+}
+
+enum Next<T> {
+    Ready(T),
+    /// The next item is under an unread directory.
+    Read,
+    Done,
+}
+
+impl<T, D> PathQueue<T, D> {
+    fn new(after: Option<&str>) -> Self {
+        PathQueue {
+            ready: BTreeMap::new(),
+            dirs: BTreeMap::new(),
+            after: after.map(str::to_string),
+        }
+    }
+
+    /// Whether an item at `path` belongs in the walk.
+    fn wants(&self, path: &str) -> bool {
+        self.after.as_deref().is_none_or(|a| path > a)
+    }
+
+    fn dir(&mut self, path: String, d: D) {
+        let key = dir_key(&path);
+        if dir_follows(&key, self.after.as_deref()) {
+            self.dirs.insert(key, (path, d));
+        }
+    }
+
+    fn next(&mut self) -> Next<T> {
+        let read = match (self.ready.first_key_value(), self.dirs.first_key_value()) {
+            (None, None) => return Next::Done,
+            (Some((r, _)), Some((d, _))) => d < r,
+            (r, _) => r.is_none(),
+        };
+        if read {
+            return Next::Read;
+        }
+        self.ready
+            .pop_first()
+            .map_or(Next::Done, |(_, item)| Next::Ready(item))
+    }
+
+    /// The `n` smallest unread directories, as `(path, payload)`. Reading
+    /// them in one batch is always safe: their children sort after them.
+    fn take_dirs(&mut self, n: usize) -> Vec<(String, D)> {
+        std::iter::from_fn(|| self.dirs.pop_first())
+            .take(n.max(1))
+            .map(|(_, d)| d)
+            .collect()
     }
 }
 

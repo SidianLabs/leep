@@ -47,6 +47,10 @@ pub struct Data {
     /// Cap every log, search and ref log page at this many items and answer
     /// `next` cursors (decimal offsets), like a server's per-request cap.
     pub page_cap: Option<usize>,
+    /// Answer every files or diff request that has both `limit` and `after`
+    /// with 400 `cursor_unrepresentable`, as if the previous page ended at a
+    /// path too long for a cursor.
+    pub long_path_cursor: bool,
     /// Refuse an unsigned land with an error `code` and a message without
     /// the marker text, so only the code can tell why. Off, the mock is a
     /// server from before codes.
@@ -596,27 +600,68 @@ async fn merge_base(
     Ok(Json(MergeBaseResponse { base }))
 }
 
+/// A page of a files or diff request: under `page_cap` and with `limit`,
+/// offsets as cursors; without `limit`, everything after `after`, as a real
+/// server answers.
+fn path_page<T>(d: &Data, items: Vec<T>, q: &HashMap<String, String>) -> (Vec<T>, Option<String>) {
+    let after = q.get("after").map(String::as_str);
+    match q.get("limit") {
+        Some(l) => page(d, items, l.parse().expect("numeric limit"), after),
+        None => {
+            let offset: usize = after.map_or(0, |a| a.parse().expect("fake cursor"));
+            (items.into_iter().skip(offset).collect(), None)
+        }
+    }
+}
+
+/// Under `long_path_cursor`, the refusal of a later files or diff page, as
+/// a real server refuses a page past a path too long for a cursor.
+fn long_path_refusal(
+    d: &Data,
+    q: &HashMap<String, String>,
+) -> Option<(StatusCode, Json<ErrorResponse>)> {
+    let refused = d.long_path_cursor && q.contains_key("limit") && q.contains_key("after");
+    refused.then(|| {
+        let msg = format!(
+            "path \"long\" {}",
+            leep_core::api::CURSOR_UNREPRESENTABLE_MARKER
+        );
+        (
+            StatusCode::BAD_REQUEST,
+            Json(
+                ErrorResponse::new(msg)
+                    .with_code(leep_core::api::error_code::CURSOR_UNREPRESENTABLE),
+            ),
+        )
+    })
+}
+
 async fn files(
     State(s): State<Shared>,
     Path(id): Path<String>,
+    RawQuery(raw): RawQuery,
     Query(q): Query<HashMap<String, String>>,
 ) -> Resp<FilesResponse> {
     let id: ChangesetId = id
         .parse()
         .map_err(|_| err(StatusCode::BAD_REQUEST, "bad id"))?;
-    let d = s.lock().unwrap();
+    let mut d = s.lock().unwrap();
+    record(&mut d, "files", &raw);
     let all = d
         .files
         .get(&id)
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "no such changeset"))?;
     let prefix = q.get("prefix").map(String::as_str).unwrap_or("");
-    Ok(Json(FilesResponse {
-        files: all
-            .values()
-            .filter(|f| f.path.is_within(prefix))
-            .cloned()
-            .collect(),
-    }))
+    let matching: Vec<FileInfo> = all
+        .values()
+        .filter(|f| f.path.is_within(prefix))
+        .cloned()
+        .collect();
+    if let Some(e) = long_path_refusal(&d, &q) {
+        return Err(e);
+    }
+    let (files, next) = path_page(&d, matching, &q);
+    Ok(Json(FilesResponse { files, next }))
 }
 
 fn generation(d: &Data, id: ChangesetId) -> u64 {
@@ -1045,6 +1090,15 @@ async fn diff(State(s): State<Shared>, RawQuery(raw): RawQuery) -> Resp<DiffResp
         resp.renames = found.renames;
         resp.renames_truncated = found.truncated;
     }
+    // Like the server: page the entries, each rename on its `to` entry's page.
+    if let Some(e) = long_path_refusal(&d, &q) {
+        return Err(e);
+    }
+    let (entries, next) = path_page(&d, std::mem::take(&mut resp.entries), &q);
+    resp.renames
+        .retain(|r| entries.iter().any(|e| e.path == r.to));
+    resp.entries = entries;
+    resp.next = next;
     Ok(Json(resp))
 }
 

@@ -1175,6 +1175,268 @@ async fn diff_rejects_a_bad_rename_threshold() {
     }
 }
 
+/// `uri` plus one more query parameter.
+fn with(uri: &str, param: &str) -> String {
+    let sep = if uri.contains('?') { '&' } else { '?' };
+    format!("{uri}{sep}{param}")
+}
+
+/// One page of `/v1/files` (`list = "files"`) or `/v1/diff` (`"entries"`):
+/// its paths and `next`.
+async fn path_page(c: &Client, uri: &str, list: &str) -> (Vec<String>, Option<String>) {
+    let r = c.get(uri).await;
+    assert_eq!(r.status, StatusCode::OK, "{uri}");
+    let v: serde_json::Value = r.json();
+    let paths = v[list]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["path"].as_str().unwrap().to_string())
+        .collect();
+    (
+        paths,
+        v.get("next").map(|n| n.as_str().unwrap().to_string()),
+    )
+}
+
+/// A files or diff cursor built from the layout in docs/FORMATS.md ("Page
+/// cursors"), to point one anywhere, such as past the end.
+fn forged_path_cursor<Q: Serialize>(kind: u8, query: &Q, path: &str) -> String {
+    use base64::Engine;
+    let mut q = vec![kind];
+    q.extend(postcard::to_stdvec(query).unwrap());
+    let mut bytes = vec![1, kind];
+    bytes.extend_from_slice(&Hash::of_blob(&q).as_bytes()[..16]);
+    bytes.extend(postcard::to_stdvec(path).unwrap());
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// `GET /v1/files` and `/v1/diff` answer one page with `limit`, resume with
+/// `after`, and answer exactly as before without either.
+#[tokio::test]
+async fn files_and_diff_page_with_limit_and_after() {
+    let c = Client::new();
+    let base = c
+        .commit(
+            &[],
+            &[
+                ("a/1", Some("1")),
+                ("a/2", Some("2")),
+                ("b", Some("b")),
+                ("c/d/e", Some("e")),
+                ("z", Some("z")),
+            ],
+            "base",
+        )
+        .await;
+    let edit = c
+        .commit(
+            &[base],
+            &[
+                ("a/1", Some("1 again")),
+                ("a/2", None),
+                ("a.txt", Some("t")),
+                ("b", None),
+                ("b/x", Some("x")),
+                ("z", Some("z again")),
+            ],
+            "edit",
+        )
+        .await;
+    let files_uri = format!("/v1/files/{base}");
+    let diff_uri = format!("/v1/diff?from={base}&to={edit}");
+    let cases = [
+        (
+            files_uri.as_str(),
+            "files",
+            &["a/1", "a/2", "b", "c/d/e", "z"][..],
+        ),
+        (
+            diff_uri.as_str(),
+            "entries",
+            // `a.txt` sorts before `a/1`, as `.` sorts before `/`.
+            &["a.txt", "a/1", "a/2", "b", "b/x", "z"][..],
+        ),
+    ];
+    for (uri, list, all) in cases {
+        // An old client: no new parameters, the old shape, everything.
+        let r = c.get(uri).await;
+        assert_eq!(r.status, StatusCode::OK);
+        let v: serde_json::Value = r.json();
+        assert_eq!(v.as_object().unwrap().keys().collect::<Vec<_>>(), [list]);
+        assert_eq!(path_page(&c, uri, list).await, (to_strings(all), None));
+
+        // First, middle and last pages of 2.
+        let (first, next) = path_page(&c, &with(uri, "limit=2"), list).await;
+        assert_eq!(first, all[..2]);
+        let next = next.expect("a first page has next");
+        let (middle, next) =
+            path_page(&c, &with(uri, &format!("limit=2&after={next}")), list).await;
+        assert_eq!(middle, all[2..4]);
+        let next = next.expect("a middle page has next");
+        let (last, end) = path_page(&c, &with(uri, &format!("limit=2&after={next}")), list).await;
+        assert_eq!(last, all[4..]);
+        assert_eq!(end, None, "{uri}: the last page has no next");
+        // `limit` may change between pages; without it, the rest.
+        let (rest, end) = path_page(&c, &with(uri, &format!("after={next}")), list).await;
+        assert_eq!((rest, end), (to_strings(&all[4..]), None));
+        // A page as large as the rest is the last one.
+        let n = all.len();
+        assert_eq!(
+            path_page(&c, &with(uri, &format!("limit={n}")), list).await,
+            (to_strings(all), None)
+        );
+
+        // Zero, negative and non-numeric limits are 400 `invalid`.
+        for bad in ["0", "-1", "two", ""] {
+            let r = c.get(&with(uri, &format!("limit={bad}"))).await;
+            assert_eq!(r.status, StatusCode::BAD_REQUEST, "{uri} limit={bad:?}");
+            assert_eq!(r.code(), "invalid");
+            assert!(r.json::<ErrorResponse>().error.contains("limit"));
+        }
+        // A cursor of another query, or garbage, is 400 naming the cursor.
+        for bad in [next.as_str(), "not-a-cursor"] {
+            let other = if list == "files" {
+                format!("/v1/files/{edit}?after={bad}")
+            } else {
+                format!("/v1/diff?to={edit}&after={bad}")
+            };
+            let r = c.get(&other).await;
+            assert_eq!(r.status, StatusCode::BAD_REQUEST, "{other}");
+            assert!(r.json::<ErrorResponse>().error.contains("cursor"));
+        }
+    }
+
+    // A cursor past the last path: an empty last page.
+    let past = forged_path_cursor(4, &(base, ""), "zz");
+    let r = c
+        .get(&format!("/v1/files/{base}?limit=2&after={past}"))
+        .await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert_eq!(
+        r.json::<serde_json::Value>(),
+        serde_json::json!({ "files": [] })
+    );
+    let past = forged_path_cursor(5, &(Some(base), edit, "", None::<u8>), "zz");
+    let r = c.get(&format!("{diff_uri}&limit=2&after={past}")).await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert_eq!(
+        r.json::<serde_json::Value>(),
+        serde_json::json!({ "entries": [] })
+    );
+    // The same layout before the end resumes there, so the forging is right.
+    let mid = forged_path_cursor(4, &(base, ""), "b");
+    assert_eq!(
+        path_page(&c, &format!("/v1/files/{base}?after={mid}"), "files").await,
+        (to_strings(&["c/d/e", "z"]), None)
+    );
+}
+
+/// A page that would end at a path too long for a cursor is 400
+/// `cursor_unrepresentable`, and the same request without `limit` answers.
+#[tokio::test]
+async fn page_ending_at_a_long_path_is_cursor_unrepresentable() {
+    let c = Client::new();
+    let long = format!("d/{}", "n".repeat(4000));
+    let tip = c
+        .commit(&[], &[(long.as_str(), Some("1")), ("e", Some("2"))], "long")
+        .await;
+    for (uri, list) in [
+        (format!("/v1/files/{tip}"), "files"),
+        (format!("/v1/diff?to={tip}"), "entries"),
+        (format!("/v1/diff?to={tip}&renames=true"), "entries"),
+    ] {
+        let r = c.get(&with(&uri, "limit=1")).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{uri}");
+        assert_eq!(r.code(), error_code::CURSOR_UNREPRESENTABLE, "{uri}");
+        assert!(r.json::<ErrorResponse>().error.contains("without `limit`"));
+        // A page that ends before it pages fine; no limit answers all.
+        let (paths, _) = path_page(&c, &with(&uri, "limit=2"), list).await;
+        assert_eq!(paths, [long.clone(), "e".into()]);
+        let (paths, next) = path_page(&c, &uri, list).await;
+        assert_eq!((paths.len(), next), (2, None));
+    }
+}
+
+fn to_strings(s: &[&str]) -> Vec<String> {
+    s.iter().map(|s| s.to_string()).collect()
+}
+
+/// With renames, pages of the diff concatenate to the unpaged answer, and
+/// each rename comes with its `to` entry.
+#[tokio::test]
+async fn diff_pages_keep_renames_whole() {
+    let c = Client::new();
+    let (base, moved) = rename_repo(&c).await;
+    let uri = format!("/v1/diff?from={base}&to={moved}&renames=true");
+    let all: DiffResponse = c.get(&uri).await.json();
+    assert_eq!(all.renames.len(), 2);
+    for limit in 1..=5 {
+        let mut got = DiffResponse::default();
+        let mut after: Option<String> = None;
+        loop {
+            let mut u = format!("{uri}&limit={limit}");
+            if let Some(a) = &after {
+                u.push_str(&format!("&after={a}"));
+            }
+            let page: DiffResponse = c.get(&u).await.json();
+            assert!(page.entries.len() <= limit);
+            for r in &page.renames {
+                assert!(page.entries.iter().any(|e| e.path == r.to), "{u}");
+            }
+            got.entries.extend(page.entries);
+            got.renames.extend(page.renames);
+            got.renames_truncated |= page.renames_truncated;
+            match page.next {
+                Some(n) => after = Some(n),
+                None => break,
+            }
+        }
+        assert_eq!(got, all, "limit {limit}");
+    }
+    // A cursor is bound to the rename settings too.
+    let page: DiffResponse = c.get(&format!("{uri}&limit=1")).await.json();
+    let next = page.next.unwrap();
+    let r = c
+        .get(&format!(
+            "/v1/diff?from={base}&to={moved}&limit=1&after={next}"
+        ))
+        .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+}
+
+/// A `limit` above [`MAX_PATHS_LIMIT`] answers a page of the maximum, and a
+/// request without `limit` is still the whole list.
+#[tokio::test]
+async fn files_and_diff_clamp_limit_to_the_max() {
+    let c = Client::new();
+    let n = MAX_PATHS_LIMIT + 5;
+    let names: Vec<String> = (0..n).map(|i| format!("d{}/f{i:05}", i % 50)).collect();
+    let files: Vec<(&str, Option<&str>)> = names.iter().map(|p| (p.as_str(), Some("x"))).collect();
+    let id = c.commit(&[], &files, "big").await;
+    let mut sorted = names.clone();
+    sorted.sort();
+
+    for (uri, list) in [
+        (format!("/v1/files/{id}"), "files"),
+        (format!("/v1/diff?to={id}"), "entries"),
+    ] {
+        let (all, next) = path_page(&c, &uri, list).await;
+        assert_eq!((all.len(), next), (n, None), "{uri}: unpaged is uncapped");
+        let (page, next) = path_page(&c, &with(&uri, &format!("limit={}", n * 10)), list).await;
+        assert_eq!(page.len(), MAX_PATHS_LIMIT, "{uri}");
+        assert_eq!(page, sorted[..MAX_PATHS_LIMIT]);
+        let next = next.expect("clamped page has next");
+        let (rest, end) = path_page(
+            &c,
+            &with(&uri, &format!("limit={}&after={next}", usize::MAX)),
+            list,
+        )
+        .await;
+        assert_eq!((rest, end), (sorted[MAX_PATHS_LIMIT..].to_vec(), None));
+    }
+}
+
 #[tokio::test]
 async fn log_follow_crosses_renames() {
     let c = Client::new();

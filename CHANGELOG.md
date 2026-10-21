@@ -7,6 +7,27 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 ## [Unreleased]
 
+### File listings and diffs answer in pages
+- `GET /v1/files/{id}` and `GET /v1/diff` take `limit` and `after` and
+  answer `next` when more remain, like log, search and the ref log. Paths
+  come in byte order and a page reads only the trees it needs, so the first
+  page of a 90k-file listing no longer walks the whole tree. `limit` is
+  capped at 10,000 (`MAX_PATHS_LIMIT`); 0 or a non-number is 400. With
+  `renames=true` each rename is on the page of its `to` entry.
+- Requests without `limit` answer the whole list exactly as before, so older
+  clients are unaffected; capping them too is left for later.
+- The CLI and MCP server fetch listings and diffs (checkout, `diff`, `show`,
+  `merge`, `stash` and every other caller) in pages of 10,000, so no one
+  response is unbounded. Against an older server they get one full answer,
+  as before.
+- A page that would end at a path too long for a cursor is 400 with the new
+  error code `cursor_unrepresentable`; the CLI and MCP server then fetch the
+  whole list in one request, so repositories with very long paths still
+  check out, diff, merge and stash.
+- Diffs with rename detection (`leep diff --renames`) stay one request:
+  the server detects renames over the whole diff for every page, so paging
+  them would repeat that work.
+
 ### Land conflicts name only stored blobs
 - A land answered with conflicts now stores the merged text its `clean`
   changes name before answering. Before, a land that moved nothing never

@@ -369,7 +369,7 @@ behavior:
 
 - `GET /v1/diff` query: `renames=true|false` (default false) and
   `rename_threshold=0..100` (default 50; anything else is 400, also when
-  `renames` is false).
+  `renames` is false). Paged diffs (`limit`) are under "Page cursors".
 - `DiffResponse`: `renames: [RenameEntry]` and `renames_truncated: bool`, both
   `#[serde(default)]` and omitted from the JSON when empty or false. `entries` is
   unchanged: a rename is still a delete entry and an add entry.
@@ -1055,9 +1055,11 @@ an existing one needs a new `format`.
 
 ## Page cursors (additive API fields, no persisted change)
 
-`LogResponse`, `SearchResponse` and `RefLogResponse` gain an optional `next`
-(`#[serde(default)]`, omitted when absent), and `GET /v1/log/{id}`,
-`GET /v1/search/{rev}` and `GET /v1/reflog[/{name}]` accept `after=<cursor>`.
+`LogResponse`, `SearchResponse`, `RefLogResponse`, `FilesResponse` and
+`DiffResponse` gain an optional `next` (`#[serde(default)]`, omitted when
+absent), and `GET /v1/log/{id}`, `GET /v1/search/{rev}`,
+`GET /v1/reflog[/{name}]`, `GET /v1/files/{id}` and `GET /v1/diff` accept
+`after=<cursor>`.
 A response carries `next` when the page stopped before the end; the same
 request plus `after=<next>` returns the following page, and concatenated pages
 equal one uncapped answer. Requests without `after` answer exactly as before
@@ -1067,7 +1069,7 @@ send `next`, so new clients stop after one page.
 The cursor is opaque text, at most 4096 characters of base64url without
 padding (`leep_derive::MAX_CURSOR_CHARS`). Clients must not parse or build
 one. Today's layout (version 1) is `version (1 byte) | endpoint kind (1: log,
-2: search, 3: ref log) | fingerprint (16 bytes: the first bytes of BLAKE3 over
+2: search, 3: ref log, 4: files, 5: diff) | fingerprint (16 bytes: the first bytes of BLAKE3 over
 the kind and the postcard encoding of every query parameter that changes the
 answer, but not `limit`) | postcard body`:
 
@@ -1087,6 +1089,28 @@ answer, but not `limit`) | postcard body`:
   `line`), or after the last file finished (`line = u64::MAX`) when the scan
   budget cut the page short.
 - ref log: the `seq` bound (`before`) of the next page.
+- files and diff: the last path of the page (a postcard string); the next
+  page holds the paths after it in byte order. The fingerprint covers the
+  changeset id and the prefix with its `/`s trimmed (files), or `from`, `to`,
+  the trimmed prefix and the rename threshold when `renames=true`, else none
+  (diff). A path too long to fit a cursor cannot be paged past: that page is
+  400 with code `cursor_unrepresentable` (`CURSOR_UNREPRESENTABLE_MARKER`
+  ends its `error`), and the client repeats the request without `limit`.
+
+`GET /v1/files/{id}` and `GET /v1/diff` (added later than the others) page
+only when the request has `limit`; without it they answer the whole list in
+one response, exactly as before, so a client that predates paging is never
+cut short. `limit` above 10,000 (`leep_core::api::MAX_PATHS_LIMIT`) is
+lowered to it, and 0 or a non-number is 400 `invalid`. `files` and diff
+`entries` are sorted by path (byte order), as they always were. With
+`renames=true`, renames are detected over the whole diff on every page and
+each one is on the page that holds its `to` entry, so concatenated pages
+(entries, renames, and `renames_truncated`, which every page repeats) equal
+the unpaged answer.
+Each such page therefore costs a full walk and rename detection of the
+whole diff, so paging a renames diff of N pages costs about N unpaged
+requests; the CLI and MCP server ask for renames diffs without `limit`, and
+paging them is for UIs that want the first page early.
 
 The server treats a cursor as untrusted: it checks the length before
 decoding, then the version, kind and fingerprint, decodes the body strictly
@@ -1149,6 +1173,7 @@ client treats an unknown or absent code by its HTTP status.
 | 400 | `land_id_reused` | a land id the ref already recorded for another changeset (ADR 0057); `land` carries the record |
 | 400 | `invalid_name` | a ref name the validator refuses |
 | 400 | `ambiguous_prefix` | a short id matching several changesets (`AmbiguousPrefixResponse`) |
+| 400 | `cursor_unrepresentable` | a paged `GET /v1/files` or `/v1/diff` whose page would end at a path too long for a cursor (added with file and diff paging): repeat the request without `limit` |
 | 400 | `invalid` | any other bad request (also `405`) |
 | 401 | `unauthorized` | no token, or an unknown one |
 | 401 | `token_expired` | a known token past its `expires` (ADR 0007): fetch a new one; retrying will not help |

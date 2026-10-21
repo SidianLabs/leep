@@ -1346,6 +1346,114 @@ fn log_and_search_follow_page_cursors() {
     assert!(queries(&mock, "search").len() >= 7);
 }
 
+/// `files` and `diff` fetch every page of a server that caps them, so
+/// checkout and diff see the whole list while each request stays bounded.
+#[test]
+fn files_and_diff_follow_page_cursors() {
+    let mock = Mock::start();
+    let names: Vec<String> = (0..7).map(|i| format!("d{}/f{i}.txt", i % 3)).collect();
+    let seed: Vec<(&str, &str, FileKind)> = names
+        .iter()
+        .map(|n| (n.as_str(), n.as_str(), FileKind::Regular))
+        .collect();
+    let base = mock.seed(None, &seed, &[]);
+    // A rename (same bytes) and an edit, so pages carry renames too.
+    let tip = mock.seed(
+        Some(base),
+        &[
+            ("moved.txt", "d0/f0.txt", FileKind::Regular),
+            ("d1/f1.txt", "edited", FileKind::Regular),
+            ("new.txt", "new", FileKind::Regular),
+        ],
+        &["d0/f0.txt", "d2/f2.txt"],
+    );
+    let c = leep_cli::client::Client::new(&mock.url);
+    let whole_files = c.files(&tip, "").unwrap();
+    let whole_diff = c.diff_renames(Some(&base), &tip, None, None).unwrap();
+    assert_eq!(whole_files.files.len(), 7);
+    assert_eq!(whole_diff.entries.len(), 5);
+    assert_eq!(whole_diff.renames.len(), 1);
+    assert!(queries(&mock, "files")[0].contains("limit=10000"));
+
+    mock.data.lock().unwrap().page_cap = Some(2);
+    mock.data.lock().unwrap().queries.clear();
+    assert_eq!(c.files(&tip, "").unwrap(), whole_files);
+    let sent = queries(&mock, "files");
+    assert_eq!(sent.len(), 4, "{sent:?}");
+    assert!(!sent[0].contains("after=") && sent[1].contains("after=2"));
+    // Renames are one request without `limit`: the server pairs the whole
+    // diff for every page, so paging would repeat that work.
+    assert_eq!(
+        c.diff_renames(Some(&base), &tip, None, None).unwrap(),
+        whole_diff
+    );
+    let sent = queries(&mock, "diff");
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert!(!sent[0].contains("limit=") && sent[0].contains("renames=true"));
+    let plain = c.diff(Some(&base), &tip, None).unwrap();
+    assert_eq!(plain.entries, whole_diff.entries);
+    assert!(plain.renames.is_empty());
+    assert_eq!(queries(&mock, "diff").len(), 4);
+    let paged = c
+        .diff_page(Some(&base), &tip, None, Some(None), Some(2), None)
+        .unwrap();
+    assert_eq!(paged.entries[..], whole_diff.entries[..2]);
+    assert!(paged.next.is_some());
+    let one = c.files_page(&tip, "", Some(2), None).unwrap();
+    assert_eq!(one.files[..], whole_files.files[..2]);
+    assert!(one.next.is_some());
+
+    // A checkout lists the tree through the same pages.
+    let (wc_dir, cache) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let ctx = init_wc(&mock, wc_dir.path(), cache.path(), &[]).unwrap();
+    for f in &whole_files.files {
+        assert!(ctx.wc.abs(f.path.as_str()).is_file(), "{}", f.path);
+    }
+}
+
+/// A page that would end at a path too long for a cursor is refused with
+/// `cursor_unrepresentable`; `files` and `diff` then ask once without
+/// `limit` and use that whole answer, so long paths never break a checkout.
+#[test]
+fn files_and_diff_refetch_whole_when_a_cursor_cannot_hold_the_path() {
+    let mock = Mock::start();
+    let names: Vec<String> = (0..5).map(|i| format!("f{i}.txt")).collect();
+    let seed: Vec<(&str, &str, FileKind)> = names
+        .iter()
+        .map(|n| (n.as_str(), n.as_str(), FileKind::Regular))
+        .collect();
+    let tip = mock.seed(None, &seed, &[]);
+    let c = leep_cli::client::Client::new(&mock.url);
+    let whole_files = c.files(&tip, "").unwrap();
+    let whole_diff = c.diff(None, &tip, None).unwrap();
+    assert_eq!(whole_files.files.len(), 5);
+    assert_eq!(whole_diff.entries.len(), 5);
+    {
+        let mut d = mock.data.lock().unwrap();
+        d.page_cap = Some(2);
+        d.long_path_cursor = true;
+        d.queries.clear();
+    }
+    for list in ["files", "diff"] {
+        if list == "files" {
+            assert_eq!(c.files(&tip, "").unwrap(), whole_files);
+        } else {
+            assert_eq!(c.diff(None, &tip, None).unwrap(), whole_diff);
+        }
+        // First page, the refused second page, then one whole request.
+        let sent = queries(&mock, list);
+        assert_eq!(sent.len(), 3, "{list}: {sent:?}");
+        assert!(sent[0].contains("limit=10000") && !sent[0].contains("after="));
+        assert!(sent[1].contains("limit=10000") && sent[1].contains("after=2"));
+        assert!(!sent[2].contains("limit=") && !sent[2].contains("after="));
+    }
+    // One page past the long path surfaces the code to its caller.
+    let e = c
+        .files_page(&tip, "", Some(2), Some("2"))
+        .expect_err("the mock refuses later pages");
+    assert_eq!(e.server_code(), Some("cursor_unrepresentable"));
+}
+
 #[test]
 fn reflog_follows_cursors_and_falls_back_to_seq() {
     let mock = Mock::start();
