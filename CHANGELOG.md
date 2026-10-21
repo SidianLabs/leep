@@ -61,8 +61,8 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   list in docs/FORMATS.md, "Error codes"), so clients need not match message
   text. The global body cap's 413, the
   request timeout's 408 and unknown routes now answer `ErrorResponse` JSON
-  instead of plain text or an empty body. `token_expired` (401) is reserved
-  for token expiry; nothing sends it yet.
+  instead of plain text or an empty body. An expired token's 401 carries
+  `token_expired`.
 - The CLI and the MCP server go by `code` when the server sends one and fall
   back to the message markers for older servers. `--json` errors gain
   `server_code`.
@@ -74,6 +74,23 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   `--require-signatures`, `--require-review` or a review policy were
   protected, so any write token could rewind or delete `main` with a raw
   compare-and-swap (ADR 0015).
+
+### Reviewer capability
+- A tokens-file entry may say `"review": false` (`leep-server gen-token
+  --no-review`): the token cannot post reviews (403 `forbidden`) and its reviews, old or
+  new, do not count. Absent means true, as before. Recommended for agent
+  tokens (ADR 0011).
+- `leep` prints the server's reason for a 403 instead of always "token lacks
+  write access".
+
+### Token expiry
+- A tokens-file entry may carry `expires` (RFC 3339, e.g.
+  `2027-01-31T00:00:00Z`); after it the token gets 401 with code
+  `token_expired` (`token expired at ...`), which `leep` reports with a
+  hint. `leep-server gen-token
+  --expires-in 30d` writes it. Gauges `leep_tokens_expiring_soon` and
+  `leep_tokens_expired`, counter `leep_token_expired_requests_total`, and the
+  alert `LeepTokensExpiringSoon` (ADR 0007).
 
 ### Summary log entries
 - `GET /v1/log/{id}?fields=summary` answers the same entries, order and

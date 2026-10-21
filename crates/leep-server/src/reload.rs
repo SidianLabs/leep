@@ -334,6 +334,8 @@ impl ReloadReport {
                 rotated = ?t.rotated,
                 role_changed = ?t.role_changed,
                 limits_changed = ?t.limits_changed,
+                expiry_changed = ?t.expiry_changed,
+                review_changed = ?t.review_changed,
                 "tokens changed"
             );
         }
@@ -399,6 +401,39 @@ fn record_loaded(config: &RuntimeConfig, previous: Option<&str>) {
     metrics::gauge!("leep_config_info", "fingerprint" => config.fingerprint.clone()).set(1.0);
     metrics::gauge!("leep_config_generation").set(config.generation as f64);
     metrics::gauge!("leep_config_last_reload_timestamp_seconds").set(now_secs());
+    record_token_expiry(config, false);
+}
+
+/// Set `leep_tokens_expired` and `leep_tokens_expiring_soon` from the token
+/// table, and with `warn` log the names of tokens in either group. Expiry
+/// moves with the clock, not with reloads, so the server also calls this
+/// periodically ([`spawn_token_expiry_gauges`]).
+pub fn record_token_expiry(config: &RuntimeConfig, warn: bool) {
+    let r = config
+        .auth
+        .as_ref()
+        .map(|a| a.expiry_report(jiff::Timestamp::now()))
+        .unwrap_or_default();
+    metrics::gauge!("leep_tokens_expired").set(r.expired.len() as f64);
+    metrics::gauge!("leep_tokens_expiring_soon").set(r.soon.len() as f64);
+    if warn && !r.expired.is_empty() {
+        tracing::warn!(tokens = ?r.expired, "tokens in the tokens file have expired and are refused");
+    }
+    if warn && !r.soon.is_empty() {
+        tracing::warn!(tokens = ?r.soon, "tokens expire within 7 days");
+    }
+}
+
+/// Refresh the token expiry gauges every `every` for the life of the process.
+pub fn spawn_token_expiry_gauges(handle: Arc<ConfigHandle>, every: std::time::Duration) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(every);
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            record_token_expiry(&handle.current(), false);
+        }
+    });
 }
 
 impl ConfigHandle {
@@ -746,6 +781,21 @@ mod tests {
     }
 
     #[test]
+    fn review_true_is_the_same_config_as_no_field() {
+        let f = files();
+        let base = fp(&f);
+        f.put(
+            "tokens.json",
+            &serde_json::json!({ "tokens": [
+                { "name": "ci", "role": "write", "hash": hash_token("t1"), "review": true },
+                { "name": "viewer", "role": "read", "hash": hash_token("t2") },
+            ] })
+            .to_string(),
+        );
+        assert_eq!(fp(&f), base);
+    }
+
+    #[test]
     fn order_and_formatting_do_not_change_the_fingerprint() {
         let f = files();
         let base = fp(&f);
@@ -839,6 +889,28 @@ mod tests {
         let mut f = files();
         f.sources.limit_defaults.rate = Some(10.0);
         check("a default limit set", f);
+
+        let f = files();
+        f.put(
+            "tokens.json",
+            &serde_json::json!({ "tokens": [
+                { "name": "ci", "role": "write", "hash": hash_token("t1"), "expires": "2030-01-01T00:00:00Z" },
+                { "name": "viewer", "role": "read", "hash": hash_token("t2") },
+            ] })
+            .to_string(),
+        );
+        check("a token expiry set", f);
+
+        let f = files();
+        f.put(
+            "tokens.json",
+            &serde_json::json!({ "tokens": [
+                { "name": "ci", "role": "write", "hash": hash_token("t1"), "review": false },
+                { "name": "viewer", "role": "read", "hash": hash_token("t2") },
+            ] })
+            .to_string(),
+        );
+        check("a token barred from review", f);
 
         let f = files();
         f.put("keys.json", &keys(&[("alice", &key(1)), ("bob", &key(2))]));
@@ -988,6 +1060,35 @@ mod tests {
         assert_ne!(first, second);
         // The generation is a per-process count and moved on every reload.
         assert!(prom.render().contains("leep_config_generation 4"));
+    }
+
+    #[test]
+    fn expiry_gauges_count_expired_and_soon_to_expire_tokens() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let prom = recorder.handle();
+        let f = files();
+        let soon = (jiff::Timestamp::now() + std::time::Duration::from_secs(3600)).to_string();
+        f.put(
+            "tokens.json",
+            &serde_json::json!({ "tokens": [
+                { "name": "ci", "role": "write", "hash": hash_token("t1"), "expires": "2020-01-01T00:00:00Z" },
+                { "name": "agent", "role": "write", "hash": hash_token("t3"), "expires": soon },
+                { "name": "viewer", "role": "read", "hash": hash_token("t2"), "expires": "2999-01-01T00:00:00Z" },
+            ] })
+            .to_string(),
+        );
+        metrics::with_local_recorder(&recorder, || {
+            let h = f.handle();
+            let text = prom.render();
+            assert!(text.contains("leep_tokens_expired 1"), "{text}");
+            assert!(text.contains("leep_tokens_expiring_soon 1"), "{text}");
+            // A reload that renews the token clears it.
+            f.put("tokens.json", &tokens(&[("ci", "write", "t1")]));
+            h.reload().unwrap();
+            let text = prom.render();
+            assert!(text.contains("leep_tokens_expired 0"), "{text}");
+            assert!(text.contains("leep_tokens_expiring_soon 0"), "{text}");
+        });
     }
 
     #[test]

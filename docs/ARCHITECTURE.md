@@ -199,7 +199,7 @@ way.
 | `generation` | `1 + max(parents)`; roots = 1 | log ordering, ancestry |
 | `skiplist` | power-of-two first-parent ancestors | `is_ancestor`, `merge_base` |
 | `signature-v1` / `rebased-origin-v1` | attestations and server rebase links, keyed per (changeset, key) and per copy; not pure functions of the changeset, so written by `put_signature` and `rebase` rather than derived | signed-changeset listing and the land policy |
-| `review-v1` | review verdicts, keyed per (changeset, reviewer name) (`Hash::of_object("review", id‖name)`); attestations written by `put_review`, last write wins, listed with one lookup per principal | review listing and the review land policy |
+| `review-v1` | review verdicts, keyed per (changeset, reviewer name) (`Hash::of_object("review", id‖name)`); attestations written by `put_review`, last write wins, listed with one lookup per reviewer (write tokens without `"review": false`) | review listing and the review land policy |
 | `last_merge-v1` | generation of the nearest merge on the first-parent chain (0 if none) | lets `merge_base` answer from skiplists when no merge sits above the first-parent common ancestor |
 | `blob-claim-v1` / `blob-condemned-v1` / `blob-rescue-v1` / `blob-doom-v1` | per blob hash, 8-byte big-endian unix seconds (doom adds a state byte); GC bookkeeping, not derived from changesets: claims by uploads and dedup checks, condemnation by `gc condemn`, rescue by uploads of a condemned blob, doom by `gc collect` (ADR 0012) | blob garbage collection and the server's missing-blob checks |
 | `history-tree-v4` | the changeset's history pack (ADR 0045): the nodes of a tree parallel to `root_tree` recording for each path (including deleted ones) the newest changesets that changed it, as written by this changeset's derivation, and the address of its root. A pack is cut into parts of about 16 KB; this value is part 0 and `history-node-v4` rows hold the rest. Nodes are addressed by (writer, part, index) and name changesets through a table per part, so the hundreds of nodes a merge rewrites name its few dozen ids once; nodes of more than 64 entries are stored as content-defined chunks so an edit rewrites one chunk (ADR 0027), and a changed node, chunk or chunk list is stored as a patch on an earlier whole version that names the entries it replaces by position (ADR 0037). Built from the first parent's tree plus the spines of changed paths, and at merges the paths where the second parent's history differs from the merge base's (another parent's from the first's, for octopus or unrelated merges) (ADR 0013) | path log, `last-change` |
@@ -1006,7 +1006,8 @@ auth is off and the server warns, and it refuses a non-loopback `--listen`
 unless `--insecure-no-auth` is given.
 With it, an axum middleware requires `Authorization: Bearer <token>` on every
 endpoint except `GET /v1/health`: 401 (with `WWW-Authenticate: Bearer`) when the
-token is missing or unknown, 403 when a `read` token makes a mutating request.
+token is missing, unknown or past the entry's optional `expires` time, 403
+when a `read` token makes a mutating request.
 `POST /v1/blobs/missing` counts as read because it only queries; it takes at
 most 100,000 hashes (the CLI sends 10,000 at a time), and read tokens' bodies are capped at 1 MiB by default. Digests are
 compared in constant time, and only the token name is logged. Use

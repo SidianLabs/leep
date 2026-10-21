@@ -69,3 +69,23 @@ container whose port is published on the host's loopback only. An open server
 lets anyone rewrite every ref; a forgotten flag should fail loudly, not
 silently. The container image listens on `0.0.0.0`, so it now needs a tokens
 file or that variable.
+
+## Expiry, 2026-10-21
+Tokens never ended unless someone removed them, so a token made for a
+short-lived agent stayed valid long after the agent was gone. An entry may now
+carry `expires`, an RFC 3339 time with an offset. `require_token` refuses a
+matching token whose time has passed with 401, code `token_expired` and the
+message `token expired at <time>`. The match itself is unchanged (constant time over every entry), and
+saying "expired" reveals nothing to a caller who does not hold the token.
+`leep-server gen-token --expires-in <duration>` writes the field, rounded to
+the second. An expired entry is not an error in the file, so expiry needs no
+edit at the moment it happens; it is logged as a warning at startup and on
+every reload. The gauges `leep_tokens_expiring_soon` (within 7 days) and
+`leep_tokens_expired`, refreshed every minute, feed the
+`LeepTokensExpiringSoon` alert, and `leep_token_expired_requests_total{token}`
+counts refusals. The field enters the config fingerprint only when set, so
+files without it keep their fingerprint. Expiry uses the server's clock: hosts
+must keep time. The CLI shows the server's message and a hint for an expired
+token instead of the fixed 401 text. The tokens file only gains an optional
+field (FORMATS.md rule 4).
+

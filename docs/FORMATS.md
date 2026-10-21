@@ -1143,8 +1143,8 @@ client treats an unknown or absent code by its HTTP status.
 | 400 | `ambiguous_prefix` | a short id matching several changesets (`AmbiguousPrefixResponse`) |
 | 400 | `invalid` | any other bad request (also `405`) |
 | 401 | `unauthorized` | no token, or an unknown one |
-| 401 | `token_expired` | a known token that has expired: fetch a new one; retrying will not help |
-| 403 | `forbidden` | a `read` token on a request that writes |
+| 401 | `token_expired` | a known token past its `expires` (ADR 0007): fetch a new one; retrying will not help |
+| 403 | `forbidden` | a `read` token on a write, or a `"review": false` token posting a review |
 | 404 | `ref_missing` | a land onto a missing ref with `create: false` (ADR 0036) |
 | 404 | `not_found` | anything else that does not exist |
 | 408 | `timeout` | the request timeout ran out; the request may or may not have applied |

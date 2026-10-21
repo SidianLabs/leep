@@ -41,6 +41,7 @@ every runbook.
 | [LeepBroadThrottling](#leepbroadthrottling) | ticket | more than 5% of all requests are 429 for 15 minutes |
 | [LeepBlobCacheColdHitRatio](#leepblobcachecoldhitratio) | ticket | blob cache hit ratio below 50% for 30 minutes |
 | [LeepConfigReloadFailed](#leepconfigreloadfailed) | page | a SIGHUP reload was refused |
+| [LeepTokensExpiringSoon](#leeptokensexpiringsoon) | ticket | a token expires within 7 days, or has expired and is still in the tokens file, for 1 hour |
 | [LeepConfigSkew](#leepconfigskew) | ticket | servers report different config fingerprints for 15 minutes |
 | [LeepSchemaVersionSkew](#leepschemaversionskew) | ticket | servers report different schema versions for 1 hour |
 | [LeepMixedVersions](#leepmixedversions) | ticket | servers report different `version` for 2 hours |
@@ -1042,6 +1043,54 @@ refuses to start on the bad file.
 digests and keys removed, and the [standard bundle](#collecting-a-bug-report).
 
 <a id="leepconfiggenerationskew"></a>
+
+## LeepTokensExpiringSoon
+
+**Meaning.** At least one entry of the tokens file has an `expires` time within
+the next 7 days (`leep_tokens_expiring_soon`), or in the past while the entry is
+still listed (`leep_tokens_expired`), for an hour. **Ticket.** Expiry is how
+short-lived agent credentials end by themselves; this is the reminder to rotate
+the ones still needed and to remove the rest.
+
+**Impact.** None yet for a token expiring soon. Once it expires, every request
+with it gets 401 with code `token_expired` (`authentication required: token
+expired at <time>`), which `leep` reports with a hint to get a new token; the
+agent stops working. Other tokens are unaffected.
+
+**Diagnose.**
+
+1. Which tokens: the server logs `tokens expire within 7 days` and `tokens in
+   the tokens file have expired and are refused` with their names at startup and
+   on every SIGHUP. Without access to logs, read the file:
+   `jq -r '.tokens[] | select(.expires) | "\(.expires) \(.name)"' tokens.json | sort`.
+2. Still in use? `sum by (token) (increase(leep_token_expired_requests_total[1h]))`
+   shows expired tokens that agents still present.
+3. Several servers: each reads its own file; compare
+   [LeepConfigSkew](#leepconfigskew) if only some servers report it.
+
+**Likely causes.**
+
+1. A token created with `gen-token --expires-in` is nearing its end as
+   intended. Confirm: step 1, a name you recognise.
+2. An agent or job that finished long ago, whose entry nobody removed. Confirm:
+   step 2 shows no requests.
+3. A clock problem on the server (a time far ahead makes tokens look expired).
+   Confirm: `date -u` on the host against a reference.
+
+**Mitigate / fix.**
+
+- Still needed: `leep-server gen-token --name NAME --role ROLE --expires-in 30d`,
+  replace the entry's `hash` and `expires` (or add a second entry and remove the
+  old one later), SIGHUP every server, then hand the new token to the agent
+  ([Reloading config](DEPLOY.md#reloading-config)).
+- No longer needed: remove the entry and SIGHUP; the gauge drops on the reload.
+- To extend without rotating, change only `expires` and SIGHUP; the token
+  itself does not change.
+- Do not remove `expires` from agent tokens to silence the alert: a token that
+  never ends outlives the agent it was made for.
+
+**Escalate / collect.** The token names and `expires` values (never the
+hashes), the server time, and the reload log lines.
 
 ## LeepConfigSkew
 

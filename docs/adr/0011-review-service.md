@@ -241,3 +241,24 @@ See [SECURITY-REVIEW.md](../SECURITY-REVIEW.md).
   protected tree so such variants still need an owner.
 - Unowned paths still take any approval, including the pusher's own
   (S-15, as documented above); a root `OWNERS` file avoids that too.
+
+## Reviewer capability, 2026-10-21
+Every write token was a reviewer, so in a deployment of many agents with write
+tokens any agent could approve another's change, and its own on paths no
+`OWNERS` file covers (S-15). A tokens-file entry may now say `"review": false`
+(absent means true, so existing files keep their behaviour). Such a token is
+left out of `Auth::reviewers`, so it is not one of the principals whose review
+rows are looked up: its reviews, including ones it posted before the change,
+neither list nor count. `POST /v1/changesets/{id}/reviews` with it answers 403
+`token may not review: its tokens-file entry has "review": false` before
+anything is read. Everything else a write token does is unchanged. The field
+reloads on SIGHUP (ADR 0024), enters the config fingerprint only when false,
+and is reported as `review_changed` in the reload log. `gen-token
+--no-review` writes it, and DEPLOY.md recommends it for every agent token. The
+CLI now prints the server's 403 reason instead of always saying the token
+lacks write access. The tokens file only gains an optional field.
+Turning review off deletes nothing: the token's `review-v1` rows stay in the
+store, unlisted and uncounted, and setting the field back to true (or removing
+it) makes them list and count again from the next request, approvals included.
+To withdraw such a token's past approvals for good, have it post a `reject` (or
+another verdict) while it may still review, or rotate it to a new name.
