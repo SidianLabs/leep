@@ -1475,9 +1475,15 @@ mod rewriting {
     use axum::response::Response;
     use serde_json::{json, Value};
 
-    /// 0: pass through. 1: `land_id_reused` refusals lose the changeset id
-    /// (as an older or reworded server might send them). 2: also drop land
-    /// ids from the ref log, so the record cannot be found.
+    /// Flags; 0 passes through. Each strips what an older or reworded
+    /// server might not send.
+    /// `land_id_reused` refusals lose the changeset id from their text.
+    pub const REWORD: u8 = 1;
+    /// `land_id_reused` refusals lose their `land` record (pre-#130 servers).
+    pub const DROP_RECORD: u8 = 2;
+    /// The ref log loses its land ids, so the record cannot be found there.
+    pub const DROP_LOG: u8 = 4;
+
     async fn rewrite(State(mode): State<Arc<AtomicU8>>, req: Request, next: Next) -> Response {
         let reflog = req.uri().path().starts_with("/v1/reflog");
         let resp = next.run(req).await;
@@ -1490,9 +1496,14 @@ mod rewriting {
         let mut out = bytes.to_vec();
         if let Ok(mut v) = serde_json::from_slice::<Value>(&bytes) {
             if v["code"] == "land_id_reused" {
-                v["error"] = json!("this land id was used before; use a new land id");
+                if m & REWORD != 0 {
+                    v["error"] = json!("this land id was used before; use a new land id");
+                }
+                if m & DROP_RECORD != 0 {
+                    v.as_object_mut().unwrap().remove("land");
+                }
             }
-            if m == 2 && reflog {
+            if m & DROP_LOG != 0 && reflog {
                 for e in v["entries"].as_array_mut().into_iter().flatten() {
                     e.as_object_mut().unwrap().remove("land_id");
                     e.as_object_mut().unwrap().remove("land_changeset");
@@ -1511,11 +1522,14 @@ mod rewriting {
     }
 }
 
-/// A `land_id_reused` refusal that does not name the earlier changeset is
-/// answered from the ref log; when the log cannot say either, the tool
-/// reports that the request landed before and lands nothing.
+/// A `land_id_reused` refusal is answered from its `land` record, which needs
+/// neither its text nor the ref log; from an older server without the record,
+/// from the changeset its text names; failing that, from the ref log; and
+/// when the log cannot say either, the tool reports that the request landed
+/// before and lands nothing.
 #[test]
-fn land_id_refusal_without_an_id_falls_back_to_the_ref_log() {
+fn land_id_refusal_is_read_from_the_record_then_text_then_ref_log() {
+    use rewriting::{DROP_LOG, DROP_RECORD, REWORD};
     use std::sync::atomic::{AtomicU8, Ordering};
     use std::sync::Arc;
 
@@ -1533,13 +1547,19 @@ fn land_id_refusal_without_an_id_falls_back_to_the_ref_log() {
         json!({ "message": "o", "changes": [{ "path": "o.txt", "content": "o\n" }] }),
     ));
 
-    mode.store(1, Ordering::SeqCst);
-    let again = data(&commit(&Server::new(config(&url)), args.clone()));
-    assert_eq!(again["from_record"], true);
-    assert_eq!(again["changeset"], first["changeset"]);
-    assert_eq!(again["landed"], first["landed"]);
+    for (m, path) in [
+        (REWORD | DROP_LOG, "the record"),
+        (DROP_RECORD | DROP_LOG, "the text of an older server"),
+        (REWORD | DROP_RECORD, "the ref log"),
+    ] {
+        mode.store(m, Ordering::SeqCst);
+        let again = data(&commit(&Server::new(config(&url)), args.clone()));
+        assert_eq!(again["from_record"], true, "from {path}");
+        assert_eq!(again["changeset"], first["changeset"], "from {path}");
+        assert_eq!(again["landed"], first["landed"], "from {path}");
+    }
 
-    mode.store(2, Ordering::SeqCst);
+    mode.store(REWORD | DROP_RECORD | DROP_LOG, Ordering::SeqCst);
     let s = Server::new(config(&url));
     let head = data(&call(&s, "leep_refs", json!({})))["refs"]["main"].clone();
     let lost = commit(&s, args);

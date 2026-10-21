@@ -489,11 +489,7 @@ impl Server {
         target_ref: &str,
         land_id: &LandId,
     ) -> Result<Option<ChangesetId>, CliError> {
-        let named = refusal
-            .message()
-            .split_once("already landed ")
-            .and_then(|(_, rest)| rest.get(..64))
-            .and_then(|hex| hex.parse::<ChangesetId>().ok());
+        let named = refused_changeset(refusal, land_id);
         if named.is_some() {
             return Ok(named);
         }
@@ -591,6 +587,19 @@ impl Server {
     }
 }
 
+/// The changeset a `land_id_reused` refusal of `land_id` names: its `land`
+/// record, or, from servers older than that field, its text.
+fn refused_changeset(refusal: &CliError, land_id: &LandId) -> Option<ChangesetId> {
+    if let Some(land) = refusal.land_refusal().filter(|l| &l.land_id == land_id) {
+        return Some(land.changeset);
+    }
+    refusal
+        .message()
+        .split_once("already landed ")
+        .and_then(|(_, rest)| rest.get(..64))
+        .and_then(|hex| hex.parse::<ChangesetId>().ok())
+}
+
 /// Paths whose change differs between two change maps (content or delete;
 /// the kind is ignored, since a retry may infer it differently).
 fn differing_paths(
@@ -627,4 +636,64 @@ fn land_error(e: CliError, changeset: ChangesetId) -> ToolError {
 /// A land refused because the ref does not exist and may not be created.
 fn missing_ref(e: &CliError) -> bool {
     e.kind() == ErrorKind::NotFound && e.is_server(error_code::REF_MISSING, MISSING_REF_MARKER)
+}
+
+#[cfg(test)]
+mod tests {
+    use leep_core::api::LandRefusal;
+
+    use super::*;
+
+    fn cs(c: char) -> ChangesetId {
+        c.to_string().repeat(64).parse().unwrap()
+    }
+
+    fn reused_text(id: &LandId, earlier: ChangesetId, requested: ChangesetId) -> String {
+        format!(
+            "invalid input: land id {id} already landed {earlier}; use a new land id to land \
+             {requested}"
+        )
+    }
+
+    #[test]
+    fn a_reused_land_id_is_read_from_the_record() {
+        let id = request_land_id("bob", None, "main", "r1");
+        // The record wins over text that names another changeset.
+        let e = CliError::user(reused_text(&id, cs('c'), cs('d')))
+            .with_server_code(Some(error_code::LAND_ID_REUSED.into()))
+            .with_land_refusal(Some(Box::new(LandRefusal {
+                land_id: id.clone(),
+                changeset: cs('a'),
+                landed: Some(cs('b')),
+            })));
+        assert_eq!(refused_changeset(&e, &id), Some(cs('a')));
+        // A reworded message does not matter when the record is there.
+        let e = CliError::user("this land id was used before").with_land_refusal(Some(Box::new(
+            LandRefusal {
+                land_id: id.clone(),
+                changeset: cs('a'),
+                landed: None,
+            },
+        )));
+        assert_eq!(refused_changeset(&e, &id), Some(cs('a')));
+    }
+
+    #[test]
+    fn a_reused_land_id_falls_back_to_the_text_of_an_older_server() {
+        let id = request_land_id("bob", None, "main", "r1");
+        let e = CliError::user(reused_text(&id, cs('a'), cs('d')));
+        assert!(e.land_refusal().is_none());
+        assert_eq!(refused_changeset(&e, &id), Some(cs('a')));
+        // A record for another land id is not this land's: use the text.
+        let other = request_land_id("bob", None, "main", "r2");
+        let e = e.with_land_refusal(Some(Box::new(LandRefusal {
+            land_id: other,
+            changeset: cs('b'),
+            landed: None,
+        })));
+        assert_eq!(refused_changeset(&e, &id), Some(cs('a')));
+        // Neither record nor text: the caller scans the ref log.
+        let e = CliError::user("this land id was used before; use a new land id");
+        assert_eq!(refused_changeset(&e, &id), None);
+    }
 }
