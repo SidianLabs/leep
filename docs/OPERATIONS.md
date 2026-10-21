@@ -43,6 +43,9 @@ measured until the response head is ready, not until the body is streamed.
 | `leep_land_lock_wait_seconds` | histogram | none | Time a land waited in its ref's in-process queue before its batch started (the name dates from the per-ref lock that batching replaced). |
 | `leep_land_batch_size` | histogram | none | Lands taken by each batch (group commit, ADR 0032), cancelled ones excluded. 1 means no contention; under load it approaches the number of lands queued behind one batch, at most 64. |
 | `leep_land_cancelled_total` | counter | none | Lands whose caller went away (timeout, disconnect) while queued, dropped before their batch replayed them. |
+| `leep_land_batch_deadline_total` | counter | none | Lands answered 409 because their batch was still retrying 60 s after its first attempt (`MAX_BATCH_LIFETIME`, ADR 0059) and gave up instead of moving the ref. Clients resend; keyed lands are then answered from their record. Anything but rare means a store so slow, or a ref so contended, that lands do not finish. |
+| `leep_land_answered_from_record_total` | counter | `original` = `present`, `missing` | Keyed lands answered from their land id record instead of landing again (ADR 0057). `missing`: the changeset was no longer stored (garbage collected, ADR 0059) and the record answered without reading it. |
+| `leep_gc_changesets_rescued_total` | counter | `by` = `create`, `land`, `ref`, `attest`, `mirror` | Condemned changesets a writer rescued because it was about to store something naming them (ADR 0059): a child, a land, a ref move, a signature or review, a git mirror map. 0 until a changeset sweep condemns; a steady rate means agents build on changesets the sweep found unreachable. |
 | `leep_land_leases_held` | gauge | none | Refs whose land lease this server holds ([Several servers on one ref](#several-servers-on-one-ref), ADR 0056). |
 | `leep_land_lease_acquired_total` | counter | none | Land leases this server took. Under steady traffic about one per hot ref per server restart; more means leases change hands. |
 | `leep_land_lease_lost_total` | counter | `reason` = `taken`, `idle` | Leases this server stopped holding: another server took it after this one failed to renew it for the TTL (`taken`), or it released it after 30 s without a land (`idle`). |
@@ -151,6 +154,15 @@ groups:
     annotations:
       summary: "A land lost the ref compare-and-swap on all 32 attempts; other writers are racing it for the same ref."
       runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leeplandexhausted
+  - alert: LeepLandBatchDeadline
+    expr: |
+      sum(increase(leep_land_batch_deadline_total[10m])) > 0
+      or
+      sum(leep_land_batch_deadline_total unless leep_land_batch_deadline_total offset 10m) > 0
+    labels: {severity: ticket}
+    annotations:
+      summary: "A land batch was still retrying 60 s after it started and answered its lands 409: the metadata store is very slow, or the ref is badly contended."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leeplandbatchdeadline
   - alert: LeepLandCasLossesHigh
     expr: sum(rate(leep_land_cas_losses_total[15m])) / sum(rate(leep_land_total[15m])) > 1
     for: 15m
@@ -902,6 +914,20 @@ server whose `GET /v1/ready` lists `land-id` in `features`; against an
 older server it stops and says the land may have applied (check `leep
 reflog REF`). Other clients that resend across runs should do the same.
 
+**Migration 7 (`changesets.stored_at`, ADR 0059).** Adds one nullable
+column with no default: on Postgres and SQLite a catalog change that
+rewrites no row, so once it has its lock it is instant on any size, and it
+may run beside servers of the previous version. On Postgres that lock is
+ACCESS EXCLUSIVE on `changesets` and waits for every open transaction that
+read the table, while every new reader and writer queues behind it. **Do
+not run it while a backup or `gc --unreachable --dry-run` is in flight.**
+On Postgres, Leep's migrations wait at most 5 s for a table lock (`lock_timeout`) and
+then fail without changing anything (`could not lock a table within 5s`);
+run `leep-server migrate` again when the long transaction has finished. They keep storing changesets without the column,
+which read as stored when the migration ran; finish the rollout before the
+first changeset condemnation (see [Changeset garbage
+collection](#changeset-garbage-collection)).
+
 **Derived kinds that change encoding.** A release that changes how a derived
 kind is stored gives it a new name, so old and new servers never read each
 other's rows; nothing to migrate. The new kind derives on first use, which on
@@ -1286,6 +1312,85 @@ means a request exceeded `--request-timeout`.
 
 Upgrade note: servers built before ADR 0012 ignore condemnations. Upgrade every
 server before the first `condemn`.
+
+### Sizing what unreachable changesets cost
+
+Changesets are never deleted, so originals of rebased lands, abandoned work
+and `leep sync` snapshots stay forever. ADR 0059 (proposed) would collect
+them; see [Changeset garbage collection](#changeset-garbage-collection). To
+measure what it would reclaim on a store, run the read-only count:
+
+```sh
+nice -n 19 leep-server --meta-pool-size 4 --meta "$LEEP_META" --blobs "$LEEP_BLOBS" \
+  gc --dry-run --unreachable --grace 0 --ref-log-retention 0
+```
+
+It writes nothing. Postgres sessions refuse writes
+(`default_transaction_read_only`), and SQLite opens with `mode=ro`; a
+`--meta` URL that already sets `options=` or `mode=` is refused. It
+reports:
+
+- the unreachable changesets by age and kind;
+- the changesets and per-changeset rows older than `--grace`, with their
+  logical bytes;
+- the tree nodes and contents only those changesets introduced;
+- the store's logical sizes (rows and bytes per derived kind, changesets,
+  ref log, refs);
+- per land, side by side: write-path bytes, index bytes and reclaimable
+  bytes. All are logical; the physical database size is printed apart and
+  runs 2.5 to 3.5 times larger on Postgres.
+
+A second column shows what keeping the ref log only `--ref-log-retention`
+would add, for a later decision. Use `--grace 0` on a store whose lands
+are all recent. Ages come from when the store first stored each changeset
+(`changesets.stored_at`, schema v7), never from the client's timestamp; a
+changeset stored before migration 0007 counts as stored when it was
+applied. The count needs a v7 schema: run `leep-server migrate` first.
+
+Tree counts are an upper bound. `--exact-trees` makes them exact by walking
+every reachable tree, which costs as much as `gc --full`. **Do not use it
+on a small host beside live servers, such as the 2-core VPS.** Memory is
+about 60 bytes per changeset, plus one hash per live object with
+`--exact-trees`.
+
+## Changeset garbage collection
+
+ADR 0059 will delete changesets that nothing reaches (refs, every ref log
+entry, the landed-copy scan window of every head, attestations, git mirror
+maps, and a grace period) with the condemn, fence and collect protocol
+blob GC uses. **Phase 1 is built: nothing condemns or deletes yet.** It is
+what every server must run before a sweep may run beside it. Deleting
+(`MetaStore::delete_changesets`) and the sweep itself come with phase 2.
+Phase 1 is:
+
+- **Store times.** Migration 0007 adds `changesets.stored_at`, written on
+  every new changeset; sweeps and the dry run age changesets by it. It is
+  a catalog-only `ADD COLUMN` on both backends and tolerates servers of
+  the previous version, which leave it NULL (read as the migration's
+  time).
+- **Rescues.** Before a server stores anything that names an existing
+  changeset (a child, a land, a rebase or merge, a ref move including
+  `leep undo`, a signature or review), and `leep-git export` before it
+  writes a mirror map, it checks whether a sweep condemned that changeset,
+  and if so rescues it and its condemned ancestors
+  (`leep_gc_changesets_rescued_total`). The check reads one row
+  (`gc-fence-active-v1`) at most every 10 s per server while no sweep runs.
+- **Land batches** read that row on every attempt, and give up with a
+  retryable 409 after 60 s (`leep_land_batch_deadline_total`), which bounds
+  how long after its check a batch can still move a ref.
+- **Land ids outlive originals.** A keyed land retry whose changeset is no
+  longer stored is answered from its land id record
+  (`leep_land_answered_from_record_total{original="missing"}`).
+- **Metrics and alert:** `leep_gc_changesets_rescued_total`,
+  `leep_land_batch_deadline_total` and
+  `leep_land_answered_from_record_total` (see [Metrics](#metrics)), and
+  [LeepLandBatchDeadline](RUNBOOKS.md#leeplandbatchdeadline).
+- `GET /v1/ready` lists `changeset-rescue`.
+
+**Before the first condemnation** (phase 2), upgrade every server, importer
+and tool that writes to the store to a release that lists
+`changeset-rescue`: an older one neither rescues nor re-checks, exactly as
+servers from before ADR 0012 did for blobs.
 
 ## Packing blobs
 

@@ -34,6 +34,29 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   after another along the path's history: they read them in one batch per
   page.
 
+### Changeset garbage collection, phase 1 (ADR 0059)
+- Migration 0007 adds `changesets.stored_at`, the unix time a changeset was
+  first stored, written by every new changeset. A catalog-only `ADD COLUMN`
+  on Postgres and SQLite that tolerates servers of the previous version;
+  older rows read as stored when the migration ran. Backups carry it.
+- Postgres migrations wait at most 5 s for a table lock (`lock_timeout`)
+  and then fail, changing nothing, instead of queueing every reader and
+  writer behind a long transaction such as a backup. Rerun
+  `leep-server migrate` once it has finished.
+- Servers now rescue changesets a changeset sweep has condemned before
+  storing anything that names them (children, lands, rebases, merges, ref
+  moves including `leep undo`, signatures, reviews, `leep-git export` mirror
+  maps). Nothing condemns yet; while no sweep runs this costs one cached
+  read every 10 s per server. `GET /v1/ready` lists `changeset-rescue`.
+- A land batch reads the sweep's flag on every attempt and gives up with a
+  retryable 409 after 60 s instead of retrying up to 32 times without a
+  time bound (`leep_land_batch_deadline_total`).
+- A keyed land retry whose changeset is no longer stored is answered from
+  its land id record instead of 404
+  (`leep_land_answered_from_record_total`).
+- `gc --unreachable --dry-run` ages changesets by `stored_at` instead of
+  the client's timestamp, and needs schema v7.
+
 ### One indexer per index group (ADR 0058)
 - `leep-server --indexing local|lease|off` (default `local`, unchanged). In
   `lease` mode each index group (path history, log filter, code search) is
@@ -702,6 +725,13 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   59 s (packed store). `gc --full` walks everything and rewrites the record;
   `repair drop` refuses the kind, and `verify` checks its rows. New example
   `gc_profile` times GC phases and counts store calls.
+- `leep-server gc --unreachable --dry-run` counts what garbage collection of
+  unreachable changesets (ADR 0059, proposed) would reclaim: changesets no
+  ref, ref log entry, scan window, attestation or mirror map reaches, their
+  per-changeset rows and the tree nodes and contents only they introduced,
+  beside the store's logical write-path and index bytes per land and, for a
+  later ADR, what a `--ref-log-retention` would add. Read-only: Postgres
+  sessions refuse writes and SQLite opens with `mode=ro`.
 - Filtered logs use an index (ADR 0047). `GET /v1/log` with `author=` or
   `extra=` and no path (`leep log --author`, `--agent`, `--agent-model`,
   `--agent-session`) used to test every ancestor, so a rare value read the

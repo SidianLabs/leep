@@ -1002,7 +1002,7 @@ async fn upgrade_from_v4_adds_land_ids() {
         assert_eq!(plan.from, 4, "{kind}");
         assert_eq!(
             plan.pending.iter().map(|m| m.name).collect::<Vec<_>>(),
-            ["land_ids", "leases"],
+            ["land_ids", "leases", "changeset_stored_at"],
             "{kind}"
         );
         let s = db.open(db.compiled(), SchemaMode::Migrate).await.unwrap();
@@ -1031,6 +1031,89 @@ async fn upgrade_from_v4_adds_land_ids() {
             .unwrap());
         let found = s.find_lands("trunk", &[id]).await.unwrap();
         assert_eq!(found[0].unwrap().landed, next, "{kind}");
+        drop(s);
+        db.cleanup().await;
+    }
+}
+
+/// A database at v6 upgrades to `changesets.stored_at` (ADR 0059) beside a
+/// v6 server that keeps running: rows from before the migration, and rows
+/// that server stores afterwards without naming the column, read as stored
+/// when the migration was applied; rows stored by the new code read as
+/// stored when they were. Compaction rewrites `data` only and keeps the
+/// column.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn upgrade_from_v6_adds_stored_at() {
+    let v6 = crate::STORED_AT_SCHEMA_VERSION as usize - 1;
+    for db in dbs("fromv6").await {
+        let kind = db.kind();
+        let d = data();
+        // A v6 server, open across the upgrade.
+        let old = db
+            .open(&db.compiled()[..v6], SchemaMode::Migrate)
+            .await
+            .unwrap();
+        load(&db, &STAGES[1], &d).await;
+        let plan = db.report(db.compiled()).await;
+        assert_eq!(plan.from, v6 as u64, "{kind}");
+        assert_eq!(
+            plan.pending.iter().map(|m| m.name).collect::<Vec<_>>(),
+            ["changeset_stored_at"],
+            "{kind}"
+        );
+        assert!(
+            old.changesets_stored_at(&[d.changesets[0].id()])
+                .await
+                .is_err(),
+            "{kind}: a v6 schema has no store times to report"
+        );
+        db.migrate(db.compiled(), false).await.unwrap();
+        let applied_at = db
+            .report(db.compiled())
+            .await
+            .applied
+            .iter()
+            .find(|m| m.version == crate::STORED_AT_SCHEMA_VERSION)
+            .unwrap()
+            .applied_at as u64;
+        let s = db
+            .open(db.compiled(), SchemaMode::RequireCurrent)
+            .await
+            .unwrap();
+        let ids: Vec<ChangesetId> = d.changesets.iter().map(Changeset::id).collect();
+        let got = s.changesets_stored_at(&ids).await.unwrap();
+        assert!(
+            got.iter().all(|t| *t == Some(applied_at)),
+            "{kind}: {got:?} vs {applied_at}"
+        );
+        verify(&*s, &STAGES[1], &d, LATEST as u64).await;
+        // The v6 server stores without naming the column.
+        let late = crate::tests::cs(616161);
+        old.put_changeset(&late).await.unwrap();
+        drop(old);
+        assert_eq!(
+            s.changesets_stored_at(&[late.id()]).await.unwrap(),
+            [Some(applied_at)],
+            "{kind}"
+        );
+        let fresh = s.put_changeset(&crate::tests::cs(626262)).await.unwrap();
+        let now = leep_core::store::unix_now() as u64;
+        let at = s.changesets_stored_at(&[fresh]).await.unwrap()[0].unwrap();
+        assert!(at >= applied_at && at <= now, "{kind}: {at}");
+        // A writer whose clock read before 1970 cannot make a row look
+        // older than the column: it reads as the migration's time.
+        let skewed = s.put_changeset(&crate::tests::cs(636363)).await.unwrap();
+        db.exec(
+            "UPDATE changesets SET stored_at = -5 WHERE id = ?",
+            vec![Arg::Bytes(skewed.0.as_bytes().to_vec())],
+        )
+        .await;
+        assert_eq!(
+            s.changesets_stored_at(&[skewed]).await.unwrap(),
+            [Some(applied_at)],
+            "{kind}"
+        );
+        assert_eq!(db.objects().await, full_schema(), "{kind}");
         drop(s);
         db.cleanup().await;
     }
@@ -1322,6 +1405,65 @@ async fn failed_migration_rolls_back_fully() {
         drop(s);
         db.cleanup().await;
     }
+}
+
+/// On Postgres, a migration whose `ALTER TABLE` cannot get its lock (a long
+/// transaction, such as a backup snapshot, holds the table) gives up after
+/// the lock timeout with a retry message instead of queueing every reader
+/// and writer behind it, and changes nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn migration_blocked_by_a_long_transaction_times_out() {
+    let Some(db) = Db::pg("locktimeout").await else {
+        return;
+    };
+    let Db::Pg { url, schema } = &db else {
+        unreachable!()
+    };
+    let s = db.open(db.compiled(), SchemaMode::Migrate).await.unwrap();
+    drop(s);
+    const ALTER: Migration = Migration {
+        version: LATEST + 1,
+        name: "alter",
+        sql: "ALTER TABLE changesets ADD COLUMN extra BIGINT;",
+        satisfied_by: &[],
+    };
+    let holder = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(url)
+        .await
+        .unwrap();
+    let mut tx = holder.begin().await.unwrap();
+    sqlx::query(&format!(
+        "LOCK TABLE \"{schema}\".changesets IN ACCESS SHARE MODE"
+    ))
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    let started = std::time::Instant::now();
+    let err = db
+        .migrate(&with(db.compiled(), &[ALTER]), false)
+        .await
+        .expect_err("times out");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(30),
+        "{:?}",
+        started.elapsed()
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("could not lock a table") && msg.contains("retry"),
+        "{msg}"
+    );
+    tx.rollback().await.unwrap();
+    holder.close().await;
+    assert_eq!(db.report(db.compiled()).await.from, LATEST as u64);
+    // Once the transaction ends, the same migration applies.
+    let r = db
+        .migrate(&with(db.compiled(), &[ALTER]), false)
+        .await
+        .unwrap();
+    assert_eq!(r.to, LATEST as u64 + 1);
+    db.cleanup().await;
 }
 
 /// Many migrators at once (separate pools, as separate servers would be)

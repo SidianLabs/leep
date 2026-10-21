@@ -210,6 +210,11 @@ pub const FEATURE_LAND_ID: &str = "land-id";
 /// (ADR 0058).
 pub const FEATURE_INDEXING_RETRY: &str = "indexing-retry";
 
+/// In [`ReadyResponse::features`]: the server rescues condemned changesets
+/// before it writes anything that names them, so a changeset garbage
+/// collection may run beside it (ADR 0059).
+pub const FEATURE_CHANGESET_RESCUE: &str = "changeset-rescue";
+
 /// One store that failed its readiness check.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReadyFailure {

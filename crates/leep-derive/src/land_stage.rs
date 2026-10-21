@@ -86,7 +86,7 @@ impl Staging {
 
     /// A handle on `repo` (same caches and policy) whose writes stage here.
     pub(crate) fn repo(self: &Arc<Self>, repo: &Repo) -> Repo {
-        repo.with_stores(
+        let mut staged = repo.with_stores(
             Arc::new(StagedBlobs {
                 inner: Arc::clone(repo.blobs()),
                 staging: Arc::clone(self),
@@ -95,7 +95,11 @@ impl Staging {
                 inner: Arc::clone(repo.meta()),
                 staging: Arc::clone(self),
             }),
-        )
+        );
+        // A rescue must be durable before its doom read; the batch makes
+        // its own, uncached, before it moves the ref (ADR 0059).
+        staged.rescues_on_write = false;
+        staged
     }
 
     /// Read the changesets a batch lands and the root trees of them and of
@@ -337,6 +341,10 @@ impl MetaStore for StagedMeta {
         ids: &[leep_core::LandId],
     ) -> Result<Vec<Option<leep_core::LandRecord>>> {
         self.inner.find_lands(name, ids).await
+    }
+
+    async fn changesets_stored_at(&self, ids: &[ChangesetId]) -> Result<Vec<Option<u64>>> {
+        self.inner.changesets_stored_at(ids).await
     }
 
     async fn ref_log(
