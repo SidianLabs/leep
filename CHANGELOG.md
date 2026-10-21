@@ -7,6 +7,29 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 ## [Unreleased]
 
+### Searches are limited per server, so lands keep their cores
+- The server runs at most `--read-concurrency search=N` searches at once
+  (default: half the cores, at least 1) and refuses the next one at once with
+  `503` `unavailable`, `Retry-After` (1 to 10 s) and the new response header
+  `Leep-Refused: read-class`, which says nothing was done (ADR 0060). On a
+  two-core host searches used to take the cores lands need. Lands, ref reads,
+  trees, files and blobs are never limited. `--read-concurrency search=off`
+  turns it off.
+- Searches together hold at most half of the metadata connection pool
+  (`--search-pool-permits`, default a quarter of `--meta-pool-size`, each
+  permit up to two connections), so ref reads and lands do not queue behind
+  them for connections.
+- `leep` retries a read refused with `Leep-Refused` up to four times, waiting
+  `Retry-After` plus up to 50% jitter; a wait over 10 s is reported instead.
+  The error then carries `refused` and `retry_after_ms` in `--json`. The MCP
+  server never waits: it returns a retryable tool error with `retry_after`.
+- New metrics `leep_read_class_permits`, `leep_read_class_in_flight` and
+  `leep_read_class_shed_total` (label `class`), and the `LeepReadsShedding`
+  alert. `LeepServerErrors` no longer counts shed searches. **Operators:** a
+  load balancer must not count a `503` with `Leep-Refused` against a backend.
+- A follower relays `Leep-Refused` with a forwarded land's answer.
+  `leep-swarm` reports shed reads apart from errors.
+
 ### Search reads less of the index
 - An indexed search stops reading a directory filter or a file's trigram
   row as soon as the query can no longer match it, instead of decoding the

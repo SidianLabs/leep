@@ -1,5 +1,5 @@
 # 0060. Protect lands from expensive reads, and admit lands per ref
-Status: Proposed
+Status: Accepted (section 1, `search` class; see "Implementation notes"); other read classes and sections 2–3 proposed
 Date: 2026-10-21
 
 ## Context
@@ -369,3 +369,60 @@ answers that question without the queue:
 - To back out, set `--read-concurrency search=off` or
   `--land-queue-batches off` and restart. Nothing persisted depends on
   either.
+
+## Implementation notes
+Section 1 is built for the `search` class. The other classes, section 2 and
+section 3 are not, and stay proposed. What is built differs from the text
+above as follows, each for the reason given:
+
+- **Classes not built.** `--read-concurrency` parses every class named in
+  section 1, so the flag has its final shape. `land_check`, `blame`,
+  `log_filtered` and `diff_large` accept only `off`, which is what the
+  server does for them; a number for one of them stops startup with a
+  message saying the class is not limited yet. Ignoring it would let an
+  operator believe a limit is in force. `--diff-large-generations` does not
+  exist yet.
+- **Search pool permits (an addition).** Measurement after this ADR was
+  written (`docs/research/search-cost.md`) found that searches also starve
+  the metadata pool: a ref read went from 0.44 ms to 141 ms beside 64
+  searches, and every land needs that pool. Bounding concurrent searches
+  bounds this too, but on a large host `cores / 2` searches can still take
+  most of the pool. So `Repo::with_search_pool_permits` adds one semaphore
+  for the metadata reads of all searches' directory opens
+  (`--search-pool-permits N|off`, default a quarter of `--meta-pool-size`,
+  at least 1). Each open holds up to two connections, so searches hold at
+  most half of the pool. The permit is taken inside `Opener::open`, under
+  the open-ahead permit the caller may hold, and dropped before the tree
+  reads, so it never waits on an open-ahead permit and the two semaphores
+  cannot wait on each other. A search waits for a pool permit instead of
+  being refused: it already holds its class permit, so the wait is bounded
+  by the other searches' reads.
+- **The cost per search.** The research found a warm search on all of
+  Linux to cost about 0.45 s of CPU, not 20 to 30 s: E1b's 20 to 30 s was
+  CPU queueing on two cores. That strengthens the case for admission and
+  changes nothing above.
+- **`Retry-After`** uses the median of the class's last 64 permit hold
+  times, from admission until the response body ends, so it includes
+  sending the answer.
+- **`Leep-Refused`** is sent as `read-class` only. The body budget's 503 does
+  not carry `body-budget` yet; it ships with section 2. The follower's relay
+  already copies `Leep-Refused` (section 2, "Forwarded lands"), so the
+  leader's admission refusal will pass through unchanged.
+- **Clients.** `leep` retries a `GET` answered `503` with `Leep-Refused`
+  whatever the value, at most `MAX_ATTEMPTS` tries with up to 50% jitter per
+  wait, and reports a `Retry-After` over `MAX_RETRY_WAIT`. It goes by the
+  header alone, not by the body's code: only a Leep server sets the header,
+  and only on a 503 `unavailable`. The final error carries the header's
+  value (`refused` in `--json`) and `retry_after_ms`. The MCP server turns
+  these retries off and returns a tool error that names the code and the
+  header and gives `retry_after` in seconds. `leep-swarm` counts shed reads
+  per route, apart from errors and timeouts.
+- **Alert and runbook.** `LeepReadsShedding` watches the `search` class
+  only, against the search route's request rate, since that is the only
+  class built. `LeepServerErrors` subtracts `leep_read_class_shed_total`.
+- **Testing.** Router tests on memory stores
+  (`crates/leep-server/tests/read_limits.rs`) cover the refusal's shape, the
+  release of the permit when a search succeeds, fails, is cancelled by the
+  client, times out or has its answer dropped, `off`, and lands, ref reads
+  and file reads while every permit is held. The swarm rerun under
+  "Testing" has not been done; the starting values above stand until it is.

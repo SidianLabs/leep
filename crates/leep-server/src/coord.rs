@@ -385,10 +385,16 @@ impl LandForward<Relayed> for HttpForward {
         {
             return Forwarded::NotLeader;
         }
-        let headers: Vec<_> = [header::CONTENT_TYPE, header::RETRY_AFTER]
-            .into_iter()
-            .filter_map(|k| resp.headers().get(&k).cloned().map(|v| (k, v)))
-            .collect();
+        // `Leep-Refused` tells the client nothing was done (ADR 0060), which
+        // it needs to resend an unkeyed land the leader refused.
+        let headers: Vec<_> = [
+            header::CONTENT_TYPE,
+            header::RETRY_AFTER,
+            HeaderName::from_static(leep_core::api::REFUSED_HEADER),
+        ]
+        .into_iter()
+        .filter_map(|k| resp.headers().get(&k).cloned().map(|v| (k, v)))
+        .collect();
         match resp.bytes().await {
             Ok(body) => Forwarded::Answered(Relayed {
                 status,
@@ -475,6 +481,64 @@ mod tests {
         let e: ErrorResponse = serde_json::from_slice(&relayed.body).unwrap();
         assert_eq!(e.request_id.as_deref(), Some("client-run:42"));
         assert_eq!(e.code.as_deref(), Some("not_found"));
+    }
+
+    /// A refusal from the holder reaches the client with the headers that
+    /// say what to do about it: `Retry-After`, and `Leep-Refused`, which
+    /// tells it nothing was done (ADR 0060). Other headers stay behind.
+    #[tokio::test]
+    async fn a_relayed_refusal_keeps_retry_after_and_leep_refused() {
+        use leep_core::LeaseKey;
+
+        let holder = axum::Router::new().route(
+            "/v1/land",
+            axum::routing::post(|| async {
+                let mut resp = crate::auth::reject(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    leep_core::api::error_code::UNAVAILABLE,
+                    "server busy",
+                );
+                let h = resp.headers_mut();
+                h.insert(header::RETRY_AFTER, HeaderValue::from_static("7"));
+                h.insert(
+                    leep_core::api::REFUSED_HEADER,
+                    HeaderValue::from_static("admission"),
+                );
+                h.insert("x-holder-only", HeaderValue::from_static("1"));
+                resp
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(crate::serve(listener, holder, std::future::pending()));
+        let coord = Coordination::new(
+            PeerPolicy {
+                prefixes: vec!["http://127.0.0.1:".into()],
+                ..PeerPolicy::default()
+            },
+            "sender".into(),
+        )
+        .unwrap();
+        let forward = HttpForward::new(coord, &HeaderMap::new(), Bytes::from_static(b"{}"));
+        let lease = Lease {
+            key: LeaseKey::new("land", "main"),
+            holder: "holder".into(),
+            address: format!("http://{addr}/"),
+            protocol: LAND_FORWARD_PROTOCOL,
+            meta: String::new(),
+            epoch: 1,
+            remaining: Duration::from_secs(2),
+        };
+        let Forwarded::Answered(relayed) = forward.forward(&lease).await else {
+            panic!("the holder did not answer");
+        };
+        let resp = relayed.into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let h = resp.headers();
+        assert_eq!(h[header::RETRY_AFTER], "7");
+        assert_eq!(h[leep_core::api::REFUSED_HEADER], "admission");
+        assert_eq!(h[header::CONTENT_TYPE], "application/json");
+        assert!(h.get("x-holder-only").is_none());
     }
 
     fn policy(prefixes: &[&str], cidrs: &[&str], plain: bool) -> PeerPolicy {

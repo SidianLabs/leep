@@ -1105,11 +1105,22 @@ lives in a guard attached to the response body, so it is released when the body
 ends, the client goes away or the timeout drops the request. Token names bound
 the state; in anonymous mode state is keyed by client address in a size-capped
 table. State is per process.
-Proposed in ADR 0060, not built: a semaphore per class of expensive read
-(search and land checks on by default at half the cores; blame, filtered log
-and large diffs off), refused with 503 `unavailable`, `Retry-After` and
-`Leep-Refused: read-class`, so lands and cheap reads keep the cores on
-small hosts, and balancers can tell the refusals from failures.
+Built for search ([ADR 0060](adr/0060-land-admission-and-read-limits.md),
+section 1): a semaphore per class of expensive read
+(`leep_server::read_limits`), one for the whole server whatever the token,
+taken with `try_acquire` in a middleware just inside the per-principal
+limits. `--read-concurrency search=N|off` defaults to half the cores, at
+least one. A full class is refused at once with 503 `unavailable`,
+`Retry-After` (the class's recent median request time over its permits,
+1 to 10 s) and `Leep-Refused: read-class`, so lands and cheap reads keep the
+cores on small hosts, and balancers can tell the refusals from failures. As
+with the concurrency guard, the permit rides in the response body. Searches
+also share a bound on their metadata reads (`Repo::with_search_pool_permits`,
+`--search-pool-permits`, a quarter of the pool by default): `Opener::open`
+takes a permit inside the call, under the open-ahead permit it may hold, so
+the two semaphores never wait on each other, and searches hold at most half
+of the pool. Still proposed: the `land_check`, `blame`, `log_filtered` and
+`diff_large` classes, which the flag parses and accepts only as `off`.
 
 **Config reload** ([ADR 0024](adr/0024-config-reload.md)). The tokens, their
 limits, the trusted signing keys, the review service and the composed land

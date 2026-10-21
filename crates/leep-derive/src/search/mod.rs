@@ -233,9 +233,10 @@ impl Drop for Opening {
     }
 }
 
-/// Directories opened ahead of the walk at once. Each is two batched
-/// metadata reads and one batched tree read, so four leave half of a
-/// 16-connection pool to other requests.
+/// Directories opened ahead of the walk at once, per search. Each is two
+/// batched metadata reads and one batched tree read. What all searches
+/// together read from the metadata store at once is bounded separately, by
+/// [`Repo::with_search_pool_permits`].
 const OPEN_AHEAD: usize = 4;
 
 /// What opening a directory needs, shared by the walk and the tasks that
@@ -300,6 +301,17 @@ impl Opener {
         }
         let mut pruned = 0;
         if self.indexed {
+            // Taken here, under the caller's `ahead` permit if it holds one,
+            // and released before the tree reads: a pool permit never waits
+            // on `ahead`, so the two semaphores cannot wait on each other.
+            let _pool = match &self.repo.search_pool {
+                Some(pool) => Some(
+                    pool.acquire()
+                        .await
+                        .map_err(|e| Error::Other(format!("search pool: {e}")))?,
+                ),
+                None => None,
+            };
             // Files that `check_file` skips without a row need none.
             let wanted: Vec<usize> = (0..files.len())
                 .filter(|&k| needs_row(&files[k].1))
@@ -318,6 +330,8 @@ impl Opener {
             for (d, row) in dirs.into_iter().zip(tree_rows) {
                 let row = match row {
                     Some(row) => row,
+                    // A cold filter is derived under the pool permit; the
+                    // class limit already bounds how many searches do this.
                     None => self.repo.search_tree_row(d.2, &self.counters).await?,
                 };
                 if self.admits(&row)? {
@@ -414,6 +428,16 @@ impl Walk {
         if let Some((path, tree)) = self.start.take() {
             let o = &self.opener;
             let admitted = !o.indexed || {
+                // The root's filter is a metadata read like `open`'s, so it
+                // takes a pool permit too; no `ahead` permit is held here.
+                let _pool = match &o.repo.search_pool {
+                    Some(pool) => Some(
+                        pool.acquire()
+                            .await
+                            .map_err(|e| Error::Other(format!("search pool: {e}")))?,
+                    ),
+                    None => None,
+                };
                 let row = o.repo.search_tree_row(tree, &o.counters).await?;
                 o.admits(&row)?
             };

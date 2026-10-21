@@ -40,6 +40,7 @@ every runbook.
 | [LeepTokenThrottled](#leeptokenthrottled) | ticket | one token has been limited steadily for 15 minutes |
 | [LeepBroadThrottling](#leepbroadthrottling) | ticket | more than 5% of all requests are 429 for 15 minutes |
 | [LeepBodyBudgetExhausted](#leepbodybudgetexhausted) | ticket | requests are refused because request bodies in flight fill `--max-inflight-bytes`, for 10 minutes |
+| [LeepReadsShedding](#leepreadsshedding) | ticket | a server refuses more than half of its searches because its search class is full, for 15 minutes |
 | [LeepBlobCacheColdHitRatio](#leepblobcachecoldhitratio) | ticket | blob cache hit ratio below 50% for 30 minutes |
 | [LeepConfigReloadFailed](#leepconfigreloadfailed) | page | a SIGHUP reload was refused |
 | [LeepTokensExpiringSoon](#leeptokensexpiringsoon) | ticket | a token expires within 7 days, or has expired and is still in the tokens file, for 1 hour |
@@ -321,7 +322,9 @@ and neither those nor 408 and 429 count here. `GET /v1/health` and
 `GET /v1/ready` are in the denominator, so busy probes dilute the ratio, and a
 failing `/v1/ready` (503) counts as a 5xx. Indexing answers (503 with
 `Leep-Indexing`, ADR 0058) are subtracted: see
-[LeepIndexingAnswersHigh](#leepindexinganswershigh).
+[LeepIndexingAnswersHigh](#leepindexinganswershigh). So are searches shed
+because their class was full (503 with `Leep-Refused`, ADR 0060): see
+[LeepReadsShedding](#leepreadsshedding).
 
 **Impact.** Agents see failed commits, lands and reads; the CLI prints the
 server's message and exits 3. Writes are idempotent, so retrying is safe, but
@@ -995,6 +998,65 @@ which does not count toward this alert. Reads without a body are unaffected.
 
 **Escalate / collect.** The gauge and refusal graphs per instance, upload
 latency, the three flags, the container memory limit, and the
+[standard bundle](#collecting-a-bug-report).
+
+## LeepReadsShedding
+
+**Meaning.** For 15 minutes, one server refused more than half of its
+searches because every permit of its search class was in use
+(`--read-concurrency`, ADR 0060). **Ticket.** A refusal is `503`
+`unavailable` with `Retry-After` and `Leep-Refused: read-class`, counted in
+`leep_read_class_shed_total{class="search"}`. It is not a failure, and
+[LeepServerErrors](#leepservererrors) does not count it. Searches are wanted
+faster than the host can run them.
+
+**Impact.** Lands and cheap reads are unaffected: that is what the limit
+protects. Searches are slower to get. `leep search` waits the `Retry-After`
+plus jitter and tries up to four times, then exits 3 with `server busy`; MCP
+agents get a retryable tool error with `retry_after` and call again. Some
+searches lose every try, because a refused client can keep losing the next
+free permit to new arrivals.
+
+**Diagnose.**
+
+1. How full: `leep_read_class_in_flight{class="search"}` against
+   `leep_read_class_permits{class="search"}` per instance. Pinned at the
+   permits means every permit is busy.
+2. How slow: `histogram_quantile(0.5, sum by (le) (rate(leep_http_request_duration_seconds_bucket{route=~"/v1/search/.*",status="200"}[15m])))`.
+   Admitted searches that got slower point at CPU or the metadata store.
+3. Who: `sum by (route, status) (rate(leep_http_requests_total{route=~"/v1/search/.*"}[15m]))`
+   and the DEBUG log (`read refused: class full`). A burst after a deploy of
+   agents, or one agent in a loop?
+4. The host: CPU use of `leep-server` and of Postgres. If the cores are not
+   busy while searches are refused, the class is set too low for the host.
+5. The settings, logged at startup as `expensive read limits`:
+   `read_concurrency` and `search_pool_permits`.
+
+**Likely causes.**
+
+1. More agents, or agents searching more often, than the host has cores for.
+   Confirm: step 1 pinned, step 4 cores busy.
+2. Expensive queries: very common words, broad regexes, or searches whose
+   index is cold (a new large import), each holding its permit longer.
+   Confirm: step 2 p50 up, the same queries in the logs.
+3. A class set lower than the host needs. Confirm: step 4 cores idle with
+   step 1 pinned.
+
+**Mitigate / fix.**
+
+- Add query capacity: more servers behind the balancer, or the indexing
+  split of ADR 0058, which adds cores. Each server has its own permits.
+- On a host with idle cores, raise `--read-concurrency search=N` and restart.
+  Do not raise it on a host whose lands are slow: the limit is what keeps
+  them fast (`LeepLandSlowP99`).
+- Make sure the balancer does not count these 503s against the backend (they
+  carry `Leep-Refused`; OPERATIONS.md, "Balancers"), or it will pull shedding
+  servers out and overload the rest.
+- `--read-concurrency search=off` turns the limit off. Do it only to rule the
+  limit out: searches then take the lands' cores again.
+
+**Escalate / collect.** The in-flight, permits and shed graphs per instance,
+search latency, host CPU, the startup line, and the
 [standard bundle](#collecting-a-bug-report).
 
 ## LeepBlobCacheColdHitRatio

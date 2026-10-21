@@ -9,6 +9,7 @@ pub mod fingerprint;
 pub mod limits;
 pub mod observe;
 pub mod protect;
+pub mod read_limits;
 pub mod reload;
 pub mod review;
 pub mod signing;
@@ -222,7 +223,7 @@ pub fn router_with_ready_timeout(
 
 /// Like [`router_with_ready_timeout`], with the server-wide body limits:
 /// per-route caps and the in-flight byte budget. `max_body_bytes` stays a
-/// ceiling on every body.
+/// ceiling on every body. Read classes get their default limits.
 pub fn router_with_body_limits(
     repo: Repo,
     max_body_bytes: usize,
@@ -231,7 +232,30 @@ pub fn router_with_body_limits(
     config: Arc<reload::ConfigHandle>,
     ready_options: ReadyOptions,
 ) -> Router {
+    router_with_read_limits(
+        repo,
+        max_body_bytes,
+        body_limits,
+        request_timeout,
+        config,
+        ready_options,
+        read_limits::ReadConcurrency::default(),
+    )
+}
+
+/// Like [`router_with_body_limits`], with the concurrency limits of the
+/// expensive read classes (ADR 0060, `--read-concurrency`).
+pub fn router_with_read_limits(
+    repo: Repo,
+    max_body_bytes: usize,
+    body_limits: limits::BodyLimits,
+    request_timeout: Duration,
+    config: Arc<reload::ConfigHandle>,
+    ready_options: ReadyOptions,
+    read_concurrency: read_limits::ReadConcurrency,
+) -> Router {
     register_ready_metrics();
+    let read_limits = read_limits::ReadLimits::new(&read_concurrency);
     let budget = limits::BodyBudget::new(body_limits);
     let repo = Arc::new(repo);
     let ready_state = Arc::new(ReadyProbe {
@@ -275,6 +299,12 @@ pub fn router_with_body_limits(
         .route("/v1/merge", post(merge))
         .route("/v1/rebase", post(rebase))
         .route("/v1/land", post(land));
+    // Innermost: a request spends its token's limits before it takes a
+    // read class permit (ADR 0060).
+    let router = router.layer(middleware::from_fn_with_state(
+        read_limits,
+        read_limits::enforce,
+    ));
     // Just inside authentication, which names the principal, and still before
     // any body is read.
     let router = router

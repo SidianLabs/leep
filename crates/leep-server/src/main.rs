@@ -262,6 +262,20 @@ struct Args {
     /// Requests that may wait for the indexer at once; others do not wait.
     #[arg(long, env = "LEEP_INDEX_WAITERS", default_value_t = 64)]
     index_waiters: usize,
+    /// Most expensive reads of one class this server runs at once (ADR
+    /// 0060), as CLASS=N or CLASS=off. Repeatable; the environment variable
+    /// takes a comma-separated list. A request over the limit is refused at
+    /// once with 503, Retry-After and `Leep-Refused: read-class`. Only
+    /// `search` is limited (default: half the cores, at least 1);
+    /// `land_check`, `blame`, `log_filtered` and `diff_large` take only off.
+    #[arg(long, env = "LEEP_READ_CONCURRENCY", value_delimiter = ',')]
+    read_concurrency: Vec<String>,
+    /// Directory opens of all searches that may read the metadata store at
+    /// once, or off; each holds up to two connections. Default: a quarter
+    /// of --meta-pool-size, at least 1, so searches hold at most half of
+    /// the pool and lands and ref reads keep the rest.
+    #[arg(long, env = "LEEP_SEARCH_POOL_PERMITS", value_parser = parse_pool_permits)]
+    search_pool_permits: Option<PoolPermits>,
     #[command(subcommand)]
     command: Option<Cmd>,
 }
@@ -662,6 +676,25 @@ fn parse_interval(s: &str) -> Result<std::time::Duration, String> {
                 .map_err(|_| format!("bad duration {s:?}; use e.g. 500ms, 2s"))?,
         )),
         None => parse_grace(s),
+    }
+}
+
+/// `--search-pool-permits`: a number of permits, or no bound.
+#[derive(Clone, Copy, Debug)]
+enum PoolPermits {
+    Off,
+    Permits(usize),
+}
+
+fn parse_pool_permits(s: &str) -> Result<PoolPermits, String> {
+    match s.trim() {
+        "off" => Ok(PoolPermits::Off),
+        n => match n.parse::<usize>() {
+            Ok(n) if n >= 1 => Ok(PoolPermits::Permits(n)),
+            _ => Err(format!(
+                "expected a number of at least 1, or off; got {s:?}"
+            )),
+        },
     }
 }
 
@@ -1215,6 +1248,15 @@ async fn main() -> anyhow::Result<()> {
         args.insecure_no_auth,
     )?;
     let metrics_app = args.metrics_listen.map(|_| install_metrics()).transpose()?;
+    let read_concurrency = leep_server::read_limits::ReadConcurrency::parse(&args.read_concurrency)
+        .map_err(anyhow::Error::msg)?;
+    let search_pool = match args.search_pool_permits {
+        Some(PoolPermits::Off) => None,
+        Some(PoolPermits::Permits(n)) => Some(n),
+        None => Some(leep_server::read_limits::default_search_pool_permits(
+            args.meta_pool_size,
+        )),
+    };
     let body_limits = leep_server::limits::BodyLimits {
         max_blob_bytes: args.max_blob_bytes.min(args.max_body_bytes),
         max_json_bytes: args.max_json_body_bytes.min(args.max_body_bytes),
@@ -1273,6 +1315,7 @@ async fn main() -> anyhow::Result<()> {
     if let Some(jobs) = args.derive_jobs {
         repo = repo.with_derive_jobs(jobs as usize);
     }
+    repo = repo.with_search_pool_permits(search_pool);
     leep_server::reload::warn_missing_refs(repo.meta().as_ref(), &config.current()).await;
     if args.request_timeout.is_zero() {
         tracing::warn!("request timeout disabled: gc --fence cannot be guaranteed safe");
@@ -1338,7 +1381,12 @@ async fn main() -> anyhow::Result<()> {
         max_inflight_bytes = body_limits.max_inflight_bytes,
         "request body limits"
     );
-    let mut app = leep_server::router_with_body_limits(
+    tracing::info!(
+        read_concurrency = %read_concurrency.describe(),
+        search_pool_permits = ?search_pool,
+        "expensive read limits (ADR 0060)"
+    );
+    let mut app = leep_server::router_with_read_limits(
         repo,
         args.max_body_bytes,
         body_limits,
@@ -1348,6 +1396,7 @@ async fn main() -> anyhow::Result<()> {
             timeout: args.ready_timeout,
             ..Default::default()
         },
+        read_concurrency,
     );
     if let Some((_, http)) = &coordination {
         app = leep_server::coord::layer(app, http.clone());

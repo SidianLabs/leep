@@ -99,6 +99,9 @@ measured until the response head is ready, not until the body is streamed.
 | `leep_request_body_bytes_in_flight` | gauge | none | Body bytes the requests in flight hold of the `--max-inflight-bytes` budget: each request's `Content-Length`, or its route's cap when it declares none, from admission until its handler finishes. |
 | `leep_request_body_budget_bytes` | gauge | none | The `--max-inflight-bytes` budget, for ratios. |
 | `leep_request_body_refused_total` | counter | `reason` = `budget`, `principal`, `size`; `class` = `blob`, `json` | Requests refused by the server-wide body limits: `budget` is a 503 because the budget was spent, `principal` a 429 because the token already holds its share of it, `size` a 413 over `--max-blob-bytes` (`class="blob"`) or `--max-json-body-bytes` (`class="json"`). All six series exist from startup. |
+| `leep_read_class_permits` | gauge | `class` = `search` | Permits of an expensive read class (`--read-concurrency`, ADR 0060): how many such requests this server runs at once. Absent for a class that is `off`. |
+| `leep_read_class_in_flight` | gauge | `class` | Requests of the class holding a permit, until their response body has been sent or dropped. |
+| `leep_read_class_shed_total` | counter | `class` | Requests of the class refused at once with `503` `unavailable`, `Retry-After` and `Leep-Refused: read-class` because every permit was in use. They also count in `leep_http_requests_total` as 503; `LeepServerErrors` subtracts them. The series exist from startup for each limited class. |
 | `leep_tokens_expiring_soon` | gauge | none | Tokens in the tokens file whose `expires` is within 7 days and not yet past. Refreshed every minute and on every load. |
 | `leep_tokens_expired` | gauge | none | Tokens still in the tokens file whose `expires` has passed; requests with them get 401. |
 | `leep_token_expired_requests_total` | counter | `token` | Requests refused because their token had expired: an agent still using a token that ran out. |
@@ -146,8 +149,9 @@ groups:
       summary: "A leep-server's /metrics cannot be scraped: the process is down, or only its metrics listener is."
       runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepserverdown
   - alert: LeepServerErrors
-    # Indexing answers (503 with Retry-After, ADR 0058) are not failures.
-    expr: (sum(rate(leep_http_requests_total{status=~"5.."}[5m])) - (sum(rate(leep_query_indexing_answers_total[5m])) or vector(0))) / sum(rate(leep_http_requests_total[5m])) > 0.01
+    # Indexing answers (503 with Retry-After, ADR 0058) and shed reads (503
+    # with Leep-Refused, ADR 0060) are not failures.
+    expr: (sum(rate(leep_http_requests_total{status=~"5.."}[5m])) - (sum(rate(leep_query_indexing_answers_total[5m])) or vector(0)) - (sum(rate(leep_read_class_shed_total[5m])) or vector(0))) / sum(rate(leep_http_requests_total[5m])) > 0.01
     for: 5m
     labels: {severity: page}
     annotations:
@@ -265,6 +269,16 @@ groups:
     annotations:
       summary: "Requests are refused with 503 because the request bodies in flight fill --max-inflight-bytes: a burst of large uploads, slow uploaders holding budget, or a budget too small for the fleet."
       runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepbodybudgetexhausted
+  - alert: LeepReadsShedding
+    # Only the search class is built; add a class's route here when it is.
+    expr: |
+      sum by (instance) (rate(leep_read_class_shed_total{class="search"}[15m]))
+        / sum by (instance) (rate(leep_http_requests_total{route=~"/v1/search/.*"}[15m])) > 0.5
+    for: 15m
+    labels: {severity: ticket}
+    annotations:
+      summary: "A server refuses more than half of its searches (503 with Leep-Refused) because its search class is full: searches are wanted faster than the host can run them."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepreadsshedding
   - alert: LeepBlobCacheColdHitRatio
     expr: |
       sum(rate(leep_blob_cache_hits_total[15m]))
@@ -614,6 +628,48 @@ anything.
 - `--max-body-bytes` (512 MiB) stays a ceiling on every route; a cap above it
   has no effect. A cap above the budget stops the server at startup, since
   such a request could never be admitted.
+
+### Expensive read limits
+
+Each class of expensive read has a concurrency limit for the whole server,
+whatever the token (ADR 0060, section 1). Per-token limits cannot do this: a
+fleet of agents each running one search is within every token's limit while
+the searches take every core the lands need. Measured on all of Linux, a
+warm search costs about 0.45 s of CPU, and on a two-core host the swarm's 20
+to 30 s searches were CPU queueing.
+
+| Flag / env | Default | What it bounds |
+|---|---|---|
+| `--read-concurrency CLASS=N\|off` / `LEEP_READ_CONCURRENCY` (comma-separated) | `search` = half the cores, at least 1 | Requests of a class running at once. Repeatable; a later setting of a class wins. Only `search` (`GET /v1/search/{rev}`) is built. `land_check`, `blame`, `log_filtered` and `diff_large` accept only `off`, which is what the server does for them; a number for one of them stops startup. |
+| `--search-pool-permits N\|off` / `LEEP_SEARCH_POOL_PERMITS` | a quarter of `--meta-pool-size`, at least 1 (4 for a pool of 16) | Directory opens of all searches that read the metadata store at once. Each holds up to two connections, so searches together hold at most half of the pool and lands and ref reads keep the rest. |
+
+- A search that finds every permit in use is refused at once, never queued:
+  `503`, code `unavailable`, `Retry-After` and `Leep-Refused: read-class`.
+  `Retry-After` is the class's median request time over its last 64
+  requests, divided by its permits and rounded up, between 1 and 10 s.
+  10 s is the CLI's longest wait: `leep` retries a refused `GET` up to four
+  times with up to 50% jitter, and the MCP server hands the refusal back to
+  the agent as a retryable error without waiting.
+- The permit is held until the response body is sent, or the client goes
+  away or `--request-timeout` drops the request. A UI that searches as the
+  user types should cancel the request it replaces (the permit is released
+  on cancel) or debounce, rather than raise the class: an overlapping
+  request is refused for at least 1 s. Cores are the limit: the
+  count is `available_parallelism`, which follows the container's CPU quota
+  on Linux.
+- Never limited: lands, ref reads (`/v1/refs`, `/v1/resolve`, `/v1/reflog`),
+  trees, files, blobs, changeset creates, `GET /v1/health` and
+  `GET /v1/ready`. Limits are per process, so N servers run up to N times a
+  class's permits.
+- Tuning. `leep_read_class_in_flight` at `leep_read_class_permits` with a
+  rising `leep_read_class_shed_total` means searches wait for cores. On a
+  host whose lands are idle, raise the class; on a busy one, add query hosts
+  (ADR 0058's split). A pool permit that waits shows as search latency, not
+  as refusals; raise `--search-pool-permits` only with `--meta-pool-size`.
+- To back out, set `--read-concurrency search=off` (and
+  `--search-pool-permits off`) and restart. Nothing persisted depends on
+  either. Balancers must not count these 503s against a backend (see
+  [Indexing a large history](#indexing-a-large-history), "Balancers").
 
 ## Config reload
 
@@ -1203,7 +1259,11 @@ apply to the server and to its tools (`verify`, `repair`, `upgrade-index`,
   so keep the sum of all pools under Postgres's `max_connections` (100 by
   default) less what other clients need. A pool that is too small makes
   requests wait. They do not fail unless they wait past sqlx's 30 s acquire
-  timeout.
+  timeout. A search opens directories ahead of its walk, two reads each, so
+  searches together are capped by the server's `--search-pool-permits`
+  (default a quarter of the pool): they hold at most half of it, and lands
+  and ref reads keep the rest (see
+  [Expensive read limits](#expensive-read-limits)).
 - **Statement bound.** sqlx sends Postgres no cancel request when a query's
   future is dropped, which is what `--request-timeout` does to a request that
   runs too long: the request answers 408 but its statement runs on in the
@@ -1304,9 +1364,12 @@ Use index leases instead (ADR 0058):
   `lease`, then the query-only servers to `off`. Servers still in `local`
   keep warming meanwhile, which costs duplicate work only. To back out,
   return to `local`; leases expire in 15 s.
-- **Balancers** must not count a 503 that carries a `Leep-Indexing` header
-  against a backend or retry it elsewhere: see
-  [RUNBOOKS.md](RUNBOOKS.md#leepindexinganswershigh).
+- **Balancers** must not count a 503 that carries a `Leep-Indexing` or a
+  `Leep-Refused` header against a backend or retry it elsewhere: a balancer
+  that pulled a shedding server out of rotation would push its load onto the
+  others, which then shed too. See
+  [RUNBOOKS.md](RUNBOOKS.md#leepindexinganswershigh) and
+  [RUNBOOKS.md](RUNBOOKS.md#leepreadsshedding).
 - **Tools that delete or rebuild rows.** `repair drop`, `repair rederive
   --missing` and `upgrade-index --yes` take the index leases of the groups
   they touch, refuse when a live server holds one (stop it, set it to `off`,

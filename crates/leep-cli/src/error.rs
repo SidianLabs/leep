@@ -125,6 +125,9 @@ struct Origin {
     request_id: Option<String>,
     /// What a `land_id_reused` refusal's land id had recorded.
     land: Option<Box<leep_core::api::LandRefusal>>,
+    /// The `Leep-Refused` value of a `503` the server answered before doing
+    /// any work (ADR 0060), such as `read-class`.
+    refused: Option<String>,
 }
 
 pub type Result<T, E = CliError> = std::result::Result<T, E>;
@@ -176,6 +179,20 @@ impl CliError {
     /// from servers older than the field; the message still says it.
     pub fn land_refusal(&self) -> Option<&leep_core::api::LandRefusal> {
         self.origin.as_ref()?.land.as_deref()
+    }
+
+    pub fn with_refused(mut self, refused: Option<String>) -> Self {
+        if refused.is_some() {
+            self.origin_mut().refused = refused;
+        }
+        self
+    }
+
+    /// For a `503` the server refused before doing any work: the limit it
+    /// names in `Leep-Refused` (ADR 0060). Sending the request again is
+    /// safe; the error's `retry_after_ms` says when.
+    pub fn refused(&self) -> Option<&str> {
+        self.origin.as_ref()?.refused.as_deref()
     }
 
     /// Whether the server refused for the reason `code` names. A server that
@@ -272,8 +289,9 @@ impl CliError {
 
     /// The `--json` form: `{"error":{"code","message","hint","retryable"}}`,
     /// plus `candidates` for an ambiguous short id, `server_code` when the
-    /// server named the error, `request_id` when a request failed and `land`
-    /// for a reused land id.
+    /// server named the error, `request_id` when a request failed, `land`
+    /// for a reused land id, and `refused` for a request the server refused
+    /// before doing any work.
     pub fn to_json(&self) -> serde_json::Value {
         let mut e = serde_json::json!({
             "code": self.kind.code(),
@@ -295,6 +313,9 @@ impl CliError {
         }
         if let Some(land) = self.land_refusal() {
             e["land"] = serde_json::json!(land);
+        }
+        if let Some(r) = self.refused() {
+            e["refused"] = serde_json::json!(r);
         }
         serde_json::json!({ "error": e })
     }

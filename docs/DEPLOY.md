@@ -221,6 +221,20 @@ few hundred MB. `leep-git import` writes the stores directly and is not
 limited. Tuning and the alert are in
 [OPERATIONS.md](OPERATIONS.md#body-limits-and-the-in-flight-budget).
 
+### Expensive read limits
+
+Also always on, and the same for every token (ADR 0060):
+
+| Flag / variable | Default | Meaning |
+|---|---|---|
+| `--read-concurrency CLASS=N\|off` / `LEEP_READ_CONCURRENCY` | `search` = half the cores, at least 1 | Searches this server runs at once; one more is refused with `503`, `Retry-After` and `Leep-Refused: read-class`. Repeatable, or comma-separated in the variable. Other classes (`land_check`, `blame`, `log_filtered`, `diff_large`) take only `off`. |
+| `--search-pool-permits N\|off` / `LEEP_SEARCH_POOL_PERMITS` | a quarter of `--meta-pool-size`, at least 1 | Directory opens of all searches reading the metadata store at once (two connections each), so searches leave at least half the pool to lands and ref reads. |
+
+`leep` retries a refused search a few times with jitter; a load balancer must
+not count a `503` carrying `Leep-Refused` against the backend. Tuning, the
+metrics and the alert are in
+[OPERATIONS.md](OPERATIONS.md#expensive-read-limits).
+
 Without a tokens file the rate and concurrency defaults apply per client IP
 address (IPv6 per /64). Behind a reverse proxy every request arrives from the
 proxy's address, so those limits become one bucket shared by everybody; use
