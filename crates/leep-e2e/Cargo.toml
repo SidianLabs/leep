@@ -3,6 +3,7 @@ name = "leep-e2e"
 description = "End-to-end tests that drive the real leep binaries"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 publish = false
 

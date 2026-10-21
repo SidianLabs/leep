@@ -3,6 +3,7 @@ name = "leep-git"
 description = "Import, export and live mirroring between git repositories and Leep"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [[bin]]

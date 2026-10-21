@@ -8,6 +8,8 @@ exclude = ["fuzz"]
 [workspace.package]
 version = "0.0.1"
 edition = "2021"
+# Matches rust-toolchain.toml; the two move together.
+rust-version = "1.97.0"
 license = "Apache-2.0"
 repository = "https://github.com/bhaweshbhaskar/leep"
 

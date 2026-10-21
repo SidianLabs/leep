@@ -3,6 +3,7 @@ name = "leep-derive"
 description = "Derived data and repository operations for Leep"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
