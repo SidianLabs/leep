@@ -48,9 +48,9 @@ no part in the fence.
    `started_at - grace` with no claim at or after that cutoff, write
    `blob-condemned-v1` unless it is already condemned (its earlier time
    stands). Deletes nothing. `--dry-run` writes nothing.
-2. **Fence.** Wait `--fence` (default 10m). `leep-server gc` sleeps; operators
+2. **Fence.** Wait `--fence` (default 10m; 15m since 2026-10-21, below). `leep-server gc` sleeps; operators
    who prefer short processes run `gc condemn` and, later, `gc collect`.
-3. **Collect** (`leep-server gc collect --fence 10m`). Record `started_at`,
+3. **Collect** (`leep-server gc collect --fence 15m`). Record `started_at`,
    mark again, then for each blob with a condemnation row whose time is at
    most `started_at - fence` (younger rows are left for a later run):
    - not condemned any more (rescued): skip;
@@ -151,7 +151,8 @@ Clock skew. The fence compares only GC-host timestamps: condemnation times
 not enter the comparison. Skew enters through the real-time bound in (b): the
 request timeout is measured on the servers, the fence on the GC host, so run
 with `fence >= timeout + skew + margin`; the default 10m against 5m leaves five
-minutes. The store modification time check compares the blob store's clock with
+minutes. (Superseded for Postgres by "Statement bound" below: the fence must
+also cover the statement timeout, and the default is 15m.) The store modification time check compares the blob store's clock with
 the GC clock and is a second line of defence only: a skewed result keeps a
 blob or defers to the rescue rows, and never deletes a blob a rescue protects.
 Condemnation times never go backwards for one blob, even if the GC host's clock
@@ -207,12 +208,20 @@ command-line tools are not bounded.
 
 For case (b) this turns an unbounded tail into a bound: a write sent before the
 request's deadline commits at most `request timeout + statement timeout` after
-the request's fence read. The fence covers that worst case when
-`fence > request timeout + statement timeout + skew`. With the defaults (5m and
-5m 5s) that is about 10m 5s plus skew, a little over the default 10m fence, so a
-deployment that wants the proof to hold for a statement that starts in the last
-moments of its request and then runs for minutes should either run `gc` with
-`--fence 15m` or set a shorter `--meta-statement-timeout` (statements of a
-request take milliseconds; `30s` gives `fence > 5m 30s + skew`). The default
-fence still covers every request whose statements finish within the remaining
-five minutes, as before.
+the request's fence read. The invariant GC now relies on is therefore
+
+    fence > request timeout + statement timeout + clock skew
+
+with the statement term on Postgres only (SQLite statements run in-process and
+end with the request). With the defaults that is 5m + 5m 5s + skew, so the
+default `--fence` is now **15m** (it was 10m, which held only for statements
+that finish within the request). `gc` evaluates the invariant with the
+`--request-timeout` and `--meta-statement-timeout` it is given (the flags are
+global, and their `LEEP_` variables apply, so run it with the servers'
+environment), allowing one minute of skew, and logs a WARN naming the numbers
+when `--fence` does not exceed them, or when either bound is off, since then no
+fence is safe. It warns rather than refuses because those are the servers'
+settings, which `gc` can only be told. Deployments that want a shorter fence can
+set a short `--meta-statement-timeout` instead (a request's statements take
+milliseconds; `30s` gives `fence > 5m 30s + skew`). `repack --fence` keeps its
+10m default: it guards reads of loose copies, which statements do not make.

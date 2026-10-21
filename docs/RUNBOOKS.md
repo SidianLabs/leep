@@ -892,8 +892,10 @@ handler finishes. These refusals also count as 5xx in
 
 **Impact.** Uploads, commits, lands and other requests with a body fail with
 `server busy: the request bodies in flight are at this server's limit; retry
-after 1s`; the CLI exits 3 and running the command again works once the budget
-frees up. Reads without a body are unaffected.
+after 1s`. `leep` tries a blob upload up to three times within 10 seconds,
+then exits 3; running the command again works once the budget frees up. A
+token past its share of the budget gets `429` instead (`reason="principal"`),
+which does not count toward this alert. Reads without a body are unaffected.
 
 **Diagnose.**
 
@@ -904,8 +906,12 @@ frees up. Reads without a body are unaffected.
 3. Slow or fast: upload latency, `histogram_quantile(0.99, sum by (le) (rate(leep_http_request_duration_seconds_bucket{route="/v1/blobs/{hash}"}[10m])))`.
    Many slow uploads with a low request rate mean clients trickle their bodies.
 4. Bodies with no declared length are charged the whole route cap. A client
-   that streams (`Transfer-Encoding: chunked`) holds 64 MiB per blob upload
-   however small the blob is.
+   that streams (`Transfer-Encoding: chunked`) holds the blob cap (256 MiB by
+   default) per blob upload however small the blob is; a streamed JSON body
+   holds 1 MiB.
+6. One token at its share: `sum by (reason) (rate(leep_request_body_refused_total[10m]))`
+   with `reason="principal"` (429s) means a token holds a quarter of the budget;
+   `RUST_LOG=leep_server=debug` names it.
 5. The settings: `--max-inflight-bytes`, `--max-blob-bytes`,
    `--max-json-body-bytes` (logged at startup as `request body limits`), and
    the memory the container has.
@@ -1719,8 +1725,9 @@ unreferenced blobs and only GC reclaims them.
 
 - Fix the cause and run `leep-server gc` (or `gc condemn` now and `gc collect` later,
   as two jobs). Run one GC at a time (`flock`).
-- Keep `--fence` above the servers' `--request-timeout` plus clock skew plus a margin
-  (default 10m against 5m), and `--grace` above the time agents take from upload to
+- Keep `--fence` above the servers' `--request-timeout` plus their
+  `--meta-statement-timeout` plus clock skew (default 15m against 5m + 5m 5s; `gc`
+  warns when it is not), and `--grace` above the time agents take from upload to
   commit.
 - Never use `--unsafe-no-fence` beside running servers. Never delete blobs by hand to
   make room: use [LeepDiskSpaceLow](#leepdiskspacelow) for urgent space.

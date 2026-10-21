@@ -150,8 +150,11 @@ The per-token caps are off by default, and the one global cap was 512 MiB on
 every route, so nothing bounded the memory request bodies take together: the
 blob and changeset handlers read the whole body into memory, and sixteen
 concurrent 512 MiB uploads from any writers would ask for 8 GiB.
+(Amended in review: blob cap 256 MiB, not 64; per-token share; 1 MiB charge for
+undeclared JSON; bounded CLI retry. The text below is current.)
 - **Per-route caps, always on.** `PUT /v1/blobs/{hash}` takes at most
-  `--max-blob-bytes` (64 MiB); every other route, all JSON, at most
+  `--max-blob-bytes` (256 MiB, so files of a size that committed in practice
+  keep committing); every other route, all JSON, at most
   `--max-json-body-bytes` (32 MiB, about 200,000 changed paths in a
   changeset). `--max-body-bytes` stays as a ceiling over both. Over the cap is
   `413` with a JSON body naming the flag: before the body is read when its
@@ -159,27 +162,40 @@ concurrent 512 MiB uploads from any writers would ask for 8 GiB.
 - **An in-flight byte budget.** A semaphore of `--max-inflight-bytes` (1 GiB),
   counted in KiB. In the limits middleware, so after authentication (a request
   without a valid token holds nothing), each request with a body takes its
-  `Content-Length`, or its route's cap when it declares none, and holds it until
+  `Content-Length` (without one, a blob upload takes the blob cap and a JSON
+  body 1 MiB: charging JSON its 32 MiB cap would let a client that streams
+  small bodies hold the budget for nothing, and the cap still bounds what it
+  sends), and holds it until
   its handler returns, which is when the body's memory is released. A request
   that does not fit is refused at once with `503` and `Retry-After: 1`, not
   queued, for the reason concurrency is refused rather than queued. A cap above
   the budget fails startup.
+- **A share per token.** With a tokens file, one token may hold at most a
+  quarter of the budget, or one request of the largest cap if that is more, so
+  every request stays admissible alone. Past it the token gets `429` with
+  `Retry-After: 1` (`reason="principal"`) and other tokens are unaffected. A
+  writer that declares large bodies and sends them slowly could otherwise hold
+  the whole budget until its requests time out.
+- **Client.** `leep` sends a blob upload refused with `503` and a
+  `Retry-After` again, up to three tries and 10 seconds of waiting: the upload
+  is content-addressed, so a resend cannot do anything twice. No other write
+  is resent, as before.
 - **Why 1 GiB, fixed.** It bounds request-body memory on its own scale, next to
   the 256 MiB blob cache and the derive cache, and fits the 2 to 4 GiB
-  containers the deployment examples assume, while allowing 16 maximum-size
-  uploads or thousands of ordinary ones at once. Deriving it from the host's
+  containers the deployment examples assume, while allowing four
+  maximum-size uploads or thousands of ordinary ones at once. Deriving it from the host's
   memory would make two servers with the same flags behave differently and
   would need cgroup parsing to be right in containers; operators with more
   memory raise it.
-- **Behaviour change.** Files between 64 MiB and 512 MiB, which committed
+- **Behaviour change.** Files between 256 MiB and 512 MiB, which committed
   before, are now refused (413) until the operator raises `--max-blob-bytes`.
   The CLI reports the 413 with a hint naming the flag and does not retry; the
   git mirror reports the server's message on the ref. `leep-git import` writes
   the stores directly and is not limited.
-- **Trade-off.** A slow client holds its declared share for up to
-  `--request-timeout`, so a writer that declares large bodies and trickles them
-  can hold the budget; per-token `concurrency` bounds how many shares one token
-  holds. Metrics `leep_request_body_bytes_in_flight`,
+- **Trade-off.** A slow client holds what it declared for up to
+  `--request-timeout`; the per-token share bounds that to a quarter of the
+  budget per token, so it takes four such tokens (or anonymous clients, which
+  have no share) to spend it. Metrics `leep_request_body_bytes_in_flight`,
   `leep_request_body_budget_bytes` and
   `leep_request_body_refused_total{reason,class}`, and the alert
   `LeepBodyBudgetExhausted`.

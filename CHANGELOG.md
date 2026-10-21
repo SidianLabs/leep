@@ -18,44 +18,28 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   dropping a query does not cancel it. Lease calls and migrations are not
   bounded (ADR 0012).
 
-### Reviewer capability
-- A tokens-file entry may say `"review": false` (`leep-server gen-token
-  --no-review`): the token cannot post reviews (403) and its reviews, old or
-  new, do not count. Absent means true, as before. Recommended for agent
-  tokens (ADR 0011).
-- `leep` prints the server's reason for a 403 instead of always "token lacks
-  write access".
-
-### Token expiry
-- A tokens-file entry may carry `expires` (RFC 3339, e.g.
-  `2027-01-31T00:00:00Z`); after it the token gets 401 `token expired at
-  ...`, which `leep` reports with a hint. `leep-server gen-token
-  --expires-in 30d` writes it. Gauges `leep_tokens_expiring_soon` and
-  `leep_tokens_expired`, counter `leep_token_expired_requests_total`, and the
-  alert `LeepTokensExpiringSoon` (ADR 0007).
-
 ### Server-wide body limits
 - **Behaviour change:** blob uploads (`PUT /v1/blobs/{hash}`) are capped at
-  64 MiB by default (`--max-blob-bytes`, `LEEP_MAX_BLOB_BYTES`), down from
-  the 512 MiB of `--max-body-bytes`, so a file larger than that is refused
-  with 413 until the operator raises the cap. Other bodies, all JSON, are
+  256 MiB by default (`--max-blob-bytes`, `LEEP_MAX_BLOB_BYTES`), down from
+  the 512 MiB of `--max-body-bytes`, so a file of 256 to 512 MiB that
+  committed before is refused with 413 until the operator raises the cap. Other bodies, all JSON, are
   capped at 32 MiB (`--max-json-body-bytes`). `--max-body-bytes` stays a
   ceiling and gains `LEEP_MAX_BODY_BYTES`.
 - `--max-inflight-bytes` (`LEEP_MAX_INFLIGHT_BYTES`, default 1 GiB) bounds
   the body bytes all requests in flight hold together; a request that would
-  go over gets 503 with `Retry-After: 1`. Metrics
+  go over gets 503 with `Retry-After: 1`. With a tokens file one token may
+  hold at most a quarter of it (429 beyond). A JSON body without a declared
+  length holds 1 MiB of it. Metrics
   `leep_request_body_bytes_in_flight`, `leep_request_body_budget_bytes` and
   `leep_request_body_refused_total`, and the alert `LeepBodyBudgetExhausted`
   (ADR 0020).
-- `leep` explains a 413 with a hint naming the server's limit.
-
-### Protected refs without a policy
-- `leep-server --protect-ref REF` (repeatable; `LEEP_PROTECT_REFS`
-  comma-separated): `REF` only moves forward and cannot be deleted through
-  the API, without requiring signatures or review. Before, only refs named by
-  `--require-signatures`, `--require-review` or a review policy were
-  protected, so any write token could rewind or delete `main` with a raw
-  compare-and-swap (ADR 0015).
+- `leep` explains a 413 with a hint naming the server's limit, and sends a
+  blob upload refused with 503 and `Retry-After` again, up to three tries
+  within 10 seconds.
+- **Behaviour change:** `leep-server gc --fence` defaults to 15m (was 10m),
+  to exceed the request timeout plus the new statement bound plus skew; `gc`
+  warns when its `--fence` does not (ADR 0012). `--request-timeout` and
+  `--meta-statement-timeout` are now accepted after a subcommand too.
 
 ### Summary log entries
 - `GET /v1/log/{id}?fields=summary` answers the same entries, order and

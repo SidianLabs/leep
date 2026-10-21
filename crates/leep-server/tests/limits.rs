@@ -883,3 +883,94 @@ fn body_refusals_are_counted_and_the_gauge_returns_to_zero() {
     let b = series(&text, "leep_request_body_budget_bytes", &[]);
     assert_eq!(value(b), (100 * KIB) as f64);
 }
+
+fn budget_rig_with(limits: leep_server::limits::BodyLimits) -> Router {
+    let config = leep_server::reload::RuntimeConfig::fixed(Some(auth(&[])), None, None, None, None);
+    leep_server::router_with_body_limits(
+        repo(),
+        1 << 30,
+        limits,
+        Duration::from_secs(60),
+        leep_server::reload::ConfigHandle::fixed(config),
+        leep_server::ReadyOptions::default(),
+    )
+}
+
+#[tokio::test]
+async fn one_token_cannot_hold_more_than_its_share_of_the_budget() {
+    // A share is a quarter of 400 KiB: 100 KiB.
+    let app = budget_rig_with(leep_server::limits::BodyLimits {
+        max_blob_bytes: 64 * KIB,
+        max_json_bytes: 8 * KIB,
+        max_inflight_bytes: 400 * KIB,
+    });
+    let (tx, body) = held_body();
+    let held = tokio::spawn(
+        app.clone()
+            .oneshot(request(Method::PUT, &blob_uri(b"slow"), A, body)),
+    );
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    // `a` holds 64 KiB; 40 more would pass its 100 KiB share.
+    let forty = vec![b'y'; 40 * KIB];
+    let r = send(&app, put_declared(A, &forty)).await;
+    assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(r.retry_after.as_deref(), Some("1"));
+    assert!(r.error().contains("this token"), "{}", r.error());
+    // The budget is far from spent, so another token is unaffected, and `a`
+    // can still send what fits its share.
+    assert_eq!(
+        send(&app, put_declared(B, &forty)).await.status,
+        StatusCode::NO_CONTENT
+    );
+    let thirty = vec![b'z'; 30 * KIB];
+    assert_eq!(
+        send(&app, put_declared(A, &thirty)).await.status,
+        StatusCode::NO_CONTENT
+    );
+    drop(tx);
+    held.await.unwrap().unwrap();
+    // Its share comes back when the slow upload ends.
+    assert_eq!(
+        send(&app, put_declared(A, &forty)).await.status,
+        StatusCode::NO_CONTENT
+    );
+}
+
+#[test]
+fn a_json_body_without_a_length_holds_one_mib_not_the_cap() {
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    metrics::with_local_recorder(&recorder, || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let app = budget_rig_with(leep_server::limits::BodyLimits {
+                    max_blob_bytes: 64 * KIB,
+                    max_json_bytes: 8 << 20,
+                    max_inflight_bytes: 64 << 20,
+                });
+                let (tx, body) = held_body();
+                let held = tokio::spawn(app.clone().oneshot(request(
+                    Method::POST,
+                    "/v1/changesets",
+                    A,
+                    body,
+                )));
+                for _ in 0..20 {
+                    tokio::task::yield_now().await;
+                }
+                let text = handle.render();
+                let g = series(&text, "leep_request_body_bytes_in_flight", &[]);
+                assert_eq!(value(g), (1 << 20) as f64, "{text}");
+                drop(tx);
+                held.await.unwrap().unwrap();
+                let text = handle.render();
+                let g = series(&text, "leep_request_body_bytes_in_flight", &[]);
+                assert_eq!(value(g), 0.0, "{text}");
+            })
+    });
+}

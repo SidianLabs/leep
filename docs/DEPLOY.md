@@ -194,15 +194,17 @@ These are always on, tokens file or not:
 
 | Flag / variable | Default | Meaning |
 |---|---|---|
-| `--max-blob-bytes` / `LEEP_MAX_BLOB_BYTES` | 64 MiB | Largest blob upload (`PUT /v1/blobs/{hash}`): the largest file a commit can contain. |
+| `--max-blob-bytes` / `LEEP_MAX_BLOB_BYTES` | 256 MiB | Largest blob upload (`PUT /v1/blobs/{hash}`): the largest file a commit can contain. |
 | `--max-json-body-bytes` / `LEEP_MAX_JSON_BODY_BYTES` | 32 MiB | Largest body of every other request. The largest is a changeset: about 150 bytes per changed path, so some 200,000 paths. |
-| `--max-inflight-bytes` / `LEEP_MAX_INFLIGHT_BYTES` | 1 GiB | Body bytes all requests in flight may hold together; a request that would go over gets `503` with `Retry-After: 1`. |
+| `--max-inflight-bytes` / `LEEP_MAX_INFLIGHT_BYTES` | 1 GiB | Body bytes all requests in flight may hold together; a request that would go over gets `503` with `Retry-After: 1`. With a tokens file, one token may hold at most a quarter of it (or one largest request, if that is more); beyond that it gets `429`. |
 | `--max-body-bytes` / `LEEP_MAX_BODY_BYTES` | 512 MiB | Ceiling on every body; the caps above apply first. |
 
 A body over its cap gets `413` with a JSON error naming the flag; `leep` prints
-it with a hint and does not retry. **Upgrading from a version without these
+it with a hint and does not retry. A blob upload refused with `503` for a spent
+budget is sent again by `leep` up to three times in all, waiting the
+`Retry-After` (at most 10 seconds altogether). **Upgrading from a version without these
 limits:** blob uploads used to be capped only by `--max-body-bytes` (512 MiB),
-so a file between 64 MiB and 512 MiB that committed before is now refused, by
+so a file between 256 MiB and 512 MiB that committed before is now refused, by
 `leep commit` and by the git mirror importing a push. Raise `--max-blob-bytes`
 (and `--max-inflight-bytes`, which must be at least as large) if your
 repositories hold such files. Bodies are held in memory while they are hashed
@@ -360,7 +362,7 @@ a reload is refused.
 | `LEEP_RATE_LIMIT`, `LEEP_RATE_BURST` | none | Per-token request rate and burst; see [Request limits](#request-limits). |
 | `LEEP_MAX_CONCURRENT_PER_TOKEN` | none | Requests in flight per token. |
 | `LEEP_READ_MAX_BODY_BYTES` | 1 MiB with a tokens file | Body size cap for read tokens; needs the tokens file. |
-| `LEEP_MAX_BLOB_BYTES` | 64 MiB | Largest blob upload; see [Body limits](#body-limits). |
+| `LEEP_MAX_BLOB_BYTES` | 256 MiB | Largest blob upload; see [Body limits](#body-limits). |
 | `LEEP_MAX_JSON_BODY_BYTES` | 32 MiB | Largest body of any other request. |
 | `LEEP_MAX_INFLIGHT_BYTES` | 1 GiB | Body bytes all requests in flight may hold together. |
 | `LEEP_MAX_BODY_BYTES` | 512 MiB | Ceiling on every request body. |

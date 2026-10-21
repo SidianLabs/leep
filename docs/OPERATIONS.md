@@ -82,7 +82,7 @@ measured until the response head is ready, not until the body is streamed.
 | `leep_requests_in_flight` | gauge | `token` | Requests in progress, until their response body has been sent. Only tokens that have a limit are tracked. |
 | `leep_request_body_bytes_in_flight` | gauge | none | Body bytes the requests in flight hold of the `--max-inflight-bytes` budget: each request's `Content-Length`, or its route's cap when it declares none, from admission until its handler finishes. |
 | `leep_request_body_budget_bytes` | gauge | none | The `--max-inflight-bytes` budget, for ratios. |
-| `leep_request_body_refused_total` | counter | `reason` = `budget`, `size`; `class` = `blob`, `json` | Requests refused by the server-wide body limits: `budget` is a 503 because the budget was spent, `size` a 413 over `--max-blob-bytes` (`class="blob"`) or `--max-json-body-bytes` (`class="json"`). All four series exist from startup. |
+| `leep_request_body_refused_total` | counter | `reason` = `budget`, `principal`, `size`; `class` = `blob`, `json` | Requests refused by the server-wide body limits: `budget` is a 503 because the budget was spent, `principal` a 429 because the token already holds its share of it, `size` a 413 over `--max-blob-bytes` (`class="blob"`) or `--max-json-body-bytes` (`class="json"`). All six series exist from startup. |
 | `leep_config_reload_total` | counter | `result` = `ok`, `error` | Config reloads (SIGHUP) by result; both series exist from startup (ADR 0024). |
 | `leep_config_generation` | gauge | none | **Per process:** 1 at startup, plus one per successful reload, even when nothing changed. It resets on restart, so it differs between healthy servers that run identical config; do not alert on it. Use `leep_config_info` to compare servers. |
 | `leep_config_info` | gauge | `fingerprint` | 1 for the fingerprint of the config in force, 0 for the ones this process ran before, so `leep_config_info == 1` has exactly one series per server. The fingerprint is 16 hex characters of a BLAKE3 over the parsed config (tokens with their authors and limits, trusted keys, review policy, `--require-signatures` and review refs, and the server-wide limit defaults), so it is the same on every server that runs the same config, across restarts, and does not change when a file is only reformatted or reordered. It holds no secret: tokens are already digests, keys are public, and the hash is truncated. It is also logged at startup and on every reload. |
@@ -550,27 +550,32 @@ Tuning:
 ### Body limits and the in-flight budget
 
 Unlike the per-token limits these are always on (ADR 0020, "Server-wide body
-limits"). A blob upload over `--max-blob-bytes` (default 64 MiB) or any other
+limits"). A blob upload over `--max-blob-bytes` (default 256 MiB) or any other
 body over `--max-json-body-bytes` (32 MiB) is a `413`, before anything is read
 when the length is declared and as soon as it is exceeded when it is not. Every
-request with a body also holds its `Content-Length` (its route's cap if it
-declares none) of `--max-inflight-bytes` (1 GiB) until its handler is done; one
-that would go over is a `503` with `Retry-After: 1`. Bodies are held in memory
+request with a body also holds its `Content-Length` of `--max-inflight-bytes`
+(1 GiB) until its handler is done; one that declares no length holds the blob
+cap for a blob upload and 1 MiB for anything else. One that would go over is a
+`503` with `Retry-After: 1`. With a tokens file, one token may hold at most a
+quarter of the budget (or one request of the largest cap, if that is more);
+past its share it gets `429`, while other tokens go on. Bodies are held in memory
 while they are hashed and stored, so the budget bounds that memory whatever the
 number of clients. Requests without a valid token are refused before they hold
 anything.
 
 - Memory: plan for `--cache-bytes` plus `--derive-cache-bytes` plus
   `--max-inflight-bytes` plus a few hundred MB, and set the budget to fit the
-  container. With 1 GiB of budget, 16 maximum-size uploads run at once; real
+  container. With 1 GiB of budget, four maximum-size uploads run at once; real
   uploads are mostly a few KB, so thousands do.
 - `leep_request_body_bytes_in_flight` near `leep_request_body_budget_bytes`
   means uploads are queuing for memory. If it sits there with few requests per
   second, clients are uploading slowly (a slow link, or a client trickling a
-  large declared body) and holding their share for up to `--request-timeout`;
-  per-token `concurrency` bounds how much of the budget one token can hold.
-- The CLI reports a 503 refusal as a server error (exit status 3) and does not
-  resend the upload; running the command again uploads only what is missing.
+  large declared body) and holding their share for up to `--request-timeout`.
+  No token can hold more than its share; `reason="principal"` refusals name
+  the token in the DEBUG log, and per-token `concurrency` bounds it further.
+- `leep` sends a blob upload refused with a 503 again, up to three tries and
+  10 seconds of waiting; past that it reports a server error (exit status 3),
+  and running the command again uploads only what is missing.
 - `--max-body-bytes` (512 MiB) stays a ceiling on every route; a cap above it
   has no effect. A cap above the budget stops the server at startup, since
   such a request could never be admitted.
@@ -1270,16 +1275,24 @@ needs no downtime.
 leep-server gc --dry-run                     # what would be condemned; writes nothing
 leep-server gc                               # condemn, wait --fence, collect
 leep-server gc condemn                       # phase one only
-leep-server gc collect --fence 10m           # phase two only
+leep-server gc collect --fence 15m           # phase two only
 leep-server gc --full                        # walk all of history, not only what is new
 ```
 
 How it works: **condemn** marks every unreferenced blob older than `--grace`
 (default 24h); a condemned blob is reported missing to clients, which upload it
-again if they need it. After `--fence` (default 10m) **collect** marks again and
+again if they need it. After `--fence` (default 15m) **collect** marks again and
 deletes the blobs that are still condemned. Collect acts only on condemnations
 at least `--fence` old, so the two phases can run as separate cron jobs or
 processes. A crashed run is safe: rerun it.
+
+The fence must exceed the servers' `--request-timeout` plus, on Postgres, their
+`--meta-statement-timeout` (default the request timeout plus 5 s) plus clock
+skew (ADR 0012): with the defaults, 5m + 5m 5s + skew, under 15m. `gc` checks
+the `--request-timeout` and `--meta-statement-timeout` it is given (or their
+`LEEP_` variables, so run it with the servers' environment) and logs a WARN
+when the fence is too short. If you raise `--request-timeout`, raise
+`--fence` with it, or set a short `--meta-statement-timeout` such as `30s`.
 
 Marking is incremental (ADR 0033): each run records what it marked in
 `gc-mark-v1` rows and the next one walks only changesets stored since, so a
@@ -1350,8 +1363,9 @@ servers. By default it is incremental. It walks back from every ref only as
 far as the history whose objects are still loose, writes and publishes a new
 pack holding the loose objects, and leaves existing packs alone, except that
 it folds in small packs so the count stays low. It then waits `--fence`
-(default 10m, the same rule as `gc --fence`: longer than the servers'
-`--request-timeout` plus clock skew) and deletes the loose copies and any
+(default 10m: longer than the servers' `--request-timeout` plus clock skew;
+the statement term of `gc --fence` does not apply, since repack's fence covers
+reads of the loose copies, not metadata writes) and deletes the loose copies and any
 packs it merged. `--fence 0` is refused unless `--unsafe-no-fence` is given,
 which is only valid with every server stopped. Filesystem blob stores
 (`file://` or a path) and object stores (`s3://`) can be packed; a `mem://`

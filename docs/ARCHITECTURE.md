@@ -899,7 +899,8 @@ misses and occupancy as Prometheus metrics (see [OPERATIONS.md](OPERATIONS.md)).
   it marks everything reachable from every stored changeset (not only refs, so
   unlanded changesets survive), *condemns* unmarked blobs older than a grace
   window (default 24h) by writing `blob-condemned-v1`, waits a fence (default
-  10m, longer than the server's `--request-timeout`), re-marks, and deletes the
+  15m, longer than the servers' `--request-timeout` plus their statement
+  bound), re-marks, and deletes the
   blobs still condemned. A condemned blob is reported missing by
   `POST /v1/blobs/missing` and rejected by `POST /v1/changesets`, so clients
   re-upload it, and an upload rescues it; collect orders its delete against

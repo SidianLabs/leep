@@ -33,6 +33,12 @@ const MAX_ATTEMPTS: u32 = 4;
 /// Times a land with a land id is sent again after an answer that may not
 /// have been the server's last word (ADR 0057).
 const LAND_RESENDS: u32 = 3;
+/// Tries of a blob upload the server refused for being busy (503 with
+/// `Retry-After`, its in-flight body budget spent), and the most time spent
+/// waiting between them in all. The upload is content-addressed, so sending
+/// it again cannot do anything twice.
+const BLOB_BUSY_ATTEMPTS: u32 = 3;
+const BLOB_BUSY_WAIT: Duration = Duration::from_secs(10);
 /// Longest pause between tries. A longer `Retry-After` means the server wants
 /// the caller gone for a while, so fail with that advice instead of hanging.
 const MAX_RETRY_WAIT: Duration = Duration::from_secs(10);
@@ -332,10 +338,13 @@ impl Client {
         let (http, built) = req.build_split();
         let built = built.map_err(|e| CliError::user(format!("bad request: {e}")))?;
         let idempotent = built.method() == reqwest::Method::GET;
+        let blob_upload =
+            built.method() == reqwest::Method::PUT && built.url().path().starts_with("/v1/blobs/");
         let mut current = built;
         let mut attempt = 1;
+        let mut waited = Duration::ZERO;
         loop {
-            let spare = if idempotent {
+            let spare = if idempotent || blob_upload {
                 current.try_clone()
             } else {
                 None
@@ -345,11 +354,30 @@ impl Client {
             if status.is_success() {
                 return Ok(resp);
             }
-            if let (StatusCode::TOO_MANY_REQUESTS, Some(next), true) =
-                (status, spare, attempt < MAX_ATTEMPTS)
-            {
-                if let Some(wait) = retry_after(&resp).filter(|w| *w <= MAX_RETRY_WAIT) {
+            if status == StatusCode::TOO_MANY_REQUESTS && idempotent && attempt < MAX_ATTEMPTS {
+                if let (Some(next), Some(wait)) =
+                    (spare, retry_after(&resp).filter(|w| *w <= MAX_RETRY_WAIT))
+                {
                     std::thread::sleep(wait);
+                    attempt += 1;
+                    current = next;
+                    continue;
+                }
+                return Err(error_from(resp, self.has_token));
+            }
+            if status == StatusCode::SERVICE_UNAVAILABLE
+                && blob_upload
+                && attempt < BLOB_BUSY_ATTEMPTS
+            {
+                // Only a stated pause: a bare 503 is a failing server.
+                let stated = resp.headers().contains_key(RETRY_AFTER)
+                    && !resp.headers().contains_key(INDEXING_HEADER);
+                if let (Some(next), Some(wait)) = (
+                    spare,
+                    retry_after(&resp).filter(|w| stated && waited + *w <= BLOB_BUSY_WAIT),
+                ) {
+                    std::thread::sleep(wait);
+                    waited += wait;
                     attempt += 1;
                     current = next;
                     continue;
@@ -1095,14 +1123,53 @@ mod tests {
     fn a_body_over_the_servers_cap_says_which_limit_and_is_not_retried() {
         const TOO_LARGE: &str = "HTTP/1.1 413 Payload Too Large\r\ncontent-type: application/json\r\n\
             content-length: 104\r\nconnection: close\r\n\r\n\
-            {\"error\":\"request body exceeds the limit of 67108864 bytes for a blob upload (server --max-blob-bytes)\"}";
+            {\"error\":\"request body exceeds the limit of 268435456 bytes for a blob upload (server --max-blob-bytes)\"}";
         let (url, seen) = stub(&[TOO_LARGE, OK]);
         let h = Hash::of_blob(b"x");
         let e = Client::new(&url).put_blob(&h, b"x".to_vec()).unwrap_err();
         assert_eq!(e.kind(), ErrorKind::User, "{e}");
-        assert!(e.to_string().contains("67108864 bytes"), "{e}");
+        assert!(e.to_string().contains("268435456 bytes"), "{e}");
         assert!(e.hint().unwrap().contains("--max-blob-bytes"), "{e:?}");
         assert!(!e.is_retryable());
+        assert_eq!(seen.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_busy_blob_upload_is_retried_a_bounded_number_of_times() {
+        const BUSY: &str = "HTTP/1.1 503 Service Unavailable\r\nretry-after: 0\r\n\
+            content-type: application/json\r\ncontent-length: 17\r\nconnection: close\r\n\r\n\
+            {\"error\":\"busy!\"}";
+        const BARE_503: &str = "HTTP/1.1 503 Service Unavailable\r\n\
+            content-type: application/json\r\ncontent-length: 17\r\nconnection: close\r\n\r\n\
+            {\"error\":\"down!\"}";
+        const NO_CONTENT: &str =
+            "HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+        let h = Hash::of_blob(b"x");
+        let (url, seen) = stub(&[BUSY, BUSY, NO_CONTENT]);
+        Client::new(&url).put_blob(&h, b"x".to_vec()).unwrap();
+        assert_eq!(seen.load(Ordering::SeqCst), 3);
+
+        // At most three tries in all.
+        let (url, seen) = stub(&[BUSY]);
+        let e = Client::new(&url).put_blob(&h, b"x".to_vec()).unwrap_err();
+        assert!(e.to_string().contains("busy!"), "{e}");
+        assert_eq!(seen.load(Ordering::SeqCst), BLOB_BUSY_ATTEMPTS as usize);
+
+        // A 503 that names no pause is not retried, nor is any other write.
+        let (url, seen) = stub(&[BARE_503, NO_CONTENT]);
+        assert!(Client::new(&url).put_blob(&h, b"x".to_vec()).is_err());
+        assert_eq!(seen.load(Ordering::SeqCst), 1);
+        let (url, seen) = stub(&[BUSY, OK]);
+        assert!(Client::new(&url)
+            .create_changeset(&Changeset {
+                parents: vec![],
+                author: "a".into(),
+                timestamp: 0,
+                message: String::new(),
+                changes: Default::default(),
+                extra: Default::default(),
+            })
+            .is_err());
         assert_eq!(seen.load(Ordering::SeqCst), 1);
     }
 
