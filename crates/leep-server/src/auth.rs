@@ -12,11 +12,14 @@
 //! ```
 //!
 //! An entry may also carry request limits (`rate`, `burst`, `concurrency`,
-//! `max_body`; ADR 0020), see [`crate::limits`].
+//! `max_body`; ADR 0020), see [`crate::limits`], `expires`, an RFC 3339
+//! time after which the token is refused, and `"review": false`, which takes
+//! a write token out of the reviewers (ADR 0011).
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::{FromRequestParts, Request};
 use axum::http::request::Parts;
@@ -74,6 +77,8 @@ pub struct Principal {
     pub role: Role,
     /// The token entry's `author`, for clients to stamp on changesets.
     pub author: Option<String>,
+    /// Whether the token may post reviews (`"review": false` says no).
+    pub review: bool,
 }
 
 /// The request's [`Principal`], or `None` when authentication is off.
@@ -110,7 +115,18 @@ pub struct TokenEntry {
     /// Largest request body, in bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_body: Option<Quota>,
+    /// When the token stops working: an RFC 3339 time with an offset, such
+    /// as `2027-01-31T00:00:00Z`. Absent, it never expires.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires: Option<String>,
+    /// Whether a write token may post reviews and its reviews count.
+    /// Absent means yes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review: Option<bool>,
 }
+
+/// How far ahead `leep_tokens_expiring_soon` looks.
+pub const EXPIRY_WARNING: Duration = Duration::from_secs(7 * 24 * 3600);
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -124,6 +140,32 @@ struct Known {
     author: Option<String>,
     digest: [u8; 32],
     limits: TokenLimits,
+    expires: Option<jiff::Timestamp>,
+    review: bool,
+}
+
+impl Known {
+    fn expired(&self, now: jiff::Timestamp) -> bool {
+        self.expires.is_some_and(|e| now >= e)
+    }
+}
+
+/// Tokens by how soon they expire, for the gauges and the startup log.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ExpiryReport {
+    /// Past their `expires`, still in the file.
+    pub expired: Vec<String>,
+    /// Expiring within [`EXPIRY_WARNING`].
+    pub soon: Vec<String>,
+}
+
+fn parse_expires(s: &str) -> Result<jiff::Timestamp, String> {
+    s.parse().map_err(|_| {
+        format!(
+            "expires must be an RFC 3339 time with an offset, such as \
+             2027-01-31T00:00:00Z, got {s:?}"
+        )
+    })
 }
 
 /// What a reload changed in the token table, by token name. Never holds
@@ -136,6 +178,9 @@ pub struct AuthChange {
     pub rotated: Vec<String>,
     pub role_changed: Vec<String>,
     pub limits_changed: Vec<String>,
+    pub expiry_changed: Vec<String>,
+    /// Gained or lost the right to review.
+    pub review_changed: Vec<String>,
 }
 
 impl AuthChange {
@@ -172,6 +217,8 @@ pub fn generate(name: &str, role: Role) -> Result<(String, TokenEntry), String> 
         burst: None,
         concurrency: None,
         max_body: None,
+        expires: None,
+        review: None,
     };
     Ok((token, entry))
 }
@@ -223,12 +270,20 @@ impl Auth {
             limits
                 .validate()
                 .map_err(|e| format!("token {:?}: {e}", t.name))?;
+            let expires = t
+                .expires
+                .as_deref()
+                .map(parse_expires)
+                .transpose()
+                .map_err(|e| format!("token {:?}: {e}", t.name))?;
             tokens.push(Known {
                 name: t.name,
                 role: t.role,
                 author: t.author,
                 digest,
                 limits,
+                expires,
+                review: t.review.unwrap_or(true),
             });
         }
         Ok(Auth { tokens })
@@ -248,14 +303,29 @@ impl Auth {
         self.tokens.is_empty()
     }
 
-    /// Names of the tokens that may write, in file order: the principals whose
-    /// reviews count.
+    /// Names of the tokens that may write and review, in file order: the
+    /// principals whose reviews count.
     pub fn reviewers(&self) -> Vec<String> {
         self.tokens
             .iter()
-            .filter(|k| k.role == Role::Write)
+            .filter(|k| k.role == Role::Write && k.review)
             .map(|k| k.name.clone())
             .collect()
+    }
+
+    /// Which tokens have expired or expire within [`EXPIRY_WARNING`] of
+    /// `now`, each list in file order.
+    pub fn expiry_report(&self, now: jiff::Timestamp) -> ExpiryReport {
+        let horizon = now + EXPIRY_WARNING;
+        let mut r = ExpiryReport::default();
+        for k in &self.tokens {
+            match k.expires {
+                Some(e) if now >= e => r.expired.push(k.name.clone()),
+                Some(e) if horizon >= e => r.soon.push(k.name.clone()),
+                _ => {}
+            }
+        }
+        r
     }
 
     /// Each token's own limit fields, in file order; unset ones fall back to
@@ -272,7 +342,7 @@ impl Auth {
         let mut all: Vec<&Known> = self.tokens.iter().collect();
         all.sort_by(|a, b| a.name.cmp(&b.name));
         c.section("tokens", all.len());
-        for k in all {
+        for k in &all {
             c.str(&k.name)
                 .str(k.role.as_str())
                 .bytes(&k.digest)
@@ -281,6 +351,24 @@ impl Auth {
                 .opt_f64(k.limits.burst)
                 .opt_quota(k.limits.concurrency)
                 .opt_quota(k.limits.max_body);
+        }
+        // A section of its own, only when used, so files without the field
+        // keep the fingerprint they had before it existed.
+        let expiring: Vec<&Known> = all
+            .iter()
+            .copied()
+            .filter(|k| k.expires.is_some())
+            .collect();
+        if !expiring.is_empty() {
+            c.section("token-expiry", expiring.len());
+            for k in expiring {
+                c.str(&k.name)
+                    .opt_str(k.expires.map(|e| e.to_string()).as_deref());
+            }
+        }
+        let barred: Vec<&String> = all.iter().filter(|k| !k.review).map(|k| &k.name).collect();
+        if !barred.is_empty() {
+            c.set("token-no-review", barred);
         }
     }
 
@@ -304,6 +392,12 @@ impl Auth {
             if o.limits != k.limits {
                 c.limits_changed.push(name.to_string());
             }
+            if o.expires != k.expires {
+                c.expiry_changed.push(name.to_string());
+            }
+            if o.review != k.review {
+                c.review_changed.push(name.to_string());
+            }
         }
         c.removed = old
             .keys()
@@ -316,6 +410,8 @@ impl Auth {
             &mut c.rotated,
             &mut c.role_changed,
             &mut c.limits_changed,
+            &mut c.expiry_changed,
+            &mut c.review_changed,
         ] {
             list.sort();
         }
@@ -385,16 +481,31 @@ pub async fn require_token(mut req: Request, next: Next) -> Response {
     let Some(auth) = &config.auth else {
         return next.run(req).await;
     };
-    let Some(Known {
-        name, role, author, ..
-    }) = bearer(&req).and_then(|t| auth.lookup(t))
-    else {
+    let Some(known) = bearer(&req).and_then(|t| auth.lookup(t)) else {
         return reject(
             StatusCode::UNAUTHORIZED,
             error_code::UNAUTHORIZED,
             "authentication required: missing or invalid bearer token",
         );
     };
+    if known.expired(jiff::Timestamp::now()) {
+        let at = known.expires.map(|e| e.to_string()).unwrap_or_default();
+        tracing::debug!(token = known.name, expires = %at, "expired token refused");
+        metrics::counter!("leep_token_expired_requests_total", "token" => known.name.clone())
+            .increment(1);
+        return reject(
+            StatusCode::UNAUTHORIZED,
+            error_code::TOKEN_EXPIRED,
+            &format!("authentication required: token expired at {at}; ask for a new one"),
+        );
+    }
+    let Known {
+        name,
+        role,
+        author,
+        review,
+        ..
+    } = known;
     let role = *role;
     if role == Role::Read && needs_write(req.method(), req.uri().path()) {
         tracing::debug!(token = name, "read token refused on a mutating request");
@@ -409,6 +520,7 @@ pub async fn require_token(mut req: Request, next: Next) -> Response {
         name: name.to_string(),
         role,
         author: author.clone(),
+        review: *review,
     });
     next.run(req).instrument(span).await
 }
@@ -429,6 +541,39 @@ mod tests {
     }
 
     #[test]
+    fn expires_is_parsed_checked_and_reported() {
+        let parse = |entries: serde_json::Value| {
+            Auth::parse(&serde_json::json!({ "tokens": entries }).to_string())
+        };
+        let now: jiff::Timestamp = "2026-10-21T12:00:00Z".parse().unwrap();
+        let a = parse(serde_json::json!([
+            { "name": "never", "role": "write", "hash": hash_token("1") },
+            { "name": "gone", "role": "write", "hash": hash_token("2"), "expires": "2026-10-21T12:00:00Z" },
+            { "name": "soon", "role": "read", "hash": hash_token("3"), "expires": "2026-10-28T13:00:00+01:00" },
+            { "name": "later", "role": "write", "hash": hash_token("4"), "expires": "2026-10-28T12:00:01Z" },
+        ]))
+        .unwrap();
+        let r = a.expiry_report(now);
+        assert_eq!(r.expired, ["gone"]);
+        assert_eq!(r.soon, ["soon"]);
+        assert!(a.lookup("2").unwrap().expired(now));
+        assert!(!a.lookup("3").unwrap().expired(now));
+        assert!(!a.lookup("1").unwrap().expired(now));
+
+        for bad in ["2027-01-31", "2027-01-31T00:00:00", "tomorrow", ""] {
+            let e = parse(serde_json::json!([
+                { "name": "x", "role": "write", "hash": hash_token("1"), "expires": bad },
+            ]))
+            .err()
+            .expect(bad);
+            assert!(
+                e.contains("token \"x\"") && e.contains("RFC 3339"),
+                "{bad:?}: {e}"
+            );
+        }
+    }
+
+    #[test]
     fn reviewers_are_the_write_tokens() {
         let text = serde_json::json!({ "tokens": [
             { "name": "ci", "role": "write", "hash": hash_token("a") },
@@ -437,6 +582,24 @@ mod tests {
         ]})
         .to_string();
         assert_eq!(Auth::parse(&text).unwrap().reviewers(), ["ci", "alice"]);
+    }
+
+    #[test]
+    fn tokens_with_review_false_are_not_reviewers() {
+        let text = serde_json::json!({ "tokens": [
+            { "name": "agent-1", "role": "write", "hash": hash_token("a"), "review": false },
+            { "name": "alice", "role": "write", "hash": hash_token("b"), "review": true },
+            { "name": "bob", "role": "write", "hash": hash_token("c") },
+        ]})
+        .to_string();
+        let a = Auth::parse(&text).unwrap();
+        assert_eq!(a.reviewers(), ["alice", "bob"]);
+        assert!(!a.lookup("a").unwrap().review);
+        assert!(a.lookup("c").unwrap().review);
+        let bad =
+            r#"{ "tokens": [{ "name": "x", "role": "write", "hash": "HASH", "review": "no" }] }"#
+                .replace("HASH", &hash_token("a"));
+        assert!(Auth::parse(&bad).is_err());
     }
 
     #[test]
@@ -468,6 +631,8 @@ mod tests {
             { "name": "promoted", "role": "read", "hash": hash_token("3") },
             { "name": "throttled", "role": "write", "hash": hash_token("4") },
             { "name": "gone", "role": "write", "hash": hash_token("5") },
+            { "name": "same2", "role": "write", "hash": hash_token("7") },
+            { "name": "agent", "role": "write", "hash": hash_token("8") },
         ]));
         let new = parse(serde_json::json!([
             { "name": "same", "role": "write", "hash": hash_token("1") },
@@ -475,6 +640,8 @@ mod tests {
             { "name": "promoted", "role": "write", "hash": hash_token("3") },
             { "name": "throttled", "role": "write", "hash": hash_token("4"), "rate": 2 },
             { "name": "fresh", "role": "read", "hash": hash_token("6") },
+            { "name": "same2", "role": "write", "hash": hash_token("7"), "expires": "2030-01-01T00:00:00Z" },
+            { "name": "agent", "role": "write", "hash": hash_token("8"), "review": false },
         ]));
         assert!(old.diff(&old).is_empty());
         let c = old.diff(&new);
@@ -483,5 +650,7 @@ mod tests {
         assert_eq!(c.rotated, ["rotated"]);
         assert_eq!(c.role_changed, ["promoted"]);
         assert_eq!(c.limits_changed, ["throttled"]);
+        assert_eq!(c.expiry_changed, ["same2"]);
+        assert_eq!(c.review_changed, ["agent"]);
     }
 }

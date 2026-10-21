@@ -1182,3 +1182,69 @@ fn server_refuses_to_start_with_bad_review_config() {
     assert!(!out.status.success());
     assert!(msg(&out).contains("--require-review"), "{}", msg(&out));
 }
+
+/// A token with `"review": false` (an agent's) cannot post reviews, and
+/// reviews it posted before it lost the right stop counting.
+#[tokio::test]
+async fn tokens_without_review_cannot_review_and_their_old_reviews_stop_counting() {
+    let tokens = |agent_reviews: bool| {
+        Auth::parse(
+            &serde_json::json!({ "tokens": [
+                { "name": "alice", "role": "write", "hash": hash_token(&token("alice")) },
+                { "name": "agent", "role": "write", "hash": hash_token(&token("agent")),
+                  "review": agent_reviews },
+                { "name": "viewer", "role": "read", "hash": hash_token(VIEWER) },
+            ]})
+            .to_string(),
+        )
+        .unwrap()
+    };
+    let repo = Repo::new(
+        Arc::new(MemoryBlobStore::new()),
+        Arc::new(MemoryMetaStore::new()),
+    );
+    let api = |auth: Auth| {
+        let svc = Arc::new(ReviewService::new(
+            auth.reviewers(),
+            ReviewPolicy::parse(POLICY).unwrap().rules,
+        ));
+        let repo = repo
+            .clone()
+            .with_land_policy(Arc::new(RequireReview::new(svc.clone(), ["main".into()])));
+        Api {
+            app: leep_server::router_with_review(
+                repo.clone(),
+                1 << 20,
+                Some(auth),
+                None,
+                Some(svc),
+            ),
+            repo,
+        }
+    };
+    let before = api(tokens(true));
+    let c = before.commit(&[], &[("a", Some("1\n"))]).await;
+    before.approve(c, "agent").await;
+    assert!(before.status(c).await.approved);
+
+    let after = api(tokens(false));
+    let r = after.review(c, "agent", Verdict::Approve).await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+    assert!(r.error().contains("\"review\": false"), "{}", r.error());
+    assert_eq!(
+        r.json::<ErrorResponse>().code.as_deref(),
+        Some(leep_core::api::error_code::FORBIDDEN)
+    );
+    // Its earlier approval is no longer listed and no longer counts.
+    let listed = after.reviews(c).await;
+    assert!(listed.reviews.is_empty(), "{:?}", listed.reviews);
+    assert!(!after.status(c).await.approved);
+    let r = after.land(c, "agent").await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert!(r.error().contains(NEEDS_REVIEW_MARKER), "{}", r.error());
+    // It can still do everything else a write token does, and a reviewer's
+    // approval lets its change land.
+    after.approve(c, "alice").await;
+    let r = after.land(c, "agent").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.error());
+}

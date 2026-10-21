@@ -38,6 +38,8 @@ getrandom = "0.3"
 futures-util = "0.3"
 globset = "0.4"
 hex = "0.4"
+# RFC 3339 timestamps (token expiry); no time zone database needed.
+jiff = { version = "0.2", default-features = false, features = ["std"] }
 regex = "1"
 regex-syntax = "0.8"
 postcard = { version = "1", features = ["use-std"] }

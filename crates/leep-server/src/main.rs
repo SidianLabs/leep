@@ -300,6 +300,14 @@ enum Cmd {
         /// none, e.g. "Name <email>".
         #[arg(long)]
         author: Option<String>,
+        /// Make the token stop working this long from now (30m, 24h, 90d);
+        /// the entry gets an `expires` time. Never expires when unset.
+        #[arg(long, value_parser = parse_expires_in)]
+        expires_in: Option<std::time::Duration>,
+        /// Keep this token from posting reviews (`"review": false`); its
+        /// reviews never count. For agent tokens.
+        #[arg(long)]
+        no_review: bool,
     },
     /// Delete blobs no changeset references (uses --meta and --blobs; safe
     /// beside running servers). Without a phase: condemn, wait --fence, then
@@ -664,6 +672,15 @@ fn parse_ready_timeout(s: &str) -> Result<std::time::Duration, String> {
     Ok(d)
 }
 
+/// `gen-token --expires-in`: a lifetime, so zero (expired at birth) is refused.
+fn parse_expires_in(s: &str) -> Result<std::time::Duration, String> {
+    let d = parse_grace(s)?;
+    if d.is_zero() {
+        return Err("must be greater than zero, e.g. 30d".into());
+    }
+    Ok(d)
+}
+
 fn parse_grace(s: &str) -> Result<std::time::Duration, String> {
     leep_derive::gc::parse_duration(s).map_err(|e| e.to_string())
 }
@@ -955,9 +972,25 @@ fn run_command(cmd: Cmd) -> anyhow::Result<()> {
         | Cmd::UpgradeIndex(_) => {
             unreachable!("handled in main")
         }
-        Cmd::GenToken { name, role, author } => {
+        Cmd::GenToken {
+            name,
+            role,
+            author,
+            expires_in,
+            no_review,
+        } => {
             let (token, mut entry) = auth::generate(&name, role).map_err(anyhow::Error::msg)?;
             entry.author = author;
+            entry.review = no_review.then_some(false);
+            if let Some(d) = expires_in {
+                let at = jiff::Timestamp::now()
+                    .checked_add(d)
+                    .context("--expires-in is too far in the future")?;
+                // Whole seconds read better in the file and lose nothing.
+                let at = jiff::Timestamp::from_second(at.as_second())
+                    .context("--expires-in is too far in the future")?;
+                entry.expires = Some(at.to_string());
+            }
             println!("token: {token}");
             println!("entry: {}", serde_json::to_string(&entry)?);
             eprintln!("Store the token now; it cannot be recovered. Add the entry to the `tokens` array of your tokens file.");
@@ -1246,6 +1279,10 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(unix)]
     leep_server::reload::spawn_sighup_reload(config.clone(), repo.meta().clone())
         .context("installing the SIGHUP handler")?;
+    leep_server::reload::spawn_token_expiry_gauges(
+        config.clone(),
+        std::time::Duration::from_secs(60),
+    );
     let index_leases = index_policy(&args, &mut repo)?;
     let warm = match (args.indexing, &index_leases) {
         (Indexing::Off, _) => {
@@ -1513,6 +1550,7 @@ fn log_config(c: &RuntimeConfig) {
         fingerprint = %c.fingerprint,
         "config loaded (servers that run the same config print the same fingerprint)"
     );
+    leep_server::reload::record_token_expiry(c, true);
     match &c.auth {
         Some(a) => tracing::info!(tokens = a.len(), "authentication enabled"),
         None => tracing::warn!("authentication disabled: no --tokens-file; anyone who can reach this server can read and write"),

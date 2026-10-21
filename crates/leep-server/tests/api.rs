@@ -1854,11 +1854,83 @@ async fn every_error_has_a_code() {
         assert!(!r.json::<ErrorResponse>().error.is_empty());
     }
 
+    // Refusals from the token middleware and the review endpoint.
+    use leep_server::auth::{hash_token, Auth};
+    let tokens = serde_json::json!({ "tokens": [
+        { "name": "old", "role": "write", "hash": hash_token("old"), "expires": "2020-01-01T00:00:00Z" },
+        { "name": "viewer", "role": "read", "hash": hash_token("viewer") },
+        { "name": "agent", "role": "write", "hash": hash_token("agent"), "review": false },
+    ]});
+    let authed = leep_server::router_with_auth(
+        Repo::new(
+            Arc::new(MemoryBlobStore::new()),
+            Arc::new(MemoryMetaStore::new()),
+        ),
+        1 << 20,
+        Some(Auth::parse(&tokens.to_string()).unwrap()),
+    );
+    let call = |token: Option<&'static str>, method: Method, uri: String, body: Vec<u8>| {
+        let app = authed.clone();
+        async move {
+            let mut req = Request::builder().method(method).uri(uri);
+            if let Some(t) = token {
+                req = req.header("authorization", format!("Bearer {t}"));
+            }
+            let resp = app
+                .oneshot(req.body(Body::from(body)).unwrap())
+                .await
+                .unwrap();
+            let (parts, body) = resp.into_parts();
+            Reply {
+                status: parts.status,
+                headers: parts.headers,
+                body: body.collect().await.unwrap().to_bytes().to_vec(),
+            }
+        }
+    };
+    let review = serde_json::to_vec(&AddReviewRequest {
+        verdict: leep_core::review::Verdict::Approve,
+        comment: String::new(),
+    })
+    .unwrap();
+    let reviews = format!("/v1/changesets/{a}/reviews");
+    let cases = [
+        (
+            call(None, Method::GET, "/v1/refs".into(), vec![]).await,
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+        ),
+        (
+            call(Some("old"), Method::GET, "/v1/refs".into(), vec![]).await,
+            StatusCode::UNAUTHORIZED,
+            "token_expired",
+        ),
+        (
+            call(
+                Some("viewer"),
+                Method::POST,
+                reviews.clone(),
+                review.clone(),
+            )
+            .await,
+            StatusCode::FORBIDDEN,
+            "forbidden",
+        ),
+        (
+            call(Some("agent"), Method::POST, reviews, review).await,
+            StatusCode::FORBIDDEN,
+            "forbidden",
+        ),
+    ];
+    for (r, status, code) in cases {
+        assert_eq!((r.status, r.code().as_str()), (status, code));
+        assert!(!r.json::<ErrorResponse>().error.is_empty());
+    }
+
     // The body budget's refusals: the route cap (413), a token over its share
     // (429) and the server's budget spent (503), the last two with
     // Retry-After. Blobs up to 64 KiB, 100 KiB in flight, so a share is
     // 64 KiB.
-    use leep_server::auth::{hash_token, Auth};
     const KIB: usize = 1024;
     let tokens = serde_json::json!({ "tokens": [
         { "name": "a", "role": "write", "hash": hash_token("a") },
