@@ -1,0 +1,42 @@
+name: Supply chain
+
+# cargo-deny against deny.toml: RustSec advisories, banned and wildcard
+# dependencies, licenses and sources. A workflow of its own so it runs beside
+# the Rust test job instead of lengthening it; it reads Cargo.lock and the
+# manifests and builds nothing. See CONTRIBUTING.md, "Supply-chain checks".
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  # Advisories are published without any change here; check main weekly.
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # Separate from the policy checks so an advisory published overnight shows
+  # up on its own and does not hide license or source results.
+  advisories:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      # Pinned to a commit; Dependabot moves it (.github/dependabot.yml).
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check advisories
+
+  # Bans, licenses and sources change only with a commit, so the weekly run
+  # skips them.
+  policy:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check bans licenses sources

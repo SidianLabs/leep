@@ -3,6 +3,7 @@ name = "leep-meta"
 description = "SQLite and Postgres MetaStore backends for Leep"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [dependencies]

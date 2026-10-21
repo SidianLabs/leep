@@ -3,6 +3,7 @@ name = "leep-fuzz-targets"
 description = "Fuzz harness functions and seed corpus for Leep's decoders and parsers"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
