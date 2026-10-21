@@ -125,9 +125,14 @@ ref, or landed there as a rebased copy, with the earlier result. Or give every
 call a `request_id` (recorded as `agent.request_id`).
 
 **`request_id` lands at most once, across restarts.** The land is sent with
-a land id (ADR 0057) derived from the request: the first 16 bytes of
-`blake3("leep-mcp-land-id\0" || target_ref || "\0" || request_id)`. Every
-MCP server process derives the same id, and the server keeps land ids in the
+a land id (ADR 0057) derived from the request and who sends it: the first 16
+bytes of
+`blake3("leep-mcp-land-id\0" || author || "\0" || session || "\0" || target_ref || "\0" || request_id)`,
+where `author` is `LEEP_AUTHOR` (the commit author) and `session` is
+`LEEP_AGENT_SESSION`, or empty when it is not set. The NUL separators are
+unambiguous: environment variables cannot hold NUL, ref names cannot hold
+control characters (`refname::validate`), and `request_id` comes last. Every
+MCP server process with the same author and session derives the same id, and the server keeps land ids in the
 ref log for as long as the log, so a second call with the same `request_id`
 and `target_ref` is answered with the first call's land however long ago it
 happened, however many lands came between, and whether or not the MCP server
@@ -138,10 +143,21 @@ instead). Such an answer carries `from_record: true` and the original
 which then simply lands nothing new). Within one process the tool also remembers the changeset a
 `request_id` made and lands that one again without building another.
 
+- A `request_id` needs to be unique per author (and per session, when
+  `LEEP_AGENT_SESSION` is set), not globally: two agents that pick the same
+  `request_id` land independently. The guarantee holds across restarts that
+  keep the author and session; an MCP server restarted with a different
+  `LEEP_AGENT_SESSION` treats the request as new.
 - The guarantee is per `target_ref`: the same `request_id` on another ref is
   a new request there.
 - A conflict lands nothing and records nothing, so the call that resolves it
   may keep the `request_id` (`leep_resolve_and_land` does).
+- If the server refuses the id as already landed but neither its answer nor
+  the ref log (newest 10,000 entries) names the earlier changeset, the call
+  fails, nothing lands, and the error says to look in `leep_reflog` and use a
+  new `request_id` for a new change.
+- If the earlier changeset is no longer stored (changeset GC, ADR 0059), the
+  answer still has `from_record: true`, without comparing changes.
 - Reusing a `request_id` for a different change is a mistake: if the earlier
   land's changes differ from this call's, the result is `isError: true`,
   `status: "already_landed"`, with the earlier `changeset` and the
@@ -174,11 +190,21 @@ changed in different places, whose merged text keeps the other side's
 edits). It builds one changeset on `onto` from those plus the resolutions,
 with the conflicted change's message (or `message`) and `agent.*`
 provenance, and lands it under the same `request_id`, so a retried
-resolution lands at most once (without a `request_id`, the conflict itself
-names the land). A resolution may also list other paths to change them. If
+resolution lands at most once (without a `request_id`, the first conflict
+names the land, and its key `conflict:<conflict_id>` is recorded as
+`agent.request_id`). A resolution may also list other paths to change them. If
 the ref moved again and the resolution conflicts, the result is a new
 conflict report with a new `conflict_id`. `onto` instead of `conflict_id`
 picks the one remembered conflict onto that id.
+
+A server that does not list `land-clean-blobs` in `GET /v1/ready` `features`
+computes a conflict in a staged replay and stores the merged text of a path
+both sides changed only when a land moves the ref, so that text is missing
+after a conflict. Against such a server the tool checks the clean changes'
+blobs first and, when some are missing, has the server merge the two
+changesets (`POST /v1/merge`), which stores them; it refuses, landing
+nothing, if they are still missing. A server with the feature stores them
+before answering, and its `clean` changes are used as they are.
 
 Conflicts are remembered in the MCP server process only (the last 64, one
 per request). If it restarted, `leep_resolve_and_land` fails with an error

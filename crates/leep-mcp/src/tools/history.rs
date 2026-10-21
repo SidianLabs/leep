@@ -180,7 +180,9 @@ impl Server {
     pub(super) fn provenance(&self, args: Value) -> ToolResult {
         let a: ProvenanceArgs = parse_args(args)?;
         let id = self.resolve_rev(a.rev.as_deref())?;
-        let path = non_empty(a.path).map(|p| p.trim_matches('/').to_string());
+        let path = non_empty(a.path)
+            .map(|p| p.trim_matches('/').to_string())
+            .filter(|p| !p.is_empty());
         let scan = a
             .limit
             .unwrap_or(DEFAULT_PROVENANCE_SCAN)
@@ -189,9 +191,7 @@ impl Server {
             .top
             .unwrap_or(DEFAULT_PROVENANCE_TOP)
             .clamp(1, MAX_PROVENANCE_TOP);
-        let p =
-            self.client
-                .provenance(&id, path.as_deref().filter(|p| !p.is_empty()), Some(scan))?;
+        let p = self.client.provenance(&id, path.as_deref(), Some(scan))?;
         let agent_changesets: u64 = p.agents.iter().map(|s| s.changesets).sum();
         let human_changesets: u64 = p.humans.iter().map(|s| s.changesets).sum();
         let agents: Vec<Value> = p
@@ -235,7 +235,7 @@ impl Server {
             "agents": agents,
             "humans": humans,
         });
-        if let Some(path) = path.filter(|p| !p.is_empty()) {
+        if let Some(path) = path {
             v["path"] = json!(path);
         }
         if p.agents.len() > top {

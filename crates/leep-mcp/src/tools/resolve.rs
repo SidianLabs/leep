@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use leep_core::api::{Authorship, Conflict, MergeRequest, MAX_MISSING_BLOBS};
+use leep_core::changeset::EXTRA_AGENT_REQUEST_ID;
 use leep_core::{Changeset, ChangesetId, FileChange, FileKind, Hash, RepoPath};
 use serde::Deserialize;
 use serde_json::Value;
@@ -13,6 +14,11 @@ use serde_json::Value;
 use super::commit::{non_empty, Edit};
 use super::{parse_args, ToolError, ToolResult};
 use crate::Server;
+
+/// In `GET /v1/ready` features: the server stores the blobs a land's
+/// conflict answer names in `clean` before it answers. Not yet in
+/// `leep_core::api`; the server fix that adds it will export it there.
+const FEATURE_LAND_CLEAN_BLOBS: &str = "land-clean-blobs";
 
 /// Conflicts remembered per MCP process; the oldest is forgotten first.
 const MAX_REMEMBERED: usize = 64;
@@ -168,8 +174,16 @@ impl Server {
     /// computes its conflict report in a staged replay that stores what it
     /// wrote only when the ref moves, so the merged text of a path both
     /// sides changed is not stored when the land conflicts. A merge of the
-    /// same two changesets is deterministic and stores those blobs.
+    /// same two changesets is deterministic and stores those blobs. A server
+    /// that advertises [`FEATURE_LAND_CLEAN_BLOBS`] stores them itself, and
+    /// its `clean` is trusted as it is.
     fn ensure_clean_blobs(&self, p: &PendingConflict) -> Result<(), ToolError> {
+        // A server that cannot say is treated as one without the feature:
+        // the check below is only extra requests.
+        let features = self.client.server_features().unwrap_or_default();
+        if features.iter().any(|f| f == FEATURE_LAND_CLEAN_BLOBS) {
+            return Ok(());
+        }
         let hashes: Vec<Hash> = p
             .clean
             .values()
@@ -182,7 +196,9 @@ impl Server {
         if missing.is_empty() {
             return Ok(());
         }
-        // Its answer is not used: only the blobs it stores on the way.
+        // Its answer is not used: only the blobs it stores on the way. Should
+        // it merge cleanly after all, it stores a merge changeset that no
+        // ref names: an orphan that changeset GC (ADR 0059) may reclaim.
         self.client.merge(&MergeRequest {
             parents: [p.onto, p.changeset],
             message: "leep-mcp: store merged files of a conflict".into(),
@@ -281,11 +297,17 @@ impl Server {
         let message = non_empty(a.message.as_deref())
             .map(str::to_string)
             .unwrap_or(original.message);
-        let extra = original
+        let mut extra: BTreeMap<String, String> = original
             .extra
             .into_iter()
             .filter(|(k, _)| !k.starts_with("leep."))
             .collect();
+        // The land id derives from this key, so the changeset says what it
+        // was (`conflict:<id>` for a land that named no request).
+        extra.insert(
+            EXTRA_AGENT_REQUEST_ID.to_string(),
+            pending.request_id.clone(),
+        );
         let cs = Changeset {
             parents: vec![pending.onto],
             author: self.cfg.author.clone(),

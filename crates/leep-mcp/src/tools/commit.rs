@@ -28,14 +28,28 @@ const RECORD_SCAN_PAGE: usize = 1000;
 /// Text of a `land_id_reused` refusal from servers that send no code.
 const LAND_ID_REUSED_MARKER: &str = "; use a new land id";
 
-/// The land id of `request_id` on `target_ref` (ADR 0057). Derived, not
-/// random, so every MCP process sends the same one: a retry after a restart,
-/// at any age, is answered from the server's record instead of landing again.
-pub fn request_land_id(target_ref: &str, request_id: &str) -> LandId {
+/// The land id of `request_id` on `target_ref` (ADR 0057), namespaced by
+/// the author and, when set, the agent session. Derived, not random, so
+/// every MCP process of the same agent sends the same one: a retry after a
+/// restart, at any age, is answered from the server's record instead of
+/// landing again, while two agents that pick the same `request_id` land
+/// independently.
+///
+/// The NUL separators cannot be forged: `author` and `session` come from
+/// environment variables, which cannot hold NUL, `refname::validate` refuses
+/// control characters in `target_ref`, and `request_id` goes last.
+pub fn request_land_id(
+    author: &str,
+    session: Option<&str>,
+    target_ref: &str,
+    request_id: &str,
+) -> LandId {
     let mut h = blake3::Hasher::new();
     h.update(b"leep-mcp-land-id\0");
-    h.update(target_ref.as_bytes());
-    h.update(b"\0");
+    for part in [author, session.unwrap_or(""), target_ref] {
+        h.update(part.as_bytes());
+        h.update(b"\0");
+    }
     h.update(request_id.as_bytes());
     LandId::from_bytes(&h.finalize().as_bytes()[..LandId::MIN_LEN])
         .expect("16 bytes is a valid land id")
@@ -270,8 +284,8 @@ impl Server {
         files_changed: usize,
         request_id: Option<&str>,
     ) -> ToolResult {
-        let land_id = request_id.map(|r| request_land_id(target_ref, r));
-        let (landed_cs, resp) = self.land_creating(created, target_ref, create, land_id)?;
+        let fixed = request_id.map(|r| (r, self.request_land_id(target_ref, r)));
+        let (landed_cs, resp) = self.land_creating(created, target_ref, create, fixed)?;
         match resp {
             LandResponse::Landed {
                 landed,
@@ -296,10 +310,23 @@ impl Server {
                     .lock()
                     .unwrap()
                     .insert(r.to_string(), (landed_cs, target_ref.to_string()));
-                let earlier = self.client.get_changeset(&landed_cs)?.changeset.changes;
+                v["from_record"] = json!(true);
+                let earlier = match self.client.get_changeset(&landed_cs) {
+                    Ok(info) => info.changeset.changes,
+                    // Reclaimed since it landed (ADR 0059): the record still
+                    // stands, there is just nothing left to compare.
+                    Err(e) if e.kind() == ErrorKind::NotFound => {
+                        v["note"] = json!(format!(
+                            "request_id `{r}` had already landed changeset {landed_cs} on \
+                             {target_ref}; it was not landed again. That changeset is no longer \
+                             stored, so this call's changes were not compared with it."
+                        ));
+                        return Ok(ToolOutput::json(v));
+                    }
+                    Err(e) => return Err(e.into()),
+                };
                 let now = self.client.get_changeset(&created)?.changeset.changes;
                 v["files_changed"] = json!(earlier.len());
-                v["from_record"] = json!(true);
                 let differ = differing_paths(&earlier, &now);
                 if differ.is_empty() {
                     v["note"] = json!(format!(
@@ -338,6 +365,16 @@ impl Server {
         }
     }
 
+    /// [`request_land_id`] for this server's author and agent session.
+    pub(super) fn request_land_id(&self, target_ref: &str, request_id: &str) -> LandId {
+        request_land_id(
+            &self.cfg.author,
+            self.cfg.agent_session.as_deref().filter(|s| !s.is_empty()),
+            target_ref,
+            request_id,
+        )
+    }
+
     /// Kind of `path` at `parent`, if the file exists there.
     pub(super) fn existing_kind(
         &self,
@@ -368,11 +405,11 @@ impl Server {
         changeset: ChangesetId,
         target_ref: &str,
         create: bool,
-        fixed: Option<LandId>,
+        fixed: Option<(&str, LandId)>,
     ) -> Result<(ChangesetId, LandResponse), ToolError> {
         let key = (changeset, target_ref.to_string());
         let land_id = match &fixed {
-            Some(id) => id.clone(),
+            Some((_, id)) => id.clone(),
             None => self
                 .pending_lands
                 .lock()
@@ -394,14 +431,24 @@ impl Server {
             let mut sent = changeset;
             let mut r = send(changeset, create);
             if let Err(e) = &r {
-                if fixed.is_some() && e.is_server(error_code::LAND_ID_REUSED, LAND_ID_REUSED_MARKER)
-                {
+                let request = fixed.as_ref().map(|(r, _)| *r);
+                if let (Some(request), true) = (
+                    request,
+                    e.is_server(error_code::LAND_ID_REUSED, LAND_ID_REUSED_MARKER),
+                ) {
                     match self.recorded_changeset(e, target_ref, &land_id) {
                         Ok(Some(earlier)) => {
                             sent = earlier;
                             r = send(earlier, create);
                         }
-                        Ok(None) => {}
+                        Ok(None) => {
+                            r = Err(CliError::user(format!(
+                                "request_id `{request}` already landed something on \
+                                 `{target_ref}` (land id {land_id}), and it was not landed \
+                                 again; see leep_reflog for what. Use a new request_id for a \
+                                 new change."
+                            )))
+                        }
                         Err(e) => r = Err(e),
                     }
                 }

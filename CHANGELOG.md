@@ -8,13 +8,15 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 ## [Unreleased]
 
 ### MCP: request ids land once across restarts
-- `leep_commit_and_land` sends a land id derived from `request_id` and
-  `target_ref` (ADR 0057) instead of a random one, so a retry with the same
-  `request_id` is answered from the server's record even after the MCP
+- `leep_commit_and_land` sends a land id derived from `request_id`,
+  `target_ref`, the author and the agent session (ADR 0057) instead of a
+  random one. A retry with the same `request_id` is answered from the server's record even after the MCP
   server restarted, at any age. Before, only the MCP process that made the
   first call remembered the request. Such an answer has `from_record: true`;
   reusing a `request_id` for different changes is reported as
-  `status: "already_landed"` with `differing_paths` and lands nothing.
+  `status: "already_landed"` with `differing_paths` and lands nothing. A
+  `request_id` need only be unique per author (and agent session, when
+  set).
 
 ### MCP: resolve a conflict by sending only the conflicting files
 - New tool `leep_resolve_and_land {conflict_id | onto, resolutions[], message?}`:

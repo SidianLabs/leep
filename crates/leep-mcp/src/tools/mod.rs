@@ -512,7 +512,7 @@ pub fn definitions() -> Vec<Value> {
                     "prompt": { "type": "string", "description": "The request that led to this change, recorded as provenance." },
                     "tests": { "type": "string", "description": "Tests run and their results, recorded as provenance." },
                     "changeset": { "type": "string", "description": "Land this existing changeset (id or unique prefix) instead of creating one, e.g. to finish a call that timed out. Give no changes with it." },
-                    "request_id": { "type": "string", "description": "Your own id for this request, unique per change. A retry with the same id and target_ref lands at most once, at any age and even from a restarted MCP server: if the first call landed, the result is that land (`from_record: true`). Keep it when you retry after a conflict." }
+                    "request_id": { "type": "string", "description": "Your own id for this request, unique per change (among your own requests; another agent may use the same id). A retry with the same id and target_ref lands at most once, at any age and even from a restarted MCP server: if the first call landed, the result is that land (`from_record: true`). Keep it when you retry after a conflict." }
                 },
                 // `message` and `changes` are required unless `changeset` is
                 // given. Not expressed with a top-level `anyOf`, which some

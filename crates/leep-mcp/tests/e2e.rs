@@ -975,7 +975,8 @@ fn request_id_lands_once_across_mcp_restarts() {
     assert_eq!(log["entries"].as_array().unwrap().len(), 4);
 
     // The ref log names the land by the derived id.
-    let id = leep_mcp::tools::request_land_id("main", "req-restart").to_string();
+    let id = leep_mcp::tools::request_land_id("tester", Some("sess-1"), "main", "req-restart")
+        .to_string();
     assert_eq!(id.len(), 32);
     let reflog = leep_cli::client::Client::new(&url)
         .ref_log(Some("main"), None, 10)
@@ -1241,9 +1242,13 @@ fn resolve_and_land_by_onto_and_conflicting_again() {
         text(&call(&s, "leep_read_file", json!({ "path": "a.txt" }))),
         "xyz\n"
     );
+    let shown = data(&call(&s, "leep_show", json!({ "rev": "main" })));
+    assert_eq!(shown["message"], "y, resolved");
+    // No request_id: the first conflict's key names the land through every
+    // later conflict of it, and the changeset says so.
     assert_eq!(
-        data(&call(&s, "leep_show", json!({ "rev": "main" })))["message"],
-        "y, resolved"
+        shown["agent"]["request_id"],
+        format!("conflict:{}", first_id.as_str().unwrap())
     );
 }
 
@@ -1278,7 +1283,7 @@ fn reflog_lists_moves_with_land_ids_and_pages() {
     assert!(newest.get("ref").is_none());
     assert_eq!(
         newest["land_id"],
-        leep_mcp::tools::request_land_id("main", "req-2").to_string()
+        leep_mcp::tools::request_land_id("tester", Some("sess-1"), "main", "req-2").to_string()
     );
     // Fast-forwards: the ref took the changeset itself.
     assert!(newest.get("land_changeset").is_none());
@@ -1399,12 +1404,154 @@ fn resolve_merge_base_and_provenance() {
     let p = data(&call(
         &s,
         "leep_provenance",
-        json!({ "rev": "main", "path": "src" }),
+        json!({ "rev": "main", "path": "/src/" }),
     ));
+    assert_eq!(p["path"], "src");
     assert_eq!(p["agent_changesets"], 1);
     assert_eq!(p["agents"][0]["files_touched"], 1);
     assert_eq!(p["humans"], json!([]));
+    // Only slashes: no filter at all.
+    let p = data(&call(
+        &s,
+        "leep_provenance",
+        json!({ "rev": "main", "path": "/" }),
+    ));
+    assert!(p.get("path").is_none());
+    assert_eq!(p["scanned"], 2);
     let p = data(&call(&s, "leep_provenance", json!({ "limit": 1 })));
     assert_eq!(p["truncated"], true);
     assert!(p["note"].as_str().unwrap().contains("limit"));
+}
+
+/// The derived land id is namespaced by author and session: two agents that
+/// happen to pick the same `request_id` land independently.
+#[test]
+fn same_request_id_from_two_authors_lands_twice() {
+    let url = start_server();
+    let mut bob = config(&url);
+    bob.author = "bob".into();
+    bob.agent_session = None;
+    let mut carol = config(&url);
+    carol.author = "carol".into();
+    carol.agent_session = None;
+    let args = |who: &str| {
+        json!({
+            "message": format!("{who}'s change"),
+            "changes": [{ "path": format!("{who}.txt"), "content": "x\n" }],
+            "request_id": "task-1",
+        })
+    };
+    let b = data(&commit(&Server::new(bob), args("bob")));
+    let c = data(&commit(&Server::new(carol), args("carol")));
+    assert_eq!(b["status"], "landed");
+    assert_eq!(c["status"], "landed");
+    assert!(c.get("from_record").is_none());
+    assert_ne!(b["landed"], c["landed"]);
+    let s = Server::new(config(&url));
+    let log = data(&call(&s, "leep_log", json!({})));
+    assert_eq!(log["entries"].as_array().unwrap().len(), 2);
+    // A session, when set, namespaces too.
+    use leep_mcp::tools::request_land_id;
+    let ids = [
+        request_land_id("bob", None, "main", "task-1"),
+        request_land_id("carol", None, "main", "task-1"),
+        request_land_id("bob", Some("s1"), "main", "task-1"),
+        request_land_id("bob", None, "side", "task-1"),
+    ];
+    for (i, a) in ids.iter().enumerate() {
+        for b in &ids[i + 1..] {
+            assert_ne!(a, b);
+        }
+    }
+}
+
+mod rewriting {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    use std::sync::Arc;
+
+    use axum::body::Body;
+    use axum::extract::{Request, State};
+    use axum::middleware::{from_fn_with_state, Next};
+    use axum::response::Response;
+    use serde_json::{json, Value};
+
+    /// 0: pass through. 1: `land_id_reused` refusals lose the changeset id
+    /// (as an older or reworded server might send them). 2: also drop land
+    /// ids from the ref log, so the record cannot be found.
+    async fn rewrite(State(mode): State<Arc<AtomicU8>>, req: Request, next: Next) -> Response {
+        let reflog = req.uri().path().starts_with("/v1/reflog");
+        let resp = next.run(req).await;
+        let m = mode.load(Ordering::SeqCst);
+        if m == 0 {
+            return resp;
+        }
+        let (mut parts, body) = resp.into_parts();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let mut out = bytes.to_vec();
+        if let Ok(mut v) = serde_json::from_slice::<Value>(&bytes) {
+            if v["code"] == "land_id_reused" {
+                v["error"] = json!("this land id was used before; use a new land id");
+            }
+            if m == 2 && reflog {
+                for e in v["entries"].as_array_mut().into_iter().flatten() {
+                    e.as_object_mut().unwrap().remove("land_id");
+                    e.as_object_mut().unwrap().remove("land_changeset");
+                }
+            }
+            out = serde_json::to_vec(&v).unwrap();
+        }
+        parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+        Response::from_parts(parts, Body::from(out))
+    }
+
+    pub fn server(mode: Arc<AtomicU8>) -> String {
+        super::common::serve(
+            leep_server::router(super::common::repo()).layer(from_fn_with_state(mode, rewrite)),
+        )
+    }
+}
+
+/// A `land_id_reused` refusal that does not name the earlier changeset is
+/// answered from the ref log; when the log cannot say either, the tool
+/// reports that the request landed before and lands nothing.
+#[test]
+fn land_id_refusal_without_an_id_falls_back_to_the_ref_log() {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    use std::sync::Arc;
+
+    let mode = Arc::new(AtomicU8::new(0));
+    let url = rewriting::server(mode.clone());
+    let args = json!({
+        "message": "feature",
+        "changes": [{ "path": "f.txt", "content": "f\n" }],
+        "request_id": "req-scan",
+    });
+    let first = data(&commit(&Server::new(config(&url)), args.clone()));
+    // Move main so a retry's fresh changeset differs from the first.
+    data(&commit(
+        &Server::new(config(&url)),
+        json!({ "message": "o", "changes": [{ "path": "o.txt", "content": "o\n" }] }),
+    ));
+
+    mode.store(1, Ordering::SeqCst);
+    let again = data(&commit(&Server::new(config(&url)), args.clone()));
+    assert_eq!(again["from_record"], true);
+    assert_eq!(again["changeset"], first["changeset"]);
+    assert_eq!(again["landed"], first["landed"]);
+
+    mode.store(2, Ordering::SeqCst);
+    let s = Server::new(config(&url));
+    let head = data(&call(&s, "leep_refs", json!({})))["refs"]["main"].clone();
+    let lost = commit(&s, args);
+    assert_eq!(lost["isError"], true);
+    let t = text(&lost);
+    assert!(
+        t.contains("already landed something") && t.contains("leep_reflog"),
+        "{t}"
+    );
+    assert!(!t.contains("changeset:"), "{t}");
+    assert_eq!(
+        data(&call(&s, "leep_refs", json!({})))["refs"]["main"],
+        head
+    );
 }
