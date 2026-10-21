@@ -14,6 +14,8 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   generation and root tree (plus `path_at`/`renamed` on `follow` logs), a
   quarter of the bytes on git/git. The default (`fields=full`) is unchanged
   byte for byte; other values are 400.
+- `leep log --oneline` prints the short id and the message's first line from
+  summary entries (`--json` prints them).
 
 ### Faster path logs
 - Path logs without a filter no longer read each changeset and root tree one

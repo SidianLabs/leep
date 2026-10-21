@@ -3,7 +3,9 @@
 use std::io::Write;
 
 use clap::Args;
-use leep_core::api::{BlameResponse, ChangesetInfo, ProvenanceResponse, SignaturesResponse};
+use leep_core::api::{
+    BlameResponse, ChangesetInfo, LogSummaryEntry, ProvenanceResponse, SignaturesResponse,
+};
 use leep_core::changeset::{EXTRA_AGENT_MODEL, EXTRA_AGENT_SESSION};
 
 use super::{print_json, Remote};
@@ -52,6 +54,11 @@ pub struct LogArgs {
     /// instead of waiting for it (says which on stderr).
     #[arg(long)]
     pub stale_ok: bool,
+    /// One line per changeset: short id and the message's first line. Asks
+    /// the server for summary entries (no changed paths, first message line,
+    /// `agent.*` metadata), which `--json` prints.
+    #[arg(long)]
+    pub oneline: bool,
 }
 
 impl LogArgs {
@@ -85,6 +92,7 @@ impl LogArgs {
             extra,
             follow: self.follow.is_some(),
             after: self.after.clone(),
+            summary: false,
         })
     }
 }
@@ -180,6 +188,15 @@ fn header(info: &ChangesetInfo, abbreviate: bool) -> String {
     out
 }
 
+/// `leep log --oneline`: short id and the message's first line.
+fn oneline(info: &LogSummaryEntry) -> String {
+    format!(
+        "{} {}\n",
+        term::paint(&short(info.id), Style::Yellow),
+        info.message_first_line
+    )
+}
+
 /// What `log --follow` adds to an entry: the file's name there, and the
 /// rename that gave it that name.
 fn follow_lines(info: &ChangesetInfo) -> Vec<String> {
@@ -196,13 +213,27 @@ fn follow_lines(info: &ChangesetInfo) -> Vec<String> {
 pub fn log(r: &Remote, args: &LogArgs) -> Result<i32> {
     let id = r.resolve_default(args.rev.as_deref())?;
     let client = r.client.clone().with_stale_ok(args.stale_ok);
-    let resp = client.log_all(&id, &args.query()?, args.limit as usize)?;
+    let (q, want) = (args.query()?, args.limit as usize);
+    let mut out = String::new();
+    if args.oneline {
+        let resp = client.log_summary_all(&id, &q, want)?;
+        note_stale(resp.answered_at, resp.behind);
+        if r.json {
+            print_json(&resp)?;
+            return Ok(0);
+        }
+        for info in &resp.entries {
+            out.push_str(&oneline(info));
+        }
+        term::page(&out, false)?;
+        return Ok(0);
+    }
+    let resp = client.log_all(&id, &q, want)?;
     note_stale(resp.answered_at, resp.behind);
     if r.json {
         print_json(&resp)?;
         return Ok(0);
     }
-    let mut out = String::new();
     for info in &resp.entries {
         out.push_str(&header(info, true));
         out.push('\n');
@@ -490,6 +521,7 @@ mod tests {
             agent_session: None,
             extra: vec![],
             after: None,
+            oneline: false,
         }
     }
 
@@ -583,6 +615,29 @@ mod tests {
             follow_lines(&info),
             ["File:   b.txt", "renamed: a.txt -> b.txt (91%)"]
         );
+    }
+
+    #[test]
+    fn oneline_is_the_short_id_and_the_subject() {
+        let entry = |message: &str| LogSummaryEntry {
+            id: cid(1),
+            parents: vec![],
+            author: "a".into(),
+            timestamp: 0,
+            message_first_line: message.lines().next().unwrap_or("").into(),
+            agent: BTreeMap::new(),
+            files_changed: 0,
+            generation: 1,
+            root_tree: Hash::of_blob(b""),
+            path_at: None,
+            renamed: None,
+        };
+        let id = short(cid(1));
+        assert_eq!(
+            oneline(&entry("subject\n\nbody")),
+            format!("{id} subject\n")
+        );
+        assert_eq!(oneline(&entry("")), format!("{id} \n"));
     }
 
     #[test]
