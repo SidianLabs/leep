@@ -127,6 +127,12 @@ pub struct Repo {
     /// Asked before each write of a derivation: the warmer's lease (ADR
     /// 0058).
     pub(crate) write_guard: Option<Arc<dyn WriteGuard>>,
+    /// The last read of `gc-fence-active-v1` (ADR 0059), shared by clones.
+    pub(crate) fence_flag: Arc<crate::changeset_gc::FenceFlag>,
+    /// Whether writes through this handle rescue the changesets they name
+    /// (ADR 0059). Off for a land batch's staged handle, whose batch rescues
+    /// before it moves the ref.
+    pub(crate) rescues_on_write: bool,
 }
 
 /// Whether a derivation may go on writing rows: the index lease it derives
@@ -485,6 +491,8 @@ impl Repo {
             index_policy: None,
             bounded: None,
             write_guard: None,
+            fence_flag: Arc::default(),
+            rescues_on_write: true,
         }
     }
 
@@ -665,6 +673,7 @@ impl Repo {
     /// generation and skiplist rows and `extra` in one write (ADR 0031). What
     /// it reads first (parents, their rows, blob condemnations) is read in one
     /// round of batched queries; anything those miss is derived as before.
+    /// Condemned parents are rescued before they are read (ADR 0059).
     async fn store_changeset(
         &self,
         cs: Changeset,
@@ -675,6 +684,8 @@ impl Repo {
         if client_blobs {
             check_path_bounds(cs.changes.keys())?;
         }
+        self.rescue_changesets(&cs.parents, crate::changeset_gc::RescueBy::Create)
+            .await?;
         let mut seen = HashSet::new();
         let contents: Vec<(&RepoPath, Hash, u64)> = cs
             .changes

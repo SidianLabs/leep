@@ -98,6 +98,9 @@ async fn compact(rows: &dyn Rows, opts: CompactOptions) -> CompactReport {
 async fn check_compaction<S: Rows + MetaStore>(a: &S, b: &S, c: &S) {
     let all = history(MIN_TRAINING_ROWS + 300, 0);
     put_all(a, &all).await;
+    let ids: Vec<ChangesetId> = all.iter().map(Changeset::id).collect();
+    let stored_at = a.changesets_stored_at(&ids).await.unwrap();
+    assert!(stored_at.iter().all(Option::is_some));
     let plain = raw(a).await;
     assert!(plain.values().all(|d| !d.starts_with(&codec::ZSTD_MAGIC)));
 
@@ -138,6 +141,8 @@ async fn check_compaction<S: Rows + MetaStore>(a: &S, b: &S, c: &S) {
     let packed = raw(a).await;
     assert!(packed.values().all(|d| Codec::uses(d, 1)));
     reads_back(a, &all).await;
+    // Only `data` is rewritten: the store times stay (ADR 0059).
+    assert_eq!(a.changesets_stored_at(&ids).await.unwrap(), stored_at);
     // The handle that predates the dictionary learns it on first read.
     assert!(!b.codec().knows(1));
     reads_back(b, &all).await;

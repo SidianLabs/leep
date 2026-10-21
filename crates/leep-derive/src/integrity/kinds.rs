@@ -6,6 +6,8 @@ use leep_core::review::REVIEW_KIND;
 use leep_core::signature::SIGNATURE_KIND;
 use leep_core::Error;
 
+use crate::changeset_gc::{CS_CONDEMNED, CS_DOOM, CS_RESCUE, GC_FENCE_ACTIVE};
+use crate::changeset_reach::CS_REACH;
 use crate::derived::{
     DerivedKind, Generation, HistoryTree, LastMerge, LogFilterIndex, RootTree, Skiplist,
     HISTORY_NODE_KIND, LOG_FILTER_NAME_KIND,
@@ -69,6 +71,9 @@ pub struct KindInfo {
 
 const GC_REFUSAL: &str = "garbage collection fence state (ADR 0012), not derived from history; \
     dropping it can let a collect delete a blob a client was just told it may reuse";
+
+const CS_GC_REFUSAL: &str = "changeset garbage collection fence state (ADR 0059), not derived \
+    from history; dropping it can let a collect delete a changeset a writer rescued";
 
 /// All kinds, in the order a pass must check or rewrite them: a kind comes
 /// after every kind its recomputation reads.
@@ -220,6 +225,44 @@ static KINDS: &[KindInfo] = &[
         summary: "state of a blob's delete handshake",
         rederive: Rederive::No("garbage collection state is not derived"),
         drop: DropPolicy::Refused(GC_REFUSAL),
+    },
+    KindInfo {
+        name: CS_CONDEMNED,
+        class: KindClass::Bookkeeping,
+        summary: "when garbage collection condemned an unreachable changeset",
+        rederive: Rederive::No("garbage collection state is not derived"),
+        drop: DropPolicy::Refused(CS_GC_REFUSAL),
+    },
+    KindInfo {
+        name: CS_RESCUE,
+        class: KindClass::Bookkeeping,
+        summary: "the condemnation a writer answered by naming the changeset",
+        rederive: Rederive::No("garbage collection state is not derived"),
+        drop: DropPolicy::Refused(CS_GC_REFUSAL),
+    },
+    KindInfo {
+        name: CS_DOOM,
+        class: KindClass::Bookkeeping,
+        summary: "state of a changeset's delete handshake",
+        rederive: Rederive::No("garbage collection state is not derived"),
+        drop: DropPolicy::Refused(CS_GC_REFUSAL),
+    },
+    KindInfo {
+        name: GC_FENCE_ACTIVE,
+        class: KindClass::Bookkeeping,
+        summary: "when the current changeset condemnation round began, or 0",
+        rederive: Rederive::No("garbage collection state is not derived"),
+        drop: DropPolicy::Refused(CS_GC_REFUSAL),
+    },
+    KindInfo {
+        name: CS_REACH,
+        class: KindClass::Bookkeeping,
+        summary: "changesets a ref or ref log entry reaches, for changeset garbage collection",
+        rederive: Rederive::No("rewritten by the next changeset reachability mark with --full"),
+        drop: DropPolicy::Refused(
+            "the reachability mark stops walking at a changeset with a row (ADR 0059); \
+             dropping part of the kind can leave a row whose ancestry lost its rows",
+        ),
     },
     KindInfo {
         name: GC_MARK,

@@ -96,6 +96,8 @@ impl Repo {
     /// Store `sig` for `id`. Idempotent. Does not verify: the caller (the
     /// server) holds the keys.
     pub async fn put_signature(&self, id: ChangesetId, sig: &Signature) -> Result<()> {
+        self.rescue_changesets(&[id], crate::changeset_gc::RescueBy::Attest)
+            .await?;
         self.get_changeset(id).await?;
         self.meta()
             .put_derived(
