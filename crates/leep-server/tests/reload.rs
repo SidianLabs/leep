@@ -114,6 +114,7 @@ impl Rig {
             limit_defaults: s.defaults,
             require_signatures: s.require_signatures,
             require_review: vec![],
+            protect_refs: vec![],
         })
         .unwrap();
         let repo = Repo::new(

@@ -624,7 +624,9 @@ branches, except those under `tags/`, which are tags. `cas_ref_checked` and
 (`leep_core::refname`), tags are created or deleted but never moved, `land`
 refuses `tags/`, and a ref a land policy covers cannot be deleted and only
 moves forward (a swap to a value that does not descend from the current one
-is a 400). The CLI has no special server API for this: `leep branch`,
+is a 400). `--protect-ref` covers a ref with a policy that checks nothing
+else (`ProtectOnly` in `leep-server`), for protection without signatures or
+review. The CLI has no special server API for this: `leep branch`,
 `leep switch` and `leep tag` are compare-and-swap calls on `/v1/refs/{name}`. `branch -d` deletes only if
 `merge_base(head, target) == head`, reading the head once and passing it as
 `expected` so a concurrent move fails with 409. `leep switch` needs a clean
