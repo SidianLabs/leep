@@ -113,11 +113,32 @@ itself fails that way (timeout, lost connection, 5xx) the error names the
 changeset the call made; calling again with `changeset` set to that id lands
 it at most once, since the server answers a changeset that is already on the
 ref, or landed there as a rebased copy, with the earlier result. Or give every
-call a `request_id` (recorded as `agent.request_id`): a second call with the
-same id, to the same MCP server process, lands the changeset the first call
-made instead of building a new one on the moved head. A conflict forgets the
-id, since the resolving call carries new content; using one id for two
-different changes is otherwise a mistake the tool cannot see.
+call a `request_id` (recorded as `agent.request_id`).
+
+**`request_id` lands at most once, across restarts.** The land is sent with
+a land id (ADR 0057) derived from the request: the first 16 bytes of
+`blake3("leep-mcp-land-id\0" || target_ref || "\0" || request_id)`. Every
+MCP server process derives the same id, and the server keeps land ids in the
+ref log for as long as the log, so a second call with the same `request_id`
+and `target_ref` is answered with the first call's land however long ago it
+happened, however many lands came between, and whether or not the MCP server
+restarted in between (a new process makes a fresh changeset, the server
+refuses its id as already landed, and the tool answers with the recorded land
+instead). Such an answer carries `from_record: true` and the original
+`changeset`. Within one process the tool also remembers the changeset a
+`request_id` made and lands that one again without building another.
+
+- The guarantee is per `target_ref`: the same `request_id` on another ref is
+  a new request there.
+- A conflict lands nothing and records nothing, so the call that resolves it
+  may keep the `request_id` (`leep_resolve_and_land` does).
+- Reusing a `request_id` for a different change is a mistake: if the earlier
+  land's changes differ from this call's, the result is `isError: true`,
+  `status: "already_landed"`, with the earlier `changeset` and the
+  `differing_paths`, and nothing new lands. Use a new id per change.
+- Against a server older than land ids (no `land-id` in `GET /v1/ready`
+  `features`), the id is ignored and only the in-process memory and the
+  server's landed-copy scan (ADR 0021) prevent a second land.
 
 Landing onto a ref that does not exist fails (`isError: true`, nothing landed)
 unless `create_ref: true` is given, so a mistyped `target_ref` cannot create a

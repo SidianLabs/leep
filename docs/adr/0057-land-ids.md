@@ -89,7 +89,11 @@ records nothing; a retry of it is found the same way).
   0.5 to 2 s apart). A land without an id is still never resent.
 - The MCP server keeps the id per (changeset, ref) until the land is answered,
   so the call that its own error message asks for (the same changeset, or the
-  same `request_id`) reuses it.
+  same `request_id`) reuses it. Amended 2026-10-21: a land that carries a
+  `request_id` instead sends an id derived from it and the ref (docs/MCP.md),
+  the same in every MCP process, so a retry after an MCP restart is
+  answered from the record too; a fresh changeset refused with
+  `land_id_reused` is answered with the recorded land.
 - The git mirror's land branches and other API callers send no id yet and
   keep the scan.
 

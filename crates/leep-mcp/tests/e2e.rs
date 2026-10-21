@@ -936,3 +936,85 @@ fn log_lists_summaries_unless_full() {
         .collect();
     assert_eq!(ids, [&fe[1]["id"], &fe[2]["id"]]);
 }
+
+/// The land id of a `request_id` is derived from it, not kept in memory, so
+/// a second MCP server process (a restart between the send and the answer)
+/// given the same request is answered from the server's record and lands
+/// nothing (ADR 0057).
+#[test]
+fn request_id_lands_once_across_mcp_restarts() {
+    let url = start_server();
+    let args = json!({
+        "message": "feature",
+        "changes": [{ "path": "f.txt", "content": "feature\n" }],
+        "request_id": "req-restart",
+    });
+    let first = data(&commit(&Server::new(config(&url)), args.clone()));
+    assert_eq!(first["status"], "landed");
+
+    // Other lands move main on in between.
+    let other = Server::new(config(&url));
+    for i in 0..3 {
+        data(&commit(
+            &other,
+            json!({ "message": format!("o{i}"), "changes": [{ "path": "o.txt", "content": format!("{i}\n") }] }),
+        ));
+    }
+    let head = data(&call(&other, "leep_refs", json!({})))["refs"]["main"].clone();
+
+    // A fresh process: nothing in memory about req-restart.
+    let again = data(&commit(&Server::new(config(&url)), args.clone()));
+    assert_eq!(again["status"], "landed");
+    assert_eq!(again["from_record"], true);
+    assert_eq!(again["changeset"], first["changeset"]);
+    assert_eq!(again["landed"], first["landed"]);
+    assert_eq!(again["files_changed"], 1);
+    let refs = data(&call(&other, "leep_refs", json!({})));
+    assert_eq!(refs["refs"]["main"], head, "nothing new landed");
+    let log = data(&call(&other, "leep_log", json!({ "limit": 50 })));
+    assert_eq!(log["entries"].as_array().unwrap().len(), 4);
+
+    // The ref log names the land by the derived id.
+    let id = leep_mcp::tools::request_land_id("main", "req-restart").to_string();
+    assert_eq!(id.len(), 32);
+    let reflog = leep_cli::client::Client::new(&url)
+        .ref_log(Some("main"), None, 10)
+        .unwrap();
+    let keyed = reflog
+        .entries
+        .iter()
+        .filter(|e| e.land_id.as_ref().map(|l| l.to_string()) == Some(id.clone()))
+        .count();
+    assert_eq!(keyed, 1, "{:?}", reflog.entries);
+
+    // The same id with other changes is a mistake: reported, not landed.
+    let wrong = commit(
+        &Server::new(config(&url)),
+        json!({
+            "message": "another",
+            "changes": [{ "path": "f.txt", "content": "different\n" }],
+            "request_id": "req-restart",
+        }),
+    );
+    assert_eq!(wrong["isError"], true);
+    let w = &wrong["structuredContent"];
+    assert_eq!(w["status"], "already_landed");
+    assert_eq!(w["changeset"], first["changeset"]);
+    assert_eq!(w["differing_paths"], json!(["f.txt"]));
+    let refs = data(&call(&other, "leep_refs", json!({})));
+    assert_eq!(refs["refs"]["main"], head);
+
+    // Another ref derives another id: the request is new there.
+    let elsewhere = data(&commit(
+        &Server::new(config(&url)),
+        json!({
+            "message": "feature",
+            "changes": [{ "path": "f.txt", "content": "feature\n" }],
+            "request_id": "req-restart",
+            "target_ref": "side",
+            "create_ref": true,
+        }),
+    ));
+    assert_eq!(elsewhere["status"], "landed");
+    assert!(elsewhere.get("from_record").is_none());
+}
