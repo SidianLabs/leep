@@ -1,0 +1,48 @@
+name: Fault sweeps
+
+# Too slow for pull requests, which run 25 seeds of each sweep in `cargo
+# test`. Every night sweeps a new block of seeds, so the seed space keeps
+# growing instead of re-running the same ones. A failure names its seed;
+# replay it with `LEEP_FAULT_SEED=<seed> cargo test -p leep-derive <test>`.
+on:
+  schedule:
+    - cron: "37 1 * * *"
+  workflow_dispatch:
+    inputs:
+      seeds:
+        description: "Seeds per sweep"
+        default: "1000"
+      start:
+        description: "First seed (empty: a new block from the run number)"
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  faults:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Pick the seed block
+        env:
+          SEEDS: ${{ inputs.seeds || '1000' }}
+          START: ${{ inputs.start }}
+          RUN: ${{ github.run_number }}
+        run: |
+          set -u
+          # Pull requests cover 1..=25 and the documented 300-seed sweep
+          # covers 1..=300; nightly blocks start above both.
+          [ -n "$START" ] || START=$(( 1001 + (RUN - 1) * SEEDS ))
+          echo "LEEP_FAULT_SEEDS=$SEEDS" >> "$GITHUB_ENV"
+          echo "LEEP_FAULT_SEED_START=$START" >> "$GITHUB_ENV"
+          echo "::notice::seeds $START..=$(( START + SEEDS - 1 ))"
+      # Every seeded sweep in leep-derive: land, admission, coordination,
+      # GC and the random-history GC mark check.
+      - run: cargo test --release -p leep-derive --lib -- fault_tests admission_fault_tests land_coord_tests incremental_mark_matches_full_mark_on_random_histories
