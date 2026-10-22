@@ -60,6 +60,9 @@ struct Confirmed {
 #[derive(Default)]
 struct Shared {
     stop: AtomicBool,
+    /// Agents start no new work while set: the main thread waits out a
+    /// killed GC's lease without the history growing meanwhile.
+    pause: AtomicBool,
     confirmed: Mutex<Vec<Confirmed>>,
     /// Answers that were neither a success nor a plain "try again".
     odd: Mutex<Vec<String>>,
@@ -70,6 +73,13 @@ struct Shared {
 }
 
 impl Shared {
+    /// Wait while the main thread has paused new work.
+    fn hold(&self) {
+        while self.pause.load(Ordering::Relaxed) && !self.stop.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     fn note_retry(&self, why: &str) {
         *self.retries.lock().unwrap() += 1;
         // 503 with `Leep-Refused: admission`: nothing was done, so the
@@ -99,6 +109,15 @@ impl Shared {
         if !expected {
             self.odd.lock().unwrap().push(why.to_string());
         }
+    }
+}
+
+/// Raises the agents' stop flag when dropped, panics included.
+struct StopOnDrop<'a>(&'a AtomicBool);
+
+impl Drop for StopOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
     }
 }
 
@@ -223,6 +242,7 @@ fn http_agent(n: usize, seed: u64, addr: SocketAddr, shared: &Shared) {
     let mut rng = Rng::new(seed ^ ((n as u64 + 1) * 0x9E37));
     let mut k = 0;
     while !shared.stop.load(Ordering::Relaxed) {
+        shared.hold();
         let steps: Vec<Step> = (0..1 + rng.below(2))
             .map(|_| {
                 k += 1;
@@ -261,6 +281,7 @@ fn cli_agent(n: usize, seed: u64, client: &Client, root: &Path, shared: &Shared)
     let mut rng = Rng::new(seed ^ ((n as u64 + 77) * 0x51ED));
     let mut k = 0;
     while !shared.stop.load(Ordering::Relaxed) {
+        shared.hold();
         k += 1;
         let step = step_for(&who, k, &mut rng);
         let deadline = Instant::now() + Duration::from_secs(120);
@@ -610,6 +631,9 @@ fn crash_rounds(
     let mut planted: Vec<Vec<u8>> = Vec::new();
 
     std::thread::scope(|s| {
+        // A failed check unwinds out of this closure; the agents must stop
+        // too, or the scope waits for them forever instead of failing.
+        let _stop = StopOnDrop(&shared.stop);
         for n in 0..http_agents {
             let shared = &shared;
             s.spawn(move || http_agent(n, seed, addr, shared));
@@ -669,7 +693,12 @@ fn crash_rounds(
 
             server = Server::start_with(port, stores, root, &server_args);
             if !planted.is_empty() {
+                // The killed collect's gc lease lapses after 60 s; agents
+                // pause meanwhile, so later rounds see the history they
+                // would have without the wait.
+                shared.pause.store(true, Ordering::Relaxed);
                 recover_planted(&tag, stores, addr, &planted);
+                shared.pause.store(false, Ordering::Relaxed);
                 planted.clear();
                 check_store(&format!("{tag}, after recovery"), stores, &shared, true);
             }
@@ -716,12 +745,13 @@ fn crash_rounds(
     n
 }
 
-/// After a killed collect: finish it, then every planted blob must be
+/// After a killed collect: finish it (once the killed run's gc lease has
+/// lapsed), then every planted blob must be
 /// gone, and uploading the same bytes again must work (after at most one more
 /// collect for a blob caught between "deleting" and "deleted", ADR 0012).
 fn recover_planted(tag: &str, stores: &Stores, addr: SocketAddr, planted: &[Vec<u8>]) {
     let t = Instant::now();
-    let done = gc_ok(
+    let done = gc_after_lease(
         tag,
         stores,
         &["collect", "--fence", "0s", "--unsafe-no-fence"],
@@ -747,7 +777,7 @@ fn recover_planted(tag: &str, stores: &Stores, addr: SocketAddr, planted: &[Vec<
         let mut status = put().0;
         if status == 409 && !retried {
             retried = true;
-            gc_ok(
+            gc_after_lease(
                 tag,
                 stores,
                 &["collect", "--fence", "0s", "--unsafe-no-fence"],
@@ -760,7 +790,7 @@ fn recover_planted(tag: &str, stores: &Stores, addr: SocketAddr, planted: &[Vec<
         );
         if status == 409 {
             // Several blobs can be in that state; one collect closes them all.
-            gc_ok(
+            gc_after_lease(
                 tag,
                 stores,
                 &["collect", "--fence", "0s", "--unsafe-no-fence"],
@@ -999,6 +1029,7 @@ fn killed_land_leader_is_replaced_postgres() {
     let mut stalls = Vec::new();
 
     std::thread::scope(|s| {
+        let _stop = StopOnDrop(&shared.stop);
         for n in 0..agents {
             let (shared, landed_at, addrs) = (&shared, &landed_at, &addrs);
             s.spawn(move || failover_agent(n, seed, addrs, shared, landed_at));
