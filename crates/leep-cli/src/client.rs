@@ -11,7 +11,9 @@
 //! blind retry of a write could repeat it. So is a 503 that carries
 //! `Leep-Refused` (an expensive read refused before any work, ADR 0060),
 //! with up to 50% random jitter added to each wait so refused clients do not
-//! return together.
+//! return together. The one write sent again after such a 503 is a land
+//! ([`Client::land_resending`]): the header says it was not admitted, so
+//! even a land without a land id may be resent.
 //!
 //! Index-backed queries (log, last-change, blame, search) send
 //! `Leep-Indexing: retry` (ADR 0058): a server whose index lags answers 503
@@ -37,6 +39,11 @@ const MAX_ATTEMPTS: u32 = 4;
 /// Times a land with a land id is sent again after an answer that may not
 /// have been the server's last word (ADR 0057).
 const LAND_RESENDS: u32 = 3;
+/// Times a land is sent again after the server refused to admit it (503
+/// with `Leep-Refused`, ADR 0060), and the most time spent waiting for
+/// those resends in all. A budget of its own beside [`LAND_RESENDS`].
+const ADMISSION_RESENDS: u32 = 5;
+const ADMISSION_WAIT: Duration = Duration::from_secs(60);
 /// Tries of a blob upload the server refused for being busy (503 with
 /// `Retry-After`, its in-flight body budget spent), and the most time spent
 /// waiting between them in all. The upload is content-addressed, so sending
@@ -993,11 +1000,38 @@ impl Client {
     /// [`land`](Self::land), sent again with the same land id after a
     /// timeout, a lost connection, a 5xx or a lost race. The id makes a
     /// repeat answer with the first one's result if that one landed, so a
-    /// resend never lands twice. Without an id it sends once.
+    /// resend never lands twice. Without an id it is sent once, except
+    /// after a refusal.
+    ///
+    /// A land the server refused to admit (503 `unavailable` with
+    /// `Leep-Refused`, ADR 0060) is sent again, with or without an id,
+    /// after `Retry-After` plus up to 50% jitter: the header says nothing
+    /// was queued. At most [`ADMISSION_RESENDS`] times and
+    /// [`ADMISSION_WAIT`] of waiting; a client built without refusal
+    /// retries (the MCP server) reports it at once instead.
     pub fn land_resending(&self, req: &LandRequest) -> Result<LandResponse> {
         let mut resends = 0;
+        let mut refusals = 0;
+        let mut waited = Duration::ZERO;
         loop {
             match self.land(req) {
+                Err(e) if e.refused().is_some() => {
+                    let wait = jittered(Duration::from_millis(e.retry_after_ms().unwrap_or(1000)));
+                    if !self.refusal_retries
+                        || refusals >= ADMISSION_RESENDS
+                        || waited + wait > ADMISSION_WAIT
+                    {
+                        return Err(e);
+                    }
+                    eprintln!(
+                        "{}; sending the land again in {:.1}s",
+                        e.message().trim_start_matches("server: "),
+                        wait.as_secs_f64()
+                    );
+                    std::thread::sleep(wait);
+                    waited += wait;
+                    refusals += 1;
+                }
                 Err(e) if req.land_id.is_some() && resends < LAND_RESENDS && resend_land(&e) => {
                     std::thread::sleep(Duration::from_millis(500 << resends));
                     resends += 1;
@@ -1011,8 +1045,10 @@ impl Client {
 /// An error after which the land may or may not have happened, or may
 /// succeed if sent again. `Conflict` here is only the 409 of a land that lost
 /// the race too often; a land with conflicts is a 200 answer, never resent.
+/// A refusal has a budget of its own.
 fn resend_land(e: &CliError) -> bool {
     e.is_retryable()
+        && e.refused().is_none()
         && matches!(
             e.kind(),
             ErrorKind::Timeout | ErrorKind::Server | ErrorKind::Unreachable | ErrorKind::Conflict
@@ -1752,6 +1788,178 @@ mod tests {
         assert_eq!(heads.lock().unwrap().len(), 1);
         assert_eq!(e.refused(), Some("read-class"));
         assert_eq!(e.retry_after_ms(), Some(3000));
+    }
+
+    /// [`recording_stub`], keeping each request's method and path, body,
+    /// and when it arrived.
+    #[allow(clippy::type_complexity)]
+    fn body_stub(
+        responses: Vec<String>,
+    ) -> (
+        String,
+        Arc<std::sync::Mutex<Vec<(String, String, std::time::Instant)>>>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let requests = seen.clone();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let mut conn = conn.unwrap();
+                let mut buf = [0u8; 4096];
+                let mut got = Vec::new();
+                let end = loop {
+                    if let Some(i) = got.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break i + 4;
+                    }
+                    let n = conn.read(&mut buf).unwrap();
+                    assert!(n > 0, "the request ended early");
+                    got.extend_from_slice(&buf[..n]);
+                };
+                let head = String::from_utf8_lossy(&got[..end]).to_lowercase();
+                let len: usize = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .map_or(0, |v| v.trim().parse().unwrap());
+                while got.len() < end + len {
+                    let n = conn.read(&mut buf).unwrap();
+                    assert!(n > 0, "the body ended early");
+                    got.extend_from_slice(&buf[..n]);
+                }
+                let line = head.lines().next().unwrap_or_default().to_string();
+                let body = String::from_utf8_lossy(&got[end..end + len]).into_owned();
+                let i = {
+                    let mut r = requests.lock().unwrap();
+                    r.push((line, body, std::time::Instant::now()));
+                    (r.len() - 1).min(responses.len() - 1)
+                };
+                conn.write_all(responses[i].as_bytes()).unwrap();
+            }
+        });
+        (url, seen)
+    }
+
+    fn not_admitted(retry_after: u32) -> String {
+        reply(
+            "503 Service Unavailable",
+            &format!("retry-after: {retry_after}\r\nleep-refused: admission\r\n"),
+            r#"{"error":"land not admitted: the land queue of \"main\" holds 2 batches (--land-queue-batches 2); nothing was done, send it again in 1s","code":"unavailable"}"#,
+        )
+    }
+
+    fn landed(id: ChangesetId) -> String {
+        reply(
+            "200 OK",
+            "",
+            &format!(r#"{{"status":"landed","landed":"{id}","rebased":false,"attempts":1}}"#),
+        )
+    }
+
+    fn land_request(keyed: bool) -> LandRequest {
+        LandRequest {
+            changeset: ChangesetId(Hash::of_blob(b"x")),
+            target_ref: "main".into(),
+            create: Some(false),
+            land_id: keyed.then(new_land_id),
+        }
+    }
+
+    /// ADR 0060, section 2: a land the server did not admit is sent again
+    /// after `Retry-After` plus jitter, under the same land id.
+    #[test]
+    fn a_land_not_admitted_is_resent_after_the_wait_under_the_same_land_id() {
+        let req = land_request(true);
+        let (url, seen) = body_stub(vec![
+            not_admitted(1),
+            not_admitted(1),
+            landed(req.changeset),
+        ]);
+        let resp = Client::new(&url).land_resending(&req).unwrap();
+        assert!(matches!(resp, LandResponse::Landed { landed, .. } if landed == req.changeset));
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 3);
+        for (line, body, _) in seen.iter() {
+            assert!(line.starts_with("post /v1/land "), "{line}");
+            let sent: LandRequest = serde_json::from_str(body).unwrap();
+            assert_eq!(sent, req, "the same land, under the same id");
+        }
+        for pair in seen.windows(2) {
+            let gap = pair[1].2.duration_since(pair[0].2);
+            assert!(gap >= Duration::from_secs(1), "{gap:?}");
+            assert!(gap < Duration::from_millis(1500 + 500), "{gap:?}");
+        }
+    }
+
+    /// The header says nothing was queued, so even a land without an id is
+    /// resent after it; never after a 503 without it.
+    #[test]
+    fn an_unkeyed_land_is_resent_only_after_a_refusal_with_leep_refused() {
+        let req = land_request(false);
+        let (url, seen) = body_stub(vec![not_admitted(0), landed(req.changeset)]);
+        Client::new(&url).land_resending(&req).unwrap();
+        assert_eq!(seen.lock().unwrap().len(), 2);
+
+        let bare = reply(
+            "503 Service Unavailable",
+            "retry-after: 0\r\n",
+            r#"{"error":"proxy says no"}"#,
+        );
+        let (url, seen) = body_stub(vec![bare, landed(req.changeset)]);
+        let e = Client::new(&url).land_resending(&req).unwrap_err();
+        assert_eq!(seen.lock().unwrap().len(), 1, "a bare 503 promises nothing");
+        assert_eq!(e.kind(), ErrorKind::Server);
+        assert_eq!(e.refused(), None);
+    }
+
+    #[test]
+    fn refused_lands_have_a_budget_of_their_own() {
+        let req = land_request(true);
+        let (url, seen) = body_stub(vec![not_admitted(0)]);
+        let e = Client::new(&url).land_resending(&req).unwrap_err();
+        assert_eq!(seen.lock().unwrap().len(), 1 + ADMISSION_RESENDS as usize);
+        assert_eq!(e.refused(), Some("admission"));
+        assert_eq!(e.server_code(), Some("unavailable"));
+        assert!(e.is_retryable());
+
+        // A wait past the budget is reported at once.
+        let (url, seen) = body_stub(vec![not_admitted(61), landed(req.changeset)]);
+        let e = Client::new(&url).land_resending(&req).unwrap_err();
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert_eq!(e.retry_after_ms(), Some(61_000));
+    }
+
+    /// The MCP server's client never sleeps: the refusal comes back at
+    /// once, with its wait.
+    #[test]
+    fn without_refusal_retries_a_refused_land_is_reported_at_once() {
+        let req = land_request(true);
+        let (url, seen) = body_stub(vec![not_admitted(4), landed(req.changeset)]);
+        let e = Client::new(&url)
+            .with_refusal_retries(false)
+            .land_resending(&req)
+            .unwrap_err();
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert_eq!(e.refused(), Some("admission"));
+        assert_eq!(e.retry_after_ms(), Some(4000));
+    }
+
+    /// Only the land route is resent after a refusal: another POST, and a
+    /// land sent with [`Client::land`], are sent once.
+    #[test]
+    fn other_posts_refused_with_leep_refused_are_not_resent() {
+        let (url, seen) = body_stub(vec![not_admitted(0), landed(land_request(false).changeset)]);
+        let e = Client::new(&url)
+            .rebase(&RebaseRequest {
+                changeset: ChangesetId(Hash::of_blob(b"x")),
+                onto: ChangesetId(Hash::of_blob(b"y")),
+            })
+            .unwrap_err();
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert_eq!(e.refused(), Some("admission"));
+
+        let (url, seen) = body_stub(vec![not_admitted(0), landed(land_request(false).changeset)]);
+        Client::new(&url).land(&land_request(true)).unwrap_err();
+        assert_eq!(seen.lock().unwrap().len(), 1);
     }
 
     #[test]
