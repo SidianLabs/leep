@@ -787,7 +787,12 @@ impl Repo {
         if client_blobs {
             check_path_bounds(cs.changes.keys())?;
         }
-        self.rescue_changesets(&cs.parents, crate::changeset_gc::RescueBy::Create)
+        // The changeset itself too: a client may post it again (the same
+        // body, so the same id) while a sweep has it condemned. Answering
+        // 200 promises it is stored, so it must outlive the collect.
+        let mut named = cs.parents.clone();
+        named.push(id);
+        self.rescue_changesets(&named, crate::changeset_gc::RescueBy::Create)
             .await?;
         let mut seen = HashSet::new();
         let contents: Vec<(&RepoPath, Hash, u64)> = cs

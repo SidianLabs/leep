@@ -823,3 +823,30 @@ async fn collect_refuses_within_a_fence_of_the_last_condemn() {
         .unwrap();
     assert_eq!(r.deleted, 1, "{r:?}");
 }
+
+/// Review item 3: a client that posts a condemned changeset again (the
+/// same body, so the same id) inside the fence was answered 200, but only
+/// its parents were rescued, so collect deleted it and a later read was
+/// 404. Storing it again must rescue the changeset itself.
+#[tokio::test(start_paused = true)]
+async fn reposting_a_condemned_changeset_rescues_it() {
+    let w = World::new(10);
+    let base = commit_file(10, &w.clean, None, "base.txt", "b\n", "base").await;
+    w.meta.cas_ref("main", None, Some(base)).await.unwrap();
+    let x = commit_file(10, &w.clean, Some(base), "x", "x\n", "x").await;
+    let body = w.meta.get_changeset(&x).await.unwrap().unwrap();
+    let o = opts();
+    let t = later();
+    changeset_sweep::condemn(&w.clean, &o, &TestClock::at(t))
+        .await
+        .unwrap();
+    assert!(is_condemned_for_test(&w.clean, x).await);
+    // A server whose cached flag is fresh, as after the 10 s TTL.
+    let server = w.server_with(&FaultPlan::new(10));
+    assert_eq!(server.create_changeset(body).await.unwrap(), x);
+    let r = changeset_sweep::collect(&w.clean, &o, &TestClock::at(t + 901))
+        .await
+        .unwrap();
+    assert!(stored(&w, x).await, "re-posted changeset deleted: {r:?}");
+    w.clean.get_changeset(x).await.unwrap();
+}
