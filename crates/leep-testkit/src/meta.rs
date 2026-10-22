@@ -241,6 +241,26 @@ impl MetaStore for FaultyMetaStore {
             .await
     }
 
+    async fn delete_changesets(&self, ids: &[ChangesetId], kinds: &[&str]) -> Result<u64> {
+        self.plan
+            .run(
+                Op::DeleteChangesets,
+                self.inner.delete_changesets(ids, kinds),
+                |_, v| v,
+            )
+            .await
+    }
+
+    async fn delete_derived_keys(&self, kinds: &[&str], keys: &[Hash]) -> Result<u64> {
+        self.plan
+            .run(
+                Op::DeleteChangesets,
+                self.inner.delete_derived_keys(kinds, keys),
+                |_, v| v,
+            )
+            .await
+    }
+
     async fn put_derived(&self, kind: &str, key: &Hash, value: Bytes) -> Result<()> {
         self.plan
             .run(

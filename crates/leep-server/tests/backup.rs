@@ -213,6 +213,7 @@ impl Hooks for GcBetween {
             fence: Duration::ZERO,
             unsafe_no_fence: true,
             dry_run: false,
+            backup_fence: None,
         };
         gc::condemn(&self.site.repo, &o, &Ahead).await.unwrap();
         let r = gc::collect(&self.site.repo, &o, &Ahead).await.unwrap();

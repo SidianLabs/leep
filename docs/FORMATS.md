@@ -46,6 +46,7 @@ skill.
 | derived `cs-rescue-v1` | — | `MetaStore.derived`, key = changeset id, value = the condemnation time the writer observed, 8-byte big-endian `i64` |
 | derived `cs-doom-v1` | — | `MetaStore.derived`, key = changeset id, value = condemnation time (8-byte big-endian `i64`) then one state byte: 0 deleting, 1 abandoned, 2 deleted |
 | derived `gc-fence-active-v1` | — | `MetaStore.derived`, one row, key = 32 zero bytes, value = unix seconds the current changeset condemnation round began, 8-byte big-endian `i64`, or 0 when none is under way |
+| derived `cs-tombstone-v1` | — | `MetaStore.derived`, key = id of a changeset the sweep deleted, value = deletion time (8-byte big-endian `i64`, the sweep host's clock), then the changeset's root tree hash (32 bytes) when it had a `root_tree` row. Written before the delete, dropped after `--tombstone-retention`; blob GC keeps the root trees of those within `--backup-fence` (ADR 0059 section 11) |
 | derived `cs-reach-v1` | — | `MetaStore.derived`, key = changeset id, value = the single byte `0x01` (a present row counts whatever it reads): a ref or ref log entry reaches the changeset, and every parent has a row. Written parents first (ADR 0059). One more row, key = 32 zero bytes, holds the `seq` of the newest ref log entry the rows cover (8-byte big-endian) |
 | derived `blob-trigrams-v1` | — | `MetaStore.derived`, key = blob hash, value = see "Code search index" below |
 | derived `tree-trigrams-v1` | — | `MetaStore.derived`, key = tree node hash (`TreeNode::hash()`), value = see "Code search index" below |
@@ -595,8 +596,9 @@ hash or derived encoding changed. Rules:
 - `operation` from a client is 1 to 32 bytes of `a-z 0-9 - _ .`, defaults to
   `cas`, and may not be `land` or `import`; `message` is up to 256 bytes with
   no control characters. `actor` is never taken from a request.
-- Entries are never removed. They name changesets, which are never deleted, so
-  blob garbage collection is unaffected.
+- Entries are never removed. Both targets of every entry are roots of the
+  changeset sweep (ADR 0059), so a changeset an entry names is never
+  deleted.
 
 ## Leases (new table, `MetaStore` methods and headers, ADR 0056)
 
@@ -1003,6 +1005,24 @@ land id record, when there is one, with the `Landed` it got the first time,
 instead of 404. A land batch that runs past 60 s answers its lands 409
 (retry). No `/v1` field, `Changeset`, `TreeNode`, hash or other encoding
 changed.
+
+## Changeset garbage collection, phase 2 (derived kind and `MetaStore` methods, ADR 0059)
+
+Persisted: the derived kind `cs-tombstone-v1`, keyed by a deleted
+changeset's id: the deletion time (unix seconds, 8-byte big-endian `i64`,
+the sweep host's clock), then the changeset's root tree hash (32 bytes)
+when it had a `root_tree` row. The sweep writes it before the delete and
+drops it after `--tombstone-retention`. `MetaStore` gains
+`delete_changesets(ids, kinds)` (one transaction: the changesets and their
+rows of `kinds`) and `delete_derived_keys(kinds, keys)`; both default to an
+error, so a wrapper that does not forward them fails loudly. Changesets
+deleted by the sweep read as not found; a client may store one again.
+
+Values of `gc-mark-v1` and `cs-reach-v1`: a present row counts whatever it
+reads (ADR 0033, amended), so a damaged value keeps rather than frees.
+
+The lease table gains the scope `gc` (name `store`, repository 0) for one
+GC at a time. No schema, `/v1`, `Changeset`, `TreeNode` or hash change.
 
 ## Backup directory (new, ADR 0026; no change to stored objects)
 Written and read by `leep-server backup`, `restore` and `backup-verify`.

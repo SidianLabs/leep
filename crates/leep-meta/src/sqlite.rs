@@ -951,6 +951,65 @@ impl MetaStore for SqliteMetaStore {
         Ok(())
     }
 
+    /// One transaction: the rows of every listed kind, then the changesets,
+    /// one `IN (...)` statement per [`BATCH_PARAMS`] ids each.
+    async fn delete_changesets(&self, ids: &[ChangesetId], kinds: &[&str]) -> Result<u64> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let keys: Vec<&[u8]> = unique(ids.iter().map(|i| i.0.as_bytes().as_slice()));
+        let mut tx = self.pool.begin().await.map_err(storage)?;
+        let mut n = 0;
+        for chunk in keys.chunks(BATCH_PARAMS) {
+            for kind in kinds {
+                let sql = format!(
+                    "DELETE FROM derived WHERE kind = ? AND key IN ({})",
+                    placeholders(chunk.len())
+                );
+                let mut q = sqlx::query(AssertSqlSafe(sql)).bind(*kind);
+                for k in chunk {
+                    q = q.bind(*k);
+                }
+                q.execute(&mut *tx).await.map_err(storage)?;
+            }
+            let sql = format!(
+                "DELETE FROM changesets WHERE id IN ({})",
+                placeholders(chunk.len())
+            );
+            let mut q = sqlx::query(AssertSqlSafe(sql));
+            for k in chunk {
+                q = q.bind(*k);
+            }
+            n += q.execute(&mut *tx).await.map_err(storage)?.rows_affected();
+        }
+        tx.commit().await.map_err(storage)?;
+        Ok(n)
+    }
+
+    async fn delete_derived_keys(&self, kinds: &[&str], keys: &[Hash]) -> Result<u64> {
+        if keys.is_empty() || kinds.is_empty() {
+            return Ok(0);
+        }
+        let keys: Vec<&[u8]> = unique(keys.iter().map(|k| k.as_bytes().as_slice()));
+        let mut tx = self.pool.begin().await.map_err(storage)?;
+        let mut n = 0;
+        for chunk in keys.chunks(BATCH_PARAMS) {
+            for kind in kinds {
+                let sql = format!(
+                    "DELETE FROM derived WHERE kind = ? AND key IN ({})",
+                    placeholders(chunk.len())
+                );
+                let mut q = sqlx::query(AssertSqlSafe(sql)).bind(*kind);
+                for k in chunk {
+                    q = q.bind(*k);
+                }
+                n += q.execute(&mut *tx).await.map_err(storage)?.rows_affected();
+            }
+        }
+        tx.commit().await.map_err(storage)?;
+        Ok(n)
+    }
+
     /// One transaction, so one commit (and one sync) for the whole batch.
     async fn put_derived_many(&self, rows: &[DerivedRow]) -> Result<()> {
         if rows.is_empty() {

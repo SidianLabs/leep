@@ -248,6 +248,16 @@ static KINDS: &[KindInfo] = &[
         drop: DropPolicy::Refused(CS_GC_REFUSAL),
     },
     KindInfo {
+        name: crate::changeset_sweep::CS_TOMBSTONE,
+        class: KindClass::Bookkeeping,
+        summary: "when the changeset sweep deleted a changeset, and its root tree",
+        rederive: Rederive::No("garbage collection state is not derived"),
+        drop: DropPolicy::Refused(
+            "gc --full keeps the root trees of changesets deleted within --backup-fence \
+             (ADR 0059); dropping tombstones can delete tree nodes a backup in flight needs",
+        ),
+    },
+    KindInfo {
         name: GC_FENCE_ACTIVE,
         class: KindClass::Bookkeeping,
         summary: "when the current changeset condemnation round began, or 0",

@@ -59,13 +59,26 @@ every runbook.
 | [LeepBackupVerifyFailed](#leepbackupverifyfailed) | ticket | the weekly `backup-verify` failed or has not passed in 9 days |
 | [LeepRestoreDrillOverdue](#leeprestoredrilloverdue) | ticket | no passing restore drill in 35 days |
 | [LeepGcStale](#leepgcstale) | ticket | `leep-server gc` has not succeeded in 3 days |
+| [LeepUnreachableGcStale](#leepunreachablegcstale) | ticket | the changeset sweep has not succeeded in 3 days (once it has run) |
+| [LeepChangesetRescueBurst](#leepchangesetrescueburst) | ticket | writers rescue more than one condemned changeset a second for 15 minutes |
+| [LeepChangesetDoomStuck](#leepchangesetdoomstuck) | ticket | writers get 409 on a changeset delete announced and never settled |
+| [LeepGcFenceFlagStuck](#leepgcfenceflagstuck) | ticket | the changeset fence flag has been up for a day |
+| [LeepChangesetCollectSlow](#leepchangesetcollectslow) | ticket | a changeset collect batch took over 5 s |
 | [LeepDiskSpaceLow](#leepdiskspacelow) | ticket | a Leep data or backup filesystem has under 10% free |
 | [LeepInodesLow](#leepinodeslow) | ticket | a filesystem holding Leep blobs or its database has under 10% of its inodes free (optional, node_exporter) |
 | [LeepInodesCritical](#leepinodescritical) | page | the same, under 3% |
 
-The last six rows depend on things Leep does not export itself: wrapper
-metrics from [Cron wrappers](#cron-wrappers) and node_exporter's filesystem
-metrics. Leep has no GC or disk metrics of its own.
+Some rows depend on things the servers do not export:
+
+- `LeepBackupStale` to `LeepGcStale`, and `LeepUnreachableGcStale`, read
+  wrapper metrics from [Cron wrappers](#cron-wrappers).
+- `LeepChangesetCollectSlow` reads the sweep's `--metrics-file`.
+- `LeepDiskSpaceLow`, `LeepInodesLow` and `LeepInodesCritical` read
+  node_exporter's filesystem metrics.
+
+Servers export only the changeset sweep's writer-side metrics
+(`leep_gc_changesets_rescued_total`,
+`leep_gc_changeset_doom_conflicts_total`, `leep_gc_fence_active`).
 
 ## Before you start
 
@@ -2081,6 +2094,14 @@ unreferenced blobs and only GC reclaims them.
      pending migrations with `--no-migrate`;
    - `invalid input: a zero fence can lose blobs while servers run; pass a positive
      fence (longer than the servers' request timeout) or --unsafe-no-fence`;
+   - `--fence Ns does not exceed --request-timeout ...`: since ADR 0059 phase 2
+     `gc` refuses a fence the servers' timeouts do not cover. Run it with the
+     servers' `--request-timeout` and `--meta-statement-timeout` (or their
+     `LEEP_` variables), or raise `--fence`;
+   - `another garbage collection is running (...)`: the changeset sweep or
+     another `gc` holds the `gc` lease; a killed run's lease lapses in 60 s;
+   - `gc --full frees the trees of deleted changesets ...`: `--full` needs
+     `--backups DIR` or `--backup-fence`;
    - `bad duration "..."; use e.g. 0, 90s, 30m, 24h, 7d`.
 3. Is it simply slow or killed? Condemn and collect walk only changesets stored since
    the last run (`changesets walked` in the report; ADR 0033), but still list every
@@ -2113,6 +2134,122 @@ unreferenced blobs and only GC reclaims them.
 
 **Escalate / collect.** The cron output of the last runs, `gc --dry-run` output,
 the job's flags and the servers' `--request-timeout`, and the store sizes.
+
+## LeepUnreachableGcStale
+
+**Meaning.** `leep-server gc --unreachable` (the changeset sweep, ADR 0059)
+has not exited successfully in 3 days, by the [wrapper](#cron-wrappers)'s
+`leep_gc_unreachable_last_success_timestamp_seconds`. **Ticket.**
+
+**Impact.** Unreachable changesets accumulate as before the sweep existed.
+If a condemn ran and no collect finished since, the fence flag stays up
+and every server reads fence rows for what it names
+([LeepGcFenceFlagStuck](#leepgcfenceflagstuck)).
+
+**Diagnose.**
+
+1. The cron log and `leep_gc_unreachable_last_exit_code`. Common errors:
+   - `another garbage collection is running (job, holder, Ns left)`: blob
+     GC or the other sweep phase overlaps; or a killed run's lease, which
+     lapses in 60 s.
+   - `--fence Ns does not exceed ...`: the fence check. Give `gc` the
+     servers' `--request-timeout` and `--meta-statement-timeout` (or their
+     `LEEP_` variables), or raise `--fence`.
+   - `servers that do not rescue changesets hold leases: ...`: upgrade
+     them before condemning.
+2. Whether it is slow: the run's printed `collect: left for the next run
+   (--max-delete)`, and `leep_gc_changesets_left_by_cap`.
+
+**Mitigate / fix.** Fix the cause and run the job by hand. A killed run
+needs nothing else: the next collect finishes what it left.
+
+**Escalate / collect.** The cron log, the run's output, `gc --unreachable
+--dry-run --grace 0`.
+
+## LeepChangesetRescueBurst
+
+**Meaning.** Servers rescue more than one condemned changeset a second
+(`leep_gc_changesets_rescued_total{by}`): agents keep naming changesets the
+sweep found unreachable and older than `--changeset-grace`. **Ticket.**
+
+**Impact.** Correct but costly: each rescue writes rows and may wait up to
+30 s for a delete in progress. A rescue that loses to a delete answers
+"unknown parent" or 404, and the agent must post its work again.
+
+**Diagnose.** The `by` label says who: `create` (building on old work),
+`land` (landing old stacks), `ref` (`leep undo` or branches at old work).
+
+**Mitigate / fix.** Raise `--changeset-grace` above how long agents keep
+building on unlanded work, or fix the agents that resume stale stacks.
+
+**Escalate / collect.** The rate by `by`, the sweep's `--changeset-grace`,
+and examples of the changesets named.
+
+## LeepChangesetDoomStuck
+
+**Meaning.** Writers were answered 409 "changeset ... is being garbage
+collected; retry" after waiting 30 s
+(`leep_gc_changeset_doom_conflicts_total`). A changeset collect announced
+a delete (`cs-doom-v1` *deleting*) and did not settle it: it was killed
+between announcing a batch and finishing it, or it is very slow. **Ticket.**
+
+**Impact.** Requests naming those changesets fail until a collect settles
+them. Nothing is lost: a kill leaves the store closed under ancestry, and
+the next collect either finishes the delete or abandons it.
+
+**Diagnose.**
+
+1. Is a collect running? `ps` on the GC host. If it is, see
+   [LeepChangesetCollectSlow](#leepchangesetcollectslow).
+2. Was one killed? The cron log.
+
+**Mitigate / fix.** Run `leep-server gc --unreachable --collect-only` now,
+once the killed run's lease has lapsed (60 s). Do not edit `cs-doom-v1`
+rows by hand.
+
+**Escalate / collect.** The cron log, the collect's output, and
+`leep-server verify --full`.
+
+## LeepGcFenceFlagStuck
+
+**Meaning.** `leep_gc_fence_active` has been 1 for a day: a changeset
+condemn raised `gc-fence-active-v1`, and no collect has resolved every
+condemnation since. **Ticket.**
+
+**Impact.** Every server reads fence rows for the changesets it names,
+which costs a few reads per write, and every land batch attempt reads them
+too. Nothing is unsafe.
+
+**Diagnose.** When the collect job last succeeded
+([LeepUnreachableGcStale](#leepunreachablegcstale)), and its
+`collect: still condemned` and `collect: left for the next run` lines. A
+store with more condemned changesets than `--max-delete` takes several
+runs.
+
+**Mitigate / fix.** Run the collect job. Raise `--max-delete` or run it
+more often if it cannot keep up. The flag is cleared by the collect that
+leaves nothing stored condemned.
+
+**Escalate / collect.** The last collect's output and the metrics file.
+
+## LeepChangesetCollectSlow
+
+**Meaning.** A changeset collect batch took more than 5 s from announcing
+its deletes to settling them
+(`leep_gc_changeset_collect_batch_seconds_max`, from the run's metrics
+file). **Ticket.**
+
+**Impact.** Writers naming a changeset in the batch wait for it (up to
+30 s, then 409); land batches waiting on it hold their ref's queue.
+
+**Diagnose.** Metadata store latency and load during the run. Batches
+delete rows of eight kinds plus the changesets in one transaction.
+
+**Mitigate / fix.** Lower `--batch` (default 500) and `--rate`, or run the
+collect in a quieter hour.
+
+**Escalate / collect.** The run's output, the metrics file, and the
+database's slow query log for the run.
 
 ## LeepDiskSpaceLow
 

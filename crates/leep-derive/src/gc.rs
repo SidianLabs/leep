@@ -491,6 +491,11 @@ pub struct GcOptions {
     pub unsafe_no_fence: bool,
     /// Report what would be condemned or deleted without writing anything.
     pub dry_run: bool,
+    /// Also keep the trees of changesets the changeset sweep deleted within
+    /// this long, for backups that snapshotted them (ADR 0059 section 6),
+    /// with either mark. `None` keeps none; `leep-server gc --full`
+    /// requires it.
+    pub backup_fence: Option<Duration>,
 }
 
 impl Default for GcOptions {
@@ -500,6 +505,7 @@ impl Default for GcOptions {
             fence: Duration::from_secs(10 * 60),
             unsafe_no_fence: false,
             dry_run: false,
+            backup_fence: None,
         }
     }
 }
@@ -745,7 +751,13 @@ async fn marked_rows(repo: &Repo, check: bool, hashes: &[Hash]) -> Result<HashSe
 /// aborts before anything is condemned or deleted, so an incomplete mark
 /// never loses a blob. Unless `write` is false, records what it walked for
 /// the next run.
-async fn mark(repo: &Repo, mode: Mark, write: bool, stats: &mut MarkStats) -> Result<Marked> {
+async fn mark(
+    repo: &Repo,
+    mode: Mark,
+    write: bool,
+    stats: &mut MarkStats,
+    extra_roots: &[Hash],
+) -> Result<Marked> {
     let trust = mode == Mark::Incremental;
     let mut walked: HashSet<Hash> = HashSet::new();
     let mut out = MarkWriter {
@@ -806,10 +818,42 @@ async fn mark(repo: &Repo, mode: Mark, write: bool, stats: &mut MarkStats) -> Re
         }
     }
     out.flush().await?;
+    // Trees of recently deleted changesets, kept but not recorded: they
+    // are live only until the backup fence passes.
+    let mut quiet = MarkWriter {
+        repo,
+        write: false,
+        rows: Vec::new(),
+    };
+    for root in extra_roots {
+        if walked.contains(root) {
+            continue;
+        }
+        // Stopping at marked nodes is safe: a marked node is kept anyway.
+        match walk_tree(repo, *root, trust, &mut walked, &mut quiet).await {
+            Ok(()) => {}
+            // Already gone (an earlier full collect, before this tombstone's
+            // fence was set): nothing of it is left to keep.
+            Err(Error::NotFound(_)) => {}
+            Err(e) => return Err(e),
+        }
+    }
     Ok(Marked {
         walked,
         rows: trust,
     })
+}
+
+/// Root trees a full mark keeps besides those of stored changesets.
+async fn backup_roots(repo: &Repo, opts: &GcOptions, started_at: i64) -> Result<Vec<Hash>> {
+    // Both marks: an incremental one trusts its rows, but the trees of a
+    // changeset no blob GC ever marked have none.
+    match opts.backup_fence {
+        Some(f) => {
+            crate::changeset_sweep::tombstoned_roots(repo, started_at.saturating_sub(secs(f))).await
+        }
+        None => Ok(Vec::new()),
+    }
 }
 
 /// Test oracle: an incremental mark that records what it walks must agree
@@ -819,12 +863,12 @@ async fn mark(repo: &Repo, mode: Mark, write: bool, stats: &mut MarkStats) -> Re
 #[cfg(test)]
 pub(crate) async fn check_incremental_mark(r: &Repo) -> std::result::Result<u64, String> {
     let mut stats = MarkStats::default();
-    let full = mark(r, Mark::Full, false, &mut stats)
+    let full = mark(r, Mark::Full, false, &mut stats, &[])
         .await
         .map_err(|e| e.to_string())?
         .walked;
     let mut stats = MarkStats::default();
-    let inc = mark(r, Mark::Incremental, true, &mut stats)
+    let inc = mark(r, Mark::Incremental, true, &mut stats, &[])
         .await
         .map_err(|e| e.to_string())?;
     let mut all: Vec<Hash> = r
@@ -930,10 +974,27 @@ pub async fn condemn_with(
     mode: Mark,
     clock: &dyn Clock,
 ) -> Result<CondemnReport> {
+    let lease = if opts.dry_run {
+        None
+    } else {
+        crate::gc_lease::GcLease::acquire(repo.meta(), "blob-condemn").await?
+    };
+    let result = condemn_leased(repo, opts, mode, clock, &lease).await;
+    crate::gc_lease::release(lease, result).await
+}
+
+async fn condemn_leased(
+    repo: &Repo,
+    opts: &GcOptions,
+    mode: Mark,
+    clock: &dyn Clock,
+    lease: &Option<crate::gc_lease::GcLease>,
+) -> Result<CondemnReport> {
     let mut report = CondemnReport::default();
     let started_at = clock.now();
     let mut stats = MarkStats::default();
-    let marked = mark(repo, mode, !opts.dry_run, &mut stats).await?;
+    let extra = backup_roots(repo, opts, started_at).await?;
+    let marked = mark(repo, mode, !opts.dry_run, &mut stats, &extra).await?;
     report.changesets_scanned = stats.changesets_scanned;
     report.changesets_walked = stats.changesets_walked;
     report.marked = marked.walked.len() as u64;
@@ -975,6 +1036,7 @@ pub async fn condemn_with(
                 continue;
             }
             if !opts.dry_run {
+                crate::gc_lease::check(lease)?;
                 // Strictly after any earlier condemnation, hence after any
                 // rescue of it, even if the clock stepped back.
                 let at = state.condemned.map_or(0, |c| c + 1).max(clock.now());
@@ -1004,11 +1066,28 @@ pub async fn collect_with(
     clock: &dyn Clock,
 ) -> Result<CollectReport> {
     check_fence(opts)?;
+    let lease = if opts.dry_run {
+        None
+    } else {
+        crate::gc_lease::GcLease::acquire(repo.meta(), "blob-collect").await?
+    };
+    let result = collect_leased(repo, opts, mode, clock, &lease).await;
+    crate::gc_lease::release(lease, result).await
+}
+
+async fn collect_leased(
+    repo: &Repo,
+    opts: &GcOptions,
+    mode: Mark,
+    clock: &dyn Clock,
+    lease: &Option<crate::gc_lease::GcLease>,
+) -> Result<CollectReport> {
     let mut report = CollectReport::default();
     let started_at = clock.now();
     let eligible_before = started_at.saturating_sub(secs(opts.fence));
     let mut stats = MarkStats::default();
-    let marked = mark(repo, mode, !opts.dry_run, &mut stats).await?;
+    let extra = backup_roots(repo, opts, started_at).await?;
+    let marked = mark(repo, mode, !opts.dry_run, &mut stats, &extra).await?;
     report.changesets_scanned = stats.changesets_scanned;
     report.changesets_walked = stats.changesets_walked;
     report.marked = marked.walked.len() as u64;
@@ -1079,6 +1158,7 @@ pub async fn collect_with(
                 report.deleted_bytes += blob.size;
                 continue;
             }
+            crate::gc_lease::check(lease)?;
             // Handshake: announce the delete, then look for a rescue. An
             // upload writes its rescue and then looks for the announcement.
             repo.meta()
@@ -1148,6 +1228,35 @@ mod tests {
         (repo, blobs)
     }
 
+    /// One GC at a time (ADR 0059 section 6): blob condemn and collect
+    /// refuse while a changeset collect holds the gc lease, and run once it
+    /// is released. A dry run takes no lease.
+    #[tokio::test]
+    async fn blob_gc_refuses_during_changeset_collect() {
+        let (repo, _) = setup();
+        let held = crate::gc_lease::GcLease::acquire(repo.meta(), "changeset-collect")
+            .await
+            .unwrap()
+            .unwrap();
+        let opts = GcOptions::default();
+        let clock = TestClock::at(now());
+        for e in [
+            collect(&repo, &opts, &clock).await.unwrap_err(),
+            condemn(&repo, &opts, &clock).await.unwrap_err(),
+        ] {
+            assert!(matches!(e, Error::Conflict(_)), "{e}");
+            assert!(e.to_string().contains("changeset-collect"), "{e}");
+        }
+        let dry = GcOptions {
+            dry_run: true,
+            ..GcOptions::default()
+        };
+        condemn(&repo, &dry, &clock).await.unwrap();
+        held.release().await.unwrap();
+        collect(&repo, &opts, &clock).await.unwrap();
+        condemn(&repo, &opts, &clock).await.unwrap();
+    }
+
     /// A clock that only moves when told to or when GC sleeps.
     struct TestClock(Mutex<i64>);
 
@@ -1180,6 +1289,7 @@ mod tests {
             fence: Duration::from_secs(FENCE as u64),
             unsafe_no_fence: false,
             dry_run,
+            backup_fence: None,
         }
     }
 
@@ -2264,7 +2374,10 @@ mod tests {
     /// What a full mark finds, writing nothing: the oracle.
     async fn full_mark(r: &Repo) -> HashSet<Hash> {
         let mut stats = MarkStats::default();
-        mark(r, Mark::Full, false, &mut stats).await.unwrap().walked
+        mark(r, Mark::Full, false, &mut stats, &[])
+            .await
+            .unwrap()
+            .walked
     }
 
     async fn assert_marks_agree(r: &Repo, what: &str) -> MarkStats {

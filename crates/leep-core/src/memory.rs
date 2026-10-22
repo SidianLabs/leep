@@ -360,6 +360,34 @@ impl MetaStore for MemoryMetaStore {
         Ok(cs.id())
     }
 
+    async fn delete_changesets(&self, ids: &[ChangesetId], kinds: &[&str]) -> Result<u64> {
+        let mut changesets = self.changesets.lock().unwrap();
+        let mut at = self.stored_at.lock().unwrap();
+        let mut derived = self.derived.lock().unwrap();
+        let mut n = 0;
+        for id in ids {
+            if changesets.remove(id).is_some() {
+                n += 1;
+            }
+            at.remove(id);
+            for kind in kinds {
+                derived.remove(&(kind.to_string(), id.0));
+            }
+        }
+        Ok(n)
+    }
+
+    async fn delete_derived_keys(&self, kinds: &[&str], keys: &[Hash]) -> Result<u64> {
+        let mut derived = self.derived.lock().unwrap();
+        let mut n = 0;
+        for key in keys {
+            for kind in kinds {
+                n += u64::from(derived.remove(&(kind.to_string(), *key)).is_some());
+            }
+        }
+        Ok(n)
+    }
+
     async fn changesets_stored_at(&self, ids: &[ChangesetId]) -> Result<Vec<Option<u64>>> {
         let _changesets = self.changesets.lock().unwrap();
         let at = self.stored_at.lock().unwrap();
@@ -892,6 +920,7 @@ pub async fn check_meta_store_contract(store: &dyn MetaStore) {
     check_ref_chain_log(store).await;
     check_land_ids(store).await;
     check_stored_at(store, &cs).await;
+    check_delete_changesets(store).await;
 
     let key = Hash::of_blob(b"k");
     assert!(store.get_derived("kind", &key).await.unwrap().is_none());
@@ -1773,6 +1802,99 @@ async fn check_ref_chain_log(store: &dyn MetaStore) {
 /// Store times (ADR 0059): recorded by every way of storing a changeset,
 /// kept by a repeated store, `None` for an absent id, one slot per id in
 /// order.
+/// `delete_changesets` removes the changesets and exactly the listed kinds
+/// of their rows, skips what is absent (so a repeat does nothing), and a
+/// deleted changeset can be stored again; `delete_derived_keys` removes
+/// exactly the named rows (ADR 0059).
+async fn check_delete_changesets(store: &dyn MetaStore) {
+    let cs = |n: u8| Changeset {
+        parents: vec![],
+        author: "delete".into(),
+        timestamp: 0,
+        message: format!("delete {n}"),
+        changes: BTreeMap::new(),
+        extra: BTreeMap::new(),
+    };
+    let row = |kind: &str, key: Hash| DerivedRow::new(kind, key, Bytes::from_static(b"v"));
+    let (a, b) = (cs(1).id(), cs(2).id());
+    let other = Hash::of_blob(b"delete: not a changeset");
+    store
+        .put_changesets_with_derived(
+            &[cs(1), cs(2)],
+            &[
+                row("del-k1", a.0),
+                row("del-k2", a.0),
+                row("del-k3", a.0),
+                row("del-k1", b.0),
+                row("del-k1", other),
+            ],
+        )
+        .await
+        .unwrap();
+    let missing = ChangesetId(Hash::of_blob(b"delete: never stored"));
+    assert_eq!(
+        store
+            .delete_changesets(&[a, missing], &["del-k1", "del-k2"])
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(store.get_changeset(&a).await.unwrap().is_none());
+    assert!(store.get_changeset(&b).await.unwrap().is_some());
+    assert!(store.get_derived("del-k1", &a.0).await.unwrap().is_none());
+    assert!(store.get_derived("del-k2", &a.0).await.unwrap().is_none());
+    assert!(
+        store.get_derived("del-k3", &a.0).await.unwrap().is_some(),
+        "only the listed kinds are deleted"
+    );
+    assert!(store.get_derived("del-k1", &b.0).await.unwrap().is_some());
+    assert!(store.get_derived("del-k1", &other).await.unwrap().is_some());
+    assert!(!store
+        .list_changesets(None, usize::MAX)
+        .await
+        .unwrap()
+        .contains(&a));
+    assert_eq!(
+        store.changesets_stored_at(&[a]).await.unwrap(),
+        vec![None],
+        "a deleted changeset has no store time"
+    );
+    assert_eq!(
+        store
+            .delete_changesets(&[a, missing], &["del-k1", "del-k2"])
+            .await
+            .unwrap(),
+        0,
+        "a repeat is a no-op"
+    );
+    assert_eq!(store.delete_changesets(&[], &[]).await.unwrap(), 0);
+
+    assert_eq!(
+        store
+            .delete_derived_keys(&["del-k3", "del-k1"], &[a.0, other])
+            .await
+            .unwrap(),
+        2
+    );
+    assert!(store.get_derived("del-k3", &a.0).await.unwrap().is_none());
+    assert!(store.get_derived("del-k1", &other).await.unwrap().is_none());
+    assert!(store.get_derived("del-k1", &b.0).await.unwrap().is_some());
+    assert_eq!(
+        store
+            .delete_derived_keys(&["del-k3", "del-k1"], &[a.0, other])
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(store.delete_derived_keys(&[], &[]).await.unwrap(), 0);
+
+    // Stored again, as a client that still has the body may.
+    assert_eq!(store.put_changeset(&cs(1)).await.unwrap(), a);
+    assert_eq!(store.get_changeset(&a).await.unwrap(), Some(cs(1)));
+    assert!(store.changesets_stored_at(&[a]).await.unwrap()[0].is_some());
+    store.delete_changesets(&[a, b], &["del-k1"]).await.unwrap();
+}
+
 async fn check_stored_at(store: &dyn MetaStore, first: &Changeset) {
     let before = unix_now() as u64;
     let cs = |n: u8| Changeset {
@@ -2166,6 +2288,26 @@ mod tests {
         async fn put_derived(&self, kind: &str, key: &Hash, value: Bytes) -> Result<()> {
             self.0.put_derived(kind, key, value).await
         }
+    }
+
+    /// A wrapper that does not forward the deletes refuses them, and
+    /// deletes nothing.
+    #[tokio::test]
+    async fn a_wrapper_that_does_not_forward_deletes_refuses_them() {
+        let store = DefaultChain(MemoryMetaStore::new());
+        let cs = Changeset {
+            parents: vec![],
+            author: "t".into(),
+            timestamp: 0,
+            message: "kept".into(),
+            changes: BTreeMap::new(),
+            extra: BTreeMap::new(),
+        };
+        let id = store.put_changeset(&cs).await.unwrap();
+        let e = store.delete_changesets(&[id], &[]).await.unwrap_err();
+        assert!(matches!(e, crate::Error::Invalid(_)), "{e}");
+        assert!(store.delete_derived_keys(&["k"], &[id.0]).await.is_err());
+        assert!(store.get_changeset(&id).await.unwrap().is_some());
     }
 
     #[tokio::test]

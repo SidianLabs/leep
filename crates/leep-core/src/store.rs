@@ -119,6 +119,14 @@ pub const LAND_LEASE_SCOPE: &str = "land";
 /// repository of a store (ADR 0054).
 pub const INDEX_LEASE_SCOPE: &str = "index";
 
+/// The scope of the garbage collection lease (ADR 0059 section 6): one,
+/// named [`GC_LEASE_NAME`], store-wide, so blob GC and the changeset sweep
+/// never run at once.
+pub const GC_LEASE_SCOPE: &str = "gc";
+
+/// The name of the one [`GC_LEASE_SCOPE`] lease.
+pub const GC_LEASE_NAME: &str = "store";
+
 /// Names one lease: what kind of work it coordinates (`scope`), in which
 /// repository (1 until ADR 0054), over what (`name`, for example a ref) and
 /// which part of it (`shard`).
@@ -153,6 +161,16 @@ impl LeaseKey {
             scope: INDEX_LEASE_SCOPE.into(),
             repo_id: 0,
             name: kind.into(),
+            shard: 0,
+        }
+    }
+
+    /// The garbage collection lease: store-wide, so repository 0.
+    pub fn gc() -> Self {
+        LeaseKey {
+            scope: GC_LEASE_SCOPE.into(),
+            repo_id: 0,
+            name: GC_LEASE_NAME.into(),
             shard: 0,
         }
     }
@@ -586,6 +604,36 @@ pub trait MetaStore: Send + Sync + 'static {
         let _ = (name, ids);
         Err(Error::Invalid(
             "this metadata store cannot look up land ids".into(),
+        ))
+    }
+
+    /// Delete the changesets `ids` and their derived rows of `kinds` keyed by
+    /// the same ids, in one transaction: a reader or a backup snapshot sees
+    /// all of it or none. Ids not stored are skipped, so a repeat is a no-op.
+    /// Returns how many changesets were deleted. Only the changeset sweep
+    /// calls it (ADR 0059), and only for changesets it has condemned and
+    /// fenced; it deletes children before parents across calls.
+    ///
+    /// Every backend must implement this. The default refuses, so a wrapper
+    /// that does not forward it fails loudly instead of deleting nothing.
+    async fn delete_changesets(&self, ids: &[ChangesetId], kinds: &[&str]) -> Result<u64> {
+        let _ = (ids, kinds);
+        Err(Error::Invalid(
+            "this metadata store cannot delete changesets".into(),
+        ))
+    }
+
+    /// Delete the derived rows of `kinds` under each of `keys`, in one
+    /// transaction; absent rows are skipped. Returns how many were deleted.
+    /// The changeset sweep's tombstone pass removes rows written for a
+    /// changeset after it was deleted (ADR 0059 section 3).
+    ///
+    /// Every backend must implement this (see
+    /// [`delete_changesets`](Self::delete_changesets)).
+    async fn delete_derived_keys(&self, kinds: &[&str], keys: &[Hash]) -> Result<u64> {
+        let _ = (kinds, keys);
+        Err(Error::Invalid(
+            "this metadata store cannot delete derived rows by key".into(),
         ))
     }
 

@@ -60,6 +60,9 @@ struct Confirmed {
 #[derive(Default)]
 struct Shared {
     stop: AtomicBool,
+    /// Agents start no new work while set: the main thread waits out a
+    /// killed GC's lease without the history growing meanwhile.
+    pause: AtomicBool,
     confirmed: Mutex<Vec<Confirmed>>,
     /// Answers that were neither a success nor a plain "try again".
     odd: Mutex<Vec<String>>,
@@ -70,6 +73,13 @@ struct Shared {
 }
 
 impl Shared {
+    /// Wait while the main thread has paused new work.
+    fn hold(&self) {
+        while self.pause.load(Ordering::Relaxed) && !self.stop.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     fn note_retry(&self, why: &str) {
         *self.retries.lock().unwrap() += 1;
         // 503 with `Leep-Refused: admission`: nothing was done, so the
@@ -99,6 +109,15 @@ impl Shared {
         if !expected {
             self.odd.lock().unwrap().push(why.to_string());
         }
+    }
+}
+
+/// Raises the agents' stop flag when dropped, panics included.
+struct StopOnDrop<'a>(&'a AtomicBool);
+
+impl Drop for StopOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
     }
 }
 
@@ -223,6 +242,7 @@ fn http_agent(n: usize, seed: u64, addr: SocketAddr, shared: &Shared) {
     let mut rng = Rng::new(seed ^ ((n as u64 + 1) * 0x9E37));
     let mut k = 0;
     while !shared.stop.load(Ordering::Relaxed) {
+        shared.hold();
         let steps: Vec<Step> = (0..1 + rng.below(2))
             .map(|_| {
                 k += 1;
@@ -261,6 +281,7 @@ fn cli_agent(n: usize, seed: u64, client: &Client, root: &Path, shared: &Shared)
     let mut rng = Rng::new(seed ^ ((n as u64 + 77) * 0x51ED));
     let mut k = 0;
     while !shared.stop.load(Ordering::Relaxed) {
+        shared.hold();
         k += 1;
         let step = step_for(&who, k, &mut rng);
         let deadline = Instant::now() + Duration::from_secs(120);
@@ -610,6 +631,9 @@ fn crash_rounds(
     let mut planted: Vec<Vec<u8>> = Vec::new();
 
     std::thread::scope(|s| {
+        // A failed check unwinds out of this closure; the agents must stop
+        // too, or the scope waits for them forever instead of failing.
+        let _stop = StopOnDrop(&shared.stop);
         for n in 0..http_agents {
             let shared = &shared;
             s.spawn(move || http_agent(n, seed, addr, shared));
@@ -669,7 +693,12 @@ fn crash_rounds(
 
             server = Server::start_with(port, stores, root, &server_args);
             if !planted.is_empty() {
+                // The killed collect's gc lease lapses after 60 s; agents
+                // pause meanwhile, so later rounds see the history they
+                // would have without the wait.
+                shared.pause.store(true, Ordering::Relaxed);
                 recover_planted(&tag, stores, addr, &planted);
+                shared.pause.store(false, Ordering::Relaxed);
                 planted.clear();
                 check_store(&format!("{tag}, after recovery"), stores, &shared, true);
             }
@@ -678,7 +707,7 @@ fn crash_rounds(
                 live_gc = Some(
                     Command::new(bin("leep-server"))
                         .args(["--meta", &stores.meta, "--blobs", &stores.blobs, "gc"])
-                        .args(["--grace", "0", "--fence", LIVE_FENCE])
+                        .args(["--grace", "0", "--fence", LIVE_FENCE, "--unsafe-fence"])
                         .env("RUST_LOG", "warn")
                         .stdout(Stdio::null())
                         .spawn()
@@ -716,12 +745,13 @@ fn crash_rounds(
     n
 }
 
-/// After a killed collect: finish it, then every planted blob must be
+/// After a killed collect: finish it (once the killed run's gc lease has
+/// lapsed), then every planted blob must be
 /// gone, and uploading the same bytes again must work (after at most one more
 /// collect for a blob caught between "deleting" and "deleted", ADR 0012).
 fn recover_planted(tag: &str, stores: &Stores, addr: SocketAddr, planted: &[Vec<u8>]) {
     let t = Instant::now();
-    let done = gc_ok(
+    let done = gc_after_lease(
         tag,
         stores,
         &["collect", "--fence", "0s", "--unsafe-no-fence"],
@@ -747,7 +777,7 @@ fn recover_planted(tag: &str, stores: &Stores, addr: SocketAddr, planted: &[Vec<
         let mut status = put().0;
         if status == 409 && !retried {
             retried = true;
-            gc_ok(
+            gc_after_lease(
                 tag,
                 stores,
                 &["collect", "--fence", "0s", "--unsafe-no-fence"],
@@ -760,7 +790,7 @@ fn recover_planted(tag: &str, stores: &Stores, addr: SocketAddr, planted: &[Vec<
         );
         if status == 409 {
             // Several blobs can be in that state; one collect closes them all.
-            gc_ok(
+            gc_after_lease(
                 tag,
                 stores,
                 &["collect", "--fence", "0s", "--unsafe-no-fence"],
@@ -999,6 +1029,7 @@ fn killed_land_leader_is_replaced_postgres() {
     let mut stalls = Vec::new();
 
     std::thread::scope(|s| {
+        let _stop = StopOnDrop(&shared.stop);
         for n in 0..agents {
             let (shared, landed_at, addrs) = (&shared, &landed_at, &addrs);
             s.spawn(move || failover_agent(n, seed, addrs, shared, landed_at));
@@ -1053,5 +1084,202 @@ fn killed_land_leader_is_replaced_postgres() {
     drop(odd);
     verify_exact(&tag, &stores, &shared);
     drop(servers);
+    drop(db);
+}
+
+// ---------------------------------------------------------------------------
+// The changeset sweep (ADR 0059 phase 2), SIGKILLed at its three dangerous
+// points: a batch announced but not deleted, a batch deleted but not
+// settled, and inside the tombstone pass. After each kill `verify --full`
+// (stored_parent_missing among its checks) must be clean, every ref must be
+// sound, and a rerun collect must finish the job.
+
+/// A commit of one file, straight into the stores.
+fn plant_commit(repo: &Repo, parent: Option<ChangesetId>, path: &str, body: &str) -> ChangesetId {
+    common_block_on(async {
+        let content = repo
+            .put_blob(body.as_bytes().to_vec().into())
+            .await
+            .unwrap();
+        repo.create_changeset(Changeset {
+            parents: parent.into_iter().collect(),
+            author: "crash".into(),
+            timestamp: 1,
+            message: path.into(),
+            changes: BTreeMap::from([(
+                RepoPath::new(path).unwrap(),
+                FileChange::Modify {
+                    content,
+                    kind: FileKind::Regular,
+                    size: body.len() as u64,
+                },
+            )]),
+            extra: BTreeMap::new(),
+        })
+        .await
+        .unwrap()
+    })
+}
+
+/// Abandoned stacks off `main`, `n` of them, three deep.
+fn plant_garbage(repo: &Repo, round: usize, n: usize) -> Vec<ChangesetId> {
+    let head = common_block_on(repo.meta().get_ref("main")).unwrap();
+    let mut out = Vec::new();
+    for s in 0..n {
+        let mut p = head;
+        for d in 0..3 {
+            let id = plant_commit(
+                repo,
+                p,
+                &format!("g{round}/{s}/{d}"),
+                &format!("{round}{s}{d}\n"),
+            );
+            out.push(id);
+            p = Some(id);
+        }
+    }
+    out
+}
+
+const SWEEP: &[&str] = &[
+    "--unreachable",
+    "--fence",
+    "0s",
+    "--unsafe-no-fence",
+    "--changeset-grace",
+    "0",
+    "--index-fence",
+    "0s",
+];
+
+/// Start a collect that stops for good at `pause`, wait until it says so,
+/// and SIGKILL it there.
+fn kill_sweep_at(tag: &str, stores: &Stores, pause: &str) {
+    use std::io::BufRead;
+    let mut child = Command::new(bin("leep-server"))
+        .args(["--meta", &stores.meta, "--blobs", &stores.blobs, "gc"])
+        .args(SWEEP)
+        .args(["--collect-only", "--batch", "4", "--rate", "0"])
+        .args(["--debug-pause-at", pause])
+        .env("RUST_LOG", "warn")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn gc --unreachable");
+    let err = child.stderr.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(err).lines().map_while(|l| l.ok()) {
+            if line.contains("leep-sweep: paused at") {
+                let _ = tx.send(line);
+            }
+        }
+    });
+    let line = rx.recv_timeout(Duration::from_secs(120));
+    let _ = child.kill();
+    let _ = child.wait();
+    let line = line.unwrap_or_else(|_| panic!("[{tag}] collect never reached {pause}"));
+    eprintln!("[{tag}] SIGKILLed gc --unreachable: {line}");
+}
+
+/// [`gc_ok`] once the gc lease a killed run left has lapsed.
+fn gc_after_lease(tag: &str, stores: &Stores, args: &[&str]) -> String {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let out = gc_output(stores, args);
+        if out.status.success() {
+            return stdout(&out);
+        }
+        let err = stderr(&out);
+        assert!(
+            err.contains("another garbage collection is running") && Instant::now() < deadline,
+            "[{tag}] gc {args:?} failed\n{}\n{err}",
+            stdout(&out)
+        );
+        std::thread::sleep(Duration::from_secs(5));
+    }
+}
+
+/// No changeset delete is left announced (`cs-doom-v1` *deleting*).
+fn assert_no_delete_announced(tag: &str, repo: &Repo) {
+    let rows = common_block_on(repo.meta().list_derived("cs-doom-v1", None, usize::MAX)).unwrap();
+    for (k, v) in rows {
+        assert_ne!(v.last(), Some(&0), "[{tag}] delete of {k} still announced");
+    }
+}
+
+fn run_sweep_crash(backend: &str, meta_url: Option<String>) {
+    let _g = serial();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let stores = match meta_url {
+        Some(url) => Stores::with_meta(&root.join("data"), url),
+        None => Stores::sqlite(&root.join("data")),
+    };
+    // Migrate, through a dry run that writes nothing else.
+    gc_ok(backend, &stores, &["--dry-run"]);
+    let repo = open_repo(&stores);
+    let base = plant_commit(&repo, None, "base.txt", "base\n");
+    common_block_on(repo.meta().cas_ref("main", None, Some(base))).unwrap();
+    // History with rebased lands, kept by the scan window.
+    for i in 0..6 {
+        let a = plant_commit(&repo, Some(base), &format!("l/{i}"), &format!("{i}\n"));
+        common_block_on(repo.land(a, "main")).unwrap();
+    }
+    for (round, pause) in ["doom:1", "batch:2", "tombstone"].into_iter().enumerate() {
+        let tag = format!("{backend}, sweep killed at {pause}");
+        let garbage = plant_garbage(&repo, round, 8);
+        gc_ok(&tag, &stores, &[SWEEP, &["--condemn-only"]].concat());
+        kill_sweep_at(&tag, &stores, pause);
+        verify_clean(&format!("{tag}, after SIGKILL"), &stores, &["--full"]);
+        let repo = open_repo(&stores);
+        common_block_on(async {
+            for name in repo.meta().list_refs().await.unwrap().keys() {
+                let head = repo.meta().get_ref(name).await.unwrap().unwrap();
+                repo.list_files(head, "").await.unwrap();
+            }
+        });
+        // A rerun finishes: everything planted is gone, nothing announced.
+        // The killed run's gc lease lapses first (60 s), as for a cron job
+        // after a crash.
+        let out = gc_after_lease(&tag, &stores, &[SWEEP, &["--collect-only"]].concat());
+        assert!(
+            out.contains("collect: fence flag cleared: true"),
+            "[{tag}] {out}"
+        );
+        verify_clean(&format!("{tag}, after the rerun"), &stores, &["--full"]);
+        assert_no_delete_announced(&tag, &repo);
+        for id in &garbage {
+            assert!(
+                common_block_on(repo.meta().get_changeset(id))
+                    .unwrap()
+                    .is_none(),
+                "[{tag}] {id} survived the rerun"
+            );
+        }
+    }
+    // Nothing reachable went.
+    let repo = open_repo(&stores);
+    let head = common_block_on(repo.meta().get_ref("main"))
+        .unwrap()
+        .unwrap();
+    for i in 0..6 {
+        common_block_on(repo.read_file(head, &RepoPath::new(format!("l/{i}")).unwrap()))
+            .unwrap()
+            .unwrap_or_else(|| panic!("[{backend}] l/{i} lost"));
+    }
+}
+
+#[test]
+fn killed_changeset_sweep_keeps_ancestry_sqlite() {
+    run_sweep_crash("sqlite", None);
+}
+
+#[test]
+fn killed_changeset_sweep_keeps_ancestry_postgres() {
+    let Some(db) = PgDb::create() else {
+        return;
+    };
+    run_sweep_crash("postgres", Some(db.url.clone()));
     drop(db);
 }

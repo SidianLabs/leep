@@ -39,7 +39,7 @@ pub(crate) const MAX_BATCH: usize = 64;
 /// sweep's fence must outlast (ADR 0059 section 3). A batch past it answers
 /// its lands with a retryable error; keyed ones are then answered from their
 /// record, so none lands twice.
-pub(crate) const MAX_BATCH_LIFETIME: Duration = Duration::from_secs(60);
+pub const MAX_BATCH_LIFETIME: Duration = Duration::from_secs(60);
 
 /// Bounds of the `Retry-After` of a land refused at a full queue, in
 /// seconds (ADR 0060, section 2). The bound is sized so the whole queue
@@ -784,6 +784,13 @@ impl Repo {
     /// condemned something (ADR 0059): rescue the land's changeset and its
     /// unlanded stack, which the move will make reachable. The fence state
     /// of `cs` is read before anything else of it.
+    ///
+    /// Two rescues, each of which may wait up to `DOOM_WAIT` (30 s) for a
+    /// delete in progress, so one attempt can wait 60 s, past
+    /// [`MAX_BATCH_LIFETIME`]. That is safe: the deadline is checked again
+    /// just before the swap, so a late attempt moves nothing and answers a
+    /// retryable error, and a keyed land is then answered from its record
+    /// when resent (ADR 0059 section 11).
     async fn rescue_land(&self, cs: ChangesetId, head: Option<ChangesetId>) -> Result<()> {
         self.rescue_condemned(&[cs], RescueBy::Land).await?;
         let stack = self.new_history(cs, head).await?;

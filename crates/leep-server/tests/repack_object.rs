@@ -43,6 +43,7 @@ fn opts() -> GcOptions {
         fence: Duration::from_secs(600),
         unsafe_no_fence: false,
         dry_run: false,
+        backup_fence: None,
     }
 }
 

@@ -1,6 +1,10 @@
 # 0012. Fenced two-phase blob garbage collection
 Status: Accepted; the mark of both phases is incremental, and collect reads
-condemnation rows in batches, since ADR 0033
+condemnation rows in batches, since ADR 0033. Amended 2026-10-22 (ADR 0059
+section 11): `gc` refuses, rather than warns about, a `--fence` the request
+and statement timeouts it is given do not cover, unless `--unsafe-fence`;
+and condemn and collect hold the store-wide `gc` lease, so "no two GC runs
+overlap" is enforced instead of assumed
 Date: 2026-10-15
 
 ## Context

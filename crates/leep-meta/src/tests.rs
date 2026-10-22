@@ -468,6 +468,75 @@ async fn overlapping_batches_do_not_deadlock() {
     }
 }
 
+/// `delete_changesets` deletes rows and changesets in one transaction: a
+/// store that refuses the changeset delete (a trigger here) keeps the rows
+/// too (ADR 0059).
+async fn check_delete_changesets_is_atomic(store: &dyn MetaStore) {
+    let cs = leep_core::Changeset {
+        parents: vec![],
+        author: "t".into(),
+        timestamp: 0,
+        message: "atomic delete".into(),
+        changes: Default::default(),
+        extra: Default::default(),
+    };
+    let id = store
+        .put_changeset_with_derived(
+            &cs,
+            &[leep_core::DerivedRow::new(
+                "del-atomic",
+                cs.id().0,
+                bytes::Bytes::from_static(b"v"),
+            )],
+        )
+        .await
+        .unwrap();
+    assert!(store
+        .delete_changesets(&[id], &["del-atomic"])
+        .await
+        .is_err());
+    assert!(store.get_changeset(&id).await.unwrap().is_some());
+    assert!(store
+        .get_derived("del-atomic", &id.0)
+        .await
+        .unwrap()
+        .is_some());
+}
+
+#[tokio::test]
+async fn sqlite_delete_changesets_is_atomic() {
+    let s = SqliteMetaStore::connect("sqlite::memory:").await.unwrap();
+    sqlx::query(
+        "CREATE TRIGGER keep BEFORE DELETE ON changesets \
+         BEGIN SELECT RAISE(ABORT, 'keep'); END",
+    )
+    .execute(&s.pool)
+    .await
+    .unwrap();
+    check_delete_changesets_is_atomic(&s).await;
+}
+
+#[tokio::test]
+async fn postgres_delete_changesets_is_atomic() {
+    let Some((s, _)) = pg_store("delatomic").await else {
+        return;
+    };
+    sqlx::query(
+        "CREATE FUNCTION keep() RETURNS trigger LANGUAGE plpgsql AS \
+         $$ BEGIN RAISE EXCEPTION 'keep'; END $$",
+    )
+    .execute(&s.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER keep BEFORE DELETE ON changesets FOR EACH ROW EXECUTE FUNCTION keep()",
+    )
+    .execute(&s.pool)
+    .await
+    .unwrap();
+    check_delete_changesets_is_atomic(&s).await;
+}
+
 #[tokio::test]
 async fn sqlite_batched_writes_are_atomic() {
     let s = SqliteMetaStore::connect("sqlite::memory:").await.unwrap();

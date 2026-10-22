@@ -105,6 +105,11 @@ pub struct Args {
     /// duration).
     #[arg(long, value_parser = dur)]
     pub gc_interval: Option<Duration>,
+    /// After every blob GC, also run the changeset sweep
+    /// (`gc --unreachable`, ADR 0059) with the soak's grace and fence, and
+    /// check nothing reachable went.
+    #[arg(long)]
+    pub sweep_changesets: bool,
     /// Interval between `derive-search main` warmups (0 disables).
     #[arg(long, value_parser = dur)]
     pub derive_interval: Option<Duration>,

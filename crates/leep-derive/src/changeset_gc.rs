@@ -14,8 +14,8 @@
 //!
 //! Requests read `gc-fence-active-v1` at most once every
 //! [`FENCE_FLAG_TTL`] and skip every per-changeset read while it is 0, so
-//! nothing costs anything until a sweep condemns. Nothing condemns yet: the
-//! sweep is phase 2 of the ADR.
+//! nothing costs anything until a sweep condemns. The sweep itself is in
+//! `changeset_sweep`.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
@@ -38,8 +38,10 @@ pub const CS_RESCUE: &str = "cs-rescue-v1";
 /// state byte: 0 deleting, 1 abandoned, 2 deleted), as `blob-doom-v1`.
 pub const CS_DOOM: &str = "cs-doom-v1";
 
-/// One row, under [`fence_flag_key`]: the time the current condemnation
-/// round began (unix seconds, big-endian), or 0 when nothing is condemned.
+/// One row, under [`fence_flag_key`]: unix seconds, big-endian. Nonzero
+/// while a condemnation round is open: when the first condemn of the round
+/// began, and from its end on when the latest condemn finished (collect
+/// waits a fence after that). 0 when nothing is condemned.
 pub const GC_FENCE_ACTIVE: &str = "gc-fence-active-v1";
 
 /// How long a request may act on a cached [`GC_FENCE_ACTIVE`]. The sweep's
@@ -88,14 +90,14 @@ pub(crate) struct FenceFlag {
 
 /// One changeset's fence rows, read condemnation first.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct CsFence {
-    condemned: Option<i64>,
-    rescued: Option<i64>,
-    doom: Option<(i64, Doom)>,
+pub(crate) struct CsFence {
+    pub(crate) condemned: Option<i64>,
+    pub(crate) rescued: Option<i64>,
+    pub(crate) doom: Option<(i64, Doom)>,
 }
 
 impl CsFence {
-    fn is_condemned(&self) -> bool {
+    pub(crate) fn is_condemned(&self) -> bool {
         match self.condemned {
             Some(c) => self.rescued.is_none_or(|r| c > r),
             None => false,
@@ -103,7 +105,7 @@ impl CsFence {
     }
 
     /// The handshake state of the current condemnation.
-    fn doom_state(&self) -> Option<Doom> {
+    pub(crate) fn doom_state(&self) -> Option<Doom> {
         match (self.condemned, self.doom) {
             (Some(c), Some((e, d))) if e == c => Some(d),
             _ => None,
@@ -139,6 +141,7 @@ impl Repo {
             .get_derived(GC_FENCE_ACTIVE, &fence_flag_key())
             .await?;
         let active = flag_active(v.as_deref());
+        metrics::gauge!("leep_gc_fence_active").set(f64::from(u8::from(active)));
         *self.fence_flag.read.lock().unwrap() = Some((started, active));
         Ok(active)
     }
@@ -190,6 +193,7 @@ impl Repo {
         // with every descendant, so a condemned changeset's live parents end
         // the walk.
         let mut order = Vec::new();
+        let mut parents_of: HashMap<ChangesetId, Vec<ChangesetId>> = HashMap::new();
         let mut gone = HashSet::new();
         while let Some(id) = stack.pop() {
             let parents = match self.meta().get_changeset(&id).await? {
@@ -202,7 +206,12 @@ impl Repo {
                 }
             };
             order.push(id);
-            let fresh: Vec<ChangesetId> = parents.into_iter().filter(|p| seen.insert(*p)).collect();
+            let fresh: Vec<ChangesetId> = parents
+                .iter()
+                .copied()
+                .filter(|p| seen.insert(*p))
+                .collect();
+            parents_of.insert(id, parents);
             if fresh.is_empty() {
                 continue;
             }
@@ -213,14 +222,15 @@ impl Repo {
                 fences.insert(*p, f);
             }
         }
-        // Ancestors first, so a writer that dies part way leaves the
-        // changeset it was asked about condemned, and the next writer walks
-        // again from it.
-        let rows: Vec<DerivedRow> = order
-            .iter()
-            .rev()
+        // Ancestors first, so that any prefix of the rows a failed write
+        // leaves (`put_derived_many` may store one) rescues only changesets
+        // whose condemned ancestors are rescued too. Collect then never
+        // finds a rescued changeset with a deleted parent; the next writer
+        // walks again from what is still condemned.
+        let rows: Vec<DerivedRow> = ancestors_first(&order, &parents_of)
+            .into_iter()
             .filter_map(|id| {
-                let c = fences.get(id)?.condemned?;
+                let c = fences.get(&id)?.condemned?;
                 Some(DerivedRow::new(CS_RESCUE, id.0, time_value(c)))
             })
             .collect();
@@ -248,6 +258,10 @@ impl Repo {
                 return Ok(());
             };
             if waited >= DOOM_WAIT {
+                // A delete announced and never finished (a collect killed
+                // between doom and delete) keeps answering this until the
+                // next collect: `LeepChangesetDoomStuck`.
+                metrics::counter!("leep_gc_changeset_doom_conflicts_total").increment(1);
                 return Err(Error::Conflict(format!(
                     "changeset {first} is being garbage collected; retry"
                 )));
@@ -260,7 +274,7 @@ impl Repo {
     /// The fence rows of `ids`, one per id, read from durable meta:
     /// condemnations in one batch, then the rescue and doom rows of the
     /// condemned ones.
-    async fn cs_fences(&self, ids: &[ChangesetId]) -> Result<Vec<CsFence>> {
+    pub(crate) async fn cs_fences(&self, ids: &[ChangesetId]) -> Result<Vec<CsFence>> {
         let keys: Vec<Hash> = ids.iter().map(|id| id.0).collect();
         let condemned = self.meta().get_derived_many(CS_CONDEMNED, &keys).await?;
         let mut out: Vec<CsFence> = Vec::with_capacity(ids.len());
@@ -292,6 +306,41 @@ impl Repo {
         }
         Ok(out)
     }
+}
+
+/// `ids` ordered so every changeset comes after those of its ancestors
+/// that are in `ids`: an iterative post-order over parent edges. A parent
+/// outside `ids` (live, or not read) imposes nothing.
+pub(crate) fn ancestors_first(
+    ids: &[ChangesetId],
+    parents_of: &HashMap<ChangesetId, Vec<ChangesetId>>,
+) -> Vec<ChangesetId> {
+    let members: HashSet<ChangesetId> = ids.iter().copied().collect();
+    let mut done: HashSet<ChangesetId> = HashSet::with_capacity(ids.len());
+    let mut out = Vec::with_capacity(ids.len());
+    for &start in ids {
+        if done.contains(&start) {
+            continue;
+        }
+        let mut stack = vec![(start, false)];
+        while let Some((id, expanded)) = stack.pop() {
+            if done.contains(&id) {
+                continue;
+            }
+            if expanded {
+                done.insert(id);
+                out.push(id);
+                continue;
+            }
+            stack.push((id, true));
+            for p in parents_of.get(&id).into_iter().flatten() {
+                if members.contains(p) && !done.contains(p) {
+                    stack.push((*p, false));
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Test support: condemn `ids` at `at` and raise the flag, as a sweep's
@@ -417,6 +466,55 @@ mod tests {
         // A later condemnation makes the old rescue stale.
         condemn_for_test(&r, &[a], 200).await;
         assert!(is_condemned_for_test(&r, a).await);
+    }
+
+    /// A rescue of two condemned siblings and their condemned ancestry,
+    /// cut short after every possible prefix of its rows (the trait lets
+    /// `put_derived_many` store any prefix, and the fault wrapper writes
+    /// row by row): no prefix rescues a changeset whose condemned parent it
+    /// leaves condemned. Reverse discovery order wrote a sibling before the
+    /// parent they share.
+    #[tokio::test(start_paused = true)]
+    async fn rescue_rows_are_written_ancestors_first() {
+        use leep_testkit::{Fault, FaultPlan, FaultyMetaStore, Op};
+        for cut in 1..=5u64 {
+            let inner = std::sync::Arc::new(leep_core::memory::MemoryMetaStore::new());
+            let blobs = std::sync::Arc::new(leep_core::memory::MemoryBlobStore::new());
+            let clean = Repo::new(blobs.clone(), inner.clone());
+            let g = commit(&clean, &[], &[("f", Some("g"))], "g").await;
+            let p = commit(&clean, &[g], &[("f", Some("p"))], "p").await;
+            let c1 = commit(&clean, &[p], &[("f", Some("c1"))], "c1").await;
+            let c2 = commit(&clean, &[p], &[("f", Some("c2"))], "c2").await;
+            condemn_for_test(&clean, &[g, p, c1, c2], 100).await;
+            let plan = FaultPlan::new(cut);
+            plan.script(Op::PutDerived, cut, Fault::Fail);
+            let faulty = Repo::new(
+                blobs,
+                std::sync::Arc::new(FaultyMetaStore::new(inner, plan)),
+            );
+            let res = faulty.rescue_condemned(&[c1, c2], RescueBy::Create).await;
+            assert_eq!(res.is_ok(), cut == 5, "cut {cut}: {res:?}");
+            let parent = HashMap::from([(c1, p), (c2, p), (p, g)]);
+            for (child, par) in parent {
+                if !is_condemned_for_test(&clean, child).await {
+                    assert!(
+                        !is_condemned_for_test(&clean, par).await,
+                        "cut {cut}: {child} rescued but its parent {par} still condemned"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ancestors_first_orders_by_parent_edges() {
+        let id = |n: u8| ChangesetId(Hash([n; 32]));
+        let (g, p, c1, c2, x) = (id(1), id(2), id(3), id(4), id(5));
+        let parents = HashMap::from([(p, vec![g]), (c1, vec![p]), (c2, vec![p, x]), (g, vec![])]);
+        let out = ancestors_first(&[c1, c2, p, g], &parents);
+        let pos = |i| out.iter().position(|o| *o == i).unwrap();
+        assert_eq!(out.len(), 4);
+        assert!(pos(g) < pos(p) && pos(p) < pos(c1) && pos(p) < pos(c2));
     }
 
     #[tokio::test(start_paused = true)]

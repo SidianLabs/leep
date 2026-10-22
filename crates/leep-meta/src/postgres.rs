@@ -1204,6 +1204,46 @@ impl MetaStore for PostgresMetaStore {
         Ok(())
     }
 
+    /// One transaction of two statements, whatever the number of ids.
+    async fn delete_changesets(&self, ids: &[ChangesetId], kinds: &[&str]) -> Result<u64> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let keys: Vec<&[u8]> = unique(ids.iter().map(|i| i.0.as_bytes().as_slice()));
+        let mut tx = self.pool.begin().await.map_err(storage)?;
+        if !kinds.is_empty() {
+            sqlx::query("DELETE FROM derived WHERE kind = ANY($1) AND key = ANY($2)")
+                .bind(kinds)
+                .bind(&keys)
+                .execute(&mut *tx)
+                .await
+                .map_err(storage)?;
+        }
+        let n = sqlx::query("DELETE FROM changesets WHERE id = ANY($1)")
+            .bind(&keys)
+            .execute(&mut *tx)
+            .await
+            .map_err(storage)?
+            .rows_affected();
+        tx.commit().await.map_err(storage)?;
+        Ok(n)
+    }
+
+    async fn delete_derived_keys(&self, kinds: &[&str], keys: &[Hash]) -> Result<u64> {
+        if keys.is_empty() || kinds.is_empty() {
+            return Ok(0);
+        }
+        let keys: Vec<&[u8]> = unique(keys.iter().map(|k| k.as_bytes().as_slice()));
+        let n = sqlx::query("DELETE FROM derived WHERE kind = ANY($1) AND key = ANY($2)")
+            .bind(kinds)
+            .bind(&keys)
+            .execute(&self.pool)
+            .await
+            .map_err(storage)?
+            .rows_affected();
+        Ok(n)
+    }
+
     /// One `INSERT ... SELECT FROM UNNEST` statement, so the batch is atomic.
     /// Rows go in `(kind, key)` order: every batched write then locks rows in
     /// one global order, so two batches sharing keys (claims for the same

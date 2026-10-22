@@ -372,6 +372,12 @@ pub fn write(i: Inputs) -> Result<bool> {
             "server_cpu_cores_mean": cpu_mean,
             "harness_rss_mib": { "first": first(|s| Some(s.harness_rss_mib)), "last": last(|s| Some(s.harness_rss_mib)) },
             "db_mib": { "first": first(|s| s.db_mib), "last": last(|s| s.db_mib) },
+            // Growth of pg_database_size per acknowledged land: compare runs
+            // with and without --sweep-changesets (ADR 0059).
+            "db_bytes_per_land": match (first(|s| s.db_mib), last(|s| s.db_mib)) {
+                (Some(a), Some(b)) if acks > 0 => Some(round2((b - a) * 1048576.0 / acks as f64)),
+                _ => None,
+            },
             "blob_mib": { "first": first(|s| s.blob_mib), "last": last(|s| s.blob_mib) },
             "postgres_tables_bytes": tr.pg.as_ref().map(|p| &p.tables),
             "postgres_connections": tr.pg.as_ref().map(|p| p.connections),
@@ -455,8 +461,9 @@ pub fn write(i: Inputs) -> Result<bool> {
         f(&report["resources"]["harness_rss_mib"]["last"]),
     ));
     s.push_str(&format!(
-        "gc  {} runs, {} blobs condemned, {} deleted, all verified: {}; derive-search {} runs; restarts {} ({} SIGTERM, {} SIGKILL)\n",
-        gc_runs.len(), c("gc_blobs_condemned"), c("gc_blobs_deleted"),
+        "gc  {} runs, {} blobs condemned, {} deleted, {} changesets deleted, db bytes per land {}, all verified: {}; derive-search {} runs; restarts {} ({} SIGTERM, {} SIGKILL)\n",
+        gc_runs.len(), c("gc_blobs_condemned"), c("gc_blobs_deleted"), c("gc_changesets_deleted"),
+        f(&report["resources"]["db_bytes_per_land"]),
         gc_runs.iter().all(|g| g.verified != Some(false)), derive_runs.len(), restarts, c("restarts_sigterm"), c("restarts_sigkill"),
     ));
     s.push_str(&format!("invariant checks  {:?}\n", i.checker_counts));

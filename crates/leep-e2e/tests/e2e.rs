@@ -702,6 +702,59 @@ fn plant_orphan(blobs_dir: &Path, data: &[u8]) -> PathBuf {
     path
 }
 
+/// ADR 0059 review items 4 and 5: the backup fence applies to every blob
+/// GC, not only `--full`, and a fence longer than the tombstones are kept
+/// is refused (it could not be honoured), naming the retention.
+#[test]
+fn gc_backup_fence_works_without_full_and_must_fit_tombstone_retention() {
+    let _g = serial();
+    let tmp = tempfile::tempdir().unwrap();
+    let stores = Stores::sqlite(&tmp.path().join("data"));
+    // Accepted without --full.
+    server_gc(&stores, &["--dry-run", "--backup-fence", "6h"]);
+    server_gc(
+        &stores,
+        &[
+            "--grace",
+            "0",
+            "--fence",
+            "0s",
+            "--unsafe-no-fence",
+            "--backup-fence",
+            "6h",
+        ],
+    );
+    // Longer than the default 7d retention: refused, naming it.
+    for args in [
+        &["--backup-fence", "8d", "--full"][..],
+        &["--backup-fence", "8d"][..],
+        &["--backup-fence", "2d", "--tombstone-retention", "1d"][..],
+    ] {
+        let out = server_cmd(
+            &stores,
+            &[&["gc", "--fence", "0s", "--unsafe-no-fence"][..], args].concat(),
+        );
+        assert!(!out.status.success(), "{args:?} accepted");
+        assert!(
+            stderr(&out).contains("--tombstone-retention"),
+            "{args:?}: {}",
+            stderr(&out)
+        );
+    }
+    server_gc(
+        &stores,
+        &[
+            "--fence",
+            "0s",
+            "--unsafe-no-fence",
+            "--backup-fence",
+            "8d",
+            "--tombstone-retention",
+            "9d",
+        ],
+    );
+}
+
 #[test]
 fn fenced_gc_removes_orphans_and_keeps_live_data() {
     let _g = serial();
@@ -750,7 +803,11 @@ fn fenced_gc_removes_orphans_and_keeps_live_data() {
         .unwrap();
     assert!(!refused.status.success());
     assert!(orphan_c.exists());
-    let both = server_gc(&stores, &["--grace", "0", "--fence", "1s"]);
+    // A 1 s fence is shorter than any server's bounds: tests only.
+    let both = server_gc(
+        &stores,
+        &["--grace", "0", "--fence", "1s", "--unsafe-fence"],
+    );
     assert!(both.contains("deleted: 1 blobs"), "{both}");
     assert!(!orphan_c.exists());
 

@@ -339,6 +339,55 @@ pub fn gc_durations(timeout: Duration) -> (Duration, Duration) {
     (grace, fence)
 }
 
+/// One changeset sweep (condemn, fence, collect) beside the swarm, with the
+/// soak's scaled-down grace and fence. Returns the changesets it deleted.
+async fn sweep_changesets(
+    bin_dir: &std::path::Path,
+    stores: &Stores,
+    grace: Duration,
+    fence: Duration,
+    log: &std::path::Path,
+    at: f64,
+) -> Result<u64, String> {
+    let out = Command::new(bin_dir.join("leep-server"))
+        .args(["gc", "--meta", &stores.meta, "--blobs", &stores.blobs])
+        .args(["--unreachable", "--rate", "0", "--index-fence", "1s"])
+        .args(["--changeset-grace", &format!("{}s", grace.as_secs())])
+        .args(["--fence", &format!("{}s", fence.as_secs())])
+        .arg("--unsafe-fence")
+        .env("RUST_LOG", "warn")
+        .stdin(Stdio::null())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .map_err(|e| format!("could not run gc --unreachable: {e}"))?;
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log)
+        .and_then(|mut f| {
+            use std::io::Write;
+            writeln!(
+                f,
+                "--- gc --unreachable at {at:.0}s (exit {})\n{text}{}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            )
+        });
+    if !out.status.success() {
+        return Err(format!(
+            "gc --unreachable failed ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+                .chars()
+                .take(400)
+                .collect::<String>()
+        ));
+    }
+    Ok(parse_gc_output(&text).get("deleted").copied().unwrap_or(0))
+}
+
 pub async fn gc_loop(
     bin_dir: PathBuf,
     stores: Stores,
@@ -361,6 +410,8 @@ pub async fn gc_loop(
             .args(["gc", "--meta", &stores.meta, "--blobs", &stores.blobs])
             .args(["--grace", &format!("{}s", grace.as_secs())])
             .args(["--fence", &format!("{}s", fence.as_secs())])
+            // The soak's fence is scaled down with its servers' timeouts.
+            .arg("--unsafe-fence")
             .env("RUST_LOG", "warn")
             .stdin(Stdio::null())
             .kill_on_drop(true)
@@ -408,7 +459,23 @@ pub async fn gc_loop(
             );
             return;
         }
-        let numbers = parse_gc_output(&text);
+        let mut numbers = parse_gc_output(&text);
+        if sh.args.sweep_changesets {
+            match sweep_changesets(&bin_dir, &stores, grace, fence, &log, at).await {
+                Ok(n) => {
+                    sh.stats.add("gc_changesets_deleted", n);
+                    numbers.insert("changesets deleted".into(), n);
+                }
+                Err(e) if sh.in_chaos(sh.now_secs()) => {
+                    let _ = e;
+                    sh.stats.inc("gc_failed_during_restart");
+                }
+                Err(e) => {
+                    sh.violate("gc", e);
+                    return;
+                }
+            }
+        }
         sh.stats.inc("gc_runs");
         sh.stats.add(
             "gc_blobs_deleted",

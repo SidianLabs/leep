@@ -17,6 +17,7 @@ use tracing_subscriber::EnvFilter;
 mod backup_cli;
 mod repack_cli;
 mod repair;
+mod sweep_cli;
 mod upgrade_cli;
 
 #[derive(Parser)]
@@ -336,7 +337,8 @@ enum Cmd {
     },
     /// Delete blobs no changeset references (uses --meta and --blobs; safe
     /// beside running servers). Without a phase: condemn, wait --fence, then
-    /// collect.
+    /// collect. With --unreachable: delete changesets nothing reaches
+    /// instead (ADR 0059), or with --dry-run count them.
     Gc {
         #[command(subcommand)]
         phase: Option<GcPhase>,
@@ -348,27 +350,89 @@ enum Cmd {
         /// upload to commit.
         #[arg(long, global = true, default_value = "24h", value_parser = parse_grace)]
         grace: std::time::Duration,
-        /// Delete only blobs condemned at least this long ago. Must exceed the
-        /// servers' --request-timeout plus their --meta-statement-timeout
-        /// (Postgres) plus clock skew; give `gc` the servers' values of those
-        /// flags (or their LEEP_ variables) and it warns when it does not.
+        /// Delete only what was condemned at least this long ago. Must exceed
+        /// the servers' --request-timeout plus their --meta-statement-timeout
+        /// (Postgres) plus clock skew, and for --unreachable also a land
+        /// batch's 60 s and the index fence; give `gc` the servers' values of
+        /// those flags (or their LEEP_ variables). It refuses a fence that
+        /// does not, unless --unsafe-fence.
         #[arg(long, global = true, default_value = "15m", value_parser = parse_grace)]
         fence: std::time::Duration,
         /// Allow --fence 0. Only safe while no server is running.
         #[arg(long, global = true)]
         unsafe_no_fence: bool,
+        /// Run with a --fence shorter than the servers' bounds require. Only
+        /// safe while no server runs with those bounds (tests, a stopped
+        /// fleet).
+        #[arg(long, global = true)]
+        unsafe_fence: bool,
         /// Walk all of history and every tree instead of only what earlier
-        /// runs did not mark (ADR 0033), and rewrite their record.
+        /// runs did not mark (ADR 0033), and rewrite their record. Needs
+        /// --backups or --backup-fence (ADR 0059 section 6).
         #[arg(long, global = true)]
         full: bool,
-        /// With --dry-run only: count the changesets ADR 0059 would delete
-        /// (unreachable from refs, the ref log, scan windows, attestations
-        /// and mirror maps, and older than --grace), their rows and tree
-        /// nodes, beside the store's write-path and index bytes per land.
-        /// Strictly read-only: Postgres sessions are read-only and SQLite
-        /// opens with mode=ro.
-        #[arg(long, requires = "dry_run", conflicts_with = "full")]
+        /// Keep the trees of changesets the changeset sweep deleted within
+        /// this long, for backups still copying them (required with --full;
+        /// at most --tombstone-retention).
+        #[arg(long, global = true, value_parser = parse_grace)]
+        backup_fence: Option<std::time::Duration>,
+        /// Derive --backup-fence from the sealed backups in this directory:
+        /// three times the longest of the last 30 days, at least an hour.
+        #[arg(long, global = true, conflicts_with = "backup_fence")]
+        backups: Option<std::path::PathBuf>,
+        /// Garbage-collect changesets nothing reaches (ADR 0059): refs, every
+        /// ref log entry, the landed-copy scan window of every head,
+        /// attestations, mirror maps and --changeset-grace. With --dry-run,
+        /// count what it would delete, strictly read-only (Postgres sessions
+        /// are read-only, SQLite opens with mode=ro), with --grace as the
+        /// grace. Without it: condemn, wait --fence, collect.
+        #[arg(long, conflicts_with = "full")]
         unreachable: bool,
+        /// With --unreachable: only condemn (a cron job).
+        #[arg(long, requires = "unreachable", conflicts_with_all = ["collect_only", "dry_run"])]
+        condemn_only: bool,
+        /// With --unreachable: only collect what was condemned a --fence ago
+        /// (a cron job).
+        #[arg(long, requires = "unreachable", conflicts_with = "dry_run")]
+        collect_only: bool,
+        /// With --unreachable: changesets stored less than this long ago are
+        /// kept, with their ancestry.
+        #[arg(long, default_value = "7d", value_parser = parse_grace, requires = "unreachable")]
+        changeset_grace: std::time::Duration,
+        /// With --unreachable: changesets per delete transaction.
+        #[arg(long, default_value_t = 500, requires = "unreachable")]
+        batch: usize,
+        /// With --unreachable: changesets deleted per second at most (0: no
+        /// limit).
+        #[arg(long, default_value_t = 500, requires = "unreachable")]
+        rate: u64,
+        /// With --unreachable: changesets one collect deletes at most; the
+        /// rest wait for the next run.
+        #[arg(long, default_value_t = 100_000, requires = "unreachable")]
+        max_delete: u64,
+        /// With --unreachable: how long the tombstone pass waits for index
+        /// writes in flight (ADR 0058).
+        #[arg(long, default_value = "60s", value_parser = parse_grace, requires = "unreachable")]
+        index_fence: std::time::Duration,
+        /// How long the sweep keeps tombstones of deleted changesets (with
+        /// --unreachable), and the longest --backup-fence any gc accepts:
+        /// past it, the root trees a backup needs are no longer known.
+        #[arg(long, default_value = "7d", value_parser = parse_grace)]
+        tombstone_retention: std::time::Duration,
+        /// With --unreachable: walk reachability from every root instead of
+        /// trusting `cs-reach-v1` rows, and write them again (ADR 0059
+        /// section 4). Slower; for a store whose rows are in doubt.
+        #[arg(long, requires = "unreachable")]
+        reach_full: bool,
+        /// With --unreachable: write the run's numbers to this Prometheus
+        /// textfile (atomically).
+        #[arg(long, requires = "unreachable")]
+        metrics_file: Option<std::path::PathBuf>,
+        /// Crash-test hook: stop a collect for good at `doom`, `batch` or
+        /// `tombstone`, the Nth time it gets there (`batch:2`), and say so on
+        /// stderr.
+        #[arg(long, hide = true, requires = "unreachable", value_parser = parse_pause)]
+        debug_pause_at: Option<(leep_derive::changeset_sweep::PausePoint, u32)>,
         /// With --unreachable: ref log retention to compare against keeping
         /// it forever (sizes the follow-up ADR on ref log retention).
         #[arg(long, default_value = "30d", value_parser = parse_grace, requires = "unreachable")]
@@ -509,50 +573,11 @@ async fn open_meta_bounded(
 /// statement failing first.
 const STATEMENT_TIMEOUT_MARGIN: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Clock skew between servers and the GC host that the fence check allows for.
-const FENCE_SKEW_ALLOWANCE: std::time::Duration = std::time::Duration::from_secs(60);
-
-/// Why `fence` does not cover the latest a request's write can commit after
-/// the request read a blob's GC state (ADR 0012: `fence > request timeout +
-/// statement timeout + skew`, the statement term on Postgres only), or
-/// `None` when it does.
-fn fence_shortfall(
-    fence: std::time::Duration,
-    request_timeout: std::time::Duration,
-    statement_timeout: Option<std::time::Duration>,
-    postgres: bool,
-) -> Option<String> {
-    if request_timeout.is_zero() {
-        return Some(
-            "--request-timeout is 0 (off): a request can write at any time after it read a \
-             blob's state, so no --fence is safe; give gc the servers' --request-timeout"
-                .into(),
-        );
-    }
-    let statement = match (postgres, statement_timeout) {
-        (false, _) => std::time::Duration::ZERO,
-        (true, Some(t)) => t,
-        (true, None) => {
-            return Some(
-                "--meta-statement-timeout is 0 (off): a statement of a timed-out request can \
-                 commit at any time later, so no --fence is safe"
-                    .into(),
-            )
-        }
-    };
-    let needed = request_timeout + statement + FENCE_SKEW_ALLOWANCE;
-    (fence <= needed).then(|| {
-        format!(
-            "--fence {}s does not exceed --request-timeout {}s + --meta-statement-timeout {}s + \
-             {}s of clock skew = {}s: a request's write can commit after the fence (ADR 0012); \
-             raise --fence",
-            fence.as_secs(),
-            request_timeout.as_secs(),
-            statement.as_secs(),
-            FENCE_SKEW_ALLOWANCE.as_secs(),
-            needed.as_secs()
-        )
-    })
+/// `doom`, `batch:2`: a point of `--debug-pause-at`, and how many times to
+/// pass it first.
+fn parse_pause(s: &str) -> Result<(leep_derive::changeset_sweep::PausePoint, u32), String> {
+    let (p, n) = s.split_once(':').unwrap_or((s, "0"));
+    Ok((p.parse()?, n.parse().map_err(|e| format!("{n:?}: {e}"))?))
 }
 
 /// The `--meta-statement-timeout` in force: the flag, or the request
@@ -954,6 +979,10 @@ async fn run_unreachable_report(
         per(r.land_write.bytes())
     );
     println!(
+        "  of which their ref log entries: {}",
+        per(r.land_write.log_bytes)
+    );
+    println!(
         "  index rows (all non-write-path derived rows in the store / lands; \
          includes any imported history's): {}",
         index_bytes.map_or("-".to_string(), per)
@@ -968,6 +997,22 @@ async fn run_unreachable_report(
         per(r.ref_log_prunable_bytes)
     );
     println!("  (changesets count by their canonical encoding; stored rows may be compressed)");
+    if let Some(l) = &r.live_trees {
+        let t = &r.log_kept.reclaimable;
+        println!(
+            "  blob store, live tree nodes and contents (all of them / lands; \
+             includes any imported history's): {} nodes {}, contents {}",
+            l.tree_nodes,
+            per(l.tree_node_bytes),
+            per(l.content_bytes)
+        );
+        println!(
+            "  blob store, reclaimable as designed by gc --full after the sweep (exact): \
+             tree nodes {}, contents {}",
+            per(t.tree_node_bytes),
+            per(t.content_bytes)
+        );
+    }
     println!(
         "reclaimable without a root_tree row (trees not counted): {}",
         r.without_root_tree
@@ -1203,6 +1248,67 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Cmd::Gc {
             phase,
+            dry_run: false,
+            fence,
+            unsafe_no_fence,
+            unsafe_fence,
+            unreachable: true,
+            condemn_only,
+            collect_only,
+            changeset_grace,
+            batch,
+            rate,
+            max_delete,
+            index_fence,
+            tombstone_retention,
+            metrics_file,
+            debug_pause_at,
+            reach_full,
+            ..
+        }) => {
+            if phase.is_some() {
+                anyhow::bail!("--unreachable takes no phase; use --condemn-only or --collect-only");
+            }
+            let bounds = sweep_cli::ServerBounds {
+                request_timeout: args.request_timeout,
+                statement_timeout: statement_timeout(
+                    args.meta_statement_timeout,
+                    args.request_timeout,
+                ),
+                postgres: args.meta.starts_with("postgres"),
+            };
+            if !(unsafe_fence || unsafe_no_fence || fence.is_zero()) {
+                if let Some(why) = sweep_cli::changeset_fence_shortfall(fence, &bounds, index_fence)
+                {
+                    anyhow::bail!(
+                        "{why}, or pass --unsafe-fence if no server runs with these bounds"
+                    );
+                }
+            }
+            let blobs = leep_store::open_blob_store(&args.blobs).context("opening blob store")?;
+            let meta = open_meta(&args.meta).await.context("opening meta store")?;
+            let repo = new_repo(blobs, meta);
+            let opts = leep_derive::changeset_sweep::SweepOptions {
+                grace: changeset_grace,
+                fence,
+                unsafe_no_fence,
+                batch,
+                rate,
+                max_delete,
+                index_fence,
+                tombstone_retention,
+                full: reach_full,
+                pause_at: debug_pause_at,
+            };
+            let phase = match (condemn_only, collect_only) {
+                (true, _) => sweep_cli::SweepPhase::Condemn,
+                (_, true) => sweep_cli::SweepPhase::Collect,
+                _ => sweep_cli::SweepPhase::Both,
+            };
+            return sweep_cli::run_sweep(&repo, phase, &opts, metrics_file.as_deref()).await;
+        }
+        Some(Cmd::Gc {
+            phase,
             grace,
             unreachable: true,
             ref_log_retention,
@@ -1232,7 +1338,11 @@ async fn main() -> anyhow::Result<()> {
             grace,
             fence,
             unsafe_no_fence,
+            unsafe_fence,
             full,
+            backup_fence,
+            backups,
+            tombstone_retention,
             ..
         }) => {
             let mark = if full {
@@ -1240,16 +1350,45 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 leep_derive::gc::Mark::Incremental
             };
-            if !unsafe_no_fence {
-                let bound = statement_timeout(args.meta_statement_timeout, args.request_timeout);
-                if let Some(why) = fence_shortfall(
-                    fence,
-                    args.request_timeout,
-                    bound,
-                    args.meta.starts_with("postgres"),
-                ) {
-                    tracing::warn!("{why}");
+            // A zero fence is refused below unless --unsafe-no-fence.
+            if !unsafe_no_fence && !fence.is_zero() {
+                let bounds = sweep_cli::ServerBounds {
+                    request_timeout: args.request_timeout,
+                    statement_timeout: statement_timeout(
+                        args.meta_statement_timeout,
+                        args.request_timeout,
+                    ),
+                    postgres: args.meta.starts_with("postgres"),
+                };
+                if let Some(why) = sweep_cli::blob_fence_shortfall(fence, &bounds) {
+                    if dry_run || unsafe_fence {
+                        tracing::warn!("{why}");
+                    } else {
+                        anyhow::bail!(
+                            "{why}, or pass --unsafe-fence if no server runs with these bounds"
+                        );
+                    }
                 }
+            }
+            let backup_fence = match (full, backup_fence, backups) {
+                (_, Some(f), _) => Some(f),
+                (_, None, Some(dir)) => {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_secs() as i64);
+                    let f = sweep_cli::backup_fence_from(&dir, now)?;
+                    tracing::info!(backup_fence = ?f, "backup fence from sealed backups");
+                    Some(f)
+                }
+                (false, None, None) => None,
+                (true, None, None) if dry_run => None,
+                (true, None, None) => anyhow::bail!(
+                    "gc --full frees the trees of deleted changesets, which a backup in flight \
+                     may still need: pass --backups DIR or --backup-fence (ADR 0059 section 6)"
+                ),
+            };
+            if let Some(f) = backup_fence {
+                sweep_cli::check_backup_fence(f, tombstone_retention)?;
             }
             return run_gc(
                 &args.meta,
@@ -1260,6 +1399,7 @@ async fn main() -> anyhow::Result<()> {
                     fence,
                     unsafe_no_fence,
                     dry_run,
+                    backup_fence,
                 },
                 mark,
             )
@@ -1869,25 +2009,5 @@ mod tests {
         );
         assert_eq!(statement_timeout(Some(Duration::ZERO), 5 * m), None);
         assert_eq!(statement_timeout(Some(m), Duration::ZERO), Some(m));
-    }
-
-    #[test]
-    fn gc_warns_when_the_fence_does_not_cover_requests_and_statements() {
-        let m = Duration::from_secs(60);
-        let st = statement_timeout(None, 5 * m);
-        // The defaults hold: 15m > 5m + 5m 5s + 1m.
-        assert_eq!(fence_shortfall(15 * m, 5 * m, st, true), None);
-        // The old 10m default does not, on Postgres.
-        let e = fence_shortfall(10 * m, 5 * m, st, true).unwrap();
-        assert!(e.contains("raise --fence") && e.contains("665s"), "{e}");
-        // Without Postgres there is no statement term.
-        assert_eq!(fence_shortfall(10 * m, 5 * m, st, false), None);
-        // A short statement bound fixes it too.
-        assert_eq!(
-            fence_shortfall(10 * m, 5 * m, Some(Duration::from_secs(30)), true),
-            None
-        );
-        assert!(fence_shortfall(15 * m, Duration::ZERO, None, true).is_some());
-        assert!(fence_shortfall(15 * m, 5 * m, None, true).is_some());
     }
 }

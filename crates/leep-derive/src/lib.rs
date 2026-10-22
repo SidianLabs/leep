@@ -13,11 +13,13 @@ mod batched_reads;
 mod blame;
 pub mod changeset_gc;
 pub mod changeset_reach;
+pub mod changeset_sweep;
 mod comments;
 mod cursor;
 pub mod derived;
 mod filter_log;
 pub mod gc;
+pub mod gc_lease;
 pub mod gc_unreachable;
 mod history;
 pub mod indexing;
@@ -65,6 +67,7 @@ mod tests;
 pub use comments::strip_comments;
 pub use cursor::MAX_CURSOR_CHARS;
 pub use history::{ExtraMatch, LogFilter, LogPage, LogParams};
+pub use land::MAX_BATCH_LIFETIME;
 pub use repo::{
     default_derive_jobs, PrefixMatch, Repo, DEFAULT_CACHE_BYTES, MAX_DEFAULT_DERIVE_JOBS,
     MAX_PREFIX_CANDIDATES,

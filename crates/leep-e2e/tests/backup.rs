@@ -182,7 +182,7 @@ impl Load {
                 while !stop.load(Ordering::Relaxed) {
                     let out = Command::new(bin("leep-server"))
                         .args(["--meta", &meta, "--blobs", &blobs])
-                        .args(["gc", "--grace", GRACE, "--fence", FENCE])
+                        .args(["gc", "--grace", GRACE, "--fence", FENCE, "--unsafe-fence"])
                         .env("RUST_LOG", "warn")
                         .output()
                         .expect("spawn gc");

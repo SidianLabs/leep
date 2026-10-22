@@ -34,6 +34,8 @@ fn soak_smoke() {
         "2s",
         "--gc-interval",
         "2s",
+        // And the changeset sweep after each blob GC (ADR 0059).
+        "--sweep-changesets",
         "--derive-interval",
         "4s",
         // Backups beside the swarm, and the final backup, restore and verify.

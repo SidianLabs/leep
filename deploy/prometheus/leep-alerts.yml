@@ -368,6 +368,43 @@ groups:
     annotations:
       summary: "leep-server gc has not succeeded in 3 days: unreferenced blobs are piling up."
       runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepgcstale
+  - alert: LeepUnreachableGcStale
+    # Only once the changeset sweep has run: it is off by default.
+    expr: time() - leep_gc_unreachable_last_success_timestamp_seconds > 3 * 86400
+    for: 1h
+    labels: {severity: ticket}
+    annotations:
+      summary: "The changeset sweep (gc --unreachable) has not succeeded in 3 days: unreachable changesets pile up and the fence flag may stay up."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepunreachablegcstale
+  - alert: LeepChangesetRescueBurst
+    expr: sum(rate(leep_gc_changesets_rescued_total[15m])) > 1
+    for: 15m
+    labels: {severity: ticket}
+    annotations:
+      summary: "Writers keep rescuing changesets the sweep condemned: agents build on work older than --changeset-grace."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepchangesetrescueburst
+  - alert: LeepChangesetDoomStuck
+    expr: |
+      sum(increase(leep_gc_changeset_doom_conflicts_total[10m])) > 0
+      or
+      sum(leep_gc_changeset_doom_conflicts_total unless leep_gc_changeset_doom_conflicts_total offset 10m) > 0
+    labels: {severity: ticket}
+    annotations:
+      summary: "Writers get 409 on a changeset delete that was announced and never finished: a changeset collect was killed mid-batch."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepchangesetdoomstuck
+  - alert: LeepGcFenceFlagStuck
+    expr: max(leep_gc_fence_active) == 1
+    for: 24h
+    labels: {severity: ticket}
+    annotations:
+      summary: "The changeset fence flag has been up for a day: collect is not running or cannot finish, and writers pay fence reads."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepgcfenceflagstuck
+  - alert: LeepChangesetCollectSlow
+    expr: max(leep_gc_changeset_collect_batch_seconds_max) > 5
+    labels: {severity: ticket}
+    annotations:
+      summary: "A changeset collect batch took over 5 s from announcing its deletes to settling them; writers naming those changesets wait meanwhile."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepchangesetcollectslow
 - name: leep-host
   # node_exporter metrics, not Leep's. Set the mountpoints to the filesystems
   # that hold the blob directory, the SQLite file or Postgres data, and the backups.

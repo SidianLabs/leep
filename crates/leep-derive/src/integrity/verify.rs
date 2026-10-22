@@ -226,6 +226,27 @@ fn id_prefix(h: &Hash) -> u64 {
     u64::from_be_bytes(h.0[..8].try_into().expect("8 bytes"))
 }
 
+/// `ids` read in one batch, or one by one when the batch fails: `Some(cs)`
+/// for each readable or absent one, `None` for one whose row is damaged
+/// (the history walk reports it), so one bad row does not end the run.
+async fn readable_changesets(
+    meta: &dyn MetaStore,
+    ids: &[ChangesetId],
+) -> Result<Vec<Option<Option<Changeset>>>> {
+    if let Ok(found) = meta.get_changesets(ids).await {
+        return Ok(found.into_iter().map(Some).collect());
+    }
+    let mut out = Vec::with_capacity(ids.len());
+    for id in ids {
+        out.push(match meta.get_changeset(id).await {
+            Ok(cs) => Some(cs),
+            Err(Error::Storage(_) | Error::Encoding(_)) => None,
+            Err(e) => return Err(e),
+        });
+    }
+    Ok(out)
+}
+
 /// Check a store. `Err` means the run could not be completed (a store was
 /// unreachable, a named ref does not exist); damage is in the report.
 pub async fn verify(
@@ -409,6 +430,8 @@ impl Verifier<'_> {
         }
         self.flush_blobs().await?;
         drop(walk);
+        self.phase("stored parents");
+        self.check_stored_parents().await?;
         self.visited_trees = HashSet::new();
         self.visited_blobs = HashSet::new();
 
@@ -1108,6 +1131,53 @@ impl Verifier<'_> {
         Ok(())
     }
 
+    /// Every stored changeset's parents are stored: the changeset sweep
+    /// (ADR 0059) deletes children before parents, so a stored changeset
+    /// naming a deleted one is damage, whether or not a ref reaches it.
+    /// Every changeset under `--full`, the sampled ones otherwise.
+    async fn check_stored_parents(&mut self) -> Result<()> {
+        let meta = self.repo.meta().clone();
+        let mut after = None;
+        loop {
+            let page = meta.list_changesets(after, PAGE).await?;
+            let Some(last) = page.last().copied() else {
+                return Ok(());
+            };
+            after = Some(last);
+            let found = readable_changesets(&*meta, &page).await?;
+            let mut asks: Vec<(ChangesetId, ChangesetId)> = Vec::new();
+            for (id, cs) in page.iter().zip(&found) {
+                let Some(Some(cs)) = cs else { continue };
+                if self.sampled(id, cs) {
+                    asks.extend(cs.parents.iter().map(|p| (*id, *p)));
+                }
+            }
+            for chunk in asks.chunks(PAGE) {
+                let parents: Vec<ChangesetId> = chunk.iter().map(|(_, p)| *p).collect();
+                let stored = readable_changesets(&*meta, &parents).await?;
+                for ((child, parent), got) in chunk.iter().zip(stored) {
+                    // Unreadable is stored but damaged: the history walk
+                    // reports that.
+                    if matches!(got, Some(None)) {
+                        self.log.push(
+                            Problem::new(
+                                "history",
+                                "stored_parent_missing",
+                                format!(
+                                    "stored changeset {child} names parent {parent}, which is \
+                                     not stored"
+                                ),
+                            )
+                            .key(&parent.0)
+                            .changeset(*child),
+                        );
+                    }
+                }
+            }
+            self.tick();
+        }
+    }
+
     async fn scan_gc_rows(&mut self) -> Result<()> {
         let meta = self.repo.meta().clone();
         for kind in [
@@ -1121,6 +1191,7 @@ impl Verifier<'_> {
             crate::changeset_gc::CS_DOOM,
             crate::changeset_gc::GC_FENCE_ACTIVE,
             crate::changeset_reach::CS_REACH,
+            crate::changeset_sweep::CS_TOMBSTONE,
         ] {
             if !self.has(kind) {
                 continue;
@@ -1133,6 +1204,8 @@ impl Verifier<'_> {
                         gc::decode_mark(&value)
                     } else if kind == crate::changeset_reach::CS_REACH {
                         crate::changeset_reach::decode_reach_row(&key, &value)
+                    } else if kind == crate::changeset_sweep::CS_TOMBSTONE {
+                        crate::changeset_sweep::decode_tombstone(&value).map(|_| ())
                     } else {
                         gc::decode_row(kind, &value).map(|_| ())
                     };
