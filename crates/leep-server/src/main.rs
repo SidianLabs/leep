@@ -419,6 +419,11 @@ enum Cmd {
         /// past it, the root trees a backup needs are no longer known.
         #[arg(long, default_value = "7d", value_parser = parse_grace)]
         tombstone_retention: std::time::Duration,
+        /// With --unreachable: walk reachability from every root instead of
+        /// trusting `cs-reach-v1` rows, and write them again (ADR 0059
+        /// section 4). Slower; for a store whose rows are in doubt.
+        #[arg(long, requires = "unreachable")]
+        reach_full: bool,
         /// With --unreachable: write the run's numbers to this Prometheus
         /// textfile (atomically).
         #[arg(long, requires = "unreachable")]
@@ -1208,6 +1213,7 @@ async fn main() -> anyhow::Result<()> {
             tombstone_retention,
             metrics_file,
             debug_pause_at,
+            reach_full,
             ..
         }) => {
             if phase.is_some() {
@@ -1241,7 +1247,7 @@ async fn main() -> anyhow::Result<()> {
                 max_delete,
                 index_fence,
                 tombstone_retention,
-                full: false,
+                full: reach_full,
                 pause_at: debug_pause_at,
             };
             let phase = match (condemn_only, collect_only) {

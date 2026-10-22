@@ -46,6 +46,7 @@ skill.
 | derived `cs-rescue-v1` | — | `MetaStore.derived`, key = changeset id, value = the condemnation time the writer observed, 8-byte big-endian `i64` |
 | derived `cs-doom-v1` | — | `MetaStore.derived`, key = changeset id, value = condemnation time (8-byte big-endian `i64`) then one state byte: 0 deleting, 1 abandoned, 2 deleted |
 | derived `gc-fence-active-v1` | — | `MetaStore.derived`, one row, key = 32 zero bytes, value = unix seconds the current changeset condemnation round began, 8-byte big-endian `i64`, or 0 when none is under way |
+| derived `cs-tombstone-v1` | — | `MetaStore.derived`, key = id of a changeset the sweep deleted, value = deletion time (8-byte big-endian `i64`, the sweep host's clock), then the changeset's root tree hash (32 bytes) when it had a `root_tree` row. Written before the delete, dropped after `--tombstone-retention`; blob GC keeps the root trees of those within `--backup-fence` (ADR 0059 section 11) |
 | derived `cs-reach-v1` | — | `MetaStore.derived`, key = changeset id, value = the single byte `0x01` (a present row counts whatever it reads): a ref or ref log entry reaches the changeset, and every parent has a row. Written parents first (ADR 0059). One more row, key = 32 zero bytes, holds the `seq` of the newest ref log entry the rows cover (8-byte big-endian) |
 | derived `blob-trigrams-v1` | — | `MetaStore.derived`, key = blob hash, value = see "Code search index" below |
 | derived `tree-trigrams-v1` | — | `MetaStore.derived`, key = tree node hash (`TreeNode::hash()`), value = see "Code search index" below |

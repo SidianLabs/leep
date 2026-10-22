@@ -622,6 +622,12 @@ fn keep_ancestors(
 /// changeset (a late indexer write leaves an orphan), and drop tombstones
 /// past their retention. Only ids that are not stored: a client may have
 /// stored a deleted changeset again.
+///
+/// That check and the delete are not atomic. A changeset stored again
+/// between them loses the derived rows written with it (`root_tree`,
+/// `generation` and the rest). That is harmless: every one of those kinds
+/// derives again on demand from the changeset and its parents, and the
+/// changeset itself is never touched here.
 async fn tombstone_pass(
     repo: &Repo,
     opts: &SweepOptions,

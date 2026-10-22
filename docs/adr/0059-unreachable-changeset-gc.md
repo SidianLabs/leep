@@ -344,7 +344,8 @@ A run does three things:
 - **Candidates.** These are stored changesets with no row and not reached
   from a transient root, found by listing changesets as blob GC does today.
 
-`--full` ignores the rows and walks from the roots.
+`--full` ignores the rows and walks from the roots. It is exposed as
+`gc --unreachable --reach-full`.
 
 ### 5. Land ids answer without the original
 **The change.** In `land_enqueue`, `self.get_changeset(cs)` comes before
