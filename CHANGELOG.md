@@ -7,6 +7,14 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 ## [Unreleased]
 
+### A land conflict no longer hides same-size local changes
+- After a land conflict, `leep land` writes your changes over the files it
+  has just checked out at the new head. Where file timestamps are coarse,
+  such a file could keep the recorded mtime and, at the same size, look
+  unchanged to `status`, so the next commit silently left your change out
+  (for example a one-character edit beside the conflict, or a binary file
+  kept as your version). Those files are now always rehashed.
+
 ### `leep-git import` and `export` read `LEEP_META` and `LEEP_BLOBS`
 - `--meta` and `--blobs` fall back to the same variables as `leep-server`
   and its subcommands, so one environment file serves the server, `backup`
