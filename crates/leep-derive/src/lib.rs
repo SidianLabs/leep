@@ -67,6 +67,7 @@ mod tests;
 pub use comments::strip_comments;
 pub use cursor::MAX_CURSOR_CHARS;
 pub use history::{ExtraMatch, LogFilter, LogPage, LogParams};
+pub use land::MAX_BATCH_LIFETIME;
 pub use repo::{
     default_derive_jobs, PrefixMatch, Repo, DEFAULT_CACHE_BYTES, MAX_DEFAULT_DERIVE_JOBS,
     MAX_PREFIX_CANDIDATES,

@@ -678,7 +678,7 @@ fn crash_rounds(
                 live_gc = Some(
                     Command::new(bin("leep-server"))
                         .args(["--meta", &stores.meta, "--blobs", &stores.blobs, "gc"])
-                        .args(["--grace", "0", "--fence", LIVE_FENCE])
+                        .args(["--grace", "0", "--fence", LIVE_FENCE, "--unsafe-fence"])
                         .env("RUST_LOG", "warn")
                         .stdout(Stdio::null())
                         .spawn()
@@ -1053,5 +1053,202 @@ fn killed_land_leader_is_replaced_postgres() {
     drop(odd);
     verify_exact(&tag, &stores, &shared);
     drop(servers);
+    drop(db);
+}
+
+// ---------------------------------------------------------------------------
+// The changeset sweep (ADR 0059 phase 2), SIGKILLed at its three dangerous
+// points: a batch announced but not deleted, a batch deleted but not
+// settled, and inside the tombstone pass. After each kill `verify --full`
+// (stored_parent_missing among its checks) must be clean, every ref must be
+// sound, and a rerun collect must finish the job.
+
+/// A commit of one file, straight into the stores.
+fn plant_commit(repo: &Repo, parent: Option<ChangesetId>, path: &str, body: &str) -> ChangesetId {
+    common_block_on(async {
+        let content = repo
+            .put_blob(body.as_bytes().to_vec().into())
+            .await
+            .unwrap();
+        repo.create_changeset(Changeset {
+            parents: parent.into_iter().collect(),
+            author: "crash".into(),
+            timestamp: 1,
+            message: path.into(),
+            changes: BTreeMap::from([(
+                RepoPath::new(path).unwrap(),
+                FileChange::Modify {
+                    content,
+                    kind: FileKind::Regular,
+                    size: body.len() as u64,
+                },
+            )]),
+            extra: BTreeMap::new(),
+        })
+        .await
+        .unwrap()
+    })
+}
+
+/// Abandoned stacks off `main`, `n` of them, three deep.
+fn plant_garbage(repo: &Repo, round: usize, n: usize) -> Vec<ChangesetId> {
+    let head = common_block_on(repo.meta().get_ref("main")).unwrap();
+    let mut out = Vec::new();
+    for s in 0..n {
+        let mut p = head;
+        for d in 0..3 {
+            let id = plant_commit(
+                repo,
+                p,
+                &format!("g{round}/{s}/{d}"),
+                &format!("{round}{s}{d}\n"),
+            );
+            out.push(id);
+            p = Some(id);
+        }
+    }
+    out
+}
+
+const SWEEP: &[&str] = &[
+    "--unreachable",
+    "--fence",
+    "0s",
+    "--unsafe-no-fence",
+    "--changeset-grace",
+    "0",
+    "--index-fence",
+    "0s",
+];
+
+/// Start a collect that stops for good at `pause`, wait until it says so,
+/// and SIGKILL it there.
+fn kill_sweep_at(tag: &str, stores: &Stores, pause: &str) {
+    use std::io::BufRead;
+    let mut child = Command::new(bin("leep-server"))
+        .args(["--meta", &stores.meta, "--blobs", &stores.blobs, "gc"])
+        .args(SWEEP)
+        .args(["--collect-only", "--batch", "4", "--rate", "0"])
+        .args(["--debug-pause-at", pause])
+        .env("RUST_LOG", "warn")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn gc --unreachable");
+    let err = child.stderr.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(err).lines().map_while(|l| l.ok()) {
+            if line.contains("leep-sweep: paused at") {
+                let _ = tx.send(line);
+            }
+        }
+    });
+    let line = rx.recv_timeout(Duration::from_secs(120));
+    let _ = child.kill();
+    let _ = child.wait();
+    let line = line.unwrap_or_else(|_| panic!("[{tag}] collect never reached {pause}"));
+    eprintln!("[{tag}] SIGKILLed gc --unreachable: {line}");
+}
+
+/// [`gc_ok`] once the gc lease a killed run left has lapsed.
+fn gc_after_lease(tag: &str, stores: &Stores, args: &[&str]) -> String {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let out = gc_output(stores, args);
+        if out.status.success() {
+            return stdout(&out);
+        }
+        let err = stderr(&out);
+        assert!(
+            err.contains("another garbage collection is running") && Instant::now() < deadline,
+            "[{tag}] gc {args:?} failed\n{}\n{err}",
+            stdout(&out)
+        );
+        std::thread::sleep(Duration::from_secs(5));
+    }
+}
+
+/// No changeset delete is left announced (`cs-doom-v1` *deleting*).
+fn assert_no_delete_announced(tag: &str, repo: &Repo) {
+    let rows = common_block_on(repo.meta().list_derived("cs-doom-v1", None, usize::MAX)).unwrap();
+    for (k, v) in rows {
+        assert_ne!(v.last(), Some(&0), "[{tag}] delete of {k} still announced");
+    }
+}
+
+fn run_sweep_crash(backend: &str, meta_url: Option<String>) {
+    let _g = serial();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let stores = match meta_url {
+        Some(url) => Stores::with_meta(&root.join("data"), url),
+        None => Stores::sqlite(&root.join("data")),
+    };
+    // Migrate, through a dry run that writes nothing else.
+    gc_ok(backend, &stores, &["--dry-run"]);
+    let repo = open_repo(&stores);
+    let base = plant_commit(&repo, None, "base.txt", "base\n");
+    common_block_on(repo.meta().cas_ref("main", None, Some(base))).unwrap();
+    // History with rebased lands, kept by the scan window.
+    for i in 0..6 {
+        let a = plant_commit(&repo, Some(base), &format!("l/{i}"), &format!("{i}\n"));
+        common_block_on(repo.land(a, "main")).unwrap();
+    }
+    for (round, pause) in ["doom:1", "batch:2", "tombstone"].into_iter().enumerate() {
+        let tag = format!("{backend}, sweep killed at {pause}");
+        let garbage = plant_garbage(&repo, round, 8);
+        gc_ok(&tag, &stores, &[SWEEP, &["--condemn-only"]].concat());
+        kill_sweep_at(&tag, &stores, pause);
+        verify_clean(&format!("{tag}, after SIGKILL"), &stores, &["--full"]);
+        let repo = open_repo(&stores);
+        common_block_on(async {
+            for name in repo.meta().list_refs().await.unwrap().keys() {
+                let head = repo.meta().get_ref(name).await.unwrap().unwrap();
+                repo.list_files(head, "").await.unwrap();
+            }
+        });
+        // A rerun finishes: everything planted is gone, nothing announced.
+        // The killed run's gc lease lapses first (60 s), as for a cron job
+        // after a crash.
+        let out = gc_after_lease(&tag, &stores, &[SWEEP, &["--collect-only"]].concat());
+        assert!(
+            out.contains("collect: fence flag cleared: true"),
+            "[{tag}] {out}"
+        );
+        verify_clean(&format!("{tag}, after the rerun"), &stores, &["--full"]);
+        assert_no_delete_announced(&tag, &repo);
+        for id in &garbage {
+            assert!(
+                common_block_on(repo.meta().get_changeset(id))
+                    .unwrap()
+                    .is_none(),
+                "[{tag}] {id} survived the rerun"
+            );
+        }
+    }
+    // Nothing reachable went.
+    let repo = open_repo(&stores);
+    let head = common_block_on(repo.meta().get_ref("main"))
+        .unwrap()
+        .unwrap();
+    for i in 0..6 {
+        common_block_on(repo.read_file(head, &RepoPath::new(format!("l/{i}")).unwrap()))
+            .unwrap()
+            .unwrap_or_else(|| panic!("[{backend}] l/{i} lost"));
+    }
+}
+
+#[test]
+fn killed_changeset_sweep_keeps_ancestry_sqlite() {
+    run_sweep_crash("sqlite", None);
+}
+
+#[test]
+fn killed_changeset_sweep_keeps_ancestry_postgres() {
+    let Some(db) = PgDb::create() else {
+        return;
+    };
+    run_sweep_crash("postgres", Some(db.url.clone()));
     drop(db);
 }

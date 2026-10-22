@@ -361,6 +361,8 @@ pub async fn gc_loop(
             .args(["gc", "--meta", &stores.meta, "--blobs", &stores.blobs])
             .args(["--grace", &format!("{}s", grace.as_secs())])
             .args(["--fence", &format!("{}s", fence.as_secs())])
+            // The soak's fence is scaled down with its servers' timeouts.
+            .arg("--unsafe-fence")
             .env("RUST_LOG", "warn")
             .stdin(Stdio::null())
             .kill_on_drop(true)

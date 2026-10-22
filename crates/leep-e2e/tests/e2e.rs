@@ -703,7 +703,11 @@ fn fenced_gc_removes_orphans_and_keeps_live_data() {
         .unwrap();
     assert!(!refused.status.success());
     assert!(orphan_c.exists());
-    let both = server_gc(&stores, &["--grace", "0", "--fence", "1s"]);
+    // A 1 s fence is shorter than any server's bounds: tests only.
+    let both = server_gc(
+        &stores,
+        &["--grace", "0", "--fence", "1s", "--unsafe-fence"],
+    );
     assert!(both.contains("deleted: 1 blobs"), "{both}");
     assert!(!orphan_c.exists());
 

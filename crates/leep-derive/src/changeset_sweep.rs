@@ -71,6 +71,55 @@ pub struct SweepOptions {
     pub tombstone_retention: Duration,
     /// Walk reachability from every root instead of trusting `cs-reach-v1`.
     pub full: bool,
+    /// Test hook for the SIGKILL crash test: stop for good at the given
+    /// point, after it was reached this many times before, and say so on
+    /// stderr, so the test can kill the process exactly there.
+    pub pause_at: Option<(PausePoint, u32)>,
+}
+
+/// Where [`SweepOptions::pause_at`] stops a collect.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PausePoint {
+    /// A batch's doom rows say *deleting*; nothing of it is deleted yet.
+    Doom,
+    /// A batch is deleted; its doom rows still say *deleting*.
+    Batch,
+    /// In the tombstone pass, before it removes rows.
+    Tombstone,
+}
+
+impl std::str::FromStr for PausePoint {
+    type Err = String;
+    fn from_str(s: &str) -> std::result::Result<Self, String> {
+        match s {
+            "doom" => Ok(PausePoint::Doom),
+            "batch" => Ok(PausePoint::Batch),
+            "tombstone" => Ok(PausePoint::Tombstone),
+            _ => Err(format!("{s:?}: expected doom, batch or tombstone")),
+        }
+    }
+}
+
+/// Counts the points a run passes; see [`SweepOptions::pause_at`].
+struct Pauser {
+    at: Option<(PausePoint, u32)>,
+    seen: u32,
+}
+
+impl Pauser {
+    async fn reached(&mut self, point: PausePoint) {
+        let Some((want, after)) = self.at else { return };
+        if want != point {
+            return;
+        }
+        if self.seen == after {
+            eprintln!("leep-sweep: paused at {point:?}");
+            loop {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            }
+        }
+        self.seen += 1;
+    }
 }
 
 impl Default for SweepOptions {
@@ -85,6 +134,7 @@ impl Default for SweepOptions {
             index_fence: Duration::from_secs(60),
             tombstone_retention: Duration::from_secs(7 * 86_400),
             full: false,
+            pause_at: None,
         }
     }
 }
@@ -393,6 +443,10 @@ async fn collect_leased(
     let todo = &todo[..todo.len().min(cap)];
 
     let mut skip: HashSet<ChangesetId> = HashSet::new();
+    let mut pauser = Pauser {
+        at: opts.pause_at,
+        seen: 0,
+    };
     for batch in todo.chunks(opts.batch) {
         gc_lease::check(lease)?;
         let batch: Vec<ChangesetId> = batch
@@ -411,6 +465,7 @@ async fn collect_leased(
             .map(|id| DerivedRow::new(CS_DOOM, id.0, doom_value(condemned_at[id], Doom::Deleting)))
             .collect();
         repo.meta().put_derived_many(&announce).await?;
+        pauser.reached(PausePoint::Doom).await;
         let now = repo.cs_fences(&batch).await?;
         let mut rescued: Vec<ChangesetId> = Vec::new();
         for (id, f) in batch.iter().zip(&now) {
@@ -447,6 +502,7 @@ async fn collect_leased(
             repo.meta()
                 .delete_changesets(&doomed, PER_CHANGESET_KINDS)
                 .await?;
+            pauser.reached(PausePoint::Batch).await;
         }
         let settle: Vec<DerivedRow> = batch
             .iter()
@@ -478,7 +534,7 @@ async fn collect_leased(
     metrics::counter!("leep_gc_changesets_deleted_total").increment(report.deleted);
     metrics::counter!("leep_gc_changeset_bytes_deleted_total").increment(report.deleted_bytes);
 
-    tombstone_pass(repo, opts, clock, lease, started, &mut report).await?;
+    tombstone_pass(repo, opts, clock, lease, started, &mut pauser, &mut report).await?;
 
     // Clear the flag once nothing stored is left condemned.
     let mut pending = 0u64;
@@ -544,6 +600,7 @@ async fn tombstone_pass(
     clock: &dyn Clock,
     lease: &Option<GcLease>,
     started: i64,
+    pauser: &mut Pauser,
     report: &mut SweepCollectReport,
 ) -> Result<()> {
     let stones = all_rows(repo, CS_TOMBSTONE).await?;
@@ -551,6 +608,7 @@ async fn tombstone_pass(
         return Ok(());
     }
     clock.sleep(opts.index_fence).await;
+    pauser.reached(PausePoint::Tombstone).await;
     let retain_after = started.saturating_sub(secs(opts.tombstone_retention));
     let mut kinds: Vec<&str> = PER_CHANGESET_KINDS.to_vec();
     kinds.extend([CS_CONDEMNED, CS_RESCUE]);

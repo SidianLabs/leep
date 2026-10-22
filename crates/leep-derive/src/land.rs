@@ -39,7 +39,7 @@ pub(crate) const MAX_BATCH: usize = 64;
 /// sweep's fence must outlast (ADR 0059 section 3). A batch past it answers
 /// its lands with a retryable error; keyed ones are then answered from their
 /// record, so none lands twice.
-pub(crate) const MAX_BATCH_LIFETIME: Duration = Duration::from_secs(60);
+pub const MAX_BATCH_LIFETIME: Duration = Duration::from_secs(60);
 
 /// Bounds of the `Retry-After` of a land refused at a full queue, in
 /// seconds (ADR 0060, section 2). The bound is sized so the whole queue
