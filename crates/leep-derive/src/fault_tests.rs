@@ -25,6 +25,10 @@ use crate::Repo;
 #[path = "admission_fault_tests.rs"]
 mod admission;
 
+/// The changeset sweep (ADR 0059 phase 2), in the same sweep.
+#[path = "sweep_fault_tests.rs"]
+mod sweep;
+
 /// Stores shared by any number of faulty "servers" and one clean verifier.
 pub(crate) struct World {
     pub(crate) blobs: Arc<MemoryBlobStore>,
@@ -58,7 +62,7 @@ impl World {
     }
 
     /// Like [`World::server`], with faults from `plan` instead.
-    fn server_with(&self, plan: &Arc<FaultPlan>) -> Repo {
+    pub(crate) fn server_with(&self, plan: &Arc<FaultPlan>) -> Repo {
         Repo::new(
             Arc::new(FaultyBlobStore::new(self.blobs.clone(), plan.clone())),
             Arc::new(FaultyMetaStore::new(self.meta.clone(), plan.clone())),
@@ -1371,10 +1375,10 @@ fn now() -> i64 {
 }
 
 /// A clock that moves only when told to or when GC sleeps.
-struct TestClock(std::sync::Mutex<i64>);
+pub(crate) struct TestClock(std::sync::Mutex<i64>);
 
 impl TestClock {
-    fn at(t: i64) -> Self {
+    pub(crate) fn at(t: i64) -> Self {
         TestClock(std::sync::Mutex::new(t))
     }
 }
@@ -1396,6 +1400,7 @@ fn gc_opts() -> GcOptions {
         fence: Duration::from_secs(FENCE as u64),
         unsafe_no_fence: false,
         dry_run: false,
+        backup_fence: None,
     }
 }
 

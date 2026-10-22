@@ -1168,6 +1168,7 @@ impl Verifier<'_> {
             crate::changeset_gc::CS_DOOM,
             crate::changeset_gc::GC_FENCE_ACTIVE,
             crate::changeset_reach::CS_REACH,
+            crate::changeset_sweep::CS_TOMBSTONE,
         ] {
             if !self.has(kind) {
                 continue;
@@ -1180,6 +1181,8 @@ impl Verifier<'_> {
                         gc::decode_mark(&value)
                     } else if kind == crate::changeset_reach::CS_REACH {
                         crate::changeset_reach::decode_reach_row(&key, &value)
+                    } else if kind == crate::changeset_sweep::CS_TOMBSTONE {
+                        crate::changeset_sweep::decode_tombstone(&value).map(|_| ())
                     } else {
                         gc::decode_row(kind, &value).map(|_| ())
                     };

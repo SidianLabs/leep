@@ -13,6 +13,7 @@ mod batched_reads;
 mod blame;
 pub mod changeset_gc;
 pub mod changeset_reach;
+pub mod changeset_sweep;
 mod comments;
 mod cursor;
 pub mod derived;

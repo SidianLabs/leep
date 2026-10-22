@@ -491,6 +491,11 @@ pub struct GcOptions {
     pub unsafe_no_fence: bool,
     /// Report what would be condemned or deleted without writing anything.
     pub dry_run: bool,
+    /// With a full mark: also keep the trees of changesets the changeset
+    /// sweep deleted within this long, for backups that snapshotted them
+    /// (ADR 0059 section 6). `None` keeps none; `leep-server gc --full`
+    /// requires it.
+    pub backup_fence: Option<Duration>,
 }
 
 impl Default for GcOptions {
@@ -500,6 +505,7 @@ impl Default for GcOptions {
             fence: Duration::from_secs(10 * 60),
             unsafe_no_fence: false,
             dry_run: false,
+            backup_fence: None,
         }
     }
 }
@@ -745,7 +751,13 @@ async fn marked_rows(repo: &Repo, check: bool, hashes: &[Hash]) -> Result<HashSe
 /// aborts before anything is condemned or deleted, so an incomplete mark
 /// never loses a blob. Unless `write` is false, records what it walked for
 /// the next run.
-async fn mark(repo: &Repo, mode: Mark, write: bool, stats: &mut MarkStats) -> Result<Marked> {
+async fn mark(
+    repo: &Repo,
+    mode: Mark,
+    write: bool,
+    stats: &mut MarkStats,
+    extra_roots: &[Hash],
+) -> Result<Marked> {
     let trust = mode == Mark::Incremental;
     let mut walked: HashSet<Hash> = HashSet::new();
     let mut out = MarkWriter {
@@ -806,10 +818,44 @@ async fn mark(repo: &Repo, mode: Mark, write: bool, stats: &mut MarkStats) -> Re
         }
     }
     out.flush().await?;
+    // Trees of recently deleted changesets, kept but not recorded: they
+    // are live only until the backup fence passes.
+    let mut quiet = MarkWriter {
+        repo,
+        write: false,
+        rows: Vec::new(),
+    };
+    for root in extra_roots {
+        if walked.contains(root) {
+            continue;
+        }
+        match walk_tree(repo, *root, false, &mut walked, &mut quiet).await {
+            Ok(()) => {}
+            // Already gone (an earlier full collect, before this tombstone's
+            // fence was set): nothing of it is left to keep.
+            Err(Error::NotFound(_)) => {}
+            Err(e) => return Err(e),
+        }
+    }
     Ok(Marked {
         walked,
         rows: trust,
     })
+}
+
+/// Root trees a full mark keeps besides those of stored changesets.
+async fn backup_roots(
+    repo: &Repo,
+    opts: &GcOptions,
+    mode: Mark,
+    started_at: i64,
+) -> Result<Vec<Hash>> {
+    match (mode, opts.backup_fence) {
+        (Mark::Full, Some(f)) => {
+            crate::changeset_sweep::tombstoned_roots(repo, started_at.saturating_sub(secs(f))).await
+        }
+        _ => Ok(Vec::new()),
+    }
 }
 
 /// Test oracle: an incremental mark that records what it walks must agree
@@ -819,12 +865,12 @@ async fn mark(repo: &Repo, mode: Mark, write: bool, stats: &mut MarkStats) -> Re
 #[cfg(test)]
 pub(crate) async fn check_incremental_mark(r: &Repo) -> std::result::Result<u64, String> {
     let mut stats = MarkStats::default();
-    let full = mark(r, Mark::Full, false, &mut stats)
+    let full = mark(r, Mark::Full, false, &mut stats, &[])
         .await
         .map_err(|e| e.to_string())?
         .walked;
     let mut stats = MarkStats::default();
-    let inc = mark(r, Mark::Incremental, true, &mut stats)
+    let inc = mark(r, Mark::Incremental, true, &mut stats, &[])
         .await
         .map_err(|e| e.to_string())?;
     let mut all: Vec<Hash> = r
@@ -949,7 +995,8 @@ async fn condemn_leased(
     let mut report = CondemnReport::default();
     let started_at = clock.now();
     let mut stats = MarkStats::default();
-    let marked = mark(repo, mode, !opts.dry_run, &mut stats).await?;
+    let extra = backup_roots(repo, opts, mode, started_at).await?;
+    let marked = mark(repo, mode, !opts.dry_run, &mut stats, &extra).await?;
     report.changesets_scanned = stats.changesets_scanned;
     report.changesets_walked = stats.changesets_walked;
     report.marked = marked.walked.len() as u64;
@@ -1041,7 +1088,8 @@ async fn collect_leased(
     let started_at = clock.now();
     let eligible_before = started_at.saturating_sub(secs(opts.fence));
     let mut stats = MarkStats::default();
-    let marked = mark(repo, mode, !opts.dry_run, &mut stats).await?;
+    let extra = backup_roots(repo, opts, mode, started_at).await?;
+    let marked = mark(repo, mode, !opts.dry_run, &mut stats, &extra).await?;
     report.changesets_scanned = stats.changesets_scanned;
     report.changesets_walked = stats.changesets_walked;
     report.marked = marked.walked.len() as u64;
@@ -1243,6 +1291,7 @@ mod tests {
             fence: Duration::from_secs(FENCE as u64),
             unsafe_no_fence: false,
             dry_run,
+            backup_fence: None,
         }
     }
 
@@ -2327,7 +2376,10 @@ mod tests {
     /// What a full mark finds, writing nothing: the oracle.
     async fn full_mark(r: &Repo) -> HashSet<Hash> {
         let mut stats = MarkStats::default();
-        mark(r, Mark::Full, false, &mut stats).await.unwrap().walked
+        mark(r, Mark::Full, false, &mut stats, &[])
+            .await
+            .unwrap()
+            .walked
     }
 
     async fn assert_marks_agree(r: &Repo, what: &str) -> MarkStats {

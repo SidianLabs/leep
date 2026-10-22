@@ -873,3 +873,133 @@ async fn coordinated_lands_under_faults_lose_nothing_and_duplicate_nothing() {
         assert_lands_kept(seed, &w, &agents).await;
     }
 }
+
+/// ADR 0059 §10: lands forwarded to the ref's leader while a changeset
+/// sweep collects the stacks they land. Every stack is condemned first, as
+/// a sweep finds abandoned work; each land then either rescues its stack in
+/// the leader's batch and lands, or finds it deleted and lands nothing. No
+/// ref ever points at a deleted changeset, and no stored changeset loses a
+/// parent.
+#[tokio::test(start_paused = true)]
+async fn sweep_racing_a_forwarded_land() {
+    use crate::changeset_sweep::{self, SweepOptions};
+    for seed in seeds() {
+        let w = world(seed);
+        seed_main(seed, &w).await;
+        let base = w.meta.get_ref(REF).await.unwrap();
+        let mut stacks = Vec::new();
+        for n in 0..6 {
+            let a = commit_file(seed, &w.clean, base, &format!("s{n}/a"), "a\n", "a").await;
+            let b = commit_file(seed, &w.clean, Some(a), &format!("s{n}/b"), "b\n", "b").await;
+            stacks.push((a, b));
+        }
+        let t = leep_core::store::unix_now() + 10 * 86_400;
+        let all: Vec<ChangesetId> = stacks.iter().flat_map(|(a, b)| [*a, *b]).collect();
+        crate::changeset_gc::condemn_for_test(&w.clean, &all, t).await;
+        w.plan
+            .jitter(2)
+            .rate(Op::META, 3, Fault::Fail)
+            .rate(Op::WRITES, 5, Fault::FailAfter);
+        let nodes: Vec<_> = (0..3)
+            .map(|i| node(&w, &w.plan, i, format!("node-{i}"), |_| {}))
+            .collect();
+        let net = net(nodes, seed, 0, 0);
+        let lands: Vec<_> = stacks
+            .iter()
+            .enumerate()
+            .map(|(n, (_, top))| {
+                let (net, top) = (net.clone(), *top);
+                // Through every server in turn: whichever does not hold
+                // the lease forwards to the one that does.
+                let via = net.nodes[n % net.nodes.len()].clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(n as u64 * 3)).await;
+                    for _ in 0..200 {
+                        let fwd = Fwd {
+                            net: net.clone(),
+                            cs: top,
+                            land_id: None,
+                        };
+                        let r = via
+                            .call(
+                                via.repo
+                                    .land_coordinated(top, REF, None, true, None, false, &fwd),
+                            )
+                            .await;
+                        let answer = match r {
+                            Some(Ok(Coordinated::Landed(r))) => Ok(r),
+                            Some(Ok(Coordinated::Forwarded(r))) => r,
+                            Some(Ok(Coordinated::NotLeader)) => panic!("NotLeader to a client"),
+                            Some(Err(e)) => Err(e),
+                            None => continue,
+                        };
+                        match answer {
+                            Ok(LandResponse::Landed { landed, .. }) => return Some(landed),
+                            Ok(other) => panic!("seed {seed}: {other:?}"),
+                            Err(e) if retryable(&e) => {}
+                            // Deleted before the land rescued it.
+                            Err(Error::NotFound(_) | Error::Invalid(_)) => return None,
+                            Err(e) => panic!("seed {seed}: land failed for real: {e}"),
+                        }
+                    }
+                    None
+                })
+            })
+            .collect();
+        let o = SweepOptions {
+            grace: Duration::from_secs(86_400),
+            batch: 1,
+            rate: 0,
+            ..SweepOptions::default()
+        };
+        let clock_t = t + o.fence.as_secs() as i64 + 1;
+        // Collect through a store that yields between calls, starting at a
+        // seeded moment among the lands.
+        let gc_plan = FaultPlan::new(seed ^ 0x9C);
+        gc_plan.jitter(3);
+        let gc_repo = w.server_with(&gc_plan);
+        let start = Rng::new(seed).below(20) as u64;
+        let collect = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(start)).await;
+            let clock = crate::fault_tests::TestClock::at(clock_t);
+            changeset_sweep::collect(&gc_repo, &o, &clock).await
+        });
+        let collected = collect
+            .await
+            .unwrap()
+            .unwrap_or_else(|e| panic!("seed {seed}: collect: {e}"));
+        let mut landed = Vec::new();
+        for l in lands {
+            landed.push(l.await.unwrap());
+        }
+        w.plan.pause();
+        let head = w.meta.get_ref(REF).await.unwrap().unwrap();
+        for ((a, b), got) in stacks.iter().zip(&landed) {
+            match got {
+                Some(id) => {
+                    assert!(w.clean.is_ancestor(*id, head).await.unwrap(), "seed {seed}");
+                }
+                None => assert!(
+                    w.meta.get_changeset(b).await.unwrap().is_none(),
+                    "seed {seed}: {b} still stored but its land gave up ({collected:?})"
+                ),
+            }
+            if w.meta.get_changeset(b).await.unwrap().is_some() {
+                assert!(
+                    w.meta.get_changeset(a).await.unwrap().is_some(),
+                    "seed {seed}"
+                );
+            }
+        }
+        crate::fault_tests::assert_ref_sound(seed, &w.clean, REF).await;
+        crate::fault_tests::assert_ref_log_replays(seed, &*w.meta).await;
+        for id in w.meta.list_changesets(None, usize::MAX).await.unwrap() {
+            for p in w.meta.get_changeset(&id).await.unwrap().unwrap().parents {
+                assert!(
+                    w.meta.get_changeset(&p).await.unwrap().is_some(),
+                    "seed {seed}: {id} lost its parent {p}"
+                );
+            }
+        }
+    }
+}

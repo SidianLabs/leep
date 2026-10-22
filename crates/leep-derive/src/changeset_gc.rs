@@ -14,8 +14,8 @@
 //!
 //! Requests read `gc-fence-active-v1` at most once every
 //! [`FENCE_FLAG_TTL`] and skip every per-changeset read while it is 0, so
-//! nothing costs anything until a sweep condemns. Nothing condemns yet: the
-//! sweep is phase 2 of the ADR.
+//! nothing costs anything until a sweep condemns. The sweep itself is in
+//! `changeset_sweep`.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
@@ -88,14 +88,14 @@ pub(crate) struct FenceFlag {
 
 /// One changeset's fence rows, read condemnation first.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct CsFence {
-    condemned: Option<i64>,
-    rescued: Option<i64>,
-    doom: Option<(i64, Doom)>,
+pub(crate) struct CsFence {
+    pub(crate) condemned: Option<i64>,
+    pub(crate) rescued: Option<i64>,
+    pub(crate) doom: Option<(i64, Doom)>,
 }
 
 impl CsFence {
-    fn is_condemned(&self) -> bool {
+    pub(crate) fn is_condemned(&self) -> bool {
         match self.condemned {
             Some(c) => self.rescued.is_none_or(|r| c > r),
             None => false,
@@ -103,7 +103,7 @@ impl CsFence {
     }
 
     /// The handshake state of the current condemnation.
-    fn doom_state(&self) -> Option<Doom> {
+    pub(crate) fn doom_state(&self) -> Option<Doom> {
         match (self.condemned, self.doom) {
             (Some(c), Some((e, d))) if e == c => Some(d),
             _ => None,
@@ -139,6 +139,7 @@ impl Repo {
             .get_derived(GC_FENCE_ACTIVE, &fence_flag_key())
             .await?;
         let active = flag_active(v.as_deref());
+        metrics::gauge!("leep_gc_fence_active").set(f64::from(u8::from(active)));
         *self.fence_flag.read.lock().unwrap() = Some((started, active));
         Ok(active)
     }
@@ -255,6 +256,10 @@ impl Repo {
                 return Ok(());
             };
             if waited >= DOOM_WAIT {
+                // A delete announced and never finished (a collect killed
+                // between doom and delete) keeps answering this until the
+                // next collect: `LeepChangesetDoomStuck`.
+                metrics::counter!("leep_gc_changeset_doom_conflicts_total").increment(1);
                 return Err(Error::Conflict(format!(
                     "changeset {first} is being garbage collected; retry"
                 )));
@@ -267,7 +272,7 @@ impl Repo {
     /// The fence rows of `ids`, one per id, read from durable meta:
     /// condemnations in one batch, then the rescue and doom rows of the
     /// condemned ones.
-    async fn cs_fences(&self, ids: &[ChangesetId]) -> Result<Vec<CsFence>> {
+    pub(crate) async fn cs_fences(&self, ids: &[ChangesetId]) -> Result<Vec<CsFence>> {
         let keys: Vec<Hash> = ids.iter().map(|id| id.0).collect();
         let condemned = self.meta().get_derived_many(CS_CONDEMNED, &keys).await?;
         let mut out: Vec<CsFence> = Vec::with_capacity(ids.len());

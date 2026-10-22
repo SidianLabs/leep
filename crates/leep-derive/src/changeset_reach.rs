@@ -92,6 +92,8 @@ pub struct Reach {
     /// Changesets a root reaches that are not stored, so their descendants
     /// cannot get rows. A healthy store has none; `verify` reports them.
     pub missing: u64,
+    /// Stored changesets listed.
+    pub stored: u64,
 }
 
 /// Whether a row is there, whatever its value: only [`REACHED`] is ever
@@ -302,6 +304,7 @@ pub async fn mark(repo: &Repo, opts: &ReachOptions) -> Result<Reach> {
             break;
         };
         after = Some(last);
+        reach.stored += page.len() as u64;
         let page: Vec<ChangesetId> = page.into_iter().filter(|id| !walked.contains(id)).collect();
         let (has, stored_at) =
             tokio::join!(rowed(repo, &page), repo.meta().changesets_stored_at(&page));

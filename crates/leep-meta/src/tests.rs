@@ -418,7 +418,7 @@ async fn check_overlapping_batches_do_not_deadlock(store: Arc<dyn MetaStore>) {
             DerivedRow::new(
                 "overlap",
                 Hash::of_blob(&n.to_be_bytes()),
-                bytes::Bytes::from_static(b"v"),
+                Bytes::from_static(b"v"),
             )
         })
         .collect();
