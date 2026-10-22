@@ -968,6 +968,22 @@ async fn run_unreachable_report(
         per(r.ref_log_prunable_bytes)
     );
     println!("  (changesets count by their canonical encoding; stored rows may be compressed)");
+    if let Some(l) = &r.live_trees {
+        let t = &r.log_kept.reclaimable;
+        println!(
+            "  blob store, live tree nodes and contents (all of them / lands; \
+             includes any imported history's): {} nodes {}, contents {}",
+            l.tree_nodes,
+            per(l.tree_node_bytes),
+            per(l.content_bytes)
+        );
+        println!(
+            "  blob store, reclaimable as designed by gc --full after the sweep (exact): \
+             tree nodes {}, contents {}",
+            per(t.tree_node_bytes),
+            per(t.content_bytes)
+        );
+    }
     println!(
         "reclaimable without a root_tree row (trees not counted): {}",
         r.without_root_tree

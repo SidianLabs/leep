@@ -1074,6 +1074,36 @@ growth per land):
   above and `skiplist` hold most of the store, against 92 MB reclaimable
   by changeset GC.
 
+**Exact trees on a local synthetic store (E4b).** `--exact-trees` now
+counts both columns exactly and prints the live tree bytes per land. A
+debug build on SQLite with filesystem blobs, `leep-swarm --agents 200
+--duration 180 --think-ms 300 --reads 1 --stale 8 --hot-fraction 0.05`
+(2,503 lands, 2,502 of them rebased, 821 conflicted changes never landed;
+5,827 changesets), then the dry run with `--grace 0`, 18 s bound and 21 s
+exact. Logical bytes per land:
+
+| Part | Bytes per land |
+|---|---|
+| Write path | 1,826 |
+| Index rows | 1,752 |
+| Reclaimable metadata (2,299 changesets: 1,478 originals, 821 other) | 685 |
+| Ref log, if retention were added | +223 |
+| Reclaimable tree nodes, exact (equal to the upper bound) | 6,404 |
+| Reclaimable file contents, exact | 347 |
+| Live tree nodes and contents | 10,730 and 1,059 |
+
+- **Exact equals the upper bound here.** Every swarm land writes fresh
+  contents, so nothing an original introduced is shared by unrelated live
+  history. Stores with reverts and repeated contents will differ; the
+  Linux store still needs the exact run on a host larger than the VPS.
+- **Metadata is 19% of metadata growth** (685 of 3,578) **and trees and
+  contents are 36% of blob growth** (6,751 of 18,540), 34% combined. The
+  scan window still held 1,024 of the 2,502 originals, so a store with
+  many more lands than 1,024 per ref reclaims more per land.
+- **This is a synthetic, debug-build store with almost every land
+  rebased.** It shows the method and the order of magnitude, not a
+  production figure. ADR 0059 section 11 says how the 20% rule is judged.
+
 #### Search admission and cheaper search (E5)
 
 The swarm rerun of [ADR 0060](adr/0060-land-admission-and-read-limits.md),

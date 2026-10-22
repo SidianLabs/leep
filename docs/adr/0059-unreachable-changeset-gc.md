@@ -568,6 +568,129 @@ garbage collection".
   `leep-swarm` reports `pg_database_size` per land with it on and off.
   Double and lost lands must stay at 0.
 
+### 11. Phase 2 design (for review before any delete code)
+Section 9 gives the delete path its own review gate. This section is that
+gate's subject. It changes sections 1 to 10 only where it says so.
+
+**Gate: the 20% rule, judged like this.**
+- **Store and settings.** The swarm workload on Postgres, run until each
+  ref has at least ten times `LANDED_COPY_SCAN` lands, so the scan window
+  does not hide most originals. Then `gc --dry-run --unreachable --grace 0
+  --exact-trees` on a host larger than the VPS. Both the release build and
+  the Linux store are wanted; a synthetic store alone is not enough.
+- **The policy counted** is the one built: ref log kept (`log_kept`). The
+  ref log retention column is reported, not counted.
+- **Two ratios, both reported.** *Metadata:* reclaimable metadata over
+  write path plus index rows per land. *Combined:* that plus the exact
+  reclaimable tree nodes and contents, over the same plus the blob store's
+  growth (live plus reclaimable trees and contents) per land.
+- **Rule.** Build if the metadata ratio reaches 20%, or if the combined
+  ratio does and the operator runs `gc --full` (until the epochs ADR,
+  trees are freed only by it). The second branch is a reading of the
+  rule, which named metadata only; the reviewer confirms or rejects it.
+- **Evidence so far.** The Linux store: 6 to 15% metadata (upper-bound
+  trees). A local synthetic store (PERFORMANCE.md, E4b): 19% metadata, 34%
+  combined, with exact trees equal to the bound, and with 1,024 originals
+  still inside the window.
+
+**What phase 2 deletes.**
+| Deleted | How |
+|---|---|
+| Unreachable changesets older than grace (section 1, ref log kept) | `delete_changesets`, children first |
+| Their per-changeset rows: `root_tree`, `generation`, `skiplist`, `last_merge-v1`, `gc-mark-v1`, `rebased-origin-v1` of an unreachable copy, `history-tree-v4`, `log-filter-v1` | in the same transaction as the changeset |
+| Late per-changeset rows written after the delete | the tombstone pass |
+| `cs-condemned-v1`, `cs-rescue-v1` of deleted ids, then their `cs-doom-v1` tombstones | the tombstone pass, one collect later |
+| Tree nodes and contents only deleted changesets used | only `gc --full` (ADR 0012's fence), honouring `--backup-fence` |
+| Ref log entries | **nothing.** Retention stays a follow-up ADR (section 9), which must keep keyed lands answerable. Phase 2 neither needs nor blocks it |
+
+Not deleted: signatures, reviews and mirror maps (their changesets are
+roots), content-keyed index rows (left for the index holder), `blame` rows
+(leaked, gauged).
+
+**Correction found in review of phase 1: ancestors of anything kept.** The
+argument of section 3 needs the deleted set to be closed under
+descendants at every instant. Two gaps break that once collect deletes:
+
+- `put_derived_many` may store any prefix on error, and the default makes
+  one call per row. The rescue walk writes its rows in reverse discovery
+  order, which is not always ancestors first. A writer that rescues *C*
+  but not yet its parent *P* can let collect delete *P* and keep *C*.
+- A condemned child that collect skips for age (re-condemned later than
+  its parent) leaves its parent unprotected by the mark.
+
+Phase 2 fixes both. Rescues are written in topological order, ancestors
+first. Collect, walking in descending generation, propagates "kept" from
+every condemned changeset it does not delete (rescued, marked, abandoned,
+too young, or in a failed batch) to all its condemned ancestors, and never
+deletes those in that run. This needs only the parents of condemned
+changesets. A non-condemned stored child is always reachable or within
+grace, so the mark already keeps its parent.
+
+**Safety argument, unchanged apart from these points.**
+- **Fence.** The default becomes 15 minutes, as for blobs since ADR 0012's
+  statement bound. The invariant is `fence > max(request timeout +
+  statement timeout + flag TTL, MAX_BATCH_LIFETIME + one swap, index
+  fence) + skew`. Unlike blob GC, the sweep **refuses** to condemn when the
+  values it is given break it: a deleted changeset cannot be re-uploaded
+  by its own writer the way a blob can.
+- **Concurrent lands.** Section 3's per-attempt re-check before the CAS,
+  the 60 s batch deadline, and copies being new. Measured collect batch
+  times (below) bound how long a batch waits on a doom.
+- **In-flight uploads and creates.** Deleting a changeset deletes no blob.
+  A create naming a deleted parent fails with "missing parent" and the
+  client can post the body again. Existence checks that decide a write
+  read durable meta, never the ancestry cache, which keeps parents of
+  deleted ids. Phase 2 audits each one.
+- **Rescue and doom.** As ADR 0012, per id, batched: write doom
+  *deleting* for the batch, re-read condemnation and rescue for the batch,
+  abandon the rescued and their ancestors, delete the rest, write doom
+  *deleted*.
+- **Followers (ADR 0056)** forward lands to the leader, whose batch
+  re-checks. Their own creates and ref moves rescue through shared meta.
+  Before condemning, the sweep requires `changeset-rescue` on every live
+  lease holder it can reach. All fence reads go to the primary; Leep has
+  no replica routing, and the runbook forbids pointing servers at a
+  standby.
+- **Backups and standbys.** Section 6: each batch is one transaction,
+  children first, so a snapshot or a standby is closed under ancestry.
+  `gc --full` keeps tombstoned root trees for `--backup-fence`. A restored
+  older backup brings deleted changesets back as unreachable; the next
+  sweep condemns them again.
+
+**Crash safety and idempotency.**
+- Condemn writes only absent condemnations, at `max(started_at, previous +
+  1)`. A rerun is a no-op for those already written.
+- Collect derives everything from stored rows; there is no run state. A
+  kill between doom *deleting* and the delete leaves writers to wait 30 s
+  and get 409 until the next collect, which finishes it.
+- `delete_changesets` of ids already deleted is a no-op (contract test).
+- The tombstone pass is idempotent. The fence flag is cleared only after
+  nothing is condemned and unresolved and the pass has finished.
+
+**Operator controls.**
+- `--dry-run` writes nothing (as today). `--condemn-only` and
+  `--collect-only` split the phases, like blob GC.
+- `--max-delete N` per run (default 100,000) and `--batch N` (default 500).
+- `--rate N` changesets deleted a second (default 2,000), a token bucket
+  across batches, so collect's write load on the database stays bounded
+  beside lands.
+- Off by default; staging first, then production, as section 9 says.
+
+**Metrics** (beside section 9's): `leep_gc_changesets_abandoned_total`,
+`leep_gc_changesets_kept_by_descendant_total`,
+`leep_gc_changeset_collect_batch_seconds` (doom *deleting* to *deleted*),
+`leep_gc_changesets_condemned_pending`, `leep_gc_fence_active`.
+
+**Runbooks** (beside section 9's): `LeepChangesetDoomStuck` (a *deleting*
+doom older than 5 minutes: rerun collect), `LeepGcFenceFlagStuck` (the
+flag set for over a day: writers pay fence reads; run collect),
+`LeepChangesetCollectSlow` (batch p99 over 5 s: lower `--batch`).
+
+**Tests.** Section 10, plus
+`collect_keeps_ancestors_of_every_changeset_it_skips`,
+`rescue_rows_are_written_ancestors_first` (with a store that fails after
+every prefix), and the fault sweeps and crash test CLAUDE.md requires.
+
 ## Alternatives considered
 | Alternative | Why not (now) |
 |---|---|
@@ -607,7 +730,11 @@ garbage collection".
    swarm store? Is the upper bound for tree nodes close enough to the
    exact count, measured on a larger host than the VPS, to judge the
    epochs ADR?
-5. **Number.** 0059 was the next free ADR number on `main` and on every
+5. **Phase 2 gate (section 11).** Does the combined ratio count towards
+   the 20% rule, given that trees are freed only by `gc --full`? Should
+   the sweep refuse, rather than warn, on a fence that breaks the
+   invariant? Who runs the gate's measurement, on which host?
+6. **Number.** 0059 was the next free ADR number on `main` and on every
    origin branch on 2026-10-21, including
    `derive/index-lease-and-bounded-queries`. Renumber if another ADR merges
    first.

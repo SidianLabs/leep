@@ -52,8 +52,8 @@ pub struct UnreachableOptions {
     /// Ref log entries older than this are dropped under the second policy
     /// (each ref's newest entry always stays).
     pub ref_log_retention: Duration,
-    /// Walk every reachable tree to make the tree counts exact under the
-    /// retention policy, instead of an upper bound.
+    /// Walk every reachable tree to make the tree counts of both policies
+    /// exact, instead of an upper bound.
     pub exact_trees: bool,
 }
 
@@ -72,7 +72,7 @@ pub struct Tally {
     pub rows: BTreeMap<&'static str, (u64, u64)>,
     /// Tree nodes and file contents only these changesets introduced
     /// relative to their first parent and their rebased copy: an upper bound
-    /// on what blob GC would then free, unless `exact`.
+    /// on what blob GC would then free, unless the policy's `exact_trees`.
     pub tree_nodes: u64,
     pub tree_node_bytes: u64,
     pub contents: u64,
@@ -128,11 +128,24 @@ pub struct UnreachableReport {
     /// What the lands recorded in the ref log wrote themselves: their copies
     /// and originals with the write path's rows, and their log entries.
     pub land_write: LandWrite,
+    /// With `exact_trees`: every tree node and content that some changeset
+    /// kept under the kept-log policy references, so blob-store growth per
+    /// land can stand beside what is reclaimable.
+    pub live_trees: Option<LiveTrees>,
     /// ADR 0059 as designed: the ref log is kept forever.
     pub log_kept: PolicyReport,
     /// The same with the ref log kept only for `ref_log_retention` (each
     /// ref's newest entry always), for the follow-up ADR.
     pub log_pruned: PolicyReport,
+}
+
+/// Live tree nodes and contents, sized as [`Tally`] sizes them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LiveTrees {
+    pub tree_nodes: u64,
+    pub tree_node_bytes: u64,
+    pub contents: u64,
+    pub content_bytes: u64,
 }
 
 /// Derived kinds the write path stores, as `leep-swarm` counts them.
@@ -557,17 +570,41 @@ pub async fn report(repo: &Repo, opts: &UnreachableOptions) -> Result<Unreachabl
     }
 
     let trees = tree_candidates(repo, &g, &doomed, &copy_of, &in_kept, &mut r).await?;
-    let live = if opts.exact_trees {
-        let reachable: Vec<u32> = (0..n as u32).filter(|i| pruned_seen[*i as usize]).collect();
-        Some(live_objects(repo, &g, &reachable, &mut r).await?)
+    // Exact: what the retention policy keeps is a subset of what the kept
+    // log keeps, so one live set, marked for the first and then extended by
+    // the rest, answers both without a second full walk.
+    let (dead_pruned, dead_kept): (HashSet<Hash>, HashSet<Hash>) = if opts.exact_trees {
+        let mut live = Live::default();
+        let pruned_live: Vec<u32> = (0..n as u32).filter(|i| pruned_seen[*i as usize]).collect();
+        live.mark(repo, &g, &pruned_live, &mut r).await?;
+        let dp = trees
+            .keys()
+            .filter(|h| !live.contains(h))
+            .copied()
+            .collect();
+        let kept_only: Vec<u32> = (0..n as u32)
+            .filter(|i| kept_seen[*i as usize] && !pruned_seen[*i as usize])
+            .collect();
+        live.mark(repo, &g, &kept_only, &mut r).await?;
+        let dk = trees
+            .iter()
+            .filter(|(h, c)| c.in_kept && !live.contains(h))
+            .map(|(h, _)| *h)
+            .collect();
+        r.live_trees = Some(live.tally);
+        (dp, dk)
     } else {
-        None
+        let dk = trees
+            .iter()
+            .filter(|(_, c)| c.in_kept)
+            .map(|(h, _)| *h)
+            .collect();
+        (trees.keys().copied().collect(), dk)
     };
     for (h, c) in &trees {
-        let exact_dead = live.as_ref().is_none_or(|l| !l.contains(h));
         for (t, on) in [
-            (&mut pruned.reclaimable, exact_dead),
-            (&mut kept.reclaimable, c.in_kept),
+            (&mut pruned.reclaimable, dead_pruned.contains(h)),
+            (&mut kept.reclaimable, dead_kept.contains(h)),
         ] {
             if !on {
                 continue;
@@ -581,9 +618,8 @@ pub async fn report(repo: &Repo, opts: &UnreachableOptions) -> Result<Unreachabl
             }
         }
     }
-    // Exact counts are for the retention policy only; the kept-log tally
-    // stays an upper bound.
-    pruned.exact_trees = live.is_some();
+    pruned.exact_trees = opts.exact_trees;
+    kept.exact_trees = opts.exact_trees;
     r.log_kept = kept;
     r.log_pruned = pruned;
     Ok(r)
@@ -744,51 +780,70 @@ async fn read_nodes(
     Ok(out)
 }
 
-/// Every tree node and content referenced by `reachable`: the mark of a full
-/// blob GC, kept in memory and not recorded.
-async fn live_objects(
-    repo: &Repo,
-    g: &Graph,
-    reachable: &[u32],
-    r: &mut UnreachableReport,
-) -> Result<HashSet<Hash>> {
-    let mut live: HashSet<Hash> = HashSet::new();
-    let mut stack: Vec<Hash> = Vec::new();
-    for chunk in reachable.chunks(PAGE) {
-        let keys: Vec<Hash> = chunk.iter().map(|&i| g.ids[i as usize].0).collect();
-        for v in repo
-            .meta()
-            .get_derived_many("root_tree", &keys)
-            .await?
-            .into_iter()
-            .flatten()
-        {
-            if let Ok(a) = <[u8; 32]>::try_from(v.as_ref()) {
-                if live.insert(Hash(a)) {
-                    stack.push(Hash(a));
+/// The tree nodes and contents some kept changeset references: the mark of a
+/// full blob GC, kept in memory and not recorded.
+#[derive(Default)]
+struct Live {
+    set: HashSet<Hash>,
+    tally: LiveTrees,
+}
+
+impl Live {
+    fn contains(&self, h: &Hash) -> bool {
+        self.set.contains(h)
+    }
+
+    /// Add everything the trees of `changesets` reference, stopping at
+    /// objects already marked.
+    async fn mark(
+        &mut self,
+        repo: &Repo,
+        g: &Graph,
+        changesets: &[u32],
+        r: &mut UnreachableReport,
+    ) -> Result<()> {
+        let mut stack: Vec<Hash> = Vec::new();
+        for chunk in changesets.chunks(PAGE) {
+            let keys: Vec<Hash> = chunk.iter().map(|&i| g.ids[i as usize].0).collect();
+            for v in repo
+                .meta()
+                .get_derived_many("root_tree", &keys)
+                .await?
+                .into_iter()
+                .flatten()
+            {
+                if let Ok(a) = <[u8; 32]>::try_from(v.as_ref()) {
+                    if self.set.insert(Hash(a)) {
+                        stack.push(Hash(a));
+                    }
                 }
             }
-        }
-        while !stack.is_empty() {
-            let take = stack.len().min(NODE_BATCH);
-            let level: Vec<Hash> = stack.split_off(stack.len() - take);
-            for (node, _) in read_nodes(repo, &level, r).await?.into_values() {
-                for e in node.entries.into_values() {
-                    match e {
-                        TreeEntry::File { content, .. } => {
-                            live.insert(content);
-                        }
-                        TreeEntry::Dir { tree } => {
-                            if live.insert(tree) {
-                                stack.push(tree);
+            while !stack.is_empty() {
+                let take = stack.len().min(NODE_BATCH);
+                let level: Vec<Hash> = stack.split_off(stack.len() - take);
+                for (node, size) in read_nodes(repo, &level, r).await?.into_values() {
+                    self.tally.tree_nodes += 1;
+                    self.tally.tree_node_bytes += size;
+                    for e in node.entries.into_values() {
+                        match e {
+                            TreeEntry::File { content, size, .. } => {
+                                if self.set.insert(content) {
+                                    self.tally.contents += 1;
+                                    self.tally.content_bytes += size;
+                                }
+                            }
+                            TreeEntry::Dir { tree } => {
+                                if self.set.insert(tree) {
+                                    stack.push(tree);
+                                }
                             }
                         }
                     }
                 }
             }
         }
+        Ok(())
     }
-    Ok(live)
 }
 
 #[cfg(test)]
@@ -850,7 +905,7 @@ mod tests {
         // The original of the rebased land is in its copy's scan window, so
         // it is kept under both policies; only the abandoned work goes.
         assert_eq!(rep.window_originals, 1);
-        assert!(rep.log_pruned.exact_trees && !rep.log_kept.exact_trees);
+        assert!(rep.log_pruned.exact_trees && rep.log_kept.exact_trees);
         for p in [&rep.log_kept, &rep.log_pruned] {
             assert_eq!(p.unreachable, 1);
             assert_eq!(p.reclaimable.changesets, 1);
@@ -910,6 +965,49 @@ mod tests {
         assert_eq!(rep.land_write.changesets, 3);
         assert!(rep.land_write.row_bytes > 0 && rep.land_write.log_bytes > 0);
         assert!(rep.ref_log_prunable_entries > crate::land::LANDED_COPY_SCAN as u64);
+    }
+
+    /// The upper bound counts what a doomed changeset introduced; the exact
+    /// count drops what unrelated live history happens to share, under
+    /// both policies.
+    #[tokio::test]
+    async fn exact_trees_drop_objects_live_history_shares() {
+        let r = repo();
+        let base = commit(&r, &[], &[("a/x", Some("0")), ("b/y", Some("0"))], "base").await;
+        r.meta()
+            .cas_ref_logged("main", None, Some(base), &RefUpdateContext::new("cas"))
+            .await
+            .unwrap();
+        commit(&r, &[base], &[("a/x", Some("wip"))], "wip").await;
+        let side = commit(&r, &[base], &[("b/y", Some("1"))], "side").await;
+        r.land(side, "main").await.unwrap();
+        // Later, live history arrives at the same `a/` as the abandoned work.
+        let head = r.meta().get_ref("main").await.unwrap().unwrap();
+        let same = commit(&r, &[head], &[("a/x", Some("wip"))], "same").await;
+        r.land(same, "main").await.unwrap();
+
+        let bound = UnreachableOptions {
+            exact_trees: false,
+            ..opts()
+        };
+        let rep = report(&r, &bound).await.unwrap();
+        assert!(rep.live_trees.is_none());
+        for p in [&rep.log_kept, &rep.log_pruned] {
+            assert!(!p.exact_trees);
+            assert_eq!(p.reclaimable.changesets, 1);
+            assert_eq!((p.reclaimable.tree_nodes, p.reclaimable.contents), (2, 1));
+        }
+        let rep = report(&r, &opts()).await.unwrap();
+        for p in [&rep.log_kept, &rep.log_pruned] {
+            assert!(p.exact_trees);
+            // Only the abandoned root is its own.
+            assert_eq!((p.reclaimable.tree_nodes, p.reclaimable.contents), (1, 0));
+        }
+        let live = rep.live_trees.unwrap();
+        // Roots of base, side and same; `a/` twice and `b/` twice.
+        assert_eq!(live.tree_nodes, 7);
+        assert_eq!(live.contents, 3);
+        assert!(live.tree_node_bytes > 0 && live.content_bytes > 0);
     }
 
     #[tokio::test]

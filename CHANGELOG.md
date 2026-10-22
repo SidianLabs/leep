@@ -7,6 +7,14 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 ## [Unreleased]
 
+### The unreachable-changeset dry run counts trees exactly for both policies
+- `gc --unreachable --dry-run --exact-trees` now makes the tree node and
+  content counts exact for the policy ADR 0059 builds (ref log kept), not
+  only for the ref log retention column, with one full mark as before.
+- With `--exact-trees` it also prints the live tree nodes and contents per
+  land, so blob-store growth stands beside what `gc --full` would free
+  after a sweep.
+
 ### Lands can be refused at a full queue instead of timing out in it
 - `--land-queue-batches N` (default `off`) bounds each ref's land queue in
   batches of up to 64 lands (ADR 0060, section 2). A land that would wait

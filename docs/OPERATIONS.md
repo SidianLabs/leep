@@ -1817,8 +1817,10 @@ are all recent. Ages come from when the store first stored each changeset
 changeset stored before migration 0007 counts as stored when it was
 applied. The count needs a v7 schema: run `leep-server migrate` first.
 
-Tree counts are an upper bound. `--exact-trees` makes them exact by walking
-every reachable tree, which costs as much as `gc --full`. **Do not use it
+Tree counts are an upper bound. `--exact-trees` makes them exact, in both
+columns, by walking every reachable tree, which costs as much as
+`gc --full`. It also prints the live tree nodes and contents per land: the
+blob store's growth, beside what `gc --full` would free after a sweep. **Do not use it
 on a small host beside live servers, such as the 2-core VPS.** Memory is
 about 60 bytes per changeset, plus one hash per live object with
 `--exact-trees`.
