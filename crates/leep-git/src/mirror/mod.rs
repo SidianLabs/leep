@@ -17,6 +17,12 @@
 //! landed onto `<ref>` through `POST /v1/land`, which rebases them like an
 //! agent's land, and then deleted with an exact lease (ADR 0049).
 //!
+//! Refs under a `--ref-prefix` (such as `review/`) are found as they appear
+//! in Leep and are push-only (ADR 0061): a Leep rewrite of one is pushed with
+//! a lease when the remote holds only what that ref held in Leep, a Leep
+//! delete deletes the branch with the same lease, and anything pushed to the
+//! branch on the remote is reported and never imported or overwritten.
+//!
 //! The decision depends only on the two current values and the map, never
 //! on remembered progress, so a crash at any point is recovered by running
 //! the cycle again: exports are deterministic, the mirror's merges are
@@ -56,8 +62,9 @@ pub const CAS_OPERATION: &str = "git-mirror";
 /// Test hook: the mirror aborts, as a SIGKILL would stop it, when it reaches
 /// the step this names (`export-commit`, `exported`, `pushed`, `imported`,
 /// `landed`, `diverged-pushed`, `merge-imported`, `merged`, `merge-landed`,
-/// `land-imported`, `land-landed`, `land-deleted`). Lets the crash tests stop
-/// it exactly between two steps rather than at a random moment.
+/// `land-imported`, `land-landed`, `land-deleted`, `prefix-deleted`). Lets
+/// the crash tests stop it exactly between two steps rather than at a random
+/// moment.
 pub const CRASH_ENV: &str = "LEEP_MIRROR_CRASH_AT";
 
 pub(crate) fn crash_point(name: &str) {
@@ -311,6 +318,9 @@ pub struct Config {
     pub refs: Vec<RefSpec>,
     /// Also mirror every Leep tag (`tags/*`) to `refs/tags/*`.
     pub tags: bool,
+    /// Also mirror every Leep ref under one of these prefixes (each ending
+    /// in `/`) to the branch of the same name, push-only.
+    pub ref_prefixes: Vec<String>,
     /// Import commits pushed to the remote into Leep (fast-forward only).
     pub import: bool,
     /// Leep refs whose backward moves may be mirrored with a lease.
@@ -343,8 +353,8 @@ impl Config {
                 bail!("--allow-rewind {name}: main and tags are never rewound on the remote");
             }
         }
-        if self.refs.is_empty() && !self.tags {
-            bail!("nothing to mirror: pass --ref (repeatable) or --tags");
+        if self.refs.is_empty() && !self.tags && self.ref_prefixes.is_empty() {
+            bail!("nothing to mirror: pass --ref (repeatable), --ref-prefix or --tags");
         }
         let mut owned = vec![("--diverged-prefix", &self.diverged_prefix)];
         if let Some(p) = &self.land_prefix {
@@ -372,11 +382,58 @@ impl Config {
                 bail!("land branches (--land-branches) need --import");
             }
         }
+        self.validate_ref_prefixes()?;
         if self.on_divergence == OnDivergence::Merge && !self.import {
             bail!("--on-divergence merge needs --import");
         }
         if self.merge_author.trim().is_empty() {
             bail!("--merge-author must not be empty");
+        }
+        Ok(())
+    }
+
+    /// A ref prefix gives the mirror push, rewind and delete rights over a
+    /// set of branches, so it must name exactly the branches it means.
+    fn validate_ref_prefixes(&self) -> Result<()> {
+        for p in &self.ref_prefixes {
+            if p.is_empty() || p == "/" {
+                bail!("--ref-prefix must not be empty or '/': it would cover every branch");
+            }
+            if !p.ends_with('/') || p.starts_with('/') {
+                bail!("--ref-prefix {p}: must be a relative prefix ending in '/', such as review/");
+            }
+            // Only the one trailing '/' is the prefix's own: `review//`
+            // leaves `review/`, which is no ref name.
+            let stem = p.strip_suffix('/').unwrap_or(p);
+            leep_core::refname::validate(stem).map_err(|e| anyhow!("--ref-prefix {p}: {e}"))?;
+            if p.starts_with("tags/") {
+                bail!("--ref-prefix {p}: tags are never mirrored under a prefix");
+            }
+            let mut owned = vec![("--diverged-prefix", self.diverged_prefix.as_str())];
+            if let Some(l) = &self.land_prefix {
+                owned.push(("--land-prefix", l));
+            }
+            for (flag, o) in owned {
+                if p.starts_with(o) || o.starts_with(p.as_str()) {
+                    bail!("--ref-prefix {p} and {flag} {o} overlap");
+                }
+            }
+            for q in &self.ref_prefixes {
+                if q != p && q.starts_with(p.as_str()) {
+                    bail!("--ref-prefix {p} and --ref-prefix {q} overlap");
+                }
+            }
+            for r in &self.refs {
+                let branch = r.git.strip_prefix("refs/heads/");
+                if r.leep.starts_with(p.as_str())
+                    || branch.is_some_and(|b| b.starts_with(p.as_str()))
+                {
+                    bail!(
+                        "--ref {} falls under --ref-prefix {p}: a ref is mirrored one way or the other",
+                        r.leep
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -392,8 +449,18 @@ struct Tracked {
     local: Option<ObjectId>,
     st: RefStatus,
     next_try: Instant,
-    /// Set from configuration, or discovered (`--tags`).
+    /// Set from configuration, or discovered (`--tags`, `--ref-prefix`).
     configured: bool,
+    /// The `--ref-prefix` it was discovered under: push-only, and deleted on
+    /// the remote when it is deleted in Leep.
+    prefix: Option<String>,
+    /// The remote value last seen equal to this ref's export.
+    pushed: Option<ObjectId>,
+    /// Dropped from tracking at the end of the cycle.
+    forget: bool,
+    /// Why the remote branch's name is no Leep ref name, for a branch under
+    /// a prefix that no Leep ref can own.
+    bad_name: Option<String>,
     /// The last automatic merge that fell back to a report, so the same
     /// pair is not merged again every cycle.
     merge_memo: Option<MergeMemo>,
@@ -421,11 +488,31 @@ impl Tracked {
             local: None,
             next_try: Instant::now(),
             configured,
+            prefix: None,
+            pushed: None,
+            forget: false,
+            bad_name: None,
             merge_memo: None,
         }
     }
 
+    fn discovered(name: &str, prefix: &str) -> Tracked {
+        let mut t = Tracked::new(
+            RefSpec {
+                leep: name.to_string(),
+                git: format!("refs/heads/{name}"),
+            },
+            false,
+        );
+        t.prefix = Some(prefix.to_string());
+        t.st.ref_prefix = Some(prefix.to_string());
+        t
+    }
+
     fn side_ref(&self, prefix: &str) -> Option<String> {
+        if self.prefix.is_some() {
+            return None;
+        }
         self.spec
             .git
             .strip_prefix("refs/heads/")
@@ -448,8 +535,14 @@ pub struct Mirror<'a> {
     pushes_since_gc: u32,
     /// Land branches on the remote, by git ref.
     lands: BTreeMap<String, land::LandBranch>,
+    /// Prefix branches deleted on the remote, newest last.
+    deleted: Vec<status::DeletedBranch>,
+    branches_deleted: u64,
     _lock: std::fs::File,
 }
+
+/// How many deletions the status keeps.
+const DELETED_KEPT: usize = 50;
 
 fn log(msg: impl AsRef<str>) {
     eprintln!(
@@ -529,6 +622,8 @@ impl<'a> Mirror<'a> {
             status: Arc::new(Mutex::new(status)),
             pushes_since_gc: 0,
             lands: BTreeMap::new(),
+            deleted: Vec::new(),
+            branches_deleted: 0,
             _lock: lock,
         })
     }
@@ -537,11 +632,16 @@ impl<'a> Mirror<'a> {
     /// the next cycle poll the remote.
     pub fn run(&mut self, wake: &status::Wake) -> ! {
         log(format!(
-            "mirroring {} to {} ({} refs{})",
+            "mirroring {} to {} ({} refs{}{})",
             redact(&self.cfg.server),
             self.remote.display_url(),
             self.refs.len(),
-            if self.cfg.tags { " and tags" } else { "" }
+            if self.cfg.tags { " and tags" } else { "" },
+            self.cfg
+                .ref_prefixes
+                .iter()
+                .map(|p| format!(", refs under {p}"))
+                .collect::<String>()
         ));
         loop {
             self.cycle();
@@ -634,6 +734,7 @@ impl<'a> Mirror<'a> {
                 backoff(r, self.cfg.max_backoff);
             }
         }
+        self.refs.retain(|r| !r.forget);
         self.sync_lands();
         if self.pushes_since_gc >= 200 {
             self.remote.gc_auto();
@@ -649,6 +750,8 @@ impl<'a> Mirror<'a> {
             s.cycles += 1;
             s.refs = self.refs.iter().map(|r| r.st.clone()).collect();
             s.land_branches = self.lands.values().map(|b| b.st.clone()).collect();
+            s.branches_deleted = self.branches_deleted;
+            s.deleted_branches = self.deleted.clone();
             s.commits_exported = self.ex.commits_written;
             s.ref_log_seq = self.seq.flatten();
             s.clone()
@@ -679,7 +782,17 @@ impl<'a> Mirror<'a> {
             }
             // A deleted tag that was only discovered is forgotten.
             self.refs
-                .retain(|r| r.configured || refs.contains_key(&r.spec.leep));
+                .retain(|r| r.configured || r.prefix.is_some() || refs.contains_key(&r.spec.leep));
+        }
+        // A prefix ref that is deleted stays tracked until its branch is
+        // deleted on the remote, or reported.
+        for p in &self.cfg.ref_prefixes {
+            for name in refs.keys().filter(|n| n.starts_with(p.as_str())) {
+                if !self.refs.iter().any(|r| &r.spec.leep == name) {
+                    log(format!("{name}: found under {p}; mirroring it"));
+                    self.refs.push(Tracked::discovered(name, p));
+                }
+            }
         }
         for r in &mut self.refs {
             let new = refs.get(&r.spec.leep).copied();
@@ -710,7 +823,14 @@ impl<'a> Mirror<'a> {
             .land_prefix
             .as_ref()
             .map(|p| format!("refs/heads/{p}"));
-        let prefixes: Vec<String> = land_prefix.iter().cloned().collect();
+        let ref_prefixes: Vec<(String, String)> = self
+            .cfg
+            .ref_prefixes
+            .iter()
+            .map(|p| (p.clone(), format!("refs/heads/{p}")))
+            .collect();
+        let mut prefixes: Vec<String> = land_prefix.iter().cloned().collect();
+        prefixes.extend(ref_prefixes.iter().map(|(_, g)| g.clone()));
         let found = self
             .remote
             .ls_remote(&names, &prefixes)
@@ -721,6 +841,22 @@ impl<'a> Mirror<'a> {
             .map(|(n, _)| n.clone())
             .collect();
         self.remote.fetch(&fetch).map_err(|e| anyhow!(e))?;
+        // A branch under a ref prefix whose Leep ref is not known here: left
+        // over from a ref deleted while the mirror was down, or not yet seen
+        // in Leep. `retire` decides which, from a fresh read of Leep.
+        for name in found.keys() {
+            let Some((p, _)) = ref_prefixes.iter().find(|(_, g)| name.starts_with(g)) else {
+                continue;
+            };
+            if !self.refs.iter().any(|r| &r.spec.git == name) {
+                let leep = name.trim_start_matches("refs/heads/");
+                let mut t = Tracked::discovered(leep, p);
+                t.bad_name = leep_core::refname::validate(leep)
+                    .err()
+                    .map(|e| e.to_string());
+                self.refs.push(t);
+            }
+        }
         for r in &mut self.refs {
             let new = found.get(&r.spec.git).copied();
             if new != r.remote {
@@ -744,6 +880,12 @@ impl<'a> Mirror<'a> {
     }
 
     fn sync_ref(&mut self, i: usize) -> Result<()> {
+        if let Some(why) = self.refs[i].bad_name.clone() {
+            return self.bad_name(i, &why);
+        }
+        if self.refs[i].leep.is_none() && self.refs[i].prefix.is_some() {
+            return self.retire(i);
+        }
         let Some(l) = self.refs[i].leep else {
             let r = &mut self.refs[i];
             match r.remote {
@@ -799,6 +941,7 @@ impl<'a> Mirror<'a> {
                 Ok(())
             }
             Some(g) if self.ancestor(g, e)? => self.push(i, e, None),
+            Some(g) if self.refs[i].prefix.is_some() => self.prefix_moved(i, e, g),
             Some(g) if self.ancestor(e, g)? => {
                 // The remote is ahead. If its tip came from Leep, Leep moved
                 // back (an undo) and must not be pushed forward again; a
@@ -849,6 +992,7 @@ impl<'a> Mirror<'a> {
             ));
         }
         set_state(r, RefState::InSync, String::new());
+        r.pushed = r.remote;
         r.st.failures = 0;
         r.st.last_sync = Some(status::now());
         // The divergence is resolved: retire the branch Leep's side went to.
@@ -908,6 +1052,183 @@ impl<'a> Mirror<'a> {
                 Ok(())
             }
         }
+    }
+
+    /// Did this ref hold, in Leep, the commit `g` the remote has for it?
+    /// Then the remote branch holds nothing Leep lacks, and the mirror may
+    /// replace or delete it with a lease on `g`. Decided from the ref log so
+    /// a restarted mirror answers the same.
+    fn held(&mut self, i: usize, g: ObjectId) -> Result<bool> {
+        if self.refs[i].pushed == Some(g) {
+            return Ok(true);
+        }
+        let Some(cg) = import::leep_origin(self.leep, &mut self.ex, g)? else {
+            return Ok(false);
+        };
+        self.leep.ref_had(&self.refs[i].spec.leep, &cg)
+    }
+
+    /// A prefix ref whose remote branch is not behind Leep's export. If the
+    /// branch holds only what the ref held in Leep (an agent rebased,
+    /// squashed or undid it), push the export with a lease. If someone
+    /// pushed to the branch, report it: prefix refs are never imported, and
+    /// their pushes are never overwritten.
+    fn prefix_moved(&mut self, i: usize, e: ObjectId, g: ObjectId) -> Result<()> {
+        if self.held(i, g)? {
+            log(format!(
+                "{}: rewritten in Leep; updating {} from {g} to {e} with a lease",
+                self.refs[i].spec.leep, self.refs[i].spec.git
+            ));
+            return self.push(i, e, Some(Some(g)));
+        }
+        let ahead = self.ancestor(e, g)?;
+        let r = &mut self.refs[i];
+        mark_pending(r);
+        let prefix = r.prefix.clone().unwrap_or_default();
+        set_state(
+            r,
+            if ahead {
+                RefState::RemoteAhead
+            } else {
+                RefState::Diverged
+            },
+            format!(
+                "{} has commits pushed to the remote (up to {g}) that Leep's {} lacks; refs \
+                 under --ref-prefix {prefix} are push-only, so the mirror neither imports nor \
+                 overwrites them. Land that work in Leep, then delete the remote branch and \
+                 the mirror pushes Leep's again",
+                r.spec.git, r.spec.leep
+            ),
+        );
+        Ok(())
+    }
+
+    /// A prefix ref that Leep no longer has. Its remote branch is deleted
+    /// with a lease when it holds only what the ref held in Leep; a branch
+    /// someone pushed to is reported and left alone.
+    fn retire(&mut self, i: usize) -> Result<()> {
+        let (name, git_ref) = (
+            self.refs[i].spec.leep.clone(),
+            self.refs[i].spec.git.clone(),
+        );
+        let Some(g) = self.refs[i].remote else {
+            self.forget(i);
+            return Ok(());
+        };
+        if !self.ex.repo.has_object(g) {
+            self.remote_stale = true;
+            let r = &mut self.refs[i];
+            set_state(r, RefState::Pending, format!("fetching remote commit {g}"));
+            return Ok(());
+        }
+        // The ref list read earlier may predate the ref: never delete a
+        // branch on a stale answer.
+        if let Some(now) = self.leep.refs()?.get(&name).copied() {
+            let r = &mut self.refs[i];
+            r.leep = Some(now);
+            r.st.leep = Some(now.to_string());
+            r.next_try = Instant::now();
+            set_state(r, RefState::Pending, "found in Leep".into());
+            return Ok(());
+        }
+        if !self.held(i, g)? {
+            let r = &mut self.refs[i];
+            mark_pending(r);
+            set_state(
+                r,
+                RefState::RemoteAhead,
+                format!(
+                    "{name} is not in Leep, but {git_ref} on the remote is at {g}, which \
+                     {name} never held in Leep; the mirror leaves it alone. Delete it by hand \
+                     once its work is landed or not needed"
+                ),
+            );
+            return Ok(());
+        }
+        let max = self.cfg.max_backoff;
+        match self.remote.push(&git_ref, None, Some(Some(g))) {
+            Ok(PushOutcome::Ok) => {
+                crash_point("prefix-deleted");
+                log(format!(
+                    "{name}: deleted in Leep; deleted {git_ref} at {g} with a lease"
+                ));
+                self.branches_deleted += 1;
+                self.deleted.push(status::DeletedBranch {
+                    leep_ref: name,
+                    git_ref,
+                    commit: g.to_string(),
+                    at: status::now(),
+                });
+                if self.deleted.len() > DELETED_KEPT {
+                    self.deleted.remove(0);
+                }
+                self.forget(i);
+            }
+            Ok(PushOutcome::Rejected(why)) => {
+                // Usually the branch moved since the last poll: the next
+                // poll sees its new value, which `held` then judges.
+                self.remote_stale = true;
+                let r = &mut self.refs[i];
+                r.st.pushes.rejected += 1;
+                r.st.failures += 1;
+                let state = if r.st.failures >= 3 {
+                    RefState::Error
+                } else {
+                    RefState::Pending
+                };
+                set_state(
+                    r,
+                    state,
+                    format!("the remote refused to delete {git_ref} at {g}: {why}"),
+                );
+                if r.st.failures > 1 {
+                    backoff(r, max);
+                }
+            }
+            Ok(PushOutcome::Failed(why)) | Err(why) => {
+                count_error(&self.status, "git");
+                let r = &mut self.refs[i];
+                r.st.pushes.failed += 1;
+                r.st.failures += 1;
+                set_state(r, RefState::Error, why);
+                backoff(r, max);
+            }
+        }
+        Ok(())
+    }
+
+    /// A branch under a prefix whose name Leep rejects: no Leep ref can hold
+    /// it, so asking the server about it would fail every cycle. Report it
+    /// once and leave it to a person.
+    fn bad_name(&mut self, i: usize, why: &str) -> Result<()> {
+        if self.refs[i].remote.is_none() {
+            self.forget(i);
+            return Ok(());
+        }
+        let r = &mut self.refs[i];
+        mark_pending(r);
+        let prefix = r.prefix.clone().unwrap_or_default();
+        set_state(
+            r,
+            RefState::RemoteAhead,
+            format!(
+                "{} is under --ref-prefix {prefix} but no Leep ref can have its name ({why}); \
+                 the mirror never pushes, imports or deletes it. Rename or delete it by hand",
+                r.spec.git
+            ),
+        );
+        Ok(())
+    }
+
+    /// Stop tracking a prefix ref and drop the mirror's local refs for it.
+    fn forget(&mut self, i: usize) {
+        let r = &mut self.refs[i];
+        r.forget = true;
+        let local = format!("refs/leep-mirror/leep/{}", r.spec.leep);
+        let _ = self.remote.delete_local_ref(&local);
+        let _ = self
+            .remote
+            .delete_local_ref(&git::tracking_ref(&r.spec.git));
     }
 
     fn rewound(&mut self, i: usize, e: ObjectId, g: ObjectId) -> Result<()> {
@@ -1301,6 +1622,7 @@ mod tests {
             work_dir: "/tmp/x".into(),
             refs: vec![RefSpec::parse("main").unwrap()],
             tags: false,
+            ref_prefixes: vec![],
             import: false,
             allow_rewind: vec![],
             diverged_prefix: "leep-diverged/".into(),
@@ -1358,6 +1680,60 @@ mod tests {
         assert!(c.validate().is_err(), "land branches without --import");
         assert_eq!("merge".parse(), Ok(OnDivergence::Merge));
         assert!("rebase".parse::<OnDivergence>().is_err());
+    }
+
+    #[test]
+    fn ref_prefixes_must_be_narrow_and_not_overlap_owned_prefixes_or_refs() {
+        let with = |prefixes: &[&str]| {
+            let mut c = config();
+            c.import = true;
+            c.land_prefix = Some("leep-land/".into());
+            c.ref_prefixes = prefixes.iter().map(|p| p.to_string()).collect();
+            c.validate()
+        };
+        assert!(with(&["review/"]).is_ok());
+        assert!(with(&["review/", "release/"]).is_ok());
+        assert!(with(&[""]).is_err(), "empty");
+        assert!(with(&["/"]).is_err(), "slash");
+        assert!(with(&["review//"]).is_err(), "empty component");
+        assert!(with(&["review//x/"]).is_err(), "empty component inside");
+        assert!(with(&["review"]).is_err(), "no trailing slash");
+        assert!(with(&["/review/"]).is_err(), "absolute");
+        assert!(with(&["re view/"]).is_err(), "not a ref name");
+        assert!(with(&["tags/"]).is_err(), "tags");
+        assert!(with(&["leep-diverged/"]).is_err(), "the diverged prefix");
+        assert!(
+            with(&["leep-diverged/x/"]).is_err(),
+            "inside the diverged prefix"
+        );
+        assert!(with(&["leep-land/"]).is_err(), "the land prefix");
+        assert!(
+            with(&["leep-land/main/"]).is_err(),
+            "inside the land prefix"
+        );
+        assert!(with(&["leep-"]).is_err(), "no trailing slash");
+        assert!(with(&["review/", "review/a/"]).is_err(), "two that overlap");
+        // The diverged prefix covers a ref prefix the other way round.
+        let mut c = config();
+        c.diverged_prefix = "review/diverged/".into();
+        c.ref_prefixes = vec!["review/".into()];
+        assert!(c.validate().is_err());
+        // A --ref under the prefix, by its Leep name or by its branch.
+        let mut c = config();
+        c.ref_prefixes = vec!["review/".into()];
+        c.refs.push(RefSpec::parse("review/x").unwrap());
+        assert!(c.validate().is_err());
+        let mut c = config();
+        c.ref_prefixes = vec!["review/".into()];
+        c.refs
+            .push(RefSpec::parse("x:refs/heads/review/x").unwrap());
+        assert!(c.validate().is_err());
+        // A prefix alone is something to mirror.
+        let mut c = config();
+        c.refs.clear();
+        assert!(c.validate().is_err());
+        c.ref_prefixes = vec!["review/".into()];
+        assert!(c.validate().is_ok());
     }
 
     #[test]

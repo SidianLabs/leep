@@ -7,6 +7,28 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 ## [Unreleased]
 
+### Leep is developed on Leep
+- Leep's own development runs through a live Leep server: agents land on
+  Leep refs `review/<area>-<desc>`, the git mirror pushes them to GitHub
+  for pull requests and CI, and work reaches `leep-main` (mirrored to
+  GitHub `main`) only by squashing and landing in Leep once CI is green.
+  docs/OPERATIONS.md, "Dogfooding: Leep on Leep", covers the mirror,
+  GitHub rulesets, the deploy key, break-glass, Dependabot and rollback.
+- CI cancels a pull request's older runs when it is pushed again. Runs for
+  pushes to `main` are never cancelled.
+
+### The git mirror follows refs under a prefix
+- `leep-git mirror run --ref-prefix review/` (repeatable) mirrors every Leep
+  ref under `review/` to the branch of the same name as refs appear, without
+  a `--ref` for each (ADR 0061). These refs are push-only: never imported,
+  merged or landed onto, whatever `--import` says. A rebase or squash in
+  Leep is pushed with a lease, and a ref deleted in Leep has its branch
+  deleted with a lease, which is healthy rather than `deleted-in-leep`. A
+  branch someone pushed to is reported as `remote-ahead` and left alone.
+- The status gains `ref_prefix` per ref and `branches_deleted` and
+  `deleted_branches` at the top, and the metric
+  `leep_mirror_branches_deleted_total` is new. The status version stays 1.
+
 ### zstd 0.14
 - zstd is upgraded from 0.13 to 0.14 (Refs #122). Stored packs and changeset
   rows read as before. **Operators:** pack ids hash the compressed bytes, so

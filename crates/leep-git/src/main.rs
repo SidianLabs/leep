@@ -94,6 +94,12 @@ struct RunArgs {
     /// Also mirror every Leep tag to refs/tags/.
     #[arg(long)]
     tags: bool,
+    /// Also mirror every Leep ref under PREFIX (such as review/) to the
+    /// branch of the same name, as refs appear (repeatable). Push-only: a
+    /// branch someone pushed to is reported, never imported or overwritten.
+    /// A ref deleted in Leep has its branch deleted with a lease.
+    #[arg(long = "ref-prefix", value_name = "PREFIX")]
+    ref_prefixes: Vec<String>,
     /// Land commits pushed to the remote in Leep when they fast-forward the
     /// Leep ref, through the server's land policy.
     #[arg(long)]
@@ -242,6 +248,14 @@ fn run_mirror(cmd: MirrorCmd) -> Result<i32> {
                         }
                     );
                 }
+                for d in &s.deleted_branches {
+                    println!(
+                        "  deleted {} at {} {}s ago (deleted in Leep)",
+                        d.git_ref.trim_start_matches("refs/heads/"),
+                        &d.commit[..12.min(d.commit.len())],
+                        now.saturating_sub(d.at)
+                    );
+                }
                 for p in &problems {
                     eprintln!("attention: {p}");
                 }
@@ -262,6 +276,7 @@ fn run_mirror(cmd: MirrorCmd) -> Result<i32> {
                 work_dir: a.work_dir,
                 refs,
                 tags: a.tags,
+                ref_prefixes: a.ref_prefixes,
                 import: a.import,
                 allow_rewind: a.allow_rewind,
                 diverged_prefix: a.diverged_prefix,

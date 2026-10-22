@@ -1526,7 +1526,19 @@ has the table.
    relax the policy to let a mirror through.
 4. **`remote-ahead`**: `--import` is off and someone pushed to the remote.
    Enable `--import`, or remove the commits from the remote by an ordinary
-   revert pushed through Leep.
+   revert pushed through Leep. For a ref under `--ref-prefix` (such as
+   `review/x`), someone pushed to its branch, which the mirror never
+   imports or overwrites. Land that work in Leep if it is wanted, then
+   delete the branch (`git push origin :refs/heads/review/x`); the mirror
+   pushes Leep's ref again, or forgets it if Leep deleted it.
+   A prefix branch also stays in `remote-ahead` when its Leep ref was
+   deleted and the mirror, after a restart, can no longer prove the ref
+   held the branch's tip: the changesets were collected by GC after the
+   delete and the mirror's map does not list the commit (a rebuilt work
+   directory), or the ref's log entries are gone. It stays until someone
+   deletes it by hand: check that it holds nothing wanted first. A branch whose name is no Leep ref
+   name (such as `review/-x`) is reported the same way and needs the same
+   fix.
 5. **`deleted-in-leep`**: the Leep ref was deleted. Delete the remote branch
    if that was intended (`git push origin :refs/heads/NAME`), or recreate
    the Leep ref. Remove the `--ref` if the branch is no longer mirrored.

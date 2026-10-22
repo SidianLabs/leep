@@ -5,6 +5,13 @@ on:
     branches: ["main"]
   pull_request:
 
+# A newer push to a pull request cancels its older runs. Every push to main
+# gets a group of its own (the run id), so those runs are never cancelled or
+# replaced while queued.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
 

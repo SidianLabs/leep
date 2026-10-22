@@ -33,7 +33,9 @@ pub enum RefState {
     /// Leep moved the ref back (an undo); the remote still has the newer
     /// commits and the mirror does not force it.
     Rewound,
-    /// The remote has commits Leep lacks and importing is off.
+    /// The remote has commits Leep lacks and importing is off, or the ref
+    /// is under a `--ref-prefix` (push-only) and someone pushed to its
+    /// branch, before or after the Leep ref was deleted.
     RemoteAhead,
     /// Importing a push was refused by Leep's land policy.
     Refused,
@@ -183,6 +185,22 @@ pub struct RefStatus {
     pub merges: MergeCounts,
     #[serde(default)]
     pub land_branches: LandCounts,
+    /// The `--ref-prefix` this ref was found under; null for a `--ref` or a
+    /// tag.
+    #[serde(default)]
+    pub ref_prefix: Option<String>,
+}
+
+/// A branch under a `--ref-prefix` that the mirror deleted on the remote
+/// because its Leep ref was deleted.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeletedBranch {
+    pub leep_ref: String,
+    pub git_ref: String,
+    /// The value deleted, which was also the lease.
+    pub commit: String,
+    /// Unix seconds.
+    pub at: u64,
 }
 
 impl RefStatus {
@@ -212,6 +230,12 @@ pub struct Status {
     /// Land branches on the remote that are not landed and deleted yet.
     #[serde(default)]
     pub land_branches: Vec<LandBranchStatus>,
+    /// Prefix branches deleted on the remote since the mirror started.
+    #[serde(default)]
+    pub branches_deleted: u64,
+    /// The most recent of those deletions, oldest first.
+    #[serde(default)]
+    pub deleted_branches: Vec<DeletedBranch>,
 }
 
 pub fn now() -> u64 {
@@ -411,6 +435,17 @@ pub fn render_metrics(s: &Status) -> String {
             esc(r)
         );
     }
+    head(
+        &mut o,
+        "leep_mirror_branches_deleted_total",
+        "counter",
+        "Branches under a --ref-prefix deleted on the remote after their Leep ref was deleted.",
+    );
+    let _ = writeln!(
+        o,
+        "leep_mirror_branches_deleted_total {}",
+        s.branches_deleted
+    );
     head(
         &mut o,
         "leep_mirror_commits_exported_total",

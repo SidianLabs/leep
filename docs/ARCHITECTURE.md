@@ -820,6 +820,13 @@ changeset and commit. With `--land-branches`, remote branches
 (`create: false`), which rebases them like an agent's land, then deleted
 with an exact lease; conflicts and refusals stay in the status.
 
+With `--ref-prefix review/` ([ADR 0061](adr/0061-mirror-ref-prefixes.md)) the
+mirror also follows every Leep ref under the prefix as it appears, push-only:
+never imported, merged or landed onto. A rewrite in Leep (rebase, squash) is
+pushed with a lease, and a Leep delete deletes the branch with a lease, but
+only when the ref log shows the Leep ref held the remote's tip; a branch
+someone pushed to is reported and left alone.
+
 ## 7. Caching tiers
 
 ```
