@@ -425,6 +425,24 @@ async fn a_missing_changeset_is_reported_with_the_child_that_needs_it() {
         assert_eq!(p.kind.as_deref(), Some("blame"), "{:#?}", r.problems);
     }
     assert!(r.derived["generation"].skipped >= 1);
+    let p = only(&r, "stored_parent_missing");
+    assert_eq!(p.changeset.as_deref(), Some(left2.to_string().as_str()));
+}
+
+/// A stored changeset no ref reaches whose parent is gone: what a
+/// changeset sweep deleting parents before children would leave (ADR
+/// 0059). The default sample mode finds it.
+#[tokio::test]
+async fn a_stored_changeset_with_a_deleted_parent_is_reported() {
+    let w = world().await;
+    let x = commit(&w.repo, &[w.ids[0]], &[("x.txt", Some(b"x"))]).await;
+    let y = commit(&w.repo, &[x], &[("y.txt", Some(b"y"))]).await;
+    assert_clean(&w).await;
+    assert_eq!(w.meta.delete_changesets(&[x], &[]).await.unwrap(), 1);
+    let r = run_verify(&w, &VerifyOptions::default()).await;
+    let p = only(&r, "stored_parent_missing");
+    assert_eq!(p.changeset.as_deref(), Some(y.to_string().as_str()));
+    assert_eq!(p.key.as_deref(), Some(x.0.to_hex().as_str()));
 }
 
 #[tokio::test]

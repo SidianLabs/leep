@@ -409,6 +409,8 @@ impl Verifier<'_> {
         }
         self.flush_blobs().await?;
         drop(walk);
+        self.phase("stored parents");
+        self.check_stored_parents().await?;
         self.visited_trees = HashSet::new();
         self.visited_blobs = HashSet::new();
 
@@ -1106,6 +1108,51 @@ impl Verifier<'_> {
             self.tick();
         }
         Ok(())
+    }
+
+    /// Every stored changeset's parents are stored: the changeset sweep
+    /// (ADR 0059) deletes children before parents, so a stored changeset
+    /// naming a deleted one is damage, whether or not a ref reaches it.
+    /// Every changeset under `--full`, the sampled ones otherwise.
+    async fn check_stored_parents(&mut self) -> Result<()> {
+        let meta = self.repo.meta().clone();
+        let mut after = None;
+        loop {
+            let page = meta.list_changesets(after, PAGE).await?;
+            let Some(last) = page.last().copied() else {
+                return Ok(());
+            };
+            after = Some(last);
+            let found = meta.get_changesets(&page).await?;
+            let mut asks: Vec<(ChangesetId, ChangesetId)> = Vec::new();
+            for (id, cs) in page.iter().zip(&found) {
+                let Some(cs) = cs else { continue };
+                if self.sampled(id, cs) {
+                    asks.extend(cs.parents.iter().map(|p| (*id, *p)));
+                }
+            }
+            for chunk in asks.chunks(PAGE) {
+                let parents: Vec<ChangesetId> = chunk.iter().map(|(_, p)| *p).collect();
+                let stored = meta.get_changesets(&parents).await?;
+                for ((child, parent), got) in chunk.iter().zip(stored) {
+                    if got.is_none() {
+                        self.log.push(
+                            Problem::new(
+                                "history",
+                                "stored_parent_missing",
+                                format!(
+                                    "stored changeset {child} names parent {parent}, which is \
+                                     not stored"
+                                ),
+                            )
+                            .key(&parent.0)
+                            .changeset(*child),
+                        );
+                    }
+                }
+            }
+            self.tick();
+        }
     }
 
     async fn scan_gc_rows(&mut self) -> Result<()> {
