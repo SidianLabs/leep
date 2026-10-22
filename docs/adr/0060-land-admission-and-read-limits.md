@@ -423,6 +423,10 @@ differs from the text above as follows, each for the reason given.
 - **Alert and runbook.** `LeepReadsShedding` watches the `search` class
   only, against the search route's request rate, since that is the only
   class built. `LeepServerErrors` subtracts `leep_read_class_shed_total`.
+  After E5 and E5b shed 90 to 98% of searches for whole runs that worked
+  as designed, the alert also requires the class's permits to complete
+  fewer than 2 searches a minute each (`docs/RUNBOOKS.md`,
+  LeepReadsShedding): shedding alone is the limit at work, not a fault.
 - **Testing.** Router tests on memory stores
   (`crates/leep-server/tests/read_limits.rs`) cover the refusal's shape, the
   release of the permit when a search succeeds, fails, is cancelled by the

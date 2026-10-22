@@ -7,6 +7,29 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 ## [Unreleased]
 
+### Alerts no longer fire on load the limits are handling
+- `LeepReadsShedding` now also needs the search permits to complete fewer
+  than 2 searches a minute each; shedding most searches under a swarm is
+  the limit working (90 to 98% in the E5 and E5b swarms).
+- `LeepLandSlowP99` is renamed `LeepLandSlow` and fires on mean queue wait
+  or mean batch time above 15 s, not land p99 above 5 s, which a busy ref
+  exceeds while every land gets in.
+- `LeepLandLeaseFlapping` counts leases taken from a holder that failed to
+  renew, not every acquisition: refs that land less than every 30 s
+  release and retake their lease harmlessly.
+- `LeepServerErrors` no longer counts body-budget refusals (503 with
+  `Leep-Refused: body-budget`), and `LeepIndexingAnswersHigh` leaves shed
+  searches out of its denominator.
+- OPERATIONS.md has a production readiness checklist.
+- New optional `leep-host-inodes` alerts, `LeepInodesLow` (ticket, under
+  10% of inodes free) and `LeepInodesCritical` (page, under 3%), from
+  node_exporter: a filesystem blob store uses one inode per loose object and
+  can run out of inodes with space to spare. OPERATIONS.md now recommends a
+  scheduled `leep-server repack` for filesystem stores and a blob volume
+  sized for inodes.
+- **Operators:** replace these rules, and rename `LeepLandSlowP99` in
+  routes and silences.
+
 ### A land conflict no longer hides same-size local changes
 - After a land conflict, `leep land` writes your changes over the files it
   has just checked out at the new head. Where file timestamps are coarse,
