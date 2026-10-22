@@ -137,6 +137,17 @@ impl GcLease {
     /// epoch even after expiry) cannot vouch for the time in between. It
     /// fails a renewal period short of the TTL, before another holder can
     /// take the lease.
+    ///
+    /// Two residual caveats, both outside what the lease can promise:
+    /// - A destructive statement that starts just before the deadline can
+    ///   commit after the lease lapses. That is bounded by one statement
+    ///   and benign: deletes are idempotent and ordered by the doom
+    ///   handshake, so a new holder finishes or abandons what it finds.
+    /// - The deadline is measured on this host's monotonic clock, while the
+    ///   store judges the TTL by its wall clock. A suspended host (a VM
+    ///   paused, a laptop asleep) may not advance the monotonic clock while
+    ///   the TTL expires, so it can resume believing it still holds the
+    ///   lease. As with ADR 0012's VM freeze, the fence margin covers it.
     pub fn check(&self) -> Result<()> {
         let since = self.last_ok.lock().unwrap().elapsed();
         if self.lost.load(Ordering::SeqCst) || since >= GC_LEASE_TTL - GC_LEASE_RENEW {

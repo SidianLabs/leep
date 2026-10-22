@@ -919,3 +919,38 @@ async fn a_damaged_fence_flag_does_not_block_collect_for_good() {
     assert_eq!(r.deleted, 1, "{r:?}");
     assert!(!stored(&w, x).await);
 }
+
+/// The row stamp alone, without the end-time guard: the same slow condemn
+/// as `condemnation_is_stamped_when_written_not_when_condemn_started`,
+/// with the flag's end time cleared before collect (as a flag lost or
+/// overwritten would leave it). Only the condemnation row's own write time
+/// keeps X past collect.
+#[tokio::test(start_paused = true)]
+async fn the_row_stamp_alone_keeps_a_changeset_condemned_during_a_slow_mark() {
+    let w = World::new(13);
+    let base = commit_file(13, &w.clean, None, "base.txt", "b\n", "base").await;
+    w.meta.cas_ref("main", None, Some(base)).await.unwrap();
+    let x = commit_file(13, &w.clean, Some(base), "x", "x\n", "x").await;
+    let o = opts();
+    let t = later();
+    let clock = SlowMarkClock {
+        first: std::sync::Mutex::new(Some(t)),
+        then: t + 25 * 60,
+    };
+    changeset_sweep::condemn(&w.clean, &o, &clock)
+        .await
+        .unwrap();
+    w.meta
+        .put_derived(
+            GC_FENCE_ACTIVE,
+            &crate::changeset_gc::fence_flag_key(),
+            Bytes::copy_from_slice(&1i64.to_be_bytes()),
+        )
+        .await
+        .unwrap();
+    let r = changeset_sweep::collect(&w.clean, &o, &TestClock::at(t + 30 * 60))
+        .await
+        .unwrap();
+    assert_eq!((r.deleted, r.fence_pending), (0, 1), "{r:?}");
+    assert!(stored(&w, x).await);
+}
