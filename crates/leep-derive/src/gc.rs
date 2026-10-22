@@ -624,12 +624,16 @@ pub enum Mark {
 /// never goes stale.
 pub const GC_MARK: &str = "gc-mark-v1";
 
-/// The only value a [`GC_MARK`] row has. Anything else reads as no row,
-/// which costs a walk and never loses a blob.
+/// The only value a [`GC_MARK`] row is written with.
 const MARK_VALUE: &[u8] = &[1];
 
+/// Whether a row is there. Its value is not consulted: only marks are ever
+/// written, so a present row whose value reads wrong is a damaged read of a
+/// mark. Reading it as no row would let a damaged read in condemn and
+/// another in collect delete a referenced blob; reading it as a mark only
+/// keeps one. `verify` reports the bad value.
 fn is_mark(v: &Option<Bytes>) -> bool {
-    v.as_deref() == Some(MARK_VALUE)
+    v.is_some()
 }
 
 /// Check a [`GC_MARK`] row's value. Public for verification and the fuzz
@@ -853,8 +857,9 @@ pub(crate) async fn check_incremental_mark(r: &Repo) -> std::result::Result<u64,
         .list_derived(GC_MARK, None, usize::MAX)
         .await
         .map_err(|e| e.to_string())?;
-    for (key, value) in rows {
-        if value.as_ref() != MARK_VALUE || !(full.contains(&key) || ids.contains(&key)) {
+    // A wrong value is a damaged mark, still a mark (see `is_mark`).
+    for (key, _) in rows {
+        if !(full.contains(&key) || ids.contains(&key)) {
             return Err(format!("row {key} names nothing referenced"));
         }
     }
@@ -1244,6 +1249,37 @@ mod tests {
             MergeResponse::Merged { id } => id,
             other => panic!("expected clean merge: {other:?}"),
         }
+    }
+
+    /// A mark row whose value reads damaged still counts as a mark: it was
+    /// written as one. Reading it as no row let a damaged read in condemn
+    /// and another in collect delete a referenced tree node (found by the
+    /// fault sweep, seed 2897 of `gc_under_faults_never_loses_referenced_data`).
+    #[tokio::test]
+    async fn a_damaged_mark_row_still_keeps_its_object() {
+        let (repo, blobs) = setup();
+        let base = commit(&repo, &[], &[("d/x.txt", Some("x\n"))]).await;
+        age_all(&blobs).await;
+        let opts = GcOptions::default();
+        condemn(&repo, &opts, &TestClock::at(now())).await.unwrap();
+        let root = repo.root_trees(&[base]).await.unwrap()[0];
+        let sub = match repo.read_tree(root).await.unwrap().entries.values().next() {
+            Some(TreeEntry::Dir { tree }) => *tree,
+            other => panic!("expected d/: {other:?}"),
+        };
+        repo.meta()
+            .put_derived(GC_MARK, &sub, Bytes::from_static(&[7]))
+            .await
+            .unwrap();
+        let r = condemn(&repo, &opts, &TestClock::at(now() + HOUR))
+            .await
+            .unwrap();
+        assert_eq!(r.condemned, 0, "{r:?}");
+        let c = collect(&repo, &opts, &TestClock::at(now() + 2 * HOUR))
+            .await
+            .unwrap();
+        assert_eq!(c.deleted, 0, "{c:?}");
+        repo.list_files(base, "").await.unwrap();
     }
 
     /// Age every blob in the store past any grace window.
@@ -2310,25 +2346,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_damaged_row_reads_as_unmarked() {
+    async fn a_damaged_row_still_reads_as_a_mark() {
         let (r, blobs) = setup();
         let id = commit(&r, &[], &[("d/a.txt", Some("a\n"))]).await;
         condemn(&r, &opts(1, false), &TestClock::at(now()))
             .await
             .unwrap();
         let root = r.root_tree(id).await.unwrap();
-        // A damaged changeset row and root row: the next run walks again.
+        // A damaged changeset row and root row: only marks are written, so
+        // they are still marks, and the next run trusts them.
         for key in [id.0, root] {
             r.meta()
                 .put_derived(GC_MARK, &key, Bytes::from_static(&[7]))
                 .await
                 .unwrap();
         }
-        // Golden bytes: changing them makes every recorded mark read as absent.
+        // Golden bytes: changing them would orphan every recorded mark.
         assert_eq!(MARK_VALUE, [1u8]);
         assert!(decode_mark(&[7]).is_err() && decode_mark(MARK_VALUE).is_ok());
         let stats = assert_marks_agree(&r, "damaged rows").await;
-        assert_eq!(stats.changesets_walked, 1);
+        assert_eq!(stats.changesets_walked, 0);
         assert_eq!(blobs.len(), 3);
         assert!(crate::integrity::kinds::check_droppable(GC_MARK).is_err());
     }
