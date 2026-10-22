@@ -702,8 +702,8 @@ batches the ref takes every waiting land, up to 64, replays them onto the
 head and moves the ref once, and lands that arrive meanwhile wait for the
 next batch. Without a bound the queue grows until clients time out and
 send their lands again into the same queue: in the swarm at 2,000 agents on
-two cores, lands waited 28 to 30 s against a 30 s client timeout and 10,000
-to 15,000 were resent per run (`docs/PERFORMANCE.md`, E5).
+two cores, lands waited 27.5 to 30 s against a 30 s client timeout and
+10,300 to 15,300 were resent per run (`docs/PERFORMANCE.md`, E5 and E5b).
 `--land-queue-batches` bounds the queue in batches (ADR 0060, section 2).
 
 | Flag / env | Default | What it bounds |
@@ -711,9 +711,10 @@ to 15,000 were resent per run (`docs/PERFORMANCE.md`, E5).
 | `--land-queue-batches N\|off` / `LEEP_LAND_QUEUE_BATCHES` | `off` | Batches a land may wait behind, its own included. The queue holds the waiting lands over 64, rounded up, plus one while a batch replays; a land that would wait behind more than `N` is refused. A land that joins a batch still filling is admitted, since it waits no longer than the lands already in it. |
 
 - A refused land gets `503`, code `unavailable`, `Retry-After` and
-  `Leep-Refused: admission` at once, before its changeset is read: the
-  batches ahead times the ref's recent batch time, rounded up, between 1
-  and 10 s. Nothing is queued or recorded, so the land may be sent again,
+  `Leep-Refused: admission` at once, before its changeset is read.
+  `Retry-After` is when the next slot frees: the replaying batch's
+  remaining time, taken as the ref's recent batch time (more than one
+  batch only if the bound was lowered), rounded up, between 1 and 10 s. Nothing is queued or recorded, so the land may be sent again,
   with or without a land id. A keyed land whose id the ref already recorded
   is answered from the record instead (one indexed read), so a client
   whose first send landed is not refused while the queue stays full.
@@ -731,11 +732,15 @@ to 15,000 were resent per run (`docs/PERFORMANCE.md`, E5).
 - **Tuning.** A land waits about one batch time per batch ahead of it, so
   choose `N` with `N` times a full batch's time under half the clients'
   request timeout (15 s for a 30 s timeout, as the swarm's agents use). A
-  full batch takes about 64 divided by the ref's lands per second. In E5 one ref
-  on two cores landed 12 to 16 times a second at 2,000 agents, so a full
-  batch of 64 took 4 to 5 s: start at `N = 2` or `3` there, and on a
-  faster host or a ref that lands more often, higher. `N = 1` admits lands
-  only while no batch replays, which keeps batches small; it is for tests.
+  full batch takes about 64 divided by the ref's lands per second. At
+  2,000 agents on one ref on two cores, E5 and E5b landed 9.5 to 16.6
+  times a second across arms and rounds (11.2 median with the default
+  search limit, E5b), so a full batch took 4 to 7 s. Start at `N = 2`
+  there: two batches stay under 15 s even at the slowest rounds, while
+  `N = 3` does only above about 13 lands a second (`64 * 3 / 15`). On a
+  faster host, or a ref that lands more often, go higher by the same
+  rule. `N = 1` is for tests only: it admits lands only while no batch
+  replays, which collapses each batch to about one land.
   Watch `leep_land_queue_batches` (pinned at `N` means the bound is doing
   the work), `leep_land_admission_refused_total` against `leep_land_total`,
   and `leep_land_lock_wait_seconds`, which should stay under the clients'

@@ -617,9 +617,10 @@ impl Repo {
     /// Refuse a land with [`leep_core::Error::Refused`] when it would wait
     /// behind more than `batches` batches of its ref's queue, its own
     /// included (`None`: never), counting the lands waiting in batches of 64
-    /// plus the one being replayed (ADR 0060, section 2). It bounds a land's wait in the queue, where a bound in
-    /// lands would allow 64 times more wait at full batches than at single
-    /// ones. Only new arrivals are refused; queued lands never are.
+    /// plus the one being replayed (ADR 0060, section 2). It bounds a land's
+    /// wait in the queue, where a bound in lands would allow 64 times more
+    /// wait at full batches than at single ones. Only new arrivals are
+    /// refused; queued lands never are.
     pub fn with_land_queue_batches(mut self, batches: Option<usize>) -> Self {
         self.land_queue_batches = batches.map(|n| n.max(1));
         for route in ["direct", "forwarded"] {

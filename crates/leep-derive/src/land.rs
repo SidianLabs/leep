@@ -205,11 +205,27 @@ impl RefQueue {
             + usize::from(self.replaying)
     }
 
-    /// `Retry-After` for a land refused with `ahead` batches queued: about
-    /// when they will have been replayed.
-    fn retry_after_secs(&self, ahead: usize) -> u64 {
-        let secs = (ahead as f64 * self.batch_secs.unwrap_or(1.0)).ceil() as u64;
+    /// `Retry-After` for `batches` batch times, rounded up and clamped.
+    fn retry_after_secs(&self, batches: usize) -> u64 {
+        let secs = (batches as f64 * self.batch_secs.unwrap_or(1.0)).ceil() as u64;
         secs.clamp(ADMISSION_RETRY_MIN_SECS, ADMISSION_RETRY_MAX_SECS)
+    }
+
+    /// `Retry-After` for a land refused at `bound`: about when a slot frees.
+    /// The queue holds `ahead >= bound` batches; each batch replayed frees
+    /// one, so `ahead + 1 - bound` of them must finish, not all `ahead`.
+    fn refused_retry_after_secs(&self, bound: usize) -> u64 {
+        let ahead = self.batches();
+        self.retry_after_secs((ahead + 1).saturating_sub(bound).max(1))
+    }
+
+    /// Fold a finished batch's time into the moving average.
+    fn record_batch(&mut self, took: Duration) {
+        let took = took.as_secs_f64();
+        self.batch_secs = Some(match self.batch_secs {
+            Some(avg) => avg + BATCH_TIME_WEIGHT * (took - avg),
+            None => took,
+        });
     }
 }
 
@@ -441,12 +457,7 @@ async fn lead(repo: Repo, target_ref: String, queue: Arc<Mutex<RefQueue>>) {
         };
         let started = Instant::now();
         repo.land_batch(&target_ref, batch).await;
-        let took = started.elapsed().as_secs_f64();
-        let mut q = lock(&queue);
-        q.batch_secs = Some(match q.batch_secs {
-            Some(avg) => avg + BATCH_TIME_WEIGHT * (took - avg),
-            None => took,
-        });
+        lock(&queue).record_batch(started.elapsed());
     }
 }
 
@@ -670,7 +681,7 @@ impl Repo {
             let ahead = q.batches();
             match self.land_queue_batches {
                 Some(bound) if q.batches_with(1) > bound => {
-                    Some((ahead, bound, q.retry_after_secs(ahead)))
+                    Some((ahead, bound, q.refused_retry_after_secs(bound)))
                 }
                 _ => {
                     q.reserved += 1;
@@ -698,8 +709,9 @@ impl Repo {
                 Ok(None) => {}
                 Err(e @ Error::LandIdReused { .. }) => return Err(e),
                 // Nothing was done either way: refusing is still true.
+                // A store error the refusal hides from the client.
                 Err(e) => {
-                    tracing::debug!(r#ref = target_ref, error = %e, "land id lookup failed at a full queue")
+                    tracing::warn!(r#ref = target_ref, error = %e, "land id lookup failed at a full queue")
                 }
             }
         }
@@ -1541,5 +1553,95 @@ impl Repo {
             }
         }
         Ok(Ok(onto))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn secs(s: f64) -> Duration {
+        Duration::from_secs_f64(s)
+    }
+
+    /// A queue with `waiting` lands and a batch replaying or not; the
+    /// waiting lands are counted as admitted places, which `batches` counts
+    /// like queued ones.
+    fn queue(waiting: usize, replaying: bool) -> RefQueue {
+        RefQueue {
+            reserved: waiting,
+            replaying,
+            ..RefQueue::default()
+        }
+    }
+
+    #[test]
+    fn batch_times_are_a_moving_average() {
+        let mut q = RefQueue::default();
+        assert_eq!(q.batch_secs, None);
+        q.record_batch(secs(2.0));
+        assert_eq!(q.batch_secs, Some(2.0), "the first batch is the average");
+        q.record_batch(secs(7.0));
+        assert!((q.batch_secs.unwrap() - 3.0).abs() < 1e-9, "2 + 0.2 * 5");
+        q.record_batch(secs(3.0));
+        assert!((q.batch_secs.unwrap() - 3.0).abs() < 1e-9);
+        for _ in 0..200 {
+            q.record_batch(secs(0.5));
+        }
+        assert!((q.batch_secs.unwrap() - 0.5).abs() < 1e-6, "converges");
+    }
+
+    #[test]
+    fn retry_after_is_batch_times_rounded_up_and_clamped() {
+        let mut q = RefQueue::default();
+        // Before any batch finished, a batch counts as 1 s.
+        assert_eq!(q.retry_after_secs(1), 1);
+        assert_eq!(q.retry_after_secs(3), 3);
+        assert_eq!(q.retry_after_secs(40), ADMISSION_RETRY_MAX_SECS);
+        q.record_batch(secs(2.5));
+        assert_eq!(q.retry_after_secs(1), 3);
+        assert_eq!(q.retry_after_secs(2), 5);
+        assert_eq!(q.retry_after_secs(5), ADMISSION_RETRY_MAX_SECS);
+        let mut fast = RefQueue::default();
+        fast.record_batch(secs(0.01));
+        assert_eq!(fast.retry_after_secs(3), ADMISSION_RETRY_MIN_SECS);
+        assert_eq!(fast.retry_after_secs(0), ADMISSION_RETRY_MIN_SECS);
+    }
+
+    /// A refused land waits for the next freed slot: `ahead + 1 - bound`
+    /// batch times, not all `ahead` of them.
+    #[test]
+    fn a_refusal_waits_for_the_next_freed_slot() {
+        // Bound 1, a batch replaying: one batch must finish.
+        let mut q = queue(0, true);
+        q.record_batch(secs(2.5));
+        assert_eq!(q.batches(), 1);
+        assert_eq!(q.refused_retry_after_secs(1), 3);
+        // Bound 2, a batch replaying and a full one waiting: still one.
+        let mut q = queue(MAX_BATCH, true);
+        q.record_batch(secs(2.5));
+        assert_eq!(q.batches(), 2);
+        assert_eq!(q.batches_with(1), 3, "refused at a bound of 2");
+        assert_eq!(q.refused_retry_after_secs(2), 3);
+        // The same queue at a bound of 1 (lowered meanwhile): two.
+        assert_eq!(q.refused_retry_after_secs(1), 5);
+        // Bound 1, no batch replaying and a full batch waiting: one.
+        let mut q = queue(MAX_BATCH, false);
+        q.record_batch(secs(4.0));
+        assert_eq!(q.batches_with(1), 2);
+        assert_eq!(q.refused_retry_after_secs(1), 4);
+        // Never more than the clamp.
+        let mut q = queue(3 * MAX_BATCH, true);
+        q.record_batch(secs(9.0));
+        assert_eq!(q.refused_retry_after_secs(1), ADMISSION_RETRY_MAX_SECS);
+    }
+
+    #[test]
+    fn a_land_joining_a_filling_batch_is_admitted() {
+        // At a bound of 2, a replaying batch and 63 waiting: the 64th fits.
+        let q = queue(MAX_BATCH - 1, true);
+        assert_eq!(q.batches_with(1), 2);
+        let q = queue(MAX_BATCH, true);
+        assert_eq!(q.batches_with(1), 3);
     }
 }

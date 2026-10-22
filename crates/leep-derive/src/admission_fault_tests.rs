@@ -237,7 +237,9 @@ async fn queued_lands_are_never_dropped_and_off_admits_every_land() {
         match bound {
             Some(_) => {
                 let e = last.expect_err("refused at the bound");
-                assert_eq!(refused_wait(&e), Some(Duration::from_secs(2)), "{e}");
+                // Two batches ahead, but one slot frees when the replaying one
+                // ends: one batch time (1 s before any finished).
+                assert_eq!(refused_wait(&e), Some(Duration::from_secs(1)), "{e}");
                 assert_eq!(started.elapsed(), Duration::ZERO, "refused at once");
                 assert_eq!(meta_calls(&w), calls, "an unkeyed refusal reads nothing");
             }
@@ -633,4 +635,62 @@ async fn leader_killed_with_full_queue() {
             );
         }
     }
+}
+
+/// A land cancelled while it reads its changeset, after admission and
+/// before it is queued, gives its place back: the queue holds nothing and
+/// the next land is admitted at a bound of 1.
+#[tokio::test(start_paused = true)]
+async fn a_land_cancelled_between_admission_and_enqueue_gives_its_place_back() {
+    let w = World::new(6);
+    let ids = lands_to_make(&w, 2).await;
+    let server = w.server().with_land_queue_batches(Some(1));
+    let reads = w.plan.calls(Op::GetChangeset);
+    w.plan.script(
+        Op::GetChangeset,
+        reads + 1,
+        Fault::Stall(Duration::from_secs(3600)),
+    );
+    let r = server.clone();
+    let cs = ids[0];
+    let stalled = tokio::spawn(async move { r.land(cs, REF).await });
+    while w.plan.calls(Op::GetChangeset) == reads {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert_eq!(server.land_queues.batches(REF), 1, "the admitted place");
+    assert_eq!(server.land_queues.pending(REF), 0, "not queued yet");
+
+    stalled.abort();
+    assert!(stalled.await.unwrap_err().is_cancelled());
+    assert_eq!(server.land_queues.batches(REF), 0, "the place came back");
+
+    landed(&server.land(ids[1], REF).await.unwrap());
+    assert_eq!(server.land_queues.batches(REF), 0);
+    assert_ref_log_replays(6, &*w.meta).await;
+}
+
+/// The leader task of a process that lives on is aborted mid-batch (a
+/// panic does the same): the queue stops counting the batch as replaying,
+/// its lands get an error, and the next land is admitted at a bound of 1
+/// and lands.
+#[tokio::test(start_paused = true)]
+async fn an_aborted_leader_stops_counting_its_batch() {
+    let w = World::new(7);
+    let ids = lands_to_make(&w, 2).await;
+    let server = w.server().with_land_queue_batches(Some(1));
+    let held = hold_a_batch(&w, &server, ids[0], Duration::from_secs(3600)).await;
+    assert_eq!(server.land_queues.batches(REF), 1, "replaying");
+    assert!(
+        server.land(ids[1], REF).await.is_err(),
+        "full at a bound of 1"
+    );
+
+    server.land_queues.abort_leaders();
+    let abandoned = held.await.unwrap().unwrap_err();
+    assert!(abandoned.to_string().contains("abandoned"), "{abandoned}");
+    assert_eq!(server.land_queues.batches(REF), 0, "no batch replays");
+
+    landed(&server.land(ids[1], REF).await.unwrap());
+    assert_eq!(server.land_queues.batches(REF), 0);
+    assert_ref_log_replays(7, &*w.meta).await;
 }

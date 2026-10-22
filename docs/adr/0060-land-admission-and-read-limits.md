@@ -457,13 +457,18 @@ differs from the text above as follows, each for the reason given.
   every batch would hold one land and the bound would cut lands/s instead
   of bounding the wait. As built, `N = 1` admits lands only while no batch
   replays, and `N = 2` admits one full batch behind the replaying one.
+  `N = 1` is for tests only: it collapses each batch to about one land.
 - **Lands being admitted count.** The check and the enqueue are not one
   step: `get_changeset` runs between them. An admitted land holds a place
   (`RefQueue::reserved`) from the check until it is queued or ends, so
   concurrent arrivals cannot all pass a check made before any of them was
   queued. The place is given back if the request is cancelled or the
   changeset read fails.
-- **`Retry-After`** is the batches ahead times the ref's moving average of
+- **`Retry-After`** is the time until a slot frees, **not the batches
+  ahead times the batch time**. A refused land finds `ahead >= N` batches,
+  and each batch the leader finishes frees one, so it waits for
+  `ahead + 1 - N` batches (one, unless the bound was lowered meanwhile),
+  not for all `ahead`. It is that count times the ref's moving average of
   batch times (each batch weighs 0.2, from its take until it is answered),
   1 s per batch before the first one finishes, rounded up and **clamped to
   1 to 10 s, not 1 to 30 s**. `N` is sized so the whole queue waits less
@@ -471,8 +476,16 @@ differs from the text above as follows, each for the reason given.
   follow a bound set too high. 10 s is section 1's ceiling, `MAX_RETRY_WAIT`,
   so every client that retries refusals waits instead of reporting.
 - **A failed land id lookup at a full queue refuses the land** (503 with
-  `Leep-Refused: admission`) instead of answering 500. Nothing was done
-  either way, and the resend reads the id again.
+  `Leep-Refused: admission`) instead of answering 500, and logs the store
+  error at WARN, since the refusal hides it from the client. Nothing was
+  done either way, and the resend reads the id again.
+- **"Nothing was done" holds per request, not per land.** A follower whose
+  forward failed (`Forwarded::Failed`, no answer) sends the land again,
+  and that second copy can be refused while the first is still queued on
+  the leader and lands. The refusal is still true of the request it
+  answers. The client's resend is then answered from the land id's record,
+  or, for an unkeyed land, found by the landed-copy scan, so it does not
+  land twice.
 - **Errors.** A refusal is `leep_core::Error::Refused` (new, not persisted),
   which the server maps to 503 `unavailable` with `Retry-After` and
   `Leep-Refused`, and does not log as a failure. It is not counted in
@@ -508,11 +521,16 @@ differs from the text above as follows, each for the reason given.
   forwards), `leader_killed_with_full_queue` (sweep: every agent lands
   within the lease TTL plus 2 s of the takeover, at a bound of 2 with
   more agents than a batch holds) and
-  `queued_lands_are_never_dropped_and_off_admits_every_land`. The two
+  `queued_lands_are_never_dropped_and_off_admits_every_land`, with
+  `a_land_cancelled_between_admission_and_enqueue_gives_its_place_back`
+  and `an_aborted_leader_stops_counting_its_batch`; `land::tests` cover
+  the moving average and `Retry-After`. The two
   `land_check_*` cases belong to section 3. Router tests in
   `crates/leep-server/tests/land_admission.rs` cover the refusal's shape,
   the recorded answer, queued lands, `off`, the metrics and a follower
-  relaying a leader's refusal over HTTP. The crash test gains
+  relaying a leader's refusal over HTTP. `leep-e2e`'s
+  `leep_land_resends_a_land_not_admitted_and_lands_it_once` runs the real
+  `leep land` against `--land-queue-batches 1`. The crash test gains
   `killed_server_with_a_full_land_queue_loses_nothing_{sqlite,postgres}`
   with `--land-queue-batches 1`; kills are not synchronized with a full
   queue, but at a bound of 1 the queue is full whenever a batch replays,
