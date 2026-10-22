@@ -50,6 +50,25 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   land, so blob-store growth stands beside what `gc --full` would free
   after a sweep.
 
+### Binary installs: a systemd unit, an env file and the alert rules as a file
+- `deploy/systemd/leep-server.service` runs `leep-server` as a dedicated
+  `leep` user with systemd sandboxing, restart on failure and
+  `systemctl reload` sending SIGHUP (tokens, signing keys and review policy
+  files). `deploy/leep-server.env.example` lists every `LEEP_` variable the
+  server reads, with its default; DEPLOY.md, "Without Docker", walks
+  through installing both.
+- The Prometheus rules ship as `deploy/prometheus/leep-alerts.yml`, ready
+  for `rule_files`; OPERATIONS.md no longer carries a copy to cut out with
+  `awk`. **Operators** who extracted the rules from OPERATIONS.md: load the
+  file instead (the rules are unchanged).
+- Text logs are coloured only on a terminal, and never when `NO_COLOR` is
+  set: logs written to a file or the journal no longer contain escape codes
+  such as `\x1b[2m`. JSON logs are unchanged.
+- `leep-server gen-token --help`, `hash-token --help` and
+  `backup-verify --help` no longer list the store and timeout flags, which
+  those commands ignore. The flags are still accepted there, so existing
+  scripts keep working.
+
 ### Alerts no longer fire on load the limits are handling
 - `LeepReadsShedding` now also needs the search permits to complete fewer
   than 2 searches a minute each; shedding most searches under a swarm is

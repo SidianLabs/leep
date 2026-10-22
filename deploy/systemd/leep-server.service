@@ -1,0 +1,70 @@
+# systemd unit for leep-server installed from binaries; see docs/DEPLOY.md,
+# "Without Docker". Install:
+#
+#   sudo useradd --system --home-dir /var/lib/leep --shell /usr/sbin/nologin leep
+#   sudo install -d -m 0750 -o root -g leep /etc/leep
+#   sudo install -m 0640 -o root -g leep deploy/leep-server.env.example /etc/leep/leep-server.env
+#   sudo install -m 0644 deploy/systemd/leep-server.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now leep-server
+#
+# `systemctl reload leep-server` sends SIGHUP, which re-reads the tokens
+# file, the signing keys file and the review policy file. Flags and
+# variables in the environment file are read only at start: change them and
+# `systemctl restart leep-server`.
+
+[Unit]
+Description=Leep version control server
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=leep
+Group=leep
+EnvironmentFile=/etc/leep/leep-server.env
+# The SQLite and filesystem blob defaults are relative (./leep-data), so
+# start in the state directory even when the environment file names none.
+WorkingDirectory=/var/lib/leep
+StateDirectory=leep
+StateDirectoryMode=0750
+ExecStart=/usr/local/bin/leep-server
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=2s
+# Shutdown lets requests in flight finish, each bounded by
+# --request-timeout (default 5m); give it that long plus a margin.
+TimeoutStopSec=330s
+# Every loose blob of a filesystem store is a file, and every client a socket.
+LimitNOFILE=65536
+UMask=0027
+
+# Hardening. The process needs only its state directory, the network and
+# read access to /etc/leep.
+NoNewPrivileges=yes
+ProtectSystem=strict
+# Writable data. Add the blob directory here if LEEP_BLOBS points outside
+# /var/lib/leep.
+ReadWritePaths=/var/lib/leep
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+
+[Install]
+WantedBy=multi-user.target
