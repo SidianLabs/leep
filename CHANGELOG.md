@@ -7,6 +7,23 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 ## [Unreleased]
 
+### Alerts no longer fire on load the limits are handling
+- `LeepReadsShedding` now also needs the search permits to complete fewer
+  than 2 searches a minute each; shedding most searches under a swarm is
+  the limit working (90 to 98% in the E5 and E5b swarms).
+- `LeepLandSlowP99` is renamed `LeepLandSlow` and fires on mean queue wait
+  or mean batch time above 15 s, not land p99 above 5 s, which a busy ref
+  exceeds while every land gets in.
+- `LeepLandLeaseFlapping` counts leases taken from a holder that failed to
+  renew, not every acquisition: refs that land less than every 30 s
+  release and retake their lease harmlessly.
+- `LeepServerErrors` no longer counts body-budget refusals (503 with
+  `Leep-Refused: body-budget`), and `LeepIndexingAnswersHigh` leaves shed
+  searches out of its denominator.
+- OPERATIONS.md has a production readiness checklist.
+- **Operators:** replace these rules, and rename `LeepLandSlowP99` in
+  routes and silences.
+
 ### Lands can be refused at a full queue instead of timing out in it
 - `--land-queue-batches N` (default `off`) bounds each ref's land queue in
   batches of up to 64 lands (ADR 0060, section 2). A land that would wait

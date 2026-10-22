@@ -1188,7 +1188,10 @@ up to 15,300 resends per run.
   98% of the swarm's search requests. That is the design: 5 to 8 searches a
   second are offered, and one permit serves 0.14 to 0.22. `LeepReadsShedding`
   (half shed for 15 minutes) would fire through this whole workload, which
-  is what the alert is for.
+  is what the alert is for. *Correction:* firing through a workload that
+  works as designed tells an operator nothing, so the alert now also needs
+  the permits to complete fewer than 2 searches a minute each, a quarter of
+  what they completed here (`docs/RUNBOOKS.md`, LeepReadsShedding).
 - **At 2,000 agents the land queue is the next limit.** Lands wait 28 to
   30 s for the lock in every arm, including C without searches, against
   the client's 30 s timeout. 10,300 to 15,300 lands per run are resent.
