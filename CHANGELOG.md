@@ -7,7 +7,6 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 ## [Unreleased]
 
-<<<<<<< HEAD
 ### Alerts no longer fire on load the limits are handling
 - `LeepReadsShedding` now also needs the search permits to complete fewer
   than 2 searches a minute each; shedding most searches under a swarm is
@@ -30,7 +29,7 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   sized for inodes.
 - **Operators:** replace these rules, and rename `LeepLandSlowP99` in
   routes and silences.
-=======
+
 ### A land conflict no longer hides same-size local changes
 - After a land conflict, `leep land` writes your changes over the files it
   has just checked out at the new head. Where file timestamps are coarse,
@@ -38,7 +37,6 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   unchanged to `status`, so the next commit silently left your change out
   (for example a one-character edit beside the conflict, or a binary file
   kept as your version). Those files are now always rehashed.
->>>>>>> 496546c3d6475edf8d6b6d563b6ef222b9a8665b
 
 ### `leep-git import` and `export` read `LEEP_META` and `LEEP_BLOBS`
 - `--meta` and `--blobs` fall back to the same variables as `leep-server`
