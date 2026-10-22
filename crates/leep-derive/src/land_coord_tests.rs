@@ -29,7 +29,7 @@ use crate::fault_tests::{assert_lands_kept, commit_file, retry, seeds, Agent, Wo
 use crate::land_coord::{Coordinated, CoordinatorConfig, Forwarded, LandCoordinator, LandForward};
 use crate::Repo;
 
-const REF: &str = "main";
+pub(crate) const REF: &str = "main";
 /// An advertised address no forward reaches.
 const UNREACHABLE: &str = "unreachable";
 
@@ -173,22 +173,22 @@ impl MetaStore for Pausable {
 }
 
 /// One simulated server process.
-struct Node {
-    address: String,
-    repo: Repo,
-    coord: Arc<LandCoordinator>,
+pub(crate) struct Node {
+    pub(crate) address: String,
+    pub(crate) repo: Repo,
+    pub(crate) coord: Arc<LandCoordinator>,
     pause: Arc<Pausable>,
     dead: watch::Sender<bool>,
 }
 
 impl Node {
-    fn is_dead(&self) -> bool {
+    pub(crate) fn is_dead(&self) -> bool {
         *self.dead.borrow()
     }
 
     /// Run `f` as a request to this server: abandoned, as a reset
     /// connection, if the server dies first.
-    async fn call<T>(&self, f: impl Future<Output = T>) -> Option<T> {
+    pub(crate) async fn call<T>(&self, f: impl Future<Output = T>) -> Option<T> {
         if self.is_dead() {
             return None;
         }
@@ -201,20 +201,20 @@ impl Node {
 
     /// SIGKILL: requests in flight are reset, batches stop wherever they
     /// are, and the lease is neither renewed nor released.
-    fn kill(&self) {
+    pub(crate) fn kill(&self) {
         self.dead.send_replace(true);
         self.coord.halt();
         self.repo.land_queues.abort_leaders();
     }
 
-    fn set_paused(&self, paused: bool) {
+    pub(crate) fn set_paused(&self, paused: bool) {
         self.pause.paused.send_replace(paused);
     }
 }
 
 /// The servers, and what happens to forwards between them.
-struct Net {
-    nodes: Vec<Arc<Node>>,
+pub(crate) struct Net {
+    pub(crate) nodes: Vec<Arc<Node>>,
     rng: Mutex<Rng>,
     /// Forwards reset before the leader saw them, per mille.
     drop: u32,
@@ -223,14 +223,14 @@ struct Net {
     lost: AtomicUsize,
 }
 
-struct Fwd {
-    net: Arc<Net>,
-    cs: ChangesetId,
-    land_id: Option<LandId>,
+pub(crate) struct Fwd {
+    pub(crate) net: Arc<Net>,
+    pub(crate) cs: ChangesetId,
+    pub(crate) land_id: Option<LandId>,
 }
 
 /// Never called: a forwarded land is never forwarded again.
-struct NoForward;
+pub(crate) struct NoForward;
 
 #[async_trait]
 impl LandForward<Result<LandResponse>> for NoForward {
@@ -283,7 +283,7 @@ impl LandForward<Result<LandResponse>> for Fwd {
 }
 
 /// A world whose lease clock is tokio's.
-fn world(seed: u64) -> World {
+pub(crate) fn world(seed: u64) -> World {
     let origin = Instant::now();
     World::with_meta(
         seed,
@@ -292,12 +292,24 @@ fn world(seed: u64) -> World {
     )
 }
 
-fn node(
+pub(crate) fn node(
     w: &World,
     plan: &Arc<FaultPlan>,
     i: usize,
     address: String,
     tune: impl FnOnce(&mut CoordinatorConfig),
+) -> Arc<Node> {
+    bounded_node(w, plan, i, address, tune, None)
+}
+
+/// [`node`] with `--land-queue-batches` (ADR 0060).
+pub(crate) fn bounded_node(
+    w: &World,
+    plan: &Arc<FaultPlan>,
+    i: usize,
+    address: String,
+    tune: impl FnOnce(&mut CoordinatorConfig),
+    queue_batches: Option<usize>,
 ) -> Arc<Node> {
     let pause = Arc::new(Pausable {
         inner: w.meta.clone(),
@@ -313,7 +325,8 @@ fn node(
         Arc::new(FaultyBlobStore::new(w.blobs.clone(), plan.clone())),
         meta,
     )
-    .with_land_coordinator(coord.clone());
+    .with_land_coordinator(coord.clone())
+    .with_land_queue_batches(queue_batches);
     Arc::new(Node {
         address,
         repo,
@@ -323,7 +336,7 @@ fn node(
     })
 }
 
-fn net(nodes: Vec<Arc<Node>>, seed: u64, drop: u32, lose: u32) -> Arc<Net> {
+pub(crate) fn net(nodes: Vec<Arc<Node>>, seed: u64, drop: u32, lose: u32) -> Arc<Net> {
     Arc::new(Net {
         nodes,
         rng: Mutex::new(Rng::new(seed ^ 0x5EED)),
@@ -446,13 +459,13 @@ async fn join(tasks: Vec<tokio::task::JoinHandle<(Agent, Seen)>>) -> (Vec<Agent>
     (agents, seen)
 }
 
-fn leader(net: &Net) -> Option<&Arc<Node>> {
+pub(crate) fn leader(net: &Net) -> Option<&Arc<Node>> {
     net.nodes
         .iter()
         .find(|n| !n.is_dead() && n.coord.held_epoch(REF).is_some())
 }
 
-async fn wait_for_leader(net: &Net) -> Arc<Node> {
+pub(crate) async fn wait_for_leader(net: &Net) -> Arc<Node> {
     for _ in 0..10_000 {
         if let Some(l) = leader(net) {
             return l.clone();
@@ -462,7 +475,7 @@ async fn wait_for_leader(net: &Net) -> Arc<Node> {
     panic!("no server took the lease");
 }
 
-async fn lease_now(w: &World) -> Lease {
+pub(crate) async fn lease_now(w: &World) -> Lease {
     w.meta
         .lease(
             &LeaseKey::land(REF),
@@ -476,7 +489,7 @@ async fn lease_now(w: &World) -> Lease {
         .expect("a lease row")
 }
 
-async fn seed_main(seed: u64, w: &World) {
+pub(crate) async fn seed_main(seed: u64, w: &World) {
     let base = commit_file(seed, &w.clean, None, "base.txt", "base\n", "base").await;
     w.meta.cas_ref(REF, None, Some(base)).await.unwrap();
 }

@@ -78,6 +78,9 @@ pub struct Repo {
     meta: Arc<dyn MetaStore>,
     /// Per-ref queues that group concurrent lands into batches (see `land`).
     pub(crate) land_queues: Arc<crate::land::LandQueues>,
+    /// Batches a ref's queue may hold before lands are refused (ADR 0060,
+    /// section 2); `None` admits every land.
+    pub(crate) land_queue_batches: Option<usize>,
     pub(crate) land_policy: Option<Arc<dyn LandPolicy>>,
     /// Batches this server's lands with every other server's on the same ref
     /// (ADR 0056); `None` batches only the lands this process receives.
@@ -537,6 +540,7 @@ impl Repo {
             blobs,
             meta,
             land_queues: Arc::default(),
+            land_queue_batches: None,
             land_policy: None,
             land_coordinator: None,
             ancestry: Arc::default(),
@@ -608,6 +612,26 @@ impl Repo {
     ) -> Self {
         self.land_coordinator = Some(coordinator);
         self
+    }
+
+    /// Refuse a land with [`leep_core::Error::Refused`] when it would wait
+    /// behind more than `batches` batches of its ref's queue, its own
+    /// included (`None`: never), counting the lands waiting in batches of 64
+    /// plus the one being replayed (ADR 0060, section 2). It bounds a land's wait in the queue, where a bound in
+    /// lands would allow 64 times more wait at full batches than at single
+    /// ones. Only new arrivals are refused; queued lands never are.
+    pub fn with_land_queue_batches(mut self, batches: Option<usize>) -> Self {
+        self.land_queue_batches = batches.map(|n| n.max(1));
+        for route in ["direct", "forwarded"] {
+            metrics::counter!("leep_land_admission_refused_total", "route" => route).increment(0);
+        }
+        metrics::gauge!("leep_land_queue_batches").increment(0.0);
+        self
+    }
+
+    /// See [`Repo::with_land_queue_batches`].
+    pub fn land_queue_batches(&self) -> Option<usize> {
+        self.land_queue_batches
     }
 
     /// See [`Repo::with_land_coordinator`].

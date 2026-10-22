@@ -43,6 +43,19 @@ pub enum Error {
         behind: u64,
         retry_after_ms: u64,
     },
+    /// Refused before any work because one of the server's limits is full
+    /// (ADR 0060), such as a ref's land queue: nothing was done, and the
+    /// same request may be sent again after `retry_after_ms`. Maps to HTTP
+    /// 503, code `unavailable`, with `Retry-After` and `Leep-Refused:
+    /// {refused}`.
+    #[error("{message}")]
+    Refused {
+        /// The `Leep-Refused` value, such as
+        /// [`crate::api::REFUSED_ADMISSION`].
+        refused: &'static str,
+        retry_after_ms: u64,
+        message: String,
+    },
     #[error("encoding error: {0}")]
     Encoding(String),
     #[error("storage error: {0}")]

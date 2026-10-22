@@ -63,6 +63,7 @@ pub(crate) fn code_of(e: &Error) -> &'static str {
         Error::Conflict(m) if m.contains(FORWARD_FAILED_MARKER) => error_code::FORWARD_FAILED,
         Error::Conflict(_) => error_code::CAS_LOST,
         Error::Indexing { .. } => error_code::INDEXING,
+        Error::Refused { .. } => error_code::UNAVAILABLE,
         Error::Encoding(_) | Error::Storage(_) | Error::Other(_) => error_code::INTERNAL,
     }
 }
@@ -195,6 +196,14 @@ mod tests {
         );
         assert_eq!(code_of_status(StatusCode::BAD_GATEWAY), "internal");
         assert_eq!(code_of(&Error::Storage("x".into())), "internal");
+        assert_eq!(
+            code_of(&Error::Refused {
+                refused: leep_core::api::REFUSED_ADMISSION,
+                retry_after_ms: 1000,
+                message: "x".into(),
+            }),
+            "unavailable"
+        );
         assert_eq!(code_of(&Error::InvalidPath("p".into(), "why")), "invalid");
         for s in [
             StatusCode::BAD_REQUEST,

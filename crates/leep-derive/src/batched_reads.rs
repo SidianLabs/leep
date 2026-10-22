@@ -178,6 +178,15 @@ fn copy(e: &Error) -> Error {
             behind: *behind,
             retry_after_ms: *retry_after_ms,
         },
+        Error::Refused {
+            refused,
+            retry_after_ms,
+            message,
+        } => Error::Refused {
+            refused,
+            retry_after_ms: *retry_after_ms,
+            message: message.clone(),
+        },
     }
 }
 

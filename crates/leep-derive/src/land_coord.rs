@@ -580,7 +580,7 @@ impl Repo {
                     ));
                 }
                 Route::Lead(_) => match self
-                    .land_led(cs, target_ref, actor, create, land_id.clone())
+                    .land_led(cs, target_ref, actor, create, land_id.clone(), from_peer)
                     .await
                 {
                     Some(r) => return r.map(Coordinated::Landed),
