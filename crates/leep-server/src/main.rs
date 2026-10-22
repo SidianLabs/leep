@@ -1110,6 +1110,41 @@ async fn shutdown_signal() {
     tracing::info!("shutting down");
 }
 
+/// Subcommands that open no store, so the store and server flags every
+/// subcommand inherits (`global = true`) mean nothing to them.
+const STORELESS_SUBCOMMANDS: [&str; 3] = ["hash-token", "gen-token", "backup-verify"];
+
+/// [`Args`]'s command, with the inherited flags left out of the help of
+/// [`STORELESS_SUBCOMMANDS`]. They stay accepted there (in either position,
+/// and from the environment), so no existing invocation breaks: each
+/// subcommand gets its own hidden copy of every global flag, which clap
+/// then treats exactly like the copy it would have propagated.
+fn cli() -> clap::Command {
+    let cmd = <Args as clap::CommandFactory>::command();
+    let globals: Vec<clap::Arg> = cmd
+        .get_arguments()
+        .filter(|a| a.is_global_set())
+        .cloned()
+        .collect();
+    STORELESS_SUBCOMMANDS.iter().fold(cmd, |cmd, name| {
+        cmd.mut_subcommand(name, |sc| {
+            globals
+                .iter()
+                .fold(sc, |sc, a| sc.arg(a.clone().hide(true)))
+        })
+    })
+}
+
+fn parse_args<I, T>(argv: I) -> Result<Args, clap::Error>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
+{
+    let mut cmd = cli();
+    let matches = cmd.try_get_matches_from_mut(argv)?;
+    <Args as clap::FromArgMatches>::from_arg_matches(&matches).map_err(|e| e.format(&mut cmd))
+}
+
 /// Colour text logs only on a terminal: escapes in a log file or a
 /// journal are noise to every reader and grep. A non-empty `NO_COLOR`
 /// (no-color.org) turns them off on a terminal too.
@@ -1119,7 +1154,7 @@ fn log_colours(terminal: bool, no_color: Option<std::ffi::OsString>) -> bool {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let args = Args::parse();
+    let args = parse_args(std::env::args_os()).unwrap_or_else(|e| e.exit());
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
     // These print their report on stdout, so logs go to stderr.
     let (writer, terminal) = if matches!(
@@ -1700,6 +1735,92 @@ impl BlobStore for ArcBlobs {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn cli_is_valid() {
+        cli().debug_assert();
+    }
+
+    /// Every global flag, as `--flag value` (or `--flag` for switches).
+    fn global_flags() -> Vec<Vec<&'static str>> {
+        vec![
+            vec!["--meta", "mem://m"],
+            vec!["--blobs", "mem://b"],
+            vec!["--no-migrate"],
+            vec!["--meta-pool-size", "7"],
+            vec!["--derive-cache-bytes", "1234"],
+            vec!["--request-timeout", "90s"],
+            vec!["--meta-statement-timeout", "30s"],
+        ]
+    }
+
+    fn assert_globals_applied(a: &Args, argv: &[&str]) {
+        assert_eq!(a.meta, "mem://m", "{argv:?}");
+        assert_eq!(a.blobs, "mem://b", "{argv:?}");
+        assert!(a.no_migrate, "{argv:?}");
+        assert_eq!(a.meta_pool_size, 7, "{argv:?}");
+        assert_eq!(a.derive_cache_bytes, 1234, "{argv:?}");
+        assert_eq!(a.request_timeout, Duration::from_secs(90), "{argv:?}");
+        assert_eq!(
+            a.meta_statement_timeout,
+            Some(Duration::from_secs(30)),
+            "{argv:?}"
+        );
+    }
+
+    #[test]
+    fn global_flags_stay_accepted_before_and_after_every_subcommand() {
+        let subcommands: &[&[&str]] = &[
+            &["hash-token"],
+            &["gen-token", "--name", "n", "--role", "read"],
+            &["backup-verify", "--from", "/b"],
+            &["gc", "--dry-run"],
+            &["gc", "condemn"],
+            &["migrate", "--status"],
+            &["derive-search", "main"],
+        ];
+        let flags: Vec<&str> = global_flags().concat();
+        for sub in subcommands {
+            let before: Vec<&str> = std::iter::once("leep-server")
+                .chain(flags.iter().copied())
+                .chain(sub.iter().copied())
+                .collect();
+            let after: Vec<&str> = std::iter::once("leep-server")
+                .chain(sub.iter().copied())
+                .chain(flags.iter().copied())
+                .collect();
+            for argv in [before, after] {
+                let a = parse_args(&argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+                assert!(a.command.is_some(), "{argv:?}");
+                assert_globals_applied(&a, &argv);
+            }
+        }
+    }
+
+    #[test]
+    fn storeless_subcommands_hide_the_store_flags_from_their_help() {
+        let mut cmd = cli();
+        for name in STORELESS_SUBCOMMANDS {
+            let help = cmd
+                .find_subcommand_mut(name)
+                .unwrap()
+                .render_long_help()
+                .to_string();
+            for flag in global_flags() {
+                let shown =
+                    |f: &str| help.contains(&format!("{f} ")) || help.contains(&format!("{f}\n"));
+                assert!(!shown(flag[0]), "{name} --help shows {}", flag[0]);
+            }
+        }
+        let gc = cmd
+            .find_subcommand_mut("gc")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(gc.contains("--meta") && gc.contains("--request-timeout"));
+        let top = cmd.render_long_help().to_string();
+        assert!(top.contains("--meta") && top.contains("--listen"));
+    }
 
     #[test]
     fn log_colours_only_on_a_terminal_without_no_color() {
