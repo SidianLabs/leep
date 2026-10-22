@@ -34,14 +34,15 @@ pub(super) struct LandBranch {
 }
 
 impl Mirror<'_> {
-    /// The Leep ref a land branch names: the longest mirrored branch `R`
-    /// with the branch under `<prefix>R/`.
+    /// The Leep ref a land branch names: the longest `--ref` branch `R`
+    /// with the branch under `<prefix>R/`. Prefix refs are push-only and
+    /// never land targets.
     fn land_target(&self, branch: &str) -> Option<String> {
         let prefix = self.cfg.land_prefix.as_deref()?;
         let rest = branch.strip_prefix("refs/heads/")?.strip_prefix(prefix)?;
         self.refs
             .iter()
-            .filter(|r| !r.spec.is_tag())
+            .filter(|r| r.configured && !r.spec.is_tag())
             .map(|r| r.spec.leep.as_str())
             .filter(|n| {
                 rest.strip_prefix(n)
@@ -133,7 +134,7 @@ impl Mirror<'_> {
             let refs: Vec<&str> = self
                 .refs
                 .iter()
-                .filter(|r| !r.spec.is_tag())
+                .filter(|r| r.configured && !r.spec.is_tag())
                 .map(|r| r.spec.leep.as_str())
                 .collect();
             let b = self.lands.get_mut(name).expect("listed");

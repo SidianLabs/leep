@@ -1,5 +1,5 @@
 # 0046. Live two-way mirror between Leep and a git remote
-Status: Accepted; extended by [0049](0049-mirror-merges-and-land-branches.md)
+Status: Accepted; extended by [0049](0049-mirror-merges-and-land-branches.md) and [0061](0061-mirror-ref-prefixes.md)
 Date: 2026-10-18
 
 ## Context
@@ -145,7 +145,8 @@ re-read.
   remote's reflog: every update of `main` was a fast-forward.
 - **Deletes.** A Leep ref that is deleted leaves the remote branch alone and
   is reported as `deleted-in-leep`. A tag that the mirror found through
-  `--tags` is simply forgotten.
+  `--tags` is simply forgotten. (ADR 0061: a ref found through
+  `--ref-prefix` has its branch deleted with a lease.)
 - **Backpressure.** Leep never waits for the mirror. The mirror merges a
   backlog into one push of the newest value. A failing ref is retried with
   exponential backoff up to `--max-backoff` (5 min), a new value on either

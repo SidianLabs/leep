@@ -123,6 +123,14 @@ impl Local {
             .unwrap());
     }
 
+    fn delete_ref(&self, name: &str) {
+        let meta = self.repo.meta();
+        let cur = self.on(meta.get_ref(name)).unwrap();
+        assert!(self
+            .on(meta.cas_ref_logged(name, cur, None, &RefUpdateContext::new("delete")))
+            .unwrap());
+    }
+
     fn get_ref(&self, name: &str) -> Option<ChangesetId> {
         self.on(self.repo.meta().get_ref(name)).unwrap()
     }
@@ -409,6 +417,7 @@ fn config(f: &Fixture, import: bool) -> Config {
         work_dir: f.work.clone(),
         refs: vec![RefSpec::parse("main").unwrap()],
         tags: true,
+        ref_prefixes: vec![],
         import,
         allow_rewind: vec![],
         diverged_prefix: "leep-diverged/".into(),
@@ -1056,4 +1065,359 @@ fn failing_land_branches_are_reported_and_left_in_place() {
     assert!(m.run_once());
     assert!(land_branch(&m, "leep-land/main/clash").is_none());
     assert_eq!(git(&f.remote, &["show", "main:a"]), "both");
+}
+
+fn prefix_config(f: &Fixture, import: bool) -> Config {
+    Config {
+        ref_prefixes: vec!["review/".into()],
+        ..config(f, import)
+    }
+}
+
+fn tracked(m: &mirror::Mirror) -> Vec<String> {
+    m.status
+        .lock()
+        .unwrap()
+        .refs
+        .iter()
+        .map(|r| r.leep_ref.clone())
+        .collect()
+}
+
+/// Leep's `main` at one changeset, and a review ref on top of it.
+fn main_and_review(leep: &Local, review: &str) -> (ChangesetId, ChangesetId) {
+    let c1 = leep.native(
+        vec![],
+        "one",
+        vec![leep.file("a", "1\n", FileKind::Regular)],
+    );
+    leep.set_ref("main", c1);
+    let r1 = leep.native(
+        vec![c1],
+        "review work",
+        vec![leep.file("r", "r1\n", FileKind::Regular)],
+    );
+    leep.set_ref(review, r1);
+    (c1, r1)
+}
+
+/// A person's commit on top of the remote's `branch`, pushed back to it.
+fn push_on_top(f: &Fixture, branch: &str, file: &str) -> String {
+    if !f.human.exists() {
+        clone_human(f);
+    }
+    git(&f.human, &["fetch", "-q", "origin"]);
+    git(
+        &f.human,
+        &["checkout", "-q", "-B", "work", &format!("origin/{branch}")],
+    );
+    write(&f.human, file, "pushed to git\n");
+    commit(&f.human, "pushed straight to git");
+    git(
+        &f.human,
+        &["push", "-q", "origin", &format!("HEAD:refs/heads/{branch}")],
+    );
+    git(&f.human, &["rev-parse", "HEAD"])
+}
+
+#[test]
+fn prefix_refs_are_discovered_and_pushed_and_rewrites_go_with_a_lease() {
+    let f = fixture();
+    let leep = Local::new();
+    let (c1, r1) = main_and_review(&leep, "review/git-a");
+    leep.set_ref("scratch", r1);
+    let mut m = mirror::Mirror::open(prefix_config(&f, false), &leep).unwrap();
+    assert!(m.run_once());
+    let main = remote_head(&f, "refs/heads/main").unwrap();
+    let a1 = remote_head(&f, "refs/heads/review/git-a").unwrap();
+    assert_eq!(git(&f.remote, &["rev-parse", "review/git-a~1"]), main);
+    assert_eq!(state(&m, "review/git-a").0, RefState::InSync);
+    {
+        let s = m.status.lock().unwrap();
+        let r = s
+            .refs
+            .iter()
+            .find(|r| r.leep_ref == "review/git-a")
+            .unwrap();
+        assert_eq!(r.ref_prefix.as_deref(), Some("review/"));
+        assert_eq!(r.git_ref, "refs/heads/review/git-a");
+        let main = s.refs.iter().find(|r| r.leep_ref == "main").unwrap();
+        assert_eq!(main.ref_prefix, None);
+    }
+    // Only refs under the prefix are found.
+    assert_eq!(remote_head(&f, "refs/heads/scratch"), None);
+    assert!(!tracked(&m).contains(&"scratch".to_string()));
+
+    // More work on the review ref is a fast-forward.
+    let r2 = leep.native(
+        vec![r1],
+        "more review work",
+        vec![leep.file("r", "r2\n", FileKind::Regular)],
+    );
+    leep.set_ref("review/git-a", r2);
+    assert!(m.run_once());
+    let a2 = remote_head(&f, "refs/heads/review/git-a").unwrap();
+    assert!(is_ancestor(&f.remote, &a1, &a2));
+
+    // The agent squashes: the branch is rewritten with a lease on what the
+    // mirror pushed, never forced blind.
+    let squashed = leep.native(
+        vec![c1],
+        "review work, squashed",
+        vec![leep.file("r", "r2\n", FileKind::Regular)],
+    );
+    leep.set_ref("review/git-a", squashed);
+    assert!(m.run_once(), "{:?}", state(&m, "review/git-a"));
+    let a3 = remote_head(&f, "refs/heads/review/git-a").unwrap();
+    assert!(!is_ancestor(&f.remote, &a2, &a3));
+    assert_eq!(
+        git(&f.remote, &["log", "-1", "--format=%s", "review/git-a"]),
+        "review work, squashed"
+    );
+
+    // A ref that appears later is found on the next cycle.
+    leep.set_ref("review/cli-b", squashed);
+    assert!(m.run_once());
+    assert_eq!(remote_head(&f, "refs/heads/review/cli-b").unwrap(), a3);
+    assert_eq!(state(&m, "review/cli-b").0, RefState::InSync);
+    assert_eq!(remote_head(&f, "refs/heads/main").unwrap(), main);
+}
+
+#[test]
+fn prefix_refs_deleted_in_leep_are_deleted_on_the_remote_with_a_lease() {
+    let f = fixture();
+    let leep = Local::new();
+    let (_, r1) = main_and_review(&leep, "review/git-a");
+    leep.set_ref("review/git-b", r1);
+    let mut m = mirror::Mirror::open(prefix_config(&f, false), &leep).unwrap();
+    assert!(m.run_once());
+    let main = remote_head(&f, "refs/heads/main").unwrap();
+    let a = remote_head(&f, "refs/heads/review/git-a").unwrap();
+    assert!(remote_head(&f, "refs/heads/review/git-b").is_some());
+
+    // Deleted in Leep: the branch goes too, and the mirror stays healthy.
+    leep.delete_ref("review/git-a");
+    assert!(m.run_once());
+    assert_eq!(remote_head(&f, "refs/heads/review/git-a"), None);
+    assert!(!tracked(&m).contains(&"review/git-a".to_string()));
+    {
+        let s = m.status.lock().unwrap();
+        assert_eq!(s.branches_deleted, 1);
+        assert_eq!(s.deleted_branches.len(), 1);
+        let d = &s.deleted_branches[0];
+        assert_eq!(
+            (d.leep_ref.as_str(), d.git_ref.as_str(), d.commit.as_str()),
+            ("review/git-a", "refs/heads/review/git-a", a.as_str())
+        );
+        let metrics = mirror::status::render_metrics(&s);
+        assert!(
+            metrics.contains("leep_mirror_branches_deleted_total 1"),
+            "{metrics}"
+        );
+        let json = serde_json::to_string(&*s).unwrap();
+        let back: mirror::Status = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, *s);
+    }
+
+    // Deleted while the mirror was down: a new mirror finds the branch
+    // under the prefix, sees in the ref log that the Leep ref held it, and
+    // deletes it with the same lease.
+    drop(m);
+    leep.delete_ref("review/git-b");
+    let mut m = mirror::Mirror::open(prefix_config(&f, false), &leep).unwrap();
+    assert!(m.run_once());
+    assert_eq!(remote_head(&f, "refs/heads/review/git-b"), None);
+    assert_eq!(m.status.lock().unwrap().branches_deleted, 1);
+    assert_eq!(tracked(&m), vec!["main".to_string()]);
+    assert_eq!(remote_head(&f, "refs/heads/main").unwrap(), main);
+}
+
+#[test]
+fn a_prefix_branch_the_remote_moved_is_reported_and_never_deleted() {
+    let f = fixture();
+    let leep = Local::new();
+    main_and_review(&leep, "review/git-a");
+    let mut m = mirror::Mirror::open(prefix_config(&f, false), &leep).unwrap();
+    assert!(m.run_once());
+
+    // Someone pushes to the branch after the mirror last polled; the Leep
+    // ref is deleted. The delete's lease names what the mirror pushed, so
+    // the remote refuses it.
+    let pushed = push_on_top(&f, "review/git-a", "late.txt");
+    leep.delete_ref("review/git-a");
+    m.cycle();
+    assert_eq!(
+        remote_head(&f, "refs/heads/review/git-a").unwrap(),
+        pushed,
+        "a lease that no longer matches deletes nothing"
+    );
+    {
+        let s = m.status.lock().unwrap();
+        let r = s
+            .refs
+            .iter()
+            .find(|r| r.leep_ref == "review/git-a")
+            .unwrap();
+        assert_eq!(r.pushes.rejected, 1, "{}", r.detail);
+        assert_eq!(s.branches_deleted, 0);
+    }
+
+    // With the new value read, it is reported and left alone.
+    assert!(!m.run_once());
+    let (st, detail) = state(&m, "review/git-a");
+    assert_eq!(st, RefState::RemoteAhead, "{detail}");
+    assert!(detail.contains("never held in Leep"), "{detail}");
+    assert_eq!(remote_head(&f, "refs/heads/review/git-a").unwrap(), pushed);
+
+    // A branch under the prefix that Leep never had is reported too.
+    git(
+        &f.human,
+        &["push", "-q", "origin", "HEAD:refs/heads/review/human-only"],
+    );
+    drop(m);
+    let mut m = mirror::Mirror::open(prefix_config(&f, false), &leep).unwrap();
+    assert!(!m.run_once());
+    assert_eq!(state(&m, "review/human-only").0, RefState::RemoteAhead);
+    assert_eq!(
+        remote_head(&f, "refs/heads/review/human-only").unwrap(),
+        pushed
+    );
+    assert_eq!(m.status.lock().unwrap().branches_deleted, 0);
+
+    // Once a person deletes it, the mirror forgets it.
+    git(
+        &f.human,
+        &[
+            "push",
+            "-q",
+            "origin",
+            ":refs/heads/review/human-only",
+            ":refs/heads/review/git-a",
+        ],
+    );
+    assert!(m.run_once());
+    assert_eq!(tracked(&m), vec!["main".to_string()]);
+}
+
+#[test]
+fn prefix_refs_are_never_imported() {
+    let f = fixture();
+    let leep = Local::new();
+    let (_, r1) = main_and_review(&leep, "review/git-a");
+    let cfg = Config {
+        ref_prefixes: vec!["review/".into()],
+        ..merge_config(&f)
+    };
+    let mut m = mirror::Mirror::open(cfg, &leep).unwrap();
+    assert!(m.run_once());
+    let exported = remote_head(&f, "refs/heads/review/git-a").unwrap();
+
+    // A push to the review branch, with --import on: reported, not landed.
+    let pushed = push_on_top(&f, "review/git-a", "pushed.txt");
+    assert!(!m.run_once());
+    let (st, detail) = state(&m, "review/git-a");
+    assert_eq!(st, RefState::RemoteAhead, "{detail}");
+    assert!(detail.contains("push-only"), "{detail}");
+    assert_eq!(leep.get_ref("review/git-a"), Some(r1));
+    assert_eq!(remote_head(&f, "refs/heads/review/git-a").unwrap(), pushed);
+    assert_eq!(m.status.lock().unwrap().commits_imported, 0);
+
+    // Leep moves too: diverged, but no merge, no diverged branch, no import.
+    let r2 = leep.native(
+        vec![r1],
+        "agent keeps working",
+        vec![leep.file("r", "r2\n", FileKind::Regular)],
+    );
+    leep.set_ref("review/git-a", r2);
+    assert!(!m.run_once());
+    let (st, detail) = state(&m, "review/git-a");
+    assert_eq!(st, RefState::Diverged, "{detail}");
+    assert_eq!(leep.get_ref("review/git-a"), Some(r2));
+    assert_eq!(remote_head(&f, "refs/heads/review/git-a").unwrap(), pushed);
+    assert_eq!(
+        remote_head(&f, "refs/heads/leep-diverged/review/git-a"),
+        None
+    );
+    assert_eq!(*leep.merges.lock().unwrap(), 0);
+
+    // A land branch cannot target a prefix ref.
+    git(
+        &f.human,
+        &[
+            "push",
+            "-q",
+            "origin",
+            "HEAD:refs/heads/leep-land/review/git-a/x",
+        ],
+    );
+    m.run_once();
+    let b = land_branch(&m, "leep-land/review/git-a/x").unwrap();
+    assert_eq!(b.state, LandState::Refused, "{}", b.detail);
+    assert_eq!(b.leep_ref, None);
+    assert!(!b.detail.contains("review/git-a,"), "{}", b.detail);
+    assert_eq!(leep.get_ref("review/git-a"), Some(r2));
+    assert_eq!(m.status.lock().unwrap().commits_imported, 0);
+
+    // Deleting the pushed branch lets the mirror push Leep's again.
+    git(
+        &f.human,
+        &["push", "-q", "origin", ":refs/heads/review/git-a"],
+    );
+    // A failing land branch is the pusher's to fix: the refs stay healthy.
+    assert!(m.run_once());
+    assert_eq!(state(&m, "review/git-a").0, RefState::InSync);
+    let now = remote_head(&f, "refs/heads/review/git-a").unwrap();
+    assert!(is_ancestor(&f.remote, &exported, &now));
+}
+
+#[test]
+fn prefix_mirroring_leaves_main_and_tags_alone() {
+    let f = fixture();
+    let leep = Local::new();
+    let (c1, r1) = main_and_review(&leep, "review/git-a");
+    leep.set_ref("tags/v1", c1);
+    let mut m = mirror::Mirror::open(prefix_config(&f, false), &leep).unwrap();
+    assert!(m.run_once());
+    let main = remote_head(&f, "refs/heads/main").unwrap();
+    let tag = remote_head(&f, "refs/tags/v1").unwrap();
+
+    // Branches outside the prefix, including look-alikes, that Leep lacks.
+    clone_human(&f);
+    for b in ["reviewer", "other", "review-x"] {
+        git(
+            &f.human,
+            &["push", "-q", "origin", &format!("HEAD:refs/heads/{b}")],
+        );
+    }
+    git(
+        &f.human,
+        &["push", "-q", "origin", "HEAD:refs/tags/review/t"],
+    );
+
+    // Review refs come and go, and a Leep tag goes too.
+    leep.set_ref("review/git-b", r1);
+    assert!(m.run_once());
+    leep.delete_ref("review/git-a");
+    leep.delete_ref("review/git-b");
+    leep.delete_ref("tags/v1");
+    assert!(m.run_once());
+    assert_eq!(remote_head(&f, "refs/heads/review/git-a"), None);
+    assert_eq!(remote_head(&f, "refs/heads/review/git-b"), None);
+
+    // Deleting main in Leep keeps the old rule for a --ref: reported, and
+    // the remote's main is left alone.
+    leep.delete_ref("main");
+    assert!(!m.run_once());
+    assert_eq!(state(&m, "main").0, RefState::DeletedInLeep);
+    assert_eq!(remote_head(&f, "refs/heads/main").unwrap(), main);
+    assert_eq!(remote_head(&f, "refs/tags/v1").unwrap(), tag);
+    for b in ["reviewer", "other", "review-x"] {
+        assert_eq!(
+            remote_head(&f, &format!("refs/heads/{b}")).unwrap(),
+            main,
+            "{b}"
+        );
+    }
+    assert_eq!(remote_head(&f, "refs/tags/review/t").unwrap(), main);
+    assert_eq!(m.status.lock().unwrap().branches_deleted, 2);
 }

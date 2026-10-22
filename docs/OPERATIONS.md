@@ -767,8 +767,11 @@ moved, the mirror reports `diverged` and stops that ref until someone merges
 in git; with `--on-divergence merge` it first tries a clean merge on the
 server and lands it. With `--land-branches`, people push to
 `leep-land/<ref>/<name>` and the mirror lands that work through Leep like an
-agent's land ([ADR 0049](adr/0049-mirror-merges-and-land-branches.md)). It
-never resolves a conflict itself and never force-pushes a mirrored branch.
+agent's land ([ADR 0049](adr/0049-mirror-merges-and-land-branches.md)). With
+`--ref-prefix review/`, every Leep ref under `review/` is pushed to the
+branch of the same name as it appears, and its branch is deleted when the
+Leep ref is ([ADR 0061](adr/0061-mirror-ref-prefixes.md)). It never resolves
+a conflict itself and never force-pushes a mirrored branch.
 
 The mirror is a separate process. It talks to `leep-server` over the HTTP
 API with a token, and to the remote with the system `git` (2.30 or later).
@@ -817,6 +820,8 @@ leep-git mirror run \
   `leep-land/`). People need to be able to push there. The mirror never
   needs force-push rights: it deletes a land branch with a lease on the
   value it landed.
+  - With `--ref-prefix`, it must also create, update with a lease and
+    delete branches under each prefix. Nobody else should push there.
   - An exception is a ref listed in `--allow-rewind`, which it updates with
     `--force-with-lease`. `main` and tags cannot be listed there.
   - Required pull requests or status checks on the mirrored branch make
@@ -827,6 +832,7 @@ leep-git mirror run \
 |---|---|---|
 | `--ref NAME[:GIT_REF]` | – | Mirror a Leep ref, repeatable. `NAME` maps to `refs/heads/NAME`, `tags/T` to `refs/tags/T`. |
 | `--tags` | off | Also mirror every Leep tag. Tags are created, never moved. |
+| `--ref-prefix PREFIX` | – | Also mirror every Leep ref under `PREFIX` (such as `review/`) to the branch of the same name, as refs appear and go. Repeatable. Push-only; see "Prefix refs" below. Must end in `/` and not overlap `--diverged-prefix`, `--land-prefix`, another prefix or any `--ref`. |
 | `--import` | off | Land fast-forward pushes from the remote in Leep, through the land policy. |
 | `--interval` | `1s` | How often to check the ref log for moves. |
 | `--git-poll` | `15s` | How often to `ls-remote` the remote. `POST /poke` polls at once. |
@@ -870,9 +876,9 @@ when there is no status file.
 | `pending` | One side moved and the mirror is catching up, or retrying after the remote moved under a push. | Nothing, unless the lag keeps growing ([LeepMirrorLagging](RUNBOOKS.md#leepmirrorlagging)). |
 | `diverged` | Both sides have commits the other lacks. Leep's side is on `leep-diverged/<branch>`. With `--on-divergence merge` the detail says why the mirror did not merge: the conflicting paths, a land policy refusal, or a remote tip Leep moved back from. | In git, merge `origin/leep-diverged/<branch>` into the branch and push. The mirror lands the merge and deletes the diverged branch. |
 | `rewound` | Leep moved the ref back (an undo). The remote keeps the newer commits. | Land a revert in Leep (the usual fix), or, for a scratch branch, allow it with `--allow-rewind`. |
-| `remote-ahead` | The remote has commits Leep lacks and `--import` is off. | Enable `--import`, or remove the commits from the remote. |
+| `remote-ahead` | The remote has commits Leep lacks and `--import` is off. For a prefix ref: someone pushed to its branch, before or after the Leep ref was deleted. | Enable `--import`, or remove the commits from the remote. For a prefix ref, land the work in Leep, then delete the branch. |
 | `refused` | Leep's land policy refused a push from git (unsigned, unreviewed, OWNERS). The detail quotes the server. | Approve the changesets with `leep review`, or revert the push in git. Checked again every minute. |
-| `deleted-in-leep` | The Leep ref is gone. The remote branch is left alone. | Delete the remote branch by hand if that is intended. |
+| `deleted-in-leep` | The Leep ref of a `--ref` is gone. The remote branch is left alone. (A prefix ref's branch is deleted instead.) | Delete the remote branch by hand if that is intended. |
 | `error` | The last attempt failed: server, remote, credentials, or the remote rejecting pushes. Retried with backoff. | Read the detail and the log ([LeepMirrorLagging](RUNBOOKS.md#leepmirrorlagging)). |
 
 ### Mirror metrics
@@ -889,6 +895,7 @@ when there is no status file.
 | `leep_mirror_merges_total` | counter | `ref`, `result` = `landed`, `conflicts`, `refused`, `lost_race` | The mirror's automatic merges (`--on-divergence merge`). `conflicts` and `refused` fall back to `diverged`. |
 | `leep_mirror_land_branches_total` | counter | `ref`, `result` = `landed`, `conflicts`, `refused` | Land branches tried, counted once per pushed commit. |
 | `leep_mirror_land_branches_failing` | gauge | `ref` | Land branches left on the remote because they conflict or were refused (`ref=""` for a name that matches no mirrored ref). |
+| `leep_mirror_branches_deleted_total` | counter | none | Branches under a `--ref-prefix` deleted because their Leep ref was deleted. |
 | `leep_mirror_commits_exported_total` | counter | none | Commits written from changesets. |
 | `leep_mirror_commits_imported_total` | counter | none | Changesets created from remote commits. |
 | `leep_mirror_errors_total` | counter | `stage` = `leep`, `git`, `export`, `import` | Failed steps. |
@@ -898,6 +905,33 @@ when there is no status file.
 Counters restart from 0 when the mirror restarts. The log goes to stderr,
 one line per state change, push or landed import, with credentials
 redacted.
+
+### Prefix refs
+
+With `--ref-prefix review/`, the mirror follows Leep refs under `review/`
+without a `--ref` for each. Agents land on `review/<area>-<desc>` and the
+branch of that name appears on the remote, ready for a pull request.
+
+- **Found as they appear.** Each read of Leep's refs adds new ones; the
+  status lists them with `"ref_prefix": "review/"`.
+- **Push-only.** A prefix ref is never imported, merged, or landed onto by a
+  land branch, whatever `--import`, `--on-divergence` and `--land-branches`
+  say. A push to its branch is reported as `remote-ahead` (or `diverged` if
+  Leep moved too) and left there.
+- **Rewrites.** When an agent rebases or squashes its review ref, the mirror
+  pushes the new value with `--force-with-lease` on the old one, but only
+  if the Leep ref held the remote's tip (checked in the ref log). Otherwise
+  it reports, as above.
+- **Deletes.** When the Leep ref is deleted, the mirror deletes the branch
+  with a lease on that same tip, under the same check, and stops tracking
+  it. This is healthy: the deletion is listed under `deleted_branches` in
+  the status and counted in `leep_mirror_branches_deleted_total`. A branch
+  deleted in Leep while the mirror was down is deleted on its next start.
+  If the remote refuses the lease, or the branch holds commits the Leep ref
+  never held, nothing is deleted and the ref reports `remote-ahead`.
+
+The mirror never deletes or rewinds a branch outside its prefixes, a tag,
+or a `--ref` branch such as `main`.
 
 ### Land branches
 
