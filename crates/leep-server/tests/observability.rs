@@ -218,3 +218,98 @@ async fn metrics_listener_serves_text_exposition() {
         .unwrap();
     assert_eq!(other.status(), 404);
 }
+
+/// The warmer counts the rows it derives by kind, beside the heads
+/// `leep_index_derived_total` counts for search; rows a search derived
+/// inline are in `leep_derive_total` only.
+#[test]
+fn warm_passes_count_rows_by_kind() {
+    let text = with_metrics(async {
+        let repo = Repo::new(
+            Arc::new(MemoryBlobStore::new()),
+            Arc::new(MemoryMetaStore::new()),
+        );
+        let mut changes = BTreeMap::new();
+        for path in ["a/x.txt", "a/b/y.txt", "z.txt"] {
+            let body = bytes::Bytes::from(format!("text of {path}\n"));
+            let content = repo.blobs().put(body.clone()).await.unwrap();
+            changes.insert(
+                RepoPath::new(path).unwrap(),
+                FileChange::Modify {
+                    content,
+                    kind: FileKind::Regular,
+                    size: body.len() as u64,
+                },
+            );
+        }
+        let cs = |parents, changes, message: &str| Changeset {
+            parents,
+            author: "a".into(),
+            timestamp: 1,
+            message: message.into(),
+            changes,
+            extra: BTreeMap::new(),
+        };
+        let base = repo
+            .create_changeset(cs(vec![], changes, "base"))
+            .await
+            .unwrap();
+        repo.meta().cas_ref("main", None, Some(base)).await.unwrap();
+        let mut warmer = leep_derive::warm::Warmer::new(repo.clone(), true);
+        assert_eq!(warmer.pass().await.unwrap().warmed, 1);
+
+        // A search derives the next head's rows inline; the warm after it
+        // finds them stored.
+        let body = bytes::Bytes::from_static(b"changed\n");
+        let content = repo.blobs().put(body.clone()).await.unwrap();
+        let change = FileChange::Modify {
+            content,
+            kind: FileKind::Regular,
+            size: body.len() as u64,
+        };
+        let changes = BTreeMap::from([(RepoPath::new("a/b/y.txt").unwrap(), change)]);
+        let next = repo
+            .create_changeset(cs(vec![base], changes, "next"))
+            .await
+            .unwrap();
+        let q = leep_derive::SearchQuery::new("changed");
+        assert_eq!(repo.search(next, &q).await.unwrap().matches.len(), 1);
+        repo.meta()
+            .cas_ref("main", Some(base), Some(next))
+            .await
+            .unwrap();
+        assert_eq!(warmer.pass().await.unwrap().warmed, 1);
+    });
+    let rows = |kind: &str| {
+        value(line(
+            &text,
+            "leep_index_rows_total",
+            &[&format!("kind=\"{kind}\"")],
+        ))
+    };
+    // The base's three directories and three files; the next head's rows
+    // were the search's.
+    assert_eq!(rows("tree-trigrams-v1"), 3.0);
+    assert_eq!(rows("blob-trigrams-v1"), 3.0);
+    assert_eq!(rows("history-tree-v4"), 2.0);
+    assert_eq!(rows("log-filter-v1"), 2.0);
+    let derived = |kind: &str| {
+        value(line(
+            &text,
+            "leep_derive_total",
+            &[&format!("kind=\"{kind}\"")],
+        ))
+    };
+    assert_eq!(derived("tree-trigrams-v1"), 3.0 + 3.0);
+    assert_eq!(derived("blob-trigrams-v1"), 3.0 + 1.0);
+    // A warmer of every group labels its passes `all`; the server's loops
+    // label theirs with their group.
+    line(&text, "leep_warm_duration_seconds", &["group=\"all\""]);
+    // Heads, for search, as before.
+    let heads = line(
+        &text,
+        "leep_index_derived_total",
+        &["kind=\"tree-trigrams-v1\""],
+    );
+    assert_eq!(value(heads), 2.0);
+}

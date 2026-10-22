@@ -15,6 +15,11 @@
 //! lease this process holds, checks the lease before each write of a
 //! derivation, and stops a derivation at the next write once the lease is
 //! gone.
+//!
+//! [`Warmer::spawn`] runs one loop per index group, each with its own tail
+//! of the ref log, so a group that falls behind (path history after an
+//! import) does not hold back the others: nothing in one group's rows
+//! depends on another's.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -23,7 +28,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use leep_core::{ChangesetId, Result};
 
-use crate::derived::{self, HistoryTree, LogFilterIndex};
+use crate::derived::{self, DerivedKind, HistoryTree, LogFilterIndex};
 use crate::indexing::{IndexGroup, IndexLeases};
 use crate::Repo;
 
@@ -60,6 +65,8 @@ pub struct Warmer {
     seq: Option<u64>,
     last_full: Option<Instant>,
     full_every: Duration,
+    /// The one group this warmer's passes warm; `None` for all of them.
+    only: Option<IndexGroup>,
 }
 
 /// A ref's head as a pass found it, and when it moved there if known.
@@ -80,6 +87,23 @@ impl Warmer {
             seq: None,
             last_full: None,
             full_every: FULL_LISTING_EVERY,
+            only: None,
+        }
+    }
+
+    /// A warmer of group `g` alone, with its own tail of the ref log and
+    /// its own record of what it warmed.
+    pub(crate) fn for_group(&self, g: IndexGroup) -> Self {
+        Warmer {
+            repo: self.repo.clone(),
+            search: self.search,
+            leases: self.leases.clone(),
+            warmed: HashMap::new(),
+            active: Vec::new(),
+            seq: None,
+            last_full: None,
+            full_every: self.full_every,
+            only: Some(g),
         }
     }
 
@@ -95,13 +119,26 @@ impl Warmer {
         self
     }
 
-    /// The groups this process warms now: all of them in `local` mode, the
-    /// held ones in `lease` mode.
-    async fn groups(&self) -> Vec<IndexGroup> {
+    /// The `group` label of this warmer's per-pass metrics: the group of a
+    /// loop of one, `all` for a warmer of every group.
+    fn group_label(&self) -> &'static str {
+        self.only.map_or("all", IndexGroup::short_name)
+    }
+
+    /// The groups this warmer covers, held or not.
+    fn all_groups(&self) -> Vec<IndexGroup> {
         let mut out = vec![IndexGroup::History, IndexGroup::LogFilter];
         if self.search {
             out.push(IndexGroup::Search);
         }
+        out.retain(|g| self.only.is_none_or(|o| o == *g));
+        out
+    }
+
+    /// The groups this process warms now: all of them in `local` mode, the
+    /// held ones in `lease` mode.
+    async fn groups(&self) -> Vec<IndexGroup> {
+        let out = self.all_groups();
         let Some(leases) = &self.leases else {
             return out;
         };
@@ -227,7 +264,8 @@ impl Warmer {
                     // 1-second resolution: ref log times are whole
                     // seconds, so 0 means "within the same second".
                     let delay = (unix_now() - at).max(0) as f64;
-                    metrics::histogram!("leep_warm_delay_seconds").record(delay);
+                    metrics::histogram!("leep_warm_delay_seconds", "group" => self.group_label())
+                        .record(delay);
                 }
                 report.warmed += 1;
             } else {
@@ -241,7 +279,8 @@ impl Warmer {
             }
         }
         let took = started.elapsed();
-        metrics::histogram!("leep_warm_duration_seconds").record(took.as_secs_f64());
+        metrics::histogram!("leep_warm_duration_seconds", "group" => self.group_label())
+            .record(took.as_secs_f64());
         if took > Duration::from_secs(1) {
             tracing::info!(
                 refs = report.warmed,
@@ -254,7 +293,7 @@ impl Warmer {
 
     /// Derive group `g` for `heads`: the changesets derived (heads, for
     /// search). In `lease` mode the derivation writes only while the lease
-    /// is held.
+    /// is held. The rows derived are counted in `leep_index_rows_total`.
     async fn warm_group(&self, g: IndexGroup, heads: &[ChangesetId]) -> Result<u64> {
         let repo = match &self.leases {
             Some(l) => self.repo.with_write_guard(Arc::new(LeaseGuard {
@@ -265,17 +304,23 @@ impl Warmer {
         };
         match g {
             IndexGroup::History => {
-                Ok(derived::derive_heads_counted::<HistoryTree>(&repo, heads).await? as u64)
+                let n = derived::derive_heads_counted::<HistoryTree>(&repo, heads).await? as u64;
+                rows_derived(HistoryTree::NAME, n);
+                Ok(n)
             }
             IndexGroup::LogFilter => {
-                Ok(derived::derive_heads_counted::<LogFilterIndex>(&repo, heads).await? as u64)
+                let n = derived::derive_heads_counted::<LogFilterIndex>(&repo, heads).await? as u64;
+                rows_derived(LogFilterIndex::NAME, n);
+                Ok(n)
             }
             IndexGroup::Search => {
                 for &id in heads {
                     if !repo.write_allowed().await {
                         return Err(lease_lost());
                     }
-                    repo.derive_search(id).await?;
+                    let r = repo.derive_search(id).await?;
+                    rows_derived(crate::search::BLOB_KIND, r.blob_rows);
+                    rows_derived(crate::search::TREE_KIND, r.tree_rows);
                 }
                 Ok(heads.len() as u64)
             }
@@ -377,17 +422,41 @@ impl Warmer {
         ))
     }
 
-    /// Run passes forever, `interval` apart, starting now.
-    pub fn spawn(mut self, interval: Duration) -> tokio::task::JoinHandle<()> {
+    /// Run passes forever, `interval` apart, starting now: one loop per
+    /// index group (see the module docs). Aborting the handle stops them
+    /// all.
+    pub fn spawn(self, interval: Duration) -> tokio::task::JoinHandle<()> {
+        let loops: Vec<Warmer> = match self.only {
+            Some(_) => vec![self],
+            None => self
+                .all_groups()
+                .into_iter()
+                .map(|g| self.for_group(g))
+                .collect(),
+        };
         tokio::spawn(async move {
-            loop {
-                if let Err(e) = self.pass().await {
-                    tracing::warn!(error = %e, "looking for moved refs to warm failed");
-                }
-                tokio::time::sleep(interval).await;
+            // Dropped when the handle is aborted, which aborts the loops.
+            let mut set = tokio::task::JoinSet::new();
+            for mut w in loops {
+                set.spawn(async move {
+                    loop {
+                        if let Err(e) = w.pass().await {
+                            tracing::warn!(error = %e, "looking for moved refs to warm failed");
+                        }
+                        tokio::time::sleep(interval).await;
+                    }
+                });
             }
+            while set.join_next().await.is_some() {}
         })
     }
+}
+
+/// Rows of `kind` a warm derived, beside `leep_index_derived_total`'s
+/// changesets (heads, for search): the share of `leep_derive_total` that
+/// the warmer, not queries, derived.
+fn rows_derived(kind: &'static str, n: u64) {
+    metrics::counter!("leep_index_rows_total", "kind" => kind).increment(n);
 }
 
 fn unix_now() -> i64 {

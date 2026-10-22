@@ -1086,3 +1086,234 @@ async fn vanished_history_nodes_answer_indexing() {
     }
     assert!(indexing > 0);
 }
+
+/// A bounded search's scan computes, over random trees and random partial
+/// indexes, the very rows derivation would store (byte for byte what
+/// `recompute_tree_row` gives), and stores none of them.
+#[tokio::test]
+async fn bounded_scan_computes_the_stored_rows_and_stores_none() {
+    use crate::search::tests::{commit_files, index_some, level_tree, tree_shape};
+    for seed in 1..=30u64 {
+        let (r, meta) = memory_repo();
+        let files = level_tree(seed, 10 + (seed as usize * 7) % 60);
+        let c = commit_files(&r, &[], &files).await;
+        let root = r.root_tree(c).await.unwrap();
+        if seed % 3 != 0 {
+            index_some(&r, seed, root).await;
+        }
+        let rows_before = index_rows(meta.as_ref()).await;
+        let scan = Arc::new(crate::indexing::bounded::SearchScan::new(&Budgets {
+            search_files: 10_000,
+            search_bytes: 1 << 30,
+            ..Budgets::default()
+        }));
+        let counters = crate::search::index::Counters::scanning(scan.clone());
+        let got = r.tree_row(root, &counters).await.unwrap();
+        assert_eq!(index_rows(meta.as_ref()).await, rows_before, "seed {seed}");
+        assert_eq!(
+            (counters.blob_rows(), counters.tree_rows()),
+            (0, 0),
+            "seed {seed}"
+        );
+        let fresh = Repo::new(r.blobs().clone(), Arc::new(MemoryMetaStore::new()));
+        let mut memo = crate::search::index::TreeRowMemo::new();
+        assert_eq!(
+            got,
+            fresh.recompute_tree_row(root, &mut memo).await.unwrap(),
+            "seed {seed}"
+        );
+        for (h, ..) in tree_shape(&r, root).await {
+            let row = match scan.get(true, &h) {
+                Some(row) => row,
+                None => r
+                    .meta()
+                    .get_derived(crate::search::TREE_KIND, &h)
+                    .await
+                    .unwrap()
+                    .expect("a filter the scan did not compute is stored"),
+            };
+            let want = fresh.recompute_tree_row(h, &mut memo).await.unwrap();
+            assert_eq!(row, want, "seed {seed}: filter of {h}");
+        }
+    }
+}
+
+/// Over its file budget a bounded search stops fetching at once (the files
+/// in flight aside), answers `Indexing`, and stores no row; within it, it
+/// answers and still stores none.
+#[tokio::test]
+async fn bounded_scan_over_budget_stops_early_and_stores_nothing() {
+    let (r, meta) = memory_repo();
+    let mut files = crate::search::tests::Files::new();
+    for d in 0..40 {
+        for f in 0..10 {
+            let body = format!("needle {d} {f}\n").into_bytes();
+            files.insert(format!("d{d}/e/f{f}"), (body, FileKind::Regular));
+        }
+    }
+    let c = crate::search::tests::commit_files(&r, &[], &files).await;
+    hold_leases(meta.as_ref()).await;
+    let rows_before = index_rows(meta.as_ref()).await;
+    let budgets = Budgets {
+        search_files: 20,
+        ..Budgets::default()
+    };
+    let scan = Arc::new(crate::indexing::bounded::SearchScan::new(&budgets));
+    let counters = crate::search::index::Counters::scanning(scan.clone());
+    let root = r.root_tree(c).await.unwrap();
+    match r.tree_row(root, &counters).await {
+        Err(Error::Indexing { kind, .. }) => assert_eq!(kind, crate::search::TREE_KIND),
+        other => panic!("{:?}", other.map(|_| ())),
+    }
+    assert!(scan.over.load(std::sync::atomic::Ordering::Relaxed));
+    let fetched = scan.files.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        fetched > 20 && fetched <= 20 + crate::search::index::CONCURRENCY as u64,
+        "{fetched} of 400 files fetched"
+    );
+    let q = bounded(&r, budgets);
+    let query = SearchQuery::new("needle 3 ");
+    match q
+        .search_page_indexed(&c.to_string(), &query, None, Freshness::Retry)
+        .await
+    {
+        Err(Error::Indexing { kind, .. }) => assert_eq!(kind, crate::search::TREE_KIND),
+        other => panic!("{:?}", other.map(|_| ())),
+    }
+    assert_eq!(index_rows(meta.as_ref()).await, rows_before);
+    let q = bounded(
+        &r,
+        Budgets {
+            search_files: 10_000,
+            ..Budgets::default()
+        },
+    );
+    let got = q
+        .search_page_indexed(&c.to_string(), &query, None, Freshness::Retry)
+        .await
+        .unwrap();
+    assert_eq!(got.value.matches.len(), 10);
+    assert_eq!(got.scanned, 400);
+    assert_eq!(index_rows(meta.as_ref()).await, rows_before);
+}
+
+/// Counts the tree nodes and blobs a repo reads.
+struct CountingBlobs {
+    inner: MemoryBlobStore,
+    /// `get_many` calls (tree reads) and keys asked.
+    many: std::sync::atomic::AtomicU64,
+    many_keys: std::sync::atomic::AtomicU64,
+    /// Single `get`s (file contents).
+    gets: std::sync::atomic::AtomicU64,
+}
+
+#[async_trait::async_trait]
+impl leep_core::BlobStore for CountingBlobs {
+    async fn put_with_hash(&self, hash: leep_core::Hash, data: Bytes) -> leep_core::Result<()> {
+        self.inner.put_with_hash(hash, data).await
+    }
+    async fn get(&self, hash: &leep_core::Hash) -> leep_core::Result<Option<Bytes>> {
+        self.gets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.get(hash).await
+    }
+    async fn get_many(&self, hashes: &[leep_core::Hash]) -> leep_core::Result<Vec<Option<Bytes>>> {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.many.fetch_add(1, SeqCst);
+        self.many_keys.fetch_add(hashes.len() as u64, SeqCst);
+        self.inner.get_many(hashes).await
+    }
+    async fn list_page(
+        &self,
+        after: Option<leep_core::Hash>,
+        limit: usize,
+    ) -> leep_core::Result<Vec<leep_core::BlobMeta>> {
+        self.inner.list_page(after, limit).await
+    }
+    async fn delete(&self, hash: &leep_core::Hash) -> leep_core::Result<()> {
+        self.inner.delete(hash).await
+    }
+}
+
+/// Over budget on a wide cold tree, a bounded scan gives up after reading
+/// the first levels of it, not every tree node and filter below the root,
+/// and before fetching any file: a retry a second later then costs as
+/// little. Within budget the same scan reads the whole tree.
+#[tokio::test]
+async fn bounded_scan_over_budget_reads_a_bounded_part_of_a_cold_tree() {
+    use crate::indexing::bounded::{SearchScan, DISCOVERY_FACTOR, DISCOVERY_FILES};
+    use crate::search::tests::{commit_files, tree_shape, Files, Probe};
+    use std::sync::atomic::Ordering::SeqCst;
+    let blobs = Arc::new(CountingBlobs {
+        inner: MemoryBlobStore::new(),
+        many: Default::default(),
+        many_keys: Default::default(),
+        gets: Default::default(),
+    });
+    let probe = Probe::new(Duration::ZERO);
+    let r = Repo::new(blobs.clone(), probe.clone());
+    // 12 directories of 12 of 12, two files in each directory: 1,885 tree
+    // nodes and 3,770 files.
+    let mut files = Files::new();
+    let mut add = |dir: String| {
+        for f in 0..2 {
+            let body = format!("{dir} {f}\n").into_bytes();
+            files.insert(format!("{dir}/f{f}"), (body, FileKind::Regular));
+        }
+    };
+    for a in 0..12 {
+        add(format!("a{a}"));
+        for b in 0..12 {
+            add(format!("a{a}/b{b}"));
+            for c in 0..12 {
+                add(format!("a{a}/b{b}/c{c}"));
+            }
+        }
+    }
+    let c = commit_files(&r, &[], &files).await;
+    let root = r.root_tree(c).await.unwrap();
+    let nodes = tree_shape(&r, root).await.len() as u64;
+    assert_eq!(nodes, 1 + 12 + 144 + 1_728);
+
+    let scan_with = |search_files: usize| {
+        Arc::new(SearchScan::new(&Budgets {
+            search_files,
+            ..Budgets::default()
+        }))
+    };
+    let count = || {
+        (
+            blobs.many_keys.load(SeqCst),
+            probe.keys_read.load(SeqCst),
+            blobs.gets.load(SeqCst),
+        )
+    };
+    // Over: a budget of 4 files lets discovery find 4 * 8 + 256 = 288.
+    assert_eq!(4 * DISCOVERY_FACTOR + DISCOVERY_FILES, 288);
+    let scan = scan_with(4);
+    let before = count();
+    let counters = crate::search::index::Counters::scanning(scan.clone());
+    match r.tree_row(root, &counters).await {
+        Err(Error::Indexing { kind, .. }) => assert_eq!(kind, crate::search::TREE_KIND),
+        other => panic!("{:?}", other.map(|_| ())),
+    }
+    let after = count();
+    let (read_nodes, read_rows, fetched) =
+        (after.0 - before.0, after.1 - before.1, after.2 - before.2);
+    eprintln!("over budget: {read_nodes} tree nodes, {read_rows} filter keys, {fetched} blobs");
+    assert!(scan.over.load(SeqCst));
+    assert_eq!(fetched, 0, "nothing fetched");
+    assert_eq!(scan.files.load(SeqCst), 0);
+    // The root and two levels (312 files found), of 1,885 nodes.
+    assert!(read_nodes <= 1 + 12 + 144, "{read_nodes} tree nodes read");
+    assert!(read_rows <= 1 + 12 + 144, "{read_rows} filter keys read");
+
+    // Within budget the scan reads everything, and fetches every file.
+    let scan = scan_with(10_000);
+    let before = count();
+    let counters = crate::search::index::Counters::scanning(scan.clone());
+    r.tree_row(root, &counters).await.unwrap();
+    let after = count();
+    assert!(after.0 - before.0 >= nodes);
+    assert_eq!(scan.files.load(SeqCst), files.len() as u64);
+    assert_eq!(index_rows(probe.as_ref()).await, 0, "nothing stored");
+}

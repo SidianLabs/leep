@@ -1,5 +1,8 @@
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::atomic::Ordering::SeqCst;
+use std::sync::atomic::{AtomicU64, AtomicUsize};
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use leep_core::api::SearchResponse;
@@ -1162,4 +1165,733 @@ async fn search_pool_permits_bound_the_reads_of_all_searches() {
     assert!(most_rows_reads_at_once(Some(1)).await <= 2);
     assert!(most_rows_reads_at_once(Some(2)).await <= 4);
     assert!(most_rows_reads_at_once(None).await > 4);
+}
+
+// ---- level-batched derivation: rows, closure, batches, round trips ----
+
+/// A metadata store that counts calls, can add latency to each, and can
+/// fail or hold `put_derived_many`: for the round-trip, fault and
+/// single-flight tests of search derivation.
+pub(crate) struct Probe {
+    inner: Arc<dyn leep_core::MetaStore>,
+    delay: std::time::Duration,
+    /// Every call.
+    pub(crate) calls: AtomicU64,
+    /// `put_derived_many` calls.
+    pub(crate) puts: AtomicU64,
+    /// Keys asked of `get_derived_many`.
+    pub(crate) keys_read: AtomicU64,
+    /// The most rows, and bytes, one `put_derived_many` carried.
+    pub(crate) most_rows: AtomicUsize,
+    pub(crate) most_bytes: AtomicUsize,
+    /// How often each row was written by `put_derived_many`.
+    written: Mutex<HashMap<(String, Hash), u64>>,
+    /// Fail this `put_derived_many` call (1-based), after storing this many
+    /// of its rows: after an error any prefix may be stored.
+    pub(crate) fail: Mutex<Option<(u64, usize)>>,
+    /// While it names a kind (`*`: any), a `put_derived_many` that carries
+    /// a row of it waits for a permit of `gate`.
+    pub(crate) hold: Mutex<Option<String>>,
+    pub(crate) gate: tokio::sync::Semaphore,
+    /// Writes waiting at the gate.
+    pub(crate) held: AtomicU64,
+}
+
+impl Probe {
+    pub(crate) fn new(delay: std::time::Duration) -> Arc<Probe> {
+        Arc::new(Probe {
+            inner: Arc::new(MemoryMetaStore::new()),
+            delay,
+            calls: AtomicU64::new(0),
+            puts: AtomicU64::new(0),
+            keys_read: AtomicU64::new(0),
+            most_rows: AtomicUsize::new(0),
+            most_bytes: AtomicUsize::new(0),
+            written: Mutex::default(),
+            fail: Mutex::new(None),
+            hold: Mutex::new(None),
+            gate: tokio::sync::Semaphore::new(0),
+            held: AtomicU64::new(0),
+        })
+    }
+
+    pub(crate) fn calls(&self) -> u64 {
+        self.calls.load(SeqCst)
+    }
+
+    /// Times `put_derived_many` wrote `key` of `kind`.
+    pub(crate) fn writes_of(&self, kind: &str, key: Hash) -> u64 {
+        let w = self.written.lock().unwrap();
+        w.get(&(kind.to_string(), key)).copied().unwrap_or(0)
+    }
+
+    async fn call(&self) {
+        self.calls.fetch_add(1, SeqCst);
+        if !self.delay.is_zero() {
+            tokio::time::sleep(self.delay).await;
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl leep_core::MetaStore for Probe {
+    async fn put_changeset(&self, cs: &Changeset) -> leep_core::Result<ChangesetId> {
+        self.call().await;
+        self.inner.put_changeset(cs).await
+    }
+    async fn get_changeset(&self, id: &ChangesetId) -> leep_core::Result<Option<Changeset>> {
+        self.call().await;
+        self.inner.get_changeset(id).await
+    }
+    async fn get_changesets(
+        &self,
+        ids: &[ChangesetId],
+    ) -> leep_core::Result<Vec<Option<Changeset>>> {
+        self.call().await;
+        self.inner.get_changesets(ids).await
+    }
+    async fn list_changesets(
+        &self,
+        after: Option<ChangesetId>,
+        limit: usize,
+    ) -> leep_core::Result<Vec<ChangesetId>> {
+        self.call().await;
+        self.inner.list_changesets(after, limit).await
+    }
+    async fn get_ref(&self, name: &str) -> leep_core::Result<Option<ChangesetId>> {
+        self.call().await;
+        self.inner.get_ref(name).await
+    }
+    async fn cas_ref_logged(
+        &self,
+        name: &str,
+        expected: Option<ChangesetId>,
+        new: Option<ChangesetId>,
+        ctx: &leep_core::RefUpdateContext,
+    ) -> leep_core::Result<bool> {
+        self.call().await;
+        self.inner.cas_ref_logged(name, expected, new, ctx).await
+    }
+    async fn find_lands(
+        &self,
+        name: &str,
+        ids: &[leep_core::LandId],
+    ) -> leep_core::Result<Vec<Option<leep_core::LandRecord>>> {
+        self.call().await;
+        self.inner.find_lands(name, ids).await
+    }
+    async fn ref_log(
+        &self,
+        name: Option<&str>,
+        before_seq: Option<u64>,
+        limit: usize,
+    ) -> leep_core::Result<Vec<leep_core::RefLogEntry>> {
+        self.call().await;
+        self.inner.ref_log(name, before_seq, limit).await
+    }
+    async fn list_refs(&self) -> leep_core::Result<BTreeMap<String, ChangesetId>> {
+        self.call().await;
+        self.inner.list_refs().await
+    }
+    async fn get_derived(&self, kind: &str, key: &Hash) -> leep_core::Result<Option<Bytes>> {
+        self.call().await;
+        self.inner.get_derived(kind, key).await
+    }
+    async fn get_derived_many(
+        &self,
+        kind: &str,
+        keys: &[Hash],
+    ) -> leep_core::Result<Vec<Option<Bytes>>> {
+        self.call().await;
+        self.keys_read.fetch_add(keys.len() as u64, SeqCst);
+        self.inner.get_derived_many(kind, keys).await
+    }
+    async fn list_derived(
+        &self,
+        kind: &str,
+        after: Option<Hash>,
+        limit: usize,
+    ) -> leep_core::Result<Vec<(Hash, Bytes)>> {
+        self.inner.list_derived(kind, after, limit).await
+    }
+    async fn put_derived(&self, kind: &str, key: &Hash, value: Bytes) -> leep_core::Result<()> {
+        self.call().await;
+        self.inner.put_derived(kind, key, value).await
+    }
+    async fn put_derived_many(&self, rows: &[leep_core::DerivedRow]) -> leep_core::Result<()> {
+        self.call().await;
+        let n = self.puts.fetch_add(1, SeqCst) + 1;
+        self.most_rows.fetch_max(rows.len(), SeqCst);
+        let bytes = rows.iter().map(|r| r.value.len()).sum();
+        self.most_bytes.fetch_max(bytes, SeqCst);
+        let hold = self.hold.lock().unwrap().clone();
+        if hold.is_some_and(|k| k == "*" || rows.iter().any(|r| r.kind == k)) {
+            self.held.fetch_add(1, SeqCst);
+            let permit = self.gate.acquire().await;
+            self.held.fetch_sub(1, SeqCst);
+            drop(permit);
+        }
+        let fail = *self.fail.lock().unwrap();
+        let (rows, result) = match fail {
+            Some((nth, prefix)) if nth == n => (
+                &rows[..prefix.min(rows.len())],
+                Err(Error::Storage("injected put_derived_many failure".into())),
+            ),
+            _ => (rows, Ok(())),
+        };
+        self.inner.put_derived_many(rows).await?;
+        let mut w = self.written.lock().unwrap();
+        for r in rows {
+            *w.entry((r.kind.clone(), r.key)).or_default() += 1;
+        }
+        result
+    }
+}
+
+/// A repo on a [`Probe`] with no added latency.
+pub(crate) fn probed() -> (Repo, Arc<Probe>) {
+    let probe = Probe::new(std::time::Duration::ZERO);
+    (
+        Repo::new(Arc::new(MemoryBlobStore::new()), probe.clone()),
+        probe,
+    )
+}
+
+/// Files by path, with content and kind.
+pub(crate) type Files = BTreeMap<String, (Vec<u8>, FileKind)>;
+
+pub(crate) async fn commit_files(r: &Repo, parents: &[ChangesetId], files: &Files) -> ChangesetId {
+    let mut changes = BTreeMap::new();
+    for (p, (data, kind)) in files {
+        let content = r.blobs().put(Bytes::copy_from_slice(data)).await.unwrap();
+        changes.insert(
+            RepoPath::new(p.as_str()).unwrap(),
+            FileChange::Modify {
+                content,
+                kind: *kind,
+                size: data.len() as u64,
+            },
+        );
+    }
+    r.create_changeset(Changeset {
+        parents: parents.to_vec(),
+        author: "t".into(),
+        timestamp: 1,
+        message: format!("c{}", parents.len()),
+        changes,
+        extra: BTreeMap::new(),
+    })
+    .await
+    .unwrap()
+}
+
+/// A random tree for the derivation tests: directories up to four deep,
+/// one subtree repeated at depths 1, 2 and 4 (the same missing directory
+/// under parents of different heights), files repeated across directories,
+/// and symlinks, binary and oversize files.
+pub(crate) fn level_tree(seed: u64, n: usize) -> Files {
+    let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+    let mut out = Files::new();
+    for i in 0..n {
+        let mut path = String::new();
+        for _ in 0..rng.below(5) {
+            path.push_str(["a", "b", "c", "d"][rng.below(4)]);
+            path.push('/');
+        }
+        path.push_str(&format!("f{i}"));
+        let kind = if rng.below(15) == 0 {
+            FileKind::Symlink
+        } else {
+            FileKind::Regular
+        };
+        out.insert(path, (random_file(&mut rng), kind));
+    }
+    let shared: Vec<Vec<u8>> = (0..1 + rng.below(4))
+        .map(|_| random_file(&mut rng))
+        .collect();
+    for prefix in ["dup", "x/dup", "x/y/z/dup"] {
+        for (i, body) in shared.iter().enumerate() {
+            out.insert(format!("{prefix}/s{i}"), (body.clone(), FileKind::Regular));
+        }
+    }
+    if rng.below(4) == 0 {
+        let huge = vec![b'x'; MAX_INDEXED_BYTES as usize + 1];
+        out.insert("big/huge".into(), (huge, FileKind::Regular));
+    }
+    out
+}
+
+/// A directory: its hash, its subdirectories, and its searchable files'
+/// contents and sizes.
+pub(crate) type DirShape = (Hash, Vec<Hash>, Vec<(Hash, u64)>);
+
+/// Every distinct directory of the tree `root`.
+pub(crate) async fn tree_shape(r: &Repo, root: Hash) -> Vec<DirShape> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::from([root]);
+    let mut todo = vec![root];
+    while let Some(h) = todo.pop() {
+        let mut dirs = Vec::new();
+        let mut files = Vec::new();
+        for e in r.read_tree(h).await.unwrap().entries.into_values() {
+            match e {
+                TreeEntry::Dir { tree } => {
+                    dirs.push(tree);
+                    if seen.insert(tree) {
+                        todo.push(tree);
+                    }
+                }
+                TreeEntry::File {
+                    content,
+                    kind,
+                    size,
+                } if kind != FileKind::Symlink => files.push((content, size)),
+                TreeEntry::File { .. } => {}
+            }
+        }
+        out.push((h, dirs, files));
+    }
+    out
+}
+
+async fn stored(meta: &dyn leep_core::MetaStore, kind: &str, key: &Hash) -> Option<Bytes> {
+    meta.get_derived(kind, key).await.unwrap()
+}
+
+/// Every stored filter below `root` has its whole subtree stored: its
+/// subdirectories' filters and its files' rows. Returns the stored filters.
+pub(crate) async fn assert_closed(r: &Repo, root: Hash, what: &str) -> usize {
+    let meta = r.meta().as_ref();
+    let mut n = 0;
+    for (h, dirs, files) in tree_shape(r, root).await {
+        if stored(meta, TREE_KIND, &h).await.is_none() {
+            continue;
+        }
+        n += 1;
+        for d in &dirs {
+            assert!(
+                stored(meta, TREE_KIND, d).await.is_some(),
+                "{what}: filter of {h} stored without that of subdirectory {d}"
+            );
+        }
+        for (f, _) in &files {
+            assert!(
+                stored(meta, BLOB_KIND, f).await.is_some(),
+                "{what}: filter of {h} stored without the row of file {f}"
+            );
+        }
+    }
+    n
+}
+
+/// Every stored filter below `root` is what `recompute_tree_row` computes
+/// with no rows to start from, and every stored blob row is that of the
+/// blob's bytes.
+pub(crate) async fn assert_rows_recomputed(r: &Repo, root: Hash, what: &str) {
+    let fresh = Repo::new(r.blobs().clone(), Arc::new(MemoryMetaStore::new()));
+    let mut memo = super::index::TreeRowMemo::new();
+    let meta = r.meta().as_ref();
+    for (h, _, files) in tree_shape(r, root).await {
+        if let Some(row) = stored(meta, TREE_KIND, &h).await {
+            let want = fresh.recompute_tree_row(h, &mut memo).await.unwrap();
+            assert_eq!(row, want, "{what}: filter of {h}");
+        }
+        for (f, size) in files {
+            if let Some(row) = stored(meta, BLOB_KIND, &f).await {
+                let want = if size > MAX_INDEXED_BYTES {
+                    BlobRow::NotIndexed(super::trigram::Skip::TooLarge)
+                } else {
+                    BlobRow::of(&r.blobs().get(&f).await.unwrap().unwrap())
+                };
+                assert_eq!(row, want.encode(), "{what}: row of blob {f}");
+            }
+        }
+    }
+}
+
+/// Store the filters of some directories of `root` (each with its subtree,
+/// as derivation does) and the rows of some files.
+pub(crate) async fn index_some(r: &Repo, seed: u64, root: Hash) {
+    let mut rng = Rng(seed ^ 0x05ee_d0f1_e7e1);
+    let c = super::index::Counters::default();
+    for (h, _, files) in tree_shape(r, root).await {
+        if rng.below(4) == 0 {
+            r.tree_row(h, &c).await.unwrap();
+        }
+        for (f, size) in files {
+            if rng.below(3) == 0 {
+                r.blob_row(f, size, &c).await.unwrap();
+            }
+        }
+    }
+}
+
+/// Derived in level batches over random trees and random partial indexes
+/// (an earlier revision's rows, some subtrees', some files'), every stored
+/// row is byte for byte what `recompute_tree_row` gives, every stored filter
+/// has its subtree stored, and deriving again computes nothing.
+#[tokio::test]
+async fn level_batches_store_the_rows_recompute_gives() {
+    for seed in 1..=40u64 {
+        let what = format!("seed {seed}");
+        let (r, _) = probed();
+        let mut rng = Rng(seed | 1);
+        let files = level_tree(seed, 5 + rng.below(70));
+        let c1 = commit_files(&r, &[], &files).await;
+        if rng.below(2) == 0 {
+            r.derive_search(c1).await.unwrap();
+        }
+        let paths: Vec<&String> = files.keys().collect();
+        let mut edits = Files::new();
+        for _ in 0..rng.below(8) {
+            let p = paths[rng.below(paths.len())].clone();
+            edits.insert(p, (random_file(&mut rng), FileKind::Regular));
+        }
+        let c2 = commit_files(&r, &[c1], &edits).await;
+        let root = r.root_tree(c2).await.unwrap();
+        if rng.below(3) != 0 {
+            index_some(&r, seed, root).await;
+        }
+        assert_closed(&r, root, &what).await;
+        r.derive_search(c2).await.unwrap();
+        assert!(stored(r.meta().as_ref(), TREE_KIND, &root).await.is_some());
+        let dirs = assert_closed(&r, root, &what).await;
+        assert_eq!(dirs, tree_shape(&r, root).await.len(), "{what}");
+        assert_rows_recomputed(&r, root, &what).await;
+        let again = r.derive_search(c2).await.unwrap();
+        assert_eq!((again.blob_rows, again.tree_rows), (0, 0), "{what}");
+    }
+}
+
+/// A level wider than a batch is split, a directory of more files than a
+/// batch is a batch of its own, and every write stays within the rows and
+/// bytes a batch may carry, with the rows those of a single derivation.
+#[tokio::test]
+async fn wide_levels_split_into_bounded_batches() {
+    let (r, probe) = probed();
+    let mut files = Files::new();
+    for i in 0..5_000 {
+        files.insert(
+            format!("flat/f{i}"),
+            (format!("flat {i}\n").into(), FileKind::Regular),
+        );
+    }
+    for d in 0..1_500 {
+        for f in 0..2 {
+            let body = format!("narrow {d} {f}\n").into_bytes();
+            files.insert(format!("n/d{d}/f{f}"), (body, FileKind::Regular));
+        }
+    }
+    // Random printable text: tens of thousands of distinct trigrams, so
+    // each of these directories' filters is dense (64 KiB).
+    let mut rng = Rng(77);
+    for d in 0..300 {
+        let body: Vec<u8> = (0..40_000).map(|_| b' ' + rng.below(95) as u8).collect();
+        files.insert(format!("dense/d{d}/f"), (body, FileKind::Regular));
+    }
+    let c = commit_files(&r, &[], &files).await;
+    let root = r.root_tree(c).await.unwrap();
+    let report = r.derive_search(c).await.unwrap();
+    assert_eq!(report.blob_rows, 5_000 + 3_000 + 300);
+    assert_eq!(report.tree_rows, 1 + 1 + 1 + 1 + 1_500 + 300);
+    let dense = r
+        .meta()
+        .get_derived(
+            TREE_KIND,
+            &tree_shape(&r, root)
+                .await
+                .into_iter()
+                .find(|(_, dirs, files)| {
+                    dirs.is_empty() && files.len() == 1 && files[0].1 == 40_000
+                })
+                .unwrap()
+                .0,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        dense.len(),
+        1 + (super::trigram::BLOOM_BITS / 8),
+        "a dense filter"
+    );
+    assert!(probe.most_rows.load(SeqCst) <= super::index::WRITE_ROWS);
+    let most = probe.most_bytes.load(SeqCst);
+    assert!(
+        most <= super::index::BATCH_BYTES + dense.len(),
+        "{most} bytes in one write"
+    );
+    assert!(
+        most > super::index::BATCH_BYTES / 2,
+        "{most}: dense filters filled a write"
+    );
+    // Each row written once.
+    for (h, _, files) in tree_shape(&r, root).await {
+        assert_eq!(probe.writes_of(TREE_KIND, h), 1);
+        for (f, _) in files {
+            assert_eq!(probe.writes_of(BLOB_KIND, f), 1);
+        }
+    }
+    assert_closed(&r, root, "wide").await;
+    assert_rows_recomputed(&r, root, "wide").await;
+}
+
+/// The swarm's shape (agents' directories beside a larger tree), with a
+/// land changing two files of one agent.
+async fn swarm_land(r: &Repo, parent: ChangesetId, seq: usize) -> ChangesetId {
+    let a = (seq * 7919) % 500;
+    let mut files = Files::new();
+    for f in 0..2 {
+        let path = if seq.is_multiple_of(50) {
+            format!("hot/h{}", seq % 8)
+        } else {
+            format!("agents/a{a}/f{f}")
+        };
+        let body = format!("swarm a{a} s{seq} file {f}\n").into_bytes();
+        files.insert(path, (body, FileKind::Regular));
+    }
+    commit_files(r, &[parent], &files).await
+}
+
+/// Metadata round trips of deriving, and of searching, a head `gap` lands
+/// past the indexed one, on the swarm's shape.
+async fn round_trips_at(gap: usize) -> (u64, u64) {
+    let (r, probe) = probed();
+    let mut files = Files::new();
+    for top in 0..10 {
+        for sub in 0..5 {
+            for f in 0..10 {
+                let body = format!("fn t{top}_s{sub}_f{f}() {{}}\n").into_bytes();
+                files.insert(format!("t{top}/s{sub}/f{f}.c"), (body, FileKind::Regular));
+            }
+        }
+    }
+    for i in 0..6 {
+        files.insert(
+            format!("ROOT{i}"),
+            (format!("root {i}\n").into(), FileKind::Regular),
+        );
+    }
+    for a in 0..500 {
+        for f in 0..2 {
+            let body = format!("swarm a{a} file {f}\n").into_bytes();
+            files.insert(format!("agents/a{a}/f{f}"), (body, FileKind::Regular));
+        }
+    }
+    let mut head = commit_files(&r, &[], &files).await;
+    r.derive_search(head).await.unwrap();
+    let mut seq = 0;
+    let mut gap_head = |r: Repo, mut head: ChangesetId| {
+        let start = seq;
+        seq += gap;
+        async move {
+            for s in start + 1..=start + gap {
+                head = swarm_land(&r, head, s).await;
+            }
+            r.root_tree(head).await.unwrap();
+            head
+        }
+    };
+    head = gap_head(r.clone(), head).await;
+    let before = probe.calls();
+    r.derive_search(head).await.unwrap();
+    let derive = probe.calls() - before;
+    head = gap_head(r.clone(), head).await;
+    let before = probe.calls();
+    let res = r
+        .search(head, &SearchQuery::new("swarm a17 "))
+        .await
+        .unwrap();
+    assert!(res.stats.tree_rows_derived > 0);
+    (derive, probe.calls() - before)
+}
+
+/// Deriving or searching a head many lands past the index costs a few
+/// metadata round trips per level of the tree, not a few per land. Deriving
+/// a directory at a time made 13, 199 and 769 round trips at gaps of 1, 32
+/// and 128 (searching: 17, 201, 769); in level batches it is 10 (14) at any
+/// gap.
+#[tokio::test]
+async fn a_gap_of_many_lands_costs_round_trips_per_level() {
+    for gap in [1, 32, 128] {
+        let (derive, search) = round_trips_at(gap).await;
+        eprintln!("gap {gap}: derive_search {derive} round trips, search {search}");
+        assert!(derive <= 12, "gap {gap}: derive_search made {derive}");
+        assert!(search <= 16, "gap {gap}: search made {search}");
+    }
+}
+
+// ---- one derivation per root, and warm loops of their own ----
+
+/// Wait, up to 20 s, until `done` says so.
+async fn wait_until<F, Fut>(what: &str, mut done: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let start = std::time::Instant::now();
+    while !done().await {
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(20),
+            "timed out waiting until {what}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
+/// Handles on `root`'s place in line: the map's, and two for each
+/// derivation leading or waiting.
+fn in_line(r: &Repo, root: Hash) -> usize {
+    let flights = r.search_flights.lock().unwrap();
+    flights.get(&root).map_or(0, Arc::strong_count)
+}
+
+/// Derivations of one root at once, two `derive_search` calls and a
+/// search, write each row once: the later ones wait for the first, then
+/// find the root's row stored. No place in line is left behind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_derivations_of_one_root_write_it_once() {
+    for seed in 1..=8u64 {
+        let probe = Probe::new(std::time::Duration::from_millis(1));
+        let r = Repo::new(Arc::new(MemoryBlobStore::new()), probe.clone());
+        let c = commit_files(&r, &[], &level_tree(seed, 60)).await;
+        let root = r.root_tree(c).await.unwrap();
+        let q = SearchQuery::new("alpha");
+        let (a, b, s) = tokio::join!(r.derive_search(c), r.derive_search(c), r.search(c, &q));
+        let (a, b, s) = (a.unwrap(), b.unwrap(), s.unwrap());
+        let dirs = tree_shape(&r, root).await;
+        let derived = [a.tree_rows, b.tree_rows, s.stats.tree_rows_derived];
+        assert_eq!(
+            derived.iter().sum::<u64>(),
+            dirs.len() as u64,
+            "seed {seed}"
+        );
+        assert_eq!(derived.iter().filter(|&&n| n > 0).count(), 1, "seed {seed}");
+        for (h, _, files) in &dirs {
+            assert_eq!(probe.writes_of(TREE_KIND, *h), 1, "seed {seed}: {h}");
+            for (f, _) in files {
+                assert_eq!(probe.writes_of(BLOB_KIND, *f), 1, "seed {seed}: {f}");
+            }
+        }
+        assert!(r.search_flights.lock().unwrap().is_empty());
+    }
+}
+
+/// A leader that is cancelled, or fails, just gives up its place: the
+/// derivation waiting behind it derives the root itself and never sees the
+/// leader's error, and the place in line is removed once both are gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stopped_leader_hands_the_root_to_the_next_in_line() {
+    for fail in [false, true] {
+        let (r, probe) = probed();
+        let c = commit_files(&r, &[], &level_tree(11, 50)).await;
+        let root = r.root_tree(c).await.unwrap();
+        *probe.hold.lock().unwrap() = Some("*".into());
+        let leader = tokio::spawn({
+            let r = r.clone();
+            async move { r.derive_search(c).await }
+        });
+        wait_until("the leader writes", || async {
+            probe.held.load(SeqCst) == 1
+        })
+        .await;
+        let waiter = tokio::spawn({
+            let r = r.clone();
+            async move { r.derive_search(c).await }
+        });
+        wait_until("the waiter is in line", || async { in_line(&r, root) == 5 }).await;
+        *probe.hold.lock().unwrap() = None;
+        if fail {
+            let held_call = probe.puts.load(SeqCst);
+            *probe.fail.lock().unwrap() = Some((held_call, 0));
+            probe.gate.add_permits(1);
+            assert!(leader.await.unwrap().is_err());
+        } else {
+            leader.abort();
+            assert!(leader.await.unwrap_err().is_cancelled());
+        }
+        let report = waiter.await.unwrap().unwrap();
+        assert!(report.tree_rows > 0, "fail {fail}: the waiter derived");
+        assert_eq!(
+            assert_closed(&r, root, "handed over").await,
+            tree_shape(&r, root).await.len()
+        );
+        assert_rows_recomputed(&r, root, "handed over").await;
+        assert!(r.search_flights.lock().unwrap().is_empty(), "fail {fail}");
+    }
+}
+
+/// A search waiting for another derivation of its root holds no pool
+/// permit: with a single permit, a search of an indexed revision completes
+/// while it waits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_search_waiting_for_a_derivation_gives_back_its_pool_permit() {
+    let probe = Probe::new(std::time::Duration::ZERO);
+    let r = Repo::new(Arc::new(MemoryBlobStore::new()), probe.clone())
+        .with_search_pool_permits(Some(1));
+    let indexed = commit_files(&r, &[], &level_tree(3, 30)).await;
+    r.derive_search(indexed).await.unwrap();
+    let cold = commit_files(&r, &[], &level_tree(4, 30)).await;
+    let root = r.root_tree(cold).await.unwrap();
+    *probe.hold.lock().unwrap() = Some("*".into());
+    let warm = tokio::spawn({
+        let r = r.clone();
+        async move { r.derive_search(cold).await }
+    });
+    wait_until("the warm writes", || async { probe.held.load(SeqCst) == 1 }).await;
+    let q = SearchQuery::new("alpha");
+    let waiting = tokio::spawn({
+        let (r, q) = (r.clone(), q.clone());
+        async move { r.search(cold, &q).await }
+    });
+    wait_until("the search is in line", || async { in_line(&r, root) == 5 }).await;
+    let other = tokio::time::timeout(std::time::Duration::from_secs(10), r.search(indexed, &q))
+        .await
+        .expect("a search of an indexed tree is not starved of permits")
+        .unwrap();
+    assert_eq!(other.stats.tree_rows_derived, 0);
+    *probe.hold.lock().unwrap() = None;
+    probe.gate.add_permits(1);
+    assert!(warm.await.unwrap().unwrap().tree_rows > 0);
+    let res = waiting.await.unwrap().unwrap();
+    assert_eq!(
+        (res.stats.blob_rows_derived, res.stats.tree_rows_derived),
+        (0, 0),
+        "it waited, then read the rows"
+    );
+    assert_eq!(res.matches, r.search(cold, &q).await.unwrap().matches);
+    assert!(r.search_flights.lock().unwrap().is_empty());
+}
+
+/// Each index group warms in a loop of its own: with path history's writes
+/// held, the search loop still indexes a head that moved after.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_slow_history_group_does_not_delay_search_warming() {
+    use crate::derived::DerivedKind;
+    let (r, probe) = probed();
+    let base = commit_files(&r, &[], &level_tree(5, 20)).await;
+    r.meta().cas_ref("main", None, Some(base)).await.unwrap();
+    *probe.hold.lock().unwrap() = Some(crate::derived::HistoryTree::NAME.into());
+    let task =
+        crate::warm::Warmer::new(r.clone(), true).spawn(std::time::Duration::from_millis(10));
+    wait_until("history is held", || async { probe.held.load(SeqCst) >= 1 }).await;
+    let head = commit_files(&r, &[base], &level_tree(6, 20)).await;
+    r.meta()
+        .cas_ref("main", Some(base), Some(head))
+        .await
+        .unwrap();
+    let root = r.root_tree(head).await.unwrap();
+    let meta = r.meta().clone();
+    wait_until("the moved head's search rows are stored", || {
+        let meta = meta.clone();
+        async move { stored(meta.as_ref(), TREE_KIND, &root).await.is_some() }
+    })
+    .await;
+    assert!(probe.held.load(SeqCst) >= 1, "history is still held");
+    let history = stored(meta.as_ref(), crate::derived::HistoryTree::NAME, &head.0).await;
+    assert!(history.is_none());
+    task.abort();
+    let _ = task.await;
+    *probe.hold.lock().unwrap() = None;
+    probe.gate.add_permits(100);
 }

@@ -267,3 +267,82 @@ async fn old_clients_get_larger_budgets_and_the_ready_feature_is_listed() {
     let ready: ReadyResponse = json(&get(&app, "/v1/ready", None).await);
     assert!(ready.features.iter().any(|f| f == FEATURE_INDEXING_RETRY));
 }
+
+/// Search rows in the store, of both kinds.
+async fn search_rows(meta: &dyn MetaStore) -> usize {
+    let mut n = 0;
+    for kind in [
+        leep_derive::search::TREE_KIND,
+        leep_derive::search::BLOB_KIND,
+    ] {
+        n += meta
+            .list_derived(kind, None, usize::MAX)
+            .await
+            .unwrap()
+            .len();
+    }
+    n
+}
+
+/// A search whose unindexed files exceed the budget is a 503 and stores
+/// nothing; within the budget it answers from rows computed in memory, and
+/// still stores nothing.
+#[tokio::test]
+async fn search_over_budget_is_503_and_no_search_stores_rows() {
+    let fx = fixture(3, 2).await;
+    let base = *fx.ids.last().unwrap();
+    let mut changes = BTreeMap::new();
+    for d in 0..30 {
+        for f in 0..10 {
+            let body = format!("needle {d} {f}\n");
+            let content = fx
+                .repo
+                .blobs()
+                .put(Bytes::from(body.clone()))
+                .await
+                .unwrap();
+            changes.insert(
+                RepoPath::new(format!("w/d{d}/f{f}")).unwrap(),
+                FileChange::Modify {
+                    content,
+                    kind: FileKind::Regular,
+                    size: body.len() as u64,
+                },
+            );
+        }
+    }
+    let tip = fx
+        .repo
+        .create_changeset(Changeset {
+            parents: vec![base],
+            author: "dev0".into(),
+            timestamp: 9,
+            message: "wide".into(),
+            changes,
+            extra: BTreeMap::new(),
+        })
+        .await
+        .unwrap();
+    let meta = fx.repo.meta().clone();
+    let before = search_rows(meta.as_ref()).await;
+    let uri = format!("/v1/search/{tip}?q=needle%207%20");
+    let tight = router(
+        &fx.repo,
+        Budgets {
+            search_files: 20,
+            ..Budgets::default()
+        },
+    );
+    let r = get(&tight, &uri, Some("retry")).await;
+    assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE);
+    let e: ErrorResponse = json(&r);
+    assert_eq!(e.code.as_deref(), Some("indexing"));
+    assert_eq!(search_rows(meta.as_ref()).await, before);
+    let roomy = router(&fx.repo, Budgets::default());
+    let r = get(&roomy, &uri, Some("retry")).await;
+    assert_eq!(r.status, StatusCode::OK);
+    let v: SearchResponse = json(&r);
+    assert_eq!(v.matches.len(), 10);
+    assert_eq!(scanned(&r), 300);
+    assert_eq!(search_rows(meta.as_ref()).await, before);
+}

@@ -14,7 +14,7 @@ pub mod plan;
 pub mod trigram;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -28,7 +28,7 @@ use leep_core::{ChangesetId, Error, FileKind, Hash, RepoPath, Result, TreeEntry,
 pub use index::{BLOB_KIND, TREE_KIND};
 pub use trigram::MAX_INDEXED_BYTES;
 
-use index::{Counters, CONCURRENCY};
+use index::{Counters, PoolSlot, CONCURRENCY};
 use plan::Compiled;
 use trigram::is_text;
 
@@ -304,14 +304,7 @@ impl Opener {
             // Taken here, under the caller's `ahead` permit if it holds one,
             // and released before the tree reads: a pool permit never waits
             // on `ahead`, so the two semaphores cannot wait on each other.
-            let _pool = match &self.repo.search_pool {
-                Some(pool) => Some(
-                    pool.acquire()
-                        .await
-                        .map_err(|e| Error::Other(format!("search pool: {e}")))?,
-                ),
-                None => None,
-            };
+            let mut pool = PoolSlot::acquire(self.repo.search_pool.as_deref()).await?;
             // Files that `check_file` skips without a row need none.
             let wanted: Vec<usize> = (0..files.len())
                 .filter(|&k| needs_row(&files[k].1))
@@ -330,9 +323,14 @@ impl Opener {
             for (d, row) in dirs.into_iter().zip(tree_rows) {
                 let row = match row {
                     Some(row) => row,
-                    // A cold filter is derived under the pool permit; the
-                    // class limit already bounds how many searches do this.
-                    None => self.repo.search_tree_row(d.2, &self.counters).await?,
+                    // A cold filter is derived under the pool permit (the
+                    // class limit already bounds how many searches do
+                    // this), or waited for without it.
+                    None => {
+                        self.repo
+                            .search_tree_row(d.2, &self.counters, &mut pool)
+                            .await?
+                    }
                 };
                 if self.admits(&row)? {
                     kept.push(d);
@@ -430,15 +428,8 @@ impl Walk {
             let admitted = !o.indexed || {
                 // The root's filter is a metadata read like `open`'s, so it
                 // takes a pool permit too; no `ahead` permit is held here.
-                let _pool = match &o.repo.search_pool {
-                    Some(pool) => Some(
-                        pool.acquire()
-                            .await
-                            .map_err(|e| Error::Other(format!("search pool: {e}")))?,
-                    ),
-                    None => None,
-                };
-                let row = o.repo.search_tree_row(tree, &o.counters).await?;
+                let mut pool = PoolSlot::acquire(o.repo.search_pool.as_deref()).await?;
+                let row = o.repo.search_tree_row(tree, &o.counters, &mut pool).await?;
                 o.admits(&row)?
             };
             if admitted {

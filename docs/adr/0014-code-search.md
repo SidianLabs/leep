@@ -95,6 +95,19 @@ filter per directory on the changed paths; everything else is shared.
 after an import or from a cron job; it is idempotent and safe beside running
 servers. A search that has no required trigram derives nothing.
 
+Missing rows are derived a level of the tree at a time, not a directory at a
+time (implementation note, 2026-10): the missing directories are found with
+one batch of tree reads and one batched row read per level, then derived by
+height, lowest first, in batches of at most 4,096 rows: a batch's files' rows
+are read in one call, the missing ones computed side by side and written with
+one `put_derived_many`, then the batch's filters are written. A level is
+written whole before its parents, and a batch's filters after its blob rows,
+so a stored filter still means its whole subtree is stored. A search on a head
+many lands past the indexed one therefore costs a few round trips per level of
+the changed paths, not a few per land. One derivation per tree root runs at a
+time in a process: a search arriving while the warmer derives the same root
+waits for it (without its search pool permit) and then reads the rows.
+
 ### API and clients
 `GET /v1/search/{rev}?q=&regex=&i=&path=&glob=&limit=` returns
 `{matches, truncated, stats}` (read role). `rev` is a ref name or a full id;

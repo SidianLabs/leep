@@ -218,7 +218,9 @@ by deriving, and skipped when they lack one, ADR 0058).
 Other kinds are derived on first read (the search kinds on the first search
 that needs them; see "Code search"), and every server also warms them in the
 background for each ref head that moved (ADR 0028), so queries on an imported
-or restarted history do not pay for the whole history. The warmer tails the
+or restarted history do not pay for the whole history. The warmer runs one
+loop per index group (path history, log filter, code search), so a group
+that falls behind does not hold back the others. Each loop tails the
 ref log every `--warm-interval` (250 ms; `seq` is assigned in commit order, so
 the tail misses nothing), lists every ref every 5 s as a backstop, and
 derives all moved heads of a pass as one range per kind
@@ -452,7 +454,17 @@ Limits: 100 matches by default, 1000 at most, 256 MiB of blob content scanned,
 `truncated` when either is hit. Only UTF-8 text blobs up to 1 MiB are searched;
 others count as `files_skipped`. The index rows are derived lazily by the first
 search that needs them, or by the warmer for ref heads (ADR 0028), and are
-keyed by content, so a new revision derives only what it changed;
+keyed by content, so a new revision derives only what it changed. Missing
+rows are derived a tree level at a time (`search::index`): the missing
+directories are found with a batched read per level, then derived by height
+in batches of at most 4,096 rows and 16 MiB, each batch reading its files'
+rows in one call, computing the missing ones side by side and writing them
+with one `put_derived_many` before its filters, and each level written
+before its parents, so a stored filter always has its subtree stored (which
+`stale-ok` and the bounded checks rely on), and a gap of many lands costs a
+few round trips per level. One derivation per tree root runs at a time in a
+process (`Repo::search_flights`); others wait for it and then read the rows;
+a bounded query's scan stores nothing and does not wait.
 `leep-server derive-search <rev>` warms any other revision ahead of time. Clients are `leep search` and the `leep_search` MCP tool.
 
 **Verification and repair** ([ADR 0025](adr/0025-repair-tools.md)).
@@ -1126,7 +1138,8 @@ also share a bound on their metadata reads (`Repo::with_search_pool_permits`,
 `--search-pool-permits`, a quarter of the pool by default): `Opener::open`
 takes a permit inside the call, under the open-ahead permit it may hold, so
 the two semaphores never wait on each other, and searches hold at most half
-of the pool. Still proposed: the `land_check`, `blame`, `log_filtered` and
+of the pool. A search gives its permit back while it waits for another
+derivation of the same tree, so waiters do not starve other searches. Still proposed: the `land_check`, `blame`, `log_filtered` and
 `diff_large` classes, which the flag parses and accepts only as `off`.
 
 **Config reload** ([ADR 0024](adr/0024-config-reload.md)). The tokens, their
