@@ -1822,6 +1822,30 @@ mod tests {
         assert!(top.contains("--meta") && top.contains("--listen"));
     }
 
+    /// deploy/leep-server.env.example lists exactly the variables the
+    /// server reads, so it cannot fall behind a new flag or keep a dead one.
+    #[test]
+    fn env_example_lists_every_variable() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../deploy/leep-server.env.example"
+        );
+        let text = std::fs::read_to_string(path).unwrap();
+        let listed: std::collections::BTreeSet<String> = text
+            .lines()
+            .map(|l| l.trim_start_matches('#'))
+            .filter_map(|l| l.split_once('=').map(|(k, _)| k))
+            .filter(|k| k.starts_with("LEEP_") && !k.contains(' '))
+            .map(String::from)
+            .collect();
+        let read: std::collections::BTreeSet<String> = cli()
+            .get_arguments()
+            .filter_map(|a| a.get_env())
+            .map(|e| e.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(listed, read, "{path} and the flags' variables differ");
+    }
+
     #[test]
     fn log_colours_only_on_a_terminal_without_no_color() {
         assert!(log_colours(true, None));

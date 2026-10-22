@@ -102,12 +102,48 @@ echo "{\"tokens\":[$(sed -n 's/^entry: //p' alice.out),$(sed -n 's/^entry: //p' 
 ```
 
 Each `.out` file holds the token on its `token:` line; hand it to its user and
-delete the file. Move `tokens.json` to `/etc/leep/`, readable only by the
-account that runs `leep-server`, and give that account `/var/lib/leep`. Then
-start the server (under systemd or another supervisor
-in production) with explicit stores. Its defaults differ from the image's:
-it listens on `127.0.0.1:7070` and, without `LEEP_META`/`LEEP_BLOBS`, keeps
-SQLite and blobs in `./leep-data` relative to the directory it starts in.
+delete the file. The server's defaults differ from the image's: it listens on
+`127.0.0.1:7070` and, without `LEEP_META`/`LEEP_BLOBS`, keeps SQLite and blobs
+in `./leep-data` relative to the directory it starts in, so give it explicit
+stores.
+
+### Under systemd
+
+[`deploy/systemd/leep-server.service`](../deploy/systemd/leep-server.service)
+runs `/usr/local/bin/leep-server` as a dedicated `leep` user with its state in
+`/var/lib/leep`, read-only access to the rest of the system, and restart on
+failure. It reads its settings from `/etc/leep/leep-server.env`; start from
+[`deploy/leep-server.env.example`](../deploy/leep-server.env.example), which
+lists every `LEEP_` variable the server reads with its default, and set at
+least `LEEP_META` (the password above), `LEEP_BLOBS` and `LEEP_TOKENS_FILE`:
+
+```sh
+sudo useradd --system --home-dir /var/lib/leep --shell /usr/sbin/nologin leep
+sudo install -d -m 0750 -o root -g leep /etc/leep
+sudo install -m 0640 -o root -g leep tokens.json /etc/leep/tokens.json && rm tokens.json
+sudo install -m 0640 -o root -g leep deploy/leep-server.env.example /etc/leep/leep-server.env
+sudoedit /etc/leep/leep-server.env                    # LEEP_META's password, stores, listen address
+sudo install -m 0644 deploy/systemd/leep-server.service /etc/systemd/system/
+sudo systemd-analyze verify /etc/systemd/system/leep-server.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now leep-server
+curl -s localhost:7070/v1/ready                       # {"status":"ready",...}
+journalctl -u leep-server -f                          # logs (plain text, no colour codes)
+```
+
+`systemctl reload leep-server` sends SIGHUP, which re-reads the tokens, signing
+keys and review policy files ([Reloading config](#reloading-config));
+everything in the environment file is read only at start, so change it and
+`systemctl restart leep-server`. The unit lets the server write only
+`/var/lib/leep`: if `LEEP_BLOBS` names a directory elsewhere, add it to
+`ReadWritePaths=` with `systemctl edit leep-server`. A stop waits for requests
+in flight, up to `--request-timeout` (5 minutes by default); the unit's
+`TimeoutStopSec` allows that.
+
+### By hand
+
+To try it in a shell instead, as an account that can write `/var/lib/leep`
+and read `/etc/leep/tokens.json`:
 
 ```sh
 export LEEP_META=postgres://leep:change-me@127.0.0.1:5432/leep
@@ -118,9 +154,17 @@ leep-server &                                  # listens on 127.0.0.1:7070
 curl -s localhost:7070/v1/ready                # {"status":"ready",...}
 ```
 
+### Subcommands and a first client
+
 Every `leep-server` subcommand (`backup`, `restore`, `migrate`, `gc`, ...)
-and `leep-git import` read the same `LEEP_META` and `LEEP_BLOBS`, so keep them
-in one environment file. From a client:
+and `leep-git import` read the same `LEEP_META` and `LEEP_BLOBS`, so run them
+with the server's environment file:
+
+```sh
+sudo -u leep sh -c 'set -a; . /etc/leep/leep-server.env; leep-server migrate --status'
+```
+
+From a client:
 
 ```sh
 export LEEP_SERVER=http://127.0.0.1:7070 LEEP_TOKEN=<alice's token>
@@ -485,6 +529,10 @@ comparable between servers). See
 a reload is refused.
 
 ## Environment variables
+
+The main ones are below; `leep-server --help` describes every flag, and
+[`deploy/leep-server.env.example`](../deploy/leep-server.env.example) lists
+every variable with its default (a test keeps it in step with the flags).
 
 | Variable | Default in image | Meaning |
 |---|---|---|
