@@ -930,6 +930,22 @@ pub async fn condemn_with(
     mode: Mark,
     clock: &dyn Clock,
 ) -> Result<CondemnReport> {
+    let lease = if opts.dry_run {
+        None
+    } else {
+        crate::gc_lease::GcLease::acquire(repo.meta(), "blob-condemn").await?
+    };
+    let result = condemn_leased(repo, opts, mode, clock, &lease).await;
+    crate::gc_lease::release(lease, result).await
+}
+
+async fn condemn_leased(
+    repo: &Repo,
+    opts: &GcOptions,
+    mode: Mark,
+    clock: &dyn Clock,
+    lease: &Option<crate::gc_lease::GcLease>,
+) -> Result<CondemnReport> {
     let mut report = CondemnReport::default();
     let started_at = clock.now();
     let mut stats = MarkStats::default();
@@ -975,6 +991,7 @@ pub async fn condemn_with(
                 continue;
             }
             if !opts.dry_run {
+                crate::gc_lease::check(lease)?;
                 // Strictly after any earlier condemnation, hence after any
                 // rescue of it, even if the clock stepped back.
                 let at = state.condemned.map_or(0, |c| c + 1).max(clock.now());
@@ -1004,6 +1021,22 @@ pub async fn collect_with(
     clock: &dyn Clock,
 ) -> Result<CollectReport> {
     check_fence(opts)?;
+    let lease = if opts.dry_run {
+        None
+    } else {
+        crate::gc_lease::GcLease::acquire(repo.meta(), "blob-collect").await?
+    };
+    let result = collect_leased(repo, opts, mode, clock, &lease).await;
+    crate::gc_lease::release(lease, result).await
+}
+
+async fn collect_leased(
+    repo: &Repo,
+    opts: &GcOptions,
+    mode: Mark,
+    clock: &dyn Clock,
+    lease: &Option<crate::gc_lease::GcLease>,
+) -> Result<CollectReport> {
     let mut report = CollectReport::default();
     let started_at = clock.now();
     let eligible_before = started_at.saturating_sub(secs(opts.fence));
@@ -1079,6 +1112,7 @@ pub async fn collect_with(
                 report.deleted_bytes += blob.size;
                 continue;
             }
+            crate::gc_lease::check(lease)?;
             // Handshake: announce the delete, then look for a rescue. An
             // upload writes its rescue and then looks for the announcement.
             repo.meta()
@@ -1146,6 +1180,35 @@ mod tests {
         let blobs = Arc::new(MemoryBlobStore::new());
         let repo = Repo::new(blobs.clone(), Arc::new(MemoryMetaStore::new()));
         (repo, blobs)
+    }
+
+    /// One GC at a time (ADR 0059 section 6): blob condemn and collect
+    /// refuse while a changeset collect holds the gc lease, and run once it
+    /// is released. A dry run takes no lease.
+    #[tokio::test]
+    async fn blob_gc_refuses_during_changeset_collect() {
+        let (repo, _) = setup();
+        let held = crate::gc_lease::GcLease::acquire(repo.meta(), "changeset-collect")
+            .await
+            .unwrap()
+            .unwrap();
+        let opts = GcOptions::default();
+        let clock = TestClock::at(now());
+        for e in [
+            collect(&repo, &opts, &clock).await.unwrap_err(),
+            condemn(&repo, &opts, &clock).await.unwrap_err(),
+        ] {
+            assert!(matches!(e, Error::Conflict(_)), "{e}");
+            assert!(e.to_string().contains("changeset-collect"), "{e}");
+        }
+        let dry = GcOptions {
+            dry_run: true,
+            ..GcOptions::default()
+        };
+        condemn(&repo, &dry, &clock).await.unwrap();
+        held.release().await.unwrap();
+        collect(&repo, &opts, &clock).await.unwrap();
+        condemn(&repo, &opts, &clock).await.unwrap();
     }
 
     /// A clock that only moves when told to or when GC sleeps.

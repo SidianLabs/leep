@@ -119,6 +119,14 @@ pub const LAND_LEASE_SCOPE: &str = "land";
 /// repository of a store (ADR 0054).
 pub const INDEX_LEASE_SCOPE: &str = "index";
 
+/// The scope of the garbage collection lease (ADR 0059 section 6): one,
+/// named [`GC_LEASE_NAME`], store-wide, so blob GC and the changeset sweep
+/// never run at once.
+pub const GC_LEASE_SCOPE: &str = "gc";
+
+/// The name of the one [`GC_LEASE_SCOPE`] lease.
+pub const GC_LEASE_NAME: &str = "store";
+
 /// Names one lease: what kind of work it coordinates (`scope`), in which
 /// repository (1 until ADR 0054), over what (`name`, for example a ref) and
 /// which part of it (`shard`).
@@ -153,6 +161,16 @@ impl LeaseKey {
             scope: INDEX_LEASE_SCOPE.into(),
             repo_id: 0,
             name: kind.into(),
+            shard: 0,
+        }
+    }
+
+    /// The garbage collection lease: store-wide, so repository 0.
+    pub fn gc() -> Self {
+        LeaseKey {
+            scope: GC_LEASE_SCOPE.into(),
+            repo_id: 0,
+            name: GC_LEASE_NAME.into(),
             shard: 0,
         }
     }
