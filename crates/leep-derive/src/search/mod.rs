@@ -14,7 +14,7 @@ pub mod plan;
 pub mod trigram;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;

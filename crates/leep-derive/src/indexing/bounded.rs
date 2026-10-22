@@ -100,7 +100,7 @@ pub(crate) struct SearchScan {
 }
 
 impl SearchScan {
-    fn new(budgets: &Budgets) -> Self {
+    pub(crate) fn new(budgets: &Budgets) -> Self {
         SearchScan {
             rows: Mutex::default(),
             files: AtomicU64::new(0),

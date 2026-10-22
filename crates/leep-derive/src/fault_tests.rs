@@ -2654,3 +2654,90 @@ async fn incremental_reach_rows_agree_with_full_reachability() {
         reach_under_faults(seed).await;
     }
 }
+
+// ---- search rows: a stored filter always has its subtree stored ----
+
+/// Lets the first `n` lease checks of a derivation pass.
+struct Countdown(std::sync::atomic::AtomicUsize);
+
+#[async_trait::async_trait]
+impl crate::repo::WriteGuard for Countdown {
+    async fn allowed(&self) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.0
+            .fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+    }
+}
+
+/// Search derivation stopped anywhere, by a `put_derived_many` that fails
+/// after storing any prefix of its rows or by the index lease lost before
+/// any write of any level, leaves every stored filter with its whole
+/// subtree stored: `stale_target` and the bounded queries' checks never
+/// trust a filter over missing rows. A later derivation completes the rows,
+/// byte for byte those `recompute_tree_row` gives.
+#[tokio::test]
+async fn search_rows_stay_closed_when_derivation_stops_anywhere() {
+    use crate::search::tests::{
+        assert_closed, assert_rows_recomputed, commit_files, index_some, level_tree, probed,
+    };
+    use std::sync::atomic::Ordering::SeqCst;
+    let (mut failed, mut lost) = (0, 0);
+    for seed in seeds() {
+        let mut rng = Rng::new(seed);
+        let files = level_tree(seed, 20 + rng.below(80));
+        let partial = rng.below(2) == 0;
+        // An uninterrupted derivation, for its number of writes.
+        let (r, probe) = probed();
+        let c = commit_files(&r, &[], &files).await;
+        let root = r.root_tree(c).await.unwrap();
+        if partial {
+            index_some(&r, seed, root).await;
+        }
+        let before = probe.puts.load(SeqCst);
+        r.derive_search(c).await.unwrap();
+        let writes = probe.puts.load(SeqCst) - before;
+        if writes == 0 {
+            continue;
+        }
+        let what = format!("seed {seed}");
+
+        // A write fails, after storing a prefix of its rows.
+        let (r, probe) = probed();
+        commit_files(&r, &[], &files).await;
+        if partial {
+            index_some(&r, seed, root).await;
+        }
+        let k = 1 + rng.below(writes as usize) as u64;
+        let prefix = rng.below(64);
+        *probe.fail.lock().unwrap() = Some((probe.puts.load(SeqCst) + k, prefix));
+        let err = r.derive_search(c).await.unwrap_err();
+        assert!(matches!(err, Error::Storage(_)), "{what}: {err}");
+        *probe.fail.lock().unwrap() = None;
+        assert_closed(&r, root, &format!("{what}, write {k} of {writes} failed")).await;
+        failed += 1;
+        r.derive_search(c).await.unwrap();
+        assert_closed(&r, root, &what).await;
+        assert_rows_recomputed(&r, root, &what).await;
+
+        // The lease is lost after `n` writes.
+        let (r, _) = probed();
+        commit_files(&r, &[], &files).await;
+        if partial {
+            index_some(&r, seed, root).await;
+        }
+        let n = rng.below(writes as usize);
+        let guarded = r.with_write_guard(Arc::new(Countdown(n.into())));
+        let err = guarded.derive_search(c).await.unwrap_err();
+        assert!(err.to_string().contains("lease was lost"), "{what}: {err}");
+        assert_closed(&r, root, &format!("{what}, lease lost after {n} writes")).await;
+        lost += 1;
+        r.derive_search(c).await.unwrap();
+        assert_closed(&r, root, &what).await;
+        assert_rows_recomputed(&r, root, &what).await;
+    }
+    assert!(
+        failed > 0 && lost > 0,
+        "{failed} failed writes, {lost} lost leases"
+    );
+}
