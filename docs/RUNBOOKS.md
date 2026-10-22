@@ -58,8 +58,10 @@ every runbook.
 | [LeepRestoreDrillOverdue](#leeprestoredrilloverdue) | ticket | no passing restore drill in 35 days |
 | [LeepGcStale](#leepgcstale) | ticket | `leep-server gc` has not succeeded in 3 days |
 | [LeepDiskSpaceLow](#leepdiskspacelow) | ticket | a Leep data or backup filesystem has under 10% free |
+| [LeepInodesLow](#leepinodeslow) | ticket | a filesystem holding Leep blobs or its database has under 10% of its inodes free (optional, node_exporter) |
+| [LeepInodesCritical](#leepinodescritical) | page | the same, under 3% |
 
-The last four rows depend on things Leep does not export itself: wrapper
+The last six rows depend on things Leep does not export itself: wrapper
 metrics from [Cron wrappers](#cron-wrappers) and node_exporter's filesystem
 metrics. Leep has no GC or disk metrics of its own.
 
@@ -2123,7 +2125,8 @@ Postgres cannot write, backups fail (see [LeepBackupStale](#leepbackupstale)).
 
 **Diagnose.**
 
-1. `df -h` and `df -i` (inodes: the filesystem blob store makes one file per blob).
+1. `df -h` and `df -i` (inodes: the filesystem blob store makes one file per
+   loose blob; running out of them is [LeepInodesLow](#leepinodeslow)).
 2. What grows: `du -xsh /var/lib/leep/*`, `du -xsh /backups/leep/*`, and for
    Postgres `SELECT pg_size_pretty(pg_database_size('leep'))` plus the size of its WAL
    directory and replication slots (a stuck slot or broken archiving keeps WAL).
@@ -2181,6 +2184,136 @@ Postgres cannot write, backups fail (see [LeepBackupStale](#leepbackupstale)).
 
 **Escalate / collect.** `df` and `du` output over time, the GC dry-run report, the
 size of the largest tables or WAL, and the [standard bundle](#collecting-a-bug-report).
+
+## LeepInodesLow
+
+**Meaning.** A filesystem that holds a filesystem blob store, the SQLite file
+or Postgres data has had less than 10% of its inodes free for 15 minutes.
+**Ticket.** At 3% [LeepInodesCritical](#leepinodescritical) pages. The rule
+is in the optional `leep-host-inodes` group and uses node_exporter's
+`node_filesystem_files_free` and `node_filesystem_files`; Leep exports no
+inode metric. A filesystem out of inodes refuses new files with the same
+`No space left on device` (ENOSPC) as one out of space, however many bytes
+are free, so [LeepDiskSpaceLow](#leepdiskspacelow) does not see it coming.
+
+**Impact.** None yet. When the inodes run out, every new blob upload fails
+(each loose object is a new file), so commits and lands that bring new
+content answer 5xx, and Postgres or SQLite fail when they need a new file
+(a WAL segment, a new relation). Reads go on working.
+
+**Diagnose.**
+
+1. Confirm: `df -i /var/lib/leep` (and the Postgres data directory). `IUse%`
+   near 100 with `df -h` showing space free is this alert. A bare-metal or VM
+   host shows the same through `df -i` on the mount.
+2. Is it the blob store? A filesystem blob store keeps one file per loose
+   object in 256 shard directories, `BLOBS/00` to `BLOBS/ff`, until
+   `leep-server repack` packs them. Count the loose objects, stopping early so
+   a huge store does not take minutes:
+   `find /var/lib/leep/blobs/[0-9a-f][0-9a-f] -type f ! -name '.*' | head -n 1000001 | wc -l`.
+   A count near the filesystem's used inodes is the answer. Leep has no
+   metric for it; the `loose_before` and `loose_after` of a `repack --json`
+   report are the other source.
+3. When did it last pack? `ls -l /var/lib/leep/blobs/packs/` (the newest
+   `.pack`'s time), and the repack job's cron log. No `packs/*.pack` at all
+   means the store was never packed.
+4. What adds files: load tests or agent swarms that write to this store, a
+   large import, and abandoned uploads (`gc --dry-run`). Each object is
+   a file whatever its size, so many small blobs use up inodes long before
+   bytes.
+5. Anything else on the filesystem with many small files (logs, caches,
+   another service), with `du --inodes -xs /var/lib/* | sort -n | tail`.
+
+**Likely causes.**
+
+1. A filesystem blob store that is never repacked, or not often enough for
+   its write rate. Confirm: steps 2 and 3. This is the usual cause: in one
+   incident a VPS's data filesystem had 3,474 free inodes of 9.96M, with
+   42 GB of space free, because about 9.9M loose blobs had piled up from load
+   tests (about 27,000 loose files per run) on a store nobody repacked.
+2. A filesystem made with too few inodes for small files. ext4 fixes its
+   inode count when the filesystem is made (by default one per 16 KiB);
+   blobs from agents' edits are mostly smaller than that. Confirm: `tune2fs -l
+   DEVICE | grep -i 'inode count\|inodes per group'`.
+3. Something besides Leep making small files. Confirm: step 5.
+
+**Mitigate / fix.**
+
+- Run `leep-server repack` (OPERATIONS.md, [Packing blobs](OPERATIONS.md#packing-blobs)).
+  It is safe beside running servers: it packs the loose objects, waits its
+  `--fence` (default 10 minutes) so readers of the loose copies finish, then
+  deletes every loose copy it packed. That frees one inode per loose object
+  and needs only a few new files for the pack, so it can run with very few
+  inodes left. It needs free space for the new pack, a small fraction of the
+  loose bytes.
+- **Plan for hours on a large store.** Inodes come back only at the end,
+  after the fence and cleanup. Measured on the project's VPS
+  ([PERFORMANCE.md](PERFORMANCE.md), "All of git/git" and the Linux
+  sections), all first repacks of a loose store: 327,000 loose objects of
+  git/git in 27 min (10 of them the fence); 4.65M loose objects of Linux in
+  2 h 55 min (49 min walking history, 1 h 45 min writing, 10 min fence,
+  10 min cleanup), with memory peaking at about 5 GB; 10.08M objects of
+  Linux in 4 h 55 min. Those were older builds; a later full repack of
+  10.36M objects, 329,000 of them loose, took 1 h 18 min at 2.16 GiB.
+  Expect hours for millions of loose objects. An incremental run's cost
+  follows the history added since the last one (0.4 s for 100 new commits
+  of a synthetic history, "Incremental repack"), plus the fence.
+- While it runs, slow down what writes new blobs: pause load tests and
+  large imports, so the remaining inodes last until the repack frees them.
+  If they will not last, page and grow or move the volume (below).
+- Then schedule it so this does not come back: an incremental `repack`
+  nightly and after load tests, or when the loose count of step 2 passes a
+  threshold (OPERATIONS.md, "Packing blobs").
+- For a lasting fix on ext4, the inode count cannot be raised in place. Make
+  a dedicated blob volume with more inodes (`mkfs.ext4 -i 4096`, one per
+  4 KiB) and move the store to it, or use a filesystem that allocates inodes
+  as it needs them (XFS, up to its `imaxpct`), or move blobs to `s3://`,
+  where objects cost no inodes.
+- **Never delete blob files by hand**, not even ones that look old or
+  orphaned: a loose object can be the only copy of committed content, and
+  one that is gone is recoverable only from backup. Unreferenced blobs go
+  through `leep-server gc`, packed ones through `repack`. Leave `packs/` and
+  `.repack-*` files alone as well (see [LeepDiskSpaceLow](#leepdiskspacelow)).
+
+**Escalate / collect.** `df -i` and `df -h` over time, the loose count, the
+listing of `packs/`, the repack job's schedule and its last report, and the
+[standard bundle](#collecting-a-bug-report).
+
+## LeepInodesCritical
+
+**Meaning.** As [LeepInodesLow](#leepinodeslow), but under 3% of the inodes
+are free for 5 minutes. **Page.** On a store adding tens of thousands of
+loose objects an hour, that can be minutes to an hour from ENOSPC on every
+blob write.
+
+**Impact.** As LeepInodesLow, imminent: once none is free, uploads, commits
+and lands with new content answer 5xx (`No space left on device`) and
+[LeepServerErrors](#leepservererrors) follows.
+
+**Diagnose.** `df -i` on the mount, then LeepInodesLow's steps 2 to 5. Work
+out how long is left: the free inodes over the rate they fall
+(`deriv(node_filesystem_files_free{mountpoint="..."}[30m])`).
+
+**Mitigate / fix**, in this order:
+
+1. Stop new loose objects: pause load tests, agent swarms and imports that
+   write to this store.
+2. Start `leep-server repack` at once, if one is not running (a second one
+   exits with "another repack is running"). Inodes come back only when it
+   finishes; see LeepInodesLow for how long that is.
+3. If the time left is shorter than the repack, buy time without touching
+   blobs: delete safe small files on the same filesystem (old logs, the
+   `.tmp-*` files older than the request timeout that
+   [LeepDiskSpaceLow](#leepdiskspacelow), step 4, lists), or move the store
+   to a volume with free inodes (copy it, then switch the servers' `--blobs`
+   during a stop).
+4. Afterwards, everything under LeepInodesLow's fix: a schedule, and a volume
+   or backend that cannot run out of inodes this way.
+
+- **Never delete blob files by hand** to free inodes, and do not run `repack
+  --unsafe-no-fence` beside running servers to finish sooner.
+
+**Escalate / collect.** As LeepInodesLow, plus the time line of free inodes.
 
 ## Cron wrappers
 

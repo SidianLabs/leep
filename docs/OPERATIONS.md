@@ -37,6 +37,14 @@ it when it is true of your deployment, and redo the list after an upgrade.
   [Cron wrappers](RUNBOOKS.md#cron-wrappers)), and its failures alert
   (`LeepGcStale`). [Changeset garbage collection](#changeset-garbage-collection)
   needs nothing scheduled yet.
+- [ ] **Repack schedule (filesystem blob stores).** An incremental
+  `leep-server repack` runs nightly and after load tests or large imports,
+  or whenever loose objects pass a count you chose, so loose files do not
+  use up the volume's inodes ([Packing blobs](#packing-blobs)). The blob
+  volume has inodes to spare: ext4 fixes the count when the filesystem is
+  made, so a dedicated blob volume gets a smaller inode ratio
+  (`mkfs.ext4 -i 4096`), or blobs live in packs or `s3://`. If
+  node_exporter runs, the `leep-host-inodes` alerts are loaded.
 - [ ] **Upgrade steps written down.** Back up, `migrate --status` and
   `--dry-run` with the new binary, read the CHANGELOG, then roll out as
   [Upgrading](#upgrading) and [DEPLOY.md](DEPLOY.md#upgrades) describe.
@@ -561,6 +569,34 @@ groups:
     annotations:
       summary: "A Leep data or backup filesystem has under 10% free; when it fills, writes fail."
       runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepdiskspacelow
+- name: leep-host-inodes
+  # OPTIONAL: needs node_exporter's filesystem collector on every host that
+  # holds Leep data; Leep exports no inode metric. Without node_exporter these
+  # rules never fire, so delete the group rather than trust it. Set the
+  # mountpoints to the filesystems holding a filesystem blob store and the
+  # SQLite file or Postgres data. A filesystem blob store uses one inode per
+  # loose object, so it can run out of inodes with most of its space free.
+  # Filesystems that allocate inodes on demand (btrfs) report 0 files and
+  # never match.
+  rules:
+  - alert: LeepInodesLow
+    expr: |
+      node_filesystem_files_free{mountpoint=~"/var/lib/leep.*|/var/lib/postgresql.*"}
+        / node_filesystem_files{mountpoint=~"/var/lib/leep.*|/var/lib/postgresql.*"} < 0.10
+    for: 15m
+    labels: {severity: ticket}
+    annotations:
+      summary: "A filesystem holding Leep blobs or its database has under 10% of its inodes free: usually a filesystem blob store's loose objects. Run leep-server repack."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepinodeslow
+  - alert: LeepInodesCritical
+    expr: |
+      node_filesystem_files_free{mountpoint=~"/var/lib/leep.*|/var/lib/postgresql.*"}
+        / node_filesystem_files{mountpoint=~"/var/lib/leep.*|/var/lib/postgresql.*"} < 0.03
+    for: 5m
+    labels: {severity: page}
+    annotations:
+      summary: "A filesystem holding Leep blobs or its database has under 3% of its inodes free: blob and database writes will soon fail with No space left on device."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepinodescritical
 ```
 
 ## Several servers on one ref
@@ -1815,6 +1851,10 @@ deletes the blobs that are still condemned. Collect acts only on condemnations
 at least `--fence` old, so the two phases can run as separate cron jobs or
 processes. A crashed run is safe: rerun it.
 
+GC deletes only unreferenced blobs, so it does not keep a filesystem store's
+file count down: live loose objects stay one file each until `leep-server
+repack` packs them. Schedule both ([Packing blobs](#packing-blobs)).
+
 The fence must exceed the servers' `--request-timeout` plus, on Postgres, their
 `--meta-statement-timeout` (default the request timeout plus 5 s) plus clock
 skew (ADR 0012): with the defaults, 5m + 5m 5s + skew, under 15m. `gc` checks
@@ -2020,6 +2060,39 @@ GC deletes and how much the pack bytes grow between full runs. Run both after
 ```
 The daily and weekly jobs may collide; the second one exits with "another
 repack is running" and the next day's run picks up.
+
+**Filesystem stores: schedule it, or run out of inodes.** A filesystem blob
+store spends one inode per loose object, whatever its size, and an
+unpacked store can exhaust the filesystem's inodes with most of its space
+free: writes then fail with `No space left on device`. One VPS reached
+3,474 free inodes of 9.96M with 42 GB free, from about 9.9M loose blobs
+that load tests (about 27,000 files a run) left in a store nobody
+repacked. So on every filesystem store:
+
+- Run the incremental `repack` on a schedule, nightly as above (hourly
+  for a busy fleet), and also after load tests and large imports, or
+  whenever the loose objects pass a count you choose, such as 100,000.
+  Leep exports no loose-object metric; count them in the job, stopping
+  early so a large store costs little:
+  ```sh
+  loose=$(find /var/lib/leep/blobs/[0-9a-f][0-9a-f] -type f ! -name '.*' | head -n 100001 | wc -l)
+  [ "$loose" -gt 100000 ] && leep-cron repack leep-server repack
+  ```
+  (`leep-cron` is the wrapper in [Cron wrappers](RUNBOOKS.md#cron-wrappers).)
+  The `loose_before` and `loose_after` of `repack --json` report the same
+  count for each run.
+- Alert on inodes: the optional `leep-host-inodes` group in
+  [Suggested alerts](#suggested-alerts) (node_exporter).
+- Size the volume for inodes, not only bytes. ext4 fixes its inode count
+  when the filesystem is made (by default one per 16 KiB of space) and it
+  cannot be raised later. Make a dedicated blob volume with a smaller inode
+  ratio (`mkfs.ext4 -i 4096`), use a filesystem that allocates inodes as
+  needed (XFS), keep the store packed, or put blobs in `s3://`, where
+  objects cost no inodes.
+
+A first repack of millions of loose objects takes hours, and the inodes come
+back only when it finishes (after the fence and cleanup):
+[LeepInodesLow](RUNBOOKS.md#leepinodeslow) has the measured times.
 
 GC and repack may overlap; a blob GC deletes during a repack stays deleted.
 GC deletes a packed blob by appending a line to `packs/tombstones`. A repack

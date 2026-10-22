@@ -21,6 +21,12 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   `Leep-Refused: body-budget`), and `LeepIndexingAnswersHigh` leaves shed
   searches out of its denominator.
 - OPERATIONS.md has a production readiness checklist.
+- New optional `leep-host-inodes` alerts, `LeepInodesLow` (ticket, under
+  10% of inodes free) and `LeepInodesCritical` (page, under 3%), from
+  node_exporter: a filesystem blob store uses one inode per loose object and
+  can run out of inodes with space to spare. OPERATIONS.md now recommends a
+  scheduled `leep-server repack` for filesystem stores and a blob volume
+  sized for inodes.
 - **Operators:** replace these rules, and rename `LeepLandSlowP99` in
   routes and silences.
 
