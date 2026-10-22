@@ -27,8 +27,8 @@ use crate::signatures::REBASED_ORIGIN_KIND;
 use crate::Repo;
 
 /// Derived kind recording reachability (see the module docs). Value: the
-/// single byte `0x01`; anything else reads as no row, which only makes a run
-/// walk more.
+/// single byte `0x01`. A row counts whatever value it reads with (see
+/// `is_row`).
 pub const CS_REACH: &str = "cs-reach-v1";
 
 /// The value of every [`CS_REACH`] row.
@@ -94,8 +94,12 @@ pub struct Reach {
     pub missing: u64,
 }
 
+/// Whether a row is there, whatever its value: only [`REACHED`] is ever
+/// written, so a wrong value is a damaged read of a row, and reading it as
+/// none would offer a reachable changeset to the sweep. `verify` reports
+/// the bad value.
 fn is_row(v: &Option<Bytes>) -> bool {
-    v.as_deref() == Some(REACHED)
+    v.is_some()
 }
 
 /// Every row of `kind`, paged.

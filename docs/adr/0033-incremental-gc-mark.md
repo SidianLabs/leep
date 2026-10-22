@@ -1,5 +1,5 @@
 # 0033. Incremental GC mark
-Status: Accepted
+Status: Accepted; a damaged mark row counts as a mark since 2026-10-22
 Date: 2026-10-17
 
 ## Context
@@ -54,8 +54,13 @@ of 1,000; a batch that fails stores a prefix of its rows (the trait's
 contract), and later batches start only after earlier ones succeed. So at any
 instant, crashed or not, every stored row's closure is stored.
 
-Any value other than `0x01` reads as no row. A missing or damaged row only
-makes a run walk more; it can never make a run skip a referenced object.
+A missing row only makes a run walk more. ~~Any value other than `0x01`
+reads as no row.~~ *Amended 2026-10-22:* a present row counts as a mark
+whatever value it reads with. Only marks are written, so a wrong value is a
+damaged read of a mark; reading it as no row made the object look
+unreferenced to condemn, and a second damaged read in collect deleted a
+referenced tree node (the fault sweep found it at seed 2897). `verify`
+still reports the bad value.
 
 ### The mark (`gc::Mark::Incremental`, the default)
 1. List changeset ids (one call per 1,000) and read their `gc-mark-v1` rows
