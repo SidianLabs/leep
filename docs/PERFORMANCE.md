@@ -1165,13 +1165,23 @@ up to 15,300 resends per run.
   93 to 107% of it, since searches straddle its edges), at 7.0 to 8.0 s per search at 500 agents and 4.1 to
   4.8 s at 2,000. One 60 s sample of A at 2,000 agents had 13 searches.
   Over those 60 s the server derived 1,552 `blob-trigrams-v1` and 993
-  `tree-trigrams-v1` rows (`leep_derive_total`), of which the warmer
-  derived 35 tree rows (`leep_index_derived_total`). *Inference:* under
-  `--indexing local` each search lands on a head a few seconds newer than
-  the indexed one, and derives the trigram rows of the files landed since.
-  On a ref that moves 10 to 20 times a second, that derivation, not the
-  probe that #135 made cheaper, is most of a search. The same sample put
-  `skiplist` derivation at 18.7 s per 60 s, about a third of a core.
+  `tree-trigrams-v1` rows (`leep_derive_total`, which counts rows from
+  every caller, the warmer included). *Correction:* this section first
+  read 35 of them as the warmer's tree rows, but `leep_index_derived_total`
+  counts the heads a search warm derived, not rows, so the sample cannot
+  split the rows between searches and the warmer;
+  `leep_index_rows_total` now counts the warmer's rows. *Inference,
+  confirmed below:* under `--indexing local` each search lands on a head
+  a few seconds newer than the indexed one, and derives the trigram rows
+  of the files landed since. On a ref that moves 10 to 20 times a second,
+  that derivation, not the probe that #135 made cheaper, is most of a
+  search; it was serial metadata round trips, not CPU. The same sample
+  put `skiplist` derivation at 18.7 s per 60 s. *Correction:* that is
+  not a third of a core of CPU, and not on the search path. `skiplist` is
+  computed on the write path, in `create_changeset`, and its duration is
+  wall time, mostly spent waiting for up to about log2(generation)
+  sequential skiplist reads on a cache miss: about 13 ms per create or
+  rebase over some 1,400 of them a minute.
 - **Admitted search latency is acceptable; most searches are refused.**
   Searches that ran answered in 3.5 to 6.0 s p50 and 11 to 19 s p99, against
   21 s p50 in the E1 round above, where most timed out. But A sheds 96 to
@@ -1200,6 +1210,49 @@ up to 15,300 resends per run.
   running, so each run takes about 7 minutes. E1 did the same, so lands/s
   are comparable. Runs that do not need bytes per land can leave out
   `--database-url`.
+
+#### Search rows derived in level batches (after E5)
+
+[research/search-inline-derive.md](research/search-inline-derive.md)
+traced E5's seconds per admitted search to the inline derivation of the
+trigram rows landed since the indexed head: one directory at a time, a
+read of each missing blob row twice, a put per row, so about 5.4
+sequential metadata round trips per landed change. Search derivation now
+finds the missing directories a level at a time and derives them by
+height in batches (one batched read of the files' rows, the missing ones
+computed side by side and written with one `put_derived_many`, then the
+filters), and one derivation per tree root runs at a time in a process.
+The warmer runs each index group in a loop of its own.
+
+Harness: an ignored, uncommitted test in `leep-server`, release build, on
+a 4-vCPU container. Memory stores, with a wrapper that adds 5 ms to every
+metadata call. A 20,000-file tree (20 × 10 × 100), 6 root files (one of
+15,000 lines) and 500 agent directories of 2 files: 21,006 blob rows and
+722 filters. Each land changes 2 files of one agent directory (sometimes
+a `hot/` file), chained. "Search" searches the new head with nothing
+derived since the indexed one; "derive" is `derive_search` alone on a
+fresh gap of the same size; "warm per land" derives after every land.
+
+| Gap (lands) | Search before: ms (round trips) | after level batches | after both fixes | Derive before → after, ms | Warm per land before → after, ms |
+|---|---|---|---|---|---|
+| 1 | 77 (13) | 71 (10) | 67 (10) | 77 → 67 | 106 → 68 |
+| 8 | 256 (55) | 71 (10) | 68 (10) | 260 → 69 | 80 → 67 |
+| 32 | 866 (195) | 71 (10) | 70 (10) | 855 → 68 | 78 → 68 |
+| 128 | 2,992 (697) | 75 (10) | 72 (10) | 2,883 → 72 | 80 → 68 |
+
+A search on an indexed head stays at 13 ms (2 round trips), and CPU per
+search at 0.007 to 0.12 s. A cold `derive_search` of the whole tree went
+from 33.8 s to 1.6 s. Searching a head 128 lands past the index now
+costs what searching one land past it does: the round trips follow the
+depth of the changed paths, not the number of lands. A test with a
+counting store, `a_gap_of_many_lands_costs_round_trips_per_level`, keeps
+that: on a smaller swarm-shaped tree `derive_search` made 13, 199 and 769
+round trips at gaps of 1, 32 and 128 before, and 10 at each after
+(searching: 17, 201, 769 before, 14 after).
+
+Not measured yet: the swarm itself. The next E5 run should record
+`stats.blob_rows_derived` and `stats.tree_rows_derived` per search and
+`leep_index_rows_total` beside `leep_derive_total`.
 
 ## Real history: git/git
 

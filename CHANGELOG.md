@@ -7,6 +7,22 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 ## [Unreleased]
 
+### Search derives missing rows in batches
+- A search on a head past the indexed one derives the missing trigram rows
+  a tree level at a time, with batched reads and writes, instead of one
+  directory at a time. With 5 ms per metadata call, a search 128 lands past
+  the index fell from 3.0 s (697 round trips) to 72 ms (10), and a cold
+  `derive-search` of a 20,000-file tree from 34 s to 1.6 s. Rows are
+  unchanged.
+- One derivation per tree root runs at a time in a server: a search that
+  arrives while the warmer derives the same root waits for it instead of
+  deriving it again, without holding a search pool permit.
+- The background warmer runs each index group in a loop of its own, so a
+  path-history catch-up no longer holds back search warming. The
+  `leep_warm_*` metrics are recorded per group loop.
+- New metric `leep_index_rows_total{kind}`: rows the warmer derived.
+  `leep_index_derived_total` still counts changesets (heads, for search).
+
 ### Leep is developed on Leep
 - Leep's own development runs through a live Leep server: agents land on
   Leep refs `review/<area>-<desc>`, the git mirror pushes them to GitHub

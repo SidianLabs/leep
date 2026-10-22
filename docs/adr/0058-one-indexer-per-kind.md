@@ -690,8 +690,20 @@ reason given:
   --drop-first`: a drop beside a deriving holder is the race the fence
   exists for, so "duplicate work, correct rows" holds only for the tools that
   derive. A drop also checks its leases right before deleting.
-- **Search warming** checks the lease before each directory's rows are
-  written, as the other groups check it before each staged write.
+- **Search warming** checks the lease before each write of a level batch
+  (a batch's blob rows, then its filters), as the other groups check it
+  before each staged write. It first checked before each directory's rows;
+  search rows are now derived a level of the tree at a time, and a
+  batch's filters are written only after its blob rows and the level
+  below, so a holder stopped between writes still leaves every stored
+  filter over a stored subtree.
+- **Three warm loops.** Each index group warms in a loop of its own, with
+  its own ref log tail, its own record of warmed heads and its own reset
+  when it takes a group over, so a group that falls behind (path history
+  after an import) no longer holds back the others' passes. Section 2's
+  "one range per group" holds per loop. `leep_index_derived_total` still
+  counts changesets (heads, for search); `leep_index_rows_total{kind}`
+  counts the rows the warmer derived.
 - **Fence.** A tool waits `--index-fence` only when the group had a lease row
   before (a store whose servers never ran in `lease` mode has no holder to
   wait for). `upgrade-index --yes` takes the leases of the groups it derives.
