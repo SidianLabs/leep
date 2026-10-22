@@ -1,6 +1,8 @@
 # Runbooks
 
-One runbook for every alert in [OPERATIONS.md](OPERATIONS.md#suggested-alerts).
+One runbook for every alert in
+[`deploy/prometheus/leep-alerts.yml`](../deploy/prometheus/leep-alerts.yml)
+(see [OPERATIONS.md](OPERATIONS.md#suggested-alerts)).
 Each alert's `runbook_url` annotation points at its section here; the anchor is
 the alert name in lower case (`#leeplandexhausted`). `scripts/check-runbooks.sh`
 fails CI when an alert has no section or a section has no alert, so the two
@@ -1427,7 +1429,8 @@ Replaces `LeepConfigGenerationSkew`, which compared `leep_config_generation`. Th
 counter is per process (1 at startup, +1 per reload even with no change), so the
 old alert fired after any single restart although every server ran the same
 config. If your rules still use the old name, replace the rule with
-`LeepConfigSkew` from [OPERATIONS.md](OPERATIONS.md#suggested-alerts).
+`LeepConfigSkew` from
+[`deploy/prometheus/leep-alerts.yml`](../deploy/prometheus/leep-alerts.yml).
 
 **Meaning.** For 15 minutes the servers have exported more than one
 `leep_config_info` fingerprint set to 1, so they are not all running the same

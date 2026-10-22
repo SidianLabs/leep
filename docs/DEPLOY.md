@@ -623,17 +623,14 @@ line from `authorized_keys`.
 ## Monitoring and runbooks
 
 Start the server with `--metrics-listen` (the compose stack does not set it) and
-load the rules from [OPERATIONS.md](OPERATIONS.md#suggested-alerts) into
-Prometheus. Every rule has a `runbook_url` pointing at its section of
-[RUNBOOKS.md](RUNBOOKS.md): what fired, the impact, how to diagnose, the likely
-causes and the safe fix. Set the base URL in the rules to wherever you publish
-that file. The rules live only in that document; to extract and check them:
-
-```sh
-awk '/^### Suggested alerts/{f=1} f&&/^```yaml/{p=1;next} p&&/^```/{exit} p' \
-  docs/OPERATIONS.md > leep-rules.yml
-promtool check rules leep-rules.yml
-```
+load the rules in
+[`deploy/prometheus/leep-alerts.yml`](../deploy/prometheus/leep-alerts.yml) into
+Prometheus (`rule_files`). Every rule has a `runbook_url` pointing at its
+section of [RUNBOOKS.md](RUNBOOKS.md): what fired, the impact, how to
+diagnose, the likely causes and the safe fix. Set the base URL in the rules to
+wherever you publish that file, then check them with
+`promtool check rules`; [OPERATIONS.md](OPERATIONS.md#suggested-alerts) says
+what each group needs and shows both steps.
 
 `GET /v1/health` only says the process is serving HTTP; it does not
 check the stores. `GET /v1/ready` does (see [Probes](#probes)). Alert on the

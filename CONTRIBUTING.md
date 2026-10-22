@@ -6,7 +6,8 @@
    ([docs/adr/](docs/adr/)) and must follow [docs/FORMATS.md](docs/FORMATS.md).
 3. Before opening a PR, run `cargo fmt --all`, `cargo clippy --workspace
    --all-targets -- -D warnings` and `cargo test --workspace`.
-   If you add or rename an alert in [docs/OPERATIONS.md](docs/OPERATIONS.md),
+   If you add or rename an alert in
+   [deploy/prometheus/leep-alerts.yml](deploy/prometheus/leep-alerts.yml),
    give it a `## <AlertName>` runbook in [docs/RUNBOOKS.md](docs/RUNBOOKS.md) and
    run `scripts/check-runbooks.sh`, which CI runs too. If you change
    dependencies, also run `cargo deny check` (see "Supply-chain checks").
