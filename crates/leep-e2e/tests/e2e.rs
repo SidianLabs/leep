@@ -129,8 +129,27 @@ fn run_agent(client: &Client, root: &Path, n: usize) -> Result<(), String> {
     let wc = root.join(format!("wc-{n:02}"));
     let wc_s = wc.to_str().unwrap();
     let session = n.to_string();
-    let step =
-        |args: &[&str]| -> Result<std::process::Output, String> { Ok(client.run(&wc, args)) };
+    // Every command and its output, for the report if this agent's edit is
+    // later missing from main.
+    let transcript = root.join(format!("transcript-{n:02}.txt"));
+    let step = |args: &[&str]| -> Result<std::process::Output, String> {
+        let out = client.run(&wc, args);
+        let shared = fs::read_to_string(wc.join("shared.txt")).unwrap_or_default();
+        let entry = format!(
+            "$ leep {}\n{}--- stdout\n{}--- stderr\n{}--- shared.txt after\n{shared}\n",
+            args.join(" "),
+            out.status,
+            stdout(&out),
+            stderr(&out),
+        );
+        fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&transcript)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, entry.as_bytes()))
+            .map_err(|e| e.to_string())?;
+        Ok(out)
+    };
     let fail = |what: &str, out: &std::process::Output| {
         format!(
             "agent {n}: {what} failed ({})\n--- stdout\n{}\n--- stderr\n{}",
@@ -258,7 +277,9 @@ fn run_import_swarm_export(stores: &Stores, work: &Path) {
     for n in CONFLICTING {
         assert!(
             shared.contains(&shared_line(n)),
-            "edit of agent {n} lost from shared.txt:\n{shared}"
+            "edit of agent {n} lost from shared.txt:\n{shared}\n--- agent {n} transcript\n{}\n--- log main\n{}",
+            fs::read_to_string(work.join(format!("transcript-{n:02}.txt"))).unwrap_or_default(),
+            stdout(&client.run(&verify, &["log", "main", "-n", "80"])),
         );
     }
     let original = shared_original();
