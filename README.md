@@ -35,9 +35,12 @@ Status: early development (v0.1).
 ## Build
 
 ```sh
-cargo build --release
+cargo build --release     # every crate, including test and benchmark tools
 cargo test
 ```
+
+To run a server without Docker, build only the shipped binaries and follow
+[DEPLOY.md, "Without Docker"](docs/DEPLOY.md#without-docker-binaries-postgres-filesystem-blobs).
 
 ## Docker
 
