@@ -58,6 +58,8 @@ measured until the response head is ready, not until the body is streamed.
 | `leep_land_cancelled_total` | counter | none | Lands whose caller went away (timeout, disconnect) while queued, dropped before their batch replayed them. |
 | `leep_land_batch_deadline_total` | counter | none | Lands answered 409 because their batch was still retrying 60 s after its first attempt (`MAX_BATCH_LIFETIME`, ADR 0059) and gave up instead of moving the ref. Clients resend; keyed lands are then answered from their record. Anything but rare means a store so slow, or a ref so contended, that lands do not finish. |
 | `leep_land_answered_from_record_total` | counter | `original` = `present`, `missing` | Keyed lands answered from their land id record instead of landing again (ADR 0057). `missing`: the changeset was no longer stored (garbage collected, ADR 0059) and the record answered without reading it. |
+| `leep_gc_changeset_doom_conflicts_total` | counter | none | Writers answered 409 because a changeset they named stayed *deleting* for 30 s: a changeset collect was killed between announcing a delete and settling it (ADR 0059). The next collect settles it. |
+| `leep_gc_fence_active` | gauge | none | 1 while a changeset condemnation round is open (`gc-fence-active-v1`), as this server last read it; writers then read fence rows for what they name. 0 when no sweep has condemned anything unresolved. |
 | `leep_gc_changesets_rescued_total` | counter | `by` = `create`, `land`, `ref`, `attest`, `mirror` | Condemned changesets a writer rescued because it was about to store something naming them (ADR 0059): a child, a land, a ref move, a signature or review, a git mirror map. 0 until a changeset sweep condemns; a steady rate means agents build on changesets the sweep found unreachable. |
 | `leep_land_leases_held` | gauge | none | Refs whose land lease this server holds ([Several servers on one ref](#several-servers-on-one-ref), ADR 0056). |
 | `leep_land_lease_acquired_total` | counter | none | Land leases this server took. Under steady traffic about one per hot ref per server restart; more means leases change hands. |
@@ -462,6 +464,43 @@ groups:
     annotations:
       summary: "leep-server gc has not succeeded in 3 days: unreferenced blobs are piling up."
       runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepgcstale
+  - alert: LeepUnreachableGcStale
+    # Only once the changeset sweep has run: it is off by default.
+    expr: time() - leep_gc_unreachable_last_success_timestamp_seconds > 3 * 86400
+    for: 1h
+    labels: {severity: ticket}
+    annotations:
+      summary: "The changeset sweep (gc --unreachable) has not succeeded in 3 days: unreachable changesets pile up and the fence flag may stay up."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepunreachablegcstale
+  - alert: LeepChangesetRescueBurst
+    expr: sum(rate(leep_gc_changesets_rescued_total[15m])) > 1
+    for: 15m
+    labels: {severity: ticket}
+    annotations:
+      summary: "Writers keep rescuing changesets the sweep condemned: agents build on work older than --changeset-grace."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepchangesetrescueburst
+  - alert: LeepChangesetDoomStuck
+    expr: |
+      sum(increase(leep_gc_changeset_doom_conflicts_total[10m])) > 0
+      or
+      sum(leep_gc_changeset_doom_conflicts_total unless leep_gc_changeset_doom_conflicts_total offset 10m) > 0
+    labels: {severity: ticket}
+    annotations:
+      summary: "Writers get 409 on a changeset delete that was announced and never finished: a changeset collect was killed mid-batch."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepchangesetdoomstuck
+  - alert: LeepGcFenceFlagStuck
+    expr: max(leep_gc_fence_active) == 1
+    for: 24h
+    labels: {severity: ticket}
+    annotations:
+      summary: "The changeset fence flag has been up for a day: collect is not running or cannot finish, and writers pay fence reads."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepgcfenceflagstuck
+  - alert: LeepChangesetCollectSlow
+    expr: max(leep_gc_changeset_collect_batch_seconds_max) > 5
+    labels: {severity: ticket}
+    annotations:
+      summary: "A changeset collect batch took over 5 s from announcing its deletes to settling them; writers naming those changesets wait meanwhile."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepchangesetcollectslow
 - name: leep-host
   # node_exporter metrics, not Leep's. Set the mountpoints to the filesystems
   # that hold the blob directory, the SQLite file or Postgres data, and the backups.
@@ -1785,10 +1824,10 @@ server before the first `condemn`.
 
 ### Sizing what unreachable changesets cost
 
-Changesets are never deleted, so originals of rebased lands, abandoned work
-and `leep sync` snapshots stay forever. ADR 0059 (proposed) would collect
-them; see [Changeset garbage collection](#changeset-garbage-collection). To
-measure what it would reclaim on a store, run the read-only count:
+Until the changeset sweep runs, originals of rebased lands, abandoned work
+and `leep sync` snapshots stay forever. ADR 0059 collects them; see
+[Changeset garbage collection](#changeset-garbage-collection). To measure
+what it would reclaim on a store, run the read-only count:
 
 ```sh
 nice -n 19 leep-server --meta-pool-size 4 --meta "$LEEP_META" --blobs "$LEEP_BLOBS" \
@@ -1827,42 +1866,109 @@ about 60 bytes per changeset, plus one hash per live object with
 
 ## Changeset garbage collection
 
-ADR 0059 will delete changesets that nothing reaches (refs, every ref log
-entry, the landed-copy scan window of every head, attestations, git mirror
-maps, and a grace period) with the condemn, fence and collect protocol
-blob GC uses. **Phase 1 is built: nothing condemns or deletes yet.** It is
-what every server must run before a sweep may run beside it. Deleting
-(`MetaStore::delete_changesets`) and the sweep itself come with phase 2.
-Phase 1 is:
+ADR 0059 deletes changesets that nothing reaches: refs, every ref log entry,
+the landed-copy scan window of every head, attestations, git mirror maps,
+and anything stored less than `--changeset-grace` ago, with its ancestry.
+It uses the condemn, fence and collect protocol blob GC uses. **It is off
+by default.** Turn it on only after the gate of ADR 0059 section 11 has
+passed, on staging first.
+
+**Before the first condemnation,** upgrade every server, importer and tool
+that writes to the store to a release that lists `changeset-rescue` in
+`GET /v1/ready`. An older one neither rescues nor re-checks, as servers
+from before ADR 0012 did for blobs. `gc --unreachable` asks every live
+lease holder and refuses if one answers without it. It cannot ask a server
+that holds no lease, so this step is the guarantee.
+
+**Run it** with the servers' environment (their `--request-timeout` and
+`--meta-statement-timeout`), from cron through the
+[wrapper](RUNBOOKS.md#cron-wrappers):
+
+```sh
+leep-server gc --unreachable --dry-run --grace 0      # what it would delete, read-only
+leep-server gc --unreachable --condemn-only           # cron, e.g. 02:13
+leep-server gc --unreachable --collect-only \
+  --metrics-file /var/lib/node_exporter/leep_gc_unreachable.prom   # cron, at least --fence later
+```
+
+```cron
+13 2 * * *  flock -n /run/leep-gc.lock  leep-cron gc_unreachable leep-server gc --unreachable --condemn-only
+43 2 * * *  flock -n /run/leep-gc.lock  leep-cron gc_unreachable leep-server gc --unreachable --collect-only --metrics-file /var/lib/node_exporter/leep_gc_unreachable.prom
+```
+
+Defaults: `--changeset-grace 7d`, `--fence 15m`, `--batch 500`,
+`--rate 500` (changesets deleted a second), `--max-delete 100000` (the rest
+waits for the next run), `--index-fence 60s` and
+`--tombstone-retention 7d`. Without `--condemn-only` or `--collect-only` it
+condemns, waits `--fence` and collects.
+
+- **One GC at a time.** Blob GC and both sweep phases hold the store-wide
+  `gc` lease. A second one refuses with "another garbage collection is
+  running (job, holder, seconds left)". A killed run's lease lapses after
+  60 s, so the next run may be refused once.
+- **The fence is checked.** `gc` refuses a `--fence` that does not exceed
+  the longest a writer can act on what it read: request timeout plus
+  statement timeout plus the flag's 10 s, a land batch's 60 s plus one
+  statement, and the index fence, plus a minute of skew. Blob GC checks
+  the first term. `--unsafe-fence` overrides it, and is only safe while no
+  server runs with those bounds. `--fence 0` still needs
+  `--unsafe-no-fence`.
+- **What it deletes:**
+  - the changesets, with their `root_tree`, `generation`, `skiplist`,
+    `last_merge-v1`, `gc-mark-v1`, `rebased-origin-v1`, `history-tree-v4`
+    and `log-filter-v1` rows, one transaction per batch, children first;
+  - later, rows written for them after the delete.
+
+  Never deleted: ref log entries, signatures, reviews, mirror maps, and
+  content-keyed index rows. `blame` rows of deleted changesets leak; each
+  collect prints an estimate, and `repair drop --kind blame` clears them.
+- **Tree nodes and contents** of deleted changesets are freed only by
+  `leep-server gc --full`. It now needs `--backups DIR` (it derives the
+  fence from your sealed backups: three times the longest of the last 30
+  days, at least an hour) or `--backup-fence`, and keeps the trees of
+  changesets deleted within it, for a backup still copying them. Keep
+  `--backup-fence` within `--tombstone-retention`.
+- **Reading a deleted changeset** answers 404. A rebased copy still names
+  its deleted original as `via`, and a keyed land retry is answered from
+  its record. A client that still has a deleted changeset's body can store
+  it again.
+- **The numbers.** `--metrics-file` writes the run's numbers as a
+  Prometheus textfile (`leep_gc_changesets_deleted`,
+  `leep_gc_changesets_condemned_pending`,
+  `leep_gc_changeset_collect_batch_seconds_max` and others; ADR 0059
+  section 11). Servers export `leep_gc_changesets_rescued_total`,
+  `leep_gc_changeset_doom_conflicts_total` and `leep_gc_fence_active`.
+- **Alerts:**
+  - [LeepUnreachableGcStale](RUNBOOKS.md#leepunreachablegcstale);
+  - [LeepChangesetRescueBurst](RUNBOOKS.md#leepchangesetrescueburst);
+  - [LeepChangesetDoomStuck](RUNBOOKS.md#leepchangesetdoomstuck);
+  - [LeepGcFenceFlagStuck](RUNBOOKS.md#leepgcfenceflagstuck);
+  - [LeepChangesetCollectSlow](RUNBOOKS.md#leepchangesetcollectslow).
+- **Postgres space.** Deleted rows are reused by later inserts after
+  vacuum. The database stops growing by that amount but does not shrink
+  without `VACUUM FULL` or `pg_repack`.
+
+What every server already does (phase 1):
 
 - **Store times.** Migration 0007 adds `changesets.stored_at`, written on
-  every new changeset; sweeps and the dry run age changesets by it. It is
-  a catalog-only `ADD COLUMN` on both backends and tolerates servers of
-  the previous version, which leave it NULL (read as the migration's
-  time).
+  every new changeset; sweeps and the dry run age changesets by it.
 - **Rescues.** Before a server stores anything that names an existing
   changeset (a child, a land, a rebase or merge, a ref move including
   `leep undo`, a signature or review), and `leep-git export` before it
-  writes a mirror map, it checks whether a sweep condemned that changeset,
-  and if so rescues it and its condemned ancestors
-  (`leep_gc_changesets_rescued_total`). The check reads one row
-  (`gc-fence-active-v1`) at most every 10 s per server while no sweep runs.
+  writes a mirror map, it checks whether a sweep condemned that changeset.
+  If so, it rescues it and its condemned ancestors, ancestors first. The
+  check reads one row (`gc-fence-active-v1`) at most every 10 s per
+  server while no sweep runs.
 - **Land batches** read that row on every attempt, and give up with a
-  retryable 409 after 60 s (`leep_land_batch_deadline_total`), which bounds
-  how long after its check a batch can still move a ref.
+  retryable 409 after 60 s
+  ([LeepLandBatchDeadline](RUNBOOKS.md#leeplandbatchdeadline)).
 - **Land ids outlive originals.** A keyed land retry whose changeset is no
-  longer stored is answered from its land id record
-  (`leep_land_answered_from_record_total{original="missing"}`).
-- **Metrics and alert:** `leep_gc_changesets_rescued_total`,
-  `leep_land_batch_deadline_total` and
-  `leep_land_answered_from_record_total` (see [Metrics](#metrics)), and
-  [LeepLandBatchDeadline](RUNBOOKS.md#leeplandbatchdeadline).
-- `GET /v1/ready` lists `changeset-rescue`.
+  longer stored is answered from its land id record.
 
-**Before the first condemnation** (phase 2), upgrade every server, importer
-and tool that writes to the store to a release that lists
-`changeset-rescue`: an older one neither rescues nor re-checks, exactly as
-servers from before ADR 0012 did for blobs.
+**The gate.** `scripts/unreachable-gc-gate.sh` measures what the sweep
+would reclaim against the store's growth, and whether `gc --full` fits
+under the backup fence. Run it on a release build, on Postgres, on a host
+with at least 4 cores, and never beside production servers.
 
 ## Packing blobs
 

@@ -7,6 +7,41 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 ## [Unreleased]
 
+### Unreachable changesets can be garbage collected (ADR 0059 phase 2, off by default)
+- `leep-server gc --unreachable` deletes changesets that no root
+  reaches: refs, every ref log entry, the landed-copy scan window of
+  every head, attestations, mirror maps, and `--changeset-grace` (7d).
+  It condemns, waits `--fence`, and collects; `--condemn-only` and
+  `--collect-only` run the phases as cron jobs. It deletes children
+  first, a transaction per `--batch` (500), at most `--rate` (500/s)
+  and `--max-delete` (100,000) a run, and keeps every condemned ancestor
+  of what it does not delete. `--metrics-file` writes the run's numbers
+  as a Prometheus textfile. **Upgrade every server first**: it refuses
+  while a lease holder's `/v1/ready` lacks `changeset-rescue`.
+- A deleted changeset reads as not found. Rebased copies still name it
+  as `via`, and keyed land retries are answered from their record.
+- **Operators:** `gc` (blob GC too) now **refuses** a `--fence` the
+  servers' `--request-timeout` and `--meta-statement-timeout` do not
+  cover, instead of warning. Pass the servers' values, or
+  `--unsafe-fence` where no server runs with them.
+- **Operators:** blob GC and the sweep hold a store-wide `gc` lease. A
+  second `gc` refuses while one runs, and a killed run blocks the next
+  for up to 60 s.
+- **Operators:** `gc --full` needs `--backups DIR` or `--backup-fence`.
+  It keeps the trees of changesets deleted within that window.
+- `verify` reports `stored_parent_missing`: a stored changeset whose
+  parent is not stored.
+- Fixed: blob GC read a `gc-mark-v1` row with a damaged value as no row.
+  A damaged read in condemn and another in collect could then delete a
+  referenced tree node. Any present row now counts.
+- Fixed: a rescue that failed part way could leave a changeset rescued
+  and its parent condemned. Rescues are written ancestors first.
+- New metrics `leep_gc_changeset_doom_conflicts_total` and
+  `leep_gc_fence_active`. New alerts `LeepUnreachableGcStale`,
+  `LeepChangesetRescueBurst`, `LeepChangesetDoomStuck`,
+  `LeepGcFenceFlagStuck` and `LeepChangesetCollectSlow`.
+- `scripts/unreachable-gc-gate.sh` measures the ADR 0059 gate.
+
 ### The unreachable-changeset dry run counts trees exactly for both policies
 - `gc --unreachable --dry-run --exact-trees` now makes the tree node and
   content counts exact for the policy ADR 0059 builds (ref log kept), not

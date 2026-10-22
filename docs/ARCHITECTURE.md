@@ -205,7 +205,8 @@ way.
 | `history-tree-v4` | the changeset's history pack (ADR 0045): the nodes of a tree parallel to `root_tree` recording for each path (including deleted ones) the newest changesets that changed it, as written by this changeset's derivation, and the address of its root. A pack is cut into parts of about 16 KB; this value is part 0 and `history-node-v4` rows hold the rest. Nodes are addressed by (writer, part, index) and name changesets through a table per part, so the hundreds of nodes a merge rewrites name its few dozen ids once; nodes of more than 64 entries are stored as content-defined chunks so an edit rewrites one chunk (ADR 0027), and a changed node, chunk or chunk list is stored as a patch on an earlier whole version that names the entries it replaces by position (ADR 0037). Built from the first parent's tree plus the spines of changed paths, and at merges the paths where the second parent's history differs from the merge base's (another parent's from the first's, for octopus or unrelated merges) (ADR 0013) | path log, `last-change` |
 | `log-filter-v1` | per changeset at first-parent depth `d`: for each level `j ≤ tz(d)`, the 64-bit fingerprints of the authors, `extra` keys and `agent.model`/`agent.session` values of everything reachable from it but not from its first-parent ancestor `2^j` up (side branches included); lower-cased author names by fingerprint in `log-filter-name-v1` (ADR 0047) | `log` with `author`/`extra` filters and no path |
 | `blame` | per (changeset, path), keyed `Hash::of_object("blame", id‖path)` | blame |
-| `cs-condemned-v1` / `cs-rescue-v1` / `cs-doom-v1` / `gc-fence-active-v1` | per changeset id (the flag: one row), the encodings of their `blob-*-v1` counterparts; the fence of changeset GC (ADR 0059): rescues by every writer that names a condemned changeset; condemnation, doom and the flag by the sweep (phase 2, not built yet) | changeset garbage collection, and the rescue checks of creates, lands, ref moves, rebases, merges, attestations and mirror maps |
+| `cs-condemned-v1` / `cs-rescue-v1` / `cs-doom-v1` / `gc-fence-active-v1` | per changeset id (the flag: one row), the encodings of their `blob-*-v1` counterparts; the fence of changeset GC (ADR 0059): rescues by every writer that names a condemned changeset; condemnation, doom and the flag by the sweep (ADR 0059 phase 2) | changeset garbage collection, and the rescue checks of creates, lands, ref moves, rebases, merges, attestations and mirror maps |
+| `cs-tombstone-v1` | per deleted changeset id: deletion time and root tree hash, written before the delete; dropped after `--tombstone-retention` (ADR 0059 section 11) | `gc --full --backup-fence`, and the sweep's tombstone pass |
 | `cs-reach-v1` | per changeset id, one byte: "a ref or ref log entry reaches it, and every parent has a row"; written parents first, plus a progress row at the zero key (ADR 0059 section 4) | the changeset sweep's incremental reachability mark |
 | `gc-mark-v1` | per changeset id, tree node hash or blob hash, one byte: "referenced by a stored changeset, and everything below has a row"; written by GC marks in post-order (ADR 0033) | incremental GC marks, which skip covered changesets and stop at marked tree nodes |
 | `blob-trigrams-v1` | per blob hash: sorted trigram set of a UTF-8 text blob up to 1 MiB (delta varints), or a "not indexed" marker (ADR 0014) | code search |
@@ -757,8 +758,8 @@ forward-only protected refs and signature or review policies still apply and a
 concurrent move is a 409. Undoing a land on a protected ref is therefore
 refused; the CLI points at `leep revert`. It never touches the working copy. Undoing a delete recreates the ref, undoing a
 create deletes it, and the redo of an undo is another undo. The log is
-unbounded; entries name changesets, which are never deleted, so GC is
-unaffected.
+unbounded; every entry's targets are roots of the changeset sweep (ADR
+0059), so what the log names is never deleted.
 
 **Checkout** (`leep checkout`): the client resolves a rev to an id and lists
 files under the requested prefixes (`GET /v1/files`, in pages of 10,000). It then fetches the
@@ -968,14 +969,22 @@ misses and occupancy as Prometheus metrics (see [OPERATIONS.md](OPERATIONS.md)).
   ADR 0012. The mark is incremental (ADR 0033): each run records what it
   walked in `gc-mark-v1` rows, written so a row always vouches for
   everything below it, and the next run walks only changesets with no row
-  and stops at marked tree nodes. Changesets are never deleted, so liveness
-  only grows and ref moves never force a full walk; `gc --full` walks
-  everything anyway.
-  [ADR 0059](adr/0059-unreachable-changeset-gc.md) (proposed; phase 1
-  built) will delete changesets no root reaches (refs, every ref log entry,
-  landed-copy scan windows, attestations, mirror maps, a grace period) by
-  the same condemn, fence and collect protocol. Phase 1 is everything a
-  server must do before a sweep may run beside it, and deletes nothing:
+  and stops at marked tree nodes. Ref moves never force a full walk, and a
+  marked object stays marked even after the changeset sweep deletes the
+  changesets that used it, which only keeps it; `gc --full` walks
+  everything anyway, and keeps the trees of changesets deleted within its
+  required `--backup-fence`. Blob GC and the changeset sweep hold the
+  store-wide `gc` lease (ADR 0056 scope `gc`), so no two run at once, and
+  refuse a fence the servers' timeouts do not cover.
+  [ADR 0059](adr/0059-unreachable-changeset-gc.md) deletes changesets no
+  root reaches (refs, every ref log entry, landed-copy scan windows,
+  attestations, mirror maps, a grace period) by the same condemn, fence and
+  collect protocol (`gc --unreachable`, off by default, behind the gate of
+  its section 11). **Changesets are deleted only by that sweep**, children
+  first, a batch per transaction, keeping every condemned ancestor of
+  anything it does not delete, so the stored set stays closed under
+  ancestry at every instant; `verify` checks it (`stored_parent_missing`).
+  Phase 1 is everything a server must do before a sweep may run beside it:
   `changesets.stored_at` (migration 0007) ages changesets by the store's
   clock; every writer that is about to make durable something naming an
   existing changeset (a child, a land, a rebase or merge, a ref move, a
@@ -988,7 +997,7 @@ misses and occupancy as Prometheus metrics (see [OPERATIONS.md](OPERATIONS.md)).
   which bounds how late it can move a ref after its fence read. A keyed
   land retry whose original is not stored is answered from its land id
   record. `changeset_reach::mark` keeps `cs-reach-v1` rows, the incremental
-  reachability the sweep will use. `/v1/ready` lists `changeset-rescue`.
+  reachability the sweep uses. `/v1/ready` lists `changeset-rescue`.
   `gc --unreachable --dry-run` measures what the sweep would reclaim.
 
 ## 9. Failure model

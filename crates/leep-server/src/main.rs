@@ -973,6 +973,10 @@ async fn run_unreachable_report(
         per(r.land_write.bytes())
     );
     println!(
+        "  of which their ref log entries: {}",
+        per(r.land_write.log_bytes)
+    );
+    println!(
         "  index rows (all non-write-path derived rows in the store / lands; \
          includes any imported history's): {}",
         index_bytes.map_or("-".to_string(), per)

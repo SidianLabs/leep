@@ -1104,6 +1104,16 @@ exact. Logical bytes per land:
   rebased.** It shows the method and the order of magnitude, not a
   production figure. ADR 0059 section 11 says how the 20% rule is judged.
 
+**The gate (pending).** `scripts/unreachable-gc-gate.sh` runs the
+measurement ADR 0059 section 11 decided:
+
+- a release build on Postgres, on a host with at least 4 cores;
+- once on the swarm store, after at least 10,240 lands per ref, and once
+  on a store restored from a sealed backup of the Linux store.
+
+It prints the metadata and combined ratios and whether `gc --full` can be
+scheduled under the backup fence. Its results go here.
+
 #### Search admission and cheaper search (E5)
 
 The swarm rerun of [ADR 0060](adr/0060-land-admission-and-read-limits.md),
