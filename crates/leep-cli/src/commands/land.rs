@@ -336,6 +336,20 @@ fn rebase_locally(
             }
         }
     }
+    // `materialize` recorded these files' stats moments before they were
+    // overwritten. Where timestamps are coarse the second write can keep the
+    // same mtime and size, and status would trust the hash of `onto`'s
+    // version, so the next commit would silently drop the user's change.
+    // An impossible mtime makes status rehash them.
+    for path in clean
+        .keys()
+        .map(|p| p.as_str())
+        .chain(conflicts.iter().map(|c| c.path.as_str()))
+    {
+        if let Some(f) = ctx.wc.state.files.get_mut(path) {
+            f.mtime_ns = 0;
+        }
+    }
     ctx.wc.save_state()?;
     Ok(unmerged)
 }
