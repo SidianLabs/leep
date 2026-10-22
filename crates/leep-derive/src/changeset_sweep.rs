@@ -281,10 +281,10 @@ async fn condemn_leased(
         .meta()
         .get_derived(GC_FENCE_ACTIVE, &fence_flag_key())
         .await?;
-    let up = flag
+    let flag = flag
         .as_deref()
-        .is_some_and(|v| decode_time(GC_FENCE_ACTIVE, v).map_or(true, |t| t != 0));
-    if !up {
+        .map(|v| decode_time(GC_FENCE_ACTIVE, v).unwrap_or(i64::MAX));
+    if flag.is_none_or(|t| t == 0) {
         repo.meta()
             .put_derived(GC_FENCE_ACTIVE, &fence_flag_key(), time_value(started))
             .await?;
@@ -311,14 +311,25 @@ async fn condemn_leased(
                 report.already_condemned += 1;
                 continue;
             }
+            // When the row is written, not when the run started: the fence
+            // must run from the moment a writer could first see it. A long
+            // mark would otherwise backdate it by the mark's duration.
             // Strictly after any earlier condemnation, so any older rescue
             // is stale, even if the clock stepped back.
-            let at = f.condemned.map_or(0, |c| c + 1).max(started);
+            let at = f.condemned.map_or(0, |c| c + 1).max(clock.now());
             rows.push(DerivedRow::new(CS_CONDEMNED, id.0, time_value(at)));
         }
         repo.meta().put_derived_many(&rows).await?;
         report.condemned += rows.len() as u64;
     }
+    // The flag records when the latest condemnation was written: collect
+    // refuses to start until a fence after it.
+    let end = clock
+        .now()
+        .max(flag.filter(|t| *t != i64::MAX).unwrap_or(0));
+    repo.meta()
+        .put_derived(GC_FENCE_ACTIVE, &fence_flag_key(), time_value(end.max(1)))
+        .await?;
     metrics::counter!("leep_gc_changesets_condemned_total").increment(report.condemned);
     Ok(report)
 }
@@ -346,6 +357,23 @@ async fn collect_leased(
     let mut report = SweepCollectReport::default();
     let started = clock.now();
     let eligible_before = started.saturating_sub(secs(opts.fence));
+    // A collect that starts within a fence of the last condemn's end could
+    // only find young rows, and runs its mark against a round still open.
+    if let Some(v) = repo
+        .meta()
+        .get_derived(GC_FENCE_ACTIVE, &fence_flag_key())
+        .await?
+    {
+        let end = decode_time(GC_FENCE_ACTIVE, &v).unwrap_or(0);
+        if end != 0 && started < end.saturating_add(secs(opts.fence)) {
+            return Err(Error::Conflict(format!(
+                "the last condemn finished at {end}; collect may start a --fence ({}s) \
+                 after it, at {} (ADR 0059 section 3)",
+                opts.fence.as_secs(),
+                end.saturating_add(secs(opts.fence))
+            )));
+        }
+    }
     let reach = changeset_reach::mark(
         repo,
         &ReachOptions {

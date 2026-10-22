@@ -38,8 +38,10 @@ pub const CS_RESCUE: &str = "cs-rescue-v1";
 /// state byte: 0 deleting, 1 abandoned, 2 deleted), as `blob-doom-v1`.
 pub const CS_DOOM: &str = "cs-doom-v1";
 
-/// One row, under [`fence_flag_key`]: the time the current condemnation
-/// round began (unix seconds, big-endian), or 0 when nothing is condemned.
+/// One row, under [`fence_flag_key`]: unix seconds, big-endian. Nonzero
+/// while a condemnation round is open: when the first condemn of the round
+/// began, and from its end on when the latest condemn finished (collect
+/// waits a fence after that). 0 when nothing is condemned.
 pub const GC_FENCE_ACTIVE: &str = "gc-fence-active-v1";
 
 /// How long a request may act on a cached [`GC_FENCE_ACTIVE`]. The sweep's

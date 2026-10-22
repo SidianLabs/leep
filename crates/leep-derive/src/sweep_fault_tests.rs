@@ -339,6 +339,15 @@ async fn collect_keeps_ancestors_of_every_changeset_it_skips() {
     // The tip condemned again later than its ancestors: still too young
     // when they are due, so it keeps them.
     condemn_for_test(&w.clean, &[c], t + 600).await;
+    // As a condemn that ended at `t` would have left the flag.
+    w.meta
+        .put_derived(
+            GC_FENCE_ACTIVE,
+            &crate::changeset_gc::fence_flag_key(),
+            Bytes::copy_from_slice(&t.to_be_bytes()),
+        )
+        .await
+        .unwrap();
     let r = changeset_sweep::collect(&w.clean, &o, &TestClock::at(t + 1000))
         .await
         .unwrap();
@@ -733,4 +742,84 @@ async fn gc_full_keeps_trees_of_changesets_deleted_within_the_backup_fence() {
         "freed past the fence"
     );
     assert_ref_sound(7, &w.clean, "main").await;
+}
+
+/// A clock for a slow condemn: the first reading is when the run started,
+/// every later one is `then` (the mark took `then - start`).
+struct SlowMarkClock {
+    first: std::sync::Mutex<Option<i64>>,
+    then: i64,
+}
+
+#[async_trait::async_trait]
+impl crate::gc::Clock for SlowMarkClock {
+    fn now(&self) -> i64 {
+        self.first.lock().unwrap().take().unwrap_or(self.then)
+    }
+
+    async fn sleep(&self, _: Duration) {}
+}
+
+/// Review blocking item 1: condemn stamped its rows with the time the run
+/// *started*, before its long mark. With condemn at 02:13, a 25-minute
+/// mark, and collect at 02:43 (fence 15m), a request at 02:37 found no
+/// condemnation of X, condemn wrote X's row at 02:38 stamped 02:13, and
+/// collect deleted X under the request's ref move. The condemnation must
+/// carry the time it was written, so the fence runs from then.
+#[tokio::test(start_paused = true)]
+async fn condemnation_is_stamped_when_written_not_when_condemn_started() {
+    let w = World::new(8);
+    let base = commit_file(8, &w.clean, None, "base.txt", "b\n", "base").await;
+    w.meta.cas_ref("main", None, Some(base)).await.unwrap();
+    let x = commit_file(8, &w.clean, Some(base), "x", "x\n", "x").await;
+    let o = opts();
+    let t = later();
+    // 02:13 start, the rows written at 02:38.
+    let clock = SlowMarkClock {
+        first: std::sync::Mutex::new(Some(t)),
+        then: t + 25 * 60,
+    };
+    changeset_sweep::condemn(&w.clean, &o, &clock)
+        .await
+        .unwrap();
+    // 02:37: a request read X's fence state and saw nothing; at 02:43
+    // collect runs; at 02:47 the request moves a ref to X.
+    let collected = changeset_sweep::collect(&w.clean, &o, &TestClock::at(t + 30 * 60)).await;
+    let ctx = leep_core::RefUpdateContext::new("cas");
+    w.meta
+        .cas_ref_logged("keep", None, Some(x), &ctx)
+        .await
+        .unwrap();
+    assert!(
+        stored(&w, x).await,
+        "X deleted within a fence of its condemnation row being written: {collected:?}"
+    );
+    assert_roots_kept(8, &w).await;
+}
+
+/// Collect refuses to start within a fence of the end of the last condemn,
+/// recorded in the flag row, whatever times the rows carry.
+#[tokio::test(start_paused = true)]
+async fn collect_refuses_within_a_fence_of_the_last_condemn() {
+    let w = World::new(9);
+    let base = commit_file(9, &w.clean, None, "base.txt", "b\n", "base").await;
+    w.meta.cas_ref("main", None, Some(base)).await.unwrap();
+    let x = commit_file(9, &w.clean, Some(base), "x", "x\n", "x").await;
+    let o = opts();
+    let t = later();
+    changeset_sweep::condemn(&w.clean, &o, &TestClock::at(t))
+        .await
+        .unwrap();
+    let e = changeset_sweep::collect(&w.clean, &o, &TestClock::at(t + 899))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(e, Error::Conflict(_)) && e.to_string().contains("--fence"),
+        "{e}"
+    );
+    assert!(stored(&w, x).await);
+    let r = changeset_sweep::collect(&w.clean, &o, &TestClock::at(t + 900))
+        .await
+        .unwrap();
+    assert_eq!(r.deleted, 1, "{r:?}");
 }

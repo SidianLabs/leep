@@ -177,9 +177,14 @@ or endpoint changes.
 
 1. **Condemn.** Record `started_at` and set `gc-fence-active-v1`. Mark
    reachability (section 4). For every stored changeset that is unmarked and
-   older than `started_at - grace`, write `cs-condemned-v1 =
-   max(started_at, previous + 1)`, unless it is already condemned. Nothing
-   is deleted. `--dry-run` writes nothing at all (section 8).
+   older than `started_at - grace`, write `cs-condemned-v1 = max(now,
+   previous + 1)`, where `now` is read when the row is written, unless it
+   is already condemned. *Amended in review (section 11):* the first
+   version stamped `started_at`, so a long mark backdated every row and
+   collect's fence ran from before writers could see it. At its end,
+   condemn writes its end time into `gc-fence-active-v1`, and collect
+   refuses to start until a fence after that. Nothing is deleted.
+   `--dry-run` writes nothing at all (section 8).
 2. **Fence.** Wait `--fence`. The bound is in "Safety argument" below.
 3. **Collect.** Record `m`. Mark reachability again from fresh roots. Then
    take each condemnation at most `m - fence` old, **in descending
@@ -663,6 +668,13 @@ stops before its next write. A killed run's lease lapses after 60 s, so
 the next cron run may be refused once.
 
 **Fence.**
+- **Measured from the row write.** A condemnation is stamped when it is
+  written, not when condemn started. Found in review: with condemn at
+  02:13, a 25-minute mark and collect at 02:43, a request at 02:37 saw no
+  row, the row was written at 02:38 stamped 02:13, and collect deleted
+  under the request's ref move. Condemn also leaves its end time in the
+  flag, and `--collect-only` refuses until a fence after it. Test:
+  `condemnation_is_stamped_when_written_not_when_condemn_started`.
 - **Invariant and default.** The invariant is `fence > max(request
   timeout + statement timeout + flag TTL, MAX_BATCH_LIFETIME + statement
   timeout, index fence) + skew`. The default is 15 minutes, as for blobs
