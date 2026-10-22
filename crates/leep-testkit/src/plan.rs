@@ -35,6 +35,10 @@ pub enum Op {
     /// Every lease call (ADR 0056). Not in [`Op::META`], so plans
     /// written before leases existed inject what they always did.
     Lease,
+    /// [`leep_core::MetaStore::delete_changesets`] and
+    /// [`leep_core::MetaStore::delete_derived_keys`] (ADR 0059). Not in
+    /// [`Op::META`] or [`Op::WRITES`], for the same reason as `Lease`.
+    DeleteChangesets,
 }
 
 impl Op {
@@ -50,6 +54,7 @@ impl Op {
                 | Op::PutDerived
                 | Op::DeleteDerivedKind
                 | Op::Lease
+                | Op::DeleteChangesets
         )
     }
 
