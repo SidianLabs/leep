@@ -656,15 +656,24 @@ of `a`, or a false conflict when the ref changed `a`'s files since. On conflict 
 `clean` (every blob it names is stored before the answer, even when the batch
 moves nothing; `/v1/ready` lists `land-clean-blobs`), resolves `conflicts` on top of `onto`, commits once and lands again,
 which is then a fast-forward. Stacks containing merges are rejected.
-Proposed, not built
-([ADR 0060](adr/0060-land-admission-and-read-limits.md)): the server that
-batches a ref's lands may bound its queue in batches
-(`--land-queue-batches`, off by default) and refuse a land with 503
-`unavailable`, `Retry-After` and `Leep-Refused: admission` before it reads
-the changeset (a keyed land whose id is already recorded gets its recorded
-answer instead), counting forwarded lands against the leader's bound; the
-header, not the status, tells clients that nothing was done, so even an
-unkeyed land may be resent; and `POST /v1/land/check`
+Built ([ADR 0060](adr/0060-land-admission-and-read-limits.md), section 2):
+the server that batches a ref's lands may bound its queue in batches
+(`--land-queue-batches N`, off by default; `Repo::with_land_queue_batches`).
+`land_enqueue` checks the in-memory `RefQueue` after the name checks and
+before `get_changeset`: a land that would wait behind more than `N`
+batches, its own included (the waiting lands over 64, rounded up, plus one
+while a batch replays), gets `Error::Refused`, which the server answers 503
+`unavailable` with `Retry-After` (batches ahead times the ref's moving
+average batch time, 1 to 10 s) and `Leep-Refused: admission`. An unkeyed
+refusal reads nothing; a keyed land first reads its id with one
+`find_lands` and, if recorded, gets that answer instead. An admitted land
+holds a place in the queue while it reads its changeset, so concurrent
+arrivals cannot all pass the check. Queued lands are never dropped; lands a
+lost lease reroutes go through the new leader's admission. Forwarded lands
+count against the leader's bound, and the follower relays the refusal with
+its headers. The header, not the status, tells clients that nothing was
+done, so `leep land` resends even an unkeyed land after it, with jitter.
+Still proposed: `POST /v1/land/check`, which
 runs one land's step onto the current head in a staging layer that is never
 flushed, outside the queue and the lease, to answer whether it would land.
 

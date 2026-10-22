@@ -103,6 +103,8 @@ measured until the response head is ready, not until the body is streamed.
 | `leep_read_class_permits` | gauge | `class` = `search` | Permits of an expensive read class (`--read-concurrency`, ADR 0060): how many such requests this server runs at once. Absent for a class that is `off`. |
 | `leep_read_class_in_flight` | gauge | `class` | Requests of the class holding a permit, until their response body has been sent or dropped. |
 | `leep_read_class_shed_total` | counter | `class` | Requests of the class refused at once with `503` `unavailable`, `Retry-After` and `Leep-Refused: read-class` because every permit was in use. They also count in `leep_http_requests_total` as 503; `LeepServerErrors` subtracts them. The series exist from startup for each limited class. |
+| `leep_land_admission_refused_total` | counter | `route` = `direct`, `forwarded` | Lands refused at once with `503` `unavailable`, `Retry-After` and `Leep-Refused: admission` because their ref's queue was at `--land-queue-batches` ([Land admission](#land-admission), ADR 0060). `forwarded`: the land came from another server, which relays the 503. Counted by the server that batches the ref; both series exist from startup. Not in `leep_land_total`. They also count in `leep_http_requests_total` as 503, a forwarded one on both servers; `LeepServerErrors` and `LeepLandErrors` subtract them. |
+| `leep_land_queue_batches` | gauge | none | The largest land queue, in batches, over the refs this server batches: the waiting lands over 64, rounded up, plus one while a batch replays. A land waits about one batch time per batch. No ref label: the hottest queue is what matters. |
 | `leep_tokens_expiring_soon` | gauge | none | Tokens in the tokens file whose `expires` is within 7 days and not yet past. Refreshed every minute and on every load. |
 | `leep_tokens_expired` | gauge | none | Tokens still in the tokens file whose `expires` has passed; requests with them get 401. |
 | `leep_token_expired_requests_total` | counter | `token` | Requests refused because their token had expired: an agent still using a token that ran out. |
@@ -150,9 +152,11 @@ groups:
       summary: "A leep-server's /metrics cannot be scraped: the process is down, or only its metrics listener is."
       runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepserverdown
   - alert: LeepServerErrors
-    # Indexing answers (503 with Retry-After, ADR 0058) and shed reads (503
-    # with Leep-Refused, ADR 0060) are not failures.
-    expr: (sum(rate(leep_http_requests_total{status=~"5.."}[5m])) - (sum(rate(leep_query_indexing_answers_total[5m])) or vector(0)) - (sum(rate(leep_read_class_shed_total[5m])) or vector(0))) / sum(rate(leep_http_requests_total[5m])) > 0.01
+    # Indexing answers (503 with Retry-After, ADR 0058), shed reads and lands
+    # not admitted (503 with Leep-Refused, ADR 0060) are not failures. A
+    # forwarded land's refusal is a 503 on the leader and again on the
+    # follower that relays it, so the forwarded series is subtracted twice.
+    expr: (sum(rate(leep_http_requests_total{status=~"5.."}[5m])) - (sum(rate(leep_query_indexing_answers_total[5m])) or vector(0)) - (sum(rate(leep_read_class_shed_total[5m])) or vector(0)) - (sum(rate(leep_land_admission_refused_total[5m])) or vector(0)) - (sum(rate(leep_land_admission_refused_total{route="forwarded"}[5m])) or vector(0))) / sum(rate(leep_http_requests_total[5m])) > 0.01
     for: 5m
     labels: {severity: page}
     annotations:
@@ -160,11 +164,18 @@ groups:
       runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepservererrors
   - alert: LeepLandErrors
     # Counts HTTP 5xx on the land route. leep_land_total{outcome="error"} also
-    # counts refused lands (400, 404), so it is not used here.
+    # counts refused lands (400, 404), so it is not used here. Lands not
+    # admitted (503 with Leep-Refused: admission, ADR 0060) are subtracted,
+    # forwarded ones twice (the leader's 503 and the follower's relay); while
+    # any have been refused, the first-5xx branch stays quiet, since their
+    # 503s create the series too.
     expr: |
-      sum(increase(leep_http_requests_total{route="/v1/land",status=~"5.."}[10m])) > 0
+      (sum(increase(leep_http_requests_total{route="/v1/land",status=~"5.."}[10m]))
+        - (sum(increase(leep_land_admission_refused_total[10m])) or vector(0))
+        - (sum(increase(leep_land_admission_refused_total{route="forwarded"}[10m])) or vector(0))) > 0.5
       or
-      sum(leep_http_requests_total{route="/v1/land",status=~"5.."} unless leep_http_requests_total{route="/v1/land",status=~"5.."} offset 10m) > 0
+      (sum(leep_http_requests_total{route="/v1/land",status=~"5.."} unless leep_http_requests_total{route="/v1/land",status=~"5.."} offset 10m) > 0
+        unless on() (sum(leep_land_admission_refused_total) > 0))
     labels: {severity: page}
     annotations:
       summary: "A land failed with a server error (5xx): a store failed while landing. Refused lands do not count."
@@ -194,6 +205,18 @@ groups:
     annotations:
       summary: "More than one lost ref compare-and-swap per land: several writers contend for one ref."
       runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leeplandcaslosseshigh
+  - alert: LeepLandAdmissionRefusing
+    # Only with --land-queue-batches set (ADR 0060). leep_land_total counts
+    # lands where they are batched, as the refusals are, so a forwarded land
+    # counts once.
+    expr: |
+      sum(rate(leep_land_admission_refused_total[15m]))
+        / (sum(rate(leep_land_admission_refused_total[15m])) + sum(rate(leep_land_total[15m]))) > 0.1
+    for: 15m
+    labels: {severity: ticket}
+    annotations:
+      summary: "More than 10% of lands are refused because their ref's queue is full (503 with Leep-Refused: admission): the ref is offered more lands than it can replay."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leeplandadmissionrefusing
   - alert: LeepLandForwardFailing
     expr: sum(rate(leep_land_forwarded_total{outcome="failed"}[10m])) > 0.1
     for: 10m
@@ -671,6 +694,59 @@ to 30 s searches were CPU queueing.
   `--search-pool-permits off`) and restart. Nothing persisted depends on
   either. Balancers must not count these 503s against a backend (see
   [Indexing a large history](#indexing-a-large-history), "Balancers").
+
+### Land admission
+
+A ref's lands are replayed in batches, one after another: the server that
+batches the ref takes every waiting land, up to 64, replays them onto the
+head and moves the ref once, and lands that arrive meanwhile wait for the
+next batch. Without a bound the queue grows until clients time out and
+send their lands again into the same queue: in the swarm at 2,000 agents on
+two cores, lands waited 28 to 30 s against a 30 s client timeout and 10,000
+to 15,000 were resent per run (`docs/PERFORMANCE.md`, E5).
+`--land-queue-batches` bounds the queue in batches (ADR 0060, section 2).
+
+| Flag / env | Default | What it bounds |
+|---|---|---|
+| `--land-queue-batches N\|off` / `LEEP_LAND_QUEUE_BATCHES` | `off` | Batches a land may wait behind, its own included. The queue holds the waiting lands over 64, rounded up, plus one while a batch replays; a land that would wait behind more than `N` is refused. A land that joins a batch still filling is admitted, since it waits no longer than the lands already in it. |
+
+- A refused land gets `503`, code `unavailable`, `Retry-After` and
+  `Leep-Refused: admission` at once, before its changeset is read: the
+  batches ahead times the ref's recent batch time, rounded up, between 1
+  and 10 s. Nothing is queued or recorded, so the land may be sent again,
+  with or without a land id. A keyed land whose id the ref already recorded
+  is answered from the record instead (one indexed read), so a client
+  whose first send landed is not refused while the queue stays full.
+- Lands already queued are never dropped. The bound is judged by the
+  server that batches the ref: the lease holder with
+  `--land-coordination on`, which counts forwarded lands like its own. A
+  follower relays the leader's 503 with its headers and never lands it
+  itself. When a leader loses its lease, its queued lands are routed again
+  and go through the new leader's admission, where they can be refused.
+- `leep land` waits the `Retry-After` plus up to 50% jitter and sends the
+  land again under the same land id, at most five times or 60 s of
+  waiting, then exits 3 and keeps the land pending for the next
+  `leep land`. The MCP server returns a retryable tool error with
+  `retry_after`. Older clients report the 503 as an error.
+- **Tuning.** A land waits about one batch time per batch ahead of it, so
+  choose `N` with `N` times a full batch's time under half the clients'
+  request timeout (15 s for a 30 s timeout, as the swarm's agents use). A
+  full batch takes about 64 divided by the ref's lands per second. In E5 one ref
+  on two cores landed 12 to 16 times a second at 2,000 agents, so a full
+  batch of 64 took 4 to 5 s: start at `N = 2` or `3` there, and on a
+  faster host or a ref that lands more often, higher. `N = 1` admits lands
+  only while no batch replays, which keeps batches small; it is for tests.
+  Watch `leep_land_queue_batches` (pinned at `N` means the bound is doing
+  the work), `leep_land_admission_refused_total` against `leep_land_total`,
+  and `leep_land_lock_wait_seconds`, which should stay under the clients'
+  timeout once the bound is right. A swarm run with it on, per ADR 0060's
+  "Rollout", sets the default; until then it is off.
+- Refusals are not failures: `LeepServerErrors` and `LeepLandErrors` do
+  not count them, and balancers must not count them against a backend
+  (they carry `Leep-Refused`). [LeepLandAdmissionRefusing](RUNBOOKS.md#leeplandadmissionrefusing)
+  fires when more than 10% of lands are refused for 15 minutes.
+- To back out, set `--land-queue-batches off` and restart. Nothing
+  persisted depends on it.
 
 ## Config reload
 

@@ -7,6 +7,29 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 ## [Unreleased]
 
+### Lands can be refused at a full queue instead of timing out in it
+- `--land-queue-batches N` (default `off`) bounds each ref's land queue in
+  batches of up to 64 lands (ADR 0060, section 2). A land that would wait
+  behind more than `N` batches, its own included, is refused at once with
+  `503` `unavailable`, `Retry-After` (1 to 10 s) and
+  `Leep-Refused: admission`, before its changeset is read. Nothing is
+  queued or recorded. A keyed land that already landed gets its recorded
+  answer instead. Queued lands are never dropped. With
+  `--land-coordination on` the lease holder judges the bound, forwarded
+  lands included, and followers relay its 503.
+- `leep land` sends a refused land again after `Retry-After` plus up to
+  50% jitter, under the same land id, up to five times or 60 s of waiting;
+  even a land without an id is resent after a 503 with `Leep-Refused`, and
+  no other write is. The MCP server returns a retryable tool error with
+  `retry_after` instead of waiting.
+- New metrics `leep_land_admission_refused_total{route}` and
+  `leep_land_queue_batches`, and the `LeepLandAdmissionRefusing` alert.
+  `LeepServerErrors` and `LeepLandErrors` no longer count these refusals,
+  including a follower's relayed copy. **Operators:** update both rules.
+- The in-flight body budget's `503` now carries `Leep-Refused: body-budget`.
+- `leep-swarm` reports lands not admitted, and `leep-soak` counts
+  `admission_503`, apart from errors and resends.
+
 ### Search derives missing rows in batches
 - A search on a head past the indexed one derives the missing trigram rows
   a tree level at a time, with batched reads and writes, instead of one

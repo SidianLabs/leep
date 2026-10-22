@@ -1170,17 +1170,42 @@ new response header `Leep-Refused: <reason>`.
   idempotent. Only a Leep server sets it, and only on such a refusal; a
   `503` without it, which a proxy or balancer may also send, promises
   nothing.
-- Values: `read-class` (an expensive read whose class is full). ADR 0060
-  reserves `admission` (a land refused by a full ref queue) and
-  `body-budget` (the in-flight body budget's `503`); servers do not send
-  those yet. Clients should treat any value as "refused before any work"
-  and must not depend on the list being closed.
+- Values: `read-class` (an expensive read whose class is full),
+  `admission` (a land refused because its ref's queue is full, see
+  [Land admission](#land-admission-additive-header-value-adr-0060)) and
+  `body-budget` (the in-flight body budget's `503`, `--max-inflight-bytes`).
+  Clients should treat any value as "refused before any work" and must
+  not depend on the list being closed.
 - A follower that relays a forwarded land's answer (ADR 0056) copies
   `Leep-Refused` along with `Content-Type` and `Retry-After`.
 - `leep` retries a `GET` answered this way like a `429`: at most four tries,
   waiting `Retry-After` plus up to 50% jitter, and reporting a wait over
   10 s instead of sleeping. Older clients report the `503` as a server
   error, whose message says to retry.
+
+## Land admission (additive header value, ADR 0060)
+
+Nothing persisted changed, and no field, code or route was added. A server
+started with `--land-queue-batches N` (default `off`) refuses
+`POST /v1/land` when the land would wait behind more than `N` batches of
+its ref's queue, its own included: `503`, code `unavailable`, the usual
+`ErrorResponse` body, `Retry-After` (whole seconds, 1 to 10) and
+`Leep-Refused: admission`.
+
+- The refusal comes before the changeset is read and before anything is
+  queued or recorded, so the land id stays free and the land may be sent
+  again, with or without a land id. A keyed land whose id the ref already
+  recorded is answered from the record (`200`, or `400`
+  `land_id_reused`) instead of being refused.
+- Only the server that batches the ref's lands refuses: the land lease
+  holder under `--land-coordination on`. A follower relays the leader's
+  `503` with its `Retry-After` and `Leep-Refused`.
+- `leep land` sends the land again after `Retry-After` plus up to 50%
+  jitter, under the same land id, at most five times or 60 s of waiting.
+  The MCP server returns a retryable tool error with `retry_after` instead
+  of waiting. Older clients report the `503` as a server error; they resend
+  a keyed land after it as after any `5xx`, and never resend an unkeyed one.
+- The body budget's `503` now carries `Leep-Refused: body-budget` too.
 
 ## Error codes (additive API field, no persisted change)
 
@@ -1217,7 +1242,7 @@ client treats an unknown or absent code by its HTTP status.
 | 500 | `internal` | the server failed |
 | 503 | `indexing` | the index is too far behind; see `indexing` and `Retry-After` (ADR 0058) |
 | 503 | `not_leader` | the server no longer coordinates lands on that ref; send the land again (ADR 0056) |
-| 503 | `unavailable` | overloaded or busy, including request bodies in flight at the server's limit (`--max-inflight-bytes`) and an expensive read whose class is full (`--read-concurrency`, ADR 0060), with `Retry-After` when known: back off and retry. With `Leep-Refused` the request was refused before any work and may be sent again, an unkeyed land included; without it nothing is promised |
+| 503 | `unavailable` | overloaded or busy, including request bodies in flight at the server's limit (`--max-inflight-bytes`), an expensive read whose class is full (`--read-concurrency`, ADR 0060) and a land whose ref's queue is full (`--land-queue-batches`, ADR 0060), with `Retry-After` when known: back off and retry. With `Leep-Refused` the request was refused before any work and may be sent again, an unkeyed land included; without it nothing is promised |
 
 A lost `POST /v1/refs/{name}` swap is unchanged: `409` with `CasRefResponse`
 (`ok: false`), not an error body. The marker texts (`NEEDS_REVIEW_MARKER`,
