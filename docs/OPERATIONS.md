@@ -2677,8 +2677,13 @@ its seed.
 ```sh
 cargo test -p leep-derive fault_tests                      # 25 seeds
 LEEP_FAULT_SEEDS=500 cargo test -p leep-derive fault_tests # seeds 1..=500
+LEEP_FAULT_SEED_START=2001 LEEP_FAULT_SEEDS=500 cargo test -p leep-derive fault_tests # seeds 2001..=2500
 LEEP_FAULT_SEED=137 cargo test -p leep-derive fault_tests  # replay one seed
 ```
+
+The `Fault sweeps` workflow runs every seeded sweep nightly on a new block
+of 1,000 seeds, so the seeds covered keep growing; its run summary names the
+block. A failure names its seed: replay it with `LEEP_FAULT_SEED`.
 
 **Crash test** (real `leep-server` and `leep` binaries, SIGKILL). It needs
 the binaries built first, and runs the Postgres variant when

@@ -2490,11 +2490,7 @@ mod tests {
     /// of each would condemn the same, and nothing referenced is ever lost.
     #[tokio::test]
     async fn incremental_mark_matches_full_mark_on_random_histories() {
-        let seeds = std::env::var("LEEP_FAULT_SEEDS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(25);
-        for seed in 1..=seeds {
+        for seed in crate::fault_tests::seeds() {
             random_history_gc(seed).await;
         }
     }

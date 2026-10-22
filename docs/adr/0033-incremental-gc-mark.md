@@ -5,7 +5,7 @@ tree nodes and blobs only while their changesets are stored. The
 changeset sweep deletes a changeset's own `gc-mark-v1` row with it. Rows
 of tree nodes and blobs stay, so incremental runs keep those objects, which
 is safe. `gc --full` ignores the rows, frees them, and keeps the trees of
-changesets deleted within `--backup-fence`, which it now requires
+changesets deleted within `--backup-fence`, which it now requires.
 Date: 2026-10-17
 
 ## Context

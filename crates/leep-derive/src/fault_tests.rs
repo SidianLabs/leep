@@ -203,13 +203,15 @@ pub(crate) async fn assert_ref_log_replays(seed: u64, meta: &dyn MetaStore) {
 const AGENTS: usize = 12;
 
 /// Seeds to run: `LEEP_FAULT_SEED=n` replays one, `LEEP_FAULT_SEEDS=n` runs
-/// `1..=n`, and the default is a short sweep.
+/// `n` seeds from `LEEP_FAULT_SEED_START` (default 1), and the default is a
+/// short sweep. A start lets the nightly sweep cover new seeds every night.
 pub(crate) fn seeds() -> std::ops::RangeInclusive<u64> {
     let var = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<u64>().ok());
+    let start = var("LEEP_FAULT_SEED_START").unwrap_or(1);
     match (var("LEEP_FAULT_SEED"), var("LEEP_FAULT_SEEDS")) {
         (Some(one), _) => one..=one,
-        (None, Some(n)) => 1..=n,
-        _ => 1..=25,
+        (None, Some(n)) => start..=start + n.max(1) - 1,
+        _ => start..=start + 24,
     }
 }
 
