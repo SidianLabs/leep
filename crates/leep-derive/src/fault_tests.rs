@@ -21,6 +21,10 @@ use leep_testkit::{is_injected, Fault, FaultPlan, FaultyBlobStore, FaultyMetaSto
 
 use crate::Repo;
 
+/// Land admission per ref (ADR 0060), in the same sweep.
+#[path = "admission_fault_tests.rs"]
+mod admission;
+
 /// Stores shared by any number of faulty "servers" and one clean verifier.
 pub(crate) struct World {
     pub(crate) blobs: Arc<MemoryBlobStore>,

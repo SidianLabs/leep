@@ -1,5 +1,5 @@
 # 0060. Protect lands from expensive reads, and admit lands per ref
-Status: Accepted (section 1, `search` class; see "Implementation notes"); other read classes and sections 2–3 proposed
+Status: Accepted (section 1, `search` class, and section 2; see "Implementation notes"); other read classes and section 3 proposed
 Date: 2026-10-21
 
 ## Context
@@ -371,9 +371,11 @@ answers that question without the queue:
   either.
 
 ## Implementation notes
-Section 1 is built for the `search` class. The other classes, section 2 and
-section 3 are not, and stay proposed. What is built differs from the text
-above as follows, each for the reason given:
+Section 1 is built for the `search` class, and section 2 is built. The
+other classes and section 3 are not, and stay proposed. What is built
+differs from the text above as follows, each for the reason given.
+
+### Section 1
 
 - **Classes not built.** `--read-concurrency` parses every class named in
   section 1, so the flag has its final shape. `land_check`, `blame`,
@@ -404,10 +406,11 @@ above as follows, each for the reason given:
 - **`Retry-After`** uses the median of the class's last 64 permit hold
   times, from admission until the response body ends, so it includes
   sending the answer.
-- **`Leep-Refused`** is sent as `read-class` only. The body budget's 503 does
-  not carry `body-budget` yet; it ships with section 2. The follower's relay
-  already copies `Leep-Refused` (section 2, "Forwarded lands"), so the
-  leader's admission refusal will pass through unchanged.
+- **`Leep-Refused`** was sent as `read-class` only until section 2 was
+  built; the body budget's 503 now carries `body-budget`, and admission
+  refusals `admission`. The follower's relay already copied
+  `Leep-Refused` (section 2, "Forwarded lands"), so the leader's admission
+  refusal passes through unchanged.
 - **Clients.** `leep` retries a `GET` answered `503` with `Leep-Refused`
   whatever the value, at most `MAX_ATTEMPTS` tries with up to 50% jitter per
   wait, and reports a `Retry-After` over `MAX_RETRY_WAIT`. It goes by the
@@ -437,3 +440,100 @@ above as follows, each for the reason given:
   permits land less often than one, so the `search` default stays
   `max(1, cores / 2)`. The E3 runs with `--land-queue-batches` wait for
   section 2.
+
+### Section 2
+- **What "batch" means, and the bound.** A batch is what the leader takes
+  from the ref's queue in one go: every waiting land, up to the 64-land
+  `MAX_BATCH`. Lands that arrive while a batch replays wait for the next
+  take. `RefQueue::batches` is the formula of "Bound": the waiting lands
+  over 64, rounded up, plus one while a batch replays, and
+  `leep_land_queue_batches` reports it. The check differs in one point. A
+  land is refused when, admitted, it would wait behind more than `N`
+  batches, its own included: `ceil((waiting + 1) / 64) + replaying > N`.
+  The text's "already holds `N` batches" would also refuse a land that
+  joins a batch still filling. Such a land waits no longer than the lands
+  already in that batch, so refusing it bounds nothing. It would also cap
+  batches: at `N = 2` one land could wait behind the replaying batch, so
+  every batch would hold one land and the bound would cut lands/s instead
+  of bounding the wait. As built, `N = 1` admits lands only while no batch
+  replays, and `N = 2` admits one full batch behind the replaying one.
+  `N = 1` is for tests only: it collapses each batch to about one land.
+- **Lands being admitted count.** The check and the enqueue are not one
+  step: `get_changeset` runs between them. An admitted land holds a place
+  (`RefQueue::reserved`) from the check until it is queued or ends, so
+  concurrent arrivals cannot all pass a check made before any of them was
+  queued. The place is given back if the request is cancelled or the
+  changeset read fails.
+- **`Retry-After`** is the time until a slot frees, **not the batches
+  ahead times the batch time**. A refused land finds `ahead >= N` batches,
+  and each batch the leader finishes frees one, so it waits for
+  `ahead + 1 - N` batches (one, unless the bound was lowered meanwhile),
+  not for all `ahead`. It is that count times the ref's moving average of
+  batch times (each batch weighs 0.2, from its take until it is answered),
+  1 s per batch before the first one finishes, rounded up and **clamped to
+  1 to 10 s, not 1 to 30 s**. `N` is sized so the whole queue waits less
+  than half a client's timeout (15 s at 30 s), so a longer wait would only
+  follow a bound set too high. 10 s is section 1's ceiling, `MAX_RETRY_WAIT`,
+  so every client that retries refusals waits instead of reporting.
+- **A failed land id lookup at a full queue refuses the land** (503 with
+  `Leep-Refused: admission`) instead of answering 500, and logs the store
+  error at WARN, since the refusal hides it from the client. Nothing was
+  done either way, and the resend reads the id again.
+- **"Nothing was done" holds per request, not per land.** A follower whose
+  forward failed (`Forwarded::Failed`, no answer) sends the land again,
+  and that second copy can be refused while the first is still queued on
+  the leader and lands. The refusal is still true of the request it
+  answers. The client's resend is then answered from the land id's record,
+  or, for an unkeyed land, found by the landed-copy scan, so it does not
+  land twice.
+- **Errors.** A refusal is `leep_core::Error::Refused` (new, not persisted),
+  which the server maps to 503 `unavailable` with `Retry-After` and
+  `Leep-Refused`, and does not log as a failure. It is not counted in
+  `leep_land_total` or `leep_land_duration_seconds`. A keyed land answered
+  from its record at a full queue counts in
+  `leep_land_answered_from_record_total{original="present"}`.
+- **Metrics and alerts.** `leep_land_admission_refused_total{route}`
+  (both series from startup) and `leep_land_queue_batches`, the largest
+  `RefQueue::batches` over the queues of the process, kept without visiting
+  every ref's queue. A forwarded refusal is a 503 in the leader's
+  `leep_http_requests_total` and again in the follower's, so
+  `LeepServerErrors` and `LeepLandErrors` subtract
+  `leep_land_admission_refused_total` and then its `route="forwarded"`
+  series a second time. `LeepLandAdmissionRefusing` divides refusals by
+  refusals plus `leep_land_total`, which only the batching server records,
+  so neither side counts a forwarded land twice.
+- **Clients.** `Client::land_resending` resends after any 503 with
+  `Leep-Refused` from `/v1/land`, keyed or not, waiting `Retry-After` plus up
+  to 50% jitter, at most five times or 60 s of waiting, and says so on
+  stderr. These resends do not use up `LAND_RESENDS`. No other `POST` is
+  resent, and `Client::land` sends once. With refusal retries off (the MCP
+  server) it returns the refusal at once. The MCP land tool reports it as
+  section 1's retryable error, not as "the land may have applied".
+  `leep-swarm` counts refused lands (`lands not admitted`) and resends them
+  without using up the land's tries; `leep-soak` counts `admission_503`
+  apart from `shed_503`.
+- **Testing.** `cargo test -p leep-derive fault_tests::admission`:
+  `admission_refused_lands_nothing` (two servers whose batches race and
+  fail commits, sweep), `admission_answers_recorded_land` (one
+  `find_lands` and nothing more), `forwarded_land_refused_by_full_leader`
+  (one forward, relayed as answered, never batched by the follower),
+  `forwarded_lands_refused_under_faults_land_once` (sweep, lost and reset
+  forwards), `leader_killed_with_full_queue` (sweep: every agent lands
+  within the lease TTL plus 2 s of the takeover, at a bound of 2 with
+  more agents than a batch holds) and
+  `queued_lands_are_never_dropped_and_off_admits_every_land`, with
+  `a_land_cancelled_between_admission_and_enqueue_gives_its_place_back`
+  and `an_aborted_leader_stops_counting_its_batch`; `land::tests` cover
+  the moving average and `Retry-After`. The two
+  `land_check_*` cases belong to section 3. Router tests in
+  `crates/leep-server/tests/land_admission.rs` cover the refusal's shape,
+  the recorded answer, queued lands, `off`, the metrics and a follower
+  relaying a leader's refusal over HTTP. `leep-e2e`'s
+  `leep_land_resends_a_land_not_admitted_and_lands_it_once` runs the real
+  `leep land` against `--land-queue-batches 1`. The crash test gains
+  `killed_server_with_a_full_land_queue_loses_nothing_{sqlite,postgres}`
+  with `--land-queue-batches 1`; kills are not synchronized with a full
+  queue, but at a bound of 1 the queue is full whenever a batch replays,
+  and the test requires refusals. The E3 runs under "Testing" with
+  `--land-queue-batches` have not been done, so the bound ships `off` as
+  "Rollout" says.

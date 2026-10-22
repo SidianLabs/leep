@@ -274,8 +274,18 @@ struct Args {
     /// once, or off; each holds up to two connections. Default: a quarter
     /// of --meta-pool-size, at least 1, so searches hold at most half of
     /// the pool and lands and ref reads keep the rest.
-    #[arg(long, env = "LEEP_SEARCH_POOL_PERMITS", value_parser = parse_pool_permits)]
-    search_pool_permits: Option<PoolPermits>,
+    #[arg(long, env = "LEEP_SEARCH_POOL_PERMITS", value_parser = parse_count_or_off)]
+    search_pool_permits: Option<CountOrOff>,
+    /// Batches a ref's land queue may hold before this server refuses new
+    /// lands onto it (ADR 0060), or off. The queue counts the lands waiting
+    /// in batches of 64, rounded up, plus the batch being replayed; a land
+    /// waits about one batch time per batch ahead of it, so this bounds the
+    /// wait. A refused land gets 503 at once with Retry-After and
+    /// `Leep-Refused: admission`, before its changeset is read, and clients
+    /// send it again; queued lands are never dropped. Start with N times a
+    /// full batch's time under half the clients' timeout.
+    #[arg(long, env = "LEEP_LAND_QUEUE_BATCHES", value_parser = parse_count_or_off, default_value = "off")]
+    land_queue_batches: CountOrOff,
     #[command(subcommand)]
     command: Option<Cmd>,
 }
@@ -679,18 +689,19 @@ fn parse_interval(s: &str) -> Result<std::time::Duration, String> {
     }
 }
 
-/// `--search-pool-permits`: a number of permits, or no bound.
+/// `--search-pool-permits` and `--land-queue-batches`: a number, or no
+/// bound.
 #[derive(Clone, Copy, Debug)]
-enum PoolPermits {
+enum CountOrOff {
     Off,
-    Permits(usize),
+    Count(usize),
 }
 
-fn parse_pool_permits(s: &str) -> Result<PoolPermits, String> {
+fn parse_count_or_off(s: &str) -> Result<CountOrOff, String> {
     match s.trim() {
-        "off" => Ok(PoolPermits::Off),
+        "off" => Ok(CountOrOff::Off),
         n => match n.parse::<usize>() {
-            Ok(n) if n >= 1 => Ok(PoolPermits::Permits(n)),
+            Ok(n) if n >= 1 => Ok(CountOrOff::Count(n)),
             _ => Err(format!(
                 "expected a number of at least 1, or off; got {s:?}"
             )),
@@ -1251,8 +1262,8 @@ async fn main() -> anyhow::Result<()> {
     let read_concurrency = leep_server::read_limits::ReadConcurrency::parse(&args.read_concurrency)
         .map_err(anyhow::Error::msg)?;
     let search_pool = match args.search_pool_permits {
-        Some(PoolPermits::Off) => None,
-        Some(PoolPermits::Permits(n)) => Some(n),
+        Some(CountOrOff::Off) => None,
+        Some(CountOrOff::Count(n)) => Some(n),
         None => Some(leep_server::read_limits::default_search_pool_permits(
             args.meta_pool_size,
         )),
@@ -1316,6 +1327,10 @@ async fn main() -> anyhow::Result<()> {
         repo = repo.with_derive_jobs(jobs as usize);
     }
     repo = repo.with_search_pool_permits(search_pool);
+    repo = repo.with_land_queue_batches(match args.land_queue_batches {
+        CountOrOff::Off => None,
+        CountOrOff::Count(n) => Some(n),
+    });
     leep_server::reload::warn_missing_refs(repo.meta().as_ref(), &config.current()).await;
     if args.request_timeout.is_zero() {
         tracing::warn!("request timeout disabled: gc --fence cannot be guaranteed safe");
@@ -1384,7 +1399,8 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(
         read_concurrency = %read_concurrency.describe(),
         search_pool_permits = ?search_pool,
-        "expensive read limits (ADR 0060)"
+        land_queue_batches = ?repo.land_queue_batches(),
+        "expensive read and land admission limits (ADR 0060)"
     );
     let mut app = leep_server::router_with_read_limits(
         repo,

@@ -83,7 +83,7 @@
 //! | 500 | `internal` | the server failed |
 //! | 503 | `indexing` | the index is too far behind; see `indexing` and `Retry-After` (ADR 0058) |
 //! | 503 | `not_leader` | the server no longer coordinates lands on that ref; send again (ADR 0056) |
-//! | 503 | `unavailable` | overloaded or busy, including request bodies in flight at the server's limit (`--max-inflight-bytes`), with `Retry-After` when known: back off and retry. With [`REFUSED_HEADER`] the server refused before any work and the request may be sent again; without it nothing is promised |
+//! | 503 | `unavailable` | overloaded or busy, including request bodies in flight at the server's limit (`--max-inflight-bytes`), an expensive read whose class is full (`--read-concurrency`) and a land whose ref's queue is full (`--land-queue-batches`), with `Retry-After` when known: back off and retry. With [`REFUSED_HEADER`] the server refused before any work and the request may be sent again; without it nothing is promised |
 //!
 //! A lost `POST /v1/refs/{name}` swap is not an error body: it is 409 with
 //! [`CasRefResponse`] (`ok: false`). The constants are in [`error_code`].
@@ -304,9 +304,9 @@ pub mod error_code {
     pub const NOT_LEADER: &str = "not_leader";
     /// 503 (with `Retry-After` when the server knows): overloaded or busy,
     /// including request bodies in flight at the server's limit
-    /// (`--max-inflight-bytes`) and an expensive read whose class is full
-    /// (ADR 0060). Back off and retry. With [`super::REFUSED_HEADER`] the
-    /// request was refused before any work.
+    /// (`--max-inflight-bytes`), an expensive read whose class is full and a
+    /// land whose ref's queue is full (ADR 0060). Back off and retry. With
+    /// [`super::REFUSED_HEADER`] the request was refused before any work.
     pub const UNAVAILABLE: &str = "unavailable";
     /// 500: the server failed.
     pub const INTERNAL: &str = "internal";
@@ -418,6 +418,13 @@ pub const REFUSED_HEADER: &str = "leep-refused";
 /// [`REFUSED_HEADER`] value: an expensive read (a search) whose class was
 /// at its concurrency limit (`--read-concurrency`).
 pub const REFUSED_READ_CLASS: &str = "read-class";
+/// [`REFUSED_HEADER`] value: a land refused because its ref's queue already
+/// held `--land-queue-batches` batches. Nothing was queued, so even a land
+/// without a land id may be sent again.
+pub const REFUSED_ADMISSION: &str = "admission";
+/// [`REFUSED_HEADER`] value: a request refused because the request bodies
+/// in flight were at the server's limit (`--max-inflight-bytes`).
+pub const REFUSED_BODY_BUDGET: &str = "body-budget";
 
 /// Body of `GET /v1/whoami`. Lets a client name the author of its changesets
 /// after the token when nothing local names one.

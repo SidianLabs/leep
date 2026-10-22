@@ -30,6 +30,7 @@ every runbook.
 | [LeepLandExhausted](#leeplandexhausted) | ticket | a land lost the ref compare-and-swap on all 32 attempts |
 | [LeepLandBatchDeadline](#leeplandbatchdeadline) | ticket | a land batch gave up after retrying for 60 seconds |
 | [LeepLandCasLossesHigh](#leeplandcaslosseshigh) | ticket | more than one lost compare-and-swap per land, for 15 minutes |
+| [LeepLandAdmissionRefusing](#leeplandadmissionrefusing) | ticket | more than 10% of lands are refused because their ref's queue is full, for 15 minutes |
 | [LeepLandForwardFailing](#leeplandforwardfailing) | ticket | servers fail to reach the server coordinating a ref's lands, for 10 minutes |
 | [LeepLandLeaseFlapping](#leeplandleaseflapping) | ticket | land leases change hands more than six times a minute, for 10 minutes |
 | [LeepIndexLagging](#leepindexlagging) | ticket | an index group trails ref moves by over 2 minutes for 10 minutes |
@@ -324,7 +325,10 @@ failing `/v1/ready` (503) counts as a 5xx. Indexing answers (503 with
 `Leep-Indexing`, ADR 0058) are subtracted: see
 [LeepIndexingAnswersHigh](#leepindexinganswershigh). So are searches shed
 because their class was full (503 with `Leep-Refused`, ADR 0060): see
-[LeepReadsShedding](#leepreadsshedding).
+[LeepReadsShedding](#leepreadsshedding). So are lands not admitted because
+their ref's queue was full (503 with `Leep-Refused: admission`), a
+forwarded one twice since the follower relays the leader's 503: see
+[LeepLandAdmissionRefusing](#leeplandadmissionrefusing).
 
 **Impact.** Agents see failed commits, lands and reads; the CLI prints the
 server's message and exits 3. Writes are idempotent, so retrying is safe, but
@@ -390,7 +394,10 @@ failed while landing. **Page.** The rule counts HTTP 5xx on the land route, not
 `leep_land_total{outcome="error"}`: that outcome counts every failed land except
 a lost race, including refused lands (400: unsigned or unreviewed changeset, tag
 ref, bad ref name) and unknown changesets (404), which are the caller's
-doing and would page on every policy refusal.
+doing and would page on every policy refusal. Lands not admitted because
+their ref's queue was full (503 with `Leep-Refused: admission`, ADR 0060)
+are subtracted: nothing was done, and clients send them again (see
+[LeepLandAdmissionRefusing](#leeplandadmissionrefusing)).
 
 **Impact.** The agent's land fails (CLI exit 3). `land` already retries a failed
 commit from a fresh read up to three times in a row before it gives up, and the
@@ -572,6 +579,80 @@ Do not add instances to speed up lands on one ref: they add cross-process
 losses.
 
 **Escalate / collect.** As in LeepLandExhausted.
+
+## LeepLandAdmissionRefusing
+
+**Meaning.** For 15 minutes, more than 10% of lands were refused because
+their ref's queue was at `--land-queue-batches` (ADR 0060, section 2).
+**Ticket.** A refusal is `503` `unavailable` with `Retry-After` and
+`Leep-Refused: admission`, made before the changeset is read, counted in
+`leep_land_admission_refused_total{route}` on the server that batches the
+ref (`forwarded` when another server sent the land and relays the 503). It
+is not a failure: nothing was queued or recorded, and
+[LeepServerErrors](#leepservererrors) and [LeepLandErrors](#leeplanderrors)
+do not count it. The ref is offered more lands than it can replay.
+
+**Impact.** Lands take longer to get in, but none waits in the queue past
+the bound, so clients stop timing out and resending into it. `leep land`
+waits the `Retry-After` plus jitter and sends the land again under the same
+land id, up to five times or 60 s, then exits 3 and keeps the land pending
+for the next `leep land`. MCP agents get a retryable tool error with
+`retry_after`. Clients older than the header report a 503.
+
+**Diagnose.**
+
+1. Which server and how full: `max by (instance) (leep_land_queue_batches)`
+   against the `land_queue_batches` the server logged at startup (`expensive
+   read and land admission limits`). Pinned at the bound means every
+   batch is full behind the one replaying. With `--land-coordination on`,
+   only the lease holder of the hot ref refuses; its followers relay
+   (`route="forwarded"`).
+2. How fast the ref lands: `sum(rate(leep_land_total{outcome="landed"}[15m]))`,
+   `histogram_quantile(0.5, sum by (le) (rate(leep_land_batch_size_bucket[15m])))`
+   and the batch time it implies (64 lands over the land rate). Batches of
+   64 mean the ref is saturated.
+3. Whether replays got slower: `leep_land_duration_seconds` and
+   `leep_land_cas_losses_total` (another writer racing the ref, see
+   [LeepLandCasLossesHigh](#leeplandcaslosseshigh)), and host CPU: on a
+   small host expensive reads take the lands' cores
+   ([LeepReadsShedding](#leepreadsshedding)).
+4. Who sends: `sum by (status) (rate(leep_http_requests_total{route="/v1/land"}[15m]))`
+   and the DEBUG log (`land refused: queue full`, with the ref and the
+   batches ahead). A new fleet of agents, or agents resending without
+   waiting?
+
+**Likely causes.**
+
+1. More agents landing on one ref than one server can replay. Confirm:
+   step 1 pinned, step 2 full batches at a steady land rate.
+2. Replays got slower: a slow metadata store, CPU taken by searches, CAS
+   races with an uncoordinated server. Confirm: step 3.
+3. A bound set lower than the host needs. Confirm: refusals while
+   `leep_land_lock_wait_seconds` stays far below the clients' timeout.
+
+**Mitigate / fix.**
+
+- A larger queue is not the fix: it only moves the wait back into the
+  queue until clients time out (ADR 0060). Raise `--land-queue-batches`
+  only when lands wait well under half the clients' timeout
+  (`leep_land_lock_wait_seconds`).
+- Make replays faster: give lands their cores back (lower
+  `--read-concurrency`, move indexing off the host, ADR 0058), fix a slow
+  metadata store, and route the hot ref's lands to one server
+  (`--land-coordination on`, or one instance at the balancer) so batches
+  do not race.
+- Spread the work over more refs: agents that land on review refs and
+  merge in batches offer the hot ref fewer lands. More replay per ref
+  (pipelined or parallel replay) is ADR 0056's next step.
+- Make sure the balancer does not count these 503s against the backend
+  (they carry `Leep-Refused`; OPERATIONS.md, "Balancers").
+- `--land-queue-batches off` turns admission off. Lands then queue without
+  bound and clients time out and resend again; do it only to rule the
+  bound out.
+
+**Escalate / collect.** The queue gauge, refusal and land rates per
+instance, batch sizes and land durations, host CPU, the startup line, and
+the [standard bundle](#collecting-a-bug-report).
 
 ## LeepLandForwardFailing
 

@@ -952,13 +952,19 @@ impl BodyBudget {
                 metrics::counter!("leep_request_body_refused_total", "reason" => "budget", "class" => class)
                     .increment(1);
                 tracing::debug!(class, bytes, "request refused: body budget spent");
-                return Err(refuse(
+                // Refused before the handler, so nothing was done (ADR 0060).
+                let mut resp = refuse(
                     StatusCode::SERVICE_UNAVAILABLE,
                     leep_core::api::error_code::UNAVAILABLE,
                     "server busy: the request bodies in flight are at this server's limit; \
                      retry after 1s",
                     Some(1),
-                ));
+                );
+                resp.headers_mut().insert(
+                    leep_core::api::REFUSED_HEADER,
+                    HeaderValue::from_static(leep_core::api::REFUSED_BODY_BUDGET),
+                );
+                return Err(resp);
             };
             metrics::gauge!("leep_request_body_bytes_in_flight").increment(bytes as f64);
             Some(BodyCharge {

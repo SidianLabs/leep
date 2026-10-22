@@ -77,6 +77,8 @@ fn rig_with(extra: &[(&str, serde_json::Value)]) -> Rig {
 struct Reply {
     status: StatusCode,
     retry_after: Option<String>,
+    /// `Leep-Refused` (ADR 0060).
+    refused: Option<String>,
     body: Vec<u8>,
 }
 
@@ -103,6 +105,10 @@ async fn send(app: &Router, req: Request<Body>) -> Reply {
         retry_after: parts
             .headers
             .get(header::RETRY_AFTER)
+            .map(|v| v.to_str().unwrap().to_string()),
+        refused: parts
+            .headers
+            .get(leep_core::api::REFUSED_HEADER)
             .map(|v| v.to_str().unwrap().to_string()),
         body: body.collect().await.unwrap().to_bytes().to_vec(),
     }
@@ -859,6 +865,8 @@ async fn a_spent_budget_answers_503_with_retry_after_until_bodies_finish() {
     assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(r.code().as_deref(), Some("unavailable"));
     assert_eq!(r.retry_after.as_deref(), Some("1"));
+    // Refused before the handler ran: nothing was done (ADR 0060).
+    assert_eq!(r.refused.as_deref(), Some("body-budget"));
     assert!(r.error().contains("retry"), "{}", r.error());
     // A smaller one still fits, and requests without a body cost nothing.
     let thirty = vec![b'z'; 30 * KIB];

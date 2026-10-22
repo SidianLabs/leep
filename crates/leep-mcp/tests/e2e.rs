@@ -1639,3 +1639,91 @@ fn a_shed_search_is_a_retryable_tool_error_without_waiting() {
         assert!(t.contains(want), "{want:?} in {t}");
     }
 }
+
+/// A land the server did not admit because its ref's queue was full (ADR
+/// 0060, section 2) comes back at once as a retryable tool error carrying
+/// `retry_after`; the tool never sleeps. Called again with the same
+/// `request_id`, the land goes out under the same land id and lands once.
+#[test]
+fn a_land_not_admitted_is_a_retryable_tool_error_and_resends_under_its_id() {
+    use std::sync::{Arc, Mutex};
+
+    use axum::body::Body;
+    use axum::extract::Request;
+    use axum::http::{header, HeaderValue, Method, StatusCode};
+    use axum::middleware::{self, Next};
+    use axum::response::{IntoResponse, Response};
+
+    let lands: Arc<Mutex<Vec<Value>>> = Arc::default();
+    let seen = lands.clone();
+    let app = leep_server::router(common::repo()).layer(middleware::from_fn(
+        move |req: Request, next: Next| {
+            let seen = seen.clone();
+            async move {
+                if req.method() != Method::POST || req.uri().path() != "/v1/land" {
+                    return next.run(req).await;
+                }
+                let (parts, body) = req.into_parts();
+                let bytes = axum::body::to_bytes(body, 1 << 20).await.unwrap();
+                let first = {
+                    let mut s = seen.lock().unwrap();
+                    s.push(serde_json::from_slice(&bytes).unwrap());
+                    s.len() == 1
+                };
+                if !first {
+                    return next
+                        .run(Request::from_parts(parts, Body::from(bytes)))
+                        .await;
+                }
+                let body = json!({
+                    "error": "land not admitted: the land queue of \"main\" holds 2 batches \
+                              (--land-queue-batches 2); nothing was done, send it again in 3s",
+                    "code": "unavailable",
+                });
+                let mut resp: Response =
+                    (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body)).into_response();
+                let h = resp.headers_mut();
+                h.insert(header::RETRY_AFTER, HeaderValue::from_static("3"));
+                h.insert("leep-refused", HeaderValue::from_static("admission"));
+                resp
+            }
+        },
+    ));
+    let s = Server::new(config(&serve(app)));
+    let args = json!({
+        "message": "first",
+        "changes": [{ "path": "a.txt", "content": "one\n" }],
+        "request_id": "req-admit",
+    });
+    let started = std::time::Instant::now();
+    let r = commit(&s, args.clone());
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "the tool slept"
+    );
+    assert_eq!(r["isError"], true);
+    assert_eq!(lands.lock().unwrap().len(), 1, "sent once");
+    let t = text(&r);
+    for want in [
+        "land not admitted",
+        "Leep-Refused: admission",
+        "unavailable",
+        "retryable",
+        "retry_after: 3",
+    ] {
+        assert!(t.contains(want), "{want:?} in {t}");
+    }
+    assert!(!t.contains("may have applied"), "{t}");
+
+    let landed = data(&commit(&s, args));
+    assert_eq!(landed["status"], "landed");
+    // The empty repository's first land is sent without `create`, then
+    // with it; every send names the same land and changeset.
+    let lands = lands.lock().unwrap();
+    assert!(lands.len() >= 2, "{lands:?}");
+    assert!(lands[0]["land_id"].is_string());
+    for l in lands.iter() {
+        assert_eq!(l["land_id"], lands[0]["land_id"], "the same land id");
+        assert_eq!(l["changeset"], lands[0]["changeset"]);
+    }
+}

@@ -3,12 +3,12 @@
 //! into batches that move the ref once (ADR 0032).
 
 use std::collections::hash_map::RandomState;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::hash::BuildHasher;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use leep_core::api::{LandRefusal, LandResponse, RebaseResponse};
+use leep_core::api::{LandRefusal, LandResponse, RebaseResponse, REFUSED_ADMISSION};
 use leep_core::refname::{self, MISSING_REF_MARKER, NOT_FORWARD_MARKER};
 use leep_core::{
     ChangesetId, Error, FileChange, Hash, LandId, LandKey, LandRecord, RefStep, RefUpdateContext,
@@ -40,6 +40,16 @@ pub(crate) const MAX_BATCH: usize = 64;
 /// its lands with a retryable error; keyed ones are then answered from their
 /// record, so none lands twice.
 pub(crate) const MAX_BATCH_LIFETIME: Duration = Duration::from_secs(60);
+
+/// Bounds of the `Retry-After` of a land refused at a full queue, in
+/// seconds (ADR 0060, section 2). The bound is sized so the whole queue
+/// waits under half a client's timeout, so a longer wait would only follow
+/// a bound set too high; the ceiling is section 1's, which every `leep`
+/// that retries refusals waits out instead of reporting.
+const ADMISSION_RETRY_MIN_SECS: u64 = 1;
+const ADMISSION_RETRY_MAX_SECS: u64 = 10;
+/// Weight of the newest batch in a queue's moving average of batch times.
+const BATCH_TIME_WEIGHT: f64 = 0.2;
 
 /// The answer for the lands of a batch past [`MAX_BATCH_LIFETIME`].
 fn past_deadline(target_ref: &str) -> Error {
@@ -91,6 +101,9 @@ impl LandStats {
 #[derive(Default)]
 pub(crate) struct LandQueues {
     queues: Mutex<HashMap<String, Arc<Mutex<RefQueue>>>>,
+    /// How many queues hold each number of batches above zero, so the
+    /// largest is known without visiting every ref's queue.
+    depths: Mutex<BTreeMap<usize, usize>>,
     /// Leader tasks, so a test can kill a simulated server mid-batch.
     #[cfg(test)]
     tasks: Mutex<Vec<tokio::task::AbortHandle>>,
@@ -126,6 +139,37 @@ impl LandQueues {
     pub(crate) fn pending(&self, target_ref: &str) -> usize {
         lock(&self.queue(target_ref)).pending.len()
     }
+
+    /// Batches `target_ref`'s queue holds, as admission counts them.
+    #[cfg(test)]
+    pub(crate) fn batches(&self, target_ref: &str) -> usize {
+        lock(&self.queue(target_ref)).batches()
+    }
+
+    /// Record `q`'s size after a change, for `leep_land_queue_batches`: the
+    /// largest queue in batches over the refs this process batches. Called
+    /// under `q`'s lock; this lock is never held while taking a queue's.
+    fn report(&self, q: &mut RefQueue) {
+        let now = q.batches();
+        if now == q.reported {
+            return;
+        }
+        let mut depths = self.depths.lock().unwrap_or_else(|e| e.into_inner());
+        if q.reported > 0 {
+            if let Some(n) = depths.get_mut(&q.reported) {
+                *n -= 1;
+                if *n == 0 {
+                    depths.remove(&q.reported);
+                }
+            }
+        }
+        if now > 0 {
+            *depths.entry(now).or_default() += 1;
+        }
+        q.reported = now;
+        let largest = depths.keys().next_back().copied().unwrap_or(0);
+        metrics::gauge!("leep_land_queue_batches").set(largest as f64);
+    }
 }
 
 #[derive(Default)]
@@ -133,6 +177,86 @@ struct RefQueue {
     pending: VecDeque<Queued>,
     /// A leader task is draining `pending`; whoever finds none starts one.
     leading: bool,
+    /// Lands admitted and not yet queued: they are reading their changeset.
+    reserved: usize,
+    /// The leader took a batch from `pending` and is replaying it.
+    replaying: bool,
+    /// Moving average of this ref's batch times, in seconds.
+    batch_secs: Option<f64>,
+    /// [`RefQueue::batches`] as last given to [`LandQueues::report`].
+    reported: usize,
+}
+
+impl RefQueue {
+    /// The batches this queue holds (ADR 0060, section 2): the lands
+    /// waiting, admitted ones included, in batches of [`MAX_BATCH`] rounded
+    /// up, plus the one being replayed. A land waits about one batch time
+    /// per batch ahead of it, whatever the batches' sizes.
+    fn batches(&self) -> usize {
+        self.batches_with(0)
+    }
+
+    /// [`RefQueue::batches`] with `more` lands added: the leader takes up
+    /// to [`MAX_BATCH`] waiting lands at once, so a new land joins the last
+    /// batch while it has room, and waits as long as the lands already in
+    /// it.
+    fn batches_with(&self, more: usize) -> usize {
+        (self.pending.len() + self.reserved + more).div_ceil(MAX_BATCH)
+            + usize::from(self.replaying)
+    }
+
+    /// `Retry-After` for `batches` batch times, rounded up and clamped.
+    fn retry_after_secs(&self, batches: usize) -> u64 {
+        let secs = (batches as f64 * self.batch_secs.unwrap_or(1.0)).ceil() as u64;
+        secs.clamp(ADMISSION_RETRY_MIN_SECS, ADMISSION_RETRY_MAX_SECS)
+    }
+
+    /// `Retry-After` for a land refused at `bound`: about when a slot frees.
+    /// The queue holds `ahead >= bound` batches; each batch replayed frees
+    /// one, so `ahead + 1 - bound` of them must finish, not all `ahead`.
+    fn refused_retry_after_secs(&self, bound: usize) -> u64 {
+        let ahead = self.batches();
+        self.retry_after_secs((ahead + 1).saturating_sub(bound).max(1))
+    }
+
+    /// Fold a finished batch's time into the moving average.
+    fn record_batch(&mut self, took: Duration) {
+        let took = took.as_secs_f64();
+        self.batch_secs = Some(match self.batch_secs {
+            Some(avg) => avg + BATCH_TIME_WEIGHT * (took - avg),
+            None => took,
+        });
+    }
+}
+
+/// A place in a ref's queue taken by an admitted land while it reads its
+/// changeset; given back if the land ends before it is queued.
+struct Admitted<'a> {
+    queues: &'a LandQueues,
+    queue: Arc<Mutex<RefQueue>>,
+    held: bool,
+}
+
+impl Admitted<'_> {
+    /// Queue `land` in the place this held.
+    fn enqueue(mut self, land: Queued) -> bool {
+        let mut q = lock(&self.queue);
+        q.reserved -= 1;
+        self.held = false;
+        q.pending.push_back(land);
+        self.queues.report(&mut q);
+        !std::mem::replace(&mut q.leading, true)
+    }
+}
+
+impl Drop for Admitted<'_> {
+    fn drop(&mut self) {
+        if self.held {
+            let mut q = lock(&self.queue);
+            q.reserved -= 1;
+            self.queues.report(&mut q);
+        }
+    }
 }
 
 fn lock(queue: &Mutex<RefQueue>) -> MutexGuard<'_, RefQueue> {
@@ -273,6 +397,15 @@ fn duplicate(e: &Error) -> Error {
             behind: *behind,
             retry_after_ms: *retry_after_ms,
         },
+        Error::Refused {
+            refused,
+            retry_after_ms,
+            message,
+        } => Error::Refused {
+            refused,
+            retry_after_ms: *retry_after_ms,
+            message: message.clone(),
+        },
     }
 }
 
@@ -280,6 +413,7 @@ fn duplicate(e: &Error) -> Error {
 /// waiting lands get an error instead of waiting forever and the next land
 /// starts a new leader.
 struct Leading {
+    queues: Arc<LandQueues>,
     queue: Arc<Mutex<RefQueue>>,
     done: bool,
 }
@@ -289,7 +423,9 @@ impl Drop for Leading {
         if !self.done {
             let mut q = lock(&self.queue);
             q.leading = false;
+            q.replaying = false;
             q.pending.clear();
+            self.queues.report(&mut q);
         }
     }
 }
@@ -297,7 +433,9 @@ impl Drop for Leading {
 /// Run batches until the queue is empty. Spawned, so a cancelled request
 /// never cancels the batch the other requests wait on.
 async fn lead(repo: Repo, target_ref: String, queue: Arc<Mutex<RefQueue>>) {
+    let queues = Arc::clone(&repo.land_queues);
     let mut leading = Leading {
+        queues: Arc::clone(&queues),
         queue: Arc::clone(&queue),
         done: false,
     };
@@ -306,13 +444,20 @@ async fn lead(repo: Repo, target_ref: String, queue: Arc<Mutex<RefQueue>>) {
             let mut q = lock(&queue);
             if q.pending.is_empty() {
                 q.leading = false;
+                q.replaying = false;
+                queues.report(&mut q);
                 leading.done = true;
                 return;
             }
             let n = q.pending.len().min(MAX_BATCH);
-            q.pending.drain(..n).collect()
+            q.replaying = true;
+            let batch = q.pending.drain(..n).collect();
+            queues.report(&mut q);
+            batch
         };
+        let started = Instant::now();
         repo.land_batch(&target_ref, batch).await;
+        lock(&queue).record_batch(started.elapsed());
     }
 }
 
@@ -373,7 +518,7 @@ impl Repo {
         create: bool,
         land_id: Option<LandId>,
     ) -> Result<LandResponse> {
-        self.land_queued(cs, target_ref, actor, create, land_id, false)
+        self.land_queued(cs, target_ref, actor, create, land_id, false, false)
             .await
             .unwrap_or_else(|| {
                 Err(Error::Other(
@@ -384,7 +529,8 @@ impl Repo {
 
     /// [`land_keyed`](Self::land_keyed) for a server holding `target_ref`'s
     /// land lease (ADR 0056): `None` when it lost the lease before the land
-    /// was replayed, and the caller must route the land again.
+    /// was replayed, and the caller must route the land again. `forwarded`
+    /// marks a land another server sent here, for the admission metric.
     pub(crate) async fn land_led(
         &self,
         cs: ChangesetId,
@@ -392,11 +538,13 @@ impl Repo {
         actor: Option<&str>,
         create: bool,
         land_id: Option<LandId>,
+        forwarded: bool,
     ) -> Option<Result<LandResponse>> {
-        self.land_queued(cs, target_ref, actor, create, land_id, true)
+        self.land_queued(cs, target_ref, actor, create, land_id, true, forwarded)
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn land_queued(
         &self,
         cs: ChangesetId,
@@ -405,6 +553,7 @@ impl Repo {
         create: bool,
         land_id: Option<LandId>,
         led: bool,
+        forwarded: bool,
     ) -> Option<Result<LandResponse>> {
         let started = Instant::now();
         let mut stats = LandStats::default();
@@ -413,9 +562,11 @@ impl Repo {
             .message(format!("landed {cs}"))
             .land(land_id.map(|id| LandKey { id, changeset: cs }));
         match self
-            .land_inner(cs, target_ref, create, ctx, &mut stats, led)
+            .land_inner(cs, target_ref, create, ctx, &mut stats, led, forwarded)
             .await
         {
+            // Not admitted: counted by the admission metric alone.
+            Settled::Answered(result @ Err(Error::Refused { .. })) => Some(result),
             Settled::Answered(result) => {
                 stats.record(&result, started.elapsed());
                 Some(result)
@@ -424,6 +575,7 @@ impl Repo {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn land_inner(
         &self,
         cs: ChangesetId,
@@ -432,9 +584,10 @@ impl Repo {
         ctx: RefUpdateContext,
         stats: &mut LandStats,
         led: bool,
+        forwarded: bool,
     ) -> Settled {
         match self
-            .land_enqueue(cs, target_ref, create, ctx, stats, led)
+            .land_enqueue(cs, target_ref, create, ctx, stats, led, forwarded)
             .await
         {
             Ok(Some(answer)) => Settled::Answered(answer),
@@ -443,6 +596,7 @@ impl Repo {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn land_enqueue(
         &self,
         cs: ChangesetId,
@@ -451,6 +605,7 @@ impl Repo {
         ctx: RefUpdateContext,
         stats: &mut LandStats,
         led: bool,
+        forwarded: bool,
     ) -> Result<Option<Result<LandResponse>>> {
         refname::validate(target_ref)?;
         if refname::is_tag(target_ref) {
@@ -458,6 +613,11 @@ impl Repo {
                 "cannot land onto {target_ref:?}: tags are immutable"
             )));
         }
+        let queue = self.land_queues.queue(target_ref);
+        let admitted = match self.admit(&queue, cs, target_ref, &ctx, forwarded).await? {
+            Ok(admitted) => admitted,
+            Err(answer) => return Ok(Some(Ok(answer))),
+        };
         match self.get_changeset(cs).await {
             Ok(_) => {}
             // A keyed retry whose original was garbage collected (ADR 0059
@@ -472,20 +632,15 @@ impl Repo {
             Err(e) => return Err(e),
         }
         let (reply, answer) = oneshot::channel();
-        let queue = self.land_queues.queue(target_ref);
-        let start_leader = {
-            let mut q = lock(&queue);
-            q.pending.push_back(Queued {
-                repo: self.clone(),
-                cs,
-                create,
-                ctx,
-                queued: Instant::now(),
-                reply,
-                led,
-            });
-            !std::mem::replace(&mut q.leading, true)
-        };
+        let start_leader = admitted.enqueue(Queued {
+            repo: self.clone(),
+            cs,
+            create,
+            ctx,
+            queued: Instant::now(),
+            reply,
+            led,
+        });
         if start_leader {
             let task = tokio::spawn(lead(self.clone(), target_ref.to_string(), queue));
             self.land_queues.track(task.abort_handle());
@@ -503,10 +658,103 @@ impl Repo {
         Ok(Some(answer.result))
     }
 
+    /// Admit a land to `queue` (ADR 0060, section 2), holding its place
+    /// while it reads its changeset. A queue where it would wait behind
+    /// more than `--land-queue-batches` batches, its own included, refuses
+    /// it with [`Error::Refused`], having read nothing; a keyed land first
+    /// reads its id, and one the ref already recorded gets that answer (the
+    /// `Err` of the inner result) instead of a refusal. Queued lands are
+    /// never dropped to make room.
+    async fn admit<'a>(
+        &'a self,
+        queue: &Arc<Mutex<RefQueue>>,
+        cs: ChangesetId,
+        target_ref: &str,
+        ctx: &RefUpdateContext,
+        forwarded: bool,
+    ) -> Result<std::result::Result<Admitted<'a>, LandResponse>> {
+        let refused = {
+            let mut q = lock(queue);
+            // Refused when it would wait behind more than `bound` batches,
+            // its own included: a land that joins a batch still filling
+            // waits no longer than the lands already in it.
+            let ahead = q.batches();
+            match self.land_queue_batches {
+                Some(bound) if q.batches_with(1) > bound => {
+                    Some((ahead, bound, q.refused_retry_after_secs(bound)))
+                }
+                _ => {
+                    q.reserved += 1;
+                    self.land_queues.report(&mut q);
+                    None
+                }
+            }
+        };
+        let Some((ahead, bound, secs)) = refused else {
+            return Ok(Ok(Admitted {
+                queues: &self.land_queues,
+                queue: Arc::clone(queue),
+                held: true,
+            }));
+        };
+        // A resend whose first send landed and lost its answer would
+        // otherwise be refused while the queue stays full.
+        if ctx.land.is_some() {
+            match self.recorded_answer(cs, target_ref, ctx).await {
+                Ok(Some(answer)) => {
+                    metrics::counter!("leep_land_answered_from_record_total", "original" => "present")
+                        .increment(1);
+                    return Ok(Err(answer));
+                }
+                Ok(None) => {}
+                Err(e @ Error::LandIdReused { .. }) => return Err(e),
+                // Nothing was done either way: refusing is still true.
+                // A store error the refusal hides from the client.
+                Err(e) => {
+                    tracing::warn!(r#ref = target_ref, error = %e, "land id lookup failed at a full queue")
+                }
+            }
+        }
+        let route = if forwarded { "forwarded" } else { "direct" };
+        metrics::counter!("leep_land_admission_refused_total", "route" => route).increment(1);
+        tracing::debug!(
+            r#ref = target_ref,
+            batches = ahead,
+            retry_after = secs,
+            route,
+            "land refused: queue full"
+        );
+        Err(Error::Refused {
+            refused: REFUSED_ADMISSION,
+            retry_after_ms: secs * 1000,
+            message: format!(
+                "land not admitted: the land queue of {target_ref:?} holds {ahead} batches \
+                 (--land-queue-batches {bound}); nothing was done, send it again in {secs}s"
+            ),
+        })
+    }
+
     /// The result recorded for `ctx`'s land id, for a land whose changeset
     /// is not stored: `Ok(None)` without an id or a record, `Invalid` when
     /// the id landed another changeset. Moves nothing.
     async fn answer_from_record(
+        &self,
+        cs: ChangesetId,
+        target_ref: &str,
+        ctx: &RefUpdateContext,
+    ) -> Result<Option<LandResponse>> {
+        let answer = self.recorded_answer(cs, target_ref, ctx).await?;
+        if answer.is_some() {
+            metrics::counter!("leep_land_answered_from_record_total", "original" => "missing")
+                .increment(1);
+        }
+        Ok(answer)
+    }
+
+    /// What `target_ref` recorded for `ctx`'s land id, read with one
+    /// `find_lands`: `Ok(None)` without an id or a record, `LandIdReused`
+    /// when the id landed another changeset.
+    async fn recorded_answer(
         &self,
         cs: ChangesetId,
         target_ref: &str,
@@ -525,8 +773,6 @@ impl Repo {
         if record.changeset != cs {
             return Err(land_id_reused(&key.id, &record, cs));
         }
-        metrics::counter!("leep_land_answered_from_record_total", "original" => "missing")
-            .increment(1);
         Ok(Some(LandResponse::Landed {
             landed: record.landed,
             rebased: record.landed != cs,
@@ -1307,5 +1553,95 @@ impl Repo {
             }
         }
         Ok(Ok(onto))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn secs(s: f64) -> Duration {
+        Duration::from_secs_f64(s)
+    }
+
+    /// A queue with `waiting` lands and a batch replaying or not; the
+    /// waiting lands are counted as admitted places, which `batches` counts
+    /// like queued ones.
+    fn queue(waiting: usize, replaying: bool) -> RefQueue {
+        RefQueue {
+            reserved: waiting,
+            replaying,
+            ..RefQueue::default()
+        }
+    }
+
+    #[test]
+    fn batch_times_are_a_moving_average() {
+        let mut q = RefQueue::default();
+        assert_eq!(q.batch_secs, None);
+        q.record_batch(secs(2.0));
+        assert_eq!(q.batch_secs, Some(2.0), "the first batch is the average");
+        q.record_batch(secs(7.0));
+        assert!((q.batch_secs.unwrap() - 3.0).abs() < 1e-9, "2 + 0.2 * 5");
+        q.record_batch(secs(3.0));
+        assert!((q.batch_secs.unwrap() - 3.0).abs() < 1e-9);
+        for _ in 0..200 {
+            q.record_batch(secs(0.5));
+        }
+        assert!((q.batch_secs.unwrap() - 0.5).abs() < 1e-6, "converges");
+    }
+
+    #[test]
+    fn retry_after_is_batch_times_rounded_up_and_clamped() {
+        let mut q = RefQueue::default();
+        // Before any batch finished, a batch counts as 1 s.
+        assert_eq!(q.retry_after_secs(1), 1);
+        assert_eq!(q.retry_after_secs(3), 3);
+        assert_eq!(q.retry_after_secs(40), ADMISSION_RETRY_MAX_SECS);
+        q.record_batch(secs(2.5));
+        assert_eq!(q.retry_after_secs(1), 3);
+        assert_eq!(q.retry_after_secs(2), 5);
+        assert_eq!(q.retry_after_secs(5), ADMISSION_RETRY_MAX_SECS);
+        let mut fast = RefQueue::default();
+        fast.record_batch(secs(0.01));
+        assert_eq!(fast.retry_after_secs(3), ADMISSION_RETRY_MIN_SECS);
+        assert_eq!(fast.retry_after_secs(0), ADMISSION_RETRY_MIN_SECS);
+    }
+
+    /// A refused land waits for the next freed slot: `ahead + 1 - bound`
+    /// batch times, not all `ahead` of them.
+    #[test]
+    fn a_refusal_waits_for_the_next_freed_slot() {
+        // Bound 1, a batch replaying: one batch must finish.
+        let mut q = queue(0, true);
+        q.record_batch(secs(2.5));
+        assert_eq!(q.batches(), 1);
+        assert_eq!(q.refused_retry_after_secs(1), 3);
+        // Bound 2, a batch replaying and a full one waiting: still one.
+        let mut q = queue(MAX_BATCH, true);
+        q.record_batch(secs(2.5));
+        assert_eq!(q.batches(), 2);
+        assert_eq!(q.batches_with(1), 3, "refused at a bound of 2");
+        assert_eq!(q.refused_retry_after_secs(2), 3);
+        // The same queue at a bound of 1 (lowered meanwhile): two.
+        assert_eq!(q.refused_retry_after_secs(1), 5);
+        // Bound 1, no batch replaying and a full batch waiting: one.
+        let mut q = queue(MAX_BATCH, false);
+        q.record_batch(secs(4.0));
+        assert_eq!(q.batches_with(1), 2);
+        assert_eq!(q.refused_retry_after_secs(1), 4);
+        // Never more than the clamp.
+        let mut q = queue(3 * MAX_BATCH, true);
+        q.record_batch(secs(9.0));
+        assert_eq!(q.refused_retry_after_secs(1), ADMISSION_RETRY_MAX_SECS);
+    }
+
+    #[test]
+    fn a_land_joining_a_filling_batch_is_admitted() {
+        // At a bound of 2, a replaying batch and 63 waiting: the 64th fits.
+        let q = queue(MAX_BATCH - 1, true);
+        assert_eq!(q.batches_with(1), 2);
+        let q = queue(MAX_BATCH, true);
+        assert_eq!(q.batches_with(1), 3);
     }
 }

@@ -412,9 +412,31 @@ impl IntoResponse for ApiError {
             | Error::LandIdReused { .. } => StatusCode::BAD_REQUEST,
             Error::NotFound(_) => StatusCode::NOT_FOUND,
             Error::Conflict(_) => StatusCode::CONFLICT,
-            Error::Indexing { .. } => StatusCode::SERVICE_UNAVAILABLE,
+            Error::Indexing { .. } | Error::Refused { .. } => StatusCode::SERVICE_UNAVAILABLE,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
+        if let Error::Refused {
+            refused,
+            retry_after_ms,
+            message,
+        } = &self.0
+        {
+            // Refused before any work (ADR 0060): not a failure, so not
+            // logged as one, and `Leep-Refused` tells the client and any
+            // balancer that sending it again is safe.
+            let body = ErrorResponse::new(message.clone()).with_code(error_code::UNAVAILABLE);
+            let mut resp = (status, Json(body)).into_response();
+            let h = resp.headers_mut();
+            h.insert(
+                header::RETRY_AFTER,
+                HeaderValue::from(retry_after_ms.div_ceil(1000).max(1)),
+            );
+            h.insert(
+                leep_core::api::REFUSED_HEADER,
+                HeaderValue::from_static(refused),
+            );
+            return resp;
+        }
         if let Error::Indexing {
             kind,
             behind,

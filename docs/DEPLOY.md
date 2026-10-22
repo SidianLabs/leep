@@ -235,6 +235,17 @@ not count a `503` carrying `Leep-Refused` against the backend. Tuning, the
 metrics and the alert are in
 [OPERATIONS.md](OPERATIONS.md#expensive-read-limits).
 
+### Land admission
+
+Off by default (ADR 0060, section 2):
+
+| Flag / variable | Default | Meaning |
+|---|---|---|
+| `--land-queue-batches N\|off` / `LEEP_LAND_QUEUE_BATCHES` | `off` | Batches (of up to 64 lands) a land may wait behind in its ref's queue, its own included; one more is refused with `503`, `Retry-After` and `Leep-Refused: admission` before any work, and `leep land` sends it again. Start with `N` times a full batch's time under half the clients' timeout; `N = 1` is for tests only, since it collapses each batch to about one land. |
+
+Choosing `N`, the metrics and the alert are in
+[OPERATIONS.md](OPERATIONS.md#land-admission).
+
 Without a tokens file the rate and concurrency defaults apply per client IP
 address (IPv6 per /64). Behind a reverse proxy every request arrives from the
 proxy's address, so those limits become one bucket shared by everybody; use

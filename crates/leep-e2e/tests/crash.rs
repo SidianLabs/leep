@@ -64,11 +64,20 @@ struct Shared {
     /// Answers that were neither a success nor a plain "try again".
     odd: Mutex<Vec<String>>,
     retries: Mutex<u64>,
+    /// Lands the server did not admit because the queue was full (ADR
+    /// 0060), each sent again.
+    not_admitted: Mutex<u64>,
 }
 
 impl Shared {
     fn note_retry(&self, why: &str) {
         *self.retries.lock().unwrap() += 1;
+        // 503 with `Leep-Refused: admission`: nothing was done, so the
+        // land is sent again, with or without a land id.
+        if why.contains("land not admitted") {
+            *self.not_admitted.lock().unwrap() += 1;
+            return;
+        }
         // 408 (request timeout), 409 (GC in flight) and connection failures
         // are the expected ways a retry arises; anything else is recorded.
         let expected = [
@@ -545,6 +554,11 @@ fn plant_orphan(blobs_dir: &Path, data: &[u8]) {
 }
 
 fn run_crash_rounds(backend: &str, meta_url: Option<String>) {
+    run_crash_rounds_with(backend, meta_url, &[]);
+}
+
+/// [`run_crash_rounds`] with the server started with `extra` flags too.
+fn run_crash_rounds_with(backend: &str, meta_url: Option<String>, extra: &[&str]) -> u64 {
     let _g = serial();
     let seed = env_u64("LEEP_CRASH_SEED", DEFAULT_SEED);
     let rounds = env_u64("LEEP_CRASH_ROUNDS", 3);
@@ -557,16 +571,23 @@ fn run_crash_rounds(backend: &str, meta_url: Option<String>) {
         None => Stores::sqlite(&root.join("data")),
     };
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        crash_rounds(backend, seed, rounds, http_agents, root, &stores)
+        crash_rounds(backend, seed, rounds, http_agents, root, &stores, extra)
     }));
-    if let Err(e) = outcome {
-        eprintln!("crash test failed: backend {backend}, LEEP_CRASH_SEED={seed}, rounds {rounds}");
-        std::panic::resume_unwind(e);
-    }
+    let not_admitted = match outcome {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!(
+                "crash test failed: backend {backend}, LEEP_CRASH_SEED={seed}, rounds {rounds}, \
+                 flags {extra:?}"
+            );
+            std::panic::resume_unwind(e);
+        }
+    };
     eprintln!(
-        "[{backend}] {rounds} kills, seed {seed:#x}, {:.1}s",
+        "[{backend}] {rounds} kills, seed {seed:#x}, {not_admitted} lands not admitted, {:.1}s",
         started.elapsed().as_secs_f64()
     );
+    not_admitted
 }
 
 fn crash_rounds(
@@ -576,9 +597,11 @@ fn crash_rounds(
     http_agents: usize,
     root: &Path,
     stores: &Stores,
-) {
+    extra: &[&str],
+) -> u64 {
     let port = free_port();
-    let server_args = ["--request-timeout", REQUEST_TIMEOUT];
+    let mut server_args = vec!["--request-timeout", REQUEST_TIMEOUT];
+    server_args.extend_from_slice(extra);
     let mut server = Server::start_with(port, stores, root, &server_args);
     let client = Client::new(&server.url, &root.join("cache"));
     let addr = server.addr;
@@ -689,6 +712,8 @@ fn crash_rounds(
     verify_through_server(&tag, root, &client, &shared);
     verify_clean(&tag, stores, &["--full", "--rehash"]);
     drop(server);
+    let n = *shared.not_admitted.lock().unwrap();
+    n
 }
 
 /// After a killed collect: finish it, then every planted blob must be
@@ -840,6 +865,28 @@ fn killed_server_and_gc_lose_nothing_postgres() {
         return;
     };
     run_crash_rounds("postgres", Some(db.url.clone()));
+    drop(db);
+}
+
+/// ADR 0060, section 2: a bound of one batch, so the queue is full whenever
+/// a batch replays and agents are refused and resend (the HTTP agents
+/// without land ids). The server is killed with its queue full; every
+/// commit lands once, with one ref move per land.
+const FULL_QUEUE: &[&str] = &["--land-queue-batches", "1"];
+
+#[test]
+fn killed_server_with_a_full_land_queue_loses_nothing_sqlite() {
+    let refused = run_crash_rounds_with("sqlite, full queue", None, FULL_QUEUE);
+    assert!(refused > 0, "no land was refused: the queue never filled");
+}
+
+#[test]
+fn killed_server_with_a_full_land_queue_loses_nothing_postgres() {
+    let Some(db) = PgDb::create() else {
+        return;
+    };
+    let refused = run_crash_rounds_with("postgres, full queue", Some(db.url.clone()), FULL_QUEUE);
+    assert!(refused > 0, "no land was refused: the queue never filled");
     drop(db);
 }
 
