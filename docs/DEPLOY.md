@@ -9,8 +9,8 @@ the server refuses to listen on anything but a loopback address unless
 `0.0.0.0:7070`, so the local examples below set it and publish the port on the
 host's loopback only.
 
-The repo `Dockerfile` builds `leep-server`, `leep` and `leep-git` into one
-`debian:bookworm-slim` image. The entrypoint is `leep-server`; it runs as the
+The repo `Dockerfile` builds `leep-server`, `leep`, `leep-git` and `leep-mcp`
+into one `debian:bookworm-slim` image. The entrypoint is `leep-server`; it runs as the
 non-root user `leep` (uid 10001) and keeps state under `/var/lib/leep`.
 The image also carries `git` and the ssh client, so the same image can run
 the git mirror with `--entrypoint leep-git` and the arguments
@@ -75,6 +75,79 @@ so it depends only on the `postgres` image.
 The image has no `curl`, so it declares no `HEALTHCHECK`, and the compose
 file has no healthcheck for `leep-server`. Probe it from outside instead
 (see [Probes](#probes)).
+
+## Without Docker (binaries, Postgres, filesystem blobs)
+
+Build only the shipped binaries, as the `Dockerfile` does (a plain `cargo
+build --release` also builds the soak, benchmark and test tools a server does
+not need), then put them on the `PATH`:
+
+```sh
+cargo build --release --locked -p leep-server -p leep-cli -p leep-git -p leep-mcp
+sudo install -m 0755 target/release/leep-server target/release/leep \
+  target/release/leep-git target/release/leep-mcp /usr/local/bin/
+```
+
+Create a database and a role (Postgres 16; the server creates its tables on
+first start), and issue tokens before the first start so the server never runs
+open:
+
+```sh
+sudo -u postgres psql -c "CREATE USER leep PASSWORD 'change-me'" -c "CREATE DATABASE leep OWNER leep"
+
+umask 077
+leep-server gen-token --name alice --role write --author "Alice <alice@example.com>" > alice.out
+leep-server gen-token --name agent-1 --role write --no-review --expires-in 30d > agent-1.out
+echo "{\"tokens\":[$(sed -n 's/^entry: //p' alice.out),$(sed -n 's/^entry: //p' agent-1.out)]}" > tokens.json
+```
+
+Each `.out` file holds the token on its `token:` line; hand it to its user and
+delete the file. Move `tokens.json` to `/etc/leep/`, readable only by the
+account that runs `leep-server`, and give that account `/var/lib/leep`. Then
+start the server (under systemd or another supervisor
+in production) with explicit stores. Its defaults differ from the image's:
+it listens on `127.0.0.1:7070` and, without `LEEP_META`/`LEEP_BLOBS`, keeps
+SQLite and blobs in `./leep-data` relative to the directory it starts in.
+
+```sh
+export LEEP_META=postgres://leep:change-me@127.0.0.1:5432/leep
+export LEEP_BLOBS=file:///var/lib/leep/blobs
+export LEEP_TOKENS_FILE=/etc/leep/tokens.json
+export LEEP_METRICS_LISTEN=127.0.0.1:9187     # optional, see Monitoring below
+leep-server &                                  # listens on 127.0.0.1:7070
+curl -s localhost:7070/v1/ready                # {"status":"ready",...}
+```
+
+Every `leep-server` subcommand (`backup`, `restore`, `migrate`, `gc`, ...)
+and `leep-git import` read the same `LEEP_META` and `LEEP_BLOBS`, so keep them
+in one environment file. From a client:
+
+```sh
+export LEEP_SERVER=http://127.0.0.1:7070 LEEP_TOKEN=<alice's token>
+mkdir app && cd app && leep init
+echo hello > README.md && leep commit -m "first commit" && leep land && leep log
+```
+
+## Importing from git
+
+`leep-git import` copies a git repository's history into the stores directly
+(no server or token involved), so run it as the operator, with the server's
+`LEEP_META` and `LEEP_BLOBS`; the server may keep running.
+
+```sh
+leep-git import --git-dir /path/to/repo --rev main --set-ref main
+```
+
+`--git-dir` is a work tree, a `.git` directory or a bare repository; `--rev`
+defaults to `HEAD`. Without `--set-ref` the changesets are stored but no ref
+points at them. `--set-ref` only fast-forwards, so import into a fresh
+repository (before anyone lands on `main`) or into a new ref name; a ref that
+already holds other history is refused (`refusing non-fast-forward`). Run it
+again after new git commits: commits already imported are skipped. Policies
+(`--protect-ref`, signatures, review) do not apply to it. For a long history,
+see
+[OPERATIONS.md](OPERATIONS.md#indexing-a-large-history); to keep a git remote
+in step continuously, use the [git mirror](OPERATIONS.md#git-mirror).
 
 ## Probes
 
@@ -359,7 +432,7 @@ Send SIGHUP to the server to re-read the tokens file, the signing keys file and
 the review policy file without a restart (ADR 0024):
 
 ```sh
-kill -HUP "$(pidof leep-server)"        # a host
+pkill -HUP -x leep-server               # a host (every leep-server on it)
 docker kill --signal=HUP leep           # a container
 docker compose kill -s HUP leep-server  # compose
 ```
@@ -456,8 +529,8 @@ a reload is refused.
 `leep-server migrate [--dry-run|--status]` applies or previews metadata schema
 migrations (`--meta` or `LEEP_META`); see [Upgrades](#upgrades).
 
-`--cache-bytes` and `--max-body-bytes` are flags only; pass them after the
-image name, e.g. `docker run leep:dev --cache-bytes 0`.
+`--cache-bytes` is a flag only; pass it after the image name, e.g.
+`docker run leep:dev --cache-bytes 0`.
 
 ## Persistence and backup
 
@@ -554,6 +627,14 @@ load the rules from [OPERATIONS.md](OPERATIONS.md#suggested-alerts) into
 Prometheus. Every rule has a `runbook_url` pointing at its section of
 [RUNBOOKS.md](RUNBOOKS.md): what fired, the impact, how to diagnose, the likely
 causes and the safe fix. Set the base URL in the rules to wherever you publish
-that file. `GET /v1/health` only says the process is serving HTTP; it does not
+that file. The rules live only in that document; to extract and check them:
+
+```sh
+awk '/^### Suggested alerts/{f=1} f&&/^```yaml/{p=1;next} p&&/^```/{exit} p' \
+  docs/OPERATIONS.md > leep-rules.yml
+promtool check rules leep-rules.yml
+```
+
+`GET /v1/health` only says the process is serving HTTP; it does not
 check the stores. `GET /v1/ready` does (see [Probes](#probes)). Alert on the
 metrics, not on a probe alone.
