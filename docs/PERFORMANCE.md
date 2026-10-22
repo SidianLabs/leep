@@ -1074,6 +1074,133 @@ growth per land):
   above and `skiplist` hold most of the store, against 92 MB reclaimable
   by changeset GC.
 
+#### Search admission and cheaper search (E5)
+
+The swarm rerun of [ADR 0060](adr/0060-land-admission-and-read-limits.md),
+"Testing": E1's reads arm again, now with the search class (#134) and the
+early stop and directory filter cache (#135). Release build of `main` at
+`718a96a`, with the server and `leep-swarm` built from it. Same two-core VPS,
+Linux store, server flags and generator settings as E1: one server with
+`--indexing local`, `--meta-pool-size 32`, warmer every 250 ms, and a fresh
+server and a fresh ref at Linux's `master` per run. The generator ran with
+2 s think time, 120 s measured after a 30 s ramp, the default read mix, land
+ids on and `--database-url`. There were three rounds per arm and agent
+count, with the arm order rotated each round.
+
+- **A**, the default: `--read-concurrency search=1` (half of two cores) and
+  `--search-pool-permits 8` (a quarter of the pool).
+- **B**, limits off: `--read-concurrency search=off --search-pool-permits
+  off`. It has #135 but no admission, so against E1's reads arm it shows
+  what #135 gives alone.
+- **C**, no searches: the read mix without `search`, as in E1's no-search
+  arm. This is the ceiling for this build.
+- **D**, `--read-concurrency search=2`.
+
+Server and Postgres CPU come from the containers' cgroup `cpu.stat`. Search
+counts and times on the server come from `/metrics`, sampled every 5 s. Ref
+reads come from a probe that read the run's ref once a second. All three
+are taken over the generator's measured window. The window was located by
+the generator's database-size queries in `pg_stat_activity`, which bound it.
+This sampler worked from round 2 on (and for D at 2,000 in round 1), so the
+server-side columns are from two rounds. Everything else, including
+lands/s, is from all three rounds. `leep-swarm` sends a shed search once
+and does not retry it, so shed counts are requests, not abandoned searches.
+
+Medians of three rounds (range). E1's shared-runtime arms are repeated for
+comparison:
+
+| Agents | Arm | Lands/s | Land p50 / p99 | Searches done / shed / timed out | Search p50 / p99 (done) | Server time per search | Ref read p50 / p99 | Server / Postgres CPU (cores) |
+|---|---|---|---|---|---|---|---|---|
+| 500 | E1 reads | 3.1 (2.4–3.6) | 57.6 s / – | 30 / – / 341 ¹ | 20.6 s / 29.7 s ¹ | – | – | – |
+| 500 | E1 no search | 30.4 (29.5–31.0) | 3.9 s / – | – | – | – | – | – |
+| 500 | A, `search=1` | 21.3 (17.2–21.4) | 10.9 s (10.4–15.5) / 19.3 s | 19 / 990 / 1 | 4.7 s / 19.1 s | 7.0–8.0 s | 23 ms / 103–109 ms | 0.85–0.88 / 0.65–0.66 |
+| 500 | B, off | 2.4 (2.2–2.8) | 74 s (59–88) / 255 s | 87 / 0 / 268 | 19.4 s / 29.5 s | 18–20 s | 98–129 ms / 228–467 ms | 0.83 / 0.95–0.97 |
+| 500 | C, no search | 25.7 (24.6–27.7) | 6.5 s (5.3–7.8) / 13.1 s | – | – | – | 17–18 ms / 80–102 ms | 0.85–0.86 / 0.60 |
+| 500 | D, `search=2` | 16.1 (14.5–17.7) | 16.7 s (14.7–21.1) / 21.0 s | 31 / 754 / 1 | 6.0 s / 15.7 s | 7.5–7.6 s | 29 ms / 122–128 ms | 0.86 / 0.71 |
+| 2,000 | E1 reads | 1.6 (1.5–2.9) | 79.1 s / – | – | – | – | – | – |
+| 2,000 | E1 no search | 18.8 (17.8–19.0) | 28.2 s / – | – | – | – | – | – |
+| 2,000 | A, `search=1` | 11.8 (11.6–12.2) | 53 s (29–60) / 206 s | 28 / 632 / 1 | 3.5 s / 11.0 s | 4.1–4.8 s | 25–28 ms / 121–124 ms | 0.92–0.95 / 0.59 |
+| 2,000 | B, off | 2.0 (1.7–3.3) | 114 s (114–119) / 210 s | 67 / 0 / 853 | 16.2 s / 29.9 s | 14–17 s | 91–127 ms / 413–445 ms | 0.80 / 0.83–0.91 |
+| 2,000 | C, no search | 15.9 (14.7–16.0) | 30 s (28–52) / 232 s | – | – | – | 21–25 ms / 108–204 ms | 0.99–1.02 / 0.42–0.46 |
+| 2,000 | D, `search=2` | 9.3 (8.6–9.5) | 78 s (51–79) / 202 s | 43 / 467 / 2 | 4.0 s / 13.1 s | 4.5–5.7 s | 29–38 ms / 103–136 ms | 0.90–0.99 / 0.64–0.67 |
+
+¹ E1's first round only (the others were not tabulated).
+
+"Done" and "shed" count inside the window. Timeouts are the generator's
+whole-run count at its 30 s client timeout. Server time per search is
+`leep_search_duration_seconds` sum over count in the window. Searches shed
+inside the window (`leep_read_class_shed_total`): 807–1,053 at 500 agents
+and 613–639 at 2,000 for A, and 714–812 and 486–500 for D. Mean
+`leep_land_lock_wait_seconds` in the window: at 500 agents A 7.6–12.0 s,
+B 27.0–27.5 s, C 4.0–5.4 s, D 13.0–17.0 s; at 2,000 agents 27.7 to 30.2 s
+in every arm. No run had a double or lost land: 24 runs, 0 / 0, through
+up to 15,300 resends per run.
+
+- **The ADR's criterion is met at both agent counts.** Measured against E1,
+  A closes 67% of the gap between the reads and no-search arms at 500
+  agents ((21.3 − 3.1) / (30.4 − 3.1)), and 52% in its lowest round. At
+  2,000 agents it closes 59% ((11.8 − 1.6) / (18.8 − 1.6)), 58 to 62% by
+  round. Against this run's own B and C, A closes 81% and 70%.
+- **One permit is right on two cores; two is too many.** D completes about
+  twice the searches of A (31 against 19 at 500 agents, 43 against 28 at
+  2,000), but lands 24% and 21% less often. D closes 48% and 45% of the E1
+  gap, which fails the criterion at both counts. `max(1, cores / 2)` stays
+  the right default on this host. The data cannot say whether a larger
+  host wants more or less than half its cores.
+- **#135 alone gives no land throughput here.** B lands 2.4 and 2.0 times
+  a second against E1's 3.1 and 1.6, inside E1's ranges. It does finish
+  more searches (46 to 91 per window, against 30 in the E1 round above),
+  but most still time out. Whatever #135 saves per search, without
+  admission the swarm's offered rate still saturates the host.
+- **In B the queue is in Postgres, not the server's CPU.** Server CPU is
+  0.8 to 1.0 cores in every arm, and B uses no more of it than A or C. What
+  changes is Postgres CPU (0.83 to 0.97 cores in B against 0.42 to 0.71
+  elsewhere) and ref reads, at 91 to 129 ms p50 in B against 17 to 38 ms
+  elsewhere. That is the pool starvation that
+  [research/search-cost.md](research/search-cost.md) measured beside 64
+  searches. That this is what holds B's lands back is an inference. The
+  arms do not separate `--search-pool-permits` from the class limit.
+- **An admitted search still costs seconds, not the research's 0.45 s.**
+  A's single permit was busy for the whole window (summed search time is
+  93 to 107% of it, since searches straddle its edges), at 7.0 to 8.0 s per search at 500 agents and 4.1 to
+  4.8 s at 2,000. One 60 s sample of A at 2,000 agents had 13 searches.
+  Over those 60 s the server derived 1,552 `blob-trigrams-v1` and 993
+  `tree-trigrams-v1` rows (`leep_derive_total`), of which the warmer
+  derived 35 tree rows (`leep_index_derived_total`). *Inference:* under
+  `--indexing local` each search lands on a head a few seconds newer than
+  the indexed one, and derives the trigram rows of the files landed since.
+  On a ref that moves 10 to 20 times a second, that derivation, not the
+  probe that #135 made cheaper, is most of a search. The same sample put
+  `skiplist` derivation at 18.7 s per 60 s, about a third of a core.
+- **Admitted search latency is acceptable; most searches are refused.**
+  Searches that ran answered in 3.5 to 6.0 s p50 and 11 to 19 s p99, against
+  21 s p50 in the E1 round above, where most timed out. But A sheds 96 to
+  98% of the swarm's search requests. That is the design: 5 to 8 searches a
+  second are offered, and one permit serves 0.14 to 0.22. `LeepReadsShedding`
+  (half shed for 15 minutes) would fire through this whole workload, which
+  is what the alert is for.
+- **At 2,000 agents the land queue is the next limit.** Lands wait 28 to
+  30 s for the lock in every arm, including C without searches, against
+  the client's 30 s timeout. 10,300 to 15,300 lands per run are resent.
+  This is what ADR 0060's section 2 (admission per ref) addresses. It
+  confirms E3's inference that most sends time out queued.
+- **Other reads.** Log, diff and file reads stay fast in A, C and D (log
+  p50 39 to 78 ms, diff 24 to 71 ms, files 11 to 30 ms) and slow in B (log
+  195 to 316 ms, diff 149 to 256 ms). Blame ran 4 to 64 times per run
+  (most blames are on files the run had not created yet and answer 404),
+  at 0.3 to 0.9 s p50 outside B. Nothing here asks for a default for the
+  `blame`, `log_filtered` or `diff_large` classes yet.
+- **C is lower than E1's no-search arm** (25.7 against 30.4 at 500 agents,
+  15.9 against 18.8 at 2,000). The build, the store (now with more
+  history) and this run's samplers differ. Which of them it is was not
+  measured.
+- **Run cost.** With `--database-url` the generator sums the sizes of
+  `changesets` and `derived` before and after the window. On this 13 GB
+  store that takes minutes and reads from disk while agents are already
+  running, so each run takes about 7 minutes. E1 did the same, so lands/s
+  are comparable. Runs that do not need bytes per land can leave out
+  `--database-url`.
+
 ## Real history: git/git
 
 The benchmarks above use synthetic, mostly linear histories. `git/git` is real
