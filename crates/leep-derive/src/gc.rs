@@ -491,9 +491,9 @@ pub struct GcOptions {
     pub unsafe_no_fence: bool,
     /// Report what would be condemned or deleted without writing anything.
     pub dry_run: bool,
-    /// With a full mark: also keep the trees of changesets the changeset
-    /// sweep deleted within this long, for backups that snapshotted them
-    /// (ADR 0059 section 6). `None` keeps none; `leep-server gc --full`
+    /// Also keep the trees of changesets the changeset sweep deleted within
+    /// this long, for backups that snapshotted them (ADR 0059 section 6),
+    /// with either mark. `None` keeps none; `leep-server gc --full`
     /// requires it.
     pub backup_fence: Option<Duration>,
 }
@@ -829,7 +829,8 @@ async fn mark(
         if walked.contains(root) {
             continue;
         }
-        match walk_tree(repo, *root, false, &mut walked, &mut quiet).await {
+        // Stopping at marked nodes is safe: a marked node is kept anyway.
+        match walk_tree(repo, *root, trust, &mut walked, &mut quiet).await {
             Ok(()) => {}
             // Already gone (an earlier full collect, before this tombstone's
             // fence was set): nothing of it is left to keep.
@@ -844,17 +845,14 @@ async fn mark(
 }
 
 /// Root trees a full mark keeps besides those of stored changesets.
-async fn backup_roots(
-    repo: &Repo,
-    opts: &GcOptions,
-    mode: Mark,
-    started_at: i64,
-) -> Result<Vec<Hash>> {
-    match (mode, opts.backup_fence) {
-        (Mark::Full, Some(f)) => {
+async fn backup_roots(repo: &Repo, opts: &GcOptions, started_at: i64) -> Result<Vec<Hash>> {
+    // Both marks: an incremental one trusts its rows, but the trees of a
+    // changeset no blob GC ever marked have none.
+    match opts.backup_fence {
+        Some(f) => {
             crate::changeset_sweep::tombstoned_roots(repo, started_at.saturating_sub(secs(f))).await
         }
-        _ => Ok(Vec::new()),
+        None => Ok(Vec::new()),
     }
 }
 
@@ -995,7 +993,7 @@ async fn condemn_leased(
     let mut report = CondemnReport::default();
     let started_at = clock.now();
     let mut stats = MarkStats::default();
-    let extra = backup_roots(repo, opts, mode, started_at).await?;
+    let extra = backup_roots(repo, opts, started_at).await?;
     let marked = mark(repo, mode, !opts.dry_run, &mut stats, &extra).await?;
     report.changesets_scanned = stats.changesets_scanned;
     report.changesets_walked = stats.changesets_walked;
@@ -1088,7 +1086,7 @@ async fn collect_leased(
     let started_at = clock.now();
     let eligible_before = started_at.saturating_sub(secs(opts.fence));
     let mut stats = MarkStats::default();
-    let extra = backup_roots(repo, opts, mode, started_at).await?;
+    let extra = backup_roots(repo, opts, started_at).await?;
     let marked = mark(repo, mode, !opts.dry_run, &mut stats, &extra).await?;
     report.changesets_scanned = stats.changesets_scanned;
     report.changesets_walked = stats.changesets_walked;

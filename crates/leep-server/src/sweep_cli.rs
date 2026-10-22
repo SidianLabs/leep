@@ -350,6 +350,23 @@ fn write_metrics(
     std::fs::rename(&tmp, path)
 }
 
+/// Refuse a backup fence longer than the sweep keeps tombstones: the root
+/// trees of changesets deleted before the retention are no longer known,
+/// so no gc could keep them that long.
+pub fn check_backup_fence(fence: Duration, tombstone_retention: Duration) -> anyhow::Result<()> {
+    if fence > tombstone_retention {
+        anyhow::bail!(
+            "--backup-fence {}s exceeds --tombstone-retention {}s: tombstones of deleted \
+             changesets are dropped after the retention, so their trees cannot be kept that \
+             long; raise --tombstone-retention (on the sweep's collect as well) or lower the \
+             backup fence",
+            fence.as_secs(),
+            tombstone_retention.as_secs()
+        );
+    }
+    Ok(())
+}
+
 /// `--backup-fence` from sealed backups (ADR 0059 section 6): three times
 /// the longest backup of the last 30 days (sealed minus snapshot time), at
 /// least one hour. `Err` when `dir` holds no sealed backup that recent.

@@ -371,13 +371,13 @@ enum Cmd {
         /// --backups or --backup-fence (ADR 0059 section 6).
         #[arg(long, global = true)]
         full: bool,
-        /// With --full: keep the trees of changesets the changeset sweep
-        /// deleted within this long, for backups still copying them.
+        /// Keep the trees of changesets the changeset sweep deleted within
+        /// this long, for backups still copying them (required with --full;
+        /// at most --tombstone-retention).
         #[arg(long, global = true, value_parser = parse_grace)]
         backup_fence: Option<std::time::Duration>,
-        /// With --full: derive --backup-fence from the sealed backups in this
-        /// directory: three times the longest of the last 30 days, at least
-        /// an hour.
+        /// Derive --backup-fence from the sealed backups in this directory:
+        /// three times the longest of the last 30 days, at least an hour.
         #[arg(long, global = true, conflicts_with = "backup_fence")]
         backups: Option<std::path::PathBuf>,
         /// Garbage-collect changesets nothing reaches (ADR 0059): refs, every
@@ -414,9 +414,10 @@ enum Cmd {
         /// writes in flight (ADR 0058).
         #[arg(long, default_value = "60s", value_parser = parse_grace, requires = "unreachable")]
         index_fence: std::time::Duration,
-        /// With --unreachable: how long tombstones of deleted changesets are
-        /// kept. `gc --full --backup-fence` must not exceed it.
-        #[arg(long, default_value = "7d", value_parser = parse_grace, requires = "unreachable")]
+        /// How long the sweep keeps tombstones of deleted changesets (with
+        /// --unreachable), and the longest --backup-fence any gc accepts:
+        /// past it, the root trees a backup needs are no longer known.
+        #[arg(long, default_value = "7d", value_parser = parse_grace)]
         tombstone_retention: std::time::Duration,
         /// With --unreachable: write the run's numbers to this Prometheus
         /// textfile (atomically).
@@ -1285,6 +1286,7 @@ async fn main() -> anyhow::Result<()> {
             full,
             backup_fence,
             backups,
+            tombstone_retention,
             ..
         }) => {
             let mark = if full {
@@ -1313,9 +1315,8 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             let backup_fence = match (full, backup_fence, backups) {
-                (false, _, _) => None,
-                (true, Some(f), _) => Some(f),
-                (true, None, Some(dir)) => {
+                (_, Some(f), _) => Some(f),
+                (_, None, Some(dir)) => {
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map_or(0, |d| d.as_secs() as i64);
@@ -1323,12 +1324,16 @@ async fn main() -> anyhow::Result<()> {
                     tracing::info!(backup_fence = ?f, "backup fence from sealed backups");
                     Some(f)
                 }
+                (false, None, None) => None,
                 (true, None, None) if dry_run => None,
                 (true, None, None) => anyhow::bail!(
                     "gc --full frees the trees of deleted changesets, which a backup in flight \
                      may still need: pass --backups DIR or --backup-fence (ADR 0059 section 6)"
                 ),
             };
+            if let Some(f) = backup_fence {
+                sweep_cli::check_backup_fence(f, tombstone_retention)?;
+            }
             return run_gc(
                 &args.meta,
                 &args.blobs,

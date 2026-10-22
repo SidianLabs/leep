@@ -850,3 +850,48 @@ async fn reposting_a_condemned_changeset_rescues_it() {
     assert!(stored(&w, x).await, "re-posted changeset deleted: {r:?}");
     w.clean.get_changeset(x).await.unwrap();
 }
+
+/// Review item 4: the backup fence held only for `gc --full`. An
+/// incremental blob GC trusts its mark rows, but the trees of a changeset
+/// that no blob GC ever marked have none, so once the sweep deleted it an
+/// incremental collect freed them under a backup in flight. With a backup
+/// fence, both marks keep them.
+#[tokio::test(start_paused = true)]
+async fn incremental_gc_keeps_trees_of_changesets_deleted_within_the_backup_fence() {
+    use crate::gc::{self, GcOptions, Mark};
+    let w = World::new(11);
+    let base = commit_file(11, &w.clean, None, "base.txt", "b\n", "base").await;
+    w.meta.cas_ref("main", None, Some(base)).await.unwrap();
+    let gone = commit_file(11, &w.clean, Some(base), "only/here.txt", "unique\n", "g").await;
+    let root = w.clean.root_tree(gone).await.unwrap();
+    let t = later();
+    assert_eq!(sweep(&w.clean, &opts(), t).await.deleted, 1);
+    age_all(&w.blobs).await;
+    let o = GcOptions {
+        grace: Duration::from_secs(3600),
+        fence: Duration::from_secs(600),
+        backup_fence: Some(Duration::from_secs(DAY as u64)),
+        ..GcOptions::default()
+    };
+    gc::condemn_with(&w.clean, &o, Mark::Incremental, &TestClock::at(t + 3600))
+        .await
+        .unwrap();
+    gc::collect_with(&w.clean, &o, Mark::Incremental, &TestClock::at(t + 7200))
+        .await
+        .unwrap();
+    assert!(
+        w.blobs.contains(&root).await.unwrap(),
+        "freed within the backup fence"
+    );
+    let late = t + 3 * DAY;
+    gc::condemn_with(&w.clean, &o, Mark::Incremental, &TestClock::at(late))
+        .await
+        .unwrap();
+    gc::collect_with(&w.clean, &o, Mark::Incremental, &TestClock::at(late + 3600))
+        .await
+        .unwrap();
+    assert!(
+        !w.blobs.contains(&root).await.unwrap(),
+        "freed past the fence"
+    );
+}

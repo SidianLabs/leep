@@ -1922,12 +1922,16 @@ condemns, waits `--fence` and collects.
   Never deleted: ref log entries, signatures, reviews, mirror maps, and
   content-keyed index rows. `blame` rows of deleted changesets leak; each
   collect prints an estimate, and `repair drop --kind blame` clears them.
-- **Tree nodes and contents** of deleted changesets are freed only by
-  `leep-server gc --full`. It now needs `--backups DIR` (it derives the
-  fence from your sealed backups: three times the longest of the last 30
-  days, at least an hour) or `--backup-fence`, and keeps the trees of
-  changesets deleted within it, for a backup still copying them. Keep
-  `--backup-fence` within `--tombstone-retention`.
+- **Tree nodes and contents** of deleted changesets are freed by blob GC.
+  - `gc --full` frees all of them. It needs `--backups DIR` (it derives
+    the fence from your sealed backups: three times the longest of the
+    last 30 days, at least an hour) or `--backup-fence`.
+  - An incremental `gc` frees those no earlier mark recorded.
+  - Give every blob GC the backup fence. Either mark then keeps the trees
+    of changesets deleted within it, for a backup still copying them.
+  - `gc` refuses a `--backup-fence` longer than `--tombstone-retention`
+    (default 7d): tombstones are dropped after the retention. Give both
+    jobs the same retention.
 - **Reading a deleted changeset** answers 404. A rebased copy still names
   its deleted original as `via`, and a keyed land retry is answered from
   its record. A client that still has a deleted changeset's body can store

@@ -616,7 +616,7 @@ it until an operator schedules it.
 | Their per-changeset rows: `root_tree`, `generation`, `skiplist`, `last_merge-v1`, `gc-mark-v1`, `rebased-origin-v1` (of an unreachable copy), `history-tree-v4`, `log-filter-v1` | in the same transaction |
 | Late per-changeset rows written after the delete, and the deleted ids' `cs-condemned-v1` and `cs-rescue-v1` | the tombstone pass (`MetaStore::delete_derived_keys`), after `--index-fence` |
 | `cs-tombstone-v1` and `cs-doom-v1` of deleted ids | the tombstone pass, past `--tombstone-retention` (7 days) |
-| Tree nodes and contents only deleted changesets used | only `gc --full`, which keeps those of changesets deleted within `--backup-fence` |
+| Tree nodes and contents only deleted changesets used | blob GC: `gc --full` frees all of them, an incremental `gc` those no mark recorded. Either mark keeps the trees of changesets deleted within `--backup-fence`, which may not exceed `--tombstone-retention` (amended in review) |
 | Ref log entries | **nothing.** Retention stays a follow-up ADR, which must keep keyed lands answerable |
 
 Not deleted: signatures, reviews and mirror maps (their changesets are
