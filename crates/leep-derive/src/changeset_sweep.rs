@@ -322,13 +322,17 @@ async fn condemn_leased(
         repo.meta().put_derived_many(&rows).await?;
         report.condemned += rows.len() as u64;
     }
-    // The flag records when the latest condemnation was written: collect
-    // refuses to start until a fence after it.
-    let end = clock
-        .now()
-        .max(flag.filter(|t| *t != i64::MAX).unwrap_or(0));
+    // The flag records when this condemn finished, after its last row:
+    // collect refuses to start until a fence after it. Not the maximum
+    // with the value read before: that read may be damaged, and a damaged
+    // future time would hold collect off for good. Each row carries its
+    // own write time, which is what the fence is measured from.
     repo.meta()
-        .put_derived(GC_FENCE_ACTIVE, &fence_flag_key(), time_value(end.max(1)))
+        .put_derived(
+            GC_FENCE_ACTIVE,
+            &fence_flag_key(),
+            time_value(clock.now().max(1)),
+        )
         .await?;
     metrics::counter!("leep_gc_changesets_condemned_total").increment(report.condemned);
     Ok(report)

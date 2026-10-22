@@ -895,3 +895,27 @@ async fn incremental_gc_keeps_trees_of_changesets_deleted_within_the_backup_fenc
         "freed past the fence"
     );
 }
+
+/// A damaged flag value (a far-future time) must not hold collect off for
+/// good: the next condemn writes its own end time, not the maximum with
+/// what it read. Found by the 300-seed sweep, where damaged reads are
+/// injected.
+#[tokio::test(start_paused = true)]
+async fn a_damaged_fence_flag_does_not_block_collect_for_good() {
+    let w = World::new(12);
+    let base = commit_file(12, &w.clean, None, "base.txt", "b\n", "base").await;
+    w.meta.cas_ref("main", None, Some(base)).await.unwrap();
+    let x = commit_file(12, &w.clean, Some(base), "x", "x\n", "x").await;
+    let t = later();
+    w.meta
+        .put_derived(
+            GC_FENCE_ACTIVE,
+            &crate::changeset_gc::fence_flag_key(),
+            Bytes::copy_from_slice(&(t + 100 * DAY).to_be_bytes()),
+        )
+        .await
+        .unwrap();
+    let r = sweep(&w.clean, &opts(), t).await;
+    assert_eq!(r.deleted, 1, "{r:?}");
+    assert!(!stored(&w, x).await);
+}
