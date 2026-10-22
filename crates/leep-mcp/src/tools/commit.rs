@@ -622,6 +622,11 @@ fn differing_paths(
 /// A failed land, with how to finish it safely when it may have applied: the
 /// server's timeout can cancel a land after it moved the ref.
 fn land_error(e: CliError, changeset: ChangesetId) -> ToolError {
+    // Not admitted (ADR 0060): nothing was queued, so the land certainly
+    // did not apply; the agent calls again after `retry_after`.
+    if e.refused().is_some() {
+        return e.into();
+    }
     match e.kind() {
         ErrorKind::Timeout | ErrorKind::Unreachable | ErrorKind::Server => ToolError(format!(
             "{}. The land of changeset {changeset} may have applied. Call \
