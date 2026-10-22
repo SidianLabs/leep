@@ -402,8 +402,10 @@ impl Config {
             if !p.ends_with('/') || p.starts_with('/') {
                 bail!("--ref-prefix {p}: must be a relative prefix ending in '/', such as review/");
             }
-            leep_core::refname::validate(p.trim_end_matches('/'))
-                .map_err(|e| anyhow!("--ref-prefix {p}: {e}"))?;
+            // Only the one trailing '/' is the prefix's own: `review//`
+            // leaves `review/`, which is no ref name.
+            let stem = p.strip_suffix('/').unwrap_or(p);
+            leep_core::refname::validate(stem).map_err(|e| anyhow!("--ref-prefix {p}: {e}"))?;
             if p.starts_with("tags/") {
                 bail!("--ref-prefix {p}: tags are never mirrored under a prefix");
             }
@@ -456,6 +458,9 @@ struct Tracked {
     pushed: Option<ObjectId>,
     /// Dropped from tracking at the end of the cycle.
     forget: bool,
+    /// Why the remote branch's name is no Leep ref name, for a branch under
+    /// a prefix that no Leep ref can own.
+    bad_name: Option<String>,
     /// The last automatic merge that fell back to a report, so the same
     /// pair is not merged again every cycle.
     merge_memo: Option<MergeMemo>,
@@ -486,6 +491,7 @@ impl Tracked {
             prefix: None,
             pushed: None,
             forget: false,
+            bad_name: None,
             merge_memo: None,
         }
     }
@@ -844,7 +850,11 @@ impl<'a> Mirror<'a> {
             };
             if !self.refs.iter().any(|r| &r.spec.git == name) {
                 let leep = name.trim_start_matches("refs/heads/");
-                self.refs.push(Tracked::discovered(leep, p));
+                let mut t = Tracked::discovered(leep, p);
+                t.bad_name = leep_core::refname::validate(leep)
+                    .err()
+                    .map(|e| e.to_string());
+                self.refs.push(t);
             }
         }
         for r in &mut self.refs {
@@ -870,6 +880,9 @@ impl<'a> Mirror<'a> {
     }
 
     fn sync_ref(&mut self, i: usize) -> Result<()> {
+        if let Some(why) = self.refs[i].bad_name.clone() {
+            return self.bad_name(i, &why);
+        }
         if self.refs[i].leep.is_none() && self.refs[i].prefix.is_some() {
             return self.retire(i);
         }
@@ -1181,6 +1194,29 @@ impl<'a> Mirror<'a> {
                 backoff(r, max);
             }
         }
+        Ok(())
+    }
+
+    /// A branch under a prefix whose name Leep rejects: no Leep ref can hold
+    /// it, so asking the server about it would fail every cycle. Report it
+    /// once and leave it to a person.
+    fn bad_name(&mut self, i: usize, why: &str) -> Result<()> {
+        if self.refs[i].remote.is_none() {
+            self.forget(i);
+            return Ok(());
+        }
+        let r = &mut self.refs[i];
+        mark_pending(r);
+        let prefix = r.prefix.clone().unwrap_or_default();
+        set_state(
+            r,
+            RefState::RemoteAhead,
+            format!(
+                "{} is under --ref-prefix {prefix} but no Leep ref can have its name ({why}); \
+                 the mirror never pushes, imports or deletes it. Rename or delete it by hand",
+                r.spec.git
+            ),
+        );
         Ok(())
     }
 
@@ -1659,6 +1695,8 @@ mod tests {
         assert!(with(&["review/", "release/"]).is_ok());
         assert!(with(&[""]).is_err(), "empty");
         assert!(with(&["/"]).is_err(), "slash");
+        assert!(with(&["review//"]).is_err(), "empty component");
+        assert!(with(&["review//x/"]).is_err(), "empty component inside");
         assert!(with(&["review"]).is_err(), "no trailing slash");
         assert!(with(&["/review/"]).is_err(), "absolute");
         assert!(with(&["re view/"]).is_err(), "not a ref name");

@@ -771,7 +771,8 @@ agent's land ([ADR 0049](adr/0049-mirror-merges-and-land-branches.md)). With
 `--ref-prefix review/`, every Leep ref under `review/` is pushed to the
 branch of the same name as it appears, and its branch is deleted when the
 Leep ref is ([ADR 0061](adr/0061-mirror-ref-prefixes.md)). It never resolves
-a conflict itself and never force-pushes a mirrored branch.
+a conflict itself. The only branches it force-pushes are those of prefix
+refs, and only with a lease on a tip the Leep ref held.
 
 The mirror is a separate process. It talks to `leep-server` over the HTTP
 API with a token, and to the remote with the system `git` (2.30 or later).
@@ -1068,21 +1069,42 @@ need git credentials: they land in Leep and the mirror pushes.
    the sections of the `commit-and-pr` skill. CI runs on it.
 4. Answer review comments by landing more commits on the review ref. A
    newer push cancels the PR's older CI run.
-5. When CI is green, squash and land on `leep-main`. The stack's base is
-   the newest `leep-main` changeset in the review ref's history.
-   - Check explicitly that it is the current head of `leep-main`:
-     ```sh
-     head=$(leep --json log -n 1 leep-main | jq -r '.entries[0].id')
-     leep log --oneline -n 200 review/<area>-<desc> | grep -q "^${head:0:12} "
-     ```
-   - If it is: `leep reset leep-main`, then `leep commit -m "<PR title>"`,
-     then `leep land --ref leep-main`.
-   - If it is not: `leep merge leep-main`, resolve and commit, `leep land`
-     on the review ref, wait for CI to pass again, then check and squash.
-   - `leep reset` without `--hard` keeps the working files. On a stale base
-     the squashed changeset would hold the old base's files and silently
-     revert everything landed on `leep-main` since. That is why the check
-     is explicit.
+5. When CI is green, squash and land on `leep-main`. Stop at the first
+   command that fails:
+   ```sh
+   x=review/<area>-<desc>
+   leep switch "$x"        # the review ref's tip, not whatever is on disk
+   leep --json status | jq -e '.changes == [] and .merging == null and .picking == null'
+   head=$(leep --json log -n 1 leep-main | jq -r '.entries[0].id')
+   leep --json log -n 1000 "$x" | jq -e --arg h "$head" 'any(.entries[]; .id == $h)'
+   leep reset "$head"      # the id checked above, never the name leep-main
+   squash=$(leep commit -m "<PR title>")
+   leep --json diff "$x" "$squash" | jq -e '.entries == []'
+   leep land --ref leep-main
+   ```
+
+   - **Switch first, and require a clean status.** The squash commits the
+     working files, not the review ref. Without `leep switch` to the ref's
+     tip, commits someone else landed on the review ref since your last
+     sync would be dropped silently.
+   - **Check the base.** The stack's base is the newest `leep-main`
+     changeset in the review ref's history. If `leep-main`'s head is not in
+     that history, `leep merge leep-main`, resolve and commit, `leep land`
+     on the review ref, wait for CI to pass again, and start step 5 again.
+     `leep reset` without `--hard` keeps the working files, so a squash on
+     a stale base would hold the old base's files and silently revert
+     everything landed on `leep-main` since.
+   - **Reset to the checked id.** `leep reset leep-main` would resolve the
+     name again, and an agent landing between the check and the reset
+     would bring the hazard back.
+   - **Diff before landing.** The squash must have exactly the review ref's
+     tree: an empty `leep diff "$x" "$squash"`.
+   - If `leep-main` moved after the check, the server rebases the single
+     squash commit onto the new head (its diff is only the review's
+     changes), or refuses on a conflict (exit 5). Then nothing landed: do
+     not resolve it there, since CI never ran on that result. Run
+     `leep reset --hard --force "$x"`, merge `leep-main` into the review
+     ref as above, and start step 5 again.
 6. The mirror pushes `leep-main` to GitHub `main` as a fast-forward. Close
    the PR with the comment `Landed as <sha>`, the commit on GitHub `main`
    (its `Leep-Changeset:` trailer names the changeset).

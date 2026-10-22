@@ -70,13 +70,36 @@ of truth; GitHub `main` is its mirror. The flow, in full in
 4. Once CI is green, squash and land on `leep-main`, close the PR with
    `Landed as <sha>`, and delete the review ref (`leep branch -D`).
 
-**Squash hazard.** Squash with `leep reset leep-main` + `leep commit` only
-when the stack's base (the newest `leep-main` changeset in the review ref's
-history) equals the current `leep-main` head, and check that explicitly
-first. Otherwise `leep merge leep-main` (or rebase), land again on the review
-ref, wait for CI to pass again, then squash. A reset without `--hard` keeps
-the working files, so squashing on a moved base would silently revert
-everything landed on `leep-main` since.
+**Squash hazard.** Squash with `leep reset` + `leep commit` only when the
+stack's base (the newest `leep-main` changeset in the review ref's history)
+equals the current `leep-main` head, checked explicitly. Otherwise
+`leep merge leep-main`, land again on the review ref, wait for CI to pass
+again, then squash. A reset without `--hard` keeps the working files, so
+squashing on a moved base would silently revert everything landed on
+`leep-main` since. Do it exactly like this, stopping at the first failure:
+
+```sh
+x=review/<area>-<desc>
+leep switch "$x"        # the review ref's tip, not whatever is on disk
+leep --json status | jq -e '.changes == [] and .merging == null and .picking == null'
+head=$(leep --json log -n 1 leep-main | jq -r '.entries[0].id')
+leep --json log -n 1000 "$x" | jq -e --arg h "$head" 'any(.entries[]; .id == $h)'
+leep reset "$head"      # the id checked above, never the name leep-main
+squash=$(leep commit -m "<PR title>")
+leep --json diff "$x" "$squash" | jq -e '.entries == []'
+leep land --ref leep-main
+```
+
+- `leep switch` and a clean status first: the squash commits the working
+  files, so commits someone else landed on the review ref would otherwise
+  be dropped.
+- Reset to the id the check captured, never to the name `leep-main`, which
+  `leep reset` resolves again.
+- The empty diff proves the squash holds exactly the review ref's tree.
+- If `leep-main` moved after the check, the server rebases the single
+  squash commit (its diff is only the review's changes) or refuses on a
+  conflict (exit 5). On a conflict, `leep reset --hard --force "$x"`, merge
+  `leep-main` into the review ref, wait for CI and start again.
 
 Never set `LEEP_AGENT_MODEL`, and never use provenance trailers: commits
 carry no AI attribution (below).

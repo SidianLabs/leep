@@ -63,6 +63,11 @@ struct Local {
     rt: tokio::runtime::Runtime,
     /// Merges asked for.
     merges: std::sync::Mutex<u32>,
+    /// Ref lists `refs` answers before the real one, oldest first: a list
+    /// read just before a ref was recreated.
+    stale_refs: std::sync::Mutex<Vec<BTreeMap<String, ChangesetId>>>,
+    /// The server is unreachable: every ref read fails.
+    down: std::sync::Mutex<bool>,
 }
 
 impl Local {
@@ -77,7 +82,16 @@ impl Local {
                 .build()
                 .unwrap(),
             merges: std::sync::Mutex::new(0),
+            stale_refs: std::sync::Mutex::new(Vec::new()),
+            down: std::sync::Mutex::new(false),
         }
+    }
+
+    fn check_up(&self) -> Result<()> {
+        if *self.down.lock().unwrap() {
+            anyhow::bail!("connection refused");
+        }
+        Ok(())
     }
 
     fn on<F: std::future::Future>(&self, f: F) -> F::Output {
@@ -173,10 +187,16 @@ impl Leep for Local {
     }
 
     fn refs(&self) -> Result<BTreeMap<String, ChangesetId>> {
+        self.check_up()?;
+        let mut stale = self.stale_refs.lock().unwrap();
+        if !stale.is_empty() {
+            return Ok(stale.remove(0));
+        }
         Ok(self.on(self.repo.meta().list_refs())?)
     }
 
     fn ref_log_head(&self) -> Result<Option<u64>> {
+        self.check_up()?;
         Ok(self
             .on(self.repo.meta().ref_log(None, None, 1))?
             .first()
@@ -184,6 +204,7 @@ impl Leep for Local {
     }
 
     fn ref_had(&self, name: &str, id: &ChangesetId) -> Result<bool> {
+        self.check_up()?;
         let all = self.on(self.repo.meta().ref_log(Some(name), None, 100_000))?;
         Ok(all.iter().any(|e| e.new == Some(*id)))
     }
@@ -1420,4 +1441,156 @@ fn prefix_mirroring_leaves_main_and_tags_alone() {
     }
     assert_eq!(remote_head(&f, "refs/tags/review/t").unwrap(), main);
     assert_eq!(m.status.lock().unwrap().branches_deleted, 2);
+}
+
+#[test]
+fn a_prefix_ref_recreated_after_a_stale_ref_list_is_not_deleted() {
+    let f = fixture();
+    let leep = Local::new();
+    let (_, r1) = main_and_review(&leep, "review/git-a");
+    let mut m = mirror::Mirror::open(prefix_config(&f, false), &leep).unwrap();
+    assert!(m.run_once());
+    let a1 = remote_head(&f, "refs/heads/review/git-a").unwrap();
+
+    // The ref list the cycle reads is from the moment the ref was briefly
+    // gone; by the time the mirror would delete the branch it is back.
+    let mut gone = leep.refs().unwrap();
+    gone.remove("review/git-a");
+    leep.delete_ref("review/git-a");
+    let r2 = leep.native(
+        vec![r1],
+        "recreated",
+        vec![leep.file("r", "r2\n", FileKind::Regular)],
+    );
+    leep.set_ref("review/git-a", r2);
+    leep.stale_refs.lock().unwrap().push(gone);
+    m.cycle();
+    assert!(
+        leep.stale_refs.lock().unwrap().is_empty(),
+        "the stale list was read"
+    );
+    assert_eq!(
+        remote_head(&f, "refs/heads/review/git-a").as_deref(),
+        Some(a1.as_str()),
+        "the fresh read saves the branch"
+    );
+    assert_eq!(m.status.lock().unwrap().branches_deleted, 0);
+    assert!(m.run_once());
+    let a2 = remote_head(&f, "refs/heads/review/git-a").unwrap();
+    assert!(is_ancestor(&f.remote, &a1, &a2));
+    assert_eq!(state(&m, "review/git-a").0, RefState::InSync);
+}
+
+#[test]
+fn a_prefix_branch_is_never_deleted_while_the_server_is_down() {
+    let f = fixture();
+    let leep = Local::new();
+    main_and_review(&leep, "review/git-a");
+    let mut m = mirror::Mirror::open(prefix_config(&f, false), &leep).unwrap();
+    assert!(m.run_once());
+    let a = remote_head(&f, "refs/heads/review/git-a").unwrap();
+
+    // A new mirror starts while the server is unreachable: it finds the
+    // branch on the remote but cannot ask Leep about it.
+    drop(m);
+    *leep.down.lock().unwrap() = true;
+    let mut m = mirror::Mirror::open(prefix_config(&f, false), &leep).unwrap();
+    assert!(!m.run_once());
+    assert_eq!(state(&m, "review/git-a").0, RefState::Error);
+    assert_eq!(
+        remote_head(&f, "refs/heads/review/git-a").as_deref(),
+        Some(a.as_str())
+    );
+
+    // Also when the ref really was deleted meanwhile.
+    leep.delete_ref("review/git-a");
+    std::thread::sleep(Duration::from_millis(1100));
+    assert!(!m.run_once());
+    assert_eq!(
+        remote_head(&f, "refs/heads/review/git-a").as_deref(),
+        Some(a.as_str())
+    );
+    assert_eq!(m.status.lock().unwrap().branches_deleted, 0);
+
+    // Back up: now the delete goes through.
+    *leep.down.lock().unwrap() = false;
+    std::thread::sleep(Duration::from_millis(1100));
+    assert!(m.run_once(), "{:?}", state(&m, "review/git-a"));
+    assert_eq!(remote_head(&f, "refs/heads/review/git-a"), None);
+    assert_eq!(m.status.lock().unwrap().branches_deleted, 1);
+}
+
+#[test]
+fn a_pushed_commit_is_kept_when_leep_returns_to_a_value_it_held() {
+    let f = fixture();
+    let leep = Local::new();
+    let (c1, x) = main_and_review(&leep, "review/git-a");
+    let mut m = mirror::Mirror::open(prefix_config(&f, false), &leep).unwrap();
+    assert!(m.run_once());
+    let gx = remote_head(&f, "refs/heads/review/git-a").unwrap();
+
+    // Leep moves on to Z while a person pushes Y on top of X; then Leep's
+    // ref is reset back to X. The remote's Y is not something Leep held.
+    let z = leep.native(vec![x], "z", vec![leep.file("z", "z\n", FileKind::Regular)]);
+    leep.set_ref("review/git-a", z);
+    let y = push_on_top(&f, "review/git-a", "y.txt");
+    leep.set_ref("review/git-a", x);
+    assert!(!m.run_once());
+    let (st, detail) = state(&m, "review/git-a");
+    assert_eq!(st, RefState::RemoteAhead, "{detail}");
+    assert_eq!(remote_head(&f, "refs/heads/review/git-a").unwrap(), y);
+    assert_eq!(leep.get_ref("review/git-a"), Some(x));
+
+    // Deleting the Leep ref does not delete Y either.
+    leep.delete_ref("review/git-a");
+    assert!(!m.run_once());
+    assert_eq!(state(&m, "review/git-a").0, RefState::RemoteAhead);
+    assert_eq!(remote_head(&f, "refs/heads/review/git-a").unwrap(), y);
+    assert_eq!(m.status.lock().unwrap().branches_deleted, 0);
+
+    // The other way round: the person resets the branch back to X, which
+    // the ref held, so a rewrite in Leep goes out with a lease on X.
+    leep.set_ref("review/git-a", x);
+    git(
+        &f.human,
+        &[
+            "push",
+            "-q",
+            "-f",
+            "origin",
+            &format!("{gx}:refs/heads/review/git-a"),
+        ],
+    );
+    let squashed = leep.native(
+        vec![c1],
+        "squashed",
+        vec![leep.file("r", "squashed\n", FileKind::Regular)],
+    );
+    leep.set_ref("review/git-a", squashed);
+    assert!(m.run_once(), "{:?}", state(&m, "review/git-a"));
+    assert_eq!(
+        git(&f.remote, &["log", "-1", "--format=%s", "review/git-a"]),
+        "squashed"
+    );
+}
+
+#[test]
+fn a_prefix_branch_whose_name_leep_rejects_is_reported() {
+    let f = fixture();
+    let leep = Local::new();
+    main_and_review(&leep, "review/git-a");
+    let mut m = mirror::Mirror::open(prefix_config(&f, false), &leep).unwrap();
+    assert!(m.run_once());
+    // A commit Leep exported, so only the name stops the ref log lookup.
+    let main = remote_head(&f, "refs/heads/main").unwrap();
+    git(&f.remote, &["update-ref", "refs/heads/review/-x", &main]);
+    assert!(!m.run_once());
+    let (st, detail) = state(&m, "review/-x");
+    assert_eq!(st, RefState::RemoteAhead, "{detail}");
+    assert!(detail.contains("no Leep ref can have its name"), "{detail}");
+    assert_eq!(m.status.lock().unwrap().errors.get("leep"), None);
+    assert_eq!(remote_head(&f, "refs/heads/review/-x").unwrap(), main);
+    git(&f.remote, &["update-ref", "-d", "refs/heads/review/-x"]);
+    assert!(m.run_once());
+    assert!(!tracked(&m).contains(&"review/-x".to_string()));
 }

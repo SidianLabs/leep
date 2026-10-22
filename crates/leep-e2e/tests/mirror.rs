@@ -1250,3 +1250,81 @@ fn merging_crash_points_resume_exactly_once() {
     assert_trees_match(&client, root, &remote, "merging-crash-points");
     git(&remote, &["fsck", "--strict", "--no-dangling"]);
 }
+
+/// `--ref-prefix review/` (ADR 0061): a review ref an agent lands on
+/// appears on the remote, and goes away when the Leep ref is deleted; main
+/// is only ever fast-forwarded.
+#[test]
+fn mirror_pushes_and_deletes_review_refs_under_a_prefix() {
+    let _g = serial();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let stores = Stores::sqlite(&root.join("data"));
+    let server = Server::start(&stores, root);
+    let client = Client::new(&server.url, &root.join("cache"));
+    let remote = make_remote(root);
+    let agent = Agent::new(&client, root, "agent");
+    agent.land("a.txt", "one\n");
+    let prefix = ["--ref-prefix", "review/"];
+    let m = Mirror::start(&server, &remote, &root.join("work"), root, &prefix);
+    wait_converged(&server, &remote, &m);
+    let main = remote_ref(&remote, "refs/heads/main").unwrap();
+
+    let review = "refs/heads/review/e2e-prefix";
+    let review_status = || {
+        let (_, v) = m.status();
+        v["refs"]
+            .as_array()
+            .and_then(|r| {
+                r.iter()
+                    .find(|r| r["leep_ref"] == "review/e2e-prefix")
+                    .cloned()
+            })
+            .unwrap_or(serde_json::Value::Null)
+    };
+    client.ok(&agent.wc, &["switch", "-c", "review/e2e-prefix"]);
+    agent.land("b.txt", "review\n");
+    wait_until(
+        "the review ref to reach the remote",
+        TIMEOUT,
+        || {
+            let st = review_status();
+            st["state"] == "in-sync"
+                && st["remote"].as_str().is_some()
+                && st["remote"].as_str() == remote_ref(&remote, review).as_deref()
+                // Created at main's commit by `switch -c`; wait for the land.
+                && st["remote"].as_str() != Some(main.as_str())
+        },
+        || format!("{}\n{}", review_status(), m.log_text()),
+    );
+    let st = review_status();
+    assert_eq!(st["ref_prefix"], "review/", "{st}");
+    assert_eq!(
+        git(&remote, &["show", "review/e2e-prefix:b.txt"]),
+        "review\n"
+    );
+    let body = git(&remote, &["log", "-1", "--format=%B", "review/e2e-prefix"]);
+    assert!(body.contains("Leep-Changeset: "), "{body}");
+    assert_eq!(remote_ref(&remote, "refs/heads/main").unwrap(), main);
+
+    // Deleted in Leep: deleted on the remote, and the mirror stays healthy.
+    client.ok(&agent.wc, &["switch", "main"]);
+    client.ok(&agent.wc, &["branch", "-D", "review/e2e-prefix"]);
+    wait_until(
+        "the review branch to be deleted",
+        TIMEOUT,
+        || {
+            let (_, v) = m.status();
+            remote_ref(&remote, review).is_none() && v["branches_deleted"] == 1
+        },
+        || format!("{}\n{}", m.status().1, m.log_text()),
+    );
+    let (code, v) = m.status();
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["deleted_branches"][0]["git_ref"], review, "{v}");
+    assert_eq!(v["refs"].as_array().unwrap().len(), 1, "{v}");
+    assert_eq!(remote_ref(&remote, "refs/heads/main").unwrap(), main);
+    assert_remote_only_fast_forwarded(&remote);
+    let log = m.log_text();
+    assert!(!log.contains("panicked"), "{log}");
+}

@@ -84,13 +84,31 @@ personal names, ticket-only names or tool-generated names.
 - Answer review comments by landing more commits on the review ref. The
   maintainer reviews on GitHub.
 - **Squash and land**, never merge on GitHub. Once CI is green:
-  1. Check that the stack's base (the newest `leep-main` changeset in the
-     review ref's history) is the current `leep-main` head. If not,
-     `leep merge leep-main`, land on the review ref, wait for green CI
-     again, and check again. `leep reset` keeps the working files, so a
-     squash on a moved base silently reverts other work.
-  2. `leep reset leep-main`, `leep commit -m "<PR title>"`,
-     `leep land --ref leep-main`.
+  1. Switch to the review ref's tip and require a clean status. Check
+     that the stack's base (the newest `leep-main` changeset in the review
+     ref's history) is the current `leep-main` head, capturing that id. If
+     it is not, `leep merge leep-main`, land on the review ref, wait for
+     green CI again, and start over. `leep reset` keeps the working files,
+     so a squash on a moved base silently reverts other work.
+  2. Reset to the captured id (never the name `leep-main`, which would be
+     resolved again), commit, require an empty diff between the review ref
+     and the squash, then land:
+     ```sh
+     x=review/<area>-<desc>
+     leep switch "$x"        # the review ref's tip, not whatever is on disk
+     leep --json status | jq -e '.changes == [] and .merging == null and .picking == null'
+     head=$(leep --json log -n 1 leep-main | jq -r '.entries[0].id')
+     leep --json log -n 1000 "$x" | jq -e --arg h "$head" 'any(.entries[]; .id == $h)'
+     leep reset "$head"      # the id checked above, never the name leep-main
+     squash=$(leep commit -m "<PR title>")
+     leep --json diff "$x" "$squash" | jq -e '.entries == []'
+     leep land --ref leep-main
+     ```
+
+     If `leep-main` moved after the check, the server rebases the single
+     squash commit (its diff is only the review's changes) or refuses on a
+     conflict (exit 5); on a conflict, `leep reset --hard --force "$x"`
+     and start over from the merge.
   3. Close the PR with the comment `Landed as <sha>`, the commit the mirror
      pushed to GitHub `main`.
   4. Delete the review ref (`leep branch -D review/<area>-<desc>`); the
