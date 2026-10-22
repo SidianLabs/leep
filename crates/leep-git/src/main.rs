@@ -17,12 +17,16 @@ struct Cli {
 enum Cmd {
     /// Import a git revision (and its ancestry) into Leep.
     Import {
-        #[arg(long)]
+        /// Metadata store URL (sqlite:, postgres://, mem://), as the server's.
+        #[arg(long, env = "LEEP_META")]
         meta: String,
-        #[arg(long)]
+        /// Blob store URL (file://, s3://, mem://), as the server's.
+        #[arg(long, env = "LEEP_BLOBS")]
         blobs: String,
+        /// The git repository: a work tree or a bare or `.git` directory.
         #[arg(long)]
         git_dir: PathBuf,
+        /// Git revision to import with its ancestry.
         #[arg(long, default_value = "HEAD")]
         rev: String,
         /// Fast-forward this Leep ref to the imported head.
@@ -31,9 +35,11 @@ enum Cmd {
     },
     /// Export a Leep revision (ref name or changeset id) as a git branch.
     Export {
-        #[arg(long)]
+        /// Metadata store URL (sqlite:, postgres://, mem://), as the server's.
+        #[arg(long, env = "LEEP_META")]
         meta: String,
-        #[arg(long)]
+        /// Blob store URL (file://, s3://, mem://), as the server's.
+        #[arg(long, env = "LEEP_BLOBS")]
         blobs: String,
         #[arg(long)]
         rev: String,

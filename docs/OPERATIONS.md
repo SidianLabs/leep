@@ -2364,7 +2364,9 @@ problems, exits 1 and `restore` refuses it.
 Exit status: `0` sealed and the check clean, `1` sealed but the check found
 problems (do not rely on that snapshot), `2` could not run (nothing sealed).
 `--json` prints the manifest and problems as one object. Progress goes to
-stderr.
+stderr. The `applying schema migration` lines a run logs are the snapshot's
+own new `meta.db` being created at the current schema; the source store is
+never migrated.
 
 Things to know:
 

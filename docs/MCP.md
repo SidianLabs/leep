@@ -43,6 +43,18 @@ Add it to any MCP client that takes a stdio server config:
 
 Logs go to stderr; stdout carries protocol messages only.
 
+To check the server and token before wiring up a client, send it a
+handshake and one tool call by hand; the last line of output is the
+`leep_refs` result:
+
+```sh
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}' \
+  '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"leep_refs","arguments":{}}}' \
+  | LEEP_SERVER=http://127.0.0.1:7070 LEEP_TOKEN=<token> leep-mcp
+```
+
 ## Tools
 
 `rev` is a branch name (default `main`), a tag (`tags/v1`, or `v1` when no branch has that name), a full 64-hex changeset id, or a unique prefix of one of at least 4 hex digits (ADR 0035; a ref wins over a prefix that spells the same).
