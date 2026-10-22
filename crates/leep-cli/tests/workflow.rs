@@ -1091,3 +1091,48 @@ fn resolve_checks_markers_unless_forced() {
     assert!(ctx.wc.state.conflicts.is_empty());
     assert_eq!(changes(&ctx), [("a.txt".to_string(), Change::Modified)]);
 }
+
+#[test]
+fn a_land_conflict_keeps_same_size_local_changes_visible() {
+    let mut env = Env::new();
+    env.mock.seed(
+        None,
+        &[
+            ("a.txt", "a\n", FileKind::Regular),
+            ("c.txt", "c=000\n", FileKind::Regular),
+        ],
+        &[],
+    );
+    let land_args = LandArgs {
+        target_ref: None,
+        create: false,
+    };
+    let mut theirs = env.wc();
+    let mut mine = env.wc();
+    write(&theirs, "a.txt", "a theirs\n");
+    commit::run(&mut theirs, &commit_args("theirs")).unwrap();
+    assert_eq!(land::run(&mut theirs, &land_args).unwrap(), 0);
+    write(&mine, "a.txt", "a mine\n");
+    write(&mine, "c.txt", "c=111\n");
+    commit::run(&mut mine, &commit_args("mine")).unwrap();
+    assert_eq!(land::run(&mut mine, &land_args).unwrap(), 5);
+    assert_eq!(read(&mine, "c.txt"), "c=111\n");
+
+    // On a coarse clock the land's write over the file it had just
+    // materialized keeps the mtime it recorded; the size is the same too.
+    let mine = env.reopen(&mine);
+    let recorded = mine.wc.state.files["c.txt"].mtime_ns;
+    if recorded != 0 {
+        fs::File::options()
+            .write(true)
+            .open(mine.wc.abs("c.txt"))
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_nanos(recorded as u64))
+            .unwrap();
+    }
+    assert!(
+        changes(&mine).contains(&("c.txt".to_string(), Change::Modified)),
+        "{:?}",
+        changes(&mine)
+    );
+}
