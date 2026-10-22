@@ -47,6 +47,9 @@ pub struct GcLease {
     holder: String,
     epoch: u64,
     lost: Arc<AtomicBool>,
+    /// When the last successful take or renewal was sent: the lease is
+    /// certainly ours for a TTL after that, and no longer.
+    last_ok: Arc<std::sync::Mutex<tokio::time::Instant>>,
     renewer: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -77,6 +80,7 @@ impl GcLease {
         };
         // Named as abandoned until the lease is in hand, so a run stopped
         // during the call leaves a name the next run can take back.
+        let sent = tokio::time::Instant::now();
         let fresh = holder_name(job);
         ABANDONED.lock().unwrap().push(fresh.clone());
         let (mut holder, mut lease) = take(fresh).await?;
@@ -106,28 +110,41 @@ impl GcLease {
             )));
         }
         let lost = Arc::new(AtomicBool::new(false));
+        let last_ok = Arc::new(std::sync::Mutex::new(sent));
         let renewer = tokio::spawn(renew(
             meta.clone(),
             holder.clone(),
             lease.epoch,
             lost.clone(),
+            last_ok.clone(),
         ));
         Ok(Some(GcLease {
             meta: meta.clone(),
             holder,
             epoch: lease.epoch,
             lost,
+            last_ok,
             renewer: Some(renewer),
         }))
     }
 
     /// `Err` once the lease may have passed to another holder: call before
     /// every destructive step.
+    ///
+    /// Judged by when the last renewal that succeeded was *sent*, not by a
+    /// flag the renewer sets: a renewer stalled in a store call sets
+    /// nothing, and a renewal that succeeds late (it matches holder and
+    /// epoch even after expiry) cannot vouch for the time in between. It
+    /// fails a renewal period short of the TTL, before another holder can
+    /// take the lease.
     pub fn check(&self) -> Result<()> {
-        if self.lost.load(Ordering::SeqCst) {
-            return Err(Error::Conflict(
-                "lost the gc lease (renewals failed for longer than its TTL); stopping".into(),
-            ));
+        let since = self.last_ok.lock().unwrap().elapsed();
+        if self.lost.load(Ordering::SeqCst) || since >= GC_LEASE_TTL - GC_LEASE_RENEW {
+            return Err(Error::Conflict(format!(
+                "lost the gc lease (not renewed for {}s, TTL {}s); stopping",
+                since.as_secs(),
+                GC_LEASE_TTL.as_secs()
+            )));
         }
         Ok(())
     }
@@ -178,17 +195,25 @@ pub async fn release<T>(lease: Option<GcLease>, result: Result<T>) -> Result<T> 
     Ok(out)
 }
 
-async fn renew(meta: Arc<dyn MetaStore>, holder: String, epoch: u64, lost: Arc<AtomicBool>) {
+async fn renew(
+    meta: Arc<dyn MetaStore>,
+    holder: String,
+    epoch: u64,
+    lost: Arc<AtomicBool>,
+    shared_ok: Arc<std::sync::Mutex<tokio::time::Instant>>,
+) {
     let key = LeaseKey::gc();
-    let mut last_ok = tokio::time::Instant::now();
+    let mut last_ok = *shared_ok.lock().unwrap();
     loop {
         tokio::time::sleep(GC_LEASE_RENEW).await;
+        let sent = tokio::time::Instant::now();
         match meta
             .renew_leases(&holder, &[(key.clone(), epoch)], timing())
             .await
         {
             Ok(v) if v.first().is_some_and(|r| r.is_some()) => {
-                last_ok = tokio::time::Instant::now()
+                last_ok = sent;
+                *shared_ok.lock().unwrap() = sent;
             }
             Ok(_) => {
                 lost.store(true, Ordering::SeqCst);
@@ -229,5 +254,35 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    /// A holder whose renewals stall (a store that hangs, a paused
+    /// process) must stop by itself before another holder could take the
+    /// lease: renewals that succeed late cannot vouch for the time between.
+    #[tokio::test(start_paused = true)]
+    async fn a_holder_whose_renewals_stall_stops_before_the_ttl() {
+        use leep_testkit::{Fault, FaultPlan, FaultyMetaStore, Op};
+        let plan = FaultPlan::new(1);
+        // The first renewal (call 2) hangs for an hour.
+        plan.script(Op::Lease, 2, Fault::Delay(Duration::from_secs(3600)));
+        let inner: Arc<dyn MetaStore> = Arc::new(
+            leep_core::memory::MemoryMetaStore::new().with_lease_clock(Arc::new({
+                let origin = tokio::time::Instant::now();
+                move || origin.elapsed().as_millis() as i64
+            })),
+        );
+        let meta: Arc<dyn MetaStore> = Arc::new(FaultyMetaStore::new(inner, plan));
+        let lease = GcLease::acquire(&meta, "changeset-collect")
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::sleep(GC_LEASE_RENEW + Duration::from_secs(1)).await;
+        lease.check().unwrap();
+        tokio::time::sleep(GC_LEASE_TTL - GC_LEASE_RENEW * 2).await;
+        assert!(
+            lease.check().is_err(),
+            "still acting on a lease not renewed for {:?}",
+            GC_LEASE_TTL - GC_LEASE_RENEW + Duration::from_secs(1)
+        );
     }
 }
