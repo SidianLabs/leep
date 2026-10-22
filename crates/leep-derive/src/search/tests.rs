@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::sync::atomic::Ordering::SeqCst;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
+use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
@@ -1187,8 +1187,9 @@ pub(crate) struct Probe {
     /// Fail this `put_derived_many` call (1-based), after storing this many
     /// of its rows: after an error any prefix may be stored.
     pub(crate) fail: Mutex<Option<(u64, usize)>>,
-    /// While set, `put_derived_many` waits for a permit of `gate`.
-    pub(crate) hold: AtomicBool,
+    /// While it names a kind (`*`: any), a `put_derived_many` that carries
+    /// a row of it waits for a permit of `gate`.
+    pub(crate) hold: Mutex<Option<String>>,
     pub(crate) gate: tokio::sync::Semaphore,
     /// Writes waiting at the gate.
     pub(crate) held: AtomicU64,
@@ -1205,7 +1206,7 @@ impl Probe {
             most_bytes: AtomicUsize::new(0),
             written: Mutex::default(),
             fail: Mutex::new(None),
-            hold: AtomicBool::new(false),
+            hold: Mutex::new(None),
             gate: tokio::sync::Semaphore::new(0),
             held: AtomicU64::new(0),
         })
@@ -1319,7 +1320,8 @@ impl leep_core::MetaStore for Probe {
         self.most_rows.fetch_max(rows.len(), SeqCst);
         let bytes = rows.iter().map(|r| r.value.len()).sum();
         self.most_bytes.fetch_max(bytes, SeqCst);
-        if self.hold.load(SeqCst) {
+        let hold = self.hold.lock().unwrap().clone();
+        if hold.is_some_and(|k| k == "*" || rows.iter().any(|r| r.kind == k)) {
             self.held.fetch_add(1, SeqCst);
             let permit = self.gate.acquire().await;
             self.held.fetch_sub(1, SeqCst);
@@ -1713,4 +1715,179 @@ async fn a_gap_of_many_lands_costs_round_trips_per_level() {
         assert!(derive <= 12, "gap {gap}: derive_search made {derive}");
         assert!(search <= 16, "gap {gap}: search made {search}");
     }
+}
+
+// ---- one derivation per root, and warm loops of their own ----
+
+/// Wait, up to 20 s, until `done` says so.
+async fn wait_until<F, Fut>(what: &str, mut done: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let start = std::time::Instant::now();
+    while !done().await {
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(20),
+            "timed out waiting until {what}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
+/// Handles on `root`'s place in line: the map's, and two for each
+/// derivation leading or waiting.
+fn in_line(r: &Repo, root: Hash) -> usize {
+    let flights = r.search_flights.lock().unwrap();
+    flights.get(&root).map_or(0, Arc::strong_count)
+}
+
+/// Derivations of one root at once, two `derive_search` calls and a
+/// search, write each row once: the later ones wait for the first, then
+/// find the root's row stored. No place in line is left behind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_derivations_of_one_root_write_it_once() {
+    for seed in 1..=8u64 {
+        let probe = Probe::new(std::time::Duration::from_millis(1));
+        let r = Repo::new(Arc::new(MemoryBlobStore::new()), probe.clone());
+        let c = commit_files(&r, &[], &level_tree(seed, 60)).await;
+        let root = r.root_tree(c).await.unwrap();
+        let q = SearchQuery::new("alpha");
+        let (a, b, s) = tokio::join!(r.derive_search(c), r.derive_search(c), r.search(c, &q));
+        let (a, b, s) = (a.unwrap(), b.unwrap(), s.unwrap());
+        let dirs = tree_shape(&r, root).await;
+        let derived = [a.tree_rows, b.tree_rows, s.stats.tree_rows_derived];
+        assert_eq!(
+            derived.iter().sum::<u64>(),
+            dirs.len() as u64,
+            "seed {seed}"
+        );
+        assert_eq!(derived.iter().filter(|&&n| n > 0).count(), 1, "seed {seed}");
+        for (h, _, files) in &dirs {
+            assert_eq!(probe.writes_of(TREE_KIND, *h), 1, "seed {seed}: {h}");
+            for (f, _) in files {
+                assert_eq!(probe.writes_of(BLOB_KIND, *f), 1, "seed {seed}: {f}");
+            }
+        }
+        assert!(r.search_flights.lock().unwrap().is_empty());
+    }
+}
+
+/// A leader that is cancelled, or fails, just gives up its place: the
+/// derivation waiting behind it derives the root itself and never sees the
+/// leader's error, and the place in line is removed once both are gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stopped_leader_hands_the_root_to_the_next_in_line() {
+    for fail in [false, true] {
+        let (r, probe) = probed();
+        let c = commit_files(&r, &[], &level_tree(11, 50)).await;
+        let root = r.root_tree(c).await.unwrap();
+        *probe.hold.lock().unwrap() = Some("*".into());
+        let leader = tokio::spawn({
+            let r = r.clone();
+            async move { r.derive_search(c).await }
+        });
+        wait_until("the leader writes", || async {
+            probe.held.load(SeqCst) == 1
+        })
+        .await;
+        let waiter = tokio::spawn({
+            let r = r.clone();
+            async move { r.derive_search(c).await }
+        });
+        wait_until("the waiter is in line", || async { in_line(&r, root) == 5 }).await;
+        *probe.hold.lock().unwrap() = None;
+        if fail {
+            let held_call = probe.puts.load(SeqCst);
+            *probe.fail.lock().unwrap() = Some((held_call, 0));
+            probe.gate.add_permits(1);
+            assert!(leader.await.unwrap().is_err());
+        } else {
+            leader.abort();
+            assert!(leader.await.unwrap_err().is_cancelled());
+        }
+        let report = waiter.await.unwrap().unwrap();
+        assert!(report.tree_rows > 0, "fail {fail}: the waiter derived");
+        assert_eq!(
+            assert_closed(&r, root, "handed over").await,
+            tree_shape(&r, root).await.len()
+        );
+        assert_rows_recomputed(&r, root, "handed over").await;
+        assert!(r.search_flights.lock().unwrap().is_empty(), "fail {fail}");
+    }
+}
+
+/// A search waiting for another derivation of its root holds no pool
+/// permit: with a single permit, a search of an indexed revision completes
+/// while it waits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_search_waiting_for_a_derivation_gives_back_its_pool_permit() {
+    let probe = Probe::new(std::time::Duration::ZERO);
+    let r = Repo::new(Arc::new(MemoryBlobStore::new()), probe.clone())
+        .with_search_pool_permits(Some(1));
+    let indexed = commit_files(&r, &[], &level_tree(3, 30)).await;
+    r.derive_search(indexed).await.unwrap();
+    let cold = commit_files(&r, &[], &level_tree(4, 30)).await;
+    let root = r.root_tree(cold).await.unwrap();
+    *probe.hold.lock().unwrap() = Some("*".into());
+    let warm = tokio::spawn({
+        let r = r.clone();
+        async move { r.derive_search(cold).await }
+    });
+    wait_until("the warm writes", || async { probe.held.load(SeqCst) == 1 }).await;
+    let q = SearchQuery::new("alpha");
+    let waiting = tokio::spawn({
+        let (r, q) = (r.clone(), q.clone());
+        async move { r.search(cold, &q).await }
+    });
+    wait_until("the search is in line", || async { in_line(&r, root) == 5 }).await;
+    let other = tokio::time::timeout(std::time::Duration::from_secs(10), r.search(indexed, &q))
+        .await
+        .expect("a search of an indexed tree is not starved of permits")
+        .unwrap();
+    assert_eq!(other.stats.tree_rows_derived, 0);
+    *probe.hold.lock().unwrap() = None;
+    probe.gate.add_permits(1);
+    assert!(warm.await.unwrap().unwrap().tree_rows > 0);
+    let res = waiting.await.unwrap().unwrap();
+    assert_eq!(
+        (res.stats.blob_rows_derived, res.stats.tree_rows_derived),
+        (0, 0),
+        "it waited, then read the rows"
+    );
+    assert_eq!(res.matches, r.search(cold, &q).await.unwrap().matches);
+    assert!(r.search_flights.lock().unwrap().is_empty());
+}
+
+/// Each index group warms in a loop of its own: with path history's writes
+/// held, the search loop still indexes a head that moved after.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_slow_history_group_does_not_delay_search_warming() {
+    use crate::derived::DerivedKind;
+    let (r, probe) = probed();
+    let base = commit_files(&r, &[], &level_tree(5, 20)).await;
+    r.meta().cas_ref("main", None, Some(base)).await.unwrap();
+    *probe.hold.lock().unwrap() = Some(crate::derived::HistoryTree::NAME.into());
+    let task =
+        crate::warm::Warmer::new(r.clone(), true).spawn(std::time::Duration::from_millis(10));
+    wait_until("history is held", || async { probe.held.load(SeqCst) >= 1 }).await;
+    let head = commit_files(&r, &[base], &level_tree(6, 20)).await;
+    r.meta()
+        .cas_ref("main", Some(base), Some(head))
+        .await
+        .unwrap();
+    let root = r.root_tree(head).await.unwrap();
+    let meta = r.meta().clone();
+    wait_until("the moved head's search rows are stored", || {
+        let meta = meta.clone();
+        async move { stored(meta.as_ref(), TREE_KIND, &root).await.is_some() }
+    })
+    .await;
+    assert!(probe.held.load(SeqCst) >= 1, "history is still held");
+    let history = stored(meta.as_ref(), crate::derived::HistoryTree::NAME, &head.0).await;
+    assert!(history.is_none());
+    task.abort();
+    let _ = task.await;
+    *probe.hold.lock().unwrap() = None;
+    probe.gate.add_permits(100);
 }

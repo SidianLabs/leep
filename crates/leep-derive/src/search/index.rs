@@ -160,17 +160,23 @@ impl Repo {
         if let Some(v) = self.meta().get_derived(TREE_KIND, &root).await? {
             return Ok(v);
         }
-        self.tree_row_unstored(root, c).await
+        self.tree_row_unstored(root, c, &mut PoolSlot::none()).await
     }
 
     /// The filter of `tree` for a search: from the shared cache, else from
     /// the store (and then cached), else computed by [`Repo::tree_row`]'s
     /// rules. A computed row is not cached: under a bounded query it lives
-    /// only in that query's [`SearchScan`].
-    pub(crate) async fn search_tree_row(&self, tree: Hash, c: &Counters) -> Result<Bytes> {
+    /// only in that query's [`SearchScan`]. `pool` is the search's pool
+    /// permit, given back while it waits for another derivation of `tree`.
+    pub(crate) async fn search_tree_row(
+        &self,
+        tree: Hash,
+        c: &Counters,
+        pool: &mut PoolSlot<'_>,
+    ) -> Result<Bytes> {
         match self.search_tree_rows(&[tree]).await?.pop().flatten() {
             Some(row) => Ok(row),
-            None => self.tree_row_unstored(tree, c).await,
+            None => self.tree_row_unstored(tree, c, pool).await,
         }
     }
 
@@ -229,10 +235,37 @@ impl Repo {
     /// and the bounded queries' checks rely on, and a gap of many lands
     /// costs a few round trips per level instead of a few per directory.
     /// Memory follows the missing directories' entries, plus one batch.
-    async fn tree_row_unstored(&self, root: Hash, c: &Counters) -> Result<Bytes> {
+    ///
+    /// One derivation of a root runs at a time in this process: a search
+    /// arriving while the warmer (or another search) derives the same root
+    /// waits for it, without its pool permit, then finds the row stored. If
+    /// that derivation stopped (cancelled, or failed), the next in line
+    /// derives instead; it never sees the other's error. A bounded scan
+    /// stores nothing, so it neither waits nor makes anyone wait.
+    async fn tree_row_unstored(
+        &self,
+        root: Hash,
+        c: &Counters,
+        pool: &mut PoolSlot<'_>,
+    ) -> Result<Bytes> {
         if let Some(v) = c.scan.as_ref().and_then(|s| s.get(true, &root)) {
             return Ok(v);
         }
+        let _flight = match c.scan {
+            Some(_) => None,
+            None => {
+                let mut flight = Flight::join(&self.search_flights, root);
+                if !flight.try_lead() {
+                    // Waiters hold no pool permit, or searches waiting on
+                    // one derivation would starve every other search.
+                    pool.release();
+                    flight.wait().await;
+                    pool.reacquire().await?;
+                }
+                Some(flight)
+            }
+        };
+        // Finds the root's row stored if a derivation just finished it.
         let mut known = Held::new(KNOWN_BYTES);
         let dirs = match self.missing_dirs(root, c, &mut known).await? {
             Missing::Stored(row) => return Ok(row),
@@ -432,6 +465,104 @@ impl Repo {
                 })
             })
             .collect()
+    }
+}
+
+/// A search's pool permit ([`Repo::with_search_pool_permits`]), which it
+/// gives back while it waits for another derivation of the same tree.
+pub(crate) struct PoolSlot<'a> {
+    pool: Option<&'a tokio::sync::Semaphore>,
+    permit: Option<tokio::sync::SemaphorePermit<'a>>,
+}
+
+impl<'a> PoolSlot<'a> {
+    /// No pool: the warmer, `derive-search` and bounded scans.
+    pub(crate) fn none() -> Self {
+        PoolSlot {
+            pool: None,
+            permit: None,
+        }
+    }
+
+    /// A permit of `pool`, when there is a pool.
+    pub(crate) async fn acquire(pool: Option<&'a tokio::sync::Semaphore>) -> Result<Self> {
+        let mut slot = PoolSlot { pool, permit: None };
+        slot.reacquire().await?;
+        Ok(slot)
+    }
+
+    fn release(&mut self) {
+        self.permit = None;
+    }
+
+    async fn reacquire(&mut self) -> Result<()> {
+        if let (Some(pool), None) = (self.pool, &self.permit) {
+            let permit = pool
+                .acquire()
+                .await
+                .map_err(|e| Error::Other(format!("search pool: {e}")))?;
+            self.permit = Some(permit);
+        }
+        Ok(())
+    }
+}
+
+/// Search derivations in flight in this process, by tree root (see
+/// [`Repo::tree_row_unstored`]).
+pub(crate) type Flights = std::sync::Mutex<HashMap<Hash, Arc<tokio::sync::Mutex<()>>>>;
+
+/// A place in line to derive one root's rows.
+struct Flight<'a> {
+    flights: &'a Flights,
+    key: Hash,
+    lock: Option<Arc<tokio::sync::Mutex<()>>>,
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl<'a> Flight<'a> {
+    fn join(flights: &'a Flights, key: Hash) -> Self {
+        let lock = flights.lock().unwrap().entry(key).or_default().clone();
+        Flight {
+            flights,
+            key,
+            lock: Some(lock),
+            guard: None,
+        }
+    }
+
+    /// Lead, if no one else derives this root now.
+    fn try_lead(&mut self) -> bool {
+        let lock = self.lock.clone().expect("joined");
+        match lock.try_lock_owned() {
+            Ok(guard) => {
+                self.guard = Some(guard);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Wait until the derivation ahead ends, finished or not, then lead.
+    async fn wait(&mut self) {
+        let lock = self.lock.clone().expect("joined");
+        self.guard = Some(lock.lock_owned().await);
+    }
+}
+
+/// The last one out removes the root's entry, so the map holds only roots
+/// being derived or waited for. Done under the map's lock, which every
+/// newcomer takes to join.
+impl Drop for Flight<'_> {
+    fn drop(&mut self) {
+        let mut flights = self.flights.lock().unwrap();
+        self.guard = None;
+        self.lock = None;
+        if flights
+            .get(&self.key)
+            .is_some_and(|l| Arc::strong_count(l) == 1)
+        {
+            flights.remove(&self.key);
+        }
     }
 }
 

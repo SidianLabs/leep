@@ -140,6 +140,9 @@ pub struct Repo {
     /// by every search through this handle and its clones; `None` leaves
     /// them unbounded. See [`Repo::with_search_pool_permits`].
     pub(crate) search_pool: Option<Arc<tokio::sync::Semaphore>>,
+    /// Search derivations in flight, by tree root, shared by clones (see
+    /// `Repo::tree_row_unstored`).
+    pub(crate) search_flights: Arc<crate::search::index::Flights>,
 }
 
 /// Whether a derivation may go on writing rows: the index lease it derives
@@ -556,6 +559,7 @@ impl Repo {
             fence_flag: Arc::default(),
             rescues_on_write: true,
             search_pool: None,
+            search_flights: Arc::default(),
         }
     }
 
