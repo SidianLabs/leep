@@ -1211,6 +1211,125 @@ up to 15,300 resends per run.
   are comparable. Runs that do not need bytes per land can leave out
   `--database-url`.
 
+#### Search rows derived in level batches, in the swarm (E5b)
+
+E5 again, on `main` at `bbd3081`, which derives missing search rows in
+batches by tree level, runs one search derivation per tree root at a time,
+and warms each index group in a loop of its own (#141; see "Search rows
+derived in level batches (after E5)" below). The same scripts as E5, the
+same two-core VPS, Linux store, server flags and generator settings, with
+the server and `leep-swarm` built in release from `bbd3081`. Arms A
+(`search=1`, the default), C (no searches) and D (`search=2`), at 500 and
+2,000 agents, three rounds each with the arm order rotated; E5's arm B was
+not run. The 5 s metrics sampler also kept `leep_index_rows_total`,
+`leep_derive_total` and `leep_query_inline_derive_total`. The window was
+located in all 18 runs, so every column is from three rounds.
+
+Medians of three rounds (range); E5's rows are repeated from above:
+
+| Agents | Arm | Run | Lands/s | Land p50 / p99 | Searches done / shed / timed out | Search p50 / p99 (done) | Server time per search | Ref read p50 / p99 | Server / Postgres CPU (cores) |
+|---|---|---|---|---|---|---|---|---|---|
+| 500 | A, `search=1` | E5 | 21.3 (17.2–21.4) | 10.9 s / 19.3 s | 19 / 990 / 1 | 4.7 s / 19.1 s | 7.0–8.0 s | 23 ms / 103–109 ms | 0.85–0.88 / 0.65–0.66 |
+| 500 | A, `search=1` | E5b | 18.4 (18.3–18.9) | 13.6 s (13.3–14.2) / 18.7 s | 21 / 890 / 0 | 4.0 s / 15.9 s | 4.6–5.8 s | 20 ms / 116 ms | 0.88 / 0.64 |
+| 500 | C, no search | E5 | 25.7 (24.6–27.7) | 6.5 s / 13.1 s | – | – | – | 17–18 ms / 80–102 ms | 0.85–0.86 / 0.60 |
+| 500 | C, no search | E5b | 25.6 (25.1–26.1) | 7.2 s (6.4–7.3) / 16.3 s | – | – | – | 15 ms / 120 ms | 0.80 / 0.56 |
+| 500 | D, `search=2` | E5 | 16.1 (14.5–17.7) | 16.7 s / 21.0 s | 31 / 754 / 1 | 6.0 s / 15.7 s | 7.5–7.6 s | 29 ms / 122–128 ms | 0.86 / 0.71 |
+| 500 | D, `search=2` | E5b | 13.7 (13.3–13.7) | 21.6 s (21.1–22.0) / 78.7 s | 41 / 651 / 0 | 4.5 s / 13.1 s | 4.9–6.0 s | 26 ms / 107 ms | 0.85 / 0.74 |
+| 2,000 | A, `search=1` | E5 | 11.8 (11.6–12.2) | 53 s / 206 s | 28 / 632 / 1 | 3.5 s / 11.0 s | 4.1–4.8 s | 25–28 ms / 121–124 ms | 0.92–0.95 / 0.59 |
+| 2,000 | A, `search=1` | E5b | 11.2 (9.5–11.2) | 74 s (55–87) / 211 s | 30 / 543 / 1 | 3.0 s / 14.2 s | 3.3–4.5 s | 23 ms / 140 ms | 0.92 / 0.62 |
+| 2,000 | C, no search | E5 | 15.9 (14.7–16.0) | 30 s / 232 s | – | – | – | 21–25 ms / 108–204 ms | 0.99–1.02 / 0.42–0.46 |
+| 2,000 | C, no search | E5b | 15.0 (11.7–16.6) | 86 s (29–89) / 211 s | – | – | – | 16 ms / 172 ms | 0.96 / 0.43 |
+| 2,000 | D, `search=2` | E5 | 9.3 (8.6–9.5) | 78 s / 202 s | 43 / 467 / 2 | 4.0 s / 13.1 s | 4.5–5.7 s | 29–38 ms / 103–136 ms | 0.90–0.99 / 0.64–0.67 |
+| 2,000 | D, `search=2` | E5b | 10.1 (9.6–10.1) | 89 s (76–90) / 210 s | 50 / 468 / 2 | 3.6 s / 11.0 s | 4.1–4.6 s | 30 ms / 134 ms | 0.88 / 0.70 |
+
+Columns are defined as in E5. "Server time per search" is the range over
+rounds of `leep_search_duration_seconds` sum over count in the window.
+E5b's ref reads are medians of the rounds' probe p50 and p99. Mean
+`leep_land_lock_wait_seconds` in the window: at 500 agents A 10.1–11.0 s,
+C 4.5–5.2 s, D 17.2–17.9 s; at 2,000 agents 27.5 to 29.0 s in every arm,
+with 10,649 to 15,300 lands resent per run. No run had a double or lost
+land: 18 runs, 0 / 0.
+
+Index rows in the window, `leep_index_rows_total` by kind (rows the warmer
+derived), medians (range):
+
+| Agents | Arm | `blob-trigrams-v1` | `tree-trigrams-v1` | `history-tree-v4` | `log-filter-v1` |
+|---|---|---|---|---|---|
+| 500 | A | 4,266 (3,916–4,400) | 2,221 (2,046–2,297) | 2,134 (2,044–2,196) | 2,196 (2,044–2,260) |
+| 500 | C | 6,156 (6,145–6,383) | 3,214 (3,204–3,333) | 3,066 (3,011–3,075) | 3,075 (3,075–3,192) |
+| 500 | D | 2,824 (2,600–3,084) | 1,473 (1,361–1,615) | 1,534 (1,452–1,542) | 1,534 (1,452–1,542) |
+| 2,000 | A | 2,340 (1,818–2,582) | 1,378 (1,104–1,513) | 1,288 (956–1,355) | 1,293 (956–1,340) |
+| 2,000 | C | 3,530 (2,758–3,704) | 1,943 (1,604–2,094) | 1,667 (1,375–1,805) | 1,765 (1,379–1,852) |
+| 2,000 | D | 1,870 (1,812–1,980) | 1,127 (1,108–1,192) | 976 (962–1,008) | 1,034 (965–1,037) |
+
+`leep_derive_total` counts the same trigram rows from every caller. Its
+excess over `leep_index_rows_total` in the window was 0 to 248
+`blob-trigrams-v1` and 0 to 140 `tree-trigrams-v1` rows per run in A and
+D, and 0 to 12 and 0 to 7 in C, which runs no search. Against the
+admitted searches that is at most about 8 blob rows and 5 tree rows per
+search. `leep_query_inline_derive_total` did not move in any run.
+
+`leep-swarm` does not record the per-search `stats.blob_rows_derived` or
+`stats.tree_rows_derived`: it reads only the status of a search answer,
+not its body. In their place, after the runs, on the idle test server
+(default limits, `bbd3081`), the swarm's query (`agent N`, limit 20) ran
+three times for each of 4 values of N, twice on the last run's ref and
+once on `main`:
+
+| N | Files considered / scanned | Bytes scanned | Matches | Rows derived (blob / tree) | Time, three runs |
+|---|---|---|---|---|---|
+| 7 | 32,046 / 380 | 30.0 MB | 0 | 0 / 0 | 3.30, 1.82, 1.88 s |
+| 123 | 46,038 / 222 | 23.8 MB | 0 | 0 / 0 | 3.03, 2.05, 2.13 s |
+| 1999 | 31,351 / 210 | 16.2 MB | 0 | 0 / 0 | 1.88, 1.47, 1.70 s |
+| 4242 | 23,699 / 7 | 0.45 MB | 0 | 0 / 0 | 1.05, 1.08, 1.01 s |
+
+- **The admitted search got cheaper, by about 30% at 500 agents and 10 to
+  15% at 2,000, not by the harness's factor of 40.** Server time per
+  search fell from 7.0–8.0 s to 4.6–5.8 s in A at 500 agents and from
+  7.5–7.6 s to 4.9–6.0 s in D. At 2,000 agents it fell less, from 4.1–4.8
+  s to 3.3–4.5 s in A and from 4.5–5.7 s to 4.1–4.6 s in D. Admitted
+  searches answered more often (A 21 and 30 per window against 19 and 28,
+  D 41 and 50 against 31 and 43). The permits stayed busy the whole window
+  (summed search time 91 to 100% of it in A, 1.75 to 2.07 permits in D).
+  Shed rates were 95 to 98% in A and 90 to 94% in D, against E5's 96 to
+  98% in A.
+- **Derivation is no longer in an admitted search.** The warmer derived
+  nearly all trigram rows in every arm, about two blob rows and one tree
+  row per land, with `history-tree-v4` rows close to the lands in the
+  window. At most a few rows per search were derived anywhere else, and
+  the idle searches above derived none.
+- **What is left is running the search itself.** On the idle server one
+  `agent N` search took 1.0 to 3.3 s and scanned up to 380 files and 30
+  MB. Its pattern matched nothing: the swarm writes `swarm <run> a<who>
+  s<seq>` lines, not `agent N`. So the search does not stop early, and
+  every file the trigram filter lets through is read in full. *Inference:*
+  under the swarm, CPU and metadata pool contention stretch those 1 to 3 s
+  to the 3 to 6 s measured. *Correction to E5:* E5 read derivation as most
+  of an admitted search. In E5b derivation is close to zero and an
+  admitted search still costs 3 to 6 s, so derivation was at most part of
+  E5's 7 to 8 s. E5 did not measure the split.
+- **Arm A did not get closer to C.** A lands at 72% of C's rate at 500
+  agents (18.4 against 25.6; E5 83%) and 75% at 2,000 (11.2 against 15.0;
+  E5 74%). C is within E5's ranges (25.6 against 25.7, 15.0 against 15.9),
+  so lands without search did not change. A at 500 agents is inside E5's
+  range (17.2–21.4) but its median is 2.9 lands/s lower, and its land p50
+  is 13.6 s against 10.9 s. *Inference:* the searches that got cheaper ran
+  more often in the same permit, and the work moved from lands to them.
+  The runs do not test this.
+- **D does not beat A.** D lands less often than A at both counts (13.7
+  against 18.4 at 500 agents, 10.1 against 11.2 at 2,000). At 500 agents D
+  is below E5's range (13.3–13.7 against 14.5–17.7), with land p99 at 79
+  s. At 2,000 it is slightly above E5's range (9.6–10.1 against 8.6–9.5).
+- **Against ADR 0060's criterion** (close at least half of E1's gap, 3.1
+  to 30.4 lands/s at 500 agents and 1.6 to 18.8 at 2,000): A closes 56% at
+  500 agents ((18.4 − 3.1) / 27.3) and 56% at 2,000 ((11.2 − 1.6) / 17.2).
+  Its lowest round at 2,000 agents, 9.5, closes 46%. D closes 39% and 49%
+  and fails at both counts. The `search` default stays at `max(1, cores /
+  2)`, one permit on two cores.
+- **At 2,000 agents the land queue is still the limit.** Lands wait 27.5
+  to 29.0 s for the lock in every arm, against the client's 30 s timeout,
+  as in E5.
+
 #### Search rows derived in level batches (after E5)
 
 [research/search-inline-derive.md](research/search-inline-derive.md)
@@ -1250,9 +1369,8 @@ that: on a smaller swarm-shaped tree `derive_search` made 13, 199 and 769
 round trips at gaps of 1, 32 and 128 before, and 10 at each after
 (searching: 17, 201, 769 before, 14 after).
 
-Not measured yet: the swarm itself. The next E5 run should record
-`stats.blob_rows_derived` and `stats.tree_rows_derived` per search and
-`leep_index_rows_total` beside `leep_derive_total`.
+The swarm itself is measured in "Search rows derived in level batches, in
+the swarm (E5b)" above.
 
 ## Real history: git/git
 
