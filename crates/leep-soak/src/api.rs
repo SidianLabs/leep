@@ -34,8 +34,8 @@ pub struct Resp {
     pub status: u16,
     pub body: Vec<u8>,
     pub retry_after: Option<Duration>,
-    /// Carried `Leep-Refused`: refused before any work (ADR 0060).
-    pub refused: bool,
+    /// `Leep-Refused`: refused before any work (ADR 0060), and why.
+    pub refused: Option<String>,
     /// Exchanges it took, retries included.
     pub tries: u32,
 }
@@ -135,7 +135,11 @@ impl Api {
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.trim().parse::<f64>().ok())
             .map(Duration::from_secs_f64);
-        let refused = res.headers().contains_key(leep_core::api::REFUSED_HEADER);
+        let refused = res
+            .headers()
+            .get(leep_core::api::REFUSED_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
         let bytes = res.bytes().await.map_err(|e| describe(&e))?;
         let dt = t0.elapsed();
         self.sh.stats.record(
@@ -175,7 +179,8 @@ impl Api {
     }
 
     /// Send until the server gives an answer a caller can act on: throttling
-    /// (429), shed reads (503 with `Leep-Refused`), request timeouts (408),
+    /// (429), shed reads and lands not admitted (503 with `Leep-Refused`),
+    /// request timeouts (408),
     /// transport failures and other 5xx are waited
     /// out and counted. A transport failure or 5xx outside a restart is a
     /// violation (the retry still happens, so the run can show what follows).
@@ -223,10 +228,19 @@ impl Api {
                                 .clamp(Duration::from_millis(20), Duration::from_secs(2));
                             self.pause(wait).await?;
                         }
-                        // A read shed because its class is full (ADR 0060):
-                        // expected under load, waited out like a 429.
-                        503 if r.refused => {
-                            self.sh.stats.inc("shed_503");
+                        // A read shed because its class is full, or a land
+                        // not admitted because its ref's queue is (ADR
+                        // 0060): expected under load, waited out like a
+                        // 429. Nothing was done, so even an unkeyed land
+                        // is sent again.
+                        503 if r.refused.is_some() => {
+                            let admission =
+                                r.refused.as_deref() == Some(leep_core::api::REFUSED_ADMISSION);
+                            self.sh.stats.inc(if admission {
+                                "admission_503"
+                            } else {
+                                "shed_503"
+                            });
                             let wait = r
                                 .retry_after
                                 .unwrap_or(Duration::from_millis(100))

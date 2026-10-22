@@ -216,6 +216,10 @@ struct Tally {
     conflicts: u64,
     status_409: u64,
     resends: u64,
+    /// Lands the server did not admit because the ref's queue was full
+    /// (503 with `Leep-Refused`, ADR 0060): sent again after `Retry-After`,
+    /// not counted as errors or resends.
+    admission: u64,
     rebased: u64,
     /// Sent a land inside the window.
     sent_in_window: bool,
@@ -249,6 +253,9 @@ impl Tally {
 enum Answer<T> {
     Ok(T),
     Status(u16),
+    /// 503 with `Leep-Refused`: refused before any work (ADR 0060), with
+    /// its `Retry-After`.
+    Refused(Duration),
     /// Timeout or a lost connection: the request may have applied.
     Lost(String),
 }
@@ -286,6 +293,17 @@ impl Shared {
             Err(e) => return Answer::Lost(short_err(&e)),
         };
         let status = res.status();
+        if status == StatusCode::SERVICE_UNAVAILABLE
+            && res.headers().contains_key(leep_core::api::REFUSED_HEADER)
+        {
+            let wait = res
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .unwrap_or(1);
+            return Answer::Refused(Duration::from_secs(wait));
+        }
         let bytes = match res.bytes().await {
             Ok(b) => b,
             Err(e) => return Answer::Lost(short_err(&e)),
@@ -418,6 +436,7 @@ async fn agent(s: Arc<Shared>, who: usize, start_after: Duration) -> Tally {
                     }
                 }
                 Answer::Status(c) => t.error(format!("sync {c}")),
+                Answer::Refused(_) => t.error("sync refused"),
                 Answer::Lost(e) => t.error(format!("sync {e}")),
             }
             t.time(measuring, "sync", t0);
@@ -520,6 +539,10 @@ async fn agent(s: Arc<Shared>, who: usize, start_after: Duration) -> Tally {
                     t.error(format!("upload {c}"));
                     upload_failed = true;
                 }
+                Answer::Refused(_) => {
+                    t.error("upload refused");
+                    upload_failed = true;
+                }
                 Answer::Lost(e) => {
                     t.error(format!("upload {e}"));
                     upload_failed = true;
@@ -563,6 +586,10 @@ async fn agent(s: Arc<Shared>, who: usize, start_after: Duration) -> Tally {
                 t.error(format!("create {c}"));
                 continue;
             }
+            Answer::Refused(_) => {
+                t.error("create refused");
+                continue;
+            }
             Answer::Lost(e) => {
                 t.error(format!("create {e}"));
                 continue;
@@ -599,6 +626,17 @@ async fn agent(s: Arc<Shared>, who: usize, start_after: Duration) -> Tally {
                 Answer::Status(409) => {
                     t.status_409 += 1;
                     tokio::time::sleep(Duration::from_millis(20 + rng.below(80) as u64)).await;
+                }
+                // Not admitted (ADR 0060): nothing was queued, so it is
+                // sent again, keyed or not, after the wait plus jitter, as
+                // `leep land` does. It does not use up the land's tries.
+                Answer::Refused(wait) => {
+                    t.admission += 1;
+                    tries -= 1;
+                    sleep_unless_stopped(&s, wait.mul_f64(1.0 + rng.unit() / 2.0)).await;
+                    if s.stop.load(Ordering::Relaxed) {
+                        break None;
+                    }
                 }
                 // The land may have applied: send it again, as a client would.
                 Answer::Status(c) if c >= 500 || c == 408 => {
@@ -830,6 +868,7 @@ async fn history_markers(s: &Shared) -> Result<HashMap<String, u32>> {
         let page = match s.call::<LogResponse>(0, Method::GET, &path, None).await {
             Answer::Ok(p) => p,
             Answer::Status(c) => bail!("log page: {c}"),
+            Answer::Refused(_) => bail!("log page refused"),
             Answer::Lost(e) => bail!("log page: {e}"),
         };
         let mut below_base = false;
@@ -950,6 +989,9 @@ struct Report {
     conflicts: u64,
     status_409: u64,
     resends: u64,
+    /// Lands not admitted (503 with `Leep-Refused`, ADR 0060), each sent
+    /// again after its `Retry-After`.
+    admission_refused: u64,
     /// Agents that sent a land inside the window and had none answered there.
     stalled_agents: usize,
     /// Agents that sent no land inside the window (still thinking, reading
@@ -1103,6 +1145,7 @@ async fn main() -> Result<()> {
         tally.conflicts += a.conflicts;
         tally.status_409 += a.status_409;
         tally.resends += a.resends;
+        tally.admission += a.admission;
         tally.rebased += a.rebased;
         tally.landed.extend(a.landed);
         for (k, v) in a.indexing {
@@ -1159,6 +1202,7 @@ async fn main() -> Result<()> {
         conflicts: tally.conflicts,
         status_409: tally.status_409,
         resends: tally.resends,
+        admission_refused: tally.admission,
         stalled_agents: stalled,
         incomplete_cycles: incomplete,
         lands_per_server: per_server,
@@ -1284,12 +1328,13 @@ fn print_report(r: &Report) {
         println!("| {k} | {} | {:.1} | {:.1} |", v.count, v.p50_ms, v.p99_ms);
     }
     println!(
-        "indexing header {} | lands/s per agent {:.4} | indexing answers {:?} | stale answers {:?} | shed reads {:?} | inline derivations {} | history derived {} for {} rows",
+        "indexing header {} | lands/s per agent {:.4} | indexing answers {:?} | stale answers {:?} | shed reads {:?} | lands not admitted {} | inline derivations {} | history derived {} for {} rows",
         r.indexing_header.as_deref().unwrap_or("none"),
         r.lands_per_agent_s,
         r.indexing_answers,
         r.stale_answers,
         r.shed_reads,
+        r.admission_refused,
         r.inline_derives,
         r.history_derived,
         r.history_rows_added.map_or("-".into(), |n| n.to_string()),
