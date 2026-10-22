@@ -302,6 +302,9 @@ fn warm_passes_count_rows_by_kind() {
     };
     assert_eq!(derived("tree-trigrams-v1"), 3.0 + 3.0);
     assert_eq!(derived("blob-trigrams-v1"), 3.0 + 1.0);
+    // A warmer of every group labels its passes `all`; the server's loops
+    // label theirs with their group.
+    line(&text, "leep_warm_duration_seconds", &["group=\"all\""]);
     // Heads, for search, as before.
     let heads = line(
         &text,

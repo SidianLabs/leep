@@ -1179,6 +1179,8 @@ pub(crate) struct Probe {
     pub(crate) calls: AtomicU64,
     /// `put_derived_many` calls.
     pub(crate) puts: AtomicU64,
+    /// Keys asked of `get_derived_many`.
+    pub(crate) keys_read: AtomicU64,
     /// The most rows, and bytes, one `put_derived_many` carried.
     pub(crate) most_rows: AtomicUsize,
     pub(crate) most_bytes: AtomicUsize,
@@ -1202,6 +1204,7 @@ impl Probe {
             delay,
             calls: AtomicU64::new(0),
             puts: AtomicU64::new(0),
+            keys_read: AtomicU64::new(0),
             most_rows: AtomicUsize::new(0),
             most_bytes: AtomicUsize::new(0),
             written: Mutex::default(),
@@ -1300,6 +1303,7 @@ impl leep_core::MetaStore for Probe {
         keys: &[Hash],
     ) -> leep_core::Result<Vec<Option<Bytes>>> {
         self.call().await;
+        self.keys_read.fetch_add(keys.len() as u64, SeqCst);
         self.inner.get_derived_many(kind, keys).await
     }
     async fn list_derived(

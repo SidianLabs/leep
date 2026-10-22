@@ -70,9 +70,9 @@ measured until the response head is ready, not until the body is streamed.
 | `leep_land_routed_total` | counter | `route` = `uncoordinated` | Lands batched here with coordination on but no lease: no live lease was known and none could be taken (the store failing). They race the CAS as without coordination. |
 | `leep_derive_total` | counter | `kind` | Derived values computed (cache hits in the meta store are not counted). |
 | `leep_derive_duration_seconds` | histogram | `kind` | Time to compute one derived value. |
-| `leep_warm_refs_total` | counter | `result` = `ok`, `error` | Ref heads the background warmer derived indexes for (ADR 0028). Each index group warms in a loop of its own, so a head counts once per group (three times with `--warm-search`). Errors are retried by the next full listing of refs, every 5 s. |
-| `leep_warm_duration_seconds` | histogram | none | Time for one index group's loop to warm the heads that moved since its last pass, together (ADR 0058). Seconds to hours after an import or a restart onto a large history; milliseconds once warm. |
-| `leep_warm_delay_seconds` | histogram | none | Time from a ref move until the warmer stored that head's indexes of one group, at **1-second resolution**: the ref log records whole seconds, so every sample is an integer and 0 means the same second. Recorded only for moves the ref-log tail found, not for refs a full listing turned up. How far the indexes trail the refs; 0 or 1 when the warmer keeps up, so read it as a count of slow warms rather than a latency below a second. |
+| `leep_warm_refs_total` | counter | `result` = `ok`, `error` | Ref heads the background warmer derived indexes for (ADR 0028). Each index group warms in a loop of its own, so a head counts once per group (three times with `--warm-search`). Each loop tails the ref log every pass and lists every ref every 5 s on its own, so the warmer makes up to three times those cheap reads. Errors are retried by the next full listing of refs, every 5 s. |
+| `leep_warm_duration_seconds` | histogram | `group` = `history`, `log-filter`, `search` | Time for one index group's loop to warm the heads that moved since its last pass, together (ADR 0058). Seconds to hours after an import or a restart onto a large history; milliseconds once warm. |
+| `leep_warm_delay_seconds` | histogram | `group` = `history`, `log-filter`, `search` | Time from a ref move until the warmer stored that head's indexes of one group, at **1-second resolution**: the ref log records whole seconds, so every sample is an integer and 0 means the same second. Recorded only for moves the ref-log tail found, not for refs a full listing turned up. How far the indexes trail the refs; 0 or 1 when the warmer keeps up, so read it as a count of slow warms rather than a latency below a second. |
 | `leep_index_lease_held` | gauge | `kind` | 1 while this server holds the index lease of the group named by its primary kind (`history-tree-v4`, `log-filter-v1`, `tree-trigrams-v1`), `--indexing lease` only (ADR 0058). |
 | `leep_index_lease_acquired_total` | counter | `kind` | Index leases this server took (a new epoch). |
 | `leep_index_lease_lost_total` | counter | `kind`; `reason` = `taken`, `store` | Index leases lost: another server took it after renewals stopped (`taken`), or renewals failed until the view ran out (`store`). |
@@ -1581,7 +1581,10 @@ Use index leases instead (ADR 0058):
   what is missing up to `--query-scan-budget` (1,024 changesets),
   `--blame-scan-budget` (128 first-parent steps), `--search-scan-budget`
   (512 files) and `--search-scan-bytes` (16 MiB), with the same answers as
-  a fully indexed store. Further behind, clients sending `Leep-Indexing:
+  a fully indexed store. A search also stops, before fetching anything,
+  once the directories without filters it has read hold more than 8 times
+  those budgets (plus 256 files and 16 MiB), so an over-budget search of a
+  cold tree does not first read the whole tree. Further behind, clients sending `Leep-Indexing:
   retry` (the CLI) get 503 with `Retry-After`, `stale-ok` (MCP) an older
   answer, and requests without the header wait up to `--index-wait` (10 s,
   at most `--index-waiters` of them at once, 64), then scan `--legacy-scan-factor`

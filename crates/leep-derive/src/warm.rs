@@ -119,6 +119,12 @@ impl Warmer {
         self
     }
 
+    /// The `group` label of this warmer's per-pass metrics: the group of a
+    /// loop of one, `all` for a warmer of every group.
+    fn group_label(&self) -> &'static str {
+        self.only.map_or("all", IndexGroup::short_name)
+    }
+
     /// The groups this warmer covers, held or not.
     fn all_groups(&self) -> Vec<IndexGroup> {
         let mut out = vec![IndexGroup::History, IndexGroup::LogFilter];
@@ -258,7 +264,8 @@ impl Warmer {
                     // 1-second resolution: ref log times are whole
                     // seconds, so 0 means "within the same second".
                     let delay = (unix_now() - at).max(0) as f64;
-                    metrics::histogram!("leep_warm_delay_seconds").record(delay);
+                    metrics::histogram!("leep_warm_delay_seconds", "group" => self.group_label())
+                        .record(delay);
                 }
                 report.warmed += 1;
             } else {
@@ -272,7 +279,8 @@ impl Warmer {
             }
         }
         let took = started.elapsed();
-        metrics::histogram!("leep_warm_duration_seconds").record(took.as_secs_f64());
+        metrics::histogram!("leep_warm_duration_seconds", "group" => self.group_label())
+            .record(took.as_secs_f64());
         if took > Duration::from_secs(1) {
             tracing::info!(
                 refs = report.warmed,

@@ -19,7 +19,13 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   deriving it again, without holding a search pool permit.
 - The background warmer runs each index group in a loop of its own, so a
   path-history catch-up no longer holds back search warming. The
-  `leep_warm_*` metrics are recorded per group loop.
+  `leep_warm_*` metrics are recorded per group loop, and the
+  `leep_warm_duration_seconds` and `leep_warm_delay_seconds` histograms
+  gain a `group` label.
+- A bounded search (`--indexing lease` or `off`) over a cold tree stops
+  with 503 once the files it found without index rows pass 8 times its
+  `--search-scan-budget` and `--search-scan-bytes` (plus 256 files and
+  16 MiB), before reading the rest of the tree.
 - New metric `leep_index_rows_total{kind}`: rows the warmer derived.
   `leep_index_derived_total` still counts changesets (heads, for search).
 

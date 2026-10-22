@@ -304,34 +304,46 @@ impl Repo {
         let mut seen: HashSet<Hash> = HashSet::from([root]);
         let mut level = vec![root];
         let mut lookup = vec![root];
+        // A bounded scan's searchable files found so far, and their bytes.
+        let (mut files, mut bytes) = (0u64, 0u64);
         while !level.is_empty() {
-            let mut nodes = Vec::with_capacity(level.len());
             for chunk in level.chunks(READ_KEYS) {
-                nodes.extend(self.read_trees(chunk).await?);
-            }
-            for (&hash, node) in level.iter().zip(nodes) {
-                let mut dir = Dir {
-                    hash,
-                    dirs: Vec::new(),
-                    files: Vec::new(),
-                };
-                for entry in node.entries.into_values() {
-                    match entry {
-                        TreeEntry::Dir { tree } => {
-                            dir.dirs.push(tree);
-                            if seen.insert(tree) {
-                                lookup.push(tree);
+                let nodes = self.read_trees(chunk).await?;
+                for (&hash, node) in chunk.iter().zip(nodes) {
+                    let mut dir = Dir {
+                        hash,
+                        dirs: Vec::new(),
+                        files: Vec::new(),
+                    };
+                    for entry in node.entries.into_values() {
+                        match entry {
+                            TreeEntry::Dir { tree } => {
+                                dir.dirs.push(tree);
+                                if seen.insert(tree) {
+                                    lookup.push(tree);
+                                }
                             }
+                            TreeEntry::File {
+                                content,
+                                kind,
+                                size,
+                            } if kind != FileKind::Symlink => dir.files.push((content, size)),
+                            TreeEntry::File { .. } => {}
                         }
-                        TreeEntry::File {
-                            content,
-                            kind,
-                            size,
-                        } if kind != FileKind::Symlink => dir.files.push((content, size)),
-                        TreeEntry::File { .. } => {}
                     }
+                    for &(_, size) in &dir.files {
+                        if size <= MAX_INDEXED_BYTES {
+                            files += 1;
+                            bytes += size;
+                        }
+                    }
+                    out.push(dir);
                 }
-                out.push(dir);
+                // A bounded scan gives up here, before reading the rest of
+                // a cold tree, once it has found far more than it may fetch.
+                if let Some(scan) = &c.scan {
+                    scan.discovered(files, bytes)?;
+                }
             }
             let rows = self.rows_of(true, &lookup, c).await?;
             level = Vec::new();
@@ -521,7 +533,12 @@ struct Flight<'a> {
 
 impl<'a> Flight<'a> {
     fn join(flights: &'a Flights, key: Hash) -> Self {
-        let lock = flights.lock().unwrap().entry(key).or_default().clone();
+        let lock = flights
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(key)
+            .or_default()
+            .clone();
         Flight {
             flights,
             key,
@@ -554,7 +571,7 @@ impl<'a> Flight<'a> {
 /// newcomer takes to join.
 impl Drop for Flight<'_> {
     fn drop(&mut self) {
-        let mut flights = self.flights.lock().unwrap();
+        let mut flights = self.flights.lock().unwrap_or_else(|e| e.into_inner());
         self.guard = None;
         self.lock = None;
         if flights
@@ -818,6 +835,63 @@ impl Repo {
                 Some(parent) => parent.bloom.or_encoded(&row)?,
                 None => return Ok(row),
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod height_tests {
+    use super::*;
+
+    fn h(n: u8) -> Hash {
+        Hash::of_blob(&[n])
+    }
+
+    fn dir(hash: Hash, dirs: &[Hash]) -> Dir {
+        Dir {
+            hash,
+            dirs: dirs.to_vec(),
+            files: Vec::new(),
+        }
+    }
+
+    /// A diamond: the root holds `a` and `s`, and `a` holds `s` again, so
+    /// the same missing subtree sits at depths 1 and 2, under parents of
+    /// different heights. In any order the walk could list them, every
+    /// missing child is lower than its parent, and a stored child (not
+    /// listed) is ignored.
+    #[test]
+    fn a_shared_subtree_is_lower_than_every_parent() {
+        let (root, a, s, leaf, stored) = (h(0), h(1), h(2), h(3), h(4));
+        let all = [
+            dir(root, &[a, s, stored]),
+            dir(a, &[s, stored]),
+            dir(s, &[leaf]),
+            dir(leaf, &[stored]),
+        ];
+        for order in [[0, 1, 2, 3], [0, 2, 1, 3], [3, 2, 1, 0], [2, 0, 3, 1]] {
+            let dirs: Vec<Dir> = order
+                .iter()
+                .map(|&i| dir(all[i].hash, &all[i].dirs))
+                .collect();
+            let levels = by_height(&dirs);
+            let height = |x: Hash| {
+                levels
+                    .iter()
+                    .position(|l| l.iter().any(|&i| dirs[i].hash == x))
+                    .expect("listed once")
+            };
+            assert_eq!(levels.iter().map(Vec::len).sum::<usize>(), 4);
+            for d in &dirs {
+                for &child in d.dirs.iter().filter(|&&c| c != stored) {
+                    assert!(height(child) < height(d.hash), "{order:?}");
+                }
+            }
+            assert_eq!(
+                [height(leaf), height(s), height(a), height(root)],
+                [0, 1, 2, 3],
+                "{order:?}"
+            );
         }
     }
 }

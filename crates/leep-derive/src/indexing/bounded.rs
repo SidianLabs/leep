@@ -126,16 +126,45 @@ impl SearchScan {
         let files = self.files.fetch_add(1, Ordering::Relaxed) + 1;
         let total = self.bytes.fetch_add(bytes, Ordering::Relaxed) + bytes;
         if files > self.max_files || total > self.max_bytes {
-            self.over.store(true, Ordering::Relaxed);
-            return Err(Error::Indexing {
-                kind: IndexGroup::Search.lease_name().into(),
-                behind: 0,
-                retry_after_ms: 1000,
-            });
+            return Err(self.overrun());
         }
         Ok(())
     }
+
+    /// Check the searchable files (and their bytes) found so far in
+    /// directories without a filter, before any is fetched: past
+    /// [`DISCOVERY_FACTOR`] times the budget, plus some slack, the search
+    /// stops with [`Error::Indexing`] instead of first reading the rest of
+    /// a large cold tree. A multiple, because a file whose row is stored
+    /// costs no fetch.
+    pub(crate) fn discovered(&self, files: u64, bytes: u64) -> Result<()> {
+        let max_files =
+            (self.max_files.saturating_mul(DISCOVERY_FACTOR)).saturating_add(DISCOVERY_FILES);
+        let max_bytes =
+            (self.max_bytes.saturating_mul(DISCOVERY_FACTOR)).saturating_add(DISCOVERY_BYTES);
+        if files > max_files || bytes > max_bytes {
+            return Err(self.overrun());
+        }
+        Ok(())
+    }
+
+    fn overrun(&self) -> Error {
+        self.over.store(true, Ordering::Relaxed);
+        Error::Indexing {
+            kind: IndexGroup::Search.lease_name().into(),
+            behind: 0,
+            retry_after_ms: 1000,
+        }
+    }
 }
+
+/// How many times its file and byte budgets a bounded search may find in
+/// directories without a filter before it gives up unfetched.
+pub(crate) const DISCOVERY_FACTOR: u64 = 8;
+/// Files, and bytes, allowed beyond that, so a budget of 0 (or a small
+/// one) still admits a search whose files all have rows.
+pub(crate) const DISCOVERY_FILES: u64 = 256;
+pub(crate) const DISCOVERY_BYTES: u64 = 16 << 20;
 
 /// The changesets reachable from some starts that lack a row of one kind.
 #[derive(Default)]
