@@ -7,6 +7,12 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 ## [Unreleased]
 
+### `leep-git import` and `export` read `LEEP_META` and `LEEP_BLOBS`
+- `--meta` and `--blobs` fall back to the same variables as `leep-server`
+  and its subcommands, so one environment file serves the server, `backup`
+  and an import. The flags still win. `leep-git import --help` now
+  describes its options.
+
 ### Lands can be refused at a full queue instead of timing out in it
 - `--land-queue-batches N` (default `off`) bounds each ref's land queue in
   batches of up to 64 lands (ADR 0060, section 2). A land that would wait
