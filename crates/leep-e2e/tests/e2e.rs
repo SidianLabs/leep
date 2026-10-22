@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::Barrier;
 
 use common::*;
 
@@ -122,15 +123,57 @@ fn has_markers(text: &str) -> bool {
         .any(|l| l.starts_with("<<<<<<<") || l.starts_with(">>>>>>>") || l.starts_with("======="))
 }
 
+/// Holds an agent at the swarm's start line until every agent has committed,
+/// also when it returns early, so a failed agent cannot strand the others.
+struct StartLine<'a>(Option<&'a Barrier>);
+
+impl StartLine<'_> {
+    fn wait(&mut self) {
+        if let Some(b) = self.0.take() {
+            b.wait();
+        }
+    }
+}
+
+impl Drop for StartLine<'_> {
+    fn drop(&mut self) {
+        self.wait();
+    }
+}
+
 /// One agent: init, commit its file, land; on conflict resolve and land again.
 /// Any other land failure fails the test: under contention the server must
 /// queue lands, not give up.
-fn run_agent(client: &Client, root: &Path, n: usize) -> Result<(), String> {
+///
+/// No agent lands before every agent has committed: one that started from a
+/// main another agent had already edited would replace that agent's line 5,
+/// a real edit that the final check would read as a lost one.
+fn run_agent(client: &Client, root: &Path, n: usize, start: &Barrier) -> Result<(), String> {
+    let mut start = StartLine(Some(start));
     let wc = root.join(format!("wc-{n:02}"));
     let wc_s = wc.to_str().unwrap();
     let session = n.to_string();
-    let step =
-        |args: &[&str]| -> Result<std::process::Output, String> { Ok(client.run(&wc, args)) };
+    // Every command and its output, for the report if this agent's edit is
+    // later missing from main.
+    let transcript = root.join(format!("transcript-{n:02}.txt"));
+    let step = |args: &[&str]| -> Result<std::process::Output, String> {
+        let out = client.run(&wc, args);
+        let shared = fs::read_to_string(wc.join("shared.txt")).unwrap_or_default();
+        let entry = format!(
+            "$ leep {}\n{}--- stdout\n{}--- stderr\n{}--- shared.txt after\n{shared}\n",
+            args.join(" "),
+            out.status,
+            stdout(&out),
+            stderr(&out),
+        );
+        fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&transcript)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, entry.as_bytes()))
+            .map_err(|e| e.to_string())?;
+        Ok(out)
+    };
     let fail = |what: &str, out: &std::process::Output| {
         format!(
             "agent {n}: {what} failed ({})\n--- stdout\n{}\n--- stderr\n{}",
@@ -178,6 +221,7 @@ fn run_agent(client: &Client, root: &Path, n: usize) -> Result<(), String> {
         }
     };
     commit(&format!("agent {n:02}: add file"))?;
+    start.wait();
 
     for _ in 0..MAX_LAND_TRIES {
         let out = step(&["land"])?;
@@ -200,9 +244,10 @@ fn run_agent(client: &Client, root: &Path, n: usize) -> Result<(), String> {
 }
 
 fn swarm(client: &Client, root: &Path) {
+    let start = &Barrier::new(AGENTS);
     let errors: Vec<String> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..AGENTS)
-            .map(|n| s.spawn(move || run_agent(client, root, n)))
+            .map(|n| s.spawn(move || run_agent(client, root, n, start)))
             .collect();
         handles
             .into_iter()
@@ -258,7 +303,9 @@ fn run_import_swarm_export(stores: &Stores, work: &Path) {
     for n in CONFLICTING {
         assert!(
             shared.contains(&shared_line(n)),
-            "edit of agent {n} lost from shared.txt:\n{shared}"
+            "edit of agent {n} lost from shared.txt:\n{shared}\n--- agent {n} transcript\n{}\n--- log main\n{}",
+            fs::read_to_string(work.join(format!("transcript-{n:02}.txt"))).unwrap_or_default(),
+            stdout(&client.run(&verify, &["log", "main", "-n", "80"])),
         );
     }
     let original = shared_original();

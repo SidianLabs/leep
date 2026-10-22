@@ -32,6 +32,9 @@ alerts=$(printf '%s\n' "$rules" | sed -nE 's/^[[:space:]]*-[[:space:]]+alert:[[:
 sections=$(sed -nE 's/^## (Leep[A-Za-z0-9]*)[[:space:]]*$/\1/p' "$RB")
 urls=$(printf '%s\n' "$rules" | grep -E '^[[:space:]]*runbook_url:' | grep -oE 'RUNBOOKS\.md#[A-Za-z0-9_-]+' | sed 's/^RUNBOOKS\.md#//' || true)
 
+# grep -q exits at its first match; fed by a pipe, that can kill the writer
+# with SIGPIPE, and pipefail then reports the match as a miss. Here-strings
+# have no writer to kill.
 dups() { sort | uniq -d; }
 
 for d in $(printf '%s\n' "$alerts" | dups); do fail "alert $d is defined twice in $OPS"; done
@@ -39,23 +42,23 @@ for d in $(printf '%s\n' "$sections" | dups); do fail "$RB has two '## $d' secti
 
 while read -r name; do
   [ -n "$name" ] || continue
-  printf '%s\n' "$sections" | grep -qx "$name" ||
+  grep -qx "$name" <<<"$sections" ||
     fail "alert $name in $OPS has no '## $name' section in $RB"
   lower=$(printf '%s' "$name" | tr 'A-Z' 'a-z')
-  printf '%s\n' "$urls" | grep -qx "$lower" ||
+  grep -qx "$lower" <<<"$urls" ||
     fail "alert $name has no runbook_url ending in RUNBOOKS.md#$lower"
 done <<<"$alerts"
 
 while read -r name; do
   [ -n "$name" ] || continue
-  printf '%s\n' "$alerts" | grep -qx "$name" ||
+  grep -qx "$name" <<<"$alerts" ||
     fail "$RB has a '## $name' section but $OPS has no such alert"
 done <<<"$sections"
 
 alert_slugs=$(printf '%s\n' "$alerts" | tr 'A-Z' 'a-z')
 while read -r u; do
   [ -n "$u" ] || continue
-  printf '%s\n' "$alert_slugs" | grep -qx "$u" ||
+  grep -qx "$u" <<<"$alert_slugs" ||
     fail "runbook_url anchor #$u in $OPS matches no alert"
 done <<<"$urls"
 
@@ -67,18 +70,18 @@ slugs() {
 
 # Links into RUNBOOKS.md from anywhere, and from RUNBOOKS.md into other docs.
 check_link() { # file target-file anchor
-  slugs "$2" | grep -qx "$3" || fail "$1 links to $2#$3, which is not a heading there"
+  grep -qx "$3" <<<"$(slugs "$2")" || fail "$1 links to $2#$3, which is not a heading there"
 }
 rb_slugs=$(slugs "$RB")
 while IFS= read -r f; do
   while read -r a; do
     [ -n "$a" ] || continue
-    printf '%s\n' "$rb_slugs" | grep -qx "$a" || fail "$f links to RUNBOOKS.md#$a, which is not a heading there"
+    grep -qx "$a" <<<"$rb_slugs" || fail "$f links to RUNBOOKS.md#$a, which is not a heading there"
   done < <(grep -oE 'RUNBOOKS\.md#[A-Za-z0-9_-]+' "$f" | sed 's/^RUNBOOKS\.md#//' | sort -u)
 done < <(ls README.md CONTRIBUTING.md docs/*.md 2>/dev/null | grep -v "^$RB$")
 while read -r a; do
   [ -n "$a" ] || continue
-  printf '%s\n' "$rb_slugs" | grep -qx "$a" || fail "$RB links to #$a, which is not a heading in $RB"
+  grep -qx "$a" <<<"$rb_slugs" || fail "$RB links to #$a, which is not a heading in $RB"
 done < <(grep -oE '\]\(#[A-Za-z0-9_-]+\)' "$RB" | sed -E 's/^\]\(#//; s/\)$//' | sort -u)
 while read -r doc a; do
   [ -n "$a" ] || continue

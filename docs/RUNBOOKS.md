@@ -32,16 +32,16 @@ every runbook.
 | [LeepLandCasLossesHigh](#leeplandcaslosseshigh) | ticket | more than one lost compare-and-swap per land, for 15 minutes |
 | [LeepLandAdmissionRefusing](#leeplandadmissionrefusing) | ticket | more than 10% of lands are refused because their ref's queue is full, for 15 minutes |
 | [LeepLandForwardFailing](#leeplandforwardfailing) | ticket | servers fail to reach the server coordinating a ref's lands, for 10 minutes |
-| [LeepLandLeaseFlapping](#leeplandleaseflapping) | ticket | land leases change hands more than six times a minute, for 10 minutes |
+| [LeepLandLeaseFlapping](#leeplandleaseflapping) | ticket | land leases are taken from servers that failed to renew them, more than once a minute, for 10 minutes |
 | [LeepIndexLagging](#leepindexlagging) | ticket | an index group trails ref moves by over 2 minutes for 10 minutes |
 | [LeepIndexerMissing](#leepindexermissing) | page | an index group has had no lease holder (queries derive inline) for 5 minutes |
 | [LeepIndexingAnswersHigh](#leepindexinganswershigh) | ticket | more than 5% of indexed reads answer 503 (index behind) for 10 minutes |
-| [LeepLandSlowP99](#leeplandslowp99) | ticket | land p99 latency above 5 seconds for 10 minutes |
+| [LeepLandSlow](#leeplandslow) | ticket | lands wait over 15 seconds on average for their batch, or batches take over 15 seconds, for 10 minutes |
 | [LeepRequestTimeouts](#leeprequesttimeouts) | ticket | more than 5 requests hit `--request-timeout` (408) in 15 minutes |
 | [LeepTokenThrottled](#leeptokenthrottled) | ticket | one token has been limited steadily for 15 minutes |
 | [LeepBroadThrottling](#leepbroadthrottling) | ticket | more than 5% of all requests are 429 for 15 minutes |
 | [LeepBodyBudgetExhausted](#leepbodybudgetexhausted) | ticket | requests are refused because request bodies in flight fill `--max-inflight-bytes`, for 10 minutes |
-| [LeepReadsShedding](#leepreadsshedding) | ticket | a server refuses more than half of its searches because its search class is full, for 15 minutes |
+| [LeepReadsShedding](#leepreadsshedding) | ticket | a server sheds more than half of its searches *and* its search permits complete fewer than 2 searches a minute each, for 15 minutes |
 | [LeepBlobCacheColdHitRatio](#leepblobcachecoldhitratio) | ticket | blob cache hit ratio below 50% for 30 minutes |
 | [LeepConfigReloadFailed](#leepconfigreloadfailed) | page | a SIGHUP reload was refused |
 | [LeepTokensExpiringSoon](#leeptokensexpiringsoon) | ticket | a token expires within 7 days, or has expired and is still in the tokens file, for 1 hour |
@@ -63,13 +63,16 @@ every runbook.
 | [LeepGcFenceFlagStuck](#leepgcfenceflagstuck) | ticket | the changeset fence flag has been up for a day |
 | [LeepChangesetCollectSlow](#leepchangesetcollectslow) | ticket | a changeset collect batch took over 5 s |
 | [LeepDiskSpaceLow](#leepdiskspacelow) | ticket | a Leep data or backup filesystem has under 10% free |
+| [LeepInodesLow](#leepinodeslow) | ticket | a filesystem holding Leep blobs or its database has under 10% of its inodes free (optional, node_exporter) |
+| [LeepInodesCritical](#leepinodescritical) | page | the same, under 3% |
 
 Some rows depend on things the servers do not export:
 
 - `LeepBackupStale` to `LeepGcStale`, and `LeepUnreachableGcStale`, read
   wrapper metrics from [Cron wrappers](#cron-wrappers).
 - `LeepChangesetCollectSlow` reads the sweep's `--metrics-file`.
-- `LeepDiskSpaceLow` reads node_exporter's filesystem metrics.
+- `LeepDiskSpaceLow`, `LeepInodesLow` and `LeepInodesCritical` read
+  node_exporter's filesystem metrics.
 
 Servers export only the changeset sweep's writer-side metrics
 (`leep_gc_changesets_rescued_total`,
@@ -340,7 +343,10 @@ because their class was full (503 with `Leep-Refused`, ADR 0060): see
 [LeepReadsShedding](#leepreadsshedding). So are lands not admitted because
 their ref's queue was full (503 with `Leep-Refused: admission`), a
 forwarded one twice since the follower relays the leader's 503: see
-[LeepLandAdmissionRefusing](#leeplandadmissionrefusing).
+[LeepLandAdmissionRefusing](#leeplandadmissionrefusing). So are requests
+refused because the bodies in flight fill `--max-inflight-bytes` (503 with
+`Leep-Refused: body-budget`): see
+[LeepBodyBudgetExhausted](#leepbodybudgetexhausted).
 
 **Impact.** Agents see failed commits, lands and reads; the CLI prints the
 server's message and exits 3. Writes are idempotent, so retrying is safe, but
@@ -604,6 +610,21 @@ is not a failure: nothing was queued or recorded, and
 [LeepServerErrors](#leepservererrors) and [LeepLandErrors](#leeplanderrors)
 do not count it. The ref is offered more lands than it can replay.
 
+*Under load.* Unlike [LeepReadsShedding](#leepreadsshedding), a sustained
+refusal ratio is the signal itself, provided the bound follows the rule in
+[Land admission](OPERATIONS.md#land-admission): `N` full batches under half
+the agents' timeout. A land is then refused only when it would otherwise
+wait past that, which is where agents start timing out and resending. In
+the E5 and E5b swarms without admission, lands at 500 agents waited 4.0 to
+12.0 s on average (no search or the default search limit), under the 15 s
+such a bound allows, while at 2,000 agents they waited 27.5 to 30.2 s
+against a 30 s timeout and 10,300 to 15,300 per run were resent: that is
+the load this alert is for. Searches are extras that the limit sacrifices
+for lands; lands are the work, so a ref that cannot take them is a capacity
+problem to fix. If it fires while lands wait far less than half the
+timeout, the bound is too low (cause 3), and with `N = 1` it fires under any
+real load.
+
 **Impact.** Lands take longer to get in, but none waits in the queue past
 the bound, so clients stop timing out and resending into it. `leep land`
 waits the `Retry-After` plus jitter and sends the land again under the same
@@ -707,10 +728,14 @@ WARN lines and the [standard bundle](#collecting-a-bug-report).
 
 ## LeepLandLeaseFlapping
 
-**Meaning.** Land leases were taken more than six times a minute for 10
-minutes (`leep_land_lease_acquired_total`). **Ticket.** A lease changes hands
-only when its holder failed to renew it for the TTL (2 s), released it after 30 s
-idle, or shut down.
+**Meaning.** For 10 minutes, more than once a minute another server took a
+land lease whose holder was still running but had not renewed it for the TTL
+(2 s) (`leep_land_lease_lost_total{reason="taken"}`). **Ticket.** A lease
+also changes hands when its holder releases it after 30 s idle or shuts
+down; neither counts here. The rule used to count acquisitions
+(`leep_land_lease_acquired_total`), but agents that land on many refs, each
+less than every 30 s, release and take a lease on almost every land: harmless
+churn that fired it under load.
 
 **Impact.** Each change costs the lands in flight on the old holder a
 reroute, and lands batched on both sides for a moment race the CAS as
@@ -719,8 +744,9 @@ without coordination. Correctness is unaffected.
 **Diagnose.**
 
 1. `leep_land_lease_lost_total` by `reason` on each server: `taken` means a
-   holder failed to renew; `idle` with reacquisitions means refs that see a
-   land every half minute or so (harmless churn, raise nothing).
+   holder failed to renew, and the servers it happens on are the ones to
+   look at; `idle` with reacquisitions means refs that see a land every half
+   minute or so (harmless churn, raise nothing).
 2. Renewals failing: the metadata store's latency and errors (a renewal is
    one `UPDATE` every 500 ms per server, on connections reserved for lease
    calls, so a busy pool does not delay it; a slow or overloaded database
@@ -815,6 +841,11 @@ that carry a `Leep-Indexing` response header (otherwise one lagging index
 takes every query server out of rotation, or multiplies the load by
 retrying elsewhere).
 
+Shed searches (`leep_read_class_shed_total`) are left out of the
+denominator: they never reach an index, and under a swarm they are most
+search requests (90 to 98% in E5 and E5b), so counting them would hide
+indexing answers on the reads that ran.
+
 **Diagnose.** First [LeepIndexLagging](#leepindexlagging) and
 [LeepIndexerMissing](#leepindexermissing). `leep_query_indexing_answers_total`
 by `route` and `mode` says which queries and clients; `leep_query_unindexed_scanned_total`
@@ -828,15 +859,36 @@ each scanned changeset costs a few reads.
 **Escalate / collect.** The metrics above, lease rows and the
 [standard bundle](#collecting-a-bug-report).
 
-## LeepLandSlowP99
+## LeepLandSlow
 
-**Meaning.** The 99th percentile of the whole land call, including the time
-queued for the ref's next batch, has been above 5 seconds for 10 minutes. **Ticket.** The
-histogram tops out at 10 s, so very slow lands read as 10 s.
+**Meaning.** On one server, for 10 minutes, either lands waited more than 15 s
+on average for their batch to start (`leep_land_lock_wait_seconds`), or the
+time from a batch starting to its lands' answers, about one batch's replay,
+averaged more than 15 s (`leep_land_duration_seconds` less the wait).
+**Ticket.** 15 s is half of the 30 s timeout the swarm's agents use; set it
+to half of your agents' land timeout (`leep` itself waits 300 s). Both
+branches are means from the histograms' `_sum` and `_count`, which the
+histograms' 10 s top bucket does not cap.
+
+*Why not land p99.* This alert was `LeepLandSlowP99`, land p99 above 5 s.
+Lands to one ref queue for its next batch (ADR 0032), so under a busy fleet
+queueing is most of a land's time and p99 is far above 5 s while everything
+works: in the E5 and E5b swarms (`docs/PERFORMANCE.md`), land p99 was 13.1 to
+19.3 s at 500 agents without searches or with the default search limit,
+under the agents' 30 s timeout, and the histogram read all of it as 10 s. What hurts agents is waiting near their timeout, after which
+they resend into the same queue. Mean wait at 500 agents was 4.0 to 5.4 s
+without searches and 7.6 to 12.0 s with the default search limit (13.0 to
+17.9 s with two search permits, whose land p99 reached 79 s); at 2,000
+agents it was 27.5 to 30.2 s against the 30 s timeout, with 10,300 to 15,300
+lands resent per run. The first branch fires at the second and not the
+first. A replay slower than 15 s is a fault at any load: at 2,000 agents on
+two cores a full batch of 64 took about 4 to 7 s (64 over the land rate).
 
 **Impact.** Agents wait; lands to one ref queue in the server and are landed in
 batches (ADR 0032), each land replayed after the ones ahead of it, so the
 latency of the busiest ref grows with the number of agents landing on it.
+Agents whose timeout is near the wait time out and resend, which adds to the
+queue.
 
 **Diagnose.**
 
@@ -858,7 +910,8 @@ latency of the busiest ref grows with the number of agents landing on it.
 
 **Likely causes.**
 
-1. More landing agents than one ref can replay. Confirm: step 1.
+1. More landing agents than one ref can replay (the first branch). Confirm:
+   step 1, batches of 64.
 2. Agents landing stacks that are far behind main: a land costs more the further
    behind its stack is (replay). Confirm: durations grow with stack age, not with
    count.
@@ -876,6 +929,12 @@ latency of the busiest ref grows with the number of agents landing on it.
   [Upgrading](OPERATIONS.md#upgrading)).
 - Ask agents to `leep sync` more often so stacks stay short; lengthen the agents'
   think time or reduce how many land on one ref.
+- For the first branch, bound the queue with `--land-queue-batches`
+  ([Land admission](OPERATIONS.md#land-admission)): lands past the bound are
+  refused at once and resent after `Retry-After` instead of timing out in the
+  queue, and [LeepLandAdmissionRefusing](#leeplandadmissionrefusing) takes
+  over as the signal that the ref is offered more than it can replay. On a
+  small host, a lower `--read-concurrency` gives lands back their cores.
 - Scale or tune the metadata store.
 - Do not add server instances to parallelize lands on one ref: lands are only
   batched within a process, so more instances mean more lost swaps, and each
@@ -1036,8 +1095,10 @@ refused with `503` because the bodies of the requests already in flight fill
 `--max-inflight-bytes` (default 1 GiB), for 10 minutes. **Ticket.** Each request
 with a body holds its `Content-Length` of the budget (its route's cap,
 `--max-blob-bytes` or `--max-json-body-bytes`, when it declares none) until its
-handler finishes. These refusals also count as 5xx in
-[LeepServerErrors](#leepservererrors).
+handler finishes. These refusals carry `Leep-Refused: body-budget`: nothing
+was done, and [LeepServerErrors](#leepservererrors) does not count them. A
+land refused this way still counts in [LeepLandErrors](#leeplanderrors),
+since the refusal counter has no route label.
 
 **Impact.** Uploads, commits, lands and other requests with a body fail with
 `server busy: the request bodies in flight are at this server's limit; retry
@@ -1095,61 +1156,121 @@ latency, the three flags, the container memory limit, and the
 
 ## LeepReadsShedding
 
-**Meaning.** For 15 minutes, one server refused more than half of its
-searches because every permit of its search class was in use
-(`--read-concurrency`, ADR 0060). **Ticket.** A refusal is `503`
-`unavailable` with `Retry-After` and `Leep-Refused: read-class`, counted in
-`leep_read_class_shed_total{class="search"}`. It is not a failure, and
-[LeepServerErrors](#leepservererrors) does not count it. Searches are wanted
-faster than the host can run them.
+**Meaning.** For 15 minutes, one server shed more than half of its searches
+because every permit of its search class was in use (`--read-concurrency`,
+ADR 0060), **and** its search permits completed fewer than 2 searches a
+minute each (`leep_http_requests_total{route=~"/v1/search/.*",status="200"}`
+over `leep_read_class_permits{class="search"}`). **Ticket.** A shed search is
+`503` `unavailable` with `Retry-After` and `Leep-Refused: read-class`, counted
+in `leep_read_class_shed_total{class="search"}`. It is not a failure, and
+[LeepServerErrors](#leepservererrors) does not count it. While a class sheds,
+its permits are busy, so the searches it completes a minute per permit are
+60 over the time each one holds its permit: under 2 means admitted searches
+take over 30 s each, are answered with errors, or a permit is never given
+back.
+
+**Why shedding alone does not fire it.** Shedding is the limit doing its
+job: searches that the host cannot run beside the lands are refused, so the
+lands keep their cores. Under an agent swarm it is the normal state. In the
+E5 and E5b swarms (`docs/PERFORMANCE.md`; 500 and 2,000 agents, two cores,
+one permit by default), 95 to 98% of searches were shed with one permit and
+90 to 94% with two, for the whole run, while lands recovered more than half
+of what unlimited searches had cost them. The first version of this alert
+(more than half shed for 15 minutes) would have fired through all of it,
+telling the operator nothing. What the swarm also showed is what a healthy
+class looks like while it sheds: every permit busy (summed search time 91
+to 107% of the window) and each admitted search taking 3.3 to 8.0 s of
+server time, so a permit completed 7 to 18 searches a minute. Saturation
+(`leep_read_class_in_flight` at `leep_read_class_permits`) is therefore true
+under healthy load too and cannot tell the two apart; throughput per permit
+can. The threshold, 2 a minute, is a quarter of the slowest healthy rate.
+
+The other design considered, the shed rate per client token, is not
+possible with these metrics and would not help: `leep_read_class_shed_total`
+has no `token` label, on purpose, since the class protects the server, not a
+token's share (ADR 0060), and a label per agent token is thousands of series.
+In a swarm every agent is shed alike, so a per-token rule would fire for all
+of them or none. One agent in a search loop shows up in step 3 below, and in
+[LeepTokenThrottled](#leeptokenthrottled) once its own rate limit trips.
+
+To watch demand rather than faults (capacity planning), graph the shed
+ratio, `sum by (instance) (rate(leep_read_class_shed_total{class="search"}[15m]))
+/ sum by (instance) (rate(leep_http_requests_total{route=~"/v1/search/.*"}[15m]))`,
+on a dashboard; do not page or ticket on it.
 
 **Impact.** Lands and cheap reads are unaffected: that is what the limit
-protects. Searches are slower to get. `leep search` waits the `Retry-After`
-plus jitter and tries up to four times, then exits 3 with `server busy`; MCP
-agents get a retryable tool error with `retry_after` and call again. Some
-searches lose every try, because a refused client can keep losing the next
-free permit to new arrivals.
+protects. Searches are scarce: `leep search` waits the `Retry-After` plus
+jitter and tries up to four times, then exits 3 with `server busy`; MCP
+agents get a retryable tool error with `retry_after` and call again. With
+permits that hardly complete, almost no search gets through, and those that
+do are slow or fail.
 
 **Diagnose.**
 
-1. How full: `leep_read_class_in_flight{class="search"}` against
-   `leep_read_class_permits{class="search"}` per instance. Pinned at the
-   permits means every permit is busy.
-2. How slow: `histogram_quantile(0.5, sum by (le) (rate(leep_http_request_duration_seconds_bucket{route=~"/v1/search/.*",status="200"}[15m])))`.
-   Admitted searches that got slower point at CPU or the metadata store.
-3. Who: `sum by (route, status) (rate(leep_http_requests_total{route=~"/v1/search/.*"}[15m]))`
-   and the DEBUG log (`read refused: class full`). A burst after a deploy of
-   agents, or one agent in a loop?
-4. The host: CPU use of `leep-server` and of Postgres. If the cores are not
-   busy while searches are refused, the class is set too low for the host.
-5. The settings, logged at startup as `expensive read limits`:
+1. Are permits held but not finishing? `leep_read_class_in_flight{class="search"}`
+   against `leep_read_class_permits{class="search"}`, and the completion rate
+   `sum by (instance, status) (rate(leep_http_requests_total{route=~"/v1/search/.*"}[15m]))`.
+   In flight pinned at the permits with no 200s at all for many minutes,
+   while `--request-timeout` (default 5 minutes) should have ended any
+   request by then, points at a permit that is never released: a bug.
+2. How slow are admitted searches? `sum(rate(leep_search_duration_seconds_sum[15m]))
+   / sum(rate(leep_search_duration_seconds_count[15m]))` (the histogram tops
+   out at 10 s, so use the mean), and
+   `histogram_quantile(0.5, sum by (le) (rate(leep_http_request_duration_seconds_bucket{route=~"/v1/search/.*",status="200"}[15m])))`.
+   Healthy under load is 3 to 8 s.
+3. Are they failing? 5xx and 503 with `Leep-Indexing` on the search route
+   (step 1's status breakdown, `leep_query_indexing_answers_total{route="search"}`):
+   a search that fails fast does not count as completed.
+4. What do they do? `leep_query_unindexed_scanned_total{route="search"}`,
+   `leep_search_total{indexed="false"}` (no required trigram: a scan of every
+   file), and `leep_derive_total{kind=~".*trigrams.*"}` against
+   `leep_index_rows_total` (rows derived inside searches rather than by the
+   warmer). The DEBUG log shows the queries (`read refused: class full` for
+   the shed ones).
+5. The host and the store: CPU of `leep-server` and of Postgres, and the
+   metadata store's latency. A search holds up to two pool connections
+   under `--search-pool-permits`; a starved pool shows as search latency.
+6. The settings, logged at startup as `expensive read limits`:
    `read_concurrency` and `search_pool_permits`.
 
 **Likely causes.**
 
-1. More agents, or agents searching more often, than the host has cores for.
-   Confirm: step 1 pinned, step 4 cores busy.
-2. Expensive queries: very common words, broad regexes, or searches whose
-   index is cold (a new large import), each holding its permit longer.
-   Confirm: step 2 p50 up, the same queries in the logs.
-3. A class set lower than the host needs. Confirm: step 4 cores idle with
-   step 1 pinned.
+1. A slow or overloaded metadata or blob store. Confirm: step 5, and other
+   routes slower too ([LeepServerErrors](#leepservererrors), step 4).
+2. Search index not kept up: a new large import, a dropped kind, or the
+   warmer behind, so searches derive rows or scan unindexed files inline.
+   Confirm: step 4, [LeepIndexLagging](#leepindexlagging) or
+   [LeepIndexerMissing](#leepindexermissing).
+3. Expensive queries: very common words, broad regexes, or patterns with no
+   required trigram, each holding its permit for a long time. Confirm: step 2
+   up, `indexed="false"` rising, the same queries in the logs.
+4. Searches failing: a store or data error on the search path. Confirm:
+   step 3.
+5. A permit that is never released. Confirm: step 1. Collect a bug report.
 
 **Mitigate / fix.**
 
-- Add query capacity: more servers behind the balancer, or the indexing
-  split of ADR 0058, which adds cores. Each server has its own permits.
-- On a host with idle cores, raise `--read-concurrency search=N` and restart.
-  Do not raise it on a host whose lands are slow: the limit is what keeps
-  them fast (`LeepLandSlowP99`).
+- Fix the store or the index first ([LeepIndexLagging](#leepindexlagging);
+  `leep-server derive-search REF` warms a ref's search rows).
+- Stop the client sending pathological queries, or revoke its token.
+- For a stuck permit, restart the server (permits are in memory), and file
+  the bug with the metrics of step 1.
+- Do not raise `--read-concurrency search=N` to fix slow searches: more
+  permits only run more slow searches at once and take the lands' cores
+  ([LeepLandSlow](#leeplandslow)); E5 measured two permits on two cores
+  landing 21 to 24% less often than one. Raise it only on a host with idle
+  cores and fast searches, for more search throughput.
+- More search capacity, if demand is the issue, comes from more query
+  servers behind the balancer or the indexing split of ADR 0058: each server
+  has its own permits.
 - Make sure the balancer does not count these 503s against the backend (they
   carry `Leep-Refused`; OPERATIONS.md, "Balancers"), or it will pull shedding
   servers out and overload the rest.
 - `--read-concurrency search=off` turns the limit off. Do it only to rule the
   limit out: searches then take the lands' cores again.
 
-**Escalate / collect.** The in-flight, permits and shed graphs per instance,
-search latency, host CPU, the startup line, and the
+**Escalate / collect.** The in-flight, permits, shed and completion graphs per
+instance, mean search time, host CPU, the startup line, and the
 [standard bundle](#collecting-a-bug-report).
 
 ## LeepBlobCacheColdHitRatio
@@ -2141,7 +2262,8 @@ Postgres cannot write, backups fail (see [LeepBackupStale](#leepbackupstale)).
 
 **Diagnose.**
 
-1. `df -h` and `df -i` (inodes: the filesystem blob store makes one file per blob).
+1. `df -h` and `df -i` (inodes: the filesystem blob store makes one file per
+   loose blob; running out of them is [LeepInodesLow](#leepinodeslow)).
 2. What grows: `du -xsh /var/lib/leep/*`, `du -xsh /backups/leep/*`, and for
    Postgres `SELECT pg_size_pretty(pg_database_size('leep'))` plus the size of its WAL
    directory and replication slots (a stuck slot or broken archiving keeps WAL).
@@ -2199,6 +2321,136 @@ Postgres cannot write, backups fail (see [LeepBackupStale](#leepbackupstale)).
 
 **Escalate / collect.** `df` and `du` output over time, the GC dry-run report, the
 size of the largest tables or WAL, and the [standard bundle](#collecting-a-bug-report).
+
+## LeepInodesLow
+
+**Meaning.** A filesystem that holds a filesystem blob store, the SQLite file
+or Postgres data has had less than 10% of its inodes free for 15 minutes.
+**Ticket.** At 3% [LeepInodesCritical](#leepinodescritical) pages. The rule
+is in the optional `leep-host-inodes` group and uses node_exporter's
+`node_filesystem_files_free` and `node_filesystem_files`; Leep exports no
+inode metric. A filesystem out of inodes refuses new files with the same
+`No space left on device` (ENOSPC) as one out of space, however many bytes
+are free, so [LeepDiskSpaceLow](#leepdiskspacelow) does not see it coming.
+
+**Impact.** None yet. When the inodes run out, every new blob upload fails
+(each loose object is a new file), so commits and lands that bring new
+content answer 5xx, and Postgres or SQLite fail when they need a new file
+(a WAL segment, a new relation). Reads go on working.
+
+**Diagnose.**
+
+1. Confirm: `df -i /var/lib/leep` (and the Postgres data directory). `IUse%`
+   near 100 with `df -h` showing space free is this alert. A bare-metal or VM
+   host shows the same through `df -i` on the mount.
+2. Is it the blob store? A filesystem blob store keeps one file per loose
+   object in 256 shard directories, `BLOBS/00` to `BLOBS/ff`, until
+   `leep-server repack` packs them. Count the loose objects, stopping early so
+   a huge store does not take minutes:
+   `find /var/lib/leep/blobs/[0-9a-f][0-9a-f] -type f ! -name '.*' | head -n 1000001 | wc -l`.
+   A count near the filesystem's used inodes is the answer. Leep has no
+   metric for it; the `loose_before` and `loose_after` of a `repack --json`
+   report are the other source.
+3. When did it last pack? `ls -l /var/lib/leep/blobs/packs/` (the newest
+   `.pack`'s time), and the repack job's cron log. No `packs/*.pack` at all
+   means the store was never packed.
+4. What adds files: load tests or agent swarms that write to this store, a
+   large import, and abandoned uploads (`gc --dry-run`). Each object is
+   a file whatever its size, so many small blobs use up inodes long before
+   bytes.
+5. Anything else on the filesystem with many small files (logs, caches,
+   another service), with `du --inodes -xs /var/lib/* | sort -n | tail`.
+
+**Likely causes.**
+
+1. A filesystem blob store that is never repacked, or not often enough for
+   its write rate. Confirm: steps 2 and 3. This is the usual cause: in one
+   incident a VPS's data filesystem had 3,474 free inodes of 9.96M, with
+   42 GB of space free, because about 9.9M loose blobs had piled up from load
+   tests (about 27,000 loose files per run) on a store nobody repacked.
+2. A filesystem made with too few inodes for small files. ext4 fixes its
+   inode count when the filesystem is made (by default one per 16 KiB);
+   blobs from agents' edits are mostly smaller than that. Confirm: `tune2fs -l
+   DEVICE | grep -i 'inode count\|inodes per group'`.
+3. Something besides Leep making small files. Confirm: step 5.
+
+**Mitigate / fix.**
+
+- Run `leep-server repack` (OPERATIONS.md, [Packing blobs](OPERATIONS.md#packing-blobs)).
+  It is safe beside running servers: it packs the loose objects, waits its
+  `--fence` (default 10 minutes) so readers of the loose copies finish, then
+  deletes every loose copy it packed. That frees one inode per loose object
+  and needs only a few new files for the pack, so it can run with very few
+  inodes left. It needs free space for the new pack, a small fraction of the
+  loose bytes.
+- **Plan for hours on a large store.** Inodes come back only at the end,
+  after the fence and cleanup. Measured on the project's VPS
+  ([PERFORMANCE.md](PERFORMANCE.md), "All of git/git" and the Linux
+  sections), all first repacks of a loose store: 327,000 loose objects of
+  git/git in 27 min (10 of them the fence); 4.65M loose objects of Linux in
+  2 h 55 min (49 min walking history, 1 h 45 min writing, 10 min fence,
+  10 min cleanup), with memory peaking at about 5 GB; 10.08M objects of
+  Linux in 4 h 55 min. Those were older builds; a later full repack of
+  10.36M objects, 329,000 of them loose, took 1 h 18 min at 2.16 GiB.
+  Expect hours for millions of loose objects. An incremental run's cost
+  follows the history added since the last one (0.4 s for 100 new commits
+  of a synthetic history, "Incremental repack"), plus the fence.
+- While it runs, slow down what writes new blobs: pause load tests and
+  large imports, so the remaining inodes last until the repack frees them.
+  If they will not last, page and grow or move the volume (below).
+- Then schedule it so this does not come back: an incremental `repack`
+  nightly and after load tests, or when the loose count of step 2 passes a
+  threshold (OPERATIONS.md, "Packing blobs").
+- For a lasting fix on ext4, the inode count cannot be raised in place. Make
+  a dedicated blob volume with more inodes (`mkfs.ext4 -i 4096`, one per
+  4 KiB) and move the store to it, or use a filesystem that allocates inodes
+  as it needs them (XFS, up to its `imaxpct`), or move blobs to `s3://`,
+  where objects cost no inodes.
+- **Never delete blob files by hand**, not even ones that look old or
+  orphaned: a loose object can be the only copy of committed content, and
+  one that is gone is recoverable only from backup. Unreferenced blobs go
+  through `leep-server gc`, packed ones through `repack`. Leave `packs/` and
+  `.repack-*` files alone as well (see [LeepDiskSpaceLow](#leepdiskspacelow)).
+
+**Escalate / collect.** `df -i` and `df -h` over time, the loose count, the
+listing of `packs/`, the repack job's schedule and its last report, and the
+[standard bundle](#collecting-a-bug-report).
+
+## LeepInodesCritical
+
+**Meaning.** As [LeepInodesLow](#leepinodeslow), but under 3% of the inodes
+are free for 5 minutes. **Page.** On a store adding tens of thousands of
+loose objects an hour, that can be minutes to an hour from ENOSPC on every
+blob write.
+
+**Impact.** As LeepInodesLow, imminent: once none is free, uploads, commits
+and lands with new content answer 5xx (`No space left on device`) and
+[LeepServerErrors](#leepservererrors) follows.
+
+**Diagnose.** `df -i` on the mount, then LeepInodesLow's steps 2 to 5. Work
+out how long is left: the free inodes over the rate they fall
+(`deriv(node_filesystem_files_free{mountpoint="..."}[30m])`).
+
+**Mitigate / fix**, in this order:
+
+1. Stop new loose objects: pause load tests, agent swarms and imports that
+   write to this store.
+2. Start `leep-server repack` at once, if one is not running (a second one
+   exits with "another repack is running"). Inodes come back only when it
+   finishes; see LeepInodesLow for how long that is.
+3. If the time left is shorter than the repack, buy time without touching
+   blobs: delete safe small files on the same filesystem (old logs, the
+   `.tmp-*` files older than the request timeout that
+   [LeepDiskSpaceLow](#leepdiskspacelow), step 4, lists), or move the store
+   to a volume with free inodes (copy it, then switch the servers' `--blobs`
+   during a stop).
+4. Afterwards, everything under LeepInodesLow's fix: a schedule, and a volume
+   or backend that cannot run out of inodes this way.
+
+- **Never delete blob files by hand** to free inodes, and do not run `repack
+  --unsafe-no-fence` beside running servers to finish sooner.
+
+**Escalate / collect.** As LeepInodesLow, plus the time line of free inodes.
 
 ## Cron wrappers
 

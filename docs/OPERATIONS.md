@@ -1,5 +1,65 @@
 # Operating Leep
 
+## Production readiness checklist
+
+For a team self-hosting Leep. Each item links to where it is explained; tick
+it when it is true of your deployment, and redo the list after an upgrade.
+
+- [ ] **Tokens.** A tokens file is mounted (`LEEP_TOKENS_FILE`), so
+  authentication is on, with one token per agent or bot, the least role it
+  needs, and an `expires` ([DEPLOY.md](DEPLOY.md#authentication)). Rotation
+  is practised: add, SIGHUP every server, roll out, remove, SIGHUP
+  ([DEPLOY.md](DEPLOY.md#reloading-config)), and
+  [LeepTokensExpiringSoon](RUNBOOKS.md#leeptokensexpiringsoon) reaches
+  someone who will rotate.
+- [ ] **TLS and the proxy.** A TLS-terminating reverse proxy sits in front;
+  `leep-server` never terminates TLS ([DEPLOY.md](DEPLOY.md)). The metrics
+  port is private and not published through it ([Metrics](#metrics)). Probes
+  use `/v1/health` for liveness and `/v1/ready` for rotation
+  ([DEPLOY.md](DEPLOY.md#probes)), and the balancer does not count 503s with
+  `Leep-Indexing` or `Leep-Refused` against a backend
+  ([Indexing a large history](#indexing-a-large-history), "Balancers").
+- [ ] **Backups and a restore drill.** `leep-server backup` runs on a
+  schedule with `--metrics-file`, `backup-verify` weekly
+  ([Schedule, retention, RPO and RTO](#schedule-retention-rpo-and-rto)), and a
+  restore drill has passed on this deployment's data and runs monthly
+  ([The restore drill](#the-restore-drill),
+  [Cron wrappers](RUNBOOKS.md#cron-wrappers)). You know your RPO and RTO.
+- [ ] **Alerts wired.** `--metrics-listen` is set and scraped, the rules in
+  [Suggested alerts](#suggested-alerts) are loaded with `runbook_url` pointing
+  at your copy of [RUNBOOKS.md](RUNBOOKS.md), pages reach an on-call person,
+  and the `leep-backup`, `leep-cron` and `leep-host` groups have their
+  metrics (otherwise their `absent()` branches fire). Thresholds that depend
+  on your agents, such as `LeepLandSlow`'s 15 s, are set for them.
+- [ ] **GC schedule.** `leep-server gc` runs daily under `flock` with a
+  `--fence` longer than the servers' `--request-timeout` plus clock skew
+  ([Blob garbage collection](#blob-garbage-collection),
+  [Cron wrappers](RUNBOOKS.md#cron-wrappers)), and its failures alert
+  (`LeepGcStale`). [Changeset garbage collection](#changeset-garbage-collection)
+  needs nothing scheduled yet.
+- [ ] **Repack schedule (filesystem blob stores).** An incremental
+  `leep-server repack` runs nightly and after load tests or large imports,
+  or whenever loose objects pass a count you chose, so loose files do not
+  use up the volume's inodes ([Packing blobs](#packing-blobs)). The blob
+  volume has inodes to spare: ext4 fixes the count when the filesystem is
+  made, so a dedicated blob volume gets a smaller inode ratio
+  (`mkfs.ext4 -i 4096`), or blobs live in packs or `s3://`. If
+  node_exporter runs, the `leep-host-inodes` alerts are loaded.
+- [ ] **Upgrade steps written down.** Back up, `migrate --status` and
+  `--dry-run` with the new binary, read the CHANGELOG, then roll out as
+  [Upgrading](#upgrading) and [DEPLOY.md](DEPLOY.md#upgrades) describe.
+  There is no downgrade except restoring the backup.
+- [ ] **Limits tuned for your fleet.** Per-token rate, burst and concurrency
+  ([Request limits](#request-limits)); the body budget against container
+  memory ([Body limits](#body-limits-and-the-in-flight-budget)); the search
+  class against cores ([Expensive read limits](#expensive-read-limits));
+  `--land-queue-batches` against your agents' timeout
+  ([Land admission](#land-admission)); pool and cache sizes
+  ([Connection pool and caches](#connection-pool-and-caches)). With several
+  servers, decide on land routing ([Several servers on one
+  ref](#several-servers-on-one-ref)) and indexing mode ([Indexing a large
+  history](#indexing-a-large-history)).
+
 ## Logs
 
 `leep-server` logs with `tracing`. Choose the format with `--log-format
@@ -154,11 +214,13 @@ groups:
       summary: "A leep-server's /metrics cannot be scraped: the process is down, or only its metrics listener is."
       runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepserverdown
   - alert: LeepServerErrors
-    # Indexing answers (503 with Retry-After, ADR 0058), shed reads and lands
-    # not admitted (503 with Leep-Refused, ADR 0060) are not failures. A
-    # forwarded land's refusal is a 503 on the leader and again on the
-    # follower that relays it, so the forwarded series is subtracted twice.
-    expr: (sum(rate(leep_http_requests_total{status=~"5.."}[5m])) - (sum(rate(leep_query_indexing_answers_total[5m])) or vector(0)) - (sum(rate(leep_read_class_shed_total[5m])) or vector(0)) - (sum(rate(leep_land_admission_refused_total[5m])) or vector(0)) - (sum(rate(leep_land_admission_refused_total{route="forwarded"}[5m])) or vector(0))) / sum(rate(leep_http_requests_total[5m])) > 0.01
+    # Indexing answers (503 with Retry-After, ADR 0058), shed reads, lands
+    # not admitted and bodies refused for the in-flight budget (503 with
+    # Leep-Refused, ADR 0060) are not failures; the last is
+    # LeepBodyBudgetExhausted's ticket. A forwarded land's refusal is a 503
+    # on the leader and again on the follower that relays it, so the
+    # forwarded series is subtracted twice.
+    expr: (sum(rate(leep_http_requests_total{status=~"5.."}[5m])) - (sum(rate(leep_query_indexing_answers_total[5m])) or vector(0)) - (sum(rate(leep_read_class_shed_total[5m])) or vector(0)) - (sum(rate(leep_land_admission_refused_total[5m])) or vector(0)) - (sum(rate(leep_land_admission_refused_total{route="forwarded"}[5m])) or vector(0)) - (sum(rate(leep_request_body_refused_total{reason="budget"}[5m])) or vector(0))) / sum(rate(leep_http_requests_total[5m])) > 0.01
     for: 5m
     labels: {severity: page}
     annotations:
@@ -210,7 +272,10 @@ groups:
   - alert: LeepLandAdmissionRefusing
     # Only with --land-queue-batches set (ADR 0060). leep_land_total counts
     # lands where they are batched, as the refusals are, so a forwarded land
-    # counts once.
+    # counts once. With N set by the rule in "Land admission" (N full
+    # batches under half the agents' timeout), lands are refused only when
+    # they would otherwise wait past it, so unlike LeepReadsShedding a
+    # sustained ratio is a real shortfall, not the limit at rest.
     expr: |
       sum(rate(leep_land_admission_refused_total[15m]))
         / (sum(rate(leep_land_admission_refused_total[15m])) + sum(rate(leep_land_total[15m]))) > 0.1
@@ -227,11 +292,15 @@ groups:
       summary: "Servers cannot reach the server coordinating a ref's lands (address not allowed, wrong --advertise-url, network); lands wait or end in 409."
       runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leeplandforwardfailing
   - alert: LeepLandLeaseFlapping
-    expr: sum(rate(leep_land_lease_acquired_total[10m])) * 60 > 6
+    # Counts leases taken from a live holder that failed to renew, not
+    # acquisitions: a ref that lands less than every 30 s releases its lease
+    # idle and takes it again on its next land, so agents spread over many
+    # refs acquire leases all the time, harmlessly.
+    expr: sum(rate(leep_land_lease_lost_total{reason="taken"}[10m])) * 60 > 1
     for: 10m
     labels: {severity: ticket}
     annotations:
-      summary: "Land leases change hands more than six times a minute: servers fail to renew them (slow or overloaded metadata store, restarts)."
+      summary: "Land leases are taken from servers that failed to renew them, more than once a minute: a slow or overloaded metadata store, or a holder starved of CPU."
       runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leeplandleaseflapping
   - alert: LeepIndexLagging
     expr: max by (kind) (leep_index_lag_seconds) > 120
@@ -253,21 +322,36 @@ groups:
       summary: "An index group has no lease holder: queries derive inline again and the index stops keeping up."
       runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepindexermissing
   - alert: LeepIndexingAnswersHigh
+    # Shed searches never reach an index, and under a swarm they are most
+    # search requests, so they are left out of the denominator.
     expr: |
       sum(rate(leep_query_indexing_answers_total[10m]))
-        / sum(rate(leep_http_requests_total{route=~"/v1/(log|last-change|blame|search)/.*"}[10m])) > 0.05
+        / (sum(rate(leep_http_requests_total{route=~"/v1/(log|last-change|blame|search)/.*"}[10m]))
+           - (sum(rate(leep_read_class_shed_total[10m])) or vector(0))) > 0.05
     for: 10m
     labels: {severity: ticket}
     annotations:
       summary: "More than 5% of indexed reads answer 503 because their index is too far behind."
       runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepindexinganswershigh
-  - alert: LeepLandSlowP99
-    expr: histogram_quantile(0.99, sum by (le) (rate(leep_land_duration_seconds_bucket[5m]))) > 5
+  - alert: LeepLandSlow
+    # Means from the histograms' _sum and _count, which the 10 s top bucket
+    # does not cap. 15 s is half the swarm agents' 30 s timeout; use half of
+    # your agents' land timeout. Queueing below that is load, not a fault.
+    # The second branch is the time from a land's batch starting to its
+    # answer: about one batch's replay.
+    expr: |
+      sum by (instance) (rate(leep_land_lock_wait_seconds_sum[10m]))
+        / sum by (instance) (rate(leep_land_lock_wait_seconds_count[10m])) > 15
+      or
+      (sum by (instance) (rate(leep_land_duration_seconds_sum[10m]))
+        / sum by (instance) (rate(leep_land_duration_seconds_count[10m]))
+        - sum by (instance) (rate(leep_land_lock_wait_seconds_sum[10m]))
+        / sum by (instance) (rate(leep_land_lock_wait_seconds_count[10m]))) > 15
     for: 10m
     labels: {severity: ticket}
     annotations:
-      summary: "Land p99 above 5 s (includes the time queued for the ref's next batch)."
-      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leeplandslowp99
+      summary: "Lands wait over 15 s on average for their batch, or a batch takes over 15 s to replay: agents near their timeout will time out and resend."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leeplandslow
   - alert: LeepRequestTimeouts
     expr: sum(increase(leep_http_requests_total{status="408"}[15m])) > 5
     labels: {severity: ticket}
@@ -296,14 +380,24 @@ groups:
       summary: "Requests are refused with 503 because the request bodies in flight fill --max-inflight-bytes: a burst of large uploads, slow uploaders holding budget, or a budget too small for the fleet."
       runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepbodybudgetexhausted
   - alert: LeepReadsShedding
+    # Shedding alone is the limit working: a swarm sheds 90 to 98% of its
+    # searches (docs/PERFORMANCE.md, E5 and E5b). It fires only when the
+    # class also completes fewer than 2 searches a minute per permit, which
+    # while it sheds means each admitted search holds its permit over 30 s
+    # (E5/E5b: 3 to 8 s) or a permit is never given back. The "or 0 * ..."
+    # branch keeps the rule alive on a server that has answered no search.
     # Only the search class is built; add a class's route here when it is.
     expr: |
-      sum by (instance) (rate(leep_read_class_shed_total{class="search"}[15m]))
-        / sum by (instance) (rate(leep_http_requests_total{route=~"/v1/search/.*"}[15m])) > 0.5
+      (sum by (instance) (rate(leep_read_class_shed_total{class="search"}[15m]))
+        / sum by (instance) (rate(leep_http_requests_total{route=~"/v1/search/.*"}[15m])) > 0.5)
+      and on (instance)
+      ((sum by (instance) (rate(leep_http_requests_total{route=~"/v1/search/.*",status="200"}[15m]))
+          or 0 * max by (instance) (leep_read_class_permits{class="search"}))
+        / max by (instance) (leep_read_class_permits{class="search"}) * 60 < 2)
     for: 15m
     labels: {severity: ticket}
     annotations:
-      summary: "A server refuses more than half of its searches (503 with Leep-Refused) because its search class is full: searches are wanted faster than the host can run them."
+      summary: "A server sheds most searches and its search permits complete fewer than 2 a minute each: admitted searches are far slower than they should be, or failing, or a permit is stuck."
       runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepreadsshedding
   - alert: LeepBlobCacheColdHitRatio
     expr: |
@@ -514,6 +608,34 @@ groups:
     annotations:
       summary: "A Leep data or backup filesystem has under 10% free; when it fills, writes fail."
       runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepdiskspacelow
+- name: leep-host-inodes
+  # OPTIONAL: needs node_exporter's filesystem collector on every host that
+  # holds Leep data; Leep exports no inode metric. Without node_exporter these
+  # rules never fire, so delete the group rather than trust it. Set the
+  # mountpoints to the filesystems holding a filesystem blob store and the
+  # SQLite file or Postgres data. A filesystem blob store uses one inode per
+  # loose object, so it can run out of inodes with most of its space free.
+  # Filesystems that allocate inodes on demand (btrfs) report 0 files and
+  # never match.
+  rules:
+  - alert: LeepInodesLow
+    expr: |
+      node_filesystem_files_free{mountpoint=~"/var/lib/leep.*|/var/lib/postgresql.*"}
+        / node_filesystem_files{mountpoint=~"/var/lib/leep.*|/var/lib/postgresql.*"} < 0.10
+    for: 15m
+    labels: {severity: ticket}
+    annotations:
+      summary: "A filesystem holding Leep blobs or its database has under 10% of its inodes free: usually a filesystem blob store's loose objects. Run leep-server repack."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepinodeslow
+  - alert: LeepInodesCritical
+    expr: |
+      node_filesystem_files_free{mountpoint=~"/var/lib/leep.*|/var/lib/postgresql.*"}
+        / node_filesystem_files{mountpoint=~"/var/lib/leep.*|/var/lib/postgresql.*"} < 0.03
+    for: 5m
+    labels: {severity: page}
+    annotations:
+      summary: "A filesystem holding Leep blobs or its database has under 3% of its inodes free: blob and database writes will soon fail with No space left on device."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepinodescritical
 ```
 
 ## Several servers on one ref
@@ -1768,6 +1890,10 @@ deletes the blobs that are still condemned. Collect acts only on condemnations
 at least `--fence` old, so the two phases can run as separate cron jobs or
 processes. A crashed run is safe: rerun it.
 
+GC deletes only unreferenced blobs, so it does not keep a filesystem store's
+file count down: live loose objects stay one file each until `leep-server
+repack` packs them. Schedule both ([Packing blobs](#packing-blobs)).
+
 The fence must exceed the servers' `--request-timeout` plus, on Postgres, their
 `--meta-statement-timeout` (default the request timeout plus 5 s) plus clock
 skew (ADR 0012): with the defaults, 5m + 5m 5s + skew, under 15m. `gc` checks
@@ -2047,6 +2173,39 @@ GC deletes and how much the pack bytes grow between full runs. Run both after
 The daily and weekly jobs may collide; the second one exits with "another
 repack is running" and the next day's run picks up.
 
+**Filesystem stores: schedule it, or run out of inodes.** A filesystem blob
+store spends one inode per loose object, whatever its size, and an
+unpacked store can exhaust the filesystem's inodes with most of its space
+free: writes then fail with `No space left on device`. One VPS reached
+3,474 free inodes of 9.96M with 42 GB free, from about 9.9M loose blobs
+that load tests (about 27,000 files a run) left in a store nobody
+repacked. So on every filesystem store:
+
+- Run the incremental `repack` on a schedule, nightly as above (hourly
+  for a busy fleet), and also after load tests and large imports, or
+  whenever the loose objects pass a count you choose, such as 100,000.
+  Leep exports no loose-object metric; count them in the job, stopping
+  early so a large store costs little:
+  ```sh
+  loose=$(find /var/lib/leep/blobs/[0-9a-f][0-9a-f] -type f ! -name '.*' | head -n 100001 | wc -l)
+  [ "$loose" -gt 100000 ] && leep-cron repack leep-server repack
+  ```
+  (`leep-cron` is the wrapper in [Cron wrappers](RUNBOOKS.md#cron-wrappers).)
+  The `loose_before` and `loose_after` of `repack --json` report the same
+  count for each run.
+- Alert on inodes: the optional `leep-host-inodes` group in
+  [Suggested alerts](#suggested-alerts) (node_exporter).
+- Size the volume for inodes, not only bytes. ext4 fixes its inode count
+  when the filesystem is made (by default one per 16 KiB of space) and it
+  cannot be raised later. Make a dedicated blob volume with a smaller inode
+  ratio (`mkfs.ext4 -i 4096`), use a filesystem that allocates inodes as
+  needed (XFS), keep the store packed, or put blobs in `s3://`, where
+  objects cost no inodes.
+
+A first repack of millions of loose objects takes hours, and the inodes come
+back only when it finishes (after the fence and cleanup):
+[LeepInodesLow](RUNBOOKS.md#leepinodeslow) has the measured times.
+
 GC and repack may overlap; a blob GC deletes during a repack stays deleted.
 GC deletes a packed blob by appending a line to `packs/tombstones`. A repack
 leaves those blobs out of every pack it writes, and drops the lines of the
@@ -2318,7 +2477,9 @@ problems, exits 1 and `restore` refuses it.
 Exit status: `0` sealed and the check clean, `1` sealed but the check found
 problems (do not rely on that snapshot), `2` could not run (nothing sealed).
 `--json` prints the manifest and problems as one object. Progress goes to
-stderr.
+stderr. The `applying schema migration` lines a run logs are the snapshot's
+own new `meta.db` being created at the current schema; the source store is
+never migrated.
 
 Things to know:
 
