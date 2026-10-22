@@ -66,7 +66,9 @@ it when it is true of your deployment, and redo the list after an upgrade.
 `leep-server` logs with `tracing`. Choose the format with `--log-format
 text|json` (env `LEEP_LOG_FORMAT`, default `text`); filter with `RUST_LOG`
 (default `info`). Use `json` when a log pipeline ingests the output: one JSON
-object per line.
+object per line. Text logs are coloured only when they go to a terminal and
+`NO_COLOR` is unset or empty, so a log file or the journal holds no escape
+codes; JSON logs are never coloured.
 
 Every HTTP request produces one INFO line, `request completed`, inside a
 `request` span. The span carries `method`, `route` (the matched template such

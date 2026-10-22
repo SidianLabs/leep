@@ -1110,12 +1110,19 @@ async fn shutdown_signal() {
     tracing::info!("shutting down");
 }
 
+/// Colour text logs only on a terminal: escapes in a log file or a
+/// journal are noise to every reader and grep. A non-empty `NO_COLOR`
+/// (no-color.org) turns them off on a terminal too.
+fn log_colours(terminal: bool, no_color: Option<std::ffi::OsString>) -> bool {
+    terminal && no_color.is_none_or(|v| v.is_empty())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
     // These print their report on stdout, so logs go to stderr.
-    let writer = if matches!(
+    let (writer, terminal) = if matches!(
         args.command,
         Some(
             Cmd::Verify(_)
@@ -1126,17 +1133,25 @@ async fn main() -> anyhow::Result<()> {
                 | Cmd::UpgradeIndex(_)
         )
     ) {
-        BoxMakeWriter::new(std::io::stderr)
+        (
+            BoxMakeWriter::new(std::io::stderr),
+            std::io::IsTerminal::is_terminal(&std::io::stderr()),
+        )
     } else {
-        BoxMakeWriter::new(std::io::stdout)
+        (
+            BoxMakeWriter::new(std::io::stdout),
+            std::io::IsTerminal::is_terminal(&std::io::stdout()),
+        )
     };
     match args.log_format {
         LogFormat::Text => tracing_subscriber::fmt()
+            .with_ansi(log_colours(terminal, std::env::var_os("NO_COLOR")))
             .with_env_filter(filter)
             .with_writer(writer)
             .init(),
         LogFormat::Json => tracing_subscriber::fmt()
             .json()
+            .with_ansi(false)
             .with_env_filter(filter)
             .with_writer(writer)
             .init(),
@@ -1685,6 +1700,15 @@ impl BlobStore for ArcBlobs {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn log_colours_only_on_a_terminal_without_no_color() {
+        assert!(log_colours(true, None));
+        assert!(log_colours(true, Some("".into())));
+        assert!(!log_colours(true, Some("1".into())));
+        assert!(!log_colours(false, None));
+        assert!(!log_colours(false, Some("1".into())));
+    }
 
     #[test]
     fn the_statement_bound_follows_the_request_timeout_unless_set() {
