@@ -7,6 +7,16 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 ## [Unreleased]
 
+### Leep is developed on Leep
+- Leep's own development runs through a live Leep server: agents land on
+  Leep refs `review/<area>-<desc>`, the git mirror pushes them to GitHub
+  for pull requests and CI, and work reaches `leep-main` (mirrored to
+  GitHub `main`) only by squashing and landing in Leep once CI is green.
+  docs/OPERATIONS.md, "Dogfooding: Leep on Leep", covers the mirror,
+  GitHub rulesets, the deploy key, break-glass, Dependabot and rollback.
+- CI cancels a pull request's older runs when it is pushed again. Runs for
+  pushes to `main` are never cancelled.
+
 ### The git mirror follows refs under a prefix
 - `leep-git mirror run --ref-prefix review/` (repeatable) mirrors every Leep
   ref under `review/` to the branch of the same name as refs appear, without

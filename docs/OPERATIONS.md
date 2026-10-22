@@ -977,6 +977,177 @@ with what is already there, and then deleted.
 `LEEP_MIRROR_CRASH_AT` is a test hook that aborts the process at a named
 step; never set it in production.
 
+## Dogfooding: Leep on Leep
+
+Leep's own development runs through a live Leep server. Leep ref
+`leep-main` is the source of truth, and GitHub `main` is its mirror. Agents
+land work on Leep refs `review/<area>-<desc>`; the mirror pushes each one to
+the GitHub branch of the same name, where the pull request and CI run. When
+CI is green the agent squashes and lands on `leep-main`, and the mirror
+pushes that to `main` as a fast-forward. The maintainer reviews on GitHub.
+Nothing is merged on GitHub.
+
+### Server and mirror
+
+Run `leep-server` with `--protect-ref leep-main` (or
+`LEEP_PROTECT_REFS=leep-main`), so `leep-main` only moves forward and cannot
+be deleted. Give the mirror its own write token named `git-mirror`.
+
+The mirror runs from the same image, as its own container:
+
+```sh
+docker run -d --name leep-mirror --restart unless-stopped \
+  --entrypoint leep-git \
+  -v leep-mirror:/var/lib/leep-mirror \
+  -v /etc/leep/mirror/deploy_key:/run/secrets/deploy_key:ro \
+  -v /etc/leep/mirror/known_hosts:/run/secrets/known_hosts:ro \
+  -v /etc/leep/mirror/token:/run/secrets/leep_token:ro \
+  -e GIT_SSH_COMMAND="ssh -i /run/secrets/deploy_key -o IdentitiesOnly=yes \
+      -o UserKnownHostsFile=/run/secrets/known_hosts -o StrictHostKeyChecking=yes" \
+  -p 127.0.0.1:9188:9188 \
+  leep:dev mirror run \
+  --server http://leep-server:7070 \
+  --token-file /run/secrets/leep_token \
+  --remote git@github.com:OWNER/leep.git \
+  --work-dir /var/lib/leep-mirror/leep \
+  --ref leep-main:refs/heads/main --import --on-divergence report \
+  --land-branches --ref-prefix review/ \
+  --listen 0.0.0.0:9188
+```
+
+- `--ref leep-main:refs/heads/main --import` mirrors `leep-main` both ways,
+  so a break-glass push to `main` comes back into Leep (below).
+- `--on-divergence report`: the mirror never merges `main` by itself.
+- `--land-branches`: people and bots hand work to Leep through
+  `leep-land/leep-main/<name>`.
+- `--ref-prefix review/`: every review ref appears on GitHub, and goes away
+  when the Leep ref is deleted ([Prefix refs](#prefix-refs)).
+
+**The deploy key.** Generate an ed25519 key for this purpose alone and add
+it to the GitHub repository as a deploy key with write access. On the VPS:
+
+```sh
+install -d -o root -g root -m 0700 /etc/leep/mirror
+ssh-keygen -t ed25519 -N '' -C leep-mirror -f /etc/leep/mirror/deploy_key
+ssh-keyscan -t ed25519 github.com > /etc/leep/mirror/known_hosts  # check against GitHub's published fingerprint
+# The image runs as uid 10001. The 0700 root directory keeps every host
+# user but root away from the key.
+chown 10001:10001 /etc/leep/mirror/deploy_key /etc/leep/mirror/token
+chmod 0400 /etc/leep/mirror/deploy_key /etc/leep/mirror/token
+rm /etc/leep/mirror/deploy_key.pub
+```
+
+Mount it into the mirror container and nowhere else: not into
+`leep-server`, not into agent containers, and not into CI. Agents never
+need git credentials: they land in Leep and the mirror pushes.
+
+### GitHub rulesets
+
+| Ruleset | Targets | Rules | Bypass |
+|---|---|---|---|
+| A | `main` | Block force pushes; restrict deletions. | None, not even admins. |
+| B | `main` | Require a pull request; require the CI status checks (`test`). | The deploy key and the maintainer. |
+| C | `review/*`, `leep-diverged/*` | Restrict creations, updates and deletions. | The deploy key. |
+
+- A holds for the mirror too: it only fast-forwards `main`.
+- B stops everyone else from pushing to `main`. The mirror needs the bypass
+  to push lands, and the maintainer to push break-glass fixes.
+- The mirror must be able to create, update (with a lease) and delete
+  `review/*`, `leep-land/*` and `leep-diverged/*`. Rulesets A and B must not
+  match them. C keeps people out of the branches the mirror owns. Leave
+  `leep-land/*` open to pushes: that is how people and bots hand work in.
+
+### The land flow
+
+1. Start from a clean working copy on `leep-main` (`leep switch leep-main`)
+   and create the review ref: `leep switch -c review/<area>-<desc>`.
+2. Commit, then `leep land`, which lands on the review ref. Within seconds
+   the mirror pushes `review/<area>-<desc>` to GitHub.
+3. Open the pull request from that branch into `main`
+   (`gh pr create --head review/<area>-<desc> --base main`). The body uses
+   the sections of the `commit-and-pr` skill. CI runs on it.
+4. Answer review comments by landing more commits on the review ref. A
+   newer push cancels the PR's older CI run.
+5. When CI is green, squash and land on `leep-main`. The stack's base is
+   the newest `leep-main` changeset in the review ref's history.
+   - Check explicitly that it is the current head of `leep-main`:
+     ```sh
+     head=$(leep --json log -n 1 leep-main | jq -r '.entries[0].id')
+     leep log --oneline -n 200 review/<area>-<desc> | grep -q "^${head:0:12} "
+     ```
+   - If it is: `leep reset leep-main`, then `leep commit -m "<PR title>"`,
+     then `leep land --ref leep-main`.
+   - If it is not: `leep merge leep-main`, resolve and commit, `leep land`
+     on the review ref, wait for CI to pass again, then check and squash.
+   - `leep reset` without `--hard` keeps the working files. On a stale base
+     the squashed changeset would hold the old base's files and silently
+     revert everything landed on `leep-main` since. That is why the check
+     is explicit.
+6. The mirror pushes `leep-main` to GitHub `main` as a fast-forward. Close
+   the PR with the comment `Landed as <sha>`, the commit on GitHub `main`
+   (its `Leep-Changeset:` trailer names the changeset).
+7. Delete the review ref (`leep branch -D review/<area>-<desc>`). The mirror
+   deletes the GitHub branch with a lease.
+
+`leep-git mirror status` lists every review ref. A review ref in
+`remote-ahead` or `diverged` means someone pushed to its GitHub branch;
+land that work in Leep, then delete the branch.
+
+### Break-glass
+
+When Leep is down or wrong and `main` needs a fix now:
+
+1. Pause the agents, so nothing lands on `leep-main`.
+2. Check that `leep-main` has not moved since the mirror's last push:
+   `leep-git mirror status` shows `leep-main` `in-sync`.
+3. The maintainer pushes the fix to GitHub `main` (a fast-forward, through
+   the ruleset B bypass).
+4. With Leep unmoved, the mirror's `--import` fast-forwards `leep-main` to
+   the pushed commit, through the land policy. Wait for `in-sync`.
+5. Resume the agents.
+
+If something landed in between, `leep-main` reports `diverged` and Leep's
+side is on `leep-diverged/main`. Merge it in git and push; the mirror lands
+the merge ([Mirror states](#mirror-states)).
+
+### Dependabot
+
+Dependabot opens pull requests from its own branches, which cannot be
+merged on GitHub. When its CI is green, hand the branch to Leep as a land
+branch:
+
+```sh
+gh pr checkout NUMBER
+git push origin HEAD:refs/heads/leep-land/leep-main/dependabot-NUMBER
+```
+
+The mirror lands it onto `leep-main` (rebased like an agent's land),
+deletes the land branch and pushes `main` ([Land branches](#land-branches)).
+Close the pull request with `Landed as <sha>`. A branch that conflicts or
+holds a merge commit stays as a land branch with the reason in the status;
+ask Dependabot to rebase it and push again.
+
+### Rollback
+
+To go back to developing on GitHub alone:
+
+1. Pause the agents. Wait until `leep-git mirror status` shows `leep-main`
+   `in-sync`, so GitHub `main` holds everything landed.
+2. Stop the mirror container (`docker stop leep-mirror`).
+3. In ruleset B, remove the deploy key from the bypass list, then remove
+   the deploy key from the repository. Delete ruleset C.
+4. Open pull requests on GitHub from the review branches still there, or
+   delete them. Nothing is lost: each one is also a ref in Leep.
+5. Merge on GitHub again, with the previous `commit-and-pr` skill and
+   CLAUDE.md rules (restore them from git history).
+
+To come back, start the mirror again. With `--import`, commits merged on
+GitHub `main` meanwhile land in `leep-main` as a fast-forward if Leep did not
+move. If it did, `leep-main` reports `diverged`.
+
+To roll back only the mirror binary to a version without `--ref-prefix`,
+drop that flag; the review branches stay on GitHub until deleted by hand.
+
 ## Upgrading
 
 The metadata schema is versioned (ADR 0023). Each database records the

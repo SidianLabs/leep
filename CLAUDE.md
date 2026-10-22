@@ -46,11 +46,40 @@ For leaks, slow drift and long-history bugs, run a soak (`docs/OPERATIONS.md`,
 - Remove or rename a `/v1` API field or endpoint. Only add, using
   `#[serde(default)]` for new fields.
 - Silently resolve merge conflicts on the server.
-- Merge a pull request. The maintainer reviews and merges every PR; open it,
-  drive it to green CI and answer review comments, then stop.
+- Move `leep-main` any other way than landing in Leep after the PR's CI is
+  green. Changes reach `leep-main` only by a land in Leep; the maintainer
+  reviews on GitHub. Never merge a pull request on GitHub, and never push to
+  GitHub `main` or a `review/*` branch.
+- Squash with `leep reset` on a stale base (see "Working in Leep").
+- Set `LEEP_AGENT_MODEL`, or use provenance trailers (`Leep-Agent-*`,
+  `--provenance-trailers`).
 - Bump the workspace version, tag a release, or mark a roadmap milestone
   closed. Those are maintainer decisions; see "How versions move" in
   [docs/ROADMAP.md](docs/ROADMAP.md).
+
+## Working in Leep
+
+Leep is developed on a live Leep server. Leep ref `leep-main` is the source
+of truth; GitHub `main` is its mirror. The flow, in full in
+[docs/OPERATIONS.md](docs/OPERATIONS.md) ("Dogfooding: Leep on Leep"):
+
+1. `leep switch leep-main`, then `leep switch -c review/<area>-<kebab-desc>`.
+2. Commit and `leep land` on the review ref. The mirror pushes it to the
+   GitHub branch of the same name; open the PR from it into `main`.
+3. Answer review by landing more commits on the review ref.
+4. Once CI is green, squash and land on `leep-main`, close the PR with
+   `Landed as <sha>`, and delete the review ref (`leep branch -D`).
+
+**Squash hazard.** Squash with `leep reset leep-main` + `leep commit` only
+when the stack's base (the newest `leep-main` changeset in the review ref's
+history) equals the current `leep-main` head, and check that explicitly
+first. Otherwise `leep merge leep-main` (or rebase), land again on the review
+ref, wait for CI to pass again, then squash. A reset without `--hard` keeps
+the working files, so squashing on a moved base would silently revert
+everything landed on `leep-main` since.
+
+Never set `LEEP_AGENT_MODEL`, and never use provenance trailers: commits
+carry no AI attribution (below).
 
 ## Where things go
 
@@ -77,9 +106,9 @@ For leaks, slow drift and long-history bugs, run a soak (`docs/OPERATIONS.md`,
 - Architectural decisions get an ADR in `docs/adr/`. Update
   `docs/ARCHITECTURE.md` in the same change.
 - Commits, branches and PRs follow the `commit-and-pr` skill:
-  `<area>: <imperative summary>` subjects, `<area>/<kebab-desc>` branches,
-  and squash-merged PRs with Summary / Why / Changes / Testing /
-  Compatibility sections.
+  `<area>: <imperative summary>` subjects, Leep review refs
+  `review/<area>-<kebab-desc>`, and squash-and-landed PRs with Summary / Why
+  / Changes / Testing / Compatibility sections.
 - **Never credit AI tools.** No `Co-Authored-By` for Claude or any AI, no
   session links, no "Generated with ..." footers, and no model names, in
   commits, PRs, code or docs.

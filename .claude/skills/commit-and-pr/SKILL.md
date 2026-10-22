@@ -7,7 +7,8 @@ description: How to name branches, write commit messages, and open pull requests
 
 ## Attribution: never credit AI tools
 
-Commits and PRs are attributed only to the human author. **Never** add:
+Commits and PRs are attributed only to the human author. Never set
+`LEEP_AGENT_MODEL` and never use provenance trailers. **Never** add:
 - `Co-Authored-By:` trailers naming Claude, Anthropic or any AI model or tool;
 - session links, `Claude-Session:` or similar trailers;
 - "Generated with Claude Code", robot emoji, or any "written by AI" footer;
@@ -41,16 +42,21 @@ Wrap at 72 columns.>
   (`See ADR 0007.`).
 - Reference issues in the body: `Fixes #12` or `Refs #12`.
 
-## Branch names
+## Review refs (branches)
 
-`<area>/<short-kebab-description>`, for example `derive/blame-cache`,
-`server/land-endpoint`, `docs/adr-0007-auth`. No personal names, ticket-only
-names or tool-generated names.
+Work goes on a Leep ref `review/<area>-<short-kebab-description>`, for
+example `review/derive-blame-cache`, `review/server-land-endpoint`,
+`review/docs-adr-0007-auth`. Create it from the current `leep-main` with
+`leep switch -c`, commit, and `leep land` onto it. The git mirror pushes it
+to the GitHub branch of the same name; never push to GitHub yourself. No
+personal names, ticket-only names or tool-generated names.
 
 ## Pull requests
 
+- **Open it** from the review branch into `main` once the mirror has pushed
+  it: `gh pr create --head review/<area>-<desc> --base main`.
 - **Title:** same format as a commit subject (`server: add /v1/land endpoint`).
-  With squash merge, the PR title becomes the commit subject on `main`.
+  The PR title becomes the subject of the squashed changeset on `leep-main`.
 - **Body:**
   ```
   ## Summary
@@ -75,7 +81,18 @@ names or tool-generated names.
   operator would notice. Never move entries into a version section: that
   happens only when the maintainer cuts a release.
 - CI (fmt, clippy `-D warnings`, tests) must be green before review.
-- Only the maintainer merges, with **squash merge**, and deletes the
-  branch. Agents open the PR, keep CI green and answer review comments, but
-  never merge.
+- Answer review comments by landing more commits on the review ref. The
+  maintainer reviews on GitHub.
+- **Squash and land**, never merge on GitHub. Once CI is green:
+  1. Check that the stack's base (the newest `leep-main` changeset in the
+     review ref's history) is the current `leep-main` head. If not,
+     `leep merge leep-main`, land on the review ref, wait for green CI
+     again, and check again. `leep reset` keeps the working files, so a
+     squash on a moved base silently reverts other work.
+  2. `leep reset leep-main`, `leep commit -m "<PR title>"`,
+     `leep land --ref leep-main`.
+  3. Close the PR with the comment `Landed as <sha>`, the commit the mirror
+     pushed to GitHub `main`.
+  4. Delete the review ref (`leep branch -D review/<area>-<desc>`); the
+     mirror deletes the GitHub branch.
 - No AI attribution in the title, body or comments (see the top of this skill).
