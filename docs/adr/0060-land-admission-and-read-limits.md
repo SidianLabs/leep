@@ -427,8 +427,19 @@ differs from the text above as follows, each for the reason given.
   (`crates/leep-server/tests/read_limits.rs`) cover the refusal's shape, the
   release of the permit when a search succeeds, fails, is cancelled by the
   client, times out or has its answer dropped, `off`, and lands, ref reads
-  and file reads while every permit is held. The swarm rerun under
-  "Testing" has not been done; the starting values above stand until it is.
+  and file reads while every permit is held.
+- **Swarm rerun.** The swarm run under "Testing" is done, twice: E5 on
+  `718a96a`, and E5b on `bbd3081`, which also derives search rows in level
+  batches (`docs/PERFORMANCE.md`, "Search admission and cheaper search
+  (E5)" and the E5b section after it). With the default of one search
+  permit on two cores, lands/s closed 67% and 59% of E1's gap at 500 and
+  2,000 agents in E5, and 56% and 56% in E5b (46% in E5b's lowest round at
+  2,000 agents). The criterion is met on the medians of both runs, and no
+  land was double or lost in 42 runs. Two permits (`search=2`) closed 48%
+  and 45% in E5 and 39% and 49% in E5b. That fails the criterion, and two
+  permits land less often than one, so the `search` default stays
+  `max(1, cores / 2)`. The E3 runs with `--land-queue-batches` wait for
+  section 2.
 
 ### Section 2
 - **What "batch" means, and the bound.** A batch is what the leader takes
@@ -505,5 +516,6 @@ differs from the text above as follows, each for the reason given.
   `killed_server_with_a_full_land_queue_loses_nothing_{sqlite,postgres}`
   with `--land-queue-batches 1`; kills are not synchronized with a full
   queue, but at a bound of 1 the queue is full whenever a batch replays,
-  and the test requires refusals. The swarm runs under "Testing" have not
-  been done, so the bound ships `off` as "Rollout" says.
+  and the test requires refusals. The E3 runs under "Testing" with
+  `--land-queue-batches` have not been done, so the bound ships `off` as
+  "Rollout" says.
