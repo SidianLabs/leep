@@ -80,19 +80,30 @@ groups:
       summary: "More than one lost ref compare-and-swap per land: several writers contend for one ref."
       runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leeplandcaslosseshigh
   - alert: LeepLandAdmissionRefusing
-    # Only with --land-queue-batches set (ADR 0060). leep_land_total counts
-    # lands where they are batched, as the refusals are, so a forwarded land
-    # counts once. With N set by the rule in "Land admission" (N full
-    # batches under half the agents' timeout), lands are refused only when
-    # they would otherwise wait past it, so unlike LeepReadsShedding a
-    # sustained ratio is a real shortfall, not the limit at rest.
+    # Land admission is on by default (--land-queue-batches 4, ADR 0060).
+    # Refusing is the bound shedding load as designed: in the E5c swarm at
+    # 500 agents, N = 4 refused 0.2k to 1.1k lands per 120 s run while
+    # admitted ones waited 4 to 5 s and no client timed out. So refusals
+    # alone do not fire: the admitted lands must also take more than half
+    # the agents' land timeout on average (the whole land call, queue
+    # included), so shedding no longer keeps them in time. Means come from
+    # the histogram's _sum and _count, as in LeepLandSlow, since the 10 s
+    # top bucket would cap a quantile. 15 s is half the swarm agents' 30 s
+    # timeout, as in LeepLandSlow; use half of your agents' land timeout.
+    # Refusals, leep_land_total and the land histograms are all counted by
+    # the server that batches the ref, so a forwarded land counts once and
+    # the branches match per instance.
     expr: |
-      sum(rate(leep_land_admission_refused_total[15m]))
-        / (sum(rate(leep_land_admission_refused_total[15m])) + sum(rate(leep_land_total[15m]))) > 0.1
+      (sum by (instance) (rate(leep_land_admission_refused_total[15m]))
+        / (sum by (instance) (rate(leep_land_admission_refused_total[15m]))
+          + sum by (instance) (rate(leep_land_total[15m]))) > 0.1)
+      and
+      (sum by (instance) (rate(leep_land_duration_seconds_sum[15m]))
+        / sum by (instance) (rate(leep_land_duration_seconds_count[15m])) > 15)
     for: 15m
     labels: {severity: ticket}
     annotations:
-      summary: "More than 10% of lands are refused because their ref's queue is full (503 with Leep-Refused: admission): the ref is offered more lands than it can replay."
+      summary: "More than 10% of lands are refused because their ref's queue is full, and admitted lands still average over 15 s: the ref is offered more lands than it can replay. Add capacity or raise --land-queue-batches."
       runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leeplandadmissionrefusing
   - alert: LeepLandForwardFailing
     expr: sum(rate(leep_land_forwarded_total{outcome="failed"}[10m])) > 0.1

@@ -7,6 +7,29 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 ## [Unreleased]
 
+### Land admission is on by default (`--land-queue-batches 4`)
+- **Behavior change.** `leep-server --land-queue-batches` (and
+  `LEEP_LAND_QUEUE_BATCHES`) now defaults to `4` instead of `off` (ADR
+  0060, section 2). A land is refused with `503`, `Retry-After` and
+  `Leep-Refused: admission` only when more than four full batches (256
+  lands) are already queued for its ref, which is out of reach below about
+  200 concurrent writers on one ref. In the E5c swarm (`docs/PERFORMANCE.md`;
+  two-core VPS, Postgres, 30 s client timeout) throughput at 500 agents was
+  unchanged and no client timed out; at 2,000 agents mean lock wait fell
+  from 27 s to 11 s and land timeouts from about 15,000 to about 250 per
+  run.
+- **Opt out:** clients older than #143 do not resend a refused land. Set
+  `--land-queue-batches off` (or `LEEP_LAND_QUEUE_BATCHES=off`) until they
+  are upgraded. Lower `N` for shorter client timeouts and raise it for
+  faster servers: `N` full batches should take about half the client
+  timeout.
+- `LeepLandAdmissionRefusing` now fires only when more than 10% of lands
+  are refused for 15 minutes **and** admitted lands average more than 15 s
+  (`leep_land_duration_seconds`; use half your agents' land timeout), per
+  instance. Refusing alone is the bound shedding load as designed. Its
+  runbook's action is to add capacity or raise `--land-queue-batches`.
+  **Operators:** replace the rule.
+
 ### Unreachable changesets can be garbage collected (ADR 0059 phase 2, off by default)
 - `leep-server gc --unreachable` deletes changesets that no root
   reaches: refs, every ref log entry, the landed-copy scan window of

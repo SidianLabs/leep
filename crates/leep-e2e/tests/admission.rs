@@ -1,7 +1,8 @@
 //! Land admission (ADR 0060, section 2) with the real binaries: `leep land`
 //! against a server started with `--land-queue-batches 1`, so every land
 //! that arrives while a batch replays is refused with 503 and
-//! `Leep-Refused: admission`. Run `cargo build --workspace` first.
+//! `Leep-Refused: admission`, and the bound the server starts with by
+//! default. Run `cargo build --workspace` first.
 
 mod common;
 
@@ -127,4 +128,50 @@ fn leep_land_resends_a_land_not_admitted_and_lands_it_once() {
             "{path}"
         );
     }
+}
+
+/// The startup line of a `leep-server` run with `extra`, read at `info`.
+fn admission_startup_line(root: &std::path::Path, extra: &[&str]) -> String {
+    let stores = Stores::sqlite(&root.join("data"));
+    let log = root.join(format!("startup-{}.log", extra.join("-")));
+    let out = std::fs::File::create(&log).unwrap();
+    let err = out.try_clone().unwrap();
+    let mut child = std::process::Command::new(bin("leep-server"))
+        .args(["--listen", &format!("127.0.0.1:{}", free_port())])
+        .args(["--meta", &stores.meta, "--blobs", &stores.blobs])
+        .args(extra)
+        .env("RUST_LOG", "info")
+        .env_remove("LEEP_LAND_QUEUE_BATCHES")
+        .stdin(std::process::Stdio::null())
+        .stdout(out)
+        .stderr(err)
+        .spawn()
+        .expect("spawn leep-server");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let line = loop {
+        let text = std::fs::read_to_string(&log).unwrap_or_default();
+        if let Some(l) = text.lines().find(|l| l.contains("land admission limits")) {
+            break l.to_string();
+        }
+        if std::time::Instant::now() > deadline || child.try_wait().unwrap().is_some() {
+            let _ = child.kill();
+            panic!("no admission startup line; log:\n{text}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    let _ = child.kill();
+    let _ = child.wait();
+    line
+}
+
+/// Admission is on by default since E5c (ADR 0060): four batches, and
+/// `off` still turns it off.
+#[test]
+fn land_queue_batches_defaults_to_four_and_off_turns_it_off() {
+    let _g = serial();
+    let tmp = tempfile::tempdir().unwrap();
+    let line = admission_startup_line(&tmp.path().join("default"), &[]);
+    assert!(line.contains("land_queue_batches=Some(4)"), "{line}");
+    let line = admission_startup_line(&tmp.path().join("off"), &["--land-queue-batches", "off"]);
+    assert!(line.contains("land_queue_batches=None"), "{line}");
 }

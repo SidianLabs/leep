@@ -1206,7 +1206,7 @@ new response header `Leep-Refused: <reason>`.
 ## Land admission (additive header value, ADR 0060)
 
 Nothing persisted changed, and no field, code or route was added. A server
-started with `--land-queue-batches N` (default `off`) refuses
+with `--land-queue-batches N` (default 4 since E5c; it was `off`) refuses
 `POST /v1/land` when the land would wait behind more than `N` batches of
 its ref's queue, its own included: `503`, code `unavailable`, the usual
 `ErrorResponse` body, `Retry-After` (whole seconds, 1 to 10) and

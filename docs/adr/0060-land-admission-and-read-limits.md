@@ -1,5 +1,5 @@
 # 0060. Protect lands from expensive reads, and admit lands per ref
-Status: Accepted (section 1, `search` class, and section 2; see "Implementation notes"); other read classes and section 3 proposed
+Status: Accepted (section 1, `search` class, and section 2; see "Implementation notes"); other read classes and section 3 proposed. Amended 2026-10-23: `--land-queue-batches` defaults to 4 after E5c (section 2, "Default after E5c")
 Date: 2026-10-21
 
 ## Context
@@ -116,7 +116,8 @@ The server that batches a ref's lands bounds that ref's queue. This is the
 holder of the ref's lease under `--land-coordination on`, or the only
 server otherwise. The bound is measured in batches, not lands:
 
-- **Bound.** `--land-queue-batches N` (default `off`). A land is refused
+- **Bound.** `--land-queue-batches N` (default `off`; 4 since 2026-10-23,
+  see "Default after E5c" under "Implementation notes"). A land is refused
   when the queue already holds `N` batches: the waiting lands, divided by
   the 64-land batch limit and rounded up, plus one for a batch being
   replayed. A land waits about one batch time per batch ahead of it, so a
@@ -184,7 +185,9 @@ server otherwise. The bound is measured in batches, not lands:
   either, including the follower's relayed copy, which its
   `leep_http_requests_total` also records as a 503.
 - **Alert:** `LeepLandAdmissionRefusing`, a ticket, when more than 10% of
-  lands are refused for 15 minutes (starting values). The ref is offered
+  lands are refused for 15 minutes (starting values; since E5c it also
+  needs admitted lands to average past half the agents' land timeout, see
+  "Default after E5c"). The ref is offered
   more lands than it can replay, which needs ADR 0056's next steps
   (pipelined or parallel replay), not a larger queue. It has a runbook
   when this is built.
@@ -354,7 +357,8 @@ answers that question without the queue:
   landed 16 to 31 times a second against a 61 to 77 ceiling, so they are
   the next suspects. The swarm rerun decides their defaults.
 - **The land queue bound ships off** until a swarm run with it on shows no
-  resend storm. That run needs the 503s answered with jittered waits,
+  resend storm. (E5c was that run; the default is 4 since 2026-10-23, see
+  "Default after E5c".) That run needs the 503s answered with jittered waits,
   sends per change no higher than without the bound, and no double or
   lost lands. This is the rule ADR 0056 used for `--land-coordination`.
   Clients that honour the 503 ship first. Operators then turn the bound on
@@ -538,6 +542,25 @@ differs from the text above as follows, each for the reason given.
   `killed_server_with_a_full_land_queue_loses_nothing_{sqlite,postgres}`
   with `--land-queue-batches 1`; kills are not synchronized with a full
   queue, but at a bound of 1 the queue is full whenever a batch replays,
-  and the test requires refusals. The E3 runs under "Testing" with
-  `--land-queue-batches` have not been done, so the bound ships `off` as
-  "Rollout" says.
+  and the test requires refusals. The bound first shipped `off`, as
+  "Rollout" says, until E5c below.
+- **Default after E5c (2026-10-23).** The swarm with `--land-queue-batches`
+  at `off`, 3, 4 and 6 (`docs/PERFORMANCE.md`, "Land admission in the
+  swarm (E5c)"; one two-core VPS, Postgres 16, 30 s client timeout, three
+  rounds) had no double or lost land in any run. At 500 agents every arm
+  landed 27 to 37 times a second and no client timed out. At 2,000 agents
+  `off` waited 27 s on average for the batch and resent about 15,000 lands
+  per 120 s run; `N = 4` waited 11 s and resent about 250, for about 88k
+  refusals that clients sent again. The default is now 4: a land is
+  refused only behind more than four full batches (256 lands), out of
+  reach below about 200 concurrent writers on one ref. `N = 3` refused
+  more at 500 agents (1.3k to 5.3k per run) for no gain there, and `N = 6`
+  let the wait at 2,000 agents reach 18 to 20 s. Clients older than #143
+  do not resend a refused land; operators set `off` until they are
+  upgraded. The rule for other hosts stays "Bound"'s: `N` full batches
+  take about half the clients' timeout. `LeepLandAdmissionRefusing` now
+  also requires admitted lands (`leep_land_duration_seconds`) to average
+  more than 15 s, half the swarm's timeout: with the bound on by default,
+  refusing is shedding as designed (E5c at 500 agents refused up to 1.1k
+  lands a run at `N = 4` with 4 to 5 s waits), and only a ref whose
+  admitted lands still near the timeout needs capacity or a higher `N`.

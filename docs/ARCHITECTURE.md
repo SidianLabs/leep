@@ -658,8 +658,9 @@ of `a`, or a false conflict when the ref changed `a`'s files since. On conflict 
 moves nothing; `/v1/ready` lists `land-clean-blobs`), resolves `conflicts` on top of `onto`, commits once and lands again,
 which is then a fast-forward. Stacks containing merges are rejected.
 Built ([ADR 0060](adr/0060-land-admission-and-read-limits.md), section 2):
-the server that batches a ref's lands may bound its queue in batches
-(`--land-queue-batches N`, off by default; `Repo::with_land_queue_batches`).
+the server that batches a ref's lands bounds its queue in batches
+(`--land-queue-batches N`, 4 by default since E5c, or `off`;
+`Repo::with_land_queue_batches`).
 `land_enqueue` checks the in-memory `RefQueue` after the name checks and
 before `get_changeset`: a land that would wait behind more than `N`
 batches, its own included (the waiting lands over 64, rounded up, plus one
