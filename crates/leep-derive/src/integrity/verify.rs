@@ -226,6 +226,27 @@ fn id_prefix(h: &Hash) -> u64 {
     u64::from_be_bytes(h.0[..8].try_into().expect("8 bytes"))
 }
 
+/// `ids` read in one batch, or one by one when the batch fails: `Some(cs)`
+/// for each readable or absent one, `None` for one whose row is damaged
+/// (the history walk reports it), so one bad row does not end the run.
+async fn readable_changesets(
+    meta: &dyn MetaStore,
+    ids: &[ChangesetId],
+) -> Result<Vec<Option<Option<Changeset>>>> {
+    if let Ok(found) = meta.get_changesets(ids).await {
+        return Ok(found.into_iter().map(Some).collect());
+    }
+    let mut out = Vec::with_capacity(ids.len());
+    for id in ids {
+        out.push(match meta.get_changeset(id).await {
+            Ok(cs) => Some(cs),
+            Err(Error::Storage(_) | Error::Encoding(_)) => None,
+            Err(e) => return Err(e),
+        });
+    }
+    Ok(out)
+}
+
 /// Check a store. `Err` means the run could not be completed (a store was
 /// unreachable, a named ref does not exist); damage is in the report.
 pub async fn verify(
@@ -1123,19 +1144,21 @@ impl Verifier<'_> {
                 return Ok(());
             };
             after = Some(last);
-            let found = meta.get_changesets(&page).await?;
+            let found = readable_changesets(&*meta, &page).await?;
             let mut asks: Vec<(ChangesetId, ChangesetId)> = Vec::new();
             for (id, cs) in page.iter().zip(&found) {
-                let Some(cs) = cs else { continue };
+                let Some(Some(cs)) = cs else { continue };
                 if self.sampled(id, cs) {
                     asks.extend(cs.parents.iter().map(|p| (*id, *p)));
                 }
             }
             for chunk in asks.chunks(PAGE) {
                 let parents: Vec<ChangesetId> = chunk.iter().map(|(_, p)| *p).collect();
-                let stored = meta.get_changesets(&parents).await?;
+                let stored = readable_changesets(&*meta, &parents).await?;
                 for ((child, parent), got) in chunk.iter().zip(stored) {
-                    if got.is_none() {
+                    // Unreadable is stored but damaged: the history walk
+                    // reports that.
+                    if matches!(got, Some(None)) {
                         self.log.push(
                             Problem::new(
                                 "history",
