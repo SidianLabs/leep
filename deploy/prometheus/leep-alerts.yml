@@ -1,0 +1,411 @@
+# Prometheus alert rules for Leep. Load this file with rule_files; see
+# docs/OPERATIONS.md ("Suggested alerts") for what each group needs and
+# docs/RUNBOOKS.md for what to do when a rule fires. This file is the only
+# copy of the rules: scripts/check-runbooks.sh (run in CI) checks it against
+# the runbooks.
+#
+# Every rule's runbook_url ends in RUNBOOKS.md#<alert name in lower case>.
+# Replace the base URL below with wherever you publish docs/RUNBOOKS.md;
+# scripts/check-runbooks.sh only checks the part from "RUNBOOKS.md#" on.
+# severity: page = wake someone, ticket = fix in working hours.
+#
+# Leep's counters appear when they are first incremented, and increase() cannot
+# see a counter's first event (there is no earlier sample), so the rules that
+# watch rare events add a second branch: "present now, absent 10 minutes ago".
+groups:
+- name: leep
+  rules:
+  - alert: LeepServerDown
+    # Needs the metrics listener scraped under a job named "leep"; adjust.
+    expr: up{job="leep"} == 0
+    for: 2m
+    labels: {severity: page}
+    annotations:
+      summary: "A leep-server's /metrics cannot be scraped: the process is down, or only its metrics listener is."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepserverdown
+  - alert: LeepServerErrors
+    # Indexing answers (503 with Retry-After, ADR 0058), shed reads, lands
+    # not admitted and bodies refused for the in-flight budget (503 with
+    # Leep-Refused, ADR 0060) are not failures; the last is
+    # LeepBodyBudgetExhausted's ticket. A forwarded land's refusal is a 503
+    # on the leader and again on the follower that relays it, so the
+    # forwarded series is subtracted twice.
+    expr: (sum(rate(leep_http_requests_total{status=~"5.."}[5m])) - (sum(rate(leep_query_indexing_answers_total[5m])) or vector(0)) - (sum(rate(leep_read_class_shed_total[5m])) or vector(0)) - (sum(rate(leep_land_admission_refused_total[5m])) or vector(0)) - (sum(rate(leep_land_admission_refused_total{route="forwarded"}[5m])) or vector(0)) - (sum(rate(leep_request_body_refused_total{reason="budget"}[5m])) or vector(0))) / sum(rate(leep_http_requests_total[5m])) > 0.01
+    for: 5m
+    labels: {severity: page}
+    annotations:
+      summary: "More than 1% of requests answer 5xx: a store is failing, or data is damaged."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepservererrors
+  - alert: LeepLandErrors
+    # Counts HTTP 5xx on the land route. leep_land_total{outcome="error"} also
+    # counts refused lands (400, 404), so it is not used here. Lands not
+    # admitted (503 with Leep-Refused: admission, ADR 0060) are subtracted,
+    # forwarded ones twice (the leader's 503 and the follower's relay); while
+    # any have been refused, the first-5xx branch stays quiet, since their
+    # 503s create the series too.
+    expr: |
+      (sum(increase(leep_http_requests_total{route="/v1/land",status=~"5.."}[10m]))
+        - (sum(increase(leep_land_admission_refused_total[10m])) or vector(0))
+        - (sum(increase(leep_land_admission_refused_total{route="forwarded"}[10m])) or vector(0))) > 0.5
+      or
+      (sum(leep_http_requests_total{route="/v1/land",status=~"5.."} unless leep_http_requests_total{route="/v1/land",status=~"5.."} offset 10m) > 0
+        unless on() (sum(leep_land_admission_refused_total) > 0))
+    labels: {severity: page}
+    annotations:
+      summary: "A land failed with a server error (5xx): a store failed while landing. Refused lands do not count."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leeplanderrors
+  - alert: LeepLandExhausted
+    expr: |
+      sum(increase(leep_land_total{outcome="exhausted"}[10m])) > 0
+      or
+      sum(leep_land_total{outcome="exhausted"} unless leep_land_total{outcome="exhausted"} offset 10m) > 0
+    labels: {severity: ticket}
+    annotations:
+      summary: "A land lost the ref compare-and-swap on all 32 attempts; other writers are racing it for the same ref."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leeplandexhausted
+  - alert: LeepLandBatchDeadline
+    expr: |
+      sum(increase(leep_land_batch_deadline_total[10m])) > 0
+      or
+      sum(leep_land_batch_deadline_total unless leep_land_batch_deadline_total offset 10m) > 0
+    labels: {severity: ticket}
+    annotations:
+      summary: "A land batch was still retrying 60 s after it started and answered its lands 409: the metadata store is very slow, or the ref is badly contended."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leeplandbatchdeadline
+  - alert: LeepLandCasLossesHigh
+    expr: sum(rate(leep_land_cas_losses_total[15m])) / sum(rate(leep_land_total[15m])) > 1
+    for: 15m
+    labels: {severity: ticket}
+    annotations:
+      summary: "More than one lost ref compare-and-swap per land: several writers contend for one ref."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leeplandcaslosseshigh
+  - alert: LeepLandAdmissionRefusing
+    # Only with --land-queue-batches set (ADR 0060). leep_land_total counts
+    # lands where they are batched, as the refusals are, so a forwarded land
+    # counts once. With N set by the rule in "Land admission" (N full
+    # batches under half the agents' timeout), lands are refused only when
+    # they would otherwise wait past it, so unlike LeepReadsShedding a
+    # sustained ratio is a real shortfall, not the limit at rest.
+    expr: |
+      sum(rate(leep_land_admission_refused_total[15m]))
+        / (sum(rate(leep_land_admission_refused_total[15m])) + sum(rate(leep_land_total[15m]))) > 0.1
+    for: 15m
+    labels: {severity: ticket}
+    annotations:
+      summary: "More than 10% of lands are refused because their ref's queue is full (503 with Leep-Refused: admission): the ref is offered more lands than it can replay."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leeplandadmissionrefusing
+  - alert: LeepLandForwardFailing
+    expr: sum(rate(leep_land_forwarded_total{outcome="failed"}[10m])) > 0.1
+    for: 10m
+    labels: {severity: ticket}
+    annotations:
+      summary: "Servers cannot reach the server coordinating a ref's lands (address not allowed, wrong --advertise-url, network); lands wait or end in 409."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leeplandforwardfailing
+  - alert: LeepLandLeaseFlapping
+    # Counts leases taken from a live holder that failed to renew, not
+    # acquisitions: a ref that lands less than every 30 s releases its lease
+    # idle and takes it again on its next land, so agents spread over many
+    # refs acquire leases all the time, harmlessly.
+    expr: sum(rate(leep_land_lease_lost_total{reason="taken"}[10m])) * 60 > 1
+    for: 10m
+    labels: {severity: ticket}
+    annotations:
+      summary: "Land leases are taken from servers that failed to renew them, more than once a minute: a slow or overloaded metadata store, or a holder starved of CPU."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leeplandleaseflapping
+  - alert: LeepIndexLagging
+    expr: max by (kind) (leep_index_lag_seconds) > 120
+    for: 10m
+    labels: {severity: ticket}
+    annotations:
+      summary: "An index group trails ref moves by more than 2 minutes: its lease holder is slow, overloaded or backfilling (ADR 0058)."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepindexlagging
+  - alert: LeepIndexerMissing
+    # Only fleets with servers in --indexing lease or off mode export the
+    # lease gauge; no holder means queries fell back to inline derivation.
+    expr: |
+      (max by (kind) (leep_index_lease_held) == 0)
+      or
+      (sum(rate(leep_query_inline_derive_total[5m])) > 0)
+    for: 5m
+    labels: {severity: page}
+    annotations:
+      summary: "An index group has no lease holder: queries derive inline again and the index stops keeping up."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepindexermissing
+  - alert: LeepIndexingAnswersHigh
+    # Shed searches never reach an index, and under a swarm they are most
+    # search requests, so they are left out of the denominator.
+    expr: |
+      sum(rate(leep_query_indexing_answers_total[10m]))
+        / (sum(rate(leep_http_requests_total{route=~"/v1/(log|last-change|blame|search)/.*"}[10m]))
+           - (sum(rate(leep_read_class_shed_total[10m])) or vector(0))) > 0.05
+    for: 10m
+    labels: {severity: ticket}
+    annotations:
+      summary: "More than 5% of indexed reads answer 503 because their index is too far behind."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepindexinganswershigh
+  - alert: LeepLandSlow
+    # Means from the histograms' _sum and _count, which the 10 s top bucket
+    # does not cap. 15 s is half the swarm agents' 30 s timeout; use half of
+    # your agents' land timeout. Queueing below that is load, not a fault.
+    # The second branch is the time from a land's batch starting to its
+    # answer: about one batch's replay.
+    expr: |
+      sum by (instance) (rate(leep_land_lock_wait_seconds_sum[10m]))
+        / sum by (instance) (rate(leep_land_lock_wait_seconds_count[10m])) > 15
+      or
+      (sum by (instance) (rate(leep_land_duration_seconds_sum[10m]))
+        / sum by (instance) (rate(leep_land_duration_seconds_count[10m]))
+        - sum by (instance) (rate(leep_land_lock_wait_seconds_sum[10m]))
+        / sum by (instance) (rate(leep_land_lock_wait_seconds_count[10m]))) > 15
+    for: 10m
+    labels: {severity: ticket}
+    annotations:
+      summary: "Lands wait over 15 s on average for their batch, or a batch takes over 15 s to replay: agents near their timeout will time out and resend."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leeplandslow
+  - alert: LeepRequestTimeouts
+    expr: sum(increase(leep_http_requests_total{status="408"}[15m])) > 5
+    labels: {severity: ticket}
+    annotations:
+      summary: "Requests are hitting --request-timeout (408). If you raise it, raise the GC --fence with it."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leeprequesttimeouts
+  - alert: LeepTokenThrottled
+    expr: sum by (token, reason) (rate(leep_requests_limited_total[10m])) > 0.5
+    for: 15m
+    labels: {severity: ticket}
+    annotations:
+      summary: "A token is being limited steadily: a runaway agent, or a limit set too low."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leeptokenthrottled
+  - alert: LeepBroadThrottling
+    expr: sum(rate(leep_http_requests_total{status="429"}[10m])) / sum(rate(leep_http_requests_total[10m])) > 0.05
+    for: 15m
+    labels: {severity: ticket}
+    annotations:
+      summary: "More than 5% of all requests are throttled (429): limits too low for the fleet, or one shared anonymous bucket."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepbroadthrottling
+  - alert: LeepBodyBudgetExhausted
+    expr: sum by (instance) (rate(leep_request_body_refused_total{reason="budget"}[10m])) > 0.05
+    for: 10m
+    labels: {severity: ticket}
+    annotations:
+      summary: "Requests are refused with 503 because the request bodies in flight fill --max-inflight-bytes: a burst of large uploads, slow uploaders holding budget, or a budget too small for the fleet."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepbodybudgetexhausted
+  - alert: LeepReadsShedding
+    # Shedding alone is the limit working: a swarm sheds 90 to 98% of its
+    # searches (docs/PERFORMANCE.md, E5 and E5b). It fires only when the
+    # class also completes fewer than 2 searches a minute per permit, which
+    # while it sheds means each admitted search holds its permit over 30 s
+    # (E5/E5b: 3 to 8 s) or a permit is never given back. The "or 0 * ..."
+    # branch keeps the rule alive on a server that has answered no search.
+    # Only the search class is built; add a class's route here when it is.
+    expr: |
+      (sum by (instance) (rate(leep_read_class_shed_total{class="search"}[15m]))
+        / sum by (instance) (rate(leep_http_requests_total{route=~"/v1/search/.*"}[15m])) > 0.5)
+      and on (instance)
+      ((sum by (instance) (rate(leep_http_requests_total{route=~"/v1/search/.*",status="200"}[15m]))
+          or 0 * max by (instance) (leep_read_class_permits{class="search"}))
+        / max by (instance) (leep_read_class_permits{class="search"}) * 60 < 2)
+    for: 15m
+    labels: {severity: ticket}
+    annotations:
+      summary: "A server sheds most searches and its search permits complete fewer than 2 a minute each: admitted searches are far slower than they should be, or failing, or a permit is stuck."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepreadsshedding
+  - alert: LeepBlobCacheColdHitRatio
+    expr: |
+      sum(rate(leep_blob_cache_hits_total[15m]))
+        / (sum(rate(leep_blob_cache_hits_total[15m])) + sum(rate(leep_blob_cache_misses_total[15m]))) < 0.5
+    for: 30m
+    labels: {severity: ticket}
+    annotations:
+      summary: "Cache hit ratio below 50%; consider a larger --cache-bytes."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepblobcachecoldhitratio
+  - alert: LeepNotReady
+    # GET /v1/ready checks run only when something probes the server; with no
+    # prober (or a prober that stopped) no series moves and this stays quiet.
+    expr: sum by (instance, store) (increase(leep_ready_checks_total{result!="ok"}[5m])) > 0
+    for: 5m
+    labels: {severity: page}
+    annotations:
+      summary: "GET /v1/ready is failing for a store: that server cannot reach its metadata or blob store and its orchestrator should be taking it out of rotation."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepnotready
+  - alert: LeepConfigReloadFailed
+    expr: increase(leep_config_reload_total{result="error"}[10m]) > 0
+    labels: {severity: page}
+    annotations:
+      summary: "A SIGHUP reload was refused; the server runs the previous config. This alert clears after 10 minutes even if the file is still bad: read the ERROR log line, fix the file, signal again, and confirm."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepconfigreloadfailed
+  - alert: LeepTokensExpiringSoon
+    expr: max(leep_tokens_expiring_soon) > 0 or max(leep_tokens_expired) > 0
+    for: 1h
+    labels: {severity: ticket}
+    annotations:
+      summary: "A token in the tokens file expires within 7 days, or has expired and is still listed: rotate it before its agent starts getting 401."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leeptokensexpiringsoon
+  - alert: LeepConfigSkew
+    # One series per server is 1; two different fingerprints means two different configs.
+    expr: count(count by (fingerprint) (leep_config_info == 1)) > 1
+    for: 15m
+    labels: {severity: ticket}
+    annotations:
+      summary: "Servers run different config (different leep_config_info fingerprints): a reload missed one, or the files differ between hosts. A restart alone does not trigger this."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepconfigskew
+  - alert: LeepSchemaVersionSkew
+    expr: max(leep_schema_version) != min(leep_schema_version)
+    for: 1h
+    labels: {severity: ticket}
+    annotations:
+      summary: "Servers run against the same database but report different schema versions: a rollout is unfinished."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepschemaversionskew
+  - alert: LeepMixedVersions
+    expr: count(count by (version) (leep_build_info)) > 1
+    for: 2h
+    labels: {severity: ticket}
+    annotations:
+      summary: "Servers report different versions for over 2 hours: a rollout is unfinished (equal versions do not prove equal builds)."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepmixedversions
+- name: leep-mirror
+  # Metrics from `leep-git mirror run --listen`, scraped under a job named
+  # "leep-mirror"; adjust. See "Git mirror" above.
+  rules:
+  - alert: LeepMirrorDown
+    expr: up{job="leep-mirror"} == 0
+    for: 5m
+    labels: {severity: page}
+    annotations:
+      summary: "A leep-git mirror cannot be scraped: lands are not reaching git, and pushes to git are not landing."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepmirrordown
+  - alert: LeepMirrorLagging
+    # Only while the mirror is still trying (pending or error); states that
+    # need a person are LeepMirrorStuck.
+    expr: |
+      max by (instance, ref) (leep_mirror_lag_seconds) > 600
+      and on (instance, ref)
+      max by (instance, ref) (leep_mirror_ref_state{state=~"pending|error"}) == 1
+    for: 2m
+    labels: {severity: page}
+    annotations:
+      summary: "A mirrored ref has differed between Leep and git for over 10 minutes while the mirror retries: the remote, its credentials or the server is failing."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepmirrorlagging
+  - alert: LeepMirrorStuck
+    expr: max by (instance, ref) (leep_mirror_ref_state{state=~"diverged|rewound|remote-ahead|refused|deleted-in-leep"}) == 1
+    for: 15m
+    labels: {severity: ticket}
+    annotations:
+      summary: "A mirrored ref needs a person: it diverged, was rewound in Leep, was refused by the land policy, or the remote is ahead."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepmirrorstuck
+  - alert: LeepMirrorLandBranchFailing
+    # Land branches (--land-branches) that conflict or were refused; the
+    # person who pushed them fixes them, so this is a ticket, not a page.
+    expr: max by (instance, ref) (leep_mirror_land_branches_failing) > 0
+    for: 1h
+    labels: {severity: ticket}
+    annotations:
+      summary: "A land branch on the git remote has conflicted with, or been refused by, its Leep ref for over an hour."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepmirrorlandbranchfailing
+- name: leep-backup
+  # Metrics written by `leep-server backup --metrics-file` (node_exporter textfile collector).
+  rules:
+  - alert: LeepBackupStale
+    # Use twice your backup interval. absent() covers "never succeeded" and a
+    # textfile collector that does not read the file.
+    expr: |
+      time() - leep_backup_last_success_timestamp_seconds > 2 * 86400
+      or
+      absent(leep_backup_last_success_timestamp_seconds)
+    for: 30m
+    labels: {severity: ticket}
+    annotations:
+      summary: "No backup has passed its check recently (or ever): your recovery point is getting older."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepbackupstale
+  - alert: LeepBackupCheckFailed
+    expr: leep_backup_last_run_ok == 0
+    labels: {severity: ticket}
+    annotations:
+      summary: "The newest backup was sealed but failed its check (or ran with --no-check); restore refuses it."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepbackupcheckfailed
+  - alert: LeepBackupSlow
+    # Last 7 days against the 7 days before (needs 14 days of retention), above 10 minutes.
+    expr: |
+      avg_over_time(leep_backup_duration_seconds[7d]) > 600
+      and
+      avg_over_time(leep_backup_duration_seconds[7d]) > 1.5 * avg_over_time(leep_backup_duration_seconds[7d] offset 7d)
+    labels: {severity: ticket}
+    annotations:
+      summary: "Backups take over 1.5 times longer than a week ago: the store is outgrowing the window."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepbackupslow
+- name: leep-cron
+  # Metrics written by the leep-cron wrapper (docs/RUNBOOKS.md#cron-wrappers),
+  # not by Leep. Delete the absent() line of a task you do not run.
+  rules:
+  - alert: LeepBackupVerifyFailed
+    expr: |
+      leep_backup_verify_last_exit_code != 0
+      or
+      time() - leep_backup_verify_last_success_timestamp_seconds > 9 * 86400
+      or
+      absent(leep_backup_verify_last_success_timestamp_seconds)
+    for: 30m
+    labels: {severity: ticket}
+    annotations:
+      summary: "The weekly backup-verify failed or has not passed in 9 days: the backup medium may be damaged."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepbackupverifyfailed
+  - alert: LeepRestoreDrillOverdue
+    expr: |
+      time() - leep_restore_drill_last_success_timestamp_seconds > 35 * 86400
+      or
+      absent(leep_restore_drill_last_success_timestamp_seconds)
+    for: 1h
+    labels: {severity: ticket}
+    annotations:
+      summary: "No passing restore drill in 35 days: an untested backup is not a backup."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leeprestoredrilloverdue
+  - alert: LeepGcStale
+    expr: |
+      time() - leep_gc_last_success_timestamp_seconds > 3 * 86400
+      or
+      absent(leep_gc_last_success_timestamp_seconds)
+    for: 1h
+    labels: {severity: ticket}
+    annotations:
+      summary: "leep-server gc has not succeeded in 3 days: unreferenced blobs are piling up."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepgcstale
+- name: leep-host
+  # node_exporter metrics, not Leep's. Set the mountpoints to the filesystems
+  # that hold the blob directory, the SQLite file or Postgres data, and the backups.
+  rules:
+  - alert: LeepDiskSpaceLow
+    expr: |
+      node_filesystem_avail_bytes{mountpoint=~"/var/lib/leep.*|/backups.*"}
+        / node_filesystem_size_bytes{mountpoint=~"/var/lib/leep.*|/backups.*"} < 0.10
+    for: 15m
+    labels: {severity: ticket}
+    annotations:
+      summary: "A Leep data or backup filesystem has under 10% free; when it fills, writes fail."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepdiskspacelow
+- name: leep-host-inodes
+  # OPTIONAL: needs node_exporter's filesystem collector on every host that
+  # holds Leep data; Leep exports no inode metric. Without node_exporter these
+  # rules never fire, so delete the group rather than trust it. Set the
+  # mountpoints to the filesystems holding a filesystem blob store and the
+  # SQLite file or Postgres data. A filesystem blob store uses one inode per
+  # loose object, so it can run out of inodes with most of its space free.
+  # Filesystems that allocate inodes on demand (btrfs) report 0 files and
+  # never match.
+  rules:
+  - alert: LeepInodesLow
+    expr: |
+      node_filesystem_files_free{mountpoint=~"/var/lib/leep.*|/var/lib/postgresql.*"}
+        / node_filesystem_files{mountpoint=~"/var/lib/leep.*|/var/lib/postgresql.*"} < 0.10
+    for: 15m
+    labels: {severity: ticket}
+    annotations:
+      summary: "A filesystem holding Leep blobs or its database has under 10% of its inodes free: usually a filesystem blob store's loose objects. Run leep-server repack."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepinodeslow
+  - alert: LeepInodesCritical
+    expr: |
+      node_filesystem_files_free{mountpoint=~"/var/lib/leep.*|/var/lib/postgresql.*"}
+        / node_filesystem_files{mountpoint=~"/var/lib/leep.*|/var/lib/postgresql.*"} < 0.03
+    for: 5m
+    labels: {severity: page}
+    annotations:
+      summary: "A filesystem holding Leep blobs or its database has under 3% of its inodes free: blob and database writes will soon fail with No space left on device."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepinodescritical
