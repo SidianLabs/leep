@@ -1373,6 +1373,48 @@ once on `main`:
   to 29.0 s for the lock in every arm, against the client's 30 s timeout,
   as in E5.
 
+#### Land admission in the swarm (E5c)
+
+The swarm with land admission (ADR 0060, section 2) at
+`--land-queue-batches` `off`, 3, 4 and 6, on one two-core VPS with
+Postgres 16: three rounds per arm, 120 s runs, 2 s think time, a 30 s
+client land timeout, batches of up to 64 lands. No run had a double or
+lost land, and the `/v1/refs` probe stayed at or under 80 ms throughout.
+
+Ranges over three rounds:
+
+| Agents | `--land-queue-batches` | Lands/s | Mean lock wait | Land timeouts and resends per run | Refused per run |
+|---|---|---|---|---|---|
+| 500 | `off` | 26.7–37.0 | 2.3–6.4 s | 0 | 0 |
+| 500 | 3 | 28.1–35.4 | 2.2–5.0 s | 0 | 1.3k–5.3k |
+| 500 | 4 | 28.3–32.2 | 3.8–5.2 s | 0 | 0.2k–1.1k |
+| 500 | 6 | 31.6–36.0 | 3.1–4.2 s | 0 | 0 |
+| 2,000 | `off` | 14.8–16.5 | 27.3–27.7 s | ~15,000 | 0 |
+| 2,000 | 3 | 16.9–18.5 | 7.3–8.0 s | 190–343 | 99k–117k |
+| 2,000 | 4 | 17.0–18.6 | 10.6–11.6 s | 240–256 | 87k–89k |
+| 2,000 | 6 | 15.3–18.1 | 17.8–20.1 s | 320–532 | 76k–81k |
+
+Mean lock wait is `leep_land_lock_wait_seconds` sum over count. Refused
+counts include the clients' own resends of refused lands. At 2,000 agents
+with admission `off`, land p50 was 50 s and p99 270 s. The 2,000-agent
+arm is bound by the clients' CPU on the one VPS, so it understates what
+admission gains.
+
+- **Land admission.** Default `--land-queue-batches 4` (ADR 0060,
+  section 2): a land is refused with 503 and `Retry-After` when more than
+  four full batches (256 lands) are already queued for its ref. That
+  bound is out of reach below about 200 concurrent writers on one ref.
+  On the two-core VPS with Postgres and a 30 s client timeout: at 500
+  agents throughput is unchanged against `off` and no client times out;
+  at 2,000 agents mean lock wait falls from 27 s to 11 s and timeouts
+  from about 15,000 to about 250 per 120 s run, at the cost of about 88k
+  refusals that clients send again. Clients older than #143 do not resend
+  a land after a 503; set `--land-queue-batches off` until they are
+  upgraded. Lower `N` for shorter client timeouts and raise it for faster
+  servers: `N` batches should take about half the client timeout. The
+  2,000-agent figures are bound by the clients' CPU and are a lower bound
+  on the benefit.
+
 #### Search rows derived in level batches (after E5)
 
 [research/search-inline-derive.md](research/search-inline-derive.md)

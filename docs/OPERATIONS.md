@@ -447,7 +447,7 @@ two cores, lands waited 27.5 to 30 s against a 30 s client timeout and
 
 | Flag / env | Default | What it bounds |
 |---|---|---|
-| `--land-queue-batches N\|off` / `LEEP_LAND_QUEUE_BATCHES` | `off` | Batches a land may wait behind, its own included. The queue holds the waiting lands over 64, rounded up, plus one while a batch replays; a land that would wait behind more than `N` is refused. A land that joins a batch still filling is admitted, since it waits no longer than the lands already in it. |
+| `--land-queue-batches N\|off` / `LEEP_LAND_QUEUE_BATCHES` | `4` | Batches a land may wait behind, its own included. The queue holds the waiting lands over 64, rounded up, plus one while a batch replays; a land that would wait behind more than `N` is refused. A land that joins a batch still filling is admitted, since it waits no longer than the lands already in it. |
 
 - A refused land gets `503`, code `unavailable`, `Retry-After` and
   `Leep-Refused: admission` at once, before its changeset is read.
@@ -468,27 +468,34 @@ two cores, lands waited 27.5 to 30 s against a 30 s client timeout and
   waiting, then exits 3 and keeps the land pending for the next
   `leep land`. The MCP server returns a retryable tool error with
   `retry_after`. Older clients report the 503 as an error.
+- **Default.** `4`, from the E5c swarm (`docs/PERFORMANCE.md`): a land is
+  refused only when more than four full batches (256 lands) are already
+  queued for its ref, which is out of reach below about 200 concurrent
+  writers on one ref, so small deployments never see it. On a two-core VPS
+  with Postgres and a 30 s client timeout, at 500 agents throughput was
+  unchanged against `off` and no client timed out; at 2,000 agents mean
+  lock wait fell from 27 s to 11 s and land timeouts from about 15,000 to
+  about 250 per 120 s run, for about 88k refusals that clients sent again.
+  Clients older than #143 do not resend a refused land: set
+  `--land-queue-batches off` until they are upgraded.
 - **Tuning.** A land waits about one batch time per batch ahead of it, so
-  choose `N` with `N` times a full batch's time under half the clients'
-  request timeout (15 s for a 30 s timeout, as the swarm's agents use). A
-  full batch takes about 64 divided by the ref's lands per second. At
-  2,000 agents on one ref on two cores, E5 and E5b landed 9.5 to 16.6
-  times a second across arms and rounds (11.2 median with the default
-  search limit, E5b), so a full batch took 4 to 7 s. Start at `N = 2`
-  there: two batches stay under 15 s even at the slowest rounds, while
-  `N = 3` does only above about 13 lands a second (`64 * 3 / 15`). On a
-  faster host, or a ref that lands more often, go higher by the same
-  rule. `N = 1` is for tests only: it admits lands only while no batch
-  replays, which collapses each batch to about one land.
+  `N` full batches should take about half the clients' land timeout (15 s
+  for a 30 s timeout, as the swarm's agents use). A full batch takes about
+  64 divided by the ref's lands per second. Lower `N` for shorter client
+  timeouts and raise it for faster servers or refs that land more often.
+  `N = 1` is for tests only: it admits lands only while no batch replays,
+  which collapses each batch to about one land.
   Watch `leep_land_queue_batches` (pinned at `N` means the bound is doing
   the work), `leep_land_admission_refused_total` against `leep_land_total`,
-  and `leep_land_lock_wait_seconds`, which should stay under the clients'
-  timeout once the bound is right. A swarm run with it on, per ADR 0060's
-  "Rollout", sets the default; until then it is off.
+  and `leep_land_lock_wait_seconds`, which should stay under half the
+  clients' timeout once the bound is right.
 - Refusals are not failures: `LeepServerErrors` and `LeepLandErrors` do
   not count them, and balancers must not count them against a backend
-  (they carry `Leep-Refused`). [LeepLandAdmissionRefusing](RUNBOOKS.md#leeplandadmissionrefusing)
-  fires when more than 10% of lands are refused for 15 minutes.
+  (they carry `Leep-Refused`). Refusing is the bound shedding load, so
+  [LeepLandAdmissionRefusing](RUNBOOKS.md#leeplandadmissionrefusing)
+  fires only when more than 10% of lands are refused for 15 minutes and
+  admitted lands also average more than half the agents' land timeout
+  (15 s in the shipped rule; use half your agents' land timeout).
 - To back out, set `--land-queue-batches off` and restart. Nothing
   persisted depends on it.
 

@@ -283,9 +283,11 @@ struct Args {
     /// waits about one batch time per batch ahead of it, so this bounds the
     /// wait. A refused land gets 503 at once with Retry-After and
     /// `Leep-Refused: admission`, before its changeset is read, and clients
-    /// send it again; queued lands are never dropped. Start with N times a
-    /// full batch's time under half the clients' timeout.
-    #[arg(long, env = "LEEP_LAND_QUEUE_BATCHES", value_parser = parse_count_or_off, default_value = "off")]
+    /// send it again; queued lands are never dropped. N full batches should
+    /// take about half the clients' land timeout. The default 4 (256 lands)
+    /// is from the E5c swarm with a 30 s timeout (docs/PERFORMANCE.md); set
+    /// off while clients that do not resend a refused land remain.
+    #[arg(long, env = "LEEP_LAND_QUEUE_BATCHES", value_parser = parse_count_or_off, default_value = "4")]
     land_queue_batches: CountOrOff,
     #[command(subcommand)]
     command: Option<Cmd>,
@@ -1984,6 +1986,15 @@ mod tests {
             .map(|e| e.to_string_lossy().into_owned())
             .collect();
         assert_eq!(listed, read, "{path} and the flags' variables differ");
+    }
+
+    /// Admission is on by default (ADR 0060, E5c); `off` still turns it off.
+    #[test]
+    fn land_queue_batches_defaults_to_four() {
+        let a = parse_args(["leep-server"]).unwrap();
+        assert!(matches!(a.land_queue_batches, CountOrOff::Count(4)));
+        let a = parse_args(["leep-server", "--land-queue-batches", "off"]).unwrap();
+        assert!(matches!(a.land_queue_batches, CountOrOff::Off));
     }
 
     #[test]
