@@ -8,6 +8,7 @@
 use std::path::PathBuf;
 
 use leep_core::api::AddSignatureResponse;
+use leep_core::outln;
 use leep_core::ChangesetId;
 
 use super::{print_json, Ctx};
@@ -57,10 +58,10 @@ pub fn added_paths(plan: &Plan) -> Vec<String> {
 /// not kept, so `leep cat` can show it.
 pub fn print_conflicts(plan: &Plan, other: ChangesetId) {
     for p in &plan.conflicts {
-        println!("  C {p} (markers written)");
+        outln!("  C {p} (markers written)");
     }
     for p in &plan.unmerged {
-        println!(
+        outln!(
             "  C {p} (no text merge: kept your version; `leep cat {other} {p}` shows the other side, \
              `leep restore --source {other} {p}` takes it)"
         );
@@ -86,7 +87,7 @@ pub fn abort(ctx: &mut Ctx, what: &str, added: &[String]) -> Result<i32> {
             "status": "aborted", "operation": what, "base": base, "discarded": discarded,
         }))?;
     } else {
-        println!(
+        outln!(
             "Aborted the {what}; the working copy is back at {} ({} discarded)",
             short(base),
             plural(discarded, "change")

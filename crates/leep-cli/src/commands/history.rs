@@ -1,12 +1,11 @@
 //! Read-only queries: log, last-change, show, cat, blame, provenance, refs.
 
-use std::io::Write;
-
 use clap::Args;
 use leep_core::api::{
     BlameResponse, ChangesetInfo, LogSummaryEntry, ProvenanceResponse, SignaturesResponse,
 };
 use leep_core::changeset::{EXTRA_AGENT_MODEL, EXTRA_AGENT_SESSION};
+use leep_core::{out, outln};
 
 use super::{print_json, Remote};
 use crate::client::LogQuery;
@@ -250,9 +249,9 @@ pub fn last_change(r: &Remote, args: &LastChangeArgs) -> Result<i32> {
         print_json(&resp)?;
         return Ok(0);
     }
-    print!("{}", header(&resp.changeset, false));
+    out!("{}", header(&resp.changeset, false));
     for c in &resp.concurrent {
-        println!("also changed concurrently in {c}");
+        outln!("also changed concurrently in {c}");
     }
     Ok(0)
 }
@@ -309,9 +308,7 @@ pub fn signature_lines(resp: &SignaturesResponse) -> Vec<String> {
 pub fn cat(r: &Remote, args: &CatArgs) -> Result<i32> {
     let id = r.resolve(&args.rev)?;
     let (data, _) = r.client.file(&id, &args.path)?;
-    let mut out = std::io::stdout().lock();
-    out.write_all(&data)?;
-    out.flush()?;
+    leep_core::stdout::write_all(&data)?;
     Ok(0)
 }
 
@@ -330,7 +327,7 @@ pub fn blame(r: &Remote, args: &BlameArgs) -> Result<i32> {
         return Ok(0);
     }
     for line in blame_lines(&resp, args.who) {
-        println!("{line}");
+        outln!("{line}");
     }
     Ok(0)
 }
@@ -380,7 +377,7 @@ pub fn provenance(r: &Remote, args: &ProvenanceArgs) -> Result<i32> {
         print_json(&resp)?;
         return Ok(0);
     }
-    print!("{}", provenance_table(&resp));
+    out!("{}", provenance_table(&resp));
     Ok(0)
 }
 
@@ -493,7 +490,7 @@ pub fn refs(r: &Remote) -> Result<i32> {
         return Ok(0);
     }
     for (name, id) in &resp.refs {
-        println!("{name} {id}");
+        outln!("{name} {id}");
     }
     Ok(0)
 }

@@ -1,10 +1,15 @@
 //! `leep-server` binary: wires stores from URLs and serves the HTTP API.
 
+// Output goes through `leep_core::outln!`, which exits quietly when the
+// reader of stdout has gone instead of panicking like `println!`.
+#![warn(clippy::print_stdout)]
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
+use leep_core::outln;
 use leep_core::BlobStore;
 use leep_derive::Repo;
 use leep_server::auth::{self, Role};
@@ -602,9 +607,9 @@ async fn run_migrate(meta: &str, dry_run: bool, status: bool) -> anyhow::Result<
         .await
         .context("migrating meta store")?;
     if status {
-        println!("schema version: {} (this server: {})", r.from, r.latest);
+        outln!("schema version: {} (this server: {})", r.from, r.latest);
         for a in &r.applied {
-            println!(
+            outln!(
                 "applied  v{:04} {} (unix {}, checksum {})",
                 a.version,
                 a.name,
@@ -616,20 +621,20 @@ async fn run_migrate(meta: &str, dry_run: bool, status: bool) -> anyhow::Result<
     let verb = if r.performed { "applied" } else { "pending" };
     for m in &r.adopted {
         let verb = if r.performed { "adopted" } else { "to adopt" };
-        println!("{verb:<8} v{:04} {} (already in place)", m.version, m.name);
+        outln!("{verb:<8} v{:04} {} (already in place)", m.version, m.name);
     }
     for m in &r.pending {
-        println!("{verb:<8} v{:04} {}", m.version, m.name);
+        outln!("{verb:<8} v{:04} {}", m.version, m.name);
         if dry_run {
-            println!("{}", m.sql.trim_end());
+            outln!("{}", m.sql.trim_end());
         }
     }
     if r.is_current() && !r.performed {
-        println!("schema is up to date at v{}", r.from);
+        outln!("schema is up to date at v{}", r.from);
     } else if r.performed {
-        println!("schema migrated from v{} to v{}", r.from, r.to);
+        outln!("schema migrated from v{} to v{}", r.from, r.to);
     } else {
-        println!(
+        outln!(
             "{} change(s) to apply to reach v{}; run `leep-server migrate`",
             r.adopted.len() + r.pending.len(),
             r.latest
@@ -649,7 +654,7 @@ async fn run_compact(meta: &str, opts: leep_meta::compact::CompactOptions) -> an
     let mut progress = |r: &leep_meta::compact::CompactReport| {
         if last.elapsed() >= std::time::Duration::from_secs(10) {
             last = std::time::Instant::now();
-            println!(
+            outln!(
                 "{:>8.0} s  {} rows, {} rewritten, {} -> {} bytes",
                 start.elapsed().as_secs_f64(),
                 r.rows,
@@ -663,7 +668,7 @@ async fn run_compact(meta: &str, opts: leep_meta::compact::CompactOptions) -> an
         .await
         .context("compacting changesets")?;
     if r.dictionary == 0 {
-        println!(
+        outln!(
             "fewer than {} changesets: nothing to train a dictionary on, nothing changed",
             leep_meta::compact::MIN_TRAINING_ROWS
         );
@@ -675,9 +680,11 @@ async fn run_compact(meta: &str, opts: leep_meta::compact::CompactOptions) -> an
         } else {
             "stored"
         };
-        println!(
+        outln!(
             "{verb} dictionary {} ({} bytes) trained on {} changesets",
-            r.dictionary, r.dictionary_bytes, r.samples
+            r.dictionary,
+            r.dictionary_bytes,
+            r.samples
         );
     }
     let verb = if opts.dry_run {
@@ -685,7 +692,7 @@ async fn run_compact(meta: &str, opts: leep_meta::compact::CompactOptions) -> an
     } else {
         "rewrote"
     };
-    println!(
+    outln!(
         "{verb} {} of {} changeset rows in {:.1} s: {} -> {} bytes ({:.2}x)",
         r.rewritten,
         r.rows,
@@ -695,7 +702,7 @@ async fn run_compact(meta: &str, opts: leep_meta::compact::CompactOptions) -> an
         r.bytes_before as f64 / r.bytes_after.max(1) as f64
     );
     if !opts.dry_run && r.rewritten > 0 && meta.starts_with("postgres") {
-        println!(
+        outln!(
             "the old row versions are free space now; `VACUUM FULL changesets` returns it to the \
              filesystem (it locks the table)"
         );
@@ -789,31 +796,31 @@ async fn run_gc(
     };
     if let Some(r) = condemn {
         let verb = if dry { "would condemn" } else { "condemned" };
-        println!("changesets scanned: {}", r.changesets_scanned);
-        println!("changesets walked: {}", r.changesets_walked);
-        println!(
+        outln!("changesets scanned: {}", r.changesets_scanned);
+        outln!("changesets walked: {}", r.changesets_walked);
+        outln!(
             "referenced blobs and trees marked by this run: {}",
             r.marked
         );
-        println!(
+        outln!(
             "referenced blobs marked by earlier runs: {}",
             r.marked_earlier
         );
-        println!("blobs scanned: {}", r.blobs_scanned);
-        println!("{verb}: {} blobs, {} bytes", r.condemned, r.condemned_bytes);
-        println!("already condemned: {}", r.already_condemned);
-        println!("kept (within grace): {}", r.kept_by_grace);
-        println!("kept (unknown age): {}", r.kept_unknown_mtime);
-        println!("kept (recently claimed): {}", r.kept_by_claim);
+        outln!("blobs scanned: {}", r.blobs_scanned);
+        outln!("{verb}: {} blobs, {} bytes", r.condemned, r.condemned_bytes);
+        outln!("already condemned: {}", r.already_condemned);
+        outln!("kept (within grace): {}", r.kept_by_grace);
+        outln!("kept (unknown age): {}", r.kept_unknown_mtime);
+        outln!("kept (recently claimed): {}", r.kept_by_claim);
     }
     if let Some(r) = collect {
         let verb = if dry { "would delete" } else { "deleted" };
-        println!("collect: condemnations examined: {}", r.condemned);
-        println!("collect: newer than fence, left alone: {}", r.fence_pending);
-        println!("collect: rescued by upload claim: {}", r.rescued_by_claim);
-        println!("collect: rescued by reference: {}", r.rescued_by_reference);
-        println!("collect: rescued by newer write: {}", r.rescued_by_upload);
-        println!("{verb}: {} blobs, {} bytes", r.deleted, r.deleted_bytes);
+        outln!("collect: condemnations examined: {}", r.condemned);
+        outln!("collect: newer than fence, left alone: {}", r.fence_pending);
+        outln!("collect: rescued by upload claim: {}", r.rescued_by_claim);
+        outln!("collect: rescued by reference: {}", r.rescued_by_reference);
+        outln!("collect: rescued by newer write: {}", r.rescued_by_upload);
+        outln!("{verb}: {} blobs, {} bytes", r.deleted, r.deleted_bytes);
     }
     Ok(())
 }
@@ -879,15 +886,15 @@ async fn run_unreachable_report(
             format!("{:.0}", b as f64 / r.lands as f64)
         }
     };
-    println!("changesets stored: {}", r.changesets);
-    println!("parents named but not stored: {}", r.missing_parents);
-    println!("refs: {}", r.refs);
-    println!("ref log entries: {} ({} lands)", r.ref_log_entries, r.lands);
-    println!("rebased-origin links: {}", r.rebased_links);
-    println!("originals in a scan window: {}", r.window_originals);
-    println!("unreachable but attested: {}", r.attested);
-    println!("unreachable but mirrored: {}", r.mirrored);
-    println!(
+    outln!("changesets stored: {}", r.changesets);
+    outln!("parents named but not stored: {}", r.missing_parents);
+    outln!("refs: {}", r.refs);
+    outln!("ref log entries: {} ({} lands)", r.ref_log_entries, r.lands);
+    outln!("rebased-origin links: {}", r.rebased_links);
+    outln!("originals in a scan window: {}", r.window_originals);
+    outln!("unreachable but attested: {}", r.attested);
+    outln!("unreachable but mirrored: {}", r.mirrored);
+    outln!(
         "ref log entries older than {}s (kept: each ref's newest): {} entries, ~{} bytes, ~{} per land",
         opts.ref_log_retention.as_secs(),
         r.ref_log_prunable_entries,
@@ -896,14 +903,17 @@ async fn run_unreachable_report(
     );
     let show = |name: &str, p: &PolicyReport| {
         let t = &p.reclaimable;
-        println!("[{name}]");
-        println!("  reachable: {}", p.reachable);
-        println!("  unreachable before grace: {}", p.unreachable);
-        println!(
+        outln!("[{name}]");
+        outln!("  reachable: {}", p.reachable);
+        outln!("  unreachable before grace: {}", p.unreachable);
+        outln!(
             "  by age (<{}d, <{}d, <{}d, older): {:?}",
-            AGE_BUCKETS_DAYS[0], AGE_BUCKETS_DAYS[1], AGE_BUCKETS_DAYS[2], p.by_age
+            AGE_BUCKETS_DAYS[0],
+            AGE_BUCKETS_DAYS[1],
+            AGE_BUCKETS_DAYS[2],
+            p.by_age
         );
-        println!(
+        outln!(
             "  reclaimable changesets (older than {}s): {} (originals {}, snapshots {}, other {})",
             opts.grace.as_secs(),
             t.changesets,
@@ -911,15 +921,15 @@ async fn run_unreachable_report(
             t.snapshots,
             t.other
         );
-        println!(
+        outln!(
             "  changeset bytes (uncompressed encoding): {} ({} per land)",
             t.changeset_bytes,
             per(t.changeset_bytes)
         );
         for (kind, (rows, bytes)) in &t.rows {
-            println!("  rows {kind}: {rows} rows, {bytes} bytes");
+            outln!("  rows {kind}: {rows} rows, {bytes} bytes");
         }
-        println!(
+        outln!(
             "  metadata bytes (logical): {} ({} per land)",
             t.meta_bytes(),
             per(t.meta_bytes())
@@ -929,13 +939,13 @@ async fn run_unreachable_report(
         } else {
             "upper bound"
         };
-        println!(
+        outln!(
             "  tree nodes ({bound}): {} nodes, {} bytes ({} per land)",
             t.tree_nodes,
             t.tree_node_bytes,
             per(t.tree_node_bytes)
         );
-        println!(
+        outln!(
             "  file contents ({bound}): {} blobs, {} bytes ({} per land)",
             t.contents,
             t.content_bytes,
@@ -949,13 +959,14 @@ async fn run_unreachable_report(
     );
     let mut index_bytes = None;
     if let Some(z) = &sizes {
-        println!("[store, logical: keys and values, not pages]");
-        println!(
+        outln!("[store, logical: keys and values, not pages]");
+        outln!(
             "  changesets: {} rows, {} bytes (as stored)",
-            z.changesets.0, z.changesets.1
+            z.changesets.0,
+            z.changesets.1
         );
-        println!("  ref log: {} rows, {} bytes", z.ref_log.0, z.ref_log.1);
-        println!("  refs: {} rows, {} bytes", z.refs.0, z.refs.1);
+        outln!("  ref log: {} rows, {} bytes", z.ref_log.0, z.ref_log.1);
+        outln!("  refs: {} rows, {} bytes", z.refs.0, z.refs.1);
         let mut index = 0;
         for (kind, rows, bytes) in &z.derived {
             let class = if WRITE_PATH_KINDS.contains(&kind.as_str()) {
@@ -964,66 +975,66 @@ async fn run_unreachable_report(
                 index += bytes;
                 "index"
             };
-            println!("  derived {kind} ({class}): {rows} rows, {bytes} bytes");
+            outln!("  derived {kind} ({class}): {rows} rows, {bytes} bytes");
         }
         index_bytes = Some(index);
         if let Some(p) = z.physical_bytes {
-            println!(
+            outln!(
                 "  physical database size: {p} bytes (pages, not logical bytes; on \
                  Postgres pg_database_size runs 2.5 to 3.5 times the logical bytes)"
             );
         }
     }
-    println!("[per land, logical bytes, side by side]");
-    println!(
+    outln!("[per land, logical bytes, side by side]");
+    outln!(
         "  write path (the lands' copies, originals, their {} rows and log entries): {}",
         WRITE_PATH_KINDS.join(", "),
         per(r.land_write.bytes())
     );
-    println!(
+    outln!(
         "  of which their ref log entries: {}",
         per(r.land_write.log_bytes)
     );
-    println!(
+    outln!(
         "  index rows (all non-write-path derived rows in the store / lands; \
          includes any imported history's): {}",
         index_bytes.map_or("-".to_string(), per)
     );
-    println!(
+    outln!(
         "  unreachable, reclaimable as designed: {}",
         per(r.log_kept.reclaimable.meta_bytes())
     );
-    println!(
+    outln!(
         "  unreachable, reclaimable with ref log retention (follow-up ADR): {} (+{} of log entries)",
         per(r.log_pruned.reclaimable.meta_bytes()),
         per(r.ref_log_prunable_bytes)
     );
-    println!("  (changesets count by their canonical encoding; stored rows may be compressed)");
+    outln!("  (changesets count by their canonical encoding; stored rows may be compressed)");
     if let Some(l) = &r.live_trees {
         let t = &r.log_kept.reclaimable;
-        println!(
+        outln!(
             "  blob store, live tree nodes and contents (all of them / lands; \
              includes any imported history's): {} nodes {}, contents {}",
             l.tree_nodes,
             per(l.tree_node_bytes),
             per(l.content_bytes)
         );
-        println!(
+        outln!(
             "  blob store, reclaimable as designed by gc --full after the sweep (exact): \
              tree nodes {}, contents {}",
             per(t.tree_node_bytes),
             per(t.content_bytes)
         );
     }
-    println!(
+    outln!(
         "reclaimable without a root_tree row (trees not counted): {}",
         r.without_root_tree
     );
-    println!(
+    outln!(
         "tree nodes missing from the blob store: {}",
         r.missing_nodes
     );
-    println!("elapsed: {:.1}s", started.elapsed().as_secs_f64());
+    outln!("elapsed: {:.1}s", started.elapsed().as_secs_f64());
     Ok(())
 }
 
@@ -1034,10 +1045,10 @@ async fn run_derive_search(meta: &str, blobs: &str, rev: &str) -> anyhow::Result
     let id = repo.resolve(rev).await?;
     let started = std::time::Instant::now();
     let r = repo.derive_search(id).await?;
-    println!("changeset: {id}");
-    println!("blob rows derived: {}", r.blob_rows);
-    println!("tree rows derived: {}", r.tree_rows);
-    println!("elapsed: {:.1}s", started.elapsed().as_secs_f64());
+    outln!("changeset: {id}");
+    outln!("blob rows derived: {}", r.blob_rows);
+    outln!("tree rows derived: {}", r.tree_rows);
+    outln!("elapsed: {:.1}s", started.elapsed().as_secs_f64());
     Ok(())
 }
 
@@ -1049,7 +1060,7 @@ fn run_command(cmd: Cmd) -> anyhow::Result<()> {
             if token.trim().is_empty() {
                 anyhow::bail!("no token on stdin");
             }
-            println!("{}", auth::hash_token(&token));
+            outln!("{}", auth::hash_token(&token));
         }
         Cmd::Gc { .. }
         | Cmd::Repack(_)
@@ -1083,8 +1094,8 @@ fn run_command(cmd: Cmd) -> anyhow::Result<()> {
                     .context("--expires-in is too far in the future")?;
                 entry.expires = Some(at.to_string());
             }
-            println!("token: {token}");
-            println!("entry: {}", serde_json::to_string(&entry)?);
+            outln!("token: {token}");
+            outln!("entry: {}", serde_json::to_string(&entry)?);
             eprintln!("Store the token now; it cannot be recovered. Add the entry to the `tokens` array of your tokens file.");
         }
     }
@@ -1219,7 +1230,15 @@ async fn main() -> anyhow::Result<()> {
             BoxMakeWriter::new(std::io::stderr),
             std::io::IsTerminal::is_terminal(&std::io::stderr()),
         )
+    } else if args.command.is_some() {
+        // A one-shot command whose reader went away (`gc | head`) ends
+        // quietly, as its own output does.
+        (
+            BoxMakeWriter::new(|| leep_core::stdout::Stdout),
+            std::io::IsTerminal::is_terminal(&std::io::stdout()),
+        )
     } else {
+        // The server outlives whoever reads its logs.
         (
             BoxMakeWriter::new(std::io::stdout),
             std::io::IsTerminal::is_terminal(&std::io::stdout()),

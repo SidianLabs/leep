@@ -1,6 +1,10 @@
 //! The Leep HTTP server: a thin axum layer over [`leep_derive::Repo`].
 //! The endpoint contract is the table in `leep_core::api`.
 
+// Output goes through `leep_core::outln!`, which exits quietly when the
+// reader of stdout has gone instead of panicking like `println!`.
+#![warn(clippy::print_stdout)]
+
 pub mod auth;
 pub mod backup;
 pub mod coord;

@@ -8,6 +8,7 @@ use super::{print_json, Ctx};
 use crate::error::{CliError, Result};
 use crate::fmt::{plural, short};
 use crate::overlay::{self, move_stack, Moved};
+use leep_core::outln;
 
 #[derive(Args, Debug, Default)]
 pub struct RebaseArgs {
@@ -59,15 +60,15 @@ pub fn run(ctx: &mut Ctx, args: &RebaseArgs) -> Result<i32> {
         .map(|()| 0);
     }
     match status {
-        "up_to_date" => println!("Already up to date with {}", short(onto)),
-        "fast_forward" => println!(
+        "up_to_date" => outln!("Already up to date with {}", short(onto)),
+        "fast_forward" => outln!(
             "Fast-forwarded {} to {} ({} written, {} removed)",
             short(base),
             short(onto),
             stats.written,
             stats.removed
         ),
-        _ => println!(
+        _ => outln!(
             "Rebased {} onto {}: base is now {} ({} written, {} removed)",
             plural(count, "local commit"),
             short(onto),

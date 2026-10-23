@@ -8,6 +8,7 @@ use leep_core::changeset::{
     EXTRA_AGENT_MODEL, EXTRA_AGENT_PROMPT, EXTRA_AGENT_SESSION, EXTRA_AGENT_TESTS,
     EXTRA_REBASED_FROM, EXTRA_REVERT_OF,
 };
+use leep_core::outln;
 use leep_core::Changeset;
 
 use super::{print_json, Ctx};
@@ -166,7 +167,7 @@ pub fn run(ctx: &mut Ctx, args: &CommitArgs) -> Result<i32> {
     if ctx.json {
         print_json(&leep_core::api::CreateChangesetResponse { id })?;
     } else {
-        println!("{id}");
+        outln!("{id}");
         eprintln!(
             "committed {} ({}{})",
             short(id),

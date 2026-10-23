@@ -114,6 +114,7 @@ Decided in [ADR 0034](adr/0034-cli-exit-codes-and-json-errors.md).
 | 5 | Conflict: content conflicts to resolve (a land, sync, merge, cherry-pick, revert or stash apply that wrote markers; a command refused while conflicts wait), or a concurrent update that won (409, a lost compare-and-swap). |
 | 6 | Nothing to do: `commit`, `amend` or `stash push` found nothing to record. |
 | 130 | Interrupted (SIGINT; the shell reports 128 + 2). |
+| 141 | stdout was closed before the output was written (`leep log \| head -1`); the shell reports 128 + 13 for SIGPIPE. Nothing is printed on stderr. |
 
 Errors print `leep: MESSAGE` on stderr, sometimes followed by `hint: ...`.
 

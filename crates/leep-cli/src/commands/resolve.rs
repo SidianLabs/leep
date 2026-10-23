@@ -11,6 +11,7 @@ use super::{print_json, Ctx};
 use crate::error::{CliError, Result};
 use crate::fmt::plural;
 use crate::status::still_conflicted;
+use leep_core::outln;
 
 #[derive(Args, Debug)]
 pub struct ResolveArgs {
@@ -64,8 +65,8 @@ pub fn run(ctx: &mut Ctx, args: &ResolveArgs) -> Result<i32> {
         return print_json(&serde_json::json!({ "resolved": picked })).map(|()| 0);
     }
     for p in &picked {
-        println!("resolved {p}");
+        outln!("resolved {p}");
     }
-    println!("Marked {} resolved", plural(picked.len(), "file"));
+    outln!("Marked {} resolved", plural(picked.len(), "file"));
     Ok(0)
 }

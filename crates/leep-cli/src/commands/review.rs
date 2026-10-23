@@ -3,6 +3,7 @@
 
 use clap::{Args, Subcommand};
 use leep_core::api::{AddReviewRequest, ReviewStatusResponse, ReviewsResponse};
+use leep_core::outln;
 use leep_core::review::Verdict;
 
 use super::{print_json, Remote};
@@ -76,7 +77,7 @@ fn verdict(r: &Remote, rev: &str, v: Verdict, comment: Option<String>) -> Result
             Verdict::Approve => "Approved",
             Verdict::Reject => "Rejected",
         };
-        println!("{word} {} as {}", short(id), resp.reviewer);
+        outln!("{word} {} as {}", short(id), resp.reviewer);
     }
     Ok(0)
 }
@@ -89,7 +90,7 @@ pub fn status(r: &Remote, args: &StatusArgs) -> Result<i32> {
         print_json(&resp)?;
     } else {
         for line in status_lines(&resp) {
-            println!("{line}");
+            outln!("{line}");
         }
     }
     // A predicate: "not approved" is exit 1, not an error (ADR 0034).
@@ -103,7 +104,7 @@ pub fn list(r: &Remote, args: &ListArgs) -> Result<i32> {
         print_json(&resp)?;
     } else {
         for line in review_lines(id, &resp) {
-            println!("{line}");
+            outln!("{line}");
         }
     }
     Ok(0)

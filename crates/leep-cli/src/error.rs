@@ -1,6 +1,7 @@
 //! CLI error type. Every error has a kind, and the kind alone decides the
 //! process exit code and the stable `code` of `--json` errors (ADR 0034).
 
+use leep_core::outln;
 use std::fmt;
 
 /// Documented process exit codes (ADR 0034). Commands that finish but report
@@ -23,6 +24,9 @@ pub mod exit {
     pub const NOTHING_TO_DO: i32 = 6;
     /// Killed by SIGINT: shells report 128 + 2. Leep installs no handler.
     pub const INTERRUPTED: i32 = 130;
+    /// stdout's reader went away (`leep log | head -1`): shells report
+    /// 128 + 13 for SIGPIPE.
+    pub const BROKEN_PIPE: i32 = leep_core::stdout::BROKEN_PIPE_EXIT;
 }
 
 /// What went wrong, as far as a caller deciding what to do next cares.
@@ -326,7 +330,7 @@ impl CliError {
     /// id, for a bug report to quote.
     pub fn report(&self, json: bool) {
         if json {
-            println!("{}", self.to_json());
+            outln!("{}", self.to_json());
         }
         eprintln!("leep: {}", self.message);
         for c in &self.candidates {

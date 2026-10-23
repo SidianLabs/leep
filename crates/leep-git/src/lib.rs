@@ -5,6 +5,10 @@
 //! (`git-to-leep-v1`, `leep-to-git-v1`), which makes both directions
 //! incremental and idempotent.
 
+// Output goes through `leep_core::outln!`, which exits quietly when the
+// reader of stdout has gone instead of panicking like `println!`.
+#![warn(clippy::print_stdout)]
+
 mod export;
 mod import;
 pub mod mirror;

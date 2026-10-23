@@ -16,6 +16,7 @@ pub mod refname;
 pub mod rename;
 pub mod review;
 pub mod signature;
+pub mod stdout;
 pub mod store;
 pub mod tree;
 

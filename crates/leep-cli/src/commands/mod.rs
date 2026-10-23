@@ -22,6 +22,7 @@ pub mod search;
 pub mod stash;
 pub mod status;
 
+use leep_core::outln;
 use leep_core::prefix::looks_like_prefix;
 use leep_core::ChangesetId;
 use serde::Serialize;
@@ -143,6 +144,6 @@ impl Remote<'_> {
 }
 
 pub fn print_json<T: Serialize>(v: &T) -> Result<()> {
-    println!("{}", serde_json::to_string_pretty(v)?);
+    outln!("{}", serde_json::to_string_pretty(v)?);
     Ok(())
 }

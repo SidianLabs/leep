@@ -10,6 +10,7 @@ use std::path::PathBuf;
 
 use clap::Args;
 use leep_core::api::{Authorship, Conflict, MergeRequest, MergeResponse};
+use leep_core::outln;
 use leep_core::{ChangesetId, FileChange, RepoPath};
 
 use super::integrate::{abort, added_paths, load_key, print_conflicts, sign};
@@ -67,7 +68,7 @@ pub fn run(ctx: &mut Ctx, args: &MergeArgs) -> Result<i32> {
                 &serde_json::json!({ "status": "up_to_date", "base": base, "other": other }),
             )?;
         } else {
-            println!(
+            outln!(
                 "Already up to date: {} is in the history of {}",
                 short(other),
                 short(base)
@@ -83,7 +84,7 @@ pub fn run(ctx: &mut Ctx, args: &MergeArgs) -> Result<i32> {
                 "written": stats.written, "removed": stats.removed,
             }))?;
         } else {
-            println!(
+            outln!(
                 "Fast-forwarded {} to {} ({} written, {} removed)",
                 short(base),
                 short(other),
@@ -118,7 +119,7 @@ pub fn run(ctx: &mut Ctx, args: &MergeArgs) -> Result<i32> {
                     "signed": signed.is_some(),
                 }))?;
             } else {
-                println!(
+                outln!(
                     "Merged {} into {}: {} ({} written, {} removed)",
                     short(other),
                     short(base),
@@ -127,7 +128,7 @@ pub fn run(ctx: &mut Ctx, args: &MergeArgs) -> Result<i32> {
                     stats.removed
                 );
                 if let Some(s) = signed {
-                    println!("signed as {} (key {})", s.name, s.key_id);
+                    outln!("signed as {} (key {})", s.name, s.key_id);
                 }
             }
             Ok(0)
@@ -157,13 +158,13 @@ pub fn run(ctx: &mut Ctx, args: &MergeArgs) -> Result<i32> {
                     "conflicts": plan.conflicts, "unmerged": plan.unmerged,
                 }))?;
             } else {
-                println!(
+                outln!(
                     "Cannot merge {} cleanly: {} conflicting",
                     short(other),
                     crate::fmt::plural(plan.conflicts.len() + plan.unmerged.len(), "file")
                 );
                 print_conflicts(&plan, other);
-                println!(
+                outln!(
                     "Resolve them (`leep resolve PATH` once chosen), then `leep commit` to finish the \
                      merge, or `leep merge --abort`."
                 );

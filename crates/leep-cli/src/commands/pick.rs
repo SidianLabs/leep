@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use clap::Args;
 use leep_core::api::{RebaseRequest, RebaseResponse};
 use leep_core::changeset::EXTRA_REVERT_OF;
+use leep_core::outln;
 use leep_core::{Changeset, ChangesetId, FileChange};
 
 use super::integrate::{abort, added_paths, load_key, print_conflicts, sign};
@@ -231,7 +232,7 @@ fn finish(
                     "signed": signed.is_some(),
                 }))?;
             } else {
-                println!(
+                outln!(
                     "{} {} as {} ({} written, {} removed)",
                     if pick.revert {
                         "Reverted"
@@ -244,7 +245,7 @@ fn finish(
                     stats.removed
                 );
                 if let Some(s) = signed {
-                    println!("signed as {} (key {})", s.name, s.key_id);
+                    outln!("signed as {} (key {})", s.name, s.key_id);
                 }
             }
             Ok(0)
@@ -277,14 +278,14 @@ fn finish(
                     "conflicts": plan.conflicts, "unmerged": plan.unmerged,
                 }))?;
             } else {
-                println!(
+                outln!(
                     "Cannot {verb} {} (\"{}\") cleanly: {} conflicting",
                     short(pick.from),
                     pick.summary,
                     crate::fmt::plural(plan.conflicts.len() + plan.unmerged.len(), "file")
                 );
                 print_conflicts(&plan, other);
-                println!(
+                outln!(
                     "Resolve them (`leep resolve PATH` once chosen), then `leep commit` to record \
                      the {verb}, or `leep {verb} --abort`."
                 );

@@ -13,6 +13,7 @@ use crate::error::Result;
 use crate::fmt::{plural, short};
 use crate::materialize::{list_files, materialize, prune_empty_dirs};
 use crate::state::{normalize_prefix, Config, WorkCopy};
+use leep_core::outln;
 
 #[derive(Args, Debug)]
 pub struct InitArgs {
@@ -82,7 +83,7 @@ pub fn run(
             if json {
                 print_json(&serde_json::json!({ "base": id, "written": stats.written }))?;
             } else {
-                println!(
+                outln!(
                     "Initialized {} at {} ({})",
                     root.display(),
                     short(id),
@@ -91,7 +92,7 @@ pub fn run(
             }
         }
         None if json => print_json(&serde_json::json!({ "base": null }))?,
-        None => println!(
+        None => outln!(
             "Initialized {}; ref {} does not exist yet",
             root.display(),
             args.target_ref

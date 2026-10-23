@@ -7,6 +7,24 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 ## [Unreleased]
 
+### Closing stdout early no longer panics
+- **Fixed.** `leep`, `leep-server`'s one-shot commands (`gen-token`, `gc`,
+  `verify`, `backup` and the rest) and `leep-git` panicked with "failed
+  printing to stdout: Broken pipe" when the reader of their output went away
+  (`leep-server gen-token ... | head -1`, `gc --dry-run | head`). They now
+  exit quietly with status 141, what a shell reports for a process killed by
+  SIGPIPE, as `git log | head -1` does. `gc`, `repack`, `migrate` and the
+  other commands that log to stdout stop the same way instead of printing a
+  tracing-subscriber error for every log line.
+- **Behavior change.** `leep log`, `diff` and `show` into a closed pipe exit
+  141 instead of 0, like every other command; under `set -o pipefail`,
+  `leep log | head -1` now fails as `git log | head -1` does. A pager quit
+  with `q` still exits 0.
+- The long-running `leep-server` keeps serving when nothing reads its log,
+  and `leep-mcp` still ends with status 1 when its client closes stdout.
+  SIGPIPE stays ignored in every binary, so a closed socket never kills a
+  process.
+
 ### Land admission is on by default (`--land-queue-batches 4`)
 - **Behavior change.** `leep-server --land-queue-batches` (and
   `LEEP_LAND_QUEUE_BATCHES`) now defaults to `4` instead of `off` (ADR

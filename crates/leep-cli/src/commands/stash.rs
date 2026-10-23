@@ -14,6 +14,7 @@ use crate::overlay;
 use crate::snapshot;
 use crate::state::Stash;
 use crate::status::{status, Change};
+use leep_core::outln;
 
 #[derive(Args, Debug)]
 #[command(args_conflicts_with_subcommands = true)]
@@ -137,7 +138,7 @@ fn push(ctx: &mut Ctx, args: &PushArgs) -> Result<i32> {
             "restored": done.restored, "removed": done.removed,
         }))?;
     } else {
-        println!(
+        outln!(
             "Saved stash 0 ({}): {message}\nRestored the working copy to {} ({} reverted, {} removed)",
             short(id),
             short(base),
@@ -156,7 +157,7 @@ fn list(ctx: &Ctx) -> Result<i32> {
     }
     for (i, s) in stashes.iter().enumerate() {
         let base = s.base.map(short).unwrap_or_else(|| "none".into());
-        println!("{i}: {} ({}, based on {base})", s.message, short(s.id));
+        outln!("{i}: {} ({}, based on {base})", s.message, short(s.id));
     }
     Ok(0)
 }
@@ -182,9 +183,9 @@ fn show(ctx: &Ctx, index: usize) -> Result<i32> {
         }))
         .map(|()| 0);
     }
-    println!("{index}: {} ({})", s.message, short(s.id));
+    outln!("{index}: {} ({})", s.message, short(s.id));
     for e in &diff.entries {
-        println!("{} {}", letter(e), e.path);
+        outln!("{} {}", letter(e), e.path);
     }
     Ok(0)
 }
@@ -229,7 +230,7 @@ fn apply(ctx: &mut Ctx, target: Option<&str>, pop: bool) -> Result<i32> {
         }))?;
         return Ok(code);
     }
-    println!(
+    outln!(
         "Applied {} on {} ({} written, {} removed)",
         short(id),
         short(base),
@@ -237,20 +238,20 @@ fn apply(ctx: &mut Ctx, target: Option<&str>, pop: bool) -> Result<i32> {
         stats.removed
     );
     for p in &plan.conflicts {
-        println!("  C {p} (markers written)");
+        outln!("  C {p} (markers written)");
     }
     for p in &plan.unmerged {
-        println!(
+        outln!(
             "  C {p} (no text merge: kept the stashed version; `leep cat @ {p}` shows the other side)"
         );
     }
     if conflicted {
-        println!("Resolve the conflicts, then `leep commit`.");
+        outln!("Resolve the conflicts, then `leep commit`.");
         if pop {
-            println!("The stash was kept; `leep stash drop` removes it once you are done.");
+            outln!("The stash was kept; `leep stash drop` removes it once you are done.");
         }
     } else if drop_it {
-        println!("Dropped stash {}", index.unwrap_or(0));
+        outln!("Dropped stash {}", index.unwrap_or(0));
     }
     Ok(code)
 }
@@ -262,7 +263,7 @@ fn drop_one(ctx: &mut Ctx, index: usize) -> Result<i32> {
     if ctx.json {
         print_json(&serde_json::json!({ "dropped": s.id, "index": index }))?;
     } else {
-        println!(
+        outln!(
             "Dropped stash {index} ({}); the changeset stays on the server",
             short(s.id)
         );

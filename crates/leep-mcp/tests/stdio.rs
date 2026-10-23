@@ -68,3 +68,42 @@ fn binary_speaks_mcp_over_stdio() {
     std::io::Read::read_to_string(&mut stdout, &mut rest).unwrap();
     assert!(rest.is_empty(), "stdout carried extra output: {rest:?}");
 }
+
+/// A client that closes our stdout has gone: the reply that fails ends the
+/// process with an error status, without a panic and without waiting for
+/// stdin to close.
+#[test]
+fn closed_stdout_ends_the_server_quietly() {
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_leep-mcp"))
+        .env("LEEP_SERVER", "http://127.0.0.1:9")
+        .env_remove("LEEP_TOKEN")
+        .stdin(Stdio::piped())
+        .stdout(writer)
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let init = json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+        "protocolVersion": "2025-06-18", "capabilities": {},
+        "clientInfo": { "name": "t", "version": "0" } } });
+    writeln!(stdin, "{init}").unwrap();
+    stdin.flush().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let status = loop {
+        if let Some(s) = child.try_wait().unwrap() {
+            break s;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "still running after its stdout closed"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    drop(stdin);
+    let mut stderr = String::new();
+    std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut stderr).unwrap();
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    assert_eq!(status.code(), Some(1), "{stderr}");
+}

@@ -2,6 +2,7 @@
 
 use clap::Args;
 use leep_core::api::SearchResponse;
+use leep_core::outln;
 
 use super::{print_json, Remote};
 use crate::client::{SearchQuery, SEARCH_PAGE};
@@ -77,7 +78,7 @@ pub fn run(r: &Remote, args: &SearchArgs) -> Result<i32> {
         return Ok(0);
     }
     for line in search_lines(&resp) {
-        println!("{line}");
+        outln!("{line}");
     }
     if resp.truncated {
         eprintln!(
