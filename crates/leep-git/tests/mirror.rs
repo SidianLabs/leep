@@ -26,8 +26,10 @@ use leep_git::mirror::{
 };
 use leep_git::{export, import, ExportOptions, ImportOptions};
 
-fn git(dir: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
+/// Run git with a fixed identity and no user configuration; the caller
+/// decides what a non-zero status means.
+fn git_output(dir: &Path, args: &[&str]) -> std::process::Output {
+    Command::new("git")
         .args(args)
         .current_dir(dir)
         .env("GIT_AUTHOR_NAME", "Ada Lovelace")
@@ -39,7 +41,11 @@ fn git(dir: &Path, args: &[&str]) -> String {
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
         .output()
-        .expect("run git");
+        .expect("run git")
+}
+
+fn git(dir: &Path, args: &[&str]) -> String {
+    let out = git_output(dir, args);
     assert!(
         out.status.success(),
         "git {args:?} failed: {}",
@@ -1965,13 +1971,33 @@ fn a_git_primary_conflict_is_reported_and_moves_nothing_until_merged_in_git() {
     assert_eq!(*leep.replays.lock().unwrap(), 1);
 
     // A person merges Leep's side in git and pushes: a fast-forward import.
+    // The merge conflicts on `a` (exit 1) and is committed with both sides;
+    // the same identity and empty configuration as every other git call,
+    // so a runner without a global identity behaves like a developer's
+    // machine.
     git(&f.human, &["fetch", "-q", "origin"]);
-    let _ = Command::new("git")
-        .args(["merge", "-q", "--no-edit", "origin/leep-diverged/main"])
-        .current_dir(&f.human)
-        .output();
+    let _ = git_output(
+        &f.human,
+        &[
+            "merge",
+            "--no-commit",
+            "--no-ff",
+            "origin/leep-diverged/main",
+        ],
+    );
+    assert!(
+        f.human.join(".git/MERGE_HEAD").exists(),
+        "the merge of the diverged branch did not start"
+    );
     write(&f.human, "a", "both\n");
     commit(&f.human, "merge, keeping both");
+    assert_eq!(
+        git(&f.human, &["rev-list", "--parents", "-n", "1", "HEAD"])
+            .split_whitespace()
+            .count(),
+        3,
+        "a merge commit with two parents"
+    );
     git(&f.human, &["push", "-q", "origin", "main"]);
     let merge = git(&f.human, &["rev-parse", "HEAD"]);
     assert!(m.run_once(), "{:?}", state(&m, "main"));
