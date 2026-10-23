@@ -12,7 +12,14 @@
 //! - with `--on-divergence merge` and `--land-branches` (ADR 0049), clean
 //!   divergences are merged by the mirror, land branches land through the
 //!   server, conflicts are reported and left alone, and crashes at every new
-//!   step neither lose nor repeat a merge or a land.
+//!   step neither lose nor repeat a merge or a land;
+//! - with `--primary git` (ADR 0062), the remote wins every race: agents'
+//!   lands are replayed onto a person's merges with no divergence, a Leep
+//!   undo is restored, and crashes and kills at every replay step neither
+//!   import nor push anything twice;
+//! - with `--ref-prefix review/ --import`, review branches are two-way: a
+//!   person's push during an agent's squash lands on the squash, and a
+//!   branch deleted on the remote deletes the ref only once its work landed.
 //!
 //! Knobs: `LEEP_MIRROR_KILL_ROUNDS` (default 12) and `LEEP_MIRROR_SEED`. Run
 //! `cargo build --workspace` first.
@@ -34,6 +41,10 @@ const TIMEOUT: Duration = Duration::from_secs(60);
 /// The flags of a mirror that merges clean divergences and lands land
 /// branches.
 const MERGING: &[&str] = &["--on-divergence", "merge", "--land-branches"];
+/// The flags of a mirror for which the remote is main's source of truth.
+const GIT_PRIMARY: &[&str] = &["--primary", "git"];
+/// The flags of a mirror with two-way review branches.
+const TWO_WAY: &[&str] = &["--ref-prefix", "review/"];
 
 fn env_u64(key: &str, default: u64) -> u64 {
     std::env::var(key)
@@ -163,12 +174,27 @@ impl Mirror {
     }
 
     fn main_status(&self) -> serde_json::Value {
+        self.ref_status("main")
+    }
+
+    fn ref_status(&self, name: &str) -> serde_json::Value {
         let (_, v) = self.status();
         v["refs"]
             .as_array()
-            .and_then(|r| r.iter().find(|r| r["leep_ref"] == "main").cloned())
+            .and_then(|r| r.iter().find(|r| r["leep_ref"] == name).cloned())
             .unwrap_or(serde_json::Value::Null)
     }
+}
+
+/// The mirror stopped at its crash point by aborting, not by an error.
+fn assert_aborted(st: std::process::ExitStatus, point: &str) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(st.signal(), Some(6), "{point}: expected an abort, got {st}");
+    }
+    #[cfg(not(unix))]
+    assert!(!st.success(), "{point}: expected an abort, got {st}");
 }
 
 impl Drop for Mirror {
@@ -195,10 +221,49 @@ fn wait_until(
 }
 
 fn leep_main(server: &Server) -> Option<String> {
-    let (code, _, body) = http_get(server.addr, "/v1/refs/main", None);
+    leep_ref(server, "main")
+}
+
+fn leep_ref(server: &Server, name: &str) -> Option<String> {
+    let (code, _, body) = http_get(server.addr, &format!("/v1/refs/{name}"), None);
     assert_eq!(code, 200, "{body}");
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
     v["target"].as_str().map(String::from)
+}
+
+/// A changeset as the server stores it.
+fn changeset(server: &Server, id: &str) -> serde_json::Value {
+    let (code, _, body) = http_get(server.addr, &format!("/v1/changesets/{id}"), None);
+    assert_eq!(code, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    v["changeset"].clone()
+}
+
+/// Move a Leep ref by compare-and-swap, as an agent rewriting its own
+/// review ref does.
+fn move_ref(server: &Server, name: &str, from: &str, to: &str) {
+    let body = format!(
+        r#"{{"expected":"{from}","new":"{to}","operation":"squash","message":"agent squash"}}"#
+    );
+    let (code, resp) = post_json(server.addr, &format!("/v1/refs/{name}"), &body);
+    assert_eq!(code, 200, "{resp}");
+    let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(v["ok"], true, "{resp}");
+}
+
+/// The number of updates of a branch on the remote, from its reflog.
+fn remote_updates(remote: &Path, branch: &str) -> usize {
+    git(
+        remote,
+        &[
+            "reflog",
+            "show",
+            "--format=%H",
+            &format!("refs/heads/{branch}"),
+        ],
+    )
+    .lines()
+    .count()
 }
 
 fn remote_ref(remote: &Path, name: &str) -> Option<String> {
@@ -245,14 +310,19 @@ impl Agent {
         }
     }
 
-    fn land(&self, path: &str, body: &str) {
+    /// Returns the changeset committed, which the server may land as a
+    /// rebased copy.
+    fn land(&self, path: &str, body: &str) -> String {
         write(&self.wc, path, body);
-        self.client
-            .ok(&self.wc, &["commit", "-m", &format!("add {path}")]);
+        let id = self
+            .client
+            .ok(&self.wc, &["commit", "-m", &format!("add {path}")])
+            .trim()
+            .to_string();
         for _ in 0..20 {
             let out = self.client.run(&self.wc, &["land"]);
             if out.status.success() {
-                return;
+                return id;
             }
             let text = format!("{}{}", stdout(&out), stderr(&out));
             assert!(
@@ -347,6 +417,55 @@ impl Person {
         sha
     }
 
+    /// Merge a pull request the way the merge button does: a commit on a
+    /// branch off the remote's main, merged with `--no-ff` into whatever
+    /// main is when the push goes through. Returns the merge pushed.
+    fn merge_pr(&self, name: &str, path: &str, body: &str) -> String {
+        let pr = format!("pr/{name}");
+        self.git(&["fetch", "-q", "origin"]);
+        self.git(&["checkout", "-q", "-B", &pr, "origin/main"]);
+        write(&self.dir, path, body);
+        self.git(&["add", "-A"]);
+        self.git(&["commit", "-q", "-m", &format!("person adds {path}")]);
+        for _ in 0..100 {
+            self.git(&["fetch", "-q", "origin"]);
+            self.git(&["checkout", "-q", "-B", "main", "origin/main"]);
+            self.git(&[
+                "merge",
+                "-q",
+                "--no-ff",
+                "--no-edit",
+                "-m",
+                &format!("Merge pull request {name}"),
+                &pr,
+            ]);
+            if self.try_git(&["push", "-q", "origin", "main"]) {
+                return self.git(&["rev-parse", "HEAD"]).trim().to_string();
+            }
+        }
+        panic!("merge of {name} kept being rejected");
+    }
+
+    /// Commit a file on top of the remote's `branch` and push it there;
+    /// local main is left as it was. Returns the commit pushed.
+    fn push_on_branch(&self, branch: &str, path: &str, body: &str) -> String {
+        self.git(&["fetch", "-q", "origin"]);
+        self.git(&[
+            "checkout",
+            "-q",
+            "-B",
+            "on-branch",
+            &format!("origin/{branch}"),
+        ]);
+        write(&self.dir, path, body);
+        self.git(&["add", "-A"]);
+        self.git(&["commit", "-q", "-m", &format!("person adds {path}")]);
+        self.git(&["push", "-q", "origin", &format!("HEAD:refs/heads/{branch}")]);
+        let sha = self.git(&["rev-parse", "HEAD"]).trim().to_string();
+        self.git(&["checkout", "-q", "main"]);
+        sha
+    }
+
     /// Push a merge of Leep's side if the mirror reported a divergence.
     fn resolve(&self) -> bool {
         if self.catch_up() {
@@ -383,7 +502,13 @@ fn assert_remote_only_fast_forwarded(remote: &Path) {
 /// changesets, each exactly once: native changesets by their
 /// `Leep-Changeset:` trailer and imported ones by their `git.commit`.
 fn assert_histories_match(client: &Client, wc: &Path, remote: &Path) {
-    let log = client.json(wc, &["log", "main", "-n", "10000"]);
+    assert_ref_histories_match(client, wc, remote, "main");
+}
+
+/// [`assert_histories_match`] for the Leep ref `name` and the remote
+/// branch of the same name.
+fn assert_ref_histories_match(client: &Client, wc: &Path, remote: &Path, name: &str) {
+    let log = client.json(wc, &["log", name, "-n", "10000"]);
     let entries = log["entries"].as_array().unwrap();
     let mut leep_ids = BTreeSet::new();
     let mut from_git = BTreeMap::new();
@@ -394,7 +519,7 @@ fn assert_histories_match(client: &Client, wc: &Path, remote: &Path) {
         }
         assert!(leep_ids.insert(id), "changeset listed twice");
     }
-    let commits = git(remote, &["log", "--format=%H%x00%B%x01", "main"]);
+    let commits = git(remote, &["log", "--format=%H%x00%B%x01", name]);
     let mut seen = BTreeSet::new();
     for rec in commits
         .split('\u{1}')
@@ -415,7 +540,7 @@ fn assert_histories_match(client: &Client, wc: &Path, remote: &Path) {
         };
         assert!(
             leep_ids.contains(&id),
-            "commit {sha} names {id}, not on Leep main"
+            "commit {sha} names {id}, not on Leep {name}"
         );
         assert!(
             seen.insert(id.clone()),
@@ -425,8 +550,37 @@ fn assert_histories_match(client: &Client, wc: &Path, remote: &Path) {
     assert_eq!(
         seen.len(),
         leep_ids.len(),
-        "every changeset on Leep main has exactly one commit on the remote"
+        "every changeset on Leep {name} has exactly one commit on the remote"
     );
+}
+
+/// Every changeset an agent landed is on Leep's main as itself or as a
+/// rebased copy (`leep.rebased_from`), possibly a copy of a copy: a land the
+/// server replayed onto a moved head and the mirror then replayed onto the
+/// remote's commits.
+fn assert_lands_on_main(server: &Server, client: &Client, wc: &Path, landed: &[String]) {
+    let log = client.json(wc, &["log", "main", "-n", "10000"]);
+    let mut covered = BTreeSet::new();
+    for e in log["entries"].as_array().unwrap() {
+        covered.insert(e["id"].as_str().unwrap().to_string());
+        let mut from = e["changeset"]["extra"]["leep.rebased_from"]
+            .as_str()
+            .map(String::from);
+        while let Some(id) = from {
+            if !covered.insert(id.clone()) {
+                break;
+            }
+            from = changeset(server, &id)["extra"]["leep.rebased_from"]
+                .as_str()
+                .map(String::from);
+        }
+    }
+    for id in landed {
+        assert!(
+            covered.contains(id),
+            "the agent's land {id} is on Leep main neither as itself nor as a rebased copy"
+        );
+    }
 }
 
 /// The files of Leep's main (through a fresh working copy) and of the
@@ -609,14 +763,18 @@ fn land_branches_on(remote: &Path) -> Vec<String> {
 /// Leep's main holds a change whose message is `msg` exactly once: a land
 /// branch or a merge was not applied twice under different ids.
 fn assert_landed_once(client: &Client, wc: &Path, msg: &str) {
-    let log = client.json(wc, &["log", "main", "-n", "10000"]);
+    assert_landed_once_on(client, wc, "main", msg);
+}
+
+fn assert_landed_once_on(client: &Client, wc: &Path, name: &str, msg: &str) {
+    let log = client.json(wc, &["log", name, "-n", "10000"]);
     let n = log["entries"]
         .as_array()
         .unwrap()
         .iter()
         .filter(|e| e["changeset"]["message"].as_str().map(str::trim) == Some(msg))
         .count();
-    assert_eq!(n, 1, "{msg:?} is on Leep main {n} times");
+    assert_eq!(n, 1, "{msg:?} is on Leep {name} {n} times");
 }
 
 /// SIGKILL the mirror at seeded random moments while it exports a backlog,
@@ -633,9 +791,20 @@ fn killed_merging_mirror_loses_and_duplicates_nothing() {
     kill_sweep(MERGING, 8);
 }
 
+/// The kill sweep with a git-primary main (ADR 0062): rounds where both
+/// sides moved are replays, killed at random moments between the import,
+/// the server's replay and the push. Nobody resolves anything, nothing is
+/// imported or pushed twice, and every land is on main as itself or as a
+/// rebased copy.
+#[test]
+fn killed_git_primary_mirror_replays_exactly_once() {
+    kill_sweep(GIT_PRIMARY, 8);
+}
+
 fn kill_sweep(extra: &[&str], default_rounds: u64) {
     let _g = serial();
-    let merging = !extra.is_empty();
+    let merging = extra == MERGING;
+    let git_primary = extra == GIT_PRIMARY;
     let seed = env_u64("LEEP_MIRROR_SEED", DEFAULT_SEED);
     let rounds = env_u64("LEEP_MIRROR_KILL_ROUNDS", default_rounds);
     eprintln!("mirror kill sweep {extra:?}: seed {seed:#x}, {rounds} rounds");
@@ -654,20 +823,27 @@ fn kill_sweep(extra: &[&str], default_rounds: u64) {
         wait_converged(&server, &remote, &m);
     }
     let person = Person::clone(&remote, root);
-    // A merging mirror needs nobody: the person never resolves.
+    // A merging or git-primary mirror needs nobody: the person never
+    // resolves.
     let settled = |m: &Mirror| {
-        if !merging && m.main_status()["state"] == "diverged" {
+        if !merging && !git_primary && m.main_status()["state"] == "diverged" {
             person.resolve();
         }
         converged(&server, &remote, m) && land_branches_on(&remote).is_empty()
     };
     let mut kills = 0;
     let mut landed = Vec::new();
+    let mut agent_lands = Vec::new();
     for round in 0..rounds {
         // 0: a backlog of lands to export and push; 1: pushes to import;
         // 2: both at once, which diverges and is merged by the person (or
-        // by the mirror); 3 (merging only): a land branch while agents land.
-        let kind = rng.below(if merging { 4 } else { 3 });
+        // by the mirror, or replayed onto the remote's side when git is
+        // primary, which gets twice the rounds of it); 3 (merging only): a
+        // land branch while agents land.
+        let kind = match rng.below(if merging || git_primary { 4 } else { 3 }) {
+            3 if git_primary => 2,
+            k => k,
+        };
         // Each round starts from both sides agreeing (the killed runs of the
         // previous round may have left work behind), so its kill lands in
         // the round's own export, push or import.
@@ -682,15 +858,20 @@ fn kill_sweep(extra: &[&str], default_rounds: u64) {
         person.catch_up();
         if kind != 1 {
             for k in 0..1 + rng.below(5) {
-                agent.land(
-                    &format!("r{round}/agent-{k}.txt"),
-                    &format!("{round} {k}\n"),
-                );
+                let path = format!("r{round}/agent-{k}.txt");
+                agent_lands.push(agent.land(&path, &format!("{round} {k}\n")));
+                if git_primary {
+                    landed.push(format!("add {path}"));
+                }
             }
         }
         if kind == 1 || kind == 2 {
             for k in 0..1 + rng.below(3) {
-                person.push_file(&format!("r{round}/person-{k}.txt"), "p\n");
+                let path = format!("r{round}/person-{k}.txt");
+                person.push_file(&path, "p\n");
+                if git_primary {
+                    landed.push(format!("person adds {path}"));
+                }
             }
         }
         if kind == 3 {
@@ -721,19 +902,24 @@ fn kill_sweep(extra: &[&str], default_rounds: u64) {
     );
     let log = m.log_text();
     eprintln!(
-        "mirror kill sweep: {} pushes, {} imports, {} merges, {} land branches, {} divergences \
-         across all runs",
+        "mirror kill sweep: {} pushes, {} imports, {} merges, {} land branches, {} replays, \
+         {} divergences across all runs",
         log.matches(": pushed ").count(),
         log.matches(": landed ").count(),
         log.matches(" from the remote into ").count(),
         log.matches(" onto main as ").count(),
+        log.matches(" unpushed lands onto the remote's ").count(),
         log.matches(": diverged: ").count()
     );
-    if merging {
+    if merging || git_primary {
         assert!(
             !log.contains(": diverged: "),
             "no divergence needed a person:\n{log}"
         );
+        assert_eq!(remote_ref(&remote, "refs/heads/leep-diverged/main"), None);
+    }
+    if git_primary {
+        assert_lands_on_main(&server, &client, &agent.wc, &agent_lands);
     }
     for msg in &landed {
         assert_landed_once(&client, &agent.wc, msg);
@@ -855,7 +1041,6 @@ fn concurrent_writers(extra: &[&str]) {
 /// after it moved, and after Leep's side of a divergence was pushed.
 #[test]
 fn crash_points_resume_exactly_once() {
-    use std::os::unix::process::ExitStatusExt;
     let _g = serial();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
@@ -909,8 +1094,7 @@ fn crash_points_resume_exactly_once() {
             }
         }
         let mut m = Mirror::start_env(&server, &remote, &work, root, &[], Some(point));
-        let st = m.wait_exit(TIMEOUT);
-        assert_eq!(st.signal(), Some(6), "{point}: expected an abort, got {st}");
+        assert_aborted(m.wait_exit(TIMEOUT), point);
         let m = Mirror::start(&server, &remote, &work, root, &[]);
         wait_until(
             &format!("convergence after a crash at {point}"),
@@ -1153,7 +1337,6 @@ fn merging_mirror_merges_clean_divergence_and_lands_land_branches() {
 /// before the delete (`land-landed`), and after the delete (`land-deleted`).
 #[test]
 fn merging_crash_points_resume_exactly_once() {
-    use std::os::unix::process::ExitStatusExt;
     let _g = serial();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
@@ -1205,8 +1388,7 @@ fn merging_crash_points_resume_exactly_once() {
             person.push_land(point, &format!("{point}/land.txt"), "l\n");
         }
         let mut m = Mirror::start_env(&server, &remote, &work, root, MERGING, Some(point));
-        let st = m.wait_exit(TIMEOUT);
-        assert_eq!(st.signal(), Some(6), "{point}: expected an abort, got {st}");
+        assert_aborted(m.wait_exit(TIMEOUT), point);
         let m = Mirror::start(&server, &remote, &work, root, MERGING);
         wait_until(
             &format!("convergence after a crash at {point}"),
@@ -1327,4 +1509,531 @@ fn mirror_pushes_and_deletes_review_refs_under_a_prefix() {
     assert_remote_only_fast_forwarded(&remote);
     let log = m.log_text();
     assert!(!log.contains("panicked"), "{log}");
+}
+
+/// `--primary git` (ADR 0062) with the real binaries: agents land through
+/// Leep while a person merges pull requests on the remote, all at once. The
+/// remote wins every race, so Leep's unpushed lands are replayed onto the
+/// person's merges: the run converges with no divergence, every land is on
+/// main as itself or a rebased copy, and the remote only fast-forwards.
+#[test]
+fn agents_land_while_a_person_merges_on_a_git_primary_remote() {
+    let _g = serial();
+    const AGENTS: usize = 3;
+    const LANDS: usize = 5;
+    const MERGES: usize = 6;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let stores = Stores::sqlite(&root.join("data"));
+    let server = Server::start(&stores, root);
+    let client = Client::new(&server.url, &root.join("cache"));
+    let remote = make_remote(root);
+    let first = Agent::new(&client, root, "agent-first");
+    first.land("start.txt", "start\n");
+    let m = Mirror::start(&server, &remote, &root.join("work"), root, GIT_PRIMARY);
+    wait_converged(&server, &remote, &m);
+    assert_eq!(m.main_status()["git_primary"], true, "{}", m.main_status());
+    let person = Person::clone(&remote, root);
+
+    let agents: Vec<Agent> = (0..AGENTS)
+        .map(|n| Agent::new(&client, root, &format!("agent-{n}")))
+        .collect();
+    let landed: Vec<String> = std::thread::scope(|s| {
+        let lands: Vec<_> = agents
+            .iter()
+            .enumerate()
+            .map(|(n, a)| {
+                s.spawn(move || {
+                    (0..LANDS)
+                        .map(|k| {
+                            a.land(
+                                &format!("agents/{n}-{k}.txt"),
+                                &format!("agent {n} land {k}\n"),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        s.spawn(|| {
+            for k in 0..MERGES {
+                person.merge_pr(
+                    &format!("p{k}"),
+                    &format!("people/{k}.txt"),
+                    &format!("merge {k}\n"),
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+        lands.into_iter().flat_map(|h| h.join().unwrap()).collect()
+    });
+    let mut diverged = false;
+    wait_until(
+        "both sides to hold every change",
+        TIMEOUT,
+        || {
+            diverged |= m.main_status()["state"] == "diverged";
+            converged(&server, &remote, &m)
+        },
+        || format!("{}\n{}", m.main_status(), m.log_text()),
+    );
+    let st = m.main_status();
+    assert!(!diverged, "a git-primary ref never diverges here: {st}");
+    assert_eq!(st["divergences"], 0, "{st}");
+    assert_eq!(remote_ref(&remote, "refs/heads/leep-diverged/main"), None);
+    let (code, all) = m.status();
+    assert_eq!(code, 0, "{all}");
+
+    let files = assert_trees_match(&client, root, &remote, "git-primary");
+    for n in 0..AGENTS {
+        for k in 0..LANDS {
+            assert!(
+                files.contains_key(&format!("agents/{n}-{k}.txt")),
+                "agent {n} land {k} lost"
+            );
+            assert_landed_once(&client, &first.wc, &format!("add agents/{n}-{k}.txt"));
+        }
+    }
+    for k in 0..MERGES {
+        assert!(
+            files.contains_key(&format!("people/{k}.txt")),
+            "merge {k} lost"
+        );
+        assert_landed_once(&client, &first.wc, &format!("person adds people/{k}.txt"));
+    }
+    assert_lands_on_main(&server, &client, &first.wc, &landed);
+    assert_histories_match(&client, &first.wc, &remote);
+    assert_remote_only_fast_forwarded(&remote);
+    git(&remote, &["fsck", "--strict", "--no-dangling"]);
+    let log = m.log_text();
+    assert!(!log.contains("panicked"), "{log}");
+    eprintln!(
+        "git-primary writers: pushes {} imports {} replays {}",
+        st["pushes"], st["imports"], st["replays"]
+    );
+}
+
+/// Abort a git-primary mirror at each step of a replay and check a restart
+/// finishes it exactly once: after the remote's side was imported and before
+/// the server replayed (`replay-imported`), after the server replayed and
+/// moved the ref and before the push (`replayed`), and after the replay's
+/// push and before the mirror saw the answer (`pushed`). Nothing is imported
+/// again, the ref moves once and the remote is updated once.
+#[test]
+fn git_primary_crash_points_resume_exactly_once() {
+    let _g = serial();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let stores = Stores::sqlite(&root.join("data"));
+    let server = Server::start(&stores, root);
+    let client = Client::new(&server.url, &root.join("cache"));
+    let remote = make_remote(root);
+    let agent = Agent::new(&client, root, "agent");
+    agent.land("seed.txt", "seed\n");
+    let work = root.join("work");
+    let person = {
+        let m = Mirror::start(&server, &remote, &work, root, GIT_PRIMARY);
+        wait_converged(&server, &remote, &m);
+        Person::clone(&remote, root)
+    };
+    let mirror_moves = || {
+        let log = client.json(&agent.wc, &["reflog", "main", "-n", "1000"]);
+        log["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["operation"] == "git-mirror")
+            .count()
+    };
+    let mut lands = Vec::new();
+    for (n, point) in ["replay-imported", "replayed", "pushed"]
+        .into_iter()
+        .enumerate()
+    {
+        person.catch_up();
+        for k in 0..2 {
+            lands.push(agent.land(&format!("{point}/agent-{k}.txt"), &format!("{n} {k}\n")));
+        }
+        for k in 0..2 {
+            person.push_file(&format!("{point}/person-{k}.txt"), "p\n");
+        }
+        let (moves, updates) = (mirror_moves(), remote_updates(&remote, "main"));
+        let mut m = Mirror::start_env(&server, &remote, &work, root, GIT_PRIMARY, Some(point));
+        assert_aborted(m.wait_exit(TIMEOUT), point);
+        let m = Mirror::start(&server, &remote, &work, root, GIT_PRIMARY);
+        wait_converged(&server, &remote, &m);
+        let (code, all) = m.status();
+        assert_eq!(code, 0, "{point}: {all}");
+        let st = m.main_status();
+        assert_eq!(st["divergences"], 0, "{point}: {st}");
+        assert_eq!(remote_ref(&remote, "refs/heads/leep-diverged/main"), None);
+        // The import before the crash was made durable: the restart finds
+        // every commit of the person's already in Leep.
+        assert_eq!(all["commits_imported"], 0, "{point}: imported twice: {all}");
+        assert_eq!(mirror_moves(), moves + 1, "{point}: the ref moved once");
+        assert_eq!(
+            remote_updates(&remote, "main"),
+            updates + 1,
+            "{point}: the replay was pushed once"
+        );
+        let (replays, pushes, exported) = match point {
+            // Nothing had moved: the restart replays, exports both copies
+            // and pushes.
+            "replay-imported" => (1, 1, 2),
+            // The ref holds the copies: the restart only exports and pushes.
+            "replayed" => (0, 1, 2),
+            // The push had landed: the restart finds both sides in sync.
+            _ => (0, 0, 0),
+        };
+        assert_eq!(st["replays"]["ok"], replays, "{point}: {st}");
+        assert_eq!(st["pushes"]["ok"], pushes, "{point}: {st}");
+        assert_eq!(all["commits_exported"], exported, "{point}: {all}");
+        drop(m);
+        for k in 0..2 {
+            assert_landed_once(&client, &agent.wc, &format!("add {point}/agent-{k}.txt"));
+            assert_landed_once(
+                &client,
+                &agent.wc,
+                &format!("person adds {point}/person-{k}.txt"),
+            );
+        }
+        assert_histories_match(&client, &agent.wc, &remote);
+        assert_remote_only_fast_forwarded(&remote);
+    }
+    assert_lands_on_main(&server, &client, &agent.wc, &lands);
+    assert_trees_match(&client, root, &remote, "git-primary-crash-points");
+    git(&remote, &["fsck", "--strict", "--no-dangling"]);
+}
+
+/// `leep undo main` on a git-primary ref is moved forward again to the
+/// remote's tip, which is the truth (ADR 0062): once with the mirror
+/// running, and once with a crash right after the restore moved the ref
+/// (`restored`), after which the restart has nothing left to do. The remote
+/// is never touched.
+#[test]
+fn a_leep_undo_on_a_git_primary_ref_is_restored_across_a_crash() {
+    let _g = serial();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let stores = Stores::sqlite(&root.join("data"));
+    let server = Server::start(&stores, root);
+    let client = Client::new(&server.url, &root.join("cache"));
+    let remote = make_remote(root);
+    let agent = Agent::new(&client, root, "agent");
+    agent.land("a.txt", "one\n");
+    let work = root.join("work");
+    let mut m = Mirror::start(&server, &remote, &work, root, GIT_PRIMARY);
+    wait_converged(&server, &remote, &m);
+    agent.land("b.txt", "two\n");
+    wait_converged(&server, &remote, &m);
+    let tip = leep_main(&server).unwrap();
+    let remote_tip = remote_ref(&remote, "refs/heads/main").unwrap();
+    let updates = remote_updates(&remote, "main");
+    let mirror_moves = || {
+        let log = client.json(&agent.wc, &["reflog", "main", "-n", "1000"]);
+        log["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["operation"] == "git-mirror")
+            .count()
+    };
+
+    // With the mirror running: restored within a cycle.
+    client.ok(&agent.wc, &["undo", "main"]);
+    wait_until(
+        "the undo to be restored",
+        TIMEOUT,
+        || leep_main(&server).as_deref() == Some(tip.as_str()) && converged(&server, &remote, &m),
+        || format!("{}\n{}", m.main_status(), m.log_text()),
+    );
+    let st = m.main_status();
+    assert_eq!(st["restores"], 1, "{st}");
+    let reflog = client.json(&agent.wc, &["reflog", "main", "-n", "1"]);
+    let e = &reflog["entries"][0];
+    assert_eq!(e["operation"], "git-mirror", "{reflog}");
+    assert!(
+        e["message"]
+            .as_str()
+            .is_some_and(|msg| msg.contains("restored from git")),
+        "{reflog}"
+    );
+    let (code, all) = m.status();
+    assert_eq!(code, 0, "a restore is a healthy end: {all}");
+    let (_, _, metrics) = http_get(m.listen.parse().unwrap(), "/metrics", None);
+    assert!(
+        metrics.contains("leep_mirror_restores_total{ref=\"main\"} 1"),
+        "{metrics}"
+    );
+
+    // A crash right after the restore moved the ref.
+    m.kill();
+    let moves = mirror_moves();
+    client.ok(&agent.wc, &["undo", "main"]);
+    assert_ne!(leep_main(&server).as_deref(), Some(tip.as_str()));
+    let mut m = Mirror::start_env(&server, &remote, &work, root, GIT_PRIMARY, Some("restored"));
+    assert_aborted(m.wait_exit(TIMEOUT), "restored");
+    assert_eq!(
+        leep_main(&server).as_deref(),
+        Some(tip.as_str()),
+        "the restore moved the ref before the crash"
+    );
+    let m = Mirror::start(&server, &remote, &work, root, GIT_PRIMARY);
+    wait_converged(&server, &remote, &m);
+    let st = m.main_status();
+    assert_eq!(st["restores"], 0, "nothing left to restore: {st}");
+    assert_eq!(st["pushes"]["ok"], 0, "{st}");
+    assert_eq!(mirror_moves(), moves + 1, "restored once");
+    assert_eq!(leep_main(&server).as_deref(), Some(tip.as_str()));
+    assert_eq!(m.status().0, 0);
+
+    assert_eq!(
+        remote_ref(&remote, "refs/heads/main").as_deref(),
+        Some(remote_tip.as_str())
+    );
+    assert_eq!(
+        remote_updates(&remote, "main"),
+        updates,
+        "the remote never moved"
+    );
+    assert_histories_match(&client, &agent.wc, &remote);
+    assert_remote_only_fast_forwarded(&remote);
+    assert_trees_match(&client, root, &remote, "restored");
+    git(&remote, &["fsck", "--strict", "--no-dangling"]);
+    assert!(!m.log_text().contains("panicked"));
+}
+
+/// Two-way review branches (`--ref-prefix review/ --import`, ADR 0062): a
+/// person pushes a commit onto an agent's review branch while the agent
+/// squashes its stack in Leep. The mirror imports the person's commit,
+/// lands it onto the squash and pushes the result with a lease on the tip
+/// it imported, across a crash after the import (`prefix-imported`) and
+/// after the land (`prefix-landed`).
+#[test]
+fn a_persons_push_to_a_review_branch_lands_on_an_agent_squash_across_crashes() {
+    let _g = serial();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let stores = Stores::sqlite(&root.join("data"));
+    let server = Server::start(&stores, root);
+    let client = Client::new(&server.url, &root.join("cache"));
+    let remote = make_remote(root);
+    let agent = Agent::new(&client, root, "agent");
+    agent.land("seed.txt", "seed\n");
+    let work = root.join("work");
+    let person = {
+        let m = Mirror::start(&server, &remote, &work, root, TWO_WAY);
+        wait_converged(&server, &remote, &m);
+        Person::clone(&remote, root)
+    };
+    let main_tip = leep_main(&server).unwrap();
+    let main_remote = remote_ref(&remote, "refs/heads/main").unwrap();
+
+    for point in ["prefix-imported", "prefix-landed"] {
+        let name = format!("review/e2e-{point}");
+        let branch = format!("refs/heads/{name}");
+        let in_sync = |m: &Mirror| {
+            let st = m.ref_status(&name);
+            st["state"] == "in-sync"
+                && st["leep"].as_str() == leep_ref(&server, &name).as_deref()
+                && st["remote"].as_str().is_some()
+                && st["remote"].as_str() == remote_ref(&remote, &branch).as_deref()
+        };
+
+        // The agent's stack reaches the branch.
+        client.ok(&agent.wc, &["switch", "main"]);
+        client.ok(&agent.wc, &["switch", "-c", &name]);
+        agent.land(&format!("{point}/one.txt"), "one\n");
+        agent.land(&format!("{point}/two.txt"), "two\n");
+        let stack = leep_ref(&server, &name).unwrap();
+        {
+            let m = Mirror::start(&server, &remote, &work, root, TWO_WAY);
+            wait_until(
+                &format!("{name} to reach the remote"),
+                TIMEOUT,
+                || in_sync(&m) && m.ref_status(&name)["leep"].as_str() == Some(stack.as_str()),
+                || format!("{}\n{}", m.ref_status(&name), m.log_text()),
+            );
+        }
+
+        // While the mirror is down, the person pushes onto the branch and
+        // the agent squashes the stack into one changeset on main.
+        let pushed = person.push_on_branch(&name, &format!("{point}/person.txt"), "p\n");
+        client.ok(&agent.wc, &["reset", &main_tip]);
+        let squash = client
+            .ok(&agent.wc, &["commit", "-m", &format!("{point}: squashed")])
+            .trim()
+            .to_string();
+        move_ref(&server, &name, &stack, &squash);
+
+        let mut m = Mirror::start_env(&server, &remote, &work, root, TWO_WAY, Some(point));
+        assert_aborted(m.wait_exit(TIMEOUT), point);
+        let m = Mirror::start(&server, &remote, &work, root, TWO_WAY);
+        wait_until(
+            &format!("the person's commit to land on {name} after a crash at {point}"),
+            TIMEOUT,
+            || {
+                in_sync(&m)
+                    && leep_ref(&server, &name).as_deref() != Some(squash.as_str())
+                    && remote_ref(&remote, &branch).as_deref() != Some(pushed.as_str())
+            },
+            || format!("{}\n{}", m.ref_status(&name), m.log_text()),
+        );
+
+        // The Leep ref holds the person's commit, rebased onto the squash.
+        let tip = leep_ref(&server, &name).unwrap();
+        let cs = changeset(&server, &tip);
+        let msg = format!("person adds {point}/person.txt");
+        assert_eq!(
+            cs["message"].as_str().map(str::trim),
+            Some(msg.as_str()),
+            "{cs}"
+        );
+        assert_eq!(cs["parents"], serde_json::json!([squash]), "{cs}");
+        assert!(cs["extra"]["leep.rebased_from"].is_string(), "{cs}");
+        assert_landed_once_on(&client, &agent.wc, &name, &msg);
+        // The agent's squashed commits are gone from the branch: only the
+        // squash and the person's copy sit above main.
+        let subjects = git(
+            &remote,
+            &["log", "--format=%s", &format!("{main_remote}..{name}")],
+        );
+        let squashed = format!("{point}: squashed");
+        assert_eq!(
+            subjects.lines().collect::<Vec<_>>(),
+            [msg.as_str(), squashed.as_str()],
+            "{subjects}"
+        );
+        assert_eq!(
+            git(&remote, &["show", &format!("{name}:{point}/person.txt")]),
+            "p\n"
+        );
+        assert_eq!(
+            git(&remote, &["show", &format!("{name}:{point}/two.txt")]),
+            "two\n"
+        );
+
+        // Rewritten with a lease on the exact tip imported, and nothing
+        // imported a second time after the crash.
+        let log = m.log_text();
+        assert!(
+            log.contains(&format!("pushing with a lease on {pushed}")),
+            "{point}:\n{log}"
+        );
+        let (code, all) = m.status();
+        assert_eq!(code, 0, "{point}: {all}");
+        assert_eq!(all["commits_imported"], 0, "{point}: imported twice: {all}");
+        let st = m.ref_status(&name);
+        assert_eq!(st["ref_prefix"], "review/", "{st}");
+        assert_eq!(st["divergences"], 0, "{st}");
+        drop(m);
+        // The Leep review ref and the review branch hold the same history,
+        // one commit per changeset.
+        assert_ref_histories_match(&client, &agent.wc, &remote, &name);
+    }
+    // Main was never touched.
+    assert_eq!(leep_main(&server).as_deref(), Some(main_tip.as_str()));
+    assert_eq!(
+        remote_ref(&remote, "refs/heads/main").as_deref(),
+        Some(main_remote.as_str())
+    );
+    assert_remote_only_fast_forwarded(&remote);
+    git(&remote, &["fsck", "--strict", "--no-dangling"]);
+}
+
+/// A review branch deleted on the remote (ADR 0062): with its work landed
+/// on main the Leep ref is deleted too, across a crash right after the
+/// delete (`ref-deleted`), and the restart neither pushes the branch again
+/// nor needs anything. With its work landed nowhere the ref is kept and
+/// reported as `deleted-on-remote`, and the branch is not pushed again.
+#[test]
+fn a_review_branch_deleted_on_the_remote_deletes_only_a_landed_ref() {
+    let _g = serial();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let stores = Stores::sqlite(&root.join("data"));
+    let server = Server::start(&stores, root);
+    let client = Client::new(&server.url, &root.join("cache"));
+    let remote = make_remote(root);
+    let agent = Agent::new(&client, root, "agent");
+    agent.land("seed.txt", "seed\n");
+    let work = root.join("work");
+    let in_sync = |m: &Mirror, name: &str| {
+        let st = m.ref_status(name);
+        st["state"] == "in-sync"
+            && st["leep"].as_str().is_some()
+            && st["leep"].as_str() == leep_ref(&server, name).as_deref()
+            && st["remote"].as_str()
+                == remote_ref(&remote, &format!("refs/heads/{name}")).as_deref()
+    };
+
+    // The mirror only knows a branch was deleted once it saw it in sync in
+    // the same process, so this one runs from the start with the crash set.
+    let mut m = Mirror::start_env(&server, &remote, &work, root, TWO_WAY, Some("ref-deleted"));
+    wait_converged(&server, &remote, &m);
+    let person = Person::clone(&remote, root);
+    let done = "review/e2e-done";
+    client.ok(&agent.wc, &["switch", "-c", done]);
+    agent.land("done.txt", "done\n");
+    wait_until(
+        "the review branch to reach the remote",
+        TIMEOUT,
+        || in_sync(&m, done) && leep_ref(&server, done) != leep_main(&server),
+        || format!("{}\n{}", m.ref_status(done), m.log_text()),
+    );
+    // The pull request is merged: the work lands on main, then the branch
+    // is deleted on the remote.
+    client.ok(&agent.wc, &["land", "--ref", "main"]);
+    assert_eq!(leep_main(&server), leep_ref(&server, done));
+    wait_converged(&server, &remote, &m);
+    person.git(&["push", "-q", "origin", &format!(":refs/heads/{done}")]);
+    assert_aborted(m.wait_exit(TIMEOUT), "ref-deleted");
+    assert_eq!(
+        leep_ref(&server, done),
+        None,
+        "the ref was deleted before the crash"
+    );
+
+    let m = Mirror::start(&server, &remote, &work, root, TWO_WAY);
+    wait_converged(&server, &remote, &m);
+    // A few cycles more: the deleted branch does not come back.
+    std::thread::sleep(Duration::from_secs(1));
+    assert_eq!(remote_ref(&remote, &format!("refs/heads/{done}")), None);
+    assert_eq!(leep_ref(&server, done), None);
+    let (code, v) = m.status();
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["refs_deleted"], 0, "deleted once, before the crash: {v}");
+    assert_eq!(v["branches_deleted"], 0, "{v}");
+    assert_eq!(m.ref_status(done), serde_json::Value::Null, "{v}");
+
+    // Work landed nowhere: kept and reported, never pushed again.
+    let open = "review/e2e-open";
+    client.ok(&agent.wc, &["switch", "main"]);
+    client.ok(&agent.wc, &["switch", "-c", open]);
+    agent.land("open.txt", "open\n");
+    wait_until(
+        "the open branch to reach the remote",
+        TIMEOUT,
+        || in_sync(&m, open) && leep_ref(&server, open) != leep_main(&server),
+        || format!("{}\n{}", m.ref_status(open), m.log_text()),
+    );
+    let kept = leep_ref(&server, open).unwrap();
+    person.git(&["push", "-q", "origin", &format!(":refs/heads/{open}")]);
+    wait_until(
+        "the deleted branch to be reported",
+        TIMEOUT,
+        || m.ref_status(open)["state"] == "deleted-on-remote",
+        || format!("{}\n{}", m.ref_status(open), m.log_text()),
+    );
+    std::thread::sleep(Duration::from_secs(1));
+    assert_eq!(leep_ref(&server, open).as_deref(), Some(kept.as_str()));
+    assert_eq!(remote_ref(&remote, &format!("refs/heads/{open}")), None);
+    let (code, v) = m.status();
+    assert_eq!(code, 1, "the kept ref needs a person: {v}");
+    assert_eq!(v["refs_deleted"], 0, "{v}");
+
+    assert_histories_match(&client, &agent.wc, &remote);
+    assert_remote_only_fast_forwarded(&remote);
+    git(&remote, &["fsck", "--strict", "--no-dangling"]);
+    assert!(!m.log_text().contains("panicked"));
 }
