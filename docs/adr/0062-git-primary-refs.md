@@ -116,7 +116,9 @@ remote.
 
 **Deletes and tags** keep ADR 0046's rules (`deleted-in-leep`, tags never
 moved). `--allow-rewind` and git-primary cannot both be set for one ref:
-the first pushes a Leep undo back, the second restores it.
+the first pushes a Leep undo back, the second restores it. On a
+git-primary ref `--on-divergence merge` does not apply: the replay is its
+divergence rule.
 
 ### `POST /v1/refs/{name}/rebase-onto` (additive)
 Body `{onto, expected_base, land_id?}`; answer `{status: "moved", head,
@@ -182,7 +184,11 @@ unchanged.
   copy, is reachable from a mirrored `--ref`: the work landed. Otherwise
   it is reported as `deleted-on-remote` and the ref is kept, since the
   work exists nowhere else. The mirror then stops tracking the branch
-  until the Leep ref moves or is deleted.
+  until the Leep ref moves or is deleted. The mirror knows a branch was
+  deleted only when it saw it in sync earlier in the same process: from
+  current values alone a deleted branch and one never pushed look the
+  same, so a branch deleted while the mirror was down is pushed again on
+  restart. That errs toward keeping work visible, never toward losing it.
 - **Leep deletes** keep ADR 0061's rule: delete the branch with a lease on
   a tip the ref held, including a tip the mirror imported for it.
 - `--on-divergence` and `--land-branches` still apply only to `--ref`

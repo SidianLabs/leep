@@ -697,6 +697,17 @@ impl Client {
         Err(self.error_from(resp))
     }
 
+    /// `POST /v1/refs/{name}/rebase-onto` (ADR 0062): replay the ref's
+    /// unpushed stack onto `onto` and move the ref once. A stale
+    /// `expected_base` is a 409, reported as a `Conflict` error.
+    pub fn rebase_onto(&self, name: &str, req: &RebaseOntoRequest) -> Result<RebaseOntoResponse> {
+        self.json(
+            self.http
+                .post(self.url(&format!("/v1/refs/{}/rebase-onto", enc(name))))
+                .json(req),
+        )
+    }
+
     pub fn resolve(&self, rev: &str) -> Result<ChangesetId> {
         let r: ResolveResponse = self.json(
             self.http

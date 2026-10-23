@@ -10,14 +10,17 @@ use std::time::Duration;
 
 use anyhow::Result;
 use bytes::Bytes;
-use leep_core::api::{LandResponse, MergeRequest, MergeResponse};
+use leep_core::api::{LandResponse, MergeRequest, MergeResponse, RebaseOntoResponse};
 use leep_core::memory::{MemoryBlobStore, MemoryMetaStore};
-use leep_core::{Changeset, ChangesetId, FileChange, FileKind, Hash, RefUpdateContext, RepoPath};
+use leep_core::{
+    Changeset, ChangesetId, FileChange, FileKind, Hash, LandId, RefUpdateContext, RepoPath,
+};
 use leep_derive::Repo;
 use leep_git::mirror::export::{CommitStyle, Exporter};
 use leep_git::mirror::map::Map;
 use leep_git::mirror::{
-    self, Cas, Config, LandOutcome, LandState, Leep, MergeOutcome, OnDivergence, RefSpec, RefState,
+    self, Cas, Config, LandOutcome, LandState, Leep, MergeOutcome, OnDivergence, Primary, RefSpec,
+    RefState, ReplayOutcome,
 };
 use leep_git::{export, import, ExportOptions, ImportOptions};
 
@@ -63,6 +66,8 @@ struct Local {
     rt: tokio::runtime::Runtime,
     /// Merges asked for.
     merges: std::sync::Mutex<u32>,
+    /// Replays (`rebase-onto`) asked for.
+    replays: std::sync::Mutex<u32>,
     /// Ref lists `refs` answers before the real one, oldest first: a list
     /// read just before a ref was recreated.
     stale_refs: std::sync::Mutex<Vec<BTreeMap<String, ChangesetId>>>,
@@ -82,6 +87,7 @@ impl Local {
                 .build()
                 .unwrap(),
             merges: std::sync::Mutex::new(0),
+            replays: std::sync::Mutex::new(0),
             stale_refs: std::sync::Mutex::new(Vec::new()),
             down: std::sync::Mutex::new(false),
         }
@@ -238,11 +244,19 @@ impl Leep for Local {
         })
     }
 
-    fn land(&self, changeset: ChangesetId, target_ref: &str) -> Result<LandOutcome> {
-        match self.on(self
-            .repo
-            .land_with(changeset, target_ref, Some("git-mirror"), false))
-        {
+    fn land(
+        &self,
+        changeset: ChangesetId,
+        target_ref: &str,
+        land_id: Option<LandId>,
+    ) -> Result<LandOutcome> {
+        match self.on(self.repo.land_keyed(
+            changeset,
+            target_ref,
+            Some("git-mirror"),
+            false,
+            land_id,
+        )) {
             Ok(LandResponse::Landed { landed, .. }) => Ok(LandOutcome::Landed(landed)),
             Ok(LandResponse::Conflicts { conflicts, .. }) => Ok(LandOutcome::Conflicts(
                 conflicts
@@ -252,6 +266,52 @@ impl Leep for Local {
             )),
             Err(leep_core::Error::Invalid(m) | leep_core::Error::NotFound(m)) => {
                 Ok(LandOutcome::Refused(m))
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn merge_base(&self, a: ChangesetId, b: ChangesetId) -> Result<Option<ChangesetId>> {
+        Ok(self.on(self.repo.merge_base(a, b))?)
+    }
+
+    fn delete_ref(&self, name: &str, expected: ChangesetId, message: &str) -> Result<Cas> {
+        let ctx = RefUpdateContext::new(mirror::CAS_OPERATION).message(message);
+        match self.on(self.repo.cas_ref_checked(name, Some(expected), None, &ctx)) {
+            Ok(true) => Ok(Cas::Won),
+            Ok(false) => Ok(Cas::Lost(self.get_ref(name))),
+            Err(leep_core::Error::Invalid(m)) => Ok(Cas::Refused(m)),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn rebase_onto(
+        &self,
+        name: &str,
+        onto: ChangesetId,
+        expected_base: ChangesetId,
+        land_id: LandId,
+    ) -> Result<ReplayOutcome> {
+        *self.replays.lock().unwrap() += 1;
+        match self.on(self.repo.rebase_onto(
+            name,
+            onto,
+            expected_base,
+            Some("git-mirror"),
+            Some(land_id),
+        )) {
+            Ok(RebaseOntoResponse::Moved { head, rebased }) => {
+                Ok(ReplayOutcome::Moved { head, rebased })
+            }
+            Ok(RebaseOntoResponse::Conflicts { conflicts, .. }) => Ok(ReplayOutcome::Conflicts(
+                conflicts
+                    .into_iter()
+                    .map(|c| c.path.as_str().to_string())
+                    .collect(),
+            )),
+            Err(leep_core::Error::Conflict(_)) => Ok(ReplayOutcome::StaleBase),
+            Err(leep_core::Error::Invalid(m) | leep_core::Error::NotFound(m)) => {
+                Ok(ReplayOutcome::Refused(m))
             }
             Err(e) => Err(e.into()),
         }
@@ -274,12 +334,17 @@ fn history(leep: &Local) -> ChangesetId {
     write(p, "a.txt", "alpha\n");
     write(p, "dir/sub/b.txt", "bravo\n");
     write(p, "run.sh", "#!/bin/sh\n");
-    std::fs::set_permissions(
-        p.join("run.sh"),
-        std::os::unix::fs::PermissionsExt::from_mode(0o755),
-    )
-    .unwrap();
-    std::os::unix::fs::symlink("a.txt", p.join("link")).unwrap();
+    // Exec bits and symlinks are Unix shapes; the rest of the history is
+    // exercised everywhere.
+    #[cfg(unix)]
+    {
+        std::fs::set_permissions(
+            p.join("run.sh"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("a.txt", p.join("link")).unwrap();
+    }
     commit(p, "first\n\nbody");
     git(p, &["checkout", "-q", "-b", "side"]);
     write(p, "side.txt", "side\n");
@@ -437,6 +502,7 @@ fn config(f: &Fixture, import: bool) -> Config {
         remote: f.remote.to_str().unwrap().to_string(),
         work_dir: f.work.clone(),
         refs: vec![RefSpec::parse("main").unwrap()],
+        primary: Primary::Leep,
         tags: true,
         ref_prefixes: vec![],
         import,
@@ -1321,19 +1387,15 @@ fn a_prefix_branch_the_remote_moved_is_reported_and_never_deleted() {
 }
 
 #[test]
-fn prefix_refs_are_never_imported() {
+fn prefix_refs_are_push_only_without_import() {
     let f = fixture();
     let leep = Local::new();
     let (_, r1) = main_and_review(&leep, "review/git-a");
-    let cfg = Config {
-        ref_prefixes: vec!["review/".into()],
-        ..merge_config(&f)
-    };
-    let mut m = mirror::Mirror::open(cfg, &leep).unwrap();
+    let mut m = mirror::Mirror::open(prefix_config(&f, false), &leep).unwrap();
     assert!(m.run_once());
     let exported = remote_head(&f, "refs/heads/review/git-a").unwrap();
 
-    // A push to the review branch, with --import on: reported, not landed.
+    // A push to the review branch: reported, not landed.
     let pushed = push_on_top(&f, "review/git-a", "pushed.txt");
     assert!(!m.run_once());
     let (st, detail) = state(&m, "review/git-a");
@@ -1361,7 +1423,99 @@ fn prefix_refs_are_never_imported() {
     );
     assert_eq!(*leep.merges.lock().unwrap(), 0);
 
-    // A land branch cannot target a prefix ref.
+    // Deleting the pushed branch lets the mirror push Leep's again.
+    git(
+        &f.human,
+        &["push", "-q", "origin", ":refs/heads/review/git-a"],
+    );
+    assert!(m.run_once());
+    assert_eq!(state(&m, "review/git-a").0, RefState::InSync);
+    let now = remote_head(&f, "refs/heads/review/git-a").unwrap();
+    assert!(is_ancestor(&f.remote, &exported, &now));
+}
+
+/// Two-way prefix refs (ADR 0062): a person's commits on a review branch
+/// are imported, and land on the Leep ref when an agent rewrote it.
+fn two_way_config(f: &Fixture) -> Config {
+    Config {
+        land_prefix: Some("leep-land/".into()),
+        ..prefix_config(f, true)
+    }
+}
+
+fn changeset(leep: &Local, id: ChangesetId) -> Changeset {
+    leep.on(leep.repo.get_changeset(id)).unwrap()
+}
+
+#[test]
+fn two_way_prefix_refs_import_a_persons_commits_and_land_them_on_a_rewrite() {
+    let f = fixture();
+    let leep = Local::new();
+    let (c1, r1) = main_and_review(&leep, "review/git-a");
+    let mut m = mirror::Mirror::open(two_way_config(&f), &leep).unwrap();
+    assert!(m.run_once());
+
+    // On top of what the mirror pushed: a fast-forward import, nothing
+    // pushed back.
+    let p1 = push_on_top(&f, "review/git-a", "late.txt");
+    assert!(m.run_once(), "{:?}", state(&m, "review/git-a"));
+    assert_eq!(state(&m, "review/git-a").0, RefState::InSync);
+    let head = leep.get_ref("review/git-a").unwrap();
+    let cs = changeset(&leep, head);
+    assert_eq!(cs.extra["git.commit"], p1);
+    assert_eq!(cs.parents, vec![r1]);
+    assert_eq!(remote_head(&f, "refs/heads/review/git-a").unwrap(), p1);
+    let log = leep
+        .on(leep.repo.meta().ref_log(Some("review/git-a"), None, 1))
+        .unwrap();
+    assert_eq!(log[0].operation, mirror::CAS_OPERATION);
+
+    // The agent squashes the stack while the person pushes again: the
+    // person's new commit is landed onto the squash and the branch is
+    // rewritten with a lease on the exact tip imported.
+    let squashed = leep.native(
+        vec![c1],
+        "squashed",
+        vec![
+            leep.file("r", "r1\n", FileKind::Regular),
+            leep.file("late.txt", "pushed to git\n", FileKind::Regular),
+        ],
+    );
+    leep.set_ref("review/git-a", squashed);
+    let p2 = push_on_top(&f, "review/git-a", "later.txt");
+    assert!(m.run_once(), "{:?}", state(&m, "review/git-a"));
+    assert_eq!(state(&m, "review/git-a").0, RefState::InSync);
+    let head = leep.get_ref("review/git-a").unwrap();
+    let cs = changeset(&leep, head);
+    assert_eq!(cs.message.trim_end(), "pushed straight to git");
+    // The person's whole unlanded stack (both pushes) is replayed onto the
+    // squash, as a land branch would be.
+    assert!(leep.on(leep.repo.is_ancestor(squashed, head)).unwrap());
+    assert!(cs
+        .changes
+        .contains_key(&RepoPath::new("later.txt").unwrap()));
+    let tip = remote_head(&f, "refs/heads/review/git-a").unwrap();
+    assert_ne!(tip, p2, "the person's commit got a new id on the branch");
+    let log = git(&f.remote, &["log", "--format=%s", "review/git-a"]);
+    assert!(
+        log.starts_with("pushed straight to git\n") && log.ends_with("\nsquashed\none"),
+        "{log}"
+    );
+    // The person's original commit is left dangling by the rewrite, which
+    // is what a rebased pull request leaves too; nothing is broken.
+    let fsck = git(&f.remote, &["fsck", "--strict"]);
+    assert!(fsck.lines().all(|l| l.starts_with("dangling ")), "{fsck}");
+    {
+        let s = m.status.lock().unwrap();
+        let r = s
+            .refs
+            .iter()
+            .find(|r| r.leep_ref == "review/git-a")
+            .unwrap();
+        assert_eq!(r.imports.landed, 2, "{}", r.detail);
+    }
+
+    // A land branch still cannot target a prefix ref.
     git(
         &f.human,
         &[
@@ -1375,20 +1529,363 @@ fn prefix_refs_are_never_imported() {
     let b = land_branch(&m, "leep-land/review/git-a/x").unwrap();
     assert_eq!(b.state, LandState::Refused, "{}", b.detail);
     assert_eq!(b.leep_ref, None);
-    assert!(!b.detail.contains("review/git-a,"), "{}", b.detail);
-    assert_eq!(leep.get_ref("review/git-a"), Some(r2));
-    assert_eq!(m.status.lock().unwrap().commits_imported, 0);
+    assert_eq!(leep.get_ref("review/git-a"), Some(head));
+    // Main was never touched.
+    assert_eq!(leep.get_ref("main"), Some(c1));
+}
 
-    // Deleting the pushed branch lets the mirror push Leep's again.
+#[test]
+fn a_two_way_prefix_conflict_is_reported_and_nothing_moves() {
+    let f = fixture();
+    let leep = Local::new();
+    let (c1, _) = main_and_review(&leep, "review/git-a");
+    let mut m = mirror::Mirror::open(two_way_config(&f), &leep).unwrap();
+    assert!(m.run_once());
+    let exported = remote_head(&f, "refs/heads/review/git-a").unwrap();
+
+    // Both sides change `r`: the person on the branch, the agent in a squash.
+    let p = push_on_top(&f, "review/git-a", "r");
+    let squashed = leep.native(
+        vec![c1],
+        "squashed",
+        vec![leep.file("r", "agent\n", FileKind::Regular)],
+    );
+    leep.set_ref("review/git-a", squashed);
+    assert!(!m.run_once());
+    let (st, detail) = state(&m, "review/git-a");
+    assert_eq!(st, RefState::Diverged, "{detail}");
+    assert!(detail.contains("path: r"), "{detail}");
+    assert_eq!(leep.get_ref("review/git-a"), Some(squashed));
+    assert_eq!(remote_head(&f, "refs/heads/review/git-a").unwrap(), p);
+    assert_eq!(
+        remote_head(&f, "refs/heads/leep-diverged/review/git-a"),
+        None,
+        "prefix refs get no diverged branch"
+    );
+
+    // The agent resolves it in Leep; the person's commit still conflicts
+    // with the new tip, so the ref stays reported until the person resets
+    // the branch to what the mirror last pushed. Then the rewrite goes out
+    // with a lease.
+    let fixed = leep.native(
+        vec![squashed],
+        "take both",
+        vec![leep.file("r", "agent and git\n", FileKind::Regular)],
+    );
+    leep.set_ref("review/git-a", fixed);
+    assert!(!m.run_once(), "the person's commit is still on the branch");
+    assert_eq!(leep.get_ref("review/git-a"), Some(fixed));
+    git(
+        &f.human,
+        &[
+            "push",
+            "-q",
+            "-f",
+            "origin",
+            &format!("{exported}:refs/heads/review/git-a"),
+        ],
+    );
+    assert!(m.run_once(), "{:?}", state(&m, "review/git-a"));
+    assert_eq!(
+        git(&f.remote, &["log", "-1", "--format=%s", "review/git-a"]),
+        "take both"
+    );
+}
+
+#[test]
+fn a_two_way_branch_deleted_on_the_remote_deletes_the_ref_only_once_landed() {
+    let f = fixture();
+    let leep = Local::new();
+    let (c1, r1) = main_and_review(&leep, "review/git-a");
+    let mut m = mirror::Mirror::open(two_way_config(&f), &leep).unwrap();
+    assert!(m.run_once());
+
+    // Deleted on the remote while the work is landed nowhere: the ref is
+    // kept and reported, and the branch is not pushed again.
+    clone_human(&f);
     git(
         &f.human,
         &["push", "-q", "origin", ":refs/heads/review/git-a"],
     );
-    // A failing land branch is the pusher's to fix: the refs stay healthy.
+    assert!(!m.run_once());
+    let (st, detail) = state(&m, "review/git-a");
+    assert_eq!(st, RefState::DeletedOnRemote, "{detail}");
+    assert_eq!(leep.get_ref("review/git-a"), Some(r1));
+    assert_eq!(remote_head(&f, "refs/heads/review/git-a"), None);
+    assert!(!m.run_once());
+    assert_eq!(remote_head(&f, "refs/heads/review/git-a"), None);
+
+    // The ref moves on: the branch is pushed again.
+    let r2 = leep.native(
+        vec![r1],
+        "more",
+        vec![leep.file("r", "r2\n", FileKind::Regular)],
+    );
+    leep.set_ref("review/git-a", r2);
+    assert!(m.run_once(), "{:?}", state(&m, "review/git-a"));
+    assert!(remote_head(&f, "refs/heads/review/git-a").is_some());
+
+    // Landed on main, then the branch is deleted (a merged pull request):
+    // the Leep ref goes too.
+    leep.set_ref("main", r2);
     assert!(m.run_once());
-    assert_eq!(state(&m, "review/git-a").0, RefState::InSync);
-    let now = remote_head(&f, "refs/heads/review/git-a").unwrap();
-    assert!(is_ancestor(&f.remote, &exported, &now));
+    git(
+        &f.human,
+        &["push", "-q", "origin", ":refs/heads/review/git-a"],
+    );
+    assert!(m.run_once(), "{:?}", state(&m, "review/git-a"));
+    assert_eq!(leep.get_ref("review/git-a"), None);
+    assert!(!tracked(&m).contains(&"review/git-a".to_string()));
+    {
+        let s = m.status.lock().unwrap();
+        assert_eq!(s.refs_deleted, 1);
+        assert_eq!(s.deleted_refs[0].leep_ref, "review/git-a");
+        assert_eq!(s.branches_deleted, 0);
+        let metrics = mirror::status::render_metrics(&s);
+        assert!(
+            metrics.contains("leep_mirror_refs_deleted_total 1"),
+            "{metrics}"
+        );
+    }
+
+    // A rebased copy counts as landed too: the ref's own tip is not on
+    // main, but main holds the server's copy of it.
+    let r3 = leep.native(
+        vec![c1],
+        "rebased later",
+        vec![leep.file("x", "x\n", FileKind::Regular)],
+    );
+    leep.set_ref("review/git-b", r3);
+    assert!(m.run_once());
+    let landed = match leep
+        .on(leep.repo.land_with(r3, "main", Some("agent"), false))
+        .unwrap()
+    {
+        LandResponse::Landed {
+            landed, rebased, ..
+        } => {
+            assert!(rebased);
+            landed
+        }
+        other => panic!("{other:?}"),
+    };
+    assert_ne!(landed, r3);
+    git(
+        &f.human,
+        &["push", "-q", "origin", ":refs/heads/review/git-b"],
+    );
+    assert!(m.run_once(), "{:?}", state(&m, "review/git-b"));
+    assert_eq!(leep.get_ref("review/git-b"), None);
+    assert_eq!(m.status.lock().unwrap().refs_deleted, 2);
+}
+
+/// Git-primary refs (ADR 0062): the remote wins a race.
+fn git_primary_config(f: &Fixture) -> Config {
+    Config {
+        primary: Primary::Git,
+        ..config(f, true)
+    }
+}
+
+fn replays(m: &mirror::Mirror) -> mirror::status::ReplayCounts {
+    let s = m.status.lock().unwrap();
+    s.refs
+        .iter()
+        .find(|r| r.leep_ref == "main")
+        .unwrap()
+        .replays
+        .clone()
+}
+
+#[test]
+fn a_git_primary_ref_replays_leeps_lands_onto_a_remote_merge() {
+    let f = fixture();
+    let leep = Local::new();
+    let c1 = leep.native(
+        vec![],
+        "one",
+        vec![leep.file("a", "1\n", FileKind::Regular)],
+    );
+    leep.set_ref("main", c1);
+    let mut m = mirror::Mirror::open(git_primary_config(&f), &leep).unwrap();
+    assert!(m.run_once());
+    let first = remote_head(&f, "refs/heads/main").unwrap();
+    assert!(m.status.lock().unwrap().refs[0].git_primary);
+
+    // An agent lands twice in Leep while a person merges on the remote.
+    let a2 = leep.native(
+        vec![c1],
+        "agent two",
+        vec![leep.file("agent.txt", "2\n", FileKind::Regular)],
+    );
+    let a3 = leep.native(
+        vec![a2],
+        "agent three",
+        vec![leep.file("agent.txt", "3\n", FileKind::Regular)],
+    );
+    leep.set_ref("main", a3);
+    clone_human(&f);
+    write(&f.human, "human.txt", "from git\n");
+    commit(&f.human, "human change");
+    git(&f.human, &["push", "-q", "origin", "main"]);
+    let human = git(&f.human, &["rev-parse", "HEAD"]);
+
+    // Replayed: Leep's ref is rewritten on top of the person's commit, the
+    // remote only fast-forwards, and nothing is merged.
+    assert!(m.run_once(), "{:?}", state(&m, "main"));
+    assert_eq!(state(&m, "main").0, RefState::InSync);
+    let head = leep.get_ref("main").unwrap();
+    let top = changeset(&leep, head);
+    assert_eq!(top.message, "agent three");
+    assert_eq!(
+        top.extra.get("leep.rebased_from").map(String::as_str),
+        Some(a3.to_string().as_str())
+    );
+    let mid = changeset(&leep, top.parents[0]);
+    assert_eq!(mid.message, "agent two");
+    let theirs = changeset(&leep, mid.parents[0]);
+    assert_eq!(theirs.extra["git.commit"], human);
+    assert_eq!(theirs.parents, vec![c1]);
+    assert_eq!(*leep.merges.lock().unwrap(), 0);
+    let log = git(&f.remote, &["log", "--format=%s", "main"]);
+    assert_eq!(log, "agent three\nagent two\nhuman change\none");
+    assert_eq!(git(&f.remote, &["rev-parse", "main~2"]), human);
+    assert!(is_ancestor(
+        &f.remote,
+        &first,
+        &remote_head(&f, "refs/heads/main").unwrap()
+    ));
+    assert_eq!(git(&f.remote, &["fsck", "--strict"]), "");
+    let reflog = leep
+        .on(leep.repo.meta().ref_log(Some("main"), None, 1))
+        .unwrap();
+    assert_eq!(reflog[0].operation, mirror::CAS_OPERATION);
+    assert_eq!(reflog[0].new, Some(head));
+    assert_eq!(replays(&m).ok, 1);
+    assert_eq!(*leep.replays.lock().unwrap(), 1);
+    // The originals are still stored, and the person's tree is Leep's tree.
+    assert!(leep.has_changeset(&a3).unwrap());
+    let metrics = mirror::status::render_metrics(&m.status.lock().unwrap());
+    assert!(
+        metrics.contains("leep_mirror_replays_total{ref=\"main\",result=\"ok\"} 1"),
+        "{metrics}"
+    );
+
+    // A Leep undo on a git-primary ref is restored from the remote.
+    leep.set_ref("main", top.parents[0]);
+    m.cycle();
+    assert_eq!(state(&m, "main").0, RefState::Restored);
+    assert!(m.run_once(), "{:?}", state(&m, "main"));
+    assert_eq!(state(&m, "main").0, RefState::InSync);
+    assert_eq!(leep.get_ref("main"), Some(head));
+    assert_eq!(
+        git(&f.remote, &["log", "-1", "--format=%s", "main"]),
+        "agent three"
+    );
+    let s = m.status.lock().unwrap();
+    assert_eq!(s.refs[0].restores, 1);
+    assert!(s.refs[0].state.healthy());
+}
+
+#[test]
+fn a_git_primary_conflict_is_reported_and_moves_nothing_until_merged_in_git() {
+    let f = fixture();
+    let leep = Local::new();
+    let c1 = leep.native(
+        vec![],
+        "one",
+        vec![leep.file("a", "1\n", FileKind::Regular)],
+    );
+    leep.set_ref("main", c1);
+    let mut m = mirror::Mirror::open(git_primary_config(&f), &leep).unwrap();
+    assert!(m.run_once());
+
+    // Both sides change `a`.
+    let agent = leep.native(
+        vec![c1],
+        "agent",
+        vec![leep.file("a", "agent\n", FileKind::Regular)],
+    );
+    leep.set_ref("main", agent);
+    clone_human(&f);
+    write(&f.human, "a", "human\n");
+    commit(&f.human, "human");
+    git(&f.human, &["push", "-q", "origin", "main"]);
+    let human = git(&f.human, &["rev-parse", "HEAD"]);
+    assert!(!m.run_once());
+    let (st, detail) = state(&m, "main");
+    assert_eq!(st, RefState::Diverged, "{detail}");
+    assert!(
+        detail.contains("not replayed") && detail.contains("path: a"),
+        "{detail}"
+    );
+    assert_eq!(leep.get_ref("main"), Some(agent));
+    assert_eq!(remote_head(&f, "refs/heads/main").unwrap(), human);
+    assert!(remote_head(&f, "refs/heads/leep-diverged/main").is_some());
+    assert_eq!(replays(&m).conflicts, 1);
+    // The same pair is not asked about again.
+    assert!(!m.run_once());
+    assert_eq!(*leep.replays.lock().unwrap(), 1);
+
+    // A person merges Leep's side in git and pushes: a fast-forward import.
+    git(&f.human, &["fetch", "-q", "origin"]);
+    let _ = Command::new("git")
+        .args(["merge", "-q", "--no-edit", "origin/leep-diverged/main"])
+        .current_dir(&f.human)
+        .output();
+    write(&f.human, "a", "both\n");
+    commit(&f.human, "merge, keeping both");
+    git(&f.human, &["push", "-q", "origin", "main"]);
+    let merge = git(&f.human, &["rev-parse", "HEAD"]);
+    assert!(m.run_once(), "{:?}", state(&m, "main"));
+    let head = leep.get_ref("main").unwrap();
+    assert_eq!(changeset(&leep, head).extra["git.commit"], merge);
+    assert!(leep.on(leep.repo.is_ancestor(agent, head)).unwrap());
+    assert_eq!(remote_head(&f, "refs/heads/leep-diverged/main"), None);
+    assert_eq!(git(&f.remote, &["fsck", "--strict"]), "");
+}
+
+#[test]
+fn a_leep_primary_ref_keeps_adr_0046s_rules_beside_a_git_primary_one() {
+    let f = fixture();
+    let leep = Local::new();
+    let c1 = leep.native(
+        vec![],
+        "one",
+        vec![leep.file("a", "1\n", FileKind::Regular)],
+    );
+    leep.set_ref("main", c1);
+    leep.set_ref("release", c1);
+    let cfg = Config {
+        refs: vec![
+            RefSpec::parse("main@git").unwrap(),
+            RefSpec::parse("release").unwrap(),
+        ],
+        ..config(&f, true)
+    };
+    let mut m = mirror::Mirror::open(cfg, &leep).unwrap();
+    assert!(m.run_once());
+    {
+        let s = m.status.lock().unwrap();
+        let by = |n: &str| s.refs.iter().find(|r| r.leep_ref == n).unwrap().git_primary;
+        assert!(by("main") && !by("release"));
+    }
+    // An undo on each: main is restored, release is rewound.
+    let a2 = leep.native(
+        vec![c1],
+        "two",
+        vec![leep.file("b", "2\n", FileKind::Regular)],
+    );
+    leep.set_ref("main", a2);
+    leep.set_ref("release", a2);
+    assert!(m.run_once());
+    leep.set_ref("main", c1);
+    leep.set_ref("release", c1);
+    assert!(!m.run_once());
+    assert_eq!(state(&m, "main").0, RefState::InSync);
+    assert_eq!(leep.get_ref("main"), Some(a2));
+    assert_eq!(state(&m, "release").0, RefState::Rewound);
+    assert_eq!(leep.get_ref("release"), Some(c1));
 }
 
 #[test]

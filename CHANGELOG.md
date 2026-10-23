@@ -24,6 +24,24 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   and `leep-mcp` still ends with status 1 when its client closes stdout.
   SIGPIPE stays ignored in every binary, so a closed socket never kills a
   process.
+
+### Git-primary refs and two-way review branches in the mirror (ADR 0062)
+- `leep-git mirror run --primary git`, or `@git` on one `--ref`, makes the
+  remote that ref's source of truth: when both sides moved, the remote's
+  commits are imported and Leep's unpushed lands are replayed onto them
+  with `POST /v1/refs/{name}/rebase-onto` (new states and counters:
+  `restored`, `leep_mirror_replays_total`, `leep_mirror_restores_total`),
+  and a Leep undo is moved forward again to the remote's tip. Needs
+  `--import`. Conflicts still report `diverged` and move nothing.
+- `--ref-prefix` refs are two-way with `--import`: a person's commits on
+  a review branch are imported, and landed onto the ref when an agent
+  rewrote it, with the branch pushed under a lease on the tip imported. A
+  branch deleted on the remote deletes the Leep ref once its work is landed
+  (`leep_mirror_refs_deleted_total`) and reports `deleted-on-remote`
+  otherwise. Without `--import` prefix refs stay push-only.
+- Land branches and the mirror's lands now carry a `land_id` derived from
+  what is landed, so a retry after a crash is the same land.
+
 ### `POST /v1/refs/{name}/rebase-onto` (ADR 0062, server half)
 - New endpoint for the git mirror's git-primary refs: replays the ref's
   first-parent stack above `expected_base` onto `onto` and moves the ref

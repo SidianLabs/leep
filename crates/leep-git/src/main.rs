@@ -98,17 +98,26 @@ struct RunArgs {
     /// status file and a lock (one mirror per directory).
     #[arg(long)]
     work_dir: PathBuf,
-    /// Leep ref to mirror, as NAME or NAME:GIT_REF (repeatable). NAME maps
-    /// to refs/heads/NAME and tags/T to refs/tags/T.
+    /// Leep ref to mirror, as NAME or NAME:GIT_REF, with @git or @leep
+    /// appended to say which side is the source of truth for it
+    /// (repeatable). NAME maps to refs/heads/NAME and tags/T to refs/tags/T.
     #[arg(long = "ref", value_name = "SPEC")]
     refs: Vec<String>,
+    /// Which side wins a race on a --ref that does not say: `leep` (both
+    /// sides moved: report, and push Leep's side to the diverged branch) or
+    /// `git` (replay Leep's unpushed lands onto the remote's commits, and
+    /// move a Leep undo forward again). Needs --import. Tags stay Leep's.
+    #[arg(long, default_value = "leep")]
+    primary: mirror::Primary,
     /// Also mirror every Leep tag to refs/tags/.
     #[arg(long)]
     tags: bool,
     /// Also mirror every Leep ref under PREFIX (such as review/) to the
-    /// branch of the same name, as refs appear (repeatable). Push-only: a
-    /// branch someone pushed to is reported, never imported or overwritten.
-    /// A ref deleted in Leep has its branch deleted with a lease.
+    /// branch of the same name, as refs appear (repeatable). With --import
+    /// the branch is two-way: a person's commits on it are imported and
+    /// landed on the Leep ref. Without it, a branch someone pushed to is
+    /// reported, never imported or overwritten. A ref deleted in Leep has
+    /// its branch deleted with a lease.
     #[arg(long = "ref-prefix", value_name = "PREFIX")]
     ref_prefixes: Vec<String>,
     /// Land commits pushed to the remote in Leep when they fast-forward the
@@ -286,6 +295,7 @@ fn run_mirror(cmd: MirrorCmd) -> Result<i32> {
                 remote: a.remote,
                 work_dir: a.work_dir,
                 refs,
+                primary: a.primary,
                 tags: a.tags,
                 ref_prefixes: a.ref_prefixes,
                 import: a.import,

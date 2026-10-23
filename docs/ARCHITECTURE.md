@@ -850,20 +850,31 @@ pushed with a lease, and a Leep delete deletes the branch with a lease, but
 only when the ref log shows the Leep ref held the remote's tip; a branch
 someone pushed to is reported and left alone.
 
-Two proposed additions make the remote the source of truth where a team
-wants that ([ADR 0062](adr/0062-git-primary-refs.md),
-[ADR 0063](adr/0063-github-reviews.md)). On a `--ref` marked git-primary,
-the "rewound" row restores the Leep ref to the remote's tip, and the
-"otherwise" row imports `G` and asks `POST /v1/refs/{name}/rebase-onto` to
-replay Leep's unpushed lands onto it, inside the ref's land coordinator so
-no land is lost to the race, then pushes the result as a fast-forward; a
-conflict reports the paths and moves nothing. With `--import`, a prefix ref
-is two-way: a person's commits on the branch are imported and landed on the
-Leep ref, and the branch is pushed with a lease on the exact tip imported.
-With `--github-reviews`, approvals on the pull request of a review branch,
-from logins in a mapping file, are posted as Leep reviews for the mapped
-principal through a `review_for` token, so the review gate of ADR 0011
-holds without a second approval.
+A `--ref` can make the remote its source of truth
+(`--ref main@git`, or `--primary git` for every `--ref`; needs `--import`;
+[ADR 0062](adr/0062-git-primary-refs.md)). Two rows change for such a ref:
+"rewound" becomes `restored`, a fast-forward CAS of the Leep ref to the
+remote tip's changeset; and "otherwise" imports `G` and asks
+`POST /v1/refs/{name}/rebase-onto` (with the merge base it read as
+`expected_base`, and a land id derived from the pair) to replay Leep's
+unpushed lands onto it and move the ref once, inside the ref's land
+coordinator so no land is lost to the race, then pushes the result as a
+fast-forward. A conflict or a refusal reports `diverged` with the paths
+(Leep's side still goes to the diverged branch, for the merge in git) and
+the same pair is not asked about again until a side moves; a stale base
+(409) is read again. With `--import`, a prefix ref is two-way: a person's
+commits on top of the branch are imported as a fast-forward of the Leep ref;
+when an agent rewrote the ref as well, they are imported and landed onto it
+with `POST /v1/land` and the branch is pushed with a lease on the exact tip
+imported; a conflict reports and moves nothing. A branch deleted on the
+remote deletes the Leep ref only when its tip, or a rebased copy of it, is
+in a mirrored `--ref`'s history; otherwise the ref is kept and reported
+(`deleted-on-remote`) and the branch is not pushed again until the ref
+moves. With the proposed `--github-reviews`
+([ADR 0063](adr/0063-github-reviews.md)), approvals on the pull request of a
+review branch, from logins in a mapping file, are posted as Leep reviews for
+the mapped principal through a `review_for` token, so the review gate of
+ADR 0011 holds without a second approval.
 
 **Rebase onto** (`POST /v1/refs/{name}/rebase-onto`, the server half of
 ADR 0062's replay; the mirror half is not built yet). It queues on the
