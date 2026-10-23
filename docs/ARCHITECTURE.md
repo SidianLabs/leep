@@ -850,6 +850,21 @@ pushed with a lease, and a Leep delete deletes the branch with a lease, but
 only when the ref log shows the Leep ref held the remote's tip; a branch
 someone pushed to is reported and left alone.
 
+Two proposed additions make the remote the source of truth where a team
+wants that ([ADR 0062](adr/0062-git-primary-refs.md),
+[ADR 0063](adr/0063-github-reviews.md)). On a `--ref` marked git-primary,
+the "rewound" row restores the Leep ref to the remote's tip, and the
+"otherwise" row imports `G` and asks `POST /v1/refs/{name}/rebase-onto` to
+replay Leep's unpushed lands onto it, inside the ref's land coordinator so
+no land is lost to the race, then pushes the result as a fast-forward; a
+conflict reports the paths and moves nothing. With `--import`, a prefix ref
+is two-way: a person's commits on the branch are imported and landed on the
+Leep ref, and the branch is pushed with a lease on the exact tip imported.
+With `--github-reviews`, approvals on the pull request of a review branch,
+from logins in a mapping file, are posted as Leep reviews for the mapped
+principal through a `review_for` token, so the review gate of ADR 0011
+holds without a second approval.
+
 ## 7. Caching tiers
 
 ```
