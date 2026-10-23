@@ -100,7 +100,8 @@ fn hex_seed(k: &SigningKey) -> String {
     hex::encode(k.to_bytes())
 }
 
-#[cfg(test)]
+// Every test needs Unix file modes.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use ed25519_dalek::{Signature, VerifyingKey};
