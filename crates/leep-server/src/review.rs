@@ -20,7 +20,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use leep_core::api::{PathReview, ReviewStatusResponse, ReviewsResponse};
+use leep_core::api::{PathReview, ReviewEntry, ReviewStatusResponse, ReviewsResponse};
 use leep_core::review::{Review, NEEDS_REVIEW_MARKER};
 use leep_core::{ChangesetId, Error, Result};
 use leep_derive::owners::OwnersResolver;
@@ -114,11 +114,29 @@ impl ReviewService {
         Ok(out)
     }
 
+    /// [`Self::reviews_for`] with each review's `review-source-v1` row, when
+    /// there is one.
+    async fn entries_for(&self, repo: &Repo, id: ChangesetId) -> Result<Vec<ReviewEntry>> {
+        let mut out = Vec::new();
+        for review in self.reviews_for(repo, id).await? {
+            let row = repo.get_review_source(id, &review.reviewer).await?;
+            out.push(ReviewEntry {
+                source: row
+                    .as_ref()
+                    .map(|s| s.source.clone())
+                    .filter(|s| !s.is_empty()),
+                via: row.map(|s| s.via),
+                review,
+            });
+        }
+        Ok(out)
+    }
+
     /// The `GET .../reviews` answer. A changeset with none of its own but
     /// recorded as a server-made rebase of one that has some reports those,
     /// with `via` naming the original.
     pub async fn describe(&self, repo: &Repo, id: ChangesetId) -> Result<ReviewsResponse> {
-        let own = self.reviews_for(repo, id).await?;
+        let own = self.entries_for(repo, id).await?;
         if !own.is_empty() {
             return Ok(ReviewsResponse {
                 reviews: own,
@@ -126,7 +144,7 @@ impl ReviewService {
             });
         }
         for origin in repo.rebase_chain(id).await? {
-            let found = self.reviews_for(repo, origin).await?;
+            let found = self.entries_for(repo, origin).await?;
             if !found.is_empty() {
                 return Ok(ReviewsResponse {
                     reviews: found,

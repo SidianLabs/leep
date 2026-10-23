@@ -1090,6 +1090,21 @@ fn review_owners_and_auto_approval_gate_landing_on_a_protected_ref() {
     assert_eq!(alice.ok(&wc_a, &["review", "list", &seed]), list);
     let json = alice.json(&wc_a, &["review", "status", "@"]);
     assert_eq!(json["approved"], true);
+
+    // Withdrawing takes the approval back (ADR 0063); approving again restores it.
+    let out = bob.ok(root, &["review", "withdraw", &seed]);
+    assert!(out.contains("Withdrew") && out.contains("as bob"), "{out}");
+    let list = alice.ok(&wc_a, &["reviews", &seed]);
+    assert!(list.contains("bob withdrawn"), "{list}");
+    assert_eq!(
+        alice.run(&wc_a, &["review", "status", "@"]).status.code(),
+        Some(1)
+    );
+    bob.ok(root, &["review", "approve", &seed, "-m", "fine"]);
+    assert_eq!(
+        alice.json(&wc_a, &["review", "status", "@"])["approved"],
+        true
+    );
     let landed = alice.ok(&wc_a, &["land"]);
     assert!(landed.contains("Landed"), "{landed}");
 

@@ -696,6 +696,8 @@ async fn setup_release(
     let rb = serde_json::to_vec(&AddReviewRequest {
         verdict: Verdict::Approve,
         comment: "root".into(),
+        reviewer: None,
+        source: None,
     })
     .unwrap();
     let r = reviewer
