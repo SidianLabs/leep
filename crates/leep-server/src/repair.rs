@@ -13,6 +13,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use clap::{Args, Subcommand};
 use ed25519_dalek::{Signature as DalekSignature, VerifyingKey};
+use leep_core::outln;
 use leep_core::signature::signing_message;
 use leep_derive::integrity::{
     self, kinds, DropReport, Problem, Progress, RederiveOptions, RederiveReport, Scope,
@@ -274,17 +275,17 @@ fn print_problems(problems: &[Problem], total: u64) {
     if total == 0 {
         return;
     }
-    println!();
+    outln!();
     if (problems.len() as u64) < total {
-        println!(
+        outln!(
             "PROBLEMS: {total} found, the first {} are listed (--max-problems)",
             problems.len()
         );
     } else {
-        println!("PROBLEMS: {total}");
+        outln!("PROBLEMS: {total}");
     }
     for p in problems {
-        println!("  [{}] {}", p.code, p.message);
+        outln!("  [{}] {}", p.code, p.message);
         let mut ctx = Vec::new();
         for (k, v) in [
             ("kind", &p.kind),
@@ -298,7 +299,7 @@ fn print_problems(problems: &[Problem], total: u64) {
             }
         }
         if !ctx.is_empty() {
-            println!("      {}", ctx.join(" "));
+            outln!("      {}", ctx.join(" "));
         }
     }
 }
@@ -312,7 +313,7 @@ struct Envelope<'a, T: Serialize> {
 }
 
 pub(crate) fn print_json<T: Serialize>(ok: bool, exit_code: i32, report: &T) -> anyhow::Result<()> {
-    println!(
+    outln!(
         "{}",
         serde_json::to_string_pretty(&Envelope {
             ok,
@@ -324,46 +325,52 @@ pub(crate) fn print_json<T: Serialize>(ok: bool, exit_code: i32, report: &T) -> 
 }
 
 fn print_verify(r: &VerifyReport) {
-    println!("verify: {} mode, {:.1}s", r.mode, r.elapsed_secs);
-    println!("refs checked: {} ({})", r.stats.refs, r.refs.join(", "));
-    println!(
+    outln!("verify: {} mode, {:.1}s", r.mode, r.elapsed_secs);
+    outln!("refs checked: {} ({})", r.stats.refs, r.refs.join(", "));
+    outln!(
         "changesets: {} reachable from the refs, {} others",
-        r.stats.changesets_reachable, r.stats.changesets_other
+        r.stats.changesets_reachable,
+        r.stats.changesets_other
     );
-    println!("tree nodes: {}", r.stats.tree_nodes);
-    println!(
+    outln!("tree nodes: {}", r.stats.tree_nodes);
+    outln!(
         "blobs: {} checked, {} re-hashed ({})",
         r.stats.blobs_checked,
         r.stats.blobs_rehashed,
         bytes_human(r.stats.bytes_rehashed)
     );
-    println!(
+    outln!(
         "ref log: {} entries, {} refs with none",
-        r.stats.reflog_entries, r.stats.reflog_refs_without_entries
+        r.stats.reflog_entries,
+        r.stats.reflog_refs_without_entries
     );
     if !r.derived.is_empty() {
-        println!("derived rows:");
+        outln!("derived rows:");
         for (kind, s) in &r.derived {
-            println!(
+            outln!(
                 "  {kind:<18} checked {}, missing {}, mismatched {}, unverifiable {}, skipped {}",
-                s.checked, s.missing, s.mismatched, s.unverifiable, s.skipped
+                s.checked,
+                s.missing,
+                s.mismatched,
+                s.unverifiable,
+                s.skipped
             );
         }
     }
     if !r.notes.is_empty() {
-        println!("notes:");
+        outln!("notes:");
         for n in r.notes.iter().take(20) {
-            println!("  {n}");
+            outln!("  {n}");
         }
         if r.notes.len() > 20 {
-            println!("  ... and {} more", r.notes.len() - 20);
+            outln!("  ... and {} more", r.notes.len() - 20);
         }
     }
     print_problems(&r.problems, r.problems_total);
     if r.ok() {
-        println!("result: clean");
+        outln!("result: clean");
     } else {
-        println!("result: {} problem(s) found", r.problems_total);
+        outln!("result: {} problem(s) found", r.problems_total);
     }
 }
 
@@ -419,24 +426,29 @@ pub async fn run_repair(meta: &str, blobs: &str, args: RepairArgs) -> i32 {
 
 fn print_rederive(r: &RederiveReport) {
     let verb = if r.dry_run { "would write" } else { "wrote" };
-    println!(
+    outln!(
         "rederive{}: {} ({:.1}s)",
         if r.dry_run { " (dry run)" } else { "" },
         r.kinds.join(" "),
         r.elapsed_secs
     );
     for (kind, k) in &r.kind_reports {
-        println!(
+        outln!(
             "  {kind:<18} examined {}, already right {}, {verb} {} missing and {} wrong, \
              could not recompute {}, subject gone {}",
-            k.examined, k.matched, k.filled, k.overwritten, k.failed, k.skipped
+            k.examined,
+            k.matched,
+            k.filled,
+            k.overwritten,
+            k.failed,
+            k.skipped
         );
     }
     for n in &r.notes {
-        println!("note: {n}");
+        outln!("note: {n}");
     }
     print_problems(&r.problems, r.problems_total);
-    println!(
+    outln!(
         "result: {} row(s) {}, {} could not be recomputed",
         r.changed(),
         if r.dry_run { "to write" } else { "written" },
@@ -445,13 +457,13 @@ fn print_rederive(r: &RederiveReport) {
 }
 
 fn print_drop(r: &DropReport) {
-    println!(
+    outln!(
         "drop{}: ({:.1}s)",
         if r.dry_run { " (dry run)" } else { "" },
         r.elapsed_secs
     );
     for (kind, n) in &r.rows {
-        println!(
+        outln!(
             "  {kind:<18} {n} row(s) {}",
             if r.dry_run {
                 "would be deleted"
@@ -460,7 +472,7 @@ fn print_drop(r: &DropReport) {
             }
         );
     }
-    println!("they derive again on demand");
+    outln!("they derive again on demand");
 }
 
 async fn repair_inner(meta: &str, blobs: &str, args: RepairArgs) -> anyhow::Result<i32> {

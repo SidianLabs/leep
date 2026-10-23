@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use clap::Args;
+use leep_core::outln;
 use leep_derive::integrity::{Problem, Progress, VerifyReport};
 use leep_server::backup::{
     self, BackupOptions, BackupOutcome, Manifest, NoHooks, RestoreOptions, VerifyBackupOptions,
@@ -171,8 +172,8 @@ fn print_problems(problems: &[Problem], total: u64) {
     if total == 0 {
         return;
     }
-    println!();
-    println!(
+    outln!();
+    outln!(
         "PROBLEMS: {total}{}",
         if (problems.len() as u64) < total {
             format!(", the first {} are listed (--max-problems)", problems.len())
@@ -181,12 +182,12 @@ fn print_problems(problems: &[Problem], total: u64) {
         }
     );
     for p in problems {
-        println!("  {p}");
+        outln!("  {p}");
     }
 }
 
 fn print_check(r: &VerifyReport) {
-    println!(
+    outln!(
         "check: {} changesets, {} tree nodes, {} blobs checked, {} re-hashed ({})",
         r.stats.changesets_reachable + r.stats.changesets_other,
         r.stats.tree_nodes,
@@ -197,15 +198,15 @@ fn print_check(r: &VerifyReport) {
 }
 
 fn print_manifest(m: &Manifest) {
-    println!("snapshot: {}", m.name);
-    println!(
+    outln!("snapshot: {}", m.name);
+    outln!(
         "taken at: {} (unix {}), schema v{}, from {}",
         backup::utc_stamp(m.snapshot_taken_at),
         m.snapshot_taken_at,
         m.schema_version,
         m.source_backend
     );
-    println!(
+    outln!(
         "metadata: {} changesets, {} refs, {} derived rows, {} ref log entries ({})",
         m.counts.changesets,
         m.counts.refs,
@@ -214,7 +215,7 @@ fn print_manifest(m: &Manifest) {
         bytes_human(m.meta_bytes)
     );
     for (name, tip) in &m.refs {
-        println!("  ref {name} -> {tip}");
+        outln!("  ref {name} -> {tip}");
     }
 }
 
@@ -294,7 +295,7 @@ async fn backup_inner(meta: &str, blobs: &str, args: BackupArgs) -> anyhow::Resu
         EXIT_PROBLEMS
     };
     if args.json {
-        println!(
+        outln!(
             "{}",
             serde_json::to_string_pretty(&BackupJson {
                 ok: code == EXIT_CLEAN,
@@ -315,7 +316,7 @@ fn print_backup(o: &BackupOutcome, code: i32) {
     let m = &o.manifest;
     print_manifest(m);
     if m.blobs.included {
-        println!(
+        outln!(
             "blobs: {} listed, {} already in the backup, {} copied ({}), {} deleted by gc meanwhile, {} only in the backup",
             m.blobs.listed,
             m.blobs.already_present,
@@ -325,7 +326,7 @@ fn print_backup(o: &BackupOutcome, code: i32) {
             m.blobs.only_in_backup
         );
         if m.blobs.packs_listed + m.blobs.packs_pruned > 0 {
-            println!(
+            outln!(
                 "packs: {} in the source, {} already in the backup, {} copied ({}), {} merged away and pruned",
                 m.blobs.packs_listed,
                 m.blobs.packs_already_present,
@@ -335,16 +336,16 @@ fn print_backup(o: &BackupOutcome, code: i32) {
             );
         }
         for id in &m.blobs.corrupt_packs {
-            println!("WARNING: source pack {id} does not match its index; not copied");
+            outln!("WARNING: source pack {id} does not match its index; not copied");
         }
-        println!("blobs at: {}", m.blobs.location);
+        outln!("blobs at: {}", m.blobs.location);
         for h in &m.blobs.corrupt {
-            println!("WARNING: source blob {h} does not hash to its name; not copied");
+            outln!("WARNING: source blob {h} does not hash to its name; not copied");
         }
     } else {
-        println!("blobs: not copied (--no-blobs); run backup-verify once they are in place");
+        outln!("blobs: not copied (--no-blobs); run backup-verify once they are in place");
     }
-    println!(
+    outln!(
         "check: {}{}",
         m.check.mode,
         if m.check.mode == "skipped" {
@@ -360,9 +361,9 @@ fn print_backup(o: &BackupOutcome, code: i32) {
         }
     );
     print_problems(&o.problems, o.problems_total);
-    println!("directory: {}", o.snapshot_dir.display());
-    println!("elapsed: {:.1}s", m.elapsed_secs);
-    println!(
+    outln!("directory: {}", o.snapshot_dir.display());
+    outln!("elapsed: {:.1}s", m.elapsed_secs);
+    outln!(
         "result: {}",
         match code {
             EXIT_CLEAN if m.check.mode == "skipped" => "sealed, not checked".to_string(),
@@ -455,7 +456,7 @@ async fn restore_inner(
         .as_ref()
         .map_or((0, 0, 0), |b| (b.listed, b.copied, b.bytes_copied));
     if args.json {
-        println!(
+        outln!(
             "{}",
             serde_json::to_string_pretty(&RestoreJson {
                 ok,
@@ -476,16 +477,19 @@ async fn restore_inner(
         );
     } else {
         print_manifest(&o.manifest);
-        println!(
+        outln!(
             "restored: {} changesets, {} refs, {} derived rows, {} ref log entries",
-            o.imported.changesets, o.imported.refs, o.imported.derived, o.imported.ref_log
+            o.imported.changesets,
+            o.imported.refs,
+            o.imported.derived,
+            o.imported.ref_log
         );
-        println!(
+        outln!(
             "blobs: {listed} in the backup, {copied} copied ({})",
             bytes_human(bytes)
         );
         if let Some(p) = o.packs.as_ref().filter(|p| p.listed > 0) {
-            println!(
+            outln!(
                 "packs: {} in the backup, {} copied whole ({})",
                 p.listed,
                 p.copied,
@@ -497,10 +501,10 @@ async fn restore_inner(
                 print_check(r);
                 print_problems(&r.problems, r.problems_total);
             }
-            None => println!("check: skipped"),
+            None => outln!("check: skipped"),
         }
-        println!("elapsed: {:.1}s", o.elapsed_secs);
-        println!(
+        outln!("elapsed: {:.1}s", o.elapsed_secs);
+        outln!(
             "result: {}",
             if ok {
                 "restored; run `leep-server verify --full --rehash` before serving traffic"
@@ -559,7 +563,7 @@ async fn verify_backup_inner(args: VerifyBackupArgs) -> anyhow::Result<i32> {
         EXIT_PROBLEMS
     };
     if args.json {
-        println!(
+        outln!(
             "{}",
             serde_json::to_string_pretty(&VerifyBackupJson {
                 ok: o.report.ok(),
@@ -572,7 +576,7 @@ async fn verify_backup_inner(args: VerifyBackupArgs) -> anyhow::Result<i32> {
         print_manifest(&o.manifest);
         print_check(&o.report);
         print_problems(&o.report.problems, o.report.problems_total);
-        println!(
+        outln!(
             "result: {}",
             if o.report.ok() {
                 "clean".to_string()

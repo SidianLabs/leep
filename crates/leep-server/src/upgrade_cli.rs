@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use clap::Args;
+use leep_core::outln;
 use leep_derive::integrity::{
     self, plan_upgrade_with, run_upgrade, CurrentKind, DropReport, IndexStatus, PlanOptions,
     UpgradeOptions, UpgradePlan, UpgradeReport,
@@ -275,21 +276,24 @@ fn print_plan(
     backend: Option<Backend>,
     facts: Option<&StorageFacts>,
 ) {
-    println!(
+    outln!(
         "upgrade-index: {} ref(s), {} changesets reachable (read in {:.1}s)",
-        plan.refs, plan.reachable, plan.elapsed_secs
+        plan.refs,
+        plan.reachable,
+        plan.elapsed_secs
     );
     if plan.unreadable > 0 {
-        println!(
+        outln!(
             "note: {} changeset(s) could not be read and are left out; `leep-server verify` \
              names them",
             plan.unreadable
         );
     }
-    println!();
-    println!(
+    outln!();
+    outln!(
         "current indexes        {:>12} {:>12}  status",
-        "rows", "missing"
+        "rows",
+        "missing"
     );
     for k in &plan.current {
         let size = match (k.status, k.value_bytes_per_changeset) {
@@ -299,7 +303,7 @@ fn print_plan(
                 bytes_human(k.missing * (per.unwrap_or(kind_profile(k.kind).1) + ROW_OVERHEAD))
             ),
         };
-        println!(
+        outln!(
             "  {:<20} {:>12} {:>12}  {}{size}",
             k.kind,
             approx(k.rows, k.rows_estimated),
@@ -311,11 +315,11 @@ fn print_plan(
         );
     }
     if !plan.retired.is_empty() {
-        println!();
-        println!("retired indexes (servers older than this one still read them)");
+        outln!();
+        outln!("retired indexes (servers older than this one still read them)");
         for r in &plan.retired {
             let parts: Vec<String> = r.rows.iter().map(|(k, n)| format!("{k} {n}")).collect();
-            println!(
+            outln!(
                 "  {:<20} {} rows ({}), {}",
                 r.kind,
                 approx(r.total_rows(), r.rows_estimated),
@@ -330,13 +334,13 @@ fn print_plan(
     if plan.current.iter().any(|k| k.rows_estimated)
         || plan.retired.iter().any(|r| r.rows_estimated)
     {
-        println!();
-        println!(
+        outln!();
+        outln!(
             "~ estimated from the database's statistics; --exact-counts counts them (slow on \
              large stores)"
         );
     }
-    println!();
+    outln!();
     let mut storage = Vec::new();
     match backend {
         Some(Backend::Postgres) => storage.push("postgres".to_string()),
@@ -357,15 +361,15 @@ fn print_plan(
         ),
         _ => {}
     }
-    println!("storage: {}", storage.join(", "));
+    outln!("storage: {}", storage.join(", "));
     for w in &e.warnings {
-        println!("warning: {w}");
+        outln!("warning: {w}");
     }
     if plan.nothing_to_do() {
         return;
     }
-    println!();
-    println!("steps:");
+    outln!();
+    outln!("steps:");
     let mut n = 0;
     let to_drop = plan.to_drop();
     let drop_names = || {
@@ -398,17 +402,17 @@ fn print_plan(
     };
     if !to_drop.is_empty() && args.drop_first {
         n += 1;
-        println!("{}", drop_line(n));
+        outln!("{}", drop_line(n));
     }
     let derive = plan.to_derive();
     if !derive.is_empty() {
         n += 1;
-        println!(
+        outln!(
             "  {n}. derive the missing rows of {} with {jobs} job(s), as `repair rederive \
              --missing` does; resumable",
             derive.join(" ")
         );
-        println!(
+        outln!(
             "     about {} changeset rows, {} ({jobs} free core(s) to one); needs about {}",
             e.derive_rows,
             span(e.derive_secs),
@@ -417,13 +421,13 @@ fn print_plan(
     }
     if !to_drop.is_empty() && !args.drop_first {
         n += 1;
-        println!("{}", drop_line(n));
+        outln!("{}", drop_line(n));
     }
     if !to_drop.is_empty() {
         n += 1;
-        println!("  {n}. reclaim space:");
+        outln!("  {n}. reclaim space:");
         for line in reclaim_hint(backend, facts) {
-            println!("     {line}");
+            outln!("     {line}");
         }
     }
     if !args.yes {
@@ -435,9 +439,9 @@ fn print_plan(
                 " [--drop-retired --old-servers-stopped]"
             };
         }
-        println!();
-        println!("run it: {cmd}");
-        println!(
+        outln!();
+        outln!("run it: {cmd}");
+        outln!(
             "separately, once no older server or tool uses the store: changeset rows can be \
          compressed (`leep-server compact-changesets --dry-run`, ADR 0053)"
         );
@@ -445,10 +449,11 @@ fn print_plan(
 }
 
 fn print_nothing(plan: &UpgradePlan) {
-    println!(
+    outln!(
         "upgrade-index: nothing to do: every index this version reads is complete for the {} \
          changesets reachable from {} ref(s), and no retired rows remain",
-        plan.reachable, plan.refs
+        plan.reachable,
+        plan.refs
     );
 }
 
@@ -459,43 +464,43 @@ fn print_report(
     backend: Option<Backend>,
     facts: Option<&StorageFacts>,
 ) {
-    println!();
-    println!("upgrade-index: done in {:.1}s", r.elapsed_secs);
+    outln!();
+    outln!("upgrade-index: done in {:.1}s", r.elapsed_secs);
     for (kind, n) in &r.derived {
-        println!("  derived {n} {kind} row(s)");
+        outln!("  derived {n} {kind} row(s)");
     }
     let mut dropped = false;
     for d in first.into_iter().chain(r.dropped.as_ref()) {
         for (kind, n) in &d.rows {
-            println!("  dropped {n} {kind} row(s)");
+            outln!("  dropped {n} {kind} row(s)");
             dropped = true;
         }
     }
     if vacuumed {
-        println!("  ran VACUUM (ANALYZE) derived");
+        outln!("  ran VACUUM (ANALYZE) derived");
     }
     let left = r.after.to_derive();
     if !left.is_empty() {
-        println!(
+        outln!(
             "still incomplete: {}; run again, and `leep-server verify` if it stays so",
             left.join(" ")
         );
     }
     if !r.after.retired.is_empty() {
-        println!(
+        outln!(
             "retired rows remain: {}; once no older server runs against this store, run \
              `leep-server upgrade-index --yes --drop-retired --old-servers-stopped`",
             r.after.to_drop().join(" ")
         );
     }
     if dropped {
-        println!("reclaim space:");
+        outln!("reclaim space:");
         for line in reclaim_hint(backend, facts) {
-            println!("  {line}");
+            outln!("  {line}");
         }
     }
     if left.is_empty() && r.after.retired.is_empty() {
-        println!("the indexes are up to date");
+        outln!("the indexes are up to date");
     }
 }
 

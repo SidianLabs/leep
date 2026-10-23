@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use clap::Args;
+use leep_core::outln;
 use leep_core::BlobStore;
 use leep_derive::Repo;
 use leep_store::{
@@ -162,7 +163,7 @@ pub async fn run_repack(meta: &str, blobs: &str, args: RepackArgs) -> anyhow::Re
         total,
     };
     if args.json {
-        println!("{}", json(&report, full, changesets, &timing));
+        outln!("{}", json(&report, full, changesets, &timing));
     } else {
         print_report(&report, full, changesets, &timing);
     }
@@ -218,7 +219,7 @@ fn json(r: &RepackReport, full: bool, changesets: u64, t: &Timing) -> serde_json
 }
 
 fn print_report(r: &RepackReport, full: bool, changesets: u64, t: &Timing) {
-    println!(
+    outln!(
         "mode: {}",
         if full {
             "full"
@@ -226,61 +227,75 @@ fn print_report(r: &RepackReport, full: bool, changesets: u64, t: &Timing) {
             "incremental (loose objects, merging packs by the geometric rule)"
         }
     );
-    println!("changesets walked: {changesets}");
-    println!(
+    outln!("changesets walked: {changesets}");
+    outln!(
         "before: {} loose objects ({} bytes), {} packs ({} objects, {} bytes)",
-        r.loose_before, r.loose_bytes_before, r.packs_before, r.packed_before, r.pack_bytes_before
+        r.loose_before,
+        r.loose_bytes_before,
+        r.packs_before,
+        r.packed_before,
+        r.pack_bytes_before
     );
     match &r.pack_id {
-        Some(id) => println!(
+        Some(id) => outln!(
             "new pack: {id} ({} bytes, index {} bytes)",
-            r.pack_bytes, r.index_bytes
+            r.pack_bytes,
+            r.index_bytes
         ),
-        None => println!("new pack: none (nothing to pack)"),
+        None => outln!("new pack: none (nothing to pack)"),
     }
-    println!(
+    outln!(
         "objects packed: {} ({} bytes uncompressed): {} as delta, {} whole",
-        r.objects, r.logical_bytes, r.deltas, r.whole
+        r.objects,
+        r.logical_bytes,
+        r.deltas,
+        r.whole
     );
-    println!(
+    outln!(
         "packs merged into it: {}; packed objects copied without recompressing: {}",
-        r.packs_merged, r.frames_reused
+        r.packs_merged,
+        r.frames_reused
     );
-    println!("dropped (deleted by gc): {}", r.dropped_tombstoned);
+    outln!("dropped (deleted by gc): {}", r.dropped_tombstoned);
     if r.late_tombstones > 0 {
-        println!("deleted by gc during the repack: {}", r.late_tombstones);
+        outln!("deleted by gc during the repack: {}", r.late_tombstones);
     }
     if r.vanished > 0 {
-        println!("deleted before they were read: {}", r.vanished);
+        outln!("deleted before they were read: {}", r.vanished);
     }
     if !r.corrupt.is_empty() {
-        println!(
+        outln!(
             "corrupt loose objects left in place (run `leep-server verify --full --rehash`): {}",
             r.corrupt.len()
         );
         for h in &r.corrupt {
-            println!("  {h}");
+            outln!("  {h}");
         }
     }
     if r.garbage_removed + r.leftovers_restored > 0 {
-        println!(
+        outln!(
             "left by an earlier killed repack: {} files deleted, {} loose copies put back",
-            r.garbage_removed, r.leftovers_restored
+            r.garbage_removed,
+            r.leftovers_restored
         );
     }
-    println!(
+    outln!(
         "loose copies deleted: {}, kept (written again meanwhile): {}",
-        r.loose_removed, r.loose_kept
+        r.loose_removed,
+        r.loose_kept
     );
-    println!(
+    outln!(
         "old packs deleted: {}, packs now: {}",
-        r.old_packs_removed, r.packs_after
+        r.old_packs_removed,
+        r.packs_after
     );
-    println!(
+    outln!(
         "after: {} loose objects ({} bytes), pack {} bytes",
-        r.loose_after, r.loose_bytes_after, r.pack_bytes
+        r.loose_after,
+        r.loose_bytes_after,
+        r.pack_bytes
     );
-    println!(
+    outln!(
         "elapsed: {:.1}s (walk {:.1}s, write {:.1}s, fence {:.1}s, cleanup {:.1}s)",
         t.total.as_secs_f64(),
         t.walk.as_secs_f64(),

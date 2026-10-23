@@ -7,6 +7,7 @@
 use std::time::Duration;
 
 use anyhow::Context;
+use leep_core::outln;
 use leep_core::{LeaseKey, MetaStore};
 use leep_derive::changeset_sweep::{self, SweepCollectReport, SweepCondemnReport, SweepOptions};
 use leep_derive::gc::SystemClock;
@@ -210,49 +211,51 @@ pub async fn run_sweep(
 }
 
 fn print_condemn(r: &SweepCondemnReport) {
-    println!("changesets stored: {}", r.stored);
-    println!("unreachable and older than grace: {}", r.unreachable);
-    println!(
+    outln!("changesets stored: {}", r.stored);
+    outln!("unreachable and older than grace: {}", r.unreachable);
+    outln!(
         "kept only by a window, attestation, mirror or grace: {}",
         r.transient
     );
-    println!("condemned: {}", r.condemned);
-    println!("already condemned: {}", r.already_condemned);
-    println!("reachability rows written: {}", r.reach_rows_written);
+    outln!("condemned: {}", r.condemned);
+    outln!("already condemned: {}", r.already_condemned);
+    outln!("reachability rows written: {}", r.reach_rows_written);
 }
 
 fn print_collect(r: &SweepCollectReport) {
-    println!("collect: unreachable: {}", r.unreachable);
-    println!("collect: newer than fence, left alone: {}", r.fence_pending);
-    println!("collect: rescued by reference: {}", r.rescued_by_reference);
-    println!(
+    outln!("collect: unreachable: {}", r.unreachable);
+    outln!("collect: newer than fence, left alone: {}", r.fence_pending);
+    outln!("collect: rescued by reference: {}", r.rescued_by_reference);
+    outln!(
         "collect: kept as ancestors of kept: {}",
         r.kept_by_descendant
     );
-    println!(
+    outln!(
         "collect: abandoned (rescued during the delete): {}",
         r.abandoned
     );
-    println!(
+    outln!(
         "deleted: {} changesets, {} bytes",
-        r.deleted, r.deleted_bytes
+        r.deleted,
+        r.deleted_bytes
     );
-    println!(
+    outln!(
         "collect: left for the next run (--max-delete): {}",
         r.left_by_cap
     );
-    println!(
+    outln!(
         "collect: deletes finished for a killed run: {}",
         r.finished_from_earlier
     );
-    println!(
+    outln!(
         "collect: tombstone pass: {} rows removed, {} tombstones dropped",
-        r.tombstone_rows_deleted, r.tombstones_dropped
+        r.tombstone_rows_deleted,
+        r.tombstones_dropped
     );
-    println!("collect: longest batch: {:.3}s", r.max_batch.as_secs_f64());
-    println!("collect: still condemned: {}", r.condemned_pending);
-    println!("collect: fence flag cleared: {}", r.flag_cleared);
-    println!(
+    outln!("collect: longest batch: {:.3}s", r.max_batch.as_secs_f64());
+    outln!("collect: still condemned: {}", r.condemned_pending);
+    outln!("collect: fence flag cleared: {}", r.flag_cleared);
+    outln!(
         "collect: blame rows of deleted changesets (estimate, leaked until \
          `repair drop --kind blame`): {}",
         r.blame_rows_of_deleted_estimate
