@@ -1,6 +1,9 @@
 //! End-to-end tests that drive the real `leep-server`, `leep` and `leep-git`
 //! binaries as subprocesses. Run `cargo build --workspace` first.
 
+// Exec bits and symlinks are Unix file modes; these tests need them.
+#![cfg(unix)]
+
 mod common;
 
 use std::collections::BTreeMap;
