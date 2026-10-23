@@ -681,6 +681,11 @@ leep-git mirror run \
 | `--merge-author` | `Leep git mirror <git-mirror@leep.invalid>` | Author of the mirror's merges. Part of each merge's id: choose once. |
 | `--land-branches` | off | Land remote branches `PREFIX<ref>/<name>` onto the Leep ref `<ref>` through the server's land, then delete them. Needs `--import`. |
 | `--land-prefix` | `leep-land/` | Prefix of land branches. Must not overlap `--diverged-prefix` or any mirrored branch. |
+| `--github-reviews` | off | Bring pull request reviews on the branches of two-way prefix refs into Leep as reviews for the mapped principal ([ADR 0063](adr/0063-github-reviews.md)); see "GitHub reviews" below. Needs `--import`, a `--ref-prefix`, `--github-users` and a Leep token with `"review_for": true`. |
+| `--github-users FILE` | – | `login = principal` lines: which GitHub logins count as which Leep reviewers. Only mapped logins count. |
+| `--github-api-token-file FILE` | – | A GitHub token with read access to pull requests (`LEEP_GITHUB_TOKEN` also works). Not the deploy key. |
+| `--github-repo OWNER/REPO` | from `--remote` | The repository on GitHub, when the remote URL does not say. |
+| `--github-api-url` | `https://api.github.com` | A GitHub Enterprise server's API root. |
 | `--provenance-trailers`, `--no-changeset-trailer` | off | Change commit messages, and so commit ids. Choose once, before the first push. |
 | `--listen ADDR` | off | Serve `GET /metrics`, `GET /status`, `GET /health` and `POST /poke`. |
 | `--once` | off | Run until nothing changes, then exit 0 if healthy and 1 if not (for cron or a check). |
@@ -734,12 +739,13 @@ when there is no status file.
 | `leep_mirror_replays_total` | counter | `ref`, `result` = `ok`, `conflicts`, `refused`, `stale_base` | Replays of a git-primary ref's unpushed lands onto the remote's commits. `conflicts` and `refused` fall back to `diverged`; `stale_base` means a side moved during the import and the pair was read again. |
 | `leep_mirror_restores_total` | counter | `ref` | Times a git-primary ref Leep moved back was moved forward again to the remote's tip. |
 | `leep_mirror_refs_deleted_total` | counter | none | Two-way prefix refs deleted in Leep after their branch was deleted on the remote with the work landed. |
+| `leep_mirror_github_reviews_total` | counter | `ref`, `result` = `approved`, `rejected`, `withdrawn`, `unmapped` | Reviews posted to Leep from the ref's pull request (`--github-reviews`); `unmapped` counts reviews by logins `--github-users` does not map, per poll. |
 | `leep_mirror_land_branches_total` | counter | `ref`, `result` = `landed`, `conflicts`, `refused` | Land branches tried, counted once per pushed commit. |
 | `leep_mirror_land_branches_failing` | gauge | `ref` | Land branches left on the remote because they conflict or were refused (`ref=""` for a name that matches no mirrored ref). |
 | `leep_mirror_branches_deleted_total` | counter | none | Branches under a `--ref-prefix` deleted because their Leep ref was deleted. |
 | `leep_mirror_commits_exported_total` | counter | none | Commits written from changesets. |
 | `leep_mirror_commits_imported_total` | counter | none | Changesets created from remote commits. |
-| `leep_mirror_errors_total` | counter | `stage` = `leep`, `git`, `export`, `import` | Failed steps. |
+| `leep_mirror_errors_total` | counter | `stage` = `leep`, `git`, `export`, `import`, `github` | Failed steps. |
 | `leep_mirror_cycles_total` | counter | none | Poll cycles. |
 | `leep_mirror_last_cycle_timestamp_seconds` | gauge | none | When the last cycle finished. |
 
@@ -788,6 +794,49 @@ branch of that name appears on the remote, ready for a pull request.
 
 The mirror never deletes or rewinds a branch outside its prefixes, a tag,
 or a `--ref` branch such as `main`.
+
+### GitHub reviews
+
+With `--github-reviews` ([ADR 0063](adr/0063-github-reviews.md)), a team
+reviews once, on GitHub, and Leep's review gate (`--require-review`,
+`OWNERS`; [ADR 0011](adr/0011-review-service.md)) holds. After each remote
+poll, for every two-way prefix ref whose branch has an open pull request,
+the mirror reads the pull request's reviews, keeps the latest per login,
+and posts the matching Leep review for the mapped principal on every
+changeset of the ref that is not yet on the pull request's base ref:
+
+| latest GitHub review by a mapped login | Leep review posted |
+|---|---|
+| `APPROVED` on the pull request's current head | `approve` |
+| `CHANGES_REQUESTED` | `reject` |
+| `APPROVED` on an older head, `DISMISSED`, or gone where one was posted | `withdrawn` |
+
+- **The mapping file is the trust root.** `--github-users` lists
+  `login = principal`; a review by any other login is counted
+  (`leep_mirror_github_reviews_total{result="unmapped"}`) and ignored. A
+  login and a principal may each appear once.
+- **The Leep token needs `"review_for": true`** in the tokens file (see
+  [DEPLOY.md](DEPLOY.md)). Such a token writes reviews as anyone it
+  names, so give it to the mirror and nothing else. Every review it posts
+  carries a `source` of the form `github:OWNER/REPO#N/reviews/ID`, which
+  `leep reviews` shows and which the mirror uses to tell its own reviews
+  from a person's: a review someone posted in Leep directly is never
+  changed by the mirror.
+- **The GitHub token** needs read access to pull requests
+  (`pull_requests: read` for a fine-grained token). Pass it with
+  `--github-api-token-file` or `LEEP_GITHUB_TOKEN`, never on the command
+  line. The mirror's git credential is not reused.
+- **Nothing lands because of this.** The agent, or `leep land`, still
+  lands when `leep review status` says approved. Stale approvals (of an
+  older head) are withdrawn whether or not the repository dismisses stale
+  reviews itself, since Leep ties an approval to one changeset id.
+- **Crashes and outages.** The mirror keeps no record of what it posted:
+  it reads Leep's reviews and posts only the differences, so a failure
+  anywhere, GitHub's or its own, is made good by the next poll. GitHub
+  failures are counted in `leep_mirror_errors_total{stage="github"}` and
+  logged; they never change a ref's state.
+- A pull request whose base is not a mirrored `--ref` is logged and
+  skipped: the mirror cannot tell which changesets it covers.
 
 ### Land branches
 

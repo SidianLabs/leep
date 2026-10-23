@@ -871,11 +871,17 @@ imported; a conflict reports and moves nothing. A branch deleted on the
 remote deletes the Leep ref only when its tip, or a rebased copy of it, is
 in a mirrored `--ref`'s history; otherwise the ref is kept and reported
 (`deleted-on-remote`) and the branch is not pushed again until the ref
-moves. With the proposed `--github-reviews`
-([ADR 0063](adr/0063-github-reviews.md)), approvals on the pull request of a
-review branch, from logins in a mapping file, are posted as Leep reviews for
-the mapped principal through a `review_for` token, so the review gate of
-ADR 0011 holds without a second approval.
+moves. With `--github-reviews` ([ADR 0063](adr/0063-github-reviews.md)),
+after each remote poll the mirror reads the open pull request of each
+two-way prefix ref's branch and its reviews, keeps the latest per login,
+and posts the matching Leep review (`approve` for an approval of the
+current head, `reject` for changes requested, `withdrawn` for a dismissal
+or a stale approval) for the principal a mapping file names, on every
+changeset of the ref's unlanded stack, through a `review_for` token; it
+recognises its own reviews by their `source` and never changes one a
+person posted directly, and keeps no record, so a failure is made good by
+the next poll. The review gate of ADR 0011 then holds without a second
+approval.
 
 **Rebase onto** (`POST /v1/refs/{name}/rebase-onto`, the server half of
 ADR 0062's replay; the mirror half is not built yet). It queues on the

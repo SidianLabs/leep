@@ -123,6 +123,17 @@ pub struct ReplayCounts {
     pub stale_base: u64,
 }
 
+/// Reviews brought from a ref's pull request into Leep (`--github-reviews`,
+/// ADR 0063), by what was posted; `unmapped` counts logins with a review
+/// that `--github-users` does not map, per poll.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitHubReviewCounts {
+    pub approved: u64,
+    pub rejected: u64,
+    pub withdrawn: u64,
+    pub unmapped: u64,
+}
+
 /// Land branches landed onto a ref.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LandCounts {
@@ -221,6 +232,12 @@ pub struct RefStatus {
     /// Times a Leep undo was moved forward again to the remote's tip.
     #[serde(default)]
     pub restores: u64,
+    /// The open pull request of a prefix ref's branch, when
+    /// `--github-reviews` found one.
+    #[serde(default)]
+    pub pull_request: Option<u64>,
+    #[serde(default)]
+    pub github_reviews: GitHubReviewCounts,
 }
 
 /// A branch under a `--ref-prefix` that the mirror deleted on the remote
@@ -257,7 +274,7 @@ pub struct Status {
     pub commits_exported: u64,
     pub commits_imported: u64,
     pub cycles: u64,
-    /// Failures by stage: `leep`, `git`, `export`, `import`.
+    /// Failures by stage: `leep`, `git`, `export`, `import`, `github`.
     pub errors: BTreeMap<String, u64>,
     /// Land branches on the remote that are not landed and deleted yet.
     #[serde(default)]
@@ -471,6 +488,26 @@ pub fn render_metrics(s: &Status) -> String {
     }
     head(
         &mut o,
+        "leep_mirror_github_reviews_total",
+        "counter",
+        "Reviews posted to Leep from a ref's pull request: approved, rejected, withdrawn; unmapped counts reviews by logins --github-users does not map.",
+    );
+    for r in &s.refs {
+        for (k, v) in [
+            ("approved", r.github_reviews.approved),
+            ("rejected", r.github_reviews.rejected),
+            ("withdrawn", r.github_reviews.withdrawn),
+            ("unmapped", r.github_reviews.unmapped),
+        ] {
+            let _ = writeln!(
+                o,
+                "leep_mirror_github_reviews_total{{ref=\"{}\",result=\"{k}\"}} {v}",
+                esc(&r.leep_ref)
+            );
+        }
+    }
+    head(
+        &mut o,
         "leep_mirror_land_branches_total",
         "counter",
         "Land branches by result: landed, conflicts, refused (land policy or a bad branch).",
@@ -552,9 +589,9 @@ pub fn render_metrics(s: &Status) -> String {
         &mut o,
         "leep_mirror_errors_total",
         "counter",
-        "Failed steps by stage: leep, git, export, import.",
+        "Failed steps by stage: leep, git, export, import, github.",
     );
-    for stage in ["leep", "git", "export", "import"] {
+    for stage in ["leep", "git", "export", "import", "github"] {
         let _ = writeln!(
             o,
             "leep_mirror_errors_total{{stage=\"{stage}\"}} {}",
