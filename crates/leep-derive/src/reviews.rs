@@ -8,7 +8,9 @@
 //! principal.
 
 use bytes::Bytes;
-use leep_core::review::{check_comment, Review, REVIEW_KIND};
+use leep_core::review::{
+    check_comment, check_source, Review, ReviewSource, REVIEW_KIND, REVIEW_SOURCE_KIND,
+};
 use leep_core::{ChangesetId, Hash, Result};
 
 use crate::Repo;
@@ -34,6 +36,37 @@ impl Repo {
                 Bytes::from(review.encode()),
             )
             .await
+    }
+
+    /// Store where `reviewer`'s review of `id` came from (ADR 0063).
+    pub async fn put_review_source(
+        &self,
+        id: ChangesetId,
+        reviewer: &str,
+        source: &ReviewSource,
+    ) -> Result<()> {
+        check_source(&source.source)?;
+        self.meta()
+            .put_derived(
+                REVIEW_SOURCE_KIND,
+                &storage_key(id, reviewer),
+                Bytes::from(source.encode()),
+            )
+            .await
+    }
+
+    /// Where `reviewer`'s review of `id` came from, if a row says. A row that
+    /// does not decode counts as absent.
+    pub async fn get_review_source(
+        &self,
+        id: ChangesetId,
+        reviewer: &str,
+    ) -> Result<Option<ReviewSource>> {
+        let row = self
+            .meta()
+            .get_derived(REVIEW_SOURCE_KIND, &storage_key(id, reviewer))
+            .await?;
+        Ok(row.and_then(|b| ReviewSource::decode(&b).ok()))
     }
 
     /// `reviewer`'s current verdict on `id`, if any.

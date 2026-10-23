@@ -70,6 +70,10 @@ fn auth() -> Auth {
         .collect();
     tokens
         .push(serde_json::json!({ "name": "viewer", "role": "read", "hash": hash_token(VIEWER) }));
+    tokens.push(serde_json::json!({
+        "name": "mirror", "role": "write", "review": false, "review_for": true,
+        "hash": hash_token(&token("mirror"))
+    }));
     Auth::parse(&serde_json::json!({ "tokens": tokens }).to_string()).unwrap()
 }
 
@@ -194,6 +198,8 @@ impl Api {
             &AddReviewRequest {
                 verdict: v,
                 comment: String::new(),
+                reviewer: None,
+                source: None,
             },
         )
         .await
@@ -276,6 +282,8 @@ async fn approve_reject_flow_latest_verdict_wins() {
             &AddReviewRequest {
                 verdict: Verdict::Approve,
                 comment: "looks right".into(),
+                reviewer: None,
+                source: None,
             },
         )
         .await;
@@ -304,6 +312,8 @@ async fn approve_reject_flow_latest_verdict_wins() {
             &AddReviewRequest {
                 verdict: Verdict::Reject,
                 comment: "wait".into(),
+                reviewer: None,
+                source: None,
             },
         )
         .await;
@@ -383,6 +393,8 @@ async fn reviews_need_authentication() {
     let body = serde_json::to_vec(&AddReviewRequest {
         verdict: Verdict::Approve,
         comment: String::new(),
+        reviewer: None,
+        source: None,
     })
     .unwrap();
     let r = api.call(Method::POST, &uri, None, body).await;
@@ -408,6 +420,8 @@ async fn auth_is_enforced_and_read_tokens_cannot_review() {
     let body = serde_json::to_vec(&AddReviewRequest {
         verdict: Verdict::Approve,
         comment: String::new(),
+        reviewer: None,
+        source: None,
     })
     .unwrap();
 
@@ -445,12 +459,13 @@ async fn the_reviewer_is_the_token_not_the_body() {
             body.to_string().into_bytes(),
         )
         .await;
-    assert_eq!(r.status, StatusCode::OK);
-    assert_eq!(r.json::<AddReviewResponse>().reviewer, "mallory");
-    let list = api.reviews(c).await;
-    assert_eq!(list.reviews.len(), 1);
-    assert_eq!(list.reviews[0].reviewer, "mallory");
-    assert!(api.repo.get_review(c, "alice").await.unwrap().is_none());
+    // ADR 0063: naming a reviewer needs `review_for`; it is refused, not
+    // taken as mallory's own review.
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+    assert!(api.reviews(c).await.reviews.is_empty());
+    for who in ["alice", "mallory"] {
+        assert!(api.repo.get_review(c, who).await.unwrap().is_none());
+    }
 }
 
 #[tokio::test]
@@ -1247,4 +1262,225 @@ async fn tokens_without_review_cannot_review_and_their_old_reviews_stop_counting
     after.approve(c, "alice").await;
     let r = after.land(c, "agent").await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.error());
+}
+
+fn review_for(who: &str, v: Verdict, source: Option<&str>) -> AddReviewRequest {
+    AddReviewRequest {
+        verdict: v,
+        comment: String::new(),
+        reviewer: Some(who.into()),
+        source: source.map(Into::into),
+    }
+}
+
+#[tokio::test]
+async fn review_for_stores_under_the_named_reviewer_with_a_source_row() {
+    let api = Api::with(POLICY);
+    let head = api
+        .seed_main(&[
+            (
+                "OWNERS",
+                Some(
+                    "alice
+",
+                ),
+            ),
+            (
+                "a",
+                Some(
+                    "1
+",
+                ),
+            ),
+        ])
+        .await;
+    let c = api
+        .commit(
+            &[head],
+            &[(
+                "a",
+                Some(
+                    "2
+",
+                ),
+            )],
+        )
+        .await;
+    let uri = format!("/v1/changesets/{c}/reviews");
+    let r = api
+        .post(
+            &uri,
+            "mirror",
+            &review_for("alice", Verdict::Approve, Some("github:o/r#1/reviews/2")),
+        )
+        .await;
+    assert_eq!(
+        r.status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&r.body)
+    );
+    assert_eq!(r.json::<AddReviewResponse>().reviewer, "alice");
+    assert!(api.repo.get_review(c, "mirror").await.unwrap().is_none());
+    let row = api.repo.get_review(c, "alice").await.unwrap().unwrap();
+    assert_eq!(row.verdict, Verdict::Approve);
+    let src = api
+        .repo
+        .get_review_source(c, "alice")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (src.via.as_str(), src.source.as_str()),
+        ("mirror", "github:o/r#1/reviews/2")
+    );
+
+    // The owner approval counts, so the change is approved.
+    assert!(api.status(c).await.approved);
+    let list = api.reviews(c).await;
+    assert_eq!(list.reviews.len(), 1);
+    assert_eq!(list.reviews[0].reviewer, "alice");
+    assert_eq!(
+        list.reviews[0].source.as_deref(),
+        Some("github:o/r#1/reviews/2")
+    );
+    assert_eq!(list.reviews[0].via.as_deref(), Some("mirror"));
+    // Old clients' view: the review fields stay at the top level.
+    let raw: serde_json::Value = api.get(&uri).await.json();
+    assert_eq!(raw["reviews"][0]["reviewer"], "alice");
+
+    // A direct post by alice replaces the row and no longer shows the source.
+    api.approve(c, "alice").await;
+    let list = api.reviews(c).await;
+    assert_eq!(list.reviews[0].source, None);
+    assert_eq!(list.reviews[0].via.as_deref(), Some("alice"));
+}
+
+#[tokio::test]
+async fn naming_a_reviewer_needs_the_review_for_capability() {
+    let api = Api::with(POLICY);
+    let c = api
+        .commit(
+            &[],
+            &[(
+                "a",
+                Some(
+                    "1
+",
+                ),
+            )],
+        )
+        .await;
+    let uri = format!("/v1/changesets/{c}/reviews");
+    for who in ["bob", "mallory"] {
+        let r = api
+            .post(&uri, who, &review_for("alice", Verdict::Approve, None))
+            .await;
+        assert_eq!(r.status, StatusCode::FORBIDDEN, "{who}");
+        assert!(r.error().contains("review_for"), "{}", r.error());
+    }
+    // Not taken as the token's own review either.
+    for name in ["alice", "bob", "mallory"] {
+        assert!(api.repo.get_review(c, name).await.unwrap().is_none());
+    }
+    assert!(api.reviews(c).await.reviews.is_empty());
+    // Without a reviewer the token still reviews as itself.
+    api.approve(c, "bob").await;
+}
+
+#[tokio::test]
+async fn withdrawn_counts_as_no_review_even_after_an_approve() {
+    let api = Api::with(POLICY);
+    let head = api
+        .seed_main(&[
+            (
+                "OWNERS",
+                Some(
+                    "alice
+",
+                ),
+            ),
+            (
+                "a",
+                Some(
+                    "1
+",
+                ),
+            ),
+        ])
+        .await;
+    let c = api
+        .commit(
+            &[head],
+            &[(
+                "a",
+                Some(
+                    "2
+",
+                ),
+            )],
+        )
+        .await;
+    api.approve(c, "alice").await;
+    assert!(api.status(c).await.approved);
+    assert_eq!(
+        api.review(c, "alice", Verdict::Withdrawn).await.status,
+        StatusCode::OK
+    );
+    let s = api.status(c).await;
+    assert!(!s.approved);
+    assert_eq!(rules(&s), [("a", "pending")]);
+    assert!(s.paths[0].approved_by.is_empty() && s.paths[0].rejected_by.is_empty());
+    let r = api.land(c, "bob").await;
+    assert_eq!(
+        r.error(),
+        needs_review(c, "a", "needs approval from one of [alice]")
+    );
+    // Listed, as what it is.
+    assert_eq!(api.reviews(c).await.reviews[0].verdict, Verdict::Withdrawn);
+
+    // It also lifts a veto, and an approval can follow.
+    api.review(c, "alice", Verdict::Reject).await;
+    assert_eq!(rules(&api.status(c).await), [("a", "rejected")]);
+    api.review(c, "alice", Verdict::Withdrawn).await;
+    assert_eq!(rules(&api.status(c).await), [("a", "pending")]);
+    // On behalf of someone, too.
+    let r = api
+        .post(
+            &format!("/v1/changesets/{c}/reviews"),
+            "mirror",
+            &review_for("alice", Verdict::Approve, Some("x")),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert!(api.status(c).await.approved);
+    assert_eq!(api.land(c, "bob").await.status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn rows_written_by_the_old_encoder_still_decode_and_count() {
+    let api = Api::with(POLICY);
+    let c = api.commit(&[], &[("a", Some("1\n"))]).await;
+    // postcard of Review { "bob", Approve, "", 7 } as written before
+    // `Withdrawn` existed, put straight into the store under the row's key.
+    let old = [3, b'b', b'o', b'b', 0, 0, 14];
+    let key = {
+        let mut bytes = c.0.as_bytes().to_vec();
+        bytes.extend_from_slice(b"bob");
+        Hash::of_object("review", &bytes)
+    };
+    api.repo
+        .meta()
+        .put_derived("review-v1", &key, Bytes::copy_from_slice(&old))
+        .await
+        .unwrap();
+    let row = api.repo.get_review(c, "bob").await.unwrap().unwrap();
+    assert_eq!((row.verdict, row.timestamp), (Verdict::Approve, 7));
+    let list = api.reviews(c).await;
+    assert_eq!(list.reviews.len(), 1);
+    assert_eq!(
+        (list.reviews[0].source.clone(), list.reviews[0].via.clone()),
+        (None, None)
+    );
+    assert!(api.status(c).await.approved);
 }

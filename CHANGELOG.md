@@ -52,6 +52,15 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 - A ref whose name ends in `/rebase-onto` can no longer be moved with
   `POST /v1/refs/{name}`; `land` still moves it.
 
+### Reviews on behalf of a named reviewer (ADR 0063, server half)
+- Tokens-file field `"review_for": true` (default false) lets a token post
+  `POST /v1/changesets/{id}/reviews` with `reviewer` and `source`; the review is
+  stored under `reviewer` and a new derived kind `review-source-v1` records the
+  posting token and source. Without the field, a body naming `reviewer` is 403.
+  `GET .../reviews` entries gain `source` and `via`.
+- `Verdict::Withdrawn` (appended last) counts as no review;
+  `leep review withdraw REV`. Servers must be upgraded before a client posts it.
+
 ### Land admission is on by default (`--land-queue-batches 4`)
 - **Behavior change.** `leep-server --land-queue-batches` (and
   `LEEP_LAND_QUEUE_BATCHES`) now defaults to `4` instead of `off` (ADR

@@ -486,6 +486,8 @@ fn review_status_reports_owners_and_blocked_paths() {
             &AddReviewRequest {
                 verdict: Verdict::Approve,
                 comment: String::new(),
+                reviewer: None,
+                source: None,
             },
         )
         .unwrap();

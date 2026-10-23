@@ -2006,7 +2006,7 @@ accepts the retired `history-tree-v1`, `history-tree-v2` and `history-tree-v3`
 current servers no longer use; see [Upgrading](#upgrading).
 
 Kinds that cannot be rederived (and so are refused by `drop` with an
-explanation and exit status 2): `signature-v1` and `review-v1` (clients wrote
+explanation and exit status 2): `signature-v1`, `review-v1` and `review-source-v1` (clients wrote
 them), `rebased-origin-v1` (written by rebase; `land`'s retry detection depends
 on it), `blob-claim-v1`, `blob-condemned-v1`, `blob-rescue-v1`, `blob-doom-v1`, `gc-mark-v1` (the GC
 fence, ADR 0012), `history-node-v4` (or `-v3`, `-v2`, `-v1`) on its own, and the ref log. The full table
