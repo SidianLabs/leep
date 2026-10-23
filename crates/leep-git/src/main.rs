@@ -1,7 +1,12 @@
+// Output goes through `leep_core::outln!`, which exits quietly when the
+// reader of stdout has gone instead of panicking like `println!`.
+#![warn(clippy::print_stdout)]
+
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use leep_core::outln;
 use leep_derive::Repo;
 use leep_git::mirror::{self, CommitStyle, RefSpec};
 use leep_git::{ExportOptions, ImportOptions};
@@ -212,9 +217,9 @@ fn run_mirror(cmd: MirrorCmd) -> Result<i32> {
                 .unwrap_or(0);
             let (healthy, problems) = mirror::status_healthy(&s, now);
             if json {
-                println!("{}", serde_json::to_string_pretty(&s)?);
+                outln!("{}", serde_json::to_string_pretty(&s)?);
             } else {
-                println!(
+                outln!(
                     "mirror pid {} {} -> {}, updated {}s ago",
                     s.pid,
                     s.server,
@@ -226,7 +231,7 @@ fn run_mirror(cmd: MirrorCmd) -> Result<i32> {
                         v.as_deref()
                             .map_or("-".to_string(), |v| v[..12.min(v.len())].to_string())
                     };
-                    println!(
+                    outln!(
                         "  {:<24} {:<16} leep {} git {} lag {}s{}",
                         r.leep_ref,
                         r.state.label(),
@@ -241,7 +246,7 @@ fn run_mirror(cmd: MirrorCmd) -> Result<i32> {
                     );
                 }
                 for b in &s.land_branches {
-                    println!(
+                    outln!(
                         "  land branch {} -> {} {} at {}{}",
                         b.branch.trim_start_matches("refs/heads/"),
                         b.leep_ref.as_deref().unwrap_or("?"),
@@ -255,7 +260,7 @@ fn run_mirror(cmd: MirrorCmd) -> Result<i32> {
                     );
                 }
                 for d in &s.deleted_branches {
-                    println!(
+                    outln!(
                         "  deleted {} at {} {}s ago (deleted in Leep)",
                         d.git_ref.trim_start_matches("refs/heads/"),
                         &d.commit[..12.min(d.commit.len())],
@@ -374,12 +379,15 @@ async fn run(cmd: Cmd) -> Result<()> {
         } => {
             let repo = open(&meta, &blobs).await?;
             let r = leep_git::import(&repo, &git_dir, &rev, &ImportOptions { set_ref }).await?;
-            println!(
+            outln!(
                 "imported {} commits ({} already present), {} blobs, {} submodules skipped",
-                r.commits_imported, r.commits_skipped, r.blobs_uploaded, r.submodules_skipped
+                r.commits_imported,
+                r.commits_skipped,
+                r.blobs_uploaded,
+                r.submodules_skipped
             );
             if let Some(h) = r.head {
-                println!("head {h}");
+                outln!("head {h}");
             }
             // Indexes are usually derived right after an import, from
             // statistics that predate it (ADR 0042). The import itself is
@@ -410,12 +418,14 @@ async fn run(cmd: Cmd) -> Result<()> {
                 },
             )
             .await?;
-            println!(
+            outln!(
                 "exported {} commits ({} already present), {} blobs",
-                r.commits_written, r.commits_skipped, r.blobs_written
+                r.commits_written,
+                r.commits_skipped,
+                r.blobs_written
             );
             if let Some(h) = r.head {
-                println!("head {h}");
+                outln!("head {h}");
             }
         }
         Cmd::Mirror { .. } => unreachable!("handled before the runtime starts"),
