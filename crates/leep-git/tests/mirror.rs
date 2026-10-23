@@ -10,13 +10,15 @@ use std::time::Duration;
 
 use anyhow::Result;
 use bytes::Bytes;
-use leep_core::api::{LandResponse, MergeRequest, MergeResponse, RebaseOntoResponse};
+use leep_core::api::{LandResponse, MergeRequest, MergeResponse, RebaseOntoResponse, ReviewEntry};
 use leep_core::memory::{MemoryBlobStore, MemoryMetaStore};
+use leep_core::review::{Review, ReviewSource, Verdict};
 use leep_core::{
     Changeset, ChangesetId, FileChange, FileKind, Hash, LandId, RefUpdateContext, RepoPath,
 };
 use leep_derive::Repo;
 use leep_git::mirror::export::{CommitStyle, Exporter};
+use leep_git::mirror::github::{GhReview, GitHubApi, GitHubConfig, Pull};
 use leep_git::mirror::map::Map;
 use leep_git::mirror::{
     self, Cas, Config, LandOutcome, LandState, Leep, MergeOutcome, OnDivergence, Primary, RefSpec,
@@ -73,15 +75,26 @@ struct Local {
     stale_refs: std::sync::Mutex<Vec<BTreeMap<String, ChangesetId>>>,
     /// The server is unreachable: every ref read fails.
     down: std::sync::Mutex<bool>,
+    /// Principals whose reviews are listed (the server reads its tokens
+    /// file for this).
+    reviewers: std::sync::Mutex<Vec<String>>,
+    /// Reviews posted through `post_review`, oldest first.
+    posted: std::sync::Mutex<Vec<(ChangesetId, String, Verdict)>>,
+    /// Fail every `post_review` once this many have been posted.
+    fail_posts_after: std::sync::Mutex<Option<usize>>,
 }
 
 impl Local {
     fn new() -> Local {
+        Local::with_repo(Repo::new(
+            Arc::new(MemoryBlobStore::new()),
+            Arc::new(MemoryMetaStore::new()),
+        ))
+    }
+
+    fn with_repo(repo: Repo) -> Local {
         Local {
-            repo: Repo::new(
-                Arc::new(MemoryBlobStore::new()),
-                Arc::new(MemoryMetaStore::new()),
-            ),
+            repo,
             rt: tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -90,7 +103,14 @@ impl Local {
             replays: std::sync::Mutex::new(0),
             stale_refs: std::sync::Mutex::new(Vec::new()),
             down: std::sync::Mutex::new(false),
+            reviewers: std::sync::Mutex::new(vec!["alice".into(), "bob".into()]),
+            posted: std::sync::Mutex::new(Vec::new()),
+            fail_posts_after: std::sync::Mutex::new(None),
         }
+    }
+
+    fn review(&self, id: ChangesetId, reviewer: &str) -> Option<Review> {
+        self.on(self.repo.get_review(id, reviewer)).unwrap()
     }
 
     fn check_up(&self) -> Result<()> {
@@ -316,6 +336,122 @@ impl Leep for Local {
             Err(e) => Err(e.into()),
         }
     }
+
+    fn reviews(&self, id: ChangesetId) -> Result<Vec<ReviewEntry>> {
+        let mut out = Vec::new();
+        for name in self.reviewers.lock().unwrap().iter() {
+            let Some(review) = self.on(self.repo.get_review(id, name))? else {
+                continue;
+            };
+            let row = self.on(self.repo.get_review_source(id, name))?;
+            out.push(ReviewEntry {
+                source: row.as_ref().map(|s| s.source.clone()),
+                via: row.map(|s| s.via),
+                review,
+            });
+        }
+        Ok(out)
+    }
+
+    fn post_review(
+        &self,
+        id: ChangesetId,
+        reviewer: &str,
+        verdict: Verdict,
+        source: &str,
+    ) -> Result<()> {
+        if let Some(n) = *self.fail_posts_after.lock().unwrap() {
+            if self.posted.lock().unwrap().len() >= n {
+                anyhow::bail!("connection reset while posting a review");
+            }
+        }
+        // As the server does: the source row first, then the review.
+        self.on(self.repo.put_review_source(
+            id,
+            reviewer,
+            &ReviewSource {
+                via: "git-mirror".into(),
+                source: source.into(),
+                timestamp: 1,
+            },
+        ))?;
+        self.on(self.repo.put_review(
+            id,
+            &Review {
+                reviewer: reviewer.into(),
+                verdict,
+                comment: String::new(),
+                timestamp: 1,
+            },
+        ))?;
+        self.posted
+            .lock()
+            .unwrap()
+            .push((id, reviewer.into(), verdict));
+        Ok(())
+    }
+}
+
+/// GitHub as a map: pull requests by branch and reviews by number.
+#[derive(Default)]
+struct FakeGitHub {
+    pulls: std::sync::Mutex<BTreeMap<String, Pull>>,
+    reviews: std::sync::Mutex<BTreeMap<u64, Vec<GhReview>>>,
+    /// Fail every call while set.
+    down: std::sync::Mutex<bool>,
+}
+
+impl FakeGitHub {
+    fn open(&self, branch: &str, number: u64, head_sha: &str, base: &str) {
+        self.pulls.lock().unwrap().insert(
+            branch.into(),
+            Pull {
+                number,
+                head_sha: head_sha.into(),
+                base_branch: base.into(),
+            },
+        );
+    }
+
+    fn review(&self, number: u64, id: u64, login: &str, state: &str, sha: &str) {
+        self.reviews
+            .lock()
+            .unwrap()
+            .entry(number)
+            .or_default()
+            .push(GhReview {
+                id,
+                login: login.into(),
+                state: state.into(),
+                commit_id: sha.into(),
+            });
+    }
+}
+
+/// The mirror's handle on a [`FakeGitHub`] the test keeps editing.
+struct SharedGitHub(Arc<FakeGitHub>);
+
+impl GitHubApi for SharedGitHub {
+    fn open_pull(&self, _: &str, _: &str, branch: &str) -> Result<Option<Pull>> {
+        if *self.0.down.lock().unwrap() {
+            anyhow::bail!("GitHub answered 503");
+        }
+        Ok(self.0.pulls.lock().unwrap().get(branch).cloned())
+    }
+
+    fn reviews(&self, _: &str, _: &str, number: u64) -> Result<Vec<GhReview>> {
+        if *self.0.down.lock().unwrap() {
+            anyhow::bail!("GitHub answered 503");
+        }
+        Ok(self
+            .0
+            .reviews
+            .lock()
+            .unwrap()
+            .get(&number)
+            .cloned()
+            .unwrap_or_default())
+    }
 }
 
 fn exporter(dir: &Path, style: CommitStyle) -> Exporter {
@@ -521,6 +657,7 @@ fn config(f: &Fixture, import: bool) -> Config {
         git_timeout: Duration::from_secs(60),
         max_backoff: Duration::from_secs(1),
         listen: None,
+        github: None,
     }
 }
 
@@ -2090,4 +2227,239 @@ fn a_prefix_branch_whose_name_leep_rejects_is_reported() {
     git(&f.remote, &["update-ref", "-d", "refs/heads/review/-x"]);
     assert!(m.run_once());
     assert!(!tracked(&m).contains(&"review/-x".to_string()));
+}
+
+/// GitHub pull request reviews into the review gate (ADR 0063).
+fn github_config(f: &Fixture) -> Config {
+    Config {
+        github: Some(GitHubConfig {
+            owner: "acme".into(),
+            repo: "app".into(),
+            users: BTreeMap::from([
+                ("ada".to_string(), "alice".to_string()),
+                ("grace".to_string(), "bob".to_string()),
+            ]),
+            token: None,
+            api_url: String::new(),
+        }),
+        ..two_way_config(f)
+    }
+}
+
+fn github_counts(m: &mirror::Mirror, leep_ref: &str) -> mirror::status::GitHubReviewCounts {
+    let s = m.status.lock().unwrap();
+    s.refs
+        .iter()
+        .find(|r| r.leep_ref == leep_ref)
+        .unwrap()
+        .github_reviews
+        .clone()
+}
+
+#[test]
+fn github_approvals_requests_and_dismissals_become_leep_reviews() {
+    let f = fixture();
+    let leep = Local::new();
+    let (_, r1) = main_and_review(&leep, "review/git-a");
+    let gh = Arc::new(FakeGitHub::default());
+    let mut m = mirror::Mirror::open(github_config(&f), &leep).unwrap();
+    m.set_github(Box::new(SharedGitHub(gh.clone())));
+    assert!(m.run_once());
+    let sha = remote_head(&f, "refs/heads/review/git-a").unwrap();
+    // No pull request yet: nothing to do.
+    assert_eq!(leep.posted.lock().unwrap().len(), 0);
+
+    gh.open("review/git-a", 7, &sha, "main");
+    gh.review(7, 1, "ada", "APPROVED", &sha);
+    assert!(m.run_once());
+    let r = leep.review(r1, "alice").unwrap();
+    assert_eq!(r.verdict, Verdict::Approve);
+    let src = leep
+        .on(leep.repo.get_review_source(r1, "alice"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(src.source, "github:acme/app#7/reviews/1");
+    {
+        let s = m.status.lock().unwrap();
+        let st = s
+            .refs
+            .iter()
+            .find(|r| r.leep_ref == "review/git-a")
+            .unwrap();
+        assert_eq!(st.pull_request, Some(7));
+        assert_eq!(st.github_reviews.approved, 1);
+        let metrics = mirror::status::render_metrics(&s);
+        assert!(
+            metrics.contains(
+                "leep_mirror_github_reviews_total{ref=\"review/git-a\",result=\"approved\"} 1"
+            ),
+            "{metrics}"
+        );
+    }
+    // The same answer again posts nothing.
+    assert!(m.run_once());
+    assert_eq!(leep.posted.lock().unwrap().len(), 1);
+
+    // Changes requested by a mapped login, a review by an unmapped one.
+    gh.review(7, 2, "grace", "CHANGES_REQUESTED", &sha);
+    gh.review(7, 3, "linus", "APPROVED", &sha);
+    assert!(m.run_once());
+    assert_eq!(leep.review(r1, "bob").unwrap().verdict, Verdict::Reject);
+    assert_eq!(leep.posted.lock().unwrap().len(), 2);
+    // Counted on every poll (`run_once` polls until nothing changes).
+    assert!(github_counts(&m, "review/git-a").unmapped >= 1);
+
+    // A dismissal withdraws; an approval of an older commit is stale and
+    // withdraws too.
+    gh.review(7, 4, "ada", "DISMISSED", &sha);
+    gh.review(
+        7,
+        5,
+        "grace",
+        "APPROVED",
+        "0000000000000000000000000000000000000000",
+    );
+    assert!(m.run_once());
+    assert_eq!(
+        leep.review(r1, "alice").unwrap().verdict,
+        Verdict::Withdrawn
+    );
+    assert_eq!(leep.review(r1, "bob").unwrap().verdict, Verdict::Withdrawn);
+    assert_eq!(github_counts(&m, "review/git-a").withdrawn, 2);
+
+    // The agent pushes more; a fresh approval covers the whole stack.
+    let r2 = leep.native(
+        vec![r1],
+        "more",
+        vec![leep.file("r", "r2\n", FileKind::Regular)],
+    );
+    leep.set_ref("review/git-a", r2);
+    assert!(m.run_once());
+    let sha2 = remote_head(&f, "refs/heads/review/git-a").unwrap();
+    assert_ne!(sha2, sha);
+    gh.open("review/git-a", 7, &sha2, "main");
+    gh.review(7, 6, "grace", "APPROVED", &sha2);
+    assert!(m.run_once());
+    assert_eq!(leep.review(r2, "bob").unwrap().verdict, Verdict::Approve);
+    assert_eq!(leep.review(r1, "bob").unwrap().verdict, Verdict::Approve);
+
+    // A review a person posted in Leep themselves is never touched.
+    leep.on(leep.repo.put_review(
+        r2,
+        &Review {
+            reviewer: "alice".into(),
+            verdict: Verdict::Reject,
+            comment: "not like this".into(),
+            timestamp: 5,
+        },
+    ))
+    .unwrap();
+    gh.review(7, 8, "ada", "APPROVED", &sha2);
+    assert!(m.run_once());
+    assert_eq!(leep.review(r2, "alice").unwrap().verdict, Verdict::Reject);
+    assert_eq!(leep.review(r1, "alice").unwrap().verdict, Verdict::Approve);
+    // Main was never reviewed: it is not in the stack.
+    assert_eq!(leep.review(leep.get_ref("main").unwrap(), "bob"), None);
+}
+
+#[test]
+fn github_reviews_converge_after_a_failure_between_reading_and_posting() {
+    let f = fixture();
+    let leep = Local::new();
+    let (_, r1) = main_and_review(&leep, "review/git-a");
+    let r2 = leep.native(
+        vec![r1],
+        "two",
+        vec![leep.file("r", "r2\n", FileKind::Regular)],
+    );
+    leep.set_ref("review/git-a", r2);
+    let gh = Arc::new(FakeGitHub::default());
+    let mut m = mirror::Mirror::open(github_config(&f), &leep).unwrap();
+    m.set_github(Box::new(SharedGitHub(gh.clone())));
+    assert!(m.run_once());
+    let sha = remote_head(&f, "refs/heads/review/git-a").unwrap();
+    gh.open("review/git-a", 9, &sha, "main");
+    gh.review(9, 1, "ada", "APPROVED", &sha);
+
+    // GitHub is down: counted, nothing posted, the ref stays healthy.
+    *gh.down.lock().unwrap() = true;
+    assert!(m.run_once());
+    assert_eq!(leep.posted.lock().unwrap().len(), 0);
+    assert!(m
+        .status
+        .lock()
+        .unwrap()
+        .errors
+        .get("github")
+        .is_some_and(|n| *n >= 1));
+
+    // The first post of the stack lands and the second fails (the mirror
+    // dies, the server hiccups): the next poll posts only what is missing.
+    *gh.down.lock().unwrap() = false;
+    *leep.fail_posts_after.lock().unwrap() = Some(1);
+    // `run_once` polls the remote (and so GitHub) on every cycle; a bare
+    // cycle waits for --git-poll.
+    m.run_once();
+    assert_eq!(leep.posted.lock().unwrap().len(), 1);
+    *leep.fail_posts_after.lock().unwrap() = None;
+    drop(m);
+    let mut m = mirror::Mirror::open(github_config(&f), &leep).unwrap();
+    m.set_github(Box::new(SharedGitHub(gh.clone())));
+    assert!(m.run_once());
+    assert_eq!(leep.posted.lock().unwrap().len(), 2);
+    assert_eq!(leep.review(r1, "alice").unwrap().verdict, Verdict::Approve);
+    assert_eq!(leep.review(r2, "alice").unwrap().verdict, Verdict::Approve);
+    assert!(m.run_once());
+    assert_eq!(leep.posted.lock().unwrap().len(), 2, "nothing posted twice");
+}
+
+#[test]
+fn a_mapped_owners_github_approval_lets_a_require_review_land_through() {
+    use leep_server::review::{RequireReview, ReviewPolicy, ReviewService};
+    let f = fixture();
+    let policy = ReviewPolicy::parse(r#"{"refs": ["main"]}"#).unwrap();
+    let service = Arc::new(ReviewService::new(
+        vec!["alice".into(), "bob".into()],
+        policy.rules,
+    ));
+    let leep = Local::with_repo(
+        Repo::new(
+            Arc::new(MemoryBlobStore::new()),
+            Arc::new(MemoryMetaStore::new()),
+        )
+        .with_land_policy(Arc::new(RequireReview::new(service.clone(), policy.refs))),
+    );
+    let (_, r1) = main_and_review(&leep, "review/git-a");
+    let gh = Arc::new(FakeGitHub::default());
+    let mut m = mirror::Mirror::open(github_config(&f), &leep).unwrap();
+    m.set_github(Box::new(SharedGitHub(gh.clone())));
+    assert!(m.run_once());
+
+    // Unreviewed: the land is refused.
+    match leep.land(r1, "main", None).unwrap() {
+        LandOutcome::Refused(why) => assert!(why.contains("review"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    assert!(
+        !leep
+            .on(service.status(&leep.repo, r1, "main"))
+            .unwrap()
+            .approved
+    );
+
+    // The owner approves on GitHub; the mirror posts it; the land goes.
+    let sha = remote_head(&f, "refs/heads/review/git-a").unwrap();
+    gh.open("review/git-a", 3, &sha, "main");
+    gh.review(3, 1, "ada", "APPROVED", &sha);
+    assert!(m.run_once());
+    assert!(
+        leep.on(service.status(&leep.repo, r1, "main"))
+            .unwrap()
+            .approved
+    );
+    assert!(matches!(
+        leep.land(r1, "main", None).unwrap(),
+        LandOutcome::Landed(_)
+    ));
+    assert_eq!(leep.get_ref("main"), Some(r1));
 }
