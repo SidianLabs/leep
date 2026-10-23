@@ -151,8 +151,9 @@ pub fn pager_command(var: impl Fn(&str) -> Option<String>) -> Option<String> {
 }
 
 /// Write the output of `log`, `diff` or `show`: through a pager when stdout
-/// is a terminal and not `json`, else straight to stdout. A reader that goes
-/// away early (`q` in the pager, `| head`) is not an error.
+/// is a terminal and not `json`, else straight to stdout. A pager quit
+/// early (`q`) is not an error; a closed pipe (`| head`) exits 141, as every
+/// other command's output does (`leep_core::stdout`).
 pub fn page(text: &str, json: bool) -> crate::error::Result<()> {
     if !json && std::io::stdout().is_terminal() {
         if let Some(cmd) = pager_command(|k| std::env::var(k).ok()) {
@@ -161,11 +162,7 @@ pub fn page(text: &str, json: bool) -> crate::error::Result<()> {
             }
         }
     }
-    let mut out = std::io::stdout().lock();
-    match out.write_all(text.as_bytes()).and_then(|()| out.flush()) {
-        Err(e) if e.kind() != std::io::ErrorKind::BrokenPipe => Err(e.into()),
-        _ => Ok(()),
-    }
+    Ok(leep_core::stdout::write_all(text.as_bytes())?)
 }
 
 /// Run `cmd` through the shell with `text` on its stdin and wait for it.

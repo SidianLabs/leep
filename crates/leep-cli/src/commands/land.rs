@@ -5,6 +5,7 @@ use std::fs;
 
 use clap::Args;
 use leep_core::api::{error_code, Conflict, LandId, LandRequest, LandResponse, FEATURE_LAND_ID};
+use leep_core::outln;
 use leep_core::refname::MISSING_REF_MARKER;
 use leep_core::review::NEEDS_REVIEW_MARKER;
 use leep_core::signature::NOT_SIGNED_MARKER;
@@ -66,7 +67,7 @@ pub fn run(ctx: &mut Ctx, args: &LandArgs) -> Result<i32> {
                 materialize(ctx, landed, false)?;
             }
             if !ctx.json {
-                println!(
+                outln!(
                     "Landed {} on {target_ref}{} ({attempts} attempt{})",
                     short(landed),
                     if rebased { " (rebased)" } else { "" },
@@ -82,7 +83,7 @@ pub fn run(ctx: &mut Ctx, args: &LandArgs) -> Result<i32> {
         } => {
             let unmerged = rebase_locally(ctx, &target_ref, onto, &conflicts, &clean)?;
             if !ctx.json {
-                println!(
+                outln!(
                     "Cannot land cleanly: {} conflict{} against {} on {target_ref}",
                     conflicts.len(),
                     if conflicts.len() == 1 { "" } else { "s" },
@@ -98,9 +99,9 @@ pub fn run(ctx: &mut Ctx, args: &LandArgs) -> Result<i32> {
                     } else {
                         "markers written".to_string()
                     };
-                    println!("  C {} ({note})", c.path);
+                    outln!("  C {} ({note})", c.path);
                 }
-                println!(
+                outln!(
                     "Your working copy is now on {} with your changes applied.\n\
                      Resolve the conflicts (`leep resolve PATH` once chosen), then run `leep commit` and `leep land`.",
                     short(onto)

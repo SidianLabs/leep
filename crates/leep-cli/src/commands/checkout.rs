@@ -10,6 +10,7 @@ use crate::overlay::{self, rebase_stack};
 use crate::snapshot;
 use crate::state::normalize_prefix;
 use crate::status::status;
+use leep_core::outln;
 
 #[derive(Args, Debug)]
 pub struct CheckoutArgs {
@@ -75,7 +76,7 @@ pub fn sync(ctx: &mut Ctx, args: &SyncArgs) -> Result<i32> {
                 "base": head, "written": 0, "removed": 0, "kept": kept
             }))?;
         } else {
-            println!(
+            outln!(
                 "Already at {} ({} kept)",
                 short(head),
                 plural(kept, "uncommitted change")
@@ -147,32 +148,32 @@ fn finish(
         return Ok(code);
     }
     if let Some((_, n)) = moved {
-        println!(
+        outln!(
             "Moved {} onto {}",
             plural(n, "local commit"),
             ctx.wc.config.target_ref
         );
     }
-    println!(
+    outln!(
         "Synced to {} ({} written, {} removed)",
         short(new_base),
         stats.written,
         stats.removed
     );
     if snapshot.is_some() {
-        println!("Your uncommitted changes were carried over.");
+        outln!("Your uncommitted changes were carried over.");
     }
     for p in conflicts {
-        println!("  C {p} (markers written)");
+        outln!("  C {p} (markers written)");
     }
     for p in unmerged {
-        println!(
+        outln!(
             "  C {p} (no text merge: kept your version; `leep cat {} {p}` shows the other side)",
             short(new_base)
         );
     }
     if code == exit::CONFLICT {
-        println!(
+        outln!(
             "Resolve the conflicts (`leep resolve PATH` when you have chosen, or \
              `leep restore PATH`), then `leep commit`."
         );
@@ -191,7 +192,7 @@ fn report(
             "base": id, "written": stats.written, "removed": stats.removed
         }))
     } else {
-        println!(
+        outln!(
             "{verb} {} ({} written, {} removed)",
             short(id),
             stats.written,

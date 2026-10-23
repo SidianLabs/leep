@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 
 use clap::Args;
 use leep_core::api::CasRefRequest;
+use leep_core::outln;
 use leep_core::refname::{self, is_tag, tag_ref, TAGS_PREFIX};
 use leep_core::ChangesetId;
 
@@ -71,7 +72,7 @@ pub fn branch(ctx: &Ctx, args: &BranchArgs) -> Result<i32> {
     if ctx.json {
         print_json(&serde_json::json!({ "name": name, "target": id }))?;
     } else {
-        println!("Created branch {name} at {}", short(id));
+        outln!("Created branch {name} at {}", short(id));
     }
     Ok(0)
 }
@@ -104,7 +105,7 @@ pub fn switch(ctx: &mut Ctx, args: &SwitchArgs) -> Result<i32> {
         }))
         .map(|()| 0);
     }
-    println!(
+    outln!(
         "Switched to branch {name} at {} ({} written, {} removed)",
         short(head),
         stats.written,
@@ -147,7 +148,7 @@ pub fn tag(ctx: &Ctx, args: &TagArgs) -> Result<i32> {
         if ctx.json {
             print_json(&serde_json::json!({ "name": short_name, "deleted": head }))?;
         } else {
-            println!("Deleted tag {short_name} (was {})", short(head));
+            outln!("Deleted tag {short_name} (was {})", short(head));
         }
         return Ok(0);
     }
@@ -162,7 +163,7 @@ pub fn tag(ctx: &Ctx, args: &TagArgs) -> Result<i32> {
     if ctx.json {
         print_json(&serde_json::json!({ "name": short_name, "target": id }))?;
     } else {
-        println!("Created tag {short_name} at {}", short(id));
+        outln!("Created tag {short_name} at {}", short(id));
     }
     Ok(0)
 }
@@ -219,7 +220,7 @@ fn delete_branch(ctx: &Ctx, name: &str, force: bool) -> Result<i32> {
     if ctx.json {
         print_json(&serde_json::json!({ "name": name, "deleted": head }))?;
     } else {
-        println!("Deleted branch {name} (was {})", short(head));
+        outln!("Deleted branch {name} (was {})", short(head));
     }
     Ok(0)
 }
@@ -232,7 +233,7 @@ fn list_branches(ctx: &Ctx) -> Result<i32> {
         return Ok(0);
     }
     for line in branch_lines(&resp.refs, &ctx.wc.config.target_ref) {
-        println!("{line}");
+        outln!("{line}");
     }
     Ok(0)
 }
@@ -261,7 +262,7 @@ fn list_tags(ctx: &Ctx) -> Result<i32> {
         return Ok(0);
     }
     for (name, id) in &resp.refs {
-        println!("{} {}", &name[TAGS_PREFIX.len()..], short(id));
+        outln!("{} {}", &name[TAGS_PREFIX.len()..], short(id));
     }
     Ok(0)
 }

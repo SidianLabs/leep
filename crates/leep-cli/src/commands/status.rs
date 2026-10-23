@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 
 use leep_core::api::RenameEntry;
+use leep_core::outln;
 use leep_core::rename::RenameOptions;
 use leep_core::ChangesetId;
 use serde::Serialize;
@@ -118,18 +119,18 @@ pub fn run(ctx: &Ctx) -> Result<i32> {
     }
     let target = &ctx.wc.config.target_ref;
     match ctx.wc.state.base {
-        Some(b) => println!("base {} (target {target})", short(b)),
-        None => println!("no base yet (target {target})"),
+        Some(b) => outln!("base {} (target {target})", short(b)),
+        None => outln!("no base yet (target {target})"),
     }
     match rel {
         Some(Relation::Ahead(n)) => {
-            println!("base is {} ahead of {target}", plural(n as usize, "commit"))
+            outln!("base is {} ahead of {target}", plural(n as usize, "commit"))
         }
-        Some(Relation::Diverged) => println!("base is not on {target}"),
+        Some(Relation::Diverged) => outln!("base is not on {target}"),
         _ => {}
     }
     if let Some(m) = &ctx.wc.state.merge_in_progress {
-        println!(
+        outln!(
             "merging {} (fix the conflicts, then `leep commit`; `leep merge --abort` cancels)",
             short(m.other)
         );
@@ -140,19 +141,19 @@ pub fn run(ctx: &Ctx) -> Result<i32> {
         } else {
             ("cherry-pick", "cherry-picking")
         };
-        println!(
+        outln!(
             "{ing} {} (fix the conflicts, then `leep commit`; `leep {what} --abort` cancels)",
             short(p.from)
         );
     }
     if stashes > 0 {
-        println!(
+        outln!(
             "{stashes} {}",
             if stashes == 1 { "stash" } else { "stashes" }
         );
     }
     if st.is_clean() {
-        println!("nothing to commit, working copy clean");
+        outln!("nothing to commit, working copy clean");
     }
     for line in change_lines(&st, &renames) {
         let note = match line.strip_prefix("C ") {
@@ -161,10 +162,10 @@ pub fn run(ctx: &Ctx) -> Result<i32> {
             }
             _ => "",
         };
-        println!("{}{note}", paint_letter(&line));
+        outln!("{}{note}", paint_letter(&line));
     }
     if st.has_conflicts() {
-        println!(
+        outln!(
             "unresolved conflicts: fix the markers, or `leep resolve PATH` once you have \
              chosen; `leep cat @ PATH` shows the other side"
         );

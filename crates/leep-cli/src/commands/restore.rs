@@ -9,6 +9,7 @@ use std::fs;
 
 use clap::Args;
 use leep_core::api::FileInfo;
+use leep_core::outln;
 
 use super::{print_json, Ctx};
 use crate::error::{CliError, Result};
@@ -287,19 +288,19 @@ fn report(ctx: &Ctx, d: &Discarded, source: Option<&str>) -> Result<()> {
         return print_json(d);
     }
     for p in &d.restored {
-        println!("restored {p}");
+        outln!("restored {p}");
     }
     for p in &d.removed {
-        println!("removed {p}");
+        outln!("removed {p}");
     }
     for p in &d.kept {
-        println!("kept new file {p} (use --force to delete it)");
+        outln!("kept new file {p} (use --force to delete it)");
     }
     let from = source.map(|s| format!(" from {s}")).unwrap_or_default();
     if d.restored.is_empty() && d.removed.is_empty() {
-        println!("Nothing to restore{from}");
+        outln!("Nothing to restore{from}");
     } else {
-        println!(
+        outln!(
             "Restored {}{from}, removed {}",
             plural(d.restored.len(), "file"),
             plural(d.removed.len(), "file")

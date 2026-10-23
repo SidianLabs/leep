@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use clap::Args;
+use leep_core::outln;
 use leep_core::{Changeset, FileChange};
 
 use super::commit::agent_extra;
@@ -129,7 +130,7 @@ pub fn run(ctx: &mut Ctx, args: &AmendArgs) -> Result<i32> {
         }))?;
         return Ok(0);
     }
-    println!("{id}");
+    outln!("{id}");
     eprintln!(
         "amended {} -> {} ({})",
         short(base),

@@ -8,6 +8,7 @@
 
 use clap::Args;
 use leep_core::api::{error_code, CasRefRequest};
+use leep_core::outln;
 use leep_core::refname::NOT_FORWARD_MARKER;
 use leep_core::{ChangesetId, RefLogEntry};
 
@@ -89,7 +90,7 @@ pub fn reflog(r: &Remote, args: &ReflogArgs) -> Result<i32> {
         print_json(&serde_json::json!({ "entries": entries }))?;
     } else {
         for e in &entries {
-            println!("{}", entry_line(e));
+            outln!("{}", entry_line(e));
         }
     }
     Ok(0)
@@ -187,17 +188,17 @@ pub fn undo(r: &Remote, args: &UndoArgs) -> Result<i32> {
         return Ok(0);
     }
     match (current, entry.old) {
-        (Some(from), Some(to)) => println!("Moved {name} back: {} -> {}", short(from), short(to)),
-        (Some(from), None) => println!("Deleted {name} (was {})", short(from)),
-        (None, Some(to)) => println!("Recreated {name} at {}", short(to)),
+        (Some(from), Some(to)) => outln!("Moved {name} back: {} -> {}", short(from), short(to)),
+        (Some(from), None) => outln!("Deleted {name} (was {})", short(from)),
+        (None, Some(to)) => outln!("Recreated {name} at {}", short(to)),
         (None, None) => unreachable!("current == old returned above"),
     }
     match undo_seq {
-        Some(seq) => println!("To redo: leep undo {name} --to {seq}"),
-        None => println!("To redo: leep undo {name}"),
+        Some(seq) => outln!("To redo: leep undo {name} --to {seq}"),
+        None => outln!("To redo: leep undo {name}"),
     }
     if name == r.target_ref && entry.old.is_some() {
-        println!("The working copy is unchanged; run `leep sync` to follow {name}.");
+        outln!("The working copy is unchanged; run `leep sync` to follow {name}.");
     }
     Ok(0)
 }

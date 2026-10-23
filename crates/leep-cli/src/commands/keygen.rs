@@ -6,6 +6,7 @@ use clap::Args;
 
 use crate::error::Result;
 use crate::sign::AuthorKey;
+use leep_core::outln;
 
 #[derive(Args, Debug)]
 pub struct KeygenArgs {
@@ -27,7 +28,7 @@ pub fn run(args: &KeygenArgs) -> Result<i32> {
         .clone()
         .or_else(|| std::env::var("USER").ok().filter(|u| !u.is_empty()))
         .unwrap_or_else(|| "me".into());
-    println!(
+    outln!(
         "{}",
         serde_json::json!({ "name": name, "public_key": key.public_key() })
     );

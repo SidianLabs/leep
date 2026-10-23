@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 
 use clap::Args;
+use leep_core::outln;
 use leep_core::ChangesetId;
 
 use super::{print_json, Ctx};
@@ -123,20 +124,20 @@ fn report(
         }));
     }
     for p in discarded {
-        println!("discarded {p}");
+        outln!("discarded {p}");
     }
     for p in kept {
-        println!("kept new file {p}");
+        outln!("kept new file {p}");
     }
     if hard {
-        println!(
+        outln!(
             "Reset to {} (was {}); discarded {}",
             short(new),
             short(old),
             plural(discarded.len(), "change")
         );
     } else {
-        println!(
+        outln!(
             "Reset base to {} (was {}); {} kept as uncommitted",
             short(new),
             short(old),
