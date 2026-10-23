@@ -865,6 +865,36 @@ from logins in a mapping file, are posted as Leep reviews for the mapped
 principal through a `review_for` token, so the review gate of ADR 0011
 holds without a second approval.
 
+**Rebase onto** (`POST /v1/refs/{name}/rebase-onto`, the server half of
+ADR 0062's replay; the mirror half is not built yet). It queues on the
+ref's land queue (forwarded to the lease holder under
+`--land-coordination on`, ADR 0056) and runs alone between land batches, in
+arrival order with them:
+```
+rebase_onto(name, onto, expected_base, land_id?):
+  refuse: bad name, tag, ref under --protect-ref (400, not_forward:
+          protect the branch on GitHub instead)
+  enqueue on queue(name) behind the lands already there
+leader: lands → land_batch as above; a rebase-onto → alone:
+loop (≤32 attempts, same lifetime as a batch):
+  head ← get_ref(name)
+  land_id recorded? → its result: the head it moved to, and the copies on
+                      the first-parent chain from there down to onto
+  merge_base(head, onto) ≠ expected_base → 409 (the caller reads again)
+  expected_base == onto → nothing to do (Moved at head)
+  land policy on new_history(onto, head)   # git's changesets, not the stack
+  expected_base == head → move to onto
+  else replay the first-parent stack head..expected_base onto onto, as a
+       land replays (staged; one copy each, leep.rebased_from)
+       conflict → Conflicts{onto, conflicts, clean}; no changeset stored
+  store staging; CAS(head → top) logged once, operation git-mirror, the
+  land id recorded with onto as its changeset; lost → backoff, redo
+```
+A land that reached the server before the replay is in `head`, so it is in
+the stack and gets a copy; one after it replays onto the result. The answer
+pairs each original with its copy, which agents holding the originals find
+through the rebase link as after any land.
+
 ## 7. Caching tiers
 
 ```

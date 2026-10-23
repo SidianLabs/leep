@@ -1203,6 +1203,27 @@ new response header `Leep-Refused: <reason>`.
   10 s instead of sleeping. Older clients report the `503` as a server
   error, whose message says to retry.
 
+## Rebase onto (new endpoint, ADR 0062)
+
+`POST /v1/refs/{name}/rebase-onto` is new. Body `RebaseOntoRequest`:
+`onto` and `expected_base` (changeset ids) and the optional `land_id`
+(as `LandRequest`'s, omitted when unset). Answer `RebaseOntoResponse`,
+tagged by `status`: `{"status": "moved", "head": id, "rebased": [[original,
+copy], ...]}` (`rebased` empty for a fast-forward or a no-op, and defaulted
+when absent), or `{"status": "conflicts", "onto", "conflicts", "clean"}`
+with the fields of `LandResponse::Conflicts`, its `clean` blobs stored the
+same way. A merge base other than `expected_base` is 409 `cas_lost`; a
+`--protect-ref` ref is 400 `not_forward`; a land id recorded for another
+`onto` is 400 `land_id_reused`. The move is a ref log entry with operation
+`git-mirror`, and a keyed one records `land_id` with `onto` as its
+`land_changeset`, so rebase-onto and lands share a ref's land ids.
+
+`POST /v1/refs/{name}` and this endpoint share the route, since ref names
+hold `/`: a `POST` whose path ends in `/rebase-onto` is always this
+endpoint, so a ref whose name ends in `/rebase-onto` can no longer be moved
+by `POST /v1/refs/{name}` (`land` still moves it). No other shape, stored
+object or table changed.
+
 ## Land admission (additive header value, ADR 0060)
 
 Nothing persisted changed, and no field, code or route was added. A server

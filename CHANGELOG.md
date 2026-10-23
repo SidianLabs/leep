@@ -24,6 +24,15 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   and `leep-mcp` still ends with status 1 when its client closes stdout.
   SIGPIPE stays ignored in every binary, so a closed socket never kills a
   process.
+### `POST /v1/refs/{name}/rebase-onto` (ADR 0062, server half)
+- New endpoint for the git mirror's git-primary refs: replays the ref's
+  first-parent stack above `expected_base` onto `onto` and moves the ref
+  once (ref log operation `git-mirror`), queued with the ref's lands so no
+  land is lost to the race. 409 when the merge base moved, 400 on a
+  `--protect-ref` ref, `land_id` for idempotent retries. The mirror does
+  not call it yet.
+- A ref whose name ends in `/rebase-onto` can no longer be moved with
+  `POST /v1/refs/{name}`; `land` still moves it.
 
 ### Land admission is on by default (`--land-queue-batches 4`)
 - **Behavior change.** `leep-server --land-queue-batches` (and
