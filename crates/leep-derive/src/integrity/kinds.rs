@@ -2,7 +2,7 @@
 //! (ADR 0025). The table here is the single source for `verify --derived`,
 //! `repair rederive` and `repair drop`, and for the lists in the docs.
 
-use leep_core::review::REVIEW_KIND;
+use leep_core::review::{REVIEW_KIND, REVIEW_SOURCE_KIND};
 use leep_core::signature::SIGNATURE_KIND;
 use leep_core::Error;
 
@@ -186,6 +186,16 @@ static KINDS: &[KindInfo] = &[
         drop: DropPolicy::Refused(
             "reviews are verdicts people recorded; they are not computed from history, \
              so a dropped row is gone for good",
+        ),
+    },
+    KindInfo {
+        name: REVIEW_SOURCE_KIND,
+        class: KindClass::Attestation,
+        summary: "which token posted a review, and where it said it came from",
+        rederive: Rederive::No("review sources are not computed from history"),
+        drop: DropPolicy::Refused(
+            "review sources are audit records written with the reviews; they are not \
+             computed from history, so a dropped row is gone for good",
         ),
     },
     KindInfo {

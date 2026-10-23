@@ -2153,6 +2153,8 @@ async fn every_error_has_a_code() {
     let review = serde_json::to_vec(&AddReviewRequest {
         verdict: leep_core::review::Verdict::Approve,
         comment: String::new(),
+        reviewer: None,
+        source: None,
     })
     .unwrap();
     let reviews = format!("/v1/changesets/{a}/reviews");

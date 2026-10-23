@@ -15,7 +15,9 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::{stream, StreamExt};
-use leep_core::review::{check_comment, Review, REVIEW_KIND};
+use leep_core::review::{
+    check_comment, check_source, Review, ReviewSource, REVIEW_KIND, REVIEW_SOURCE_KIND,
+};
 use leep_core::signature::{key_id as signature_key_id, Signature, SIGNATURE_KIND};
 use leep_core::{
     BlobStore, Changeset, ChangesetId, Error, FileChange, Hash, MetaStore, RepoPath, Result,
@@ -988,6 +990,28 @@ impl Verifier<'_> {
                             REVIEW_KIND,
                             &key,
                             format!("review row {key} {why}"),
+                        );
+                    }
+                }
+                self.tick();
+            }
+        }
+        if self.has(REVIEW_SOURCE_KIND) {
+            let mut scan = RowScan::new(REVIEW_SOURCE_KIND, full, self.opts.sample);
+            while let Some(page) = scan.next(&*meta).await? {
+                for (key, value) in page {
+                    self.kstats(REVIEW_SOURCE_KIND).checked += 1;
+                    let bad = match ReviewSource::decode(&value) {
+                        Err(e) => Some(format!("does not decode: {e}")),
+                        Ok(s) => check_source(&s.source)
+                            .err()
+                            .map(|e| format!("is not a valid review source: {e}")),
+                    };
+                    if let Some(why) = bad {
+                        self.attestation_problem(
+                            REVIEW_SOURCE_KIND,
+                            &key,
+                            format!("review source row {key} {why}"),
                         );
                     }
                 }

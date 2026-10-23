@@ -925,6 +925,8 @@ impl Agent {
             let rb = serde_json::to_vec(&AddReviewRequest {
                 verdict: Verdict::Approve,
                 comment: "looks fine".into(),
+                reviewer: None,
+                source: None,
             })
             .unwrap();
             let r = reviewer
