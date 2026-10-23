@@ -295,6 +295,21 @@ impl Repo {
                 clean: m.changes,
             });
         }
+        let id = self.rebased_copy(cs, onto, m.changes).await?;
+        Ok(RebaseResponse::Rebased { id })
+    }
+
+    /// Store `cs`'s copy on `onto` with `changes`, linked to `cs`. The link is
+    /// written with the copy, so a copy never exists without it (on stores
+    /// with atomic writes) and is never linked before it exists (on any
+    /// store). `changes` may be empty: `onto` already has what `cs` does.
+    pub(crate) async fn rebased_copy(
+        &self,
+        cs: ChangesetId,
+        onto: ChangesetId,
+        changes: BTreeMap<RepoPath, FileChange>,
+    ) -> Result<ChangesetId> {
+        let orig = self.get_changeset(cs).await?;
         let mut extra = orig.extra;
         extra.insert(EXTRA_REBASED_FROM.into(), cs.to_string());
         let copy = Changeset {
@@ -302,16 +317,11 @@ impl Repo {
             author: orig.author,
             timestamp: orig.timestamp,
             message: orig.message,
-            changes: m.changes,
+            changes,
             extra,
         };
-        // The link is written with the copy, so a copy never exists without
-        // it (on stores with atomic writes) and is never linked before it
-        // exists (on any store).
         let link = Self::rebase_link(copy.id(), cs);
-        let id = self
-            .store_server_changeset_with_rows(copy, vec![link])
-            .await?;
-        Ok(RebaseResponse::Rebased { id })
+        self.store_server_changeset_with_rows(copy, vec![link])
+            .await
     }
 }
