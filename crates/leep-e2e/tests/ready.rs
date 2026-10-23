@@ -1,4 +1,5 @@
 //! `GET /v1/ready` and the config fingerprint with the real `leep-server`.
+#![cfg_attr(not(unix), allow(dead_code))]
 
 mod common;
 
@@ -102,6 +103,7 @@ fn the_one(addr: std::net::SocketAddr) -> String {
 
 /// A restart resets the generation but not the fingerprint; a real change
 /// moves the fingerprint and leaves one series at 1.
+#[cfg(unix)] // needs SIGHUP
 #[test]
 fn the_fingerprint_survives_a_restart_and_follows_the_content() {
     let _g = serial();

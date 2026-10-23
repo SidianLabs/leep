@@ -1308,7 +1308,12 @@ async fn edited_migration_is_refused() {
             .compiled()
             .iter()
             .map(|m| Migration {
-                sql: Box::leak(m.sql.replace('\n', "\r\n").into_boxed_str()),
+                sql: Box::leak(
+                    m.sql
+                        .replace("\r\n", "\n")
+                        .replace('\n', "\r\n")
+                        .into_boxed_str(),
+                ),
                 ..*m
             })
             .collect();

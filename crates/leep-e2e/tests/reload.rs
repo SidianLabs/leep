@@ -1,5 +1,6 @@
 //! Config reload with the real binary (ADR 0024): edit the tokens file, send
 //! SIGHUP, and watch the server change its answers without restarting.
+#![cfg_attr(not(unix), allow(dead_code))]
 
 mod common;
 
@@ -67,6 +68,7 @@ fn metric(addr: std::net::SocketAddr, line_start: &str) -> Option<f64> {
         .and_then(|l| l.rsplit(' ').next()?.parse().ok())
 }
 
+#[cfg(unix)] // needs SIGHUP
 #[test]
 fn sighup_applies_token_edits_and_rejects_a_bad_file_without_stopping() {
     let _g = serial();
@@ -138,6 +140,7 @@ fn sighup_applies_token_edits_and_rejects_a_bad_file_without_stopping() {
     assert_eq!(http_get(server.addr, "/v1/refs", None).0, 401);
 }
 
+#[cfg(unix)] // needs SIGHUP
 #[test]
 fn sighup_without_any_config_file_is_harmless() {
     let _g = serial();

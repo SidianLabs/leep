@@ -297,10 +297,14 @@ fn request(data: &[u8], ids: &[String; 3]) -> Option<Request<Body>> {
 }
 
 thread_local! {
-    static RUNTIME: tokio::runtime::Runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("runtime");
+    // Never dropped: on Windows the runtime's blocking threads need the
+    // loader lock a thread's exit holds, so dropping it there deadlocks.
+    static RUNTIME: std::mem::ManuallyDrop<tokio::runtime::Runtime> = std::mem::ManuallyDrop::new(
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime"),
+    );
 }
 
 /// Drive the real router with a fresh in-memory repo. Malformed input is the

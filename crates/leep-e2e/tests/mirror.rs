@@ -455,7 +455,12 @@ fn assert_trees_match(
         while let Some(d) = stack.pop() {
             for e in fs::read_dir(&d).unwrap().flatten() {
                 let p = e.path();
-                let rel = p.strip_prefix(dir).unwrap().to_str().unwrap().to_string();
+                let rel = p
+                    .strip_prefix(dir)
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .replace(std::path::MAIN_SEPARATOR, "/");
                 if rel == skip {
                     continue;
                 }
@@ -855,6 +860,7 @@ fn concurrent_writers(extra: &[&str]) {
 /// after it moved, and after Leep's side of a divergence was pushed.
 #[test]
 fn crash_points_resume_exactly_once() {
+    #[cfg(unix)]
     use std::os::unix::process::ExitStatusExt;
     let _g = serial();
     let tmp = tempfile::tempdir().unwrap();
@@ -909,7 +915,9 @@ fn crash_points_resume_exactly_once() {
             }
         }
         let mut m = Mirror::start_env(&server, &remote, &work, root, &[], Some(point));
+        #[cfg_attr(not(unix), allow(unused_variables))]
         let st = m.wait_exit(TIMEOUT);
+        #[cfg(unix)]
         assert_eq!(st.signal(), Some(6), "{point}: expected an abort, got {st}");
         let m = Mirror::start(&server, &remote, &work, root, &[]);
         wait_until(
@@ -1153,6 +1161,7 @@ fn merging_mirror_merges_clean_divergence_and_lands_land_branches() {
 /// before the delete (`land-landed`), and after the delete (`land-deleted`).
 #[test]
 fn merging_crash_points_resume_exactly_once() {
+    #[cfg(unix)]
     use std::os::unix::process::ExitStatusExt;
     let _g = serial();
     let tmp = tempfile::tempdir().unwrap();
@@ -1205,7 +1214,9 @@ fn merging_crash_points_resume_exactly_once() {
             person.push_land(point, &format!("{point}/land.txt"), "l\n");
         }
         let mut m = Mirror::start_env(&server, &remote, &work, root, MERGING, Some(point));
+        #[cfg_attr(not(unix), allow(unused_variables))]
         let st = m.wait_exit(TIMEOUT);
+        #[cfg(unix)]
         assert_eq!(st.signal(), Some(6), "{point}: expected an abort, got {st}");
         let m = Mirror::start(&server, &remote, &work, root, MERGING);
         wait_until(

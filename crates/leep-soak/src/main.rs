@@ -58,13 +58,11 @@ fn digest(token: &str) -> String {
 
 fn write_private(path: &Path, text: &str) -> Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+    let mut f = opts.open(path)?;
     f.write_all(text.as_bytes())?;
     Ok(())
 }
@@ -182,7 +180,10 @@ fn locate_bins(args: &Args) -> Result<PathBuf> {
             .to_path_buf(),
     };
     for b in ["leep", "leep-server"] {
-        if !dir.join(b).is_file() {
+        if !dir
+            .join(format!("{b}{}", std::env::consts::EXE_SUFFIX))
+            .is_file()
+        {
             bail!(
                 "{} not found in {}; run `cargo build --workspace` (same profile) first, or pass --bin-dir",
                 b,
@@ -218,6 +219,11 @@ async fn run(args: Args) -> Result<bool> {
         std::fs::create_dir_all(&out)?;
         &out
     })?;
+    // Windows canonicalizes to a `\\?\` path, whose `?` breaks the sqlite URL.
+    let out = match out.to_str().and_then(|p| p.strip_prefix(r"\\?\")) {
+        Some(plain) => PathBuf::from(plain),
+        None => out,
+    };
     // Scratch space of an earlier run in the same directory (kept after a
     // failure) would hand the `leep` agents working copies that exist already.
     let work = out.join("work");

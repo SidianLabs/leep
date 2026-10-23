@@ -602,12 +602,7 @@ pub(crate) fn lock_tombstones(dir: &Path) -> Result<File> {
 
 /// Make renames and creations in `dir` durable.
 pub(crate) fn sync_dir(dir: &Path) -> Result<()> {
-    #[cfg(unix)]
-    File::open(dir)
-        .and_then(|d| d.sync_all())
-        .map_err(storage_err)?;
-    let _ = dir;
-    Ok(())
+    leep_core::fsync::sync_dir(dir).map_err(storage_err)
 }
 
 #[cfg(test)]
