@@ -142,7 +142,7 @@ pub fn plan_conflicts(
     if !outside.is_empty() {
         return Err(CliError::user(format!(
             "cannot apply here: the changes touch paths outside this sparse \
-             checkout ({}); widen it with `leep checkout @ --prefix ...`",
+             checkout ({}); widen it with `leep checkout @ --add-prefix PATH`",
             outside.join(", ")
         )));
     }

@@ -79,6 +79,23 @@ pub struct SqliteMetaStore {
     pub(crate) has_stored_at: bool,
 }
 
+/// `sqlite:///C:/path` (a Windows drive letter after the third slash, as
+/// in a `file://` URL) becomes `sqlite://C:/path`: sqlx takes what follows
+/// `sqlite://` as the file name, and `/C:/path` is no Windows path.
+fn sqlite_url(url: &str) -> std::borrow::Cow<'_, str> {
+    match url.strip_prefix("sqlite:///") {
+        Some(rest)
+            if rest.len() >= 3
+                && rest.as_bytes()[0].is_ascii_alphabetic()
+                && rest.as_bytes()[1] == b':'
+                && matches!(rest.as_bytes()[2], b'/' | b'\\') =>
+        {
+            format!("sqlite://{rest}").into()
+        }
+        _ => url.into(),
+    }
+}
+
 impl SqliteMetaStore {
     /// Connect and migrate. `url` is e.g. `sqlite://path?mode=rwc` or
     /// `sqlite::memory:` (single connection so every query sees one DB).
@@ -132,7 +149,7 @@ impl SqliteMetaStore {
     /// rollback-journal mode: a snapshot is written once, by one writer, and
     /// ends as a single file with no write-ahead log to carry along.
     pub(crate) async fn create_single(url: &str) -> Result<Self> {
-        let opts = SqliteConnectOptions::from_str(url)
+        let opts = SqliteConnectOptions::from_str(&sqlite_url(url))
             .map_err(storage)?
             .journal_mode(SqliteJournalMode::Delete)
             .busy_timeout(std::time::Duration::from_secs(30));
@@ -146,7 +163,7 @@ impl SqliteMetaStore {
     }
 
     async fn pool(url: &str) -> Result<SqlitePool> {
-        let opts = SqliteConnectOptions::from_str(url).map_err(storage)?;
+        let opts = SqliteConnectOptions::from_str(&sqlite_url(url)).map_err(storage)?;
         let memory = url.contains(":memory:") || url.contains("mode=memory");
         let (opts, max) = if memory {
             (opts, 1)
@@ -1083,4 +1100,29 @@ async fn put_rows(conn: &mut SqliteConnection, rows: &[DerivedRow]) -> Result<()
         .map_err(storage)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod url_tests {
+    use super::sqlite_url;
+
+    #[test]
+    fn drive_letters_after_the_third_slash_are_paths() {
+        assert_eq!(
+            sqlite_url("sqlite:///C:/leep/meta.db?mode=rwc"),
+            "sqlite://C:/leep/meta.db?mode=rwc"
+        );
+        assert_eq!(
+            sqlite_url(r"sqlite:///d:\leep\meta.db"),
+            r"sqlite://d:\leep\meta.db"
+        );
+        for same in [
+            "sqlite:///var/lib/leep/meta.db?mode=rwc",
+            "sqlite://C:/leep/meta.db",
+            "sqlite::memory:",
+            "sqlite:///c",
+        ] {
+            assert_eq!(sqlite_url(same), same);
+        }
+    }
 }

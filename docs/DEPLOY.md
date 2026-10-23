@@ -539,6 +539,13 @@ every variable with its default (a test keeps it in step with the flags).
 | `LEEP_LISTEN` | `0.0.0.0:7070` | Listen address. |
 | `LEEP_META` | `sqlite:///var/lib/leep/meta.db?mode=rwc` | Metadata store: `sqlite:`, `postgres://`, `mem://`. |
 | `LEEP_BLOBS` | `file:///var/lib/leep/blobs` | Blob store: `file://`, `s3://bucket?endpoint=URL&region=R&allow_http=true`, `mem://`. |
+
+On Windows, write the drive letter after the third slash as in any `file://`
+URL: `LEEP_META=sqlite:///C:/leep/data/meta.db?mode=rwc` and
+`LEEP_BLOBS=file:///C:/leep/data/blobs` (`file://C:/...` is accepted too).
+A Windows working copy cannot store the executable bit, so `leep` keeps
+each file's stored kind there and never reports an executable-bit change
+from Windows, as git does with `core.filemode=false`.
 | `LEEP_TOKENS_FILE` | none | Tokens file; enables authentication. |
 | `LEEP_INSECURE_NO_AUTH` | off | `1` lets the server run without a tokens file on a non-loopback address (the image's default listen address). Only for a port published on loopback or behind a proxy that authenticates. |
 | `LEEP_SIGNING_KEYS_FILE` | none | Trusted author keys file; enables signature submission. |

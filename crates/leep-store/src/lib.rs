@@ -37,11 +37,21 @@ fn storage_err(e: impl std::fmt::Display) -> Error {
     Error::Storage(e.to_string())
 }
 
+/// The path a `file://` URL names, after the scheme. A Windows drive
+/// letter may follow the third slash (`file:///C:/x`, RFC 8089) or stand
+/// where a host would (`file://C:/x`, as people type it); `/C:/x` is no
+/// path on Windows, so the slash before a drive letter is dropped.
+pub fn file_url_path(rest: &str) -> PathBuf {
+    let b = rest.as_bytes();
+    let drive = b.len() >= 3 && b[0] == b'/' && b[1].is_ascii_alphabetic() && b[2] == b':';
+    PathBuf::from(if drive { &rest[1..] } else { rest })
+}
+
 /// The directory of a filesystem blob store URL (`file:///abs/path` or a
 /// bare path), `None` for any other kind.
 pub fn fs_blob_root(url: &str) -> Option<PathBuf> {
     if let Some(rest) = url.strip_prefix("file://") {
-        return Some(PathBuf::from(rest));
+        return Some(file_url_path(rest));
     }
     (!url.contains("://") && url != "mem:").then(|| PathBuf::from(url))
 }
@@ -80,7 +90,7 @@ pub fn open_blob_store(url: &str) -> Result<Arc<dyn BlobStore>> {
         return Ok(Arc::new(MemoryBlobStore::new()));
     }
     if let Some(rest) = url.strip_prefix("file://") {
-        return Ok(Arc::new(FsBlobStore::new(PathBuf::from(rest))));
+        return Ok(Arc::new(FsBlobStore::new(file_url_path(rest))));
     }
     if let Some(store) = open_object_blob_store(url)? {
         return Ok(Arc::new(store));
@@ -131,6 +141,20 @@ mod tests {
         assert!(open_blob_store("ftp://x").is_err());
         assert!(open_blob_store("s3://b?bogus=1").is_err());
         assert_eq!(fs_blob_root(&format!("file://{p}")).unwrap(), dir.path());
+        // Windows drive letters, in both spellings; a Unix path is untouched.
+        assert_eq!(
+            fs_blob_root("file:///C:/leep/blobs").unwrap(),
+            PathBuf::from("C:/leep/blobs")
+        );
+        assert_eq!(
+            fs_blob_root("file://C:/leep/blobs").unwrap(),
+            PathBuf::from("C:/leep/blobs")
+        );
+        assert_eq!(
+            fs_blob_root("file:///var/lib/leep").unwrap(),
+            PathBuf::from("/var/lib/leep")
+        );
+        assert_eq!(fs_blob_root("file:///c").unwrap(), PathBuf::from("/c"));
         assert_eq!(fs_blob_root(p).unwrap(), dir.path());
         assert!(fs_blob_root("s3://bucket").is_none());
         assert!(fs_blob_root("mem://").is_none());
