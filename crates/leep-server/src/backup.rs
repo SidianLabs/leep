@@ -300,9 +300,7 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
     drop(f);
     std::fs::rename(&tmp, path).map_err(storage)?;
     if let Some(dir) = path.parent() {
-        std::fs::File::open(dir)
-            .and_then(|d| d.sync_all())
-            .map_err(storage)?;
+        leep_core::fsync::sync_dir(dir).map_err(storage)?;
     }
     Ok(())
 }
