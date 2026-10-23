@@ -1706,8 +1706,8 @@ pile up and reach git in one push once the cause is fixed.
 ## LeepMirrorStuck
 
 **Meaning.** For 15 minutes a mirrored ref has been in a state only a
-person can clear: `diverged`, `rewound`, `remote-ahead`, `refused` or
-`deleted-in-leep`. **Ticket.**
+person can clear: `diverged`, `rewound`, `remote-ahead`, `refused`,
+`deleted-in-leep` or `deleted-on-remote`. **Ticket.**
 
 **Impact.** That ref is not mirrored in either direction. The other refs
 are unaffected. Nothing is lost: each side keeps its own commits, and the
@@ -1739,11 +1739,29 @@ has the table.
    itself and reports only conflicts (ADR 0049). With that mode on, the
    detail says why this one was not merged: the conflicting paths, a land
    policy refusal of the merge, or a remote tip Leep moved back from.
+   On a git-primary ref (`--ref main@git` or `--primary git`, ADR 0062)
+   the mirror replays Leep's unpushed lands onto the remote's commits
+   instead, and `diverged` means the replay could not happen: the detail
+   starts with `not replayed` and names the conflicting paths, or quotes
+   the server's refusal (a ref under `--protect-ref` cannot be
+   git-primary: protect the branch on the remote instead). The fix is the
+   same merge in git; agents keep landing meanwhile and the replay picks
+   up every land once the merge is pushed. `leep_mirror_replays_total`
+   counts replays by result.
+   For a two-way prefix ref (`--ref-prefix` with `--import`), `diverged`
+   means a person's commits on the branch conflict with an agent's rewrite
+   of the ref. One side merges the other's work: the person rebases onto
+   the branch the mirror last pushed and pushes, or the agent takes the
+   person's changes and lands them, after which the person deletes or
+   resets the branch.
 2. **`rewound`**: someone ran `leep undo` (or a raw ref CAS) on a mirrored
    ref, so Leep is behind the remote. Either land a revert in Leep, which
    the mirror pushes as a fast-forward, or undo the undo (`leep undo`
    again). For a scratch branch where rewinding is normal, restart the
-   mirror with `--allow-rewind NAME`.
+   mirror with `--allow-rewind NAME`. A git-primary ref never gets here:
+   its undo is moved forward again to the remote's tip within a cycle
+   (`restored`, a healthy state, counted in `leep_mirror_restores_total`),
+   so revert on the remote instead.
 3. **`refused`**: a push from git did not pass Leep's land policy. The
    detail quotes the server, for example `changeset X is not signed by a
    trusted key` or `needs review`. Approve the changesets with `leep review`
@@ -1767,6 +1785,14 @@ has the table.
 5. **`deleted-in-leep`**: the Leep ref was deleted. Delete the remote branch
    if that was intended (`git push origin :refs/heads/NAME`), or recreate
    the Leep ref. Remove the `--ref` if the branch is no longer mirrored.
+6. **`deleted-on-remote`**: the branch of a two-way prefix ref was deleted
+   on the remote (a closed pull request) while the ref's work is landed on
+   no mirrored `--ref`, so the mirror kept the Leep ref and will not push
+   the branch again until the ref moves. If the work is wanted, land it
+   (`leep land`), and the mirror then deletes the ref itself; if not,
+   delete the ref in Leep (`leep branch -D review/x`). Had the work been
+   landed, the mirror would have deleted the ref on its own
+   (`leep_mirror_refs_deleted_total`).
 
 **What not to do.** Do not force-push the remote's branch to match Leep, and
 do not move the Leep ref to match the remote with a raw CAS. Both discard

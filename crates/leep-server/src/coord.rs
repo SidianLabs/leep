@@ -329,6 +329,8 @@ pub struct HttpForward {
     pub authorization: Option<HeaderValue>,
     /// The client request's id, so the holder logs the land under it too.
     pub request_id: Option<HeaderValue>,
+    /// Where on the holder: `v1/land`, or a ref's `rebase-onto`.
+    pub path: String,
 }
 
 impl HttpForward {
@@ -338,7 +340,14 @@ impl HttpForward {
             body,
             authorization: headers.get(header::AUTHORIZATION).cloned(),
             request_id: headers.get(leep_core::api::REQUEST_ID_HEADER).cloned(),
+            path: "v1/land".into(),
         }
+    }
+
+    /// The same forward to `path` (relative, as `v1/land`).
+    pub fn to(mut self, path: impl Into<String>) -> Self {
+        self.path = path.into();
+        self
     }
 }
 
@@ -352,7 +361,7 @@ impl LandForward<Relayed> for HttpForward {
                 return Forwarded::failed("not_allowed", why);
             }
         };
-        let url = match url.join("v1/land") {
+        let url = match url.join(&self.path) {
             Ok(u) => u,
             Err(e) => return Forwarded::failed("not_allowed", e.to_string()),
         };

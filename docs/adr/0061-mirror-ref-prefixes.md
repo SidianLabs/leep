@@ -1,5 +1,5 @@
 # 0061. The git mirror follows refs under a prefix, push-only
-Status: Accepted
+Status: Accepted; extended by (proposed) [0062](0062-git-primary-refs.md), which makes prefix refs two-way
 Date: 2026-10-22
 
 ## Context

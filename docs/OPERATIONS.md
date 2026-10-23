@@ -598,9 +598,15 @@ server and lands it. With `--land-branches`, people push to
 agent's land ([ADR 0049](adr/0049-mirror-merges-and-land-branches.md)). With
 `--ref-prefix review/`, every Leep ref under `review/` is pushed to the
 branch of the same name as it appears, and its branch is deleted when the
-Leep ref is ([ADR 0061](adr/0061-mirror-ref-prefixes.md)). It never resolves
-a conflict itself. The only branches it force-pushes are those of prefix
-refs, and only with a lease on a tip the Leep ref held.
+Leep ref is ([ADR 0061](adr/0061-mirror-ref-prefixes.md)); with `--import`
+as well, a person's commits on such a branch are imported and landed on the
+Leep ref. With `--primary git` (or `@git` on one `--ref`), the remote is
+that ref's source of truth: when both sides moved, Leep's unpushed lands are
+replayed onto the remote's commits and the remote only fast-forwards, and a
+Leep undo is moved forward again ([ADR 0062](adr/0062-git-primary-refs.md)).
+It never resolves a conflict itself. The only branches it force-pushes are
+those of prefix refs, and only with a lease on a tip the Leep ref held or
+the mirror imported.
 
 The mirror is a separate process. It talks to `leep-server` over the HTTP
 API with a token, and to the remote with the system `git` (2.30 or later).
@@ -659,10 +665,11 @@ leep-git mirror run \
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--ref NAME[:GIT_REF]` | – | Mirror a Leep ref, repeatable. `NAME` maps to `refs/heads/NAME`, `tags/T` to `refs/tags/T`. |
+| `--ref NAME[:GIT_REF][@git\|@leep]` | – | Mirror a Leep ref, repeatable. `NAME` maps to `refs/heads/NAME`, `tags/T` to `refs/tags/T`. `@git` or `@leep` names the ref's source of truth; without it, `--primary` decides. |
+| `--primary` | `leep` | Which side wins a race on a `--ref` that does not say. `leep`: ADR 0046's rules (both moved: `diverged`; an undo: `rewound`). `git`: the remote's commits are imported and Leep's unpushed lands replayed onto them by `POST /v1/refs/{name}/rebase-onto`; an undo is `restored` to the remote's tip. Needs `--import`. Tags are never git-primary, and a git-primary ref cannot be in `--allow-rewind` or under the server's `--protect-ref`. |
 | `--tags` | off | Also mirror every Leep tag. Tags are created, never moved. |
-| `--ref-prefix PREFIX` | – | Also mirror every Leep ref under `PREFIX` (such as `review/`) to the branch of the same name, as refs appear and go. Repeatable. Push-only; see "Prefix refs" below. Must end in `/` and not overlap `--diverged-prefix`, `--land-prefix`, another prefix or any `--ref`. |
-| `--import` | off | Land fast-forward pushes from the remote in Leep, through the land policy. |
+| `--ref-prefix PREFIX` | – | Also mirror every Leep ref under `PREFIX` (such as `review/`) to the branch of the same name, as refs appear and go. Repeatable. Push-only without `--import`, two-way with it; see "Prefix refs" below. Must end in `/` and not overlap `--diverged-prefix`, `--land-prefix`, another prefix or any `--ref`. |
+| `--import` | off | Land fast-forward pushes from the remote in Leep, through the land policy. Also makes prefix refs two-way. |
 | `--interval` | `1s` | How often to check the ref log for moves. |
 | `--git-poll` | `15s` | How often to `ls-remote` the remote. `POST /poke` polls at once. |
 | `--reconcile` | `60s` | Re-read every Leep ref even if the ref log is quiet. |
@@ -703,11 +710,13 @@ when there is no status file.
 |---|---|---|
 | `in-sync` | The remote ref is the export of the Leep ref. | Nothing. |
 | `pending` | One side moved and the mirror is catching up, or retrying after the remote moved under a push. | Nothing, unless the lag keeps growing ([LeepMirrorLagging](RUNBOOKS.md#leepmirrorlagging)). |
-| `diverged` | Both sides have commits the other lacks. Leep's side is on `leep-diverged/<branch>`. With `--on-divergence merge` the detail says why the mirror did not merge: the conflicting paths, a land policy refusal, or a remote tip Leep moved back from. | In git, merge `origin/leep-diverged/<branch>` into the branch and push. The mirror lands the merge and deletes the diverged branch. |
-| `rewound` | Leep moved the ref back (an undo). The remote keeps the newer commits. | Land a revert in Leep (the usual fix), or, for a scratch branch, allow it with `--allow-rewind`. |
-| `remote-ahead` | The remote has commits Leep lacks and `--import` is off. For a prefix ref: someone pushed to its branch, before or after the Leep ref was deleted. | Enable `--import`, or remove the commits from the remote. For a prefix ref, land the work in Leep, then delete the branch. |
-| `refused` | Leep's land policy refused a push from git (unsigned, unreviewed, OWNERS). The detail quotes the server. | Approve the changesets with `leep review`, or revert the push in git. Checked again every minute. |
+| `diverged` | Both sides have commits the other lacks. Leep's side is on `leep-diverged/<branch>`. With `--on-divergence merge` the detail says why the mirror did not merge: the conflicting paths, a land policy refusal, or a remote tip Leep moved back from. On a git-primary ref the detail says why Leep's lands were not replayed: the conflicting paths, or the server's refusal. For a two-way prefix ref: a person's commits on the branch conflict with an agent's rewrite of the ref. | In git, merge `origin/leep-diverged/<branch>` into the branch and push. The mirror lands the merge and deletes the diverged branch. For a prefix ref, one side takes the other's changes: the person rebases and pushes, or the agent lands them and the person resets the branch. |
+| `rewound` | Leep moved the ref back (an undo). The remote keeps the newer commits. | Land a revert in Leep (the usual fix), or, for a scratch branch, allow it with `--allow-rewind`. A git-primary ref is `restored` instead. |
+| `restored` | A git-primary ref Leep moved back was moved forward again to the remote's tip. Clears on the next cycle. | Nothing. To move such a ref back, revert on the remote. |
+| `remote-ahead` | The remote has commits Leep lacks and `--import` is off. For a prefix ref without `--import`: someone pushed to its branch, before or after the Leep ref was deleted. | Enable `--import`, or remove the commits from the remote. For a prefix ref, land the work in Leep, then delete the branch, or turn on `--import` so such pushes are imported. |
+| `refused` | Leep's land policy refused a push from git (unsigned, unreviewed, OWNERS), or refused a git-primary replay (a ref under `--protect-ref`). The detail quotes the server. | Approve the changesets with `leep review`, or revert the push in git. For a protected git-primary ref, protect the branch on the remote and drop `--protect-ref` for it. Checked again every minute. |
 | `deleted-in-leep` | The Leep ref of a `--ref` is gone. The remote branch is left alone. (A prefix ref's branch is deleted instead.) | Delete the remote branch by hand if that is intended. |
+| `deleted-on-remote` | The branch of a two-way prefix ref was deleted on the remote while its work is landed on no mirrored `--ref`. The Leep ref is kept and the branch is not pushed again until the ref moves. (Had the work been landed, the Leep ref would have been deleted too.) | Land the work, after which the mirror deletes the ref, or delete the ref in Leep. |
 | `error` | The last attempt failed: server, remote, credentials, or the remote rejecting pushes. Retried with backoff. | Read the detail and the log ([LeepMirrorLagging](RUNBOOKS.md#leepmirrorlagging)). |
 
 ### Mirror metrics
@@ -722,6 +731,9 @@ when there is no status file.
 | `leep_mirror_imports_total` | counter | `ref`, `result` = `landed`, `refused`, `lost_race` | Remote pushes the mirror tried to land in Leep. |
 | `leep_mirror_divergences_total` | counter | `ref` | Times the ref entered `diverged`. A steady rate means people push to a ref agents land on all the time. With `--on-divergence merge` only divergences the mirror could not merge count. |
 | `leep_mirror_merges_total` | counter | `ref`, `result` = `landed`, `conflicts`, `refused`, `lost_race` | The mirror's automatic merges (`--on-divergence merge`). `conflicts` and `refused` fall back to `diverged`. |
+| `leep_mirror_replays_total` | counter | `ref`, `result` = `ok`, `conflicts`, `refused`, `stale_base` | Replays of a git-primary ref's unpushed lands onto the remote's commits. `conflicts` and `refused` fall back to `diverged`; `stale_base` means a side moved during the import and the pair was read again. |
+| `leep_mirror_restores_total` | counter | `ref` | Times a git-primary ref Leep moved back was moved forward again to the remote's tip. |
+| `leep_mirror_refs_deleted_total` | counter | none | Two-way prefix refs deleted in Leep after their branch was deleted on the remote with the work landed. |
 | `leep_mirror_land_branches_total` | counter | `ref`, `result` = `landed`, `conflicts`, `refused` | Land branches tried, counted once per pushed commit. |
 | `leep_mirror_land_branches_failing` | gauge | `ref` | Land branches left on the remote because they conflict or were refused (`ref=""` for a name that matches no mirrored ref). |
 | `leep_mirror_branches_deleted_total` | counter | none | Branches under a `--ref-prefix` deleted because their Leep ref was deleted. |
@@ -743,14 +755,29 @@ branch of that name appears on the remote, ready for a pull request.
 
 - **Found as they appear.** Each read of Leep's refs adds new ones; the
   status lists them with `"ref_prefix": "review/"`.
-- **Push-only.** A prefix ref is never imported, merged, or landed onto by a
-  land branch, whatever `--import`, `--on-divergence` and `--land-branches`
-  say. A push to its branch is reported as `remote-ahead` (or `diverged` if
-  Leep moved too) and left there.
+- **Push-only without `--import`.** A push to the branch is reported as
+  `remote-ahead` (or `diverged` if Leep moved too) and left there. Prefix
+  refs are never merged (`--on-divergence`) or landed onto by a land branch
+  either way.
+- **Two-way with `--import`** ([ADR 0062](adr/0062-git-primary-refs.md)).
+  A person's commits on top of the branch are imported and the Leep ref
+  moves forward to them, through the ref's land policy. When an agent
+  rebased or squashed the ref as well, the person's commits are imported and
+  landed onto the new ref with `POST /v1/land` (the server replays them,
+  as it does a land branch), and the branch is pushed with a lease on the
+  exact tip imported, so the person's commits get new ids there, as a
+  rebase of a pull request gives them. A conflict is reported as
+  `diverged` and nothing moves. A branch deleted on the remote deletes the
+  Leep ref too when the ref's tip, or a rebased copy of it, is in a
+  mirrored `--ref`'s history (a merged pull request); otherwise the ref is
+  kept and reported as `deleted-on-remote`, and the branch is not pushed
+  again until the ref moves. A branch deleted while the mirror was down
+  is pushed again on its next start: the mirror cannot tell that from a
+  branch it never pushed, and never drops work to guess.
 - **Rewrites.** When an agent rebases or squashes its review ref, the mirror
   pushes the new value with `--force-with-lease` on the old one, but only
   if the Leep ref held the remote's tip (checked in the ref log). Otherwise
-  it reports, as above.
+  it reports, or with `--import` imports, as above.
 - **Deletes.** When the Leep ref is deleted, the mirror deletes the branch
   with a lease on that same tip, under the same check, and stops tracking
   it. This is healthy: the deletion is listed under `deleted_branches` in

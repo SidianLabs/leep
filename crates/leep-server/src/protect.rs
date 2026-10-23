@@ -31,6 +31,10 @@ impl LandPolicy for ProtectOnly {
         self.refs.contains(target_ref)
     }
 
+    fn protects(&self, target_ref: &str) -> bool {
+        self.applies_to(target_ref)
+    }
+
     async fn check_land(
         &self,
         _repo: &Repo,

@@ -297,11 +297,11 @@ groups:
       summary: "A mirrored ref has differed between Leep and git for over 10 minutes while the mirror retries: the remote, its credentials or the server is failing."
       runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepmirrorlagging
   - alert: LeepMirrorStuck
-    expr: max by (instance, ref) (leep_mirror_ref_state{state=~"diverged|rewound|remote-ahead|refused|deleted-in-leep"}) == 1
+    expr: max by (instance, ref) (leep_mirror_ref_state{state=~"diverged|rewound|remote-ahead|refused|deleted-in-leep|deleted-on-remote"}) == 1
     for: 15m
     labels: {severity: ticket}
     annotations:
-      summary: "A mirrored ref needs a person: it diverged, was rewound in Leep, was refused by the land policy, or the remote is ahead."
+      summary: "A mirrored ref needs a person: it diverged, was rewound in Leep, was refused by the land policy, the remote is ahead, or its branch was deleted on the remote with the work landed nowhere."
       runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepmirrorstuck
   - alert: LeepMirrorLandBranchFailing
     # Land branches (--land-branches) that conflict or were refused; the
