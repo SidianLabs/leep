@@ -100,6 +100,9 @@ impl Mirror {
             .unwrap();
         let err = out.try_clone().unwrap();
         let listen = format!("127.0.0.1:{}", free_port());
+        // A restarted mirror writes its own status on its first cycle; until
+        // then readers must not mistake the previous process's file for it.
+        let _ = fs::remove_file(work.join("status.json"));
         let mut cmd = Command::new(bin("leep-git"));
         match crash_at {
             Some(p) => cmd.env("LEEP_MIRROR_CRASH_AT", p),
@@ -237,6 +240,22 @@ fn changeset(server: &Server, id: &str) -> serde_json::Value {
     assert_eq!(code, 200, "{body}");
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
     v["changeset"].clone()
+}
+
+/// Is `ancestor` on the first-parent chain of `tip`? Test histories are
+/// short, so the walk is bounded rather than indexed.
+fn first_parent_has(server: &Server, tip: &str, ancestor: &str) -> bool {
+    let mut cur = tip.to_string();
+    for _ in 0..64 {
+        if cur == ancestor {
+            return true;
+        }
+        match changeset(server, &cur)["parents"][0].as_str() {
+            Some(p) => cur = p.to_string(),
+            None => return false,
+        }
+    }
+    false
 }
 
 /// Move a Leep ref by compare-and-swap, as an agent rewriting its own
@@ -1889,7 +1908,11 @@ fn a_persons_push_to_a_review_branch_lands_on_an_agent_squash_across_crashes() {
             Some(msg.as_str()),
             "{cs}"
         );
-        assert_eq!(cs["parents"], serde_json::json!([squash]), "{cs}");
+        // The server replays the person's whole unlanded stack onto the
+        // squash, the agent's original commits included (as copies whose
+        // changes the squash already has), so the squash is an ancestor of
+        // the person's copy, not necessarily its parent.
+        assert!(first_parent_has(&server, &tip, &squash), "{cs}");
         assert!(cs["extra"]["leep.rebased_from"].is_string(), "{cs}");
         assert_landed_once_on(&client, &agent.wc, &name, &msg);
         // The agent's squashed commits are gone from the branch: only the
@@ -1899,10 +1922,13 @@ fn a_persons_push_to_a_review_branch_lands_on_an_agent_squash_across_crashes() {
             &["log", "--format=%s", &format!("{main_remote}..{name}")],
         );
         let squashed = format!("{point}: squashed");
+        let lines: Vec<&str> = subjects.lines().collect();
+        assert_eq!(lines.first().copied(), Some(msg.as_str()), "{subjects}");
+        assert_eq!(lines.last().copied(), Some(squashed.as_str()), "{subjects}");
         assert_eq!(
-            subjects.lines().collect::<Vec<_>>(),
-            [msg.as_str(), squashed.as_str()],
-            "{subjects}"
+            lines.iter().filter(|l| **l == msg).count(),
+            1,
+            "the person's commit once: {subjects}"
         );
         assert_eq!(
             git(&remote, &["show", &format!("{name}:{point}/person.txt")]),
