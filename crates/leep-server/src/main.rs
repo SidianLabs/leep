@@ -1104,19 +1104,52 @@ fn run_command(cmd: Cmd) -> anyhow::Result<()> {
 
 /// Create the parent directory a local `sqlite:` or `file://` URL points into.
 fn ensure_local_dirs(meta: &str, blobs: &str) -> anyhow::Result<()> {
-    if let Some(rest) = blobs.strip_prefix("file://") {
-        std::fs::create_dir_all(rest).with_context(|| format!("creating {rest}"))?;
+    if blobs.starts_with("file://") {
+        if let Some(dir) = leep_store::fs_blob_root(blobs) {
+            std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        }
     }
     if let Some(rest) = meta.strip_prefix("sqlite:") {
         let path = rest.trim_start_matches("//");
         let path = path.split('?').next().unwrap_or(path);
-        if path != ":memory:" && !path.is_empty() {
-            if let Some(dir) = std::path::Path::new(path).parent() {
+        // `sqlite:///C:/x` names `C:/x`, as `file:///C:/x` does.
+        let path = leep_store::file_url_path(path);
+        if path.as_os_str() != ":memory:" && !path.as_os_str().is_empty() {
+            if let Some(dir) = path.parent() {
                 std::fs::create_dir_all(dir).with_context(|| format!("creating {dir:?}"))?;
             }
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod local_dirs_tests {
+    use super::ensure_local_dirs;
+
+    /// Drive-letter URLs name the same directories as their plain forms.
+    #[test]
+    fn drive_letter_urls_create_the_right_directories() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().to_string_lossy().replace('\\', "/");
+        // Both spellings of a drive letter are accepted; a Unix path has
+        // no drive letter and is passed through unchanged.
+        let (meta, blobs) = if root.as_bytes().get(1) == Some(&b':') {
+            (
+                format!("sqlite:///{root}/a/meta.db?mode=rwc"),
+                format!("file:///{root}/b/blobs"),
+            )
+        } else {
+            (
+                format!("sqlite://{root}/a/meta.db?mode=rwc"),
+                format!("file://{root}/b/blobs"),
+            )
+        };
+        ensure_local_dirs(&meta, &blobs).unwrap();
+        assert!(d.path().join("a").is_dir());
+        assert!(d.path().join("b").join("blobs").is_dir());
+        ensure_local_dirs("sqlite::memory:", "mem://").unwrap();
+    }
 }
 
 /// Install the global Prometheus recorder; returns the `/metrics` app.

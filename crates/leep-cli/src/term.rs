@@ -3,7 +3,9 @@
 //! stdout is a terminal); JSON output is never coloured or paged. Plain ANSI
 //! escapes and `std::io::IsTerminal`, so no dependency is needed.
 
-use std::io::{IsTerminal, Write};
+use std::io::IsTerminal;
+#[cfg(unix)]
+use std::io::Write;
 use std::sync::OnceLock;
 
 /// `--color`.

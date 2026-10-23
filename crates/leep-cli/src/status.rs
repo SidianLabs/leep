@@ -170,9 +170,26 @@ fn is_executable(md: &Metadata) -> bool {
     md.permissions().mode() & 0o111 != 0
 }
 
+/// The kind of a plain file on disk. The exec bit decides.
+#[cfg(unix)]
+fn local_kind(md: &Metadata, _prev: Option<&FileState>) -> FileKind {
+    if is_executable(md) {
+        FileKind::Executable
+    } else {
+        FileKind::Regular
+    }
+}
+
+/// The kind of a plain file on disk where the filesystem keeps no exec bit
+/// (Windows): the stored kind is kept, as git does with
+/// `core.filemode=false`, so a checkout never reports a kind change it could
+/// not have made. A new file is regular; the bit cannot be set from here.
 #[cfg(not(unix))]
-fn is_executable(_: &Metadata) -> bool {
-    false
+fn local_kind(_md: &Metadata, prev: Option<&FileState>) -> FileKind {
+    match prev {
+        Some(p) if p.kind == FileKind::Executable => FileKind::Executable,
+        _ => FileKind::Regular,
+    }
 }
 
 /// Bytes that represent a file in a blob: contents, or the link target.
@@ -197,11 +214,7 @@ pub fn scan_file(abs: &Path, md: &Metadata, prev: Option<&FileState>) -> Result<
             mtime_ns: mtime,
         });
     }
-    let kind = if is_executable(md) {
-        FileKind::Executable
-    } else {
-        FileKind::Regular
-    };
+    let kind = local_kind(md, prev);
     let content = match prev {
         Some(p) if p.size == md.len() && p.mtime_ns == mtime && p.kind != FileKind::Symlink => {
             p.content
@@ -446,6 +459,39 @@ mod tests {
         let s = status(&wc).unwrap();
         assert_eq!(change_of(&s, "run.sh"), Some(Change::Modified));
         assert_eq!(change_of(&s, "link"), Some(Change::Modified));
+    }
+
+    /// Without an exec bit to read, a tracked executable stays one and a
+    /// new file is regular: no kind change can come from this platform.
+    #[cfg(not(unix))]
+    #[test]
+    fn without_an_exec_bit_the_stored_kind_is_kept() {
+        let d = tempfile::tempdir().unwrap();
+        write(d.path(), "run.sh", "#!/bin/sh\n");
+        let p = d.path().join("run.sh");
+        let md = fs::metadata(&p).unwrap();
+        let stored = FileState {
+            content: Hash::of_blob(b"other"),
+            kind: FileKind::Executable,
+            size: 1,
+            mtime_ns: 0,
+        };
+        let s = scan_file(&p, &md, Some(&stored)).unwrap();
+        assert_eq!(s.kind, FileKind::Executable);
+        assert_eq!(
+            s.content,
+            Hash::of_blob(b"#!/bin/sh\n"),
+            "content is rehashed"
+        );
+        assert_eq!(scan_file(&p, &md, None).unwrap().kind, FileKind::Regular);
+        let regular = FileState {
+            kind: FileKind::Regular,
+            ..stored
+        };
+        assert_eq!(
+            scan_file(&p, &md, Some(&regular)).unwrap().kind,
+            FileKind::Regular
+        );
     }
 
     fn renames_of(wc: &WorkCopy, old: &BTreeMap<Hash, Vec<u8>>) -> Vec<(String, String, u8)> {
