@@ -38,6 +38,14 @@ pub trait LandPolicy: Send + Sync + 'static {
         false
     }
 
+    /// Whether `target_ref` is protected for its own sake (`--protect-ref`),
+    /// not only as the ref a check covers. `rebase-onto` refuses such refs:
+    /// it rewrites the ref, which protection exists to forbid (ADR 0062).
+    fn protects(&self, target_ref: &str) -> bool {
+        let _ = target_ref;
+        false
+    }
+
     /// Called before `land` moves `target_ref`, which is at `head`.
     /// `new_history` lists the changesets the ref would gain that the caller
     /// submitted (never the server-made rebased copies), nearest to the tip
@@ -69,6 +77,10 @@ impl LandPolicy for PolicySet {
 
     fn depends_on_head(&self) -> bool {
         self.0.iter().any(|p| p.depends_on_head())
+    }
+
+    fn protects(&self, target_ref: &str) -> bool {
+        self.0.iter().any(|p| p.protects(target_ref))
     }
 
     async fn check_land(

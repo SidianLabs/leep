@@ -60,6 +60,8 @@ mod page_tests;
 #[cfg(test)]
 mod path_page_tests;
 #[cfg(test)]
+mod rebase_onto_tests;
+#[cfg(test)]
 mod tests;
 
 /// The comment lexer, public only so the fuzz harness can check it directly.
@@ -67,7 +69,7 @@ mod tests;
 pub use comments::strip_comments;
 pub use cursor::MAX_CURSOR_CHARS;
 pub use history::{ExtraMatch, LogFilter, LogPage, LogParams};
-pub use land::MAX_BATCH_LIFETIME;
+pub use land::{GIT_MIRROR_OPERATION, MAX_BATCH_LIFETIME};
 pub use repo::{
     default_derive_jobs, PrefixMatch, Repo, DEFAULT_CACHE_BYTES, MAX_DEFAULT_DERIVE_JOBS,
     MAX_PREFIX_CANDIDATES,
