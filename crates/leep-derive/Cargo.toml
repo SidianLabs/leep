@@ -23,7 +23,7 @@ tokio.workspace = true
 tracing.workspace = true
 metrics.workspace = true
 diffy = "0.5"
-similar = "2"
+similar = "3"
 
 [dev-dependencies]
 leep-testkit.workspace = true
