@@ -22,7 +22,9 @@ use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
 use leep_core::{Error, Hash, Result};
 use object_store::path::Path;
-use object_store::{ObjectStore, PutMode, PutPayload, PutResult, UpdateVersion, WriteMultipart};
+use object_store::{
+    ObjectStore, ObjectStoreExt, PutMode, PutPayload, PutResult, UpdateVersion, WriteMultipart,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::task::JoinHandle;
 
@@ -202,7 +204,7 @@ impl Lease {
             {
                 Ok(r) => return Ok(Lease::start(store, token, version_of(r))),
                 Err(object_store::Error::AlreadyExists { .. }) => {}
-                Err(object_store::Error::NotImplemented) => {
+                Err(object_store::Error::NotImplemented { .. }) => {
                     return Err(Error::Storage(
                         "this object store does not support conditional writes \
                          (If-None-Match), which the repack lease needs"
@@ -241,7 +243,7 @@ impl Lease {
                 }
                 // Backends without conditional updates (the local filesystem
                 // one): delete the expired lease and race to create it again.
-                Err(object_store::Error::NotImplemented) => {
+                Err(object_store::Error::NotImplemented { .. }) => {
                     delete_all(&*store, vec![key.clone()]).await?;
                 }
                 Err(e) => return Err(storage_err(e)),
@@ -318,7 +320,7 @@ impl LeaseInner {
                 return Err(lost_lease());
             }
             // Without conditional updates: overwrite only if still ours.
-            Err(object_store::Error::NotImplemented) => {
+            Err(object_store::Error::NotImplemented { .. }) => {
                 if !self.holds().await? {
                     self.lost.store(true, Ordering::SeqCst);
                     return Err(lost_lease());

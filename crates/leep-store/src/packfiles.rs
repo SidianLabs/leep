@@ -13,7 +13,7 @@ use bytes::Bytes;
 use futures::stream::{self, BoxStream, StreamExt, TryStreamExt};
 use leep_core::{Error, Hash, Result};
 use object_store::path::Path as ObjectPath;
-use object_store::ObjectStore;
+use object_store::{ObjectStore, ObjectStoreExt};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::objpacks;
