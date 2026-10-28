@@ -66,6 +66,7 @@ change with a regression test.
 | S-19 | Refs | Medium | Refs no signature or review policy names could be rewound or deleted by any writer, so `main` was unprotected on most servers | Fixed 2026-10-21, `--protect-ref`, ADR 0015 |
 | S-20 | Resource use | Medium | Request bodies were read whole into memory with one 512 MiB cap per request and no bound on bodies in flight; a statement of a timed-out request ran on in Postgres | Fixed 2026-10-21, per-route caps, in-flight budget, statement timeout, ADR 0020 and 0012 |
 | S-21 | Auth | Low | Tokens had no time bound, so a token made for a short-lived agent stayed valid until removed by hand | Fixed 2026-10-21, `expires`, ADR 0007 |
+| S-23 | Review | High | A merge that kept its first parent's version dropped a side parent's change without review; an empty merge with an old first parent could rewind a reviewed ref | Fixed 2026-10-28, ADR 0011 |
 | S-22 | Review | Medium | Every write token was a reviewer, so one agent could approve another's change, or its own on unowned paths | Fixed 2026-10-21, `"review": false`, ADR 0011 |
 
 ### S-01: merge-parent laundering (High, fixed)
@@ -87,6 +88,22 @@ have no base, so a side can only bring in paths the first parent lacks. Clean
 merges made by the server are unaffected. Tests:
 `merge_parent_does_not_cover_discarding_the_first_parents_change` (derive) and
 `a_merge_cannot_launder_an_old_version_back_without_review` (server).
+
+### S-23: changes a merge drops (High, fixed 2026-10-28)
+
+A merge is judged on its changes relative to its first parent. A path where
+it keeps the first parent's version is not among them, even when a side
+parent changed it since their merge base, so the side's change is dropped
+with nothing judged. `merge(old, head)` with no changes is a fast-forward of
+the ref (the head is a parent), passes the forward-only check, and has the
+tree of `old`: a writer could undo every reviewed change since `old` in one
+land. The same hole let a `leep merge main` on a branch keep the branch's
+version of a file `main` had fixed.
+
+*Fix.* Paths a merge drops from a side are judged as well, with no auto rule
+or `merge_parent` cover, so an owner must approve. Tests:
+`a_merge_that_drops_a_sides_change_needs_review` (derive) and
+`a_merge_with_an_old_first_parent_cannot_rewind_main_without_review` (server).
 
 ### S-02: checkout writes outside the working copy (High, fixed)
 
