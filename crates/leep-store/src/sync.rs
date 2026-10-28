@@ -234,6 +234,22 @@ pub async fn sync_blobs(
     Ok(report)
 }
 
+/// What a pack copy is for, which decides what happens to tombstones.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PackSyncMode {
+    /// Into a backup pool, the union of every sealed snapshot. The pool only
+    /// grows: the source's tombstones are not copied, since an older
+    /// snapshot may still name an object the source has since deleted (the
+    /// changeset sweep, ADR 0059, issue #155). Pool packs a source repack
+    /// merged away are pruned when other pool packs hold every object they
+    /// hold.
+    Pool,
+    /// Into a store being restored. The source's tombstones of the packs
+    /// the destination holds are copied, so the target reads exactly as the
+    /// source (the pool) does. Nothing is pruned.
+    Restore,
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct PackSyncReport {
     /// Packs the source has published.
@@ -248,18 +264,19 @@ pub struct PackSyncReport {
     pub vanished: u64,
     /// Source packs whose bytes do not match their index; not copied.
     pub corrupt: Vec<String>,
-    /// Tombstone lines copied for packs the destination holds.
+    /// Tombstone lines copied for packs the destination holds; always zero
+    /// into a pool.
     pub tombstones_added: u64,
     /// Destination packs the source no longer has, deleted because other
-    /// destination packs hold every live object they did.
+    /// destination packs hold every object they do.
     pub pruned: u64,
 }
 
 /// Copy the packs `src` has published that `dst` lacks, each as its two
-/// files, then the tombstones of the packs `dst` holds. Run it before
-/// [`sync_blobs`]: a destination that reads packs then lists their objects
-/// as present, so only loose objects are copied one by one, and one that
-/// does not still gets every object loose.
+/// files, then (on a restore) the tombstones of the packs `dst` holds. Run
+/// it before [`sync_blobs`]: a destination that reads packs then lists
+/// their objects as present, so only loose objects are copied one by one,
+/// and one that does not still gets every object loose.
 ///
 /// The pack file goes first and the index publishes it, as in a repack, so
 /// an interrupted copy leaves an unpublished pack that the next run writes
@@ -267,15 +284,15 @@ pub struct PackSyncReport {
 /// records while it streams, and the index against its name, so a damaged
 /// source pack is reported and never published in the destination.
 ///
-/// With `prune`, a destination pack the source no longer has (a repack
+/// Into a pool, a destination pack the source no longer has (a repack
 /// merged it into a bigger one) is deleted when the destination's other
-/// packs hold every live object it holds, so a backup pool does not keep
-/// every intermediate pack. Objects are never lost that way; a pack that
-/// holds anything no other pack does stays.
+/// packs hold every object it holds, so a backup pool does not keep every
+/// intermediate pack. Objects are never lost that way; a pack that holds
+/// anything no other pack does stays.
 pub async fn sync_packs(
     src: &dyn PackFiles,
     dst: &dyn PackFiles,
-    prune: bool,
+    mode: PackSyncMode,
 ) -> Result<PackSyncReport> {
     let mut report = PackSyncReport::default();
     let src_ids = src.pack_ids().await?;
@@ -339,6 +356,18 @@ pub async fn sync_packs(
         report.bytes_copied += n + idx_len;
     }
 
+    match mode {
+        PackSyncMode::Restore => report.tombstones_added = copy_tombstones(src, dst).await?,
+        PackSyncMode::Pool => {
+            let source: HashSet<&String> = src_ids.iter().collect();
+            report.pruned = prune_superseded(dst, &source).await?;
+        }
+    }
+    Ok(report)
+}
+
+/// Add the source's tombstones of the packs `dst` holds that `dst` lacks.
+async fn copy_tombstones(src: &dyn PackFiles, dst: &dyn PackFiles) -> Result<u64> {
     let held: HashSet<String> = dst.pack_ids().await?.into_iter().collect();
     let theirs = src.tombstones().await?;
     let ours = dst.tombstones().await?;
@@ -355,20 +384,17 @@ pub async fn sync_packs(
         add.extend(new.into_iter().map(|h| (id.clone(), *h)));
     }
     add.sort();
-    report.tombstones_added = add.len() as u64;
     if !add.is_empty() {
         dst.add_tombstones(&add).await?;
     }
-
-    if prune {
-        let source: HashSet<&String> = src_ids.iter().collect();
-        report.pruned = prune_superseded(dst, &source).await?;
-    }
-    Ok(report)
+    Ok(add.len() as u64)
 }
 
-/// Delete destination packs the source no longer has whose every live object
-/// is live in another destination pack. Index first, as a repack does.
+/// Delete destination packs the source no longer has when every object they
+/// hold is in another destination pack, and readable there wherever it is
+/// readable in them. Index first, as a repack does. Tombstones never make
+/// an object prunable: a pool's tombstones (only written before issue #155
+/// was fixed) may hide what an older snapshot needs, and its bytes must stay.
 async fn prune_superseded(dst: &dyn PackFiles, source: &HashSet<&String>) -> Result<u64> {
     let ids = dst.pack_ids().await?;
     if ids.iter().all(|id| source.contains(id)) {
@@ -386,17 +412,18 @@ async fn prune_superseded(dst: &dyn PackFiles, source: &HashSet<&String>) -> Res
     }
     let no_dead = HashSet::new();
     let live = |id: &str, h: &Hash| !dead.get(id).unwrap_or(&no_dead).contains(h);
+    // Another pack keeps `h`'s bytes, and keeps it readable if `id` does.
+    let kept = |i: usize, id: &str, h: &Hash, packs: &[(String, PackIndex)]| {
+        packs
+            .iter()
+            .enumerate()
+            .any(|(j, (oid, o))| j != i && o.find(h).is_some() && (live(oid, h) || !live(id, h)))
+    };
     let mut pruned = 0;
     let mut i = 0;
     while i < packs.len() {
         let (id, index) = &packs[i];
-        let covered = !source.contains(id)
-            && index.hashes().filter(|h| live(id, h)).all(|h| {
-                packs
-                    .iter()
-                    .enumerate()
-                    .any(|(j, (oid, o))| j != i && o.find(&h).is_some() && live(oid, &h))
-            });
+        let covered = !source.contains(id) && index.hashes().all(|h| kept(i, id, &h, &packs));
         if covered {
             dst.delete(&format!("{id}.idx")).await?;
             dst.delete(&format!("{id}.pack")).await?;
@@ -633,38 +660,39 @@ mod tests {
             let (src, hashes) = source(a.path()).await;
             let dst = FsBlobStore::new(b.path());
             let (sp, dp) = (FsPackFiles::new(a.path()), FsPackFiles::new(b.path()));
-            let r = sync_packs(&sp, &dp, true).await.unwrap();
+            let r = sync_packs(&sp, &dp, PackSyncMode::Pool).await.unwrap();
             assert_eq!((r.listed, r.copied, r.present), (2, 2, 0), "{r:?}");
-            assert_eq!(r.tombstones_added, 1, "{r:?}");
+            assert_eq!(r.tombstones_added, 0, "{r:?}");
+            assert!(dp.tombstones().await.unwrap().is_empty());
             assert!(r.corrupt.is_empty());
             let b2 = sync_blobs(&src, &dst, &SyncOptions::default())
                 .await
                 .unwrap();
             assert_eq!(b2.copied, 3, "only the loose objects: {b2:?}");
-            assert_eq!(all(&src).await, all(&dst).await);
-            assert!(
-                dst.get(&hashes[3]).await.unwrap().is_none(),
-                "deleted stays deleted"
-            );
-            for h in hashes.iter().filter(|h| **h != hashes[3]) {
+            assert_eq!(b2.only_in_destination, 1, "{b2:?}");
+            // The pool keeps what the source deleted: an older snapshot may
+            // need it (issue #155).
+            for h in &hashes {
                 assert!(dst.get(h).await.unwrap().is_some());
             }
             // Again: nothing to do.
-            let r = sync_packs(&sp, &dp, true).await.unwrap();
+            let r = sync_packs(&sp, &dp, PackSyncMode::Pool).await.unwrap();
             assert_eq!(
                 (r.copied, r.present, r.tombstones_added),
                 (0, 2, 0),
                 "{r:?}"
             );
 
-            // The source merges its packs; the pool gets the merged pack and
-            // drops the two it supersedes, losing no object.
+            // The source merges its packs and the full repack drops the
+            // deleted object. The pool gets the merged pack and drops the
+            // small pack it covers; the big one still holds the deleted
+            // object, so it stays.
             repack(&src, RepackMode::Full).await;
-            let r = sync_packs(&sp, &dp, true).await.unwrap();
-            assert_eq!((r.copied, r.pruned), (1, 2), "{r:?}");
-            assert_eq!(dp.pack_ids().await.unwrap(), sp.pack_ids().await.unwrap());
+            let r = sync_packs(&sp, &dp, PackSyncMode::Pool).await.unwrap();
+            assert_eq!((r.copied, r.pruned), (1, 1), "{r:?}");
+            assert_eq!(dp.pack_ids().await.unwrap().len(), 2);
             let fresh = FsBlobStore::new(b.path());
-            for h in hashes.iter().filter(|h| **h != hashes[3]) {
+            for h in &hashes {
                 assert!(fresh.get(h).await.unwrap().is_some());
             }
         }
@@ -674,12 +702,12 @@ mod tests {
             let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
             let (src, hashes) = source(a.path()).await;
             let (sp, dp) = (FsPackFiles::new(a.path()), FsPackFiles::new(b.path()));
-            sync_packs(&sp, &dp, true).await.unwrap();
+            sync_packs(&sp, &dp, PackSyncMode::Pool).await.unwrap();
             // GC deletes another packed object; the full repack drops it, so
             // only the pool's old pack still has it.
             src.delete(&hashes[5]).await.unwrap();
             repack(&src, RepackMode::Full).await;
-            let r = sync_packs(&sp, &dp, true).await.unwrap();
+            let r = sync_packs(&sp, &dp, PackSyncMode::Pool).await.unwrap();
             assert_eq!((r.copied, r.pruned), (1, 1), "{r:?}");
             let pool = FsBlobStore::new(b.path());
             assert!(
@@ -688,14 +716,43 @@ mod tests {
             );
         }
 
+        /// A pool written before issue #155 was fixed carries tombstones. A
+        /// tombstoned object never makes a pool pack prunable: its bytes may
+        /// be what an older snapshot needs.
+        #[tokio::test]
+        async fn pool_tombstones_never_make_a_pack_prunable() {
+            let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+            let (src, _) = source(a.path()).await;
+            let (sp, dp) = (FsPackFiles::new(a.path()), FsPackFiles::new(b.path()));
+            sync_packs(&sp, &dp, PackSyncMode::Pool).await.unwrap();
+            // What an old backup did: copy the source's tombstones.
+            let old: Vec<(String, Hash)> = sp
+                .tombstones()
+                .await
+                .unwrap()
+                .into_iter()
+                .flat_map(|(id, hs)| hs.into_iter().map(move |h| (id.clone(), h)))
+                .collect();
+            assert_eq!(old.len(), 1);
+            dp.add_tombstones(&old).await.unwrap();
+            repack(&src, RepackMode::Full).await;
+            let r = sync_packs(&sp, &dp, PackSyncMode::Pool).await.unwrap();
+            assert_eq!((r.copied, r.pruned), (1, 1), "{r:?}");
+            let big = &old[0].0;
+            assert!(
+                dp.pack_ids().await.unwrap().contains(big),
+                "the pack holding the tombstoned object stays"
+            );
+        }
+
         #[tokio::test]
         async fn packs_copy_to_an_object_store_under_packs_keys() {
             let a = tempfile::tempdir().unwrap();
-            let (src, _) = source(a.path()).await;
+            let (src, hashes) = source(a.path()).await;
             let bucket: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
             let dp = ObjectPackFiles::new(bucket.clone());
             let sp = FsPackFiles::new(a.path());
-            let r = sync_packs(&sp, &dp, true).await.unwrap();
+            let r = sync_packs(&sp, &dp, PackSyncMode::Pool).await.unwrap();
             assert_eq!(r.copied, 2, "{r:?}");
             let ids = sp.pack_ids().await.unwrap();
             assert_eq!(dp.pack_ids().await.unwrap(), ids);
@@ -707,25 +764,46 @@ mod tests {
                     assert_eq!(got, want);
                 }
             }
-            assert_eq!(
-                dp.tombstones().await.unwrap(),
-                sp.tombstones().await.unwrap()
-            );
+            assert!(dp.tombstones().await.unwrap().is_empty());
             // The object store reads the packs, so only loose objects follow
-            // one by one, and it lists what the source does.
+            // one by one, and it lists what the source does plus the object
+            // the source deleted.
             let dst = ObjectBlobStore::new(bucket);
             let r = sync_blobs(&src, &dst, &SyncOptions::default())
                 .await
                 .unwrap();
             assert_eq!(r.copied, 3, "{r:?}");
-            assert_eq!(all(&src).await, all(&dst).await);
+            let mut want = all(&src).await;
+            want.push(hashes[3]);
+            want.sort();
+            assert_eq!(all(&dst).await, want);
             // And back: packs restore from the bucket into a fresh store.
             let c = tempfile::tempdir().unwrap();
-            let r = sync_packs(&dp, &FsPackFiles::new(c.path()), false)
+            let r = sync_packs(&dp, &FsPackFiles::new(c.path()), PackSyncMode::Restore)
                 .await
                 .unwrap();
-            assert_eq!((r.copied, r.tombstones_added), (2, 1), "{r:?}");
-            assert_eq!(all(&FsBlobStore::new(c.path())).await.len(), 44);
+            assert_eq!((r.copied, r.tombstones_added), (2, 0), "{r:?}");
+            assert_eq!(all(&FsBlobStore::new(c.path())).await.len(), 45);
+        }
+
+        /// A restore copies the tombstones its source holds, so the target
+        /// reads as the source does.
+        #[tokio::test]
+        async fn a_restore_copies_the_source_tombstones() {
+            let (a, c) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+            let (_, hashes) = source(a.path()).await;
+            let (sp, cp) = (FsPackFiles::new(a.path()), FsPackFiles::new(c.path()));
+            let r = sync_packs(&sp, &cp, PackSyncMode::Restore).await.unwrap();
+            assert_eq!((r.copied, r.tombstones_added, r.pruned), (2, 1, 0), "{r:?}");
+            assert_eq!(
+                cp.tombstones().await.unwrap(),
+                sp.tombstones().await.unwrap()
+            );
+            assert!(FsBlobStore::new(c.path())
+                .get(&hashes[3])
+                .await
+                .unwrap()
+                .is_none());
         }
 
         #[tokio::test]
@@ -740,7 +818,7 @@ mod tests {
             bytes[last] ^= 1;
             std::fs::write(&path, bytes).unwrap();
             let dp = FsPackFiles::new(b.path());
-            let r = sync_packs(&sp, &dp, false).await.unwrap();
+            let r = sync_packs(&sp, &dp, PackSyncMode::Restore).await.unwrap();
             assert_eq!(r.corrupt, vec![ids[0].clone()], "{r:?}");
             assert_eq!(r.copied, 1);
             assert_eq!(dp.pack_ids().await.unwrap(), vec![ids[1].clone()]);

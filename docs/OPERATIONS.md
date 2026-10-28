@@ -2207,7 +2207,10 @@ both stores:
   the loose objects one by one as before. The pool stays about the size of
   the packed source, and an unchanged store copies nothing. A pool pack that
   the source merged away is deleted once other pool packs hold every object
-  it held (`packs_pruned` in the manifest). `restore` copies the packs back
+  it held (`packs_pruned` in the manifest). Objects GC deleted at the source
+  stay in the pool's packs, as they do loose: an older snapshot may need
+  them once the changeset sweep runs (issue #155), so a pool keeps somewhat
+  more packs than the source. `restore` copies the packs back
   first, so a packed store restores packed. Pools from before this change
   (all loose) restore as they always did; later backups add packs beside
   their loose objects.

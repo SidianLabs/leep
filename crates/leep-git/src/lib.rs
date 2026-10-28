@@ -37,6 +37,12 @@ pub const EXTRA_GIT_ENCODING: &str = "git.encoding";
 /// Without them signed commits (e.g. every commit made on github.com) would
 /// not round-trip to the same sha.
 pub const EXTRA_GIT_HEADERS: &str = "git.extra_headers";
+/// `extra` key holding the original bytes of the commit fields that are not
+/// valid UTF-8, as a JSON object of base64 strings (`author`, `committer`,
+/// `message`, `encoding`, `headers`). A changeset stores text, so the fields
+/// it holds are lossy for such a commit; this restores them on export. Absent
+/// for the usual UTF-8 commit, so its changeset id does not change.
+pub const EXTRA_GIT_RAW: &str = "git.raw";
 
 /// Largest single object the bridge reads from git. gix caps allocations
 /// at 16 MiB when it opens a repository owned by another user (reduced
@@ -96,14 +102,27 @@ pub(crate) async fn lookup_git(
         .map_err(|_| Error::Encoding("bad leep-to-git value".into()))
 }
 
-/// Parse `Name <email>`; falls back to the whole string as the name.
-pub(crate) fn parse_ident(s: &str) -> (String, String) {
-    match (s.rfind('<'), s.ends_with('>')) {
+/// Parse `Name <email>`; falls back to the whole input as the name.
+pub(crate) fn parse_ident(s: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    match (s.iter().rposition(|&b| b == b'<'), s.ends_with(b">")) {
         (Some(i), true) => (
-            s[..i].trim_end().to_string(),
-            s[i + 1..s.len() - 1].to_string(),
+            s[..i].trim_ascii_end().to_vec(),
+            s[i + 1..s.len() - 1].to_vec(),
         ),
-        _ => (s.to_string(), String::new()),
+        _ => (s.to_vec(), Vec::new()),
+    }
+}
+
+/// `-0000` means UTC with an unknown local offset. It is the same instant as
+/// `+0000` but different bytes, so it must survive as its own token.
+pub(crate) const NEGATIVE_ZERO_TZ: &str = "-0000";
+
+/// The `+HHMM` token to store for a signature whose raw `<secs> <tz>` text is
+/// `raw_time`, whose decoded offset is `offset`.
+pub(crate) fn tz_token(raw_time: &str, offset: i32) -> String {
+    match raw_time.rsplit_once(' ') {
+        Some((_, NEGATIVE_ZERO_TZ)) => NEGATIVE_ZERO_TZ.to_string(),
+        _ => format_tz(offset),
     }
 }
 

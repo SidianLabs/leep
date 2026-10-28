@@ -352,6 +352,125 @@ async fn round_trip_is_byte_exact() {
     assert_eq!(e2.commits_written, 0);
 }
 
+/// Write a commit object from raw bytes, so a test can use headers git's
+/// own porcelain would not produce (`-0000`, non-UTF-8 text).
+fn raw_commit(dir: &Path, parent: Option<&str>, headers: &[&[u8]], message: &[u8]) -> String {
+    use std::io::Write;
+    let tree = git(dir, &["write-tree"]);
+    let mut body = format!("tree {tree}\n").into_bytes();
+    if let Some(p) = parent {
+        body.extend(format!("parent {p}\n").bytes());
+    }
+    for h in headers {
+        body.extend_from_slice(h);
+        body.push(b'\n');
+    }
+    body.push(b'\n');
+    body.extend_from_slice(message);
+    let mut child = Command::new("git")
+        .args(["hash-object", "-t", "commit", "-w", "--stdin"])
+        .current_dir(dir)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(&body).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
+}
+
+/// Import `main` of `src`, export it into a fresh bare repo and return it.
+async fn re_export(src: &Path, commits: usize) -> tempfile::TempDir {
+    let repo = new_repo();
+    let r = import(&repo, &src.join(".git"), "main", &ImportOptions::default())
+        .await
+        .unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let e = export(
+        &repo,
+        r.head.unwrap(),
+        &out.path().join("out.git"),
+        "main",
+        &ExportOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(e.commits_written, commits);
+    out
+}
+
+fn assert_same_history(src: &Path, out: &tempfile::TempDir) {
+    let bare = out.path().join("out.git");
+    assert_eq!(
+        git(src, &["rev-list", "--topo-order", "main"]),
+        git(&bare, &["rev-list", "--topo-order", "main"])
+    );
+}
+
+#[tokio::test]
+async fn negative_zero_timezone_round_trips() {
+    // `-0000` is "UTC, offset unknown"; hg-git and fast-import tools write it.
+    let d = init();
+    let p = d.path();
+    write(p, "a.txt", "a\n");
+    git(p, &["add", "-A"]);
+    let c1 = raw_commit(
+        p,
+        None,
+        &[
+            b"author Ada <ada@example.com> 1700000000 -0000",
+            b"committer Grace <grace@example.com> 1700000001 +0000",
+        ],
+        b"one\n",
+    );
+    let c2 = raw_commit(
+        p,
+        Some(&c1),
+        &[
+            b"author Ada <ada@example.com> 1700000002 +0000",
+            b"committer Grace <grace@example.com> 1700000003 -0000",
+        ],
+        b"two\n",
+    );
+    git(p, &["update-ref", "refs/heads/main", &c2]);
+    let out = re_export(p, 2).await;
+    assert_same_history(p, &out);
+}
+
+#[tokio::test]
+async fn non_utf8_commit_round_trips() {
+    let d = init();
+    let p = d.path();
+    write(p, "a.txt", "a\n");
+    git(p, &["add", "-A"]);
+    let c1 = raw_commit(
+        p,
+        None,
+        &[
+            b"author Jos\xe9 <jose@example.com> 1700000000 +0100",
+            b"committer Ren\xe9e <renee@example.com> 1700000001 +0100",
+            b"encoding ISO-8859-1",
+            b"x-note caf\xe9",
+        ],
+        b"caf\xe9 au lait\n",
+    );
+    let c2 = raw_commit(
+        p,
+        Some(&c1),
+        &[
+            b"author Ada <ada@example.com> 1700000002 +0000",
+            b"committer Ada <ada@example.com> 1700000002 +0000",
+        ],
+        b"child of a Latin-1 commit\n",
+    );
+    git(p, &["update-ref", "refs/heads/main", &c2]);
+    let out = re_export(p, 2).await;
+    assert_same_history(p, &out);
+}
+
 fn native(
     parents: Vec<ChangesetId>,
     msg: &str,

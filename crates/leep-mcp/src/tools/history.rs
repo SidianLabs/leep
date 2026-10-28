@@ -19,6 +19,7 @@ const DEFAULT_PROVENANCE_TOP: usize = 10;
 const MAX_PROVENANCE_TOP: usize = 100;
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ReflogArgs {
     #[serde(rename = "ref")]
     name: Option<String>,
@@ -29,17 +30,20 @@ struct ReflogArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ResolveArgs {
     rev: String,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct MergeBaseArgs {
     a: String,
     b: String,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ProvenanceArgs {
     rev: Option<String>,
     path: Option<String>,

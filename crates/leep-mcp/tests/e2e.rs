@@ -796,6 +796,111 @@ fn retried_commit_and_land_lands_once() {
     assert_eq!(r["isError"], true);
 }
 
+/// A misspelled argument is refused, not ignored: `target-ref` must not
+/// fall back to `main`, nor `bse` drop the concurrency guard.
+#[test]
+fn misspelled_arguments_land_nothing() {
+    let s = Server::new(config(&start_server()));
+    let r = commit(
+        &s,
+        json!({
+            "message": "typo",
+            "changes": [{ "path": "a.txt", "content": "one\n" }],
+            "target-ref": "review/x",
+            "create_ref": true,
+        }),
+    );
+    assert_eq!(r["isError"], true);
+    assert!(
+        text(&r).contains("unknown field `target-ref`"),
+        "{}",
+        text(&r)
+    );
+    let refs = data(&call(&s, "leep_refs", json!({})));
+    assert!(refs.to_string().find("main").is_none(), "{refs}");
+    let r = call(&s, "leep_log", json!({ "limt": 1 }));
+    assert_eq!(r["isError"], true);
+}
+
+/// Reusing a `request_id` for different changes is refused with the earlier
+/// changeset, not answered as landed; the same changes stay idempotent.
+#[test]
+fn reused_request_id_with_new_changes_is_refused() {
+    let s = Server::new(config(&start_server()));
+    let args = json!({
+        "message": "first",
+        "changes": [{ "path": "a.txt", "content": "one\n" }],
+        "request_id": "step-1",
+    });
+    let first = data(&commit(&s, args.clone()));
+    let again = data(&commit(&s, args));
+    assert_eq!(again["landed"], first["landed"]);
+
+    let r = commit(
+        &s,
+        json!({
+            "message": "second",
+            "changes": [{ "path": "a.txt", "content": "two\n" }],
+            "request_id": "step-1",
+        }),
+    );
+    assert_eq!(r["isError"], true, "{}", text(&r));
+    let v = &r["structuredContent"];
+    assert_eq!(v["status"], "already_landed");
+    assert_eq!(v["changeset"], first["changeset"]);
+    assert_eq!(v["differing_paths"], json!(["a.txt"]));
+    let log = data(&call(&s, "leep_log", json!({})));
+    assert_eq!(log["entries"].as_array().unwrap().len(), 1);
+    let file = call(&s, "leep_read_file", json!({ "path": "a.txt" }));
+    assert!(text(&file).contains("one"), "{}", text(&file));
+
+    // A retry by id alone still answers the earlier land.
+    let by_id = data(&commit(&s, json!({ "request_id": "step-1" })));
+    assert_eq!(by_id["landed"], first["landed"]);
+}
+
+/// An id remembered by a call whose land failed (here: the ref is missing)
+/// never landed anything, so a later call with other changes lands them.
+#[test]
+fn request_id_of_a_failed_land_does_not_swallow_new_changes() {
+    let s = Server::new(config(&start_server()));
+    let first = data(&commit(
+        &s,
+        json!({
+            "message": "base",
+            "changes": [{ "path": "base.txt", "content": "b\n" }],
+        }),
+    ));
+    assert_eq!(first["status"], "landed");
+    let r = commit(
+        &s,
+        json!({
+            "message": "old",
+            "changes": [{ "path": "a.txt", "content": "old\n" }],
+            "request_id": "step-2",
+            "target_ref": "review/y",
+        }),
+    );
+    assert_eq!(r["isError"], true);
+    let r = data(&commit(
+        &s,
+        json!({
+            "message": "new",
+            "changes": [{ "path": "a.txt", "content": "new\n" }],
+            "request_id": "step-2",
+            "target_ref": "review/y",
+            "create_ref": true,
+        }),
+    ));
+    assert_eq!(r["status"], "landed");
+    let file = call(
+        &s,
+        "leep_read_file",
+        json!({ "rev": "review/y", "path": "a.txt" }),
+    );
+    assert!(text(&file).contains("new"), "{}", text(&file));
+}
+
 /// ADR 0058: read tools take an answer at the newest indexed changeset when
 /// the server's index lags (`answered_at`, `behind`), unless `fresh`, which
 /// gets an error naming the index, the lag and when to retry.
