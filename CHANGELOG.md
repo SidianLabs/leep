@@ -7,6 +7,18 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 ## [Unreleased]
 
+### Filesystem store temp files cannot collide across servers (issue #154)
+- **Fixed.** Loose-blob, repack and pack-copy temp files were named
+  `.tmp-<pid>-<counter>` and opened with a truncating `File::create`. Two
+  servers on one shared volume (two containers, each pid 1, counting from 0)
+  could pick the same name, interleave writes in one file and publish another
+  writer's bytes under a blob's hash, where loose reads are not hash-checked.
+  Temp files are now created with `O_EXCL`, retrying with a fresh name on a
+  clash, and the name carries a random per-process nonce
+  (`.tmp-<pid>-<nonce>-<n>`). Leftovers from older versions are still
+  recognised and cleaned up. A blob already corrupted this way is only found
+  by `verify --rehash`.
+
 ### Review covers the changes a merge drops
 - **Fixed.** A merge that kept its first parent's version of a file that a
   side parent had changed since their merge base threw that change away
