@@ -153,7 +153,10 @@ refuses its id as already landed, and the tool answers with the recorded land
 instead). Such an answer carries `from_record: true` and the original
 `changeset` (unless the new changeset came out identical to the original,
 which then simply lands nothing new). Within one process the tool also remembers the changeset a
-`request_id` made and lands that one again without building another.
+`request_id` made and lands that one again without building another, when the
+call carries the same changes or none (a retry by id alone). Other changes
+under a known id go to the server like a new process's call: refused as
+`already_landed` if the id landed, landed if it did not.
 
 - A `request_id` needs to be unique per author (and per session, when
   `LEEP_AGENT_SESSION` is set), not globally: two agents that pick the same
