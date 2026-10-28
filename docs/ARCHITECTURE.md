@@ -200,6 +200,7 @@ way.
 | `skiplist` | power-of-two first-parent ancestors | `is_ancestor`, `merge_base` |
 | `signature-v1` / `rebased-origin-v1` | attestations and server rebase links, keyed per (changeset, key) and per copy; not pure functions of the changeset, so written by `put_signature` and `rebase` rather than derived | signed-changeset listing and the land policy |
 | `review-v1` | review verdicts, keyed per (changeset, reviewer name) (`Hash::of_object("review", id‖name)`); attestations written by `put_review`, last write wins, listed with one lookup per reviewer (write tokens without `"review": false`) | review listing and the review land policy |
+| `review-source-v1` | which token posted a review for a named principal and the `source` it gave (`ReviewSource { via, source, timestamp }`), keyed as `review-v1` is; written by `put_review_source` beside the review (ADR 0063) | `source` and `via` in review listing, the audit trail |
 | `last_merge-v1` | generation of the nearest merge on the first-parent chain (0 if none) | lets `merge_base` answer from skiplists when no merge sits above the first-parent common ancestor |
 | `blob-claim-v1` / `blob-condemned-v1` / `blob-rescue-v1` / `blob-doom-v1` | per blob hash, 8-byte big-endian unix seconds (doom adds a state byte); GC bookkeeping, not derived from changesets: claims by uploads and dedup checks, condemnation by `gc condemn`, rescue by uploads of a condemned blob, doom by `gc collect` (ADR 0012) | blob garbage collection and the server's missing-blob checks |
 | `history-tree-v4` | the changeset's history pack (ADR 0045): the nodes of a tree parallel to `root_tree` recording for each path (including deleted ones) the newest changesets that changed it, as written by this changeset's derivation, and the address of its root. A pack is cut into parts of about 16 KB; this value is part 0 and `history-node-v4` rows hold the rest. Nodes are addressed by (writer, part, index) and name changesets through a table per part, so the hundreds of nodes a merge rewrites name its few dozen ids once; nodes of more than 64 entries are stored as content-defined chunks so an edit rewrites one chunk (ADR 0027), and a changed node, chunk or chunk list is stored as a patch on an earlier whole version that names the entries it replaces by position (ADR 0037). Built from the first parent's tree plus the spines of changed paths, and at merges the paths where the second parent's history differs from the merge base's (another parent's from the first's, for octopus or unrelated merges) (ADR 0013) | path log, `last-change` |
@@ -849,6 +850,68 @@ never imported, merged or landed onto. A rewrite in Leep (rebase, squash) is
 pushed with a lease, and a Leep delete deletes the branch with a lease, but
 only when the ref log shows the Leep ref held the remote's tip; a branch
 someone pushed to is reported and left alone.
+
+A `--ref` can make the remote its source of truth
+(`--ref main@git`, or `--primary git` for every `--ref`; needs `--import`;
+[ADR 0062](adr/0062-git-primary-refs.md)). Two rows change for such a ref:
+"rewound" becomes `restored`, a fast-forward CAS of the Leep ref to the
+remote tip's changeset; and "otherwise" imports `G` and asks
+`POST /v1/refs/{name}/rebase-onto` (with the merge base it read as
+`expected_base`, and a land id derived from the pair) to replay Leep's
+unpushed lands onto it and move the ref once, inside the ref's land
+coordinator so no land is lost to the race, then pushes the result as a
+fast-forward. A conflict or a refusal reports `diverged` with the paths
+(Leep's side still goes to the diverged branch, for the merge in git) and
+the same pair is not asked about again until a side moves; a stale base
+(409) is read again. With `--import`, a prefix ref is two-way: a person's
+commits on top of the branch are imported as a fast-forward of the Leep ref;
+when an agent rewrote the ref as well, they are imported and landed onto it
+with `POST /v1/land` and the branch is pushed with a lease on the exact tip
+imported; a conflict reports and moves nothing. A branch deleted on the
+remote deletes the Leep ref only when its tip, or a rebased copy of it, is
+in a mirrored `--ref`'s history; otherwise the ref is kept and reported
+(`deleted-on-remote`) and the branch is not pushed again until the ref
+moves. With `--github-reviews` ([ADR 0063](adr/0063-github-reviews.md)),
+after each remote poll the mirror reads the open pull request of each
+two-way prefix ref's branch and its reviews, keeps the latest per login,
+and posts the matching Leep review (`approve` for an approval of the
+current head, `reject` for changes requested, `withdrawn` for a dismissal
+or a stale approval) for the principal a mapping file names, on every
+changeset of the ref's unlanded stack, through a `review_for` token; it
+recognises its own reviews by their `source` and never changes one a
+person posted directly, and keeps no record, so a failure is made good by
+the next poll. The review gate of ADR 0011 then holds without a second
+approval.
+
+**Rebase onto** (`POST /v1/refs/{name}/rebase-onto`, the server half of
+ADR 0062's replay; the mirror half is not built yet). It queues on the
+ref's land queue (forwarded to the lease holder under
+`--land-coordination on`, ADR 0056) and runs alone between land batches, in
+arrival order with them:
+```
+rebase_onto(name, onto, expected_base, land_id?):
+  refuse: bad name, tag, ref under --protect-ref (400, not_forward:
+          protect the branch on GitHub instead)
+  enqueue on queue(name) behind the lands already there
+leader: lands → land_batch as above; a rebase-onto → alone:
+loop (≤32 attempts, same lifetime as a batch):
+  head ← get_ref(name)
+  land_id recorded? → its result: the head it moved to, and the copies on
+                      the first-parent chain from there down to onto
+  merge_base(head, onto) ≠ expected_base → 409 (the caller reads again)
+  expected_base == onto → nothing to do (Moved at head)
+  land policy on new_history(onto, head)   # git's changesets, not the stack
+  expected_base == head → move to onto
+  else replay the first-parent stack head..expected_base onto onto, as a
+       land replays (staged; one copy each, leep.rebased_from)
+       conflict → Conflicts{onto, conflicts, clean}; no changeset stored
+  store staging; CAS(head → top) logged once, operation git-mirror, the
+  land id recorded with onto as its changeset; lost → backoff, redo
+```
+A land that reached the server before the replay is in `head`, so it is in
+the stack and gets a copy; one after it replays onto the result. The answer
+pairs each original with its copy, which agents holding the originals find
+through the rebase link as after any land.
 
 ## 7. Caching tiers
 

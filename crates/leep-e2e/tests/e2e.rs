@@ -1,10 +1,14 @@
 //! End-to-end tests that drive the real `leep-server`, `leep` and `leep-git`
 //! binaries as subprocesses. Run `cargo build --workspace` first.
 
+// Exec bits and symlinks are Unix file modes; these tests need them.
+#![cfg(unix)]
+
 mod common;
 
 use std::collections::BTreeMap;
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Barrier;
@@ -56,6 +60,7 @@ fn make_fixture(root: &Path) -> Fixture {
     commit(&dir, "initial import");
 
     put(&dir, "scripts/run.sh", "#!/bin/sh\necho hi\n");
+    #[cfg(unix)]
     fs::set_permissions(
         dir.join("scripts/run.sh"),
         fs::Permissions::from_mode(0o755),
@@ -64,6 +69,7 @@ fn make_fixture(root: &Path) -> Fixture {
     commit(&dir, "add script");
 
     put(&dir, "docs/guide/intro.md", "intro\n");
+    #[cfg(unix)]
     std::os::unix::fs::symlink("../README.md", dir.join("docs/readme-link")).unwrap();
     commit(&dir, "docs and symlink");
 
@@ -520,26 +526,32 @@ fn run_import_swarm_export(stores: &Stores, work: &Path) {
             "{path} in export"
         );
     }
-    assert_eq!(modes.get("scripts/run.sh"), Some(&"100755"), "exec bit");
-    assert_eq!(modes.get("docs/readme-link"), Some(&"120000"), "symlink");
-    assert_eq!(
-        git(&bare, &["show", "main:docs/readme-link"]),
-        "../README.md"
-    );
+    #[cfg(unix)]
+    {
+        assert_eq!(modes.get("scripts/run.sh"), Some(&"100755"), "exec bit");
+        assert_eq!(modes.get("docs/readme-link"), Some(&"120000"), "symlink");
+        assert_eq!(
+            git(&bare, &["show", "main:docs/readme-link"]),
+            "../README.md"
+        );
+    }
     assert!(!modes.contains_key("old.txt"));
     let shared_exported = git(&bare, &["show", "main:shared.txt"]);
     assert_eq!(shared_exported, shared);
 
     // The checked-out working copy keeps the exec bit and the symlink too.
-    let mode = fs::metadata(verify.join("scripts/run.sh"))
-        .unwrap()
-        .permissions()
-        .mode();
-    assert_ne!(mode & 0o111, 0, "script lost its exec bit");
-    assert_eq!(
-        fs::read_link(verify.join("docs/readme-link")).unwrap(),
-        Path::new("../README.md")
-    );
+    #[cfg(unix)]
+    {
+        let mode = fs::metadata(verify.join("scripts/run.sh"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_ne!(mode & 0o111, 0, "script lost its exec bit");
+        assert_eq!(
+            fs::read_link(verify.join("docs/readme-link")).unwrap(),
+            Path::new("../README.md")
+        );
+    }
 
     // What the import, the swarm's rebases and the export left behind is
     // sound all the way down (ADR 0025).
@@ -845,6 +857,7 @@ fn signed_changesets_gate_landing_on_a_protected_ref() {
             "alice",
         ],
     );
+    #[cfg(unix)]
     assert_eq!(
         fs::metadata(&keyfile).unwrap().permissions().mode() & 0o777,
         0o600
@@ -1090,6 +1103,21 @@ fn review_owners_and_auto_approval_gate_landing_on_a_protected_ref() {
     assert_eq!(alice.ok(&wc_a, &["review", "list", &seed]), list);
     let json = alice.json(&wc_a, &["review", "status", "@"]);
     assert_eq!(json["approved"], true);
+
+    // Withdrawing takes the approval back (ADR 0063); approving again restores it.
+    let out = bob.ok(root, &["review", "withdraw", &seed]);
+    assert!(out.contains("Withdrew") && out.contains("as bob"), "{out}");
+    let list = alice.ok(&wc_a, &["reviews", &seed]);
+    assert!(list.contains("bob withdrawn"), "{list}");
+    assert_eq!(
+        alice.run(&wc_a, &["review", "status", "@"]).status.code(),
+        Some(1)
+    );
+    bob.ok(root, &["review", "approve", &seed, "-m", "fine"]);
+    assert_eq!(
+        alice.json(&wc_a, &["review", "status", "@"])["approved"],
+        true
+    );
     let landed = alice.ok(&wc_a, &["land"]);
     assert!(landed.contains("Landed"), "{landed}");
 

@@ -79,6 +79,9 @@ pub struct Principal {
     pub author: Option<String>,
     /// Whether the token may post reviews (`"review": false` says no).
     pub review: bool,
+    /// Whether the token may post reviews for a principal it names
+    /// (`"review_for": true`, ADR 0063).
+    pub review_for: bool,
 }
 
 /// The request's [`Principal`], or `None` when authentication is off.
@@ -123,6 +126,10 @@ pub struct TokenEntry {
     /// Absent means yes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review: Option<bool>,
+    /// Whether the token may post reviews on behalf of a principal it names
+    /// (the git mirror's GitHub approvals, ADR 0063). Absent means no.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_for: Option<bool>,
 }
 
 /// How far ahead `leep_tokens_expiring_soon` looks.
@@ -142,6 +149,7 @@ struct Known {
     limits: TokenLimits,
     expires: Option<jiff::Timestamp>,
     review: bool,
+    review_for: bool,
 }
 
 impl Known {
@@ -179,7 +187,7 @@ pub struct AuthChange {
     pub role_changed: Vec<String>,
     pub limits_changed: Vec<String>,
     pub expiry_changed: Vec<String>,
-    /// Gained or lost the right to review.
+    /// Gained or lost the right to review, or to review for others.
     pub review_changed: Vec<String>,
 }
 
@@ -219,6 +227,7 @@ pub fn generate(name: &str, role: Role) -> Result<(String, TokenEntry), String> 
         max_body: None,
         expires: None,
         review: None,
+        review_for: None,
     };
     Ok((token, entry))
 }
@@ -284,6 +293,7 @@ impl Auth {
                 limits,
                 expires,
                 review: t.review.unwrap_or(true),
+                review_for: t.review_for.unwrap_or(false),
             });
         }
         Ok(Auth { tokens })
@@ -370,6 +380,14 @@ impl Auth {
         if !barred.is_empty() {
             c.set("token-no-review", barred);
         }
+        let speakers: Vec<&String> = all
+            .iter()
+            .filter(|k| k.review_for)
+            .map(|k| &k.name)
+            .collect();
+        if !speakers.is_empty() {
+            c.set("token-review-for", speakers);
+        }
     }
 
     /// What `newer` changes relative to `self`, each list sorted by name.
@@ -395,7 +413,7 @@ impl Auth {
             if o.expires != k.expires {
                 c.expiry_changed.push(name.to_string());
             }
-            if o.review != k.review {
+            if o.review != k.review || o.review_for != k.review_for {
                 c.review_changed.push(name.to_string());
             }
         }
@@ -504,6 +522,7 @@ pub async fn require_token(mut req: Request, next: Next) -> Response {
         role,
         author,
         review,
+        review_for,
         ..
     } = known;
     let role = *role;
@@ -521,6 +540,7 @@ pub async fn require_token(mut req: Request, next: Next) -> Response {
         role,
         author: author.clone(),
         review: *review,
+        review_for: *review_for,
     });
     next.run(req).instrument(span).await
 }
@@ -582,6 +602,27 @@ mod tests {
         ]})
         .to_string();
         assert_eq!(Auth::parse(&text).unwrap().reviewers(), ["ci", "alice"]);
+    }
+
+    #[test]
+    fn review_for_defaults_to_false_and_changes_the_fingerprint() {
+        let parse = |extra: &str| {
+            Auth::parse(&format!(
+                r#"{{ "tokens": [{{ "name": "m", "role": "write", "hash": "{}" {extra} }}] }}"#,
+                hash_token("m")
+            ))
+            .unwrap()
+        };
+        let (plain, mirror) = (parse(""), parse(r#", "review_for": true"#));
+        assert!(!plain.lookup("m").unwrap().review_for);
+        assert!(mirror.lookup("m").unwrap().review_for);
+        assert_eq!(plain.diff(&mirror).review_changed, ["m"]);
+        let print = |a: &Auth| {
+            let mut c = crate::fingerprint::Canon::new();
+            a.fingerprint_into(&mut c);
+            c.finish()
+        };
+        assert_ne!(print(&plain), print(&mirror));
     }
 
     #[test]

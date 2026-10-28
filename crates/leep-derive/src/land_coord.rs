@@ -12,12 +12,13 @@
 //! over HTTP, tests call another `Repo` directly.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use leep_core::api::{LandResponse, FORWARD_FAILED_MARKER};
+use leep_core::api::{LandResponse, RebaseOntoResponse, FORWARD_FAILED_MARKER};
 use leep_core::refname;
 use leep_core::{
     ChangesetId, Error, LandId, Lease, LeaseClaim, LeaseKey, LeaseTiming, MetaStore, Result,
@@ -118,10 +119,11 @@ pub trait LandForward<A>: Send + Sync {
     async fn forward(&self, lease: &Lease) -> Forwarded<A>;
 }
 
-/// The outcome of [`Repo::land_coordinated`].
-pub enum Coordinated<A> {
+/// The outcome of [`Repo::land_coordinated`] (`R` a [`LandResponse`]) or
+/// [`Repo::rebase_onto_coordinated`].
+pub enum Coordinated<A, R = LandResponse> {
     /// Batched by this server.
-    Landed(LandResponse),
+    Landed(R),
     /// Batched by the lease holder, whose answer this is.
     Forwarded(A),
     /// A land forwarded here by another server, which this server no longer
@@ -549,18 +551,103 @@ impl Repo {
         from_peer: bool,
         forward: &dyn LandForward<A>,
     ) -> Result<Coordinated<A>> {
-        let Some(coord) = self.land_coordinator.clone() else {
+        if self.land_coordinator.is_none() {
             return Ok(Coordinated::Landed(
-                self.land_keyed(cs, target_ref, actor, create, land_id.clone())
+                self.land_keyed(cs, target_ref, actor, create, land_id)
                     .await?,
             ));
-        };
+        }
         refname::validate(target_ref)?;
         if refname::is_tag(target_ref) {
             return Err(Error::Invalid(format!(
                 "cannot land onto {target_ref:?}: tags are immutable"
             )));
         }
+        let land_id = &land_id;
+        self.coordinate(
+            target_ref,
+            "land onto",
+            from_peer,
+            forward,
+            |led| async move {
+                if led {
+                    self.land_led(cs, target_ref, actor, create, land_id.clone(), from_peer)
+                        .await
+                } else {
+                    Some(
+                        self.land_keyed(cs, target_ref, actor, create, land_id.clone())
+                            .await,
+                    )
+                }
+            },
+        )
+        .await
+    }
+
+    /// [`rebase_onto`](Repo::rebase_onto) routed as
+    /// [`land_coordinated`](Self::land_coordinated) routes a land: queued
+    /// with the ref's lands on the server holding its lease.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn rebase_onto_coordinated<A: Send>(
+        &self,
+        target_ref: &str,
+        onto: ChangesetId,
+        expected_base: ChangesetId,
+        actor: Option<&str>,
+        land_id: Option<LandId>,
+        from_peer: bool,
+        forward: &dyn LandForward<A>,
+    ) -> Result<Coordinated<A, RebaseOntoResponse>> {
+        if self.land_coordinator.is_none() {
+            return Ok(Coordinated::Landed(
+                self.rebase_onto(target_ref, onto, expected_base, actor, land_id)
+                    .await?,
+            ));
+        }
+        // Refused before routing: the policy is this request's.
+        self.check_rebase_onto(target_ref)?;
+        let land_id = &land_id;
+        self.coordinate(
+            target_ref,
+            "rebase-onto of",
+            from_peer,
+            forward,
+            |led| async move {
+                if led {
+                    self.rebase_onto_led(target_ref, onto, expected_base, actor, land_id.clone())
+                        .await
+                } else {
+                    Some(
+                        self.rebase_onto(target_ref, onto, expected_base, actor, land_id.clone())
+                            .await,
+                    )
+                }
+            },
+        )
+        .await
+    }
+
+    /// Run a request on `target_ref` where its lease says: `here(led)` on
+    /// this server (`led` when it holds the lease; `None` back means the
+    /// lease was lost and it is routed again), or `forward` to the holder.
+    /// `what` names the request in the error of a forward that gave up.
+    async fn coordinate<A: Send, R, F, Fut>(
+        &self,
+        target_ref: &str,
+        what: &str,
+        from_peer: bool,
+        forward: &dyn LandForward<A>,
+        here: F,
+    ) -> Result<Coordinated<A, R>>
+    where
+        F: Fn(bool) -> Fut,
+        Fut: Future<Output = Option<Result<R>>>,
+    {
+        let Some(coord) = self.land_coordinator.clone() else {
+            return Ok(Coordinated::Landed(here(false).await.unwrap_or_else(
+                || Err(Error::Other("handed back unexpectedly; retry".into())),
+            )?));
+        };
         let started = Instant::now();
         loop {
             match coord.route(target_ref).await {
@@ -574,15 +661,11 @@ impl Repo {
                     coord.uncoordinated.fetch_add(1, Ordering::Relaxed);
                     metrics::counter!("leep_land_routed_total", "route" => "uncoordinated")
                         .increment(1);
-                    return Ok(Coordinated::Landed(
-                        self.land_keyed(cs, target_ref, actor, create, land_id.clone())
-                            .await?,
-                    ));
+                    return Ok(Coordinated::Landed(here(false).await.unwrap_or_else(
+                        || Err(Error::Other("handed back unexpectedly; retry".into())),
+                    )?));
                 }
-                Route::Lead(_) => match self
-                    .land_led(cs, target_ref, actor, create, land_id.clone(), from_peer)
-                    .await
-                {
+                Route::Lead(_) => match here(true).await {
                     Some(r) => return r.map(Coordinated::Landed),
                     None => {
                         metrics::counter!("leep_land_rerouted_total").increment(1);
@@ -640,7 +723,7 @@ impl Repo {
             if started.elapsed() >= coord.config().forward_wait {
                 metrics::counter!("leep_land_forward_gave_up_total").increment(1);
                 return Err(Error::Conflict(format!(
-                    "land onto {target_ref:?} {FORWARD_FAILED_MARKER}; retry"
+                    "{what} {target_ref:?} {FORWARD_FAILED_MARKER}; retry"
                 )));
             }
         }

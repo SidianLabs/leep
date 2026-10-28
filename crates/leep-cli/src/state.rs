@@ -514,9 +514,9 @@ mod tests {
             },
         )
         .unwrap();
-        let cfg = dir.path().join(DIR).join("config.json");
         #[cfg(unix)]
         {
+            let cfg = dir.path().join(DIR).join("config.json");
             use std::os::unix::fs::PermissionsExt;
             let mode = fs::metadata(&cfg).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600);

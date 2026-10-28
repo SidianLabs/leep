@@ -35,7 +35,8 @@ skill.
 | derived `root_tree` | — | `MetaStore.derived`, value = 32 raw bytes |
 | derived `generation` | — | `MetaStore.derived`, value = u64 (owned by leep-derive) |
 | derived `signature-v1` | — | `MetaStore.derived`, key = `Hash::of_object("signature", changeset_id ‖ key_id)`, value = postcard `Signature { key_id: String, public_key: [u8; 32], sig: [u8; 64] }` (`leep_core::signature`) |
-| derived `review-v1` | — | `MetaStore.derived`, key = `Hash::of_object("review", changeset_id ‖ reviewer name utf-8)`, value = postcard `Review { reviewer: String, verdict: Verdict, comment: String, timestamp: i64 }` (`leep_core::review`); `Verdict` is `Approve` (variant 0) or `Reject` (variant 1) |
+| derived `review-v1` | — | `MetaStore.derived`, key = `Hash::of_object("review", changeset_id ‖ reviewer name utf-8)`, value = postcard `Review { reviewer: String, verdict: Verdict, comment: String, timestamp: i64 }` (`leep_core::review`); `Verdict` is `Approve` (variant 0), `Reject` (variant 1) or `Withdrawn` (variant 2, ADR 0063; a policy reads it as no review) |
+| derived `review-source-v1` | — | `MetaStore.derived`, key as `review-v1` is, value = postcard `ReviewSource { via: String, source: String, timestamp: i64 }` (`leep_core::review`): the token that posted a review and its `source` string (ADR 0063); written before the review it describes, replaced by a later direct post |
 | derived `rebased-origin-v1` | — | `MetaStore.derived`, key = rebased copy id, value = 32 raw bytes (id it was rebased from); written by `Repo::rebase` |
 | derived `blob-claim-v1` | — | `MetaStore.derived`, key = blob hash, value = unix seconds as 8-byte big-endian `i64` |
 | derived `blob-condemned-v1` | — | `MetaStore.derived`, key = blob hash, value = condemnation time, unix seconds as 8-byte big-endian `i64`, from the GC host's clock |
@@ -111,9 +112,13 @@ so `Changeset` and the changeset id are unchanged. The `review-v1` row is
 overwritten by the same reviewer, so a verdict can change; the reviewer in the
 value is the token name of the authenticated caller. Changing the `Review`
 field order, the `Verdict` variant order or the key derivation requires a
-`-v2` kind. JSON uses `"approve"` / `"reject"`. The API additions
+`-v2` kind. JSON uses `"approve"` / `"reject"` / `"withdrawn"`; `Withdrawn`
+was appended last (ADR 0063), so rows written before it decode unchanged, and
+an older server answers 400 to it. The API additions
 (`/v1/changesets/{id}/reviews`, `/v1/changesets/{id}/review-status`) only add
-endpoints and types.
+endpoints and types. `POST .../reviews` gained optional `reviewer` and `source`
+(403 unless the token has `"review_for": true`), and each `GET .../reviews`
+entry gained optional `source` and `via`.
 
 **`OWNERS` file** (any directory of the tree; a regular or executable file,
 symlinks are ignored; at most 1 MiB): one owner name per line, where a name is
@@ -1202,6 +1207,27 @@ new response header `Leep-Refused: <reason>`.
   waiting `Retry-After` plus up to 50% jitter, and reporting a wait over
   10 s instead of sleeping. Older clients report the `503` as a server
   error, whose message says to retry.
+
+## Rebase onto (new endpoint, ADR 0062)
+
+`POST /v1/refs/{name}/rebase-onto` is new. Body `RebaseOntoRequest`:
+`onto` and `expected_base` (changeset ids) and the optional `land_id`
+(as `LandRequest`'s, omitted when unset). Answer `RebaseOntoResponse`,
+tagged by `status`: `{"status": "moved", "head": id, "rebased": [[original,
+copy], ...]}` (`rebased` empty for a fast-forward or a no-op, and defaulted
+when absent), or `{"status": "conflicts", "onto", "conflicts", "clean"}`
+with the fields of `LandResponse::Conflicts`, its `clean` blobs stored the
+same way. A merge base other than `expected_base` is 409 `cas_lost`; a
+`--protect-ref` ref is 400 `not_forward`; a land id recorded for another
+`onto` is 400 `land_id_reused`. The move is a ref log entry with operation
+`git-mirror`, and a keyed one records `land_id` with `onto` as its
+`land_changeset`, so rebase-onto and lands share a ref's land ids.
+
+`POST /v1/refs/{name}` and this endpoint share the route, since ref names
+hold `/`: a `POST` whose path ends in `/rebase-onto` is always this
+endpoint, so a ref whose name ends in `/rebase-onto` can no longer be moved
+by `POST /v1/refs/{name}` (`land` still moves it). No other shape, stored
+object or table changed.
 
 ## Land admission (additive header value, ADR 0060)
 

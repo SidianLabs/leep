@@ -17,6 +17,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 cargo bench -p leep-derive                   # criterion; LEEP_BENCH_LARGE=1 adds 100k cases; see docs/PERFORMANCE.md
 ```
+Windows runs the unit and integration tests; Linux and macOS also run the e2e, soak and crash tests.
 CI runs fmt check, `scripts/check-version.sh` (versions stay below 0.1.0),
 clippy with `-D warnings`, and tests against Postgres 16.
 A change isn't done until all of them pass locally.
@@ -51,8 +52,6 @@ For leaks, slow drift and long-history bugs, run a soak (`docs/OPERATIONS.md`,
   reviews on GitHub. Never merge a pull request on GitHub, and never push to
   GitHub `main` or a `review/*` branch.
 - Squash with `leep reset` on a stale base (see "Working in Leep").
-- Set `LEEP_AGENT_MODEL`, or use provenance trailers (`Leep-Agent-*`,
-  `--provenance-trailers`).
 - Bump the workspace version, tag a release, or mark a roadmap milestone
   closed. Those are maintainer decisions; see "How versions move" in
   [docs/ROADMAP.md](docs/ROADMAP.md).
@@ -101,8 +100,8 @@ leep land --ref leep-main
   conflict (exit 5). On a conflict, `leep reset --hard --force "$x"`, merge
   `leep-main` into the review ref, wait for CI and start again.
 
-Never set `LEEP_AGENT_MODEL`, and never use provenance trailers: commits
-carry no AI attribution (below).
+Set `LEEP_AGENT_MODEL` to the model you are, so every commit records its
+provenance in `agent.model`; that is what the feature is for (below).
 
 ## Where things go
 
@@ -132,6 +131,9 @@ carry no AI attribution (below).
   `<area>: <imperative summary>` subjects, Leep review refs
   `review/<area>-<kebab-desc>`, and squash-and-landed PRs with Summary / Why
   / Changes / Testing / Compatibility sections.
-- **Never credit AI tools.** No `Co-Authored-By` for Claude or any AI, no
-  session links, no "Generated with ..." footers, and no model names, in
-  commits, PRs, code or docs.
+- **Credit the agent.** A commit made with an AI agent ends with a
+  `Co-Authored-By:` trailer naming it (for Claude:
+  `Co-Authored-By: Claude <noreply@anthropic.com>`), and sets
+  `LEEP_AGENT_MODEL` so Leep records the model. PRs may keep the tool's
+  "Generated with ..." footer. Leep is built on agent provenance; its own
+  history should carry it.

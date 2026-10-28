@@ -112,6 +112,10 @@ upgrade it from the docs alone.
 - Installable releases: prebuilt binaries, a published container image,
   `cargo install`
 - A read-only web view of history, diffs and reviews
+- The mirror with git as the source of truth: git-primary refs, two-way
+  review branches ([ADR 0062](adr/0062-git-primary-refs.md)) and GitHub
+  approvals satisfying the review gate ([ADR 0063](adr/0063-github-reviews.md)),
+  so a team keeps GitHub's rules unchanged while agents land through Leep
 
 Exit: the design partners' top requests for this milestone are shipped,
 and Leep's own development has run on a Leep server since M5.

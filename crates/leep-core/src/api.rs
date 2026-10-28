@@ -30,12 +30,13 @@
 //! | GET  | `/v1/merge-base?a=x&b=y` | – | [`MergeBaseResponse`] |
 //! | POST | `/v1/changesets/{id}/signatures` | [`AddSignatureRequest`] | [`AddSignatureResponse`] (400 if the signature is bad or the key is not trusted; 404 if the changeset is unknown) |
 //! | GET  | `/v1/changesets/{id}/signatures` | – | [`SignaturesResponse`] (trusted signatures, re-verified on read) |
-//! | POST | `/v1/changesets/{id}/reviews` | [`AddReviewRequest`] | [`AddReviewResponse`] (the reviewer is the token's name; 400 without authentication; 404 if the changeset is unknown) |
+//! | POST | `/v1/changesets/{id}/reviews` | [`AddReviewRequest`] | [`AddReviewResponse`] (the reviewer is the token's name, or the body's `reviewer` for a `review_for` token and 403 for any other; 400 without authentication; 404 if the changeset is unknown) |
 //! | GET  | `/v1/changesets/{id}/reviews` | – | [`ReviewsResponse`] |
 //! | GET  | `/v1/changesets/{id}/review-status?ref=main` | – | [`ReviewStatusResponse`] (`ref` defaults to `main`) |
 //! | POST | `/v1/merge` | [`MergeRequest`] | [`MergeResponse`] |
 //! | POST | `/v1/rebase` | [`RebaseRequest`] | [`RebaseResponse`] |
 //! | POST | `/v1/land` | [`LandRequest`] | [`LandResponse`] (`create: false` refuses to create a missing `target_ref` with 404; absent creates it, as before; ADR 0036. `land_id` makes retries idempotent at any age; ADR 0057) |
+//! | POST | `/v1/refs/{name}/rebase-onto` | [`RebaseOntoRequest`] | [`RebaseOntoResponse`] (replays the ref's first-parent stack above `expected_base` onto `onto` and moves the ref once, ordered with lands; 409 if the merge base of the head and `onto` is not `expected_base`; 400 on a `--protect-ref` ref; needs a write token; ADR 0062) |
 //!
 //! Ref names may contain `/` (e.g. `release/1.0`); `{name}` and `{rev}` match
 //! the rest of the path. Every ref write (`POST /v1/refs/{name}` and the
@@ -565,13 +566,20 @@ pub struct SignaturesResponse {
     pub via: Option<ChangesetId>,
 }
 
-/// Record the caller's verdict on a changeset. The reviewer is the
-/// authenticated token's name; the body cannot name one.
+/// Record a verdict on a changeset. The reviewer is the authenticated
+/// token's name, unless the token has `"review_for": true` and the body names
+/// `reviewer` (ADR 0063); any other token naming one is refused with 403.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AddReviewRequest {
     pub verdict: Verdict,
     #[serde(default)]
     pub comment: String,
+    /// Principal the review is for. Needs the `review_for` capability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer: Option<String>,
+    /// Where the review came from, stored beside it as a `ReviewSource`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -580,10 +588,42 @@ pub struct AddReviewResponse {
     pub verdict: Verdict,
 }
 
+/// A stored review as listed: the review's own fields plus, when a
+/// `review-source-v1` row exists (the review was posted on someone's behalf,
+/// ADR 0063), where it came from and which token posted it. On the wire the
+/// review's fields stay at the top level, so old clients see what they did.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewEntry {
+    #[serde(flatten)]
+    pub review: Review,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// Token name that posted it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
+}
+
+impl From<Review> for ReviewEntry {
+    fn from(review: Review) -> Self {
+        ReviewEntry {
+            review,
+            source: None,
+            via: None,
+        }
+    }
+}
+
+impl std::ops::Deref for ReviewEntry {
+    type Target = Review;
+    fn deref(&self) -> &Review {
+        &self.review
+    }
+}
+
 /// Reviews of one changeset by the server's known principals.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewsResponse {
-    pub reviews: Vec<Review>,
+    pub reviews: Vec<ReviewEntry>,
     /// Set when the changeset has no review of its own but is a server-made
     /// rebased copy of this one, whose `reviews` are reported instead.
     /// Informational: the land policy never accepts a copy on this basis.
@@ -1107,6 +1147,42 @@ pub enum LandResponse {
     },
 }
 
+/// `POST /v1/refs/{name}/rebase-onto` (ADR 0062): the git mirror's replay
+/// of Leep's unpushed lands onto commits git gained, for a git-primary ref.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RebaseOntoRequest {
+    /// The new base: the changeset imported from git.
+    pub onto: ChangesetId,
+    /// The merge base of the ref's head and `onto` the caller saw. Any other
+    /// is 409: something moved, and the caller decides again.
+    pub expected_base: ChangesetId,
+    /// As for [`LandRequest::land_id`]: a retry of the same replay answers
+    /// with the first result. Shares the ref's land ids.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub land_id: Option<LandId>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum RebaseOntoResponse {
+    /// The ref is at `head`. `rebased` pairs each replayed changeset with its
+    /// copy, oldest first; empty when the ref only moved forward to `onto`
+    /// or was already there.
+    Moved {
+        head: ChangesetId,
+        #[serde(default)]
+        rebased: Vec<(ChangesetId, ChangesetId)>,
+    },
+    /// As [`LandResponse::Conflicts`]: the stack squashed relative to `onto`.
+    /// Nothing moved and no changeset was stored.
+    Conflicts {
+        onto: ChangesetId,
+        conflicts: Vec<Conflict>,
+        #[serde(default)]
+        clean: BTreeMap<RepoPath, FileChange>,
+    },
+}
+
 /// A byte range within [`SearchMatch::line`] (`end` is exclusive).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchRange {
@@ -1194,6 +1270,48 @@ pub struct SearchResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rebase_onto_shapes_are_stable() {
+        let a = ChangesetId(Hash::of_blob(b"a"));
+        let b = ChangesetId(Hash::of_blob(b"b"));
+        let r: RebaseOntoRequest = serde_json::from_value(serde_json::json!({
+            "onto": a.to_string(), "expected_base": b.to_string()
+        }))
+        .unwrap();
+        assert_eq!(r.land_id, None);
+        assert_eq!(
+            serde_json::to_value(&r).unwrap().as_object().unwrap().len(),
+            2,
+            "an absent land id is omitted"
+        );
+        let v = serde_json::to_value(RebaseOntoResponse::Moved {
+            head: b,
+            rebased: vec![(a, b)],
+        })
+        .unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "status": "moved", "head": b.to_string(),
+                "rebased": [[a.to_string(), b.to_string()]]
+            })
+        );
+        let v = serde_json::to_value(RebaseOntoResponse::Conflicts {
+            onto: a,
+            conflicts: vec![],
+            clean: BTreeMap::new(),
+        })
+        .unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "status": "conflicts", "onto": a.to_string(), "conflicts": [], "clean": {}
+            })
+        );
+        let back: RebaseOntoResponse = serde_json::from_value(v).unwrap();
+        assert!(matches!(back, RebaseOntoResponse::Conflicts { .. }));
+    }
 
     #[test]
     fn whoami_shape_is_stable() {
@@ -1416,6 +1534,16 @@ mod tests {
             serde_json::from_value(serde_json::json!({ "verdict": "approve" })).unwrap();
         assert_eq!(req.verdict, Verdict::Approve);
         assert_eq!(req.comment, "");
+        assert_eq!((req.reviewer, req.source), (None, None));
+        let e: ReviewEntry = serde_json::from_value(serde_json::json!({
+            "reviewer": "a", "verdict": "withdrawn", "comment": "", "timestamp": 1,
+            "source": "github:o/r#1", "via": "mirror"
+        }))
+        .unwrap();
+        assert_eq!(e.verdict, Verdict::Withdrawn);
+        assert_eq!(e.via.as_deref(), Some("mirror"));
+        let plain = serde_json::to_value(ReviewEntry::from(e.review.clone())).unwrap();
+        assert!(plain.get("source").is_none() && plain["reviewer"] == "a");
         assert!(serde_json::from_value::<AddReviewRequest>(
             serde_json::json!({ "verdict": "shrug" })
         )

@@ -7,6 +7,7 @@
 pub mod api;
 pub mod changeset;
 pub mod error;
+pub mod fsync;
 pub mod hash;
 pub mod intern;
 pub mod memory;

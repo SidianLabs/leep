@@ -154,6 +154,8 @@ fn checkout_materializes_prefixes_modes_and_prunes() {
             Some("a.txt")
         );
     }
+    // Modes and symlinks are not materialized on Windows, so status differs.
+    #[cfg(unix)]
     assert!(status(&ctx.wc).unwrap().is_clean());
 
     // Server moves on: delete a.txt, edit sub/x.txt. Sync follows it.
@@ -622,6 +624,7 @@ fn search_sends_flags_and_decodes_matches() {
 }
 
 mod signing {
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     use ed25519_dalek::{Signature, VerifyingKey};
@@ -674,6 +677,7 @@ mod signing {
         assert_valid(req, id);
     }
 
+    #[cfg(unix)]
     #[test]
     fn unusable_key_fails_before_anything_is_uploaded() {
         let mock = Mock::start();

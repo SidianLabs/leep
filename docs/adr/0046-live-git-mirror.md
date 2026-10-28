@@ -1,5 +1,5 @@
 # 0046. Live two-way mirror between Leep and a git remote
-Status: Accepted; extended by [0049](0049-mirror-merges-and-land-branches.md) and [0061](0061-mirror-ref-prefixes.md)
+Status: Accepted; extended by [0049](0049-mirror-merges-and-land-branches.md), [0061](0061-mirror-ref-prefixes.md) and (proposed) [0062](0062-git-primary-refs.md)
 Date: 2026-10-18
 
 ## Context

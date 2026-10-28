@@ -7,6 +7,21 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 ## [Unreleased]
 
+### GitHub pull request reviews reach the review gate (ADR 0063, mirror half)
+- `leep-git mirror run --github-reviews`, with `--github-users FILE`
+  (`login = principal`), `--github-api-token-file` and optionally
+  `--github-repo` and `--github-api-url`: after each remote poll, the
+  reviews of the open pull request of every two-way prefix ref's branch
+  are posted to Leep as reviews for the mapped principal, on every
+  changeset of the ref's unlanded stack (`approve`, `reject`, or
+  `withdrawn` for a dismissal or a stale approval), through a token with
+  `"review_for": true`. Only mapped logins count; a person's own Leep
+  review is never changed. New per-ref status (`pull_request`,
+  `github_reviews`), `leep_mirror_github_reviews_total{ref,result}` and
+  the `github` error stage.
+- `reqwest` moves to the workspace dependencies; `leep-git` uses it for
+  GitHub and `leep-cli` for the server as before.
+
 ### Windows working copies and store URLs (issue #208)
 - **Fixed.** On Windows every executable file in a working copy showed as
   modified forever, since NTFS has no executable bit to compare: `leep`
@@ -37,6 +52,42 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   and `leep-mcp` still ends with status 1 when its client closes stdout.
   SIGPIPE stays ignored in every binary, so a closed socket never kills a
   process.
+
+### Git-primary refs and two-way review branches in the mirror (ADR 0062)
+- `leep-git mirror run --primary git`, or `@git` on one `--ref`, makes the
+  remote that ref's source of truth: when both sides moved, the remote's
+  commits are imported and Leep's unpushed lands are replayed onto them
+  with `POST /v1/refs/{name}/rebase-onto` (new states and counters:
+  `restored`, `leep_mirror_replays_total`, `leep_mirror_restores_total`),
+  and a Leep undo is moved forward again to the remote's tip. Needs
+  `--import`. Conflicts still report `diverged` and move nothing.
+- `--ref-prefix` refs are two-way with `--import`: a person's commits on
+  a review branch are imported, and landed onto the ref when an agent
+  rewrote it, with the branch pushed under a lease on the tip imported. A
+  branch deleted on the remote deletes the Leep ref once its work is landed
+  (`leep_mirror_refs_deleted_total`) and reports `deleted-on-remote`
+  otherwise. Without `--import` prefix refs stay push-only.
+- Land branches and the mirror's lands now carry a `land_id` derived from
+  what is landed, so a retry after a crash is the same land.
+
+### `POST /v1/refs/{name}/rebase-onto` (ADR 0062, server half)
+- New endpoint for the git mirror's git-primary refs: replays the ref's
+  first-parent stack above `expected_base` onto `onto` and moves the ref
+  once (ref log operation `git-mirror`), queued with the ref's lands so no
+  land is lost to the race. 409 when the merge base moved, 400 on a
+  `--protect-ref` ref, `land_id` for idempotent retries. The mirror does
+  not call it yet.
+- A ref whose name ends in `/rebase-onto` can no longer be moved with
+  `POST /v1/refs/{name}`; `land` still moves it.
+
+### Reviews on behalf of a named reviewer (ADR 0063, server half)
+- Tokens-file field `"review_for": true` (default false) lets a token post
+  `POST /v1/changesets/{id}/reviews` with `reviewer` and `source`; the review is
+  stored under `reviewer` and a new derived kind `review-source-v1` records the
+  posting token and source. Without the field, a body naming `reviewer` is 403.
+  `GET .../reviews` entries gain `source` and `via`.
+- `Verdict::Withdrawn` (appended last) counts as no review;
+  `leep review withdraw REV`. Servers must be upgraded before a client posts it.
 
 ### Land admission is on by default (`--land-queue-batches 4`)
 - **Behavior change.** `leep-server --land-queue-batches` (and

@@ -470,6 +470,18 @@ move refs like any write token; posting a review is a 403 (`token may not
 review`), and reviews it posted before are ignored from the next request on
 (the field reloads on SIGHUP).
 
+A token entry may also say `"review_for": true` (default `false`). Such a token
+may post a review with a body `reviewer` naming the principal it is for, and a
+`source` string; the review is stored under that principal and a
+`review-source-v1` row records which token posted it (ADR 0063). It is for the
+git mirror's GitHub approvals and nothing else: it can write a review as anyone
+it names, so keep it off every other token. It is independent of `"review"`,
+which governs only reviews the token posts as itself; a mirror token is usually
+`"review": false, "review_for": true`. A body naming a `reviewer` from any other
+token is a 403, never taken as that token's own review. The field reloads on
+SIGHUP. A review can be withdrawn with verdict `withdrawn` (`leep review
+withdraw REV`); it then counts as no review.
+
 ## Reloading config
 
 Send SIGHUP to the server to re-read the tokens file, the signing keys file and

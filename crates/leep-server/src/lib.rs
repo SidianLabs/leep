@@ -285,7 +285,7 @@ pub fn router_with_read_limits(
         )
         .route("/v1/changesets/{id}/review-status", get(review_status))
         .route("/v1/refs", get(list_refs))
-        .route("/v1/refs/{*name}", get(get_ref).post(cas_ref))
+        .route("/v1/refs/{*name}", get(get_ref).post(post_ref))
         .route("/v1/reflog", get(ref_log_all))
         .route("/v1/reflog/{*name}", get(ref_log_one))
         .route("/v1/resolve/{*rev}", get(resolve))
@@ -883,24 +883,65 @@ async fn add_review(
     Path(id): Path<String>,
     body: Bytes,
 ) -> ApiResult<Response> {
-    if who.as_ref().is_some_and(|p| !p.review) {
-        return Ok(auth::reject(
+    let forbidden = |why: &str| {
+        auth::reject(
             StatusCode::FORBIDDEN,
             leep_core::api::error_code::FORBIDDEN,
-            "token may not review: its tokens-file entry has \"review\": false",
-        ));
-    }
+            why,
+        )
+    };
     let id = cid(&id)?;
     let req: AddReviewRequest = parse_json(&body)?;
+    // A body naming a reviewer is never taken as the token's own review. With
+    // the capability the token speaks for someone else, so its own `review`
+    // flag (an agent-style token that approves nothing itself) does not apply.
+    if let Some(p) = who.as_ref() {
+        if req.reviewer.is_some() {
+            if !p.review_for {
+                return Ok(forbidden(
+                    "token may not review for others: its tokens-file entry lacks \
+                     \"review_for\": true",
+                ));
+            }
+        } else if !p.review {
+            return Ok(forbidden(
+                "token may not review: its tokens-file entry has \"review\": false",
+            ));
+        }
+    }
     repo.get_changeset(id).await?;
     let who = who.ok_or_else(|| Error::Invalid(NEEDS_AUTH.into()))?;
+    let reviewer = match req.reviewer {
+        Some(name) if name.trim().is_empty() => {
+            return Err(Error::Invalid("review reviewer must not be empty".into()).into())
+        }
+        Some(name) => name,
+        None => who.name.clone(),
+    };
+    leep_core::review::check_source(req.source.as_deref().unwrap_or_default())?;
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64);
+    // Source first: a crash between the two leaves a source with no review
+    // behind it, which listing ignores, never a review with a wrong origin.
+    // A direct post over an earlier on-behalf one replaces its source row,
+    // so the old origin is not shown for the new verdict.
+    if req.source.is_some() || repo.get_review_source(id, &reviewer).await?.is_some() {
+        repo.put_review_source(
+            id,
+            &reviewer,
+            &leep_core::review::ReviewSource {
+                via: who.name.clone(),
+                source: req.source.unwrap_or_default(),
+                timestamp,
+            },
+        )
+        .await?;
+    }
     repo.put_review(
         id,
         &leep_core::review::Review {
-            reviewer: who.name.clone(),
+            reviewer: reviewer.clone(),
             verdict: req.verdict,
             comment: req.comment,
             timestamp,
@@ -908,7 +949,7 @@ async fn add_review(
     )
     .await?;
     Ok(Json(AddReviewResponse {
-        reviewer: who.name,
+        reviewer,
         verdict: req.verdict,
     })
     .into_response())
@@ -987,11 +1028,92 @@ fn ref_context(who: Option<&auth::Principal>, req: &CasRefRequest) -> ApiResult<
     Ok(ctx)
 }
 
-async fn cas_ref(
+/// `POST /v1/refs/{name}` moves a ref, and `POST /v1/refs/{name}/rebase-onto`
+/// replays it: ref names may hold `/`, so both share the route. A ref whose
+/// name ends in `/rebase-onto` cannot be moved by `POST`; land onto it.
+#[allow(clippy::too_many_arguments)]
+async fn post_ref(
     State(repo): S,
     Extension(config): Cfg,
-    auth::MaybePrincipal(who): auth::MaybePrincipal,
+    who: auth::MaybePrincipal,
+    coordination: Option<Extension<Arc<coord::Coordination>>>,
+    from_peer: Option<Extension<coord::FromPeer>>,
+    headers: HeaderMap,
     Path(name): Path<String>,
+    body: Bytes,
+) -> ApiResult<Response> {
+    match name.strip_suffix(REBASE_ONTO_SUFFIX) {
+        Some(name) => {
+            rebase_onto(
+                repo,
+                config,
+                who,
+                coordination,
+                from_peer,
+                headers,
+                name,
+                body,
+            )
+            .await
+        }
+        None => cas_ref(repo, config, who, &name, body).await,
+    }
+}
+
+const REBASE_ONTO_SUFFIX: &str = "/rebase-onto";
+
+/// Replay a git-primary ref onto commits git gained (ADR 0062), queued with
+/// the ref's lands on the server coordinating it.
+#[allow(clippy::too_many_arguments)]
+async fn rebase_onto(
+    repo: Arc<Repo>,
+    config: Arc<reload::RuntimeConfig>,
+    auth::MaybePrincipal(who): auth::MaybePrincipal,
+    coordination: Option<Extension<Arc<coord::Coordination>>>,
+    from_peer: Option<Extension<coord::FromPeer>>,
+    headers: HeaderMap,
+    name: &str,
+    body: Bytes,
+) -> ApiResult<Response> {
+    let req: RebaseOntoRequest = parse_json(&body)?;
+    let repo = repo.with_land_policy_replaced(config.land_policy.clone());
+    let actor = who.as_ref().map(|p| p.name.as_str());
+    let Some(Extension(coordination)) = coordination.filter(|_| repo.land_coordinator().is_some())
+    else {
+        return Ok(Json(
+            repo.rebase_onto(name, req.onto, req.expected_base, actor, req.land_id)
+                .await?,
+        )
+        .into_response());
+    };
+    let forward = coord::HttpForward::new(coordination, &headers, body)
+        .to(format!("v1/refs/{name}{REBASE_ONTO_SUFFIX}"));
+    use leep_derive::land_coord::Coordinated;
+    Ok(
+        match repo
+            .rebase_onto_coordinated(
+                name,
+                req.onto,
+                req.expected_base,
+                actor,
+                req.land_id,
+                from_peer.is_some(),
+                &forward,
+            )
+            .await?
+        {
+            Coordinated::Landed(r) => Json(r).into_response(),
+            Coordinated::Forwarded(relayed) => relayed.into_response(),
+            Coordinated::NotLeader => coord::not_leader(),
+        },
+    )
+}
+
+async fn cas_ref(
+    repo: Arc<Repo>,
+    config: Arc<reload::RuntimeConfig>,
+    auth::MaybePrincipal(who): auth::MaybePrincipal,
+    name: &str,
     body: Bytes,
 ) -> ApiResult<Response> {
     let req: CasRefRequest = parse_json(&body)?;
@@ -999,9 +1121,9 @@ async fn cas_ref(
     // One policy snapshot for the whole move: protection, forward-only, checks.
     let repo = repo.with_land_policy_replaced(config.land_policy.clone());
     let won = repo
-        .cas_ref_checked(&name, req.expected, req.new, &ctx)
+        .cas_ref_checked(name, req.expected, req.new, &ctx)
         .await?;
-    let current = repo.meta().get_ref(&name).await?;
+    let current = repo.meta().get_ref(name).await?;
     let status = if won {
         StatusCode::OK
     } else {

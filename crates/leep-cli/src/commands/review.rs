@@ -16,6 +16,8 @@ pub enum ReviewCmd {
     Approve(ApproveArgs),
     /// Reject a changeset; an owner's rejection blocks it from landing.
     Reject(RejectArgs),
+    /// Take back your earlier approval or rejection; it then counts as no review.
+    Withdraw(ApproveArgs),
     /// Show, per changed path, who still has to approve (exit 1 if not approved).
     Status(StatusArgs),
     /// List the reviews a changeset has.
@@ -56,6 +58,7 @@ pub fn run(r: &Remote, cmd: &ReviewCmd) -> Result<i32> {
     match cmd {
         ReviewCmd::Approve(a) => verdict(r, &a.rev, Verdict::Approve, a.message.clone()),
         ReviewCmd::Reject(a) => verdict(r, &a.rev, Verdict::Reject, Some(a.message.clone())),
+        ReviewCmd::Withdraw(a) => verdict(r, &a.rev, Verdict::Withdrawn, a.message.clone()),
         ReviewCmd::Status(a) => status(r, a),
         ReviewCmd::List(a) => list(r, a),
     }
@@ -68,6 +71,8 @@ fn verdict(r: &Remote, rev: &str, v: Verdict, comment: Option<String>) -> Result
         &AddReviewRequest {
             verdict: v,
             comment: comment.unwrap_or_default(),
+            reviewer: None,
+            source: None,
         },
     )?;
     if r.json {
@@ -76,6 +81,7 @@ fn verdict(r: &Remote, rev: &str, v: Verdict, comment: Option<String>) -> Result
         let word = match v {
             Verdict::Approve => "Approved",
             Verdict::Reject => "Rejected",
+            Verdict::Withdrawn => "Withdrew review of",
         };
         outln!("{word} {} as {}", short(id), resp.reviewer);
     }
@@ -179,6 +185,12 @@ pub fn review_lines(id: leep_core::ChangesetId, resp: &ReviewsResponse) -> Vec<S
         if !r.comment.is_empty() {
             line.push_str(&format!(" {:?}", r.comment));
         }
+        match (&r.source, &r.via) {
+            (Some(s), Some(v)) => line.push_str(&format!(" [{s} via {v}]")),
+            (Some(s), None) => line.push_str(&format!(" [{s}]")),
+            (None, Some(v)) => line.push_str(&format!(" [via {v}]")),
+            (None, None) => {}
+        }
         out.push(line);
     }
     out
@@ -186,7 +198,7 @@ pub fn review_lines(id: leep_core::ChangesetId, resp: &ReviewsResponse) -> Vec<S
 
 #[cfg(test)]
 mod tests {
-    use leep_core::api::PathReview;
+    use leep_core::api::{PathReview, ReviewEntry};
     use leep_core::review::Review;
     use leep_core::{ChangesetId, Hash, RepoPath};
 
@@ -253,11 +265,15 @@ mod tests {
         };
         assert!(review_lines(id(), &none)[0].contains("no reviews"));
         let resp = ReviewsResponse {
-            reviews: vec![Review {
-                reviewer: "alice".into(),
-                verdict: Verdict::Approve,
-                comment: "ok".into(),
-                timestamp: 0,
+            reviews: vec![ReviewEntry {
+                source: Some("github:o/r#1".into()),
+                via: Some("mirror".into()),
+                review: Review {
+                    reviewer: "alice".into(),
+                    verdict: Verdict::Approve,
+                    comment: "ok".into(),
+                    timestamp: 0,
+                },
             }],
             via: Some(ChangesetId(Hash::of_blob(b"orig"))),
         };
@@ -265,5 +281,6 @@ mod tests {
         assert!(lines[0].starts_with("1 review "), "{lines:?}");
         assert!(lines[1].contains("rebased from"));
         assert!(lines[2].contains("alice approve 1970-01-01") && lines[2].contains("\"ok\""));
+        assert!(lines[2].ends_with("[github:o/r#1 via mirror]"), "{lines:?}");
     }
 }

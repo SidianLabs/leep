@@ -8,7 +8,9 @@ use std::hash::BuildHasher;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use leep_core::api::{LandRefusal, LandResponse, RebaseResponse, REFUSED_ADMISSION};
+use leep_core::api::{
+    LandRefusal, LandResponse, RebaseOntoResponse, RebaseResponse, REFUSED_ADMISSION,
+};
 use leep_core::refname::{self, MISSING_REF_MARKER, NOT_FORWARD_MARKER};
 use leep_core::{
     ChangesetId, Error, FileChange, Hash, LandId, LandKey, LandRecord, RefStep, RefUpdateContext,
@@ -50,6 +52,8 @@ const ADMISSION_RETRY_MIN_SECS: u64 = 1;
 const ADMISSION_RETRY_MAX_SECS: u64 = 10;
 /// Weight of the newest batch in a queue's moving average of batch times.
 const BATCH_TIME_WEIGHT: f64 = 0.2;
+/// The ref log operation of a `rebase-onto` move: the git mirror's.
+pub const GIT_MIRROR_OPERATION: &str = "git-mirror";
 
 /// The answer for the lands of a batch past [`MAX_BATCH_LIFETIME`].
 fn past_deadline(target_ref: &str) -> Error {
@@ -174,7 +178,7 @@ impl LandQueues {
 
 #[derive(Default)]
 struct RefQueue {
-    pending: VecDeque<Queued>,
+    pending: VecDeque<Job>,
     /// A leader task is draining `pending`; whoever finds none starts one.
     leading: bool,
     /// Lands admitted and not yet queued: they are reading their changeset.
@@ -243,7 +247,7 @@ impl Admitted<'_> {
         let mut q = lock(&self.queue);
         q.reserved -= 1;
         self.held = false;
-        q.pending.push_back(land);
+        q.pending.push_back(Job::Land(land));
         self.queues.report(&mut q);
         !std::mem::replace(&mut q.leading, true)
     }
@@ -261,6 +265,40 @@ impl Drop for Admitted<'_> {
 
 fn lock(queue: &Mutex<RefQueue>) -> MutexGuard<'_, RefQueue> {
     queue.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// What a ref's queue holds, in arrival order: lands, batched together, and
+/// replays of the ref onto a new base (ADR 0062), each run alone between
+/// batches, so lands and replays never race each other's swaps.
+enum Job {
+    Land(Queued),
+    RebaseOnto(QueuedRebase),
+}
+
+/// A `rebase-onto` waiting its turn.
+struct QueuedRebase {
+    repo: Repo,
+    onto: ChangesetId,
+    expected_base: ChangesetId,
+    ctx: RefUpdateContext,
+    /// `None`: this server stopped coordinating the ref; route it again.
+    reply: oneshot::Sender<Option<Result<RebaseOntoResponse>>>,
+    led: bool,
+}
+
+/// What the leader runs next.
+enum Next {
+    Lands(Vec<Queued>),
+    RebaseOnto(Box<QueuedRebase>),
+}
+
+/// What one attempt of a `rebase-onto` came to before its swap.
+enum Replayed {
+    Done(RebaseOntoResponse),
+    Move {
+        head: ChangesetId,
+        rebased: Vec<(ChangesetId, ChangesetId)>,
+    },
 }
 
 /// A land waiting for its batch.
@@ -440,23 +478,54 @@ async fn lead(repo: Repo, target_ref: String, queue: Arc<Mutex<RefQueue>>) {
         done: false,
     };
     loop {
-        let batch: Vec<Queued> = {
+        let next = {
             let mut q = lock(&queue);
-            if q.pending.is_empty() {
-                q.leading = false;
-                q.replaying = false;
-                queues.report(&mut q);
-                leading.done = true;
-                return;
-            }
-            let n = q.pending.len().min(MAX_BATCH);
+            let next = match q.pending.pop_front() {
+                None => {
+                    q.leading = false;
+                    q.replaying = false;
+                    queues.report(&mut q);
+                    leading.done = true;
+                    return;
+                }
+                Some(Job::RebaseOnto(r)) => Next::RebaseOnto(Box::new(r)),
+                Some(Job::Land(first)) => {
+                    let mut batch = vec![first];
+                    while batch.len() < MAX_BATCH {
+                        match q.pending.pop_front() {
+                            Some(Job::Land(l)) => batch.push(l),
+                            Some(other) => {
+                                q.pending.push_front(other);
+                                break;
+                            }
+                            None => break,
+                        }
+                    }
+                    Next::Lands(batch)
+                }
+            };
             q.replaying = true;
-            let batch = q.pending.drain(..n).collect();
             queues.report(&mut q);
-            batch
+            next
         };
         let started = Instant::now();
-        repo.land_batch(&target_ref, batch).await;
+        match next {
+            Next::Lands(batch) => repo.land_batch(&target_ref, batch).await,
+            Next::RebaseOnto(r) => {
+                let QueuedRebase {
+                    repo,
+                    onto,
+                    expected_base,
+                    ctx,
+                    reply,
+                    led,
+                } = *r;
+                let result = repo
+                    .rebase_onto_attempts(&target_ref, onto, expected_base, &ctx, led)
+                    .await;
+                let _ = reply.send(result);
+            }
+        }
         lock(&queue).record_batch(started.elapsed());
     }
 }
@@ -1288,7 +1357,8 @@ impl Repo {
             .await?;
         match head {
             Some(h) if !fast_forward => match self.replay_stack(cs, h, origins).await? {
-                Ok(id) => Ok(Step::Move(id)),
+                // The stack holds `cs` at least.
+                Ok(pairs) => Ok(Step::Move(pairs.last().map_or(cs, |p| p.1))),
                 Err(resp) => Ok(Step::Done(resp)),
             },
             _ => Ok(Step::Move(cs)),
@@ -1506,12 +1576,13 @@ impl Repo {
     ///
     /// On conflict, returns the whole stack squashed into one three-way merge
     /// relative to `head`, so the client can resolve it in a single commit.
+    /// Otherwise each replayed changeset with its copy, oldest first.
     async fn replay_stack(
         &self,
         cs: ChangesetId,
         head: ChangesetId,
         origins: &mut HashMap<ChangesetId, Option<ChangesetId>>,
-    ) -> Result<Result<ChangesetId, LandResponse>> {
+    ) -> Result<Result<Vec<(ChangesetId, ChangesetId)>, LandResponse>> {
         let mut stack = Vec::new();
         let mut fork = None;
         let mut cur = cs;
@@ -1540,9 +1611,13 @@ impl Repo {
         }
 
         let mut onto = head;
+        let mut pairs = Vec::with_capacity(stack.len());
         for &id in stack.iter().rev() {
             match self.rebase(id, onto).await? {
-                RebaseResponse::Rebased { id } => onto = id,
+                RebaseResponse::Rebased { id: copy } => {
+                    pairs.push((id, copy));
+                    onto = copy;
+                }
                 RebaseResponse::Conflicts { .. } => {
                     let m = self
                         .merge_trees(
@@ -1551,6 +1626,15 @@ impl Repo {
                             self.root_tree(cs).await?,
                         )
                         .await?;
+                    if m.conflicts.is_empty() {
+                        // A member clashes with `head` alone, but the stack
+                        // as a whole merges cleanly (`head` already has what
+                        // the stack ends with). Land the stack as one copy of
+                        // `cs`; an empty change is a legitimate copy.
+                        let copy = self.rebased_copy(cs, head, m.changes).await?;
+                        return Ok(Ok(vec![(cs, copy)]));
+                    }
+                    debug_assert!(!m.conflicts.is_empty());
                     return Ok(Err(LandResponse::Conflicts {
                         onto: head,
                         conflicts: m.conflicts,
@@ -1559,7 +1643,313 @@ impl Repo {
                 }
             }
         }
-        Ok(Ok(onto))
+        Ok(Ok(pairs))
+    }
+}
+
+/// `rebase-onto` (ADR 0062): the git mirror's replay of a git-primary ref's
+/// unpushed lands onto what git gained. It queues with the ref's lands, so
+/// it neither loses swaps to them nor drops one.
+impl Repo {
+    /// Replay the first-parent stack from `target_ref`'s head down to
+    /// `expected_base` onto `onto`, one copy per changeset, and move the ref
+    /// to the last copy in one logged move (operation `git-mirror`). 409
+    /// unless the merge base of the head and `onto` is `expected_base`, so a
+    /// caller deciding from an old read moves nothing. The land policy checks
+    /// `onto`'s changesets the head lacks; the stack's were checked when they
+    /// landed. Refused on a ref the policy [`protects`], which only moves
+    /// forward. Conflicts store no changeset and move nothing.
+    ///
+    /// [`protects`]: crate::LandPolicy::protects
+    pub async fn rebase_onto(
+        &self,
+        target_ref: &str,
+        onto: ChangesetId,
+        expected_base: ChangesetId,
+        actor: Option<&str>,
+        land_id: Option<LandId>,
+    ) -> Result<RebaseOntoResponse> {
+        self.rebase_onto_queued(target_ref, onto, expected_base, actor, land_id, false)
+            .await
+            .unwrap_or_else(|| {
+                Err(Error::Other(
+                    "rebase-onto was handed back unexpectedly; retry".into(),
+                ))
+            })
+    }
+
+    /// [`rebase_onto`](Self::rebase_onto) on a server holding the ref's land
+    /// lease: `None` when it lost the lease first, and the caller routes the
+    /// request again.
+    pub(crate) async fn rebase_onto_led(
+        &self,
+        target_ref: &str,
+        onto: ChangesetId,
+        expected_base: ChangesetId,
+        actor: Option<&str>,
+        land_id: Option<LandId>,
+    ) -> Option<Result<RebaseOntoResponse>> {
+        self.rebase_onto_queued(target_ref, onto, expected_base, actor, land_id, true)
+            .await
+    }
+
+    /// The refusals that need no read: a bad name, a tag, a protected ref.
+    pub(crate) fn check_rebase_onto(&self, target_ref: &str) -> Result<()> {
+        refname::validate(target_ref)?;
+        if refname::is_tag(target_ref) {
+            return Err(Error::Invalid(format!(
+                "cannot rebase {target_ref:?}: tags are immutable"
+            )));
+        }
+        if self
+            .land_policy
+            .as_ref()
+            .is_some_and(|p| p.protects(target_ref))
+        {
+            return Err(Error::Invalid(format!(
+                "cannot rebase {target_ref:?}: it is protected (--protect-ref) and \
+                 {NOT_FORWARD_MARKER}; a ref git leads cannot be protected in Leep, so \
+                 protect the branch on GitHub instead"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn rebase_onto_queued(
+        &self,
+        target_ref: &str,
+        onto: ChangesetId,
+        expected_base: ChangesetId,
+        actor: Option<&str>,
+        land_id: Option<LandId>,
+        led: bool,
+    ) -> Option<Result<RebaseOntoResponse>> {
+        if let Err(e) = self.check_rebase_onto(target_ref) {
+            return Some(Err(e));
+        }
+        let ctx = RefUpdateContext::new(GIT_MIRROR_OPERATION)
+            .actor(actor)
+            .message(format!("rebased onto {onto}"))
+            .land(land_id.map(|id| LandKey {
+                id,
+                changeset: onto,
+            }));
+        let queue = self.land_queues.queue(target_ref);
+        let (reply, answer) = oneshot::channel();
+        let start_leader = {
+            let mut q = lock(&queue);
+            q.pending.push_back(Job::RebaseOnto(QueuedRebase {
+                repo: self.clone(),
+                onto,
+                expected_base,
+                ctx,
+                reply,
+                led,
+            }));
+            self.land_queues.report(&mut q);
+            !std::mem::replace(&mut q.leading, true)
+        };
+        if start_leader {
+            let task = tokio::spawn(lead(self.clone(), target_ref.to_string(), queue));
+            self.land_queues.track(task.abort_handle());
+        }
+        answer.await.unwrap_or_else(|_| {
+            Some(Err(Error::Other(format!(
+                "rebase-onto of {target_ref:?} was abandoned before it finished; retry"
+            ))))
+        })
+    }
+
+    /// Run a queued `rebase-onto` to its answer, retrying lost swaps (other
+    /// servers sharing the store) as a land batch does. `None` when a lost
+    /// lease hands it back.
+    async fn rebase_onto_attempts(
+        &self,
+        target_ref: &str,
+        onto: ChangesetId,
+        expected_base: ChangesetId,
+        ctx: &RefUpdateContext,
+        led: bool,
+    ) -> Option<Result<RebaseOntoResponse>> {
+        let started = tokio::time::Instant::now();
+        let mut checked = Checked::default();
+        let mut commit_errors = 0;
+        let mut last_error = None;
+        for attempt in 1..=MAX_LAND_ATTEMPTS {
+            if let Some(coord) = self.land_coordinator.as_ref().filter(|_| led) {
+                if !coord.still_leading(target_ref).await {
+                    return None;
+                }
+            }
+            if started.elapsed() >= MAX_BATCH_LIFETIME {
+                return Some(Err(past_deadline(target_ref)));
+            }
+            let start = match self.meta().get_ref(target_ref).await {
+                Ok(h) => h,
+                Err(e) => return Some(Err(e)),
+            };
+            let staging = Arc::new(Staging::default());
+            let replayed = self
+                .rebase_onto_step(
+                    target_ref,
+                    start,
+                    onto,
+                    expected_base,
+                    ctx,
+                    &mut checked,
+                    &staging,
+                )
+                .await;
+            let (head, rebased) = match replayed {
+                Ok(Replayed::Move { head, rebased }) => (head, rebased),
+                Ok(Replayed::Done(resp)) => return Some(Ok(resp)),
+                Err(e) => return Some(Err(e)),
+            };
+            if started.elapsed() >= MAX_BATCH_LIFETIME {
+                return Some(Err(past_deadline(target_ref)));
+            }
+            let step = RefStep {
+                new: Some(head),
+                ctx: ctx.clone(),
+            };
+            let applied = match staging.flush(self).await {
+                Err(e) => Err(e),
+                Ok(()) => self.commit_steps(target_ref, start, &[step]).await,
+            };
+            match applied {
+                Ok(1) => return Some(Ok(RebaseOntoResponse::Moved { head, rebased })),
+                // Lost to another server's move, or its record of this land
+                // id: the next attempt reads both again.
+                Ok(_) | Err(Error::Conflict(_)) => {
+                    commit_errors = 0;
+                    metrics::counter!("leep_land_cas_losses_total").increment(1);
+                }
+                Err(e) => {
+                    commit_errors += 1;
+                    if commit_errors >= MAX_COMMIT_ERRORS {
+                        return Some(Err(e));
+                    }
+                    last_error = Some(e);
+                }
+            }
+            tokio::time::sleep(backoff(attempt)).await;
+        }
+        Some(Err(last_error.unwrap_or_else(|| {
+            Error::Conflict(format!(
+                "rebase-onto of {target_ref:?} lost the race {MAX_LAND_ATTEMPTS} times; retry"
+            ))
+        })))
+    }
+
+    /// One attempt from the head `start`, up to the swap.
+    #[allow(clippy::too_many_arguments)]
+    async fn rebase_onto_step(
+        &self,
+        target_ref: &str,
+        start: Option<ChangesetId>,
+        onto: ChangesetId,
+        expected_base: ChangesetId,
+        ctx: &RefUpdateContext,
+        checked: &mut Checked,
+        staging: &Arc<Staging>,
+    ) -> Result<Replayed> {
+        // After the head: a replay recorded since would have moved it.
+        if let Some(key) = &ctx.land {
+            let found = self
+                .meta()
+                .find_lands(target_ref, std::slice::from_ref(&key.id))
+                .await?;
+            if let Some(record) = found.into_iter().next().flatten() {
+                if record.changeset != key.changeset {
+                    return Err(land_id_reused(&key.id, &record, key.changeset));
+                }
+                metrics::counter!("leep_land_recorded_total").increment(1);
+                return Ok(Replayed::Done(RebaseOntoResponse::Moved {
+                    head: record.landed,
+                    rebased: self.recorded_copies(record.landed, onto).await?,
+                }));
+            }
+        }
+        let Some(head) = start else {
+            return Err(Error::NotFound(format!(
+                "ref {target_ref:?} does not exist"
+            )));
+        };
+        let base = self.merge_base(head, onto).await?;
+        if base != Some(expected_base) {
+            let found = base.map_or_else(|| "none".to_string(), |b| b.to_string());
+            return Err(Error::Conflict(format!(
+                "the merge base of {target_ref:?} at {head} and {onto} is {found}, not the \
+                 expected {expected_base}; read the ref again"
+            )));
+        }
+        // `onto` is in the head already: nothing to do.
+        if expected_base == onto {
+            return Ok(Replayed::Done(RebaseOntoResponse::Moved {
+                head,
+                rebased: Vec::new(),
+            }));
+        }
+        // Both sides become reachable from the ref; see `rescue_land`.
+        if self.changeset_fence_active(true).await? {
+            self.rescue_land(onto, Some(head)).await?;
+            self.rescue_land(head, Some(onto)).await?;
+        }
+        // `onto`'s changesets the ref never had, and not the stack's: those
+        // passed when they landed, and their copies keep that standing.
+        self.enforce_land_policy(onto, Some(head), target_ref, checked)
+            .await?;
+        if expected_base == head {
+            return Ok(Replayed::Move {
+                head: onto,
+                rebased: Vec::new(),
+            });
+        }
+        let staged = staging.repo(self);
+        match staged.replay_stack(head, onto, &mut HashMap::new()).await? {
+            Ok(rebased) => Ok(Replayed::Move {
+                head: rebased.last().map_or(onto, |p| p.1),
+                rebased,
+            }),
+            Err(resp) => match self.store_clean(staging, resp).await? {
+                LandResponse::Conflicts {
+                    onto,
+                    conflicts,
+                    clean,
+                } => Ok(Replayed::Done(RebaseOntoResponse::Conflicts {
+                    onto,
+                    conflicts,
+                    clean,
+                })),
+                LandResponse::Landed { .. } => {
+                    Err(Error::Other("replay answered a land, not conflicts".into()))
+                }
+            },
+        }
+    }
+
+    /// The pairs of an applied `rebase-onto`, read back for a retry: the
+    /// server-made copies on the first-parent chain from `head` down to
+    /// `onto`, oldest first.
+    async fn recorded_copies(
+        &self,
+        head: ChangesetId,
+        onto: ChangesetId,
+    ) -> Result<Vec<(ChangesetId, ChangesetId)>> {
+        let mut pairs = Vec::new();
+        let mut cur = head;
+        while cur != onto && pairs.len() < LANDED_COPY_SCAN {
+            let Some(original) = self.rebased_origin(cur).await? else {
+                break;
+            };
+            pairs.push((original, cur));
+            match self.parents(cur).await?.first() {
+                Some(&p) => cur = p,
+                None => break,
+            }
+        }
+        pairs.reverse();
+        Ok(pairs)
     }
 }
 

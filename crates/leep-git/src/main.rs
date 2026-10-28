@@ -98,17 +98,26 @@ struct RunArgs {
     /// status file and a lock (one mirror per directory).
     #[arg(long)]
     work_dir: PathBuf,
-    /// Leep ref to mirror, as NAME or NAME:GIT_REF (repeatable). NAME maps
-    /// to refs/heads/NAME and tags/T to refs/tags/T.
+    /// Leep ref to mirror, as NAME or NAME:GIT_REF, with @git or @leep
+    /// appended to say which side is the source of truth for it
+    /// (repeatable). NAME maps to refs/heads/NAME and tags/T to refs/tags/T.
     #[arg(long = "ref", value_name = "SPEC")]
     refs: Vec<String>,
+    /// Which side wins a race on a --ref that does not say: `leep` (both
+    /// sides moved: report, and push Leep's side to the diverged branch) or
+    /// `git` (replay Leep's unpushed lands onto the remote's commits, and
+    /// move a Leep undo forward again). Needs --import. Tags stay Leep's.
+    #[arg(long, default_value = "leep")]
+    primary: mirror::Primary,
     /// Also mirror every Leep tag to refs/tags/.
     #[arg(long)]
     tags: bool,
     /// Also mirror every Leep ref under PREFIX (such as review/) to the
-    /// branch of the same name, as refs appear (repeatable). Push-only: a
-    /// branch someone pushed to is reported, never imported or overwritten.
-    /// A ref deleted in Leep has its branch deleted with a lease.
+    /// branch of the same name, as refs appear (repeatable). With --import
+    /// the branch is two-way: a person's commits on it are imported and
+    /// landed on the Leep ref. Without it, a branch someone pushed to is
+    /// reported, never imported or overwritten. A ref deleted in Leep has
+    /// its branch deleted with a lease.
     #[arg(long = "ref-prefix", value_name = "PREFIX")]
     ref_prefixes: Vec<String>,
     /// Land commits pushed to the remote in Leep when they fast-forward the
@@ -167,6 +176,26 @@ struct RunArgs {
     /// Serve GET /metrics, GET /status, GET /health and POST /poke here.
     #[arg(long, env = "LEEP_MIRROR_LISTEN")]
     listen: Option<std::net::SocketAddr>,
+    /// Bring pull request approvals on the branches of two-way prefix refs
+    /// into Leep as reviews for the mapped principal (ADR 0063). Needs
+    /// --import, a --ref-prefix, --github-users and a Leep token with
+    /// "review_for": true.
+    #[arg(long)]
+    github_reviews: bool,
+    /// File holding a GitHub token with read access to pull requests
+    /// (LEEP_GITHUB_TOKEN also works). Never on the command line.
+    #[arg(long, value_name = "FILE")]
+    github_api_token_file: Option<PathBuf>,
+    /// File of `login = principal` lines: which GitHub logins count as
+    /// which Leep reviewers. Only mapped logins count.
+    #[arg(long, value_name = "FILE")]
+    github_users: Option<PathBuf>,
+    /// The GitHub repository, when it cannot be read from --remote.
+    #[arg(long, value_name = "OWNER/REPO")]
+    github_repo: Option<String>,
+    /// The GitHub API root (a GitHub Enterprise server's, if not github.com).
+    #[arg(long, default_value = "https://api.github.com")]
+    github_api_url: String,
     /// Run cycles until nothing changes, then exit 0 if every ref is in
     /// sync or pending and 1 otherwise.
     #[arg(long)]
@@ -280,12 +309,58 @@ fn run_mirror(cmd: MirrorCmd) -> Result<i32> {
                 .iter()
                 .map(|r| RefSpec::parse(r))
                 .collect::<Result<Vec<_>>>()?;
+            let github = if a.github_reviews {
+                let users_path = a
+                    .github_users
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("--github-reviews needs --github-users FILE"))?;
+                let users = mirror::github::parse_users(
+                    &std::fs::read_to_string(users_path)
+                        .with_context(|| format!("reading {}", users_path.display()))?,
+                )
+                .with_context(|| format!("{}", users_path.display()))?;
+                let (owner, repo) = match &a.github_repo {
+                    Some(r) => r
+                        .split_once('/')
+                        .map(|(o, r)| (o.to_string(), r.to_string()))
+                        .filter(|(o, r)| !o.is_empty() && !r.is_empty())
+                        .ok_or_else(|| anyhow::anyhow!("--github-repo must be OWNER/REPO"))?,
+                    None => mirror::github::repo_from_remote(&a.remote).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "cannot tell the GitHub repository from --remote; pass --github-repo \
+                             OWNER/REPO"
+                        )
+                    })?,
+                };
+                let gh_token = match &a.github_api_token_file {
+                    Some(f) => Some(
+                        std::fs::read_to_string(f)
+                            .with_context(|| format!("reading {}", f.display()))?
+                            .trim()
+                            .to_string(),
+                    )
+                    .filter(|t| !t.is_empty()),
+                    None => std::env::var("LEEP_GITHUB_TOKEN")
+                        .ok()
+                        .filter(|t| !t.is_empty()),
+                };
+                Some(mirror::github::GitHubConfig {
+                    owner,
+                    repo,
+                    users,
+                    token: gh_token,
+                    api_url: a.github_api_url.clone(),
+                })
+            } else {
+                None
+            };
             let cfg = mirror::Config {
                 server: a.server.clone(),
                 token: token.clone(),
                 remote: a.remote,
                 work_dir: a.work_dir,
                 refs,
+                primary: a.primary,
                 tags: a.tags,
                 ref_prefixes: a.ref_prefixes,
                 import: a.import,
@@ -304,6 +379,7 @@ fn run_mirror(cmd: MirrorCmd) -> Result<i32> {
                 git_timeout: a.git_timeout,
                 max_backoff: a.max_backoff,
                 listen: a.listen,
+                github,
             };
             let client = leep_cli::client::Client::with_token(&a.server, token.as_deref());
             let mut m = mirror::Mirror::open(cfg, &client)?;

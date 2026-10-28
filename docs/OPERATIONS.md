@@ -598,9 +598,15 @@ server and lands it. With `--land-branches`, people push to
 agent's land ([ADR 0049](adr/0049-mirror-merges-and-land-branches.md)). With
 `--ref-prefix review/`, every Leep ref under `review/` is pushed to the
 branch of the same name as it appears, and its branch is deleted when the
-Leep ref is ([ADR 0061](adr/0061-mirror-ref-prefixes.md)). It never resolves
-a conflict itself. The only branches it force-pushes are those of prefix
-refs, and only with a lease on a tip the Leep ref held.
+Leep ref is ([ADR 0061](adr/0061-mirror-ref-prefixes.md)); with `--import`
+as well, a person's commits on such a branch are imported and landed on the
+Leep ref. With `--primary git` (or `@git` on one `--ref`), the remote is
+that ref's source of truth: when both sides moved, Leep's unpushed lands are
+replayed onto the remote's commits and the remote only fast-forwards, and a
+Leep undo is moved forward again ([ADR 0062](adr/0062-git-primary-refs.md)).
+It never resolves a conflict itself. The only branches it force-pushes are
+those of prefix refs, and only with a lease on a tip the Leep ref held or
+the mirror imported.
 
 The mirror is a separate process. It talks to `leep-server` over the HTTP
 API with a token, and to the remote with the system `git` (2.30 or later).
@@ -659,10 +665,11 @@ leep-git mirror run \
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--ref NAME[:GIT_REF]` | – | Mirror a Leep ref, repeatable. `NAME` maps to `refs/heads/NAME`, `tags/T` to `refs/tags/T`. |
+| `--ref NAME[:GIT_REF][@git\|@leep]` | – | Mirror a Leep ref, repeatable. `NAME` maps to `refs/heads/NAME`, `tags/T` to `refs/tags/T`. `@git` or `@leep` names the ref's source of truth; without it, `--primary` decides. |
+| `--primary` | `leep` | Which side wins a race on a `--ref` that does not say. `leep`: ADR 0046's rules (both moved: `diverged`; an undo: `rewound`). `git`: the remote's commits are imported and Leep's unpushed lands replayed onto them by `POST /v1/refs/{name}/rebase-onto`; an undo is `restored` to the remote's tip. Needs `--import`. Tags are never git-primary, and a git-primary ref cannot be in `--allow-rewind` or under the server's `--protect-ref`. |
 | `--tags` | off | Also mirror every Leep tag. Tags are created, never moved. |
-| `--ref-prefix PREFIX` | – | Also mirror every Leep ref under `PREFIX` (such as `review/`) to the branch of the same name, as refs appear and go. Repeatable. Push-only; see "Prefix refs" below. Must end in `/` and not overlap `--diverged-prefix`, `--land-prefix`, another prefix or any `--ref`. |
-| `--import` | off | Land fast-forward pushes from the remote in Leep, through the land policy. |
+| `--ref-prefix PREFIX` | – | Also mirror every Leep ref under `PREFIX` (such as `review/`) to the branch of the same name, as refs appear and go. Repeatable. Push-only without `--import`, two-way with it; see "Prefix refs" below. Must end in `/` and not overlap `--diverged-prefix`, `--land-prefix`, another prefix or any `--ref`. |
+| `--import` | off | Land fast-forward pushes from the remote in Leep, through the land policy. Also makes prefix refs two-way. |
 | `--interval` | `1s` | How often to check the ref log for moves. |
 | `--git-poll` | `15s` | How often to `ls-remote` the remote. `POST /poke` polls at once. |
 | `--reconcile` | `60s` | Re-read every Leep ref even if the ref log is quiet. |
@@ -674,6 +681,11 @@ leep-git mirror run \
 | `--merge-author` | `Leep git mirror <git-mirror@leep.invalid>` | Author of the mirror's merges. Part of each merge's id: choose once. |
 | `--land-branches` | off | Land remote branches `PREFIX<ref>/<name>` onto the Leep ref `<ref>` through the server's land, then delete them. Needs `--import`. |
 | `--land-prefix` | `leep-land/` | Prefix of land branches. Must not overlap `--diverged-prefix` or any mirrored branch. |
+| `--github-reviews` | off | Bring pull request reviews on the branches of two-way prefix refs into Leep as reviews for the mapped principal ([ADR 0063](adr/0063-github-reviews.md)); see "GitHub reviews" below. Needs `--import`, a `--ref-prefix`, `--github-users` and a Leep token with `"review_for": true`. |
+| `--github-users FILE` | – | `login = principal` lines: which GitHub logins count as which Leep reviewers. Only mapped logins count. |
+| `--github-api-token-file FILE` | – | A GitHub token with read access to pull requests (`LEEP_GITHUB_TOKEN` also works). Not the deploy key. |
+| `--github-repo OWNER/REPO` | from `--remote` | The repository on GitHub, when the remote URL does not say. |
+| `--github-api-url` | `https://api.github.com` | A GitHub Enterprise server's API root. |
 | `--provenance-trailers`, `--no-changeset-trailer` | off | Change commit messages, and so commit ids. Choose once, before the first push. |
 | `--listen ADDR` | off | Serve `GET /metrics`, `GET /status`, `GET /health` and `POST /poke`. |
 | `--once` | off | Run until nothing changes, then exit 0 if healthy and 1 if not (for cron or a check). |
@@ -703,11 +715,13 @@ when there is no status file.
 |---|---|---|
 | `in-sync` | The remote ref is the export of the Leep ref. | Nothing. |
 | `pending` | One side moved and the mirror is catching up, or retrying after the remote moved under a push. | Nothing, unless the lag keeps growing ([LeepMirrorLagging](RUNBOOKS.md#leepmirrorlagging)). |
-| `diverged` | Both sides have commits the other lacks. Leep's side is on `leep-diverged/<branch>`. With `--on-divergence merge` the detail says why the mirror did not merge: the conflicting paths, a land policy refusal, or a remote tip Leep moved back from. | In git, merge `origin/leep-diverged/<branch>` into the branch and push. The mirror lands the merge and deletes the diverged branch. |
-| `rewound` | Leep moved the ref back (an undo). The remote keeps the newer commits. | Land a revert in Leep (the usual fix), or, for a scratch branch, allow it with `--allow-rewind`. |
-| `remote-ahead` | The remote has commits Leep lacks and `--import` is off. For a prefix ref: someone pushed to its branch, before or after the Leep ref was deleted. | Enable `--import`, or remove the commits from the remote. For a prefix ref, land the work in Leep, then delete the branch. |
-| `refused` | Leep's land policy refused a push from git (unsigned, unreviewed, OWNERS). The detail quotes the server. | Approve the changesets with `leep review`, or revert the push in git. Checked again every minute. |
+| `diverged` | Both sides have commits the other lacks. Leep's side is on `leep-diverged/<branch>`. With `--on-divergence merge` the detail says why the mirror did not merge: the conflicting paths, a land policy refusal, or a remote tip Leep moved back from. On a git-primary ref the detail says why Leep's lands were not replayed: the conflicting paths, or the server's refusal. For a two-way prefix ref: a person's commits on the branch conflict with an agent's rewrite of the ref. | In git, merge `origin/leep-diverged/<branch>` into the branch and push. The mirror lands the merge and deletes the diverged branch. For a prefix ref, one side takes the other's changes: the person rebases and pushes, or the agent lands them and the person resets the branch. |
+| `rewound` | Leep moved the ref back (an undo). The remote keeps the newer commits. | Land a revert in Leep (the usual fix), or, for a scratch branch, allow it with `--allow-rewind`. A git-primary ref is `restored` instead. |
+| `restored` | A git-primary ref Leep moved back was moved forward again to the remote's tip. Clears on the next cycle. | Nothing. To move such a ref back, revert on the remote. |
+| `remote-ahead` | The remote has commits Leep lacks and `--import` is off. For a prefix ref without `--import`: someone pushed to its branch, before or after the Leep ref was deleted. | Enable `--import`, or remove the commits from the remote. For a prefix ref, land the work in Leep, then delete the branch, or turn on `--import` so such pushes are imported. |
+| `refused` | Leep's land policy refused a push from git (unsigned, unreviewed, OWNERS), or refused a git-primary replay (a ref under `--protect-ref`). The detail quotes the server. | Approve the changesets with `leep review`, or revert the push in git. For a protected git-primary ref, protect the branch on the remote and drop `--protect-ref` for it. Checked again every minute. |
 | `deleted-in-leep` | The Leep ref of a `--ref` is gone. The remote branch is left alone. (A prefix ref's branch is deleted instead.) | Delete the remote branch by hand if that is intended. |
+| `deleted-on-remote` | The branch of a two-way prefix ref was deleted on the remote while its work is landed on no mirrored `--ref`. The Leep ref is kept and the branch is not pushed again until the ref moves. (Had the work been landed, the Leep ref would have been deleted too.) | Land the work, after which the mirror deletes the ref, or delete the ref in Leep. |
 | `error` | The last attempt failed: server, remote, credentials, or the remote rejecting pushes. Retried with backoff. | Read the detail and the log ([LeepMirrorLagging](RUNBOOKS.md#leepmirrorlagging)). |
 
 ### Mirror metrics
@@ -722,12 +736,16 @@ when there is no status file.
 | `leep_mirror_imports_total` | counter | `ref`, `result` = `landed`, `refused`, `lost_race` | Remote pushes the mirror tried to land in Leep. |
 | `leep_mirror_divergences_total` | counter | `ref` | Times the ref entered `diverged`. A steady rate means people push to a ref agents land on all the time. With `--on-divergence merge` only divergences the mirror could not merge count. |
 | `leep_mirror_merges_total` | counter | `ref`, `result` = `landed`, `conflicts`, `refused`, `lost_race` | The mirror's automatic merges (`--on-divergence merge`). `conflicts` and `refused` fall back to `diverged`. |
+| `leep_mirror_replays_total` | counter | `ref`, `result` = `ok`, `conflicts`, `refused`, `stale_base` | Replays of a git-primary ref's unpushed lands onto the remote's commits. `conflicts` and `refused` fall back to `diverged`; `stale_base` means a side moved during the import and the pair was read again. |
+| `leep_mirror_restores_total` | counter | `ref` | Times a git-primary ref Leep moved back was moved forward again to the remote's tip. |
+| `leep_mirror_refs_deleted_total` | counter | none | Two-way prefix refs deleted in Leep after their branch was deleted on the remote with the work landed. |
+| `leep_mirror_github_reviews_total` | counter | `ref`, `result` = `approved`, `rejected`, `withdrawn`, `unmapped` | Reviews posted to Leep from the ref's pull request (`--github-reviews`); `unmapped` counts reviews by logins `--github-users` does not map, per poll. |
 | `leep_mirror_land_branches_total` | counter | `ref`, `result` = `landed`, `conflicts`, `refused` | Land branches tried, counted once per pushed commit. |
 | `leep_mirror_land_branches_failing` | gauge | `ref` | Land branches left on the remote because they conflict or were refused (`ref=""` for a name that matches no mirrored ref). |
 | `leep_mirror_branches_deleted_total` | counter | none | Branches under a `--ref-prefix` deleted because their Leep ref was deleted. |
 | `leep_mirror_commits_exported_total` | counter | none | Commits written from changesets. |
 | `leep_mirror_commits_imported_total` | counter | none | Changesets created from remote commits. |
-| `leep_mirror_errors_total` | counter | `stage` = `leep`, `git`, `export`, `import` | Failed steps. |
+| `leep_mirror_errors_total` | counter | `stage` = `leep`, `git`, `export`, `import`, `github` | Failed steps. |
 | `leep_mirror_cycles_total` | counter | none | Poll cycles. |
 | `leep_mirror_last_cycle_timestamp_seconds` | gauge | none | When the last cycle finished. |
 
@@ -743,14 +761,29 @@ branch of that name appears on the remote, ready for a pull request.
 
 - **Found as they appear.** Each read of Leep's refs adds new ones; the
   status lists them with `"ref_prefix": "review/"`.
-- **Push-only.** A prefix ref is never imported, merged, or landed onto by a
-  land branch, whatever `--import`, `--on-divergence` and `--land-branches`
-  say. A push to its branch is reported as `remote-ahead` (or `diverged` if
-  Leep moved too) and left there.
+- **Push-only without `--import`.** A push to the branch is reported as
+  `remote-ahead` (or `diverged` if Leep moved too) and left there. Prefix
+  refs are never merged (`--on-divergence`) or landed onto by a land branch
+  either way.
+- **Two-way with `--import`** ([ADR 0062](adr/0062-git-primary-refs.md)).
+  A person's commits on top of the branch are imported and the Leep ref
+  moves forward to them, through the ref's land policy. When an agent
+  rebased or squashed the ref as well, the person's commits are imported and
+  landed onto the new ref with `POST /v1/land` (the server replays them,
+  as it does a land branch), and the branch is pushed with a lease on the
+  exact tip imported, so the person's commits get new ids there, as a
+  rebase of a pull request gives them. A conflict is reported as
+  `diverged` and nothing moves. A branch deleted on the remote deletes the
+  Leep ref too when the ref's tip, or a rebased copy of it, is in a
+  mirrored `--ref`'s history (a merged pull request); otherwise the ref is
+  kept and reported as `deleted-on-remote`, and the branch is not pushed
+  again until the ref moves. A branch deleted while the mirror was down
+  is pushed again on its next start: the mirror cannot tell that from a
+  branch it never pushed, and never drops work to guess.
 - **Rewrites.** When an agent rebases or squashes its review ref, the mirror
   pushes the new value with `--force-with-lease` on the old one, but only
   if the Leep ref held the remote's tip (checked in the ref log). Otherwise
-  it reports, as above.
+  it reports, or with `--import` imports, as above.
 - **Deletes.** When the Leep ref is deleted, the mirror deletes the branch
   with a lease on that same tip, under the same check, and stops tracking
   it. This is healthy: the deletion is listed under `deleted_branches` in
@@ -761,6 +794,49 @@ branch of that name appears on the remote, ready for a pull request.
 
 The mirror never deletes or rewinds a branch outside its prefixes, a tag,
 or a `--ref` branch such as `main`.
+
+### GitHub reviews
+
+With `--github-reviews` ([ADR 0063](adr/0063-github-reviews.md)), a team
+reviews once, on GitHub, and Leep's review gate (`--require-review`,
+`OWNERS`; [ADR 0011](adr/0011-review-service.md)) holds. After each remote
+poll, for every two-way prefix ref whose branch has an open pull request,
+the mirror reads the pull request's reviews, keeps the latest per login,
+and posts the matching Leep review for the mapped principal on every
+changeset of the ref that is not yet on the pull request's base ref:
+
+| latest GitHub review by a mapped login | Leep review posted |
+|---|---|
+| `APPROVED` on the pull request's current head | `approve` |
+| `CHANGES_REQUESTED` | `reject` |
+| `APPROVED` on an older head, `DISMISSED`, or gone where one was posted | `withdrawn` |
+
+- **The mapping file is the trust root.** `--github-users` lists
+  `login = principal`; a review by any other login is counted
+  (`leep_mirror_github_reviews_total{result="unmapped"}`) and ignored. A
+  login and a principal may each appear once.
+- **The Leep token needs `"review_for": true`** in the tokens file (see
+  [DEPLOY.md](DEPLOY.md)). Such a token writes reviews as anyone it
+  names, so give it to the mirror and nothing else. Every review it posts
+  carries a `source` of the form `github:OWNER/REPO#N/reviews/ID`, which
+  `leep reviews` shows and which the mirror uses to tell its own reviews
+  from a person's: a review someone posted in Leep directly is never
+  changed by the mirror.
+- **The GitHub token** needs read access to pull requests
+  (`pull_requests: read` for a fine-grained token). Pass it with
+  `--github-api-token-file` or `LEEP_GITHUB_TOKEN`, never on the command
+  line. The mirror's git credential is not reused.
+- **Nothing lands because of this.** The agent, or `leep land`, still
+  lands when `leep review status` says approved. Stale approvals (of an
+  older head) are withdrawn whether or not the repository dismisses stale
+  reviews itself, since Leep ties an approval to one changeset id.
+- **Crashes and outages.** The mirror keeps no record of what it posted:
+  it reads Leep's reviews and posts only the differences, so a failure
+  anywhere, GitHub's or its own, is made good by the next poll. GitHub
+  failures are counted in `leep_mirror_errors_total{stage="github"}` and
+  logged; they never change a ref's state.
+- A pull request whose base is not a mirrored `--ref` is logged and
+  skipped: the mirror cannot tell which changesets it covers.
 
 ### Land branches
 
@@ -1979,7 +2055,7 @@ accepts the retired `history-tree-v1`, `history-tree-v2` and `history-tree-v3`
 current servers no longer use; see [Upgrading](#upgrading).
 
 Kinds that cannot be rederived (and so are refused by `drop` with an
-explanation and exit status 2): `signature-v1` and `review-v1` (clients wrote
+explanation and exit status 2): `signature-v1`, `review-v1` and `review-source-v1` (clients wrote
 them), `rebased-origin-v1` (written by rebase; `land`'s retry detection depends
 on it), `blob-claim-v1`, `blob-condemned-v1`, `blob-rescue-v1`, `blob-doom-v1`, `gc-mark-v1` (the GC
 fence, ADR 0012), `history-node-v4` (or `-v3`, `-v2`, `-v1`) on its own, and the ref log. The full table
