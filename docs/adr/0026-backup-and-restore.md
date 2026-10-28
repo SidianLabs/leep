@@ -1,5 +1,7 @@
 # 0026. Backup and restore
-Status: Accepted
+Status: Accepted. Amended 2026-10-28 (issue #155): changesets can be
+deleted since ADR 0059, so the pool keeps every object any snapshot ever
+copied, packed ones included, and nothing the source deletes is hidden in it.
 Date: 2026-10-16
 
 ## Context
@@ -111,7 +113,10 @@ concurrent runs safe. Details:
 - Blobs only in the pool (deleted from the source since, or needed by an older
   snapshot) stay. The pool never shrinks on its own: to retire old snapshots
   and reclaim space, start a new pool and keep the old one for as long as its
-  snapshots must restore (OPERATIONS.md).
+  snapshots must restore (OPERATIONS.md). *Amended 2026-10-28:* this holds
+  for packed objects too. A backup never copies the source's pack
+  tombstones into the pool (ADR 0039, section 6), and no pool-side prune
+  removes an object, so no source deletion reaches a sealed snapshot.
 
 ### Consistency
 **Invariant (ADR 0012).** A blob or tree node that a stored changeset needs is
@@ -120,8 +125,18 @@ safety argument shows that no `collect` deletes such a blob: any changeset
 stored before the collect's mark protects it by the mark (the mark covers every
 stored changeset, reachable or not, and every tree it names), and any stored
 after reads the blob as unblocked, which the rescue and doom handshake orders
-against the delete. Changesets are never deleted, so the protection is
-permanent.
+against the delete. ~~Changesets are never deleted, so the protection is
+permanent.~~ *Amended 2026-10-28:* since ADR 0059 the changeset sweep
+deletes unreachable changesets, and a later `gc` frees the blobs and tree
+nodes only they used. The protection lasts while the changeset is stored,
+which covers the snapshot taken while it was (the claim below, and ADR
+0059's `--backup-fence` for a delete that races the copy). After that the
+source may delete the objects, so an **older** snapshot that names them is
+safe only because the pool keeps them: the pool's object set only grows,
+for loose and packed objects alike. A backup that hid them in the pool
+(as copying the source's pack tombstones did, issue #155) would break that
+older snapshot silently, since each run's closure check covers only its
+own snapshot.
 
 **Claim.** Take the metadata snapshot at instant T0, then list and copy blobs
 afterwards. Every blob the snapshot's changesets need is in the pool when the
@@ -201,6 +216,13 @@ GC will not delete anything for `--grace` after a restore.
    blob store unless `--force`, or `--resume` when the metadata is still empty
    (continuing an interrupted restore).
 3. Copy the pool's blobs the target lacks (the same incremental copy).
+   *Amended 2026-10-28:* the target gets the whole pool, so objects no
+   changeset of the snapshot names (deleted from the source after it, or
+   needed only by other snapshots) arrive as well, packed or loose, as
+   loose pool extras always did. They are unreferenced, and GC frees them
+   after its grace. No tombstones are derived per snapshot: nothing in a
+   snapshot depends on an object being absent (a doomed blob that is still
+   present is a collect that had not finished, above).
 4. Load the metadata in **one transaction**. A snapshot from an older schema is
    migrated on a scratch copy and adopted exactly as ADR 0023 describes for a
    database (the backup medium is never opened for writing, and its hash
@@ -270,7 +292,10 @@ alert on its age fires.
 - The metadata copy is one stream and one long transaction.
 - Retention is by deleting snapshot directories. Reclaiming pool space needs a
   new pool (or deleting a pool once its snapshots are gone); there is no
-  pruning tool. A shared pool also means a snapshot is only as good as the
+  pruning tool. A pool-side prune would have to know which sealed snapshots
+  still name each object (a closure walk of every snapshot kept); none
+  exists, so the pool keeps everything, including the objects of
+  changesets the sweep deleted. A shared pool also means a snapshot is only as good as the
   pool: keep it on durable storage and verify on a schedule.
 - No encryption or compression: put the backup on encrypted storage. The
   backup holds all repository content, signatures and review history, and

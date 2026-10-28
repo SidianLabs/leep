@@ -732,3 +732,138 @@ async fn packed_sources_back_up_packs_whole_and_old_loose_pools_still_restore() 
     assert!(pack_names(&dest.dir.join("blobs")).is_empty());
     assert_eq!(dest.repo.meta().get_ref("main").await.unwrap(), Some(c));
 }
+
+/// A clock that reads one fixed time, for runs that must happen far past
+/// the sweep's and GC's windows.
+struct At(i64);
+
+#[async_trait]
+impl Clock for At {
+    fn now(&self) -> i64 {
+        self.0
+    }
+    async fn sleep(&self, _: Duration) {}
+}
+
+/// Issue #155: the changeset sweep plus `gc --full` delete a packed tree
+/// node at the source, which tombstones it in its pack. The next backup
+/// must not carry that tombstone into the pool's copy of the pack, or an
+/// older snapshot that names the node stops verifying and restoring.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_packed_object_deleted_at_the_source_stays_in_the_pool_for_older_snapshots() {
+    use leep_derive::changeset_sweep::{self, SweepOptions};
+
+    let root = tempfile::tempdir().unwrap();
+    let site = Site::new(root.path(), "src").await;
+    let (_, side, _) = site.populate().await;
+    let side_tree = site.repo.root_tree(side).await.unwrap();
+    repack_site(&site, leep_store::RepackMode::Full).await;
+    let source_packs = leep_store::open_pack_files(&site.blobs_url)
+        .unwrap()
+        .unwrap();
+    let out = root.path().join("backup");
+
+    let mut o = opts(&site, &out);
+    o.name = Some("20260101T000000Z".into());
+    let first = backup::backup(o, &NoHooks, quiet()).await.unwrap();
+    assert!(first.ok(), "{:?}", first.problems);
+    assert_eq!(first.manifest.blobs.packs_copied, 1);
+
+    // The sweep deletes the unreachable side changeset, then a full GC
+    // deletes its packed trees and contents: tombstones in the source pack.
+    let t = leep_core::store::unix_now() + 30 * 86_400;
+    let sweep = SweepOptions {
+        rate: 0,
+        ..SweepOptions::default()
+    };
+    changeset_sweep::condemn(&site.repo, &sweep, &At(t))
+        .await
+        .unwrap();
+    let r = changeset_sweep::collect(&site.repo, &sweep, &At(t + 3600))
+        .await
+        .unwrap();
+    assert_eq!(r.deleted, 1, "{r:?}");
+    let full = GcOptions {
+        grace: Duration::ZERO,
+        fence: Duration::ZERO,
+        unsafe_no_fence: true,
+        dry_run: false,
+        backup_fence: None,
+    };
+    gc::condemn_with(&site.repo, &full, gc::Mark::Full, &At(t + 7200))
+        .await
+        .unwrap();
+    gc::collect_with(&site.repo, &full, gc::Mark::Full, &At(t + 7200))
+        .await
+        .unwrap();
+    assert!(!site.repo.blobs().contains(&side_tree).await.unwrap());
+    let dead = source_packs.tombstones().await.unwrap();
+    assert!(
+        dead.values().any(|h| h.contains(&side_tree)),
+        "the source tombstoned the packed tree: {dead:?}"
+    );
+
+    let mut o = opts(&site, &out);
+    o.name = Some("20260102T000000Z".into());
+    let second = backup::backup(o, &NoHooks, quiet()).await.unwrap();
+    assert!(second.ok(), "{:?}", second.problems);
+    assert_eq!(second.manifest.blobs.tombstones_copied, 0);
+
+    // The older snapshot still verifies against the pool and restores.
+    let pool =
+        || leep_store::open_blob_store(&format!("file://{}", out.join("blobs").display())).unwrap();
+    assert!(
+        pool().contains(&side_tree).await.unwrap(),
+        "the pool keeps it"
+    );
+    let v = backup::verify_backup(
+        VerifyBackupOptions {
+            from: out.clone(),
+            snapshot: Some("20260101T000000Z".into()),
+            blobs: pool(),
+            rehash: true,
+            max_problems: 10,
+        },
+        &Quiet,
+    )
+    .await
+    .unwrap();
+    assert!(v.report.ok(), "{:?}", v.report.problems);
+    let dest = Site::new(root.path(), "restored").await;
+    let mut r = restore_opts(&out, &dest);
+    r.snapshot = Some("20260101T000000Z".into());
+    let r = backup::restore(r, quiet()).await.unwrap();
+    assert!(
+        r.report.as_ref().unwrap().ok(),
+        "{:?}",
+        r.report.unwrap().problems
+    );
+    assert_eq!(
+        dest.repo
+            .read_file(side, &RepoPath::new("only/in/side.txt").unwrap())
+            .await
+            .unwrap()
+            .unwrap()
+            .1,
+        "unreachable but stored\n"
+    );
+
+    // The newest snapshot restores too; the deleted objects come along as
+    // unreferenced extras, as loose pool blobs always have.
+    let dest = Site::new(root.path(), "restored-newest").await;
+    let r = backup::restore(restore_opts(&out, &dest), quiet())
+        .await
+        .unwrap();
+    assert!(
+        r.report.as_ref().unwrap().ok(),
+        "{:?}",
+        r.report.unwrap().problems
+    );
+    assert!(dest
+        .repo
+        .meta()
+        .get_changeset(&side)
+        .await
+        .unwrap()
+        .is_none());
+}
