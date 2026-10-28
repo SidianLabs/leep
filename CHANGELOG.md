@@ -7,6 +7,15 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 ## [Unreleased]
 
+### Blame of files with a lone CR (issue #169)
+- **Fixed.** `GET /v1/blame` answered 500 for a file with a `\r` not followed
+  by `\n` (`a\r\rb\n`, old Mac line endings): the diff split lines at a
+  lone `\r` and the reported text did not. Blame now ends a line only at
+  `\n`, as the rest of Leep does, so such a `\r` stays in its line's text.
+  The cached `blame` encoding is unchanged; rows cached for a history whose
+  older versions had a lone `\r` may number those lines differently until
+  `repair drop --kind blame`.
+
 ### GitHub pull request reviews reach the review gate (ADR 0063, mirror half)
 - `leep-git mirror run --github-reviews`, with `--github-users FILE`
   (`login = principal`), `--github-api-token-file` and optionally

@@ -559,6 +559,21 @@ async fn long_logs_are_the_same_json() {
     }
 }
 
+/// A lone CR is part of its line; blame answered 500 for such files.
+#[tokio::test]
+async fn blame_of_a_file_with_lone_crs() {
+    let c = Client::new();
+    let a = c.commit(&[], &[("f", Some("a\r\rb\n"))], "a").await;
+    let b = c.commit(&[a], &[("f", Some("a\r\rb\nc\r\n"))], "b").await;
+    let bl: BlameResponse = c.get(&format!("/v1/blame/{b}?path=f")).await.json();
+    let got: Vec<_> = bl
+        .lines
+        .iter()
+        .map(|l| (l.text.as_str(), l.changeset))
+        .collect();
+    assert_eq!(got, [("a\r\rb", a), ("c", b)]);
+}
+
 #[tokio::test]
 async fn log_diff_blame_merge_base() {
     let c = Client::new();
