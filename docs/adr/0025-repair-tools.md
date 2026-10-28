@@ -34,7 +34,7 @@ leep-server repair drop --kind KIND... [--dry-run] [--json]
 ```
 
 Exit status: `0` clean, `1` problems found (for `repair rederive --dry-run`: rows
-that need repair; for a real run: rows that could not be recomputed), `2` could
+that need repair; for a real run: rows that could not be recomputed, or changesets that could not be read), `2` could
 not run (bad arguments, a refusal, an unreachable or missing store). Progress
 goes to stderr, the report to stdout, as text or with `--json` as one object.
 

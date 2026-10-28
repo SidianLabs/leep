@@ -167,7 +167,7 @@ impl Exporter {
         if self.style.changeset_trailer && !reproduces(self.repo.object_hash(), cs, &commit)? {
             commit = commit_object(cs, tree, parents, self.style.provenance_trailers, Some(id))?;
         }
-        let oid = self.repo.write_object(commit)?.detach();
+        let oid = gix::prelude::Write::write_buf(&self.repo, gix::objs::Kind::Commit, &commit)?;
         self.map.insert(id, oid, Origin::Exported)?;
         self.commits_written += 1;
         Ok(())
@@ -191,13 +191,11 @@ impl Exporter {
 }
 
 /// Is `commit` the commit `cs` was imported from?
-fn reproduces(kind: gix::hash::Kind, cs: &Changeset, commit: &gix::objs::Commit) -> Result<bool> {
+fn reproduces(kind: gix::hash::Kind, cs: &Changeset, commit: &[u8]) -> Result<bool> {
     let Some(want) = cs.extra.get(EXTRA_GIT_COMMIT) else {
         return Ok(false);
     };
-    let mut buf = Vec::new();
-    gix::objs::WriteTo::write_to(commit, &mut buf)?;
-    let oid = gix::objs::compute_hash(kind, gix::objs::Kind::Commit, &buf)?;
+    let oid = gix::objs::compute_hash(kind, gix::objs::Kind::Commit, commit)?;
     Ok(want.parse::<ObjectId>().is_ok_and(|w| w == oid))
 }
 

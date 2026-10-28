@@ -1991,9 +1991,9 @@ history, trees and blobs first, derived rows after.
 |---|---|---|
 | `missing_changeset`, `corrupt_changeset` | A changeset row is gone or does not hash to its id; the report names the child that needs it | Not repairable: changesets are source data. Restore the `changesets` row from a backup (`verify` then checks everything again). Do not delete the referencing ref; `leep undo` and the ref log can show where it pointed before |
 | `stored_parent_missing` | A stored changeset names a parent that is not stored, whether or not a ref reaches it (every changeset under `--full`, the sample otherwise). The changeset sweep (ADR 0059) deletes children before parents, so this is never its normal state | Not repairable by `repair`. Restore the parent's `changesets` row from a backup taken before the sweep. Report it: a sweep or a restore went wrong |
-| `missing_tree`, `corrupt_tree` | A tree node is absent or its bytes do not hash to its address. The report gives the oldest changeset that reaches it and the directory | `leep-server repair rederive --kind root_tree` rewrites every node from the changes that introduced it, for the changesets in scope, and `verify` confirms. If it reports `rederive_failed`, an input blob is missing; restore it first |
+| `missing_tree`, `corrupt_tree` | A tree node is absent, its bytes do not hash to its address, or the store cannot read it (a packed entry that does not decode). The report gives the oldest changeset that reaches it and the directory | `leep-server repair rederive --kind root_tree` rewrites every node from the changes that introduced it, for the changesets in scope, and `verify` confirms. If it reports `rederive_failed`, an input blob is missing; restore it first |
 | `missing_blob` | A file blob a changeset names is gone (a bad restore, a deleted file, a GC bug). The report names the changeset and path | Not recomputable. Restore the blob from the blob store's backup; its address is in the report, `blobs/<hex[0..2]>/<hex[2..]>`. Once you have the bytes (a client's `~/.cache/leep/objects` may still hold them) `PUT /v1/blobs/{hash}` stores them again |
-| `corrupt_blob`, `blob_size_mismatch` (`--rehash`) | The bytes under a blob's address do not hash to it, or are not the declared length | Delete the file and restore from backup, as for a missing blob. Until then reads of it return the damaged bytes |
+| `corrupt_blob`, `blob_size_mismatch` (`--rehash`) | The bytes under a blob's address do not hash to it, are not the declared length, or the store cannot read them (a packed entry that does not decode; a `--full` trigram check finds these too) | Delete the file and restore from backup, as for a missing blob. Until then reads of it return the damaged bytes |
 | `derived_mismatch` | A derived row differs from its recomputation. The report gives kind, row key and changeset | `leep-server repair rederive --kind <kind>` and run `verify --full` again. Find out why (disk, restore, an old version): derived rows are only ever wrong through damage |
 | (note) `log-filter-v1 merge row(s) hold exactly what the merge brings in` | Not a problem. Past the side-walk budget (200,000 changesets) this version stores a superset in a merge's `log-filter-v1` row, and rows written before the budget (ADR 0047's code) hold the exact set. Both are valid (ADR 0051). `verify` walks such a merge again without the budget and accepts the row when it is that exact set. A row a build with a different budget wrote is not recognised and is reported as `derived_mismatch` | Nothing. `repair rederive --kind log-filter-v1` would rewrite those rows as this version writes them, which changes no answer |
 | `derived_unverifiable` | A row could not be recomputed because something it reads is damaged | Fix the damaged tree node, blob or parent, then verify again |
@@ -2036,6 +2036,12 @@ rewrite the tree nodes and history pack parts they derive, which is what
 restores a missing or damaged one. The search kinds (`blob-trigrams-v1`,
 `tree-trigrams-v1`) are rewritten for the rows that exist; use
 `derive-search REV` to build rows that do not.
+
+`rederive` exits `1` for a real run when a row could not be recomputed or a
+changeset in scope could not be read (reported as `rederive_failed`, counted
+in `unreadable_changesets` in the JSON report), and `0` only when neither
+happened. A blob that cannot be read leaves its trigram row `skipped`;
+`verify` reports the blob.
 
 `drop` removes every row of a kind and the kind then derives again on demand.
 A kind that is a large share of `derived` is deleted by walking the table in
@@ -2201,7 +2207,10 @@ both stores:
   the loose objects one by one as before. The pool stays about the size of
   the packed source, and an unchanged store copies nothing. A pool pack that
   the source merged away is deleted once other pool packs hold every object
-  it held (`packs_pruned` in the manifest). `restore` copies the packs back
+  it held (`packs_pruned` in the manifest). Objects GC deleted at the source
+  stay in the pool's packs, as they do loose: an older snapshot may need
+  them once the changeset sweep runs (issue #155), so a pool keeps somewhat
+  more packs than the source. `restore` copies the packs back
   first, so a packed store restores packed. Pools from before this change
   (all loose) restore as they always did; later backups add packs beside
   their loose objects.

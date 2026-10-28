@@ -421,6 +421,24 @@ fn a_damaged_changeset_row_is_reported_not_fatal() {
     assert!(v["stats"]["changesets_reachable"].as_u64().unwrap() >= 2);
 }
 
+/// A tip whose row cannot be read has no parent edge to fail on, so repair
+/// has to count it itself: exit 0 here would tell a script the store is fine.
+#[test]
+fn repair_rederive_exits_1_when_a_tip_changeset_is_unreadable() {
+    let _g = serial();
+    let tmp = tempfile::tempdir().unwrap();
+    let stores = Stores::sqlite(&tmp.path().join("data"));
+    let p = populate(&stores, tmp.path());
+    let tip = p.ids.last().unwrap();
+    sql(
+        &stores,
+        &format!("UPDATE changesets SET data = X'ff' WHERE id = X'{tip}'"),
+    );
+    let v = json(&stores, &["repair", "rederive", "--kind", "all"], 1);
+    assert_eq!(v["ok"], false, "{v:#}");
+    assert_eq!(with_code(&v, "rederive_failed").len(), 1, "{v:#}");
+}
+
 /// Not part of the normal run: builds a store of about 10 000 changesets on
 /// SQLite and a filesystem blob store, warms every derived kind, and times
 /// `verify` in each mode. The numbers go in docs/PERFORMANCE.md.

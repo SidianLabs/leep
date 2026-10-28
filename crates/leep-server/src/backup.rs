@@ -16,6 +16,11 @@
 //! never deleted: ADR 0012). The closure check then proves it for this run by
 //! walking every changeset of the snapshot against the copied blobs, and a
 //! snapshot is sealed with its result.
+//!
+//! The pool only grows. Nothing the source deletes is deleted or hidden in
+//! it (the source's pack tombstones are not copied), because since the
+//! changeset sweep (ADR 0059) an older snapshot can name an object the
+//! source no longer has.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -28,7 +33,9 @@ use leep_derive::integrity::{self, Problem, Progress, VerifyOptions};
 use leep_derive::Repo;
 use leep_meta::snapshot::{self, SnapshotInfo};
 use leep_meta::SchemaMode;
-use leep_store::sync::{sync_blobs, sync_packs, PackSyncReport, SyncOptions, SyncReport};
+use leep_store::sync::{
+    sync_blobs, sync_packs, PackSyncMode, PackSyncReport, SyncOptions, SyncReport,
+};
 use leep_store::PackFiles;
 use serde::{Deserialize, Serialize};
 
@@ -117,6 +124,8 @@ pub struct BlobSection {
     /// packs hold all they held.
     #[serde(default)]
     pub packs_pruned: u64,
+    /// Always 0 since issue #155: the pool keeps objects the source deleted,
+    /// because older snapshots may need them. Kept for older manifests.
     #[serde(default)]
     pub tombstones_copied: u64,
     #[serde(default)]
@@ -393,14 +402,14 @@ fn sync_options(
 async fn copy_packs(
     src: Option<&dyn PackFiles>,
     dst: Option<&dyn PackFiles>,
-    prune: bool,
+    mode: PackSyncMode,
     progress: &dyn Progress,
     what: &str,
 ) -> Result<Option<PackSyncReport>> {
     let (Some(src), Some(dst)) = (src, dst) else {
         return Ok(None);
     };
-    let r = sync_packs(src, dst, prune).await?;
+    let r = sync_packs(src, dst, mode).await?;
     if r.listed > 0 || r.pruned > 0 {
         progress.info(&format!(
             "{what}: packs: {} in the source, {} already there, {} copied ({} bytes), {} merged away and pruned, {} tombstones copied",
@@ -467,7 +476,7 @@ pub async fn backup(
             let packs = copy_packs(
                 opts.source_packs.as_deref(),
                 opts.dest_packs.as_deref(),
-                true,
+                PackSyncMode::Pool,
                 &*progress,
                 "backup",
             )
@@ -805,7 +814,7 @@ pub async fn restore(opts: RestoreOptions, progress: Arc<dyn Progress>) -> Resul
     let pack_report = copy_packs(
         opts.source_packs.as_deref(),
         opts.target_packs.as_deref(),
-        false,
+        PackSyncMode::Restore,
         &*progress,
         "restore",
     )

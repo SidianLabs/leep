@@ -16,6 +16,62 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   older versions had a lone `\r` may number those lines differently until
   `repair drop --kind blame`.
 
+### Verify and repair report unreadable changesets and objects (issues #165, #166)
+- **Fixed.** `repair rederive` exited 0 and printed `ok: true` when a
+  changeset in scope could not be read and no child named it as a parent (a
+  damaged tip or ref head). It now counts such changesets
+  (`unreadable_changesets` in the JSON report, included in the "could not
+  be recomputed" total) and exits 1.
+- **Fixed.** A packed blob or tree node whose entry does not decode ended
+  `verify` and `repair` with exit 2 and no report, losing the problems
+  found before it. `verify` now reports `corrupt_blob` or `corrupt_tree`
+  (and counts an unreadable trigram blob as `unverifiable`) and keeps
+  going; `repair` skips the trigram row of such a blob.
+
+### Git commits keep their exact bytes through import and export (issues #173, #174)
+- **Fixed.** A commit whose author or committer time zone is `-0000` was
+  exported as `+0000`, and a commit with non-UTF-8 bytes in its message,
+  author, committer, `encoding` or extra headers was exported with U+FFFD
+  in their place. Both changed the sha and every descendant's, so the mirror
+  reported `diverged` after a rebuild and the CLI export wrote a second
+  `git-to-leep-v1` row. Import now keeps the `-0000` token in
+  `git.author_tz` / `git.committer_tz`, and the original bytes of any
+  non-UTF-8 field in a new `git.raw` extra (JSON of base64 strings). The
+  `extra` of a UTF-8 commit with a normal time zone is unchanged, so its
+  changeset id is too. Changesets imported before this fix still export as
+  they did; re-import does not change them either, because the importer skips
+  commits it has mapped.
+- The raw bytes of a field are used only while its lossy text still equals the
+  changeset's, so a reworded changeset exports its new text.
+
+### Backups keep packed objects older snapshots need (issue #155)
+- **Fixed.** A backup copied the source's pack tombstones into the backup
+  pool, which every snapshot shares. Once the changeset sweep (ADR 0059)
+  deleted a changeset and `gc --full` deleted its packed tree nodes and
+  contents, the next backup hid them in the pool, and an older sealed
+  snapshot that named them failed `backup-verify` and could not be
+  restored. Nothing reported it, since each backup checks only its own
+  snapshot. The sweep is off by default, so no pool was known to be
+  affected. Backups now never copy source tombstones, and pruning a pool
+  pack the source merged away ignores pool tombstones, so the pool keeps
+  every object, packed or loose. A pool now keeps somewhat more packs than
+  the source; `tombstones_copied` in the manifest is 0. `restore` still
+  copies the pool's own tombstones (only older pools have any). ADR 0026
+  and ADR 0039 are amended.
+
+### MCP tool arguments are strict; a reused request id cannot drop changes (issues #156, #157)
+- **Fixed.** `leep-mcp` ignored unknown tool arguments, so a misspelled
+  `target_ref` landed on `main` and a misspelled `base` dropped the
+  concurrency guard. Every tool argument struct, including a change entry,
+  now refuses an unknown field with `invalid arguments: unknown field ...`,
+  as the published schemas already promised.
+- **Fixed.** In one process, `leep_commit_and_land` with a reused
+  `request_id` and different `changes` answered `landed` with the earlier
+  changeset and dropped the new changes. It now returns `isError: true`,
+  `status: "already_landed"` when the id landed, as the cross-process path
+  did, and lands the new changes when the id's earlier land had failed. The
+  same id with the same changes, or by itself, stays idempotent.
+
 ### Filesystem store temp files cannot collide across servers (issue #154)
 - **Fixed.** Loose-blob, repack and pack-copy temp files were named
   `.tmp-<pid>-<counter>` and opened with a truncating `File::create`. Two

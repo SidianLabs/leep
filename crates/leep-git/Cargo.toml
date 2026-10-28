@@ -17,6 +17,7 @@ leep-store.workspace = true
 leep-meta.workspace = true
 leep-cli.workspace = true
 anyhow.workspace = true
+base64.workspace = true
 bytes.workspace = true
 futures-util.workspace = true
 reqwest.workspace = true
