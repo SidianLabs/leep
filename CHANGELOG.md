@@ -7,6 +7,19 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 ## [Unreleased]
 
+### MCP tool arguments are strict; a reused request id cannot drop changes (issues #156, #157)
+- **Fixed.** `leep-mcp` ignored unknown tool arguments, so a misspelled
+  `target_ref` landed on `main` and a misspelled `base` dropped the
+  concurrency guard. Every tool argument struct, including a change entry,
+  now refuses an unknown field with `invalid arguments: unknown field ...`,
+  as the published schemas already promised.
+- **Fixed.** In one process, `leep_commit_and_land` with a reused
+  `request_id` and different `changes` answered `landed` with the earlier
+  changeset and dropped the new changes. It now returns `isError: true`,
+  `status: "already_landed"` when the id landed, as the cross-process path
+  did, and lands the new changes when the id's earlier land had failed. The
+  same id with the same changes, or by itself, stays idempotent.
+
 ### Filesystem store temp files cannot collide across servers (issue #154)
 - **Fixed.** Loose-blob, repack and pack-copy temp files were named
   `.tmp-<pid>-<counter>` and opened with a truncating `File::create`. Two
