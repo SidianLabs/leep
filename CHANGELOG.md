@@ -22,6 +22,19 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 - `reqwest` moves to the workspace dependencies; `leep-git` uses it for
   GitHub and `leep-cli` for the server as before.
 
+### Windows working copies and store URLs (issue #208)
+- **Fixed.** On Windows every executable file in a working copy showed as
+  modified forever, since NTFS has no executable bit to compare: `leep`
+  now keeps a tracked file's stored kind where the bit cannot be read, as
+  git does with `core.filemode=false`. A new file is regular, and a
+  Windows working copy cannot set or clear the bit.
+- `leep checkout @ --add-prefix PREFIX` widens a sparse checkout; `--prefix`
+  replaces the set, as before, and says so. The "widen it with" hints name
+  `--add-prefix`.
+- **Fixed.** `file:///C:/path` and `sqlite:///C:/path` (and `file://C:/path`)
+  are accepted on Windows; before, the path was read as `/C:/path` and the
+  server failed to create its stores.
+
 ### Closing stdout early no longer panics
 - **Fixed.** `leep`, `leep-server`'s one-shot commands (`gen-token`, `gc`,
   `verify`, `backup` and the rest) and `leep-git` panicked with "failed

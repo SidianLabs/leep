@@ -16,9 +16,13 @@ use leep_core::outln;
 pub struct CheckoutArgs {
     /// Ref or tag name, changeset id (full, or 4+ leading hex digits), or `@`.
     pub rev: String,
-    /// Replace the sparse prefixes (repeatable).
-    #[arg(long = "prefix")]
+    /// Replace the sparse prefixes with these (repeatable). The whole set
+    /// must be given; see --add-prefix to widen.
+    #[arg(long = "prefix", conflicts_with = "add_prefixes")]
     pub prefixes: Vec<String>,
+    /// Add sparse prefixes to the current set (repeatable).
+    #[arg(long = "add-prefix", value_name = "PREFIX")]
+    pub add_prefixes: Vec<String>,
     /// Discard local changes and overwrite untracked files.
     #[arg(long)]
     pub force: bool,
@@ -35,6 +39,21 @@ pub fn checkout(ctx: &mut Ctx, args: &CheckoutArgs) -> Result<i32> {
             .iter()
             .map(|p| normalize_prefix(p))
             .collect::<Result<_>>()?;
+        ctx.wc.save_config()?;
+    } else if !args.add_prefixes.is_empty() {
+        // A working copy with no prefixes holds everything already; adding
+        // one would narrow it, so there is nothing to widen.
+        if ctx.wc.config.prefixes.is_empty() {
+            return Err(CliError::user(
+                "this working copy is not sparse: it already holds the whole repository",
+            ));
+        }
+        for p in &args.add_prefixes {
+            let p = normalize_prefix(p)?;
+            if !ctx.wc.config.prefixes.contains(&p) {
+                ctx.wc.config.prefixes.push(p);
+            }
+        }
         ctx.wc.save_config()?;
     }
     let stats = materialize(ctx, id, args.force)?;

@@ -136,6 +136,7 @@ fn checkout_materializes_prefixes_modes_and_prunes() {
     let all = CheckoutArgs {
         rev: "main".into(),
         prefixes: vec![".".into()],
+        add_prefixes: vec![],
         force: false,
     };
     checkout(&mut ctx, &all).unwrap();
@@ -176,6 +177,7 @@ fn checkout_materializes_prefixes_modes_and_prunes() {
     let back = CheckoutArgs {
         rev: "@".into(),
         prefixes: vec![],
+        add_prefixes: vec![],
         force: true,
     };
     checkout(&mut ctx, &back).unwrap();
@@ -1211,6 +1213,7 @@ fn tags_are_created_listed_resolved_and_deleted() {
         &CheckoutArgs {
             rev: "tags/v1".into(),
             prefixes: vec![],
+            add_prefixes: vec![],
             force: false,
         },
     )

@@ -296,7 +296,7 @@ fn rebase_locally(
     if !outside.is_empty() {
         return Err(CliError::user(format!(
             "cannot resolve here: the conflicting stack touches paths outside this \
-             sparse checkout ({}); widen it with `leep checkout @ --prefix ...` and land again",
+             sparse checkout ({}); widen it with `leep checkout @ --add-prefix PATH` and land again",
             outside.join(", ")
         )));
     }

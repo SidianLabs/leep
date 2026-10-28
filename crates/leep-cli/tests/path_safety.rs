@@ -30,6 +30,7 @@ fn checkout_rev(ctx: &mut Ctx, rev: &str, force: bool) -> String {
     let args = CheckoutArgs {
         rev: rev.into(),
         prefixes: vec![],
+        add_prefixes: vec![],
         force,
     };
     checkout(ctx, &args).unwrap_err().to_string()

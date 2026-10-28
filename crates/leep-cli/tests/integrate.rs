@@ -380,6 +380,7 @@ fn merge_conflict_writes_markers_then_commit_records_both_parents() {
             &CheckoutArgs {
                 rev: "main".into(),
                 prefixes: vec![],
+                add_prefixes: vec![],
                 force: false,
             },
         )
