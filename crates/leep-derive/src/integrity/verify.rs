@@ -145,8 +145,12 @@ struct BlobRef {
 }
 
 enum BlobCheck {
-    Fine { rehashed: Option<u64> },
+    Fine {
+        rehashed: Option<u64>,
+    },
     Bad(Problem),
+    /// The store could not decode the blob's bytes.
+    Unreadable(Hash, Problem),
 }
 
 async fn check_blob(
@@ -176,8 +180,29 @@ async fn check_blob(
             missing(&b)
         });
     }
-    let Some(data) = blobs.get(&b.hash).await? else {
-        return Ok(missing(&b));
+    let data = match blobs.get(&b.hash).await {
+        Ok(Some(data)) => data,
+        Ok(None) => return Ok(missing(&b)),
+        Err(e) => {
+            return match damage_of(&e) {
+                Some(Damage::Missing) => Ok(missing(&b)),
+                Some(Damage::Corrupt) => Ok(BlobCheck::Unreadable(
+                    b.hash,
+                    Problem::new(
+                        "blob",
+                        "corrupt_blob",
+                        format!(
+                            "blob {} cannot be read: {e}; changeset {} has it at {}",
+                            b.hash, b.changeset, b.path
+                        ),
+                    )
+                    .key(&b.hash)
+                    .changeset(b.changeset)
+                    .path(b.path),
+                )),
+                None => Err(e),
+            };
+        }
     };
     let len = data.len() as u64;
     let actual = Hash::of_blob(&data);
@@ -283,6 +308,7 @@ pub async fn verify(
         visited_blobs: HashSet::new(),
         visited_hnodes: HashSet::new(),
         damaged_hnodes: HashSet::new(),
+        damaged_blobs: HashSet::new(),
         pending: Vec::new(),
         ticker: Ticker::new(Duration::from_secs(5)),
         phase: "starting",
@@ -339,6 +365,9 @@ struct Verifier<'a> {
     visited_blobs: HashSet<Hash>,
     visited_hnodes: HashSet<NodeRef>,
     damaged_hnodes: HashSet<NodeRef>,
+    /// Blobs already reported unreadable, so a trigram row naming one does
+    /// not report it again.
+    damaged_blobs: HashSet<Hash>,
     pending: Vec<BlobRef>,
     ticker: Ticker,
     phase: &'static str,
@@ -533,6 +562,10 @@ impl Verifier<'_> {
                     }
                 }
                 BlobCheck::Bad(p) => self.log.push(p),
+                BlobCheck::Unreadable(hash, p) => {
+                    self.damaged_blobs.insert(hash);
+                    self.log.push(p);
+                }
             }
         }
         Ok(())
@@ -561,17 +594,24 @@ impl Verifier<'_> {
             }
             self.stats.tree_nodes += 1;
             let shown = if dir.is_empty() { "/" } else { dir.as_str() };
-            let bytes = match self.shadow_blobs.get(&tree).await? {
-                Some(b) => b,
-                None if tree == TreeNode::empty_hash() => continue,
-                None => {
+            let read = match self.shadow_blobs.get(&tree).await {
+                Ok(Some(b)) => Ok(b),
+                Ok(None) if tree == TreeNode::empty_hash() => continue,
+                Ok(None) => Err(("missing_tree", "is missing".to_string())),
+                Err(e) => match damage_of(&e) {
+                    Some(Damage::Missing) => Err(("missing_tree", format!("is missing: {e}"))),
+                    Some(Damage::Corrupt) => Err(("corrupt_tree", format!("cannot be read: {e}"))),
+                    None => return Err(e),
+                },
+            };
+            let bytes = match read {
+                Ok(b) => b,
+                Err((code, why)) => {
                     self.log.push(
                         Problem::new(
                             "tree",
-                            "missing_tree",
-                            format!(
-                                "tree node {tree} is missing; changeset {id} has it at {shown}"
-                            ),
+                            code,
+                            format!("tree node {tree} {why}; changeset {id} has it at {shown}"),
                         )
                         .key(&tree)
                         .changeset(id)
@@ -822,9 +862,34 @@ impl Verifier<'_> {
         let mut scan = RowScan::new(kind, self.opts.full, self.opts.sample);
         while let Some(page) = scan.next(&*meta).await? {
             for (key, value) in page {
-                let Some(data) = self.repo.blobs().get(&key).await? else {
-                    self.kstats(kind).skipped += 1;
-                    continue;
+                let data = match self.repo.blobs().get(&key).await {
+                    Ok(Some(data)) => data,
+                    Ok(None) => {
+                        self.kstats(kind).skipped += 1;
+                        continue;
+                    }
+                    Err(e) => match damage_of(&e) {
+                        Some(Damage::Missing) => {
+                            self.kstats(kind).skipped += 1;
+                            continue;
+                        }
+                        Some(Damage::Corrupt) => {
+                            self.kstats(kind).unverifiable += 1;
+                            if self.damaged_blobs.insert(key) {
+                                self.log.push(
+                                    Problem::new(
+                                        "blob",
+                                        "corrupt_blob",
+                                        format!("blob {key} cannot be read: {e}"),
+                                    )
+                                    .kind(kind)
+                                    .key(&key),
+                                );
+                            }
+                            continue;
+                        }
+                        None => return Err(e),
+                    },
                 };
                 if Hash::of_blob(&data) != key {
                     self.kstats(kind).unverifiable += 1;

@@ -7,6 +7,18 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 ## [Unreleased]
 
+### Verify and repair report unreadable changesets and objects (issues #165, #166)
+- **Fixed.** `repair rederive` exited 0 and printed `ok: true` when a
+  changeset in scope could not be read and no child named it as a parent (a
+  damaged tip or ref head). It now counts such changesets
+  (`unreadable_changesets` in the JSON report, included in the "could not
+  be recomputed" total) and exits 1.
+- **Fixed.** A packed blob or tree node whose entry does not decode ended
+  `verify` and `repair` with exit 2 and no report, losing the problems
+  found before it. `verify` now reports `corrupt_blob` or `corrupt_tree`
+  (and counts an unreadable trigram blob as `unverifiable`) and keeps
+  going; `repair` skips the trigram row of such a blob.
+
 ### Git commits keep their exact bytes through import and export (issues #173, #174)
 - **Fixed.** A commit whose author or committer time zone is `-0000` was
   exported as `+0000`, and a commit with non-UTF-8 bytes in its message,

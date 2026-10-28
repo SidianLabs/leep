@@ -697,6 +697,146 @@ async fn rederiving_root_trees_restores_damaged_tree_nodes() {
     assert_clean(&w).await;
 }
 
+/// Reads of `bad` fail the way a pack entry that does not decode does; the
+/// rest passes through. `contains` only consults the index, as a pack does.
+struct UndecodablePack {
+    inner: Arc<MemoryBlobStore>,
+    bad: Vec<Hash>,
+}
+
+#[async_trait::async_trait]
+impl leep_core::BlobStore for UndecodablePack {
+    async fn put_with_hash(&self, hash: Hash, data: Bytes) -> leep_core::Result<()> {
+        self.inner.put_with_hash(hash, data).await
+    }
+
+    async fn get(&self, hash: &Hash) -> leep_core::Result<Option<Bytes>> {
+        if self.bad.contains(hash) {
+            return Err(leep_core::Error::Storage(format!(
+                "corrupt packed object {hash} in pack p1: frame does not decode"
+            )));
+        }
+        self.inner.get(hash).await
+    }
+
+    async fn contains(&self, hash: &Hash) -> leep_core::Result<bool> {
+        self.inner.contains(hash).await
+    }
+
+    async fn list_page(
+        &self,
+        after: Option<Hash>,
+        limit: usize,
+    ) -> leep_core::Result<Vec<leep_core::BlobMeta>> {
+        self.inner.list_page(after, limit).await
+    }
+
+    async fn delete(&self, hash: &Hash) -> leep_core::Result<()> {
+        self.inner.delete(hash).await
+    }
+}
+
+async fn with_undecodable(w: World, bad: Vec<Hash>) -> World {
+    let blobs = Arc::new(UndecodablePack {
+        inner: w.blobs.clone(),
+        bad,
+    });
+    World {
+        repo: Repo::new(blobs, w.meta.clone()),
+        ..w
+    }
+}
+
+async fn first_dir(w: &World) -> Hash {
+    let root = w.repo.root_tree(w.ids[0]).await.unwrap();
+    let TreeEntry::Dir { tree } = w.repo.read_tree(root).await.unwrap().entries["d"].clone() else {
+        panic!("d is a directory")
+    };
+    tree
+}
+
+/// One bad pack entry must not end the run: the report lists it and every
+/// other damaged object.
+#[tokio::test]
+async fn undecodable_pack_entries_are_findings_not_aborts() {
+    let w = world().await;
+    let dir = first_dir(&w).await;
+    let blob = Hash::of_blob(b"a1\nshared line\n");
+    let w = with_undecodable(w, vec![dir, blob]).await;
+    // Plus a second, ordinary damage elsewhere.
+    let gone = Hash::of_blob(b"l\n");
+    w.blobs.delete(&gone).await.unwrap();
+
+    for opts in [full(), VerifyOptions::default()] {
+        let r = verify(&w.repo, &opts, &Quiet)
+            .await
+            .unwrap_or_else(|e| panic!("verify aborted instead of reporting: {e}"));
+        let tree = only(&r, "corrupt_tree");
+        assert_eq!(tree.key.as_deref(), Some(dir.to_hex().as_str()));
+        assert!(codes(&r).contains(&"missing_blob"), "{:#?}", r.problems);
+        if opts.rehash {
+            let b = only(&r, "corrupt_blob");
+            assert_eq!(b.key.as_deref(), Some(blob.to_hex().as_str()));
+        }
+    }
+}
+
+/// The trigram scan reads blob bytes of its own, outside the reachability
+/// walk, so it needs its own coverage.
+#[tokio::test]
+async fn a_blob_that_cannot_be_read_does_not_stop_the_trigram_scan() {
+    let w = world().await;
+    let bad = Hash::of_blob(b"fin\n");
+    let w = with_undecodable(w, vec![bad]).await;
+    let opts = VerifyOptions {
+        full: true,
+        ..VerifyOptions::default()
+    };
+    let r = verify(&w.repo, &opts, &Quiet)
+        .await
+        .unwrap_or_else(|e| panic!("verify aborted instead of reporting: {e}"));
+    assert!(r.derived["blob-trigrams-v1"].unverifiable >= 1);
+    let p = only(&r, "corrupt_blob");
+    assert_eq!(p.key.as_deref(), Some(bad.to_hex().as_str()));
+}
+
+#[tokio::test]
+async fn rederive_skips_a_blob_that_cannot_be_read() {
+    let w = world().await;
+    let bad = Hash::of_blob(b"fin\n");
+    let w = with_undecodable(w, vec![bad]).await;
+    let r = rederive_kinds(&w, &["blob-trigrams-v1"], false).await;
+    assert!(r.kind_reports["blob-trigrams-v1"].skipped >= 1);
+}
+
+/// A tip no one names as a parent: nothing downstream fails, so the walk's
+/// own report of it must make the repair unclean.
+#[tokio::test]
+async fn an_unreadable_tip_makes_rederive_fail() {
+    let w = world().await;
+    assert!(w.meta.remove_changeset(&w.tip()));
+    let r = rederive(
+        &w.repo,
+        &RederiveOptions {
+            kinds: vec!["generation"],
+            scope: Scope::Refs(vec!["main".into()]),
+            dry_run: false,
+            max_problems: 1000,
+            jobs: 4,
+            missing_only: false,
+        },
+        &Quiet,
+    )
+    .await
+    .unwrap();
+    assert!(
+        r.problems.iter().any(|p| p.code == "rederive_failed"),
+        "{:#?}",
+        r.problems
+    );
+    assert!(r.failed() > 0, "an unreadable changeset is a failure");
+}
+
 #[tokio::test]
 async fn search_rows_are_recomputed_from_blobs_and_trees() {
     let w = world().await;
