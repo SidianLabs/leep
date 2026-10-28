@@ -2633,6 +2633,7 @@ dependencies = [
  "blake3",
  "bytes",
  "futures",
+ "getrandom 0.4.3",
  "hex",
  "leep-core",
  "leep-testkit",

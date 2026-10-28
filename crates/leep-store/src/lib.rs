@@ -18,6 +18,7 @@ mod packset;
 mod packwrite;
 mod repack;
 pub mod sync;
+mod tmpfile;
 
 use std::path::PathBuf;
 use std::sync::Arc;

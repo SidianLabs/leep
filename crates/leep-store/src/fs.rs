@@ -1,5 +1,4 @@
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -10,8 +9,7 @@ use std::io::Write;
 use crate::dirsync::DirSyncer;
 use crate::packset::{merge_listing, PackSet, DEFAULT_DECODED_CACHE};
 use crate::storage_err;
-
-static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+use crate::tmpfile::create_exclusive;
 
 /// Most blocking tasks one `get_many` uses: enough to keep a disk's queue
 /// and the cores busy, few enough to leave the blocking pool to others.
@@ -175,13 +173,8 @@ impl BlobStore for FsBlobStore {
             }
             let dir = path.parent().expect("blob path has a parent");
             std::fs::create_dir_all(dir).map_err(storage_err)?;
-            let tmp = dir.join(format!(
-                ".tmp-{}-{}",
-                std::process::id(),
-                TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
-            ));
+            let (tmp, mut f) = create_exclusive(dir, "").map_err(storage_err)?;
             let res = (|| {
-                let mut f = std::fs::File::create(&tmp)?;
                 f.write_all(&data)?;
                 f.sync_all()?;
                 drop(f);
@@ -601,6 +594,38 @@ mod tests {
         store.delete(&hash).await.unwrap();
         assert!(store.get(&hash).await.unwrap().is_none());
         assert!(shard.join(".tmp-4242-1").exists());
+    }
+
+    /// Two servers on one volume can be the same pid with the same counter,
+    /// so a temp file another writer already created must never be reused.
+    #[tokio::test]
+    async fn put_does_not_reuse_an_existing_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsBlobStore::new(dir.path());
+        let data = Bytes::from("the blob being put");
+        let hash = Hash::of_blob(&data);
+        let shard = dir.path().join(&hash.to_hex()[..2]);
+        std::fs::create_dir_all(&shard).unwrap();
+        // Other tests bump the counter too, so claim the next several names.
+        let next = crate::tmpfile::TMP_COUNTER.load(std::sync::atomic::Ordering::Relaxed);
+        let others: Vec<_> = (next..next + 16)
+            .map(|n| {
+                let name = format!(
+                    ".tmp-{}-{}-{n}",
+                    std::process::id(),
+                    crate::tmpfile::nonce()
+                );
+                shard.join(name)
+            })
+            .collect();
+        for p in &others {
+            std::fs::write(p, b"another writer's bytes").unwrap();
+        }
+        store.put(data.clone()).await.unwrap();
+        assert_eq!(store.get(&hash).await.unwrap().unwrap(), data);
+        for p in &others {
+            assert_eq!(std::fs::read(p).unwrap(), b"another writer's bytes");
+        }
     }
 
     /// Errors injected around a real filesystem store: a put that fails after
