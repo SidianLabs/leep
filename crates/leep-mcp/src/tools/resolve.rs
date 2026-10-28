@@ -81,6 +81,7 @@ pub(crate) fn conflict_request(changeset: &ChangesetId, onto: &ChangesetId) -> S
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Args {
     conflict_id: Option<String>,
     onto: Option<String>,
