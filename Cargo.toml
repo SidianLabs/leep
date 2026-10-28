@@ -42,6 +42,8 @@ hex = "0.4"
 jiff = { version = "0.2", default-features = false, features = ["std"] }
 regex = "1"
 regex-syntax = "0.8"
+# Blocking HTTP for the CLI and the git mirror; rustls so no system TLS.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 postcard = { version = "1", features = ["use-std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

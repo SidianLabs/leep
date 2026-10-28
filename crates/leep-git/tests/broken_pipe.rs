@@ -7,7 +7,7 @@ use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
 
 fn git(dir: &Path, args: &[&str]) {
-    let out = Command::new("/usr/bin/git")
+    let out = Command::new("git")
         .args(args)
         .current_dir(dir)
         .env("GIT_AUTHOR_NAME", "Ada Lovelace")

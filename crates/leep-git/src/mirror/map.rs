@@ -45,11 +45,14 @@ impl Map {
     /// Open or create the map. A torn last line (a crash mid-append) is cut
     /// off so later appends start on a fresh line.
     pub fn open(path: &Path) -> std::io::Result<Map> {
+        // Opened for writing, not appending: cutting off a torn tail needs
+        // `set_len`, which an append-only handle cannot do on Windows. The
+        // position is moved to the end once below and never elsewhere.
         let mut file = OpenOptions::new()
             .create(true)
             .truncate(false)
             .read(true)
-            .append(true)
+            .write(true)
             .open(path)?;
         let mut to_git = HashMap::new();
         let mut to_leep = HashMap::new();

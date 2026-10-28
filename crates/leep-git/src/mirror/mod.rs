@@ -41,6 +41,7 @@
 
 pub mod export;
 mod git;
+pub mod github;
 pub mod import;
 mod land;
 pub mod map;
@@ -56,10 +57,11 @@ use gix::ObjectId;
 use leep_cli::client::Client;
 use leep_cli::error::ErrorKind;
 use leep_core::api::{
-    Authorship, CasRefRequest, LandRequest, LandResponse, MergeRequest, MergeResponse,
-    RebaseOntoRequest, RebaseOntoResponse,
+    AddReviewRequest, Authorship, CasRefRequest, LandRequest, LandResponse, MergeRequest,
+    MergeResponse, RebaseOntoRequest, RebaseOntoResponse, ReviewEntry,
 };
 use leep_core::changeset::EXTRA_REBASED_FROM;
+use leep_core::review::Verdict;
 use leep_core::{Changeset, ChangesetId, Hash, LandId};
 
 pub use export::CommitStyle;
@@ -134,6 +136,18 @@ pub trait Leep {
         expected_base: ChangesetId,
         land_id: LandId,
     ) -> Result<ReplayOutcome>;
+    /// `GET /v1/changesets/{id}/reviews`: the stored reviews with where
+    /// each came from.
+    fn reviews(&self, id: ChangesetId) -> Result<Vec<ReviewEntry>>;
+    /// `POST /v1/changesets/{id}/reviews` for a named reviewer (ADR 0063);
+    /// needs a `review_for` token.
+    fn post_review(
+        &self,
+        id: ChangesetId,
+        reviewer: &str,
+        verdict: Verdict,
+        source: &str,
+    ) -> Result<()>;
 }
 
 /// How a replay (`rebase-onto`) ended.
@@ -345,6 +359,27 @@ impl Leep for Client {
             Err(e) => Err(e.into()),
         }
     }
+
+    fn reviews(&self, id: ChangesetId) -> Result<Vec<ReviewEntry>> {
+        Ok(Client::reviews(self, &id)?.reviews)
+    }
+
+    fn post_review(
+        &self,
+        id: ChangesetId,
+        reviewer: &str,
+        verdict: Verdict,
+        source: &str,
+    ) -> Result<()> {
+        let req = AddReviewRequest {
+            verdict,
+            comment: String::new(),
+            reviewer: Some(reviewer.to_string()),
+            source: Some(source.to_string()),
+        };
+        Client::add_review(self, &id, &req)?;
+        Ok(())
+    }
 }
 
 /// Which side of a `--ref` is the source of truth (ADR 0062).
@@ -506,6 +541,9 @@ pub struct Config {
     pub git_timeout: Duration,
     pub max_backoff: Duration,
     pub listen: Option<std::net::SocketAddr>,
+    /// Bring GitHub pull request reviews into Leep's review gate for two-way
+    /// prefix refs (ADR 0063).
+    pub github: Option<github::GitHubConfig>,
 }
 
 impl Config {
@@ -577,6 +615,20 @@ impl Config {
         }
         if self.merge_author.trim().is_empty() {
             bail!("--merge-author must not be empty");
+        }
+        if let Some(g) = &self.github {
+            if !self.import || self.ref_prefixes.is_empty() {
+                bail!(
+                    "--github-reviews needs --import and a --ref-prefix: reviews are read for \
+                     the pull requests of two-way prefix refs"
+                );
+            }
+            if g.users.is_empty() {
+                bail!("--github-reviews: --github-users maps no login, so no review would count");
+            }
+            if g.owner.is_empty() || g.repo.is_empty() {
+                bail!("--github-reviews: no repository; pass --github-repo OWNER/REPO");
+            }
         }
         Ok(())
     }
@@ -730,6 +782,8 @@ pub struct Mirror<'a> {
     /// last.
     deleted_refs: Vec<status::DeletedBranch>,
     refs_deleted: u64,
+    /// GitHub, when `--github-reviews` is on.
+    github: Option<Box<dyn github::GitHubApi>>,
     _lock: std::fs::File,
 }
 
@@ -804,6 +858,14 @@ impl<'a> Mirror<'a> {
                 t
             })
             .collect();
+        let github = match &cfg.github {
+            Some(g) => Some(Box::new(github::GitHubClient::new(
+                &g.api_url,
+                g.token.clone(),
+                cfg.git_timeout,
+            )?) as Box<dyn github::GitHubApi>),
+            None => None,
+        };
         Ok(Mirror {
             status_path: cfg.work_dir.join("status.json"),
             cfg,
@@ -822,8 +884,14 @@ impl<'a> Mirror<'a> {
             branches_deleted: 0,
             deleted_refs: Vec::new(),
             refs_deleted: 0,
+            github,
             _lock: lock,
         })
+    }
+
+    /// Use `api` for GitHub instead of the HTTPS client (tests).
+    pub fn set_github(&mut self, api: Box<dyn github::GitHubApi>) {
+        self.github = Some(api);
     }
 
     /// Run until the process is killed. `wake` cuts a sleep short and makes
@@ -885,11 +953,13 @@ impl<'a> Mirror<'a> {
             self.count_error("leep");
             log(format!("reading refs from the server failed: {e:#}"));
         }
+        let mut polled = false;
         if self.remote_stale || Instant::now() >= self.next_git_poll {
             match self.poll_remote() {
                 Ok(()) => {
                     self.remote_stale = false;
                     self.next_git_poll = Instant::now() + self.cfg.git_poll;
+                    polled = true;
                 }
                 Err(e) => {
                     self.count_error("git");
@@ -934,6 +1004,9 @@ impl<'a> Mirror<'a> {
         }
         self.refs.retain(|r| !r.forget);
         self.sync_lands();
+        if polled {
+            self.sync_github_reviews();
+        }
         if self.pushes_since_gc >= 200 {
             self.remote.gc_auto();
             self.pushes_since_gc = 0;
@@ -2249,7 +2322,31 @@ mod tests {
             git_timeout: Duration::from_secs(600),
             max_backoff: Duration::from_secs(300),
             listen: None,
+            github: None,
         }
+    }
+
+    #[test]
+    fn github_reviews_need_import_a_prefix_and_mapped_users() {
+        let gh = |users: &[(&str, &str)]| github::GitHubConfig {
+            owner: "acme".into(),
+            repo: "app".into(),
+            users: users
+                .iter()
+                .map(|(l, p)| (l.to_string(), p.to_string()))
+                .collect(),
+            token: None,
+            api_url: "https://api.github.com".into(),
+        };
+        let mut c = config();
+        c.github = Some(gh(&[("ada", "alice")]));
+        assert!(c.validate().is_err(), "without --import");
+        c.import = true;
+        assert!(c.validate().is_err(), "without a prefix");
+        c.ref_prefixes = vec!["review/".into()];
+        assert!(c.validate().is_ok());
+        c.github = Some(gh(&[]));
+        assert!(c.validate().is_err(), "no users");
     }
 
     #[test]

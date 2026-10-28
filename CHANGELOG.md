@@ -7,6 +7,21 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 ## [Unreleased]
 
+### GitHub pull request reviews reach the review gate (ADR 0063, mirror half)
+- `leep-git mirror run --github-reviews`, with `--github-users FILE`
+  (`login = principal`), `--github-api-token-file` and optionally
+  `--github-repo` and `--github-api-url`: after each remote poll, the
+  reviews of the open pull request of every two-way prefix ref's branch
+  are posted to Leep as reviews for the mapped principal, on every
+  changeset of the ref's unlanded stack (`approve`, `reject`, or
+  `withdrawn` for a dismissal or a stale approval), through a token with
+  `"review_for": true`. Only mapped logins count; a person's own Leep
+  review is never changed. New per-ref status (`pull_request`,
+  `github_reviews`), `leep_mirror_github_reviews_total{ref,result}` and
+  the `github` error stage.
+- `reqwest` moves to the workspace dependencies; `leep-git` uses it for
+  GitHub and `leep-cli` for the server as before.
+
 ### Closing stdout early no longer panics
 - **Fixed.** `leep`, `leep-server`'s one-shot commands (`gen-token`, `gc`,
   `verify`, `backup` and the rest) and `leep-git` panicked with "failed
