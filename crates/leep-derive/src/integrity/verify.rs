@@ -1387,12 +1387,8 @@ impl Verifier<'_> {
         };
         let mut why = None;
         if let Some(text) = &text {
-            let lines: Vec<&str> = text
-                .split_inclusive('\n')
-                .map(|l| {
-                    let l = l.strip_suffix('\n').unwrap_or(l);
-                    l.strip_suffix('\r').unwrap_or(l)
-                })
+            let lines: Vec<&str> = crate::blame::split_lines(text)
+                .map(crate::blame::strip_eol)
                 .collect();
             if lines.len() != cached.1.len() {
                 why = Some(format!(

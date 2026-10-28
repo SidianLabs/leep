@@ -494,12 +494,13 @@ async fn first_blame_of_an_old_file_reads_little() {
     assert!(reads[1] < 600, "{reads:?}");
 }
 
-/// The replay's line diffs are those of `similar`'s `TextDiff::diff_lines`,
-/// with lines split the same way, over texts with every kind of line end,
-/// a last line without one, empty texts and multi-byte characters.
+/// The replay's line diffs are those of `similar`'s `TextDiff` over the same
+/// lines (split at `\n` only, see `split_lines`), over texts with every kind
+/// of line end, a last line without one, empty texts and multi-byte
+/// characters.
 #[tokio::test]
 async fn replay_diffs_are_those_of_text_diff() {
-    use similar::{DiffableStr, TextDiff};
+    use similar::TextDiff;
     let pieces = [
         "a\n", "b\n", "c\r\n", "d\r", "\r", "\n", "é\n", "x", "a\r\n", "", "b", "ü\r",
     ];
@@ -513,15 +514,13 @@ async fn replay_diffs_are_those_of_text_diff() {
                     .collect()
             })
             .collect();
-        for v in &versions {
-            let ours: Vec<&str> = crate::blame::split_lines(v).collect();
-            assert_eq!(ours, v.as_str().tokenize_lines(), "{v:?}");
-        }
         let (ops, back) = crate::blame::diff_versions(versions.clone()).await.unwrap();
         assert_eq!(back, versions);
         for (i, ops) in ops.iter().enumerate() {
+            let old: Vec<&str> = crate::blame::split_lines(&versions[i]).collect();
+            let new: Vec<&str> = crate::blame::split_lines(&versions[i + 1]).collect();
             let want: crate::blame::Ops = TextDiff::configure()
-                .diff_lines(&versions[i], &versions[i + 1])
+                .diff_slices(&old, &new)
                 .ops()
                 .iter()
                 .map(|op| op.as_tag_tuple())
@@ -584,4 +583,118 @@ async fn failed_reads_fail_the_blame() {
         .unwrap();
     assert_eq!(b, full.0);
     let _ = answered;
+}
+
+/// Blame's lines are `\n`-terminated, as everywhere else Leep reads a file
+/// (`\r\n` is just `\n` after a `\r`). A `\r` alone is part of its line.
+#[tokio::test]
+async fn a_lone_cr_is_part_of_its_line() {
+    for (content, want) in [
+        ("a\r\rb\n", vec!["a\r\rb"]),
+        ("a\r\r\n", vec!["a\r"]),
+        ("a\rb\n", vec!["a\rb"]),
+        ("a\rb\nc\r", vec!["a\rb", "c\r"]),
+        ("\r\n\r\r\n", vec!["", "\r"]),
+        ("\r", vec!["\r"]),
+    ] {
+        let (r, _) = slow_repo();
+        let tip = commit(&r, &[], &[("f", Some(content))]).await;
+        for span in [1, 4] {
+            assert!(agree(&r, tip, "f", span, false).await, "{content:?}");
+        }
+        let lines = r.blame(tip, &rp("f")).await.unwrap().lines;
+        let got: Vec<&str> = lines.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(got, want, "{content:?}");
+        for (i, l) in lines.iter().enumerate() {
+            assert_eq!((l.changeset, l.origin_line), (tip, i as u32 + 1));
+        }
+    }
+}
+
+/// A lone CR that appears in one version and is gone in the next changes the
+/// line it is in, no more: the line after it keeps its credit.
+#[tokio::test]
+async fn a_lone_cr_that_comes_and_goes_blames_by_lines() {
+    let (r, _) = slow_repo();
+    let c1 = commit(&r, &[], &[("f", Some("x\ny\nz\n"))]).await;
+    let c2 = commit(&r, &[c1], &[("f", Some("x\ry\nz\n"))]).await;
+    let c3 = commit(&r, &[c2], &[("f", Some("x\ny\nz\n"))]).await;
+    let c4 = commit(&r, &[c3], &[("f", Some("x\ny\nz\nw\r"))]).await;
+    let c5 = commit(&r, &[c4], &[("f", Some("x\ny\nz\nw\n"))]).await;
+    for (tip, want) in [
+        (c2, vec![("x\ry", c2, 1), ("z", c1, 3)]),
+        (c3, vec![("x", c3, 1), ("y", c3, 2), ("z", c1, 3)]),
+        (
+            c4,
+            vec![("x", c3, 1), ("y", c3, 2), ("z", c1, 3), ("w\r", c4, 4)],
+        ),
+        (
+            c5,
+            vec![("x", c3, 1), ("y", c3, 2), ("z", c1, 3), ("w", c5, 4)],
+        ),
+    ] {
+        for span in [1, 2, 8] {
+            assert!(agree(&r, tip, "f", span, false).await);
+        }
+        let lines = r.blame(tip, &rp("f")).await.unwrap().lines;
+        let got: Vec<(&str, ChangesetId, u32)> = lines
+            .iter()
+            .map(|l| (l.text.as_str(), l.changeset, l.origin_line))
+            .collect();
+        assert_eq!(got, want, "at {tip}");
+    }
+}
+
+/// Over random versions with every kind of line end, blame has a line for
+/// each `\n`-terminated line of the file, and each line is the one of the
+/// version it credits, at the line number it gives.
+#[tokio::test]
+async fn blame_of_versions_with_every_line_end_is_consistent() {
+    let pieces = [
+        "a\n", "b\n", "c\r\n", "d\r", "\r", "\n", "é\n", "x", "a\r\n", "", "b", "ü\r",
+    ];
+    let strip = |l: &str| {
+        let stripped = l.strip_suffix("\r\n").or_else(|| l.strip_suffix('\n'));
+        stripped.unwrap_or(l).to_string()
+    };
+    let mut rng = Lcg(11);
+    for _ in 0..25 {
+        let (r, _) = slow_repo();
+        let mut texts: BTreeMap<ChangesetId, String> = BTreeMap::new();
+        let mut tip: Option<ChangesetId> = None;
+        let mut last = String::new();
+        for _ in 0..2 + rng.below(8) {
+            let most = if rng.below(4) == 0 { 60 } else { 12 };
+            let text: String = (0..1 + rng.below(most))
+                .map(|_| pieces[rng.below(pieces.len())])
+                .collect();
+            if text == last {
+                continue;
+            }
+            let parents: Vec<ChangesetId> = tip.into_iter().collect();
+            let id = commit(&r, &parents, &[("f", Some(&text))]).await;
+            texts.insert(id, text.clone());
+            (tip, last) = (Some(id), text);
+        }
+        let tip = tip.unwrap();
+        for span in [1, 3] {
+            assert!(agree(&r, tip, "f", span, false).await, "{last:?}");
+        }
+        let lines = r.blame(tip, &rp("f")).await.unwrap().lines;
+        let want: Vec<String> = last.split_inclusive('\n').map(strip).collect();
+        let got: Vec<&String> = lines.iter().map(|l| &l.text).collect();
+        assert_eq!(got, want.iter().collect::<Vec<_>>(), "{last:?}");
+        for l in &lines {
+            let origin: Vec<String> = texts[&l.changeset]
+                .split_inclusive('\n')
+                .map(strip)
+                .collect();
+            assert_eq!(
+                origin.get(l.origin_line as usize - 1),
+                Some(&l.text),
+                "{l:?} of {:?}",
+                texts[&l.changeset]
+            );
+        }
+    }
 }

@@ -81,9 +81,13 @@ pub(crate) fn cache_key(id: ChangesetId, path: &RepoPath) -> Hash {
     Hash::of_object("blame", &b)
 }
 
-fn strip_eol(line: &str) -> String {
-    let l = line.strip_suffix('\n').unwrap_or(line);
-    l.strip_suffix('\r').unwrap_or(l).to_string()
+/// `line` of [`split_lines`] without its terminator. A `\r` belongs to the
+/// line unless a `\n` follows it.
+pub(crate) fn strip_eol(line: &str) -> &str {
+    match line.strip_suffix('\n') {
+        Some(l) => l.strip_suffix('\r').unwrap_or(l),
+        None => line,
+    }
 }
 
 impl Repo {
@@ -791,7 +795,7 @@ impl Repo {
             }
             old_text = versions.pop().expect("the newest version");
         }
-        let texts: Vec<&str> = old_text.split_inclusive('\n').collect();
+        let texts: Vec<&str> = split_lines(&old_text).collect();
         if texts.len() != lines.len() {
             return Err(Error::Other(format!(
                 "blame of {path} has {} lines for {} lines of text",
@@ -805,7 +809,7 @@ impl Repo {
             .map(|((changeset, origin_line), text)| BlameLine {
                 changeset,
                 origin_line,
-                text: strip_eol(text),
+                text: strip_eol(text).to_string(),
             })
             .collect();
         let resp: CachedBlame = (path.clone(), lines);
@@ -829,11 +833,11 @@ pub(crate) type Ops = Vec<(DiffTag, std::ops::Range<usize>, std::ops::Range<usiz
 /// applying them does. Returns the versions too.
 ///
 /// Each diff is the one `TextDiff::configure().timeout(DIFF_TIMEOUT)
-/// .diff_lines` makes, but cheaper: that splits both versions into lines and
-/// numbers the distinct lines for every pair, so every version was split and
-/// hashed twice. Here each task splits and numbers its versions once, and
-/// diffs the numbers with the same algorithm, which compares lines only for
-/// equality and so gives the same diff.
+/// .diff_slices` makes over [`split_lines`], but cheaper: that numbers the
+/// distinct lines for every pair, so every version was split and hashed
+/// twice. Here each task splits and numbers its versions once, and diffs the
+/// numbers with the same algorithm, which compares lines only for equality
+/// and so gives the same diff.
 pub(crate) async fn diff_versions(versions: Vec<String>) -> Result<(Vec<Ops>, Vec<String>)> {
     let versions = Arc::new(versions);
     let pairs = versions.len().saturating_sub(1);
@@ -886,34 +890,12 @@ pub(crate) async fn diff_versions(versions: Vec<String>) -> Result<(Vec<Ops>, Ve
     Ok((out, versions))
 }
 
-/// The lines of `text` as `similar` splits them for a line diff: each ends
-/// after `\n`, `\r\n`, or a `\r` not followed by `\n`.
+/// The lines of `text`, each with its `\n`. The one splitter for the diff and
+/// for the text blame reports, so their line counts cannot disagree. Only
+/// `\n` ends a line, as in the rest of Leep (`\r\n` is `\n` after a `\r`);
+/// splitting at a lone `\r` as `similar` does made blame fail on such files.
 pub(crate) fn split_lines(text: &str) -> impl Iterator<Item = &str> {
-    let b = text.as_bytes();
-    let mut start = 0;
-    let mut i = 0;
-    std::iter::from_fn(move || {
-        while i < b.len() {
-            let end = match b[i] {
-                b'\n' => i + 1,
-                b'\r' if b.get(i + 1) == Some(&b'\n') => i + 2,
-                b'\r' => i + 1,
-                _ => {
-                    i += 1;
-                    continue;
-                }
-            };
-            let line = &text[start..end];
-            (start, i) = (end, end);
-            return Some(line);
-        }
-        if start < b.len() {
-            let line = &text[start..];
-            start = b.len();
-            return Some(line);
-        }
-        None
-    })
+    text.split_inclusive('\n')
 }
 
 /// The changesets that changed the file, newest first, as a blame walk
