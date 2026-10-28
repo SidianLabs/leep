@@ -18,7 +18,7 @@ use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
 use leep_core::{BlobMeta, Error, Hash, Result};
 use object_store::path::Path;
-use object_store::{ObjectStore, PutPayload};
+use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 
 use crate::pack::{self, IdxEntry, PackIndex};
 use crate::packset::{merge_listing, DecodedCache, Tombstones};

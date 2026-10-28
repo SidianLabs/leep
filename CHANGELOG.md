@@ -23,6 +23,27 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 - The raw bytes of a field are used only while its lossy text still equals the
   changeset's, so a reworded changeset exports its new text.
 
+### Filesystem store temp files cannot collide across servers (issue #154)
+- **Fixed.** Loose-blob, repack and pack-copy temp files were named
+  `.tmp-<pid>-<counter>` and opened with a truncating `File::create`. Two
+  servers on one shared volume (two containers, each pid 1, counting from 0)
+  could pick the same name, interleave writes in one file and publish another
+  writer's bytes under a blob's hash, where loose reads are not hash-checked.
+  Temp files are now created with `O_EXCL`, retrying with a fresh name on a
+  clash, and the name carries a random per-process nonce
+  (`.tmp-<pid>-<nonce>-<n>`). Leftovers from older versions are still
+  recognised and cleaned up. A blob already corrupted this way is only found
+  by `verify --rehash`.
+
+### Review covers the changes a merge drops
+- **Fixed.** A merge that kept its first parent's version of a file that a
+  side parent had changed since their merge base threw that change away
+  without the file appearing among the merge's changes, so review never
+  asked about it. An empty merge whose first parent was an old commit and
+  whose side was the ref's head could therefore put a reviewed ref back to
+  the old files. Such files are now judged as `pending` (an owner's approval
+  clears them) in the land policy and in `review-status`.
+
 ### GitHub pull request reviews reach the review gate (ADR 0063, mirror half)
 - `leep-git mirror run --github-reviews`, with `--github-users FILE`
   (`login = principal`), `--github-api-token-file` and optionally
