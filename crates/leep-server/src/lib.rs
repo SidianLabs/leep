@@ -883,24 +883,65 @@ async fn add_review(
     Path(id): Path<String>,
     body: Bytes,
 ) -> ApiResult<Response> {
-    if who.as_ref().is_some_and(|p| !p.review) {
-        return Ok(auth::reject(
+    let forbidden = |why: &str| {
+        auth::reject(
             StatusCode::FORBIDDEN,
             leep_core::api::error_code::FORBIDDEN,
-            "token may not review: its tokens-file entry has \"review\": false",
-        ));
-    }
+            why,
+        )
+    };
     let id = cid(&id)?;
     let req: AddReviewRequest = parse_json(&body)?;
+    // A body naming a reviewer is never taken as the token's own review. With
+    // the capability the token speaks for someone else, so its own `review`
+    // flag (an agent-style token that approves nothing itself) does not apply.
+    if let Some(p) = who.as_ref() {
+        if req.reviewer.is_some() {
+            if !p.review_for {
+                return Ok(forbidden(
+                    "token may not review for others: its tokens-file entry lacks \
+                     \"review_for\": true",
+                ));
+            }
+        } else if !p.review {
+            return Ok(forbidden(
+                "token may not review: its tokens-file entry has \"review\": false",
+            ));
+        }
+    }
     repo.get_changeset(id).await?;
     let who = who.ok_or_else(|| Error::Invalid(NEEDS_AUTH.into()))?;
+    let reviewer = match req.reviewer {
+        Some(name) if name.trim().is_empty() => {
+            return Err(Error::Invalid("review reviewer must not be empty".into()).into())
+        }
+        Some(name) => name,
+        None => who.name.clone(),
+    };
+    leep_core::review::check_source(req.source.as_deref().unwrap_or_default())?;
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64);
+    // Source first: a crash between the two leaves a source with no review
+    // behind it, which listing ignores, never a review with a wrong origin.
+    // A direct post over an earlier on-behalf one replaces its source row,
+    // so the old origin is not shown for the new verdict.
+    if req.source.is_some() || repo.get_review_source(id, &reviewer).await?.is_some() {
+        repo.put_review_source(
+            id,
+            &reviewer,
+            &leep_core::review::ReviewSource {
+                via: who.name.clone(),
+                source: req.source.unwrap_or_default(),
+                timestamp,
+            },
+        )
+        .await?;
+    }
     repo.put_review(
         id,
         &leep_core::review::Review {
-            reviewer: who.name.clone(),
+            reviewer: reviewer.clone(),
             verdict: req.verdict,
             comment: req.comment,
             timestamp,
@@ -908,7 +949,7 @@ async fn add_review(
     )
     .await?;
     Ok(Json(AddReviewResponse {
-        reviewer: who.name,
+        reviewer,
         verdict: req.verdict,
     })
     .into_response())
