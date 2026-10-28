@@ -15,7 +15,6 @@ use std::collections::{BinaryHeap, HashSet};
 use std::fs::File;
 use std::io::{BufWriter, ErrorKind, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -30,6 +29,7 @@ use crate::packset::{
 use crate::packwrite::{
     hint_ids, plan_merge, write_order, write_pack, ObjectTable, PackSource, SourceRead,
 };
+use crate::tmpfile::create_exclusive;
 use crate::{storage_err, FsBlobStore};
 
 /// Held for a whole repack, fence included, so two never overlap. A lock,
@@ -38,7 +38,6 @@ const REPACK_LOCK: &str = "repack.lock";
 /// Prefix of a loose copy moved aside while a repack decides whether to
 /// delete it. A leftover is a whole object and the next repack puts it back.
 const ASIDE_PREFIX: &str = ".repack-";
-static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Where a repack is. The hook sees each step before it runs or after it is
 /// durable, so returning an error simulates a kill there.
@@ -331,24 +330,19 @@ fn rewrite_tombstones(dir: &Path) -> Result<()> {
         return sync_dir(dir);
     }
     let body: String = keep.iter().map(|(id, h)| tombstone_line(id, h)).collect();
-    let tmp = temp_name(dir, "tombstones");
-    write_durably(&tmp, body.as_bytes())?;
+    let tmp = write_durably(dir, "tombstones", body.as_bytes())?;
     std::fs::rename(&tmp, &path).map_err(storage_err)?;
     sync_dir(dir)
 }
 
-fn temp_name(dir: &Path, ext: &str) -> PathBuf {
-    dir.join(format!(
-        ".tmp-{}-{}.{ext}",
-        std::process::id(),
-        TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
-    ))
-}
-
-fn write_durably(path: &Path, bytes: &[u8]) -> Result<()> {
-    let mut f = File::create(path).map_err(storage_err)?;
-    f.write_all(bytes).map_err(storage_err)?;
-    f.sync_all().map_err(storage_err)
+fn write_durably(dir: &Path, ext: &str, bytes: &[u8]) -> Result<PathBuf> {
+    let (path, mut f) = create_exclusive(dir, &format!(".{ext}")).map_err(storage_err)?;
+    let res = f.write_all(bytes).and_then(|()| f.sync_all());
+    if let Err(e) = res {
+        let _ = std::fs::remove_file(&path);
+        return Err(storage_err(e));
+    }
+    Ok(path)
 }
 
 /// Loose objects and their total size.
@@ -734,9 +728,8 @@ impl FsBlobStore {
             RepackMode::Incremental { .. } => write_order(&table, old_bases, hints),
         };
 
-        let tmp_pack = temp_name(&dir, "pack");
-        let mut out =
-            BufWriter::with_capacity(1 << 20, File::create(&tmp_pack).map_err(storage_err)?);
+        let (tmp_pack, file) = create_exclusive(&dir, ".pack").map_err(storage_err)?;
+        let mut out = BufWriter::with_capacity(1 << 20, file);
         let mut src = FsSource {
             store: self,
             sources: &sources,
@@ -782,10 +775,9 @@ impl FsBlobStore {
         std::fs::rename(&tmp_pack, dir.join(format!("{id}.pack"))).map_err(storage_err)?;
         sync_dir(&dir)?;
         step(&opts, RepackStep::PackRenamed)?;
-        let tmp_idx = temp_name(&dir, "idx");
+        let (tmp_idx, file) = create_exclusive(&dir, ".idx").map_err(storage_err)?;
         {
-            let mut f =
-                BufWriter::with_capacity(1 << 20, File::create(&tmp_idx).map_err(storage_err)?);
+            let mut f = BufWriter::with_capacity(1 << 20, file);
             let mut check = blake3::Hasher::new();
             written.write_index(&table, &mut |b: &[u8]| {
                 check.update(b);
