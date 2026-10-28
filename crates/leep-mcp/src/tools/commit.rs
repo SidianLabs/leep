@@ -56,6 +56,7 @@ pub fn request_land_id(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Args {
     #[serde(default)]
     message: String,
@@ -82,6 +83,7 @@ pub(super) fn non_empty(s: Option<&str>) -> Option<&str> {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct Edit {
     pub path: String,
     content: Option<String>,
@@ -158,7 +160,14 @@ impl Server {
                          request_id for a different request"
                     )));
                 }
-                return self.land_existing(id, &target_ref, a.create_ref, Some(r.as_str()));
+                if a.changes.is_empty() || self.same_changes(id, &a.changes)? {
+                    return self.land_existing(id, &target_ref, a.create_ref, Some(r.as_str()));
+                }
+                // Other changes under a known id: the remembered changeset may
+                // never have landed (its land failed), so forget it and let
+                // the land id decide. If it did land, the server's record
+                // refuses this call as `already_landed`.
+                self.requests.lock().unwrap().remove(r);
             }
         }
         if a.message.trim().is_empty() {
@@ -242,6 +251,23 @@ impl Server {
             files,
             request_id.as_deref(),
         )
+    }
+
+    /// Whether `edits` make the same changes as the stored changeset `id`.
+    /// One that is no longer stored counts as different.
+    fn same_changes(&self, id: ChangesetId, edits: &[Edit]) -> Result<bool, ToolError> {
+        let mut now = BTreeMap::new();
+        let mut blobs = BTreeMap::new();
+        for e in edits {
+            let path = RepoPath::new(e.path.as_str())
+                .map_err(|err| ToolError(format!("bad path `{}`: {err}", e.path)))?;
+            now.insert(path, e.change(&mut blobs)?);
+        }
+        match self.client.get_changeset(&id) {
+            Ok(info) => Ok(differing_paths(&info.changeset.changes, &now).is_empty()),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Upload the blobs the server lacks.
@@ -648,6 +674,27 @@ mod tests {
     use leep_core::api::LandRefusal;
 
     use super::*;
+
+    #[test]
+    fn unknown_arguments_are_refused() {
+        let e = parse_args::<Args>(json!({"message":"m","changes":[],"target-ref":"x"}))
+            .err()
+            .expect("unknown field");
+        assert!(
+            e.0.starts_with("invalid arguments: unknown field `target-ref`"),
+            "{}",
+            e.0
+        );
+        let e = parse_args::<Args>(json!({
+            "message": "m",
+            "changes": [{ "path": "a", "content": "x", "exec": true }],
+        }))
+        .err()
+        .expect("unknown field in an edit");
+        assert!(e.0.contains("unknown field `exec`"), "{}", e.0);
+        parse_args::<Args>(json!({"message":"m","changes":[{"path":"a","delete":true}]}))
+            .unwrap_or_else(|e| panic!("{}", e.0));
+    }
 
     fn cs(c: char) -> ChangesetId {
         c.to_string().repeat(64).parse().unwrap()

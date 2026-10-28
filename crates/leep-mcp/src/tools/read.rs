@@ -25,6 +25,7 @@ const DEFAULT_SEARCH_LIMIT: u32 = 50;
 const MAX_SEARCH_LIMIT: u32 = 200;
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct LogArgs {
     rev: Option<String>,
     path: Option<String>,
@@ -40,23 +41,27 @@ struct LogArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ShowArgs {
     rev: String,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ListArgs {
     rev: Option<String>,
     prefix: Option<String>,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PathArgs {
     rev: Option<String>,
     path: String,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct BlameArgs {
     rev: Option<String>,
     path: String,
@@ -64,6 +69,7 @@ struct BlameArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SearchArgs {
     query: String,
     rev: Option<String>,
@@ -77,6 +83,7 @@ struct SearchArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ReviewStatusArgs {
     rev: String,
     #[serde(rename = "ref")]
@@ -84,6 +91,7 @@ struct ReviewStatusArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DiffArgs {
     from: Option<String>,
     to: String,
