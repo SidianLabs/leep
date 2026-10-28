@@ -226,8 +226,16 @@ impl Repo {
                 .collect()
         };
         let (approvals, rejections) = (by(Verdict::Approve), by(Verdict::Reject));
-        let mut paths = Vec::with_capacity(cs.changes.len());
-        for (path, change) in &cs.changes {
+        let dropped = self.dropped_side_changes(&cs.parents, id).await?;
+        let mut judged: Vec<(&RepoPath, Option<&FileChange>)> = cs
+            .changes
+            .iter()
+            .map(|(p, c)| (p, Some(c)))
+            .chain(dropped.iter().map(|p| (p, None)))
+            .collect();
+        judged.sort_by(|a, b| a.0.cmp(b.0));
+        let mut paths = Vec::with_capacity(judged.len());
+        for (path, change) in judged {
             let owned = owners.owners_of(path).await?;
             let relevant = |set: &BTreeSet<&str>| -> Vec<String> {
                 set.iter()
@@ -238,16 +246,22 @@ impl Repo {
             let (approved_by, rejected_by) = (relevant(&approvals), relevant(&rejections));
             let rule = if !rejected_by.is_empty() {
                 PathRule::Rejected
-            } else if self
-                .covered_by_merge_parent(&cs.parents, path, change)
-                .await?
-            {
-                PathRule::MergeParent
-            } else if let Some(r) = self
-                .auto_rule(rules, path, cs.parents.first().copied(), change)
-                .await?
-            {
-                PathRule::Auto(r)
+            } else if let Some(change) = change {
+                if self
+                    .covered_by_merge_parent(&cs.parents, path, change)
+                    .await?
+                {
+                    PathRule::MergeParent
+                } else if let Some(r) = self
+                    .auto_rule(rules, path, cs.parents.first().copied(), change)
+                    .await?
+                {
+                    PathRule::Auto(r)
+                } else if !approved_by.is_empty() {
+                    PathRule::Owner
+                } else {
+                    PathRule::Pending
+                }
             } else if !approved_by.is_empty() {
                 PathRule::Owner
             } else {
@@ -262,6 +276,44 @@ impl Repo {
             });
         }
         Ok(ChangesetReview { id, paths })
+    }
+
+    /// Paths where merge `id` keeps its first parent's version although a
+    /// side parent changed the path since their merge base. They are not
+    /// among the merge's own changes, which are relative to the first parent,
+    /// yet the merge throws the side's change away: with an old first parent
+    /// and the target ref's head as the side, it rewinds the ref's files.
+    async fn dropped_side_changes(
+        &self,
+        parents: &[ChangesetId],
+        id: ChangesetId,
+    ) -> Result<Vec<RepoPath>> {
+        let Some((&ours, sides)) = parents.split_first() else {
+            return Ok(Vec::new());
+        };
+        let key = |f: &Option<FileInfo>| f.as_ref().map(|f| (f.content, f.kind));
+        let mine = self.root_tree(id).await?;
+        let mut dropped = BTreeSet::new();
+        for &side in sides {
+            let base = self.merge_base(ours, side).await?;
+            for e in self
+                .diff_trees(self.root_tree(side).await?, mine, "")
+                .await?
+            {
+                let kept_ours = key(&self.lookup_file(ours, &e.path).await?) == key(&e.new);
+                if !kept_ours || dropped.contains(&e.path) {
+                    continue;
+                }
+                let at_base = match base {
+                    Some(b) => key(&self.lookup_file(b, &e.path).await?),
+                    None => None,
+                };
+                if at_base != key(&e.old) {
+                    dropped.insert(e.path);
+                }
+            }
+        }
+        Ok(dropped.into_iter().collect())
     }
 
     /// On a merge, `change` takes the path as it is in a side parent, and

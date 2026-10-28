@@ -8,7 +8,7 @@ use object_store::aws::AmazonS3Builder;
 use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
 use object_store::path::Path;
-use object_store::{ObjectStore, PutPayload};
+use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 
 use crate::objpacks::{RemotePackSet, DEFAULT_REFRESH_INTERVAL};
 use crate::packset::DEFAULT_DECODED_CACHE;

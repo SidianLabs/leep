@@ -1172,7 +1172,10 @@ under the token's name, never a name from the body, and needs authentication.
 Ownership is per directory: `OWNERS` files (one name per line, `#` comments,
 `noparent`) in the tree, read from the **target ref's head** at check time so a
 change cannot grant itself ownership; a path no file covers has no owners and
-any one approval satisfies it. Per changed path, an owner's reject blocks,
+any one approval satisfies it. The judged paths are the changeset's changes
+plus, on a merge, every path where it keeps the first parent's version of a
+file a side parent changed since their merge base (dropped changes need an
+owner). Per path, an owner's reject blocks,
 then a merge-side match (`merge_parent`: the path equals a side parent's and
 the first parent left it as it was at their merge base, so taking the side is
 what a clean merge does), an enabled auto rule from the
