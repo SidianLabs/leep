@@ -575,6 +575,7 @@ mod tests {
             FsBlobStore, FsPackFiles, ObjectBlobStore, ObjectPackFiles, RepackMode, RepackOptions,
         };
         use object_store::memory::InMemory;
+        use object_store::ObjectStoreExt;
 
         async fn repack(store: &FsBlobStore, mode: RepackMode) {
             let opts = RepackOptions {

@@ -17,7 +17,7 @@ blake3.workspace = true
 hex.workspace = true
 getrandom.workspace = true
 zstd.workspace = true
-object_store = { version = "0.12", features = ["aws"] }
+object_store = { version = "0.14", features = ["aws"] }
 url = "2"
 futures = "0.3"
 

@@ -953,6 +953,45 @@ async fn a_merge_cannot_launder_an_old_version_back_without_review() {
     assert_eq!(api.main_ref().await, Some(fix));
 }
 
+/// An empty merge whose first parent is the old commit and whose side parent
+/// is main's head is a fast-forward of main, yet its tree is the old commit's:
+/// landing it would undo the reviewed fix with no review.
+#[tokio::test]
+async fn a_merge_with_an_old_first_parent_cannot_rewind_main_without_review() {
+    let api = Api::with(POLICY);
+    let old = api
+        .seed_main(&[("OWNERS", Some("alice\n")), ("auth.rs", Some("weak\n"))])
+        .await;
+    let fix = api.commit(&[old], &[("auth.rs", Some("strong\n"))]).await;
+    api.approve(fix, "alice").await;
+    assert_eq!(api.land(fix, "bob").await.status, StatusCode::OK);
+
+    let rewind = api.commit(&[old, fix], &[]).await;
+    assert_eq!(rules(&api.status(rewind).await), [("auth.rs", "pending")]);
+    let r = api.land(rewind, "mallory").await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        r.error(),
+        needs_review(rewind, "auth.rs", "needs approval from one of [alice]")
+    );
+    let r = api
+        .post(
+            "/v1/refs/main",
+            "mallory",
+            &CasRefRequest {
+                expected: Some(fix),
+                new: Some(rewind),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.error());
+    assert_eq!(api.main_ref().await, Some(fix));
+
+    api.approve(rewind, "alice").await;
+    assert_eq!(api.land(rewind, "bob").await.status, StatusCode::OK);
+}
+
 /// Security review 2026-10, S-09: rewinding a protected ref would drop a
 /// reviewed fix without review, so the server refuses any move that is not
 /// a fast-forward.
