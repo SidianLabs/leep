@@ -16,7 +16,7 @@ use leep_core::{Changeset, ChangesetId, DeleteStep, Error, Hash, Result};
 use serde::Serialize;
 
 use super::kinds::{self, DropPolicy, KindClass};
-use super::problems::{recoverable, Damage, Problem, ProblemLog, Progress, Ticker};
+use super::problems::{damage_of, recoverable, Damage, Problem, ProblemLog, Progress, Ticker};
 use super::rows::{derive_kind, expected_blob_row, prepare, recompute, RowScan, PAGE};
 use super::shadow::{ShadowBlobs, ShadowMeta};
 use super::walk::{plan, Unreadable};
@@ -77,6 +77,10 @@ pub struct RederiveReport {
     /// Kinds processed, dependencies included, in the order they ran.
     pub kinds: Vec<String>,
     pub kind_reports: BTreeMap<String, RederiveKindReport>,
+    /// Changesets in scope that could not be read. Nothing downstream fails
+    /// for a tip, so `failed()` has to count them itself.
+    #[serde(default)]
+    pub unreadable_changesets: u64,
     pub problems: Vec<Problem>,
     pub problems_total: u64,
     pub notes: Vec<String>,
@@ -92,8 +96,10 @@ impl RederiveReport {
             .sum()
     }
 
+    /// Rows that could not be recomputed, and changesets that could not be
+    /// read at all.
     pub fn failed(&self) -> u64 {
-        self.kind_reports.values().map(|r| r.failed).sum()
+        self.kind_reports.values().map(|r| r.failed).sum::<u64>() + self.unreadable_changesets
     }
 }
 
@@ -109,6 +115,7 @@ struct Rederive<'a> {
     log: ProblemLog,
     ticker: Ticker,
     visited: u64,
+    unreadable: u64,
 }
 
 /// Recompute derived rows and write the ones that are missing or wrong.
@@ -149,6 +156,7 @@ pub async fn rederive(
         log: ProblemLog::new(opts.max_problems),
         ticker: Ticker::new(Duration::from_secs(5)),
         visited: 0,
+        unreadable: 0,
     };
     let mut notes = Vec::new();
     let verb = if opts.dry_run {
@@ -225,6 +233,7 @@ pub async fn rederive(
             .into_iter()
             .map(|(k, v)| (k.to_string(), v))
             .collect(),
+        unreadable_changesets: r.unreadable,
         problems,
         problems_total,
         notes,
@@ -270,13 +279,18 @@ impl Rederive<'_> {
         while let Some(page) = scan.next(&*meta).await? {
             for (key, value) in page {
                 self.report(kind).examined += 1;
-                let data = match self.real.blobs().get(&key).await? {
-                    Some(d) if Hash::of_blob(&d) == key => d,
+                let data = match self.real.blobs().get(&key).await {
+                    Ok(Some(d)) if Hash::of_blob(&d) == key => d,
                     // Collected, or damaged (and then not ours to fix).
-                    _ => {
+                    Ok(_) => {
                         self.report(kind).skipped += 1;
                         continue;
                     }
+                    Err(e) if damage_of(&e).is_some() => {
+                        self.report(kind).skipped += 1;
+                        continue;
+                    }
+                    Err(e) => return Err(e),
                 };
                 let expected = expected_blob_row(&data);
                 if expected == value {
@@ -541,6 +555,7 @@ impl Unreadable for Rederive<'_> {
         if let Some(c) = referenced_by {
             p = p.changeset(c);
         }
+        self.unreadable += 1;
         self.log.push(p);
         Ok(())
     }
