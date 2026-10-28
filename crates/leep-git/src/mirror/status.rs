@@ -41,12 +41,18 @@ pub enum RefState {
     Refused,
     /// The ref was deleted in Leep; the remote branch is left alone.
     DeletedInLeep,
+    /// A git-primary ref Leep moved back was moved forward again to the
+    /// remote's tip (ADR 0062). Clears on the next cycle.
+    Restored,
+    /// The branch of a two-way prefix ref was deleted on the remote while
+    /// its work is landed nowhere; the Leep ref is kept (ADR 0062).
+    DeletedOnRemote,
     /// The last attempt failed (server, remote or local); retried with backoff.
     Error,
 }
 
 impl RefState {
-    pub const ALL: [RefState; 8] = [
+    pub const ALL: [RefState; 10] = [
         RefState::InSync,
         RefState::Pending,
         RefState::Diverged,
@@ -54,6 +60,8 @@ impl RefState {
         RefState::RemoteAhead,
         RefState::Refused,
         RefState::DeletedInLeep,
+        RefState::Restored,
+        RefState::DeletedOnRemote,
         RefState::Error,
     ];
 
@@ -66,13 +74,18 @@ impl RefState {
             RefState::RemoteAhead => "remote-ahead",
             RefState::Refused => "refused",
             RefState::DeletedInLeep => "deleted-in-leep",
+            RefState::Restored => "restored",
+            RefState::DeletedOnRemote => "deleted-on-remote",
             RefState::Error => "error",
         }
     }
 
     /// States that clear on their own; anything else needs a person.
     pub fn healthy(self) -> bool {
-        matches!(self, RefState::InSync | RefState::Pending)
+        matches!(
+            self,
+            RefState::InSync | RefState::Pending | RefState::Restored
+        )
     }
 }
 
@@ -97,6 +110,17 @@ pub struct MergeCounts {
     pub conflicts: u64,
     pub refused: u64,
     pub lost_race: u64,
+}
+
+/// Replays of a git-primary ref's unpushed lands onto the remote's commits
+/// (ADR 0062).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplayCounts {
+    pub ok: u64,
+    pub conflicts: u64,
+    pub refused: u64,
+    /// The base moved between the mirror's read and the server's check.
+    pub stale_base: u64,
 }
 
 /// Land branches landed onto a ref.
@@ -189,6 +213,14 @@ pub struct RefStatus {
     /// tag.
     #[serde(default)]
     pub ref_prefix: Option<String>,
+    /// The remote is this ref's source of truth (ADR 0062).
+    #[serde(default)]
+    pub git_primary: bool,
+    #[serde(default)]
+    pub replays: ReplayCounts,
+    /// Times a Leep undo was moved forward again to the remote's tip.
+    #[serde(default)]
+    pub restores: u64,
 }
 
 /// A branch under a `--ref-prefix` that the mirror deleted on the remote
@@ -236,6 +268,13 @@ pub struct Status {
     /// The most recent of those deletions, oldest first.
     #[serde(default)]
     pub deleted_branches: Vec<DeletedBranch>,
+    /// Two-way prefix refs deleted in Leep after their branch was deleted
+    /// on the remote with the work landed (ADR 0062).
+    #[serde(default)]
+    pub refs_deleted: u64,
+    /// The most recent of those, oldest first.
+    #[serde(default)]
+    pub deleted_refs: Vec<DeletedBranch>,
 }
 
 pub fn now() -> u64 {
@@ -398,6 +437,40 @@ pub fn render_metrics(s: &Status) -> String {
     }
     head(
         &mut o,
+        "leep_mirror_replays_total",
+        "counter",
+        "Replays of a git-primary ref's unpushed lands onto the remote's commits by result: ok, conflicts, refused, stale_base.",
+    );
+    for r in &s.refs {
+        for (k, v) in [
+            ("ok", r.replays.ok),
+            ("conflicts", r.replays.conflicts),
+            ("refused", r.replays.refused),
+            ("stale_base", r.replays.stale_base),
+        ] {
+            let _ = writeln!(
+                o,
+                "leep_mirror_replays_total{{ref=\"{}\",result=\"{k}\"}} {v}",
+                esc(&r.leep_ref)
+            );
+        }
+    }
+    head(
+        &mut o,
+        "leep_mirror_restores_total",
+        "counter",
+        "Times a git-primary ref Leep moved back was moved forward again to the remote's tip.",
+    );
+    for r in &s.refs {
+        let _ = writeln!(
+            o,
+            "leep_mirror_restores_total{{ref=\"{}\"}} {}",
+            esc(&r.leep_ref),
+            r.restores
+        );
+    }
+    head(
+        &mut o,
         "leep_mirror_land_branches_total",
         "counter",
         "Land branches by result: landed, conflicts, refused (land policy or a bad branch).",
@@ -446,6 +519,13 @@ pub fn render_metrics(s: &Status) -> String {
         "leep_mirror_branches_deleted_total {}",
         s.branches_deleted
     );
+    head(
+        &mut o,
+        "leep_mirror_refs_deleted_total",
+        "counter",
+        "Two-way prefix refs deleted in Leep after their branch was deleted on the remote with the work landed.",
+    );
+    let _ = writeln!(o, "leep_mirror_refs_deleted_total {}", s.refs_deleted);
     head(
         &mut o,
         "leep_mirror_commits_exported_total",

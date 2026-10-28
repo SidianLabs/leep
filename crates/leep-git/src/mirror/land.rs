@@ -19,7 +19,7 @@ use gix::ObjectId;
 
 use super::git::{tracking_ref, PushOutcome};
 use super::status::{self, LandBranchStatus, LandState};
-use super::{crash_point, import, list_paths, log, LandOutcome, Mirror};
+use super::{crash_point, import, land_id_for, list_paths, log, LandOutcome, Mirror};
 
 pub(super) struct LandBranch {
     pub commit: ObjectId,
@@ -161,9 +161,11 @@ impl Mirror<'_> {
             .head
             .ok_or_else(|| anyhow!("import: {commit} has no changeset after import"))?;
         crash_point("land-imported");
+        // The same branch value is the same land, however often it is retried.
+        let id = land_id_for(&["land", name, &commit.to_string()]);
         let outcome = self
             .leep
-            .land(head, &target)
+            .land(head, &target, Some(id))
             .with_context(|| format!("import: landing {name} onto {target}"))?;
         let max = self.cfg.max_backoff;
         match outcome {

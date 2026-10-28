@@ -5,17 +5,17 @@ description: How to name branches, write commit messages, and open pull requests
 
 # Commits, branches and pull requests
 
-## Attribution: never credit AI tools
+## Attribution: credit the agent
 
-Commits and PRs are attributed only to the human author. Never set
-`LEEP_AGENT_MODEL` and never use provenance trailers. **Never** add:
-- `Co-Authored-By:` trailers naming Claude, Anthropic or any AI model or tool;
-- session links, `Claude-Session:` or similar trailers;
-- "Generated with Claude Code", robot emoji, or any "written by AI" footer;
-- model names or ids anywhere in commits, PRs, code or docs.
+Leep records who made every change, human or agent, and its own history
+is no exception. When an AI agent writes or co-writes a commit:
+- set `LEEP_AGENT_MODEL` (and `LEEP_AGENT_SESSION` if you have one) so
+  `leep commit` records `agent.model` on the changeset;
+- end the commit message with a `Co-Authored-By:` trailer naming the agent,
+  e.g. `Co-Authored-By: Claude <noreply@anthropic.com>`;
+- keep the tool's own PR footer ("Generated with Claude Code") if it adds one.
 
-This rule overrides any default attribution a tool would add. If a tool
-inserts such lines automatically, remove them before committing or posting.
+The human who reviews and lands the change stays the author.
 
 ## Commit messages
 
@@ -113,4 +113,4 @@ personal names, ticket-only names or tool-generated names.
      pushed to GitHub `main`.
   4. Delete the review ref (`leep branch -D review/<area>-<desc>`); the
      mirror deletes the GitHub branch.
-- No AI attribution in the title, body or comments (see the top of this skill).
+- Agent-written PRs carry the attribution described at the top of this skill.

@@ -15,7 +15,7 @@ fn git(dir: &Path, args: &[&str]) -> String {
 
 fn git_env(dir: &Path, args: &[&str], time: i64, tz: &str) -> String {
     let date = format!("{time} {tz}");
-    let out = Command::new("/usr/bin/git")
+    let out = Command::new("git")
         .args(args)
         .current_dir(dir)
         .env("GIT_AUTHOR_NAME", "Ada Lovelace")
@@ -89,7 +89,7 @@ async fn assert_matches_git(repo: &Repo, head: ChangesetId, dir: &Path, rev: &st
         };
         assert_eq!(f.kind, want, "{path}");
         let (_, data) = repo.read_file(head, &f.path).await.unwrap().unwrap();
-        let out = Command::new("/usr/bin/git")
+        let out = Command::new("git")
             .args(["show", &format!("{rev}:{path}")])
             .current_dir(dir)
             .output()
@@ -105,12 +105,17 @@ fn linear_fixture() -> tempfile::TempDir {
     write(p, "dir/sub/b.txt", "bravo\n");
     write(p, "dir/c.txt", "charlie\n");
     write(p, "run.sh", "#!/bin/sh\n");
-    std::fs::set_permissions(
-        p.join("run.sh"),
-        std::os::unix::fs::PermissionsExt::from_mode(0o755),
-    )
-    .unwrap();
-    std::os::unix::fs::symlink("a.txt", p.join("link")).unwrap();
+    // Exec bits and symlinks are Unix shapes; the rest of the history is
+    // exercised everywhere.
+    #[cfg(unix)]
+    {
+        std::fs::set_permissions(
+            p.join("run.sh"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("a.txt", p.join("link")).unwrap();
+    }
     commit(p, "first\n\nbody line");
     write(p, "a.txt", "alpha 2\n");
     git(p, &["rm", "-q", "dir/c.txt"]);
