@@ -365,8 +365,9 @@ struct WorkDir(PathBuf);
 impl WorkDir {
     fn new() -> Result<WorkDir> {
         let dir = std::env::temp_dir().join(format!(
-            "leep-repack-{}-{}-{}",
+            "leep-repack-{}-{}-{}-{}",
             std::process::id(),
+            crate::tmpfile::nonce(),
             WORK_COUNTER.fetch_add(1, Ordering::Relaxed),
             now_secs()
         ));

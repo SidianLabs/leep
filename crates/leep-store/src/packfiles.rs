@@ -5,7 +5,6 @@
 
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -21,12 +20,11 @@ use crate::packset::{
     self, parse_tombstones, sync_dir, tombstone_line, Tombstones, PACKS_DIR, TOMBSTONES,
 };
 use crate::storage_err;
+use crate::tmpfile::create_exclusive;
 
 pub type ByteStream = BoxStream<'static, Result<Bytes>>;
 
 const CHUNK: usize = 1 << 20;
-
-static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// The files under a blob store's `packs/`: `<id>.pack`, `<id>.idx` and the
 /// tombstones (one file on a filesystem, one empty object each in a bucket).
@@ -118,13 +116,12 @@ impl PackFiles for FsPackFiles {
         tokio::fs::create_dir_all(&self.dir)
             .await
             .map_err(storage_err)?;
-        let tmp = self.dir.join(format!(
-            ".tmp-{}-{}.copy",
-            std::process::id(),
-            TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
+        let (tmp, file) = {
+            let dir = self.dir.clone();
+            blocking(move || create_exclusive(&dir, ".copy").map_err(storage_err)).await?
+        };
         let res = async {
-            let mut f = tokio::fs::File::create(&tmp).await.map_err(storage_err)?;
+            let mut f = tokio::fs::File::from_std(file);
             let mut n = 0u64;
             while let Some(chunk) = data.next().await {
                 let chunk = chunk?;
@@ -247,5 +244,35 @@ impl PackFiles for ObjectPackFiles {
                 .map_err(storage_err)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A copy never writes through a temp file another writer already made.
+    #[tokio::test]
+    async fn write_does_not_reuse_an_existing_temp_file() {
+        let root = tempfile::tempdir().unwrap();
+        let files = FsPackFiles::new(root.path());
+        let dir = root.path().join(PACKS_DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        let next = crate::tmpfile::TMP_COUNTER.load(std::sync::atomic::Ordering::Relaxed);
+        let theirs: Vec<_> = (next..next + 16)
+            .map(|n| {
+                let nonce = crate::tmpfile::nonce();
+                dir.join(format!(".tmp-{}-{nonce}-{n}.copy", std::process::id()))
+            })
+            .collect();
+        for p in &theirs {
+            std::fs::write(p, b"theirs").unwrap();
+        }
+        let body = stream::iter([Ok(Bytes::from_static(b"the pack"))]).boxed();
+        files.write("a.pack", body).await.unwrap();
+        assert_eq!(std::fs::read(dir.join("a.pack")).unwrap(), b"the pack");
+        for p in &theirs {
+            assert_eq!(std::fs::read(p).unwrap(), b"theirs");
+        }
     }
 }
