@@ -1,5 +1,7 @@
 # 0039. Incremental repack and pack backups
-Status: Accepted
+Status: Accepted. Amended 2026-10-28 (issue #155): a backup no longer
+copies the source's tombstones into the pool, and pruning ignores pool
+tombstones (section 6).
 Date: 2026-10-17
 
 ## Context
@@ -114,7 +116,7 @@ tombstone that names a missing pack.
 files. `FsPackFiles` covers a directory, and `ObjectPackFiles` covers a
 bucket, in ADR 0040's layout. `leep_store::open_pack_files(url)` opens one
 for a `file://`/path or `s3://` URL, and returns `None` for `mem://`.
-`sync::sync_packs(src, dst, prune)` runs before the existing `sync_blobs`, in
+`sync::sync_packs(src, dst, mode)` runs before the existing `sync_blobs`, in
 `backup` and in `restore`:
 
 - For each pack the source has published and the destination has not, it
@@ -128,21 +130,42 @@ for a `file://`/path or `s3://` URL, and returns `None` for `mem://`.
   Restore refuses a pool with one. A pack the source deletes while it is
   being copied counts as `vanished`. Its objects are in the pack that
   replaced it, or they are copied loose.
-- Tombstones of the packs the destination holds are added: as lines to the
+- ~~Tombstones of the packs the destination holds are added: as lines to the
   file on a filesystem, and as one empty object each in a bucket. This is
   safe for older snapshots: changesets are never deleted, so GC never
   deletes what any snapshot needs (ADR 0026), and the closure check of each
-  run still proves it.
+  run still proves it.~~ *Amended 2026-10-28 (issue #155):* the premise
+  failed with ADR 0059. Once the changeset sweep deletes a changeset and
+  `gc --full` deletes its packed tree nodes, the source tombstones them in
+  their pack; the next backup copied those tombstones into the pool's copy
+  of the pack, so an older sealed snapshot naming them stopped verifying
+  and restoring. Each run's closure check covers only its own snapshot, so
+  nothing noticed. Now `sync_packs` takes a `PackSyncMode`:
+  - **`Pool` (backup)** copies no tombstones. The pool keeps every packed
+    object as it keeps every loose one; its object set only grows.
+  - **`Restore`** copies the pool's tombstones of the packs the target
+    holds, so the target reads exactly as the pool does. A pool written
+    since this change has none. One written before may hold some, nearly
+    all from blob GC of objects no changeset ever named; they stay as they
+    are.
+  The manifest's `tombstones_copied` stays, and is 0 for a backup.
 - Then `sync_blobs` runs unchanged. A destination that reads packs lists
   their objects with the same logical sizes, so only loose objects are
   copied one by one. A destination that does not read packs still receives
   every object loose.
 - **Pruning (backup only).** A source repack that merges packs would leave
   every intermediate pack in the pool forever. A pool pack the source no
-  longer has is deleted, index first, when other pool packs hold every live
-  object it held. The object set of the pool still only grows. A pack that
-  holds anything no other pack does is kept: for example, an object GC
-  deleted and a full repack then dropped, between two backups.
+  longer has is deleted, index first, when other pool packs hold every
+  object it held (*amended 2026-10-28:* every object, not every live one;
+  a pool tombstone never makes an object prunable, and the object stays
+  readable wherever it was). The object set of the pool still only grows.
+  A pack that holds anything no other pack does is kept: for example, an
+  object GC deleted and a full repack then dropped. Since the pool no
+  longer takes the source's tombstones, that is now every pack that held
+  an object the source deleted before its next full repack, so a pool
+  keeps somewhat more packs than the source. No prune that knows which
+  sealed snapshots still need an object exists; ADR 0026 has the
+  retention advice (start a new pool).
 
 `BackupOptions` and `RestoreOptions` gain `source_packs`/`dest_packs`
 (`target_packs`). The manifest's blob section gains `packs_listed`,
@@ -211,5 +234,9 @@ stays until the next `--full`. Run `--full` from time to time (OPERATIONS.md,
 - **Backups mirror the source's packs exactly**, deleting pool packs the
   source deleted. That would break the pool's rule that its object set only
   grows (ADR 0026). Pruning only covered packs keeps that rule.
+- **Copy source tombstones only for objects no sealed snapshot names**
+  (issue #155). It would need a closure walk of every kept snapshot on each
+  backup, to save the space of objects the source deleted, which the pool
+  keeps when they are loose anyway.
 - **A new manifest format.** The fields are additions with defaults, and
   older readers ignore them.

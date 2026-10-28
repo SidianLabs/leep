@@ -515,7 +515,11 @@ snapshot against the pool and seals the result in `manifest.json`. The order
 is the consistency argument: a blob a stored changeset needs is never deleted
 (ADR 0012), so everything the snapshot needs is in the store when the copy
 looks, however GC interleaves; the walk enforces it on every run, so no lock
-against GC is needed. `restore` loads blobs, then metadata in one transaction,
+against GC is needed. The pool is shared by every snapshot and only grows:
+since the changeset sweep (ADR 0059) can delete changesets, the source may
+later delete objects an older snapshot names, so nothing deleted at the
+source is deleted or hidden in the pool (packed objects included; issue
+#155). `restore` loads blobs, then metadata in one transaction,
 into empty stores only, refusing a newer schema and a damaged file, and the
 restored stores pass `verify`. Compressed changeset rows and their
 dictionaries are copied byte for byte. `backup-verify` checks a backup without
@@ -944,9 +948,12 @@ name objects by `u32` ids (a sorted table of the run's objects, whose ranks
 are the ids, and `leep_core::intern` in the walk), about 140 bytes per
 object for a full repack. Compression runs on one thread per CPU; a single
 writer thread picks each frame in order, so the pack's bytes do not depend
-on the thread count. Backups copy packs and their tombstones as files
+on the thread count. Backups copy packs as files
 (`leep_store::packfiles`, `sync::sync_packs`) before the object-by-object
-copy, which then finds the packed objects present. A read
+copy, which then finds the packed objects present. They do not copy the
+source's tombstones: the pool keeps every object an older snapshot may
+name, since the changeset sweep can delete changesets (ADR 0026, ADR 0039,
+issue #155). A restore copies the pool's own tombstones, if any. A read
 decodes the chain iteratively and checks the result against its hash. GC
 deletes a packed object by appending a tombstone; the next full repack leaves
 it out. A store reads a pack published by another process on its next miss

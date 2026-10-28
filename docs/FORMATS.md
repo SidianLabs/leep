@@ -1073,7 +1073,7 @@ work on a scratch copy.
 | `counts` | `changesets`, `refs`, `derived`, `ref_log` row counts; a restore must load exactly these |
 | `ref_log_last_seq` | highest ref log `seq` ever issued |
 | `refs` | ref name to changeset id (hex) at the snapshot |
-| `blobs` | `included`, `location`, `listed`, `already_present`, `copied`, `bytes_copied`, `replaced`, `vanished`, `only_in_backup`, `corrupt` (hashes the source held with wrong bytes); since ADR 0039 also `packs_listed`, `packs_already_present`, `packs_copied`, `pack_bytes_copied`, `packs_pruned`, `tombstones_copied`, `corrupt_packs` (0 or empty when absent) |
+| `blobs` | `included`, `location`, `listed`, `already_present`, `copied`, `bytes_copied`, `replaced`, `vanished`, `only_in_backup`, `corrupt` (hashes the source held with wrong bytes); since ADR 0039 also `packs_listed`, `packs_already_present`, `packs_copied`, `pack_bytes_copied`, `packs_pruned`, `tombstones_copied`, `corrupt_packs` (0 or empty when absent; `tombstones_copied` is 0 since issue #155, as a backup no longer copies the source's tombstones into the pool) |
 | `check` | `mode` (`closure`, `closure+rehash`, `skipped`), `ok`, `changesets`, `tree_nodes`, `blobs_checked`, `blobs_rehashed`, `problems`, `first_problems` |
 | `elapsed_secs` | wall time of the run |
 

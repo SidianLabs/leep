@@ -7,6 +7,21 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 ## [Unreleased]
 
+### Backups keep packed objects older snapshots need (issue #155)
+- **Fixed.** A backup copied the source's pack tombstones into the backup
+  pool, which every snapshot shares. Once the changeset sweep (ADR 0059)
+  deleted a changeset and `gc --full` deleted its packed tree nodes and
+  contents, the next backup hid them in the pool, and an older sealed
+  snapshot that named them failed `backup-verify` and could not be
+  restored. Nothing reported it, since each backup checks only its own
+  snapshot. The sweep is off by default, so no pool was known to be
+  affected. Backups now never copy source tombstones, and pruning a pool
+  pack the source merged away ignores pool tombstones, so the pool keeps
+  every object, packed or loose. A pool now keeps somewhat more packs than
+  the source; `tombstones_copied` in the manifest is 0. `restore` still
+  copies the pool's own tombstones (only older pools have any). ADR 0026
+  and ADR 0039 are amended.
+
 ### Review covers the changes a merge drops
 - **Fixed.** A merge that kept its first parent's version of a file that a
   side parent had changed since their merge base threw that change away
