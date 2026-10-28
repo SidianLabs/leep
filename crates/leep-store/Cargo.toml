@@ -15,6 +15,7 @@ tracing.workspace = true
 metrics.workspace = true
 blake3.workspace = true
 hex.workspace = true
+getrandom.workspace = true
 zstd.workspace = true
 object_store = { version = "0.14", features = ["aws"] }
 url = "2"
