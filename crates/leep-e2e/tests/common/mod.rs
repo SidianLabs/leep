@@ -7,6 +7,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -457,7 +458,20 @@ impl PgDb {
             return None;
         };
         // Schemas cannot be selected through the URL, so isolate with a database.
-        let name = format!("leep_e2e_{}_{}", std::process::id(), free_port());
+        // A counter, not a free port: the OS can hand two tests running at
+        // once the same released port, and both would create one database.
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let name = format!(
+            "leep_e2e_{}_{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        );
+        // A database left by a killed run of an earlier process with this
+        // pid is stale: no live process can own the name.
+        run_sql(
+            &admin_url,
+            &format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"),
+        );
         run_sql(&admin_url, &format!("CREATE DATABASE {name}"));
         let (base, query) = match admin_url.split_once('?') {
             Some((b, q)) => (b, format!("?{q}")),
