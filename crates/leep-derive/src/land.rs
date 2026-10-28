@@ -1626,6 +1626,15 @@ impl Repo {
                             self.root_tree(cs).await?,
                         )
                         .await?;
+                    if m.conflicts.is_empty() {
+                        // A member clashes with `head` alone, but the stack
+                        // as a whole merges cleanly (`head` already has what
+                        // the stack ends with). Land the stack as one copy of
+                        // `cs`; an empty change is a legitimate copy.
+                        let copy = self.rebased_copy(cs, head, m.changes).await?;
+                        return Ok(Ok(vec![(cs, copy)]));
+                    }
+                    debug_assert!(!m.conflicts.is_empty());
                     return Ok(Err(LandResponse::Conflicts {
                         onto: head,
                         conflicts: m.conflicts,
