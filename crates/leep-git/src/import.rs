@@ -15,9 +15,9 @@ use leep_derive::Repo;
 use tokio::sync::mpsc;
 
 use crate::{
-    format_tz, gerr, git_key, lookup_leep, EXTRA_GIT_AUTHOR_TZ, EXTRA_GIT_COMMIT,
+    gerr, git_key, lookup_leep, tz_token, EXTRA_GIT_AUTHOR_TZ, EXTRA_GIT_COMMIT,
     EXTRA_GIT_COMMITTER, EXTRA_GIT_COMMITTER_TZ, EXTRA_GIT_ENCODING, EXTRA_GIT_HEADERS,
-    GIT_TO_LEEP, LEEP_TO_GIT,
+    EXTRA_GIT_RAW, GIT_TO_LEEP, LEEP_TO_GIT,
 };
 
 /// Commits decoded and with their blobs uploaded ahead of the changeset
@@ -57,14 +57,16 @@ pub struct ImportReport {
 pub(crate) struct Prepared {
     pub(crate) parents: Vec<ObjectId>,
     author: String,
-    author_tz: i32,
+    author_tz: String,
     time: i64,
     committer: String,
     committer_time: i64,
-    committer_tz: i32,
+    committer_tz: String,
     message: String,
     encoding: Option<String>,
     headers: Vec<(String, String)>,
+    /// Original bytes of the fields above that are not valid UTF-8.
+    raw: BTreeMap<&'static str, serde_json::Value>,
     pub(crate) changes: Vec<(String, Option<(FileKind, ObjectId)>)>,
     pub(crate) submodules: usize,
 }
@@ -123,6 +125,11 @@ fn flatten(
     Ok(out)
 }
 
+fn b64(bytes: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
 pub(crate) fn prepare(ts: &gix::ThreadSafeRepository, id: ObjectId) -> Result<Prepared> {
     let g = ts.to_thread_local();
     let commit = g
@@ -138,6 +145,27 @@ pub(crate) fn prepare(ts: &gix::ThreadSafeRepository, id: ObjectId) -> Result<Pr
     let ident = |s: &gix::actor::SignatureRef<'_>| {
         format!("{} <{}>", s.name.to_str_lossy(), s.email.to_str_lossy())
     };
+    let raw_ident = |s: &gix::actor::SignatureRef<'_>| {
+        [
+            s.name.as_ref(),
+            b" <".as_slice(),
+            s.email.as_ref(),
+            b">".as_slice(),
+        ]
+        .concat()
+    };
+    let mut raw = BTreeMap::new();
+    let mut keep = |key: &'static str, bytes: &[u8]| {
+        if std::str::from_utf8(bytes).is_err() {
+            raw.insert(key, b64(bytes).into());
+        }
+    };
+    keep("author", &raw_ident(&author));
+    keep("committer", &raw_ident(&committer));
+    keep("message", c.message);
+    if let Some(e) = c.encoding {
+        keep("encoding", e);
+    }
     let (atime, ctime) = (
         author.time().map_err(gerr)?,
         committer.time().map_err(gerr)?,
@@ -149,6 +177,17 @@ pub(crate) fn prepare(ts: &gix::ThreadSafeRepository, id: ObjectId) -> Result<Pr
         .iter()
         .map(|(k, v)| (k.to_str_lossy().into_owned(), v.to_str_lossy().into_owned()))
         .collect();
+    if c.extra_headers
+        .iter()
+        .any(|(k, v)| std::str::from_utf8(k).is_err() || std::str::from_utf8(v).is_err())
+    {
+        let pairs: Vec<_> = c
+            .extra_headers
+            .iter()
+            .map(|(k, v)| [b64(k), b64(v)])
+            .collect();
+        raw.insert("headers", serde_json::json!(pairs));
+    }
 
     let old_tree = match parents.first() {
         Some(p) => {
@@ -218,14 +257,15 @@ pub(crate) fn prepare(ts: &gix::ThreadSafeRepository, id: ObjectId) -> Result<Pr
     Ok(Prepared {
         parents,
         author: ident(&author),
-        author_tz: atime.offset,
+        author_tz: tz_token(author.time, atime.offset),
         time: atime.seconds,
         committer: ident(&committer),
         committer_time: ctime.seconds,
-        committer_tz: ctime.offset,
+        committer_tz: tz_token(committer.time, ctime.offset),
         message,
         encoding,
         headers,
+        raw,
         changes,
         submodules: subs,
     })
@@ -263,11 +303,8 @@ pub(crate) fn changeset_for(
             EXTRA_GIT_COMMITTER.to_string(),
             format!("{} {}", p.committer, p.committer_time),
         ),
-        (EXTRA_GIT_AUTHOR_TZ.to_string(), format_tz(p.author_tz)),
-        (
-            EXTRA_GIT_COMMITTER_TZ.to_string(),
-            format_tz(p.committer_tz),
-        ),
+        (EXTRA_GIT_AUTHOR_TZ.to_string(), p.author_tz),
+        (EXTRA_GIT_COMMITTER_TZ.to_string(), p.committer_tz),
     ]);
     if let Some(e) = p.encoding {
         extra.insert(EXTRA_GIT_ENCODING.to_string(), e);
@@ -275,6 +312,10 @@ pub(crate) fn changeset_for(
     if !p.headers.is_empty() {
         let json = serde_json::to_string(&p.headers).map_err(gerr)?;
         extra.insert(EXTRA_GIT_HEADERS.to_string(), json);
+    }
+    if !p.raw.is_empty() {
+        let json = serde_json::to_string(&p.raw).map_err(gerr)?;
+        extra.insert(EXTRA_GIT_RAW.to_string(), json);
     }
     Ok(Changeset {
         parents,

@@ -2519,6 +2519,7 @@ name = "leep-git"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "base64 0.23.1",
  "bytes",
  "clap",
  "futures-util",

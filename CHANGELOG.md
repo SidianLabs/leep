@@ -7,6 +7,22 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 ## [Unreleased]
 
+### Git commits keep their exact bytes through import and export (issues #173, #174)
+- **Fixed.** A commit whose author or committer time zone is `-0000` was
+  exported as `+0000`, and a commit with non-UTF-8 bytes in its message,
+  author, committer, `encoding` or extra headers was exported with U+FFFD
+  in their place. Both changed the sha and every descendant's, so the mirror
+  reported `diverged` after a rebuild and the CLI export wrote a second
+  `git-to-leep-v1` row. Import now keeps the `-0000` token in
+  `git.author_tz` / `git.committer_tz`, and the original bytes of any
+  non-UTF-8 field in a new `git.raw` extra (JSON of base64 strings). The
+  `extra` of a UTF-8 commit with a normal time zone is unchanged, so its
+  changeset id is too. Changesets imported before this fix still export as
+  they did; re-import does not change them either, because the importer skips
+  commits it has mapped.
+- The raw bytes of a field are used only while its lossy text still equals the
+  changeset's, so a reworded changeset exports its new text.
+
 ### Backups keep packed objects older snapshots need (issue #155)
 - **Fixed.** A backup copied the source's pack tombstones into the backup
   pool, which every snapshot shares. Once the changeset sweep (ADR 0059)
