@@ -4679,3 +4679,41 @@ mod create_rows {
         assert_eq!(r.generation(id).await.unwrap(), 2);
     }
 }
+
+#[tokio::test]
+async fn landing_a_change_the_head_already_has_is_not_a_conflict() {
+    for base_files in [
+        vec![("a", Some("a\n"))],
+        vec![("a", Some("a\n")), ("r", Some("old\n"))],
+    ] {
+        let r = repo();
+        let base = commit(&r, &[], &base_files, "base").await;
+        let h = commit(&r, &[base], &[("r", Some("x\n"))], "person").await;
+        let s = commit(&r, &[base], &[("r", Some("x\n"))], "squash").await;
+        r.land(h, "main").await.unwrap();
+        let resp = r.land(s, "main").await.unwrap();
+        let LandResponse::Landed { landed: id, .. } = resp else {
+            panic!("expected Landed, got {resp:?}")
+        };
+        assert!(r.is_ancestor(h, id).await.unwrap());
+        assert_eq!(text(&r, id, "r").await.as_deref(), Some("x\n"));
+    }
+}
+
+#[tokio::test]
+async fn a_stack_whose_squash_the_head_already_has_lands_without_a_conflict() {
+    let r = repo();
+    let base = commit(&r, &[], &[("r", Some("old\n"))], "base").await;
+    let h = commit(&r, &[base], &[("r", Some("x\n"))], "squash").await;
+    // Alone the first commit clashes with `h`; together the stack ends where
+    // `h` already is.
+    let p1 = commit(&r, &[base], &[("r", Some("y\n"))], "first").await;
+    let p2 = commit(&r, &[p1], &[("r", Some("x\n"))], "second").await;
+    r.land(h, "main").await.unwrap();
+    let resp = r.land(p2, "main").await.unwrap();
+    let LandResponse::Landed { landed, .. } = resp else {
+        panic!("expected Landed, got {resp:?}")
+    };
+    assert!(r.is_ancestor(h, landed).await.unwrap());
+    assert_eq!(text(&r, landed, "r").await.as_deref(), Some("x\n"));
+}
