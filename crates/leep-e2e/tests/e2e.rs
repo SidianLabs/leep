@@ -8,6 +8,7 @@ mod common;
 
 use std::collections::BTreeMap;
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Barrier;
@@ -59,6 +60,7 @@ fn make_fixture(root: &Path) -> Fixture {
     commit(&dir, "initial import");
 
     put(&dir, "scripts/run.sh", "#!/bin/sh\necho hi\n");
+    #[cfg(unix)]
     fs::set_permissions(
         dir.join("scripts/run.sh"),
         fs::Permissions::from_mode(0o755),
@@ -67,6 +69,7 @@ fn make_fixture(root: &Path) -> Fixture {
     commit(&dir, "add script");
 
     put(&dir, "docs/guide/intro.md", "intro\n");
+    #[cfg(unix)]
     std::os::unix::fs::symlink("../README.md", dir.join("docs/readme-link")).unwrap();
     commit(&dir, "docs and symlink");
 
@@ -523,26 +526,32 @@ fn run_import_swarm_export(stores: &Stores, work: &Path) {
             "{path} in export"
         );
     }
-    assert_eq!(modes.get("scripts/run.sh"), Some(&"100755"), "exec bit");
-    assert_eq!(modes.get("docs/readme-link"), Some(&"120000"), "symlink");
-    assert_eq!(
-        git(&bare, &["show", "main:docs/readme-link"]),
-        "../README.md"
-    );
+    #[cfg(unix)]
+    {
+        assert_eq!(modes.get("scripts/run.sh"), Some(&"100755"), "exec bit");
+        assert_eq!(modes.get("docs/readme-link"), Some(&"120000"), "symlink");
+        assert_eq!(
+            git(&bare, &["show", "main:docs/readme-link"]),
+            "../README.md"
+        );
+    }
     assert!(!modes.contains_key("old.txt"));
     let shared_exported = git(&bare, &["show", "main:shared.txt"]);
     assert_eq!(shared_exported, shared);
 
     // The checked-out working copy keeps the exec bit and the symlink too.
-    let mode = fs::metadata(verify.join("scripts/run.sh"))
-        .unwrap()
-        .permissions()
-        .mode();
-    assert_ne!(mode & 0o111, 0, "script lost its exec bit");
-    assert_eq!(
-        fs::read_link(verify.join("docs/readme-link")).unwrap(),
-        Path::new("../README.md")
-    );
+    #[cfg(unix)]
+    {
+        let mode = fs::metadata(verify.join("scripts/run.sh"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_ne!(mode & 0o111, 0, "script lost its exec bit");
+        assert_eq!(
+            fs::read_link(verify.join("docs/readme-link")).unwrap(),
+            Path::new("../README.md")
+        );
+    }
 
     // What the import, the swarm's rebases and the export left behind is
     // sound all the way down (ADR 0025).
@@ -848,6 +857,7 @@ fn signed_changesets_gate_landing_on_a_protected_ref() {
             "alice",
         ],
     );
+    #[cfg(unix)]
     assert_eq!(
         fs::metadata(&keyfile).unwrap().permissions().mode() & 0o777,
         0o600

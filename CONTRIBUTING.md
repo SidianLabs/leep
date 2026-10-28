@@ -11,6 +11,7 @@
    give it a `## <AlertName>` runbook in [docs/RUNBOOKS.md](docs/RUNBOOKS.md) and
    run `scripts/check-runbooks.sh`, which CI runs too. If you change
    dependencies, also run `cargo deny check` (see "Supply-chain checks").
+   Windows runs the unit and integration tests; Linux and macOS also run the e2e, soak and crash tests.
 4. Keep PRs to one logical change. Follow the commit, branch and PR
    conventions in [`.claude/skills/commit-and-pr/SKILL.md`](.claude/skills/commit-and-pr/SKILL.md).
    Commits and PRs credit human authors only, never AI tools.

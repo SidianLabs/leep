@@ -211,10 +211,14 @@ pub async fn export_snapshot(src_url: &str, dest: &Path) -> Result<SnapshotInfo>
         }
     };
     let sync = (|| -> std::io::Result<()> {
-        std::fs::File::open(&partial)?.sync_all()?;
+        // Windows refuses to flush a handle opened read-only.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&partial)?
+            .sync_all()?;
         std::fs::rename(&partial, dest)?;
         if let Some(dir) = dest.parent().filter(|d| !d.as_os_str().is_empty()) {
-            std::fs::File::open(dir)?.sync_all()?;
+            leep_core::fsync::sync_dir(dir)?;
         }
         Ok(())
     })();
@@ -238,6 +242,14 @@ async fn export_to(src_url: &str, partial: &Path) -> Result<SnapshotInfo> {
         "creating the snapshot file",
         SqliteMetaStore::create_single(&dest_url).await,
     )?;
+    // Closed on every path: Windows cannot delete a file a pool holds open,
+    // and a failed export removes its partial file.
+    let res = copy_into(src_url, &dest).await;
+    dest.pool.close().await;
+    res
+}
+
+async fn copy_into(src_url: &str, dest: &SqliteMetaStore) -> Result<SnapshotInfo> {
     let mut sink = at(
         "creating the snapshot file",
         SqliteSink::begin(&dest.pool).await,
@@ -271,7 +283,6 @@ async fn export_to(src_url: &str, partial: &Path) -> Result<SnapshotInfo> {
         "committing the snapshot file",
         Box::new(sink).commit().await,
     )?;
-    dest.pool.close().await;
     Ok(info)
 }
 

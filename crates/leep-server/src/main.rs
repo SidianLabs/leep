@@ -1210,8 +1210,27 @@ fn log_colours(terminal: bool, no_color: Option<std::ffi::OsString>) -> bool {
     terminal && no_color.is_none_or(|v| v.is_empty())
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+/// Main thread stack on Linux; Windows gives 1 MiB, which the debug build's
+/// large subcommand futures overflow.
+const MAIN_STACK_BYTES: usize = 8 * 1024 * 1024;
+
+fn main() -> anyhow::Result<()> {
+    std::thread::Builder::new()
+        .name("main".into())
+        .stack_size(MAIN_STACK_BYTES)
+        .spawn(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .context("building tokio runtime")?
+                .block_on(run())
+        })
+        .context("spawning main thread")?
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
+async fn run() -> anyhow::Result<()> {
     let args = parse_args(std::env::args_os()).unwrap_or_else(|e| e.exit());
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
     // These print their report on stdout, so logs go to stderr.
