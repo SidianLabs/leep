@@ -60,12 +60,14 @@ own. `GET .../reviews` on a copy with none reports the original's reviews with
 `via` (using `rebase_chain`), which is informational only.
 
 **Decision per path.** For each path a changeset changes (relative to its first
-parent), in this order:
+parent), and on a merge also each path where it keeps the first parent's
+version although a side parent changed the path since their merge base (the
+merge drops that change; S-23), in this order:
 1. a `reject` from an owner of the path blocks it, whatever else holds; with no
    owners a `reject` from any principal blocks;
 2. on a merge, a path whose new content and kind equal that path in one of
    `parents[1..]` is **covered** (`merge_parent`): that side's history is in the
-   land's new history and is reviewed on its own;
+   land's new history and is reviewed on its own (never a dropped path);
 3. an enabled **auto rule** that holds approves it (`auto:<rule>`);
 4. an approval from an owner (or anyone, when unowned) approves it (`owner`);
 5. otherwise it is `pending`.
@@ -214,6 +216,11 @@ See [SECURITY-REVIEW.md](../SECURITY-REVIEW.md).
   if it equals a side parent's *and* the first parent left it as it was at the
   two parents' merge base, which is when a clean three-way merge takes the
   side's version. Server-made clean merges are unaffected.
+- **Dropped side changes (S-23, fixed).** A merge's changes are relative to
+  its first parent, so a path where it kept the first parent's version and
+  threw away a side's change was never judged: an empty `merge(old, head)` is
+  a fast-forward of the ref whose tree is `old`'s. Such paths are judged too,
+  with no auto rule and no `merge_parent`: an owner must approve.
 - **`comment_only` (S-03, fixed).** The lexer now also gives up on string
   interpolation that can nest quotes (Python f- and t-strings, C#, Kotlin,
   Scala, Swift, Ruby, shell) unless every interpolated expression closes and

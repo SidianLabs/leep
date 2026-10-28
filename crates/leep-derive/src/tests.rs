@@ -2739,6 +2739,46 @@ mod review {
         assert_eq!(rule_of(&s, "a.rs"), PathRule::Pending);
     }
 
+    /// A merge that keeps its first parent's version of a path a side parent
+    /// changed since their merge base drops that change, and the path is not
+    /// among the merge's own changes. An empty merge with an old first parent
+    /// would otherwise rewind a protected ref's files with no review.
+    #[tokio::test]
+    async fn a_merge_that_drops_a_sides_change_needs_review() {
+        let r = repo();
+        let base = commit(
+            &r,
+            &[],
+            &[("a.rs", Some("old\n")), ("b.rs", Some("1\n"))],
+            "base",
+        )
+        .await;
+        let fix = commit(&r, &[base], &[("a.rs", Some("fixed\n"))], "fix").await;
+        let none = ReviewRules::default();
+
+        // Empty merge with the old commit first: its tree is the base's.
+        let m = commit(&r, &[base, fix], &[], "m").await;
+        let s = status(&r, Some(fix), &none, m, &[]).await;
+        assert_eq!(rule_of(&s, "a.rs"), PathRule::Pending);
+        assert!(!s.approved());
+        let s = status(&r, Some(fix), &none, m, &[rev("alice", Verdict::Approve)]).await;
+        assert_eq!(rule_of(&s, "a.rs"), PathRule::Owner);
+
+        // A side's change the merge keeps, or one only ours made, is not dropped.
+        let theirs = commit(&r, &[base], &[("b.rs", Some("2\n"))], "theirs").await;
+        let m = commit(&r, &[fix, theirs], &[("b.rs", Some("2\n"))], "m").await;
+        let s = status(&r, Some(fix), &none, m, &[]).await;
+        assert_eq!(s.paths.len(), 1);
+        assert_eq!(rule_of(&s, "b.rs"), PathRule::MergeParent);
+
+        // Merging the ref into a branch and keeping the branch's version of
+        // a file the ref changed drops the ref's change.
+        let m = commit(&r, &[theirs, fix], &[], "m").await;
+        let s = status(&r, Some(fix), &none, m, &[]).await;
+        assert_eq!(s.paths.len(), 1);
+        assert_eq!(rule_of(&s, "a.rs"), PathRule::Pending);
+    }
+
     #[tokio::test]
     async fn review_rows_overwrite_per_reviewer_and_are_validated() {
         let r = repo();
