@@ -109,6 +109,7 @@ pub struct Repo {
     pub(crate) history_roots: Arc<HistoryRootCache>,
     /// Tree nodes viewed for lookups (see `read_tree_view`).
     pub(crate) trees: Arc<TreeCache>,
+    pub(crate) nodes: Arc<NodeCache>,
     /// Encoded `tree-trigrams-v1` rows read from the store by searches
     /// (see `Repo::search_tree_rows`).
     pub(crate) search_trees: Arc<SearchTreeCache>,
@@ -377,6 +378,13 @@ pub(crate) struct StagedNodes {
 /// delta chain first. Checked against their hash before they are cached.
 pub(crate) type TreeCache = SizedCache<TreeView, TREE_CACHE_BYTES>;
 
+/// Decoded tree nodes by hash, for [`Repo::read_tree`] and
+/// [`Repo::read_trees`]: a land's merge, its tree build and diffs read the
+/// same upper directories of the head over and over (ADR 0066). Only nodes
+/// read from the store and checked against their hash are kept; a node's
+/// hash names its content, so an entry is never stale.
+pub(crate) type NodeCache = SizedCache<TreeNode, NODE_CACHE_BYTES>;
+
 /// Directory filters (`tree-trigrams-v1` rows) as stored, by tree hash. A
 /// search reads the filter of every directory it opens, and the upper levels
 /// are the same for every query and for every revision that did not change
@@ -418,7 +426,11 @@ struct SizedMaps<V> {
 const HISTORY_CACHE_BYTES: usize = 96 << 20;
 
 /// Bytes the tree cache may hold, counted like [`HISTORY_CACHE_BYTES`].
-const TREE_CACHE_BYTES: usize = 32 << 20;
+const TREE_CACHE_BYTES: usize = 16 << 20;
+
+/// Bytes the decoded node cache may hold, counting a node at three times its
+/// encoding. With [`TREE_CACHE_BYTES`], the 32 MiB tree nodes always had.
+const NODE_CACHE_BYTES: usize = 16 << 20;
 
 impl<V, const BUDGET: usize> SizedCache<V, BUDGET> {
     pub(crate) fn scaled(s: CacheScale) -> Self {
@@ -508,6 +520,7 @@ pub const DEFAULT_CACHE_BYTES: usize = HISTORY_CACHE_BYTES
     + HISTORY_PART_CACHE_BYTES
     + HISTORY_ROOT_CACHE_BYTES
     + TREE_CACHE_BYTES
+    + NODE_CACHE_BYTES
     + SEARCH_TREE_CACHE_BYTES
     + crate::derived::LOG_FILTER_CACHE_BYTES;
 
@@ -562,6 +575,7 @@ impl Repo {
             history_parts: Arc::default(),
             history_roots: Arc::default(),
             trees: Arc::default(),
+            nodes: Arc::default(),
             search_trees: Arc::default(),
             skiplists: Arc::default(),
             log_filter: Arc::default(),
@@ -715,6 +729,7 @@ impl Repo {
         self.history_parts = Arc::new(SizedCache::scaled(s));
         self.history_roots = Arc::new(SizedCache::scaled(s));
         self.trees = Arc::new(SizedCache::scaled(s));
+        self.nodes = Arc::new(SizedCache::scaled(s));
         self.search_trees = Arc::new(SizedCache::scaled(s));
         self.skiplists = Arc::new(SkiplistCache::scaled(s));
         self.log_filter = Arc::new(crate::derived::LogFilterCaches::scaled(s));
@@ -1239,6 +1254,9 @@ impl Repo {
         if let Some(n) = self.node_memo.as_ref().and_then(|m| m.get(&tree)) {
             return Ok(n);
         }
+        if let Some(n) = self.nodes.get(&tree) {
+            return Ok((*n).clone());
+        }
         let node = self.read_tree_stored(tree).await?;
         if let Some(m) = &self.node_memo {
             m.insert(tree, node.clone());
@@ -1254,10 +1272,22 @@ impl Repo {
             Some(b) if Hash::of_object(TreeNode::KIND, &b) != tree => {
                 Err(Error::Storage(format!("corrupt tree node {tree}")))
             }
-            Some(b) => TreeNode::decode(&b),
+            Some(b) => {
+                let node = TreeNode::decode(&b)?;
+                self.cache_node(tree, &node, b.len());
+                Ok(node)
+            }
             None if tree == TreeNode::empty_hash() => Ok(TreeNode::default()),
             None => Err(Error::NotFound(format!("tree {tree}"))),
         }
+    }
+
+    /// Keep a node read from the store and checked against its hash. In a
+    /// staged land batch the nodes the batch wrote are answered by its memo
+    /// before the store is asked, so only stored nodes get here.
+    fn cache_node(&self, tree: Hash, node: &TreeNode, encoded_len: usize) {
+        self.nodes
+            .insert_sized(tree, Arc::new(node.clone()), 3 * encoded_len);
     }
 
     /// [`Repo::read_tree`] of each of `trees`, in order, with one
@@ -1269,15 +1299,19 @@ impl Repo {
         distinct.sort_unstable();
         distinct.dedup();
         let mut nodes = HashMap::with_capacity(distinct.len());
-        if let Some(m) = &self.node_memo {
-            distinct.retain(|t| match m.get(t) {
+        distinct.retain(|t| {
+            let held = match self.node_memo.as_ref().and_then(|m| m.get(t)) {
+                Some(n) => Some(n),
+                None => self.nodes.get(t).map(|n| (*n).clone()),
+            };
+            match held {
                 Some(n) => {
                     nodes.insert(*t, n);
                     false
                 }
                 None => true,
-            });
-        }
+            }
+        });
         let found = if distinct.is_empty() {
             Vec::new()
         } else {
@@ -1299,7 +1333,11 @@ impl Repo {
                 Some(b) if Hash::of_object(TreeNode::KIND, &b) != tree => {
                     return Err(Error::Storage(format!("corrupt tree node {tree}")))
                 }
-                Some(b) => TreeNode::decode(&b)?,
+                Some(b) => {
+                    let node = TreeNode::decode(&b)?;
+                    self.cache_node(tree, &node, b.len());
+                    node
+                }
                 None if tree == TreeNode::empty_hash() => TreeNode::default(),
                 None => return Err(Error::NotFound(format!("tree {tree}"))),
             };

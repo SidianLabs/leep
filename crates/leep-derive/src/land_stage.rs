@@ -273,6 +273,29 @@ impl BlobStore for StagedBlobs {
         self.inner.get(hash).await
     }
 
+    /// Staged blobs from memory, and every other one in one batched read
+    /// of the store (the default asks for them one at a time).
+    async fn get_many(&self, hashes: &[Hash]) -> Result<Vec<Option<Bytes>>> {
+        let mut out: Vec<Option<Bytes>> = {
+            let s = self.staging.lock();
+            hashes.iter().map(|h| s.blobs.get(h).cloned()).collect()
+        };
+        let missing: Vec<Hash> = hashes
+            .iter()
+            .zip(&out)
+            .filter(|(_, b)| b.is_none())
+            .map(|(h, _)| *h)
+            .collect();
+        if missing.is_empty() {
+            return Ok(out);
+        }
+        let mut read = self.inner.get_many(&missing).await?.into_iter();
+        for slot in out.iter_mut().filter(|b| b.is_none()) {
+            *slot = read.next().flatten();
+        }
+        Ok(out)
+    }
+
     /// A staged blob counts: it is stored before anything that references it.
     async fn contains(&self, hash: &Hash) -> Result<bool> {
         if self.staging.lock().blobs.contains_key(hash) {

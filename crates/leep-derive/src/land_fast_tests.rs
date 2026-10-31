@@ -1070,3 +1070,90 @@ async fn a_file_over_a_directory_the_ref_grew_is_a_conflict() {
     let answer = p.land(theirs).await;
     assert!(answer.contains("rebased: true"), "{answer}");
 }
+
+/// Counts the reads that reach a blob store.
+struct Counting {
+    inner: MemoryBlobStore,
+    gets: std::sync::atomic::AtomicUsize,
+    batches: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl leep_core::BlobStore for Counting {
+    async fn put_with_hash(&self, hash: leep_core::Hash, data: Bytes) -> Result<()> {
+        self.inner.put_with_hash(hash, data).await
+    }
+    async fn get(&self, hash: &leep_core::Hash) -> Result<Option<Bytes>> {
+        self.gets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.get(hash).await
+    }
+    async fn get_many(&self, hashes: &[leep_core::Hash]) -> Result<Vec<Option<Bytes>>> {
+        self.batches
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut out = Vec::new();
+        for h in hashes {
+            out.push(self.inner.get(h).await?);
+        }
+        Ok(out)
+    }
+    async fn list_page(
+        &self,
+        after: Option<leep_core::Hash>,
+        limit: usize,
+    ) -> Result<Vec<leep_core::store::BlobMeta>> {
+        self.inner.list_page(after, limit).await
+    }
+    async fn delete(&self, hash: &leep_core::Hash) -> Result<()> {
+        self.inner.delete(hash).await
+    }
+}
+
+/// Tree nodes are read from the store once and then served decoded, and a
+/// staged batch reads the nodes it did not write in one batched read.
+#[tokio::test]
+async fn tree_nodes_are_read_once_and_in_batches() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let blobs = Arc::new(Counting {
+        inner: MemoryBlobStore::new(),
+        gets: Default::default(),
+        batches: Default::default(),
+    });
+    let r = Repo::new(blobs.clone(), Arc::new(MemoryMetaStore::new()));
+    let base = create(
+        &r,
+        &[],
+        &edits(&[
+            ("a/x", Some("1\n")),
+            ("b/x", Some("2\n")),
+            ("c/x", Some("3\n")),
+        ]),
+        "base",
+    )
+    .await;
+    let root = r.root_tree(base).await.unwrap();
+    // A fresh handle has nothing cached.
+    let r = Repo::new(blobs.clone(), Arc::clone(r.meta()));
+    let dirs: Vec<leep_core::Hash> = r
+        .read_tree(root)
+        .await
+        .unwrap()
+        .entries
+        .values()
+        .map(|e| match e {
+            leep_core::TreeEntry::Dir { tree } => *tree,
+            _ => panic!("a directory"),
+        })
+        .collect();
+    let staging = Arc::new(crate::land_stage::Staging::default());
+    let staged = staging.repo(&r);
+    let (gets, batches) = (blobs.gets.load(SeqCst), blobs.batches.load(SeqCst));
+    staged.read_trees(&dirs).await.unwrap();
+    assert_eq!(blobs.batches.load(SeqCst), batches + 1, "one batched read");
+    assert_eq!(blobs.gets.load(SeqCst), gets, "no single reads");
+    // Read again, through either handle: from memory.
+    staged.read_trees(&dirs).await.unwrap();
+    r.read_trees(&dirs).await.unwrap();
+    r.read_tree(root).await.unwrap();
+    assert_eq!(blobs.batches.load(SeqCst), batches + 1);
+    assert_eq!(blobs.gets.load(SeqCst), gets);
+}
