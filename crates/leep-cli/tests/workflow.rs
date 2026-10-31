@@ -454,7 +454,10 @@ fn sync_no_rebase_keeps_the_old_rule_and_head_sync_is_a_no_op() {
     assert_eq!(sync(&mut ctx, &SyncArgs::default()).unwrap(), 0);
     assert_eq!(snapshots(&env, "sync"), 0);
     assert_eq!(read(&ctx, "a.txt"), "edited\n");
-    let strict = SyncArgs { no_rebase: true };
+    let strict = SyncArgs {
+        no_rebase: true,
+        ..Default::default()
+    };
     let e = sync(&mut ctx, &strict).unwrap_err();
     assert!(user_err(e).contains("uncommitted"));
     assert_eq!(read(&ctx, "a.txt"), "edited\n");

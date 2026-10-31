@@ -172,7 +172,10 @@ fn checkout_materializes_prefixes_modes_and_prunes() {
 
     // `--no-rebase` keeps the old rule: a dirty working copy is refused.
     write(&ctx, "sub/x.txt", "local edit\n");
-    let strict = SyncArgs { no_rebase: true };
+    let strict = SyncArgs {
+        no_rebase: true,
+        ..Default::default()
+    };
     assert!(sync(&mut ctx, &strict).is_err());
     let back = CheckoutArgs {
         rev: "@".into(),

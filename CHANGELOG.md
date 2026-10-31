@@ -7,6 +7,15 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 ## [Unreleased]
 
+### `sync --no-rebase` keeps local commits (issue #176)
+- **Fixed.** `leep sync --no-rebase` moved the working copy to the target's
+  head even when the base was an unlanded local commit, leaving it
+  unreachable from any ref without a word. It now refuses (exit 1), naming
+  the local commits and pointing at `leep sync`, unless the base is already
+  in the target's history.
+- **Added.** `leep sync --no-rebase --discard` keeps the old behaviour on
+  request and prints the abandoned id on stderr.
+
 ### `status` on a diverged base (issue #175)
 - **Fixed.** `leep status` called a base that forked from an older target
   commit "N commits ahead" (`ahead: N`) although the target had moved on, so

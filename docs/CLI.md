@@ -99,6 +99,13 @@ The counts are generation differences from the merge base, exact for a
 linear history. `leep sync` moves the local commits onto the head in the
 last two cases.
 
+`leep sync --no-rebase` moves nothing local: it refuses (exit 1) a working
+copy with uncommitted changes, and a base that is not in the target's history,
+naming the local commits it would leave behind. `--discard`, which needs
+`--no-rebase`, syncs anyway and prints the abandoned base's id on stderr;
+`leep checkout ID` returns to it and `leep branch NAME ID` keeps it, until
+then no ref points at it.
+
 ## Conflict markers
 
 When a land, sync, merge, cherry-pick, revert or stash apply cannot merge a

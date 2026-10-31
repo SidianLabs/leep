@@ -122,3 +122,69 @@ fn status_on_a_base_unrelated_to_its_target_says_so() {
     let out = leep.ok(wc.path(), &["status"]);
     assert!(out.contains("base shares no history with main"), "{out}");
 }
+
+fn base_of(leep: &Leep, dir: &Path) -> String {
+    leep.json(dir, &["status"])["base"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+#[test]
+fn sync_no_rebase_refuses_to_drop_a_local_commit() {
+    let leep = Leep::new();
+    let mock = Mock::start();
+    let (wc, local, _) = forked(&leep, &mock);
+    let out = leep.run(wc.path(), &["sync", "--no-rebase"]);
+    let err = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(err.contains(&local[..12]), "{err}");
+    assert!(err.contains("not on main"), "{err}");
+    assert!(err.contains("`leep sync`"), "{err}");
+    assert!(err.contains("--discard"), "{err}");
+    assert_eq!(base_of(&leep, wc.path()), local);
+    assert_eq!(
+        std::fs::read_to_string(wc.path().join("local.txt")).unwrap(),
+        "mine\n"
+    );
+}
+
+#[test]
+fn sync_no_rebase_discard_abandons_the_local_commit_and_names_it() {
+    let leep = Leep::new();
+    let mock = Mock::start();
+    let (wc, local, head) = forked(&leep, &mock);
+    let out = leep.run(wc.path(), &["sync", "--no-rebase", "--discard"]);
+    let err = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    assert!(err.contains(&local[..12]), "{err}");
+    assert_eq!(base_of(&leep, wc.path()), head.to_string());
+    assert!(!wc.path().join("local.txt").exists());
+}
+
+#[test]
+fn sync_no_rebase_still_moves_a_base_that_is_on_the_target() {
+    let leep = Leep::new();
+    let mock = Mock::start();
+    let m1 = mock.seed(None, &file("1\n"), &[]);
+    let wc = tempfile::tempdir().unwrap();
+    leep.ok(wc.path(), &["--server", &mock.url, "init", "."]);
+    let m2 = mock.seed(Some(m1), &file("2\n"), &[]);
+    let out = leep.run(wc.path(), &["sync", "--no-rebase"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(base_of(&leep, wc.path()), m2.to_string());
+    assert_eq!(
+        std::fs::read_to_string(wc.path().join("a.txt")).unwrap(),
+        "2\n"
+    );
+}
+
+#[test]
+fn sync_discard_needs_no_rebase() {
+    let leep = Leep::new();
+    let mock = Mock::start();
+    let (wc, local, _) = forked(&leep, &mock);
+    let out = leep.run(wc.path(), &["sync", "--discard"]);
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+    assert_eq!(base_of(&leep, wc.path()), local);
+}
