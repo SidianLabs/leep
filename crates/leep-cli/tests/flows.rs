@@ -1656,3 +1656,61 @@ fn an_interrupted_checkout_blocks_status_and_commit_until_rerun() {
     assert_eq!(saved.materializing, None);
     assert_eq!(saved.base, Some(to));
 }
+
+#[test]
+fn a_land_text_conflict_keeps_the_executable_bit() {
+    let mock = Mock::start();
+    let cache = tempfile::tempdir().unwrap();
+    let dirs: Vec<_> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
+    mock.seed(
+        None,
+        &[("run.sh", "#!/bin/sh\necho 0\n", FileKind::Executable)],
+        &[],
+    );
+    let mut wcs: Vec<Ctx> = dirs
+        .iter()
+        .map(|d| init_wc(&mock, d.path(), cache.path(), &[]).unwrap())
+        .collect();
+    let land_args = LandArgs {
+        target_ref: None,
+        create: false,
+    };
+    // Writing an existing file keeps its mode, so both edits stay 755.
+    write(&wcs[0], "run.sh", "#!/bin/sh\necho A\n");
+    commit::run(&mut wcs[0], &commit_args("A")).unwrap();
+    assert_eq!(land::run(&mut wcs[0], &land_args).unwrap(), 0);
+    write(&wcs[1], "run.sh", "#!/bin/sh\necho B\n");
+    commit::run(&mut wcs[1], &commit_args("B")).unwrap();
+    assert_eq!(land::run(&mut wcs[1], &land_args).unwrap(), 5);
+    let ctx = &mut wcs[1];
+    assert!(read(ctx, "run.sh").contains("<<<<<<<"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(ctx.wc.abs("run.sh"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o755, "marker file keeps the exec bit");
+    }
+
+    // Resolving changes the content only: no kind change is committed.
+    write(ctx, "run.sh", "#!/bin/sh\necho AB\n");
+    let st = status(&ctx.wc).unwrap();
+    assert_eq!(st.entries.len(), 1);
+    assert_eq!(st.entries[0].change, Change::Modified);
+    assert_eq!(
+        st.entries[0].now.as_ref().unwrap().kind,
+        FileKind::Executable
+    );
+    commit::run(ctx, &commit_args("resolved")).unwrap();
+    let id = ctx.wc.state.base.unwrap();
+    let d = mock.data.lock().unwrap();
+    assert!(matches!(
+        d.changesets[&id].changes[&"run.sh".try_into().unwrap()],
+        FileChange::Modify {
+            kind: FileKind::Executable,
+            ..
+        }
+    ));
+}

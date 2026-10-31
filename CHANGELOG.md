@@ -30,6 +30,15 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   `land` and `switch` fail with an I/O error, and a FIFO made them hang
   waiting for a writer. The working-copy scan now records only regular
   files and symlinks and skips other file types silently, as git does.
+
+### Land conflicts keep the file's mode (issue #171)
+- **Fixed.** When `leep land` wrote conflict markers into an executable file
+  it wrote it as a regular file, so resolving and committing silently
+  removed the exec bit. The marker file now takes its kind from your side of
+  the conflict (else the landed side). Where the two sides' modes differ,
+  the conflict line says so (`mode differs: landed 755, yours 644; kept
+  yours`) instead of settling it unseen.
+
 ### Failed or interrupted checkouts no longer lose files on the next commit (issue #170)
 - **Fixed.** A checkout, switch, sync or `reset --hard` whose blob download
   failed part-way left the files already written recorded as clean while the
