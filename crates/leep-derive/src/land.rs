@@ -32,10 +32,14 @@ const BACKOFF_CAP_MS: u64 = 200;
 const MAX_COMMIT_ERRORS: u32 = 3;
 /// Changesets examined when looking for an earlier landing of the same stack.
 pub(crate) const LANDED_COPY_SCAN: usize = 1024;
-/// Lands one batch takes at most. It bounds the commit (one ref log row per
-/// land) and how long a land waits behind replays of the lands queued before
-/// it; the next batch starts as soon as this one commits.
-pub(crate) const MAX_BATCH: usize = 64;
+/// Lands one batch takes at most, unless [`Repo::with_land_max_batch`] says
+/// otherwise. It bounds the commit (one ref log row per land) and how long a
+/// land waits behind replays of the lands queued before it; the next batch
+/// starts as soon as this one commits.
+pub const MAX_BATCH: usize = 64;
+/// Fewest batches `--land-queue-seconds` admits a land behind, whatever the
+/// batch time: one would collapse each batch to about one land.
+pub const MIN_QUEUE_BATCHES: usize = 2;
 /// How long a batch may keep trying, from its first attempt. A batch runs
 /// detached from the requests that asked for it, so this bounds how long
 /// after its last fence read it can still move a ref, which the changeset
@@ -106,10 +110,24 @@ impl LandStats {
     }
 }
 
+/// How long a ref's land queue may grow before new lands are refused (ADR
+/// 0060 section 2, ADR 0068).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum LandQueueBound {
+    /// At most this many batches ahead, its own included
+    /// (`--land-queue-batches`).
+    Batches(usize),
+    /// At most this long a wait: the ref's moving batch time turned into
+    /// batches (`--land-queue-seconds`).
+    Seconds(Duration),
+}
+
 /// The land queues of one process, one per target ref.
 #[derive(Default)]
 pub(crate) struct LandQueues {
     queues: Mutex<HashMap<String, Arc<Mutex<RefQueue>>>>,
+    /// Lands per batch, for queues made from now on; 0 is [`MAX_BATCH`].
+    pub(crate) max_batch: std::sync::atomic::AtomicUsize,
     /// How many queues hold each number of batches above zero, so the
     /// largest is known without visiting every ref's queue.
     depths: Mutex<BTreeMap<usize, usize>>,
@@ -127,7 +145,13 @@ pub(crate) struct LandQueues {
 impl LandQueues {
     fn queue(&self, target_ref: &str) -> Arc<Mutex<RefQueue>> {
         let mut queues = self.queues.lock().unwrap_or_else(|e| e.into_inner());
-        Arc::clone(queues.entry(target_ref.to_string()).or_default())
+        let max_batch = self.max_batch.load(std::sync::atomic::Ordering::Relaxed);
+        Arc::clone(queues.entry(target_ref.to_string()).or_insert_with(|| {
+            Arc::new(Mutex::new(RefQueue {
+                max_batch,
+                ..RefQueue::default()
+            }))
+        }))
     }
 
     #[cfg(test)]
@@ -209,6 +233,8 @@ struct RefQueue {
     /// 0066). The leader takes it for a batch and puts it back after; a
     /// leader that panics loses it, and the next starts cold.
     writes: WriteMap,
+    /// Lands per batch; 0 is [`MAX_BATCH`].
+    max_batch: usize,
 }
 
 impl RefQueue {
@@ -225,8 +251,30 @@ impl RefQueue {
     /// batch while it has room, and waits as long as the lands already in
     /// it.
     fn batches_with(&self, more: usize) -> usize {
-        (self.pending.len() + self.reserved + more).div_ceil(MAX_BATCH)
+        (self.pending.len() + self.reserved + more).div_ceil(self.batch_cap())
             + usize::from(self.replaying)
+    }
+
+    /// Lands the leader takes into one batch.
+    fn batch_cap(&self) -> usize {
+        match self.max_batch {
+            0 => MAX_BATCH,
+            n => n,
+        }
+    }
+
+    /// The batches a land may wait behind under `bound` (ADR 0060 section
+    /// 2; ADR 0068 for seconds): a count as given, or as many batch times
+    /// of this ref as fit in the seconds, at least [`MIN_QUEUE_BATCHES`].
+    /// Before a batch finished, a batch counts as 1 s, as for `Retry-After`.
+    fn bound_batches(&self, bound: LandQueueBound) -> usize {
+        match bound {
+            LandQueueBound::Batches(n) => n,
+            LandQueueBound::Seconds(limit) => {
+                let per_batch = self.batch_secs.unwrap_or(1.0).max(1e-3);
+                ((limit.as_secs_f64() / per_batch).floor() as usize).max(MIN_QUEUE_BATCHES)
+            }
+        }
     }
 
     /// `Retry-After` for `batches` batch times, rounded up and clamped.
@@ -511,7 +559,8 @@ async fn lead(repo: Repo, target_ref: String, queue: Arc<Mutex<RefQueue>>) {
                 Some(Job::RebaseOnto(r)) => Next::RebaseOnto(Box::new(r)),
                 Some(Job::Land(first)) => {
                     let mut batch = vec![first];
-                    while batch.len() < MAX_BATCH {
+                    let cap = q.batch_cap();
+                    while batch.len() < cap {
                         match q.pending.pop_front() {
                             Some(Job::Land(l)) => batch.push(l),
                             Some(other) => {
@@ -775,9 +824,9 @@ impl Repo {
             // its own included: a land that joins a batch still filling
             // waits no longer than the lands already in it.
             let ahead = q.batches();
-            match self.land_queue_batches {
-                Some(bound) if q.batches_with(1) > bound => {
-                    Some((ahead, bound, q.refused_retry_after_secs(bound)))
+            match self.land_queue_bound.map(|b| (b, q.bound_batches(b))) {
+                Some((how, bound)) if q.batches_with(1) > bound => {
+                    Some((ahead, how, bound, q.refused_retry_after_secs(bound)))
                 }
                 _ => {
                     q.reserved += 1;
@@ -786,7 +835,7 @@ impl Repo {
                 }
             }
         };
-        let Some((ahead, bound, secs)) = refused else {
+        let Some((ahead, how, bound, secs)) = refused else {
             return Ok(Ok(Admitted {
                 queues: &self.land_queues,
                 queue: Arc::clone(queue),
@@ -823,10 +872,18 @@ impl Repo {
         Err(Error::Refused {
             refused: REFUSED_ADMISSION,
             retry_after_ms: secs * 1000,
-            message: format!(
-                "land not admitted: the land queue of {target_ref:?} holds {ahead} batches \
-                 (--land-queue-batches {bound}); nothing was done, send it again in {secs}s"
-            ),
+            message: match how {
+                LandQueueBound::Batches(_) => format!(
+                    "land not admitted: the land queue of {target_ref:?} holds {ahead} batches \
+                     (--land-queue-batches {bound}); nothing was done, send it again in {secs}s"
+                ),
+                LandQueueBound::Seconds(limit) => format!(
+                    "land not admitted: the land queue of {target_ref:?} holds {ahead} batches, \
+                     more than {} s of them (--land-queue-seconds, {bound} batches now); \
+                     nothing was done, send it again in {secs}s",
+                    limit.as_secs_f64()
+                ),
+            },
         })
     }
 
@@ -2204,6 +2261,41 @@ mod tests {
         assert_eq!(q.refused_retry_after_secs(2), 20);
         // Twice that is past the ceiling.
         assert_eq!(q.refused_retry_after_secs(1), ADMISSION_RETRY_MAX_SECS);
+    }
+
+    /// `--land-queue-seconds` is as many batches as fit at the moving batch
+    /// time, never fewer than two; a count is taken as given.
+    #[test]
+    fn a_time_bound_is_the_batches_that_fit_in_it() {
+        let five = LandQueueBound::Seconds(secs(5.0));
+        let mut q = RefQueue::default();
+        assert_eq!(q.bound_batches(five), 5, "a batch counts as 1 s at first");
+        q.record_batch(secs(0.25));
+        assert_eq!(q.bound_batches(five), 20);
+        let mut slow = RefQueue::default();
+        slow.record_batch(secs(4.0));
+        assert_eq!(slow.bound_batches(five), MIN_QUEUE_BATCHES);
+        slow.record_batch(secs(40.0));
+        assert_eq!(slow.bound_batches(five), MIN_QUEUE_BATCHES);
+        assert_eq!(q.bound_batches(LandQueueBound::Batches(3)), 3);
+    }
+
+    /// The batch size counts in admission: batches of 4 fill sooner.
+    #[test]
+    fn batches_count_in_the_configured_batch_size() {
+        let q = RefQueue {
+            reserved: 8,
+            max_batch: 4,
+            ..RefQueue::default()
+        };
+        assert_eq!(q.batches(), 2);
+        assert_eq!(q.batches_with(1), 3);
+        let big = RefQueue {
+            reserved: 200,
+            max_batch: 256,
+            ..RefQueue::default()
+        };
+        assert_eq!(big.batches(), 1);
     }
 
     #[test]
