@@ -651,11 +651,11 @@ async fn a_miss_refreshes_and_finds_a_new_pack() {
     assert_eq!(loose_count(&*objects).await, 0);
     assert_eq!(&eager.get(&h).await.unwrap().unwrap()[..], b"soon packed");
     assert!(eager.contains(&h).await.unwrap());
-    // Within the interval a miss does not list again: why the interval must
-    // stay below the repack fence.
-    assert!(lazy.get(&h).await.unwrap().is_none());
-    lazy.packs.refresh().await.unwrap();
+    // Within the interval a miss does not list tombstones again, but it
+    // lists `packs/` for packs published since (ADR 0068): another server's
+    // land pack is read at once.
     assert_eq!(&lazy.get(&h).await.unwrap().unwrap()[..], b"soon packed");
+    assert!(lazy.contains(&h).await.unwrap());
 }
 
 /// A reader holding the index of a pack that a later repack replaced and
@@ -850,5 +850,7 @@ async fn request_counts() {
         .is_none());
     let miss = counting.take();
     println!("miss within the refresh interval: {miss:?}");
-    assert_eq!(miss.len(), 1, "{miss:?}");
+    // The loose GET, and one listing of `packs/` for new packs (ADR 0068).
+    assert_eq!(miss.get("GET"), Some(&1), "{miss:?}");
+    assert_eq!(miss.values().sum::<u64>(), 2, "{miss:?}");
 }

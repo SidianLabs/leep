@@ -36,6 +36,12 @@ pub(crate) struct Pack {
 }
 
 impl Pack {
+    /// A pack this process just wrote and published, from its decoded
+    /// index and the open file, so publishing need not read either back.
+    pub fn from_parts(id: String, index: PackIndex, file: File) -> Pack {
+        Pack { id, index, file }
+    }
+
     /// `None` if the pack vanished (a repack replaced it) while loading.
     fn open(dir: &Path, id: &str) -> Result<Option<Pack>> {
         let idx_bytes = match std::fs::read(dir.join(format!("{id}.idx"))) {
@@ -217,23 +223,67 @@ pub(crate) fn published_ids(dir: &Path) -> Result<Vec<String>> {
 
 /// The packs and tombstones as of one scan.
 pub(crate) struct View {
-    /// Each pack with the hashes deleted from it.
+    /// Each pack with the hashes deleted from it: the packs reads search
+    /// first, smallest first (recent writes are read most), then the packs
+    /// a repack of this process merged into a published pack and has not
+    /// deleted yet ([`PackSet::supersede`]), which reads skip.
     pub packs: Vec<(Arc<Pack>, HashSet<Hash>)>,
+    /// How many of `packs` reads search.
+    searchable: usize,
     ids: Vec<String>,
     tombstones: Option<FileSig>,
 }
 
 impl View {
-    /// The first live packed copy of `hash`.
+    /// The first live packed copy of `hash`, in the packs reads search.
     pub fn locate(&self, hash: &Hash) -> Option<(&Arc<Pack>, IdxEntry)> {
-        self.packs.iter().find_map(|(p, dead)| {
+        self.packs[..self.searchable].iter().find_map(|(p, dead)| {
             let e = p.index.find(hash)?;
             (!dead.contains(hash)).then_some((p, e))
         })
     }
 
+    /// The packs reads search: every published pack but the superseded.
+    pub fn searchable(&self) -> &[(Arc<Pack>, HashSet<Hash>)] {
+        &self.packs[..self.searchable]
+    }
+
     pub fn is_empty(&self) -> bool {
         self.packs.is_empty()
+    }
+}
+
+/// Order `packs` for [`View`]: searchable ones smallest first, superseded
+/// ones after them. Returns how many are searchable.
+pub(crate) fn order_packs<P: PackLike>(
+    packs: &mut [(Arc<P>, HashSet<Hash>)],
+    superseded: &HashSet<String>,
+) -> usize {
+    packs.sort_by(|(a, _), (b, _)| {
+        superseded
+            .contains(a.id())
+            .cmp(&superseded.contains(b.id()))
+            .then(a.index().len().cmp(&b.index().len()))
+            .then_with(|| a.id().cmp(b.id()))
+    });
+    packs
+        .iter()
+        .take_while(|(p, _)| !superseded.contains(p.id()))
+        .count()
+}
+
+/// A loaded pack of either kind of store, for [`order_packs`].
+pub(crate) trait PackLike {
+    fn id(&self) -> &str;
+    fn index(&self) -> &PackIndex;
+}
+
+impl PackLike for Pack {
+    fn id(&self) -> &str {
+        &self.id
+    }
+    fn index(&self) -> &PackIndex {
+        &self.index
     }
 }
 
@@ -242,6 +292,11 @@ pub(crate) struct PackSet {
     view: RwLock<Option<Arc<View>>>,
     refreshing: Mutex<()>,
     decoded: DecodedCache,
+    /// Packs a repack of this process merged into a published pack, until
+    /// they are deleted: every live object of each is in that pack (packed
+    /// copies are always copied; GC's deletes are tombstoned there too), so
+    /// reads here skip them. Other processes read them until the deletion.
+    superseded: Mutex<HashSet<String>>,
 }
 
 impl PackSet {
@@ -251,6 +306,7 @@ impl PackSet {
             view: RwLock::new(None),
             refreshing: Mutex::new(()),
             decoded: DecodedCache::new(decoded_capacity),
+            superseded: Mutex::default(),
         }
     }
 
@@ -282,6 +338,12 @@ impl PackSet {
                 return Ok(v.clone());
             }
         }
+        let superseded = {
+            let mut s = self.superseded.lock().unwrap();
+            // Deleted: nothing left to skip.
+            s.retain(|id| ids.binary_search(id).is_ok());
+            s.clone()
+        };
         let mut open: HashMap<&str, &Arc<Pack>> = HashMap::new();
         if let Some(v) = &current {
             for (p, _) in &v.packs {
@@ -302,14 +364,71 @@ impl PackSet {
             let dead = tombstones.remove(id).unwrap_or_default();
             packs.push((pack, dead));
         }
+        let searchable = order_packs(&mut packs, &superseded);
         let view = Arc::new(View {
             packs,
+            searchable,
             // Only what loaded, so a pack seen mid-delete is retried next time.
             ids: if loaded == ids { ids } else { loaded },
             tombstones: tomb_sig,
         });
         *self.view.write().unwrap() = Some(view.clone());
+        metrics::gauge!("leep_blob_packs").set(searchable as f64);
         Ok(view)
+    }
+
+    /// Add a pack this process just published to the view, without
+    /// scanning `packs/`: its writer reads its objects next. Tombstones
+    /// cannot name a pack no view has listed, so it has none yet.
+    pub fn insert_published(&self, pack: Pack) -> Result<()> {
+        let _one = self.refreshing.lock().unwrap();
+        let Some(current) = self.view.read().unwrap().clone() else {
+            // No view yet: the first use scans and finds it.
+            return Ok(());
+        };
+        if current.ids.binary_search(&pack.id).is_ok() {
+            return Ok(());
+        }
+        let mut ids = current.ids.clone();
+        let at = ids.binary_search(&pack.id).unwrap_err();
+        ids.insert(at, pack.id.clone());
+        let mut packs = current.packs.clone();
+        packs.push((Arc::new(pack), HashSet::new()));
+        let superseded = self.superseded.lock().unwrap().clone();
+        let searchable = order_packs(&mut packs, &superseded);
+        *self.view.write().unwrap() = Some(Arc::new(View {
+            packs,
+            searchable,
+            ids,
+            tombstones: current.tombstones,
+        }));
+        metrics::gauge!("leep_blob_packs").set(searchable as f64);
+        Ok(())
+    }
+
+    /// Stop searching `ids`: a repack of this process merged them into a
+    /// published pack, which holds every live object of each. They stay in
+    /// the view, so a delete still tombstones them for other processes,
+    /// until the repack deletes them.
+    pub fn supersede(&self, ids: &[String]) {
+        let _one = self.refreshing.lock().unwrap();
+        let superseded = {
+            let mut s = self.superseded.lock().unwrap();
+            s.extend(ids.iter().cloned());
+            s.clone()
+        };
+        let Some(current) = self.view.read().unwrap().clone() else {
+            return;
+        };
+        let mut packs = current.packs.clone();
+        let searchable = order_packs(&mut packs, &superseded);
+        *self.view.write().unwrap() = Some(Arc::new(View {
+            packs,
+            searchable,
+            ids: current.ids.clone(),
+            tombstones: current.tombstones,
+        }));
+        metrics::gauge!("leep_blob_packs").set(searchable as f64);
     }
 
     /// The view, rescanned first if the tombstones file changed since. One

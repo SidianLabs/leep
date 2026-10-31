@@ -22,7 +22,7 @@ url = "2"
 futures = "0.3"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-rustix = { version = "1", features = ["fs"] }
+rustix = { version = "1", features = ["fs", "process", "thread"] }
 
 [dev-dependencies]
 leep-testkit.workspace = true
