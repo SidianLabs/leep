@@ -130,6 +130,11 @@ pub struct State {
     /// answers with the earlier result instead of landing twice.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_land: Option<PendingLand>,
+    /// Set while files are being moved to this changeset and saved before
+    /// the first write, so a checkout killed part-way is not mistaken for
+    /// local edits: commands refuse until it is run again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub materializing: Option<ChangesetId>,
 }
 
 /// See [`State::pending_land`].
@@ -549,6 +554,7 @@ mod tests {
         let out = serde_json::to_string(&st).unwrap();
         assert!(!out.contains("in_progress"), "unset fields are not written");
         assert!(st.pending_land.is_none() && !out.contains("pending_land"));
+        assert!(st.materializing.is_none() && !out.contains("materializing"));
     }
 
     #[test]

@@ -44,6 +44,7 @@ impl Ctx {
     /// Refuse to start something new while a merge, cherry-pick or revert
     /// waits for its commit. Finishing or aborting it is the way out.
     pub fn refuse_in_progress(&self) -> Result<()> {
+        self.refuse_interrupted()?;
         let state = &self.wc.state;
         if let Some(m) = &state.merge_in_progress {
             return Err(CliError::conflict(format!(
@@ -65,6 +66,20 @@ impl Ctx {
             )));
         }
         Ok(())
+    }
+
+    /// Refuse while a checkout was cut off part-way: the files are a mix of
+    /// two changesets, so status and commit would misreport them.
+    pub fn refuse_interrupted(&self) -> Result<()> {
+        match self.wc.state.materializing {
+            Some(id) => Err(CliError::user(format!(
+                "a checkout of {} was interrupted and the working copy is part-way \
+                 there; run `leep checkout {id}` to finish it (`--force` to discard \
+                 changes made since)",
+                crate::fmt::short(id)
+            ))),
+            None => Ok(()),
+        }
     }
 
     pub fn require_clean(&self) -> Result<()> {

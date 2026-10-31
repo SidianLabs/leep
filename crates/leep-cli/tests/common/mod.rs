@@ -23,8 +23,13 @@ pub struct Data {
     pub refs: BTreeMap<String, ChangesetId>,
     /// Blobs the server answers with garbage for.
     pub corrupt: HashSet<Hash>,
+    /// Blobs the server answers 500 for, like a failing backend.
+    pub fail_blobs: HashSet<Hash>,
     /// Every hash received by `PUT /v1/blobs/{hash}`, in order.
     pub puts: Vec<Hash>,
+    /// Answer 500 to every blob upload once this many have been stored, to
+    /// test that a failed upload stops the commit.
+    pub fail_puts_after: Option<usize>,
     /// `(path, raw query string)` of every log, blame and provenance request.
     pub queries: Vec<(String, String)>,
     /// Every signature request received, with the changeset it was posted to.
@@ -335,6 +340,9 @@ async fn put_blob(
         return Err(err(StatusCode::BAD_REQUEST, "hash mismatch"));
     }
     let mut d = s.lock().unwrap();
+    if d.fail_puts_after.is_some_and(|n| d.puts.len() >= n) {
+        return Err(err(StatusCode::INTERNAL_SERVER_ERROR, "blob store failed"));
+    }
     d.puts.push(h);
     d.blobs.insert(h, body.to_vec());
     Ok(StatusCode::NO_CONTENT)
@@ -350,6 +358,9 @@ async fn get_blob(
     let d = s.lock().unwrap();
     if d.corrupt.contains(&h) {
         return Ok(b"definitely not the right bytes".to_vec());
+    }
+    if d.fail_blobs.contains(&h) {
+        return Err(err(StatusCode::INTERNAL_SERVER_ERROR, "blob store failed"));
     }
     d.blobs
         .get(&h)

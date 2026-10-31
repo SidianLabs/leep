@@ -486,7 +486,7 @@ pub fn rebase_stack(
 /// Goes through [`apply`], so everything is fetched before the first write,
 /// writes are journalled and undone on failure, and the state is saved last.
 /// `merge`, `rebase`, `cherry-pick` and `revert` use it instead of
-/// `materialize`, which saves partial progress.
+/// `materialize`, which keeps the files it already wrote.
 pub fn move_to(ctx: &mut Ctx, id: ChangesetId) -> Result<Stats> {
     let base_files = list_files(ctx, &id)?;
     let want = base_files

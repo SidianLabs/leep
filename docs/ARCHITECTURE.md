@@ -703,7 +703,10 @@ branch head the way `sync` does.
 `.leep/state.json` records the base, the files as materialized (content, kind,
 size, mtime) so `status` rehashes only files whose size or mtime changed, the
 paths where conflict markers were written, and the local stash list. Uncommitted
-work is whatever differs from that record. `sync` with local changes and
+work is whatever differs from that record. A plain checkout (`materialize.rs`)
+fetches every blob before its first write and names its target in
+`materializing` until the base is recorded, so a run cut off part-way blocks
+`status` and `commit` until it is run again. `sync` with local changes and
 `stash` store the work as a *snapshot changeset* (parent = base,
 `extra["leep.snapshot"]` = `sync` or `stash`, no ref). `sync` and `stash apply`
 call `POST /v1/rebase` for the snapshot onto the new base and write the result

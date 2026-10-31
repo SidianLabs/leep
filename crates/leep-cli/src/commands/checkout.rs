@@ -29,10 +29,12 @@ pub struct CheckoutArgs {
 }
 
 pub fn checkout(ctx: &mut Ctx, args: &CheckoutArgs) -> Result<i32> {
-    if !args.force {
+    let id = ctx.remote().resolve(&args.rev)?;
+    // Rerunning an interrupted checkout finishes it; `materialize` checks
+    // that every difference on disk is part of that move.
+    if !args.force && ctx.wc.state.materializing != Some(id) {
         ctx.require_clean()?;
     }
-    let id = ctx.remote().resolve(&args.rev)?;
     if !args.prefixes.is_empty() {
         ctx.wc.config.prefixes = args
             .prefixes
@@ -64,9 +66,14 @@ pub fn checkout(ctx: &mut Ctx, args: &CheckoutArgs) -> Result<i32> {
 #[derive(Args, Debug, Default)]
 pub struct SyncArgs {
     /// Refuse a working copy with uncommitted changes instead of carrying
-    /// them over, and do not move local commits.
+    /// them over, and do not move local commits: a base that is not on the
+    /// target is refused.
     #[arg(long)]
     pub no_rebase: bool,
+    /// With --no-rebase, sync even when local commits are not on the target,
+    /// leaving them behind (their id is printed on stderr).
+    #[arg(long, requires = "no_rebase")]
+    pub discard: bool,
 }
 
 /// Move to the current head of the target ref, carrying uncommitted changes
@@ -86,7 +93,8 @@ pub fn sync(ctx: &mut Ctx, args: &SyncArgs) -> Result<i32> {
     st.refuse_conflicts()?;
     let base = match ctx.wc.state.base {
         Some(b) if !args.no_rebase => b,
-        _ => return plain_sync(ctx, head),
+        Some(b) => return strict_sync(ctx, b, head, args.discard),
+        None => return plain_sync(ctx, head),
     };
     if base == head {
         let kept = st.entries.len();
@@ -135,6 +143,51 @@ pub fn sync(ctx: &mut Ctx, args: &SyncArgs) -> Result<i32> {
         &plan.conflicts,
         &plan.unmerged,
     )
+}
+
+/// `sync --no-rebase`: move to `head` only when that leaves no local commit
+/// behind, unless `discard` says to. A changeset no ref points at is easily
+/// lost and may be collected (ADR 0017).
+fn strict_sync(
+    ctx: &mut Ctx,
+    base: leep_core::ChangesetId,
+    head: leep_core::ChangesetId,
+    discard: bool,
+) -> Result<i32> {
+    let target = ctx.wc.config.target_ref.clone();
+    let fork = ctx.client.merge_base(&base, &head)?.base;
+    if fork == Some(base) {
+        return plain_sync(ctx, head);
+    }
+    if !discard {
+        let what = match fork {
+            Some(f) => {
+                let gen = |id| ctx.client.get_changeset(&id).map(|c| c.generation);
+                let n = gen(base)?.saturating_sub(gen(f)?) as usize;
+                let verb = if n == 1 { "is" } else { "are" };
+                format!(
+                    "{} ({}..) {verb} not on {target}",
+                    plural(n, "local commit"),
+                    short(base)
+                )
+            }
+            None => format!("base {} shares no history with {target}", short(base)),
+        };
+        return Err(CliError::user(format!(
+            "{what}; `leep sync` rebases them onto {target}, \
+             `leep sync --no-rebase --discard` abandons them"
+        ))
+        .with_hint(format!(
+            "`leep branch <name> {base}` keeps them under a name"
+        )));
+    }
+    let code = plain_sync(ctx, head)?;
+    eprintln!(
+        "note: abandoned {}, which is not on {target}; return to it with \
+         `leep checkout {base}` or keep it with `leep branch <name> {base}`",
+        short(base)
+    );
+    Ok(code)
 }
 
 fn plain_sync(ctx: &mut Ctx, head: leep_core::ChangesetId) -> Result<i32> {

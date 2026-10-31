@@ -7,6 +7,59 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 ## [Unreleased]
 
+### `sync --no-rebase` keeps local commits (issue #176)
+- **Fixed.** `leep sync --no-rebase` moved the working copy to the target's
+  head even when the base was an unlanded local commit, leaving it
+  unreachable from any ref without a word. It now refuses (exit 1), naming
+  the local commits and pointing at `leep sync`, unless the base is already
+  in the target's history.
+- **Added.** `leep sync --no-rebase --discard` keeps the old behaviour on
+  request and prints the abandoned id on stderr.
+
+### `status` on a diverged base (issue #175)
+- **Fixed.** `leep status` called a base that forked from an older target
+  commit "N commits ahead" (`ahead: N`) although the target had moved on, so
+  an agent reading it saw no reason to sync. It now prints `base is N
+  commits ahead, M commits behind TARGET`, and `--json` adds `behind: M`
+  next to the unchanged `ahead` and `on_target: false`; `behind` is absent
+  otherwise. A base with no common ancestor prints `base shares no history
+  with TARGET` instead of `base is not on TARGET`. See docs/CLI.md.
+
+### Sockets and FIFOs in the working copy (issue #172)
+- **Fixed.** A unix socket in the working copy made `status`, `commit`,
+  `land` and `switch` fail with an I/O error, and a FIFO made them hang
+  waiting for a writer. The working-copy scan now records only regular
+  files and symlinks and skips other file types silently, as git does.
+
+### Land conflicts keep the file's mode (issue #171)
+- **Fixed.** When `leep land` wrote conflict markers into an executable file
+  it wrote it as a regular file, so resolving and committing silently
+  removed the exec bit. The marker file now takes its kind from your side of
+  the conflict (else the landed side). Where the two sides' modes differ,
+  the conflict line says so (`mode differs: landed 755, yours 644; kept
+  yours`) instead of settling it unseen.
+
+### Failed or interrupted checkouts no longer lose files on the next commit (issue #170)
+- **Fixed.** A checkout, switch, sync or `reset --hard` whose blob download
+  failed part-way left the files already written recorded as clean while the
+  base stayed the old changeset, so the next `leep commit` silently dropped
+  them and the deletions; a killed one made the next commit revert them.
+  The CLI now downloads every blob and checks for untracked files in the
+  way before it writes or deletes anything, so a failed download changes
+  nothing. A run cut off while writing is recorded in `.leep/state.json`
+  (the optional `materializing` field): `status`, `commit` and the commands
+  that need a clean working copy refuse until `leep checkout <id>` is run
+  again to finish it.
+### Commits upload their blobs in parallel
+- **Changed.** `commit`, `amend`, `sync` and `stash` uploaded each new blob
+  in turn, one request at a time, so a commit of many small files waited on
+  round trips: 5000 new files took 25 s against a local server. They now
+  read, check, cache and upload up to 8 blobs at once (`LEEP_UPLOAD_JOBS`
+  sets another number), which took the same commit to 12 s; the rest is the
+  server storing them. Each worker holds one file's bytes at a time; after a
+  failed upload no new one starts, and the error reported is the one the
+  first failing file gave, as before.
+
 ### Blame of files with a lone CR (issue #169)
 - **Fixed.** `GET /v1/blame` answered 500 for a file with a `\r` not followed
   by `\n` (`a\r\rb\n`, old Mac line endings): the diff split lines at a

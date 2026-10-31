@@ -81,6 +81,31 @@ metadata), about a quarter of the bytes of full ones on git/git; with
 is the first land onto `main` of an empty repository. When a land creates a
 ref, `leep` prints `created ref NAME` on stderr.
 
+## The base against the target ref
+
+`leep status` says where the working copy's base stands against the head of
+its target ref. `leep --json status` carries the same in `on_target`,
+`ahead` and `behind`:
+
+| Case | Text | `on_target` | `ahead` | `behind` |
+|---|---|---|---|---|
+| The base is in the target's history | (nothing) | `true` | `null` | absent |
+| The target's head is in the base's history | `base is N commits ahead of main` | `false` | N | absent |
+| Each side has commits the other lacks | `base is N commits ahead, M commits behind main` | `false` | N | M |
+| No common ancestor | `base shares no history with main` | `false` | `null` | absent |
+| Server unreachable, or no such ref | (nothing) | `null` | `null` | absent |
+
+The counts are generation differences from the merge base, exact for a
+linear history. `leep sync` moves the local commits onto the head in the
+last two cases.
+
+`leep sync --no-rebase` moves nothing local: it refuses (exit 1) a working
+copy with uncommitted changes, and a base that is not in the target's history,
+naming the local commits it would leave behind. `--discard`, which needs
+`--no-rebase`, syncs anyway and prints the abandoned base's id on stderr;
+`leep checkout ID` returns to it and `leep branch NAME ID` keeps it, until
+then no ref points at it.
+
 ## Conflict markers
 
 When a land, sync, merge, cherry-pick, revert or stash apply cannot merge a
@@ -180,6 +205,7 @@ print their normal JSON result and exit 5 rather than an error.
   | `LEEP_AGENT_MODEL`, `LEEP_AGENT_SESSION`, `LEEP_AGENT_PROMPT`, `LEEP_AGENT_TESTS` | Provenance recorded by `commit` and `amend` (`agent.*` metadata). |
   | `LEEP_SIGNING_KEY` | Key file that `commit`, `amend`, `merge`, `cherry-pick` and `revert` sign with. |
   | `LEEP_CACHE_DIR` | Local blob cache. |
+  | `LEEP_UPLOAD_JOBS` | Blob uploads in flight at once when `commit`, `amend`, `sync` or `stash` send new files (8). |
   | `NO_COLOR`, `CLICOLOR_FORCE`, `CLICOLOR` | Colour, as above; output to a pipe is plain unless `CLICOLOR_FORCE` is set. |
   | `LEEP_PAGER`, `PAGER` | Pager for `log`, `diff` and `show` on a terminal; never used for a pipe. |
 

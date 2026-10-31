@@ -99,7 +99,10 @@ pub fn run(ctx: &mut Ctx, args: &LandArgs) -> Result<i32> {
                     } else {
                         "markers written".to_string()
                     };
-                    outln!("  C {} ({note})", c.path);
+                    match mode_conflict(c) {
+                        Some(m) => outln!("  C {} ({note}; {m})", c.path),
+                        None => outln!("  C {} ({note})", c.path),
+                    }
                 }
                 outln!(
                     "Your working copy is now on {} with your changes applied.\n\
@@ -314,7 +317,7 @@ fn rebase_locally(
                 write_file(
                     &ctx.wc.abs_for_write(&path)?,
                     text.as_bytes(),
-                    FileKind::Regular,
+                    conflict_kind(c),
                 )?;
                 if !ctx.wc.state.conflicts.contains(&path) {
                     ctx.wc.state.conflicts.push(path);
@@ -355,6 +358,33 @@ fn rebase_locally(
     Ok(unmerged)
 }
 
+/// The kind a marker file is written with: yours (`theirs`, the stack
+/// being landed) where it exists, so a mode is never silently dropped.
+fn conflict_kind(c: &Conflict) -> FileKind {
+    c.theirs
+        .as_ref()
+        .or(c.ours.as_ref())
+        .map_or(FileKind::Regular, |i| i.kind)
+}
+
+/// Both sides have the file with different kinds: a mode conflict the
+/// markers cannot show, reported so it is not settled unseen.
+fn mode_conflict(c: &Conflict) -> Option<String> {
+    let mode = |k: FileKind| match k {
+        FileKind::Regular => "644",
+        FileKind::Executable => "755",
+        FileKind::Symlink => "symlink",
+    };
+    match (&c.ours, &c.theirs) {
+        (Some(o), Some(t)) if o.kind != t.kind => Some(format!(
+            "mode differs: landed {}, yours {}; kept yours",
+            mode(o.kind),
+            mode(t.kind)
+        )),
+        _ => None,
+    }
+}
+
 /// Write one change to disk without recording it in state, so it shows up as
 /// a local modification.
 fn apply(ctx: &Ctx, path: &str, change: &FileChange) -> Result<()> {
@@ -375,7 +405,42 @@ fn apply(ctx: &Ctx, path: &str, change: &FileChange) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use leep_core::api::FileInfo;
     use leep_core::Hash;
+
+    #[test]
+    fn a_marker_file_takes_its_kind_from_the_conflict() {
+        let side = |kind| {
+            Some(FileInfo {
+                path: RepoPath::new("run.sh").unwrap(),
+                content: Hash::of_blob(b"x"),
+                kind,
+                size: 1,
+            })
+        };
+        let c = |ours, theirs| Conflict {
+            path: RepoPath::new("run.sh").unwrap(),
+            base: None,
+            ours,
+            theirs,
+            merged_with_markers: Some(String::new()),
+        };
+        let exec = c(side(FileKind::Executable), side(FileKind::Executable));
+        assert_eq!(conflict_kind(&exec), FileKind::Executable);
+        assert_eq!(mode_conflict(&exec), None);
+        let added = c(None, side(FileKind::Executable));
+        assert_eq!(conflict_kind(&added), FileKind::Executable);
+        assert_eq!(
+            conflict_kind(&c(side(FileKind::Executable), None)),
+            FileKind::Executable
+        );
+        let differ = c(side(FileKind::Executable), side(FileKind::Regular));
+        assert_eq!(conflict_kind(&differ), FileKind::Regular, "yours wins");
+        assert_eq!(
+            mode_conflict(&differ).as_deref(),
+            Some("mode differs: landed 755, yours 644; kept yours")
+        );
+    }
 
     #[test]
     fn a_pending_land_is_resent_only_to_a_server_that_records_ids() {

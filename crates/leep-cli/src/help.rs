@@ -40,7 +40,8 @@ Exit 5 means conflicts: resolve them, `leep commit`, then `leep land` again.";
 pub const SYNC: &str = "\
 Examples:
   leep sync                             # carry uncommitted work and local commits along
-  leep sync --no-rebase                 # refuse instead if anything is uncommitted";
+  leep sync --no-rebase                 # refuse instead if anything is uncommitted or unlanded
+  leep sync --no-rebase --discard       # move anyway, leaving local commits behind";
 
 pub const BRANCH: &str = "\
 Examples:
