@@ -7,6 +7,18 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 ## [Unreleased]
 
+### `.gitignore` is read alongside `.leepignore`
+- **Added.** The working-copy scan (`status`, `commit`, `stash`, ...) now
+  reads the root `.gitignore` as well as the root `.leepignore`, so a
+  repository migrated from git no longer shows its build output and other
+  ignored files as added. `.leepignore` is read second, so its rules win
+  (`!pattern` takes a path back). Tracked files still show when they change,
+  whatever the rules say, and nested ignore files are still not read. See
+  docs/CLI.md, "Ignored files".
+- **Fixed.** An untracked file inside an ignored directory that also holds
+  tracked files (`out/` ignored, `out/keep.bin` tracked) showed as added;
+  it is now ignored, as in git.
+
 ### `sync --no-rebase` keeps local commits (issue #176)
 - **Fixed.** `leep sync --no-rebase` moved the working copy to the target's
   head even when the base was an unlanded local commit, leaving it

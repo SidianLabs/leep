@@ -1,5 +1,5 @@
 //! Working-copy scanning: walk files under the sparse prefixes, honour
-//! `.leepignore`, and compare against the materialized state.
+//! `.gitignore` and `.leepignore`, and compare against the materialized state.
 
 use std::collections::BTreeMap;
 use std::fs::{self, Metadata};
@@ -79,11 +79,20 @@ impl Status {
     }
 }
 
+/// Ignore files read from the working copy root, in this order. A later
+/// rule overrides an earlier one, so `.leepignore` wins over `.gitignore`:
+/// a repository migrated from git keeps its ignores, and `!pattern` in
+/// `.leepignore` can still take a path back. Nested ignore files are not
+/// read.
+pub const IGNORE_FILES: [&str; 2] = [".gitignore", ".leepignore"];
+
 fn load_ignore(root: &Path) -> Gitignore {
     let mut b = GitignoreBuilder::new(root);
-    let f = root.join(".leepignore");
-    if f.is_file() {
-        let _ = b.add(f);
+    for name in IGNORE_FILES {
+        let f = root.join(name);
+        if f.is_file() {
+            let _ = b.add(f);
+        }
     }
     b.build().unwrap_or_else(|_| Gitignore::empty())
 }
@@ -112,17 +121,20 @@ pub fn walk(
 ) -> Result<BTreeMap<String, Metadata>> {
     let ignore = load_ignore(root);
     let mut out = BTreeMap::new();
-    let mut stack: Vec<String> = Vec::new();
+    // Each directory carries whether it is ignored: one is still walked when
+    // it holds tracked files, and then only those are listed, as in git.
+    let mut stack: Vec<(String, bool)> = Vec::new();
     for p in prefixes {
         if p.is_empty() {
-            stack.push(String::new());
+            stack.push((String::new(), false));
             continue;
         }
         let Ok(md) = fs::symlink_metadata(root.join(p)) else {
             continue;
         };
         if md.is_dir() {
-            stack.push(p.clone());
+            let ignored = ignore.matched_path_or_any_parents(p, true).is_ignore();
+            stack.push((p.clone(), ignored));
         } else if is_recordable(&md)
             && (tracked.contains_key(p)
                 || !ignore.matched_path_or_any_parents(p, false).is_ignore())
@@ -130,7 +142,7 @@ pub fn walk(
             out.insert(p.clone(), md);
         }
     }
-    while let Some(dir) = stack.pop() {
+    while let Some((dir, dir_ignored)) = stack.pop() {
         let abs = if dir.is_empty() {
             root.to_path_buf()
         } else {
@@ -152,12 +164,14 @@ pub fn walk(
             };
             let md = entry.metadata()?;
             if md.is_dir() {
-                if ignore.matched(&rel, true).is_ignore() && !has_tracked_under(tracked, &rel) {
+                let ignored = dir_ignored || ignore.matched(&rel, true).is_ignore();
+                if ignored && !has_tracked_under(tracked, &rel) {
                     continue;
                 }
-                stack.push(rel);
+                stack.push((rel, ignored));
             } else if is_recordable(&md)
-                && (tracked.contains_key(&rel) || !ignore.matched(&rel, false).is_ignore())
+                && (tracked.contains_key(&rel)
+                    || !(dir_ignored || ignore.matched(&rel, false).is_ignore()))
             {
                 out.insert(rel, md);
             }
@@ -398,6 +412,81 @@ mod tests {
         let found = walk(&wc.root, &wc.prefixes(), &BTreeMap::new()).unwrap();
         let keys: Vec<_> = found.keys().map(String::as_str).collect();
         assert_eq!(keys, [".leepignore", "a.txt", "keep.log", "src/b.rs"]);
+    }
+
+    #[test]
+    fn gitignore_is_read_and_leepignore_wins() {
+        let d = tempfile::tempdir().unwrap();
+        let wc = wc(d.path());
+        write(d.path(), ".gitignore", "*.log\nbuild/\n/env\n");
+        write(d.path(), ".leepignore", "!keep.log\n*.tmp\n");
+        write(d.path(), "a.txt", "a");
+        write(d.path(), "x.log", "x");
+        write(d.path(), "keep.log", "k");
+        write(d.path(), "y.tmp", "y");
+        write(d.path(), "build/out", "o");
+        write(d.path(), "env", "secret");
+        write(d.path(), "src/env", "kept: anchored to the root");
+        let found = walk(&wc.root, &wc.prefixes(), &BTreeMap::new()).unwrap();
+        let keys: Vec<_> = found.keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            [".gitignore", ".leepignore", "a.txt", "keep.log", "src/env"]
+        );
+    }
+
+    /// Only the root's ignore files are read.
+    #[test]
+    fn nested_ignore_files_are_not_read() {
+        let d = tempfile::tempdir().unwrap();
+        let wc = wc(d.path());
+        write(d.path(), "sub/.gitignore", "*.txt\n");
+        write(d.path(), "sub/.leepignore", "*.txt\n");
+        write(d.path(), "sub/a.txt", "a");
+        let found = walk(&wc.root, &wc.prefixes(), &BTreeMap::new()).unwrap();
+        assert!(found.contains_key("sub/a.txt"), "{:?}", found.keys());
+    }
+
+    /// A `.git` directory anywhere (a git checkout converted in place, or a
+    /// vendored submodule) is never walked, ignore files or not.
+    #[test]
+    fn git_directories_are_never_walked() {
+        let d = tempfile::tempdir().unwrap();
+        let wc = wc(d.path());
+        write(d.path(), ".git/HEAD", "ref: refs/heads/main");
+        write(d.path(), ".git/objects/ab/cdef", "x");
+        write(d.path(), "vendor/lib/.git/config", "g");
+        write(d.path(), "vendor/lib/src.c", "c");
+        let found = walk(&wc.root, &wc.prefixes(), &BTreeMap::new()).unwrap();
+        let keys: Vec<_> = found.keys().map(String::as_str).collect();
+        assert_eq!(keys, ["vendor/lib/src.c"]);
+    }
+
+    #[test]
+    fn tracked_files_matching_gitignore_still_show() {
+        let d = tempfile::tempdir().unwrap();
+        let mut wc = wc(d.path());
+        write(d.path(), "config.local", "v1");
+        write(d.path(), "out/keep.bin", "b1");
+        track_all(&mut wc);
+        // The rule arrives after the files were tracked, as when a repository
+        // migrated from git carries files its .gitignore also matches.
+        write(d.path(), ".gitignore", "*.local\nout/\n");
+        write(d.path(), "other.local", "untracked");
+        write(d.path(), "out/new.bin", "untracked");
+        let s = status(&wc).unwrap();
+        assert_eq!(change_of(&s, ".gitignore"), Some(Change::Added));
+        assert_eq!(change_of(&s, "config.local"), None);
+        assert_eq!(change_of(&s, "other.local"), None);
+        assert_eq!(change_of(&s, "out/new.bin"), None);
+
+        write(d.path(), "config.local", "v2, longer");
+        write(d.path(), "out/keep.bin", "b2, longer");
+        let s = status(&wc).unwrap();
+        assert_eq!(change_of(&s, "config.local"), Some(Change::Modified));
+        assert_eq!(change_of(&s, "out/keep.bin"), Some(Change::Modified));
+        assert_eq!(change_of(&s, "other.local"), None);
+        assert_eq!(change_of(&s, "out/new.bin"), None);
     }
 
     #[test]

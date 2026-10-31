@@ -55,6 +55,21 @@ A ref wins over a short id that spells the same. An ambiguous short id fails
 with exit 1 and lists the candidates (`--json`: `code: "ambiguous"` and
 `candidates`).
 
+## Ignored files
+
+`status`, `commit` and the other commands that scan the working copy skip
+untracked files matched by the root `.gitignore` and the root `.leepignore`,
+in gitignore syntax. Both are read, `.gitignore` first, so a repository
+migrated from git keeps its ignores; a rule in `.leepignore` overrides one in
+`.gitignore` (`!build/keep.txt` takes a path back). Only the files at the
+working copy root are read: a `.gitignore` or `.leepignore` in a
+subdirectory, `.git/info/exclude` and git's global excludes file are not.
+
+Ignore rules only hide untracked files. A tracked file that a rule matches is
+still scanned, and shows as `M` or `D` when it changes; to stop tracking it,
+delete it and commit. `.leep` and `.git`
+directories, at any depth, are never scanned.
+
 ## Long listings
 
 `leep log -n`, `leep search -n` and `leep reflog -n` may ask for more than the
