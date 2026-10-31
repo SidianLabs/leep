@@ -30,6 +30,17 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   `land` and `switch` fail with an I/O error, and a FIFO made them hang
   waiting for a writer. The working-copy scan now records only regular
   files and symlinks and skips other file types silently, as git does.
+### Failed or interrupted checkouts no longer lose files on the next commit (issue #170)
+- **Fixed.** A checkout, switch, sync or `reset --hard` whose blob download
+  failed part-way left the files already written recorded as clean while the
+  base stayed the old changeset, so the next `leep commit` silently dropped
+  them and the deletions; a killed one made the next commit revert them.
+  The CLI now downloads every blob and checks for untracked files in the
+  way before it writes or deletes anything, so a failed download changes
+  nothing. A run cut off while writing is recorded in `.leep/state.json`
+  (the optional `materializing` field): `status`, `commit` and the commands
+  that need a clean working copy refuse until `leep checkout <id>` is run
+  again to finish it.
 
 ### Blame of files with a lone CR (issue #169)
 - **Fixed.** `GET /v1/blame` answered 500 for a file with a `\r` not followed

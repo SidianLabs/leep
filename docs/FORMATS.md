@@ -958,6 +958,12 @@ The CLI's `.leep/state.json` gains the optional `pending_land` (`changeset`,
 `target_ref`, `land_id`), present only while a land waits for a final
 answer; older CLIs ignore it.
 
+It also gains the optional `materializing` (a changeset id), saved before a
+checkout's first write and removed once its base is recorded. While it is
+present, `status`, `commit` and the commands that need a clean working copy
+refuse until `leep checkout <id>` finishes the move. Absent means none, so a
+state file without it loads as before; an older CLI ignores it.
+
 `RefLogEntry` (`GET /v1/reflog`, `GET /v1/reflog/{name}`) later gained the
 optional `land_id` (the same lowercase hex as `LandRequest.land_id`) and
 `land_changeset` (a changeset id), read from the columns above. Both are

@@ -1498,3 +1498,161 @@ fn reflog_follows_cursors_and_falls_back_to_seq() {
     assert_eq!(all.len(), 5);
     assert_eq!(r(Some(2)), all);
 }
+
+/// Files of changeset `id` on the mock, as path -> (content, kind).
+fn tree_of(
+    mock: &Mock,
+    id: leep_core::ChangesetId,
+) -> std::collections::BTreeMap<String, (Hash, FileKind)> {
+    mock.data.lock().unwrap().files[&id]
+        .iter()
+        .map(|(p, f)| (p.clone(), (f.content, f.kind)))
+        .collect()
+}
+
+fn five_file_move(mock: &Mock) -> (leep_core::ChangesetId, leep_core::ChangesetId) {
+    let r = FileKind::Regular;
+    let from = mock.seed(
+        None,
+        &[
+            ("a.txt", "a1\n", r),
+            ("b.txt", "b1\n", r),
+            ("c.txt", "c1\n", r),
+            ("d.txt", "d1\n", r),
+            ("old.txt", "old\n", r),
+        ],
+        &[],
+    );
+    let to = mock.seed(
+        Some(from),
+        &[
+            ("a.txt", "a2\n", r),
+            ("b.txt", "b2\n", r),
+            ("c.txt", "c2\n", r),
+            ("d.txt", "d2\n", r),
+        ],
+        &["old.txt"],
+    );
+    (from, to)
+}
+
+#[test]
+fn a_checkout_whose_third_blob_fails_moves_nothing() {
+    let mock = Mock::start();
+    let (wc_dir, cache) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (from, to) = five_file_move(&mock);
+    mock.data.lock().unwrap().refs.insert("main".into(), from);
+    let mut ctx = init_wc(&mock, wc_dir.path(), cache.path(), &[]).unwrap();
+    assert_eq!(ctx.wc.state.base, Some(from));
+
+    // Files are written in path order, so c.txt is the third blob fetched.
+    mock.data
+        .lock()
+        .unwrap()
+        .fail_blobs
+        .insert(Hash::of_blob(b"c2\n"));
+    let args = CheckoutArgs {
+        rev: to.to_string(),
+        prefixes: vec![],
+        add_prefixes: vec![],
+        force: false,
+    };
+    assert!(checkout(&mut ctx, &args).is_err());
+
+    // Nothing moved: the disk, the state and the base all still say `from`.
+    let reopened = WorkCopy::open(wc_dir.path()).unwrap();
+    assert_eq!(reopened.state.base, Some(from));
+    assert!(status(&ctx.wc).unwrap().is_clean());
+    assert_eq!(read(&ctx, "a.txt"), "a1\n");
+    assert_eq!(read(&ctx, "b.txt"), "b1\n");
+    assert_eq!(read(&ctx, "old.txt"), "old\n");
+
+    // A commit now records exactly what is on disk: `from` plus the edit.
+    write(&ctx, "d.txt", "edited\n");
+    commit::run(&mut ctx, &commit_args("edit after failed checkout")).unwrap();
+    let mut want = tree_of(&mock, from);
+    want.insert(
+        "d.txt".into(),
+        (Hash::of_blob(b"edited\n"), FileKind::Regular),
+    );
+    assert_eq!(tree_of(&mock, ctx.wc.state.base.unwrap()), want);
+
+    // Once the server recovers, the checkout goes through, and a commit on
+    // top is the target plus the edit.
+    mock.data.lock().unwrap().fail_blobs.clear();
+    let force = CheckoutArgs {
+        force: true,
+        ..args
+    };
+    checkout(&mut ctx, &force).unwrap();
+    assert_eq!(ctx.wc.state.base, Some(to));
+    assert!(!ctx.wc.abs("old.txt").exists());
+    write(&ctx, "a.txt", "mine\n");
+    commit::run(&mut ctx, &commit_args("edit on target")).unwrap();
+    let mut want = tree_of(&mock, to);
+    want.insert(
+        "a.txt".into(),
+        (Hash::of_blob(b"mine\n"), FileKind::Regular),
+    );
+    assert_eq!(tree_of(&mock, ctx.wc.state.base.unwrap()), want);
+}
+
+#[test]
+fn an_interrupted_checkout_blocks_status_and_commit_until_rerun() {
+    let mock = Mock::start();
+    let (wc_dir, cache) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (from, to) = five_file_move(&mock);
+    mock.data.lock().unwrap().refs.insert("main".into(), from);
+    let mut ctx = init_wc(&mock, wc_dir.path(), cache.path(), &[]).unwrap();
+
+    // What a checkout killed after two writes and the deletion leaves: the
+    // marker saved before the first write, and nothing after it.
+    ctx.wc.state.materializing = Some(to);
+    ctx.wc.save_state().unwrap();
+    write(&ctx, "a.txt", "a2\n");
+    write(&ctx, "b.txt", "b2\n");
+    fs::remove_file(ctx.wc.abs("old.txt")).unwrap();
+    let mut ctx = Ctx {
+        wc: WorkCopy::open(wc_dir.path()).unwrap(),
+        ..ctx
+    };
+    let interrupted = |e: leep_cli::error::CliError| {
+        let m = e.to_string();
+        assert!(
+            m.contains("interrupted") && m.contains(&format!("leep checkout {to}")),
+            "{m}"
+        );
+    };
+
+    interrupted(leep_cli::commands::status::run(&ctx).unwrap_err());
+    write(&ctx, "d.txt", "edited\n");
+    interrupted(commit::run(&mut ctx, &commit_args("would revert upstream")).unwrap_err());
+    interrupted(sync(&mut ctx, &SyncArgs::default()).unwrap_err());
+    let rerun = CheckoutArgs {
+        rev: to.to_string(),
+        prefixes: vec![],
+        add_prefixes: vec![],
+        force: false,
+    };
+    // A local edit made since cannot be told from the move: it needs --force.
+    assert!(checkout(&mut ctx, &rerun).is_err());
+    assert_eq!(ctx.wc.state.materializing, Some(to));
+    write(&ctx, "d.txt", "d1\n");
+    write(&ctx, "notes.txt", "untracked, not in the target\n");
+
+    // Rerunning the same checkout finishes it.
+    checkout(&mut ctx, &rerun).unwrap();
+    assert_eq!(ctx.wc.state.materializing, None);
+    assert_eq!(ctx.wc.state.base, Some(to));
+    let st = status(&ctx.wc).unwrap();
+    assert_eq!(st.entries.len(), 1, "only the untracked file");
+    assert_eq!(st.entries[0].change, Change::Added);
+    leep_cli::commands::status::run(&ctx).unwrap();
+    assert_eq!(read(&ctx, "c.txt"), "c2\n");
+    assert_eq!(read(&ctx, "d.txt"), "d2\n");
+    assert!(!ctx.wc.abs("old.txt").exists());
+    assert_eq!(read(&ctx, "notes.txt"), "untracked, not in the target\n");
+    let saved = WorkCopy::open(wc_dir.path()).unwrap().state;
+    assert_eq!(saved.materializing, None);
+    assert_eq!(saved.base, Some(to));
+}

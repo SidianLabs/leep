@@ -87,6 +87,7 @@ pub fn run(ctx: &mut Ctx, args: &CommitArgs) -> Result<i32> {
         .filter(|p| !p.as_os_str().is_empty())
         .map(AuthorKey::load)
         .transpose()?;
+    ctx.refuse_interrupted()?;
     let st = status(&ctx.wc)?;
     st.refuse_conflicts()?;
     let merge = ctx.wc.state.merge_in_progress.clone();

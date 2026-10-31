@@ -29,10 +29,12 @@ pub struct CheckoutArgs {
 }
 
 pub fn checkout(ctx: &mut Ctx, args: &CheckoutArgs) -> Result<i32> {
-    if !args.force {
+    let id = ctx.remote().resolve(&args.rev)?;
+    // Rerunning an interrupted checkout finishes it; `materialize` checks
+    // that every difference on disk is part of that move.
+    if !args.force && ctx.wc.state.materializing != Some(id) {
         ctx.require_clean()?;
     }
-    let id = ctx.remote().resolve(&args.rev)?;
     if !args.prefixes.is_empty() {
         ctx.wc.config.prefixes = args
             .prefixes

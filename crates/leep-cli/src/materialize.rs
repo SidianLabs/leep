@@ -11,7 +11,7 @@ use leep_core::{ChangesetId, FileKind, Hash};
 use crate::commands::Ctx;
 use crate::error::{CliError, Result};
 use crate::state::FileState;
-use crate::status::{self, scan_file};
+use crate::status::{self, scan_file, Change};
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Stats {
@@ -34,8 +34,12 @@ pub fn list_files(ctx: &Ctx, id: &ChangesetId) -> Result<BTreeMap<String, FileIn
 ///
 /// Only paths whose recorded content differs are touched. Untracked files in
 /// the way are an error unless `force`; with `force`, locally modified tracked
-/// files are overwritten too. State is saved even on failure so partial
-/// progress is not mistaken for local edits.
+/// files are overwritten too. Every blob is fetched and every check made
+/// before the first write, so a failed download changes nothing. From the
+/// first write until the base is set, `state.materializing` names `target`,
+/// so a run cut off part-way is refused by later commands rather than read as
+/// local edits; running it again with the same target finishes it. State is
+/// saved even on failure so the files already moved are recorded.
 pub fn materialize(ctx: &mut Ctx, target: ChangesetId, force: bool) -> Result<Stats> {
     let result = run(ctx, target, force);
     let saved = ctx.wc.save_state();
@@ -46,16 +50,30 @@ pub fn materialize(ctx: &mut Ctx, target: ChangesetId, force: bool) -> Result<St
 
 fn run(ctx: &mut Ctx, target: ChangesetId, force: bool) -> Result<Stats> {
     let listing = list_files(ctx, &target)?;
-    let dirty: HashSet<String> = if force {
-        status::status(&ctx.wc)?
-            .entries
-            .into_iter()
-            .map(|e| e.path)
-            .collect()
+    let resuming = ctx.wc.state.materializing == Some(target);
+    let dirty: HashSet<String> = if force || resuming {
+        let entries = status::status(&ctx.wc)?.entries;
+        if !force {
+            // A run cut off part-way leaves each file as it was or as the
+            // target has it; anything else was edited since.
+            for e in &entries {
+                let want = listing.get(&e.path).map(|f| f.content);
+                if e.change == Change::Added && want.is_none() {
+                    continue; // the user's own new file; not touched
+                }
+                if e.now.as_ref().map(|n| n.content) != want {
+                    return Err(CliError::user(format!(
+                        "{} has local changes that finishing the interrupted checkout \
+                         would overwrite (use --force)",
+                        e.path
+                    )));
+                }
+            }
+        }
+        entries.into_iter().map(|e| e.path).collect()
     } else {
         HashSet::new()
     };
-    let mut stats = Stats::default();
 
     let stale: Vec<String> = ctx
         .wc
@@ -65,6 +83,32 @@ fn run(ctx: &mut Ctx, target: ChangesetId, force: bool) -> Result<Stats> {
         .filter(|p| !listing.contains_key(*p))
         .cloned()
         .collect();
+    let mut todo: Vec<(&String, &FileInfo)> = Vec::new();
+    for (path, info) in &listing {
+        let current = ctx.wc.state.files.get(path);
+        let up_to_date = current.is_some_and(|c| c.content == info.content && c.kind == info.kind);
+        if !up_to_date || dirty.contains(path) {
+            todo.push((path, info));
+        }
+    }
+
+    // Everything that can fail without touching the disk happens first.
+    for path in &stale {
+        ctx.wc.abs_for_write(path)?;
+    }
+    for (path, info) in &todo {
+        let abs = ctx.wc.abs_for_write(path)?;
+        ctx.cache.fetch(&ctx.client, &info.content)?;
+        if !force && !ctx.wc.state.files.contains_key(*path) {
+            check_not_in_the_way(&abs, path, &info.content)?;
+        }
+    }
+    if !stale.is_empty() || !todo.is_empty() {
+        ctx.wc.state.materializing = Some(target);
+        ctx.wc.save_state()?;
+    }
+
+    let mut stats = Stats::default();
     for path in stale {
         let abs = ctx.wc.abs_for_write(&path)?;
         match fs::remove_file(&abs) {
@@ -76,17 +120,9 @@ fn run(ctx: &mut Ctx, target: ChangesetId, force: bool) -> Result<Stats> {
         ctx.wc.state.files.remove(&path);
     }
 
-    for (path, info) in &listing {
-        let current = ctx.wc.state.files.get(path);
-        let up_to_date = current.is_some_and(|c| c.content == info.content && c.kind == info.kind);
-        if up_to_date && !dirty.contains(path) {
-            continue;
-        }
+    for (path, info) in todo {
         let abs = ctx.wc.abs_for_write(path)?;
         let data = ctx.cache.fetch(&ctx.client, &info.content)?;
-        if current.is_none() && !force {
-            check_not_in_the_way(&abs, path, &info.content)?;
-        }
         write_file(&abs, &data, info.kind)?;
         let md = fs::symlink_metadata(&abs)?;
         let fs_state = scan_file(&abs, &md, None)?;
@@ -106,6 +142,7 @@ fn run(ctx: &mut Ctx, target: ChangesetId, force: bool) -> Result<Stats> {
     ctx.wc.state.unresolved.clear();
     ctx.wc.state.merge_in_progress = None;
     ctx.wc.state.pick_in_progress = None;
+    ctx.wc.state.materializing = None;
     ctx.wc.state.base = Some(target);
     Ok(stats)
 }

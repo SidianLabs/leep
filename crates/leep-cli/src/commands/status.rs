@@ -97,6 +97,7 @@ pub fn renames(ctx: &Ctx, st: &Status) -> Vec<RenameEntry> {
 }
 
 pub fn run(ctx: &Ctx) -> Result<i32> {
+    ctx.refuse_interrupted()?;
     let st = status(&ctx.wc)?;
     let rel = ctx.wc.state.base.and_then(|b| relation(ctx, b));
     let stashes = ctx.wc.state.stashes.len();
