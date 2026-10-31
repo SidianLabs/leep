@@ -58,6 +58,8 @@ mod land_batch_tests;
 #[cfg(test)]
 mod land_coord_tests;
 #[cfg(test)]
+mod land_fast_tests;
+#[cfg(test)]
 mod page_tests;
 #[cfg(test)]
 mod path_page_tests;

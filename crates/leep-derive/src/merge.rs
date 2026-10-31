@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use leep_core::api::{Conflict, FileInfo, MergeRequest, MergeResponse, RebaseResponse};
+use leep_core::api::{Conflict, DiffEntry, FileInfo, MergeRequest, MergeResponse, RebaseResponse};
 use leep_core::changeset::EXTRA_REBASED_FROM;
 use leep_core::{
     Changeset, ChangesetId, Error, FileChange, FileKind, Hash, RepoPath, Result, TreeEntry,
@@ -176,7 +176,34 @@ impl Repo {
     }
 
     /// Three-way merge of trees; `changes` apply on top of `ours`.
+    ///
+    /// Only `theirs` is diffed against `base`. `ours` is read at the paths
+    /// that diff names and nowhere else, so a merge costs the size of
+    /// `theirs`' change, not of everything `ours` did since `base` (a land
+    /// onto a busy ref). The file `ours` has at a path is what a full diff
+    /// from `base` would give there: the diff's new side where it lists
+    /// the path, and otherwise `base`'s file, which `ours` still has.
     pub(crate) async fn merge_trees(
+        &self,
+        base: Hash,
+        ours: Hash,
+        theirs: Hash,
+    ) -> Result<TreeMerge> {
+        let theirs_diff = self.diff_trees(base, theirs, "").await?;
+        let paths: Vec<&RepoPath> = theirs_diff.iter().map(|e| &e.path).collect();
+        let ours_at: HashMap<RepoPath, Option<FileInfo>> = if ours == base {
+            HashMap::new()
+        } else {
+            self.files_at(ours, &paths).await?
+        };
+        self.resolve_merge(ours, theirs_diff, ours_at).await
+    }
+
+    /// [`Repo::merge_trees`] the way it was before it read `ours` only at
+    /// `theirs`' paths: from a diff of the whole of `ours` against `base`.
+    /// The oracle the restricted read is checked against.
+    #[cfg(test)]
+    pub(crate) async fn merge_trees_full(
         &self,
         base: Hash,
         ours: Hash,
@@ -188,12 +215,28 @@ impl Repo {
             .into_iter()
             .map(|e| (e.path, e.new))
             .collect();
+        let theirs_diff = self.diff_trees(base, theirs, "").await?;
+        let ours_at = theirs_diff
+            .iter()
+            .filter_map(|e| Some((e.path.clone(), ours_diff.get(&e.path)?.clone())))
+            .collect();
+        self.resolve_merge(ours, theirs_diff, ours_at).await
+    }
+
+    /// Resolve each entry of `theirs_diff` against `ours`' file at its path
+    /// (`ours_at`; a path missing there is unchanged from `base`).
+    async fn resolve_merge(
+        &self,
+        ours: Hash,
+        theirs_diff: Vec<DiffEntry>,
+        mut ours_at: HashMap<RepoPath, Option<FileInfo>>,
+    ) -> Result<TreeMerge> {
         let mut changes = BTreeMap::new();
         let mut conflicts = Vec::new();
         let mut taken = Vec::new();
-        for e in self.diff_trees(base, theirs, "").await? {
-            let our_info = match ours_diff.get(&e.path) {
-                Some(n) => n.clone(),
+        for e in theirs_diff {
+            let our_info = match ours_at.remove(&e.path) {
+                Some(n) => n,
                 None => e.old.clone(),
             };
             match self.resolve3(&e.old, &our_info, &e.new).await? {

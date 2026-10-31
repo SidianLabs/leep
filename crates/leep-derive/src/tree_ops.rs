@@ -221,6 +221,62 @@ impl Repo {
             .and_then(|e| file_info(path.clone(), &e)))
     }
 
+    /// The file at each of `paths` under `tree` (`None` for a directory or
+    /// nothing), reading the directories on the way one level at a time with
+    /// [`Repo::read_trees`], each node once. What a merge needs of one side
+    /// at the paths the other side touched, without walking the rest.
+    pub(crate) async fn files_at(
+        &self,
+        tree: Hash,
+        paths: &[&RepoPath],
+    ) -> Result<HashMap<RepoPath, Option<FileInfo>>> {
+        // The directories each level needs, by path; level 0 is the root.
+        let mut levels: Vec<BTreeSet<&str>> = vec![BTreeSet::from([""])];
+        for p in paths {
+            let s = p.as_str();
+            for (i, _) in s.match_indices('/') {
+                let d = &s[..i];
+                let level = depth(d);
+                if levels.len() <= level {
+                    levels.resize_with(level + 1, BTreeSet::new);
+                }
+                levels[level].insert(d);
+            }
+        }
+        // Directory path -> its node's hash, `None` when absent or a file.
+        let mut dirs: HashMap<&str, Option<Hash>> = HashMap::from([("", Some(tree))]);
+        let mut nodes: HashMap<&str, TreeNode> = HashMap::new();
+        for level in &levels {
+            for &d in level {
+                if dirs.contains_key(d) {
+                    continue;
+                }
+                let (parent, name) = d.rsplit_once('/').unwrap_or(("", d));
+                let h = match nodes.get(parent).and_then(|n| n.entries.get(name)) {
+                    Some(TreeEntry::Dir { tree }) => Some(*tree),
+                    _ => None,
+                };
+                dirs.insert(d, h);
+            }
+            let read: Vec<(&str, Hash)> = level
+                .iter()
+                .filter_map(|&d| dirs.get(d).copied().flatten().map(|h| (d, h)))
+                .collect();
+            let hashes: Vec<Hash> = read.iter().map(|(_, h)| *h).collect();
+            for ((d, _), node) in read.into_iter().zip(self.read_trees(&hashes).await?) {
+                nodes.insert(d, node);
+            }
+        }
+        let mut out = HashMap::with_capacity(paths.len());
+        for &p in paths {
+            let entry = nodes
+                .get(p.parent().unwrap_or(""))
+                .and_then(|n| n.entries.get(p.file_name()));
+            out.insert(p.clone(), entry.and_then(|e| file_info(p.clone(), e)));
+        }
+        Ok(out)
+    }
+
     /// One directory level; `NotFound` if `dir` is not a directory.
     pub async fn list_dir(&self, id: ChangesetId, dir: &str) -> Result<TreeResponse> {
         let dir = dir.trim_matches('/');
