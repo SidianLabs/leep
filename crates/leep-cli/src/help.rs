@@ -61,6 +61,7 @@ Examples:
   leep log -n 5
   leep log main --path src/parser.rs
   leep log --follow src/new_name.rs     # across renames
+  leep log --oneline --graph -n 50      # with the commit graph
   leep log --agent-model M --author alice
   leep --json log -n 1                  # full ids and changesets";
 

@@ -140,6 +140,20 @@ message's first line. It asks the server for summary entries
 metadata), about a quarter of the bytes of full ones on git/git; with
 `--json` it prints them. `leep log` and `leep log --json` are unchanged.
 
+`leep log --graph` draws the commit graph left of the entries, with or
+without `--oneline`, as `git log --graph` does: `*` marks each changeset,
+`|` a line of history, `\` a merge's parents fanning out, `/` lines
+joining, `_` a line crossing others to join one further left, and `*-.`
+(one more `-.` per extra parent) an octopus merge. The server's log comes
+newest first by generation, so each changeset follows all its children
+shown; the lanes carry over every page the CLI fetches for one `-n`, and
+stop where `-n` does. `--after` starts a new drawing at the page it
+continues. With `--path`, `--follow`, `--author`, `--agent`,
+`--agent-model`, `--agent-session` or `--extra`, `--graph` is refused
+(exit 2): the changesets that connect the shown ones are left out, and the
+CLI does not rewrite parents as git does. With `--json` it is ignored and
+the raw response is printed.
+
 ## Landing onto a new ref
 
 `leep land` moves the working copy's target ref, or the ref given with

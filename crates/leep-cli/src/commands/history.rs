@@ -11,6 +11,7 @@ use super::{print_json, Remote};
 use crate::client::LogQuery;
 use crate::error::{CliError, Result};
 use crate::fmt::{rename_line, short, utc_time};
+use crate::graph::{self, Graph};
 use crate::term::{self, Style};
 
 #[derive(Args, Debug)]
@@ -58,6 +59,14 @@ pub struct LogArgs {
     /// `agent.*` metadata), which `--json` prints.
     #[arg(long)]
     pub oneline: bool,
+    /// Draw the commit graph left of the entries. Not with filters, which
+    /// leave out the changesets that connect the shown ones; ignored with
+    /// `--json`.
+    #[arg(
+        long,
+        conflicts_with_all = ["path", "follow", "author", "agent", "agent_model", "agent_session", "extra"]
+    )]
+    pub graph: bool,
 }
 
 impl LogArgs {
@@ -220,8 +229,16 @@ pub fn log(r: &Remote, args: &LogArgs) -> Result<i32> {
             print_json(&resp)?;
             return Ok(0);
         }
+        let mut graph = args.graph.then(Graph::new);
         for info in &resp.entries {
-            out.push_str(&oneline(info));
+            let line = oneline(info);
+            match &mut graph {
+                Some(g) => out.push_str(&graph::render(
+                    &g.next(&info.id, &info.parents),
+                    &[line.trim_end_matches('\n')],
+                )),
+                None => out.push_str(&line),
+            }
         }
         term::page(&out, false)?;
         return Ok(0);
@@ -232,9 +249,22 @@ pub fn log(r: &Remote, args: &LogArgs) -> Result<i32> {
         print_json(&resp)?;
         return Ok(0);
     }
+    let mut graph = args.graph.then(Graph::new);
     for info in &resp.entries {
-        out.push_str(&header(info, true));
-        out.push('\n');
+        let text = header(info, true);
+        match &mut graph {
+            Some(g) => {
+                let lines: Vec<&str> = text.lines().chain([""]).collect();
+                out.push_str(&graph::render(
+                    &g.next(&info.id, &info.changeset.parents),
+                    &lines,
+                ));
+            }
+            None => {
+                out.push_str(&text);
+                out.push('\n');
+            }
+        }
     }
     term::page(&out, false)?;
     Ok(0)
@@ -525,6 +555,7 @@ mod tests {
             extra: vec![],
             after: None,
             oneline: false,
+            graph: false,
         }
     }
 

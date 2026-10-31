@@ -14,6 +14,7 @@ pub mod client;
 pub mod commands;
 pub mod error;
 pub mod fmt;
+pub mod graph;
 pub mod help;
 pub mod identity;
 pub mod markers;

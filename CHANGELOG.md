@@ -24,6 +24,15 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   base and target ref the bisect started at. Each step reads only the part of
   the logs it needs, and refuses more than 100,000 candidates. See
   docs/CLI.md, "Bisect".
+### `leep log --graph`
+- **Added.** `leep log --graph` draws the commit graph left of the entries,
+  with or without `--oneline`, in the style of `git log --graph`: merges
+  (octopus too), branches that end, and lanes that carry across the pages
+  one `-n` fetches. It is refused with the filters (`--path`, `--follow`,
+  `--author`, `--agent*`, `--extra`), whose answers leave out the
+  changesets that connect the shown ones, and ignored with `--json`. No API
+  change: the graph is drawn from each entry's parents. See docs/CLI.md,
+  "Long listings".
 
 ### Blame follows renames and merged branches
 - **Fixed.** `blame` credited every line of a moved file to the changeset

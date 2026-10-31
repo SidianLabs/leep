@@ -482,6 +482,7 @@ fn provenance_queries_reach_the_server_and_decode() {
             extra: vec![],
             after: None,
             oneline: false,
+            graph: false,
         };
         f(&mut a);
         a
@@ -1052,6 +1053,7 @@ fn log_follow_sends_the_flag_and_decodes_path_at() {
         extra: vec![],
         after: None,
         oneline: false,
+        graph: false,
     };
     let resp = r.client.log(&id, &args.query().unwrap()).unwrap();
     let q = queries(&mock, "log").pop().unwrap();
