@@ -19,6 +19,7 @@ use leep_core::{
 use tokio::sync::oneshot;
 
 use crate::changeset_gc::RescueBy;
+use crate::land_fast::{Lookup, WriteMap};
 use crate::land_stage::{Staging, FLUSH_WRITES_IN_FLIGHT};
 use crate::Repo;
 
@@ -114,6 +115,9 @@ pub(crate) struct LandQueues {
     /// The lands each batch took, in order, for tests to replay one by one.
     #[cfg(test)]
     pub(crate) batches: Mutex<Vec<Vec<ChangesetId>>>,
+    /// What the fast path made of each replayed land, in order.
+    #[cfg(test)]
+    pub(crate) lookups: Mutex<Vec<(ChangesetId, Lookup)>>,
 }
 
 impl LandQueues {
@@ -142,6 +146,14 @@ impl LandQueues {
     #[cfg(test)]
     pub(crate) fn pending(&self, target_ref: &str) -> usize {
         lock(&self.queue(target_ref)).pending.len()
+    }
+
+    /// Tips and entries of `target_ref`'s write map.
+    #[cfg(test)]
+    pub(crate) fn write_map_size(&self, target_ref: &str) -> (usize, usize) {
+        let q = self.queue(target_ref);
+        let q = lock(&q);
+        (q.writes.tips(), q.writes.entries())
     }
 
     /// Batches `target_ref`'s queue holds, as admission counts them.
@@ -189,6 +201,10 @@ struct RefQueue {
     batch_secs: Option<f64>,
     /// [`RefQueue::batches`] as last given to [`LandQueues::report`].
     reported: usize,
+    /// What the ref's recent changesets wrote, for the fast path (ADR
+    /// 0066). The leader takes it for a batch and puts it back after; a
+    /// leader that panics loses it, and the next starts cold.
+    writes: WriteMap,
 }
 
 impl RefQueue {
@@ -510,7 +526,11 @@ async fn lead(repo: Repo, target_ref: String, queue: Arc<Mutex<RefQueue>>) {
         };
         let started = Instant::now();
         match next {
-            Next::Lands(batch) => repo.land_batch(&target_ref, batch).await,
+            Next::Lands(batch) => {
+                let mut writes = std::mem::take(&mut lock(&queue).writes);
+                repo.land_batch(&target_ref, batch, &mut writes).await;
+                lock(&queue).writes = writes;
+            }
             Next::RebaseOnto(r) => {
                 let QueuedRebase {
                     repo,
@@ -869,7 +889,7 @@ impl Repo {
     /// Land a batch: replay each land onto the head the previous one left,
     /// then move the ref once. Lands answered before anything in the batch
     /// moved the ref are answered at once, as a lone land would be.
-    async fn land_batch(&self, target_ref: &str, batch: Vec<Queued>) {
+    async fn land_batch(&self, target_ref: &str, batch: Vec<Queued>, writes: &mut WriteMap) {
         let mut lands: Vec<InFlight> = batch
             .into_iter()
             .map(|q| {
@@ -929,6 +949,9 @@ impl Repo {
                 }
             };
             let mut head = start;
+            if self.land_fast_path {
+                writes.sync(start);
+            }
             // The replays write here; it is stored just before the ref moves.
             let staging = Arc::new(Staging::default());
             let ids: Vec<ChangesetId> = lands.iter().map(|l| l.q.cs).collect();
@@ -997,6 +1020,7 @@ impl Repo {
                 }
                 taken.push(l.q.cs);
                 let repo = staging.repo(&l.q.repo);
+                let fast = self.land_fast_path.then_some(&*writes);
                 let step = match recorded_step(&l.q, &recorded, attempt) {
                     Some(step) => step,
                     None if fenced => match self.rescue_land(l.q.cs, start).await {
@@ -1009,6 +1033,7 @@ impl Repo {
                                 attempt,
                                 &mut l.checked,
                                 &mut origins,
+                                fast,
                             )
                             .await
                         }
@@ -1023,6 +1048,7 @@ impl Repo {
                             attempt,
                             &mut l.checked,
                             &mut origins,
+                            fast,
                         )
                         .await
                     }
@@ -1046,6 +1072,9 @@ impl Repo {
                             new: Some(new),
                             ctx: l.q.ctx.clone(),
                         });
+                        if self.land_fast_path {
+                            staged.follow_move(writes, head, new).await;
+                        }
                         head = Some(new);
                         waiting.push((l, Ok(Step::Move(new))));
                     }
@@ -1272,6 +1301,7 @@ impl Repo {
                 1,
                 &mut Checked::default(),
                 &mut HashMap::new(),
+                None,
             )
             .await?;
         match step {
@@ -1323,6 +1353,7 @@ impl Repo {
         attempt: u32,
         checked: &mut Checked,
         origins: &mut HashMap<ChangesetId, Option<ChangesetId>>,
+        fast: Option<&WriteMap>,
     ) -> Result<Step> {
         if head.is_none() && !create {
             return Err(Error::NotFound(format!(
@@ -1356,7 +1387,7 @@ impl Repo {
         self.enforce_land_policy(cs, head, target_ref, checked)
             .await?;
         match head {
-            Some(h) if !fast_forward => match self.replay_stack(cs, h, origins).await? {
+            Some(h) if !fast_forward => match self.replay_stack(cs, h, origins, fast).await? {
                 // The stack holds `cs` at least.
                 Ok(pairs) => Ok(Step::Move(pairs.last().map_or(cs, |p| p.1))),
                 Err(resp) => Ok(Step::Done(resp)),
@@ -1582,9 +1613,13 @@ impl Repo {
         cs: ChangesetId,
         head: ChangesetId,
         origins: &mut HashMap<ChangesetId, Option<ChangesetId>>,
+        fast: Option<&WriteMap>,
     ) -> Result<Result<Vec<(ChangesetId, ChangesetId)>, LandResponse>> {
         let mut stack = Vec::new();
+        let mut members = Vec::new();
         let mut fork = None;
+        // Whether `fork` is in `head`'s history (not a member whose copy is).
+        let mut trunk = false;
         let mut cur = cs;
         loop {
             let c = self.get_changeset(cur).await?;
@@ -1594,12 +1629,15 @@ impl Repo {
                 )));
             }
             stack.push(cur);
-            match c.parents.first() {
-                Some(&p) if self.is_ancestor(p, head).await? => {
+            let parent = c.parents.first().copied();
+            members.push(c);
+            match parent {
+                Some(p) if self.is_ancestor(p, head).await? => {
                     fork = Some(p);
+                    trunk = true;
                     break;
                 }
-                Some(&p) => {
+                Some(p) => {
                     if self.landed_copy(p, head, origins).await?.is_some() {
                         fork = Some(p);
                         break;
@@ -1610,6 +1648,97 @@ impl Repo {
             }
         }
 
+        let started = Instant::now();
+        if let Some(map) = fast {
+            let base = fork.filter(|_| trunk);
+            if let Some(pairs) = self.replay_fast(&stack, &members, base, head, map).await? {
+                metrics::counter!("leep_land_replays_total", "path" => "fast").increment(1);
+                metrics::histogram!("leep_land_replay_seconds", "path" => "fast")
+                    .record(started.elapsed().as_secs_f64());
+                return Ok(Ok(pairs));
+            }
+        }
+        let replayed = self.replay_slow(cs, head, &stack, fork).await;
+        metrics::counter!("leep_land_replays_total", "path" => "slow").increment(1);
+        metrics::histogram!("leep_land_replay_seconds", "path" => "slow")
+            .record(started.elapsed().as_secs_f64());
+        replayed
+    }
+
+    /// The fast path (ADR 0066): when no change of the stack meets anything
+    /// the ref wrote since `base` (the tip of the ref's first-parent line
+    /// the stack starts from), each member is copied onto the head with its
+    /// own changes, less those that change nothing, and no merge. That is
+    /// what [`Repo::replay_slow`] makes of such a stack, to the byte: every
+    /// path the stack changes is as `ours` and `base` both have it, so each
+    /// three-way merge takes `theirs`, and nothing collides. `None` when the
+    /// map cannot show the stack disjoint; the slow path decides then.
+    async fn replay_fast(
+        &self,
+        stack: &[ChangesetId],
+        members: &[leep_core::Changeset],
+        base: Option<ChangesetId>,
+        head: ChangesetId,
+        map: &WriteMap,
+    ) -> Result<Option<Vec<(ChangesetId, ChangesetId)>>> {
+        let since = match base {
+            None => Err(Lookup::Ineligible),
+            Some(_) if map.head() != Some(head) => Err(Lookup::Cold),
+            Some(b) => map.base(b),
+        };
+        let since = match since {
+            Ok(s) => s,
+            Err(why) => {
+                self.note_lookup(stack[0], why);
+                return Ok(None);
+            }
+        };
+        let touched = members
+            .iter()
+            .flat_map(|c| c.changes.keys())
+            .any(|p| map.touched_since(since, p.as_str()));
+        if touched {
+            self.note_lookup(stack[0], Lookup::Overlap);
+            return Ok(None);
+        }
+        self.note_lookup(stack[0], Lookup::Hit);
+        let mut onto = head;
+        let mut pairs = Vec::with_capacity(stack.len());
+        for (&id, c) in stack.iter().zip(members).rev() {
+            let parent = c.parents[0];
+            // As `rebase` answers a changeset already on `onto`.
+            if parent == onto {
+                pairs.push((id, id));
+                onto = id;
+                continue;
+            }
+            self.rescue_changesets(&[id, onto], RescueBy::Create)
+                .await?;
+            let changes = self.effective_changes(parent, &c.changes).await?;
+            let copy = self.rebased_copy(id, onto, changes).await?;
+            pairs.push((id, copy));
+            onto = copy;
+        }
+        Ok(Some(pairs))
+    }
+
+    fn note_lookup(&self, cs: ChangesetId, lookup: Lookup) {
+        lookup.record();
+        #[cfg(test)]
+        self.land_queues.lookups.lock().unwrap().push((cs, lookup));
+        #[cfg(not(test))]
+        let _ = cs;
+    }
+
+    /// The slow path: rebase each member of `stack` (newest first) onto the
+    /// head with a three-way merge, or answer the conflicts.
+    async fn replay_slow(
+        &self,
+        cs: ChangesetId,
+        head: ChangesetId,
+        stack: &[ChangesetId],
+        fork: Option<ChangesetId>,
+    ) -> Result<Result<Vec<(ChangesetId, ChangesetId)>, LandResponse>> {
         let mut onto = head;
         let mut pairs = Vec::with_capacity(stack.len());
         for &id in stack.iter().rev() {
@@ -1906,7 +2035,10 @@ impl Repo {
             });
         }
         let staged = staging.repo(self);
-        match staged.replay_stack(head, onto, &mut HashMap::new()).await? {
+        match staged
+            .replay_stack(head, onto, &mut HashMap::new(), None)
+            .await?
+        {
             Ok(rebased) => Ok(Replayed::Move {
                 head: rebased.last().map_or(onto, |p| p.1),
                 rebased,

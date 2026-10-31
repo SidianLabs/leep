@@ -86,6 +86,8 @@ pub struct Repo {
     /// Batches this server's lands with every other server's on the same ref
     /// (ADR 0056); `None` batches only the lands this process receives.
     pub(crate) land_coordinator: Option<Arc<crate::land_coord::LandCoordinator>>,
+    /// Copy disjoint lands onto the head without a merge (ADR 0066).
+    pub(crate) land_fast_path: bool,
     /// Parents and generations of changesets seen by history walks.
     pub(crate) ancestry: Arc<AncestryCache>,
     /// Decoded path-history nodes, keyed by `NodeRef::cache_key` (see
@@ -544,6 +546,7 @@ impl Repo {
             land_queue_batches: None,
             land_policy: None,
             land_coordinator: None,
+            land_fast_path: true,
             ancestry: Arc::default(),
             history_rows: Arc::default(),
             history_raw: Arc::default(),
@@ -629,6 +632,23 @@ impl Repo {
         }
         metrics::gauge!("leep_land_queue_batches").increment(0.0);
         self
+    }
+
+    /// Whether a land none of whose paths the ref touched since its base is
+    /// copied onto the head without a three-way merge (ADR 0066), on by
+    /// default. Off replays every land in full; the answers are the same,
+    /// which is what turning it off is for (comparing, benchmarking).
+    pub fn with_land_fast_path(mut self, on: bool) -> Self {
+        self.land_fast_path = on;
+        for path in ["fast", "slow"] {
+            metrics::counter!("leep_land_replays_total", "path" => path).increment(0);
+        }
+        self
+    }
+
+    /// See [`Repo::with_land_fast_path`].
+    pub fn land_fast_path(&self) -> bool {
+        self.land_fast_path
     }
 
     /// See [`Repo::with_land_queue_batches`].

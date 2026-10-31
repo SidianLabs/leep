@@ -27,6 +27,7 @@ pub mod indexing;
 pub mod integrity;
 mod land;
 pub mod land_coord;
+mod land_fast;
 mod land_stage;
 mod merge;
 pub mod owners;
