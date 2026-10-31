@@ -105,7 +105,28 @@ before, so the client resolves the conflicts on the new head and lands
 again. It is server configuration only: nothing persisted or on the wire
 changes. Disjoint lands land without a merge under either policy.
 
-### 5. Metrics
+### 5. Admission waits out slow batches
+ADR 0060 clamped a refused land's `Retry-After` (the time until a queue
+slot frees, about one batch time) to 1 to 10 s. With 20 s batches at 1,024
+agents clients came back while the batch they waited for still ran, and
+were refused 13,000 to 28,000 times a run. The ceiling is now half of
+`MAX_BATCH_LIFETIME` (30 s), which covers every batch a healthy server
+makes; `leep land` waits it out with its jitter (at most 45 s) inside its
+60 s admission budget. A `leep` that reports a wait over 10 s instead of
+sleeping does so only for reads (`MAX_RETRY_WAIT`), never for a refused
+land.
+
+### 6. Read caching
+`Repo::read_tree` and `read_trees` keep the nodes they read from the store,
+decoded, in a byte-bounded cache by hash (16 MiB, taken from the former
+32 MiB tree cache, so the default cache budget is unchanged); they read
+from the store on every call before, which made a land 50 lands behind the
+head cost 170 to 200 ms on Postgres with a 20,000-file tree. A staged batch
+reads the nodes it did not write in one batched read. The merge's collision
+checks read their entries in one batched walk instead of one walk from the
+root per path component.
+
+### 7. Metrics
 `leep_land_replays_total{path}` and `leep_land_replay_seconds{path}` (fast,
 slow), `leep_land_fast_map_total{result}` (hit, overlap, cold, window,
 ineligible), `leep_land_fast_map_resets_total`,

@@ -734,7 +734,7 @@ before `get_changeset`: a land that would wait behind more than `N`
 batches, its own included (the waiting lands over 64, rounded up, plus one
 while a batch replays), gets `Error::Refused`, which the server answers 503
 `unavailable` with `Retry-After` (batches ahead times the ref's moving
-average batch time, 1 to 10 s) and `Leep-Refused: admission`. An unkeyed
+average batch time, 1 to 30 s, half of a batch's 60 s lifetime, since ADR 0066) and `Leep-Refused: admission`. An unkeyed
 refusal reads nothing; a keyed land first reads its id with one
 `find_lands` and, if recorded, gets that answer instead. An admitted land
 holds a place in the queue while it reads its changeset, so concurrent

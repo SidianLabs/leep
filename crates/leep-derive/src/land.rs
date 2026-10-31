@@ -45,12 +45,16 @@ pub(crate) const MAX_BATCH: usize = 64;
 pub const MAX_BATCH_LIFETIME: Duration = Duration::from_secs(60);
 
 /// Bounds of the `Retry-After` of a land refused at a full queue, in
-/// seconds (ADR 0060, section 2). The bound is sized so the whole queue
-/// waits under half a client's timeout, so a longer wait would only follow
-/// a bound set too high; the ceiling is section 1's, which every `leep`
-/// that retries refusals waits out instead of reporting.
+/// seconds (ADR 0060, section 2). The answer is the time until a slot
+/// frees, about one batch time, so the ceiling must reach the longest batch
+/// time there can be: a ceiling under it (10 s, before ADR 0066) sends
+/// clients back while the batch they wait for still runs, to be refused
+/// again (13,000 to 28,000 refusals at 1,024 agents with 20 s batches). A
+/// batch runs at most [`MAX_BATCH_LIFETIME`]; half of it covers every batch
+/// a healthy server makes, and `leep land` waits that out with its jitter
+/// (up to 45 s) inside its 60 s budget for admission waits.
 const ADMISSION_RETRY_MIN_SECS: u64 = 1;
-const ADMISSION_RETRY_MAX_SECS: u64 = 10;
+const ADMISSION_RETRY_MAX_SECS: u64 = MAX_BATCH_LIFETIME.as_secs() / 2;
 /// Weight of the newest batch in a queue's moving average of batch times.
 const BATCH_TIME_WEIGHT: f64 = 0.2;
 /// The ref log operation of a `rebase-onto` move: the git mirror's.
@@ -2149,7 +2153,8 @@ mod tests {
         q.record_batch(secs(2.5));
         assert_eq!(q.retry_after_secs(1), 3);
         assert_eq!(q.retry_after_secs(2), 5);
-        assert_eq!(q.retry_after_secs(5), ADMISSION_RETRY_MAX_SECS);
+        assert_eq!(q.retry_after_secs(5), 13);
+        assert_eq!(q.retry_after_secs(20), ADMISSION_RETRY_MAX_SECS);
         let mut fast = RefQueue::default();
         fast.record_batch(secs(0.01));
         assert_eq!(fast.retry_after_secs(3), ADMISSION_RETRY_MIN_SECS);
@@ -2181,6 +2186,18 @@ mod tests {
         // Never more than the clamp.
         let mut q = queue(3 * MAX_BATCH, true);
         q.record_batch(secs(9.0));
+        assert_eq!(q.refused_retry_after_secs(1), ADMISSION_RETRY_MAX_SECS);
+    }
+
+    /// Slow batches are waited out, not raced: a 20 s batch gets 20 s, and
+    /// the ceiling follows the longest a batch may run.
+    #[test]
+    fn retry_after_reaches_the_batch_time_of_slow_batches() {
+        assert_eq!(ADMISSION_RETRY_MAX_SECS, MAX_BATCH_LIFETIME.as_secs() / 2);
+        let mut q = queue(MAX_BATCH, true);
+        q.record_batch(secs(20.0));
+        assert_eq!(q.refused_retry_after_secs(2), 20);
+        // Twice that is past the ceiling.
         assert_eq!(q.refused_retry_after_secs(1), ADMISSION_RETRY_MAX_SECS);
     }
 

@@ -467,7 +467,7 @@ How a land is replayed onto a moved head (ADR 0066):
   `Leep-Refused: admission` at once, before its changeset is read.
   `Retry-After` is when the next slot frees: the replaying batch's
   remaining time, taken as the ref's recent batch time (more than one
-  batch only if the bound was lowered), rounded up, between 1 and 10 s. Nothing is queued or recorded, so the land may be sent again,
+  batch only if the bound was lowered), rounded up, between 1 and 30 s (half of the 60 s a batch may run, ADR 0066; it was 10 s, which sent clients back while 20 s batches still ran). Nothing is queued or recorded, so the land may be sent again,
   with or without a land id. A keyed land whose id the ref already recorded
   is answered from the record instead (one indexed read), so a client
   whose first send landed is not refused while the queue stays full.

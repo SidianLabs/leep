@@ -59,6 +59,12 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 - **Fixed.** A land that replaces a directory with a file, onto a ref that
   added files to that directory since the land's base, failed with 400
   (`d is a directory`). It is now answered as a conflict on that path.
+- **Changed.** A land refused at a full queue is told to come back after
+  up to 30 s (half of the 60 s a batch may run) instead of at most 10 s, so
+  clients no longer return while a slow batch still runs.
+- **Changed.** Tree nodes read from the store are cached decoded (16 MiB of
+  the existing 32 MiB tree cache budget), so lands, diffs and merges stop
+  re-reading the head's upper directories.
 - **Added.** `--land-conflicts merge|strict` (`LEEP_LAND_CONFLICTS`) and
   `--strict-land-ref REF` (`LEEP_STRICT_LAND_REFS`). `strict` answers any
   file both the ref and a land changed since the land's base as a conflict,
