@@ -982,3 +982,99 @@ async fn postgres_statement_timeout_bounds_the_data_pool_only() {
     .await
     .unwrap();
 }
+
+/// Request handlers holding every connection of the shared pool cannot queue
+/// a land leader's reads and ref moves (ADR 0067): in the land lane they run
+/// on the reserved pool, while the same call outside it waits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn postgres_land_lane_survives_a_saturated_pool() {
+    use leep_core::lane::{scope, Lane};
+    use leep_core::RefStep;
+    use std::time::Duration;
+    let Some(url) = pg_url() else {
+        return;
+    };
+    let s = PostgresMetaStore::connect_with_schema_and_lanes(&url, &schema("land_lane"), 2, 2)
+        .await
+        .unwrap();
+    assert_eq!(s.land_pool_size(), 2);
+    let base = s.put_changeset(&cs(1)).await.unwrap();
+    let next = s.put_changeset(&cs(2)).await.unwrap();
+    let last = s.put_changeset(&cs(3)).await.unwrap();
+    let ctx = RefUpdateContext::new("land");
+    assert!(s
+        .cas_ref_logged("main", None, Some(base), &ctx)
+        .await
+        .unwrap());
+
+    let held = [
+        s.pool.acquire().await.unwrap(),
+        s.pool.acquire().await.unwrap(),
+    ];
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), s.get_ref("main"))
+            .await
+            .is_err(),
+        "the shared pool is saturated"
+    );
+    let leader = async {
+        assert_eq!(s.get_ref("main").await.unwrap(), Some(base));
+        let reads: [(&str, &[leep_core::Hash]); 1] = [("k", &[base.0])];
+        assert_eq!(s.get_derived_kinds(&reads).await.unwrap(), vec![vec![None]]);
+        assert!(s
+            .cas_ref_logged("main", Some(base), Some(next), &ctx)
+            .await
+            .unwrap());
+        let steps = [RefStep {
+            new: Some(last),
+            ctx: ctx.clone(),
+        }];
+        assert_eq!(
+            s.cas_ref_logged_chain("main", Some(next), &steps)
+                .await
+                .unwrap(),
+            1
+        );
+    };
+    tokio::time::timeout(Duration::from_secs(10), scope(Lane::Land, leader))
+        .await
+        .expect("the land lane does not wait for the shared pool");
+    drop(held);
+    assert_eq!(s.get_ref("main").await.unwrap(), Some(last));
+    assert_eq!(s.ref_log(Some("main"), None, 10).await.unwrap().len(), 3);
+}
+
+/// `--meta-land-pool-size 0` reserves nothing: the land lane shares the
+/// data pool. The default reserves an eighth of it, at least 4.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn postgres_land_lane_sizes() {
+    use leep_core::lane::{scope, Lane};
+    use std::time::Duration;
+    let Some(url) = pg_url() else {
+        return;
+    };
+    assert_eq!(crate::default_land_pool_size(16), 4);
+    assert_eq!(crate::default_land_pool_size(32), 4);
+    assert_eq!(crate::default_land_pool_size(80), 10);
+    let s = PostgresMetaStore::connect_with_schema(&url, &schema("land_sizes"))
+        .await
+        .unwrap();
+    assert_eq!(s.land_pool_size(), 4);
+    drop(s);
+    let s = PostgresMetaStore::connect_with_schema_and_lanes(&url, &schema("land_sizes"), 1, 0)
+        .await
+        .unwrap();
+    assert_eq!(s.land_pool_size(), 0);
+    let held = s.pool.acquire().await.unwrap();
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(300),
+            scope(Lane::Land, s.get_ref("main"))
+        )
+        .await
+        .is_err(),
+        "without a reserve the land lane waits like any request"
+    );
+    drop(held);
+    assert_eq!(scope(Lane::Land, s.get_ref("main")).await.unwrap(), None);
+}

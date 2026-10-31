@@ -4688,6 +4688,189 @@ mod create_rows {
         }
     }
 
+    /// Counts metadata reads in flight, each held a moment so overlapping
+    /// reads overlap: a create must hold at most one pooled connection at a
+    /// time (ADR 0067).
+    struct InFlight {
+        inner: Arc<dyn MetaStore>,
+        now: std::sync::atomic::AtomicUsize,
+        max: std::sync::atomic::AtomicUsize,
+        kinds_calls: std::sync::atomic::AtomicUsize,
+        /// The metadata lane of each ref move (ADR 0067).
+        cas_lanes: std::sync::Mutex<Vec<leep_core::lane::Lane>>,
+    }
+
+    impl InFlight {
+        async fn read<T>(&self, f: impl std::future::Future<Output = T>) -> T {
+            use std::sync::atomic::Ordering::SeqCst;
+            let n = self.now.fetch_add(1, SeqCst) + 1;
+            self.max.fetch_max(n, SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            let out = f.await;
+            self.now.fetch_sub(1, SeqCst);
+            out
+        }
+    }
+
+    #[async_trait]
+    impl MetaStore for InFlight {
+        async fn put_changeset(&self, cs: &Changeset) -> Result<ChangesetId> {
+            self.inner.put_changeset(cs).await
+        }
+        async fn get_changeset(&self, id: &ChangesetId) -> Result<Option<Changeset>> {
+            self.read(self.inner.get_changeset(id)).await
+        }
+        async fn get_changesets(&self, ids: &[ChangesetId]) -> Result<Vec<Option<Changeset>>> {
+            self.read(self.inner.get_changesets(ids)).await
+        }
+        async fn list_changesets(
+            &self,
+            after: Option<ChangesetId>,
+            limit: usize,
+        ) -> Result<Vec<ChangesetId>> {
+            self.inner.list_changesets(after, limit).await
+        }
+        async fn get_ref(&self, name: &str) -> Result<Option<ChangesetId>> {
+            self.inner.get_ref(name).await
+        }
+        async fn cas_ref_logged(
+            &self,
+            name: &str,
+            expected: Option<ChangesetId>,
+            new: Option<ChangesetId>,
+            ctx: &RefUpdateContext,
+        ) -> Result<bool> {
+            self.cas_lanes
+                .lock()
+                .unwrap()
+                .push(leep_core::lane::current());
+            self.inner.cas_ref_logged(name, expected, new, ctx).await
+        }
+        async fn find_lands(
+            &self,
+            name: &str,
+            ids: &[leep_core::LandId],
+        ) -> Result<Vec<Option<leep_core::LandRecord>>> {
+            self.inner.find_lands(name, ids).await
+        }
+        async fn ref_log(
+            &self,
+            name: Option<&str>,
+            before_seq: Option<u64>,
+            limit: usize,
+        ) -> Result<Vec<RefLogEntry>> {
+            self.inner.ref_log(name, before_seq, limit).await
+        }
+        async fn list_refs(&self) -> Result<BTreeMap<String, ChangesetId>> {
+            self.inner.list_refs().await
+        }
+        async fn list_derived(
+            &self,
+            kind: &str,
+            after: Option<Hash>,
+            limit: usize,
+        ) -> Result<Vec<(Hash, Bytes)>> {
+            self.inner.list_derived(kind, after, limit).await
+        }
+        async fn get_derived(&self, kind: &str, key: &Hash) -> Result<Option<Bytes>> {
+            self.read(self.inner.get_derived(kind, key)).await
+        }
+        async fn get_derived_many(&self, kind: &str, keys: &[Hash]) -> Result<Vec<Option<Bytes>>> {
+            self.read(self.inner.get_derived_many(kind, keys)).await
+        }
+        async fn get_derived_kinds(
+            &self,
+            reads: &[(&str, &[Hash])],
+        ) -> Result<Vec<Vec<Option<Bytes>>>> {
+            self.kinds_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.read(self.inner.get_derived_kinds(reads)).await
+        }
+        async fn put_derived(&self, kind: &str, key: &Hash, value: Bytes) -> Result<()> {
+            self.inner.put_derived(kind, key, value).await
+        }
+    }
+
+    /// Creation reads its inputs one round trip after another, never two at
+    /// once, and every derived kind it needs in one call; the rows it writes
+    /// are those of a store answering the same reads.
+    fn in_flight() -> Arc<InFlight> {
+        Arc::new(InFlight {
+            inner: Arc::new(MemoryMetaStore::new()),
+            now: Default::default(),
+            max: Default::default(),
+            kinds_calls: Default::default(),
+            cas_lanes: Default::default(),
+        })
+    }
+
+    #[tokio::test]
+    async fn create_reads_one_at_a_time_with_the_same_rows() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let probe = in_flight();
+        let a = repo();
+        let b = Repo::new(Arc::new(MemoryBlobStore::new()), probe.clone());
+        let mut tips = Vec::new();
+        for r in [&a, &b] {
+            let root = commit(r, &[], &[("a/b", Some("0")), ("c", Some("c"))], "root").await;
+            let mut main = root;
+            let mut side = root;
+            for i in 0..12 {
+                let v = i.to_string();
+                let path = format!("d{}/f{}", i % 3, i % 4);
+                main = commit(r, &[main], &[(&path, Some(&v))], "main").await;
+                if i % 3 == 0 {
+                    side = commit(r, &[side], &[("side", Some(&v))], "side").await;
+                    main = commit(r, &[main, side], &[("m", Some(&v))], "merge").await;
+                }
+            }
+            tips.push(main);
+        }
+        assert_eq!(tips[0], tips[1], "same changesets");
+        assert_eq!(probe.max.load(SeqCst), 1, "never two reads at once");
+        assert!(
+            probe.kinds_calls.load(SeqCst) > 0,
+            "derived kinds read together"
+        );
+        for kind in [
+            RootTree::NAME,
+            Generation::NAME,
+            Skiplist::NAME,
+            crate::derived::LastMerge::NAME,
+        ] {
+            assert_eq!(rows(&a, kind).await, rows(&b, kind).await, "{kind}");
+        }
+    }
+
+    /// A land's batch leader moves the ref in the land lane, so the Postgres
+    /// store serves it from its reserved connections (ADR 0067); a ref move
+    /// outside a batch stays in the shared lane.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn land_leaders_move_refs_in_the_land_lane() {
+        use leep_core::lane::Lane;
+        let probe = in_flight();
+        let r = Repo::new(Arc::new(MemoryBlobStore::new()), probe.clone());
+        let base = commit(&r, &[], &[("f", Some("0"))], "base").await;
+        assert!(r.meta().cas_ref("main", None, Some(base)).await.unwrap());
+        assert_eq!(*probe.cas_lanes.lock().unwrap(), [Lane::Shared]);
+        probe.cas_lanes.lock().unwrap().clear();
+        let mut lands = Vec::new();
+        for i in 0..4 {
+            let c = commit(&r, &[base], &[(&format!("g{i}"), Some("1"))], "c").await;
+            let r = r.clone();
+            lands.push(tokio::spawn(async move { r.land(c, "main").await }));
+        }
+        for l in lands {
+            assert!(matches!(
+                l.await.unwrap().unwrap(),
+                LandResponse::Landed { .. }
+            ));
+        }
+        let lanes = probe.cas_lanes.lock().unwrap().clone();
+        assert!(!lanes.is_empty());
+        assert!(lanes.iter().all(|l| *l == Lane::Land), "{lanes:?}");
+    }
+
     #[tokio::test]
     async fn rows_given_to_create_are_written_only_with_a_valid_changeset() {
         let r = repo();

@@ -10,6 +10,7 @@ license.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 leep-core.workspace = true
+metrics.workspace = true
 sqlx = { workspace = true, features = ["sqlite", "postgres"] }
 tokio.workspace = true
 tracing.workspace = true

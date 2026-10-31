@@ -47,6 +47,14 @@ pub async fn open_meta_store(url: &str) -> Result<Arc<dyn MetaStore>> {
 /// (`leep-server --meta-pool-size`).
 pub const DEFAULT_POSTGRES_POOL_SIZE: u32 = 16;
 
+/// Connections a Postgres store reserves for land leaders (ADR 0067) unless
+/// told otherwise (`leep-server --meta-land-pool-size`): an eighth of the
+/// data pool, and at least 4, so a leader and its parallel prefetch reads
+/// never wait for request handlers.
+pub fn default_land_pool_size(pool_size: u32) -> u32 {
+    (pool_size / 8).max(4)
+}
+
 /// [`open_meta_store`] with a choice of what to do about pending migrations.
 /// Either way, a database newer than this binary is refused.
 pub async fn open_meta_store_with(url: &str, mode: SchemaMode) -> Result<Arc<dyn MetaStore>> {
@@ -72,11 +80,26 @@ pub async fn open_meta_store_with_options(
     pool_size: u32,
     statement_timeout: Option<std::time::Duration>,
 ) -> Result<Arc<dyn MetaStore>> {
+    open_meta_store_with_lanes(url, mode, pool_size, None, statement_timeout).await
+}
+
+/// [`open_meta_store_with_options`], with `land_pool_size` Postgres
+/// connections reserved for land leaders (ADR 0067); `None` reserves
+/// [`default_land_pool_size`] and `Some(0)` none. SQLite and `mem://` ignore
+/// it: SQLite has one writer at a time whatever the pool.
+pub async fn open_meta_store_with_lanes(
+    url: &str,
+    mode: SchemaMode,
+    pool_size: u32,
+    land_pool_size: Option<u32>,
+    statement_timeout: Option<std::time::Duration>,
+) -> Result<Arc<dyn MetaStore>> {
     if url.starts_with("sqlite:") {
         Ok(Arc::new(SqliteMetaStore::connect_with(url, mode).await?))
     } else if url.starts_with("postgres://") || url.starts_with("postgresql://") {
+        let land = land_pool_size.unwrap_or_else(|| default_land_pool_size(pool_size));
         Ok(Arc::new(
-            PostgresMetaStore::connect_with_options(url, mode, pool_size, statement_timeout)
+            PostgresMetaStore::connect_with_lanes(url, mode, pool_size, land, statement_timeout)
                 .await?,
         ))
     } else if url.starts_with("mem://") {

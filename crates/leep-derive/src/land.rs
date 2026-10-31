@@ -735,7 +735,10 @@ impl Repo {
             led,
         });
         if start_leader {
-            let task = tokio::spawn(lead(self.clone(), target_ref.to_string(), queue));
+            // In the land lane (ADR 0067): request handlers holding every shared
+            // metadata connection must not queue the batch they all wait on.
+            let leader = lead(self.clone(), target_ref.to_string(), queue);
+            let task = tokio::spawn(leep_core::lane::scope(leep_core::lane::Lane::Land, leader));
             self.land_queues.track(task.abort_handle());
         }
         let answer = answer.await.map_err(|_| {
@@ -1902,7 +1905,10 @@ impl Repo {
             !std::mem::replace(&mut q.leading, true)
         };
         if start_leader {
-            let task = tokio::spawn(lead(self.clone(), target_ref.to_string(), queue));
+            // In the land lane (ADR 0067): request handlers holding every shared
+            // metadata connection must not queue the batch they all wait on.
+            let leader = lead(self.clone(), target_ref.to_string(), queue);
+            let task = tokio::spawn(leep_core::lane::scope(leep_core::lane::Lane::Land, leader));
             self.land_queues.track(task.abort_handle());
         }
         answer.await.unwrap_or_else(|_| {

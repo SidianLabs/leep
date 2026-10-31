@@ -157,6 +157,7 @@ measured until the response head is ready, not until the body is streamed.
 | `leep_search_total` | counter | `indexed` = `true`, `false` | Searches served; `false` means the query had no required trigram and scanned files directly. |
 | `leep_search_duration_seconds` | histogram | none | Whole search call, including any index rows it derived. |
 | `leep_blob_cache_hits_total` | counter | none | Blob reads served from the in-memory cache. |
+| `leep_meta_pool_connections` | gauge | `pool` = `data`, `land`; `state` = `in_use`, `idle` | Open Postgres metadata connections per pool, as of that pool's last call (ADR 0067). `data` at `in_use` = `--meta-pool-size` with lands slow means request handlers are queueing for connections; `land` is the reserve of `--meta-land-pool-size`. |
 | `leep_blob_cache_misses_total` | counter | none | Blob reads that went to the durable store. |
 | `leep_blob_cache_bytes` | gauge | none | Bytes held in the cache. |
 | `leep_blob_cache_entries` | gauge | none | Blobs held in the cache. |
@@ -1397,7 +1398,8 @@ apply to the server and to its tools (`verify`, `repair`, `upgrade-index`,
 
 | Flag / env | Default | What it bounds |
 |---|---|---|
-| `--meta-pool-size` / `LEEP_META_POOL_SIZE` | 16 | Connections this process opens to a Postgres metadata store. SQLite ignores it. |
+| `--meta-pool-size` / `LEEP_META_POOL_SIZE` | 16 | Connections this process opens to a Postgres metadata store for requests, derivation and tools. SQLite ignores it. |
+| `--meta-land-pool-size` / `LEEP_META_LAND_POOL_SIZE` | an eighth of `--meta-pool-size`, at least 4 | Further Postgres connections reserved for land leaders (ADR 0067), opened on first use. `0` reserves none. SQLite ignores it. |
 | `--derive-cache-bytes` / `LEEP_DERIVE_CACHE_BYTES` | 423624704 (404 MiB) | The in-memory caches of derived indexes: path-history nodes, parts and roots (148 MiB), tree nodes (32 MiB), search's directory filters (64 MiB), and the filtered-log caches (160 MiB). The ancestry and skiplist caches are bounded by entries, about 100 MB together by default, and scale by the same factor. |
 
 `--cache-bytes` (256 MiB) is separate: it caches blobs.
@@ -1413,6 +1415,17 @@ apply to the server and to its tools (`verify`, `repair`, `upgrade-index`,
   (default a quarter of the pool): they hold at most half of it, and lands
   and ref reads keep the rest (see
   [Expensive read limits](#expensive-read-limits)).
+- **Land reserve.** The leader of a ref's land batch, which every land on
+  the ref waits for, draws on a pool of its own, `--meta-land-pool-size`
+  connections beyond `--meta-pool-size` (default an eighth of it, at least
+  4; ADR 0067). Without it, a burst of creates and reads that held the
+  whole pool queued the leader's ref reads, fence reads and ref move
+  behind them: at 1,024 agents with a pool of 32, sqlx logged acquires
+  slower than 2 s and the mean `leep_land_lock_wait_seconds` rose from
+  22 ms to 4-7 s. Count the reserve in the sum against `max_connections`
+  (a server with defaults opens at most 16 + 4 + 2 lease connections).
+  `0` returns to one shared pool. `leep_meta_pool_connections` shows how
+  full each pool is.
 - **Statement bound.** sqlx sends Postgres no cancel request when a query's
   future is dropped, which is what `--request-timeout` does to a request that
   runs too long: the request answers 408 but its statement runs on in the

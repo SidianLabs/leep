@@ -202,6 +202,26 @@ impl<S: BlobStore> BlobStore for CachedBlobStore<S> {
         self.inner.contains(hash).await
     }
 
+    /// A hit is checked against the inner store, as `contains` does; a miss
+    /// is the inner store's answer, cached.
+    async fn get_stored(&self, hash: &Hash) -> Result<Option<Bytes>> {
+        let hit = self.lru.lock().unwrap().get(hash);
+        if let Some(d) = hit {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            metrics::counter!("leep_blob_cache_hits_total").increment(1);
+            return Ok(self.inner.contains(hash).await?.then_some(d));
+        }
+        self.misses.fetch_add(1, Ordering::Relaxed);
+        metrics::counter!("leep_blob_cache_misses_total").increment(1);
+        let found = self.inner.get_stored(hash).await?;
+        if let Some(d) = &found {
+            let mut lru = self.lru.lock().unwrap();
+            lru.insert(*hash, d.clone(), self.capacity);
+            Self::publish(&lru);
+        }
+        Ok(found)
+    }
+
     /// Always asks the inner store, as `contains` does.
     async fn contains_many(&self, hashes: &[Hash]) -> Result<Vec<bool>> {
         self.inner.contains_many(hashes).await
@@ -299,6 +319,8 @@ mod tests {
         let h = cache.put(Bytes::from_static(b"cached")).await.unwrap();
         cache.inner().delete(&h).await.unwrap();
         assert!(!cache.contains(&h).await.unwrap());
+        assert!(cache.get(&h).await.unwrap().is_some(), "still cached");
+        assert_eq!(cache.get_stored(&h).await.unwrap(), None);
     }
 
     #[tokio::test]

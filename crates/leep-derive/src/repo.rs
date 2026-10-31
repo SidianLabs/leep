@@ -832,8 +832,9 @@ impl Repo {
 
     /// Validate `cs`, build its tree, and store it with its root tree,
     /// generation and skiplist rows and `extra` in one write (ADR 0031). What
-    /// it reads first (parents, their rows, blob condemnations) is read in one
-    /// round of batched queries; anything those miss is derived as before.
+    /// it reads first (parents, their rows, blob condemnations) is read in two
+    /// batched round trips, one connection at a time; anything those miss is
+    /// derived as before.
     /// Condemned parents are rescued before they are read (ADR 0059).
     async fn store_changeset(
         &self,
@@ -881,7 +882,11 @@ impl Repo {
             if client_blobs && maybe_condemned {
                 self.check_reusable(content, path.as_str()).await?;
             }
-            match self.blobs.get(content).await? {
+            // `get` may be served from a cache tier; existence must come from
+            // durable storage, which GC can change from another process.
+            // `get_stored` checks that without a second read where the
+            // backend's read already was of the durable copy.
+            match self.blobs.get_stored(content).await? {
                 None => return Err(Error::Invalid(format!("missing blob {content} for {path}"))),
                 Some(b) if b.len() as u64 != *size => {
                     return Err(Error::Invalid(format!(
@@ -890,11 +895,6 @@ impl Repo {
                     )))
                 }
                 Some(_) => {}
-            }
-            // `get` may be served from a cache tier; existence must come from
-            // durable storage, which GC can change from another process.
-            if !self.blobs.contains(content).await? {
-                return Err(Error::Invalid(format!("missing blob {content} for {path}")));
             }
         }
         let base = match (cs.parents.first(), pre.base_tree) {
@@ -997,11 +997,13 @@ impl Repo {
         }
     }
 
-    /// The stored state `store_changeset` starts from, read in one round:
-    /// whether each parent exists, the parents' generations (from the
-    /// ancestry cache where known), the first parent's root tree and skiplist,
-    /// and the condemnation rows of the contents (client changesets only;
-    /// read before the blobs are checked, as `check_reusable` requires).
+    /// The stored state `store_changeset` starts from, read in two round
+    /// trips (the changesets, then every derived kind in one
+    /// [`MetaStore::get_derived_kinds`]): whether each parent exists, the
+    /// parents' generations (from the ancestry cache where known), the first
+    /// parent's root tree and skiplist, and the condemnation rows of the
+    /// contents (client changesets only; read before the blobs are checked,
+    /// as `check_reusable` requires).
     ///
     /// Like the log's read-ahead (ADR 0030), whatever this does not supply (a
     /// failed batch, an absent or undecodable row) the caller reads or derives
@@ -1033,55 +1035,65 @@ impl Repo {
         let grandparent = cached_list.as_ref().and_then(|l| l.first()).map(|e| e.id);
         let merge_keys: Vec<Hash> = first.into_iter().chain(grandparent).map(|p| p.0).collect();
         let content_keys: Vec<Hash> = contents.iter().map(|(_, h, _)| *h).collect();
-        let (stored, condemned, gens, tree, list, merges) = tokio::join!(
-            async {
-                if cs.parents.is_empty() {
-                    return Ok(Vec::new());
-                }
-                meta.get_changesets(&cs.parents).await
-            },
-            async {
-                if !client_blobs || content_keys.is_empty() {
-                    return Ok(vec![None; content_keys.len()]);
-                }
-                meta.get_derived_many(crate::gc::BLOB_CONDEMNED, &content_keys)
-                    .await
-            },
-            async {
-                if uncached.is_empty() {
-                    return Ok(Vec::new());
-                }
-                meta.get_derived_many(Generation::NAME, &uncached).await
-            },
-            async {
-                match first {
-                    Some(p) => meta.get_derived(RootTree::NAME_STR, &p.0).await,
-                    None => Ok(None),
-                }
-            },
-            async {
-                match first {
-                    Some(p) if cached_list.is_none() => {
-                        meta.get_derived(Skiplist::NAME, &p.0).await
-                    }
-                    _ => Ok(None),
-                }
-            },
-            async {
-                if cs.parents.len() != 1 {
-                    return Ok(Vec::new());
-                }
-                meta.get_derived_many(LastMerge::NAME, &merge_keys).await
-            },
-        );
-        let mut merges = merges
+        // Two round trips, one after the other, so a create holds at most one
+        // pooled connection at a time: with one connection per read, a burst
+        // of creates took the whole pool and queued the land leader behind
+        // it (ADR 0067).
+        let stored = if cs.parents.is_empty() {
+            Ok(Vec::new())
+        } else {
+            meta.get_changesets(&cs.parents).await
+        };
+        let none: &[Hash] = &[];
+        let first_key: Vec<Hash> = first.map(|p| p.0).into_iter().collect();
+        let reads: [(&str, &[Hash]); 5] = [
+            (
+                crate::gc::BLOB_CONDEMNED,
+                if client_blobs { &content_keys } else { none },
+            ),
+            (Generation::NAME, &uncached),
+            (RootTree::NAME_STR, &first_key),
+            (
+                Skiplist::NAME,
+                if cached_list.is_none() {
+                    &first_key
+                } else {
+                    none
+                },
+            ),
+            (
+                LastMerge::NAME,
+                if cs.parents.len() == 1 {
+                    &merge_keys
+                } else {
+                    none
+                },
+            ),
+        ];
+        // A failed read leaves every kind to the caller, as a failed batch
+        // did before.
+        let [condemned, gens, tree, list, merges] = match meta
+            .get_derived_kinds(&reads)
+            .await
             .ok()
+            .and_then(|r| <[_; 5]>::try_from(r).ok())
+        {
+            Some([c, g, t, l, m]) => [Some(c), Some(g), Some(t), Some(l), Some(m)],
+            None => [None, None, None, None, None],
+        };
+        let condemned = match client_blobs {
+            true => condemned,
+            false => Some(vec![None; content_keys.len()]),
+        };
+        let tree = tree.and_then(|t| t.into_iter().next().flatten());
+        let list = list.and_then(|l| l.into_iter().next().flatten());
+        let mut merges = merges
             .filter(|m| m.len() == merge_keys.len())
             .unwrap_or_default()
             .into_iter()
             .map(|v| v.and_then(|v| derived::decode_u64(&v).ok()));
         let last_merges = [merges.next().flatten(), merges.next().flatten()];
-        let mut gens = gens.ok().into_iter().flatten();
+        let mut gens = gens.into_iter().flatten();
         let parent_generations = cached
             .into_iter()
             .map(|g| {
@@ -1098,18 +1110,11 @@ impl Repo {
             first_parent,
             last_merges,
             parents_stored: stored.map(|s| s.iter().map(Option::is_some).collect()),
-            condemned: condemned.ok(),
+            condemned,
             parent_generations,
-            base_tree: tree
-                .ok()
-                .flatten()
-                .and_then(|v| derived::decode_hash(&v).ok()),
-            parent_skiplist: cached_list.or_else(|| {
-                list.ok()
-                    .flatten()
-                    .and_then(|v| Skiplist::decode(&v).ok())
-                    .map(Arc::from)
-            }),
+            base_tree: tree.and_then(|v| derived::decode_hash(&v).ok()),
+            parent_skiplist: cached_list
+                .or_else(|| list.and_then(|v| Skiplist::decode(&v).ok()).map(Arc::from)),
         }
     }
 

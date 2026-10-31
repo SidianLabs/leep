@@ -71,6 +71,18 @@ struct Args {
         value_parser = clap::value_parser!(u32).range(1..=10_000),
     )]
     meta_pool_size: u32,
+    /// Postgres connections reserved, beyond --meta-pool-size, for land
+    /// leaders and their ref moves (ADR 0067), so request handlers holding
+    /// every connection of the shared pool cannot queue the lands they wait
+    /// for. Default: an eighth of --meta-pool-size, at least 4. 0 reserves
+    /// none (leaders share the pool). Opened on first use; SQLite ignores it.
+    #[arg(
+        long,
+        global = true,
+        env = "LEEP_META_LAND_POOL_SIZE",
+        value_parser = clap::value_parser!(u32).range(0..=10_000),
+    )]
+    meta_land_pool_size: Option<u32>,
     /// Bytes the in-memory caches of derived indexes (path history, trees,
     /// search's directory filters, filtered log) may hold; the ancestry and
     /// skiplist caches scale with it. Separate from --cache-bytes, which
@@ -574,6 +586,11 @@ static NO_MIGRATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool
 static META_POOL_SIZE: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(leep_meta::DEFAULT_POSTGRES_POOL_SIZE);
 
+/// Set once from `--meta-land-pool-size`; read by [`open_meta`]. `u32::MAX`
+/// until set: the default for the pool size.
+static META_LAND_POOL_SIZE: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(u32::MAX);
+
 /// Set once from `--derive-cache-bytes`; read by [`new_repo`].
 static DERIVE_CACHE_BYTES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(leep_derive::DEFAULT_CACHE_BYTES);
@@ -605,7 +622,9 @@ async fn open_meta_bounded(
         leep_meta::SchemaMode::Migrate
     };
     let pool = META_POOL_SIZE.load(std::sync::atomic::Ordering::Relaxed);
-    leep_meta::open_meta_store_with_options(url, mode, pool, statement_timeout).await
+    let land = Some(META_LAND_POOL_SIZE.load(std::sync::atomic::Ordering::Relaxed))
+        .filter(|&n| n != u32::MAX);
+    leep_meta::open_meta_store_with_lanes(url, mode, pool, land, statement_timeout).await
 }
 
 /// Added to --request-timeout for the default statement bound, so a request
@@ -1353,6 +1372,9 @@ async fn run() -> anyhow::Result<()> {
     }
     NO_MIGRATE.store(args.no_migrate, std::sync::atomic::Ordering::Relaxed);
     META_POOL_SIZE.store(args.meta_pool_size, std::sync::atomic::Ordering::Relaxed);
+    if let Some(n) = args.meta_land_pool_size {
+        META_LAND_POOL_SIZE.store(n, std::sync::atomic::Ordering::Relaxed);
+    }
     DERIVE_CACHE_BYTES.store(
         args.derive_cache_bytes,
         std::sync::atomic::Ordering::Relaxed,
@@ -1974,6 +1996,9 @@ impl BlobStore for ArcBlobs {
     async fn contains(&self, hash: &leep_core::Hash) -> leep_core::Result<bool> {
         self.0.contains(hash).await
     }
+    async fn get_stored(&self, hash: &leep_core::Hash) -> leep_core::Result<Option<bytes::Bytes>> {
+        self.0.get_stored(hash).await
+    }
     async fn contains_many(&self, hashes: &[leep_core::Hash]) -> leep_core::Result<Vec<bool>> {
         self.0.contains_many(hashes).await
     }
@@ -2012,6 +2037,7 @@ mod tests {
             vec!["--blobs", "mem://b"],
             vec!["--no-migrate"],
             vec!["--meta-pool-size", "7"],
+            vec!["--meta-land-pool-size", "3"],
             vec!["--derive-cache-bytes", "1234"],
             vec!["--request-timeout", "90s"],
             vec!["--meta-statement-timeout", "30s"],
@@ -2023,6 +2049,7 @@ mod tests {
         assert_eq!(a.blobs, "mem://b", "{argv:?}");
         assert!(a.no_migrate, "{argv:?}");
         assert_eq!(a.meta_pool_size, 7, "{argv:?}");
+        assert_eq!(a.meta_land_pool_size, Some(3), "{argv:?}");
         assert_eq!(a.derive_cache_bytes, 1234, "{argv:?}");
         assert_eq!(a.request_timeout, Duration::from_secs(90), "{argv:?}");
         assert_eq!(

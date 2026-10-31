@@ -115,6 +115,19 @@ impl BlobStore for ObjectBlobStore {
         }
     }
 
+    /// A loose object read is the durable copy; a packed one is checked as
+    /// `contains` checks.
+    async fn get_stored(&self, hash: &Hash) -> Result<Option<Bytes>> {
+        match self.store.get(&Self::key(hash)).await {
+            Ok(r) => Ok(Some(r.bytes().await.map_err(storage_err)?)),
+            Err(object_store::Error::NotFound { .. }) => match self.packs.get(hash).await? {
+                Some(b) if self.contains(hash).await? => Ok(Some(b)),
+                _ => Ok(None),
+            },
+            Err(e) => Err(storage_err(e)),
+        }
+    }
+
     async fn contains(&self, hash: &Hash) -> Result<bool> {
         match self.store.head(&Self::key(hash)).await {
             Ok(_) => Ok(true),

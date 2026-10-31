@@ -73,7 +73,7 @@ content-addressing and (b) the atomicity of `MetaStore::cas_ref`.
 
 | Crate | Role | May depend on |
 |---|---|---|
-| `leep-core` | Types, hashing, encoding, `BlobStore`/`MetaStore` traits (including listing and blob deletion for GC, a changeset id prefix lookup for short ids, listing and dropping derived rows by kind for repair, batched changeset and derived reads for history walks, and batched derived writes and changeset-with-rows writes for changeset creation), in-memory stores, conformance tests, API types, pure rename detection | no other leep crate; no I/O, no async runtime |
+| `leep-core` | Types, hashing, encoding, `BlobStore`/`MetaStore` traits (including listing and blob deletion for GC, a changeset id prefix lookup for short ids, listing and dropping derived rows by kind for repair, batched changeset and derived reads for history walks, derived reads of several kinds in one call, and batched derived writes and changeset-with-rows writes for changeset creation), in-memory stores, conformance tests, API types, pure rename detection | no other leep crate; no I/O, no async runtime |
 | `leep-store` | `BlobStore` backends: filesystem (loose objects plus delta-compressed packs and the repack writer, ADR 0029, ADR 0039), `object_store` (S3/MinIO; loose objects plus the same packs, ADR 0040), `CachedBlobStore`, `open_blob_store(url)`, and the incremental blob and pack copy backup and restore use (`sync`, `packfiles`, ADR 0026, ADR 0039) | core |
 | `leep-meta` | `MetaStore` backends: SQLite, Postgres, `open_meta_store(url)`, the versioned schema migrator (`migrate`, ADR 0023), metadata snapshots and their import (`snapshot`, ADR 0026), and `analyze_meta_store`, which bulk loaders call to refresh Postgres planner statistics (ADR 0042) | core |
 | `leep-derive` | `Repo`: derived data framework and kinds, plus all operations, blob garbage collection (`gc`), the delta-base walks for `repack` (`pack_order`, full or loose-only) and store verification and repair (`integrity`) | core (traits only, never a concrete backend) |
@@ -670,7 +670,13 @@ A lease lives 2 s (the TTL) from its last renewal, and only then may another
 server take it; a holder trusts it until the store-reported time left, less
 one renew interval (500 ms), counted from when it sent that renewal. Lease
 calls use connections of their own, so a renewal never waits behind data
-traffic. A forwarded land is never forwarded again. The leader of a batch is a
+traffic. So do batch leaders
+([ADR 0067](adr/0067-reserved-land-connections.md)): the leader runs in
+the land lane (a task-local, `leep_core::lane`), and the Postgres
+store answers a task in that lane from a reserved pool
+(`--meta-land-pool-size`), so request handlers holding every shared
+connection cannot queue the batch they all wait for. A forwarded land is
+never forwarded again. The leader of a batch is a
 spawned task, so a cancelled request cannot stop a batch; a land cancelled
 before its batch reached it is dropped, one already replayed lands.
 Replays are cheap when lands are disjoint ([ADR 0066](adr/0066-land-fast-path-and-conflict-policy.md),
