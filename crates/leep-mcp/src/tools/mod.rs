@@ -10,8 +10,7 @@ mod resolve;
 pub use commit::request_land_id;
 pub(crate) use resolve::Conflicts;
 
-use leep_cli::error::{CliError, ErrorKind};
-use leep_core::prefix::looks_like_prefix;
+use leep_cli::error::CliError;
 use leep_core::ChangesetId;
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
@@ -179,19 +178,12 @@ impl Server {
         let fail = |e: CliError| {
             ToolError(format!(
                 "cannot resolve rev `{rev}`: {}. Use a ref name from leep_refs, a changeset id, \
-                 or a unique prefix of one (at least 4 hex digits).",
+                 or a unique prefix of one (at least 4 hex digits), optionally with git-style \
+                 `~N` / `^N` suffixes.",
                 describe(&e)
             ))
         };
-        match self.client.resolve(rev) {
-            Err(e) if e.kind() == ErrorKind::NotFound && looks_like_prefix(rev) => {
-                match self.client.resolve_prefix(rev) {
-                    Err(p) if p.kind() == ErrorKind::NotFound => Err(fail(e)),
-                    other => other.map_err(fail),
-                }
-            }
-            other => other.map_err(fail),
-        }
+        self.client.resolve_rev(rev).map(|(id, _)| id).map_err(fail)
     }
 
     pub(crate) fn blob(&self, hash: &leep_core::Hash) -> Result<Vec<u8>, ToolError> {
@@ -436,11 +428,12 @@ pub fn definitions() -> Vec<Value> {
         tool(
             "leep_resolve",
             "Resolve a revision",
-            "Turn a rev (ref name, tag, full id or unique id prefix) into its full changeset id, \
-             with `via`: `ref`, `id` or `prefix`. An ambiguous prefix lists the candidates.",
+            "Turn a rev (ref name, tag, full id or unique id prefix, optionally with git-style \
+             `~N` / `^N` suffixes such as `main~2` or `main^2`) into its full changeset id, with \
+             `via`: `ref`, `id`, `prefix` or `suffix`. An ambiguous prefix lists the candidates.",
             json!({
                 "type": "object",
-                "properties": { "rev": { "type": "string", "description": "Ref name, tag, changeset id or unique prefix of one (required)." } },
+                "properties": { "rev": { "type": "string", "description": "Ref name, tag, changeset id or unique prefix of one, optionally with `~N` / `^N` suffixes (required)." } },
                 "required": ["rev"],
                 "additionalProperties": false
             }),

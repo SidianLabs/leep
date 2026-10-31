@@ -24,7 +24,6 @@ pub mod stash;
 pub mod status;
 
 use leep_core::outln;
-use leep_core::prefix::looks_like_prefix;
 use leep_core::ChangesetId;
 use serde::Serialize;
 
@@ -119,31 +118,32 @@ pub struct Remote<'a> {
 impl Remote<'_> {
     /// `@` = working copy base; 64-hex = id; otherwise a ref or tag name,
     /// then a short id of 4 or more hex digits (ADR 0035). A ref wins over a
-    /// short id that spells the same.
+    /// short id that spells the same. Any of them may carry git-style `~N` /
+    /// `^N` suffixes, which the server walks (ADR 0064); `@` is replaced by
+    /// its id before the suffix is sent.
     pub fn resolve(&self, rev: &str) -> Result<ChangesetId> {
-        if rev == "@" {
-            return self
+        let (base, suffix) = leep_core::revision::split(rev);
+        if base == "@" {
+            let id = self
                 .base
-                .ok_or_else(|| CliError::user("working copy has no base changeset yet"));
+                .ok_or_else(|| CliError::user("working copy has no base changeset yet"))?;
+            if suffix.is_empty() {
+                return Ok(id);
+            }
+            return self.client.resolve(&format!("{id}{suffix}"));
         }
         if rev.len() == 64 {
             if let Ok(id) = rev.parse::<ChangesetId>() {
                 return Ok(id);
             }
         }
-        let missing = match self.client.resolve(rev) {
-            Err(e) if e.kind() == ErrorKind::NotFound => e.with_hint(
+        match self.client.resolve_rev(rev) {
+            Ok((id, _)) => Ok(id),
+            Err(e) if e.kind() == ErrorKind::NotFound && suffix.is_empty() => Err(e.with_hint(
                 "`leep refs` lists branches and tags, `leep log` shows changeset ids; \
                  a short id needs at least 4 hex digits",
-            ),
-            other => return other,
-        };
-        if !looks_like_prefix(rev) {
-            return Err(missing);
-        }
-        match self.client.resolve_prefix(rev) {
-            Err(e) if e.kind() == ErrorKind::NotFound => Err(missing),
-            other => other,
+            )),
+            Err(e) => Err(e),
         }
     }
 

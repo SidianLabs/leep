@@ -1479,6 +1479,24 @@ fn resolve_merge_base_and_provenance() {
     let r = call(&s, "leep_resolve", json!({ "rev": "nosuch" }));
     assert_eq!(r["isError"], true);
     assert!(text(&r).contains("[code: not_found]"), "{}", text(&r));
+    // Git-style suffixes (ADR 0064), on a ref and on a short id.
+    let r = data(&call(&s, "leep_resolve", json!({ "rev": "main~1" })));
+    assert_eq!(
+        (r["id"].clone(), r["via"].clone()),
+        (json!(root), json!("suffix"))
+    );
+    let r = data(&call(
+        &s,
+        "leep_resolve",
+        json!({ "rev": format!("{}^", &side[..8]) }),
+    ));
+    assert_eq!(r["id"], root);
+    let r = data(&call(&s, "leep_show", json!({ "rev": "main^" })));
+    assert_eq!(r["id"], root);
+    let r = call(&s, "leep_resolve", json!({ "rev": "main~2" }));
+    assert!(text(&r).contains("[code: not_found]"), "{}", text(&r));
+    let r = call(&s, "leep_resolve", json!({ "rev": "main~x" }));
+    assert_eq!(r["isError"], true);
 
     // leep_merge_base.
     let mb = data(&call(

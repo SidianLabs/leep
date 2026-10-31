@@ -297,6 +297,19 @@ fn add_stats(total: &mut SearchStats, page: &SearchStats) {
     total.indexed = page.indexed;
 }
 
+/// How [`Client::resolve_rev`] read a revision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RevVia {
+    /// A full changeset id.
+    Id,
+    /// A ref or tag name.
+    Ref,
+    /// A short id.
+    Prefix,
+    /// A revision with `~N` / `^N` suffixes.
+    Suffix,
+}
+
 /// Percent-encode a URL path, keeping `/` so ref names like `team/x` work.
 fn enc(s: &str) -> String {
     let mut out = String::new();
@@ -714,6 +727,37 @@ impl Client {
                 .get(self.url(&format!("/v1/resolve/{}", enc(rev)))),
         )?;
         Ok(r.id)
+    }
+
+    /// A ref, tag or full id, optionally with `~N` / `^N` suffixes, which
+    /// the server walks (ADR 0064); else a short id of 4 or more hex digits
+    /// (ADR 0035), with or without suffixes. A ref wins over a short id that
+    /// spells the same. Also says how the revision was read.
+    pub fn resolve_rev(&self, rev: &str) -> Result<(ChangesetId, RevVia)> {
+        let (base, suffix) = leep_core::revision::split(rev);
+        let missing = match self.resolve(rev) {
+            Ok(id) if !suffix.is_empty() => return Ok((id, RevVia::Suffix)),
+            Ok(id) if id.to_string() == rev.to_ascii_lowercase() => return Ok((id, RevVia::Id)),
+            Ok(id) => return Ok((id, RevVia::Ref)),
+            Err(e) if e.kind() == ErrorKind::NotFound => e,
+            Err(e) => return Err(e),
+        };
+        if !leep_core::prefix::looks_like_prefix(base) {
+            return Err(missing);
+        }
+        // With a suffix, the miss may be the walk (past a root) rather than
+        // the base: a base the server knows keeps that answer.
+        if !suffix.is_empty() && self.resolve(base).is_ok() {
+            return Err(missing);
+        }
+        let id = match self.resolve_prefix(base) {
+            Err(e) if e.kind() == ErrorKind::NotFound => return Err(missing),
+            other => other?,
+        };
+        if suffix.is_empty() {
+            return Ok((id, RevVia::Prefix));
+        }
+        Ok((self.resolve(&format!("{id}{suffix}"))?, RevVia::Suffix))
     }
 
     /// The one changeset whose id starts with `prefix`. Several matches are

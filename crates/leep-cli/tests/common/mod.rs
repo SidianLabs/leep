@@ -531,12 +531,39 @@ async fn reflog_one(
     reflog_page(&s.lock().unwrap(), Some(&name), q)
 }
 
+/// A ref or full id, then git-style suffixes walked one parent at a time
+/// (ADR 0064), like the real server.
 async fn resolve(State(s): State<Shared>, Path(rev): Path<String>) -> Resp<ResolveResponse> {
+    use leep_core::revision::{self, Step};
     let d = s.lock().unwrap();
-    match d.refs.get(&rev) {
-        Some(id) => Ok(Json(ResolveResponse { id: *id })),
-        None => Err(err(StatusCode::NOT_FOUND, "unknown revision")),
+    let name = |n: &str| {
+        d.refs.get(n).copied().or_else(|| {
+            n.parse::<ChangesetId>()
+                .ok()
+                .filter(|id| n.len() == 64 && d.changesets.contains_key(id))
+        })
+    };
+    let missing = || err(StatusCode::NOT_FOUND, &format!("unknown revision {rev:?}"));
+    if let Some(id) = name(&rev) {
+        return Ok(Json(ResolveResponse { id }));
     }
+    let (base, steps) = match revision::parse(&rev) {
+        Ok(Some(p)) => p,
+        Ok(None) => return Err(missing()),
+        Err(e) => return Err(err(StatusCode::BAD_REQUEST, &e.to_string())),
+    };
+    let mut id = name(base).ok_or_else(missing)?;
+    for step in steps {
+        let (nth, times) = match step {
+            Step::Parent(0) => continue,
+            Step::Parent(n) => (n as usize - 1, 1),
+            Step::Ancestor(n) => (0, n),
+        };
+        for _ in 0..times {
+            id = *d.changesets[&id].parents.get(nth).ok_or_else(missing)?;
+        }
+    }
+    Ok(Json(ResolveResponse { id }))
 }
 
 /// Like the real server: one match, 400 with the candidates, or 404.

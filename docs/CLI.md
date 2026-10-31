@@ -55,6 +55,19 @@ A ref wins over a short id that spells the same. An ambiguous short id fails
 with exit 1 and lists the candidates (`--json`: `code: "ambiguous"` and
 `candidates`).
 
+Any of these may be followed by git-style suffixes
+([ADR 0064](adr/0064-revision-suffixes.md)), applied left to right:
+
+- `REV~N` is the Nth first-parent ancestor (`main~1` is the changeset before
+  `main`); `REV~` is `REV~1`;
+- `REV^N` is the Nth parent, so `REV^2` is a merge's second parent; `REV^`
+  is `REV^1` and `REV^0` is `REV` itself;
+- they chain: `main~2^2~1`, `@~1`, `2a954d8ef7c7^2`.
+
+Walking past the first changeset, or asking for a parent that does not exist,
+fails with exit 4. A malformed suffix (`main~x`, `main^{commit}`) and git's
+reflog syntax (`main@{1}`; use `leep reflog`) fail with exit 1.
+
 ## Ignored files
 
 `status`, `commit` and the other commands that scan the working copy skip

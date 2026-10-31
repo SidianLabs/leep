@@ -68,7 +68,9 @@ pub const SHOW: &str = "\
 Examples:
   leep show main
   leep show 2a954d8ef7c7                # any unique prefix of 4+ hex digits
-  leep show @                           # the working copy base";
+  leep show @                           # the working copy base
+  leep show main~2                      # two first parents back
+  leep show @^2                         # the base's second parent (a merge)";
 
 pub const SEARCH: &str = "\
 Examples:
