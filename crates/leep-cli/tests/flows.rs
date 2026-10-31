@@ -107,6 +107,63 @@ fn commit_uploads_only_missing_blobs() {
 }
 
 #[test]
+fn commit_uploads_many_blobs_in_parallel() {
+    let mock = Mock::start();
+    let (wc_dir, cache) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let mut ctx = init_wc(&mock, wc_dir.path(), cache.path(), &[]).unwrap();
+    for i in 0..200 {
+        write(
+            &ctx,
+            &format!("d{}/f{i}.txt", i % 7),
+            &format!("file {i}\n"),
+        );
+    }
+    commit::run(&mut ctx, &commit_args("many")).unwrap();
+    let d = mock.data.lock().unwrap();
+    let cs = &d.changesets[&ctx.wc.state.base.unwrap()];
+    assert_eq!(cs.changes.len(), 200);
+    assert_eq!(d.puts.len(), 200, "each blob uploaded exactly once");
+    for i in 0..200 {
+        let body = format!("file {i}\n");
+        let h = Hash::of_blob(body.as_bytes());
+        assert_eq!(d.blobs[&h], body.as_bytes());
+        assert!(Cache::new(cache.path()).get(&h).is_some(), "cached");
+    }
+    drop(d);
+    assert!(status(&ctx.wc).unwrap().is_clean());
+}
+
+#[test]
+fn a_failed_upload_midway_fails_the_commit() {
+    let mock = Mock::start();
+    let (wc_dir, cache) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let mut ctx = init_wc(&mock, wc_dir.path(), cache.path(), &[]).unwrap();
+    for i in 0..200 {
+        write(&ctx, &format!("f{i}.txt"), &format!("file {i}\n"));
+    }
+    mock.data.lock().unwrap().fail_puts_after = Some(20);
+    let e = commit::run(&mut ctx, &commit_args("fails")).unwrap_err();
+    assert!(e.to_string().contains("blob store failed"), "{e}");
+    assert!(ctx.wc.state.base.is_none());
+    {
+        let d = mock.data.lock().unwrap();
+        assert!(
+            d.changesets.is_empty(),
+            "no changeset after a failed upload"
+        );
+        assert_eq!(d.puts.len(), 20);
+    }
+    assert!(!status(&ctx.wc).unwrap().is_clean());
+
+    // The blobs that did arrive are not sent again.
+    mock.data.lock().unwrap().fail_puts_after = None;
+    commit::run(&mut ctx, &commit_args("retried")).unwrap();
+    let d = mock.data.lock().unwrap();
+    assert_eq!(d.puts.len(), 200);
+    assert_eq!(d.changesets.len(), 1);
+}
+
+#[test]
 fn checkout_materializes_prefixes_modes_and_prunes() {
     let mock = Mock::start();
     let (wc_dir, cache) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());

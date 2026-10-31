@@ -205,6 +205,7 @@ print their normal JSON result and exit 5 rather than an error.
   | `LEEP_AGENT_MODEL`, `LEEP_AGENT_SESSION`, `LEEP_AGENT_PROMPT`, `LEEP_AGENT_TESTS` | Provenance recorded by `commit` and `amend` (`agent.*` metadata). |
   | `LEEP_SIGNING_KEY` | Key file that `commit`, `amend`, `merge`, `cherry-pick` and `revert` sign with. |
   | `LEEP_CACHE_DIR` | Local blob cache. |
+  | `LEEP_UPLOAD_JOBS` | Blob uploads in flight at once when `commit`, `amend`, `sync` or `stash` send new files (8). |
   | `NO_COLOR`, `CLICOLOR_FORCE`, `CLICOLOR` | Colour, as above; output to a pipe is plain unless `CLICOLOR_FORCE` is set. |
   | `LEEP_PAGER`, `PAGER` | Pager for `log`, `diff` and `show` on a terminal; never used for a pipe. |
 

@@ -50,6 +50,15 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   (the optional `materializing` field): `status`, `commit` and the commands
   that need a clean working copy refuse until `leep checkout <id>` is run
   again to finish it.
+### Commits upload their blobs in parallel
+- **Changed.** `commit`, `amend`, `sync` and `stash` uploaded each new blob
+  in turn, one request at a time, so a commit of many small files waited on
+  round trips: 5000 new files took 25 s against a local server. They now
+  read, check, cache and upload up to 8 blobs at once (`LEEP_UPLOAD_JOBS`
+  sets another number), which took the same commit to 12 s; the rest is the
+  server storing them. Each worker holds one file's bytes at a time; after a
+  failed upload no new one starts, and the error reported is the one the
+  first failing file gave, as before.
 
 ### Blame of files with a lone CR (issue #169)
 - **Fixed.** `GET /v1/blame` answered 500 for a file with a `\r` not followed
