@@ -7,6 +7,15 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 ## [Unreleased]
 
+### `status` on a diverged base (issue #175)
+- **Fixed.** `leep status` called a base that forked from an older target
+  commit "N commits ahead" (`ahead: N`) although the target had moved on, so
+  an agent reading it saw no reason to sync. It now prints `base is N
+  commits ahead, M commits behind TARGET`, and `--json` adds `behind: M`
+  next to the unchanged `ahead` and `on_target: false`; `behind` is absent
+  otherwise. A base with no common ancestor prints `base shares no history
+  with TARGET` instead of `base is not on TARGET`. See docs/CLI.md.
+
 ### Sockets and FIFOs in the working copy (issue #172)
 - **Fixed.** A unix socket in the working copy made `status`, `commit`,
   `land` and `switch` fail with an I/O error, and a FIFO made them hang

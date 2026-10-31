@@ -81,6 +81,24 @@ metadata), about a quarter of the bytes of full ones on git/git; with
 is the first land onto `main` of an empty repository. When a land creates a
 ref, `leep` prints `created ref NAME` on stderr.
 
+## The base against the target ref
+
+`leep status` says where the working copy's base stands against the head of
+its target ref. `leep --json status` carries the same in `on_target`,
+`ahead` and `behind`:
+
+| Case | Text | `on_target` | `ahead` | `behind` |
+|---|---|---|---|---|
+| The base is in the target's history | (nothing) | `true` | `null` | absent |
+| The target's head is in the base's history | `base is N commits ahead of main` | `false` | N | absent |
+| Each side has commits the other lacks | `base is N commits ahead, M commits behind main` | `false` | N | M |
+| No common ancestor | `base shares no history with main` | `false` | `null` | absent |
+| Server unreachable, or no such ref | (nothing) | `null` | `null` | absent |
+
+The counts are generation differences from the merge base, exact for a
+linear history. `leep sync` moves the local commits onto the head in the
+last two cases.
+
 ## Conflict markers
 
 When a land, sync, merge, cherry-pick, revert or stash apply cannot merge a

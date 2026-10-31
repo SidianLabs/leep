@@ -31,6 +31,10 @@ struct Report {
     on_target: Option<bool>,
     /// Commits between the base and where it leaves the target's history.
     ahead: Option<u64>,
+    /// Commits the target gained since the base left its history; only when
+    /// the two have diverged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    behind: Option<u64>,
     /// Deleted and added files that look like one moved file. `changes` still
     /// lists both paths, so readers that ignore this see what they always did.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -49,27 +53,39 @@ struct Entry {
     status: Change,
 }
 
-/// Where the base stands against the target ref.
+/// Where the base stands against the target ref. Counts are generation
+/// differences, exact for a linear history.
 enum Relation {
     OnTarget,
+    /// The target's head is in the base's history.
     Ahead(u64),
-    Diverged,
+    /// Each side has commits the other lacks.
+    Diverged {
+        ahead: u64,
+        behind: u64,
+    },
+    /// No common ancestor at all.
+    Unrelated,
 }
 
 /// Best effort: `status` must keep working offline, so any failure is `None`.
 fn relation(ctx: &Ctx, base: ChangesetId) -> Option<Relation> {
     let head = ctx.client.get_ref(&ctx.wc.config.target_ref).ok()?.target?;
     let fork = ctx.client.merge_base(&base, &head).ok()?.base;
-    match fork {
-        Some(f) if f == base => Some(Relation::OnTarget),
-        // Generation numbers make this exact for a linear stack.
-        Some(f) => {
-            let top = ctx.client.get_changeset(&base).ok()?.generation;
-            let low = ctx.client.get_changeset(&f).ok()?.generation;
-            Some(Relation::Ahead(top.saturating_sub(low)))
-        }
-        None => Some(Relation::Diverged),
+    let Some(f) = fork else {
+        return Some(Relation::Unrelated);
+    };
+    if f == base {
+        return Some(Relation::OnTarget);
     }
+    let gen = |id| ctx.client.get_changeset(&id).ok().map(|c| c.generation);
+    let low = gen(f)?;
+    let ahead = gen(base)?.saturating_sub(low);
+    if f == head {
+        return Some(Relation::Ahead(ahead));
+    }
+    let behind = gen(head)?.saturating_sub(low);
+    Some(Relation::Diverged { ahead, behind })
 }
 
 /// Renames among the working copy's deleted and added files.
@@ -110,7 +126,11 @@ pub fn run(ctx: &Ctx) -> Result<i32> {
             }),
             on_target: rel.as_ref().map(|r| matches!(r, Relation::OnTarget)),
             ahead: match rel {
-                Some(Relation::Ahead(n)) => Some(n),
+                Some(Relation::Ahead(n) | Relation::Diverged { ahead: n, .. }) => Some(n),
+                _ => None,
+            },
+            behind: match rel {
+                Some(Relation::Diverged { behind, .. }) => Some(behind),
                 _ => None,
             },
             renames,
@@ -126,7 +146,12 @@ pub fn run(ctx: &Ctx) -> Result<i32> {
         Some(Relation::Ahead(n)) => {
             outln!("base is {} ahead of {target}", plural(n as usize, "commit"))
         }
-        Some(Relation::Diverged) => outln!("base is not on {target}"),
+        Some(Relation::Diverged { ahead, behind }) => outln!(
+            "base is {} ahead, {} behind {target}",
+            plural(ahead as usize, "commit"),
+            plural(behind as usize, "commit")
+        ),
+        Some(Relation::Unrelated) => outln!("base shares no history with {target}"),
         _ => {}
     }
     if let Some(m) = &ctx.wc.state.merge_in_progress {
