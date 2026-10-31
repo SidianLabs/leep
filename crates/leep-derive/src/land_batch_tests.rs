@@ -1586,3 +1586,116 @@ async fn a_conflict_whose_clean_blobs_cannot_be_stored_answers_the_error() {
     assert_clean_stored(&r, &resp).await;
     assert_eq!(r.meta().get_ref("main").await.unwrap(), head);
 }
+
+/// Blob reads counted by kind, for the batch's warm-up (ADR 0068).
+#[derive(Default)]
+struct CountingBlobs {
+    inner: MemoryBlobStore,
+    gets: AtomicUsize,
+    get_stored: AtomicUsize,
+    contains: AtomicUsize,
+    contains_many: AtomicUsize,
+}
+
+#[async_trait]
+impl leep_core::BlobStore for CountingBlobs {
+    async fn put_with_hash(&self, hash: Hash, data: Bytes) -> Result<()> {
+        self.inner.put_with_hash(hash, data).await
+    }
+    async fn get(&self, hash: &Hash) -> Result<Option<Bytes>> {
+        self.gets.fetch_add(1, Ordering::SeqCst);
+        self.inner.get(hash).await
+    }
+    async fn get_stored(&self, hash: &Hash) -> Result<Option<Bytes>> {
+        self.get_stored.fetch_add(1, Ordering::SeqCst);
+        self.inner.get_stored(hash).await
+    }
+    async fn contains(&self, hash: &Hash) -> Result<bool> {
+        self.contains.fetch_add(1, Ordering::SeqCst);
+        self.inner.contains(hash).await
+    }
+    async fn contains_many(&self, hashes: &[Hash]) -> Result<Vec<bool>> {
+        self.contains_many.fetch_add(1, Ordering::SeqCst);
+        self.inner.contains_many(hashes).await
+    }
+    async fn list_page(
+        &self,
+        after: Option<Hash>,
+        limit: usize,
+    ) -> Result<Vec<leep_core::BlobMeta>> {
+        self.inner.list_page(after, limit).await
+    }
+    async fn delete(&self, hash: &Hash) -> Result<()> {
+        self.inner.delete(hash).await
+    }
+}
+
+/// A batch of fast copies asks the store whether their contents exist once,
+/// in the prefetch, instead of reading every content of every copy (ADR
+/// 0068); a content that is gone is still found missing, and only that
+/// land fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_batch_asks_for_its_copies_contents_once_and_still_finds_one_missing() {
+    let gate = Gate::new();
+    let blobs = Arc::new(CountingBlobs::default());
+    let r = Repo::new(blobs.clone(), gate.clone());
+    let script: Vec<Spec> = (0..8)
+        .map(|i| {
+            spec(
+                &[Parent::Base],
+                &[
+                    (&format!("d{i}/a.txt"), Some(&format!("a {i}\n"))),
+                    (&format!("d{i}/b.txt"), Some(&format!("b {i}\n"))),
+                ],
+                &format!("c{i}"),
+            )
+        })
+        .collect();
+    let (base, ids) = build(&r, &script).await;
+    // One content of the last changeset vanishes before the land.
+    let gone = Hash::of_blob(b"b 7\n");
+    leep_core::BlobStore::delete(&blobs.inner, &gone)
+        .await
+        .unwrap();
+    let lands: Vec<(ChangesetId, Option<&'static str>)> =
+        ids.iter().map(|id| (*id, None)).collect();
+    let (blocker, tasks) = queue_in_order(&r, &gate, base, &lands).await;
+    for c in [
+        &blobs.gets,
+        &blobs.get_stored,
+        &blobs.contains,
+        &blobs.contains_many,
+    ] {
+        c.store(0, Ordering::SeqCst);
+    }
+    release(&gate);
+    blocker.await.unwrap().unwrap();
+    let mut answers = Vec::new();
+    for t in tasks {
+        answers.push(t.await.unwrap());
+    }
+    for a in &answers[..7] {
+        assert!(
+            matches!(a, Ok(LandResponse::Landed { .. })),
+            "{}",
+            outcome(a)
+        );
+    }
+    let last = outcome(&answers[7]);
+    assert!(last.contains("missing blob"), "{last}");
+    assert_eq!(
+        blobs.get_stored.load(Ordering::SeqCst),
+        0,
+        "no content read back"
+    );
+    // The prefetch's batch, and the one content it did not find, asked
+    // again by its copy.
+    let many = blobs.contains_many.load(Ordering::SeqCst);
+    assert!(many <= 2, "{many} contains_many calls");
+    let head = r.meta().get_ref("main").await.unwrap().unwrap();
+    let root = r.read_tree(r.root_tree(head).await.unwrap()).await.unwrap();
+    for i in 0..7 {
+        assert!(root.entries.contains_key(&format!("d{i}")), "d{i} landed");
+    }
+    assert!(!root.entries.contains_key("d7"));
+}

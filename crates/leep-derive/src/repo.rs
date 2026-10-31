@@ -874,12 +874,35 @@ impl Repo {
                 return Err(Error::Invalid(format!("unknown parent {p}")));
             }
         }
-        for (i, (path, content, size)) in contents.iter().enumerate() {
+        if !client_blobs {
+            // A server-built changeset (a merge, a rebased copy) names
+            // contents of stored changesets, whose sizes their creates
+            // checked against the blobs, and merge results the server
+            // wrote with their sizes. Only their existence is checked, in
+            // durable storage and in one batch: a land batch answers it from
+            // what its prefetch found (ADR 0068) instead of reading every
+            // content of every copy.
+            let hashes: Vec<Hash> = contents.iter().map(|(_, h, _)| *h).collect();
+            let present = self.blobs.contains_many(&hashes).await?;
+            if present.len() != hashes.len() {
+                return Err(Error::Storage(format!(
+                    "contains_many answered {} of {} hashes",
+                    present.len(),
+                    hashes.len()
+                )));
+            }
+            if let Some(((path, content, _), _)) = contents.iter().zip(&present).find(|(_, p)| !**p)
+            {
+                return Err(Error::Invalid(format!("missing blob {content} for {path}")));
+            }
+        }
+        let client_contents = if client_blobs { &contents[..] } else { &[] };
+        for (i, (path, content, size)) in client_contents.iter().enumerate() {
             let maybe_condemned = match &pre.condemned {
                 Some(c) => c[i].is_some(),
                 None => true,
             };
-            if client_blobs && maybe_condemned {
+            if maybe_condemned {
                 self.check_reusable(content, path.as_str()).await?;
             }
             // `get` may be served from a cache tier; existence must come from

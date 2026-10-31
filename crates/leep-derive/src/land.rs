@@ -20,7 +20,7 @@ use tokio::sync::oneshot;
 
 use crate::changeset_gc::RescueBy;
 use crate::land_fast::{ConflictPolicy, Lookup, WriteMap};
-use crate::land_stage::{Staging, FLUSH_WRITES_IN_FLIGHT};
+use crate::land_stage::Staging;
 use crate::Repo;
 
 /// Lands within one process are batched per ref, so losses only come from
@@ -1221,8 +1221,7 @@ impl Repo {
                 .collect();
             let blobs = staging.staged_blobs(&hashes);
             if !blobs.is_empty() {
-                self.put_rescuing_many_in_flight(blobs, FLUSH_WRITES_IN_FLIGHT, &[])
-                    .await?;
+                self.put_rescuing_many(blobs, &[]).await?;
             }
         }
         Ok(resp)

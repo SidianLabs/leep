@@ -18,11 +18,6 @@ use crate::gc::BLOB_CONDEMNED;
 use crate::signatures::REBASED_ORIGIN_KIND;
 use crate::Repo;
 
-/// Blobs written at once when a batch is stored. A batch rewrites a few
-/// directories per land, so a full batch of shallow paths is one wave: the
-/// filesystem then commits the writes' syncs together.
-pub(crate) const FLUSH_WRITES_IN_FLIGHT: usize = 256;
-
 /// What the replays of one batch attempt wrote, plus the immutable rows they
 /// read, so a land does not read again what the land before it read.
 #[derive(Default)]
@@ -76,6 +71,12 @@ struct Staged {
     read_changesets: HashMap<ChangesetId, Changeset>,
     /// Stored rows of kinds whose value never changes once written.
     read_rows: HashMap<(String, Hash), Bytes>,
+    /// Blobs found in durable storage by this attempt: the contents of the
+    /// batch's changesets, asked once by [`Staging::prefetch`], and any
+    /// other blob a `contains` found. Each is named by a stored changeset
+    /// (an original the batch lands, or the head's history), which every GC
+    /// mark covers, so it stays stored for the attempt.
+    stored_blobs: HashSet<Hash>,
 }
 
 impl Staged {
@@ -165,7 +166,35 @@ impl Staging {
             meta.get_changesets(ids),
             meta.get_derived_many(RootTree::NAME_STR, &keys)
         );
+        // The contents the copies of these changesets will name, asked of
+        // the store in one batch instead of once per copy (ADR 0068).
+        let mut seen_contents = HashSet::new();
+        let contents: Vec<Hash> = found
+            .iter()
+            .flatten()
+            .flatten()
+            .flat_map(|cs| cs.changes.values())
+            .filter_map(|c| match c {
+                leep_core::FileChange::Modify { content, .. } => Some(*content),
+                leep_core::FileChange::Delete => None,
+            })
+            .filter(|h| seen_contents.insert(*h))
+            .collect();
+        let present = if contents.is_empty() {
+            Ok(Vec::new())
+        } else {
+            repo.blobs().contains_many(&contents).await
+        };
         let mut s = self.lock();
+        if let Ok(present) = present {
+            s.stored_blobs.extend(
+                contents
+                    .iter()
+                    .zip(present)
+                    .filter(|(_, p)| *p)
+                    .map(|(h, _)| *h),
+            );
+        }
         if let Ok(found) = found {
             for (id, cs) in ids.iter().zip(found) {
                 if let Some(cs) = cs {
@@ -239,8 +268,7 @@ impl Staging {
             // Flushed there, before any changeset names them (ADR 0044). The
             // copies name no other new contents: theirs were made durable
             // when the landed changesets were created.
-            repo.put_rescuing_many_in_flight(blobs, FLUSH_WRITES_IN_FLIGHT, &[])
-                .await?;
+            repo.put_rescuing_many(blobs, &[]).await?;
         }
         if !changesets.is_empty() || !rows.is_empty() {
             repo.meta()
@@ -264,6 +292,65 @@ impl BlobStore for StagedBlobs {
             s.blob_order.push(hash);
         }
         Ok(())
+    }
+
+    /// Staged, like a put: nothing is durable until [`Staging::flush`].
+    async fn put_many(&self, items: Vec<(Hash, Bytes)>) -> Result<Vec<Hash>> {
+        let mut s = self.staging.lock();
+        for (hash, data) in items {
+            if s.blobs.insert(hash, data).is_none() {
+                s.blob_order.push(hash);
+            }
+        }
+        Ok(Vec::new())
+    }
+
+    /// A staged blob from memory; any other is the store's durable copy.
+    async fn get_stored(&self, hash: &Hash) -> Result<Option<Bytes>> {
+        if let Some(b) = self.staging.lock().blobs.get(hash) {
+            return Ok(Some(b.clone()));
+        }
+        self.inner.get_stored(hash).await
+    }
+
+    /// Staged blobs and blobs this attempt found stored answer from memory;
+    /// the rest in one batch of the store, whose finds are kept.
+    async fn contains_many(&self, hashes: &[Hash]) -> Result<Vec<bool>> {
+        let mut out: Vec<bool> = {
+            let s = self.staging.lock();
+            hashes
+                .iter()
+                .map(|h| s.blobs.contains_key(h) || s.stored_blobs.contains(h))
+                .collect()
+        };
+        let ask: Vec<Hash> = hashes
+            .iter()
+            .zip(&out)
+            .filter(|(_, known)| !**known)
+            .map(|(h, _)| *h)
+            .collect();
+        if ask.is_empty() {
+            return Ok(out);
+        }
+        let found = self.inner.contains_many(&ask).await?;
+        if found.len() != ask.len() {
+            return Err(Error::Storage(format!(
+                "contains_many answered {} of {} hashes",
+                found.len(),
+                ask.len()
+            )));
+        }
+        let mut found = found.into_iter();
+        let mut s = self.staging.lock();
+        for (h, slot) in hashes.iter().zip(out.iter_mut()) {
+            if !*slot {
+                *slot = found.next().unwrap_or(false);
+                if *slot {
+                    s.stored_blobs.insert(*h);
+                }
+            }
+        }
+        Ok(out)
     }
 
     async fn get(&self, hash: &Hash) -> Result<Option<Bytes>> {
@@ -296,12 +383,20 @@ impl BlobStore for StagedBlobs {
         Ok(out)
     }
 
-    /// A staged blob counts: it is stored before anything that references it.
+    /// A staged blob counts: it is stored before anything that references
+    /// it. So does one this attempt found stored.
     async fn contains(&self, hash: &Hash) -> Result<bool> {
-        if self.staging.lock().blobs.contains_key(hash) {
-            return Ok(true);
+        {
+            let s = self.staging.lock();
+            if s.blobs.contains_key(hash) || s.stored_blobs.contains(hash) {
+                return Ok(true);
+            }
         }
-        self.inner.contains(hash).await
+        let found = self.inner.contains(hash).await?;
+        if found {
+            self.staging.lock().stored_blobs.insert(*hash);
+        }
+        Ok(found)
     }
 
     /// Nothing staged is durable or acknowledged until [`Staging::flush`]
@@ -484,6 +579,83 @@ impl MetaStore for StagedMeta {
                 *slot = read.next().flatten();
                 if let (true, Some(v)) = (keep, slot.as_ref()) {
                     s.read_rows.insert((kind.to_string(), *k), v.clone());
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Each read answered from the staging where it can, and everything
+    /// else in one `get_derived_kinds` of the store, as `store_changeset`
+    /// asks for a copy's inputs (the default would make a round trip per
+    /// kind).
+    async fn get_derived_kinds(
+        &self,
+        reads: &[(&str, &[Hash])],
+    ) -> Result<Vec<Vec<Option<Bytes>>>> {
+        // Per read: the answers so far, and which slots the store fills.
+        let mut out: Vec<Vec<Option<Bytes>>> = Vec::with_capacity(reads.len());
+        let mut fill: Vec<Vec<bool>> = Vec::with_capacity(reads.len());
+        let mut asks: Vec<Vec<Hash>> = Vec::with_capacity(reads.len());
+        {
+            let s = self.staging.lock();
+            for (kind, keys) in reads {
+                let mut answers = Vec::with_capacity(keys.len());
+                let mut from_store = Vec::with_capacity(keys.len());
+                let mut ask = Vec::new();
+                for k in keys.iter() {
+                    let staged_blob = *kind == BLOB_CONDEMNED && s.blobs.contains_key(k);
+                    let v = s.row(kind, k);
+                    let ask_it = v.is_none() && !staged_blob;
+                    if ask_it {
+                        ask.push(*k);
+                    }
+                    from_store.push(ask_it);
+                    answers.push(v);
+                }
+                out.push(answers);
+                fill.push(from_store);
+                asks.push(ask);
+            }
+        }
+        if asks.iter().all(|a| a.is_empty()) {
+            return Ok(out);
+        }
+        let inner_reads: Vec<(&str, &[Hash])> = reads
+            .iter()
+            .zip(&asks)
+            .map(|((kind, _), ask)| (*kind, ask.as_slice()))
+            .collect();
+        let read = self.inner.get_derived_kinds(&inner_reads).await?;
+        if read.len() != reads.len() {
+            return Err(Error::Storage(format!(
+                "get_derived_kinds answered {} of {} reads",
+                read.len(),
+                reads.len()
+            )));
+        }
+        let mut s = self.staging.lock();
+        for ((((kind, keys), answers), from_store), (ask, got)) in reads
+            .iter()
+            .zip(out.iter_mut())
+            .zip(&fill)
+            .zip(asks.iter().zip(read))
+        {
+            if got.len() != ask.len() {
+                return Err(Error::Storage(format!(
+                    "get_derived_kinds answered {} of {} {kind} keys",
+                    got.len(),
+                    ask.len()
+                )));
+            }
+            let keep = immutable_kind(kind);
+            let mut got = got.into_iter();
+            for ((k, slot), from_store) in keys.iter().zip(answers.iter_mut()).zip(from_store) {
+                if *from_store {
+                    *slot = got.next().flatten();
+                    if let (true, Some(v)) = (keep, slot.as_ref()) {
+                        s.read_rows.insert((kind.to_string(), *k), v.clone());
+                    }
                 }
             }
         }

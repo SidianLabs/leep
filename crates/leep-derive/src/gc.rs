@@ -27,11 +27,6 @@ use crate::Repo;
 /// Page size for changeset and blob listings.
 const PAGE: usize = 1000;
 
-/// Blob writes in flight when several are stored together. Each is
-/// independent and content addressed, so order does not matter, and a store
-/// that syncs every write gets them done together.
-const BLOB_WRITES_IN_FLIGHT: usize = 4;
-
 /// Fence reads in flight in [`Repo::missing_blobs`], for the hashes that
 /// have a condemnation row (or all of them, if the batched read failed).
 const FENCES_IN_FLIGHT: usize = 64;
@@ -329,35 +324,38 @@ impl Repo {
     /// ([`leep_core::BlobStore::flush_blobs`]) alongside that read, in one
     /// call and without waiting for other requests' writes: callers store
     /// something that names them next.
+    ///
+    /// The blobs are written with one [`leep_core::BlobStore::put_many`], so
+    /// a store may write them as one pack (ADR 0068); the blobs it reports
+    /// durable are left out of the flush. Either way every blob is durable
+    /// and readable before its condemnation is read.
     pub(crate) async fn put_rescuing_many(
         &self,
         items: Vec<(Hash, Bytes)>,
         named: &[Hash],
     ) -> Result<()> {
-        self.put_rescuing_many_in_flight(items, BLOB_WRITES_IN_FLIGHT, named)
-            .await
-    }
-
-    /// [`Repo::put_rescuing_many`] writing up to `in_flight` blobs at once.
-    pub(crate) async fn put_rescuing_many_in_flight(
-        &self,
-        items: Vec<(Hash, Bytes)>,
-        in_flight: usize,
-        named: &[Hash],
-    ) -> Result<()> {
-        for chunk in items.chunks(in_flight.max(1)) {
-            let writes: Vec<_> = chunk
-                .iter()
-                .map(|(h, d)| self.blobs().put_with_hash(*h, d.clone()))
-                .collect();
-            try_join_all(writes).await?;
-        }
+        let packed: HashSet<Hash> = self
+            .blobs()
+            .put_many(items.clone())
+            .await?
+            .into_iter()
+            .collect();
         let hashes: Vec<Hash> = items.iter().map(|(h, _)| *h).collect();
-        let mut durable = hashes.clone();
-        durable.extend_from_slice(named);
+        let mut to_flush: Vec<Hash> = hashes
+            .iter()
+            .filter(|h| !packed.contains(h))
+            .copied()
+            .collect();
+        to_flush.extend_from_slice(named);
         let (batch, flushed) = tokio::join!(
             self.meta().get_derived_many(BLOB_CONDEMNED, &hashes),
-            self.blobs().flush_blobs(&durable)
+            async {
+                if to_flush.is_empty() {
+                    Ok(())
+                } else {
+                    self.blobs().flush_blobs(&to_flush).await
+                }
+            }
         );
         flushed?;
         let mut rescued = Vec::new();
