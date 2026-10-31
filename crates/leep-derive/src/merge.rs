@@ -1,6 +1,6 @@
 //! Three-way tree merge, plus `merge` and `rebase` built on it.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
@@ -140,9 +140,10 @@ impl Repo {
     }
 
     /// Would setting `p` clash with a file/directory already in `ours`?
+    /// `at` holds `ours`' entry at `p` and at each of its directories.
     async fn collides(
         &self,
-        ours: Hash,
+        at: &HashMap<String, Option<TreeEntry>>,
         p: &RepoPath,
         changes: &BTreeMap<RepoPath, FileChange>,
     ) -> Result<bool> {
@@ -152,7 +153,7 @@ impl Repo {
                 prefix.push('/');
             }
             prefix.push_str(comp);
-            let entry = self.entry_at(ours, &prefix).await?;
+            let entry = at.get(&prefix).cloned().flatten();
             if prefix == p.as_str() {
                 let Some(TreeEntry::Dir { tree }) = entry else {
                     return Ok(false);
@@ -181,6 +182,22 @@ impl Repo {
             }
         }
         Ok(false)
+    }
+
+    /// `ours`' entries at `p` and its directories, one `entry_at` each: the
+    /// oracle for the batched read.
+    #[cfg(test)]
+    async fn walk_entries(
+        &self,
+        ours: Hash,
+        p: &RepoPath,
+    ) -> Result<HashMap<String, Option<TreeEntry>>> {
+        let mut out = HashMap::new();
+        let s = p.as_str();
+        for k in s.match_indices('/').map(|(i, _)| &s[..i]).chain([s]) {
+            out.insert(k.to_string(), self.entry_at(ours, k).await?);
+        }
+        Ok(out)
     }
 
     /// Three-way merge of trees; `changes` apply on top of `ours`.
@@ -288,10 +305,36 @@ impl Repo {
                 }),
             }
         }
+        // `ours`' entries at every modified path and its directories, in
+        // one batched read per level, for the collision checks.
+        let mut wanted: BTreeSet<&str> = BTreeSet::new();
+        for (path, ..) in &taken {
+            if matches!(changes.get(path), Some(FileChange::Modify { .. })) {
+                let s = path.as_str();
+                wanted.extend(s.match_indices('/').map(|(i, _)| &s[..i]));
+                wanted.insert(s);
+            }
+        }
+        let wanted: Vec<&str> = wanted.into_iter().collect();
+        let at = if wanted.is_empty() {
+            HashMap::new()
+        } else {
+            self.entries_at(ours, &wanted).await?
+        };
         for (path, old, our_info, new) in taken {
-            if matches!(changes.get(&path), Some(FileChange::Modify { .. }))
-                && self.collides(ours, &path, &changes).await?
-            {
+            let modify = matches!(changes.get(&path), Some(FileChange::Modify { .. }));
+            // Under test, every check is made both ways: from the batched
+            // entries and by walking `ours` from its root.
+            #[cfg(test)]
+            if modify {
+                let walked = self.walk_entries(ours, &path).await?;
+                assert_eq!(
+                    self.collides(&at, &path, &changes).await?,
+                    self.collides(&walked, &path, &changes).await?,
+                    "{path}"
+                );
+            }
+            if modify && self.collides(&at, &path, &changes).await? {
                 changes.remove(&path);
                 conflicts.push(Conflict {
                     path,

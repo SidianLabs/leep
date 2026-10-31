@@ -253,10 +253,27 @@ impl Repo {
         tree: Hash,
         paths: &[&RepoPath],
     ) -> Result<HashMap<RepoPath, Option<FileInfo>>> {
+        let names: Vec<&str> = paths.iter().map(|p| p.as_str()).collect();
+        let entries = self.entries_at(tree, &names).await?;
+        Ok(paths
+            .iter()
+            .map(|&p| {
+                let e = entries.get(p.as_str()).and_then(|e| e.as_ref());
+                (p.clone(), e.and_then(|e| file_info(p.clone(), e)))
+            })
+            .collect())
+    }
+
+    /// The entry at each of `paths` (non-empty, `/`-separated) under `tree`,
+    /// read as [`Repo::files_at`] reads them.
+    pub(crate) async fn entries_at(
+        &self,
+        tree: Hash,
+        paths: &[&str],
+    ) -> Result<HashMap<String, Option<TreeEntry>>> {
         // The directories each level needs, by path; level 0 is the root.
         let mut levels: Vec<BTreeSet<&str>> = vec![BTreeSet::from([""])];
-        for p in paths {
-            let s = p.as_str();
+        for &s in paths {
             for (i, _) in s.match_indices('/') {
                 let d = &s[..i];
                 let level = depth(d);
@@ -292,10 +309,9 @@ impl Repo {
         }
         let mut out = HashMap::with_capacity(paths.len());
         for &p in paths {
-            let entry = nodes
-                .get(p.parent().unwrap_or(""))
-                .and_then(|n| n.entries.get(p.file_name()));
-            out.insert(p.clone(), entry.and_then(|e| file_info(p.clone(), e)));
+            let (parent, name) = p.rsplit_once('/').unwrap_or(("", p));
+            let entry = nodes.get(parent).and_then(|n| n.entries.get(name));
+            out.insert(p.to_string(), entry.cloned());
         }
         Ok(out)
     }
