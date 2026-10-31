@@ -480,7 +480,19 @@ async fn bounded_history_queries_match_the_indexed_answers() {
                 match q.blame_indexed(tip, &f.path, Freshness::Retry).await {
                     Ok(got) => {
                         assert!(steps <= budget.blame);
-                        assert_eq!(got.value.lines, want.lines, "seed {seed}: {}", f.path);
+                        // Past the side budget (what the blame budget leaves
+                        // after the head's chain) a merge keeps the lines of
+                        // the branch it did not follow (ADR 0065).
+                        let (g, w) = (&got.value.lines, &want.lines);
+                        assert_eq!(g.len(), w.len(), "seed {seed}: {}", f.path);
+                        for (gl, wl) in g.iter().zip(w) {
+                            if gl != wl {
+                                assert!(budget.blame < 10_000, "seed {seed}: {}", f.path);
+                                let cs = a.get_changeset(gl.changeset).await.unwrap();
+                                assert!(cs.parents.len() > 1, "seed {seed}: {gl:?} vs {wl:?}");
+                                assert_eq!(gl.text, wl.text);
+                            }
+                        }
                     }
                     Err(Error::Indexing { .. }) => assert!(steps > budget.blame),
                     Err(e) => panic!("{e}"),
@@ -1316,4 +1328,87 @@ async fn bounded_scan_over_budget_reads_a_bounded_part_of_a_cold_tree() {
     assert!(after.0 - before.0 >= nodes);
     assert_eq!(scan.files.load(SeqCst), files.len() as u64);
     assert_eq!(index_rows(probe.as_ref()).await, 0, "nothing stored");
+}
+
+/// A bounded blame walks a merged branch's un-indexed steps within what
+/// `--blame-scan-budget` leaves after its own chain, and reports them in
+/// `scanned`; past that budget the merge keeps the branch's lines and the
+/// answer is not cached (ADR 0065).
+#[tokio::test]
+async fn bounded_blame_counts_and_bounds_merged_branches() {
+    async fn commit(r: &Repo, parents: &[ChangesetId], files: &[(&str, &str)]) -> ChangesetId {
+        let mut changes = BTreeMap::new();
+        for (p, t) in files {
+            changes.insert(
+                RepoPath::new(*p).unwrap(),
+                FileChange::Modify {
+                    content: r
+                        .blobs()
+                        .put(Bytes::copy_from_slice(t.as_bytes()))
+                        .await
+                        .unwrap(),
+                    kind: FileKind::Regular,
+                    size: t.len() as u64,
+                },
+            );
+        }
+        r.create_changeset(Changeset {
+            parents: parents.to_vec(),
+            author: "t".into(),
+            timestamp: 1,
+            message: "m".into(),
+            changes,
+            extra: BTreeMap::new(),
+        })
+        .await
+        .unwrap()
+    }
+    let (r, meta) = memory_repo();
+    let root = commit(&r, &[], &[("f", "a\n"), ("g", "0\n")]).await;
+    let m1 = commit(&r, &[root], &[("g", "1\n")]).await;
+    derived::derive::<HistoryTree>(&r, m1).await.unwrap();
+    // Three un-indexed changes on a branch, one on the main line.
+    let s1 = commit(&r, &[m1], &[("f", "a\ns1\n")]).await;
+    let s2 = commit(&r, &[s1], &[("f", "a\ns1\ns2\n")]).await;
+    let s3 = commit(&r, &[s2], &[("f", "a\ns1\ns2\ns3\n")]).await;
+    let m2 = commit(&r, &[m1], &[("f", "a\nmain\n")]).await;
+    let x = commit(&r, &[m2, s3], &[("f", "a\nmain\ns1\ns2\ns3\n")]).await;
+    hold_leases(meta.as_ref()).await;
+    let budgets = |blame| Budgets {
+        scan: 10_000,
+        blame,
+        search_files: 10_000,
+        search_bytes: 1 << 30,
+        legacy_factor: 8,
+    };
+    let path = RepoPath::new("f").unwrap();
+    let cached = || async {
+        r.meta()
+            .get_derived(crate::blame::KIND, &crate::blame::cache_key(x, &path))
+            .await
+            .unwrap()
+    };
+    // The head's chain takes two steps of three: the branch does not fit.
+    let q = bounded(&r, budgets(3));
+    let got = q.blame_indexed(x, &path, Freshness::Retry).await.unwrap();
+    let credit: Vec<ChangesetId> = got.value.lines.iter().map(|l| l.changeset).collect();
+    assert_eq!(credit, [root, m2, x, x, x]);
+    assert!(cached().await.is_none(), "an incomplete blame was cached");
+    let rows = index_rows(meta.as_ref()).await;
+    // With room for it, the branch is followed and its steps are scanned.
+    let q = bounded(&r, budgets(100));
+    let got = q.blame_indexed(x, &path, Freshness::Retry).await.unwrap();
+    let credit: Vec<ChangesetId> = got.value.lines.iter().map(|l| l.changeset).collect();
+    assert_eq!(credit, [root, m2, s1, s2, s3]);
+    assert!(
+        got.scanned >= 5,
+        "scanned {} (head 2, branch 3)",
+        got.scanned
+    );
+    assert!(cached().await.is_some());
+    assert_eq!(
+        index_rows(meta.as_ref()).await,
+        rows,
+        "a bounded blame wrote index rows"
+    );
 }

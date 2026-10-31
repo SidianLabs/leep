@@ -12,36 +12,39 @@
 //! diff keeps, then of each other parent's in order for the lines still
 //! unexplained, and credits the rest to itself, as `git blame` passes blame
 //! to parents.
+//!
+//! Walks start oldest first (by the generation of the changeset they start
+//! from), and the blame at each walk's start is cached once it is complete,
+//! so a blame that stops at [`FOLLOW_WALKS`] leaves the oldest part of the
+//! graph cached and the next request starts its walks above it.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::cmp::{Ordering, Reverse};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
 
+use bytes::Bytes;
 use leep_core::api::{BlameLine, FileInfo};
 use leep_core::rename::RenameOptions;
 use leep_core::{ChangesetId, Error, FileChange, Hash, RepoPath, Result};
 use similar::DiffTag;
 
 use crate::blame::{
-    diff_pairs, split_lines, strip_eol, CachedBlame, Cuts, End, Found, CONTENT_BATCH, CONTENT_BYTES,
+    cache_key, diff_pairs, split_lines, strip_eol, CachedBlame, Cuts, End, Found, CONTENT_BATCH,
+    CONTENT_BYTES, KIND,
 };
 use crate::derived::{decode_u64, DerivedKind, HistoryTree, LastMerge};
 use crate::indexing::bounded::{newest_indexed, Bounded};
 use crate::Repo;
 
 /// Walks one blame starts below merges and renames, at most. Past this the
-/// remaining merges keep the lines they brought in, and the answer is not
-/// cached, so a later request (finding the walks' cached blames) gets
-/// further.
-const FOLLOW_WALKS: usize = 1024;
+/// newest merges not yet followed keep the lines they brought in, and the
+/// answer is not cached; the complete blames at the starts of the walks
+/// done are, so a later request starts at most this many walks above them.
+pub(crate) const FOLLOW_WALKS: usize = 1024;
 
 /// Walks run at once. Each is a first-parent walk with its own batched
 /// reads; most stop after a few steps, at a changer another walk found.
 const WALKS_IN_FLIGHT: usize = 16;
-
-/// First-parent steps without an index row a bounded blame (ADR 0058) walks
-/// one by one down a merged branch, at most; a branch further from an
-/// indexed changeset is not followed.
-const SIDE_SCAN_STEPS: u64 = 128;
 
 /// The versions of a file a blame is made of, and how they derive.
 pub(crate) struct Graph {
@@ -52,9 +55,13 @@ pub(crate) struct Graph {
     /// chain, whose blame is the same.
     pub(crate) latest: Option<ChangesetId>,
     pub(crate) examined: usize,
-    /// Every merge and rename was followed: the answer is the blame of the
-    /// changeset, and may be cached.
-    pub(crate) complete: bool,
+    /// Walks started below merges and renames.
+    pub(crate) walks: usize,
+    /// Cache the complete blames at the walks' starts.
+    cache: bool,
+    /// Where walks started, by the version they reached: their blames are
+    /// cached there once complete.
+    starts: Vec<(ChangesetId, usize)>,
 }
 
 /// A changer's version of the file, or a cached blame.
@@ -73,6 +80,9 @@ struct Node {
     sides: Vec<(usize, usize)>,
     /// The bounded handle (ADR 0058) the walk that found it ran on.
     bounded: Option<Arc<Bounded>>,
+    /// A merge or rename of this version was not followed (a bound was
+    /// hit): its blame, and every blame made from it, is incomplete.
+    cut: bool,
 }
 
 /// Where a walk's first version goes.
@@ -89,7 +99,62 @@ struct Want {
     path: RepoPath,
     info: FileInfo,
     bounded: Option<Arc<Bounded>>,
+    /// Down a merged branch: a bounded blame (ADR 0058) gives the walk its
+    /// own bounds when it starts ([`Repo::side_bounds`]).
+    side: bool,
     slot: Slot,
+}
+
+/// A queued [`Want`], popped oldest first: by the generation of `at`, then
+/// in the order queued.
+struct Queued {
+    generation: u64,
+    seq: usize,
+    want: Want,
+}
+
+impl Queued {
+    fn key(&self) -> (Reverse<u64>, Reverse<usize>) {
+        (Reverse(self.generation), Reverse(self.seq))
+    }
+}
+
+impl PartialEq for Queued {
+    fn eq(&self, other: &Self) -> bool {
+        self.key() == other.key()
+    }
+}
+
+impl Eq for Queued {}
+
+impl PartialOrd for Queued {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Queued {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.key().cmp(&other.key())
+    }
+}
+
+/// The walks still to start.
+#[derive(Default)]
+struct Queue {
+    heap: BinaryHeap<Queued>,
+    seq: usize,
+}
+
+impl Queue {
+    fn push(&mut self, generation: u64, want: Want) {
+        self.seq += 1;
+        self.heap.push(Queued {
+            generation,
+            seq: self.seq,
+            want,
+        });
+    }
 }
 
 #[derive(Default)]
@@ -105,10 +170,19 @@ struct Builder {
     latest: Option<ChangesetId>,
     examined: usize,
     walks: usize,
-    incomplete: bool,
+    /// Where walks below merges and renames started, and their versions.
+    walked: Vec<(ChangesetId, usize)>,
 }
 
 impl Builder {
+    /// A bound kept `slot` from being followed.
+    fn cut(&mut self, slot: Slot) {
+        match slot {
+            Slot::Top => {}
+            Slot::Renamed(to) | Slot::Side(to, _) => self.nodes[to].cut = true,
+        }
+    }
+
     fn attach(&mut self, slot: Slot, n: usize) {
         match slot {
             Slot::Top => self.top = Some(n),
@@ -165,6 +239,7 @@ impl Builder {
                     renamed: false,
                     sides: Vec::new(),
                     bounded: w.bounded.clone(),
+                    cut: false,
                 },
             );
             fresh.push(n);
@@ -193,6 +268,7 @@ impl Builder {
                                 renamed: false,
                                 sides: Vec::new(),
                                 bounded: None,
+                                cut: false,
                             },
                         ),
                     })
@@ -208,6 +284,9 @@ impl Builder {
                 w.path, w.at
             ))
         })?;
+        if !matches!(w.slot, Slot::Top) {
+            self.walked.push((w.at, first));
+        }
         self.starts.insert((w.at, w.path), first);
         self.attach(w.slot, first);
         Ok(fresh)
@@ -277,19 +356,25 @@ impl Repo {
         path: &RepoPath,
         cuts: Option<Cuts>,
         cache: bool,
+        most_walks: usize,
     ) -> Result<Graph> {
         let mut b = Builder::default();
-        let mut queue = VecDeque::from([Want {
-            at: id,
-            path: path.clone(),
-            info: tip,
-            bounded: self.bounded.clone(),
-            slot: Slot::Top,
-        }]);
-        while !queue.is_empty() {
+        let mut queue = Queue::default();
+        queue.push(
+            u64::MAX,
+            Want {
+                at: id,
+                path: path.clone(),
+                info: tip,
+                bounded: self.bounded.clone(),
+                side: false,
+                slot: Slot::Top,
+            },
+        );
+        while !queue.heap.is_empty() {
             let mut batch: Vec<Want> = Vec::new();
             while batch.len() < WALKS_IN_FLIGHT {
-                let Some(w) = queue.pop_front() else {
+                let Some(Queued { want: w, .. }) = queue.heap.pop() else {
                     break;
                 };
                 let key = (w.at, w.path.clone());
@@ -297,16 +382,65 @@ impl Repo {
                     b.attach(w.slot, n);
                     continue;
                 }
+                batch.push(w);
+            }
+            // A complete blame cached at a walk's start (by an earlier
+            // request that stopped at its bounds) needs no walk.
+            let below: Vec<usize> = (0..batch.len())
+                .filter(|&i| !matches!(batch[i].slot, Slot::Top))
+                .collect();
+            let mut hits: Vec<Option<CachedBlame>> = vec![None; batch.len()];
+            if cache && !below.is_empty() {
+                let keys: Vec<Hash> = below
+                    .iter()
+                    .map(|&i| cache_key(batch[i].at, &batch[i].path))
+                    .collect();
+                let found = self.meta().get_derived_many(KIND, &keys).await?;
+                for (&i, v) in below.iter().zip(found) {
+                    if let Some(v) = v {
+                        hits[i] = Some(postcard::from_bytes(&v)?);
+                    }
+                }
+            }
+            let mut walk: Vec<Want> = Vec::new();
+            for (w, hit) in batch.into_iter().zip(hits) {
+                if let Some(blame) = hit {
+                    let n = b.nodes.len();
+                    b.nodes.push(Node {
+                        cs: w.at,
+                        info: w.info,
+                        generation: 0,
+                        cached: Some(blame),
+                        base: None,
+                        renamed: false,
+                        sides: Vec::new(),
+                        bounded: None,
+                        cut: false,
+                    });
+                    b.starts.insert((w.at, w.path), n);
+                    b.attach(w.slot, n);
+                    continue;
+                }
                 if !matches!(w.slot, Slot::Top) {
-                    if b.walks >= FOLLOW_WALKS {
-                        b.incomplete = true;
+                    if b.walks >= most_walks {
+                        b.cut(w.slot);
                         continue;
                     }
                     b.walks += 1;
                 }
-                batch.push(w);
+                let mut w = w;
+                if w.side && self.bounded.is_some() {
+                    match self.side_bounds(w.at).await? {
+                        Some(bounds) => w.bounded = Some(bounds),
+                        None => {
+                            b.cut(w.slot);
+                            continue;
+                        }
+                    }
+                }
+                walk.push(w);
             }
-            let walks = batch.iter().map(|w| {
+            let walks = walk.iter().map(|w| {
                 let repo = self.with_bounded_opt(w.bounded.clone());
                 let stop = b.stop_at.get(&w.path).cloned().unwrap_or_default();
                 let (at, info, path) = (w.at, w.info.clone(), w.path.clone());
@@ -314,7 +448,7 @@ impl Repo {
             });
             let found = futures_util::future::try_join_all(walks).await?;
             let mut fresh = Vec::new();
-            for (w, f) in batch.into_iter().zip(found) {
+            for (w, f) in walk.into_iter().zip(found) {
                 fresh.extend(b.add_walk(w, f)?);
             }
             self.follow(&mut b, &fresh, &mut queue).await?;
@@ -325,7 +459,9 @@ impl Repo {
             top,
             latest: b.latest,
             examined: b.examined,
-            complete: !b.incomplete,
+            walks: b.walks,
+            cache,
+            starts: b.walked,
         })
     }
 
@@ -333,12 +469,7 @@ impl Repo {
     /// every other parent whose version of the file differs from the first
     /// parent's; at a version that created the path, from the rename
     /// source in its first parent, if any.
-    async fn follow(
-        &self,
-        b: &mut Builder,
-        fresh: &[usize],
-        queue: &mut VecDeque<Want>,
-    ) -> Result<()> {
+    async fn follow(&self, b: &mut Builder, fresh: &[usize], queue: &mut Queue) -> Result<()> {
         if fresh.is_empty() {
             return Ok(());
         }
@@ -407,13 +538,18 @@ impl Repo {
                 continue;
             };
             if let Some(info) = self.lookup_file(p1, &from.from).await? {
-                queue.push_back(Want {
-                    at: p1,
-                    path: from.from,
-                    info,
-                    bounded: b.nodes[n].bounded.clone(),
-                    slot: Slot::Renamed(n),
-                });
+                let generation = self.generation(p1).await?;
+                queue.push(
+                    generation,
+                    Want {
+                        at: p1,
+                        path: from.from,
+                        info,
+                        bounded: b.nodes[n].bounded.clone(),
+                        side: false,
+                        slot: Slot::Renamed(n),
+                    },
+                );
             }
         }
         Ok(())
@@ -426,7 +562,7 @@ impl Repo {
         &self,
         b: &mut Builder,
         sides: Vec<(usize, usize, ChangesetId)>,
-        queue: &mut VecDeque<Want>,
+        queue: &mut Queue,
     ) -> Result<HashSet<usize>> {
         let mut merged_in = HashSet::new();
         let mut by_path: HashMap<RepoPath, Vec<(usize, usize, ChangesetId)>> = HashMap::new();
@@ -452,39 +588,38 @@ impl Repo {
                 if base == Some(info.content) {
                     continue;
                 }
-                let bounded = match &self.bounded {
-                    None => None,
-                    Some(_) => match self.side_bounds(p).await? {
-                        Some(bounds) => Some(bounds),
-                        None => {
-                            b.incomplete = true;
-                            continue;
-                        }
+                let generation = self.generation(p).await?;
+                queue.push(
+                    generation,
+                    Want {
+                        at: p,
+                        path: path.clone(),
+                        info,
+                        bounded: None,
+                        side: true,
+                        slot: Slot::Side(n, k),
                     },
-                };
-                queue.push_back(Want {
-                    at: p,
-                    path: path.clone(),
-                    info,
-                    bounded,
-                    slot: Slot::Side(n, k),
-                });
+                );
             }
         }
         Ok(merged_in)
     }
 
     /// For a bounded blame (ADR 0058), the bounds of a walk down a merged
-    /// branch from `p`: its newest indexed first-parent ancestor, or `None`
-    /// when that is more than [`SIDE_SCAN_STEPS`] steps down. Rows are
-    /// parent-closed, so everything below it is indexed.
+    /// branch from `p`: its newest indexed first-parent ancestor (rows are
+    /// parent-closed, so everything below it is indexed), its un-indexed
+    /// steps counted into the blame's own handle. `None` when those steps
+    /// would take the branches walked past what the blame's scan budget
+    /// (`--blame-scan-budget`) leaves after its own first-parent chain.
     async fn side_bounds(&self, p: ChangesetId) -> Result<Option<Arc<Bounded>>> {
+        let top = self.bounded.clone().expect("a bounded blame");
         let (found, steps) = newest_indexed(self, HistoryTree::NAME, p).await?;
-        if steps > SIDE_SCAN_STEPS {
+        if !top.charge_side(steps) {
             return Ok(None);
         }
         Ok(Some(Arc::new(Bounded {
             floor: Some(found.map_or(0, |e| e.generation)),
+            count_into: Some(top),
             ..Default::default()
         })))
     }
@@ -522,9 +657,13 @@ impl Repo {
     /// long chain holds two windows. A version that is not UTF-8 makes the
     /// versions descending from it by first parents fail, and is not
     /// followed into from a merge or rename (the merge keeps those lines).
-    pub(crate) async fn replay_graph(&self, mut g: Graph, path: &RepoPath) -> Result<Replayed> {
+    pub(crate) async fn replay_graph(
+        &self,
+        mut g: Graph,
+        path: &RepoPath,
+    ) -> Result<(Replayed, bool)> {
         if let Some(c) = g.nodes[g.top].cached.take() {
-            return Ok(Replayed::Cached(c));
+            return Ok((Replayed::Cached(c), true));
         }
         let n = g.nodes.len();
         let mut left = vec![0usize; n];
@@ -547,6 +686,29 @@ impl Repo {
         let nodes = &g.nodes;
         let mut order: Vec<usize> = (0..n).collect();
         order.sort_by_key(|&i| (nodes[i].generation, i));
+        // A blame is complete when no bound cut it or anything it is made
+        // from; only complete blames are cached.
+        let mut complete = vec![false; n];
+        for &i in &order {
+            let node = &nodes[i];
+            complete[i] = !node.cut
+                && node
+                    .base
+                    .iter()
+                    .chain(node.sides.iter().map(|(_, s)| s))
+                    .all(|&d| complete[d]);
+        }
+        let mut cache_at: HashMap<usize, Vec<ChangesetId>> = HashMap::new();
+        if g.cache {
+            for &(at, i) in &g.starts {
+                if complete[i] && !leaves.contains_key(&i) {
+                    let keys = cache_at.entry(i).or_insert_with(|| vec![nodes[i].cs]);
+                    if !keys.contains(&at) {
+                        keys.push(at);
+                    }
+                }
+            }
+        }
         let mut windows: Vec<&[usize]> = Vec::new();
         let (mut start, mut bytes) = (0, 0);
         for (i, &x) in order.iter().enumerate() {
@@ -689,6 +851,15 @@ impl Repo {
                         held.remove(d);
                     }
                 }
+                if let (Some(keys), Ok(lines), Some(text)) = (cache_at.get(&i), &state, &texts[j]) {
+                    let value = postcard::to_stdvec(&credited(&node.info.path, text, lines)?)?;
+                    let value = Bytes::from(value);
+                    for &at in keys {
+                        self.meta()
+                            .put_derived(KIND, &cache_key(at, &node.info.path), value.clone())
+                            .await?;
+                    }
+                }
                 let text = texts[j].clone();
                 held.insert(
                     i,
@@ -705,23 +876,30 @@ impl Repo {
             .state
             .map_err(|p| Error::Invalid(format!("{p} is not valid UTF-8")))?;
         let text = top.text.expect("a good version has its text");
-        let texts: Vec<&str> = split_lines(&text).collect();
-        if texts.len() != lines.len() {
-            return Err(Error::Other(format!(
-                "blame of {path} has {} lines for {} lines of text",
-                lines.len(),
-                texts.len()
-            )));
-        }
-        let lines: Vec<BlameLine> = lines
-            .into_iter()
-            .zip(texts)
-            .map(|((changeset, origin_line), text)| BlameLine {
-                changeset,
-                origin_line,
-                text: strip_eol(text).to_string(),
-            })
-            .collect();
-        Ok(Replayed::Fresh((path.clone(), lines)))
+        let resp = credited(path, &text, &lines)?;
+        Ok((Replayed::Fresh(resp), complete[g.top]))
     }
+}
+
+/// The blame of `path` whose version is `text`, its lines credited as
+/// `lines`.
+fn credited(path: &RepoPath, text: &str, lines: &[(ChangesetId, u32)]) -> Result<CachedBlame> {
+    let texts: Vec<&str> = split_lines(text).collect();
+    if texts.len() != lines.len() {
+        return Err(Error::Other(format!(
+            "blame of {path} has {} lines for {} lines of text",
+            lines.len(),
+            texts.len()
+        )));
+    }
+    let lines = lines
+        .iter()
+        .zip(texts)
+        .map(|(&(changeset, origin_line), text)| BlameLine {
+            changeset,
+            origin_line,
+            text: strip_eol(text).to_string(),
+        })
+        .collect();
+    Ok((path.clone(), lines))
 }

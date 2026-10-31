@@ -329,11 +329,13 @@ other parent with a version different from the first parent's starts
 another walk, as does the rename source of a creation. Each such walk stops
 at the first changer an earlier walk found (or at a cached blame), so a
 side branch costs its own changes plus a step into the main line, and the
-walks together form a graph of versions. Walks run breadth first, 16 at
+walks together form a graph of versions. Walks start oldest first, 16 at
 once, and at most 1,024 per blame; past that, or (for a bounded blame,
-ADR 0058) at a branch more than 128 un-indexed steps from an indexed
-changeset, the merge keeps the lines it brought in and the answer is not
-cached. The graph is replayed oldest first by generation, a version kept
+ADR 0058) when a branch's un-indexed steps exceed what
+`--blame-scan-budget` leaves after the blamed changeset's chain, the newest
+merges not yet followed keep the lines they brought in and the answer is
+not cached. The complete blame at each walk's start is cached, and a walk
+whose start has one is not started, so a repeated request goes further. The graph is replayed oldest first by generation, a version kept
 only until the versions made from it are replayed. A version that is not
 UTF-8 fails the blame when it is on the blamed file's first-parent line, as
 before, and is not followed from a merge or rename otherwise.

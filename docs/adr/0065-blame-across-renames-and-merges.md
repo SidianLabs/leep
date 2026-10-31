@@ -47,19 +47,44 @@ answers computed the old way must not be served for the new semantics.
   further walks from the other parents and rename sources. A walk stops at
   the first changer an earlier walk of the same blame found, as it stops at
   a cached blame, so a merged branch costs its own changes plus a step into
-  the main line. Walks run breadth first, 16 at a time, iteratively; no
-  history is recursed over on the call stack. The versions found form a
+  the main line. Walks start oldest first (by the generation of the
+  changeset they start from), 16 at a time, iteratively; no history is
+  recursed over on the call stack. The versions found form a
   graph, replayed oldest first by generation, in the existing windows of
   64 versions read while the previous window is diffed on several threads;
   a version is held only until the versions made from it are replayed.
 - **Bounds.** A blame starts at most 1,024 walks below merges and renames.
   A bounded blame (ADR 0058) walks a merged branch with its own floor, the
   branch's newest indexed first-parent ancestor (rows are parent-closed, so
-  everything below is indexed), and does not follow a branch more than 128
-  un-indexed steps from one. Past either bound the merge keeps the lines it
-  brought in, as before, and the answer is **not cached**, so a cached row
-  is always the complete answer; later requests, finding the walks' cached
-  rows, get further. The API is unchanged.
+  everything below is indexed). The branches' un-indexed steps share one
+  budget: what `--blame-scan-budget` leaves after the head's own
+  un-indexed first-parent steps (charged by the steps down to that floor,
+  an upper bound of what the walk examines). They are counted in the
+  answer's `scanned` (`Leep-Index-Scanned`). Past either bound the newest
+  merges not yet followed keep the lines they brought in, as before, and
+  the answer is **not cached**, so a cached row is always the complete
+  answer.
+- **Progress past the bounds.** A version's blame is complete when no
+  bound cut a merge or rename of it or of anything it is made from. The
+  complete blame at each walk's start is cached (keyed by the start and by
+  the version it reached), and a walk whose start has a cached row is not
+  started, so it does not count against the 1,024. Because walks start
+  oldest first, the walks a capped request does are the ones whose blames
+  can be complete, and the next request starts its 1,024 above them: a
+  blame needing `W` walks is complete, and cached, after about
+  `W / 1,024` requests, each bounded as one is. Until then each request
+  repeats the head walk and the replay. The `blame` read class (ADR 0060,
+  `--read-concurrency blame=...`, off by default) is the operator's limit
+  on how many such requests run at once; it is not built yet and accepts
+  only `off`, so for now the per-request bounds and the request timeout are
+  the limits. The API is unchanged.
+- **Memory.** A long chain holds about two windows of versions, as before.
+  A version is held until every version made from it is replayed, so a
+  merge holds its first parent's version and the version of each differing
+  other parent at once, whatever `CONTENT_BYTES` says: memory is bounded by
+  the versions still awaited, at most about the walks (1,024) times the
+  largest version, and in practice by the merges whose branch versions are
+  replayed before them.
 - **Non-UTF-8 versions.** One on the blamed file's first-parent line fails
   the blame (`Invalid`), as before. One reached through a merge or rename
   is not followed: the merge keeps those lines.
@@ -85,3 +110,9 @@ answers computed the old way must not be served for the new semantics.
   version it would by walking on. Incomplete answers are never stored.
 - `/v1/blame` is unchanged: `origin_line` is the line in the crediting
   changeset's version, which may be under the file's old name.
+- **Diff timeout.** Diffs past `DIFF_TIMEOUT` (500 ms) settle for a correct
+  but less minimal answer, which only blurs which changeset gets a line's
+  credit. Diffs against merged branches are now diffs too, so this happens
+  more often, and `verify`'s note that a blame row "differs from a
+  recomputation but is consistent with the file" applies to more rows; it
+  stays a note, not a problem.

@@ -20,9 +20,13 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   after the upgrade is computed again. `blame` is a retired kind:
   `leep-server repair drop --kind blame` (or `upgrade-index --drop-retired`)
   deletes its rows once no older server runs. A blame that stops following
-  merges at its bounds (1,024 branch and rename walks, or a branch far from
-  the index under `--indexing lease`/`off`) keeps the old credit for those
-  lines and is not cached.
+  merges at its bounds (1,024 branch and rename walks, or, under
+  `--indexing lease`/`off`, branch steps without index rows past what
+  `--blame-scan-budget` leaves after the blamed changeset's own chain)
+  keeps the old credit for the newest merges it did not follow and is not
+  cached; the complete blames of the branches it did follow are, so a
+  repeated request goes further and soon gets the complete, cached answer.
+  A bounded blame's `scanned` count includes the branches' steps.
 
 ### `leep config`, and the author from git
 - **Added.** `leep config author "Name <email>"` sets the author of new

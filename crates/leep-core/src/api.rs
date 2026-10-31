@@ -949,9 +949,11 @@ fn is_false(b: &bool) -> bool {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlameLine {
-    /// Changeset that last changed this line.
+    /// Changeset that wrote this line, followed across renames and merged
+    /// branches (ADR 0065).
     pub changeset: ChangesetId,
-    /// 1-based line number in that changeset's version of the file.
+    /// 1-based line number in that changeset's version of the file, which
+    /// may be under an older path when the file was renamed since.
     pub origin_line: u32,
     pub text: String,
 }

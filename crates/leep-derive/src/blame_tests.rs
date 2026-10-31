@@ -1179,3 +1179,67 @@ async fn blame_matches_the_definition_across_merges_and_renames() {
         }
     }
 }
+
+/// A blame that needs more walks below merges than it may start leaves the
+/// merges it did not follow their lines and is not cached, but caches the
+/// complete blames at the starts of the (oldest) walks it did, so each
+/// repeated request starts its walks above them and the answer becomes
+/// complete, and then cached, after a few requests.
+#[tokio::test]
+async fn repeated_blames_past_the_walk_limit_make_progress() {
+    let (r, _) = slow_repo();
+    let mut text = String::from("a\n");
+    let mut main = commit(&r, &[], &[("f", Some(&text)), ("g", Some("0\n"))]).await;
+    for k in 0..12 {
+        let mine = format!("{text}side {k}\n");
+        let side = commit(&r, &[main], &[("f", Some(&mine))]).await;
+        let other = commit(&r, &[main], &[("g", Some(&format!("{k}\n")))]).await;
+        main = commit(&r, &[other, side], &[("f", Some(&mine))]).await;
+        text = mine;
+    }
+    let path = rp("f");
+    let (want, _) = r.blame_walk_in(main, &path, None, false).await.unwrap();
+    let merges: usize = want.1.iter().filter(|l| l.text.starts_with("side")).count();
+    assert_eq!(merges, 12);
+    let cuts = Some(Cuts {
+        head: 32,
+        min_span: 32,
+    });
+    let on_merges = |b: &crate::blame::CachedBlame| {
+        let mut n = 0;
+        for (got, want) in b.1.iter().zip(&want.1) {
+            if got != want {
+                n += 1;
+            }
+        }
+        n
+    };
+    let mut left = usize::MAX;
+    let mut rounds = 0;
+    loop {
+        rounds += 1;
+        assert!(rounds <= 6, "no progress after {rounds} requests");
+        let run = r.blame_run(main, &path, cuts, true, 3).await.unwrap();
+        assert!(run.walks <= 3, "{} walks", run.walks);
+        let stored = r
+            .meta()
+            .get_derived(crate::blame::KIND, &crate::blame::cache_key(main, &path))
+            .await
+            .unwrap();
+        if run.complete {
+            assert_eq!(run.blame, want);
+            assert!(stored.is_some());
+            break;
+        }
+        assert!(stored.is_none(), "an incomplete blame was cached");
+        let wrong = on_merges(&run.blame);
+        assert!(
+            wrong < left,
+            "request {rounds}: {wrong} lines still wrong, {left} before"
+        );
+        left = wrong;
+    }
+    assert_eq!(rounds, 4, "12 merges, 3 walks a request");
+    let again = r.blame_run(main, &path, cuts, true, 3).await.unwrap();
+    assert_eq!((again.walks, again.examined, again.complete), (0, 0, true));
+}

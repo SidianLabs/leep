@@ -674,20 +674,50 @@ impl Repo {
         cuts: Option<Cuts>,
         cache: bool,
     ) -> Result<(CachedBlame, usize)> {
+        let run = self
+            .blame_run(id, path, cuts, cache, crate::blame_follow::FOLLOW_WALKS)
+            .await?;
+        Ok((run.blame, run.examined))
+    }
+
+    /// [`Repo::blame_walk_in`] starting at most `most_walks` walks below
+    /// merges and renames, and what it did.
+    pub(crate) async fn blame_run(
+        &self,
+        id: ChangesetId,
+        path: &RepoPath,
+        cuts: Option<Cuts>,
+        cache: bool,
+        most_walks: usize,
+    ) -> Result<BlameRun> {
         let tip = self
             .lookup_file(id, path)
             .await?
             .ok_or_else(|| Error::NotFound(format!("file {path} at {id}")))?;
         if cache {
             if let Some(v) = self.meta().get_derived(KIND, &cache_key(id, path)).await? {
-                return Ok((postcard::from_bytes(&v)?, 0));
+                return Ok(BlameRun {
+                    blame: postcard::from_bytes(&v)?,
+                    examined: 0,
+                    walks: 0,
+                    complete: true,
+                });
             }
         }
-        let graph = self.blame_graph(id, tip, path, cuts, cache).await?;
-        let examined = graph.examined;
-        let (latest, complete) = (graph.latest, graph.complete);
-        let resp = match self.replay_graph(graph, path).await? {
-            Replayed::Cached(resp) => return Ok((resp, examined)),
+        let graph = self
+            .blame_graph(id, tip, path, cuts, cache, most_walks)
+            .await?;
+        let (examined, walks, latest) = (graph.examined, graph.walks, graph.latest);
+        let (resp, complete) = self.replay_graph(graph, path).await?;
+        let resp = match resp {
+            Replayed::Cached(blame) => {
+                return Ok(BlameRun {
+                    blame,
+                    examined,
+                    walks,
+                    complete,
+                })
+            }
             Replayed::Fresh(resp) => resp,
         };
         // A blame that gave up following some merge or rename is not the
@@ -700,7 +730,12 @@ impl Repo {
                     .await?;
             }
         }
-        Ok((resp, examined))
+        Ok(BlameRun {
+            blame: resp,
+            examined,
+            walks,
+            complete,
+        })
     }
 
     /// The changers of `path` down `start`'s first-parent chain, newest
@@ -747,6 +782,18 @@ impl Repo {
             }
         }
     }
+}
+
+/// What one blame computed: the blame, the changesets its first-parent
+/// walks examined, the walks it started below merges and renames, and
+/// whether it followed all of them.
+pub(crate) struct BlameRun {
+    pub(crate) blame: CachedBlame,
+    pub(crate) examined: usize,
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) walks: usize,
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) complete: bool,
 }
 
 /// One diff of consecutive versions, as `(tag, old lines, new lines)`.
