@@ -1435,7 +1435,7 @@ impl Verifier<'_> {
                     self.notes.push(format!(
                         "blame row for {path} at {tip} differs from a recomputation but is \
                          consistent with the file; blame diffs are time-limited, and \
-                         `repair drop --kind blame` refreshes the cache"
+                         `repair drop --kind blame-v2` refreshes the cache"
                     ));
                 }
             }

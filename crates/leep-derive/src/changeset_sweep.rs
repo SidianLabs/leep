@@ -183,7 +183,7 @@ pub struct SweepCollectReport {
     pub flag_cleared: bool,
     /// Blame rows keyed by the deleted changesets, estimated from the
     /// store's blame rows per changeset: they leak until
-    /// `repair drop --kind blame` (ADR 0059 section 1).
+    /// `repair drop --kind blame-v2` (ADR 0059 section 1).
     pub blame_rows_of_deleted_estimate: u64,
 }
 

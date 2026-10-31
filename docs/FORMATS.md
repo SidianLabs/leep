@@ -58,6 +58,8 @@ skill.
 | retired `history-tree-v1`, `history-node-v1` | — | written by servers before ADR 0027; never read by current servers; removed with `repair drop --kind history-tree-v1` |
 | retired `history-tree-v2`, `history-node-v2` | — | written by servers from ADR 0027 to ADR 0037; never read by current servers; removed with `repair drop --kind history-tree-v2` |
 | retired `history-tree-v3`, `history-node-v3` | — | written by servers from ADR 0037 to ADR 0045 (one content-addressed postcard row per node, chunk, list or patch, keyed by `Hash::of_object("history-node-v3", bytes)`); never read by current servers; removed with `repair drop --kind history-tree-v3` |
+| derived `blame-v2` | — | `MetaStore.derived`, key = `Hash::of_object("blame", changeset id ‖ path bytes)`, value = postcard `(RepoPath, Vec<BlameLine>)`: a complete blame following renames and merged branches (ADR 0065), written for the blamed changeset and its newest changer |
+| retired `blame` | — | the same key and encoding, credited over first parents only; written by servers before ADR 0065; never read by current servers; removed with `repair drop --kind blame` |
 | other derived kinds | — | owned and versioned by `leep-derive` |
 
 ## Integrity on read

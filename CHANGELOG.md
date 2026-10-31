@@ -7,6 +7,23 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 ## [Unreleased]
 
+### Blame follows renames and merged branches
+- **Fixed.** `blame` credited every line of a moved file to the changeset
+  that moved it, and every line merged from a branch to the merge. It now
+  credits the changeset that wrote the line, as `git blame` does: a file
+  created by a rename continues under its old name (detected as for
+  `log --follow`), and at a merge, lines another parent holds unchanged are
+  credited down that parent; only lines the merge wrote itself (a conflict
+  resolution) are the merge's. `/v1/blame` is unchanged. See ADR 0065.
+- **Changed.** Cached blames move from derived kind `blame` to `blame-v2`,
+  so answers cached the old way are not served; the first blame of each file
+  after the upgrade is computed again. `blame` is a retired kind:
+  `leep-server repair drop --kind blame` (or `upgrade-index --drop-retired`)
+  deletes its rows once no older server runs. A blame that stops following
+  merges at its bounds (1,024 branch and rename walks, or a branch far from
+  the index under `--indexing lease`/`off`) keeps the old credit for those
+  lines and is not cached.
+
 ### `leep config`, and the author from git
 - **Added.** `leep config author "Name <email>"` sets the author of new
   changesets for the working copy (`.leep/config.json`), `--global` for the

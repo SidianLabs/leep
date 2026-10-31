@@ -16,8 +16,9 @@ use crate::gc::{BLOB_CLAIM, BLOB_CONDEMNED, BLOB_DOOM, BLOB_RESCUE, GC_MARK};
 use crate::search::{BLOB_KIND as BLOB_TRIGRAMS, TREE_KIND as TREE_TRIGRAMS};
 use crate::signatures::REBASED_ORIGIN_KIND;
 
-/// Name of the blame cache kind, keyed by a hash of (changeset, path).
-pub const BLAME_KIND: &str = "blame";
+/// Name of the blame cache kind, keyed by a hash of (changeset, path). The
+/// `-v2` blames follow renames and merged branches (ADR 0065).
+pub const BLAME_KIND: &str = "blame-v2";
 
 /// Name of the kind holding history-index nodes.
 pub const HISTORY_NODE: &str = HISTORY_NODE_KIND;
@@ -164,7 +165,7 @@ static KINDS: &[KindInfo] = &[
         summary: "cached blame of one file at one changeset",
         rederive: Rederive::No(
             "rows are keyed by a hash of (changeset, path) and cannot be listed; \
-             use `repair drop --kind blame`, and they are recomputed when asked for",
+             use `repair drop --kind blame-v2`, and they are recomputed when asked for",
         ),
         drop: DropPolicy::Allowed { also: &[] },
     },
@@ -360,6 +361,14 @@ static RETIRED: &[KindInfo] = &[
         drop: DropPolicy::Refused(
             "history-tree-v3 rows point at these nodes; drop history-tree-v3, which removes both",
         ),
+    },
+    KindInfo {
+        name: "blame",
+        class: KindClass::PerPath,
+        summary: "cached blames over first parents only, replaced by blame-v2, which follows \
+                  renames and merged branches (ADR 0065)",
+        rederive: Rederive::No("retired; this version caches blame-v2 instead"),
+        drop: DropPolicy::Allowed { also: &[] },
     },
 ];
 

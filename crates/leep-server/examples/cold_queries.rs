@@ -632,7 +632,7 @@ async fn main() {
                 "blame" => {
                     let path =
                         RepoPath::new(args.get(4).unwrap_or_else(|| usage()).clone()).unwrap();
-                    raw_meta.delete_derived_kind("blame").await.unwrap();
+                    raw_meta.delete_derived_kind("blame-v2").await.unwrap();
                     *tally.0.lock().unwrap() = BTreeMap::new();
                     let t = Instant::now();
                     let b = repo.blame(head, &path).await.unwrap();

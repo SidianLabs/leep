@@ -177,7 +177,7 @@ fn run_verify_workflow(stores: &Stores, work: &Path) {
         "history-tree-v4",
         "blob-trigrams-v1",
         "tree-trigrams-v1",
-        "blame",
+        "blame-v2",
     ] {
         assert!(
             v["derived"][kind]["checked"].as_u64().unwrap() > 0,
@@ -194,7 +194,7 @@ fn run_verify_workflow(stores: &Stores, work: &Path) {
         vec!["verify", "--ref", "no-such-ref"],
         vec!["repair", "drop", "--kind", "signature-v1"],
         vec!["repair", "drop", "--kind", "no-such-kind"],
-        vec!["repair", "rederive", "--kind", "blame"],
+        vec!["repair", "rederive", "--kind", "blame-v2"],
     ] {
         let out = run(stores, &args);
         assert_eq!(code(&out), 2, "{args:?}: {}", stderr(&out));
@@ -341,11 +341,11 @@ fn run_verify_workflow(stores: &Stores, work: &Path) {
     // one goes, the store stays clean, and queries bring the rows back.
     let dropped = json(
         stores,
-        &["repair", "drop", "--kind", "blame", "tree-trigrams-v1"],
+        &["repair", "drop", "--kind", "blame-v2", "tree-trigrams-v1"],
         0,
     );
     assert!(
-        dropped["rows"]["blame"].as_u64().unwrap() >= 1,
+        dropped["rows"]["blame-v2"].as_u64().unwrap() >= 1,
         "{dropped:#}"
     );
     json(stores, &["verify", "--full"], 0);

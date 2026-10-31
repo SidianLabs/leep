@@ -1250,7 +1250,11 @@ left (`repair drop` accepts retired kind names; it changes no answer of the
 new servers). The path-history index moved from
 `history-tree-v1` to `history-tree-v2` this way (ADR 0027), from
 `history-tree-v2` to `history-tree-v3` (ADR 0037), and from
-`history-tree-v3` to `history-tree-v4` (ADR 0045). The warmer derives the new
+`history-tree-v3` to `history-tree-v4` (ADR 0045). The blame cache moved from
+`blame` to `blame-v2` (ADR 0065), which needs no warming: blames are cached
+when asked for, so the first blame of each file after the upgrade computes
+it again, and `repair drop --kind blame` (or `upgrade-index --drop-retired`)
+deletes the old rows once no old server runs. The warmer derives the new
 index in the background after the new servers start; on a long history,
 rederive first if path queries must not wait for it:
 
@@ -1708,7 +1712,7 @@ condemns, waits `--fence` and collects.
 
   Never deleted: ref log entries, signatures, reviews, mirror maps, and
   content-keyed index rows. `blame` rows of deleted changesets leak; each
-  collect prints an estimate, and `repair drop --kind blame` clears them.
+  collect prints an estimate, and `repair drop --kind blame-v2` clears them.
 - **Tree nodes and contents** of deleted changesets are freed by blob GC.
   - `gc --full` frees all of them. It needs `--backups DIR` (it derives
     the fence from your sealed backups: three times the longest of the
@@ -2015,7 +2019,7 @@ leep-server repair rederive --kind skiplist               # also checks generati
 leep-server repair rederive --kind root_tree --ref main   # only the history of one ref
 leep-server repair rederive --kind all                    # every kind that can be recomputed
 leep-server repair rederive --kind history-tree-v4 --missing --jobs 16   # build an index after an import; resumable
-leep-server repair drop --kind blame blob-trigrams-v1     # delete rows; they derive again when asked for
+leep-server repair drop --kind blame-v2 blob-trigrams-v1  # delete rows; they derive again when asked for
 leep-server repair drop --kind history-tree-v4 --dry-run  # also removes history-node-v4; counts only
 ```
 
@@ -2057,15 +2061,16 @@ long history the first query derives the whole history. Warm them with
 `repair rederive` instead of waiting for a user. Dropping `history-tree-v4` also
 drops `history-node-v4`, because only it refers to those rows. `drop` also
 accepts the retired `history-tree-v1`, `history-tree-v2` and `history-tree-v3`
-(with `history-node-v1`, `history-node-v2` and `history-node-v3`), which
-current servers no longer use; see [Upgrading](#upgrading).
+(with `history-node-v1`, `history-node-v2` and `history-node-v3`) and the
+retired blame cache `blame`, which current servers no longer use; see
+[Upgrading](#upgrading).
 
 Kinds that cannot be rederived (and so are refused by `drop` with an
 explanation and exit status 2): `signature-v1`, `review-v1` and `review-source-v1` (clients wrote
 them), `rebased-origin-v1` (written by rebase; `land`'s retry detection depends
 on it), `blob-claim-v1`, `blob-condemned-v1`, `blob-rescue-v1`, `blob-doom-v1`, `gc-mark-v1` (the GC
 fence, ADR 0012), `history-node-v4` (or `-v3`, `-v2`, `-v1`) on its own, and the ref log. The full table
-with reasons is in ADR 0025. `blame` can be dropped but not rederived: its rows
+with reasons is in ADR 0025. `blame-v2` can be dropped but not rederived: its rows
 are keyed by a hash of (changeset, path) and cannot be listed.
 
 **Restart servers after a repair of the search kinds.** A running server

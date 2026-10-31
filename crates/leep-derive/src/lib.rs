@@ -11,6 +11,7 @@
 mod ancestry;
 mod batched_reads;
 mod blame;
+mod blame_follow;
 pub mod changeset_gc;
 pub mod changeset_reach;
 pub mod changeset_sweep;
