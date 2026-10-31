@@ -926,6 +926,14 @@ AND id <= ? ORDER BY id LIMIT ?`, the bounds being the prefix padded with
 `0x00` and `0xff` bytes (`leep_core::prefix::IdPrefix`). No encoding, hash,
 index or table changed, and no existing `/v1` shape changed.
 
+## Revision suffixes (additive meaning of `/v1/resolve`, ADR 0064)
+
+`GET /v1/resolve/{rev}` accepts git-style `~N` and `^N` steps after the base
+it always took. A `rev` without `~`, `^` or `@{` resolves exactly as before.
+One with them used to be 404; it is now 200, 404 (walk past a root, missing
+Nth parent) or 400 (malformed suffix, reflog syntax). No type, field or
+encoding changed. The whole string is tried as a ref name first.
+
 ## Explicit ref creation on land (additive API field, ADR 0036)
 
 `LandRequest` gains the optional `create` (`true`, `false` or absent; omitted

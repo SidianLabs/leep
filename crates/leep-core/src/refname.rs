@@ -20,7 +20,8 @@ pub const MISSING_REF_MARKER: &str = "does not exist and the land may not create
 /// Longest accepted ref name, in bytes.
 pub const MAX_LEN: usize = 255;
 
-/// Characters git forbids besides control characters and space.
+/// Characters git forbids besides control characters and space. `~` and
+/// `^` among them keep revision suffixes unambiguous (ADR 0064).
 const FORBIDDEN: &[char] = &['~', '^', ':', '?', '*', '[', '\\'];
 
 /// Whether `name` is in the tag namespace.

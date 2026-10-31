@@ -36,6 +36,7 @@ mod renames;
 mod repo;
 pub mod review;
 mod reviews;
+mod revision;
 pub mod search;
 mod signatures;
 mod tree_ops;

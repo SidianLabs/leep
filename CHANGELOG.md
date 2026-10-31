@@ -85,6 +85,18 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   server storing them. Each worker holds one file's bytes at a time; after a
   failed upload no new one starts, and the error reported is the one the
   first failing file gave, as before.
+### Git-style revision suffixes: `main~1`, `@^2` (ADR 0064)
+- `~N` (Nth first-parent ancestor) and `^N` (Nth parent; `^0` is the
+  changeset itself) now follow any revision, chained left to right as in git:
+  `leep diff main~1 main`, `leep show @~1`, `leep checkout 2a954d8e^2`,
+  `main~2^2~1`. `GET /v1/resolve/{rev}` walks them on the server in one
+  request, `~N` by the first-parent skiplist, so the CLI, the MCP tools and
+  scripts all get the same grammar. The CLI expands `@` and short ids before
+  sending the suffix.
+- A walk past the first changeset or a missing Nth parent is 404 (exit 4); a
+  malformed suffix and git's reflog syntax `@{...}` are 400 (exit 1).
+  Revisions without `~`, `^` or `@{` resolve as before; ref names already
+  could not contain them.
 
 ### Blame of files with a lone CR (issue #169)
 - **Fixed.** `GET /v1/blame` answered 500 for a file with a `\r` not followed

@@ -413,6 +413,33 @@ async fn refs_cas_and_resolve() {
     );
 }
 
+/// ADR 0064: `~N` and `^N` resolve on the server; `^` arrives
+/// percent-encoded, as clients send it.
+#[tokio::test]
+async fn resolve_revision_suffixes() {
+    let c = Client::new();
+    let a = c.commit(&[], &[("f", Some("a"))], "a").await;
+    let b = c.commit(&[a], &[("f", Some("b"))], "b").await;
+    let x = c.commit(&[a], &[("g", Some("x"))], "x").await;
+    let m = c.commit(&[b, x], &[("h", Some("m"))], "m").await;
+    c.set_ref("main", m).await;
+    let c = &c;
+    let id = |uri: String| async move { c.get(&uri).await.json::<ResolveResponse>().id };
+    assert_eq!(id("/v1/resolve/main~1".into()).await, b);
+    assert_eq!(id("/v1/resolve/main~2".into()).await, a);
+    assert_eq!(id("/v1/resolve/main%5E2".into()).await, x);
+    assert_eq!(id("/v1/resolve/main^2~1".into()).await, a);
+    assert_eq!(id(format!("/v1/resolve/{m}%5E0")).await, m);
+
+    let r = c.get("/v1/resolve/main~3").await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
+    assert!(r.json::<ErrorResponse>().error.contains("main~3"));
+    for bad in ["main~x", "main%40%7B1%7D", "main%5E%7Bcommit%7D"] {
+        let r = c.get(&format!("/v1/resolve/{bad}")).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{bad}");
+    }
+}
+
 #[tokio::test]
 async fn tree_files_file() {
     let c = Client::new();

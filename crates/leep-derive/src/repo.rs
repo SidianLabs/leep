@@ -7,6 +7,7 @@ use bytes::Bytes;
 use leep_core::api::ChangesetInfo;
 use leep_core::prefix::IdPrefix;
 use leep_core::refname;
+use leep_core::revision;
 use leep_core::{
     BlobStore, Changeset, ChangesetId, DerivedRow, Error, FileChange, Hash, MetaStore, RepoPath,
     Result, TreeNode,
@@ -1272,24 +1273,45 @@ impl Repo {
         Ok(view)
     }
 
-    /// Resolve a ref name or full 64-hex changeset id. As a last resort a
+    /// Resolve a ref name or full 64-hex changeset id, optionally followed
+    /// by git-style `~N` / `^N` suffixes (ADR 0064). As a last resort a
     /// short name is looked up as a tag (`v1` for `tags/v1`), so a branch or
     /// id of the same name always wins.
+    ///
+    /// The whole string is tried as a name before any suffix is parsed, so
+    /// even a ref stored before `~` and `^` were forbidden in names still
+    /// resolves to itself. A malformed suffix or reflog syntax is `Invalid`.
     pub async fn resolve(&self, rev: &str) -> Result<ChangesetId> {
-        if let Some(id) = self.meta.get_ref(rev).await? {
+        if let Some(id) = self.resolve_name(rev).await? {
             return Ok(id);
+        }
+        let Some((base, steps)) = revision::parse(rev)? else {
+            return Err(Error::NotFound(format!("revision {rev:?}")));
+        };
+        let Some(id) = self.resolve_name(base).await? else {
+            return Err(Error::NotFound(format!(
+                "revision {rev:?}: no ref, tag or changeset {base:?}"
+            )));
+        };
+        self.walk_steps(rev, id, &steps).await
+    }
+
+    /// A ref, full id or short tag name, without suffixes.
+    async fn resolve_name(&self, rev: &str) -> Result<Option<ChangesetId>> {
+        if let Some(id) = self.meta.get_ref(rev).await? {
+            return Ok(Some(id));
         }
         if let Ok(id) = rev.parse::<ChangesetId>() {
             if rev.len() == 64 && self.meta.get_changeset(&id).await?.is_some() {
-                return Ok(id);
+                return Ok(Some(id));
             }
         }
         if !refname::is_tag(rev) && refname::validate(rev).is_ok() {
             if let Some(id) = self.meta.get_ref(&refname::tag_ref(rev)).await? {
-                return Ok(id);
+                return Ok(Some(id));
             }
         }
-        Err(Error::NotFound(format!("revision {rev:?}")))
+        Ok(None)
     }
 
     /// The changesets whose id starts with `prefix` (4 to 64 hex digits):
