@@ -7,7 +7,7 @@ use bytes::Bytes;
 use leep_core::memory::{MemoryBlobStore, MemoryMetaStore};
 use leep_core::{Changeset, ChangesetId, FileChange, FileKind, RepoPath};
 use leep_derive::Repo;
-use leep_git::{export, import, ExportOptions, ImportOptions};
+use leep_git::{export, import, ExportOptions, ImportOptions, ImportReport, SUBMODULE_PATHS_KEPT};
 
 fn git(dir: &Path, args: &[&str]) -> String {
     git_env(dir, args, 1_700_000_000, "+0000")
@@ -272,28 +272,140 @@ async fn reserved_blob_prefix_stops_import_clearly() {
     assert_matches_git(&repo, r.head.unwrap(), p, "HEAD~1").await;
 }
 
-#[tokio::test]
-async fn submodules_are_skipped() {
+fn have_git() -> bool {
+    let ok = Command::new("git")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !ok {
+        eprintln!("git not installed; skipping");
+    }
+    ok
+}
+
+/// A repository whose history adds gitlinks `vendor/sub` and `deps/x/lib`
+/// (inside a new directory), then moves `vendor/sub` to another commit.
+fn repo_with_gitlinks() -> tempfile::TempDir {
     let d = init();
     let p = d.path();
+    let gitlink = |sha: &str, path: &str| {
+        git(
+            p,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{sha},{path}"),
+            ],
+        );
+    };
     write(p, "a", "1\n");
     git(p, &["add", "a"]);
-    git(
-        p,
-        &[
-            "update-index",
-            "--add",
-            "--cacheinfo",
-            "160000,1111111111111111111111111111111111111111,vendor/sub",
-        ],
-    );
+    gitlink("1111111111111111111111111111111111111111", "vendor/sub");
     git(p, &["commit", "-q", "-m", "with gitlink"]);
+    gitlink("2222222222222222222222222222222222222222", "vendor/sub");
+    gitlink("3333333333333333333333333333333333333333", "deps/x/lib");
+    git(p, &["commit", "-q", "-m", "bump and add"]);
+    d
+}
+
+#[tokio::test]
+async fn submodules_are_skipped_and_their_paths_reported() {
+    if !have_git() {
+        return;
+    }
+    let d = repo_with_gitlinks();
+    let p = d.path();
     let repo = new_repo();
     let r = import(&repo, &p.join(".git"), "HEAD", &ImportOptions::default())
         .await
         .unwrap();
-    assert_eq!(r.submodules_skipped, 1);
+    // Three gitlink updates, two distinct paths.
+    assert_eq!(r.submodules_skipped, 3);
+    assert_eq!(r.submodule_paths, ["deps/x/lib", "vendor/sub"]);
+    assert_eq!(r.submodule_paths_omitted, 0);
     assert_eq!(repo.list_files(r.head.unwrap(), "").await.unwrap().len(), 1);
+    let w = r.submodule_warning().unwrap();
+    assert!(w.contains("2 submodule paths were not imported"), "{w}");
+    assert!(w.contains("\n  deps/x/lib\n  vendor/sub\n"), "{w}");
+    assert!(w.contains("export"), "{w}");
+}
+
+#[tokio::test]
+async fn import_warns_about_dropped_submodules_on_stderr() {
+    if !have_git() {
+        return;
+    }
+    let d = repo_with_gitlinks();
+    let mut c = Command::new(env!("CARGO_BIN_EXE_leep-git"));
+    for (k, _) in std::env::vars() {
+        if k.starts_with("LEEP_") {
+            c.env_remove(k);
+        }
+    }
+    let out = c
+        .args([
+            "import",
+            "--meta",
+            "mem://",
+            "--blobs",
+            "mem://",
+            "--git-dir",
+        ])
+        .arg(d.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(stdout.contains("3 submodules skipped"), "{stdout}");
+    assert!(!stdout.contains("vendor/sub"), "{stdout}");
+    assert!(stderr.contains("  vendor/sub\n"), "{stderr}");
+    assert!(stderr.contains("will not contain them"), "{stderr}");
+
+    // Nothing to say without submodules.
+    let plain = init();
+    write(plain.path(), "a", "1\n");
+    commit(plain.path(), "plain");
+    let mut c = Command::new(env!("CARGO_BIN_EXE_leep-git"));
+    for (k, _) in std::env::vars() {
+        if k.starts_with("LEEP_") {
+            c.env_remove(k);
+        }
+    }
+    let out = c
+        .args([
+            "import",
+            "--meta",
+            "mem://",
+            "--blobs",
+            "mem://",
+            "--git-dir",
+        ])
+        .arg(plain.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("submodule"));
+}
+
+#[test]
+fn the_submodule_warning_caps_its_list() {
+    let r = ImportReport {
+        submodules_skipped: 1005,
+        submodule_paths: (0..SUBMODULE_PATHS_KEPT)
+            .map(|i| format!("s/{i}"))
+            .collect(),
+        submodule_paths_omitted: 5,
+        ..Default::default()
+    };
+    let w = r.submodule_warning().unwrap();
+    assert!(w.contains("1005 submodule paths were not imported"), "{w}");
+    assert!(w.contains("\n  and 5 more\n"), "{w}");
+    assert_eq!(w.lines().count(), SUBMODULE_PATHS_KEPT + 3);
+    assert!(ImportReport::default().submodule_warning().is_none());
 }
 
 #[tokio::test]

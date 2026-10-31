@@ -7,8 +7,8 @@ use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use crate::cache::Cache;
 use crate::client::Client;
 use crate::commands::{
-    amend, branch, checkout, commit, config, diff, history, init, keygen, land, merge, pick,
-    rebase, reflog, reset, resolve, restore, review, search, stash, status, Ctx, Remote,
+    amend, bisect, branch, checkout, commit, config, diff, history, init, keygen, land, merge,
+    pick, rebase, reflog, reset, resolve, restore, review, search, stash, status, Ctx, Remote,
 };
 use crate::error::{CliError, ErrorKind, Result};
 use crate::help;
@@ -107,6 +107,9 @@ pub enum Command {
     /// Show history.
     #[command(after_help = help::LOG)]
     Log(history::LogArgs),
+    /// Find the changeset that introduced a bug by binary search.
+    #[command(subcommand, after_help = help::BISECT)]
+    Bisect(bisect::BisectCmd),
     /// Show the newest changeset that changed a file or directory.
     LastChange(history::LastChangeArgs),
     /// Show one changeset.
@@ -258,10 +261,22 @@ pub fn run(cli: Cli) -> Result<i32> {
         json: cli.json,
     };
     match &cli.command {
+        Command::Commit(_)
+        | Command::Amend(_)
+        | Command::Land(_)
+        | Command::Merge(_)
+        | Command::Rebase(_)
+        | Command::CherryPick(_)
+        | Command::Revert(_)
+        | Command::Sync(_) => ctx.refuse_bisecting()?,
+        _ => {}
+    }
+    match &cli.command {
         Command::Init(_) | Command::Keygen(_) | Command::Config(_) => {
             unreachable!("handled above")
         }
         Command::Checkout(a) => checkout::checkout(&mut ctx, a),
+        Command::Bisect(c) => bisect::run(&mut ctx, c),
         Command::Status => status::run(&ctx),
         Command::Diff(a) => diff::run(&ctx, a),
         Command::Commit(a) => commit::run(&mut ctx, a),

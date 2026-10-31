@@ -26,6 +26,9 @@ struct Report {
     /// about, and which of the two it is.
     #[serde(skip_serializing_if = "Option::is_none")]
     picking: Option<Picking>,
+    /// A bisect in progress (`.leep/bisect.json`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bisecting: Option<Bisecting>,
     /// Whether the base is in the target ref's history; `None` when the
     /// server could not be asked or the ref does not exist.
     on_target: Option<bool>,
@@ -45,6 +48,15 @@ struct Report {
 struct Picking {
     from: String,
     operation: &'static str,
+}
+
+#[derive(Serialize)]
+struct Bisecting {
+    bad: Option<ChangesetId>,
+    good: Vec<ChangesetId>,
+    skip: Vec<ChangesetId>,
+    original_base: ChangesetId,
+    original_ref: String,
 }
 
 #[derive(Serialize)]
@@ -102,6 +114,7 @@ pub fn run(ctx: &Ctx) -> Result<i32> {
     let rel = ctx.wc.state.base.and_then(|b| relation(ctx, b));
     let stashes = ctx.wc.state.stashes.len();
     let renames = renames(ctx, &st);
+    let bisect = crate::bisect::BisectState::load(&ctx.wc.root)?;
     if ctx.json {
         print_json(&Report {
             base: ctx.wc.state.base.map(|b| b.to_string()),
@@ -124,6 +137,13 @@ pub fn run(ctx: &Ctx) -> Result<i32> {
             picking: ctx.wc.state.pick_in_progress.as_ref().map(|p| Picking {
                 from: p.from.to_string(),
                 operation: if p.revert { "revert" } else { "cherry-pick" },
+            }),
+            bisecting: bisect.map(|b| Bisecting {
+                bad: b.bad,
+                good: b.good,
+                skip: b.skip,
+                original_base: b.original_base,
+                original_ref: b.original_ref,
             }),
             on_target: rel.as_ref().map(|r| matches!(r, Relation::OnTarget)),
             ahead: match rel {
@@ -170,6 +190,20 @@ pub fn run(ctx: &Ctx) -> Result<i32> {
         outln!(
             "{ing} {} (fix the conflicts, then `leep commit`; `leep {what} --abort` cancels)",
             short(p.from)
+        );
+    }
+    if let Some(b) = &bisect {
+        outln!(
+            "bisecting: {}, {} good, {} skipped (`leep bisect reset` returns to {} on {})",
+            b.bad
+                .map_or("no bad changeset yet".to_string(), |id| format!(
+                    "bad {}",
+                    short(id)
+                )),
+            b.good.len(),
+            b.skip.len(),
+            short(b.original_base),
+            b.original_ref
         );
     }
     if stashes > 0 {

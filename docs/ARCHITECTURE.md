@@ -780,6 +780,18 @@ and, for a merge, the second parent; `--abort` removes what the operation
 added and resets hard. `MergeResponse::Conflicts` carries `clean` so the client
 has the cleanly merged paths; the CLI checks that a server reported them.
 
+**Bisect.** `leep bisect` needs no endpoint of its own. Its marks live in
+`.leep/bisect.json` (`bisect.rs`), apart from `state.json`, and each step
+recomputes the candidates (ancestors of the bad changeset minus ancestors of
+the good ones) from paged summary logs, which list ancestors newest first by
+generation: the bad changeset's log is read until no parent of a candidate is
+left unseen, and each good changeset's log in step, down to the generation
+reached, to tell which parents it contains. The walk is iterative and capped
+(100,000 candidates, 1,000,000 entries read). The next candidate is the one
+with git's bisection weight (the most even split of the set by what it has
+in its history), and it is checked out with `materialize`. `commit`, `land`
+and the other history-making commands refuse while the file exists.
+
 **Ref log and undo** ([ADR 0018](adr/0018-ref-log.md)). Every successful ref
 create, move or delete appends a row to `ref_log` in the same transaction (or
 under the same lock, in memory) as the conditional update, so a ref never

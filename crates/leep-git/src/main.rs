@@ -465,6 +465,9 @@ async fn run(cmd: Cmd) -> Result<()> {
             if let Some(h) = r.head {
                 outln!("head {h}");
             }
+            if let Some(w) = r.submodule_warning() {
+                eprint!("{w}");
+            }
             // Indexes are usually derived right after an import, from
             // statistics that predate it (ADR 0042). The import itself is
             // done, so a failure only warns.

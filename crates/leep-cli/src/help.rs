@@ -61,6 +61,7 @@ Examples:
   leep log -n 5
   leep log main --path src/parser.rs
   leep log --follow src/new_name.rs     # across renames
+  leep log --oneline --graph -n 50      # with the commit graph
   leep log --agent-model M --author alice
   leep --json log -n 1                  # full ids and changesets";
 
@@ -71,6 +72,18 @@ Examples:
   leep show @                           # the working copy base
   leep show main~2                      # two first parents back
   leep show @^2                         # the base's second parent (a merge)";
+
+pub const BISECT: &str = "\
+Examples:
+  leep bisect start main v1.2           # bad, then good; checks out the middle
+  leep bisect good                      # the checked-out changeset works
+  leep bisect bad                       # it shows the bug
+  leep bisect skip                      # it cannot be tested
+  leep bisect start @ main~20 && leep bisect run cargo test -p parser
+  leep bisect log
+  leep bisect reset                     # back to where the bisect started
+`bisect run` reads the command's exit status like git: 0 good, 125 skip,
+1 to 127 bad, 128 or more (or a signal) stops the bisect.";
 
 pub const SEARCH: &str = "\
 Examples:
@@ -144,6 +157,7 @@ pub const GROUPS: &[(&str, &[&str])] = &[
         &[
             "log",
             "show",
+            "bisect",
             "cat",
             "blame",
             "last-change",
@@ -277,8 +291,8 @@ mod tests {
     #[test]
     fn examples_parse() {
         let all = [
-            INIT, CHECKOUT, STATUS, DIFF, COMMIT, LAND, SYNC, BRANCH, SWITCH, LOG, SHOW, SEARCH,
-            BLAME, UNDO, REVIEW, CONFIG,
+            INIT, CHECKOUT, STATUS, DIFF, COMMIT, LAND, SYNC, BRANCH, SWITCH, LOG, SHOW, BISECT,
+            SEARCH, BLAME, UNDO, REVIEW, CONFIG,
         ];
         let mut checked = 0;
         for text in all {

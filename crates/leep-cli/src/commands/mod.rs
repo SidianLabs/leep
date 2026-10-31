@@ -1,6 +1,7 @@
 //! One module per command family. Commands return the process exit code.
 
 pub mod amend;
+pub mod bisect;
 pub mod branch;
 pub mod checkout;
 pub mod commit;
@@ -64,6 +65,21 @@ impl Ctx {
                  or `{abort}`",
                 crate::fmt::short(p.from)
             )));
+        }
+        Ok(())
+    }
+
+    /// Refuse to record or move history while a bisect has the working copy
+    /// on a candidate: a commit there would be made on an old changeset.
+    pub fn refuse_bisecting(&self) -> Result<()> {
+        if crate::bisect::in_progress(&self.wc.root) {
+            return Err(CliError::user(
+                "a bisect is in progress and the working copy is on one of its candidates; \
+                 `leep bisect reset` ends it",
+            )
+            .with_hint(
+                "`leep bisect reset` returns to the base and target ref the bisect started at",
+            ));
         }
         Ok(())
     }

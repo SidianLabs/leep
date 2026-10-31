@@ -1332,6 +1332,26 @@ every JSON error body (`ErrorResponse`, `AmbiguousPrefixResponse`) gains
 server coordinating the ref. Success bodies are unchanged. Clients that send
 nothing see only the new header and field.
 
+## Bisect state (new client file, no server change)
+
+`leep bisect` keeps its state in a new file, `.leep/bisect.json`, present
+only while a bisect is in progress and removed by `leep bisect reset`. It is
+not an API and is never sent to the server; `.leep/state.json` is unchanged,
+so an older CLI ignores the bisect (and does not refuse `commit` during one).
+It is a JSON object:
+
+| Key | Type | Meaning |
+|---|---|---|
+| `original_base` | changeset id | The base when the bisect started; `reset` checks it out again. |
+| `original_ref` | string | The target ref when the bisect started; `reset` restores it. |
+| `bad` | changeset id, optional | The bad changeset; absent until one is marked. |
+| `good` | array of changeset ids | Good changesets, in marking order. |
+| `skip` | array of changeset ids | Skipped changesets. |
+| `log` | array of `{op, id, subject}` | Every mark, oldest first, for `bisect log`: `op` is `bad`, `good`, `skip` or `first_bad` (the answer, logged once found), `subject` the first line of the changeset's message. |
+
+Every key but `original_base` and `original_ref` may be absent and defaults
+to empty, so later CLIs can add keys the same way.
+
 ## Author settings (optional client config field, no server change)
 
 The CLI's `.leep/config.json` (the working copy's settings: `server`,

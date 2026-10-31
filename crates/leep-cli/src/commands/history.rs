@@ -11,6 +11,7 @@ use super::{print_json, Remote};
 use crate::client::LogQuery;
 use crate::error::{CliError, Result};
 use crate::fmt::{rename_line, short, utc_time};
+use crate::graph::{self, Graph};
 use crate::term::{self, Style};
 
 #[derive(Args, Debug)]
@@ -58,6 +59,14 @@ pub struct LogArgs {
     /// `agent.*` metadata), which `--json` prints.
     #[arg(long)]
     pub oneline: bool,
+    /// Draw the commit graph left of the entries. Not with filters, which
+    /// leave out the changesets that connect the shown ones; ignored with
+    /// `--json`.
+    #[arg(
+        long,
+        conflicts_with_all = ["path", "follow", "author", "agent", "agent_model", "agent_session", "extra"]
+    )]
+    pub graph: bool,
 }
 
 impl LogArgs {
@@ -220,8 +229,16 @@ pub fn log(r: &Remote, args: &LogArgs) -> Result<i32> {
             print_json(&resp)?;
             return Ok(0);
         }
+        let mut graph = args.graph.then(Graph::new);
         for info in &resp.entries {
-            out.push_str(&oneline(info));
+            let line = oneline(info);
+            match &mut graph {
+                Some(g) => out.push_str(&graph::render(
+                    &g.next(&info.id, &info.parents),
+                    &[line.trim_end_matches('\n')],
+                )),
+                None => out.push_str(&line),
+            }
         }
         term::page(&out, false)?;
         return Ok(0);
@@ -232,9 +249,22 @@ pub fn log(r: &Remote, args: &LogArgs) -> Result<i32> {
         print_json(&resp)?;
         return Ok(0);
     }
+    let mut graph = args.graph.then(Graph::new);
     for info in &resp.entries {
-        out.push_str(&header(info, true));
-        out.push('\n');
+        let text = header(info, true);
+        match &mut graph {
+            Some(g) => {
+                let lines: Vec<&str> = text.lines().chain([""]).collect();
+                out.push_str(&graph::render(
+                    &g.next(&info.id, &info.changeset.parents),
+                    &lines,
+                ));
+            }
+            None => {
+                out.push_str(&text);
+                out.push('\n');
+            }
+        }
     }
     term::page(&out, false)?;
     Ok(0)
@@ -263,11 +293,19 @@ pub fn show(r: &Remote, args: &ShowArgs) -> Result<i32> {
         print_json(&info)?;
         return Ok(0);
     }
+    term::page(&show_text(r, &info)?, false)?;
+    Ok(0)
+}
+
+/// What `leep show` prints for `info`: parents, header, signers and the
+/// changed paths.
+pub(crate) fn show_text(r: &Remote, info: &ChangesetInfo) -> Result<String> {
+    let id = info.id;
     let mut out = String::new();
     for p in &info.changeset.parents {
         out.push_str(&format!("parent {p}\n"));
     }
-    out.push_str(&header(&info, false));
+    out.push_str(&header(info, false));
     // Older servers lack the endpoint; a changeset is still worth showing.
     if let Ok(sigs) = r.client.signatures(&id) {
         for line in signature_lines(&sigs) {
@@ -285,8 +323,7 @@ pub fn show(r: &Remote, args: &ShowArgs) -> Result<i32> {
         };
         out.push_str(&format!("{} {}\n", term::letter(letter), e.path));
     }
-    term::page(&out, false)?;
-    Ok(0)
+    Ok(out)
 }
 
 /// `Signed-by` lines for `leep show`, one per trusted signer.
@@ -518,6 +555,7 @@ mod tests {
             extra: vec![],
             after: None,
             oneline: false,
+            graph: false,
         }
     }
 

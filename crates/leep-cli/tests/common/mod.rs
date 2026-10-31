@@ -1014,8 +1014,34 @@ fn record(d: &mut Data, path: &str, raw: &Option<String>) {
         .push((path.to_string(), raw.clone().unwrap_or_default()));
 }
 
-/// Newest-first first-parent log honoring repeated `extra` (`k:v` or `k`)
-/// and `author`, like the real server.
+/// Generations of `from` and all its ancestors, without recursion.
+fn generations(d: &Data, from: ChangesetId) -> HashMap<ChangesetId, u64> {
+    let mut gen: HashMap<ChangesetId, u64> = HashMap::new();
+    let mut stack = vec![from];
+    while let Some(&c) = stack.last() {
+        if gen.contains_key(&c) {
+            stack.pop();
+            continue;
+        }
+        let parents = &d.changesets[&c].parents;
+        let todo: Vec<ChangesetId> = parents
+            .iter()
+            .filter(|p| !gen.contains_key(*p))
+            .copied()
+            .collect();
+        if todo.is_empty() {
+            let g = parents.iter().map(|p| gen[p]).max().unwrap_or(0) + 1;
+            gen.insert(c, g);
+            stack.pop();
+        } else {
+            stack.extend(todo);
+        }
+    }
+    gen
+}
+
+/// Every ancestor, newest first by generation then id, honoring repeated
+/// `extra` (`k:v` or `k`) and `author`, like the real server.
 async fn log(
     State(s): State<Shared>,
     Path(id): Path<String>,
@@ -1023,18 +1049,19 @@ async fn log(
 ) -> Resp<LogResponse> {
     let mut d = s.lock().unwrap();
     record(&mut d, "log", &raw);
-    let mut cur: Option<ChangesetId> = Some(
-        id.parse()
-            .map_err(|_| err(StatusCode::BAD_REQUEST, "bad id"))?,
-    );
+    let id: ChangesetId = id
+        .parse()
+        .map_err(|_| err(StatusCode::BAD_REQUEST, "bad id"))?;
+    if !d.changesets.contains_key(&id) {
+        return Err(err(StatusCode::NOT_FOUND, "no such changeset"));
+    }
+    let gen = generations(&d, id);
+    let mut order: Vec<(u64, ChangesetId)> = gen.iter().map(|(c, g)| (*g, *c)).collect();
+    order.sort_unstable_by(|a, b| b.cmp(a));
     let q = pairs(&raw);
     let mut entries = Vec::new();
-    while let Some(c) = cur {
-        let cs = d
-            .changesets
-            .get(&c)
-            .ok_or_else(|| err(StatusCode::NOT_FOUND, "no such changeset"))?
-            .clone();
+    for (generation, c) in order {
+        let cs = d.changesets[&c].clone();
         let ok = q.iter().all(|(k, v)| match k.as_str() {
             "author" => cs.author.to_lowercase().contains(&v.to_lowercase()),
             "extra" => match v.split_once(':') {
@@ -1043,12 +1070,11 @@ async fn log(
             },
             _ => true,
         });
-        cur = cs.parents.first().copied();
         if ok {
             let follow = q.iter().any(|(k, v)| k == "follow" && v == "true");
             entries.push(ChangesetInfo {
                 id: c,
-                generation: 0,
+                generation,
                 root_tree: Hash::of_blob(b""),
                 changeset: cs,
                 path_at: follow

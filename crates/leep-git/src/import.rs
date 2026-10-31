@@ -49,8 +49,51 @@ pub struct ImportReport {
     pub commits_imported: usize,
     pub commits_skipped: usize,
     pub blobs_uploaded: usize,
+    /// Gitlinks added or changed, counted once per commit that did.
     pub submodules_skipped: usize,
+    /// Distinct paths of those gitlinks, sorted; at most
+    /// [`SUBMODULE_PATHS_KEPT`], the first seen in import order.
+    pub submodule_paths: Vec<String>,
+    /// Distinct gitlink paths beyond [`SUBMODULE_PATHS_KEPT`].
+    pub submodule_paths_omitted: usize,
     pub head: Option<ChangesetId>,
+}
+
+/// How many submodule paths an [`ImportReport`] lists; a history with more
+/// is unusual, and the warning only has to say where to look.
+pub const SUBMODULE_PATHS_KEPT: usize = 1000;
+
+impl ImportReport {
+    /// What to tell the operator about the submodules an import dropped, or
+    /// `None` if there were none. Leep stores no gitlinks, so an export of
+    /// this history leaves them out and does not reproduce those commits.
+    pub fn submodule_warning(&self) -> Option<String> {
+        let distinct = self.submodule_paths.len() + self.submodule_paths_omitted;
+        if self.submodules_skipped == 0 || distinct == 0 {
+            return None;
+        }
+        let mut out = format!(
+            "warning: {} not imported: Leep does not store git submodules, \
+             so these gitlinks were dropped:\n",
+            if distinct == 1 {
+                "1 submodule path was".to_string()
+            } else {
+                format!("{distinct} submodule paths were")
+            }
+        );
+        for p in &self.submodule_paths {
+            out.push_str(&format!("  {p}\n"));
+        }
+        if self.submodule_paths_omitted > 0 {
+            out.push_str(&format!("  and {} more\n", self.submodule_paths_omitted));
+        }
+        out.push_str(
+            "warning: an export of this history (leep-git export, the git mirror) \
+             will not contain them, so commits that had them will not come out \
+             the same\n",
+        );
+        Some(out)
+    }
 }
 
 /// One git commit, decoded and diffed against its first parent.
@@ -68,7 +111,8 @@ pub(crate) struct Prepared {
     /// Original bytes of the fields above that are not valid UTF-8.
     raw: BTreeMap<&'static str, serde_json::Value>,
     pub(crate) changes: Vec<(String, Option<(FileKind, ObjectId)>)>,
-    pub(crate) submodules: usize,
+    /// Paths of the gitlinks this commit adds or changes, which are dropped.
+    pub(crate) submodules: Vec<String>,
 }
 
 type Entry = (EntryKind, ObjectId);
@@ -109,7 +153,7 @@ fn flatten(
     g: &gix::Repository,
     prefix: &str,
     tree: ObjectId,
-    subs: &mut usize,
+    subs: &mut Vec<String>,
 ) -> Result<Vec<(String, Entry)>> {
     let mut out = Vec::new();
     let mut stack = vec![(prefix.to_string(), tree)];
@@ -117,7 +161,7 @@ fn flatten(
         for (name, (k, oid)) in read_tree(g, t)? {
             match k {
                 EntryKind::Tree => stack.push((join(&p, &name), oid)),
-                EntryKind::Commit => *subs += 1,
+                EntryKind::Commit => subs.push(join(&p, &name)),
                 _ => out.push((join(&p, &name), (k, oid))),
             }
         }
@@ -202,7 +246,7 @@ pub(crate) fn prepare(ts: &gix::ThreadSafeRepository, id: ObjectId) -> Result<Pr
     };
 
     let mut changes = Vec::new();
-    let mut subs = 0usize;
+    let mut subs = Vec::new();
     let mut stack: Vec<(String, Option<ObjectId>, Option<ObjectId>)> =
         vec![(String::new(), old_tree, Some(tree))];
     while let Some((prefix, old, new)) = stack.pop() {
@@ -231,7 +275,7 @@ pub(crate) fn prepare(ts: &gix::ThreadSafeRepository, id: ObjectId) -> Result<Pr
                 continue;
             }
             if let Some(t) = o_tree {
-                let mut ignored = 0;
+                let mut ignored = Vec::new();
                 for (p, _) in flatten(&g, &path, t, &mut ignored)? {
                     changes.push((p, None));
                 }
@@ -242,7 +286,7 @@ pub(crate) fn prepare(ts: &gix::ThreadSafeRepository, id: ObjectId) -> Result<Pr
                 }
             }
             if matches!(n, Some((EntryKind::Commit, _))) {
-                subs += 1;
+                subs.push(path.clone());
             }
             match (n, o) {
                 (Some((k, oid)), _) if file_kind(k).is_some() => {
@@ -468,6 +512,9 @@ pub async fn import(
     let blob_cache: Arc<Mutex<HashMap<ObjectId, (Hash, u64)>>> = Default::default();
     // Commits mapped in this run, so parents need no metadata lookup.
     let mut mapped: HashMap<ObjectId, ChangesetId> = HashMap::new();
+    // Every distinct gitlink path dropped, to count those beyond the report's
+    // list.
+    let mut submodule_paths: HashSet<String> = HashSet::new();
 
     // Decoding, diffing and blob uploads run ahead of the changeset writes,
     // which must stay in parent-first order (`buffered` keeps it). They run
@@ -522,7 +569,16 @@ pub async fn import(
             };
             parents.push(id);
         }
-        report.submodules_skipped += p.submodules;
+        report.submodules_skipped += p.submodules.len();
+        for path in &p.submodules {
+            if submodule_paths.insert(path.clone()) {
+                if report.submodule_paths.len() < SUBMODULE_PATHS_KEPT {
+                    report.submodule_paths.push(path.clone());
+                } else {
+                    report.submodule_paths_omitted += 1;
+                }
+            }
+        }
         let cs = {
             let cache = blob_cache.lock().unwrap();
             changeset_for(oid, p, parents, |blob| {
@@ -573,5 +629,6 @@ pub async fn import(
             }
         }
     }
+    report.submodule_paths.sort();
     Ok(report)
 }
