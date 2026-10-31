@@ -590,11 +590,16 @@ async fn the_write_map_stays_bounded() {
 /// directory, deletes, renames as a delete and an add, no-op modifies, and
 /// stacks on a landed copy of their own. Landed concurrently with the fast
 /// path, and one at a time in the batches' order without it: the same
-/// answers, heads, trees and ref logs.
+/// answers, heads, trees and ref logs, and never an error.
+/// `LEEP_LAND_FAST_SEEDS` sets how many histories (40; 25 for strict).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fast_and_slow_lands_agree_on_random_histories() {
     let (mut hits, mut slow, mut conflicts) = (0, 0, 0);
-    for seed in 1..=40u64 {
+    for seed in 1..=std::env::var("LEEP_LAND_FAST_SEEDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(40u64)
+    {
         let (h, s, c) = differential(seed, false).await;
         hits += h;
         slow += s;
@@ -698,6 +703,7 @@ pub(crate) async fn differential(seed: u64, strict: bool) -> (usize, usize, usiz
             let before = p.slow.meta().get_ref("main").await.unwrap().unwrap();
             let want = outcome(&p.slow.land(cs, "main").await);
             assert_eq!(got[&cs], want, "seed {seed} round {round}: land of {cs}");
+            assert!(!want.starts_with("error"), "seed {seed}: {want}");
             if want.starts_with("Conflicts") {
                 conflicts += 1;
             }
@@ -974,7 +980,11 @@ async fn a_batch_builds_trees_from_the_nodes_it_holds() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_strict_policy_conflicts_exactly_on_same_path_overlaps() {
     let (mut hits, mut conflicts) = (0, 0);
-    for seed in 1..=25u64 {
+    for seed in 1..=std::env::var("LEEP_LAND_FAST_SEEDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(25u64)
+    {
         let (h, _, c) = differential(seed, true).await;
         hits += h;
         conflicts += c;
@@ -1015,4 +1025,48 @@ async fn strict_refs_refuse_what_merge_refs_merge() {
         Some(crate::ConflictPolicy::Strict)
     );
     assert_eq!(crate::ConflictPolicy::parse("rebase"), None);
+}
+
+/// A land that replaces a directory with a file conflicts, instead of
+/// failing with 400, when the ref added files to that directory since the
+/// land's base: deleting the files the land knew of does not empty it.
+#[tokio::test]
+async fn a_file_over_a_directory_the_ref_grew_is_a_conflict() {
+    let p = Pair::new();
+    let base = p.create(&[], &edits(&[("d/x", Some("x\n"))]), "base").await;
+    p.land(base).await;
+    let theirs = p
+        .create(
+            &[base],
+            &edits(&[("d/x", None), ("d", Some("f\n"))]),
+            "theirs",
+        )
+        .await;
+    let ours = p
+        .create(&[base], &edits(&[("d/y", Some("y\n"))]), "ours")
+        .await;
+    p.land(ours).await;
+    let answer = p.land(theirs).await;
+    assert!(answer.starts_with("Conflicts"), "{answer}");
+    assert_eq!(
+        conflict_paths(&answer),
+        BTreeSet::from([RepoPath::new("d").unwrap()])
+    );
+    // Without the new file it lands, a directory swapped for a file.
+    let p = Pair::new();
+    let base = p.create(&[], &edits(&[("d/x", Some("x\n"))]), "base").await;
+    p.land(base).await;
+    let theirs = p
+        .create(
+            &[base],
+            &edits(&[("d/x", None), ("d", Some("f\n"))]),
+            "theirs",
+        )
+        .await;
+    let ours = p
+        .create(&[base], &edits(&[("e", Some("e\n"))]), "ours")
+        .await;
+    p.land(ours).await;
+    let answer = p.land(theirs).await;
+    assert!(answer.contains("rebased: true"), "{answer}");
 }

@@ -154,10 +154,18 @@ impl Repo {
             prefix.push_str(comp);
             let entry = self.entry_at(ours, &prefix).await?;
             if prefix == p.as_str() {
-                return Ok(matches!(entry, Some(TreeEntry::Dir { .. }))
-                    && !changes
-                        .iter()
-                        .any(|(k, c)| k.is_within(p.as_str()) && matches!(c, FileChange::Delete)));
+                let Some(TreeEntry::Dir { tree }) = entry else {
+                    return Ok(false);
+                };
+                // The file fits only if every file `ours` has below `p` goes:
+                // `ours` may have added some there since the base.
+                let below = self.diff_trees(TreeNode::empty_hash(), tree, "").await?;
+                return Ok(below.iter().any(|e| {
+                    let path = format!("{}/{}", p.as_str(), e.path.as_str());
+                    !RepoPath::new(path)
+                        .ok()
+                        .is_some_and(|q| changes.get(&q) == Some(&FileChange::Delete))
+                }));
             }
             match entry {
                 Some(TreeEntry::File { .. }) => {

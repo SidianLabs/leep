@@ -56,6 +56,9 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   Conflict answers are unchanged.
 - **Changed.** A batch builds each copy's tree on the directories the copy
   before it wrote, in memory, and encodes each tree node once.
+- **Fixed.** A land that replaces a directory with a file, onto a ref that
+  added files to that directory since the land's base, failed with 400
+  (`d is a directory`). It is now answered as a conflict on that path.
 - **Added.** `--land-conflicts merge|strict` (`LEEP_LAND_CONFLICTS`) and
   `--strict-land-ref REF` (`LEEP_STRICT_LAND_REFS`). `strict` answers any
   file both the ref and a land changed since the land's base as a conflict,
