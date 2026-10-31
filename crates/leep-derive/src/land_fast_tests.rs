@@ -409,6 +409,12 @@ async fn a_disjoint_land_copies_to_the_slow_paths_bytes() {
     let copy1 = p.fast.get_changeset(copy2.parents[0]).await.unwrap();
     assert!(!copy1.changes.contains_key(&RepoPath::new("lib/a").unwrap()));
     assert_eq!(copy1.changes.len(), 5);
+    // The fast copies carry the rebase link the scan finds retries by.
+    assert_eq!(p.fast.rebased_origin(head).await.unwrap(), Some(s2));
+    assert_eq!(
+        p.fast.rebased_origin(copy2.parents[0]).await.unwrap(),
+        Some(s1)
+    );
     for id in [head, copy2.parents[0]] {
         assert_eq!(
             p.fast.rebased_origin(id).await.unwrap(),
@@ -929,6 +935,9 @@ async fn retries_are_answered_once_with_or_without_land_ids() {
         let keyed = r.land_keyed(c, "main", None, true, Some(id(3))).await;
         assert_eq!(outcome(&plain), outcome(&keyed));
     }
+    // The fast repository copied `b` and `c` without a merge, and found
+    // every retry by the copies' rebase links.
+    assert_eq!(lookups(&p.fast), vec![Lookup::Hit, Lookup::Hit]);
     p.head().await;
     p.assert_same_logs().await;
 }
