@@ -13,7 +13,7 @@ command's options with examples for the common ones.
 |---|---|
 | Work | `init`, `checkout`, `status`, `diff`, `commit`, `amend`, `stash`, `restore`, `resolve`, `reset`, `sync`, `land` |
 | Branches | `branch`, `switch`, `tag`, `merge`, `rebase`, `cherry-pick`, `revert` |
-| History | `log`, `show`, `cat`, `blame`, `last-change`, `search`, `provenance`, `refs`, `reflog` |
+| History | `log`, `show`, `bisect`, `cat`, `blame`, `last-change`, `search`, `provenance`, `refs`, `reflog` |
 | Review | `review` (`approve`, `reject`, `status`, `list`), `reviews` |
 | Admin | `undo`, `keygen`, `config` |
 
@@ -192,6 +192,75 @@ server passes on, still says `ours` and `theirs`, and the `/v1` fields keep
 those names. Detection only looks for a line starting with `<<<<<<< `, so
 files written by older clients with `<<<<<<< ours` still block `commit` and
 `land` until resolved.
+
+## Bisect
+
+`leep bisect` finds the changeset that introduced a bug by binary search,
+with git's commands and semantics:
+
+```sh
+leep bisect start main v1.2     # BAD, then GOOD...; checks out the first candidate
+leep bisect good                # or `bad`, or `skip`: marks the checked-out changeset
+leep bisect bad 2a954d8ef7c7    # any revision, including `main~3` and `@`
+leep bisect run cargo test -p parser
+leep bisect log                 # the marks so far
+leep bisect reset               # back to the base and target ref of `start`
+```
+
+`start` needs a clean working copy and a base. `bad`, `good` and `skip`
+take revisions (default `@`, the checked-out changeset), and a changeset
+has one mark: marking it again replaces the old one. The candidates are the
+ancestors of the bad changeset that are not ancestors of any good one, minus
+the skipped ones, so on merge-heavy history a culprit on a merged branch is
+found, not the merge. Each step checks out the candidate that best halves
+them (git's bisection weight: the most even split between the candidates it
+has in its history and the rest) and prints
+
+```
+Bisecting: 9 revisions left to test after this (roughly 3 steps)
+[<id>] <subject>
+```
+
+When one is left, `bisect` prints `<id> is the first bad changeset` and its
+`leep show` summary; the working copy stays where it is until `reset`. If
+only skipped changesets are left, it prints `There are only 'skip'ped
+changesets left to test.`, `The first bad changeset could be any of:` and
+their ids, and exits 1. Marks that leave no candidate (a bad changeset in the
+history of a good one) are refused and not recorded.
+
+`bisect run CMD [ARGS...]` runs the command in the current directory on each
+candidate and marks it by the exit status, like git: 0 good, 125 skip, 1 to
+127 bad; 128 or more, a signal, or a command that cannot start stops the
+bisect with exit 1 and keeps the marks. With `--json` the command's stdout
+goes to stderr, so stdout holds one document.
+
+While a bisect is in progress, `status` says so (`--json`: `bisecting`, with
+`bad`, `good`, `skip`, `original_base` and `original_ref`), and `commit`,
+`amend`, `land`, `merge`, `rebase`, `cherry-pick`, `revert` and `sync`
+refuse with a pointer to `leep bisect reset`. `checkout` and `switch` still
+work; `reset` returns to where the bisect started either way. A step refuses
+edits to tracked files, which the next checkout would overwrite; untracked
+files (build output) may stay.
+
+`--json` prints, for every step, `status` (`waiting`, `testing`, `found` or
+`only_skipped`) with `bad`, `good` and `skip`, plus `current`, `remaining`
+and `steps` when testing, `first_bad` (the changeset as `leep --json show`
+prints it) when found, and `candidates` when only skipped ones are left.
+`bisect run` prints one such document at the end, with `runs`: each tested
+`id`, its `exit_code` and the `result`. `bisect reset` prints the `base`,
+`target_ref`, `written` and `removed`; `bisect log` the marks as `entries`.
+
+Each step reads the logs of the bad and good changesets from the server
+(`GET /v1/log/{id}?fields=summary`, newest first by generation, in pages
+that start at 128 entries and double). The bad changeset's log is read only
+until every parent of a candidate has been seen, and each good changeset's
+log only down to the oldest generation reached, so a step costs about as many
+entries as there are candidates, plus one `GET /v1/changesets/{id}` per good
+changeset and for the chosen one. Nothing but the marks is kept between
+steps (`.leep/bisect.json`; see [FORMATS.md](FORMATS.md)). A step refuses
+more than 100,000 candidates or 1,000,000 log entries read; mark a newer good
+changeset. Up to 2,048 candidates every one is weighed exactly; above that,
+the 256 nearest the middle of the generation order.
 
 ## Exit codes
 

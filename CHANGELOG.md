@@ -7,6 +7,24 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 ## [Unreleased]
 
+### `leep bisect`
+- **Added.** `leep bisect start [BAD [GOOD...]]`, `bad`, `good`, `skip`,
+  `reset`, `log` and `run CMD [ARGS...]` find the changeset that introduced
+  a bug by binary search, as `git bisect` does: the candidates are the
+  ancestors of the bad changeset that no good one has, so a culprit on a
+  merged branch is found rather than the merge, and each step checks out the
+  candidate that best halves them (`Bisecting: N revisions left to test after
+  this (roughly K steps)`), ending with `<id> is the first bad changeset` and
+  its `show` summary. `run` reads exit statuses like git (0 good, 125 skip,
+  1 to 127 bad, 128 or more stops). Revisions take everything other commands
+  take, including `main~3` and `@`; `--json` prints each step as a document.
+  The state is a new file, `.leep/bisect.json`; while it exists `status`
+  reports the bisect and `commit`, `land` and the other history-making
+  commands refuse with a pointer to `leep bisect reset`, which returns to the
+  base and target ref the bisect started at. Each step reads only the part of
+  the logs it needs, and refuses more than 100,000 candidates. See
+  docs/CLI.md, "Bisect".
+
 ### Blame follows renames and merged branches
 - **Fixed.** `blame` credited every line of a moved file to the changeset
   that moved it, and every line merged from a branch to the merge. It now

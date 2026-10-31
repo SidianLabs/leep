@@ -263,11 +263,19 @@ pub fn show(r: &Remote, args: &ShowArgs) -> Result<i32> {
         print_json(&info)?;
         return Ok(0);
     }
+    term::page(&show_text(r, &info)?, false)?;
+    Ok(0)
+}
+
+/// What `leep show` prints for `info`: parents, header, signers and the
+/// changed paths.
+pub(crate) fn show_text(r: &Remote, info: &ChangesetInfo) -> Result<String> {
+    let id = info.id;
     let mut out = String::new();
     for p in &info.changeset.parents {
         out.push_str(&format!("parent {p}\n"));
     }
-    out.push_str(&header(&info, false));
+    out.push_str(&header(info, false));
     // Older servers lack the endpoint; a changeset is still worth showing.
     if let Ok(sigs) = r.client.signatures(&id) {
         for line in signature_lines(&sigs) {
@@ -285,8 +293,7 @@ pub fn show(r: &Remote, args: &ShowArgs) -> Result<i32> {
         };
         out.push_str(&format!("{} {}\n", term::letter(letter), e.path));
     }
-    term::page(&out, false)?;
-    Ok(0)
+    Ok(out)
 }
 
 /// `Signed-by` lines for `leep show`, one per trusted signer.

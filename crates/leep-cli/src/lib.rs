@@ -7,6 +7,7 @@
 // reader of stdout has gone instead of panicking like `println!`.
 #![warn(clippy::print_stdout)]
 
+pub mod bisect;
 pub mod cache;
 pub mod cli;
 pub mod client;
