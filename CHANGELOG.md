@@ -24,6 +24,14 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   base and target ref the bisect started at. Each step reads only the part of
   the logs it needs, and refuses more than 100,000 candidates. See
   docs/CLI.md, "Bisect".
+### Submodule paths on git import
+- **Changed.** `leep-git import` used to say only `N submodules skipped`.
+  It now also warns on stderr, listing the distinct paths of the gitlinks it
+  dropped (up to 1,000, then `and N more`), that they are not imported and
+  that an export of the history will not contain them. `ImportReport` gains
+  `submodule_paths` and `submodule_paths_omitted`; the stdout summary is
+  unchanged. See docs/DEPLOY.md, "Importing from git".
+
 ### `leep log --graph`
 - **Added.** `leep log --graph` draws the commit graph left of the entries,
   with or without `--oneline`, in the style of `git log --graph`: merges

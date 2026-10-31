@@ -188,7 +188,16 @@ points at them. `--set-ref` only fast-forwards, so import into a fresh
 repository (before anyone lands on `main`) or into a new ref name; a ref that
 already holds other history is refused (`refusing non-fast-forward`). Run it
 again after new git commits: commits already imported are skipped. Policies
-(`--protect-ref`, signatures, review) do not apply to it. For a long history,
+(`--protect-ref`, signatures, review) do not apply to it.
+
+Leep does not store git submodules. An import drops every gitlink (a
+submodule's entry in a tree) and keeps the rest of the commit; it counts
+them on stdout (`N submodules skipped`, one per commit that added or moved
+one) and lists their distinct paths on stderr, up to 1,000 and then
+`and N more`. Those paths are missing from the Leep snapshots, and an
+export (`leep-git export`, the git mirror) will not contain them, so the
+commits that had them do not come out the same; vendor the code or fetch
+it in your build instead. For a long history,
 see
 [OPERATIONS.md](OPERATIONS.md#indexing-a-large-history); to keep a git remote
 in step continuously, use the [git mirror](OPERATIONS.md#git-mirror).
