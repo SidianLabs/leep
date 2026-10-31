@@ -6,6 +6,7 @@
 #![warn(clippy::print_stdout)]
 
 pub mod auth;
+pub mod background_repack;
 pub mod backup;
 pub mod coord;
 pub mod errors;

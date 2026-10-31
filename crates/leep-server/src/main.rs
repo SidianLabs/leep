@@ -296,16 +296,59 @@ struct Args {
     search_pool_permits: Option<CountOrOff>,
     /// Batches a ref's land queue may hold before this server refuses new
     /// lands onto it (ADR 0060), or off. The queue counts the lands waiting
-    /// in batches of 64, rounded up, plus the batch being replayed; a land
-    /// waits about one batch time per batch ahead of it, so this bounds the
-    /// wait. A refused land gets 503 at once with Retry-After and
-    /// `Leep-Refused: admission`, before its changeset is read, and clients
-    /// send it again; queued lands are never dropped. N full batches should
-    /// take about half the clients' land timeout. The default 4 (256 lands)
-    /// is from the E5c swarm with a 30 s timeout (docs/PERFORMANCE.md); set
-    /// off while clients that do not resend a refused land remain.
-    #[arg(long, env = "LEEP_LAND_QUEUE_BATCHES", value_parser = parse_count_or_off, default_value = "4")]
-    land_queue_batches: CountOrOff,
+    /// in batches of --land-max-batch, rounded up, plus the batch being
+    /// replayed; a land waits about one batch time per batch ahead of it,
+    /// so this bounds the wait. A refused land gets 503 at once with
+    /// Retry-After and `Leep-Refused: admission`, before its changeset is
+    /// read, and clients send it again; queued lands are never dropped.
+    /// When given, it replaces --land-queue-seconds (ADR 0068), which bounds
+    /// the same wait in seconds and is the default; the two cannot both be
+    /// given. Set off while clients that do not resend a refused land
+    /// remain.
+    #[arg(long, env = "LEEP_LAND_QUEUE_BATCHES", value_parser = parse_count_or_off)]
+    land_queue_batches: Option<CountOrOff>,
+    /// How long a land may wait in its ref's queue before this server
+    /// refuses new lands onto it (ADR 0068), or off: the batches that fit
+    /// in it at the ref's moving batch time, at least 2. Refused lands are
+    /// answered as with --land-queue-batches. Should be about a sixth of
+    /// the clients' land timeout (30 s by default).
+    #[arg(long, env = "LEEP_LAND_QUEUE_SECONDS", value_parser = parse_duration_or_off)]
+    land_queue_seconds: Option<DurationOrOff>,
+    /// Lands one batch takes at most (ADR 0032, ADR 0068). Larger batches
+    /// commit more lands per ref move and per pack, and make each land wait
+    /// longer behind the batch before it.
+    #[arg(long, env = "LEEP_LAND_MAX_BATCH", default_value_t = leep_derive::MAX_BATCH, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=4096))]
+    land_max_batch: usize,
+    /// Write the new objects of a land batch (and any other batched server
+    /// write of at least --land-pack-min-objects objects) as one pack
+    /// instead of a file or object each (ADR 0068). Filesystem and object
+    /// store blob stores only.
+    #[arg(long, env = "LEEP_LAND_PACKS", value_enum, default_value_t = Switch::On)]
+    land_packs: Switch,
+    /// Fewest new objects written as a pack; fewer are written loose.
+    #[arg(long, env = "LEEP_LAND_PACK_MIN_OBJECTS", default_value_t = leep_store::DEFAULT_PACK_MIN_OBJECTS, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
+    land_pack_min_objects: usize,
+    /// Merge packs in the background as land batches write them (ADR
+    /// 0068), so reads search few. Filesystem and object store blob stores
+    /// only. Off leaves merging to `leep-server repack`.
+    #[arg(long, env = "LEEP_BACKGROUND_REPACK", value_enum, default_value_t = Switch::On)]
+    background_repack: Switch,
+    /// The background repack merges when reads search more packs than
+    /// this.
+    #[arg(long, env = "LEEP_BACKGROUND_REPACK_PACKS", default_value_t = 32, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(2..))]
+    background_repack_packs: usize,
+    /// How long packs the background repack merged stay on disk after the
+    /// merged pack is published, for readers in other processes. Must
+    /// exceed the servers' --request-timeout plus clock skew, like
+    /// `leep-server repack --fence`.
+    #[arg(long, env = "LEEP_BACKGROUND_REPACK_FENCE", default_value = "10m", value_parser = parse_grace)]
+    background_repack_fence: std::time::Duration,
+    /// How often the background repack looks at the pack count.
+    #[arg(long, env = "LEEP_BACKGROUND_REPACK_INTERVAL", default_value = "5s", value_parser = parse_grace)]
+    background_repack_interval: std::time::Duration,
+    /// zstd level of the packs the background repack writes, 1 to 22.
+    #[arg(long, env = "LEEP_BACKGROUND_REPACK_LEVEL", default_value_t = 3, value_parser = clap::value_parser!(i32).range(1..=22))]
+    background_repack_level: i32,
     /// Copy a land onto the ref without a three-way merge when nothing the
     /// ref changed since the land's base touches its paths (ADR 0066). The
     /// answers are the same either way; `off` replays every land in full,
@@ -781,6 +824,42 @@ fn parse_interval(s: &str) -> Result<std::time::Duration, String> {
 enum CountOrOff {
     Off,
     Count(usize),
+}
+
+/// `--land-queue-seconds`: a duration, or no bound.
+#[derive(Clone, Copy, Debug)]
+enum DurationOrOff {
+    Off,
+    For(std::time::Duration),
+}
+
+fn parse_duration_or_off(s: &str) -> Result<DurationOrOff, String> {
+    match s.trim() {
+        "off" => Ok(DurationOrOff::Off),
+        d => match leep_derive::gc::parse_duration(d) {
+            Ok(d) if !d.is_zero() => Ok(DurationOrOff::For(d)),
+            Ok(_) => Err("expected a positive duration, or off; got 0".into()),
+            Err(e) => Err(e.to_string()),
+        },
+    }
+}
+
+/// The default of `--land-queue-seconds` (ADR 0068).
+const DEFAULT_LAND_QUEUE_SECONDS: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The land admission bound the flags ask for: `--land-queue-batches` when
+/// given, else `--land-queue-seconds` (by default 5 s).
+fn land_queue_bound(args: &Args) -> anyhow::Result<Option<leep_derive::LandQueueBound>> {
+    use leep_derive::LandQueueBound;
+    Ok(match (args.land_queue_batches, args.land_queue_seconds) {
+        (Some(_), Some(_)) => anyhow::bail!(
+            "--land-queue-batches and --land-queue-seconds bound the same queue; give one"
+        ),
+        (Some(CountOrOff::Off), None) | (None, Some(DurationOrOff::Off)) => None,
+        (Some(CountOrOff::Count(n)), None) => Some(LandQueueBound::Batches(n)),
+        (None, Some(DurationOrOff::For(d))) => Some(LandQueueBound::Seconds(d)),
+        (None, None) => Some(LandQueueBound::Seconds(DEFAULT_LAND_QUEUE_SECONDS)),
+    })
 }
 
 fn parse_count_or_off(s: &str) -> Result<CountOrOff, String> {
@@ -1624,7 +1703,7 @@ async fn run() -> anyhow::Result<()> {
     log_config(&config.current());
     ensure_local_dirs(&args.meta, &args.blobs)?;
 
-    let mut blobs = leep_store::open_blob_store(&args.blobs).context("opening blob store")?;
+    let (mut blobs, pack_store) = open_server_blobs(&args)?;
     if args.cache_bytes > 0 {
         blobs =
             Arc::new(CachedBlobStore::new(ArcBlobs(blobs), args.cache_bytes)) as Arc<dyn BlobStore>;
@@ -1654,10 +1733,12 @@ async fn run() -> anyhow::Result<()> {
         repo = repo.with_derive_jobs(jobs as usize);
     }
     repo = repo.with_search_pool_permits(search_pool);
-    repo = repo.with_land_queue_batches(match args.land_queue_batches {
-        CountOrOff::Off => None,
-        CountOrOff::Count(n) => Some(n),
-    });
+    repo = match land_queue_bound(&args)? {
+        Some(leep_derive::LandQueueBound::Batches(n)) => repo.with_land_queue_batches(Some(n)),
+        Some(leep_derive::LandQueueBound::Seconds(d)) => repo.with_land_queue_seconds(Some(d)),
+        None => repo.with_land_queue_batches(None),
+    };
+    repo = repo.with_land_max_batch(args.land_max_batch);
     repo = repo
         .with_land_fast_path(args.land_fast_path == Switch::On)
         .with_land_conflicts(land_conflicts(&args));
@@ -1713,6 +1794,37 @@ async fn run() -> anyhow::Result<()> {
     if let Some(w) = warm {
         w.spawn(args.warm_interval);
     }
+    match (args.background_repack, pack_store) {
+        (Switch::On, Some(store)) => {
+            let opts = leep_server::background_repack::BackgroundRepackOptions {
+                interval: args.background_repack_interval,
+                trigger_packs: args.background_repack_packs,
+                fence: args.background_repack_fence,
+                level: args.background_repack_level,
+                ..Default::default()
+            };
+            if !args.request_timeout.is_zero() && opts.fence <= args.request_timeout {
+                tracing::warn!(
+                    fence_s = opts.fence.as_secs_f64(),
+                    request_timeout_s = args.request_timeout.as_secs_f64(),
+                    "--background-repack-fence does not exceed --request-timeout: \
+                     a read in another process may miss a merged pack's objects"
+                );
+            }
+            tracing::info!(
+                trigger_packs = opts.trigger_packs,
+                fence_s = opts.fence.as_secs_f64(),
+                level = opts.level,
+                "merging packs in the background (ADR 0068)"
+            );
+            leep_server::background_repack::BackgroundRepack::new(store, repo.clone(), opts)
+                .spawn();
+        }
+        (Switch::On, None) => {
+            tracing::info!("background repack off: the blob store keeps no packs")
+        }
+        (Switch::Off, _) => tracing::info!("background repack off (--background-repack off)"),
+    }
     let coordination = match args.land_coordination {
         Coordination::Off => None,
         Coordination::On => Some(land_coordination(&args, repo.meta().clone())?),
@@ -1729,8 +1841,9 @@ async fn run() -> anyhow::Result<()> {
     tracing::info!(
         read_concurrency = %read_concurrency.describe(),
         search_pool_permits = ?search_pool,
-        land_queue_batches = ?repo.land_queue_batches(),
-        "expensive read and land admission limits (ADR 0060)"
+        land_queue = ?repo.land_queue_bound(),
+        land_max_batch = repo.land_max_batch(),
+        "expensive read and land admission limits (ADR 0060, ADR 0068)"
     );
     tracing::info!(
         land_fast_path = repo.land_fast_path(),
@@ -1972,6 +2085,39 @@ fn log_config(c: &RuntimeConfig) {
     }
 }
 
+/// The server's blob store, with pack writes as the flags ask (ADR 0068),
+/// and the same store as a [`PackStore`] for the background repack when it
+/// keeps packs.
+fn open_server_blobs(
+    args: &Args,
+) -> anyhow::Result<(
+    Arc<dyn BlobStore>,
+    Option<leep_server::background_repack::PackStore>,
+)> {
+    use leep_server::background_repack::PackStore;
+    let writes = match args.land_packs {
+        Switch::On => leep_store::PackWrites {
+            min_objects: args.land_pack_min_objects,
+            ..Default::default()
+        },
+        Switch::Off => leep_store::PackWrites::off(),
+    };
+    if args.blobs != "mem://" && args.blobs != "mem:" {
+        if let Some(store) =
+            leep_store::open_object_blob_store(&args.blobs).context("opening blob store")?
+        {
+            let store = store.with_pack_writes(writes);
+            return Ok((Arc::new(store.clone()), Some(PackStore::Object(store))));
+        }
+        if let Some(root) = leep_store::fs_blob_root(&args.blobs) {
+            let store = leep_store::FsBlobStore::new(root).with_pack_writes(writes);
+            return Ok((Arc::new(store.clone()), Some(PackStore::Fs(store))));
+        }
+    }
+    let blobs = leep_store::open_blob_store(&args.blobs).context("opening blob store")?;
+    Ok((blobs, None))
+}
+
 /// Lets the cache wrap an already-boxed store.
 struct ArcBlobs(Arc<dyn BlobStore>);
 
@@ -1983,6 +2129,12 @@ impl BlobStore for ArcBlobs {
         data: bytes::Bytes,
     ) -> leep_core::Result<()> {
         self.0.put_with_hash(hash, data).await
+    }
+    async fn put_many(
+        &self,
+        items: Vec<(leep_core::Hash, bytes::Bytes)>,
+    ) -> leep_core::Result<Vec<leep_core::Hash>> {
+        self.0.put_many(items).await
     }
     async fn get(&self, hash: &leep_core::Hash) -> leep_core::Result<Option<bytes::Bytes>> {
         self.0.get(hash).await
@@ -2165,11 +2317,62 @@ mod tests {
 
     /// Admission is on by default (ADR 0060, E5c); `off` still turns it off.
     #[test]
-    fn land_queue_batches_defaults_to_four() {
+    fn land_queue_defaults_to_five_seconds() {
+        use leep_derive::LandQueueBound;
         let a = parse_args(["leep-server"]).unwrap();
-        assert!(matches!(a.land_queue_batches, CountOrOff::Count(4)));
+        assert!(a.land_queue_batches.is_none());
+        assert_eq!(
+            land_queue_bound(&a).unwrap(),
+            Some(LandQueueBound::Seconds(Duration::from_secs(5)))
+        );
+        assert_eq!(a.land_max_batch, 64);
         let a = parse_args(["leep-server", "--land-queue-batches", "off"]).unwrap();
-        assert!(matches!(a.land_queue_batches, CountOrOff::Off));
+        assert!(matches!(a.land_queue_batches, Some(CountOrOff::Off)));
+        assert_eq!(land_queue_bound(&a).unwrap(), None);
+        // The batch count still works, and replaces the seconds.
+        let a = parse_args(["leep-server", "--land-queue-batches", "4"]).unwrap();
+        assert_eq!(
+            land_queue_bound(&a).unwrap(),
+            Some(LandQueueBound::Batches(4))
+        );
+        let a = parse_args(["leep-server", "--land-queue-seconds", "12s"]).unwrap();
+        assert_eq!(
+            land_queue_bound(&a).unwrap(),
+            Some(LandQueueBound::Seconds(Duration::from_secs(12)))
+        );
+        let a = parse_args(["leep-server", "--land-queue-seconds", "off"]).unwrap();
+        assert_eq!(land_queue_bound(&a).unwrap(), None);
+        let a = parse_args([
+            "leep-server",
+            "--land-queue-seconds",
+            "3s",
+            "--land-queue-batches",
+            "4",
+        ])
+        .unwrap();
+        assert!(land_queue_bound(&a).is_err(), "one bound or the other");
+        assert!(parse_args(["leep-server", "--land-queue-seconds", "0s"]).is_err());
+        let a = parse_args(["leep-server", "--land-max-batch", "256"]).unwrap();
+        assert_eq!(a.land_max_batch, 256);
+        assert!(parse_args(["leep-server", "--land-max-batch", "0"]).is_err());
+    }
+
+    #[test]
+    fn pack_flags_default_on() {
+        let a = parse_args(["leep-server"]).unwrap();
+        assert!(a.land_packs == Switch::On && a.background_repack == Switch::On);
+        assert_eq!(a.land_pack_min_objects, 16);
+        assert_eq!(a.background_repack_packs, 32);
+        assert_eq!(a.background_repack_fence, Duration::from_secs(600));
+        let a = parse_args([
+            "leep-server",
+            "--land-packs",
+            "off",
+            "--background-repack",
+            "off",
+        ])
+        .unwrap();
+        assert!(a.land_packs == Switch::Off && a.background_repack == Switch::Off);
     }
 
     #[test]
