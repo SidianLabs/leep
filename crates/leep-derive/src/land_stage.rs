@@ -4,12 +4,14 @@
 //! round of fsyncs and a transaction per land.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use leep_core::store::{BlobMeta, DerivedRow, RefLogEntry, RefUpdateContext};
-use leep_core::{BlobStore, Changeset, ChangesetId, Error, Hash, MetaStore, Result};
+use leep_core::{BlobStore, Changeset, ChangesetId, Error, Hash, MetaStore, Result, TreeNode};
 
 use crate::derived::{DerivedKind, Generation, RootTree};
 use crate::gc::BLOB_CONDEMNED;
@@ -26,6 +28,40 @@ pub(crate) const FLUSH_WRITES_IN_FLIGHT: usize = 256;
 #[derive(Default)]
 pub(crate) struct Staging {
     inner: Mutex<Staged>,
+    memo: Arc<NodeMemo>,
+}
+
+/// The decoded tree nodes of one batch attempt, by hash, and the time its
+/// replays spent building trees. A node's hash names its content, so a
+/// node kept here is the stored one; the memo lives as long as the
+/// attempt's staging and holds what its replays touched, a few directories
+/// per land.
+#[derive(Default)]
+pub(crate) struct NodeMemo {
+    nodes: Mutex<HashMap<Hash, TreeNode>>,
+    tree_nanos: AtomicU64,
+}
+
+impl NodeMemo {
+    pub(crate) fn get(&self, hash: &Hash) -> Option<TreeNode> {
+        self.nodes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(hash)
+            .cloned()
+    }
+
+    pub(crate) fn insert(&self, hash: Hash, node: TreeNode) {
+        self.nodes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(hash, node);
+    }
+
+    pub(crate) fn add_tree_time(&self, took: Duration) {
+        self.tree_nanos
+            .fetch_add(took.as_nanos() as u64, Ordering::Relaxed);
+    }
 }
 
 #[derive(Default)]
@@ -99,7 +135,13 @@ impl Staging {
         // A rescue must be durable before its doom read; the batch makes
         // its own, uncached, before it moves the ref (ADR 0059).
         staged.rescues_on_write = false;
+        staged.node_memo = Some(Arc::clone(&self.memo));
         staged
+    }
+
+    /// Time the attempt's replays spent building trees so far.
+    pub(crate) fn tree_time(&self) -> Duration {
+        Duration::from_nanos(self.memo.tree_nanos.load(Ordering::Relaxed))
     }
 
     /// Read the changesets a batch lands and the root trees of them and of

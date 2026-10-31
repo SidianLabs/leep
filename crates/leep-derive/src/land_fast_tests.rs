@@ -845,3 +845,44 @@ async fn retries_are_answered_once_with_or_without_land_ids() {
     p.head().await;
     p.assert_same_logs().await;
 }
+
+/// A batch attempt builds each land's tree on the nodes the land before it
+/// wrote, from memory: the same root as building from the stores, and the
+/// nodes it wrote are served decoded without a read.
+#[tokio::test]
+async fn a_batch_builds_trees_from_the_nodes_it_holds() {
+    let r = plain_repo();
+    let base = create(
+        &r,
+        &[],
+        &edits(&[("a/b/c", Some("1\n")), ("d", Some("d\n"))]),
+        "base",
+    )
+    .await;
+    let staging = Arc::new(crate::land_stage::Staging::default());
+    let staged = staging.repo(&r);
+    let tree = r.root_tree(base).await.unwrap();
+    let mut changes = BTreeMap::new();
+    changes.insert(
+        RepoPath::new("a/b/e").unwrap(),
+        FileChange::Modify {
+            content: r.put_blob(Bytes::from_static(b"e\n")).await.unwrap(),
+            kind: FileKind::Regular,
+            size: 2,
+        },
+    );
+    let built = crate::tree_ops::apply_changes(&staged, tree, &changes)
+        .await
+        .unwrap();
+    let want = crate::tree_ops::apply_changes(&r, tree, &changes)
+        .await
+        .unwrap();
+    assert_eq!(built, want);
+    let memo = staged.node_memo.as_ref().unwrap();
+    let root = memo.get(&built).expect("the new root is held decoded");
+    assert_eq!(root.hash(), built);
+    assert_eq!(staged.read_tree(built).await.unwrap(), root);
+    assert!(staging.tree_time() > std::time::Duration::ZERO);
+    // A plain repository holds nothing between calls.
+    assert!(r.node_memo.is_none());
+}

@@ -91,6 +91,19 @@ pub(crate) async fn apply_changes(
     base: Hash,
     changes: &BTreeMap<RepoPath, FileChange>,
 ) -> Result<Hash> {
+    let started = std::time::Instant::now();
+    let tree = apply_changes_inner(repo, base, changes).await;
+    if let Some(m) = &repo.node_memo {
+        m.add_tree_time(started.elapsed());
+    }
+    tree
+}
+
+async fn apply_changes_inner(
+    repo: &Repo,
+    base: Hash,
+    changes: &BTreeMap<RepoPath, FileChange>,
+) -> Result<Hash> {
     if changes.is_empty() {
         if base == TreeNode::empty_hash() {
             let empty = TreeNode::default();
@@ -160,16 +173,14 @@ pub(crate) async fn apply_changes(
         if node.entries.is_empty() {
             parent.entries.remove(name);
         } else {
-            let h = node.hash();
-            rewritten.push((h, Bytes::from(node.encode())));
+            let h = store_node(repo, node, &mut rewritten);
             parent
                 .entries
                 .insert(name.to_string(), TreeEntry::Dir { tree: h });
         }
     }
     let root = nodes.remove("").expect("root");
-    let h = root.hash();
-    rewritten.push((h, Bytes::from(root.encode())));
+    let h = store_node(repo, root, &mut rewritten);
     let mut named: Vec<Hash> = changes
         .values()
         .filter_map(|c| match c {
@@ -181,6 +192,18 @@ pub(crate) async fn apply_changes(
     named.dedup();
     repo.put_rescuing_many(rewritten, &named).await?;
     Ok(h)
+}
+
+/// Encode `node` once for its hash and its bytes, queue it for writing, and
+/// keep it decoded for the rest of a land batch attempt.
+fn store_node(repo: &Repo, node: TreeNode, rewritten: &mut Vec<(Hash, Bytes)>) -> Hash {
+    let bytes = node.encode();
+    let h = Hash::of_object(TreeNode::KIND, &bytes);
+    rewritten.push((h, Bytes::from(bytes)));
+    if let Some(m) = &repo.node_memo {
+        m.insert(h, node);
+    }
+    h
 }
 
 /// Drop loaded directories that became empty (deepest first).

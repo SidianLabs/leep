@@ -142,6 +142,11 @@ pub struct Repo {
     /// (ADR 0059). Off for a land batch's staged handle, whose batch rescues
     /// before it moves the ref.
     pub(crate) rescues_on_write: bool,
+    /// Decoded tree nodes a land batch attempt read or wrote (ADR 0066):
+    /// its replays build each land's tree on the one before, so they find
+    /// the nodes they rewrite in memory instead of reading and decoding
+    /// them again. `None` outside a staged batch.
+    pub(crate) node_memo: Option<Arc<crate::land_stage::NodeMemo>>,
     /// Permits for the metadata reads of a search's directory opens, shared
     /// by every search through this handle and its clones; `None` leaves
     /// them unbounded. See [`Repo::with_search_pool_permits`].
@@ -566,6 +571,7 @@ impl Repo {
             write_guard: None,
             fence_flag: Arc::default(),
             rescues_on_write: true,
+            node_memo: None,
             search_pool: None,
             search_flights: Arc::default(),
         }
@@ -1214,6 +1220,17 @@ impl Repo {
 
     /// Read one tree node. The empty tree always exists.
     pub async fn read_tree(&self, tree: Hash) -> Result<TreeNode> {
+        if let Some(n) = self.node_memo.as_ref().and_then(|m| m.get(&tree)) {
+            return Ok(n);
+        }
+        let node = self.read_tree_stored(tree).await?;
+        if let Some(m) = &self.node_memo {
+            m.insert(tree, node.clone());
+        }
+        Ok(node)
+    }
+
+    async fn read_tree_stored(&self, tree: Hash) -> Result<TreeNode> {
         match self.blobs.get(&tree).await? {
             // A node's address is the hash of its bytes, so damage is
             // detectable. GC marks from these nodes: reading a damaged one as
@@ -1235,7 +1252,21 @@ impl Repo {
         let mut distinct = trees.to_vec();
         distinct.sort_unstable();
         distinct.dedup();
-        let found = self.blobs.get_many(&distinct).await?;
+        let mut nodes = HashMap::with_capacity(distinct.len());
+        if let Some(m) = &self.node_memo {
+            distinct.retain(|t| match m.get(t) {
+                Some(n) => {
+                    nodes.insert(*t, n);
+                    false
+                }
+                None => true,
+            });
+        }
+        let found = if distinct.is_empty() {
+            Vec::new()
+        } else {
+            self.blobs.get_many(&distinct).await?
+        };
         if found.len() != distinct.len() {
             return Err(Error::Storage(format!(
                 "get_many answered {} of {} tree nodes",
@@ -1247,7 +1278,6 @@ impl Repo {
         for t in trees {
             *uses.entry(*t).or_default() += 1;
         }
-        let mut nodes = HashMap::with_capacity(distinct.len());
         for (tree, bytes) in distinct.into_iter().zip(found) {
             let node = match bytes {
                 Some(b) if Hash::of_object(TreeNode::KIND, &b) != tree => {
@@ -1257,6 +1287,9 @@ impl Repo {
                 None if tree == TreeNode::empty_hash() => TreeNode::default(),
                 None => return Err(Error::NotFound(format!("tree {tree}"))),
             };
+            if let Some(m) = &self.node_memo {
+                m.insert(tree, node.clone());
+            }
             nodes.insert(tree, node);
         }
         let mut out = Vec::with_capacity(trees.len());

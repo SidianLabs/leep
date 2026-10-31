@@ -1009,6 +1009,7 @@ impl Repo {
             let mut steps: Vec<RefStep> = Vec::new();
             let mut waiting: Vec<(InFlight, Result<Step>)> = Vec::new();
             let mut taken = Vec::new();
+            let replaying = Instant::now();
             for mut l in std::mem::take(&mut lands) {
                 if attempt == 1 && l.q.reply.is_closed() {
                     metrics::counter!("leep_land_cancelled_total").increment(1);
@@ -1085,6 +1086,12 @@ impl Repo {
                     Err(e) if steps.is_empty() => l.answer(Err(e), attempt, false),
                     other => waiting.push((l, other)),
                 }
+            }
+            if !taken.is_empty() {
+                metrics::histogram!("leep_land_batch_replay_seconds")
+                    .record(replaying.elapsed().as_secs_f64());
+                metrics::histogram!("leep_land_batch_tree_seconds")
+                    .record(staging.tree_time().as_secs_f64());
             }
             if attempt == 1 && !taken.is_empty() {
                 metrics::histogram!("leep_land_batch_size").record(taken.len() as f64);
