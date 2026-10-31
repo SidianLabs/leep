@@ -1201,7 +1201,10 @@ async fn blame_resumes_from_a_cached_older_blame() {
         tip = commit(&r, &[tip], &[(&format!("o{i}"), Some("x\n"))], "other").await;
     }
     for cached_at in [tips[3], tips[60], tips[98]] {
-        r.meta().delete_derived_kind("blame").await.unwrap();
+        r.meta()
+            .delete_derived_kind(crate::blame::KIND)
+            .await
+            .unwrap();
         r.blame(cached_at, &rp("f")).await.unwrap();
         let (full, _) = r.blame_walk(tip, &rp("f"), false, false).await.unwrap();
         let (with_cache, _) = r.blame_walk(tip, &rp("f"), true, true).await.unwrap();
@@ -1856,7 +1859,7 @@ async fn blame_cache_written_before_summaries_still_decodes() {
     key.extend_from_slice(b"f");
     r.meta()
         .put_derived(
-            "blame",
+            crate::blame::KIND,
             &Hash::of_object("blame", &key),
             Bytes::from(postcard::to_stdvec(&legacy).unwrap()),
         )

@@ -205,7 +205,7 @@ way.
 | `blob-claim-v1` / `blob-condemned-v1` / `blob-rescue-v1` / `blob-doom-v1` | per blob hash, 8-byte big-endian unix seconds (doom adds a state byte); GC bookkeeping, not derived from changesets: claims by uploads and dedup checks, condemnation by `gc condemn`, rescue by uploads of a condemned blob, doom by `gc collect` (ADR 0012) | blob garbage collection and the server's missing-blob checks |
 | `history-tree-v4` | the changeset's history pack (ADR 0045): the nodes of a tree parallel to `root_tree` recording for each path (including deleted ones) the newest changesets that changed it, as written by this changeset's derivation, and the address of its root. A pack is cut into parts of about 16 KB; this value is part 0 and `history-node-v4` rows hold the rest. Nodes are addressed by (writer, part, index) and name changesets through a table per part, so the hundreds of nodes a merge rewrites name its few dozen ids once; nodes of more than 64 entries are stored as content-defined chunks so an edit rewrites one chunk (ADR 0027), and a changed node, chunk or chunk list is stored as a patch on an earlier whole version that names the entries it replaces by position (ADR 0037). Built from the first parent's tree plus the spines of changed paths, and at merges the paths where the second parent's history differs from the merge base's (another parent's from the first's, for octopus or unrelated merges) (ADR 0013) | path log, `last-change` |
 | `log-filter-v1` | per changeset at first-parent depth `d`: for each level `j ≤ tz(d)`, the 64-bit fingerprints of the authors, `extra` keys and `agent.model`/`agent.session` values of everything reachable from it but not from its first-parent ancestor `2^j` up (side branches included); lower-cased author names by fingerprint in `log-filter-name-v1` (ADR 0047) | `log` with `author`/`extra` filters and no path |
-| `blame` | per (changeset, path), keyed `Hash::of_object("blame", id‖path)` | blame |
+| `blame-v2` | per (changeset, path), keyed `Hash::of_object("blame", id‖path)`: the postcard `(path, lines)` of a complete blame, following renames and merged branches (ADR 0065; the retired `blame` followed first parents only) | blame |
 | `cs-condemned-v1` / `cs-rescue-v1` / `cs-doom-v1` / `gc-fence-active-v1` | per changeset id (the flag: one row), the encodings of their `blob-*-v1` counterparts; the fence of changeset GC (ADR 0059): rescues by every writer that names a condemned changeset; condemnation, doom and the flag by the sweep (ADR 0059 phase 2) | changeset garbage collection, and the rescue checks of creates, lands, ref moves, rebases, merges, attestations and mirror maps |
 | `cs-tombstone-v1` | per deleted changeset id: deletion time and root tree hash, written before the delete; dropped after `--tombstone-retention` (ADR 0059 section 11) | `gc --full --backup-fence`, and the sweep's tombstone pass |
 | `cs-reach-v1` | per changeset id, one byte: "a ref or ref log entry reaches it, and every parent has a row"; written parents first, plus a progress row at the zero key (ADR 0059 section 4) | the changeset sweep's incremental reachability mark |
@@ -245,7 +245,8 @@ ancestors. It finds that part (stopping at a budget) and runs on a handle
 that knows it: the path walk examines an un-indexed changeset the way
 `log_scan` does and queues its parents, then settles its queue so the page's
 `next` is the indexed walk's; last-change computes the newest changes bottom
-up over the part; blame walks un-indexed first-parent steps one by one;
+up over the part; blame walks un-indexed first-parent steps one by one
+(a merged branch's down to its newest indexed first-parent ancestor);
 the filtered log scans the part; search computes missing trigram rows in
 memory. A request over the budget gets `Error::Indexing` (503) with
 `Leep-Indexing: retry`, an answer at the newest indexed first-parent
@@ -310,9 +311,37 @@ node rows (96 MiB by default; all of `Repo`'s derive caches scale with
 `leep-server --derive-cache-bytes`), so derivation does not re-read the chunks of the root and other
 hot directories for every changeset.
 
-**Blame.** Blame follows first parents and credits each line to the
-changeset whose diff against its first parent inserted it; the result is
-cached under `blame` for the changeset and for the newest changer. The walk
+**Blame** ([ADR 0065](adr/0065-blame-across-renames-and-merges.md)). Blame
+credits each line to the changeset that wrote it, as `git blame` does: a
+changed version of the file passes each line its first parent's version
+keeps (by a line diff) to that version, then each line still unexplained
+that another parent's version holds unchanged to that one, parents in order,
+and keeps the rest. A version whose path is new relative to its first parent
+continues under the file it was renamed from there (detected as for
+`log --follow`, whole files only), unless a merge took it from another
+parent. The result is cached under `blame-v2` for the changeset and for the
+newest changer.
+
+The history is found by first-parent walks, described below. The walk
+from the blamed changeset finds the changers on its chain; at each merge
+among them that changed the file (told apart by `last_merge-v1`), every
+other parent with a version different from the first parent's starts
+another walk, as does the rename source of a creation. Each such walk stops
+at the first changer an earlier walk found (or at a cached blame), so a
+side branch costs its own changes plus a step into the main line, and the
+walks together form a graph of versions. Walks start oldest first, 16 at
+once, and at most 1,024 per blame; past that, or (for a bounded blame,
+ADR 0058) when a branch's un-indexed steps exceed what
+`--blame-scan-budget` leaves after the blamed changeset's chain, the newest
+merges not yet followed keep the lines they brought in and the answer is
+not cached. The complete blame at each walk's start is cached, and a walk
+whose start has one is not started, so a repeated request goes further. The graph is replayed oldest first by generation, a version kept
+only until the versions made from it are replayed. A version that is not
+UTF-8 fails the blame when it is on the blamed file's first-parent line, as
+before, and is not followed from a merge or rename otherwise.
+
+**Blame walks.** Each first-parent walk asks the path-history index
+where the next change is. The walk
 asks the path-history index where the next change is: the newest changers'
 largest generation `g` says that no first-parent ancestor above `g` changed
 the file, and skiplists find the lowest one at or above it. Every skiplist
@@ -349,8 +378,9 @@ lies below the file's creation and stops at once. The steps are exactly
 those of one walk, so the answer is too, and a file untouched for most of
 history costs a few reads per stretch rather than any per changeset.
 
-The versions are read 64 (and at most 32 MiB) at a time, each window while
-the one before is diffed on several threads. Each diff is the one
+The versions are read 64 (and at most 32 MiB) at a time, in replay order,
+each window while the one before is diffed on several threads (a merge's
+diffs against its other parents among them). Each diff is the one
 `similar::TextDiff::diff_lines` makes, with each version split into lines
 and its lines numbered once per task rather than twice per diff (Myers
 compares lines only for equality, so the numbers give the same diff), and
@@ -368,7 +398,8 @@ score then path), symlinks exact only. Similarity is skipped, and reported as
 the pairs beside the unchanged `entries` when asked (`renames=true`), the CLI's
 working-copy `diff` and `status` run the same code, and `GET /v1/log` with
 `follow=true` continues a file's path log under its old name by detecting the
-rename at the changeset that created the file.
+rename at the changeset that created the file. Blame continues the same way
+(ADR 0065).
 
 **Provenance queries.** `agent.*` keys in `extra` (see `EXTRA_AGENT_*`) are
 queryable without any new data on changesets. `GET /v1/log` takes `author`
@@ -376,7 +407,7 @@ and repeated `extra=key:value` / `extra=key` filters (ANDed), `GET
 /v1/provenance` counts changesets per agent model and session and per human
 author, and blame responses carry a deduplicated per-changeset summary
 (author, time, first message line, `agent.*` keys). The summaries are
-attached on read, so the cached `blame` value keeps its original encoding.
+attached on read, so the cached blame value keeps its original encoding.
 Provenance scans the newest changesets (capped at 10 000, reporting
 `truncated`); it is an aggregate, so it has no cursor.
 

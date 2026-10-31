@@ -257,7 +257,7 @@ fn print_collect(r: &SweepCollectReport) {
     outln!("collect: fence flag cleared: {}", r.flag_cleared);
     outln!(
         "collect: blame rows of deleted changesets (estimate, leaked until \
-         `repair drop --kind blame`): {}",
+         `repair drop --kind blame-v2`): {}",
         r.blame_rows_of_deleted_estimate
     );
 }

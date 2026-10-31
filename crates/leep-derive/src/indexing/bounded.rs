@@ -77,11 +77,34 @@ pub(crate) struct Bounded {
     pub(crate) search: Option<Arc<SearchScan>>,
     /// Changesets (or files) examined without a row.
     pub(crate) examined: AtomicU64,
+    /// Blame: un-indexed first-parent steps the walks down merged branches
+    /// may take in all (ADR 0065): what `--blame-scan-budget` leaves after
+    /// the head's own chain.
+    pub(crate) side_budget: u64,
+    /// Blame: those steps charged so far.
+    pub(crate) side_spent: AtomicU64,
+    /// Blame: the handle of the blame a merged branch's walk belongs to,
+    /// which its examined steps are counted into as well.
+    pub(crate) count_into: Option<Arc<Bounded>>,
 }
 
 impl Bounded {
     pub(crate) fn examined(&self, n: u64) {
         self.examined.fetch_add(n, Ordering::Relaxed);
+        if let Some(b) = &self.count_into {
+            b.examined(n);
+        }
+    }
+
+    /// Charge `steps` to the side budget; false (charging nothing) if they
+    /// do not fit.
+    pub(crate) fn charge_side(&self, steps: u64) -> bool {
+        self.side_spent
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |spent| {
+                let total = spent.checked_add(steps)?;
+                (total <= self.side_budget).then_some(total)
+            })
+            .is_ok()
     }
 }
 
@@ -401,6 +424,7 @@ impl Repo {
                 }
                 Ok(Some(Bounded {
                     floor: Some(found.map_or(0, |e| e.generation)),
+                    side_budget: (budgets.blame as u64).saturating_sub(steps),
                     ..Default::default()
                 }))
             }

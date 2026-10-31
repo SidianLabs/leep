@@ -191,9 +191,9 @@ async fn agree(r: &Repo, tip: ChangesetId, path: &str, span: u64, cache: bool) -
 }
 
 /// Many short stretches give the reference walk's answer over histories with
-/// edits, reverts, deletes and re-creations, renames (blame does not follow
-/// them), binary versions, and merges that bring a side branch's version of
-/// a file, delete it or keep the first parent's.
+/// edits, reverts, deletes and re-creations, renames, binary versions, and
+/// merges that bring a side branch's version of a file, delete it or keep
+/// the first parent's.
 #[tokio::test]
 async fn stretches_agree_with_a_full_walk() {
     let text = |tag: usize| -> String { (0..6).map(|i| format!("line {i} v{tag}\n")).collect() };
@@ -315,7 +315,10 @@ async fn stretches_agree_with_a_full_walk() {
         // With cached blames at some earlier changesets, the walk stops at
         // the newest cached changer, in whichever stretch it lies.
         for round in 0..6 {
-            r.meta().delete_derived_kind("blame").await.unwrap();
+            r.meta()
+                .delete_derived_kind(crate::blame::KIND)
+                .await
+                .unwrap();
             for _ in 0..1 + round {
                 let at = all[rng.below(all.len())];
                 for n in names {
@@ -573,7 +576,10 @@ async fn failed_reads_fail_the_blame() {
             Err(e) => panic!("unexpected error {e:?}"),
         }
         meta.fail_every.store(0, Ordering::Relaxed);
-        r.meta().delete_derived_kind("blame").await.unwrap();
+        r.meta()
+            .delete_derived_kind(crate::blame::KIND)
+            .await
+            .unwrap();
     }
     assert!(failed > 0, "no failure was injected");
     let cold = Repo::new(r.blobs().clone(), meta.clone());
@@ -697,4 +703,543 @@ async fn blame_of_versions_with_every_line_end_is_consistent() {
             );
         }
     }
+}
+
+/// Who blame credits each line of `path` at `tip` with, as (text,
+/// changeset), the same from the reference walk, the walk in stretches and
+/// a cached `blame`; and every line's `origin_line` names that line in the
+/// crediting changeset's version of the file, under some name.
+async fn credits(r: &Repo, tip: ChangesetId, path: &str) -> Vec<(String, ChangesetId)> {
+    let (full, _) = r.blame_walk(tip, &rp(path), false, false).await.unwrap();
+    let (fast, _) = r.blame_walk(tip, &rp(path), true, false).await.unwrap();
+    assert_eq!(full, fast, "{path} at {tip}");
+    let b = r.blame(tip, &rp(path)).await.unwrap();
+    assert_eq!(b.lines, full.1, "{path} at {tip}, cached");
+    assert_eq!(r.blame(tip, &rp(path)).await.unwrap().lines, full.1);
+    for l in &full.1 {
+        let files = r.list_files(l.changeset, "").await.unwrap();
+        let mut found = false;
+        for f in files {
+            let Some((_, d)) = r.read_file(l.changeset, &f.path).await.unwrap() else {
+                continue;
+            };
+            let text = String::from_utf8_lossy(&d).into_owned();
+            if text.split('\n').nth(l.origin_line as usize - 1) == Some(l.text.as_str()) {
+                found = true;
+            }
+        }
+        assert!(found, "{l:?}: no file of {} has it there", l.changeset);
+    }
+    full.1.into_iter().map(|l| (l.text, l.changeset)).collect()
+}
+
+fn numbered(n: usize, tag: &str) -> String {
+    (1..=n).map(|i| format!("{tag} line {i}\n")).collect()
+}
+
+/// A file renamed whole, exactly or with some lines dropped (similar enough
+/// for `log --follow`), keeps the credit of the changesets that wrote its
+/// lines under the old name; the rename itself is credited with nothing.
+#[tokio::test]
+async fn blame_follows_a_file_across_a_rename() {
+    for drop_lines in [0usize, 3] {
+        let r = Repo::new(
+            Arc::new(MemoryBlobStore::new()),
+            Arc::new(MemoryMetaStore::new()),
+        );
+        let first = numbered(10, "c1");
+        let c0 = commit(&r, &[], &[("other", Some("x\n"))]).await;
+        let c1 = commit(&r, &[c0], &[("src/old.rs", Some(&first))]).await;
+        let second = format!("{first}c2 line a\nc2 line b\n");
+        let c2 = commit(&r, &[c1], &[("src/old.rs", Some(&second))]).await;
+        let mut lines: Vec<&str> = second.split_inclusive('\n').collect();
+        for _ in 0..drop_lines {
+            lines.remove(4);
+        }
+        let moved = lines.concat();
+        let c3 = commit(
+            &r,
+            &[c2],
+            &[("src/old.rs", None), ("crates/core/new.rs", Some(&moved))],
+        )
+        .await;
+        let fourth = moved.replace("c1 line 2\n", "c4 line 2\n");
+        let c4 = commit(&r, &[c3], &[("crates/core/new.rs", Some(&fourth))]).await;
+        let got = credits(&r, c4, "crates/core/new.rs").await;
+        let by: Vec<ChangesetId> = got.iter().map(|(_, c)| *c).collect();
+        assert!(!by.contains(&c3), "dropping {drop_lines}: {got:?}");
+        for (text, c) in &got {
+            let want = match &text[..2] {
+                "c1" => c1,
+                "c2" => c2,
+                "c4" => c4,
+                _ => unreachable!(),
+            };
+            assert_eq!(*c, want, "dropping {drop_lines}: {text}");
+        }
+        assert_eq!(got.len(), 12 - drop_lines);
+    }
+}
+
+/// A merge credits a line it took unchanged from its second parent to the
+/// side branch's changeset that wrote it, a line from its first parent to
+/// the main line's, and only lines it wrote itself (a conflict resolution)
+/// to the merge. A file created on a side branch and merged in is credited
+/// to the side branch too.
+#[tokio::test]
+async fn blame_credits_lines_merged_from_a_side_branch() {
+    let r = Repo::new(
+        Arc::new(MemoryBlobStore::new()),
+        Arc::new(MemoryMetaStore::new()),
+    );
+    let base = commit(&r, &[], &[("f", Some("a\nb\nc\n"))]).await;
+    let side = commit(
+        &r,
+        &[base],
+        &[("f", Some("a\nside\nb\nc\n")), ("new", Some("s1\ns2\n"))],
+    )
+    .await;
+    let side2 = commit(&r, &[side], &[("other", Some("o\n"))]).await;
+    let main = commit(&r, &[base], &[("f", Some("a\nb\nc\nmain\n"))]).await;
+    let merge = commit(
+        &r,
+        &[main, side2],
+        &[
+            ("f", Some("a\nside\nb\nc\nmain\n")),
+            ("new", Some("s1\ns2\n")),
+        ],
+    )
+    .await;
+    let got = credits(&r, merge, "f").await;
+    let want = [
+        ("a", base),
+        ("side", side),
+        ("b", base),
+        ("c", base),
+        ("main", main),
+    ];
+    let want: Vec<(String, ChangesetId)> = want.iter().map(|(t, c)| (t.to_string(), *c)).collect();
+    assert_eq!(got, want);
+    let got = credits(&r, merge, "new").await;
+    assert_eq!(got, [("s1".to_string(), side), ("s2".to_string(), side)]);
+
+    // A resolution written in the merge is the merge's; the rest is not.
+    let resolved = commit(
+        &r,
+        &[main, side2],
+        &[("f", Some("a\nside\nb\nresolved\nc\nmain\n"))],
+    )
+    .await;
+    let got = credits(&r, resolved, "f").await;
+    let want = [
+        ("a", base),
+        ("side", side),
+        ("b", base),
+        ("resolved", resolved),
+        ("c", base),
+        ("main", main),
+    ];
+    let want: Vec<(String, ChangesetId)> = want.iter().map(|(t, c)| (t.to_string(), *c)).collect();
+    assert_eq!(got, want);
+
+    // Later main-line changes on top keep the side's credit, and a line the
+    // side branch and the main line both wrote is the first parent's.
+    let both = commit(&r, &[main], &[("f", Some("a\nb\nc\nmain\nboth\n"))]).await;
+    let side3 = commit(&r, &[side2], &[("f", Some("a\nside\nb\nc\nboth\n"))]).await;
+    let merge2 = commit(
+        &r,
+        &[both, side3],
+        &[("f", Some("a\nside\nb\nc\nmain\nboth\n"))],
+    )
+    .await;
+    let tip = commit(
+        &r,
+        &[merge2],
+        &[("f", Some("top\na\nside\nb\nc\nmain\nboth\n"))],
+    )
+    .await;
+    let got = credits(&r, tip, "f").await;
+    let want = [
+        ("top", tip),
+        ("a", base),
+        ("side", side),
+        ("b", base),
+        ("c", base),
+        ("main", main),
+        ("both", both),
+    ];
+    let want: Vec<(String, ChangesetId)> = want.iter().map(|(t, c)| (t.to_string(), *c)).collect();
+    assert_eq!(got, want);
+}
+
+/// Blame by the definition, over every changeset of a history oldest first
+/// (`order`), for every file: a version the same as its first parent's has
+/// its blame; otherwise its lines take the credit of the first parent's
+/// version (or, for a path new there and not merged in from another parent,
+/// of the file it was renamed from there) where a diff keeps them, then of each other parent's differing version in
+/// order, and the rest are its own.
+async fn reference_blames(
+    r: &Repo,
+    order: &[ChangesetId],
+) -> BTreeMap<(ChangesetId, String), Vec<(ChangesetId, u32)>> {
+    use leep_core::rename::RenameOptions;
+    use similar::DiffTag;
+    type Blames = BTreeMap<(ChangesetId, String), Vec<(ChangesetId, u32)>>;
+    async fn text(r: &Repo, c: ChangesetId, p: &str) -> Option<String> {
+        r.read_file(c, &rp(p))
+            .await
+            .unwrap()
+            .map(|(_, d)| String::from_utf8(d.to_vec()).unwrap())
+    }
+    async fn ops(old: &str, new: &str) -> crate::blame::Ops {
+        let (mut ops, _) = crate::blame::diff_versions(vec![old.to_string(), new.to_string()])
+            .await
+            .unwrap();
+        ops.remove(0)
+    }
+    let mut out: Blames = BTreeMap::new();
+    for &c in order {
+        let parents = r.get_changeset(c).await.unwrap().parents;
+        for f in r.list_files(c, "").await.unwrap() {
+            let p = f.path.as_str().to_string();
+            let own = text(r, c, &p).await.unwrap();
+            let p1 = parents.first().copied();
+            let mut base: Option<(String, Vec<(ChangesetId, u32)>)> = None;
+            if let Some(p1) = p1 {
+                match text(r, p1, &p).await {
+                    Some(t) if t == own => {
+                        let b = out[&(p1, p.clone())].clone();
+                        out.insert((c, p), b);
+                        continue;
+                    }
+                    Some(t) => base = Some((t, out[&(p1, p.clone())].clone())),
+                    None => {
+                        // A merge that took the file from another parent is
+                        // not searched for a rename.
+                        let mut merged_in = false;
+                        for &pk in parents.iter().skip(1) {
+                            merged_in |= text(r, pk, &p).await.is_some();
+                        }
+                        let found = match merged_in {
+                            true => Vec::new(),
+                            false => {
+                                let entries = r.diff(Some(p1), c, "").await.unwrap();
+                                r.detect_renames(&entries, &RenameOptions::default())
+                                    .await
+                                    .unwrap()
+                                    .renames
+                            }
+                        };
+                        if let Some(rn) = found.iter().find(|rn| rn.to == f.path) {
+                            let from = rn.from.as_str().to_string();
+                            let t = text(r, p1, &from).await.unwrap();
+                            base = Some((t, out[&(p1, from)].clone()));
+                        }
+                    }
+                }
+            }
+            let n = crate::blame::split_lines(&own).count();
+            let mut lines: Vec<Option<(ChangesetId, u32)>> = vec![None; n];
+            if let Some((t, b)) = &base {
+                for (tag, old, new) in ops(t, &own).await {
+                    if tag == DiffTag::Equal {
+                        for (o, l) in old.zip(new) {
+                            lines[l] = Some(b[o]);
+                        }
+                    }
+                }
+            }
+            for &pk in parents.iter().skip(1) {
+                let Some(t) = text(r, pk, &p).await else {
+                    continue;
+                };
+                if base.as_ref().is_some_and(|(b, _)| *b == t) {
+                    continue;
+                }
+                let b = &out[&(pk, p.clone())];
+                for (tag, old, new) in ops(&t, &own).await {
+                    if tag == DiffTag::Equal {
+                        for (o, l) in old.zip(new) {
+                            if lines[l].is_none() {
+                                lines[l] = Some(b[o]);
+                            }
+                        }
+                    }
+                }
+            }
+            let lines = lines
+                .into_iter()
+                .enumerate()
+                .map(|(l, x)| x.unwrap_or((c, l as u32 + 1)))
+                .collect();
+            out.insert((c, p), lines);
+        }
+    }
+    out
+}
+
+/// Over random histories of edits, deletes, renames (exact and similar),
+/// side branches merged back with a mix of both sides' lines, files created
+/// on a side branch, and octopus merges, blame of every file at many
+/// changesets is the definition's (`reference_blames`), from the reference
+/// walk, from short stretches, and with blames cached at random changesets.
+#[tokio::test]
+async fn blame_matches_the_definition_across_merges_and_renames() {
+    let names = ["a", "b", "dir/c", "dir/sub/d", "e"];
+    for seed in 1..=6u64 {
+        let r = Repo::new(
+            Arc::new(MemoryBlobStore::new()),
+            Arc::new(MemoryMetaStore::new()),
+        );
+        let mut rng = Lcg(seed * 31 + 7);
+        let mut tag = 0usize;
+        let fresh = |rng: &mut Lcg, tag: &mut usize| -> String {
+            *tag += 1;
+            (0..2 + rng.below(6))
+                .map(|i| format!("w{tag} {i}\n"))
+                .collect()
+        };
+        let read = |r: Repo, c: ChangesetId, p: &'static str| async move {
+            r.read_file(c, &rp(p))
+                .await
+                .unwrap()
+                .map(|(_, d)| String::from_utf8(d.to_vec()).unwrap())
+        };
+        let (t0, t1) = (fresh(&mut rng, &mut tag), fresh(&mut rng, &mut tag));
+        let root = commit(&r, &[], &[("a", Some(&t0)), ("dir/c", Some(&t1))]).await;
+        let mut all = vec![root];
+        let mut heads = vec![root];
+        let (mut merges, mut renames) = (0, 0);
+        for _ in 0..120 {
+            let h = rng.below(heads.len());
+            let at = heads[h];
+            let n = names[rng.below(names.len())];
+            let cur = read(r.clone(), at, n).await;
+            let next = match rng.below(12) {
+                0..=4 => {
+                    // Edit: insert, replace or drop a line, or create.
+                    let t = match &cur {
+                        Some(t) => {
+                            let mut lines: Vec<String> =
+                                t.split_inclusive('\n').map(str::to_string).collect();
+                            let i = rng.below(lines.len() + 1);
+                            tag += 1;
+                            match rng.below(3) {
+                                0 if i < lines.len() => lines[i] = format!("x{tag}\n"),
+                                1 if i < lines.len() && lines.len() > 1 => {
+                                    lines.remove(i);
+                                }
+                                _ => lines.insert(i, format!("x{tag}\n")),
+                            }
+                            lines.concat()
+                        }
+                        None => fresh(&mut rng, &mut tag),
+                    };
+                    commit(&r, &[at], &[(n, Some(&t))]).await
+                }
+                5 if cur.is_some() => commit(&r, &[at], &[(n, None)]).await,
+                5 => continue,
+                6 | 7 => {
+                    // Rename to a free name, exactly or with an edit.
+                    let mut to = n;
+                    for _ in 0..8 {
+                        let o = names[rng.below(names.len())];
+                        if read(r.clone(), at, o).await.is_none() {
+                            to = o;
+                        }
+                    }
+                    match &cur {
+                        Some(t) if to != n => {
+                            let mut t = t.clone();
+                            if rng.below(2) == 0 {
+                                tag += 1;
+                                t.push_str(&format!("r{tag}\n"));
+                            }
+                            renames += 1;
+                            commit(&r, &[at], &[(n, None), (to, Some(&t))]).await
+                        }
+                        _ => continue,
+                    }
+                }
+                8 | 9 => {
+                    // Branch off.
+                    heads.push(at);
+                    continue;
+                }
+                _ => {
+                    // Merge another head (or two) into this one.
+                    let others: Vec<ChangesetId> = heads
+                        .iter()
+                        .copied()
+                        .filter(|o| *o != at)
+                        .take(1 + rng.below(2))
+                        .collect();
+                    if others.is_empty() {
+                        continue;
+                    }
+                    let mut parents = vec![at];
+                    parents.extend(&others);
+                    // Mostly a file the branches disagree on.
+                    let mut n = n;
+                    for o in names {
+                        let differ =
+                            read(r.clone(), at, o).await != read(r.clone(), others[0], o).await;
+                        if differ && rng.below(3) > 0 {
+                            n = o;
+                        }
+                    }
+                    let cur = read(r.clone(), at, n).await;
+                    let theirs = read(r.clone(), others[0], n).await;
+                    let t: Option<String> = match (rng.below(4), &cur, &theirs) {
+                        (0, _, _) => theirs.clone(),
+                        (1, Some(a), Some(b)) | (2, Some(a), Some(b)) => {
+                            // Ours, then their lines we lack, maybe with a
+                            // line of the merge's own.
+                            let mut t = a.clone();
+                            for l in b.split_inclusive('\n') {
+                                if !a.split_inclusive('\n').any(|x| x == l) {
+                                    t.push_str(l);
+                                }
+                            }
+                            if rng.below(2) == 0 {
+                                tag += 1;
+                                t.insert_str(0, &format!("m{tag}\n"));
+                            }
+                            Some(t)
+                        }
+                        _ => cur.clone(),
+                    };
+                    let files: Vec<(&str, Option<&str>)> = match (&t, &cur) {
+                        (a, b) if a == b => Vec::new(),
+                        _ => vec![(n, t.as_deref())],
+                    };
+                    let id = commit(&r, &parents, &files).await;
+                    merges += usize::from(!files.is_empty());
+                    heads.retain(|o| !others.contains(o));
+                    let h = heads.iter().position(|o| *o == at).unwrap();
+                    heads[h] = id;
+                    all.push(id);
+                    continue;
+                }
+            };
+            heads[h] = next;
+            all.push(next);
+        }
+        let want = reference_blames(&r, &all).await;
+        let mut compared = 0;
+        let check = |got: &crate::blame::CachedBlame, c: ChangesetId, p: &str| {
+            let lines: Vec<(ChangesetId, u32)> =
+                got.1.iter().map(|l| (l.changeset, l.origin_line)).collect();
+            assert_eq!(lines, want[&(c, p.to_string())], "seed {seed}: {p} at {c}");
+        };
+        for (i, &c) in all.iter().enumerate() {
+            if i % 3 != 0 && !heads.contains(&c) {
+                continue;
+            }
+            for f in r.list_files(c, "").await.unwrap() {
+                let p = f.path.as_str();
+                let (full, _) = r.blame_walk_in(c, &f.path, None, false).await.unwrap();
+                check(&full, c, p);
+                for span in [1, 4] {
+                    let cuts = Cuts {
+                        head: span,
+                        min_span: span as u64,
+                    };
+                    let (fast, _) = r
+                        .blame_walk_in(c, &f.path, Some(cuts), false)
+                        .await
+                        .unwrap();
+                    check(&fast, c, p);
+                }
+                compared += 1;
+            }
+        }
+        assert!(compared > 25, "seed {seed} compared only {compared}");
+        assert!(
+            merges >= 3 && renames >= 2,
+            "seed {seed}: {merges} merges changing a file, {renames} renames"
+        );
+        for round in 0..3 {
+            r.meta()
+                .delete_derived_kind(crate::blame::KIND)
+                .await
+                .unwrap();
+            for _ in 0..3 + round * 4 {
+                let at = all[rng.below(all.len())];
+                for n in names {
+                    let _ = r.blame(at, &rp(n)).await;
+                }
+            }
+            for &h in &heads {
+                for f in r.list_files(h, "").await.unwrap() {
+                    let (got, _) = r.blame_walk(h, &f.path, true, true).await.unwrap();
+                    check(&got, h, f.path.as_str());
+                }
+            }
+        }
+    }
+}
+
+/// A blame that needs more walks below merges than it may start leaves the
+/// merges it did not follow their lines and is not cached, but caches the
+/// complete blames at the starts of the (oldest) walks it did, so each
+/// repeated request starts its walks above them and the answer becomes
+/// complete, and then cached, after a few requests.
+#[tokio::test]
+async fn repeated_blames_past_the_walk_limit_make_progress() {
+    let (r, _) = slow_repo();
+    let mut text = String::from("a\n");
+    let mut main = commit(&r, &[], &[("f", Some(&text)), ("g", Some("0\n"))]).await;
+    for k in 0..12 {
+        let mine = format!("{text}side {k}\n");
+        let side = commit(&r, &[main], &[("f", Some(&mine))]).await;
+        let other = commit(&r, &[main], &[("g", Some(&format!("{k}\n")))]).await;
+        main = commit(&r, &[other, side], &[("f", Some(&mine))]).await;
+        text = mine;
+    }
+    let path = rp("f");
+    let (want, _) = r.blame_walk_in(main, &path, None, false).await.unwrap();
+    let merges: usize = want.1.iter().filter(|l| l.text.starts_with("side")).count();
+    assert_eq!(merges, 12);
+    let cuts = Some(Cuts {
+        head: 32,
+        min_span: 32,
+    });
+    let on_merges = |b: &crate::blame::CachedBlame| {
+        let mut n = 0;
+        for (got, want) in b.1.iter().zip(&want.1) {
+            if got != want {
+                n += 1;
+            }
+        }
+        n
+    };
+    let mut left = usize::MAX;
+    let mut rounds = 0;
+    loop {
+        rounds += 1;
+        assert!(rounds <= 6, "no progress after {rounds} requests");
+        let run = r.blame_run(main, &path, cuts, true, 3).await.unwrap();
+        assert!(run.walks <= 3, "{} walks", run.walks);
+        let stored = r
+            .meta()
+            .get_derived(crate::blame::KIND, &crate::blame::cache_key(main, &path))
+            .await
+            .unwrap();
+        if run.complete {
+            assert_eq!(run.blame, want);
+            assert!(stored.is_some());
+            break;
+        }
+        assert!(stored.is_none(), "an incomplete blame was cached");
+        let wrong = on_merges(&run.blame);
+        assert!(
+            wrong < left,
+            "request {rounds}: {wrong} lines still wrong, {left} before"
+        );
+        left = wrong;
+    }
+    assert_eq!(rounds, 4, "12 merges, 3 walks a request");
+    let again = r.blame_run(main, &path, cuts, true, 3).await.unwrap();
+    assert_eq!((again.walks, again.examined, again.complete), (0, 0, true));
 }

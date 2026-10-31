@@ -102,7 +102,7 @@ async fn upgrade_workflow(meta: Arc<dyn MetaStore>) {
         .unwrap();
     let want = dump(&*meta, CURRENT).await;
     let blame_key = Hash([42; 32]);
-    meta.put_derived("blame", &blame_key, Bytes::from_static(b"kept"))
+    meta.put_derived("blame-v2", &blame_key, Bytes::from_static(b"kept"))
         .await
         .unwrap();
 
@@ -172,7 +172,7 @@ async fn upgrade_workflow(meta: Arc<dyn MetaStore>) {
     assert!(r.after.nothing_to_do(), "{:#?}", r.after);
     assert_eq!(dump(&*meta, CURRENT).await, want);
     assert_eq!(
-        meta.get_derived("blame", &blame_key)
+        meta.get_derived("blame-v2", &blame_key)
             .await
             .unwrap()
             .unwrap(),

@@ -313,7 +313,7 @@ async fn a_healthy_store_verifies_clean_and_verify_writes_nothing() {
         "blob-trigrams-v1",
         "tree-trigrams-v1",
         "history-node-v4",
-        "blame",
+        "blame-v2",
         "signature-v1",
         "review-v1",
         "rebased-origin-v1",
@@ -422,7 +422,7 @@ async fn a_missing_changeset_is_reported_with_the_child_that_needs_it() {
     // Rows that need the lost parent are skipped, not reported wrong. Blame
     // rows that credit the lost changeset really are wrong.
     for p in r.problems.iter().filter(|p| p.code == "derived_mismatch") {
-        assert_eq!(p.kind.as_deref(), Some("blame"), "{:#?}", r.problems);
+        assert_eq!(p.kind.as_deref(), Some("blame-v2"), "{:#?}", r.problems);
     }
     assert!(r.derived["generation"].skipped >= 1);
     let p = only(&r, "stored_parent_missing");
@@ -1303,12 +1303,12 @@ async fn dropping_history_trees_takes_the_nodes_with_them() {
 async fn dry_run_drop_counts_and_deletes_nothing() {
     let w = world().await;
     let before = snapshot(&w).await;
-    let report = drop_kinds(&w.repo, &["generation", "blame"], true, &Quiet)
+    let report = drop_kinds(&w.repo, &["generation", "blame-v2"], true, &Quiet)
         .await
         .unwrap();
     assert!(report.dry_run);
     assert!(report.rows["generation"] >= 8);
-    assert!(report.rows["blame"] >= 3);
+    assert!(report.rows["blame-v2"] >= 3);
     assert_eq!(snapshot(&w).await, before);
 }
 
@@ -1345,7 +1345,7 @@ async fn kinds_history_cannot_regenerate_are_refused() {
         .unwrap_err();
     assert!(err.to_string().contains("review-v1"));
     assert_eq!(snapshot(&w).await, before);
-    for kind in ["history-node-v4", "blame", "signature-v1", "bogus"] {
+    for kind in ["history-node-v4", "blame-v2", "signature-v1", "bogus"] {
         let r = rederive(
             &w.repo,
             &RederiveOptions {

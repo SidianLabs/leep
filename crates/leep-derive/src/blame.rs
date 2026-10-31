@@ -1,6 +1,7 @@
-//! Line-level blame over first-parent history, cached as derived data.
+//! Line-level blame, cached as derived data: first-parent walks, joined at
+//! merges and renames into one graph of file versions (`blame_follow`).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,6 +12,7 @@ use leep_core::{ChangesetId, Error, Hash, RepoPath, Result, TreeEntry};
 use similar::{Algorithm, DiffTag};
 
 use crate::batched_reads::{BatchedBlobs, BatchedMeta};
+use crate::blame_follow::Replayed;
 use crate::derived::{self, DerivedKind, HistoryEntry, RootTree, SkipEntry, Skiplist};
 use crate::history::agent_keys;
 use crate::tree_ops::file_info;
@@ -33,11 +35,11 @@ const CACHE_CHECK_BATCH: usize = 32;
 /// most. With [`CONTENT_BYTES`], bounds the memory held for a file with
 /// thousands of versions: two windows, the one diffed and the one read
 /// ahead.
-const CONTENT_BATCH: usize = 64;
+pub(crate) const CONTENT_BATCH: usize = 64;
 
 /// Bytes of file versions read at once when replaying them, at most (but
 /// one version at a time may be larger).
-const CONTENT_BYTES: u64 = 32 << 20;
+pub(crate) const CONTENT_BYTES: u64 = 32 << 20;
 
 /// Most blocking tasks one window of versions is diffed on.
 const DIFF_TASKS: usize = 8;
@@ -68,12 +70,17 @@ const HEAD_STEPS: usize = 32;
 /// so this bounds memory and tasks rather than store connections.
 const STRETCHES_IN_FLIGHT: usize = 64;
 
-/// What is cached under `blame`. Kept at the original `{path, lines}` shape so
+/// What is cached under [`KIND`]. Kept at the original `{path, lines}` shape so
 /// entries written before changeset summaries existed still decode; summaries
 /// are attached on every read.
 /// A tuple, because postcard encodes it identically to the old struct and
 /// this crate has no serde dependency of its own.
 pub(crate) type CachedBlame = (RepoPath, Vec<BlameLine>);
+
+/// The kind cached blames are stored under. `blame` credited
+/// lines over first parents only; `blame-v2` (ADR 0065) follows renames and
+/// merged branches, so the old rows are retired rather than read.
+pub(crate) const KIND: &str = crate::integrity::kinds::BLAME_KIND;
 
 pub(crate) fn cache_key(id: ChangesetId, path: &RepoPath) -> Hash {
     let mut b = id.0.as_bytes().to_vec();
@@ -91,41 +98,6 @@ pub(crate) fn strip_eol(line: &str) -> &str {
 }
 
 impl Repo {
-    async fn utf8_content(&self, info: &FileInfo) -> Result<String> {
-        let data = self
-            .blobs()
-            .get(&info.content)
-            .await?
-            .ok_or_else(|| Error::Storage(format!("blob {} missing", info.content)))?;
-        String::from_utf8(data.to_vec())
-            .map_err(|_| Error::Invalid(format!("{} is not valid UTF-8", info.path)))
-    }
-
-    /// [`Repo::utf8_content`] of each of `infos`, in order, with one
-    /// `get_many`.
-    async fn utf8_contents(&self, infos: impl Iterator<Item = &FileInfo>) -> Result<Vec<String>> {
-        let infos: Vec<&FileInfo> = infos.collect();
-        let hashes: Vec<Hash> = infos.iter().map(|i| i.content).collect();
-        let found = self.blobs().get_many(&hashes).await?;
-        if found.len() != infos.len() {
-            return Err(Error::Storage(format!(
-                "get_many answered {} of {} blobs",
-                found.len(),
-                infos.len()
-            )));
-        }
-        infos
-            .into_iter()
-            .zip(found)
-            .map(|(info, data)| {
-                let data =
-                    data.ok_or_else(|| Error::Storage(format!("blob {} missing", info.content)))?;
-                String::from_utf8(data.to_vec())
-                    .map_err(|_| Error::Invalid(format!("{} is not valid UTF-8", info.path)))
-            })
-            .collect()
-    }
-
     /// The newest of `changers` (newest first) with a cached blame of
     /// `path`: its position and the blame.
     async fn newest_cached(
@@ -137,7 +109,7 @@ impl Repo {
             return Ok(None);
         }
         let keys: Vec<Hash> = changers.iter().map(|(c, _)| cache_key(*c, path)).collect();
-        let found = self.meta().get_derived_many("blame", &keys).await?;
+        let found = self.meta().get_derived_many(KIND, &keys).await?;
         for (i, v) in found.into_iter().enumerate() {
             if let Some(v) = v {
                 return Ok(Some((i, postcard::from_bytes(&v)?)));
@@ -146,8 +118,9 @@ impl Repo {
         Ok(None)
     }
 
-    /// Attribute each line of `path` at `id` to the changeset that introduced
-    /// it, following first parents, and describe each distinct changeset.
+    /// Attribute each line of `path` at `id` to the changeset that wrote it,
+    /// across renames and through merges (ADR 0065), and describe each
+    /// distinct changeset.
     pub async fn blame(&self, id: ChangesetId, path: &RepoPath) -> Result<BlameResponse> {
         let (path, lines) = self.blame_lines(id, path).await?;
         let mut ids: Vec<ChangesetId> = lines.iter().map(|l| l.changeset).collect();
@@ -253,11 +226,12 @@ impl Repo {
             bottom,
             most,
             mut first_parents,
+            known,
         } = stretch;
         let mut walk = StretchWalk {
             steps: Vec::new(),
-            first_cached: None,
-            cached: None,
+            first_hit: None,
+            hit: None,
             resume: None,
             absent: false,
         };
@@ -325,15 +299,25 @@ impl Repo {
                         .is_none_or(|p| p.content != here.content),
                     Some(_) => unreachable!("a step without a file at its parent ends the walk"),
                 };
-                if changed {
-                    unchecked.push(walk.steps.len());
-                }
+                let i = walk.steps.len();
                 ended = parent.is_none() || parent_info.is_none();
                 walk.steps.push(Step {
                     x,
                     has_parent: parent.is_some(),
                     parent_info,
                 });
+                if changed && known.contains(&x) {
+                    // Another walk of this blame has the file's history
+                    // from here on.
+                    if i > 0 {
+                        walk.hit = Some((i, Hit::Known));
+                        walk.resume = None;
+                        return Ok(walk);
+                    }
+                    walk.first_hit = Some(Hit::Known);
+                } else if changed {
+                    unchecked.push(i);
+                }
                 if ended {
                     break;
                 }
@@ -344,17 +328,17 @@ impl Repo {
                     .iter()
                     .map(|&i| cache_key(walk.steps[i].x, path))
                     .collect();
-                let found = self.meta().get_derived_many("blame", &keys).await?;
+                let found = self.meta().get_derived_many(KIND, &keys).await?;
                 for (i, v) in unchecked.drain(..).zip(found) {
                     let Some(v) = v else {
                         continue;
                     };
                     let blame: CachedBlame = postcard::from_bytes(&v)?;
                     if i == 0 {
-                        walk.first_cached = Some(blame);
+                        walk.first_hit = Some(Hit::Cached(blame));
                     } else {
                         walk.steps.truncate(i + 1);
-                        walk.cached = Some((i, blame));
+                        walk.hit = Some((i, Hit::Cached(blame)));
                         return Ok(walk);
                     }
                 }
@@ -423,6 +407,9 @@ impl Repo {
     /// `cuts.head` steps are walked from `id` while the cuts are planned,
     /// and the stretches are walked only below where those steps stop, if
     /// the walk did not end there.
+    ///
+    /// A changer in `stop_at` ends the walk as a cached blame does: another
+    /// walk of the same blame already has the history below it.
     async fn blame_stretches(
         &self,
         id: ChangesetId,
@@ -430,6 +417,7 @@ impl Repo {
         path: &RepoPath,
         cache: bool,
         cuts: Cuts,
+        stop_at: Arc<HashSet<ChangesetId>>,
     ) -> Result<Found> {
         // Derives the index first if it is missing, with the stores as they
         // are: derivation batches its own reads. A bounded blame (ADR 0058)
@@ -453,6 +441,7 @@ impl Repo {
                     known: BTreeMap::from([(tip_gen, id)]),
                     lists: HashMap::new(),
                 },
+                known: stop_at.clone(),
             },
         );
         let plan = self.plan_stretches(id, tip_gen, cuts.min_span);
@@ -470,7 +459,7 @@ impl Repo {
         };
         let mut found = Found {
             chain: Vec::new(),
-            cached: None,
+            end: End::Start,
             examined: 0,
         };
         let mut cur_info = tip;
@@ -508,6 +497,7 @@ impl Repo {
                     bottom,
                     most: usize::MAX,
                     first_parents: FirstParents { known, lists },
+                    known: stop_at.clone(),
                 }
             })
             .collect();
@@ -656,11 +646,11 @@ impl Repo {
             .collect())
     }
 
-    /// Blame by walking first parents. `skip` jumps over stretches where the
-    /// index says the file did not change, and walks many stretches at once;
-    /// without it every ancestor is read, which tests use as the reference.
-    /// `cache` reads and writes cached blames. Returns the blame and the
-    /// number of changesets examined.
+    /// Blame of `path` at `id`. `skip` jumps over stretches of first parents
+    /// where the index says the file did not change, and walks many
+    /// stretches at once; without it every ancestor is read, which tests use
+    /// as the reference. `cache` reads and writes cached blames. Returns the
+    /// blame and the number of changesets examined.
     pub(crate) async fn blame_walk(
         &self,
         id: ChangesetId,
@@ -684,35 +674,96 @@ impl Repo {
         cuts: Option<Cuts>,
         cache: bool,
     ) -> Result<(CachedBlame, usize)> {
+        let run = self
+            .blame_run(id, path, cuts, cache, crate::blame_follow::FOLLOW_WALKS)
+            .await?;
+        Ok((run.blame, run.examined))
+    }
+
+    /// [`Repo::blame_walk_in`] starting at most `most_walks` walks below
+    /// merges and renames, and what it did.
+    pub(crate) async fn blame_run(
+        &self,
+        id: ChangesetId,
+        path: &RepoPath,
+        cuts: Option<Cuts>,
+        cache: bool,
+        most_walks: usize,
+    ) -> Result<BlameRun> {
         let tip = self
             .lookup_file(id, path)
             .await?
             .ok_or_else(|| Error::NotFound(format!("file {path} at {id}")))?;
         if cache {
-            if let Some(v) = self
-                .meta()
-                .get_derived("blame", &cache_key(id, path))
-                .await?
-            {
-                return Ok((postcard::from_bytes(&v)?, 0));
+            if let Some(v) = self.meta().get_derived(KIND, &cache_key(id, path)).await? {
+                return Ok(BlameRun {
+                    blame: postcard::from_bytes(&v)?,
+                    examined: 0,
+                    walks: 0,
+                    complete: true,
+                });
             }
         }
-        // Walk first parents collecting the changesets that changed the file,
-        // stopping at its creation or at a cached blame.
-        let Found {
-            chain,
-            cached,
+        let graph = self
+            .blame_graph(id, tip, path, cuts, cache, most_walks)
+            .await?;
+        let (examined, walks, latest) = (graph.examined, graph.walks, graph.latest);
+        let (resp, complete) = self.replay_graph(graph, path).await?;
+        let resp = match resp {
+            Replayed::Cached(blame) => {
+                return Ok(BlameRun {
+                    blame,
+                    examined,
+                    walks,
+                    complete,
+                })
+            }
+            Replayed::Fresh(resp) => resp,
+        };
+        // A blame that gave up following some merge or rename is not the
+        // blame of this changeset, so it is not cached (ADR 0065).
+        if cache && complete {
+            let value = Bytes::from(postcard::to_stdvec(&resp)?);
+            for key_id in latest.into_iter().chain([id]) {
+                self.meta()
+                    .put_derived(KIND, &cache_key(key_id, path), value.clone())
+                    .await?;
+            }
+        }
+        Ok(BlameRun {
+            blame: resp,
             examined,
-        } = match cuts {
-            Some(cuts) => self.blame_stretches(id, tip, path, cache, cuts).await?,
+            walks,
+            complete,
+        })
+    }
+
+    /// The changers of `path` down `start`'s first-parent chain, newest
+    /// first, where the file at `start` is `tip`: down to the file's
+    /// creation, a cached blame or a changer in `stop_at`.
+    pub(crate) async fn walk_chain(
+        &self,
+        start: ChangesetId,
+        tip: FileInfo,
+        path: &RepoPath,
+        cuts: Option<Cuts>,
+        cache: bool,
+        stop_at: Arc<HashSet<ChangesetId>>,
+    ) -> Result<Found> {
+        match cuts {
+            Some(cuts) => {
+                self.blame_stretches(start, tip, path, cache, cuts, stop_at)
+                    .await
+            }
             None => {
                 let mut acc = Changers {
                     chain: Vec::new(),
                     checked: 0,
                     cur_info: tip,
-                    cached: None,
+                    end: End::Start,
+                    stop_at,
                 };
-                let (mut cur, mut examined) = (id, 0);
+                let (mut cur, mut examined) = (start, 0);
                 loop {
                     examined += 1;
                     let parent = self.get_changeset(cur).await?.parents.first().copied();
@@ -724,170 +775,102 @@ impl Repo {
                         .step(self, path, cache, cur, parent.is_some(), parent_info)
                         .await?
                     {
-                        break acc.found(examined);
+                        return Ok(acc.found(examined));
                     }
                     cur = parent.expect("a step continues only with a parent");
                 }
             }
-        };
-        let latest = chain.first().map(|(c, _)| *c);
-        // Lines are tracked as (changeset, line in it) while the versions are
-        // replayed, and given their text from the last version at the end:
-        // a line kept by a diff has the same text in both versions, so
-        // copying texts through every version only cost time.
-        let (mut lines, mut old_text): (Vec<(ChangesetId, u32)>, String) = match cached {
-            Some((resp, info)) => {
-                if chain.is_empty() {
-                    return Ok((resp, examined));
-                }
-                let lines = resp
-                    .1
-                    .iter()
-                    .map(|l| (l.changeset, l.origin_line))
-                    .collect();
-                (lines, self.utf8_content(&info).await?)
-            }
-            None => (Vec::new(), String::new()),
-        };
-        let oldest_first: Vec<(ChangesetId, FileInfo)> = chain.into_iter().rev().collect();
-        let mut windows: Vec<&[(ChangesetId, FileInfo)]> = Vec::new();
-        let (mut start, mut bytes) = (0, 0);
-        for (i, (_, info)) in oldest_first.iter().enumerate() {
-            if i > start && (i - start == CONTENT_BATCH || bytes + info.size > CONTENT_BYTES) {
-                windows.push(&oldest_first[start..i]);
-                (start, bytes) = (i, 0);
-            }
-            bytes += info.size;
         }
-        if start < oldest_first.len() {
-            windows.push(&oldest_first[start..]);
-        }
-        let windows = &windows;
-        let read = |k: usize| async move {
-            match windows.get(k) {
-                Some(w) => self.utf8_contents(w.iter().map(|(_, i)| i)).await.map(Some),
-                None => Ok(None),
-            }
-        };
-        // Each window's versions are read while the one before is diffed.
-        let mut next = read(0).await?;
-        for (k, window) in windows.iter().enumerate() {
-            let texts = next.take().expect("a window read for each window");
-            let mut versions = Vec::with_capacity(texts.len() + 1);
-            versions.push(std::mem::take(&mut old_text));
-            versions.extend(texts);
-            let (diffed, ahead) =
-                futures_util::future::join(diff_versions(versions), read(k + 1)).await;
-            let (ops, mut versions) = diffed?;
-            next = ahead?;
-            for ((cid, _), ops) in window.iter().zip(ops) {
-                let mut next = Vec::with_capacity(lines.len());
-                for (tag, old, new) in ops {
-                    match tag {
-                        DiffTag::Equal => next.extend_from_slice(&lines[old]),
-                        DiffTag::Delete => {}
-                        DiffTag::Insert | DiffTag::Replace => {
-                            next.extend(new.map(|i| (*cid, i as u32 + 1)));
-                        }
-                    }
-                }
-                lines = next;
-            }
-            old_text = versions.pop().expect("the newest version");
-        }
-        let texts: Vec<&str> = split_lines(&old_text).collect();
-        if texts.len() != lines.len() {
-            return Err(Error::Other(format!(
-                "blame of {path} has {} lines for {} lines of text",
-                lines.len(),
-                texts.len()
-            )));
-        }
-        let lines: Vec<BlameLine> = lines
-            .into_iter()
-            .zip(texts)
-            .map(|((changeset, origin_line), text)| BlameLine {
-                changeset,
-                origin_line,
-                text: strip_eol(text).to_string(),
-            })
-            .collect();
-        let resp: CachedBlame = (path.clone(), lines);
-        if cache {
-            let value = Bytes::from(postcard::to_stdvec(&resp)?);
-            for key_id in latest.into_iter().chain([id]) {
-                self.meta()
-                    .put_derived("blame", &cache_key(key_id, path), value.clone())
-                    .await?;
-            }
-        }
-        Ok((resp, examined))
     }
+}
+
+/// What one blame computed: the blame, the changesets its first-parent
+/// walks examined, the walks it started below merges and renames, and
+/// whether it followed all of them.
+pub(crate) struct BlameRun {
+    pub(crate) blame: CachedBlame,
+    pub(crate) examined: usize,
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) walks: usize,
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) complete: bool,
 }
 
 /// One diff of consecutive versions, as `(tag, old lines, new lines)`.
 pub(crate) type Ops = Vec<(DiffTag, std::ops::Range<usize>, std::ops::Range<usize>)>;
 
-/// The line diffs of each version in `versions` against the one before,
-/// computed on several cores: they do not depend on each other, only
-/// applying them does. Returns the versions too.
+/// The line diffs of each version in `versions` against the one before
+/// ([`diff_pairs`] over consecutive versions). Returns the versions too.
+#[cfg(test)]
+pub(crate) async fn diff_versions(versions: Vec<String>) -> Result<(Vec<Ops>, Vec<String>)> {
+    let texts: Vec<Arc<String>> = versions.iter().cloned().map(Arc::new).collect();
+    let pairs = (1..texts.len()).map(|i| (i - 1, i)).collect();
+    Ok((diff_pairs(Arc::new(texts), pairs).await?, versions))
+}
+
+/// The line diff of each pair `(old, new)` of `texts`, computed on several
+/// cores: they do not depend on each other, only applying them does.
 ///
 /// Each diff is the one `TextDiff::configure().timeout(DIFF_TIMEOUT)
 /// .diff_slices` makes over [`split_lines`], but cheaper: that numbers the
 /// distinct lines for every pair, so every version was split and hashed
-/// twice. Here each task splits and numbers its versions once, and diffs the
-/// numbers with the same algorithm, which compares lines only for equality
-/// and so gives the same diff.
-pub(crate) async fn diff_versions(versions: Vec<String>) -> Result<(Vec<Ops>, Vec<String>)> {
-    let versions = Arc::new(versions);
-    let pairs = versions.len().saturating_sub(1);
+/// twice. Here each task splits and numbers each text it diffs once (a
+/// chain's pairs share their texts), and diffs the numbers with the same
+/// algorithm, which compares lines only for equality and so gives the same
+/// diff.
+pub(crate) async fn diff_pairs(
+    texts: Arc<Vec<Arc<String>>>,
+    pairs: Vec<(usize, usize)>,
+) -> Result<Vec<Ops>> {
+    let pairs = Arc::new(pairs);
     let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
-    let per_task = pairs.div_ceil(cores.min(DIFF_TASKS)).max(1);
+    let per_task = pairs.len().div_ceil(cores.min(DIFF_TASKS)).max(1);
     let mut tasks = Vec::new();
-    for start in (0..pairs).step_by(per_task) {
-        let versions = versions.clone();
-        let end = (start + per_task).min(pairs);
+    for start in (0..pairs.len()).step_by(per_task) {
+        let (texts, pairs) = (texts.clone(), pairs.clone());
+        let end = (start + per_task).min(pairs.len());
         tasks.push(tokio::task::spawn_blocking(move || {
             let mut ids: HashMap<&str, u32> = HashMap::new();
-            let numbered: Vec<Vec<u32>> = versions[start..=end]
-                .iter()
-                .map(|v| {
-                    split_lines(v)
-                        .map(|line| {
-                            let next = ids.len() as u32;
-                            *ids.entry(line).or_insert(next)
-                        })
-                        .collect()
-                })
-                .collect();
-            numbered
-                .windows(2)
-                .map(|w| {
-                    let deadline = std::time::Instant::now().checked_add(DIFF_TIMEOUT);
+            let mut numbered: HashMap<usize, Vec<u32>> = HashMap::new();
+            let mut out = Vec::with_capacity(end - start);
+            for &(old, new) in &pairs[start..end] {
+                for t in [old, new] {
+                    numbered.entry(t).or_insert_with(|| {
+                        split_lines(&texts[t])
+                            .map(|line| {
+                                let next = ids.len() as u32;
+                                *ids.entry(line).or_insert(next)
+                            })
+                            .collect()
+                    });
+                }
+                let (a, b) = (&numbered[&old], &numbered[&new]);
+                let deadline = std::time::Instant::now().checked_add(DIFF_TIMEOUT);
+                out.push(
                     similar::capture_diff_deadline(
                         Algorithm::Myers,
-                        &w[0][..],
-                        0..w[0].len(),
-                        &w[1][..],
-                        0..w[1].len(),
+                        &a[..],
+                        0..a.len(),
+                        &b[..],
+                        0..b.len(),
                         deadline,
                     )
                     .iter()
                     .map(|op| op.as_tag_tuple())
-                    .collect::<Ops>()
-                })
-                .collect::<Vec<Ops>>()
+                    .collect::<Ops>(),
+                );
+            }
+            out
         }));
     }
-    let mut out = Vec::with_capacity(pairs);
+    let mut out = Vec::with_capacity(pairs.len());
     for t in tasks {
         out.extend(
             t.await
                 .map_err(|e| Error::Other(format!("blame diff task failed: {e}")))?,
         );
     }
-    let versions = Arc::try_unwrap(versions).unwrap_or_else(|v| (*v).clone());
-    Ok((out, versions))
+    Ok(out)
 }
 
 /// The lines of `text`, each with its `\n`. The one splitter for the diff and
@@ -906,9 +889,10 @@ struct Changers {
     checked: usize,
     /// The file at the changeset the walk examines next.
     cur_info: FileInfo,
-    /// The newest cached blame found, and the file it is of; the walk ends
-    /// there.
-    cached: Option<(CachedBlame, FileInfo)>,
+    /// Where the walk ended.
+    end: End,
+    /// Changers whose history another walk has.
+    stop_at: Arc<HashSet<ChangesetId>>,
 }
 
 /// How a blame walk is cut into stretches: steps walked from the tip before
@@ -919,13 +903,29 @@ pub(crate) struct Cuts {
     pub(crate) min_span: u64,
 }
 
-/// What a blame's walk found: the changers, newest first, down to the end
-/// of the file's history or to `cached`, the newest changer's cached blame
-/// and the file it is of; and how many changesets it examined.
-struct Found {
-    chain: Vec<(ChangesetId, FileInfo)>,
-    cached: Option<(CachedBlame, FileInfo)>,
-    examined: usize,
+/// What a blame's walk found: the changers, newest first, down to `end`;
+/// and how many changesets it examined.
+pub(crate) struct Found {
+    pub(crate) chain: Vec<(ChangesetId, FileInfo)>,
+    pub(crate) end: End,
+    pub(crate) examined: usize,
+}
+
+/// Where a walk down a first-parent chain ended, below its last changer.
+pub(crate) enum End {
+    /// The file's history starts at the last changer: its first parent
+    /// lacks the file, or it has none.
+    Start,
+    /// At a changer with a cached blame, and the file there.
+    Cached(ChangesetId, CachedBlame, FileInfo),
+    /// At a changer another walk of the same blame found.
+    Known(ChangesetId),
+}
+
+/// A step that ends a walk before the file's creation.
+enum Hit {
+    Cached(CachedBlame),
+    Known,
 }
 
 impl Found {
@@ -935,8 +935,8 @@ impl Found {
     fn take(&mut self, walk: StretchWalk, cur_info: &mut FileInfo) -> bool {
         let StretchWalk {
             steps,
-            mut first_cached,
-            mut cached,
+            mut first_hit,
+            mut hit,
             absent,
             ..
         } = walk;
@@ -950,13 +950,16 @@ impl Found {
                 .as_ref()
                 .is_none_or(|p| p.content != cur_info.content);
             if changed {
-                let hit = match &cached {
-                    _ if i == 0 => first_cached.take(),
-                    Some((j, _)) if *j == i => cached.take().map(|(_, b)| b),
+                let found = match &hit {
+                    _ if i == 0 => first_hit.take(),
+                    Some((j, _)) if *j == i => hit.take().map(|(_, h)| h),
                     _ => None,
                 };
-                if let Some(blame) = hit {
-                    self.cached = Some((blame, cur_info.clone()));
+                if let Some(h) = found {
+                    self.end = match h {
+                        Hit::Cached(blame) => End::Cached(step.x, blame, cur_info.clone()),
+                        Hit::Known => End::Known(step.x),
+                    };
                     return true;
                 }
                 self.chain.push((step.x, cur_info.clone()));
@@ -979,12 +982,13 @@ struct Step {
 }
 
 /// What [`Repo::walk_stretch`] found: the steps, newest first, down to the
-/// bottom of the stretch or the end of the walk, and cached blames: of the
-/// first step, and of the step the walk ended at.
+/// bottom of the stretch or the end of the walk, and what ends the walk if
+/// it changed the file: at the first step, and at the step the walk ended
+/// at.
 struct StretchWalk {
     steps: Vec<Step>,
-    first_cached: Option<CachedBlame>,
-    cached: Option<(usize, CachedBlame)>,
+    first_hit: Option<Hit>,
+    hit: Option<(usize, Hit)>,
     /// Where the walk stopped after its most steps, with the stretch below
     /// still to walk.
     resume: Option<SkipEntry>,
@@ -1001,6 +1005,8 @@ struct Stretch {
     most: usize,
     /// Seeded with the chain's ancestors known between `top` and `bottom`.
     first_parents: FirstParents,
+    /// Changers that end the walk (see [`End::Known`]).
+    known: Arc<HashSet<ChangesetId>>,
 }
 
 /// The path-history entry of a step: `Unknown` when the step has no row in
@@ -1027,7 +1033,7 @@ impl Changers {
     fn found(self, examined: usize) -> Found {
         Found {
             chain: self.chain,
-            cached: self.cached,
+            end: self.end,
             examined,
         }
     }
@@ -1040,7 +1046,7 @@ impl Changers {
             .await?
         {
             let i = self.checked + i;
-            self.cached = Some((blame, self.chain[i].1.clone()));
+            self.end = End::Cached(self.chain[i].0, blame, self.chain[i].1.clone());
             self.chain.truncate(i);
             return Ok(true);
         }
@@ -1064,6 +1070,10 @@ impl Changers {
         let changed = parent_info
             .as_ref()
             .is_none_or(|p| p.content != self.cur_info.content);
+        if changed && self.stop_at.contains(&x) {
+            self.end = End::Known(x);
+            return Ok(false);
+        }
         if changed {
             self.chain.push((x, self.cur_info.clone()));
         }
