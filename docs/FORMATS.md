@@ -698,9 +698,15 @@ first, then packs. Hashes, `TreeNode`, the API and clients do not change.
 | `packs/<id>.pack` | the entries |
 | `packs/<id>.idx` | the index; its presence publishes the pack |
 | `packs/tombstones` | packed objects deleted by GC |
-| `packs/tombstones.lock`, `packs/repack.lock` | empty files, locked with `flock` |
-| `packs/.tmp-*` | a write in progress, or garbage of a killed repack |
+| `packs/tombstones.lock`, `packs/repack.lock`, `packs/write.lock` | empty files, locked with `flock` (`write.lock`: shared by a `put_many` writing a pack, exclusive while a repack deletes unindexed packs; ADR 0068) |
+| `packs/.tmp-*` | a write in progress, or garbage of a killed repack or pack write |
 | `<shard>/.repack-<rest of hex>` | a loose copy a repack moved aside; a whole object |
+
+A pack written by `put_many` (a land batch, ADR 0068) is an ordinary pack:
+every entry a whole frame, in hash order, each index record's `modified`
+the time of the write. The same objects packed within one second would make
+the same id, so such a writer bumps every `modified` by one second until the
+id is not published yet.
 
 `<id>` is the lowercase hex BLAKE3 of the whole `.idx` file. The id is
 therefore a function of the compressed bytes: the same objects packed by a

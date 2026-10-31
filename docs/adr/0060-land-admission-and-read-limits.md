@@ -1,5 +1,5 @@
 # 0060. Protect lands from expensive reads, and admit lands per ref
-Status: Accepted (section 1, `search` class, and section 2; see "Implementation notes"); other read classes and section 3 proposed. Amended 2026-10-23: `--land-queue-batches` defaults to 4 after E5c (section 2, "Default after E5c")
+Status: Accepted (section 1, `search` class, and section 2; see "Implementation notes"); other read classes and section 3 proposed. Amended 2026-10-23: `--land-queue-batches` defaults to 4 after E5c (section 2, "Default after E5c"). Amended by ADR 0068: the default bound is `--land-queue-seconds 5s`; `--land-queue-batches` replaces it when given
 Date: 2026-10-21
 
 ## Context

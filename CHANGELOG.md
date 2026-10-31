@@ -7,6 +7,40 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 ## [Unreleased]
 
+### Land batches write one pack
+- **Changed.** A land batch's new objects (tree nodes, merged contents)
+  are written as one pack on filesystem and object store blob stores,
+  instead of a file or bucket object each with its own fsync and rename:
+  four fsyncs per batch instead of about 1,150 files and up to 257
+  directory syncs, and a land's objects take their compressed size on disk
+  instead of a 4 KiB block each. Packs and indexes keep their format; any
+  Leep that reads packs reads them. `BlobStore::put_many` is new (a
+  provided method, so other backends keep working). `--land-packs off`
+  writes loose objects as before; `--land-pack-min-objects` (16) sets the
+  smallest batch packed. See ADR 0068.
+- **Added.** The server merges packs in the background
+  (`--background-repack`, on by default; `--background-repack-packs`,
+  `-interval`, `-fence`, `-level`) with the geometric rule and delta bases
+  of `leep-server repack`, on a low-priority thread, so reads search few
+  packs. `RepackMode::Planned` merges a chosen set of packs, on object
+  stores too. On an object store a miss now also lists `packs/` for packs
+  published since, so another server's land pack is read at once; upgrade
+  every server before land packs are written to a shared bucket.
+- **Changed.** A land batch checks that its copies' contents exist with one
+  batched call, and a server-built changeset is checked for its contents'
+  existence instead of reading each back to compare sizes.
+- **Added.** `--land-max-batch` (64) sets the lands per batch, and
+  `--land-queue-seconds` (5 s, the new default) bounds land admission by
+  the time a land would wait, turned into batches at the ref's moving
+  batch time. `--land-queue-batches N` still works and replaces it when
+  given; its default of 4 is gone.
+- **Added.** Metrics `leep_pack_writes_total`, `leep_pack_write_objects`,
+  `leep_pack_write_bytes`, `leep_pack_write_seconds`, `leep_blob_packs`,
+  `leep_repack_background_runs_total`,
+  `leep_repack_background_packs_merged_total`,
+  `leep_repack_background_seconds` and
+  `leep_repack_background_cleanup_seconds`.
+
 ### `leep bisect`
 - **Added.** `leep bisect start [BAD [GOOD...]]`, `bad`, `good`, `skip`,
   `reset`, `log` and `run CMD [ARGS...]` find the changeset that introduced
