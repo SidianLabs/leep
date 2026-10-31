@@ -96,6 +96,13 @@ fn has_tracked_under(files: &BTreeMap<String, FileState>, dir: &str) -> bool {
         .is_some_and(|(k, _)| k.starts_with(&start))
 }
 
+/// Only regular files and symlinks can be stored. Sockets, FIFOs and devices
+/// are skipped, as git does: reading a socket fails and opening a FIFO
+/// blocks until a writer appears.
+fn is_recordable(md: &Metadata) -> bool {
+    md.is_file() || md.file_type().is_symlink()
+}
+
 /// All non-ignored files (and symlinks) under `prefixes`, by repo path.
 /// Tracked files are listed even if an ignore pattern matches them.
 pub fn walk(
@@ -116,8 +123,9 @@ pub fn walk(
         };
         if md.is_dir() {
             stack.push(p.clone());
-        } else if tracked.contains_key(p)
-            || !ignore.matched_path_or_any_parents(p, false).is_ignore()
+        } else if is_recordable(&md)
+            && (tracked.contains_key(p)
+                || !ignore.matched_path_or_any_parents(p, false).is_ignore())
         {
             out.insert(p.clone(), md);
         }
@@ -148,7 +156,9 @@ pub fn walk(
                     continue;
                 }
                 stack.push(rel);
-            } else if tracked.contains_key(&rel) || !ignore.matched(&rel, false).is_ignore() {
+            } else if is_recordable(&md)
+                && (tracked.contains_key(&rel) || !ignore.matched(&rel, false).is_ignore())
+            {
                 out.insert(rel, md);
             }
         }
@@ -423,6 +433,43 @@ mod tests {
         assert_eq!(change_of(&s, "del.txt"), Some(Change::Deleted));
         assert_eq!(change_of(&s, "add.txt"), Some(Change::Added));
         assert_eq!(change_of(&s, "keep.txt"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn status_skips_sockets() {
+        let d = tempfile::tempdir().unwrap();
+        let mut wc = wc(d.path());
+        write(d.path(), "a.txt", "a");
+        track_all(&mut wc);
+        let _sock = std::os::unix::net::UnixListener::bind(d.path().join("app.sock")).unwrap();
+        let s = status(&wc).unwrap();
+        assert!(s.is_clean(), "{:?}", s.entries);
+    }
+
+    /// A FIFO must be skipped without being opened: opening one for reading
+    /// blocks until a writer appears, so a regression hangs rather than fails.
+    #[cfg(unix)]
+    #[test]
+    fn status_skips_fifos_without_opening_them() {
+        let d = tempfile::tempdir().unwrap();
+        let mut wc = wc(d.path());
+        write(d.path(), "a.txt", "a");
+        track_all(&mut wc);
+        let made = std::process::Command::new("mkfifo")
+            .arg(d.path().join("x.fifo"))
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let r = status(&wc).map(|s| s.entries.len());
+            let _ = tx.send(r.map_err(|e| e.to_string()));
+        });
+        let got = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("status hung on a FIFO");
+        assert_eq!(got.unwrap(), 0);
     }
 
     #[test]

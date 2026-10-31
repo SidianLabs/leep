@@ -7,6 +7,12 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 ## [Unreleased]
 
+### Sockets and FIFOs in the working copy (issue #172)
+- **Fixed.** A unix socket in the working copy made `status`, `commit`,
+  `land` and `switch` fail with an I/O error, and a FIFO made them hang
+  waiting for a writer. The working-copy scan now records only regular
+  files and symlinks and skips other file types silently, as git does.
+
 ### Blame of files with a lone CR (issue #169)
 - **Fixed.** `GET /v1/blame` answered 500 for a file with a `\r` not followed
   by `\n` (`a\r\rb\n`, old Mac line endings): the diff split lines at a
