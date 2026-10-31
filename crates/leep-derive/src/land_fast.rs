@@ -9,7 +9,7 @@
 //! after a restart or a lost lease, a base older than its window, a base off
 //! the ref's first-parent line) goes the slow way, which is the full replay.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 use leep_core::{ChangesetId, FileChange, RepoPath, Result};
 
@@ -27,6 +27,68 @@ pub(crate) const MAP_ENTRIES: usize = if cfg!(test) { 600 } else { 1 << 20 };
 /// a longer one (a large fast-forward) starts the map again from the new
 /// head.
 const MAX_TRAIL: usize = 1024;
+
+/// What the slow path makes of a path that both the ref and a land changed
+/// since the land's base (ADR 0066). Server configuration only: nothing
+/// persisted depends on it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ConflictPolicy {
+    /// A three-way merge: clean when the sides changed different lines or
+    /// made the same change. The default, as before this policy existed.
+    #[default]
+    Merge,
+    /// Any such path is a conflict returned to the client, however it would
+    /// merge: the land must be redone on the new head. Lands that touch
+    /// nothing in common still land without a merge.
+    Strict,
+}
+
+impl ConflictPolicy {
+    pub fn parse(s: &str) -> Option<ConflictPolicy> {
+        match s {
+            "merge" => Some(ConflictPolicy::Merge),
+            "strict" => Some(ConflictPolicy::Strict),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            ConflictPolicy::Merge => "merge",
+            ConflictPolicy::Strict => "strict",
+        }
+    }
+}
+
+/// The [`ConflictPolicy`] of each ref: one for every ref, and the refs that
+/// are strict whatever it is.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LandConflicts {
+    default: ConflictPolicy,
+    strict_refs: BTreeSet<String>,
+}
+
+impl LandConflicts {
+    pub fn new(default: ConflictPolicy, strict_refs: impl IntoIterator<Item = String>) -> Self {
+        LandConflicts {
+            default,
+            strict_refs: strict_refs.into_iter().collect(),
+        }
+    }
+
+    /// Strict on every ref.
+    pub fn strict() -> Self {
+        Self::new(ConflictPolicy::Strict, [])
+    }
+
+    pub fn for_ref(&self, target_ref: &str) -> ConflictPolicy {
+        if self.strict_refs.contains(target_ref) {
+            ConflictPolicy::Strict
+        } else {
+            self.default
+        }
+    }
+}
 
 /// Why a land took the path it took, for `leep_land_fast_map_total`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

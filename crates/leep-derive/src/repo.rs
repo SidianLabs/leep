@@ -88,6 +88,8 @@ pub struct Repo {
     pub(crate) land_coordinator: Option<Arc<crate::land_coord::LandCoordinator>>,
     /// Copy disjoint lands onto the head without a merge (ADR 0066).
     pub(crate) land_fast_path: bool,
+    /// How a land's slow path treats same-path overlaps, per ref.
+    pub(crate) land_conflicts: Arc<crate::LandConflicts>,
     /// Parents and generations of changesets seen by history walks.
     pub(crate) ancestry: Arc<AncestryCache>,
     /// Decoded path-history nodes, keyed by `NodeRef::cache_key` (see
@@ -552,6 +554,7 @@ impl Repo {
             land_policy: None,
             land_coordinator: None,
             land_fast_path: true,
+            land_conflicts: Arc::default(),
             ancestry: Arc::default(),
             history_rows: Arc::default(),
             history_raw: Arc::default(),
@@ -650,6 +653,19 @@ impl Repo {
             metrics::counter!("leep_land_replays_total", "path" => path).increment(0);
         }
         self
+    }
+
+    /// How a land replayed the slow way treats a path the ref also changed
+    /// since its base, per ref (ADR 0066): a three-way merge by default, or
+    /// a conflict on refs that are strict.
+    pub fn with_land_conflicts(mut self, conflicts: crate::LandConflicts) -> Self {
+        self.land_conflicts = Arc::new(conflicts);
+        self
+    }
+
+    /// See [`Repo::with_land_conflicts`].
+    pub fn land_conflicts(&self) -> &crate::LandConflicts {
+        &self.land_conflicts
     }
 
     /// See [`Repo::with_land_fast_path`].

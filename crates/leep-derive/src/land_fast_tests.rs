@@ -1,7 +1,7 @@
 //! The land fast path and the slow path's restricted merge (ADR 0066): each
 //! must answer exactly what the full replay answers.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -595,7 +595,7 @@ async fn the_write_map_stays_bounded() {
 async fn fast_and_slow_lands_agree_on_random_histories() {
     let (mut hits, mut slow, mut conflicts) = (0, 0, 0);
     for seed in 1..=40u64 {
-        let (h, s, c) = differential(seed).await;
+        let (h, s, c) = differential(seed, false).await;
         hits += h;
         slow += s;
         conflicts += c;
@@ -607,9 +607,18 @@ async fn fast_and_slow_lands_agree_on_random_histories() {
 
 /// One random history, landed by both: (fast-path lands, slow-path lands,
 /// conflicts).
-pub(crate) async fn differential(seed: u64) -> (usize, usize, usize) {
+pub(crate) async fn differential(seed: u64, strict: bool) -> (usize, usize, usize) {
     let mut rng = Rng::new(seed);
-    let p = Pair::new();
+    let p = if strict {
+        Pair::with(
+            plain_repo().with_land_conflicts(crate::LandConflicts::strict()),
+            plain_repo()
+                .with_land_fast_path(false)
+                .with_land_conflicts(crate::LandConflicts::strict()),
+        )
+    } else {
+        Pair::new()
+    };
     let base_edits = random_edits(&mut rng, &Files::new(), 10, "");
     let base_edits: Edits = base_edits
         .into_iter()
@@ -684,11 +693,18 @@ pub(crate) async fn differential(seed: u64) -> (usize, usize, usize) {
             now.len(),
             "seed {seed}: every land batched once"
         );
+        let bases: HashMap<ChangesetId, Option<ChangesetId>> = now.iter().copied().collect();
         for cs in order {
+            let before = p.slow.meta().get_ref("main").await.unwrap().unwrap();
             let want = outcome(&p.slow.land(cs, "main").await);
             assert_eq!(got[&cs], want, "seed {seed} round {round}: land of {cs}");
             if want.starts_with("Conflicts") {
                 conflicts += 1;
+            }
+            if strict {
+                if let Some(Some(fork)) = bases.get(&cs) {
+                    check_strict(&p.slow, *fork, before, cs, &want).await;
+                }
             }
             // Now and then the agent builds on its own landed changeset.
             if want.contains("rebased: true") && rng.below(4) == 0 {
@@ -707,6 +723,71 @@ pub(crate) async fn differential(seed: u64) -> (usize, usize, usize) {
     let looked = lookups(&p.fast);
     let hits = looked.iter().filter(|l| **l == Lookup::Hit).count();
     (hits, looked.len() - hits, conflicts)
+}
+
+/// Under the strict policy a land conflicts exactly when it changes a path
+/// the ref changed since its base (or clashes as a file against a
+/// directory, which conflicts under either policy).
+async fn check_strict(
+    r: &Repo,
+    fork: ChangesetId,
+    head: ChangesetId,
+    cs: ChangesetId,
+    answer: &str,
+) {
+    let tree = |id| r.root_tree(id);
+    let (f, h, c) = (
+        tree(fork).await.unwrap(),
+        tree(head).await.unwrap(),
+        tree(cs).await.unwrap(),
+    );
+    let ours: BTreeSet<RepoPath> = r
+        .diff_trees(f, h, "")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|e| e.path)
+        .collect();
+    let theirs: BTreeSet<RepoPath> = r
+        .diff_trees(f, c, "")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|e| e.path)
+        .collect();
+    let overlap: Vec<&RepoPath> = ours.intersection(&theirs).collect();
+    if overlap.is_empty() {
+        if answer.starts_with("Conflicts") {
+            // Only file/directory clashes, never a path both sides changed.
+            for path in conflict_paths(answer) {
+                assert!(
+                    !ours.contains(&path),
+                    "{path} conflicted without an overlap"
+                );
+            }
+        }
+        return;
+    }
+    assert!(
+        answer.starts_with("Conflicts"),
+        "{overlap:?} overlap: {answer}"
+    );
+    let paths = conflict_paths(answer);
+    for p in overlap {
+        assert!(
+            paths.contains(p),
+            "{p} overlaps and is not a conflict: {answer}"
+        );
+    }
+}
+
+/// The paths of a `Conflicts` answer, from its debug form.
+fn conflict_paths(answer: &str) -> BTreeSet<RepoPath> {
+    answer
+        .split("Conflict { path: \"")
+        .skip(1)
+        .map(|s| RepoPath::new(&s[..s.find('"').unwrap()]).unwrap())
+        .collect()
 }
 
 /// Approves a changeset only when every path is approved or covered, the
@@ -885,4 +966,53 @@ async fn a_batch_builds_trees_from_the_nodes_it_holds() {
     assert!(staging.tree_time() > std::time::Duration::ZERO);
     // A plain repository holds nothing between calls.
     assert!(r.node_memo.is_none());
+}
+
+/// The strict policy lands disjoint lands the fast way and answers every
+/// same-path overlap with a conflict, the same with and without the fast
+/// path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_strict_policy_conflicts_exactly_on_same_path_overlaps() {
+    let (mut hits, mut conflicts) = (0, 0);
+    for seed in 1..=25u64 {
+        let (h, _, c) = differential(seed, true).await;
+        hits += h;
+        conflicts += c;
+    }
+    assert!(hits > 50, "disjoint lands took the fast path ({hits})");
+    assert!(conflicts > 20, "overlaps conflicted ({conflicts})");
+}
+
+/// One same-file change that merges cleanly: landed under `merge`, refused
+/// under `strict`, and only on the refs `strict` names.
+#[tokio::test]
+async fn strict_refs_refuse_what_merge_refs_merge() {
+    let conflicts = crate::LandConflicts::new(crate::ConflictPolicy::Merge, ["prod".to_string()]);
+    let r = plain_repo().with_land_conflicts(conflicts);
+    let base = create(&r, &[], &edits(&[("t", Some("1\n2\n3\n"))]), "base").await;
+    for name in ["main", "prod"] {
+        r.land(base, name).await.unwrap();
+    }
+    let ours = create(&r, &[base], &edits(&[("t", Some("1\n2\nX\n"))]), "ours").await;
+    let theirs = create(&r, &[base], &edits(&[("t", Some("Y\n2\n3\n"))]), "theirs").await;
+    for name in ["main", "prod"] {
+        r.land(ours, name).await.unwrap();
+    }
+    let merged = r.land(theirs, "main").await.unwrap();
+    assert!(
+        matches!(merged, LandResponse::Landed { rebased: true, .. }),
+        "{merged:?}"
+    );
+    let refused = r.land(theirs, "prod").await.unwrap();
+    let LandResponse::Conflicts { conflicts, .. } = refused else {
+        panic!("{refused:?}");
+    };
+    assert_eq!(conflicts.len(), 1);
+    assert_eq!(conflicts[0].path.as_str(), "t");
+    assert_eq!(conflicts[0].merged_with_markers, None);
+    assert_eq!(
+        crate::ConflictPolicy::parse("strict"),
+        Some(crate::ConflictPolicy::Strict)
+    );
+    assert_eq!(crate::ConflictPolicy::parse("rebase"), None);
 }

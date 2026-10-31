@@ -606,11 +606,18 @@ loop (≤32 attempts):
     else:
       stack ← first-parent chain from cs down to where it joins head's history,
               or to an entry whose server-made copy is in it
-      replay each stack entry onto head, oldest first        # 3-way per entry
-      conflict? → Conflicts{onto: head, conflicts, clean} for this land only
-                  (the whole stack squashed into one 3-way merge vs head;
-                   never auto-resolved on the server)
-      move to replayed top
+      if the leader's write map holds the stack's base and nothing written
+         since touches the stack's paths, their directories or below them:
+        copy each entry onto head, oldest first, with its own changes
+          (less no-op modifies), no merge                 # fast path, ADR 0066
+      else:
+        replay each stack entry onto head, oldest first   # 3-way per entry,
+                                                           # ours read only at theirs' paths
+        conflict? → Conflicts{onto: head, conflicts, clean} for this land only
+                    (the whole stack squashed into one 3-way merge vs head;
+                     never auto-resolved on the server; under a strict ref
+                     every path both sides changed is a conflict)
+      move to replayed top, and append its first-parent chain to the write map
     a move sets head; answers that precede every move are sent at once
       (a Conflicts answer first stores the merged text its clean changes
        name: GC rescue check, flush; an error is that land's answer)
@@ -666,6 +673,31 @@ calls use connections of their own, so a renewal never waits behind data
 traffic. A forwarded land is never forwarded again. The leader of a batch is a
 spawned task, so a cancelled request cannot stop a batch; a land cancelled
 before its batch reached it is dropped, one already replayed lands.
+Replays are cheap when lands are disjoint ([ADR 0066](adr/0066-land-fast-path-and-conflict-policy.md),
+`land_fast.rs`). The leader keeps, per ref and in memory only, a write map
+of the ref's first-parent line it has followed: each changeset's sequence
+number, the newest one that wrote each path, and the newest that wrote below
+each directory, for the last 4,096 changesets (at most 2^20 entries). It
+describes one head and is checked against the head every batch attempt
+reads; any other head starts it again from that head, so a cold map (after
+a restart or a lost lease) or another server's move only sends lands the
+slow way. A stack based on a changeset the map holds, and touching no path
+written since (nor a file at one of its directories, nor anything below
+it), is copied without a merge: each member's own changes, less modifies
+that change nothing, onto the previous copy, through the same
+`rebased_copy` as the slow path, whose copy for such a stack it equals to
+the byte. Everything else (overlaps, bases out of the map, stacks on their
+own landed copies) replays the slow way, whose merge diffs only base
+against theirs and reads ours at those paths, so it costs the size of the
+land rather than the ref's churn since its base. `--land-conflicts strict`
+(or `--strict-land-ref`) makes the slow path answer every path both sides
+changed as a conflict instead of merging it; the default `merge` keeps the
+three-way merge. A batch builds its copies' trees on the decoded nodes the
+copies before them wrote, held in the attempt's staging, rewriting only
+touched directories, and still stores each copy's tree and `root_tree` row.
+The land policy runs on every land before any of this, and the landed-copy
+scan stays for keyed lands too: a keyed land answered "already landed" from
+the scan records nothing to answer its retry from.
 The copy test makes `land` idempotent: a client that never saw the answer to
 a land that applied (a timeout, a killed server, an error after commit) can
 send it again and gets the copy back instead of a second one. It looks for a

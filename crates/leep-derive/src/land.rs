@@ -19,7 +19,7 @@ use leep_core::{
 use tokio::sync::oneshot;
 
 use crate::changeset_gc::RescueBy;
-use crate::land_fast::{Lookup, WriteMap};
+use crate::land_fast::{ConflictPolicy, Lookup, WriteMap};
 use crate::land_stage::{Staging, FLUSH_WRITES_IN_FLIGHT};
 use crate::Repo;
 
@@ -1394,7 +1394,16 @@ impl Repo {
         self.enforce_land_policy(cs, head, target_ref, checked)
             .await?;
         match head {
-            Some(h) if !fast_forward => match self.replay_stack(cs, h, origins, fast).await? {
+            Some(h) if !fast_forward => match self
+                .replay_stack(
+                    cs,
+                    h,
+                    origins,
+                    fast,
+                    self.land_conflicts.for_ref(target_ref),
+                )
+                .await?
+            {
                 // The stack holds `cs` at least.
                 Ok(pairs) => Ok(Step::Move(pairs.last().map_or(cs, |p| p.1))),
                 Err(resp) => Ok(Step::Done(resp)),
@@ -1621,6 +1630,7 @@ impl Repo {
         head: ChangesetId,
         origins: &mut HashMap<ChangesetId, Option<ChangesetId>>,
         fast: Option<&WriteMap>,
+        policy: ConflictPolicy,
     ) -> Result<Result<Vec<(ChangesetId, ChangesetId)>, LandResponse>> {
         let mut stack = Vec::new();
         let mut members = Vec::new();
@@ -1665,7 +1675,7 @@ impl Repo {
                 return Ok(Ok(pairs));
             }
         }
-        let replayed = self.replay_slow(cs, head, &stack, fork).await;
+        let replayed = self.replay_slow(cs, head, &stack, fork, policy).await;
         metrics::counter!("leep_land_replays_total", "path" => "slow").increment(1);
         metrics::histogram!("leep_land_replay_seconds", "path" => "slow")
             .record(started.elapsed().as_secs_f64());
@@ -1745,21 +1755,23 @@ impl Repo {
         head: ChangesetId,
         stack: &[ChangesetId],
         fork: Option<ChangesetId>,
+        policy: ConflictPolicy,
     ) -> Result<Result<Vec<(ChangesetId, ChangesetId)>, LandResponse>> {
         let mut onto = head;
         let mut pairs = Vec::with_capacity(stack.len());
         for &id in stack.iter().rev() {
-            match self.rebase(id, onto).await? {
+            match self.rebase_as(id, onto, policy).await? {
                 RebaseResponse::Rebased { id: copy } => {
                     pairs.push((id, copy));
                     onto = copy;
                 }
                 RebaseResponse::Conflicts { .. } => {
                     let m = self
-                        .merge_trees(
+                        .merge_trees_as(
                             self.tree_or_empty(fork).await?,
                             self.root_tree(head).await?,
                             self.root_tree(cs).await?,
+                            policy,
                         )
                         .await?;
                     if m.conflicts.is_empty() {
@@ -2043,7 +2055,7 @@ impl Repo {
         }
         let staged = staging.repo(self);
         match staged
-            .replay_stack(head, onto, &mut HashMap::new(), None)
+            .replay_stack(head, onto, &mut HashMap::new(), None, ConflictPolicy::Merge)
             .await?
         {
             Ok(rebased) => Ok(Replayed::Move {

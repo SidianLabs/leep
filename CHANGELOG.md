@@ -41,6 +41,29 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   changesets that connect the shown ones, and ignored with `--json`. No API
   change: the graph is drawn from each entry's parents. See docs/CLI.md,
   "Long listings".
+### Faster lands onto busy refs
+- **Changed.** A land none of whose files the ref changed since its base is
+  copied onto the head without a three-way merge (the fast path). Its
+  copies are the ones the merge made, to the byte. The leader of each ref
+  remembers, in memory, which paths the ref's last 4,096 changesets wrote;
+  lands it cannot vouch for (a base it has not seen since it started
+  leading, an overlap, a stack on its own landed copy) replay as before.
+  `--land-fast-path off` (`LEEP_LAND_FAST_PATH`) replays every land in full;
+  the answers are the same. See ADR 0066.
+- **Changed.** A replayed land's merge reads the head only at the paths the
+  land changed, instead of diffing everything the ref changed since the
+  land's base, so a land based far back costs as much as its own change.
+  Conflict answers are unchanged.
+- **Changed.** A batch builds each copy's tree on the directories the copy
+  before it wrote, in memory, and encodes each tree node once.
+- **Added.** `--land-conflicts merge|strict` (`LEEP_LAND_CONFLICTS`) and
+  `--strict-land-ref REF` (`LEEP_STRICT_LAND_REFS`). `strict` answers any
+  file both the ref and a land changed since the land's base as a conflict,
+  even one that would merge cleanly; `merge`, the default, merges as before.
+- **Added.** Metrics `leep_land_replays_total{path}`,
+  `leep_land_replay_seconds{path}`, `leep_land_fast_map_total{result}`,
+  `leep_land_fast_map_resets_total`, `leep_land_batch_replay_seconds` and
+  `leep_land_batch_tree_seconds` (docs/OPERATIONS.md).
 
 ### Blame follows renames and merged branches
 - **Fixed.** `blame` credited every line of a moved file to the changeset

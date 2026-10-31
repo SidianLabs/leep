@@ -294,6 +294,27 @@ struct Args {
     /// off while clients that do not resend a refused land remain.
     #[arg(long, env = "LEEP_LAND_QUEUE_BATCHES", value_parser = parse_count_or_off, default_value = "4")]
     land_queue_batches: CountOrOff,
+    /// Copy a land onto the ref without a three-way merge when nothing the
+    /// ref changed since the land's base touches its paths (ADR 0066). The
+    /// answers are the same either way; `off` replays every land in full,
+    /// for comparison.
+    #[arg(long, env = "LEEP_LAND_FAST_PATH", value_enum, default_value_t = Switch::On)]
+    land_fast_path: Switch,
+    /// What a land replayed with a merge makes of a file the ref also
+    /// changed since the land's base (ADR 0066): `merge` merges it three
+    /// ways and conflicts only where the changes clash; `strict` answers
+    /// every such file as a conflict, for the client to redo on the new
+    /// head.
+    #[arg(long, env = "LEEP_LAND_CONFLICTS", value_enum, default_value_t = LandConflictsArg::Merge)]
+    land_conflicts: LandConflictsArg,
+    /// A ref whose lands follow `strict` whatever --land-conflicts says.
+    /// Repeatable; the environment variable takes a comma-separated list.
+    #[arg(
+        long = "strict-land-ref",
+        env = "LEEP_STRICT_LAND_REFS",
+        value_delimiter = ','
+    )]
+    strict_land_refs: Vec<String>,
     #[command(subcommand)]
     command: Option<Cmd>,
 }
@@ -302,6 +323,18 @@ struct Args {
 enum Coordination {
     On,
     Off,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum Switch {
+    On,
+    Off,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum LandConflictsArg {
+    Merge,
+    Strict,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -1152,6 +1185,15 @@ mod local_dirs_tests {
     }
 }
 
+/// `--land-conflicts` and `--strict-land-ref` as the repository takes them.
+fn land_conflicts(args: &Args) -> leep_derive::LandConflicts {
+    let default = match args.land_conflicts {
+        LandConflictsArg::Merge => leep_derive::ConflictPolicy::Merge,
+        LandConflictsArg::Strict => leep_derive::ConflictPolicy::Strict,
+    };
+    leep_derive::LandConflicts::new(default, args.strict_land_refs.iter().cloned())
+}
+
 /// Install the global Prometheus recorder; returns the `/metrics` app.
 fn install_metrics() -> anyhow::Result<axum::Router> {
     use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
@@ -1594,6 +1636,9 @@ async fn run() -> anyhow::Result<()> {
         CountOrOff::Off => None,
         CountOrOff::Count(n) => Some(n),
     });
+    repo = repo
+        .with_land_fast_path(args.land_fast_path == Switch::On)
+        .with_land_conflicts(land_conflicts(&args));
     leep_server::reload::warn_missing_refs(repo.meta().as_ref(), &config.current()).await;
     if args.request_timeout.is_zero() {
         tracing::warn!("request timeout disabled: gc --fence cannot be guaranteed safe");
@@ -1664,6 +1709,12 @@ async fn run() -> anyhow::Result<()> {
         search_pool_permits = ?search_pool,
         land_queue_batches = ?repo.land_queue_batches(),
         "expensive read and land admission limits (ADR 0060)"
+    );
+    tracing::info!(
+        land_fast_path = repo.land_fast_path(),
+        land_conflicts = repo.land_conflicts().for_ref("").name(),
+        strict_land_refs = ?args.strict_land_refs,
+        "land replay (ADR 0066)"
     );
     let mut app = leep_server::router_with_read_limits(
         repo,
@@ -2057,6 +2108,32 @@ mod tests {
             .map(|e| e.to_string_lossy().into_owned())
             .collect();
         assert_eq!(listed, read, "{path} and the flags' variables differ");
+    }
+
+    /// The fast path is on and same-file overlaps merge unless configured.
+    #[test]
+    fn land_replay_defaults_to_the_fast_path_and_merging() {
+        let a = parse_args(["leep-server"]).unwrap();
+        assert!(a.land_fast_path == Switch::On);
+        let c = land_conflicts(&a);
+        assert_eq!(c.for_ref("main"), leep_derive::ConflictPolicy::Merge);
+        let a = parse_args([
+            "leep-server",
+            "--land-fast-path",
+            "off",
+            "--strict-land-ref",
+            "prod",
+        ])
+        .unwrap();
+        assert!(a.land_fast_path == Switch::Off);
+        let c = land_conflicts(&a);
+        assert_eq!(c.for_ref("prod"), leep_derive::ConflictPolicy::Strict);
+        assert_eq!(c.for_ref("main"), leep_derive::ConflictPolicy::Merge);
+        let a = parse_args(["leep-server", "--land-conflicts", "strict"]).unwrap();
+        assert_eq!(
+            land_conflicts(&a).for_ref("main"),
+            leep_derive::ConflictPolicy::Strict
+        );
     }
 
     /// Admission is on by default (ADR 0060, E5c); `off` still turns it off.

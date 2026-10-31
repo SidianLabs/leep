@@ -12,7 +12,7 @@ use leep_core::{
 };
 
 use crate::changeset_gc::RescueBy;
-use crate::Repo;
+use crate::{ConflictPolicy, Repo};
 
 /// Result of merging `theirs` into `ours`: `changes` are relative to `ours`.
 pub(crate) struct TreeMerge {
@@ -189,6 +189,20 @@ impl Repo {
         ours: Hash,
         theirs: Hash,
     ) -> Result<TreeMerge> {
+        self.merge_trees_as(base, ours, theirs, ConflictPolicy::Merge)
+            .await
+    }
+
+    /// [`Repo::merge_trees`] under `policy`: [`ConflictPolicy::Strict`]
+    /// answers every path both sides changed since `base` as a conflict,
+    /// even one a three-way merge would resolve (ADR 0066).
+    pub(crate) async fn merge_trees_as(
+        &self,
+        base: Hash,
+        ours: Hash,
+        theirs: Hash,
+        policy: ConflictPolicy,
+    ) -> Result<TreeMerge> {
         let theirs_diff = self.diff_trees(base, theirs, "").await?;
         let paths: Vec<&RepoPath> = theirs_diff.iter().map(|e| &e.path).collect();
         let ours_at: HashMap<RepoPath, Option<FileInfo>> = if ours == base {
@@ -196,7 +210,7 @@ impl Repo {
         } else {
             self.files_at(ours, &paths).await?
         };
-        self.resolve_merge(ours, theirs_diff, ours_at).await
+        self.resolve_merge(ours, theirs_diff, ours_at, policy).await
     }
 
     /// [`Repo::merge_trees`] the way it was before it read `ours` only at
@@ -220,7 +234,8 @@ impl Repo {
             .iter()
             .filter_map(|e| Some((e.path.clone(), ours_diff.get(&e.path)?.clone())))
             .collect();
-        self.resolve_merge(ours, theirs_diff, ours_at).await
+        self.resolve_merge(ours, theirs_diff, ours_at, ConflictPolicy::Merge)
+            .await
     }
 
     /// Resolve each entry of `theirs_diff` against `ours`' file at its path
@@ -230,6 +245,7 @@ impl Repo {
         ours: Hash,
         theirs_diff: Vec<DiffEntry>,
         mut ours_at: HashMap<RepoPath, Option<FileInfo>>,
+        policy: ConflictPolicy,
     ) -> Result<TreeMerge> {
         let mut changes = BTreeMap::new();
         let mut conflicts = Vec::new();
@@ -239,6 +255,16 @@ impl Repo {
                 Some(n) => n,
                 None => e.old.clone(),
             };
+            if policy == ConflictPolicy::Strict && our_info != e.old {
+                conflicts.push(Conflict {
+                    path: e.path,
+                    base: e.old,
+                    ours: our_info,
+                    theirs: e.new,
+                    merged_with_markers: None,
+                });
+                continue;
+            }
             match self.resolve3(&e.old, &our_info, &e.new).await? {
                 Resolved::Keep => {}
                 Resolved::Set(c) => {
@@ -314,6 +340,16 @@ impl Repo {
 
     /// Replay `cs`'s changes (relative to its first parent) onto `onto`.
     pub async fn rebase(&self, cs: ChangesetId, onto: ChangesetId) -> Result<RebaseResponse> {
+        self.rebase_as(cs, onto, ConflictPolicy::Merge).await
+    }
+
+    /// [`Repo::rebase`] with `policy` deciding same-path overlaps.
+    pub(crate) async fn rebase_as(
+        &self,
+        cs: ChangesetId,
+        onto: ChangesetId,
+        policy: ConflictPolicy,
+    ) -> Result<RebaseResponse> {
         // The copy's link names `cs`, and its parent is `onto`.
         self.rescue_changesets(&[cs, onto], RescueBy::Create)
             .await?;
@@ -326,10 +362,11 @@ impl Repo {
         }
         self.get_changeset(onto).await?;
         let m = self
-            .merge_trees(
+            .merge_trees_as(
                 self.tree_or_empty(orig.parents.first().copied()).await?,
                 self.root_tree(onto).await?,
                 self.root_tree(cs).await?,
+                policy,
             )
             .await?;
         if !m.conflicts.is_empty() {
