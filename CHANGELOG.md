@@ -7,6 +7,32 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 ## [Unreleased]
 
+### `leep config`, and the author from git
+- **Added.** `leep config author "Name <email>"` sets the author of new
+  changesets for the working copy (`.leep/config.json`), `--global` for the
+  user (`$XDG_CONFIG_HOME/leep/config.json`, `%APPDATA%\leep\config.json` on
+  Windows), `--unset` removes it, and `leep config author` prints the author
+  in effect and where it comes from (`--json`: `{"author", "source"}`). Only
+  `author` is supported so far.
+- **Changed.** With no `--author` or `LEEP_AUTHOR`, the author now comes from
+  those settings, then from git's `user.name` and `user.email` (as
+  `Name <email>`), and only then from the login name or the server, so
+  people arriving from git no longer commit as their login name or
+  `unknown`. `.leep/config.json` gains an optional `author` key that older
+  CLIs ignore. See docs/CLI.md, "Author of new changesets".
+
+### `.gitignore` is read alongside `.leepignore`
+- **Added.** The working-copy scan (`status`, `commit`, `stash`, ...) now
+  reads the root `.gitignore` as well as the root `.leepignore`, so a
+  repository migrated from git no longer shows its build output and other
+  ignored files as added. `.leepignore` is read second, so its rules win
+  (`!pattern` takes a path back). Tracked files still show when they change,
+  whatever the rules say, and nested ignore files are still not read. See
+  docs/CLI.md, "Ignored files".
+- **Fixed.** An untracked file inside an ignored directory that also holds
+  tracked files (`out/` ignored, `out/keep.bin` tracked) showed as added;
+  it is now ignored, as in git.
+
 ### `sync --no-rebase` keeps local commits (issue #176)
 - **Fixed.** `leep sync --no-rebase` moved the working copy to the target's
   head even when the base was an unlanded local commit, leaving it
@@ -59,6 +85,18 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   server storing them. Each worker holds one file's bytes at a time; after a
   failed upload no new one starts, and the error reported is the one the
   first failing file gave, as before.
+### Git-style revision suffixes: `main~1`, `@^2` (ADR 0064)
+- `~N` (Nth first-parent ancestor) and `^N` (Nth parent; `^0` is the
+  changeset itself) now follow any revision, chained left to right as in git:
+  `leep diff main~1 main`, `leep show @~1`, `leep checkout 2a954d8e^2`,
+  `main~2^2~1`. `GET /v1/resolve/{rev}` walks them on the server in one
+  request, `~N` by the first-parent skiplist, so the CLI, the MCP tools and
+  scripts all get the same grammar. The CLI expands `@` and short ids before
+  sending the suffix.
+- A walk past the first changeset or a missing Nth parent is 404 (exit 4); a
+  malformed suffix and git's reflog syntax `@{...}` are 400 (exit 1).
+  Revisions without `~`, `^` or `@{` resolve as before; ref names already
+  could not contain them.
 
 ### Blame of files with a lone CR (issue #169)
 - **Fixed.** `GET /v1/blame` answered 500 for a file with a `\r` not followed

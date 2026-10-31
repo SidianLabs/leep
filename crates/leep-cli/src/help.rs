@@ -68,7 +68,9 @@ pub const SHOW: &str = "\
 Examples:
   leep show main
   leep show 2a954d8ef7c7                # any unique prefix of 4+ hex digits
-  leep show @                           # the working copy base";
+  leep show @                           # the working copy base
+  leep show main~2                      # two first parents back
+  leep show @^2                         # the base's second parent (a merge)";
 
 pub const SEARCH: &str = "\
 Examples:
@@ -86,6 +88,16 @@ pub const UNDO: &str = "\
 Examples:
   leep undo                             # the target ref's last move
   leep reflog main -n 5 && leep undo main --to 41";
+
+pub const CONFIG: &str = "\
+Examples:
+  leep config author \"Ada Lovelace <ada@example.com>\"   # this working copy
+  leep config --global author \"Ada Lovelace <ada@example.com>\"
+  leep config author                    # the author in effect, and where it comes from
+  leep config --unset author
+The author of a new changeset is the first of: --author, LEEP_AUTHOR, this
+working copy's setting, the --global one, git's user.name and user.email,
+the login name, the server's name for the token.";
 
 pub const REVIEW: &str = "\
 Examples:
@@ -142,7 +154,7 @@ pub const GROUPS: &[(&str, &[&str])] = &[
         ],
     ),
     ("Review", &["review", "reviews"]),
-    ("Admin", &["undo", "keygen"]),
+    ("Admin", &["undo", "keygen", "config"]),
 ];
 
 /// The global options, written out once for the top-level help. The flags
@@ -266,7 +278,7 @@ mod tests {
     fn examples_parse() {
         let all = [
             INIT, CHECKOUT, STATUS, DIFF, COMMIT, LAND, SYNC, BRANCH, SWITCH, LOG, SHOW, SEARCH,
-            BLAME, UNDO, REVIEW,
+            BLAME, UNDO, REVIEW, CONFIG,
         ];
         let mut checked = 0;
         for text in all {

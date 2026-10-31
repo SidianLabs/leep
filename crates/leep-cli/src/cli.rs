@@ -7,8 +7,8 @@ use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use crate::cache::Cache;
 use crate::client::Client;
 use crate::commands::{
-    amend, branch, checkout, commit, diff, history, init, keygen, land, merge, pick, rebase,
-    reflog, reset, resolve, restore, review, search, stash, status, Ctx, Remote,
+    amend, branch, checkout, commit, config, diff, history, init, keygen, land, merge, pick,
+    rebase, reflog, reset, resolve, restore, review, search, stash, status, Ctx, Remote,
 };
 use crate::error::{CliError, ErrorKind, Result};
 use crate::help;
@@ -66,6 +66,9 @@ pub enum Command {
     Diff(diff::DiffArgs),
     /// Create an author signing key for `leep commit --sign`.
     Keygen(keygen::KeygenArgs),
+    /// Read or set Leep's own settings (the author of new changesets).
+    #[command(after_help = help::CONFIG)]
+    Config(config::ConfigArgs),
     /// Record local changes as a changeset.
     #[command(after_help = help::COMMIT)]
     Commit(commit::CommitArgs),
@@ -191,6 +194,9 @@ pub fn run(cli: Cli) -> Result<i32> {
     if let Command::Keygen(args) = &cli.command {
         return keygen::run(args);
     }
+    if let Command::Config(args) = &cli.command {
+        return config::run(args, cli.json);
+    }
     let cache = Cache::from_env()?;
     if let Command::Init(args) = &cli.command {
         let server = cli.server.as_deref().unwrap_or(DEFAULT_SERVER);
@@ -252,7 +258,9 @@ pub fn run(cli: Cli) -> Result<i32> {
         json: cli.json,
     };
     match &cli.command {
-        Command::Init(_) | Command::Keygen(_) => unreachable!("handled above"),
+        Command::Init(_) | Command::Keygen(_) | Command::Config(_) => {
+            unreachable!("handled above")
+        }
         Command::Checkout(a) => checkout::checkout(&mut ctx, a),
         Command::Status => status::run(&ctx),
         Command::Diff(a) => diff::run(&ctx, a),

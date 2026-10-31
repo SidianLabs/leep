@@ -794,6 +794,16 @@ from `MetaStore::changesets_with_prefix`: a bounded range scan of the
 changesets' primary key (the prefix padded with `00` and `ff` bytes). Several
 matches are a 400 listing up to 10 candidates; `leep log` prints 12-digit ids.
 
+**Revision suffixes** ([ADR 0064](adr/0064-revision-suffixes.md)). Any of
+those may end in git-style steps: `~N` (Nth first-parent ancestor), `^N` (Nth
+parent, `^0` itself), chained left to right (`main~2^2~1`). The grammar is
+`leep_core::revision`; `Repo::resolve` walks it on the server, `~N` by the
+first-parent skiplist so a large `N` costs `O(log N)` reads. The whole string
+is tried as a name first (ref names cannot contain `~` or `^`, but older refs
+might). `@` and short ids are expanded by the client, which then sends
+`<id><suffix>`; the MCP server shares that helper (`Client::resolve_rev`).
+Malformed suffixes and reflog syntax (`@{...}`) are 400, a walk past a root 404.
+
 **Merge**: three-way, per path, with base = `merge_base(ours, theirs)`.
 Identical changes on both sides merge trivially. Text files merge by line
 (`diffy`). Binary files and delete-vs-modify cases are returned as conflicts.

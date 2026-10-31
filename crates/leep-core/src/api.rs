@@ -16,7 +16,7 @@
 //! | POST | `/v1/refs/{name}` | [`CasRefRequest`] | [`CasRefResponse`] (409 if it lost) |
 //! | GET  | `/v1/reflog?before=seq&limit=n&after=cursor` | – | [`RefLogResponse`] (every ref move, newest first; `limit` defaults to 50, capped at 1000; `before` returns entries with a smaller `seq`; `after` is a page cursor, and with `before` is 400) |
 //! | GET  | `/v1/reflog/{name}?before=seq&limit=n&after=cursor` | – | [`RefLogResponse`] (the moves of one ref; an unknown or never-moved ref is an empty list) |
-//! | GET  | `/v1/resolve/{rev}` | – | [`ResolveResponse`] (`rev` = ref name, full 64-hex id or short tag name) |
+//! | GET  | `/v1/resolve/{rev}` | – | [`ResolveResponse`] (`rev` = ref name, full 64-hex id or short tag name, optionally followed by `~N` / `^N` steps; 404 if a step walks past a root, 400 if the suffix is malformed or uses `@{...}`; ADR 0064) |
 //! | GET  | `/v1/resolve-prefix/{prefix}` | – | [`ResolvePrefixResponse`] (the one changeset whose id starts with `prefix`, 4 to 64 hex digits in any case; 404 if none; 400 [`AmbiguousPrefixResponse`] listing up to 10 `candidates` if several; 400 if the prefix is shorter than 4 digits, longer than 64 or not hex; ADR 0035) |
 //! | GET  | `/v1/tree/{id}?path=dir` | – | [`TreeResponse`] (one directory level) |
 //! | GET  | `/v1/files/{id}?prefix=dir&limit=n&after=cursor` | – | [`FilesResponse`] (recursive listing, sorted by path; without `limit` the whole listing, as before; `limit` is capped at [`MAX_PATHS_LIMIT`], 0 or not a number is 400; `after` is a page cursor) |

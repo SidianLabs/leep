@@ -2,8 +2,7 @@
 //! bases and provenance. Outputs are compact, since every byte lands in the
 //! agent's context.
 
-use leep_cli::error::ErrorKind;
-use leep_core::prefix::looks_like_prefix;
+use leep_cli::client::RevVia;
 use leep_core::ChangesetId;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -140,21 +139,17 @@ impl Server {
         let fail = |e: leep_cli::error::CliError| {
             ToolError(format!(
                 "cannot resolve `{rev}`: {}. Use a ref name from leep_refs, a changeset id, or \
-                 a unique prefix of one (at least 4 hex digits).",
+                 a unique prefix of one (at least 4 hex digits), optionally with git-style \
+                 `~N` / `^N` suffixes.",
                 describe(&e)
             ))
         };
-        let (id, via) = match self.client.resolve(rev) {
-            Ok(id) if id.to_string() == rev.to_ascii_lowercase() => (id, "id"),
-            Ok(id) => (id, "ref"),
-            Err(e) if e.kind() == ErrorKind::NotFound && looks_like_prefix(rev) => {
-                match self.client.resolve_prefix(rev) {
-                    Ok(id) => (id, "prefix"),
-                    Err(p) if p.kind() == ErrorKind::NotFound => return Err(fail(e)),
-                    Err(p) => return Err(fail(p)),
-                }
-            }
-            Err(e) => return Err(fail(e)),
+        let (id, via) = self.client.resolve_rev(rev).map_err(fail)?;
+        let via = match via {
+            RevVia::Id => "id",
+            RevVia::Ref => "ref",
+            RevVia::Prefix => "prefix",
+            RevVia::Suffix => "suffix",
         };
         Ok(ToolOutput::json(json!({
             "rev": rev,

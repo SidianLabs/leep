@@ -158,7 +158,7 @@ pub fn revert(ctx: &mut Ctx, args: &RevertArgs) -> Result<i32> {
     let message = format!("Revert \"{summary}\"\n\nThis reverts {rev}.");
     let inverse = ctx.client.create_changeset(&Changeset {
         parents: vec![rev],
-        author: snapshot::author(ctx, args.author.as_deref()),
+        author: snapshot::author(ctx, args.author.as_deref())?,
         timestamp: snapshot::now_secs(),
         message: message.clone(),
         changes,

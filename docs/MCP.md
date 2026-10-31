@@ -57,7 +57,7 @@ printf '%s\n' \
 
 ## Tools
 
-`rev` is a branch name (default `main`), a tag (`tags/v1`, or `v1` when no branch has that name), a full 64-hex changeset id, or a unique prefix of one of at least 4 hex digits (ADR 0035; a ref wins over a prefix that spells the same).
+`rev` is a branch name (default `main`), a tag (`tags/v1`, or `v1` when no branch has that name), a full 64-hex changeset id, or a unique prefix of one of at least 4 hex digits (ADR 0035; a ref wins over a prefix that spells the same). Any of them may end in git-style steps, applied left to right: `~N` is the Nth first-parent ancestor, `^N` the Nth parent (`main~2`, `main^2`, `main~1^2~3`; ADR 0064).
 
 | Tool | Arguments | Result |
 |---|---|---|
@@ -71,7 +71,7 @@ printf '%s\n' \
 | `leep_search` | `query`, `rev?`, `regex?`, `case_insensitive?`, `path?`, `glob?`, `limit?` (default 50, max 200), `cursor?` | matching lines `{path, line_number, line, ranges}` ordered by path then line, `truncated`, `stats`, and `next` when the page stopped early (pass it back as `cursor`, with `rev` set to the result's `rev`); per line, UTF-8 text files up to 1 MiB (others counted in `stats.files_skipped`) |
 | `leep_review_status` | `rev`, `ref?` (default `main`) | per changed path: the rule that satisfies it (`auto:*`, `owner`, `merge_parent`) or `pending` / `rejected`, with owners and who approved or rejected, plus `approved`, `blocked_paths` and `next_step`; needs a server with authentication |
 | `leep_reflog` | `ref?` (default `main`) or `all?`, `limit?` (default 20, max 200), `cursor?`, `full_ids?` | the ref's moves newest first: `seq`, `op`, `old`, `new` (12-digit id prefixes unless `full_ids`), `time`, `actor`, `message`, and `land_id` for a land that named itself (`land_changeset` when the ref took a rebased copy); `ref` per entry with `all`; `next` when older entries follow (pass it back as `cursor`) |
-| `leep_resolve` | `rev` | `{rev, id, via}`: the full id and whether it came from a ref (or tag), a full `id` or a `prefix`; an ambiguous prefix is an error listing the candidates |
+| `leep_resolve` | `rev` | `{rev, id, via}`: the full id and whether it came from a ref (or tag), a full `id`, a `prefix`, or a revision with `~N` / `^N` steps (`suffix`, ADR 0064); an ambiguous prefix is an error listing the candidates |
 | `leep_merge_base` | `a`, `b` | `base` (the newest common ancestor, null if unrelated) and `a_is_ancestor_of_b` / `b_is_ancestor_of_a` |
 | `leep_provenance` | `rev?`, `path?`, `limit?` (changesets scanned, default 1000, max 10000), `top?` (rows per group, default 10, max 100) | per agent model and session, and per human author: changesets, distinct files touched, first and last timestamps; `agent_changesets` / `human_changesets` totals, `*_omitted` counts past `top`, `scanned` and `truncated` |
 | `leep_commit_and_land` | `message`, `changes[]`, `base?`, `target_ref?`, `create_ref?`, `prompt?`, `tests?`, `request_id?`; or `changeset` alone | landed id, or a conflict report |

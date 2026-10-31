@@ -2430,7 +2430,8 @@ fn author_falls_back_to_the_token_name_when_nothing_local_names_one() {
         &["--tokens-file", tokens.to_str().unwrap()],
     );
     let client = Client::new(&server.url, &root.join("cache"));
-    // Like a container or CI job: no login name at all.
+    // Like a container or CI job: no login name, no user config, no git
+    // identity.
     let token = std::cell::RefCell::new(carol_t);
     let leep = |cwd: &Path, author: Option<&str>, args: &[&str]| {
         let mut c = client.cmd(cwd);
@@ -2438,7 +2439,11 @@ fn author_falls_back_to_the_token_name_when_nothing_local_names_one() {
             .env_remove("LEEP_AUTHOR")
             .env_remove("USER")
             .env_remove("LOGNAME")
-            .env_remove("USERNAME");
+            .env_remove("USERNAME")
+            .env("XDG_CONFIG_HOME", root.join("xdg"))
+            .env("APPDATA", root.join("xdg"))
+            .env("GIT_CONFIG_GLOBAL", root.join("no-gitconfig"))
+            .env("GIT_CONFIG_NOSYSTEM", "1");
         if let Some(a) = author {
             c.env("LEEP_AUTHOR", a);
         }

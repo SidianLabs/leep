@@ -16,6 +16,7 @@ pub mod prefix;
 pub mod refname;
 pub mod rename;
 pub mod review;
+pub mod revision;
 pub mod signature;
 pub mod stdout;
 pub mod store;

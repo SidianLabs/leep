@@ -926,6 +926,14 @@ AND id <= ? ORDER BY id LIMIT ?`, the bounds being the prefix padded with
 `0x00` and `0xff` bytes (`leep_core::prefix::IdPrefix`). No encoding, hash,
 index or table changed, and no existing `/v1` shape changed.
 
+## Revision suffixes (additive meaning of `/v1/resolve`, ADR 0064)
+
+`GET /v1/resolve/{rev}` accepts git-style `~N` and `^N` steps after the base
+it always took. A `rev` without `~`, `^` or `@{` resolves exactly as before.
+One with them used to be 404; it is now 200, 404 (walk past a root, missing
+Nth parent) or 400 (malformed suffix, reflog syntax). No type, field or
+encoding changed. The whole string is tried as a ref name first.
+
 ## Explicit ref creation on land (additive API field, ADR 0036)
 
 `LandRequest` gains the optional `create` (`true`, `false` or absent; omitted
@@ -1321,3 +1329,21 @@ every JSON error body (`ErrorResponse`, `AmbiguousPrefixResponse`) gains
 (OPERATIONS.md, "Logs") and passes it on when it forwards a land to the
 server coordinating the ref. Success bodies are unchanged. Clients that send
 nothing see only the new header and field.
+
+## Author settings (optional client config field, no server change)
+
+The CLI's `.leep/config.json` (the working copy's settings: `server`,
+`target_ref`, `prefixes`, `token`) gains the optional `author`, a string
+written by `leep config author`. It is omitted when unset
+(`skip_serializing_if`), so a config without one is written exactly as
+before, a file written before it existed loads unchanged (`serde(default)`),
+and an older CLI ignores the key. An older CLI that rewrites the file (for
+example `leep switch` saving `target_ref`) drops it, as it would any key it
+does not know.
+
+`leep config --global` writes a new per-user file, `config.json` under
+`$XDG_CONFIG_HOME/leep/` (else `%APPDATA%\leep\` on Windows, else
+`~/.config/leep/`): a JSON object whose only key so far is `author`. The CLI
+keeps keys it does not know when it rewrites that file. Neither file is sent
+to the server; the author ends up in `Changeset.author` as before, and no
+changeset, tree, hash or API shape changed.
