@@ -23,6 +23,10 @@ pub struct Config {
     /// Bearer token; lowest precedence after `--token` and `LEEP_TOKEN`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
+    /// Author of new changesets here, set by `leep config author`; below
+    /// `--author` and `LEEP_AUTHOR`, above the user config and git.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
 }
 
 // Manual so the token can never reach logs through `{:?}`.
@@ -33,6 +37,7 @@ impl std::fmt::Debug for Config {
             .field("target_ref", &self.target_ref)
             .field("prefixes", &self.prefixes)
             .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .field("author", &self.author)
             .finish()
     }
 }
@@ -383,6 +388,7 @@ mod tests {
                 target_ref: "main".into(),
                 prefixes: vec!["src".into()],
                 token: None,
+                author: None,
             },
         )
         .unwrap();
@@ -480,6 +486,7 @@ mod tests {
                 target_ref: "main".into(),
                 prefixes: vec![],
                 token: None,
+                author: None,
             },
         )
         .unwrap();
@@ -492,6 +499,21 @@ mod tests {
         fs::create_dir_all(dir.path().join("d/e")).unwrap();
         assert_eq!(wc.abs_for_write("d/e/f").unwrap(), dir.path().join("d/e/f"));
         assert!(wc.abs_for_write("new/dir/f").is_ok());
+    }
+
+    /// `author` is optional both ways: a file written before it existed
+    /// loads, and a config without one is written without the key, so an
+    /// older CLI reads it unchanged.
+    #[test]
+    fn config_author_is_optional() {
+        let old: Config = serde_json::from_str(r#"{"server":"http://x"}"#).unwrap();
+        assert_eq!(old.author, None);
+        let v = serde_json::to_value(&old).unwrap();
+        assert!(v.get("author").is_none(), "{v}");
+        let with: Config =
+            serde_json::from_str(r#"{"server":"http://x","author":"A <a@x>"}"#).unwrap();
+        assert_eq!(with.author.as_deref(), Some("A <a@x>"));
+        assert_eq!(serde_json::to_value(&with).unwrap()["author"], "A <a@x>");
     }
 
     #[test]
@@ -516,6 +538,7 @@ mod tests {
                 target_ref: "main".into(),
                 prefixes: vec![],
                 token: Some("s3cret".into()),
+                author: None,
             },
         )
         .unwrap();

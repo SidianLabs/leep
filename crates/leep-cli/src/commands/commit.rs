@@ -24,8 +24,9 @@ pub struct CommitArgs {
     /// revert, which supply their own.
     #[arg(short, long)]
     pub message: Option<String>,
-    /// Author (default: $LEEP_AUTHOR, else the login name, else the token's
-    /// name on the server).
+    /// Author (default: $LEEP_AUTHOR, else `leep config author`, else git's
+    /// user.name and user.email, else the login name, else the token's name
+    /// on the server).
     #[arg(long)]
     pub author: Option<String>,
     /// Model that produced the change.
@@ -45,7 +46,7 @@ pub struct CommitArgs {
     pub sign: Option<PathBuf>,
 }
 
-fn author(ctx: &Ctx, args: &CommitArgs) -> String {
+fn author(ctx: &Ctx, args: &CommitArgs) -> Result<String> {
     snapshot::author(ctx, args.author.as_deref())
 }
 
@@ -129,7 +130,7 @@ pub fn run(ctx: &mut Ctx, args: &CommitArgs) -> Result<i32> {
     }
     let cs = Changeset {
         parents,
-        author: author(ctx, args),
+        author: author(ctx, args)?,
         timestamp: snapshot::now_secs(),
         message,
         changes,

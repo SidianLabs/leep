@@ -1321,3 +1321,21 @@ every JSON error body (`ErrorResponse`, `AmbiguousPrefixResponse`) gains
 (OPERATIONS.md, "Logs") and passes it on when it forwards a land to the
 server coordinating the ref. Success bodies are unchanged. Clients that send
 nothing see only the new header and field.
+
+## Author settings (optional client config field, no server change)
+
+The CLI's `.leep/config.json` (the working copy's settings: `server`,
+`target_ref`, `prefixes`, `token`) gains the optional `author`, a string
+written by `leep config author`. It is omitted when unset
+(`skip_serializing_if`), so a config without one is written exactly as
+before, a file written before it existed loads unchanged (`serde(default)`),
+and an older CLI ignores the key. An older CLI that rewrites the file (for
+example `leep switch` saving `target_ref`) drops it, as it would any key it
+does not know.
+
+`leep config --global` writes a new per-user file, `config.json` under
+`$XDG_CONFIG_HOME/leep/` (else `%APPDATA%\leep\` on Windows, else
+`~/.config/leep/`): a JSON object whose only key so far is `author`. The CLI
+keeps keys it does not know when it rewrites that file. Neither file is sent
+to the server; the author ends up in `Changeset.author` as before, and no
+changeset, tree, hash or API shape changed.

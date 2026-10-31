@@ -377,6 +377,7 @@ mod tests {
                 target_ref: "main".into(),
                 prefixes: vec![],
                 token: None,
+                author: None,
             },
         )
         .unwrap()

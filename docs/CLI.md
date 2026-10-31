@@ -15,7 +15,7 @@ command's options with examples for the common ones.
 | Branches | `branch`, `switch`, `tag`, `merge`, `rebase`, `cherry-pick`, `revert` |
 | History | `log`, `show`, `cat`, `blame`, `last-change`, `search`, `provenance`, `refs`, `reflog` |
 | Review | `review` (`approve`, `reject`, `status`, `list`), `reviews` |
-| Admin | `undo`, `keygen` |
+| Admin | `undo`, `keygen`, `config` |
 
 Global options, accepted by every command and listed only in `leep --help`:
 
@@ -69,6 +69,46 @@ Ignore rules only hide untracked files. A tracked file that a rule matches is
 still scanned, and shows as `M` or `D` when it changes; to stop tracking it,
 delete it and commit. `.leep` and `.git`
 directories, at any depth, are never scanned.
+
+## Author of new changesets
+
+`commit`, `merge`, `cherry-pick`, `revert` and `stash` stamp new changesets
+with the first author they find:
+
+1. `--author` (where the command has it);
+2. `LEEP_AUTHOR`;
+3. `author` in the working copy's `.leep/config.json`, set by `leep config
+   author`;
+4. `author` in the user config file, set by `leep config --global author`:
+   `$XDG_CONFIG_HOME/leep/config.json`, else `%APPDATA%\leep\config.json` on
+   Windows, else `~/.config/leep/config.json`;
+5. git's identity: `git config --get user.name` and `user.email`, run in the
+   working copy root, as `Name <email>` (just the name without an email).
+   A missing `git` or an unset name is skipped silently;
+6. the login name (`USER`, `LOGNAME`, `USERNAME`);
+7. the server's name for the token (its `author`, else its `name`; see
+   DEPLOY.md), else `unknown`.
+
+Blank values count as unset. `amend` keeps the author unless given
+`--author`.
+
+`leep config` reads and writes Leep's own settings; only `author` exists so
+far, and any other key is a usage error (exit 2) that lists the supported
+ones. It needs no server.
+
+| Command | Effect |
+|---|---|
+| `leep config author "Name <email>"` | Set it in this working copy's `.leep/config.json`. |
+| `leep config --global author "Name <email>"` | Set it in the user config file. |
+| `leep config author` | Print the author in effect on stdout, and where it comes from on stderr. Works outside a working copy too. |
+| `leep config --global author` | Print the user config file's value, if any. |
+| `leep config --unset author` | Remove it from `.leep/config.json` (with `--global`, from the user config file). |
+
+With `--json`, every form prints `{"author": ..., "source": ...}`. `source` is
+one of `env`, `repo`, `user`, `git`, `login`, or `server` when nothing local
+names an author (then `author` is `null`); after a set or unset it is the
+level written (`repo` or `user`). A value with a line break or another
+control character is refused (exit 1); so is an empty one: use `--unset`.
 
 ## Long listings
 
@@ -216,7 +256,7 @@ print their normal JSON result and exit 5 rather than an error.
   |---|---|
   | `LEEP_SERVER` | Server URL; `--server` overrides it, and it overrides `.leep/config.json`. |
   | `LEEP_TOKEN` | Bearer token; `--token` overrides it, and it overrides `.leep/config.json`. |
-  | `LEEP_AUTHOR` | Author of new changesets. |
+  | `LEEP_AUTHOR` | Author of new changesets; `--author` overrides it, and it overrides `leep config author` (see "Author of new changesets"). |
   | `LEEP_AGENT_MODEL`, `LEEP_AGENT_SESSION`, `LEEP_AGENT_PROMPT`, `LEEP_AGENT_TESTS` | Provenance recorded by `commit` and `amend` (`agent.*` metadata). |
   | `LEEP_SIGNING_KEY` | Key file that `commit`, `amend`, `merge`, `cherry-pick` and `revert` sign with. |
   | `LEEP_CACHE_DIR` | Local blob cache. |

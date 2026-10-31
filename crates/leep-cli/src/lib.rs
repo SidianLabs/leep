@@ -14,6 +14,7 @@ pub mod commands;
 pub mod error;
 pub mod fmt;
 pub mod help;
+pub mod identity;
 pub mod markers;
 pub mod materialize;
 pub mod overlay;

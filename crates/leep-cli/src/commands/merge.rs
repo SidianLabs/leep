@@ -103,7 +103,7 @@ pub fn run(ctx: &mut Ctx, args: &MergeArgs) -> Result<i32> {
         parents: [base, other],
         message: message.clone(),
         authorship: Authorship {
-            author: snapshot::author(ctx, args.author.as_deref()),
+            author: snapshot::author(ctx, args.author.as_deref())?,
             timestamp: Some(snapshot::now_secs()),
         },
         extra: BTreeMap::new(),

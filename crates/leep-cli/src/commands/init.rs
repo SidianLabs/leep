@@ -57,6 +57,7 @@ pub fn run(
             target_ref: args.target_ref.clone(),
             prefixes,
             token: token.filter(|_| store_token),
+            author: None,
         },
     )?;
     let mut ctx = Ctx {

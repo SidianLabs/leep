@@ -7,6 +7,20 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 ## [Unreleased]
 
+### `leep config`, and the author from git
+- **Added.** `leep config author "Name <email>"` sets the author of new
+  changesets for the working copy (`.leep/config.json`), `--global` for the
+  user (`$XDG_CONFIG_HOME/leep/config.json`, `%APPDATA%\leep\config.json` on
+  Windows), `--unset` removes it, and `leep config author` prints the author
+  in effect and where it comes from (`--json`: `{"author", "source"}`). Only
+  `author` is supported so far.
+- **Changed.** With no `--author` or `LEEP_AUTHOR`, the author now comes from
+  those settings, then from git's `user.name` and `user.email` (as
+  `Name <email>`), and only then from the login name or the server, so
+  people arriving from git no longer commit as their login name or
+  `unknown`. `.leep/config.json` gains an optional `author` key that older
+  CLIs ignore. See docs/CLI.md, "Author of new changesets".
+
 ### `.gitignore` is read alongside `.leepignore`
 - **Added.** The working-copy scan (`status`, `commit`, `stash`, ...) now
   reads the root `.gitignore` as well as the root `.leepignore`, so a

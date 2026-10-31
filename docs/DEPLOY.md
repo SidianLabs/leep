@@ -260,8 +260,9 @@ by itself, and rotate the ones still needed before then: the
 ([OPERATIONS.md](OPERATIONS.md#metrics)). Changing `expires` takes effect on
 SIGHUP like any other edit; a request admitted before the time passes finishes.
 An entry may also carry `"author": "Name <email>"` (or `gen-token --author`).
-When a client names no author itself (no `--author`, `LEEP_AUTHOR` or login
-name, as in most containers), `leep` stamps that on its changesets, falling
+When a client names no author itself (no `--author`, `LEEP_AUTHOR`,
+`leep config author`, git `user.name` or login name, as in most containers;
+see [CLI.md](CLI.md#author-of-new-changesets)), `leep` stamps that on its changesets, falling
 back to the token's `name`. It is a default, not enforcement: a client that
 sets `LEEP_AUTHOR` still wins.
 Clients pass the token with `LEEP_TOKEN`, `leep --token` or
