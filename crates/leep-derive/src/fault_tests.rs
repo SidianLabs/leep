@@ -29,6 +29,22 @@ mod admission;
 #[path = "sweep_fault_tests.rs"]
 mod sweep;
 
+/// Whether the repositories of the run with `seed` leave their creates'
+/// tree nodes out (ADR 0069): `LEEP_FAULT_LAZY=on` or `off` for every seed,
+/// otherwise odd seeds on and even seeds off, so one sweep covers both.
+pub(crate) fn lazy_mode(seed: u64) -> bool {
+    match std::env::var("LEEP_FAULT_LAZY").as_deref() {
+        Ok("on") => true,
+        Ok("off") => false,
+        _ => seed % 2 == 1,
+    }
+}
+
+/// [`lazy_mode`] for a test with no seed: lazy unless `LEEP_FAULT_LAZY=off`.
+pub(crate) fn lazy_unseeded() -> bool {
+    std::env::var("LEEP_FAULT_LAZY").as_deref() != Ok("off")
+}
+
 /// Stores shared by any number of faulty "servers" and one clean verifier.
 pub(crate) struct World {
     pub(crate) blobs: Arc<MemoryBlobStore>,
@@ -36,6 +52,8 @@ pub(crate) struct World {
     pub(crate) plan: Arc<FaultPlan>,
     /// Reads the same data with no faults.
     pub(crate) clean: Repo,
+    /// See [`lazy_mode`].
+    pub(crate) lazy: bool,
 }
 
 impl World {
@@ -47,8 +65,10 @@ impl World {
     pub(crate) fn with_meta(seed: u64, meta: MemoryMetaStore) -> World {
         let blobs = Arc::new(MemoryBlobStore::new());
         let meta = Arc::new(meta);
+        let lazy = lazy_mode(seed);
         World {
-            clean: Repo::new(blobs.clone(), meta.clone()),
+            clean: Repo::new(blobs.clone(), meta.clone()).with_lazy_create_trees(lazy),
+            lazy,
             plan: FaultPlan::new(seed),
             blobs,
             meta,
@@ -67,6 +87,7 @@ impl World {
             Arc::new(FaultyBlobStore::new(self.blobs.clone(), plan.clone())),
             Arc::new(FaultyMetaStore::new(self.meta.clone(), plan.clone())),
         )
+        .with_lazy_create_trees(self.lazy)
     }
 }
 
@@ -963,7 +984,8 @@ async fn derivation_under_faults_leaves_no_wrong_rows() {
     // Ground truth: every row a fault-free derivation writes.
     let blobs = Arc::new(MemoryBlobStore::new());
     let truth_meta = Tamper::new(Arc::new(MemoryMetaStore::new()));
-    let truth = Repo::new(blobs.clone(), truth_meta.clone());
+    let truth =
+        Repo::new(blobs.clone(), truth_meta.clone()).with_lazy_create_trees(lazy_unseeded());
     let ids = small_history(0, &truth).await;
     let want = answers(&truth, &ids).await.unwrap();
     for id in &ids {
@@ -1096,7 +1118,9 @@ async fn parallel_derivation_under_faults_stores_rows_after_their_parents() {
     };
     let blobs = Arc::new(MemoryBlobStore::new());
     let truth_meta = Tamper::new(Arc::new(MemoryMetaStore::new()));
-    let truth = Repo::new(blobs.clone(), truth_meta.clone()).with_derive_jobs(1);
+    let truth = Repo::new(blobs.clone(), truth_meta.clone())
+        .with_derive_jobs(1)
+        .with_lazy_create_trees(lazy_unseeded());
     let ids = lanes_history(&truth, 300).await;
     let tip = *ids.last().unwrap();
     derive::<HistoryTree>(&truth, tip).await.unwrap();
@@ -1251,7 +1275,8 @@ const VERIFIED: &[&str] = &[
 async fn flip_outcomes() -> BTreeMap<String, Outcomes> {
     let blobs = Arc::new(MemoryBlobStore::new());
     let truth_meta = Tamper::new(Arc::new(MemoryMetaStore::new()));
-    let truth = Repo::new(blobs.clone(), truth_meta.clone());
+    let truth =
+        Repo::new(blobs.clone(), truth_meta.clone()).with_lazy_create_trees(lazy_unseeded());
     let mut ids = small_history(0, &truth).await;
     // A changeset touching enough directories that its history pack takes
     // more than one part, so `history-node-v4` rows are swept too.
@@ -1983,7 +2008,9 @@ async fn index_holders_killed_paused_and_racing_store_the_fault_free_rows() {
     use crate::derived::{derive, HistoryTree, LogFilterIndex};
     let blobs = Arc::new(MemoryBlobStore::new());
     let truth_meta = Tamper::new(Arc::new(MemoryMetaStore::new()));
-    let truth = Repo::new(blobs.clone(), truth_meta.clone()).with_derive_jobs(1);
+    let truth = Repo::new(blobs.clone(), truth_meta.clone())
+        .with_derive_jobs(1)
+        .with_lazy_create_trees(lazy_unseeded());
     let ids = lanes_history(&truth, 160).await;
     let tip = *ids.last().unwrap();
     // Heads: the octopus and a few older lane tips, so passes have several.
@@ -2013,7 +2040,7 @@ async fn a_fence_holds_a_drop_back_until_a_paused_holder_write_lands() {
     for fence in [Duration::from_secs(5), Duration::ZERO] {
         let blobs = Arc::new(MemoryBlobStore::new());
         let meta = Arc::new(clocked_meta());
-        let clean = Repo::new(blobs.clone(), meta.clone());
+        let clean = Repo::new(blobs.clone(), meta.clone()).with_lazy_create_trees(lazy_unseeded());
         let ids = lanes_history(&clean, 200).await;
         let tip = *ids.last().unwrap();
         // The lower part is indexed already; the holder derives the rest.
