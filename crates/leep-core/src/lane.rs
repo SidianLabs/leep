@@ -1,7 +1,7 @@
 //! Which share of the metadata store's connections a task draws on (ADR
 //! 0067). Land leaders run in [`Lane::Land`] so that request handlers
 //! filling the shared pool can never queue the one task every land on a ref
-//! waits for, and the index warmer in [`Lane::Index`] (ADR 0071) so that
+//! waits for, and the index warmer in [`Lane::Index`] (ADR 0073) so that
 //! queries scanning past a lagging index cannot starve the task that closes
 //! the lag. Stores without separate pools ignore it.
 

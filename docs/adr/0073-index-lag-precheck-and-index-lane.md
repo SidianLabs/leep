@@ -1,4 +1,4 @@
-# 0071. Skiplist pre-check for bounded queries and an index lane
+# 0073. Skiplist pre-check for bounded queries and an index lane
 Status: Accepted
 Date: 2026-11-01
 

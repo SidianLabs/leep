@@ -252,7 +252,7 @@ the tail misses nothing), lists every ref every 5 s as a backstop, and
 derives all moved heads of a pass as one range per kind
 (`derived::derive_heads`), so shared history is derived once and different
 refs' new changesets derive side by side (ADR 0058, phase 0).
-The loops run in the index lane (`leep_core::lane::Lane::Index`, ADR 0071),
+The loops run in the index lane (`leep_core::lane::Lane::Index`, ADR 0073),
 and the tasks their derivations spawn keep it (`lane::inherit_index`): the
 Postgres store answers them from a reserved pool
 (`--meta-index-pool-size`), so queries that fill the shared pool while an
@@ -274,7 +274,7 @@ ancestors. It finds that part (stopping at a budget) and runs on a handle
 that knows it. Before walking, it counts the un-indexed first-parent chain
 of its starts down the skiplists: a chain longer than the budget proves the
 part over it in O(log gap) reads, so a lagging index costs a query tens of
-calls instead of two round trips per changeset behind (ADR 0071). Within
+calls instead of two round trips per changeset behind (ADR 0073). Within
 the budget: the path walk examines an un-indexed changeset the way
 `log_scan` does and queues its parents, then settles its queue so the page's
 `next` is the indexed walk's; last-change computes the newest changes bottom

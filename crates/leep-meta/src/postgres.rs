@@ -102,7 +102,7 @@ pub struct PostgresMetaStore {
     /// `pool` cannot queue the task every land on a ref waits for. `None`
     /// (`--meta-land-pool-size 0`) shares `pool`. Connects on first use.
     pub(crate) land_pool: Option<PgPool>,
-    /// Data calls of tasks in [`Lane::Index`] (ADR 0071): the index warmer,
+    /// Data calls of tasks in [`Lane::Index`] (ADR 0073): the index warmer,
     /// so queries scanning past a lagging index cannot starve the task that
     /// closes the lag. `None` (`--meta-index-pool-size 0`) shares `pool`.
     /// Connects on first use.
@@ -174,7 +174,7 @@ impl PostgresMetaStore {
 
     /// [`connect_with_lanes`](Self::connect_with_lanes), with
     /// `index_pool_size` connections reserved for the index warmer (ADR
-    /// 0071) instead of
+    /// 0073) instead of
     /// [`default_index_pool_size`](crate::default_index_pool_size); 0
     /// reserves none.
     pub async fn connect_with_pools(
@@ -591,7 +591,7 @@ impl Pools {
 }
 
 impl PostgresMetaStore {
-    /// The pool the running task's data calls draw on (ADR 0067, 0071),
+    /// The pool the running task's data calls draw on (ADR 0067, 0073),
     /// with the connection gauges of that pool brought up to date.
     fn db(&self) -> &PgPool {
         let lane = leep_core::lane::current();

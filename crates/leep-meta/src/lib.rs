@@ -83,7 +83,7 @@ pub async fn open_meta_store_with_options(
     open_meta_store_with_lanes(url, mode, pool_size, None, statement_timeout).await
 }
 
-/// Connections a Postgres store reserves for the index warmer (ADR 0071)
+/// Connections a Postgres store reserves for the index warmer (ADR 0073)
 /// unless told otherwise (`leep-server --meta-index-pool-size`): a
 /// sixteenth of the data pool, and at least 4, so each group's warming loop
 /// has a read and a write in flight.
@@ -97,7 +97,7 @@ pub fn default_index_pool_size(pool_size: u32) -> u32 {
 pub struct LanePools {
     /// Land leaders (ADR 0067); default [`default_land_pool_size`].
     pub land: Option<u32>,
-    /// The index warmer (ADR 0071); default [`default_index_pool_size`].
+    /// The index warmer (ADR 0073); default [`default_index_pool_size`].
     pub index: Option<u32>,
 }
 

@@ -1080,7 +1080,7 @@ async fn postgres_land_lane_sizes() {
 }
 
 /// Queries holding every connection of the shared pool cannot starve the
-/// index warmer (ADR 0071): in the index lane its reads and row writes run
+/// index warmer (ADR 0073): in the index lane its reads and row writes run
 /// on the reserved pool, while the same calls outside it wait. The land
 /// lane does not draw on the index pool.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

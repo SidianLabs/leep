@@ -4406,7 +4406,7 @@ mod warm {
         assert!(has_history(&r, c).await);
     }
 
-    /// Records the metadata lane of every data call (ADR 0067, 0071).
+    /// Records the metadata lane of every data call (ADR 0067, 0073).
     struct LaneProbe {
         inner: Arc<MemoryMetaStore>,
         calls: std::sync::Mutex<Vec<(&'static str, leep_core::lane::Lane)>>,
@@ -4496,7 +4496,7 @@ mod warm {
     /// The warmer's loops make every metadata call in the index lane,
     /// including the reads and row writes of the tasks its derivations
     /// spawn, so the Postgres store serves them from the index pool (ADR
-    /// 0071). A land leader's derivation tasks do not inherit the land lane.
+    /// 0073). A land leader's derivation tasks do not inherit the land lane.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn warm_loops_run_in_the_index_lane() {
         use leep_core::lane::Lane;

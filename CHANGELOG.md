@@ -13,7 +13,7 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   in tens of metadata calls, instead of walking the gap two round trips per
   changeset. Its answer (503, `stale-ok`, or the legacy wait and larger
   scan) is unchanged; a gap within budget is walked as before. See ADR
-  0071.
+  0073.
 - **Added.** `--meta-index-pool-size` (`LEEP_META_INDEX_POOL_SIZE`):
   Postgres connections reserved for the index warmer, opened on first use,
   default a sixteenth of `--meta-pool-size` and at least 4; `0` shares the

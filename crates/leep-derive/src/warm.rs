@@ -19,7 +19,7 @@
 //! [`Warmer::spawn`] runs one loop per index group, each with its own tail
 //! of the ref log, so a group that falls behind (path history after an
 //! import) does not hold back the others: nothing in one group's rows
-//! depends on another's. The loops run in the index lane (ADR 0071): on
+//! depends on another's. The loops run in the index lane (ADR 0073): on
 //! Postgres they draw on connections of their own, so queries that fill
 //! the shared pool while the index is behind cannot slow the warmer that
 //! would bring it back.
@@ -429,7 +429,7 @@ impl Warmer {
     /// Run passes forever, `interval` apart, starting now: one loop per
     /// index group (see the module docs), each in the index lane, so the
     /// metadata store serves it from connections queries cannot take (ADR
-    /// 0071). Aborting the handle stops them all.
+    /// 0073). Aborting the handle stops them all.
     pub fn spawn(self, interval: Duration) -> tokio::task::JoinHandle<()> {
         let loops: Vec<Warmer> = match self.only {
             Some(_) => vec![self],

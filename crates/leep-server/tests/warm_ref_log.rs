@@ -140,7 +140,7 @@ async fn tail_on_sqlite() {
 }
 
 /// Queries holding every connection of the shared Postgres pool do not
-/// stop the warmer (ADR 0071): its loops, and the tasks their derivations
+/// stop the warmer (ADR 0073): its loops, and the tasks their derivations
 /// spawn, run in the index lane on connections of their own, while a call
 /// in the shared lane waits.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

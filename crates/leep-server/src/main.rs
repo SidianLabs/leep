@@ -84,7 +84,7 @@ struct Args {
     )]
     meta_land_pool_size: Option<u32>,
     /// Postgres connections reserved, beyond --meta-pool-size, for the
-    /// index warmer (ADR 0071), so queries scanning past a lagging index
+    /// index warmer (ADR 0073), so queries scanning past a lagging index
     /// cannot starve the passes that close the lag. Default: a sixteenth of
     /// --meta-pool-size, at least 4. 0 reserves none (the warmer shares the
     /// pool). Opened on first use; SQLite ignores it.

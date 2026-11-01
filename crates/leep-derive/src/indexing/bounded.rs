@@ -11,7 +11,7 @@
 //!
 //! Each query first finds its un-indexed part, stopping at a budget; a gap
 //! the skiplists show is longer than the budget is over it without being
-//! walked (ADR 0071). Within the budget it runs on a handle that knows the
+//! walked (ADR 0073). Within the budget it runs on a handle that knows the
 //! part ([`Bounded`]). Over it, the request's `Leep-Indexing` header
 //! decides: `retry` gets [`Error::Indexing`] (503), `stale-ok` an answer at
 //! the newest indexed first-parent ancestor, and a request without the
