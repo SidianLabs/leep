@@ -667,6 +667,10 @@ impl BlobStore for MissCounting {
         }
         Ok(got)
     }
+    /// The exact retry of a miss `get` counted already (ADR 0070).
+    async fn get_exact(&self, hash: &Hash) -> leep_core::Result<Option<Bytes>> {
+        self.inner.get_exact(hash).await
+    }
     async fn contains(&self, hash: &Hash) -> leep_core::Result<bool> {
         self.inner.contains(hash).await
     }
