@@ -64,6 +64,8 @@ struct Shared {
     /// killed GC's lease without the history growing meanwhile.
     pause: AtomicBool,
     confirmed: Mutex<Vec<Confirmed>>,
+    /// Changesets whose trees a store check has read.
+    trees_read: Mutex<HashSet<ChangesetId>>,
     /// Answers that were neither a success nor a plain "try again".
     odd: Mutex<Vec<String>>,
     retries: Mutex<u64>,
@@ -116,6 +118,41 @@ impl Shared {
 struct StopOnDrop<'a>(&'a AtomicBool);
 
 impl Drop for StopOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Ends the test binary once a crash test runs past its budget
+/// (`LEEP_CRASH_BUDGET_SECS`, default 900): a test that stops converging
+/// then fails CI with its log within minutes, instead of holding the
+/// tests queued behind `serial()` until the job's timeout.
+struct Watchdog(std::sync::Arc<AtomicBool>);
+
+impl Watchdog {
+    fn start() -> Self {
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+        let budget = Duration::from_secs(env_u64("LEEP_CRASH_BUDGET_SECS", 900));
+        let name = std::thread::current()
+            .name()
+            .unwrap_or("crash test")
+            .to_string();
+        let flag = done.clone();
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            while !flag.load(Ordering::Relaxed) {
+                if started.elapsed() > budget {
+                    eprintln!("{name} ran past its {budget:?} budget; ending the test binary");
+                    std::process::exit(101);
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        });
+        Watchdog(done)
+    }
+}
+
+impl Drop for Watchdog {
     fn drop(&mut self) {
         self.0.store(true, Ordering::Relaxed);
     }
@@ -362,6 +399,19 @@ fn common_block_on<F: std::future::Future>(f: F) -> F::Output {
 /// Everything the invariants say about a store, checked from outside the
 /// server. `tag` names the backend, seed and round in every message.
 fn check_store(tag: &str, stores: &Stores, shared: &Shared, live: bool) {
+    check_store_with(tag, stores, shared, live, false);
+}
+
+/// [`check_store`] under live traffic, reading the trees of only the
+/// changesets no earlier check read. A full check is linear in the store,
+/// and agents landing through it grow the store in proportion to its
+/// length, so full checks under traffic stop converging on a slow runner.
+/// What an earlier check proved stays checked by the next full one.
+fn check_store_live_new(tag: &str, stores: &Stores, shared: &Shared) {
+    check_store_with(tag, stores, shared, true, true);
+}
+
+fn check_store_with(tag: &str, stores: &Stores, shared: &Shared, live: bool, only_new: bool) {
     let repo = open_repo(stores);
     common_block_on(async {
         let meta = repo.meta();
@@ -379,7 +429,11 @@ fn check_store(tag: &str, stores: &Stores, shared: &Shared, live: bool) {
             all.extend(page);
         }
         let mut blobs_ok: HashSet<Hash> = HashSet::new();
+        let read_before = std::mem::take(&mut *shared.trees_read.lock().unwrap());
         for id in &all {
+            if only_new && read_before.contains(id) {
+                continue;
+            }
             let files = repo
                 .list_files(*id, "")
                 .await
@@ -395,6 +449,12 @@ fn check_store(tag: &str, stores: &Stores, shared: &Shared, live: bool) {
                 }
             }
         }
+
+        shared
+            .trees_read
+            .lock()
+            .unwrap()
+            .extend(all.iter().copied());
 
         // Every ref reaches only changesets that exist.
         for (name, head) in &refs {
@@ -581,6 +641,7 @@ fn run_crash_rounds(backend: &str, meta_url: Option<String>) {
 /// [`run_crash_rounds`] with the server started with `extra` flags too.
 fn run_crash_rounds_with(backend: &str, meta_url: Option<String>, extra: &[&str]) -> u64 {
     let _g = serial();
+    let _w = Watchdog::start();
     let seed = env_u64("LEEP_CRASH_SEED", DEFAULT_SEED);
     let rounds = env_u64("LEEP_CRASH_ROUNDS", 3);
     let http_agents = env_u64("LEEP_CRASH_AGENTS", 6) as usize;
@@ -1014,6 +1075,7 @@ fn killed_land_leader_is_replaced_postgres() {
         return;
     };
     let _g = serial();
+    let _w = Watchdog::start();
     let seed = env_u64("LEEP_CRASH_SEED", DEFAULT_SEED);
     let rounds = env_u64("LEEP_CRASH_ROUNDS", 3);
     let agents = env_u64("LEEP_CRASH_AGENTS", 6) as usize;
@@ -1083,14 +1145,8 @@ fn killed_land_leader_is_replaced_postgres() {
             stalls.push(worst);
             let moved = lease_holder(&db.url).unwrap_or_default();
             assert_ne!(moved, holder, "[{tag}] the lease moved on");
-            // Agents pause for the check. Landing through it, they grew the
-            // store in proportion to the check's own length, and the next
-            // check (linear in the store) took longer again: on a slow
-            // runner the rounds never converged.
-            shared.pause.store(true, Ordering::Relaxed);
-            check_store(&format!("{tag}, after SIGKILL"), &stores, &shared, true);
+            check_store_live_new(&format!("{tag}, after SIGKILL"), &stores, &shared);
             servers[i] = start(ports[i]);
-            shared.pause.store(false, Ordering::Relaxed);
         }
         std::thread::sleep(Duration::from_millis(400));
         shared.stop.store(true, Ordering::Relaxed);
@@ -1234,6 +1290,7 @@ fn assert_no_delete_announced(tag: &str, repo: &Repo) {
 
 fn run_sweep_crash(backend: &str, meta_url: Option<String>) {
     let _g = serial();
+    let _w = Watchdog::start();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     let stores = match meta_url {
