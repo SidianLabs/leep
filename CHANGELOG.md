@@ -112,6 +112,14 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 - **Changed.** A land batch that fast-forwards a ref to such a changeset
   stores its tree in two waves (nodes, then the root), so two packs; an
   eager create flushes its tree's nodes before writing the root.
+### Criss-cross merges check every merge base
+- **Fixed.** `POST /v1/merge` (and `leep merge`) in a criss-cross history,
+  where the two sides have several best common ancestors, merged against
+  one of them and could drop a side's edit or resolution without a
+  conflict. Every path the bases disagree on is now resolved against each
+  base, and a path whose answers differ is reported as a conflict. The
+  review rules on merges (`merge-parent`, dropped side changes) check every
+  base too. See ADR 0071. Fixes #160.
 
 ### Land batches write one pack
 - **Changed.** A land batch's new objects (tree nodes, merged contents)

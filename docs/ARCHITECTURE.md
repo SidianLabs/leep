@@ -950,6 +950,11 @@ Malformed suffixes and reflog syntax (`@{...}`) are 400, a walk past a root 404.
 **Merge**: three-way, per path, with base = `merge_base(ours, theirs)`.
 Identical changes on both sides merge trivially. Text files merge by line
 (`diffy`). Binary files and delete-vs-modify cases are returned as conflicts.
+In a criss-cross (`merge_bases` finds more than one best common ancestor),
+every path some base disagrees on is resolved against each base, and a path
+whose answers differ is a conflict, never a silent pick
+([ADR 0071](adr/0071-criss-cross-merges-check-every-base.md)). The review
+rules on merges check every base the same way.
 
 `merge_base(a, b)` is the common ancestor with the highest generation, ties
 going to the highest id; no other common ancestor can descend from it. It is

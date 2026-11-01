@@ -295,7 +295,9 @@ impl Repo {
         let mine = self.root_tree(id).await?;
         let mut dropped = BTreeSet::new();
         for &side in sides {
-            let base = self.merge_base(ours, side).await?;
+            // In a criss-cross, a change dropped relative to any of the
+            // merge bases counts (ADR 0071).
+            let bases = self.merge_bases(ours, side).await?;
             for e in self
                 .diff_trees(self.root_tree(side).await?, mine, "")
                 .await?
@@ -304,11 +306,14 @@ impl Repo {
                 if !kept_ours || dropped.contains(&e.path) {
                     continue;
                 }
-                let at_base = match base {
-                    Some(b) => key(&self.lookup_file(b, &e.path).await?),
-                    None => None,
-                };
-                if at_base != key(&e.old) {
+                let mut at_bases = Vec::new();
+                for &b in &bases {
+                    at_bases.push(key(&self.lookup_file(b, &e.path).await?));
+                }
+                if at_bases.is_empty() {
+                    at_bases.push(None);
+                }
+                if at_bases.iter().any(|at| *at != key(&e.old)) {
                     dropped.insert(e.path);
                 }
             }
@@ -349,11 +354,21 @@ impl Repo {
                 Some(v) => v,
                 None => *ours_now.insert(key(self.lookup_file(ours, path).await?)),
             };
-            let at_base = match self.merge_base(ours, *side).await? {
-                Some(b) => key(self.lookup_file(b, path).await?),
-                None => None,
-            };
-            if at_base == ours_now {
+            // Covered only if the first parent left the path as every merge
+            // base has it: in a criss-cross one base can hide a change
+            // another shows (ADR 0071).
+            let bases = self.merge_bases(ours, *side).await?;
+            let mut covered = true;
+            if bases.is_empty() {
+                covered = ours_now.is_none();
+            }
+            for b in bases {
+                if key(self.lookup_file(b, path).await?) != ours_now {
+                    covered = false;
+                    break;
+                }
+            }
+            if covered {
                 return Ok(true);
             }
         }

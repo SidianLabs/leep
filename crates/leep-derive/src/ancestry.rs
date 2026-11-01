@@ -31,8 +31,11 @@ pub(crate) fn skiplist_reads_for(keep: bool) -> Option<Arc<SkiplistCache>> {
 const P1: u8 = 1;
 const P2: u8 = 2;
 const BOTH: u8 = P1 | P2;
-#[cfg(test)]
 const STALE: u8 = 4;
+
+/// Changesets [`Repo::side_is_clear`] may walk per side in
+/// [`Repo::merge_bases`] before the full walk decides.
+const MERGE_BASES_SIDE_BUDGET: usize = 10_000;
 
 /// Skiplist reads `first_parent_lca` may make. Reaching a first-parent
 /// ancestor takes at most two per bit of the distance, so 64 covers any
@@ -99,6 +102,117 @@ impl Repo {
                 .await?
                 .unwrap_or(c),
         ))
+    }
+
+    /// Every best common ancestor of `a` and `b`: the common ancestors of
+    /// which none is an ancestor of another, [`Repo::merge_base`]'s answer
+    /// first, the rest newest first. Empty for unrelated histories. More than
+    /// one means a criss-cross, where a three-way merge against any single
+    /// one of them can take a side's change without the conflict another
+    /// would raise (ADR 0071).
+    pub async fn merge_bases(&self, a: ChangesetId, b: ChangesetId) -> Result<Vec<ChangesetId>> {
+        let Some(best) = self.merge_base(a, b).await? else {
+            return Ok(Vec::new());
+        };
+        if best == a || best == b {
+            return Ok(vec![best]);
+        }
+        // Usually one side is a short branch with nothing behind it that
+        // `best` lacks; then `best` is the only one.
+        let key = (self.generation(best).await?, best);
+        let (ga, gb) = (self.generation(a).await?, self.generation(b).await?);
+        let sides = if gb <= ga { [b, a] } else { [a, b] };
+        for tip in sides {
+            if self
+                .side_is_clear(tip, key, MERGE_BASES_SIDE_BUDGET)
+                .await?
+            {
+                return Ok(vec![best]);
+            }
+        }
+        let mut heads = self.common_ancestor_heads(a, b).await?;
+        heads.retain(|&h| h != best);
+        heads.insert(0, best);
+        Ok(heads)
+    }
+
+    /// The maximal common ancestors of `a` and `b`, newest first: git's
+    /// paint-down walk (each changeset marked with the sides reaching it; one
+    /// both reach marks everything behind it stale), then the candidates
+    /// behind another candidate dropped. Iterative, with batched reads.
+    pub(crate) async fn common_ancestor_heads(
+        &self,
+        a: ChangesetId,
+        b: ChangesetId,
+    ) -> Result<Vec<ChangesetId>> {
+        let mut reader = Reader::default();
+        let tips = reader.generations(self, &[a, b], u64::MAX).await?;
+        let mut marks: HashMap<ChangesetId, u8, ByKey> = HashMap::default();
+        let mut gens: HashMap<ChangesetId, u64, ByKey> = HashMap::default();
+        let mut heap: BinaryHeap<(u64, ChangesetId)> = BinaryHeap::new();
+        for (id, g, m) in [(a, tips[0], P1), (b, tips[1], P2)] {
+            *marks.entry(id).or_default() |= m;
+            if gens.insert(id, g).is_none() {
+                heap.push((g, id));
+            }
+        }
+        // Queued changesets not (yet) marked stale; the walk ends at none.
+        let mut live = heap.len();
+        let mut candidates: Vec<(u64, ChangesetId)> = Vec::new();
+        while live > 0 {
+            let Some((g, id)) = heap.pop() else { break };
+            let mut m = marks[&id];
+            if m & STALE == 0 {
+                live -= 1;
+            }
+            if m & BOTH == BOTH && m & STALE == 0 {
+                candidates.push((g, id));
+                m |= STALE;
+                marks.insert(id, m);
+            }
+            let parents = reader.parents(self, id, g).await?;
+            let new: Vec<ChangesetId> = parents
+                .iter()
+                .copied()
+                .filter(|p| !gens.contains_key(p))
+                .collect();
+            let new_gens = reader.generations(self, &new, g).await?;
+            gens.extend(new.into_iter().zip(new_gens));
+            for &p in parents.iter() {
+                let old = marks.get(&p).copied().unwrap_or(0);
+                let next = old | m;
+                if next == old {
+                    continue;
+                }
+                marks.insert(p, next);
+                if old == 0 {
+                    // First reached now. Parents rank below `id`, so it pops
+                    // after every changeset that can still mark it.
+                    heap.push((gens[&p], p));
+                    if next & STALE == 0 {
+                        live += 1;
+                    }
+                } else if old & STALE == 0 && next & STALE != 0 {
+                    live -= 1;
+                }
+            }
+        }
+        candidates.sort_unstable_by(|x, y| y.cmp(x));
+        let mut heads = Vec::new();
+        for (i, &(_, c)) in candidates.iter().enumerate() {
+            // Only a newer candidate can descend from `c`.
+            let mut behind = false;
+            for &(_, o) in &candidates[..i] {
+                if self.is_ancestor(c, o).await? {
+                    behind = true;
+                    break;
+                }
+            }
+            if !behind {
+                heads.push(c);
+            }
+        }
+        Ok(heads)
     }
 
     /// Whether `ancestor`, of generation `target`, is on the first-parent

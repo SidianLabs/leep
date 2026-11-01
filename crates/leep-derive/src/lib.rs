@@ -50,6 +50,8 @@ mod blame_tests;
 #[cfg(test)]
 mod bounded_tests;
 #[cfg(test)]
+mod criss_cross_tests;
+#[cfg(test)]
 mod fault_tests;
 #[cfg(test)]
 mod flush_tests;

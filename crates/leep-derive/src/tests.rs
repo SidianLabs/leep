@@ -21,7 +21,7 @@ fn cas_ctx() -> leep_core::RefUpdateContext {
     leep_core::RefUpdateContext::new("cas")
 }
 
-fn rp(s: &str) -> RepoPath {
+pub(crate) fn rp(s: &str) -> RepoPath {
     RepoPath::new(s).unwrap()
 }
 
@@ -76,7 +76,7 @@ pub(crate) async fn commit(
     try_commit(r, parents, files, msg).await.unwrap()
 }
 
-async fn text(r: &Repo, id: ChangesetId, path: &str) -> Option<String> {
+pub(crate) async fn text(r: &Repo, id: ChangesetId, path: &str) -> Option<String> {
     r.read_file(id, &rp(path))
         .await
         .unwrap()
@@ -87,7 +87,7 @@ fn is_invalid<T: std::fmt::Debug>(r: leep_core::Result<T>) -> bool {
     matches!(r, Err(Error::Invalid(_)))
 }
 
-fn merge_req(ours: ChangesetId, theirs: ChangesetId) -> MergeRequest {
+pub(crate) fn merge_req(ours: ChangesetId, theirs: ChangesetId) -> MergeRequest {
     MergeRequest {
         parents: [ours, theirs],
         message: "merge".into(),
