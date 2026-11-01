@@ -43,15 +43,15 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   data pool. Count them against `max_connections`. SQLite ignores it.
 - **Added.** `pool="index"` on `leep_meta_pool_connections`, and
   `leep_query_scans_skipped_total{kind}`.
-### Land batches pipeline
-- **Changed.** While a land batch stores its writes and moves the ref, the
+### Land batches can pipeline
+- **Added.** With `--land-pipeline on`, while a land batch stores its writes and moves the ref, the
   next batch replays onto the head that commit will leave, over its
   staged writes, and commits right after it. If the commit ahead does not
   apply whole (a lost swap, a failed store, a lost lease) the batch behind
   is dropped before it answers or stores anything and is done again from
-  the ref. Answers, ref log and head are as before. `--land-pipeline
-  on|off` (`LEEP_LAND_PIPELINE`, on) turns it off for comparison. See
-  ADR 0072.
+  the ref. Answers, ref log and head are as before. Off by default
+  (`LEEP_LAND_PIPELINE`): it showed no gain in the mixed read and land
+  swarm, where lands were not the bottleneck. See ADR 0072.
 - **Changed.** A batch's first attempt stops taking lands after 200 ms of
   replay and hands the rest to the next batch (`--land-batch-replay-ms
   N|off`, `LEEP_LAND_BATCH_REPLAY_MS`), so slow replays close a batch

@@ -340,8 +340,9 @@ struct Args {
     /// Pipeline land batches (ADR 0072): the next batch replays onto the
     /// head a committing batch will leave while its commit runs, and is
     /// redone from the ref if that commit fails. The answers are the same
-    /// either way; `off` runs one batch at a time, for comparison.
-    #[arg(long, env = "LEEP_LAND_PIPELINE", value_enum, default_value_t = Switch::On)]
+    /// either way. Off by default until a run where lands are the
+    /// bottleneck shows it gaining; in the mixed swarm it changed nothing.
+    #[arg(long, env = "LEEP_LAND_PIPELINE", value_enum, default_value_t = Switch::Off)]
     land_pipeline: Switch,
     /// Write the new objects of a land batch (and any other batched server
     /// write of at least --land-pack-min-objects objects) as one pack
@@ -2447,13 +2448,15 @@ mod tests {
         assert!(parse_args(["leep-server", "--land-max-batch", "0"]).is_err());
     }
 
-    /// Batches pipeline and close after 200 ms of replay unless told
-    /// otherwise (ADR 0072).
+    /// Batches run one at a time and close after 200 ms of replay unless
+    /// told otherwise (ADR 0072).
     #[test]
-    fn land_batches_pipeline_by_default() {
+    fn land_batches_do_not_pipeline_by_default() {
         let a = parse_args(["leep-server"]).unwrap();
-        assert!(a.land_pipeline == Switch::On);
+        assert!(a.land_pipeline == Switch::Off);
         assert!(a.land_batch_replay_ms.is_none());
+        let a = parse_args(["leep-server", "--land-pipeline", "on"]).unwrap();
+        assert!(a.land_pipeline == Switch::On);
         let a = parse_args([
             "leep-server",
             "--land-pipeline",

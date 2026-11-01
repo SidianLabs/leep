@@ -200,3 +200,11 @@ land they replayed, as before.
   original; a coordinated leader paused past its lease with batches
   staged; the fault sweep counts kept and dropped speculative attempts;
   the SIGKILL crash test runs pipelined batches of two.
+
+## Default
+`--land-pipeline` is off by default. In the 2,000-agent mixed read and
+land swarm (`leep-swarm`, 2-core server) lands ran at 52 a second with
+pipelining on and off alike (land p99 384 ms on, 442 ms off; batches of
+2.3 and 3.8): reads, not commits, limited that run, which is not the
+regime this design is for. It is turned on by default only after a run
+where the land leader is the bottleneck shows it gaining.
