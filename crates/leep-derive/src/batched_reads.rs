@@ -417,6 +417,14 @@ impl BlobStore for BatchedBlobs {
         self.inner.contains(hash).await
     }
 
+    async fn get_stored(&self, hash: &Hash) -> Result<Option<Bytes>> {
+        self.inner.get_stored(hash).await
+    }
+
+    async fn get_exact(&self, hash: &Hash) -> Result<Option<Bytes>> {
+        self.inner.get_exact(hash).await
+    }
+
     async fn contains_many(&self, hashes: &[Hash]) -> Result<Vec<bool>> {
         self.inner.contains_many(hashes).await
     }

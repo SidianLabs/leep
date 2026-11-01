@@ -170,6 +170,13 @@ impl BlobStore for ShadowBlobs {
         self.inner.contains(hash).await
     }
 
+    async fn get_exact(&self, hash: &Hash) -> Result<Option<Bytes>> {
+        if let Some(b) = self.writes.lock().unwrap().get(hash) {
+            return Ok(Some(b.clone()));
+        }
+        self.inner.get_exact(hash).await
+    }
+
     async fn list_page(&self, after: Option<Hash>, limit: usize) -> Result<Vec<BlobMeta>> {
         self.inner.list_page(after, limit).await
     }
