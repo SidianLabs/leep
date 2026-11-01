@@ -19,6 +19,12 @@ tokio::task_local! {
     pub(crate) static SKIPLIST_READS: Option<Arc<SkiplistCache>>;
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    /// Calls of [`Repo::merge_bases`] in the scope, for tests that bound them.
+    pub(crate) static MERGE_BASES_CALLS: std::cell::Cell<usize>;
+}
+
 /// What a derivation scopes [`SKIPLIST_READS`] to: the enclosing
 /// derivation's cache, else a new one if `keep`.
 pub(crate) fn skiplist_reads_for(keep: bool) -> Option<Arc<SkiplistCache>> {
@@ -111,6 +117,8 @@ impl Repo {
     /// one of them can take a side's change without the conflict another
     /// would raise (ADR 0071).
     pub async fn merge_bases(&self, a: ChangesetId, b: ChangesetId) -> Result<Vec<ChangesetId>> {
+        #[cfg(test)]
+        let _ = MERGE_BASES_CALLS.try_with(|c| c.set(c.get() + 1));
         let Some(best) = self.merge_base(a, b).await? else {
             return Ok(Vec::new());
         };

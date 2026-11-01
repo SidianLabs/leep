@@ -311,3 +311,37 @@ async fn random_criss_cross_merges_never_drop_an_edit() {
     );
     assert!(conflicted > 0);
 }
+
+/// A review asks for a merge's bases at every changed path; in a
+/// criss-cross each answer is a walk, so a review finds them once per side.
+#[tokio::test]
+async fn a_review_finds_merge_bases_once_per_side() {
+    use crate::ancestry::MERGE_BASES_CALLS;
+    let r = repo();
+    let o = commit(&r, &[], &[("f", Some("o\n"))], "o").await;
+    let a = commit(&r, &[o], &[("f", Some("a\n"))], "a").await;
+    let b = commit(&r, &[o], &[("f", Some("b\n"))], "b").await;
+    let m1 = commit(&r, &[a, b], &[], "m1").await;
+    let m2 = commit(&r, &[b, a], &[], "m2").await;
+    let paths: Vec<String> = (0..40).map(|i| format!("d/{i}.txt")).collect();
+    let files: Vec<(&str, Option<&str>)> =
+        paths.iter().map(|p| (p.as_str(), Some("y\n"))).collect();
+    let y = commit(&r, &[m2], &files, "y").await;
+    let x = commit(&r, &[m1], &[("x", Some("x\n"))], "x").await;
+    // Takes all of y's files, and y's `f`.
+    let mut taken = files.clone();
+    taken.push(("f", Some("b\n")));
+    let m = commit(&r, &[x, y], &taken, "m").await;
+    let calls = MERGE_BASES_CALLS
+        .scope(std::cell::Cell::new(0), async {
+            let mut owners = OwnersResolver::new(&r, None).await.unwrap();
+            let review = r
+                .review_changeset(m, &ReviewRules::default(), &[], &mut owners)
+                .await
+                .unwrap();
+            assert_eq!(review.paths.len(), 41);
+            MERGE_BASES_CALLS.with(|c| c.get())
+        })
+        .await;
+    assert_eq!(calls, 1, "one side, one merge_bases");
+}
