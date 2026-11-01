@@ -1408,6 +1408,10 @@ impl Repo {
                     lands.extend(waiting.into_iter().map(|(l, _)| l));
                     // Rows of the batch ahead may be among them.
                     carried.clear();
+                    // Uncounted, yet bounded: `spec` is gone, so the redo
+                    // reads the ref and counts, and the wait ends because
+                    // the batch ahead ends (its own 32 attempts,
+                    // `MAX_COMMIT_ERRORS` and lifetime bound it).
                     let _ = a.done.await;
                     attempt -= 1;
                     continue;
