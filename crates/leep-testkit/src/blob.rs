@@ -33,6 +33,15 @@ impl BlobStore for FaultyBlobStore {
             .await
     }
 
+    /// One fault decision for the whole batch: a backend that packs it
+    /// publishes all of it or none, and a put that fails after applying
+    /// leaves every item stored.
+    async fn put_many(&self, items: Vec<(Hash, Bytes)>) -> Result<Vec<Hash>> {
+        self.plan
+            .run(Op::Put, self.inner.put_many(items), |_, v| v)
+            .await
+    }
+
     async fn get(&self, hash: &Hash) -> Result<Option<Bytes>> {
         self.plan
             .run(Op::Get, self.inner.get(hash), |plan, v| {

@@ -368,7 +368,10 @@ Off by default (ADR 0060, section 2):
 
 | Flag / variable | Default | Meaning |
 |---|---|---|
-| `--land-queue-batches N\|off` / `LEEP_LAND_QUEUE_BATCHES` | `4` | Batches (of up to 64 lands) a land may wait behind in its ref's queue, its own included; one more is refused with `503`, `Retry-After` and `Leep-Refused: admission` before any work, and `leep land` sends it again. The default refuses only past 256 queued lands on one ref, out of reach below about 200 concurrent writers on it. `N` full batches should take about half the clients' land timeout: lower it for shorter timeouts, raise it for faster servers. Set `off` while clients older than #143 remain, since they do not resend a refused land. `N = 1` is for tests only, since it collapses each batch to about one land. |
+| `--land-queue-seconds D\|off` / `LEEP_LAND_QUEUE_SECONDS` | `5s` | How long a land may wait in its ref's queue (ADR 0068): the batches that fit in `D` at the ref's moving batch time, at least 2; a land past it is refused with `503`, `Retry-After` and `Leep-Refused: admission` before any work, and `leep land` sends it again. About a sixth of the clients' land timeout. Set `off` while clients older than #143 remain, since they do not resend a refused land. |
+| `--land-queue-batches N\|off` / `LEEP_LAND_QUEUE_BATCHES` | unset | The same bound in batches (of up to `--land-max-batch` lands), instead of `--land-queue-seconds`; giving both is an error. Before ADR 0068 this was the bound, `4` by default. `N` full batches should take about half the clients' land timeout. `N = 1` is for tests only, since it collapses each batch to about one land. |
+| `--land-max-batch N` / `LEEP_LAND_MAX_BATCH` | `64` | Lands one batch takes. |
+| `--land-packs on\|off`, `--background-repack on\|off` and their tuning flags | `on` | Land batches write their new objects as one pack, merged in the background (ADR 0068); see OPERATIONS.md, "Packs written by land batches". |
 
 Choosing `N`, the metrics and the alert are in
 [OPERATIONS.md](OPERATIONS.md#land-admission).

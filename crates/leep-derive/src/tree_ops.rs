@@ -107,7 +107,7 @@ async fn apply_changes_inner(
     if changes.is_empty() {
         if base == TreeNode::empty_hash() {
             let empty = TreeNode::default();
-            repo.put_rescuing_many(vec![(base, Bytes::from(empty.encode()))], &[])
+            repo.put_rescuing_many_loose(vec![(base, Bytes::from(empty.encode()))], &[])
                 .await?;
         }
         return Ok(base);
@@ -190,7 +190,7 @@ async fn apply_changes_inner(
         .collect();
     named.sort_unstable();
     named.dedup();
-    repo.put_rescuing_many(rewritten, &named).await?;
+    repo.put_rescuing_many_loose(rewritten, &named).await?;
     Ok(h)
 }
 

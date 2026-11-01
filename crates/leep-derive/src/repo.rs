@@ -79,9 +79,9 @@ pub struct Repo {
     meta: Arc<dyn MetaStore>,
     /// Per-ref queues that group concurrent lands into batches (see `land`).
     pub(crate) land_queues: Arc<crate::land::LandQueues>,
-    /// Batches a ref's queue may hold before lands are refused (ADR 0060,
-    /// section 2); `None` admits every land.
-    pub(crate) land_queue_batches: Option<usize>,
+    /// How long a ref's queue may grow before lands are refused (ADR 0060,
+    /// section 2; ADR 0068); `None` admits every land.
+    pub(crate) land_queue_bound: Option<crate::land::LandQueueBound>,
     pub(crate) land_policy: Option<Arc<dyn LandPolicy>>,
     /// Batches this server's lands with every other server's on the same ref
     /// (ADR 0056); `None` batches only the lands this process receives.
@@ -563,7 +563,7 @@ impl Repo {
             blobs,
             meta,
             land_queues: Arc::default(),
-            land_queue_batches: None,
+            land_queue_bound: None,
             land_policy: None,
             land_coordinator: None,
             land_fast_path: true,
@@ -649,12 +649,57 @@ impl Repo {
     /// wait at full batches than at single ones. Only new arrivals are
     /// refused; queued lands never are.
     pub fn with_land_queue_batches(mut self, batches: Option<usize>) -> Self {
-        self.land_queue_batches = batches.map(|n| n.max(1));
+        self.land_queue_bound = batches.map(|n| crate::land::LandQueueBound::Batches(n.max(1)));
+        Self::register_admission_metrics();
+        self
+    }
+
+    /// Refuse a land when it would wait longer than `limit` in its ref's
+    /// queue (`None`: never): [`Repo::with_land_queue_batches`] with the
+    /// count of batches that fit in `limit` at the ref's moving batch time,
+    /// and at least [`crate::land::MIN_QUEUE_BATCHES`] (ADR 0068). Unlike a
+    /// count, it admits more lands when batches are fast, and as many
+    /// seconds of them whatever the batch size.
+    pub fn with_land_queue_seconds(mut self, limit: Option<std::time::Duration>) -> Self {
+        self.land_queue_bound = limit
+            .filter(|l| !l.is_zero())
+            .map(crate::land::LandQueueBound::Seconds);
+        Self::register_admission_metrics();
+        self
+    }
+
+    fn register_admission_metrics() {
         for route in ["direct", "forwarded"] {
             metrics::counter!("leep_land_admission_refused_total", "route" => route).increment(0);
         }
         metrics::gauge!("leep_land_queue_batches").increment(0.0);
+    }
+
+    /// Take at most `n` lands into one batch (at least 1; default
+    /// [`crate::land::MAX_BATCH`]). Call it before the first land: queues
+    /// keep the size they were made with.
+    pub fn with_land_max_batch(self, n: usize) -> Self {
+        self.land_queues
+            .max_batch
+            .store(n.max(1), std::sync::atomic::Ordering::Relaxed);
         self
+    }
+
+    /// See [`Repo::with_land_max_batch`].
+    pub fn land_max_batch(&self) -> usize {
+        match self
+            .land_queues
+            .max_batch
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            0 => crate::land::MAX_BATCH,
+            n => n,
+        }
+    }
+
+    /// See [`Repo::with_land_queue_seconds`].
+    pub fn land_queue_bound(&self) -> Option<crate::land::LandQueueBound> {
+        self.land_queue_bound
     }
 
     /// Whether a land none of whose paths the ref touched since its base is
@@ -687,9 +732,13 @@ impl Repo {
         self.land_fast_path
     }
 
-    /// See [`Repo::with_land_queue_batches`].
+    /// See [`Repo::with_land_queue_batches`]: the count, when the bound is
+    /// one.
     pub fn land_queue_batches(&self) -> Option<usize> {
-        self.land_queue_batches
+        match self.land_queue_bound {
+            Some(crate::land::LandQueueBound::Batches(n)) => Some(n),
+            _ => None,
+        }
     }
 
     /// See [`Repo::with_land_coordinator`].
@@ -874,12 +923,35 @@ impl Repo {
                 return Err(Error::Invalid(format!("unknown parent {p}")));
             }
         }
-        for (i, (path, content, size)) in contents.iter().enumerate() {
+        if !client_blobs {
+            // A server-built changeset (a merge, a rebased copy) names
+            // contents of stored changesets, whose sizes their creates
+            // checked against the blobs, and merge results the server
+            // wrote with their sizes. Only their existence is checked, in
+            // durable storage and in one batch: a land batch answers it from
+            // what its prefetch found (ADR 0068) instead of reading every
+            // content of every copy.
+            let hashes: Vec<Hash> = contents.iter().map(|(_, h, _)| *h).collect();
+            let present = self.blobs.contains_many(&hashes).await?;
+            if present.len() != hashes.len() {
+                return Err(Error::Storage(format!(
+                    "contains_many answered {} of {} hashes",
+                    present.len(),
+                    hashes.len()
+                )));
+            }
+            if let Some(((path, content, _), _)) = contents.iter().zip(&present).find(|(_, p)| !**p)
+            {
+                return Err(Error::Invalid(format!("missing blob {content} for {path}")));
+            }
+        }
+        let client_contents = if client_blobs { &contents[..] } else { &[] };
+        for (i, (path, content, size)) in client_contents.iter().enumerate() {
             let maybe_condemned = match &pre.condemned {
                 Some(c) => c[i].is_some(),
                 None => true,
             };
-            if client_blobs && maybe_condemned {
+            if maybe_condemned {
                 self.check_reusable(content, path.as_str()).await?;
             }
             // `get` may be served from a cache tier; existence must come from

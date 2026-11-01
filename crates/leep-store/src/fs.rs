@@ -7,9 +7,34 @@ use leep_core::{BlobMeta, BlobStore, Error, Hash, Result};
 use std::io::Write;
 
 use crate::dirsync::DirSyncer;
-use crate::packset::{merge_listing, PackSet, DEFAULT_DECODED_CACHE};
+use crate::packput::{self, PackWriteStep, PackWrites};
+use crate::packset::{merge_listing, sync_dir, Pack, PackSet, DEFAULT_DECODED_CACHE};
 use crate::storage_err;
 use crate::tmpfile::create_exclusive;
+
+/// Held shared by a `put_many` while it writes a pack, from its first temp
+/// file to its index's rename, and exclusively by a repack while it deletes
+/// temp files and packs without an index, so a repack never deletes a pack
+/// whose index is about to be published. A lock, not a marker: the kernel
+/// releases it when the process dies.
+pub(crate) const WRITE_LOCK: &str = "write.lock";
+
+/// Open and lock `packs/write.lock`, shared or exclusive.
+pub(crate) fn lock_pack_writes(dir: &Path, exclusive: bool) -> Result<std::fs::File> {
+    std::fs::create_dir_all(dir).map_err(storage_err)?;
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join(WRITE_LOCK))
+        .map_err(storage_err)?;
+    if exclusive {
+        f.lock().map_err(storage_err)?;
+    } else {
+        f.lock_shared().map_err(storage_err)?;
+    }
+    Ok(f)
+}
 
 /// Most blocking tasks one `get_many` uses: enough to keep a disk's queue
 /// and the cores busy, few enough to leave the blocking pool to others.
@@ -19,17 +44,24 @@ const READ_TASKS: usize = 16;
 const MIN_PER_READ_TASK: usize = 8;
 
 /// Blobs on the local filesystem: loose at `<root>/<2 hex>/<62 hex>`, and
-/// packed in `<root>/packs/` once `repack` has run (ADR 0029). New writes are
-/// always loose; reads try the loose file first, then the packs.
+/// packed in `<root>/packs/` (ADR 0029). A put writes a loose file; a
+/// `put_many` of at least [`PackWrites::min_objects`] new objects writes
+/// them as one pack (ADR 0068). Reads try the loose file first, then the
+/// packs.
 ///
 /// A put syncs its file but not its directory; [`BlobStore::flush`] syncs
 /// the directories of every put since the last flush (ADR 0044). Clones share
-/// that record, so a flush on one covers puts through another.
+/// that record, so a flush on one covers puts through another. A pack is
+/// durable when `put_many` returns.
 #[derive(Clone)]
 pub struct FsBlobStore {
     root: PathBuf,
     pub(crate) packs: Arc<PackSet>,
     dirs: Arc<DirSyncer>,
+    writes: PackWrites,
+    /// Whether this process has synced the root since it saw `packs/`, so
+    /// the directory's own entry survives a power loss.
+    packs_dir_synced: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl std::fmt::Debug for FsBlobStore {
@@ -52,7 +84,26 @@ impl FsBlobStore {
         let root = root.into();
         let packs = Arc::new(PackSet::new(&root, bytes));
         let dirs = Arc::new(DirSyncer::new(&root));
-        Self { root, packs, dirs }
+        Self {
+            root,
+            packs,
+            dirs,
+            writes: PackWrites::default(),
+            packs_dir_synced: Arc::default(),
+        }
+    }
+
+    /// How `put_many` writes packs (ADR 0068); [`PackWrites::off`] keeps
+    /// every write loose.
+    pub fn with_pack_writes(mut self, writes: PackWrites) -> Self {
+        self.writes = writes;
+        self
+    }
+
+    /// Packs reads search now: published, and not merged by a repack of
+    /// this process. Scans `packs/` first.
+    pub fn pack_count(&self) -> Result<usize> {
+        Ok(self.packs.refresh()?.searchable().len())
     }
 
     /// Directory fsyncs issued by flushes so far, for tests.
@@ -134,6 +185,98 @@ impl FsBlobStore {
     }
 }
 
+/// Objects with their bytes.
+type Objects = Vec<(Hash, Bytes)>;
+
+impl FsBlobStore {
+    /// `put_with_hash` for each item, [`leep_core::store::PUT_IN_FLIGHT`]
+    /// at a time.
+    async fn put_loose_many(&self, items: Vec<(Hash, Bytes)>) -> Result<Vec<Hash>> {
+        for chunk in items.chunks(leep_core::store::PUT_IN_FLIGHT) {
+            let puts: Vec<_> = chunk
+                .iter()
+                .map(|(h, d)| self.put_with_hash(*h, d.clone()))
+                .collect();
+            futures::future::try_join_all(puts).await?;
+        }
+        Ok(Vec::new())
+    }
+
+    /// The blocking part of `put_many` over sorted, distinct `items`:
+    /// touch the loose copies there are, pack the rest if enough remain.
+    /// Returns the hashes packed and the items left to write loose.
+    fn put_packed_blocking(&self, items: Vec<(Hash, Bytes)>) -> Result<(Vec<Hash>, Objects)> {
+        let started = std::time::Instant::now();
+        let mut new = Vec::with_capacity(items.len());
+        let mut loose = Vec::new();
+        let mut tree_first = false;
+        for (hash, data) in items {
+            if touch(&self.path_for(&hash)).map_err(storage_err)? {
+                // Maybe another writer's rename nobody synced: as put does.
+                self.dirs.mark(hash.0[0]);
+            } else if packput::packable(&hash, &data, &mut tree_first) {
+                new.push((hash, data));
+            } else {
+                loose.push((hash, data));
+            }
+        }
+        if !self.writes.packs(new.len()) {
+            loose.extend(new);
+            return Ok((Vec::new(), loose));
+        }
+        let now = unix_secs(std::time::SystemTime::now()).unwrap_or(0);
+        let mut encoded = packput::encode(&new, self.writes.level, now)?;
+        let dir = self.packs.dir();
+        while dir.join(format!("{}.idx", encoded.id)).exists() {
+            encoded.next_id()?;
+        }
+        let bytes = encoded.pack.len() as u64;
+        self.write_pack_files(encoded)?;
+        packput::record(new.len(), bytes, started.elapsed());
+        Ok((new.into_iter().map(|(h, _)| h).collect(), loose))
+    }
+
+    /// Publish an encoded pack as a repack does: the pack, then its index,
+    /// each through a synced temp file and a synced rename, then add it to
+    /// this process's view.
+    fn write_pack_files(&self, p: packput::EncodedPack) -> Result<()> {
+        let dir = self.packs.dir().to_path_buf();
+        let _writing = lock_pack_writes(&dir, false)?;
+        if !self
+            .packs_dir_synced
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            // Its entry in the root, which may be another process's mkdir.
+            sync_dir(&self.root)?;
+            self.packs_dir_synced
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        let pack_path = dir.join(format!("{}.pack", p.id));
+        let idx_path = dir.join(format!("{}.idx", p.id));
+        let write_temp = |ext: &str, bytes: &[u8]| -> Result<PathBuf> {
+            let (tmp, mut f) = create_exclusive(&dir, ext).map_err(storage_err)?;
+            if let Err(e) = f.write_all(bytes).and_then(|()| f.sync_all()) {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(storage_err(e));
+            }
+            Ok(tmp)
+        };
+        let tmp = write_temp(".pack", &p.pack)?;
+        self.writes.step(PackWriteStep::PackSynced)?;
+        std::fs::rename(&tmp, &pack_path).map_err(storage_err)?;
+        sync_dir(&dir)?;
+        self.writes.step(PackWriteStep::PackRenamed)?;
+        let tmp = write_temp(".idx", &p.idx)?;
+        self.writes.step(PackWriteStep::IndexSynced)?;
+        std::fs::rename(&tmp, &idx_path).map_err(storage_err)?;
+        sync_dir(&dir)?;
+        self.writes.step(PackWriteStep::Published)?;
+        let file = std::fs::File::open(&pack_path).map_err(storage_err)?;
+        self.packs
+            .insert_published(Pack::from_parts(p.id, p.index, file))
+    }
+}
+
 /// Refresh the mtime of an existing blob so garbage collection's grace window
 /// counts from the latest upload. Returns false if the blob is absent.
 fn touch(path: &Path) -> std::io::Result<bool> {
@@ -188,6 +331,25 @@ impl BlobStore for FsBlobStore {
             Ok(())
         })
         .await
+    }
+
+    /// At least [`PackWrites::min_objects`] objects without a loose copy
+    /// become one pack, durable and in this process's view before it
+    /// returns; their hashes are returned. Objects with a loose copy have
+    /// it touched as `put_with_hash` does (and need a flush); a packed copy
+    /// does not count, as for `put_with_hash`, and a new pack holds the
+    /// object again with a fresh `modified` that no older tombstone hides.
+    async fn put_many(&self, mut items: Vec<(Hash, Bytes)>) -> Result<Vec<Hash>> {
+        if !self.writes.packs(items.len()) {
+            return self.put_loose_many(items).await;
+        }
+        packput::sort_distinct(&mut items);
+        let store = self.clone();
+        let (packed, loose) = self
+            .blocking(move |_| store.put_packed_blocking(items))
+            .await?;
+        self.put_loose_many(loose).await?;
+        Ok(packed)
     }
 
     /// Syncs the shard directories (and the root for shards it has not

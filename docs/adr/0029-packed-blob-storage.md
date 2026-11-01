@@ -1,5 +1,5 @@
 # 0029. Packed blob storage
-Status: Accepted
+Status: Accepted; amended by ADR 0068 (a batch of new objects may be written as a pack, not only loose)
 Date: 2026-10-16
 
 ## Context

@@ -74,7 +74,7 @@ content-addressing and (b) the atomicity of `MetaStore::cas_ref`.
 | Crate | Role | May depend on |
 |---|---|---|
 | `leep-core` | Types, hashing, encoding, `BlobStore`/`MetaStore` traits (including listing and blob deletion for GC, a changeset id prefix lookup for short ids, listing and dropping derived rows by kind for repair, batched changeset and derived reads for history walks, derived reads of several kinds in one call, and batched derived writes and changeset-with-rows writes for changeset creation), in-memory stores, conformance tests, API types, pure rename detection | no other leep crate; no I/O, no async runtime |
-| `leep-store` | `BlobStore` backends: filesystem (loose objects plus delta-compressed packs and the repack writer, ADR 0029, ADR 0039), `object_store` (S3/MinIO; loose objects plus the same packs, ADR 0040), `CachedBlobStore`, `open_blob_store(url)`, and the incremental blob and pack copy backup and restore use (`sync`, `packfiles`, ADR 0026, ADR 0039) | core |
+| `leep-store` | `BlobStore` backends: filesystem (loose objects plus delta-compressed packs, the repack writer, and packs written by `put_many`, ADR 0029, ADR 0039, ADR 0068), `object_store` (S3/MinIO; loose objects plus the same packs, ADR 0040), `CachedBlobStore`, `open_blob_store(url)`, and the incremental blob and pack copy backup and restore use (`sync`, `packfiles`, ADR 0026, ADR 0039) | core |
 | `leep-meta` | `MetaStore` backends: SQLite, Postgres, `open_meta_store(url)`, the versioned schema migrator (`migrate`, ADR 0023), metadata snapshots and their import (`snapshot`, ADR 0026), and `analyze_meta_store`, which bulk loaders call to refresh Postgres planner statistics (ADR 0042) | core |
 | `leep-derive` | `Repo`: derived data framework and kinds, plus all operations, blob garbage collection (`gc`), the delta-base walks for `repack` (`pack_order`, full or loose-only) and store verification and repair (`integrity`) | core (traits only, never a concrete backend) |
 | `leep-server` | HTTP server binary `leep-server`, and its offline subcommands (`gc`, `migrate`, `verify`, `repair`, `backup`, `restore`, `backup-verify`) | core, store, meta, derive |
@@ -588,13 +588,15 @@ with the batch's writes staged in memory ([ADR 0043](adr/0043-staged-land-batche
 ```
 land(cs):  check name/tag/cs; enqueue on queue(target); start a leader if none; await answer
 
-leader(target):  while queue not empty: land_batch(take ≤64 queued, in arrival order)
+leader(target):  while queue not empty: land_batch(take ≤64 queued (--land-max-batch), in arrival order)
 
 land_batch:
 loop (≤32 attempts):
   start ← get_ref(target);  head ← start;  staging ← empty
   prefetch the lands' changesets, root trees and the head's rebase links
            (stored rebase links an earlier attempt of the batch read are kept),
+    whether their contents exist (one contains_many, kept for the attempt: a
+    copy's contents are checked against it, not read back, ADR 0068),
     and what target's ref log recorded for the lands' land ids
   for each land, writing into staging and reading it back (dropped if its caller left before it was reached):
     if its land id is recorded (or moved earlier in this batch):
@@ -622,8 +624,10 @@ loop (≤32 attempts):
       (a Conflicts answer first stores the merged text its clean changes
        name: GC rescue check, flush; an error is that land's answer)
   no moves → done (staging dropped)
-  store staging: blobs (one wave, GC rescue check, flush), then changesets
-                 and rows (one atomic write); an error counts as a CAS error below
+  store staging: blobs (one put_many: one pack of ≥16 new objects on a
+                 filesystem or object store, ADR 0068; GC rescue check; flush of
+                 what was not packed), then changesets and rows (one atomic
+                 write); an error counts as a CAS error below
   CAS(start → head) logging one entry per move (cas_ref_logged_chain)
   CAS won → every land gets its answer;  CAS lost → jittered backoff, redo batch
   CAS errored → it may have applied: the next pass re-reads the head and
@@ -732,13 +736,15 @@ of `a`, or a false conflict when the ref changed `a`'s files since. On conflict 
 moves nothing; `/v1/ready` lists `land-clean-blobs`), resolves `conflicts` on top of `onto`, commits once and lands again,
 which is then a fast-forward. Stacks containing merges are rejected.
 Built ([ADR 0060](adr/0060-land-admission-and-read-limits.md), section 2):
-the server that batches a ref's lands bounds its queue in batches
-(`--land-queue-batches N`, 4 by default since E5c, or `off`;
-`Repo::with_land_queue_batches`).
+the server that batches a ref's lands bounds its queue: by default in
+seconds (`--land-queue-seconds`, 5 s, `Repo::with_land_queue_seconds`,
+ADR 0068), turned into batches at the ref's moving batch time and never
+fewer than 2; or in batches (`--land-queue-batches N`, which replaces the
+seconds when given, `Repo::with_land_queue_batches`); or `off`.
 `land_enqueue` checks the in-memory `RefQueue` after the name checks and
 before `get_changeset`: a land that would wait behind more than `N`
-batches, its own included (the waiting lands over 64, rounded up, plus one
-while a batch replays), gets `Error::Refused`, which the server answers 503
+batches, its own included (the waiting lands over `--land-max-batch`,
+rounded up, plus one while a batch replays), gets `Error::Refused`, which the server answers 503
 `unavailable` with `Retry-After` (batches ahead times the ref's moving
 average batch time, 1 to 30 s, half of a batch's 60 s lifetime, since ADR 0066) and `Leep-Refused: admission`. An unkeyed
 refusal reads nothing; a keyed land first reads its id with one
@@ -1025,10 +1031,31 @@ The filesystem store has two layers of its own (ADR 0029):
 
 ```
 FsBlobStore.get(hash)
-   → loose file <root>/<2 hex>/<62 hex>          (every new write lands here)
+   → loose file <root>/<2 hex>/<62 hex>          (puts and small batches land here)
    → packs/*.idx  (in memory as file bytes, searched in place: hash → pack, offset, base; minus tombstones)
         → decoded-object cache (64 MiB, per store) → delta chain in the .pack
 ```
+Since ADR 0068 a `put_many` of at least 16 new objects (a land batch's
+tree nodes and merged contents, a batched import; a create's tree nodes
+stay loose) writes them as one pack
+instead: whole zstd frames in hash order, built in memory, the `.pack` and
+then the `.idx` published through synced temp files and synced renames,
+durable before `put_many` returns, and added to the process's view without
+a rescan. `put_rescuing_many` leaves the hashes it packed out of its flush.
+A pack write holds `packs/write.lock` shared, and a repack holds it
+exclusively while it deletes unindexed packs, so it never deletes one about
+to be published. The server merges these packs in the background
+(`--background-repack`): while more than 32 packs are searched, it merges
+the packs of the lowest size class (`floor(log4(objects))`) that holds at
+least four, up to 64 packs and 1 GiB, packs over 256 MiB left to
+`leep-server repack`, with a `RepackMode::Planned` repack of exactly those
+packs on a nice-19 thread, without a history walk. Each object is rewritten
+at most once per class, and at most about 32 packs below 256 MiB are
+searched. Reads in the process stop
+searching the merged ("superseded") packs at once; they are deleted a fence
+later. Each repack step takes the repack lock, so merges follow each other
+while earlier cleanups wait out their fence.
+
 `leep-server repack` moves loose objects into a pack: a file version is
 stored as a zstd delta against the previous version at its path, a tree node
 against the same directory in the first parent, chains capped at 32. By
@@ -1076,13 +1103,16 @@ The object store backend (ADR 0040) reads the same packs from the bucket:
 
 ```
 ObjectBlobStore.get(hash)
-   → GET blobs/<2 hex>/<62 hex>                     (every new write lands here)
+   → GET blobs/<2 hex>/<62 hex>                     (puts and small batches land here; ADR 0068 packs land batches)
    → packs/*.idx  (fetched once, kept in memory; minus packs/tombstones/<id>/<hash>)
         → decoded-object cache → one batched ranged GET of the chain's frames in the .pack
 ```
-With no directory to watch, a miss lists `packs/` again at most every 5 s,
-which is safe because a repack deletes loose copies only after a fence of
-minutes, and a read that finds its cached pack deleted lists at once.
+With no directory to watch, a miss lists `packs/` and its tombstones again
+at most every 5 s, which is safe because a repack deletes loose copies only
+after a fence of minutes, and a read that finds its cached pack deleted
+lists at once. Since land batches publish packs (ADR 0068) a miss also lists
+`packs/` alone (one LIST shared by concurrent misses) and loads only new
+packs, so a land pack another server just published is read at once.
 `contains` HEADs the copy's tombstone and the pack's index, so it is exact
 across processes as GC needs. Tombstones are one empty object each, so GC
 deletes never contend, and a lease object (`packs/repack.lease`, conditional
@@ -1109,7 +1139,9 @@ misses and occupancy as Prometheus metrics (see [OPERATIONS.md](OPERATIONS.md)).
   recent writes and the named blobs durable, and `flush_blobs(hashes)` only
   the given ones; tree writes flush together with the contents their
   changeset names (`flush_blobs`), and a land batch flushes the blobs it
-  stores before its metadata write. The filesystem store defers its
+  stores before its metadata write. A blob a store wrote as part of a pack
+  (`BlobStore::put_many`, ADR 0068) is durable when the call returns and is
+  left out of the flush. The filesystem store defers its
   directory fsyncs to the flush, so an upload is answered before its
   directory is synced (ADR 0044). It tracks each shard directory on its own
   and a flush syncs only the directories it needs, sharing syncs already
@@ -1185,6 +1217,8 @@ misses and occupancy as Prometheus metrics (see [OPERATIONS.md](OPERATIONS.md)).
 | Disk, volume or database lost | Everything since the last backup's snapshot instant | `leep-server restore` into fresh stores, `verify --full --rehash`, start servers (OPERATIONS.md, "Backup and restore") |
 | `gc` killed at any point | Rows it wrote are harmless (a condemned blob is re-uploaded on demand, an announced delete is closed by the next collect); no reachable blob was deleted | Run `gc collect` again |
 | `repack` killed at any point | Before the index rename nothing is published (temp files and an index-less pack are garbage); after it every object is in the new pack and perhaps also loose, moved aside, or in an old pack. Every object reads throughout | Run `repack` again: it deletes the garbage, puts moved-aside copies back and finishes |
+| A land batch's pack write killed or failing at any point (ADR 0068) | Before the index rename (or upload) nothing is published: temp files or an index-less `.pack` are garbage. After it the pack's objects are stored but no changeset names them yet. Every stored changeset's objects read throughout | Nothing: the land is retried and writes its objects again; the next repack deletes the garbage |
+| The server killed with background merges waiting for their fence | The merged packs stay published beside the merged pack: every object is in both | Nothing: after a restart the next background merge or `repack` folds them in |
 | `repack` of an object store killed at any point | Before the index upload nothing is published (an index-less `.pack` or an incomplete multipart upload is garbage); after it every object is in the new pack and perhaps also loose or in an old pack. Every object reads throughout. The lease stays until it expires (10 min) | Run `repack` again after the lease expires: it deletes the garbage (once older than the lease) and finishes |
 
 **What each backend guarantees.** "Applied" means durable against a process

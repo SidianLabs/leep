@@ -122,6 +122,18 @@ impl<S: BlobStore> BlobStore for CachedBlobStore<S> {
         Ok(())
     }
 
+    /// One `put_many` of the inner store, so a backend that packs a batch
+    /// sees it whole; every item is then cached as a lone put caches it.
+    async fn put_many(&self, items: Vec<(Hash, Bytes)>) -> Result<Vec<Hash>> {
+        let durable = self.inner.put_many(items.clone()).await?;
+        let mut lru = self.lru.lock().unwrap();
+        for (hash, data) in items {
+            lru.insert(hash, data, self.capacity);
+        }
+        Self::publish(&lru);
+        Ok(durable)
+    }
+
     async fn get(&self, hash: &Hash) -> Result<Option<Bytes>> {
         if let Some(d) = self.lru.lock().unwrap().get(hash) {
             self.hits.fetch_add(1, Ordering::Relaxed);

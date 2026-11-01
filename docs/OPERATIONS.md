@@ -117,7 +117,17 @@ measured until the response head is ready, not until the body is streamed.
 | `leep_land_cas_losses_total` | counter | none | Lost ref compare-and-swaps, one per batch attempt that lost (races with other writers of the ref: other server instances, imports, raw ref updates; lands in one process are batched and never race each other). |
 | `leep_land_duration_seconds` | histogram | none | Whole land call, including time queued. |
 | `leep_land_lock_wait_seconds` | histogram | none | Time a land waited in its ref's in-process queue before its batch started (the name dates from the per-ref lock that batching replaced). |
-| `leep_land_batch_size` | histogram | none | Lands taken by each batch (group commit, ADR 0032), cancelled ones excluded. 1 means no contention; under load it approaches the number of lands queued behind one batch, at most 64. |
+| `leep_land_batch_size` | histogram | none | Lands taken by each batch (group commit, ADR 0032), cancelled ones excluded. 1 means no contention; under load it approaches the number of lands queued behind one batch, at most `--land-max-batch` (64). |
+| `leep_pack_writes_total` | counter | none | Packs written by `put_many` (ADR 0068): land batches with at least `--land-pack-min-objects` new objects, and batched imports. About one per batch under load. |
+| `leep_pack_write_objects` | histogram | none | Objects in each of those packs. |
+| `leep_pack_write_bytes` | histogram | none | Bytes of each of those packs, compressed. |
+| `leep_pack_write_seconds` | histogram | none | Time to sort, check, compress, write, sync and publish one of those packs; the land leader waits for it. |
+| `leep_blob_packs` | gauge | none | Packs reads search in this process: published, minus the ones a background merge superseded. Stays near `--background-repack-packs` under load; climbing means merges do not keep up. |
+| `leep_repack_background_runs_total` | counter | `outcome` = `merged`, `error` | Background merges (ADR 0068). An error is logged and retried at the next interval. |
+| `leep_repack_background_packs_merged_total` | counter | none | Packs those merges folded into a merged pack. |
+| `leep_repack_background_objects_written_total` | counter | none | Objects those merges wrote. Against `leep_pack_write_objects_sum` (objects land packs wrote) it should stay below about 6. |
+| `leep_repack_background_seconds` | histogram | none | Time of each merge: walk, write and publish. |
+| `leep_repack_background_cleanup_seconds` | histogram | none | Time of each cleanup a fence after a merge (deleting the merged packs). |
 | `leep_land_cancelled_total` | counter | none | Lands whose caller went away (timeout, disconnect) while queued, dropped before their batch replayed them. |
 | `leep_land_batch_deadline_total` | counter | none | Lands answered 409 because their batch was still retrying 60 s after its first attempt (`MAX_BATCH_LIFETIME`, ADR 0059) and gave up instead of moving the ref. Clients resend; keyed lands are then answered from their record. Anything but rare means a store so slow, or a ref so contended, that lands do not finish. |
 | `leep_land_answered_from_record_total` | counter | `original` = `present`, `missing` | Keyed lands answered from their land id record instead of landing again (ADR 0057). `missing`: the changeset was no longer stored (garbage collected, ADR 0059) and the record answered without reading it. |
@@ -450,11 +460,14 @@ next batch. Without a bound the queue grows until clients time out and
 send their lands again into the same queue: in the swarm at 2,000 agents on
 two cores, lands waited 27.5 to 30 s against a 30 s client timeout and
 10,300 to 15,300 were resent per run (`docs/PERFORMANCE.md`, E5 and E5b).
-`--land-queue-batches` bounds the queue in batches (ADR 0060, section 2).
+`--land-queue-seconds` bounds the wait in seconds (ADR 0068), or
+`--land-queue-batches` in batches (ADR 0060, section 2).
 
 | Flag / env | Default | What it bounds |
 |---|---|---|
-| `--land-queue-batches N\|off` / `LEEP_LAND_QUEUE_BATCHES` | `4` | Batches a land may wait behind, its own included. The queue holds the waiting lands over 64, rounded up, plus one while a batch replays; a land that would wait behind more than `N` is refused. A land that joins a batch still filling is admitted, since it waits no longer than the lands already in it. |
+| `--land-queue-seconds D\|off` / `LEEP_LAND_QUEUE_SECONDS` | `5s` | How long a land may wait in its ref's queue: the batches that fit in `D` at the ref's moving batch time (1 s per batch until one finished), never fewer than 2. A count of batches lets 64 times more wait through at full batches than at single ones and does not follow the server's speed; this does. About a sixth of the clients' land timeout. |
+| `--land-queue-batches N\|off` / `LEEP_LAND_QUEUE_BATCHES` | unset | Batches a land may wait behind, its own included, instead of `--land-queue-seconds` (giving both is an error). The queue holds the waiting lands over `--land-max-batch`, rounded up, plus one while a batch replays; a land that would wait behind more than `N` is refused. A land that joins a batch still filling is admitted, since it waits no longer than the lands already in it. Before ADR 0068 this was the bound, `4` by default; set `4` to keep that. |
+| `--land-max-batch N` / `LEEP_LAND_MAX_BATCH` | `64` | Lands one batch takes (1 to 4,096). Larger batches move the ref and write a pack once for more lands, and make a land wait longer behind the batch before it. |
 
 How a land is replayed onto a moved head (ADR 0066):
 
@@ -1801,7 +1814,9 @@ as a zstd delta against the previous version at its path and each tree node
 against the same directory one commit earlier, so a long history shrinks by
 one to two orders of magnitude (the first 3,795 commits of git/git: 91.2 MB
 loose, 4.2 MB packed with its index) and the store holds a handful of files
-instead of one per object. New writes stay loose until the next repack.
+instead of one per object. Uploads and lone writes stay loose until the next
+repack; land batches write their new objects as one pack each, which the
+server merges in the background (below, ADR 0068).
 
 ```sh
 leep-server repack                    # loose objects into a new pack; merge small packs (ADR 0039)
@@ -1849,6 +1864,48 @@ also gives the time spent walking, writing, fencing and cleaning up. Only one
 repack runs at a time per store (a second one exits with "another repack is
 running"). Killing it is safe at any point: the store stays readable, and
 the next run deletes the leftovers and finishes.
+
+### Packs written by land batches
+
+Since ADR 0068 a land batch writes its new objects (tree nodes, merged
+contents) as one pack instead of a file or bucket object each, and the
+server merges these packs in the background so reads search few. Both are
+on by default for filesystem and object stores; `mem://` stores keep
+neither.
+
+| Flag / env | Default | What it does |
+|---|---|---|
+| `--land-packs on\|off` / `LEEP_LAND_PACKS` | `on` | Write a batch of new objects as one pack. `off` writes every object loose, as before. |
+| `--land-pack-min-objects N` / `LEEP_LAND_PACK_MIN_OBJECTS` | `16` | Fewest new objects written as a pack; fewer stay loose. |
+| `--background-repack on\|off` / `LEEP_BACKGROUND_REPACK` | `on` | Merge packs in the background. `off` leaves merging to `leep-server repack`, and reads then search every land pack until it runs. |
+| `--background-repack-packs N` / `LEEP_BACKGROUND_REPACK_PACKS` | `32` | Merge when reads search more packs than this. |
+| `--background-repack-interval D` / `LEEP_BACKGROUND_REPACK_INTERVAL` | `5s` | How often the pack count is checked and cleanups that are due run. |
+| `--background-repack-fence D` / `LEEP_BACKGROUND_REPACK_FENCE` | `--request-timeout` + 1m (`6m`; `10m` with no request timeout) | How long merged packs stay on disk after the merged pack is published, for readers in other processes. Longer than `--request-timeout` plus clock skew, like `repack --fence`; the server warns otherwise. |
+| `--background-repack-level N` / `LEEP_BACKGROUND_REPACK_LEVEL` | `3` | zstd level of the merged packs. |
+
+Merges are tiered: a pack's class is `floor(log4(live objects))`, and while
+more than `--background-repack-packs` packs are searched the server merges
+the packs of the lowest class holding at least four, smallest first, up to
+64 packs and 1 GiB, back to back. Packs over 256 MiB are left to
+`leep-server repack`. Each object is rewritten at most once per class
+(about six), and at most about 32 packs below 256 MiB stay searched; the
+packs above it grow by about one per 256 MiB to 1 GiB written, so keep the
+cron `repack` of this section. Merges leave loose objects alone and do not
+walk history: merged packs hold whole frames, and `leep-server repack`
+stores versions as deltas. They run one at a time on a thread at the
+lowest CPU priority. At most 256 merges, or 4 GiB of merged packs, wait for
+their fence at once. Reads in the server stop searching the
+merged packs at once, and the server deletes them a fence later. Each step
+takes the store's repack lock (or lease), so a `leep-server repack` started
+meanwhile may find it taken and exit with "another repack is running"; run
+it again. A background cleanup that finds the lock taken waits for the next
+interval. A server stopped with cleanups pending leaves the merged packs
+published beside the merged one; the next merge or `repack` folds them in.
+
+On an object store, upgrade every server before land packs are written
+there: a server built before ADR 0068 lists `packs/` on a miss at most
+every 5 s and may briefly miss the objects of a land pack another server
+just wrote.
 
 When to run it: after a large import, then incremental runs often and a full
 one rarely. The incremental run's cost follows the new history, so daily or

@@ -178,17 +178,35 @@ pub async fn pack_order_loose(
     repo: &Repo,
     is_loose: &(dyn Fn(&Hash) -> bool + Sync),
 ) -> Result<PackOrder> {
+    pack_order_where(repo, is_loose, is_loose, usize::MAX).await
+}
+
+/// Like [`pack_order_loose`], for a merge of packs (ADR 0068): lists the
+/// objects `wanted` accepts, walking back from every ref tip through each
+/// changeset whose root tree `wanted` or `walk_through` accepts (a land's
+/// copy has its tree in a land pack, a fast-forwarded create its tree
+/// loose), and at most `limit` changesets, so a store whose loose objects
+/// are never packed does not walk all of its history every time.
+pub async fn pack_order_where(
+    repo: &Repo,
+    wanted: &(dyn Fn(&Hash) -> bool + Sync),
+    walk_through: &(dyn Fn(&Hash) -> bool + Sync),
+    limit: usize,
+) -> Result<PackOrder> {
     let empty = TreeNode::empty_hash();
     let mut seen: HashSet<ChangesetId> = HashSet::new();
     let mut stack: Vec<ChangesetId> = repo.meta().list_refs().await?.into_values().collect();
     let mut found: Vec<(u64, ChangesetId, Option<ChangesetId>)> = Vec::new();
     let mut roots: HashMap<ChangesetId, Hash> = HashMap::new();
     while let Some(id) = stack.pop() {
+        if found.len() >= limit {
+            break;
+        }
         if !seen.insert(id) {
             continue;
         }
         let root = repo.root_tree(id).await?;
-        if root != empty && !is_loose(&root) {
+        if root != empty && !wanted(&root) && !walk_through(&root) {
             continue;
         }
         roots.insert(id, root);
@@ -206,7 +224,7 @@ pub async fn pack_order_loose(
             },
             None => None,
         };
-        walk.changeset(repo, roots[&id], parent_root, is_loose)
+        walk.changeset(repo, roots[&id], parent_root, wanted)
             .await?;
     }
     Ok(PackOrder {

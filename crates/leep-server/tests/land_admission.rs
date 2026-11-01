@@ -287,6 +287,10 @@ async fn settle() {
 }
 
 fn assert_not_admitted(r: &Reply) {
+    assert_not_admitted_by(r, "--land-queue-batches");
+}
+
+fn assert_not_admitted_by(r: &Reply, flag: &str) {
     assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE, "{:?}", r.body);
     assert_eq!(r.headers[REFUSED_HEADER], REFUSED_ADMISSION);
     let secs: u64 = r.headers[header::RETRY_AFTER]
@@ -297,7 +301,7 @@ fn assert_not_admitted(r: &Reply) {
     assert!((1..=30).contains(&secs), "Retry-After {secs}");
     let e = r.error();
     assert_eq!(e.code.as_deref(), Some("unavailable"));
-    assert!(e.error.contains("--land-queue-batches"), "{}", e.error);
+    assert!(e.error.contains(flag), "{}", e.error);
     assert!(e.error.contains("nothing was done"), "{}", e.error);
     assert!(e.request_id.is_some());
 }
@@ -309,6 +313,46 @@ async fn land_moves(meta: &MemoryMetaStore) -> usize {
         .iter()
         .filter(|e| e.operation == "land")
         .count()
+}
+
+/// `--land-queue-seconds` (ADR 0068): before any batch finished a batch
+/// counts as one second, so 2 s admits two batches of
+/// `--land-max-batch 4`; once batches are known to be fast, the same
+/// queue admits more.
+#[tokio::test]
+async fn a_land_past_the_seconds_bound_is_refused_and_fast_batches_admit_more() {
+    let r = rig(None, 12).await;
+    let repo = r
+        .repo
+        .clone()
+        .with_land_queue_seconds(Some(Duration::from_secs(2)))
+        .with_land_max_batch(4);
+    let app = leep_server::router(repo);
+    r.gate.armed.store(true, Ordering::SeqCst);
+    let held = spawn_land(&app, r.lands[0], None);
+    r.gate.until_held().await;
+    // One batch replaying, one of four waiting: two batches, the bound.
+    let queued: Vec<_> = r.lands[1..=4]
+        .iter()
+        .map(|cs| spawn_land(&app, *cs, None))
+        .collect();
+    settle().await;
+    let refused = land(&app, r.lands[5], None).await;
+    assert_not_admitted_by(&refused, "--land-queue-seconds");
+    r.gate.open();
+    held.await.unwrap().landed();
+    for q in queued {
+        q.await.unwrap().landed();
+    }
+    // Batches took milliseconds: two seconds now hold many of them.
+    let more: Vec<_> = r.lands[5..12]
+        .iter()
+        .map(|cs| spawn_land(&app, *cs, None))
+        .collect();
+    for m in more {
+        m.await.unwrap().landed();
+    }
+    assert_eq!(land_moves(&r.meta).await, 12);
 }
 
 #[tokio::test]

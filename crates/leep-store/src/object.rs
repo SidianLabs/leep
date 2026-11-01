@@ -10,7 +10,8 @@ use object_store::memory::InMemory;
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 
-use crate::objpacks::{RemotePackSet, DEFAULT_REFRESH_INTERVAL};
+use crate::objpacks::{idx_key, pack_key, RemotePack, RemotePackSet, DEFAULT_REFRESH_INTERVAL};
+use crate::packput::{self, PackWriteStep, PackWrites};
 use crate::packset::DEFAULT_DECODED_CACHE;
 use crate::storage_err;
 
@@ -26,12 +27,14 @@ pub struct S3Config {
 }
 
 /// Blobs in any `object_store` backend: loose under `blobs/<2 hex>/<62 hex>`,
-/// and packed under `packs/` once `repack` has run (ADR 0040). New writes are
-/// always loose; reads try the loose object first, then the packs.
+/// and packed under `packs/` (ADR 0040). A put writes a loose object; a
+/// `put_many` of at least [`PackWrites::min_objects`] objects writes them as
+/// one pack (ADR 0068). Reads try the loose object first, then the packs.
 #[derive(Clone)]
 pub struct ObjectBlobStore {
     pub(crate) store: Arc<dyn ObjectStore>,
     pub(crate) packs: Arc<RemotePackSet>,
+    writes: PackWrites,
 }
 
 impl std::fmt::Debug for ObjectBlobStore {
@@ -63,7 +66,37 @@ impl ObjectBlobStore {
             decoded_cache,
             refresh_interval,
         ));
-        Self { store, packs }
+        Self {
+            store,
+            packs,
+            writes: PackWrites::default(),
+        }
+    }
+
+    /// How `put_many` writes packs (ADR 0068); [`PackWrites::off`] keeps
+    /// every write loose.
+    pub fn with_pack_writes(mut self, writes: PackWrites) -> Self {
+        self.writes = writes;
+        self
+    }
+
+    /// Packs reads search now: published, and not merged by a repack of
+    /// this process. Lists `packs/` first.
+    pub async fn pack_count(&self) -> Result<usize> {
+        Ok(self.packs.refresh().await?.searchable().len())
+    }
+
+    /// `put_with_hash` for each item, [`leep_core::store::PUT_IN_FLIGHT`]
+    /// at a time.
+    async fn put_loose_many(&self, items: Vec<(Hash, Bytes)>) -> Result<()> {
+        for chunk in items.chunks(leep_core::store::PUT_IN_FLIGHT) {
+            let puts: Vec<_> = chunk
+                .iter()
+                .map(|(h, d)| self.put_with_hash(*h, d.clone()))
+                .collect();
+            futures::future::try_join_all(puts).await?;
+        }
+        Ok(())
     }
 
     pub fn s3(cfg: S3Config) -> Result<Self> {
@@ -105,6 +138,66 @@ impl BlobStore for ObjectBlobStore {
             .await
             .map_err(storage_err)?;
         Ok(())
+    }
+
+    /// At least [`PackWrites::min_objects`] objects become one pack: the
+    /// `.pack` uploaded, then the `.idx`, which publishes it, then added to
+    /// this process's view; their hashes are returned. Other servers find it
+    /// on their next miss. Unlike `put_with_hash`, an object that also has a
+    /// loose copy keeps that copy's `modified` in listings, which GC's grace
+    /// window reads; the rescue rows of ADR 0012, which the caller writes
+    /// after this, are what protect it.
+    async fn put_many(&self, mut items: Vec<(Hash, Bytes)>) -> Result<Vec<Hash>> {
+        if !self.writes.packs(items.len()) {
+            self.put_loose_many(items).await?;
+            return Ok(Vec::new());
+        }
+        let started = std::time::Instant::now();
+        packput::sort_distinct(&mut items);
+        let mut tree_first = false;
+        let (new, loose): (Vec<_>, Vec<_>) = items
+            .into_iter()
+            .partition(|(h, d)| packput::packable(h, d, &mut tree_first));
+        if !self.writes.packs(new.len()) {
+            self.put_loose_many(new.into_iter().chain(loose).collect())
+                .await?;
+            return Ok(Vec::new());
+        }
+        let level = self.writes.level;
+        let now = crate::fs::unix_secs(std::time::SystemTime::now()).unwrap_or(0);
+        let (new, encoded) = tokio::task::spawn_blocking(move || {
+            let encoded = packput::encode(&new, level, now);
+            (new, encoded)
+        })
+        .await
+        .map_err(|e| leep_core::Error::Storage(format!("pack task failed: {e}")))?;
+        let mut encoded = encoded?;
+        let view = self.packs.view().await?;
+        while view.pack(&encoded.id).is_some() {
+            encoded.next_id()?;
+        }
+        let bytes = encoded.pack.len() as u64;
+        self.writes.step(PackWriteStep::PackSynced)?;
+        self.store
+            .put(&pack_key(&encoded.id), PutPayload::from(encoded.pack))
+            .await
+            .map_err(storage_err)?;
+        self.writes.step(PackWriteStep::PackRenamed)?;
+        self.writes.step(PackWriteStep::IndexSynced)?;
+        self.store
+            .put(&idx_key(&encoded.id), PutPayload::from(encoded.idx))
+            .await
+            .map_err(storage_err)?;
+        self.writes.step(PackWriteStep::Published)?;
+        self.packs
+            .insert_published(RemotePack {
+                id: encoded.id,
+                index: encoded.index,
+            })
+            .await;
+        self.put_loose_many(loose).await?;
+        packput::record(new.len(), bytes, started.elapsed());
+        Ok(new.into_iter().map(|(h, _)| h).collect())
     }
 
     async fn get(&self, hash: &Hash) -> Result<Option<Bytes>> {

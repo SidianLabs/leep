@@ -1,5 +1,5 @@
 # 0040. Packs in object stores
-Status: Accepted
+Status: Accepted; amended by ADR 0068 (land batches write packs; a miss also lists `packs/` for new packs)
 Date: 2026-10-17
 
 ## Context

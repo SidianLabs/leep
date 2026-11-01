@@ -362,6 +362,10 @@ pub struct BlobMeta {
 /// in flight.
 pub const CONTAINS_IN_FLIGHT: usize = 64;
 
+/// How many `put_with_hash` calls the default [`BlobStore::put_many`] keeps
+/// in flight: a land batch's few hundred objects in one or two waves.
+pub const PUT_IN_FLIGHT: usize = 256;
+
 /// How many `get` calls the default [`BlobStore::get_many`] keeps in flight.
 /// Bounded so a batch of large blobs does not hold all of them at once
 /// before the first is used.
@@ -380,6 +384,26 @@ pub trait BlobStore: Send + Sync + 'static {
     /// Store bytes under a caller-computed address (used for tree nodes and
     /// other derived objects). Callers guarantee `hash` is correct for `data`.
     async fn put_with_hash(&self, hash: Hash, data: Bytes) -> Result<()>;
+
+    /// [`put_with_hash`](Self::put_with_hash) for many objects at once (ADR
+    /// 0068). Returns the hashes among `items` that are durable already, so
+    /// the caller leaves them out of its [`flush_blobs`](Self::flush_blobs);
+    /// every other item is stored as `put_with_hash` stores it. A backend
+    /// that writes a batch as one pack returns the hashes it packed, made
+    /// durable and readable through this store before it returns.
+    ///
+    /// The default makes [`PUT_IN_FLIGHT`] `put_with_hash` calls at a time
+    /// and returns no hash, which is always correct.
+    async fn put_many(&self, items: Vec<(Hash, Bytes)>) -> Result<Vec<Hash>> {
+        for chunk in items.chunks(PUT_IN_FLIGHT) {
+            let mut puts = Vec::with_capacity(chunk.len());
+            for (h, d) in chunk {
+                puts.push(self.put_with_hash(*h, d.clone()));
+            }
+            futures_util::future::try_join_all(puts).await?;
+        }
+        Ok(Vec::new())
+    }
 
     async fn get(&self, hash: &Hash) -> Result<Option<Bytes>>;
 

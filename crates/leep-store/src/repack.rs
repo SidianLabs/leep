@@ -32,8 +32,10 @@ use crate::packwrite::{
 use crate::tmpfile::create_exclusive;
 use crate::{storage_err, FsBlobStore};
 
-/// Held for a whole repack, fence included, so two never overlap. A lock,
-/// not a pid file: the kernel releases it when the process dies.
+/// Held for each step of a repack (publishing, cleaning up), and by default
+/// from the first to the last, fence included, so no two steps of repacks
+/// overlap. A lock, not a pid file: the kernel releases it when the process
+/// dies.
 const REPACK_LOCK: &str = "repack.lock";
 /// Prefix of a loose copy moved aside while a repack decides whether to
 /// delete it. A leftover is a whole object and the next repack puts it back.
@@ -76,6 +78,14 @@ pub enum RepackMode {
     /// [`plan_merge`](crate::plan_merge) picks, so pack sizes stay a geometric series and the
     /// count stays at most `max_packs`. The other packs are left alone.
     Incremental { factor: u64, max_packs: usize },
+    /// Exactly the packs [`RepackOptions::packs`] names that are still
+    /// published and searched (the caller ran
+    /// [`plan_merge`](crate::plan_merge) on [`FsBlobStore::pack_sizes`]),
+    /// with the loose objects only if `loose`. The background repack of
+    /// ADR 0068 merges packs this way without listing loose objects, and
+    /// writes the walk's hints first, since they cover exactly the merged
+    /// objects.
+    Planned { loose: bool },
 }
 
 #[derive(Clone)]
@@ -90,6 +100,8 @@ pub struct RepackOptions {
     pub threads: usize,
     /// Called at each step; an error aborts the repack where it stands.
     pub hook: Option<RepackHook>,
+    /// The packs a [`RepackMode::Planned`] repack merges.
+    pub packs: Vec<String>,
 }
 
 impl Default for RepackOptions {
@@ -100,6 +112,7 @@ impl Default for RepackOptions {
             mode: RepackMode::Full,
             threads: 0,
             hook: None,
+            packs: Vec::new(),
         }
     }
 }
@@ -113,6 +126,15 @@ impl std::fmt::Debug for RepackOptions {
             .field("threads", &self.threads)
             .finish_non_exhaustive()
     }
+}
+
+/// A searchable pack's live object count and its `.pack` size, for
+/// planning a merge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackSize {
+    pub id: String,
+    pub objects: u64,
+    pub bytes: u64,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -171,12 +193,38 @@ pub struct PublishedPack {
     from_loose: Vec<(Hash, i64)>,
     replaced: Vec<String>,
     opts: RepackOptions,
-    _lock: File,
+    /// The repack lock, unless [`unlock`](Self::unlock) let it go.
+    lock: Option<File>,
 }
 
 impl PublishedPack {
     pub fn report(&self) -> &RepackReport {
         &self.report
+    }
+
+    /// Let other repacks run until [`finish`](Self::finish), which takes
+    /// the lock again. Safe because every step of a repack holds the lock:
+    /// a repack published meanwhile may also merge the packs this one
+    /// replaces, or pack its loose copies again, and the cleanups of both
+    /// remove only copies a published pack holds, checked under the lock.
+    /// The packs this one replaced are no longer searched in this process
+    /// ([`PackSet::supersede`]), nor merged again by its repacks.
+    pub fn unlock(&mut self) {
+        self.lock = None;
+    }
+
+    /// The packs this repack replaces, deleted by [`finish`](Self::finish).
+    pub fn replaced(&self) -> &[String] {
+        &self.replaced
+    }
+
+    /// Take the repack lock again after [`unlock`](Self::unlock); `Conflict`
+    /// while another repack holds it, and this one is kept for a retry.
+    pub fn relock(&mut self) -> Result<()> {
+        if self.lock.is_none() {
+            self.lock = Some(take_repack_lock(self.store.packs.dir())?);
+        }
+        Ok(())
     }
 
     /// Delete the loose copies of everything now packed and the replaced
@@ -187,7 +235,9 @@ impl PublishedPack {
             .map_err(|e| Error::Storage(format!("repack task failed: {e}")))?
     }
 
-    fn finish_blocking(mut self) -> Result<RepackReport> {
+    /// [`finish`](Self::finish) on this thread.
+    pub fn finish_blocking(mut self) -> Result<RepackReport> {
+        self.relock()?;
         let store = self.store.clone();
         let new_id = self.report.pack_id.clone();
         let mut put_back_dirs = std::collections::BTreeSet::new();
@@ -246,6 +296,24 @@ impl PublishedPack {
         self.report.loose_after = n;
         self.report.loose_bytes_after = bytes;
         Ok(self.report)
+    }
+}
+
+/// The repack lock of the store whose `packs/` is `dir`, or `Conflict`.
+fn take_repack_lock(dir: &Path) -> Result<File> {
+    std::fs::create_dir_all(dir).map_err(storage_err)?;
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join(REPACK_LOCK))
+        .map_err(storage_err)?;
+    match lock.try_lock() {
+        Ok(()) => Ok(lock),
+        Err(std::fs::TryLockError::WouldBlock) => Err(Error::Conflict(
+            "another repack is running on this blob store".into(),
+        )),
+        Err(std::fs::TryLockError::Error(e)) => Err(storage_err(e)),
     }
 }
 
@@ -571,22 +639,7 @@ impl FsBlobStore {
             )));
         }
         let dir = self.packs.dir().to_path_buf();
-        std::fs::create_dir_all(&dir).map_err(storage_err)?;
-        let lock = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(dir.join(REPACK_LOCK))
-            .map_err(storage_err)?;
-        match lock.try_lock() {
-            Ok(()) => {}
-            Err(std::fs::TryLockError::WouldBlock) => {
-                return Err(Error::Conflict(
-                    "another repack is running on this blob store".into(),
-                ))
-            }
-            Err(std::fs::TryLockError::Error(e)) => return Err(storage_err(e)),
-        }
+        let lock = take_repack_lock(&dir)?;
         let mut report = RepackReport {
             garbage_removed: remove_unpublished(&dir)?,
             ..RepackReport::default()
@@ -598,7 +651,12 @@ impl FsBlobStore {
             restore: true,
             ..LeftoverCounts::default()
         };
-        let loose = loose_objects(self.root(), &mut leftovers)?;
+        let with_loose = !matches!(opts.mode, RepackMode::Planned { loose: false, .. });
+        let loose = if with_loose {
+            loose_objects(self.root(), &mut leftovers)?
+        } else {
+            Vec::new()
+        };
         report.leftovers_restored = leftovers.restored;
         report.garbage_removed += leftovers.removed;
         report.packs_before = view.packs.len() as u64;
@@ -620,6 +678,12 @@ impl FsBlobStore {
                     .into_iter()
                     .collect()
             }
+            RepackMode::Planned { .. } => view
+                .searchable()
+                .iter()
+                .filter(|(p, _)| opts.packs.contains(&p.id))
+                .map(|(p, _)| p.id.clone())
+                .collect(),
         };
         report.packs_merged = merged.len() as u64;
         let all: Vec<(usize, &Pack, &HashSet<Hash>)> = view
@@ -629,7 +693,11 @@ impl FsBlobStore {
             .map(|(i, (p, dead))| (i, &**p, dead))
             .collect();
         report.pack_bytes_before = all.iter().map(|(_, p, _)| p.index.pack_len()).sum();
-        report.packed_before = merge_packs(&all).count() as u64;
+        report.packed_before = match opts.mode {
+            // A count over every pack, too slow for the background merges.
+            RepackMode::Planned { .. } => all.iter().map(|(_, p, dead)| live(dead, p)).sum(),
+            _ => merge_packs(&all).count() as u64,
+        };
         let merging: Vec<(usize, &Pack, &HashSet<Hash>)> = all
             .iter()
             .copied()
@@ -724,7 +792,7 @@ impl FsBlobStore {
         // merged packs first, so loose objects can use them as bases.
         let hints = hint_ids(&table, hints);
         let order = match opts.mode {
-            RepackMode::Full => write_order(&table, hints, old_bases),
+            RepackMode::Full | RepackMode::Planned { .. } => write_order(&table, hints, old_bases),
             RepackMode::Incremental { .. } => write_order(&table, old_bases, hints),
         };
 
@@ -759,7 +827,7 @@ impl FsBlobStore {
                 from_loose,
                 replaced,
                 opts,
-                _lock: lock,
+                lock: Some(lock),
             });
         }
         // The index is encoded twice, once for its id and once into its
@@ -811,13 +879,59 @@ impl FsBlobStore {
         // arrays of this run go first.
         drop((written, sources, table, view));
         self.packs.refresh()?;
+        let replaced: Vec<String> = replaced.into_iter().filter(|r| *r != id).collect();
+        // The new pack holds every live object of each; reads here stop
+        // searching them now rather than after the fence.
+        self.packs.supersede(&replaced);
         Ok(PublishedPack {
             store: self.clone(),
             report,
             from_loose,
-            replaced: replaced.into_iter().filter(|r| *r != id).collect(),
+            replaced,
             opts,
-            _lock: lock,
+            lock: Some(lock),
+        })
+    }
+
+    /// [`repack_publish`](Self::repack_publish) on this thread, for a caller
+    /// that runs it on a thread of its own (the background repack lowers
+    /// that thread's priority).
+    pub fn repack_publish_blocking(
+        &self,
+        hints: impl Into<PackHints>,
+        opts: RepackOptions,
+    ) -> Result<PublishedPack> {
+        self.publish_blocking(hints.into(), opts)
+    }
+
+    /// Each searchable pack with its live object count and size: what
+    /// [`plan_merge`](crate::plan_merge) plans from. Scans `packs/` first.
+    pub fn pack_sizes(&self) -> Result<Vec<PackSize>> {
+        let view = self.packs.refresh()?;
+        Ok(view
+            .searchable()
+            .iter()
+            .map(|(p, dead)| PackSize {
+                id: p.id.clone(),
+                objects: p.index.len().saturating_sub(dead.len()) as u64,
+                bytes: p.index.pack_len(),
+            })
+            .collect())
+    }
+    /// Whether `hash` has a live copy in one of the packs `ids` names, for
+    /// the walk that picks delta bases of a planned merge.
+    pub fn packed_in(&self, ids: &HashSet<String>) -> Result<impl Fn(&Hash) -> bool + Send + Sync> {
+        let view = self.packs.view()?;
+        let packs: Vec<(Arc<Pack>, HashSet<Hash>)> = view
+            .packs
+            .iter()
+            .filter(|(p, _)| ids.contains(&p.id))
+            .cloned()
+            .collect();
+        Ok(move |h: &Hash| {
+            packs
+                .iter()
+                .any(|(p, dead)| p.index.find(h).is_some() && !dead.contains(h))
         })
     }
 
@@ -852,9 +966,12 @@ impl FsBlobStore {
     }
 }
 
-/// Delete what a killed repack left in `packs/`: temp files, and packs whose
-/// index was never published. Only under the repack lock.
+/// Delete what a killed repack or pack write left in `packs/`: temp files,
+/// and packs whose index was never published. Only under the repack lock,
+/// and with pack writes held off (`write.lock`), so a pack whose index a
+/// `put_many` is about to publish is not taken for garbage.
 fn remove_unpublished(dir: &Path) -> Result<u64> {
+    let _writes = crate::fs::lock_pack_writes(dir, true)?;
     let ids: HashSet<String> = published_ids(dir)?.into_iter().collect();
     let mut removed = 0;
     for entry in std::fs::read_dir(dir).map_err(storage_err)? {

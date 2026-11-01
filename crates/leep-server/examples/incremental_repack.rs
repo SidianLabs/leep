@@ -152,7 +152,7 @@ impl Site {
         let t = Instant::now();
         let order = match mode {
             RepackMode::Full => pack_order(&self.repo).await.unwrap(),
-            RepackMode::Incremental { .. } => {
+            RepackMode::Incremental { .. } | RepackMode::Planned { .. } => {
                 let s = self.store.clone();
                 pack_order_loose(&self.repo, &move |h| s.is_loose(h))
                     .await

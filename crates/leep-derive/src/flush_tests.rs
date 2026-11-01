@@ -31,6 +31,13 @@ struct Deferred {
     /// Put by "another process": only a flush that names them syncs them.
     elsewhere: Mutex<HashSet<Hash>>,
     flushes: Mutex<usize>,
+    /// `put_many` of at least this many blobs writes them as a "pack":
+    /// durable when it returns, and said so (ADR 0068). 0: never.
+    pack_min: usize,
+    /// Hashes `put_many` packed, and those of them flushes were asked to
+    /// sync after they were packed.
+    packed: Mutex<HashSet<Hash>>,
+    flushed: Mutex<HashSet<Hash>>,
 }
 
 impl Deferred {
@@ -62,6 +69,23 @@ impl BlobStore for Deferred {
         Ok(())
     }
 
+    async fn put_many(&self, items: Vec<(Hash, Bytes)>) -> Result<Vec<Hash>> {
+        if self.pack_min == 0 || items.len() < self.pack_min {
+            for (h, d) in items {
+                self.put_with_hash(h, d).await?;
+            }
+            return Ok(Vec::new());
+        }
+        let mut packed = Vec::new();
+        for (h, d) in items {
+            self.inner.put_with_hash(h, d.clone()).await?;
+            self.copies.lock().unwrap().insert(h, d);
+            self.packed.lock().unwrap().insert(h);
+            packed.push(h);
+        }
+        Ok(packed)
+    }
+
     async fn get(&self, hash: &Hash) -> Result<Option<Bytes>> {
         self.inner.get(hash).await
     }
@@ -88,6 +112,15 @@ impl BlobStore for Deferred {
     /// request's flush, or on a blanket one, is caught.
     async fn flush_blobs(&self, hashes: &[Hash]) -> Result<()> {
         *self.flushes.lock().unwrap() += 1;
+        {
+            // Only flushes of blobs already packed: a create may flush the
+            // same tree node before a land batch packs it.
+            let packed = self.packed.lock().unwrap();
+            self.flushed
+                .lock()
+                .unwrap()
+                .extend(hashes.iter().filter(|h| packed.contains(*h)).copied());
+        }
         let named: HashSet<Hash> = hashes.iter().copied().collect();
         self.unsynced.lock().unwrap().retain(|h| !named.contains(h));
         self.elsewhere
@@ -249,7 +282,15 @@ impl MetaStore for Checked {
 }
 
 fn repo() -> (Repo, Arc<Deferred>, Arc<Checked>) {
-    let blobs = Arc::new(Deferred::default());
+    repo_packing(0)
+}
+
+/// [`repo`] over blobs whose `put_many` of `pack_min` or more packs them.
+fn repo_packing(pack_min: usize) -> (Repo, Arc<Deferred>, Arc<Checked>) {
+    let blobs = Arc::new(Deferred {
+        pack_min,
+        ..Deferred::default()
+    });
     let meta = Arc::new(Checked {
         inner: MemoryMetaStore::new(),
         blobs: blobs.clone(),
@@ -384,4 +425,47 @@ async fn a_merge_flushes_the_merged_content() {
     };
     assert!(!blobs.is_unsynced(content));
     assert_eq!(meta.violations(), Vec::<String>::new());
+}
+
+/// With a store that writes land batches as packs (ADR 0068), no copy is
+/// stored before every node of its tree is durable either way, and the
+/// blobs a pack made durable are not flushed again: the batch's flush names
+/// only what is still unsynced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn batched_lands_through_packs_store_nothing_unsynced_and_skip_packed_flushes() {
+    let (r, blobs, meta) = repo_packing(4);
+    let base = commit(&r, vec![], &[("base.txt", b"base\n")]).await;
+    r.meta().cas_ref("main", None, Some(base)).await.unwrap();
+    let agents: Vec<_> = (0..16)
+        .map(|i| {
+            let r = r.clone();
+            tokio::spawn(async move {
+                for j in 0..3 {
+                    let path = format!("agents/a{i}/d{j}/f");
+                    let data = format!("agent {i} edit {j}\n");
+                    let head = r.meta().get_ref("main").await.unwrap();
+                    let cs =
+                        commit(&r, head.into_iter().collect(), &[(&path, data.as_bytes())]).await;
+                    let LandResponse::Landed { .. } = r.land(cs, "main").await.unwrap() else {
+                        panic!("agents edit disjoint files");
+                    };
+                }
+            })
+        })
+        .collect();
+    for a in agents {
+        a.await.unwrap();
+    }
+    assert_eq!(meta.violations(), Vec::<String>::new());
+    let packed = blobs.packed.lock().unwrap().clone();
+    assert!(!packed.is_empty(), "batches went into packs");
+    let flushed = blobs.flushed.lock().unwrap();
+    // A node packed by one batch may be written again by a later batch too
+    // small to pack, and flushed then; most never are.
+    assert!(
+        flushed.len() * 4 < packed.len(),
+        "{} of {} packed blobs flushed after being packed",
+        flushed.len(),
+        packed.len()
+    );
 }

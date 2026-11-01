@@ -2162,7 +2162,67 @@ pub async fn check_blob_store_contract(store: &dyn BlobStore) {
     store.flush_blobs(&[]).await.unwrap();
     store.flush_blobs(&[h, other]).await.unwrap();
 
+    check_put_many(store).await;
     check_blob_list_and_delete(store).await;
+}
+
+/// `put_many` stores every item readable at once, whatever part of the
+/// batch a backend packs, and says durable only of items it was given.
+async fn check_put_many(store: &dyn BlobStore) {
+    assert!(store.put_many(Vec::new()).await.unwrap().is_empty());
+    for n in [3usize, 40] {
+        let mut items: Vec<(Hash, Bytes)> = (0..n)
+            .map(|i| {
+                let data = Bytes::from(format!("put-many {n} item {i} ").repeat(i % 7 + 1));
+                (Hash::of_blob(&data), data)
+            })
+            .collect();
+        let node = Bytes::from(format!("put-many node {n}"));
+        items.push((Hash::of_object("tree-v1", &node), node));
+        // Given twice, and one stored before.
+        items.push(items[1].clone());
+        let before = Bytes::from(format!("put-many stored before {n}"));
+        items.push((store.put(before.clone()).await.unwrap(), before));
+        let durable = store.put_many(items.clone()).await.unwrap();
+        for d in &durable {
+            assert!(items.iter().any(|(h, _)| h == d), "durable names an item");
+        }
+        store.flush_blobs(&[]).await.unwrap();
+        let hashes: Vec<Hash> = items.iter().map(|(h, _)| *h).collect();
+        assert!(
+            store
+                .contains_many(&hashes)
+                .await
+                .unwrap()
+                .iter()
+                .all(|c| *c),
+            "every item is stored"
+        );
+        let got = store.get_many(&hashes).await.unwrap();
+        for ((h, data), got) in items.iter().zip(got) {
+            assert_eq!(got.as_ref(), Some(data), "{h}");
+            assert_eq!(store.get_stored(h).await.unwrap().as_ref(), Some(data));
+        }
+        let listed = list_all_blobs(store, 1000).await;
+        let now = now_secs();
+        for (h, data) in &items {
+            let m = listed.iter().find(|m| m.hash == *h).expect("listed");
+            assert_eq!(m.size, data.len() as u64, "listed size");
+            if let Some(t) = m.modified {
+                assert!((now - 3600..=now + 3600).contains(&t), "mtime near now");
+            }
+        }
+        // Deleted, then stored again by a later batch: visible again.
+        let (gone, data) = items[0].clone();
+        store.delete(&gone).await.unwrap();
+        assert!(!store.contains(&gone).await.unwrap());
+        assert!(store.get(&gone).await.unwrap().is_none());
+        let mut again = items[2..].to_vec();
+        again.push((gone, data.clone()));
+        store.put_many(again).await.unwrap();
+        assert!(store.contains(&gone).await.unwrap());
+        assert_eq!(store.get(&gone).await.unwrap(), Some(data));
+    }
 }
 
 async fn list_all_blobs(store: &dyn BlobStore, page: usize) -> Vec<BlobMeta> {

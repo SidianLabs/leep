@@ -21,7 +21,7 @@ use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 
 use crate::pack::{self, IdxEntry, PackIndex};
-use crate::packset::{merge_listing, DecodedCache, Tombstones};
+use crate::packset::{merge_listing, order_packs, DecodedCache, PackLike, Tombstones};
 use crate::storage_err;
 
 pub(crate) const PACKS_PREFIX: &str = "packs";
@@ -54,20 +54,40 @@ pub(crate) struct RemotePack {
     pub index: PackIndex,
 }
 
+impl PackLike for RemotePack {
+    fn id(&self) -> &str {
+        &self.id
+    }
+    fn index(&self) -> &PackIndex {
+        &self.index
+    }
+}
+
 /// The packs and tombstones as of one listing.
 pub(crate) struct View {
+    /// Searchable packs first, smallest first, then the ones a repack of
+    /// this process superseded (see `packset::View`).
     pub packs: Vec<(Arc<RemotePack>, HashSet<Hash>)>,
+    searchable: usize,
     /// When the listing behind this view began.
     started: Instant,
+    /// When the latest listing of `packs/` began, this one's or a later
+    /// one that only looked for new packs.
+    packs_started: Instant,
 }
 
 impl View {
-    /// The first live packed copy of `hash`.
+    /// The first live packed copy of `hash`, in the packs reads search.
     pub fn locate(&self, hash: &Hash) -> Option<(&Arc<RemotePack>, IdxEntry)> {
-        self.packs.iter().find_map(|(p, dead)| {
+        self.packs[..self.searchable].iter().find_map(|(p, dead)| {
             let e = p.index.find(hash)?;
             (!dead.contains(hash)).then_some((p, e))
         })
+    }
+
+    /// The packs reads search.
+    pub fn searchable(&self) -> &[(Arc<RemotePack>, HashSet<Hash>)] {
+        &self.packs[..self.searchable]
     }
 
     pub fn pack(&self, id: &str) -> Option<&Arc<RemotePack>> {
@@ -109,6 +129,20 @@ pub(crate) async fn list_tombstones(store: &dyn ObjectStore) -> Result<Tombstone
         }
     }
     Ok(out)
+}
+
+/// The tombstones naming pack `id`.
+pub(crate) async fn list_tombstones_of(store: &dyn ObjectStore, id: &str) -> Result<HashSet<Hash>> {
+    let prefix = Path::from(format!("{TOMBSTONES_PREFIX}/{id}"));
+    let listed: Vec<_> = store
+        .list(Some(&prefix))
+        .try_collect()
+        .await
+        .map_err(storage_err)?;
+    Ok(listed
+        .iter()
+        .filter_map(|o| o.location.filename()?.parse().ok())
+        .collect())
 }
 
 /// What sits directly under `packs/`: published ids (those with an index,
@@ -176,6 +210,9 @@ pub(crate) struct RemotePackSet {
     refreshing: tokio::sync::Mutex<()>,
     decoded: DecodedCache,
     interval: Duration,
+    /// Packs a repack of this process merged into a published pack, until
+    /// they are deleted (see `packset::PackSet`).
+    superseded: std::sync::Mutex<HashSet<String>>,
 }
 
 impl RemotePackSet {
@@ -186,7 +223,97 @@ impl RemotePackSet {
             refreshing: tokio::sync::Mutex::new(()),
             decoded: DecodedCache::new(decoded_capacity),
             interval,
+            superseded: std::sync::Mutex::default(),
         }
+    }
+
+    /// A new view of `packs`, ordered for reads, and stored as current.
+    fn install(
+        &self,
+        mut packs: Vec<(Arc<RemotePack>, HashSet<Hash>)>,
+        started: Instant,
+        packs_started: Instant,
+    ) -> Arc<View> {
+        let superseded = {
+            let mut s = self.superseded.lock().unwrap();
+            s.retain(|id| packs.iter().any(|(p, _)| p.id == *id));
+            s.clone()
+        };
+        let searchable = order_packs(&mut packs, &superseded);
+        let view = Arc::new(View {
+            packs,
+            searchable,
+            started,
+            packs_started,
+        });
+        *self.view.write().unwrap() = Some(view.clone());
+        metrics::gauge!("leep_blob_packs").set(searchable as f64);
+        view
+    }
+
+    /// Add a pack this process just published, without listing.
+    pub async fn insert_published(&self, pack: RemotePack) {
+        let _one = self.refreshing.lock().await;
+        let Some(current) = self.current() else {
+            return;
+        };
+        if current.pack(&pack.id).is_some() {
+            return;
+        }
+        let mut packs = current.packs.clone();
+        packs.push((Arc::new(pack), HashSet::new()));
+        self.install(packs, current.started, current.packs_started);
+    }
+
+    /// Stop searching `ids` (see `packset::PackSet::supersede`).
+    pub async fn supersede(&self, ids: &[String]) {
+        let _one = self.refreshing.lock().await;
+        self.superseded.lock().unwrap().extend(ids.iter().cloned());
+        if let Some(current) = self.current() {
+            self.install(
+                current.packs.clone(),
+                current.started,
+                current.packs_started,
+            );
+        }
+    }
+
+    /// A view that holds every pack published before this call: one LIST
+    /// of `packs/` (shared by concurrent callers), loading only the packs
+    /// not loaded yet, with their tombstones. What a miss needs now that
+    /// any server's `put_many` publishes packs: a changeset naming their
+    /// objects can be stored right after, and read through another
+    /// server at once (ADR 0068).
+    async fn refresh_new_packs(&self) -> Result<Arc<View>> {
+        let since = Instant::now();
+        let _one = self.refreshing.lock().await;
+        let current = self.current();
+        if let Some(v) = current.as_ref().filter(|v| v.packs_started >= since) {
+            return Ok(v.clone());
+        }
+        let packs_started = Instant::now();
+        let (ids, _) = list_packs_dir(&*self.store).await?;
+        let Some(current) = current else {
+            drop(_one);
+            return self.refresh().await;
+        };
+        let new: Vec<String> = ids
+            .iter()
+            .filter(|id| current.pack(id).is_none())
+            .cloned()
+            .collect();
+        let mut packs: Vec<(Arc<RemotePack>, HashSet<Hash>)> = current
+            .packs
+            .iter()
+            .filter(|(p, _)| ids.binary_search(&p.id).is_ok())
+            .cloned()
+            .collect();
+        let loaded = self.open_packs(None, &new).await?;
+        for p in loaded {
+            let dead = list_tombstones_of(&*self.store, &p.id).await?;
+            packs.push((p, dead));
+        }
+        Ok(self.install(packs, current.started, packs_started))
     }
 
     fn current(&self) -> Option<Arc<View>> {
@@ -236,9 +363,7 @@ impl RemotePackSet {
                 (p, dead)
             })
             .collect();
-        let view = Arc::new(View { packs, started });
-        *self.view.write().unwrap() = Some(view.clone());
-        Ok(view)
+        Ok(self.install(packs, started, started))
     }
 
     /// The packs published now, without listing tombstones: what a delete
@@ -290,6 +415,9 @@ impl RemotePackSet {
         if view.locate(hash).is_none() {
             view = self.refresh_for_miss().await?;
         }
+        if view.locate(hash).is_none() {
+            view = self.refresh_new_packs().await?;
+        }
         // A pack deleted after its fence (this view predates the repack that
         // replaced it) answers 404; the refresh finds the replacement.
         for _ in 0..3 {
@@ -313,6 +441,9 @@ impl RemotePackSet {
         let mut view = self.view().await?;
         if view.locate(hash).is_none() {
             view = self.refresh_for_miss().await?;
+        }
+        if view.locate(hash).is_none() {
+            view = self.refresh_new_packs().await?;
         }
         for _ in 0..3 {
             let Some((p, _)) = view.locate(hash) else {
@@ -435,7 +566,9 @@ impl RemotePackSet {
             }
             *slot = Some(Arc::new(View {
                 packs,
+                searchable: v.searchable,
                 started: v.started,
+                packs_started: v.packs_started,
             }));
         }
         Ok(())

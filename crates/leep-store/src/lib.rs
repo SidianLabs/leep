@@ -14,6 +14,7 @@ pub mod pack;
 #[cfg(test)]
 mod pack_tests;
 pub mod packfiles;
+mod packput;
 mod packset;
 mod packwrite;
 mod repack;
@@ -31,8 +32,24 @@ pub use fs::FsBlobStore;
 pub use object::{ObjectBlobStore, S3Config};
 pub use objrepack::PublishedObjectPack;
 pub use packfiles::{FsPackFiles, ObjectPackFiles, PackFiles};
+pub use packput::{
+    PackWriteHook, PackWriteStep, PackWrites, DEFAULT_PACK_LEVEL, DEFAULT_PACK_MIN_OBJECTS,
+};
 pub use packwrite::plan_merge;
-pub use repack::{PublishedPack, RepackHook, RepackMode, RepackOptions, RepackReport, RepackStep};
+pub use repack::{
+    PackSize, PublishedPack, RepackHook, RepackMode, RepackOptions, RepackReport, RepackStep,
+};
+
+/// Run the calling thread at the lowest CPU priority (nice 19) from now
+/// on, for background work that must not slow requests down: the server's
+/// background repack (ADR 0068) runs its pack writes on a thread of its own
+/// that calls this. Advice only: does nothing off Linux or if refused.
+pub fn lower_thread_priority() {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = rustix::process::setpriority_process(Some(rustix::thread::gettid()), 19);
+    }
+}
 
 fn storage_err(e: impl std::fmt::Display) -> Error {
     Error::Storage(e.to_string())

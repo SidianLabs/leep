@@ -39,6 +39,9 @@ use crate::repack::step;
 use crate::{storage_err, ObjectBlobStore, RepackOptions, RepackReport, RepackStep};
 use leep_core::intern::PackHints;
 
+/// A loaded pack with its tombstoned hashes.
+type LivePack = (Arc<crate::objpacks::RemotePack>, HashSet<Hash>);
+
 const LEASE_KEY: &str = "packs/repack.lease";
 /// How long a lease outlives its holder's last renewal. Only matters when a
 /// repack dies: the next one waits this long, or an operator deletes the
@@ -549,7 +552,8 @@ pub struct PublishedObjectPack {
     from_loose: Vec<(Hash, LooseStamp)>,
     replaced: Vec<String>,
     opts: RepackOptions,
-    lease: Lease,
+    /// The lease, unless [`unlock`](Self::unlock) let it go.
+    lease: Option<Lease>,
 }
 
 struct Published {
@@ -577,26 +581,65 @@ impl ObjectBlobStore {
                 opts.level
             )));
         }
-        if opts.mode != crate::RepackMode::Full {
+        if matches!(opts.mode, crate::RepackMode::Incremental { .. }) {
             return Err(Error::Invalid(
-                "object stores support only a full repack for now".into(),
+                "object stores support a full or a planned repack only".into(),
             ));
         }
         let lease = Lease::acquire(self.store.clone()).await?;
         match self.publish_leased(hints, &opts, &lease).await {
-            Ok(p) => Ok(PublishedObjectPack {
-                store: self.clone(),
-                report: p.report,
-                from_loose: p.from_loose,
-                replaced: p.replaced,
-                opts,
-                lease,
-            }),
+            Ok(p) => {
+                self.packs.supersede(&p.replaced).await;
+                Ok(PublishedObjectPack {
+                    store: self.clone(),
+                    report: p.report,
+                    from_loose: p.from_loose,
+                    replaced: p.replaced,
+                    opts,
+                    lease: Some(lease),
+                })
+            }
             Err(e) => {
                 lease.release().await;
                 Err(e)
             }
         }
+    }
+
+    /// Each searchable pack with its live object count, from the cached
+    /// view (this process's pack writes are in it; other servers' appear at
+    /// its next refresh): what [`plan_merge`](crate::plan_merge) plans from.
+    pub async fn pack_sizes(&self) -> Result<Vec<crate::PackSize>> {
+        let view = self.packs.view().await?;
+        Ok(view
+            .searchable()
+            .iter()
+            .map(|(p, dead)| crate::PackSize {
+                id: p.id.clone(),
+                objects: p.index.len().saturating_sub(dead.len()) as u64,
+                bytes: p.index.pack_len(),
+            })
+            .collect())
+    }
+
+    /// Whether `hash` has a live copy in one of the packs `ids` names, for
+    /// the walk that picks delta bases of a planned merge.
+    pub async fn packed_in(
+        &self,
+        ids: &HashSet<String>,
+    ) -> Result<impl Fn(&Hash) -> bool + Send + Sync> {
+        let view = self.packs.view().await?;
+        let packs: Vec<_> = view
+            .packs
+            .iter()
+            .filter(|(p, _)| ids.contains(&p.id))
+            .cloned()
+            .collect();
+        Ok(move |h: &Hash| {
+            packs
+                .iter()
+                .any(|(p, dead)| p.index.find(h).is_some() && !dead.contains(h))
+        })
     }
 
     async fn publish_leased(
@@ -612,10 +655,25 @@ impl ObjectBlobStore {
         step(opts, RepackStep::Started)?;
 
         let view = self.packs.refresh().await?;
-        let loose = list_all_loose(&*self.store).await?;
+        let (merging, with_loose): (Vec<&LivePack>, bool) = match &opts.mode {
+            crate::RepackMode::Planned { loose } => (
+                view.searchable()
+                    .iter()
+                    .filter(|(p, _)| opts.packs.contains(&p.id))
+                    .collect(),
+                *loose,
+            ),
+            _ => (view.packs.iter().collect(), true),
+        };
+        let loose = if with_loose {
+            list_all_loose(&*self.store).await?
+        } else {
+            BTreeMap::new()
+        };
         let mut sources: HashMap<Hash, Source> = HashMap::new();
         report.packs_before = view.packs.len() as u64;
-        for (p, dead) in &view.packs {
+        report.packs_merged = merging.len() as u64;
+        for (p, dead) in merging.iter().copied() {
             report.pack_bytes_before += p.index.pack_len();
             for e in p.index.iter() {
                 if dead.contains(&e.hash) {
@@ -628,8 +686,7 @@ impl ObjectBlobStore {
                 }
             }
         }
-        let tombstoned: HashSet<Hash> = view
-            .packs
+        let tombstoned: HashSet<Hash> = merging
             .iter()
             .flat_map(|(_, dead)| dead.iter().copied())
             .collect();
@@ -699,7 +756,7 @@ impl ObjectBlobStore {
         .map_err(|e| Error::Storage(format!("repack task failed: {e}")))??;
         let mut report = report;
         step(opts, RepackStep::PackSynced)?;
-        let replaced: Vec<String> = view.packs.iter().map(|(p, _)| p.id.clone()).collect();
+        let replaced: Vec<String> = merging.iter().map(|(p, _)| p.id.clone()).collect();
         if written.records.is_empty() {
             return Ok(Published {
                 report,
@@ -773,7 +830,12 @@ impl ObjectBlobStore {
         packed: impl Iterator<Item = u32>,
         sources: &[Source],
     ) -> Result<Vec<Hash>> {
-        let loose = list_all_loose(&*self.store).await?;
+        // A merge of packs alone has no loose source to look for.
+        let loose = if sources.iter().any(|s| s.loose.is_some()) {
+            list_all_loose(&*self.store).await?
+        } else {
+            BTreeMap::new()
+        };
         let tombstones = list_tombstones(&*self.store).await?;
         Ok(packed
             .filter(|&i| {
@@ -825,22 +887,53 @@ impl PublishedObjectPack {
         &self.report
     }
 
+    /// Release the lease until [`finish`](Self::finish), which takes it
+    /// again, so other repacks can publish meanwhile (see
+    /// [`PublishedPack::unlock`](crate::PublishedPack::unlock)).
+    pub async fn unlock(&mut self) {
+        if let Some(l) = self.lease.take() {
+            l.release().await;
+        }
+    }
+
+    /// The packs this repack replaces, deleted by [`finish`](Self::finish).
+    pub fn replaced(&self) -> &[String] {
+        &self.replaced
+    }
+
+    /// Take the lease again after [`unlock`](Self::unlock); `Conflict`
+    /// while another repack holds it, and this one is kept for a retry.
+    pub async fn relock(&mut self) -> Result<()> {
+        if self.lease.is_none() {
+            self.lease = Some(Lease::acquire(self.store.store.clone()).await?);
+        }
+        Ok(())
+    }
+
     /// Delete the loose copies of everything now packed and the replaced
     /// packs, then the tombstones of packs that are gone.
     pub async fn finish(mut self) -> Result<RepackReport> {
+        self.relock().await?;
         let res = self.finish_leased().await;
-        self.lease.release().await;
+        if let Some(l) = &self.lease {
+            l.release().await;
+        }
         res?;
         Ok(std::mem::take(&mut self.report))
     }
 
+    fn lease(&self) -> &Lease {
+        self.lease.as_ref().expect("finish holds the lease")
+    }
+
     async fn finish_leased(&mut self) -> Result<()> {
         let objects = self.store.store.clone();
-        self.lease.check().await?;
-        if let Some(id) = self.report.pack_id.clone() {
+        self.lease().check().await?;
+        let had_loose = !self.from_loose.is_empty();
+        if let Some(id) = self.report.pack_id.clone().filter(|_| had_loose) {
             self.remove_loose(&id).await?;
         }
-        self.lease.check().await?;
+        self.lease().check().await?;
         for id in &self.replaced {
             // The index first: without it the pack is unpublished garbage.
             delete_all(&*objects, vec![idx_key(id)]).await?;
@@ -859,10 +952,15 @@ impl PublishedObjectPack {
             .collect();
         delete_all(&*objects, stale).await?;
         step(&self.opts, RepackStep::TombstonesRewritten)?;
-        self.store.packs.refresh().await?;
-        let loose = list_all_loose(&*objects).await?;
-        self.report.loose_after = loose.len() as u64;
-        self.report.loose_bytes_after = loose.values().map(|s| s.size).sum();
+        self.report.packs_after = self.store.packs.refresh().await?.searchable().len() as u64;
+        if !matches!(
+            self.opts.mode,
+            crate::RepackMode::Planned { loose: false, .. }
+        ) {
+            let loose = list_all_loose(&*objects).await?;
+            self.report.loose_after = loose.len() as u64;
+            self.report.loose_bytes_after = loose.values().map(|s| s.size).sum();
+        }
         Ok(())
     }
 
@@ -886,7 +984,7 @@ impl PublishedObjectPack {
                 Some(_) => batch.push(*hash),
             }
             if batch.len() >= DELETE_BATCH || (n + 1 == total && !batch.is_empty()) {
-                self.lease.check().await?;
+                self.lease().check().await?;
                 let keys = batch.iter().map(ObjectBlobStore::key).collect();
                 delete_all(&*objects, keys).await?;
                 step(&self.opts, RepackStep::LooseMovedAside(n as u64 + 1))?;
