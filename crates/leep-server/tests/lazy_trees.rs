@@ -190,3 +190,81 @@ async fn lazy_lands_read_the_same_after_a_restart() {
     // the histories are compared by length; their contents were read above.
     assert_eq!(results[0], results[1]);
 }
+
+/// Slow-path lands (fast path off) of creates made on a head 40 lands old,
+/// on the filesystem store with land packs, landed through a handle whose
+/// caches never saw the creates (another server, or evicted): time per land
+/// and tree derivations, eager and lazy. Run in release to compare:
+/// `cargo test --release -p leep-server --test lazy_trees slow -- --nocapture`.
+#[tokio::test]
+async fn slow_path_lands_of_lazy_creates_derive_once_each() {
+    let mut per_land = Vec::new();
+    for lazy in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = Arc::new(MemoryMetaStore::new());
+        let repo = Repo::new(Arc::new(FsBlobStore::new(dir.path())), meta.clone())
+            .with_lazy_create_trees(lazy);
+        let mut files = Vec::new();
+        for a in 0..40 {
+            for b in 0..10 {
+                for f in 0..5 {
+                    files.push((format!("src/m{a}/s{b}/f{f}.rs"), format!("{a} {b} {f}\n")));
+                }
+            }
+        }
+        let base = repo
+            .create_changeset(changeset(None, upload(&repo, &files).await))
+            .await
+            .unwrap();
+        repo.land(base, "main").await.unwrap();
+        let old_head = base;
+        // Forty lands move the head; the creates below are on the old one.
+        for r in 0..40 {
+            let head = meta.get_ref("main").await.unwrap();
+            let edit = vec![(format!("src/m{r}/s0/f0.rs"), format!("trunk {r}\n"))];
+            let cs = repo
+                .create_changeset(changeset(head, upload(&repo, &edit).await))
+                .await
+                .unwrap();
+            repo.land(cs, "main").await.unwrap();
+        }
+        let mut lands = Vec::new();
+        for i in 0..20 {
+            let edit = vec![
+                (format!("src/m{i}/s1/f1.rs"), format!("agent {i}\n")),
+                (format!("src/m{}/s2/f2.rs", i + 20), format!("agent {i}\n")),
+            ];
+            lands.push(
+                repo.create_changeset(changeset(Some(old_head), upload(&repo, &edit).await))
+                    .await
+                    .unwrap(),
+            );
+        }
+        // A busy server's derived-node cache holds nothing of these trees by
+        // the time they land: 256 agents' creates churn it.
+        let lander = Repo::new(Arc::new(FsBlobStore::new(dir.path())), meta.clone())
+            .with_land_fast_path(false)
+            .with_cache_budget(0);
+        // Warm the head's directories, as a busy server has them.
+        let head = meta.get_ref("main").await.unwrap().unwrap();
+        lander.list_files(head, "").await.unwrap();
+        let started = std::time::Instant::now();
+        for id in &lands {
+            let before = lander.lazy_tree_derivations();
+            match lander.land(*id, "main").await.unwrap() {
+                LandResponse::Landed { rebased: true, .. } => {}
+                other => panic!("{other:?}"),
+            }
+            let derived = lander.lazy_tree_derivations() - before;
+            assert!(
+                derived <= u64::from(lazy),
+                "{derived} derivations for one land"
+            );
+        }
+        per_land.push(started.elapsed().as_secs_f64() * 1e3 / lands.len() as f64);
+    }
+    println!(
+        "slow-path land: eager {:.2} ms, lazy {:.2} ms",
+        per_land[0], per_land[1]
+    );
+}

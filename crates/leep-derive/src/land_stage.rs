@@ -34,6 +34,11 @@ pub(crate) struct Staging {
 #[derive(Default)]
 pub(crate) struct NodeMemo {
     nodes: Mutex<HashMap<Hash, TreeNode>>,
+    /// Nodes of unstored trees the attempt derived (ADR 0069), kept apart
+    /// from `nodes`, which the attempt may treat as stored: a slow-path
+    /// replay derives the land's tree once and its merge reads it here,
+    /// whatever the shared cache evicts meanwhile.
+    derived: Mutex<HashMap<Hash, TreeNode>>,
     tree_nanos: AtomicU64,
 }
 
@@ -51,6 +56,21 @@ impl NodeMemo {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(hash, node);
+    }
+
+    pub(crate) fn get_derived(&self, hash: &Hash) -> Option<TreeNode> {
+        self.derived
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(hash)
+            .cloned()
+    }
+
+    pub(crate) fn insert_derived(&self, nodes: &HashMap<Hash, TreeNode>) {
+        let mut d = self.derived.lock().unwrap_or_else(|e| e.into_inner());
+        for (h, n) in nodes {
+            d.entry(*h).or_insert_with(|| n.clone());
+        }
     }
 
     pub(crate) fn add_tree_time(&self, took: Duration) {

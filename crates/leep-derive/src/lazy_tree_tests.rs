@@ -584,3 +584,65 @@ async fn gc_sweeps_and_reports_keep_and_count_what_eager_mode_does() {
         .unwrap();
     assert!(v.ok(), "{:#?}", v.problems);
 }
+
+/// A slow-path land of a lazy create, on a handle whose caches never saw
+/// the create (another server, or nodes evicted): its tree is derived once,
+/// not once per node the merge reads.
+#[tokio::test]
+async fn a_slow_path_land_derives_the_lazy_tree_once() {
+    let blobs = Arc::new(MemoryBlobStore::new());
+    let meta = Arc::new(MemoryMetaStore::new());
+    let r = Repo::new(blobs.clone(), meta.clone()).with_lazy_create_trees(true);
+    let mut files: Vec<(String, String)> = Vec::new();
+    for d in 0..20 {
+        for f in 0..10 {
+            files.push((format!("src/d{d}/sub/f{f}.rs"), format!("line {d} {f}\n")));
+        }
+    }
+    let refs: Vec<(&str, Option<&str>)> = files
+        .iter()
+        .map(|(p, c)| (p.as_str(), Some(c.as_str())))
+        .collect();
+    let base = r
+        .create_changeset(cs(&[], changes(&r, &refs).await, "base"))
+        .await
+        .unwrap();
+    r.land(base, "main").await.unwrap();
+    // Lazy creates on the base, each touching three deep directories.
+    let mut lands = Vec::new();
+    for i in 0..6 {
+        let edits: Vec<(String, String)> = (0..3)
+            .map(|k| {
+                (
+                    format!("src/d{}/sub/f{i}.rs", (i * 3 + k) % 20),
+                    format!("line edit {i} {k}\n"),
+                )
+            })
+            .collect();
+        let refs: Vec<(&str, Option<&str>)> = edits
+            .iter()
+            .map(|(p, c)| (p.as_str(), Some(c.as_str())))
+            .collect();
+        lands.push(
+            r.create_changeset(cs(&[base], changes(&r, &refs).await, &format!("e{i}")))
+                .await
+                .unwrap(),
+        );
+    }
+    // Every land after the first replays the slow way onto a moved head.
+    // No cache at all: a busy server's creates churn its derived-node
+    // cache faster than a land's merge reads one tree.
+    let lander = Repo::new(blobs, meta)
+        .with_land_fast_path(false)
+        .with_cache_budget(0);
+    for (i, id) in lands.iter().enumerate() {
+        let before = lander.lazy_tree_derivations();
+        let resp = lander.land(*id, "main").await.unwrap();
+        let derived = lander.lazy_tree_derivations() - before;
+        assert!(
+            matches!(resp, leep_core::api::LandResponse::Landed { .. }),
+            "{resp:?}"
+        );
+        assert!(derived <= 1, "land {i} derived {derived} trees");
+    }
+}

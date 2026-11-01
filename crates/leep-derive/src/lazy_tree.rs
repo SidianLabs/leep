@@ -57,10 +57,12 @@ const LAZY_MAP_ENTRIES: usize = 1 << 15;
 pub(crate) struct LazyTrees {
     /// Nodes derived (or built by a create) and not stored, by hash.
     pub(crate) nodes: SizedCache<TreeNode, LAZY_NODE_CACHE_BYTES>,
-    /// Tree node hash -> the changeset whose tree holds it: every root
-    /// looked up, and every node a derivation built. A missing node with no
-    /// origin is missing.
-    origins: Mutex<TwoGen<Hash, ChangesetId>>,
+    /// Root hash -> changeset, for every root looked up: busy, so kept
+    /// apart from `node_origins`, whose entries it would otherwise push out.
+    root_origins: Mutex<TwoGen<Hash, ChangesetId>>,
+    /// Tree node hash -> the changeset whose derivation (or lazy create)
+    /// built it. A missing node in neither map is missing.
+    node_origins: Mutex<TwoGen<Hash, ChangesetId>>,
     /// Changesets whose trees were derived or built unstored -> derivations
     /// from their tree down to a stored one (1 for a changeset on a stored
     /// parent's tree).
@@ -80,25 +82,33 @@ impl LazyTrees {
         let entries = s.of(LAZY_MAP_ENTRIES).max(1024);
         LazyTrees {
             nodes: SizedCache::scaled(s),
-            origins: Mutex::new(TwoGen::new(entries)),
+            root_origins: Mutex::new(TwoGen::new(entries)),
+            node_origins: Mutex::new(TwoGen::new(entries)),
             depths: Mutex::new(TwoGen::new(entries)),
             derivations: Default::default(),
         }
     }
 
     fn origin(&self, tree: &Hash) -> Option<ChangesetId> {
-        self.origins.lock().unwrap().get(tree)
+        if let Some(id) = self.node_origins.lock().unwrap().get(tree) {
+            return Some(id);
+        }
+        self.root_origins.lock().unwrap().get(tree)
     }
 
     pub(crate) fn depth(&self, id: &ChangesetId) -> Option<u32> {
         self.depths.lock().unwrap().get(id)
     }
 
+    pub(crate) fn remember_depth(&self, id: ChangesetId, depth: u32) {
+        self.depths.lock().unwrap().insert(id, depth);
+    }
+
     /// Keep the nodes of `id`'s unstored tree, `depth` derivations from a
     /// stored one.
     pub(crate) fn remember(&self, id: ChangesetId, depth: u32, nodes: &[(Hash, Bytes, TreeNode)]) {
         {
-            let mut o = self.origins.lock().unwrap();
+            let mut o = self.node_origins.lock().unwrap();
             for (h, _, _) in nodes {
                 o.insert(*h, id);
             }
@@ -160,14 +170,14 @@ impl Repo {
     /// [`Repo::root_tree`], which does).
     pub(crate) fn note_root(&self, id: ChangesetId, root: Hash) {
         if root != TreeNode::empty_hash() {
-            self.lazy.origins.lock().unwrap().insert(root, id);
+            self.lazy.root_origins.lock().unwrap().insert(root, id);
         }
     }
 
     /// [`Repo::note_root`] for many.
     pub(crate) fn note_roots<'a>(&self, roots: impl IntoIterator<Item = (ChangesetId, &'a Hash)>) {
         let empty = TreeNode::empty_hash();
-        let mut o = self.lazy.origins.lock().unwrap();
+        let mut o = self.lazy.root_origins.lock().unwrap();
         for (id, root) in roots {
             if *root != empty {
                 o.insert(*root, id);
@@ -191,18 +201,56 @@ impl Repo {
     /// from the changeset that holds it. `None` when no changeset known to
     /// hold it was looked up: the node is missing.
     pub(crate) async fn lazy_node(&self, tree: Hash) -> Result<Option<TreeNode>> {
-        if let Some(n) = self.lazy.nodes.get(&tree) {
-            return Ok(Some((*n).clone()));
+        Ok(self.lazy_nodes(&[tree]).await?.remove(&tree))
+    }
+
+    /// [`Repo::lazy_node`] of each of `trees`, deriving each changeset's
+    /// tree at most once for all of them (a directory level of a diff names
+    /// many nodes of one tree). Nodes no known changeset holds are left out.
+    pub(crate) async fn lazy_nodes(&self, trees: &[Hash]) -> Result<HashMap<Hash, TreeNode>> {
+        let mut out = HashMap::with_capacity(trees.len());
+        let mut chains: HashMap<ChangesetId, HashMap<Hash, TreeNode>> = HashMap::new();
+        for &tree in trees {
+            if out.contains_key(&tree) {
+                continue;
+            }
+            if let Some(n) = self.derived_node(&tree) {
+                out.insert(tree, n);
+                continue;
+            }
+            let Some(id) = self.lazy.origin(&tree) else {
+                continue;
+            };
+            if let std::collections::hash_map::Entry::Vacant(e) = chains.entry(id) {
+                // Boxed: a derivation reads through `Reads::Derive`, which
+                // never comes back here, but the types do not show that.
+                e.insert(Box::pin(self.derive_tree(id)).await?.chain);
+            }
+            // The node may be an ancestor's the derivation passed (a
+            // changeset that changed nothing has its parent's tree).
+            if let Some(n) = chains[&id].get(&tree) {
+                out.insert(tree, n.clone());
+                continue;
+            }
+            // An ancestor's that the chain started from, cached when the
+            // derivation began and evicted since: derive from stored trees,
+            // which builds it.
+            let derived = Box::pin(self.derive_tree_with(id, false)).await?;
+            if let Some(n) = derived.chain.get(&tree) {
+                out.insert(tree, n.clone());
+            }
+            chains.insert(id, derived.chain);
         }
-        let Some(id) = self.lazy.origin(&tree) else {
-            return Ok(None);
-        };
-        // Boxed: a derivation reads through `Reads::Derive`, which never
-        // comes back here, but the types do not show that.
-        // The node may be one of an ancestor the derivation passed (a
-        // changeset that changed nothing has its parent's tree).
-        let mut derived = Box::pin(self.derive_tree(id)).await?;
-        Ok(derived.chain.remove(&tree))
+        Ok(out)
+    }
+
+    /// A node derived earlier: by this land batch attempt, which keeps
+    /// every node it derived for its whole life, or in the shared cache.
+    pub(crate) fn derived_node(&self, tree: &Hash) -> Option<TreeNode> {
+        if let Some(n) = self.node_memo.as_ref().and_then(|m| m.get_derived(tree)) {
+            return Some(n);
+        }
+        self.lazy.nodes.get(tree).map(|n| (*n).clone())
     }
 
     /// Rebuild `id`'s tree from the nearest stored tree on its first-parent
@@ -241,7 +289,7 @@ impl Repo {
             if parent_root == empty {
                 break (empty, 0);
             }
-            if cached && self.lazy.nodes.get(&parent_root).is_some() {
+            if cached && self.derived_node(&parent_root).is_some() {
                 if let Some(d) = self.lazy.depth(&p) {
                     break (parent_root, d);
                 }
@@ -255,6 +303,7 @@ impl Repo {
         let mut local: HashMap<Hash, TreeNode> = HashMap::new();
         let mut last = None;
         for (cid, cs, want) in chain.into_iter().rev() {
+            self.warm_dirs(base, &cs.changes, &local, cached).await?;
             let reads = Reads::Derive {
                 local: &local,
                 cached,
@@ -281,10 +330,77 @@ impl Repo {
         }
         metrics::histogram!("leep_lazy_tree_derive_seconds")
             .record(started.elapsed().as_secs_f64());
+        if let Some(m) = &self.node_memo {
+            m.insert_derived(&local);
+        }
         Ok(DerivedTree {
             depth: last.expect("the chain holds `id`"),
             chain: local,
         })
+    }
+
+    /// Read the stored directories of `base` on the paths `changes` names
+    /// into the node caches, a level at a time with one batched read each,
+    /// so the build after it reads them from memory: one by one, a build on
+    /// an old tree waited on the store once per directory (ADR 0069).
+    async fn warm_dirs(
+        &self,
+        base: Hash,
+        changes: &std::collections::BTreeMap<leep_core::RepoPath, leep_core::FileChange>,
+        local: &HashMap<Hash, TreeNode>,
+        cached: bool,
+    ) -> Result<()> {
+        // The directories each level needs, by path; level 0 is the root.
+        let mut levels: Vec<std::collections::BTreeSet<&str>> =
+            vec![std::collections::BTreeSet::from([""])];
+        for p in changes.keys() {
+            let s = p.as_str();
+            for (i, _) in s.match_indices('/') {
+                let d = &s[..i];
+                let level = d.matches('/').count() + 1;
+                if levels.len() <= level {
+                    levels.resize_with(level + 1, Default::default);
+                }
+                levels[level].insert(d);
+            }
+        }
+        let mut nodes: HashMap<&str, TreeNode> = HashMap::new();
+        for level in &levels {
+            let mut want: Vec<(&str, Hash)> = Vec::new();
+            for &d in level {
+                let h = if d.is_empty() {
+                    base
+                } else {
+                    let (parent, name) = d.rsplit_once('/').unwrap_or(("", d));
+                    match nodes.get(parent).and_then(|n| n.entries.get(name)) {
+                        Some(leep_core::TreeEntry::Dir { tree }) => *tree,
+                        _ => continue,
+                    }
+                };
+                let held = local
+                    .get(&h)
+                    .cloned()
+                    .or_else(|| cached.then(|| self.derived_node(&h)).flatten());
+                match held {
+                    Some(n) => {
+                        nodes.insert(d, n);
+                    }
+                    None => want.push((d, h)),
+                }
+            }
+            if want.is_empty() {
+                continue;
+            }
+            let hashes: Vec<Hash> = want.iter().map(|(_, h)| *h).collect();
+            let found = self.read_trees_stored(&hashes).await?;
+            for (d, h) in want {
+                // Absent: the build reports it as it would.
+                if let Some(n) = found.get(&h) {
+                    nodes.insert(d, n.clone());
+                }
+            }
+        }
+        Ok(())
     }
 
     /// How many derivations `parent`'s tree (root `base`) is from a stored

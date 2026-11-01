@@ -75,8 +75,8 @@ impl Reads<'_> {
                     return Ok(n.clone());
                 }
                 if cached {
-                    if let Some(n) = repo.lazy.nodes.get(&tree) {
-                        return Ok((*n).clone());
+                    if let Some(n) = repo.derived_node(&tree) {
+                        return Ok(n);
                     }
                 }
                 repo.read_tree_stored_opt(tree)
