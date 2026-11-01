@@ -435,6 +435,7 @@ fn check_store_live_new(tag: &str, stores: &Stores, shared: &Shared) {
 }
 
 fn check_store_with(tag: &str, stores: &Stores, shared: &Shared, live: bool, only_new: bool) {
+    let started = Instant::now();
     let repo = open_repo(stores);
     common_block_on(async {
         let meta = repo.meta();
@@ -478,6 +479,16 @@ fn check_store_with(tag: &str, stores: &Stores, shared: &Shared, live: bool, onl
             .lock()
             .unwrap()
             .extend(all.iter().copied());
+        let read = if only_new {
+            all.iter().filter(|id| !read_before.contains(id)).count()
+        } else {
+            all.len()
+        };
+        progress!(
+            "[{tag}] read the trees of {read} of {} changesets in {:.1}s",
+            all.len(),
+            started.elapsed().as_secs_f64()
+        );
 
         // Every ref reaches only changesets that exist.
         for (name, head) in &refs {
@@ -1147,6 +1158,7 @@ fn killed_land_leader_is_replaced_postgres() {
                 .unwrap_or_else(|| panic!("[{tag}] lease names {holder}"));
             servers[i].kill();
             let killed = Instant::now();
+            progress!("[{tag}] killed the lease holder {holder}");
             // Every agent lands again within the TTL plus two seconds.
             let bound = LEASE_TTL + Duration::from_secs(2);
             std::thread::sleep(bound + Duration::from_millis(200));
@@ -1170,6 +1182,7 @@ fn killed_land_leader_is_replaced_postgres() {
             assert_ne!(moved, holder, "[{tag}] the lease moved on");
             check_store_live_new(&format!("{tag}, after SIGKILL"), &stores, &shared);
             servers[i] = start(ports[i]);
+            progress!("[{tag}] restarted it; {} lands so far", after.len());
         }
         std::thread::sleep(Duration::from_millis(400));
         shared.stop.store(true, Ordering::Relaxed);
@@ -1185,7 +1198,12 @@ fn killed_land_leader_is_replaced_postgres() {
         &odd[..odd.len().min(5)]
     );
     drop(odd);
+    let t = Instant::now();
     verify_exact(&tag, &stores, &shared);
+    progress!(
+        "[{tag}] verify_exact took {:.1}s",
+        t.elapsed().as_secs_f64()
+    );
     drop(servers);
     drop(db);
 }
