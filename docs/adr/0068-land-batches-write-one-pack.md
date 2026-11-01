@@ -116,17 +116,34 @@ server merges them as they come (`--background-repack`, on by default for
 filesystem and object stores):
 
 - Every 5 s (`--background-repack-interval`) it counts the packs reads
-  search; above 32 (`--background-repack-packs`) the geometric rule of
-  `leep-server repack` (`plan_merge`, factor 4, at most 16 packs) picks
-  the packs to merge, loose objects left out.
-- Delta bases come from a walk like the incremental repack's: back from
-  every ref tip through changesets whose root tree is in those packs (or
-  loose, on a filesystem), at most 4,096 changesets, listing their objects
-  with the previous version of the same path or directory as base. A wide
-  directory node rewritten by every land (`teams/` with 256 entries) is
-  stored as a small delta against its previous version. The walk's hints
-  are written first; a merged pack's own deltas follow for objects the walk
-  did not reach.
+  search, and while there are more than 32 (`--background-repack-packs`)
+  it merges, back to back (up to 32 merges a tick), loose objects left out.
+- **Tiered, not cumulative.** A pack's class is `floor(log4(live
+  objects))`. A merge takes the packs of the lowest class that holds at
+  least 4 of them, smallest first, at most 64 packs and 1 GiB; packs over
+  256 MiB are left to `leep-server repack`. Merging four or more packs of a
+  class makes a pack of a higher class, so an object is rewritten at most
+  once per class (about six classes from a land pack to 256 MiB), and when
+  the merges stop every class holds at most three packs: reads search at
+  most 32 packs, or three per class in use, plus the packs over 256 MiB.
+  The first version used `plan_merge`, whose rule folds the largest pack
+  into a merge while it is smaller than four times the rest, which under a
+  steady stream of small packs rewrote the largest pack every two or three
+  runs: work quadratic in the history, and runs long enough for 1,500
+  packs to pile up in the clean benchmark.
+- **No history walk.** Merged packs hold whole frames, recompressed at the
+  merge's level, and keep any deltas of the packs they merge. The walk for
+  delta bases (version against version, which would store the 256-entry
+  `teams/` node rewritten by every land as a small delta) ran on the
+  request runtime and grew with the merged packs; delta compression is left
+  to `leep-server repack`, which walks history anyway.
+- **Bounds.** A model of 20,000 land packs of 100 to 1,500 objects
+  (`tiered_merges_keep_the_count_bounded_and_the_work_linear`) keeps at
+  most 32 packs under 256 MiB searched and rewrites 3.9 objects per object
+  written. A 90 s, 256-agent `leep-land-bench` run on SQLite with the
+  trigger at 8 kept 12 packs searched (15 merges of about 4,000 objects,
+  0.25 to 0.45 s each); with the default trigger and a 5 s fence, 15 packs
+  were searched after 78 land packs.
 - A new repack mode, `RepackMode::Planned`, merges exactly the packs named
   in `RepackOptions::packs` that are still published and searched, with or
   without the loose objects. Object stores accept it too (they had only
@@ -141,8 +158,9 @@ a copy GC tombstoned while the merge ran is tombstoned in the merged pack
 too (the "late tombstones" of ADR 0029). Reads in this process stop
 searching the merged packs at once; they stay in the view, so a GC delete
 still tombstones them for other processes, and are deleted a fence later
-(`--background-repack-fence`, 10 minutes, as `repack --fence`), so a
-reader in another process that listed them keeps finding every object.
+(`--background-repack-fence`, by default `--request-timeout` plus one
+minute, 6 minutes with the defaults), so a reader in another process that
+listed them keeps finding every object.
 
 **Steps, not runs, exclude each other.** `leep-server repack` held its
 lock (or lease) from publish to cleanup, fence included. The background
@@ -154,8 +172,8 @@ again, and each cleanup removes a loose copy only after checking, under
 the lock, that it is unchanged and that its own published pack holds a
 live copy, and removing a pack already removed is a no-op. A cleanup that
 finds the lock taken (a `leep-server repack` running) waits for the next
-tick. At most 256 cleanups wait at once, which bounds the disk merged packs
-hold. Cleanups not run when the process stops leave the merged packs on
+tick. At most 256 cleanups, and 4 GiB of packs to delete, wait at once,
+which bounds the disk held twice. Cleanups not run when the process stops leave the merged packs on
 disk and published; after a restart they are searched again and merged by
 the next background or command line repack.
 
@@ -200,8 +218,18 @@ computed as before.
   nodes. The cron schedule of OPERATIONS.md stays useful for those and for
   full repacks.
 - A cold read of a recent object costs a pack read instead of a file read,
-  and its decoding; the decoded-object and blob caches absorb repeats. Pack
-  counts stay near 32 under load.
+  and its decoding; the decoded-object and blob caches absorb repeats. Reads
+  search at most about 32 packs below 256 MiB (section 5); packs above it
+  accumulate, about one per 256 MiB to 1 GiB written, until
+  `leep-server repack` merges them.
+- **Bytes.** Land packs store nothing twice: after a 30 s, 256-agent run
+  with background merges off, 4,992 entries in 39 packs were 4,992
+  distinct objects, none also loose (`examples/pack_dups.rs`). What a run
+  shows on top is merged packs waiting for their fence beside the pack
+  that replaced them: 1.53 times the logical bytes 90 s into a run with
+  merges, 1.00 once the fence passed. The first version made this worse by
+  rewriting the largest pack every few runs and holding each generation for
+  10 minutes; the tiered rule and the shorter fence bound it.
 - Object stores: one LIST per miss (shared by concurrent misses) beyond
   what ADR 0040's table says, and land packs cut PUTs per land from about
   20 to about 2 per batch.
@@ -218,7 +246,7 @@ computed as before.
   `leep_repack_background_runs_total`,
   `leep_repack_background_packs_merged_total`,
   `leep_repack_background_seconds`,
-  `leep_repack_background_cleanup_seconds`.
+  `leep_repack_background_cleanup_seconds`, `leep_repack_background_objects_written_total`.
 - Tests: `put_many` in the contract of every backend; a fault sweep that
   fails pack writes at every step under concurrent lands on a real
   filesystem store and reads every reachable object through a new store;

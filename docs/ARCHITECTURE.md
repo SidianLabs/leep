@@ -1045,10 +1045,13 @@ a rescan. `put_rescuing_many` leaves the hashes it packed out of its flush.
 A pack write holds `packs/write.lock` shared, and a repack holds it
 exclusively while it deletes unindexed packs, so it never deletes one about
 to be published. The server merges these packs in the background
-(`--background-repack`): above 32 searched packs, `plan_merge` (factor 4)
-picks the small ones, a walk of the recent history they hold names delta
-bases, and a `RepackMode::Planned` repack of exactly those packs, on a
-nice-19 thread, publishes the merged pack. Reads in the process stop
+(`--background-repack`): while more than 32 packs are searched, it merges
+the packs of the lowest size class (`floor(log4(objects))`) that holds at
+least four, up to 64 packs and 1 GiB, packs over 256 MiB left to
+`leep-server repack`, with a `RepackMode::Planned` repack of exactly those
+packs on a nice-19 thread, without a history walk. Each object is rewritten
+at most once per class, and at most about 32 packs below 256 MiB are
+searched. Reads in the process stop
 searching the merged ("superseded") packs at once; they are deleted a fence
 later. Each repack step takes the repack lock, so merges follow each other
 while earlier cleanups wait out their fence.

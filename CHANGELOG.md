@@ -20,9 +20,11 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   smallest batch packed. See ADR 0068.
 - **Added.** The server merges packs in the background
   (`--background-repack`, on by default; `--background-repack-packs`,
-  `-interval`, `-fence`, `-level`) with the geometric rule and delta bases
-  of `leep-server repack`, on a low-priority thread, so reads search few
-  packs. `RepackMode::Planned` merges a chosen set of packs, on object
+  `-interval`, `-fence`, `-level`), tiered by size so each object is
+  rewritten at most once per size class, on a low-priority thread, so
+  reads search at most about 32 packs below 256 MiB (larger ones are left
+  to `leep-server repack`). Merged packs wait `--request-timeout` plus a
+  minute before deletion. Creates' tree nodes stay loose. `RepackMode::Planned` merges a chosen set of packs, on object
   stores too. On an object store a miss now also lists `packs/` for packs
   published since, so another server's land pack is read at once; upgrade
   every server before land packs are written to a shared bucket.
@@ -39,7 +41,7 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   `leep_repack_background_runs_total`,
   `leep_repack_background_packs_merged_total`,
   `leep_repack_background_seconds` and
-  `leep_repack_background_cleanup_seconds`.
+  `leep_repack_background_cleanup_seconds`, `leep_repack_background_objects_written_total`.
 
 ### `leep bisect`
 - **Added.** `leep bisect start [BAD [GOOD...]]`, `bad`, `good`, `skip`,

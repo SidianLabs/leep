@@ -125,6 +125,7 @@ measured until the response head is ready, not until the body is streamed.
 | `leep_blob_packs` | gauge | none | Packs reads search in this process: published, minus the ones a background merge superseded. Stays near `--background-repack-packs` under load; climbing means merges do not keep up. |
 | `leep_repack_background_runs_total` | counter | `outcome` = `merged`, `error` | Background merges (ADR 0068). An error is logged and retried at the next interval. |
 | `leep_repack_background_packs_merged_total` | counter | none | Packs those merges folded into a merged pack. |
+| `leep_repack_background_objects_written_total` | counter | none | Objects those merges wrote. Against `leep_pack_write_objects_sum` (objects land packs wrote) it should stay below about 6. |
 | `leep_repack_background_seconds` | histogram | none | Time of each merge: walk, write and publish. |
 | `leep_repack_background_cleanup_seconds` | histogram | none | Time of each cleanup a fence after a merge (deleting the merged packs). |
 | `leep_land_cancelled_total` | counter | none | Lands whose caller went away (timeout, disconnect) while queued, dropped before their batch replayed them. |
@@ -1879,14 +1880,21 @@ neither.
 | `--background-repack on\|off` / `LEEP_BACKGROUND_REPACK` | `on` | Merge packs in the background. `off` leaves merging to `leep-server repack`, and reads then search every land pack until it runs. |
 | `--background-repack-packs N` / `LEEP_BACKGROUND_REPACK_PACKS` | `32` | Merge when reads search more packs than this. |
 | `--background-repack-interval D` / `LEEP_BACKGROUND_REPACK_INTERVAL` | `5s` | How often the pack count is checked and cleanups that are due run. |
-| `--background-repack-fence D` / `LEEP_BACKGROUND_REPACK_FENCE` | `10m` | How long merged packs stay on disk after the merged pack is published, for readers in other processes. Longer than `--request-timeout` plus clock skew, like `repack --fence`; the server warns otherwise. |
+| `--background-repack-fence D` / `LEEP_BACKGROUND_REPACK_FENCE` | `--request-timeout` + 1m (`6m`; `10m` with no request timeout) | How long merged packs stay on disk after the merged pack is published, for readers in other processes. Longer than `--request-timeout` plus clock skew, like `repack --fence`; the server warns otherwise. |
 | `--background-repack-level N` / `LEEP_BACKGROUND_REPACK_LEVEL` | `3` | zstd level of the merged packs. |
 
-A merge picks packs with the geometric rule of `repack` (factor 4, down to
-16 packs) and leaves loose objects alone; a walk of the history those packs
-hold (at most 4,096 changesets) gives each object the previous version at
-its path, or of its directory, as delta base. It runs one at a time on a
-thread at the lowest CPU priority. Reads in the server stop searching the
+Merges are tiered: a pack's class is `floor(log4(live objects))`, and while
+more than `--background-repack-packs` packs are searched the server merges
+the packs of the lowest class holding at least four, smallest first, up to
+64 packs and 1 GiB, back to back. Packs over 256 MiB are left to
+`leep-server repack`. Each object is rewritten at most once per class
+(about six), and at most about 32 packs below 256 MiB stay searched; the
+packs above it grow by about one per 256 MiB to 1 GiB written, so keep the
+cron `repack` of this section. Merges leave loose objects alone and do not
+walk history: merged packs hold whole frames, and `leep-server repack`
+stores versions as deltas. They run one at a time on a thread at the
+lowest CPU priority. At most 256 merges, or 4 GiB of merged packs, wait for
+their fence at once. Reads in the server stop searching the
 merged packs at once, and the server deletes them a fence later. Each step
 takes the store's repack lock (or lease), so a `leep-server repack` started
 meanwhile may find it taken and exit with "another repack is running"; run
