@@ -618,6 +618,7 @@ impl Repo {
                 Some(v) => derived::decode_hash(&v)?,
                 None => self.root_tree(*id).await?,
             };
+            self.note_root(*id, tree);
             entries.push(Some(TreeEntry::Dir { tree }));
         }
         for comp in path.as_str().split('/').filter(|c| !c.is_empty()) {

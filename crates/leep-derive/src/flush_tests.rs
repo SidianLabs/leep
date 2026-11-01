@@ -155,14 +155,18 @@ impl Checked {
             .iter()
             .find(|r| r.kind == RootTree::NAME_STR && r.key == id.0)
             .map(|r| Hash(r.value.as_ref().try_into().unwrap()));
-        // Walk the tree iteratively; every node must be synced.
+        // Walk the tree iteratively; every node must be synced. A tree
+        // whose root is absent was left out by a lazy create (ADR 0069);
+        // below a present root every node must be there.
         let mut stack: Vec<Hash> = root.into_iter().collect();
         while let Some(h) = stack.pop() {
             if self.blobs.is_unsynced(&h) {
                 bad.push(format!("tree node {h}"));
             }
             let Some(bytes) = self.blobs.copies.lock().unwrap().get(&h).cloned() else {
-                bad.push(format!("tree node {h} absent"));
+                if Some(h) != root || h == TreeNode::empty_hash() {
+                    bad.push(format!("tree node {h} absent"));
+                }
                 continue;
             };
             let node = TreeNode::decode(&bytes).unwrap();
@@ -468,4 +472,107 @@ async fn batched_lands_through_packs_store_nothing_unsynced_and_skip_packed_flus
         flushed.len(),
         packed.len()
     );
+}
+
+/// Every node of `root`'s tree is stored and synced.
+fn assert_whole_and_synced(blobs: &Deferred, root: Hash, what: &str) {
+    let mut stack = vec![root];
+    while let Some(h) = stack.pop() {
+        if h == TreeNode::empty_hash() {
+            continue;
+        }
+        assert!(!blobs.is_unsynced(&h), "{what}: tree node {h} unsynced");
+        let bytes = blobs.copies.lock().unwrap().get(&h).cloned();
+        let bytes = bytes.unwrap_or_else(|| panic!("{what}: tree node {h} absent"));
+        for e in TreeNode::decode(&bytes).unwrap().entries.values() {
+            if let TreeEntry::Dir { tree } = e {
+                stack.push(*tree);
+            }
+        }
+    }
+}
+
+/// A lazy create (ADR 0069) writes no tree node, and still flushes every
+/// content it names before it is stored.
+#[tokio::test]
+async fn a_lazy_create_flushes_its_contents_and_writes_no_tree() {
+    let (r, blobs, meta) = repo();
+    let r = r.with_lazy_create_trees(true);
+    let first = commit(&r, vec![], &[("a/b/one.txt", b"one\n")]).await;
+    let far = blobs.put_elsewhere(b"far\n").await;
+    let before = blobs.copies.lock().unwrap().len();
+    let flushes = blobs.flushes();
+    let id = r
+        .create_changeset(changeset(vec![first], &[("a/c/far.txt", b"far\n")], "far"))
+        .await
+        .unwrap();
+    assert!(!blobs.is_unsynced(&far));
+    assert_eq!(blobs.flushes(), flushes + 1, "the contents in one flush");
+    assert_eq!(
+        blobs.copies.lock().unwrap().len(),
+        before,
+        "no tree node written"
+    );
+    let root = r.root_tree(id).await.unwrap();
+    assert!(!blobs.copies.lock().unwrap().contains_key(&root));
+    assert_eq!(meta.violations(), Vec::<String>::new());
+}
+
+/// Lands of lazy creates, fast-forwards and copies alike, leave the ref on
+/// a tree that is stored whole and synced before the ref names it.
+#[tokio::test]
+async fn lazy_lands_leave_every_head_on_a_whole_synced_tree() {
+    for pack_min in [0, 4] {
+        let (r, blobs, meta) = repo_packing(pack_min);
+        let r = r.with_lazy_create_trees(true);
+        let base = commit(&r, vec![], &[("base.txt", b"base\n")]).await;
+        r.meta().cas_ref("main", None, Some(base)).await.unwrap();
+        // One agent: every land is a fast-forward of a lazy create, some of
+        // stacks of two.
+        for j in 0..6 {
+            let head = r.meta().get_ref("main").await.unwrap().unwrap();
+            let path = format!("solo/d{}/f{j}", j % 2);
+            let mut cs = commit(&r, vec![head], &[(&path, b"solo\n")]).await;
+            if j % 3 == 0 {
+                cs = commit(&r, vec![cs], &[("solo/top", format!("{j}").as_bytes())]).await;
+            }
+            assert!(matches!(
+                r.land(cs, "main").await.unwrap(),
+                LandResponse::Landed { rebased: false, .. }
+            ));
+            let root = r.root_tree(cs).await.unwrap();
+            assert_whole_and_synced(&blobs, root, &format!("fast-forward {j}"));
+        }
+        // Many agents: copies onto heads that may be fast-forwards.
+        let agents: Vec<_> = (0..8)
+            .map(|i| {
+                let r = r.clone();
+                tokio::spawn(async move {
+                    let mut last = None;
+                    for j in 0..3 {
+                        let path = format!("agents/a{i}/f");
+                        let data = format!("agent {i} edit {j}\n");
+                        let head = r.meta().get_ref("main").await.unwrap();
+                        let cs =
+                            commit(&r, head.into_iter().collect(), &[(&path, data.as_bytes())])
+                                .await;
+                        let LandResponse::Landed { landed, .. } = r.land(cs, "main").await.unwrap()
+                        else {
+                            panic!("agents edit disjoint files");
+                        };
+                        last = Some(landed);
+                    }
+                    last.unwrap()
+                })
+            })
+            .collect();
+        for a in agents {
+            let landed = a.await.unwrap();
+            let root = r.root_tree(landed).await.unwrap();
+            assert_whole_and_synced(&blobs, root, "a landed changeset");
+        }
+        let head = r.meta().get_ref("main").await.unwrap().unwrap();
+        assert_whole_and_synced(&blobs, r.root_tree(head).await.unwrap(), "the head");
+        assert_eq!(meta.violations(), Vec::<String>::new());
+    }
 }

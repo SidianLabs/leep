@@ -135,6 +135,7 @@ async fn root_trees(repo: &Repo, ids: &[ChangesetId]) -> Result<Vec<Hash>> {
             _ => repo.root_tree(*id).await?,
         });
     }
+    repo.note_roots(ids.iter().copied().zip(&out));
     Ok(out)
 }
 

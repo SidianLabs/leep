@@ -1118,6 +1118,15 @@ impl Repo {
                         .await
                     }
                 };
+                // The ref moves to the changeset itself: store its tree if
+                // its create left it out (ADR 0069).
+                let step = match step {
+                    Ok(Step::Move(new)) if new == l.q.cs => staging
+                        .stage_tree(&repo, new)
+                        .await
+                        .map(|()| Step::Move(new)),
+                    s => s,
+                };
                 match step {
                     Ok(Step::Move(new)) => {
                         // A duplicate later in the batch answers with this.

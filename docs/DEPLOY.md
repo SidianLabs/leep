@@ -597,7 +597,7 @@ from Windows, as git does with `core.filemode=false`.
 | `LEEP_DERIVE_JOBS` | the cores, up to 8 | Changesets the warmer's catch-up, or a query over un-derived history, derives at once (ADR 0050). Lower it to leave cores for requests while a large import is being indexed. |
 | `LEEP_META_POOL_SIZE` | 16 | Most connections to a Postgres metadata store per process; keep the sum over every server and tool under `max_connections` (OPERATIONS.md, "Connection pool and caches"). |
 | `LEEP_META_LAND_POOL_SIZE` | an eighth of `LEEP_META_POOL_SIZE`, at least 4 | Further Postgres connections reserved for land batch leaders (ADR 0067), opened on first use; count them in the same sum. `0` reserves none. |
-| `LEEP_DERIVE_CACHE_BYTES` | 404 MiB | Budget of the in-memory derived-index caches (path history, trees, search's directory filters, filtered log); separate from `--cache-bytes`, the blob cache. |
+| `LEEP_DERIVE_CACHE_BYTES` | 420 MiB | Budget of the in-memory derived-index caches (path history, trees, unstored trees derived on read, search's directory filters, filtered log); separate from `--cache-bytes`, the blob cache. |
 | `LEEP_READY_TIMEOUT` | `2s` | Bound on each store check behind `GET /v1/ready` (`500ms`, `2s`; not zero). See [Probes](#probes). |
 | `LEEP_METRICS_LISTEN` | off | Address for a separate, unauthenticated `GET /metrics` listener; keep it private. See [OPERATIONS.md](OPERATIONS.md). |
 | `LEEP_LOG_FORMAT` | `text` | `text` or `json` (one object per line). |

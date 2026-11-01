@@ -27,6 +27,10 @@ impl DerivedKind for RootTree {
             Some(p) => decode_hash(p)?,
             None => TreeNode::empty_hash(),
         };
+        // The parent's tree may be unstored (ADR 0069).
+        if let Some(p) = cs.parents.first() {
+            repo.note_root(*p, base);
+        }
         let tree = apply_changes(repo, base, &cs.changes).await?;
         Ok(Bytes::copy_from_slice(tree.as_bytes()))
     }

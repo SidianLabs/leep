@@ -29,6 +29,7 @@ mod land;
 pub mod land_coord;
 mod land_fast;
 mod land_stage;
+pub mod lazy_tree;
 mod merge;
 pub mod owners;
 pub mod pack_order;
@@ -60,6 +61,8 @@ mod land_batch_tests;
 mod land_coord_tests;
 #[cfg(test)]
 mod land_fast_tests;
+#[cfg(test)]
+mod lazy_tree_tests;
 #[cfg(test)]
 mod page_tests;
 #[cfg(test)]

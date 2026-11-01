@@ -345,7 +345,9 @@ impl Repo {
     /// [`Repo::put_rescuing_many`] writing each blob on its own (loose on
     /// stores that pack batches): a create's few tree nodes, which as packs
     /// would make a pack per create, each for the background repack to
-    /// merge again (ADR 0068).
+    /// merge again (ADR 0068). The last item, a tree's root, is written
+    /// only once the others are: a stored root vouches for its whole tree
+    /// (ADR 0069), so a failed write must not leave it without its nodes.
     pub(crate) async fn put_rescuing_many_loose(
         &self,
         items: Vec<(Hash, Bytes)>,
@@ -367,12 +369,19 @@ impl Repo {
                 .into_iter()
                 .collect()
         } else {
-            for chunk in items.chunks(LOOSE_WRITES_IN_FLIGHT) {
+            let (last, rest) = match items.split_last() {
+                Some((last, rest)) => (Some(last), rest),
+                None => (None, &items[..]),
+            };
+            for chunk in rest.chunks(LOOSE_WRITES_IN_FLIGHT) {
                 let writes: Vec<_> = chunk
                     .iter()
                     .map(|(h, d)| self.blobs().put_with_hash(*h, d.clone()))
                     .collect();
                 try_join_all(writes).await?;
+            }
+            if let Some((h, d)) = last {
+                self.blobs().put_with_hash(*h, d.clone()).await?;
             }
             HashSet::new()
         };

@@ -96,6 +96,10 @@ pub struct Stats {
     /// Changesets no ref reaches, checked only by `--full`.
     pub changesets_other: u64,
     pub tree_nodes: u64,
+    /// Of `tree_nodes`, those of trees created without their nodes (ADR
+    /// 0069): not stored, derived from the first parent's tree and checked
+    /// against the `root_tree` rows on the way.
+    pub lazy_tree_nodes: u64,
     pub blobs_checked: u64,
     pub blobs_rehashed: u64,
     pub bytes_rehashed: u64,
@@ -604,6 +608,25 @@ impl Verifier<'_> {
                     None => return Err(e),
                 },
             };
+            // A node of a tree created without its nodes (ADR 0069) is
+            // fine if the tree derives from its first parent's and matches
+            // its `root_tree` row, which the derivation checks.
+            let read = match read {
+                Err(("missing_tree", why)) => match self.shadow.lazy_node(tree).await {
+                    Ok(Some(n)) => {
+                        self.stats.lazy_tree_nodes += 1;
+                        self.walk_node(id, n, &dir, &mut stack);
+                        continue;
+                    }
+                    Ok(None) => Err(("missing_tree", why)),
+                    Err(e) if recoverable(&e) => Err((
+                        "missing_tree",
+                        format!("is missing and its tree does not derive: {e}"),
+                    )),
+                    Err(e) => return Err(e),
+                },
+                r => r,
+            };
             let bytes = match read {
                 Ok(b) => b,
                 Err((code, why)) => {
@@ -642,21 +665,31 @@ impl Verifier<'_> {
                     continue;
                 }
             };
-            for (name, entry) in node.entries {
-                let path = join(&dir, &name);
-                match entry {
-                    TreeEntry::Dir { tree } => {
-                        if !self.visited_trees.contains(&tree) {
-                            stack.push((tree, path));
-                        }
-                    }
-                    TreeEntry::File { content, size, .. } => {
-                        self.blob_ref(content, size, id, &path)
-                    }
-                }
-            }
+            self.walk_node(id, node, &dir, &mut stack);
         }
         Ok(())
+    }
+
+    /// Queue the directories `node` (at `dir` in `id`'s tree) names and
+    /// check the contents.
+    fn walk_node(
+        &mut self,
+        id: ChangesetId,
+        node: TreeNode,
+        dir: &str,
+        stack: &mut Vec<(Hash, String)>,
+    ) {
+        for (name, entry) in node.entries {
+            let path = join(dir, &name);
+            match entry {
+                TreeEntry::Dir { tree } => {
+                    if !self.visited_trees.contains(&tree) {
+                        stack.push((tree, path));
+                    }
+                }
+                TreeEntry::File { content, size, .. } => self.blob_ref(content, size, id, &path),
+            }
+        }
     }
 
     // --- derived rows owned by a changeset ---------------------------------
