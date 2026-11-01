@@ -394,8 +394,7 @@ async fn gc_collects_and_rescues_objects_in_land_packs() {
 }
 
 /// The background repack merges land packs into few while lands go on,
-/// with deltas between versions of the wide `teams/` node, and every read
-/// stays correct, in this process and in a new one.
+/// and every read stays correct, in this process and in a new one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_background_repack_merges_land_packs_while_lands_continue() {
     let dir = tempfile::tempdir().unwrap();
@@ -409,7 +408,6 @@ async fn the_background_repack_merges_land_packs_while_lands_continue() {
     assert!(meta.cas_ref("main", None, Some(base)).await.unwrap());
     let mut bg = BackgroundRepack::new(
         PackStore::Fs(blobs.clone()),
-        repo.clone(),
         BackgroundRepackOptions {
             trigger_packs: 4,
             fence: Duration::ZERO,
@@ -446,9 +444,12 @@ async fn the_background_repack_merges_land_packs_while_lands_continue() {
     let mut merges = Vec::new();
     for _ in 0..200 {
         let tick = bg.tick().await.unwrap();
-        if let Some(r) = tick.merged {
-            merges.push(r);
-        }
+        assert!(
+            tick.packs <= 12,
+            "{} packs searched after a tick",
+            tick.packs
+        );
+        merges.extend(tick.merged);
         // Reads through the store the lands and merges share.
         assert_main_readable_through(&repo, &meta).await;
         if merges.len() >= 3 {
@@ -464,15 +465,12 @@ async fn the_background_repack_merges_land_packs_while_lands_continue() {
     bg.tick().await.unwrap();
     bg.finish_all().await.unwrap();
     assert!(!merges.is_empty(), "the trigger fired");
-    assert!(
-        merges.iter().any(|r| r.deltas > 0),
-        "versions of the wide node were stored as deltas: {merges:?}"
-    );
     let merged: u64 = merges.iter().map(|r| r.packs_merged).sum();
     assert!(merged >= 4, "{merges:?}");
     // Few packs remain searched, fewer than were written.
     let now = blobs.pack_count().unwrap();
-    assert!(now <= 8, "{now} packs after merging {merged}");
+    // At most `trigger_packs`, or three per size class in use.
+    assert!(now <= 12, "{now} packs after merging {merged}");
     assert_eq!(bg.pending(), 0);
     assert!(landed.load(Ordering::Relaxed) >= 60);
     assert_main_readable(dir.path(), &meta, "after merging").await;

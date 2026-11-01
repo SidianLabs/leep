@@ -340,9 +340,10 @@ struct Args {
     /// How long packs the background repack merged stay on disk after the
     /// merged pack is published, for readers in other processes. Must
     /// exceed the servers' --request-timeout plus clock skew, like
-    /// `leep-server repack --fence`.
-    #[arg(long, env = "LEEP_BACKGROUND_REPACK_FENCE", default_value = "10m", value_parser = parse_grace)]
-    background_repack_fence: std::time::Duration,
+    /// `leep-server repack --fence`. Default: --request-timeout plus 1m
+    /// (10m with no request timeout).
+    #[arg(long, env = "LEEP_BACKGROUND_REPACK_FENCE", value_parser = parse_grace)]
+    background_repack_fence: Option<std::time::Duration>,
     /// How often the background repack looks at the pack count.
     #[arg(long, env = "LEEP_BACKGROUND_REPACK_INTERVAL", default_value = "5s", value_parser = parse_grace)]
     background_repack_interval: std::time::Duration,
@@ -842,6 +843,17 @@ fn parse_duration_or_off(s: &str) -> Result<DurationOrOff, String> {
             Err(e) => Err(e.to_string()),
         },
     }
+}
+
+/// `--background-repack-fence`, or by default the request timeout plus a
+/// minute of clock skew and margin (10 minutes with no request timeout).
+fn background_repack_fence(args: &Args) -> std::time::Duration {
+    args.background_repack_fence
+        .unwrap_or(if args.request_timeout.is_zero() {
+            std::time::Duration::from_secs(600)
+        } else {
+            args.request_timeout + std::time::Duration::from_secs(60)
+        })
 }
 
 /// The default of `--land-queue-seconds` (ADR 0068).
@@ -1799,7 +1811,7 @@ async fn run() -> anyhow::Result<()> {
             let opts = leep_server::background_repack::BackgroundRepackOptions {
                 interval: args.background_repack_interval,
                 trigger_packs: args.background_repack_packs,
-                fence: args.background_repack_fence,
+                fence: background_repack_fence(&args),
                 level: args.background_repack_level,
                 ..Default::default()
             };
@@ -1817,8 +1829,7 @@ async fn run() -> anyhow::Result<()> {
                 level = opts.level,
                 "merging packs in the background (ADR 0068)"
             );
-            leep_server::background_repack::BackgroundRepack::new(store, repo.clone(), opts)
-                .spawn();
+            leep_server::background_repack::BackgroundRepack::new(store, opts).spawn();
         }
         (Switch::On, None) => {
             tracing::info!("background repack off: the blob store keeps no packs")
@@ -2363,7 +2374,11 @@ mod tests {
         assert!(a.land_packs == Switch::On && a.background_repack == Switch::On);
         assert_eq!(a.land_pack_min_objects, 16);
         assert_eq!(a.background_repack_packs, 32);
-        assert_eq!(a.background_repack_fence, Duration::from_secs(600));
+        assert_eq!(a.background_repack_fence, None);
+        // The request timeout (5 min) plus a minute.
+        assert_eq!(background_repack_fence(&a), Duration::from_secs(360));
+        let a = parse_args(["leep-server", "--request-timeout", "0"]).unwrap();
+        assert_eq!(background_repack_fence(&a), Duration::from_secs(600));
         let a = parse_args([
             "leep-server",
             "--land-packs",
