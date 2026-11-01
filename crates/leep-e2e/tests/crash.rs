@@ -123,11 +123,24 @@ impl Drop for StopOnDrop<'_> {
     }
 }
 
+/// `eprintln!` that libtest does not capture: these tests run for minutes,
+/// and a run the watchdog ends never prints what was captured.
+macro_rules! progress {
+    ($($t:tt)*) => {{
+        use std::io::Write;
+        let _ = writeln!(std::io::stderr(), $($t)*);
+    }};
+}
+
 /// Ends the test binary once a crash test runs past its budget
 /// (`LEEP_CRASH_BUDGET_SECS`, default 900): a test that stops converging
 /// then fails CI with its log within minutes, instead of holding the
 /// tests queued behind `serial()` until the job's timeout.
-struct Watchdog(std::sync::Arc<AtomicBool>);
+struct Watchdog {
+    done: std::sync::Arc<AtomicBool>,
+    name: String,
+    started: Instant,
+}
 
 impl Watchdog {
     fn start() -> Self {
@@ -137,24 +150,34 @@ impl Watchdog {
             .name()
             .unwrap_or("crash test")
             .to_string();
-        let flag = done.clone();
+        let started = Instant::now();
+        progress!("{name}: started, budget {budget:?}");
+        let (flag, who) = (done.clone(), name.clone());
         std::thread::spawn(move || {
-            let started = Instant::now();
             while !flag.load(Ordering::Relaxed) {
                 if started.elapsed() > budget {
-                    eprintln!("{name} ran past its {budget:?} budget; ending the test binary");
+                    progress!("{who} ran past its {budget:?} budget; ending the test binary");
                     std::process::exit(101);
                 }
                 std::thread::sleep(Duration::from_millis(200));
             }
         });
-        Watchdog(done)
+        Watchdog {
+            done,
+            name,
+            started,
+        }
     }
 }
 
 impl Drop for Watchdog {
     fn drop(&mut self) {
-        self.0.store(true, Ordering::Relaxed);
+        self.done.store(true, Ordering::Relaxed);
+        progress!(
+            "{}: done in {:.1}s",
+            self.name,
+            self.started.elapsed().as_secs_f64()
+        );
     }
 }
 
@@ -585,7 +608,7 @@ fn kill_collect_midway(
     }
     let t = Instant::now();
     gc_ok(tag, stores, &["condemn", "--grace", "0"]);
-    eprintln!("[{tag}] condemn took {:.1}s", t.elapsed().as_secs_f64());
+    progress!("[{tag}] condemn took {:.1}s", t.elapsed().as_secs_f64());
     let mut child = Command::new(bin("leep-server"))
         .args(["--meta", &stores.meta, "--blobs", &stores.blobs, "gc"])
         .args(["collect", "--fence", "0s", "--unsafe-no-fence"])
@@ -610,7 +633,7 @@ fn kill_collect_midway(
     let finished = child.try_wait().unwrap().is_some();
     let _ = child.kill();
     let _ = child.wait();
-    eprintln!(
+    progress!(
         "[{tag}] killed gc collect {} ({} of {} planted blobs left)",
         if finished {
             "after it finished"
@@ -658,14 +681,14 @@ fn run_crash_rounds_with(backend: &str, meta_url: Option<String>, extra: &[&str]
     let not_admitted = match outcome {
         Ok(n) => n,
         Err(e) => {
-            eprintln!(
+            progress!(
                 "crash test failed: backend {backend}, LEEP_CRASH_SEED={seed}, rounds {rounds}, \
                  flags {extra:?}"
             );
             std::panic::resume_unwind(e);
         }
     };
-    eprintln!(
+    progress!(
         "[{backend}] {rounds} kills, seed {seed:#x}, {not_admitted} lands not admitted, {:.1}s",
         started.elapsed().as_secs_f64()
     );
@@ -776,7 +799,7 @@ fn crash_rounds(
                 );
             }
             let confirmed_now = shared.confirmed.lock().unwrap().len();
-            eprintln!(
+            progress!(
                 "[{tag}] {confirmed_now} lands confirmed so far ({} during the last round)",
                 confirmed_now - confirmed_before
             );
@@ -817,7 +840,7 @@ fn recover_planted(tag: &str, stores: &Stores, addr: SocketAddr, planted: &[Vec<
         stores,
         &["collect", "--fence", "0s", "--unsafe-no-fence"],
     );
-    eprintln!(
+    progress!(
         "[{tag}] finishing collect took {:.1}s",
         t.elapsed().as_secs_f64()
     );
@@ -1153,7 +1176,7 @@ fn killed_land_leader_is_replaced_postgres() {
     });
 
     let tag = format!("coordinated seed {seed:#x} final");
-    eprintln!("[{tag}] longest wait for a land after each kill: {stalls:?}");
+    progress!("[{tag}] longest wait for a land after each kill: {stalls:?}");
     check_store(&tag, &stores, &shared, false);
     let odd = shared.odd.lock().unwrap();
     assert!(
@@ -1259,7 +1282,7 @@ fn kill_sweep_at(tag: &str, stores: &Stores, pause: &str) {
     let _ = child.kill();
     let _ = child.wait();
     let line = line.unwrap_or_else(|_| panic!("[{tag}] collect never reached {pause}"));
-    eprintln!("[{tag}] SIGKILLed gc --unreachable: {line}");
+    progress!("[{tag}] SIGKILLed gc --unreachable: {line}");
 }
 
 /// [`gc_ok`] once the gc lease a killed run left has lapsed.
