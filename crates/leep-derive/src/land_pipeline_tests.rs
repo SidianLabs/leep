@@ -275,6 +275,7 @@ fn disjoint() -> Vec<Spec> {
 /// Land `a` and hold its swap, then land `b`, which replays onto `a`'s
 /// staged head while `a` waits. Returns once `b`'s replay is done.
 async fn stage_behind(r: &Repo, meta: &Hold, a: ChangesetId, b: ChangesetId) -> (Pending, Pending) {
+    wait_for(|| r.land_queues.idle("main")).await;
     meta.swaps.send_replace(false);
     let ta = land(r, a);
     wait_for(|| meta.waiting_swaps.load(Ordering::SeqCst) == 1).await;
@@ -457,6 +458,7 @@ async fn a_resend_staged_behind_its_original_lands_once() {
             let cs = ids[1];
             tokio::spawn(async move { r.land_keyed(cs, "main", None, true, id).await })
         };
+        wait_for(|| r.land_queues.idle("main")).await;
         meta.swaps.send_replace(false);
         let first = send();
         wait_for(|| meta.waiting_swaps.load(Ordering::SeqCst) == 1).await;
@@ -478,6 +480,7 @@ async fn pipelining_off_waits_for_each_commit() {
     let (r, meta, _) = held_repo();
     let r = r.with_land_pipeline(false);
     let (_, ids) = build(&r, &disjoint()).await;
+    wait_for(|| r.land_queues.idle("main")).await;
     meta.swaps.send_replace(false);
     let ta = land(&r, ids[0]);
     wait_for(|| meta.waiting_swaps.load(Ordering::SeqCst) == 1).await;
@@ -500,6 +503,7 @@ async fn slow_replays_close_a_batch_early() {
         let (r, meta, _) = held_repo();
         let r = r.with_land_batch_replay_limit(limit);
         let (base, ids) = build(&r, &disjoint()).await;
+        wait_for(|| r.land_queues.idle("main")).await;
         meta.reads.send_replace(false);
         let blocker = land(&r, base);
         wait_for(|| meta.waiting_reads.load(Ordering::SeqCst) == 1).await;
@@ -547,6 +551,7 @@ async fn a_herd_at_a_fresh_queue_is_not_refused_for_lack_of_a_batch_time() {
         ));
     }
     let (base, ids) = build(&r, &script).await;
+    wait_for(|| r.land_queues.idle("main")).await;
     meta.reads.send_replace(false);
     let blocker = land(&r, base);
     wait_for(|| meta.waiting_reads.load(Ordering::SeqCst) == 1).await;
@@ -565,6 +570,7 @@ async fn a_herd_at_a_fresh_queue_is_not_refused_for_lack_of_a_batch_time() {
     // A slow batch time now: 5 s holds two batches of 2, the one in flight
     // included.
     r.land_queues.set_batch_secs("main", 2.5);
+    wait_for(|| r.land_queues.idle("main")).await;
     meta.reads.send_replace(false);
     let blocker = land(&r, base);
     wait_for(|| meta.waiting_reads.load(Ordering::SeqCst) == 1).await;

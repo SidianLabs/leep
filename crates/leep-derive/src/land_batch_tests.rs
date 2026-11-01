@@ -339,6 +339,9 @@ async fn queue_in_order(
     base: ChangesetId,
     lands: &[(ChangesetId, Option<&'static str>)],
 ) -> (Pending, Vec<Pending>) {
+    // A leader still finishing an earlier land could take the blocker
+    // onto that land's head without reading the ref (ADR 0072).
+    wait_for(|| r.land_queues.idle("main")).await;
     gate.reads.send_replace(false);
     let blocker = {
         let r = r.clone();
@@ -1245,6 +1248,9 @@ async fn queue_keyed(
     base: ChangesetId,
     lands: &[(ChangesetId, Option<leep_core::LandId>)],
 ) -> (Pending, Vec<Pending>) {
+    // A leader still finishing an earlier land could take the blocker
+    // onto that land's head without reading the ref (ADR 0072).
+    wait_for(|| r.land_queues.idle("main")).await;
     gate.reads.send_replace(false);
     let blocker = {
         let r = r.clone();
