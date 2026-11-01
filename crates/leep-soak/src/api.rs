@@ -123,9 +123,13 @@ impl Api {
             rq = rq.bearer_auth(t);
         }
         if let Some(b) = body {
-            rq = rq
-                .header("content-type", "application/json")
-                .body(b.to_vec());
+            // Blob uploads are raw bytes; every other body is JSON.
+            let ty = if *method == Method::PUT {
+                "application/octet-stream"
+            } else {
+                "application/json"
+            };
+            rq = rq.header("content-type", ty).body(b.to_vec());
         }
         let res = rq.send().await.map_err(|e| describe(&e))?;
         let status = res.status().as_u16();

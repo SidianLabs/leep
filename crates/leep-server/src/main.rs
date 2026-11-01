@@ -238,6 +238,12 @@ struct Args {
     /// comma-separated list.
     #[arg(long = "protect-ref", env = "LEEP_PROTECT_REFS", value_delimiter = ',')]
     protect_refs: Vec<String>,
+    /// Without --tokens-file, requests must name `localhost` or an IP
+    /// address as their host; this accepts another name too, such as the
+    /// service name other containers reach the server by. Repeatable; the
+    /// environment variable takes a comma-separated list.
+    #[arg(long = "allow-host", env = "LEEP_ALLOW_HOSTS", value_delimiter = ',')]
+    allow_hosts: Vec<String>,
     /// Serve Prometheus metrics on this address (`GET /metrics`, no auth, keep
     /// it private). Off when unset.
     #[arg(long, env = "LEEP_METRICS_LISTEN")]
@@ -1969,6 +1975,9 @@ async fn run() -> anyhow::Result<()> {
     if let Some((_, http)) = &coordination {
         app = leep_server::coord::layer(app, http.clone());
     }
+    app = app.layer(axum::Extension(leep_server::guard::AllowedHosts::new(
+        &args.allow_hosts,
+    )));
 
     let serve_options = serve_options(&args);
     let listener = tokio::net::TcpListener::bind(args.listen)

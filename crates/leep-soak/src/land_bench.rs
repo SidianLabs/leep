@@ -88,6 +88,7 @@ impl Http {
         let res = self
             .client
             .put(format!("{}/v1/blobs/{h}", self.base))
+            .header("content-type", "application/octet-stream")
             .body(data.to_vec())
             .send()
             .await?;

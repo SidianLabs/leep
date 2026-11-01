@@ -279,6 +279,23 @@ Clients pass the token with `LEEP_TOKEN`, `leep --token` or
 re-read on SIGHUP, so tokens can be rotated and revoked without a restart
 ([Reloading config](#reloading-config)).
 
+**Without a tokens file** the server serves only requests that look local:
+their host (the `Host` header, or the HTTP/2 authority) must be `localhost`
+or an IP address, and they must carry no `Origin` header; anything else is
+403 `forbidden`. Leep's own clients pass both checks; a web page in a
+browser does not. When other containers reach the server by a service name
+(`http://leep-server:7070`), list that name with `--allow-host leep-server`
+(`LEEP_ALLOW_HOSTS`); behind a proxy that authenticates, have the proxy
+send the upstream's address as the host or list the public name. The
+probes are exempt. With a tokens file neither check applies.
+
+Every request body declares its type: `Content-Type: application/json` on
+`POST`, `application/octet-stream` on blob uploads (`PUT`); another type is
+415. A request without `Content-Type` is accepted only with an
+`Authorization` header, so `leep` builds from before this check, which sent
+blob uploads without one, keep working against a server with tokens; against
+a server without tokens, upgrade them.
+
 ## Request limits
 
 Optional, and off unless set (ADR 0020). One runaway agent should not starve
@@ -573,6 +590,7 @@ each file's stored kind there and never reports an executable-bit change
 from Windows, as git does with `core.filemode=false`.
 | `LEEP_TOKENS_FILE` | none | Tokens file; enables authentication. |
 | `LEEP_INSECURE_NO_AUTH` | off | `1` lets the server run without a tokens file on a non-loopback address (the image's default listen address). Only for a port published on loopback or behind a proxy that authenticates. |
+| `LEEP_ALLOW_HOSTS` | none | Without a tokens file, requests must name `localhost` or an IP address as their host and carry no `Origin` header; this comma-separated list accepts other host names too, such as the service name other containers use. See [Authentication](#authentication). |
 | `LEEP_SIGNING_KEYS_FILE` | none | Trusted author keys file; enables signature submission. |
 | `LEEP_REQUIRE_SIGNATURES` | none | Comma-separated refs that only accept signed lands; needs the keys file. |
 | `LEEP_REVIEW_POLICY_FILE` | none | Review policy JSON (auto-approval rules, refs that require review); needs the tokens file. |

@@ -12,6 +12,7 @@ pub mod conn;
 pub mod coord;
 pub mod errors;
 pub mod fingerprint;
+pub mod guard;
 pub mod limits;
 pub mod observe;
 pub mod protect;
@@ -316,6 +317,9 @@ pub fn router_with_read_limits(
     let router = router
         .layer(middleware::from_fn(limits::enforce))
         .layer(Extension(budget));
+    // Inside authentication, so a request without a token is a 401 first,
+    // and before any body is read.
+    let router = router.layer(middleware::from_fn(guard::check));
     // Next in, so a rejected request never has its body read.
     let router = router.layer(middleware::from_fn(auth::require_token));
     // Outside both: the request keeps this config snapshot to its end.

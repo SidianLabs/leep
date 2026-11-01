@@ -1348,6 +1348,12 @@ With it, an axum middleware requires `Authorization: Bearer <token>` on every
 endpoint except `GET /v1/health`: 401 (with `WWW-Authenticate: Bearer`) when the
 token is missing, unknown or past the entry's optional `expires` time, 403
 when a `read` token makes a mutating request.
+Before any body is read, `leep_server::guard` requires `POST` bodies to be
+declared `application/json` and `PUT` bodies `application/octet-stream`
+(415; a request with no type is let through when it carries
+`Authorization`, for older clients), and, without authentication, refuses
+requests with an `Origin` header or a host that is not `localhost`, an IP
+address or an `--allow-host` name (403).
 `POST /v1/blobs/missing` counts as read because it only queries; it takes at
 most 100,000 hashes (the CLI sends 10,000 at a time), and read tokens' bodies are capped at 1 MiB by default. Digests are
 compared in constant time, and only the token name is logged. Use

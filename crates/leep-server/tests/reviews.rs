@@ -116,7 +116,15 @@ impl Api {
     }
 
     async fn call(&self, method: Method, uri: &str, tok: Option<&str>, body: Vec<u8>) -> Reply {
-        let mut b = Request::builder().method(method).uri(uri);
+        let ty = if method == Method::PUT {
+            "application/octet-stream"
+        } else {
+            "application/json"
+        };
+        let mut b = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", ty);
         if let Some(t) = tok {
             b = b.header(header::AUTHORIZATION, format!("Bearer {t}"));
         }

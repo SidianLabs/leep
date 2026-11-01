@@ -28,7 +28,7 @@ use std::time::Duration;
 use leep_core::api::*;
 use leep_core::{Changeset, ChangesetId, FileKind, Hash};
 use reqwest::blocking::{Client as Http, RequestBuilder, Response};
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, RETRY_AFTER};
+use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE, RETRY_AFTER};
 use reqwest::StatusCode;
 use serde::de::DeserializeOwned;
 
@@ -558,6 +558,7 @@ impl Client {
         self.send(
             self.http
                 .put(self.url(&format!("/v1/blobs/{hash}")))
+                .header(CONTENT_TYPE, "application/octet-stream")
                 .body(data),
         )
         .map(|_| ())

@@ -151,6 +151,20 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   base, and a path whose answers differ is reported as a conflict. The
   review rules on merges (`merge-parent`, dropped side changes) check every
   base too. See ADR 0071. Fixes #160.
+### Request bodies declare their type; open servers take only local requests
+- **Changed.** `POST` bodies must be sent with `Content-Type:
+  application/json` and blob uploads (`PUT`) with
+  `application/octet-stream`; another type is 415 `invalid`. A request
+  without `Content-Type` is still accepted when it carries an
+  `Authorization` header: `leep` before this change sent blob uploads
+  without one, so upgrade clients that talk to a server without tokens.
+  `leep`, the git mirror, `leep-mcp` and `leep-soak` send the types.
+- **Changed.** A server without `--tokens-file` refuses (403 `forbidden`)
+  requests with an `Origin` header and requests whose host is not
+  `localhost`, an IP address or a name given with the new `--allow-host`
+  (`LEEP_ALLOW_HOSTS`). The probes are exempt. See DEPLOY.md,
+  "Authentication".
+
 ### Connection timeouts
 - **Added.** The server bounds each connection: `--header-read-timeout`
   (30 s; also closes idle HTTP/1.1 keep-alive connections),

@@ -341,7 +341,12 @@ impl Shared {
     async fn put_blob(&self, server: usize, data: Vec<u8>) -> Answer<Hash> {
         let h = Hash::of_blob(&data);
         let url = format!("{}/v1/blobs/{h}", self.servers[server]);
-        match self.client.put(url).body(data).send().await {
+        let put = self
+            .client
+            .put(url)
+            .header("content-type", "application/octet-stream")
+            .body(data);
+        match put.send().await {
             Err(e) => Answer::Lost(short_err(&e)),
             Ok(r) if r.status().is_success() => Answer::Ok(h),
             Ok(r) => Answer::Status(r.status().as_u16()),

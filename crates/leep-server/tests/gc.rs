@@ -46,6 +46,14 @@ impl Stack {
 
     async fn send(&self, method: Method, uri: &str, body: Vec<u8>) -> (StatusCode, Vec<u8>) {
         let req = Request::builder()
+            .header(
+                "content-type",
+                if method == Method::PUT {
+                    "application/octet-stream"
+                } else {
+                    "application/json"
+                },
+            )
             .method(method)
             .uri(uri)
             .body(Body::from(body))
@@ -190,6 +198,7 @@ async fn requests_over_the_timeout_are_aborted() {
         let req = Request::builder()
             .method(Method::PUT)
             .uri(format!("/v1/blobs/{h}"))
+            .header("content-type", "application/octet-stream")
             .body(Body::from("slow"))
             .unwrap();
         app.oneshot(req).await.unwrap().status()

@@ -203,6 +203,15 @@ pub fn post_json(addr: SocketAddr, path: &str, body: &str) -> (u16, String) {
 /// what the server answered (or that it did not). Returns the status and the
 /// response body; any transport failure is an `Err`, as it is for a client
 /// whose server was just killed.
+/// What the server requires a body of `method` to declare.
+fn content_type(method: &str) -> &'static str {
+    if method == "PUT" {
+        "application/octet-stream"
+    } else {
+        "application/json"
+    }
+}
+
 pub fn http(
     addr: SocketAddr,
     method: &str,
@@ -214,7 +223,8 @@ pub fn http(
     s.set_write_timeout(Some(Duration::from_secs(30)))?;
     let head = format!(
         "{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\
-         Content-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+         Content-Type: {}\r\nContent-Length: {}\r\n\r\n",
+        content_type(method),
         body.len()
     );
     s.write_all(head.as_bytes())?;
@@ -253,7 +263,8 @@ pub fn http_abandon(addr: SocketAddr, method: &str, path: &str, body: &[u8], aft
     };
     let head = format!(
         "{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\
-         Content-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+         Content-Type: {}\r\nContent-Length: {}\r\n\r\n",
+        content_type(method),
         body.len()
     );
     if s.write_all(head.as_bytes()).is_ok() && s.write_all(body).is_ok() {
