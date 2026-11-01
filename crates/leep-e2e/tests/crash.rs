@@ -1180,8 +1180,17 @@ fn killed_land_leader_is_replaced_postgres() {
             stalls.push(worst);
             let moved = lease_holder(&db.url).unwrap_or_default();
             assert_ne!(moved, holder, "[{tag}] the lease moved on");
+            // The first check runs under live traffic. Later ones pause the
+            // agents: on a fast runner they landed about four times the
+            // store during each check and restart, the trees to read grew
+            // with it, and the rounds never converged (CI: a 19 s check,
+            // then 424 s, then a final check past the budget).
+            if round > 0 {
+                shared.pause.store(true, Ordering::Relaxed);
+            }
             check_store_live_new(&format!("{tag}, after SIGKILL"), &stores, &shared);
             servers[i] = start(ports[i]);
+            shared.pause.store(false, Ordering::Relaxed);
             progress!("[{tag}] restarted it; {} lands so far", after.len());
         }
         std::thread::sleep(Duration::from_millis(400));
