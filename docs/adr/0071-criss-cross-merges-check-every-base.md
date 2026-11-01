@@ -63,6 +63,13 @@ Option 3.
   against an oracle that brute-forces all best common ancestors.
 - Some criss-cross merges that were clean are now conflicts, exactly those
   whose result depended on which base was picked.
+- A later edit to a file whose criss-cross resolution the bases disagree on
+  conflicts on every merge of the two lines, since each base has neither
+  side's version, until a merge of them lands; that merge is then the
+  single best common ancestor and later merges are ordinary again. git's
+  recursive strategy would merge such an edit cleanly against its virtual
+  base. The cost is bounded by one resolved merge, and it is the price of
+  never picking a side silently.
 - The API shape is unchanged; `GET /v1/merge-base` still answers one base.
 - A criss-cross merge where the shortcut fails pays a paint-down walk and
   one tree diff per extra base, plus reads at the disputed paths.
