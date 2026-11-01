@@ -2689,10 +2689,28 @@ async fn reach_under_faults(seed: u64) {
             );
         }
     }
+    // A random history can leave nothing unreachable (every tip landed or
+    // named, or young), and then the comparison below proves nothing. An
+    // abandoned two-changeset branch, aged past grace and marked by one more
+    // run that may die, always gives it something to find.
+    let gone = commit_file(seed, clean, Some(base), "gone/a.txt", "a\n", "gone a").await;
+    let gone_tip = commit_file(seed, clean, Some(gone), "gone/b.txt", "b\n", "gone b").await;
+    for id in [gone, gone_tip] {
+        w.meta.set_stored_at(&id, 0);
+    }
+    let kill_after = if rng.below(2) == 0 {
+        usize::MAX
+    } else {
+        rng.below(60)
+    };
+    let _ = leep_testkit::cancel_after_polls(mark(&gc, &opts), kill_after).await;
+    if let Err(e) = check_reach_rows(clean).await {
+        panic!("seed {seed} after abandoning a branch: {e}");
+    }
     let want = unreachable_oracle(clean, &opts).await;
     assert!(
-        !want.is_empty() || tips.len() < 4,
-        "seed {seed}: the history left nothing unreachable to check against"
+        want.contains(&gone) && want.contains(&gone_tip),
+        "seed {seed}: the abandoned branch is unreachable"
     );
     let run = mark(clean, &opts).await.unwrap();
     assert_eq!(run.unreachable, want, "seed {seed}: incremental");
