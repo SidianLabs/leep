@@ -18,6 +18,9 @@ env:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # A hung test fails the job with its log instead of holding a runner for
+    # the 6-hour default.
+    timeout-minutes: 90
     services:
       postgres:
         image: postgres:16
@@ -28,6 +31,11 @@ jobs:
           --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 10
     env:
       LEEP_TEST_POSTGRES_URL: postgres://postgres:leep@localhost:5432/postgres
+      # Line tables keep file:line in backtraces at a fraction of the size of
+      # full debug info; the workspace's test binaries with full debug info
+      # outgrew the runner's disk.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@v7
       # Installs the version pinned in rust-toolchain.toml.
@@ -40,6 +48,9 @@ jobs:
       - run: ./scripts/check-runbooks.sh
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      - name: Disk usage after the tests
+        if: always()
+        run: df -h . && du -sh target
       # Compile only, so the benches do not rot.
       - run: cargo bench --no-run -p leep-derive
 
