@@ -91,6 +91,19 @@ pub(crate) async fn apply_changes(
     base: Hash,
     changes: &BTreeMap<RepoPath, FileChange>,
 ) -> Result<Hash> {
+    let started = std::time::Instant::now();
+    let tree = apply_changes_inner(repo, base, changes).await;
+    if let Some(m) = &repo.node_memo {
+        m.add_tree_time(started.elapsed());
+    }
+    tree
+}
+
+async fn apply_changes_inner(
+    repo: &Repo,
+    base: Hash,
+    changes: &BTreeMap<RepoPath, FileChange>,
+) -> Result<Hash> {
     if changes.is_empty() {
         if base == TreeNode::empty_hash() {
             let empty = TreeNode::default();
@@ -160,16 +173,14 @@ pub(crate) async fn apply_changes(
         if node.entries.is_empty() {
             parent.entries.remove(name);
         } else {
-            let h = node.hash();
-            rewritten.push((h, Bytes::from(node.encode())));
+            let h = store_node(repo, node, &mut rewritten);
             parent
                 .entries
                 .insert(name.to_string(), TreeEntry::Dir { tree: h });
         }
     }
     let root = nodes.remove("").expect("root");
-    let h = root.hash();
-    rewritten.push((h, Bytes::from(root.encode())));
+    let h = store_node(repo, root, &mut rewritten);
     let mut named: Vec<Hash> = changes
         .values()
         .filter_map(|c| match c {
@@ -181,6 +192,18 @@ pub(crate) async fn apply_changes(
     named.dedup();
     repo.put_rescuing_many(rewritten, &named).await?;
     Ok(h)
+}
+
+/// Encode `node` once for its hash and its bytes, queue it for writing, and
+/// keep it decoded for the rest of a land batch attempt.
+fn store_node(repo: &Repo, node: TreeNode, rewritten: &mut Vec<(Hash, Bytes)>) -> Hash {
+    let bytes = node.encode();
+    let h = Hash::of_object(TreeNode::KIND, &bytes);
+    rewritten.push((h, Bytes::from(bytes)));
+    if let Some(m) = &repo.node_memo {
+        m.insert(h, node);
+    }
+    h
 }
 
 /// Drop loaded directories that became empty (deepest first).
@@ -219,6 +242,78 @@ impl Repo {
             .entry_at(tree, path.as_str())
             .await?
             .and_then(|e| file_info(path.clone(), &e)))
+    }
+
+    /// The file at each of `paths` under `tree` (`None` for a directory or
+    /// nothing), reading the directories on the way one level at a time with
+    /// [`Repo::read_trees`], each node once. What a merge needs of one side
+    /// at the paths the other side touched, without walking the rest.
+    pub(crate) async fn files_at(
+        &self,
+        tree: Hash,
+        paths: &[&RepoPath],
+    ) -> Result<HashMap<RepoPath, Option<FileInfo>>> {
+        let names: Vec<&str> = paths.iter().map(|p| p.as_str()).collect();
+        let entries = self.entries_at(tree, &names).await?;
+        Ok(paths
+            .iter()
+            .map(|&p| {
+                let e = entries.get(p.as_str()).and_then(|e| e.as_ref());
+                (p.clone(), e.and_then(|e| file_info(p.clone(), e)))
+            })
+            .collect())
+    }
+
+    /// The entry at each of `paths` (non-empty, `/`-separated) under `tree`,
+    /// read as [`Repo::files_at`] reads them.
+    pub(crate) async fn entries_at(
+        &self,
+        tree: Hash,
+        paths: &[&str],
+    ) -> Result<HashMap<String, Option<TreeEntry>>> {
+        // The directories each level needs, by path; level 0 is the root.
+        let mut levels: Vec<BTreeSet<&str>> = vec![BTreeSet::from([""])];
+        for &s in paths {
+            for (i, _) in s.match_indices('/') {
+                let d = &s[..i];
+                let level = depth(d);
+                if levels.len() <= level {
+                    levels.resize_with(level + 1, BTreeSet::new);
+                }
+                levels[level].insert(d);
+            }
+        }
+        // Directory path -> its node's hash, `None` when absent or a file.
+        let mut dirs: HashMap<&str, Option<Hash>> = HashMap::from([("", Some(tree))]);
+        let mut nodes: HashMap<&str, TreeNode> = HashMap::new();
+        for level in &levels {
+            for &d in level {
+                if dirs.contains_key(d) {
+                    continue;
+                }
+                let (parent, name) = d.rsplit_once('/').unwrap_or(("", d));
+                let h = match nodes.get(parent).and_then(|n| n.entries.get(name)) {
+                    Some(TreeEntry::Dir { tree }) => Some(*tree),
+                    _ => None,
+                };
+                dirs.insert(d, h);
+            }
+            let read: Vec<(&str, Hash)> = level
+                .iter()
+                .filter_map(|&d| dirs.get(d).copied().flatten().map(|h| (d, h)))
+                .collect();
+            let hashes: Vec<Hash> = read.iter().map(|(_, h)| *h).collect();
+            for ((d, _), node) in read.into_iter().zip(self.read_trees(&hashes).await?) {
+                nodes.insert(d, node);
+            }
+        }
+        let mut out = HashMap::with_capacity(paths.len());
+        for &p in paths {
+            let (parent, name) = p.rsplit_once('/').unwrap_or(("", p));
+            let entry = nodes.get(parent).and_then(|n| n.entries.get(name));
+            out.insert(p.to_string(), entry.cloned());
+        }
+        Ok(out)
     }
 
     /// One directory level; `NotFound` if `dir` is not a directory.

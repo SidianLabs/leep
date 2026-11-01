@@ -548,6 +548,147 @@ async fn a_swap_lost_to_another_server_redoes_the_batch_on_its_head() {
     assert_eq!(log_steps(&log), log_steps(&want_log));
 }
 
+/// A batch whose swap another server wins redoes its lands on the new head
+/// without trusting the leader's write map, which described the head the
+/// lost attempt built: the other server wrote a file a land of the batch
+/// writes too, and that land must meet it in a merge (here a conflict), as
+/// landing in turn after the other server's move does. Lands of the redone
+/// attempt find the map started again from the new head (ADR 0066).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lost_swap_never_reuses_the_write_map_of_the_lost_attempt() {
+    use crate::land_fast::Lookup;
+    use Parent::*;
+    let script = vec![
+        spec(&[Base], &[("a", Some("a\n"))], "a"),
+        spec(&[Base], &[("b", Some("b\n"))], "b"),
+        spec(&[Base], &[("c", Some("mine\n"))], "c"),
+        // Written by the other server: the same file as `c`.
+        spec(&[Base], &[("c", Some("theirs\n"))], "other"),
+    ];
+    let order: Vec<(usize, Option<&'static str>)> =
+        vec![(0, Some("w0")), (1, Some("w1")), (2, Some("w2"))];
+    let (r, gate) = gated_repo();
+    let (base, ids) = build(&r, &script).await;
+    let lands: Vec<_> = order.iter().map(|&(i, a)| (ids[i], a)).collect();
+    let (blocker, tasks) = queue_in_order(&r, &gate, base, &lands).await;
+    *gate.intruder.lock().unwrap() = Some((Some(base), ids[3]));
+    release(&gate);
+    blocker.await.unwrap().unwrap();
+    let mut answers = Vec::new();
+    for t in tasks {
+        answers.push(outcome(&t.await.unwrap()).replace("attempts: 2", "attempts: 1"));
+    }
+    assert!(answers[2].starts_with("Conflicts"), "{}", answers[2]);
+    let looked: Vec<Lookup> = r
+        .land_queues
+        .lookups
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(_, l)| *l)
+        .collect();
+    // The lost attempt: `a` fast-forwards, `b` and `c` are disjoint from
+    // it. The redone one: the map knows only the other server's head.
+    assert_eq!(
+        looked,
+        vec![
+            Lookup::Hit,
+            Lookup::Hit,
+            Lookup::Cold,
+            Lookup::Cold,
+            Lookup::Cold
+        ]
+    );
+
+    let oracle = plain_repo().with_land_fast_path(false);
+    let (_, oids) = build(&oracle, &script).await;
+    oracle
+        .meta()
+        .cas_ref_logged(
+            "main",
+            Some(base),
+            Some(oids[3]),
+            &RefUpdateContext::new("cas").message("another server"),
+        )
+        .await
+        .unwrap();
+    let mut want = Vec::new();
+    for &(i, actor) in &order {
+        want.push(outcome(&oracle.land_as(oids[i], "main", actor).await));
+    }
+    assert_eq!(answers, want);
+    assert_eq!(
+        r.meta().get_ref("main").await.unwrap(),
+        oracle.meta().get_ref("main").await.unwrap()
+    );
+    let log = r.meta().ref_log(Some("main"), None, 100).await.unwrap();
+    let want_log = oracle
+        .meta()
+        .ref_log(Some("main"), None, 100)
+        .await
+        .unwrap();
+    assert_eq!(log_steps(&log), log_steps(&want_log));
+}
+
+/// Within one batch, disjointness is decided against the head the lands
+/// before left, staged and not yet stored: a land that makes `d` a file
+/// after an earlier land of the batch wrote `d/x` replays the slow way and
+/// conflicts; a land writing into `e/` after an earlier one deleted `e/`'s
+/// last file is disjoint and lands. The answers, heads and log are those of
+/// landing in turn without the fast path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn disjointness_is_judged_on_the_batchs_staged_heads() {
+    use crate::land_fast::Lookup;
+    use Parent::*;
+    let script = vec![
+        spec(&[Base], &[("e/one", Some("1\n"))], "seed e"),
+        spec(&[Script(0)], &[("d/x", Some("x\n"))], "d/x"),
+        spec(&[Script(0)], &[("d", Some("file\n"))], "d file"),
+        spec(&[Script(0)], &[("e/one", None)], "drop e"),
+        spec(&[Script(0)], &[("e/two", Some("2\n"))], "e/two"),
+    ];
+    let order: Vec<(usize, Option<&'static str>)> =
+        vec![(1, None), (2, None), (3, None), (4, None)];
+    let (r, gate) = gated_repo();
+    let (base, ids) = build(&r, &script).await;
+    r.land(ids[0], "main").await.unwrap();
+    let lands: Vec<_> = order.iter().map(|&(i, a)| (ids[i], a)).collect();
+    let (blocker, tasks) = queue_in_order(&r, &gate, base, &lands).await;
+    release(&gate);
+    blocker.await.unwrap().unwrap();
+    let mut answers = Vec::new();
+    for t in tasks {
+        answers.push(outcome(&t.await.unwrap()));
+    }
+    assert!(answers[1].starts_with("Conflicts"), "{}", answers[1]);
+    assert!(answers[3].contains("rebased: true"), "{}", answers[3]);
+    let looked: Vec<Lookup> = r
+        .land_queues
+        .lookups
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(_, l)| *l)
+        .collect();
+    // `d/x` fast-forwards; `d` overlaps it; `drop e` and `e/two` are
+    // disjoint from what landed before them.
+    assert_eq!(looked, vec![Lookup::Overlap, Lookup::Hit, Lookup::Hit]);
+
+    let oracle = plain_repo().with_land_fast_path(false);
+    let (_, oids) = build(&oracle, &script).await;
+    oracle.land(oids[0], "main").await.unwrap();
+    let mut want = Vec::new();
+    for &(i, actor) in &order {
+        want.push(outcome(&oracle.land_as(oids[i], "main", actor).await));
+    }
+    assert_eq!(answers, want);
+    let head = r.meta().get_ref("main").await.unwrap();
+    assert_eq!(head, oracle.meta().get_ref("main").await.unwrap());
+    let files = r.list_files(head.unwrap(), "").await.unwrap();
+    let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(paths, ["base.txt", "d/x", "e/two"]);
+}
+
 /// A redone batch keeps the `rebased-origin-v1` rows its lost attempt read
 /// from the store, so its landed-copy scans read only what the head gained
 /// (ADR 0056, "Scan carry").

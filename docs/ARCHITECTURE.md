@@ -73,7 +73,7 @@ content-addressing and (b) the atomicity of `MetaStore::cas_ref`.
 
 | Crate | Role | May depend on |
 |---|---|---|
-| `leep-core` | Types, hashing, encoding, `BlobStore`/`MetaStore` traits (including listing and blob deletion for GC, a changeset id prefix lookup for short ids, listing and dropping derived rows by kind for repair, batched changeset and derived reads for history walks, and batched derived writes and changeset-with-rows writes for changeset creation), in-memory stores, conformance tests, API types, pure rename detection | no other leep crate; no I/O, no async runtime |
+| `leep-core` | Types, hashing, encoding, `BlobStore`/`MetaStore` traits (including listing and blob deletion for GC, a changeset id prefix lookup for short ids, listing and dropping derived rows by kind for repair, batched changeset and derived reads for history walks, derived reads of several kinds in one call, and batched derived writes and changeset-with-rows writes for changeset creation), in-memory stores, conformance tests, API types, pure rename detection | no other leep crate; no I/O, no async runtime |
 | `leep-store` | `BlobStore` backends: filesystem (loose objects plus delta-compressed packs and the repack writer, ADR 0029, ADR 0039), `object_store` (S3/MinIO; loose objects plus the same packs, ADR 0040), `CachedBlobStore`, `open_blob_store(url)`, and the incremental blob and pack copy backup and restore use (`sync`, `packfiles`, ADR 0026, ADR 0039) | core |
 | `leep-meta` | `MetaStore` backends: SQLite, Postgres, `open_meta_store(url)`, the versioned schema migrator (`migrate`, ADR 0023), metadata snapshots and their import (`snapshot`, ADR 0026), and `analyze_meta_store`, which bulk loaders call to refresh Postgres planner statistics (ADR 0042) | core |
 | `leep-derive` | `Repo`: derived data framework and kinds, plus all operations, blob garbage collection (`gc`), the delta-base walks for `repack` (`pack_order`, full or loose-only) and store verification and repair (`integrity`) | core (traits only, never a concrete backend) |
@@ -606,11 +606,18 @@ loop (≤32 attempts):
     else:
       stack ← first-parent chain from cs down to where it joins head's history,
               or to an entry whose server-made copy is in it
-      replay each stack entry onto head, oldest first        # 3-way per entry
-      conflict? → Conflicts{onto: head, conflicts, clean} for this land only
-                  (the whole stack squashed into one 3-way merge vs head;
-                   never auto-resolved on the server)
-      move to replayed top
+      if the leader's write map holds the stack's base and nothing written
+         since touches the stack's paths, their directories or below them:
+        copy each entry onto head, oldest first, with its own changes
+          (less no-op modifies), no merge                 # fast path, ADR 0066
+      else:
+        replay each stack entry onto head, oldest first   # 3-way per entry,
+                                                           # ours read only at theirs' paths
+        conflict? → Conflicts{onto: head, conflicts, clean} for this land only
+                    (the whole stack squashed into one 3-way merge vs head;
+                     never auto-resolved on the server; under a strict ref
+                     every path both sides changed is a conflict)
+      move to replayed top, and append its first-parent chain to the write map
     a move sets head; answers that precede every move are sent at once
       (a Conflicts answer first stores the merged text its clean changes
        name: GC rescue check, flush; an error is that land's answer)
@@ -663,9 +670,40 @@ A lease lives 2 s (the TTL) from its last renewal, and only then may another
 server take it; a holder trusts it until the store-reported time left, less
 one renew interval (500 ms), counted from when it sent that renewal. Lease
 calls use connections of their own, so a renewal never waits behind data
-traffic. A forwarded land is never forwarded again. The leader of a batch is a
+traffic. So do batch leaders
+([ADR 0067](adr/0067-reserved-land-connections.md)): the leader runs in
+the land lane (a task-local, `leep_core::lane`), and the Postgres
+store answers a task in that lane from a reserved pool
+(`--meta-land-pool-size`), so request handlers holding every shared
+connection cannot queue the batch they all wait for. A forwarded land is
+never forwarded again. The leader of a batch is a
 spawned task, so a cancelled request cannot stop a batch; a land cancelled
 before its batch reached it is dropped, one already replayed lands.
+Replays are cheap when lands are disjoint ([ADR 0066](adr/0066-land-fast-path-and-conflict-policy.md),
+`land_fast.rs`). The leader keeps, per ref and in memory only, a write map
+of the ref's first-parent line it has followed: each changeset's sequence
+number, the newest one that wrote each path, and the newest that wrote below
+each directory, for the last 4,096 changesets (at most 2^20 entries). It
+describes one head and is checked against the head every batch attempt
+reads; any other head starts it again from that head, so a cold map (after
+a restart or a lost lease) or another server's move only sends lands the
+slow way. A stack based on a changeset the map holds, and touching no path
+written since (nor a file at one of its directories, nor anything below
+it), is copied without a merge: each member's own changes, less modifies
+that change nothing, onto the previous copy, through the same
+`rebased_copy` as the slow path, whose copy for such a stack it equals to
+the byte. Everything else (overlaps, bases out of the map, stacks on their
+own landed copies) replays the slow way, whose merge diffs only base
+against theirs and reads ours at those paths, so it costs the size of the
+land rather than the ref's churn since its base. `--land-conflicts strict`
+(or `--strict-land-ref`) makes the slow path answer every path both sides
+changed as a conflict instead of merging it; the default `merge` keeps the
+three-way merge. A batch builds its copies' trees on the decoded nodes the
+copies before them wrote, held in the attempt's staging, rewriting only
+touched directories, and still stores each copy's tree and `root_tree` row.
+The land policy runs on every land before any of this, and the landed-copy
+scan stays for keyed lands too: a keyed land answered "already landed" from
+the scan records nothing to answer its retry from.
 The copy test makes `land` idempotent: a client that never saw the answer to
 a land that applied (a timeout, a killed server, an error after commit) can
 send it again and gets the copy back instead of a second one. It looks for a
@@ -702,7 +740,7 @@ before `get_changeset`: a land that would wait behind more than `N`
 batches, its own included (the waiting lands over 64, rounded up, plus one
 while a batch replays), gets `Error::Refused`, which the server answers 503
 `unavailable` with `Retry-After` (batches ahead times the ref's moving
-average batch time, 1 to 10 s) and `Leep-Refused: admission`. An unkeyed
+average batch time, 1 to 30 s, half of a batch's 60 s lifetime, since ADR 0066) and `Leep-Refused: admission`. An unkeyed
 refusal reads nothing; a keyed land first reads its id with one
 `find_lands` and, if recorded, gets that answer instead. An admitted land
 holds a place in the queue while it reads its changeset, so concurrent

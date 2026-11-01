@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use leep_core::lane::Lane;
 use leep_core::prefix::IdPrefix;
 use leep_core::store::unix_now;
 use leep_core::{
@@ -96,6 +97,11 @@ const LEASE_POOL_SIZE: u32 = 2;
 
 pub struct PostgresMetaStore {
     pub(crate) pool: PgPool,
+    /// Data calls of tasks in [`Lane::Land`] (ADR 0067): land leaders and
+    /// their ref moves, so request handlers holding every connection of
+    /// `pool` cannot queue the task every land on a ref waits for. `None`
+    /// (`--meta-land-pool-size 0`) shares `pool`. Connects on first use.
+    pub(crate) land_pool: Option<PgPool>,
     /// Lease calls only (ADR 0056), every scope, so a renewal never waits
     /// for a connection behind data traffic: a lease not renewed in time is
     /// taken over. Connects on first use.
@@ -126,7 +132,7 @@ impl PostgresMetaStore {
     /// [`connect_with`](Self::connect_with), opening at most `pool_size`
     /// connections.
     pub async fn connect_with_pool(url: &str, mode: SchemaMode, pool_size: u32) -> Result<Self> {
-        Self::open(url, None, mode, MIGRATIONS, pool_size, None).await
+        Self::open(url, None, mode, MIGRATIONS, Pools::new(pool_size), None).await
     }
 
     /// [`connect_with_pool`](Self::connect_with_pool), with every statement
@@ -139,7 +145,43 @@ impl PostgresMetaStore {
         pool_size: u32,
         statement_timeout: Option<Duration>,
     ) -> Result<Self> {
-        Self::open(url, None, mode, MIGRATIONS, pool_size, statement_timeout).await
+        let pools = Pools::new(pool_size);
+        Self::open(url, None, mode, MIGRATIONS, pools, statement_timeout).await
+    }
+
+    /// [`connect_with_options`](Self::connect_with_options), with
+    /// `land_pool_size` connections reserved for land leaders (ADR 0067)
+    /// instead of [`default_land_pool_size`](crate::default_land_pool_size);
+    /// 0 reserves none.
+    pub async fn connect_with_lanes(
+        url: &str,
+        mode: SchemaMode,
+        pool_size: u32,
+        land_pool_size: u32,
+        statement_timeout: Option<Duration>,
+    ) -> Result<Self> {
+        let pools = Pools {
+            data: pool_size,
+            land: land_pool_size,
+        };
+        Self::open(url, None, mode, MIGRATIONS, pools, statement_timeout).await
+    }
+
+    /// A store in `schema` with the given pool sizes, for tests of the land
+    /// lane.
+    #[doc(hidden)]
+    pub async fn connect_with_schema_and_lanes(
+        url: &str,
+        schema: &str,
+        pool_size: u32,
+        land_pool_size: u32,
+    ) -> Result<Self> {
+        let pools = Pools {
+            data: pool_size,
+            land: land_pool_size,
+        };
+        let schema = Some(schema.to_string());
+        Self::open(url, schema, SchemaMode::Migrate, MIGRATIONS, pools, None).await
     }
 
     /// A store in `schema` whose data pool bounds statements, for tests of
@@ -155,7 +197,7 @@ impl PostgresMetaStore {
             Some(schema.to_string()),
             SchemaMode::Migrate,
             MIGRATIONS,
-            crate::DEFAULT_POSTGRES_POOL_SIZE,
+            Pools::new(crate::DEFAULT_POSTGRES_POOL_SIZE),
             Some(statement_timeout),
         )
         .await
@@ -169,7 +211,7 @@ impl PostgresMetaStore {
             Some(schema.to_string()),
             SchemaMode::Migrate,
             MIGRATIONS,
-            crate::DEFAULT_POSTGRES_POOL_SIZE,
+            Pools::new(crate::DEFAULT_POSTGRES_POOL_SIZE),
             None,
         )
         .await
@@ -189,7 +231,7 @@ impl PostgresMetaStore {
             schema.map(str::to_string),
             mode,
             migrations,
-            crate::DEFAULT_POSTGRES_POOL_SIZE,
+            Pools::new(crate::DEFAULT_POSTGRES_POOL_SIZE),
             None,
         )
         .await
@@ -237,19 +279,26 @@ impl PostgresMetaStore {
         schema: Option<String>,
         mode: SchemaMode,
         migrations: &[Migration],
-        pool_size: u32,
+        pools: Pools,
         statement_timeout: Option<Duration>,
     ) -> Result<Self> {
-        let pool = Self::pool(url, schema.clone(), pool_size, statement_timeout).await?;
+        let pool = Self::pool(url, schema.clone(), pools.data, statement_timeout).await?;
         let report = Self::run(&pool, migrations, mode == SchemaMode::Migrate).await?;
         if mode == SchemaMode::RequireCurrent {
             migrate::require_current(&report)?;
         }
         // Never bounded: a renewal that waits on a busy database should be
         // late, not cancelled, and the lease TTL already bounds it.
-        let lease_pool = Self::options(schema, LEASE_POOL_SIZE, None)
-            .connect_lazy_with(PgConnectOptions::from_str(url).map_err(storage)?);
-        let store = Self::with_pool(pool, lease_pool, migrations);
+        let opts = PgConnectOptions::from_str(url).map_err(storage)?;
+        // Bounded like the data pool: the leader's statements were on it
+        // before, and the same runaway statement would hold a connection.
+        let land_pool = (pools.land > 0).then(|| {
+            Self::options(schema.clone(), pools.land, statement_timeout)
+                .connect_lazy_with(opts.clone())
+        });
+        let lease_pool = Self::options(schema, LEASE_POOL_SIZE, None).connect_lazy_with(opts);
+        let mut store = Self::with_pool(pool, lease_pool, migrations);
+        store.land_pool = land_pool;
         crate::features::check(&store.features().await?)?;
         store.load_dicts().await?;
         Ok(store)
@@ -367,7 +416,7 @@ impl PostgresMetaStore {
                  AND s.attname = 'kind' \
              WHERE c.oid = 'derived'::regclass",
         )
-        .fetch_optional(&self.pool)
+        .fetch_optional(self.db())
         .await
         .map_err(storage)?;
         let Some((tuples, Some(vals), Some(freqs))) = row else {
@@ -466,10 +515,51 @@ fn quote_ident(s: &str) -> String {
     format!("\"{}\"", s.replace('"', "\"\""))
 }
 
+/// Connections per pool, as `--meta-pool-size` and `--meta-land-pool-size`
+/// set them.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Pools {
+    data: u32,
+    land: u32,
+}
+
+impl Pools {
+    fn new(data: u32) -> Self {
+        Self {
+            data,
+            land: crate::default_land_pool_size(data),
+        }
+    }
+}
+
 impl PostgresMetaStore {
+    /// The pool the running task's data calls draw on (ADR 0067), with the
+    /// connection gauges of that pool brought up to date.
+    fn db(&self) -> &PgPool {
+        let (name, pool) = match (leep_core::lane::current(), &self.land_pool) {
+            (Lane::Land, Some(land)) => ("land", land),
+            _ => ("data", &self.pool),
+        };
+        let size = pool.size();
+        let idle = u32::try_from(pool.num_idle()).unwrap_or(u32::MAX).min(size);
+        metrics::gauge!("leep_meta_pool_connections", "pool" => name, "state" => "in_use")
+            .set(f64::from(size - idle));
+        metrics::gauge!("leep_meta_pool_connections", "pool" => name, "state" => "idle")
+            .set(f64::from(idle));
+        pool
+    }
+
+    /// Connections the land pool may open; 0 when it shares the data pool.
+    pub fn land_pool_size(&self) -> u32 {
+        self.land_pool
+            .as_ref()
+            .map_or(0, |p| p.options().get_max_connections())
+    }
+
     fn with_pool(pool: PgPool, lease_pool: PgPool, migrations: &[Migration]) -> Self {
         Self {
             pool,
+            land_pool: None,
             lease_pool,
             codec: Codec::default(),
             has_dicts: migrations
@@ -490,7 +580,7 @@ impl PostgresMetaStore {
             return Ok(Vec::new());
         }
         sqlx::query_scalar("SELECT name FROM store_features ORDER BY name")
-            .fetch_all(&self.pool)
+            .fetch_all(self.db())
             .await
             .map_err(storage)
     }
@@ -508,7 +598,7 @@ impl PostgresMetaStore {
         )
         .bind(name)
         .bind(unix_now())
-        .execute(&self.pool)
+        .execute(self.db())
         .await
         .map_err(storage)?;
         Ok(())
@@ -520,7 +610,7 @@ impl PostgresMetaStore {
             return Ok(());
         }
         let ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM changeset_dicts ORDER BY id")
-            .fetch_all(&self.pool)
+            .fetch_all(self.db())
             .await
             .map_err(storage)?;
         let mut rows = Vec::new();
@@ -531,7 +621,7 @@ impl PostgresMetaStore {
             let data: Vec<u8> =
                 sqlx::query_scalar("SELECT data FROM changeset_dicts WHERE id = $1")
                     .bind(id)
-                    .fetch_one(&self.pool)
+                    .fetch_one(self.db())
                     .await
                     .map_err(storage)?;
             rows.push((id, data));
@@ -584,7 +674,7 @@ impl PostgresMetaStore {
         let n: i64 = sqlx::query_scalar(
             "SELECT pg_relation_size('derived') / current_setting('block_size')::bigint",
         )
-        .fetch_one(&self.pool)
+        .fetch_one(self.db())
         .await
         .map_err(storage)?;
         Ok(n as u64)
@@ -609,7 +699,7 @@ impl PostgresMetaStore {
         // Block numbers are 32 bits; the last range ends past every block.
         let end = (at + span).min(u64::from(u32::MAX));
         let started = std::time::Instant::now();
-        let mut tx = self.pool.begin().await.map_err(storage)?;
+        let mut tx = self.db().begin().await.map_err(storage)?;
         sqlx::query(NO_INDEX_PATHS)
             .execute(&mut *tx)
             .await
@@ -667,7 +757,7 @@ impl PostgresMetaStore {
         .bind(name)
         .bind(after)
         .bind(KEY_BATCH)
-        .fetch_one(&self.pool)
+        .fetch_one(self.db())
         .await
         .map_err(storage)?;
         deleted[kind] = n as u64;
@@ -715,7 +805,7 @@ impl MetaStore for PostgresMetaStore {
                 .bind(id.0.as_bytes().as_slice())
                 .bind(data)
         };
-        q.execute(&self.pool).await.map_err(storage)?;
+        q.execute(self.db()).await.map_err(storage)?;
         Ok(id)
     }
 
@@ -738,7 +828,7 @@ impl MetaStore for PostgresMetaStore {
         )
         .bind(keys)
         .bind(crate::STORED_AT_SCHEMA_VERSION)
-        .fetch_all(&self.pool)
+        .fetch_all(self.db())
         .await
         .map_err(storage)?;
         crate::stored_at_in_order(ids, rows.iter().map(|r| (r.get(0), r.get(1))))
@@ -747,7 +837,7 @@ impl MetaStore for PostgresMetaStore {
     async fn get_changeset(&self, id: &ChangesetId) -> Result<Option<Changeset>> {
         let row = sqlx::query("SELECT data FROM changesets WHERE id = $1")
             .bind(id.0.as_bytes().as_slice())
-            .fetch_optional(&self.pool)
+            .fetch_optional(self.db())
             .await
             .map_err(storage)?;
         let Some(row) = row else { return Ok(None) };
@@ -768,7 +858,7 @@ impl MetaStore for PostgresMetaStore {
         let keys: Vec<&[u8]> = unique(ids.iter().map(|i| i.0.as_bytes().as_slice()));
         let rows = sqlx::query("SELECT id, data FROM changesets WHERE id = ANY($1)")
             .bind(keys)
-            .fetch_all(&self.pool)
+            .fetch_all(self.db())
             .await
             .map_err(storage)?;
         self.decode_rows(ids, rows.iter().map(|r| (r.get(0), r.get(1))).collect())
@@ -786,7 +876,7 @@ impl MetaStore for PostgresMetaStore {
         let rows = sqlx::query("SELECT id FROM changesets WHERE id > $1 ORDER BY id LIMIT $2")
             .bind(after)
             .bind(i64::try_from(limit).unwrap_or(i64::MAX))
-            .fetch_all(&self.pool)
+            .fetch_all(self.db())
             .await
             .map_err(storage)?;
         rows.into_iter()
@@ -806,7 +896,7 @@ impl MetaStore for PostgresMetaStore {
         .bind(prefix.lower().0 .0.to_vec())
         .bind(prefix.upper().0 .0.to_vec())
         .bind(i64::try_from(limit).unwrap_or(i64::MAX))
-        .fetch_all(&self.pool)
+        .fetch_all(self.db())
         .await
         .map_err(storage)?;
         rows.into_iter()
@@ -817,7 +907,7 @@ impl MetaStore for PostgresMetaStore {
     async fn get_ref(&self, name: &str) -> Result<Option<ChangesetId>> {
         let row = sqlx::query("SELECT target FROM refs WHERE name = $1")
             .bind(name)
-            .fetch_optional(&self.pool)
+            .fetch_optional(self.db())
             .await
             .map_err(storage)?;
         row.map(|r| to_id(&r.get::<Vec<u8>, _>(0))).transpose()
@@ -837,7 +927,7 @@ impl MetaStore for PostgresMetaStore {
         let exp = expected.map(|i| i.0 .0.to_vec());
         let new = new.map(|i| i.0 .0.to_vec());
         let (land_id, land_changeset) = land_columns(ctx);
-        let mut tx = self.pool.begin().await.map_err(storage)?;
+        let mut tx = self.db().begin().await.map_err(storage)?;
         let q = match (&exp, &new) {
             (None, Some(n)) => sqlx::query(
                 "INSERT INTO refs (name, target) VALUES ($1, $2) ON CONFLICT DO NOTHING",
@@ -940,7 +1030,7 @@ impl MetaStore for PostgresMetaStore {
         let last = steps.last().and_then(|s| s.new).map(|i| i.0 .0.to_vec());
         // The ref update is the transaction's first statement, as in
         // `cas_ref_logged`.
-        let mut tx = self.pool.begin().await.map_err(storage)?;
+        let mut tx = self.db().begin().await.map_err(storage)?;
         let q = match (&exp, &last) {
             (None, Some(n)) => sqlx::query(
                 "INSERT INTO refs (name, target) VALUES ($1, $2) ON CONFLICT DO NOTHING",
@@ -1012,7 +1102,7 @@ impl MetaStore for PostgresMetaStore {
         )
         .bind(name)
         .bind(&keys)
-        .fetch_all(&self.pool)
+        .fetch_all(self.db())
         .await
         .map_err(storage)?;
         lands_in_order(ids, rows)
@@ -1033,7 +1123,7 @@ impl MetaStore for PostgresMetaStore {
         .bind(name)
         .bind(before)
         .bind(i64::try_from(limit).unwrap_or(i64::MAX))
-        .fetch_all(&self.pool)
+        .fetch_all(self.db())
         .await
         .map_err(storage)?;
         rows.into_iter().map(log_entry).collect()
@@ -1041,7 +1131,7 @@ impl MetaStore for PostgresMetaStore {
 
     async fn list_refs(&self) -> Result<BTreeMap<String, ChangesetId>> {
         let rows = sqlx::query("SELECT name, target FROM refs")
-            .fetch_all(&self.pool)
+            .fetch_all(self.db())
             .await
             .map_err(storage)?;
         rows.into_iter()
@@ -1053,7 +1143,7 @@ impl MetaStore for PostgresMetaStore {
         let row = sqlx::query("SELECT value FROM derived WHERE kind = $1 AND key = $2")
             .bind(kind)
             .bind(key.as_bytes().as_slice())
-            .fetch_optional(&self.pool)
+            .fetch_optional(self.db())
             .await
             .map_err(storage)?;
         Ok(row.map(|r| Bytes::from(r.get::<Vec<u8>, _>(0))))
@@ -1074,13 +1164,69 @@ impl MetaStore for PostgresMetaStore {
         )
         .bind(kind)
         .bind(wanted)
-        .fetch_all(&self.pool)
+        .fetch_all(self.db())
         .await
         .map_err(storage)?;
         Ok(values_in_order(
             keys,
             rows.iter().map(|r| (r.get(0), r.get(1))),
         ))
+    }
+
+    /// One statement: a `UNION ALL` of the `get_derived_many` query per
+    /// non-empty read, each tagged with its read's index, so every branch
+    /// keeps that query's plan.
+    async fn get_derived_kinds(
+        &self,
+        reads: &[(&str, &[Hash])],
+    ) -> Result<Vec<Vec<Option<Bytes>>>> {
+        let asked: Vec<usize> = (0..reads.len())
+            .filter(|&i| !reads[i].1.is_empty())
+            .collect();
+        if asked.is_empty() {
+            return Ok(reads.iter().map(|_| Vec::new()).collect());
+        }
+        let mut q = sqlx::QueryBuilder::new("");
+        for (n, &i) in asked.iter().enumerate() {
+            let (kind, keys) = reads[i];
+            if n > 0 {
+                q.push(" UNION ALL ");
+            }
+            let wanted: Vec<Vec<u8>> = unique(keys.iter().map(|k| k.as_bytes().as_slice()))
+                .into_iter()
+                .map(<[u8]>::to_vec)
+                .collect();
+            q.push("SELECT ")
+                .push_bind(i32::try_from(i).map_err(|_| {
+                    leep_core::Error::Invalid("too many derived reads in one call".into())
+                })?)
+                .push("::int4, key, value FROM derived WHERE kind = (SELECT ")
+                .push_bind(kind)
+                .push("::text) AND key = ANY(")
+                .push_bind(wanted)
+                .push(")");
+        }
+        let rows = q.build().fetch_all(self.db()).await.map_err(storage)?;
+        let mut found: Vec<Vec<(Vec<u8>, Vec<u8>)>> = reads.iter().map(|_| Vec::new()).collect();
+        for r in rows {
+            let i: i32 = r.get(0);
+            let slot = usize::try_from(i)
+                .ok()
+                .and_then(|i| found.get_mut(i))
+                .ok_or_else(|| leep_core::Error::Storage(format!("unasked derived read {i}")))?;
+            slot.push((r.get(1), r.get(2)));
+        }
+        Ok(reads
+            .iter()
+            .zip(found)
+            .map(|((_, keys), rows)| {
+                if keys.is_empty() {
+                    Vec::new()
+                } else {
+                    values_in_order(keys, rows.into_iter())
+                }
+            })
+            .collect())
     }
 
     /// An empty `after` sorts below every 32-byte key, so `None` needs no
@@ -1098,7 +1244,7 @@ impl MetaStore for PostgresMetaStore {
         .bind(kind)
         .bind(after)
         .bind(i64::try_from(limit).unwrap_or(i64::MAX))
-        .fetch_all(&self.pool)
+        .fetch_all(self.db())
         .await
         .map_err(storage)?;
         rows.into_iter()
@@ -1115,7 +1261,7 @@ impl MetaStore for PostgresMetaStore {
     async fn count_derived(&self, kind: &str) -> Result<u64> {
         let n: i64 = sqlx::query_scalar("SELECT count(*) FROM derived WHERE kind = $1")
             .bind(kind)
-            .fetch_one(&self.pool)
+            .fetch_one(self.db())
             .await
             .map_err(storage)?;
         Ok(n as u64)
@@ -1131,7 +1277,7 @@ impl MetaStore for PostgresMetaStore {
         )
         .bind(kind)
         .bind(EXACT_UP_TO)
-        .fetch_one(&self.pool)
+        .fetch_one(self.db())
         .await
         .map_err(storage)?;
         if n < EXACT_UP_TO {
@@ -1166,7 +1312,7 @@ impl MetaStore for PostgresMetaStore {
                 let rows: i64 =
                     sqlx::query_scalar("SELECT count(*) FROM derived WHERE kind = ANY($1)")
                         .bind(kinds)
-                        .fetch_one(&self.pool)
+                        .fetch_one(self.db())
                         .await
                         .map_err(storage)?;
                 match drop::plan(rows as u64, self.derived_pages().await?) {
@@ -1198,7 +1344,7 @@ impl MetaStore for PostgresMetaStore {
         .bind(kind)
         .bind(key.as_bytes().as_slice())
         .bind(value.as_ref())
-        .execute(&self.pool)
+        .execute(self.db())
         .await
         .map_err(storage)?;
         Ok(())
@@ -1210,7 +1356,7 @@ impl MetaStore for PostgresMetaStore {
             return Ok(0);
         }
         let keys: Vec<&[u8]> = unique(ids.iter().map(|i| i.0.as_bytes().as_slice()));
-        let mut tx = self.pool.begin().await.map_err(storage)?;
+        let mut tx = self.db().begin().await.map_err(storage)?;
         if !kinds.is_empty() {
             sqlx::query("DELETE FROM derived WHERE kind = ANY($1) AND key = ANY($2)")
                 .bind(kinds)
@@ -1237,7 +1383,7 @@ impl MetaStore for PostgresMetaStore {
         let n = sqlx::query("DELETE FROM derived WHERE kind = ANY($1) AND key = ANY($2)")
             .bind(kinds)
             .bind(&keys)
-            .execute(&self.pool)
+            .execute(self.db())
             .await
             .map_err(storage)?
             .rows_affected();
@@ -1262,7 +1408,7 @@ impl MetaStore for PostgresMetaStore {
         .bind(kinds)
         .bind(keys)
         .bind(values)
-        .execute(&self.pool)
+        .execute(self.db())
         .await
         .map_err(storage)?;
         Ok(())
@@ -1302,7 +1448,7 @@ impl MetaStore for PostgresMetaStore {
         if self.has_stored_at {
             q = q.bind(crate::stored_now());
         }
-        q.execute(&self.pool).await.map_err(storage)?;
+        q.execute(self.db()).await.map_err(storage)?;
         Ok(id)
     }
 
@@ -1349,13 +1495,13 @@ impl MetaStore for PostgresMetaStore {
         if self.has_stored_at {
             q = q.bind(crate::stored_now());
         }
-        q.execute(&self.pool).await.map_err(storage)?;
+        q.execute(self.db()).await.map_err(storage)?;
         Ok(())
     }
 
     async fn schema_version(&self) -> Result<Option<u64>> {
         let v: Option<i64> = sqlx::query_scalar("SELECT MAX(version) FROM schema_migrations")
-            .fetch_one(&self.pool)
+            .fetch_one(self.db())
             .await
             .map_err(storage)?;
         Ok(Some(v.unwrap_or(0) as u64))

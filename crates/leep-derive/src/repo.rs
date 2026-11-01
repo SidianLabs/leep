@@ -86,6 +86,10 @@ pub struct Repo {
     /// Batches this server's lands with every other server's on the same ref
     /// (ADR 0056); `None` batches only the lands this process receives.
     pub(crate) land_coordinator: Option<Arc<crate::land_coord::LandCoordinator>>,
+    /// Copy disjoint lands onto the head without a merge (ADR 0066).
+    pub(crate) land_fast_path: bool,
+    /// How a land's slow path treats same-path overlaps, per ref.
+    pub(crate) land_conflicts: Arc<crate::LandConflicts>,
     /// Parents and generations of changesets seen by history walks.
     pub(crate) ancestry: Arc<AncestryCache>,
     /// Decoded path-history nodes, keyed by `NodeRef::cache_key` (see
@@ -105,6 +109,7 @@ pub struct Repo {
     pub(crate) history_roots: Arc<HistoryRootCache>,
     /// Tree nodes viewed for lookups (see `read_tree_view`).
     pub(crate) trees: Arc<TreeCache>,
+    pub(crate) nodes: Arc<NodeCache>,
     /// Encoded `tree-trigrams-v1` rows read from the store by searches
     /// (see `Repo::search_tree_rows`).
     pub(crate) search_trees: Arc<SearchTreeCache>,
@@ -140,6 +145,11 @@ pub struct Repo {
     /// (ADR 0059). Off for a land batch's staged handle, whose batch rescues
     /// before it moves the ref.
     pub(crate) rescues_on_write: bool,
+    /// Decoded tree nodes a land batch attempt read or wrote (ADR 0066):
+    /// its replays build each land's tree on the one before, so they find
+    /// the nodes they rewrite in memory instead of reading and decoding
+    /// them again. `None` outside a staged batch.
+    pub(crate) node_memo: Option<Arc<crate::land_stage::NodeMemo>>,
     /// Permits for the metadata reads of a search's directory opens, shared
     /// by every search through this handle and its clones; `None` leaves
     /// them unbounded. See [`Repo::with_search_pool_permits`].
@@ -368,6 +378,13 @@ pub(crate) struct StagedNodes {
 /// delta chain first. Checked against their hash before they are cached.
 pub(crate) type TreeCache = SizedCache<TreeView, TREE_CACHE_BYTES>;
 
+/// Decoded tree nodes by hash, for [`Repo::read_tree`] and
+/// [`Repo::read_trees`]: a land's merge, its tree build and diffs read the
+/// same upper directories of the head over and over (ADR 0066). Only nodes
+/// read from the store and checked against their hash are kept; a node's
+/// hash names its content, so an entry is never stale.
+pub(crate) type NodeCache = SizedCache<TreeNode, NODE_CACHE_BYTES>;
+
 /// Directory filters (`tree-trigrams-v1` rows) as stored, by tree hash. A
 /// search reads the filter of every directory it opens, and the upper levels
 /// are the same for every query and for every revision that did not change
@@ -409,7 +426,11 @@ struct SizedMaps<V> {
 const HISTORY_CACHE_BYTES: usize = 96 << 20;
 
 /// Bytes the tree cache may hold, counted like [`HISTORY_CACHE_BYTES`].
-const TREE_CACHE_BYTES: usize = 32 << 20;
+const TREE_CACHE_BYTES: usize = 16 << 20;
+
+/// Bytes the decoded node cache may hold, counting a node at three times its
+/// encoding. With [`TREE_CACHE_BYTES`], the 32 MiB tree nodes always had.
+const NODE_CACHE_BYTES: usize = 16 << 20;
 
 impl<V, const BUDGET: usize> SizedCache<V, BUDGET> {
     pub(crate) fn scaled(s: CacheScale) -> Self {
@@ -499,6 +520,7 @@ pub const DEFAULT_CACHE_BYTES: usize = HISTORY_CACHE_BYTES
     + HISTORY_PART_CACHE_BYTES
     + HISTORY_ROOT_CACHE_BYTES
     + TREE_CACHE_BYTES
+    + NODE_CACHE_BYTES
     + SEARCH_TREE_CACHE_BYTES
     + crate::derived::LOG_FILTER_CACHE_BYTES;
 
@@ -544,6 +566,8 @@ impl Repo {
             land_queue_batches: None,
             land_policy: None,
             land_coordinator: None,
+            land_fast_path: true,
+            land_conflicts: Arc::default(),
             ancestry: Arc::default(),
             history_rows: Arc::default(),
             history_raw: Arc::default(),
@@ -551,6 +575,7 @@ impl Repo {
             history_parts: Arc::default(),
             history_roots: Arc::default(),
             trees: Arc::default(),
+            nodes: Arc::default(),
             search_trees: Arc::default(),
             skiplists: Arc::default(),
             log_filter: Arc::default(),
@@ -563,6 +588,7 @@ impl Repo {
             write_guard: None,
             fence_flag: Arc::default(),
             rescues_on_write: true,
+            node_memo: None,
             search_pool: None,
             search_flights: Arc::default(),
         }
@@ -631,6 +657,36 @@ impl Repo {
         self
     }
 
+    /// Whether a land none of whose paths the ref touched since its base is
+    /// copied onto the head without a three-way merge (ADR 0066), on by
+    /// default. Off replays every land in full; the answers are the same,
+    /// which is what turning it off is for (comparing, benchmarking).
+    pub fn with_land_fast_path(mut self, on: bool) -> Self {
+        self.land_fast_path = on;
+        for path in ["fast", "slow"] {
+            metrics::counter!("leep_land_replays_total", "path" => path).increment(0);
+        }
+        self
+    }
+
+    /// How a land replayed the slow way treats a path the ref also changed
+    /// since its base, per ref (ADR 0066): a three-way merge by default, or
+    /// a conflict on refs that are strict.
+    pub fn with_land_conflicts(mut self, conflicts: crate::LandConflicts) -> Self {
+        self.land_conflicts = Arc::new(conflicts);
+        self
+    }
+
+    /// See [`Repo::with_land_conflicts`].
+    pub fn land_conflicts(&self) -> &crate::LandConflicts {
+        &self.land_conflicts
+    }
+
+    /// See [`Repo::with_land_fast_path`].
+    pub fn land_fast_path(&self) -> bool {
+        self.land_fast_path
+    }
+
     /// See [`Repo::with_land_queue_batches`].
     pub fn land_queue_batches(&self) -> Option<usize> {
         self.land_queue_batches
@@ -673,6 +729,7 @@ impl Repo {
         self.history_parts = Arc::new(SizedCache::scaled(s));
         self.history_roots = Arc::new(SizedCache::scaled(s));
         self.trees = Arc::new(SizedCache::scaled(s));
+        self.nodes = Arc::new(SizedCache::scaled(s));
         self.search_trees = Arc::new(SizedCache::scaled(s));
         self.skiplists = Arc::new(SkiplistCache::scaled(s));
         self.log_filter = Arc::new(crate::derived::LogFilterCaches::scaled(s));
@@ -775,8 +832,9 @@ impl Repo {
 
     /// Validate `cs`, build its tree, and store it with its root tree,
     /// generation and skiplist rows and `extra` in one write (ADR 0031). What
-    /// it reads first (parents, their rows, blob condemnations) is read in one
-    /// round of batched queries; anything those miss is derived as before.
+    /// it reads first (parents, their rows, blob condemnations) is read in two
+    /// batched round trips, one connection at a time; anything those miss is
+    /// derived as before.
     /// Condemned parents are rescued before they are read (ADR 0059).
     async fn store_changeset(
         &self,
@@ -824,7 +882,11 @@ impl Repo {
             if client_blobs && maybe_condemned {
                 self.check_reusable(content, path.as_str()).await?;
             }
-            match self.blobs.get(content).await? {
+            // `get` may be served from a cache tier; existence must come from
+            // durable storage, which GC can change from another process.
+            // `get_stored` checks that without a second read where the
+            // backend's read already was of the durable copy.
+            match self.blobs.get_stored(content).await? {
                 None => return Err(Error::Invalid(format!("missing blob {content} for {path}"))),
                 Some(b) if b.len() as u64 != *size => {
                     return Err(Error::Invalid(format!(
@@ -833,11 +895,6 @@ impl Repo {
                     )))
                 }
                 Some(_) => {}
-            }
-            // `get` may be served from a cache tier; existence must come from
-            // durable storage, which GC can change from another process.
-            if !self.blobs.contains(content).await? {
-                return Err(Error::Invalid(format!("missing blob {content} for {path}")));
             }
         }
         let base = match (cs.parents.first(), pre.base_tree) {
@@ -940,11 +997,13 @@ impl Repo {
         }
     }
 
-    /// The stored state `store_changeset` starts from, read in one round:
-    /// whether each parent exists, the parents' generations (from the
-    /// ancestry cache where known), the first parent's root tree and skiplist,
-    /// and the condemnation rows of the contents (client changesets only;
-    /// read before the blobs are checked, as `check_reusable` requires).
+    /// The stored state `store_changeset` starts from, read in two round
+    /// trips (the changesets, then every derived kind in one
+    /// [`MetaStore::get_derived_kinds`]): whether each parent exists, the
+    /// parents' generations (from the ancestry cache where known), the first
+    /// parent's root tree and skiplist, and the condemnation rows of the
+    /// contents (client changesets only; read before the blobs are checked,
+    /// as `check_reusable` requires).
     ///
     /// Like the log's read-ahead (ADR 0030), whatever this does not supply (a
     /// failed batch, an absent or undecodable row) the caller reads or derives
@@ -976,55 +1035,65 @@ impl Repo {
         let grandparent = cached_list.as_ref().and_then(|l| l.first()).map(|e| e.id);
         let merge_keys: Vec<Hash> = first.into_iter().chain(grandparent).map(|p| p.0).collect();
         let content_keys: Vec<Hash> = contents.iter().map(|(_, h, _)| *h).collect();
-        let (stored, condemned, gens, tree, list, merges) = tokio::join!(
-            async {
-                if cs.parents.is_empty() {
-                    return Ok(Vec::new());
-                }
-                meta.get_changesets(&cs.parents).await
-            },
-            async {
-                if !client_blobs || content_keys.is_empty() {
-                    return Ok(vec![None; content_keys.len()]);
-                }
-                meta.get_derived_many(crate::gc::BLOB_CONDEMNED, &content_keys)
-                    .await
-            },
-            async {
-                if uncached.is_empty() {
-                    return Ok(Vec::new());
-                }
-                meta.get_derived_many(Generation::NAME, &uncached).await
-            },
-            async {
-                match first {
-                    Some(p) => meta.get_derived(RootTree::NAME_STR, &p.0).await,
-                    None => Ok(None),
-                }
-            },
-            async {
-                match first {
-                    Some(p) if cached_list.is_none() => {
-                        meta.get_derived(Skiplist::NAME, &p.0).await
-                    }
-                    _ => Ok(None),
-                }
-            },
-            async {
-                if cs.parents.len() != 1 {
-                    return Ok(Vec::new());
-                }
-                meta.get_derived_many(LastMerge::NAME, &merge_keys).await
-            },
-        );
-        let mut merges = merges
+        // Two round trips, one after the other, so a create holds at most one
+        // pooled connection at a time: with one connection per read, a burst
+        // of creates took the whole pool and queued the land leader behind
+        // it (ADR 0067).
+        let stored = if cs.parents.is_empty() {
+            Ok(Vec::new())
+        } else {
+            meta.get_changesets(&cs.parents).await
+        };
+        let none: &[Hash] = &[];
+        let first_key: Vec<Hash> = first.map(|p| p.0).into_iter().collect();
+        let reads: [(&str, &[Hash]); 5] = [
+            (
+                crate::gc::BLOB_CONDEMNED,
+                if client_blobs { &content_keys } else { none },
+            ),
+            (Generation::NAME, &uncached),
+            (RootTree::NAME_STR, &first_key),
+            (
+                Skiplist::NAME,
+                if cached_list.is_none() {
+                    &first_key
+                } else {
+                    none
+                },
+            ),
+            (
+                LastMerge::NAME,
+                if cs.parents.len() == 1 {
+                    &merge_keys
+                } else {
+                    none
+                },
+            ),
+        ];
+        // A failed read leaves every kind to the caller, as a failed batch
+        // did before.
+        let [condemned, gens, tree, list, merges] = match meta
+            .get_derived_kinds(&reads)
+            .await
             .ok()
+            .and_then(|r| <[_; 5]>::try_from(r).ok())
+        {
+            Some([c, g, t, l, m]) => [Some(c), Some(g), Some(t), Some(l), Some(m)],
+            None => [None, None, None, None, None],
+        };
+        let condemned = match client_blobs {
+            true => condemned,
+            false => Some(vec![None; content_keys.len()]),
+        };
+        let tree = tree.and_then(|t| t.into_iter().next().flatten());
+        let list = list.and_then(|l| l.into_iter().next().flatten());
+        let mut merges = merges
             .filter(|m| m.len() == merge_keys.len())
             .unwrap_or_default()
             .into_iter()
             .map(|v| v.and_then(|v| derived::decode_u64(&v).ok()));
         let last_merges = [merges.next().flatten(), merges.next().flatten()];
-        let mut gens = gens.ok().into_iter().flatten();
+        let mut gens = gens.into_iter().flatten();
         let parent_generations = cached
             .into_iter()
             .map(|g| {
@@ -1041,18 +1110,11 @@ impl Repo {
             first_parent,
             last_merges,
             parents_stored: stored.map(|s| s.iter().map(Option::is_some).collect()),
-            condemned: condemned.ok(),
+            condemned,
             parent_generations,
-            base_tree: tree
-                .ok()
-                .flatten()
-                .and_then(|v| derived::decode_hash(&v).ok()),
-            parent_skiplist: cached_list.or_else(|| {
-                list.ok()
-                    .flatten()
-                    .and_then(|v| Skiplist::decode(&v).ok())
-                    .map(Arc::from)
-            }),
+            base_tree: tree.and_then(|v| derived::decode_hash(&v).ok()),
+            parent_skiplist: cached_list
+                .or_else(|| list.and_then(|v| Skiplist::decode(&v).ok()).map(Arc::from)),
         }
     }
 
@@ -1194,6 +1256,20 @@ impl Repo {
 
     /// Read one tree node. The empty tree always exists.
     pub async fn read_tree(&self, tree: Hash) -> Result<TreeNode> {
+        if let Some(n) = self.node_memo.as_ref().and_then(|m| m.get(&tree)) {
+            return Ok(n);
+        }
+        if let Some(n) = self.nodes.get(&tree) {
+            return Ok((*n).clone());
+        }
+        let node = self.read_tree_stored(tree).await?;
+        if let Some(m) = &self.node_memo {
+            m.insert(tree, node.clone());
+        }
+        Ok(node)
+    }
+
+    async fn read_tree_stored(&self, tree: Hash) -> Result<TreeNode> {
         match self.blobs.get(&tree).await? {
             // A node's address is the hash of its bytes, so damage is
             // detectable. GC marks from these nodes: reading a damaged one as
@@ -1201,10 +1277,22 @@ impl Repo {
             Some(b) if Hash::of_object(TreeNode::KIND, &b) != tree => {
                 Err(Error::Storage(format!("corrupt tree node {tree}")))
             }
-            Some(b) => TreeNode::decode(&b),
+            Some(b) => {
+                let node = TreeNode::decode(&b)?;
+                self.cache_node(tree, &node, b.len());
+                Ok(node)
+            }
             None if tree == TreeNode::empty_hash() => Ok(TreeNode::default()),
             None => Err(Error::NotFound(format!("tree {tree}"))),
         }
+    }
+
+    /// Keep a node read from the store and checked against its hash. In a
+    /// staged land batch the nodes the batch wrote are answered by its memo
+    /// before the store is asked, so only stored nodes get here.
+    fn cache_node(&self, tree: Hash, node: &TreeNode, encoded_len: usize) {
+        self.nodes
+            .insert_sized(tree, Arc::new(node.clone()), 3 * encoded_len);
     }
 
     /// [`Repo::read_tree`] of each of `trees`, in order, with one
@@ -1215,7 +1303,25 @@ impl Repo {
         let mut distinct = trees.to_vec();
         distinct.sort_unstable();
         distinct.dedup();
-        let found = self.blobs.get_many(&distinct).await?;
+        let mut nodes = HashMap::with_capacity(distinct.len());
+        distinct.retain(|t| {
+            let held = match self.node_memo.as_ref().and_then(|m| m.get(t)) {
+                Some(n) => Some(n),
+                None => self.nodes.get(t).map(|n| (*n).clone()),
+            };
+            match held {
+                Some(n) => {
+                    nodes.insert(*t, n);
+                    false
+                }
+                None => true,
+            }
+        });
+        let found = if distinct.is_empty() {
+            Vec::new()
+        } else {
+            self.blobs.get_many(&distinct).await?
+        };
         if found.len() != distinct.len() {
             return Err(Error::Storage(format!(
                 "get_many answered {} of {} tree nodes",
@@ -1227,16 +1333,22 @@ impl Repo {
         for t in trees {
             *uses.entry(*t).or_default() += 1;
         }
-        let mut nodes = HashMap::with_capacity(distinct.len());
         for (tree, bytes) in distinct.into_iter().zip(found) {
             let node = match bytes {
                 Some(b) if Hash::of_object(TreeNode::KIND, &b) != tree => {
                     return Err(Error::Storage(format!("corrupt tree node {tree}")))
                 }
-                Some(b) => TreeNode::decode(&b)?,
+                Some(b) => {
+                    let node = TreeNode::decode(&b)?;
+                    self.cache_node(tree, &node, b.len());
+                    node
+                }
                 None if tree == TreeNode::empty_hash() => TreeNode::default(),
                 None => return Err(Error::NotFound(format!("tree {tree}"))),
             };
+            if let Some(m) = &self.node_memo {
+                m.insert(tree, node.clone());
+            }
             nodes.insert(tree, node);
         }
         let mut out = Vec::with_capacity(trees.len());

@@ -19,6 +19,7 @@ use leep_core::{
 use tokio::sync::oneshot;
 
 use crate::changeset_gc::RescueBy;
+use crate::land_fast::{ConflictPolicy, Lookup, WriteMap};
 use crate::land_stage::{Staging, FLUSH_WRITES_IN_FLIGHT};
 use crate::Repo;
 
@@ -44,12 +45,16 @@ pub(crate) const MAX_BATCH: usize = 64;
 pub const MAX_BATCH_LIFETIME: Duration = Duration::from_secs(60);
 
 /// Bounds of the `Retry-After` of a land refused at a full queue, in
-/// seconds (ADR 0060, section 2). The bound is sized so the whole queue
-/// waits under half a client's timeout, so a longer wait would only follow
-/// a bound set too high; the ceiling is section 1's, which every `leep`
-/// that retries refusals waits out instead of reporting.
+/// seconds (ADR 0060, section 2). The answer is the time until a slot
+/// frees, about one batch time, so the ceiling must reach the longest batch
+/// time there can be: a ceiling under it (10 s, before ADR 0066) sends
+/// clients back while the batch they wait for still runs, to be refused
+/// again (13,000 to 28,000 refusals at 1,024 agents with 20 s batches). A
+/// batch runs at most [`MAX_BATCH_LIFETIME`]; half of it covers every batch
+/// a healthy server makes, and `leep land` waits that out with its jitter
+/// (up to 45 s) inside its 60 s budget for admission waits.
 const ADMISSION_RETRY_MIN_SECS: u64 = 1;
-const ADMISSION_RETRY_MAX_SECS: u64 = 10;
+const ADMISSION_RETRY_MAX_SECS: u64 = MAX_BATCH_LIFETIME.as_secs() / 2;
 /// Weight of the newest batch in a queue's moving average of batch times.
 const BATCH_TIME_WEIGHT: f64 = 0.2;
 /// The ref log operation of a `rebase-onto` move: the git mirror's.
@@ -114,6 +119,9 @@ pub(crate) struct LandQueues {
     /// The lands each batch took, in order, for tests to replay one by one.
     #[cfg(test)]
     pub(crate) batches: Mutex<Vec<Vec<ChangesetId>>>,
+    /// What the fast path made of each replayed land, in order.
+    #[cfg(test)]
+    pub(crate) lookups: Mutex<Vec<(ChangesetId, Lookup)>>,
 }
 
 impl LandQueues {
@@ -142,6 +150,14 @@ impl LandQueues {
     #[cfg(test)]
     pub(crate) fn pending(&self, target_ref: &str) -> usize {
         lock(&self.queue(target_ref)).pending.len()
+    }
+
+    /// Tips and entries of `target_ref`'s write map.
+    #[cfg(test)]
+    pub(crate) fn write_map_size(&self, target_ref: &str) -> (usize, usize) {
+        let q = self.queue(target_ref);
+        let q = lock(&q);
+        (q.writes.tips(), q.writes.entries())
     }
 
     /// Batches `target_ref`'s queue holds, as admission counts them.
@@ -189,6 +205,10 @@ struct RefQueue {
     batch_secs: Option<f64>,
     /// [`RefQueue::batches`] as last given to [`LandQueues::report`].
     reported: usize,
+    /// What the ref's recent changesets wrote, for the fast path (ADR
+    /// 0066). The leader takes it for a batch and puts it back after; a
+    /// leader that panics loses it, and the next starts cold.
+    writes: WriteMap,
 }
 
 impl RefQueue {
@@ -510,7 +530,11 @@ async fn lead(repo: Repo, target_ref: String, queue: Arc<Mutex<RefQueue>>) {
         };
         let started = Instant::now();
         match next {
-            Next::Lands(batch) => repo.land_batch(&target_ref, batch).await,
+            Next::Lands(batch) => {
+                let mut writes = std::mem::take(&mut lock(&queue).writes);
+                repo.land_batch(&target_ref, batch, &mut writes).await;
+                lock(&queue).writes = writes;
+            }
             Next::RebaseOnto(r) => {
                 let QueuedRebase {
                     repo,
@@ -711,7 +735,10 @@ impl Repo {
             led,
         });
         if start_leader {
-            let task = tokio::spawn(lead(self.clone(), target_ref.to_string(), queue));
+            // In the land lane (ADR 0067): request handlers holding every shared
+            // metadata connection must not queue the batch they all wait on.
+            let leader = lead(self.clone(), target_ref.to_string(), queue);
+            let task = tokio::spawn(leep_core::lane::scope(leep_core::lane::Lane::Land, leader));
             self.land_queues.track(task.abort_handle());
         }
         let answer = answer.await.map_err(|_| {
@@ -869,7 +896,7 @@ impl Repo {
     /// Land a batch: replay each land onto the head the previous one left,
     /// then move the ref once. Lands answered before anything in the batch
     /// moved the ref are answered at once, as a lone land would be.
-    async fn land_batch(&self, target_ref: &str, batch: Vec<Queued>) {
+    async fn land_batch(&self, target_ref: &str, batch: Vec<Queued>, writes: &mut WriteMap) {
         let mut lands: Vec<InFlight> = batch
             .into_iter()
             .map(|q| {
@@ -929,6 +956,9 @@ impl Repo {
                 }
             };
             let mut head = start;
+            if self.land_fast_path {
+                writes.sync(start);
+            }
             // The replays write here; it is stored just before the ref moves.
             let staging = Arc::new(Staging::default());
             let ids: Vec<ChangesetId> = lands.iter().map(|l| l.q.cs).collect();
@@ -986,6 +1016,7 @@ impl Repo {
             let mut steps: Vec<RefStep> = Vec::new();
             let mut waiting: Vec<(InFlight, Result<Step>)> = Vec::new();
             let mut taken = Vec::new();
+            let replaying = Instant::now();
             for mut l in std::mem::take(&mut lands) {
                 if attempt == 1 && l.q.reply.is_closed() {
                     metrics::counter!("leep_land_cancelled_total").increment(1);
@@ -997,6 +1028,7 @@ impl Repo {
                 }
                 taken.push(l.q.cs);
                 let repo = staging.repo(&l.q.repo);
+                let fast = self.land_fast_path.then_some(&*writes);
                 let step = match recorded_step(&l.q, &recorded, attempt) {
                     Some(step) => step,
                     None if fenced => match self.rescue_land(l.q.cs, start).await {
@@ -1009,6 +1041,7 @@ impl Repo {
                                 attempt,
                                 &mut l.checked,
                                 &mut origins,
+                                fast,
                             )
                             .await
                         }
@@ -1023,6 +1056,7 @@ impl Repo {
                             attempt,
                             &mut l.checked,
                             &mut origins,
+                            fast,
                         )
                         .await
                     }
@@ -1046,6 +1080,9 @@ impl Repo {
                             new: Some(new),
                             ctx: l.q.ctx.clone(),
                         });
+                        if self.land_fast_path {
+                            staged.follow_move(writes, head, new).await;
+                        }
                         head = Some(new);
                         waiting.push((l, Ok(Step::Move(new))));
                     }
@@ -1056,6 +1093,12 @@ impl Repo {
                     Err(e) if steps.is_empty() => l.answer(Err(e), attempt, false),
                     other => waiting.push((l, other)),
                 }
+            }
+            if !taken.is_empty() {
+                metrics::histogram!("leep_land_batch_replay_seconds")
+                    .record(replaying.elapsed().as_secs_f64());
+                metrics::histogram!("leep_land_batch_tree_seconds")
+                    .record(staging.tree_time().as_secs_f64());
             }
             if attempt == 1 && !taken.is_empty() {
                 metrics::histogram!("leep_land_batch_size").record(taken.len() as f64);
@@ -1272,6 +1315,7 @@ impl Repo {
                 1,
                 &mut Checked::default(),
                 &mut HashMap::new(),
+                None,
             )
             .await?;
         match step {
@@ -1323,6 +1367,7 @@ impl Repo {
         attempt: u32,
         checked: &mut Checked,
         origins: &mut HashMap<ChangesetId, Option<ChangesetId>>,
+        fast: Option<&WriteMap>,
     ) -> Result<Step> {
         if head.is_none() && !create {
             return Err(Error::NotFound(format!(
@@ -1356,7 +1401,16 @@ impl Repo {
         self.enforce_land_policy(cs, head, target_ref, checked)
             .await?;
         match head {
-            Some(h) if !fast_forward => match self.replay_stack(cs, h, origins).await? {
+            Some(h) if !fast_forward => match self
+                .replay_stack(
+                    cs,
+                    h,
+                    origins,
+                    fast,
+                    self.land_conflicts.for_ref(target_ref),
+                )
+                .await?
+            {
                 // The stack holds `cs` at least.
                 Ok(pairs) => Ok(Step::Move(pairs.last().map_or(cs, |p| p.1))),
                 Err(resp) => Ok(Step::Done(resp)),
@@ -1582,9 +1636,14 @@ impl Repo {
         cs: ChangesetId,
         head: ChangesetId,
         origins: &mut HashMap<ChangesetId, Option<ChangesetId>>,
+        fast: Option<&WriteMap>,
+        policy: ConflictPolicy,
     ) -> Result<Result<Vec<(ChangesetId, ChangesetId)>, LandResponse>> {
         let mut stack = Vec::new();
+        let mut members = Vec::new();
         let mut fork = None;
+        // Whether `fork` is in `head`'s history (not a member whose copy is).
+        let mut trunk = false;
         let mut cur = cs;
         loop {
             let c = self.get_changeset(cur).await?;
@@ -1594,12 +1653,15 @@ impl Repo {
                 )));
             }
             stack.push(cur);
-            match c.parents.first() {
-                Some(&p) if self.is_ancestor(p, head).await? => {
+            let parent = c.parents.first().copied();
+            members.push(c);
+            match parent {
+                Some(p) if self.is_ancestor(p, head).await? => {
                     fork = Some(p);
+                    trunk = true;
                     break;
                 }
-                Some(&p) => {
+                Some(p) => {
                     if self.landed_copy(p, head, origins).await?.is_some() {
                         fork = Some(p);
                         break;
@@ -1610,20 +1672,113 @@ impl Repo {
             }
         }
 
+        let started = Instant::now();
+        if let Some(map) = fast {
+            let base = fork.filter(|_| trunk);
+            if let Some(pairs) = self.replay_fast(&stack, &members, base, head, map).await? {
+                metrics::counter!("leep_land_replays_total", "path" => "fast").increment(1);
+                metrics::histogram!("leep_land_replay_seconds", "path" => "fast")
+                    .record(started.elapsed().as_secs_f64());
+                return Ok(Ok(pairs));
+            }
+        }
+        let replayed = self.replay_slow(cs, head, &stack, fork, policy).await;
+        metrics::counter!("leep_land_replays_total", "path" => "slow").increment(1);
+        metrics::histogram!("leep_land_replay_seconds", "path" => "slow")
+            .record(started.elapsed().as_secs_f64());
+        replayed
+    }
+
+    /// The fast path (ADR 0066): when no change of the stack meets anything
+    /// the ref wrote since `base` (the tip of the ref's first-parent line
+    /// the stack starts from), each member is copied onto the head with its
+    /// own changes, less those that change nothing, and no merge. That is
+    /// what [`Repo::replay_slow`] makes of such a stack, to the byte: every
+    /// path the stack changes is as `ours` and `base` both have it, so each
+    /// three-way merge takes `theirs`, and nothing collides. `None` when the
+    /// map cannot show the stack disjoint; the slow path decides then.
+    async fn replay_fast(
+        &self,
+        stack: &[ChangesetId],
+        members: &[leep_core::Changeset],
+        base: Option<ChangesetId>,
+        head: ChangesetId,
+        map: &WriteMap,
+    ) -> Result<Option<Vec<(ChangesetId, ChangesetId)>>> {
+        let since = match base {
+            None => Err(Lookup::Ineligible),
+            Some(_) if map.head() != Some(head) => Err(Lookup::Cold),
+            Some(b) => map.base(b),
+        };
+        let since = match since {
+            Ok(s) => s,
+            Err(why) => {
+                self.note_lookup(stack[0], why);
+                return Ok(None);
+            }
+        };
+        let touched = members
+            .iter()
+            .flat_map(|c| c.changes.keys())
+            .any(|p| map.touched_since(since, p.as_str()));
+        if touched {
+            self.note_lookup(stack[0], Lookup::Overlap);
+            return Ok(None);
+        }
+        self.note_lookup(stack[0], Lookup::Hit);
+        let mut onto = head;
+        let mut pairs = Vec::with_capacity(stack.len());
+        for (&id, c) in stack.iter().zip(members).rev() {
+            let parent = c.parents[0];
+            // As `rebase` answers a changeset already on `onto`.
+            if parent == onto {
+                pairs.push((id, id));
+                onto = id;
+                continue;
+            }
+            self.rescue_changesets(&[id, onto], RescueBy::Create)
+                .await?;
+            let changes = self.effective_changes(parent, &c.changes).await?;
+            let copy = self.rebased_copy(id, onto, changes).await?;
+            pairs.push((id, copy));
+            onto = copy;
+        }
+        Ok(Some(pairs))
+    }
+
+    fn note_lookup(&self, cs: ChangesetId, lookup: Lookup) {
+        lookup.record();
+        #[cfg(test)]
+        self.land_queues.lookups.lock().unwrap().push((cs, lookup));
+        #[cfg(not(test))]
+        let _ = cs;
+    }
+
+    /// The slow path: rebase each member of `stack` (newest first) onto the
+    /// head with a three-way merge, or answer the conflicts.
+    async fn replay_slow(
+        &self,
+        cs: ChangesetId,
+        head: ChangesetId,
+        stack: &[ChangesetId],
+        fork: Option<ChangesetId>,
+        policy: ConflictPolicy,
+    ) -> Result<Result<Vec<(ChangesetId, ChangesetId)>, LandResponse>> {
         let mut onto = head;
         let mut pairs = Vec::with_capacity(stack.len());
         for &id in stack.iter().rev() {
-            match self.rebase(id, onto).await? {
+            match self.rebase_as(id, onto, policy).await? {
                 RebaseResponse::Rebased { id: copy } => {
                     pairs.push((id, copy));
                     onto = copy;
                 }
                 RebaseResponse::Conflicts { .. } => {
                     let m = self
-                        .merge_trees(
+                        .merge_trees_as(
                             self.tree_or_empty(fork).await?,
                             self.root_tree(head).await?,
                             self.root_tree(cs).await?,
+                            policy,
                         )
                         .await?;
                     if m.conflicts.is_empty() {
@@ -1750,7 +1905,10 @@ impl Repo {
             !std::mem::replace(&mut q.leading, true)
         };
         if start_leader {
-            let task = tokio::spawn(lead(self.clone(), target_ref.to_string(), queue));
+            // In the land lane (ADR 0067): request handlers holding every shared
+            // metadata connection must not queue the batch they all wait on.
+            let leader = lead(self.clone(), target_ref.to_string(), queue);
+            let task = tokio::spawn(leep_core::lane::scope(leep_core::lane::Lane::Land, leader));
             self.land_queues.track(task.abort_handle());
         }
         answer.await.unwrap_or_else(|_| {
@@ -1906,7 +2064,10 @@ impl Repo {
             });
         }
         let staged = staging.repo(self);
-        match staged.replay_stack(head, onto, &mut HashMap::new()).await? {
+        match staged
+            .replay_stack(head, onto, &mut HashMap::new(), None, ConflictPolicy::Merge)
+            .await?
+        {
             Ok(rebased) => Ok(Replayed::Move {
                 head: rebased.last().map_or(onto, |p| p.1),
                 rebased,
@@ -1998,7 +2159,8 @@ mod tests {
         q.record_batch(secs(2.5));
         assert_eq!(q.retry_after_secs(1), 3);
         assert_eq!(q.retry_after_secs(2), 5);
-        assert_eq!(q.retry_after_secs(5), ADMISSION_RETRY_MAX_SECS);
+        assert_eq!(q.retry_after_secs(5), 13);
+        assert_eq!(q.retry_after_secs(20), ADMISSION_RETRY_MAX_SECS);
         let mut fast = RefQueue::default();
         fast.record_batch(secs(0.01));
         assert_eq!(fast.retry_after_secs(3), ADMISSION_RETRY_MIN_SECS);
@@ -2030,6 +2192,18 @@ mod tests {
         // Never more than the clamp.
         let mut q = queue(3 * MAX_BATCH, true);
         q.record_batch(secs(9.0));
+        assert_eq!(q.refused_retry_after_secs(1), ADMISSION_RETRY_MAX_SECS);
+    }
+
+    /// Slow batches are waited out, not raced: a 20 s batch gets 20 s, and
+    /// the ceiling follows the longest a batch may run.
+    #[test]
+    fn retry_after_reaches_the_batch_time_of_slow_batches() {
+        assert_eq!(ADMISSION_RETRY_MAX_SECS, MAX_BATCH_LIFETIME.as_secs() / 2);
+        let mut q = queue(MAX_BATCH, true);
+        q.record_batch(secs(20.0));
+        assert_eq!(q.refused_retry_after_secs(2), 20);
+        // Twice that is past the ceiling.
         assert_eq!(q.refused_retry_after_secs(1), ADMISSION_RETRY_MAX_SECS);
     }
 

@@ -294,7 +294,7 @@ fn assert_not_admitted(r: &Reply) {
         .unwrap()
         .parse()
         .unwrap();
-    assert!((1..=10).contains(&secs), "Retry-After {secs}");
+    assert!((1..=30).contains(&secs), "Retry-After {secs}");
     let e = r.error();
     assert_eq!(e.code.as_deref(), Some("unavailable"));
     assert!(e.error.contains("--land-queue-batches"), "{}", e.error);
@@ -558,7 +558,7 @@ fn a_follower_relays_the_leaders_refusal_unchanged() {
         let h = relayed.headers().clone();
         assert_eq!(h[REFUSED_HEADER], REFUSED_ADMISSION);
         let secs: u64 = h["retry-after"].to_str().unwrap().parse().unwrap();
-        assert!((1..=10).contains(&secs), "Retry-After {secs}");
+        assert!((1..=30).contains(&secs), "Retry-After {secs}");
         assert!(h.get("leep-land-not-leader").is_none());
         let e: ErrorResponse = serde_json::from_slice(&relayed.bytes().await.unwrap()).unwrap();
         assert_eq!(e.code.as_deref(), Some("unavailable"));

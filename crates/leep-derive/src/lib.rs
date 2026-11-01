@@ -27,6 +27,7 @@ pub mod indexing;
 pub mod integrity;
 mod land;
 pub mod land_coord;
+mod land_fast;
 mod land_stage;
 mod merge;
 pub mod owners;
@@ -58,6 +59,8 @@ mod land_batch_tests;
 #[cfg(test)]
 mod land_coord_tests;
 #[cfg(test)]
+mod land_fast_tests;
+#[cfg(test)]
 mod page_tests;
 #[cfg(test)]
 mod path_page_tests;
@@ -72,6 +75,7 @@ pub use comments::strip_comments;
 pub use cursor::MAX_CURSOR_CHARS;
 pub use history::{ExtraMatch, LogFilter, LogPage, LogParams};
 pub use land::{GIT_MIRROR_OPERATION, MAX_BATCH_LIFETIME};
+pub use land_fast::{ConflictPolicy, LandConflicts};
 pub use repo::{
     default_derive_jobs, PrefixMatch, Repo, DEFAULT_CACHE_BYTES, MAX_DEFAULT_DERIVE_JOBS,
     MAX_PREFIX_CANDIDATES,

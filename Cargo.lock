@@ -2563,6 +2563,7 @@ dependencies = [
  "bytes",
  "leep-core",
  "leep-testkit",
+ "metrics",
  "sqlx",
  "tempfile",
  "tokio",

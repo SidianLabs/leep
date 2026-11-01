@@ -10,6 +10,7 @@ pub mod error;
 pub mod fsync;
 pub mod hash;
 pub mod intern;
+pub mod lane;
 pub mod memory;
 pub mod path;
 pub mod prefix;

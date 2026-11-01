@@ -1285,6 +1285,8 @@ async fn bounded_scan_over_budget_reads_a_bounded_part_of_a_cold_tree() {
     let root = r.root_tree(c).await.unwrap();
     let nodes = tree_shape(&r, root).await.len() as u64;
     assert_eq!(nodes, 1 + 12 + 144 + 1_728);
+    // Cold: a fresh handle, whose node cache holds nothing yet.
+    let r = Repo::new(blobs.clone(), probe.clone());
 
     let scan_with = |search_files: usize| {
         Arc::new(SearchScan::new(&Budgets {
@@ -1319,7 +1321,9 @@ async fn bounded_scan_over_budget_reads_a_bounded_part_of_a_cold_tree() {
     assert!(read_nodes <= 1 + 12 + 144, "{read_nodes} tree nodes read");
     assert!(read_rows <= 1 + 12 + 144, "{read_rows} filter keys read");
 
-    // Within budget the scan reads everything, and fetches every file.
+    // Within budget the scan reads everything, and fetches every file
+    // (again from a cold handle).
+    let r = Repo::new(blobs.clone(), probe.clone());
     let scan = scan_with(10_000);
     let before = count();
     let counters = crate::search::index::Counters::scanning(scan.clone());

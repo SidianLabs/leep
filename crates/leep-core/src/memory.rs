@@ -76,6 +76,10 @@ impl BlobStore for MemoryBlobStore {
         Ok(self.blobs.lock().unwrap().get(hash).map(|e| e.data.clone()))
     }
 
+    async fn get_stored(&self, hash: &Hash) -> Result<Option<Bytes>> {
+        self.get(hash).await
+    }
+
     async fn list_page(&self, after: Option<Hash>, limit: usize) -> Result<Vec<BlobMeta>> {
         let lower = after.map_or(Bound::Unbounded, Bound::Excluded);
         Ok(self
@@ -1186,6 +1190,31 @@ async fn check_batched_reads(store: &dyn MetaStore) {
         store.get_derived_many("bd-b", &[key(9)]).await.unwrap(),
         vec![Some(Bytes::from_static(b"b9"))]
     );
+    // Several kinds at once answer as `get_derived_many` per read, empty
+    // and repeated reads included.
+    let none: &[Hash] = &[];
+    let b_keys = [key(9), key(2)];
+    let reads: Vec<(&str, &[Hash])> = vec![
+        ("bd-a", &ask),
+        ("bd-b", &b_keys),
+        ("bd-a", none),
+        ("bd-missing", &ask[..2]),
+        ("bd-a", &ask[1..3]),
+    ];
+    let got = store.get_derived_kinds(&reads).await.unwrap();
+    assert_eq!(got.len(), reads.len(), "one answer per read");
+    for ((kind, keys), answer) in reads.iter().zip(&got) {
+        assert_eq!(
+            answer,
+            &store.get_derived_many(kind, keys).await.unwrap(),
+            "get_derived_kinds read {kind} as get_derived_many"
+        );
+    }
+    assert!(store.get_derived_kinds(&[]).await.unwrap().is_empty());
+    assert_eq!(
+        store.get_derived_kinds(&[("bd-a", none)]).await.unwrap(),
+        vec![Vec::<Option<Bytes>>::new()]
+    );
     // Larger than any reasonable statement parameter limit per batch.
     let many: Vec<Hash> = (0..2500).map(|n| key(n % 6)).collect();
     let got = store.get_derived_many("bd-a", &many).await.unwrap();
@@ -2095,6 +2124,8 @@ pub async fn check_blob_store_contract(store: &dyn BlobStore) {
     let other = Hash::of_blob(b"absent");
     assert!(store.get(&other).await.unwrap().is_none());
     assert!(!store.contains(&other).await.unwrap());
+    assert_eq!(store.get_stored(&h).await.unwrap(), Some(data.clone()));
+    assert_eq!(store.get_stored(&other).await.unwrap(), None);
 
     let custom = Hash::of_object("tree-v1", b"node");
     store

@@ -71,6 +71,18 @@ struct Args {
         value_parser = clap::value_parser!(u32).range(1..=10_000),
     )]
     meta_pool_size: u32,
+    /// Postgres connections reserved, beyond --meta-pool-size, for land
+    /// leaders and their ref moves (ADR 0067), so request handlers holding
+    /// every connection of the shared pool cannot queue the lands they wait
+    /// for. Default: an eighth of --meta-pool-size, at least 4. 0 reserves
+    /// none (leaders share the pool). Opened on first use; SQLite ignores it.
+    #[arg(
+        long,
+        global = true,
+        env = "LEEP_META_LAND_POOL_SIZE",
+        value_parser = clap::value_parser!(u32).range(0..=10_000),
+    )]
+    meta_land_pool_size: Option<u32>,
     /// Bytes the in-memory caches of derived indexes (path history, trees,
     /// search's directory filters, filtered log) may hold; the ancestry and
     /// skiplist caches scale with it. Separate from --cache-bytes, which
@@ -294,6 +306,27 @@ struct Args {
     /// off while clients that do not resend a refused land remain.
     #[arg(long, env = "LEEP_LAND_QUEUE_BATCHES", value_parser = parse_count_or_off, default_value = "4")]
     land_queue_batches: CountOrOff,
+    /// Copy a land onto the ref without a three-way merge when nothing the
+    /// ref changed since the land's base touches its paths (ADR 0066). The
+    /// answers are the same either way; `off` replays every land in full,
+    /// for comparison.
+    #[arg(long, env = "LEEP_LAND_FAST_PATH", value_enum, default_value_t = Switch::On)]
+    land_fast_path: Switch,
+    /// What a land replayed with a merge makes of a file the ref also
+    /// changed since the land's base (ADR 0066): `merge` merges it three
+    /// ways and conflicts only where the changes clash; `strict` answers
+    /// every such file as a conflict, for the client to redo on the new
+    /// head.
+    #[arg(long, env = "LEEP_LAND_CONFLICTS", value_enum, default_value_t = LandConflictsArg::Merge)]
+    land_conflicts: LandConflictsArg,
+    /// A ref whose lands follow `strict` whatever --land-conflicts says.
+    /// Repeatable; the environment variable takes a comma-separated list.
+    #[arg(
+        long = "strict-land-ref",
+        env = "LEEP_STRICT_LAND_REFS",
+        value_delimiter = ','
+    )]
+    strict_land_refs: Vec<String>,
     #[command(subcommand)]
     command: Option<Cmd>,
 }
@@ -302,6 +335,18 @@ struct Args {
 enum Coordination {
     On,
     Off,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum Switch {
+    On,
+    Off,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum LandConflictsArg {
+    Merge,
+    Strict,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -541,6 +586,11 @@ static NO_MIGRATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool
 static META_POOL_SIZE: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(leep_meta::DEFAULT_POSTGRES_POOL_SIZE);
 
+/// Set once from `--meta-land-pool-size`; read by [`open_meta`]. `u32::MAX`
+/// until set: the default for the pool size.
+static META_LAND_POOL_SIZE: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(u32::MAX);
+
 /// Set once from `--derive-cache-bytes`; read by [`new_repo`].
 static DERIVE_CACHE_BYTES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(leep_derive::DEFAULT_CACHE_BYTES);
@@ -572,7 +622,9 @@ async fn open_meta_bounded(
         leep_meta::SchemaMode::Migrate
     };
     let pool = META_POOL_SIZE.load(std::sync::atomic::Ordering::Relaxed);
-    leep_meta::open_meta_store_with_options(url, mode, pool, statement_timeout).await
+    let land = Some(META_LAND_POOL_SIZE.load(std::sync::atomic::Ordering::Relaxed))
+        .filter(|&n| n != u32::MAX);
+    leep_meta::open_meta_store_with_lanes(url, mode, pool, land, statement_timeout).await
 }
 
 /// Added to --request-timeout for the default statement bound, so a request
@@ -1152,6 +1204,15 @@ mod local_dirs_tests {
     }
 }
 
+/// `--land-conflicts` and `--strict-land-ref` as the repository takes them.
+fn land_conflicts(args: &Args) -> leep_derive::LandConflicts {
+    let default = match args.land_conflicts {
+        LandConflictsArg::Merge => leep_derive::ConflictPolicy::Merge,
+        LandConflictsArg::Strict => leep_derive::ConflictPolicy::Strict,
+    };
+    leep_derive::LandConflicts::new(default, args.strict_land_refs.iter().cloned())
+}
+
 /// Install the global Prometheus recorder; returns the `/metrics` app.
 fn install_metrics() -> anyhow::Result<axum::Router> {
     use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
@@ -1311,6 +1372,9 @@ async fn run() -> anyhow::Result<()> {
     }
     NO_MIGRATE.store(args.no_migrate, std::sync::atomic::Ordering::Relaxed);
     META_POOL_SIZE.store(args.meta_pool_size, std::sync::atomic::Ordering::Relaxed);
+    if let Some(n) = args.meta_land_pool_size {
+        META_LAND_POOL_SIZE.store(n, std::sync::atomic::Ordering::Relaxed);
+    }
     DERIVE_CACHE_BYTES.store(
         args.derive_cache_bytes,
         std::sync::atomic::Ordering::Relaxed,
@@ -1594,6 +1658,9 @@ async fn run() -> anyhow::Result<()> {
         CountOrOff::Off => None,
         CountOrOff::Count(n) => Some(n),
     });
+    repo = repo
+        .with_land_fast_path(args.land_fast_path == Switch::On)
+        .with_land_conflicts(land_conflicts(&args));
     leep_server::reload::warn_missing_refs(repo.meta().as_ref(), &config.current()).await;
     if args.request_timeout.is_zero() {
         tracing::warn!("request timeout disabled: gc --fence cannot be guaranteed safe");
@@ -1664,6 +1731,12 @@ async fn run() -> anyhow::Result<()> {
         search_pool_permits = ?search_pool,
         land_queue_batches = ?repo.land_queue_batches(),
         "expensive read and land admission limits (ADR 0060)"
+    );
+    tracing::info!(
+        land_fast_path = repo.land_fast_path(),
+        land_conflicts = repo.land_conflicts().for_ref("").name(),
+        strict_land_refs = ?args.strict_land_refs,
+        "land replay (ADR 0066)"
     );
     let mut app = leep_server::router_with_read_limits(
         repo,
@@ -1923,6 +1996,9 @@ impl BlobStore for ArcBlobs {
     async fn contains(&self, hash: &leep_core::Hash) -> leep_core::Result<bool> {
         self.0.contains(hash).await
     }
+    async fn get_stored(&self, hash: &leep_core::Hash) -> leep_core::Result<Option<bytes::Bytes>> {
+        self.0.get_stored(hash).await
+    }
     async fn contains_many(&self, hashes: &[leep_core::Hash]) -> leep_core::Result<Vec<bool>> {
         self.0.contains_many(hashes).await
     }
@@ -1961,6 +2037,7 @@ mod tests {
             vec!["--blobs", "mem://b"],
             vec!["--no-migrate"],
             vec!["--meta-pool-size", "7"],
+            vec!["--meta-land-pool-size", "3"],
             vec!["--derive-cache-bytes", "1234"],
             vec!["--request-timeout", "90s"],
             vec!["--meta-statement-timeout", "30s"],
@@ -1972,6 +2049,7 @@ mod tests {
         assert_eq!(a.blobs, "mem://b", "{argv:?}");
         assert!(a.no_migrate, "{argv:?}");
         assert_eq!(a.meta_pool_size, 7, "{argv:?}");
+        assert_eq!(a.meta_land_pool_size, Some(3), "{argv:?}");
         assert_eq!(a.derive_cache_bytes, 1234, "{argv:?}");
         assert_eq!(a.request_timeout, Duration::from_secs(90), "{argv:?}");
         assert_eq!(
@@ -2057,6 +2135,32 @@ mod tests {
             .map(|e| e.to_string_lossy().into_owned())
             .collect();
         assert_eq!(listed, read, "{path} and the flags' variables differ");
+    }
+
+    /// The fast path is on and same-file overlaps merge unless configured.
+    #[test]
+    fn land_replay_defaults_to_the_fast_path_and_merging() {
+        let a = parse_args(["leep-server"]).unwrap();
+        assert!(a.land_fast_path == Switch::On);
+        let c = land_conflicts(&a);
+        assert_eq!(c.for_ref("main"), leep_derive::ConflictPolicy::Merge);
+        let a = parse_args([
+            "leep-server",
+            "--land-fast-path",
+            "off",
+            "--strict-land-ref",
+            "prod",
+        ])
+        .unwrap();
+        assert!(a.land_fast_path == Switch::Off);
+        let c = land_conflicts(&a);
+        assert_eq!(c.for_ref("prod"), leep_derive::ConflictPolicy::Strict);
+        assert_eq!(c.for_ref("main"), leep_derive::ConflictPolicy::Merge);
+        let a = parse_args(["leep-server", "--land-conflicts", "strict"]).unwrap();
+        assert_eq!(
+            land_conflicts(&a).for_ref("main"),
+            leep_derive::ConflictPolicy::Strict
+        );
     }
 
     /// Admission is on by default (ADR 0060, E5c); `off` still turns it off.

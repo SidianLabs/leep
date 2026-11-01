@@ -41,6 +41,56 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   changesets that connect the shown ones, and ignored with `--json`. No API
   change: the graph is drawn from each entry's parents. See docs/CLI.md,
   "Long listings".
+### Faster lands onto busy refs
+- **Changed.** A land none of whose files the ref changed since its base is
+  copied onto the head without a three-way merge (the fast path). Its
+  copies are the ones the merge made, to the byte. The leader of each ref
+  remembers, in memory, which paths the ref's last 4,096 changesets wrote;
+  lands it cannot vouch for (a base it has not seen since it started
+  leading, an overlap, a stack on its own landed copy) replay as before.
+  `--land-fast-path off` (`LEEP_LAND_FAST_PATH`) replays every land in full;
+  the answers are the same. See ADR 0066.
+- **Changed.** A replayed land's merge reads the head only at the paths the
+  land changed, instead of diffing everything the ref changed since the
+  land's base, so a land based far back costs as much as its own change.
+  Conflict answers are unchanged.
+- **Changed.** A batch builds each copy's tree on the directories the copy
+  before it wrote, in memory, and encodes each tree node once.
+- **Fixed.** A land that replaces a directory with a file, onto a ref that
+  added files to that directory since the land's base, failed with 400
+  (`d is a directory`). It is now answered as a conflict on that path.
+- **Changed.** A land refused at a full queue is told to come back after
+  up to 30 s (half of the 60 s a batch may run) instead of at most 10 s, so
+  clients no longer return while a slow batch still runs.
+- **Changed.** Tree nodes read from the store are cached decoded (16 MiB of
+  the existing 32 MiB tree cache budget), so lands, diffs and merges stop
+  re-reading the head's upper directories.
+- **Added.** `--land-conflicts merge|strict` (`LEEP_LAND_CONFLICTS`) and
+  `--strict-land-ref REF` (`LEEP_STRICT_LAND_REFS`). `strict` answers any
+  file both the ref and a land changed since the land's base as a conflict,
+  even one that would merge cleanly; `merge`, the default, merges as before.
+- **Added.** Metrics `leep_land_replays_total{path}`,
+  `leep_land_replay_seconds{path}`, `leep_land_fast_map_total{result}`,
+  `leep_land_fast_map_resets_total`, `leep_land_batch_replay_seconds` and
+  `leep_land_batch_tree_seconds` (docs/OPERATIONS.md).
+### Land leaders keep metadata connections under load
+- **Changed.** The leader of a ref's land batch now uses Postgres
+  connections reserved for it, so request handlers holding the whole pool
+  no longer queue the batch every land waits for. At 1,024 agents with a
+  pool of 32, the mean `leep_land_lock_wait_seconds` had risen from 22 ms
+  to 4-7 s that way. New global flag `--meta-land-pool-size`
+  (`LEEP_META_LAND_POOL_SIZE`), default an eighth of `--meta-pool-size`
+  and at least 4, opened on first use; `0` shares the pool as before.
+  A server with default flags may therefore open 4 more Postgres
+  connections. SQLite ignores it. See ADR 0067.
+- **Changed.** Creating a changeset reads its inputs in two round trips on
+  one connection at a time instead of up to six queries on six connections
+  at once, and reads each named blob once instead of twice where the blob
+  store's read is already of the durable copy (filesystem and object
+  stores, loose blobs).
+- **Added.** Gauge `leep_meta_pool_connections{pool, state}`: open
+  connections of the `data` and `land` metadata pools, `in_use` and
+  `idle`.
 
 ### Blame follows renames and merged branches
 - **Fixed.** `blame` credited every line of a moved file to the changeset

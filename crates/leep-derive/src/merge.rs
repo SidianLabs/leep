@@ -1,10 +1,10 @@
 //! Three-way tree merge, plus `merge` and `rebase` built on it.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use leep_core::api::{Conflict, FileInfo, MergeRequest, MergeResponse, RebaseResponse};
+use leep_core::api::{Conflict, DiffEntry, FileInfo, MergeRequest, MergeResponse, RebaseResponse};
 use leep_core::changeset::EXTRA_REBASED_FROM;
 use leep_core::{
     Changeset, ChangesetId, Error, FileChange, FileKind, Hash, RepoPath, Result, TreeEntry,
@@ -12,7 +12,7 @@ use leep_core::{
 };
 
 use crate::changeset_gc::RescueBy;
-use crate::Repo;
+use crate::{ConflictPolicy, Repo};
 
 /// Result of merging `theirs` into `ours`: `changes` are relative to `ours`.
 pub(crate) struct TreeMerge {
@@ -140,9 +140,10 @@ impl Repo {
     }
 
     /// Would setting `p` clash with a file/directory already in `ours`?
+    /// `at` holds `ours`' entry at `p` and at each of its directories.
     async fn collides(
         &self,
-        ours: Hash,
+        at: &HashMap<String, Option<TreeEntry>>,
         p: &RepoPath,
         changes: &BTreeMap<RepoPath, FileChange>,
     ) -> Result<bool> {
@@ -152,12 +153,20 @@ impl Repo {
                 prefix.push('/');
             }
             prefix.push_str(comp);
-            let entry = self.entry_at(ours, &prefix).await?;
+            let entry = at.get(&prefix).cloned().flatten();
             if prefix == p.as_str() {
-                return Ok(matches!(entry, Some(TreeEntry::Dir { .. }))
-                    && !changes
-                        .iter()
-                        .any(|(k, c)| k.is_within(p.as_str()) && matches!(c, FileChange::Delete)));
+                let Some(TreeEntry::Dir { tree }) = entry else {
+                    return Ok(false);
+                };
+                // The file fits only if every file `ours` has below `p` goes:
+                // `ours` may have added some there since the base.
+                let below = self.diff_trees(TreeNode::empty_hash(), tree, "").await?;
+                return Ok(below.iter().any(|e| {
+                    let path = format!("{}/{}", p.as_str(), e.path.as_str());
+                    !RepoPath::new(path)
+                        .ok()
+                        .is_some_and(|q| changes.get(&q) == Some(&FileChange::Delete))
+                }));
             }
             match entry {
                 Some(TreeEntry::File { .. }) => {
@@ -175,8 +184,65 @@ impl Repo {
         Ok(false)
     }
 
+    /// `ours`' entries at `p` and its directories, one `entry_at` each: the
+    /// oracle for the batched read.
+    #[cfg(test)]
+    async fn walk_entries(
+        &self,
+        ours: Hash,
+        p: &RepoPath,
+    ) -> Result<HashMap<String, Option<TreeEntry>>> {
+        let mut out = HashMap::new();
+        let s = p.as_str();
+        for k in s.match_indices('/').map(|(i, _)| &s[..i]).chain([s]) {
+            out.insert(k.to_string(), self.entry_at(ours, k).await?);
+        }
+        Ok(out)
+    }
+
     /// Three-way merge of trees; `changes` apply on top of `ours`.
+    ///
+    /// Only `theirs` is diffed against `base`. `ours` is read at the paths
+    /// that diff names and nowhere else, so a merge costs the size of
+    /// `theirs`' change, not of everything `ours` did since `base` (a land
+    /// onto a busy ref). The file `ours` has at a path is what a full diff
+    /// from `base` would give there: the diff's new side where it lists
+    /// the path, and otherwise `base`'s file, which `ours` still has.
     pub(crate) async fn merge_trees(
+        &self,
+        base: Hash,
+        ours: Hash,
+        theirs: Hash,
+    ) -> Result<TreeMerge> {
+        self.merge_trees_as(base, ours, theirs, ConflictPolicy::Merge)
+            .await
+    }
+
+    /// [`Repo::merge_trees`] under `policy`: [`ConflictPolicy::Strict`]
+    /// answers every path both sides changed since `base` as a conflict,
+    /// even one a three-way merge would resolve (ADR 0066).
+    pub(crate) async fn merge_trees_as(
+        &self,
+        base: Hash,
+        ours: Hash,
+        theirs: Hash,
+        policy: ConflictPolicy,
+    ) -> Result<TreeMerge> {
+        let theirs_diff = self.diff_trees(base, theirs, "").await?;
+        let paths: Vec<&RepoPath> = theirs_diff.iter().map(|e| &e.path).collect();
+        let ours_at: HashMap<RepoPath, Option<FileInfo>> = if ours == base {
+            HashMap::new()
+        } else {
+            self.files_at(ours, &paths).await?
+        };
+        self.resolve_merge(ours, theirs_diff, ours_at, policy).await
+    }
+
+    /// [`Repo::merge_trees`] the way it was before it read `ours` only at
+    /// `theirs`' paths: from a diff of the whole of `ours` against `base`.
+    /// The oracle the restricted read is checked against.
+    #[cfg(test)]
+    pub(crate) async fn merge_trees_full(
         &self,
         base: Hash,
         ours: Hash,
@@ -188,14 +254,42 @@ impl Repo {
             .into_iter()
             .map(|e| (e.path, e.new))
             .collect();
+        let theirs_diff = self.diff_trees(base, theirs, "").await?;
+        let ours_at = theirs_diff
+            .iter()
+            .filter_map(|e| Some((e.path.clone(), ours_diff.get(&e.path)?.clone())))
+            .collect();
+        self.resolve_merge(ours, theirs_diff, ours_at, ConflictPolicy::Merge)
+            .await
+    }
+
+    /// Resolve each entry of `theirs_diff` against `ours`' file at its path
+    /// (`ours_at`; a path missing there is unchanged from `base`).
+    async fn resolve_merge(
+        &self,
+        ours: Hash,
+        theirs_diff: Vec<DiffEntry>,
+        mut ours_at: HashMap<RepoPath, Option<FileInfo>>,
+        policy: ConflictPolicy,
+    ) -> Result<TreeMerge> {
         let mut changes = BTreeMap::new();
         let mut conflicts = Vec::new();
         let mut taken = Vec::new();
-        for e in self.diff_trees(base, theirs, "").await? {
-            let our_info = match ours_diff.get(&e.path) {
-                Some(n) => n.clone(),
+        for e in theirs_diff {
+            let our_info = match ours_at.remove(&e.path) {
+                Some(n) => n,
                 None => e.old.clone(),
             };
+            if policy == ConflictPolicy::Strict && our_info != e.old {
+                conflicts.push(Conflict {
+                    path: e.path,
+                    base: e.old,
+                    ours: our_info,
+                    theirs: e.new,
+                    merged_with_markers: None,
+                });
+                continue;
+            }
             match self.resolve3(&e.old, &our_info, &e.new).await? {
                 Resolved::Keep => {}
                 Resolved::Set(c) => {
@@ -211,10 +305,36 @@ impl Repo {
                 }),
             }
         }
+        // `ours`' entries at every modified path and its directories, in
+        // one batched read per level, for the collision checks.
+        let mut wanted: BTreeSet<&str> = BTreeSet::new();
+        for (path, ..) in &taken {
+            if matches!(changes.get(path), Some(FileChange::Modify { .. })) {
+                let s = path.as_str();
+                wanted.extend(s.match_indices('/').map(|(i, _)| &s[..i]));
+                wanted.insert(s);
+            }
+        }
+        let wanted: Vec<&str> = wanted.into_iter().collect();
+        let at = if wanted.is_empty() {
+            HashMap::new()
+        } else {
+            self.entries_at(ours, &wanted).await?
+        };
         for (path, old, our_info, new) in taken {
-            if matches!(changes.get(&path), Some(FileChange::Modify { .. }))
-                && self.collides(ours, &path, &changes).await?
-            {
+            let modify = matches!(changes.get(&path), Some(FileChange::Modify { .. }));
+            // Under test, every check is made both ways: from the batched
+            // entries and by walking `ours` from its root.
+            #[cfg(test)]
+            if modify {
+                let walked = self.walk_entries(ours, &path).await?;
+                assert_eq!(
+                    self.collides(&at, &path, &changes).await?,
+                    self.collides(&walked, &path, &changes).await?,
+                    "{path}"
+                );
+            }
+            if modify && self.collides(&at, &path, &changes).await? {
                 changes.remove(&path);
                 conflicts.push(Conflict {
                     path,
@@ -271,6 +391,16 @@ impl Repo {
 
     /// Replay `cs`'s changes (relative to its first parent) onto `onto`.
     pub async fn rebase(&self, cs: ChangesetId, onto: ChangesetId) -> Result<RebaseResponse> {
+        self.rebase_as(cs, onto, ConflictPolicy::Merge).await
+    }
+
+    /// [`Repo::rebase`] with `policy` deciding same-path overlaps.
+    pub(crate) async fn rebase_as(
+        &self,
+        cs: ChangesetId,
+        onto: ChangesetId,
+        policy: ConflictPolicy,
+    ) -> Result<RebaseResponse> {
         // The copy's link names `cs`, and its parent is `onto`.
         self.rescue_changesets(&[cs, onto], RescueBy::Create)
             .await?;
@@ -283,10 +413,11 @@ impl Repo {
         }
         self.get_changeset(onto).await?;
         let m = self
-            .merge_trees(
+            .merge_trees_as(
                 self.tree_or_empty(orig.parents.first().copied()).await?,
                 self.root_tree(onto).await?,
                 self.root_tree(cs).await?,
+                policy,
             )
             .await?;
         if !m.conflicts.is_empty() {

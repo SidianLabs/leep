@@ -272,6 +272,25 @@ impl BlobStore for FsBlobStore {
         .await
     }
 
+    /// A loose file read is the durable copy. A packed one may come from a
+    /// pack view older than a tombstone, so it is checked as `contains`
+    /// checks.
+    async fn get_stored(&self, hash: &Hash) -> Result<Option<Bytes>> {
+        let path = self.path_for(hash);
+        let hash = *hash;
+        self.blocking(move |p| match std::fs::read(&path) {
+            Ok(v) => Ok(Some(v.into())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => match p.get(&hash)? {
+                Some(b) if p.contains(&hash)? || path.try_exists().map_err(storage_err)? => {
+                    Ok(Some(b))
+                }
+                _ => Ok(None),
+            },
+            Err(e) => Err(storage_err(e)),
+        })
+        .await
+    }
+
     /// Split over up to [`READ_TASKS`] blocking tasks, each of which first
     /// asks the kernel for every pack frame its blobs need (see
     /// [`PackSet::prefetch`]), so a cold read of many packed objects waits on

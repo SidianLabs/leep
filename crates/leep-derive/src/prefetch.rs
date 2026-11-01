@@ -157,7 +157,16 @@ impl ReadAhead {
         // costs about as much as waiting for them, runs on several threads.
         let tasks: Vec<_> = batches
             .into_iter()
-            .map(|(batch, gens)| tokio::spawn(read_batch(repo.clone(), batch, gens, roots)))
+            .map(|(batch, gens)| {
+                // In the reader's metadata lane: a land leader's prefetch
+                // stays on its reserved pool (ADR 0067).
+                tokio::spawn(leep_core::lane::inherit(read_batch(
+                    repo.clone(),
+                    batch,
+                    gens,
+                    roots,
+                )))
+            })
             .collect();
         for task in tasks {
             // A batch whose task failed only loses its read-ahead, like a

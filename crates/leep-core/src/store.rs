@@ -405,6 +405,19 @@ pub trait BlobStore: Send + Sync + 'static {
         Ok(self.get(hash).await?.is_some())
     }
 
+    /// [`get`](Self::get), answering `None` unless the blob is in durable
+    /// storage now: what a caller about to make the blob reachable needs,
+    /// since `get` may be answered from a cache tier while garbage collection
+    /// in another process deletes the stored copy. The default is `get` then
+    /// [`contains`](Self::contains); a backend whose `get` already read the
+    /// durable copy answers with that one read.
+    async fn get_stored(&self, hash: &Hash) -> Result<Option<Bytes>> {
+        match self.get(hash).await? {
+            Some(b) if self.contains(hash).await? => Ok(Some(b)),
+            _ => Ok(None),
+        }
+    }
+
     /// [`contains`](Self::contains) for many hashes, answered in order and
     /// each as exactly. The default asks [`CONTAINS_IN_FLIGHT`] at a time;
     /// backends that can answer a batch more cheaply override it.
@@ -743,6 +756,24 @@ pub trait MetaStore: Send + Sync + 'static {
         let mut out = Vec::with_capacity(keys.len());
         for key in keys {
             out.push(self.get_derived(kind, key).await?);
+        }
+        Ok(out)
+    }
+
+    /// [`get_derived_many`](Self::get_derived_many) for several kinds at
+    /// once: one answer per `(kind, keys)` read, in order. Lets a request
+    /// that needs rows of several kinds hold one connection for one round
+    /// trip instead of one connection per kind.
+    ///
+    /// The default makes one `get_derived_many` per read, in order; database
+    /// backends override it with one statement.
+    async fn get_derived_kinds(
+        &self,
+        reads: &[(&str, &[Hash])],
+    ) -> Result<Vec<Vec<Option<Bytes>>>> {
+        let mut out = Vec::with_capacity(reads.len());
+        for (kind, keys) in reads {
+            out.push(self.get_derived_many(kind, keys).await?);
         }
         Ok(out)
     }
