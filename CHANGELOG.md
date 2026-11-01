@@ -202,6 +202,10 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   `leep_server::serve` now serves through `leep_server::conn::serve_with`
   instead of `axum::serve`. Metric `leep_http_response_body_idle_total`.
   See OPERATIONS.md, "Connections".
+- **Changed.** `leep` (and so the git mirror and `leep-mcp`) and
+  `leep-soak` keep idle pooled connections for 20 s, below the server's
+  default `--header-read-timeout`, so they do not reuse a connection the
+  server has closed for being idle.
 
 ### Land batches write one pack
 - **Changed.** A land batch's new objects (tree nodes, merged contents)

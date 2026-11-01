@@ -1096,6 +1096,8 @@ async fn main() -> Result<()> {
         .no_proxy()
         .timeout(Duration::from_secs(args.request_timeout))
         .tcp_nodelay(true)
+        // Below the server's default --header-read-timeout (30 s).
+        .pool_idle_timeout(Duration::from_secs(20))
         .pool_max_idle_per_host(args.agents.max(16))
         .build()?;
     let run = {

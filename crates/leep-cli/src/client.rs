@@ -324,6 +324,12 @@ fn enc(s: &str) -> String {
     out
 }
 
+/// How long an idle pooled connection is kept. Below the server's default
+/// `--header-read-timeout` (30 s), which closes an HTTP/1.1 connection idle
+/// that long, so a long-running client (leep-mcp, the git mirror) does not
+/// send a request on a connection the server is closing.
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
+
 impl Client {
     pub fn new(server: &str) -> Self {
         Self::with_token(server, None)
@@ -332,7 +338,9 @@ impl Client {
     /// Send `Authorization: Bearer <token>` on every request. The header is
     /// marked sensitive so it is redacted from debug output.
     pub fn with_token(server: &str, token: Option<&str>) -> Self {
-        let mut builder = Http::builder().timeout(Duration::from_secs(300));
+        let mut builder = Http::builder()
+            .timeout(Duration::from_secs(300))
+            .pool_idle_timeout(POOL_IDLE_TIMEOUT);
         if let Some(t) = token {
             if let Ok(mut v) = HeaderValue::from_str(&format!("Bearer {t}")) {
                 v.set_sensitive(true);

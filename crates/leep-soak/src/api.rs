@@ -96,6 +96,8 @@ impl Api {
             .no_proxy()
             .timeout(Duration::from_secs(60))
             .tcp_nodelay(true)
+            // Below the server's default --header-read-timeout (30 s).
+            .pool_idle_timeout(Duration::from_secs(20))
             .build()
             .expect("http client");
         Api {
