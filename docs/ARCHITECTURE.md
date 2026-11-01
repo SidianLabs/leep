@@ -213,6 +213,29 @@ way.
 | `blob-trigrams-v1` | per blob hash: sorted trigram set of a UTF-8 text blob up to 1 MiB (delta varints), or a "not indexed" marker (ADR 0014) | code search |
 | `tree-trigrams-v1` | per tree node hash: fixed-size bloom filter (2^19 bits) over every trigram below the directory, the OR of its children's filters; shared by every revision with the same subtree (ADR 0014) | code search directory pruning |
 
+**Unstored trees** ([ADR 0069](adr/0069-lazy-create-trees.md)). The
+`root_tree` row is always stored with its changeset, but the nodes of the
+tree it names need not be: a client's create builds its tree in memory and
+leaves the nodes out (`--lazy-create-trees`, on by default). The rule:
+a changeset's tree is either stored whole (its root node is present, and
+so is every node below it) or its root is absent and the tree is its first
+parent's tree with `changes` applied, that tree being stored or itself
+derivable, within 64 first parents; creates keep runs to 8
+(`MAX_LAZY_DEPTH`) by storing the tree of the create that would make a
+longer one. Writes keep "a present root means a whole tree": a tree's root
+is written after its other nodes, a tree built on an unstored base stores
+the base's nodes it keeps, and a land that moves a ref to a changeset as it
+is (a fast-forward, a first land) stores its tree before the move, the root
+after the rest is durable, so ref heads are stored whole. `read_tree`,
+`read_trees` and `read_tree_view` derive a missing node from the changeset
+whose root was last looked up for it (`root_tree` and the batched readers
+of `root_tree` rows record root to changeset): `derive_tree` walks first
+parents iteratively to a stored (or cached) tree, rebuilds each tree up
+the chain in memory with the create's code, checks each against its
+`root_tree` row, and keeps the nodes in a bounded cache; reads never store
+them. GC marks, `gc-unreachable`, `verify` and the pack order walk derived
+nodes like stored ones (ADR 0069 section 4).
+
 `root_tree`, `generation`, `skiplist` and `last_merge-v1` are computed
 eagerly when a changeset is created and written with it in one call (ADR
 0031, see "Commit" below; `last_merge-v1` from the parents' rows only, never
@@ -569,8 +592,11 @@ Nothing mutable has changed yet; the changeset is just an addressable object.
 Storing a changeset (ADR 0031) costs one round of reads and one write. The
 server reads, concurrently and in batches, whether the parents exist, their
 generations, the first parent's root tree and skiplist, and the contents'
-`blob-condemned-v1` rows. It checks parents and blobs, writes the rewritten
-tree nodes (then reads their condemnation rows in one batch), computes the
+`blob-condemned-v1` rows. It checks parents and blobs, builds the tree in
+memory and, for a client's create with `--lazy-create-trees on` (the
+default, ADR 0069, "Unstored trees" in §5), stores none of its nodes but
+flushes the contents it names; otherwise it writes the rewritten
+tree nodes (then reads their condemnation rows in one batch). It computes the
 generation and skiplist with the derived kinds' own code, and stores the
 changeset with its `root_tree`, `generation` and `skiplist` rows through
 `MetaStore::put_changeset_with_derived`: one statement on Postgres, one
@@ -601,9 +627,9 @@ loop (≤32 attempts):
   for each land, writing into staging and reading it back (dropped if its caller left before it was reached):
     if its land id is recorded (or moved earlier in this batch):
                                      that land's result (400 if the id named another cs)
-    elif head is None:               move to cs
-    elif cs is an ancestor of head:  already landed
-    elif head is an ancestor of cs:  move to cs                   # fast-forward
+    elif head is None:               move to cs                   # cs's tree staged
+    elif cs is an ancestor of head:  already landed                #   if unstored
+    elif head is an ancestor of cs:  move to cs                   # fast-forward (ditto)
     elif head's history holds a server-made copy of cs:  already landed
     else:
       stack ← first-parent chain from cs down to where it joins head's history,

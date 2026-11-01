@@ -32,7 +32,7 @@ skill.
 |---|---|---|
 | `Changeset` | `changeset-v1` | `MetaStore.changesets.data`, as the canonical bytes or a zstd frame of them (ADR 0053, "Changeset rows" below) |
 | `TreeNode` | `tree-v1` | `BlobStore`, keyed by `TreeNode::hash()` |
-| derived `root_tree` | — | `MetaStore.derived`, value = 32 raw bytes |
+| derived `root_tree` | — | `MetaStore.derived`, value = 32 raw bytes. The tree it names may be unstored (ADR 0069): its root node absent and the tree derivable from the first parent's; a present root node has every node below it stored. No format changed for this |
 | derived `generation` | — | `MetaStore.derived`, value = u64 (owned by leep-derive) |
 | derived `signature-v1` | — | `MetaStore.derived`, key = `Hash::of_object("signature", changeset_id ‖ key_id)`, value = postcard `Signature { key_id: String, public_key: [u8; 32], sig: [u8; 64] }` (`leep_core::signature`) |
 | derived `review-v1` | — | `MetaStore.derived`, key = `Hash::of_object("review", changeset_id ‖ reviewer name utf-8)`, value = postcard `Review { reviewer: String, verdict: Verdict, comment: String, timestamp: i64 }` (`leep_core::review`); `Verdict` is `Approve` (variant 0), `Reject` (variant 1) or `Withdrawn` (variant 2, ADR 0063; a policy reads it as no review) |
