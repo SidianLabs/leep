@@ -37,10 +37,16 @@ impl Reply {
 
 impl Client {
     fn new() -> Self {
+        Self::with_lazy_trees(false)
+    }
+
+    /// A server whose creates leave their tree nodes out (ADR 0069), or not.
+    fn with_lazy_trees(on: bool) -> Self {
         let repo = Repo::new(
             Arc::new(MemoryBlobStore::new()),
             Arc::new(MemoryMetaStore::new()),
-        );
+        )
+        .with_lazy_create_trees(on);
         Client(leep_server::router(repo))
     }
 
@@ -2481,4 +2487,98 @@ async fn request_ids_are_kept_or_made_and_echoed() {
         r.json::<ErrorResponse>().request_id.as_deref(),
         Some("t-404")
     );
+}
+
+/// Every read of unlanded changesets, a stack of them and a merge, answers
+/// byte for byte the same whether creates stored their trees or not (ADR
+/// 0069), as do lands of them.
+#[tokio::test]
+async fn reads_and_lands_answer_the_same_with_lazy_trees() {
+    let mut bodies: Vec<Vec<(String, StatusCode, Vec<u8>)>> = Vec::new();
+    for lazy in [false, true] {
+        let c = Client::with_lazy_trees(lazy);
+        let base = c
+            .commit(
+                &[],
+                &[
+                    ("README", Some("hello line\n")),
+                    ("src/a.rs", Some("fn a() {}\n")),
+                    ("src/deep/b.rs", Some("b line\n")),
+                ],
+                "base",
+            )
+            .await;
+        c.set_ref("main", base).await;
+        let one = c
+            .commit(&[base], &[("src/deep/c.rs", Some("c line\n"))], "one")
+            .await;
+        let two = c
+            .commit(
+                &[one],
+                &[("src/a.rs", Some("fn a() { b() }\n")), ("README", None)],
+                "two",
+            )
+            .await;
+        let side = c
+            .commit(&[base], &[("docs/x.md", Some("x line\n"))], "side")
+            .await;
+        let m: MergeResponse = c.post("/v1/merge", &merge_req(two, side)).await.json();
+        let MergeResponse::Merged { id: merged } = m else {
+            panic!("{m:?}")
+        };
+        let mut got = Vec::new();
+        for id in [one, two, side, merged] {
+            for uri in [
+                format!("/v1/changesets/{id}"),
+                format!("/v1/tree/{id}"),
+                format!("/v1/tree/{id}?path=src/deep"),
+                format!("/v1/files/{id}"),
+                format!("/v1/file/{id}?path=src/a.rs"),
+                format!("/v1/diff?from={base}&to={id}"),
+                format!("/v1/log/{id}?path=src"),
+                format!("/v1/last-change/{id}?path=src/a.rs"),
+                format!("/v1/blame/{id}?path=src/a.rs"),
+                format!("/v1/search/{id}?q=line"),
+                format!("/v1/provenance/{id}"),
+            ] {
+                let r = c.get(&uri).await;
+                got.push((uri, r.status, r.body));
+            }
+        }
+        for id in [two, side] {
+            let r = c
+                .post(
+                    "/v1/land",
+                    &LandRequest {
+                        changeset: id,
+                        target_ref: "main".into(),
+                        create: None,
+                        land_id: None,
+                    },
+                )
+                .await;
+            got.push((format!("land {id}"), r.status, r.body));
+        }
+        let head: RefsResponse = c.get("/v1/refs").await.json();
+        for (name, id) in head.refs {
+            let r = c.get(&format!("/v1/files/{id}")).await;
+            got.push((format!("files of {name}"), r.status, r.body));
+        }
+        bodies.push(got);
+    }
+    let (eager, lazy) = (&bodies[0], &bodies[1]);
+    assert_eq!(eager.len(), lazy.len());
+    for (e, l) in eager.iter().zip(lazy) {
+        assert_eq!(
+            e.1,
+            StatusCode::OK,
+            "{} {}",
+            e.0,
+            String::from_utf8_lossy(&e.2)
+        );
+        assert_eq!(
+            (e.0.as_str(), e.1, String::from_utf8_lossy(&e.2)),
+            (l.0.as_str(), l.1, String::from_utf8_lossy(&l.2))
+        );
+    }
 }

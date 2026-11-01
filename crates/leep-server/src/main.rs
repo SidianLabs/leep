@@ -356,6 +356,12 @@ struct Args {
     /// for comparison.
     #[arg(long, env = "LEEP_LAND_FAST_PATH", value_enum, default_value_t = Switch::On)]
     land_fast_path: Switch,
+    /// Leave a create's tree nodes out of the blob store and derive them
+    /// when read (ADR 0069): a create then writes no tree node, and a land
+    /// stores the tree of a changeset the ref moves to as it is. The answers
+    /// are the same either way; `off` stores every create's tree, as before.
+    #[arg(long, env = "LEEP_LAZY_CREATE_TREES", value_enum, default_value_t = Switch::On)]
+    lazy_create_trees: Switch,
     /// What a land replayed with a merge makes of a file the ref also
     /// changed since the land's base (ADR 0066): `merge` merges it three
     /// ways and conflicts only where the changes clash; `strict` answers
@@ -1753,7 +1759,8 @@ async fn run() -> anyhow::Result<()> {
     repo = repo.with_land_max_batch(args.land_max_batch);
     repo = repo
         .with_land_fast_path(args.land_fast_path == Switch::On)
-        .with_land_conflicts(land_conflicts(&args));
+        .with_land_conflicts(land_conflicts(&args))
+        .with_lazy_create_trees(args.lazy_create_trees == Switch::On);
     leep_server::reload::warn_missing_refs(repo.meta().as_ref(), &config.current()).await;
     if args.request_timeout.is_zero() {
         tracing::warn!("request timeout disabled: gc --fence cannot be guaranteed safe");
@@ -1861,6 +1868,10 @@ async fn run() -> anyhow::Result<()> {
         land_conflicts = repo.land_conflicts().for_ref("").name(),
         strict_land_refs = ?args.strict_land_refs,
         "land replay (ADR 0066)"
+    );
+    tracing::info!(
+        lazy_create_trees = repo.lazy_create_trees(),
+        "creates' tree nodes (ADR 0069)"
     );
     let mut app = leep_server::router_with_read_limits(
         repo,
@@ -2305,6 +2316,7 @@ mod tests {
     fn land_replay_defaults_to_the_fast_path_and_merging() {
         let a = parse_args(["leep-server"]).unwrap();
         assert!(a.land_fast_path == Switch::On);
+        assert!(a.lazy_create_trees == Switch::On);
         let c = land_conflicts(&a);
         assert_eq!(c.for_ref("main"), leep_derive::ConflictPolicy::Merge);
         let a = parse_args([
@@ -2313,9 +2325,12 @@ mod tests {
             "off",
             "--strict-land-ref",
             "prod",
+            "--lazy-create-trees",
+            "off",
         ])
         .unwrap();
         assert!(a.land_fast_path == Switch::Off);
+        assert!(a.lazy_create_trees == Switch::Off);
         let c = land_conflicts(&a);
         assert_eq!(c.for_ref("prod"), leep_derive::ConflictPolicy::Strict);
         assert_eq!(c.for_ref("main"), leep_derive::ConflictPolicy::Merge);
