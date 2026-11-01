@@ -356,7 +356,7 @@ impl Repo {
             return;
         }
         for (id, row) in missing.into_iter().zip(rows) {
-            if let Some(list) = row.and_then(|b| derived::Skiplist::decode(&b).ok()) {
+            if let Some(list) = row.and_then(|b| derived::Skiplist::decode_of(id, &b).ok()) {
                 reads.insert(id, list.into());
             }
         }
@@ -697,8 +697,10 @@ impl Repo {
             if x == ancestor {
                 return Ok(true);
             }
-            let list =
-                derived::Skiplist::decode(&derived::derive::<derived::Skiplist>(self, x).await?)?;
+            let list = derived::Skiplist::decode_of(
+                x,
+                &derived::derive::<derived::Skiplist>(self, x).await?,
+            )?;
             match list.iter().rev().find(|e| e.generation >= target) {
                 Some(e) => x = e.id,
                 None => break,

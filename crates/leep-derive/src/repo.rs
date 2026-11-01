@@ -1300,8 +1300,11 @@ impl Repo {
             condemned,
             parent_generations,
             base_tree: tree.and_then(|v| derived::decode_hash(&v).ok()),
-            parent_skiplist: cached_list
-                .or_else(|| list.and_then(|v| Skiplist::decode(&v).ok()).map(Arc::from)),
+            parent_skiplist: cached_list.or_else(|| {
+                let p = first?;
+                list.and_then(|v| Skiplist::decode_of(p, &v).ok())
+                    .map(Arc::from)
+            }),
         }
     }
 

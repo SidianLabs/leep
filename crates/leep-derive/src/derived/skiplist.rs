@@ -44,6 +44,17 @@ impl Skiplist {
         Ok(entries)
     }
 
+    /// [`Skiplist::decode`] for the row of `id`, which must not name `id`
+    /// itself: a walk riding it would go round forever. Every reader that
+    /// knows whose row it holds uses this, cached or not.
+    pub fn decode_of(id: ChangesetId, b: &[u8]) -> Result<Vec<SkipEntry>> {
+        let list = Self::decode(b)?;
+        if list.iter().any(|e| e.id == id) {
+            return Err(Error::Storage(format!("skiplist of {id} names itself")));
+        }
+        Ok(list)
+    }
+
     pub(crate) fn encode(entries: &[SkipEntry]) -> Bytes {
         let mut out = Vec::with_capacity(entries.len() * 40);
         for e in entries {
@@ -115,12 +126,7 @@ impl Repo {
         if let Some(l) = self.skiplists.get(&id) {
             return Ok(l);
         }
-        let list = Skiplist::decode(&derive::<Skiplist>(self, id).await?)?;
-        // A list naming its own changeset would send a walk round forever.
-        if list.iter().any(|e| e.id == id) {
-            return Err(Error::Storage(format!("skiplist of {id} names itself")));
-        }
-        Ok(list.into())
+        Ok(Skiplist::decode_of(id, &derive::<Skiplist>(self, id).await?)?.into())
     }
 }
 
@@ -165,5 +171,33 @@ mod tests {
         let fresh = Repo::new(r.blobs().clone(), r.meta().clone());
         let err = fresh.skiplist(id).await.expect_err("names itself");
         assert!(matches!(err, Error::Storage(_)), "{err}");
+    }
+
+    /// The same row read in a batch into a derivation's skiplist cache
+    /// (`prefetch_skiplists`) is refused too, so an ancestry walk served
+    /// from that cache errs instead of going round forever.
+    #[tokio::test]
+    async fn a_prefetched_list_naming_itself_is_not_walked() {
+        use crate::ancestry::SKIPLIST_READS;
+        let r = crate::tests::repo();
+        let root = crate::tests::commit(&r, &[], &[("a", Some("1"))], "a").await;
+        let id = crate::tests::commit(&r, &[root], &[("a", Some("2"))], "b").await;
+        let looped = Skiplist::encode(&[SkipEntry { id, generation: 5 }]);
+        r.meta()
+            .put_derived(Skiplist::NAME, &id.0, looped)
+            .await
+            .unwrap();
+        let fresh = Repo::new(r.blobs().clone(), r.meta().clone());
+        let cache = std::sync::Arc::new(crate::repo::SkiplistCache::default());
+        let walk = SKIPLIST_READS.scope(Some(cache.clone()), async {
+            fresh.prefetch_skiplists(&[id]).await;
+            fresh.is_ancestor(root, id).await
+        });
+        let got = tokio::time::timeout(std::time::Duration::from_secs(10), walk)
+            .await
+            .expect("the walk ends");
+        let err = got.expect_err("names itself");
+        assert!(matches!(err, Error::Storage(_)), "{err}");
+        assert!(cache.get(&id).is_none(), "the row is not cached");
     }
 }

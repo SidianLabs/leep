@@ -220,7 +220,7 @@ impl ReadAhead {
             if let Some(list) = skips
                 .as_ref()
                 .and_then(|v| v[i].as_deref())
-                .and_then(|b| Skiplist::decode(b).ok())
+                .and_then(|b| Skiplist::decode_of(*id, b).ok())
             {
                 for (k, e) in list.iter().enumerate() {
                     if (1usize << k.min(63)) > reach {
