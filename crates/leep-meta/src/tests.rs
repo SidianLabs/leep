@@ -1078,3 +1078,92 @@ async fn postgres_land_lane_sizes() {
     drop(held);
     assert_eq!(scope(Lane::Land, s.get_ref("main")).await.unwrap(), None);
 }
+
+/// Queries holding every connection of the shared pool cannot starve the
+/// index warmer (ADR 0071): in the index lane its reads and row writes run
+/// on the reserved pool, while the same calls outside it wait. The land
+/// lane does not draw on the index pool.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn postgres_index_lane_survives_a_saturated_pool() {
+    use leep_core::lane::{scope, Lane};
+    use std::time::Duration;
+    let Some(url) = pg_url() else {
+        return;
+    };
+    let s = PostgresMetaStore::connect_with_schema_and_pools(&url, &schema("index_lane"), 2, 0, 2)
+        .await
+        .unwrap();
+    assert_eq!(s.index_pool_size(), 2);
+    let base = s.put_changeset(&cs(1)).await.unwrap();
+    assert!(s.cas_ref("main", None, Some(base)).await.unwrap());
+
+    let held = s.hold_data_pool().await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), s.get_ref("main"))
+            .await
+            .is_err(),
+        "the shared pool is saturated"
+    );
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(300),
+            scope(Lane::Land, s.get_ref("main"))
+        )
+        .await
+        .is_err(),
+        "a land lane without a reserve shares the data pool, not the index pool"
+    );
+    let warmer = async {
+        assert_eq!(s.list_refs().await.unwrap().len(), 1);
+        assert_eq!(s.ref_log(None, None, 1).await.unwrap().len(), 1);
+        assert!(s.get_changesets(&[base]).await.unwrap()[0].is_some());
+        let row = bytes::Bytes::from_static(b"row");
+        s.put_derived_many(&[leep_core::DerivedRow::new("k", base.0, row.clone())])
+            .await
+            .unwrap();
+        assert_eq!(
+            s.get_derived_many("k", &[base.0]).await.unwrap(),
+            vec![Some(row)]
+        );
+    };
+    tokio::time::timeout(Duration::from_secs(10), scope(Lane::Index, warmer))
+        .await
+        .expect("the index lane does not wait for the shared pool");
+    drop(held);
+    assert!(s.get_derived("k", &base.0).await.unwrap().is_some());
+}
+
+/// `--meta-index-pool-size 0` reserves nothing: the index lane shares the
+/// data pool. The default reserves a sixteenth of it, at least 4.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn postgres_index_lane_sizes() {
+    use leep_core::lane::{scope, Lane};
+    use std::time::Duration;
+    let Some(url) = pg_url() else {
+        return;
+    };
+    assert_eq!(crate::default_index_pool_size(16), 4);
+    assert_eq!(crate::default_index_pool_size(32), 4);
+    assert_eq!(crate::default_index_pool_size(128), 8);
+    let s = PostgresMetaStore::connect_with_schema(&url, &schema("index_sizes"))
+        .await
+        .unwrap();
+    assert_eq!(s.index_pool_size(), 4);
+    drop(s);
+    let s = PostgresMetaStore::connect_with_schema_and_pools(&url, &schema("index_sizes"), 1, 4, 0)
+        .await
+        .unwrap();
+    assert_eq!(s.index_pool_size(), 0);
+    let held = s.hold_data_pool().await.unwrap();
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(300),
+            scope(Lane::Index, s.get_ref("main"))
+        )
+        .await
+        .is_err(),
+        "without a reserve the index lane waits like any request"
+    );
+    drop(held);
+    assert_eq!(scope(Lane::Index, s.get_ref("main")).await.unwrap(), None);
+}

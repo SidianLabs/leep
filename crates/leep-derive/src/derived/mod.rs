@@ -414,12 +414,12 @@ impl<K: DerivedKind> DeriveWave<K> {
             let rows: Arc<[DerivedRow]> = std::mem::take(&mut self.pending).into();
             let meta = self.repo.meta().clone();
             let carried = rows.clone();
-            let handle = tokio::spawn(async move {
+            let handle = tokio::spawn(leep_core::lane::inherit_index(async move {
                 for batch in carried.chunks(STAGED_WRITE) {
                     meta.put_derived_many(batch).await?;
                 }
                 Ok(())
-            });
+            }));
             self.writing = Some((handle, rows));
         }
         if wait {

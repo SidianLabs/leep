@@ -160,12 +160,14 @@ enum Event<T> {
 
 /// `fut` as a task of its own that still sees the derivation's task locals:
 /// the kinds whose lock it holds (a merge asking for its merge base must not
-/// wait on its own lock) and its skiplist reads.
+/// wait on its own lock), its skiplist reads, and the warmer's index lane
+/// (ADR 0071).
 pub(crate) fn scoped<F>(fut: F) -> impl Future<Output = F::Output> + Send + 'static
 where
     F: Future + Send + 'static,
     F::Output: Send,
 {
+    let fut = leep_core::lane::inherit_index(fut);
     let held = HELD.try_with(|h| h.borrow().clone()).ok();
     let reads = SKIPLIST_READS.try_with(|c| c.clone()).ok();
     async move {

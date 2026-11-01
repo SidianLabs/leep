@@ -4406,6 +4406,153 @@ mod warm {
         assert!(has_history(&r, c).await);
     }
 
+    /// Records the metadata lane of every data call (ADR 0067, 0071).
+    struct LaneProbe {
+        inner: Arc<MemoryMetaStore>,
+        calls: std::sync::Mutex<Vec<(&'static str, leep_core::lane::Lane)>>,
+    }
+
+    impl LaneProbe {
+        fn note(&self, op: &'static str) {
+            let lane = leep_core::lane::current();
+            self.calls.lock().unwrap().push((op, lane));
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl MetaStore for LaneProbe {
+        async fn put_changeset(&self, cs: &Changeset) -> leep_core::Result<ChangesetId> {
+            self.note("put_changeset");
+            self.inner.put_changeset(cs).await
+        }
+        async fn get_changeset(&self, id: &ChangesetId) -> leep_core::Result<Option<Changeset>> {
+            self.note("get_changeset");
+            self.inner.get_changeset(id).await
+        }
+        async fn get_changesets(
+            &self,
+            ids: &[ChangesetId],
+        ) -> leep_core::Result<Vec<Option<Changeset>>> {
+            self.note("get_changesets");
+            self.inner.get_changesets(ids).await
+        }
+        async fn get_ref(&self, name: &str) -> leep_core::Result<Option<ChangesetId>> {
+            self.note("get_ref");
+            self.inner.get_ref(name).await
+        }
+        async fn list_changesets(
+            &self,
+            after: Option<ChangesetId>,
+            limit: usize,
+        ) -> leep_core::Result<Vec<ChangesetId>> {
+            self.note("list_changesets");
+            self.inner.list_changesets(after, limit).await
+        }
+        async fn cas_ref_logged(
+            &self,
+            name: &str,
+            expected: Option<ChangesetId>,
+            new: Option<ChangesetId>,
+            ctx: &leep_core::RefUpdateContext,
+        ) -> leep_core::Result<bool> {
+            self.note("cas_ref_logged");
+            self.inner.cas_ref_logged(name, expected, new, ctx).await
+        }
+        async fn ref_log(
+            &self,
+            name: Option<&str>,
+            before_seq: Option<u64>,
+            limit: usize,
+        ) -> leep_core::Result<Vec<leep_core::RefLogEntry>> {
+            self.note("ref_log");
+            self.inner.ref_log(name, before_seq, limit).await
+        }
+        async fn list_refs(&self) -> leep_core::Result<BTreeMap<String, ChangesetId>> {
+            self.note("list_refs");
+            self.inner.list_refs().await
+        }
+        async fn get_derived(&self, kind: &str, key: &Hash) -> leep_core::Result<Option<Bytes>> {
+            self.note("get_derived");
+            self.inner.get_derived(kind, key).await
+        }
+        async fn get_derived_many(
+            &self,
+            kind: &str,
+            keys: &[Hash],
+        ) -> leep_core::Result<Vec<Option<Bytes>>> {
+            self.note("get_derived_many");
+            self.inner.get_derived_many(kind, keys).await
+        }
+        async fn put_derived(&self, kind: &str, key: &Hash, value: Bytes) -> leep_core::Result<()> {
+            self.note("put_derived");
+            self.inner.put_derived(kind, key, value).await
+        }
+        async fn put_derived_many(&self, rows: &[leep_core::DerivedRow]) -> leep_core::Result<()> {
+            self.note("put_derived_many");
+            self.inner.put_derived_many(rows).await
+        }
+    }
+
+    /// The warmer's loops make every metadata call in the index lane,
+    /// including the reads and row writes of the tasks its derivations
+    /// spawn, so the Postgres store serves them from the index pool (ADR
+    /// 0071). A land leader's derivation tasks do not inherit the land lane.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn warm_loops_run_in_the_index_lane() {
+        use leep_core::lane::Lane;
+        let inner = Arc::new(MemoryMetaStore::new());
+        let blobs: Arc<dyn leep_core::BlobStore> = Arc::new(MemoryBlobStore::new());
+        let r = Repo::new(blobs.clone(), inner.clone());
+        let heads = branchy(&r).await;
+        for (name, h) in &heads {
+            r.meta().cas_ref(name, None, Some(*h)).await.unwrap();
+        }
+        let probe = Arc::new(LaneProbe {
+            inner: inner.clone(),
+            calls: Default::default(),
+        });
+        let cold = Repo::new(blobs, probe.clone()).with_derive_jobs(4);
+        let task = Warmer::new(cold, true).spawn(Duration::from_millis(50));
+        let started = std::time::Instant::now();
+        for (_, h) in &heads {
+            while inner
+                .get_derived(HistoryTree::NAME, &h.0)
+                .await
+                .unwrap()
+                .is_none()
+            {
+                assert!(started.elapsed() < Duration::from_secs(20), "not warmed");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+        task.abort();
+        let _ = task.await;
+        let calls = probe.calls.lock().unwrap().clone();
+        assert!(calls.iter().any(|(op, _)| *op == "put_derived_many"));
+        let stray: Vec<_> = calls.iter().filter(|(_, l)| *l != Lane::Index).collect();
+        assert!(stray.is_empty(), "outside the index lane: {stray:?}");
+
+        // A derivation in the land lane spawns its tasks in the shared one.
+        let probe = Arc::new(LaneProbe {
+            inner: Arc::new(MemoryMetaStore::new()),
+            calls: Default::default(),
+        });
+        let r = Repo::new(Arc::new(MemoryBlobStore::new()), probe.clone());
+        let heads = branchy(&r).await;
+        let r = Repo::new(r.blobs().clone(), probe.clone()).with_derive_jobs(4);
+        probe.calls.lock().unwrap().clear();
+        let tips: Vec<ChangesetId> = heads.iter().map(|(_, h)| *h).collect();
+        leep_core::lane::scope(
+            Lane::Land,
+            derived::derive_heads_counted::<HistoryTree>(&r, &tips),
+        )
+        .await
+        .unwrap();
+        let calls = probe.calls.lock().unwrap().clone();
+        assert!(calls.iter().all(|(_, l)| *l != Lane::Index), "{calls:?}");
+        assert!(calls.iter().any(|(_, l)| *l == Lane::Shared), "{calls:?}");
+    }
+
     /// With a 250 ms pass, a moved head is indexed within about a second,
     /// where the old 30 s poll left it un-indexed for up to that long.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
