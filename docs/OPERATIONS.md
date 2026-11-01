@@ -162,6 +162,7 @@ measured until the response head is ready, not until the body is streamed.
 | `leep_query_unindexed_scanned_total` | counter | `route` = `log`, `log_filter`, `last_change`, `blame`, `search` | Changesets (files, for search) a bounded query examined without index rows. |
 | `leep_query_indexing_answers_total` | counter | `route`; `mode` = `retry`, `legacy` | Queries answered 503 because their index was over budget behind (`legacy`: requests without `Leep-Indexing`, after their wait and larger scan). Subtracted by `LeepServerErrors`. |
 | `leep_query_stale_answers_total` | counter | `route` | `stale-ok` queries answered at an older changeset. |
+| `leep_query_scans_skipped_total` | counter | `kind` = `history-tree-v4`, `log-filter-v1` | Bounded walks not made because the skiplists showed the un-indexed first-parent chain alone was over the budget (ADR 0071). Rising with `leep_index_backlog_changesets` means the index is behind and queries are answering without walking the gap. |
 | `leep_query_inline_derive_total` | counter | `route` | Queries in `lease` or `off` mode that found no live index lease and derived inline. Stays 0 while an indexer runs. |
 | `leep_query_index_wait_seconds` | histogram | none | Time requests without the header waited for the indexer. |
 | `leep_query_index_waiters` | gauge | none | Requests waiting for the indexer now (at most `--index-waiters`). |
@@ -171,7 +172,7 @@ measured until the response head is ready, not until the body is streamed.
 | `leep_search_total` | counter | `indexed` = `true`, `false` | Searches served; `false` means the query had no required trigram and scanned files directly. |
 | `leep_search_duration_seconds` | histogram | none | Whole search call, including any index rows it derived. |
 | `leep_blob_cache_hits_total` | counter | none | Blob reads served from the in-memory cache. |
-| `leep_meta_pool_connections` | gauge | `pool` = `data`, `land`; `state` = `in_use`, `idle` | Open Postgres metadata connections per pool, as of that pool's last call (ADR 0067). `data` at `in_use` = `--meta-pool-size` with lands slow means request handlers are queueing for connections; `land` is the reserve of `--meta-land-pool-size`. |
+| `leep_meta_pool_connections` | gauge | `pool` = `data`, `land`, `index`; `state` = `in_use`, `idle` | Open Postgres metadata connections per pool, as of that pool's last call (ADR 0067, 0071). `data` at `in_use` = `--meta-pool-size` with lands slow means request handlers are queueing for connections; `land` is the reserve of `--meta-land-pool-size`, `index` the warmer's reserve of `--meta-index-pool-size`. |
 | `leep_blob_cache_misses_total` | counter | none | Blob reads that went to the durable store. |
 | `leep_blob_cache_bytes` | gauge | none | Bytes held in the cache. |
 | `leep_blob_cache_entries` | gauge | none | Blobs held in the cache. |
@@ -1422,6 +1423,7 @@ apply to the server and to its tools (`verify`, `repair`, `upgrade-index`,
 |---|---|---|
 | `--meta-pool-size` / `LEEP_META_POOL_SIZE` | 16 | Connections this process opens to a Postgres metadata store for requests, derivation and tools. SQLite ignores it. |
 | `--meta-land-pool-size` / `LEEP_META_LAND_POOL_SIZE` | an eighth of `--meta-pool-size`, at least 4 | Further Postgres connections reserved for land leaders (ADR 0067), opened on first use. `0` reserves none. SQLite ignores it. |
+| `--meta-index-pool-size` / `LEEP_META_INDEX_POOL_SIZE` | a sixteenth of `--meta-pool-size`, at least 4 | Further Postgres connections reserved for the index warmer (ADR 0071), opened on first use (only by a server that warms). `0` reserves none. SQLite ignores it. |
 | `--derive-cache-bytes` / `LEEP_DERIVE_CACHE_BYTES` | 440401920 (420 MiB) | The in-memory caches of derived indexes: path-history nodes, parts and roots (148 MiB), tree nodes (32 MiB), nodes of unstored trees derived on read (16 MiB, ADR 0069), search's directory filters (64 MiB), and the filtered-log caches (160 MiB). The ancestry and skiplist caches are bounded by entries, about 100 MB together by default, and scale by the same factor. |
 
 `--cache-bytes` (256 MiB) is separate: it caches blobs.
@@ -1448,6 +1450,15 @@ apply to the server and to its tools (`verify`, `repair`, `upgrade-index`,
   (a server with defaults opens at most 16 + 4 + 2 lease connections).
   `0` returns to one shared pool. `leep_meta_pool_connections` shows how
   full each pool is.
+- **Index reserve.** The warmer's loops (and the tasks their derivations
+  spawn) draw on a pool of their own, `--meta-index-pool-size`
+  connections (default a sixteenth of `--meta-pool-size`, at least 4;
+  ADR 0071). Without it, a lagging index fed itself: path logs and blames
+  scanning past the lag filled the shared pool, the warmer queued behind
+  them, and in a 2,000-agent swarm on a pool of 32 one history pass ran
+  326 s while lag sat near 3,650. Count this reserve in the sum too (a
+  warming server with defaults opens at most 16 + 4 + 4 + 2). `0` puts
+  the warmer back on the shared pool.
 - **Statement bound.** sqlx sends Postgres no cancel request when a query's
   future is dropped, which is what `--request-timeout` does to a request that
   runs too long: the request answers 408 but its statement runs on in the

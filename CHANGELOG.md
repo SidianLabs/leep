@@ -7,6 +7,20 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 ## [Unreleased]
 
+### A lagging index no longer starves its own warmer
+- **Changed.** A bounded path log, last-change or filtered log whose index
+  is further behind than its scan budget now learns so down the skiplists,
+  in tens of metadata calls, instead of walking the gap two round trips per
+  changeset. Its answer (503, `stale-ok`, or the legacy wait and larger
+  scan) is unchanged; a gap within budget is walked as before. See ADR
+  0071.
+- **Added.** `--meta-index-pool-size` (`LEEP_META_INDEX_POOL_SIZE`):
+  Postgres connections reserved for the index warmer, opened on first use,
+  default a sixteenth of `--meta-pool-size` and at least 4; `0` shares the
+  data pool. Count them against `max_connections`. SQLite ignores it.
+- **Added.** `pool="index"` on `leep_meta_pool_connections`, and
+  `leep_query_scans_skipped_total{kind}`.
+
 ### Blob-store misses check a stamp instead of rescanning
 - **Changed.** A read or existence check that misses a store's cached
   pack view no longer rescans every time. The filesystem store compares
