@@ -64,17 +64,21 @@ pack (so before the land stores a changeset naming its objects, keeping
 ADR 0068's ordering), a repack after it publishes and after it deletes the
 packs it replaced, and the pack-file copy of backups after it writes or
 deletes an index. Its contents are the pack id, a per-process nonce, a
-counter and the time, so every write has a new etag.
+counter and the time, so no two writes have the same contents.
 
-A view records the etag a HEAD of `packs/.gen` saw before the view's
-listing of `packs/` began. A miss HEADs `packs/.gen` (one HEAD per 50 ms
-per process, shared by concurrent misses) and lists `packs/` for new
-packs only if the etag differs. Any publish whose `put_many` returned
-before that HEAD wrote the stamp after its index: either before the
-view's HEAD, so its index was in the view's listing, or after, so the etag
-differs. A bucket without `packs/.gen` (only older servers wrote it), or a
-backend that reports neither an etag nor a version, falls back to a
-listing per miss, as ADR 0068 did. The full listing (tombstones included)
+A view records the contents a GET of `packs/.gen` returned before the
+view's listing of `packs/` began. A miss GETs `packs/.gen` (one GET per
+50 ms per process, shared by concurrent misses; about 60 bytes, so it
+costs what a HEAD would) and lists `packs/` for new packs only if the
+contents differ. Any publish whose `put_many` returned before that GET
+wrote the stamp after its index: either before the view's GET, so its
+index was in the view's listing, or after, so the contents differ. The
+contents are compared, not the etag: some backends derive the etag from
+metadata (`object_store`'s local filesystem backend uses inode, mtime and
+size), which a reused inode, a coarse mtime and a body of the same length
+can repeat for two generations. A bucket without `packs/.gen` (only older
+servers wrote it), or an empty one, falls back to a listing per miss, as
+ADR 0068 did. The full listing (tombstones included)
 still runs on a miss at most every 5 s (ADR 0040 section 5), and a read
 that finds its pack deleted (404) still lists at once.
 
@@ -98,7 +102,24 @@ What uses it is what something already references:
 - a create's check of the contents it names (`get_stored` before), and a
   land batch's check of a server-built changeset's contents, which asks
   `get_exact` for each content its `contains_many` reported missing before
-  refusing it.
+  refusing it;
+- reads of file contents a stored changeset or tree names
+  (`Repo::read_content`, `read_contents`): file reads, search and its
+  indexing, owners, review rules, blame, merges, rename detection, and
+  `GET /v1/blobs/{hash}` (clients fetch hashes they read from stored
+  trees). They ask `get` (or `get_many`) and only after a miss
+  `get_exact`, so a land another server made a moment ago is not a 404 or
+  a "blob missing" error within the stamp's window.
+
+A tree this process built or derived unstored and has not stored since (a
+lazy create's, ADR 0069) is never asked exactly: a create on an unlanded
+lazy create takes its parent's depth from memory instead of reading the
+parent's root, a derivation continues past such a parent without asking,
+and storing a tree over such a base skips the read of its root. In the
+benchmark below these reads were all 962 forced scans, each a certain
+miss; on S3 they would have been about 12 serialized LISTs a second. A
+tree another process stored meanwhile derives to the same nodes, and a
+depth counted from memory can only be too high.
 
 Existence checks before an upload (`blobs/missing`, a create's prefetch, a
 land batch's `contains_many` warm-up) use the stamps only: a false
@@ -139,7 +160,7 @@ still read before the directory. A repack rescans explicitly at each step.
   against a mutex, a full tombstones read and a directory listing. Under
   load misses rescan at most ten times a second, and concurrent ones share
   a scan.
-- An object store miss costs one HEAD per 50 ms per process instead of a
+- An object store miss costs one small GET per 50 ms per process instead of a
   LIST each; a listing follows each publish once per process. A foreign
   pack is visible to `get` and `contains` within the 50 ms window, at once
   to `get_exact`. On the filesystem the window is 100 ms on an unconfirmed

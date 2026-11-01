@@ -14,14 +14,18 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   rescans only when one changed (or, for a view whose directory time is
   within 2 s of its scan, at most every 100 ms); concurrent misses share a
   scan and the tombstones file is read only when it changed. The object
-  store HEADs a new `packs/.gen` (at most once per 50 ms per process) and
-  lists `packs/` only when its etag changed. See ADR 0070.
+  store reads a new `packs/.gen` (at most once per 50 ms per process) and
+  lists `packs/` only when its contents changed. See ADR 0070.
 - **Added.** `packs/.gen` in object store buckets, rewritten by every
   writer after it publishes or deletes packs. A bucket without it is read
   as before. Upgrade every server sharing a bucket.
 - **Added.** `BlobStore::get_exact`: `get_stored` whose `None` is exact
   (one more scan after a miss). Tree reads and a changeset's content checks
   use it after a miss; the default is `get_stored`, and wrappers forward it.
+  File content reads named by stored changesets (file reads, search, blame,
+  merges, `GET /v1/blobs/{hash}`) retry with it after a miss, so a land
+  another server just made is not a 404. Trees this process knows are
+  unstored (lazy creates) are never asked exactly.
 - **Added.** Metrics `leep_blob_pack_scans_total{reason}`,
   `leep_blob_miss_total{outcome}`, `leep_blob_miss_seconds` and
   `leep_blob_pack_view_age_seconds`.

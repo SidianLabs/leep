@@ -825,7 +825,7 @@ are replaced:
 | `packs/<id>.idx` | the index, uploaded after the pack; its presence publishes the pack |
 | `packs/tombstones/<pack id>/<object hash hex>` | empty; the object's copy in that pack is deleted |
 | `packs/repack.lease` | text: `leep repack lease\nholder <id>\nexpires <unix seconds>\n`; present while a repack runs |
-| `packs/.gen` | text: `<pack id> <process nonce> <counter> <unix nanoseconds>\n`; the pack-set stamp (ADR 0070), rewritten, last writer wins, by every writer after it publishes or deletes packs (a `put_many` pack, a repack's publish and its deletes, a pack-file copy of an index). Only its etag matters: readers list `packs/` again when it changes. Absent in a bucket only older servers wrote |
+| `packs/.gen` | text: `<pack id> <process nonce> <counter> <unix nanoseconds>\n`; the pack-set stamp (ADR 0070), rewritten, last writer wins, by every writer after it publishes or deletes packs (a `put_many` pack, a repack's publish and its deletes, a pack-file copy of an index). Readers compare its whole contents, never its etag, and list `packs/` again when they change. Absent in a bucket only older servers wrote |
 
 A tombstone hides only the copy in the pack it names, and a loose copy of
 the same hash is always served, as on the filesystem. Readers ignore keys

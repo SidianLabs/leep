@@ -1148,8 +1148,8 @@ after a fence of minutes, and a read that finds its cached pack deleted
 lists at once. Since land batches publish packs (ADR 0068) a miss may also
 list `packs/` alone and load only new packs: every publisher rewrites
 `packs/.gen` after its index and before it returns (ADR 0070), and a miss
-HEADs that stamp (one HEAD per 50 ms per process) and lists only if its
-etag changed since the view's listing; a bucket without the stamp is listed
+reads that stamp (one GET per 50 ms per process) and lists only if its
+contents changed since the view's listing; a bucket without the stamp is listed
 on every miss, as before. `get_exact` lists once more after a miss.
 `contains` HEADs the copy's tombstone and the pack's index, so it is exact
 across processes as GC needs. Tombstones are one empty object each, so GC
