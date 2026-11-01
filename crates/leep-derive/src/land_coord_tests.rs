@@ -586,6 +586,57 @@ async fn a_leader_paused_past_its_lease_hands_over() {
     }
 }
 
+/// The leader stops past its lease while batches pipeline (ADR 0072):
+/// commits are slow, so a batch replays behind each one, and the pause
+/// catches some with a batch staged behind a commit. The staged batch is
+/// never committed onto a head that did not land: its lands go back to be
+/// routed to the new holder, and every land is kept exactly once.
+#[tokio::test(start_paused = true)]
+async fn a_lease_lost_with_a_batch_staged_behind_a_commit_hands_both_over() {
+    let mut staged = 0;
+    for seed in 1..=8 {
+        let w = world(seed);
+        w.plan
+            .rate(&[Op::CasRef], 1000, Fault::Delay(Duration::from_millis(80)))
+            .rate(Op::WRITES, 1000, Fault::Delay(Duration::from_millis(40)));
+        let nodes: Vec<_> = (0..3)
+            .map(|i| node(&w, &w.plan, i, format!("node-{i}"), |_| {}))
+            .collect();
+        let net = net(nodes, seed, 0, 0);
+        // Agents arriving over time, so lands queue behind each commit.
+        let tasks: Vec<_> = (0..24)
+            .map(|n| {
+                let (net, clean) = (net.clone(), w.clean.clone());
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(n as u64 * 15)).await;
+                    agent(seed, net, clean, n, 1).await
+                })
+            })
+            .collect();
+        let old = wait_for_leader(&net).await;
+        tokio::time::sleep(Duration::from_millis(150 + seed * 15)).await;
+        old.set_paused(true);
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        old.set_paused(false);
+        let (agents, _) = join(tasks).await;
+        w.plan.pause();
+        assert_lands_kept(seed, &w, &agents).await;
+        // Staged attempts the pause dropped rather than committed.
+        staged += old
+            .repo
+            .land_queues
+            .speculated
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, kept)| !kept)
+            .count();
+        let lease = lease_now(&w).await;
+        assert_ne!(lease.holder, old.coord.config().holder, "seed {seed}");
+    }
+    assert!(staged > 0, "the pause dropped staged batches ({staged})");
+}
+
 /// The leader is killed at a random point of a batch. Its lease is neither
 /// renewed nor released; another server takes it once it goes stale, and
 /// every agent lands within the lease time plus two seconds of the kill.
