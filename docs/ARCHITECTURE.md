@@ -232,8 +232,9 @@ whose root was last looked up for it (`root_tree` and the batched readers
 of `root_tree` rows record root to changeset): `derive_tree` walks first
 parents iteratively to a stored (or cached) tree, rebuilds each tree up
 the chain in memory with the create's code, checks each against its
-`root_tree` row, and keeps the nodes in a bounded cache; reads never store
-them. GC marks, `gc-unreachable`, `verify` and the pack order walk derived
+`root_tree` row, and keeps the nodes in a bounded cache (a land batch
+attempt also keeps every node it derived, so a slow-path merge derives the
+land's tree once); reads never store them. GC marks, `gc-unreachable`, `verify` and the pack order walk derived
 nodes like stored ones (ADR 0069 section 4).
 
 `root_tree`, `generation`, `skiplist` and `last_merge-v1` are computed

@@ -254,3 +254,8 @@ computed as before.
   background repack merging while lands run; the flush order test with a
   packing store; the batch warm-up's single content check; time-based
   admission.
+
+Since ADR 0069, a batch that fast-forwards a ref to a changeset created
+without its tree stores that tree, its root after the rest is durable: such
+a batch writes two packs (or a pack and a loose root), the nodes and then
+the roots.

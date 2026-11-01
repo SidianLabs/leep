@@ -54,16 +54,20 @@ exists to compare the two.
 "A present root means a whole tree" is what makes absence cheap to detect
 (one read of the root) and what every reader below relies on. Writes keep
 it:
-- A tree written in one wave writes its root last, after the other
-  writes of the wave succeeded (`put_rescuing_many_loose`); a land
-  batch's pack is published atomically.
+- A tree written loose writes its root last, after the other nodes are
+  written and their shard directories flushed (`put_rescuing_many_loose`),
+  so no reordering by the filesystem can leave a root without its nodes:
+  an eager create pays a second, small flush for it. A land batch's pack
+  is published atomically.
 - A tree built on an unstored base (an eager create at the depth bound, a
   copy onto an unstored head, a merge) stores the base's nodes it keeps as
   well (`Repo::unstored_below`), so it is whole. A stored base costs
   nothing extra: one read of its root, which the build reads anyway.
 - A land that moves a ref to a changeset itself (a fast-forward, the first
   land on a ref) stages its unstored nodes in the batch, the root in a
-  second wave after the rest is durable (`Staging::stage_tree`). A ref's
+  second wave after the rest is durable (`Staging::stage_tree`); on a
+  store that packs batches that wave is a second pack, so a batch with a
+  fast-forward writes two packs (the nodes, then the roots). A ref's
   head is therefore stored whole after every land, so the fast path's
   read of the head and every trunk walk read stored nodes. Members of a
   fast-forwarded stack below its tip stay unstored, bounded as above, as
@@ -82,15 +86,21 @@ unchanged (FORMATS.md has nothing new); there are only fewer objects.
 derived nodes (16 MiB by default, part of `--derive-cache-bytes`), or
 derives the tree of the changeset that holds the node: `root_tree` (and
 every batched read of `root_tree` rows that is followed by a tree read)
-records root -> changeset, and a derivation records each node it builds.
-A node no changeset known to hold it was looked up for is missing, as
-before.
+records root -> changeset in one map, and a derivation records each node
+it builds in another, consulted first, so the busy root map never pushes
+out a derived tree's nodes. A node no changeset known to hold it was
+looked up for is missing, as before. A read of many nodes (a level of a
+diff) derives each changeset's tree once for all of them, and a node that
+was the cached ancestor a derivation started from, evicted meanwhile, is
+found by deriving again from stored trees.
 
 `Repo::derive_tree` walks first parents iteratively until a stored tree
 (or one derived earlier and still cached), at most `MAX_LAZY_CHAIN`, then
 builds each tree up the chain in memory with the create's own code,
 reading only stored nodes and the chain's own (never deriving again, so it
-never recurses), and checks each against its `root_tree` row: a mismatch
+never recurses; the stored directories on the changed paths are read a
+level at a time in one batched read each, not one by one), and checks
+each against its `root_tree` row: a mismatch
 is `Storage("corrupt tree of changeset ...")` and is never served. Each
 build costs what the create's build cost, without the writes.
 
@@ -99,8 +109,16 @@ Reads never store what they derive. Unlanded changesets are read rarely
 few directories is cheaper than the fsyncs storing them would cost, and
 storing would turn reads into writes and write the garbage this decision
 removes. A land's slow path derives the stack's trees in memory inside
-the batch, which costs about the copy's own `apply_changes`; the fast path
-reads only the head.
+the batch, which costs about the copy's own `apply_changes`: the batch
+attempt keeps every node it derived (`NodeMemo`, apart from the nodes it
+may treat as stored), so the merge reads the land's tree from there. The
+first version relied on the shared cache alone, which creates also filled
+with their nodes; under 256 agents it held a land's tree for less than one
+merge, so the merge re-derived the tree for every node it read (6 to 8
+times a land in `a_slow_path_land_derives_the_lazy_tree_once` without a
+cache) and a slow-path replay took 92 ms instead of 2.8 ms. Creates now
+keep only the depth of their tree, and a slow-path land derives each tree
+once. The fast path reads only the head and the land's base, both stored.
 
 ### 4. Everything else that walks trees
 - **GC mark** walks a lazy changeset's derived tree: what it marks is
@@ -123,7 +141,9 @@ reads only the head.
 - **Pack ordering** for repacks may name unstored nodes; the repack
   ignores hints for objects it does not hold.
 - **Clients, the git mirror and MCP** read trees only through the
-  changeset endpoints, which derive.
+  changeset endpoints, which derive. `GET /v1/blobs/{hash}` of an unstored
+  tree node answers 404: tree nodes were never part of that endpoint's
+  contract for clients, and the clients here fetch only file contents.
 
 ## Consequences
 - A create writes no tree node: on the filesystem store, a create three
@@ -134,6 +154,9 @@ reads only the head.
   `MAX_LAZY_DEPTH` in-memory tree builds and a metadata read or two per
   step; later reads hit the cache. A cold walk of a history made only of
   lazy creates (no lands) pays that per changeset.
+- Fault sweeps run odd seeds with lazy creates and even seeds without
+  (`LEEP_FAULT_LAZY=on|off` forces one mode); the crash e2e runs the
+  server in either mode through `LEEP_LAZY_CREATE_TREES`.
 - Metrics: `leep_create_lazy_trees_total`,
   `leep_lazy_tree_derivations_total`, `leep_lazy_tree_derive_seconds`,
   `leep_lazy_tree_materialized_total`.

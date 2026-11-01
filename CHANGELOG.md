@@ -23,6 +23,13 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   `leep_lazy_tree_materialized_total`.
 - **Changed.** `--derive-cache-bytes` defaults to 420 MiB, 16 MiB more for
   the derived nodes of unstored trees.
+- **Changed.** `GET /v1/blobs/{hash}` answers 404 for a tree node of an
+  unlanded changeset, which is no longer stored. Tree nodes were never
+  meant to be fetched there; the CLI, the git mirror and MCP fetch only
+  file contents and read trees through the changeset endpoints.
+- **Changed.** A land batch that fast-forwards a ref to such a changeset
+  stores its tree in two waves (nodes, then the root), so two packs; an
+  eager create flushes its tree's nodes before writing the root.
 
 ### Land batches write one pack
 - **Changed.** A land batch's new objects (tree nodes, merged contents)
