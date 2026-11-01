@@ -646,3 +646,102 @@ async fn a_slow_path_land_derives_the_lazy_tree_once() {
         assert!(derived <= 1, "land {i} derived {derived} trees");
     }
 }
+
+/// Counts the reads that found nothing: on the filesystem store each one
+/// rescans the packs.
+struct MissCounting {
+    inner: Arc<MemoryBlobStore>,
+    misses: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl BlobStore for MissCounting {
+    async fn put_with_hash(&self, hash: Hash, data: Bytes) -> leep_core::Result<()> {
+        self.inner.put_with_hash(hash, data).await
+    }
+    async fn get(&self, hash: &Hash) -> leep_core::Result<Option<Bytes>> {
+        let got = self.inner.get(hash).await?;
+        if got.is_none() {
+            self.misses
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(got)
+    }
+    async fn contains(&self, hash: &Hash) -> leep_core::Result<bool> {
+        self.inner.contains(hash).await
+    }
+    async fn list_page(
+        &self,
+        after: Option<Hash>,
+        limit: usize,
+    ) -> leep_core::Result<Vec<leep_core::BlobMeta>> {
+        self.inner.list_page(after, limit).await
+    }
+    async fn delete(&self, hash: &Hash) -> leep_core::Result<()> {
+        self.inner.delete(hash).await
+    }
+}
+
+/// A slow-path land of a lazy create asks the store for none of its
+/// unstored nodes when this process made the create (and for its root alone
+/// when another did), and stores no more nodes than the directories its
+/// copy rewrites: what it costs follows the paths it changes, not the size
+/// of the tree.
+#[tokio::test]
+async fn a_slow_path_land_stays_off_the_store_and_stores_only_its_paths() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mem = Arc::new(MemoryBlobStore::new());
+    let blobs = Arc::new(MissCounting {
+        inner: mem.clone(),
+        misses: Default::default(),
+    });
+    let meta = Arc::new(MemoryMetaStore::new());
+    let r = Repo::new(blobs.clone(), meta.clone())
+        .with_lazy_create_trees(true)
+        .with_land_fast_path(false);
+    let mut files: Vec<(String, String)> = Vec::new();
+    for a in 0..30 {
+        for b in 0..10 {
+            files.push((format!("src/m{a}/s{b}/f.rs"), format!("line {a} {b}\n")));
+        }
+    }
+    let refs: Vec<(&str, Option<&str>)> = files
+        .iter()
+        .map(|(p, c)| (p.as_str(), Some(c.as_str())))
+        .collect();
+    let base = r
+        .create_changeset(cs(&[], changes(&r, &refs).await, "base"))
+        .await
+        .unwrap();
+    r.land(base, "main").await.unwrap();
+    let mut made = Vec::new();
+    for i in 0..4 {
+        let path = format!("src/m{i}/s{i}/new.rs");
+        let body = format!("line {i}\n");
+        made.push(
+            r.create_changeset(cs(&[base], changes(&r, &[(&path, Some(&body))]).await, "e"))
+                .await
+                .unwrap(),
+        );
+    }
+    let other = Repo::new(blobs.clone(), meta.clone()).with_land_fast_path(false);
+    for (i, id) in made.iter().enumerate() {
+        let lander = if i % 2 == 0 { &r } else { &other };
+        let (misses, stored) = (
+            blobs.misses.load(Relaxed),
+            mem.list_page(None, usize::MAX).await.unwrap().len(),
+        );
+        let resp = lander.land(*id, "main").await.unwrap();
+        assert!(
+            matches!(resp, leep_core::api::LandResponse::Landed { rebased, .. } if rebased == (i > 0)),
+            "{resp:?}"
+        );
+        let missed = blobs.misses.load(Relaxed) - misses;
+        let added = mem.list_page(None, usize::MAX).await.unwrap().len() - stored;
+        let allowed_misses = if i % 2 == 0 { 0 } else { 1 };
+        assert!(missed <= allowed_misses, "land {i}: {missed} store misses");
+        // The root, src, src/m<i> and src/m<i>/s<i>: the copy's, or the
+        // fast-forwarded tree's.
+        assert!(added <= 4, "land {i} stored {added} objects");
+    }
+}

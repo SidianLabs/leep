@@ -285,6 +285,7 @@ impl Staging {
         if s.blobs.insert(root, root_bytes).is_none() {
             s.late_roots.push(root);
         }
+        repo.lazy.forget_depth(&id);
         metrics::counter!("leep_lazy_tree_materialized_total").increment(1);
         Ok(())
     }

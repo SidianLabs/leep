@@ -1394,6 +1394,9 @@ impl Repo {
     /// Read one tree node. The empty tree always exists. A node of a tree
     /// created without its nodes is derived (ADR 0069).
     pub async fn read_tree(&self, tree: Hash) -> Result<TreeNode> {
+        if let Some(n) = self.lazy_first(&[tree]).await?.remove(&tree) {
+            return Ok(n);
+        }
         if let Some(n) = self.read_tree_stored_opt(tree).await? {
             return Ok(n);
         }
@@ -1445,7 +1448,13 @@ impl Repo {
     /// distinct ones: a walk that knows a whole level of a tree reads it with
     /// many reads in flight instead of one.
     pub async fn read_trees(&self, trees: &[Hash]) -> Result<Vec<TreeNode>> {
-        let mut nodes = self.read_trees_stored(trees).await?;
+        let mut nodes = self.lazy_first(trees).await?;
+        let rest: Vec<Hash> = trees
+            .iter()
+            .filter(|t| !nodes.contains_key(*t))
+            .copied()
+            .collect();
+        nodes.extend(self.read_trees_stored(&rest).await?);
         let mut uses: HashMap<Hash, usize> = HashMap::with_capacity(trees.len());
         for t in trees {
             *uses.entry(*t).or_default() += 1;
@@ -1545,7 +1554,12 @@ impl Repo {
         if let Some(t) = self.trees.get(&tree) {
             return Ok(t);
         }
-        let view = match self.blobs.get(&tree).await? {
+        let derived = self.lazy_first(&[tree]).await?.remove(&tree);
+        let stored = match derived {
+            Some(n) => Some(Bytes::from(n.encode())),
+            None => self.blobs.get(&tree).await?,
+        };
+        let view = match stored {
             Some(b) if Hash::of_object(TreeNode::KIND, &b) != tree => {
                 return Err(Error::Storage(format!("corrupt tree node {tree}")))
             }

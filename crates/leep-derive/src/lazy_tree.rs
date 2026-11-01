@@ -100,6 +100,13 @@ impl LazyTrees {
         self.depths.lock().unwrap().get(id)
     }
 
+    /// `id`'s tree is being stored: readers should ask the store for it.
+    pub(crate) fn forget_depth(&self, id: &ChangesetId) {
+        let mut d = self.depths.lock().unwrap();
+        d.new.remove(id);
+        d.old.remove(id);
+    }
+
     pub(crate) fn remember_depth(&self, id: ChangesetId, depth: u32) {
         self.depths.lock().unwrap().insert(id, depth);
     }
@@ -240,6 +247,36 @@ impl Repo {
                 out.insert(tree, n.clone());
             }
             chains.insert(id, derived.chain);
+        }
+        Ok(out)
+    }
+
+    /// The nodes among `trees` known not to be stored, so not worth asking
+    /// the store for: derived earlier, or roots of trees this process
+    /// created without their nodes, derived now. On the filesystem store a
+    /// miss rescans the packs, and a slow-path merge that asked the store
+    /// for every node of a land's tree before deriving it spent most of its
+    /// time there (ADR 0069). A tree stored since is derived anyway, which
+    /// gives the same nodes.
+    pub(crate) async fn lazy_first(&self, trees: &[Hash]) -> Result<HashMap<Hash, TreeNode>> {
+        let mut out = HashMap::new();
+        let mut derive = Vec::new();
+        for t in trees {
+            if out.contains_key(t) {
+                continue;
+            }
+            if let Some(n) = self.derived_node(t) {
+                out.insert(*t, n);
+            } else if self
+                .lazy
+                .origin(t)
+                .is_some_and(|id| self.lazy.depth(&id).is_some())
+            {
+                derive.push(*t);
+            }
+        }
+        if !derive.is_empty() {
+            out.extend(self.lazy_nodes(&derive).await?);
         }
         Ok(out)
     }
@@ -471,12 +508,22 @@ impl Repo {
                 out.push((h, bytes, node));
                 continue;
             }
-            if h == empty || !seen.insert(h) || self.read_tree_stored_opt(h).await?.is_some() {
+            if h == empty || !seen.insert(h) {
                 continue;
             }
-            let node = match local.get(&h) {
-                Some(n) => n.clone(),
-                None => self.read_tree(h).await?,
+            // A node known unstored is not asked of the store (a miss can
+            // rescan its packs); writing one that is stored after all is
+            // harmless.
+            let known = match local.get(&h) {
+                Some(n) => Some(n.clone()),
+                None => self.lazy_first(&[h]).await?.remove(&h),
+            };
+            let node = match known {
+                Some(n) => n,
+                None => match self.read_tree_stored_opt(h).await? {
+                    Some(_) => continue,
+                    None => self.read_tree(h).await?,
+                },
             };
             let bytes = Bytes::from(node.encode());
             let dirs: Vec<Hash> = node
@@ -510,6 +557,7 @@ impl Repo {
             self.put_rescuing_many(nodes, &[]).await?;
         }
         self.put_rescuing_many(vec![root], &[]).await?;
+        self.lazy.forget_depth(&id);
         metrics::counter!("leep_lazy_tree_materialized_total").increment(1);
         Ok(true)
     }
