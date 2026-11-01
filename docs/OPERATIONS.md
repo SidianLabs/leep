@@ -1114,6 +1114,27 @@ If something landed in between, `leep-main` reports `diverged` and Leep's
 side is on `leep-diverged/main`. Merge it in git and push; the mirror lands
 the merge ([Mirror states](#mirror-states)).
 
+### The production environment
+
+`.github/workflows/remote.yml` (a shell command on the server over SSH,
+[DEPLOY.md](DEPLOY.md#running-commands-on-the-server-from-github-actions))
+runs in the GitHub environment `production`. A repository admin sets it up
+once, under Settings > Environments > New environment, `production`:
+
+- **Required reviewers**: the maintainer (and anyone else trusted to run
+  commands on the server). Each run then waits for one of them to approve.
+- **Deployment branches**: `main` only.
+- **Environment secrets**: move `DEPLOY_HOST`, `DEPLOY_USER`,
+  `DEPLOY_SSH_KEY` and `DEPLOY_KNOWN_HOSTS` here from the repository
+  secrets, so no other workflow can read them.
+
+The workflow needs no change once the environment exists. Until an admin
+creates it, the first run creates an unprotected `production` environment,
+so set the reviewers before relying on it.
+
+All workflows declare a read-only `permissions:` block (`contents: read`);
+none needs to write to the repository.
+
 ### Dependabot
 
 Dependabot opens pull requests from its own branches, which cannot be

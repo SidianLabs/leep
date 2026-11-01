@@ -722,7 +722,10 @@ this and added to that user's `~/.ssh/authorized_keys`) and
 `DEPLOY_KNOWN_HOSTS` (the server's host key line, so a changed host key fails
 the run). Anyone who can dispatch workflows can run any command as that user,
 so give the user only the rights deploys need. Revoke by deleting the key's
-line from `authorized_keys`.
+line from `authorized_keys`. The job runs in the GitHub environment
+`production`: have a repository admin give it required reviewers, limit it
+to `main` and keep the four secrets there
+([OPERATIONS.md](OPERATIONS.md#the-production-environment)).
 
 ## Monitoring and runbooks
 

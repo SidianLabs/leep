@@ -151,6 +151,13 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   base, and a path whose answers differ is reported as a conflict. The
   review rules on merges (`merge-parent`, dropped side changes) check every
   base too. See ADR 0071. Fixes #160.
+### CI permissions
+- **Changed.** `.github/workflows/rust.yml` declares a read-only
+  `permissions:` block like the other workflows, and `remote.yml` runs in
+  the `production` environment, which a repository admin should give
+  required reviewers and the deploy secrets (OPERATIONS.md, "The
+  production environment").
+
 ### Server errors, metrics listener and peer prefixes
 - **Changed.** A 500 answers with a generic `error` and the
   `request_id`; the underlying error text (from the metadata or blob
