@@ -696,7 +696,11 @@ operation it thinks for an exponentially distributed time with mean
 are one of `--hot-files` shared files, which is where conflicts come from.
 A land answered 409 is sent again after a short pause; one that times out,
 loses its connection or gets a 5xx is resent the way a client would, with
-its land id (ADR 0057) unless `--land-id false`.
+its land id (ADR 0057) unless `--land-id false`. A read refused because its class is full
+(503 with `Leep-Refused`, ADR 0060 and ADR 0074) is not sent again: it is
+reported under *shed reads* by the server's class (`search`, `blame`,
+`log_filtered`), and the agent waits its `Retry-After` plus up to half
+again before its next operation, so shed agents do not spin.
 
 Every land writes a unique marker (its message, `swarm <run> a<agent> s<seq>`).
 After the window the generator walks the target ref's whole history and

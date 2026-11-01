@@ -23,6 +23,9 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 - **Changed.** `LeepReadsShedding` fires per class (`search`, `blame`,
   `log_filtered`) from the class counters; servers without the new counters
   do not trigger it.
+- **Changed.** `leep-swarm` reports shed reads by the server's class name
+  and waits the `Retry-After` plus jitter after a shed read instead of
+  going straight on.
 
 ### A lagging index no longer starves its own warmer
 - **Changed.** A bounded path log, last-change or filtered log whose index

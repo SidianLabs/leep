@@ -232,7 +232,8 @@ struct Tally {
     /// Reads answered at an older changeset (`stale-ok`), by route.
     stale: BTreeMap<&'static str, u64>,
     /// Reads the server refused because their class was full (503 with
-    /// `Leep-Refused`, ADR 0060), by route: shed, not failed or timed out.
+    /// `Leep-Refused`, ADR 0060, ADR 0074), by the server's class name
+    /// (`search`, `blame`, `log_filtered`): shed, not failed or timed out.
     shed: BTreeMap<&'static str, u64>,
 }
 
@@ -268,8 +269,9 @@ enum ReadAnswer {
     },
     /// 503 because the index lags (ADR 0058).
     Indexing,
-    /// 503 with `Leep-Refused`: refused before any work (ADR 0060).
-    Shed,
+    /// 503 with `Leep-Refused`: refused before any work (ADR 0060), with
+    /// its `Retry-After`.
+    Shed(Duration),
     Status(u16),
     Lost(String),
 }
@@ -293,16 +295,8 @@ impl Shared {
             Err(e) => return Answer::Lost(short_err(&e)),
         };
         let status = res.status();
-        if status == StatusCode::SERVICE_UNAVAILABLE
-            && res.headers().contains_key(leep_core::api::REFUSED_HEADER)
-        {
-            let wait = res
-                .headers()
-                .get("retry-after")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.trim().parse::<u64>().ok())
-                .unwrap_or(1);
-            return Answer::Refused(Duration::from_secs(wait));
+        if let Some(wait) = refused_wait(status, res.headers()) {
+            return Answer::Refused(wait);
         }
         let bytes = match res.bytes().await {
             Ok(b) => b,
@@ -336,34 +330,12 @@ impl Shared {
     /// A read, with `--indexing-header` when it is index-backed.
     async fn read(&self, server: usize, path: &str, indexed: bool) -> ReadAnswer {
         let url = format!("{}{path}", self.servers[server]);
-        let mut rq = self.client.get(url);
-        if let (true, Some(h)) = (indexed, &self.args.indexing_header) {
-            rq = rq.header("leep-indexing", h.as_str());
-        }
-        match rq.send().await {
-            Err(e) => ReadAnswer::Lost(short_err(&e)),
-            Ok(r) => {
-                let s = r.status();
-                if s == StatusCode::SERVICE_UNAVAILABLE
-                    && r.headers().contains_key(leep_core::api::REFUSED_HEADER)
-                {
-                    return ReadAnswer::Shed;
-                }
-                match r.bytes().await {
-                    Err(e) => ReadAnswer::Lost(short_err(&e)),
-                    Ok(b) if s == StatusCode::OK => ReadAnswer::Ok {
-                        stale: indexed && contains(&b, b"\"answered_at\""),
-                    },
-                    Ok(b)
-                        if s == StatusCode::SERVICE_UNAVAILABLE
-                            && contains(&b, b"\"indexing\"") =>
-                    {
-                        ReadAnswer::Indexing
-                    }
-                    Ok(_) => ReadAnswer::Status(s.as_u16()),
-                }
-            }
-        }
+        let header = if indexed {
+            self.args.indexing_header.as_deref()
+        } else {
+            None
+        };
+        read_at(&self.client, url, header, indexed).await
     }
 
     async fn put_blob(&self, server: usize, data: Vec<u8>) -> Answer<Hash> {
@@ -375,6 +347,72 @@ impl Shared {
             Ok(r) => Answer::Status(r.status().as_u16()),
         }
     }
+}
+
+/// The `Retry-After` of a 503 with `Leep-Refused` (refused before any
+/// work, ADR 0060), 1 s when it has none; `None` for any other answer.
+fn refused_wait(status: StatusCode, headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    if status != StatusCode::SERVICE_UNAVAILABLE
+        || !headers.contains_key(leep_core::api::REFUSED_HEADER)
+    {
+        return None;
+    }
+    let secs = headers
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(1);
+    Some(Duration::from_secs(secs))
+}
+
+/// One GET of `url`, sending `Leep-Indexing: <indexing>` when given.
+async fn read_at(
+    client: &Client,
+    url: String,
+    indexing: Option<&str>,
+    indexed: bool,
+) -> ReadAnswer {
+    let mut rq = client.get(url);
+    if let Some(h) = indexing {
+        rq = rq.header("leep-indexing", h);
+    }
+    match rq.send().await {
+        Err(e) => ReadAnswer::Lost(short_err(&e)),
+        Ok(r) => {
+            let s = r.status();
+            if let Some(wait) = refused_wait(s, r.headers()) {
+                return ReadAnswer::Shed(wait);
+            }
+            match r.bytes().await {
+                Err(e) => ReadAnswer::Lost(short_err(&e)),
+                Ok(b) if s == StatusCode::OK => ReadAnswer::Ok {
+                    stale: indexed && contains(&b, b"\"answered_at\""),
+                },
+                Ok(b) if s == StatusCode::SERVICE_UNAVAILABLE && contains(&b, b"\"indexing\"") => {
+                    ReadAnswer::Indexing
+                }
+                Ok(_) => ReadAnswer::Status(s.as_u16()),
+            }
+        }
+    }
+}
+
+/// The server's read class (ADR 0060, ADR 0074) of a swarm read, as named
+/// in `leep_read_class_shed_total`, or `None` for one that is never shed.
+fn read_class(kind: Read, path: &str) -> Option<&'static str> {
+    match kind {
+        Read::Search => Some("search"),
+        Read::Blame => Some("blame"),
+        Read::Log if path.contains("path=") => Some("log_filtered"),
+        Read::Log | Read::Files | Read::Diff => None,
+    }
+}
+
+/// How long an agent waits after a shed read: the `Retry-After` plus up to
+/// half again, as `leep` does, so shed agents do not come back in step.
+/// `unit` is uniform in [0, 1).
+fn shed_backoff(wait: Duration, unit: f64) -> Duration {
+    wait.mul_f64(1.0 + unit.clamp(0.0, 1.0) / 2.0)
 }
 
 fn contains(hay: &[u8], needle: &[u8]) -> bool {
@@ -504,10 +542,14 @@ async fn agent(s: Arc<Shared>, who: usize, start_after: Duration) -> Tally {
                         *t.indexing.entry(op).or_default() += 1;
                     }
                 }
-                ReadAnswer::Shed => {
+                // Not retried: the agent moves on, after the wait the server
+                // asked for, so shed agents do not spin on a full class.
+                ReadAnswer::Shed(wait) => {
                     if measuring {
-                        *t.shed.entry(op).or_default() += 1;
+                        let class = read_class(kind, &path).unwrap_or(op);
+                        *t.shed.entry(class).or_default() += 1;
                     }
+                    sleep_unless_stopped(&s, shed_backoff(wait, rng.unit())).await;
                 }
                 ReadAnswer::Status(c) => t.error(format!("{op} {c}")),
                 ReadAnswer::Lost(e) => t.error(format!("{op} {e}")),
@@ -1015,7 +1057,8 @@ struct Report {
     indexing_answers: BTreeMap<String, u64>,
     /// Reads answered at an older changeset, by route.
     stale_answers: BTreeMap<String, u64>,
-    /// Reads refused because their class was full (ADR 0060), by route.
+    /// Reads refused because their class was full (ADR 0060, ADR 0074),
+    /// by class (`search`, `blame`, `log_filtered`).
     shed_reads: BTreeMap<String, u64>,
     /// Queries that derived an index inline in `lease` or `off` mode
     /// (`leep_query_inline_derive_total`; 0 while a lease lives).
@@ -1341,5 +1384,80 @@ fn print_report(r: &Report) {
     );
     if !r.errors.is_empty() {
         println!("errors: {:?}", r.errors);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A server that answers every request with `head` and an empty body.
+    async fn answering(head: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = sock.read(&mut buf).await;
+                    let _ = sock.write_all(head.as_bytes()).await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn a_shed_read_carries_its_retry_after() {
+        let client = Client::new();
+        let shed = answering(
+            "HTTP/1.1 503 Service Unavailable\r\nretry-after: 3\r\nleep-refused: read-class\r\n\
+             content-length: 0\r\nconnection: close\r\n\r\n",
+        )
+        .await;
+        let a = read_at(&client, format!("{shed}/v1/blame/x?path=a"), None, true).await;
+        assert!(matches!(a, ReadAnswer::Shed(w) if w == Duration::from_secs(3)));
+
+        // Without Retry-After, a second; without Leep-Refused, not shed.
+        let bare = answering(
+            "HTTP/1.1 503 Service Unavailable\r\nleep-refused: read-class\r\n\
+             content-length: 0\r\nconnection: close\r\n\r\n",
+        )
+        .await;
+        let a = read_at(&client, format!("{bare}/v1/log/x?path=a"), None, true).await;
+        assert!(matches!(a, ReadAnswer::Shed(w) if w == Duration::from_secs(1)));
+        let failing = answering(
+            "HTTP/1.1 503 Service Unavailable\r\nretry-after: 3\r\n\
+             content-length: 0\r\nconnection: close\r\n\r\n",
+        )
+        .await;
+        let a = read_at(&client, format!("{failing}/v1/blame/x"), None, true).await;
+        assert!(matches!(a, ReadAnswer::Status(503)));
+    }
+
+    #[test]
+    fn shed_reads_are_counted_by_the_servers_class() {
+        assert_eq!(read_class(Read::Blame, "/v1/blame/x?path=f"), Some("blame"));
+        assert_eq!(
+            read_class(Read::Log, "/v1/log/x?limit=20&path=hot/h1"),
+            Some("log_filtered")
+        );
+        assert_eq!(read_class(Read::Log, "/v1/log/x?limit=20"), None);
+        assert_eq!(
+            read_class(Read::Search, "/v1/search/main?q=a"),
+            Some("search")
+        );
+        assert_eq!(read_class(Read::Files, "/v1/files/x"), None);
+        assert_eq!(read_class(Read::Diff, "/v1/diff?to=x"), None);
+    }
+
+    #[test]
+    fn a_shed_agent_waits_the_retry_after_plus_up_to_half() {
+        let w = Duration::from_secs(2);
+        assert_eq!(shed_backoff(w, 0.0), w);
+        assert_eq!(shed_backoff(w, 0.5), Duration::from_millis(2500));
+        assert!(shed_backoff(w, 0.999_999) < Duration::from_secs(3));
+        assert_eq!(shed_backoff(w, 7.0), Duration::from_secs(3));
     }
 }
