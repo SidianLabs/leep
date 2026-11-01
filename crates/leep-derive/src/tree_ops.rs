@@ -509,10 +509,10 @@ impl Repo {
         let Some(info) = self.lookup_file(id, path).await? else {
             return Ok(None);
         };
-        let data =
-            self.blobs().get(&info.content).await?.ok_or_else(|| {
-                Error::Storage(format!("blob {} missing for {path}", info.content))
-            })?;
+        let data = self
+            .read_content(&info.content)
+            .await?
+            .ok_or_else(|| Error::Storage(format!("blob {} missing for {path}", info.content)))?;
         Ok(Some((info, data)))
     }
 

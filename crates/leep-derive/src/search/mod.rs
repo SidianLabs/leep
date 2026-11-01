@@ -760,10 +760,10 @@ impl Repo {
                 Some(true) => {}
             }
         }
-        let data =
-            self.blobs().get(&f.content).await?.ok_or_else(|| {
-                Error::Storage(format!("blob {} missing for {}", f.content, f.path))
-            })?;
+        let data = self
+            .read_content(&f.content)
+            .await?
+            .ok_or_else(|| Error::Storage(format!("blob {} missing for {}", f.content, f.path)))?;
         let fetched = data.len() as u64;
         let path = RepoPath::new(f.path.as_str())?;
         let skip_lines = f.skip_lines;

@@ -628,7 +628,7 @@ impl Repo {
     /// for one that is not UTF-8.
     async fn texts_of(&self, infos: &[&FileInfo]) -> Result<Vec<Option<Arc<String>>>> {
         let hashes: Vec<Hash> = infos.iter().map(|i| i.content).collect();
-        let found = self.blobs().get_many(&hashes).await?;
+        let found = self.read_contents(&hashes).await?;
         if found.len() != infos.len() {
             return Err(Error::Storage(format!(
                 "get_many answered {} of {} blobs",

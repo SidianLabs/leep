@@ -1597,6 +1597,40 @@ impl Repo {
         Ok(())
     }
 
+    /// The bytes of a file content named by a stored changeset or tree:
+    /// `get`, and after a miss `get_exact`, so a content in a pack another
+    /// process published a moment ago (a land elsewhere) is not reported
+    /// missing within the stamp's window (ADR 0070). Costs nothing more on
+    /// a hit.
+    pub async fn read_content(&self, hash: &Hash) -> Result<Option<Bytes>> {
+        match self.blobs.get(hash).await? {
+            Some(b) => Ok(Some(b)),
+            None => self.blobs.get_exact(hash).await,
+        }
+    }
+
+    /// [`Repo::read_content`] of each of `hashes`, in order, with one
+    /// `get_many` and the misses asked again together.
+    pub async fn read_contents(&self, hashes: &[Hash]) -> Result<Vec<Option<Bytes>>> {
+        let mut found = self.blobs.get_many(hashes).await?;
+        if found.len() != hashes.len() {
+            return Err(Error::Storage(format!(
+                "get_many answered {} of {} blobs",
+                found.len(),
+                hashes.len()
+            )));
+        }
+        let missed: Vec<usize> = (0..hashes.len()).filter(|&i| found[i].is_none()).collect();
+        for chunk in missed.chunks(leep_core::store::GET_IN_FLIGHT) {
+            let asks = chunk.iter().map(|&i| self.blobs.get_exact(&hashes[i]));
+            let again = futures_util::future::try_join_all(asks).await?;
+            for (&i, b) in chunk.iter().zip(again) {
+                found[i] = b;
+            }
+        }
+        Ok(found)
+    }
+
     /// [`Repo::read_tree`] as a [`TreeView`], kept in a bounded cache, for
     /// walks that look up names in the same directories again and again.
     pub(crate) async fn read_tree_view(&self, tree: Hash) -> Result<Arc<TreeView>> {
