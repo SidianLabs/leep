@@ -159,4 +159,24 @@ still read before the directory. A repack rescans explicitly at each step.
 - The benchmark of the context is rerun in the "Results" section.
 
 ## Results
-Pending the benchmark run.
+The clean benchmark of the context (release build, server on CPUs 0-1,
+`leep-land-bench` on 2-3, Postgres, fresh database and filesystem store,
+`--agents 1024 --overlap-pct 5 --base-lag 0 --subtrees 256
+--fixture-files 20000 --files 2`, 20 s warm-up, 60 s window):
+
+| | lands/s | land p50 | land p99 | 503s |
+|---|---|---|---|---|
+| main (before ADR 0069) | | | 4.5 s | 115 |
+| lazy create trees (ADR 0069) | | | 12.4 s | 8,303 |
+| with stamps (this ADR) | 221.6 | 4.04 s | 4.56 s | 483 |
+
+All 483 503s were land admission refusals within two seconds at the start
+of the warm-up, when 1,024 agents arrived at once; none fell in the
+measured window. Over the whole run (setup included) the store resolved
+19,010 view misses (38,984 hashes, all absent), 91% of them in under 25 µs
+and 0.88 s in all, with 1,872 scans: 623 `miss_changed` (217 land packs
+and 6 background merges were published), 250 `miss_unconfirmed`, 962
+`miss_forced` (exact tree reads of slow-path lands), 36 `repack`, 1
+`first`. Before, each miss was a scan. Land latency is now the land
+queue: lands waited 3.6 s on average for their batch, about the 5 s
+admission bound, with the leader replaying 217 batches of 64.
