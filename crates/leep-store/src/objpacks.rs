@@ -4,9 +4,9 @@
 //! read with ranged GETs.
 //!
 //! There is no directory to watch. Every publisher writes `packs/.gen` after
-//! the index it publishes, so a miss HEADs that one object (at most once per
-//! [`GEN_WINDOW`] in a process) and lists `packs/` only when its etag
-//! changed (ADR 0070). A bucket without it (written only by older servers)
+//! the index it publishes, so a miss reads that one small object (at most
+//! once per [`GEN_WINDOW`] in a process) and lists `packs/` only when its
+//! contents changed (ADR 0070). A bucket without it (written only by older servers)
 //! is listed on every miss, as ADR 0068 did. The full listing, tombstones
 //! included, still runs on a miss at most once per refresh interval (ADR
 //! 0040).
@@ -38,7 +38,7 @@ const LOAD_CONCURRENCY: usize = 8;
 /// The pack-set generation stamp (ADR 0070): rewritten, last writer wins,
 /// by every writer after it publishes or deletes a pack.
 pub(crate) const GEN_KEY: &str = "packs/.gen";
-/// How old a HEAD of [`GEN_KEY`] a miss may reuse: concurrent misses in one
+/// How old a read of [`GEN_KEY`] a miss may reuse: concurrent misses in one
 /// process share one request.
 pub(crate) const GEN_WINDOW: Duration = Duration::from_millis(50);
 
@@ -46,22 +46,25 @@ pub(crate) fn gen_key() -> Path {
     Path::from(GEN_KEY)
 }
 
-/// What a HEAD of [`GEN_KEY`] saw.
+/// What a read of [`GEN_KEY`] saw.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Gen {
     /// No stamp: only older servers wrote this bucket.
     Absent,
-    /// The stamp's etag (or version): every write of it differs.
-    Tag(String),
-    /// A backend that reports neither, so changes cannot be seen.
+    /// The stamp's contents, which every write makes unique. Compared
+    /// instead of an etag: some backends derive the etag from metadata
+    /// (the local filesystem's is inode, mtime and size), which two writes
+    /// can share.
+    Body(Bytes),
+    /// An empty stamp, which no writer leaves, so changes cannot be seen.
     Unknown,
 }
 
 /// Announce a change of the published packs: write [`GEN_KEY`] with
 /// contents no other write has (the pack id, this process, a counter and
-/// the time), so its etag changes. Called after the index PUT or the
-/// deletes it announces, before the write returns: a reader that HEADs the
-/// stamp after that sees a new etag and lists `packs/`.
+/// the time). Called after the index PUT or the
+/// deletes it announces, before the write returns: a reader that reads the
+/// stamp after that sees new contents and lists `packs/`.
 pub(crate) async fn bump_gen(store: &dyn ObjectStore, pack_id: &str) -> Result<()> {
     static WRITES: AtomicU64 = AtomicU64::new(0);
     let nanos = std::time::SystemTime::now()
@@ -80,13 +83,22 @@ pub(crate) async fn bump_gen(store: &dyn ObjectStore, pack_id: &str) -> Result<(
     Ok(())
 }
 
-async fn head_gen(store: &dyn ObjectStore) -> Result<Gen> {
-    match store.head(&gen_key()).await {
-        Ok(m) => Ok(match (m.e_tag, m.version) {
-            (Some(t), _) => Gen::Tag(t),
-            (None, Some(v)) => Gen::Tag(v),
-            (None, None) => Gen::Unknown,
-        }),
+/// One GET of the stamp: about 60 bytes, so it costs what a HEAD does.
+pub(crate) async fn read_gen(store: &dyn ObjectStore) -> Result<Gen> {
+    match store.get(&gen_key()).await {
+        Ok(r) => {
+            let body = match r.bytes().await {
+                Ok(b) => b,
+                // Replaced or deleted between the response and its body.
+                Err(e) if not_found(&e) => return Ok(Gen::Absent),
+                Err(e) => return Err(storage_err(e)),
+            };
+            Ok(if body.is_empty() {
+                Gen::Unknown
+            } else {
+                Gen::Body(body)
+            })
+        }
         Err(e) if not_found(&e) => Ok(Gen::Absent),
         Err(e) => Err(storage_err(e)),
     }
@@ -134,8 +146,8 @@ pub(crate) struct View {
     /// When the latest listing of `packs/` began, this one's or a later
     /// one that only looked for new packs.
     packs_started: Instant,
-    /// The stamp a HEAD that ended before that listing began saw: while a
-    /// later HEAD sees the same, no pack was published since.
+    /// The stamp a read that ended before that listing began saw: while a
+    /// later read sees the same, no pack was published since.
     gen: Gen,
 }
 
@@ -267,7 +279,7 @@ async fn load_pack(store: &dyn ObjectStore, id: &str) -> Result<Option<RemotePac
     }))
 }
 
-/// A HEAD of the stamp, kept for misses within [`GEN_WINDOW`] of it.
+/// A read of the stamp, kept for misses within [`GEN_WINDOW`] of it.
 struct GenSeen {
     started: Instant,
     gen: Gen,
@@ -277,7 +289,7 @@ pub(crate) struct RemotePackSet {
     store: Arc<dyn ObjectStore>,
     view: RwLock<Option<Arc<View>>>,
     refreshing: tokio::sync::Mutex<()>,
-    /// Held while HEADing the stamp; taken after `refreshing`, never before.
+    /// Held while reading the stamp; taken after `refreshing`, never before.
     gen_check: tokio::sync::Mutex<()>,
     last_gen: std::sync::Mutex<Option<GenSeen>>,
     /// Listings of `packs/` so far, for tests.
@@ -317,7 +329,7 @@ impl RemotePackSet {
         Ok(list_packs_dir(&*self.store).await?.0)
     }
 
-    /// The stamp as seen by a HEAD that began at or after `since`: a recent
+    /// The stamp as seen by a read that began at or after `since`: a recent
     /// one if there is one, else a new one, shared by concurrent callers.
     async fn gen_since(&self, since: Instant) -> Result<Gen> {
         let recent = |seen: &Option<GenSeen>| {
@@ -333,7 +345,7 @@ impl RemotePackSet {
             return Ok(g);
         }
         let started = Instant::now();
-        let gen = head_gen(&*self.store).await?;
+        let gen = read_gen(&*self.store).await?;
         *self.last_gen.lock().unwrap() = Some(GenSeen {
             started,
             gen: gen.clone(),
@@ -452,8 +464,8 @@ impl RemotePackSet {
             .gen_since(asked.checked_sub(GEN_WINDOW).unwrap_or(asked))
             .await?;
         match (&gen, &view.gen) {
-            (Gen::Tag(now), Gen::Tag(then)) if now == then => Ok(view),
-            (Gen::Tag(_), _) => self.refresh_new_packs(asked, ScanReason::MissChanged).await,
+            (Gen::Body(now), Gen::Body(then)) if now == then => Ok(view),
+            (Gen::Body(_), _) => self.refresh_new_packs(asked, ScanReason::MissChanged).await,
             _ => {
                 self.refresh_new_packs(asked, ScanReason::MissUnstamped)
                     .await

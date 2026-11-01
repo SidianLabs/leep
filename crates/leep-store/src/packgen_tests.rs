@@ -274,3 +274,43 @@ async fn a_stamped_bucket_lists_only_after_a_publish() {
         .unwrap();
     assert!(body.starts_with(newest.id.as_bytes()));
 }
+
+/// On the local filesystem backend, whose etag is inode, mtime and size,
+/// stamps are told apart by their contents: every write differs, even two
+/// of the same length within one mtime tick on a reused inode.
+#[tokio::test]
+async fn the_stamp_is_compared_by_contents_on_the_local_backend() {
+    let dir = tempfile::tempdir().unwrap();
+    let writer = ObjectBlobStore::local(dir.path()).unwrap();
+    let reader = ObjectBlobStore::local(dir.path()).unwrap();
+    publish(&writer, "first").await;
+    let objects = writer.store.clone();
+    let mut seen = Vec::new();
+    for _ in 0..20 {
+        crate::objpacks::bump_gen(&*objects, &"ab".repeat(32))
+            .await
+            .unwrap();
+        seen.push(crate::objpacks::read_gen(&*objects).await.unwrap());
+    }
+    for (i, g) in seen.iter().enumerate() {
+        assert!(matches!(g, crate::objpacks::Gen::Body(_)), "{g:?}");
+        assert!(!seen[..i].contains(g), "stamp {i} repeats an earlier one");
+    }
+
+    assert!(reader.get(&absent()).await.unwrap().is_none());
+    let lists = reader.packs.lists();
+    for _ in 0..5 {
+        assert!(reader.get(&absent()).await.unwrap().is_none());
+    }
+    assert_eq!(reader.packs.lists(), lists, "no listing while unchanged");
+    let late = publish(&writer, "late").await;
+    tokio::time::sleep(crate::objpacks::GEN_WINDOW + Duration::from_millis(10)).await;
+    for (h, data) in &late {
+        assert_eq!(reader.get(h).await.unwrap().as_ref(), Some(data), "{h}");
+    }
+    let exact = publish(&writer, "exact").await;
+    assert_eq!(
+        reader.get_exact(&exact[0].0).await.unwrap(),
+        Some(exact[0].1.clone())
+    );
+}

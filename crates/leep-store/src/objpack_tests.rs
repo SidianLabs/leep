@@ -858,10 +858,13 @@ async fn request_counts() {
         .is_none());
     let miss = counting.take();
     println!("miss within the refresh interval: {miss:?}");
-    // The loose GET, and a HEAD of the unchanged stamp (none if one less
+    // The loose GET, and a GET of the unchanged stamp (none if one less
     // than 50 ms old is reused) instead of a listing of `packs/` (ADR 0070).
-    assert_eq!(miss.get("GET"), Some(&1), "{miss:?}");
-    assert!(miss.get("HEAD").is_none_or(|n| *n <= 1), "{miss:?}");
+    assert!(
+        miss.get("GET").is_some_and(|n| (1..=2).contains(n)),
+        "{miss:?}"
+    );
+    assert!(!miss.contains_key("HEAD"), "{miss:?}");
     assert!(!miss.contains_key("LIST"), "{miss:?}");
     assert!(reader
         .get(&Hash::of_blob(b"absent"))
@@ -870,7 +873,7 @@ async fn request_counts() {
         .is_none());
     let again = counting.take();
     println!("another miss within the stamp window: {again:?}");
-    assert!(again.get("HEAD").is_none_or(|n| *n <= 1), "{again:?}");
+    assert!(again.get("GET").is_some_and(|n| *n <= 2), "{again:?}");
     assert!(!again.contains_key("LIST"), "{again:?}");
     assert!(reader
         .get_exact(&Hash::of_blob(b"absent"))
