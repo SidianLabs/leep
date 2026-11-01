@@ -7,6 +7,23 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 ## [Unreleased]
 
+### Blame and filtered logs are limited by default
+- **Changed.** `--read-concurrency` now limits the `blame` class
+  (`GET /v1/blame`), default one per core and at least 2, and the
+  `log_filtered` class (`GET /v1/log` with a path, `author` or `extra`, and
+  `GET /v1/last-change`), default twice that; on two cores search 1, blame
+  2, filtered log 4. One more is refused at once, before any store read,
+  with the documented `503` `unavailable`, `Retry-After` and
+  `Leep-Refused: read-class`, which `leep` already retries. `blame=off` and
+  `log_filtered=off` restore the old behaviour. In a 2,000-agent swarm on
+  two cores, unlimited blames and path logs held the whole metadata pool
+  and pushed create p50 to 3.4 s and land p50 to 1.4 s. See ADR 0074.
+- **Added.** `leep_read_class_admitted_total{class}` and
+  `leep_read_class_completed_total{class}`.
+- **Changed.** `LeepReadsShedding` fires per class (`search`, `blame`,
+  `log_filtered`) from the class counters; servers without the new counters
+  do not trigger it.
+
 ### A lagging index no longer starves its own warmer
 - **Changed.** A bounded path log, last-change or filtered log whose index
   is further behind than its scan budget now learns so down the skiplists,

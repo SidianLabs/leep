@@ -293,11 +293,12 @@ struct Args {
     #[arg(long, env = "LEEP_INDEX_WAITERS", default_value_t = 64)]
     index_waiters: usize,
     /// Most expensive reads of one class this server runs at once (ADR
-    /// 0060), as CLASS=N or CLASS=off. Repeatable; the environment variable
-    /// takes a comma-separated list. A request over the limit is refused at
-    /// once with 503, Retry-After and `Leep-Refused: read-class`. Only
-    /// `search` is limited (default: half the cores, at least 1);
-    /// `land_check`, `blame`, `log_filtered` and `diff_large` take only off.
+    /// 0060, ADR 0074), as CLASS=N or CLASS=off. Repeatable; the environment
+    /// variable takes a comma-separated list. A request over the limit is
+    /// refused at once with 503, Retry-After and `Leep-Refused: read-class`.
+    /// Defaults: `search` half the cores, at least 1; `blame` one per core,
+    /// at least 2; `log_filtered` (path, author or extra log, last-change)
+    /// twice blame. `land_check` and `diff_large` take only off.
     #[arg(long, env = "LEEP_READ_CONCURRENCY", value_delimiter = ',')]
     read_concurrency: Vec<String>,
     /// Directory opens of all searches that may read the metadata store at

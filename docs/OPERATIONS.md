@@ -181,9 +181,11 @@ measured until the response head is ready, not until the body is streamed.
 | `leep_request_body_bytes_in_flight` | gauge | none | Body bytes the requests in flight hold of the `--max-inflight-bytes` budget: each request's `Content-Length`, or its route's cap when it declares none, from admission until its handler finishes. |
 | `leep_request_body_budget_bytes` | gauge | none | The `--max-inflight-bytes` budget, for ratios. |
 | `leep_request_body_refused_total` | counter | `reason` = `budget`, `principal`, `size`; `class` = `blob`, `json` | Requests refused by the server-wide body limits: `budget` is a 503 because the budget was spent, `principal` a 429 because the token already holds its share of it, `size` a 413 over `--max-blob-bytes` (`class="blob"`) or `--max-json-body-bytes` (`class="json"`). All six series exist from startup. |
-| `leep_read_class_permits` | gauge | `class` = `search` | Permits of an expensive read class (`--read-concurrency`, ADR 0060): how many such requests this server runs at once. Absent for a class that is `off`. |
+| `leep_read_class_permits` | gauge | `class` = `search`, `blame`, `log_filtered` | Permits of an expensive read class (`--read-concurrency`, ADR 0060): how many such requests this server runs at once. Absent for a class that is `off`. |
 | `leep_read_class_in_flight` | gauge | `class` | Requests of the class holding a permit, until their response body has been sent or dropped. |
 | `leep_read_class_shed_total` | counter | `class` | Requests of the class refused at once with `503` `unavailable`, `Retry-After` and `Leep-Refused: read-class` because every permit was in use. They also count in `leep_http_requests_total` as 503; `LeepServerErrors` subtracts them. The series exist from startup for each limited class. |
+| `leep_read_class_admitted_total` | counter | `class` | Requests of the class that got a permit. With `leep_read_class_shed_total`, the share shed. |
+| `leep_read_class_completed_total` | counter | `class` | Admitted requests answered 2xx, counted when the permit is released. Per permit, the class's throughput (`LeepReadsShedding`). |
 | `leep_land_admission_refused_total` | counter | `route` = `direct`, `forwarded` | Lands refused at once with `503` `unavailable`, `Retry-After` and `Leep-Refused: admission` because their ref's queue was at `--land-queue-batches` ([Land admission](#land-admission), ADR 0060). `forwarded`: the land came from another server, which relays the 503. Counted by the server that batches the ref; both series exist from startup. Not in `leep_land_total`. They also count in `leep_http_requests_total` as 503, a forwarded one on both servers; `LeepServerErrors` and `LeepLandErrors` subtract them. |
 | `leep_land_queue_batches` | gauge | none | The largest land queue, in batches, over the refs this server batches: the waiting lands over 64, rounded up, plus one while a batch replays. A land waits about one batch time per batch. No ref label: the hottest queue is what matters. |
 | `leep_land_replays_total` | counter | `path` = `fast`, `slow` | Lands replayed onto a moved head (not fast-forwards or lands answered without a move): `fast` copied the stack without a merge because nothing the ref changed since its base touches its paths, `slow` replayed it with a three-way merge per changeset (ADR 0066). Both series exist from startup. |
@@ -429,10 +431,11 @@ to 30 s searches were CPU queueing.
 
 | Flag / env | Default | What it bounds |
 |---|---|---|
-| `--read-concurrency CLASS=N\|off` / `LEEP_READ_CONCURRENCY` (comma-separated) | `search` = half the cores, at least 1 | Requests of a class running at once. Repeatable; a later setting of a class wins. Only `search` (`GET /v1/search/{rev}`) is built. `land_check`, `blame`, `log_filtered` and `diff_large` accept only `off`, which is what the server does for them; a number for one of them stops startup. |
+| `--read-concurrency CLASS=N\|off` / `LEEP_READ_CONCURRENCY` (comma-separated) | `search` = half the cores, at least 1; `blame` = the cores, at least 2; `log_filtered` = twice `blame` (on two cores: 1, 2 and 4) | Requests of a class running at once. Repeatable; a later setting of a class wins. `search` is `GET /v1/search/{rev}`; `blame` is `GET /v1/blame/{id}`; `log_filtered` is `GET /v1/log/{id}` with a non-empty `path`, an `author` or an `extra`, and `GET /v1/last-change/{id}` (ADR 0074). `land_check` and `diff_large` accept only `off`, which is what the server does for them; a number for one of them stops startup. |
 | `--search-pool-permits N\|off` / `LEEP_SEARCH_POOL_PERMITS` | a quarter of `--meta-pool-size`, at least 1 (4 for a pool of 16) | Directory opens of all searches that read the metadata store at once. Each holds up to two connections, so searches together hold at most half of the pool and lands and ref reads keep the rest. |
 
-- A search that finds every permit in use is refused at once, never queued:
+- A search, blame or filtered log that finds every permit of its class in
+  use is refused at once, never queued, before it reads any store:
   `503`, code `unavailable`, `Retry-After` and `Leep-Refused: read-class`.
   `Retry-After` is the class's median request time over its last 64
   requests, divided by its permits and rounded up, between 1 and 10 s.
@@ -447,16 +450,19 @@ to 30 s searches were CPU queueing.
   count is `available_parallelism`, which follows the container's CPU quota
   on Linux.
 - Never limited: lands, ref reads (`/v1/refs`, `/v1/resolve`, `/v1/reflog`),
-  trees, files, blobs, changeset creates, `GET /v1/health` and
-  `GET /v1/ready`. Limits are per process, so N servers run up to N times a
+  trees, files, blobs, changeset creates, a log with no path, author or
+  extra filter, `GET /v1/health` and `GET /v1/ready`. Limits are per process, so N servers run up to N times a
   class's permits.
 - Tuning. `leep_read_class_in_flight` at `leep_read_class_permits` with a
-  rising `leep_read_class_shed_total` means searches wait for cores. On a
+  rising `leep_read_class_shed_total` means that class's reads wait for
+  cores or connections. A blame or path log also holds its permit while it
+  waits for the indexer (`--index-wait`), so a lagging index shows as
+  blame and log shedding; fix the lag, not the class. On a
   host whose lands are idle, raise the class; on a busy one, add query hosts
   (ADR 0058's split). A pool permit that waits shows as search latency, not
   as refusals; raise `--search-pool-permits` only with `--meta-pool-size`.
-- To back out, set `--read-concurrency search=off` (and
-  `--search-pool-permits off`) and restart. Nothing persisted depends on
+- To back out, set `--read-concurrency search=off` (or `blame=off`,
+  `log_filtered=off`; and `--search-pool-permits off`) and restart. Nothing persisted depends on
   either. Balancers must not count these 503s against a backend (see
   [Indexing a large history](#indexing-a-large-history), "Balancers").
 

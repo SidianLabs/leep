@@ -1,16 +1,18 @@
-//! Concurrency limits per class of expensive read (ADR 0060, section 1).
+//! Concurrency limits per class of expensive read (ADR 0060, section 1;
+//! ADR 0074).
 //!
 //! ADR 0020's limits are per token, and a fleet of agents each running one
-//! search is within every token's limit while the searches take every core
-//! the lands need. Each class here has one semaphore for the whole server.
-//! A request that finds its class full is refused at once with `503`
-//! `unavailable`, `Retry-After` and `Leep-Refused: read-class`, never
-//! queued: a queue would only move the pile-up into server memory.
+//! search or blame is within every token's limit while those reads take
+//! every core and connection the lands need. Each class here has one
+//! semaphore for the whole server. A request that finds its class full is
+//! refused at once with `503` `unavailable`, `Retry-After` and
+//! `Leep-Refused: read-class`, never queued: a queue would only move the
+//! pile-up into server memory.
 //!
-//! Only the `search` class is built. The other classes the ADR names are
-//! parsed, so the flag has its final shape, and may be set to `off`, which
-//! is what this server does for them; a number for one of them is refused
-//! at startup instead of being silently ignored.
+//! The `search`, `blame` and `log_filtered` classes are built. The others
+//! the ADR names are parsed, so the flag has its final shape, and may be set
+//! to `off`, which is what this server does for them; a number for one of
+//! them is refused at startup instead of being silently ignored.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -18,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::{Request, State};
-use axum::http::{header, HeaderValue, Method, StatusCode};
+use axum::http::{header, HeaderValue, Method, StatusCode, Uri};
 use axum::middleware::Next;
 use axum::response::Response;
 use http_body_util::BodyExt;
@@ -31,9 +33,10 @@ pub enum ReadClass {
     Search,
     /// `POST /v1/land/check` (ADR 0060, section 3; not built).
     LandCheck,
-    /// `GET /v1/blame/{id}` (not built).
+    /// `GET /v1/blame/{id}`.
     Blame,
-    /// `GET /v1/log/{id}` with a path, `author` or `extra` filter (not built).
+    /// `GET /v1/log/{id}` with a path, `author` or `extra` filter, and
+    /// `GET /v1/last-change/{id}`, which walks the same path history.
     LogFiltered,
     /// `GET /v1/diff` across many generations (not built).
     DiffLarge,
@@ -65,7 +68,10 @@ impl ReadClass {
 
     /// Whether this server can limit the class.
     pub fn is_built(self) -> bool {
-        self == ReadClass::Search
+        matches!(
+            self,
+            ReadClass::Search | ReadClass::Blame | ReadClass::LogFiltered
+        )
     }
 }
 
@@ -83,8 +89,26 @@ const MAX_PERMITS: usize = 1 << 20;
 /// least one, so on a two-core host one core always serves lands and cheap
 /// reads. `available_parallelism` reads the CPU quota on Linux.
 pub fn default_search_permits() -> usize {
-    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
-    (cores / 2).max(1)
+    (cores() / 2).max(1)
+}
+
+/// The `blame` class's default: one per core, at least two (ADR 0074). A
+/// blame spends much of its time waiting on metadata and blob reads, so one
+/// per core keeps the cores busy without letting blames queue for them; two
+/// at least, so on a small host one long blame does not shed every other.
+pub fn default_blame_permits() -> usize {
+    cores().max(2)
+}
+
+/// The `log_filtered` class's default: twice [`default_blame_permits`]. A
+/// path log or last-change is mostly index and changeset reads with little
+/// CPU, and agents send them several times as often as blames.
+pub fn default_log_filtered_permits() -> usize {
+    2 * default_blame_permits()
+}
+
+fn cores() -> usize {
+    std::thread::available_parallelism().map_or(1, |n| n.get())
 }
 
 /// `--search-pool-permits`' default for a metadata pool of `pool_size`
@@ -98,12 +122,16 @@ pub fn default_search_pool_permits(pool_size: u32) -> usize {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReadConcurrency {
     pub search: ClassLimit,
+    pub blame: ClassLimit,
+    pub log_filtered: ClassLimit,
 }
 
 impl Default for ReadConcurrency {
     fn default() -> Self {
         ReadConcurrency {
             search: ClassLimit::Permits(default_search_permits()),
+            blame: ClassLimit::Permits(default_blame_permits()),
+            log_filtered: ClassLimit::Permits(default_log_filtered_permits()),
         }
     }
 }
@@ -113,6 +141,18 @@ impl ReadConcurrency {
     pub fn off() -> Self {
         ReadConcurrency {
             search: ClassLimit::Off,
+            blame: ClassLimit::Off,
+            log_filtered: ClassLimit::Off,
+        }
+    }
+
+    /// The limit of a built class; `Off` for the others.
+    pub fn get(&self, class: ReadClass) -> ClassLimit {
+        match class {
+            ReadClass::Search => self.search,
+            ReadClass::Blame => self.blame,
+            ReadClass::LogFiltered => self.log_filtered,
+            _ => ClassLimit::Off,
         }
     }
 
@@ -159,12 +199,15 @@ impl ReadConcurrency {
             };
             match class {
                 ReadClass::Search => out.search = limit,
+                ReadClass::Blame => out.blame = limit,
+                ReadClass::LogFiltered => out.log_filtered = limit,
                 // Off is what this server does for them already.
                 _ if limit == ClassLimit::Off => {}
                 _ => {
                     return Err(format!(
                         "--read-concurrency {}: this server does not limit that class yet \
-                         (ADR 0060); only search can be limited, and the others only set to off",
+                         (ADR 0060); only search, blame and log_filtered can be limited, \
+                         and the others only set to off",
                         class.name()
                     ))
                 }
@@ -173,12 +216,17 @@ impl ReadConcurrency {
         Ok(out)
     }
 
-    /// `search=2` style, for the startup log.
+    /// `search=1,blame=2,log_filtered=4` style, for the startup log.
     pub fn describe(&self) -> String {
-        match self.search {
-            ClassLimit::Off => "search=off".into(),
-            ClassLimit::Permits(n) => format!("search={n}"),
-        }
+        ReadClass::ALL
+            .into_iter()
+            .filter(|c| c.is_built())
+            .map(|c| match self.get(c) {
+                ClassLimit::Off => format!("{}=off", c.name()),
+                ClassLimit::Permits(n) => format!("{}={n}", c.name()),
+            })
+            .collect::<Vec<_>>()
+            .join(",")
     }
 }
 
@@ -212,6 +260,8 @@ impl Class {
         metrics::gauge!("leep_read_class_permits", "class" => name).set(permits as f64);
         metrics::gauge!("leep_read_class_in_flight", "class" => name).increment(0.0);
         metrics::counter!("leep_read_class_shed_total", "class" => name).increment(0);
+        metrics::counter!("leep_read_class_admitted_total", "class" => name).increment(0);
+        metrics::counter!("leep_read_class_completed_total", "class" => name).increment(0);
         Class {
             class,
             permits,
@@ -249,39 +299,79 @@ impl Class {
 struct Held {
     class: Arc<Class>,
     since: Instant,
+    /// The handler answered 2xx; set once the response head is known.
+    ok: bool,
     _permit: OwnedSemaphorePermit,
 }
 
 impl Drop for Held {
     fn drop(&mut self) {
         self.class.record(self.since.elapsed());
-        metrics::gauge!("leep_read_class_in_flight", "class" => self.class.class.name())
-            .decrement(1.0);
+        let name = self.class.class.name();
+        metrics::gauge!("leep_read_class_in_flight", "class" => name).decrement(1.0);
+        if self.ok {
+            metrics::counter!("leep_read_class_completed_total", "class" => name).increment(1);
+        }
     }
 }
 
 /// The read classes of one server. Flags, so they do not reload.
 pub struct ReadLimits {
     search: Option<Arc<Class>>,
+    blame: Option<Arc<Class>>,
+    log_filtered: Option<Arc<Class>>,
 }
 
 impl ReadLimits {
     pub fn new(config: &ReadConcurrency) -> Arc<ReadLimits> {
-        let search = match config.search {
+        let class = |c: ReadClass| match config.get(c) {
             ClassLimit::Off => None,
-            ClassLimit::Permits(n) => Some(Arc::new(Class::new(ReadClass::Search, n))),
+            ClassLimit::Permits(n) => Some(Arc::new(Class::new(c, n))),
         };
-        Arc::new(ReadLimits { search })
+        Arc::new(ReadLimits {
+            search: class(ReadClass::Search),
+            blame: class(ReadClass::Blame),
+            log_filtered: class(ReadClass::LogFiltered),
+        })
     }
 
-    /// The limited class a request belongs to, if any.
-    fn class_of(&self, method: &Method, path: &str) -> Option<&Arc<Class>> {
-        let read = method == Method::GET || method == Method::HEAD;
-        if read && path.starts_with("/v1/search/") {
-            return self.search.as_ref();
+    /// The limited class a request belongs to, if any. Decided from the
+    /// method, path and query alone, before any store is read.
+    fn class_of(&self, method: &Method, uri: &Uri) -> Option<&Arc<Class>> {
+        if method != Method::GET && method != Method::HEAD {
+            return None;
         }
-        None
+        let path = uri.path();
+        let class = if path.starts_with("/v1/search/") {
+            &self.search
+        } else if path.starts_with("/v1/blame/") {
+            &self.blame
+        } else if path.starts_with("/v1/last-change/")
+            || (path.starts_with("/v1/log/") && log_is_filtered(uri))
+        {
+            &self.log_filtered
+        } else {
+            return None;
+        };
+        class.as_ref()
     }
+}
+
+/// Whether a `GET /v1/log` names a path, `author` or `extra`, as the
+/// handler reads them. A log without them is a first-parent page walk,
+/// cheap and bounded by its limit, and is not limited. A query that does
+/// not parse is refused by the handler before any work.
+fn log_is_filtered(uri: &Uri) -> bool {
+    let Ok(axum::extract::Query(pairs)) =
+        axum::extract::Query::<Vec<(String, String)>>::try_from_uri(uri)
+    else {
+        return false;
+    };
+    pairs.iter().any(|(k, v)| match k.as_str() {
+        "path" => !v.trim_matches('/').is_empty(),
+        "author" | "extra" => true,
+        _ => false,
+    })
 }
 
 /// The answer to a request whose class is full.
@@ -315,19 +405,23 @@ fn refuse(class: &Class) -> Response {
 /// `"unlimited"` ones included: the class protects the server, not a
 /// token's share.
 pub async fn enforce(State(limits): State<Arc<ReadLimits>>, req: Request, next: Next) -> Response {
-    let Some(class) = limits.class_of(req.method(), req.uri().path()).cloned() else {
+    let Some(class) = limits.class_of(req.method(), req.uri()).cloned() else {
         return next.run(req).await;
     };
     let Ok(permit) = class.semaphore.clone().try_acquire_owned() else {
         return refuse(&class);
     };
-    metrics::gauge!("leep_read_class_in_flight", "class" => class.class.name()).increment(1.0);
-    let held = Held {
+    let name = class.class.name();
+    metrics::gauge!("leep_read_class_in_flight", "class" => name).increment(1.0);
+    metrics::counter!("leep_read_class_admitted_total", "class" => name).increment(1);
+    let mut held = Held {
         class,
         since: Instant::now(),
+        ok: false,
         _permit: permit,
     };
     let resp = next.run(req).await;
+    held.ok = resp.status().is_success();
     let (parts, body) = resp.into_parts();
     let body = body.map_frame(move |frame| {
         let _held = &held;
@@ -352,8 +446,12 @@ mod tests {
             p(&["search=off", "search=2"]).unwrap().search,
             ClassLimit::Permits(2)
         );
+        let both = p(&["blame=3", "log_filtered=off", "blame=5"]).unwrap();
+        assert_eq!(both.blame, ClassLimit::Permits(5));
+        assert_eq!(both.log_filtered, ClassLimit::Off);
+        assert_eq!(both.search, d.search);
         // Classes this server does not limit may be set to what it does.
-        for c in ["land_check", "blame", "log_filtered", "diff_large"] {
+        for c in ["land_check", "diff_large"] {
             assert_eq!(p(&[&format!("{c}=off")]).unwrap(), d, "{c}");
             let e = p(&[&format!("{c}=4")]).unwrap_err();
             assert!(e.contains(c) && e.contains("does not limit"), "{e}");
@@ -370,6 +468,28 @@ mod tests {
             assert!(e.contains(want), "{bad}: {e}");
         }
         assert!(p(&["grep=1"]).unwrap_err().contains("log_filtered"));
+    }
+
+    #[test]
+    fn defaults_follow_the_cores() {
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let d = ReadConcurrency::default();
+        assert_eq!(d.search, ClassLimit::Permits((cores / 2).max(1)));
+        assert_eq!(d.blame, ClassLimit::Permits(cores.max(2)));
+        assert_eq!(d.log_filtered, ClassLimit::Permits(2 * cores.max(2)));
+        assert_eq!(
+            d.describe(),
+            format!(
+                "search={},blame={},log_filtered={}",
+                (cores / 2).max(1),
+                cores.max(2),
+                2 * cores.max(2)
+            )
+        );
+        assert_eq!(
+            ReadConcurrency::off().describe(),
+            "search=off,blame=off,log_filtered=off"
+        );
     }
 
     #[test]
@@ -401,22 +521,51 @@ mod tests {
     }
 
     #[test]
-    fn only_searches_are_classified() {
+    fn requests_are_classified_by_route_and_filter() {
         let l = ReadLimits::new(&ReadConcurrency {
             search: ClassLimit::Permits(1),
+            blame: ClassLimit::Permits(1),
+            log_filtered: ClassLimit::Permits(1),
         });
-        assert!(l.class_of(&Method::GET, "/v1/search/main").is_some());
-        assert!(l.class_of(&Method::GET, "/v1/search/team/x").is_some());
-        for (m, p) in [
+        let class = |m: Method, u: &str| {
+            l.class_of(&m, &u.parse::<Uri>().unwrap())
+                .map(|c| c.class.name())
+        };
+        for (m, u, want) in [
+            (Method::GET, "/v1/search/main", "search"),
+            (Method::GET, "/v1/search/team/x?q=a", "search"),
+            (Method::GET, "/v1/blame/x?path=a.txt", "blame"),
+            (Method::HEAD, "/v1/blame/x?path=a.txt", "blame"),
+            (Method::GET, "/v1/log/x?path=a.txt", "log_filtered"),
+            (
+                Method::GET,
+                "/v1/log/x?limit=5&path=d%2Fb.txt",
+                "log_filtered",
+            ),
+            (Method::GET, "/v1/log/x?author=al", "log_filtered"),
+            (Method::GET, "/v1/log/x?extra=k%3Dv", "log_filtered"),
+            (Method::GET, "/v1/last-change/x?path=a.txt", "log_filtered"),
+        ] {
+            assert_eq!(class(m.clone(), u), Some(want), "{m} {u}");
+        }
+        for (m, u) in [
             (Method::POST, "/v1/search/main"),
             (Method::GET, "/v1/refs/main"),
             (Method::POST, "/v1/land"),
-            (Method::GET, "/v1/blame/x"),
             (Method::GET, "/v1/searchy"),
+            (Method::GET, "/v1/log/x"),
+            (Method::GET, "/v1/log/x?limit=20&fields=summary"),
+            (Method::GET, "/v1/log/x?path=&limit=2"),
+            (Method::GET, "/v1/log/x?path=%2F"),
+            (Method::GET, "/v1/files/x?prefix=a"),
+            (Method::GET, "/v1/diff?to=x"),
+            (Method::GET, "/v1/provenance/x?path=a"),
         ] {
-            assert!(l.class_of(&m, p).is_none(), "{m} {p}");
+            assert_eq!(class(m.clone(), u), None, "{m} {u}");
         }
         let off = ReadLimits::new(&ReadConcurrency::off());
-        assert!(off.class_of(&Method::GET, "/v1/search/main").is_none());
+        for u in ["/v1/search/main", "/v1/blame/x?path=a", "/v1/log/x?path=a"] {
+            assert!(off.class_of(&Method::GET, &u.parse().unwrap()).is_none());
+        }
     }
 }
