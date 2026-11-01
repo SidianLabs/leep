@@ -34,7 +34,6 @@ use crate::invariants::Checker;
 use crate::metrics::{SamplerCfg, Trends};
 use crate::ops::{Server, ServerConfig, Stores};
 use crate::shared::Shared;
-use crate::util::Rng;
 
 /// Tokens and keys of an owned server with policy on.
 struct Identity {
@@ -46,8 +45,24 @@ struct Identity {
     key_files: Vec<PathBuf>,
 }
 
-fn token_for(seed: u64, name: &str) -> String {
-    blake3::hash(format!("leep-soak:{seed}:{name}").as_bytes())
+/// Key the run's tokens and signing keys are derived from. It is random
+/// for each run (or `LEEP_SOAK_TOKEN_SECRET`, to reproduce a run's tokens),
+/// never the workload seed, which is printed in reports and, in CI, is the
+/// public run number: anyone who can reach the server could otherwise
+/// compute a write token.
+fn run_secret() -> Result<[u8; 32]> {
+    if let Ok(s) = std::env::var("LEEP_SOAK_TOKEN_SECRET") {
+        if !s.is_empty() {
+            return Ok(blake3::derive_key("leep-soak token secret", s.as_bytes()));
+        }
+    }
+    let mut b = [0u8; 32];
+    getrandom::fill(&mut b).map_err(|e| anyhow::anyhow!("no OS random source: {e}"))?;
+    Ok(b)
+}
+
+fn token_for(secret: &[u8; 32], name: &str) -> String {
+    blake3::keyed_hash(secret, format!("leep-soak:token:{name}").as_bytes())
         .to_hex()
         .to_string()
 }
@@ -80,20 +95,21 @@ fn write_policy(args: &Args, dir: &Path) -> Result<(Identity, Vec<String>)> {
         }
         e
     };
-    let ops = token_for(args.seed, "ops");
-    let reviewer = token_for(args.seed, "reviewer");
+    let secret = run_secret()?;
+    let ops = token_for(&secret, "ops");
+    let reviewer = token_for(&secret, "reviewer");
     let mut tokens = vec![
         entry("soak-ops", &ops, true),
         entry("soak-reviewer", &reviewer, true),
     ];
     let agents: Vec<String> = (0..args.agents)
-        .map(|i| token_for(args.seed, &format!("agent-{i}")))
+        .map(|i| token_for(&secret, &format!("agent-{i}")))
         .collect();
     for (i, t) in agents.iter().enumerate() {
         tokens.push(entry(&format!("soak-agent-{i}"), t, false));
     }
     let clis: Vec<String> = (0..args.cli_agents)
-        .map(|i| token_for(args.seed, &format!("cli-{i}")))
+        .map(|i| token_for(&secret, &format!("cli-{i}")))
         .collect();
     // A checkout is thousands of reads (docs/OPERATIONS.md, request limits), so
     // the `leep` agents get their own unlimited entries, as a merge bot would.
@@ -105,12 +121,10 @@ fn write_policy(args: &Args, dir: &Path) -> Result<(Identity, Vec<String>)> {
         serde_json::to_string_pretty(&serde_json::json!({ "tokens": tokens }))?,
     )?;
 
-    let mut rng = Rng::new(args.seed ^ 0x5161);
     let keys: Vec<SigningKey> = (0..4 + args.cli_agents)
-        .map(|_| {
-            let mut seed = [0u8; 32];
-            seed.copy_from_slice(&rng.bytes(32));
-            SigningKey::from_bytes(&seed)
+        .map(|i| {
+            let seed = blake3::keyed_hash(&secret, format!("leep-soak:signer:{i}").as_bytes());
+            SigningKey::from_bytes(seed.as_bytes())
         })
         .collect();
     let entries: Vec<_> = keys

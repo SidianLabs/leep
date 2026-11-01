@@ -2627,6 +2627,9 @@ It creates a throwaway Postgres database in the admin URL (`--postgres-url`,
 means SQLite), puts blobs in a directory, starts `leep-server` with
 metrics, tokens (one per agent), trusted signing keys and a review policy on
 `release`, and drops the database and the directory when the run passes.
+Tokens and signing keys come from a random secret made for each run, not
+from `--seed`, which the report prints and CI sets to the public run
+number; set `LEEP_SOAK_TOKEN_SECRET` to make a run's tokens reproducible.
 After a failure it keeps both (the report names them) so you can start a
 server on them and look; its `work` directory is cleared when the same `--out`
 is used again. Use `--server URL --token T` to soak a server you

@@ -151,6 +151,12 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   base, and a path whose answers differ is reported as a conflict. The
   review rules on merges (`merge-parent`, dropped side changes) check every
   base too. See ADR 0071. Fixes #160.
+### Soak tokens
+- **Changed.** `leep-soak` derives its server's tokens and signing keys
+  from a random secret made for each run (or `LEEP_SOAK_TOKEN_SECRET`)
+  instead of from `--seed`, which is printed in reports and is the run
+  number in CI.
+
 ### CI permissions
 - **Changed.** `.github/workflows/rust.yml` declares a read-only
   `permissions:` block like the other workflows, and `remote.yml` runs in
