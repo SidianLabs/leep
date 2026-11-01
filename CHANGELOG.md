@@ -18,6 +18,9 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   `log_filtered=off` restore the old behaviour. In a 2,000-agent swarm on
   two cores, unlimited blames and path logs held the whole metadata pool
   and pushed create p50 to 3.4 s and land p50 to 1.4 s. See ADR 0074.
+- **Fixed.** An answer under a read-class permit (search, and now blame
+  and filtered log) keeps its `Content-Length` instead of going out
+  chunked.
 - **Added.** `leep_read_class_admitted_total{class}` and
   `leep_read_class_completed_total{class}`.
 - **Changed.** `LeepReadsShedding` fires per class (`search`, `blame`,

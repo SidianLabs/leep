@@ -18,12 +18,14 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use axum::body::Body;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+use axum::body::{Body, Bytes, HttpBody};
 use axum::extract::{Request, State};
 use axum::http::{header, HeaderValue, Method, StatusCode, Uri};
 use axum::middleware::Next;
 use axum::response::Response;
-use http_body_util::BodyExt;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// A class of expensive read with a concurrency limit of its own.
@@ -422,12 +424,36 @@ pub async fn enforce(State(limits): State<Arc<ReadLimits>>, req: Request, next: 
     };
     let resp = next.run(req).await;
     held.ok = resp.status().is_success();
-    let (parts, body) = resp.into_parts();
-    let body = body.map_frame(move |frame| {
-        let _held = &held;
-        frame
-    });
-    Response::from_parts(parts, Body::new(body))
+    let (parts, inner) = resp.into_parts();
+    Response::from_parts(parts, Body::new(HeldBody { inner, _held: held }))
+}
+
+/// A response body that holds its request's permit until it ends or is
+/// dropped. It forwards the size hint, so an answer of known length keeps
+/// its `Content-Length` instead of turning chunked.
+struct HeldBody {
+    inner: Body,
+    _held: Held,
+}
+
+impl HttpBody for HeldBody {
+    type Data = Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Bytes>, axum::Error>>> {
+        Pin::new(&mut self.inner).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
 }
 
 #[cfg(test)]

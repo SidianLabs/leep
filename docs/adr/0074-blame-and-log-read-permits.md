@@ -73,7 +73,11 @@ Nothing bounded either route but `--request-timeout`.
   response body, so it is held while the answer is sent and released when
   the body ends or is dropped: on a client disconnect, on cancellation, and
   when `--request-timeout` drops the request (its 408 is answered without
-  the permit). A blame or path log that waits for the indexer
+  the permit). The body wrapper forwards the answer's size hint: ADR
+  0060's `map_frame` wrapper did not, so every limited answer, searches
+  included, went out chunked instead of with `Content-Length`, which broke
+  a raw HTTP client in the e2e suite once path logs were limited. A blame
+  or path log that waits for the indexer
   (`--index-wait`) holds its permit while it waits, so a lagging index
   shows as shedding in these classes; that is intended, since the waiting
   request is also holding a task and soon a connection.

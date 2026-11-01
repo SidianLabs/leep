@@ -501,6 +501,25 @@ async fn full_blame_and_log_classes_refuse_before_any_store_read() {
     }
 }
 
+/// A limited answer keeps its exact length, so it is sent with
+/// `Content-Length` rather than chunked, as without a limit.
+#[tokio::test]
+async fn limited_answers_keep_their_length() {
+    use http_body::Body as _;
+    let r = rig_with(one_each(), Duration::from_secs(60)).await;
+    let mut uris: Vec<String> = heavy(&r).into_iter().map(|(u, _)| u).collect();
+    uris.push(format!("/v1/blame/{}?path=missing.txt", r.head));
+    for uri in uris {
+        let resp = start(&r.app, &uri).await;
+        let len = resp.body().size_hint().exact();
+        let body = read(resp).await.body;
+        assert_eq!(len, Some(body.len() as u64), "{uri}");
+    }
+    let r = rig(ClassLimit::Permits(1)).await;
+    let resp = start(&r.app, SEARCH).await;
+    assert!(resp.body().size_hint().exact().is_some());
+}
+
 #[tokio::test]
 async fn blame_and_log_permits_are_released_on_error_and_dropped_answers() {
     let r = rig_with(one_each(), Duration::from_secs(60)).await;
