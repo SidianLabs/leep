@@ -2587,6 +2587,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.4.3",
  "hex",
+ "http-body",
  "http-body-util",
  "jiff",
  "leep-core",

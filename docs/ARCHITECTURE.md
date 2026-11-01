@@ -1392,11 +1392,15 @@ ends, the client goes away or the timeout drops the request. Token names bound
 the state; in anonymous mode state is keyed by client address in a size-capped
 table. State is per process.
 Built for search ([ADR 0060](adr/0060-land-admission-and-read-limits.md),
-section 1): a semaphore per class of expensive read
+section 1), blame and filtered log ([ADR 0074](adr/0074-blame-and-log-read-permits.md)):
+a semaphore per class of expensive read
 (`leep_server::read_limits`), one for the whole server whatever the token,
 taken with `try_acquire` in a middleware just inside the per-principal
-limits. `--read-concurrency search=N|off` defaults to half the cores, at
-least one. A full class is refused at once with 503 `unavailable`,
+limits, so a refused request reads no store. `--read-concurrency CLASS=N|off`
+defaults to half the cores (at least one) for `search`, the cores (at least
+two) for `blame`, and twice that for `log_filtered`, which is a log with a
+path, `author` or `extra` filter and `last-change`; the middleware tells
+them apart from the method, path and query alone. A full class is refused at once with 503 `unavailable`,
 `Retry-After` (the class's recent median request time over its permits,
 1 to 10 s) and `Leep-Refused: read-class`, so lands and cheap reads keep the
 cores on small hosts, and balancers can tell the refusals from failures. As
@@ -1406,8 +1410,8 @@ also share a bound on their metadata reads (`Repo::with_search_pool_permits`,
 takes a permit inside the call, under the open-ahead permit it may hold, so
 the two semaphores never wait on each other, and searches hold at most half
 of the pool. A search gives its permit back while it waits for another
-derivation of the same tree, so waiters do not starve other searches. Still proposed: the `land_check`, `blame`, `log_filtered` and
-`diff_large` classes, which the flag parses and accepts only as `off`.
+derivation of the same tree, so waiters do not starve other searches. Still proposed: the `land_check` and `diff_large` classes, which the flag
+parses and accepts only as `off`.
 
 **Config reload** ([ADR 0024](adr/0024-config-reload.md)). The tokens, their
 limits, the trusted signing keys, the review service and the composed land

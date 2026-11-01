@@ -350,14 +350,14 @@ limited. Tuning and the alert are in
 
 ### Expensive read limits
 
-Also always on, and the same for every token (ADR 0060):
+Also always on, and the same for every token (ADR 0060, ADR 0074):
 
 | Flag / variable | Default | Meaning |
 |---|---|---|
-| `--read-concurrency CLASS=N\|off` / `LEEP_READ_CONCURRENCY` | `search` = half the cores, at least 1 | Searches this server runs at once; one more is refused with `503`, `Retry-After` and `Leep-Refused: read-class`. Repeatable, or comma-separated in the variable. Other classes (`land_check`, `blame`, `log_filtered`, `diff_large`) take only `off`. |
+| `--read-concurrency CLASS=N\|off` / `LEEP_READ_CONCURRENCY` | `search` = half the cores, at least 1; `blame` = the cores, at least 2; `log_filtered` = twice `blame` | Searches, blames and filtered logs (a log with a path, author or extra filter, and last-change) this server runs at once, per class; one more is refused with `503`, `Retry-After` and `Leep-Refused: read-class`. Repeatable, or comma-separated in the variable, e.g. `search=1,blame=off`. Other classes (`land_check`, `diff_large`) take only `off`. |
 | `--search-pool-permits N\|off` / `LEEP_SEARCH_POOL_PERMITS` | a quarter of `--meta-pool-size`, at least 1 | Directory opens of all searches reading the metadata store at once (two connections each), so searches leave at least half the pool to lands and ref reads. |
 
-`leep` retries a refused search a few times with jitter; a load balancer must
+`leep` retries a refused search, blame or log a few times with jitter; a load balancer must
 not count a `503` carrying `Leep-Refused` against the backend. Tuning, the
 metrics and the alert are in
 [OPERATIONS.md](OPERATIONS.md#expensive-read-limits).

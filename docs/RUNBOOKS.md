@@ -1166,18 +1166,30 @@ latency, the three flags, the container memory limit, and the
 
 ## LeepReadsShedding
 
-**Meaning.** For 15 minutes, one server shed more than half of its searches
-because every permit of its search class was in use (`--read-concurrency`,
-ADR 0060), **and** its search permits completed fewer than 2 searches a
-minute each (`leep_http_requests_total{route=~"/v1/search/.*",status="200"}`
-over `leep_read_class_permits{class="search"}`). **Ticket.** A shed search is
-`503` `unavailable` with `Retry-After` and `Leep-Refused: read-class`, counted
-in `leep_read_class_shed_total{class="search"}`. It is not a failure, and
+**Meaning.** For 15 minutes, one server shed more than half of the requests
+of one expensive read class (the alert's `class` label: `search`, `blame` or
+`log_filtered`) because every permit of the class was in use
+(`--read-concurrency`, ADR 0060, ADR 0074), **and** the class's permits
+completed fewer than 2 requests a minute each
+(`leep_read_class_completed_total` over `leep_read_class_permits`; the shed
+share is `leep_read_class_shed_total` over it plus
+`leep_read_class_admitted_total`). **Ticket.** A shed request is `503`
+`unavailable` with `Retry-After` and `Leep-Refused: read-class`, counted in
+`leep_read_class_shed_total{class}`. It is not a failure, and
 [LeepServerErrors](#leepservererrors) does not count it. While a class sheds,
-its permits are busy, so the searches it completes a minute per permit are
-60 over the time each one holds its permit: under 2 means admitted searches
+its permits are busy, so the requests it completes a minute per permit are
+60 over the time each one holds its permit: under 2 means admitted requests
 take over 30 s each, are answered with errors, or a permit is never given
 back.
+
+The steps below are written for searches, the first class built. For
+`blame` (`GET /v1/blame`) and `log_filtered` (`GET /v1/log` with a path,
+`author` or `extra`, and `GET /v1/last-change`), read the same metrics with
+that `class` label, the routes' `leep_http_request_duration_seconds`, and
+`leep_query_unindexed_scanned_total{route}`, `leep_query_indexing_answers_total{route}`
+for steps 2 to 4: a slow blame or path log is most often a lagging history
+index ([LeepIndexLagging](#leepindexlagging)), a file changed thousands of
+times, or a starved metadata pool.
 
 **Why shedding alone does not fire it.** Shedding is the limit doing its
 job: searches that the host cannot run beside the lands are refused, so the
@@ -1277,7 +1289,10 @@ do are slow or fail.
   carry `Leep-Refused`; OPERATIONS.md, "Balancers"), or it will pull shedding
   servers out and overload the rest.
 - `--read-concurrency search=off` turns the limit off. Do it only to rule the
-  limit out: searches then take the lands' cores again.
+  limit out: searches then take the lands' cores again. The same holds for
+  `blame=off` and `log_filtered=off`: in a 2,000-agent swarm on two cores,
+  unlimited blames alone held the whole metadata pool and pushed create p50
+  to 3.4 s (ADR 0074).
 
 **Escalate / collect.** The in-flight, permits, shed and completion graphs per
 instance, mean search time, host CPU, the startup line, and the

@@ -202,23 +202,25 @@ groups:
       runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepbodybudgetexhausted
   - alert: LeepReadsShedding
     # Shedding alone is the limit working: a swarm sheds 90 to 98% of its
-    # searches (docs/PERFORMANCE.md, E5 and E5b). It fires only when the
-    # class also completes fewer than 2 searches a minute per permit, which
-    # while it sheds means each admitted search holds its permit over 30 s
-    # (E5/E5b: 3 to 8 s) or a permit is never given back. The "or 0 * ..."
-    # branch keeps the rule alive on a server that has answered no search.
-    # Only the search class is built; add a class's route here when it is.
+    # searches (docs/PERFORMANCE.md, E5 and E5b). It fires, per class
+    # (search, blame, log_filtered), only when the class also completes
+    # fewer than 2 requests a minute per permit, which while it sheds means
+    # each admitted request holds its permit over 30 s (E5/E5b searches: 3
+    # to 8 s) or a permit is never given back. Completed is answered 2xx.
+    # The "or 0 * ..." branch keeps the rule alive for a class that has
+    # completed nothing.
     expr: |
-      (sum by (instance) (rate(leep_read_class_shed_total{class="search"}[15m]))
-        / sum by (instance) (rate(leep_http_requests_total{route=~"/v1/search/.*"}[15m])) > 0.5)
-      and on (instance)
-      ((sum by (instance) (rate(leep_http_requests_total{route=~"/v1/search/.*",status="200"}[15m]))
-          or 0 * max by (instance) (leep_read_class_permits{class="search"}))
-        / max by (instance) (leep_read_class_permits{class="search"}) * 60 < 2)
+      (sum by (instance, class) (rate(leep_read_class_shed_total[15m]))
+        / (sum by (instance, class) (rate(leep_read_class_shed_total[15m]))
+          + sum by (instance, class) (rate(leep_read_class_admitted_total[15m]))) > 0.5)
+      and on (instance, class)
+      ((sum by (instance, class) (rate(leep_read_class_completed_total[15m]))
+          or 0 * max by (instance, class) (leep_read_class_permits))
+        / max by (instance, class) (leep_read_class_permits) * 60 < 2)
     for: 15m
     labels: {severity: ticket}
     annotations:
-      summary: "A server sheds most searches and its search permits complete fewer than 2 a minute each: admitted searches are far slower than they should be, or failing, or a permit is stuck."
+      summary: "A server sheds most requests of an expensive read class (search, blame or filtered log) and its permits complete fewer than 2 a minute each: admitted requests are far slower than they should be, or failing, or a permit is stuck."
       runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepreadsshedding
   - alert: LeepBlobCacheColdHitRatio
     expr: |

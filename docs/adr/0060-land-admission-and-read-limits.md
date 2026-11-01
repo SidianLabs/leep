@@ -1,5 +1,5 @@
 # 0060. Protect lands from expensive reads, and admit lands per ref
-Status: Accepted (section 1, `search` class, and section 2; see "Implementation notes"); other read classes and section 3 proposed. Amended 2026-10-23: `--land-queue-batches` defaults to 4 after E5c (section 2, "Default after E5c"). Amended by ADR 0068: the default bound is `--land-queue-seconds 5s`; `--land-queue-batches` replaces it when given
+Status: Accepted (section 1, `search` class, and section 2; see "Implementation notes"); other read classes and section 3 proposed. Amended 2026-10-23: `--land-queue-batches` defaults to 4 after E5c (section 2, "Default after E5c"). Amended by ADR 0068: the default bound is `--land-queue-seconds 5s`; `--land-queue-batches` replaces it when given. Amended by ADR 0074: the `blame` and `log_filtered` classes are built and on by default
 Date: 2026-10-21
 
 ## Context
@@ -381,6 +381,9 @@ differs from the text above as follows, each for the reason given.
 
 ### Section 1
 
+- **`blame` and `log_filtered`** were built later, on by default, by ADR
+  0074, which also puts `GET /v1/last-change` in `log_filtered`. The rest
+  of this note now holds for `land_check` and `diff_large` only.
 - **Classes not built.** `--read-concurrency` parses every class named in
   section 1, so the flag has its final shape. `land_check`, `blame`,
   `log_filtered` and `diff_large` accept only `off`, which is what the
