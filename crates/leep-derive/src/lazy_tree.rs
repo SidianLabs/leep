@@ -100,6 +100,15 @@ impl LazyTrees {
         self.depths.lock().unwrap().get(id)
     }
 
+    /// Whether `tree` is a node of a tree this process built or derived
+    /// unstored and has not stored since: not worth asking the store for,
+    /// least of all exactly, which on a miss rescans its packs (ADR 0070).
+    /// A tree another process stored since derives to the same nodes.
+    pub(crate) fn known_unstored(&self, tree: &Hash) -> bool {
+        self.origin(tree)
+            .is_some_and(|id| self.depth(&id).is_some())
+    }
+
     /// `id`'s tree is being stored: readers should ask the store for it.
     pub(crate) fn forget_depth(&self, id: &ChangesetId) {
         let mut d = self.depths.lock().unwrap();
@@ -331,6 +340,11 @@ impl Repo {
                     break (parent_root, d);
                 }
             }
+            // Known unstored: derive it too rather than ask the store.
+            if cached && self.lazy.depth(&p).is_some() {
+                cur = p;
+                continue;
+            }
             if self.read_tree_stored_opt(parent_root).await?.is_some() {
                 break (parent_root, 0);
             }
@@ -444,13 +458,18 @@ impl Repo {
     /// tree: 0 when stored. Reads the root node, which the create that asks
     /// reads next anyway.
     pub(crate) async fn lazy_depth(&self, parent: ChangesetId, base: Hash) -> Result<u32> {
-        if base == TreeNode::empty_hash() || self.read_tree_stored_opt(base).await?.is_some() {
+        if base == TreeNode::empty_hash() {
             return Ok(0);
         }
-        if self.lazy.nodes.get(&base).is_some() {
-            if let Some(d) = self.lazy.depth(&parent) {
-                return Ok(d);
-            }
+        // A parent whose tree this process built unstored, and has not
+        // stored since, is not asked of the store: nearly every create on
+        // an unlanded one would miss there exactly (ADR 0070). A tree
+        // another process stored since only makes the depth an overcount.
+        if let Some(d) = self.lazy.depth(&parent) {
+            return Ok(d);
+        }
+        if self.read_tree_stored_opt(base).await?.is_some() {
+            return Ok(0);
         }
         Ok(self.derive_tree(parent).await?.depth)
     }
@@ -474,7 +493,10 @@ impl Repo {
         base: Hash,
         built: &crate::tree_ops::Built,
     ) -> Result<Vec<(Hash, Bytes, TreeNode)>> {
-        if base == TreeNode::empty_hash() || self.read_tree_stored_opt(base).await?.is_some() {
+        if base == TreeNode::empty_hash()
+            || (!self.lazy.known_unstored(&base)
+                && self.read_tree_stored_opt(base).await?.is_some())
+        {
             return Ok(Vec::new());
         }
         let own: std::collections::HashSet<Hash> = built.nodes.iter().map(|(h, _, _)| *h).collect();
