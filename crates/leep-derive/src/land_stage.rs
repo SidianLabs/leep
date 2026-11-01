@@ -20,18 +20,10 @@ use crate::Repo;
 
 /// What the replays of one batch attempt wrote, plus the immutable rows they
 /// read, so a land does not read again what the land before it read.
-///
-/// A pipelined batch (ADR 0072) stages over the staging of the batch ahead
-/// of it, whose commit is still in flight: reads fall through to that
-/// layer before the stores, so its replays see the copies, nodes and rows
-/// the batch ahead wrote. Its own flush stores only its own writes, which is
-/// enough because it commits only after the batch ahead committed.
 #[derive(Default)]
 pub(crate) struct Staging {
     inner: Mutex<Staged>,
     memo: Arc<NodeMemo>,
-    /// The staging of the batch ahead, until that batch committed.
-    parent: Mutex<Option<Arc<Staging>>>,
 }
 
 /// The decoded tree nodes of one batch attempt, by hash, and the time its
@@ -48,27 +40,15 @@ pub(crate) struct NodeMemo {
     /// whatever the shared cache evicts meanwhile.
     derived: Mutex<HashMap<Hash, TreeNode>>,
     tree_nanos: AtomicU64,
-    /// The memo of the staging below, so a node the batch ahead staged is
-    /// answered from memory and never reaches the cache of stored nodes.
-    parent: Mutex<Option<Arc<NodeMemo>>>,
 }
 
 impl NodeMemo {
-    fn parent(&self) -> Option<Arc<NodeMemo>> {
-        self.parent
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-    }
-
     pub(crate) fn get(&self, hash: &Hash) -> Option<TreeNode> {
-        let own = self
-            .nodes
+        self.nodes
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(hash)
-            .cloned();
-        own.or_else(|| self.parent()?.get(hash))
+            .cloned()
     }
 
     pub(crate) fn insert(&self, hash: Hash, node: TreeNode) {
@@ -79,13 +59,11 @@ impl NodeMemo {
     }
 
     pub(crate) fn get_derived(&self, hash: &Hash) -> Option<TreeNode> {
-        let own = self
-            .derived
+        self.derived
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(hash)
-            .cloned();
-        own.or_else(|| self.parent()?.get_derived(hash))
+            .cloned()
     }
 
     pub(crate) fn insert_derived(&self, nodes: &HashMap<Hash, TreeNode>) {
@@ -164,82 +142,6 @@ fn no_refs() -> Error {
 impl Staging {
     fn lock(&self) -> MutexGuard<'_, Staged> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    /// An empty staging over `below`, the staging of the batch ahead whose
-    /// commit is in flight (ADR 0072).
-    pub(crate) fn over(below: &Arc<Staging>) -> Staging {
-        let s = Staging::default();
-        *s.parent.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(below));
-        *s.memo.parent.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&below.memo));
-        s
-    }
-
-    /// Stop reading through the staging below: its batch committed, so
-    /// what it staged is stored. Keeps the chain of stagings one deep.
-    pub(crate) fn detach(&self) {
-        self.parent.lock().unwrap_or_else(|e| e.into_inner()).take();
-        self.memo
-            .parent
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
-    }
-
-    fn parent(&self) -> Option<Arc<Staging>> {
-        self.parent
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-    }
-
-    /// A blob staged here or below.
-    fn staged_blob(&self, hash: &Hash) -> Option<Bytes> {
-        let own = self.lock().blobs.get(hash).cloned();
-        own.or_else(|| self.parent()?.staged_blob(hash))
-    }
-
-    /// Whether a blob is staged here or below.
-    fn blob_staged(&self, hash: &Hash) -> bool {
-        self.lock().blobs.contains_key(hash) || self.parent().is_some_and(|p| p.blob_staged(hash))
-    }
-
-    /// Whether a blob is staged, or was found stored, here or below.
-    fn blob_known(&self, hash: &Hash) -> bool {
-        {
-            let s = self.lock();
-            if s.blobs.contains_key(hash) || s.stored_blobs.contains(hash) {
-                return true;
-            }
-        }
-        self.parent().is_some_and(|p| p.blob_known(hash))
-    }
-
-    /// A changeset staged or read here or below.
-    fn changeset(&self, id: &ChangesetId) -> Option<Changeset> {
-        let own = self.lock().changeset(id);
-        own.or_else(|| self.parent()?.changeset(id))
-    }
-
-    /// A row staged or read here or below.
-    fn row(&self, kind: &str, key: &Hash) -> Option<Bytes> {
-        let own = self.lock().row(kind, key);
-        own.or_else(|| self.parent()?.row(kind, key))
-    }
-
-    /// Whether `id`'s changeset or its rebase link was staged (not read)
-    /// here or below.
-    fn staged_origin(&self, id: &ChangesetId) -> bool {
-        {
-            let s = self.lock();
-            if s.changesets.contains_key(id)
-                || s.rows
-                    .contains_key(&(REBASED_ORIGIN_KIND.to_string(), id.0))
-            {
-                return true;
-            }
-        }
-        self.parent().is_some_and(|p| p.staged_origin(id))
     }
 
     /// A handle on `repo` (same caches and policy) whose writes stage here.
@@ -337,9 +239,14 @@ impl Staging {
     /// from the stores, so a later attempt of the batch may keep it; a
     /// staged entry may never have been stored (its swap lost, or its write
     /// failed) and must not outlive the attempt.
-    /// The staging below counts as staged too: its batch may not land.
     pub(crate) fn retain_stored(&self, origins: &mut HashMap<ChangesetId, Option<ChangesetId>>) {
-        origins.retain(|id, _| !self.staged_origin(id));
+        let s = self.lock();
+        origins.retain(|id, _| {
+            !s.changesets.contains_key(id)
+                && !s
+                    .rows
+                    .contains_key(&(REBASED_ORIGIN_KIND.to_string(), id.0))
+        });
     }
 
     /// Copies of the blobs among `hashes` that this attempt staged; blobs a
@@ -459,16 +366,16 @@ impl BlobStore for StagedBlobs {
 
     /// A staged blob from memory; any other is the store's durable copy.
     async fn get_stored(&self, hash: &Hash) -> Result<Option<Bytes>> {
-        if let Some(b) = self.staging.staged_blob(hash) {
-            return Ok(Some(b));
+        if let Some(b) = self.staging.lock().blobs.get(hash) {
+            return Ok(Some(b.clone()));
         }
         self.inner.get_stored(hash).await
     }
 
     /// As [`get_stored`](Self::get_stored), exact for the rest.
     async fn get_exact(&self, hash: &Hash) -> Result<Option<Bytes>> {
-        if let Some(b) = self.staging.staged_blob(hash) {
-            return Ok(Some(b));
+        if let Some(b) = self.staging.lock().blobs.get(hash) {
+            return Ok(Some(b.clone()));
         }
         self.inner.get_exact(hash).await
     }
@@ -476,7 +383,13 @@ impl BlobStore for StagedBlobs {
     /// Staged blobs and blobs this attempt found stored answer from memory;
     /// the rest in one batch of the store, whose finds are kept.
     async fn contains_many(&self, hashes: &[Hash]) -> Result<Vec<bool>> {
-        let mut out: Vec<bool> = hashes.iter().map(|h| self.staging.blob_known(h)).collect();
+        let mut out: Vec<bool> = {
+            let s = self.staging.lock();
+            hashes
+                .iter()
+                .map(|h| s.blobs.contains_key(h) || s.stored_blobs.contains(h))
+                .collect()
+        };
         let ask: Vec<Hash> = hashes
             .iter()
             .zip(&out)
@@ -508,8 +421,8 @@ impl BlobStore for StagedBlobs {
     }
 
     async fn get(&self, hash: &Hash) -> Result<Option<Bytes>> {
-        if let Some(b) = self.staging.staged_blob(hash) {
-            return Ok(Some(b));
+        if let Some(b) = self.staging.lock().blobs.get(hash) {
+            return Ok(Some(b.clone()));
         }
         self.inner.get(hash).await
     }
@@ -517,8 +430,10 @@ impl BlobStore for StagedBlobs {
     /// Staged blobs from memory, and every other one in one batched read
     /// of the store (the default asks for them one at a time).
     async fn get_many(&self, hashes: &[Hash]) -> Result<Vec<Option<Bytes>>> {
-        let mut out: Vec<Option<Bytes>> =
-            hashes.iter().map(|h| self.staging.staged_blob(h)).collect();
+        let mut out: Vec<Option<Bytes>> = {
+            let s = self.staging.lock();
+            hashes.iter().map(|h| s.blobs.get(h).cloned()).collect()
+        };
         let missing: Vec<Hash> = hashes
             .iter()
             .zip(&out)
@@ -538,8 +453,11 @@ impl BlobStore for StagedBlobs {
     /// A staged blob counts: it is stored before anything that references
     /// it. So does one this attempt found stored.
     async fn contains(&self, hash: &Hash) -> Result<bool> {
-        if self.staging.blob_known(hash) {
-            return Ok(true);
+        {
+            let s = self.staging.lock();
+            if s.blobs.contains_key(hash) || s.stored_blobs.contains(hash) {
+                return Ok(true);
+            }
         }
         let found = self.inner.contains(hash).await?;
         if found {
@@ -587,7 +505,7 @@ impl MetaStore for StagedMeta {
     }
 
     async fn get_changeset(&self, id: &ChangesetId) -> Result<Option<Changeset>> {
-        if let Some(cs) = self.staging.changeset(id) {
+        if let Some(cs) = self.staging.lock().changeset(id) {
             return Ok(Some(cs));
         }
         let cs = self.inner.get_changeset(id).await?;
@@ -598,8 +516,10 @@ impl MetaStore for StagedMeta {
     }
 
     async fn get_changesets(&self, ids: &[ChangesetId]) -> Result<Vec<Option<Changeset>>> {
-        let mut out: Vec<Option<Changeset>> =
-            ids.iter().map(|id| self.staging.changeset(id)).collect();
+        let mut out: Vec<Option<Changeset>> = {
+            let s = self.staging.lock();
+            ids.iter().map(|id| s.changeset(id)).collect()
+        };
         let missing: Vec<ChangesetId> = ids
             .iter()
             .zip(&out)
@@ -696,13 +616,15 @@ impl MetaStore for StagedMeta {
     /// A staged blob reads as not condemned: its condemnation is checked
     /// when the batch stores it, after the write, as `put_rescuing_many` requires.
     async fn get_derived_many(&self, kind: &str, keys: &[Hash]) -> Result<Vec<Option<Bytes>>> {
-        let (mut out, skip): (Vec<Option<Bytes>>, Vec<bool>) = keys
-            .iter()
-            .map(|k| {
-                let staged_blob = kind == BLOB_CONDEMNED && self.staging.blob_staged(k);
-                (self.staging.row(kind, k), staged_blob)
-            })
-            .unzip();
+        let (mut out, skip): (Vec<Option<Bytes>>, Vec<bool>) = {
+            let s = self.staging.lock();
+            keys.iter()
+                .map(|k| {
+                    let staged_blob = kind == BLOB_CONDEMNED && s.blobs.contains_key(k);
+                    (s.row(kind, k), staged_blob)
+                })
+                .unzip()
+        };
         let missing: Vec<Hash> = keys
             .iter()
             .zip(out.iter().zip(&skip))
@@ -743,13 +665,13 @@ impl MetaStore for StagedMeta {
         let mut fill: Vec<Vec<bool>> = Vec::with_capacity(reads.len());
         let mut asks: Vec<Vec<Hash>> = Vec::with_capacity(reads.len());
         {
-            let s = &self.staging;
+            let s = self.staging.lock();
             for (kind, keys) in reads {
                 let mut answers = Vec::with_capacity(keys.len());
                 let mut from_store = Vec::with_capacity(keys.len());
                 let mut ask = Vec::new();
                 for k in keys.iter() {
-                    let staged_blob = *kind == BLOB_CONDEMNED && s.blob_staged(k);
+                    let staged_blob = *kind == BLOB_CONDEMNED && s.blobs.contains_key(k);
                     let v = s.row(kind, k);
                     let ask_it = v.is_none() && !staged_blob;
                     if ask_it {

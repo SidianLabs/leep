@@ -1015,25 +1015,6 @@ fn killed_server_with_a_full_land_queue_loses_nothing_postgres() {
     drop(db);
 }
 
-/// ADR 0072: batches of two, pipelined, so the agents' lands make many
-/// batches and a kill often lands while one batch commits and the next is
-/// staged on it. Every commit lands once, with one ref move per land.
-const PIPELINED: &[&str] = &["--land-pipeline", "on", "--land-max-batch", "2"];
-
-#[test]
-fn killed_server_with_pipelined_batches_loses_nothing_sqlite() {
-    run_crash_rounds_with("sqlite, pipelined", None, PIPELINED);
-}
-
-#[test]
-fn killed_server_with_pipelined_batches_loses_nothing_postgres() {
-    let Some(db) = PgDb::create() else {
-        return;
-    };
-    run_crash_rounds_with("postgres, pipelined", Some(db.url.clone()), PIPELINED);
-    drop(db);
-}
-
 // ---------------------------------------------------------------------------
 // Several servers coordinating lands (ADR 0056)
 

@@ -221,12 +221,7 @@ async fn queued_lands_are_never_dropped_and_off_admits_every_land() {
     for bound in [Some(2), None] {
         let w = World::new(1);
         let ids = lands_to_make(&w, FULL + 2).await;
-        let server = w
-            .server()
-            // One batch at a time: a land arriving while the held batch
-            // commits would otherwise replay behind it (ADR 0072), not queue.
-            .with_land_pipeline(false)
-            .with_land_queue_batches(bound);
+        let server = w.server().with_land_queue_batches(bound);
         let held = hold_a_batch(&w, &server, ids[0], Duration::from_secs(5)).await;
         // One batch replaying and one waiting, filled one land at a time:
         // each joins the waiting batch, so none is refused.
@@ -281,12 +276,7 @@ async fn queued_lands_are_never_dropped_and_off_admits_every_land() {
 async fn admission_answers_recorded_land() {
     let w = World::new(2);
     let ids = lands_to_make(&w, 4).await;
-    let server = w
-        .server()
-        // One batch at a time: a land arriving while the held batch
-        // commits would otherwise replay behind it (ADR 0072), not queue.
-        .with_land_pipeline(false)
-        .with_land_queue_batches(Some(1));
+    let server = w.server().with_land_queue_batches(Some(1));
     let id = LandId::from_bytes(&[9; 16]).unwrap();
     let first = server
         .land_keyed(ids[0], REF, None, true, Some(id.clone()))
@@ -574,10 +564,8 @@ async fn forwarded_lands_refused_under_faults_land_once() {
     assert!(refusals > 0, "no land was refused");
 }
 
-/// Agents in [`leader_killed_with_full_queue`]: more than two batches
-/// hold, so lands wait even while one batch commits and the next replays
-/// onto it (ADR 0072), which count as one batch ahead.
-const AGENTS_OVER_A_BATCH: usize = 2 * crate::land::MAX_BATCH + 8;
+/// Agents in [`leader_killed_with_full_queue`]: more than one batch holds.
+const AGENTS_OVER_A_BATCH: usize = crate::land::MAX_BATCH + 8;
 
 /// The leader is killed with its queue at the bound. Lands it held are
 /// reset, lands it refused are resent after their wait, and another
@@ -592,8 +580,8 @@ async fn leader_killed_with_full_queue() {
             .jitter(3)
             .rate(&[Op::CasRef], 1000, Fault::Delay(Duration::from_millis(30)))
             .rate(Op::META, 20, Fault::Delay(Duration::from_millis(5)));
-        // Two batches: those in flight and one full one waiting. More
-        // agents than fit, so some are refused.
+        // Two batches: one replaying and one full one waiting. More agents
+        // than fit, so some are refused.
         let bound = 2;
         let net = bounded_net(&w, seed, bound, 0, 0);
         let tasks: Vec<_> = (0..AGENTS_OVER_A_BATCH)
@@ -689,12 +677,7 @@ async fn a_land_cancelled_between_admission_and_enqueue_gives_its_place_back() {
 async fn an_aborted_leader_stops_counting_its_batch() {
     let w = World::new(7);
     let ids = lands_to_make(&w, 2).await;
-    let server = w
-        .server()
-        // One batch at a time: a land arriving while the held batch
-        // commits would otherwise replay behind it (ADR 0072), not queue.
-        .with_land_pipeline(false)
-        .with_land_queue_batches(Some(1));
+    let server = w.server().with_land_queue_batches(Some(1));
     let held = hold_a_batch(&w, &server, ids[0], Duration::from_secs(3600)).await;
     assert_eq!(server.land_queues.batches(REF), 1, "replaying");
     assert!(

@@ -201,11 +201,8 @@ async fn rig_on(meta: MemoryMetaStore, bound: Option<usize>, n: usize) -> Rig {
         inner: meta.clone(),
         gate: gate.clone(),
     });
-    // One batch at a time, so lands sent while a swap is held queue behind
-    // it instead of replaying onto it (ADR 0072): these tests count queues.
-    let repo = Repo::new(Arc::new(MemoryBlobStore::new()), gated.clone())
-        .with_land_queue_batches(bound)
-        .with_land_pipeline(false);
+    let repo =
+        Repo::new(Arc::new(MemoryBlobStore::new()), gated.clone()).with_land_queue_batches(bound);
     let head = commit(&repo, &[], "base.txt").await;
     assert!(gated.cas_ref("main", None, Some(head)).await.unwrap());
     let mut lands = Vec::new();
@@ -318,13 +315,12 @@ async fn land_moves(meta: &MemoryMetaStore) -> usize {
         .count()
 }
 
-/// `--land-queue-seconds` (ADR 0068): before any batch finished there is no
-/// batch time and the seconds refuse nothing (ADR 0072; a batch counted as
-/// one second before, which would have refused the sixth land here, past
-/// two batches of `--land-max-batch 4`); once batches are known to be
-/// fast, the queue admits many.
+/// `--land-queue-seconds` (ADR 0068): before any batch finished a batch
+/// counts as one second, so 2 s admits two batches of
+/// `--land-max-batch 4`; once batches are known to be fast, the same
+/// queue admits more.
 #[tokio::test]
-async fn a_fresh_queue_admits_a_herd_and_fast_batches_admit_more() {
+async fn a_land_past_the_seconds_bound_is_refused_and_fast_batches_admit_more() {
     let r = rig(None, 12).await;
     let repo = r
         .repo
@@ -335,24 +331,21 @@ async fn a_fresh_queue_admits_a_herd_and_fast_batches_admit_more() {
     r.gate.armed.store(true, Ordering::SeqCst);
     let held = spawn_land(&app, r.lands[0], None);
     r.gate.until_held().await;
-    // One batch replaying and two of four waiting: three batches, past 2 s
-    // at 1 s a batch, but no batch time is known yet.
-    let queued: Vec<_> = r.lands[1..=8]
+    // One batch replaying, one of four waiting: two batches, the bound.
+    let queued: Vec<_> = r.lands[1..=4]
         .iter()
         .map(|cs| spawn_land(&app, *cs, None))
         .collect();
     settle().await;
-    let late = spawn_land(&app, r.lands[9], None);
-    settle().await;
-    assert!(!late.is_finished(), "admitted and queued, not refused");
+    let refused = land(&app, r.lands[5], None).await;
+    assert_not_admitted_by(&refused, "--land-queue-seconds");
     r.gate.open();
-    late.await.unwrap().landed();
     held.await.unwrap().landed();
     for q in queued {
         q.await.unwrap().landed();
     }
     // Batches took milliseconds: two seconds now hold many of them.
-    let more: Vec<_> = r.lands[10..12]
+    let more: Vec<_> = r.lands[5..12]
         .iter()
         .map(|cs| spawn_land(&app, *cs, None))
         .collect();
