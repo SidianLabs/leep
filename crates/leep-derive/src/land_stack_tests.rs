@@ -28,7 +28,7 @@ async fn chain(r: &crate::Repo, from: ChangesetId, n: usize) -> ChangesetId {
 
 /// A 5,000-deep unlanded stack onto a ref that moved since its base is
 /// refused with a 400 that says to land it in pieces, without replaying
-/// any of it; a stack at the cap still lands.
+/// any of it; one over the cap is refused, and exactly the cap lands.
 #[tokio::test]
 async fn a_stack_longer_than_the_cap_is_refused() {
     let r = repo();
@@ -49,11 +49,18 @@ async fn a_stack_longer_than_the_cap_is_refused() {
     assert!(msg.contains(&MAX_LAND_STACK.to_string()), "{msg}");
     assert_eq!(r.meta().get_ref("main").await.unwrap(), Some(moved));
 
-    // Landing an ancestor first leaves a short enough stack.
-    let first = r.log(long, None, 5_000).await.unwrap()[5_000 - MAX_LAND_STACK].id;
+    // One over the cap is refused; exactly the cap lands.
+    let log = r.log(long, None, 5_000).await.unwrap();
+    let over = log[5_000 - MAX_LAND_STACK - 1].id;
+    assert!(matches!(r.land(over, "main").await, Err(Error::Invalid(_))));
+    let first = log[5_000 - MAX_LAND_STACK].id;
     let LandResponse::Landed { landed, .. } = r.land(first, "main").await.unwrap() else {
-        panic!("a stack at the cap lands")
+        panic!("a stack of exactly the cap lands")
     };
+    assert_eq!(
+        r.log(landed, None, 5_000).await.unwrap().len(),
+        MAX_LAND_STACK + 2
+    );
     assert_eq!(r.meta().get_ref("main").await.unwrap(), Some(landed));
 }
 

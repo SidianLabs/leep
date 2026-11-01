@@ -2048,12 +2048,6 @@ impl Repo {
         let mut trunk = false;
         let mut cur = cs;
         loop {
-            if stack.len() >= MAX_LAND_STACK {
-                return Err(Error::Invalid(format!(
-                    "cannot land {cs}: its stack of unlanded changesets is longer than \
-                     {MAX_LAND_STACK}; land it in pieces, an ancestor first"
-                )));
-            }
             deadline.check()?;
             let c = self.get_changeset(cur).await?;
             if c.parents.len() > 1 {
@@ -2074,6 +2068,14 @@ impl Repo {
                     if self.landed_copy(p, head, origins).await?.is_some() {
                         fork = Some(p);
                         break;
+                    }
+                    // `p` would be one member more: a stack of exactly the
+                    // cap still lands.
+                    if stack.len() >= MAX_LAND_STACK {
+                        return Err(Error::Invalid(format!(
+                            "cannot land {cs}: its stack of unlanded changesets is longer \
+                             than {MAX_LAND_STACK}; land it in pieces, an ancestor first"
+                        )));
                     }
                     cur = p;
                 }
