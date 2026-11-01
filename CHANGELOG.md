@@ -27,6 +27,9 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   unlanded changeset, which is no longer stored. Tree nodes were never
   meant to be fetched there; the CLI, the git mirror and MCP fetch only
   file contents and read trees through the changeset endpoints.
+- **Changed.** The changeset sweep stores the tree of a changeset it
+  deletes whose create left it out, before its tombstone, so
+  `gc --full --backup-fence` keeps its contents as before.
 - **Changed.** A land batch that fast-forwards a ref to such a changeset
   stores its tree in two waves (nodes, then the root), so two packs; an
   eager create flushes its tree's nodes before writing the root.

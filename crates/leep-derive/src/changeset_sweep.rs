@@ -518,6 +518,7 @@ async fn collect_leased(
             .copied()
             .collect();
         if !doomed.is_empty() {
+            store_unstored_trees(repo, &doomed).await?;
             let keys: Vec<Hash> = doomed.iter().map(|id| id.0).collect();
             let roots = repo.meta().get_derived_many("root_tree", &keys).await?;
             let at = clock.now();
@@ -683,6 +684,40 @@ async fn tombstone_pass(
     }
     metrics::counter!("leep_gc_tombstone_rows_deleted_total")
         .increment(report.tombstone_rows_deleted);
+    Ok(())
+}
+
+/// Store the trees of `doomed` that their creates left out (ADR 0069),
+/// before their tombstones name the roots: `gc --full --backup-fence` keeps
+/// a deleted changeset's contents through its stored tree, for a backup
+/// that copied the changeset before the delete, and once it is deleted its
+/// tree can no longer be derived. Two waves, the roots after the rest is
+/// durable, so a stored root still means a whole tree. Blob GC frees them
+/// once the fence has passed.
+async fn store_unstored_trees(repo: &Repo, doomed: &[ChangesetId]) -> Result<()> {
+    let mut nodes = Vec::new();
+    let mut roots = Vec::new();
+    let mut seen = HashSet::new();
+    for id in doomed {
+        let mut tree = repo.unstored_tree(*id).await?;
+        if let Some((h, b, _)) = tree.pop() {
+            if seen.insert(h) {
+                roots.push((h, b));
+            }
+        }
+        nodes.extend(
+            tree.into_iter()
+                .filter(|(h, _, _)| seen.insert(*h))
+                .map(|(h, b, _)| (h, b)),
+        );
+    }
+    if !nodes.is_empty() {
+        repo.put_rescuing_many(nodes, &[]).await?;
+    }
+    if !roots.is_empty() {
+        metrics::counter!("leep_lazy_tree_materialized_total").increment(roots.len() as u64);
+        repo.put_rescuing_many(roots, &[]).await?;
+    }
     Ok(())
 }
 

@@ -127,8 +127,14 @@ once. The fast path reads only the head and the land's base, both stored.
   are found either way; condemnation, rescue and collect (ADR 0012, 0059)
   are unchanged, and a node later stored by a fast-forward is written
   through the rescue check, as a create's were.
-- **`gc --full --backup-fence`** keeps the stored roots of tombstoned
-  changesets; an unstored one has nothing to keep.
+- **`gc --full --backup-fence`** keeps the trees of tombstoned changesets,
+  and with them the contents a backup that copied the changeset needs.
+  Once a changeset is deleted its tree no longer derives, so the
+  changeset sweep stores the unstored trees of a batch it deletes (one
+  pack of nodes, then the roots) before it writes their tombstones; blob
+  GC frees them once the fence has passed. This writes in the background
+  what the creates no longer write on the request path, and only for
+  changesets the sweep deletes.
 - **`gc-unreachable`** walks derived nodes for the contents they name and
   counts no tree node for them: an unstored node frees nothing.
 - **`verify`** accepts an absent node when the changeset's tree derives
