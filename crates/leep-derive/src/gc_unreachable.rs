@@ -674,6 +674,7 @@ async fn tree_candidates(
                     .map(|a| (i, Hash(a)))
             })
             .collect();
+        repo.note_roots(roots.iter().map(|(&i, h)| (g.ids[i as usize], h)));
         let mut frontier: Vec<Step> = Vec::new();
         for &i in chunk {
             let Some(root) = roots.get(&i) else {
@@ -710,11 +711,15 @@ async fn tree_candidates(
                 let Some((node, size)) = nodes.get(&a) else {
                     continue;
                 };
-                out.entry(a).or_insert(Candidate {
-                    node: true,
-                    size: *size,
-                    in_kept: kept,
-                });
+                // A node of an unstored tree (ADR 0069) frees nothing, but
+                // what it names may.
+                if let Some(size) = size {
+                    out.entry(a).or_insert(Candidate {
+                        node: true,
+                        size: *size,
+                        in_kept: kept,
+                    });
+                }
                 let ref_nodes: Vec<Option<&TreeNode>> = refs
                     .iter()
                     .map(|h| h.and_then(|h| nodes.get(&h).map(|(n, _)| n)))
@@ -757,24 +762,30 @@ async fn tree_candidates(
     Ok(out)
 }
 
-/// Decode tree nodes, with their stored sizes. Missing ones are counted and
-/// left out; the empty tree need not be stored.
+/// Decode tree nodes, with their stored sizes; a node of a tree created
+/// without its nodes is derived (ADR 0069) and has no size. Missing ones
+/// are counted and left out; the empty tree need not be stored.
 async fn read_nodes(
     repo: &Repo,
     hashes: &[Hash],
     r: &mut UnreachableReport,
-) -> Result<HashMap<Hash, (TreeNode, u64)>> {
+) -> Result<HashMap<Hash, (TreeNode, Option<u64>)>> {
     let found = repo.blobs().get_many(hashes).await?;
     let mut out = HashMap::with_capacity(hashes.len());
     for (h, b) in hashes.iter().zip(found) {
         match b {
             Some(b) => {
-                out.insert(*h, (TreeNode::decode(&b)?, b.len() as u64));
+                out.insert(*h, (TreeNode::decode(&b)?, Some(b.len() as u64)));
             }
             None if *h == TreeNode::empty_hash() => {
-                out.insert(*h, (TreeNode::default(), 0));
+                out.insert(*h, (TreeNode::default(), Some(0)));
             }
-            None => r.missing_nodes += 1,
+            None => match repo.lazy_node(*h).await? {
+                Some(n) => {
+                    out.insert(*h, (n, None));
+                }
+                None => r.missing_nodes += 1,
+            },
         }
     }
     Ok(out)
@@ -805,14 +816,11 @@ impl Live {
         let mut stack: Vec<Hash> = Vec::new();
         for chunk in changesets.chunks(PAGE) {
             let keys: Vec<Hash> = chunk.iter().map(|&i| g.ids[i as usize].0).collect();
-            for v in repo
-                .meta()
-                .get_derived_many("root_tree", &keys)
-                .await?
-                .into_iter()
-                .flatten()
-            {
+            let rows = repo.meta().get_derived_many("root_tree", &keys).await?;
+            for (&i, v) in chunk.iter().zip(rows) {
+                let Some(v) = v else { continue };
                 if let Ok(a) = <[u8; 32]>::try_from(v.as_ref()) {
+                    repo.note_root(g.ids[i as usize], Hash(a));
                     if self.set.insert(Hash(a)) {
                         stack.push(Hash(a));
                     }
@@ -822,8 +830,10 @@ impl Live {
                 let take = stack.len().min(NODE_BATCH);
                 let level: Vec<Hash> = stack.split_off(stack.len() - take);
                 for (node, size) in read_nodes(repo, &level, r).await?.into_values() {
-                    self.tally.tree_nodes += 1;
-                    self.tally.tree_node_bytes += size;
+                    if let Some(size) = size {
+                        self.tally.tree_nodes += 1;
+                        self.tally.tree_node_bytes += size;
+                    }
                     for e in node.entries.into_values() {
                         match e {
                             TreeEntry::File { content, size, .. } => {

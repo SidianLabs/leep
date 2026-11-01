@@ -502,6 +502,7 @@ impl Repo {
                 }
             };
             if let Some(path) = path {
+                self.note_root(cid, root_tree);
                 let parent_tree = match cs.parents.first() {
                     Some(p) => self.root_tree(*p).await?,
                     None => TreeNode::empty_hash(),
@@ -546,6 +547,7 @@ impl Repo {
                 _ => self.root_tree(*id).await?,
             });
         }
+        self.note_roots(ids.iter().copied().zip(&out));
         Ok(out)
     }
 

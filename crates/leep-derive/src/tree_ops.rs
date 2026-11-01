@@ -51,10 +51,47 @@ pub(crate) fn file_info(path: RepoPath, e: &TreeEntry) -> Option<FileInfo> {
     }
 }
 
+/// Where [`build_tree`] reads the nodes it rewrites from.
+#[derive(Clone, Copy)]
+pub(crate) enum Reads<'a> {
+    /// [`Repo::read_tree`]: stored nodes, and nodes of trees created without
+    /// them derived on demand (ADR 0069).
+    Repo,
+    /// A lazy derivation's own reads (ADR 0069): the nodes the chain built
+    /// so far, then (if `cached`) nodes derived earlier, then stored nodes,
+    /// and never a derivation of their own, so deriving never recurses.
+    Derive {
+        local: &'a HashMap<Hash, TreeNode>,
+        cached: bool,
+    },
+}
+
+impl Reads<'_> {
+    async fn read(self, repo: &Repo, tree: Hash) -> Result<TreeNode> {
+        match self {
+            Reads::Repo => repo.read_tree(tree).await,
+            Reads::Derive { local, cached } => {
+                if let Some(n) = local.get(&tree) {
+                    return Ok(n.clone());
+                }
+                if cached {
+                    if let Some(n) = repo.derived_node(&tree) {
+                        return Ok(n);
+                    }
+                }
+                repo.read_tree_stored_opt(tree)
+                    .await?
+                    .ok_or_else(|| Error::NotFound(format!("tree {tree}")))
+            }
+        }
+    }
+}
+
 /// Load the directory nodes along `dir` into `nodes` (which must contain the
 /// root). Returns false if a component is absent and `create` is false.
 async fn ensure_dir(
     repo: &Repo,
+    reads: Reads<'_>,
     nodes: &mut HashMap<String, TreeNode>,
     dir: &str,
     create: bool,
@@ -64,7 +101,7 @@ async fn ensure_dir(
         let next = join(&cur, comp);
         if !nodes.contains_key(&next) {
             let node = match nodes[&cur].entries.get(comp) {
-                Some(TreeEntry::Dir { tree }) => repo.read_tree(*tree).await?,
+                Some(TreeEntry::Dir { tree }) => reads.read(repo, *tree).await?,
                 None if create => TreeNode::default(),
                 None => return Ok(false),
                 Some(TreeEntry::File { .. }) => {
@@ -76,6 +113,13 @@ async fn ensure_dir(
         cur = next;
     }
     Ok(true)
+}
+
+/// A tree [`build_tree`] built in memory: its root hash and the nodes it
+/// rewrote, deepest first, so the root comes last.
+pub(crate) struct Built {
+    pub(crate) root: Hash,
+    pub(crate) nodes: Vec<(Hash, Bytes, TreeNode)>,
 }
 
 /// Apply `changes` to the tree `base`, rewriting only directories on changed
@@ -112,8 +156,55 @@ async fn apply_changes_inner(
         }
         return Ok(base);
     }
+    let built = build_tree(repo, Reads::Repo, base, changes).await?;
+    // Store every rewritten node in one batch (the changeset that will
+    // reference them is written after all of them), keeping them decoded
+    // for the rest of a land batch attempt. On an unstored base (ADR 0069)
+    // the nodes of it the new tree keeps go too, so the tree is whole.
+    let below = repo.unstored_below(base, &built).await?;
+    let mut rewritten = Vec::with_capacity(below.len() + built.nodes.len());
+    for (h, bytes, node) in below.into_iter().chain(built.nodes) {
+        if let Some(m) = &repo.node_memo {
+            m.insert(h, node);
+        }
+        rewritten.push((h, bytes));
+    }
+    repo.put_rescuing_many_loose(rewritten, &named_contents(changes))
+        .await?;
+    Ok(built.root)
+}
+
+/// The distinct contents `changes` names, sorted.
+pub(crate) fn named_contents(changes: &BTreeMap<RepoPath, FileChange>) -> Vec<Hash> {
+    let mut named: Vec<Hash> = changes
+        .values()
+        .filter_map(|c| match c {
+            FileChange::Modify { content, .. } => Some(*content),
+            FileChange::Delete => None,
+        })
+        .collect();
+    named.sort_unstable();
+    named.dedup();
+    named
+}
+
+/// The tree of `changes` applied to `base`, built in memory and stored
+/// nowhere: what [`apply_changes`] stores, with the same checks and errors.
+/// Reads the nodes it rewrites through `reads`.
+pub(crate) async fn build_tree(
+    repo: &Repo,
+    reads: Reads<'_>,
+    base: Hash,
+    changes: &BTreeMap<RepoPath, FileChange>,
+) -> Result<Built> {
+    if changes.is_empty() {
+        return Ok(Built {
+            root: base,
+            nodes: Vec::new(),
+        });
+    }
     let mut nodes: HashMap<String, TreeNode> = HashMap::new();
-    nodes.insert(String::new(), repo.read_tree(base).await?);
+    nodes.insert(String::new(), reads.read(repo, base).await?);
 
     // Deletes first, so a changeset may replace a file with a directory.
     let mut deleted = false;
@@ -123,7 +214,7 @@ async fn apply_changes_inner(
         }
         let absent = || Error::Invalid(format!("delete of absent path {path}"));
         let dir = parent_dir(path.as_str());
-        if !ensure_dir(repo, &mut nodes, dir, false).await? {
+        if !ensure_dir(repo, reads, &mut nodes, dir, false).await? {
             return Err(absent());
         }
         let node = nodes.get_mut(dir).expect("loaded");
@@ -146,7 +237,7 @@ async fn apply_changes_inner(
             continue;
         };
         let dir = parent_dir(path.as_str());
-        ensure_dir(repo, &mut nodes, dir, true).await?;
+        ensure_dir(repo, reads, &mut nodes, dir, true).await?;
         let node = nodes.get_mut(dir).expect("loaded");
         if let Some(TreeEntry::Dir { .. }) = node.entries.get(path.file_name()) {
             return Err(Error::Invalid(format!("{path} is a directory")));
@@ -161,8 +252,7 @@ async fn apply_changes_inner(
         );
     }
 
-    // Rebuild bottom-up, then store every rewritten node in one batch (the
-    // changeset that will reference them is written after all of them).
+    // Rebuild bottom-up.
     let mut dirs: Vec<String> = nodes.keys().filter(|d| !d.is_empty()).cloned().collect();
     dirs.sort_by_key(|d| std::cmp::Reverse(depth(d)));
     let mut rewritten = Vec::with_capacity(dirs.len() + 1);
@@ -173,36 +263,25 @@ async fn apply_changes_inner(
         if node.entries.is_empty() {
             parent.entries.remove(name);
         } else {
-            let h = store_node(repo, node, &mut rewritten);
+            let h = encode_node(node, &mut rewritten);
             parent
                 .entries
                 .insert(name.to_string(), TreeEntry::Dir { tree: h });
         }
     }
     let root = nodes.remove("").expect("root");
-    let h = store_node(repo, root, &mut rewritten);
-    let mut named: Vec<Hash> = changes
-        .values()
-        .filter_map(|c| match c {
-            FileChange::Modify { content, .. } => Some(*content),
-            FileChange::Delete => None,
-        })
-        .collect();
-    named.sort_unstable();
-    named.dedup();
-    repo.put_rescuing_many_loose(rewritten, &named).await?;
-    Ok(h)
+    let root = encode_node(root, &mut rewritten);
+    Ok(Built {
+        root,
+        nodes: rewritten,
+    })
 }
 
-/// Encode `node` once for its hash and its bytes, queue it for writing, and
-/// keep it decoded for the rest of a land batch attempt.
-fn store_node(repo: &Repo, node: TreeNode, rewritten: &mut Vec<(Hash, Bytes)>) -> Hash {
+/// Encode `node` once for its hash and its bytes, and queue it.
+fn encode_node(node: TreeNode, rewritten: &mut Vec<(Hash, Bytes, TreeNode)>) -> Hash {
     let bytes = node.encode();
     let h = Hash::of_object(TreeNode::KIND, &bytes);
-    rewritten.push((h, Bytes::from(bytes)));
-    if let Some(m) = &repo.node_memo {
-        m.insert(h, node);
-    }
+    rewritten.push((h, Bytes::from(bytes), node));
     h
 }
 

@@ -7,6 +7,33 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 ## [Unreleased]
 
+### Creates leave their tree nodes out
+- **Changed.** `POST /v1/changesets` builds the new tree in memory, checks
+  it and stores its root hash as before, but writes none of its tree
+  nodes: no file and no fsync per directory on the create path. Readers of
+  an unlanded changeset derive the missing nodes from its first parent's
+  tree and its changes, checked against its `root_tree` row, and keep them
+  in memory; a land that fast-forwards a ref (or lands first on it) stores
+  the tree before moving the ref. Nothing persisted changes format; there
+  are fewer objects. `--lazy-create-trees off` stores every create's tree
+  as before, for comparison. See ADR 0069.
+- **Added.** `verify` reports `lazy_tree_nodes`: nodes of unstored trees it
+  derived and checked. Metrics `leep_create_lazy_trees_total`,
+  `leep_lazy_tree_derivations_total`, `leep_lazy_tree_derive_seconds` and
+  `leep_lazy_tree_materialized_total`.
+- **Changed.** `--derive-cache-bytes` defaults to 420 MiB, 16 MiB more for
+  the derived nodes of unstored trees.
+- **Changed.** `GET /v1/blobs/{hash}` answers 404 for a tree node of an
+  unlanded changeset, which is no longer stored. Tree nodes were never
+  meant to be fetched there; the CLI, the git mirror and MCP fetch only
+  file contents and read trees through the changeset endpoints.
+- **Changed.** The changeset sweep stores the tree of a changeset it
+  deletes whose create left it out, before its tombstone, so
+  `gc --full --backup-fence` keeps its contents as before.
+- **Changed.** A land batch that fast-forwards a ref to such a changeset
+  stores its tree in two waves (nodes, then the root), so two packs; an
+  eager create flushes its tree's nodes before writing the root.
+
 ### Land batches write one pack
 - **Changed.** A land batch's new objects (tree nodes, merged contents)
   are written as one pack on filesystem and object store blob stores,

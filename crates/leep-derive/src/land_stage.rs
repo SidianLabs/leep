@@ -34,6 +34,11 @@ pub(crate) struct Staging {
 #[derive(Default)]
 pub(crate) struct NodeMemo {
     nodes: Mutex<HashMap<Hash, TreeNode>>,
+    /// Nodes of unstored trees the attempt derived (ADR 0069), kept apart
+    /// from `nodes`, which the attempt may treat as stored: a slow-path
+    /// replay derives the land's tree once and its merge reads it here,
+    /// whatever the shared cache evicts meanwhile.
+    derived: Mutex<HashMap<Hash, TreeNode>>,
     tree_nanos: AtomicU64,
 }
 
@@ -53,6 +58,21 @@ impl NodeMemo {
             .insert(hash, node);
     }
 
+    pub(crate) fn get_derived(&self, hash: &Hash) -> Option<TreeNode> {
+        self.derived
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(hash)
+            .cloned()
+    }
+
+    pub(crate) fn insert_derived(&self, nodes: &HashMap<Hash, TreeNode>) {
+        let mut d = self.derived.lock().unwrap_or_else(|e| e.into_inner());
+        for (h, n) in nodes {
+            d.entry(*h).or_insert_with(|| n.clone());
+        }
+    }
+
     pub(crate) fn add_tree_time(&self, took: Duration) {
         self.tree_nanos
             .fetch_add(took.as_nanos() as u64, Ordering::Relaxed);
@@ -63,6 +83,9 @@ impl NodeMemo {
 struct Staged {
     blobs: HashMap<Hash, Bytes>,
     blob_order: Vec<Hash>,
+    /// Root nodes of trees a fast-forward stores (ADR 0069), written after
+    /// `blob_order` is durable: a root present means its tree is whole.
+    late_roots: Vec<Hash>,
     changesets: HashMap<ChangesetId, Changeset>,
     changeset_order: Vec<ChangesetId>,
     rows: HashMap<(String, Hash), Bytes>,
@@ -239,16 +262,49 @@ impl Staging {
             .collect()
     }
 
+    /// Stage `id`'s tree if it is not stored (ADR 0069): a changeset the
+    /// ref moves to as it is (a fast-forward, or the first land on a ref)
+    /// may have been created without its tree, and a ref's line keeps its
+    /// trees stored so its lands and readers need not derive them. `repo`
+    /// is this staging's handle.
+    pub(crate) async fn stage_tree(&self, repo: &Repo, id: ChangesetId) -> Result<()> {
+        let mut nodes = repo.unstored_tree(id).await?;
+        let Some((root, root_bytes, root_node)) = nodes.pop() else {
+            return Ok(());
+        };
+        // In the memo, as every node the attempt stages: a staged node read
+        // back through the store must not reach the cache of stored nodes.
+        self.memo.insert(root, root_node);
+        let mut s = self.lock();
+        for (h, b, n) in nodes {
+            self.memo.insert(h, n);
+            if s.blobs.insert(h, b).is_none() {
+                s.blob_order.push(h);
+            }
+        }
+        if s.blobs.insert(root, root_bytes).is_none() {
+            s.late_roots.push(root);
+        }
+        repo.lazy.forget_depth(&id);
+        metrics::counter!("leep_lazy_tree_materialized_total").increment(1);
+        Ok(())
+    }
+
     /// Store what the batch wrote, in the order a lone write keeps: blobs
     /// (through the GC rescue check) before the changesets and rows that
     /// reference them, all of it before the caller moves the ref. Stopping
     /// part way leaves only unreferenced objects, as an interrupted lone land
     /// does.
     pub(crate) async fn flush(&self, repo: &Repo) -> Result<()> {
-        let (blobs, changesets, rows) = {
+        let (blobs, late, changesets, rows) = {
             let s = self.lock();
             let blobs: Vec<(Hash, Bytes)> = s
                 .blob_order
+                .iter()
+                .map(|h| (*h, s.blobs[h].clone()))
+                .collect();
+            let late: Vec<(Hash, Bytes)> = s
+                .late_roots
                 .iter()
                 .map(|h| (*h, s.blobs[h].clone()))
                 .collect();
@@ -262,13 +318,16 @@ impl Staging {
                 .iter()
                 .map(|k| DerivedRow::new(k.0.clone(), k.1, s.rows[k].clone()))
                 .collect();
-            (blobs, changesets, rows)
+            (blobs, late, changesets, rows)
         };
         if !blobs.is_empty() {
             // Flushed there, before any changeset names them (ADR 0044). The
             // copies name no other new contents: theirs were made durable
             // when the landed changesets were created.
             repo.put_rescuing_many(blobs, &[]).await?;
+        }
+        if !late.is_empty() {
+            repo.put_rescuing_many(late, &[]).await?;
         }
         if !changesets.is_empty() || !rows.is_empty() {
             repo.meta()

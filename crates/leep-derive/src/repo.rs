@@ -18,8 +18,9 @@ use crate::derived::{
     history_pack::{Part, RawNode},
     DerivedKind, Generation, LastMerge, NodeRef, RootTree, SkipEntry, Skiplist, StoredHistoryNode,
 };
+use crate::lazy_tree::MAX_LAZY_DEPTH;
 use crate::signatures::{LandPolicy, PolicySet};
-use crate::tree_ops::{apply_changes, TreeView};
+use crate::tree_ops::{apply_changes, build_tree, named_contents, Reads, TreeView};
 
 /// Longest path, in bytes, a client changeset may name (Linux's `PATH_MAX`).
 pub const MAX_PATH_BYTES: usize = 4096;
@@ -110,6 +111,12 @@ pub struct Repo {
     /// Tree nodes viewed for lookups (see `read_tree_view`).
     pub(crate) trees: Arc<TreeCache>,
     pub(crate) nodes: Arc<NodeCache>,
+    /// Trees of created changesets that were not stored, derived on demand
+    /// (ADR 0069).
+    pub(crate) lazy: Arc<crate::lazy_tree::LazyTrees>,
+    /// Whether creates of client changesets leave their tree nodes out
+    /// (ADR 0069).
+    pub(crate) lazy_create: bool,
     /// Encoded `tree-trigrams-v1` rows read from the store by searches
     /// (see `Repo::search_tree_rows`).
     pub(crate) search_trees: Arc<SearchTreeCache>,
@@ -521,6 +528,7 @@ pub const DEFAULT_CACHE_BYTES: usize = HISTORY_CACHE_BYTES
     + HISTORY_ROOT_CACHE_BYTES
     + TREE_CACHE_BYTES
     + NODE_CACHE_BYTES
+    + crate::lazy_tree::LAZY_NODE_CACHE_BYTES
     + SEARCH_TREE_CACHE_BYTES
     + crate::derived::LOG_FILTER_CACHE_BYTES;
 
@@ -576,6 +584,8 @@ impl Repo {
             history_roots: Arc::default(),
             trees: Arc::default(),
             nodes: Arc::default(),
+            lazy: Arc::default(),
+            lazy_create: false,
             search_trees: Arc::default(),
             skiplists: Arc::default(),
             log_filter: Arc::default(),
@@ -702,6 +712,14 @@ impl Repo {
         self.land_queue_bound
     }
 
+    /// Leave the tree nodes of client changesets out at create, deriving
+    /// them when read (ADR 0069). Off stores them, as before; either way a
+    /// tree created without its nodes reads the same.
+    pub fn with_lazy_create_trees(mut self, on: bool) -> Self {
+        self.lazy_create = on;
+        self
+    }
+
     /// Whether a land none of whose paths the ref touched since its base is
     /// copied onto the head without a three-way merge (ADR 0066), on by
     /// default. Off replays every land in full; the answers are the same,
@@ -779,6 +797,7 @@ impl Repo {
         self.history_roots = Arc::new(SizedCache::scaled(s));
         self.trees = Arc::new(SizedCache::scaled(s));
         self.nodes = Arc::new(SizedCache::scaled(s));
+        self.lazy = Arc::new(crate::lazy_tree::LazyTrees::scaled(s));
         self.search_trees = Arc::new(SizedCache::scaled(s));
         self.skiplists = Arc::new(SkiplistCache::scaled(s));
         self.log_filter = Arc::new(crate::derived::LogFilterCaches::scaled(s));
@@ -970,16 +989,49 @@ impl Repo {
             }
         }
         let base = match (cs.parents.first(), pre.base_tree) {
-            (Some(_), Some(t)) => t,
+            (Some(p), Some(t)) => {
+                self.note_root(*p, t);
+                t
+            }
             (Some(p), None) => self.root_tree(*p).await?,
             (None, _) => TreeNode::empty_hash(),
+        };
+        // A client's changeset leaves its tree out unless that would make
+        // too long a run of unstored trees (ADR 0069).
+        let mut lazy_depth = match (client_blobs && self.lazy_create, cs.parents.first()) {
+            (false, _) => None,
+            (true, None) => Some(1),
+            (true, Some(p)) => {
+                Some(self.lazy_depth(*p, base).await? + 1).filter(|d| *d <= MAX_LAZY_DEPTH)
+            }
         };
         // The changeset makes its blobs reachable, so they must survive a
         // power loss before it is stored (ADR 0044): `apply_changes` flushes
         // the tree nodes it writes and every content the changeset names,
         // which may have been uploaded to another process or before a
-        // restart, after the checks above found them.
-        let tree = apply_changes(self, base, &cs.changes).await?;
+        // restart, after the checks above found them. A lazy create
+        // flushes the contents alone.
+        let mut lazily = false;
+        let tree = match lazy_depth {
+            None => apply_changes(self, base, &cs.changes).await?,
+            Some(_) => {
+                let built = build_tree(self, Reads::Repo, base, &cs.changes).await?;
+                if self.read_tree_stored_opt(built.root).await?.is_some() {
+                    // A root that is stored must have its whole tree below
+                    // it, and this one may be left from an interrupted
+                    // write: store the tree after all.
+                    lazy_depth = None;
+                    apply_changes(self, base, &cs.changes).await?
+                } else {
+                    let named = named_contents(&cs.changes);
+                    if !named.is_empty() {
+                        self.blobs.flush_blobs(&named).await?;
+                    }
+                    lazily = true;
+                    built.root
+                }
+            }
+        };
 
         let started = std::time::Instant::now();
         let mut parent_generations = Vec::with_capacity(cs.parents.len());
@@ -1030,6 +1082,13 @@ impl Repo {
         }
         rows.extend(extra);
         self.meta.put_changeset_with_derived(&cs, &rows).await?;
+        if let (Some(depth), true) = (lazy_depth, lazily) {
+            // Only the depth: keeping the nodes too churned the derived-node
+            // cache with every create's, evicting the trees readers derive.
+            self.lazy.remember_depth(id, depth);
+            self.note_root(id, tree);
+            metrics::counter!("leep_create_lazy_trees_total").increment(1);
+        }
         self.skiplists.insert(id, skiplist);
         let parents: Arc<[ChangesetId]> = cs.parents.into();
         self.ancestry.update(id, |e| {
@@ -1212,7 +1271,9 @@ impl Repo {
     /// Hash of the changeset's root tree node.
     pub async fn root_tree(&self, id: ChangesetId) -> Result<Hash> {
         let v = derived::derive::<RootTree>(self, id).await?;
-        derived::decode_hash(&v)
+        let root = derived::decode_hash(&v)?;
+        self.note_root(id, root);
+        Ok(root)
     }
 
     /// [`Repo::root_tree`], answered from what [`Repo::prefetch_root_trees`]
@@ -1221,7 +1282,10 @@ impl Repo {
     /// that must not answer later reads.
     pub(crate) async fn root_tree_prefetched(&self, id: ChangesetId) -> Result<Hash> {
         match self.ancestry.get(&id, |e| e.root) {
-            Some(r) => Ok(r),
+            Some(r) => {
+                self.note_root(id, r);
+                Ok(r)
+            }
             None => self.root_tree(id).await,
         }
     }
@@ -1269,6 +1333,7 @@ impl Repo {
         }
         for (key, v) in keys.iter().zip(values) {
             if let Some(r) = v.and_then(|v| derived::decode_hash(&v).ok()) {
+                self.note_root(ChangesetId(*key), r);
                 self.ancestry
                     .update(ChangesetId(*key), |e| e.root = Some(r));
             }
@@ -1326,37 +1391,48 @@ impl Repo {
         Ok(p)
     }
 
-    /// Read one tree node. The empty tree always exists.
+    /// Read one tree node. The empty tree always exists. A node of a tree
+    /// created without its nodes is derived (ADR 0069).
     pub async fn read_tree(&self, tree: Hash) -> Result<TreeNode> {
-        if let Some(n) = self.node_memo.as_ref().and_then(|m| m.get(&tree)) {
+        if let Some(n) = self.lazy_first(&[tree]).await?.remove(&tree) {
             return Ok(n);
         }
-        if let Some(n) = self.nodes.get(&tree) {
-            return Ok((*n).clone());
+        if let Some(n) = self.read_tree_stored_opt(tree).await? {
+            return Ok(n);
         }
-        let node = self.read_tree_stored(tree).await?;
-        if let Some(m) = &self.node_memo {
-            m.insert(tree, node.clone());
-        }
-        Ok(node)
+        self.lazy_node(tree)
+            .await?
+            .ok_or_else(|| Error::NotFound(format!("tree {tree}")))
     }
 
-    async fn read_tree_stored(&self, tree: Hash) -> Result<TreeNode> {
-        match self.blobs.get(&tree).await? {
+    /// [`Repo::read_tree`] of a stored node (or one a land batch attempt
+    /// staged), `None` when the store lacks it: never derived.
+    pub(crate) async fn read_tree_stored_opt(&self, tree: Hash) -> Result<Option<TreeNode>> {
+        if let Some(n) = self.node_memo.as_ref().and_then(|m| m.get(&tree)) {
+            return Ok(Some(n));
+        }
+        if let Some(n) = self.nodes.get(&tree) {
+            return Ok(Some((*n).clone()));
+        }
+        let node = match self.blobs.get(&tree).await? {
             // A node's address is the hash of its bytes, so damage is
             // detectable. GC marks from these nodes: reading a damaged one as
             // valid would leave live blobs unmarked.
             Some(b) if Hash::of_object(TreeNode::KIND, &b) != tree => {
-                Err(Error::Storage(format!("corrupt tree node {tree}")))
+                return Err(Error::Storage(format!("corrupt tree node {tree}")))
             }
             Some(b) => {
                 let node = TreeNode::decode(&b)?;
                 self.cache_node(tree, &node, b.len());
-                Ok(node)
+                node
             }
-            None if tree == TreeNode::empty_hash() => Ok(TreeNode::default()),
-            None => Err(Error::NotFound(format!("tree {tree}"))),
+            None if tree == TreeNode::empty_hash() => TreeNode::default(),
+            None => return Ok(None),
+        };
+        if let Some(m) = &self.node_memo {
+            m.insert(tree, node.clone());
         }
+        Ok(Some(node))
     }
 
     /// Keep a node read from the store and checked against its hash. In a
@@ -1372,6 +1448,56 @@ impl Repo {
     /// distinct ones: a walk that knows a whole level of a tree reads it with
     /// many reads in flight instead of one.
     pub async fn read_trees(&self, trees: &[Hash]) -> Result<Vec<TreeNode>> {
+        let mut nodes = self.lazy_first(trees).await?;
+        let rest: Vec<Hash> = trees
+            .iter()
+            .filter(|t| !nodes.contains_key(*t))
+            .copied()
+            .collect();
+        nodes.extend(self.read_trees_stored(&rest).await?);
+        let mut uses: HashMap<Hash, usize> = HashMap::with_capacity(trees.len());
+        for t in trees {
+            *uses.entry(*t).or_default() += 1;
+        }
+        let missing: Vec<Hash> = uses
+            .keys()
+            .filter(|t| !nodes.contains_key(*t))
+            .copied()
+            .collect();
+        if !missing.is_empty() {
+            // Derived, not stored (ADR 0069); one derivation answers every
+            // node of its tree.
+            let mut derived = self.lazy_nodes(&missing).await?;
+            for t in missing {
+                match derived.remove(&t) {
+                    Some(n) => {
+                        nodes.insert(t, n);
+                    }
+                    None => return Err(Error::NotFound(format!("tree {t}"))),
+                }
+            }
+        }
+        let mut out = Vec::with_capacity(trees.len());
+        for t in trees {
+            // The last use of a node takes it; earlier repeats clone.
+            let left = uses.get_mut(t).expect("counted");
+            *left -= 1;
+            out.push(if *left > 0 {
+                nodes[t].clone()
+            } else {
+                nodes.remove(t).expect("each distinct node decoded once")
+            });
+        }
+        Ok(out)
+    }
+
+    /// The stored (or staged) nodes among `trees`, by hash, with one
+    /// [`BlobStore::get_many`](leep_core::BlobStore::get_many) for those not
+    /// held in memory; nodes the store lacks are left out, never derived.
+    pub(crate) async fn read_trees_stored(
+        &self,
+        trees: &[Hash],
+    ) -> Result<HashMap<Hash, TreeNode>> {
         let mut distinct = trees.to_vec();
         distinct.sort_unstable();
         distinct.dedup();
@@ -1401,10 +1527,6 @@ impl Repo {
                 distinct.len()
             )));
         }
-        let mut uses: HashMap<Hash, usize> = HashMap::with_capacity(distinct.len());
-        for t in trees {
-            *uses.entry(*t).or_default() += 1;
-        }
         for (tree, bytes) in distinct.into_iter().zip(found) {
             let node = match bytes {
                 Some(b) if Hash::of_object(TreeNode::KIND, &b) != tree => {
@@ -1416,25 +1538,14 @@ impl Repo {
                     node
                 }
                 None if tree == TreeNode::empty_hash() => TreeNode::default(),
-                None => return Err(Error::NotFound(format!("tree {tree}"))),
+                None => continue,
             };
             if let Some(m) = &self.node_memo {
                 m.insert(tree, node.clone());
             }
             nodes.insert(tree, node);
         }
-        let mut out = Vec::with_capacity(trees.len());
-        for t in trees {
-            // The last use of a node takes it; earlier repeats clone.
-            let left = uses.get_mut(t).expect("counted");
-            *left -= 1;
-            out.push(if *left > 0 {
-                nodes[t].clone()
-            } else {
-                nodes.remove(t).expect("each distinct node decoded once")
-            });
-        }
-        Ok(out)
+        Ok(nodes)
     }
 
     /// [`Repo::read_tree`] as a [`TreeView`], kept in a bounded cache, for
@@ -1443,13 +1554,21 @@ impl Repo {
         if let Some(t) = self.trees.get(&tree) {
             return Ok(t);
         }
-        let view = match self.blobs.get(&tree).await? {
+        let derived = self.lazy_first(&[tree]).await?.remove(&tree);
+        let stored = match derived {
+            Some(n) => Some(Bytes::from(n.encode())),
+            None => self.blobs.get(&tree).await?,
+        };
+        let view = match stored {
             Some(b) if Hash::of_object(TreeNode::KIND, &b) != tree => {
                 return Err(Error::Storage(format!("corrupt tree node {tree}")))
             }
             Some(b) => TreeView::parse(b)?,
             None if tree == TreeNode::empty_hash() => TreeView::empty(),
-            None => return Err(Error::NotFound(format!("tree {tree}"))),
+            None => match self.lazy_node(tree).await? {
+                Some(n) => TreeView::parse(Bytes::from(n.encode()))?,
+                None => return Err(Error::NotFound(format!("tree {tree}"))),
+            },
         };
         let view = Arc::new(view);
         // `insert` counts twice what it is given.
@@ -1584,7 +1703,7 @@ mod tests {
         ] {
             assert_eq!(d.of(n), n);
         }
-        assert_eq!(DEFAULT_CACHE_BYTES, 404 << 20);
+        assert_eq!(DEFAULT_CACHE_BYTES, 420 << 20);
         let half = CacheScale {
             total: DEFAULT_CACHE_BYTES / 2,
         };

@@ -182,6 +182,10 @@ measured until the response head is ready, not until the body is streamed.
 | `leep_land_admission_refused_total` | counter | `route` = `direct`, `forwarded` | Lands refused at once with `503` `unavailable`, `Retry-After` and `Leep-Refused: admission` because their ref's queue was at `--land-queue-batches` ([Land admission](#land-admission), ADR 0060). `forwarded`: the land came from another server, which relays the 503. Counted by the server that batches the ref; both series exist from startup. Not in `leep_land_total`. They also count in `leep_http_requests_total` as 503, a forwarded one on both servers; `LeepServerErrors` and `LeepLandErrors` subtract them. |
 | `leep_land_queue_batches` | gauge | none | The largest land queue, in batches, over the refs this server batches: the waiting lands over 64, rounded up, plus one while a batch replays. A land waits about one batch time per batch. No ref label: the hottest queue is what matters. |
 | `leep_land_replays_total` | counter | `path` = `fast`, `slow` | Lands replayed onto a moved head (not fast-forwards or lands answered without a move): `fast` copied the stack without a merge because nothing the ref changed since its base touches its paths, `slow` replayed it with a three-way merge per changeset (ADR 0066). Both series exist from startup. |
+| `leep_create_lazy_trees_total` | counter | | Creates that stored no tree node (ADR 0069, `--lazy-create-trees on`). |
+| `leep_lazy_tree_derivations_total` | counter | | Trees of creates rebuilt in memory because a read needed a node that was not stored (ADR 0069). A rate near the read rate of unlanded changesets is normal; one that tracks every log or blame means a history made of lazy creates is walked cold. |
+| `leep_lazy_tree_derive_seconds` | histogram | | Time of one such rebuild, the whole chain down to a stored tree. |
+| `leep_lazy_tree_materialized_total` | counter | | Unstored trees a land stored because it moved a ref to the changeset as it is (a fast-forward or a first land). |
 | `leep_land_replay_seconds` | histogram | `path` | Time one land's replay took, by path. |
 | `leep_land_fast_map_total` | counter | `result` = `hit`, `overlap`, `cold`, `window`, `ineligible` | What the leader's write map said about a replayed land: `hit` took the fast path; `overlap` touches a path the ref changed since its base; `cold` is based on a head older than what the map has seen since this server started leading the ref (or since another server moved it); `window` is based further back than the map's 4,096 changesets; `ineligible` has no base on the ref's first-parent line (a stack on its own landed copy, a root). All but `hit` replay the slow way. |
 | `leep_land_fast_map_resets_total` | counter | none | Times a write map started again from the current head: another server moved the ref, a swap was lost, a fast-forward was too long to follow, or the map outgrew its bound. |
@@ -474,6 +478,7 @@ How a land is replayed onto a moved head (ADR 0066):
 | Flag / env | Default | What it does |
 |---|---|---|
 | `--land-fast-path on\|off` / `LEEP_LAND_FAST_PATH` | `on` | Copy a land without a merge when nothing the ref changed since its base touches its paths. The answers are the same either way; `off` is for comparison. |
+| `--lazy-create-trees on\|off` / `LEEP_LAZY_CREATE_TREES` | `on` | A create stores no tree node: its tree is built in memory to check it and hash it, and derived from the first parent's tree when something reads it (ADR 0069). A land that moves a ref to such a changeset as it is stores its tree first. The answers are the same either way; `off` stores every create's tree, for comparison. A server may switch at any restart: either setting reads trees written under the other. |
 | `--land-conflicts merge\|strict` / `LEEP_LAND_CONFLICTS` | `merge` | `merge` merges a file both the ref and the land changed three ways; `strict` answers every such file as a conflict, which the client resolves on the new head. |
 | `--strict-land-ref REF` / `LEEP_STRICT_LAND_REFS` | none | Refs that are `strict` whatever `--land-conflicts` says. Repeatable. |
 
@@ -1413,7 +1418,7 @@ apply to the server and to its tools (`verify`, `repair`, `upgrade-index`,
 |---|---|---|
 | `--meta-pool-size` / `LEEP_META_POOL_SIZE` | 16 | Connections this process opens to a Postgres metadata store for requests, derivation and tools. SQLite ignores it. |
 | `--meta-land-pool-size` / `LEEP_META_LAND_POOL_SIZE` | an eighth of `--meta-pool-size`, at least 4 | Further Postgres connections reserved for land leaders (ADR 0067), opened on first use. `0` reserves none. SQLite ignores it. |
-| `--derive-cache-bytes` / `LEEP_DERIVE_CACHE_BYTES` | 423624704 (404 MiB) | The in-memory caches of derived indexes: path-history nodes, parts and roots (148 MiB), tree nodes (32 MiB), search's directory filters (64 MiB), and the filtered-log caches (160 MiB). The ancestry and skiplist caches are bounded by entries, about 100 MB together by default, and scale by the same factor. |
+| `--derive-cache-bytes` / `LEEP_DERIVE_CACHE_BYTES` | 440401920 (420 MiB) | The in-memory caches of derived indexes: path-history nodes, parts and roots (148 MiB), tree nodes (32 MiB), nodes of unstored trees derived on read (16 MiB, ADR 0069), search's directory filters (64 MiB), and the filtered-log caches (160 MiB). The ancestry and skiplist caches are bounded by entries, about 100 MB together by default, and scale by the same factor. |
 
 `--cache-bytes` (256 MiB) is separate: it caches blobs.
 
@@ -1454,7 +1459,7 @@ apply to the server and to its tools (`verify`, `repair`, `upgrade-index`,
   with `canceling statement due to statement timeout` in the ERROR log; if a
   legitimate one does, raise the flag rather than turning it off.
 - **Derive caches.** Every cache gets its default share of the budget
-  times `budget / 404 MiB`. More helps derivation of very wide histories
+  times `budget / 420 MiB`. More helps derivation of very wide histories
   and filtered logs over long ranges: `history-tree-v4` derivation re-reads
   hot directory nodes, and `log-filter-v1` merge walks reuse fingerprints.
   Search keeps the `tree-trigrams-v1` rows it reads from the store (64 MiB

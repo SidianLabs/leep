@@ -64,6 +64,8 @@ struct Shared {
     /// killed GC's lease without the history growing meanwhile.
     pause: AtomicBool,
     confirmed: Mutex<Vec<Confirmed>>,
+    /// Changesets whose trees a store check has read.
+    trees_read: Mutex<HashSet<ChangesetId>>,
     /// Answers that were neither a success nor a plain "try again".
     odd: Mutex<Vec<String>>,
     retries: Mutex<u64>,
@@ -118,6 +120,64 @@ struct StopOnDrop<'a>(&'a AtomicBool);
 impl Drop for StopOnDrop<'_> {
     fn drop(&mut self) {
         self.0.store(true, Ordering::Relaxed);
+    }
+}
+
+/// `eprintln!` that libtest does not capture: these tests run for minutes,
+/// and a run the watchdog ends never prints what was captured.
+macro_rules! progress {
+    ($($t:tt)*) => {{
+        use std::io::Write;
+        let _ = writeln!(std::io::stderr(), $($t)*);
+    }};
+}
+
+/// Ends the test binary once a crash test runs past its budget
+/// (`LEEP_CRASH_BUDGET_SECS`, default 900): a test that stops converging
+/// then fails CI with its log within minutes, instead of holding the
+/// tests queued behind `serial()` until the job's timeout.
+struct Watchdog {
+    done: std::sync::Arc<AtomicBool>,
+    name: String,
+    started: Instant,
+}
+
+impl Watchdog {
+    fn start() -> Self {
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+        let budget = Duration::from_secs(env_u64("LEEP_CRASH_BUDGET_SECS", 900));
+        let name = std::thread::current()
+            .name()
+            .unwrap_or("crash test")
+            .to_string();
+        let started = Instant::now();
+        progress!("{name}: started, budget {budget:?}");
+        let (flag, who) = (done.clone(), name.clone());
+        std::thread::spawn(move || {
+            while !flag.load(Ordering::Relaxed) {
+                if started.elapsed() > budget {
+                    progress!("{who} ran past its {budget:?} budget; ending the test binary");
+                    std::process::exit(101);
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        });
+        Watchdog {
+            done,
+            name,
+            started,
+        }
+    }
+}
+
+impl Drop for Watchdog {
+    fn drop(&mut self) {
+        self.done.store(true, Ordering::Relaxed);
+        progress!(
+            "{}: done in {:.1}s",
+            self.name,
+            self.started.elapsed().as_secs_f64()
+        );
     }
 }
 
@@ -362,6 +422,20 @@ fn common_block_on<F: std::future::Future>(f: F) -> F::Output {
 /// Everything the invariants say about a store, checked from outside the
 /// server. `tag` names the backend, seed and round in every message.
 fn check_store(tag: &str, stores: &Stores, shared: &Shared, live: bool) {
+    check_store_with(tag, stores, shared, live, false);
+}
+
+/// [`check_store`] under live traffic, reading the trees of only the
+/// changesets no earlier check read. A full check is linear in the store,
+/// and agents landing through it grow the store in proportion to its
+/// length, so full checks under traffic stop converging on a slow runner.
+/// What an earlier check proved stays checked by the next full one.
+fn check_store_live_new(tag: &str, stores: &Stores, shared: &Shared) {
+    check_store_with(tag, stores, shared, true, true);
+}
+
+fn check_store_with(tag: &str, stores: &Stores, shared: &Shared, live: bool, only_new: bool) {
+    let started = Instant::now();
     let repo = open_repo(stores);
     common_block_on(async {
         let meta = repo.meta();
@@ -379,7 +453,11 @@ fn check_store(tag: &str, stores: &Stores, shared: &Shared, live: bool) {
             all.extend(page);
         }
         let mut blobs_ok: HashSet<Hash> = HashSet::new();
+        let read_before = std::mem::take(&mut *shared.trees_read.lock().unwrap());
         for id in &all {
+            if only_new && read_before.contains(id) {
+                continue;
+            }
             let files = repo
                 .list_files(*id, "")
                 .await
@@ -395,6 +473,22 @@ fn check_store(tag: &str, stores: &Stores, shared: &Shared, live: bool) {
                 }
             }
         }
+
+        shared
+            .trees_read
+            .lock()
+            .unwrap()
+            .extend(all.iter().copied());
+        let read = if only_new {
+            all.iter().filter(|id| !read_before.contains(id)).count()
+        } else {
+            all.len()
+        };
+        progress!(
+            "[{tag}] read the trees of {read} of {} changesets in {:.1}s",
+            all.len(),
+            started.elapsed().as_secs_f64()
+        );
 
         // Every ref reaches only changesets that exist.
         for (name, head) in &refs {
@@ -525,7 +619,7 @@ fn kill_collect_midway(
     }
     let t = Instant::now();
     gc_ok(tag, stores, &["condemn", "--grace", "0"]);
-    eprintln!("[{tag}] condemn took {:.1}s", t.elapsed().as_secs_f64());
+    progress!("[{tag}] condemn took {:.1}s", t.elapsed().as_secs_f64());
     let mut child = Command::new(bin("leep-server"))
         .args(["--meta", &stores.meta, "--blobs", &stores.blobs, "gc"])
         .args(["collect", "--fence", "0s", "--unsafe-no-fence"])
@@ -550,7 +644,7 @@ fn kill_collect_midway(
     let finished = child.try_wait().unwrap().is_some();
     let _ = child.kill();
     let _ = child.wait();
-    eprintln!(
+    progress!(
         "[{tag}] killed gc collect {} ({} of {} planted blobs left)",
         if finished {
             "after it finished"
@@ -581,6 +675,7 @@ fn run_crash_rounds(backend: &str, meta_url: Option<String>) {
 /// [`run_crash_rounds`] with the server started with `extra` flags too.
 fn run_crash_rounds_with(backend: &str, meta_url: Option<String>, extra: &[&str]) -> u64 {
     let _g = serial();
+    let _w = Watchdog::start();
     let seed = env_u64("LEEP_CRASH_SEED", DEFAULT_SEED);
     let rounds = env_u64("LEEP_CRASH_ROUNDS", 3);
     let http_agents = env_u64("LEEP_CRASH_AGENTS", 6) as usize;
@@ -597,14 +692,14 @@ fn run_crash_rounds_with(backend: &str, meta_url: Option<String>, extra: &[&str]
     let not_admitted = match outcome {
         Ok(n) => n,
         Err(e) => {
-            eprintln!(
+            progress!(
                 "crash test failed: backend {backend}, LEEP_CRASH_SEED={seed}, rounds {rounds}, \
                  flags {extra:?}"
             );
             std::panic::resume_unwind(e);
         }
     };
-    eprintln!(
+    progress!(
         "[{backend}] {rounds} kills, seed {seed:#x}, {not_admitted} lands not admitted, {:.1}s",
         started.elapsed().as_secs_f64()
     );
@@ -698,9 +793,9 @@ fn crash_rounds(
                 // would have without the wait.
                 shared.pause.store(true, Ordering::Relaxed);
                 recover_planted(&tag, stores, addr, &planted);
-                shared.pause.store(false, Ordering::Relaxed);
                 planted.clear();
                 check_store(&format!("{tag}, after recovery"), stores, &shared, true);
+                shared.pause.store(false, Ordering::Relaxed);
             }
             if round % 3 == 2 {
                 // A fenced run beside live traffic, as an operator would.
@@ -715,7 +810,7 @@ fn crash_rounds(
                 );
             }
             let confirmed_now = shared.confirmed.lock().unwrap().len();
-            eprintln!(
+            progress!(
                 "[{tag}] {confirmed_now} lands confirmed so far ({} during the last round)",
                 confirmed_now - confirmed_before
             );
@@ -756,7 +851,7 @@ fn recover_planted(tag: &str, stores: &Stores, addr: SocketAddr, planted: &[Vec<
         stores,
         &["collect", "--fence", "0s", "--unsafe-no-fence"],
     );
-    eprintln!(
+    progress!(
         "[{tag}] finishing collect took {:.1}s",
         t.elapsed().as_secs_f64()
     );
@@ -943,6 +1038,22 @@ fn lease_holder(meta_url: &str) -> Option<String> {
     })
 }
 
+/// [`lease_holder`], waiting up to `wait` for one: a leader whose queue
+/// emptied for a moment can let its lease lapse before the next land
+/// takes it again.
+fn lease_holder_within(meta_url: &str, wait: Duration) -> Option<String> {
+    let deadline = Instant::now() + wait;
+    loop {
+        if let Some(h) = lease_holder(meta_url) {
+            return Some(h);
+        }
+        if Instant::now() > deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// An HTTP agent that lands through server `n % count` and moves on to the
 /// next one whenever a request fails, like a client behind a balancer that
 /// takes a dead server out. Records when each of its lands was answered.
@@ -958,6 +1069,7 @@ fn failover_agent(
     let mut k = 0;
     let mut at = n;
     while !shared.stop.load(Ordering::Relaxed) {
+        shared.hold();
         let steps: Vec<Step> = (0..1 + rng.below(2))
             .map(|_| {
                 k += 1;
@@ -997,6 +1109,7 @@ fn killed_land_leader_is_replaced_postgres() {
         return;
     };
     let _g = serial();
+    let _w = Watchdog::start();
     let seed = env_u64("LEEP_CRASH_SEED", DEFAULT_SEED);
     let rounds = env_u64("LEEP_CRASH_ROUNDS", 3);
     let agents = env_u64("LEEP_CRASH_AGENTS", 6) as usize;
@@ -1037,13 +1150,15 @@ fn killed_land_leader_is_replaced_postgres() {
         for round in 0..rounds {
             let tag = format!("coordinated seed {seed:#x} round {round}");
             std::thread::sleep(Duration::from_millis(800 + rng.below(700) as u64));
-            let holder = lease_holder(&db.url).unwrap_or_else(|| panic!("[{tag}] no lease"));
+            let holder = lease_holder_within(&db.url, 2 * LEASE_TTL)
+                .unwrap_or_else(|| panic!("[{tag}] no lease"));
             let i = ports
                 .iter()
                 .position(|p| holder == format!("http://127.0.0.1:{p}"))
                 .unwrap_or_else(|| panic!("[{tag}] lease names {holder}"));
             servers[i].kill();
             let killed = Instant::now();
+            progress!("[{tag}] killed the lease holder {holder}");
             // Every agent lands again within the TTL plus two seconds.
             let bound = LEASE_TTL + Duration::from_secs(2);
             std::thread::sleep(bound + Duration::from_millis(200));
@@ -1065,15 +1180,25 @@ fn killed_land_leader_is_replaced_postgres() {
             stalls.push(worst);
             let moved = lease_holder(&db.url).unwrap_or_default();
             assert_ne!(moved, holder, "[{tag}] the lease moved on");
-            check_store(&format!("{tag}, after SIGKILL"), &stores, &shared, true);
+            // The first check runs under live traffic. Later ones pause the
+            // agents: on a fast runner they landed about four times the
+            // store during each check and restart, the trees to read grew
+            // with it, and the rounds never converged (CI: a 19 s check,
+            // then 424 s, then a final check past the budget).
+            if round > 0 {
+                shared.pause.store(true, Ordering::Relaxed);
+            }
+            check_store_live_new(&format!("{tag}, after SIGKILL"), &stores, &shared);
             servers[i] = start(ports[i]);
+            shared.pause.store(false, Ordering::Relaxed);
+            progress!("[{tag}] restarted it; {} lands so far", after.len());
         }
         std::thread::sleep(Duration::from_millis(400));
         shared.stop.store(true, Ordering::Relaxed);
     });
 
     let tag = format!("coordinated seed {seed:#x} final");
-    eprintln!("[{tag}] longest wait for a land after each kill: {stalls:?}");
+    progress!("[{tag}] longest wait for a land after each kill: {stalls:?}");
     check_store(&tag, &stores, &shared, false);
     let odd = shared.odd.lock().unwrap();
     assert!(
@@ -1082,7 +1207,12 @@ fn killed_land_leader_is_replaced_postgres() {
         &odd[..odd.len().min(5)]
     );
     drop(odd);
+    let t = Instant::now();
     verify_exact(&tag, &stores, &shared);
+    progress!(
+        "[{tag}] verify_exact took {:.1}s",
+        t.elapsed().as_secs_f64()
+    );
     drop(servers);
     drop(db);
 }
@@ -1179,7 +1309,7 @@ fn kill_sweep_at(tag: &str, stores: &Stores, pause: &str) {
     let _ = child.kill();
     let _ = child.wait();
     let line = line.unwrap_or_else(|_| panic!("[{tag}] collect never reached {pause}"));
-    eprintln!("[{tag}] SIGKILLed gc --unreachable: {line}");
+    progress!("[{tag}] SIGKILLed gc --unreachable: {line}");
 }
 
 /// [`gc_ok`] once the gc lease a killed run left has lapsed.
@@ -1210,6 +1340,7 @@ fn assert_no_delete_announced(tag: &str, repo: &Repo) {
 
 fn run_sweep_crash(backend: &str, meta_url: Option<String>) {
     let _g = serial();
+    let _w = Watchdog::start();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     let stores = match meta_url {
