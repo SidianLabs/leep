@@ -1199,8 +1199,16 @@ pub(crate) struct Probe {
 
 impl Probe {
     pub(crate) fn new(delay: std::time::Duration) -> Arc<Probe> {
+        Probe::wrapping(Arc::new(MemoryMetaStore::new()), delay)
+    }
+
+    /// A probe in front of `inner`.
+    pub(crate) fn wrapping(
+        inner: Arc<dyn leep_core::MetaStore>,
+        delay: std::time::Duration,
+    ) -> Arc<Probe> {
         Arc::new(Probe {
-            inner: Arc::new(MemoryMetaStore::new()),
+            inner,
             delay,
             calls: AtomicU64::new(0),
             puts: AtomicU64::new(0),
@@ -1313,6 +1321,23 @@ impl leep_core::MetaStore for Probe {
         limit: usize,
     ) -> leep_core::Result<Vec<(Hash, Bytes)>> {
         self.inner.list_derived(kind, after, limit).await
+    }
+    fn supports_leases(&self) -> bool {
+        self.inner.supports_leases()
+    }
+    async fn lease(
+        &self,
+        key: &leep_core::LeaseKey,
+        timing: leep_core::LeaseTiming,
+    ) -> leep_core::Result<Option<leep_core::Lease>> {
+        self.inner.lease(key, timing).await
+    }
+    async fn acquire_lease(
+        &self,
+        claim: &leep_core::LeaseClaim<'_>,
+        timing: leep_core::LeaseTiming,
+    ) -> leep_core::Result<leep_core::Lease> {
+        self.inner.acquire_lease(claim, timing).await
     }
     async fn put_derived(&self, kind: &str, key: &Hash, value: Bytes) -> leep_core::Result<()> {
         self.call().await;

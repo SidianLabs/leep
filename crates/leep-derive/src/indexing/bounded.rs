@@ -9,13 +9,15 @@
 //! order, `truncated` and whether a page has a `next` cursor are what a
 //! fully indexed store gives.
 //!
-//! Each query first finds its un-indexed part, stopping at a budget. Within
-//! the budget it runs on a handle that knows the part ([`Bounded`]). Over
-//! it, the request's `Leep-Indexing` header decides: `retry` gets
-//! [`Error::Indexing`] (503), `stale-ok` an answer at the newest indexed
-//! first-parent ancestor, and a request without the header waits for the
-//! indexer, then scans with larger budgets, then gets the 503. Only when no
-//! live index lease exists does a query derive inline, as in `local` mode.
+//! Each query first finds its un-indexed part, stopping at a budget; a gap
+//! the skiplists show is longer than the budget is over it without being
+//! walked (ADR 0071). Within the budget it runs on a handle that knows the
+//! part ([`Bounded`]). Over it, the request's `Leep-Indexing` header
+//! decides: `retry` gets [`Error::Indexing`] (503), `stale-ok` an answer at
+//! the newest indexed first-parent ancestor, and a request without the
+//! header waits for the indexer, then scans with larger budgets, then gets
+//! the 503. Only when no live index lease exists does a query derive
+//! inline, as in `local` mode.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -204,6 +206,11 @@ pub(crate) struct Missing {
 /// changesets per round trip), stopping once more than `cap` are found.
 /// Rows only staged by a derivation in this process count as missing: they
 /// can still be dropped.
+///
+/// Before walking, the starts without a row are checked down the skiplists
+/// ([`chain_over`]): a gap longer than `cap` would otherwise cost about two
+/// serial round trips per changeset of a linear chain just to learn it is
+/// over, and under load those walks starve the indexer that closes the gap.
 pub(crate) async fn find_missing(
     repo: &Repo,
     kind: &str,
@@ -215,6 +222,7 @@ pub(crate) async fn find_missing(
     let mut seen: HashSet<ChangesetId> = HashSet::new();
     let mut frontier: Vec<ChangesetId> =
         starts.iter().copied().filter(|s| seen.insert(*s)).collect();
+    let mut first = true;
     while !frontier.is_empty() {
         let mut missing = Vec::new();
         for chunk in frontier.chunks(derived::BATCH) {
@@ -226,7 +234,13 @@ pub(crate) async fn find_missing(
                 }
             }
         }
-        if m.set.len() + missing.len() > cap {
+        let over = m.set.len() + missing.len() > cap
+            || (std::mem::take(&mut first) && chain_over(repo, kind, &missing, cap).await?);
+        if over {
+            if m.set.len() + missing.len() <= cap {
+                metrics::counter!("leep_query_scans_skipped_total", "kind" => kind.to_string())
+                    .increment(1);
+            }
             m.over = true;
             m.set.extend(missing);
             return Ok(m);
@@ -245,6 +259,34 @@ pub(crate) async fn find_missing(
         }
     }
     Ok(m)
+}
+
+/// Starts without a row whose first-parent chains [`chain_over`] checks:
+/// any one chain longer than the cap proves the walk over it, so a few
+/// suffice, and checking every seed of a later page would cost about what
+/// the walk does.
+const CHAIN_CHECKS: usize = 4;
+
+/// Whether some of `unindexed` (changesets without a row of `kind`) has
+/// more than `cap` first-parent ancestors, itself included, without one.
+/// Each of those is reachable and lacks a row, so [`find_missing`] would
+/// find more than `cap` too: true gives the walk's own verdict in
+/// O(log gap) batched reads (counted down the skiplists, which relies on
+/// rows being parent-closed, as [`newest_indexed`] does). False proves
+/// nothing; the walk decides.
+async fn chain_over(
+    repo: &Repo,
+    kind: &str,
+    unindexed: &[ChangesetId],
+    cap: usize,
+) -> Result<bool> {
+    for &s in unindexed.iter().take(CHAIN_CHECKS) {
+        let (_, steps) = descend(repo, kind, s, cap as u64).await?;
+        if steps > cap as u64 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// The newest first-parent ancestor of `head` (itself included) with a
@@ -268,8 +310,26 @@ pub(crate) async fn newest_indexed(
             0,
         ));
     }
+    descend(repo, kind, head, u64::MAX).await
+}
+
+/// [`newest_indexed`] for a `head` known to lack a row, giving up with
+/// `None` once more than `stop` ancestors are known to lack one; the count
+/// is then a lower bound.
+async fn descend(
+    repo: &Repo,
+    kind: &str,
+    head: ChangesetId,
+    stop: u64,
+) -> Result<(Option<SkipEntry>, u64)> {
+    let meta = repo.meta();
+    // `steps` counts `head` and the ancestors down to `x`, `x` excluded;
+    // they and `x` lack a row.
     let (mut x, mut steps) = (head, 0u64);
     loop {
+        if steps > stop {
+            return Ok((None, steps));
+        }
         let list = repo.skiplist(x).await?;
         if list.is_empty() {
             return Ok((None, steps + 1));
