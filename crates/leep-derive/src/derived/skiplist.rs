@@ -24,13 +24,24 @@ impl Skiplist {
         if !rest.is_empty() {
             return Err(Error::Encoding("bad skiplist value".into()));
         }
-        Ok(chunks
+        let entries: Vec<SkipEntry> = chunks
             .iter()
             .map(|c| SkipEntry {
                 id: ChangesetId(Hash(c[..32].try_into().expect("32 bytes"))),
                 generation: u64::from_be_bytes(c[32..].try_into().expect("8 bytes")),
             })
-            .collect())
+            .collect();
+        // Each entry is farther up the first-parent chain than the last, so
+        // a walk riding the list always moves down and ends.
+        if !entries
+            .windows(2)
+            .all(|w| w[0].generation > w[1].generation)
+        {
+            return Err(Error::Encoding(
+                "bad skiplist value: generations do not descend".into(),
+            ));
+        }
+        Ok(entries)
     }
 
     pub(crate) fn encode(entries: &[SkipEntry]) -> Bytes {
@@ -104,6 +115,55 @@ impl Repo {
         if let Some(l) = self.skiplists.get(&id) {
             return Ok(l);
         }
-        Ok(Skiplist::decode(&derive::<Skiplist>(self, id).await?)?.into())
+        let list = Skiplist::decode(&derive::<Skiplist>(self, id).await?)?;
+        // A list naming its own changeset would send a walk round forever.
+        if list.iter().any(|e| e.id == id) {
+            return Err(Error::Storage(format!("skiplist of {id} names itself")));
+        }
+        Ok(list.into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(b: u8, generation: u64) -> SkipEntry {
+        SkipEntry {
+            id: ChangesetId(Hash([b; 32])),
+            generation,
+        }
+    }
+
+    /// A damaged row whose entries do not move down the chain (so a walk
+    /// riding it could go round) is an error, not a list.
+    #[test]
+    fn generations_must_descend() {
+        let good = [entry(1, 9), entry(2, 8), entry(3, 6)];
+        assert_eq!(Skiplist::decode(&Skiplist::encode(&good)).unwrap(), good);
+        for bad in [
+            vec![entry(1, 9), entry(2, 9)],
+            vec![entry(1, 6), entry(2, 8)],
+            vec![entry(1, 5), entry(1, 5)],
+        ] {
+            assert!(Skiplist::decode(&Skiplist::encode(&bad)).is_err());
+        }
+    }
+
+    /// A stored list that names its own changeset is reported, not walked.
+    #[tokio::test]
+    async fn a_list_naming_itself_is_corrupt() {
+        let r = crate::tests::repo();
+        let id = crate::tests::commit(&r, &[], &[("a", Some("1"))], "a").await;
+        let row = Skiplist::encode(&[entry(0, 3)]);
+        let mut looped = row.to_vec();
+        looped[..32].copy_from_slice(id.0.as_bytes());
+        r.meta()
+            .put_derived(Skiplist::NAME, &id.0, looped.into())
+            .await
+            .unwrap();
+        let fresh = Repo::new(r.blobs().clone(), r.meta().clone());
+        let err = fresh.skiplist(id).await.expect_err("names itself");
+        assert!(matches!(err, Error::Storage(_)), "{err}");
     }
 }

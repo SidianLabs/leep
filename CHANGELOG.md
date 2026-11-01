@@ -112,6 +112,16 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 - **Changed.** A land batch that fast-forwards a ref to such a changeset
   stores its tree in two waves (nodes, then the root), so two packs; an
   eager create flushes its tree's nodes before writing the root.
+### Damaged history packs and skiplists are errors, not panics
+- **Fixed.** A `history-tree-v4` part whose id table names its own writer,
+  or a node that names itself or a later node of its part, is a `corrupt
+  history node` storage error, which `verify` reports and `repair
+  rederive` rebuilds. Writing a pack whose nodes name its writer by
+  absolute reference no longer trips a debug assertion; it writes a part
+  that fails to decode. A skiplist row whose generations do not descend,
+  or that names its own changeset, is an error too, so an ancestry walk
+  never goes round. Fixes #216.
+
 ### Criss-cross merges check every merge base
 - **Fixed.** `POST /v1/merge` (and `leep merge`) in a criss-cross history,
   where the two sides have several best common ancestors, merged against
