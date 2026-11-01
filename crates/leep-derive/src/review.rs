@@ -400,8 +400,8 @@ impl Repo {
             return Ok(None);
         }
         let (Some(old), Some(new)) = (
-            self.blobs().get(&old.content).await?,
-            self.blobs().get(content).await?,
+            self.read_content(&old.content).await?,
+            self.read_content(content).await?,
         ) else {
             return Ok(None);
         };

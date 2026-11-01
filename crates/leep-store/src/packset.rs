@@ -8,7 +8,9 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant, SystemTime};
 
 use bytes::Bytes;
 use leep_core::{BlobMeta, Error, Hash, Result};
@@ -26,6 +28,77 @@ pub(crate) const TOMBSTONES_LOCK: &str = "tombstones.lock";
 /// Decoded objects kept for delta chains: a read of a recent version usually
 /// decodes the older versions it is based on, which the next read needs again.
 pub(crate) const DEFAULT_DECODED_CACHE: usize = 64 << 20;
+/// A view whose `packs/` modification time was this close to the clock when
+/// it was scanned is unconfirmed: a change in the same timestamp tick as the
+/// last one before the scan leaves the time as it was (ADR 0070). Covers the
+/// coarsest timestamps of a local filesystem (2 s on FAT).
+pub(crate) const MTIME_GRANULARITY: Duration = Duration::from_secs(2);
+/// Shortest time between two rescans that misses on an unconfirmed view
+/// trigger while its stamps look unchanged.
+pub(crate) const UNCONFIRMED_RESCAN: Duration = Duration::from_millis(100);
+
+/// Why a store scanned its packs again, the `reason` label of
+/// `leep_blob_pack_scans_total` (ADR 0070).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ScanReason {
+    /// No view yet.
+    First,
+    /// A miss found a stamp changed: `packs/` or the tombstones on a
+    /// filesystem, `packs/.gen` in a bucket.
+    MissChanged,
+    /// A miss on a filesystem view whose stamp may hide a change (see
+    /// [`MTIME_GRANULARITY`]), at most every [`UNCONFIRMED_RESCAN`].
+    MissUnconfirmed,
+    /// A bucket without `packs/.gen`, or whose stamp has no etag: every
+    /// miss lists `packs/`, as before ADR 0070.
+    MissUnstamped,
+    /// [`BlobStore::get_exact`](leep_core::BlobStore::get_exact) missed
+    /// after the stamp check and looks once more.
+    MissForced,
+    /// `contains` found the tombstones changed.
+    Tombstones,
+    /// A bucket's periodic full listing on a miss (ADR 0040 section 5).
+    Interval,
+    /// A repack step, which must see every pack.
+    Repack,
+    /// Anything else that must see every pack: a delete, a pack count, a
+    /// deleted pack found under a bucket view.
+    Explicit,
+}
+
+impl ScanReason {
+    fn label(self) -> &'static str {
+        match self {
+            ScanReason::First => "first",
+            ScanReason::MissChanged => "miss_changed",
+            ScanReason::MissUnconfirmed => "miss_unconfirmed",
+            ScanReason::MissUnstamped => "miss_unstamped",
+            ScanReason::MissForced => "miss_forced",
+            ScanReason::Tombstones => "tombstones",
+            ScanReason::Interval => "interval",
+            ScanReason::Repack => "repack",
+            ScanReason::Explicit => "explicit",
+        }
+    }
+
+    pub fn record(self) {
+        metrics::counter!("leep_blob_pack_scans_total", "reason" => self.label()).increment(1);
+    }
+}
+
+/// Record a miss of the cached pack view: how it ended, what resolving it
+/// took, and how old the view that answered was.
+pub(crate) fn record_miss(started: Instant, found: usize, absent: usize, view_scanned: Instant) {
+    if found > 0 {
+        metrics::counter!("leep_blob_miss_total", "outcome" => "found_after_scan")
+            .increment(found as u64);
+    }
+    if absent > 0 {
+        metrics::counter!("leep_blob_miss_total", "outcome" => "absent").increment(absent as u64);
+    }
+    metrics::histogram!("leep_blob_miss_seconds").record(started.elapsed().as_secs_f64());
+    metrics::gauge!("leep_blob_pack_view_age_seconds").set(view_scanned.elapsed().as_secs_f64());
+}
 
 /// One published pack, open for reading. The open handle keeps the bytes
 /// readable after a repack deletes the file.
@@ -140,6 +213,36 @@ pub(crate) struct FileSig {
     ino: u64,
 }
 
+/// A directory's stamp: inode and modification time. Its length is left
+/// out: some filesystems change it with every entry and others never.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DirSig {
+    modified: Option<SystemTime>,
+    ino: u64,
+}
+
+fn dir_sig(path: &Path) -> Result<Option<DirSig>> {
+    Ok(file_sig(path)?.map(|s| DirSig {
+        modified: s.modified,
+        ino: s.ino,
+    }))
+}
+
+/// Whether a directory stamped `sig` when the clock read `now` shows every
+/// later change: its time is older than any timestamp tick, so the next
+/// change in it sets another. An absent directory shows its creation.
+fn stamp_confirmed(sig: Option<DirSig>, now: SystemTime) -> bool {
+    match sig {
+        None => true,
+        Some(DirSig {
+            modified: Some(m), ..
+        }) => now
+            .duration_since(m)
+            .is_ok_and(|age| age > MTIME_GRANULARITY),
+        Some(_) => false,
+    }
+}
+
 pub(crate) fn file_sig(path: &Path) -> Result<Option<FileSig>> {
     match std::fs::metadata(path) {
         Ok(m) => Ok(Some(FileSig {
@@ -189,13 +292,12 @@ pub(crate) fn tombstone_line(pack_id: &str, hash: &Hash) -> String {
     format!("{pack_id} {hash}\n")
 }
 
-fn read_tombstones(dir: &Path) -> Result<(Option<FileSig>, Tombstones)> {
-    let path = dir.join(TOMBSTONES);
-    // Signature first: a change after it is noticed next time.
-    let sig = file_sig(&path)?;
-    match std::fs::read(&path) {
-        Ok(b) => Ok((sig, parse_tombstones(&b))),
-        Err(e) if e.kind() == ErrorKind::NotFound => Ok((None, Tombstones::new())),
+/// The tombstones file's contents. Stat it first: a change after the stat
+/// is noticed next time.
+fn read_tombstones(path: &Path) -> Result<Tombstones> {
+    match std::fs::read(path) {
+        Ok(b) => Ok(parse_tombstones(&b)),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(Tombstones::new()),
         Err(e) => Err(storage_err(e)),
     }
 }
@@ -231,7 +333,20 @@ pub(crate) struct View {
     /// How many of `packs` reads search.
     searchable: usize,
     ids: Vec<String>,
+    /// Stamps taken before the scan read the tombstones and the directory:
+    /// while both are unchanged (and the view is confirmed), so are the
+    /// packs and their tombstones (ADR 0070).
     tombstones: Option<FileSig>,
+    dir: Option<DirSig>,
+    /// When the scan behind this view began.
+    scanned: Instant,
+    /// Whether an unchanged `dir` stamp proves `packs/` unchanged: false
+    /// while its time is within [`MTIME_GRANULARITY`] of the scan, or when a
+    /// listed pack failed to load.
+    confirmed: bool,
+    /// Whether every listed pack loaded. If one did not, its tombstones
+    /// were dropped, so the next scan reads the file again.
+    complete: bool,
 }
 
 impl View {
@@ -250,6 +365,11 @@ impl View {
 
     pub fn is_empty(&self) -> bool {
         self.packs.is_empty()
+    }
+
+    /// When the scan behind this view began.
+    pub fn scanned(&self) -> Instant {
+        self.scanned
     }
 }
 
@@ -291,6 +411,8 @@ pub(crate) struct PackSet {
     dir: PathBuf,
     view: RwLock<Option<Arc<View>>>,
     refreshing: Mutex<()>,
+    /// Directory scans so far, for tests.
+    scans: AtomicU64,
     decoded: DecodedCache,
     /// Packs a repack of this process merged into a published pack, until
     /// they are deleted: every live object of each is in that pack (packed
@@ -305,6 +427,7 @@ impl PackSet {
             dir: root.join(PACKS_DIR),
             view: RwLock::new(None),
             refreshing: Mutex::new(()),
+            scans: AtomicU64::new(0),
             decoded: DecodedCache::new(decoded_capacity),
             superseded: Mutex::default(),
         }
@@ -314,29 +437,109 @@ impl PackSet {
         &self.dir
     }
 
+    /// Directory scans so far, for tests.
+    #[cfg(test)]
+    pub fn scans(&self) -> u64 {
+        self.scans.load(Ordering::Relaxed)
+    }
+
     /// The current view, scanning on first use.
     pub fn view(&self) -> Result<Arc<View>> {
         if let Some(v) = self.view.read().unwrap().as_ref() {
             return Ok(v.clone());
         }
-        self.refresh()
+        let _one = self.refreshing.lock().unwrap();
+        if let Some(v) = self.view.read().unwrap().as_ref() {
+            return Ok(v.clone());
+        }
+        self.scan(ScanReason::First)
     }
 
-    /// Scan `packs/` again, reusing packs already open. Another process may
-    /// have published a pack (and deleted the loose copies it holds), deleted
-    /// replaced packs, or written tombstones.
+    /// Scan `packs/` again now, reusing packs already open: for callers
+    /// that must see every pack, whatever the stamps say.
     pub fn refresh(&self) -> Result<Arc<View>> {
+        self.rescan(ScanReason::Explicit)
+    }
+
+    /// [`refresh`](Self::refresh), counted under `reason`.
+    pub fn rescan(&self, reason: ScanReason) -> Result<Arc<View>> {
+        self.rescan_after(Instant::now(), reason)
+    }
+
+    /// A view whose scan began at or after `since`: the current one if it
+    /// qualifies (a concurrent caller may just have scanned), else a new
+    /// one. Concurrent misses share scans this way instead of queueing one
+    /// each.
+    fn rescan_after(&self, since: Instant, reason: ScanReason) -> Result<Arc<View>> {
         let _one = self.refreshing.lock().unwrap();
-        // Tombstones before the directory: a repack deletes replaced indexes
-        // before it drops their tombstones, so this order never pairs an old
-        // pack with a tombstone file that has forgotten it.
-        let (tomb_sig, mut tombstones) = read_tombstones(&self.dir)?;
-        let ids = published_ids(&self.dir)?;
-        let current = self.view.read().unwrap().clone();
-        if let Some(v) = &current {
-            if v.ids == ids && v.tombstones == tomb_sig {
+        if let Some(v) = self.view.read().unwrap().as_ref() {
+            if v.scanned >= since {
                 return Ok(v.clone());
             }
+        }
+        self.scan(reason)
+    }
+
+    /// The view a miss of the current one should search: the current view
+    /// while the stamps of `packs/` and the tombstones are as it recorded
+    /// them (two `stat`s, no lock), else a scan. An unconfirmed view is
+    /// rescanned at most every [`UNCONFIRMED_RESCAN`].
+    pub fn view_after_miss(&self) -> Result<Arc<View>> {
+        let v = self.view()?;
+        let started = Instant::now();
+        let tombstones = file_sig(&self.dir.join(TOMBSTONES))?;
+        let dir = dir_sig(&self.dir)?;
+        if tombstones != v.tombstones || dir != v.dir {
+            return self.rescan_after(started, ScanReason::MissChanged);
+        }
+        if !v.confirmed && started.duration_since(v.scanned) >= UNCONFIRMED_RESCAN {
+            let since = started.checked_sub(UNCONFIRMED_RESCAN).unwrap_or(started);
+            return self.rescan_after(since, ScanReason::MissUnconfirmed);
+        }
+        Ok(v)
+    }
+
+    /// Scan `packs/`, reusing packs already open. Another process may have
+    /// published a pack (and deleted the loose copies it holds), deleted
+    /// replaced packs, or written tombstones. Call with `refreshing` held.
+    fn scan(&self, reason: ScanReason) -> Result<Arc<View>> {
+        let began = Instant::now();
+        let current = self.view.read().unwrap().clone();
+        // Tombstones before the directory: a repack deletes replaced indexes
+        // before it drops their tombstones, so this order never pairs an old
+        // pack with a tombstone file that has forgotten it. The file is read
+        // only when its stamp changed: tombstones are only appended, or
+        // rewritten into a new file, and one naming a pack this scan lists
+        // for the first time was written after that pack was published, so
+        // after the stamp the current view recorded.
+        let tomb_path = self.dir.join(TOMBSTONES);
+        let tomb_sig = file_sig(&tomb_path)?;
+        let mut tombstones = match &current {
+            Some(v) if v.complete && v.tombstones == tomb_sig => None,
+            _ => Some(read_tombstones(&tomb_path)?),
+        };
+        let now = SystemTime::now();
+        let dir = dir_sig(&self.dir)?;
+        let ids = published_ids(&self.dir)?;
+        self.scans.fetch_add(1, Ordering::Relaxed);
+        reason.record();
+        let confirmed = stamp_confirmed(dir, now);
+        if let Some(v) = current
+            .as_ref()
+            .filter(|v| v.ids == ids && tombstones.is_none())
+        {
+            let view = Arc::new(View {
+                packs: v.packs.clone(),
+                searchable: v.searchable,
+                ids,
+                tombstones: tomb_sig,
+                dir,
+                scanned: began,
+                confirmed,
+                complete: true,
+            });
+            *self.view.write().unwrap() = Some(view.clone());
+            return Ok(view);
         }
         let superseded = {
             let mut s = self.superseded.lock().unwrap();
@@ -344,33 +547,43 @@ impl PackSet {
             s.retain(|id| ids.binary_search(id).is_ok());
             s.clone()
         };
-        let mut open: HashMap<&str, &Arc<Pack>> = HashMap::new();
+        let mut open: HashMap<&str, &(Arc<Pack>, HashSet<Hash>)> = HashMap::new();
         if let Some(v) = &current {
-            for (p, _) in &v.packs {
-                open.insert(&p.id, p);
+            for p in &v.packs {
+                open.insert(&p.0.id, p);
             }
         }
         let mut packs = Vec::new();
         let mut loaded = Vec::new();
         for id in &ids {
-            let pack = match open.get(id.as_str()) {
-                Some(p) => (*p).clone(),
+            let known = open.get(id.as_str());
+            let pack = match known {
+                Some((p, _)) => p.clone(),
                 None => match Pack::open(&self.dir, id)? {
                     Some(p) => Arc::new(p),
                     None => continue,
                 },
             };
             loaded.push(id.clone());
-            let dead = tombstones.remove(id).unwrap_or_default();
+            let dead = match &mut tombstones {
+                Some(t) => t.remove(id).unwrap_or_default(),
+                None => known.map(|(_, d)| d.clone()).unwrap_or_default(),
+            };
             packs.push((pack, dead));
         }
         let searchable = order_packs(&mut packs, &superseded);
+        let complete = loaded == ids;
         let view = Arc::new(View {
             packs,
             searchable,
-            // Only what loaded, so a pack seen mid-delete is retried next time.
-            ids: if loaded == ids { ids } else { loaded },
+            // Only what loaded, so a pack seen mid-delete is retried next
+            // time, and the view stays unconfirmed until then.
+            ids: if complete { ids } else { loaded },
             tombstones: tomb_sig,
+            dir,
+            scanned: began,
+            confirmed: confirmed && complete,
+            complete,
         });
         *self.view.write().unwrap() = Some(view.clone());
         metrics::gauge!("leep_blob_packs").set(searchable as f64);
@@ -400,7 +613,7 @@ impl PackSet {
             packs,
             searchable,
             ids,
-            tombstones: current.tombstones,
+            ..*current
         }));
         metrics::gauge!("leep_blob_packs").set(searchable as f64);
         Ok(())
@@ -426,7 +639,7 @@ impl PackSet {
             packs,
             searchable,
             ids: current.ids.clone(),
-            tombstones: current.tombstones,
+            ..*current
         }));
         metrics::gauge!("leep_blob_packs").set(searchable as f64);
     }
@@ -435,31 +648,74 @@ impl PackSet {
     /// `stat`, so a caller that must not report a deleted object can afford it.
     pub fn fresh_tombstones(&self) -> Result<Arc<View>> {
         let v = self.view()?;
+        let started = Instant::now();
         if file_sig(&self.dir.join(TOMBSTONES))? == v.tombstones {
             return Ok(v);
         }
-        self.refresh()
+        self.rescan_after(started, ScanReason::Tombstones)
     }
 
-    /// Bytes of a packed object, `None` if no live packed copy exists. Looks
-    /// again after a rescan before answering `None`.
+    /// Bytes of a packed object, `None` if no live packed copy exists in
+    /// the view a miss gets ([`view_after_miss`](Self::view_after_miss)).
     pub fn get(&self, hash: &Hash) -> Result<Option<Bytes>> {
         let v = self.view()?;
         if let Some((p, e)) = v.locate(hash) {
             return self.decode(p, &e).map(Some);
         }
-        let v = self.refresh()?;
-        match v.locate(hash) {
+        let started = Instant::now();
+        let v = self.view_after_miss()?;
+        let found = v.locate(hash);
+        record_miss(
+            started,
+            found.is_some() as usize,
+            found.is_none() as usize,
+            v.scanned,
+        );
+        match found {
             Some((p, e)) => self.decode(p, &e).map(Some),
             None => Ok(None),
         }
     }
 
+    /// [`get`](Self::get), with a `None` that is exact: after a miss of
+    /// the view a miss gets, one scan that began after `called`, which
+    /// holds every pack published before then. Callers pass when their call
+    /// began, so lookups started together share one scan.
+    pub fn get_exact(&self, hash: &Hash, called: Instant) -> Result<Option<Bytes>> {
+        let v = self.view()?;
+        if let Some((p, e)) = v.locate(hash) {
+            return self.decode(p, &e).map(Some);
+        }
+        let started = Instant::now();
+        let mut v = self.view_after_miss()?;
+        if v.locate(hash).is_none() {
+            v = self.rescan_after(called, ScanReason::MissForced)?;
+        }
+        let found = v.locate(hash);
+        record_miss(
+            started,
+            found.is_some() as usize,
+            found.is_none() as usize,
+            v.scanned,
+        );
+        match found {
+            Some((p, e)) => self.decode(p, &e).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Whether a live packed copy exists: exact for tombstones, which GC
+    /// relies on (ADR 0012); a pack another process published is found as
+    /// [`get`](Self::get) finds it.
     pub fn contains(&self, hash: &Hash) -> Result<bool> {
         if self.fresh_tombstones()?.locate(hash).is_some() {
             return Ok(true);
         }
-        Ok(self.refresh()?.locate(hash).is_some())
+        let started = Instant::now();
+        let v = self.view_after_miss()?;
+        let found = v.locate(hash).is_some();
+        record_miss(started, found as usize, !found as usize, v.scanned);
+        Ok(found)
     }
 
     /// Start reading every frame that decoding `hashes` will need (see

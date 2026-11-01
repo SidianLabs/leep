@@ -775,11 +775,12 @@ async fn put_blob(State(repo): S, Path(h): Path<String>, body: Bytes) -> ApiResu
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Clients fetch hashes they read from stored trees, so a miss is asked
+/// again exactly (ADR 0070): a land another server just made is not a 404.
 async fn get_blob(State(repo): S, Path(h): Path<String>) -> ApiResult<Response> {
     let h = hash(&h)?;
     let data = repo
-        .blobs()
-        .get(&h)
+        .read_content(&h)
         .await?
         .ok_or_else(|| Error::NotFound(format!("blob {h}")))?;
     Ok(octet_stream(data, []))

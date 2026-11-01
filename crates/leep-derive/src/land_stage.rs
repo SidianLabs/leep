@@ -372,6 +372,14 @@ impl BlobStore for StagedBlobs {
         self.inner.get_stored(hash).await
     }
 
+    /// As [`get_stored`](Self::get_stored), exact for the rest.
+    async fn get_exact(&self, hash: &Hash) -> Result<Option<Bytes>> {
+        if let Some(b) = self.staging.lock().blobs.get(hash) {
+            return Ok(Some(b.clone()));
+        }
+        self.inner.get_exact(hash).await
+    }
+
     /// Staged blobs and blobs this attempt found stored answer from memory;
     /// the rest in one batch of the store, whose finds are kept.
     async fn contains_many(&self, hashes: &[Hash]) -> Result<Vec<bool>> {

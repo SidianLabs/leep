@@ -825,6 +825,7 @@ are replaced:
 | `packs/<id>.idx` | the index, uploaded after the pack; its presence publishes the pack |
 | `packs/tombstones/<pack id>/<object hash hex>` | empty; the object's copy in that pack is deleted |
 | `packs/repack.lease` | text: `leep repack lease\nholder <id>\nexpires <unix seconds>\n`; present while a repack runs |
+| `packs/.gen` | text: `<pack id> <process nonce> <counter> <unix nanoseconds>\n`; the pack-set stamp (ADR 0070), rewritten, last writer wins, by every writer after it publishes or deletes packs (a `put_many` pack, a repack's publish and its deletes, a pack-file copy of an index). Readers compare its whole contents, never its etag, and list `packs/` again when they change. Absent in a bucket only older servers wrote |
 
 A tombstone hides only the copy in the pack it names, and a loose copy of
 the same hash is always served, as on the filesystem. Readers ignore keys
@@ -832,6 +833,10 @@ under `packs/` they do not recognise. The lease is created only if absent
 and replaced only if its etag is the one its holder last wrote; once its
 expiry has passed another repack may take it over. A `.pack` with no `.idx`
 is garbage. Replaced packs are removed index first, then their tombstones.
+A writer that publishes a pack without rewriting `packs/.gen` (a server
+before ADR 0070) leaves readers that saw the stamp finding the pack only at
+their next full listing (5 s) or through an exact read; the stamp never
+names a pack, so its contents need no compatibility.
 
 Golden bytes: `leep-store` asserts a fixed `LEEPIDX2` index's bytes and id
 (`pack::tests::index_golden_bytes`), decodes fixed `LEEPIDX1` bytes with

@@ -2126,6 +2126,8 @@ pub async fn check_blob_store_contract(store: &dyn BlobStore) {
     assert!(!store.contains(&other).await.unwrap());
     assert_eq!(store.get_stored(&h).await.unwrap(), Some(data.clone()));
     assert_eq!(store.get_stored(&other).await.unwrap(), None);
+    assert_eq!(store.get_exact(&h).await.unwrap(), Some(data.clone()));
+    assert_eq!(store.get_exact(&other).await.unwrap(), None);
 
     let custom = Hash::of_object("tree-v1", b"node");
     store
@@ -2202,6 +2204,7 @@ async fn check_put_many(store: &dyn BlobStore) {
         for ((h, data), got) in items.iter().zip(got) {
             assert_eq!(got.as_ref(), Some(data), "{h}");
             assert_eq!(store.get_stored(h).await.unwrap().as_ref(), Some(data));
+            assert_eq!(store.get_exact(h).await.unwrap().as_ref(), Some(data));
         }
         let listed = list_all_blobs(store, 1000).await;
         let now = now_secs();
@@ -2217,6 +2220,7 @@ async fn check_put_many(store: &dyn BlobStore) {
         store.delete(&gone).await.unwrap();
         assert!(!store.contains(&gone).await.unwrap());
         assert!(store.get(&gone).await.unwrap().is_none());
+        assert!(store.get_exact(&gone).await.unwrap().is_none());
         let mut again = items[2..].to_vec();
         again.push((gone, data.clone()));
         store.put_many(again).await.unwrap();

@@ -38,8 +38,7 @@ impl Repo {
 
     async fn fingerprint(&self, h: Hash) -> Result<Option<Fingerprint>> {
         let data = self
-            .blobs()
-            .get(&h)
+            .read_content(&h)
             .await?
             .ok_or_else(|| Error::Storage(format!("blob {h} missing")))?;
         Ok(Fingerprint::of(&data))

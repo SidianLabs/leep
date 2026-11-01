@@ -234,6 +234,32 @@ impl<S: BlobStore> BlobStore for CachedBlobStore<S> {
         Ok(found)
     }
 
+    /// A hit the inner store confirms, as for `get_stored`; anything else is
+    /// the inner store's exact answer, cached.
+    async fn get_exact(&self, hash: &Hash) -> Result<Option<Bytes>> {
+        let hit = self.lru.lock().unwrap().get(hash);
+        match hit {
+            Some(d) => {
+                self.hits.fetch_add(1, Ordering::Relaxed);
+                metrics::counter!("leep_blob_cache_hits_total").increment(1);
+                if self.inner.contains(hash).await? {
+                    return Ok(Some(d));
+                }
+            }
+            None => {
+                self.misses.fetch_add(1, Ordering::Relaxed);
+                metrics::counter!("leep_blob_cache_misses_total").increment(1);
+            }
+        }
+        let found = self.inner.get_exact(hash).await?;
+        if let Some(d) = &found {
+            let mut lru = self.lru.lock().unwrap();
+            lru.insert(*hash, d.clone(), self.capacity);
+            Self::publish(&lru);
+        }
+        Ok(found)
+    }
+
     /// Always asks the inner store, as `contains` does.
     async fn contains_many(&self, hashes: &[Hash]) -> Result<Vec<bool>> {
         self.inner.contains_many(hashes).await

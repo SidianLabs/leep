@@ -30,10 +30,10 @@ use tokio::task::JoinHandle;
 
 use crate::fs::unix_secs;
 use crate::objpacks::{
-    idx_key, list_packs_dir, list_tombstones, pack_key, tombstone_key, TOMBSTONES_PREFIX,
+    bump_gen, idx_key, list_packs_dir, list_tombstones, pack_key, tombstone_key, TOMBSTONES_PREFIX,
 };
 use crate::pack::{self, IdxEntry, PackIndex};
-use crate::packset::{self, PackSet, DEFAULT_DECODED_CACHE};
+use crate::packset::{self, PackSet, ScanReason, DEFAULT_DECODED_CACHE};
 use crate::packwrite::{hint_ids, write_order, write_pack, ObjectTable, PackSource, SourceRead};
 use crate::repack::step;
 use crate::{storage_err, ObjectBlobStore, RepackOptions, RepackReport, RepackStep};
@@ -654,7 +654,7 @@ impl ObjectBlobStore {
         };
         step(opts, RepackStep::Started)?;
 
-        let view = self.packs.refresh().await?;
+        let view = self.packs.rescan(ScanReason::Repack).await?;
         let (merging, with_loose): (Vec<&LivePack>, bool) = match &opts.mode {
             crate::RepackMode::Planned { loose } => (
                 view.searchable()
@@ -795,6 +795,7 @@ impl ObjectBlobStore {
                 .put(&idx_key(&id), PutPayload::from(idx_bytes))
                 .await
                 .map_err(storage_err)?;
+            bump_gen(&*self.store, &id).await?;
         }
         step(opts, RepackStep::Published)?;
         report.pack_bytes = written.len;
@@ -810,7 +811,7 @@ impl ObjectBlobStore {
                 .await?;
             report.late_tombstones = late.len() as u64;
         }
-        self.packs.refresh().await?;
+        self.packs.rescan(ScanReason::Repack).await?;
         Ok(Published {
             report,
             from_loose: written
@@ -940,6 +941,10 @@ impl PublishedObjectPack {
             delete_all(&*objects, vec![pack_key(id)]).await?;
             self.report.old_packs_removed += 1;
         }
+        if !self.replaced.is_empty() {
+            let id = self.report.pack_id.clone().unwrap_or_default();
+            bump_gen(&*objects, &id).await?;
+        }
         step(&self.opts, RepackStep::OldPacksRemoved)?;
         // Tombstones listed before packs, so a pack published in between
         // (none can be, under the lease) would keep its tombstones.
@@ -952,7 +957,13 @@ impl PublishedObjectPack {
             .collect();
         delete_all(&*objects, stale).await?;
         step(&self.opts, RepackStep::TombstonesRewritten)?;
-        self.report.packs_after = self.store.packs.refresh().await?.searchable().len() as u64;
+        self.report.packs_after = self
+            .store
+            .packs
+            .rescan(ScanReason::Repack)
+            .await?
+            .searchable()
+            .len() as u64;
         if !matches!(
             self.opts.mode,
             crate::RepackMode::Planned { loose: false, .. }

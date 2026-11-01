@@ -1683,10 +1683,12 @@ async fn a_batch_asks_for_its_copies_contents_once_and_still_finds_one_missing()
     }
     let last = outcome(&answers[7]);
     assert!(last.contains("missing blob"), "{last}");
+    // No content read back, but the one the prefetch did not find, which
+    // is looked up exactly (ADR 0070) before its land is refused.
     assert_eq!(
         blobs.get_stored.load(Ordering::SeqCst),
-        0,
-        "no content read back"
+        1,
+        "only the missing content read back"
     );
     // The prefetch's batch, and the one content it did not find, asked
     // again by its copy.

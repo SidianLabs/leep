@@ -50,6 +50,14 @@ impl BlobStore for FaultyBlobStore {
             .await
     }
 
+    async fn get_exact(&self, hash: &Hash) -> Result<Option<Bytes>> {
+        self.plan
+            .run(Op::Get, self.inner.get_exact(hash), |plan, v| {
+                v.map(|b| Bytes::from(plan.corrupt(&b)))
+            })
+            .await
+    }
+
     async fn contains(&self, hash: &Hash) -> Result<bool> {
         self.plan
             .run(Op::Contains, self.inner.contains(hash), |_, v| v)

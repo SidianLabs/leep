@@ -57,8 +57,7 @@ impl Repo {
             return Ok(Some(String::new()));
         };
         let data = self
-            .blobs()
-            .get(&i.content)
+            .read_content(&i.content)
             .await?
             .ok_or_else(|| Error::Storage(format!("blob {} missing", i.content)))?;
         Ok(String::from_utf8(data.to_vec()).ok())

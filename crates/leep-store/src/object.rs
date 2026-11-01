@@ -10,7 +10,9 @@ use object_store::memory::InMemory;
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 
-use crate::objpacks::{idx_key, pack_key, RemotePack, RemotePackSet, DEFAULT_REFRESH_INTERVAL};
+use crate::objpacks::{
+    bump_gen, idx_key, pack_key, RemotePack, RemotePackSet, DEFAULT_REFRESH_INTERVAL,
+};
 use crate::packput::{self, PackWriteStep, PackWrites};
 use crate::packset::DEFAULT_DECODED_CACHE;
 use crate::storage_err;
@@ -141,9 +143,10 @@ impl BlobStore for ObjectBlobStore {
     }
 
     /// At least [`PackWrites::min_objects`] objects become one pack: the
-    /// `.pack` uploaded, then the `.idx`, which publishes it, then added to
-    /// this process's view; their hashes are returned. Other servers find it
-    /// on their next miss. Unlike `put_with_hash`, an object that also has a
+    /// `.pack` uploaded, then the `.idx`, which publishes it, then
+    /// `packs/.gen` rewritten to announce it (ADR 0070), then added to this
+    /// process's view; their hashes are returned. Other servers find it on
+    /// their next miss. Unlike `put_with_hash`, an object that also has a
     /// loose copy keeps that copy's `modified` in listings, which GC's grace
     /// window reads; the rescue rows of ADR 0012, which the caller writes
     /// after this, are what protect it.
@@ -189,6 +192,9 @@ impl BlobStore for ObjectBlobStore {
             .await
             .map_err(storage_err)?;
         self.writes.step(PackWriteStep::Published)?;
+        // Before returning: a changeset naming these objects is stored only
+        // after, and a reader that misses one then sees the stamp changed.
+        bump_gen(&*self.store, &encoded.id).await?;
         self.packs
             .insert_published(RemotePack {
                 id: encoded.id,
@@ -204,6 +210,22 @@ impl BlobStore for ObjectBlobStore {
         match self.store.get(&Self::key(hash)).await {
             Ok(r) => Ok(Some(r.bytes().await.map_err(storage_err)?)),
             Err(object_store::Error::NotFound { .. }) => self.packs.get(hash).await,
+            Err(e) => Err(storage_err(e)),
+        }
+    }
+
+    /// [`get_stored`](Self::get_stored), whose packed lookup lists
+    /// `packs/` once more after a miss the stamp confirmed (ADR 0070).
+    async fn get_exact(&self, hash: &Hash) -> Result<Option<Bytes>> {
+        let called = std::time::Instant::now();
+        match self.store.get(&Self::key(hash)).await {
+            Ok(r) => Ok(Some(r.bytes().await.map_err(storage_err)?)),
+            Err(object_store::Error::NotFound { .. }) => {
+                match self.packs.get_exact(hash, called).await? {
+                    Some(b) if self.contains(hash).await? => Ok(Some(b)),
+                    _ => Ok(None),
+                }
+            }
             Err(e) => Err(storage_err(e)),
         }
     }

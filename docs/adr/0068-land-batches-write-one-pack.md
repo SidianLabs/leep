@@ -1,5 +1,5 @@
 # 0068. Land batches write one pack
-Status: Accepted
+Status: Accepted; amended by ADR 0070 (a miss rescans packs only when a stamp changed)
 Date: 2026-10-31
 
 ## Context

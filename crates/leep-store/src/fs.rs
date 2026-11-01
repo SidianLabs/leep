@@ -367,9 +367,8 @@ impl BlobStore for FsBlobStore {
     }
 
     /// Stats the loose files in a few blocking tasks, then looks up the
-    /// misses in the packs after one rescan, instead of a task and a rescan
-    /// per hash. Every miss is looked up in packs scanned after its stat, as
-    /// in `contains`.
+    /// misses in the packs a miss gets after those stats (one stamp check
+    /// for the batch, ADR 0070), instead of a task and a check per hash.
     async fn contains_many(&self, hashes: &[Hash]) -> Result<Vec<bool>> {
         const CHUNK: usize = 4096;
         if hashes.len() <= 1 {
@@ -407,12 +406,24 @@ impl BlobStore for FsBlobStore {
         }
         let packed = self
             .blocking(move |p| {
-                let v = p.refresh()?;
-                Ok(misses
-                    .into_iter()
-                    .filter(|(_, h)| v.locate(h).is_some())
-                    .map(|(i, _)| i)
-                    .collect::<Vec<usize>>())
+                let v = p.fresh_tombstones()?;
+                let (found, misses): (Vec<_>, Vec<_>) =
+                    misses.into_iter().partition(|(_, h)| v.locate(h).is_some());
+                let mut found: Vec<usize> = found.into_iter().map(|(i, _)| i).collect();
+                if !misses.is_empty() {
+                    let started = std::time::Instant::now();
+                    let v = p.view_after_miss()?;
+                    let before = found.len();
+                    found.extend(
+                        misses
+                            .iter()
+                            .filter(|(_, h)| v.locate(h).is_some())
+                            .map(|(i, _)| *i),
+                    );
+                    let after = found.len() - before;
+                    crate::packset::record_miss(started, after, misses.len() - after, v.scanned());
+                }
+                Ok(found)
             })
             .await?;
         for i in packed {
@@ -448,6 +459,27 @@ impl BlobStore for FsBlobStore {
                 }
                 _ => Ok(None),
             },
+            Err(e) => Err(storage_err(e)),
+        })
+        .await
+    }
+
+    /// [`get_stored`](Self::get_stored), whose packed lookup looks once
+    /// more after a miss that the stamps confirmed (ADR 0070).
+    async fn get_exact(&self, hash: &Hash) -> Result<Option<Bytes>> {
+        let called = std::time::Instant::now();
+        let path = self.path_for(hash);
+        let hash = *hash;
+        self.blocking(move |p| match std::fs::read(&path) {
+            Ok(v) => Ok(Some(v.into())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                match p.get_exact(&hash, called)? {
+                    Some(b) if p.contains(&hash)? || path.try_exists().map_err(storage_err)? => {
+                        Ok(Some(b))
+                    }
+                    _ => Ok(None),
+                }
+            }
             Err(e) => Err(storage_err(e)),
         })
         .await

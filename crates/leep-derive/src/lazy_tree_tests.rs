@@ -652,6 +652,7 @@ async fn a_slow_path_land_derives_the_lazy_tree_once() {
 struct MissCounting {
     inner: Arc<MemoryBlobStore>,
     misses: std::sync::atomic::AtomicUsize,
+    exact_misses: std::sync::atomic::AtomicUsize,
 }
 
 #[async_trait::async_trait]
@@ -664,6 +665,22 @@ impl BlobStore for MissCounting {
         if got.is_none() {
             self.misses
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(got)
+    }
+    /// The exact retry of a miss `get` counted already (ADR 0070); counted
+    /// apart, since on a real store each one that misses forces a scan.
+    async fn get_exact(&self, hash: &Hash) -> leep_core::Result<Option<Bytes>> {
+        let got = self.inner.get_exact(hash).await?;
+        if got.is_none() {
+            self.exact_misses
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if std::env::var_os("LEEP_TRACE_EXACT").is_some() {
+                eprintln!(
+                    "exact miss {hash}\n{}",
+                    std::backtrace::Backtrace::force_capture()
+                );
+            }
         }
         Ok(got)
     }
@@ -694,6 +711,7 @@ async fn a_slow_path_land_stays_off_the_store_and_stores_only_its_paths() {
     let blobs = Arc::new(MissCounting {
         inner: mem.clone(),
         misses: Default::default(),
+        exact_misses: Default::default(),
     });
     let meta = Arc::new(MemoryMetaStore::new());
     let r = Repo::new(blobs.clone(), meta.clone())
@@ -743,5 +761,80 @@ async fn a_slow_path_land_stays_off_the_store_and_stores_only_its_paths() {
         // The root, src, src/m<i> and src/m<i>/s<i>: the copy's, or the
         // fast-forwarded tree's.
         assert!(added <= 4, "land {i} stored {added} objects");
+    }
+}
+
+/// Lazy creates, stacked or not, and the slow-path lands of them made in
+/// this process ask the store exactly for nothing: every node they miss is
+/// of a tree known unstored, and on a real store each exact miss forces a
+/// scan (ADR 0070).
+#[tokio::test]
+async fn a_slow_path_land_of_a_lazy_create_forces_no_scan() {
+    for fast in [false, true] {
+        slow_path_lands_force_no_scan(fast).await;
+    }
+}
+
+async fn slow_path_lands_force_no_scan(fast: bool) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mem = Arc::new(MemoryBlobStore::new());
+    let blobs = Arc::new(MissCounting {
+        inner: mem.clone(),
+        misses: Default::default(),
+        exact_misses: Default::default(),
+    });
+    let meta = Arc::new(MemoryMetaStore::new());
+    let r = Repo::new(blobs.clone(), meta.clone())
+        .with_lazy_create_trees(true)
+        .with_land_fast_path(fast);
+    let mut files: Vec<(String, String)> = Vec::new();
+    for a in 0..20 {
+        for b in 0..5 {
+            files.push((format!("src/m{a}/s{b}/f.rs"), format!("line {a} {b}\n")));
+        }
+    }
+    files.push(("shared/lib.rs".into(), "shared\n".into()));
+    let refs: Vec<(&str, Option<&str>)> = files
+        .iter()
+        .map(|(p, c)| (p.as_str(), Some(c.as_str())))
+        .collect();
+    let base = r
+        .create_changeset(cs(&[], changes(&r, &refs).await, "base"))
+        .await
+        .unwrap();
+    r.land(base, "main").await.unwrap();
+    // Creates on the same base, landed one after another: every land after
+    // the first is rebased, some over a change to the same file. Half are
+    // made on an unlanded lazy create, as an agent stacks its changes.
+    let before = blobs.exact_misses.load(Relaxed);
+    let mut made = Vec::new();
+    for i in 0..6 {
+        let path = format!("src/m{i}/s{i}/new.rs");
+        let body = format!("line {i}\n");
+        let mut ch = vec![(path.as_str(), Some(body.as_str()))];
+        let shared = format!("shared {i}\n");
+        if i % 2 == 0 {
+            ch.push(("shared/lib.rs", Some(shared.as_str())));
+        }
+        let parent = if i % 2 == 1 { made[i - 1] } else { base };
+        made.push(
+            r.create_changeset(cs(&[parent], changes(&r, &ch).await, "e"))
+                .await
+                .unwrap(),
+        );
+    }
+    let forced = blobs.exact_misses.load(Relaxed) - before;
+    assert_eq!(
+        forced, 0,
+        "creates (fast path {fast}): {forced} exact misses"
+    );
+    for id in &made {
+        let before = blobs.exact_misses.load(Relaxed);
+        let _ = r.land(*id, "main").await.unwrap();
+        let forced = blobs.exact_misses.load(Relaxed) - before;
+        assert_eq!(
+            forced, 0,
+            "land of {id} (fast path {fast}): {forced} exact misses"
+        );
     }
 }

@@ -959,9 +959,13 @@ impl Repo {
                     hashes.len()
                 )));
             }
-            if let Some(((path, content, _), _)) = contents.iter().zip(&present).find(|(_, p)| !**p)
-            {
-                return Err(Error::Invalid(format!("missing blob {content} for {path}")));
+            // The batch answer may come from a pack view a stamp vouched for
+            // (ADR 0070); a content reported missing is looked up exactly
+            // before the changeset is refused.
+            for ((path, content, _), _) in contents.iter().zip(&present).filter(|(_, p)| !**p) {
+                if self.blobs.get_exact(content).await?.is_none() {
+                    return Err(Error::Invalid(format!("missing blob {content} for {path}")));
+                }
             }
         }
         let client_contents = if client_blobs { &contents[..] } else { &[] };
@@ -975,9 +979,10 @@ impl Repo {
             }
             // `get` may be served from a cache tier; existence must come from
             // durable storage, which GC can change from another process.
-            // `get_stored` checks that without a second read where the
-            // backend's read already was of the durable copy.
-            match self.blobs.get_stored(content).await? {
+            // `get_exact` checks that without a second read where the
+            // backend's read already was of the durable copy, and does not
+            // refuse a content on a stale view of the packs (ADR 0070).
+            match self.blobs.get_exact(content).await? {
                 None => return Err(Error::Invalid(format!("missing blob {content} for {path}"))),
                 Some(b) if b.len() as u64 != *size => {
                     return Err(Error::Invalid(format!(
@@ -1016,7 +1021,17 @@ impl Repo {
             None => apply_changes(self, base, &cs.changes).await?,
             Some(_) => {
                 let built = build_tree(self, Reads::Repo, base, &cs.changes).await?;
-                if self.read_tree_stored_opt(built.root).await?.is_some() {
+                // Not exact (ADR 0070): nearly every lazy create misses here.
+                // A loose root is read directly; one in a pack another
+                // process published a moment ago has its whole tree below it
+                // (packs are written whole, roots after their nodes), and
+                // taking it for unstored only makes this tree lazy over
+                // stored nodes, which readers derive alike.
+                if self
+                    .read_tree_stored_with(built.root, false)
+                    .await?
+                    .is_some()
+                {
                     // A root that is stored must have its whole tree below
                     // it, and this one may be left from an interrupted
                     // write: store the tree after all.
@@ -1406,15 +1421,30 @@ impl Repo {
     }
 
     /// [`Repo::read_tree`] of a stored node (or one a land batch attempt
-    /// staged), `None` when the store lacks it: never derived.
+    /// staged), `None` when the store lacks it: never derived. The store's
+    /// `None` is exact (ADR 0070).
     pub(crate) async fn read_tree_stored_opt(&self, tree: Hash) -> Result<Option<TreeNode>> {
+        self.read_tree_stored_with(tree, true).await
+    }
+
+    /// [`Repo::read_tree_stored_opt`], asking the store again exactly after
+    /// a miss only if `exact`.
+    pub(crate) async fn read_tree_stored_with(
+        &self,
+        tree: Hash,
+        exact: bool,
+    ) -> Result<Option<TreeNode>> {
         if let Some(n) = self.node_memo.as_ref().and_then(|m| m.get(&tree)) {
             return Ok(Some(n));
         }
         if let Some(n) = self.nodes.get(&tree) {
             return Ok(Some((*n).clone()));
         }
-        let node = match self.blobs.get(&tree).await? {
+        let stored = match self.blobs.get(&tree).await? {
+            None if exact && tree != TreeNode::empty_hash() => self.blobs.get_exact(&tree).await?,
+            b => b,
+        };
+        let node = match stored {
             // A node's address is the hash of its bytes, so damage is
             // detectable. GC marks from these nodes: reading a damaged one as
             // valid would leave live blobs unmarked.
@@ -1515,7 +1545,7 @@ impl Repo {
                 None => true,
             }
         });
-        let found = if distinct.is_empty() {
+        let mut found = if distinct.is_empty() {
             Vec::new()
         } else {
             self.blobs.get_many(&distinct).await?
@@ -1527,6 +1557,7 @@ impl Repo {
                 distinct.len()
             )));
         }
+        self.retry_exact(&distinct, &mut found).await?;
         for (tree, bytes) in distinct.into_iter().zip(found) {
             let node = match bytes {
                 Some(b) if Hash::of_object(TreeNode::KIND, &b) != tree => {
@@ -1548,6 +1579,58 @@ impl Repo {
         Ok(nodes)
     }
 
+    /// Ask the store again, exactly (ADR 0070), for each node of `trees`
+    /// that `found` misses, all at once so that concurrent lookups share
+    /// the store's rescan. A node missing after that is not stored.
+    async fn retry_exact(&self, trees: &[Hash], found: &mut [Option<Bytes>]) -> Result<()> {
+        let empty = TreeNode::empty_hash();
+        let missed: Vec<usize> = (0..trees.len())
+            .filter(|&i| found[i].is_none() && trees[i] != empty)
+            .collect();
+        for chunk in missed.chunks(leep_core::store::GET_IN_FLIGHT) {
+            let asks = chunk.iter().map(|&i| self.blobs.get_exact(&trees[i]));
+            let again = futures_util::future::try_join_all(asks).await?;
+            for (&i, b) in chunk.iter().zip(again) {
+                found[i] = b;
+            }
+        }
+        Ok(())
+    }
+
+    /// The bytes of a file content named by a stored changeset or tree:
+    /// `get`, and after a miss `get_exact`, so a content in a pack another
+    /// process published a moment ago (a land elsewhere) is not reported
+    /// missing within the stamp's window (ADR 0070). Costs nothing more on
+    /// a hit.
+    pub async fn read_content(&self, hash: &Hash) -> Result<Option<Bytes>> {
+        match self.blobs.get(hash).await? {
+            Some(b) => Ok(Some(b)),
+            None => self.blobs.get_exact(hash).await,
+        }
+    }
+
+    /// [`Repo::read_content`] of each of `hashes`, in order, with one
+    /// `get_many` and the misses asked again together.
+    pub async fn read_contents(&self, hashes: &[Hash]) -> Result<Vec<Option<Bytes>>> {
+        let mut found = self.blobs.get_many(hashes).await?;
+        if found.len() != hashes.len() {
+            return Err(Error::Storage(format!(
+                "get_many answered {} of {} blobs",
+                found.len(),
+                hashes.len()
+            )));
+        }
+        let missed: Vec<usize> = (0..hashes.len()).filter(|&i| found[i].is_none()).collect();
+        for chunk in missed.chunks(leep_core::store::GET_IN_FLIGHT) {
+            let asks = chunk.iter().map(|&i| self.blobs.get_exact(&hashes[i]));
+            let again = futures_util::future::try_join_all(asks).await?;
+            for (&i, b) in chunk.iter().zip(again) {
+                found[i] = b;
+            }
+        }
+        Ok(found)
+    }
+
     /// [`Repo::read_tree`] as a [`TreeView`], kept in a bounded cache, for
     /// walks that look up names in the same directories again and again.
     pub(crate) async fn read_tree_view(&self, tree: Hash) -> Result<Arc<TreeView>> {
@@ -1557,7 +1640,10 @@ impl Repo {
         let derived = self.lazy_first(&[tree]).await?.remove(&tree);
         let stored = match derived {
             Some(n) => Some(Bytes::from(n.encode())),
-            None => self.blobs.get(&tree).await?,
+            None => match self.blobs.get(&tree).await? {
+                None if tree != TreeNode::empty_hash() => self.blobs.get_exact(&tree).await?,
+                b => b,
+            },
         };
         let view = match stored {
             Some(b) if Hash::of_object(TreeNode::KIND, &b) != tree => {

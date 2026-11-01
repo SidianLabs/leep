@@ -442,6 +442,20 @@ pub trait BlobStore: Send + Sync + 'static {
         }
     }
 
+    /// [`get_stored`](Self::get_stored), with a `None` that is exact: the
+    /// blob was in durable storage in no process when the call began (ADR
+    /// 0070). A backend that answers a miss from a cached view of what other
+    /// processes wrote, checked only against a cheap change stamp, rescans
+    /// once before it answers `None`. For reads of objects something already
+    /// references (tree nodes, a changeset's contents), where a false miss
+    /// is an error; existence checks before an upload use
+    /// [`contains`](Self::contains), where it only costs a re-upload. The
+    /// default is `get_stored`, exact for every backend without such a view.
+    /// Wrappers forward it.
+    async fn get_exact(&self, hash: &Hash) -> Result<Option<Bytes>> {
+        self.get_stored(hash).await
+    }
+
     /// [`contains`](Self::contains) for many hashes, answered in order and
     /// each as exactly. The default asks [`CONTAINS_IN_FLIGHT`] at a time;
     /// backends that can answer a batch more cheaply override it.

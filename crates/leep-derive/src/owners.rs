@@ -109,10 +109,11 @@ impl<'a> OwnersResolver<'a> {
                 info.size
             )));
         }
-        let data =
-            self.repo.blobs().get(&info.content).await?.ok_or_else(|| {
-                Error::Storage(format!("blob {} missing for {name}", info.content))
-            })?;
+        let data = self
+            .repo
+            .read_content(&info.content)
+            .await?
+            .ok_or_else(|| Error::Storage(format!("blob {} missing for {name}", info.content)))?;
         Ok(Some(parse_owners(&String::from_utf8_lossy(&data))))
     }
 

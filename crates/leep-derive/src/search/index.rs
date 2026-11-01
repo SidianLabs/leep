@@ -113,8 +113,7 @@ impl Repo {
             return Ok(BlobRow::NotIndexed(Skip::TooLarge));
         }
         let data = self
-            .blobs()
-            .get(&hash)
+            .read_content(&hash)
             .await?
             .ok_or_else(|| Error::Storage(format!("blob {hash} missing while indexing")))?;
         if let Some(scan) = &c.scan {

@@ -201,8 +201,12 @@ async fn reads_after_repack_equal_the_originals_in_the_shared_format() {
         let (id, idx) = index_of(&*objects).await;
         assert_eq!(
             keys(&*objects, "packs").await,
-            vec![format!("packs/{id}.idx"), format!("packs/{id}.pack")],
-            "{name}: only the pack, its index and nothing else"
+            vec![
+                "packs/.gen".to_string(),
+                format!("packs/{id}.idx"),
+                format!("packs/{id}.pack")
+            ],
+            "{name}: only the stamp, the pack, its index and nothing else"
         );
         assert_eq!(idx.magic(), pack::IDX_MAGIC);
         for s in [handle(&objects), fresh(&objects)] {
@@ -521,7 +525,11 @@ async fn a_repack_killed_at_any_step_leaves_a_readable_store() {
             let (id, _) = index_of(&*objects).await;
             assert_eq!(
                 keys(&*objects, "packs").await,
-                vec![format!("packs/{id}.idx"), format!("packs/{id}.pack")],
+                vec![
+                    "packs/.gen".to_string(),
+                    format!("packs/{id}.idx"),
+                    format!("packs/{id}.pack")
+                ],
                 "{what}: no garbage, tombstones or lease left"
             );
         }
@@ -850,7 +858,29 @@ async fn request_counts() {
         .is_none());
     let miss = counting.take();
     println!("miss within the refresh interval: {miss:?}");
-    // The loose GET, and one listing of `packs/` for new packs (ADR 0068).
-    assert_eq!(miss.get("GET"), Some(&1), "{miss:?}");
-    assert_eq!(miss.values().sum::<u64>(), 2, "{miss:?}");
+    // The loose GET, and a GET of the unchanged stamp (none if one less
+    // than 50 ms old is reused) instead of a listing of `packs/` (ADR 0070).
+    assert!(
+        miss.get("GET").is_some_and(|n| (1..=2).contains(n)),
+        "{miss:?}"
+    );
+    assert!(!miss.contains_key("HEAD"), "{miss:?}");
+    assert!(!miss.contains_key("LIST"), "{miss:?}");
+    assert!(reader
+        .get(&Hash::of_blob(b"absent"))
+        .await
+        .unwrap()
+        .is_none());
+    let again = counting.take();
+    println!("another miss within the stamp window: {again:?}");
+    assert!(again.get("GET").is_some_and(|n| *n <= 2), "{again:?}");
+    assert!(!again.contains_key("LIST"), "{again:?}");
+    assert!(reader
+        .get_exact(&Hash::of_blob(b"absent"))
+        .await
+        .unwrap()
+        .is_none());
+    let exact = counting.take();
+    println!("exact miss: {exact:?}");
+    assert_eq!(exact.get("LIST"), Some(&1), "one forced listing: {exact:?}");
 }
