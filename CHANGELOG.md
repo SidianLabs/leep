@@ -112,6 +112,14 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 - **Changed.** A land batch that fast-forwards a ref to such a changeset
   stores its tree in two waves (nodes, then the root), so two packs; an
   eager create flushes its tree's nodes before writing the root.
+### The comment lexer agrees with itself
+- **Fixed.** `strip_comments`, which decides the `comment_only` review rule,
+  dropped the indentation of a file's first code line, so its output could
+  read differently from its input (Ruby ` =x` became an `=begin`-style
+  block). The first line keeps its indentation, and a text whose stripped
+  form does not lex back to itself is never comment-only. Changing only the
+  first line's indentation is no longer a comment-only edit. Fixes #217.
+
 ### Damaged history packs and skiplists are errors, not panics
 - **Fixed.** A `history-tree-v4` part whose id table names its own writer,
   or a node that names itself or a later node of its part, is a `corrupt

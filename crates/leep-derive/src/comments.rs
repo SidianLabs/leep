@@ -330,10 +330,15 @@ impl Lexer<'_> {
         }
     }
 
-    /// Emit pending whitespace in normalized form, then `s`. Whitespace at
-    /// the start of the file is dropped.
+    /// Emit pending whitespace in normalized form, then `s`. Blank lines
+    /// and comments at the start of the file are dropped, the indentation
+    /// of its first code line is not.
     fn token(&mut self, s: &str) {
-        if self.seen_ws && !self.out.is_empty() {
+        if self.out.is_empty() {
+            if self.newline {
+                self.out.push_str(&self.indent);
+            }
+        } else if self.seen_ws {
             if self.newline {
                 self.out.push('\n');
                 self.out.push_str(&self.indent);
@@ -1029,12 +1034,23 @@ pub fn strip_comments(ext: &str, text: &str) -> Option<String> {
     if lang.cgo && imports_c(text) {
         return None;
     }
+    let out = lex(&lang, text)?;
+    // The result must read as itself: a text whose comments and whitespace
+    // the lexer removed differently on a second pass is one it does not
+    // understand, and `comment_only` must not trust it (#217).
+    (lex(&lang, &out).as_deref() == Some(out.as_str())).then_some(out)
+}
+
+fn lex(lang: &Lang, text: &str) -> Option<String> {
     Lexer {
         chars: text.chars().collect(),
-        lang: &lang,
+        lang,
         out: String::new(),
         seen_ws: false,
-        newline: false,
+        // The file starts a line, so the first line's indentation is kept
+        // like any other's: dropping it can move a token to column 0, where
+        // it means something else (Ruby's `=begin`).
+        newline: true,
         indent: String::new(),
     }
     .lex()
@@ -1560,5 +1576,129 @@ mod tests {
         for (ext, a, b) in cases {
             assert!(same(ext, a, b), "{ext}: {a:?} vs {b:?}");
         }
+    }
+
+    /// The nightly fuzz crash of #217, minimized: the first line's
+    /// indentation was dropped, which moved ` =gin` to column 0, where Ruby
+    /// reads `=begin`-style blocks, so the output no longer lexed as itself.
+    /// Both passes now agree, here and on the whole crash input.
+    #[test]
+    fn first_line_indentation_is_kept_so_stripping_is_idempotent() {
+        let out = s("rb", " =gin\nx\n");
+        assert_eq!(out, " =gin\nx");
+        assert_eq!(strip_comments("rb", &out), Some(out.clone()));
+        assert!(!same("rb", " =x\n", "=x\n"));
+        assert!(!same("py", "  x = 1\n", "x = 1\n"));
+        // Leading comments and blank lines still vanish.
+        assert!(same("py", "# a\n\nx = 1\n", "x = 1\n"));
+        assert!(same("rs", "// a\n    fn f(){}\n", "    fn f(){}\n"));
+
+        let crash =
+            include_bytes!("../../../fuzz/corpus/comment_lexer/regress-rb-first-line-indent");
+        let text = String::from_utf8_lossy(&crash[1..]);
+        let text = text.split('\0').next().unwrap();
+        if let Some(out) = strip_comments("rb", text) {
+            assert_eq!(strip_comments("rb", &out), Some(out));
+        }
+    }
+
+    /// Whatever the lexer returns reads as itself, for every language, on
+    /// random texts built from the characters that steer it.
+    #[test]
+    fn stripping_is_idempotent_on_random_texts() {
+        const EXTS: &[&str] = &[
+            "rs", "c", "h", "cc", "cpp", "hpp", "java", "js", "ts", "jsx", "tsx", "go", "swift",
+            "kt", "scala", "cs", "py", "sh", "bash", "rb", "pl", "toml", "yaml", "yml",
+        ];
+        const PIECES: &[&str] = &[
+            " ",
+            "  ",
+            "\t",
+            "\n",
+            "\r\n",
+            "\u{b}",
+            "\u{c}",
+            "=",
+            "=begin",
+            "=end",
+            "=pod",
+            "=cut",
+            "#",
+            "#{",
+            "${",
+            "$(",
+            "}",
+            "{",
+            ")",
+            "(",
+            "\"",
+            "'",
+            "'''",
+            "\"\"\"",
+            "/",
+            "//",
+            "/*",
+            "*/",
+            "*",
+            "\\",
+            "x",
+            "a1",
+            "b",
+            "%",
+            "?",
+            "<<",
+            "-",
+            ":",
+            "|",
+            ">",
+            "@",
+            "$",
+            "r#\"",
+            "f\"",
+            "`",
+            "__END__",
+            "q(",
+            "\u{fffd}",
+            "\u{11}",
+            "--",
+            "!",
+            ";",
+            ",",
+            "[",
+            "]",
+            "R\"",
+            "@\"",
+            "$\"",
+            "import \"C\"",
+            "??/",
+            "\\u0022",
+        ];
+        let mut seed: u64 = 0x2170_2170;
+        let mut rand = move |n: usize| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) as usize) % n
+        };
+        let iters: usize = std::env::var("LEEP_LEXER_CASES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(200_000);
+        let mut read = 0usize;
+        for _ in 0..iters {
+            let ext = EXTS[rand(EXTS.len())];
+            let text: String = (0..rand(24)).map(|_| PIECES[rand(PIECES.len())]).collect();
+            if let Some(out) = strip_comments(ext, &text) {
+                read += 1;
+                // The first pass of the check inside `strip_comments` is what
+                // this asserts; lex it here without the check too.
+                let again = lex(&language(ext).unwrap(), &out);
+                assert_eq!(again.as_ref(), Some(&out), "{ext}: {text:?} -> {out:?}");
+            }
+        }
+        assert!(
+            read > iters / 10,
+            "too few texts read to mean anything: {read}"
+        );
     }
 }

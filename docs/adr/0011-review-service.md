@@ -110,8 +110,9 @@ comment text into code and is therefore a code change.
 **Whitespace in `comment_only`** is normalized, not removed. Removing it
 would let `ab` pass for `a/**/b`, and a Python re-indent for a comment edit.
 A whitespace run containing a newline becomes one newline plus the next
-line's indentation, other runs become one space, and a comment counts as
-whitespace. Whitespace inside string literals is kept verbatim. So on a known
+line's indentation (the first code line keeps its indentation too), other
+runs become one space, and a comment counts as whitespace. A text whose
+result does not lex back to itself is refused. Whitespace inside string literals is kept verbatim. So on a known
 language `comment_only` also accepts blank-line and spacing changes between
 tokens, which `whitespace_only` deliberately does not, since that rule applies
 to any text file.
