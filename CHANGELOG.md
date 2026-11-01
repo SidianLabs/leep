@@ -7,6 +7,26 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 ## [Unreleased]
 
+### Land batches pipeline
+- **Changed.** While a land batch stores its writes and moves the ref, the
+  next batch replays onto the head that commit will leave, over its
+  staged writes, and commits right after it. If the commit ahead does not
+  apply whole (a lost swap, a failed store, a lost lease) the batch behind
+  is dropped before it answers or stores anything and is done again from
+  the ref. Answers, ref log and head are as before. `--land-pipeline
+  on|off` (`LEEP_LAND_PIPELINE`, on) turns it off for comparison. See
+  ADR 0072.
+- **Changed.** A batch's first attempt stops taking lands after 200 ms of
+  replay and hands the rest to the next batch (`--land-batch-replay-ms
+  N|off`, `LEEP_LAND_BATCH_REPLAY_MS`), so slow replays close a batch
+  before `--land-max-batch`.
+- **Fixed.** `--land-queue-seconds` no longer refuses lands onto a ref
+  before its first batch ended: with no batch time it counted each batch
+  as 1 s and refused most of a herd arriving at a fresh server. Two
+  pipelined batches in flight count as one batch ahead.
+- **Added.** Metrics `leep_land_pipeline_total{outcome}` and
+  `leep_land_batch_closed_early_total`.
+
 ### Blob-store misses check a stamp instead of rescanning
 - **Changed.** A read or existence check that misses a store's cached
   pack view no longer rescans every time. The filesystem store compares
