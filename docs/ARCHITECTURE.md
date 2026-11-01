@@ -625,6 +625,11 @@ with the batch's writes staged in memory ([ADR 0043](adr/0043-staged-land-batche
 land(cs):  check name/tag/cs; enqueue on queue(target); start a leader if none; await answer
 
 leader(target):  while queue not empty: land_batch(take ≤64 queued (--land-max-batch), in arrival order)
+  pipelined (ADR 0072, --land-pipeline): when a batch starts storing, take the next;
+    its first attempt replays onto the head that commit will leave, over its staging,
+    answers and stores nothing, then: commit applied whole → go on from that head;
+    else (lost swap, failed store, lease gone, a sweep under way) → drop it,
+    wait for the batch ahead to end, redo the attempt from get_ref
 
 land_batch:
 loop (≤32 attempts):
@@ -634,7 +639,9 @@ loop (≤32 attempts):
     whether their contents exist (one contains_many, kept for the attempt: a
     copy's contents are checked against it, not read back, ADR 0068),
     and what target's ref log recorded for the lands' land ids
-  for each land, writing into staging and reading it back (dropped if its caller left before it was reached):
+  for each land, writing into staging and reading it back (dropped if its caller left before it was reached;
+                 after 200 ms of replay the first attempt hands the lands it has not reached
+                 back to the queue's front, --land-batch-replay-ms, ADR 0072):
     if its land id is recorded (or moved earlier in this batch):
                                      that land's result (400 if the id named another cs)
     elif head is None:               move to cs                   # cs's tree staged
@@ -677,7 +684,18 @@ the same transaction as the single ref update. Batching is what removed the
 cost of contention: lands on one ref in one process never race the CAS (they
 were serialized by a per-ref lock before), but each paid a ref read, a commit
 and a landed-copy scan as long as the number of agents ahead of it; a batch
-pays the read and commit once and its scans share the rows they read. Its
+pays the read and commit once and its scans share the rows they read.
+Batches overlap ([ADR 0072](adr/0072-pipelined-land-batches.md)): while
+one batch stores its writes and swaps the ref (a pack fsync and a
+Postgres transaction, about half of a batch's time under load), the leader
+takes the next and replays it onto the head that commit will leave, its
+staging layered over the committing batch's, so its copies read the
+batch ahead's unstored copies, nodes, rebase links and land ids. It holds
+every answer and stores nothing until that commit is known: applied whole,
+it commits next from that head (its own flush suffices, the batch ahead's
+objects being stored); otherwise it is dropped and redone from the ref
+once the batch ahead has ended. At most one batch replays behind the one
+committing, and none behind a batch that offers no move. Its
 replays write into a staging layer (`land_stage.rs`: a `BlobStore` and a
 `MetaStore` over the real ones that keep writes in memory and serve them back),
 so a replay costs memory reads and CPU instead of a tree fsync wave and a
@@ -774,13 +792,15 @@ which is then a fast-forward. Stacks containing merges are rejected.
 Built ([ADR 0060](adr/0060-land-admission-and-read-limits.md), section 2):
 the server that batches a ref's lands bounds its queue: by default in
 seconds (`--land-queue-seconds`, 5 s, `Repo::with_land_queue_seconds`,
-ADR 0068), turned into batches at the ref's moving batch time and never
-fewer than 2; or in batches (`--land-queue-batches N`, which replaces the
+ADR 0068), turned into batches at the ref's moving batch time (the interval
+between batch ends, with batches pipelined) and never fewer than 2, and
+refusing nothing before the ref's first batch ended, when there is no batch
+time yet (ADR 0072); or in batches (`--land-queue-batches N`, which replaces the
 seconds when given, `Repo::with_land_queue_batches`); or `off`.
 `land_enqueue` checks the in-memory `RefQueue` after the name checks and
 before `get_changeset`: a land that would wait behind more than `N`
 batches, its own included (the waiting lands over `--land-max-batch`,
-rounded up, plus one while a batch replays), gets `Error::Refused`, which the server answers 503
+rounded up, plus one while a batch is in flight, or two pipelined ones), gets `Error::Refused`, which the server answers 503
 `unavailable` with `Retry-After` (batches ahead times the ref's moving
 average batch time, 1 to 30 s, half of a batch's 60 s lifetime, since ADR 0066) and `Leep-Refused: admission`. An unkeyed
 refusal reads nothing; a keyed land first reads its id with one

@@ -695,6 +695,47 @@ impl Repo {
         self
     }
 
+    /// Pipeline land batches (ADR 0072, on by default): the next batch
+    /// replays onto the head a committing batch will leave while its commit
+    /// runs, and commits after it, or is redone from the ref if that commit
+    /// fails. Off runs one batch at a time, as before; the answers are the
+    /// same either way.
+    pub fn with_land_pipeline(self, on: bool) -> Self {
+        self.land_queues
+            .no_pipeline
+            .store(!on, std::sync::atomic::Ordering::Relaxed);
+        for outcome in ["kept", "discarded", "fenced"] {
+            metrics::counter!("leep_land_pipeline_total", "outcome" => outcome).increment(0);
+        }
+        self
+    }
+
+    /// See [`Repo::with_land_pipeline`].
+    pub fn land_pipeline(&self) -> bool {
+        self.land_queues.pipeline()
+    }
+
+    /// Stop taking lands into a batch once its first attempt has replayed
+    /// for `limit` ([`crate::land::MAX_BATCH_REPLAY`] by default; `None`:
+    /// only the batch size bounds it). The lands left go back to the front
+    /// of the queue for the next batch (ADR 0072).
+    pub fn with_land_batch_replay_limit(self, limit: Option<std::time::Duration>) -> Self {
+        let us = match limit {
+            None => u64::MAX,
+            Some(d) => (d.as_micros() as u64).clamp(1, u64::MAX - 1),
+        };
+        self.land_queues
+            .replay_limit_us
+            .store(us, std::sync::atomic::Ordering::Relaxed);
+        metrics::counter!("leep_land_batch_closed_early_total").increment(0);
+        self
+    }
+
+    /// See [`Repo::with_land_batch_replay_limit`].
+    pub fn land_batch_replay_limit(&self) -> Option<std::time::Duration> {
+        self.land_queues.replay_limit()
+    }
+
     /// See [`Repo::with_land_max_batch`].
     pub fn land_max_batch(&self) -> usize {
         match self

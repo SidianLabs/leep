@@ -62,6 +62,8 @@ mod land_coord_tests;
 #[cfg(test)]
 mod land_fast_tests;
 #[cfg(test)]
+mod land_pipeline_tests;
+#[cfg(test)]
 mod lazy_tree_tests;
 #[cfg(test)]
 mod page_tests;
@@ -78,7 +80,8 @@ pub use comments::strip_comments;
 pub use cursor::MAX_CURSOR_CHARS;
 pub use history::{ExtraMatch, LogFilter, LogPage, LogParams};
 pub use land::{
-    LandQueueBound, GIT_MIRROR_OPERATION, MAX_BATCH, MAX_BATCH_LIFETIME, MIN_QUEUE_BATCHES,
+    LandQueueBound, GIT_MIRROR_OPERATION, MAX_BATCH, MAX_BATCH_LIFETIME, MAX_BATCH_REPLAY,
+    MIN_QUEUE_BATCHES,
 };
 pub use land_fast::{ConflictPolicy, LandConflicts};
 pub use repo::{

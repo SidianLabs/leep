@@ -332,6 +332,18 @@ struct Args {
     /// longer behind the batch before it.
     #[arg(long, env = "LEEP_LAND_MAX_BATCH", default_value_t = leep_derive::MAX_BATCH, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=4096))]
     land_max_batch: usize,
+    /// Milliseconds of replay after which a batch takes no more lands
+    /// (ADR 0072), or off: the lands left go to the next batch, so slow
+    /// replays close a batch before --land-max-batch.
+    #[arg(long, env = "LEEP_LAND_BATCH_REPLAY_MS", value_parser = parse_count_or_off)]
+    land_batch_replay_ms: Option<CountOrOff>,
+    /// Pipeline land batches (ADR 0072): the next batch replays onto the
+    /// head a committing batch will leave while its commit runs, and is
+    /// redone from the ref if that commit fails. The answers are the same
+    /// either way. Off by default until a run where lands are the
+    /// bottleneck shows it gaining; in the mixed swarm it changed nothing.
+    #[arg(long, env = "LEEP_LAND_PIPELINE", value_enum, default_value_t = Switch::Off)]
+    land_pipeline: Switch,
     /// Write the new objects of a land batch (and any other batched server
     /// write of at least --land-pack-min-objects objects) as one pack
     /// instead of a file or object each (ADR 0068). Filesystem and object
@@ -1792,7 +1804,14 @@ async fn run() -> anyhow::Result<()> {
         Some(leep_derive::LandQueueBound::Seconds(d)) => repo.with_land_queue_seconds(Some(d)),
         None => repo.with_land_queue_batches(None),
     };
-    repo = repo.with_land_max_batch(args.land_max_batch);
+    repo = repo
+        .with_land_max_batch(args.land_max_batch)
+        .with_land_pipeline(args.land_pipeline == Switch::On)
+        .with_land_batch_replay_limit(match args.land_batch_replay_ms {
+            None => Some(leep_derive::MAX_BATCH_REPLAY),
+            Some(CountOrOff::Off) => None,
+            Some(CountOrOff::Count(ms)) => Some(std::time::Duration::from_millis(ms as u64)),
+        });
     repo = repo
         .with_land_fast_path(args.land_fast_path == Switch::On)
         .with_land_conflicts(land_conflicts(&args))
@@ -1898,6 +1917,11 @@ async fn run() -> anyhow::Result<()> {
         land_queue = ?repo.land_queue_bound(),
         land_max_batch = repo.land_max_batch(),
         "expensive read and land admission limits (ADR 0060, ADR 0068)"
+    );
+    tracing::info!(
+        land_pipeline = repo.land_pipeline(),
+        land_batch_replay = ?repo.land_batch_replay_limit(),
+        "land batches (ADR 0072)"
     );
     tracing::info!(
         land_fast_path = repo.land_fast_path(),
@@ -2422,6 +2446,33 @@ mod tests {
         let a = parse_args(["leep-server", "--land-max-batch", "256"]).unwrap();
         assert_eq!(a.land_max_batch, 256);
         assert!(parse_args(["leep-server", "--land-max-batch", "0"]).is_err());
+    }
+
+    /// Batches run one at a time and close after 200 ms of replay unless
+    /// told otherwise (ADR 0072).
+    #[test]
+    fn land_batches_do_not_pipeline_by_default() {
+        let a = parse_args(["leep-server"]).unwrap();
+        assert!(a.land_pipeline == Switch::Off);
+        assert!(a.land_batch_replay_ms.is_none());
+        let a = parse_args(["leep-server", "--land-pipeline", "on"]).unwrap();
+        assert!(a.land_pipeline == Switch::On);
+        let a = parse_args([
+            "leep-server",
+            "--land-pipeline",
+            "off",
+            "--land-batch-replay-ms",
+            "off",
+        ])
+        .unwrap();
+        assert!(a.land_pipeline == Switch::Off);
+        assert!(matches!(a.land_batch_replay_ms, Some(CountOrOff::Off)));
+        let a = parse_args(["leep-server", "--land-batch-replay-ms", "50"]).unwrap();
+        assert!(matches!(
+            a.land_batch_replay_ms,
+            Some(CountOrOff::Count(50))
+        ));
+        assert!(parse_args(["leep-server", "--land-batch-replay-ms", "0"]).is_err());
     }
 
     #[test]

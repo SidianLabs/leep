@@ -37,6 +37,12 @@ pub(crate) const LANDED_COPY_SCAN: usize = 1024;
 /// land waits behind replays of the lands queued before it; the next batch
 /// starts as soon as this one commits.
 pub const MAX_BATCH: usize = 64;
+/// Replay time after which a batch's first attempt stops taking lands and
+/// hands the rest back to the front of the queue, for the next batch,
+/// unless [`Repo::with_land_batch_replay_limit`] says otherwise (ADR 0072).
+/// Slow replays (large merges, cold caches) then close a batch early
+/// instead of holding every land behind 64 of them; fast ones fill it.
+pub const MAX_BATCH_REPLAY: Duration = Duration::from_millis(200);
 /// Fewest batches `--land-queue-seconds` admits a land behind, whatever the
 /// batch time: one would collapse each batch to about one land.
 pub const MIN_QUEUE_BATCHES: usize = 2;
@@ -128,6 +134,12 @@ pub(crate) struct LandQueues {
     queues: Mutex<HashMap<String, Arc<Mutex<RefQueue>>>>,
     /// Lands per batch, for queues made from now on; 0 is [`MAX_BATCH`].
     pub(crate) max_batch: std::sync::atomic::AtomicUsize,
+    /// Batches are not pipelined (ADR 0072): each starts once the one
+    /// before it ended.
+    pub(crate) no_pipeline: std::sync::atomic::AtomicBool,
+    /// Replay limit of a batch's first attempt in microseconds; 0 is
+    /// [`MAX_BATCH_REPLAY`], `u64::MAX` none.
+    pub(crate) replay_limit_us: std::sync::atomic::AtomicU64,
     /// How many queues hold each number of batches above zero, so the
     /// largest is known without visiting every ref's queue.
     depths: Mutex<BTreeMap<usize, usize>>,
@@ -140,9 +152,28 @@ pub(crate) struct LandQueues {
     /// What the fast path made of each replayed land, in order.
     #[cfg(test)]
     pub(crate) lookups: Mutex<Vec<(ChangesetId, Lookup)>>,
+    /// Each speculative attempt (ADR 0072), in order: its lands, and
+    /// whether it was kept.
+    #[cfg(test)]
+    pub(crate) speculated: Mutex<Vec<(Vec<ChangesetId>, bool)>>,
 }
 
 impl LandQueues {
+    pub(crate) fn pipeline(&self) -> bool {
+        !self.no_pipeline.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn replay_limit(&self) -> Option<Duration> {
+        match self
+            .replay_limit_us
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            0 => Some(MAX_BATCH_REPLAY),
+            u64::MAX => None,
+            us => Some(Duration::from_micros(us)),
+        }
+    }
+
     fn queue(&self, target_ref: &str) -> Arc<Mutex<RefQueue>> {
         let mut queues = self.queues.lock().unwrap_or_else(|e| e.into_inner());
         let max_batch = self.max_batch.load(std::sync::atomic::Ordering::Relaxed);
@@ -184,6 +215,18 @@ impl LandQueues {
         (q.writes.tips(), q.writes.entries())
     }
 
+    /// No leader runs for `target_ref`.
+    #[cfg(test)]
+    pub(crate) fn idle(&self, target_ref: &str) -> bool {
+        !lock(&self.queue(target_ref)).leading
+    }
+
+    /// Set `target_ref`'s moving batch time.
+    #[cfg(test)]
+    pub(crate) fn set_batch_secs(&self, target_ref: &str, secs: f64) {
+        lock(&self.queue(target_ref)).batch_secs = Some(secs);
+    }
+
     /// Batches `target_ref`'s queue holds, as admission counts them.
     #[cfg(test)]
     pub(crate) fn batches(&self, target_ref: &str) -> usize {
@@ -223,8 +266,9 @@ struct RefQueue {
     leading: bool,
     /// Lands admitted and not yet queued: they are reading their changeset.
     reserved: usize,
-    /// The leader took a batch from `pending` and is replaying it.
-    replaying: bool,
+    /// Batches the leader took from `pending` that have not ended: one, or
+    /// two while one commits and the next replays onto it (ADR 0072).
+    in_flight: usize,
     /// Moving average of this ref's batch times, in seconds.
     batch_secs: Option<f64>,
     /// [`RefQueue::batches`] as last given to [`LandQueues::report`].
@@ -235,13 +279,20 @@ struct RefQueue {
     writes: WriteMap,
     /// Lands per batch; 0 is [`MAX_BATCH`].
     max_batch: usize,
+    /// Told of every land queued, so a leader waiting on a commit with
+    /// nothing queued takes the next batch as soon as one arrives.
+    arrived: Arc<tokio::sync::Notify>,
 }
 
 impl RefQueue {
     /// The batches this queue holds (ADR 0060, section 2): the lands
     /// waiting, admitted ones included, in batches of [`MAX_BATCH`] rounded
-    /// up, plus the one being replayed. A land waits about one batch time
-    /// per batch ahead of it, whatever the batches' sizes.
+    /// up, plus one while any is in flight. A land waits about one batch
+    /// time per batch ahead of it, whatever the batches' sizes. Two
+    /// pipelined batches in flight count as one (ADR 0072): the batch time
+    /// is the interval between their ends, and the one committing ends
+    /// within it while the next replays; counting both would make the
+    /// smallest bound, two, refuse every land while batches pipeline.
     fn batches(&self) -> usize {
         self.batches_with(0)
     }
@@ -252,7 +303,7 @@ impl RefQueue {
     /// it.
     fn batches_with(&self, more: usize) -> usize {
         (self.pending.len() + self.reserved + more).div_ceil(self.batch_cap())
-            + usize::from(self.replaying)
+            + self.in_flight.min(1)
     }
 
     /// Lands the leader takes into one batch.
@@ -266,14 +317,21 @@ impl RefQueue {
     /// The batches a land may wait behind under `bound` (ADR 0060 section
     /// 2; ADR 0068 for seconds): a count as given, or as many batch times
     /// of this ref as fit in the seconds, at least [`MIN_QUEUE_BATCHES`].
-    /// Before a batch finished, a batch counts as 1 s, as for `Retry-After`.
+    ///
+    /// Before a batch of the ref ended there is no batch time to turn the
+    /// seconds into, and the seconds refuse nothing (ADR 0072): counting a
+    /// batch as 1 s, as before, refused most of a herd arriving at a fresh
+    /// server (483 of 1,024 agents in the first 2 s) whose batches take
+    /// 0.3 s. The first batch to end sets the estimate; the herd is no
+    /// larger than the clients sending it.
     fn bound_batches(&self, bound: LandQueueBound) -> usize {
         match bound {
             LandQueueBound::Batches(n) => n,
-            LandQueueBound::Seconds(limit) => {
-                let per_batch = self.batch_secs.unwrap_or(1.0).max(1e-3);
-                ((limit.as_secs_f64() / per_batch).floor() as usize).max(MIN_QUEUE_BATCHES)
-            }
+            LandQueueBound::Seconds(limit) => match self.batch_secs {
+                None => usize::MAX,
+                Some(per_batch) => ((limit.as_secs_f64() / per_batch.max(1e-3)).floor() as usize)
+                    .max(MIN_QUEUE_BATCHES),
+            },
         }
     }
 
@@ -316,6 +374,7 @@ impl Admitted<'_> {
         q.reserved -= 1;
         self.held = false;
         q.pending.push_back(Job::Land(land));
+        q.arrived.notify_one();
         self.queues.report(&mut q);
         !std::mem::replace(&mut q.leading, true)
     }
@@ -529,62 +588,146 @@ impl Drop for Leading {
         if !self.done {
             let mut q = lock(&self.queue);
             q.leading = false;
-            q.replaying = false;
+            q.in_flight = 0;
             q.pending.clear();
             self.queues.report(&mut q);
         }
     }
 }
 
+/// What a batch about to commit offers the batch taken behind it (ADR
+/// 0072): the head its commit will leave and what it staged, to replay onto
+/// before the commit is known.
+struct Ahead {
+    head: Option<ChangesetId>,
+    staging: Arc<Staging>,
+    /// The land ids its moves record, which the ref log may not show yet.
+    recorded: HashMap<LandId, LandRecord>,
+    /// `true` once its commit applied whole and it has no land left to
+    /// retry; `false`, or closed, otherwise.
+    landed: oneshot::Receiver<bool>,
+    /// Closed once its batch has ended.
+    done: oneshot::Receiver<()>,
+}
+
+/// Take the next job from `q`: a rebase, or up to a batch of lands.
+fn take_next(q: &mut RefQueue) -> Option<Next> {
+    match q.pending.pop_front()? {
+        Job::RebaseOnto(r) => Some(Next::RebaseOnto(Box::new(r))),
+        Job::Land(first) => {
+            let mut batch = vec![first];
+            let cap = q.batch_cap();
+            while batch.len() < cap {
+                match q.pending.pop_front() {
+                    Some(Job::Land(l)) => batch.push(l),
+                    Some(other) => {
+                        q.pending.push_front(other);
+                        break;
+                    }
+                    None => break,
+                }
+            }
+            Some(Next::Lands(batch))
+        }
+    }
+}
+
+/// Note a job's end: it leaves the queue's count, and its time since it
+/// started or the job before it ended, whichever is later, joins the batch
+/// time. With pipelined batches that is the interval between commits, the
+/// rate the queue drains at, not the batch's own longer life.
+fn job_ended(queues: &LandQueues, queue: &Mutex<RefQueue>, started: Instant, last: &mut Instant) {
+    let now = Instant::now();
+    let from = started.max(*last);
+    *last = now;
+    let mut q = lock(queue);
+    q.in_flight = q.in_flight.saturating_sub(1);
+    q.record_batch(now - from);
+    queues.report(&mut q);
+}
+
 /// Run batches until the queue is empty. Spawned, so a cancelled request
 /// never cancels the batch the other requests wait on.
+///
+/// Pipelined (ADR 0072): once a batch starts its commit, the next is taken
+/// and replays onto the head that commit will leave, in this task, while
+/// the commit runs. At most one batch replays behind the one committing; it
+/// commits only after that one did, and redoes its attempt from the ref
+/// otherwise. A batch that offers nothing to build on (pipelining off, no
+/// move, a rebase) is waited out before the next starts.
 async fn lead(repo: Repo, target_ref: String, queue: Arc<Mutex<RefQueue>>) {
+    use futures_util::stream::{FuturesUnordered, StreamExt};
     let queues = Arc::clone(&repo.land_queues);
     let mut leading = Leading {
         queues: Arc::clone(&queues),
         queue: Arc::clone(&queue),
         done: false,
     };
+    let mut last_end = Instant::now();
+    // Batches started and not yet ended, each answering with its start.
+    let mut running = FuturesUnordered::new();
+    // What the newest batch offered to build on.
+    let mut ahead: Option<Ahead> = None;
     loop {
+        if ahead.is_none() {
+            while let Some(started) = running.next().await {
+                job_ended(&queues, &queue, started, &mut last_end);
+            }
+        }
         let next = {
             let mut q = lock(&queue);
-            let next = match q.pending.pop_front() {
-                None => {
+            match take_next(&mut q) {
+                None if running.is_empty() => {
                     q.leading = false;
-                    q.replaying = false;
+                    q.in_flight = 0;
                     queues.report(&mut q);
                     leading.done = true;
                     return;
                 }
-                Some(Job::RebaseOnto(r)) => Next::RebaseOnto(Box::new(r)),
-                Some(Job::Land(first)) => {
-                    let mut batch = vec![first];
-                    let cap = q.batch_cap();
-                    while batch.len() < cap {
-                        match q.pending.pop_front() {
-                            Some(Job::Land(l)) => batch.push(l),
-                            Some(other) => {
-                                q.pending.push_front(other);
-                                break;
-                            }
-                            None => break,
+                None => None,
+                Some(next) => {
+                    q.in_flight += 1;
+                    queues.report(&mut q);
+                    Some(next)
+                }
+            }
+        };
+        match next {
+            // Nothing waiting while a batch commits: the first land to
+            // arrive meanwhile may still replay onto it.
+            None => {
+                let arrived = Arc::clone(&lock(&queue).arrived);
+                tokio::select! {
+                    () = arrived.notified() => {}
+                    Some(started) = running.next() => {
+                        job_ended(&queues, &queue, started, &mut last_end);
+                    }
+                }
+            }
+            Some(Next::Lands(batch)) => {
+                let (offer, mut offered) = oneshot::channel();
+                let (repo, target_ref, q, spec) = (&repo, &target_ref, &*queue, ahead.take());
+                running.push(async move {
+                    let started = Instant::now();
+                    repo.land_batch(target_ref, batch, q, spec, offer).await;
+                    started
+                });
+                // Every batch in flight moves on while this one replays.
+                ahead = loop {
+                    tokio::select! {
+                        a = &mut offered => break a.ok().flatten(),
+                        Some(started) = running.next() => {
+                            job_ended(&queues, &queue, started, &mut last_end);
                         }
                     }
-                    Next::Lands(batch)
-                }
-            };
-            q.replaying = true;
-            queues.report(&mut q);
-            next
-        };
-        let started = Instant::now();
-        match next {
-            Next::Lands(batch) => {
-                let mut writes = std::mem::take(&mut lock(&queue).writes);
-                repo.land_batch(&target_ref, batch, &mut writes).await;
-                lock(&queue).writes = writes;
+                };
             }
-            Next::RebaseOnto(r) => {
+            Some(Next::RebaseOnto(r)) => {
+                while let Some(started) = running.next().await {
+                    job_ended(&queues, &queue, started, &mut last_end);
+                }
+                ahead = None;
+                let started = Instant::now();
                 let QueuedRebase {
                     repo,
                     onto,
@@ -597,9 +740,9 @@ async fn lead(repo: Repo, target_ref: String, queue: Arc<Mutex<RefQueue>>) {
                     .rebase_onto_attempts(&target_ref, onto, expected_base, &ctx, led)
                     .await;
                 let _ = reply.send(result);
+                job_ended(&queues, &queue, started, &mut last_end);
             }
         }
-        lock(&queue).record_batch(started.elapsed());
     }
 }
 
@@ -953,7 +1096,22 @@ impl Repo {
     /// Land a batch: replay each land onto the head the previous one left,
     /// then move the ref once. Lands answered before anything in the batch
     /// moved the ref are answered at once, as a lone land would be.
-    async fn land_batch(&self, target_ref: &str, batch: Vec<Queued>, writes: &mut WriteMap) {
+    ///
+    /// With `spec`, the batch ahead is committing (ADR 0072): the first
+    /// attempt replays onto the head that commit will leave, over its
+    /// staging, answers nothing and stores nothing until that commit is
+    /// known, and then either goes on as an attempt from that head or is
+    /// dropped and done again from the ref once the batch ahead ended.
+    /// `offer` tells the leader, when this batch starts its first commit,
+    /// what the batch behind it may build on.
+    async fn land_batch(
+        &self,
+        target_ref: &str,
+        batch: Vec<Queued>,
+        queue: &Mutex<RefQueue>,
+        mut spec: Option<Ahead>,
+        offer: oneshot::Sender<Option<Ahead>>,
+    ) {
         let mut lands: Vec<InFlight> = batch
             .into_iter()
             .map(|q| {
@@ -978,7 +1136,16 @@ impl Repo {
         // and never changes, so a later attempt reads only the rows of the
         // head's new ancestors instead of scanning the whole stretch again.
         let mut carried: HashMap<ChangesetId, Option<ChangesetId>> = HashMap::new();
-        for attempt in 1..=MAX_LAND_ATTEMPTS {
+        let mut offer = Some(offer);
+        // Held from this batch's first commit: what the batch behind waits on.
+        let mut landed: Option<oneshot::Sender<bool>> = None;
+        let mut _ended: Option<oneshot::Sender<()>> = None;
+        // No attempt replayed a land yet: the batch may still hand lands
+        // back to the queue, and is counted once.
+        let mut first_replay = true;
+        let mut attempt = 0;
+        while attempt < MAX_LAND_ATTEMPTS {
+            attempt += 1;
             // A server that lost the ref's lease stops retrying: the lands
             // it was coordinating go back to be routed to the new holder.
             if let Some(coord) = &self.land_coordinator {
@@ -1003,21 +1170,24 @@ impl Repo {
                 }
                 return;
             }
-            let start = match self.meta().get_ref(target_ref).await {
-                Ok(h) => h,
-                Err(e) => {
-                    for l in lands {
-                        l.answer(Err(duplicate(&e)), attempt, false);
+            let start = match &spec {
+                Some(a) => a.head,
+                None => match self.meta().get_ref(target_ref).await {
+                    Ok(h) => h,
+                    Err(e) => {
+                        for l in lands {
+                            l.answer(Err(duplicate(&e)), attempt, false);
+                        }
+                        return;
                     }
-                    return;
-                }
+                },
             };
             let mut head = start;
-            if self.land_fast_path {
-                writes.sync(start);
-            }
             // The replays write here; it is stored just before the ref moves.
-            let staging = Arc::new(Staging::default());
+            let staging = Arc::new(match &spec {
+                Some(a) => Staging::over(&a.staging),
+                None => Staging::default(),
+            });
             let ids: Vec<ChangesetId> = lands.iter().map(|l| l.q.cs).collect();
             let staged = staging.repo(self);
             // Origins read by this attempt's landed-copy scans: the lands
@@ -1043,6 +1213,13 @@ impl Repo {
                     origins
                 }
             );
+            // The batch ahead's moves are not in the ref log until it
+            // commits; this attempt is kept only if they are.
+            if let (Ok(r), Some(a)) = (&mut recorded, &spec) {
+                for (id, record) in &a.recorded {
+                    r.entry(id.clone()).or_insert(*record);
+                }
+            }
             // A failed flag read holds back the whole attempt, until it has
             // failed as often as a commit may.
             let fenced = match fenced {
@@ -1058,11 +1235,23 @@ impl Repo {
                         }
                         return;
                     }
+                    staging.retain_stored(&mut origins);
                     carried = origins;
                     tokio::time::sleep(backoff(attempt)).await;
                     continue;
                 }
             };
+            // A sweep under way rescues each land's history at the head it
+            // replays onto, which must be stored: wait for the batch ahead.
+            if fenced {
+                if let Some(a) = spec.take() {
+                    metrics::counter!("leep_land_pipeline_total", "outcome" => "fenced")
+                        .increment(1);
+                    let _ = a.done.await;
+                    attempt -= 1;
+                    continue;
+                }
+            }
             // A failed land id lookup holds back only the lands with ids, to
             // the next attempt, until it has failed as often as a commit may.
             match &recorded {
@@ -1073,11 +1262,27 @@ impl Repo {
             let mut steps: Vec<RefStep> = Vec::new();
             let mut waiting: Vec<(InFlight, Result<Step>)> = Vec::new();
             let mut taken = Vec::new();
+            let mut handed_back = Vec::new();
+            // Answers rest on the batch ahead until its commit is known.
+            let speculative = spec.is_some();
+            let replay_limit = self.land_queues.replay_limit().filter(|_| first_replay);
+            let mut writes = std::mem::take(&mut lock(queue).writes);
+            if self.land_fast_path {
+                writes.sync(start);
+            }
             let replaying = Instant::now();
-            for mut l in std::mem::take(&mut lands) {
+            let mut todo = std::mem::take(&mut lands).into_iter();
+            while let Some(mut l) = todo.next() {
                 if attempt == 1 && l.q.reply.is_closed() {
                     metrics::counter!("leep_land_cancelled_total").increment(1);
                     continue;
+                }
+                // A batch of slow replays closes early: the lands it has not
+                // touched wait for the next batch, at the queue's front.
+                if replay_limit.is_some_and(|max| replaying.elapsed() >= max) && !taken.is_empty() {
+                    handed_back.push(l);
+                    handed_back.extend(todo.by_ref());
+                    break;
                 }
                 if hold_keyed && l.q.ctx.land.is_some() {
                     lands.push(l);
@@ -1085,7 +1290,7 @@ impl Repo {
                 }
                 taken.push(l.q.cs);
                 let repo = staging.repo(&l.q.repo);
-                let fast = self.land_fast_path.then_some(&*writes);
+                let fast = self.land_fast_path.then_some(&writes);
                 let step = match recorded_step(&l.q, &recorded, attempt) {
                     Some(step) => step,
                     None if fenced => match self.rescue_land(l.q.cs, start).await {
@@ -1147,18 +1352,27 @@ impl Repo {
                             ctx: l.q.ctx.clone(),
                         });
                         if self.land_fast_path {
-                            staged.follow_move(writes, head, new).await;
+                            staged.follow_move(&mut writes, head, new).await;
                         }
                         head = Some(new);
                         waiting.push((l, Ok(Step::Move(new))));
                     }
-                    Ok(Step::Done(resp)) if steps.is_empty() => {
+                    Ok(Step::Done(resp)) if steps.is_empty() && !speculative => {
                         let result = self.store_clean(&staging, resp).await;
                         l.answer(result, attempt, false)
                     }
-                    Err(e) if steps.is_empty() => l.answer(Err(e), attempt, false),
+                    Err(e) if steps.is_empty() && !speculative => l.answer(Err(e), attempt, false),
                     other => waiting.push((l, other)),
                 }
+            }
+            lock(queue).writes = writes;
+            if !handed_back.is_empty() {
+                metrics::counter!("leep_land_batch_closed_early_total").increment(1);
+                let mut q = lock(queue);
+                for l in handed_back.into_iter().rev() {
+                    q.pending.push_front(Job::Land(l.q));
+                }
+                self.land_queues.report(&mut q);
             }
             if !taken.is_empty() {
                 metrics::histogram!("leep_land_batch_replay_seconds")
@@ -1166,13 +1380,57 @@ impl Repo {
                 metrics::histogram!("leep_land_batch_tree_seconds")
                     .record(staging.tree_time().as_secs_f64());
             }
-            if attempt == 1 && !taken.is_empty() {
+            if first_replay && !taken.is_empty() {
+                first_replay = false;
                 metrics::histogram!("leep_land_batch_size").record(taken.len() as f64);
                 #[cfg(test)]
                 self.land_queues.batches.lock().unwrap().push(taken);
             }
             staging.retain_stored(&mut origins);
             carried = origins;
+            // The batch ahead's commit decides this attempt, before anything
+            // of it is answered or stored.
+            if let Some(a) = spec.take() {
+                let kept = a.landed.await.unwrap_or(false)
+                    && self.still_leading_for(target_ref, &waiting, &lands).await;
+                #[cfg(test)]
+                self.land_queues.speculated.lock().unwrap().push((
+                    waiting
+                        .iter()
+                        .map(|(l, _)| l.q.cs)
+                        .chain(lands.iter().map(|l| l.q.cs))
+                        .collect(),
+                    kept,
+                ));
+                if !kept {
+                    metrics::counter!("leep_land_pipeline_total", "outcome" => "discarded")
+                        .increment(1);
+                    lands.extend(waiting.into_iter().map(|(l, _)| l));
+                    // Rows of the batch ahead may be among them.
+                    carried.clear();
+                    // Uncounted, yet bounded: `spec` is gone, so the redo
+                    // reads the ref and counts, and the wait ends because
+                    // the batch ahead ends (its own 32 attempts,
+                    // `MAX_COMMIT_ERRORS` and lifetime bound it).
+                    let _ = a.done.await;
+                    attempt -= 1;
+                    continue;
+                }
+                metrics::counter!("leep_land_pipeline_total", "outcome" => "kept").increment(1);
+                // What it staged is stored now.
+                staging.detach();
+                if steps.is_empty() {
+                    // Nothing moved: these answers preceded every move.
+                    for (l, step) in std::mem::take(&mut waiting) {
+                        let result = match step {
+                            Ok(Step::Done(resp)) => self.store_clean(&staging, resp).await,
+                            Ok(Step::Move(_)) => unreachable!("no move was staged"),
+                            Err(e) => Err(e),
+                        };
+                        l.answer(result, attempt, false);
+                    }
+                }
+            }
             if steps.is_empty() {
                 if lands.is_empty() {
                     return;
@@ -1191,6 +1449,24 @@ impl Repo {
                 }
                 return;
             }
+            // The next batch may replay onto this attempt's head while it
+            // commits (ADR 0072). Only the first commit is offered.
+            if let Some(tx) = offer.take() {
+                let ahead = self.land_queues.pipeline().then(|| {
+                    let (landed_tx, landed_rx) = oneshot::channel();
+                    let (ended_tx, ended_rx) = oneshot::channel();
+                    landed = Some(landed_tx);
+                    _ended = Some(ended_tx);
+                    Ahead {
+                        head,
+                        staging: Arc::clone(&staging),
+                        recorded: recorded.as_ref().cloned().unwrap_or_default(),
+                        landed: landed_rx,
+                        done: ended_rx,
+                    }
+                });
+                let _ = tx.send(ahead);
+            }
             // Whether an error came from the swap itself.
             let applied = match staging.flush(self).await {
                 Err(e) => Err((e, false)),
@@ -1199,8 +1475,10 @@ impl Repo {
                     .await
                     .map_err(|e| (e, true)),
             };
+            let mut whole = false;
             match applied {
                 Ok(n) => {
+                    whole = n == steps.len();
                     if n < steps.len() {
                         commit_errors = 0;
                         metrics::counter!("leep_land_cas_losses_total").increment(1);
@@ -1252,6 +1530,12 @@ impl Repo {
                     lands.extend(waiting.into_iter().map(|(l, _)| l));
                 }
             }
+            // The batch behind keeps its replays only if this commit left
+            // exactly the head they were made on, and nothing of this batch
+            // is still to land after them.
+            if let Some(tx) = landed.take() {
+                let _ = tx.send(whole && lands.is_empty());
+            }
             if lands.is_empty() {
                 return;
             }
@@ -1269,6 +1553,22 @@ impl Repo {
                 ),
             }
         }
+    }
+
+    /// Whether this server still coordinates `target_ref`, when any of
+    /// these lands came through its lease; a batch whose replays rested on
+    /// another's commit asks again before it commits them itself.
+    async fn still_leading_for(
+        &self,
+        target_ref: &str,
+        waiting: &[(InFlight, Result<Step>)],
+        held: &[InFlight],
+    ) -> bool {
+        let Some(coord) = &self.land_coordinator else {
+            return true;
+        };
+        let led = waiting.iter().map(|(l, _)| l).chain(held).any(|l| l.q.led);
+        !led || coord.still_leading(target_ref).await
     }
 
     /// Store the merged text a conflict answer's `clean` changes name, which
@@ -1966,6 +2266,7 @@ impl Repo {
                 reply,
                 led,
             }));
+            q.arrived.notify_one();
             self.land_queues.report(&mut q);
             !std::mem::replace(&mut q.leading, true)
         };
@@ -2193,7 +2494,7 @@ mod tests {
     fn queue(waiting: usize, replaying: bool) -> RefQueue {
         RefQueue {
             reserved: waiting,
-            replaying,
+            in_flight: usize::from(replaying),
             ..RefQueue::default()
         }
     }
@@ -2278,7 +2579,11 @@ mod tests {
     fn a_time_bound_is_the_batches_that_fit_in_it() {
         let five = LandQueueBound::Seconds(secs(5.0));
         let mut q = RefQueue::default();
-        assert_eq!(q.bound_batches(five), 5, "a batch counts as 1 s at first");
+        assert_eq!(
+            q.bound_batches(five),
+            usize::MAX,
+            "no batch time yet: the seconds refuse nothing"
+        );
         q.record_batch(secs(0.25));
         assert_eq!(q.bound_batches(five), 20);
         let mut slow = RefQueue::default();
@@ -2305,6 +2610,26 @@ mod tests {
             ..RefQueue::default()
         };
         assert_eq!(big.batches(), 1);
+    }
+
+    /// A batch committing and the next replaying onto it count as one
+    /// batch time ahead of a new land (ADR 0072), so the smallest bound
+    /// still admits a filling batch behind them.
+    #[test]
+    fn pipelined_batches_count_once() {
+        let q = RefQueue {
+            reserved: 1,
+            in_flight: 2,
+            ..RefQueue::default()
+        };
+        assert_eq!(q.batches(), 2);
+        assert_eq!(q.batches_with(MAX_BATCH - 1), 2);
+        assert_eq!(q.batches_with(MAX_BATCH), 3);
+        let five = LandQueueBound::Seconds(secs(5.0));
+        let mut slow = q;
+        slow.record_batch(secs(4.0));
+        assert_eq!(slow.bound_batches(five), MIN_QUEUE_BATCHES);
+        assert!(slow.batches_with(1) <= MIN_QUEUE_BATCHES);
     }
 
     #[test]
