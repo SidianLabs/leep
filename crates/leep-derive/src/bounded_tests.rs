@@ -1416,3 +1416,233 @@ async fn bounded_blame_counts_and_bounds_merged_branches() {
         "a bounded blame wrote index rows"
     );
 }
+
+/// A linear history of `n` changesets editing `a` and `b` in turn.
+async fn chain(r: &Repo, n: usize) -> Vec<ChangesetId> {
+    let mut ids: Vec<ChangesetId> = Vec::new();
+    for step in 0..n {
+        let body = format!("step {step}\n");
+        let content = r.blobs().put(Bytes::from(body.clone())).await.unwrap();
+        let path = if step % 2 == 0 { "a" } else { "b" };
+        let cs = Changeset {
+            parents: ids.last().copied().into_iter().collect(),
+            author: "alice".into(),
+            timestamp: step as i64,
+            message: format!("c{step}"),
+            changes: BTreeMap::from([(
+                RepoPath::new(path).unwrap(),
+                FileChange::Modify {
+                    content,
+                    kind: FileKind::Regular,
+                    size: body.len() as u64,
+                },
+            )]),
+            extra: BTreeMap::new(),
+        };
+        ids.push(r.create_changeset(cs).await.unwrap());
+    }
+    ids
+}
+
+/// A chain on a probe that counts metadata calls, its history index
+/// derived up to `ids[indexed]`, every index lease held, and a fully
+/// indexed copy for reference answers.
+async fn probed_chain(
+    n: usize,
+    indexed: usize,
+) -> (
+    Arc<MemoryBlobStore>,
+    Arc<crate::search::tests::Probe>,
+    Vec<ChangesetId>,
+    Repo,
+) {
+    let inner = Arc::new(MemoryMetaStore::new().with_lease_clock(Arc::new(|| 1_000)));
+    let probe = crate::search::tests::Probe::wrapping(inner, Duration::ZERO);
+    let blobs = Arc::new(MemoryBlobStore::new());
+    let r = Repo::new(blobs.clone(), probe.clone());
+    let ids = chain(&r, n).await;
+    derived::derive::<HistoryTree>(&r, ids[indexed])
+        .await
+        .unwrap();
+    hold_leases(probe.as_ref()).await;
+    let (a, _) = memory_repo();
+    assert_eq!(chain(&a, n).await, ids);
+    for &c in &ids {
+        derived::derive::<HistoryTree>(&a, c).await.unwrap();
+    }
+    (blobs, probe, ids, a)
+}
+
+/// A path log whose index is further behind than its scan budget learns
+/// so down the skiplists, in a number of metadata calls that does not grow
+/// with the gap, and answers what the full walk would have: `Indexing`
+/// for `retry` and old clients (whose larger budget is also short of the
+/// gap), the reference page at the newest indexed changeset for
+/// `stale-ok`. A gap within budget is still walked, a call or two per
+/// changeset, and answered fresh.
+#[tokio::test]
+async fn an_over_budget_gap_is_answered_without_walking_it() {
+    let (n, indexed, scan) = (1_200, 199, 64);
+    let gap = (n - 1 - indexed) as u64;
+    let (blobs, probe, ids, a) = probed_chain(n, indexed).await;
+    let tip = ids[n - 1];
+    let budgets = Budgets {
+        scan,
+        legacy_factor: 8,
+        ..Budgets::default()
+    };
+    assert!(gap as usize > scan * budgets.legacy_factor);
+    let params = LogParams {
+        path: Some("a".into()),
+        ..Default::default()
+    };
+    let rows_before = index_rows(probe.as_ref()).await;
+    for freshness in [Freshness::Retry, Freshness::Legacy] {
+        // Cold: a fresh handle caches nothing.
+        let q = bounded(&Repo::new(blobs.clone(), probe.clone()), budgets);
+        let before = probe.calls();
+        let err = q
+            .log_page_indexed(tip, &params, 5, None, freshness)
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        let calls = probe.calls() - before;
+        match err {
+            Error::Indexing {
+                kind,
+                behind,
+                retry_after_ms,
+            } => {
+                assert_eq!(kind, HistoryTree::NAME);
+                assert_eq!(behind, gap);
+                // 1,000 behind at the holder's 50 a second.
+                assert_eq!(retry_after_ms, 20_000);
+            }
+            e => panic!("{freshness:?}: {e:?}"),
+        }
+        assert!(calls < 64, "{freshness:?}: {calls} metadata calls");
+
+        let q = bounded(&Repo::new(blobs.clone(), probe.clone()), budgets);
+        let before = probe.calls();
+        let err = q
+            .last_change_indexed(tip, "a", freshness)
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert!(matches!(err, Error::Indexing { behind, .. } if behind == gap));
+        let calls = probe.calls() - before;
+        assert!(calls < 64, "last change {freshness:?}: {calls} calls");
+    }
+
+    let q = bounded(&Repo::new(blobs.clone(), probe.clone()), budgets);
+    let before = probe.calls();
+    let page = q
+        .log_page_indexed(tip, &params, 5, None, Freshness::StaleOk)
+        .await
+        .unwrap();
+    let calls = probe.calls() - before;
+    assert_eq!(page.answered_at, Some(ids[indexed]));
+    assert_eq!(page.behind, Some(gap));
+    assert_eq!(page.scanned, 0);
+    let want = a.log_page(ids[indexed], &params, 5, None).await.unwrap();
+    let got: Vec<ChangesetId> = page.value.entries.iter().map(|e| e.id).collect();
+    assert_eq!(got, want.entries.iter().map(|e| e.id).collect::<Vec<_>>());
+    assert_eq!(page.value.next.is_some(), want.next.is_some());
+    assert!(calls < 128, "stale-ok: {calls} calls");
+    assert_eq!(index_rows(probe.as_ref()).await, rows_before);
+
+    // Within budget: the gap is walked and the answer is fresh.
+    let small = 40;
+    derived::derive::<HistoryTree>(&a, ids[n - 1 - small])
+        .await
+        .unwrap();
+    let r = Repo::new(blobs.clone(), probe.clone());
+    derived::derive::<HistoryTree>(&r, ids[n - 1 - small])
+        .await
+        .unwrap();
+    let rows_before = index_rows(probe.as_ref()).await;
+    for freshness in [Freshness::Retry, Freshness::StaleOk, Freshness::Legacy] {
+        let q = bounded(&Repo::new(blobs.clone(), probe.clone()), budgets);
+        let before = probe.calls();
+        let page = q
+            .log_page_indexed(tip, &params, 5, None, freshness)
+            .await
+            .unwrap();
+        let calls = probe.calls() - before;
+        assert_eq!(page.answered_at, None);
+        assert_eq!(page.behind, None);
+        assert!(page.scanned > 0);
+        let want = a.log_page(tip, &params, 5, None).await.unwrap();
+        let got: Vec<ChangesetId> = page.value.entries.iter().map(|e| e.id).collect();
+        assert_eq!(got, want.entries.iter().map(|e| e.id).collect::<Vec<_>>());
+        assert!(calls >= small as u64, "{freshness:?}: {calls} calls");
+    }
+    assert_eq!(index_rows(probe.as_ref()).await, rows_before);
+}
+
+/// The skiplist check decides only what the walk would: over exactly when
+/// more than the cap lack a row, at the boundary too, and a gap it cannot
+/// see (a long merged branch under a short first-parent chain) is still
+/// found by walking.
+#[tokio::test]
+async fn find_missing_is_over_exactly_past_the_cap() {
+    use crate::indexing::bounded::find_missing;
+    let cap = 64;
+    let (r, _) = memory_repo();
+    let ids = chain(&r, 300).await;
+    let tip = ids[299];
+    for gap in [200usize, 65, 64, 63, 1] {
+        derived::derive::<HistoryTree>(&r, ids[299 - gap])
+            .await
+            .unwrap();
+        let got = missing(&r, HistoryTree::NAME, &[tip]).await;
+        assert_eq!(got, gap);
+        let fresh = Repo::new(r.blobs().clone(), r.meta().clone());
+        let m = find_missing(&fresh, HistoryTree::NAME, &[tip], cap)
+            .await
+            .unwrap();
+        assert_eq!(m.over, gap > cap, "gap {gap}");
+        if !m.over {
+            assert_eq!(m.set.len(), gap);
+            assert_eq!(m.frontier, vec![ids[299 - gap]]);
+        }
+    }
+
+    // A merge whose first parent is indexed, its second parent the top of
+    // a 100-changeset branch without rows.
+    let (r, _) = memory_repo();
+    let base = chain(&r, 3).await;
+    derived::derive::<HistoryTree>(&r, base[2]).await.unwrap();
+    let mut side = base[0];
+    for step in 0..100 {
+        side = r
+            .create_changeset(Changeset {
+                parents: vec![side],
+                author: "bob".into(),
+                timestamp: step,
+                message: format!("side {step}"),
+                changes: BTreeMap::new(),
+                extra: BTreeMap::new(),
+            })
+            .await
+            .unwrap();
+    }
+    let merge = r
+        .create_changeset(Changeset {
+            parents: vec![base[2], side],
+            author: "bob".into(),
+            timestamp: 200,
+            message: "merge".into(),
+            changes: BTreeMap::new(),
+            extra: BTreeMap::new(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(missing(&r, HistoryTree::NAME, &[merge]).await, 101);
+    for (cap, over) in [(100, true), (101, false)] {
+        let m = find_missing(&r, HistoryTree::NAME, &[merge], cap)
+            .await
+            .unwrap();
+        assert_eq!(m.over, over, "cap {cap}");
+    }
+}

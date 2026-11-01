@@ -1,7 +1,9 @@
 //! Which share of the metadata store's connections a task draws on (ADR
 //! 0067). Land leaders run in [`Lane::Land`] so that request handlers
 //! filling the shared pool can never queue the one task every land on a ref
-//! waits for. Stores without separate pools ignore it.
+//! waits for, and the index warmer in [`Lane::Index`] (ADR 0073) so that
+//! queries scanning past a lagging index cannot starve the task that closes
+//! the lag. Stores without separate pools ignore it.
 
 use std::cell::Cell;
 use std::future::Future;
@@ -16,6 +18,8 @@ pub enum Lane {
     Shared,
     /// The pool reserved for land leaders and their ref moves.
     Land,
+    /// The pool reserved for the index warmer's passes and derivations.
+    Index,
 }
 
 thread_local! {
@@ -42,6 +46,18 @@ pub fn scope<F: Future>(lane: Lane, f: F) -> Scoped<F> {
 /// task.
 pub fn inherit<F: Future>(f: F) -> Scoped<F> {
     scope(current(), f)
+}
+
+/// `f` in [`Lane::Index`] if the caller is in it, else in [`Lane::Shared`]
+/// as any spawned task is: for tasks a derivation spawns, which keep the
+/// warmer on its reserved connections without moving a land leader's
+/// derivations onto the land pool's few.
+pub fn inherit_index<F: Future>(f: F) -> Scoped<F> {
+    let lane = match current() {
+        Lane::Index => Lane::Index,
+        _ => Lane::Shared,
+    };
+    scope(lane, f)
 }
 
 /// A future polled in a lane; see [`scope`].
@@ -90,5 +106,19 @@ mod tests {
         })
         .await;
         assert_eq!(current(), Lane::Shared);
+    }
+
+    #[tokio::test]
+    async fn derivation_tasks_keep_only_the_index_lane() {
+        let spawned = |lane| {
+            scope(lane, async {
+                tokio::spawn(inherit_index(async { current() }))
+                    .await
+                    .unwrap()
+            })
+        };
+        assert_eq!(spawned(Lane::Index).await, Lane::Index);
+        assert_eq!(spawned(Lane::Land).await, Lane::Shared);
+        assert_eq!(spawned(Lane::Shared).await, Lane::Shared);
     }
 }

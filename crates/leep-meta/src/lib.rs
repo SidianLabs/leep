@@ -24,7 +24,7 @@ pub mod space;
 mod sqlite;
 
 pub use migrate::{AppliedMigration, Migration, MigrationRef, MigrationReport};
-pub use postgres::{PostgresMetaStore, MIGRATIONS as POSTGRES_MIGRATIONS};
+pub use postgres::{HeldConnections, PostgresMetaStore, MIGRATIONS as POSTGRES_MIGRATIONS};
 pub use sqlite::{SqliteMetaStore, MIGRATIONS as SQLITE_MIGRATIONS};
 
 /// What opening a store does about pending schema migrations.
@@ -83,6 +83,24 @@ pub async fn open_meta_store_with_options(
     open_meta_store_with_lanes(url, mode, pool_size, None, statement_timeout).await
 }
 
+/// Connections a Postgres store reserves for the index warmer (ADR 0073)
+/// unless told otherwise (`leep-server --meta-index-pool-size`): a
+/// sixteenth of the data pool, and at least 4, so each group's warming loop
+/// has a read and a write in flight.
+pub fn default_index_pool_size(pool_size: u32) -> u32 {
+    (pool_size / 16).max(4)
+}
+
+/// Postgres connections reserved beyond the data pool, per lane: `None`
+/// reserves the default, `Some(0)` none.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LanePools {
+    /// Land leaders (ADR 0067); default [`default_land_pool_size`].
+    pub land: Option<u32>,
+    /// The index warmer (ADR 0073); default [`default_index_pool_size`].
+    pub index: Option<u32>,
+}
+
 /// [`open_meta_store_with_options`], with `land_pool_size` Postgres
 /// connections reserved for land leaders (ADR 0067); `None` reserves
 /// [`default_land_pool_size`] and `Some(0)` none. SQLite and `mem://` ignore
@@ -94,13 +112,42 @@ pub async fn open_meta_store_with_lanes(
     land_pool_size: Option<u32>,
     statement_timeout: Option<std::time::Duration>,
 ) -> Result<Arc<dyn MetaStore>> {
+    let lanes = LanePools {
+        land: land_pool_size,
+        index: None,
+    };
+    open_meta_store_with_pools(url, mode, pool_size, lanes, statement_timeout).await
+}
+
+/// [`open_meta_store_with_options`], with Postgres connections reserved per
+/// lane as `lanes` says. SQLite and `mem://` ignore lanes: SQLite has one
+/// writer at a time whatever the pool.
+pub async fn open_meta_store_with_pools(
+    url: &str,
+    mode: SchemaMode,
+    pool_size: u32,
+    lanes: LanePools,
+    statement_timeout: Option<std::time::Duration>,
+) -> Result<Arc<dyn MetaStore>> {
     if url.starts_with("sqlite:") {
         Ok(Arc::new(SqliteMetaStore::connect_with(url, mode).await?))
     } else if url.starts_with("postgres://") || url.starts_with("postgresql://") {
-        let land = land_pool_size.unwrap_or_else(|| default_land_pool_size(pool_size));
+        let land = lanes
+            .land
+            .unwrap_or_else(|| default_land_pool_size(pool_size));
+        let index = lanes
+            .index
+            .unwrap_or_else(|| default_index_pool_size(pool_size));
         Ok(Arc::new(
-            PostgresMetaStore::connect_with_lanes(url, mode, pool_size, land, statement_timeout)
-                .await?,
+            PostgresMetaStore::connect_with_pools(
+                url,
+                mode,
+                pool_size,
+                land,
+                index,
+                statement_timeout,
+            )
+            .await?,
         ))
     } else if url.starts_with("mem://") {
         Ok(Arc::new(leep_core::memory::MemoryMetaStore::new()))

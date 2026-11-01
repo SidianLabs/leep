@@ -102,6 +102,11 @@ pub struct PostgresMetaStore {
     /// `pool` cannot queue the task every land on a ref waits for. `None`
     /// (`--meta-land-pool-size 0`) shares `pool`. Connects on first use.
     pub(crate) land_pool: Option<PgPool>,
+    /// Data calls of tasks in [`Lane::Index`] (ADR 0073): the index warmer,
+    /// so queries scanning past a lagging index cannot starve the task that
+    /// closes the lag. `None` (`--meta-index-pool-size 0`) shares `pool`.
+    /// Connects on first use.
+    pub(crate) index_pool: Option<PgPool>,
     /// Lease calls only (ADR 0056), every scope, so a renewal never waits
     /// for a connection behind data traffic: a lease not renewed in time is
     /// taken over. Connects on first use.
@@ -161,8 +166,29 @@ impl PostgresMetaStore {
         statement_timeout: Option<Duration>,
     ) -> Result<Self> {
         let pools = Pools {
+            land: land_pool_size,
+            ..Pools::new(pool_size)
+        };
+        Self::open(url, None, mode, MIGRATIONS, pools, statement_timeout).await
+    }
+
+    /// [`connect_with_lanes`](Self::connect_with_lanes), with
+    /// `index_pool_size` connections reserved for the index warmer (ADR
+    /// 0073) instead of
+    /// [`default_index_pool_size`](crate::default_index_pool_size); 0
+    /// reserves none.
+    pub async fn connect_with_pools(
+        url: &str,
+        mode: SchemaMode,
+        pool_size: u32,
+        land_pool_size: u32,
+        index_pool_size: u32,
+        statement_timeout: Option<Duration>,
+    ) -> Result<Self> {
+        let pools = Pools {
             data: pool_size,
             land: land_pool_size,
+            index: index_pool_size,
         };
         Self::open(url, None, mode, MIGRATIONS, pools, statement_timeout).await
     }
@@ -177,8 +203,27 @@ impl PostgresMetaStore {
         land_pool_size: u32,
     ) -> Result<Self> {
         let pools = Pools {
+            land: land_pool_size,
+            ..Pools::new(pool_size)
+        };
+        let schema = Some(schema.to_string());
+        Self::open(url, schema, SchemaMode::Migrate, MIGRATIONS, pools, None).await
+    }
+
+    /// A store in `schema` with every pool size given, for tests of the
+    /// index lane.
+    #[doc(hidden)]
+    pub async fn connect_with_schema_and_pools(
+        url: &str,
+        schema: &str,
+        pool_size: u32,
+        land_pool_size: u32,
+        index_pool_size: u32,
+    ) -> Result<Self> {
+        let pools = Pools {
             data: pool_size,
             land: land_pool_size,
+            index: index_pool_size,
         };
         let schema = Some(schema.to_string());
         Self::open(url, schema, SchemaMode::Migrate, MIGRATIONS, pools, None).await
@@ -296,9 +341,15 @@ impl PostgresMetaStore {
             Self::options(schema.clone(), pools.land, statement_timeout)
                 .connect_lazy_with(opts.clone())
         });
+        // Bounded too: the warmer's statements were on the data pool.
+        let index_pool = (pools.index > 0).then(|| {
+            Self::options(schema.clone(), pools.index, statement_timeout)
+                .connect_lazy_with(opts.clone())
+        });
         let lease_pool = Self::options(schema, LEASE_POOL_SIZE, None).connect_lazy_with(opts);
         let mut store = Self::with_pool(pool, lease_pool, migrations);
         store.land_pool = land_pool;
+        store.index_pool = index_pool;
         crate::features::check(&store.features().await?)?;
         store.load_dicts().await?;
         Ok(store)
@@ -515,12 +566,18 @@ fn quote_ident(s: &str) -> String {
     format!("\"{}\"", s.replace('"', "\"\""))
 }
 
-/// Connections per pool, as `--meta-pool-size` and `--meta-land-pool-size`
-/// set them.
+/// Connections checked out by
+/// [`hold_data_pool`](PostgresMetaStore::hold_data_pool), returned on drop.
+#[doc(hidden)]
+pub struct HeldConnections(#[allow(dead_code)] Vec<sqlx::pool::PoolConnection<sqlx::Postgres>>);
+
+/// Connections per pool, as `--meta-pool-size`, `--meta-land-pool-size`
+/// and `--meta-index-pool-size` set them.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Pools {
     data: u32,
     land: u32,
+    index: u32,
 }
 
 impl Pools {
@@ -528,16 +585,19 @@ impl Pools {
         Self {
             data,
             land: crate::default_land_pool_size(data),
+            index: crate::default_index_pool_size(data),
         }
     }
 }
 
 impl PostgresMetaStore {
-    /// The pool the running task's data calls draw on (ADR 0067), with the
-    /// connection gauges of that pool brought up to date.
+    /// The pool the running task's data calls draw on (ADR 0067, 0073),
+    /// with the connection gauges of that pool brought up to date.
     fn db(&self) -> &PgPool {
-        let (name, pool) = match (leep_core::lane::current(), &self.land_pool) {
-            (Lane::Land, Some(land)) => ("land", land),
+        let lane = leep_core::lane::current();
+        let (name, pool) = match (lane, &self.land_pool, &self.index_pool) {
+            (Lane::Land, Some(land), _) => ("land", land),
+            (Lane::Index, _, Some(index)) => ("index", index),
             _ => ("data", &self.pool),
         };
         let size = pool.size();
@@ -556,10 +616,29 @@ impl PostgresMetaStore {
             .map_or(0, |p| p.options().get_max_connections())
     }
 
+    /// Connections the index pool may open; 0 when it shares the data pool.
+    pub fn index_pool_size(&self) -> u32 {
+        self.index_pool
+            .as_ref()
+            .map_or(0, |p| p.options().get_max_connections())
+    }
+
+    /// Check out every connection of the data pool and keep them until the
+    /// result is dropped, so tests can saturate it.
+    #[doc(hidden)]
+    pub async fn hold_data_pool(&self) -> Result<HeldConnections> {
+        let mut held = Vec::new();
+        for _ in 0..self.pool.options().get_max_connections() {
+            held.push(self.pool.acquire().await.map_err(storage)?);
+        }
+        Ok(HeldConnections(held))
+    }
+
     fn with_pool(pool: PgPool, lease_pool: PgPool, migrations: &[Migration]) -> Self {
         Self {
             pool,
             land_pool: None,
+            index_pool: None,
             lease_pool,
             codec: Codec::default(),
             has_dicts: migrations

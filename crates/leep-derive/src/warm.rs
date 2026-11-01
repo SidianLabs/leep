@@ -19,13 +19,17 @@
 //! [`Warmer::spawn`] runs one loop per index group, each with its own tail
 //! of the ref log, so a group that falls behind (path history after an
 //! import) does not hold back the others: nothing in one group's rows
-//! depends on another's.
+//! depends on another's. The loops run in the index lane (ADR 0073): on
+//! Postgres they draw on connections of their own, so queries that fill
+//! the shared pool while the index is behind cannot slow the warmer that
+//! would bring it back.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use leep_core::lane::{scope, Lane};
 use leep_core::{ChangesetId, Result};
 
 use crate::derived::{self, DerivedKind, HistoryTree, LogFilterIndex};
@@ -423,8 +427,9 @@ impl Warmer {
     }
 
     /// Run passes forever, `interval` apart, starting now: one loop per
-    /// index group (see the module docs). Aborting the handle stops them
-    /// all.
+    /// index group (see the module docs), each in the index lane, so the
+    /// metadata store serves it from connections queries cannot take (ADR
+    /// 0073). Aborting the handle stops them all.
     pub fn spawn(self, interval: Duration) -> tokio::task::JoinHandle<()> {
         let loops: Vec<Warmer> = match self.only {
             Some(_) => vec![self],
@@ -438,14 +443,14 @@ impl Warmer {
             // Dropped when the handle is aborted, which aborts the loops.
             let mut set = tokio::task::JoinSet::new();
             for mut w in loops {
-                set.spawn(async move {
+                set.spawn(scope(Lane::Index, async move {
                     loop {
                         if let Err(e) = w.pass().await {
                             tracing::warn!(error = %e, "looking for moved refs to warm failed");
                         }
                         tokio::time::sleep(interval).await;
                     }
-                });
+                }));
             }
             while set.join_next().await.is_some() {}
         })

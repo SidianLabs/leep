@@ -138,3 +138,54 @@ async fn tail_on_sqlite() {
     let meta = SqliteMetaStore::connect(&url).await.unwrap();
     tail(Arc::new(meta), false).await;
 }
+
+/// Queries holding every connection of the shared Postgres pool do not
+/// stop the warmer (ADR 0073): its loops, and the tasks their derivations
+/// spawn, run in the index lane on connections of their own, while a call
+/// in the shared lane waits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn warmer_derives_while_the_shared_pool_is_saturated() {
+    use leep_core::lane::{scope, Lane};
+    let Ok(url) = std::env::var("LEEP_TEST_POSTGRES_URL") else {
+        eprintln!("skipping: LEEP_TEST_POSTGRES_URL not set");
+        return;
+    };
+    let schema = format!("leep_test_warm_index_lane_{}", std::process::id());
+    // One shared connection, one for the land lane (which this test reads
+    // through to watch), two for the warmer.
+    let pg = Arc::new(
+        PostgresMetaStore::connect_with_schema_and_pools(&url, &schema, 1, 1, 2)
+            .await
+            .unwrap(),
+    );
+    let meta: Arc<dyn MetaStore> = pg.clone();
+    let blobs: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+    let r = Repo::new(blobs.clone(), meta.clone());
+    let mut head = commit(&r, None, "base").await;
+    for i in 0..200 {
+        head = commit(&r, Some(head), &format!("c{i}")).await;
+    }
+    assert!(meta.cas_ref("main", None, Some(head)).await.unwrap());
+
+    let held = pg.hold_data_pool().await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), meta.get_ref("main"))
+            .await
+            .is_err(),
+        "the shared pool is saturated"
+    );
+    // A cold handle, so the warmer reads everything it derives from.
+    let cold = Repo::new(blobs, meta.clone()).with_derive_jobs(4);
+    let task = Warmer::new(cold, true).spawn(Duration::from_millis(50));
+    let started = std::time::Instant::now();
+    while !scope(Lane::Land, indexed(&r, head)).await {
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the warmer derived nothing while the shared pool was held"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    task.abort();
+    drop(held);
+    assert!(indexed(&r, head).await);
+}
