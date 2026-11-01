@@ -61,12 +61,16 @@ loose. The pack and index formats do not change.
   frames with `modified` one second later until the id is new.
 
 ### 2. Who uses it
-`Repo::put_rescuing_many`, the write behind every server-side blob a
-changeset may name (tree nodes of creates, merges and land batches, merged
-contents, batched imports), calls `put_many` once and leaves the hashes it
-returns out of its `flush_blobs`, so a packed batch syncs no shard
-directory at all. Its writes in flight per call were 4 (creates) or 256
-(land batches); they are now the backend's (256 by default).
+`Repo::put_rescuing_many` (a land batch's store, the merged text of a
+conflict answer, batched imports) calls `put_many` once and leaves the
+hashes it returns out of its `flush_blobs`, so a packed batch syncs no
+shard directory at all. A create's tree nodes go through
+`put_rescuing_many_loose`, which writes each on its own as before (4 in
+flight): with nested paths a create writes 16 nodes or more, and packing
+them made a pack per create, as many packs as lands for the background
+repack to merge again (measured: about 2,800 packs for 2,300 lands; with
+creates loose, 56). Land batches write at most 256 objects at a time when
+they are not packed (the default `put_many`), as before.
 
 ### 3. Durability ordering
 ADR 0044's rule stands: no changeset is stored before every blob it names
@@ -183,8 +187,12 @@ computed as before.
 ## Consequences
 - A land batch commits its new objects with four fsyncs and two files
   instead of about 1,150 files and up to 257 directory syncs, and the
-  copies' content checks become one batched call; see docs/PERFORMANCE.md
-  once the clean benchmark is rerun. On disk a land's objects take about
+  copies' content checks become one batched call. A rough local run
+  (`leep-land-bench`, SQLite, 10 files per changeset, `--subtrees 256`,
+  server and bench sharing 4 busy cores) was bound by SQLite and the
+  clients either way: 69 to 73 lands/s with packs, 68 to 72 without, at 64
+  and 256 agents, 56 packs written for about 2,170 lands, merged to 22
+  searched. The clean Postgres benchmark of the context is to be rerun. On disk a land's objects take about
   their compressed size instead of a 4 KiB block each, and the store holds
   a few dozen pack files instead of a file per object.
 - Most objects written by land batches are packed from the start, so the

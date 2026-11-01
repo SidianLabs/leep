@@ -1036,7 +1036,8 @@ FsBlobStore.get(hash)
         → decoded-object cache (64 MiB, per store) → delta chain in the .pack
 ```
 Since ADR 0068 a `put_many` of at least 16 new objects (a land batch's
-tree nodes and merged contents, a batched import) writes them as one pack
+tree nodes and merged contents, a batched import; a create's tree nodes
+stay loose) writes them as one pack
 instead: whole zstd frames in hash order, built in memory, the `.pack` and
 then the `.idx` published through synced temp files and synced renames,
 durable before `put_many` returns, and added to the process's view without
