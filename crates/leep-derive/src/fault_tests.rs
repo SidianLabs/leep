@@ -286,7 +286,8 @@ async fn run_agent(seed: u64, repo: Repo, n: usize, steps: usize, per_try: Durat
 /// Many agents landing stacks through several server instances while the
 /// stores fail, stall and answer ambiguously. Nothing a land reported may be
 /// lost, nothing may land twice, and everything reachable stays readable.
-async fn lands_under_faults(seed: u64) {
+/// Returns the batches staged behind a commit (ADR 0072), kept and dropped.
+async fn lands_under_faults(seed: u64) -> (usize, usize) {
     let w = World::new(seed);
     let ten_min = Duration::from_secs(600);
     w.plan
@@ -328,6 +329,17 @@ async fn lands_under_faults(seed: u64) {
 
     w.plan.pause();
     assert_lands_kept(seed, &w, &agents).await;
+    let (mut kept, mut dropped) = (0, 0);
+    for s in &servers {
+        for (_, k) in s.land_queues.speculated.lock().unwrap().iter() {
+            if *k {
+                kept += 1;
+            } else {
+                dropped += 1;
+            }
+        }
+    }
+    (kept, dropped)
 }
 
 /// After agents stop: everything `main` reaches is readable, every land an
@@ -376,8 +388,19 @@ pub(crate) async fn assert_lands_kept(seed: u64, w: &World, agents: &[Agent]) {
 
 #[tokio::test(start_paused = true)]
 async fn lands_under_faults_lose_nothing_and_duplicate_nothing() {
+    let (mut kept, mut dropped) = (0, 0);
     for seed in seeds() {
-        lands_under_faults(seed).await;
+        let (k, d) = lands_under_faults(seed).await;
+        kept += k;
+        dropped += d;
+    }
+    // Commits are slow and fail, so batches replay behind them and some of
+    // those replays are dropped (ADR 0072).
+    if seeds().count() >= 10 {
+        assert!(
+            kept > 0 && dropped > 0,
+            "staged: {kept} kept, {dropped} dropped"
+        );
     }
 }
 

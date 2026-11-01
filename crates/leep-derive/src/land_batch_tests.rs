@@ -196,7 +196,7 @@ impl MetaStore for Gate {
     }
 }
 
-fn plain_repo() -> Repo {
+pub(crate) fn plain_repo() -> Repo {
     Repo::new(
         Arc::new(MemoryBlobStore::new()),
         Arc::new(MemoryMetaStore::new()),
@@ -212,21 +212,21 @@ fn gated_repo() -> (Repo, Arc<Gate>) {
 /// One changeset to create: parents by index into the script (or the base),
 /// and the files it writes (`None` deletes).
 #[derive(Clone)]
-struct Spec {
+pub(crate) struct Spec {
     parents: Vec<Parent>,
     files: Vec<(String, Option<String>)>,
     msg: String,
 }
 
 #[derive(Clone, Copy)]
-enum Parent {
+pub(crate) enum Parent {
     Base,
     Script(usize),
 }
 
 /// Create the base (landed on `main`) and every spec, in order. The same
 /// script gives the same ids in any repository.
-async fn build(r: &Repo, script: &[Spec]) -> (ChangesetId, Vec<ChangesetId>) {
+pub(crate) async fn build(r: &Repo, script: &[Spec]) -> (ChangesetId, Vec<ChangesetId>) {
     let base = make(
         r,
         &[],
@@ -250,7 +250,7 @@ async fn build(r: &Repo, script: &[Spec]) -> (ChangesetId, Vec<ChangesetId>) {
     (base, ids)
 }
 
-async fn make(
+pub(crate) async fn make(
     r: &Repo,
     parents: &[ChangesetId],
     files: &[(String, Option<String>)],
@@ -286,7 +286,7 @@ async fn make(
     .unwrap()
 }
 
-fn spec(parents: &[Parent], files: &[(&str, Option<&str>)], msg: &str) -> Spec {
+pub(crate) fn spec(parents: &[Parent], files: &[(&str, Option<&str>)], msg: &str) -> Spec {
     Spec {
         parents: parents.to_vec(),
         files: files
@@ -298,14 +298,14 @@ fn spec(parents: &[Parent], files: &[(&str, Option<&str>)], msg: &str) -> Spec {
 }
 
 /// A land's answer in comparable form.
-fn outcome(r: &Result<LandResponse>) -> String {
+pub(crate) fn outcome(r: &Result<LandResponse>) -> String {
     match r {
         Ok(resp) => format!("{resp:?}"),
         Err(e) => format!("error: {e}"),
     }
 }
 
-fn log_steps(entries: &[RefLogEntry]) -> Vec<String> {
+pub(crate) fn log_steps(entries: &[RefLogEntry]) -> Vec<String> {
     entries
         .iter()
         .rev()
@@ -318,7 +318,7 @@ fn log_steps(entries: &[RefLogEntry]) -> Vec<String> {
         .collect()
 }
 
-async fn wait_for(mut done: impl FnMut() -> bool) {
+pub(crate) async fn wait_for(mut done: impl FnMut() -> bool) {
     for _ in 0..10_000 {
         if done() {
             return;
@@ -876,16 +876,16 @@ async fn a_lone_land_swaps_with_a_single_logged_cas() {
 }
 
 /// Small deterministic generator, so a failing seed can be rerun.
-struct Rng(u64);
+pub(crate) struct Rng(pub(crate) u64);
 
 impl Rng {
-    fn next(&mut self) -> u64 {
+    pub(crate) fn next(&mut self) -> u64 {
         self.0 ^= self.0 << 13;
         self.0 ^= self.0 >> 7;
         self.0 ^= self.0 << 17;
         self.0
     }
-    fn below(&mut self, n: usize) -> usize {
+    pub(crate) fn below(&mut self, n: usize) -> usize {
         (self.next() % n as u64) as usize
     }
 }
@@ -998,6 +998,11 @@ async fn a_batch_stores_its_replays_in_one_metadata_write() {
 /// Every changeset in `head`'s history is stored with its root tree,
 /// generation and skiplist rows, and every tree node under its root tree is
 /// in the blob store itself (not only in a cache).
+/// [`assert_stored`] for other test modules.
+pub(crate) async fn assert_stored_pub(r: &Repo, head: ChangesetId) {
+    assert_stored(r, head).await
+}
+
 async fn assert_stored(r: &Repo, head: ChangesetId) {
     use crate::derived::{DerivedKind, Generation, RootTree, Skiplist};
     let mut stack = vec![head];
