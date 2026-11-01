@@ -175,7 +175,8 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 - **Changed.** `--peer-url-prefix` is compared as a parsed origin
   (scheme, host and port equal, then a path prefix) instead of raw text;
   `http://host:` with no port allows every port of that host, and a
-  partial host such as `http://10.0.3.` is refused at startup. The
+  partial host such as `http://10.0.3.` or `https://leep-` is refused at
+  startup ("does not name a whole host"): list each server's origin. The
   example in `deploy/leep-server.env.example` is now a full origin.
 
 ### Request bodies declare their type; open servers take only local requests

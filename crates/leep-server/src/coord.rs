@@ -154,7 +154,7 @@ impl std::str::FromStr for PeerPrefix {
             },
         };
         let host = url.host_str().unwrap_or("").to_string();
-        if host.is_empty() || !host.eq_ignore_ascii_case(written) {
+        if host.is_empty() || !host.eq_ignore_ascii_case(written) || !whole_host(&host) {
             return Err(bad("does not name a whole host"));
         }
         Ok(PeerPrefix {
@@ -168,6 +168,25 @@ impl std::str::FromStr for PeerPrefix {
             path: url.path().to_string(),
         })
     }
+}
+
+/// Whether `host` is an IP address or a complete DNS name: labels of
+/// letters, digits, `-` and `_`, none empty and none starting or ending
+/// with `-`. A text prefix such as `https://leep-` used to match
+/// `https://leep-1.internal`; parsed, it would match nothing, so it is
+/// refused rather than left to stop every forward without a word.
+fn whole_host(host: &str) -> bool {
+    if host.starts_with('[') || host.parse::<IpAddr>().is_ok() {
+        return true;
+    }
+    host.split('.').all(|label| {
+        !label.is_empty()
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    })
 }
 
 impl PeerPrefix {
@@ -718,13 +737,18 @@ mod tests {
             "10.0.3.7:7070",
             "ftp://10.0.0.1/",
             "https://u:p@leep/",
+            "https://leep-",
+            "https://leep-:7070/",
+            "https://leep.internal.",
+            "https://leep..internal/",
         ] {
             assert!(policy(&[bad], &[], false).validate().is_err(), "{bad}");
         }
         for good in [
             "http://10.0.3.7:7070/",
             "http://127.0.0.1:",
-            "https://leep-",
+            "https://leep-1.internal:7070/",
+            "http://leep_server:7070/",
             "http://[::1]:",
         ] {
             assert!(policy(&[good], &[], false).validate().is_ok(), "{good}");

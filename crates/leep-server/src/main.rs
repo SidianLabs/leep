@@ -2146,6 +2146,9 @@ fn land_coordination(
         cidrs: args.peer_cidr.clone(),
         allow_plain_http: args.peer_allow_plain_http,
     };
+    // Before the advertise URL is checked against the prefixes, so a
+    // malformed prefix is named as such.
+    policy.validate().map_err(anyhow::Error::msg)?;
     policy
         .check_url(&address)
         .map_err(|e| anyhow::anyhow!("--advertise-url: {e}"))?;

@@ -2501,6 +2501,12 @@ fn land_coordination_checks_the_advertise_url_at_startup() {
     };
     let log = run(format!("http://127.0.0.1:{elsewhere}"), "http://127.0.0.1:");
     assert!(log.contains("does not reach this server"), "{log}");
-    let log = run(format!("http://127.0.0.1:{port}"), "https://leep-");
+    let log = run(
+        format!("http://127.0.0.1:{port}"),
+        "https://leep-1.internal:7070/",
+    );
     assert!(log.contains("not allowed"), "{log}");
+    // A prefix that is only the start of a host name matches nothing.
+    let log = run(format!("http://127.0.0.1:{port}"), "https://leep-");
+    assert!(log.contains("does not name a whole host"), "{log}");
 }
