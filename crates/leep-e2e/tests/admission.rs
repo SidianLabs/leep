@@ -142,6 +142,7 @@ fn admission_startup_line(root: &std::path::Path, extra: &[&str]) -> String {
         .args(extra)
         .env("RUST_LOG", "info")
         .env_remove("LEEP_LAND_QUEUE_BATCHES")
+        .env_remove("LEEP_LAND_QUEUE_SECONDS")
         .stdin(std::process::Stdio::null())
         .stdout(out)
         .stderr(err)
@@ -164,14 +165,17 @@ fn admission_startup_line(root: &std::path::Path, extra: &[&str]) -> String {
     line
 }
 
-/// Admission is on by default since E5c (ADR 0060): four batches, and
-/// `off` still turns it off.
+/// Admission is on by default (ADR 0060), bounded in seconds since ADR
+/// 0068; `--land-queue-batches N` still bounds it in batches, and `off`
+/// still turns it off.
 #[test]
-fn land_queue_batches_defaults_to_four_and_off_turns_it_off() {
+fn land_queue_defaults_to_five_seconds_and_off_turns_it_off() {
     let _g = serial();
     let tmp = tempfile::tempdir().unwrap();
     let line = admission_startup_line(&tmp.path().join("default"), &[]);
-    assert!(line.contains("land_queue_batches=Some(4)"), "{line}");
+    assert!(line.contains("land_queue=Some(Seconds(5s))"), "{line}");
+    let line = admission_startup_line(&tmp.path().join("batches"), &["--land-queue-batches", "4"]);
+    assert!(line.contains("land_queue=Some(Batches(4))"), "{line}");
     let line = admission_startup_line(&tmp.path().join("off"), &["--land-queue-batches", "off"]);
-    assert!(line.contains("land_queue_batches=None"), "{line}");
+    assert!(line.contains("land_queue=None"), "{line}");
 }
