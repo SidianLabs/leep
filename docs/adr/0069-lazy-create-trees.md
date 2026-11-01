@@ -111,14 +111,20 @@ storing would turn reads into writes and write the garbage this decision
 removes. A land's slow path derives the stack's trees in memory inside
 the batch, which costs about the copy's own `apply_changes`: the batch
 attempt keeps every node it derived (`NodeMemo`, apart from the nodes it
-may treat as stored), so the merge reads the land's tree from there. The
-first version relied on the shared cache alone, which creates also filled
-with their nodes; under 256 agents it held a land's tree for less than one
-merge, so the merge re-derived the tree for every node it read (6 to 8
-times a land in `a_slow_path_land_derives_the_lazy_tree_once` without a
-cache) and a slow-path replay took 92 ms instead of 2.8 ms. Creates now
-keep only the depth of their tree, and a slow-path land derives each tree
-once. The fast path reads only the head and the land's base, both stored.
+may treat as stored), so the merge reads the land's tree from there, and
+creates keep only the depth of their tree, so that cache is not churned by
+every create. Readers do not ask the store for a node known to be
+unstored: one derived already, or the root of a tree this process created
+without its nodes (`Repo::lazy_first`). The first version asked the store
+for every node of the land's tree before falling back to deriving it; on
+the filesystem store each miss rescans `packs/`, and that, not the
+derivation (about 1 ms), made a slow-path replay take 82 to 93 ms instead
+of 2.3 to 4.2 ms in the 256-agent benchmark (20 ms against 2.8 ms in a
+30 s local run of the same harness, 3.3 ms against 3.0 ms after).
+`a_slow_path_land_stays_off_the_store_and_stores_only_its_paths` checks
+that such a land misses the store at most once (for the root, when
+another process made the create) and stores only the directories on its
+paths. The fast path reads only the head and the land's base, both stored.
 
 ### 4. Everything else that walks trees
 - **GC mark** walks a lazy changeset's derived tree: what it marks is
