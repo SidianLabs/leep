@@ -355,8 +355,8 @@ async fn a_create_flushes_its_contents_and_tree_before_storing() {
     assert!(!blobs.is_unsynced(&far));
     assert_eq!(
         blobs.flushes(),
-        flushes + 1,
-        "contents and tree in one flush"
+        flushes + 2,
+        "the nodes, then the root with the contents"
     );
     assert_eq!(meta.violations(), Vec::<String>::new());
     assert_eq!(*meta.writes.lock().unwrap(), 2);

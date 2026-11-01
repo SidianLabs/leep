@@ -346,8 +346,9 @@ impl Repo {
     /// stores that pack batches): a create's few tree nodes, which as packs
     /// would make a pack per create, each for the background repack to
     /// merge again (ADR 0068). The last item, a tree's root, is written
-    /// only once the others are: a stored root vouches for its whole tree
-    /// (ADR 0069), so a failed write must not leave it without its nodes.
+    /// only once the others are written and flushed: a stored root vouches
+    /// for its whole tree (ADR 0069), so neither a failed write nor a crash
+    /// may leave it without its nodes.
     pub(crate) async fn put_rescuing_many_loose(
         &self,
         items: Vec<(Hash, Bytes)>,
@@ -362,6 +363,8 @@ impl Repo {
         named: &[Hash],
         pack: bool,
     ) -> Result<()> {
+        // Durable already: what a pack holds, or the nodes flushed before
+        // their root.
         let packed: HashSet<Hash> = if pack {
             self.blobs()
                 .put_many(items.clone())
@@ -380,10 +383,17 @@ impl Repo {
                     .collect();
                 try_join_all(writes).await?;
             }
+            // The others' directory entries are synced before the root is
+            // written, so no reordering below us can leave a root without
+            // its nodes.
+            let early: Vec<Hash> = rest.iter().map(|(h, _)| *h).collect();
+            if last.is_some() && !early.is_empty() {
+                self.blobs().flush_blobs(&early).await?;
+            }
             if let Some((h, d)) = last {
                 self.blobs().put_with_hash(*h, d.clone()).await?;
             }
-            HashSet::new()
+            early.into_iter().collect()
         };
         let hashes: Vec<Hash> = items.iter().map(|(h, _)| *h).collect();
         let mut to_flush: Vec<Hash> = hashes
