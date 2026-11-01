@@ -112,6 +112,15 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 - **Changed.** A land batch that fast-forwards a ref to such a changeset
   stores its tree in two waves (nodes, then the root), so two packs; an
   eager create flushes its tree's nodes before writing the root.
+### Bounded land replays
+- **Changed.** A land whose stack of unlanded changesets is longer than
+  1,024 is refused with a 400 that says to land it in pieces, before
+  anything is replayed. A replay checks its batch's deadline at every
+  stack entry: past 30 s (half of the 60 s batch lifetime) that land alone
+  answers the retryable past-deadline 409, instead of holding the ref's
+  queue until the whole batch expires. The same applies to the git
+  mirror's `rebase-onto`. Fixes #158.
+
 ### The comment lexer agrees with itself
 - **Fixed.** `strip_comments`, which decides the `comment_only` review rule,
   dropped the indentation of a file's first code line, so its output could

@@ -788,7 +788,13 @@ and built `b` on its own `a` lands only `b`, instead of a second, empty copy
 of `a`, or a false conflict when the ref changed `a`'s files since. On conflict the client applies
 `clean` (every blob it names is stored before the answer, even when the batch
 moves nothing; `/v1/ready` lists `land-clean-blobs`), resolves `conflicts` on top of `onto`, commits once and lands again,
-which is then a fast-forward. Stacks containing merges are rejected.
+which is then a fast-forward. Stacks containing merges are rejected, and so
+are stacks longer than `MAX_LAND_STACK` (1,024, the landed-copy scan): 400,
+"land it in pieces". A replay runs on the ref's leader ahead of every land
+queued behind it, so it checks a deadline at every stack entry: past
+`REPLAY_BUDGET` (half of `MAX_BATCH_LIFETIME`) from its batch's start, that
+land alone answers the retryable past-deadline 409, and the lands replayed
+before it still commit.
 Built ([ADR 0060](adr/0060-land-admission-and-read-limits.md), section 2):
 the server that batches a ref's lands bounds its queue: by default in
 seconds (`--land-queue-seconds`, 5 s, `Repo::with_land_queue_seconds`,

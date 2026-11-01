@@ -66,6 +66,8 @@ mod land_fast_tests;
 #[cfg(test)]
 mod land_pipeline_tests;
 #[cfg(test)]
+mod land_stack_tests;
+#[cfg(test)]
 mod lazy_tree_tests;
 #[cfg(test)]
 mod page_tests;
