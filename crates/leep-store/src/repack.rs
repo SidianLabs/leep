@@ -24,7 +24,8 @@ use leep_core::{Error, Hash, Result};
 use crate::fs::unix_secs;
 use crate::pack::{self, MAX_CHAIN};
 use crate::packset::{
-    lock_tombstones, parse_tombstones, published_ids, sync_dir, tombstone_line, Pack, TOMBSTONES,
+    lock_tombstones, parse_tombstones, published_ids, sync_dir, tombstone_line, Pack, ScanReason,
+    TOMBSTONES,
 };
 use crate::packwrite::{
     hint_ids, plan_merge, write_order, write_pack, ObjectTable, PackSource, SourceRead,
@@ -291,7 +292,7 @@ impl PublishedPack {
         step(&self.opts, RepackStep::OldPacksRemoved)?;
         rewrite_tombstones(&dir)?;
         step(&self.opts, RepackStep::TombstonesRewritten)?;
-        self.report.packs_after = store.packs.refresh()?.packs.len() as u64;
+        self.report.packs_after = store.packs.rescan(ScanReason::Repack)?.packs.len() as u64;
         let (n, bytes) = count_loose(store.root())?;
         self.report.loose_after = n;
         self.report.loose_bytes_after = bytes;
@@ -646,7 +647,7 @@ impl FsBlobStore {
         };
         step(&opts, RepackStep::Started)?;
 
-        let view = self.packs.refresh()?;
+        let view = self.packs.rescan(ScanReason::Repack)?;
         let mut leftovers = LeftoverCounts {
             restore: true,
             ..LeftoverCounts::default()
@@ -878,7 +879,7 @@ impl FsBlobStore {
         // Loading the new index holds it beside the old ones; the per-object
         // arrays of this run go first.
         drop((written, sources, table, view));
-        self.packs.refresh()?;
+        self.packs.rescan(ScanReason::Repack)?;
         let replaced: Vec<String> = replaced.into_iter().filter(|r| *r != id).collect();
         // The new pack holds every live object of each; reads here stop
         // searching them now rather than after the fence.
@@ -907,7 +908,7 @@ impl FsBlobStore {
     /// Each searchable pack with its live object count and size: what
     /// [`plan_merge`](crate::plan_merge) plans from. Scans `packs/` first.
     pub fn pack_sizes(&self) -> Result<Vec<PackSize>> {
-        let view = self.packs.refresh()?;
+        let view = self.packs.rescan(ScanReason::Repack)?;
         Ok(view
             .searchable()
             .iter()

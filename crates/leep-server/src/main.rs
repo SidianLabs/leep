@@ -1317,6 +1317,10 @@ fn install_metrics() -> anyhow::Result<axum::Router> {
         .set_buckets_for_metric(Matcher::Suffix("_seconds".into()), SECONDS_BUCKETS)?
         .set_buckets_for_metric(Matcher::Full("leep_land_attempts".into()), ATTEMPT_BUCKETS)?
         .set_buckets_for_metric(Matcher::Full("leep_land_batch_size".into()), BATCH_BUCKETS)?
+        .set_buckets_for_metric(
+            Matcher::Full("leep_blob_miss_seconds".into()),
+            MISS_SECONDS_BUCKETS,
+        )?
         .install_recorder()
         .context("installing metrics recorder")?;
     leep_server::observe::record_build_info();
@@ -1332,6 +1336,12 @@ fn install_metrics() -> anyhow::Result<axum::Router> {
 
 const SECONDS_BUCKETS: &[f64] = &[
     0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+];
+/// A pack view miss takes microseconds when its stamp is unchanged and up
+/// to a pack listing when it is not (ADR 0070).
+const MISS_SECONDS_BUCKETS: &[f64] = &[
+    0.00001, 0.000025, 0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.1,
+    1.0,
 ];
 const ATTEMPT_BUCKETS: &[f64] = &[1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 24.0, 32.0];
 /// Lands per group commit; a batch holds at most 64.
@@ -2172,6 +2182,9 @@ impl BlobStore for ArcBlobs {
     }
     async fn get_stored(&self, hash: &leep_core::Hash) -> leep_core::Result<Option<bytes::Bytes>> {
         self.0.get_stored(hash).await
+    }
+    async fn get_exact(&self, hash: &leep_core::Hash) -> leep_core::Result<Option<bytes::Bytes>> {
+        self.0.get_exact(hash).await
     }
     async fn contains_many(&self, hashes: &[leep_core::Hash]) -> leep_core::Result<Vec<bool>> {
         self.0.contains_many(hashes).await

@@ -3,14 +3,16 @@
 //! empty object each at `packs/tombstones/<pack id>/<hash>`, and entries
 //! read with ranged GETs.
 //!
-//! There is no directory to watch, so the cached view is refreshed on a miss
-//! at most once per refresh interval. That is enough because a repack keeps
-//! the loose copies and replaced packs for a fence after it publishes, and
-//! the interval is far shorter than any fence: a miss after the fence comes
-//! more than an interval after the publish, so the refresh it allows (or one
-//! that started later) lists the new pack.
+//! There is no directory to watch. Every publisher writes `packs/.gen` after
+//! the index it publishes, so a miss HEADs that one object (at most once per
+//! [`GEN_WINDOW`] in a process) and lists `packs/` only when its etag
+//! changed (ADR 0070). A bucket without it (written only by older servers)
+//! is listed on every miss, as ADR 0068 did. The full listing, tombstones
+//! included, still runs on a miss at most once per refresh interval (ADR
+//! 0040).
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -21,7 +23,9 @@ use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 
 use crate::pack::{self, IdxEntry, PackIndex};
-use crate::packset::{merge_listing, order_packs, DecodedCache, PackLike, Tombstones};
+use crate::packset::{
+    merge_listing, order_packs, record_miss, DecodedCache, PackLike, ScanReason, Tombstones,
+};
 use crate::storage_err;
 
 pub(crate) const PACKS_PREFIX: &str = "packs";
@@ -31,6 +35,62 @@ pub(crate) const TOMBSTONES_PREFIX: &str = "packs/tombstones";
 pub(crate) const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 /// Indexes fetched at once when a refresh finds several new packs.
 const LOAD_CONCURRENCY: usize = 8;
+/// The pack-set generation stamp (ADR 0070): rewritten, last writer wins,
+/// by every writer after it publishes or deletes a pack.
+pub(crate) const GEN_KEY: &str = "packs/.gen";
+/// How old a HEAD of [`GEN_KEY`] a miss may reuse: concurrent misses in one
+/// process share one request.
+pub(crate) const GEN_WINDOW: Duration = Duration::from_millis(50);
+
+pub(crate) fn gen_key() -> Path {
+    Path::from(GEN_KEY)
+}
+
+/// What a HEAD of [`GEN_KEY`] saw.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Gen {
+    /// No stamp: only older servers wrote this bucket.
+    Absent,
+    /// The stamp's etag (or version): every write of it differs.
+    Tag(String),
+    /// A backend that reports neither, so changes cannot be seen.
+    Unknown,
+}
+
+/// Announce a change of the published packs: write [`GEN_KEY`] with
+/// contents no other write has (the pack id, this process, a counter and
+/// the time), so its etag changes. Called after the index PUT or the
+/// deletes it announces, before the write returns: a reader that HEADs the
+/// stamp after that sees a new etag and lists `packs/`.
+pub(crate) async fn bump_gen(store: &dyn ObjectStore, pack_id: &str) -> Result<()> {
+    static WRITES: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let body = format!(
+        "{pack_id} {} {} {nanos}\n",
+        crate::tmpfile::nonce(),
+        WRITES.fetch_add(1, Ordering::Relaxed)
+    );
+    store
+        .put(&gen_key(), PutPayload::from(body.into_bytes()))
+        .await
+        .map_err(storage_err)?;
+    Ok(())
+}
+
+async fn head_gen(store: &dyn ObjectStore) -> Result<Gen> {
+    match store.head(&gen_key()).await {
+        Ok(m) => Ok(match (m.e_tag, m.version) {
+            (Some(t), _) => Gen::Tag(t),
+            (None, Some(v)) => Gen::Tag(v),
+            (None, None) => Gen::Unknown,
+        }),
+        Err(e) if not_found(&e) => Ok(Gen::Absent),
+        Err(e) => Err(storage_err(e)),
+    }
+}
 
 pub(crate) fn idx_key(id: &str) -> Path {
     Path::from(format!("{PACKS_PREFIX}/{id}.idx"))
@@ -74,6 +134,9 @@ pub(crate) struct View {
     /// When the latest listing of `packs/` began, this one's or a later
     /// one that only looked for new packs.
     packs_started: Instant,
+    /// The stamp a HEAD that ended before that listing began saw: while a
+    /// later HEAD sees the same, no pack was published since.
+    gen: Gen,
 }
 
 impl View {
@@ -204,10 +267,21 @@ async fn load_pack(store: &dyn ObjectStore, id: &str) -> Result<Option<RemotePac
     }))
 }
 
+/// A HEAD of the stamp, kept for misses within [`GEN_WINDOW`] of it.
+struct GenSeen {
+    started: Instant,
+    gen: Gen,
+}
+
 pub(crate) struct RemotePackSet {
     store: Arc<dyn ObjectStore>,
     view: RwLock<Option<Arc<View>>>,
     refreshing: tokio::sync::Mutex<()>,
+    /// Held while HEADing the stamp; taken after `refreshing`, never before.
+    gen_check: tokio::sync::Mutex<()>,
+    last_gen: std::sync::Mutex<Option<GenSeen>>,
+    /// Listings of `packs/` so far, for tests.
+    lists: AtomicU64,
     decoded: DecodedCache,
     interval: Duration,
     /// Packs a repack of this process merged into a published pack, until
@@ -221,10 +295,50 @@ impl RemotePackSet {
             store,
             view: RwLock::new(None),
             refreshing: tokio::sync::Mutex::new(()),
+            gen_check: tokio::sync::Mutex::new(()),
+            last_gen: std::sync::Mutex::new(None),
+            lists: AtomicU64::new(0),
             decoded: DecodedCache::new(decoded_capacity),
             interval,
             superseded: std::sync::Mutex::default(),
         }
+    }
+
+    /// Listings of `packs/` so far, for tests.
+    #[cfg(test)]
+    pub fn lists(&self) -> u64 {
+        self.lists.load(Ordering::Relaxed)
+    }
+
+    /// One LIST of `packs/`, counted.
+    async fn list_packs(&self, reason: ScanReason) -> Result<Vec<String>> {
+        self.lists.fetch_add(1, Ordering::Relaxed);
+        reason.record();
+        Ok(list_packs_dir(&*self.store).await?.0)
+    }
+
+    /// The stamp as seen by a HEAD that began at or after `since`: a recent
+    /// one if there is one, else a new one, shared by concurrent callers.
+    async fn gen_since(&self, since: Instant) -> Result<Gen> {
+        let recent = |seen: &Option<GenSeen>| {
+            seen.as_ref()
+                .filter(|g| g.started >= since)
+                .map(|g| g.gen.clone())
+        };
+        if let Some(g) = recent(&self.last_gen.lock().unwrap()) {
+            return Ok(g);
+        }
+        let _one = self.gen_check.lock().await;
+        if let Some(g) = recent(&self.last_gen.lock().unwrap()) {
+            return Ok(g);
+        }
+        let started = Instant::now();
+        let gen = head_gen(&*self.store).await?;
+        *self.last_gen.lock().unwrap() = Some(GenSeen {
+            started,
+            gen: gen.clone(),
+        });
+        Ok(gen)
     }
 
     /// A new view of `packs`, ordered for reads, and stored as current.
@@ -233,6 +347,7 @@ impl RemotePackSet {
         mut packs: Vec<(Arc<RemotePack>, HashSet<Hash>)>,
         started: Instant,
         packs_started: Instant,
+        gen: Gen,
     ) -> Arc<View> {
         let superseded = {
             let mut s = self.superseded.lock().unwrap();
@@ -245,6 +360,7 @@ impl RemotePackSet {
             searchable,
             started,
             packs_started,
+            gen,
         });
         *self.view.write().unwrap() = Some(view.clone());
         metrics::gauge!("leep_blob_packs").set(searchable as f64);
@@ -262,7 +378,12 @@ impl RemotePackSet {
         }
         let mut packs = current.packs.clone();
         packs.push((Arc::new(pack), HashSet::new()));
-        self.install(packs, current.started, current.packs_started);
+        self.install(
+            packs,
+            current.started,
+            current.packs_started,
+            current.gen.clone(),
+        );
     }
 
     /// Stop searching `ids` (see `packset::PackSet::supersede`).
@@ -274,29 +395,30 @@ impl RemotePackSet {
                 current.packs.clone(),
                 current.started,
                 current.packs_started,
+                current.gen.clone(),
             );
         }
     }
 
-    /// A view that holds every pack published before this call: one LIST
+    /// A view that holds every pack published before `since`: one LIST
     /// of `packs/` (shared by concurrent callers), loading only the packs
     /// not loaded yet, with their tombstones. What a miss needs now that
     /// any server's `put_many` publishes packs: a changeset naming their
     /// objects can be stored right after, and read through another
     /// server at once (ADR 0068).
-    async fn refresh_new_packs(&self) -> Result<Arc<View>> {
-        let since = Instant::now();
+    async fn refresh_new_packs(&self, since: Instant, reason: ScanReason) -> Result<Arc<View>> {
         let _one = self.refreshing.lock().await;
         let current = self.current();
         if let Some(v) = current.as_ref().filter(|v| v.packs_started >= since) {
             return Ok(v.clone());
         }
-        let packs_started = Instant::now();
-        let (ids, _) = list_packs_dir(&*self.store).await?;
         let Some(current) = current else {
             drop(_one);
-            return self.refresh().await;
+            return self.refresh_after(Instant::now(), ScanReason::First).await;
         };
+        let gen = self.gen_since(Instant::now()).await?;
+        let packs_started = Instant::now();
+        let ids = self.list_packs(reason).await?;
         let new: Vec<String> = ids
             .iter()
             .filter(|id| current.pack(id).is_none())
@@ -313,7 +435,30 @@ impl RemotePackSet {
             let dead = list_tombstones_of(&*self.store, &p.id).await?;
             packs.push((p, dead));
         }
-        Ok(self.install(packs, current.started, packs_started))
+        Ok(self.install(packs, current.started, packs_started, gen))
+    }
+
+    /// The view a miss of the current one should search: the periodic full
+    /// listing if one is due, then, unless that holds `hash`, a listing of
+    /// new packs only if the stamp changed since the view's listing (or
+    /// the bucket has no usable stamp).
+    async fn view_after_miss(&self, hash: &Hash) -> Result<Arc<View>> {
+        let view = self.refresh_for_miss().await?;
+        if view.locate(hash).is_some() {
+            return Ok(view);
+        }
+        let asked = Instant::now();
+        let gen = self
+            .gen_since(asked.checked_sub(GEN_WINDOW).unwrap_or(asked))
+            .await?;
+        match (&gen, &view.gen) {
+            (Gen::Tag(now), Gen::Tag(then)) if now == then => Ok(view),
+            (Gen::Tag(_), _) => self.refresh_new_packs(asked, ScanReason::MissChanged).await,
+            _ => {
+                self.refresh_new_packs(asked, ScanReason::MissUnstamped)
+                    .await
+            }
+        }
     }
 
     fn current(&self) -> Option<Arc<View>> {
@@ -324,26 +469,46 @@ impl RemotePackSet {
     pub async fn view(&self) -> Result<Arc<View>> {
         match self.current() {
             Some(v) => Ok(v),
-            None => self.refresh().await,
+            None => {
+                let since = Instant::now();
+                let _one = self.refreshing.lock().await;
+                if let Some(v) = self.current() {
+                    return Ok(v);
+                }
+                drop(_one);
+                self.refresh_after(since, ScanReason::First).await
+            }
         }
     }
 
     /// A view listed now: one that began listing after this call.
     pub async fn refresh(&self) -> Result<Arc<View>> {
-        self.refresh_after(Instant::now()).await
+        self.rescan(ScanReason::Explicit).await
+    }
+
+    /// [`refresh`](Self::refresh), counted under `reason`.
+    pub async fn rescan(&self, reason: ScanReason) -> Result<Arc<View>> {
+        self.refresh_after(Instant::now(), reason).await
     }
 
     /// A view no older than the refresh interval, for a miss.
     async fn refresh_for_miss(&self) -> Result<Arc<View>> {
         let now = Instant::now();
-        self.refresh_after(now.checked_sub(self.interval).unwrap_or(now))
-            .await
+        self.refresh_after(
+            now.checked_sub(self.interval).unwrap_or(now),
+            ScanReason::Interval,
+        )
+        .await
     }
 
     /// A view whose listing began at or after `since`: the current one if it
     /// qualifies (a concurrent caller may just have listed), else a new one.
     /// Packs already loaded are reused.
-    async fn refresh_after(&self, since: Instant) -> Result<Arc<View>> {
+    async fn refresh_after(&self, since: Instant, reason: ScanReason) -> Result<Arc<View>> {
+        let current = self.current();
+        if let Some(v) = current.as_ref().filter(|v| v.started >= since) {
+            return Ok(v.clone());
+        }
         let _one = self.refreshing.lock().await;
         let current = self.current();
         if let Some(v) = current.as_ref().filter(|v| v.started >= since) {
@@ -352,9 +517,11 @@ impl RemotePackSet {
         let started = Instant::now();
         // Tombstones before the indexes: a repack deletes a replaced index
         // before its tombstones, so this order never pairs a listed pack with
-        // a tombstone listing that has forgotten it.
+        // a tombstone listing that has forgotten it. The stamp before the
+        // listing of `packs/`, which then holds every pack it announces.
         let mut tombstones = list_tombstones(&*self.store).await?;
-        let (ids, _) = list_packs_dir(&*self.store).await?;
+        let gen = self.gen_since(Instant::now()).await?;
+        let ids = self.list_packs(reason).await?;
         let packs = self.open_packs(current.as_deref(), &ids).await?;
         let packs = packs
             .into_iter()
@@ -363,7 +530,7 @@ impl RemotePackSet {
                 (p, dead)
             })
             .collect();
-        Ok(self.install(packs, started, started))
+        Ok(self.install(packs, started, started, gen))
     }
 
     /// The packs published now, without listing tombstones: what a delete
@@ -409,15 +576,41 @@ impl RemotePackSet {
         Ok(ids.iter().filter_map(|id| open.get(id)).cloned().collect())
     }
 
-    /// Bytes of a packed object, `None` if no live packed copy exists.
+    /// Bytes of a packed object, `None` if no live packed copy exists in
+    /// the view a miss gets ([`view_after_miss`](Self::view_after_miss)).
     pub async fn get(&self, hash: &Hash) -> Result<Option<Bytes>> {
         let mut view = self.view().await?;
         if view.locate(hash).is_none() {
-            view = self.refresh_for_miss().await?;
+            let started = Instant::now();
+            view = self.view_after_miss(hash).await?;
+            let found = view.locate(hash).is_some() as usize;
+            record_miss(started, found, 1 - found, view.packs_started);
         }
+        self.read_located(view, hash).await
+    }
+
+    /// [`get`](Self::get), with a `None` that is exact: after a miss of the
+    /// view a miss gets, one listing of `packs/` that began after `called`,
+    /// which holds every pack published before then.
+    pub async fn get_exact(&self, hash: &Hash, called: Instant) -> Result<Option<Bytes>> {
+        let mut view = self.view().await?;
         if view.locate(hash).is_none() {
-            view = self.refresh_new_packs().await?;
+            let started = Instant::now();
+            view = self.view_after_miss(hash).await?;
+            if view.locate(hash).is_none() {
+                view = self
+                    .refresh_new_packs(called, ScanReason::MissForced)
+                    .await?;
+            }
+            let found = view.locate(hash).is_some() as usize;
+            record_miss(started, found, 1 - found, view.packs_started);
         }
+        self.read_located(view, hash).await
+    }
+
+    /// Read `hash` from the pack `view` locates it in, listing again if
+    /// that pack was deleted.
+    async fn read_located(&self, mut view: Arc<View>, hash: &Hash) -> Result<Option<Bytes>> {
         // A pack deleted after its fence (this view predates the repack that
         // replaced it) answers 404; the refresh finds the replacement.
         for _ in 0..3 {
@@ -440,10 +633,10 @@ impl RemotePackSet {
     pub async fn contains(&self, hash: &Hash) -> Result<bool> {
         let mut view = self.view().await?;
         if view.locate(hash).is_none() {
-            view = self.refresh_for_miss().await?;
-        }
-        if view.locate(hash).is_none() {
-            view = self.refresh_new_packs().await?;
+            let started = Instant::now();
+            view = self.view_after_miss(hash).await?;
+            let found = view.locate(hash).is_some() as usize;
+            record_miss(started, found, 1 - found, view.packs_started);
         }
         for _ in 0..3 {
             let Some((p, _)) = view.locate(hash) else {
@@ -569,6 +762,7 @@ impl RemotePackSet {
                 searchable: v.searchable,
                 started: v.started,
                 packs_started: v.packs_started,
+                gen: v.gen.clone(),
             }));
         }
         Ok(())

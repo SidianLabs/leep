@@ -14,6 +14,8 @@ pub mod pack;
 #[cfg(test)]
 mod pack_tests;
 pub mod packfiles;
+#[cfg(test)]
+mod packgen_tests;
 mod packput;
 mod packset;
 mod packwrite;

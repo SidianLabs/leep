@@ -179,6 +179,15 @@ impl ObjectPackFiles {
     }
 }
 
+/// Rewrite `packs/.gen` if `name` is an index, which publishes or
+/// unpublishes a pack.
+async fn announce_index(store: &dyn ObjectStore, name: &str) -> Result<()> {
+    match name.strip_suffix(".idx") {
+        Some(id) => objpacks::bump_gen(store, id).await,
+        None => Ok(()),
+    }
+}
+
 fn object_none<T>(r: object_store::Result<T>) -> Result<Option<T>> {
     match r {
         Ok(v) => Ok(Some(v)),
@@ -205,7 +214,8 @@ impl PackFiles for ObjectPackFiles {
     }
 
     /// One put, or a multipart upload for a large file; either becomes
-    /// visible only when complete.
+    /// visible only when complete. An index written is announced in
+    /// `packs/.gen`, as a pack write announces it (ADR 0070).
     async fn write(&self, name: &str, mut data: ByteStream) -> Result<u64> {
         let mut w = object_store::buffered::BufWriter::new(self.store.clone(), Self::key(name));
         let mut n = 0u64;
@@ -224,12 +234,13 @@ impl PackFiles for ObjectPackFiles {
             }
         }
         w.shutdown().await.map_err(storage_err)?;
+        announce_index(&*self.store, name).await?;
         Ok(n)
     }
 
     async fn delete(&self, name: &str) -> Result<()> {
         object_none(self.store.delete(&Self::key(name)).await)?;
-        Ok(())
+        announce_index(&*self.store, name).await
     }
 
     async fn tombstones(&self) -> Result<Tombstones> {
