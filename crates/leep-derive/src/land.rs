@@ -215,6 +215,12 @@ impl LandQueues {
         (q.writes.tips(), q.writes.entries())
     }
 
+    /// No leader runs for `target_ref`.
+    #[cfg(test)]
+    pub(crate) fn idle(&self, target_ref: &str) -> bool {
+        !lock(&self.queue(target_ref)).leading
+    }
+
     /// Set `target_ref`'s moving batch time.
     #[cfg(test)]
     pub(crate) fn set_batch_secs(&self, target_ref: &str, secs: f64) {
