@@ -48,7 +48,15 @@ alongside the commit. Its first attempt is *speculative*:
   stored. Otherwise it is dropped whole: its lands go back into the batch,
   rebase links it read are forgotten, it waits for the batch ahead to end,
   and redoes the attempt from the ref. A dropped attempt does not count
-  against the 32 attempts, and its lands may still be dropped as cancelled.
+  against the 32 attempts (`attempt -= 1`), and its lands may still be
+  dropped as cancelled. That cannot loop: each drop waits for the batch
+  ahead to *end*, and after it ended there is nothing ahead to speculate
+  on, so the redo reads the ref and counts. The batch ahead itself ends:
+  its own attempts are bounded by the 32 attempts, `MAX_COMMIT_ERRORS`
+  (three failed commits in a row answer its lands) and
+  `MAX_BATCH_LIFETIME`. The bound on the batch behind therefore rests on
+  those of the batch ahead; a change that let a batch retry its commit
+  without limit would let the batch behind wait without limit too.
 - A changeset sweep under way (ADR 0059) needs each land's history rescued
   at a stored head, so a speculative attempt that reads the fence up waits
   for the batch ahead to end and starts from the ref.
@@ -138,7 +146,9 @@ land they replayed, as before.
   | off | 163, 181, 185 | 3.0 to 4.6 s / 4.4 to 9.7 s | 0.5 to 1.1 s | 2.5 to 4.1 s | 59 to 63 | 5,386, 620, 400 |
   | on | 157, 163, 177, 187 | 1.2 to 1.3 s / 1.7 to 1.9 s | 2.0 to 2.4 s | 90 to 110 ms | 31 to 34 | 752, 416, 0, 0 |
 
-  Throughput did not rise. With pipelining the queue drains faster than
+  Throughput did not rise, and the latency moved rather than went away:
+  create p50 rose from 0.5 to 1.1 s to 2.0 to 2.4 s as land p50 fell from
+  3 to 4.6 s to 1.2 s. With pipelining the queue drains faster than
   lands arrive (half-full batches, a land waits about 0.1 s for its batch)
   and each land answers in a third of the time, but the server's two cores
   were already saturated: the time agents no longer spend queued they
@@ -152,6 +162,30 @@ land they replayed, as before.
   closed 27 to 30 batches per run without pipelining and 1 to 18 with it.
   Warm-up refusals are gone: the remaining 503s came later, from the
   seconds bound under a busy host's slow batches.
+- Smaller batches cost more per land in the stores, measured over the
+  same runs (lands include the warm-up):
+
+  | per 1,000 lands | off | on |
+  |---|---|---|
+  | batches (metadata transactions: two each) | 16 to 17 (33) | 30 to 33 (61 to 65) |
+  | packs written (batches of fewer than 16 objects write loose) | 16 to 17 | 25 to 31 |
+  | pack bytes per land | 10.9 to 11.1 KiB | 10.8 to 11.1 KiB |
+  | pack write time | 0.40 to 0.60 s | 0.60 to 0.71 s |
+  | background repack runs / packs merged | 0.5 to 0.6 / 16 to 19 | 1.9 to 2.1 / 28 to 33 |
+  | objects the repack rewrote per land | 8.0 to 9.0 | 7.6 to 8.7 |
+  | background repack time | 0.23 to 0.47 s | 0.31 to 0.44 s |
+
+  Ref log rows are one per land either way, so a batch's single
+  `cas_ref_logged_chain` writes about half as many rows per statement.
+  Bytes stored and objects rewritten per land do not change; what doubles
+  is fixed per-batch cost: metadata transactions, pack files and their
+  fsyncs, about 0.2 ms per land of pack writing. The background repack
+  merges about four times as often (it runs once 32 packs exist) but
+  rewrites about as much per land, and took a similar 0.3 to 0.5 ms per
+  land. GC's mark and sweep are per changeset and object, not per pack,
+  and are unaffected; a collect reads more, smaller packs until the next
+  repack. Under full load pipelined batches would fill again and these
+  costs fall back to those of full batches.
 - A batch holds two stagings in memory while one commits and the next
   replays: about twice the bound ADR 0043 gave, a few tree nodes and a
   changeset per land.
