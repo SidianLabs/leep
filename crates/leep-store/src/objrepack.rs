@@ -609,16 +609,15 @@ impl ObjectBlobStore {
     /// Each searchable pack with its live object count, from the cached
     /// view (this process's pack writes are in it; other servers' appear at
     /// its next refresh): what [`plan_merge`](crate::plan_merge) plans from.
-    pub async fn pack_sizes(&self) -> Result<Vec<(String, u64)>> {
+    pub async fn pack_sizes(&self) -> Result<Vec<crate::PackSize>> {
         let view = self.packs.view().await?;
         Ok(view
             .searchable()
             .iter()
-            .map(|(p, dead)| {
-                (
-                    p.id.clone(),
-                    p.index.len().saturating_sub(dead.len()) as u64,
-                )
+            .map(|(p, dead)| crate::PackSize {
+                id: p.id.clone(),
+                objects: p.index.len().saturating_sub(dead.len()) as u64,
+                bytes: p.index.pack_len(),
             })
             .collect())
     }

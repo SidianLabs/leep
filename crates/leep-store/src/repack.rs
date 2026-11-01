@@ -128,6 +128,15 @@ impl std::fmt::Debug for RepackOptions {
     }
 }
 
+/// A searchable pack's live object count and its `.pack` size, for
+/// planning a merge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackSize {
+    pub id: String,
+    pub objects: u64,
+    pub bytes: u64,
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct RepackReport {
     pub loose_before: u64,
@@ -895,22 +904,20 @@ impl FsBlobStore {
         self.publish_blocking(hints.into(), opts)
     }
 
-    /// Each searchable pack with its live object count: what
+    /// Each searchable pack with its live object count and size: what
     /// [`plan_merge`](crate::plan_merge) plans from. Scans `packs/` first.
-    pub fn pack_sizes(&self) -> Result<Vec<(String, u64)>> {
+    pub fn pack_sizes(&self) -> Result<Vec<PackSize>> {
         let view = self.packs.refresh()?;
         Ok(view
             .searchable()
             .iter()
-            .map(|(p, dead)| {
-                (
-                    p.id.clone(),
-                    p.index.len().saturating_sub(dead.len()) as u64,
-                )
+            .map(|(p, dead)| PackSize {
+                id: p.id.clone(),
+                objects: p.index.len().saturating_sub(dead.len()) as u64,
+                bytes: p.index.pack_len(),
             })
             .collect())
     }
-
     /// Whether `hash` has a live copy in one of the packs `ids` names, for
     /// the walk that picks delta bases of a planned merge.
     pub fn packed_in(&self, ids: &HashSet<String>) -> Result<impl Fn(&Hash) -> bool + Send + Sync> {

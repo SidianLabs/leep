@@ -36,7 +36,9 @@ pub use packput::{
     PackWriteHook, PackWriteStep, PackWrites, DEFAULT_PACK_LEVEL, DEFAULT_PACK_MIN_OBJECTS,
 };
 pub use packwrite::plan_merge;
-pub use repack::{PublishedPack, RepackHook, RepackMode, RepackOptions, RepackReport, RepackStep};
+pub use repack::{
+    PackSize, PublishedPack, RepackHook, RepackMode, RepackOptions, RepackReport, RepackStep,
+};
 
 /// Run the calling thread at the lowest CPU priority (nice 19) from now
 /// on, for background work that must not slow requests down: the server's
