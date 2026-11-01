@@ -1,5 +1,5 @@
 # 0040. Packs in object stores
-Status: Accepted; amended by ADR 0068 (land batches write packs; a miss also lists `packs/` for new packs)
+Status: Accepted; amended by ADR 0068 (land batches write packs; a miss also lists `packs/` for new packs) and ADR 0070 (a miss lists `packs/` only when `packs/.gen` changed)
 Date: 2026-10-17
 
 ## Context

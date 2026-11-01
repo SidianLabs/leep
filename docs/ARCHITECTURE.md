@@ -1105,7 +1105,15 @@ issue #155). A restore copies the pool's own tombstones, if any. A read
 decodes the chain iteratively and checks the result against its hash. GC
 deletes a packed object by appending a tombstone; the next full repack leaves
 it out. A store reads a pack published by another process on its next miss
-(it rescans `packs/` before answering "absent"). An index (ADR 0038) keeps
+(ADR 0070): the view records stamps of `packs/` (inode, modification time)
+and of the tombstones file, taken before its scan, and a miss `stat`s both
+and rescans only if one changed, or if the view is unconfirmed (its
+directory time within 2 s of its scan, so a change in the same timestamp
+tick could hide; rescanned at most every 100 ms). Concurrent misses share
+a scan, and the tombstones file is read only when its stamp changed.
+`BlobStore::get_exact`, which tree reads and a changeset's content checks
+use after a miss, scans once more before answering "absent"; existence
+checks before an upload trust the stamps. An index (ADR 0038) keeps
 the hashes in a sorted column behind a 256-entry fanout table. Each hash then
 has a record whose field widths are chosen per pack, about 45 bytes per
 object in all. The store keeps index files in memory as they are on disk and
@@ -1137,9 +1145,12 @@ ObjectBlobStore.get(hash)
 With no directory to watch, a miss lists `packs/` and its tombstones again
 at most every 5 s, which is safe because a repack deletes loose copies only
 after a fence of minutes, and a read that finds its cached pack deleted
-lists at once. Since land batches publish packs (ADR 0068) a miss also lists
-`packs/` alone (one LIST shared by concurrent misses) and loads only new
-packs, so a land pack another server just published is read at once.
+lists at once. Since land batches publish packs (ADR 0068) a miss may also
+list `packs/` alone and load only new packs: every publisher rewrites
+`packs/.gen` after its index and before it returns (ADR 0070), and a miss
+HEADs that stamp (one HEAD per 50 ms per process) and lists only if its
+etag changed since the view's listing; a bucket without the stamp is listed
+on every miss, as before. `get_exact` lists once more after a miss.
 `contains` HEADs the copy's tombstone and the pack's index, so it is exact
 across processes as GC needs. Tombstones are one empty object each, so GC
 deletes never contend, and a lease object (`packs/repack.lease`, conditional
