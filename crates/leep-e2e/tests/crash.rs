@@ -698,9 +698,9 @@ fn crash_rounds(
                 // would have without the wait.
                 shared.pause.store(true, Ordering::Relaxed);
                 recover_planted(&tag, stores, addr, &planted);
-                shared.pause.store(false, Ordering::Relaxed);
                 planted.clear();
                 check_store(&format!("{tag}, after recovery"), stores, &shared, true);
+                shared.pause.store(false, Ordering::Relaxed);
             }
             if round % 3 == 2 {
                 // A fenced run beside live traffic, as an operator would.
@@ -943,6 +943,22 @@ fn lease_holder(meta_url: &str) -> Option<String> {
     })
 }
 
+/// [`lease_holder`], waiting up to `wait` for one: a leader whose queue
+/// emptied for a moment can let its lease lapse before the next land
+/// takes it again.
+fn lease_holder_within(meta_url: &str, wait: Duration) -> Option<String> {
+    let deadline = Instant::now() + wait;
+    loop {
+        if let Some(h) = lease_holder(meta_url) {
+            return Some(h);
+        }
+        if Instant::now() > deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// An HTTP agent that lands through server `n % count` and moves on to the
 /// next one whenever a request fails, like a client behind a balancer that
 /// takes a dead server out. Records when each of its lands was answered.
@@ -958,6 +974,7 @@ fn failover_agent(
     let mut k = 0;
     let mut at = n;
     while !shared.stop.load(Ordering::Relaxed) {
+        shared.hold();
         let steps: Vec<Step> = (0..1 + rng.below(2))
             .map(|_| {
                 k += 1;
@@ -1037,7 +1054,8 @@ fn killed_land_leader_is_replaced_postgres() {
         for round in 0..rounds {
             let tag = format!("coordinated seed {seed:#x} round {round}");
             std::thread::sleep(Duration::from_millis(800 + rng.below(700) as u64));
-            let holder = lease_holder(&db.url).unwrap_or_else(|| panic!("[{tag}] no lease"));
+            let holder = lease_holder_within(&db.url, 2 * LEASE_TTL)
+                .unwrap_or_else(|| panic!("[{tag}] no lease"));
             let i = ports
                 .iter()
                 .position(|p| holder == format!("http://127.0.0.1:{p}"))
@@ -1065,8 +1083,14 @@ fn killed_land_leader_is_replaced_postgres() {
             stalls.push(worst);
             let moved = lease_holder(&db.url).unwrap_or_default();
             assert_ne!(moved, holder, "[{tag}] the lease moved on");
+            // Agents pause for the check. Landing through it, they grew the
+            // store in proportion to the check's own length, and the next
+            // check (linear in the store) took longer again: on a slow
+            // runner the rounds never converged.
+            shared.pause.store(true, Ordering::Relaxed);
             check_store(&format!("{tag}, after SIGKILL"), &stores, &shared, true);
             servers[i] = start(ports[i]);
+            shared.pause.store(false, Ordering::Relaxed);
         }
         std::thread::sleep(Duration::from_millis(400));
         shared.stop.store(true, Ordering::Relaxed);
