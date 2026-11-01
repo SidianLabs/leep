@@ -80,7 +80,7 @@ mod tests;
 
 /// The comment lexer, public only so the fuzz harness can check it directly.
 #[doc(hidden)]
-pub use comments::strip_comments;
+pub use comments::{strip_comments, strip_comments_unchecked};
 pub use cursor::MAX_CURSOR_CHARS;
 pub use history::{ExtraMatch, LogFilter, LogPage, LogParams};
 pub use land::{

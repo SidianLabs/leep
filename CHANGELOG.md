@@ -127,7 +127,11 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   read differently from its input (Ruby ` =x` became an `=begin`-style
   block). The first line keeps its indentation, and a text whose stripped
   form does not lex back to itself is never comment-only. Changing only the
-  first line's indentation is no longer a comment-only edit. Fixes #217.
+  first line's indentation is no longer a comment-only edit. In C and C++
+  a backslash outside a literal that is not a line splice (and not at the
+  end of the file) makes the lexer give up, a backslash, blanks including
+  vertical tab or form feed, and a newline is a splice, and in Go any
+  `"C"` marks a possible cgo file. Fixes #217.
 
 ### Damaged history packs and skiplists are errors, not panics
 - **Fixed.** A `history-tree-v4` part whose id table names its own writer,

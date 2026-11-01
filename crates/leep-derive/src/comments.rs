@@ -425,8 +425,11 @@ impl Lexer<'_> {
         if !self.lang.splices || self.at(i) != Some('\\') {
             return false;
         }
+        // GCC skips every non-newline blank here, vertical tab and form
+        // feed included; missing those let normalization turn `\<VT>`,
+        // newline into a splice the next pass refuses (#217).
         let mut j = i + 1;
-        while matches!(self.at(j), Some(' ' | '\t')) {
+        while matches!(self.at(j), Some(' ' | '\t' | '\u{b}' | '\u{c}')) {
             j += 1;
         }
         matches!(self.at(j), Some('\n')) || self.starts(j, "\r\n")
@@ -732,6 +735,16 @@ impl Lexer<'_> {
             {
                 return None;
             }
+            // A backslash outside a literal that is not a splice is not C;
+            // removing a comment after it (`\//c`) would make it one (#217).
+            // One with only blanks after it ends the file either way.
+            if lang.splices
+                && c == '\\'
+                && !self.splice_at(i)
+                && !self.chars[i + 1..].iter().all(|c| is_ws(*c))
+            {
+                return None;
+            }
             // Ruby `=begin` and Perl POD blocks are comments the lexer does
             // not model; a quote inside one would desynchronize it.
             if (lang.ruby || lang.perl)
@@ -1007,18 +1020,30 @@ fn has_ascii_unicode_escape(text: &str) -> bool {
     })
 }
 
-/// Whether a Go file uses cgo, whose preamble comment is compiled as C.
+/// Whether a Go file may use cgo, whose preamble comment is compiled as C.
+/// Any `"C"` counts: the import may follow a comment on its line
+/// (`/* preamble */ import "C"`), and a line-based test missed it there,
+/// while stripping the comment then exposed it (#217).
 fn imports_c(text: &str) -> bool {
-    text.lines().any(|l| {
-        let t = l.trim();
-        t.starts_with("import \"C\"") || t == "\"C\""
-    })
+    text.contains("\"C\"")
 }
 
 /// `text` with comments removed and whitespace normalized, for language
 /// `ext` (file extension without the dot). `None` when the extension is not
 /// supported or the text is ambiguous.
 pub fn strip_comments(ext: &str, text: &str) -> Option<String> {
+    let out = strip_comments_unchecked(ext, text)?;
+    // The result must read as itself: a text whose comments and whitespace
+    // the lexer removed differently on a second pass is one it does not
+    // understand, and `comment_only` must not trust it (#217).
+    (strip_comments_unchecked(ext, &out).as_deref() == Some(out.as_str())).then_some(out)
+}
+
+/// [`strip_comments`] without its check that the result reads as itself:
+/// one pass of the lexer. For the fuzz target and tests, which assert the
+/// property on the lexer itself, where the check would hide a failure.
+#[doc(hidden)]
+pub fn strip_comments_unchecked(ext: &str, text: &str) -> Option<String> {
     let lang = language(&ext.to_ascii_lowercase())?;
     if text.contains('\0') {
         return None;
@@ -1034,11 +1059,7 @@ pub fn strip_comments(ext: &str, text: &str) -> Option<String> {
     if lang.cgo && imports_c(text) {
         return None;
     }
-    let out = lex(&lang, text)?;
-    // The result must read as itself: a text whose comments and whitespace
-    // the lexer removed differently on a second pass is one it does not
-    // understand, and `comment_only` must not trust it (#217).
-    (lex(&lang, &out).as_deref() == Some(out.as_str())).then_some(out)
+    lex(&lang, text)
 }
 
 fn lex(lang: &Lang, text: &str) -> Option<String> {
@@ -1597,9 +1618,33 @@ mod tests {
             include_bytes!("../../../fuzz/corpus/comment_lexer/regress-rb-first-line-indent");
         let text = String::from_utf8_lossy(&crash[1..]);
         let text = text.split('\0').next().unwrap();
-        if let Some(out) = strip_comments("rb", text) {
-            assert_eq!(strip_comments("rb", &out), Some(out));
+        if let Some(out) = strip_comments_unchecked("rb", text) {
+            assert_eq!(strip_comments_unchecked("rb", &out), Some(out));
         }
+    }
+
+    /// Inputs the property test found once it checked one pass of the
+    /// lexer instead of `strip_comments`, whose own check had hidden them:
+    /// each read differently once comments and blanks were gone (#217).
+    #[test]
+    fn stripping_never_creates_a_splice_or_a_cgo_import() {
+        for (ext, text) in [
+            // `\`, blanks with a vertical tab, newline: GCC splices it.
+            ("hpp", "x(\\  \u{b}\ny"),
+            // A comment between a backslash and the newline.
+            ("cpp", "x\\// c\ny"),
+            // `import "C"` after a comment on its line is cgo.
+            ("go", "/* c */import \"C\"\n"),
+        ] {
+            assert_eq!(strip_comments_unchecked(ext, text), None, "{ext}: {text:?}");
+        }
+        // A splice after a blank and a trailing backslash still read.
+        assert!(same(
+            "c",
+            "#define A 1 \\\n + 2 // c\n",
+            "#define A 1 \\\n + 2\n"
+        ));
+        assert!(strip_comments("c", "a \\\n").is_some());
     }
 
     /// Whatever the lexer returns reads as itself, for every language, on
@@ -1688,12 +1733,13 @@ mod tests {
         for _ in 0..iters {
             let ext = EXTS[rand(EXTS.len())];
             let text: String = (0..rand(24)).map(|_| PIECES[rand(PIECES.len())]).collect();
-            if let Some(out) = strip_comments(ext, &text) {
+            // On the lexer itself: `strip_comments`' own check would hide a
+            // failure by giving up.
+            if let Some(out) = strip_comments_unchecked(ext, &text) {
                 read += 1;
-                // The first pass of the check inside `strip_comments` is what
-                // this asserts; lex it here without the check too.
-                let again = lex(&language(ext).unwrap(), &out);
+                let again = strip_comments_unchecked(ext, &out);
                 assert_eq!(again.as_ref(), Some(&out), "{ext}: {text:?} -> {out:?}");
+                assert_eq!(strip_comments(ext, &text), Some(out));
             }
         }
         assert!(
