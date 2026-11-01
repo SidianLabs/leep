@@ -8,6 +8,7 @@
 pub mod auth;
 pub mod background_repack;
 pub mod backup;
+pub mod conn;
 pub mod coord;
 pub mod errors;
 pub mod fingerprint;
@@ -357,19 +358,14 @@ pub fn check_protected_refs(what: &str, refs: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// Serve `app` on `listener` until `shutdown` resolves.
+/// Serve `app` on `listener` until `shutdown` resolves, with the default
+/// [`conn::ServeOptions`]; see [`conn::serve_with`].
 pub async fn serve(
     listener: tokio::net::TcpListener,
     app: Router,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
-    // The peer address keys anonymous request limits (ADR 0020).
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown)
-    .await
+    conn::serve_with(listener, app, shutdown, conn::ServeOptions::default()).await
 }
 
 type S = State<Arc<Repo>>;

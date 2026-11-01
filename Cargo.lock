@@ -2589,6 +2589,8 @@ dependencies = [
  "hex",
  "http-body",
  "http-body-util",
+ "hyper",
+ "hyper-util",
  "jiff",
  "leep-core",
  "leep-derive",

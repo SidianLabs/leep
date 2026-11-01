@@ -151,6 +151,16 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   base, and a path whose answers differ is reported as a conflict. The
   review rules on merges (`merge-parent`, dropped side changes) check every
   base too. See ADR 0071. Fixes #160.
+### Connection timeouts
+- **Added.** The server bounds each connection: `--header-read-timeout`
+  (30 s; also closes idle HTTP/1.1 keep-alive connections),
+  `--idle-timeout` (2 min), `--body-idle-timeout` (60 s: a request body
+  that stalls fails, and a response the client stops reading is dropped
+  and its connection closed, which releases the read-class permit and the
+  token's concurrency slot it held) and `--max-connections` (10,000).
+  `leep_server::serve` now serves through `leep_server::conn::serve_with`
+  instead of `axum::serve`. Metric `leep_http_response_body_idle_total`.
+  See OPERATIONS.md, "Connections".
 
 ### Land batches write one pack
 - **Changed.** A land batch's new objects (tree nodes, merged contents)

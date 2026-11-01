@@ -111,6 +111,7 @@ measured until the response head is ready, not until the body is streamed.
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
 | `leep_http_requests_total` | counter | `method`, `route`, `status` | Requests handled. `route` is the matched template or `unmatched`; unknown methods are `other`. |
+| `leep_http_response_body_idle_total` | counter | | Responses dropped because the client read nothing of them for `--body-idle-timeout` ([Connections](#connections)). |
 | `leep_http_request_duration_seconds` | histogram | `method`, `route` | Time to produce the response head. |
 | `leep_land_total` | counter | `outcome` = `landed`, `conflicts`, `exhausted`, `error` | Land calls by result. `conflicts` is a normal reply that needs client action; `exhausted` means the CAS lost every retry (HTTP 409). `error` is every other failure, including refused lands (400: unsigned, unreviewed, bad ref) and unknown changesets (404), so it is not a server-health signal; count 5xx on `route="/v1/land"` for that. |
 | `leep_land_attempts` | histogram | none | CAS attempts of the batch a land was committed in (ADR 0032); above 1 means another writer of the ref won a race. |
@@ -343,6 +344,28 @@ behind expire within the TTL.
 
 A tier of dedicated landing servers (API servers that only forward, landers
 that only lead) is future work; today every coordinating server can lead.
+
+## Connections
+
+The server bounds each connection itself, so a client that opens a
+connection and sends nothing, sends a request slowly, or stops reading its
+answer does not hold the server's resources for long. All four are flags;
+`0` (or `off` for the cap) turns one off.
+
+| Flag | Variable | Default | Meaning |
+|---|---|---|---|
+| `--header-read-timeout` | `LEEP_HEADER_READ_TIMEOUT` | `30s` | Time to send a complete request head, counted from when the connection opens and, on HTTP/1.1, from the end of the previous request. A connection that misses it is closed without an answer, so it also closes HTTP/1.1 keep-alive connections idle that long. |
+| `--idle-timeout` | `LEEP_IDLE_TIMEOUT` | `2m` | A connection with no request in progress for this long is closed gracefully (HTTP/2 gets a `GOAWAY`). |
+| `--body-idle-timeout` | `LEEP_BODY_IDLE_TIMEOUT` | `60s` | A request body that delivers no bytes for this long fails the request. A response the client reads nothing of for this long is dropped and its connection closed, which releases the read-class permit and the token's concurrency slot the response held ([Expensive read limits](#expensive-read-limits), [Request limits](#request-limits)). |
+| `--max-connections` | `LEEP_MAX_CONNECTIONS` | `10000` | Connections served at once. Further connections wait in the kernel's listen backlog until one closes. Keep it under the process's open file limit. |
+
+`--request-timeout` bounds the time to the response head; a large response
+then streams for as long as the client keeps reading, and
+`--body-idle-timeout` bounds only the pauses. A proxy in front should keep
+its own idle timeouts at or below these, and its upstream keep-alive
+timeout below `--header-read-timeout`, so it does not send a request on a
+connection the server is closing. A response cut off by
+`--body-idle-timeout` counts in `leep_http_response_body_idle_total`.
 
 ## Request limits
 

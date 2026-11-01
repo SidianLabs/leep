@@ -111,6 +111,27 @@ struct Args {
     /// warns when the values it is given do not.
     #[arg(long, global = true, env = "LEEP_REQUEST_TIMEOUT", default_value = "5m", value_parser = parse_grace)]
     request_timeout: std::time::Duration,
+    /// Time a client has to send a complete request head, counted from when
+    /// its connection opens and, on HTTP/1.1, from the end of its previous
+    /// request, so it also closes keep-alive connections idle that long
+    /// (0, 10s, 30s); 0 turns it off.
+    #[arg(long, env = "LEEP_HEADER_READ_TIMEOUT", default_value = "30s", value_parser = parse_grace)]
+    header_read_timeout: std::time::Duration,
+    /// Close a connection that has had no request in progress for this long
+    /// (HTTP/2 gets a GOAWAY; HTTP/1.1 connections already close after
+    /// --header-read-timeout without a new request); 0 turns it off.
+    #[arg(long, env = "LEEP_IDLE_TIMEOUT", default_value = "2m", value_parser = parse_grace)]
+    idle_timeout: std::time::Duration,
+    /// Time a request body may deliver nothing, or a client may read nothing
+    /// of a response, before the request fails and its connection closes.
+    /// This releases what the request holds (a read-class permit, a token's
+    /// concurrency slot) when a client stops reading; 0 turns it off.
+    #[arg(long, env = "LEEP_BODY_IDLE_TIMEOUT", default_value = "60s", value_parser = parse_grace)]
+    body_idle_timeout: std::time::Duration,
+    /// Most connections served at once, or off; further connections wait in
+    /// the listen backlog until one closes.
+    #[arg(long, env = "LEEP_MAX_CONNECTIONS", default_value = "10000", value_parser = parse_count_or_off)]
+    max_connections: CountOrOff,
     /// Bound on each statement the server sends to a Postgres metadata store
     /// (its `statement_timeout`), so a query whose request was cut off by
     /// --request-timeout does not run on in the database (0, 30s, 5m). Lease
@@ -1949,6 +1970,7 @@ async fn run() -> anyhow::Result<()> {
         app = leep_server::coord::layer(app, http.clone());
     }
 
+    let serve_options = serve_options(&args);
     let listener = tokio::net::TcpListener::bind(args.listen)
         .await
         .with_context(|| format!("binding {}", args.listen))?;
@@ -1968,25 +1990,35 @@ async fn run() -> anyhow::Result<()> {
     // server takes the groups at once.
     let releasing = index_leases.clone();
     let Some((coordinator, http)) = coordination else {
-        leep_server::serve(listener, app, async move {
-            shutdown_signal().await;
-            if let Some(l) = releasing {
-                l.shutdown().await;
-            }
-        })
+        leep_server::conn::serve_with(
+            listener,
+            app,
+            async move {
+                shutdown_signal().await;
+                if let Some(l) = releasing {
+                    l.shutdown().await;
+                }
+            },
+            serve_options,
+        )
         .await?;
         return Ok(());
     };
     // Leases are given up as soon as shutdown starts, so another server
     // takes the refs at once; lands still in flight here are handed back.
     let stopping = coordinator.clone();
-    let server = tokio::spawn(leep_server::serve(listener, app, async move {
-        shutdown_signal().await;
-        stopping.shutdown().await;
-        if let Some(l) = releasing {
-            l.shutdown().await;
-        }
-    }));
+    let server = tokio::spawn(leep_server::conn::serve_with(
+        listener,
+        app,
+        async move {
+            shutdown_signal().await;
+            stopping.shutdown().await;
+            if let Some(l) = releasing {
+                l.shutdown().await;
+            }
+        },
+        serve_options,
+    ));
     let address = coordinator.config().address.clone();
     if let Err(e) = http.check_self(&address).await {
         coordinator.shutdown().await;
@@ -2121,6 +2153,20 @@ fn land_coordination(
     let coordinator = leep_derive::land_coord::LandCoordinator::new(meta, cfg);
     let http = leep_server::coord::Coordination::new(policy, holder)?;
     Ok((coordinator, http))
+}
+
+/// The connection bounds of the flags; 0 or `off` turns one off.
+fn serve_options(args: &Args) -> leep_server::conn::ServeOptions {
+    let on = |d: std::time::Duration| (!d.is_zero()).then_some(d);
+    leep_server::conn::ServeOptions {
+        header_read_timeout: on(args.header_read_timeout),
+        idle_timeout: on(args.idle_timeout),
+        body_idle_timeout: on(args.body_idle_timeout),
+        max_connections: match args.max_connections {
+            CountOrOff::Off => None,
+            CountOrOff::Count(n) => Some(n),
+        },
+    }
 }
 
 /// Without tokens anyone who reaches the server can read and rewrite every

@@ -1419,7 +1419,14 @@ unless the request's config has limits. For a principal with limits it checks th
 size, takes a token from the read or write bucket, and `try_acquire`s a
 concurrency permit, refusing with 413 or 429 (never queueing). The permit
 lives in a guard attached to the response body, so it is released when the body
-ends, the client goes away or the timeout drops the request. Token names bound
+ends, the client goes away or the timeout drops the request.
+Connections are served by `leep_server::conn` on hyper's builders with a timer,
+not `axum::serve`: a header-read timeout (also the HTTP/1.1 keep-alive idle
+bound), an idle timeout, a cap on open connections, and a body idle timeout.
+That last one fails a request body that stalls, closes a socket whose writes
+stall, and has a watchdog drop a large response the client stops reading
+(an HTTP/2 stream can stall without the socket stalling), so a guard riding
+in a response body is released within that bound. Token names bound
 the state; in anonymous mode state is keyed by client address in a size-capped
 table. State is per process.
 Built for search ([ADR 0060](adr/0060-land-admission-and-read-limits.md),
