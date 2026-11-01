@@ -34,7 +34,8 @@ struct Deferred {
     /// `put_many` of at least this many blobs writes them as a "pack":
     /// durable when it returns, and said so (ADR 0068). 0: never.
     pack_min: usize,
-    /// Hashes `put_many` packed, and hashes flushes were asked to sync.
+    /// Hashes `put_many` packed, and those of them flushes were asked to
+    /// sync after they were packed.
     packed: Mutex<HashSet<Hash>>,
     flushed: Mutex<HashSet<Hash>>,
 }
@@ -111,7 +112,15 @@ impl BlobStore for Deferred {
     /// request's flush, or on a blanket one, is caught.
     async fn flush_blobs(&self, hashes: &[Hash]) -> Result<()> {
         *self.flushes.lock().unwrap() += 1;
-        self.flushed.lock().unwrap().extend(hashes.iter().copied());
+        {
+            // Only flushes of blobs already packed: a create may flush the
+            // same tree node before a land batch packs it.
+            let packed = self.packed.lock().unwrap();
+            self.flushed
+                .lock()
+                .unwrap()
+                .extend(hashes.iter().filter(|h| packed.contains(*h)).copied());
+        }
         let named: HashSet<Hash> = hashes.iter().copied().collect();
         self.unsynced.lock().unwrap().retain(|h| !named.contains(h));
         self.elsewhere
@@ -451,13 +460,12 @@ async fn batched_lands_through_packs_store_nothing_unsynced_and_skip_packed_flus
     let packed = blobs.packed.lock().unwrap().clone();
     assert!(!packed.is_empty(), "batches went into packs");
     let flushed = blobs.flushed.lock().unwrap();
-    let both: Vec<_> = packed.iter().filter(|h| flushed.contains(*h)).collect();
-    // A node packed by one batch may be written again (and flushed) by a
-    // later lone write; most are never flushed.
+    // A node packed by one batch may be written again by a later batch too
+    // small to pack, and flushed then; most never are.
     assert!(
-        both.len() * 4 < packed.len(),
-        "{} of {} packed blobs flushed",
-        both.len(),
+        flushed.len() * 4 < packed.len(),
+        "{} of {} packed blobs flushed after being packed",
+        flushed.len(),
         packed.len()
     );
 }

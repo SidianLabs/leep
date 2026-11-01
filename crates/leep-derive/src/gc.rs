@@ -27,6 +27,11 @@ use crate::Repo;
 /// Page size for changeset and blob listings.
 const PAGE: usize = 1000;
 
+/// Blob writes in flight in [`Repo::put_rescuing_many_loose`]. Each is
+/// independent and content addressed, so order does not matter, and a store
+/// that syncs every write gets them done together.
+const LOOSE_WRITES_IN_FLIGHT: usize = 4;
+
 /// Fence reads in flight in [`Repo::missing_blobs`], for the hashes that
 /// have a condemnation row (or all of them, if the batched read failed).
 const FENCES_IN_FLIGHT: usize = 64;
@@ -334,12 +339,43 @@ impl Repo {
         items: Vec<(Hash, Bytes)>,
         named: &[Hash],
     ) -> Result<()> {
-        let packed: HashSet<Hash> = self
-            .blobs()
-            .put_many(items.clone())
-            .await?
-            .into_iter()
-            .collect();
+        self.put_rescuing(items, named, true).await
+    }
+
+    /// [`Repo::put_rescuing_many`] writing each blob on its own (loose on
+    /// stores that pack batches): a create's few tree nodes, which as packs
+    /// would make a pack per create, each for the background repack to
+    /// merge again (ADR 0068).
+    pub(crate) async fn put_rescuing_many_loose(
+        &self,
+        items: Vec<(Hash, Bytes)>,
+        named: &[Hash],
+    ) -> Result<()> {
+        self.put_rescuing(items, named, false).await
+    }
+
+    async fn put_rescuing(
+        &self,
+        items: Vec<(Hash, Bytes)>,
+        named: &[Hash],
+        pack: bool,
+    ) -> Result<()> {
+        let packed: HashSet<Hash> = if pack {
+            self.blobs()
+                .put_many(items.clone())
+                .await?
+                .into_iter()
+                .collect()
+        } else {
+            for chunk in items.chunks(LOOSE_WRITES_IN_FLIGHT) {
+                let writes: Vec<_> = chunk
+                    .iter()
+                    .map(|(h, d)| self.blobs().put_with_hash(*h, d.clone()))
+                    .collect();
+                try_join_all(writes).await?;
+            }
+            HashSet::new()
+        };
         let hashes: Vec<Hash> = items.iter().map(|(h, _)| *h).collect();
         let mut to_flush: Vec<Hash> = hashes
             .iter()
