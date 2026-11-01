@@ -2716,3 +2716,32 @@ async fn write_bodies_declare_their_type_and_open_servers_take_only_local_reques
         .await;
     assert_eq!(r.status, StatusCode::OK);
 }
+
+/// A 500 carries a generic message and the request id; the store's own
+/// error text stays in the server log.
+#[tokio::test]
+async fn internal_errors_do_not_echo_store_errors() {
+    use leep_testkit::{Fault, FaultPlan, FaultyBlobStore, Op};
+    let plan = FaultPlan::new(7);
+    let blobs = FaultyBlobStore::new(Arc::new(MemoryBlobStore::new()), plan.clone());
+    let c = Client(leep_server::router(Repo::new(
+        Arc::new(blobs),
+        Arc::new(MemoryMetaStore::new()),
+    )));
+    plan.rate(&[Op::Get], 1000, Fault::Fail);
+    let r = c
+        .send(
+            Request::builder()
+                .uri(format!("/v1/blobs/{}", Hash::of_blob(b"x")))
+                .header(REQUEST_ID_HEADER, "req-500")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::INTERNAL_SERVER_ERROR);
+    let e = r.json::<ErrorResponse>();
+    assert_eq!(e.error, leep_server::INTERNAL_ERROR_MESSAGE);
+    assert_eq!(e.code.as_deref(), Some("internal"));
+    assert_eq!(e.request_id.as_deref(), Some("req-500"));
+    assert!(!String::from_utf8_lossy(&r.body).contains("storage"));
+}

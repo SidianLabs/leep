@@ -94,6 +94,9 @@ the id.
 Headers are never logged, so `Authorization` values cannot appear. The
 authentication span (DEBUG) records the token's name, never its value.
 Server-side failures additionally log an ERROR line with the error text.
+A 500 answers the client with a generic message and its `request_id`, never
+that text (a database or object store message can name hosts, buckets or
+paths): look the id up in the log.
 
 ## Metrics
 
@@ -102,7 +105,11 @@ Metrics are off by default. Start the server with `--metrics-listen <ADDR>`
 `GET /metrics` (Prometheus text format). The listener is separate from the
 API port, needs no token and serves nothing else, so bind it to a private
 interface or network and never publish it through the API's reverse proxy.
-The address is logged at startup.
+Its labels include token names (the `token` label of
+`leep_requests_limited_total`, `leep_requests_in_flight` and
+`leep_token_expired_requests_total`), which tell a reader who uses the
+server. The address is logged at startup, with a warning when it is not a
+loopback address.
 
 Instrumentation uses the `metrics` facade, which does nothing unless a
 recorder is installed; only the server binary installs one. HTTP latency is
@@ -277,7 +284,7 @@ leep-server --meta postgres://... --blobs ... --listen 0.0.0.0:7070 \
 |---|---|---|
 | `--land-coordination on\|off` | `LEEP_LAND_COORDINATION` | Default `off`. Needs Postgres or SQLite, `--advertise-url` and an allow-list. |
 | `--advertise-url URL` | `LEEP_ADVERTISE_URL` | Where other servers reach this one directly, not through the balancer. Checked at startup: the server fetches `URL/v1/health` and refuses to start unless the answer comes from itself. |
-| `--peer-url-prefix P` | `LEEP_PEER_URL_PREFIX` | Repeatable (comma-separated in the variable). A land, with its client's token, is forwarded only to a lease address that starts with one of these, compared as raw text: write the scheme, host, port and the trailing slash, `https://leep-1.internal:7070/`, never `https://leep-` (which also matches `https://leep-evil.example`). |
+| `--peer-url-prefix P` | `LEEP_PEER_URL_PREFIX` | Repeatable (comma-separated in the variable). A land, with its client's token, is forwarded only to a lease address on one of these origins: write the scheme, the whole host, the port and a trailing slash, `https://leep-1.internal:7070/`. The address is compared parsed, so its scheme, host and port must equal the prefix's (a missing port is the scheme's default) and its path must start with the prefix's path. A host followed by a colon and no port, `http://10.0.3.7:`, allows every port of that host. A partial host such as `http://10.0.3.` is refused at startup; use `--peer-cidr` for a network. |
 | `--peer-cidr NET` | `LEEP_PEER_CIDR` | ...or whose host is an IP address in one of these networks. Requests from these networks (and from the IP hosts of the prefixes) are recognised as peers. |
 | `--peer-allow-plain-http` | `LEEP_PEER_ALLOW_PLAIN_HTTP` | Allow `http://` to a host that is not a loopback or private IP address. Without it such a peer needs `https://`. |
 | `--land-lease-ttl` | `LEEP_LAND_LEASE_TTL` | Default `2s`. Another server takes over a lease not renewed for this long; the holder itself stops trusting it one renew interval earlier (1.5 s by default). |

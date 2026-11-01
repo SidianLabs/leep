@@ -262,10 +262,12 @@ struct Args {
     /// balancer), e.g. `http://10.0.3.7:7070`. Checked at startup.
     #[arg(long, env = "LEEP_ADVERTISE_URL")]
     advertise_url: Option<String>,
-    /// Servers' URLs start with this; lands, with their client's token, are
-    /// forwarded only to an address that starts with one of these or whose
-    /// IP address is in a --peer-cidr. Repeatable; the environment variable
-    /// takes a comma-separated list.
+    /// Servers' origins, e.g. `https://leep-1.internal:7070/`; lands, with
+    /// their client's token, are forwarded only to an address on one of
+    /// these (scheme, host and port equal, path under the prefix's; `host:`
+    /// with no port allows any port) or whose IP address is in a
+    /// --peer-cidr. Repeatable; the environment variable takes a
+    /// comma-separated list.
     #[arg(long, env = "LEEP_PEER_URL_PREFIX", value_delimiter = ',')]
     peer_url_prefix: Vec<String>,
     /// Networks the servers are in, e.g. `10.0.0.0/16`. Requests from these
@@ -1757,6 +1759,9 @@ async fn run() -> anyhow::Result<()> {
         args.tokens_file.is_some(),
         args.insecure_no_auth,
     )?;
+    if let Some(addr) = args.metrics_listen {
+        warn_open_metrics(addr);
+    }
     let metrics_app = args.metrics_listen.map(|_| install_metrics()).transpose()?;
     let read_concurrency = leep_server::read_limits::ReadConcurrency::parse(&args.read_concurrency)
         .map_err(anyhow::Error::msg)?;
@@ -2162,6 +2167,18 @@ fn land_coordination(
     let coordinator = leep_derive::land_coord::LandCoordinator::new(meta, cfg);
     let http = leep_server::coord::Coordination::new(policy, holder)?;
     Ok((coordinator, http))
+}
+
+/// The metrics listener has no authentication and its labels name tokens
+/// and routes, so a non-loopback address is worth a word at startup.
+fn warn_open_metrics(addr: SocketAddr) {
+    if !addr.ip().is_loopback() {
+        tracing::warn!(
+            %addr,
+            "the metrics listener is on a non-loopback address; it needs no token \
+             and its labels include token names, so keep the address on a private network"
+        );
+    }
 }
 
 /// The connection bounds of the flags; 0 or `off` turns one off.

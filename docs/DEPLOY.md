@@ -622,7 +622,7 @@ from Windows, as git does with `core.filemode=false`.
 | `LEEP_BODY_IDLE_TIMEOUT` | `60s` | A request body that delivers nothing, or a response the client reads nothing of, for this long fails and its connection closes, freeing the permits the request holds; `0` turns it off. |
 | `LEEP_MAX_CONNECTIONS` | `10000` | Most connections served at once, or `off`; further ones wait in the listen backlog. |
 | `LEEP_READY_TIMEOUT` | `2s` | Bound on each store check behind `GET /v1/ready` (`500ms`, `2s`; not zero). See [Probes](#probes). |
-| `LEEP_METRICS_LISTEN` | off | Address for a separate, unauthenticated `GET /metrics` listener; keep it private. See [OPERATIONS.md](OPERATIONS.md). |
+| `LEEP_METRICS_LISTEN` | off | Address for a separate, unauthenticated `GET /metrics` listener; keep it private: its labels include token names, and the server warns at startup when the address is not loopback. See [OPERATIONS.md](OPERATIONS.md#metrics). |
 | `LEEP_LOG_FORMAT` | `text` | `text` or `json` (one object per line). |
 | `RUST_LOG` | `info` | Log filter. |
 

@@ -59,7 +59,8 @@
 //! `Error::Invalid` → 400, `Error::NotFound` → 404, CAS loss and
 //! `Error::Conflict` (e.g. a land that kept losing to concurrent lands) →
 //! 409, `Error::Indexing` → 503 with `Retry-After` and [`IndexingInfo`]
-//! (ADR 0058), anything else → 500.
+//! (ADR 0058), anything else → 500, whose `error` is a generic message:
+//! the detail is in the server log under the response's `request_id`.
 //!
 //! # Error codes
 //!

@@ -151,6 +151,20 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   base, and a path whose answers differ is reported as a conflict. The
   review rules on merges (`merge-parent`, dropped side changes) check every
   base too. See ADR 0071. Fixes #160.
+### Server errors, metrics listener and peer prefixes
+- **Changed.** A 500 answers with a generic `error` and the
+  `request_id`; the underlying error text (from the metadata or blob
+  store, for example) is logged under that id and no longer sent to the
+  client. `code` is unchanged (`internal`).
+- **Changed.** `--metrics-listen` on a non-loopback address logs a
+  warning at startup: the listener needs no token and its labels include
+  token names.
+- **Changed.** `--peer-url-prefix` is compared as a parsed origin
+  (scheme, host and port equal, then a path prefix) instead of raw text;
+  `http://host:` with no port allows every port of that host, and a
+  partial host such as `http://10.0.3.` is refused at startup. The
+  example in `deploy/leep-server.env.example` is now a full origin.
+
 ### Request bodies declare their type; open servers take only local requests
 - **Changed.** `POST` bodies must be sent with `Content-Type:
   application/json` and blob uploads (`PUT`) with

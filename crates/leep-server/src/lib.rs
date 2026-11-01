@@ -398,6 +398,11 @@ fn with_scanned(mut resp: Response, scanned: u64) -> Response {
     resp
 }
 
+/// The `error` of every 500 the handlers answer; `request_id` beside it
+/// finds the detail in the server log.
+pub const INTERNAL_ERROR_MESSAGE: &str =
+    "internal server error; the server log has the details under this request_id";
+
 /// The single place `leep_core::Error` becomes an HTTP status.
 #[derive(Debug)]
 pub struct ApiError(Error);
@@ -473,7 +478,13 @@ impl IntoResponse for ApiError {
             return resp;
         }
         if status.is_server_error() {
+            // The detail (a database or object store message, a path) stays
+            // in the log, where the request span names the request id; the
+            // client gets that id with a generic message.
             tracing::error!(error = %self.0, "request failed");
+            let body = ErrorResponse::new(INTERNAL_ERROR_MESSAGE.to_string())
+                .with_code(errors::code_of(&self.0));
+            return (status, Json(body)).into_response();
         }
         let mut body = ErrorResponse::new(self.0.to_string()).with_code(errors::code_of(&self.0));
         if let Error::LandIdReused { refusal, .. } = self.0 {
