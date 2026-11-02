@@ -2206,6 +2206,12 @@ restores a missing or damaged one. The search kinds (`blob-trigrams-v1`,
 `tree-trigrams-v1`) are rewritten for the rows that exist; use
 `derive-search REV` to build rows that do not.
 
+A running server keeps decoded skiplists and search directory filters in
+memory once read. A correct row never changes, so the copies never go
+stale, but one that was damaged when a server read it stays cached there:
+after `rederive --kind skiplist` (or `all`) has written rows it found
+wrong, restart the servers that were running.
+
 `rederive` exits `1` for a real run when a row could not be recomputed or a
 changeset in scope could not be read (reported as `rederive_failed`, counted
 in `unreadable_changesets` in the JSON report), and `0` only when neither
