@@ -26,6 +26,8 @@ call M1 to M3 "v0.1" to "v0.3".
   made once the [1.0 criteria](#10-criteria) are met.
 
 ## M1: Core loop
+**Closed 2026-11-02** by the maintainer: every item done.
+
 - [x] Core data model, storage traits, API types (`leep-core`)
 - [x] Blob backends: filesystem, S3/MinIO, LRU cache (`leep-store`)
 - [x] Metadata backends: SQLite, Postgres (`leep-meta`)
@@ -36,6 +38,8 @@ call M1 to M3 "v0.1" to "v0.3".
 - [x] End-to-end test: import a git repo, run 50 concurrent agent lands, export back to git
 
 ## M2: Operable
+**Closed 2026-11-02** by the maintainer: every item done.
+
 - [x] Token auth (static bearer tokens, read/write roles; ADR 0007)
 - [x] Structured logs (`--log-format json`, one line per request)
 - [x] Prometheus metrics (cache hit rates, land retries, derive latency; `--metrics-listen`)
@@ -44,6 +48,8 @@ call M1 to M3 "v0.1" to "v0.3".
 - [x] Benchmarks: commit and land latency versus repository size (`docs/PERFORMANCE.md`)
 
 ## M3: Agent-native
+**Closed 2026-11-02** by the maintainer: every item done.
+
 - [x] Fenced two-phase blob GC that closes the last claim/delete race (ADR 0012)
 - [x] Provenance: `leep log --agent`, and queries over `agent.*` metadata (`leep provenance`, `leep blame --who`)
 - [x] Signed changesets (author keys; Ed25519 attestations, `--require-signatures` land policy; ADR 0010)
@@ -51,6 +57,11 @@ call M1 to M3 "v0.1" to "v0.3".
 - [x] MCP server exposing Leep operations to agents (`leep-mcp`; ADR 0009)
 
 ## M4: History and search
+**Closed 2026-11-02** by the maintainer: every item done, and the exit
+criterion holds well past 100k changesets: all of Linux (1,484,762 commits)
+derived the path-history, log-filter and search indexes without operator
+action (`docs/PERFORMANCE.md`, "All of Linux" and "Path history on Linux").
+
 - [x] Path-history index as derived data (`history-tree-v1`, `leep last-change`; ADR 0013)
 - [x] Server-side code search as derived data (`leep search`; ADR 0014)
 
