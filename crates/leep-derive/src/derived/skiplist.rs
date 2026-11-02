@@ -200,4 +200,26 @@ mod tests {
         assert!(matches!(err, Error::Storage(_)), "{err}");
         assert!(cache.get(&id).is_none(), "the row is not cached");
     }
+
+    /// A list kept by a query (see `SkipReadCache`), without a read.
+    pub(crate) fn cached_skips(&self, id: ChangesetId) -> Option<Arc<[SkipEntry]>> {
+        self.skip_reads.get(&id.0).map(|s| (*s).clone())
+    }
+
+    /// Keep `list`, the skiplist of `id` as read or derived, for later
+    /// queries.
+    pub(crate) fn cache_skips(&self, id: ChangesetId, list: Arc<[SkipEntry]>) {
+        let n = 40 * list.len();
+        self.skip_reads.insert(id.0, Arc::new(list), n);
+    }
+
+    /// [`Repo::skiplist`] for a query, kept for the next ones.
+    pub(crate) async fn query_skiplist(&self, id: ChangesetId) -> Result<Arc<[SkipEntry]>> {
+        if let Some(l) = self.cached_skips(id) {
+            return Ok(l);
+        }
+        let l = self.skiplist(id).await?;
+        self.cache_skips(id, l.clone());
+        Ok(l)
+    }
 }

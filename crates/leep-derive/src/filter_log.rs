@@ -350,14 +350,7 @@ impl Repo {
             if x == ancestor {
                 return Ok(true);
             }
-            let sk = match self.cached_skips(x) {
-                Some(sk) => sk,
-                None => {
-                    let sk = self.skiplist(x).await?;
-                    self.cache_skips(x, sk.clone());
-                    sk
-                }
-            };
+            let sk = self.query_skiplist(x).await?;
             match sk.iter().rev().find(|e| e.generation >= target) {
                 Some(e) => x = e.id,
                 None => return Ok(false),

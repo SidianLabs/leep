@@ -404,9 +404,9 @@ impl Repo {
     ///
     /// Cutting costs a few reads per stretch, wasted on a file changed only
     /// a few times or with a cached blame near `id`. So the first
-    /// `cuts.head` steps are walked from `id` while the cuts are planned,
-    /// and the stretches are walked only below where those steps stop, if
-    /// the walk did not end there.
+    /// `cuts.head` steps are walked from `id` first, and the cuts are
+    /// planned and the stretches walked only below where those steps stop,
+    /// if the walk did not end there.
     ///
     /// A changer in `stop_at` ends the walk as a cached blame does: another
     /// walk of the same blame already has the history below it.
@@ -444,18 +444,13 @@ impl Repo {
                 known: stop_at.clone(),
             },
         );
-        let plan = self.plan_stretches(id, tip_gen, cuts.min_span);
-        let (head, plan) = match futures_util::future::select(Box::pin(head), Box::pin(plan)).await
-        {
-            futures_util::future::Either::Left((head, plan)) => {
-                let head = head?;
-                if head.resume.is_none() {
-                    (head, None)
-                } else {
-                    (head, Some(plan.await?))
-                }
-            }
-            futures_util::future::Either::Right((plan, head)) => (head.await?, Some(plan?)),
+        // Cuts are planned only once the head walk is known not to end the
+        // blame: most blames end within it, and a blame is bound by the
+        // CPU its queries cost rather than by their latency.
+        let head = head.await?;
+        let plan = match head.resume {
+            Some(_) => Some(self.plan_stretches(id, tip_gen, cuts.min_span).await?),
+            None => None,
         };
         let mut found = Found {
             chain: Vec::new(),
@@ -560,18 +555,39 @@ impl Repo {
             if want.is_empty() {
                 break;
             }
-            let keys: Vec<Hash> = want.iter().map(|c| c.0).collect();
-            let found = self.meta().get_derived_many(Skiplist::NAME, &keys).await?;
-            for (i, c) in want.into_iter().enumerate() {
-                let list = match found.get(i).cloned().flatten() {
-                    Some(v) => Skiplist::decode_of(c, &v)?,
-                    None => Skiplist::decode_of(c, &derived::derive::<Skiplist>(self, c).await?)?,
+            // Lists kept by earlier blames need no read.
+            let (kept, read): (Vec<_>, Vec<_>) = want
+                .into_iter()
+                .map(|c| (c, self.cached_skips(c)))
+                .partition(|(_, l)| l.is_some());
+            let found = match read.is_empty() {
+                true => Vec::new(),
+                false => {
+                    let keys: Vec<Hash> = read.iter().map(|(c, _)| c.0).collect();
+                    self.meta().get_derived_many(Skiplist::NAME, &keys).await?
+                }
+            };
+            let mut got: Vec<(ChangesetId, Arc<[SkipEntry]>)> = kept
+                .into_iter()
+                .map(|(c, l)| (c, l.expect("kept")))
+                .collect();
+            for (i, (c, _)) in read.into_iter().enumerate() {
+                let list: Arc<[SkipEntry]> = match found.get(i).cloned().flatten() {
+                    Some(v) => {
+                        let l: Arc<[SkipEntry]> = Skiplist::decode_of(c, &v)?.into();
+                        self.cache_skips(c, l.clone());
+                        l
+                    }
+                    None => self.query_skiplist(c).await?,
                 };
-                for e in &list {
+                got.push((c, list));
+            }
+            for (c, list) in got {
+                for e in list.iter() {
                     known.insert(e.generation, e.id);
                     self.remember_generation(e.id, e.generation);
                 }
-                lists.insert(c, Arc::new(list));
+                lists.insert(c, list);
             }
         }
         // Keep a point as a cut once it is far enough below the last cut:
@@ -712,12 +728,22 @@ impl Repo {
         let (resp, complete) = self.replay_graph(graph, path).await?;
         let resp = match resp {
             Replayed::Cached(blame) => {
+                // The cached blame of the file's newest changer, which is
+                // this one's: kept at `id` too, so the next blame here is
+                // one read instead of a walk down to that changer. A walk
+                // stores the same encoding at both.
+                if cache {
+                    let value = Bytes::from(postcard::to_stdvec(&blame)?);
+                    self.meta()
+                        .put_derived(KIND, &cache_key(id, path), value)
+                        .await?;
+                }
                 return Ok(BlameRun {
                     blame,
                     examined,
                     walks,
                     complete,
-                })
+                });
             }
             Replayed::Fresh(resp) => resp,
         };
@@ -1028,7 +1054,7 @@ enum Skip {
 }
 
 /// Skiplists read, by changeset.
-type SkipLists = HashMap<ChangesetId, Arc<Vec<SkipEntry>>>;
+type SkipLists = HashMap<ChangesetId, Arc<[SkipEntry]>>;
 
 impl Changers {
     fn found(self, examined: usize) -> Found {
@@ -1108,16 +1134,18 @@ struct FirstParents {
 impl FirstParents {
     async fn list(&mut self, repo: &Repo, id: ChangesetId) -> Result<&[SkipEntry]> {
         if !self.lists.contains_key(&id) {
-            let list = Skiplist::decode_of(id, &derived::derive::<Skiplist>(repo, id).await?)?;
-            for e in &list {
+            // Kept across requests: blames of one repository step down the
+            // same main chain.
+            let list = repo.query_skiplist(id).await?;
+            for e in list.iter() {
                 self.known.insert(e.generation, e.id);
                 // A changer is often on this chain; its generation then
                 // needs no read of its own.
                 repo.remember_generation(e.id, e.generation);
             }
-            self.lists.insert(id, Arc::new(list));
+            self.lists.insert(id, list);
         }
-        Ok(&self.lists[&id])
+        Ok(&self.lists[&id][..])
     }
 
     /// The first parent of `id`, a changeset of this chain.

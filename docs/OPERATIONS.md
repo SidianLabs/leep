@@ -1485,7 +1485,7 @@ apply to the server and to its tools (`verify`, `repair`, `upgrade-index`,
 | `--meta-pool-size` / `LEEP_META_POOL_SIZE` | 16 | Connections this process opens to a Postgres metadata store for requests, derivation and tools. SQLite ignores it. |
 | `--meta-land-pool-size` / `LEEP_META_LAND_POOL_SIZE` | an eighth of `--meta-pool-size`, at least 4 | Further Postgres connections reserved for land leaders (ADR 0067), opened on first use. `0` reserves none. SQLite ignores it. |
 | `--meta-index-pool-size` / `LEEP_META_INDEX_POOL_SIZE` | a sixteenth of `--meta-pool-size`, at least 4 | Further Postgres connections reserved for the index warmer (ADR 0073), opened on first use (only by a server that warms). `0` reserves none. SQLite ignores it. |
-| `--derive-cache-bytes` / `LEEP_DERIVE_CACHE_BYTES` | 440401920 (420 MiB) | The in-memory caches of derived indexes: path-history nodes, parts and roots (148 MiB), tree nodes (32 MiB), nodes of unstored trees derived on read (16 MiB, ADR 0069), search's directory filters (64 MiB), and the filtered-log caches (160 MiB). The ancestry and skiplist caches are bounded by entries, about 100 MB together by default, and scale by the same factor. |
+| `--derive-cache-bytes` / `LEEP_DERIVE_CACHE_BYTES` | 440401920 (420 MiB) | The in-memory caches of derived indexes: path-history nodes, parts and roots (148 MiB), tree nodes (32 MiB), nodes of unstored trees derived on read (16 MiB, ADR 0069), search's directory filters (64 MiB), skiplists read by blame and filtered logs (32 MiB), and the filtered-log caches (128 MiB). The ancestry and skiplist caches are bounded by entries, about 100 MB together by default, and scale by the same factor. |
 
 `--cache-bytes` (256 MiB) is separate: it caches blobs.
 

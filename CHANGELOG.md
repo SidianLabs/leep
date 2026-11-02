@@ -7,6 +7,22 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 ## [Unreleased]
 
+### Blame reads less metadata
+- **Changed.** Skiplists read by blame and filtered logs are kept in one
+  process-wide cache of 32 MiB of the derive cache budget
+  (`--derive-cache-bytes`; it was the filtered log's own, which shrinks
+  to 128 MiB, so the total is unchanged). Blame read the same main-chain
+  skiplists one row at a time on every request.
+- **Changed.** A blame at a head whose answer is the cached blame of the
+  file's newest changer is stored at the head too, so the next blame there
+  is one lookup instead of a walk down to that changer.
+- **Changed.** Blame plans the stretches of a long walk only once the first
+  32 steps from the head have not finished it, instead of alongside them.
+- On a 4,100-changeset linear history with files of 6 to 25 versions,
+  metadata calls per blame in a warm process fell from 119 to 95 for a
+  file's first blame, from 78 to 9 at a head 40 lands later, and from 68 to
+  2 for a repeated blame there.
+
 ### Blame and filtered logs are limited by default
 - **Changed.** `--read-concurrency` now limits the `blame` class
   (`GET /v1/blame`), default one per core and at least 2, and the
