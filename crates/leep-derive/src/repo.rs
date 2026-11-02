@@ -93,6 +93,11 @@ pub struct Repo {
     pub(crate) land_conflicts: Arc<crate::LandConflicts>,
     /// Parents and generations of changesets seen by history walks.
     pub(crate) ancestry: Arc<AncestryCache>,
+    /// Whether [`Repo::root_tree`] answers from, and fills, the roots in
+    /// `ancestry`. Off for verification and repair, which replace damaged
+    /// rows as they go: a damaged root read before its replacement must not
+    /// answer the reads after it.
+    root_cache: bool,
     /// Decoded path-history nodes, keyed by `NodeRef::cache_key` (see
     /// `read_history_row`).
     pub(crate) history_rows: Arc<HistoryRowCache>,
@@ -177,10 +182,11 @@ pub(crate) trait WriteGuard: Send + Sync {
 
 type DeriveLock = Arc<tokio::sync::Mutex<()>>;
 
-/// Parents and generation of changesets, kept in memory because history
-/// walks (`is_ancestor`, `merge_base`) visit thousands of changesets and would
-/// otherwise make a metadata round trip, and decode a whole changeset, per
-/// step. Both are immutable, so entries never go stale. Bounded: entries live
+/// Parents, generation and root tree of changesets, kept in memory because
+/// history walks (`is_ancestor`, `merge_base`) visit thousands of changesets
+/// and would otherwise make a metadata round trip, and decode a whole
+/// changeset, per step, and every read of a tree starts from its root. All
+/// are immutable, so entries never go stale. Bounded: entries live
 /// in two generations of maps, and the older one is dropped when the newer
 /// fills, so recently used entries survive.
 pub(crate) struct AncestryCache {
@@ -229,7 +235,8 @@ impl std::hash::Hasher for KeyHasher {
 struct AncestryEntry {
     parents: Option<Arc<[ChangesetId]>>,
     generation: Option<u64>,
-    /// Root tree, read ahead for path-history derivation (see
+    /// Root tree: read or computed by [`Repo::root_tree`] and creates, or
+    /// read ahead for path-history derivation (see
     /// `Repo::root_tree_prefetched`).
     root: Option<Hash>,
 }
@@ -595,6 +602,7 @@ impl Repo {
             land_fast_path: true,
             land_conflicts: Arc::default(),
             ancestry: Arc::default(),
+            root_cache: true,
             history_rows: Arc::default(),
             history_raw: Arc::default(),
             history_staged: Arc::default(),
@@ -1171,6 +1179,7 @@ impl Repo {
             e.parents = Some(parents);
             e.generation = Some(generation);
         });
+        self.remember_root(id, tree);
         Ok(id)
     }
 
@@ -1347,12 +1356,41 @@ impl Repo {
         })
     }
 
-    /// Hash of the changeset's root tree node.
+    /// Hash of the changeset's root tree node. A root is a function of its
+    /// changeset, so once read it is kept in the ancestry cache: every
+    /// listing and diff asks for it, and a metadata read per call was about
+    /// a tenth of a busy server's statements. Only a value read or derived
+    /// is kept, never a miss or an error. A row damaged in the store and
+    /// repaired by another process stays cached until this process
+    /// restarts, like [`SkipReadCache`].
     pub async fn root_tree(&self, id: ChangesetId) -> Result<Hash> {
+        if self.root_cache {
+            if let Some(r) = self.ancestry.get(&id, |e| e.root) {
+                self.note_root(id, r);
+                return Ok(r);
+            }
+        }
         let v = derived::derive::<RootTree>(self, id).await?;
         let root = derived::decode_hash(&v)?;
         self.note_root(id, root);
+        self.remember_root(id, root);
         Ok(root)
+    }
+
+    /// Keep `id`'s root tree for [`Repo::root_tree`], read or computed.
+    fn remember_root(&self, id: ChangesetId, root: Hash) {
+        if self.root_cache {
+            self.ancestry.update(id, |e| e.root = Some(root));
+        }
+    }
+
+    /// A handle sharing this one's caches whose [`Repo::root_tree`] reads the
+    /// row every time, for verification and repair (see `root_cache`).
+    pub(crate) fn without_root_cache(&self) -> Self {
+        Repo {
+            root_cache: false,
+            ..self.clone()
+        }
     }
 
     /// [`Repo::root_tree`], answered from what [`Repo::prefetch_root_trees`]
@@ -1471,8 +1509,16 @@ impl Repo {
     }
 
     /// Read one tree node. The empty tree always exists. A node of a tree
-    /// created without its nodes is derived (ADR 0069).
+    /// created without its nodes is derived (ADR 0069). A copy of
+    /// [`Repo::read_tree_shared`], for callers that keep or change it.
     pub async fn read_tree(&self, tree: Hash) -> Result<TreeNode> {
+        Ok(Arc::unwrap_or_clone(self.read_tree_shared(tree).await?))
+    }
+
+    /// [`Repo::read_tree`] as the node the caches hold: copying a wide
+    /// directory on every read was the largest part of a busy server's
+    /// lookups, listings and diffs.
+    pub async fn read_tree_shared(&self, tree: Hash) -> Result<Arc<TreeNode>> {
         if let Some(n) = self.lazy_first(&[tree]).await?.remove(&tree) {
             return Ok(n);
         }
@@ -1487,7 +1533,7 @@ impl Repo {
     /// [`Repo::read_tree`] of a stored node (or one a land batch attempt
     /// staged), `None` when the store lacks it: never derived. The store's
     /// `None` is exact (ADR 0070).
-    pub(crate) async fn read_tree_stored_opt(&self, tree: Hash) -> Result<Option<TreeNode>> {
+    pub(crate) async fn read_tree_stored_opt(&self, tree: Hash) -> Result<Option<Arc<TreeNode>>> {
         self.read_tree_stored_with(tree, true).await
     }
 
@@ -1497,12 +1543,12 @@ impl Repo {
         &self,
         tree: Hash,
         exact: bool,
-    ) -> Result<Option<TreeNode>> {
-        if let Some(n) = self.node_memo.as_ref().and_then(|m| m.get(&tree)) {
+    ) -> Result<Option<Arc<TreeNode>>> {
+        if let Some(n) = self.node_memo.as_ref().and_then(|m| m.get_shared(&tree)) {
             return Ok(Some(n));
         }
         if let Some(n) = self.nodes.get(&tree) {
-            return Ok(Some((*n).clone()));
+            return Ok(Some(n));
         }
         let stored = match self.blobs.get(&tree).await? {
             None if exact && tree != TreeNode::empty_hash() => self.blobs.get_exact(&tree).await?,
@@ -1516,11 +1562,11 @@ impl Repo {
                 return Err(Error::Storage(format!("corrupt tree node {tree}")))
             }
             Some(b) => {
-                let node = TreeNode::decode(&b)?;
+                let node = Arc::new(TreeNode::decode(&b)?);
                 self.cache_node(tree, &node, b.len());
                 node
             }
-            None if tree == TreeNode::empty_hash() => TreeNode::default(),
+            None if tree == TreeNode::empty_hash() => Arc::new(TreeNode::default()),
             None => return Ok(None),
         };
         if let Some(m) = &self.node_memo {
@@ -1532,16 +1578,27 @@ impl Repo {
     /// Keep a node read from the store and checked against its hash. In a
     /// staged land batch the nodes the batch wrote are answered by its memo
     /// before the store is asked, so only stored nodes get here.
-    fn cache_node(&self, tree: Hash, node: &TreeNode, encoded_len: usize) {
-        self.nodes
-            .insert_sized(tree, Arc::new(node.clone()), 3 * encoded_len);
+    fn cache_node(&self, tree: Hash, node: &Arc<TreeNode>, encoded_len: usize) {
+        self.nodes.insert_sized(tree, node.clone(), 3 * encoded_len);
     }
 
     /// [`Repo::read_tree`] of each of `trees`, in order, with one
     /// [`BlobStore::get_many`](leep_core::BlobStore::get_many) for the
     /// distinct ones: a walk that knows a whole level of a tree reads it with
-    /// many reads in flight instead of one.
+    /// many reads in flight instead of one. Copies of
+    /// [`Repo::read_trees_shared`].
     pub async fn read_trees(&self, trees: &[Hash]) -> Result<Vec<TreeNode>> {
+        Ok(self
+            .read_trees_shared(trees)
+            .await?
+            .into_iter()
+            .map(Arc::unwrap_or_clone)
+            .collect())
+    }
+
+    /// [`Repo::read_trees`] as the nodes the caches hold, a repeated hash
+    /// answered by the same node.
+    pub async fn read_trees_shared(&self, trees: &[Hash]) -> Result<Vec<Arc<TreeNode>>> {
         let mut nodes = self.lazy_first(trees).await?;
         let rest: Vec<Hash> = trees
             .iter()
@@ -1549,12 +1606,8 @@ impl Repo {
             .copied()
             .collect();
         nodes.extend(self.read_trees_stored(&rest).await?);
-        let mut uses: HashMap<Hash, usize> = HashMap::with_capacity(trees.len());
-        for t in trees {
-            *uses.entry(*t).or_default() += 1;
-        }
-        let missing: Vec<Hash> = uses
-            .keys()
+        let missing: Vec<Hash> = trees
+            .iter()
             .filter(|t| !nodes.contains_key(*t))
             .copied()
             .collect();
@@ -1563,6 +1616,9 @@ impl Repo {
             // node of its tree.
             let mut derived = self.lazy_nodes(&missing).await?;
             for t in missing {
+                if nodes.contains_key(&t) {
+                    continue;
+                }
                 match derived.remove(&t) {
                     Some(n) => {
                         nodes.insert(t, n);
@@ -1571,18 +1627,7 @@ impl Repo {
                 }
             }
         }
-        let mut out = Vec::with_capacity(trees.len());
-        for t in trees {
-            // The last use of a node takes it; earlier repeats clone.
-            let left = uses.get_mut(t).expect("counted");
-            *left -= 1;
-            out.push(if *left > 0 {
-                nodes[t].clone()
-            } else {
-                nodes.remove(t).expect("each distinct node decoded once")
-            });
-        }
-        Ok(out)
+        Ok(trees.iter().map(|t| nodes[t].clone()).collect())
     }
 
     /// The stored (or staged) nodes among `trees`, by hash, with one
@@ -1591,15 +1636,15 @@ impl Repo {
     pub(crate) async fn read_trees_stored(
         &self,
         trees: &[Hash],
-    ) -> Result<HashMap<Hash, TreeNode>> {
+    ) -> Result<HashMap<Hash, Arc<TreeNode>>> {
         let mut distinct = trees.to_vec();
         distinct.sort_unstable();
         distinct.dedup();
         let mut nodes = HashMap::with_capacity(distinct.len());
         distinct.retain(|t| {
-            let held = match self.node_memo.as_ref().and_then(|m| m.get(t)) {
+            let held = match self.node_memo.as_ref().and_then(|m| m.get_shared(t)) {
                 Some(n) => Some(n),
-                None => self.nodes.get(t).map(|n| (*n).clone()),
+                None => self.nodes.get(t),
             };
             match held {
                 Some(n) => {
@@ -1628,11 +1673,11 @@ impl Repo {
                     return Err(Error::Storage(format!("corrupt tree node {tree}")))
                 }
                 Some(b) => {
-                    let node = TreeNode::decode(&b)?;
+                    let node = Arc::new(TreeNode::decode(&b)?);
                     self.cache_node(tree, &node, b.len());
                     node
                 }
-                None if tree == TreeNode::empty_hash() => TreeNode::default(),
+                None if tree == TreeNode::empty_hash() => Arc::new(TreeNode::default()),
                 None => continue,
             };
             if let Some(m) = &self.node_memo {

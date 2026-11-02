@@ -122,7 +122,12 @@ impl LazyTrees {
 
     /// Keep the nodes of `id`'s unstored tree, `depth` derivations from a
     /// stored one.
-    pub(crate) fn remember(&self, id: ChangesetId, depth: u32, nodes: &[(Hash, Bytes, TreeNode)]) {
+    pub(crate) fn remember(
+        &self,
+        id: ChangesetId,
+        depth: u32,
+        nodes: &[(Hash, Bytes, Arc<TreeNode>)],
+    ) {
         {
             let mut o = self.node_origins.lock().unwrap();
             for (h, _, _) in nodes {
@@ -131,8 +136,7 @@ impl LazyTrees {
         }
         self.depths.lock().unwrap().insert(id, depth);
         for (h, bytes, node) in nodes {
-            self.nodes
-                .insert_sized(*h, Arc::new(node.clone()), 3 * bytes.len());
+            self.nodes.insert_sized(*h, node.clone(), 3 * bytes.len());
         }
     }
 }
@@ -176,7 +180,7 @@ impl<K: StdHash + Eq + Copy, V: Copy> TwoGen<K, V> {
 /// chain.
 pub(crate) struct DerivedTree {
     pub(crate) depth: u32,
-    pub(crate) chain: HashMap<Hash, TreeNode>,
+    pub(crate) chain: HashMap<Hash, Arc<TreeNode>>,
 }
 
 impl Repo {
@@ -216,16 +220,16 @@ impl Repo {
     /// The node `tree` of an unstored tree: derived earlier, or derived now
     /// from the changeset that holds it. `None` when no changeset known to
     /// hold it was looked up: the node is missing.
-    pub(crate) async fn lazy_node(&self, tree: Hash) -> Result<Option<TreeNode>> {
+    pub(crate) async fn lazy_node(&self, tree: Hash) -> Result<Option<Arc<TreeNode>>> {
         Ok(self.lazy_nodes(&[tree]).await?.remove(&tree))
     }
 
     /// [`Repo::lazy_node`] of each of `trees`, deriving each changeset's
     /// tree at most once for all of them (a directory level of a diff names
     /// many nodes of one tree). Nodes no known changeset holds are left out.
-    pub(crate) async fn lazy_nodes(&self, trees: &[Hash]) -> Result<HashMap<Hash, TreeNode>> {
+    pub(crate) async fn lazy_nodes(&self, trees: &[Hash]) -> Result<HashMap<Hash, Arc<TreeNode>>> {
         let mut out = HashMap::with_capacity(trees.len());
-        let mut chains: HashMap<ChangesetId, HashMap<Hash, TreeNode>> = HashMap::new();
+        let mut chains: HashMap<ChangesetId, HashMap<Hash, Arc<TreeNode>>> = HashMap::new();
         for &tree in trees {
             if out.contains_key(&tree) {
                 continue;
@@ -267,7 +271,7 @@ impl Repo {
     /// for every node of a land's tree before deriving it spent most of its
     /// time there (ADR 0069). A tree stored since is derived anyway, which
     /// gives the same nodes.
-    pub(crate) async fn lazy_first(&self, trees: &[Hash]) -> Result<HashMap<Hash, TreeNode>> {
+    pub(crate) async fn lazy_first(&self, trees: &[Hash]) -> Result<HashMap<Hash, Arc<TreeNode>>> {
         let mut out = HashMap::new();
         let mut derive = Vec::new();
         for t in trees {
@@ -292,11 +296,11 @@ impl Repo {
 
     /// A node derived earlier: by this land batch attempt, which keeps
     /// every node it derived for its whole life, or in the shared cache.
-    pub(crate) fn derived_node(&self, tree: &Hash) -> Option<TreeNode> {
+    pub(crate) fn derived_node(&self, tree: &Hash) -> Option<Arc<TreeNode>> {
         if let Some(n) = self.node_memo.as_ref().and_then(|m| m.get_derived(tree)) {
             return Some(n);
         }
-        self.lazy.nodes.get(tree).map(|n| (*n).clone())
+        self.lazy.nodes.get(tree)
     }
 
     /// Rebuild `id`'s tree from the nearest stored tree on its first-parent
@@ -351,7 +355,7 @@ impl Repo {
             cur = p;
         };
         let started = std::time::Instant::now();
-        let mut local: HashMap<Hash, TreeNode> = HashMap::new();
+        let mut local: HashMap<Hash, Arc<TreeNode>> = HashMap::new();
         let mut last = None;
         for (cid, cs, want) in chain.into_iter().rev() {
             self.warm_dirs(base, &cs.changes, &local, cached).await?;
@@ -398,7 +402,7 @@ impl Repo {
         &self,
         base: Hash,
         changes: &std::collections::BTreeMap<leep_core::RepoPath, leep_core::FileChange>,
-        local: &HashMap<Hash, TreeNode>,
+        local: &HashMap<Hash, Arc<TreeNode>>,
         cached: bool,
     ) -> Result<()> {
         // The directories each level needs, by path; level 0 is the root.
@@ -415,7 +419,7 @@ impl Repo {
                 levels[level].insert(d);
             }
         }
-        let mut nodes: HashMap<&str, TreeNode> = HashMap::new();
+        let mut nodes: HashMap<&str, Arc<TreeNode>> = HashMap::new();
         for level in &levels {
             let mut want: Vec<(&str, Hash)> = Vec::new();
             for &d in level {
@@ -479,7 +483,7 @@ impl Repo {
     pub(crate) async fn unstored_tree(
         &self,
         id: ChangesetId,
-    ) -> Result<Vec<(Hash, Bytes, TreeNode)>> {
+    ) -> Result<Vec<(Hash, Bytes, Arc<TreeNode>)>> {
         let root = self.root_tree(id).await?;
         self.unstored_closure(vec![root], &HashMap::new()).await
     }
@@ -492,7 +496,7 @@ impl Repo {
         &self,
         base: Hash,
         built: &crate::tree_ops::Built,
-    ) -> Result<Vec<(Hash, Bytes, TreeNode)>> {
+    ) -> Result<Vec<(Hash, Bytes, Arc<TreeNode>)>> {
         if base == TreeNode::empty_hash()
             || (!self.lazy.known_unstored(&base)
                 && self.read_tree_stored_opt(base).await?.is_some())
@@ -518,13 +522,14 @@ impl Repo {
     pub(crate) async fn unstored_closure(
         &self,
         roots: Vec<Hash>,
-        local: &HashMap<Hash, TreeNode>,
-    ) -> Result<Vec<(Hash, Bytes, TreeNode)>> {
+        local: &HashMap<Hash, Arc<TreeNode>>,
+    ) -> Result<Vec<(Hash, Bytes, Arc<TreeNode>)>> {
         let empty = TreeNode::empty_hash();
         let mut out = Vec::new();
         let mut seen = std::collections::HashSet::new();
-        let mut stack: Vec<(Hash, Option<(Bytes, TreeNode)>)> =
-            roots.into_iter().map(|h| (h, None)).collect();
+        // A node's encoding and the node, once its children are pushed.
+        type Done = Option<(Bytes, Arc<TreeNode>)>;
+        let mut stack: Vec<(Hash, Done)> = roots.into_iter().map(|h| (h, None)).collect();
         while let Some((h, done)) = stack.pop() {
             if let Some((bytes, node)) = done {
                 out.push((h, bytes, node));
@@ -544,7 +549,7 @@ impl Repo {
                 Some(n) => n,
                 None => match self.read_tree_stored_opt(h).await? {
                     Some(_) => continue,
-                    None => self.read_tree(h).await?,
+                    None => self.read_tree_shared(h).await?,
                 },
             };
             let bytes = Bytes::from(node.encode());

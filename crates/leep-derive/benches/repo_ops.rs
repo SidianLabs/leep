@@ -512,6 +512,55 @@ fn detect_renames(c: &mut Criterion) {
     g.finish();
 }
 
+/// Reads in one directory of [`FILES_PER_DIR`] entries, like a swarm's
+/// `agents/`: a lookup, a listing and a one-file diff each open that node,
+/// so their cost shows whether a cached node is shared or copied per read.
+fn wide_dir_reads(c: &mut Criterion) {
+    let rt = Runtime::new().unwrap();
+    let mut g = c.benchmark_group("wide_dir_reads");
+    g.sample_size(30).measurement_time(Duration::from_secs(3));
+    let repo = new_repo();
+    let (parent, tip) = rt.block_on(async {
+        let change = blob(&repo, b"state").await;
+        let changes = (0..FILES_PER_DIR)
+            .map(|i| {
+                (
+                    RepoPath::new(format!("agents/a{i}")).unwrap(),
+                    change.clone(),
+                )
+            })
+            .chain([(RepoPath::new("README").unwrap(), change.clone())])
+            .collect();
+        let parent = repo
+            .create_changeset(changeset(&[], changes))
+            .await
+            .unwrap();
+        let edit = blob(&repo, b"edited").await;
+        let path = RepoPath::new("agents/a500").unwrap();
+        let cs = changeset(&[parent], BTreeMap::from([(path, edit)]));
+        (parent, repo.create_changeset(cs).await.unwrap())
+    });
+    let path = RepoPath::new("agents/a500").unwrap();
+    g.bench_function("lookup_file", |b| {
+        b.to_async(&rt).iter(|| async {
+            assert!(repo.lookup_file(tip, &path).await.unwrap().is_some());
+        })
+    });
+    g.bench_function("list_files", |b| {
+        b.to_async(&rt).iter(|| async {
+            let files = repo.list_files(tip, "agents").await.unwrap();
+            assert_eq!(files.len(), FILES_PER_DIR);
+        })
+    });
+    g.bench_function("diff_one_file", |b| {
+        b.to_async(&rt).iter(|| async {
+            let d = repo.diff(Some(parent), tip, "").await.unwrap();
+            assert_eq!(d.len(), 1);
+        })
+    });
+    g.finish();
+}
+
 criterion_group!(
     benches,
     detect_renames,
@@ -521,6 +570,7 @@ criterion_group!(
     ancestry,
     log,
     last_change,
-    derive_history_index
+    derive_history_index,
+    wide_dir_reads
 );
 criterion_main!(benches);

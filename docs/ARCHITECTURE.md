@@ -1094,6 +1094,14 @@ client ~/.cache/leep/objects   (per machine, shared by all jobs on it)
 All three tiers are safe without invalidation, because keys are content
 hashes.
 
+Above them each `Repo` keeps decoded tree nodes (ADR 0066) and hands every
+reader the cached node itself (`Arc<TreeNode>`): a lookup, listing or diff
+borrows the entries it needs, and only building a tree copies, once, the
+directories on the changed paths. The root tree of each changeset read or
+created is kept in the ancestry cache, so a listing or diff of a changeset
+seen before makes no metadata read for it. Verification and repair, which
+replace damaged rows as they go, read roots from the store each time.
+
 The filesystem store has two layers of its own (ADR 0029):
 
 ```
