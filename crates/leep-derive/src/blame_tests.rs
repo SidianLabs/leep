@@ -198,6 +198,7 @@ async fn agree(r: &Repo, tip: ChangesetId, path: &str, span: u64, cache: bool) -
     let cuts = Cuts {
         head: span as usize,
         min_span: span,
+        linear_jumps: true,
     };
     let full = r.blame_walk_in(tip, &rp(path), None, false).await;
     let fast = r.blame_walk_in(tip, &rp(path), Some(cuts), cache).await;
@@ -457,6 +458,7 @@ async fn first_blame_of_a_busy_file_is_not_one_read_per_change() {
     let cuts = Some(Cuts {
         head: 4,
         min_span: 8,
+        linear_jumps: true,
     });
     // The same blame without delays, for the time the replay takes.
     let started = std::time::Instant::now();
@@ -578,6 +580,7 @@ async fn failed_reads_fail_the_blame() {
     let cuts = Cuts {
         head: 2,
         min_span: 4,
+        linear_jumps: true,
     };
     let (mut failed, mut answered) = (0, 0);
     for every in [7, 13, 50, 97, 211, 400, 1000] {
@@ -1166,6 +1169,7 @@ async fn blame_matches_the_definition_across_merges_and_renames() {
                     let cuts = Cuts {
                         head: span,
                         min_span: span as u64,
+                        linear_jumps: true,
                     };
                     let (fast, _) = r
                         .blame_walk_in(c, &f.path, Some(cuts), false)
@@ -1226,6 +1230,7 @@ async fn repeated_blames_past_the_walk_limit_make_progress() {
     let cuts = Some(Cuts {
         head: 32,
         min_span: 32,
+        linear_jumps: true,
     });
     let on_merges = |b: &crate::blame::CachedBlame| {
         let mut n = 0;

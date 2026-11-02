@@ -7,6 +7,19 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 ## [Unreleased]
 
+### Blame cost follows a file's versions on deep histories
+- **Changed.** A blame walk goes straight from one change of a file to the
+  next where the first-parent chain has no merge in between (the
+  `last_merge-v1` row, read with each step's index entry), instead of
+  descending skiplists a halving of the distance at a time; and a blame's
+  gathered reads of several derived kinds go out as one
+  `get_derived_kinds` call, one statement on Postgres, instead of one per
+  kind. On a 200,000-changeset linear history with in-memory stores
+  (`deep_blame_calls`), a cold blame of a file with 18 versions fell from
+  191 metadata statements to 77 (skiplist reads 114 to 36), of a file with
+  75 versions from 728 to 372, and of a hot file with 14,743 versions from
+  9,406 to 3,764. Answers are unchanged.
+
 ### Tree reads share cached nodes
 - **Changed.** Reads of tree nodes hand out the decoded node the server's
   caches hold instead of a copy: a file lookup, a listing or a diff no

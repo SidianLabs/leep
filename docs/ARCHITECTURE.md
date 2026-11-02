@@ -377,7 +377,12 @@ before, and is not followed from a merge or rename otherwise.
 where the next change is. The walk
 asks the path-history index where the next change is: the newest changers'
 largest generation `g` says that no first-parent ancestor above `g` changed
-the file, and skiplists find the lowest one at or above it. Every skiplist
+the file, and skiplists find the lowest one at or above it. Where the
+chain has no merge at or above `g` (the step's `last_merge-v1` row, read
+with its index entry), every ancestor that high is on the chain, so the
+changer at `g` is that ancestor and the walk goes straight to it, reading
+its skiplist with its generation: on a linear history a change costs a few
+reads whatever the distance to the next one. Every skiplist
 read during a walk names first-parent ancestors 1, 2, 4, ... steps further
 down, so the walk keeps them by generation and starts each descent from
 the nearest known point, and keeps their generations, which spares a read
@@ -398,9 +403,9 @@ a time (each round one batched read of the lists of cuts above a gap still
 too wide). If the walk goes on, the stretches below where it stopped are
 walked at once, up to 64, each from its top, as separate tasks; their reads
 are gathered into batched reads (`batched_reads`: single-row and batched
-derived reads that arrive while a batch is out go in the next
-`get_derived_many`, blob batches in the next `get_many`), so the stretches
-advance a step per round trip together. A stretch does not know the file
+derived reads of any kind that arrive while a batch is out go in the next
+`get_derived_kinds`, one statement on Postgres, blob batches in the next
+`get_many`), so the stretches advance a step per round trip together. A stretch does not know the file
 at its top, which is where the stretch above ends, so its first step's
 cached blame is looked up in case it changed the file; the steps are then
 taken in order, newest first, each stretch's first step judged against the
