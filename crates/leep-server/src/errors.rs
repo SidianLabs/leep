@@ -104,7 +104,13 @@ pub async fn json_errors(req: Request, next: Next) -> Response {
         Ok(b) => String::from_utf8_lossy(&b.to_bytes()).trim().to_string(),
         Err(_) => String::new(),
     };
-    let error = if text.is_empty() {
+    let error = if status == StatusCode::INTERNAL_SERVER_ERROR {
+        // Whatever failed may describe the server's internals; the log has it.
+        if !text.is_empty() {
+            tracing::error!(error = %text, "request failed");
+        }
+        crate::INTERNAL_ERROR_MESSAGE.to_string()
+    } else if text.is_empty() {
         status
             .canonical_reason()
             .unwrap_or("error")

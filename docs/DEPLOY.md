@@ -279,6 +279,23 @@ Clients pass the token with `LEEP_TOKEN`, `leep --token` or
 re-read on SIGHUP, so tokens can be rotated and revoked without a restart
 ([Reloading config](#reloading-config)).
 
+**Without a tokens file** the server serves only requests that look local:
+their host (the `Host` header, or the HTTP/2 authority) must be `localhost`
+or an IP address, and they must carry no `Origin` header; anything else is
+403 `forbidden`. Leep's own clients pass both checks; a web page in a
+browser does not. When other containers reach the server by a service name
+(`http://leep-server:7070`), list that name with `--allow-host leep-server`
+(`LEEP_ALLOW_HOSTS`); behind a proxy that authenticates, have the proxy
+send the upstream's address as the host or list the public name. The
+probes are exempt. With a tokens file neither check applies.
+
+Every request body declares its type: `Content-Type: application/json` on
+`POST`, `application/octet-stream` on blob uploads (`PUT`); another type is
+415. A request without `Content-Type` is accepted only with an
+`Authorization` header, so `leep` builds from before this check, which sent
+blob uploads without one, keep working against a server with tokens; against
+a server without tokens, upgrade them.
+
 ## Request limits
 
 Optional, and off unless set (ADR 0020). One runaway agent should not starve
@@ -573,6 +590,7 @@ each file's stored kind there and never reports an executable-bit change
 from Windows, as git does with `core.filemode=false`.
 | `LEEP_TOKENS_FILE` | none | Tokens file; enables authentication. |
 | `LEEP_INSECURE_NO_AUTH` | off | `1` lets the server run without a tokens file on a non-loopback address (the image's default listen address). Only for a port published on loopback or behind a proxy that authenticates. |
+| `LEEP_ALLOW_HOSTS` | none | Without a tokens file, requests must name `localhost` or an IP address as their host and carry no `Origin` header; this comma-separated list accepts other host names too, such as the service name other containers use. See [Authentication](#authentication). |
 | `LEEP_SIGNING_KEYS_FILE` | none | Trusted author keys file; enables signature submission. |
 | `LEEP_REQUIRE_SIGNATURES` | none | Comma-separated refs that only accept signed lands; needs the keys file. |
 | `LEEP_REVIEW_POLICY_FILE` | none | Review policy JSON (auto-approval rules, refs that require review); needs the tokens file. |
@@ -599,8 +617,12 @@ from Windows, as git does with `core.filemode=false`.
 | `LEEP_META_LAND_POOL_SIZE` | an eighth of `LEEP_META_POOL_SIZE`, at least 4 | Further Postgres connections reserved for land batch leaders (ADR 0067), opened on first use; count them in the same sum. `0` reserves none. |
 | `LEEP_META_INDEX_POOL_SIZE` | a sixteenth of `LEEP_META_POOL_SIZE`, at least 4 | Further Postgres connections reserved for the index warmer (ADR 0073), opened on first use by a server that warms; count them in the same sum. `0` reserves none. |
 | `LEEP_DERIVE_CACHE_BYTES` | 420 MiB | Budget of the in-memory derived-index caches (path history, trees, unstored trees derived on read, search's directory filters, filtered log); separate from `--cache-bytes`, the blob cache. |
+| `LEEP_HEADER_READ_TIMEOUT` | `30s` | Time a client has to send a complete request head, from when its connection opens and, on HTTP/1.1, from the end of its previous request (so it also closes idle keep-alive connections); `0` turns it off. See [OPERATIONS.md](OPERATIONS.md#connections). |
+| `LEEP_IDLE_TIMEOUT` | `2m` | Close a connection with no request in progress for this long; `0` turns it off. |
+| `LEEP_BODY_IDLE_TIMEOUT` | `60s` | A request body that delivers nothing, or a response the client reads nothing of, for this long fails and its connection closes, freeing the permits the request holds; `0` turns it off. |
+| `LEEP_MAX_CONNECTIONS` | `10000` | Most connections served at once, or `off`; further ones wait in the listen backlog. |
 | `LEEP_READY_TIMEOUT` | `2s` | Bound on each store check behind `GET /v1/ready` (`500ms`, `2s`; not zero). See [Probes](#probes). |
-| `LEEP_METRICS_LISTEN` | off | Address for a separate, unauthenticated `GET /metrics` listener; keep it private. See [OPERATIONS.md](OPERATIONS.md). |
+| `LEEP_METRICS_LISTEN` | off | Address for a separate, unauthenticated `GET /metrics` listener; keep it private: its labels include token names, and the server warns at startup when the address is not loopback. See [OPERATIONS.md](OPERATIONS.md#metrics). |
 | `LEEP_LOG_FORMAT` | `text` | `text` or `json` (one object per line). |
 | `RUST_LOG` | `info` | Log filter. |
 
@@ -700,7 +722,10 @@ this and added to that user's `~/.ssh/authorized_keys`) and
 `DEPLOY_KNOWN_HOSTS` (the server's host key line, so a changed host key fails
 the run). Anyone who can dispatch workflows can run any command as that user,
 so give the user only the rights deploys need. Revoke by deleting the key's
-line from `authorized_keys`.
+line from `authorized_keys`. The job runs in the GitHub environment
+`production`: have a repository admin give it required reviewers, limit it
+to `main` and keep the four secrets there
+([OPERATIONS.md](OPERATIONS.md#the-production-environment)).
 
 ## Monitoring and runbooks
 

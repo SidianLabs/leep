@@ -47,11 +47,20 @@
 //! that a land policy protects is 400. `{rev}` tries a ref, then a full id,
 //! then `tags/{rev}`.
 //!
+//! A `POST` body is sent with `Content-Type: application/json` and a `PUT`
+//! body with `application/octet-stream`; another type is 415 `invalid`. A
+//! request with no `Content-Type` is accepted only when it carries an
+//! `Authorization` header, as blob uploads from older clients did. A server
+//! without authentication refuses, with 403 `forbidden`, a request that has
+//! an `Origin` header or whose host is not `localhost`, an IP address or a
+//! name the server allows (`--allow-host`); the probes are exempt.
+//!
 //! Errors are `{"error": "...", "code": "..."}` ([`ErrorResponse`]):
 //! `Error::Invalid` → 400, `Error::NotFound` → 404, CAS loss and
 //! `Error::Conflict` (e.g. a land that kept losing to concurrent lands) →
 //! 409, `Error::Indexing` → 503 with `Retry-After` and [`IndexingInfo`]
-//! (ADR 0058), anything else → 500.
+//! (ADR 0058), anything else → 500, whose `error` is a generic message:
+//! the detail is in the server log under the response's `request_id`.
 //!
 //! # Error codes
 //!

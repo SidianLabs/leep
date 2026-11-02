@@ -60,7 +60,9 @@ jobs:
           CHAOS: ${{ inputs.chaos && '--chaos' || '' }}
           SEED: ${{ inputs.seed || github.run_number }}
         run: |
-          # The seed is in the report, so a failure can be replayed.
+          # The seed is in the report, so a failure can be replayed. It only
+          # plans the workload: the server's tokens come from a random
+          # secret leep-soak makes for each run.
           ./target/release/leep-soak \
             --duration "$DURATION" --agents "$AGENTS" --think "$THINK" --seed "$SEED" $CHAOS \
             --out soak-out

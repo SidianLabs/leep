@@ -111,6 +111,27 @@ struct Args {
     /// warns when the values it is given do not.
     #[arg(long, global = true, env = "LEEP_REQUEST_TIMEOUT", default_value = "5m", value_parser = parse_grace)]
     request_timeout: std::time::Duration,
+    /// Time a client has to send a complete request head, counted from when
+    /// its connection opens and, on HTTP/1.1, from the end of its previous
+    /// request, so it also closes keep-alive connections idle that long
+    /// (0, 10s, 30s); 0 turns it off.
+    #[arg(long, env = "LEEP_HEADER_READ_TIMEOUT", default_value = "30s", value_parser = parse_grace)]
+    header_read_timeout: std::time::Duration,
+    /// Close a connection that has had no request in progress for this long
+    /// (HTTP/2 gets a GOAWAY; HTTP/1.1 connections already close after
+    /// --header-read-timeout without a new request); 0 turns it off.
+    #[arg(long, env = "LEEP_IDLE_TIMEOUT", default_value = "2m", value_parser = parse_grace)]
+    idle_timeout: std::time::Duration,
+    /// Time a request body may deliver nothing, or a client may read nothing
+    /// of a response, before the request fails and its connection closes.
+    /// This releases what the request holds (a read-class permit, a token's
+    /// concurrency slot) when a client stops reading; 0 turns it off.
+    #[arg(long, env = "LEEP_BODY_IDLE_TIMEOUT", default_value = "60s", value_parser = parse_grace)]
+    body_idle_timeout: std::time::Duration,
+    /// Most connections served at once, or off; further connections wait in
+    /// the listen backlog until one closes.
+    #[arg(long, env = "LEEP_MAX_CONNECTIONS", default_value = "10000", value_parser = parse_count_or_off)]
+    max_connections: CountOrOff,
     /// Bound on each statement the server sends to a Postgres metadata store
     /// (its `statement_timeout`), so a query whose request was cut off by
     /// --request-timeout does not run on in the database (0, 30s, 5m). Lease
@@ -217,6 +238,12 @@ struct Args {
     /// comma-separated list.
     #[arg(long = "protect-ref", env = "LEEP_PROTECT_REFS", value_delimiter = ',')]
     protect_refs: Vec<String>,
+    /// Without --tokens-file, requests must name `localhost` or an IP
+    /// address as their host; this accepts another name too, such as the
+    /// service name other containers reach the server by. Repeatable; the
+    /// environment variable takes a comma-separated list.
+    #[arg(long = "allow-host", env = "LEEP_ALLOW_HOSTS", value_delimiter = ',')]
+    allow_hosts: Vec<String>,
     /// Serve Prometheus metrics on this address (`GET /metrics`, no auth, keep
     /// it private). Off when unset.
     #[arg(long, env = "LEEP_METRICS_LISTEN")]
@@ -235,10 +262,12 @@ struct Args {
     /// balancer), e.g. `http://10.0.3.7:7070`. Checked at startup.
     #[arg(long, env = "LEEP_ADVERTISE_URL")]
     advertise_url: Option<String>,
-    /// Servers' URLs start with this; lands, with their client's token, are
-    /// forwarded only to an address that starts with one of these or whose
-    /// IP address is in a --peer-cidr. Repeatable; the environment variable
-    /// takes a comma-separated list.
+    /// Servers' origins, e.g. `https://leep-1.internal:7070/`; lands, with
+    /// their client's token, are forwarded only to an address on one of
+    /// these (scheme, host and port equal, path under the prefix's; `host:`
+    /// with no port allows any port) or whose IP address is in a
+    /// --peer-cidr. Repeatable; the environment variable takes a
+    /// comma-separated list.
     #[arg(long, env = "LEEP_PEER_URL_PREFIX", value_delimiter = ',')]
     peer_url_prefix: Vec<String>,
     /// Networks the servers are in, e.g. `10.0.0.0/16`. Requests from these
@@ -1730,6 +1759,9 @@ async fn run() -> anyhow::Result<()> {
         args.tokens_file.is_some(),
         args.insecure_no_auth,
     )?;
+    if let Some(addr) = args.metrics_listen {
+        warn_open_metrics(addr);
+    }
     let metrics_app = args.metrics_listen.map(|_| install_metrics()).transpose()?;
     let read_concurrency = leep_server::read_limits::ReadConcurrency::parse(&args.read_concurrency)
         .map_err(anyhow::Error::msg)?;
@@ -1948,7 +1980,11 @@ async fn run() -> anyhow::Result<()> {
     if let Some((_, http)) = &coordination {
         app = leep_server::coord::layer(app, http.clone());
     }
+    app = app.layer(axum::Extension(leep_server::guard::AllowedHosts::new(
+        &args.allow_hosts,
+    )));
 
+    let serve_options = serve_options(&args);
     let listener = tokio::net::TcpListener::bind(args.listen)
         .await
         .with_context(|| format!("binding {}", args.listen))?;
@@ -1968,25 +2004,35 @@ async fn run() -> anyhow::Result<()> {
     // server takes the groups at once.
     let releasing = index_leases.clone();
     let Some((coordinator, http)) = coordination else {
-        leep_server::serve(listener, app, async move {
-            shutdown_signal().await;
-            if let Some(l) = releasing {
-                l.shutdown().await;
-            }
-        })
+        leep_server::conn::serve_with(
+            listener,
+            app,
+            async move {
+                shutdown_signal().await;
+                if let Some(l) = releasing {
+                    l.shutdown().await;
+                }
+            },
+            serve_options,
+        )
         .await?;
         return Ok(());
     };
     // Leases are given up as soon as shutdown starts, so another server
     // takes the refs at once; lands still in flight here are handed back.
     let stopping = coordinator.clone();
-    let server = tokio::spawn(leep_server::serve(listener, app, async move {
-        shutdown_signal().await;
-        stopping.shutdown().await;
-        if let Some(l) = releasing {
-            l.shutdown().await;
-        }
-    }));
+    let server = tokio::spawn(leep_server::conn::serve_with(
+        listener,
+        app,
+        async move {
+            shutdown_signal().await;
+            stopping.shutdown().await;
+            if let Some(l) = releasing {
+                l.shutdown().await;
+            }
+        },
+        serve_options,
+    ));
     let address = coordinator.config().address.clone();
     if let Err(e) = http.check_self(&address).await {
         coordinator.shutdown().await;
@@ -2100,6 +2146,9 @@ fn land_coordination(
         cidrs: args.peer_cidr.clone(),
         allow_plain_http: args.peer_allow_plain_http,
     };
+    // Before the advertise URL is checked against the prefixes, so a
+    // malformed prefix is named as such.
+    policy.validate().map_err(anyhow::Error::msg)?;
     policy
         .check_url(&address)
         .map_err(|e| anyhow::anyhow!("--advertise-url: {e}"))?;
@@ -2121,6 +2170,32 @@ fn land_coordination(
     let coordinator = leep_derive::land_coord::LandCoordinator::new(meta, cfg);
     let http = leep_server::coord::Coordination::new(policy, holder)?;
     Ok((coordinator, http))
+}
+
+/// The metrics listener has no authentication and its labels name tokens
+/// and routes, so a non-loopback address is worth a word at startup.
+fn warn_open_metrics(addr: SocketAddr) {
+    if !addr.ip().is_loopback() {
+        tracing::warn!(
+            %addr,
+            "the metrics listener is on a non-loopback address; it needs no token \
+             and its labels include token names, so keep the address on a private network"
+        );
+    }
+}
+
+/// The connection bounds of the flags; 0 or `off` turns one off.
+fn serve_options(args: &Args) -> leep_server::conn::ServeOptions {
+    let on = |d: std::time::Duration| (!d.is_zero()).then_some(d);
+    leep_server::conn::ServeOptions {
+        header_read_timeout: on(args.header_read_timeout),
+        idle_timeout: on(args.idle_timeout),
+        body_idle_timeout: on(args.body_idle_timeout),
+        max_connections: match args.max_connections {
+            CountOrOff::Off => None,
+            CountOrOff::Count(n) => Some(n),
+        },
+    }
 }
 
 /// Without tokens anyone who reaches the server can read and rewrite every

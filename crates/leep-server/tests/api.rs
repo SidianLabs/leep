@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::http::{HeaderMap, Method, Request, StatusCode};
+use axum::http::{header, HeaderMap, Method, Request, StatusCode};
 use axum::Router;
 use http_body_util::BodyExt;
 use leep_core::api::*;
@@ -51,11 +51,21 @@ impl Client {
     }
 
     async fn raw(&self, method: Method, uri: &str, body: Vec<u8>) -> Reply {
+        let ty = if method == Method::PUT {
+            "application/octet-stream"
+        } else {
+            "application/json"
+        };
         let req = Request::builder()
             .method(method)
             .uri(uri)
+            .header(header::CONTENT_TYPE, ty)
             .body(Body::from(body))
             .unwrap();
+        self.send(req).await
+    }
+
+    async fn send(&self, req: Request<Body>) -> Reply {
         let resp = self.0.clone().oneshot(req).await.unwrap();
         let (parts, body) = resp.into_parts();
         Reply {
@@ -859,6 +869,7 @@ async fn real_tcp_listener() {
     let h = Hash::of_blob(b"over tcp");
     let r = http
         .put(format!("http://{addr}/v1/blobs/{h}"))
+        .header("content-type", "application/octet-stream")
         .body("over tcp")
         .send()
         .await
@@ -2581,4 +2592,156 @@ async fn reads_and_lands_answer_the_same_with_lazy_trees() {
             (l.0.as_str(), l.1, String::from_utf8_lossy(&l.2))
         );
     }
+}
+
+/// Write bodies must say what they are, and a server without tokens serves
+/// only requests that name a local host and come from no web page.
+#[tokio::test]
+async fn write_bodies_declare_their_type_and_open_servers_take_only_local_requests() {
+    let c = Client::new();
+    let cs = Changeset {
+        parents: vec![],
+        author: "t".into(),
+        timestamp: 1,
+        message: "m".into(),
+        changes: BTreeMap::new(),
+        extra: BTreeMap::new(),
+    };
+    let body = serde_json::to_vec(&cs).unwrap();
+    let post = |ty: Option<&str>, extra: &[(&str, &str)]| {
+        let mut b = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/changesets");
+        if let Some(ty) = ty {
+            b = b.header(header::CONTENT_TYPE, ty);
+        }
+        for (k, v) in extra {
+            b = b.header(*k, *v);
+        }
+        b.body(Body::from(body.clone())).unwrap()
+    };
+
+    let r = c.send(post(Some("text/plain"), &[])).await;
+    assert_eq!(r.status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert_eq!(r.code(), "invalid");
+    let r = c.send(post(None, &[])).await;
+    assert_eq!(
+        r.status,
+        StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        "no token, no type"
+    );
+    let r = c
+        .send(post(
+            Some("text/plain"),
+            &[("origin", "https://example.com")],
+        ))
+        .await;
+    assert!(r.status.is_client_error(), "{}", r.status);
+    let r = c
+        .send(post(
+            Some("application/json"),
+            &[("origin", "https://example.com")],
+        ))
+        .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+    assert_eq!(r.code(), "forbidden");
+    let r = c
+        .send(post(
+            Some("application/json"),
+            &[("host", "leep.example.com")],
+        ))
+        .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+    let r = c
+        .send(
+            Request::builder()
+                .uri("/v1/refs")
+                .header("host", "leep.example.com:7070")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "reads too");
+
+    // Local names and addresses, with parameters on the type, are served.
+    for host in ["localhost:7070", "127.0.0.1:7070", "[::1]:7070", "10.0.0.5"] {
+        let r = c
+            .send(post(
+                Some("application/json; charset=utf-8"),
+                &[("host", host)],
+            ))
+            .await;
+        assert_eq!(r.status, StatusCode::OK, "{host}: {:?}", r.body);
+    }
+    // Probes answer whoever asks.
+    let r = c
+        .send(
+            Request::builder()
+                .uri("/v1/health")
+                .header("host", "leep.example.com")
+                .header("origin", "https://example.com")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK);
+
+    // A blob upload is raw bytes.
+    let h = Hash::of_blob(b"x");
+    let r = c
+        .send(
+            Request::builder()
+                .method(Method::PUT)
+                .uri(format!("/v1/blobs/{h}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("x"))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+    // An operator may allow another name.
+    let app = leep_server::router(Repo::new(
+        Arc::new(MemoryBlobStore::new()),
+        Arc::new(MemoryMetaStore::new()),
+    ))
+    .layer(axum::Extension(leep_server::guard::AllowedHosts::new(&[
+        "leep-server",
+    ])));
+    let r = Client(app)
+        .send(post(
+            Some("application/json"),
+            &[("host", "leep-server:7070")],
+        ))
+        .await;
+    assert_eq!(r.status, StatusCode::OK);
+}
+
+/// A 500 carries a generic message and the request id; the store's own
+/// error text stays in the server log.
+#[tokio::test]
+async fn internal_errors_do_not_echo_store_errors() {
+    use leep_testkit::{Fault, FaultPlan, FaultyBlobStore, Op};
+    let plan = FaultPlan::new(7);
+    let blobs = FaultyBlobStore::new(Arc::new(MemoryBlobStore::new()), plan.clone());
+    let c = Client(leep_server::router(Repo::new(
+        Arc::new(blobs),
+        Arc::new(MemoryMetaStore::new()),
+    )));
+    plan.rate(&[Op::Get], 1000, Fault::Fail);
+    let r = c
+        .send(
+            Request::builder()
+                .uri(format!("/v1/blobs/{}", Hash::of_blob(b"x")))
+                .header(REQUEST_ID_HEADER, "req-500")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::INTERNAL_SERVER_ERROR);
+    let e = r.json::<ErrorResponse>();
+    assert_eq!(e.error, leep_server::INTERNAL_ERROR_MESSAGE);
+    assert_eq!(e.code.as_deref(), Some("internal"));
+    assert_eq!(e.request_id.as_deref(), Some("req-500"));
+    assert!(!String::from_utf8_lossy(&r.body).contains("storage"));
 }

@@ -10,6 +10,11 @@ name: Remote
 #                             authorized_keys; remove that line to revoke
 #   DEPLOY_KNOWN_HOSTS        the server's host key line, so a changed host
 #                             key fails the run instead of being trusted
+#
+# The job runs in the `production` environment, so a repository admin can
+# require reviewers before each run and keep the secrets there instead of
+# at repository level (docs/DEPLOY.md, "Running commands on the server from
+# GitHub Actions").
 
 on:
   workflow_dispatch:
@@ -29,6 +34,7 @@ concurrency:
 jobs:
   run:
     if: github.ref == 'refs/heads/main'
+    environment: production
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:

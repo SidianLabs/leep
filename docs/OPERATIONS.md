@@ -94,6 +94,9 @@ the id.
 Headers are never logged, so `Authorization` values cannot appear. The
 authentication span (DEBUG) records the token's name, never its value.
 Server-side failures additionally log an ERROR line with the error text.
+A 500 answers the client with a generic message and its `request_id`, never
+that text (a database or object store message can name hosts, buckets or
+paths): look the id up in the log.
 
 ## Metrics
 
@@ -102,7 +105,11 @@ Metrics are off by default. Start the server with `--metrics-listen <ADDR>`
 `GET /metrics` (Prometheus text format). The listener is separate from the
 API port, needs no token and serves nothing else, so bind it to a private
 interface or network and never publish it through the API's reverse proxy.
-The address is logged at startup.
+Its labels include token names (the `token` label of
+`leep_requests_limited_total`, `leep_requests_in_flight` and
+`leep_token_expired_requests_total`), which tell a reader who uses the
+server. The address is logged at startup, with a warning when it is not a
+loopback address.
 
 Instrumentation uses the `metrics` facade, which does nothing unless a
 recorder is installed; only the server binary installs one. HTTP latency is
@@ -111,6 +118,7 @@ measured until the response head is ready, not until the body is streamed.
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
 | `leep_http_requests_total` | counter | `method`, `route`, `status` | Requests handled. `route` is the matched template or `unmatched`; unknown methods are `other`. |
+| `leep_http_response_body_idle_total` | counter | | Responses dropped because the client read nothing of them for `--body-idle-timeout` ([Connections](#connections)). |
 | `leep_http_request_duration_seconds` | histogram | `method`, `route` | Time to produce the response head. |
 | `leep_land_total` | counter | `outcome` = `landed`, `conflicts`, `exhausted`, `error` | Land calls by result. `conflicts` is a normal reply that needs client action; `exhausted` means the CAS lost every retry (HTTP 409). `error` is every other failure, including refused lands (400: unsigned, unreviewed, bad ref) and unknown changesets (404), so it is not a server-health signal; count 5xx on `route="/v1/land"` for that. |
 | `leep_land_attempts` | histogram | none | CAS attempts of the batch a land was committed in (ADR 0032); above 1 means another writer of the ref won a race. |
@@ -276,7 +284,7 @@ leep-server --meta postgres://... --blobs ... --listen 0.0.0.0:7070 \
 |---|---|---|
 | `--land-coordination on\|off` | `LEEP_LAND_COORDINATION` | Default `off`. Needs Postgres or SQLite, `--advertise-url` and an allow-list. |
 | `--advertise-url URL` | `LEEP_ADVERTISE_URL` | Where other servers reach this one directly, not through the balancer. Checked at startup: the server fetches `URL/v1/health` and refuses to start unless the answer comes from itself. |
-| `--peer-url-prefix P` | `LEEP_PEER_URL_PREFIX` | Repeatable (comma-separated in the variable). A land, with its client's token, is forwarded only to a lease address that starts with one of these, compared as raw text: write the scheme, host, port and the trailing slash, `https://leep-1.internal:7070/`, never `https://leep-` (which also matches `https://leep-evil.example`). |
+| `--peer-url-prefix P` | `LEEP_PEER_URL_PREFIX` | Repeatable (comma-separated in the variable). A land, with its client's token, is forwarded only to a lease address on one of these origins: write the scheme, the whole host, the port and a trailing slash, `https://leep-1.internal:7070/`. The address is compared parsed, so its scheme, host and port must equal the prefix's (a missing port is the scheme's default) and its path must start with the prefix's path. A host followed by a colon and no port, `http://10.0.3.7:`, allows every port of that host. A partial host is refused at startup with "does not name a whole host": an address such as `http://10.0.3.` (use `--peer-cidr` for a network) or the start of a name such as `https://leep-`, which raw-text matching used to accept for `https://leep-1.internal`; list each server's origin instead. |
 | `--peer-cidr NET` | `LEEP_PEER_CIDR` | ...or whose host is an IP address in one of these networks. Requests from these networks (and from the IP hosts of the prefixes) are recognised as peers. |
 | `--peer-allow-plain-http` | `LEEP_PEER_ALLOW_PLAIN_HTTP` | Allow `http://` to a host that is not a loopback or private IP address. Without it such a peer needs `https://`. |
 | `--land-lease-ttl` | `LEEP_LAND_LEASE_TTL` | Default `2s`. Another server takes over a lease not renewed for this long; the holder itself stops trusting it one renew interval earlier (1.5 s by default). |
@@ -343,6 +351,28 @@ behind expire within the TTL.
 
 A tier of dedicated landing servers (API servers that only forward, landers
 that only lead) is future work; today every coordinating server can lead.
+
+## Connections
+
+The server bounds each connection itself, so a client that opens a
+connection and sends nothing, sends a request slowly, or stops reading its
+answer does not hold the server's resources for long. All four are flags;
+`0` (or `off` for the cap) turns one off.
+
+| Flag | Variable | Default | Meaning |
+|---|---|---|---|
+| `--header-read-timeout` | `LEEP_HEADER_READ_TIMEOUT` | `30s` | Time to send a complete request head, counted from when the connection opens and, on HTTP/1.1, from the end of the previous request. A connection that misses it is closed without an answer, so it also closes HTTP/1.1 keep-alive connections idle that long. |
+| `--idle-timeout` | `LEEP_IDLE_TIMEOUT` | `2m` | A connection with no request in progress for this long is closed gracefully (HTTP/2 gets a `GOAWAY`). |
+| `--body-idle-timeout` | `LEEP_BODY_IDLE_TIMEOUT` | `60s` | A request body that delivers no bytes for this long fails the request. A response the client reads nothing of for this long is dropped and its connection closed, which releases the read-class permit and the token's concurrency slot the response held ([Expensive read limits](#expensive-read-limits), [Request limits](#request-limits)). |
+| `--max-connections` | `LEEP_MAX_CONNECTIONS` | `10000` | Connections served at once. Further connections wait in the kernel's listen backlog until one closes. Keep it under the process's open file limit. |
+
+`--request-timeout` bounds the time to the response head; a large response
+then streams for as long as the client keeps reading, and
+`--body-idle-timeout` bounds only the pauses. A proxy in front should keep
+its own idle timeouts at or below these, and its upstream keep-alive
+timeout below `--header-read-timeout`, so it does not send a request on a
+connection the server is closing. A response cut off by
+`--body-idle-timeout` counts in `leep_http_response_body_idle_total`.
 
 ## Request limits
 
@@ -1083,6 +1113,27 @@ When Leep is down or wrong and `main` needs a fix now:
 If something landed in between, `leep-main` reports `diverged` and Leep's
 side is on `leep-diverged/main`. Merge it in git and push; the mirror lands
 the merge ([Mirror states](#mirror-states)).
+
+### The production environment
+
+`.github/workflows/remote.yml` (a shell command on the server over SSH,
+[DEPLOY.md](DEPLOY.md#running-commands-on-the-server-from-github-actions))
+runs in the GitHub environment `production`. A repository admin sets it up
+once, under Settings > Environments > New environment, `production`:
+
+- **Required reviewers**: the maintainer (and anyone else trusted to run
+  commands on the server). Each run then waits for one of them to approve.
+- **Deployment branches**: `main` only.
+- **Environment secrets**: move `DEPLOY_HOST`, `DEPLOY_USER`,
+  `DEPLOY_SSH_KEY` and `DEPLOY_KNOWN_HOSTS` here from the repository
+  secrets, so no other workflow can read them.
+
+The workflow needs no change once the environment exists. Until an admin
+creates it, the first run creates an unprotected `production` environment,
+so set the reviewers before relying on it.
+
+All workflows declare a read-only `permissions:` block (`contents: read`);
+none needs to write to the repository.
 
 ### Dependabot
 
@@ -2576,6 +2627,9 @@ It creates a throwaway Postgres database in the admin URL (`--postgres-url`,
 means SQLite), puts blobs in a directory, starts `leep-server` with
 metrics, tokens (one per agent), trusted signing keys and a review policy on
 `release`, and drops the database and the directory when the run passes.
+Tokens and signing keys come from a random secret made for each run, not
+from `--seed`, which the report prints and CI sets to the public run
+number; set `LEEP_SOAK_TOKEN_SECRET` to make a run's tokens reproducible.
 After a failure it keeps both (the report names them) so you can start a
 server on them and look; its `work` directory is cleared when the same `--out`
 is used again. Use `--server URL --token T` to soak a server you

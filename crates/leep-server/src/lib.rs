@@ -8,9 +8,11 @@
 pub mod auth;
 pub mod background_repack;
 pub mod backup;
+pub mod conn;
 pub mod coord;
 pub mod errors;
 pub mod fingerprint;
+pub mod guard;
 pub mod limits;
 pub mod observe;
 pub mod protect;
@@ -315,6 +317,9 @@ pub fn router_with_read_limits(
     let router = router
         .layer(middleware::from_fn(limits::enforce))
         .layer(Extension(budget));
+    // Inside authentication, so a request without a token is a 401 first,
+    // and before any body is read.
+    let router = router.layer(middleware::from_fn(guard::check));
     // Next in, so a rejected request never has its body read.
     let router = router.layer(middleware::from_fn(auth::require_token));
     // Outside both: the request keeps this config snapshot to its end.
@@ -357,19 +362,14 @@ pub fn check_protected_refs(what: &str, refs: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// Serve `app` on `listener` until `shutdown` resolves.
+/// Serve `app` on `listener` until `shutdown` resolves, with the default
+/// [`conn::ServeOptions`]; see [`conn::serve_with`].
 pub async fn serve(
     listener: tokio::net::TcpListener,
     app: Router,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
-    // The peer address keys anonymous request limits (ADR 0020).
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown)
-    .await
+    conn::serve_with(listener, app, shutdown, conn::ServeOptions::default()).await
 }
 
 type S = State<Arc<Repo>>;
@@ -397,6 +397,11 @@ fn with_scanned(mut resp: Response, scanned: u64) -> Response {
         .insert(INDEX_SCANNED_HEADER, HeaderValue::from(scanned));
     resp
 }
+
+/// The `error` of every 500 the handlers answer; `request_id` beside it
+/// finds the detail in the server log.
+pub const INTERNAL_ERROR_MESSAGE: &str =
+    "internal server error; the server log has the details under this request_id";
 
 /// The single place `leep_core::Error` becomes an HTTP status.
 #[derive(Debug)]
@@ -473,7 +478,13 @@ impl IntoResponse for ApiError {
             return resp;
         }
         if status.is_server_error() {
+            // The detail (a database or object store message, a path) stays
+            // in the log, where the request span names the request id; the
+            // client gets that id with a generic message.
             tracing::error!(error = %self.0, "request failed");
+            let body = ErrorResponse::new(INTERNAL_ERROR_MESSAGE.to_string())
+                .with_code(errors::code_of(&self.0));
+            return (status, Json(body)).into_response();
         }
         let mut body = ErrorResponse::new(self.0.to_string()).with_code(errors::code_of(&self.0));
         if let Error::LandIdReused { refusal, .. } = self.0 {

@@ -289,9 +289,16 @@ fn request(data: &[u8], ids: &[String; 3]) -> Option<Request<Body>> {
         uri.push_str(tpl);
         (Method::from_bytes(r.method.as_bytes()).unwrap(), uri)
     };
+    // The type the server requires, so bodies reach the handlers.
+    let ty = if method == Method::PUT {
+        "application/octet-stream"
+    } else {
+        "application/json"
+    };
     Request::builder()
         .method(method)
         .uri(uri)
+        .header("content-type", ty)
         .body(Body::from(body.to_vec()))
         .ok()
 }

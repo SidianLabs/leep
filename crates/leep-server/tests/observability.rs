@@ -33,6 +33,14 @@ fn with_metrics<F: Future<Output = ()>>(fut: F) -> String {
 
 async fn send(app: &Router, method: Method, uri: &str, body: Vec<u8>) -> StatusCode {
     let req = Request::builder()
+        .header(
+            "content-type",
+            if method == Method::PUT {
+                "application/octet-stream"
+            } else {
+                "application/json"
+            },
+        )
         .method(method)
         .uri(uri)
         .body(Body::from(body))
@@ -105,6 +113,7 @@ fn http_and_land_metrics_use_route_templates() {
         let req = Request::builder()
             .method(Method::POST)
             .uri("/v1/changesets")
+            .header("content-type", "application/json")
             .body(Body::from(serde_json::to_vec(&cs).unwrap()))
             .unwrap();
         let resp = app.clone().oneshot(req).await.unwrap();

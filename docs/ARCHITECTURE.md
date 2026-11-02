@@ -1348,6 +1348,12 @@ With it, an axum middleware requires `Authorization: Bearer <token>` on every
 endpoint except `GET /v1/health`: 401 (with `WWW-Authenticate: Bearer`) when the
 token is missing, unknown or past the entry's optional `expires` time, 403
 when a `read` token makes a mutating request.
+Before any body is read, `leep_server::guard` requires `POST` bodies to be
+declared `application/json` and `PUT` bodies `application/octet-stream`
+(415; a request with no type is let through when it carries
+`Authorization`, for older clients), and, without authentication, refuses
+requests with an `Origin` header or a host that is not `localhost`, an IP
+address or an `--allow-host` name (403).
 `POST /v1/blobs/missing` counts as read because it only queries; it takes at
 most 100,000 hashes (the CLI sends 10,000 at a time), and read tokens' bodies are capped at 1 MiB by default. Digests are
 compared in constant time, and only the token name is logged. Use
@@ -1419,7 +1425,14 @@ unless the request's config has limits. For a principal with limits it checks th
 size, takes a token from the read or write bucket, and `try_acquire`s a
 concurrency permit, refusing with 413 or 429 (never queueing). The permit
 lives in a guard attached to the response body, so it is released when the body
-ends, the client goes away or the timeout drops the request. Token names bound
+ends, the client goes away or the timeout drops the request.
+Connections are served by `leep_server::conn` on hyper's builders with a timer,
+not `axum::serve`: a header-read timeout (also the HTTP/1.1 keep-alive idle
+bound), an idle timeout, a cap on open connections, and a body idle timeout.
+That last one fails a request body that stalls, closes a socket whose writes
+stall, and has a watchdog drop a large response the client stops reading
+(an HTTP/2 stream can stall without the socket stalling), so a guard riding
+in a response body is released within that bound. Token names bound
 the state; in anonymous mode state is keyed by client address in a size-capped
 table. State is per process.
 Built for search ([ADR 0060](adr/0060-land-admission-and-read-limits.md),

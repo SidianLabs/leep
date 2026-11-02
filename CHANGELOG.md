@@ -151,6 +151,62 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   base, and a path whose answers differ is reported as a conflict. The
   review rules on merges (`merge-parent`, dropped side changes) check every
   base too. See ADR 0071. Fixes #160.
+### Soak tokens
+- **Changed.** `leep-soak` derives its server's tokens and signing keys
+  from a random secret made for each run (or `LEEP_SOAK_TOKEN_SECRET`)
+  instead of from `--seed`, which is printed in reports and is the run
+  number in CI.
+
+### CI permissions
+- **Changed.** `.github/workflows/rust.yml` declares a read-only
+  `permissions:` block like the other workflows, and `remote.yml` runs in
+  the `production` environment, which a repository admin should give
+  required reviewers and the deploy secrets (OPERATIONS.md, "The
+  production environment").
+
+### Server errors, metrics listener and peer prefixes
+- **Changed.** A 500 answers with a generic `error` and the
+  `request_id`; the underlying error text (from the metadata or blob
+  store, for example) is logged under that id and no longer sent to the
+  client. `code` is unchanged (`internal`).
+- **Changed.** `--metrics-listen` on a non-loopback address logs a
+  warning at startup: the listener needs no token and its labels include
+  token names.
+- **Changed.** `--peer-url-prefix` is compared as a parsed origin
+  (scheme, host and port equal, then a path prefix) instead of raw text;
+  `http://host:` with no port allows every port of that host, and a
+  partial host such as `http://10.0.3.` or `https://leep-` is refused at
+  startup ("does not name a whole host"): list each server's origin. The
+  example in `deploy/leep-server.env.example` is now a full origin.
+
+### Request bodies declare their type; open servers take only local requests
+- **Changed.** `POST` bodies must be sent with `Content-Type:
+  application/json` and blob uploads (`PUT`) with
+  `application/octet-stream`; another type is 415 `invalid`. A request
+  without `Content-Type` is still accepted when it carries an
+  `Authorization` header: `leep` before this change sent blob uploads
+  without one, so upgrade clients that talk to a server without tokens.
+  `leep`, the git mirror, `leep-mcp` and `leep-soak` send the types.
+- **Changed.** A server without `--tokens-file` refuses (403 `forbidden`)
+  requests with an `Origin` header and requests whose host is not
+  `localhost`, an IP address or a name given with the new `--allow-host`
+  (`LEEP_ALLOW_HOSTS`). The probes are exempt. See DEPLOY.md,
+  "Authentication".
+
+### Connection timeouts
+- **Added.** The server bounds each connection: `--header-read-timeout`
+  (30 s; also closes idle HTTP/1.1 keep-alive connections),
+  `--idle-timeout` (2 min), `--body-idle-timeout` (60 s: a request body
+  that stalls fails, and a response the client stops reading is dropped
+  and its connection closed, which releases the read-class permit and the
+  token's concurrency slot it held) and `--max-connections` (10,000).
+  `leep_server::serve` now serves through `leep_server::conn::serve_with`
+  instead of `axum::serve`. Metric `leep_http_response_body_idle_total`.
+  See OPERATIONS.md, "Connections".
+- **Changed.** `leep` (and so the git mirror and `leep-mcp`) and
+  `leep-soak` keep idle pooled connections for 20 s, below the server's
+  default `--header-read-timeout`, so they do not reuse a connection the
+  server has closed for being idle.
 
 ### Land batches write one pack
 - **Changed.** A land batch's new objects (tree nodes, merged contents)

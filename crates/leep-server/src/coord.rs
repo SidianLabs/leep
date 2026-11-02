@@ -36,7 +36,8 @@ pub const INSTANCE_HEADER: &str = "leep-instance";
 /// Which addresses lands may be forwarded to, and which callers are peers.
 #[derive(Clone, Debug, Default)]
 pub struct PeerPolicy {
-    /// `--peer-url-prefix`: an address must start with one of these...
+    /// `--peer-url-prefix`: an address must be on one of these origins
+    /// (see [`PeerPrefix`])...
     pub prefixes: Vec<String>,
     /// `--peer-cidr`: ...or name an IP address inside one of these.
     pub cidrs: Vec<Cidr>,
@@ -103,6 +104,111 @@ fn canonical(ip: IpAddr) -> IpAddr {
     }
 }
 
+/// A `--peer-url-prefix`, matched on the parsed address rather than as
+/// text: scheme, host and port must equal the address's, and its path must
+/// start with the prefix's path. `http://10.0.3.7:7070/` names one server;
+/// `http://10.0.3.7:` (a colon and no port) names every port of that host.
+/// As text, `https://leep.example` would also have matched
+/// `https://leep.example.evil.net`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PeerPrefix {
+    scheme: String,
+    host: String,
+    /// `None`: any port.
+    port: Option<u16>,
+    path: String,
+}
+
+impl std::str::FromStr for PeerPrefix {
+    type Err = String;
+
+    fn from_str(p: &str) -> Result<Self, String> {
+        let bad = |why: &str| {
+            format!(
+                "--peer-url-prefix {p:?} {why}; write an origin such as \
+                 https://leep-1.internal:7070/"
+            )
+        };
+        let (scheme, rest) = p.split_once("://").ok_or_else(|| bad("is not a URL"))?;
+        let authority = rest.split('/').next().unwrap_or("");
+        let any_port = authority.ends_with(':');
+        let host_port = authority.trim_end_matches(':');
+        let text = format!("{scheme}://{host_port}{}", &rest[authority.len()..]);
+        let url = reqwest::Url::parse(&text).map_err(|e| bad(&format!("is not a URL ({e})")))?;
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(bad("is not http or https"));
+        }
+        if url.username() != "" || url.password().is_some() || url.query().is_some() {
+            return Err(bad("must not carry credentials or a query"));
+        }
+        // The host as written must be the host parsed, so a partial address
+        // such as `10.0.3.` (which a URL parser reads as 10.0.0.3) is
+        // refused instead of reinterpreted.
+        let written = match host_port.find(']') {
+            Some(end) if host_port.starts_with('[') => &host_port[..=end],
+            _ => match host_port.rsplit_once(':') {
+                Some((h, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => {
+                    h
+                }
+                _ => host_port,
+            },
+        };
+        let host = url.host_str().unwrap_or("").to_string();
+        if host.is_empty() || !host.eq_ignore_ascii_case(written) || !whole_host(&host) {
+            return Err(bad("does not name a whole host"));
+        }
+        Ok(PeerPrefix {
+            scheme: url.scheme().to_string(),
+            host,
+            port: if any_port {
+                None
+            } else {
+                url.port_or_known_default()
+            },
+            path: url.path().to_string(),
+        })
+    }
+}
+
+/// Whether `host` is an IP address or a complete DNS name: labels of
+/// letters, digits, `-` and `_`, none empty and none starting or ending
+/// with `-`. A text prefix such as `https://leep-` used to match
+/// `https://leep-1.internal`; parsed, it would match nothing, so it is
+/// refused rather than left to stop every forward without a word.
+fn whole_host(host: &str) -> bool {
+    if host.starts_with('[') || host.parse::<IpAddr>().is_ok() {
+        return true;
+    }
+    host.split('.').all(|label| {
+        !label.is_empty()
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    })
+}
+
+impl PeerPrefix {
+    fn matches(&self, url: &reqwest::Url) -> bool {
+        url.scheme() == self.scheme
+            && url.host_str() == Some(self.host.as_str())
+            && self
+                .port
+                .is_none_or(|p| url.port_or_known_default() == Some(p))
+            && url.path().starts_with(&self.path)
+    }
+
+    /// The host when it is an IP address.
+    fn ip(&self) -> Option<IpAddr> {
+        self.host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse()
+            .ok()
+    }
+}
+
 /// The URL's host when it is an IP address; names are never resolved.
 fn host_ip(url: &reqwest::Url) -> Option<IpAddr> {
     url.host_str()?
@@ -140,10 +246,7 @@ impl PeerPolicy {
             return Err(format!("peer address {address:?} has no host"));
         }
         let ip = host_ip(&url);
-        let listed = self
-            .prefixes
-            .iter()
-            .any(|p| address.starts_with(p.as_str()))
+        let listed = self.parsed_prefixes().any(|p| p.matches(&url))
             || ip.is_some_and(|ip| self.cidrs.iter().any(|c| c.contains(ip)));
         if !listed {
             return Err(format!(
@@ -164,25 +267,29 @@ impl PeerPolicy {
     /// prefix whose host is an IP address. Host names are never resolved, so
     /// an allow-list of names alone recognises no peer.
     pub fn recognises_peers(&self) -> bool {
-        !self.cidrs.is_empty()
-            || self.prefixes.iter().any(|p| {
-                reqwest::Url::parse(p)
-                    .ok()
-                    .and_then(|u| host_ip(&u))
-                    .is_some()
-            })
+        !self.cidrs.is_empty() || self.parsed_prefixes().any(|p| p.ip().is_some())
     }
 
     /// Whether a request from `ip` comes from a peer server.
     pub fn is_peer(&self, ip: IpAddr) -> bool {
         let ip = canonical(ip);
         self.cidrs.iter().any(|c| c.contains(ip))
-            || self.prefixes.iter().any(|p| {
-                reqwest::Url::parse(p)
-                    .ok()
-                    .and_then(|u| host_ip(&u))
-                    .is_some_and(|h| canonical(h) == ip)
-            })
+            || self
+                .parsed_prefixes()
+                .any(|p| p.ip().is_some_and(|h| canonical(h) == ip))
+    }
+
+    /// Check every `--peer-url-prefix`, so a malformed one stops the server
+    /// at startup instead of allowing nothing, or something else.
+    pub fn validate(&self) -> Result<(), String> {
+        for p in &self.prefixes {
+            p.parse::<PeerPrefix>()?;
+        }
+        Ok(())
+    }
+
+    fn parsed_prefixes(&self) -> impl Iterator<Item = PeerPrefix> + '_ {
+        self.prefixes.iter().filter_map(|p| p.parse().ok())
     }
 }
 
@@ -196,6 +303,7 @@ pub struct Coordination {
 
 impl Coordination {
     pub fn new(policy: PeerPolicy, holder: String) -> anyhow::Result<Arc<Self>> {
+        policy.validate().map_err(anyhow::Error::msg)?;
         let client = reqwest::Client::builder()
             // A redirect could send the client's token anywhere.
             .redirect(reqwest::redirect::Policy::none())
@@ -578,12 +686,15 @@ mod tests {
     #[test]
     fn only_listed_addresses_get_a_token() {
         let p = policy(
-            &["https://leep-", "http://127.0.0.1:"],
+            &["https://leep-2.internal:7070/", "http://127.0.0.1:"],
             &["10.0.0.0/8"],
             false,
         );
         assert!(p.check_url("https://leep-2.internal:7070").is_ok());
+        assert!(p.check_url("https://leep-2.internal:7070/").is_ok());
+        assert!(p.check_url("https://leep-3.internal:7070/").is_err());
         assert!(p.check_url("http://127.0.0.1:7391").is_ok());
+        assert!(p.check_url("http://127.0.0.10:7391").is_err());
         assert!(p.check_url("http://10.3.4.5:7070").is_ok());
         assert!(p.check_url("https://evil.example").is_err());
         assert!(p.check_url("http://11.0.0.1:7070").is_err());
@@ -591,11 +702,57 @@ mod tests {
         assert!(p.check_url("http://user:pw@10.0.0.1:7070").is_err());
         assert!(p.check_url("not a url").is_err());
         // Plain http only to loopback or private hosts, unless allowed.
-        let p = policy(&["http://leep-", "http://8.8.8.8"], &[], false);
+        let p = policy(
+            &["http://leep-1.internal:7070/", "http://8.8.8.8:"],
+            &[],
+            false,
+        );
         assert!(p.check_url("http://leep-1.internal:7070").is_err());
         assert!(p.check_url("http://8.8.8.8:7070").is_err());
-        let p = policy(&["http://leep-"], &[], true);
+        let p = policy(&["http://leep-1.internal:7070/"], &[], true);
         assert!(p.check_url("http://leep-1.internal:7070").is_ok());
+    }
+
+    /// A prefix is an origin, compared parsed: a longer host name, another
+    /// port, scheme or path, or credentials do not pass for it.
+    #[test]
+    fn prefixes_match_whole_origins() {
+        let p = policy(&["https://leep.example.com"], &[], false);
+        assert!(p.check_url("https://leep.example.com/").is_ok());
+        assert!(p.check_url("https://LEEP.example.com:443/").is_ok());
+        assert!(p.check_url("https://leep.example.com.evil.net/").is_err());
+        assert!(p.check_url("https://leep.example.community/").is_err());
+        assert!(p.check_url("https://leep.example.com:8443/").is_err());
+        assert!(p.check_url("http://leep.example.com/").is_err());
+        assert!(p.check_url("https://leep.example.com@evil.net/").is_err());
+        let p = policy(&["https://gw.example.com/leep/"], &[], false);
+        assert!(p.check_url("https://gw.example.com/leep/").is_ok());
+        assert!(p.check_url("https://gw.example.com/other/").is_err());
+        let p = policy(&["http://[fd00::7]:7070/"], &[], false);
+        assert!(p.check_url("http://[fd00::7]:7070").is_ok());
+        assert!(p.is_peer("fd00::7".parse().unwrap()));
+        // Partial hosts and other malformed prefixes are refused at startup.
+        for bad in [
+            "http://10.0.3.",
+            "10.0.3.7:7070",
+            "ftp://10.0.0.1/",
+            "https://u:p@leep/",
+            "https://leep-",
+            "https://leep-:7070/",
+            "https://leep.internal.",
+            "https://leep..internal/",
+        ] {
+            assert!(policy(&[bad], &[], false).validate().is_err(), "{bad}");
+        }
+        for good in [
+            "http://10.0.3.7:7070/",
+            "http://127.0.0.1:",
+            "https://leep-1.internal:7070/",
+            "http://leep_server:7070/",
+            "http://[::1]:",
+        ] {
+            assert!(policy(&[good], &[], false).validate().is_ok(), "{good}");
+        }
     }
 
     #[test]

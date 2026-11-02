@@ -173,7 +173,7 @@ loop, for at most 30 s (then 409, which clients retry):
   the client and applies its own land policy snapshot, so forwarding grants
   no identity. The ref log actor is the client's token, as before.
 - **H5, allow-list.**
-  - Lands go only to an address that starts with a `--peer-url-prefix`, or
+  - Lands go only to an address on a `--peer-url-prefix` origin, or
     whose host is an IP address in a `--peer-cidr`.
   - Redirects are refused, and so are URLs with credentials or a query.
   - Plain `http://` is refused unless the host is loopback or private, or
@@ -185,8 +185,12 @@ loop, for at most 30 s (then 409, which clients retry):
     and checks that `GET {advertise-url}/v1/health` answers with its own
     `Leep-Instance` header. A wrong URL stops the server instead of
     stranding lands.
-  - `--peer-url-prefix` is compared as raw text, so it is written with the
-    port and trailing slash (`https://leep-1.internal:7070/`).
+  - `--peer-url-prefix` is written as an origin with the port and
+    trailing slash (`https://leep-1.internal:7070/`). Since 2026-11 it is
+    compared parsed (scheme, host, port, then path prefix), no longer as
+    raw text; `http://host:` with no port allows every port of that host,
+    and a partial host (`http://10.0.3.`, `https://leep-`) is refused at
+    startup.
   - A server whose allow-list has host names only warns at startup: no
     request can be recognised as a peer's, so forwarded lands are charged
     the concurrency limit twice and may be forwarded again.

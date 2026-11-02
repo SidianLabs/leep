@@ -50,7 +50,15 @@ async fn call(
     token: Option<&str>,
     body: Vec<u8>,
 ) -> Reply {
-    let mut b = Request::builder().method(method).uri(uri);
+    let ty = if method == Method::PUT {
+        "application/octet-stream"
+    } else {
+        "application/json"
+    };
+    let mut b = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("content-type", ty);
     if let Some(t) = token {
         b = b.header(header::AUTHORIZATION, format!("Bearer {t}"));
     }
@@ -618,4 +626,41 @@ fn token_author_must_be_one_non_empty_line() {
     assert!(Auth::parse(&entry("A <a@example.com>")).is_ok());
     assert!(Auth::parse(&entry(" ")).is_err());
     assert!(Auth::parse(&entry("A\nB")).is_err());
+}
+
+/// Clients built before write bodies had to declare their type sent blob
+/// uploads without `Content-Type`: with a token that is still accepted, a
+/// wrong type never is, and a server with tokens does not check the host.
+#[tokio::test]
+async fn a_token_excuses_a_missing_content_type_but_not_a_wrong_one() {
+    let app = app(true);
+    let h = Hash::of_blob(b"x");
+    let put = |ty: Option<&str>, token: Option<&str>| {
+        let mut b = Request::builder()
+            .method(Method::PUT)
+            .uri(format!("/v1/blobs/{h}"))
+            .header(header::HOST, "leep.example.com");
+        if let Some(ty) = ty {
+            b = b.header(header::CONTENT_TYPE, ty);
+        }
+        if let Some(t) = token {
+            b = b.header(header::AUTHORIZATION, format!("Bearer {t}"));
+        }
+        b.body(Body::from("x")).unwrap()
+    };
+    let status = |req: Request<Body>| {
+        let app = app.clone();
+        async move { app.oneshot(req).await.unwrap().status() }
+    };
+    assert_eq!(status(put(None, Some(WRITE))).await, StatusCode::NO_CONTENT);
+    assert_eq!(
+        status(put(Some("text/plain"), Some(WRITE))).await,
+        StatusCode::UNSUPPORTED_MEDIA_TYPE
+    );
+    assert_eq!(
+        status(put(Some("application/octet-stream"), Some(WRITE))).await,
+        StatusCode::NO_CONTENT
+    );
+    // Without a token: 401 before anything else.
+    assert_eq!(status(put(None, None)).await, StatusCode::UNAUTHORIZED);
 }

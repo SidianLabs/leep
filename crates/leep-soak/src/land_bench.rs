@@ -88,6 +88,7 @@ impl Http {
         let res = self
             .client
             .put(format!("{}/v1/blobs/{h}", self.base))
+            .header("content-type", "application/octet-stream")
             .body(data.to_vec())
             .send()
             .await?;
@@ -278,6 +279,8 @@ async fn main() -> Result<()> {
         .no_proxy()
         .timeout(Duration::from_secs(120))
         .tcp_nodelay(true)
+        // Below the server's default --header-read-timeout (30 s).
+        .pool_idle_timeout(Duration::from_secs(20))
         .pool_max_idle_per_host(256)
         .build()?;
     let servers: Vec<Arc<Http>> = args

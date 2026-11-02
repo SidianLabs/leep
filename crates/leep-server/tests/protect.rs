@@ -46,6 +46,14 @@ impl Api {
 
     async fn call(&self, method: Method, uri: &str, body: Vec<u8>) -> Reply {
         let req = Request::builder()
+            .header(
+                "content-type",
+                if method == Method::PUT {
+                    "application/octet-stream"
+                } else {
+                    "application/json"
+                },
+            )
             .method(method)
             .uri(uri)
             .body(Body::from(body))
