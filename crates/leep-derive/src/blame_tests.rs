@@ -28,9 +28,26 @@ struct Slow {
     reads: AtomicUsize,
     /// Fail every read whose number is a multiple of this (0: none).
     fail_every: AtomicUsize,
+    /// Reads of skiplist rows, single or batched.
+    skip_reads: AtomicUsize,
+    /// Writes of cached blames.
+    blame_puts: AtomicUsize,
 }
 
 impl Slow {
+    fn note_kind(&self, kind: &str) {
+        if kind == <crate::derived::Skiplist as crate::derived::DerivedKind>::NAME {
+            self.skip_reads.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn counts(&self) -> (usize, usize) {
+        (
+            self.reads.load(Ordering::Relaxed),
+            self.skip_reads.load(Ordering::Relaxed),
+        )
+    }
+
     async fn read(&self) -> leep_core::Result<()> {
         let n = self.reads.fetch_add(1, Ordering::Relaxed) + 1;
         let us = self.latency_us.load(Ordering::Relaxed);
@@ -93,6 +110,7 @@ impl MetaStore for Slow {
     }
     async fn get_derived(&self, kind: &str, key: &Hash) -> leep_core::Result<Option<Bytes>> {
         self.read().await?;
+        self.note_kind(kind);
         self.inner.get_derived(kind, key).await
     }
     async fn get_derived_many(
@@ -101,9 +119,13 @@ impl MetaStore for Slow {
         keys: &[Hash],
     ) -> leep_core::Result<Vec<Option<Bytes>>> {
         self.read().await?;
+        self.note_kind(kind);
         self.inner.get_derived_many(kind, keys).await
     }
     async fn put_derived(&self, kind: &str, key: &Hash, value: Bytes) -> leep_core::Result<()> {
+        if kind == crate::blame::KIND {
+            self.blame_puts.fetch_add(1, Ordering::Relaxed);
+        }
         self.inner.put_derived(kind, key, value).await
     }
     async fn delete_derived_kind(&self, kind: &str) -> leep_core::Result<u64> {
@@ -1242,4 +1264,245 @@ async fn repeated_blames_past_the_walk_limit_make_progress() {
     assert_eq!(rounds, 4, "12 merges, 3 walks a request");
     let again = r.blame_run(main, &path, cuts, true, 3).await.unwrap();
     assert_eq!((again.walks, again.examined, again.complete), (0, 0, true));
+}
+
+/// A linear history of `len` changesets, each changing one file: `tracked`
+/// files changed 6 to 25 times each at random points (each change appends
+/// a line), the rest changing one of a few busy files. Returns the tip.
+async fn swarm(r: &Repo, len: usize, tracked: usize, seed: u64) -> (ChangesetId, Vec<String>) {
+    let mut rng = Lcg(seed);
+    let names: Vec<String> = (0..tracked).map(|i| format!("src/m{i}.rs")).collect();
+    let mut at: Vec<(usize, usize)> = Vec::new();
+    for f in 0..tracked {
+        for _ in 0..6 + rng.below(20) {
+            at.push((1 + rng.below(len - 1), f));
+        }
+    }
+    at.sort_unstable();
+    let mut texts: Vec<String> = names.iter().map(|n| format!("// {n}\n")).collect();
+    let first: Vec<(&str, Option<&str>)> = names
+        .iter()
+        .zip(&texts)
+        .map(|(n, t)| (n.as_str(), Some(t.as_str())))
+        .collect();
+    let mut tip = commit(r, &[], &first).await;
+    let mut next = at.iter().peekable();
+    for i in 1..len {
+        let mut f = None;
+        while let Some(&&(j, g)) = next.peek() {
+            if j > i {
+                break;
+            }
+            next.next();
+            f = Some(g);
+        }
+        tip = match f {
+            Some(f) => {
+                texts[f].push_str(&format!("line {i}\n"));
+                commit(r, &[tip], &[(&names[f], Some(&texts[f]))]).await
+            }
+            None => {
+                let busy = format!("busy/{}", rng.below(4));
+                commit(r, &[tip], &[(&busy, Some(&format!("{i}\n")))]).await
+            }
+        };
+    }
+    (tip, names)
+}
+
+/// A blame at a head whose answer is the cached blame of the file's newest
+/// changer stores it at the head, once and as the same bytes, so the next
+/// blame there is a lookup.
+#[tokio::test]
+async fn a_blame_answered_by_a_changers_cached_blame_is_kept_at_the_head() {
+    let (r, meta) = slow_repo();
+    let mut text = String::new();
+    let mut tip = commit(&r, &[], &[("f", Some("0\n")), ("g", Some("0\n"))]).await;
+    for i in 0..5 {
+        text.push_str(&format!("line {i}\n"));
+        tip = commit(&r, &[tip], &[("f", Some(&text))]).await;
+    }
+    let latest = tip;
+    for i in 0..40 {
+        tip = commit(&r, &[tip], &[("g", Some(&format!("{i}\n")))]).await;
+    }
+    let path = rp("f");
+    r.blame_walk(tip, &path, true, true).await.unwrap();
+    for i in 0..40 {
+        tip = commit(&r, &[tip], &[("g", Some(&format!("again {i}\n")))]).await;
+    }
+    crate::derived::derive::<crate::derived::HistoryTree>(&r, tip)
+        .await
+        .unwrap();
+    let (want, _) = r.blame_walk_in(tip, &path, None, false).await.unwrap();
+
+    let blame_at = |id: ChangesetId| {
+        let meta = meta.clone();
+        let key = crate::blame::cache_key(id, &path);
+        async move {
+            meta.inner
+                .get_derived(crate::blame::KIND, &key)
+                .await
+                .unwrap()
+        }
+    };
+    assert!(blame_at(tip).await.is_none());
+    let puts = meta.blame_puts.load(Ordering::Relaxed);
+    meta.reads.store(0, Ordering::Relaxed);
+    let cold = Repo::new(r.blobs().clone(), meta.clone());
+    let (got, examined) = cold.blame_walk(tip, &path, true, true).await.unwrap();
+    let walked = meta.reads.load(Ordering::Relaxed);
+    assert_eq!(got, want);
+    assert!(
+        examined > 0,
+        "the newest changer's blame was found by a walk"
+    );
+    assert_eq!(meta.blame_puts.load(Ordering::Relaxed), puts + 1);
+    assert_eq!(blame_at(tip).await, blame_at(latest).await);
+
+    meta.reads.store(0, Ordering::Relaxed);
+    let cold = Repo::new(r.blobs().clone(), meta.clone());
+    let (again, examined) = cold.blame_walk(tip, &path, true, true).await.unwrap();
+    let looked_up = meta.reads.load(Ordering::Relaxed);
+    assert_eq!(again, want);
+    assert_eq!(examined, 0);
+    assert_eq!(meta.blame_puts.load(Ordering::Relaxed), puts + 1);
+    assert!(
+        looked_up <= walked && looked_up <= 6,
+        "{looked_up} reads at the head, {walked} for the walk"
+    );
+}
+
+/// Skiplists kept by queries are the stored ones, are found again without
+/// a read, and stay within the cache's budget.
+#[tokio::test]
+async fn kept_skiplists_are_the_stored_ones_within_the_budget() {
+    let (r, meta) = slow_repo();
+    let mut ids = vec![commit(&r, &[], &[("f", Some("0\n"))]).await];
+    for i in 0..400 {
+        let p = ids[ids.len() - 1];
+        ids.push(commit(&r, &[p], &[("f", Some(&format!("{i}\n")))]).await);
+    }
+    let small = Repo::new(r.blobs().clone(), meta.clone())
+        .with_cache_budget(crate::DEFAULT_CACHE_BYTES >> 8);
+    for &id in &ids {
+        let stored = crate::derived::Skiplist::decode(
+            &meta
+                .inner
+                .get_derived("skiplist", &id.0)
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(&small.query_skiplist(id).await.unwrap()[..], &stored[..]);
+    }
+    let held = small.skip_reads.held_bytes();
+    assert!(held <= small.skip_reads.budget(), "{held} bytes held");
+    assert!(
+        small.cached_skips(ids[0]).is_none(),
+        "the oldest list is evicted"
+    );
+    let before = meta.counts().1;
+    for &id in &ids[ids.len() - 20..] {
+        let kept = small.query_skiplist(id).await.unwrap();
+        assert_eq!(kept, r.skiplist(id).await.unwrap());
+    }
+    assert_eq!(meta.counts().1, before, "kept lists are read again");
+}
+
+/// A first blame in a process that blamed other files before reads far
+/// fewer skiplists than the first blame in a new one, and answers the same.
+#[tokio::test]
+async fn a_warm_process_reads_few_skiplists_for_a_new_blame() {
+    let (r, meta) = slow_repo();
+    let (tip, names) = swarm(&r, 1500, 8, 7).await;
+    crate::derived::derive::<crate::derived::HistoryTree>(&r, tip)
+        .await
+        .unwrap();
+    let server = Repo::new(r.blobs().clone(), meta.clone());
+    let mut first = 0;
+    for n in &names {
+        let before = meta.counts().1;
+        let (b, _) = server.blame_walk(tip, &rp(n), true, false).await.unwrap();
+        first += meta.counts().1 - before;
+        let (want, _) = r.blame_walk_in(tip, &rp(n), None, false).await.unwrap();
+        assert_eq!(b, want, "{n}");
+    }
+    // Uncached blames again, at the same head: every list the walks step
+    // down is kept.
+    let mut warm = 0;
+    for n in &names {
+        let before = meta.counts().1;
+        let (b, _) = server.blame_walk(tip, &rp(n), true, false).await.unwrap();
+        warm += meta.counts().1 - before;
+        let fresh = Repo::new(r.blobs().clone(), meta.clone());
+        assert_eq!(
+            b,
+            fresh.blame_walk(tip, &rp(n), true, false).await.unwrap().0
+        );
+    }
+    assert!(first > 40, "{first} skiplist reads cold");
+    assert!(
+        warm * 10 <= first,
+        "{warm} skiplist reads warm, {first} cold"
+    );
+}
+
+/// Metadata calls per blame on a swarm-like history (`cargo test -p
+/// leep-derive blame_calls_on_a_swarm_history -- --ignored --nocapture`).
+#[tokio::test]
+#[ignore]
+async fn blame_calls_on_a_swarm_history() {
+    let (r, meta) = slow_repo();
+    let (mut tip, names) = swarm(&r, 4100, 40, 11).await;
+    crate::derived::derive::<crate::derived::HistoryTree>(&r, tip)
+        .await
+        .unwrap();
+    let server = Repo::new(r.blobs().clone(), meta.clone());
+    let report = |label: &str, calls: &[(usize, usize)]| {
+        let mut all: Vec<usize> = calls.iter().map(|c| c.0).collect();
+        all.sort_unstable();
+        let skips: usize = calls.iter().map(|c| c.1).sum();
+        println!(
+            "{label}: calls per blame mean {:.1} median {} max {}, skiplist reads mean {:.1}",
+            all.iter().sum::<usize>() as f64 / all.len() as f64,
+            all[all.len() / 2],
+            all[all.len() - 1],
+            skips as f64 / all.len() as f64
+        );
+    };
+    let run = |label: &'static str, tip: ChangesetId, names: &[String]| {
+        let (server, meta, names) = (server.clone(), meta.clone(), names.to_vec());
+        async move {
+            let mut calls = Vec::new();
+            for n in &names {
+                let before = meta.counts();
+                server.blame_walk(tip, &rp(n), true, true).await.unwrap();
+                let after = meta.counts();
+                calls.push((after.0 - before.0, after.1 - before.1));
+            }
+            report(label, &calls);
+        }
+    };
+    run("first blames at head 1, files 0-19", tip, &names[..20]).await;
+    run("first blames at head 1, files 20-39", tip, &names[20..]).await;
+    for i in 0..40 {
+        let f = &names[i % 4];
+        let t = format!("moved {i}\n");
+        tip = match i % 5 {
+            0 => {
+                let info = r.lookup_file(tip, &rp(f)).await.unwrap().unwrap();
+                let old = r.blobs().get(&info.content).await.unwrap().unwrap();
+                let new = format!("{}{t}", String::from_utf8(old.to_vec()).unwrap());
+                commit(&r, &[tip], &[(f, Some(&new))]).await
+            }
+            _ => commit(&r, &[tip], &[("busy/0", Some(&t))]).await,
+        };
+    }
+    crate::derived::derive::<crate::derived::HistoryTree>(&r, tip)
+        .await
+        .unwrap();
+    run("blames at head 2 (40 lands later)", tip, &names).await;
+    run("again at head 2", tip, &names).await;
 }

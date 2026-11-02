@@ -123,6 +123,8 @@ pub struct Repo {
     /// Skiplists computed, or read while creating changesets (see
     /// `SkiplistCache`).
     pub(crate) skiplists: Arc<SkiplistCache>,
+    /// Skiplists read from the store by queries (see `SkipReadCache`).
+    pub(crate) skip_reads: Arc<SkipReadCache>,
     /// Decoded `log-filter-v1` rows and author names (see `filter_row`).
     pub(crate) log_filter: Arc<crate::derived::LogFilterCaches>,
     /// One lock per derived kind, held while a missing range is derived (see
@@ -407,6 +409,21 @@ pub(crate) type SearchTreeCache = SizedCache<Bytes, SEARCH_TREE_CACHE_BYTES>;
 /// Linux-sized tree opens.
 const SEARCH_TREE_CACHE_BYTES: usize = 64 << 20;
 
+/// Skiplists read by queries, by changeset: filtered logs ride first-parent
+/// chains down by them, and blame steps down them between a file's changes,
+/// so every blame of a busy repository reads the same main-chain lists.
+/// Kept apart from [`SkiplistCache`], whose lists creation trusts:
+/// a row is cached here as read, so one damaged in the store and repaired by
+/// another process stays cached until this process restarts, like
+/// [`SearchTreeCache`]. A list is a function of its changeset, so a correct
+/// row is never stale.
+pub(crate) type SkipReadCache = SizedCache<Arc<[SkipEntry]>, SKIP_READ_CACHE_BYTES>;
+
+/// Bytes [`SkipReadCache`] may hold, counting a list at twice its 40 bytes
+/// per entry: about 30,000 lists of 14 entries, the main chain of a history
+/// that deep, or the hot stretch of a deeper one.
+const SKIP_READ_CACHE_BYTES: usize = 32 << 20;
+
 /// Content-addressed values by hash, bounded like [`AncestryCache`] but by
 /// bytes: each map holds up to half of the budget, `BUDGET` unless the
 /// `Repo`'s cache budget scales it.
@@ -520,8 +537,8 @@ impl<V> SizedMaps<V> {
 
 /// Bytes the byte-bounded derive caches of one [`Repo`] hold by default:
 /// path-history nodes, parts, roots and patches, tree nodes, search's
-/// directory filters, and the filtered-log caches. See
-/// [`Repo::with_cache_budget`].
+/// directory filters, skiplists read by queries, and the filtered-log
+/// caches. See [`Repo::with_cache_budget`].
 pub const DEFAULT_CACHE_BYTES: usize = HISTORY_CACHE_BYTES
     + HISTORY_RAW_CACHE_BYTES
     + HISTORY_PART_CACHE_BYTES
@@ -530,6 +547,7 @@ pub const DEFAULT_CACHE_BYTES: usize = HISTORY_CACHE_BYTES
     + NODE_CACHE_BYTES
     + crate::lazy_tree::LAZY_NODE_CACHE_BYTES
     + SEARCH_TREE_CACHE_BYTES
+    + SKIP_READ_CACHE_BYTES
     + crate::derived::LOG_FILTER_CACHE_BYTES;
 
 /// Every cache's default bound times `total / DEFAULT_CACHE_BYTES`, so the
@@ -588,6 +606,7 @@ impl Repo {
             lazy_create: false,
             search_trees: Arc::default(),
             skiplists: Arc::default(),
+            skip_reads: Arc::default(),
             log_filter: Arc::default(),
             derive_locks: Arc::default(),
             staged_values: Arc::default(),
@@ -841,6 +860,7 @@ impl Repo {
         self.lazy = Arc::new(crate::lazy_tree::LazyTrees::scaled(s));
         self.search_trees = Arc::new(SizedCache::scaled(s));
         self.skiplists = Arc::new(SkiplistCache::scaled(s));
+        self.skip_reads = Arc::new(SizedCache::scaled(s));
         self.log_filter = Arc::new(crate::derived::LogFilterCaches::scaled(s));
         self
     }

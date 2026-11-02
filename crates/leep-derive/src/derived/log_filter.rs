@@ -26,7 +26,7 @@ use bytes::Bytes;
 use leep_core::changeset::{EXTRA_AGENT_MODEL, EXTRA_AGENT_SESSION};
 use leep_core::{Changeset, ChangesetId, DerivedRow, Error, Hash, Result};
 
-use super::{derive, DerivedKind, SkipEntry};
+use super::{derive, DerivedKind};
 use crate::ancestry::Reader;
 use crate::repo::{ByKey, CacheScale, SizedCache};
 use crate::Repo;
@@ -351,16 +351,13 @@ const ROW_CACHE_BYTES: usize = 64 << 20;
 /// Names kept in memory, counted at their length plus overhead.
 const NAME_CACHE_BYTES: usize = 16 << 20;
 
-/// Bytes of skiplists kept for filtered logs.
-const SKIP_CACHE_BYTES: usize = 32 << 20;
-
 /// Bytes of [`own_fingerprints`] kept, counting about 80 bytes of overhead
 /// per changeset: a few hundred thousand changesets.
 const FPS_CACHE_BYTES: usize = 48 << 20;
 
 /// What the caches below hold in total at their defaults.
 pub(crate) const LOG_FILTER_CACHE_BYTES: usize =
-    ROW_CACHE_BYTES + NAME_CACHE_BYTES + SKIP_CACHE_BYTES + FPS_CACHE_BYTES;
+    ROW_CACHE_BYTES + NAME_CACHE_BYTES + FPS_CACHE_BYTES;
 
 /// Author fingerprints whose name row this process has staged, so each
 /// author's row is written once per process rather than once per changeset.
@@ -372,9 +369,6 @@ const WRITTEN_NAMES: usize = 1 << 20;
 pub(crate) struct LogFilterCaches {
     rows: SizedCache<FilterRow, ROW_CACHE_BYTES>,
     names: SizedCache<Option<String>, NAME_CACHE_BYTES>,
-    /// Skiplists read by filtered logs, which `Repo`'s skiplist cache does
-    /// not keep.
-    skips: SizedCache<Arc<[SkipEntry]>, SKIP_CACHE_BYTES>,
     /// Fingerprints of changesets' own values, which merge walks read for
     /// every changeset a side brings in, often the same ones merge after
     /// merge.
@@ -389,7 +383,6 @@ impl LogFilterCaches {
         LogFilterCaches {
             rows: SizedCache::scaled(s),
             names: SizedCache::scaled(s),
-            skips: SizedCache::scaled(s),
             fps: SizedCache::scaled(s),
             ..Default::default()
         }
@@ -452,15 +445,6 @@ impl Repo {
     pub(crate) fn cache_filter_row(&self, id: ChangesetId, row: Arc<FilterRow>) {
         let weight = row.weight();
         self.log_filter.rows.insert(id.0, row, weight / 2);
-    }
-
-    pub(crate) fn cached_skips(&self, id: ChangesetId) -> Option<Arc<[SkipEntry]>> {
-        self.log_filter.skips.get(&id.0).map(|s| (*s).clone())
-    }
-
-    pub(crate) fn cache_skips(&self, id: ChangesetId, sk: Arc<[SkipEntry]>) {
-        let n = 40 * sk.len();
-        self.log_filter.skips.insert(id.0, Arc::new(sk), n);
     }
 
     /// Names behind author fingerprints, `None` where no name row exists (a

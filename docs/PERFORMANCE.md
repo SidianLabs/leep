@@ -806,6 +806,141 @@ What it suggests, to be checked on the real baseline:
   and the warmer; `pg_database_size` grew 5 to 8 KB per land, the rest
   being Postgres's own index and page overhead.
 
+### Capacity of one server in the mixed swarm (ADR 0073, ADR 0074)
+
+Measured 2026-11-01 and 2026-11-02.
+
+One release `leep-server` pinned to 2 vCPU (`taskset -c 0,1`), `leep-swarm`
+on the other two (`-c 2,3`), Postgres 16 on the same 4-vCPU host, filesystem
+blobs, a fresh database per run, `--meta-pool-size 32`, `RUST_LOG=warn`.
+Swarm: `--think-ms 2000 --reads 4 --stale 4 --files 2 --ramp 60
+--duration 300` with the default read mix (`log=3,files=3,blame=1,search=1,
+diff=2`). Each run waited for the load average to fall below 1.5 first,
+except where noted. Criteria: lands at least 90% of offered, land p99 at
+most 5 s, sync, files and diff p99 at most 500 ms, log p99 at most 2 s,
+blame and search p99 at most 3 s, history-index lag p50 at most 64 and max
+at most 512 generations.
+
+#### How 2,000 agents collapsed, and what fixed each stage
+
+| Build and mode | lands/s | create p50 | log p99 | blame p50 | history lag p50 / max |
+|---|---|---|---|---|---|
+| `--indexing local` (default) | 52.1 | 28 ms | 30 s (6,263 timeouts) | 24 s (4,719 timeouts) | 2,554 / 3,841 |
+| `--indexing lease`, no header | 47.0 | 1.6 s | 3.7 s (9,304 408s) | mostly "indexing" answers | 3,637 / 3,664 |
+| + skiplist pre-check and index lane (ADR 0073) | 46.4 | 3.4 s | 23.6 s (790 408s) | 15.9 s | 626 / 1,088 |
+| + blame and filtered-log permits (ADR 0074), `stale-ok` | 56.4 | 3.6 s | 10.9 s | shed (6,823) | 3,862 / 3,975 |
+
+- **Local mode.** Every blame and path log derived the missing history
+  inline under the warmer's derive lock, timed out at 30 s and threw the
+  staged work away. The warmer spent most of its time waiting for the lock.
+- **Lease mode before ADR 0073.** Once the index was a few hundred
+  changesets behind, every bounded query walked its whole budget, two serial
+  round trips per changeset on a linear tip. That filled the shared pool.
+  The lease-holding warmer drew on the same pool, so one history pass ran
+  326 s and derived about 350 changesets while about 13,500 landed.
+- **After ADR 0073.** The warmer keeps pace (13,905 of 14,580 lands
+  indexed) and lag stays bounded. The server is then CPU- and pool-bound,
+  with blame and path log holding most connections.
+- **After ADR 0074.** Shedding works, but at 2,000 agents the basic
+  operations alone saturate two cores: upload, create, files, sync and
+  diff, about 440 requests a second. Lag regrows, because the warmer now
+  loses on CPU.
+
+#### Agents per server
+
+Build with ADR 0073 and ADR 0074, `--indexing lease`, `--request-timeout
+25s`, swarm sending `Leep-Indexing: stale-ok`:
+
+| Agents | lands/s (per agent) | land p99 | create p99 | log p99 | blame p99 | lag p50 / max | blame shed | criteria |
+|---|---|---|---|---|---|---|---|---|
+| 250 | 20.5 (0.082) | 143 ms | 27 ms | 17 ms | 47 ms | 2 / 11 | 0.5% | pass |
+| 500 | 41.2 (0.082) | 66 ms | 23 ms | 28 ms | 84 ms | 6 / 17 | 3% | pass |
+| 1,000 | 77.5 (0.078) | 690 ms | 109 ms | 305 ms | 606 ms | 35 / 149 | 48% | pass |
+| 2,000 | 56.4 (0.028) | 41 s | 5.7 s | 10.9 s | shed | 3,862 / 3,975 | 99% | fail |
+
+The 1,000-agent run started at load 3.6 and the 2,000-agent one at 4.7.
+No run lost or doubled a land.
+
+With the cross-request skiplist cache and blames kept at the head, and
+the same configuration:
+
+| Agents | lands/s | land p99 | create p99 | log p99 | blame p50 / p99 | blames served / shed | lag p50 / max |
+|---|---|---|---|---|---|---|---|
+| 1,000, before | 77.5 | 690 ms | 109 ms | 305 ms | 49 / 606 ms | 4,831 / 4,443 | 35 / 149 |
+| 1,000, with the cache | 78.5 | 434 ms | 85 ms | 182 ms | 22 / 145 ms | 7,463 / 1,903 | 31 / 103 |
+| 2,000, with the cache | 54.9 | 59 s | 4.4 s | 8.4 s | shed | 366 / 6,352 | 3,853 / 3,876 |
+
+The 2,000-agent run still fails: upload, create, files, sync and diff
+saturate two cores on their own.
+
+**Where a blame's time went.** One cold blame on a 4,100-changeset history,
+with the server idle, cost about 27 ms of CPU: 14.5 ms in the server and
+12.9 ms in Postgres. Wall time was about the same as CPU, and about 85% of
+it was per-query overhead. Line diffs were about 1%. A cold blame made 25 to
+119 queries, and 56% to 69% of them read one skiplist row each while the
+walk stepped from one changer of the file to the next. Nothing cached those
+rows across requests.
+
+Metadata calls per blame, before and after the cache:
+
+| Case | Before | After |
+|---|---|---|
+| A file's first blame | 117 to 122 | 85 to 105 |
+| Blame at a new head, 40 lands later | 77.6 | 8.7 |
+| The same blame again | 68.3 | 2.0 |
+
+Sizing from these runs:
+- **Swarm agents.** About 500 swarm agents per vCPU (about 220 requests a
+  second, about 40 lands a second) with blame partly shed. About 250 per
+  vCPU if every blame must be answered.
+- **Real agents.** A swarm agent's requests are lighter than a real
+  coding agent's (2 small files, a small repository, tiny blobs) but far
+  more frequent: a cycle of about 12 s against minutes. A real agent likely
+  puts 5 to 20 times less load on the server, so one vCPU likely serves
+  several thousand of them.
+- **Re-measuring.** Both numbers are order-of-magnitude and should be
+  re-measured on a 4 to 8 vCPU server with the load average below the core
+  count at the start.
+
+#### Not yet validated
+
+- **Long histories.** The swarm histories hold a few thousand changesets;
+  the target holds millions.
+
+- **Several servers.** Several stateless servers sharing Postgres and the
+  blob store should scale reads and creates, but only one server has been
+  measured. Lease handoff under load is also unmeasured. Measuring them
+  needs a host with at least 8 vCPU (two servers of 2 vCPU, Postgres and
+  the swarm).
+- **One ref's land leader.** About 220 lands a second per ref on 2 vCPU
+  (`leep-land-bench`, 1,024 agents). At one land per agent every ten
+  minutes, 100,000 agents is about 170 lands a second, within it.
+- **History-tree derivation.** It is serial along a linear chain, at about
+  1 ms per changeset, so about 1,000 changesets a second per chain.
+- **The ref log and Postgres writes.** The ref log's global sequence and
+  Postgres write volume (about 10 KB per land) come next.
+
+#### Extending blames in the warmer (experiment, not merged)
+
+An experimental build had the index warmer extend cached blames for the
+files each landed changeset wrote, with a walk cut to 8 changers. In this
+swarm it did not help:
+
+| Run | blame shed | blame p99 | history lag p50 / max | log p99 |
+|---|---|---|---|---|
+| 1,000 agents, off | 4,443 | 606 ms | 35 / 149 | 305 ms |
+| 1,000 agents, on | 5,176 | 738 ms | 128 / 623 | 969 ms |
+
+- **What it did.** 3,158 of its attempts ended too far from any cached
+  blame and only 28 rows were written, yet the pass took 124 s in 300 s.
+  That CPU came out of history warming.
+- **Why.** Swarm blames are spread over thousands of distinct files and
+  half of them are shed, so almost no file has a cached blame near its new
+  changes.
+- **Decision.** It was not merged. It is worth trying again only with a
+  demand-driven seeding rule (files blamed or read recently) and a CPU
+  priority between warm groups, history first.
+
 ### One indexer per kind (ADR 0058), local smoke test
 
 `leep-swarm` on this branch, release build, a fresh Postgres 16 database
