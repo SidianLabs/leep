@@ -46,6 +46,10 @@ futures-util.workspace = true
 # Forwarding lands to the server that coordinates their ref (ADR 0056).
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 
+# mallopt, to cap glibc's malloc arenas (src/main.rs).
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 leep-testkit.workspace = true
 base64.workspace = true

@@ -1479,7 +1479,28 @@ fn log_colours(terminal: bool, no_color: Option<std::ffi::OsString>) -> bool {
 /// large subcommand futures overflow.
 const MAIN_STACK_BYTES: usize = 8 * 1024 * 1024;
 
+/// glibc gives each thread that contends for the heap an arena of its own, up
+/// to eight per CPU, and each keeps what is freed in it. A server whose
+/// requests free buffers on other threads than allocated them kept 2.7 GB
+/// resident with 1.19 GB in use over 32 arenas at 1M changesets. Two arenas
+/// cap that, as for the importer (`leep-git`). Must run before any thread
+/// starts; an operator's `MALLOC_ARENA_MAX` (which glibc reads itself) wins.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn limit_malloc_arenas() {
+    if std::env::var_os("MALLOC_ARENA_MAX").is_some() {
+        return;
+    }
+    // SAFETY: mallopt only sets an allocator parameter; no other thread exists yet.
+    unsafe {
+        libc::mallopt(libc::M_ARENA_MAX, 2);
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn limit_malloc_arenas() {}
+
 fn main() -> anyhow::Result<()> {
+    limit_malloc_arenas();
     std::thread::Builder::new()
         .name("main".into())
         .stack_size(MAIN_STACK_BYTES)
@@ -2304,6 +2325,9 @@ impl BlobStore for ArcBlobs {
     }
     async fn contains(&self, hash: &leep_core::Hash) -> leep_core::Result<bool> {
         self.0.contains(hash).await
+    }
+    async fn warm(&self) -> leep_core::Result<()> {
+        self.0.warm().await
     }
     async fn get_stored(&self, hash: &leep_core::Hash) -> leep_core::Result<Option<bytes::Bytes>> {
         self.0.get_stored(hash).await
