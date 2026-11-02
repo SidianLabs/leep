@@ -50,6 +50,10 @@ impl BlobStore for FaultyBlobStore {
             .await
     }
 
+    async fn warm(&self) -> Result<()> {
+        self.inner.warm().await
+    }
+
     async fn get_exact(&self, hash: &Hash) -> Result<Option<Bytes>> {
         self.plan
             .run(Op::Get, self.inner.get_exact(hash), |plan, v| {

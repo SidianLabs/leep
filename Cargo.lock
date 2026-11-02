@@ -2597,6 +2597,7 @@ dependencies = [
  "leep-meta",
  "leep-store",
  "leep-testkit",
+ "libc",
  "metrics",
  "metrics-exporter-prometheus",
  "postcard",

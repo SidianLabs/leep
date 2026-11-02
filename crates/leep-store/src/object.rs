@@ -243,6 +243,10 @@ impl BlobStore for ObjectBlobStore {
         }
     }
 
+    async fn warm(&self) -> Result<()> {
+        self.packs.view().await.map(|_| ())
+    }
+
     async fn contains(&self, hash: &Hash) -> Result<bool> {
         match self.store.head(&Self::key(hash)).await {
             Ok(_) => Ok(true),

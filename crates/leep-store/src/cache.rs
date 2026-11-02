@@ -207,6 +207,10 @@ impl<S: BlobStore> BlobStore for CachedBlobStore<S> {
         Ok(())
     }
 
+    async fn warm(&self) -> Result<()> {
+        self.inner.warm().await
+    }
+
     /// Always asks the inner store. GC may delete a blob from another process
     /// while it is still cached here; answering from the cache would let a
     /// client skip re-uploading a blob that is gone from durable storage.

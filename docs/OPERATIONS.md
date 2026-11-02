@@ -1489,6 +1489,34 @@ apply to the server and to its tools (`verify`, `repair`, `upgrade-index`,
 
 `--cache-bytes` (256 MiB) is separate: it caches blobs.
 
+### Readiness while a pack index loads
+
+A packed blob store (filesystem or object store, ADR 0070) lists its packs
+and reads their indexes on first use: about 321 MB at 1M changesets, which
+on a cold page cache took longer than `--ready-timeout`. The server starts
+that load in the background as soon as it builds its routes, and until it
+ends `GET /v1/ready` waits at most `--ready-timeout` for it, then answers
+503 with `{"store":"blobs","reason":"loading"}` without probing the blob
+store, so a slow load is never counted as
+a `timeout` in `leep_ready_checks_total`. `/v1/health` is unaffected. When
+the load ends the server logs `blob store loaded` with `elapsed_ms`, and the
+next check is the usual one. If the load fails, the server logs
+`blob store warm-up failed` and readiness reports the failure through its
+normal check. Keep the rotation probe's failure threshold longer than a cold
+start takes (watch `elapsed_ms`), or the balancer may restart a server that
+is only loading; restart on liveness only.
+
+### Malloc arenas
+
+On Linux with glibc the server limits malloc to two arenas
+(`mallopt(M_ARENA_MAX, 2)` before it starts any thread), as the importer
+does. By default glibc makes up to eight per CPU and each keeps the memory
+freed in it: at 1M changesets the server held 2.7 GB resident with 1.19 GB
+in use over 32 arenas. To choose another limit, set `MALLOC_ARENA_MAX` in
+the server's environment (for example `8` for the glibc behaviour on a
+2-core host, or `1`); when it is set the server leaves it alone. Other
+allocators (musl, macOS, Windows) are unaffected.
+
 - **Pool.** A request or derivation job holds at most one connection at a
   time. Raise the pool with `--derive-jobs` or `rederive --jobs` past 16 on
   a machine with the cores for it. Every server and tool has its own pool,

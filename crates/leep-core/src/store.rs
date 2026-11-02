@@ -429,6 +429,14 @@ pub trait BlobStore: Send + Sync + 'static {
         Ok(self.get(hash).await?.is_some())
     }
 
+    /// Loads whatever the first read would otherwise load lazily (a packed
+    /// store's index listing), so the server can do it before it reports
+    /// ready instead of inside a readiness probe. Idempotent; the default
+    /// has nothing to load.
+    async fn warm(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// [`get`](Self::get), answering `None` unless the blob is in durable
     /// storage now: what a caller about to make the blob reachable needs,
     /// since `get` may be answered from a cache tier while garbage collection

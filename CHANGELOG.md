@@ -26,6 +26,15 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   0069) while the blob copy was listing the source: the listing could
   see the root and miss a node written just before it. The copy now also
   copies every node below a tree node it copied that the backup lacks.
+### Readiness waits for the pack index; fewer malloc arenas
+- **Fixed.** After a cold restart on a large store, `GET /v1/ready` could
+  time out while the blob store's first pack-index load (321 MB at 1M
+  changesets) ran. The server now loads it in the background at startup and
+  answers 503 `{"store":"blobs","reason":"loading"}` without probing until
+  it ends. New `BlobStore::warm` (default no-op) does the load.
+- **Changed.** `leep-server` limits glibc malloc to two arenas at startup
+  (Linux/glibc, unless `MALLOC_ARENA_MAX` is set), as the importer does. At
+  1M changesets it held 2.7 GB resident with 1.19 GB in use over 32 arenas.
 
 ### Tree reads share cached nodes
 - **Changed.** Reads of tree nodes hand out the decoded node the server's
