@@ -1829,6 +1829,56 @@ After the fix ("Merge base" below), the same database on a freshly started
 server answers `master~1000` in 6 ms, `master~20000` in 3 ms and the root in
 5 ms.
 
+### Many agents landing on one branch: Git, and Leep before and after
+
+Measured 2026-11-02 on one 4-vCPU, 8 GB cloud box (Ubuntu 24.04), each
+system given the same four cores. Every agent edits only its own files (no
+conflicts, the easy case) and lands as fast as it can on one branch, 20 s of
+warm-up and 60 s measured.
+
+- **Git 2.56:** each agent has its own clone, commits and pushes to one local
+  bare repository over `file://` (no network or hosting service: Git's best
+  case), and on a rejected push runs `git pull --rebase` and pushes again.
+- **Leep:** `leep-land-bench --files 2`, server pinned to two cores,
+  Postgres 16 and the agents on the other two. "Before" is main at #229, the
+  last commit before the scaling work in this file (ADR 0066 onward); "now" is
+  main at #246.
+
+| Agents | Git pushes/s | Git rejected pushes | Git p50 / p99 | Leep before, lands/s | Leep before, p50 / p99 | Leep now, lands/s | Leep now, p50 / p99 |
+|---|---|---|---|---|---|---|---|
+| 16 | 8.4 | 6,380 (14 attempts per accepted push) | 83 ms / 26 s | 405 | 24 / 41 ms | 455 | 20 / 44 ms |
+| 64 | 2.5 | 7,985 (34 per push) | 17 s / 75 s | 382 | 104 / 237 ms | 602 | 46 / 125 ms |
+| 256 | 1.1 | 8,742 | 39 s / 75 s | stopped: a land answered 503 | | 271 | 232 ms / 1.1 s |
+
+- **Git:** throughput falls as agents are added. Every push races every
+  other for the branch, and the losers fetch, rebase and retry, so at 256
+  agents about one push a second is accepted while nearly 9,000 are refused.
+- **Leep:** the server replays disjoint lands onto the head itself (ADR
+  0066), so no agent retries. At 64 agents it lands 240× as many changes a
+  second as Git, at 256 agents about 250×.
+- **Leep before and after:** "before" refused lands outright at 256 agents.
+  At 256 agents the bench's small tree and two cores leave "now" CPU-bound,
+  hence fewer lands/s than at 64.
+
+Mixed read and land swarm, 1,000 agents, same box (`--indexing lease`,
+`stale-ok`, the configuration of the capacity section):
+
+| | Leep before | Leep now |
+|---|---|---|
+| lands/s | 81.5 | 81.5 |
+| land p99 | 599 ms | 83 ms |
+| blame p50 / p99 | 12.5 / 177 ms | 5.1 / 62 ms |
+| create p99 | 41 ms | 29 ms |
+| log p99 | 61 ms | 48 ms |
+
+Both keep up with the offered rate at 1,000 agents on this box; "now"
+answers with a seventh of the land tail. The collapse at 2,000 agents on two
+vCPU described above happened with every build; the fixes in ADR 0073 and
+0074 keep it from feeding on itself.
+
+For one user reading a local history Git stays faster: see the next section
+(`log` 100 in 5 ms against 34–44 ms for Leep over HTTP).
+
 ### Against other version control systems
 
 The same history and queries with git (as cloned, and with a
