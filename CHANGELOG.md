@@ -19,6 +19,13 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   191 metadata statements to 77 (skiplist reads 114 to 36), of a file with
   75 versions from 728 to 372, and of a hot file with 14,743 versions from
   9,406 to 3,764. Answers are unchanged.
+### Backups copy trees stored during the copy whole
+- **Fixed.** A backup could fail its closure check with `missing_tree`
+  (and, with `--accept-failed-check`, restore a root without its tree)
+  when a land stored the tree of a changeset created without it (ADR
+  0069) while the blob copy was listing the source: the listing could
+  see the root and miss a node written just before it. The copy now also
+  copies every node below a tree node it copied that the backup lacks.
 
 ### Tree reads share cached nodes
 - **Changed.** Reads of tree nodes hand out the decoded node the server's

@@ -867,3 +867,139 @@ async fn a_packed_object_deleted_at_the_source_stays_in_the_pool_for_older_snaps
         .unwrap()
         .is_none());
 }
+
+/// The source as a blob listing sees it while a tree is written: hashes in
+/// `hidden` are left out of `list_page` (the listing walked past their
+/// shard before they were written) but read as stored.
+struct ListingRace {
+    inner: Arc<dyn BlobStore>,
+    hidden: std::sync::Mutex<std::collections::HashSet<Hash>>,
+}
+
+#[async_trait]
+impl BlobStore for ListingRace {
+    async fn put_with_hash(&self, hash: Hash, data: Bytes) -> leep_core::Result<()> {
+        self.inner.put_with_hash(hash, data).await
+    }
+    async fn get(&self, hash: &Hash) -> leep_core::Result<Option<Bytes>> {
+        self.inner.get(hash).await
+    }
+    async fn list_page(
+        &self,
+        after: Option<Hash>,
+        limit: usize,
+    ) -> leep_core::Result<Vec<leep_core::BlobMeta>> {
+        let mut page = self.inner.list_page(after, limit).await?;
+        let hidden = self.hidden.lock().unwrap().clone();
+        page.retain(|m| !hidden.contains(&m.hash));
+        Ok(page)
+    }
+    async fn delete(&self, hash: &Hash) -> leep_core::Result<()> {
+        self.inner.delete(hash).await
+    }
+}
+
+/// A fast-forward land between the two halves stores the tree of a
+/// changeset created without it (ADR 0069): the nodes, then the root. The
+/// blob listing is not a snapshot, so it can see the root and miss nodes
+/// written moments before it.
+struct FastForwardBetween {
+    site: Arc<Site>,
+    lazy: ChangesetId,
+    source: Arc<ListingRace>,
+}
+
+#[async_trait]
+impl Hooks for FastForwardBetween {
+    async fn after_meta_snapshot(&self, _: &SnapshotInfo) {
+        let repo = &self.site.repo;
+        let root = repo.root_tree(self.lazy).await.unwrap();
+        assert!(!repo.blobs().contains(&root).await.unwrap());
+        // The nodes below the root that the land is about to write.
+        let mut below = Vec::new();
+        let mut stack = vec![root];
+        while let Some(t) = stack.pop() {
+            for e in repo.read_tree(t).await.unwrap().entries.values() {
+                if let leep_core::TreeEntry::Dir { tree } = e {
+                    if !repo.blobs().contains(tree).await.unwrap() {
+                        below.push(*tree);
+                        stack.push(*tree);
+                    }
+                }
+            }
+        }
+        assert!(repo.materialize_tree(self.lazy).await.unwrap());
+        assert!(!below.is_empty());
+        self.source.hidden.lock().unwrap().extend(below);
+        self.site.advance("main", self.lazy).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tree_stored_while_the_blobs_are_listed_is_copied_whole() {
+    let root = tempfile::tempdir().unwrap();
+    let site = Arc::new(Site::new(root.path(), "src").await);
+    let (tip, _, _) = site.populate().await;
+    let lazy_repo = Repo::new(
+        leep_store::open_blob_store(&site.blobs_url).unwrap(),
+        leep_meta::open_meta_store(&site.meta_url).await.unwrap(),
+    )
+    .with_lazy_create_trees(true);
+    let text = "a new directory\n";
+    let content = lazy_repo
+        .put_blob(Bytes::copy_from_slice(text.as_bytes()))
+        .await
+        .unwrap();
+    let lazy = lazy_repo
+        .create_changeset(Changeset {
+            parents: vec![tip],
+            author: "t".into(),
+            timestamp: 2,
+            message: "lazy".into(),
+            changes: BTreeMap::from([(
+                RepoPath::new("release/a00/note-0001.md").unwrap(),
+                FileChange::Modify {
+                    content,
+                    kind: FileKind::Regular,
+                    size: text.len() as u64,
+                },
+            )]),
+            extra: BTreeMap::new(),
+        })
+        .await
+        .unwrap();
+    let out = root.path().join("backup");
+    let source = Arc::new(ListingRace {
+        inner: leep_store::open_blob_store(&site.blobs_url).unwrap(),
+        hidden: Default::default(),
+    });
+    let mut o = opts(&site, &out);
+    o.source_blobs = source.clone();
+    let outcome = backup::backup(
+        o,
+        &FastForwardBetween {
+            site: site.clone(),
+            lazy,
+            source,
+        },
+        quiet(),
+    )
+    .await
+    .unwrap();
+    assert!(outcome.ok(), "{:?}", outcome.problems);
+
+    let dest = Site::new(root.path(), "restored").await;
+    let restored = backup::restore(restore_opts(&out, &dest), quiet())
+        .await
+        .unwrap();
+    assert!(
+        restored.report.as_ref().unwrap().ok(),
+        "{:?}",
+        restored.report.unwrap().problems
+    );
+    let path = RepoPath::new("release/a00/note-0001.md").unwrap();
+    assert_eq!(
+        dest.repo.read_file(lazy, &path).await.unwrap().unwrap().1,
+        text
+    );
+}
