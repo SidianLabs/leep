@@ -1573,6 +1573,30 @@ allocators (musl, macOS, Windows) are unaffected.
   often rows are read again. RSS also holds the blob cache, request
   buffers and the derivation working set.
 
+### Blob upload syncs
+
+A blob upload to a filesystem store (`file://` or a path) writes a temp file
+and renames it into place only once its bytes are durable. Since ADR 0076
+uploads that arrive together share that sync (group commit): an upload
+with others in flight waits up to `--blob-fsync-window` for more, then the
+batch is made durable by one `syncfs` of the blob file system (Linux 5.8
+and later; elsewhere one fsync per file) and renamed. An upload with
+nothing else in flight is synced on its own at once, so a quiet server
+waits for nothing.
+
+| Flag / env | Default | What it does |
+|---|---|---|
+| `--blob-fsync-window D` / `LEEP_BLOB_FSYNC_WINDOW` | `2ms` | How long an upload with company waits for others to share its sync with; at most `100ms`. `0` syncs each upload's file on its own, as before. |
+
+A `syncfs` writes back every dirty file on the file system, not only the
+blobs. Keep the blob directory on a file system of its own, not the one
+that holds a Postgres or SQLite data directory: otherwise each shared sync
+also waits for the database's unsynced writes. If it cannot be separated
+and upload latency (`leep_http_request_duration_seconds`, `method="PUT"`,
+`route="/v1/blobs/{hash}"`) rises, set `--blob-fsync-window 0`. A writeback error
+anywhere on that file system fails the uploads whose batch saw it; clients
+retry them.
+
 ## Indexing a large history
 
 After importing a long history (`leep-git import`, a restore without

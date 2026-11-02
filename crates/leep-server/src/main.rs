@@ -382,6 +382,12 @@ struct Args {
     /// Fewest new objects written as a pack; fewer are written loose.
     #[arg(long, env = "LEEP_LAND_PACK_MIN_OBJECTS", default_value_t = leep_store::DEFAULT_PACK_MIN_OBJECTS, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
     land_pack_min_objects: usize,
+    /// How long a blob upload to a filesystem store waits for concurrent
+    /// uploads to share one sync of their files with (group commit, ADR
+    /// 0076), in ms or s; `0` syncs each file on its own, as before.
+    /// An upload with no other in flight never waits. At most 100ms.
+    #[arg(long, env = "LEEP_BLOB_FSYNC_WINDOW", default_value = "2ms", value_parser = parse_fsync_window)]
+    blob_fsync_window: std::time::Duration,
     /// Merge packs in the background as land batches write them (ADR
     /// 0068), so reads search few. Filesystem and object store blob stores
     /// only. Off leaves merging to `leep-server repack`.
@@ -887,6 +893,15 @@ fn parse_interval(s: &str) -> Result<std::time::Duration, String> {
         )),
         None => parse_grace(s),
     }
+}
+
+/// `--blob-fsync-window`: every upload with company may wait this long.
+fn parse_fsync_window(s: &str) -> Result<std::time::Duration, String> {
+    let d = parse_interval(s)?;
+    if d > std::time::Duration::from_millis(100) {
+        return Err("at most 100ms; uploads wait up to this long".into());
+    }
+    Ok(d)
 }
 
 /// `--search-pool-permits` and `--land-queue-batches`: a number, or no
@@ -2288,7 +2303,9 @@ fn open_server_blobs(
             return Ok((Arc::new(store.clone()), Some(PackStore::Object(store))));
         }
         if let Some(root) = leep_store::fs_blob_root(&args.blobs) {
-            let store = leep_store::FsBlobStore::new(root).with_pack_writes(writes);
+            let store = leep_store::FsBlobStore::new(root)
+                .with_pack_writes(writes)
+                .with_fsync_window(args.blob_fsync_window);
             return Ok((Arc::new(store.clone()), Some(PackStore::Fs(store))));
         }
     }
@@ -2572,6 +2589,22 @@ mod tests {
             Some(CountOrOff::Count(50))
         ));
         assert!(parse_args(["leep-server", "--land-batch-replay-ms", "0"]).is_err());
+    }
+
+    /// Uploads share file syncs for up to 2 ms unless told otherwise (ADR
+    /// 0076); 0 turns it off, and a long window is refused.
+    #[test]
+    fn blob_fsync_window_flag() {
+        let ms = std::time::Duration::from_millis;
+        assert_eq!(
+            parse_args(["leep-server"]).unwrap().blob_fsync_window,
+            ms(2)
+        );
+        let a = parse_args(["leep-server", "--blob-fsync-window", "0"]).unwrap();
+        assert!(a.blob_fsync_window.is_zero());
+        let a = parse_args(["leep-server", "--blob-fsync-window", "5ms"]).unwrap();
+        assert_eq!(a.blob_fsync_window, ms(5));
+        assert!(parse_args(["leep-server", "--blob-fsync-window", "1s"]).is_err());
     }
 
     #[test]
