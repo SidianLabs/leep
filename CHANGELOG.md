@@ -18,6 +18,17 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   puts issue 0.002 to 0.008 syncs each instead of 1. A `syncfs` also waits
   for other dirty files on the same file system, so keep blobs off the
   database's file system or set the window to 0.
+### The indexer finds a long missing range in batches
+- **Changed.** Before deriving, a derivation found the changesets it lacked
+  one frontier at a time, which on a linear chain (what the warmer sees,
+  since lands rebase) cost two serial metadata round trips per changeset
+  before anything derived. A narrow frontier is now followed a
+  first-parent chain at a time, listed down the skiplists in batched reads
+  (ADR 0077). On local Postgres, the history index catching up a
+  4,000-changeset gap made 138 metadata reads instead of 8,083, started
+  deriving after 0.14 s instead of 1.92 s, and ran at 5,000 changesets a
+  second instead of 1,550. The changesets derived and the rows written are
+  unchanged.
 ### Blame cost follows a file's versions on deep histories
 - **Changed.** A blame walk goes straight from one change of a file to the
   next where the first-parent chain has no merge in between (the

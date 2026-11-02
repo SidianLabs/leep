@@ -54,6 +54,8 @@ mod criss_cross_tests;
 #[cfg(test)]
 mod deep_blame_tests;
 #[cfg(test)]
+mod derive_walk_tests;
+#[cfg(test)]
 mod fault_tests;
 #[cfg(test)]
 mod flush_tests;
