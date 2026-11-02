@@ -61,15 +61,15 @@ pub(crate) enum Reads<'a> {
     /// so far, then (if `cached`) nodes derived earlier, then stored nodes,
     /// and never a derivation of their own, so deriving never recurses.
     Derive {
-        local: &'a HashMap<Hash, TreeNode>,
+        local: &'a HashMap<Hash, Arc<TreeNode>>,
         cached: bool,
     },
 }
 
 impl Reads<'_> {
-    async fn read(self, repo: &Repo, tree: Hash) -> Result<TreeNode> {
+    async fn read(self, repo: &Repo, tree: Hash) -> Result<Arc<TreeNode>> {
         match self {
-            Reads::Repo => repo.read_tree(tree).await,
+            Reads::Repo => repo.read_tree_shared(tree).await,
             Reads::Derive { local, cached } => {
                 if let Some(n) = local.get(&tree) {
                     return Ok(n.clone());
@@ -92,7 +92,7 @@ impl Reads<'_> {
 async fn ensure_dir(
     repo: &Repo,
     reads: Reads<'_>,
-    nodes: &mut HashMap<String, TreeNode>,
+    nodes: &mut HashMap<String, Arc<TreeNode>>,
     dir: &str,
     create: bool,
 ) -> Result<bool> {
@@ -102,7 +102,7 @@ async fn ensure_dir(
         if !nodes.contains_key(&next) {
             let node = match nodes[&cur].entries.get(comp) {
                 Some(TreeEntry::Dir { tree }) => reads.read(repo, *tree).await?,
-                None if create => TreeNode::default(),
+                None if create => Arc::new(TreeNode::default()),
                 None => return Ok(false),
                 Some(TreeEntry::File { .. }) => {
                     return Err(Error::Invalid(format!("{next} is a file, not a directory")))
@@ -119,7 +119,7 @@ async fn ensure_dir(
 /// rewrote, deepest first, so the root comes last.
 pub(crate) struct Built {
     pub(crate) root: Hash,
-    pub(crate) nodes: Vec<(Hash, Bytes, TreeNode)>,
+    pub(crate) nodes: Vec<(Hash, Bytes, Arc<TreeNode>)>,
 }
 
 /// Apply `changes` to the tree `base`, rewriting only directories on changed
@@ -203,7 +203,9 @@ pub(crate) async fn build_tree(
             nodes: Vec::new(),
         });
     }
-    let mut nodes: HashMap<String, TreeNode> = HashMap::new();
+    // Shared with the caches until changed: only the directories on the
+    // changed paths are copied, by `Arc::make_mut`, once each.
+    let mut nodes: HashMap<String, Arc<TreeNode>> = HashMap::new();
     nodes.insert(String::new(), reads.read(repo, base).await?);
 
     // Deletes first, so a changeset may replace a file with a directory.
@@ -219,7 +221,7 @@ pub(crate) async fn build_tree(
         }
         let node = nodes.get_mut(dir).expect("loaded");
         match node.entries.get(path.file_name()) {
-            Some(TreeEntry::File { .. }) => node.entries.remove(path.file_name()),
+            Some(TreeEntry::File { .. }) => Arc::make_mut(node).entries.remove(path.file_name()),
             _ => return Err(absent()),
         };
         deleted = true;
@@ -242,7 +244,7 @@ pub(crate) async fn build_tree(
         if let Some(TreeEntry::Dir { .. }) = node.entries.get(path.file_name()) {
             return Err(Error::Invalid(format!("{path} is a directory")));
         }
-        node.entries.insert(
+        Arc::make_mut(node).entries.insert(
             path.file_name().to_string(),
             TreeEntry::File {
                 content: *content,
@@ -258,7 +260,7 @@ pub(crate) async fn build_tree(
     let mut rewritten = Vec::with_capacity(dirs.len() + 1);
     for d in dirs {
         let node = nodes.remove(&d).expect("present");
-        let parent = nodes.get_mut(parent_dir(&d)).expect("parent loaded");
+        let parent = Arc::make_mut(nodes.get_mut(parent_dir(&d)).expect("parent loaded"));
         let name = d.rsplit('/').next().expect("non-empty");
         if node.entries.is_empty() {
             parent.entries.remove(name);
@@ -278,7 +280,7 @@ pub(crate) async fn build_tree(
 }
 
 /// Encode `node` once for its hash and its bytes, and queue it.
-fn encode_node(node: TreeNode, rewritten: &mut Vec<(Hash, Bytes, TreeNode)>) -> Hash {
+fn encode_node(node: Arc<TreeNode>, rewritten: &mut Vec<(Hash, Bytes, Arc<TreeNode>)>) -> Hash {
     let bytes = node.encode();
     let h = Hash::of_object(TreeNode::KIND, &bytes);
     rewritten.push((h, Bytes::from(bytes), node));
@@ -286,7 +288,7 @@ fn encode_node(node: TreeNode, rewritten: &mut Vec<(Hash, Bytes, TreeNode)>) -> 
 }
 
 /// Drop loaded directories that became empty (deepest first).
-fn prune(nodes: &mut HashMap<String, TreeNode>) {
+fn prune(nodes: &mut HashMap<String, Arc<TreeNode>>) {
     let mut dirs: Vec<String> = nodes.keys().filter(|d| !d.is_empty()).cloned().collect();
     dirs.sort_by_key(|d| std::cmp::Reverse(depth(d)));
     for d in dirs {
@@ -294,7 +296,7 @@ fn prune(nodes: &mut HashMap<String, TreeNode>) {
             nodes.remove(&d);
             let name = d.rsplit('/').next().expect("non-empty");
             if let Some(p) = nodes.get_mut(parent_dir(&d)) {
-                p.entries.remove(name);
+                Arc::make_mut(p).entries.remove(name);
             }
         }
     }
@@ -308,8 +310,10 @@ impl Repo {
             let TreeEntry::Dir { tree } = cur else {
                 return Ok(None);
             };
-            match self.read_tree(tree).await?.entries.remove(comp) {
-                Some(e) => cur = e,
+            // Borrowed from the shared node: a wide directory is not copied
+            // to take one entry.
+            match self.read_tree_shared(tree).await?.entries.get(comp) {
+                Some(e) => cur = e.clone(),
                 None => return Ok(None),
             }
         }
@@ -364,7 +368,7 @@ impl Repo {
         }
         // Directory path -> its node's hash, `None` when absent or a file.
         let mut dirs: HashMap<&str, Option<Hash>> = HashMap::from([("", Some(tree))]);
-        let mut nodes: HashMap<&str, TreeNode> = HashMap::new();
+        let mut nodes: HashMap<&str, Arc<TreeNode>> = HashMap::new();
         for level in &levels {
             for &d in level {
                 if dirs.contains_key(d) {
@@ -382,7 +386,7 @@ impl Repo {
                 .filter_map(|&d| dirs.get(d).copied().flatten().map(|h| (d, h)))
                 .collect();
             let hashes: Vec<Hash> = read.iter().map(|(_, h)| *h).collect();
-            for ((d, _), node) in read.into_iter().zip(self.read_trees(&hashes).await?) {
+            for ((d, _), node) in read.into_iter().zip(self.read_trees_shared(&hashes).await?) {
                 nodes.insert(d, node);
             }
         }
@@ -484,10 +488,10 @@ impl Repo {
                 Next::Read => {
                     let batch = q.take_dirs((want - out.len()).min(TREE_BATCH));
                     let hashes: Vec<Hash> = batch.iter().map(|(_, t)| *t).collect();
-                    let nodes = self.read_trees(&hashes).await?;
+                    let nodes = self.read_trees_shared(&hashes).await?;
                     for ((p, _), node) in batch.iter().zip(nodes) {
-                        for (name, child) in node.entries {
-                            add(&mut q, join(p, &name), child)?;
+                        for (name, child) in &node.entries {
+                            add(&mut q, join(p, name), child.clone())?;
                         }
                     }
                 }
@@ -598,7 +602,7 @@ impl Repo {
                     let nodes: HashMap<Hash, Arc<TreeNode>> = hashes
                         .iter()
                         .copied()
-                        .zip(self.read_trees(&hashes).await?.into_iter().map(Arc::new))
+                        .zip(self.read_trees_shared(&hashes).await?)
                         .collect();
                     let empty = Arc::new(TreeNode::default());
                     let take = |t: Option<Hash>| match t.and_then(|t| nodes.get(&t)) {
@@ -610,12 +614,11 @@ impl Repo {
                         let names: BTreeSet<&String> =
                             a.entries.keys().chain(b.entries.keys()).collect();
                         for name in names {
-                            add(
-                                &mut q,
-                                join(&path, name),
-                                a.entries.get(name).cloned(),
-                                b.entries.get(name).cloned(),
-                            )?;
+                            let (old, new) = (a.entries.get(name), b.entries.get(name));
+                            if old == new {
+                                continue;
+                            }
+                            add(&mut q, join(&path, name), old.cloned(), new.cloned())?;
                         }
                     }
                 }

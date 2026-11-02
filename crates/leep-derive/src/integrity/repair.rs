@@ -133,12 +133,12 @@ pub async fn rederive(
         let meta = ShadowMeta::new(repo.meta().clone());
         let blobs = ShadowBlobs::new(repo.blobs().clone());
         (
-            Repo::new(blobs.clone(), meta.clone()),
+            Repo::new(blobs.clone(), meta.clone()).without_root_cache(),
             Some(meta),
             Some(blobs),
         )
     } else {
-        (repo.clone(), None, None)
+        (repo.without_root_cache(), None, None)
     };
     let changeset_kinds: Vec<&'static str> = all
         .iter()

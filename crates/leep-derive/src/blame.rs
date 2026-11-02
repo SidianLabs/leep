@@ -645,14 +645,15 @@ impl Repo {
                     _ => None,
                 })
                 .collect();
-            let mut nodes = self.read_trees(&dirs).await?.into_iter();
+            let mut nodes = self.read_trees_shared(&dirs).await?.into_iter();
             for e in entries.iter_mut() {
                 *e = match e {
                     Some(TreeEntry::Dir { .. }) => nodes
                         .next()
                         .expect("one node per directory")
                         .entries
-                        .remove(comp),
+                        .get(comp)
+                        .cloned(),
                     _ => None,
                 };
             }

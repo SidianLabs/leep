@@ -1,6 +1,7 @@
 //! Paged file listings and diffs: pages concatenate to the unpaged answer in
 //! path order (also across file/directory swaps and renames), a page reads
-//! only the trees it needs, and cursors are checked as untrusted input.
+//! only the trees it needs, cursors are checked as untrusted input, and
+//! repeated reads share cached nodes and roots instead of reading again.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -13,6 +14,7 @@ use leep_core::memory::{MemoryBlobStore, MemoryMetaStore};
 use leep_core::rename::RenameOptions;
 use leep_core::store::{BlobMeta, BlobStore};
 use leep_core::{ChangesetId, Error, Hash, Result};
+use leep_testkit::{FaultPlan, FaultyMetaStore, Op};
 
 use crate::cursor::{self, CursorKind, Fingerprint, PathPos};
 use crate::filter_log::tests::Lcg;
@@ -418,4 +420,88 @@ async fn path_cursors_are_checked_and_may_point_past_the_end() {
             .len(),
         2
     );
+}
+
+/// A root tree is a function of its changeset, so once a handle has read a
+/// changeset's root, more listings, lookups and diffs of it read no derived
+/// row: a busy server spent about a tenth of its statements on these.
+#[tokio::test]
+async fn repeated_reads_ask_for_each_root_tree_once() {
+    let plan = FaultPlan::new(0);
+    let meta = Arc::new(FaultyMetaStore::new(
+        Arc::new(MemoryMetaStore::new()),
+        plan.clone(),
+    ));
+    let blobs = Arc::new(MemoryBlobStore::new());
+    let writer = Repo::new(blobs.clone(), meta.clone());
+    let c1 = commit(
+        &writer,
+        &[],
+        &[("d/a", Some("1")), ("d/b", Some("2"))],
+        "c1",
+    )
+    .await;
+    let c2 = commit(&writer, &[c1], &[("d/a", Some("3"))], "c2").await;
+    let reads = || plan.calls(Op::GetDerived);
+    let path = leep_core::RepoPath::new("d/a").unwrap();
+
+    // The creating handle kept the roots it computed.
+    let before = reads();
+    assert_eq!(writer.list_files(c2, "").await.unwrap().len(), 2);
+    assert_eq!(writer.diff(Some(c1), c2, "").await.unwrap().len(), 1);
+    assert_eq!(reads(), before);
+
+    // Another server's handle reads each root once.
+    let r = Repo::new(blobs, meta);
+    let before = reads();
+    assert_eq!(r.list_files(c2, "").await.unwrap().len(), 2);
+    assert_eq!(r.diff(Some(c1), c2, "").await.unwrap().len(), 1);
+    let first = reads() - before;
+    assert_eq!(first, 2, "one root_tree row per changeset");
+    for _ in 0..3 {
+        assert_eq!(r.list_files(c2, "d").await.unwrap().len(), 2);
+        let page = r.list_files_page(c1, "", Some(1), None).await.unwrap();
+        assert_eq!(page.files.len(), 1);
+        assert!(r.lookup_file(c1, &path).await.unwrap().is_some());
+        assert_eq!(r.list_dir(c2, "d").await.unwrap().entries.len(), 2);
+        assert_eq!(r.diff(Some(c1), c2, "d").await.unwrap().len(), 1);
+        assert_eq!(r.diff(None, c1, "").await.unwrap().len(), 2);
+    }
+    assert_eq!(reads() - before, first);
+}
+
+/// Reads hand out the cached node itself: lookups and listings in a wide
+/// directory share it rather than copying its entries each time.
+#[tokio::test]
+async fn reads_share_cached_tree_nodes() {
+    use leep_core::{RepoPath, TreeEntry};
+
+    let w = repo();
+    let names: Vec<(String, String)> = (0..1000)
+        .map(|i| (format!("agents/a{i}"), format!("{i}\n")))
+        .collect();
+    let files: Vec<(&str, Option<&str>)> = names
+        .iter()
+        .map(|(p, b)| (p.as_str(), Some(b.as_str())))
+        .collect();
+    let c = commit(&w, &[], &files, "c").await;
+    let r = Repo::new(w.blobs().clone(), w.meta().clone());
+    let root = r.root_tree(c).await.unwrap();
+    let Some(TreeEntry::Dir { tree }) = r.entry_at(root, "agents").await.unwrap() else {
+        panic!("agents is a directory");
+    };
+    let held = r.read_tree_shared(tree).await.unwrap();
+    assert_eq!(held.entries.len(), 1000);
+    let path = RepoPath::new("agents/a500").unwrap();
+    for _ in 0..10 {
+        assert!(r.lookup_file(c, &path).await.unwrap().is_some());
+        assert_eq!(r.list_files(c, "agents").await.unwrap().len(), 1000);
+    }
+    assert!(Arc::ptr_eq(&held, &r.read_tree_shared(tree).await.unwrap()));
+    for n in r.read_trees_shared(&[tree, tree]).await.unwrap() {
+        assert!(Arc::ptr_eq(&held, &n));
+    }
+    // The reads above kept no handle of their own: only `held` and the
+    // cache's.
+    assert_eq!(Arc::strong_count(&held), 2);
 }

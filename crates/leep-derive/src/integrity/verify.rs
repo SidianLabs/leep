@@ -289,7 +289,7 @@ pub async fn verify(
     let kinds = kinds::with_dependencies(&opts.derived);
     let shadow_meta = ShadowMeta::new(repo.meta().clone());
     let shadow_blobs = ShadowBlobs::new(repo.blobs().clone());
-    let shadow = Repo::new(shadow_blobs.clone(), shadow_meta.clone());
+    let shadow = Repo::new(shadow_blobs.clone(), shadow_meta.clone()).without_root_cache();
     shadow.log_filter.copy_side_budget(&repo.log_filter);
     let mut v = Verifier {
         repo,
@@ -615,7 +615,7 @@ impl Verifier<'_> {
                 Err(("missing_tree", why)) => match self.shadow.lazy_node(tree).await {
                     Ok(Some(n)) => {
                         self.stats.lazy_tree_nodes += 1;
-                        self.walk_node(id, n, &dir, &mut stack);
+                        self.walk_node(id, Arc::unwrap_or_clone(n), &dir, &mut stack);
                         continue;
                     }
                     Ok(None) => Err(("missing_tree", why)),

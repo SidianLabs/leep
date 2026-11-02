@@ -7,6 +7,21 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 ## [Unreleased]
 
+### Tree reads share cached nodes
+- **Changed.** Reads of tree nodes hand out the decoded node the server's
+  caches hold instead of a copy: a file lookup, a listing or a diff no
+  longer copies every directory it opens, and a land copies only the
+  directories it rewrites. At 1,000 agents on one 2-core server, copying
+  and freeing nodes was about a third of a file read's CPU and a quarter
+  of a land batch's, growing with directory width.
+- **Changed.** A changeset's root tree, once read or created, is kept in
+  the ancestry cache, so listings and diffs of a changeset seen before make
+  no metadata read for it (about 12% of a swarm's statements).
+- In a directory of 1,000 files on in-memory stores (`cargo bench -p
+  leep-derive -- wide_dir_reads`), a warm file lookup fell from 49 µs to
+  0.7 µs, a one-file diff from 395 µs to 194 µs and a listing of the
+  directory from 398 µs to 317 µs.
+
 ### Blame reads less metadata
 - **Changed.** Skiplists read by blame and filtered logs are kept in one
   process-wide cache of 32 MiB of the derive cache budget

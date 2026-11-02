@@ -41,12 +41,12 @@ pub(crate) struct Staging {
 /// per land.
 #[derive(Default)]
 pub(crate) struct NodeMemo {
-    nodes: Mutex<HashMap<Hash, TreeNode>>,
+    nodes: Mutex<HashMap<Hash, Arc<TreeNode>>>,
     /// Nodes of unstored trees the attempt derived (ADR 0069), kept apart
     /// from `nodes`, which the attempt may treat as stored: a slow-path
     /// replay derives the land's tree once and its merge reads it here,
     /// whatever the shared cache evicts meanwhile.
-    derived: Mutex<HashMap<Hash, TreeNode>>,
+    derived: Mutex<HashMap<Hash, Arc<TreeNode>>>,
     tree_nanos: AtomicU64,
     /// The memo of the staging below, so a node the batch ahead staged is
     /// answered from memory and never reaches the cache of stored nodes.
@@ -61,24 +61,32 @@ impl NodeMemo {
             .clone()
     }
 
+    /// A copy of [`NodeMemo::get_shared`].
+    #[cfg(test)]
     pub(crate) fn get(&self, hash: &Hash) -> Option<TreeNode> {
+        self.get_shared(hash).map(Arc::unwrap_or_clone)
+    }
+
+    /// The node held for `hash`, shared: the land batch reads the same
+    /// wide directories for every land it replays.
+    pub(crate) fn get_shared(&self, hash: &Hash) -> Option<Arc<TreeNode>> {
         let own = self
             .nodes
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(hash)
             .cloned();
-        own.or_else(|| self.parent()?.get(hash))
+        own.or_else(|| self.parent()?.get_shared(hash))
     }
 
-    pub(crate) fn insert(&self, hash: Hash, node: TreeNode) {
+    pub(crate) fn insert(&self, hash: Hash, node: Arc<TreeNode>) {
         self.nodes
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(hash, node);
     }
 
-    pub(crate) fn get_derived(&self, hash: &Hash) -> Option<TreeNode> {
+    pub(crate) fn get_derived(&self, hash: &Hash) -> Option<Arc<TreeNode>> {
         let own = self
             .derived
             .lock()
@@ -88,7 +96,7 @@ impl NodeMemo {
         own.or_else(|| self.parent()?.get_derived(hash))
     }
 
-    pub(crate) fn insert_derived(&self, nodes: &HashMap<Hash, TreeNode>) {
+    pub(crate) fn insert_derived(&self, nodes: &HashMap<Hash, Arc<TreeNode>>) {
         let mut d = self.derived.lock().unwrap_or_else(|e| e.into_inner());
         for (h, n) in nodes {
             d.entry(*h).or_insert_with(|| n.clone());

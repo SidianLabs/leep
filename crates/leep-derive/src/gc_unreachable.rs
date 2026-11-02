@@ -782,7 +782,7 @@ async fn read_nodes(
             }
             None => match repo.lazy_node(*h).await? {
                 Some(n) => {
-                    out.insert(*h, (n, None));
+                    out.insert(*h, (std::sync::Arc::unwrap_or_clone(n), None));
                 }
                 None => r.missing_nodes += 1,
             },
