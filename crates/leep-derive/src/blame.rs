@@ -13,7 +13,7 @@ use similar::{Algorithm, DiffTag};
 
 use crate::batched_reads::{BatchedBlobs, BatchedMeta};
 use crate::blame_follow::Replayed;
-use crate::derived::{self, DerivedKind, HistoryEntry, RootTree, SkipEntry, Skiplist};
+use crate::derived::{self, DerivedKind, HistoryEntry, LastMerge, RootTree, SkipEntry, Skiplist};
 use crate::history::agent_keys;
 use crate::tree_ops::file_info;
 use crate::Repo;
@@ -57,14 +57,14 @@ const STRETCHES: u64 = 256;
 
 /// Fewest generations a stretch spans (but those near the tip), so a short
 /// history is walked as one or a few stretches.
-const MIN_STRETCH_SPAN: u64 = 32;
+pub(crate) const MIN_STRETCH_SPAN: u64 = 32;
 
 /// Steps walked from the tip before the stretches below are: enough for
 /// most files, which change rarely, and for a cached blame near the tip.
 /// On git/git, 32 kept a file of 17 changes as fast as before stretches
 /// (16 cost it 30 ms cold), and cost files of hundreds of changes nothing
 /// measurable.
-const HEAD_STEPS: usize = 32;
+pub(crate) const HEAD_STEPS: usize = 32;
 
 /// Stretches walked at once. Their reads are gathered into batched reads,
 /// so this bounds memory and tasks rather than store connections.
@@ -174,7 +174,10 @@ impl Repo {
     /// first-parent ancestor with a generation above `g` cannot be a changer,
     /// and [`FirstParents::lowest_at_or_above`] finds the last one at or
     /// above `g`. With `g` at or below `bottom`, nothing above the generation
-    /// `bottom` changed the path.
+    /// `bottom` changed the path. Where the chain has no merge at or above
+    /// `g`, the changer at `g` is that ancestor, and the walk goes straight
+    /// to it: on a deep linear history the descent cost a skiplist read per
+    /// halving of the distance, for every change.
     async fn skip_unchanged(
         &self,
         chain: &mut FirstParents,
@@ -187,13 +190,27 @@ impl Repo {
             return Ok(Skip::Here);
         };
         let gens =
-            futures_util::future::try_join_all(entry.changed().iter().map(|&c| self.generation(c)))
-                .await?;
-        let Some(g) = gens.into_iter().max() else {
+            futures_util::future::try_join_all(entry.changed().iter().map(|&c| self.generation(c)));
+        // A lone changer's skiplist, which names its parent, is read with
+        // its generation: on a chain without merges the walk goes there next.
+        let (gens, list) = match entry.changed() {
+            &[c] if chain.linear_from < u64::MAX => {
+                let (gens, list) = futures_util::future::join(gens, chain.list(self, c)).await;
+                (gens, list.map(|_| ()))
+            }
+            _ => (gens.await, Ok(())),
+        };
+        let gens = gens?;
+        list?;
+        let Some((g, c)) = gens.into_iter().zip(entry.changed().iter().copied()).max() else {
             return Ok(Skip::Here);
         };
         if g <= bottom {
             return Ok(Skip::Past);
+        }
+        if g >= chain.linear_from {
+            chain.known.insert(g, c);
+            return Ok(Skip::To(c));
         }
         chain.lowest_at_or_above(self, g).await.map(Skip::To)
     }
@@ -352,10 +369,22 @@ impl Repo {
         }
     }
 
+    /// The lowest generation from which every ancestor of `cur` lies on its
+    /// first-parent chain (the newest merge on the chain, `last_merge-v1`);
+    /// `u64::MAX`, which no generation reaches, if the row is missing, as
+    /// nothing is derived here.
+    async fn linear_from(&self, cur: ChangesetId) -> Result<u64> {
+        match self.meta().get_derived(LastMerge::NAME, &cur.0).await? {
+            Some(v) => derived::decode_u64(&v),
+            None => Ok(u64::MAX),
+        }
+    }
+
     /// The index entry of `path` at `cur`, a changeset of `chain`, read
-    /// together with `cur`'s skiplist: the walk needs the list next, to go
-    /// to `cur`'s parent if `cur` changed the file, or to start its descent
-    /// to the next change from near `cur`.
+    /// together with `cur`'s skiplist and, for [`Cuts::linear_jumps`], the
+    /// newest merge below it: the walk needs the list next, to go to `cur`'s
+    /// parent if `cur` changed the file, or to start its descent to the next
+    /// change from near `cur`, unless no merge lies above that change.
     async fn entry_and_list(
         &self,
         chain: &mut FirstParents,
@@ -373,12 +402,22 @@ impl Repo {
                 return Ok(Lookup::Unknown);
             }
         }
-        let (entry, list) = futures_util::future::join(
+        let jumps = chain.linear_jumps;
+        let (entry, list, linear_from) = futures_util::future::join3(
             self.history_entry(cur, path.as_str()),
             chain.list(self, cur),
+            async {
+                match jumps {
+                    true => self.linear_from(cur).await,
+                    false => Ok(u64::MAX),
+                }
+            },
         )
         .await;
         list?;
+        // The rest of the walk is below `cur`, where its bound, the
+        // tightest yet, holds.
+        chain.linear_from = linear_from?;
         entry.map(Lookup::Entry)
     }
 
@@ -430,6 +469,7 @@ impl Repo {
             Arc::new(BatchedMeta::new(self.meta().clone())),
         );
         let tip_gen = self.generation(id).await?;
+        let linear_jumps = cuts.linear_jumps;
         let head = walker.walk_stretch(
             path,
             cache,
@@ -440,6 +480,8 @@ impl Repo {
                 first_parents: FirstParents {
                     known: BTreeMap::from([(tip_gen, id)]),
                     lists: HashMap::new(),
+                    linear_from: u64::MAX,
+                    linear_jumps,
                 },
                 known: stop_at.clone(),
             },
@@ -491,7 +533,12 @@ impl Repo {
                     top: top.id,
                     bottom,
                     most: usize::MAX,
-                    first_parents: FirstParents { known, lists },
+                    first_parents: FirstParents {
+                        known,
+                        lists,
+                        linear_from: u64::MAX,
+                        linear_jumps,
+                    },
                     known: stop_at.clone(),
                 }
             })
@@ -679,6 +726,7 @@ impl Repo {
         let skip = skip.then_some(Cuts {
             head: HEAD_STEPS,
             min_span: MIN_STRETCH_SPAN,
+            linear_jumps: true,
         });
         self.blame_walk_in(id, path, skip, cache).await
     }
@@ -929,6 +977,9 @@ struct Changers {
 pub(crate) struct Cuts {
     pub(crate) head: usize,
     pub(crate) min_span: u64,
+    /// Go straight to a changer where the chain has no merge above it
+    /// ([`Repo::skip_unchanged`]); off, tests measure the descent alone.
+    pub(crate) linear_jumps: bool,
 }
 
 /// What a blame's walk found: the changers, newest first, down to `end`;
@@ -1130,6 +1181,11 @@ impl Changers {
 struct FirstParents {
     known: BTreeMap<u64, ChangesetId>,
     lists: SkipLists,
+    /// Every ancestor of the changeset examined last with at least this
+    /// generation is on the chain ([`Repo::linear_from`]).
+    linear_from: u64,
+    /// See [`Cuts::linear_jumps`].
+    linear_jumps: bool,
 }
 
 impl FirstParents {

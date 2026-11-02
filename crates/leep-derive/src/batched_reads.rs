@@ -32,11 +32,13 @@ const MAX_BATCH: usize = 1024;
 /// Answers to one batch of keys of one group.
 type Answer = Result<Vec<Option<Bytes>>>;
 
-/// Where gathered reads go: one batched read of keys of one group (a
-/// derived kind, or blobs).
+/// Where gathered reads go: one batched read of the keys of each group (a
+/// derived kind, or blobs), one answer per group, in order. A round's reads
+/// of several kinds go out as one store call, so a database runs one
+/// statement per round instead of one per kind.
 #[async_trait]
 trait Source: Send + Sync {
-    async fn fetch(&self, group: &str, keys: &[Hash]) -> Answer;
+    async fn fetch(&self, reads: &[(&str, &[Hash])]) -> Result<Vec<Vec<Option<Bytes>>>>;
 }
 
 /// Reads queued for the next batch, and who sends batches.
@@ -123,9 +125,34 @@ impl Gather {
             for w in batch {
                 by_group.entry(w.group.clone()).or_default().push(w);
             }
-            let reads = by_group.into_iter().map(|(group, waiting)| async move {
-                let keys: Vec<Hash> = waiting.iter().flat_map(|w| w.keys.clone()).collect();
-                match source.fetch(&group, &keys).await {
+            let groups: Vec<(String, Vec<Hash>, Vec<Waiting>)> = by_group
+                .into_iter()
+                .map(|(group, waiting)| {
+                    let keys = waiting.iter().flat_map(|w| w.keys.clone()).collect();
+                    (group, keys, waiting)
+                })
+                .collect();
+            let reads: Vec<(&str, &[Hash])> = groups
+                .iter()
+                .map(|(g, keys, _)| (g.as_str(), &keys[..]))
+                .collect();
+            let answers: Vec<Answer> = match source.fetch(&reads).await {
+                Ok(found) if found.len() == groups.len() => found.into_iter().map(Ok).collect(),
+                Ok(found) => {
+                    let why = format!(
+                        "a batched read answered {} of {} kinds",
+                        found.len(),
+                        groups.len()
+                    );
+                    groups
+                        .iter()
+                        .map(|_| Err(Error::Storage(why.clone())))
+                        .collect()
+                }
+                Err(e) => groups.iter().map(|_| Err(copy(&e))).collect(),
+            };
+            for ((_, keys, waiting), answer) in groups.into_iter().zip(answers) {
+                match answer {
                     Ok(found) if found.len() == keys.len() => {
                         let mut found = found.into_iter();
                         for w in waiting {
@@ -148,8 +175,7 @@ impl Gather {
                         }
                     }
                 }
-            });
-            futures_util::future::join_all(reads).await;
+            }
         }
     }
 }
@@ -209,8 +235,11 @@ impl BatchedMeta {
 
 #[async_trait]
 impl Source for BatchedMeta {
-    async fn fetch(&self, kind: &str, keys: &[Hash]) -> Answer {
-        self.inner.get_derived_many(kind, keys).await
+    async fn fetch(&self, reads: &[(&str, &[Hash])]) -> Result<Vec<Vec<Option<Bytes>>>> {
+        match reads {
+            [(kind, keys)] => Ok(vec![self.inner.get_derived_many(kind, keys).await?]),
+            _ => self.inner.get_derived_kinds(reads).await,
+        }
     }
 }
 
@@ -390,8 +419,12 @@ impl BatchedBlobs {
 
 #[async_trait]
 impl Source for BatchedBlobs {
-    async fn fetch(&self, _: &str, keys: &[Hash]) -> Answer {
-        self.inner.get_many(keys).await
+    async fn fetch(&self, reads: &[(&str, &[Hash])]) -> Result<Vec<Vec<Option<Bytes>>>> {
+        let mut out = Vec::with_capacity(reads.len());
+        for (_, keys) in reads {
+            out.push(self.inner.get_many(keys).await?);
+        }
+        Ok(out)
     }
 }
 
