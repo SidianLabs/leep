@@ -166,6 +166,15 @@ in Perl, `(a + b) / 2`) still allow comment-only edits. Tests:
 `constructs_that_desynchronize_the_lexer_are_refused` and
 `ordinary_interpolation_splices_and_operators_still_work`.
 
+*Follow-up (#217).* The nightly fuzzer found the lexer disagreeing with
+itself: it dropped the first line's indentation, which moved Ruby's ` =x`
+to column 0, where a second pass read it as an `=begin`-style block. The
+first line's indentation is now kept like any other line's, and
+`strip_comments` gives up on any text whose result does not lex back to
+itself, so a class of input it gets wrong in this way can never be approved.
+Tests: `first_line_indentation_is_kept_so_stripping_is_idempotent` and
+`stripping_is_idempotent_on_random_texts`.
+
 The lexer remains a heuristic. ADR 0011's advice stands: pair auto-approval
 with owners on sensitive trees.
 

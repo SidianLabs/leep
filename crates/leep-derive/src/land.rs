@@ -54,6 +54,17 @@ pub const MIN_QUEUE_BATCHES: usize = 2;
 /// record, so none lands twice.
 pub const MAX_BATCH_LIFETIME: Duration = Duration::from_secs(60);
 
+/// Most unlanded changesets one land replays (#158). A replay runs on the
+/// ref's leader, ahead of every land queued behind it, and costs a rebase
+/// per member; a longer stack is refused up front, to be landed in pieces.
+/// It matches how far back a landed copy is looked for, so a stack the cap
+/// admits is also one whose earlier landing is found.
+pub const MAX_LAND_STACK: usize = LANDED_COPY_SCAN;
+/// How far into its batch a land's replay may run before that land alone
+/// answers past-deadline (retryable). Half the batch lifetime, so the lands
+/// replayed before it still have time to commit.
+pub const REPLAY_BUDGET: Duration = Duration::from_secs(MAX_BATCH_LIFETIME.as_secs() / 2);
+
 /// Bounds of the `Retry-After` of a land refused at a full queue, in
 /// seconds (ADR 0060, section 2). The answer is the time until a slot
 /// frees, about one batch time, so the ceiling must reach the longest batch
@@ -77,6 +88,23 @@ fn past_deadline(target_ref: &str) -> Error {
         "land onto {target_ref:?} did not finish within {}s; retry",
         MAX_BATCH_LIFETIME.as_secs()
     ))
+}
+
+/// When a land's replay must stop: past `at`, that land answers
+/// [`past_deadline`] instead of holding the ref's queue (#158).
+#[derive(Clone, Copy)]
+struct ReplayDeadline<'a> {
+    at: tokio::time::Instant,
+    target_ref: &'a str,
+}
+
+impl ReplayDeadline<'_> {
+    fn check(&self) -> Result<()> {
+        if tokio::time::Instant::now() >= self.at {
+            return Err(past_deadline(self.target_ref));
+        }
+        Ok(())
+    }
 }
 
 /// Full-jitter exponential backoff, so racing servers spread out instead of
@@ -1304,6 +1332,7 @@ impl Repo {
                                 &mut l.checked,
                                 &mut origins,
                                 fast,
+                                started + REPLAY_BUDGET,
                             )
                             .await
                         }
@@ -1319,6 +1348,7 @@ impl Repo {
                             &mut l.checked,
                             &mut origins,
                             fast,
+                            started + REPLAY_BUDGET,
                         )
                         .await
                     }
@@ -1681,6 +1711,7 @@ impl Repo {
                 &mut Checked::default(),
                 &mut HashMap::new(),
                 None,
+                tokio::time::Instant::now() + REPLAY_BUDGET,
             )
             .await?;
         match step {
@@ -1733,6 +1764,7 @@ impl Repo {
         checked: &mut Checked,
         origins: &mut HashMap<ChangesetId, Option<ChangesetId>>,
         fast: Option<&WriteMap>,
+        deadline: tokio::time::Instant,
     ) -> Result<Step> {
         if head.is_none() && !create {
             return Err(Error::NotFound(format!(
@@ -1773,6 +1805,10 @@ impl Repo {
                     origins,
                     fast,
                     self.land_conflicts.for_ref(target_ref),
+                    ReplayDeadline {
+                        at: deadline,
+                        target_ref,
+                    },
                 )
                 .await?
             {
@@ -2003,6 +2039,7 @@ impl Repo {
         origins: &mut HashMap<ChangesetId, Option<ChangesetId>>,
         fast: Option<&WriteMap>,
         policy: ConflictPolicy,
+        deadline: ReplayDeadline<'_>,
     ) -> Result<Result<Vec<(ChangesetId, ChangesetId)>, LandResponse>> {
         let mut stack = Vec::new();
         let mut members = Vec::new();
@@ -2011,6 +2048,7 @@ impl Repo {
         let mut trunk = false;
         let mut cur = cs;
         loop {
+            deadline.check()?;
             let c = self.get_changeset(cur).await?;
             if c.parents.len() > 1 {
                 return Err(Error::Invalid(format!(
@@ -2031,6 +2069,14 @@ impl Repo {
                         fork = Some(p);
                         break;
                     }
+                    // `p` would be one member more: a stack of exactly the
+                    // cap still lands.
+                    if stack.len() >= MAX_LAND_STACK {
+                        return Err(Error::Invalid(format!(
+                            "cannot land {cs}: its stack of unlanded changesets is longer \
+                             than {MAX_LAND_STACK}; land it in pieces, an ancestor first"
+                        )));
+                    }
                     cur = p;
                 }
                 None => break,
@@ -2040,14 +2086,19 @@ impl Repo {
         let started = Instant::now();
         if let Some(map) = fast {
             let base = fork.filter(|_| trunk);
-            if let Some(pairs) = self.replay_fast(&stack, &members, base, head, map).await? {
+            if let Some(pairs) = self
+                .replay_fast(&stack, &members, base, head, map, deadline)
+                .await?
+            {
                 metrics::counter!("leep_land_replays_total", "path" => "fast").increment(1);
                 metrics::histogram!("leep_land_replay_seconds", "path" => "fast")
                     .record(started.elapsed().as_secs_f64());
                 return Ok(Ok(pairs));
             }
         }
-        let replayed = self.replay_slow(cs, head, &stack, fork, policy).await;
+        let replayed = self
+            .replay_slow(cs, head, &stack, fork, policy, deadline)
+            .await;
         metrics::counter!("leep_land_replays_total", "path" => "slow").increment(1);
         metrics::histogram!("leep_land_replay_seconds", "path" => "slow")
             .record(started.elapsed().as_secs_f64());
@@ -2069,6 +2120,7 @@ impl Repo {
         base: Option<ChangesetId>,
         head: ChangesetId,
         map: &WriteMap,
+        deadline: ReplayDeadline<'_>,
     ) -> Result<Option<Vec<(ChangesetId, ChangesetId)>>> {
         let since = match base {
             None => Err(Lookup::Ineligible),
@@ -2094,6 +2146,7 @@ impl Repo {
         let mut onto = head;
         let mut pairs = Vec::with_capacity(stack.len());
         for (&id, c) in stack.iter().zip(members).rev() {
+            deadline.check()?;
             let parent = c.parents[0];
             // As `rebase` answers a changeset already on `onto`.
             if parent == onto {
@@ -2128,10 +2181,12 @@ impl Repo {
         stack: &[ChangesetId],
         fork: Option<ChangesetId>,
         policy: ConflictPolicy,
+        deadline: ReplayDeadline<'_>,
     ) -> Result<Result<Vec<(ChangesetId, ChangesetId)>, LandResponse>> {
         let mut onto = head;
         let mut pairs = Vec::with_capacity(stack.len());
         for &id in stack.iter().rev() {
+            deadline.check()?;
             match self.rebase_as(id, onto, policy).await? {
                 RebaseResponse::Rebased { id: copy } => {
                     pairs.push((id, copy));
@@ -2322,6 +2377,7 @@ impl Repo {
                     ctx,
                     &mut checked,
                     &staging,
+                    started + REPLAY_BUDGET,
                 )
                 .await;
             let (head, rebased) = match replayed {
@@ -2376,6 +2432,7 @@ impl Repo {
         ctx: &RefUpdateContext,
         checked: &mut Checked,
         staging: &Arc<Staging>,
+        deadline: tokio::time::Instant,
     ) -> Result<Replayed> {
         // After the head: a replay recorded since would have moved it.
         if let Some(key) = &ctx.land {
@@ -2431,7 +2488,17 @@ impl Repo {
         }
         let staged = staging.repo(self);
         match staged
-            .replay_stack(head, onto, &mut HashMap::new(), None, ConflictPolicy::Merge)
+            .replay_stack(
+                head,
+                onto,
+                &mut HashMap::new(),
+                None,
+                ConflictPolicy::Merge,
+                ReplayDeadline {
+                    at: deadline,
+                    target_ref,
+                },
+            )
             .await?
         {
             Ok(rebased) => Ok(Replayed::Move {

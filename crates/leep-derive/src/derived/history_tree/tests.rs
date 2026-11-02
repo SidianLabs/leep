@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use leep_core::memory::{MemoryBlobStore, MemoryMetaStore};
-use leep_core::{ChangesetId, Hash, MetaStore};
+use leep_core::{ChangesetId, Error, Hash, MetaStore};
 
 use super::*;
 use crate::derived::history_pack;
@@ -1208,4 +1208,74 @@ async fn a_chunk_that_does_not_fit_its_list_is_corrupt() {
     let h = commit_pack(&repo, pending, h).await;
     let e = repo.read_history_node(h).await.unwrap_err().to_string();
     assert!(e.contains("corrupt history node"), "{e}");
+}
+
+/// The nightly fuzz crash of #216: a part of writer `[7; 32]` whose node
+/// names a node of `[8; 32]` by absolute reference. Stored again in a pack
+/// written by `[8; 32]`, that is a pack naming itself: writing it must not
+/// panic, and reading it back must be an error, not a reference to some
+/// other node of the pack.
+#[test]
+fn a_pack_that_names_itself_is_an_error_not_a_panic() {
+    let crash = include_bytes!("../../../../../fuzz/corpus/history_node/regress-names-own-writer");
+    let (seven, eight) = (id(7), id(8));
+    let decoded = decode_unchecked(crash, seven, 0).expect("the crash input decodes");
+    assert!(decoded.table.contains(&eight));
+    // As a part of `[8; 32]` itself, its table names its own writer.
+    let err = decode_unchecked(crash, eight, 0)
+        .err()
+        .expect("names itself");
+    assert!(err.to_string().contains("refers to itself"), "{err}");
+    let mut stored = 0;
+    for (node, _) in decoded.nodes {
+        let RawNode::Ready(n) = node else { continue };
+        if n.base().is_some() {
+            continue;
+        }
+        let mut b = PackBuilder::new(eight);
+        let at = b.stage(n, None);
+        let pack = b.finish(at);
+        match decode_part(&pack.value, eight, 0) {
+            Err(Error::Storage(why)) => assert!(why.contains("refers to itself"), "{why}"),
+            other => panic!(
+                "a pack naming its writer must not decode: {:?}",
+                other.is_ok()
+            ),
+        }
+        stored += 1;
+    }
+    assert!(stored > 0);
+}
+
+/// A node may name only nodes of its own pack written before it: one that
+/// names itself (or a later node of its part) could make a walk loop.
+#[test]
+fn a_node_that_names_itself_or_a_later_node_is_corrupt() {
+    // Part 0, no table, root (0, 0, 1), then nodes with lengths.
+    let part = |nodes: &[&[u8]]| {
+        let mut rest = vec![0, 0, 0, 1, nodes.len() as u8];
+        rest.extend(nodes.iter().map(|n| n.len() as u8));
+        for n in nodes {
+            rest.extend_from_slice(n);
+        }
+        let mut bytes = vec![0; 8];
+        bytes.push(0);
+        bytes.extend(rest);
+        bytes
+    };
+    let empty: &[u8] = &[0, 0];
+    // A flat node with one tree entry "a" changed by nobody, naming this
+    // pack's node (part + 0, idx).
+    let naming = |idx: u8| vec![0, 1, 0, 1, b'a', 1, 0, 0, idx];
+    let w = id(9);
+    let good = part(&[empty, &naming(0)]);
+    assert_eq!(decode_unchecked(&good, w, 0).unwrap().nodes.len(), 2);
+    for bad in [
+        part(&[&naming(0)]),
+        part(&[empty, &naming(1)]),
+        part(&[&naming(1), empty]),
+    ] {
+        let err = decode_unchecked(&bad, w, 0).err().expect("corrupt");
+        assert!(err.to_string().contains("itself or a later node"), "{err}");
+    }
 }

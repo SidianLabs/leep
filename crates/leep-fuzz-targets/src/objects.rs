@@ -45,7 +45,6 @@ pub fn tree_node(data: &[u8]) {
 /// as the same node.
 pub fn history_node(data: &[u8]) {
     let cs = ChangesetId(Hash([7; 32]));
-    let other = ChangesetId(Hash([8; 32]));
     for part in [0, 1] {
         let Ok(decoded) = decode_unchecked(data, cs, part) else {
             continue;
@@ -67,6 +66,12 @@ pub fn history_node(data: &[u8]) {
             if n.base().is_some() {
                 continue;
             }
+            // A pack names only its ancestors' nodes, never its own writer's
+            // by absolute reference, so store it again under a writer it
+            // does not name (#216).
+            let Some(other) = writer_not_named(&n, cs) else {
+                continue;
+            };
             let mut b = PackBuilder::new(other);
             let at = b.stage(n.clone(), None);
             let pack = b.finish(at);
@@ -112,6 +117,24 @@ pub fn history_node(data: &[u8]) {
             assert_eq!(whole, Ok(StoredHistoryNode::Flat(node.clone())));
         }
     }
+}
+
+/// The first of `[8; 32]`, `[9; 32]`, ... that is neither `cs` nor a
+/// changeset whose node `node` refers to.
+fn writer_not_named(node: &StoredHistoryNode, cs: ChangesetId) -> Option<ChangesetId> {
+    let named: Vec<ChangesetId> = match node {
+        StoredHistoryNode::Flat(n) => n
+            .entries
+            .values()
+            .filter_map(|e| e.node())
+            .map(|r| r.cs)
+            .collect(),
+        StoredHistoryNode::Split(refs) => refs.iter().map(|r| r.node.cs).collect(),
+        _ => Vec::new(),
+    };
+    (8..=u8::MAX)
+        .map(|b| ChangesetId(Hash([b; 32])))
+        .find(|w| *w != cs && !named.contains(w))
 }
 
 pub fn signature(data: &[u8]) {

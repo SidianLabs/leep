@@ -526,7 +526,7 @@ impl Ahead {
             let sk = sks
                 .as_ref()
                 .and_then(|r| r[i].as_deref())
-                .and_then(|b| Skiplist::decode(b).ok());
+                .and_then(|b| Skiplist::decode_of(id, b).ok());
             if let Some(row) = row {
                 let row = Arc::new(row);
                 repo.cache_filter_row(id, row.clone());

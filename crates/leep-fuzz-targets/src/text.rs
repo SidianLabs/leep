@@ -10,7 +10,7 @@ use leep_core::{refname, ChangesetId, FileKind, Hash, RepoPath};
 use leep_derive::review::{comment_only, whitespace_only};
 use leep_derive::search::plan::{Compiled, MAX_LINE_BYTES};
 use leep_derive::search::trigram::{extract, BlobRow, Bloom};
-use leep_derive::{gc, strip_comments, ExtraMatch};
+use leep_derive::{gc, strip_comments, strip_comments_unchecked, ExtraMatch};
 
 use crate::lossy;
 
@@ -55,10 +55,20 @@ pub fn comment_lexer(data: &[u8]) {
             s.chars().count() <= ta.chars().count(),
             "stripping never adds characters"
         );
-        // What is left reads the same way: no comment and no string is
-        // created or lost by removing comments.
-        assert_eq!(strip_comments(ext, s).as_ref(), Some(s), "idempotent");
     }
+    // What is left reads the same way: no comment and no string is created
+    // or lost by removing comments. Asserted on one pass of the lexer, since
+    // `strip_comments` gives up on a result that does not (#217) and so
+    // could never show the lexer disagreeing with itself.
+    let ua = strip_comments_unchecked(ext, &ta);
+    if let Some(u) = &ua {
+        assert_eq!(
+            strip_comments_unchecked(ext, u).as_ref(),
+            Some(u),
+            "idempotent"
+        );
+    }
+    assert_eq!(sa, ua, "the check in strip_comments never fires");
     assert_eq!(
         comment_only(&path, ta.as_bytes(), tb.as_bytes()),
         comment_only(&path, tb.as_bytes(), ta.as_bytes()),

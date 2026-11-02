@@ -564,8 +564,8 @@ impl Repo {
             let found = self.meta().get_derived_many(Skiplist::NAME, &keys).await?;
             for (i, c) in want.into_iter().enumerate() {
                 let list = match found.get(i).cloned().flatten() {
-                    Some(v) => Skiplist::decode(&v)?,
-                    None => Skiplist::decode(&derived::derive::<Skiplist>(self, c).await?)?,
+                    Some(v) => Skiplist::decode_of(c, &v)?,
+                    None => Skiplist::decode_of(c, &derived::derive::<Skiplist>(self, c).await?)?,
                 };
                 for e in &list {
                     known.insert(e.generation, e.id);
@@ -1108,7 +1108,7 @@ struct FirstParents {
 impl FirstParents {
     async fn list(&mut self, repo: &Repo, id: ChangesetId) -> Result<&[SkipEntry]> {
         if !self.lists.contains_key(&id) {
-            let list = Skiplist::decode(&derived::derive::<Skiplist>(repo, id).await?)?;
+            let list = Skiplist::decode_of(id, &derived::derive::<Skiplist>(repo, id).await?)?;
             for e in &list {
                 self.known.insert(e.generation, e.id);
                 // A changer is often on this chain; its generation then

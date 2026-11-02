@@ -1842,6 +1842,11 @@ MB for Linux) and the commit map, both well under 1 GB.
 
 ### Merge base
 
+`merge_base` answers one best common ancestor. A merge does not rely on that
+choice: in a criss-cross it also finds the others (`merge_bases`, usually
+settled by `side_is_clear` with no walk) and conflicts on any path they
+resolve differently (ADR 0071).
+
 On all of git/git (82,500 commits) on the VPS, `GET /v1/merge-base` of `main`
 and `master~1000` took 70 s on a freshly started server (31 s with the
 machine less loaded) and 0.10 s once the process had cached the ancestry it

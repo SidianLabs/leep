@@ -355,20 +355,113 @@ impl Repo {
         }
     }
 
+    /// Three-way merge of changesets `ours` and `theirs` against their merge
+    /// bases. With one base this is [`Repo::merge_trees`]. In a criss-cross
+    /// there are several, and the merge is made against the first, then
+    /// every path the bases disagree on is resolved against each of them:
+    /// a path whose answers differ is a conflict, though any one base would
+    /// have taken a side's version without one (ADR 0071).
+    pub(crate) async fn merge_changesets(
+        &self,
+        ours: ChangesetId,
+        theirs: ChangesetId,
+    ) -> Result<TreeMerge> {
+        let bases = self.merge_bases(ours, theirs).await?;
+        let (ours, theirs) = (self.root_tree(ours).await?, self.root_tree(theirs).await?);
+        let first = self.tree_or_empty(bases.first().copied()).await?;
+        let mut m = self.merge_trees(first, ours, theirs).await?;
+        if bases.len() > 1 {
+            let mut trees = vec![first];
+            for &b in &bases[1..] {
+                trees.push(self.root_tree(b).await?);
+            }
+            self.reconcile_bases(&trees, ours, theirs, &mut m).await?;
+        }
+        Ok(m)
+    }
+
+    /// Make `m`, merged against `bases[0]`, a conflict at every path where
+    /// the merge against another of `bases` would end differently. A path
+    /// all bases agree on resolves the same against each, so only paths some
+    /// base changes relative to `bases[0]` are looked at.
+    async fn reconcile_bases(
+        &self,
+        bases: &[Hash],
+        ours: Hash,
+        theirs: Hash,
+        m: &mut TreeMerge,
+    ) -> Result<()> {
+        let mut disputed: BTreeSet<RepoPath> = BTreeSet::new();
+        for &b in &bases[1..] {
+            disputed.extend(
+                self.diff_trees(bases[0], b, "")
+                    .await?
+                    .into_iter()
+                    .map(|e| e.path),
+            );
+        }
+        if disputed.is_empty() {
+            return Ok(());
+        }
+        let paths: Vec<&RepoPath> = disputed.iter().collect();
+        let ours_at = self.files_at(ours, &paths).await?;
+        let theirs_at = self.files_at(theirs, &paths).await?;
+        let mut bases_at = Vec::with_capacity(bases.len());
+        for &b in bases {
+            bases_at.push(self.files_at(b, &paths).await?);
+        }
+        let key = |f: &Option<FileInfo>| f.as_ref().map(|f| (f.content, f.kind));
+        for path in disputed {
+            let (o, t) = (&ours_at[&path], &theirs_at[&path]);
+            // What the path ends as against each base; `None` for a conflict.
+            let mut outcome = None;
+            let mut agree = true;
+            for at in &bases_at {
+                let end = match self.resolve3(&at[&path], o, t).await? {
+                    Resolved::Keep => Some(key(o)),
+                    Resolved::Set(FileChange::Modify { content, kind, .. }) => {
+                        Some(Some((content, kind)))
+                    }
+                    Resolved::Set(FileChange::Delete) => Some(None),
+                    Resolved::Conflict(_) => None,
+                };
+                match (&outcome, end) {
+                    (_, None) => {
+                        agree = false;
+                        break;
+                    }
+                    (None, Some(e)) => outcome = Some(e),
+                    (Some(prev), Some(e)) if *prev != e => {
+                        agree = false;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            if agree {
+                continue;
+            }
+            m.changes.remove(&path);
+            m.conflicts.retain(|c| c.path != path);
+            m.conflicts.push(Conflict {
+                path: path.clone(),
+                base: bases_at[0][&path].clone(),
+                ours: o.clone(),
+                theirs: t.clone(),
+                merged_with_markers: None,
+            });
+        }
+        m.conflicts.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(())
+    }
+
     /// Three-way merge of two changesets into a new merge changeset with
     /// parents `[ours, theirs]`, or the list of conflicts.
     pub async fn merge(&self, req: MergeRequest) -> Result<MergeResponse> {
         let [ours, theirs] = req.parents;
         self.rescue_changesets(&[ours, theirs], RescueBy::Create)
             .await?;
-        let base = self.merge_base(ours, theirs).await?;
-        let m = self
-            .merge_trees(
-                self.tree_or_empty(base).await?,
-                self.root_tree(ours).await?,
-                self.root_tree(theirs).await?,
-            )
-            .await?;
+        let m = self.merge_changesets(ours, theirs).await?;
         if !m.conflicts.is_empty() {
             return Ok(MergeResponse::Conflicts {
                 conflicts: m.conflicts,

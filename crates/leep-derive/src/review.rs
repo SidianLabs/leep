@@ -14,7 +14,8 @@
 //!
 //! A changeset is approved when no path is pending or rejected.
 
-use std::collections::BTreeSet;
+use std::collections::hash_map::Entry;
+use std::collections::{BTreeSet, HashMap};
 
 use globset::{Glob, GlobBuilder, GlobSet, GlobSetBuilder};
 use leep_core::api::FileInfo;
@@ -207,6 +208,26 @@ impl ChangesetReview {
     }
 }
 
+/// The merge bases of a merge's first parent with each side parent, found
+/// once per review: a review asks for them at every changed path, and in a
+/// criss-cross each answer is a walk.
+#[derive(Default)]
+struct SideBases(HashMap<(ChangesetId, ChangesetId), Vec<ChangesetId>>);
+
+impl SideBases {
+    async fn get(
+        &mut self,
+        repo: &Repo,
+        ours: ChangesetId,
+        side: ChangesetId,
+    ) -> Result<&[ChangesetId]> {
+        Ok(match self.0.entry((ours, side)) {
+            Entry::Occupied(e) => e.into_mut(),
+            Entry::Vacant(e) => e.insert(repo.merge_bases(ours, side).await?),
+        })
+    }
+}
+
 impl Repo {
     /// Judge changeset `id` against `reviews` (at most one per reviewer, all
     /// about `id` exactly) and the owners `owners` reads from the target ref.
@@ -226,7 +247,10 @@ impl Repo {
                 .collect()
         };
         let (approvals, rejections) = (by(Verdict::Approve), by(Verdict::Reject));
-        let dropped = self.dropped_side_changes(&cs.parents, id).await?;
+        let mut bases = SideBases::default();
+        let dropped = self
+            .dropped_side_changes(&cs.parents, id, &mut bases)
+            .await?;
         let mut judged: Vec<(&RepoPath, Option<&FileChange>)> = cs
             .changes
             .iter()
@@ -248,7 +272,7 @@ impl Repo {
                 PathRule::Rejected
             } else if let Some(change) = change {
                 if self
-                    .covered_by_merge_parent(&cs.parents, path, change)
+                    .covered_by_merge_parent(&cs.parents, path, change, &mut bases)
                     .await?
                 {
                     PathRule::MergeParent
@@ -287,6 +311,7 @@ impl Repo {
         &self,
         parents: &[ChangesetId],
         id: ChangesetId,
+        side_bases: &mut SideBases,
     ) -> Result<Vec<RepoPath>> {
         let Some((&ours, sides)) = parents.split_first() else {
             return Ok(Vec::new());
@@ -295,7 +320,9 @@ impl Repo {
         let mine = self.root_tree(id).await?;
         let mut dropped = BTreeSet::new();
         for &side in sides {
-            let base = self.merge_base(ours, side).await?;
+            // In a criss-cross, a change dropped relative to any of the
+            // merge bases counts (ADR 0071).
+            let bases = side_bases.get(self, ours, side).await?.to_vec();
             for e in self
                 .diff_trees(self.root_tree(side).await?, mine, "")
                 .await?
@@ -304,11 +331,14 @@ impl Repo {
                 if !kept_ours || dropped.contains(&e.path) {
                     continue;
                 }
-                let at_base = match base {
-                    Some(b) => key(&self.lookup_file(b, &e.path).await?),
-                    None => None,
-                };
-                if at_base != key(&e.old) {
+                let mut at_bases = Vec::new();
+                for &b in &bases {
+                    at_bases.push(key(&self.lookup_file(b, &e.path).await?));
+                }
+                if at_bases.is_empty() {
+                    at_bases.push(None);
+                }
+                if at_bases.iter().any(|at| *at != key(&e.old)) {
                     dropped.insert(e.path);
                 }
             }
@@ -327,6 +357,7 @@ impl Repo {
         parents: &[ChangesetId],
         path: &RepoPath,
         change: &FileChange,
+        side_bases: &mut SideBases,
     ) -> Result<bool> {
         let Some((&ours, sides)) = parents.split_first() else {
             return Ok(false);
@@ -349,11 +380,21 @@ impl Repo {
                 Some(v) => v,
                 None => *ours_now.insert(key(self.lookup_file(ours, path).await?)),
             };
-            let at_base = match self.merge_base(ours, *side).await? {
-                Some(b) => key(self.lookup_file(b, path).await?),
-                None => None,
-            };
-            if at_base == ours_now {
+            // Covered only if the first parent left the path as every merge
+            // base has it: in a criss-cross one base can hide a change
+            // another shows (ADR 0071).
+            let bases = side_bases.get(self, ours, *side).await?.to_vec();
+            let mut covered = true;
+            if bases.is_empty() {
+                covered = ours_now.is_none();
+            }
+            for b in bases {
+                if key(self.lookup_file(b, path).await?) != ours_now {
+                    covered = false;
+                    break;
+                }
+            }
+            if covered {
                 return Ok(true);
             }
         }

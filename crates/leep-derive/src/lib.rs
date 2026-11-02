@@ -50,6 +50,8 @@ mod blame_tests;
 #[cfg(test)]
 mod bounded_tests;
 #[cfg(test)]
+mod criss_cross_tests;
+#[cfg(test)]
 mod fault_tests;
 #[cfg(test)]
 mod flush_tests;
@@ -64,6 +66,8 @@ mod land_fast_tests;
 #[cfg(test)]
 mod land_pipeline_tests;
 #[cfg(test)]
+mod land_stack_tests;
+#[cfg(test)]
 mod lazy_tree_tests;
 #[cfg(test)]
 mod page_tests;
@@ -76,7 +80,7 @@ mod tests;
 
 /// The comment lexer, public only so the fuzz harness can check it directly.
 #[doc(hidden)]
-pub use comments::strip_comments;
+pub use comments::{strip_comments, strip_comments_unchecked};
 pub use cursor::MAX_CURSOR_CHARS;
 pub use history::{ExtraMatch, LogFilter, LogPage, LogParams};
 pub use land::{

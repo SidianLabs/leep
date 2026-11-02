@@ -112,6 +112,45 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 - **Changed.** A land batch that fast-forwards a ref to such a changeset
   stores its tree in two waves (nodes, then the root), so two packs; an
   eager create flushes its tree's nodes before writing the root.
+### Bounded land replays
+- **Changed.** A land whose stack of unlanded changesets is longer than
+  1,024 is refused with a 400 that says to land it in pieces, before
+  anything is replayed. A replay checks its batch's deadline at every
+  stack entry: past 30 s (half of the 60 s batch lifetime) that land alone
+  answers the retryable past-deadline 409, instead of holding the ref's
+  queue until the whole batch expires. The same applies to the git
+  mirror's `rebase-onto`. Fixes #158.
+
+### The comment lexer agrees with itself
+- **Fixed.** `strip_comments`, which decides the `comment_only` review rule,
+  dropped the indentation of a file's first code line, so its output could
+  read differently from its input (Ruby ` =x` became an `=begin`-style
+  block). The first line keeps its indentation, and a text whose stripped
+  form does not lex back to itself is never comment-only. Changing only the
+  first line's indentation is no longer a comment-only edit. In C and C++
+  a backslash outside a literal that is not a line splice (and not at the
+  end of the file) makes the lexer give up, a backslash, blanks including
+  vertical tab or form feed, and a newline is a splice, and in Go any
+  `"C"` marks a possible cgo file. Fixes #217.
+
+### Damaged history packs and skiplists are errors, not panics
+- **Fixed.** A `history-tree-v4` part whose id table names its own writer,
+  or a node that names itself or a later node of its part, is a `corrupt
+  history node` storage error, which `verify` reports and `repair
+  rederive` rebuilds. Writing a pack whose nodes name its writer by
+  absolute reference no longer trips a debug assertion; it writes a part
+  that fails to decode. A skiplist row whose generations do not descend,
+  or that names its own changeset, is an error too, so an ancestry walk
+  never goes round. Fixes #216.
+
+### Criss-cross merges check every merge base
+- **Fixed.** `POST /v1/merge` (and `leep merge`) in a criss-cross history,
+  where the two sides have several best common ancestors, merged against
+  one of them and could drop a side's edit or resolution without a
+  conflict. Every path the bases disagree on is now resolved against each
+  base, and a path whose answers differ is reported as a conflict. The
+  review rules on merges (`merge-parent`, dropped side changes) check every
+  base too. See ADR 0071. Fixes #160.
 
 ### Land batches write one pack
 - **Changed.** A land batch's new objects (tree nodes, merged contents)

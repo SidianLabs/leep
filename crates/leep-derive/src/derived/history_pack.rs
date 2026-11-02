@@ -114,6 +114,20 @@ impl Table {
         i
     }
 
+    /// `id` as a table entry even if it is the writer: how a node of
+    /// another pack that names the writer absolutely (damage; a pack only
+    /// names its ancestors) is written, so the pack fails to decode instead
+    /// of reading as a reference to some other node of its own.
+    fn entry_for(&mut self, id: ChangesetId) -> u64 {
+        if let Some(&i) = self.index.get(&id) {
+            return i;
+        }
+        self.ids.push(id);
+        let i = self.ids.len() as u64;
+        self.index.insert(id, i);
+        i
+    }
+
     fn truncate(&mut self, len: usize) {
         for id in self.ids.drain(len..) {
             self.index.remove(&id);
@@ -158,11 +172,11 @@ impl Encoder<'_> {
             put_varint(&mut self.out, part);
             put_varint(&mut self.out, idx);
         } else {
-            debug_assert_ne!(
-                r.cs, self.table.writer,
-                "a pack refers to itself while pending"
-            );
-            let i = self.table.id(r.cs);
+            let i = if r.cs == self.table.writer {
+                self.table.entry_for(r.cs)
+            } else {
+                self.table.id(r.cs)
+            };
             put_varint(&mut self.out, i);
             put_varint(&mut self.out, r.part as u64);
             put_varint(&mut self.out, r.idx as u64);
@@ -652,6 +666,9 @@ struct Decoder<'a> {
     cs: ChangesetId,
     part: u32,
     table: &'a [ChangesetId],
+    /// The index of the node being decoded (`None` for the root): a node
+    /// names only nodes of its pack written before it, so never itself.
+    node: Option<u32>,
 }
 
 impl Decoder<'_> {
@@ -671,6 +688,9 @@ impl Decoder<'_> {
         let part = self.r.u32()?;
         let idx = self.r.u32()?;
         if w == 0 {
+            if part == 0 && self.node.is_some_and(|n| idx >= n) {
+                return Err(bad("a node refers to itself or a later node"));
+            }
             let part = self
                 .part
                 .checked_add(part)
@@ -847,14 +867,20 @@ impl Part {
         }
         let mut table = Vec::with_capacity(n as usize);
         for _ in 0..n {
-            let id = r.take(32)?;
-            table.push(ChangesetId(Hash(id.try_into().expect("32 bytes"))));
+            let id = ChangesetId(Hash(r.take(32)?.try_into().expect("32 bytes")));
+            // The writer is index 0; naming it here would let a node name
+            // its own pack by absolute part, and so itself.
+            if id == cs {
+                return Err(bad("a pack refers to itself"));
+            }
+            table.push(id);
         }
         let mut d = Decoder {
             r,
             cs,
             part,
             table: &table,
+            node: None,
         };
         let root = if part == 0 { Some(d.node_ref()?) } else { None };
         let count = d.r.count()?;
@@ -912,6 +938,7 @@ impl Part {
             cs: self.cs,
             part: self.part,
             table: &self.table,
+            node: Some(idx),
         };
         Some(match d.node() {
             Ok(n) if d.r.pos == range.end => Ok(n),

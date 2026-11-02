@@ -788,7 +788,13 @@ and built `b` on its own `a` lands only `b`, instead of a second, empty copy
 of `a`, or a false conflict when the ref changed `a`'s files since. On conflict the client applies
 `clean` (every blob it names is stored before the answer, even when the batch
 moves nothing; `/v1/ready` lists `land-clean-blobs`), resolves `conflicts` on top of `onto`, commits once and lands again,
-which is then a fast-forward. Stacks containing merges are rejected.
+which is then a fast-forward. Stacks containing merges are rejected, and so
+are stacks longer than `MAX_LAND_STACK` (1,024, the landed-copy scan): 400,
+"land it in pieces". A replay runs on the ref's leader ahead of every land
+queued behind it, so it checks a deadline at every stack entry: past
+`REPLAY_BUDGET` (half of `MAX_BATCH_LIFETIME`) from its batch's start, that
+land alone answers the retryable past-deadline 409, and the lands replayed
+before it still commit.
 Built ([ADR 0060](adr/0060-land-admission-and-read-limits.md), section 2):
 the server that batches a ref's lands bounds its queue: by default in
 seconds (`--land-queue-seconds`, 5 s, `Repo::with_land_queue_seconds`,
@@ -950,6 +956,11 @@ Malformed suffixes and reflog syntax (`@{...}`) are 400, a walk past a root 404.
 **Merge**: three-way, per path, with base = `merge_base(ours, theirs)`.
 Identical changes on both sides merge trivially. Text files merge by line
 (`diffy`). Binary files and delete-vs-modify cases are returned as conflicts.
+In a criss-cross (`merge_bases` finds more than one best common ancestor),
+every path some base disagrees on is resolved against each base, and a path
+whose answers differ is a conflict, never a silent pick
+([ADR 0071](adr/0071-criss-cross-merges-check-every-base.md)). The review
+rules on merges check every base the same way.
 
 `merge_base(a, b)` is the common ancestor with the highest generation, ties
 going to the highest id; no other common ancestor can descend from it. It is
