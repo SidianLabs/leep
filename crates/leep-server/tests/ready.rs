@@ -394,3 +394,91 @@ async fn concurrent_probes_share_one_check() {
     assert_eq!(r.meta_plan.calls(Op::GetRef), 1);
     assert_eq!(r.blob_plan.calls(Op::Contains), 1);
 }
+
+/// A blob store whose first load (the pack index) takes as long as a test
+/// lets it, and which counts the probes that reach it.
+struct SlowLoad {
+    inner: MemoryBlobStore,
+    release: Arc<tokio::sync::Notify>,
+    contains: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl leep_core::BlobStore for SlowLoad {
+    async fn put_with_hash(&self, h: leep_core::Hash, d: bytes::Bytes) -> leep_core::Result<()> {
+        self.inner.put_with_hash(h, d).await
+    }
+    async fn get(&self, h: &leep_core::Hash) -> leep_core::Result<Option<bytes::Bytes>> {
+        self.inner.get(h).await
+    }
+    async fn contains(&self, h: &leep_core::Hash) -> leep_core::Result<bool> {
+        self.contains
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.contains(h).await
+    }
+    async fn warm(&self) -> leep_core::Result<()> {
+        self.release.notified().await;
+        Ok(())
+    }
+    async fn list_page(
+        &self,
+        a: Option<leep_core::Hash>,
+        n: usize,
+    ) -> leep_core::Result<Vec<leep_core::BlobMeta>> {
+        self.inner.list_page(a, n).await
+    }
+    async fn delete(&self, h: &leep_core::Hash) -> leep_core::Result<()> {
+        self.inner.delete(h).await
+    }
+}
+
+/// While the first load runs, readiness says `blobs` is loading, within the
+/// ready timeout and without a probe that could time out; when it ends, ready, with no failure
+/// in between.
+#[tokio::test]
+async fn not_ready_while_the_blob_store_loads_then_ready() {
+    let release = Arc::new(tokio::sync::Notify::new());
+    let blobs = Arc::new(SlowLoad {
+        inner: MemoryBlobStore::new(),
+        release: release.clone(),
+        contains: Default::default(),
+    });
+    let repo = Repo::new(blobs.clone(), Arc::new(MemoryMetaStore::new()));
+    let config = ConfigHandle::fixed(RuntimeConfig::fixed(None, None, None, None, None));
+    let app = leep_server::router_with_body_limits(
+        repo,
+        1 << 20,
+        leep_server::limits::BodyLimits::under(1 << 20),
+        Duration::from_secs(60),
+        config,
+        leep_server::ReadyOptions {
+            timeout: Duration::from_millis(50),
+            cache: Duration::ZERO,
+        },
+    );
+    for _ in 0..3 {
+        let began = Instant::now();
+        let (status, body) = ready(&app).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let got = parse(&body);
+        assert_eq!(got.failed.len(), 1, "{got:?}");
+        assert_eq!(
+            (got.failed[0].store.as_str(), got.failed[0].reason.as_str()),
+            ("blobs", "loading")
+        );
+        assert!(began.elapsed() < Duration::from_millis(500));
+    }
+    assert_eq!(blobs.contains.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    release.notify_one();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let (status, body) = ready(&app).await;
+        if status == StatusCode::OK {
+            break;
+        }
+        assert!(Instant::now() < deadline, "never ready: {body:?}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(blobs.contains.load(std::sync::atomic::Ordering::SeqCst) > 0);
+}

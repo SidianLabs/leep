@@ -212,8 +212,10 @@ file says):
 | `GET /v1/health` | Is the process alive? (liveness) | nothing but that HTTP is served | 200 `"ok"` |
 | `GET /v1/ready` | Can it serve right now? (readiness) | reads one ref from the metadata store and asks the blob store about one fixed hash, concurrently, each under `--ready-timeout` (default 2 s) | 200 `{"status":"ready","features":["land-id","indexing-retry","changeset-rescue","land-clean-blobs"]}`, or 503 `{"status":"not ready","failed":[{"store":"meta","reason":"unavailable"}],"features":["land-id","indexing-retry","changeset-rescue","land-clean-blobs"]}` (`features`: optional behaviours clients may check for, ADR 0057) |
 
-`store` is `meta` or `blobs`; `reason` is `unavailable` or `timed out after
-2000ms`, never the driver's message (it can carry a host name; the server logs
+`store` is `meta` or `blobs`; `reason` is `unavailable`, `loading` (the blob
+store's pack index is still loading after a start; no probe is made until it
+ends, [OPERATIONS.md](OPERATIONS.md#readiness-while-a-pack-index-loads)) or
+`timed out after 2000ms`, never the driver's message (it can carry a host name; the server logs
 it as `readiness check failed`). Restart on liveness, and take a server out of
 rotation on readiness. Do not use `/v1/ready` as a liveness probe: when a
 shared database blips, every server would be restarted at once for no gain.
@@ -621,6 +623,7 @@ from Windows, as git does with `core.filemode=false`.
 | `LEEP_IDLE_TIMEOUT` | `2m` | Close a connection with no request in progress for this long; `0` turns it off. |
 | `LEEP_BODY_IDLE_TIMEOUT` | `60s` | A request body that delivers nothing, or a response the client reads nothing of, for this long fails and its connection closes, freeing the permits the request holds; `0` turns it off. |
 | `LEEP_MAX_CONNECTIONS` | `10000` | Most connections served at once, or `off`; further ones wait in the listen backlog. |
+| `MALLOC_ARENA_MAX` | `2` (set by the server on Linux/glibc when unset) | Cap on glibc malloc arenas, which otherwise retain much freed memory. Set it to override ([Malloc arenas](OPERATIONS.md#malloc-arenas)). |
 | `LEEP_READY_TIMEOUT` | `2s` | Bound on each store check behind `GET /v1/ready` (`500ms`, `2s`; not zero). See [Probes](#probes). |
 | `LEEP_METRICS_LISTEN` | off | Address for a separate, unauthenticated `GET /metrics` listener; keep it private: its labels include token names, and the server warns at startup when the address is not loopback. See [OPERATIONS.md](OPERATIONS.md#metrics). |
 | `LEEP_LOG_FORMAT` | `text` | `text` or `json` (one object per line). |

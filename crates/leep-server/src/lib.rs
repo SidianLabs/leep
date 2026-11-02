@@ -269,6 +269,7 @@ pub fn router_with_read_limits(
         repo: repo.clone(),
         options: ready_options,
         last: tokio::sync::Mutex::new(None),
+        warming: start_warmup(&repo),
     });
     let router = Router::new()
         .route("/v1/health", get(health))
@@ -708,6 +709,34 @@ struct ReadyProbe {
     /// callers that arrive meanwhile wait for its answer instead of starting
     /// their own: at most one check per cache period, whatever the load.
     last: tokio::sync::Mutex<Option<(tokio::time::Instant, Vec<ReadyFailure>)>>,
+    /// `true` while the blob store's first load (a pack index, 321 MB at 1M
+    /// changesets) runs. Probing it meanwhile would only time out at the
+    /// deadline, so `blobs` is reported as loading until it finishes.
+    warming: tokio::sync::watch::Receiver<bool>,
+}
+
+/// Starts the blob store's warm-up in the background; the returned receiver
+/// reads `true` until it ends. A failed warm-up is logged and then ends
+/// too: the probe's own blob check reports the failure from then on. With
+/// no runtime to run it on, the store is simply not warmed.
+fn start_warmup(repo: &Arc<Repo>) -> tokio::sync::watch::Receiver<bool> {
+    let Ok(rt) = tokio::runtime::Handle::try_current() else {
+        return tokio::sync::watch::channel(false).1;
+    };
+    let (tx, rx) = tokio::sync::watch::channel(true);
+    let blobs = repo.blobs().clone();
+    rt.spawn(async move {
+        let began = std::time::Instant::now();
+        match blobs.warm().await {
+            Ok(()) => tracing::info!(
+                elapsed_ms = began.elapsed().as_millis() as u64,
+                "blob store loaded"
+            ),
+            Err(e) => tracing::warn!(error = %e, "blob store warm-up failed"),
+        }
+        let _ = tx.send(false);
+    });
+    rx
 }
 
 impl ReadyProbe {
@@ -730,16 +759,33 @@ impl ReadyProbe {
         let limit = self.options.timeout;
         let meta = self.repo.meta().clone();
         let blobs = self.repo.blobs().clone();
+        let mut warming = self.warming.clone();
         let (m, b) = tokio::join!(
             check_store("meta", limit, async move {
                 meta.get_ref(READY_PROBE_REF).await.map(|_| ())
             }),
-            check_store("blobs", limit, async move {
-                blobs
-                    .contains(&Hash::of_blob(READY_PROBE_BLOB))
-                    .await
-                    .map(|_| ())
-            }),
+            async move {
+                // Give a load that is nearly done the check's own time to
+                // finish; a slower one is reported, not probed.
+                let loaded = tokio::time::timeout(limit, async {
+                    // Ok or Err alike: a closed channel means it ended.
+                    let _ = warming.wait_for(|w| !*w).await;
+                })
+                .await;
+                if loaded.is_err() {
+                    return Some(ReadyFailure {
+                        store: "blobs".to_string(),
+                        reason: "loading".to_string(),
+                    });
+                }
+                check_store("blobs", limit, async move {
+                    blobs
+                        .contains(&Hash::of_blob(READY_PROBE_BLOB))
+                        .await
+                        .map(|_| ())
+                })
+                .await
+            },
         );
         [m, b].into_iter().flatten().collect()
     }

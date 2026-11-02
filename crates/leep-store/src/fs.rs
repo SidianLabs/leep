@@ -534,6 +534,10 @@ impl BlobStore for FsBlobStore {
         Ok(out)
     }
 
+    async fn warm(&self) -> Result<()> {
+        self.blocking(|p| p.view().map(|_| ())).await
+    }
+
     /// Rereads the tombstones if they changed, so a blob GC deleted from a
     /// pack in another process is not reported present.
     async fn contains(&self, hash: &Hash) -> Result<bool> {
