@@ -4,6 +4,7 @@
 //! parents first, several at a time ([`wavefront`], ADR 0050), and caches
 //! each under `(kind, changeset id)` in the `MetaStore`.
 
+mod chain_walk;
 mod generation;
 pub mod history_pack;
 mod history_tree;
@@ -239,6 +240,10 @@ async fn derive_missing<K: DerivedKind>(repo: &Repo, id: ChangesetId) -> Result<
         .ok_or_else(|| Error::Storage("derivation produced no value".into()))
 }
 
+/// Frontiers at most this wide are walked a first-parent chain at a time
+/// ([`chain_walk::follow_chain`]): a wider one already fills its batches.
+const CHAIN_SEEDS: usize = 8;
+
 /// Derive `K` for `roots`, which the caller found missing, and every
 /// ancestor of theirs that lacks a value. Returns the value of the root
 /// placed last, which for one root is that root's, and how many changesets
@@ -256,7 +261,25 @@ async fn derive_range<K: DerivedKind>(
     let mut seen: HashSet<ChangesetId> = roots.iter().copied().collect();
     let mut frontier: Vec<ChangesetId> = seen.iter().copied().collect();
     let mut first = true;
+    // A narrow frontier is followed a first-parent chain at a time down the
+    // skiplists (ADR 0077); the skiplist kind itself has no rows to follow.
+    let chains = K::NAME != <Skiplist as DerivedKind>::NAME;
     while !frontier.is_empty() {
+        if !first && chains && frontier.len() <= CHAIN_SEEDS {
+            for s in std::mem::take(&mut frontier) {
+                chain_walk::follow_chain(
+                    repo,
+                    K::NAME,
+                    s,
+                    &mut seen,
+                    &mut parents,
+                    &mut arena,
+                    &mut frontier,
+                )
+                .await?;
+            }
+            continue;
+        }
         let mut missing = Vec::with_capacity(frontier.len());
         for chunk in frontier.chunks(BATCH) {
             // The roots were checked by the caller.

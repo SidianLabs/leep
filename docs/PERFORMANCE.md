@@ -3558,6 +3558,42 @@ What it says:
   derivation, which spreads one chain over cores. It only matters if one of
   those cases falls below the land rate.
 
+### Finding the missing range (ADR 0077)
+
+Measured 2026-11-02. The 2 round trips per changeset of catch-up above
+were mostly `derive_range` finding the gap: one row read and one changeset
+read per changeset of a linear chain, all before the first derivation.
+ADR 0077 lists the chain down the skiplists instead, a level per batched
+read. `crates/leep-server/tests/warm_catch_up.rs` builds a 500-changeset
+indexed base and a linear gap on top of it on Postgres, then derives the
+history index for the head from a cold handle in the index lane, as the
+warmer does:
+
+```sh
+LEEP_TEST_POSTGRES_URL=postgres://... LEEP_CATCH_UP_GAP=4000 \
+  cargo test --release -p leep-server --test warm_catch_up -- --ignored --nocapture
+```
+
+Local Postgres 16 over a Unix socket, in-memory blobs, release build, a
+4-vCPU VM, one run per row. "Before" is the same build with the chain walk
+turned off, which is the old frontier walk.
+
+| Gap | Before | After |
+|---|---|---|
+| 4,000 | 1,548/s, 8,083 reads, first write after 1.92 s | 4,998/s, 138 reads, first write after 0.14 s |
+| 8,000 | 1,542/s, 16,131 reads, first write after 3.73 s | 4,484/s, 226 reads, first write after 0.24 s |
+
+- **Reads fall from 2 per changeset to about 0.03.** Finding the range
+  took 8,064 reads at a gap of 4,000 and 118 after; the rest are the
+  wavefront's batched changeset reads and the derivations' own.
+- **The time to first write is the lag the warmer adds on top of
+  deriving.** Each round trip here costs about 0.24 ms; under the swarm's
+  load Postgres answers far slower, so the old walk's cost grew with the
+  gap and the load together, which is how the index fell 3,900 changesets
+  behind at 2,000 agents. Not yet re-measured in the swarm.
+- **Derivation itself is unchanged**, about 6,000 changesets a second for
+  these one-file changesets once the range is known.
+
 ## Garbage collection
 
 `leep-server gc` phases timed with

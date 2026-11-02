@@ -259,6 +259,15 @@ Postgres store answers them from a reserved pool
 index is behind cannot slow the warmer that would catch it up.
 `derive` takes a per-kind lock once a value is missing, so concurrent requests
 and the warmer never derive the same range twice.
+Before deriving, `derive_range` finds the missing range, keeping only each
+changeset's parents. A wide frontier is walked a batch of changesets per
+round trip; a frontier of at most 8 is followed a first-parent chain at a
+time (`derived::chain_walk`, ADR 0077): the chain is listed down the
+skiplists a level per batched read, bounded by the first row (or changeset
+already found) on it, then checked and read in batches, each changeset kept
+only while it is the first parent of the one above. A linear gap of N
+changesets, the warmer's usual case since lands rebase, costs about
+3N/256 + 2 log2(N) reads instead of 2N, and the range found is the same.
 
 **Who builds indexes (ADR 0058).** `--indexing local` (the default) is the
 above, on every server. With `--indexing lease`, each index group (path
