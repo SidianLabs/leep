@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::{stream, StreamExt};
+use leep_core::changeset::EXTRA_REBASED_FROM;
 use leep_core::review::{
     check_comment, check_source, Review, ReviewSource, REVIEW_KIND, REVIEW_SOURCE_KIND,
 };
@@ -1217,17 +1218,36 @@ impl Verifier<'_> {
                 let mut why = None;
                 match origin {
                     None => why = Some(format!("is {} bytes, not a changeset id", value.len())),
+                    // The copy's id hashes its `leep.rebased_from`, so the
+                    // row must agree with it. The original may be gone: the
+                    // changeset sweep deletes it and keeps the reachable
+                    // copy's row (ADR 0059, "Kept").
                     Some(o) => {
-                        for (what, id) in [("copy", copy), ("original", o)] {
-                            match meta.get_changeset(&id).await {
-                                Ok(Some(_)) => {}
-                                Ok(None) => {
-                                    why =
-                                        Some(format!("names the {what} {id}, which does not exist"))
+                        match meta.get_changeset(&copy).await {
+                            Ok(Some(cs)) => {
+                                let named = cs.extra.get(EXTRA_REBASED_FROM);
+                                if named != Some(&o.to_string()) {
+                                    why = Some(format!(
+                                        "names the original {o}, but the copy's {EXTRA_REBASED_FROM} is {}",
+                                        named.map_or("absent", String::as_str)
+                                    ));
                                 }
+                            }
+                            Ok(None) => {
+                                why = Some(format!("names the copy {copy}, which does not exist"))
+                            }
+                            Err(e) if damage_of(&e).is_some() => {
+                                why =
+                                    Some(format!("names the copy {copy}, which is unreadable: {e}"))
+                            }
+                            Err(e) => return Err(e),
+                        }
+                        if why.is_none() {
+                            match meta.get_changeset(&o).await {
+                                Ok(_) => {}
                                 Err(e) if damage_of(&e).is_some() => {
                                     why = Some(format!(
-                                        "names the {what} {id}, which is unreadable: {e}"
+                                        "names the original {o}, which is unreadable: {e}"
                                     ))
                                 }
                                 Err(e) => return Err(e),

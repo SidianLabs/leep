@@ -511,6 +511,46 @@ async fn get_of_deleted_original_is_404_and_copy_via_answers() {
     }
 }
 
+/// The copy's `rebased-origin-v1` row outlives its deleted original (ADR
+/// 0059, "Kept"), so `verify` must accept a row whose original is gone.
+#[tokio::test(start_paused = true)]
+async fn verify_accepts_a_copy_whose_original_was_swept() {
+    let w = World::new(5);
+    let base = commit_file(5, &w.clean, None, "base.txt", "b\n", "base").await;
+    w.meta.cas_ref("main", None, Some(base)).await.unwrap();
+    let feature = commit_file(5, &w.clean, Some(base), "f.txt", "f\n", "feature").await;
+    let other = commit_file(5, &w.clean, Some(base), "o.txt", "o\n", "other").await;
+    w.meta
+        .cas_ref("main", Some(base), Some(other))
+        .await
+        .unwrap();
+    let Some(copy) = try_land(&w.clean, feature, None).await else {
+        panic!("not landed");
+    };
+    assert_ne!(copy, feature);
+    let mut head = copy;
+    for i in 0..crate::land::LANDED_COPY_SCAN {
+        let next = commit_file(5, &w.clean, Some(head), "n.txt", &format!("{i}\n"), "n").await;
+        w.meta
+            .cas_ref("main", Some(head), Some(next))
+            .await
+            .unwrap();
+        head = next;
+    }
+    let r = sweep(&w.clean, &opts(), later()).await;
+    assert_eq!(r.deleted, 1, "{r:?}");
+    assert!(!stored(&w, feature).await);
+    assert_eq!(w.clean.rebased_origin(copy).await.unwrap(), Some(feature));
+    let full = crate::integrity::VerifyOptions {
+        full: true,
+        ..crate::integrity::VerifyOptions::default()
+    };
+    let v = crate::integrity::verify(&w.clean, &full, &crate::integrity::Quiet)
+        .await
+        .unwrap();
+    assert!(v.ok(), "{:#?}", v.problems);
+}
+
 /// A backup restored after a sweep brings deleted changesets back with the
 /// fence rows they had when it was taken. Nothing reaches them, so the next
 /// sweep condemns and deletes them again; their deleted state and

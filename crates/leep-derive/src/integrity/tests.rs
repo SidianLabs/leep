@@ -959,6 +959,23 @@ async fn attestations_and_bookkeeping_rows_are_checked_for_structure() {
     );
 }
 
+/// A rebased-origin row must name what the copy's `leep.rebased_from` names,
+/// even when that other changeset is stored.
+#[tokio::test]
+async fn a_rebased_origin_row_must_agree_with_the_copy() {
+    let w = world().await;
+    put_row(
+        &w,
+        REBASED_ORIGIN_KIND,
+        &w.copy.0,
+        w.ids[0].0.as_bytes().to_vec(),
+    )
+    .await;
+    let r = run_verify(&w, &VerifyOptions::default()).await;
+    let p = only(&r, "bad_rebased_origin");
+    assert!(p.message.contains("leep.rebased_from"), "{p:?}");
+}
+
 #[tokio::test]
 async fn a_full_run_matches_attestations_to_changesets_and_checks_signatures() {
     let w = world().await;
