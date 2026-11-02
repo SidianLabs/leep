@@ -584,7 +584,9 @@ snapshot against the pool and seals the result in `manifest.json`. The order
 is the consistency argument: a blob a stored changeset needs is never deleted
 (ADR 0012), so everything the snapshot needs is in the store when the copy
 looks, however GC interleaves; the walk enforces it on every run, so no lock
-against GC is needed. The pool is shared by every snapshot and only grows:
+against GC is needed. A tree a snapshot changeset was created without (ADR
+0069) may be stored during the copy, so the copy also takes every node below
+a tree node it copied, which a listing running meanwhile can miss. The pool is shared by every snapshot and only grows:
 since the changeset sweep (ADR 0059) can delete changesets, the source may
 later delete objects an older snapshot names, so nothing deleted at the
 source is deleted or hidden in the pool (packed objects included; issue

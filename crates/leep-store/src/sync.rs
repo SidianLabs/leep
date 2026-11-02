@@ -11,7 +11,7 @@ use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use futures::stream::{self, StreamExt};
-use leep_core::{BlobMeta, BlobStore, Error, Hash, Result, TreeNode};
+use leep_core::{BlobMeta, BlobStore, Error, Hash, Result, TreeEntry, TreeNode};
 
 use crate::pack::{self, PackIndex};
 use crate::packfiles::{read_all, PackFiles};
@@ -61,6 +61,10 @@ pub struct SyncReport {
     /// In the destination only: blobs the source has since deleted, or that an
     /// earlier snapshot needs. Kept.
     pub only_in_destination: u64,
+    /// Tree nodes the listing missed below a tree node it copied, copied
+    /// after it (included in `copied`): the source wrote them while it was
+    /// listed.
+    pub completed: u64,
 }
 
 /// Do `data` hash to `hash`, as a file blob or as a tree node?
@@ -129,9 +133,25 @@ impl<'a> Cursor<'a> {
 }
 
 enum Outcome {
-    Copied(u64),
+    /// Its size, and the directories it names if it is a tree node.
+    Copied(u64, Option<Vec<Hash>>),
     Vanished,
     Corrupt(Hash),
+}
+
+/// The directories `data` names if it is the tree node `hash`, `None` if it
+/// is not a tree node.
+fn tree_dirs(hash: &Hash, data: &[u8]) -> Option<Vec<Hash>> {
+    let node = TreeNode::decode(data).ok().filter(|n| n.hash() == *hash)?;
+    Some(
+        node.entries
+            .values()
+            .filter_map(|e| match e {
+                TreeEntry::Dir { tree } => Some(*tree),
+                TreeEntry::File { .. } => None,
+            })
+            .collect(),
+    )
 }
 
 async fn copy_one(
@@ -143,15 +163,82 @@ async fn copy_one(
     let Some(data) = src.get(&m.hash).await? else {
         return Ok(Outcome::Vanished);
     };
-    if !blob_intact(&m.hash, &data) {
-        return Ok(Outcome::Corrupt(m.hash));
-    }
+    let dirs = if Hash::of_blob(&data) == m.hash {
+        None
+    } else {
+        match tree_dirs(&m.hash, &data) {
+            Some(d) => Some(d),
+            None => return Ok(Outcome::Corrupt(m.hash)),
+        }
+    };
     if replace {
         dst.delete(&m.hash).await?;
     }
     let n = data.len() as u64;
     dst.put_with_hash(m.hash, data).await?;
-    Ok(Outcome::Copied(n))
+    Ok(Outcome::Copied(n, dirs))
+}
+
+/// Copy the tree nodes below the copied nodes that `dst` still lacks,
+/// reading them from `src` exactly.
+///
+/// A listing is not a snapshot. A tree created without its nodes (ADR
+/// 0069) is stored later, by the land that moves a ref to it or by the
+/// changeset sweep, nodes first and root last; a listing running meanwhile
+/// can pass a node's shard (or miss a pack published after its view) before
+/// the node is written, then reach the root's shard after the root is. The
+/// copy would then hold a root without its whole tree, which every reader
+/// takes as stored whole, and its changeset is in the snapshot (created,
+/// unlanded, before it). Children are written before their parents, so the
+/// source holds every node below a root it listed.
+async fn complete_trees(
+    src: &dyn BlobStore,
+    dst: &dyn BlobStore,
+    copied: HashSet<Hash>,
+    mut todo: Vec<Hash>,
+    concurrency: usize,
+    report: &mut SyncReport,
+) -> Result<()> {
+    let empty = TreeNode::empty_hash();
+    let mut seen = copied;
+    while !todo.is_empty() {
+        let mut batch = std::mem::take(&mut todo);
+        batch.retain(|h| *h != empty && seen.insert(*h));
+        for chunk in batch.chunks(PAGE) {
+            let have = dst.contains_many(chunk).await?;
+            let lacking: Vec<Hash> = chunk
+                .iter()
+                .zip(have)
+                .filter(|(_, have)| !have)
+                .map(|(h, _)| *h)
+                .collect();
+            let mut results = stream::iter(lacking.into_iter().map(|h| async move {
+                let data = match src.get(&h).await? {
+                    Some(d) => Some(d),
+                    None => src.get_exact(&h).await?,
+                };
+                // Absent or damaged in the source too: the closure check
+                // reports it.
+                let Some(data) = data else { return Ok(None) };
+                let Some(dirs) = tree_dirs(&h, &data) else {
+                    return Ok(None);
+                };
+                let n = data.len() as u64;
+                dst.put_with_hash(h, data).await?;
+                Ok::<_, Error>(Some((n, dirs)))
+            }))
+            .buffer_unordered(concurrency);
+            while let Some(r) = results.next().await {
+                if let Some((n, dirs)) = r? {
+                    report.copied += 1;
+                    report.completed += 1;
+                    report.bytes_copied += n;
+                    todo.extend(dirs);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Copy every blob of `src` that `dst` lacks. Blobs only in `dst` stay.
@@ -170,6 +257,9 @@ pub async fn sync_blobs(
     let mut dst_cursor = Cursor::new(dst);
     let mut after: Option<Hash> = None;
     let mut last_progress = std::time::Instant::now();
+    // Tree nodes copied, and the directories they name.
+    let mut copied_trees = HashSet::new();
+    let mut dirs_named = Vec::new();
     loop {
         let page = src.list_page(after, PAGE).await?;
         let Some(last) = page.last() else { break };
@@ -201,9 +291,13 @@ pub async fn sync_blobs(
         .buffer_unordered(opts.concurrency);
         while let Some(r) = results.next().await {
             match r? {
-                (_, _, Outcome::Copied(n)) => {
+                (m, _, Outcome::Copied(n, dirs)) => {
                     report.copied += 1;
                     report.bytes_copied += n;
+                    if let Some(dirs) = dirs {
+                        copied_trees.insert(m.hash);
+                        dirs_named.extend(dirs);
+                    }
                 }
                 (_, replace, Outcome::Vanished) => {
                     report.vanished += 1;
@@ -228,6 +322,15 @@ pub async fn sync_blobs(
         }
     }
     report.only_in_destination += dst_cursor.count_rest().await?;
+    complete_trees(
+        src,
+        dst,
+        copied_trees,
+        dirs_named,
+        opts.concurrency,
+        &mut report,
+    )
+    .await?;
     // A backup or restore is sealed after this returns, so every copy must
     // survive a power loss by then (ADR 0044).
     dst.flush(&[]).await?;

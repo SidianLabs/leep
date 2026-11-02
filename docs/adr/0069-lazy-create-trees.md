@@ -141,6 +141,14 @@ paths. The fast path reads only the head and the land's base, both stored.
   GC frees them once the fence has passed. This writes in the background
   what the creates no longer write on the request path, and only for
   changesets the sweep deletes.
+- **Backups** copy every tree node below a tree node they copied (an
+  amendment, after a soak's backup held a root without one of its
+  nodes). A tree that was not stored at the metadata snapshot can be
+  stored while the blobs are listed, and a listing is not a snapshot:
+  it can pass a node's shard before the node is written and reach the
+  root's after the root is. `sync_blobs` therefore reads, exactly, each
+  directory a copied node names that the destination lacks; children are
+  written before their parents, so the source has them.
 - **`gc-unreachable`** walks derived nodes for the contents they name and
   counts no tree node for them: an unstored node frees nothing.
 - **`verify`** accepts an absent node when the changeset's tree derives
