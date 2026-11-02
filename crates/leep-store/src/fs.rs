@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -7,6 +8,7 @@ use leep_core::{BlobMeta, BlobStore, Error, Hash, Result};
 use std::io::Write;
 
 use crate::dirsync::DirSyncer;
+use crate::groupsync::{GroupSync, Job, Submitted};
 use crate::packput::{self, PackWriteStep, PackWrites};
 use crate::packset::{merge_listing, sync_dir, Pack, PackSet, DEFAULT_DECODED_CACHE};
 use crate::storage_err;
@@ -51,13 +53,17 @@ const MIN_PER_READ_TASK: usize = 8;
 ///
 /// A put syncs its file but not its directory; [`BlobStore::flush`] syncs
 /// the directories of every put since the last flush (ADR 0044). Clones share
-/// that record, so a flush on one covers puts through another. A pack is
-/// durable when `put_many` returns.
+/// that record, so a flush on one covers puts through another. Concurrent
+/// puts can share their file syncs (ADR 0076, [`with_fsync_window`]). A pack
+/// is durable when `put_many` returns.
+///
+/// [`with_fsync_window`]: Self::with_fsync_window
 #[derive(Clone)]
 pub struct FsBlobStore {
     root: PathBuf,
     pub(crate) packs: Arc<PackSet>,
     dirs: Arc<DirSyncer>,
+    group: Arc<GroupSync>,
     writes: PackWrites,
     /// Whether this process has synced the root since it saw `packs/`, so
     /// the directory's own entry survives a power loss.
@@ -84,10 +90,12 @@ impl FsBlobStore {
         let root = root.into();
         let packs = Arc::new(PackSet::new(&root, bytes));
         let dirs = Arc::new(DirSyncer::new(&root));
+        let group = Arc::new(GroupSync::new(root.clone(), dirs.clone(), Duration::ZERO));
         Self {
             root,
             packs,
             dirs,
+            group,
             writes: PackWrites::default(),
             packs_dir_synced: Arc::default(),
         }
@@ -100,6 +108,14 @@ impl FsBlobStore {
         self
     }
 
+    /// How long a put that has company waits for more puts to share its
+    /// file sync with (ADR 0076). Zero, the default, syncs each put's file
+    /// on its own, as before.
+    pub fn with_fsync_window(mut self, window: Duration) -> Self {
+        self.group = Arc::new(GroupSync::new(self.root.clone(), self.dirs.clone(), window));
+        self
+    }
+
     /// Packs reads search now: published, and not merged by a repack of
     /// this process. Scans `packs/` first.
     pub fn pack_count(&self) -> Result<usize> {
@@ -109,6 +125,12 @@ impl FsBlobStore {
     /// Directory fsyncs issued by flushes so far, for tests.
     pub fn dir_syncs(&self) -> u64 {
         self.dirs.syncs()
+    }
+
+    /// Syscalls that made loose blob bytes durable so far (an fsync or a
+    /// `syncfs` each), for tests and measurements.
+    pub fn file_syncs(&self) -> u64 {
+        self.group.syncs()
     }
 
     /// Directories with renames a flush has not synced yet, for tests.
@@ -302,35 +324,77 @@ impl BlobStore for FsBlobStore {
     /// A packed copy does not count: the loose write refreshes `modified`,
     /// which GC's grace window needs (ADR 0012), and a loose copy also
     /// outlives a tombstone on the packed one. One blocking task does the
-    /// whole write. The directory is synced by the next [`flush`](Self::flush),
-    /// which is also told about a blob found already stored, since it may be
-    /// another writer's rename that is not synced yet.
+    /// whole write, except that with a sync window a batch the file joins
+    /// may sync and rename it (ADR 0076). The directory is synced by the
+    /// next [`flush`](Self::flush), which is also told about a blob found
+    /// already stored, since it may be another writer's rename that is not
+    /// synced yet.
     async fn put_with_hash(&self, hash: Hash, data: Bytes) -> Result<()> {
         let path = self.path_for(&hash);
         let dirs = self.dirs.clone();
+        let group = self.group.clone();
         let shard = hash.0[0];
-        self.blocking(move |_| {
-            if touch(&path).map_err(storage_err)? {
-                dirs.mark(shard);
-                return Ok(());
-            }
-            let dir = path.parent().expect("blob path has a parent");
-            std::fs::create_dir_all(dir).map_err(storage_err)?;
-            let (tmp, mut f) = create_exclusive(dir, "").map_err(storage_err)?;
-            let res = (|| {
-                f.write_all(&data)?;
-                f.sync_all()?;
-                drop(f);
-                std::fs::rename(&tmp, &path)
-            })();
-            if let Err(e) = res {
-                let _ = std::fs::remove_file(&tmp);
-                return Err(storage_err(e));
-            }
-            dirs.mark(shard);
-            Ok(())
-        })
-        .await
+        if group.window().is_zero() {
+            return self
+                .blocking(move |_| {
+                    if touch(&path).map_err(storage_err)? {
+                        dirs.mark(shard);
+                        return Ok(());
+                    }
+                    let dir = path.parent().expect("blob path has a parent");
+                    std::fs::create_dir_all(dir).map_err(storage_err)?;
+                    let (tmp, mut f) = create_exclusive(dir, "").map_err(storage_err)?;
+                    let res = (|| {
+                        f.write_all(&data)?;
+                        group.count_sync();
+                        f.sync_all()?;
+                        drop(f);
+                        std::fs::rename(&tmp, &path)
+                    })();
+                    if let Err(e) = res {
+                        let _ = std::fs::remove_file(&tmp);
+                        return Err(storage_err(e));
+                    }
+                    dirs.mark(shard);
+                    Ok(())
+                })
+                .await;
+        }
+        // Counted before the blocking task starts, so puts still writing
+        // their files keep a window open for each other.
+        let in_flight = group.enter();
+        let rt = tokio::runtime::Handle::current();
+        let submitted = self
+            .blocking(move |_| {
+                if touch(&path).map_err(storage_err)? {
+                    dirs.mark(shard);
+                    return Ok(None);
+                }
+                let dir = path.parent().expect("blob path has a parent");
+                std::fs::create_dir_all(dir).map_err(storage_err)?;
+                let failures = group.prepare();
+                let (tmp, mut file) = create_exclusive(dir, "").map_err(storage_err)?;
+                if let Err(e) = file.write_all(&data) {
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err(storage_err(e));
+                }
+                let job = Job {
+                    tmp,
+                    path,
+                    file: Some(file),
+                    shard,
+                    failures,
+                };
+                Ok(Some(group.submit(job, in_flight, &rt)))
+            })
+            .await?;
+        match submitted {
+            None => Ok(()),
+            Some(Submitted::Done(res)) => res,
+            Some(Submitted::Queued(rx)) => rx
+                .await
+                .map_err(|_| Error::Storage("blob sync batch failed".into()))?,
+        }
     }
 
     /// At least [`PackWrites::min_objects`] objects without a loose copy
@@ -591,6 +655,9 @@ mod tests {
         let h = store.put(Bytes::from_static(b"layout")).await.unwrap();
         let hex = h.to_hex();
         assert!(dir.path().join(&hex[..2]).join(&hex[2..]).is_file());
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsBlobStore::new(dir.path()).with_fsync_window(Duration::from_millis(2));
+        check_blob_store_contract(&store).await;
     }
 
     #[tokio::test]
@@ -754,9 +821,14 @@ mod tests {
     /// not hash to its name. Leftover temp files are not blobs.
     #[tokio::test]
     async fn abandoned_puts_never_publish_a_partial_blob() {
+        abandoned_puts_with(Duration::ZERO).await;
+        abandoned_puts_with(Duration::from_millis(2)).await;
+    }
+
+    async fn abandoned_puts_with(window: Duration) {
         use leep_testkit::cancel_after_polls;
         let dir = tempfile::tempdir().unwrap();
-        let store = FsBlobStore::new(dir.path());
+        let store = FsBlobStore::new(dir.path()).with_fsync_window(window);
         let data = Bytes::from(vec![0x5a; 3 << 20]);
         let hash = Hash::of_blob(&data);
         let mut finished = 0;
@@ -867,5 +939,181 @@ mod tests {
         assert!(is_injected(&store.put(data.clone()).await.unwrap_err()));
         assert_eq!(store.put(data.clone()).await.unwrap(), hash);
         assert_eq!(files(dir.path()).len(), 1, "no duplicate and no temp file");
+    }
+
+    /// Distinct puts from many tasks at once, as uploads arrive.
+    async fn put_concurrently(store: &FsBlobStore, n: usize, size: usize) -> Vec<Hash> {
+        let mut tasks = Vec::new();
+        for i in 0..n {
+            let s = store.clone();
+            let mut data = vec![0u8; size];
+            data[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            tasks.push(tokio::spawn(async move { s.put(Bytes::from(data)).await }));
+        }
+        let mut out = Vec::new();
+        for t in tasks {
+            out.push(t.await.unwrap().unwrap());
+        }
+        out
+    }
+
+    fn temp_files(root: &Path) -> usize {
+        files(root)
+            .iter()
+            .filter(|(n, _)| n.contains(".tmp-"))
+            .count()
+    }
+
+    /// Puts that arrive together share their file syncs (one `syncfs` per
+    /// batch on Linux 5.8+), still mark their shards for the next flush,
+    /// and read back; with no window each put syncs its own file.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_puts_share_file_syncs() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsBlobStore::new(dir.path()).with_pack_writes(PackWrites::off());
+        put_concurrently(&store, 64, 512).await;
+        assert_eq!(store.file_syncs(), 64, "no window: a sync per put");
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsBlobStore::new(dir.path()).with_fsync_window(Duration::from_millis(20));
+        let hashes = put_concurrently(&store, 64, 512).await;
+        let syncs = store.file_syncs();
+        assert!(syncs >= 1);
+        if store.group.shares_syncs() {
+            assert!(syncs <= 16, "{syncs} syncs for 64 puts");
+        }
+        for h in &hashes {
+            assert_eq!(store.get(h).await.unwrap().unwrap().len(), 512);
+            assert!(store.is_loose(h));
+        }
+        assert_eq!(temp_files(dir.path()), 0);
+        assert_eq!(store.dir_syncs(), 0, "directories still wait for a flush");
+        assert!(store.unsynced_dirs() > 0);
+        store.flush(&[]).await.unwrap();
+        assert_eq!(store.unsynced_dirs(), 0);
+    }
+
+    /// A put alone does not wait for the window: nobody could share it.
+    #[tokio::test]
+    async fn a_lone_put_does_not_wait_for_the_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsBlobStore::new(dir.path()).with_fsync_window(Duration::from_secs(30));
+        let started = std::time::Instant::now();
+        for i in 0..5u32 {
+            store.put(Bytes::from(format!("lone {i}"))).await.unwrap();
+        }
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_eq!(store.file_syncs(), 5);
+    }
+
+    /// No blob of a batch is under its final name before the batch's sync
+    /// has returned, and no put returns before then.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn batched_puts_return_and_appear_only_after_their_sync() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsBlobStore::new(dir.path()).with_fsync_window(Duration::from_millis(20));
+        let synced = Arc::new(AtomicU64::new(0));
+        let seen = synced.clone();
+        *store.group.hook.lock().unwrap() = Some(Box::new(move |paths| {
+            for p in paths {
+                assert!(!p.exists(), "renamed before its sync");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+            seen.fetch_add(paths.len() as u64, Ordering::SeqCst);
+            Ok(())
+        }));
+        let mut tasks = Vec::new();
+        for i in 0..32u32 {
+            let s = store.clone();
+            let synced = synced.clone();
+            tasks.push(tokio::spawn(async move {
+                let data = Bytes::from(format!("ordered {i}"));
+                let started = std::time::Instant::now();
+                let h = s.put(data).await.unwrap();
+                assert!(started.elapsed() >= Duration::from_millis(50));
+                assert!(synced.load(Ordering::SeqCst) > 0, "returned before a sync");
+                assert!(s.is_loose(&h), "returned before its rename");
+            }));
+        }
+        for t in tasks {
+            t.await.unwrap();
+        }
+        assert_eq!(synced.load(Ordering::SeqCst), 32, "each blob synced once");
+    }
+
+    /// A failed shared sync fails every put of its batch, leaves no blob
+    /// under its final name and no temp file, and puts work again after.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_failed_batch_sync_fails_its_puts_and_publishes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsBlobStore::new(dir.path()).with_fsync_window(Duration::from_millis(20));
+        *store.group.hook.lock().unwrap() = Some(Box::new(|_| {
+            Err(std::io::Error::other("injected sync failure"))
+        }));
+        let mut tasks = Vec::new();
+        for i in 0..16u32 {
+            let s = store.clone();
+            tasks.push(tokio::spawn(async move {
+                s.put(Bytes::from(format!("doomed {i}"))).await
+            }));
+        }
+        for t in tasks {
+            let err = t.await.unwrap().unwrap_err();
+            assert!(err.to_string().contains("injected sync failure"), "{err}");
+        }
+        assert!(files(dir.path()).is_empty(), "nothing published or left");
+        assert_eq!(store.unsynced_dirs(), 0, "no shard marked");
+        *store.group.hook.lock().unwrap() = None;
+        let hashes = put_concurrently(&store, 16, 64).await;
+        for h in hashes {
+            assert!(store.contains(&h).await.unwrap());
+        }
+    }
+
+    /// Throughput of 1,000 concurrent 512-byte puts (`LEEP_MEASURE_PUTS`)
+    /// with no window and with the server's default, and the process's CPU
+    /// time per put (Linux). `cargo test -p leep-store --release --lib --
+    /// --ignored --nocapture measure_fsync_window`; set `LEEP_MEASURE_DIR`
+    /// to a directory on the disk to measure, not a tmpfs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore]
+    async fn measure_fsync_window() {
+        /// User and system CPU ticks of this process.
+        fn cpu() -> (u64, u64) {
+            let Ok(stat) = std::fs::read_to_string("/proc/self/stat") else {
+                return (0, 0);
+            };
+            let rest = &stat[stat.rfind(')').unwrap() + 2..];
+            let f: Vec<&str> = rest.split(' ').collect();
+            (f[11].parse().unwrap(), f[12].parse().unwrap())
+        }
+        let base = std::env::var_os("LEEP_MEASURE_DIR").map(PathBuf::from);
+        let n: usize = std::env::var("LEEP_MEASURE_PUTS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1000);
+        for round in 0..3 {
+            for window in [Duration::ZERO, Duration::from_millis(2)] {
+                let dir = match &base {
+                    Some(b) => tempfile::tempdir_in(b).unwrap(),
+                    None => tempfile::tempdir().unwrap(),
+                };
+                let store = FsBlobStore::new(dir.path()).with_fsync_window(window);
+                let (u0, s0) = cpu();
+                let started = std::time::Instant::now();
+                put_concurrently(&store, n, 512).await;
+                let secs = started.elapsed().as_secs_f64();
+                let (u1, s1) = cpu();
+                println!(
+                    "round {round} window {window:?}: {:.0} puts/s, {:.3} file syncs per put, \
+                     CPU per put {:.0} us user {:.0} us system",
+                    n as f64 / secs,
+                    store.file_syncs() as f64 / n as f64,
+                    (u1 - u0) as f64 * 10_000.0 / n as f64,
+                    (s1 - s0) as f64 * 10_000.0 / n as f64,
+                );
+            }
+        }
     }
 }

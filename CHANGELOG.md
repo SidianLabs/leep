@@ -7,6 +7,17 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 ## [Unreleased]
 
+### Concurrent blob uploads share their file syncs
+- **Changed.** A filesystem store's uploads that arrive together are made
+  durable by one sync instead of an fsync each (group commit, ADR 0076): an
+  upload with others in flight waits up to `--blob-fsync-window` (new,
+  `LEEP_BLOB_FSYNC_WINDOW`, default `2ms`, `0` for the old behaviour), then
+  its batch is synced with one `syncfs` (Linux 5.8+) and renamed into place.
+  A blob still appears under its name only once its bytes are durable, and
+  an upload is still answered only after that. 1,000 concurrent 512-byte
+  puts issue 0.002 to 0.008 syncs each instead of 1. A `syncfs` also waits
+  for other dirty files on the same file system, so keep blobs off the
+  database's file system or set the window to 0.
 ### Blame cost follows a file's versions on deep histories
 - **Changed.** A blame walk goes straight from one change of a file to the
   next where the first-parent chain has no merge in between (the

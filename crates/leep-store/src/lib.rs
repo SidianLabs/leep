@@ -5,6 +5,7 @@
 mod cache;
 mod dirsync;
 mod fs;
+mod groupsync;
 mod object;
 #[cfg(test)]
 mod objpack_tests;
