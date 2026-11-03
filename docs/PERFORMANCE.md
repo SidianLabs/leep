@@ -3792,6 +3792,162 @@ SQLite (release build, warm, 24,000 changesets: 432,000 rows to drop from a
 520 MB file): dry-run count 4.6 s to 61 ms; delete 20,900 to 40,800 rows a
 second (rowid walk, 40 steps).
 
+## One million changesets of history
+
+Every swarm above runs on a history a few tens of thousands of changesets
+deep, because that is as far as a swarm gets in an hour. This section puts
+the same workload on top of 1,000,000 changesets of linear history, to see
+what depth alone costs.
+
+**Setup.** The 4-vCPU, 8 GB cloud box of "Many agents landing on one
+branch" (Ubuntu 24.04, Postgres 16 in Docker with `shared_buffers=1GB`,
+filesystem blobs on the same 20 GB disk), main at #249 built in release.
+`leep-history-gen` (in `leep-soak`) wrote the history straight through
+`Repo`, without HTTP, in ten resumable steps of 100,000
+(`--until 100000`, `200000`, ...), with an incremental `leep-server repack`
+(`--fence 60s`, nothing else running) after each step, since its uploads stay
+loose until a repack and land batches would have been packed. The tree is
+monorepo-shaped: 20,000 files of 40 lines in 256 leaf directories
+(`src/mNN/sNN/`), the swarm's 200 seeded files `d*/f*` and its 8 hot files
+`hot/h*` (200 lines). Each changeset edits 1 file (50%), 2 (35%) or 3
+(15%), one line each; 5% of edits go to a hot file, 0.2% to a seeded file,
+0.5% create a file, and a fifth of the rest go to 1% of the `src` files. The
+ref moves every 2,000 changesets with a ref log entry per changeset, as lands
+write them. At the head: 28,437 files.
+
+**Writing it.** 3,820 s for 1,000,000 changesets (262 a second); the rate
+fell from about 430/s over the first 20,000 to 190-250/s after 800,000. The
+ten repacks took 115-223 s each (26 minutes in all). Both stores grow
+linearly, about 2.4 KB of Postgres and 1.5 KB of packed blobs per changeset:
+
+| Generation | Postgres (`pg_database_size`) | Blobs (packed) | Step: write / repack |
+|---|---|---|---|
+| 100,000 | 243 MB | 140 MB | 256 s / 115 s |
+| 300,000 | 720 MB | 432 MB | 351 s / 131 s |
+| 500,000 | 1.20 GB | 738 MB | 370 s / 141 s |
+| 700,000 | 1.70 GB | 1.05 GB | 379 s / 142 s |
+| 1,000,000 | 2.43 GB | 1.52 GB | 409 s / 159 s |
+| 1,000,000, indexes warm | 4.19 GB | 1.52 GB | |
+
+At 1,000,000, before any index: `derived` 1.76 GB (the skiplists alone 790
+bytes a changeset, 790 MB), `changesets` 394 MB, `ref_log` 270 MB. The blobs
+are two packs (1.21 GB with a 306 MB index; 1.36M objects, 996k of them
+deltas). Warming added the history index (1.19 GB of rows) and the log
+filter (172 MB).
+
+**Warming the indexes.** `leep-server --indexing lease` on the new store,
+page cache dropped. Derivation is not lazy: the index lease holder starts
+from the head and derives the whole missing history at once.
+
+| Index | Caught up to the head | Rate |
+|---|---|---|
+| search (`tree-trigrams-v1`, head only) | under 20 s | |
+| log filter (`log-filter-v1`) | 70-78 s | about 14,000 changesets/s |
+| history (`history-tree-v4`) | 542 s | about 1,850 changesets/s |
+
+Server RSS was 1.0-1.3 GB throughout the warm-up, and 1.72-1.83 GB (high water
+mark) after each swarm run below.
+
+**Single operations**, over HTTP on loopback, on a new server process with
+the page cache dropped (Postgres was not restarted, so its buffers stay
+warm). "Cold, first" is the first such start after the warm-up, when
+Postgres's buffers held index rows; "cold, again" a second start; "repeat"
+the same request a second and third time.
+
+| Operation | Cold, first | Cold, again | Repeat |
+|---|---|---|---|
+| `log` 100 | 327 ms | 34 ms | 4-9 ms |
+| `log` 10,000 | 6.9 s | 0.34 s | 0.13-0.18 s |
+| `diff` head~1 to head | 10 ms | 3.5 ms | 1 ms |
+| Full file listing (28,437 files) | 352 ms | 55 ms | 16-30 ms |
+| `last-change d3/f7` (13 changes, last at 944,066) | 6 ms | 1.9 ms | 1 ms |
+| `last-change` of a `src` file | 3.9 ms | 1.7 ms | 0.8 ms |
+| `log path=d3/f7` (all 13, back to generation 1) | 139 ms | 18 ms | 11 ms |
+| `blame d3/f7` (5 lines) | | 343 ms | 2.5 ms |
+| `blame` of a `src` file (41 lines) | | 2.0 s | 8 ms |
+| `blame hot/h0` (about 10,000 changers; 397 lines) | 408 at 25 s | 61 s | 10 ms |
+| `blame hot/h1`, after `hot/h0` | | 43 s | |
+
+The hot-file blame ran on a server with `--request-timeout 900s`. Under the
+default 25 s it answered 408 three times in a row, 75 s in all against the
+61 s it needs, so a blame cut off by the timeout evidently keeps no
+progress and never finishes. Once one has
+finished its answer is cached and the next blame at a later head is quick.
+
+**The swarm on top**, 1,000 agents, the flags of `box_bench.sh` (server on
+CPUs 0-1, swarm on 2-3, `--indexing lease --request-timeout 25s`,
+`--think-ms 2000 --reads 4 --stale 4 --files 2 --ramp 60 --duration 300
+--indexing-header stale-ok`). "Shallow" is the swarm's own small tree from an
+empty store: the earlier run on main, and a run of this build. "Wide" is the
+deep store's tree after only 1,000 generations (`leep-history-gen --until
+1000`), which separates the cost of the tree from that of the depth. The two
+deep runs were back to back on one server; `hot/h0` and `hot/h1` had cached
+blames from the table above, the other six hot files did not.
+
+| | Shallow (earlier) | Shallow (this build) | Wide, 1,000 deep | 1M deep, run 1 | 1M deep, run 2 |
+|---|---|---|---|---|---|
+| lands/s | 81.2 | 82.0 | 80.9 | 76.4 | 77.8 |
+| land p50 / p99 | — / 134 ms | 15 / 64 ms | 29 / 207 ms | 106 / 4,368 ms | 99 / 4,539 ms |
+| land batch mean | | 1.4 | 2.0 | 5.4 | 4.2 |
+| create p99 | | 26 ms | 45 ms | 122 ms | 238 ms |
+| blame p50 / p99 | 5.9 / 72 ms | 3.3 / 44 ms | 19 / 91 ms | 27 / 186 ms | 25 / 179 ms |
+| blame shed | | 289 | 1,240 | 3,366 | 2,487 |
+| log p99 | 54 ms | 36 ms | 64 ms | 81 ms | 90 ms |
+| search p99 | | 43 ms | 68 ms | 79 ms | 69 ms |
+| index lag, history p50 / max | 13 / 39 | 11 / 30 | 13 / 44 | 13 / 81 | 10 / 98 |
+| errors | | none | none | 6 blame 408 | none (82 lands not admitted) |
+
+Lands only (`leep-land-bench --files 2`, no reads, 60 s per step), the deep
+store against the wide one:
+
+| Agents | Wide, 1,000 deep: lands/s, p50 / p99 | 1M deep: lands/s, p50 / p99 |
+|---|---|---|
+| 16 | 484, 16 / 31 ms | 167, 51 / 235 ms |
+| 64 | 454, 71 / 154 ms | 191, 223 / 691 ms |
+
+The server's replay histogram puts the difference in the replay: 0.74 ms a
+land on the wide store against 2.75 ms on the deep one.
+
+**What this shows.**
+
+- Size grows linearly with depth (2.4 KB of Postgres, 1.5 KB of packed
+  blobs per changeset before indexes, 4.2 KB of Postgres after) and nothing
+  fell over: every write, repack and index pass finished, with RSS flat.
+- Reads that go through an index hardly notice the depth. `last-change`,
+  `log` with a path, `diff`, the listing and `log` 100 answer in
+  milliseconds at a million changesets, as at a thousand; the log of a file
+  changed 13 times reaches generation 1 in 11 ms.
+- An empty server takes 9 minutes to index a million changesets of history,
+  mostly the history index (1,850 a second on two cores).
+- The swarm still lands within 5-7% of its offered rate (76-78 lands/s
+  against 81-82), but the land tail grows twentyfold (p99 4.4-4.5 s against
+  207 ms on the same tree at depth 1,000). The land-only bench shows why: at
+  depth a land's replay costs 3.7 times as much and the land path's ceiling
+  falls from about 470 to about 180 lands a second, close enough to the
+  offered rate that queues form. The cause inside replay has not been
+  profiled.
+- Blame on a hot file is the one operation that does not scale: about 10,000
+  changers spread over a million generations take 43-61 s on this box, more
+  than the 25 s request timeout, and a timed-out blame keeps no progress.
+- Some of the swarm's cost is the tree, not the depth: going from the
+  swarm's 208 files to about 20,400 at depth 1,000 already moves land p99 from
+  64 to 207 ms and blame p50 from 3.3 to 19 ms.
+
+**What it doesn't show.**
+
+- The history is linear and synthetic: one writer, no merges, small edits,
+  file sizes and change shapes from a generator rather than a real
+  repository. Real histories have merges, renames and large changes.
+- One box, one run per configuration (two for the deep swarm), Postgres and
+  the swarm sharing two vCPUs. Differences of 10-20% in tails are noise;
+  the twentyfold land tail and the hot-file blame are not.
+- Cold means a new server process and an empty page cache, never a
+  restarted Postgres; first touches against an empty buffer pool would be
+  slower than the "cold" columns.
+- The writer bypasses the land path, so the generation rate is not a land
+  rate, and it writes the history before any index exists, so it does not
+  measure the warmer keeping up with a history growing at this depth.
+
 ## Analysis
 
 Principle 5 (cost scales with the change, not the repository) holds for the

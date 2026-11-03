@@ -7,6 +7,13 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 ## [Unreleased]
 
+### A bulk writer of deep history
+- **Added.** `leep-history-gen` (in `leep-soak`) writes a long linear,
+  monorepo-shaped history straight through the stores, resumable, up to
+  `--until <generation>`, for measuring Leep at depths a swarm cannot reach
+  in reasonable time. Used for "One million changesets of history" in
+  docs/PERFORMANCE.md.
+
 ### Concurrent blob uploads share their file syncs
 - **Changed.** A filesystem store's uploads that arrive together are made
   durable by one sync instead of an fsync each (group commit, ADR 0076): an

@@ -19,8 +19,16 @@ path = "src/land_bench.rs"
 name = "leep-swarm"
 path = "src/swarm.rs"
 
+[[bin]]
+name = "leep-history-gen"
+path = "src/history_gen.rs"
+
 [dependencies]
 leep-core.workspace = true
+leep-derive.workspace = true
+leep-meta.workspace = true
+leep-store.workspace = true
+bytes.workspace = true
 anyhow.workspace = true
 blake3.workspace = true
 ed25519-dalek.workspace = true
