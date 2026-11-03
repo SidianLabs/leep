@@ -118,3 +118,10 @@ prints one line on stdout:
 - An agent with `--json` never parses free text: success and failure are
   both one JSON document on stdout.
 - `docs/CLI.md` lists the codes and the JSON shape for users and agents.
+
+## Note, 2026-11-03: policy refusals are 422
+ADR 0085 moved the land-policy refusals (`needs_review`, `not_signed`,
+`not_forward`) from `400` to `422` with the same `code`. "Any other 4xx is
+`user`" covers it, so they stay exit 1, and the land hint, keyed on `code`
+and the marker text, is unchanged. Nothing in the CLI needed to change; a
+stub test pins the mapping (`a_policy_422_is_a_user_error_with_its_code`).

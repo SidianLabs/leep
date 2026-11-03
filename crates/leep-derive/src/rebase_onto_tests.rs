@@ -263,7 +263,7 @@ async fn a_protected_ref_is_refused() {
     let plain = repo();
     let s = split(&plain).await;
     let r = plain.clone().with_land_policy(Recorder::new(None, true));
-    let Err(Error::Invalid(m)) = r.rebase_onto("main", s.t, s.base, None, None).await else {
+    let Err(Error::Policy(m)) = r.rebase_onto("main", s.t, s.base, None, None).await else {
         panic!("expected a refusal")
     };
     assert!(

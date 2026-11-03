@@ -413,7 +413,7 @@ health output, `verify --json`, and the [standard bundle](#collecting-a-bug-repo
 **Meaning.** `POST /v1/land` answered 5xx at least once in 10 minutes: a store
 failed while landing. **Page.** The rule counts HTTP 5xx on the land route, not
 `leep_land_total{outcome="error"}`: that outcome counts every failed land except
-a lost race, including refused lands (400: unsigned or unreviewed changeset, tag
+a lost race, including refused lands (422: unsigned or unreviewed changeset; 400: tag
 ref, bad ref name) and unknown changesets (404), which are the caller's
 doing and would page on every policy refusal. Lands not admitted because
 their ref's queue was full (503 with `Leep-Refused: admission`, ADR 0060)

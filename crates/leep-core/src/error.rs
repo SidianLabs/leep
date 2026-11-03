@@ -12,6 +12,12 @@ pub enum Error {
     /// Caller error: malformed or inconsistent input. Maps to HTTP 400.
     #[error("invalid input: {0}")]
     Invalid(String),
+    /// A well-formed request a land policy refuses (review, signatures,
+    /// forward-only): nothing is wrong with the input, the target ref's
+    /// rules are not met yet. Maps to HTTP 422, with the `code` its marker
+    /// text names (ADR 0085).
+    #[error("{0}")]
+    Policy(String),
     /// A concurrent update won repeatedly; retrying later can succeed. Maps
     /// to HTTP 409.
     #[error("conflict: {0}")]

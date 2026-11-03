@@ -455,7 +455,7 @@ docker run -d -p 127.0.0.1:7070:7070 -v leep-data:/var/lib/leep \
 `--signing-keys-file` enables `POST /v1/changesets/{id}/signatures`, which
 needs a write token when auth is on. `--require-signatures REF` (repeatable;
 the environment variable is comma-separated) makes `land` onto `REF` fail
-with 400 unless every changeset it adds is signed by a listed key, and needs
+with 422 unless every changeset it adds is signed by a listed key, and needs
 the keys file. The keys file is re-read on SIGHUP; the `--require-signatures`
 refs are flags and need a restart ([Reloading config](#reloading-config)). Authors
 commit with `leep commit --sign KEYFILE` or `LEEP_SIGNING_KEY=KEYFILE`; the key

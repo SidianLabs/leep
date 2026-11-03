@@ -437,7 +437,7 @@ async fn adding_and_removing_a_trusted_key_changes_what_land_accepts() {
         refused.error()
     );
     let land = r.land(by_bob, "main").await;
-    assert_eq!(land.status, StatusCode::BAD_REQUEST);
+    assert_eq!(land.status, StatusCode::UNPROCESSABLE_ENTITY);
 
     r.edit("keys.json", &keys(&[("alice", 1), ("bob", 2)]));
     r.reload();
@@ -451,7 +451,12 @@ async fn adding_and_removing_a_trusted_key_changes_what_land_accepts() {
     r.edit("keys.json", &keys(&[("bob", 2)]));
     r.reload();
     let land = r.land(by_alice, "main").await;
-    assert_eq!(land.status, StatusCode::BAD_REQUEST, "{}", land.error());
+    assert_eq!(
+        land.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "{}",
+        land.error()
+    );
     let listed = r
         .call(
             Method::GET,
@@ -482,7 +487,7 @@ async fn review_policy_refs_and_rules_change_at_runtime() {
     r.reload();
     let whitespace = r.commit(&[other], "a.txt", "x = 1 \n").await;
     let needs = r.land(whitespace, "main").await;
-    assert_eq!(needs.status, StatusCode::BAD_REQUEST);
+    assert_eq!(needs.status, StatusCode::UNPROCESSABLE_ENTITY);
     assert!(needs.error().contains("review"), "{}", needs.error());
 
     // Teach the policy that whitespace-only edits approve themselves.
@@ -513,7 +518,7 @@ async fn protected_delete_and_forward_only_rules_follow_the_reloaded_refs() {
     r.edit("policy.json", r#"{ "refs": ["stable"] }"#);
     r.reload();
     let rewind = r.move_ref("stable", Some(second), Some(first)).await;
-    assert_eq!(rewind.status, StatusCode::BAD_REQUEST);
+    assert_eq!(rewind.status, StatusCode::UNPROCESSABLE_ENTITY);
     assert!(rewind.error().contains("forward"), "{}", rewind.error());
     let delete = r.move_ref("stable", Some(second), None).await;
     assert_eq!(delete.status, StatusCode::BAD_REQUEST);
@@ -689,7 +694,10 @@ async fn an_in_flight_request_finishes_under_the_config_it_started_with() {
     // review, and the lander's in-flight count survived the reload.
     assert_eq!(r.get("uploader-token").await, unauthorized());
     assert_eq!(r.get("lander-token").await, StatusCode::TOO_MANY_REQUESTS);
-    assert_eq!(r.land(after, "main").await.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        r.land(after, "main").await.status,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
 
     // The stalled requests finish with the config they started with.
     up_tx.send(Bytes::from_static(data)).await.unwrap();

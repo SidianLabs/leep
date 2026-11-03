@@ -186,6 +186,7 @@ fn copy(e: &Error) -> Error {
         Error::InvalidPath(p, why) => Error::InvalidPath(p.clone(), why),
         Error::InvalidHash(m) => Error::InvalidHash(m.clone()),
         Error::Invalid(m) => Error::Invalid(m.clone()),
+        Error::Policy(m) => Error::Policy(m.clone()),
         Error::Conflict(m) => Error::Conflict(m.clone()),
         Error::LandIdReused { refusal, requested } => Error::LandIdReused {
             refusal: refusal.clone(),

@@ -7,6 +7,24 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 ## [Unreleased]
 
+### Review verdicts carry across identical rebases; policy refusals are 422
+- **Changed.** A reviewer's approve or reject of a changeset X now counts
+  for a changeset Y that names X in `leep.rebased_from` (a hint, followed to
+  at most 64 candidates) and makes exactly X's change to every path X needed
+  a reviewer for: the same old and new content and kind, old relative to
+  each one's own first parent (ADR 0085). A changelog-only conflict
+  resolution keeps its approval; a changed byte, a moved base or a dropped
+  path does not, and a forged hint gains nothing. A reviewer's own verdict
+  on Y wins; among candidates, each reviewer's newest review decides (a
+  newest withdrawal carries nothing), and a reject or withdrawal on a copy
+  is also recorded on the candidates whose approval carried to it. At most
+  16 reviewed candidates are compared. `review-status` paths gain
+  `carried_from`.
+- **Changed.** Land-policy refusals (`needs_review`, `not_signed`,
+  `not_forward`) answer `422` instead of `400`, with the same `code` and
+  marker and without the `invalid input: ` prefix (`Error::Policy`). Older
+  CLIs still exit 1 with the land hint, and the git mirror still counts the
+  land refused.
 ### Snapshot tests keep the Postgres URL's query string
 - **Fixed.** The leep-meta snapshot tests' per-test database URL now swaps only the database name, so a Unix-socket `LEEP_TEST_POSTGRES_URL` (`?host=...&port=...`) works.
 
@@ -42,6 +60,21 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   commit that resolves it records the changesets it replaces in
   `leep.rebased_from` (comma-joined for a stack), so a server can carry
   review verdicts over to an identical rebase.
+### Review verdicts carry across identical rebases; policy refusals are 422
+- **Changed.** A reviewer's approve or reject of a changeset X now counts
+  for a changeset Y that names X in `leep.rebased_from` (a hint, followed to
+  at most 64 candidates) and makes exactly X's change to every path X needed
+  a reviewer for: the same old and new content and kind, old relative to
+  each one's own first parent (ADR 0085). A changelog-only conflict
+  resolution keeps its approval; a changed byte, a moved base or a dropped
+  path does not, and a forged hint gains nothing. A reviewer's own verdict
+  on Y wins; withdrawals carry nothing. `review-status` paths gain
+  `carried_from`.
+- **Changed.** Land-policy refusals (`needs_review`, `not_signed`,
+  `not_forward`) answer `422` instead of `400`, with the same `code` and
+  marker and without the `invalid input: ` prefix (`Error::Policy`). Older
+  CLIs still exit 1 with the land hint, and the git mirror still counts the
+  land refused.
 
 ### Blames of tracked files are kept current as changes land
 - **Added.** Every blame a server answers tracks its file (at most

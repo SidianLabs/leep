@@ -894,7 +894,7 @@ branches, except those under `tags/`, which are tags. `cas_ref_checked` and
 (`leep_core::refname`), tags are created or deleted but never moved, `land`
 refuses `tags/`, and a ref a land policy covers cannot be deleted and only
 moves forward (a swap to a value that does not descend from the current one
-is a 400). `--protect-ref` covers a ref with a policy that checks nothing
+is a 422, `not_forward`). `--protect-ref` covers a ref with a policy that checks nothing
 else (`ProtectOnly` in `leep-server`), for protection without signatures or
 review. The CLI has no special server API for this: `leep branch`,
 `leep switch` and `leep tag` are compare-and-swap calls on `/v1/refs/{name}`. `branch -d` deletes only if
@@ -1134,7 +1134,7 @@ ref's land queue (forwarded to the lease holder under
 arrival order with them:
 ```
 rebase_onto(name, onto, expected_base, land_id?):
-  refuse: bad name, tag, ref under --protect-ref (400, not_forward:
+  refuse: bad name, tag, ref under --protect-ref (422, not_forward:
           protect the branch on GitHub instead)
   enqueue on queue(name) behind the lands already there
 leader: lands → land_batch as above; a rebase-onto → alone:
@@ -1496,7 +1496,7 @@ changeset and key), and `Changeset` is unchanged. `leep-server
 `{name, public_key: "ed25519:<hex>"}`, read at startup and on SIGHUP; signatures by
 other keys are refused at `POST /v1/changesets/{id}/signatures` (write token),
 and `GET` re-verifies what it lists. `--require-signatures <REF>` (repeatable,
-`LEEP_REQUIRE_SIGNATURES`) makes `land` onto that ref fail with 400 unless every
+`LEEP_REQUIRE_SIGNATURES`) makes `land` onto that ref fail with 422 unless every
 changeset the land adds to the ref, including each unlanded stack entry and
 merged side branch, is signed by a trusted key. The policy checks the
 originals the client submitted; the rebased copies the server creates carry
@@ -1526,9 +1526,19 @@ what a clean merge does), an enabled auto rule from the
 functions in `leep-derive`; never for an `OWNERS` file) or an owner's
 approval satisfies it.
 `--require-review <REF>` (repeatable, `LEEP_REQUIRE_REVIEW`) and the policy
-file's `refs` make `land` onto a ref fail with 400 `changeset X needs review:
-path P ...` unless every changeset it adds is approved, checked on the
-originals the client submitted, as for signatures. It is a second
+file's `refs` make `land` onto a ref fail with 422 `changeset X needs review:
+path P ...` (`Error::Policy`, ADR 0085; 400 before) unless every changeset it
+adds is approved, checked on the originals the client submitted, as for
+signatures. Verdicts on a changeset X count for Y when Y names X in
+`leep.rebased_from` (a hint, followed to at most 64 candidates) and makes
+exactly X's change to every path X needed a reviewer for: same old and new
+content and kind, old relative to each one's own first parent
+([ADR 0085](adr/0085-review-verdicts-carry-across-identical-rebases.md));
+each reviewer's newest review among the candidates that reproduce a path
+decides, a reject or withdrawal on a copy is also written on the candidates
+whose approval carried to it, and at most 16 candidates with reviews are
+compared (with more, none carry). `review-status` names the source in
+`carried_from`. It is a second
 `LandPolicy`: `Repo::with_land_policy` composes policies (all must pass), and
 `check_land` now receives the head so owners and new history agree.
 `GET .../review-status?ref=` shows the per-path state, `GET .../reviews`

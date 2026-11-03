@@ -165,7 +165,7 @@ async fn a_protected_ref_only_moves_forward_and_cannot_be_deleted() {
     // A rewind and a sideways move are refused.
     for to in [a, side] {
         let r = api.cas("main", Some(b), Some(to)).await;
-        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.body);
+        assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", r.body);
         assert!(error(&r).contains(NOT_FORWARD_MARKER), "{}", r.body);
         assert_eq!(r.body["code"], "not_forward", "{}", r.body);
     }
@@ -348,7 +348,7 @@ async fn protecting_a_reviewed_ref_still_requires_review() {
     .unwrap();
     for (uri, body) in [("/v1/land", land.clone()), ("/v1/refs/main", cas)] {
         let (s, v) = call(Method::POST, uri.into(), "tok-bob", body).await;
-        assert_eq!(s, StatusCode::BAD_REQUEST, "{uri}: {v}");
+        assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{uri}: {v}");
         assert!(
             v["error"]
                 .as_str()

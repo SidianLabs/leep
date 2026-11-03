@@ -266,6 +266,7 @@ mod tests {
             owners: v(owners),
             approved_by: v(ok),
             rejected_by: v(no),
+            carried_from: None,
         }
     }
 

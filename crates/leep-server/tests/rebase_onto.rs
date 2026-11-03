@@ -175,7 +175,12 @@ async fn a_protected_ref_is_refused_with_400() {
     let app = leep_server::router_with_config(r.clone(), 1 << 20, Duration::from_secs(60), config);
     let s = split(&r, "main").await;
     let reply = rebase_onto(&app, "main", s.t, s.base, None).await;
-    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.body);
+    assert_eq!(
+        reply.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "{}",
+        reply.body
+    );
     assert_eq!(reply.body["code"], "not_forward");
     assert!(
         reply.body["error"].as_str().unwrap().contains("GitHub"),

@@ -94,6 +94,7 @@ fn again(e: &Error) -> Error {
         Error::InvalidPath(p, why) => Error::InvalidPath(p.clone(), why),
         Error::InvalidHash(h) => Error::InvalidHash(h.clone()),
         Error::Invalid(m) => Error::Invalid(m.clone()),
+        Error::Policy(m) => Error::Policy(m.clone()),
         Error::Conflict(m) => Error::Conflict(m.clone()),
         Error::NotFound(m) => Error::NotFound(m.clone()),
         Error::Indexing {

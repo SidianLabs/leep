@@ -262,9 +262,7 @@ impl LandPolicy for RequireSignatures {
         for id in new_history {
             if !self.keys.is_signed(repo, *id).await? {
                 tracing::info!(%id, target_ref, "land refused: unsigned changeset");
-                return Err(Error::Invalid(format!(
-                    "changeset {id} {NOT_SIGNED_MARKER}"
-                )));
+                return Err(Error::Policy(format!("changeset {id} {NOT_SIGNED_MARKER}")));
             }
         }
         Ok(())
