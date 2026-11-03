@@ -17,7 +17,10 @@ use leep_core::{
 };
 use tokio::sync::watch;
 
+use crate::derived::{DerivedKind, Skiplist};
 use crate::Repo;
+
+const SKIPLIST: &str = <Skiplist as DerivedKind>::NAME;
 
 /// A ref move: from, to and its context.
 type Move = (Option<ChangesetId>, Option<ChangesetId>, RefUpdateContext);
@@ -46,6 +49,8 @@ struct Gate {
     find_fails: AtomicUsize,
     /// Keys of every `rebased-origin-v1` row read from the store.
     origin_reads: Mutex<Vec<Hash>>,
+    /// Calls that read `skiplist` rows: one round trip each.
+    skiplist_reads: AtomicUsize,
 }
 
 impl Gate {
@@ -64,6 +69,7 @@ impl Gate {
             intruder_moves: Mutex::new(Vec::new()),
             find_fails: AtomicUsize::new(0),
             origin_reads: Mutex::new(Vec::new()),
+            skiplist_reads: AtomicUsize::new(0),
         })
     }
 
@@ -189,7 +195,19 @@ impl MetaStore for Gate {
         if kind == crate::REBASED_ORIGIN_KIND {
             self.origin_reads.lock().unwrap().push(*key);
         }
+        if kind == SKIPLIST {
+            self.skiplist_reads.fetch_add(1, Ordering::SeqCst);
+        }
         self.inner.get_derived(kind, key).await
+    }
+    async fn get_derived_many(&self, kind: &str, keys: &[Hash]) -> Result<Vec<Option<Bytes>>> {
+        if kind == crate::REBASED_ORIGIN_KIND {
+            self.origin_reads.lock().unwrap().extend_from_slice(keys);
+        }
+        if kind == SKIPLIST && !keys.is_empty() {
+            self.skiplist_reads.fetch_add(1, Ordering::SeqCst);
+        }
+        self.inner.get_derived_many(kind, keys).await
     }
     async fn put_derived(&self, kind: &str, key: &Hash, value: Bytes) -> Result<()> {
         self.inner.put_derived(kind, key, value).await
@@ -1711,4 +1729,150 @@ async fn a_batch_asks_for_its_copies_contents_once_and_still_finds_one_missing()
         assert!(root.entries.contains_key(&format!("d{i}")), "d{i} landed");
     }
     assert!(!root.entries.contains_key("d7"));
+}
+
+/// A history of `len` changesets on `main` from `base`, with a merge of a
+/// one-changeset side branch every `merge_every` (0: linear).
+async fn long_history(r: &Repo, len: usize, merge_every: usize) -> ChangesetId {
+    let mut head = r.meta().get_ref("main").await.unwrap().unwrap();
+    for n in 0..len {
+        let file = format!("h/{}", n % 13);
+        let body = format!("{n}\n");
+        head = if merge_every > 0 && n % merge_every == merge_every - 1 {
+            let side = make(
+                r,
+                &[head],
+                &[(format!("s/{n}"), Some("s\n".into()))],
+                "side",
+            )
+            .await;
+            let main = make(r, &[head], &[(file, Some(body))], "main").await;
+            make(r, &[main, side], &[], "merge").await
+        } else {
+            make(r, &[head], &[(file, Some(body))], "c").await
+        };
+    }
+    let old = r.meta().get_ref("main").await.unwrap();
+    assert!(r.meta().cas_ref("main", old, Some(head)).await.unwrap());
+    head
+}
+
+/// The skiplist of `id` by definition: its first-parent ancestors 1, 2, 4,
+/// ... steps up, with their generations, walked one parent at a time.
+async fn naive_skiplist(r: &Repo, id: ChangesetId) -> Vec<crate::derived::SkipEntry> {
+    let mut chain = Vec::new();
+    let mut cur = id;
+    while let Some(&p) = r.get_changeset(cur).await.unwrap().parents.first() {
+        chain.push(p);
+        cur = p;
+    }
+    let mut list = Vec::new();
+    let mut d = 1;
+    while d <= chain.len() {
+        let id = chain[d - 1];
+        list.push(crate::derived::SkipEntry {
+            id,
+            generation: r.generation(id).await.unwrap(),
+        });
+        d *= 2;
+    }
+    list
+}
+
+/// Land, in one batch on a new process over `gate`'s store, `count`
+/// changesets made on the head (and a stack of two), and return the
+/// skiplist reads the batch made and the changesets now on `main`'s
+/// first-parent chain above `head`, newest first.
+async fn land_on_history(
+    r: &Repo,
+    gate: &Arc<Gate>,
+    head: ChangesetId,
+    count: usize,
+) -> (usize, Vec<ChangesetId>) {
+    let mut lands = Vec::new();
+    for i in 0..count {
+        let file = format!("n/{i}");
+        lands.push((
+            make(r, &[head], &[(file, Some(format!("{i}\n")))], "n").await,
+            None,
+        ));
+    }
+    let lower = make(r, &[head], &[("stack/1".into(), Some("1\n".into()))], "s1").await;
+    let upper = make(r, &[lower], &[("stack/2".into(), Some("2\n".into()))], "s2").await;
+    lands.push((upper, None));
+    // A new process: nothing cached.
+    let fresh = Repo::new(r.blobs().clone(), gate.clone());
+    let (blocker, tasks) = queue_in_order(&fresh, gate, head, &lands).await;
+    gate.skiplist_reads.store(0, Ordering::SeqCst);
+    release(gate);
+    blocker.await.unwrap().unwrap();
+    for t in tasks {
+        assert!(matches!(
+            t.await.unwrap().unwrap(),
+            LandResponse::Landed { .. }
+        ));
+    }
+    let reads = gate.skiplist_reads.load(Ordering::SeqCst);
+    let batches = fresh.land_queues.batches.lock().unwrap().clone();
+    assert_eq!(batches.len(), 2, "the lands made one batch: {batches:?}");
+    let mut above = Vec::new();
+    let mut cur = r.meta().get_ref("main").await.unwrap().unwrap();
+    while cur != head {
+        above.push(cur);
+        cur = r.get_changeset(cur).await.unwrap().parents[0];
+    }
+    assert_eq!(above.len(), count + 2);
+    (reads, above)
+}
+
+/// The skiplists of a batch's copies, built from rows the batch read a
+/// level at a time (ADR 0079), are those of the definition, byte for byte,
+/// over linear histories and histories with merges; and so are the rows of
+/// the history itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn copies_skiplists_match_the_definition() {
+    for merge_every in [0, 5] {
+        let (r, gate) = gated_repo();
+        build(&r, &[]).await;
+        let head = long_history(&r, 300, merge_every).await;
+        let (_, above) = land_on_history(&r, &gate, head, 12).await;
+        let mut cur = Some(above[0]);
+        let mut checked = 0;
+        while let Some(id) = cur {
+            let row = r.meta().get_derived(SKIPLIST, &id.0).await.unwrap();
+            let want = Skiplist::encode(&naive_skiplist(&r, id).await);
+            assert_eq!(
+                row,
+                Some(want),
+                "skiplist of {id} (merges every {merge_every})"
+            );
+            checked += 1;
+            cur = r.get_changeset(id).await.unwrap().parents.first().copied();
+        }
+        assert!(checked > 300);
+    }
+}
+
+/// A batch on a deep history reads the rows its copies' skiplists are
+/// built from a level at a time, so its skiplist reads grow with the
+/// levels, not with the copies times the levels as when every copy read
+/// its own chain one row after another.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_batch_on_a_deep_history_reads_skiplists_a_level_at_a_time() {
+    let (r, gate) = gated_repo();
+    build(&r, &[]).await;
+    let head = long_history(&r, 4096, 0).await;
+    let copies = 32;
+    let (reads, above) = land_on_history(&r, &gate, head, copies).await;
+    for id in above {
+        let row = r.meta().get_derived(SKIPLIST, &id.0).await.unwrap();
+        assert_eq!(row, Some(Skiplist::encode(&naive_skiplist(&r, id).await)));
+    }
+    // 13 levels at a depth of 4,097, read once for the blocking land's
+    // batch and once for the copies' (264 reads when each copy read its own
+    // chain), and a few for ancestry checks.
+    assert!(
+        reads <= 2 * 13 + 4,
+        "{reads} skiplist reads for {copies} copies"
+    );
 }

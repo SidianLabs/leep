@@ -40,6 +40,7 @@ pub use log_filter::{
 };
 pub(crate) use log_filter::{LogFilterCaches, LOG_FILTER_CACHE_BYTES};
 pub use root_tree::RootTree;
+pub(crate) use skiplist::SkipPlan;
 pub use skiplist::{SkipEntry, Skiplist};
 
 /// A kind of derived data keyed by changeset id.

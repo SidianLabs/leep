@@ -7,6 +7,16 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 ## [Unreleased]
 
+### Lands on a deep history read skiplists a level at a time
+- **Changed.** A land batch reads the skiplist rows its copies are built
+  from a level at a time for the whole batch, on a task beside its replays,
+  instead of each copy reading about log2(history) rows one after another
+  while the leader waited (ADR 0079); a create computes its skiplist beside
+  its tree write. Stored rows are unchanged, byte for byte. On a 150,000
+  changeset history `leep-land-bench` went from 143-186 to 249 lands/s at
+  16 agents and from 204-215 to 297-327 at 64, with replay 0.53-0.56 ms a
+  land instead of 2.8 ms, as fast as on a history 1,000 deep.
+
 ### A bulk writer of deep history
 - **Added.** `leep-history-gen` (in `leep-soak`) writes a long linear,
   monorepo-shaped history straight through the stores, resumable, up to
