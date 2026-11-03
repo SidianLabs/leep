@@ -4,6 +4,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
 use leep_core::prefix::IdPrefix;
+use leep_core::review_request::{
+    NewReviewRequest, ReviewRequest, ReviewRequestFilter, ReviewRequestState,
+};
 use leep_core::{
     Changeset, ChangesetId, DeleteStep, Hash, LandId, LandRecord, Lease, LeaseClaim, LeaseKey,
     LeaseTiming, MetaStore, RefLogEntry, RefStep, RefUpdateContext, Result,
@@ -89,6 +92,60 @@ impl MetaStore for FaultyMetaStore {
             .run(
                 Op::CasRef,
                 self.inner.cas_ref_logged(name, expected, new, ctx),
+                |_, v| v,
+            )
+            .await
+    }
+
+    fn supports_review_requests(&self) -> bool {
+        self.inner.supports_review_requests()
+    }
+
+    async fn put_review_request(&self, req: &NewReviewRequest) -> Result<ReviewRequest> {
+        self.plan
+            .run(
+                Op::ReviewRequest,
+                self.inner.put_review_request(req),
+                |_, v| v,
+            )
+            .await
+    }
+
+    async fn get_review_request(&self, id: u64) -> Result<Option<ReviewRequest>> {
+        self.plan
+            .run(
+                Op::ReviewRequest,
+                self.inner.get_review_request(id),
+                |_, v| v,
+            )
+            .await
+    }
+
+    async fn list_review_requests(
+        &self,
+        filter: &ReviewRequestFilter,
+    ) -> Result<Vec<ReviewRequest>> {
+        self.plan
+            .run(
+                Op::ReviewRequest,
+                self.inner.list_review_requests(filter),
+                |_, v| v,
+            )
+            .await
+    }
+
+    async fn close_review_request(
+        &self,
+        id: u64,
+        state: ReviewRequestState,
+        landed_as: Option<ChangesetId>,
+        closed: i64,
+    ) -> Result<bool> {
+        self.plan
+            .run(
+                Op::ReviewRequest,
+                self.inner
+                    .close_review_request(id, state, landed_as, closed),
                 |_, v| v,
             )
             .await

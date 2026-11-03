@@ -6,6 +6,9 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use leep_core::lane::Lane;
 use leep_core::prefix::IdPrefix;
+use leep_core::review_request::{
+    NewReviewRequest, ReviewRequest, ReviewRequestFilter, ReviewRequestState,
+};
 use leep_core::store::unix_now;
 use leep_core::{
     check_land_key, check_ref_chain, Changeset, ChangesetId, DeleteStep, DerivedRow, Hash, LandId,
@@ -67,6 +70,12 @@ pub const MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/postgres/0007_changeset_stored_at.sql"),
         satisfied_by: &[],
     },
+    Migration {
+        version: 8,
+        name: "review_requests",
+        sql: include_str!("../migrations/postgres/0008_review_requests.sql"),
+        satisfied_by: &[],
+    },
 ];
 
 /// Every table a bulk load fills, for [`PostgresMetaStore::analyze`].
@@ -125,6 +134,8 @@ pub struct PostgresMetaStore {
     pub(crate) has_dicts: bool,
     /// Whether `changesets` has `stored_at` (ADR 0059).
     pub(crate) has_stored_at: bool,
+    /// Whether the schema has the review request tables (ADR 0086).
+    pub(crate) has_review_requests: bool,
     /// Whether the schema has `store_features` (ADR 0055).
     pub(crate) has_features: bool,
     /// Tops the pools up to their warm floor (ADR 0084); `None` without
@@ -831,6 +842,9 @@ impl PostgresMetaStore {
             has_stored_at: migrations
                 .iter()
                 .any(|m| m.version >= crate::STORED_AT_SCHEMA_VERSION),
+            has_review_requests: migrations
+                .iter()
+                .any(|m| m.version >= crate::review_requests::REVIEW_REQUESTS_SCHEMA_VERSION),
             keeper: None,
         }
     }
@@ -1246,6 +1260,42 @@ impl MetaStore for PostgresMetaStore {
             .map_err(|e| log_insert_error(name, e))?;
         tx.commit().await.map_err(storage)?;
         Ok(true)
+    }
+
+    fn supports_review_requests(&self) -> bool {
+        self.has_review_requests
+    }
+
+    async fn put_review_request(&self, req: &NewReviewRequest) -> Result<ReviewRequest> {
+        crate::review_requests::pg_put(self.db_for("review_requests"), req).await
+    }
+
+    async fn get_review_request(&self, id: u64) -> Result<Option<ReviewRequest>> {
+        crate::review_requests::pg_get(self.db_for("review_requests"), id).await
+    }
+
+    async fn list_review_requests(
+        &self,
+        filter: &ReviewRequestFilter,
+    ) -> Result<Vec<ReviewRequest>> {
+        crate::review_requests::pg_list(self.db_for("review_requests"), filter).await
+    }
+
+    async fn close_review_request(
+        &self,
+        id: u64,
+        state: ReviewRequestState,
+        landed_as: Option<ChangesetId>,
+        closed: i64,
+    ) -> Result<bool> {
+        crate::review_requests::pg_close(
+            self.db_for("review_requests"),
+            id,
+            state,
+            landed_as,
+            closed,
+        )
+        .await
     }
 
     fn supports_leases(&self) -> bool {
@@ -1731,6 +1781,54 @@ impl MetaStore for PostgresMetaStore {
             .await
             .map_err(storage)?;
         Ok(id)
+    }
+
+    /// One statement, as for `put_changeset_with_derived`: `if_new` is
+    /// inserted only when the changeset insert returned a row, which only
+    /// the one statement that inserted the id sees (a concurrent one waits
+    /// on the unique index, then does nothing).
+    async fn put_changeset_with_derived_if_new(
+        &self,
+        cs: &Changeset,
+        rows: &[DerivedRow],
+        if_new: &[DerivedRow],
+    ) -> Result<bool> {
+        let id = cs.id();
+        let data = self.encode(cs).await?;
+        let (kinds, keys, values) = derived_columns(rows);
+        let (new_kinds, new_keys, new_values) = derived_columns(if_new);
+        let insert = if self.has_stored_at {
+            "INSERT INTO changesets (id, data, stored_at) VALUES ($1, $2, $9)"
+        } else {
+            "INSERT INTO changesets (id, data) VALUES ($1, $2)"
+        };
+        let sql = format!(
+            "WITH c AS ({insert} ON CONFLICT DO NOTHING RETURNING id), \
+             d AS (INSERT INTO derived (kind, key, value) \
+               SELECT * FROM UNNEST($3::text[], $4::bytea[], $5::bytea[]) ORDER BY 1, 2 \
+               ON CONFLICT (kind, key) DO UPDATE SET value = excluded.value \
+               WHERE derived.value IS DISTINCT FROM excluded.value), \
+             n AS (INSERT INTO derived (kind, key, value) \
+               SELECT * FROM UNNEST($6::text[], $7::bytea[], $8::bytea[]) \
+               WHERE EXISTS (SELECT 1 FROM c) ORDER BY 1, 2 \
+               ON CONFLICT (kind, key) DO UPDATE SET value = excluded.value) \
+             SELECT EXISTS (SELECT 1 FROM c)"
+        );
+        let mut q = sqlx::query_scalar(AssertSqlSafe(sql))
+            .bind(id.0.as_bytes().as_slice())
+            .bind(data)
+            .bind(kinds)
+            .bind(keys)
+            .bind(values)
+            .bind(new_kinds)
+            .bind(new_keys)
+            .bind(new_values);
+        if self.has_stored_at {
+            q = q.bind(crate::stored_now());
+        }
+        q.fetch_one(self.db_for("put_changeset_with_derived"))
+            .await
+            .map_err(storage)
     }
 
     /// One statement, as for `put_changeset_with_derived`, with the

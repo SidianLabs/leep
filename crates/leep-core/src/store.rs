@@ -9,6 +9,9 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 use crate::prefix::IdPrefix;
+use crate::review_request::{
+    NewReviewRequest, ReviewRequest, ReviewRequestFilter, ReviewRequestState,
+};
 use crate::{Changeset, ChangesetId, Error, Hash, Result};
 
 /// Unix seconds now, the server clock every ref log entry is stamped with.
@@ -860,6 +863,25 @@ pub trait MetaStore: Send + Sync + 'static {
         Ok(id)
     }
 
+    /// [`put_changeset_with_derived`](Self::put_changeset_with_derived), also
+    /// writing `if_new` when this call is the one that inserted the changeset,
+    /// in the same atomic step: never for a changeset that was already
+    /// stored, and for exactly one of several concurrent calls. Returns
+    /// whether it inserted. Rows that record who first stored a changeset
+    /// (ADR 0086) depend on that. The default writes the changeset and
+    /// `rows`, never `if_new`, and returns false: without an atomic insert
+    /// it cannot tell.
+    async fn put_changeset_with_derived_if_new(
+        &self,
+        cs: &Changeset,
+        rows: &[DerivedRow],
+        if_new: &[DerivedRow],
+    ) -> Result<bool> {
+        let _ = if_new;
+        self.put_changeset_with_derived(cs, rows).await?;
+        Ok(false)
+    }
+
     /// Store many changesets and derived rows in one round trip: what a land
     /// batch built (ADR 0043). Idempotent; rows are written as by
     /// [`put_derived_many`](Self::put_derived_many).
@@ -927,6 +949,61 @@ pub trait MetaStore: Send + Sync + 'static {
     async fn schema_version(&self) -> Result<Option<u64>> {
         Ok(None)
     }
+
+    /// Whether the review request methods below work (ADR 0086). Without
+    /// them the server answers the review request endpoints with 400 and
+    /// lands close nothing.
+    fn supports_review_requests(&self) -> bool {
+        false
+    }
+
+    /// Store a new open review request and return it with the id the store
+    /// gave it. Ids only grow. Two calls are two requests, even when equal.
+    async fn put_review_request(&self, req: &NewReviewRequest) -> Result<ReviewRequest> {
+        let _ = req;
+        Err(no_review_requests())
+    }
+
+    async fn get_review_request(&self, id: u64) -> Result<Option<ReviewRequest>> {
+        let _ = id;
+        Err(no_review_requests())
+    }
+
+    /// The requests `filter` matches, highest id first, at most
+    /// `filter.limit`.
+    async fn list_review_requests(
+        &self,
+        filter: &ReviewRequestFilter,
+    ) -> Result<Vec<ReviewRequest>> {
+        let _ = filter;
+        Err(no_review_requests())
+    }
+
+    /// Move request `id` from open to `state` (not `Open`) at `closed`, in
+    /// one conditional step. False, changing nothing, when it is absent or
+    /// no longer open, so two closers never both win.
+    async fn close_review_request(
+        &self,
+        id: u64,
+        state: ReviewRequestState,
+        landed_as: Option<ChangesetId>,
+        closed: i64,
+    ) -> Result<bool> {
+        let _ = (id, state, landed_as, closed);
+        Err(no_review_requests())
+    }
+}
+
+fn no_review_requests() -> Error {
+    Error::Invalid("this metadata store does not keep review requests".into())
+}
+
+/// The state a close must move to: anything but `Open`.
+pub fn check_close_state(state: ReviewRequestState) -> Result<()> {
+    if state == ReviewRequestState::Open {
+        return Err(Error::Invalid("a review request cannot be reopened".into()));
+    }
+    Ok(())
 }
 
 /// A land key names where a land took the ref, so it never rides on a delete.

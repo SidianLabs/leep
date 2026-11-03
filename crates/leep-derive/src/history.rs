@@ -531,6 +531,7 @@ impl Repo {
                 root_tree,
                 path_at: None,
                 renamed: None,
+                created_by: None,
             });
         }
         let ids: Vec<ChangesetId> = later.iter().map(|&i| out[i].id).collect();
@@ -857,6 +858,7 @@ mod read_ahead_tests {
                 generation,
                 path_at: None,
                 renamed: None,
+                created_by: None,
             });
         }
         Ok(out)

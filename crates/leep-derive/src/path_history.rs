@@ -1578,6 +1578,7 @@ impl Repo {
                 root_tree,
                 path_at: None,
                 renamed: None,
+                created_by: None,
             });
         }
         Ok(LogPageRaw {
@@ -1745,6 +1746,7 @@ impl Repo {
                 root_tree: self.root_tree(cid).await?,
                 path_at: Some(RepoPath::new(&*name)?),
                 renamed,
+                created_by: None,
             });
         }
         walk.settle(self).await?;

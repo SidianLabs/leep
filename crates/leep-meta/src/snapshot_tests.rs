@@ -49,6 +49,36 @@ async fn populate(store: &dyn MetaStore) {
         )
         .await
         .unwrap();
+    // Review requests (ADR 0086): one open with reviewers, one open to
+    // anyone, one closed.
+    use leep_core::review_request::{NewReviewRequest, ReviewRequestState};
+    let mut ids = Vec::new();
+    for (i, reviewers) in [vec!["bo", "rhea"], vec![], vec!["cy"]]
+        .into_iter()
+        .enumerate()
+    {
+        let r = store
+            .put_review_request(&NewReviewRequest {
+                changeset: cs(i as i64).id(),
+                target_ref: "main".into(),
+                requester: "alice".into(),
+                reviewers: reviewers.into_iter().map(String::from).collect(),
+                message: format!("request {i}"),
+                created: 1_700_000_000 + i as i64,
+            })
+            .await
+            .unwrap();
+        ids.push(r.id);
+    }
+    assert!(store
+        .close_review_request(
+            ids[2],
+            ReviewRequestState::Landed,
+            Some(side),
+            1_700_000_100
+        )
+        .await
+        .unwrap());
 }
 
 type Dump = (
@@ -58,6 +88,7 @@ type Dump = (
     Vec<String>,
     Vec<String>,
     Vec<Option<u64>>,
+    Vec<String>,
 );
 
 /// A dump without its land ids and store times, for a copy that went
@@ -122,7 +153,39 @@ async fn dump(store: &dyn MetaStore) -> Dump {
         .map(|l| format!("{l:?}"))
         .collect();
     lands.extend(log_lands);
-    (ids, refs, log, derived, lands, stored)
+    let requests = store
+        .list_review_requests(&leep_core::review_request::ReviewRequestFilter {
+            limit: 1000,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| format!("{r:?}"))
+        .collect();
+    (ids, refs, log, derived, lands, stored, requests)
+}
+
+/// A restored store gives its next review request a higher id than any it
+/// restored.
+async fn next_request_id_is_fresh(store: &dyn MetaStore) {
+    let f = leep_core::review_request::ReviewRequestFilter {
+        limit: 1,
+        ..Default::default()
+    };
+    let top = store.list_review_requests(&f).await.unwrap()[0].id;
+    let next = store
+        .put_review_request(&leep_core::review_request::NewReviewRequest {
+            changeset: cs(1).id(),
+            target_ref: "main".into(),
+            requester: "late".into(),
+            reviewers: vec![],
+            message: String::new(),
+            created: 1,
+        })
+        .await
+        .unwrap();
+    assert!(next.id > top, "{} after {top}", next.id);
 }
 
 fn sqlite_url(dir: &std::path::Path, name: &str) -> String {
@@ -203,6 +266,7 @@ async fn sqlite_round_trip_keeps_everything_and_the_ref_log_sequence() {
         dest.ref_log(None, None, 1).await.unwrap()[0].seq,
         last as u64 + 1
     );
+    next_request_id_is_fresh(&*dest).await;
 }
 
 #[tokio::test]
@@ -351,7 +415,7 @@ async fn schema_version_rules_follow_adr_0023() {
     // From an un-versioned database (before ADR 0023): adopted, then restored.
     let older = edit(
         "older.db",
-        "DROP TABLE schema_migrations; DROP TABLE changeset_dicts; DROP TABLE store_features; \
+        "DROP TABLE review_requests; DROP TABLE review_request_reviewers; DROP TABLE schema_migrations; DROP TABLE changeset_dicts; DROP TABLE store_features; \
          DROP INDEX ref_log_land_id; ALTER TABLE ref_log DROP COLUMN land_changeset; \
          ALTER TABLE ref_log DROP COLUMN land_id; \
          DROP TABLE leases; ALTER TABLE changesets DROP COLUMN stored_at",
@@ -375,7 +439,7 @@ async fn schema_version_rules_follow_adr_0023() {
     // SQLite) and 3: migrated on the scratch copy, then restored.
     let v1 = edit(
         "v1.db",
-        "DROP TABLE changeset_dicts; DROP TABLE store_features; DROP TABLE leases; DROP INDEX ref_log_land_id; ALTER TABLE ref_log DROP COLUMN land_changeset; \
+        "DROP TABLE review_requests; DROP TABLE review_request_reviewers; DROP TABLE changeset_dicts; DROP TABLE store_features; DROP TABLE leases; DROP INDEX ref_log_land_id; ALTER TABLE ref_log DROP COLUMN land_changeset; \
          ALTER TABLE ref_log DROP COLUMN land_id; ALTER TABLE changesets DROP COLUMN stored_at; \
          DELETE FROM schema_migrations WHERE version > 1",
     )
@@ -399,7 +463,7 @@ async fn schema_version_rules_follow_adr_0023() {
     // the scratch copy, empty, and the plain rows restore as they were.
     let v2 = edit(
         "v2.db",
-        "DROP TABLE changeset_dicts; DROP TABLE store_features; DROP TABLE leases; DROP INDEX ref_log_land_id; ALTER TABLE ref_log DROP COLUMN land_changeset; \
+        "DROP TABLE review_requests; DROP TABLE review_request_reviewers; DROP TABLE changeset_dicts; DROP TABLE store_features; DROP TABLE leases; DROP INDEX ref_log_land_id; ALTER TABLE ref_log DROP COLUMN land_changeset; \
          ALTER TABLE ref_log DROP COLUMN land_id; ALTER TABLE changesets DROP COLUMN stored_at; \
          DELETE FROM schema_migrations WHERE version > 2",
     )
@@ -423,7 +487,7 @@ async fn schema_version_rules_follow_adr_0023() {
     // copy; the source had no dictionary, so it names no feature.
     let v3 = edit(
         "v3.db",
-        "DROP TABLE store_features; DROP TABLE leases; DROP INDEX ref_log_land_id; ALTER TABLE ref_log DROP COLUMN land_changeset; \
+        "DROP TABLE review_requests; DROP TABLE review_request_reviewers; DROP TABLE store_features; DROP TABLE leases; DROP INDEX ref_log_land_id; ALTER TABLE ref_log DROP COLUMN land_changeset; \
          ALTER TABLE ref_log DROP COLUMN land_id; ALTER TABLE changesets DROP COLUMN stored_at; \
          DELETE FROM schema_migrations WHERE version > 3",
     )
@@ -448,7 +512,7 @@ async fn schema_version_rules_follow_adr_0023() {
     // scratch copy, and every restored entry has none.
     let v4 = edit(
         "v4.db",
-        "DROP INDEX ref_log_land_id; ALTER TABLE ref_log DROP COLUMN land_changeset; \
+        "DROP TABLE review_requests; DROP TABLE review_request_reviewers; DROP INDEX ref_log_land_id; ALTER TABLE ref_log DROP COLUMN land_changeset; \
          ALTER TABLE ref_log DROP COLUMN land_id; DROP TABLE leases; \
          ALTER TABLE changesets DROP COLUMN stored_at; \
          DELETE FROM schema_migrations WHERE version > 4",
@@ -476,7 +540,7 @@ async fn schema_version_rules_follow_adr_0023() {
     // migration ran.
     let v6 = edit(
         "v6.db",
-        "ALTER TABLE changesets DROP COLUMN stored_at; \
+        "DROP TABLE review_requests; DROP TABLE review_request_reviewers; ALTER TABLE changesets DROP COLUMN stored_at; \
          DELETE FROM schema_migrations WHERE version > 6",
     )
     .await;
@@ -497,6 +561,29 @@ async fn schema_version_rules_follow_adr_0023() {
     let first = d.5[0].unwrap();
     assert!(first >= before, "{first} < {before}");
     assert!(d.5.iter().all(|t| *t == Some(first)), "{:?}", d.5);
+
+    // From v7, before review requests (ADR 0086): the tables are created on
+    // the scratch copy, empty, and everything else restores as it was.
+    let v7 = edit(
+        "v7.db",
+        "DROP TABLE review_requests; DROP TABLE review_request_reviewers; \
+         DELETE FROM schema_migrations WHERE version > 7",
+    )
+    .await;
+    assert_eq!(snapshot_schema_version(&v7).await.unwrap(), 7);
+    let dest_url = sqlite_url(dir.path(), "d9.db");
+    import_snapshot(&v7, &dest_url, false, SchemaMode::Migrate)
+        .await
+        .unwrap();
+    let d9 = open_meta_store(&dest_url).await.unwrap();
+    assert_eq!(
+        d9.schema_version().await.unwrap(),
+        Some(latest_schema_version())
+    );
+    let (d, mut src_dump) = (dump(&*d9).await, dump(&*src).await);
+    assert!(d.6.is_empty() && !src_dump.6.is_empty());
+    src_dump.6.clear();
+    assert_eq!(d, src_dump);
 
     // Not a snapshot at all.
     let junk = dir.path().join("junk.db");
@@ -688,6 +775,7 @@ async fn postgres_to_sqlite_to_postgres() {
     let id = dest.put_changeset(&cs(900)).await.unwrap();
     assert!(dest.cas_ref("fresh", None, Some(id)).await.unwrap());
     assert_eq!(dest.ref_log(None, None, 1).await.unwrap()[0].seq, last + 1);
+    next_request_id_is_fresh(&*dest).await;
     // A second import into the now non-empty database is refused; forced, it replaces.
     assert!(import_snapshot(&snap, &b.url, false, SchemaMode::Migrate)
         .await

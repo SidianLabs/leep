@@ -20,6 +20,7 @@ pub mod reset;
 pub mod resolve;
 pub mod restore;
 pub mod review;
+pub mod review_request;
 pub mod search;
 pub mod stash;
 pub mod status;

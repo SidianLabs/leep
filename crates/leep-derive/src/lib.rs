@@ -41,6 +41,7 @@ pub mod read_stats;
 mod renames;
 mod repo;
 pub mod review;
+mod review_requests;
 mod reviews;
 mod revision;
 pub mod search;

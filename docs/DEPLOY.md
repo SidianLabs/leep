@@ -282,6 +282,16 @@ When a client names no author itself (no `--author`, `LEEP_AUTHOR`,
 see [CLI.md](CLI.md#author-of-new-changesets)), `leep` stamps that on its changesets, falling
 back to the token's `name`. It is a default, not enforcement: a client that
 sets `LEEP_AUTHOR` still wins.
+
+**Give every agent its own token**, named for the agent (`gen-token --name
+agent-7 --role write --no-review --author "agent-7 <...>"`), rather than one
+token shared by a fleet. The token's name is the only identity the server
+can vouch for: it is the actor in the ref log, the requester and reviewer of
+review requests, and, since ADR 0086, the creator recorded with every
+changeset the token stores (`Created-by:` in `leep show`, `created_by` in
+the API). Agents usually share an author string (the tool's own), so with
+one shared token a reviewer cannot tell their changes apart. Set `author`
+on each entry too, so agents that name no author stamp a distinct one.
 Clients pass the token with `LEEP_TOKEN`, `leep --token` or
 `leep init --token`. `GET /v1/health` and `GET /v1/ready` stay public for probes. The file is
 re-read on SIGHUP, so tokens can be rotated and revoked without a restart
@@ -519,6 +529,13 @@ which governs only reviews the token posts as itself; a mirror token is usually
 token is a 403, never taken as that token's own review. The field reloads on
 SIGHUP. A review can be withdrawn with verdict `withdrawn` (`leep review
 withdraw REV`); it then counts as no review.
+
+Agents ask for a review through the server: `leep review request REV`
+records a request for the owners of the paths still pending (or `--to NAME`),
+and reviewers list what waits for them with `leep review inbox` (ADR 0086).
+Reviewer names must be tokens that may review. A request closes when its
+change lands. No configuration is needed beyond the tokens file; without
+one the endpoints answer 400.
 
 ## Reloading config
 

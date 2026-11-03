@@ -8,10 +8,13 @@ use async_trait::async_trait;
 use bytes::Bytes;
 
 use crate::prefix::IdPrefix;
+use crate::review_request::{
+    NewReviewRequest, ReviewRequest, ReviewRequestFilter, ReviewRequestState,
+};
 use crate::store::{
-    check_land_key, check_ref_chain, land_id_taken, lease_remaining_ms, unix_now, BlobMeta,
-    DeleteStep, DerivedRow, LandId, LandRecord, Lease, LeaseClaim, LeaseKey, LeaseTiming,
-    RefLogEntry, RefStep, RefUpdateContext,
+    check_close_state, check_land_key, check_ref_chain, land_id_taken, lease_remaining_ms,
+    unix_now, BlobMeta, DeleteStep, DerivedRow, LandId, LandRecord, Lease, LeaseClaim, LeaseKey,
+    LeaseTiming, RefLogEntry, RefStep, RefUpdateContext,
 };
 use crate::{BlobStore, Changeset, ChangesetId, Hash, MetaStore, Result};
 
@@ -112,6 +115,7 @@ pub struct MemoryMetaStore {
     derived: Mutex<BTreeMap<(String, Hash), Bytes>>,
     leases: Mutex<BTreeMap<LeaseKey, LeaseRow>>,
     lease_clock: LeaseClock,
+    review_requests: Mutex<BTreeMap<u64, ReviewRequest>>,
 }
 
 /// The clock land leases are judged by, in milliseconds. The system clock
@@ -277,7 +281,11 @@ impl MemoryMetaStore {
 
     /// Store `cs` unless it is stored, recording the time on the first store.
     /// The caller holds the `changesets` lock.
-    fn insert_changeset(&self, changesets: &mut BTreeMap<ChangesetId, Changeset>, cs: &Changeset) {
+    fn insert_changeset(
+        &self,
+        changesets: &mut BTreeMap<ChangesetId, Changeset>,
+        cs: &Changeset,
+    ) -> bool {
         let id = cs.id();
         if let std::collections::btree_map::Entry::Vacant(v) = changesets.entry(id) {
             v.insert(cs.clone());
@@ -285,7 +293,9 @@ impl MemoryMetaStore {
                 .lock()
                 .unwrap()
                 .insert(id, unix_now().max(0) as u64);
+            return true;
         }
+        false
     }
 }
 
@@ -353,6 +363,69 @@ impl MetaStore for MemoryMetaStore {
             Some(row) if row.holder == holder && row.epoch == epoch => {
                 row.renewed_at = 0;
                 row.expires_at = 0;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    fn supports_review_requests(&self) -> bool {
+        true
+    }
+
+    async fn put_review_request(&self, req: &NewReviewRequest) -> Result<ReviewRequest> {
+        let mut all = self.review_requests.lock().unwrap();
+        let id = all.keys().next_back().map_or(1, |k| k + 1);
+        let row = ReviewRequest {
+            id,
+            changeset: req.changeset,
+            target_ref: req.target_ref.clone(),
+            requester: req.requester.clone(),
+            reviewers: req.reviewers.clone(),
+            message: req.message.clone(),
+            created: req.created,
+            state: ReviewRequestState::Open,
+            closed: None,
+            landed_as: None,
+        };
+        all.insert(id, row.clone());
+        Ok(row)
+    }
+
+    async fn get_review_request(&self, id: u64) -> Result<Option<ReviewRequest>> {
+        Ok(self.review_requests.lock().unwrap().get(&id).cloned())
+    }
+
+    async fn list_review_requests(
+        &self,
+        filter: &ReviewRequestFilter,
+    ) -> Result<Vec<ReviewRequest>> {
+        Ok(self
+            .review_requests
+            .lock()
+            .unwrap()
+            .values()
+            .rev()
+            .filter(|r| filter.matches(r))
+            .take(filter.limit)
+            .cloned()
+            .collect())
+    }
+
+    async fn close_review_request(
+        &self,
+        id: u64,
+        state: ReviewRequestState,
+        landed_as: Option<ChangesetId>,
+        closed: i64,
+    ) -> Result<bool> {
+        check_close_state(state)?;
+        let mut all = self.review_requests.lock().unwrap();
+        match all.get_mut(&id) {
+            Some(r) if r.state == ReviewRequestState::Open => {
+                r.state = state;
+                r.closed = Some(closed);
+                r.landed_as = landed_as;
                 Ok(true)
             }
             _ => Ok(false),
@@ -625,6 +698,21 @@ impl MetaStore for MemoryMetaStore {
         Ok(id)
     }
 
+    async fn put_changeset_with_derived_if_new(
+        &self,
+        cs: &Changeset,
+        rows: &[DerivedRow],
+        if_new: &[DerivedRow],
+    ) -> Result<bool> {
+        let mut changesets = self.changesets.lock().unwrap();
+        let mut all = self.derived.lock().unwrap();
+        let inserted = self.insert_changeset(&mut changesets, cs);
+        for r in rows.iter().chain(if inserted { if_new } else { &[] }) {
+            all.insert((r.kind.clone(), r.key), r.value.clone());
+        }
+        Ok(inserted)
+    }
+
     async fn put_changesets_with_derived(
         &self,
         changesets: &[Changeset],
@@ -640,6 +728,270 @@ impl MetaStore for MemoryMetaStore {
         }
         Ok(())
     }
+}
+
+/// Conformance checks for [`MetaStore::put_changeset_with_derived_if_new`]
+/// (ADR 0086), for stores that implement it atomically: of concurrent
+/// stores of one new changeset exactly one inserts and writes its `if_new`
+/// rows, and a store of a changeset already present writes none.
+pub async fn check_insert_once_contract(store: &dyn MetaStore) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static RUN: AtomicU64 = AtomicU64::new(0);
+    let run = format!(
+        "{}-{}-{}",
+        std::process::id(),
+        RUN.fetch_add(1, Ordering::Relaxed),
+        unix_now()
+    );
+    let cs = Changeset {
+        parents: vec![],
+        author: "insert-once".into(),
+        timestamp: 1,
+        message: run,
+        changes: BTreeMap::new(),
+        extra: BTreeMap::new(),
+    };
+    let id = cs.id();
+    let always = |i: u8| {
+        vec![DerivedRow::new(
+            "insert-once-always",
+            id.0,
+            Bytes::from(vec![i]),
+        )]
+    };
+    let once = |i: u8| {
+        vec![DerivedRow::new(
+            "insert-once-new",
+            id.0,
+            Bytes::from(vec![i]),
+        )]
+    };
+    let calls: Vec<(Vec<DerivedRow>, Vec<DerivedRow>)> =
+        (0..8).map(|i| (always(i), once(i))).collect();
+    let got = futures_util::future::join_all(
+        calls
+            .iter()
+            .map(|(a, o)| store.put_changeset_with_derived_if_new(&cs, a, o)),
+    )
+    .await;
+    let winners: Vec<usize> = got
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, r)| r.unwrap().then_some(i))
+        .collect();
+    assert_eq!(winners.len(), 1, "exactly one insert");
+    let row = store.get_derived("insert-once-new", &id.0).await.unwrap();
+    assert_eq!(row.as_deref(), Some(&[winners[0] as u8][..]));
+    assert!(store
+        .get_derived("insert-once-always", &id.0)
+        .await
+        .unwrap()
+        .is_some());
+    assert_eq!(store.get_changeset(&id).await.unwrap(), Some(cs.clone()));
+    // Already stored: the rows that always go are written, `if_new` is not.
+    assert!(!store
+        .put_changeset_with_derived_if_new(&cs, &always(42), &once(42))
+        .await
+        .unwrap());
+    assert_eq!(
+        store.get_derived("insert-once-new", &id.0).await.unwrap(),
+        row
+    );
+    assert_eq!(
+        store
+            .get_derived("insert-once-always", &id.0)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(&[42u8][..])
+    );
+}
+
+/// Conformance checks for the review request methods (ADR 0086), for every
+/// `MetaStore` whose `supports_review_requests` is true. Names are unique
+/// per call, so it may run again on a store that already has requests.
+pub async fn check_review_request_contract(store: &dyn MetaStore) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static RUN: AtomicU64 = AtomicU64::new(0);
+
+    assert!(store.supports_review_requests());
+    let run = format!(
+        "{}-{}-{}",
+        std::process::id(),
+        RUN.fetch_add(1, Ordering::Relaxed),
+        unix_now()
+    );
+    let name = |n: &str| format!("rr-{n}-{run}");
+    let cs = |n: &str| ChangesetId(Hash::of_blob(name(n).as_bytes()));
+    let (a, b, c) = (name("a"), name("b"), name("c"));
+    let (r1, r2) = (name("ref1"), name("ref2"));
+    let new = |changeset: ChangesetId, target: &str, requester: &str, reviewers: &[&String]| {
+        NewReviewRequest {
+            changeset,
+            target_ref: target.to_string(),
+            requester: requester.to_string(),
+            reviewers: reviewers.iter().map(|s| s.to_string()).collect(),
+            message: "please review\nline two \u{e9}".into(),
+            created: 1_700_000_000,
+        }
+    };
+    let first = store
+        .put_review_request(&new(cs("1"), &r1, &a, &[&b]))
+        .await
+        .unwrap();
+    let second = store
+        .put_review_request(&new(cs("2"), &r1, &a, &[]))
+        .await
+        .unwrap();
+    let third = store
+        .put_review_request(&new(cs("1"), &r2, &b, &[&a, &c]))
+        .await
+        .unwrap();
+    assert!(first.id < second.id && second.id < third.id, "ids grow");
+    assert_eq!(
+        first,
+        ReviewRequest {
+            id: first.id,
+            changeset: cs("1"),
+            target_ref: r1.clone(),
+            requester: a.clone(),
+            reviewers: vec![b.clone()],
+            message: "please review\nline two \u{e9}".into(),
+            created: 1_700_000_000,
+            state: ReviewRequestState::Open,
+            closed: None,
+            landed_as: None,
+        }
+    );
+    assert_eq!(third.reviewers, [a.clone(), c.clone()]);
+    assert_eq!(
+        store.get_review_request(first.id).await.unwrap(),
+        Some(first.clone())
+    );
+    assert_eq!(store.get_review_request(u64::MAX / 2).await.unwrap(), None);
+
+    let list = |f: ReviewRequestFilter| async move {
+        store
+            .list_review_requests(&ReviewRequestFilter { limit: 10, ..f })
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect::<Vec<_>>()
+    };
+    let by = |requester: &str| ReviewRequestFilter {
+        requester: Some(requester.to_string()),
+        ..Default::default()
+    };
+    let to = |reviewer: &str, target: &str| ReviewRequestFilter {
+        reviewer: Some(reviewer.to_string()),
+        target_ref: Some(target.to_string()),
+        ..Default::default()
+    };
+    assert_eq!(list(by(&a)).await, [second.id, first.id], "newest first");
+    assert_eq!(list(by(&b)).await, [third.id]);
+    // Named, or open to any reviewer and made by someone else.
+    assert_eq!(list(to(&b, &r1)).await, [second.id, first.id]);
+    assert_eq!(list(to(&a, &r1)).await, Vec::<u64>::new(), "not your own");
+    assert_eq!(list(to(&a, &r2)).await, [third.id]);
+    assert_eq!(list(to(&c, &r2)).await, [third.id]);
+    assert_eq!(list(to(&b, &r2)).await, Vec::<u64>::new());
+    let of = ReviewRequestFilter {
+        changeset: Some(cs("1")),
+        ..Default::default()
+    };
+    assert_eq!(list(of).await, [third.id, first.id]);
+    let one = store
+        .list_review_requests(&ReviewRequestFilter { limit: 1, ..by(&a) })
+        .await
+        .unwrap();
+    assert_eq!(one, std::slice::from_ref(&second));
+    let page = ReviewRequestFilter {
+        before: Some(second.id),
+        ..by(&a)
+    };
+    assert_eq!(list(page).await, [first.id]);
+    let none = store
+        .list_review_requests(&ReviewRequestFilter { limit: 0, ..by(&a) })
+        .await
+        .unwrap();
+    assert!(none.is_empty());
+
+    // Closing is one conditional step from open.
+    let landed_as = Some(cs("copy"));
+    assert!(store
+        .close_review_request(first.id, ReviewRequestState::Landed, landed_as, 99)
+        .await
+        .unwrap());
+    assert!(!store
+        .close_review_request(first.id, ReviewRequestState::Withdrawn, None, 100)
+        .await
+        .unwrap());
+    assert!(store
+        .close_review_request(second.id, ReviewRequestState::Open, None, 100)
+        .await
+        .is_err());
+    assert!(!store
+        .close_review_request(u64::MAX / 2, ReviewRequestState::Withdrawn, None, 100)
+        .await
+        .unwrap());
+    let closed = store.get_review_request(first.id).await.unwrap().unwrap();
+    assert_eq!(
+        (closed.state, closed.closed, closed.landed_as),
+        (ReviewRequestState::Landed, Some(99), landed_as)
+    );
+    assert!(store
+        .close_review_request(third.id, ReviewRequestState::Withdrawn, None, 101)
+        .await
+        .unwrap());
+    let withdrawn = store.get_review_request(third.id).await.unwrap().unwrap();
+    assert_eq!(
+        (withdrawn.state, withdrawn.closed, withdrawn.landed_as),
+        (ReviewRequestState::Withdrawn, Some(101), None)
+    );
+    let state = |states: &[ReviewRequestState]| ReviewRequestFilter {
+        states: states.to_vec(),
+        ..by(&a)
+    };
+    assert_eq!(list(state(&[ReviewRequestState::Open])).await, [second.id]);
+    assert_eq!(list(state(&[ReviewRequestState::Landed])).await, [first.id]);
+    assert_eq!(
+        list(state(&[
+            ReviewRequestState::Landed,
+            ReviewRequestState::Withdrawn
+        ]))
+        .await,
+        [first.id]
+    );
+    assert_eq!(list(to(&a, &r2)).await, [third.id], "closed still listed");
+    let open_to_a = ReviewRequestFilter {
+        states: vec![ReviewRequestState::Open],
+        ..to(&a, &r2)
+    };
+    assert_eq!(list(open_to_a).await, Vec::<u64>::new());
+
+    // Concurrent requests are all kept, each with its own id.
+    let d = name("d");
+    let reqs: Vec<NewReviewRequest> = (0..16)
+        .map(|i| NewReviewRequest {
+            changeset: cs(&i.to_string()),
+            ..new(cs("x"), &r1, &d, &[])
+        })
+        .collect();
+    let made =
+        futures_util::future::join_all(reqs.iter().map(|r| store.put_review_request(r))).await;
+    let mut ids: Vec<u64> = made.into_iter().map(|r| r.unwrap().id).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(ids.len(), 16);
+    let all = store
+        .list_review_requests(&ReviewRequestFilter {
+            limit: 100,
+            ..by(&d)
+        })
+        .await
+        .unwrap();
+    assert_eq!(all.len(), 16);
 }
 
 /// Conformance checks for the lease methods (ADR 0056), for every
@@ -947,6 +1299,9 @@ pub async fn check_meta_store_contract(store: &dyn MetaStore) {
     check_batched_reads(store).await;
     check_batched_writes(store).await;
     check_rewrites(store).await;
+    if store.supports_review_requests() {
+        check_review_request_contract(store).await;
+    }
 }
 
 /// Through every write path, an identical write leaves the row alone (same
@@ -2308,6 +2663,26 @@ mod tests {
     async fn memory_stores_pass_contract() {
         check_meta_store_contract(&MemoryMetaStore::new()).await;
         check_blob_store_contract(&MemoryBlobStore::new()).await;
+    }
+
+    #[tokio::test]
+    async fn memory_insert_once_passes_contract() {
+        check_insert_once_contract(&MemoryMetaStore::new()).await;
+    }
+
+    #[tokio::test]
+    async fn memory_review_requests_pass_contract() {
+        check_review_request_contract(&MemoryMetaStore::new()).await;
+    }
+
+    /// A store without review requests says so, and its calls refuse.
+    #[tokio::test]
+    async fn stores_without_review_requests_refuse_them() {
+        let store = DefaultChain(MemoryMetaStore::new());
+        assert!(!store.supports_review_requests());
+        let f = ReviewRequestFilter::default();
+        assert!(store.list_review_requests(&f).await.is_err());
+        assert!(store.get_review_request(1).await.is_err());
     }
 
     #[tokio::test]
