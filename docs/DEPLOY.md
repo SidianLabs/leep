@@ -154,6 +154,12 @@ leep-server &                                  # listens on 127.0.0.1:7070
 curl -s localhost:7070/v1/ready                # {"status":"ready",...}
 ```
 
+Postgres needs memory in proportion to history: about 2.4 KB per changeset,
+about 4.2 KB once the indexes are warm, and blames and logs over a long
+history slow sharply once the database no longer fits in memory. See
+[OPERATIONS.md](OPERATIONS.md#sizing-postgres-memory) before a deep history
+goes live.
+
 ### Subcommands and a first client
 
 Every `leep-server` subcommand (`backup`, `restore`, `migrate`, `gc`, ...)
