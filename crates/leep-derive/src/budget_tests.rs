@@ -59,8 +59,9 @@ const BUDGETS: &[Limit] = &[
     Limit::fixed("log 100", "meta in flight", 4),
     // A cold blame of a file with v versions on a 2,000-deep linear
     // history: about three reads per version, none for the depth (ADR
-    // 0065, ADR 0077).
-    Limit::linear("blame", "meta calls", 9, 3),
+    // 0065, ADR 0077), plus the one lookup of the newest changer's cached
+    // blame before the head walk goes on (ADR 0083).
+    Limit::linear("blame", "meta calls", 10, 3),
     Limit::fixed("blame", "meta in flight", 1),
     // A literal search of a 256-file tree on a new process, deriving the
     // trigram index on the way (ADR 0014): every blob read once.

@@ -126,6 +126,46 @@ impl Repo {
         Ok(None)
     }
 
+    /// The cached blame of `path` at the newest changer of it at `id`, which
+    /// is the blame at `id`, when the index names exactly one newest changer
+    /// and no merge on `id`'s first-parent chain lies above it: then the
+    /// walk's first step goes straight to that changer and ends at its row
+    /// ([`Repo::skip_unchanged`]). The blame warmer extends from it
+    /// (`blame_warm`). `None` when the changer has no row or the index
+    /// cannot say (several newest changers, a merge above the changer, or a
+    /// bounded blame above its floor).
+    pub(crate) async fn newest_changer_blame(
+        &self,
+        id: ChangesetId,
+        path: &RepoPath,
+    ) -> Result<Option<(ChangesetId, CachedBlame)>> {
+        if let Some(b) = &self.bounded {
+            // A bounded blame (ADR 0058) reads the index only up to its
+            // floor.
+            match b.floor {
+                Some(floor) if self.generation(id).await? <= floor => {}
+                _ => return Ok(None),
+            }
+        }
+        let Some(entry) = self.history_entry(id, path.as_str()).await? else {
+            return Ok(None);
+        };
+        let &[c] = entry.changed() else {
+            return Ok(None);
+        };
+        if c != id {
+            let (g, from) =
+                futures_util::future::join(self.generation(c), self.linear_from(id)).await;
+            if g? < from? {
+                return Ok(None);
+            }
+        }
+        match self.meta().get_derived(KIND, &cache_key(c, path)).await? {
+            Some(v) => Ok(Some((c, postcard::from_bytes(&v)?))),
+            None => Ok(None),
+        }
+    }
+
     /// Attribute each line of `path` at `id` to the changeset that wrote it,
     /// across renames and through merges (ADR 0065), and describe each
     /// distinct changeset.
@@ -143,6 +183,7 @@ impl Repo {
         hold: Option<crate::BlameHold>,
     ) -> Result<BlameResponse> {
         let (path, lines) = self.blame_shared(id, path, hold).await?;
+        self.blame_tracker.track(&path);
         let mut ids: Vec<ChangesetId> = lines.iter().map(|l| l.changeset).collect();
         ids.sort_unstable();
         ids.dedup();
@@ -287,6 +328,8 @@ impl Repo {
         }
         let mut cur = top;
         let mut pending: Vec<(ChangesetId, Option<ChangesetId>)> = Vec::new();
+        // Whether the first step's cached blame was looked up already.
+        let mut first_checked = false;
         loop {
             // Nothing changed between `cur` and the changeset skipped to, so
             // the file there is the one the last step found.
@@ -306,6 +349,34 @@ impl Repo {
             if let Some(x) = next {
                 let parent = first_parents.parent(self, x).await?;
                 pending.push((x, parent.map(|p| p.id)));
+                // The head walk's first changer below the tip is where a
+                // blame kept current by the warmer (ADR 0083) is: looked up
+                // at once, so a warm blame ends here instead of after a
+                // batch of steps.
+                if cache
+                    && most < usize::MAX
+                    && x != top
+                    && walk.steps.is_empty()
+                    && pending.len() == 1
+                    && !known.contains(&x)
+                {
+                    if let Some(v) = self.meta().get_derived(KIND, &cache_key(x, path)).await? {
+                        let parent_info = match parent {
+                            Some(p) => self.lookup_files(&[p.id], path).await?.pop().flatten(),
+                            None => None,
+                        };
+                        walk.resume =
+                            parent.filter(|p| p.generation > bottom && parent_info.is_some());
+                        walk.steps.push(Step {
+                            x,
+                            has_parent: parent.is_some(),
+                            parent_info,
+                        });
+                        walk.first_hit = Some(Hit::Cached(postcard::from_bytes(&v)?));
+                        return Ok(walk);
+                    }
+                    first_checked = true;
+                }
                 if let Some(p) = parent.filter(|p| p.generation > bottom) {
                     if walk.steps.len() + pending.len() < most {
                         entry = self.entry_and_list(&mut first_parents, p.id, path).await?;
@@ -356,7 +427,7 @@ impl Repo {
                         return Ok(walk);
                     }
                     walk.first_hit = Some(Hit::Known);
-                } else if changed {
+                } else if changed && !(i == 0 && first_checked) {
                     unchecked.push(i);
                 }
                 if ended {
@@ -514,10 +585,6 @@ impl Repo {
         // blame: most blames end within it, and a blame is bound by the
         // CPU its queries cost rather than by their latency.
         let head = head.await?;
-        let plan = match head.resume {
-            Some(_) => Some(self.plan_stretches(id, tip_gen, cuts.min_span).await?),
-            None => None,
-        };
         let mut found = Found {
             chain: Vec::new(),
             end: End::Start,
@@ -528,9 +595,10 @@ impl Repo {
         if found.take(head, &mut cur_info) {
             return Ok(found);
         }
-        let (Some(resume), Some((cuts, mut known, lists))) = (resume, plan) else {
+        let Some(resume) = resume else {
             return Ok(found);
         };
+        let (cuts, mut known, lists) = self.plan_stretches(id, tip_gen, cuts.min_span).await?;
         known.insert(resume.generation, resume.id);
         // The stretch from where the head stopped, then those of the cuts
         // below it.
@@ -992,6 +1060,33 @@ pub(crate) async fn diff_pairs(
 /// splitting at a lone `\r` as `similar` does made blame fail on such files.
 pub(crate) fn split_lines(text: &str) -> impl Iterator<Item = &str> {
     text.split_inclusive('\n')
+}
+
+/// The lines of a version made from a version whose lines are `from` by
+/// `ops`, its line diff against that version: a line the diff keeps keeps
+/// its credit, the others go to `cs`. Also returns the indexes of the
+/// latter. The one rule for a replayed version and an extended blame
+/// (`blame_warm`), so the rows they write cannot differ.
+pub(crate) fn apply_base(
+    ops: &Ops,
+    from: &[(ChangesetId, u32)],
+    cs: ChangesetId,
+) -> (Vec<(ChangesetId, u32)>, Vec<usize>) {
+    let mut lines: Vec<(ChangesetId, u32)> = Vec::new();
+    let mut mine: Vec<usize> = Vec::new();
+    for (tag, old, new) in ops {
+        match tag {
+            DiffTag::Equal => lines.extend_from_slice(&from[old.clone()]),
+            DiffTag::Delete => {}
+            DiffTag::Insert | DiffTag::Replace => {
+                for l in new.clone() {
+                    mine.push(l);
+                    lines.push((cs, l as u32 + 1));
+                }
+            }
+        }
+    }
+    (lines, mine)
 }
 
 /// The changesets that changed the file, newest first, as a blame walk

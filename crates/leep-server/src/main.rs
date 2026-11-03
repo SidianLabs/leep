@@ -158,6 +158,15 @@ struct Args {
         value_parser = clap::builder::BoolishValueParser::new(),
     )]
     warm_search: bool,
+    /// Files whose blames are kept current as changes land (ADR 0083):
+    /// those blamed most recently, up to this many, each forgotten after 30
+    /// minutes without a blame. For each landed changeset that writes one,
+    /// a background loop extends its cached blame by one line diff, so the
+    /// next blame of it answers from the cache. 0 turns it off. Runs every
+    /// --warm-interval, in every --indexing mode (the rows are caches of this
+    /// server's own blames), and takes a `blame` read permit per pass.
+    #[arg(long, env = "LEEP_WARM_BLAME_PATHS", default_value_t = leep_derive::blame_warm::TRACKED_PATHS)]
+    warm_blame_paths: usize,
     /// Changesets a derivation of a missing range (the warmer's catch-up, or
     /// the first query over un-derived history) works on at once (ADR 0050).
     /// Default: the cores, up to 8.
@@ -1883,7 +1892,9 @@ async fn run() -> anyhow::Result<()> {
     repo = repo
         .with_land_fast_path(args.land_fast_path == Switch::On)
         .with_land_conflicts(land_conflicts(&args))
-        .with_lazy_create_trees(args.lazy_create_trees == Switch::On);
+        .with_lazy_create_trees(args.lazy_create_trees == Switch::On)
+        .with_blame_tracking(args.warm_blame_paths);
+    let read_limits = leep_server::read_limits::ReadLimits::new(&read_concurrency);
     leep_server::reload::warn_missing_refs(repo.meta().as_ref(), &config.current()).await;
     if args.request_timeout.is_zero() {
         tracing::warn!("request timeout disabled: gc --fence cannot be guaranteed safe");
@@ -1935,6 +1946,17 @@ async fn run() -> anyhow::Result<()> {
     }
     if let Some(w) = warm {
         w.spawn(args.warm_interval);
+    }
+    if args.warm_blame_paths > 0 && !args.warm_interval.is_zero() {
+        tracing::info!(
+            paths = args.warm_blame_paths,
+            "keeping blames of recently blamed files current (ADR 0083)"
+        );
+        let mut b = leep_derive::blame_warm::BlameWarmer::new(repo.clone());
+        if let Some(gate) = read_limits.blame_gate() {
+            b = b.with_gate(gate);
+        }
+        b.spawn(args.warm_interval);
     }
     match (args.background_repack, pack_store) {
         (Switch::On, Some(store)) => {
@@ -2010,7 +2032,7 @@ async fn run() -> anyhow::Result<()> {
         lazy_create_trees = repo.lazy_create_trees(),
         "creates' tree nodes (ADR 0069)"
     );
-    let mut app = leep_server::router_with_read_limits(
+    let mut app = leep_server::router_with_read_classes(
         repo,
         args.max_body_bytes,
         body_limits,
@@ -2020,7 +2042,7 @@ async fn run() -> anyhow::Result<()> {
             timeout: args.ready_timeout,
             ..Default::default()
         },
-        read_concurrency,
+        read_limits,
     );
     if let Some((_, http)) = &coordination {
         app = leep_server::coord::layer(app, http.clone());

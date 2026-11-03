@@ -263,8 +263,29 @@ pub fn router_with_read_limits(
     ready_options: ReadyOptions,
     read_concurrency: read_limits::ReadConcurrency,
 ) -> Router {
+    router_with_read_classes(
+        repo,
+        max_body_bytes,
+        body_limits,
+        request_timeout,
+        config,
+        ready_options,
+        read_limits::ReadLimits::new(&read_concurrency),
+    )
+}
+
+/// Like [`router_with_read_limits`], with read classes built by the caller,
+/// who shares them with the blame warmer (ADR 0083).
+pub fn router_with_read_classes(
+    repo: Repo,
+    max_body_bytes: usize,
+    body_limits: limits::BodyLimits,
+    request_timeout: Duration,
+    config: Arc<reload::ConfigHandle>,
+    ready_options: ReadyOptions,
+    read_limits: Arc<read_limits::ReadLimits>,
+) -> Router {
     register_ready_metrics();
-    let read_limits = read_limits::ReadLimits::new(&read_concurrency);
     let budget = limits::BodyBudget::new(body_limits);
     let repo = Arc::new(repo);
     let ready_state = Arc::new(ReadyProbe {

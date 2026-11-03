@@ -343,6 +343,21 @@ impl ReadLimits {
         })
     }
 
+    /// A gate for the blame warmer (ADR 0083): each pass with work takes a
+    /// `blame` permit, if one is free, so warming counts against the class
+    /// and waits while requests fill it. `None` when the class is off.
+    pub fn blame_gate(&self) -> Option<leep_derive::blame_warm::WarmGate> {
+        let class = self.blame.clone()?;
+        Some(Arc::new(move || {
+            class
+                .semaphore
+                .clone()
+                .try_acquire_owned()
+                .ok()
+                .map(|p| Box::new(p) as leep_derive::BlameHold)
+        }))
+    }
+
     /// The limited class a request belongs to, if any. Decided from the
     /// method, path and query alone, before any store is read.
     fn class_of(&self, method: &Method, uri: &Uri) -> Option<&Arc<Class>> {
@@ -605,5 +620,20 @@ mod tests {
         for u in ["/v1/search/main", "/v1/blame/x?path=a", "/v1/log/x?path=a"] {
             assert!(off.class_of(&Method::GET, &u.parse().unwrap()).is_none());
         }
+    }
+    /// The blame warmer's gate takes a `blame` permit while one is free and
+    /// gives it back when dropped; with the class off there is no gate.
+    #[test]
+    fn the_blame_gate_shares_the_blame_permits() {
+        let p = |s: &[&str]| ReadConcurrency::parse(s).unwrap();
+        let limits = ReadLimits::new(&p(&["blame=2"]));
+        let gate = limits.blame_gate().expect("a gate while blame is limited");
+        let a = gate().expect("a free permit");
+        let b = gate().expect("a second free permit");
+        assert!(gate().is_none(), "the class is full");
+        drop(a);
+        assert!(gate().is_some());
+        drop(b);
+        assert!(ReadLimits::new(&p(&["blame=off"])).blame_gate().is_none());
     }
 }
