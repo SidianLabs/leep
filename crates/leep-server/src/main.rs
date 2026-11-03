@@ -75,7 +75,8 @@ struct Args {
     /// leaders and their ref moves (ADR 0067), so request handlers holding
     /// every connection of the shared pool cannot queue the lands they wait
     /// for. Default: an eighth of --meta-pool-size, at least 4. 0 reserves
-    /// none (leaders share the pool). Opened on first use; SQLite ignores it.
+    /// none (leaders share the pool). Opened on first use beyond
+    /// --meta-pool-min; SQLite ignores it.
     #[arg(
         long,
         global = true,
@@ -87,7 +88,8 @@ struct Args {
     /// index warmer (ADR 0073), so queries scanning past a lagging index
     /// cannot starve the passes that close the lag. Default: a sixteenth of
     /// --meta-pool-size, at least 4. 0 reserves none (the warmer shares the
-    /// pool). Opened on first use; SQLite ignores it.
+    /// pool). Opened on first use beyond the one of --meta-pool-min;
+    /// SQLite ignores it.
     #[arg(
         long,
         global = true,
@@ -95,6 +97,19 @@ struct Args {
         value_parser = clap::value_parser!(u32).range(0..=10_000),
     )]
     meta_index_pool_size: Option<u32>,
+    /// Postgres connections the server opens at startup and keeps open
+    /// (ADR 0084), so its first requests, and the first after a quiet
+    /// spell, do not wait for connections: this many of --meta-pool-size
+    /// and of the land reserve, and one each of the index and lease pools.
+    /// Every server holds them, idle or not. 0 opens connections on first
+    /// use. Commands such as gc and migrate always do; SQLite ignores it.
+    #[arg(
+        long,
+        env = "LEEP_META_POOL_MIN",
+        default_value_t = leep_meta::DEFAULT_SERVER_POOL_MIN,
+        value_parser = clap::value_parser!(u32).range(0..=10_000),
+    )]
+    meta_pool_min: u32,
     /// Bytes the in-memory caches of derived indexes (path history, trees,
     /// search's directory filters, filtered log) may hold; the ancestry and
     /// skiplist caches scale with it. Separate from --cache-bytes, which
@@ -731,14 +746,15 @@ fn new_repo(blobs: Arc<dyn BlobStore>, meta: Arc<dyn leep_core::MetaStore>) -> R
 
 /// Open the metadata store, applying pending migrations unless `--no-migrate`.
 async fn open_meta(url: &str) -> leep_core::Result<Arc<dyn leep_core::MetaStore>> {
-    open_meta_bounded(url, None).await
+    open_meta_bounded(url, None, 0).await
 }
 
 /// [`open_meta`], with each Postgres data statement bounded by
-/// `statement_timeout`.
+/// `statement_timeout` and a warm floor of `min` connections (ADR 0084).
 async fn open_meta_bounded(
     url: &str,
     statement_timeout: Option<std::time::Duration>,
+    min: u32,
 ) -> leep_core::Result<Arc<dyn leep_core::MetaStore>> {
     let mode = if NO_MIGRATE.load(std::sync::atomic::Ordering::Relaxed) {
         leep_meta::SchemaMode::RequireCurrent
@@ -752,6 +768,7 @@ async fn open_meta_bounded(
     let lanes = leep_meta::LanePools {
         land: set(&META_LAND_POOL_SIZE),
         index: set(&META_INDEX_POOL_SIZE),
+        min,
     };
     leep_meta::open_meta_store_with_pools(url, mode, pool, lanes, statement_timeout).await
 }
@@ -1864,7 +1881,7 @@ async fn run() -> anyhow::Result<()> {
             ),
         }
     }
-    let meta = open_meta_bounded(&args.meta, bound)
+    let meta = open_meta_bounded(&args.meta, bound, args.meta_pool_min)
         .await
         .context("opening meta store")?;
     if let Some(v) = meta.schema_version().await? {
@@ -2521,6 +2538,21 @@ mod tests {
             .map(|e| e.to_string_lossy().into_owned())
             .collect();
         assert_eq!(listed, read, "{path} and the flags' variables differ");
+    }
+
+    /// A server keeps a warm floor of 4 by default; 0 turns it off. Only
+    /// the server takes the flag: commands open their stores lazily.
+    #[test]
+    fn meta_pool_min_parses() {
+        let a = parse_args(["leep-server"]).unwrap();
+        assert_eq!(a.meta_pool_min, leep_meta::DEFAULT_SERVER_POOL_MIN);
+        assert_eq!(a.meta_pool_min, 4);
+        let a = parse_args(["leep-server", "--meta-pool-min", "0"]).unwrap();
+        assert_eq!(a.meta_pool_min, 0);
+        let a = parse_args(["leep-server", "--meta-pool-min", "12"]).unwrap();
+        assert_eq!(a.meta_pool_min, 12);
+        assert!(parse_args(["leep-server", "--meta-pool-min", "-1"]).is_err());
+        assert!(parse_args(["leep-server", "gc", "--dry-run", "--meta-pool-min", "2"]).is_err());
     }
 
     /// The fast path is on and same-file overlaps merge unless configured.

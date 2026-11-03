@@ -1167,3 +1167,47 @@ async fn postgres_index_lane_sizes() {
     drop(held);
     assert_eq!(scope(Lane::Index, s.get_ref("main")).await.unwrap(), None);
 }
+
+/// A store opened with a warm floor (ADR 0084) has its connections open
+/// before its first query; one opened for a command keeps today's lazy
+/// pools: one data connection from the open, the rest on first use.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn postgres_warm_floor_opens_with_the_store() {
+    let Some(url) = pg_url() else {
+        return;
+    };
+    let s = PostgresMetaStore::connect_with_schema_and_floor(&url, &schema("floor"), 8, 3)
+        .await
+        .unwrap();
+    assert_eq!(s.land_pool_size(), 4);
+    // The open's own reads may have opened more data connections than the
+    // floor; the floor is a minimum.
+    let [data, land, index, lease] = s.open_connections();
+    assert!(data >= 3, "data {data}");
+    assert_eq!([land, index, lease], [3, 1, 1], "land, index, lease");
+    assert_eq!(s.get_ref("main").await.unwrap(), None);
+    assert_eq!(s.open_connections()[1..], [3, 1, 1]);
+    drop(s);
+
+    let s = PostgresMetaStore::connect_with_schema_and_floor(&url, &schema("floor"), 2, 9)
+        .await
+        .unwrap();
+    assert_eq!(
+        s.open_connections(),
+        [2, 4, 1, 1],
+        "a floor is capped by each pool's size"
+    );
+    assert_eq!(s.data_pool_floor(), 2);
+    drop(s);
+
+    let s = PostgresMetaStore::connect_with_schema(&url, &schema("floor"))
+        .await
+        .unwrap();
+    assert_eq!(s.open_connections()[1..], [0, 0, 0], "a lazy store");
+    assert_eq!(s.data_pool_floor(), 0);
+    let s = PostgresMetaStore::connect_with_schema_and_floor(&url, &schema("floor"), 8, 0)
+        .await
+        .unwrap();
+    assert_eq!(s.open_connections()[1..], [0, 0, 0], "a floor of 0 is lazy");
+    assert_eq!(s.data_pool_floor(), 0);
+}

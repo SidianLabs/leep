@@ -794,7 +794,13 @@ traffic. So do batch leaders
 the land lane (a task-local, `leep_core::lane`), and the Postgres
 store answers a task in that lane from a reserved pool
 (`--meta-land-pool-size`), so request handlers holding every shared
-connection cannot queue the batch they all wait for. A forwarded land is
+connection cannot queue the batch they all wait for. A server keeps a warm
+floor of connections open in every pool from startup on (`--meta-pool-min`,
+[ADR 0084](adr/0084-warm-floor-of-postgres-connections.md)): the store opens
+it before the listener binds and a keeper task tops it up after sqlx
+retires idle connections, so neither a fresh server's first requests nor the
+first after a quiet spell wait to connect; commands that open a store
+briefly keep their pools lazy. A forwarded land is
 never forwarded again. The leader of a batch is a
 spawned task, so a cancelled request cannot stop a batch; a land cancelled
 before its batch reached it is dropped, one already replayed lands.
