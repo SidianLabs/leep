@@ -36,6 +36,7 @@ pub mod owners;
 pub mod pack_order;
 mod path_history;
 mod prefetch;
+pub mod read_stats;
 mod renames;
 mod repo;
 pub mod review;

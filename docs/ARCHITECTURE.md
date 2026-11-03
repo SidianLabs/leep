@@ -314,6 +314,15 @@ still answers with an error status.
 The read-ahead never changes the answer: the heap, the `seen` set and the
 order are those of the plain walk, and whatever a batch did not return is read
 singly at the point the plain walk would read it.
+What a batch reads (parents, generations, root trees, and the generations
+skiplists name) goes into the ancestry cache, and a changeset whose parents
+the cache holds has them guessed at once, so a stretch this server walked or
+created before is asked for in one batch of changesets alone: a repeated
+`log limit=100` is one store call instead of 22 in 7 round trips (ADR 0082).
+`GET /v1/log/{rev}` and `GET /v1/changesets/{rev}` also take a revision and
+name the id it resolved to in `Leep-Resolved`, so the CLI asks for a ref's log
+in one request; these and `/v1/resolve` report their phases and metadata reads
+in `Server-Timing` (`leep_derive::read_stats`).
 
 **Path history.** `log --path P` and `GET /v1/last-change/{id}?path=P` read
 the `history-tree-v4` index instead of scanning ancestors (ADR 0013). A lookup
@@ -1135,6 +1144,12 @@ directories on the changed paths. The root tree of each changeset read or
 created is kept in the ancestry cache, so a listing or diff of a changeset
 seen before makes no metadata read for it. Verification and repair, which
 replace damaged rows as they go, read roots from the store each time.
+
+The client cache also keeps changesets as `GET /v1/changesets/{id}` answered
+them, under `changesets/` keyed by id and checked against it on read
+(ADR 0082), so `leep show` of a changeset shown before makes no request for
+it. Only display reads them; whether a server has a changeset is always asked
+of that server.
 
 The filesystem store has two layers of its own (ADR 0029):
 

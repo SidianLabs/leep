@@ -245,6 +245,15 @@ impl std::hash::Hasher for KeyHasher {
     }
 }
 
+/// What a batched read learned of one changeset, for
+/// [`Repo::remember_read`].
+pub(crate) struct RememberedRead {
+    pub(crate) id: ChangesetId,
+    pub(crate) parents: Option<Arc<[ChangesetId]>>,
+    pub(crate) generation: Option<u64>,
+    pub(crate) root: Option<Hash>,
+}
+
 #[derive(Clone, Default)]
 struct AncestryEntry {
     parents: Option<Arc<[ChangesetId]>>,
@@ -280,6 +289,23 @@ impl AncestryCache {
                 out
             }
             None => f(&AncestryEntry::default()),
+        }
+    }
+
+    /// [`AncestryCache::update`] of many entries under one lock.
+    fn update_many<F: FnOnce(&mut AncestryEntry)>(
+        &self,
+        items: impl IntoIterator<Item = (ChangesetId, F)>,
+    ) {
+        let mut m = self.inner.lock().unwrap();
+        for (id, f) in items {
+            let mut e = m
+                .new
+                .remove(&id)
+                .or_else(|| m.old.remove(&id))
+                .unwrap_or_default();
+            f(&mut e);
+            m.insert(id, e, self.limit);
         }
     }
 
@@ -1368,8 +1394,7 @@ impl Repo {
 
     /// Fetch a changeset; `NotFound` if absent.
     pub async fn get_changeset(&self, id: ChangesetId) -> Result<Changeset> {
-        self.meta
-            .get_changeset(&id)
+        crate::read_stats::round(1, self.meta.get_changeset(&id))
             .await?
             .ok_or_else(|| Error::NotFound(format!("changeset {id}")))
     }
@@ -1404,6 +1429,16 @@ impl Repo {
         self.note_root(id, root);
         self.remember_root(id, root);
         Ok(root)
+    }
+
+    /// Root tree of `id` if this process holds it, without a read; never
+    /// on a handle without the root cache.
+    pub(crate) fn cached_root(&self, id: ChangesetId) -> Option<Hash> {
+        if self.root_cache {
+            self.ancestry.get(&id, |e| e.root)
+        } else {
+            None
+        }
     }
 
     /// Keep `id`'s root tree for [`Repo::root_tree`], read or computed.
@@ -1510,6 +1545,25 @@ impl Repo {
     /// Keep parents a batched read returned, for later walks.
     pub(crate) fn remember_parents(&self, id: ChangesetId, parents: Arc<[ChangesetId]>) {
         self.ancestry.update(id, |e| e.parents = Some(parents));
+    }
+
+    /// Keep what a batched read gave, under one lock: per changeset its
+    /// parents, generation and root tree where known.
+    pub(crate) fn remember_read(&self, rows: Vec<RememberedRead>) {
+        let root_cache = self.root_cache;
+        self.ancestry.update_many(rows.into_iter().map(|r| {
+            (r.id, move |e: &mut AncestryEntry| {
+                if let Some(p) = r.parents {
+                    e.parents = Some(p);
+                }
+                if let Some(g) = r.generation {
+                    e.generation = Some(g);
+                }
+                if let (Some(t), true) = (r.root, root_cache) {
+                    e.root = Some(t);
+                }
+            })
+        }));
     }
 
     /// Keep a generation a batched read or a skiplist entry gave.
@@ -1825,16 +1879,22 @@ impl Repo {
 
     /// A ref, full id or short tag name, without suffixes.
     async fn resolve_name(&self, rev: &str) -> Result<Option<ChangesetId>> {
-        if let Some(id) = self.meta.get_ref(rev).await? {
+        if let Some(id) = crate::read_stats::round(1, self.meta.get_ref(rev)).await? {
             return Ok(Some(id));
         }
         if let Ok(id) = rev.parse::<ChangesetId>() {
-            if rev.len() == 64 && self.meta.get_changeset(&id).await?.is_some() {
+            if rev.len() == 64
+                && crate::read_stats::round(1, self.meta.get_changeset(&id))
+                    .await?
+                    .is_some()
+            {
                 return Ok(Some(id));
             }
         }
         if !refname::is_tag(rev) && refname::validate(rev).is_ok() {
-            if let Some(id) = self.meta.get_ref(&refname::tag_ref(rev)).await? {
+            if let Some(id) =
+                crate::read_stats::round(1, self.meta.get_ref(&refname::tag_ref(rev))).await?
+            {
                 return Ok(Some(id));
             }
         }

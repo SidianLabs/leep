@@ -2,6 +2,8 @@
 //! need, enough to exercise commit, checkout and land without a real server.
 
 #![allow(dead_code)]
+// Handler-shaped helpers return what the handlers do.
+#![allow(clippy::result_large_err)]
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::TcpListener;
@@ -60,6 +62,15 @@ pub struct Data {
     /// the marker text, so only the code can tell why. Off, the mock is a
     /// server from before codes.
     pub codes: bool,
+    /// Take only full ids in `/v1/log/{id}` and `/v1/changesets/{id}`,
+    /// like a server from before ADR 0082, which answers 400 for a name.
+    pub ids_only: bool,
+    /// Every changeset read by `GET /v1/changesets/{id}`, as asked for.
+    pub changeset_reads: Vec<String>,
+    /// `GET /v1/resolve/{rev}` requests answered.
+    pub resolves: usize,
+    /// The `{id}` of every `GET /v1/log/{id}`, as asked for.
+    pub log_heads: Vec<String>,
 }
 
 pub type Shared = Arc<Mutex<Data>>;
@@ -534,8 +545,43 @@ async fn reflog_one(
 /// A ref or full id, then git-style suffixes walked one parent at a time
 /// (ADR 0064), like the real server.
 async fn resolve(State(s): State<Shared>, Path(rev): Path<String>) -> Resp<ResolveResponse> {
+    let mut d = s.lock().unwrap();
+    d.resolves += 1;
+    Ok(Json(ResolveResponse {
+        id: resolve_in(&d, &rev)?,
+    }))
+}
+
+/// `{id}` of `/v1/log` and `/v1/changesets`: a full id, or (unless
+/// `ids_only`) a revision, with whether it was one.
+fn head_of(d: &Data, s: &str) -> Result<(ChangesetId, bool), (StatusCode, Json<ErrorResponse>)> {
+    if let Ok(id) = s.parse::<ChangesetId>() {
+        if s.len() == 64 {
+            return Ok((id, false));
+        }
+    }
+    if d.ids_only {
+        return Err(err(StatusCode::BAD_REQUEST, "bad id"));
+    }
+    Ok((resolve_in(d, s)?, true))
+}
+
+fn with_resolved<T: serde::Serialize>(
+    r: Resp<T>,
+    id: ChangesetId,
+    resolved: bool,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let mut resp = r.into_response();
+    if resolved {
+        resp.headers_mut()
+            .insert(RESOLVED_HEADER, id.to_string().parse().unwrap());
+    }
+    resp
+}
+
+fn resolve_in(d: &Data, rev: &str) -> Result<ChangesetId, (StatusCode, Json<ErrorResponse>)> {
     use leep_core::revision::{self, Step};
-    let d = s.lock().unwrap();
     let name = |n: &str| {
         d.refs.get(n).copied().or_else(|| {
             n.parse::<ChangesetId>()
@@ -544,10 +590,10 @@ async fn resolve(State(s): State<Shared>, Path(rev): Path<String>) -> Resp<Resol
         })
     };
     let missing = || err(StatusCode::NOT_FOUND, &format!("unknown revision {rev:?}"));
-    if let Some(id) = name(&rev) {
-        return Ok(Json(ResolveResponse { id }));
+    if let Some(id) = name(rev) {
+        return Ok(id);
     }
-    let (base, steps) = match revision::parse(&rev) {
+    let (base, steps) = match revision::parse(rev) {
         Ok(Some(p)) => p,
         Ok(None) => return Err(missing()),
         Err(e) => return Err(err(StatusCode::BAD_REQUEST, &e.to_string())),
@@ -563,7 +609,7 @@ async fn resolve(State(s): State<Shared>, Path(rev): Path<String>) -> Resp<Resol
             id = *d.changesets[&id].parents.get(nth).ok_or_else(missing)?;
         }
     }
-    Ok(Json(ResolveResponse { id }))
+    Ok(id)
 }
 
 /// Like the real server: one match, 400 with the candidates, or 404.
@@ -715,11 +761,22 @@ fn generation(d: &Data, id: ChangesetId) -> u64 {
     best
 }
 
-async fn get_changeset(State(s): State<Shared>, Path(id): Path<String>) -> Resp<ChangesetInfo> {
-    let id: ChangesetId = id
-        .parse()
-        .map_err(|_| err(StatusCode::BAD_REQUEST, "bad id"))?;
-    let d = s.lock().unwrap();
+async fn get_changeset(
+    State(s): State<Shared>,
+    Path(id): Path<String>,
+) -> axum::response::Response {
+    let mut d = s.lock().unwrap();
+    d.changeset_reads.push(id.clone());
+    match head_of(&d, &id) {
+        Ok((id, resolved)) => with_resolved(changeset_info(&d, id), id, resolved),
+        Err(e) => {
+            use axum::response::IntoResponse;
+            e.into_response()
+        }
+    }
+}
+
+fn changeset_info(d: &Data, id: ChangesetId) -> Resp<ChangesetInfo> {
     let cs = d
         .changesets
         .get(&id)
@@ -727,7 +784,7 @@ async fn get_changeset(State(s): State<Shared>, Path(id): Path<String>) -> Resp<
         .clone();
     Ok(Json(ChangesetInfo {
         id,
-        generation: generation(&d, id),
+        generation: generation(d, id),
         root_tree: Hash::of_blob(b""),
         changeset: cs,
         path_at: None,
@@ -1046,19 +1103,29 @@ async fn log(
     State(s): State<Shared>,
     Path(id): Path<String>,
     RawQuery(raw): RawQuery,
-) -> Resp<LogResponse> {
+) -> axum::response::Response {
     let mut d = s.lock().unwrap();
-    record(&mut d, "log", &raw);
-    let id: ChangesetId = id
-        .parse()
-        .map_err(|_| err(StatusCode::BAD_REQUEST, "bad id"))?;
+    d.log_heads.push(id.clone());
+    match head_of(&d, &id) {
+        Ok((id, resolved)) => {
+            record(&mut d, "log", &raw);
+            with_resolved(log_of(&d, id, &raw), id, resolved)
+        }
+        Err(e) => {
+            use axum::response::IntoResponse;
+            e.into_response()
+        }
+    }
+}
+
+fn log_of(d: &Data, id: ChangesetId, raw: &Option<String>) -> Resp<LogResponse> {
     if !d.changesets.contains_key(&id) {
         return Err(err(StatusCode::NOT_FOUND, "no such changeset"));
     }
-    let gen = generations(&d, id);
+    let gen = generations(d, id);
     let mut order: Vec<(u64, ChangesetId)> = gen.iter().map(|(c, g)| (*g, *c)).collect();
     order.sort_unstable_by(|a, b| b.cmp(a));
-    let q = pairs(&raw);
+    let q = pairs(raw);
     let mut entries = Vec::new();
     for (generation, c) in order {
         let cs = d.changesets[&c].clone();
@@ -1093,7 +1160,7 @@ async fn log(
         .iter()
         .find(|(k, _)| k == "after")
         .map(|(_, v)| v.as_str());
-    let (entries, next) = page(&d, entries, limit, after);
+    let (entries, next) = page(d, entries, limit, after);
     Ok(Json(LogResponse {
         entries,
         next,

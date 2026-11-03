@@ -10,7 +10,7 @@
 //! | GET  | `/v1/blobs/{hash}` | – | raw bytes, or 404 |
 //! | POST | `/v1/blobs/missing` | [`MissingBlobsRequest`] | [`MissingBlobsResponse`]; 400 if over [`MAX_MISSING_BLOBS`] hashes |
 //! | POST | `/v1/changesets` | [`Changeset`] | [`CreateChangesetResponse`] |
-//! | GET  | `/v1/changesets/{id}` | – | [`ChangesetInfo`] |
+//! | GET  | `/v1/changesets/{id}` | – | [`ChangesetInfo`] (`id` may also be a revision as for `/v1/resolve/{rev}`, with `/` sent as `%2F`; the answer then carries [`RESOLVED_HEADER`]; ADR 0082) |
 //! | GET  | `/v1/refs` | – | [`RefsResponse`] |
 //! | GET  | `/v1/refs/{name}` | – | [`RefResponse`] |
 //! | POST | `/v1/refs/{name}` | [`CasRefRequest`] | [`CasRefResponse`] (409 if it lost) |
@@ -21,7 +21,7 @@
 //! | GET  | `/v1/tree/{id}?path=dir` | – | [`TreeResponse`] (one directory level) |
 //! | GET  | `/v1/files/{id}?prefix=dir&limit=n&after=cursor` | – | [`FilesResponse`] (recursive listing, sorted by path; without `limit` the whole listing, as before; `limit` is capped at [`MAX_PATHS_LIMIT`], 0 or not a number is 400; `after` is a page cursor) |
 //! | GET  | `/v1/file/{id}?path=p` | – | raw bytes + `x-leep-kind` header, or 404 |
-//! | GET  | `/v1/log/{id}?path=p&limit=n&author=a&extra=k:v` | – | [`LogResponse`] (newest first; `limit` defaults to 100, capped at 10000). `author` is a case-insensitive substring; `extra` repeats, is ANDed, and is `key:value` (exact) or `key` (present). `limit` counts matches. With `path` the walk follows the path-history index; without it, or for `author` and `extra`, a selective filter scans changesets linearly. `follow=true` (needs a file `path`; 400 otherwise) continues the history of a renamed file under its old name and marks entries with `path_at` and `renamed` (ADR 0016). `after` is a page cursor. `fields=summary` answers [`LogSummaryResponse`] instead: the same entries, cursors and fields, each entry a [`LogSummaryEntry`] (the message's first line, `agent.*` keys, the number of changed paths, no paths); `fields=full` is the default; anything else is 400 |
+//! | GET  | `/v1/log/{id}?path=p&limit=n&author=a&extra=k:v` | – | [`LogResponse`] (newest first; `limit` defaults to 100, capped at 10000). `author` is a case-insensitive substring; `extra` repeats, is ANDed, and is `key:value` (exact) or `key` (present). `limit` counts matches. With `path` the walk follows the path-history index; without it, or for `author` and `extra`, a selective filter scans changesets linearly. `follow=true` (needs a file `path`; 400 otherwise) continues the history of a renamed file under its old name and marks entries with `path_at` and `renamed` (ADR 0016). `after` is a page cursor. `fields=summary` answers [`LogSummaryResponse`] instead: the same entries, cursors and fields, each entry a [`LogSummaryEntry`] (the message's first line, `agent.*` keys, the number of changed paths, no paths); `fields=full` is the default; anything else is 400. `id` may also be a revision as for `/v1/resolve/{rev}`, with `/` sent as `%2F`: the answer then carries [`RESOLVED_HEADER`], and later pages are asked for by that id (ADR 0082) |
 //! | GET  | `/v1/last-change/{id}?path=p` | – | [`LastChangeResponse`] (the newest changeset reachable from `id` that changed file or directory `p`, answered from the path-history index; a deleted path answers with the deleting changeset; 404 if `p` never existed) |
 //! | GET  | `/v1/diff?from=a&to=b&prefix=dir&renames=bool&rename_threshold=n&limit=n&after=cursor` | – | [`DiffResponse`] (`from` omitted = empty tree; `renames=true` adds detected renames, `rename_threshold` is 0 to 100 and defaults to 50, anything else is 400; ADR 0016. `limit` and `after` page `entries` as for `/v1/files`; each rename rides on the page holding its `to` entry) |
 //! | GET  | `/v1/blame/{id}?path=p` | – | [`BlameResponse`] (with per-changeset [`ChangesetSummary`]) |
@@ -115,6 +115,14 @@
 //! 503, `stale-ok` an answer at the newest indexed first-parent ancestor
 //! (`answered_at`, `behind`), and no header a wait, a larger scan, then 503.
 //! Successful indexed reads carry [`INDEX_SCANNED_HEADER`].
+//!
+//! # Server-Timing
+//!
+//! `GET /v1/log`, `/v1/changesets/{id}` and `/v1/resolve` answer with a
+//! `Server-Timing` header naming their phases (`resolve`, `walk` or
+//! `fetch`, `encode`) and their metadata reads (`db`, `resolve-db`, with
+//! the store calls and round trips in `desc`), for diagnosis only: the
+//! names may change and clients must not depend on them (ADR 0082).
 //! Hashes and ids are lowercase hex in JSON.
 //!
 //! # Pagination
@@ -418,6 +426,12 @@ pub const INDEXING_STALE_OK: &str = "stale-ok";
 /// Response header of an indexed read: changesets (or, for search, files)
 /// without index rows that the answer examined directly.
 pub const INDEX_SCANNED_HEADER: &str = "leep-index-scanned";
+
+/// Response header of `GET /v1/log/{rev}` and `GET /v1/changesets/{rev}`
+/// when `rev` was not a full id: the changeset it resolved to (ADR 0082).
+/// A client paging such a log asks for later pages by this id, since a
+/// cursor belongs to the query on the id.
+pub const RESOLVED_HEADER: &str = "leep-resolved";
 
 /// Response header of a `503` `unavailable` that a Leep server answered
 /// before doing any work (ADR 0060), so the request may be sent again as it

@@ -115,7 +115,7 @@ pub async fn derive<K: DerivedKind>(repo: &Repo, id: ChangesetId) -> Result<Byte
     if let Some(v) = staged_value(repo, K::NAME, id) {
         return Ok(v);
     }
-    if let Some(v) = repo.meta().get_derived(K::NAME, &id.0).await? {
+    if let Some(v) = crate::read_stats::round(1, repo.meta().get_derived(K::NAME, &id.0)).await? {
         return Ok(v);
     }
     refuse_in_bounded_query(repo, K::NAME)?;

@@ -122,3 +122,70 @@ fn the_cli_takes_suffixes_in_diff_show_and_checkout() {
     let out = run(&["show", "main~x"]);
     assert_eq!(out.status.code(), Some(1));
 }
+
+/// A log or show of a revision is one request (ADR 0082): the server
+/// resolves it. A server that takes only ids answers 400, and the CLI
+/// resolves it first as before. A changeset shown before comes from the
+/// cache.
+#[test]
+fn log_and_show_of_a_revision_are_one_request() {
+    for ids_only in [false, true] {
+        let mock = Mock::start();
+        mock.data.lock().unwrap().ids_only = ids_only;
+        let [c1, c2, c3] = seed_chain(&mock);
+        let (cache, dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let run = |args: &[&str]| leep(cache.path(), dir.path(), &mock.url, args);
+        let counts = || {
+            let d = mock.data.lock().unwrap();
+            let logs = d.queries.iter().filter(|(p, _)| p == "log").count();
+            (d.resolves, logs, d.changeset_reads.len())
+        };
+        let resolves = |n: usize| if ids_only { n } else { 0 };
+
+        let out = ok(&run(&["log", "--oneline", "main~1"]));
+        assert_eq!(out.lines().count(), 2, "{out}");
+        assert!(out.starts_with(&c2.to_string()[..8]), "{out}");
+        assert_eq!(counts(), (resolves(1), 1, 0), "ids only: {ids_only}");
+
+        let v: serde_json::Value =
+            serde_json::from_str(&ok(&run(&["--json", "log", "-n", "1", "main"]))).unwrap();
+        assert_eq!(v["entries"][0]["id"], c3.to_string());
+        assert_eq!(counts(), (resolves(2), 2, 0));
+
+        let v: serde_json::Value =
+            serde_json::from_str(&ok(&run(&["--json", "show", "main~2"]))).unwrap();
+        assert_eq!(v["id"], c1.to_string());
+        let reads = if ids_only { 2 } else { 1 };
+        assert_eq!(counts(), (resolves(3), 2, reads));
+        // By id, again: from the cache.
+        let id = c1.to_string();
+        let v: serde_json::Value =
+            serde_json::from_str(&ok(&run(&["--json", "show", &id]))).unwrap();
+        assert_eq!(v["id"], id);
+        assert_eq!(counts(), (resolves(3), 2, reads));
+
+        // Unknown names and short ids still resolve as before, with hints.
+        let out = run(&["log", "nope"]);
+        assert_eq!(out.status.code(), Some(4));
+        assert!(String::from_utf8_lossy(&out.stderr).contains("leep refs"));
+        let short = &c2.to_string()[..10];
+        let out = ok(&run(&["log", "--oneline", short]));
+        assert_eq!(out.lines().count(), 2, "{out}");
+    }
+}
+
+/// Later pages of a revision's log are asked for by the id the first page
+/// named, which the cursors belong to.
+#[test]
+fn later_log_pages_use_the_resolved_id() {
+    let mock = Mock::start();
+    let [_, _, c3] = seed_chain(&mock);
+    mock.data.lock().unwrap().page_cap = Some(1);
+    let client = Client::new(&mock.url);
+    let q = leep_cli::client::LogQuery::default();
+    let (log, id) = client.log_all_at("main", &q, 3).unwrap();
+    assert_eq!(log.entries.len(), 3);
+    assert_eq!(id, Some(c3));
+    let c3 = c3.to_string();
+    assert_eq!(mock.data.lock().unwrap().log_heads, ["main", &c3, &c3]);
+}

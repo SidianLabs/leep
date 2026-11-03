@@ -20,10 +20,11 @@ pub mod read_limits;
 pub mod reload;
 pub mod review;
 pub mod signing;
+pub mod timing;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
@@ -37,6 +38,7 @@ use leep_core::api::*;
 use leep_core::rename::RenameOptions;
 use leep_core::{Changeset, ChangesetId, Error, FileKind, Hash, RefUpdateContext, RepoPath};
 use leep_derive::indexing::{Answered, Freshness};
+use leep_derive::read_stats;
 use leep_derive::{search, ExtraMatch, LogFilter, LogParams, PrefixMatch, Repo, SearchQuery};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -875,8 +877,51 @@ async fn create_changeset(State(repo): S, body: Bytes) -> ApiResult<Json<CreateC
     Ok(Json(CreateChangesetResponse { id }))
 }
 
-async fn get_changeset(State(repo): S, Path(id): Path<String>) -> ApiResult<Json<ChangesetInfo>> {
-    Ok(Json(repo.info(cid(&id)?).await?))
+/// `{id}` of a read endpoint that also takes a revision (ADR 0082): a full
+/// id as it is, else whatever `/v1/resolve/{rev}` resolves, so a client
+/// asking for a ref saves the round trip of resolving it first. Says
+/// whether it resolved; the time and reads that took go into `timing`.
+async fn id_or_rev(
+    repo: &Repo,
+    s: &str,
+    timing: &mut timing::ServerTiming,
+) -> ApiResult<(ChangesetId, bool)> {
+    if s.len() == 64 {
+        if let Ok(id) = s.parse() {
+            return Ok((id, false));
+        }
+    }
+    let started = Instant::now();
+    let (id, reads) = read_stats::measure(repo.resolve(s)).await;
+    timing
+        .phase("resolve", started.elapsed())
+        .reads("resolve-db", reads);
+    Ok((id?, true))
+}
+
+/// `resp` naming the changeset a revision resolved to ([`RESOLVED_HEADER`]).
+fn with_resolved(mut resp: Response, id: ChangesetId, resolved: bool) -> Response {
+    if resolved {
+        if let Ok(v) = HeaderValue::from_str(&id.to_string()) {
+            resp.headers_mut().insert(RESOLVED_HEADER, v);
+        }
+    }
+    resp
+}
+
+async fn get_changeset(State(repo): S, Path(id): Path<String>) -> ApiResult<Response> {
+    let mut timing = timing::ServerTiming::new();
+    let (id, resolved) = id_or_rev(&repo, &id, &mut timing).await?;
+    let started = Instant::now();
+    let (info, reads) = read_stats::measure(repo.info(id)).await;
+    let info = info?;
+    timing.phase("fetch", started.elapsed()).reads("db", reads);
+    let started = Instant::now();
+    let resp = Json(info).into_response();
+    timing.phase("encode", started.elapsed());
+    let mut resp = with_resolved(resp, id, resolved);
+    timing.apply(&mut resp);
+    Ok(resp)
 }
 
 /// The config snapshot the request started with.
@@ -1236,10 +1281,16 @@ async fn ref_log_one(
     ref_log(&repo, Some(&name), q).await
 }
 
-async fn resolve(State(repo): S, Path(rev): Path<String>) -> ApiResult<Json<ResolveResponse>> {
-    Ok(Json(ResolveResponse {
-        id: repo.resolve(&rev).await?,
-    }))
+async fn resolve(State(repo): S, Path(rev): Path<String>) -> ApiResult<Response> {
+    let started = Instant::now();
+    let (id, reads) = read_stats::measure(repo.resolve(&rev)).await;
+    let mut timing = timing::ServerTiming::new();
+    timing
+        .phase("resolve", started.elapsed())
+        .reads("db", reads);
+    let mut resp = Json(ResolveResponse { id: id? }).into_response();
+    timing.apply(&mut resp);
+    Ok(resp)
 }
 
 /// A short id: 200 with the one match, or 400 listing the candidates.
@@ -1317,26 +1368,31 @@ async fn log(
     Query(pairs): Query<Vec<(String, String)>>,
 ) -> ApiResult<Response> {
     let q = LogQuery::parse(pairs)?;
+    let mut timing = timing::ServerTiming::new();
+    let (id, resolved) = id_or_rev(&repo, &id, &mut timing).await?;
     let limit = q.limit.unwrap_or(DEFAULT_LOG_LIMIT).min(MAX_LOG_LIMIT);
     let params = LogParams {
         path: q.path,
         follow: q.follow,
         filter: q.filter,
     };
+    let started = Instant::now();
+    let (answer, reads) = read_stats::measure(repo.log_page_indexed(
+        id,
+        &params,
+        limit,
+        q.after.as_deref(),
+        freshness(&headers),
+    ))
+    .await;
     let Answered {
         value: page,
         answered_at,
         behind,
         scanned,
-    } = repo
-        .log_page_indexed(
-            cid(&id)?,
-            &params,
-            limit,
-            q.after.as_deref(),
-            freshness(&headers),
-        )
-        .await?;
+    } = answer?;
+    timing.phase("walk", started.elapsed()).reads("db", reads);
+    let started = Instant::now();
     let tail = LogTail {
         next: page.next,
         answered_at,
@@ -1349,7 +1405,11 @@ async fn log(
             log_json(entries, tail)
         }
     };
-    Ok(with_scanned(resp, scanned))
+    // A long log streams: this is only the first chunks' share.
+    timing.phase("encode", started.elapsed());
+    let mut resp = with_resolved(with_scanned(resp, scanned), id, resolved);
+    timing.apply(&mut resp);
+    Ok(resp)
 }
 
 /// Entries one task encodes of a long log.

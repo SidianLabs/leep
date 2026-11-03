@@ -172,19 +172,29 @@ impl From<AnyLog> for LogSummaryResponse {
 /// One log page: entries, `next`, `answered_at`, `behind`.
 type LogPageParts<E> = (Vec<E>, Option<String>, Option<ChangesetId>, Option<u64>);
 
-/// Up to `want` entries of the log `q` asks for, from pages that `fetch`
-/// reads, each continuing at the previous one's cursor.
+/// Up to `want` entries of the log of `head` that `q` asks for, from pages
+/// that `fetch` reads, each continuing at the previous one's cursor. A
+/// page that names the id `head` resolved to ([`RESOLVED_HEADER`]) has
+/// later pages asked for by that id, which the cursor belongs to. Returns
+/// that id too, if a page named it.
 fn pages<E>(
+    head: &str,
     q: &LogQuery,
     want: usize,
-    fetch: impl Fn(&LogQuery) -> Result<LogPageParts<E>>,
-) -> Result<LogPageParts<E>> {
+    fetch: impl Fn(&str, &LogQuery) -> Result<(LogPageParts<E>, Option<ChangesetId>)>,
+) -> Result<(LogPageParts<E>, Option<ChangesetId>)> {
     let mut q = q.clone();
+    let mut head = head.to_string();
+    let mut resolved = None;
     let mut out: LogPageParts<E> = (Vec::new(), None, None, None);
     loop {
         let left = want - out.0.len();
         q.limit = Some(left.min(LOG_PAGE as usize) as u32);
-        let (entries, next, answered_at, behind) = fetch(&q)?;
+        let ((entries, next, answered_at, behind), id) = fetch(&head, &q)?;
+        if let Some(id) = id.filter(|_| resolved.is_none()) {
+            resolved = Some(id);
+            head = id.to_string();
+        }
         out.0.extend(entries);
         out.1 = next;
         // Later pages continue the walk the first one pinned.
@@ -193,7 +203,7 @@ fn pages<E>(
             out.3 = behind;
         }
         if out.0.len() >= want || out.1.is_none() {
-            return Ok(out);
+            return Ok((out, resolved));
         }
         q.after = out.1.clone();
     }
@@ -324,6 +334,23 @@ fn enc(s: &str) -> String {
     out
 }
 
+/// Percent-encode one URL path segment: [`enc`] that also encodes `/`, for
+/// a revision in `/v1/log/{rev}` or `/v1/changesets/{rev}` (ADR 0082).
+fn enc_segment(s: &str) -> String {
+    enc(s).replace('/', "%2F")
+}
+
+/// The changeset a revision resolved to, if the server says
+/// ([`RESOLVED_HEADER`]).
+fn resolved_of(resp: &Response) -> Option<ChangesetId> {
+    resp.headers()
+        .get(RESOLVED_HEADER)?
+        .to_str()
+        .ok()?
+        .parse()
+        .ok()
+}
+
 /// How long an idle pooled connection is kept. Below the server's default
 /// `--header-read-timeout` (30 s), which closes an HTTP/1.1 connection idle
 /// that long, so a long-running client (leep-mcp, the git mirror) does not
@@ -387,6 +414,12 @@ impl Client {
     /// the server answers that its index is behind, for at most
     /// `LEEP_INDEX_WAIT` in all.
     fn indexed<T: DeserializeOwned>(&self, make: impl Fn() -> RequestBuilder) -> Result<T> {
+        self.indexed_send(make)?.json::<T>().map_err(bad_response)
+    }
+
+    /// [`Client::indexed`], answering the response itself, for callers
+    /// that also read its headers.
+    fn indexed_send(&self, make: impl Fn() -> RequestBuilder) -> Result<Response> {
         let value = if self.stale_ok {
             INDEXING_STALE_OK
         } else {
@@ -395,7 +428,7 @@ impl Client {
         let started = std::time::Instant::now();
         let (limit, mut retries) = self.index_retry.unwrap_or((index_wait(), u32::MAX));
         loop {
-            match self.json(make().header(INDEXING_HEADER, value)) {
+            match self.send(make().header(INDEXING_HEADER, value)) {
                 Err(e) if e.kind() == ErrorKind::Indexing => {
                     let wait = Duration::from_millis(e.retry_after_ms().unwrap_or(1000))
                         .clamp(Duration::from_millis(100), MAX_RETRY_WAIT)
@@ -603,6 +636,16 @@ impl Client {
 
     pub fn get_changeset(&self, id: &ChangesetId) -> Result<ChangesetInfo> {
         self.json(self.http.get(self.url(&format!("/v1/changesets/{id}"))))
+    }
+
+    /// [`Client::get_changeset`] of a full id or of a revision the server
+    /// resolves (ADR 0082). A server from before that answers 400 for
+    /// anything but a full id.
+    pub fn get_changeset_at(&self, head: &str) -> Result<ChangesetInfo> {
+        self.json(
+            self.http
+                .get(self.url(&format!("/v1/changesets/{}", enc_segment(head)))),
+        )
     }
 
     /// Attest to a changeset with an already-signed request.
@@ -839,40 +882,73 @@ impl Client {
     }
 
     pub fn log(&self, id: &ChangesetId, q: &LogQuery) -> Result<LogResponse> {
-        let params = q.params_for(false);
-        self.indexed(|| {
-            self.http
-                .get(self.url(&format!("/v1/log/{id}")))
-                .query(&params)
-        })
+        Ok(self.log_at(&id.to_string(), q)?.0)
+    }
+
+    /// [`Client::log`] of a full id or of a revision the server resolves
+    /// (ADR 0082), with the id it resolved to if it says. A server from
+    /// before that answers 400 for anything but a full id.
+    pub fn log_at(&self, head: &str, q: &LogQuery) -> Result<(LogResponse, Option<ChangesetId>)> {
+        self.log_page_at(head, q, false)
     }
 
     /// [`Client::log`] without each changeset's changed paths, which a
     /// listing does not show and which make most of a full log's bytes.
     pub fn log_summary(&self, id: &ChangesetId, q: &LogQuery) -> Result<LogSummaryResponse> {
-        let params = q.params_for(true);
-        let any: AnyLog = self.indexed(|| {
+        Ok(self.log_summary_at(&id.to_string(), q)?.0)
+    }
+
+    /// [`Client::log_summary`] of a revision, as [`Client::log_at`].
+    pub fn log_summary_at(
+        &self,
+        head: &str,
+        q: &LogQuery,
+    ) -> Result<(LogSummaryResponse, Option<ChangesetId>)> {
+        let (any, id): (AnyLog, _) = self.log_page_at(head, q, true)?;
+        Ok((any.into(), id))
+    }
+
+    fn log_page_at<T: DeserializeOwned>(
+        &self,
+        head: &str,
+        q: &LogQuery,
+        summary: bool,
+    ) -> Result<(T, Option<ChangesetId>)> {
+        let params = q.params_for(summary);
+        let resp = self.indexed_send(|| {
             self.http
-                .get(self.url(&format!("/v1/log/{id}")))
+                .get(self.url(&format!("/v1/log/{}", enc_segment(head))))
                 .query(&params)
         })?;
-        Ok(any.into())
+        let id = resolved_of(&resp);
+        Ok((resp.json::<T>().map_err(bad_response)?, id))
     }
 
     /// Up to `want` log entries, following page cursors past the server's
     /// per-request cap. `next` is set if the log goes on. A server without
     /// cursors answers one page.
     pub fn log_all(&self, id: &ChangesetId, q: &LogQuery, want: usize) -> Result<LogResponse> {
-        let (entries, next, answered_at, behind) = pages(q, want, |q| {
-            let p = self.log(id, q)?;
-            Ok((p.entries, p.next, p.answered_at, p.behind))
+        Ok(self.log_all_at(&id.to_string(), q, want)?.0)
+    }
+
+    /// [`Client::log_all`] of a revision, as [`Client::log_at`].
+    pub fn log_all_at(
+        &self,
+        head: &str,
+        q: &LogQuery,
+        want: usize,
+    ) -> Result<(LogResponse, Option<ChangesetId>)> {
+        let ((entries, next, answered_at, behind), id) = pages(head, q, want, |head, q| {
+            let (p, id) = self.log_at(head, q)?;
+            Ok(((p.entries, p.next, p.answered_at, p.behind), id))
         })?;
-        Ok(LogResponse {
+        let resp = LogResponse {
             entries,
             next,
             answered_at,
             behind,
-        })
+        };
+        Ok((resp, id))
     }
 
     /// [`Client::log_all`] with summary entries.
@@ -882,16 +958,27 @@ impl Client {
         q: &LogQuery,
         want: usize,
     ) -> Result<LogSummaryResponse> {
-        let (entries, next, answered_at, behind) = pages(q, want, |q| {
-            let p = self.log_summary(id, q)?;
-            Ok((p.entries, p.next, p.answered_at, p.behind))
+        Ok(self.log_summary_all_at(&id.to_string(), q, want)?.0)
+    }
+
+    /// [`Client::log_summary_all`] of a revision, as [`Client::log_at`].
+    pub fn log_summary_all_at(
+        &self,
+        head: &str,
+        q: &LogQuery,
+        want: usize,
+    ) -> Result<(LogSummaryResponse, Option<ChangesetId>)> {
+        let ((entries, next, answered_at, behind), id) = pages(head, q, want, |head, q| {
+            let (p, id) = self.log_summary_at(head, q)?;
+            Ok(((p.entries, p.next, p.answered_at, p.behind), id))
         })?;
-        Ok(LogSummaryResponse {
+        let resp = LogSummaryResponse {
             entries,
             next,
             answered_at,
             behind,
-        })
+        };
+        Ok((resp, id))
     }
 
     /// Newest change to a file or directory, from the server's path index.

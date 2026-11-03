@@ -51,6 +51,24 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   method and pool. `leep-land-bench --json`, and statements per land, pool
   peaks, discarded attempts and server-side shed reads in `leep-swarm`'s
   report.
+### Short logs in fewer round trips
+- **Changed.** The history walk keeps the parents, root trees and
+  generations it reads in the ancestry cache and asks for a stretch it has
+  walked or created before in one batch: a repeated `log limit=100` on a
+  100,000-changeset history is one store call instead of 22 in 7 round
+  trips, 4.5-5.4 ms instead of 9.7-12.6 ms on the server (ADR 0082). Log
+  bodies are unchanged, byte for byte.
+- **Added.** `GET /v1/log/{rev}` and `GET /v1/changesets/{rev}` take a
+  revision as `/v1/resolve` does (`/` as `%2F`) and name the changeset in a
+  `Leep-Resolved` header, so `leep log main`, `leep show main~1` and a log
+  outside a working copy make one request instead of two; against an older
+  server the CLI resolves first, as before.
+- **Added.** `Server-Timing` on `GET /v1/log`, `/v1/changesets/{id}` and
+  `/v1/resolve`: phases, and the metadata store calls and round trips.
+- **Added.** `leep show` keeps changesets in the local cache, keyed by id
+  and checked on read, and does not ask again for one shown before.
+  End to end, `leep log -n 100` went from 17-20 ms to 10-15 ms on a warm
+  local server.
 
 ### Lands on a deep history read skiplists a level at a time
 - **Changed.** A land batch reads the skiplist rows its copies are built

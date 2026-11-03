@@ -1904,6 +1904,63 @@ reads make the walk 2 to 4 times slower, 3 to 4 us per changeset. Against about
 0.1 ms per Postgres round trip saved per changeset, that is the right trade
 for any real backend.
 
+### Short logs in fewer round trips (ADR 0082)
+
+What one agent waits for on `leep log -n 100`. 100,000 changesets of linear
+history from `leep-history-gen` (default tree, 52 changesets a second on a
+shared box), local Postgres 16 over TCP on loopback (`shared_buffers=1GB`),
+filesystem blobs, release builds of main (#254) and of this change, server
+with `--warm-interval 0`, on a 4-vCPU sandbox shared with another build
+(load average 1.5 to 3). Server times are curl's `time_total` for
+`GET /v1/log/{head}?limit=100`; "first" is the first request to a freshly
+started server, three starts each; "repeat" the median of seven more.
+Store calls come from the new `Server-Timing` header; Postgres
+transactions from `pg_stat_database.xact_commit` around one request.
+
+| | Before | After |
+|---|---|---|
+| Server, first request | 24, 30, 42 ms | 25, 19, 64 ms |
+| Server, first request: store calls / rounds | | 22 / 7 |
+| Server, repeat | 9.7, 12.6, 12.5 ms | 4.5, 4.5, 5.4 ms |
+| Server, repeat: store calls / rounds | about 22 / 7 | 1 / 1 |
+| Server, repeat: Postgres transactions | 27, 32, 27 | 3, 3, 3 |
+| Server, `limit=10000` repeat | 0.27-0.30 s | 0.13-0.19 s |
+
+End to end, `leep` processes timed from Python (median of 21; starting
+`/bin/true` costs 1.7 ms the same way), two rounds:
+
+| | Before | After |
+|---|---|---|
+| `leep log -n 100`, no working copy (target ref) | 19.9, 19.0 ms | 11.6, 14.7 ms |
+| `leep log -n 100 --oneline main` | 18.7, 17.3 ms | 9.5, 12.7 ms |
+| `leep log -n 100 <id>` | 17.0, 17.2 ms | 11.0, 12.6 ms |
+| `leep --json show <id>`, shown before | 6.8, 6.7 ms | 4.8, 5.7 ms |
+| `leep log -n 100` on a server just started | 40-53 ms | 33-75 ms |
+| requests per `leep log -n 100 main` | 2 | 1 |
+| `git log -n 100`, same shape of history | 6.5, 6.1 ms | |
+
+Where the time went, from `Server-Timing` on the new server:
+
+- **Repeat:** the walk is one read of 100 changesets, 1.8-2.4 ms of the
+  2.0-3.1 ms walk (rows, decoding and the id check); encoding 0.2-0.3 ms.
+  Before, the read-ahead knew only the generations it had seen, so every
+  request learned its window again along the skiplists, 7 rounds.
+- **First request to a fresh server:** 16-58 ms of store time in 7 rounds.
+  The same server's first log of another stretch (`main~30000`, pool
+  connections open, caches cold) took 11-21 ms, so about 10-15 ms of the
+  first request is opening Postgres connections, and the rest is 2-3 ms a
+  round on rows not in the cache. The new code does not change this;
+  keeping pool connections open from the start would.
+- **Client:** `leep --version` takes 3.2 ms and `leep log -n 1` against a
+  warm server 8.1 ms; `leep log -n 100` 12 ms. Against the new server, the
+  old CLI's log of an id took about as long as the new one's: the end to end
+  gain is the server's, plus one request (2-3 ms) for a log or show of a
+  name.
+
+Bodies were compared with the old server's, byte for byte: `limit` 1, 100,
+300 (at `main~45000`), 5,000 and 10,000, `fields=summary`, and a second page
+from a cursor.
+
 ### Full history with chunked nodes, warming and batched log
 
 The whole of git/git again, on the same VPS, after ADRs 0027 (chunked nodes),
