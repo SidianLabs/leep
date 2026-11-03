@@ -30,6 +30,20 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   `blame` operation budget is 10 + 3 per version, from 9 + 3).
 - **Added.** `leep-swarm --blame-hot <share>` sends that share of blames
   to the hot files.
+### Servers keep a warm floor of Postgres connections
+- **Added.** `--meta-pool-min` (`LEEP_META_POOL_MIN`, default 4): a server
+  opens this many connections of its Postgres data pool and of the land
+  reserve, and one each of the index and lease pools, before it starts
+  serving, and keeps them open while idle (ADR 0084). A fresh server's first
+  requests, and the first after ten quiet minutes, no longer wait to
+  connect (numbers in docs/PERFORMANCE.md, "Warm floor of Postgres
+  connections"). Startup waits at most 10 s for the floor, then starts
+  anyway; a keeper tops it up every 30 s. `0` restores the lazy pools.
+  Commands (`gc`, `repack`, `migrate`, `backup`, ...) stay lazy.
+- **Upgrading.** Every server now holds 10 connections even when idle (at
+  the defaults; the maxima are unchanged): count them against Postgres's
+  `max_connections`, or lower the floor where many servers share a small
+  database.
 
 ### Replaced packs are retired durably
 - **Fixed.** A server restarted while its background merges waited for

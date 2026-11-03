@@ -2052,6 +2052,53 @@ Bodies were compared with the old server's, byte for byte: `limit` 1, 100,
 300 (at `main~45000`), 5,000 and 10,000, `fields=summary`, and a second page
 from a cursor.
 
+### Warm floor of Postgres connections (ADR 0084)
+
+The first requests of a server, with and without its pools' warm floor.
+5,000 changesets of linear history from `leep-history-gen` (`--files
+2000`), local Postgres 16 over TCP on loopback (`shared_buffers=1GB`),
+filesystem blobs, a release build of this change with `--warm-interval 0`
+and `--meta-pool-min 0` (the lazy pools of before; the open path is
+otherwise the same) or `4` (the default), on a 4-vCPU sandbox shared with
+other builds (load average 1.5 to 3). Times are curl's `time_total`; `db` is
+the store time from `Server-Timing` (ADR 0082). "Fresh" is the first
+request to a server that has just answered `/v1/health`, ten starts each
+for `log`, five for a create (`POST /v1/changesets` of an empty changeset
+on the head), floors alternating.
+
+| | Floor 0 | Floor 4 |
+|---|---|---|
+| Connections held after start (pg_stat_activity) | 1 | 10 |
+| Start to `/v1/health` | 41-59 ms | 43-85 ms (the floor opens in 17-31 ms) |
+| Fresh: first `log/main?limit=100`, median (range) | 18.4 ms (16.1-25.7) | 12.4 ms (9.8-15.8) |
+| Fresh: its `db` time, median | 14.8 ms | 7.5 ms |
+| Fresh: repeat `log` | 4-8 ms | 4-8 ms |
+| Fresh: first create | 11-31 ms | 14-28 ms |
+| After 21 idle minutes: connections held | 0 | 10 |
+| After 21 idle minutes: first `log` | 18.7, 20.7 ms (`db` 8.2, 9.4) | 6.2, 10.1 ms (`db` 3.2, 4.9) |
+| After 21 idle minutes: first create | 18.5, 24.4 ms | 7.6, 10.5 ms |
+| After 21 idle minutes: repeat | 4.0-5.5 ms | 5.1-7.3 ms |
+
+- **Fresh `log`:** the walk's 22 store calls run up to 8 at a time over 7
+  rounds, so a lazy pool opened about 5 connections inside the request.
+  With the floor it opens none; the 7 ms of store time left is rows not yet
+  in Postgres's or the server's caches.
+- **Fresh create:** no change, within the noise. A create's calls run one
+  after another, and the lazy pool already had the connection the open's
+  own queries left.
+- **Cold backends.** Without the table touch of ADR 0084 (Decision 5) the
+  first create was 3-7 ms slower with a floor than without (16-20 ms
+  against 11-13 ms, five starts each): sqlx hands idle connections out in
+  turn, so each statement met a backend that had not yet loaded the
+  catalog entries of its tables (1-2 ms a table, measured in `psql`).
+- **After a quiet spell:** four servers (log and create, each floor) were
+  warmed with three requests each and left idle; two rounds. sqlx's reaper
+  runs every 10 minutes and closes connections idle for 10, so the lazy
+  pools were closed at the 20th minute and their next request reopened
+  them, while the floors were reopened by sqlx in the background (10
+  connections throughout). The caches stayed warm, so here the whole
+  difference, 9-14 ms, is connecting.
+
 ### Full history with chunked nodes, warming and batched log
 
 The whole of git/git again, on the same VPS, after ADRs 0027 (chunked nodes),

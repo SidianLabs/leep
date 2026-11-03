@@ -18,6 +18,7 @@ mod drop;
 pub mod features;
 mod leases;
 pub mod migrate;
+mod pool_floor;
 mod postgres;
 pub mod snapshot;
 pub mod space;
@@ -91,6 +92,11 @@ pub fn default_index_pool_size(pool_size: u32) -> u32 {
     (pool_size / 16).max(4)
 }
 
+/// A server's warm floor by default (ADR 0084): 4 data connections, so 4
+/// of the land reserve and one each of the index and lease pools, 10 in
+/// all.
+pub const DEFAULT_SERVER_POOL_MIN: u32 = 4;
+
 /// Postgres connections reserved beyond the data pool, per lane: `None`
 /// reserves the default, `Some(0)` none.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -99,6 +105,11 @@ pub struct LanePools {
     pub land: Option<u32>,
     /// The index warmer (ADR 0073); default [`default_index_pool_size`].
     pub index: Option<u32>,
+    /// The warm floor (ADR 0084): connections opened with the store and
+    /// kept open, `min` of the data pool and of the land reserve and one of
+    /// the index and lease pools. 0, the default, opens each on first use,
+    /// right for a store opened for one command; a server keeps a floor.
+    pub min: u32,
 }
 
 /// [`open_meta_store_with_options`], with `land_pool_size` Postgres
@@ -114,7 +125,7 @@ pub async fn open_meta_store_with_lanes(
 ) -> Result<Arc<dyn MetaStore>> {
     let lanes = LanePools {
         land: land_pool_size,
-        index: None,
+        ..LanePools::default()
     };
     open_meta_store_with_pools(url, mode, pool_size, lanes, statement_timeout).await
 }
@@ -139,12 +150,13 @@ pub async fn open_meta_store_with_pools(
             .index
             .unwrap_or_else(|| default_index_pool_size(pool_size));
         Ok(Arc::new(
-            PostgresMetaStore::connect_with_pools(
+            PostgresMetaStore::connect_with_floor(
                 url,
                 mode,
                 pool_size,
                 land,
                 index,
+                lanes.min,
                 statement_timeout,
             )
             .await?,

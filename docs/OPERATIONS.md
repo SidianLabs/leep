@@ -1494,6 +1494,7 @@ apply to the server and to its tools (`verify`, `repair`, `upgrade-index`,
 | `--meta-pool-size` / `LEEP_META_POOL_SIZE` | 16 | Connections this process opens to a Postgres metadata store for requests, derivation and tools. SQLite ignores it. |
 | `--meta-land-pool-size` / `LEEP_META_LAND_POOL_SIZE` | an eighth of `--meta-pool-size`, at least 4 | Further Postgres connections reserved for land leaders (ADR 0067), opened on first use. `0` reserves none. SQLite ignores it. |
 | `--meta-index-pool-size` / `LEEP_META_INDEX_POOL_SIZE` | a sixteenth of `--meta-pool-size`, at least 4 | Further Postgres connections reserved for the index warmer (ADR 0073), opened on first use (only by a server that warms). `0` reserves none. SQLite ignores it. |
+| `--meta-pool-min` / `LEEP_META_POOL_MIN` | 4 | The server's warm floor (ADR 0084): connections opened at startup and kept open, this many of `--meta-pool-size` and of the land reserve and one each of the index and lease pools (10 at the default). `0` opens every connection on first use. Server only: commands (`gc`, `repack`, `migrate`, `backup`, ...) always open lazily. SQLite ignores it. |
 | `--derive-cache-bytes` / `LEEP_DERIVE_CACHE_BYTES` | 440401920 (420 MiB) | The in-memory caches of derived indexes: path-history nodes, parts and roots (148 MiB), tree nodes (32 MiB), nodes of unstored trees derived on read (16 MiB, ADR 0069), search's directory filters (64 MiB), skiplists read by blame and filtered logs (32 MiB), and the filtered-log caches (128 MiB). The ancestry and skiplist caches are bounded by entries, about 100 MB together by default, and scale by the same factor. |
 
 `--cache-bytes` (256 MiB) is separate: it caches blobs.
@@ -1548,6 +1549,25 @@ allocators (musl, macOS, Windows) are unaffected.
   (a server with defaults opens at most 16 + 4 + 2 lease connections).
   `0` returns to one shared pool. `leep_meta_pool_connections` shows how
   full each pool is.
+- **Warm floor.** A server opens `--meta-pool-min` connections of the
+  data pool and of the land reserve, and one of the index and lease pools,
+  before it binds its listener, and keeps them open while idle (ADR 0084).
+  Without them a fresh server's first log spent about 10-15 ms connecting,
+  and so did the first request after 10 quiet minutes (sqlx closes idle
+  connections). These connections are held all the time, not only under
+  load: with defaults a server holds 10 of its 26 at all times, so N
+  servers hold 10 N even when idle. The maxima above still bound the sum
+  against `max_connections`; lower the floor (or set `0`) where many
+  servers share a small database. Startup waits at most 10 s for the
+  floor: past that, or if a connection fails, the server logs `could not
+  open the pool's warm floor` or `... took too long` and starts anyway,
+  and a background keeper tops the floor up every 30 s. A database that
+  cannot be reached at all still fails the start as before: the first
+  connection is retried for sqlx's 30 s acquire timeout, then the server
+  exits with `opening meta store`. A server
+  ready on `GET /v1/ready` has therefore opened its floor or logged why
+  not; `leep_meta_pool_connections` shows each pool's idle connections
+  from startup on.
 - **Index reserve.** The warmer's loops (and the tasks their derivations
   spawn) draw on a pool of their own, `--meta-index-pool-size`
   connections (default a sixteenth of `--meta-pool-size`, at least 4;

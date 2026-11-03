@@ -297,7 +297,8 @@ there is nothing left to serve. Nothing is corrupted: the check only reads.
    store.
 3. `meta`: Postgres up and accepting connections (`pg_isready`), connection slots
    (`SELECT count(*) FROM pg_stat_activity` against `max_connections`; each server
-   holds a pool of 16), locks and long transactions, disk full. SQLite: the file
+   may open up to 16 + 4 + 4 + 2 at the defaults and holds a warm floor of 10
+   even when idle), locks and long transactions, disk full. SQLite: the file
    is on local disk with space and not locked by a long job (`database is locked`).
 4. `blobs`: filesystem mounted and not read-only (`df -h`, `touch` as the server's
    user), or for S3, the bucket, endpoint, credentials and clock skew.

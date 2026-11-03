@@ -95,6 +95,13 @@ const LOG_LOCK: i64 = 7164738;
 /// claim or release.
 const LEASE_POOL_SIZE: u32 = 2;
 
+/// Planned on each new connection of a warm floor, to load the catalog
+/// entries of the tables data calls use; returns no row.
+const TOUCH_DATA: &str = "SELECT 1 FROM changesets, refs, ref_log, derived LIMIT 0";
+
+/// [`TOUCH_DATA`] for the lease pool.
+const TOUCH_LEASES: &str = "SELECT 1 FROM leases LIMIT 0";
+
 pub struct PostgresMetaStore {
     pub(crate) pool: PgPool,
     /// Data calls of tasks in [`Lane::Land`] (ADR 0067): land leaders and
@@ -120,6 +127,9 @@ pub struct PostgresMetaStore {
     pub(crate) has_stored_at: bool,
     /// Whether the schema has `store_features` (ADR 0055).
     pub(crate) has_features: bool,
+    /// Tops the pools up to their warm floor (ADR 0084); `None` without
+    /// one.
+    pub(crate) keeper: Option<crate::pool_floor::Keeper>,
 }
 
 impl PostgresMetaStore {
@@ -189,8 +199,49 @@ impl PostgresMetaStore {
             data: pool_size,
             land: land_pool_size,
             index: index_pool_size,
+            min: 0,
         };
         Self::open(url, None, mode, MIGRATIONS, pools, statement_timeout).await
+    }
+
+    /// [`connect_with_pools`](Self::connect_with_pools), keeping a warm
+    /// floor of connections open in every pool from the start (ADR 0084):
+    /// `min` in the data pool and up to `min` in the land pool, one in the
+    /// index pool and one in the lease pool. 0 opens each on first use, as
+    /// a store opened for one command should.
+    pub async fn connect_with_floor(
+        url: &str,
+        mode: SchemaMode,
+        pool_size: u32,
+        land_pool_size: u32,
+        index_pool_size: u32,
+        min: u32,
+        statement_timeout: Option<Duration>,
+    ) -> Result<Self> {
+        let pools = Pools {
+            data: pool_size,
+            land: land_pool_size,
+            index: index_pool_size,
+            min,
+        };
+        Self::open(url, None, mode, MIGRATIONS, pools, statement_timeout).await
+    }
+
+    /// [`connect_with_floor`](Self::connect_with_floor) in `schema`, for
+    /// tests of the floor.
+    #[doc(hidden)]
+    pub async fn connect_with_schema_and_floor(
+        url: &str,
+        schema: &str,
+        pool_size: u32,
+        min: u32,
+    ) -> Result<Self> {
+        let pools = Pools {
+            min,
+            ..Pools::new(pool_size)
+        };
+        let schema = Some(schema.to_string());
+        Self::open(url, schema, SchemaMode::Migrate, MIGRATIONS, pools, None).await
     }
 
     /// A store in `schema` with the given pool sizes, for tests of the land
@@ -224,6 +275,7 @@ impl PostgresMetaStore {
             data: pool_size,
             land: land_pool_size,
             index: index_pool_size,
+            min: 0,
         };
         let schema = Some(schema.to_string());
         Self::open(url, schema, SchemaMode::Migrate, MIGRATIONS, pools, None).await
@@ -298,6 +350,7 @@ impl PostgresMetaStore {
             url,
             schema.map(str::to_string),
             crate::DEFAULT_POSTGRES_POOL_SIZE,
+            0,
             None,
         )
         .await?;
@@ -327,7 +380,15 @@ impl PostgresMetaStore {
         pools: Pools,
         statement_timeout: Option<Duration>,
     ) -> Result<Self> {
-        let pool = Self::pool(url, schema.clone(), pools.data, statement_timeout).await?;
+        let floor = pools.floor();
+        let pool = Self::pool(
+            url,
+            schema.clone(),
+            pools.data,
+            floor.data,
+            statement_timeout,
+        )
+        .await?;
         let report = Self::run(&pool, migrations, mode == SchemaMode::Migrate).await?;
         if mode == SchemaMode::RequireCurrent {
             migrate::require_current(&report)?;
@@ -338,27 +399,95 @@ impl PostgresMetaStore {
         // Bounded like the data pool: the leader's statements were on it
         // before, and the same runaway statement would hold a connection.
         let land_pool = (pools.land > 0).then(|| {
-            Self::options(schema.clone(), pools.land, statement_timeout)
-                .connect_lazy_with(opts.clone())
+            Self::options(
+                schema.clone(),
+                pools.land,
+                floor.land,
+                statement_timeout,
+                TOUCH_DATA,
+            )
+            .connect_lazy_with(opts.clone())
         });
         // Bounded too: the warmer's statements were on the data pool.
         let index_pool = (pools.index > 0).then(|| {
-            Self::options(schema.clone(), pools.index, statement_timeout)
-                .connect_lazy_with(opts.clone())
+            Self::options(
+                schema.clone(),
+                pools.index,
+                floor.index,
+                statement_timeout,
+                TOUCH_DATA,
+            )
+            .connect_lazy_with(opts.clone())
         });
-        let lease_pool = Self::options(schema, LEASE_POOL_SIZE, None).connect_lazy_with(opts);
+        let lease_pool = Self::options(schema, LEASE_POOL_SIZE, floor.lease, None, TOUCH_LEASES)
+            .connect_lazy_with(opts);
         let mut store = Self::with_pool(pool, lease_pool, migrations);
         store.land_pool = land_pool;
         store.index_pool = index_pool;
         crate::features::check(&store.features().await?)?;
         store.load_dicts().await?;
+        if pools.min > 0 {
+            let floors = store.floors(floor);
+            crate::pool_floor::fill_all(&floors, crate::pool_floor::OPEN_TIMEOUT).await;
+            store.keeper = Some(crate::pool_floor::spawn_keeper(floors));
+        }
         Ok(store)
+    }
+
+    /// Each pool with its warm floor (ADR 0084).
+    fn floors(&self, floor: Floor) -> Vec<crate::pool_floor::Floor> {
+        use crate::pool_floor::Floor as F;
+        let mut floors = vec![F {
+            name: "data",
+            pool: self.pool.clone(),
+            min: floor.data,
+        }];
+        if let Some(pool) = &self.land_pool {
+            floors.push(F {
+                name: "land",
+                pool: pool.clone(),
+                min: floor.land,
+            });
+        }
+        if let Some(pool) = &self.index_pool {
+            floors.push(F {
+                name: "index",
+                pool: pool.clone(),
+                min: floor.index,
+            });
+        }
+        floors.push(F {
+            name: "lease",
+            pool: self.lease_pool.clone(),
+            min: floor.lease,
+        });
+        floors
+    }
+
+    /// The data pool's warm floor, for tests: 0 when it opens on first use.
+    #[doc(hidden)]
+    pub fn data_pool_floor(&self) -> u32 {
+        self.pool.options().get_min_connections()
+    }
+
+    /// Open connections per pool, for tests of the warm floor: data, land,
+    /// index and lease (0 for a lane pool the store does not have).
+    #[doc(hidden)]
+    pub fn open_connections(&self) -> [u32; 4] {
+        let size = |p: &Option<PgPool>| p.as_ref().map_or(0, PgPool::size);
+        [
+            self.pool.size(),
+            size(&self.land_pool),
+            size(&self.index_pool),
+            self.lease_pool.size(),
+        ]
     }
 
     async fn pool(
         url: &str,
         schema: Option<String>,
         max: u32,
+        min: u32,
         statement_timeout: Option<Duration>,
     ) -> Result<PgPool> {
         let opts = PgConnectOptions::from_str(url).map_err(storage)?;
@@ -377,26 +506,39 @@ impl PostgresMetaStore {
             .map_err(storage)?;
             admin.close().await;
         }
-        Self::options(schema, max, statement_timeout)
-            .connect_with(opts)
-            .await
-            .map_err(storage)
+        // `connect_with` would open a floor of `min` as part of the open and
+        // fail it for a floor short of its goal; one connection proves the
+        // database is there, and the floor is opened with the others.
+        let pool =
+            Self::options(schema, max, min, statement_timeout, TOUCH_DATA).connect_lazy_with(opts);
+        drop(pool.acquire().await.map_err(storage)?);
+        Ok(pool)
     }
 
     /// `statement_timeout` is set per connection because sqlx never cancels
     /// a statement whose future is dropped: without it, a query of a request
     /// cut off by the server's request timeout runs on in Postgres to the
     /// end, holding its connection and locks.
+    ///
+    /// A pool with a warm floor (`min` > 0) also plans `touch` on each new
+    /// connection: a backend loads a table's catalog entries on its first
+    /// statement on it, 1-2 ms a table, and the floor's connections would
+    /// otherwise each pay that inside a request (ADR 0084).
     fn options(
         schema: Option<String>,
         max: u32,
+        min: u32,
         statement_timeout: Option<Duration>,
+        touch: &'static str,
     ) -> PgPoolOptions {
         let timeout = statement_timeout
             .filter(|t| !t.is_zero())
             .map(|t| format!("SET statement_timeout = {}", t.as_millis().max(1)));
+        // sqlx reopens a connection of the floor right after its reaper
+        // closes one; `pool_floor` opens it at the start.
         PgPoolOptions::new()
             .max_connections(max.max(1))
+            .min_connections(min.min(max.max(1)))
             .after_connect(move |conn, _| {
                 let set = schema
                     .as_ref()
@@ -410,6 +552,11 @@ impl PostgresMetaStore {
                         sqlx::query(AssertSqlSafe(timeout))
                             .execute(&mut *conn)
                             .await?;
+                    }
+                    if min > 0 {
+                        // Fails before the first migration; the connection
+                        // is fine either way.
+                        let _ = sqlx::raw_sql(touch).execute(&mut *conn).await;
                     }
                     Ok(())
                 })
@@ -578,6 +725,8 @@ pub(crate) struct Pools {
     data: u32,
     land: u32,
     index: u32,
+    /// The warm floor (ADR 0084); 0 opens every pool on first use.
+    min: u32,
 }
 
 impl Pools {
@@ -586,8 +735,42 @@ impl Pools {
             data,
             land: crate::default_land_pool_size(data),
             index: crate::default_index_pool_size(data),
+            min: 0,
         }
     }
+
+    /// Connections kept open per pool: `min` of the data pool and of the
+    /// land reserve (all of it at the defaults: one land leader per ref
+    /// and its ref move), and one each of the index and lease pools, whose
+    /// single loops use one at a time.
+    fn floor(&self) -> Floor {
+        let m = self.min;
+        Floor {
+            data: m.min(self.data.max(1)),
+            land: m.min(self.land),
+            index: m.min(1).min(self.index),
+            lease: m.min(1),
+        }
+    }
+}
+
+/// See [`Pools::floor`].
+#[derive(Debug, Clone, Copy)]
+struct Floor {
+    data: u32,
+    land: u32,
+    index: u32,
+    lease: u32,
+}
+
+/// Bring `leep_meta_pool_connections` for pool `name` up to date.
+pub(crate) fn pool_gauges(name: &'static str, pool: &PgPool) {
+    let size = pool.size();
+    let idle = u32::try_from(pool.num_idle()).unwrap_or(u32::MAX).min(size);
+    metrics::gauge!("leep_meta_pool_connections", "pool" => name, "state" => "in_use")
+        .set(f64::from(size - idle));
+    metrics::gauge!("leep_meta_pool_connections", "pool" => name, "state" => "idle")
+        .set(f64::from(idle));
 }
 
 impl PostgresMetaStore {
@@ -602,12 +785,7 @@ impl PostgresMetaStore {
             (Lane::Index, _, Some(index)) => ("index", index),
             _ => ("data", &self.pool),
         };
-        let size = pool.size();
-        let idle = u32::try_from(pool.num_idle()).unwrap_or(u32::MAX).min(size);
-        metrics::gauge!("leep_meta_pool_connections", "pool" => name, "state" => "in_use")
-            .set(f64::from(size - idle));
-        metrics::gauge!("leep_meta_pool_connections", "pool" => name, "state" => "idle")
-            .set(f64::from(idle));
+        pool_gauges(name, pool);
         metrics::counter!("leep_meta_statements_total", "op" => op, "pool" => name).increment(1);
         pool
     }
@@ -653,6 +831,7 @@ impl PostgresMetaStore {
             has_stored_at: migrations
                 .iter()
                 .any(|m| m.version >= crate::STORED_AT_SCHEMA_VERSION),
+            keeper: None,
         }
     }
 
