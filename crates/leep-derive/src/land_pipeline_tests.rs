@@ -382,6 +382,10 @@ async fn a_failed_flush_ahead_drops_the_batch_staged_behind() {
     let (r, meta, blobs) = held_repo();
     let (_, ids) = build(&r, &script).await;
     r.land(ids[0], "main").await.unwrap();
+    // o's answer comes before its batch task ends: a land arriving in that
+    // window would replay behind o's finished commit and be recorded as
+    // speculated, which this test does not expect.
+    wait_for(|| r.land_queues.idle("main")).await;
     blobs.puts.send_replace(false);
     let ta = land(&r, ids[1]);
     wait_for(|| blobs.waiting_puts.load(Ordering::SeqCst) == 1).await;
