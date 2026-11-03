@@ -171,6 +171,12 @@ pub struct Repo {
     /// Search derivations in flight, by tree root, shared by clones (see
     /// `Repo::tree_row_unstored`).
     pub(crate) search_flights: Arc<crate::search::index::Flights>,
+    /// Blames running detached, by changeset and path, shared by clones
+    /// (ADR 0078).
+    pub(crate) blame_flights: Arc<crate::blame_flight::BlameFlights>,
+    /// Versions a blame replays between checkpoints (ADR 0078); tests make
+    /// it small.
+    pub(crate) blame_checkpoint_every: usize,
 }
 
 /// Whether a derivation may go on writing rows: the index lease it derives
@@ -628,6 +634,8 @@ impl Repo {
             node_memo: None,
             search_pool: None,
             search_flights: Arc::default(),
+            blame_flights: Arc::default(),
+            blame_checkpoint_every: crate::blame::CHECKPOINT_EVERY,
         }
     }
 

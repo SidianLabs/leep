@@ -1130,19 +1130,36 @@ impl Repo {
         path: &RepoPath,
         freshness: Freshness,
     ) -> Result<Answered<BlameResponse>> {
+        self.blame_indexed_held(id, path, freshness, None).await
+    }
+
+    /// [`Repo::blame_indexed`] with the blame itself detached
+    /// ([`Repo::blame_held`], ADR 0078), keeping `hold` until it ends. A
+    /// request that joins a running blame reports none of its scanned
+    /// changesets, which the request that started it counts.
+    pub async fn blame_indexed_held(
+        &self,
+        id: ChangesetId,
+        path: &RepoPath,
+        freshness: Freshness,
+        hold: Option<crate::BlameHold>,
+    ) -> Result<Answered<BlameResponse>> {
         let started = Instant::now();
         let route = Route::Blame;
         match self
             .plan(route, freshness, id, Need::Chain(id), true, started)
             .await?
         {
-            Plan::Inline => Ok(Answered::fresh(self.blame(id, path).await?)),
+            Plan::Inline => Ok(Answered::fresh(self.blame_held(id, path, hold).await?)),
             Plan::At {
                 at,
                 bounded,
                 behind,
             } => {
-                let value = self.with_bounded(bounded.clone()).blame(at, path).await?;
+                let value = self
+                    .with_bounded(bounded.clone())
+                    .blame_held(at, path, hold)
+                    .await?;
                 Ok(Answered {
                     value,
                     answered_at: (at != id).then_some(at),

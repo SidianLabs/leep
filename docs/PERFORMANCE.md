@@ -941,7 +941,43 @@ swarm it did not help:
   demand-driven seeding rule (files blamed or read recently) and a CPU
   priority between warm groups, history first.
 
-### One indexer per kind (ADR 0058), local smoke test
+### Long blames past the request timeout (ADR 0078)
+
+On a 1M-changeset linear history, a cold blame of a file with about 10,000
+changers took about 61 s against a 25 s `--request-timeout`. Every retry
+started again from nothing and timed out again. Blames now run detached,
+and requests for the same blame join them, and long replays cache a
+checkpoint every 256 versions.
+
+Local Postgres 16 (unix socket), filesystem blobs, release build:
+`crates/leep-server/tests/blame_past_timeout.rs` (ignored; see its header).
+The hot file has 3,000 versions (1,000 to 2,500 lines) in a 12,000-changeset
+linear history, with 3 changesets of other files between its versions, and
+the history index already derived. Two runs:
+
+| Measure | Run 1 | Run 2 |
+|---|---|---|
+| Cold blame, new process | 618 ms | 549 ms |
+| Cold blame again, new process, Postgres warm | 565 ms | 539 ms |
+| Cached blame | 35 ms | 30 ms |
+| Rows written by one blame | 12 (773 KB): 11 checkpoints and the answer | same |
+| Process killed after 5 checkpoints; new process resumes | 430 ms | 421 ms |
+| Request timeout at 40% of cold, retried at once | 408, 408, 200: answered after 571 ms | 408, 408, 200: 525 ms |
+
+- **Retry after a timeout.** The retries join the blame that is still
+  running, and the answer comes at about the cold time. Before this
+  change every attempt took the full cold time and ran into the timeout.
+  Scaled to the 1M case (61 s against 25 s), the third attempt should
+  get the answer after about 61 s, instead of no attempt ever getting it.
+- **Resume from checkpoints.** A new process starts from the newest
+  checkpoint, so it walks and replays only the versions above it. That
+  saved about a quarter of the time here. The fixed costs (the tip's
+  lookup, the index root, cold skiplist caches, the changeset summaries)
+  and the walk above the checkpoint are paid again.
+- **Rows.** One row per 256 versions, each the size of one blame: about
+  64 KB here at 1,000 to 2,500 lines.
+
+
 
 `leep-swarm` on this branch, release build, a fresh Postgres 16 database
 (fsync off) and blob directory per run, everything on one shared 4-vCPU

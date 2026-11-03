@@ -555,11 +555,29 @@ async fn blame_and_log_permits_are_released_on_error_and_dropped_answers() {
     }
 }
 
+/// The first answer to `uri` that is not a read-class refusal, within ten
+/// seconds: a detached blame gives its permit back when it ends, a moment
+/// after the request that started it.
+async fn until_admitted(app: &Router, uri: &str) -> Reply {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let r = get(app, uri).await;
+        if r.headers.get(REFUSED_HEADER).is_none() {
+            return r;
+        }
+        assert!(std::time::Instant::now() < deadline, "{uri} still refused");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// A filtered log's permit is released when its client cancels. A blame
+/// goes on detached (ADR 0078) and keeps its permit until it ends, so the
+/// class still counts it, then gives it back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn blame_and_log_permits_are_released_when_the_client_cancels() {
     for i in 0..2 {
         let r = rig_with(one_each(), Duration::from_secs(60)).await;
-        let (uri, _) = heavy(&r)[i].clone();
+        let (uri, class) = heavy(&r)[i].clone();
         r.gate.armed_all.store(true, Ordering::SeqCst);
         let (app, u) = (r.app.clone(), uri.clone());
         let stalled = tokio::spawn(async move { get(&app, &u).await });
@@ -568,16 +586,25 @@ async fn blame_and_log_permits_are_released_when_the_client_cancels() {
 
         stalled.abort();
         assert!(stalled.await.unwrap_err().is_cancelled());
+        if class == "blame" {
+            assert_refused(&get(&r.app, &uri).await);
+        }
         r.gate.open();
-        assert_eq!(get(&r.app, &uri).await.status, StatusCode::OK, "{uri}");
+        assert_eq!(
+            until_admitted(&r.app, &uri).await.status,
+            StatusCode::OK,
+            "{uri}"
+        );
     }
 }
 
+/// As for a cancel: a timed-out filtered log gives its permit back at once,
+/// a timed-out blame when it has finished in the background.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn blame_and_log_permits_are_released_when_a_request_times_out() {
     for i in 0..2 {
         let r = rig_with(one_each(), Duration::from_millis(300)).await;
-        let (uri, _) = heavy(&r)[i].clone();
+        let (uri, class) = heavy(&r)[i].clone();
         r.gate.armed_all.store(true, Ordering::SeqCst);
         let (app, u) = (r.app.clone(), uri.clone());
         let stalled = tokio::spawn(async move { get(&app, &u).await });
@@ -585,8 +612,15 @@ async fn blame_and_log_permits_are_released_when_a_request_times_out() {
         assert_refused(&get(&r.app, &uri).await);
 
         assert_eq!(stalled.await.unwrap().status, StatusCode::REQUEST_TIMEOUT);
+        if class == "blame" {
+            assert_refused(&get(&r.app, &uri).await);
+        }
         r.gate.open();
-        assert_eq!(get(&r.app, &uri).await.status, StatusCode::OK, "{uri}");
+        assert_eq!(
+            until_admitted(&r.app, &uri).await.status,
+            StatusCode::OK,
+            "{uri}"
+        );
     }
 }
 

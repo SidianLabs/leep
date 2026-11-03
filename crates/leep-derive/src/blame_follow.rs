@@ -17,6 +17,12 @@
 //! from), and the blame at each walk's start is cached once it is complete,
 //! so a blame that stops at [`FOLLOW_WALKS`] leaves the oldest part of the
 //! graph cached and the next request starts its walks above it.
+//!
+//! A long replay also leaves checkpoints (ADR 0078): every so many versions
+//! on the blamed changeset's first-parent line, the complete blame there is
+//! cached as that changer's blame, so a blame cut short (a restart, or one
+//! computed inline whose request was dropped) walks and replays only above
+//! the newest checkpoint next time, instead of from the file's creation.
 
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashMap, HashSet};
@@ -62,6 +68,19 @@ pub(crate) struct Graph {
     /// Where walks started, by the version they reached: their blames are
     /// cached there once complete.
     starts: Vec<(ChangesetId, usize)>,
+    /// Versions replayed between checkpoints (0: none); see
+    /// [`Repo::replay_graph`].
+    checkpoint_every: usize,
+}
+
+/// What [`Repo::replay_graph`] did besides the blame.
+pub(crate) struct ReplayStats {
+    /// No bound cut the blame or anything it is made from.
+    pub(crate) complete: bool,
+    /// Versions diffed, not counting cached blames.
+    pub(crate) replayed: usize,
+    /// Checkpoints written.
+    pub(crate) checkpoints: usize,
 }
 
 /// A changer's version of the file, or a cached blame.
@@ -462,6 +481,7 @@ impl Repo {
             walks: b.walks,
             cache,
             starts: b.walked,
+            checkpoint_every: self.blame_checkpoint_every,
         })
     }
 
@@ -657,13 +677,25 @@ impl Repo {
     /// long chain holds two windows. A version that is not UTF-8 makes the
     /// versions descending from it by first parents fail, and is not
     /// followed into from a merge or rename (the merge keeps those lines).
+    ///
+    /// The replay goes by generation, so once a version is replayed its
+    /// lines are its complete blame, if no bound cut it. After every
+    /// `checkpoint_every` versions replayed, the next complete version on
+    /// the top's first-parent line (through renames) is cached as a
+    /// checkpoint (ADR 0078): the walk of a later blame of the top stops at
+    /// it, and so does its replay. The top itself is cached by the caller.
     pub(crate) async fn replay_graph(
         &self,
         mut g: Graph,
         path: &RepoPath,
-    ) -> Result<(Replayed, bool)> {
+    ) -> Result<(Replayed, ReplayStats)> {
+        let mut stats = ReplayStats {
+            complete: true,
+            replayed: 0,
+            checkpoints: 0,
+        };
         if let Some(c) = g.nodes[g.top].cached.take() {
-            return Ok((Replayed::Cached(c), true));
+            return Ok((Replayed::Cached(c), stats));
         }
         let n = g.nodes.len();
         let mut left = vec![0usize; n];
@@ -698,6 +730,16 @@ impl Repo {
                     .chain(node.sides.iter().map(|(_, s)| s))
                     .all(|&d| complete[d]);
         }
+        // The top's first-parent line, which a later blame of the top walks
+        // first: a checkpoint is found there.
+        let mut on_line = vec![false; n];
+        let mut x = Some(g.top);
+        while let Some(i) = x.filter(|&i| !on_line[i]) {
+            on_line[i] = true;
+            x = nodes[i].base;
+        }
+        let every = if g.cache { g.checkpoint_every } else { 0 };
+        let mut since = 0usize;
         let mut cache_at: HashMap<usize, Vec<ChangesetId>> = HashMap::new();
         if g.cache {
             for &(at, i) in &g.starts {
@@ -790,11 +832,13 @@ impl Repo {
             next = ahead?;
             for (j, &i) in window.iter().enumerate() {
                 let node = &nodes[i];
+                let mut fresh = false;
                 let state = if let Some(p) = bad.get(&i) {
                     Err(p.clone())
                 } else if let Some(lines) = leaves.remove(&i) {
                     Ok(lines)
                 } else {
+                    fresh = true;
                     let own = texts[j].as_ref().expect("a good version has its text");
                     let mut lines: Vec<(ChangesetId, u32)> = Vec::new();
                     let mut mine: Vec<usize> = Vec::new();
@@ -851,13 +895,33 @@ impl Repo {
                         held.remove(d);
                     }
                 }
-                if let (Some(keys), Ok(lines), Some(text)) = (cache_at.get(&i), &state, &texts[j]) {
+                if fresh {
+                    stats.replayed += 1;
+                    since += 1;
+                }
+                let checkpoint = every > 0
+                    && since >= every
+                    && fresh
+                    && on_line[i]
+                    && complete[i]
+                    && i != g.top
+                    && state.is_ok();
+                let keys = match (cache_at.get(&i), checkpoint) {
+                    (Some(keys), _) => Some(keys.clone()),
+                    (None, true) => Some(vec![node.cs]),
+                    (None, false) => None,
+                };
+                if let (Some(keys), Ok(lines), Some(text)) = (keys, &state, &texts[j]) {
                     let value = postcard::to_stdvec(&credited(&node.info.path, text, lines)?)?;
                     let value = Bytes::from(value);
-                    for &at in keys {
+                    for at in keys {
                         self.meta()
                             .put_derived(KIND, &cache_key(at, &node.info.path), value.clone())
                             .await?;
+                    }
+                    if checkpoint {
+                        stats.checkpoints += 1;
+                        since = 0;
                     }
                 }
                 let text = texts[j].clone();
@@ -877,7 +941,8 @@ impl Repo {
             .map_err(|p| Error::Invalid(format!("{p} is not valid UTF-8")))?;
         let text = top.text.expect("a good version has its text");
         let resp = credited(path, &text, &lines)?;
-        Ok((Replayed::Fresh(resp), complete[g.top]))
+        stats.complete = complete[g.top];
+        Ok((Replayed::Fresh(resp), stats))
     }
 }
 

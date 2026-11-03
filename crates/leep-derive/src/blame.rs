@@ -66,6 +66,14 @@ pub(crate) const MIN_STRETCH_SPAN: u64 = 32;
 /// measurable.
 pub(crate) const HEAD_STEPS: usize = 32;
 
+/// Versions a blame replays between checkpoints (ADR 0078): the work a
+/// blame cut short loses, at most, and one cached row per this many
+/// versions of a long-lived file. A row is the whole blame of the file, so
+/// a smaller spacing costs space (and writes) for little: on a file of
+/// several thousand versions, replaying this many takes well under a
+/// second.
+pub(crate) const CHECKPOINT_EVERY: usize = 256;
+
 /// Stretches walked at once. Their reads are gathered into batched reads,
 /// so this bounds memory and tasks rather than store connections.
 const STRETCHES_IN_FLIGHT: usize = 64;
@@ -122,7 +130,19 @@ impl Repo {
     /// across renames and through merges (ADR 0065), and describe each
     /// distinct changeset.
     pub async fn blame(&self, id: ChangesetId, path: &RepoPath) -> Result<BlameResponse> {
-        let (path, lines) = self.blame_lines(id, path).await?;
+        self.blame_held(id, path, None).await
+    }
+
+    /// [`Repo::blame`], computed on a task that finishes even if this call
+    /// is dropped and that concurrent calls for the same blame join (ADR
+    /// 0078); `hold` is kept until that task ends.
+    pub async fn blame_held(
+        &self,
+        id: ChangesetId,
+        path: &RepoPath,
+        hold: Option<crate::BlameHold>,
+    ) -> Result<BlameResponse> {
+        let (path, lines) = self.blame_shared(id, path, hold).await?;
         let mut ids: Vec<ChangesetId> = lines.iter().map(|l| l.changeset).collect();
         ids.sort_unstable();
         ids.dedup();
@@ -158,7 +178,11 @@ impl Repo {
         })
     }
 
-    async fn blame_lines(&self, id: ChangesetId, path: &RepoPath) -> Result<CachedBlame> {
+    pub(crate) async fn blame_lines(
+        &self,
+        id: ChangesetId,
+        path: &RepoPath,
+    ) -> Result<CachedBlame> {
         Ok(self.blame_walk(id, path, true, true).await?.0)
     }
 
@@ -767,6 +791,8 @@ impl Repo {
                     examined: 0,
                     walks: 0,
                     complete: true,
+                    replayed: 0,
+                    checkpoints: 0,
                 });
             }
         }
@@ -774,7 +800,8 @@ impl Repo {
             .blame_graph(id, tip, path, cuts, cache, most_walks)
             .await?;
         let (examined, walks, latest) = (graph.examined, graph.walks, graph.latest);
-        let (resp, complete) = self.replay_graph(graph, path).await?;
+        let (resp, stats) = self.replay_graph(graph, path).await?;
+        let (complete, replayed, checkpoints) = (stats.complete, stats.replayed, stats.checkpoints);
         let resp = match resp {
             Replayed::Cached(blame) => {
                 // The cached blame of the file's newest changer, which is
@@ -792,6 +819,8 @@ impl Repo {
                     examined,
                     walks,
                     complete,
+                    replayed,
+                    checkpoints,
                 });
             }
             Replayed::Fresh(resp) => resp,
@@ -811,6 +840,8 @@ impl Repo {
             examined,
             walks,
             complete,
+            replayed,
+            checkpoints,
         })
     }
 
@@ -870,6 +901,12 @@ pub(crate) struct BlameRun {
     pub(crate) walks: usize,
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) complete: bool,
+    /// Versions diffed (ADR 0078 tests count the work a checkpoint saves).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) replayed: usize,
+    /// Checkpoints written.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) checkpoints: usize,
 }
 
 /// One diff of consecutive versions, as `(tag, old lines, new lines)`.
