@@ -39,6 +39,9 @@ pub enum Op {
     /// [`leep_core::MetaStore::delete_derived_keys`] (ADR 0059). Not in
     /// [`Op::META`] or [`Op::WRITES`], for the same reason as `Lease`.
     DeleteChangesets,
+    /// Every review request call (ADR 0086). Not in [`Op::META`], for the
+    /// same reason as `Lease`.
+    ReviewRequest,
 }
 
 impl Op {
@@ -55,6 +58,7 @@ impl Op {
                 | Op::DeleteDerivedKind
                 | Op::Lease
                 | Op::DeleteChangesets
+                | Op::ReviewRequest
         )
     }
 

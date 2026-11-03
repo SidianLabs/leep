@@ -14,7 +14,7 @@ command's options with examples for the common ones.
 | Work | `init`, `checkout`, `status`, `diff`, `commit`, `amend`, `stash`, `restore`, `resolve`, `reset`, `sync`, `land` |
 | Branches | `branch`, `switch`, `tag`, `merge`, `rebase`, `cherry-pick`, `revert` |
 | History | `log`, `show`, `bisect`, `cat`, `blame`, `last-change`, `search`, `provenance`, `refs`, `reflog` |
-| Review | `review` (`approve`, `reject`, `status`, `list`), `reviews` |
+| Review | `review` (`approve`, `reject`, `withdraw`, `status`, `list`, `request`, `inbox`, `cancel`), `reviews` |
 | Admin | `undo`, `keygen`, `config` |
 
 Global options, accepted by every command and listed only in `leep --help`:
@@ -122,6 +122,31 @@ one of `env`, `repo`, `user`, `git`, `login`, or `server` when nothing local
 names an author (then `author` is `null`); after a set or unset it is the
 level written (`repo` or `user`). A value with a line break or another
 control character is refused (exit 1); so is an empty one: use `--unset`.
+
+## Review requests
+
+On a server with a tokens file, a change that needs review can ask for it
+through the server instead of out of band
+([ADR 0086](adr/0086-review-requests-and-creators.md)). Names are token
+names, as in `OWNERS` files.
+
+| Command | Effect |
+|---|---|
+| `leep review request REV [-m MSG]` | Ask for a review of `REV` before it lands on the target ref (`--ref` for another). With no `--to`, the server asks the owners of the paths still pending or rejected on that ref, or any reviewer when none is owned. Prints `Requested review of ID on REF from NAMES (#N)`; asking again for the same thing answers the open request (`Already requested ...`). |
+| `leep review request REV --to NAME [--to NAME]...` | Ask these reviewers instead. Each must be a token that may review, and not you; anything else is refused (exit 1). |
+| `leep review inbox` | Open requests that name you, or that any reviewer may take and someone else made, newest first: `#N STATE ID -> REF by REQUESTER (created by CREATOR), for REVIEWERS (TIME)`, then the changeset's title and the note. `--mine` lists the requests you made, `--all` adds closed ones, `-n N` caps the list (50). |
+| `leep review cancel N` | Withdraw request `N`, which you made. |
+
+A request closes by itself when its changeset lands on its ref, as itself or
+as the copy the land replayed it as; `leep review inbox --mine --all` shows
+`landed as ID` for a copy. A changeset you squash or rebase yourself is a
+new one: request again, and cancel the old request. `--json` prints the
+server's answer. Against a server without review requests the commands say
+the server needs an upgrade.
+
+`leep show` prints `Created-by: NAME` when the server recorded which token
+created the changeset, so a reviewer can tell agents apart even when they
+share an author.
 
 ## Long listings
 

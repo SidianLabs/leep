@@ -116,7 +116,10 @@ pub const REVIEW: &str = "\
 Examples:
   leep review status @                  # who still has to approve (exit 1 if not approved)
   leep review approve 2a954d8ef7c7 -m \"looks good\"
-  leep review reject 2a954d8ef7c7 -m \"breaks the parser\"";
+  leep review reject 2a954d8ef7c7 -m \"breaks the parser\"
+  leep review request @ -m \"new API field\"   # ask the owners of what is still pending
+  leep review request @ --to rhea       # or name the reviewers
+  leep review inbox                     # requests waiting for you (--mine: the ones you made)";
 /// Shown under the top-level help; the full contract is docs/CLI.md.
 pub const EXIT_CODES: &str = "\
 Exit codes (ADR 0034):

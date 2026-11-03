@@ -147,6 +147,9 @@ measured until the response head is ready, not until the body is streamed.
 | `leep_gc_changeset_doom_conflicts_total` | counter | none | Writers answered 409 because a changeset they named stayed *deleting* for 30 s: a changeset collect was killed between announcing a delete and settling it (ADR 0059). The next collect settles it. |
 | `leep_gc_fence_active` | gauge | none | 1 while a changeset condemnation round is open (`gc-fence-active-v1`), as this server last read it; writers then read fence rows for what they name. 0 when no sweep has condemned anything unresolved. |
 | `leep_gc_changesets_rescued_total` | counter | `by` = `create`, `land`, `ref`, `attest`, `mirror` | Condemned changesets a writer rescued because it was about to store something naming them (ADR 0059): a child, a land, a ref move, a signature or review, a git mirror map. 0 until a changeset sweep condemns; a steady rate means agents build on changesets the sweep found unreachable. |
+| `leep_review_requests_created_total` | counter | none | Review requests opened (`POST /v1/review-requests` that did not answer an existing one; ADR 0086). |
+| `leep_review_requests_closed_total` | counter | `state` = `landed`, `withdrawn` | Review requests closed: by the follow-up of a land or by a listing that found the changeset on its ref (`landed`), or by their requester (`withdrawn`). |
+| `leep_review_request_close_errors_total` | counter | none | Land follow-ups that failed or timed out while closing review requests. The land itself had succeeded; the requests close at the next listing when their changeset is on the ref's first-parent chain, else stay open until withdrawn. A steady rate means the metadata store is failing these small writes. |
 | `leep_land_leases_held` | gauge | none | Refs whose land lease this server holds ([Several servers on one ref](#several-servers-on-one-ref), ADR 0056). |
 | `leep_land_lease_acquired_total` | counter | none | Land leases this server took. Under steady traffic about one per hot ref per server restart; more means leases change hands. |
 | `leep_land_lease_lost_total` | counter | `reason` = `taken`, `idle` | Leases this server stopped holding: another server took it after this one failed to renew it for the TTL (`taken`), or it released it after 30 s without a land (`idle`). |
@@ -1292,6 +1295,14 @@ run `leep-server migrate` again when the long transaction has finished. They kee
 which read as stored when the migration ran; finish the rollout before the
 first changeset condemnation (see [Changeset garbage
 collection](#changeset-garbage-collection)).
+
+**Migration 8 (`review_requests`, ADR 0086).** Creates two new, empty
+tables and their indexes and touches no existing table, so it takes no lock
+another statement waits on and may run beside servers of the previous
+version, which never read the tables. Requests are opened only on upgraded
+servers; finish the rollout so every server that runs lands also closes
+them (a request a v7 server's land satisfied closes at the next listing if
+its changeset is on the ref's first-parent chain).
 
 **Derived kinds that change encoding.** A release that changes how a derived
 kind is stored gives it a new name, so old and new servers never read each

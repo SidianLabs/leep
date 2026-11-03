@@ -331,6 +331,7 @@ impl Repo {
                     root_tree: TreeNode::empty_hash(),
                     path_at: None,
                     renamed: None,
+                    created_by: None,
                 });
             }
         }
@@ -663,6 +664,7 @@ fn push_match(
             root_tree: TreeNode::empty_hash(),
             path_at: None,
             renamed: None,
+            created_by: None,
         });
     }
     false

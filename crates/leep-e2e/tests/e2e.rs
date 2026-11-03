@@ -1079,6 +1079,20 @@ fn review_owners_and_auto_approval_gate_landing_on_a_protected_ref() {
         "{text}"
     );
 
+    // Alice asks through the server (ADR 0086). Nothing is owned, so any
+    // reviewer may take it; bob's inbox shows it, and who made the change.
+    let out = alice.ok(&wc_a, &["review", "request", "@", "-m", "first commit"]);
+    assert!(out.contains("from any reviewer (#1)"), "{out}");
+    let inbox = bob.ok(root, &["review", "inbox"]);
+    assert!(
+        inbox.contains("#1 open") && inbox.contains("by alice") && inbox.contains("> first commit"),
+        "{inbox}"
+    );
+    let own = alice.ok(root, &["review", "inbox"]);
+    assert!(own.contains("No review requests"), "{own}");
+    let show = bob.ok(root, &["show", &seed]);
+    assert!(show.contains("Created-by: alice"), "{show}");
+
     // A read token cannot review; reading is fine.
     let out = viewer.run(root, &["review", "approve", &seed]);
     assert_eq!(out.status.code(), Some(1));
@@ -1120,6 +1134,19 @@ fn review_owners_and_auto_approval_gate_landing_on_a_protected_ref() {
     );
     let landed = alice.ok(&wc_a, &["land"]);
     assert!(landed.contains("Landed"), "{landed}");
+    // The land closed the request, in a task beside its answer.
+    let mut state = serde_json::Value::Null;
+    for _ in 0..100 {
+        let mine = alice.json(root, &["review", "inbox", "--mine", "--all"]);
+        state = mine["requests"][0]["state"].clone();
+        if state == "landed" {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert_eq!(state, "landed");
+    let inbox = bob.ok(root, &["review", "inbox"]);
+    assert!(inbox.contains("No review requests"), "{inbox}");
 
     // Now alice owns everything. A comment-only change lands without review.
     let wc_b = root.join("wc-bob");

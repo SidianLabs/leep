@@ -197,6 +197,7 @@ mod tests {
             root_tree: Hash::of_blob(b"root"),
             path_at: None,
             renamed: None,
+            created_by: None,
         }
     }
 

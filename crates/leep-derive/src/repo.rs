@@ -1413,6 +1413,8 @@ impl Repo {
             .ok_or_else(|| Error::NotFound(format!("changeset {id}")))
     }
 
+    /// What `GET /v1/changesets/{id}` answers, with who created it
+    /// (ADR 0086).
     pub async fn info(&self, id: ChangesetId) -> Result<ChangesetInfo> {
         Ok(ChangesetInfo {
             id,
@@ -1421,6 +1423,7 @@ impl Repo {
             root_tree: self.root_tree(id).await?,
             path_at: None,
             renamed: None,
+            created_by: self.created_by(id).await?,
         })
     }
 

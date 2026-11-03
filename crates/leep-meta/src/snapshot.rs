@@ -107,6 +107,25 @@ type SnapLogRow = (
     Option<Vec<u8>>,
 );
 
+/// A `review_requests` row with every column (ADR 0086).
+type RequestRow = (
+    i64,
+    i64,
+    Vec<u8>,
+    String,
+    String,
+    String,
+    i64,
+    String,
+    Option<i64>,
+    Option<Vec<u8>>,
+);
+/// A `review_request_reviewers` row: request id, reviewer.
+type ReviewerRow = (i64, String);
+
+const REQUEST_COLUMNS: &str =
+    "id, repo_id, changeset, target_ref, requester, message, created, state, closed, landed_as";
+
 /// Rows of one read transaction on the source.
 #[async_trait]
 trait Source: Send {
@@ -119,6 +138,12 @@ trait Source: Send {
         -> Result<Vec<DerivedRow>>;
     async fn ref_log(&mut self, after_seq: i64, limit: usize) -> Result<Vec<SnapLogRow>>;
     async fn ref_log_last_seq(&mut self) -> Result<i64>;
+    async fn review_requests(&mut self, after: i64, limit: usize) -> Result<Vec<RequestRow>>;
+    async fn review_request_reviewers(
+        &mut self,
+        after: &ReviewerRow,
+        limit: usize,
+    ) -> Result<Vec<ReviewerRow>>;
 }
 
 /// One write transaction on the destination.
@@ -133,6 +158,9 @@ trait Sink: Send {
     async fn put_derived(&mut self, rows: &[DerivedRow]) -> Result<()>;
     async fn put_ref_log(&mut self, rows: &[SnapLogRow]) -> Result<()>;
     async fn set_ref_log_last_seq(&mut self, seq: i64) -> Result<()>;
+    /// Rows keep their ids; later requests get higher ones.
+    async fn put_review_requests(&mut self, rows: &[RequestRow]) -> Result<()>;
+    async fn put_review_request_reviewers(&mut self, rows: &[ReviewerRow]) -> Result<()>;
     async fn commit(self: Box<Self>) -> Result<()>;
 }
 
@@ -185,6 +213,20 @@ async fn copy(src: &mut dyn Source, dst: &mut dyn Sink) -> Result<SnapshotInfo> 
     let last_seq = src.ref_log_last_seq().await?.max(after);
     info.ref_log_last_seq = u64::try_from(last_seq).map_err(|_| storage("negative ref log seq"))?;
     dst.set_ref_log_last_seq(last_seq).await?;
+    let mut after = 0i64;
+    loop {
+        let page = src.review_requests(after, PAGE).await?;
+        let Some(last) = page.last() else { break };
+        after = last.0;
+        dst.put_review_requests(&page).await?;
+    }
+    let mut after = (0i64, String::new());
+    loop {
+        let page = src.review_request_reviewers(&after, PAGE).await?;
+        let Some(last) = page.last() else { break };
+        after = last.clone();
+        dst.put_review_request_reviewers(&page).await?;
+    }
     Ok(info)
 }
 
@@ -459,6 +501,34 @@ impl SqliteSource {
 
 #[async_trait]
 impl Source for SqliteSource {
+    async fn review_requests(&mut self, after: i64, limit: usize) -> Result<Vec<RequestRow>> {
+        sqlx::query_as(AssertSqlSafe(format!(
+            "SELECT {REQUEST_COLUMNS} FROM review_requests WHERE id > ? ORDER BY id LIMIT ?"
+        )))
+        .bind(after)
+        .bind(limit as i64)
+        .fetch_all(&mut *self.0)
+        .await
+        .map_err(storage)
+    }
+
+    async fn review_request_reviewers(
+        &mut self,
+        after: &ReviewerRow,
+        limit: usize,
+    ) -> Result<Vec<ReviewerRow>> {
+        sqlx::query_as(
+            "SELECT request_id, reviewer FROM review_request_reviewers \
+             WHERE (request_id, reviewer) > (?, ?) ORDER BY request_id, reviewer LIMIT ?",
+        )
+        .bind(after.0)
+        .bind(&after.1)
+        .bind(limit as i64)
+        .fetch_all(&mut *self.0)
+        .await
+        .map_err(storage)
+    }
+
     async fn schema_version(&mut self) -> Result<u64> {
         let v: Option<i64> = sqlx::query_scalar("SELECT MAX(version) FROM schema_migrations")
             .fetch_one(&mut *self.0)
@@ -563,6 +633,37 @@ impl SqliteSink {
 
 #[async_trait]
 impl Sink for SqliteSink {
+    async fn put_review_requests(&mut self, rows: &[RequestRow]) -> Result<()> {
+        let mut q = QueryBuilder::<Sqlite>::new(format!(
+            "INSERT INTO review_requests ({REQUEST_COLUMNS}) "
+        ));
+        q.push_values(rows, |mut b, r| {
+            b.push_bind(r.0)
+                .push_bind(r.1)
+                .push_bind(&r.2)
+                .push_bind(&r.3)
+                .push_bind(&r.4)
+                .push_bind(&r.5)
+                .push_bind(r.6)
+                .push_bind(&r.7)
+                .push_bind(r.8)
+                .push_bind(&r.9);
+        });
+        q.build().execute(&mut *self.0).await.map_err(storage)?;
+        Ok(())
+    }
+
+    async fn put_review_request_reviewers(&mut self, rows: &[ReviewerRow]) -> Result<()> {
+        let mut q = QueryBuilder::<Sqlite>::new(
+            "INSERT INTO review_request_reviewers (request_id, reviewer) ",
+        );
+        q.push_values(rows, |mut b, (id, name)| {
+            b.push_bind(id).push_bind(name);
+        });
+        q.build().execute(&mut *self.0).await.map_err(storage)?;
+        Ok(())
+    }
+
     async fn is_empty(&mut self) -> Result<bool> {
         let n: i64 = sqlx::query_scalar(
             "SELECT (SELECT COUNT(*) FROM (SELECT 1 FROM changesets LIMIT 1)) \
@@ -570,7 +671,8 @@ impl Sink for SqliteSink {
              + (SELECT COUNT(*) FROM (SELECT 1 FROM derived LIMIT 1)) \
              + (SELECT COUNT(*) FROM (SELECT 1 FROM ref_log LIMIT 1)) \
              + (SELECT COUNT(*) FROM (SELECT 1 FROM changeset_dicts LIMIT 1)) \
-             + (SELECT COUNT(*) FROM (SELECT 1 FROM store_features LIMIT 1))",
+             + (SELECT COUNT(*) FROM (SELECT 1 FROM store_features LIMIT 1)) \
+             + (SELECT COUNT(*) FROM (SELECT 1 FROM review_requests LIMIT 1))",
         )
         .fetch_one(&mut *self.0)
         .await
@@ -586,6 +688,8 @@ impl Sink for SqliteSink {
             "refs",
             "derived",
             "ref_log",
+            "review_requests",
+            "review_request_reviewers",
             // Leases name servers of the old store; never restored.
             "leases",
         ] {
@@ -714,6 +818,34 @@ impl PgSource {
 
 #[async_trait]
 impl Source for PgSource {
+    async fn review_requests(&mut self, after: i64, limit: usize) -> Result<Vec<RequestRow>> {
+        sqlx::query_as(AssertSqlSafe(format!(
+            "SELECT {REQUEST_COLUMNS} FROM review_requests WHERE id > $1 ORDER BY id LIMIT $2"
+        )))
+        .bind(after)
+        .bind(limit as i64)
+        .fetch_all(&mut *self.0)
+        .await
+        .map_err(storage)
+    }
+
+    async fn review_request_reviewers(
+        &mut self,
+        after: &ReviewerRow,
+        limit: usize,
+    ) -> Result<Vec<ReviewerRow>> {
+        sqlx::query_as(
+            "SELECT request_id, reviewer FROM review_request_reviewers \
+             WHERE (request_id, reviewer) > ($1, $2) ORDER BY request_id, reviewer LIMIT $3",
+        )
+        .bind(after.0)
+        .bind(&after.1)
+        .bind(limit as i64)
+        .fetch_all(&mut *self.0)
+        .await
+        .map_err(storage)
+    }
+
     async fn schema_version(&mut self) -> Result<u64> {
         let v: Option<i64> = sqlx::query_scalar("SELECT MAX(version) FROM schema_migrations")
             .fetch_one(&mut *self.0)
@@ -823,13 +955,53 @@ impl PgSink {
 
 #[async_trait]
 impl Sink for PgSink {
+    async fn put_review_requests(&mut self, rows: &[RequestRow]) -> Result<()> {
+        let mut q = QueryBuilder::<Postgres>::new(format!(
+            "INSERT INTO review_requests ({REQUEST_COLUMNS}) "
+        ));
+        q.push_values(rows, |mut b, r| {
+            b.push_bind(r.0)
+                .push_bind(r.1)
+                .push_bind(&r.2)
+                .push_bind(&r.3)
+                .push_bind(&r.4)
+                .push_bind(&r.5)
+                .push_bind(r.6)
+                .push_bind(&r.7)
+                .push_bind(r.8)
+                .push_bind(&r.9);
+        });
+        q.build().execute(&mut *self.0).await.map_err(storage)?;
+        // Explicit ids do not move the sequence; the next request must get
+        // a higher id than any restored one.
+        sqlx::query(
+            "SELECT setval(pg_get_serial_sequence('review_requests', 'id'), \
+             (SELECT MAX(id) FROM review_requests))",
+        )
+        .execute(&mut *self.0)
+        .await
+        .map_err(storage)?;
+        Ok(())
+    }
+
+    async fn put_review_request_reviewers(&mut self, rows: &[ReviewerRow]) -> Result<()> {
+        let mut q = QueryBuilder::<Postgres>::new(
+            "INSERT INTO review_request_reviewers (request_id, reviewer) ",
+        );
+        q.push_values(rows, |mut b, (id, name)| {
+            b.push_bind(id).push_bind(name);
+        });
+        q.build().execute(&mut *self.0).await.map_err(storage)?;
+        Ok(())
+    }
+
     async fn is_empty(&mut self) -> Result<bool> {
         // Writers are excluded so that "empty" stays true until commit. A
         // concurrent server inserting meanwhile would be a deployment error;
         // the lock turns it into a wait, not a corrupt mix.
         sqlx::query(
-            "LOCK TABLE changesets, changeset_dicts, store_features, refs, derived, ref_log \
-             IN ACCESS EXCLUSIVE MODE",
+            "LOCK TABLE changesets, changeset_dicts, store_features, refs, derived, ref_log, \
+             review_requests, review_request_reviewers IN ACCESS EXCLUSIVE MODE",
         )
         .execute(&mut *self.0)
         .await
@@ -840,7 +1012,8 @@ impl Sink for PgSink {
              + (SELECT COUNT(*) FROM (SELECT 1 FROM derived LIMIT 1) c) \
              + (SELECT COUNT(*) FROM (SELECT 1 FROM ref_log LIMIT 1) d) \
              + (SELECT COUNT(*) FROM (SELECT 1 FROM changeset_dicts LIMIT 1) e) \
-             + (SELECT COUNT(*) FROM (SELECT 1 FROM store_features LIMIT 1) f)",
+             + (SELECT COUNT(*) FROM (SELECT 1 FROM store_features LIMIT 1) f) \
+             + (SELECT COUNT(*) FROM (SELECT 1 FROM review_requests LIMIT 1) g)",
         )
         .fetch_one(&mut *self.0)
         .await
@@ -856,6 +1029,8 @@ impl Sink for PgSink {
             "refs",
             "derived",
             "ref_log",
+            "review_requests",
+            "review_request_reviewers",
             // Leases name servers of the old store; never restored.
             "leases",
         ] {

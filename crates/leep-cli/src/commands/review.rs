@@ -22,6 +22,13 @@ pub enum ReviewCmd {
     Status(StatusArgs),
     /// List the reviews a changeset has.
     List(ListArgs),
+    /// Ask for a review of a changeset before it lands (default reviewers:
+    /// the owners of the paths still pending).
+    Request(super::review_request::RequestArgs),
+    /// List the review requests waiting for you (--mine: the ones you made).
+    Inbox(super::review_request::InboxArgs),
+    /// Withdraw a review request you made.
+    Cancel(super::review_request::CancelArgs),
 }
 
 #[derive(Args, Debug)]
@@ -61,6 +68,9 @@ pub fn run(r: &Remote, cmd: &ReviewCmd) -> Result<i32> {
         ReviewCmd::Withdraw(a) => verdict(r, &a.rev, Verdict::Withdrawn, a.message.clone()),
         ReviewCmd::Status(a) => status(r, a),
         ReviewCmd::List(a) => list(r, a),
+        ReviewCmd::Request(a) => super::review_request::request(r, a),
+        ReviewCmd::Inbox(a) => super::review_request::inbox(r, a),
+        ReviewCmd::Cancel(a) => super::review_request::cancel(r, a),
     }
 }
 

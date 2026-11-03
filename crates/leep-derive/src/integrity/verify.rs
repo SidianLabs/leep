@@ -19,6 +19,7 @@ use leep_core::changeset::EXTRA_REBASED_FROM;
 use leep_core::review::{
     check_comment, check_source, Review, ReviewSource, REVIEW_KIND, REVIEW_SOURCE_KIND,
 };
+use leep_core::review_request::{CreatedBy, CREATED_BY_KIND};
 use leep_core::signature::{key_id as signature_key_id, Signature, SIGNATURE_KIND};
 use leep_core::{
     BlobStore, Changeset, ChangesetId, Error, FileChange, Hash, MetaStore, RepoPath, Result,
@@ -1111,6 +1112,22 @@ impl Verifier<'_> {
                             REVIEW_SOURCE_KIND,
                             &key,
                             format!("review source row {key} {why}"),
+                        );
+                    }
+                }
+                self.tick();
+            }
+        }
+        if self.has(CREATED_BY_KIND) {
+            let mut scan = RowScan::new(CREATED_BY_KIND, full, self.opts.sample);
+            while let Some(page) = scan.next(&*meta).await? {
+                for (key, value) in page {
+                    self.kstats(CREATED_BY_KIND).checked += 1;
+                    if let Err(e) = CreatedBy::decode(&value) {
+                        self.attestation_problem(
+                            CREATED_BY_KIND,
+                            &key,
+                            format!("created-by row {key} does not decode: {e}"),
                         );
                     }
                 }

@@ -4,6 +4,9 @@ use std::str::FromStr;
 use async_trait::async_trait;
 use bytes::Bytes;
 use leep_core::prefix::IdPrefix;
+use leep_core::review_request::{
+    NewReviewRequest, ReviewRequest, ReviewRequestFilter, ReviewRequestState,
+};
 use leep_core::store::unix_now;
 use leep_core::{
     check_land_key, check_ref_chain, Changeset, ChangesetId, DeleteStep, DerivedRow, Hash, LandId,
@@ -64,6 +67,12 @@ pub const MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/sqlite/0007_changeset_stored_at.sql"),
         satisfied_by: &[],
     },
+    Migration {
+        version: 8,
+        name: "review_requests",
+        sql: include_str!("../migrations/sqlite/0008_review_requests.sql"),
+        satisfied_by: &[],
+    },
 ];
 
 pub struct SqliteMetaStore {
@@ -77,6 +86,8 @@ pub struct SqliteMetaStore {
     pub(crate) has_features: bool,
     /// Whether `changesets` has `stored_at` (ADR 0059).
     pub(crate) has_stored_at: bool,
+    /// Whether the schema has the review request tables (ADR 0086).
+    pub(crate) has_review_requests: bool,
 }
 
 /// `sqlite:///C:/path` (a Windows drive letter after the third slash, as
@@ -309,6 +320,9 @@ impl SqliteMetaStore {
             has_stored_at: migrations
                 .iter()
                 .any(|m| m.version >= crate::STORED_AT_SCHEMA_VERSION),
+            has_review_requests: migrations
+                .iter()
+                .any(|m| m.version >= crate::review_requests::REVIEW_REQUESTS_SCHEMA_VERSION),
         }
     }
 
@@ -720,6 +734,35 @@ impl MetaStore for SqliteMetaStore {
             .map_err(|e| log_insert_error(name, e))?;
         tx.commit().await.map_err(storage)?;
         Ok(true)
+    }
+
+    fn supports_review_requests(&self) -> bool {
+        self.has_review_requests
+    }
+
+    async fn put_review_request(&self, req: &NewReviewRequest) -> Result<ReviewRequest> {
+        crate::review_requests::sqlite_put(&self.pool, req).await
+    }
+
+    async fn get_review_request(&self, id: u64) -> Result<Option<ReviewRequest>> {
+        crate::review_requests::sqlite_get(&self.pool, id).await
+    }
+
+    async fn list_review_requests(
+        &self,
+        filter: &ReviewRequestFilter,
+    ) -> Result<Vec<ReviewRequest>> {
+        crate::review_requests::sqlite_list(&self.pool, filter).await
+    }
+
+    async fn close_review_request(
+        &self,
+        id: u64,
+        state: ReviewRequestState,
+        landed_as: Option<ChangesetId>,
+        closed: i64,
+    ) -> Result<bool> {
+        crate::review_requests::sqlite_close(&self.pool, id, state, landed_as, closed).await
     }
 
     fn supports_leases(&self) -> bool {

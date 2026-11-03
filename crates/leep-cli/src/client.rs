@@ -700,6 +700,24 @@ impl Client {
         )
     }
 
+    /// `POST /v1/review-requests` (ADR 0086).
+    pub fn request_review(&self, req: &CreateReviewRequest) -> Result<CreateReviewRequestResponse> {
+        self.json(self.http.post(self.url("/v1/review-requests")).json(req))
+    }
+
+    /// `GET /v1/review-requests` with `query` as its filters.
+    pub fn review_requests(&self, query: &[(&str, String)]) -> Result<ReviewRequestsResponse> {
+        self.json(self.http.get(self.url("/v1/review-requests")).query(query))
+    }
+
+    pub fn withdraw_review_request(&self, id: u64) -> Result<ReviewRequestEntry> {
+        self.json(
+            self.http
+                .post(self.url(&format!("/v1/review-requests/{id}/withdraw")))
+                .json(&serde_json::json!({})),
+        )
+    }
+
     pub fn whoami(&self) -> Result<WhoAmIResponse> {
         self.json(self.http.get(self.url("/v1/whoami")))
     }
