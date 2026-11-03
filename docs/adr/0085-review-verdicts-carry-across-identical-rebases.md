@@ -34,23 +34,23 @@ another changeset X counts for Y when all of these hold:
    a hint only: it chooses which changesets to compare and grants nothing. A
    changeset without the extra has no candidates; the server's own rebased
    copies always carry it.
-2. **Y reproduces every reviewed change of X.** The reviewed paths of X are
-   those that, judged with no reviews, are pending: not auto-approved and not
-   covered by a merge parent. `OWNERS` files are never auto-approved, so they
-   are always among them. Each must be among Y's changes with the identical
-   triple (path, old content and kind, new content and kind), where "old" is
-   the path in each changeset's **own first parent**. Same old and same new
+2. **Y reproduces every reviewed change of X.** X is not a merge. Every path
+   X changed is either among Y's changes with the identical triple (path,
+   old content and kind, new content and kind), where "old" is the path in
+   each changeset's **own first parent**, or one an auto rule approves in X.
+   `OWNERS` files are never auto-approved. Same old and same new
    whole-content hashes mean the file is byte for byte what was reviewed and
-   the base did not move under it. If any reviewed path differs, is missing
-   from Y, or is a dropped side change of a merge, nothing carries from X: a
-   reviewed path never carries without the others it was approved with.
-3. **The verdict is an approve or a reject**, by a reviewer who has no review
-   of Y itself. A review of Y, a withdrawal included, is that reviewer's word
-   on Y and replaces anything carried. A withdrawal of X carries nothing.
+   the base did not move under it. If any other path differs or is missing
+   from Y, nothing carries from X: a reviewed path never carries without the
+   others it was approved with. Verdicts count on the reproduced paths.
+3. **The reviewer has no review of Y itself.** A review of Y, a withdrawal
+   included, is that reviewer's word on Y and replaces anything carried.
 
-Each candidate is checked on its own, and its verdicts count only on its
-reproduced paths; where several candidates carry to one path, a reviewer's
-verdict comes from the nearest that has one. So a resolved stack keeps the
+Each candidate is checked on its own. Where several candidates reproduce a
+path, each reviewer's **newest** review among them decides (by timestamp; in
+the same second reject beats withdrawal beats approval), so the order a
+client names candidates in never matters; a newest withdrawal carries
+nothing. So a resolved stack keeps the
 approval of every entry whose reviewed changes it kept exactly. An entry
 whose reviewed file a lower entry also changed does not reproduce (its old
 content is the lower entry's new one) and needs review again. Paths Y changes that
@@ -59,10 +59,33 @@ auto rules are judged on Y's own bytes. Owners still come from the target
 ref's head. Rejects carry exactly as approvals do, so a veto is not escaped by
 re-committing the same change.
 
+**Taking back.** A reject or withdrawal posted on Y is also written, as the
+same reviewer's verdict with a `review-source-v1` row
+(`leep:taken-back-on:<Y>`, `via` the posting token), on each candidate of Y
+where that reviewer's approval would carry to Y. Otherwise a later copy that
+names only X, not Y, would carry the approval the reviewer just took back on
+an identical change: candidates are found from hints, never by searching for
+copies. This changes X's own status too, which is the point: its reviewed
+change is the one rejected.
+
+**Bounds.** At most 64 candidates are walked (one changeset read each, and
+one `rebased-origin-v1` read for each that has a hint); reviews are read
+once per candidate per status request or land check; at most 16 candidates
+with reviews by others are compared (`MAX_CARRY_CHECKS`), and with a 17th
+nothing carries at all, since stopping early could drop a newer reject. A
+comparison needs no judgement of X: a path whose new content differs is
+refused before any read unless an auto rule could hold for it, each matching
+path costs two file lookups, and only differing paths read contents for the
+content rules; a candidate with more than 1,024 paths is not compared. A
+status request on a changeset naming 64 approved, non-reproducing
+candidates makes 174 metadata calls with four principals
+(`too_many_reviewed_candidates_carry_nothing_and_the_work_is_bounded`).
+
 `PathReview` in `GET .../review-status` gains `carried_from` (the X whose
 verdict counted on that path; omitted otherwise, `#[serde(default)]`). The
-`rule` stays `owner` or `rejected`. Nothing persisted changes: no new rows,
-no new fields in `Changeset`. A client that resolves a land's conflicts names
+`rule` stays `owner` or `rejected`. Nothing persisted changes: no new kinds
+or fields (taking back writes ordinary `review-v1` and `review-source-v1`
+rows). A client that resolves a land's conflicts names
 the original by stamping `leep.rebased_from` on the resolving commit (the
 CLI's side is a separate change); any client may.
 
@@ -98,11 +121,8 @@ is still `400 invalid`).
   `review-status` (with `carried_from`) when it reproduces the reviewed
   changes, instead of showing them only in `GET .../reviews` with `via`.
   Land was unaffected: it judges the originals.
-- Cost: a changeset without `leep.rebased_from` costs nothing more. One with
-  it costs, per candidate, a changeset read, a `rebased-origin-v1` read and
-  one review lookup per principal, and for each candidate with verdicts a
-  judgement of X with no reviews (auto rules read file contents) and two file
-  lookups per reviewed path. At most 64 candidates.
+- Cost: a changeset without `leep.rebased_from` costs nothing more; one with
+  it is bounded as above.
 - **422 compatibility.** The stable `code` and the marker texts are
   unchanged, so clients that branch on them (the CLI's land hint, the MCP
   server, the soak agent) keep working. ADR 0034 maps "any other 4xx" to

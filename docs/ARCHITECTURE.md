@@ -1534,7 +1534,11 @@ signatures. Verdicts on a changeset X count for Y when Y names X in
 exactly X's change to every path X needed a reviewer for: same old and new
 content and kind, old relative to each one's own first parent
 ([ADR 0085](adr/0085-review-verdicts-carry-across-identical-rebases.md));
-`review-status` names the source in `carried_from`. It is a second
+each reviewer's newest review among the candidates that reproduce a path
+decides, a reject or withdrawal on a copy is also written on the candidates
+whose approval carried to it, and at most 16 candidates with reviews are
+compared (with more, none carry). `review-status` names the source in
+`carried_from`. It is a second
 `LandPolicy`: `Repo::with_land_policy` composes policies (all must pass), and
 `check_land` now receives the head so owners and new history agree.
 `GET .../review-status?ref=` shows the per-path state, `GET .../reviews`

@@ -17,8 +17,9 @@
 //! Verdicts on another changeset X can carry to this one (ADR 0085), but only
 //! for paths whose change is identical in both: see [`Repo::carried_paths`].
 
+use std::collections::btree_map::Entry as BTreeEntry;
 use std::collections::hash_map::Entry;
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use globset::{Glob, GlobBuilder, GlobSet, GlobSetBuilder};
 use leep_core::api::FileInfo;
@@ -37,6 +38,10 @@ const MAX_AUTO_BYTES: u64 = 2 * 1024 * 1024;
 /// and a client writes the hints, so the walk is bounded however they nest.
 /// The CLI names up to 64 ids (a resolved stack), so the bound matches it.
 pub const MAX_CARRY_CANDIDATES: usize = 64;
+
+/// Most changed paths a candidate may have for [`Repo::carried_paths`] to
+/// compare it; a bigger one carries nothing, so its cost stays bounded.
+pub const MAX_CARRY_PATHS: usize = 1024;
 
 /// A rule that approves a path without a human.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -208,9 +213,21 @@ pub struct PathStatus {
 pub struct Carried {
     pub from: ChangesetId,
     pub paths: BTreeSet<RepoPath>,
-    /// Reviews of `from`, by reviewers with no review of their own of the
-    /// changeset being judged.
+    /// Reviews of `from`, withdrawals included, by reviewers with no review
+    /// of their own of the changeset being judged.
     pub reviews: Vec<Review>,
+}
+
+/// Whether `a` is a later word than `b` from the same reviewer: by
+/// timestamp, and on a tie the more cautious verdict, so a reject posted in
+/// the same second as an approval wins.
+pub fn later(a: &Review, b: &Review) -> bool {
+    let rank = |v: Verdict| match v {
+        Verdict::Approve => 0,
+        Verdict::Withdrawn => 1,
+        Verdict::Reject => 2,
+    };
+    (a.timestamp, rank(a.verdict)) > (b.timestamp, rank(b.verdict))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -266,9 +283,10 @@ impl Repo {
     }
 
     /// [`Self::review_changeset`], also counting `carried`'s verdicts on
-    /// their paths. The caller found them with [`Self::carried_paths`],
-    /// nearest first: where several carry to a path, a reviewer's verdict
-    /// comes from the first that has one.
+    /// their paths (found with [`Self::carried_paths`]). Where several carry
+    /// to a path, each reviewer's newest review among them decides, so the
+    /// order a client named them in never does; a newest withdrawal carries
+    /// nothing.
     pub async fn review_changeset_carried(
         &self,
         id: ChangesetId,
@@ -308,24 +326,35 @@ impl Repo {
             // Carried verdicts count only where the change is the one they
             // were given on, and never for a dropped side change. Callers
             // leave out reviewers with a review of `id` itself.
-            let mut carried_from = None;
-            let mut decided = BTreeSet::new();
+            let mut newest: BTreeMap<&str, (&Review, ChangesetId)> = BTreeMap::new();
             for c in carried
                 .iter()
                 .filter(|c| change.is_some() && c.paths.contains(path))
             {
                 for r in &c.reviews {
-                    if !decided.insert(r.reviewer.as_str()) || !counts(&r.reviewer) {
-                        continue;
+                    match newest.entry(r.reviewer.as_str()) {
+                        BTreeEntry::Vacant(e) => {
+                            e.insert((r, c.from));
+                        }
+                        BTreeEntry::Occupied(mut e) if later(r, e.get().0) => {
+                            e.insert((r, c.from));
+                        }
+                        BTreeEntry::Occupied(_) => {}
                     }
-                    let set = match r.verdict {
-                        Verdict::Approve => &mut approved,
-                        Verdict::Reject => &mut rejected,
-                        Verdict::Withdrawn => continue,
-                    };
-                    if set.insert(r.reviewer.clone()) {
-                        carried_from.get_or_insert(c.from);
-                    }
+                }
+            }
+            let mut carried_from = None;
+            for (who, (r, from)) in newest {
+                if !counts(who) {
+                    continue;
+                }
+                let set = match r.verdict {
+                    Verdict::Approve => &mut approved,
+                    Verdict::Reject => &mut rejected,
+                    Verdict::Withdrawn => continue,
+                };
+                if set.insert(who.to_string()) {
+                    carried_from.get_or_insert(from);
                 }
             }
             let (approved_by, rejected_by): (Vec<String>, Vec<String>) = (
@@ -405,55 +434,88 @@ impl Repo {
         Ok(out)
     }
 
-    /// The paths of `from` that needed a reviewer (neither auto-approved nor
-    /// covered by a merge parent) when `id` makes exactly the same change to
-    /// every one of them: the same old content and kind, relative to each
-    /// one's own first parent, and the same new content and kind. Same old
-    /// and new means the reviewed file is byte for byte what was reviewed
-    /// and the base did not move under it. `None` when any of them differs
-    /// or is missing from `id` (so a reviewed path cannot be carried without
-    /// the others it was approved with), or when `from` needed no reviewer.
-    /// Paths only `id` changes are not included; they are judged on their own.
+    /// The paths where `id` makes exactly the change `from` made (the same
+    /// old content and kind, each relative to its own first parent, and the
+    /// same new content and kind), when every other path `from` changed is
+    /// one an auto rule approves in `from`. Same old and new means the file
+    /// is byte for byte what was reviewed and the base did not move under
+    /// it. `None` when a path of `from` that needed a reviewer is changed
+    /// differently in `id`, or missing from it (so a reviewed path never
+    /// carries without the others it was approved with), when `from` is a
+    /// merge or changes more than [`MAX_CARRY_PATHS`] paths, or when nothing
+    /// is reproduced. Paths only `id` changes are judged on their own.
+    ///
+    /// Cheap by construction: a path whose new content differs is refused
+    /// before any read unless an auto rule could hold for it, then each
+    /// matching path costs two file lookups, and only the paths that differ
+    /// read contents, for the content rules.
     pub async fn carried_paths(
         &self,
         from: ChangesetId,
         id: ChangesetId,
         rules: &ReviewRules,
-        owners: &mut OwnersResolver<'_>,
     ) -> Result<Option<BTreeSet<RepoPath>>> {
         let theirs = self.get_changeset(from).await?;
+        // A merge's changes are not all its own (`merge_parent`, dropped
+        // side changes); its paths are not compared.
+        if theirs.parents.len() > 1 || theirs.changes.len() > MAX_CARRY_PATHS {
+            return Ok(None);
+        }
         let mine = self.get_changeset(id).await?;
-        // With no reviews every path that needs a human is pending.
-        let judged = self.review_changeset(from, rules, &[], owners).await?;
         let new_key = |c: &FileChange| match c {
             FileChange::Modify { content, kind, .. } => Some((*content, *kind)),
             FileChange::Delete => None,
         };
-        let mut out = BTreeSet::new();
-        for p in judged.paths.iter().filter(|p| p.rule == PathRule::Pending) {
-            // A dropped side change has no change of its own to compare.
-            let (Some(a), Some(b)) = (theirs.changes.get(&p.path), mine.changes.get(&p.path))
-            else {
-                return Ok(None);
-            };
-            if new_key(a) != new_key(b) {
+        let content_rules =
+            rules.enabled(AutoRule::CommentOnly) || rules.enabled(AutoRule::WhitespaceOnly);
+        // Could an auto rule approve this path in `from`? Decided without a
+        // read where it can be: never for `OWNERS`, always for a docs path.
+        let may_be_auto = |p: &RepoPath, c: &FileChange| {
+            p.file_name() != OWNERS_FILE
+                && ((rules.enabled(AutoRule::DocsOnly) && rules.is_docs(p.as_str()))
+                    || (content_rules && matches!(c, FileChange::Modify { .. })))
+        };
+        let mut same_new = Vec::new();
+        let mut differ = Vec::new();
+        for (p, c) in &theirs.changes {
+            if mine.changes.get(p).map(new_key) == Some(new_key(c)) {
+                same_new.push((p, c));
+            } else if may_be_auto(p, c) {
+                differ.push((p, c));
+            } else {
                 return Ok(None);
             }
-            let old = |parent: Option<ChangesetId>| async move {
+        }
+        let (px, py) = (
+            theirs.parents.first().copied(),
+            mine.parents.first().copied(),
+        );
+        let old = |parent: Option<ChangesetId>, p: &RepoPath| {
+            let p = p.clone();
+            async move {
                 Ok::<_, Error>(match parent {
                     Some(parent) => self
-                        .lookup_file(parent, &p.path)
+                        .lookup_file(parent, &p)
                         .await?
                         .map(|f| (f.content, f.kind)),
                     None => None,
                 })
-            };
-            if old(theirs.parents.first().copied()).await?
-                != old(mine.parents.first().copied()).await?
-            {
+            }
+        };
+        let mut out = BTreeSet::new();
+        for (p, c) in same_new {
+            if old(px, p).await? == old(py, p).await? {
+                out.insert(p.clone());
+            } else if may_be_auto(p, c) {
+                differ.push((p, c));
+            } else {
                 return Ok(None);
             }
-            out.insert(p.path.clone());
+        }
+        for (p, c) in differ {
+            if self.auto_rule(rules, p, px, c).await?.is_none() {
+                return Ok(None);
+            }
         }
         Ok((!out.is_empty()).then_some(out))
     }

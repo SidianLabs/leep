@@ -1880,3 +1880,178 @@ async fn a_resolved_stack_carries_each_entry_it_kept_exactly() {
     );
     assert_eq!(api.land(y, "bob").await.status, StatusCode::OK);
 }
+
+/// A review stored with a chosen time, past the endpoint (and so past its
+/// take-back), to order verdicts within one second.
+async fn put_at(api: &Api, id: ChangesetId, who: &str, v: Verdict, at: i64) {
+    api.repo
+        .put_review(
+            id,
+            &leep_core::review::Review {
+                reviewer: who.into(),
+                verdict: v,
+                comment: String::new(),
+                timestamp: at,
+            },
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn the_newest_verdict_wins_whatever_order_the_hint_names_them_in() {
+    // Alice approved `x`, then rejected (or withdrew on) `x2`, an identical
+    // re-commit. A third copy names both, in either order: her newest word
+    // decides, not the first id in the hint.
+    for later in [Verdict::Reject, Verdict::Withdrawn] {
+        let c = carry_setup().await;
+        put_at(&c.api, c.x, "alice", Verdict::Approve, 100).await;
+        let x2 = c.resolve(A1, Some(c.x)).await;
+        assert!(c.api.status(x2).await.approved);
+        put_at(&c.api, x2, "alice", later, 200).await;
+        for hint in [format!("{},{x2}", c.x), format!("{x2},{}", c.x)] {
+            let x3 = c
+                .api
+                .commit_from(&[c.head], &[("src/a.rs", Some(A1))], Some(&hint))
+                .await;
+            let s = c.api.status(x3).await;
+            assert!(!s.approved, "{later:?} {hint}: {s:?}");
+            let want = if later == Verdict::Reject {
+                "rejected"
+            } else {
+                "pending"
+            };
+            assert_eq!(rules(&s), [("src/a.rs", want)], "{hint}");
+            assert_eq!(
+                c.api.land(x3, "bob").await.status,
+                StatusCode::UNPROCESSABLE_ENTITY
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_newer_approval_wins_only_where_its_changeset_reproduces_the_path() {
+    let c = carry_setup().await;
+    put_at(&c.api, c.x, "alice", Verdict::Reject, 100).await;
+    // `same` reproduces `x`'s change; `other` does not.
+    let same = c.resolve(A1, Some(c.x)).await;
+    put_at(&c.api, same, "alice", Verdict::Approve, 200).await;
+    let other = c.resolve("fn a() { other() }\n", Some(c.x)).await;
+    put_at(&c.api, other, "alice", Verdict::Approve, 300).await;
+    for hint in [format!("{},{same}", c.x), format!("{same},{}", c.x)] {
+        let y = c
+            .api
+            .commit_from(&[c.head], &[("src/a.rs", Some(A1))], Some(&hint))
+            .await;
+        let s = c.api.status(y).await;
+        assert!(s.approved, "{hint}: {s:?}");
+        assert_eq!(s.paths[0].carried_from, Some(same));
+    }
+    for hint in [format!("{},{other}", c.x), format!("{other},{}", c.x)] {
+        let y = c
+            .api
+            .commit_from(&[c.head], &[("src/a.rs", Some(A1))], Some(&hint))
+            .await;
+        let s = c.api.status(y).await;
+        assert_eq!(rules(&s), [("src/a.rs", "rejected")], "{hint}");
+        assert_eq!(s.paths[0].carried_from, Some(c.x));
+    }
+}
+
+#[tokio::test]
+async fn a_reject_on_a_copy_takes_back_the_approval_it_carried() {
+    // The copy that names only `x` would otherwise never see the reject on
+    // `x2`: the reject is also recorded on `x`, as alice's, with its source.
+    for later in [Verdict::Reject, Verdict::Withdrawn] {
+        let c = carry_setup().await;
+        c.api.approve(c.x, "alice").await;
+        let x2 = c.resolve(A1, Some(c.x)).await;
+        assert!(c.api.status(x2).await.approved);
+        assert_eq!(
+            c.api.review(x2, "alice", later).await.status,
+            StatusCode::OK
+        );
+        let on_x = c.api.reviews(c.x).await.reviews;
+        assert_eq!(on_x[0].verdict, later);
+        assert_eq!(
+            on_x[0].source.as_deref(),
+            Some(&*format!("leep:taken-back-on:{x2}"))
+        );
+        let x3 = c.resolve(A1, Some(c.x)).await;
+        assert!(!c.api.status(x3).await.approved, "{later:?}");
+        assert_eq!(
+            c.api.land(x3, "bob").await.status,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        // A copy that did not reproduce `x` takes nothing back.
+        c.api.approve(c.x, "alice").await;
+        let other = c.resolve("fn a() { other() }\n", Some(c.x)).await;
+        c.api.review(other, "alice", Verdict::Reject).await;
+        assert_eq!(
+            c.api.reviews(c.x).await.reviews[0].verdict,
+            Verdict::Approve
+        );
+    }
+}
+
+#[tokio::test]
+async fn too_many_reviewed_candidates_carry_nothing_and_the_work_is_bounded() {
+    use leep_testkit::budget::Budget;
+    // Behind a counting store: the work of one status request on a
+    // changeset whose hint names 64 approved candidates, none reproducing.
+    let budget = Budget::new(
+        Arc::new(MemoryBlobStore::new()),
+        Arc::new(MemoryMetaStore::new()),
+    );
+    let mut repo = Repo::new(budget.clone(), budget.clone());
+    let policy = ReviewPolicy::parse(POLICY).unwrap();
+    let svc = Arc::new(ReviewService::new(auth().reviewers(), policy.rules));
+    repo = repo.with_land_policy(Arc::new(RequireReview::new(svc.clone(), policy.refs)));
+    let api = Api {
+        app: leep_server::router_with_review(repo.clone(), 1 << 20, Some(auth()), None, Some(svc)),
+        repo,
+    };
+    let base = api
+        .seed_main(&[("OWNERS", Some("alice\n")), ("a", Some("1\n"))])
+        .await;
+    let mut ids = Vec::new();
+    for i in 0..64 {
+        let x = api
+            .commit(&[base], &[("a", Some(&format!("x{i}\n")))])
+            .await;
+        put_at(&api, x, "alice", Verdict::Approve, 100).await;
+        ids.push(x.to_string());
+    }
+    let y = api
+        .commit_from(&[base], &[("a", Some("y\n"))], Some(&ids.join(",")))
+        .await;
+    budget.start();
+    let s = api.status(y).await;
+    let used = budget.stop();
+    assert_eq!(rules(&s), [("a", "pending")]);
+    // The walk reads the 64 changesets (and the one rebase row of the
+    // hinted changeset); reviews are read per candidate (4 principals here)
+    // until the 17th reviewed one, when nothing carries and the rest are
+    // not compared. Measured: 174 calls (100 changesets, 72 review rows).
+    let meta = used.meta_calls();
+    eprintln!(
+        "carry status over 64 candidates: {meta} meta calls, {} blob calls\n{used}",
+        used.blob_calls()
+    );
+    assert!(meta <= 180, "{meta} meta calls\n{used}");
+    // With one more reviewed candidate than the cap, an approval that
+    // would carry does not: no partial answer.
+    let good = api.commit(&[base], &[("a", Some("y\n"))]).await;
+    put_at(&api, good, "alice", Verdict::Approve, 100).await;
+    let mut hint = vec![good.to_string()];
+    hint.extend(ids.iter().take(16).cloned());
+    let z = api
+        .commit_from(&[base], &[("a", Some("y\n"))], Some(&hint.join(",")))
+        .await;
+    assert!(!api.status(z).await.approved);
+    let ok = api
+        .commit_from(&[base], &[("a", Some("y\n"))], Some(&hint[..16].join(",")))
+        .await;
+    assert!(api.status(ok).await.approved);
+}

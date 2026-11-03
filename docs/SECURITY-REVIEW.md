@@ -122,7 +122,26 @@ file and drops the one it was approved with. Rejects carry the same way, so
 re-committing does not escape a veto; a reviewer's own verdict on Y, a
 withdrawal included, wins over a carried one. Several candidates (a
 resolved stack) are each checked on their own, so combining them carries no
-verdict to a path its own candidate did not reproduce whole. The hint walk is bounded (64
+verdict to a path its own candidate did not reproduce whole.
+
+*Follow-up (review of the first version).* Where several candidates carried
+to a path, the first with a verdict decided, and the client orders the hint:
+approve X, reject the identical copy X2, then name `X,X2` (or only `X`) on a
+third copy, and the approval carried. Now each reviewer's newest review among
+the reproducing candidates decides, whatever the order, and a reject or
+withdrawal posted on a copy is also written on the candidates whose approval
+by the same reviewer carried to it, so naming only `X` finds it too. The
+cost was also unbounded in practice (a full judgement per candidate, merges
+included); it is now capped (16 compared candidates, then none carry; no
+merges; no judgement of X). Tests:
+`the_newest_verdict_wins_whatever_order_the_hint_names_them_in`,
+`a_newer_approval_wins_only_where_its_changeset_reproduces_the_path`,
+`a_reject_on_a_copy_takes_back_the_approval_it_carried`,
+`too_many_reviewed_candidates_carry_nothing_and_the_work_is_bounded`.
+
+*Accepted.* A carried approval re-lands a change identical to one that was
+later reverted: the identical-change rule cannot tell a reverted change from
+one never landed, as landing the approved original itself again could not. The hint walk is bounded (64
 candidates), ids that do not parse or do not exist are skipped, and a hint
 naming Y itself is ignored. Tests in `crates/leep-server/tests/reviews.rs`:
 `a_forged_hint_to_an_approved_changeset_gains_nothing`,

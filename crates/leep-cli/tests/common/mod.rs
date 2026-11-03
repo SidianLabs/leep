@@ -481,6 +481,7 @@ async fn review_status(
             owners: vec![],
             approved_by: ok.clone(),
             rejected_by: no.clone(),
+            carried_from: None,
         })
         .collect();
     Ok(Json(ReviewStatusResponse {

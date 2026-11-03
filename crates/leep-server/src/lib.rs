@@ -1007,6 +1007,7 @@ struct StatusQuery {
 
 async fn add_review(
     State(repo): S,
+    Extension(config): Cfg,
     auth::MaybePrincipal(who): auth::MaybePrincipal,
     Path(id): Path<String>,
     body: Bytes,
@@ -1066,16 +1067,18 @@ async fn add_review(
         )
         .await?;
     }
-    repo.put_review(
-        id,
-        &leep_core::review::Review {
-            reviewer: reviewer.clone(),
-            verdict: req.verdict,
-            comment: req.comment,
-            timestamp,
-        },
-    )
-    .await?;
+    let review = leep_core::review::Review {
+        reviewer: reviewer.clone(),
+        verdict: req.verdict,
+        comment: req.comment,
+        timestamp,
+    };
+    repo.put_review(id, &review).await?;
+    // A reject or withdrawal also takes back the approvals by the same
+    // reviewer that carried to `id` (ADR 0085).
+    if let Some(service) = config.review.as_ref() {
+        service.take_back(&repo, id, &review, &who.name).await?;
+    }
     Ok(Json(AddReviewResponse {
         reviewer,
         verdict: req.verdict,

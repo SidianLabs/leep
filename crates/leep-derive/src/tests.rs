@@ -3043,14 +3043,10 @@ mod review {
             "m",
         )
         .await;
-        let mut o = OwnersResolver::new(&r, Some(moved)).await.unwrap();
         let carried = |y| {
             let r = r.clone();
             let docs = docs.clone();
-            async move {
-                let mut o = OwnersResolver::new(&r, Some(moved)).await.unwrap();
-                r.carried_paths(x, y, &docs, &mut o).await.unwrap()
-            }
+            async move { r.carried_paths(x, y, &docs).await.unwrap() }
         };
         // The docs path is auto in `x`, so `y` may change it differently,
         // and add a path of its own.
@@ -3089,13 +3085,26 @@ mod review {
         let on_b = commit(&r, &[base], &[("a.rs", Some("5\n"))], "a moved").await;
         let rebased = commit(&r, &[on_b], &[("a.rs", Some("2\n"))], "rebased").await;
         assert_eq!(carried(rebased).await, None);
-        // A `x` that needed no reviewer carries nothing.
-        let docs_only = commit(&r, &[base], &[("N.md", Some("d\n"))], "d").await;
+        // An OWNERS file is never auto, even under a docs glob.
+        let docs_owners = ReviewRules::new([AutoRule::DocsOnly], &["**".into()]).unwrap();
+        let owners = commit(
+            &r,
+            &[base],
+            &[("OWNERS", Some("x\n")), ("a.rs", Some("2\n"))],
+            "o",
+        )
+        .await;
+        let y = commit(&r, &[base], &[("a.rs", Some("2\n"))], "y").await;
         assert_eq!(
-            r.carried_paths(docs_only, docs_only, &docs, &mut o)
-                .await
-                .unwrap(),
+            r.carried_paths(owners, y, &docs_owners).await.unwrap(),
             None
+        );
+        // A merge is never a source, whatever it reproduces.
+        let merge = commit(&r, &[x, moved], &[("a.rs", Some("2\n"))], "merge").await;
+        assert_eq!(r.carried_paths(merge, y, &docs).await.unwrap(), None);
+        assert_eq!(
+            r.carried_paths(x, y, &docs).await.unwrap(),
+            Some(BTreeSet::from([rp("a.rs")]))
         );
     }
 }
