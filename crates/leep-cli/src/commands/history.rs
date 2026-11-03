@@ -5,8 +5,10 @@ use leep_core::api::{
     BlameResponse, ChangesetInfo, LogSummaryEntry, ProvenanceResponse, SignaturesResponse,
 };
 use leep_core::changeset::{EXTRA_AGENT_MODEL, EXTRA_AGENT_SESSION};
+use leep_core::rename::DEFAULT_THRESHOLD;
 use leep_core::{out, outln};
 
+use super::diff::{diff_text, parent_diff};
 use super::{print_json, Head, Remote};
 use crate::client::LogQuery;
 use crate::error::{CliError, Result};
@@ -59,6 +61,11 @@ pub struct LogArgs {
     /// `agent.*` metadata), which `--json` prints.
     #[arg(long)]
     pub oneline: bool,
+    /// Print every metadata key and the whole message. By default an entry
+    /// leaves out `git.*` keys (raw headers of imported git commits) and
+    /// prints the message's first paragraph; `--json` always has everything.
+    #[arg(short = 'v', long, conflicts_with = "oneline")]
+    pub verbose: bool,
     /// Draw the commit graph left of the entries. Not with filters, which
     /// leave out the changesets that connect the shown ones; ignored with
     /// `--json`.
@@ -132,6 +139,10 @@ pub struct LastChangeArgs {
 pub struct ShowArgs {
     /// Ref or tag name, changeset id (full, or 4+ leading hex digits), or `@`.
     pub rev: String,
+    /// Also print the patch: the changeset's diff against its first parent,
+    /// as `leep diff REV` shows it (with `--json`, a `patch` field).
+    #[arg(short = 'p', long)]
+    pub patch: bool,
 }
 
 #[derive(Args, Debug)]
@@ -168,10 +179,33 @@ pub fn note_stale(answered_at: Option<leep_core::ChangesetId>, behind: Option<u6
     }
 }
 
-/// `abbreviate` prints the 12-digit short id, which every command accepts
-/// back; `--json` always has the full id.
-fn header(info: &ChangesetInfo, abbreviate: bool) -> String {
-    let id = if abbreviate {
+/// How much of a changeset [`header`] prints.
+#[derive(Clone, Copy, Debug)]
+struct Detail {
+    /// The 12-digit short id, which every command accepts back; `--json`
+    /// always has the full id.
+    abbreviate: bool,
+    /// `Parent:` lines, for `show`.
+    parents: bool,
+    /// Every metadata key and the whole message. Without it `git.*` keys
+    /// are left out: imported history carries raw commit headers there
+    /// (signatures, encodings), kilobytes per entry that a log reader skips.
+    full: bool,
+}
+
+impl Detail {
+    const SHOW: Detail = Detail {
+        abbreviate: false,
+        parents: true,
+        full: true,
+    };
+}
+
+/// Metadata keys a default `leep log` leaves out.
+const QUIET_EXTRA_PREFIX: &str = "git.";
+
+fn header(info: &ChangesetInfo, d: Detail) -> String {
+    let id = if d.abbreviate {
         short(info.id)
     } else {
         info.id.to_string()
@@ -180,19 +214,48 @@ fn header(info: &ChangesetInfo, abbreviate: bool) -> String {
         "{}\n",
         term::paint(&format!("changeset {id}"), Style::Yellow)
     );
+    if d.parents {
+        for p in &info.changeset.parents {
+            out.push_str(&format!("Parent: {p}\n"));
+        }
+    }
     out.push_str(&format!("Author: {}\n", info.changeset.author));
     out.push_str(&format!("Date:   {}\n", utc_time(info.changeset.timestamp)));
     for (k, v) in &info.changeset.extra {
-        out.push_str(&format!("{k}: {v}\n"));
+        if d.full || !k.starts_with(QUIET_EXTRA_PREFIX) {
+            out.push_str(&format!("{k}: {v}\n"));
+        }
     }
     for line in follow_lines(info) {
         out.push_str(&format!("{line}\n"));
     }
     out.push('\n');
-    for line in info.changeset.message.lines() {
+    let message = &info.changeset.message;
+    let shown = if d.full {
+        message.as_str()
+    } else {
+        first_paragraph(message)
+    };
+    for line in shown.lines() {
         out.push_str(&format!("    {line}\n"));
     }
+    if shown.len() < message.trim().len() {
+        out.push_str("    [...]\n");
+    }
     out
+}
+
+/// The message up to its first blank line, without leading blank lines.
+fn first_paragraph(message: &str) -> &str {
+    let m = message.trim_start_matches(['\n', '\r']);
+    let mut end = 0;
+    for line in m.split_inclusive('\n') {
+        if line.trim().is_empty() {
+            break;
+        }
+        end += line.len();
+    }
+    m[..end].trim_end()
 }
 
 /// `leep log --oneline`: short id and the message's first line.
@@ -251,7 +314,14 @@ pub fn log(r: &Remote, args: &LogArgs) -> Result<i32> {
     }
     let mut graph = args.graph.then(Graph::new);
     for info in &resp.entries {
-        let text = header(info, true);
+        let text = header(
+            info,
+            Detail {
+                abbreviate: true,
+                parents: false,
+                full: args.verbose,
+            },
+        );
         match &mut graph {
             Some(g) => {
                 let lines: Vec<&str> = text.lines().chain([""]).collect();
@@ -279,7 +349,16 @@ pub fn last_change(r: &Remote, args: &LastChangeArgs) -> Result<i32> {
         print_json(&resp)?;
         return Ok(0);
     }
-    out!("{}", header(&resp.changeset, false));
+    out!(
+        "{}",
+        header(
+            &resp.changeset,
+            Detail {
+                parents: false,
+                ..Detail::SHOW
+            }
+        )
+    );
     for c in &resp.concurrent {
         outln!("also changed concurrently in {c}");
     }
@@ -295,23 +374,35 @@ pub fn show(r: &Remote, args: &ShowArgs) -> Result<i32> {
             info
         }
     };
-    if r.json {
-        print_json(&info)?;
+    if !args.patch {
+        if r.json {
+            print_json(&info)?;
+        } else {
+            term::page(&show_text(r, &info)?, false)?;
+        }
         return Ok(0);
     }
-    term::page(&show_text(r, &info)?, false)?;
+    let parent = info.changeset.parents.first().copied();
+    let resp = parent_diff(r, parent.as_ref(), &info.id, Some(DEFAULT_THRESHOLD))?;
+    let patch = diff_text(r, &resp)?;
+    if r.json {
+        let mut v = serde_json::to_value(&info)?;
+        v["patch"] = serde_json::Value::String(patch);
+        print_json(&v)?;
+        return Ok(0);
+    }
+    let mut out = show_text(r, &info)?;
+    out.push('\n');
+    out.push_str(&term::diff(&patch));
+    term::page(&out, false)?;
     Ok(0)
 }
 
-/// What `leep show` prints for `info`: parents, header, signers and the
-/// changed paths.
+/// What `leep show` prints for `info`: the header with its parents,
+/// signers and the changed paths.
 pub(crate) fn show_text(r: &Remote, info: &ChangesetInfo) -> Result<String> {
     let id = info.id;
-    let mut out = String::new();
-    for p in &info.changeset.parents {
-        out.push_str(&format!("parent {p}\n"));
-    }
-    out.push_str(&header(info, false));
+    let mut out = header(info, Detail::SHOW);
     // Older servers lack the endpoint; a changeset is still worth showing.
     if let Ok(sigs) = r.client.signatures(&id) {
         for line in signature_lines(&sigs) {
@@ -561,6 +652,7 @@ mod tests {
             extra: vec![],
             after: None,
             oneline: false,
+            verbose: false,
             graph: false,
         }
     }
@@ -655,6 +747,66 @@ mod tests {
             follow_lines(&info),
             ["File:   b.txt", "renamed: a.txt -> b.txt (91%)"]
         );
+    }
+
+    #[test]
+    fn default_log_entries_hide_git_headers_and_the_message_body() {
+        let mut extra = BTreeMap::new();
+        extra.insert("agent.model".to_string(), "m1".to_string());
+        extra.insert("git.extra_headers".to_string(), "gpgsig ...".to_string());
+        extra.insert("leep.rebased_from".to_string(), "abc".to_string());
+        let info = ChangesetInfo {
+            id: cid(1),
+            changeset: leep_core::Changeset {
+                parents: vec![cid(2)],
+                author: "a".into(),
+                timestamp: 0,
+                message: "\nsubject\nmore subject\n\nbody\n\nmore body\n".into(),
+                changes: BTreeMap::new(),
+                extra,
+            },
+            generation: 2,
+            root_tree: Hash::of_blob(b""),
+            path_at: None,
+            renamed: None,
+        };
+        let quiet = header(
+            &info,
+            Detail {
+                abbreviate: true,
+                parents: false,
+                full: false,
+            },
+        );
+        assert!(
+            quiet.contains("agent.model: m1\nleep.rebased_from: abc\n"),
+            "{quiet}"
+        );
+        assert!(
+            !quiet.contains("git.") && !quiet.contains("Parent:"),
+            "{quiet}"
+        );
+        assert!(
+            quiet.ends_with("\n\n    subject\n    more subject\n    [...]\n"),
+            "{quiet}"
+        );
+        let full = header(&info, Detail::SHOW);
+        assert!(
+            full.contains(&format!(
+                "changeset {}\nParent: {}\nAuthor: a\n",
+                cid(1),
+                cid(2)
+            )),
+            "{full}"
+        );
+        assert!(full.contains("git.extra_headers: gpgsig ...\n"), "{full}");
+        assert!(
+            full.contains("    body\n    \n    more body\n") && !full.contains("[...]"),
+            "{full}"
+        );
+        assert_eq!(first_paragraph("one line"), "one line");
+        assert_eq!(first_paragraph("a\r\n\r\nb"), "a");
+        assert_eq!(first_paragraph(""), "");
     }
 
     #[test]

@@ -6,7 +6,7 @@ use std::fs;
 use clap::Args;
 use leep_core::api::{DiffResponse, FileInfo, RenameEntry};
 use leep_core::rename::RenameOptions;
-use leep_core::FileKind;
+use leep_core::{ChangesetId, FileKind};
 
 use super::{print_json, Ctx, Remote};
 use crate::error::{CliError, Result};
@@ -16,8 +16,9 @@ use crate::term;
 
 #[derive(Args, Debug, Default)]
 pub struct DiffArgs {
-    /// Either nothing (working copy vs base) or `FROM TO` revisions.
-    #[arg(num_args = 0..=2, value_name = "FROM TO")]
+    /// Nothing (working copy vs base), `REV` (that changeset's own change,
+    /// against its first parent) or `FROM TO` revisions.
+    #[arg(num_args = 0..=2, value_name = "REV | FROM TO")]
     pub revs: Vec<String>,
     /// Show a renamed file as a delete and an add.
     #[arg(long, conflicts_with = "find_renames")]
@@ -48,8 +49,11 @@ impl DiffArgs {
 pub fn run(ctx: &Ctx, args: &DiffArgs) -> Result<i32> {
     match args.revs.as_slice() {
         [] => working_copy(ctx, args.threshold()),
+        [rev] => changeset(&ctx.remote(), rev, args.threshold()),
         [from, to] => revisions(&ctx.remote(), from, to, args.threshold()),
-        _ => Err(CliError::user("diff takes no arguments or exactly FROM TO")),
+        _ => Err(CliError::user(
+            "diff takes no arguments, one revision, or FROM TO",
+        )),
     }
 }
 
@@ -124,11 +128,43 @@ pub fn working_diff(ctx: &Ctx, threshold: Option<u8>) -> Result<(String, Vec<Ren
 
 fn revisions(r: &Remote, from: &str, to: &str, threshold: Option<u8>) -> Result<i32> {
     let resp = revisions_diff(r, from, to, threshold)?;
+    print_diff(r, &resp)
+}
+
+/// `leep diff REV`: what REV itself changed, as `leep diff REV^ REV` would
+/// show it; a root changeset is diffed against the empty tree.
+fn changeset(r: &Remote, rev: &str, threshold: Option<u8>) -> Result<i32> {
+    let id = r.resolve(rev)?;
+    let parent = r
+        .cache
+        .changeset(r.client, &id)?
+        .changeset
+        .parents
+        .first()
+        .copied();
+    let resp = parent_diff(r, parent.as_ref(), &id, threshold)?;
+    print_diff(r, &resp)
+}
+
+/// The diff from `parent` (`None`: the empty tree) to `id`.
+pub fn parent_diff(
+    r: &Remote,
+    parent: Option<&ChangesetId>,
+    id: &ChangesetId,
+    threshold: Option<u8>,
+) -> Result<DiffResponse> {
+    match threshold {
+        Some(t) => r.client.diff_renames(parent, id, None, Some(t)),
+        None => r.client.diff(parent, id, None),
+    }
+}
+
+fn print_diff(r: &Remote, resp: &DiffResponse) -> Result<i32> {
     if r.json {
-        print_json(&resp)?;
+        print_json(resp)?;
         return Ok(0);
     }
-    term::page(&term::diff(&diff_text(r, &resp)?), false)?;
+    term::page(&term::diff(&diff_text(r, resp)?), false)?;
     Ok(0)
 }
 
@@ -141,10 +177,7 @@ pub fn revisions_diff(
 ) -> Result<DiffResponse> {
     let from = r.resolve(from)?;
     let to = r.resolve(to)?;
-    match threshold {
-        Some(t) => r.client.diff_renames(Some(&from), &to, None, Some(t)),
-        None => r.client.diff(Some(&from), &to, None),
-    }
+    parent_diff(r, Some(&from), &to, threshold)
 }
 
 /// The unified diff of every entry, fetching blobs through the cache.

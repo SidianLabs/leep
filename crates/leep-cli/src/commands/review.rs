@@ -2,7 +2,7 @@
 //! still needs before it can land (ADR 0011).
 
 use clap::{Args, Subcommand};
-use leep_core::api::{AddReviewRequest, ReviewStatusResponse, ReviewsResponse};
+use leep_core::api::{AddReviewRequest, PathReview, ReviewStatusResponse, ReviewsResponse};
 use leep_core::outln;
 use leep_core::review::Verdict;
 
@@ -12,9 +12,11 @@ use crate::fmt::{plural, short, utc_time};
 
 #[derive(Subcommand, Debug)]
 pub enum ReviewCmd {
-    /// Approve a changeset as the authenticated user.
+    /// Approve a changeset as the authenticated user, then say whether it
+    /// may now land on the target ref or which paths still wait.
     Approve(ApproveArgs),
     /// Reject a changeset; an owner's rejection blocks it from landing.
+    /// Says where that leaves it, as `approve` does.
     Reject(RejectArgs),
     /// Take back your earlier approval or rejection; it then counts as no review.
     Withdraw(ApproveArgs),
@@ -84,6 +86,18 @@ fn verdict(r: &Remote, rev: &str, v: Verdict, comment: Option<String>) -> Result
             Verdict::Withdrawn => "Withdrew review of",
         };
         outln!("{word} {} as {}", short(id), resp.reviewer);
+        // Only a hint: the verdict is recorded whatever this says.
+        match r.client.review_status(&id, r.target_ref) {
+            Ok(st) => {
+                for line in verdict_follow_up(&st) {
+                    outln!("{line}");
+                }
+            }
+            Err(e) => eprintln!(
+                "(could not read the review status on {}: {e})",
+                r.target_ref
+            ),
+        }
     }
     Ok(0)
 }
@@ -116,7 +130,9 @@ pub fn list(r: &Remote, args: &ListArgs) -> Result<i32> {
     Ok(0)
 }
 
-/// Human-readable review status, one line per changed path.
+/// Human-readable review status, one line per changed path, then how to
+/// see the change. The server's rule names stay in `--json`; here each path
+/// says what satisfied it or what it still needs.
 pub fn status_lines(resp: &ReviewStatusResponse) -> Vec<String> {
     let mut out = vec![format!(
         "changeset {} on {}: {}",
@@ -128,33 +144,67 @@ pub fn status_lines(resp: &ReviewStatusResponse) -> Vec<String> {
             "not approved"
         }
     )];
+    let width = resp
+        .paths
+        .iter()
+        .map(|p| p.path.as_str().chars().count())
+        .max()
+        .unwrap_or(0);
     for p in &resp.paths {
-        let state = match p.rule.as_str() {
-            "pending" => "PENDING",
-            "rejected" => "REJECTED",
-            _ => "ok",
-        };
-        let mut notes = Vec::new();
-        if p.owners.is_empty() {
-            notes.push("no owners: any reviewer".to_string());
-        } else {
-            notes.push(format!("owners: {}", p.owners.join(", ")));
-        }
-        if !p.approved_by.is_empty() {
-            notes.push(format!("approved by: {}", p.approved_by.join(", ")));
-        }
-        if !p.rejected_by.is_empty() {
-            notes.push(format!("rejected by: {}", p.rejected_by.join(", ")));
-        }
-        out.push(format!(
-            "  {state:<8} {:<20} {} ({})",
-            p.rule,
-            p.path,
-            notes.join("; ")
-        ));
+        let (state, why) = path_state(p);
+        out.push(format!("  {state:<8} {:<width$}  {why}", p.path.as_str()));
     }
     if resp.paths.is_empty() {
         out.push("  (no changed paths)".into());
+    }
+    out.push(format!("diff: leep diff {}", short(resp.changeset)));
+    out
+}
+
+/// The state column and the explanation for one path.
+fn path_state(p: &PathReview) -> (&'static str, String) {
+    let who = |names: &[String]| names.join(", ");
+    let whose = if p.owners.is_empty() {
+        "any reviewer"
+    } else {
+        "owner"
+    };
+    let rejected = || {
+        let mut why = format!("rejected by {}", who(&p.rejected_by));
+        if !p.approved_by.is_empty() {
+            why.push_str(&format!("; approved by {}", who(&p.approved_by)));
+        }
+        why
+    };
+    match p.rule.as_str() {
+        "pending" if p.owners.is_empty() => {
+            ("PENDING", "needs an approval from any reviewer".into())
+        }
+        "pending" => ("PENDING", format!("needs one of: {}", who(&p.owners))),
+        "rejected" => ("REJECTED", rejected()),
+        "owner" => (
+            "ok",
+            format!("approved by {} ({whose})", who(&p.approved_by)),
+        ),
+        "merge_parent" => ("ok", "unchanged from a merge parent".into()),
+        rule if rule.starts_with("auto:") => ("ok", format!("needs no review ({rule})")),
+        // A rule this client does not know: say it as the server does.
+        rule => ("?", format!("rule {rule}")),
+    }
+}
+
+/// After a verdict: whether the changeset may now land on `target_ref`, or
+/// which paths still hold it back.
+pub fn verdict_follow_up(resp: &ReviewStatusResponse) -> Vec<String> {
+    if resp.approved {
+        return vec![format!("now approved for {}", resp.target_ref)];
+    }
+    let mut out = vec![format!("not yet approved for {}:", resp.target_ref)];
+    for p in &resp.paths {
+        let (state, why) = path_state(p);
+        if state != "ok" {
+            out.push(format!("  {state:<8} {}  {why}", p.path));
+        }
     }
     out
 }
@@ -198,7 +248,7 @@ pub fn review_lines(id: leep_core::ChangesetId, resp: &ReviewsResponse) -> Vec<S
 
 #[cfg(test)]
 mod tests {
-    use leep_core::api::{PathReview, ReviewEntry};
+    use leep_core::api::ReviewEntry;
     use leep_core::review::Review;
     use leep_core::{ChangesetId, Hash, RepoPath};
 
@@ -220,7 +270,7 @@ mod tests {
     }
 
     #[test]
-    fn status_lists_each_path() {
+    fn status_says_what_each_path_needs() {
         let resp = ReviewStatusResponse {
             changeset: id(),
             target_ref: "main".into(),
@@ -229,19 +279,43 @@ mod tests {
                 path("a.rs", "auto:comment_only", &["alice"], &[], &[]),
                 path("b.rs", "pending", &["alice", "bob"], &[], &[]),
                 path("c.rs", "rejected", &[], &["carol"], &["dan"]),
+                path("d.rs", "owner", &[], &["rhea"], &[]),
+                path("e.rs", "owner", &["alice"], &["alice"], &[]),
+                path("f.rs", "pending", &[], &[], &[]),
+                path("g.rs", "merge_parent", &[], &[], &[]),
+                path("h.rs", "future_rule", &[], &[], &[]),
             ],
         };
         let lines = status_lines(&resp);
-        assert!(lines[0].ends_with("on main: not approved"), "{lines:?}");
-        assert!(
-            lines[1].contains("ok")
-                && lines[1].contains("auto:comment_only")
-                && lines[1].contains(" a.rs ")
+        let short = short(id());
+        assert_eq!(
+            lines,
+            [
+                format!("changeset {short} on main: not approved"),
+                "  ok       a.rs  needs no review (auto:comment_only)".into(),
+                "  PENDING  b.rs  needs one of: alice, bob".into(),
+                "  REJECTED c.rs  rejected by dan; approved by carol".into(),
+                "  ok       d.rs  approved by rhea (any reviewer)".into(),
+                "  ok       e.rs  approved by alice (owner)".into(),
+                "  PENDING  f.rs  needs an approval from any reviewer".into(),
+                "  ok       g.rs  unchanged from a merge parent".into(),
+                "  ?        h.rs  rule future_rule".into(),
+                format!("diff: leep diff {short}"),
+            ]
         );
-        assert!(lines[2].contains("PENDING") && lines[2].contains("owners: alice, bob"));
-        assert!(lines[3].contains("REJECTED"));
-        assert!(lines[3].contains("no owners") && lines[3].contains("rejected by: dan"));
-        assert!(lines[3].contains("approved by: carol"));
+        for l in &lines {
+            assert!(
+                !l.contains("PENDING  pending") && !l.contains(" owner "),
+                "{l}"
+            );
+        }
+        let follow = verdict_follow_up(&resp);
+        assert_eq!(follow[0], "not yet approved for main:");
+        assert_eq!(follow.len(), 5, "{follow:?}");
+        assert!(
+            follow[1].contains("b.rs") && follow[3].contains("f.rs"),
+            "{follow:?}"
+        );
     }
 
     #[test]
@@ -255,6 +329,7 @@ mod tests {
         let lines = status_lines(&resp);
         assert!(lines[0].ends_with(": approved"));
         assert_eq!(lines[1], "  (no changed paths)");
+        assert_eq!(verdict_follow_up(&resp), ["now approved for main"]);
     }
 
     #[test]

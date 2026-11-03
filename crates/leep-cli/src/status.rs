@@ -18,6 +18,15 @@ use crate::state::{FileState, WorkCopy, DIR};
 /// Marker line `leep land` writes into conflicted files.
 pub const CONFLICT_MARKER: &str = "<<<<<<< ";
 
+/// Whether a line of a conflicted file is a leftover marker: the start, a
+/// base section or the end of a conflict. Not `=======`, which is also how
+/// Markdown and reStructuredText underline headings.
+pub fn is_marker_line(line: &str) -> bool {
+    [CONFLICT_MARKER, "||||||| ", ">>>>>>> "]
+        .iter()
+        .any(|m| line.starts_with(m))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Change {
@@ -360,7 +369,7 @@ pub fn working_renames(
 
 pub fn still_conflicted(wc: &WorkCopy, path: &str) -> bool {
     fs::read_to_string(wc.abs(path))
-        .map(|s| s.lines().any(|l| l.starts_with(CONFLICT_MARKER)))
+        .map(|s| s.lines().any(is_marker_line))
         .unwrap_or(false)
 }
 
@@ -690,7 +699,17 @@ mod tests {
         let s = status(&wc).unwrap();
         assert_eq!(change_of(&s, "c.txt"), Some(Change::Conflicted));
         assert!(s.has_conflicts());
-        write(d.path(), "c.txt", "resolved");
+        // Half-removed markers still count; a heading underline does not.
+        for leftover in ["x\n>>>>>>> theirs\n", "||||||| base\nx\n"] {
+            write(d.path(), "c.txt", leftover);
+            let s = status(&wc).unwrap();
+            assert_eq!(
+                change_of(&s, "c.txt"),
+                Some(Change::Conflicted),
+                "{leftover:?}"
+            );
+        }
+        write(d.path(), "c.txt", "Title\n=======\nresolved");
         let s = status(&wc).unwrap();
         assert_eq!(change_of(&s, "c.txt"), Some(Change::Modified));
     }

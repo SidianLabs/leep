@@ -920,8 +920,14 @@ undone if anything fails, and the state is saved last. Conflicts become marker
 files like in `land`, and `commit` and `land` refuse while any remain. The CLI
 relabels the server's `<<<<<<< ours` / `>>>>>>> theirs` by role before writing
 (`main (landed)` / `yours` for `land` and `sync`, `yours` / `ID (merging)` for
-`merge`; `markers.rs`); detection only checks the `<<<<<<< ` prefix, so old and
-new labels both count.
+`merge`; `markers.rs`), drops an empty diff3 base section and labels a
+non-empty one `||||||| base`; detection checks the `<<<<<<< `, `||||||| ` and
+`>>>>>>> ` prefixes (not `=======`, a Markdown heading underline), so old and
+new labels and half-deleted conflicts all count. A conflicted `land` is
+remembered in `state.resolving` until a land lands or a checkout moves away,
+and the commit made on the head it rebased onto records the replaced stack in
+`leep.rebased_from` (comma-joined ids), a hint a server may use to carry
+review verdicts over to identical changes.
 Conflicts with no text merge (binary, delete versus modify) keep the local
 version and are recorded in `state.unresolved`; they block the same way until
 `leep resolve PATH` or `leep restore PATH` clears them. If the

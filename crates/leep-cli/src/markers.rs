@@ -4,9 +4,15 @@
 //! relabels them by role before writing the file (`docs/CLI.md`); the `/v1`
 //! text and the `ours`/`theirs` fields are unchanged.
 //!
-//! Only the label after the marker changes. Conflict detection
-//! ([`crate::status::CONFLICT_MARKER`]) looks at the `<<<<<<< ` prefix, so
-//! files with old and new labels are both recognised.
+//! The server writes diff3 style, with the common ancestor between the two
+//! sides as `||||||| original`. Where that section is empty (both sides
+//! added text where the base had none) it only adds noise, so the CLI drops
+//! it; a non-empty one is relabelled `||||||| base`.
+//!
+//! Only the labels change. Conflict detection
+//! ([`crate::status::is_marker_line`]) looks at the `<<<<<<< `, `||||||| `
+//! and `>>>>>>> ` prefixes, so files with old and new labels are both
+//! recognised.
 
 /// What the two sides of a conflict are called in the marker lines.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -36,18 +42,39 @@ const BASE: &str = "||||||| ";
 const SPLIT: &str = "=======";
 const THEIRS: &str = ">>>>>>> theirs";
 
-/// `text` with the server's default labels replaced by `labels`. Only whole
-/// marker lines in marker order are touched (`<<<<<<< ours`, an optional
-/// `|||||||` line, `=======`, `>>>>>>> theirs`), so file content that merely
-/// looks like a marker elsewhere is left alone.
+/// Label of a non-empty base section.
+const BASE_LABEL: &str = "||||||| base";
+
+/// How to read a marker file, for the conflict report: which section is
+/// which, and what resolving means.
+pub fn explain(labels: &Labels) -> String {
+    let (ours, theirs) = (&labels.ours, &labels.theirs);
+    format!(
+        "Each conflict holds both versions: from `<<<<<<< {ours}` to `=======` is {ours}, \
+         from `=======` to `>>>>>>> {theirs}` is {theirs}; a `{BASE_LABEL}` section before \
+         `=======`, if present, is the text both started from. Keep what you want and delete \
+         the marker lines."
+    )
+}
+
+/// `text` with the server's default labels replaced by `labels`, an empty
+/// base section dropped and a non-empty one labelled `||||||| base`. Only
+/// whole marker lines in marker order are touched (`<<<<<<< ours`, an
+/// optional `|||||||` line, `=======`, `>>>>>>> theirs`), so file content
+/// that merely looks like a marker elsewhere is left alone.
 pub fn relabel(text: &str, labels: &Labels) -> String {
     #[derive(PartialEq)]
     enum In {
         Outside,
         Ours,
+        /// Just after a base line, held back until it is known whether the
+        /// section has any lines.
+        BaseStart,
+        Base,
         Theirs,
     }
     let mut state = In::Outside;
+    let mut held = "";
     let mut out = String::with_capacity(text.len() + 64);
     for line in text.split_inclusive('\n') {
         let (body, end) = match line.strip_suffix('\n') {
@@ -59,11 +86,26 @@ pub fn relabel(text: &str, labels: &Labels) -> String {
                 state = In::Ours;
                 Some(format!("<<<<<<< {}", labels.ours))
             }
-            In::Ours if body == SPLIT => {
+            In::Ours | In::Base if body == SPLIT => {
                 state = In::Theirs;
                 None
             }
-            In::Ours if body.starts_with(BASE) => None,
+            In::BaseStart if body == SPLIT => {
+                // Empty: the held base line is dropped.
+                state = In::Theirs;
+                None
+            }
+            In::Ours if body.starts_with(BASE) => {
+                state = In::BaseStart;
+                held = line;
+                continue;
+            }
+            In::BaseStart => {
+                state = In::Base;
+                out.push_str(BASE_LABEL);
+                out.push_str(if held.ends_with('\n') { "\n" } else { "" });
+                None
+            }
             In::Theirs if body == THEIRS => {
                 state = In::Outside;
                 Some(format!(">>>>>>> {}", labels.theirs))
@@ -77,6 +119,10 @@ pub fn relabel(text: &str, labels: &Labels) -> String {
             }
             None => out.push_str(line),
         }
+    }
+    if state == In::BaseStart {
+        // Cut off after the base line: not a conflict the server wrote.
+        out.push_str(held);
     }
     out
 }
@@ -93,12 +139,33 @@ mod tests {
         let got = relabel(SERVER, &Labels::landed("main"));
         assert_eq!(
             got,
-            "a\n<<<<<<< main (landed)\nfrom main\n||||||| original\nold\n=======\nmine\n>>>>>>> yours\nz\n"
+            "a\n<<<<<<< main (landed)\nfrom main\n||||||| base\nold\n=======\nmine\n>>>>>>> yours\nz\n"
         );
         let two = format!("{SERVER}{SERVER}");
         let got = relabel(&two, &Labels::new("yours", "abc123 (merging)"));
         assert_eq!(got.matches("<<<<<<< yours\n").count(), 2);
         assert_eq!(got.matches(">>>>>>> abc123 (merging)\n").count(), 2);
+    }
+
+    #[test]
+    fn drops_an_empty_base_section() {
+        let server = "<<<<<<< ours\nx\n||||||| original\n=======\ny\n>>>>>>> theirs\n";
+        assert_eq!(
+            relabel(server, &Labels::new("yours", "stash 1")),
+            "<<<<<<< yours\nx\n=======\ny\n>>>>>>> stash 1\n"
+        );
+        // A base line with nothing after it is left as it was.
+        let cut = "<<<<<<< ours\nx\n||||||| original";
+        assert_eq!(
+            relabel(cut, &Labels::landed("main")),
+            "<<<<<<< main (landed)\nx\n||||||| original"
+        );
+        let text = explain(&Labels::landed("main"));
+        assert!(text.contains("to `=======` is main (landed)"), "{text}");
+        assert!(
+            text.contains("`>>>>>>> yours` is yours") && text.contains("||||||| base"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -122,6 +189,7 @@ mod tests {
             assert!(text
                 .lines()
                 .any(|l| l.starts_with(crate::status::CONFLICT_MARKER)));
+            assert!(text.lines().any(crate::status::is_marker_line));
         }
     }
 }

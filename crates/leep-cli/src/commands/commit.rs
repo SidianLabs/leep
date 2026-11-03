@@ -127,6 +127,16 @@ pub fn run(ctx: &mut Ctx, args: &CommitArgs) -> Result<i32> {
             EXTRA_REBASED_FROM
         };
         extra.insert(key.to_string(), p.from.to_string());
+    } else if let Some(r) = ctx
+        .wc
+        .state
+        .resolving
+        .as_ref()
+        .filter(|r| ctx.wc.state.base == Some(r.onto) && merge.is_none())
+    {
+        // The resolution of a land's conflicts: name what it replaces, so
+        // reviews of identical changes can carry over (the server decides).
+        extra.insert(EXTRA_REBASED_FROM.to_string(), r.rebased_from());
     }
     let cs = Changeset {
         parents,
