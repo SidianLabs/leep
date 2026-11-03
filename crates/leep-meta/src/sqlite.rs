@@ -333,7 +333,7 @@ impl SqliteMetaStore {
         conn: &mut SqliteConnection,
         id: &ChangesetId,
         data: &[u8],
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let q = if self.has_stored_at {
             sqlx::query(
                 "INSERT INTO changesets (id, data, stored_at) VALUES (?, ?, ?) \
@@ -347,8 +347,8 @@ impl SqliteMetaStore {
                 .bind(id.0.as_bytes().as_slice())
                 .bind(data)
         };
-        q.execute(conn).await.map_err(storage)?;
-        Ok(())
+        let n = q.execute(conn).await.map_err(storage)?.rows_affected();
+        Ok(n == 1)
     }
 
     /// The format features the store names (ADR 0055).
@@ -1149,6 +1149,29 @@ impl MetaStore for SqliteMetaStore {
         put_rows(&mut tx, rows).await?;
         tx.commit().await.map_err(storage)?;
         Ok(id)
+    }
+
+    /// One transaction; whether the insert happened decides `if_new`.
+    async fn put_changeset_with_derived_if_new(
+        &self,
+        cs: &Changeset,
+        rows: &[DerivedRow],
+        if_new: &[DerivedRow],
+    ) -> Result<bool> {
+        let id = cs.id();
+        let data = self.encode(cs).await?;
+        let mut tx = self
+            .db_for("put_changeset_with_derived")
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(storage)?;
+        let inserted = self.insert_changeset(&mut tx, &id, &data).await?;
+        put_rows(&mut tx, rows).await?;
+        if inserted {
+            put_rows(&mut tx, if_new).await?;
+        }
+        tx.commit().await.map_err(storage)?;
+        Ok(inserted)
     }
 
     /// One transaction, as for `put_changeset_with_derived`.

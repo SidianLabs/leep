@@ -1783,6 +1783,54 @@ impl MetaStore for PostgresMetaStore {
         Ok(id)
     }
 
+    /// One statement, as for `put_changeset_with_derived`: `if_new` is
+    /// inserted only when the changeset insert returned a row, which only
+    /// the one statement that inserted the id sees (a concurrent one waits
+    /// on the unique index, then does nothing).
+    async fn put_changeset_with_derived_if_new(
+        &self,
+        cs: &Changeset,
+        rows: &[DerivedRow],
+        if_new: &[DerivedRow],
+    ) -> Result<bool> {
+        let id = cs.id();
+        let data = self.encode(cs).await?;
+        let (kinds, keys, values) = derived_columns(rows);
+        let (new_kinds, new_keys, new_values) = derived_columns(if_new);
+        let insert = if self.has_stored_at {
+            "INSERT INTO changesets (id, data, stored_at) VALUES ($1, $2, $9)"
+        } else {
+            "INSERT INTO changesets (id, data) VALUES ($1, $2)"
+        };
+        let sql = format!(
+            "WITH c AS ({insert} ON CONFLICT DO NOTHING RETURNING id), \
+             d AS (INSERT INTO derived (kind, key, value) \
+               SELECT * FROM UNNEST($3::text[], $4::bytea[], $5::bytea[]) ORDER BY 1, 2 \
+               ON CONFLICT (kind, key) DO UPDATE SET value = excluded.value \
+               WHERE derived.value IS DISTINCT FROM excluded.value), \
+             n AS (INSERT INTO derived (kind, key, value) \
+               SELECT * FROM UNNEST($6::text[], $7::bytea[], $8::bytea[]) \
+               WHERE EXISTS (SELECT 1 FROM c) ORDER BY 1, 2 \
+               ON CONFLICT (kind, key) DO UPDATE SET value = excluded.value) \
+             SELECT EXISTS (SELECT 1 FROM c)"
+        );
+        let mut q = sqlx::query_scalar(AssertSqlSafe(sql))
+            .bind(id.0.as_bytes().as_slice())
+            .bind(data)
+            .bind(kinds)
+            .bind(keys)
+            .bind(values)
+            .bind(new_kinds)
+            .bind(new_keys)
+            .bind(new_values);
+        if self.has_stored_at {
+            q = q.bind(crate::stored_now());
+        }
+        q.fetch_one(self.db_for("put_changeset_with_derived"))
+            .await
+            .map_err(storage)
+    }
+
     /// One statement, as for `put_changeset_with_derived`, with the
     /// changesets in id order so concurrent batches lock them in one order.
     async fn put_changesets_with_derived(

@@ -12,10 +12,9 @@ use std::collections::{HashMap, HashSet};
 
 use bytes::Bytes;
 use leep_core::api::ReviewRequestEntry;
-use leep_core::changeset::EXTRA_REBASED_FROM;
 use leep_core::review_request::{
     check_request, CreatedBy, NewReviewRequest, ReviewRequest, ReviewRequestFilter,
-    ReviewRequestState, CREATED_BY_KIND,
+    ReviewRequestState, CREATED_BY_KIND, MAX_OPEN_REQUESTS, TOO_MANY_REQUESTS_MARKER,
 };
 use leep_core::store::unix_now;
 use leep_core::{refname, Changeset, ChangesetId, DerivedRow, Error, Result};
@@ -38,9 +37,12 @@ fn unsupported() -> Error {
 
 impl Repo {
     /// [`Repo::create_changeset`], recording `principal` as the creator in a
-    /// `created-by-v1` row written with the changeset. The first creator
-    /// stays: a changeset that already has a row is stored without a new
-    /// one. `None` (no authentication) records nothing.
+    /// `created-by-v1` row written only by the store write that inserts the
+    /// changeset, atomically with it: posting the bytes of a changeset that
+    /// is already stored (an old commit, a server-made one, one stored
+    /// without authentication) never makes the poster its creator, and of
+    /// concurrent posts exactly the first records one. `None` (no
+    /// authentication) records nothing.
     pub async fn create_changeset_by(
         &self,
         cs: Changeset,
@@ -50,27 +52,16 @@ impl Repo {
             return self.create_changeset(cs).await;
         };
         let id = cs.id();
-        if self
-            .meta()
-            .get_derived(CREATED_BY_KIND, &id.0)
-            .await?
-            .is_some()
-        {
-            return self.create_changeset(cs).await;
-        }
         let row = CreatedBy {
             principal: principal.to_string(),
             timestamp: unix_now(),
         };
-        self.create_changeset_with_rows(
-            cs,
-            vec![DerivedRow::new(
-                CREATED_BY_KIND,
-                id.0,
-                Bytes::from(row.encode()),
-            )],
-        )
-        .await
+        let if_new = vec![DerivedRow::new(
+            CREATED_BY_KIND,
+            id.0,
+            Bytes::from(row.encode()),
+        )];
+        self.store_changeset(cs, true, Vec::new(), if_new).await
     }
 
     /// Who created `id`, if a server recorded it. A row that does not
@@ -92,13 +83,26 @@ impl Repo {
         check_request(&req)?;
         refname::validate(&req.target_ref)?;
         self.get_changeset(req.changeset).await?;
-        if let Some(head) = self.meta().get_ref(&req.target_ref).await? {
-            if self.on_first_parent_of(req.changeset, head).await? {
+        // A missing ref is fine only where a land policy will judge the land
+        // that creates it: the first change of a protected ref needs review
+        // too. Anywhere else nothing could ever close the request.
+        match self.meta().get_ref(&req.target_ref).await? {
+            None if !self
+                .land_policy()
+                .is_some_and(|p| p.applies_to(&req.target_ref)) =>
+            {
+                return Err(Error::NotFound(format!(
+                    "ref {} does not exist; a review request names the ref its change would land on",
+                    req.target_ref
+                )));
+            }
+            Some(head) if self.on_first_parent_of(req.changeset, head).await? => {
                 return Err(Error::Invalid(format!(
                     "changeset {} is already on {}",
                     req.changeset, req.target_ref
                 )));
             }
+            _ => {}
         }
         let same = self
             .meta()
@@ -107,14 +111,37 @@ impl Repo {
                 changeset: Some(req.changeset),
                 target_ref: Some(req.target_ref.clone()),
                 states: vec![ReviewRequestState::Open],
-                limit: 50,
+                // The cap bounds them, so this sees every open one.
+                limit: MAX_OPEN_REQUESTS,
                 ..Default::default()
             })
             .await?;
         if let Some(r) = same.into_iter().find(|r| r.reviewers == req.reviewers) {
             return Ok((r, true));
         }
+        self.check_open_requests(&req.requester).await?;
         Ok((self.meta().put_review_request(&req).await?, false))
+    }
+
+    /// Refuse a requester at [`MAX_OPEN_REQUESTS`] open requests. At the
+    /// cap, a listing first closes the ones that landed by a move the land
+    /// path did not report, so only requests really waiting count.
+    async fn check_open_requests(&self, requester: &str) -> Result<()> {
+        let filter = ReviewRequestFilter {
+            requester: Some(requester.to_string()),
+            states: vec![ReviewRequestState::Open],
+            limit: MAX_OPEN_REQUESTS,
+            ..Default::default()
+        };
+        if self.meta().list_review_requests(&filter).await?.len() < MAX_OPEN_REQUESTS
+            || self.review_requests(&filter).await?.0.len() < MAX_OPEN_REQUESTS
+        {
+            return Ok(());
+        }
+        Err(Error::Invalid(format!(
+            "{requester} has {MAX_OPEN_REQUESTS} {TOO_MANY_REQUESTS_MARKER}; withdraw some \
+             (`leep review cancel`) or wait for them to land"
+        )))
     }
 
     /// The requests `filter` matches, and the `before` of the next page
@@ -270,6 +297,10 @@ impl Repo {
 
     /// The server-made copies on `head`'s first-parent chain, by the
     /// changeset each copies, down to the first changeset that is not one.
+    /// Only the `rebased-origin-v1` row the server writes when it makes a
+    /// copy counts: a changeset's own `leep.rebased_from` is whatever its
+    /// client wrote, and trusting it would let one agent's land close
+    /// another's request.
     async fn copies_below(&self, head: ChangesetId) -> Result<HashMap<ChangesetId, ChangesetId>> {
         let mut out = HashMap::new();
         let mut cur = Some(head);
@@ -278,16 +309,11 @@ impl Repo {
             if !seen.insert(id) {
                 break;
             }
-            let cs = self.get_changeset(id).await?;
-            let Some(origin) = cs
-                .extra
-                .get(EXTRA_REBASED_FROM)
-                .and_then(|o| o.parse::<ChangesetId>().ok())
-            else {
+            let Some(origin) = self.rebased_origin(id).await? else {
                 break;
             };
             out.insert(origin, id);
-            cur = cs.parents.first().copied();
+            cur = self.get_changeset(id).await?.parents.first().copied();
         }
         Ok(out)
     }
@@ -460,6 +486,13 @@ mod tests {
         let mut bad = ask(c, "ada", &[]);
         bad.target_ref = "a..b".into();
         assert!(r.request_review(bad).await.is_err());
+        // A ref that does not exist: nothing could ever close it.
+        let mut nowhere = ask(c, "ada", &[]);
+        nowhere.target_ref = "nowhere".into();
+        assert!(matches!(
+            r.request_review(nowhere).await,
+            Err(Error::NotFound(_))
+        ));
 
         let w = r.withdraw_review_request(a.id).await.unwrap();
         assert_eq!(w.state, ReviewRequestState::Withdrawn);
@@ -475,6 +508,123 @@ mod tests {
             r.withdraw_review_request(9999).await,
             Err(Error::NotFound(_))
         ));
+    }
+
+    /// One requester's open requests are capped; withdrawing one, or one
+    /// landing, makes room.
+    #[tokio::test]
+    async fn open_requests_per_requester_are_capped() {
+        let r = repo();
+        let base = commit(&r, None, 1).await;
+        r.meta().cas_ref("main", None, Some(base)).await.unwrap();
+        let c = commit(&r, Some(base), 2).await;
+        let mut first = None;
+        for i in 0..MAX_OPEN_REQUESTS {
+            let name = format!("r{i}");
+            let (q, existing) = r.request_review(ask(c, "ada", &[&name])).await.unwrap();
+            assert!(!existing);
+            first.get_or_insert(q.id);
+        }
+        let err = r
+            .request_review(ask(c, "ada", &["one-more"]))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains(TOO_MANY_REQUESTS_MARKER), "{err}");
+        // An existing one is still answered, and others may still ask.
+        assert!(r.request_review(ask(c, "ada", &["r0"])).await.unwrap().1);
+        r.request_review(ask(c, "bo", &["one-more"])).await.unwrap();
+        r.withdraw_review_request(first.unwrap()).await.unwrap();
+        r.request_review(ask(c, "ada", &["one-more"]))
+            .await
+            .unwrap();
+        // Requests whose change reached the ref by a raw move stop counting.
+        let err = r
+            .request_review(ask(c, "ada", &["two-more"]))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains(TOO_MANY_REQUESTS_MARKER), "{err}");
+        r.meta().cas_ref("main", Some(base), Some(c)).await.unwrap();
+        let d = commit(&r, Some(c), 3).await;
+        r.request_review(ask(d, "ada", &["two-more"]))
+            .await
+            .unwrap();
+    }
+
+    /// `leep.rebased_from` is client data: a changeset that names another
+    /// agent's unlanded changeset in it, landed and then built on by a
+    /// replayed land, must not close that agent's request.
+    #[tokio::test]
+    async fn a_forged_rebased_from_closes_nothing() {
+        let r = repo();
+        let base = commit(&r, None, 1).await;
+        r.meta().cas_ref("main", None, Some(base)).await.unwrap();
+        let x = commit(&r, Some(base), 2).await;
+        let (qa, _) = r.request_review(ask(x, "ada", &["rhea"])).await.unwrap();
+        // Bo's changeset claims to be a copy of ada's and lands.
+        let mut forged = r
+            .get_changeset(commit(&r, Some(base), 3).await)
+            .await
+            .unwrap();
+        forged.message = "not a copy".into();
+        forged.extra.insert(
+            leep_core::changeset::EXTRA_REBASED_FROM.into(),
+            x.to_string(),
+        );
+        let y = r.create_changeset(forged).await.unwrap();
+        r.land(y, "main").await.unwrap();
+        // Cy's land is replayed on top of it.
+        let w = commit(&r, Some(base), 4).await;
+        let landed = match r.land(w, "main").await.unwrap() {
+            leep_core::api::LandResponse::Landed {
+                landed, rebased, ..
+            } => {
+                assert!(rebased);
+                landed
+            }
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(r.get_changeset(landed).await.unwrap().parents, [y]);
+        assert_eq!(
+            r.close_landed_review_requests("main", w, landed)
+                .await
+                .unwrap(),
+            0
+        );
+        let qa = r.review_request(qa.id).await.unwrap();
+        assert_eq!((qa.state, qa.landed_as), (ReviewRequestState::Open, None));
+    }
+
+    /// Of concurrent creates of one changeset by different tokens exactly
+    /// one records itself, and a later create of a stored changeset never
+    /// does, even when no creator was recorded.
+    #[tokio::test]
+    async fn only_the_insert_records_a_creator() {
+        let r = repo();
+        let base = commit(&r, None, 1).await;
+        let cs = r.get_changeset(base).await.unwrap();
+        let old = r
+            .create_changeset_by(cs.clone(), Some("mallory"))
+            .await
+            .unwrap();
+        assert_eq!(r.created_by(old).await.unwrap(), None);
+        let next = Changeset {
+            parents: vec![base],
+            message: "raced".into(),
+            ..cs
+        };
+        let names = ["a", "b", "c", "d", "e", "f", "g", "h"];
+        let made = futures_util::future::join_all(
+            names
+                .iter()
+                .map(|n| r.create_changeset_by(next.clone(), Some(n))),
+        )
+        .await;
+        let id = made[0].as_ref().unwrap();
+        assert!(made.iter().all(|m| m.as_ref().unwrap() == id));
+        let by = r.created_by(*id).await.unwrap().unwrap();
+        assert!(names.contains(&by.principal.as_str()));
+        r.create_changeset_by(next, Some("mallory")).await.unwrap();
+        assert_eq!(r.created_by(*id).await.unwrap(), Some(by));
     }
 
     /// A land closes the request of what it landed, of the stack below
@@ -497,6 +647,7 @@ mod tests {
             .request_review(ask(elsewhere, "bo", &["rhea"]))
             .await
             .unwrap();
+        r.meta().cas_ref("dev", None, Some(base)).await.unwrap();
         let mut dev = ask(s2, "ada", &["rhea"]);
         dev.target_ref = "dev".into();
         let (q4, _) = r.request_review(dev).await.unwrap();

@@ -70,9 +70,14 @@ review their own change.
   and are not the requester; when no such path has an owner the request is
   open to any reviewer. An open request of the same requester, changeset,
   ref and reviewers answers instead of a second one (`existing: true`), so a
-  retry does not duplicate it. A changeset already on the ref's first-parent
-  chain is 400; an unknown one 404. Without a tokens file the endpoint is
-  400, as reviews are.
+  retry does not duplicate it. The ref must exist (404 otherwise: nothing
+  would ever close the request), unless a land policy covers it, since the
+  land that creates a protected ref needs review too. A changeset already on
+  the ref's first-parent chain is 400; an unknown one 404. One requester may
+  have at most 100 open requests (`MAX_OPEN_REQUESTS`); one more is 400 with
+  code `too_many_review_requests`, after the requester's open requests that
+  reached the ref by an unreported move are closed. Without a tokens file
+  the endpoint is 400, as reviews are.
 - `GET /v1/review-requests?reviewer=&requester=&changeset=&ref=&state=&open=&before=&limit=`
   lists them (a read token may), each with the changeset's `created_by` and
   the first line of its message as `title`. `limit` defaults to 50, at most
@@ -86,9 +91,13 @@ After `land` answers `landed` on the server that ran it (the coordinating
 server, for a forwarded land), the server spawns a task that closes, as
 `landed`, the open requests of that ref whose changeset is the one landed,
 one of the stack the land replayed (found by walking the new head's
-first-parent chain through the copies' `leep.rebased_from`, at most 256
-steps; `landed_as` is the copy), or now on the head's first-parent chain
-(`landed_as` is itself). The task runs after the answer is decided, with a
+first-parent chain while each changeset has a `rebased-origin-v1` row, at
+most 256 steps; `landed_as` is the copy), or now on the head's first-parent
+chain (`landed_as` is itself). Only the `rebased-origin-v1` row counts as
+"a copy of": the server writes it when it makes a copy, while a changeset's
+`leep.rebased_from` is whatever its client wrote (the CLI writes it for
+cherry-picks and conflict resolutions), so trusting it would let one
+agent's land close another agent's request. The task runs after the answer is decided, with a
 10-second timeout; an error or a timeout is counted in
 `leep_review_request_close_errors_total` and logged, never returned. A land
 never waits for it, and the close never changes the ref, so it adds no new
@@ -106,10 +115,17 @@ withdrawn: nothing links the new changeset to the old.
 ### The creator is a derived row written with the changeset
 `POST /v1/changesets` from an authenticated client writes a
 `created-by-v1` row, key = changeset id, value = postcard `CreatedBy {
-principal: String, timestamp: i64 }` (`leep_core::review_request`), in the
-same `put_changeset_with_derived` write as the changeset (ADR 0031), so on
-Postgres and SQLite the changeset is never visible without it. The first
-creator stays: a create of a changeset that already has a row writes none.
+principal: String, timestamp: i64 }` (`leep_core::review_request`), through
+the new `MetaStore::put_changeset_with_derived_if_new`: the row is written
+only by the store write that inserts the changeset, atomically with it (a
+SQLite `BEGIN IMMEDIATE` transaction that writes it only when the insert
+changed a row; on Postgres one statement whose insert of the row depends on
+the changeset insert's `RETURNING`). So posting the bytes of a changeset
+that is already stored (an old commit, a server-made one, one stored
+without authentication) never makes the poster its creator, and of
+concurrent posts exactly the inserting one records itself. The default of
+the method writes no such row, so a backend without it records no creators
+rather than wrong ones. `check_insert_once_contract` checks backends.
 Without authentication nothing is recorded. Server-made changesets (merges,
 rebased copies) get no row. `GET /v1/changesets/{id}` answers it as
 `ChangesetInfo::created_by` (optional; omitted when absent, so the shape is
@@ -137,8 +153,8 @@ the server is too old instead of printing a 404.
   closed only by new servers' lands or listings. Backups (ADR 0026) copy both
   tables, keeping ids, and a restore moves the Postgres sequence past them.
 - `GET /v1/changesets/{id}` makes one more metadata read, for the row.
-  `POST /v1/changesets` with a token makes one more, to keep the first
-  creator; without a token neither changes.
+  `POST /v1/changesets` with a token makes no extra statement: the row
+  rides in the changeset's own write.
 - A successful land with open requests on its ref makes one indexed query,
   and with matching requests a few reads and one update each, after its
   answer. A land with none makes one indexed query.

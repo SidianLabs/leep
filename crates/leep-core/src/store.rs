@@ -863,6 +863,25 @@ pub trait MetaStore: Send + Sync + 'static {
         Ok(id)
     }
 
+    /// [`put_changeset_with_derived`](Self::put_changeset_with_derived), also
+    /// writing `if_new` when this call is the one that inserted the changeset,
+    /// in the same atomic step: never for a changeset that was already
+    /// stored, and for exactly one of several concurrent calls. Returns
+    /// whether it inserted. Rows that record who first stored a changeset
+    /// (ADR 0086) depend on that. The default writes the changeset and
+    /// `rows`, never `if_new`, and returns false: without an atomic insert
+    /// it cannot tell.
+    async fn put_changeset_with_derived_if_new(
+        &self,
+        cs: &Changeset,
+        rows: &[DerivedRow],
+        if_new: &[DerivedRow],
+    ) -> Result<bool> {
+        let _ = if_new;
+        self.put_changeset_with_derived(cs, rows).await?;
+        Ok(false)
+    }
+
     /// Store many changesets and derived rows in one round trip: what a land
     /// batch built (ADR 0043). Idempotent; rows are written as by
     /// [`put_derived_many`](Self::put_derived_many).

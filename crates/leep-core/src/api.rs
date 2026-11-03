@@ -33,7 +33,7 @@
 //! | POST | `/v1/changesets/{id}/reviews` | [`AddReviewRequest`] | [`AddReviewResponse`] (the reviewer is the token's name, or the body's `reviewer` for a `review_for` token and 403 for any other; 400 without authentication; 404 if the changeset is unknown) |
 //! | GET  | `/v1/changesets/{id}/reviews` | – | [`ReviewsResponse`] |
 //! | GET  | `/v1/changesets/{id}/review-status?ref=main` | – | [`ReviewStatusResponse`] (`ref` defaults to `main`) |
-//! | POST | `/v1/review-requests` | [`CreateReviewRequest`] | [`CreateReviewRequestResponse`] (ask for a review of `changeset` before it lands on `target_ref`; the requester is the token's name; `reviewers` must be tokens that may review, and default to the owners of the paths the changeset still needs approved; an open request of the same requester, changeset, ref and reviewers is answered instead of a second one; 400 without authentication; 404 if the changeset is unknown; ADR 0086) |
+//! | POST | `/v1/review-requests` | [`CreateReviewRequest`] | [`CreateReviewRequestResponse`] (ask for a review of `changeset` before it lands on `target_ref`; the requester is the token's name; `reviewers` must be tokens that may review, and default to the owners of the paths the changeset still needs approved; an open request of the same requester, changeset, ref and reviewers is answered instead of a second one; 400 without authentication; 404 if the changeset is unknown, or `target_ref` is missing and no land policy covers it; 400 `too_many_review_requests` when the requester already has `MAX_OPEN_REQUESTS` (100) open; ADR 0086) |
 //! | GET  | `/v1/review-requests?reviewer=n&requester=n&changeset=id&ref=r&state=s&open=bool&before=id&limit=n` | – | [`ReviewRequestsResponse`] (newest first; `reviewer` matches requests that name it and requests open to any reviewer made by someone else; `state` is `open`, `landed` or `withdrawn`, `open=true` is `state=open` and `open=false` every closed state; `limit` defaults to 50, capped at 500; `before` pages by id; ADR 0086) |
 //! | GET  | `/v1/review-requests/{id}` | – | [`ReviewRequestEntry`] (404 if unknown) |
 //! | POST | `/v1/review-requests/{id}/withdraw` | – | [`ReviewRequestEntry`] (only its requester may; 403 otherwise; a request no longer open is answered as it is) |
@@ -83,6 +83,7 @@
 //! | 400 | `invalid_name` | a ref name [`crate::refname::validate`] refuses |
 //! | 400 | `ambiguous_prefix` | a short id matching several changesets ([`AmbiguousPrefixResponse`]) |
 //! | 400 | `cursor_unrepresentable` | a paged `GET /v1/files` or `/v1/diff` whose page ends at a path too long for a cursor: repeat the request without `limit` |
+//! | 400 | `too_many_review_requests` | a review request from a principal with [`crate::review_request::MAX_OPEN_REQUESTS`] open ones already (ADR 0086) |
 //! | 400 | `invalid` | any other bad request |
 //! | 401 | `unauthorized` | no token, or an unknown one |
 //! | 401 | `token_expired` | a known token past its `expires` (ADR 0007): fetch a new one; retrying will not help |
@@ -288,6 +289,11 @@ pub mod error_code {
     /// long to fit a cursor ([`super::CURSOR_UNREPRESENTABLE_MARKER`]). The
     /// same request without `limit` answers the whole list.
     pub const CURSOR_UNREPRESENTABLE: &str = "cursor_unrepresentable";
+    /// 400: a review request from a principal that already has as many open
+    /// ones as the server allows
+    /// ([`crate::review_request::TOO_MANY_REQUESTS_MARKER`], ADR 0086).
+    /// Withdraw some (`leep review cancel`) or wait for them to land.
+    pub const TOO_MANY_REVIEW_REQUESTS: &str = "too_many_review_requests";
     /// 400: any other bad request.
     pub const INVALID: &str = "invalid";
     /// 401: no token, or an unknown one.
@@ -344,6 +350,7 @@ pub mod error_code {
         INVALID_NAME,
         AMBIGUOUS_PREFIX,
         CURSOR_UNREPRESENTABLE,
+        TOO_MANY_REVIEW_REQUESTS,
         INVALID,
         UNAUTHORIZED,
         TOKEN_EXPIRED,

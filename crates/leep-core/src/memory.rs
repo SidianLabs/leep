@@ -281,7 +281,11 @@ impl MemoryMetaStore {
 
     /// Store `cs` unless it is stored, recording the time on the first store.
     /// The caller holds the `changesets` lock.
-    fn insert_changeset(&self, changesets: &mut BTreeMap<ChangesetId, Changeset>, cs: &Changeset) {
+    fn insert_changeset(
+        &self,
+        changesets: &mut BTreeMap<ChangesetId, Changeset>,
+        cs: &Changeset,
+    ) -> bool {
         let id = cs.id();
         if let std::collections::btree_map::Entry::Vacant(v) = changesets.entry(id) {
             v.insert(cs.clone());
@@ -289,7 +293,9 @@ impl MemoryMetaStore {
                 .lock()
                 .unwrap()
                 .insert(id, unix_now().max(0) as u64);
+            return true;
         }
+        false
     }
 }
 
@@ -692,6 +698,21 @@ impl MetaStore for MemoryMetaStore {
         Ok(id)
     }
 
+    async fn put_changeset_with_derived_if_new(
+        &self,
+        cs: &Changeset,
+        rows: &[DerivedRow],
+        if_new: &[DerivedRow],
+    ) -> Result<bool> {
+        let mut changesets = self.changesets.lock().unwrap();
+        let mut all = self.derived.lock().unwrap();
+        let inserted = self.insert_changeset(&mut changesets, cs);
+        for r in rows.iter().chain(if inserted { if_new } else { &[] }) {
+            all.insert((r.kind.clone(), r.key), r.value.clone());
+        }
+        Ok(inserted)
+    }
+
     async fn put_changesets_with_derived(
         &self,
         changesets: &[Changeset],
@@ -707,6 +728,83 @@ impl MetaStore for MemoryMetaStore {
         }
         Ok(())
     }
+}
+
+/// Conformance checks for [`MetaStore::put_changeset_with_derived_if_new`]
+/// (ADR 0086), for stores that implement it atomically: of concurrent
+/// stores of one new changeset exactly one inserts and writes its `if_new`
+/// rows, and a store of a changeset already present writes none.
+pub async fn check_insert_once_contract(store: &dyn MetaStore) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static RUN: AtomicU64 = AtomicU64::new(0);
+    let run = format!(
+        "{}-{}-{}",
+        std::process::id(),
+        RUN.fetch_add(1, Ordering::Relaxed),
+        unix_now()
+    );
+    let cs = Changeset {
+        parents: vec![],
+        author: "insert-once".into(),
+        timestamp: 1,
+        message: run,
+        changes: BTreeMap::new(),
+        extra: BTreeMap::new(),
+    };
+    let id = cs.id();
+    let always = |i: u8| {
+        vec![DerivedRow::new(
+            "insert-once-always",
+            id.0,
+            Bytes::from(vec![i]),
+        )]
+    };
+    let once = |i: u8| {
+        vec![DerivedRow::new(
+            "insert-once-new",
+            id.0,
+            Bytes::from(vec![i]),
+        )]
+    };
+    let calls: Vec<(Vec<DerivedRow>, Vec<DerivedRow>)> =
+        (0..8).map(|i| (always(i), once(i))).collect();
+    let got = futures_util::future::join_all(
+        calls
+            .iter()
+            .map(|(a, o)| store.put_changeset_with_derived_if_new(&cs, a, o)),
+    )
+    .await;
+    let winners: Vec<usize> = got
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, r)| r.unwrap().then_some(i))
+        .collect();
+    assert_eq!(winners.len(), 1, "exactly one insert");
+    let row = store.get_derived("insert-once-new", &id.0).await.unwrap();
+    assert_eq!(row.as_deref(), Some(&[winners[0] as u8][..]));
+    assert!(store
+        .get_derived("insert-once-always", &id.0)
+        .await
+        .unwrap()
+        .is_some());
+    assert_eq!(store.get_changeset(&id).await.unwrap(), Some(cs.clone()));
+    // Already stored: the rows that always go are written, `if_new` is not.
+    assert!(!store
+        .put_changeset_with_derived_if_new(&cs, &always(42), &once(42))
+        .await
+        .unwrap());
+    assert_eq!(
+        store.get_derived("insert-once-new", &id.0).await.unwrap(),
+        row
+    );
+    assert_eq!(
+        store
+            .get_derived("insert-once-always", &id.0)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(&[42u8][..])
+    );
 }
 
 /// Conformance checks for the review request methods (ADR 0086), for every
@@ -2565,6 +2663,11 @@ mod tests {
     async fn memory_stores_pass_contract() {
         check_meta_store_contract(&MemoryMetaStore::new()).await;
         check_blob_store_contract(&MemoryBlobStore::new()).await;
+    }
+
+    #[tokio::test]
+    async fn memory_insert_once_passes_contract() {
+        check_insert_once_contract(&MemoryMetaStore::new()).await;
     }
 
     #[tokio::test]

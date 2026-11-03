@@ -1304,6 +1304,29 @@ servers; finish the rollout so every server that runs lands also closes
 them (a request a v7 server's land satisfied closes at the next listing if
 its changeset is on the ref's first-parent chain).
 
+There is no down migration, and a v7 server refuses to start on a v8
+database (`database schema v8 is newer than this server`). To go back to v7
+without restoring a backup, stop every server and drop what migration 8
+added, which loses every review request (nothing else reads the tables):
+
+```sql
+BEGIN;
+DROP TABLE review_request_reviewers;
+DROP TABLE review_requests;
+DELETE FROM schema_migrations WHERE version = 8;
+COMMIT;
+```
+
+The same SQL works on Postgres and SQLite (dropping a table drops its
+indexes). `created-by-v1` rows stay in `derived`; v7 servers never read
+them. Otherwise restore a backup taken before the upgrade.
+
+**Open review requests per requester** are capped at 100
+(`MAX_OPEN_REQUESTS`, a constant): one more is refused with 400 and code
+`too_many_review_requests`. An agent that hits it should cancel requests it
+no longer needs (`leep review cancel N`, listed by `leep review inbox
+--mine`); requests close by themselves as their changesets land.
+
 **Derived kinds that change encoding.** A release that changes how a derived
 kind is stored gives it a new name, so old and new servers never read each
 other's rows; nothing to migrate. The new kind derives on first use, which on

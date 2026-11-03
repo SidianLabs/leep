@@ -17,7 +17,9 @@ use leep_core::api::{
     error_code, CreateReviewRequest, CreateReviewRequestResponse, LandResponse, ReviewRequestEntry,
     ReviewRequestsResponse,
 };
-use leep_core::review_request::{NewReviewRequest, ReviewRequestFilter, ReviewRequestState};
+use leep_core::review_request::{
+    NewReviewRequest, ReviewRequestFilter, ReviewRequestState, TOO_MANY_REQUESTS_MARKER,
+};
 use leep_core::store::unix_now;
 use leep_core::{ChangesetId, Error};
 use leep_derive::Repo;
@@ -41,8 +43,11 @@ pub(crate) async fn create(
     Extension(config): Cfg,
     auth::MaybePrincipal(who): auth::MaybePrincipal,
     body: Bytes,
-) -> ApiResult<Json<CreateReviewRequestResponse>> {
+) -> ApiResult<Response> {
     let req: CreateReviewRequest = parse_json(&body)?;
+    // The policy the request arrived under decides which missing refs may
+    // be asked about (a protected ref's first land).
+    let repo = repo.with_land_policy_replaced(config.land_policy.clone());
     let (Some(who), Some(tokens)) = (who, config.auth.as_ref()) else {
         return Err(Error::Invalid(NEEDS_AUTH.into()).into());
     };
@@ -68,7 +73,7 @@ pub(crate) async fn create(
     if reviewers.is_empty() {
         reviewers = default_reviewers(&repo, &config, &req, &who.name, &may_review).await?;
     }
-    let (request, existing) = repo
+    let asked = repo
         .request_review(NewReviewRequest {
             changeset: req.changeset,
             target_ref: req.target_ref,
@@ -77,14 +82,25 @@ pub(crate) async fn create(
             message: req.message,
             created: unix_now(),
         })
-        .await?;
+        .await;
+    let (request, existing) = match asked {
+        Err(Error::Invalid(m)) if m.contains(TOO_MANY_REQUESTS_MARKER) => {
+            return Ok(auth::reject(
+                StatusCode::BAD_REQUEST,
+                error_code::TOO_MANY_REVIEW_REQUESTS,
+                &format!("invalid input: {m}"),
+            ));
+        }
+        r => r?,
+    };
     if !existing {
         metrics::counter!("leep_review_requests_created_total").increment(1);
     }
     Ok(Json(CreateReviewRequestResponse {
         request: entry(&repo, request).await?,
         existing,
-    }))
+    })
+    .into_response())
 }
 
 /// The owners of the paths `req.changeset` still needs approved on its ref

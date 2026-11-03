@@ -40,6 +40,15 @@ impl CreatedBy {
 /// Longest accepted review request message, in bytes.
 pub const MAX_REQUEST_MESSAGE_BYTES: usize = 4 * 1024;
 
+/// Most open review requests one requester may have at once; one more is
+/// refused with [`TOO_MANY_REQUESTS_MARKER`] (code
+/// `too_many_review_requests`). Keeps a runaway agent from filling the
+/// table and every inbox.
+pub const MAX_OPEN_REQUESTS: usize = 100;
+
+/// Stable text in the 400 for a requester at [`MAX_OPEN_REQUESTS`].
+pub const TOO_MANY_REQUESTS_MARKER: &str = "open review requests, the most one requester may have";
+
 /// Most reviewers one request may name.
 pub const MAX_REQUEST_REVIEWERS: usize = 32;
 

@@ -31,9 +31,18 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   and `leep show` prints `Created-by:`. The first creator stays. Without
   authentication nothing is recorded. DEPLOY.md now says to give every
   agent its own token.
+- **Added.** A request needs its target ref to exist (or a land policy to cover
+  it), and one requester
+  may have at most 100 open requests (400, code
+  `too_many_review_requests`). Lands close requests only through the
+  server's own `rebased-origin-v1` links, never a client's
+  `leep.rebased_from`; a creator is recorded only by the store write that
+  inserts the changeset (`MetaStore::put_changeset_with_derived_if_new`),
+  so re-posting a stored changeset never claims it.
 - **Upgrade.** Migration 8 (`review_requests`) adds two empty tables; it
-  may run beside v7 servers, which never read them. Backups copy the
-  tables.
+  may run beside v7 servers, which never read them. There is no down
+  migration; OPERATIONS.md gives the SQL to drop it by hand. Backups copy
+  the tables.
 ### Snapshot tests keep the Postgres URL's query string
 - **Fixed.** The leep-meta snapshot tests' per-test database URL now swaps only the database name, so a Unix-socket `LEEP_TEST_POSTGRES_URL` (`?host=...&port=...`) works.
 

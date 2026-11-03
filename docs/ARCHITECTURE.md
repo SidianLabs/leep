@@ -1545,15 +1545,17 @@ conditional update from `open`. `POST /v1/review-requests` opens one for the
 token's principal; with no reviewers named, the server asks the owners of
 the paths `review-status` still finds pending or rejected on the target ref
 (any reviewer when none is owned). Named reviewers must be tokens that may
-review. `GET /v1/review-requests?reviewer=NAME&open=true` is a reviewer's
+review, the ref must exist, and a requester may have 100 open requests. `GET /v1/review-requests?reviewer=NAME&open=true` is a reviewer's
 inbox. After a land answers `landed`, a spawned task closes the ref's open
 requests that the land satisfied (the landed changeset, its stack by the
-copies' `leep.rebased_from`, and anything else now on the head's
+copies' server-written `rebased-origin-v1` rows, never a client's
+`leep.rebased_from`, and anything else now on the head's
 first-parent chain); it never changes the ref and its errors are only
 logged, so it cannot fail a land. A listing closes what the task missed,
 for requests on the page, by a first-parent check against the ref's head.
-An authenticated `POST /v1/changesets` writes a `created-by-v1` row with
-the changeset, and `GET /v1/changesets/{id}` answers it as `created_by`, so
+An authenticated `POST /v1/changesets` writes a `created-by-v1` row only
+in the store write that inserts the changeset
+(`put_changeset_with_derived_if_new`), and `GET /v1/changesets/{id}` answers it as `created_by`, so
 reviewers see which token made a change even when every agent uses the
 same author. `leep review request|inbox|cancel` are the clients.
 

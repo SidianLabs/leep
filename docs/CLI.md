@@ -137,6 +137,10 @@ names, as in `OWNERS` files.
 | `leep review inbox` | Open requests that name you, or that any reviewer may take and someone else made, newest first: `#N STATE ID -> REF by REQUESTER (created by CREATOR), for REVIEWERS (TIME)`, then the changeset's title and the note. `--mine` lists the requests you made, `--all` adds closed ones, `-n N` caps the list (50). |
 | `leep review cancel N` | Withdraw request `N`, which you made. |
 
+The ref must exist (or be one the server protects), and you may have at most 100 open requests; one more
+is refused (exit 1, `--json` `server_code: "too_many_review_requests"`)
+until you cancel some or they land.
+
 A request closes by itself when its changeset lands on its ref, as itself or
 as the copy the land replayed it as; `leep review inbox --mine --all` shows
 `landed as ID` for a copy. A changeset you squash or rebase yourself is a

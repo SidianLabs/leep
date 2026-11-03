@@ -235,6 +235,71 @@ async fn the_creating_token_is_recorded_and_shown() {
     );
 }
 
+/// Re-posting the bytes of a changeset that is already stored, here one
+/// stored without a creator, never makes the poster its creator.
+#[tokio::test]
+async fn an_existing_changeset_cannot_be_claimed() {
+    let api = Api::new(true);
+    let cs = Changeset {
+        parents: vec![],
+        author: "someone".into(),
+        timestamp: 7,
+        message: "stored before creators were recorded".into(),
+        changes: BTreeMap::new(),
+        extra: BTreeMap::new(),
+    };
+    let id = api.repo.create_changeset(cs.clone()).await.unwrap();
+    let r: CreateChangesetResponse = api.post("/v1/changesets", Some("bob"), &cs).await.ok();
+    assert_eq!(r.id, id);
+    let info: ChangesetInfo = api.get(&format!("/v1/changesets/{id}")).await.ok();
+    assert_eq!(info.created_by, None);
+}
+
+/// A request must name a ref that exists, and one requester may have at
+/// most `MAX_OPEN_REQUESTS` open, refused with a code of its own.
+#[tokio::test]
+async fn requests_need_a_ref_and_are_capped() {
+    use leep_core::review_request::MAX_OPEN_REQUESTS;
+    let api = Api::new(true);
+    let head = api.seed_main(&[("a", "0\n")]).await;
+    let first = api
+        .commit(Some("alice"), &[head], &[("a", "x\n")], "x")
+        .await;
+    let r = api
+        .post(
+            "/v1/review-requests",
+            Some("alice"),
+            &serde_json::json!({ "changeset": first, "target_ref": "nowhere" }),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND, "{}", r.error());
+    assert!(r.error().contains("nowhere"), "{}", r.error());
+    // A protected ref that does not exist yet may be asked about: the land
+    // that creates it needs review too.
+    let fresh = Api::new(true);
+    let root = fresh
+        .commit(Some("alice"), &[], &[("a", "1\n")], "first")
+        .await;
+    let r: CreateReviewRequestResponse = fresh.request("alice", root, &["bob"], "").await.ok();
+    assert_eq!(r.request.request.target_ref, "main");
+    for i in 0..MAX_OPEN_REQUESTS {
+        let c = api
+            .commit(Some("alice"), &[head], &[("a", &format!("{i}\n"))], "c")
+            .await;
+        let _: CreateReviewRequestResponse = api.request("alice", c, &["bob"], "").await.ok();
+    }
+    let r = api.request("alice", first, &["bob"], "").await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    let body: ErrorResponse = r.json();
+    assert_eq!(
+        body.code.as_deref(),
+        Some(error_code::TOO_MANY_REVIEW_REQUESTS)
+    );
+    assert!(body.error.contains("leep review cancel"), "{}", body.error);
+    // Someone else may still ask.
+    let _: CreateReviewRequestResponse = api.request("carol", first, &["bob"], "").await.ok();
+}
+
 #[tokio::test]
 async fn without_authentication_nothing_is_recorded_and_requests_refuse() {
     let api = Api::new(false);

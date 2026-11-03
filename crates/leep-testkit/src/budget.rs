@@ -893,6 +893,29 @@ impl MetaStore for Budget {
         Ok(id)
     }
 
+    async fn put_changeset_with_derived_if_new(
+        &self,
+        cs: &Changeset,
+        rows: &[DerivedRow],
+        if_new: &[DerivedRow],
+    ) -> Result<bool> {
+        let inserted = self
+            .meta(
+                "meta.put_changeset_with_derived",
+                1 + n(rows.len() + if_new.len()),
+                cs_len(cs) + rows_len(rows) + rows_len(if_new),
+                self.meta
+                    .put_changeset_with_derived_if_new(cs, rows, if_new),
+                none,
+            )
+            .await?;
+        self.kind_rows(rows);
+        if inserted {
+            self.kind_rows(if_new);
+        }
+        Ok(inserted)
+    }
+
     async fn put_changesets_with_derived(
         &self,
         changesets: &[Changeset],
