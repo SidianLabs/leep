@@ -7,6 +7,9 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 ## [Unreleased]
 
+### Snapshot tests keep the Postgres URL's query string
+- **Fixed.** The leep-meta snapshot tests' per-test database URL now swaps only the database name, so a Unix-socket `LEEP_TEST_POSTGRES_URL` (`?host=...&port=...`) works.
+
 ### Postgres memory sizing guide
 - **Added.** OPERATIONS.md, "Sizing Postgres memory": what grows per changeset, `shared_buffers` and `effective_cache_size` guidance, how to check the hit ratio, and the slow cold-blame symptom; linked from DEPLOY.md.
 
