@@ -2,46 +2,38 @@
 //! follow the file's versions, not the depth of history.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use bytes::Bytes;
 use leep_core::memory::{MemoryBlobStore, MemoryMetaStore};
-use leep_core::{
-    Changeset, ChangesetId, FileChange, FileKind, Hash, MetaStore, RefLogEntry, RefUpdateContext,
-    RepoPath, Result,
-};
+use leep_core::{Changeset, ChangesetId, FileChange, FileKind, Hash, RepoPath};
+use leep_testkit::budget::{Budget, Usage};
 
 use crate::blame::{Cuts, HEAD_STEPS, MIN_STRETCH_SPAN};
 use crate::Repo;
 
-/// Counts metadata reads: statements in all, and calls and keys by kind.
-#[derive(Default)]
-struct Counter {
-    inner: Arc<MemoryMetaStore>,
-    counts: Mutex<Counts>,
-}
-
-#[derive(Default, Clone, Debug)]
-struct Counts {
-    statements: usize,
-    /// kind -> (calls, keys)
-    by_kind: BTreeMap<String, (usize, usize)>,
-}
-
-impl Counts {
-    fn calls(&self, kind: &str) -> usize {
-        self.by_kind.get(kind).map_or(0, |c| c.0)
-    }
+/// Metadata reads in `u`: one statement each on a database backend.
+fn reads(u: &Usage) -> u64 {
+    [
+        "meta.get_changeset",
+        "meta.get_changesets",
+        "meta.get_derived",
+        "meta.get_derived_many",
+        "meta.get_derived_kinds",
+    ]
+    .iter()
+    .map(|op| u.calls(op))
+    .sum()
 }
 
 /// A cold blame of a file changed `versions - 1` times, evenly, over a
 /// linear history of `len` changesets that otherwise change another file:
 /// the store's statements, its skiplist reads, and the answer.
-async fn sparse_file_blame(
+pub(crate) async fn sparse_file_blame(
     len: usize,
     versions: usize,
     linear_jumps: bool,
-) -> (Counts, crate::blame::CachedBlame) {
+) -> (Usage, crate::blame::CachedBlame) {
     let blobs = Arc::new(MemoryBlobStore::new());
     let meta = Arc::new(MemoryMetaStore::new());
     let r = Repo::new(blobs.clone(), meta.clone());
@@ -59,11 +51,8 @@ async fn sparse_file_blame(
     crate::derived::derive::<crate::derived::HistoryTree>(&r, tip)
         .await
         .unwrap();
-    let counter = Arc::new(Counter {
-        inner: meta,
-        counts: Mutex::default(),
-    });
-    let (b, c, _) = cold_blame(&blobs, &counter, tip, "old", linear_jumps).await;
+    let budget = Budget::new(blobs, meta);
+    let (b, c, _) = cold_blame(&budget, tip, "old", linear_jumps).await;
     (c, b)
 }
 
@@ -98,109 +87,28 @@ async fn a_cold_blame_on_a_deep_linear_history_reads_per_version() {
         let (descended, want) = sparse_file_blame(len, versions, false).await;
         assert_eq!(b, want, "{len}");
         assert_eq!(b.1.len(), versions);
-        let skips = jumped.calls(<crate::derived::Skiplist as crate::derived::DerivedKind>::NAME);
-        assert!(skips <= 2 * versions + 2, "{skips} skiplist reads at {len}");
+        let skips =
+            jumped.kind_calls(<crate::derived::Skiplist as crate::derived::DerivedKind>::NAME);
         assert!(
-            skips * 2 < descended.calls("skiplist"),
+            skips <= 2 * versions as u64 + 2,
+            "{skips} skiplist reads at {len}"
+        );
+        assert!(
+            skips * 2 < descended.kind_calls("skiplist"),
             "{skips} skiplist reads at {len}, {} descending",
-            descended.calls("skiplist")
+            descended.kind_calls("skiplist")
         );
+        let statements_now = reads(&jumped);
         assert!(
-            jumped.statements <= 6 * versions,
-            "{} statements at {len}: {jumped:?}",
-            jumped.statements
+            statements_now <= 6 * versions as u64,
+            "{statements_now} statements at {len}: {jumped}"
         );
-        statements.push(jumped.statements);
+        statements.push(statements_now);
     }
     assert!(
         statements[1] <= statements[0] + 2,
         "statements grew with history: {statements:?}"
     );
-}
-
-impl Counter {
-    fn note(&self, kind: &str, keys: usize, statement: bool) {
-        let mut c = self.counts.lock().unwrap();
-        if statement {
-            c.statements += 1;
-        }
-        let e = c.by_kind.entry(kind.to_string()).or_default();
-        e.0 += 1;
-        e.1 += keys;
-    }
-
-    fn take(&self) -> Counts {
-        std::mem::take(&mut *self.counts.lock().unwrap())
-    }
-}
-
-#[async_trait::async_trait]
-impl MetaStore for Counter {
-    async fn put_changeset(&self, cs: &Changeset) -> Result<ChangesetId> {
-        self.inner.put_changeset(cs).await
-    }
-    async fn get_changeset(&self, id: &ChangesetId) -> Result<Option<Changeset>> {
-        self.note("changeset", 1, true);
-        self.inner.get_changeset(id).await
-    }
-    async fn get_changesets(&self, ids: &[ChangesetId]) -> Result<Vec<Option<Changeset>>> {
-        self.note("changeset", ids.len(), true);
-        self.inner.get_changesets(ids).await
-    }
-    async fn list_changesets(
-        &self,
-        after: Option<ChangesetId>,
-        limit: usize,
-    ) -> Result<Vec<ChangesetId>> {
-        self.inner.list_changesets(after, limit).await
-    }
-    async fn get_ref(&self, name: &str) -> Result<Option<ChangesetId>> {
-        self.inner.get_ref(name).await
-    }
-    async fn cas_ref_logged(
-        &self,
-        name: &str,
-        expected: Option<ChangesetId>,
-        new: Option<ChangesetId>,
-        ctx: &RefUpdateContext,
-    ) -> Result<bool> {
-        self.inner.cas_ref_logged(name, expected, new, ctx).await
-    }
-    async fn ref_log(
-        &self,
-        name: Option<&str>,
-        before_seq: Option<u64>,
-        limit: usize,
-    ) -> Result<Vec<RefLogEntry>> {
-        self.inner.ref_log(name, before_seq, limit).await
-    }
-    async fn list_refs(&self) -> Result<BTreeMap<String, ChangesetId>> {
-        self.inner.list_refs().await
-    }
-    async fn get_derived(&self, kind: &str, key: &Hash) -> Result<Option<Bytes>> {
-        self.note(kind, 1, true);
-        self.inner.get_derived(kind, key).await
-    }
-    async fn get_derived_many(&self, kind: &str, keys: &[Hash]) -> Result<Vec<Option<Bytes>>> {
-        self.note(kind, keys.len(), true);
-        self.inner.get_derived_many(kind, keys).await
-    }
-    async fn get_derived_kinds(
-        &self,
-        reads: &[(&str, &[Hash])],
-    ) -> Result<Vec<Vec<Option<Bytes>>>> {
-        self.counts.lock().unwrap().statements += 1;
-        for (kind, keys) in reads {
-            self.note(kind, keys.len(), false);
-        }
-        self.inner.get_derived_kinds(reads).await
-    }
-    async fn put_derived(&self, kind: &str, key: &Hash, value: Bytes) -> Result<()> {
-        self.inner.put_derived(kind, key, value).await
-    }
-    async fn delete_derived_kind(&self, kind: &str) -> Result<u64> {
-        self.inner.delete_derived_kind(kind).await
-    }
 }
 
 /// A linear history of `len` changesets over a wide tree: one or two files
@@ -306,19 +214,19 @@ fn modify(data: &[u8]) -> FileChange {
 /// A cold blame (a new process, no cached blames) of `path`: the answer,
 /// the reads it made and how long it took.
 async fn cold_blame(
-    blobs: &Arc<MemoryBlobStore>,
-    counter: &Arc<Counter>,
+    budget: &Arc<Budget>,
     tip: ChangesetId,
     path: &str,
     linear_jumps: bool,
-) -> (crate::blame::CachedBlame, Counts, std::time::Duration) {
-    counter
-        .inner
+) -> (crate::blame::CachedBlame, Usage, std::time::Duration) {
+    budget
+        .inner()
+        .1
         .delete_derived_kind(crate::blame::KIND)
         .await
         .unwrap();
-    let cold = Repo::new(blobs.clone(), counter.clone());
-    counter.take();
+    let cold = Repo::new(budget.clone(), budget.clone());
+    budget.start();
     let started = std::time::Instant::now();
     let cuts = Cuts {
         head: HEAD_STEPS,
@@ -330,28 +238,18 @@ async fn cold_blame(
         .await
         .unwrap();
     let took = started.elapsed();
-    (b, counter.take(), took)
+    (b, budget.stop(), took)
 }
 
 async fn deep_repo(
     len: usize,
     old_versions: usize,
-) -> (
-    Arc<MemoryBlobStore>,
-    Arc<Counter>,
-    Repo,
-    ChangesetId,
-    [usize; 3],
-) {
+) -> (Arc<Budget>, Repo, ChangesetId, [usize; 3]) {
     let blobs = Arc::new(MemoryBlobStore::new());
     let meta = Arc::new(MemoryMetaStore::new());
     let writer = Repo::new(blobs.clone(), meta.clone());
     let (tip, versions) = deep_history(&writer, len, old_versions).await;
-    let counter = Arc::new(Counter {
-        inner: meta,
-        counts: Mutex::default(),
-    });
-    (blobs, counter, writer, tip, versions)
+    (Budget::new(blobs, meta), writer, tip, versions)
 }
 
 /// Calls per cold blame on a deep history, by kind (`LEEP_DEEP_LEN=200000
@@ -364,7 +262,7 @@ async fn deep_blame_calls() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(100_000);
     let started = std::time::Instant::now();
-    let (blobs, counter, _writer, tip, versions) = deep_repo(len, 18).await;
+    let (budget, _writer, tip, versions) = deep_repo(len, 18).await;
     println!("built {len} changesets in {:?}", started.elapsed());
     for (label, path, v) in [
         ("old", "old/a.rs", versions[0]),
@@ -373,15 +271,15 @@ async fn deep_blame_calls() {
     ] {
         let mut answers = Vec::new();
         for linear_jumps in [false, true] {
-            let (b, c, took) = cold_blame(&blobs, &counter, tip, path, linear_jumps).await;
+            let (b, c, took) = cold_blame(&budget, tip, path, linear_jumps).await;
             println!(
                 "{label} ({v} versions, {} lines) linear_jumps {linear_jumps}: {} statements in {took:?}",
                 b.1.len(),
-                c.statements
+                reads(&c)
             );
             answers.push(b);
-            for (kind, (calls, keys)) in &c.by_kind {
-                println!("    {kind:<24} calls {calls:>6} keys {keys:>7}");
+            for (kind, t) in &c.kinds {
+                println!("    {kind:<24} calls {:>6} keys {:>7}", t.calls, t.keys);
             }
         }
         assert_eq!(answers[0], answers[1], "{label}");

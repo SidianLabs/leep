@@ -55,6 +55,99 @@ indicative; expect roughly +/-15% run to run.
 | `log` without a path, limit 10,000 (before / after ADR 0030) | | 22.7 ms / 59.7 ms | |
 | `log` with an author filter matching nothing, all 10k (before / after ADR 0030) | | 8.6 ms / 35.5 ms | |
 
+## Guarding performance in CI
+
+ADR 0081. Two layers, both run on every pull request. Neither replaces the
+benchmarks in this document: they catch changes of shape (more calls, more
+at once, a collapse), not a 10% slowdown.
+
+### Operation budgets
+
+`crates/leep-derive/src/budget_tests.rs` runs each hot flow over memory
+stores wrapped in `leep_testkit::budget::Budget`, on a new `Repo` (nothing
+cached), and checks what it asked of the stores against `BUDGETS`:
+
+```sh
+cargo test -p leep-derive --lib budget_tests
+```
+
+The flows run on one thread, so the counts are exact and the same
+everywhere. A failure prints which way and the full usage: calls, keys and
+bytes per store method and per derived kind, and the most calls in flight
+overall, per lane and per concurrent flow.
+
+- **Over budget.** The change makes the flow do more storage work, or more
+  of it at once. Find the method that grew in the usage. A call in flight
+  holds a Postgres connection, so `meta in flight` is the connections the
+  flow takes at once from its pool (`land lane in flight`: the four of the
+  land pool). If the growth is intended, raise the line and say why in the
+  commit.
+- **More than 20% under budget.** Lower the line to the measured value, in
+  the same change, so a later regression cannot spend the gain unseen.
+
+Reapplying either half of #253's first version to this tree fails it: the
+create read its skiplist beside its tree write (`create / meta in flight: 2
+is over its budget of 1`, and 2 per create with eight at once), and the
+skiplist plan started before the batch's own reads (`land batch / land lane
+in flight: 5 is over its budget of 4`). The land-only bench gained from both.
+
+### Ratio bench in CI
+
+The `perf` job builds the merge base's `leep-server` and the change's on
+one runner and runs `scripts/perf-ratio.sh`: each server in turn, A B A B,
+on a fresh database, pinned to CPUs 0-1 with the generators on 2-3, under
+
+- `leep-land-bench --agents 32 --duration 8 --files 2`, and
+- `leep-swarm --agents 200 --think-ms 500 --duration 20 --ramp 5`, against
+  `--meta-pool-size 8`, so 200 agents press the pool as 1,000 press 32.
+
+`leep-perf-compare` then judges the four runs:
+
+| Kind | Checks | Fails when |
+|---|---|---|
+| Counts | lands not admitted, 409s, stalled agents, CAS losses, discarded pipelined attempts, reads shed by the servers, most connections in use per pool | both B runs exceed `factor x max(A) + slack` (2x and a small slack; 1x for pool peaks) |
+| Work per land | statements per land (all, and on the land pool) from `leep_meta_statements_total`, write and database bytes per land, batch mean | mean(B) / mean(A) above 1.2-2x |
+| Wall time | lands/s (both), land, create and sync p99 | below 0.7x or above 2x |
+
+A check whose two A runs differ by as much as it allows is reported
+inconclusive and does not fail: the runner was too noisy to tell. A value
+the base server does not report (statements, before ADR 0081) is skipped.
+The table goes to the job summary.
+
+To run it locally against a branch's merge base, see the header of
+`scripts/perf-ratio.sh`; give the same binaries twice for an A/A run.
+
+**A/A on the dev box.** Two A/A runs of one release build (this change),
+2026-11-03, Postgres 16 on the same 4-vCPU box with other agents building
+beside it (load average 5 and 11 at the start). Every check passed in both;
+the runs took 160 s and 165 s.
+
+| | A/A 1: A runs | B runs | A/A 2: A runs | B runs |
+|---|---|---|---|---|
+| land-bench lands/s | 203.5, 213.3 | 215.0, 197.2 | 194.6, 284.8 | 198.7, 179.1 |
+| land-bench statements per land | 10.6, 10.6 | 10.7, 10.5 | 10.6, 10.4 | 10.6, 10.7 |
+| swarm statements per land | 28.1, 28.9 | 27.7, 26.5 | 28.2, 30.3 | 28.7, 28.3 |
+| swarm write bytes per land | 1,754, 1,801 | 1,714, 1,759 | 1,731, 1,782 | 1,794, 1,798 |
+| swarm lands/s | 33.1, 48.8 | 37.7, 31.0 | 42.3, 56.0 | 53.3, 54.1 |
+| swarm create p99 ms | 293, 994 | 252, 252 | 3,146, 782 | 846, 769 |
+| swarm lands not admitted | 36, 0 | 0, 44 | 0, 0 | 0, 0 |
+| most land-pool connections in use | 4, 4 | 2, 4 | 2, 3 | 3, 4 |
+
+Statements and bytes per land moved by 2-7% between runs of one build;
+lands/s by up to 45% and create p99 by 4x, which is why wall time gates
+only on collapses and noisy pairs read as inconclusive.
+
+**What it does not catch.** The same day, B was a server with both halves
+of #253's first version reapplied (the budget tests fail on it, above) and
+A this change. Every check passed: statements per land 1.06x (land pool
+1.20x), lands/s 0.96x and 1.04x, and the B runs' p99s were lower than A's
+(noise). On a fresh store a few thousand changesets deep, with 200 agents
+for 20 s, a create's skiplist is a few cached reads and the plan is
+cheap, so neither half costs anything measurable; #253 regressed on a
+500,000-deep store with 1,000 agents for 300 s. The ratio bench is for
+collapses and for what only Postgres shows; the budgets are what catch a
+change of shape.
+
 ## Rename detection
 
 `cargo bench -p leep-derive --bench repo_ops -- detect_renames` times the pure

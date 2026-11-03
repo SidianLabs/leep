@@ -82,7 +82,7 @@ content-addressing and (b) the atomicity of `MetaStore::cas_ref`.
 | `leep-mcp` | MCP server binary `leep-mcp` for AI agents (stdio JSON-RPC; talks to `leep-server` over HTTP) | core and the `leep-cli` library (its HTTP client); never derive, store, meta or server outside dev-dependencies |
 | `leep-git` | Git bridge: library plus the `leep-git` admin binary (offline `import` and `export`, which open the stores; the `mirror` daemon, which uses only the HTTP API and the system `git`) | core, derive, and the `leep-cli` library (its HTTP client, for the mirror); store and meta only to open stores by URL in the binary |
 | `leep-fuzz-targets` | Test-only (`publish = false`): fuzz harness functions and the seed corpus loader for every decoder and parser (`docs/FUZZING.md`) | core, derive, server (to drive the real router and config parsers); nothing depends on it except the `fuzz/` crate |
-| `leep-testkit` | Fault-injecting `BlobStore`/`MetaStore` wrappers and a seeded fault plan, for tests (ADR 0021) | core; a dev-dependency only, never a normal dependency of any crate |
+| `leep-testkit` | Fault-injecting `BlobStore`/`MetaStore` wrappers and a seeded fault plan, for tests (ADR 0021), and `Budget`, a wrapper of both stores that counts what a flow asks of them for the operation budget tests (ADR 0081) | core; a dev-dependency only, never a normal dependency of any crate |
 | `leep-soak` | Soak test binary (`publish = false`): an agent swarm against a real `leep-server`, invariant checks, GC and restarts beside it, a trend report (ADR 0022). Starts the `leep` and `leep-server` binaries; talks to the server over HTTP only | core only (types); nothing depends on it |
 
 Rules:
@@ -1395,6 +1395,17 @@ packs carry checksums, and both are checked on read; most other derived rows are
 lists them). `leep-server verify` closes that gap offline by recomputation (ADR 0025). The tests that establish all of this are in ADR 0021; the soak test
 (ADR 0022) checks the same properties over hours and a deep history, with
 GC and restarts running beside a swarm of agents.
+
+Performance is guarded by counts rather than wall time
+([ADR 0081](adr/0081-operation-budgets-and-ratio-bench.md)). Each hot flow
+(create, land batch, log, blame, search, upload) has an exact budget of
+store calls, and of calls in flight at once overall, per lane and per
+concurrent flow, checked in `cargo test` over memory stores
+(`leep-derive/src/budget_tests.rs`); a gain of more than 20% must be
+written into the budget. On pull requests a `perf` job runs the merge
+base's server and the change's in turn on one runner and fails on counts
+(lands not admitted, 409s, CAS losses, shed reads, pool connections,
+statements per land) and on collapses of throughput or p99.
 
 Observability: libraries emit `tracing` events and `metrics` facade calls
 (no-ops without a recorder); only `leep-server` installs a recorder and

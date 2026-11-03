@@ -761,6 +761,42 @@ fn metric_labeled(page: &str, name: &str, label: &str) -> f64 {
         .sum()
 }
 
+/// `leep_meta_pool_connections{state="in_use"}` by pool, summed over the
+/// servers' pages in `page`.
+fn pool_in_use(page: &str) -> BTreeMap<String, f64> {
+    let mut out = BTreeMap::new();
+    for l in page.lines().filter(|l| !l.starts_with('#')) {
+        let Some(rest) = l.strip_prefix("leep_meta_pool_connections{") else {
+            continue;
+        };
+        if !rest.contains("state=\"in_use\"") {
+            continue;
+        }
+        let pool = rest
+            .split("pool=\"")
+            .nth(1)
+            .and_then(|r| r.split('"').next())
+            .unwrap_or("");
+        if let Some(v) = l.rsplit(' ').next().and_then(|v| v.parse::<f64>().ok()) {
+            *out.entry(pool.to_string()).or_default() += v;
+        }
+    }
+    out
+}
+
+/// Statements (`leep_meta_statements_total`, of samples labelled `label`
+/// if given) the servers sent per land answered `landed`; `None` if they
+/// sent none, as servers from before the counter do.
+fn statements_per_land(before: &str, after: &str, label: Option<&str>, landed: u64) -> Option<f64> {
+    const NAME: &str = "leep_meta_statements_total";
+    let read = |page: &str| match label {
+        Some(l) => metric_labeled(page, NAME, l),
+        None => metric(page, NAME),
+    };
+    let total = metric(after, NAME);
+    (total > 0.0 && landed > 0).then(|| (read(after) - read(before)) / landed as f64)
+}
+
 /// Rows of the path-history index.
 async fn history_rows(pool: &sqlx::PgPool) -> Result<i64> {
     let (n,): (i64,) =
@@ -1072,6 +1108,20 @@ struct Report {
     /// excess is derivation done twice.
     history_derived: f64,
     history_rows_added: Option<i64>,
+    /// Land batches whose pipelined attempt was thrown away (ADR 0072).
+    pipeline_discarded: f64,
+    /// Reads the servers shed (`leep_read_class_shed_total`), which counts
+    /// every refusal; `shed_reads` counts those agents saw.
+    read_class_shed: f64,
+    /// The most metadata connections in use at once per pool (`data`,
+    /// `land`, `index`), sampled once a second from
+    /// `leep_meta_pool_connections` and summed over the servers.
+    max_pool_in_use: BTreeMap<String, f64>,
+    /// Metadata statements per land answered `landed`, over all traffic and
+    /// on the land pool alone (`leep_meta_statements_total`, ADR 0081);
+    /// `None` from a server that does not count them.
+    statements_per_land: Option<f64>,
+    land_pool_statements_per_land: Option<f64>,
     db_bytes_per_land: Option<f64>,
     /// Logical bytes per land written by the write path (changesets, ref
     /// log, refs and their derived rows), and by indexes reads and the
@@ -1172,10 +1222,29 @@ async fn main() -> Result<()> {
             }
         })
     });
+    let pool_task = (!args.metrics.is_empty()).then(|| {
+        let (s, client) = (Arc::clone(&s), client.clone());
+        tokio::spawn(async move {
+            let mut max: BTreeMap<String, f64> = BTreeMap::new();
+            while !s.stop.load(Ordering::Relaxed) {
+                let page = scrape(&client, &s.args.metrics).await;
+                for (pool, n) in pool_in_use(&page) {
+                    let m = max.entry(pool).or_default();
+                    *m = m.max(n);
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            max
+        })
+    });
     tokio::time::sleep(Duration::from_secs(args.duration)).await;
     s.stop.store(true, Ordering::Relaxed);
     let elapsed = started.elapsed().as_secs_f64();
     let after = scrape(&client, &args.metrics).await;
+    let max_pool_in_use = match pool_task {
+        Some(t) => t.await?,
+        None => BTreeMap::new(),
+    };
     let mut tally = Tally::default();
     let (mut stalled, mut incomplete) = (0, 0);
     let mut per_server = vec![0u64; s.servers.len()];
@@ -1303,6 +1372,24 @@ async fn main() -> Result<()> {
             (Some(b), Some(a)) => Some(a - b),
             _ => None,
         },
+        pipeline_discarded: metric_labeled(
+            &after,
+            "leep_land_pipeline_total",
+            "outcome=\"discarded\"",
+        ) - metric_labeled(
+            &before,
+            "leep_land_pipeline_total",
+            "outcome=\"discarded\"",
+        ),
+        read_class_shed: d("leep_read_class_shed_total"),
+        max_pool_in_use,
+        statements_per_land: statements_per_land(&before, &after, None, landed_total),
+        land_pool_statements_per_land: statements_per_land(
+            &before,
+            &after,
+            Some("pool=\"land\""),
+            landed_total,
+        ),
         db_bytes_per_land: per_land(bytes_before.map(|b| b.0), bytes_after.map(|a| a.0)),
         write_bytes_per_land: per_land(bytes_before.map(|b| b.1 .0), bytes_after.map(|a| a.1 .0)),
         index_bytes_per_land: per_land(bytes_before.map(|b| b.1 .1), bytes_after.map(|a| a.1 .1)),
@@ -1389,6 +1476,14 @@ fn print_report(r: &Report) {
         r.history_derived,
         r.history_rows_added.map_or("-".into(), |n| n.to_string()),
     );
+    println!(
+        "pipeline discarded {} | reads shed by servers {} | max pool in use {:?} | statements per land {} (land pool {})",
+        r.pipeline_discarded,
+        r.read_class_shed,
+        r.max_pool_in_use,
+        r.statements_per_land.map_or("-".into(), |v| format!("{v:.1}")),
+        r.land_pool_statements_per_land.map_or("-".into(), |v| format!("{v:.1}")),
+    );
     if !r.errors.is_empty() {
         println!("errors: {:?}", r.errors);
     }
@@ -1457,6 +1552,25 @@ mod tests {
         );
         assert_eq!(read_class(Read::Files, "/v1/files/x"), None);
         assert_eq!(read_class(Read::Diff, "/v1/diff?to=x"), None);
+    }
+
+    #[test]
+    fn pool_gauges_and_statements_are_read_by_label() {
+        let page = "# TYPE x gauge\n\
+            leep_meta_pool_connections{pool=\"data\",state=\"in_use\"} 7\n\
+            leep_meta_pool_connections{pool=\"data\",state=\"idle\"} 3\n\
+            leep_meta_pool_connections{pool=\"land\",state=\"in_use\"} 2\n\
+            leep_meta_statements_total{op=\"get_ref\",pool=\"land\"} 30\n\
+            leep_meta_statements_total{op=\"get_ref\",pool=\"data\"} 70\n";
+        let pools = pool_in_use(page);
+        assert_eq!(pools["data"], 7.0);
+        assert_eq!(pools["land"], 2.0);
+        assert_eq!(statements_per_land("", page, None, 10), Some(10.0));
+        assert_eq!(
+            statements_per_land("", page, Some("pool=\"land\""), 10),
+            Some(3.0)
+        );
+        assert_eq!(statements_per_land("", "", None, 10), None);
     }
 
     #[test]

@@ -58,6 +58,55 @@ jobs:
       # Compile only, so the benches do not rot.
       - run: cargo bench --no-run -p leep-derive
 
+  # The ratio bench (ADR 0081; docs/PERFORMANCE.md, "Ratio bench in CI"):
+  # the merge base's server and this change's, built on one runner and run
+  # in turn (A B A B) under a short land bench and a 200-agent swarm.
+  # Counts gate hard; wall-time ratios only on collapses, and a check whose
+  # two A runs disagree is reported inconclusive, not failed. The per-flow
+  # operation budgets in `cargo test` are the primary guard; this catches
+  # what only a real server and Postgres show. Its own runner, so it adds
+  # no time to `test`.
+  perf:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    timeout-minutes: 60
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: leep
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: perf
+      - name: Build this change
+        run: |
+          cargo build --release -p leep-server -p leep-soak
+          mkdir -p "$RUNNER_TEMP/perf/pr"
+          cp target/release/leep-{server,land-bench,swarm,perf-compare} "$RUNNER_TEMP/perf/pr/"
+      # The same target directory: dependencies build once for both.
+      - name: Build the merge base
+        run: |
+          base=$(git merge-base HEAD "origin/${{ github.base_ref }}")
+          git worktree add "$RUNNER_TEMP/perf/base-src" "$base"
+          (cd "$RUNNER_TEMP/perf/base-src" && CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo build --release -p leep-server)
+          mkdir -p "$RUNNER_TEMP/perf/base"
+          cp target/release/leep-server "$RUNNER_TEMP/perf/base/"
+      - name: Ratio bench
+        run: >-
+          ./scripts/perf-ratio.sh --pg postgres://postgres:leep@localhost:5432/postgres
+          --base "$RUNNER_TEMP/perf/base" --pr "$RUNNER_TEMP/perf/pr" --out "$RUNNER_TEMP/perf/runs"
+      - name: Server logs
+        if: failure()
+        run: tail -n 50 "$RUNNER_TEMP"/perf/runs/*/server.log || true
+
   docker:
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'

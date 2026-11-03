@@ -3,7 +3,7 @@
 //! they did.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -28,7 +28,7 @@ type Move = (Option<ChangesetId>, Option<ChangesetId>, RefUpdateContext);
 /// A memory store whose ref reads and swaps can be held shut, which lets a
 /// test queue lands in a known order, and which can let another writer move
 /// the ref just before the next swap.
-struct Gate {
+pub(crate) struct Gate {
     inner: MemoryMetaStore,
     reads: watch::Sender<bool>,
     swaps: watch::Sender<bool>,
@@ -51,17 +51,10 @@ struct Gate {
     origin_reads: Mutex<Vec<Hash>>,
     /// Calls that read `skiplist` rows: one round trip each.
     skiplist_reads: AtomicUsize,
-    /// Whether reads and writes are counted in flight (and yield first, so
-    /// calls a caller makes concurrently overlap).
-    track: AtomicBool,
-    in_flight: AtomicUsize,
-    /// The most calls in flight at once while tracked: the connections a
-    /// pooled backend would hold at once.
-    max_in_flight: AtomicUsize,
 }
 
 impl Gate {
-    fn new() -> Arc<Gate> {
+    pub(crate) fn new() -> Arc<Gate> {
         Arc::new(Gate {
             inner: MemoryMetaStore::new(),
             reads: watch::channel(true).0,
@@ -77,22 +70,7 @@ impl Gate {
             find_fails: AtomicUsize::new(0),
             origin_reads: Mutex::new(Vec::new()),
             skiplist_reads: AtomicUsize::new(0),
-            track: AtomicBool::new(false),
-            in_flight: AtomicUsize::new(0),
-            max_in_flight: AtomicUsize::new(0),
         })
-    }
-
-    async fn tracked<T>(&self, call: impl std::future::Future<Output = T>) -> T {
-        if !self.track.load(Ordering::SeqCst) {
-            return call.await;
-        }
-        let n = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
-        self.max_in_flight.fetch_max(n, Ordering::SeqCst);
-        tokio::task::yield_now().await;
-        let out = call.await;
-        self.in_flight.fetch_sub(1, Ordering::SeqCst);
-        out
     }
 
     async fn pass(open: &watch::Sender<bool>, waiting: &AtomicUsize) {
@@ -132,7 +110,7 @@ impl Gate {
 #[async_trait]
 impl MetaStore for Gate {
     async fn put_changeset(&self, cs: &Changeset) -> Result<ChangesetId> {
-        self.tracked(self.inner.put_changeset(cs)).await
+        self.inner.put_changeset(cs).await
     }
     async fn put_changeset_with_derived(
         &self,
@@ -140,8 +118,7 @@ impl MetaStore for Gate {
         rows: &[leep_core::DerivedRow],
     ) -> Result<ChangesetId> {
         self.single_writes.fetch_add(1, Ordering::SeqCst);
-        self.tracked(self.inner.put_changeset_with_derived(cs, rows))
-            .await
+        self.inner.put_changeset_with_derived(cs, rows).await
     }
     async fn put_changesets_with_derived(
         &self,
@@ -154,7 +131,7 @@ impl MetaStore for Gate {
             .await
     }
     async fn get_changeset(&self, id: &ChangesetId) -> Result<Option<Changeset>> {
-        self.tracked(self.inner.get_changeset(id)).await
+        self.inner.get_changeset(id).await
     }
     async fn list_changesets(
         &self,
@@ -165,7 +142,7 @@ impl MetaStore for Gate {
     }
     async fn get_ref(&self, name: &str) -> Result<Option<ChangesetId>> {
         Self::pass(&self.reads, &self.waiting_reads).await;
-        self.tracked(self.inner.get_ref(name)).await
+        self.inner.get_ref(name).await
     }
     async fn cas_ref_logged(
         &self,
@@ -221,7 +198,7 @@ impl MetaStore for Gate {
         if kind == SKIPLIST {
             self.skiplist_reads.fetch_add(1, Ordering::SeqCst);
         }
-        self.tracked(self.inner.get_derived(kind, key)).await
+        self.inner.get_derived(kind, key).await
     }
     async fn get_derived_many(&self, kind: &str, keys: &[Hash]) -> Result<Vec<Option<Bytes>>> {
         if kind == crate::REBASED_ORIGIN_KIND {
@@ -230,10 +207,10 @@ impl MetaStore for Gate {
         if kind == SKIPLIST && !keys.is_empty() {
             self.skiplist_reads.fetch_add(1, Ordering::SeqCst);
         }
-        self.tracked(self.inner.get_derived_many(kind, keys)).await
+        self.inner.get_derived_many(kind, keys).await
     }
     async fn put_derived(&self, kind: &str, key: &Hash, value: Bytes) -> Result<()> {
-        self.tracked(self.inner.put_derived(kind, key, value)).await
+        self.inner.put_derived(kind, key, value).await
     }
 }
 
@@ -369,12 +346,12 @@ pub(crate) async fn wait_for(mut done: impl FnMut() -> bool) {
     panic!("condition never held");
 }
 
-type Pending = tokio::task::JoinHandle<Result<LandResponse>>;
+pub(crate) type Pending = tokio::task::JoinHandle<Result<LandResponse>>;
 
 /// Queue `lands` on `main` in this order behind a held head read, so they
 /// form one batch once `release` opens it. A no-op land of `base` goes first
 /// and holds the leader in its own batch.
-async fn queue_in_order(
+pub(crate) async fn queue_in_order(
     r: &Repo,
     gate: &Gate,
     base: ChangesetId,
@@ -400,7 +377,7 @@ async fn queue_in_order(
     (blocker, tasks)
 }
 
-fn release(gate: &Gate) {
+pub(crate) fn release(gate: &Gate) {
     gate.reads.send_replace(true);
 }
 
@@ -1756,7 +1733,7 @@ async fn a_batch_asks_for_its_copies_contents_once_and_still_finds_one_missing()
 
 /// A history of `len` changesets on `main` from `base`, with a merge of a
 /// one-changeset side branch every `merge_every` (0: linear).
-async fn long_history(r: &Repo, len: usize, merge_every: usize) -> ChangesetId {
+pub(crate) async fn long_history(r: &Repo, len: usize, merge_every: usize) -> ChangesetId {
     let mut head = r.meta().get_ref("main").await.unwrap().unwrap();
     for n in 0..len {
         let file = format!("h/{}", n % 13);
@@ -1898,42 +1875,4 @@ async fn a_batch_on_a_deep_history_reads_skiplists_a_level_at_a_time() {
         reads <= 2 * 13 + 4,
         "{reads} skiplist reads for {copies} copies"
     );
-}
-
-/// A create holds at most one metadata connection at a time (ADR 0067):
-/// its generation and skiplist reads come after its tree, not beside it,
-/// so a thousand agents creating at once ask the shared pool for a
-/// thousand connections, not two thousand.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_create_makes_one_metadata_call_at_a_time() {
-    let (r, gate) = gated_repo();
-    build(&r, &[]).await;
-    let head = long_history(&r, 300, 0).await;
-    // A new process: the generation, skiplist and root rows are all read.
-    let fresh = Repo::new(r.blobs().clone(), gate.clone());
-    let body = Bytes::from_static(b"1\n");
-    let content = fresh.put_blob(body.clone()).await.unwrap();
-    let mut changes = BTreeMap::new();
-    changes.insert(
-        RepoPath::new("x/1").unwrap(),
-        FileChange::Modify {
-            content,
-            kind: FileKind::Regular,
-            size: body.len() as u64,
-        },
-    );
-    gate.track.store(true, Ordering::SeqCst);
-    fresh
-        .create_changeset(Changeset {
-            parents: vec![head],
-            author: "t".into(),
-            timestamp: 1_700_000_000,
-            message: "x".into(),
-            changes,
-            extra: BTreeMap::new(),
-        })
-        .await
-        .unwrap();
-    gate.track.store(false, Ordering::SeqCst);
-    assert_eq!(gate.max_in_flight.load(Ordering::SeqCst), 1);
 }
