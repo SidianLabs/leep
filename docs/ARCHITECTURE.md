@@ -1165,6 +1165,25 @@ searching the merged ("superseded") packs at once; they are deleted a fence
 later. Each repack step takes the repack lock, so merges follow each other
 while earlier cleanups wait out their fence.
 
+**Retirement is durable** (ADR 0080). Once a repack (background merge or
+`leep-server repack`) has published the pack that replaces others, it
+appends them to `packs/retired` (`<id> <unix seconds>` lines; in a bucket
+the object `packs/.retired`, rewritten whole, then `packs/.gen`). Every
+view reads that record before the tombstones and the directory, and its
+stamp is one of the pack-set stamps, so no process scanning after the
+append searches or plans a retired pack: not this one (which also keeps
+the in-memory "superseded" set as a fast path), not another server, and
+not this one after a restart. A retired pack's live objects are all in a
+published pack, and it is deleted only by a lock (or lease) holder at least
+a fence after it was retired: by the merge's own cleanup while the process
+lives, otherwise by `retire_sweep`, which runs at server start, at every
+background tick and at the start of `leep-server repack`, and which also
+deletes `.tmp-*` files and packs without an index. A repack's temp files
+are deleted on its error paths too. Before this, "replaced; delete after
+the fence" lived only in the merging process, so a restart inside the fence
+left the replaced packs published, searched and merged again, copying their
+objects once more per restart.
+
 `leep-server repack` moves loose objects into a pack: a file version is
 stored as a zstd delta against the previous version at its path, a tree node
 against the same directory in the first parent, chains capped at 32. By
@@ -1188,8 +1207,8 @@ decodes the chain iteratively and checks the result against its hash. GC
 deletes a packed object by appending a tombstone; the next full repack leaves
 it out. A store reads a pack published by another process on its next miss
 (ADR 0070): the view records stamps of `packs/` (inode, modification time)
-and of the tombstones file, taken before its scan, and a miss `stat`s both
-and rescans only if one changed, or if the view is unconfirmed (its
+and of the retired record and the tombstones file, taken before its scan,
+and a miss `stat`s all three and rescans only if one changed, or if the view is unconfirmed (its
 directory time within 2 s of its scan, so a change in the same timestamp
 tick could hide; rescanned at most every 100 ms). Concurrent misses share
 a scan, and the tombstones file is read only when its stamp changed.
@@ -1232,7 +1251,9 @@ list `packs/` alone and load only new packs: every publisher rewrites
 `packs/.gen` after its index and before it returns (ADR 0070), and a miss
 reads that stamp (one GET per 50 ms per process) and lists only if its
 contents changed since the view's listing; a bucket without the stamp is listed
-on every miss, as before. `get_exact` lists once more after a miss.
+on every miss, as before. Each listing also GETs `packs/.retired` (after
+the stamp, before the LIST) and leaves the packs it names out of reads
+and merge plans. `get_exact` lists once more after a miss.
 `contains` HEADs the copy's tombstone and the pack's index, so it is exact
 across processes as GC needs. Tombstones are one empty object each, so GC
 deletes never contend, and a lease object (`packs/repack.lease`, conditional
@@ -1341,9 +1362,9 @@ misses and occupancy as Prometheus metrics (see [OPERATIONS.md](OPERATIONS.md)).
 | Backup taken while servers and GC run | The metadata snapshot is one instant; blobs are copied after it, and a blob the snapshot needs cannot have been deleted (ADR 0012), so the backup restores. A backup whose check finds a missing blob is sealed as failed, exits 1, and `restore` refuses it | Alert on `leep_backup_last_run_ok` and the last-success age; take another backup (ADR 0026) |
 | Disk, volume or database lost | Everything since the last backup's snapshot instant | `leep-server restore` into fresh stores, `verify --full --rehash`, start servers (OPERATIONS.md, "Backup and restore") |
 | `gc` killed at any point | Rows it wrote are harmless (a condemned blob is re-uploaded on demand, an announced delete is closed by the next collect); no reachable blob was deleted | Run `gc collect` again |
-| `repack` killed at any point | Before the index rename nothing is published (temp files and an index-less pack are garbage); after it every object is in the new pack and perhaps also loose, moved aside, or in an old pack. Every object reads throughout | Run `repack` again: it deletes the garbage, puts moved-aside copies back and finishes |
+| `repack` killed at any point | Before the index rename nothing is published (an index-less pack is garbage; a temp file is deleted on an error, left only by a kill); after it every object is in the new pack and perhaps also loose, moved aside, or in an old pack. Once the replaced packs are retired (ADR 0080, milliseconds after the index rename) no process searches or merges them again. Every object reads throughout | Run `repack` again, or start a server: the sweep deletes the garbage, and the retired packs once their fence has passed; `repack` puts moved-aside copies back and finishes |
 | A land batch's pack write killed or failing at any point (ADR 0068) | Before the index rename (or upload) nothing is published: temp files or an index-less `.pack` are garbage. After it the pack's objects are stored but no changeset names them yet. Every stored changeset's objects read throughout | Nothing: the land is retried and writes its objects again; the next repack deletes the garbage |
-| The server killed with background merges waiting for their fence | The merged packs stay published beside the merged pack: every object is in both | Nothing: after a restart the next background merge or `repack` folds them in |
+| The server killed with background merges waiting for their fence | The merged packs stay on disk beside the merged pack, retired (ADR 0080): every object is in both, but no process searches or merges the retired ones again | Nothing: the sweep of the next server start (or background tick, or `repack`) deletes them once their fence has passed. A kill in the milliseconds between a merge's publish and its retirement leaves them unretired; the next merge folds them in |
 | `repack` of an object store killed at any point | Before the index upload nothing is published (an index-less `.pack` or an incomplete multipart upload is garbage); after it every object is in the new pack and perhaps also loose or in an old pack. Every object reads throughout. The lease stays until it expires (10 min) | Run `repack` again after the lease expires: it deletes the garbage (once older than the lease) and finishes |
 
 **What each backend guarantees.** "Applied" means durable against a process

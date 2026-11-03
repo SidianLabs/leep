@@ -698,6 +698,7 @@ first, then packs. Hashes, `TreeNode`, the API and clients do not change.
 | `packs/<id>.pack` | the entries |
 | `packs/<id>.idx` | the index; its presence publishes the pack |
 | `packs/tombstones` | packed objects deleted by GC |
+| `packs/retired` | packs replaced by a published pack, waiting out the fence before deletion (ADR 0080) |
 | `packs/tombstones.lock`, `packs/repack.lock`, `packs/write.lock` | empty files, locked with `flock` (`write.lock`: shared by a `put_many` writing a pack, exclusive while a repack deletes unindexed packs; ADR 0068) |
 | `packs/.tmp-*` | a write in progress, or garbage of a killed repack or pack write |
 | `<shard>/.repack-<rest of hex>` | a loose copy a repack moved aside; a whole object |
@@ -808,10 +809,33 @@ Appends and rewrites hold an exclusive lock on `tombstones.lock`; a full
 repack rewrites the file (temp file, fsync, rename) keeping only lines whose
 pack still exists, and removes it when none remain.
 
+**`retired`** (ADR 0080): append-only text, one line per retired pack:
+`<pack id hex> <unix seconds>\n`, the second field when the pack was
+retired. A final line without its newline is ignored, as is any malformed
+line; a pack named twice counts from its earliest time. Only a holder of
+`repack.lock` writes it: a repack appends the packs it replaced (fsync, and
+a directory fsync when it creates the file) after the replacing pack's index
+rename and directory fsync, so every live object of a retired pack is in a
+published pack. Pack ids are content hashes, so a merge can write a pack
+the record already names (inside its fence); that repack rewrites the file
+without the published pack's line instead of appending, so a published
+replacement is never retired. A repack's cleanup or a sweep rewrites it (temp file,
+fsync, rename) keeping only lines whose pack still has its index, and
+removes it when none remain. Readers read it before `tombstones` and the
+directory listing, skip the packs it names for reads and merge planning
+(they stay in the view, so a GC delete still tombstones them), and include
+its stamp (length, modification time, inode) in the pack-set stamps of ADR
+0070. A retired pack is deleted (index, directory fsync, pack) only by a
+holder of `repack.lock`, and only once `<unix seconds>` plus the fence has
+passed. Servers before ADR 0080 ignore the file.
+
 **Publishing.** A repack writes `.tmp-*.pack`, fsyncs it, renames it to
 `<id>.pack`, then does the same for `<id>.idx` and fsyncs the directory after
 each rename. The index rename publishes. A `.pack` with no `.idx` is garbage.
-Replaced packs are removed index first.
+Replaced packs are retired, then, after the fence, removed index first. A
+failed write deletes its temp file; one left by a killed process, and a
+`.pack` with no `.idx`, are deleted by the next sweep (at server start, by
+the background repack, and by `leep-server repack`).
 
 ### Packs in an object store (ADR 0040)
 
@@ -825,14 +849,16 @@ are replaced:
 | `packs/<id>.idx` | the index, uploaded after the pack; its presence publishes the pack |
 | `packs/tombstones/<pack id>/<object hash hex>` | empty; the object's copy in that pack is deleted |
 | `packs/repack.lease` | text: `leep repack lease\nholder <id>\nexpires <unix seconds>\n`; present while a repack runs |
-| `packs/.gen` | text: `<pack id> <process nonce> <counter> <unix nanoseconds>\n`; the pack-set stamp (ADR 0070), rewritten, last writer wins, by every writer after it publishes or deletes packs (a `put_many` pack, a repack's publish and its deletes, a pack-file copy of an index). Readers compare its whole contents, never its etag, and list `packs/` again when they change. Absent in a bucket only older servers wrote |
+| `packs/.gen` | text: `<pack id> <process nonce> <counter> <unix nanoseconds>\n`; the pack-set stamp (ADR 0070), rewritten, last writer wins, by every writer after it publishes, retires or deletes packs (a `put_many` pack, a repack's publish, its retirement and its deletes, a sweep's deletes, a pack-file copy of an index). Readers compare its whole contents, never its etag, and list `packs/` again when they change. Absent in a bucket only older servers wrote |
+| `packs/.retired` | text: the lines of the filesystem's `packs/retired` (ADR 0080), rewritten whole (buckets cannot append) only by the lease holder, with a conditional PUT (`If-Match` on the etag it read, `If-None-Match` when absent; retried on a conflict after the lease is checked), after the replacing index is uploaded and before the `packs/.gen` write that announces it. A repack that publishes a pack whose id the record names removes that line in the same write. Left empty, not deleted, when no line remains (a delete cannot be conditional). Readers GET it after `packs/.gen` and before listing `packs/`. Absent in a bucket no repack of ADR 0080 or later wrote |
 
 A tombstone hides only the copy in the pack it names, and a loose copy of
 the same hash is always served, as on the filesystem. Readers ignore keys
 under `packs/` they do not recognise. The lease is created only if absent
 and replaced only if its etag is the one its holder last wrote; once its
 expiry has passed another repack may take it over. A `.pack` with no `.idx`
-is garbage. Replaced packs are removed index first, then their tombstones.
+is garbage. Replaced packs are retired, then, after the fence, removed
+index first, then their tombstones and their `.retired` lines.
 A writer that publishes a pack without rewriting `packs/.gen` (a server
 before ADR 0070) leaves readers that saw the stamp finding the pack only at
 their next full listing (5 s) or through an exact read; the stamp never

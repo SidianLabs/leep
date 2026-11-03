@@ -495,3 +495,94 @@ async fn assert_main_readable_through(repo: &Repo, meta: &Arc<MemoryMetaStore>) 
         }
     }
 }
+
+/// Copies of each object across the published packs of the store at
+/// `root`, or only across `among`.
+fn packed_copies(root: &Path, among: Option<&HashSet<String>>) -> BTreeMap<Hash, usize> {
+    let dir = root.join("packs");
+    let mut out = BTreeMap::new();
+    for e in std::fs::read_dir(&dir).unwrap() {
+        let name = e.unwrap().file_name().to_string_lossy().into_owned();
+        let Some(id) = name.strip_suffix(".idx") else {
+            continue;
+        };
+        if among.is_some_and(|a| !a.contains(id)) {
+            continue;
+        }
+        let idx =
+            leep_store::pack::PackIndex::decode(std::fs::read(dir.join(&name)).unwrap()).unwrap();
+        for r in 0..idx.len() {
+            *out.entry(idx.hash_at(r)).or_default() += 1;
+        }
+    }
+    out
+}
+
+/// A server restarted while its background merges wait for their fence
+/// (ADR 0080): the merged packs stay retired, so no restart merges them
+/// again, the pack directory holds what the same merges without restarts
+/// would, and once the fence passes each object is stored once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restarts_inside_the_fence_never_merge_retired_packs_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = BackgroundRepackOptions {
+        trigger_packs: 2,
+        fence: Duration::from_secs(3600),
+        ..BackgroundRepackOptions::default()
+    };
+    let mut objects = 0usize;
+    for restart in 0..8 {
+        // A new process: a new store handle and a new background repack.
+        let store = FsBlobStore::new(dir.path());
+        for b in 0..4 {
+            let items: Vec<(Hash, Bytes)> = (0..20)
+                .map(|i| {
+                    let data = Bytes::from(format!("restart {restart} batch {b} object {i}\n"));
+                    (Hash::of_blob(&data), data)
+                })
+                .collect();
+            assert_eq!(store.put_many(items).await.unwrap().len(), 20);
+            objects += 20;
+        }
+        let mut bg = BackgroundRepack::new(PackStore::Fs(store.clone()), opts.clone());
+        let tick = bg.tick().await.unwrap();
+        assert!(!tick.merged.is_empty(), "restart {restart}: {tick:?}");
+        let searched: HashSet<String> = store
+            .pack_sizes()
+            .unwrap()
+            .into_iter()
+            .map(|p| p.id)
+            .collect();
+        let dup: Vec<_> = packed_copies(dir.path(), Some(&searched))
+            .into_iter()
+            .filter(|(_, n)| *n > 1)
+            .collect();
+        assert!(dup.is_empty(), "restart {restart}: searched twice: {dup:?}");
+        // Stopped inside the fence: the cleanups queued in memory are lost.
+        assert!(bg.pending() > 0);
+    }
+    // Each object is in its land pack and in one merged pack per class it
+    // rose through (two here), whatever the restarts.
+    let entries: usize = packed_copies(dir.path(), None).values().sum();
+    assert!(
+        entries <= 3 * objects,
+        "{entries} entries for {objects} objects"
+    );
+
+    // A process started after the fence sweeps the retired packs at once.
+    let store = FsBlobStore::new(dir.path());
+    let mut bg = BackgroundRepack::new(
+        PackStore::Fs(store.clone()),
+        BackgroundRepackOptions {
+            fence: Duration::ZERO,
+            ..opts
+        },
+    );
+    let tick = bg.tick().await.unwrap();
+    let swept = tick.swept.expect("the store was free");
+    assert!(swept.retired_removed > 0, "{swept:?}");
+    let copies = packed_copies(dir.path(), None);
+    assert_eq!(copies.len(), objects);
+    assert!(copies.values().all(|&n| n == 1), "one copy of each object");
+    assert!(store.retired_packs().unwrap().is_empty());
+}

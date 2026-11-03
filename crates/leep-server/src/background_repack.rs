@@ -20,12 +20,15 @@
 //!
 //! One merge at a time, on a thread of its own at the lowest CPU priority
 //! with one compression thread, so it takes what the land leader leaves.
-//! Reads in this process stop searching the merged packs at once; they are
-//! deleted a fence later, as `leep-server repack` deletes what it replaced,
-//! so other processes reading them meanwhile (backups, a second server)
-//! keep finding every object. Each step holds the store's repack lock or
-//! lease, so a `leep-server repack` run beside it is refused or refuses
-//! this, and neither deletes what the other still needs.
+//! A merge retires the packs it merged durably (ADR 0080): no process
+//! searches or plans them again, this one after a restart included. They
+//! are deleted a fence later, as `leep-server repack` deletes what it
+//! replaced, so other processes reading them meanwhile (backups, a second
+//! server) keep finding every object: by the merge's cleanup while this
+//! process lives, and otherwise by the sweep that runs at start and at the
+//! start of every tick. Each step holds the store's repack lock or lease,
+//! so a `leep-server repack` run beside it is refused or refuses this, and
+//! neither deletes what the other still needs.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -33,7 +36,7 @@ use std::time::{Duration, Instant};
 use leep_core::{Error, Result};
 use leep_store::{
     FsBlobStore, ObjectBlobStore, PackSize, PublishedObjectPack, PublishedPack, RepackMode,
-    RepackOptions, RepackReport,
+    RepackOptions, RepackReport, SweepReport,
 };
 
 /// What the background repack does, and how often.
@@ -153,6 +156,25 @@ impl PackStore {
         }
     }
 
+    /// The store's [`retire_sweep`](FsBlobStore::retire_sweep): garbage
+    /// and the retired packs past `fence`. `None` while another repack
+    /// holds the store. On an object store, unless `full`, the lease is
+    /// taken only when a retired pack is due (one GET otherwise).
+    pub async fn sweep(&self, fence: Duration, full: bool) -> Result<Option<SweepReport>> {
+        match self {
+            PackStore::Fs(s) => {
+                let s = s.clone();
+                on_low_thread(move || s.retire_sweep_blocking(fence)).await
+            }
+            PackStore::Object(s) => {
+                if !full && !s.retired_due(fence).await? {
+                    return Ok(Some(SweepReport::default()));
+                }
+                s.retire_sweep(fence).await
+            }
+        }
+    }
+
     async fn publish(&self, opts: RepackOptions) -> Result<Pending> {
         let hints = leep_core::intern::PackHints::default();
         match self {
@@ -211,6 +233,27 @@ async fn on_low_thread<T: Send + 'static>(
         .map_err(|_| Error::Storage("the repack thread stopped".into()))?
 }
 
+/// The sweep a server runs when it starts (ADR 0080), logged; failures
+/// are logged too, as the background repack retries at every tick.
+pub async fn sweep_at_start(store: &PackStore, fence: Duration) {
+    match store.sweep(fence, true).await {
+        Ok(Some(r)) => {
+            metrics::counter!("leep_repack_retired_removed_total").increment(r.retired_removed);
+            if r.garbage_removed + r.retired_removed + r.retired_waiting > 0 {
+                tracing::info!(
+                    garbage_removed = r.garbage_removed,
+                    retired_removed = r.retired_removed,
+                    retired_bytes_removed = r.retired_bytes_removed,
+                    retired_waiting = r.retired_waiting,
+                    "swept packs left by earlier repacks"
+                );
+            }
+        }
+        Ok(None) => tracing::debug!("another repack holds the store; sweep skipped"),
+        Err(e) => tracing::warn!(error = %e, "sweep of retired packs failed"),
+    }
+}
+
 /// A merge whose cleanup waits for its fence.
 struct Waiting {
     due: Instant,
@@ -234,6 +277,9 @@ pub struct TickReport {
     pub merged: Vec<RepackReport>,
     /// Cleanups of earlier merges finished.
     pub finished: usize,
+    /// What the sweep the tick began with did; `None` if it was skipped
+    /// (another repack held the store) or failed.
+    pub swept: Option<SweepReport>,
     /// Packs reads search after the tick.
     pub packs: usize,
 }
@@ -244,6 +290,7 @@ impl BackgroundRepack {
         metrics::counter!("leep_repack_background_runs_total", "outcome" => "error").increment(0);
         metrics::counter!("leep_repack_background_packs_merged_total").increment(0);
         metrics::counter!("leep_repack_background_objects_written_total").increment(0);
+        metrics::counter!("leep_repack_retired_removed_total").increment(0);
         BackgroundRepack {
             store,
             opts,
@@ -256,9 +303,12 @@ impl BackgroundRepack {
         self.pending.len()
     }
 
-    /// Run for the life of the process, one tick per interval.
+    /// Run for the life of the process: a full sweep at once (what a
+    /// process that stopped inside a fence, or a killed pack write, left),
+    /// then one tick per interval.
     pub fn spawn(mut self) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
+            sweep_at_start(&self.store, self.opts.fence).await;
             loop {
                 tokio::time::sleep(self.opts.interval).await;
                 if let Err(e) = self.tick().await {
@@ -271,8 +321,20 @@ impl BackgroundRepack {
     /// Finish the cleanups whose fence has passed, then merge while more
     /// than `trigger_packs` packs are searched and a class has `fanout`.
     pub async fn tick(&mut self) -> Result<TickReport> {
+        let swept = match self.store.sweep(self.opts.fence, false).await {
+            Ok(s) => s,
+            // The merges need no sweep; the next tick tries again.
+            Err(e) => {
+                tracing::warn!(error = %e, "sweep of retired packs failed");
+                None
+            }
+        };
+        if let Some(s) = swept.as_ref().filter(|s| s.retired_removed > 0) {
+            metrics::counter!("leep_repack_retired_removed_total").increment(s.retired_removed);
+        }
         let mut report = TickReport {
             finished: self.finish_due(false).await?,
+            swept,
             ..TickReport::default()
         };
         loop {

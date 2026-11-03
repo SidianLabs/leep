@@ -21,6 +21,9 @@ mod packput;
 mod packset;
 mod packwrite;
 mod repack;
+mod retire;
+#[cfg(test)]
+mod retire_tests;
 pub mod sync;
 mod tmpfile;
 
@@ -42,6 +45,7 @@ pub use packwrite::plan_merge;
 pub use repack::{
     PackSize, PublishedPack, RepackHook, RepackMode, RepackOptions, RepackReport, RepackStep,
 };
+pub use retire::SweepReport;
 
 /// Run the calling thread at the lowest CPU priority (nice 19) from now
 /// on, for background work that must not slow requests down: the server's

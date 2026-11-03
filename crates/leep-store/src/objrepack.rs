@@ -6,6 +6,7 @@
 //! The hook steps mean here: `PackSynced` the local pack file is written,
 //! `PackRenamed` the pack is uploaded (no index names it yet), `IndexSynced`
 //! the index is encoded and about to be uploaded, `Published` it is uploaded,
+//! `Retired` the replaced packs are in `packs/.retired` (ADR 0080),
 //! `RemovingLoose(n)` the n-th loose copy is about to be checked,
 //! `LooseMovedAside(n)` a batch of loose copies ending at the n-th was
 //! deleted and the tombstones are about to be checked again, and
@@ -30,12 +31,14 @@ use tokio::task::JoinHandle;
 
 use crate::fs::unix_secs;
 use crate::objpacks::{
-    bump_gen, idx_key, list_packs_dir, list_tombstones, pack_key, tombstone_key, TOMBSTONES_PREFIX,
+    bump_gen, idx_key, list_packs_dir, list_tombstones, pack_key, put_retired, read_retired,
+    read_retired_versioned, tombstone_key, TOMBSTONES_PREFIX,
 };
 use crate::pack::{self, IdxEntry, PackIndex};
 use crate::packset::{self, PackSet, ScanReason, DEFAULT_DECODED_CACHE};
 use crate::packwrite::{hint_ids, write_order, write_pack, ObjectTable, PackSource, SourceRead};
 use crate::repack::step;
+use crate::retire::{past_fence, SweepReport};
 use crate::{storage_err, ObjectBlobStore, RepackOptions, RepackReport, RepackStep};
 use leep_core::intern::PackHints;
 
@@ -758,6 +761,10 @@ impl ObjectBlobStore {
         step(opts, RepackStep::PackSynced)?;
         let replaced: Vec<String> = merging.iter().map(|(p, _)| p.id.clone()).collect();
         if written.records.is_empty() {
+            // Every object of the merged packs was deleted: they retire
+            // with no replacement.
+            self.retire(&replaced, "", "", lease).await?;
+            step(opts, RepackStep::Retired)?;
             return Ok(Published {
                 report,
                 from_loose: Vec::new(),
@@ -811,6 +818,13 @@ impl ObjectBlobStore {
                 .await?;
             report.late_tombstones = late.len() as u64;
         }
+        // The new pack holds every live object of each replaced pack: they
+        // retire durably (ADR 0080), so no server listing from now on
+        // searches or merges them, and a sweep deletes them after the fence.
+        let replaced: Vec<String> = replaced.into_iter().filter(|r| *r != id).collect();
+        self.retire(&replaced, &id, &id, lease).await?;
+        self.packs.unsupersede(&id);
+        step(opts, RepackStep::Retired)?;
         self.packs.rescan(ScanReason::Repack).await?;
         Ok(Published {
             report,
@@ -819,8 +833,155 @@ impl ObjectBlobStore {
                 .into_iter()
                 .map(|(id, stamp)| (*table.hash(id), stamp))
                 .collect(),
-            replaced: replaced.into_iter().filter(|r| *r != id).collect(),
+            replaced,
         })
+    }
+
+    /// Add `ids` to `packs/.retired` as retired now, take `published` (the
+    /// pack just published, if any) out of it, and announce it in
+    /// `packs/.gen`. A merge can reproduce a pack byte for byte, so its id
+    /// may name a pack retired earlier and still listed; left retired, it
+    /// would hide the only copy of what its sources held, and a sweep would
+    /// delete it. Only under the lease.
+    async fn retire(&self, ids: &[String], published: &str, by: &str, lease: &Lease) -> Result<()> {
+        let now = now_secs();
+        let changed = self
+            .update_retired(lease, |r| {
+                let mut changed = r.remove(published).is_some();
+                for id in ids {
+                    if id != published && !r.contains_key(id) {
+                        r.insert(id.clone(), now);
+                        changed = true;
+                    }
+                }
+                changed
+            })
+            .await?;
+        if changed {
+            bump_gen(&*self.store, by).await?;
+        }
+        Ok(())
+    }
+
+    /// Read-modify-write `packs/.retired` with a conditional PUT, so a
+    /// writer that lost the lease between its check and its PUT cannot
+    /// drop another holder's lines: on a conflict the lease is checked
+    /// (an error if lost) and the change applied again to what is there.
+    /// `edit` returns whether it changed anything; nothing is written if
+    /// not. Whether anything was written.
+    async fn update_retired(
+        &self,
+        lease: &Lease,
+        edit: impl Fn(&mut crate::retire::Retired) -> bool,
+    ) -> Result<bool> {
+        for _ in 0..8 {
+            let (mut r, seen) = read_retired_versioned(&*self.store).await?;
+            if !edit(&mut r) {
+                return Ok(false);
+            }
+            lease.check().await?;
+            if put_retired(&*self.store, &r, seen).await? {
+                return Ok(true);
+            }
+            tracing::warn!("packs/.retired changed under this repack; applying the change again");
+        }
+        Err(Error::Conflict(
+            "packs/.retired keeps changing under this repack; try again".into(),
+        ))
+    }
+
+    /// Drop the retired lines and the tombstones of packs that no longer
+    /// exist. Only under the lease, after the deletes.
+    async fn forget_gone_packs(&self, lease: &Lease) -> Result<()> {
+        // Tombstones listed before packs, so a pack published in between
+        // (none can be, under the lease) would keep its tombstones.
+        let tombstones = list_tombstones(&*self.store).await?;
+        let (ids, _) = list_packs_dir(&*self.store).await?;
+        self.update_retired(lease, |r| {
+            let before = r.len();
+            r.retain(|id, _| ids.binary_search(id).is_ok());
+            r.len() != before
+        })
+        .await?;
+        let stale: Vec<Path> = tombstones
+            .into_iter()
+            .filter(|(id, _)| ids.binary_search(id).is_err())
+            .flat_map(|(id, hashes)| hashes.into_iter().map(move |h| tombstone_key(&id, &h)))
+            .collect();
+        delete_all(&*self.store, stale).await
+    }
+
+    /// Clean up after repacks, as
+    /// [`FsBlobStore::retire_sweep`](crate::FsBlobStore::retire_sweep)
+    /// does, under the lease: delete `.pack` objects no index publishes
+    /// (once older than the lease TTL), delete the packs retired at least
+    /// `fence` ago (index first), announce it, and forget packs that are
+    /// gone. `None`, doing nothing, while another repack holds the lease.
+    pub async fn retire_sweep(&self, fence: Duration) -> Result<Option<SweepReport>> {
+        let lease = match Lease::acquire(self.store.clone()).await {
+            Ok(l) => l,
+            Err(Error::Conflict(_)) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let res = self.sweep_leased(fence, &lease).await;
+        lease.release().await;
+        res.map(Some)
+    }
+
+    /// Whether `packs/.retired` names a pack retired at least `fence` ago:
+    /// one GET, so the background repack checks it before taking the
+    /// lease for a sweep.
+    pub async fn retired_due(&self, fence: Duration) -> Result<bool> {
+        let now = now_secs();
+        Ok(read_retired(&*self.store)
+            .await?
+            .values()
+            .any(|at| past_fence(*at, fence, now)))
+    }
+
+    /// The packs `packs/.retired` names, with when each was retired.
+    pub async fn retired_packs(&self) -> Result<Vec<(String, i64)>> {
+        Ok(read_retired(&*self.store).await?.into_iter().collect())
+    }
+
+    async fn sweep_leased(&self, fence: Duration, lease: &Lease) -> Result<SweepReport> {
+        let mut r = SweepReport {
+            garbage_removed: self.remove_unpublished().await?,
+            ..SweepReport::default()
+        };
+        let retired = read_retired(&*self.store).await?;
+        if retired.is_empty() {
+            return Ok(r);
+        }
+        let (ids, _) = list_packs_dir(&*self.store).await?;
+        let view = self.packs.view().await?;
+        let now = now_secs();
+        let mut stale = false;
+        for (id, at) in &retired {
+            if ids.binary_search(id).is_err() {
+                stale = true;
+                continue;
+            }
+            if !past_fence(*at, fence, now) {
+                r.retired_waiting += 1;
+                continue;
+            }
+            lease.check().await?;
+            // The index first: without it the pack is unpublished garbage.
+            delete_all(&*self.store, vec![idx_key(id)]).await?;
+            delete_all(&*self.store, vec![pack_key(id)]).await?;
+            r.retired_removed += 1;
+            r.retired_bytes_removed += view.pack(id).map_or(0, |p| p.index.pack_len());
+        }
+        if r.retired_removed > 0 {
+            bump_gen(&*self.store, "").await?;
+        }
+        if stale || r.retired_removed > 0 {
+            lease.check().await?;
+            self.forget_gone_packs(lease).await?;
+            self.packs.rescan(ScanReason::Repack).await?;
+        }
+        Ok(r)
     }
 
     /// Objects of the new pack whose source GC deleted while it was written:
@@ -946,16 +1107,7 @@ impl PublishedObjectPack {
             bump_gen(&*objects, &id).await?;
         }
         step(&self.opts, RepackStep::OldPacksRemoved)?;
-        // Tombstones listed before packs, so a pack published in between
-        // (none can be, under the lease) would keep its tombstones.
-        let tombstones = list_tombstones(&*objects).await?;
-        let (ids, _) = list_packs_dir(&*objects).await?;
-        let stale: Vec<Path> = tombstones
-            .into_iter()
-            .filter(|(id, _)| ids.binary_search(id).is_err())
-            .flat_map(|(id, hashes)| hashes.into_iter().map(move |h| tombstone_key(&id, &h)))
-            .collect();
-        delete_all(&*objects, stale).await?;
+        self.store.forget_gone_packs(self.lease()).await?;
         step(&self.opts, RepackStep::TombstonesRewritten)?;
         self.report.packs_after = self
             .store

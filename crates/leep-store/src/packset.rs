@@ -17,6 +17,7 @@ use leep_core::{BlobMeta, Error, Hash, Result};
 
 use crate::cache::Lru;
 use crate::pack::{self, IdxEntry, PackIndex, PACK_MAGIC, READ_CHAIN_LIMIT};
+use crate::retire::{read_retired, RETIRED};
 use crate::storage_err;
 
 pub(crate) const PACKS_DIR: &str = "packs";
@@ -333,9 +334,14 @@ pub(crate) struct View {
     /// How many of `packs` reads search.
     searchable: usize,
     ids: Vec<String>,
-    /// Stamps taken before the scan read the tombstones and the directory:
-    /// while both are unchanged (and the view is confirmed), so are the
-    /// packs and their tombstones (ADR 0070).
+    /// The packs `packs/retired` named when the scan read it (ADR 0080):
+    /// ordered after the searchable ones, like superseded packs.
+    retired: Arc<HashSet<String>>,
+    /// Stamps taken before the scan read the retired record, the
+    /// tombstones and the directory: while all are unchanged (and the view
+    /// is confirmed), so are the packs, which of them reads search, and
+    /// their tombstones (ADR 0070).
+    retired_sig: Option<FileSig>,
     tombstones: Option<FileSig>,
     dir: Option<DirSig>,
     /// When the scan behind this view began.
@@ -358,7 +364,8 @@ impl View {
         })
     }
 
-    /// The packs reads search: every published pack but the superseded.
+    /// The packs reads search: every published pack but the superseded and
+    /// the retired.
     pub fn searchable(&self) -> &[(Arc<Pack>, HashSet<Hash>)] {
         &self.packs[..self.searchable]
     }
@@ -390,6 +397,14 @@ pub(crate) fn order_packs<P: PackLike>(
         .iter()
         .take_while(|(p, _)| !superseded.contains(p.id()))
         .count()
+}
+
+/// The packs reads skip: superseded in this process, or retired.
+pub(crate) fn hidden(superseded: &HashSet<String>, retired: &HashSet<String>) -> HashSet<String> {
+    if retired.is_empty() {
+        return superseded.clone();
+    }
+    superseded.union(retired).cloned().collect()
 }
 
 /// A loaded pack of either kind of store, for [`order_packs`].
@@ -481,15 +496,16 @@ impl PackSet {
     }
 
     /// The view a miss of the current one should search: the current view
-    /// while the stamps of `packs/` and the tombstones are as it recorded
-    /// them (two `stat`s, no lock), else a scan. An unconfirmed view is
-    /// rescanned at most every [`UNCONFIRMED_RESCAN`].
+    /// while the stamps of the retired record, the tombstones and `packs/`
+    /// are as it recorded them (three `stat`s, no lock), else a scan. An
+    /// unconfirmed view is rescanned at most every [`UNCONFIRMED_RESCAN`].
     pub fn view_after_miss(&self) -> Result<Arc<View>> {
         let v = self.view()?;
         let started = Instant::now();
+        let retired = file_sig(&self.dir.join(RETIRED))?;
         let tombstones = file_sig(&self.dir.join(TOMBSTONES))?;
         let dir = dir_sig(&self.dir)?;
-        if tombstones != v.tombstones || dir != v.dir {
+        if retired != v.retired_sig || tombstones != v.tombstones || dir != v.dir {
             return self.rescan_after(started, ScanReason::MissChanged);
         }
         if !v.confirmed && started.duration_since(v.scanned) >= UNCONFIRMED_RESCAN {
@@ -505,6 +521,19 @@ impl PackSet {
     fn scan(&self, reason: ScanReason) -> Result<Arc<View>> {
         let began = Instant::now();
         let current = self.view.read().unwrap().clone();
+        // The retired record first, then the tombstones, then the
+        // directory (ADR 0080): a line is dropped only after the pack it
+        // names is gone, so a pack this scan lists that a record read
+        // earlier forgot was never retired when that record was read. Read
+        // only when its stamp changed, as the tombstones are.
+        let retired_path = self.dir.join(RETIRED);
+        let retired_sig = file_sig(&retired_path)?;
+        let retired = match &current {
+            Some(v) if v.retired_sig == retired_sig => None,
+            _ => Some(Arc::new(
+                read_retired(&self.dir)?.into_keys().collect::<HashSet<_>>(),
+            )),
+        };
         // Tombstones before the directory: a repack deletes replaced indexes
         // before it drops their tombstones, so this order never pairs an old
         // pack with a tombstone file that has forgotten it. The file is read
@@ -526,12 +555,14 @@ impl PackSet {
         let confirmed = stamp_confirmed(dir, now);
         if let Some(v) = current
             .as_ref()
-            .filter(|v| v.ids == ids && tombstones.is_none())
+            .filter(|v| v.ids == ids && tombstones.is_none() && retired.is_none())
         {
             let view = Arc::new(View {
                 packs: v.packs.clone(),
                 searchable: v.searchable,
                 ids,
+                retired: v.retired.clone(),
+                retired_sig,
                 tombstones: tomb_sig,
                 dir,
                 scanned: began,
@@ -541,12 +572,19 @@ impl PackSet {
             *self.view.write().unwrap() = Some(view.clone());
             return Ok(view);
         }
+        let retired = match retired {
+            Some(r) => r,
+            None => current
+                .as_ref()
+                .map_or_else(Default::default, |v| v.retired.clone()),
+        };
         let superseded = {
             let mut s = self.superseded.lock().unwrap();
             // Deleted: nothing left to skip.
             s.retain(|id| ids.binary_search(id).is_ok());
             s.clone()
         };
+        let hidden = hidden(&superseded, &retired);
         let mut open: HashMap<&str, &(Arc<Pack>, HashSet<Hash>)> = HashMap::new();
         if let Some(v) = &current {
             for p in &v.packs {
@@ -571,7 +609,7 @@ impl PackSet {
             };
             packs.push((pack, dead));
         }
-        let searchable = order_packs(&mut packs, &superseded);
+        let searchable = order_packs(&mut packs, &hidden);
         let complete = loaded == ids;
         let view = Arc::new(View {
             packs,
@@ -579,6 +617,8 @@ impl PackSet {
             // Only what loaded, so a pack seen mid-delete is retried next
             // time, and the view stays unconfirmed until then.
             ids: if complete { ids } else { loaded },
+            retired,
+            retired_sig,
             tombstones: tomb_sig,
             dir,
             scanned: began,
@@ -608,11 +648,12 @@ impl PackSet {
         let mut packs = current.packs.clone();
         packs.push((Arc::new(pack), HashSet::new()));
         let superseded = self.superseded.lock().unwrap().clone();
-        let searchable = order_packs(&mut packs, &superseded);
+        let searchable = order_packs(&mut packs, &hidden(&superseded, &current.retired));
         *self.view.write().unwrap() = Some(Arc::new(View {
             packs,
             searchable,
             ids,
+            retired: current.retired.clone(),
             ..*current
         }));
         metrics::gauge!("leep_blob_packs").set(searchable as f64);
@@ -634,14 +675,22 @@ impl PackSet {
             return;
         };
         let mut packs = current.packs.clone();
-        let searchable = order_packs(&mut packs, &superseded);
+        let searchable = order_packs(&mut packs, &hidden(&superseded, &current.retired));
         *self.view.write().unwrap() = Some(Arc::new(View {
             packs,
             searchable,
             ids: current.ids.clone(),
+            retired: current.retired.clone(),
             ..*current
         }));
         metrics::gauge!("leep_blob_packs").set(searchable as f64);
+    }
+
+    /// Search `id` again: a repack of this process published it anew (the
+    /// same bytes as a pack it had superseded). Takes effect at the next
+    /// scan.
+    pub fn unsupersede(&self, id: &str) {
+        self.superseded.lock().unwrap().remove(id);
     }
 
     /// The view, rescanned first if the tombstones file changed since. One

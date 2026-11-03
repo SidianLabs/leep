@@ -7,6 +7,28 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 ## [Unreleased]
 
+### Replaced packs are retired durably
+- **Fixed.** A server restarted while its background merges waited for
+  their fence searched the packs they had replaced again and merged them
+  again, copying their objects once more per restart; one store's packs
+  grew from 1.5 GB to 9.3 GB and filled its disk. A repack (background or
+  `leep-server repack`) now records the packs it replaced in
+  `packs/retired` (`packs/.retired` in a bucket) right after it publishes
+  their replacement (ADR 0080). No process reads or plans a retired pack
+  again, a restarted one included, and it is deleted once its fence has
+  passed.
+- **Added.** A sweep runs at server start, at every background repack
+  interval and at the start of `leep-server repack`: it deletes retired
+  packs past their fence, and temp files and packs without an index left
+  by a killed or failed pack write. A repack that fails (a full disk)
+  deletes its temp files itself. New metric
+  `leep_repack_retired_removed_total`; `repack --json` reports
+  `retired_removed`.
+- **Upgrading.** Servers before this change ignore the new file; upgrade
+  every server sharing a store. Duplicate packs that older servers left are
+  not recorded as retired: reclaim them once with `leep-server repack
+  --full` (docs/OPERATIONS.md, "Packs written by land batches").
+
 ### Lands on a deep history read skiplists a level at a time
 - **Changed.** A land batch reads the skiplist rows its copies are built
   from a level at a time for the whole batch, on a task beside its replays,
