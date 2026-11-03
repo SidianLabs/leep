@@ -404,6 +404,24 @@ middleware puts a `ReadPermit` in the request's extensions), so detached
 work still counts against the class. At most `2 × max(2, cores)` blames run
 detached; past that a blame runs inline and ends with its request.
 
+**Blames kept current** ([ADR 0083](adr/0083-keep-blames-of-tracked-files-current.md)).
+Every answered blame tracks its path in memory (`blame_warm::BlameTracker`,
+at most `--warm-blame-paths`, each for 30 minutes after its last blame). A
+blame warmer loop (`BlameWarmer`, beside the index warmers, on the shared
+connections, gated by a `blame` read permit per pass) follows each ref's
+first-parent chain from where it left off and, for each landed changeset
+with one parent and each tracked file it wrote, reads the cached blame of
+the file's newest changer at the parent (`Repo::newest_changer_blame`: the
+index's only newest changer, at or above the parent's `last_merge-v1`)
+and writes the changeset's own row from it with one line diff
+(`Repo::blame_extend`, the replay's `apply_base`), byte-identical to the
+row a request would cache. It extends a changeset only once the
+path-history index is derived at its parent and never walks: a missing
+row (a merge, rename or gap broke the chain) marks the file cold on that
+ref until it is blamed again. The head walk of a request looks up the
+cached blame of its first changer below the tip at once and ends there on
+a hit, so a blame of a tracked file at a new head is a few reads.
+
 **Blame walks.** Each first-parent walk asks the path-history index
 where the next change is. The walk
 asks the path-history index where the next change is: the newest changers'

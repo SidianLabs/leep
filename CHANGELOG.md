@@ -7,6 +7,30 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 ## [Unreleased]
 
+### Blames of tracked files are kept current as changes land
+- **Added.** Every blame a server answers tracks its file (at most
+  `--warm-blame-paths`, `LEEP_WARM_BLAME_PATHS`, default 1,024, each for 30
+  minutes after its last blame), and a blame warmer beside the index
+  warmers extends each tracked file's cached blame to every landed
+  changeset that writes it, with one line diff and no walk (ADR 0083,
+  superseding the unmerged ADR 0075). The rows are the `blame-v2` rows a
+  request would cache, byte for byte. The warmer reads the path-history
+  index only where it is derived, works at most 200 ms a pass, takes a
+  `blame` read permit per pass with work, and runs in every `--indexing`
+  mode; `--warm-blame-paths 0` turns it off. On a 200,000-changeset
+  history a blame of a hot file 8,000 changesets after its last blame took
+  19.5 ms instead of 437 ms; in a 300-agent swarm blame p99 fell from
+  169-234 ms to 38-46 ms and blame sheds by two thirds, with lands/s and
+  index lag unchanged. New metrics `leep_warm_blame_total{result}`,
+  `leep_warm_blame_shed_total`, `leep_blame_tracked_paths` and
+  `leep_warm_duration_seconds{group="blame"}`.
+- **Changed.** A blame's walk from the tip looks up the cached blame of
+  the first changer below it at once and ends there on a hit, instead of
+  after a batch of steps; a cold blame makes one more metadata call (the
+  `blame` operation budget is 10 + 3 per version, from 9 + 3).
+- **Added.** `leep-swarm --blame-hot <share>` sends that share of blames
+  to the hot files.
+
 ### Replaced packs are retired durably
 - **Fixed.** A server restarted while its background merges waited for
   their fence searched the packs they had replaced again and merged them

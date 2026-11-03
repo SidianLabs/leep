@@ -30,7 +30,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use leep_core::lane::{scope, Lane};
-use leep_core::{ChangesetId, Result};
+use leep_core::{ChangesetId, MetaStore, Result};
 
 use crate::derived::{self, DerivedKind, HistoryTree, LogFilterIndex};
 use crate::indexing::{IndexGroup, IndexLeases};
@@ -65,18 +65,44 @@ pub struct Warmer {
     warmed: HashMap<IndexGroup, HashMap<String, ChangesetId>>,
     /// Groups the last pass warmed.
     active: Vec<IndexGroup>,
-    /// Newest ref log entry handled; `None` until a full listing.
-    seq: Option<u64>,
-    last_full: Option<Instant>,
-    full_every: Duration,
+    tail: RefTail,
     /// The one group this warmer's passes warm; `None` for all of them.
     only: Option<IndexGroup>,
 }
 
 /// A ref's head as a pass found it, and when it moved there if known.
-struct Moved {
-    head: ChangesetId,
-    at: Option<i64>,
+pub(crate) struct Moved {
+    pub(crate) head: ChangesetId,
+    pub(crate) at: Option<i64>,
+}
+
+/// The refs that moved since the last look, from a tail of the ref log or
+/// a full listing.
+pub(crate) struct RefTail {
+    /// Newest ref log entry handled; `None` until a full listing.
+    seq: Option<u64>,
+    last_full: Option<Instant>,
+    pub(crate) full_every: Duration,
+}
+
+impl Default for RefTail {
+    fn default() -> Self {
+        RefTail {
+            seq: None,
+            last_full: None,
+            full_every: FULL_LISTING_EVERY,
+        }
+    }
+}
+
+/// What [`RefTail::moved`] found.
+pub(crate) struct Moves {
+    /// Refs to look at, at their heads now.
+    pub(crate) moved: BTreeMap<String, Moved>,
+    /// A full listing: refs not in `moved` are gone.
+    pub(crate) full: bool,
+    /// Refs the tail saw deleted.
+    pub(crate) deleted: Vec<String>,
 }
 
 impl Warmer {
@@ -88,9 +114,7 @@ impl Warmer {
             leases: None,
             warmed: HashMap::new(),
             active: Vec::new(),
-            seq: None,
-            last_full: None,
-            full_every: FULL_LISTING_EVERY,
+            tail: RefTail::default(),
             only: None,
         }
     }
@@ -104,9 +128,10 @@ impl Warmer {
             leases: self.leases.clone(),
             warmed: HashMap::new(),
             active: Vec::new(),
-            seq: None,
-            last_full: None,
-            full_every: self.full_every,
+            tail: RefTail {
+                full_every: self.tail.full_every,
+                ..RefTail::default()
+            },
             only: Some(g),
         }
     }
@@ -119,7 +144,7 @@ impl Warmer {
 
     /// List every ref this often instead of [`FULL_LISTING_EVERY`] (tests).
     pub fn with_full_listing_every(mut self, every: Duration) -> Self {
-        self.full_every = every;
+        self.tail.full_every = every;
         self
     }
 
@@ -164,7 +189,7 @@ impl Warmer {
         if groups.iter().any(|g| !self.active.contains(g)) {
             // A group taken over (or the first pass): what the previous
             // holder left undone is found only by looking at every ref.
-            self.last_full = None;
+            self.tail.last_full = None;
             for g in &groups {
                 if !self.active.contains(g) {
                     self.warmed.remove(g);
@@ -175,7 +200,16 @@ impl Warmer {
         if groups.is_empty() {
             return Ok(WarmReport::default());
         }
-        let moved = self.moved().await?;
+        let moves = self.tail.moved(self.repo.meta()).await?;
+        for w in self.warmed.values_mut() {
+            if moves.full {
+                w.retain(|name, _| moves.moved.contains_key(name));
+            }
+            for name in &moves.deleted {
+                w.remove(name);
+            }
+        }
+        let moved = moves.moved;
         let mut report = WarmReport {
             refs: moved.len(),
             ..Default::default()
@@ -331,101 +365,6 @@ impl Warmer {
         }
     }
 
-    /// The refs to look at: every ref on a full listing, else those the ref
-    /// log says moved. A ref whose warming failed is retried by the next
-    /// full listing, a few seconds later, rather than on every pass.
-    async fn moved(&mut self) -> Result<BTreeMap<String, Moved>> {
-        let due = self
-            .last_full
-            .is_none_or(|t| t.elapsed() >= self.full_every);
-        let tailed = if due { None } else { self.tail().await? };
-        match tailed {
-            Some(found) => Ok(found),
-            None => self.full().await,
-        }
-    }
-
-    /// Every ref, read after the newest ref log entry, so the tail resumes
-    /// from a point the listing already covers.
-    async fn full(&mut self) -> Result<BTreeMap<String, Moved>> {
-        let newest = self.repo.meta().ref_log(None, None, 1).await?;
-        let refs = self.repo.meta().list_refs().await?;
-        self.seq = Some(newest.first().map_or(0, |e| e.seq));
-        self.last_full = Some(Instant::now());
-        for w in self.warmed.values_mut() {
-            w.retain(|name, _| refs.contains_key(name));
-        }
-        Ok(refs
-            .into_iter()
-            .map(|(name, head)| (name, Moved { head, at: None }))
-            .collect())
-    }
-
-    /// Refs moved since the last entry handled, at their newest heads; a
-    /// deleted ref is forgotten. `None` when the tail cannot tell (too many
-    /// entries, or no full listing yet), and the caller lists every ref.
-    async fn tail(&mut self) -> Result<Option<BTreeMap<String, Moved>>> {
-        let Some(last) = self.seq else {
-            return Ok(None);
-        };
-        let meta = self.repo.meta();
-        let mut entries = Vec::new();
-        let mut before = None;
-        let mut reached = false;
-        for _ in 0..TAIL_PAGES {
-            let page = meta.ref_log(None, before, TAIL_PAGE).await?;
-            let full = page.len() == TAIL_PAGE;
-            for e in page {
-                if e.seq <= last {
-                    reached = true;
-                    break;
-                }
-                before = Some(e.seq);
-                entries.push(e);
-            }
-            if reached || !full {
-                reached = true;
-                break;
-            }
-        }
-        if !reached {
-            return Ok(None);
-        }
-        let mut moved = BTreeMap::new();
-        if let Some(newest) = entries.first() {
-            self.seq = Some(newest.seq);
-        }
-        // Newest first: the first entry of a ref is its head now.
-        for e in entries {
-            if moved.contains_key(&e.name) {
-                continue;
-            }
-            match e.new {
-                Some(head) => {
-                    moved.insert(
-                        e.name,
-                        Some(Moved {
-                            head,
-                            at: Some(e.time),
-                        }),
-                    );
-                }
-                None => {
-                    for w in self.warmed.values_mut() {
-                        w.remove(&e.name);
-                    }
-                    moved.insert(e.name, None);
-                }
-            }
-        }
-        Ok(Some(
-            moved
-                .into_iter()
-                .filter_map(|(name, m)| m.map(|m| (name, m)))
-                .collect(),
-        ))
-    }
-
     /// Run passes forever, `interval` apart, starting now: one loop per
     /// index group (see the module docs), each in the index lane, so the
     /// metadata store serves it from connections queries cannot take (ADR
@@ -454,6 +393,104 @@ impl Warmer {
             }
             while set.join_next().await.is_some() {}
         })
+    }
+}
+
+impl RefTail {
+    /// The refs to look at: every ref on a full listing, else those the ref
+    /// log says moved. A ref whose warming failed is retried by the next
+    /// full listing, a few seconds later, rather than on every pass.
+    pub(crate) async fn moved(&mut self, meta: &Arc<dyn MetaStore>) -> Result<Moves> {
+        let due = self
+            .last_full
+            .is_none_or(|t| t.elapsed() >= self.full_every);
+        let tailed = if due { None } else { self.tail(meta).await? };
+        match tailed {
+            Some(found) => Ok(found),
+            None => self.full(meta).await,
+        }
+    }
+
+    /// Every ref, read after the newest ref log entry, so the tail resumes
+    /// from a point the listing already covers.
+    async fn full(&mut self, meta: &Arc<dyn MetaStore>) -> Result<Moves> {
+        let newest = meta.ref_log(None, None, 1).await?;
+        let refs = meta.list_refs().await?;
+        self.seq = Some(newest.first().map_or(0, |e| e.seq));
+        self.last_full = Some(Instant::now());
+        Ok(Moves {
+            moved: refs
+                .into_iter()
+                .map(|(name, head)| (name, Moved { head, at: None }))
+                .collect(),
+            full: true,
+            deleted: Vec::new(),
+        })
+    }
+
+    /// Refs moved since the last entry handled, at their newest heads; a
+    /// deleted ref is forgotten. `None` when the tail cannot tell (too many
+    /// entries, or no full listing yet), and the caller lists every ref.
+    async fn tail(&mut self, meta: &Arc<dyn MetaStore>) -> Result<Option<Moves>> {
+        let Some(last) = self.seq else {
+            return Ok(None);
+        };
+        let mut entries = Vec::new();
+        let mut before = None;
+        let mut reached = false;
+        for _ in 0..TAIL_PAGES {
+            let page = meta.ref_log(None, before, TAIL_PAGE).await?;
+            let full = page.len() == TAIL_PAGE;
+            for e in page {
+                if e.seq <= last {
+                    reached = true;
+                    break;
+                }
+                before = Some(e.seq);
+                entries.push(e);
+            }
+            if reached || !full {
+                reached = true;
+                break;
+            }
+        }
+        if !reached {
+            return Ok(None);
+        }
+        let mut moved = BTreeMap::new();
+        let mut deleted = Vec::new();
+        if let Some(newest) = entries.first() {
+            self.seq = Some(newest.seq);
+        }
+        // Newest first: the first entry of a ref is its head now.
+        for e in entries {
+            if moved.contains_key(&e.name) {
+                continue;
+            }
+            match e.new {
+                Some(head) => {
+                    moved.insert(
+                        e.name,
+                        Some(Moved {
+                            head,
+                            at: Some(e.time),
+                        }),
+                    );
+                }
+                None => {
+                    deleted.push(e.name.clone());
+                    moved.insert(e.name, None);
+                }
+            }
+        }
+        Ok(Some(Moves {
+            moved: moved
+                .into_iter()
+                .filter_map(|(name, m)| m.map(|m| (name, m)))
+                .collect(),
+            full: false,
+            deleted,
+        }))
     }
 }
 

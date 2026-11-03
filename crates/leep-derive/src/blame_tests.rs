@@ -32,6 +32,8 @@ struct Slow {
     skip_reads: AtomicUsize,
     /// Writes of cached blames.
     blame_puts: AtomicUsize,
+    /// Reads of cached blames, single or batched.
+    blame_reads: AtomicUsize,
     /// The write of a cached blame with this number (0: none) is stored,
     /// says so on `stalled`, and never returns.
     stall_at_blame_put: AtomicUsize,
@@ -46,6 +48,9 @@ impl Slow {
     fn note_kind(&self, kind: &str) {
         if kind == <crate::derived::Skiplist as crate::derived::DerivedKind>::NAME {
             self.skip_reads.fetch_add(1, Ordering::Relaxed);
+        }
+        if kind == crate::blame::KIND {
+            self.blame_reads.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -1769,4 +1774,422 @@ async fn concurrent_blames_share_one_computation_that_outlives_its_callers() {
     until("the flight ends", || server.blame_flights.running() == 0).await;
     assert!(stored(tip, other.clone()).await.is_some());
     assert_eq!(server.blame(tip, &other).await.unwrap().lines.len(), 1);
+}
+
+/// One pass of the index warmers, then one of the blame warmer, as a
+/// server runs them: the blame warmer reads the index only where it is
+/// derived.
+async fn warm_pass(
+    w: &mut crate::warm::Warmer,
+    b: &mut crate::blame_warm::BlameWarmer,
+) -> crate::blame_warm::BlameWarmReport {
+    w.pass().await.unwrap();
+    b.pass().await.unwrap()
+}
+
+fn warmers(r: &Repo) -> (crate::warm::Warmer, crate::blame_warm::BlameWarmer) {
+    (
+        crate::warm::Warmer::new(r.clone(), false),
+        crate::blame_warm::BlameWarmer::new(r.clone()),
+    )
+}
+
+/// Blames the warmer extended (ADR 0083) are byte for byte the blames a
+/// cold request computes, over random histories of one ref with edits,
+/// creations, deletes, renames, binary versions and merged side branches,
+/// warmed a few lands at a time, with occasional request blames seeding
+/// the tracked files as clients would.
+#[tokio::test]
+async fn warm_extended_blames_match_cold_blames() {
+    use crate::blame::{cache_key, KIND};
+    let names = ["a", "b", "dir/c", "dir/sub/d", "e"];
+    let mut total_extended = 0;
+    for seed in 1..=4u64 {
+        let r = Repo::new(
+            Arc::new(MemoryBlobStore::new()),
+            Arc::new(MemoryMetaStore::new()),
+        );
+        let mut rng = Lcg(seed * 17 + 3);
+        let mut tag = 0usize;
+        let read = |r: Repo, c: ChangesetId, p: &'static str| async move {
+            r.read_file(c, &rp(p))
+                .await
+                .unwrap()
+                .map(|(_, d)| d.to_vec())
+        };
+        let edit = |rng: &mut Lcg, tag: &mut usize, cur: Option<Vec<u8>>| -> Vec<u8> {
+            *tag += 1;
+            let t = cur
+                .and_then(|c| String::from_utf8(c).ok())
+                .unwrap_or_default();
+            let mut lines: Vec<String> = t.split_inclusive('\n').map(str::to_string).collect();
+            let i = rng.below(lines.len() + 1);
+            match rng.below(4) {
+                0 if i < lines.len() => lines[i] = format!("x{tag}\n"),
+                1 if i < lines.len() && lines.len() > 1 => {
+                    lines.remove(i);
+                }
+                // A last line without its newline, or with a `\r`.
+                2 if i == lines.len() => lines.push(format!("x{tag}\r\ny{tag}")),
+                _ => lines.insert(i, format!("x{tag}\n")),
+            }
+            lines.concat().into_bytes()
+        };
+        let root = commit(&r, &[], &[("a", Some("a0\n")), ("b", Some("b0\n"))]).await;
+        r.meta().cas_ref("main", None, Some(root)).await.unwrap();
+        let (mut w, mut b) = warmers(&r);
+        warm_pass(&mut w, &mut b).await;
+        let mut head = root;
+        let mut mains = vec![root];
+        let mut all = vec![root];
+        let mut side: Option<ChangesetId> = None;
+        let (mut merges, mut renames) = (0, 0);
+        for step in 0..150 {
+            let n = names[rng.below(names.len())];
+            let next = match rng.below(14) {
+                0..=5 | 12 => {
+                    // A land touching one to three files.
+                    let mut files: Vec<(&str, Vec<u8>)> = Vec::new();
+                    for k in 0..1 + rng.below(3) {
+                        let n = if k == 0 {
+                            n
+                        } else {
+                            names[rng.below(names.len())]
+                        };
+                        if files.iter().any(|(f, _)| *f == n) {
+                            continue;
+                        }
+                        let cur = read(r.clone(), head, n).await;
+                        files.push((n, edit(&mut rng, &mut tag, cur)));
+                    }
+                    let files: Vec<(&str, Option<&[u8]>)> =
+                        files.iter().map(|(f, t)| (*f, Some(&t[..]))).collect();
+                    commit_bytes(&r, &[head], &files).await
+                }
+                6 if read(r.clone(), head, n).await.is_some() => {
+                    commit(&r, &[head], &[(n, None)]).await
+                }
+                7 => {
+                    // A binary version, which blame refuses.
+                    commit_bytes(&r, &[head], &[(n, Some(&[0xff, 0xfe, b'\n'][..]))]).await
+                }
+                8 | 9 => {
+                    let Some(cur) = read(r.clone(), head, n).await else {
+                        continue;
+                    };
+                    // To a free name, or out of the tracked set.
+                    let mut to = format!("old/{tag}");
+                    tag += 1;
+                    for o in names {
+                        if read(r.clone(), head, o).await.is_none() && rng.below(2) == 0 {
+                            to = o.to_string();
+                        }
+                    }
+                    renames += 1;
+                    commit_bytes(&r, &[head], &[(n, None), (&to, Some(&cur[..]))]).await
+                }
+                10 | 11 => {
+                    // Work on a side branch, merged later.
+                    let base = side.unwrap_or(head);
+                    let cur = read(r.clone(), base, n).await;
+                    let t = edit(&mut rng, &mut tag, cur);
+                    let s = commit_bytes(&r, &[base], &[(n, Some(&t[..]))]).await;
+                    all.push(s);
+                    side = Some(s);
+                    continue;
+                }
+                _ => {
+                    let Some(s) = side.take() else {
+                        continue;
+                    };
+                    // Theirs, ours, or both for one file they disagree on.
+                    let mut files: Vec<(&str, Option<Vec<u8>>)> = Vec::new();
+                    for o in names {
+                        let (ours, theirs) =
+                            (read(r.clone(), head, o).await, read(r.clone(), s, o).await);
+                        if ours == theirs || !files.is_empty() {
+                            continue;
+                        }
+                        let t = match (rng.below(3), &ours, &theirs) {
+                            (0, _, _) => theirs.clone(),
+                            (1, Some(a), Some(b)) => Some([&a[..], &b[..]].concat()),
+                            _ => continue,
+                        };
+                        files.push((o, t));
+                    }
+                    merges += 1;
+                    let files: Vec<(&str, Option<&[u8]>)> =
+                        files.iter().map(|(f, t)| (*f, t.as_deref())).collect();
+                    commit_bytes(&r, &[head, s], &files).await
+                }
+            };
+            r.meta()
+                .cas_ref("main", Some(head), Some(next))
+                .await
+                .unwrap();
+            head = next;
+            mains.push(next);
+            all.push(next);
+            if rng.below(3) == 0 {
+                let _ = r.blame(head, &rp(names[rng.below(names.len())])).await;
+            }
+            if step % 3 == 0 {
+                warm_pass(&mut w, &mut b).await;
+            }
+        }
+        warm_pass(&mut w, &mut b).await;
+        assert!(
+            merges >= 3 && renames >= 2,
+            "seed {seed}: {merges} merges, {renames} renames"
+        );
+
+        // Lands whose files' blames are cached there: blamed before, since
+        // the last merge, rename or binary version of the file.
+        let mut warm = 0;
+        for &c in &mains {
+            let cs = r.get_changeset(c).await.unwrap();
+            for (p, ch) in &cs.changes {
+                if matches!(ch, FileChange::Modify { .. }) {
+                    let row = r.meta().get_derived(KIND, &cache_key(c, p)).await.unwrap();
+                    warm += usize::from(row.is_some());
+                }
+            }
+        }
+        assert!(warm >= 10, "seed {seed}: {warm} warm");
+
+        // Every blame cached, by the warmer or a request, is the cold one,
+        // and so is every request answered from them.
+        let mut extended = 0;
+        for &c in &all {
+            for f in r.list_files(c, "").await.unwrap() {
+                let cold = r.blame_walk_in(c, &f.path, None, false).await;
+                let row = r
+                    .meta()
+                    .get_derived(KIND, &cache_key(c, &f.path))
+                    .await
+                    .unwrap();
+                let answer = r.blame_walk(c, &f.path, true, true).await;
+                match (cold, answer) {
+                    (Ok((cold, _)), Ok((answer, _))) => {
+                        let bytes = postcard::to_stdvec(&cold).unwrap();
+                        if let Some(row) = row {
+                            assert_eq!(
+                                &row[..],
+                                &bytes[..],
+                                "seed {seed}: row of {} at {c}",
+                                f.path
+                            );
+                            extended += 1;
+                        }
+                        assert_eq!(answer, cold, "seed {seed}: {} at {c}", f.path);
+                    }
+                    (Err(Error::Invalid(_)), Err(Error::Invalid(_))) => {
+                        assert!(row.is_none());
+                    }
+                    (a, b) => panic!("seed {seed}: {} at {c}: {a:?} vs {b:?}", f.path),
+                }
+            }
+        }
+        assert!(extended >= warm, "seed {seed}: {extended} rows compared");
+        total_extended += extended;
+    }
+    assert!(total_extended >= 100, "{total_extended} rows compared");
+}
+
+/// A tracked hot file's blame is extended at every land, so a request at
+/// the head is a few reads; files nobody blamed cost the warmer no blame
+/// reads. A merge that changes the file breaks its chain: the warmer stops
+/// on that ref without reading, until a request blames it again.
+#[tokio::test]
+async fn the_warmer_extends_a_tracked_file_land_by_land() {
+    use crate::blame::{cache_key, KIND};
+    let (r, meta) = slow_repo();
+    let path = rp("hot");
+    let mut text = String::from("0\n");
+    let root = commit(&r, &[], &[("hot", Some(&text)), ("cold", Some("c\n"))]).await;
+    r.meta().cas_ref("main", None, Some(root)).await.unwrap();
+    let (mut w, mut b) = warmers(&r);
+    warm_pass(&mut w, &mut b).await;
+    let cached = |c: ChangesetId| {
+        let r = r.clone();
+        let path = path.clone();
+        async move {
+            r.meta()
+                .get_derived(KIND, &cache_key(c, &path))
+                .await
+                .unwrap()
+                .is_some()
+        }
+    };
+    let land = |head: ChangesetId, files: Vec<(String, String)>| {
+        let r = r.clone();
+        async move {
+            let files: Vec<(&str, Option<&str>)> = files
+                .iter()
+                .map(|(p, t)| (p.as_str(), Some(t.as_str())))
+                .collect();
+            let next = commit(&r, &[head], &files).await;
+            r.meta()
+                .cas_ref("main", Some(head), Some(next))
+                .await
+                .unwrap();
+            next
+        }
+    };
+    // Nobody blamed it yet: lands cost no blame reads.
+    let mut head = root;
+    for k in 1..=8 {
+        text.push_str(&format!("{k}\n"));
+        head = land(head, vec![("hot".into(), text.clone())]).await;
+    }
+    let before = meta.blame_reads.load(Ordering::Relaxed);
+    let report = warm_pass(&mut w, &mut b).await;
+    assert_eq!(report.written + report.missed, 0);
+    assert_eq!(meta.blame_reads.load(Ordering::Relaxed), before);
+    assert!(!cached(head).await);
+
+    r.blame(head, &path).await.unwrap();
+    let mut changers = Vec::new();
+    for k in 9..=48 {
+        text.push_str(&format!("{k}\n"));
+        head = land(head, vec![("hot".into(), text.clone())]).await;
+        changers.push(head);
+        if k % 4 == 0 {
+            // Several lands in one pass, still in order.
+            warm_pass(&mut w, &mut b).await;
+        }
+    }
+    for &c in &changers {
+        assert!(cached(c).await);
+    }
+    // Lands of another file, then a request at the head: the newest
+    // changer's row in a few reads, with nothing examined.
+    for k in 0..3 {
+        head = land(head, vec![("cold".into(), format!("{k}\n"))]).await;
+    }
+    warm_pass(&mut w, &mut b).await;
+    let before = meta.reads.load(Ordering::Relaxed);
+    let (got, examined) = r.blame_walk(head, &path, true, true).await.unwrap();
+    let reads = meta.reads.load(Ordering::Relaxed) - before;
+    assert_eq!(examined, 1);
+    assert!(reads <= 12, "{reads} reads for a warm blame");
+    assert_eq!(
+        got,
+        r.blame_walk_in(head, &path, None, false).await.unwrap().0
+    );
+
+    // A merge that changes the file: not extended, and neither is the
+    // next change, whose blame would follow the merged branch.
+    let s = commit(&r, &[head], &[("hot", Some(&format!("side\n{text}")))]).await;
+    text = format!("side\n{text}merged\n");
+    let m = commit(&r, &[head, s], &[("hot", Some(&text))]).await;
+    r.meta().cas_ref("main", Some(head), Some(m)).await.unwrap();
+    head = m;
+    text.push_str("after\n");
+    head = land(head, vec![("hot".into(), text.clone())]).await;
+    let report = warm_pass(&mut w, &mut b).await;
+    assert_eq!(report.written, 0);
+    assert!(!cached(m).await && !cached(head).await);
+    // Cold on this ref now: the next land costs no blame read.
+    text.push_str("again\n");
+    head = land(head, vec![("hot".into(), text.clone())]).await;
+    w.pass().await.unwrap();
+    let before = meta.blame_reads.load(Ordering::Relaxed);
+    let report = b.pass().await.unwrap();
+    assert_eq!((report.written, report.missed), (0, 0));
+    assert_eq!(meta.blame_reads.load(Ordering::Relaxed), before);
+    // A request caches through the merge and tracks the file again; the
+    // warmer extends from there.
+    r.blame(head, &path).await.unwrap();
+    text.push_str("later\n");
+    head = land(head, vec![("hot".into(), text.clone())]).await;
+    let report = warm_pass(&mut w, &mut b).await;
+    assert_eq!(report.written, 1);
+    assert!(cached(head).await);
+    let (row, _) = r.blame_walk_in(head, &path, None, false).await.unwrap();
+    let stored = r
+        .meta()
+        .get_derived(KIND, &cache_key(head, &path))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&stored[..], &postcard::to_stdvec(&row).unwrap()[..]);
+}
+
+/// The warmer takes the gate's permit before working and does nothing
+/// while the gate refuses: the lands wait for a pass it admits, which
+/// catches up in order.
+#[tokio::test]
+async fn the_blame_warmer_waits_for_its_gate() {
+    use std::sync::atomic::AtomicBool;
+    let r = Repo::new(
+        Arc::new(MemoryBlobStore::new()),
+        Arc::new(MemoryMetaStore::new()),
+    );
+    let path = rp("f");
+    let mut text = String::from("0\n");
+    let mut head = commit(&r, &[], &[("f", Some(&text))]).await;
+    r.meta().cas_ref("main", None, Some(head)).await.unwrap();
+    let open = Arc::new(AtomicBool::new(false));
+    let taken = Arc::new(AtomicUsize::new(0));
+    let gate: crate::blame_warm::WarmGate = {
+        let (open, taken) = (open.clone(), taken.clone());
+        Arc::new(move || {
+            open.load(Ordering::Relaxed).then(|| {
+                taken.fetch_add(1, Ordering::Relaxed);
+                Box::new(()) as crate::BlameHold
+            })
+        })
+    };
+    let mut w = crate::warm::Warmer::new(r.clone(), false);
+    let mut b = crate::blame_warm::BlameWarmer::new(r.clone()).with_gate(gate);
+    warm_pass(&mut w, &mut b).await;
+    r.blame(head, &path).await.unwrap();
+    for k in 1..=5 {
+        text.push_str(&format!("{k}\n"));
+        let next = commit(&r, &[head], &[("f", Some(&text))]).await;
+        r.meta()
+            .cas_ref("main", Some(head), Some(next))
+            .await
+            .unwrap();
+        head = next;
+    }
+    let report = warm_pass(&mut w, &mut b).await;
+    assert!(report.shed);
+    assert_eq!(report.written, 0);
+    open.store(true, Ordering::Relaxed);
+    let report = warm_pass(&mut w, &mut b).await;
+    assert_eq!((report.shed, report.written), (false, 5));
+    assert_eq!(taken.load(Ordering::Relaxed), 1);
+    // Nothing new: no permit taken.
+    warm_pass(&mut w, &mut b).await;
+    assert_eq!(taken.load(Ordering::Relaxed), 1);
+}
+
+/// The tracked set is bounded, forgets the least recently blamed first,
+/// and forgets files nobody blamed for a while; a blame warms a file again
+/// on every ref.
+#[test]
+fn the_tracked_files_are_bounded_and_expire() {
+    use crate::blame_warm::BlameTracker;
+    let t = BlameTracker::new(2, Duration::from_secs(3600));
+    t.track(&rp("a"));
+    t.track(&rp("b"));
+    t.track(&rp("c"));
+    assert_eq!(t.len(), 2);
+    assert!(!t.wants_for_tests(&rp("a"), "main"));
+    assert!(t.wants_for_tests(&rp("c"), "main"));
+    t.cool_for_tests(&rp("c"), "main");
+    assert!(!t.wants_for_tests(&rp("c"), "main"));
+    assert!(t.wants_for_tests(&rp("c"), "review/x"));
+    t.track(&rp("c"));
+    assert!(t.wants_for_tests(&rp("c"), "main"));
+    let off = BlameTracker::new(0, Duration::from_secs(3600));
+    off.track(&rp("a"));
+    assert_eq!(off.len(), 0);
+    let brief = BlameTracker::new(4, Duration::ZERO);
+    brief.track(&rp("a"));
+    assert!(!brief.wants_for_tests(&rp("a"), "main"));
+    assert!(!brief.any_for_tests());
+    assert_eq!(brief.len(), 0);
 }

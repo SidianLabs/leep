@@ -159,7 +159,10 @@ measured until the response head is ready, not until the body is streamed.
 | `leep_derive_total` | counter | `kind` | Derived values computed (cache hits in the meta store are not counted). |
 | `leep_derive_duration_seconds` | histogram | `kind` | Time to compute one derived value. |
 | `leep_warm_refs_total` | counter | `result` = `ok`, `error` | Ref heads the background warmer derived indexes for (ADR 0028). Each index group warms in a loop of its own, so a head counts once per group (three times with `--warm-search`). Each loop tails the ref log every pass and lists every ref every 5 s on its own, so the warmer makes up to three times those cheap reads. Errors are retried by the next full listing of refs, every 5 s. |
-| `leep_warm_duration_seconds` | histogram | `group` = `history`, `log-filter`, `search` | Time for one index group's loop to warm the heads that moved since its last pass, together (ADR 0058). Seconds to hours after an import or a restart onto a large history; milliseconds once warm. |
+| `leep_warm_duration_seconds` | histogram | `group` = `history`, `log-filter`, `search`, `blame` | Time for one index group's loop to warm the heads that moved since its last pass, together (ADR 0058). Seconds to hours after an import or a restart onto a large history; milliseconds once warm. `blame` is the blame warmer's passes that looked at a changeset (ADR 0083), at most about 200 ms each. |
+| `leep_warm_blame_total` | counter | `result` = `written`, `missed`, `skipped` | Tracked files a landed changeset wrote, by what the blame warmer did (ADR 0083): `written` extended the file's cached blame by one diff; `missed` found no cached blame at the parent's newest changer (a merge, rename, gap or restart broke the chain), so the file is cold on that ref until blamed again; `skipped` was a creation, rename, merge, a version over 1 MiB or not UTF-8. A high `missed` share means blames are spread over files changed between blames. |
+| `leep_warm_blame_shed_total` | counter | | Blame warmer passes skipped because every `blame` read permit was taken (ADR 0083, ADR 0074). The lands wait for a later pass. Steadily rising with `leep_read_class_shed_total{class="blame"}`: the class is too small for the blame load. |
+| `leep_blame_tracked_paths` | gauge | | Files whose blames the blame warmer keeps current: those blamed in the last 30 minutes, at most `--warm-blame-paths`. |
 | `leep_warm_delay_seconds` | histogram | `group` = `history`, `log-filter`, `search` | Time from a ref move until the warmer stored that head's indexes of one group, at **1-second resolution**: the ref log records whole seconds, so every sample is an integer and 0 means the same second. Recorded only for moves the ref-log tail found, not for refs a full listing turned up. How far the indexes trail the refs; 0 or 1 when the warmer keeps up, so read it as a count of slow warms rather than a latency below a second. |
 | `leep_index_lease_held` | gauge | `kind` | 1 while this server holds the index lease of the group named by its primary kind (`history-tree-v4`, `log-filter-v1`, `tree-trigrams-v1`), `--indexing lease` only (ADR 0058). |
 | `leep_index_lease_acquired_total` | counter | `kind` | Index leases this server took (a new epoch). |
@@ -1642,6 +1645,21 @@ leep-server repair rederive --kind history-tree-v4 log-filter-v1 --missing --job
 
 `rederive` prints the rows derived so far every five seconds. On a server,
 the rate of `leep_derive_total{kind}` is the warmer's derivation speed.
+
+**Keeping blames current (ADR 0083).** Every server also runs a blame
+warmer (unless `--warm-blame-paths 0`, `LEEP_WARM_BLAME_PATHS`, or
+`--warm-interval 0`), in every `--indexing` mode. It tracks the files this
+server answered blames for (at most `--warm-blame-paths`, default 1,024,
+each for 30 minutes after its last blame) and, every `--warm-interval`,
+extends each tracked file's cached blame to every landed changeset that
+wrote it, with one line diff, so the next blame of a hot file at a new
+head is a few reads instead of a walk and a diff per change since the last
+one. It reads the path-history index only where it is already derived,
+never derives, works at most 200 ms a pass, and takes a `blame` read
+permit for each pass with work (none free: it waits,
+`leep_warm_blame_shed_total`). It writes one `blame-v2` row per land per
+tracked file the land wrote, about the size of the file. Set
+`--warm-blame-paths 0` to turn it off; blames then behave as before.
 
 **The warmer with several servers.** In `--indexing local` (the default)
 every server runs a warmer: it reads the ref log every `--warm-interval`

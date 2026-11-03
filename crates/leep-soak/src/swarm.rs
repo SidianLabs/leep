@@ -69,6 +69,11 @@ struct Args {
     /// Share of written files that are hot files (0 to 1).
     #[arg(long, default_value_t = 0.02)]
     hot_fraction: f64,
+    /// Share of blames that ask for a hot file instead of a seeded one (0
+    /// to 1): hot files change at nearly every land, which is where blame
+    /// costs most (ADR 0083).
+    #[arg(long, default_value_t = 0.0)]
+    blame_hot: f64,
     /// Largest stale-base distance: a change is made on a head up to this
     /// many observed heads behind the newest (uniform), so it is replayed.
     #[arg(long, default_value_t = 4)]
@@ -509,6 +514,9 @@ async fn agent(s: Arc<Shared>, who: usize, start_after: Duration) -> Tally {
                 Read::Log if rng.below(2) == 0 => format!("/v1/log/{head}?limit=20&path={hot}"),
                 Read::Log => format!("/v1/log/{head}?limit=20"),
                 Read::Files => format!("/v1/files/{head}?prefix=d{}", rng.below(10)),
+                Read::Blame if (rng.below(1_000_000) as f64) < s.args.blame_hot * 1e6 => {
+                    format!("/v1/blame/{head}?path={hot}")
+                }
                 Read::Blame => {
                     let f = &s.seeded_files[rng.below(s.seeded_files.len())];
                     format!("/v1/blame/{head}?path={f}")

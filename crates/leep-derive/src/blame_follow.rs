@@ -35,8 +35,8 @@ use leep_core::{ChangesetId, Error, FileChange, Hash, RepoPath, Result};
 use similar::DiffTag;
 
 use crate::blame::{
-    cache_key, diff_pairs, split_lines, strip_eol, CachedBlame, Cuts, End, Found, CONTENT_BATCH,
-    CONTENT_BYTES, KIND,
+    apply_base, cache_key, diff_pairs, split_lines, strip_eol, CachedBlame, Cuts, End, Found,
+    CONTENT_BATCH, CONTENT_BYTES, KIND,
 };
 use crate::derived::{decode_u64, DerivedKind, HistoryTree, LastMerge};
 use crate::indexing::bounded::{newest_indexed, Bounded};
@@ -840,31 +840,19 @@ impl Repo {
                 } else {
                     fresh = true;
                     let own = texts[j].as_ref().expect("a good version has its text");
-                    let mut lines: Vec<(ChangesetId, u32)> = Vec::new();
-                    let mut mine: Vec<usize> = Vec::new();
-                    match (base_pair[j], node.base) {
+                    let (mut lines, mut mine) = match (base_pair[j], node.base) {
                         (Some(p), Some(d)) => {
                             let from = held[&d].state.as_ref().expect("a good base");
-                            for (tag, old, new) in &ops[p] {
-                                match tag {
-                                    DiffTag::Equal => lines.extend_from_slice(&from[old.clone()]),
-                                    DiffTag::Delete => {}
-                                    DiffTag::Insert | DiffTag::Replace => {
-                                        for l in new.clone() {
-                                            mine.push(l);
-                                            lines.push((node.cs, l as u32 + 1));
-                                        }
-                                    }
-                                }
-                            }
+                            apply_base(&ops[p], from, node.cs)
                         }
                         _ => {
-                            for l in 0..split_lines(own).count() {
-                                mine.push(l);
-                                lines.push((node.cs, l as u32 + 1));
-                            }
+                            let n = split_lines(own).count();
+                            (
+                                (0..n).map(|l| (node.cs, l as u32 + 1)).collect(),
+                                (0..n).collect(),
+                            )
                         }
-                    }
+                    };
                     for &(d, p) in &side_pairs[j] {
                         if mine.is_empty() {
                             break;
@@ -948,7 +936,11 @@ impl Repo {
 
 /// The blame of `path` whose version is `text`, its lines credited as
 /// `lines`.
-fn credited(path: &RepoPath, text: &str, lines: &[(ChangesetId, u32)]) -> Result<CachedBlame> {
+pub(crate) fn credited(
+    path: &RepoPath,
+    text: &str,
+    lines: &[(ChangesetId, u32)],
+) -> Result<CachedBlame> {
     let texts: Vec<&str> = split_lines(text).collect();
     if texts.len() != lines.len() {
         return Err(Error::Other(format!(

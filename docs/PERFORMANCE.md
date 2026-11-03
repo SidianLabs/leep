@@ -1032,7 +1032,8 @@ swarm it did not help:
   changes.
 - **Decision.** It was not merged. It is worth trying again only with a
   demand-driven seeding rule (files blamed or read recently) and a CPU
-  priority between warm groups, history first.
+  priority between warm groups, history first. ADR 0083 did that: see
+  "Blames kept current as changes land" below.
 
 ### Long blames past the request timeout (ADR 0078)
 
@@ -1069,6 +1070,96 @@ the history index already derived. Two runs:
   and the walk above the checkpoint are paid again.
 - **Rows.** One row per 256 versions, each the size of one blame: about
   64 KB here at 1,000 to 2,500 lines.
+
+### Blames kept current as changes land (ADR 0083)
+
+**Where a cold blame of a hot file goes.** `leep-history-gen --until
+200000 --hot-files 2` (otherwise the defaults of "One million changesets
+of history": 20,000 `src` files, one to three edits a changeset, 5% of
+edits to a hot file) on local Postgres 16 (TCP, `shared_buffers=1GB`, the
+whole 0.5 GB database in its buffers), filesystem blobs repacked after
+each 100,000, the history index derived (280 s). `hot/h0` has about 8,200
+versions over 200,000 generations, 399 lines. Cold blame through
+`cold_queries query ... blame hot/h0` (a new process, the page cache
+dropped, cached blames deleted), with timers around the walk and the
+replay (not committed); `perf` does not run on this host's kernel.
+
+| | `hot/h0` | `hot/h1` |
+|---|---|---|
+| Cold blame | 4.6-5.3 s | 4.0 s |
+| Walk (`blame_graph`) | 3.2-3.9 s | 3.2 s |
+| Replay (`replay_graph`) | 0.74-0.76 s | 0.71 s |
+| of it: line diffs (8 threads) | 0.31 s | 0.33 s |
+| of it: waiting on blob reads beyond the diffs | 0.34 s | 0.27 s |
+| of it: applying diffs, checkpoint writes | 0.08 s | 0.09 s |
+| Process CPU (user + sys) | 3.5 + 3.3 s | |
+
+- **The walk is three quarters of it**, about 0.45 ms a version: per
+  change an index entry, a skiplist, a `last_merge-v1` row and a
+  generation (batched over 64 stretches: 2,315, 2,230, 1,879 and 1,225
+  calls), the root tree row and two tree nodes of the parent for the
+  file lookup (16,300 blob reads), and the cached-blame probes (160
+  calls). Each step needs the one before, so it is round trips in a row
+  even when batched.
+- **The replay is 0.09 ms a version.** The blob reads include every
+  version's delta chain, decoded through the pack reader's shared cache,
+  and add 0.3 s beyond the diffs that run beside them. Sharing decoded
+  delta bases within a replay window would save at most that, under 10%
+  of the blame here, so it was not done.
+- **Not the 61 s of the 1M box.** Here Postgres holds the database in its
+  buffers and the disk is local; there the database was 4.2 GB against
+  1 GB of buffers, after a page-cache drop, and the walk's thousands of
+  dependent reads went to disk. What scales is the walk, per version.
+
+**What changed.** A blame no longer has to be cold to be slow: on hot
+history every land changes the hot files, and before this change the next
+blame of one walked and diffed every change since the last cached one.
+Now the server tracks the files it answered blames for, and a loop beside
+the index warmers extends each one's cached blame to every land that
+writes it, with one diff and no walk; a request at a new head finds the
+newest changer's row on its first step.
+
+Same store and server (`--indexing local`), `leep-history-gen
+--ref-every 1` landing on `main` (one ref log entry and ref move per
+changeset, about 70-110 a second), `hot/h0` blamed at the head over HTTP
+first, then again after N changesets (about 4% of which change it):
+
+| | After 2,000 changesets | After 8,000 |
+|---|---|---|
+| `--warm-blame-paths 0` | 370 ms | 437 ms |
+| default (1,024) | 15.6 ms | 19.5 ms |
+| rows the warmer wrote | 88 | 295 |
+| warmer passes, time in them | 78, 1.74 s | 304, 5.6 s |
+
+The first blame of `hot/h0` on the new server took 3.4 s, as before. The
+warmer's passes cost about 0.7-0.9 ms a landed changeset here, mostly
+reading each landed changeset; extending a row is one diff of two
+versions.
+
+**The swarm.** `leep-swarm` on this branch, 300 agents, 90 s after a 20 s
+ramp, `--think-ms 1000 --read-mix log=3,files=3,blame=3,search=1,diff=2
+--blame-hot 0.5 --hot-fraction 0.1` (half the blames ask for one of the 8
+hot files, which one land in five writes), server on CPUs 0-1 and the swarm
+on 2-3 of one shared 4-vCPU host (load 2.3-3.1), a fresh database and blob
+directory per run, two runs each, alternating:
+
+| | lands/s | land p50 / p99 | blame p50 / p99 | blame shed | history lag p50 / max | warmer |
+|---|---|---|---|---|---|---|
+| off, run 1 | 45.0 | 25.8 / 160 ms | 7.5 / 234 ms | 927 | 6 / 18 | |
+| on, run 1 | 47.3 | 20.1 / 64 ms | 5.1 / 38 ms | 336 | 5 / 13 | 876 rows, 390 passes in 7.2 s, 22 passes shed |
+| off, run 2 | 45.4 | 27.5 / 131 ms | 9.1 / 169 ms | 864 | 7 / 15 | |
+| on, run 2 | 47.3 | 20.8 / 88 ms | 5.2 / 46 ms | 318 | 4 / 18 | 837 rows, 390 passes in 7.2 s, 20 passes shed |
+
+- **No cost to lands or the index.** Lands per second and the history
+  index's lag are the same or better with the warmer on; it runs on the
+  shared connections and reads the index only where derived.
+- **Blames get cheap.** Blame p99 falls four- to sixfold and a third as
+  many blames are shed: a blame of a hot file holds its permit for a few
+  reads instead of a walk. 208 files were tracked; one chain broke.
+- **What it doesn't show.** One host shared by the server, Postgres and
+  the swarm; one land rate; a swarm history of a few thousand changesets.
+  A hot-file blame on a deep history (the 1M box) should gain more, as
+  each request there walked more.
 
 
 

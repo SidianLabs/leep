@@ -13,6 +13,7 @@ mod batched_reads;
 mod blame;
 mod blame_flight;
 mod blame_follow;
+pub mod blame_warm;
 pub mod changeset_gc;
 pub mod changeset_reach;
 pub mod changeset_sweep;

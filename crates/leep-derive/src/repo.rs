@@ -185,6 +185,9 @@ pub struct Repo {
     /// Versions a blame replays between checkpoints (ADR 0078); tests make
     /// it small.
     pub(crate) blame_checkpoint_every: usize,
+    /// Files blamed lately, whose blames the blame warmer keeps current
+    /// (ADR 0083); shared by clones.
+    pub(crate) blame_tracker: Arc<crate::blame_warm::BlameTracker>,
 }
 
 /// Whether a derivation may go on writing rows: the index lease it derives
@@ -674,7 +677,18 @@ impl Repo {
             search_flights: Arc::default(),
             blame_flights: Arc::default(),
             blame_checkpoint_every: crate::blame::CHECKPOINT_EVERY,
+            blame_tracker: Arc::default(),
         }
+    }
+
+    /// Track at most `paths` blamed files for the blame warmer
+    /// ([`crate::blame_warm::BlameWarmer`], ADR 0083); 0 tracks none.
+    pub fn with_blame_tracking(mut self, paths: usize) -> Self {
+        self.blame_tracker = Arc::new(crate::blame_warm::BlameTracker::new(
+            paths,
+            crate::blame_warm::TRACK_FOR,
+        ));
+        self
     }
 
     /// Bound queries by `policy` (ADR 0058, modes `lease` and `off`).
