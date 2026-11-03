@@ -7,7 +7,7 @@ use leep_core::api::{
 use leep_core::changeset::{EXTRA_AGENT_MODEL, EXTRA_AGENT_SESSION};
 use leep_core::{out, outln};
 
-use super::{print_json, Remote};
+use super::{print_json, Head, Remote};
 use crate::client::LogQuery;
 use crate::error::{CliError, Result};
 use crate::fmt::{rename_line, short, utc_time};
@@ -218,12 +218,12 @@ fn follow_lines(info: &ChangesetInfo) -> Vec<String> {
 }
 
 pub fn log(r: &Remote, args: &LogArgs) -> Result<i32> {
-    let id = r.resolve_default(args.rev.as_deref())?;
+    let head = r.head(args.rev.as_deref())?;
     let client = r.client.clone().with_stale_ok(args.stale_ok);
     let (q, want) = (args.query()?, args.limit as usize);
     let mut out = String::new();
     if args.oneline {
-        let resp = client.log_summary_all(&id, &q, want)?;
+        let resp = r.ask(&head, |h| client.log_summary_all_at(h, &q, want))?.0;
         note_stale(resp.answered_at, resp.behind);
         if r.json {
             print_json(&resp)?;
@@ -243,7 +243,7 @@ pub fn log(r: &Remote, args: &LogArgs) -> Result<i32> {
         term::page(&out, false)?;
         return Ok(0);
     }
-    let resp = client.log_all(&id, &q, want)?;
+    let resp = r.ask(&head, |h| client.log_all_at(h, &q, want))?.0;
     note_stale(resp.answered_at, resp.behind);
     if r.json {
         print_json(&resp)?;
@@ -287,8 +287,14 @@ pub fn last_change(r: &Remote, args: &LastChangeArgs) -> Result<i32> {
 }
 
 pub fn show(r: &Remote, args: &ShowArgs) -> Result<i32> {
-    let id = r.resolve(&args.rev)?;
-    let info = r.client.get_changeset(&id)?;
+    let info = match r.head(Some(&args.rev))? {
+        Head::Id(id) => r.cache.changeset(r.client, &id)?,
+        head => {
+            let info = r.ask(&head, |h| r.client.get_changeset_at(h))?;
+            r.cache.put_changeset(&info);
+            info
+        }
+    };
     if r.json {
         print_json(&info)?;
         return Ok(0);

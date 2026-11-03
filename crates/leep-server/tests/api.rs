@@ -315,8 +315,14 @@ async fn changesets() {
         c.get(&format!("/v1/changesets/{missing}")).await.status,
         StatusCode::NOT_FOUND
     );
+    // Not an id: a revision (ADR 0082), here one that names nothing, or a
+    // malformed one.
     assert_eq!(
         c.get("/v1/changesets/xyz").await.status,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        c.get("/v1/changesets/xyz~q").await.status,
         StatusCode::BAD_REQUEST
     );
 }
@@ -600,6 +606,79 @@ async fn long_logs_are_the_same_json() {
         assert_eq!(ids, want, "limit {limit}");
         assert_eq!(serde_json::to_vec(&l).unwrap(), r.body, "limit {limit}");
     }
+}
+
+/// `/v1/log/{rev}` and `/v1/changesets/{rev}` resolve a revision in the
+/// same request (ADR 0082): same body as by id, the id in `Leep-Resolved`,
+/// later pages by that id; ids answer as before, and every answer says
+/// where its time went.
+#[tokio::test]
+async fn log_and_changeset_take_a_revision() {
+    let c = Client::new();
+    let a = c.commit(&[], &[("f", Some("1\n"))], "a").await;
+    let b = c.commit(&[a], &[("f", Some("2\n"))], "b").await;
+    let d = c.commit(&[b], &[("f", Some("3\n"))], "d").await;
+    c.set_ref("team/x", d).await;
+    c.set_ref("tags/v1", b).await;
+    let by_id = c.get(&format!("/v1/log/{d}?limit=2")).await;
+    assert_eq!(by_id.status, StatusCode::OK);
+    assert!(by_id.headers.get(RESOLVED_HEADER).is_none());
+    let timing = by_id.headers["server-timing"].to_str().unwrap();
+    assert!(
+        timing.contains("walk;dur=") && timing.contains("db;dur="),
+        "{timing}"
+    );
+    let by_name = c.get("/v1/log/team%2Fx?limit=2").await;
+    assert_eq!(by_name.status, StatusCode::OK);
+    assert_eq!(by_name.body, by_id.body);
+    assert_eq!(by_name.headers[RESOLVED_HEADER], d.to_string().as_str());
+    assert!(by_name.headers["server-timing"]
+        .to_str()
+        .unwrap()
+        .starts_with("resolve;dur="));
+    let l: LogResponse = by_name.json();
+    let next = l.next.expect("a second page");
+    let rest: LogResponse = c
+        .get(&format!("/v1/log/{d}?limit=2&after={next}"))
+        .await
+        .json();
+    assert_eq!(rest.entries.iter().map(|e| e.id).collect::<Vec<_>>(), [a]);
+    for (rev, want) in [("team%2Fx~1", b), ("v1", b), ("tags%2Fv1%5E", a)] {
+        let r = c
+            .get(&format!("/v1/log/{rev}?limit=1&fields=summary"))
+            .await;
+        assert_eq!(r.status, StatusCode::OK, "{rev}");
+        assert_eq!(
+            r.headers[RESOLVED_HEADER],
+            want.to_string().as_str(),
+            "{rev}"
+        );
+        let info: ChangesetInfo = c.get(&format!("/v1/changesets/{rev}")).await.json();
+        assert_eq!(info.id, want, "{rev}");
+    }
+    let by_id = c.get(&format!("/v1/changesets/{d}")).await;
+    let by_name = c.get("/v1/changesets/team%2Fx").await;
+    assert_eq!(by_name.body, by_id.body);
+    assert_eq!(by_name.headers[RESOLVED_HEADER], d.to_string().as_str());
+    assert!(by_id.headers["server-timing"]
+        .to_str()
+        .unwrap()
+        .contains("fetch;dur="));
+    for missing in ["nope", "team%2Fy", "abcd"] {
+        assert_eq!(
+            c.get(&format!("/v1/log/{missing}")).await.status,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            c.get(&format!("/v1/changesets/{missing}")).await.status,
+            StatusCode::NOT_FOUND
+        );
+    }
+    let r = c.get("/v1/resolve/team/x").await;
+    assert!(r.headers["server-timing"]
+        .to_str()
+        .unwrap()
+        .contains("db;dur="));
 }
 
 /// A lone CR is part of its line; blame answered 500 for such files.

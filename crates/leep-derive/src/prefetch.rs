@@ -29,6 +29,7 @@ use std::collections::{BinaryHeap, HashMap};
 use leep_core::{Changeset, ChangesetId, Hash, Result};
 
 use crate::derived::{decode_hash, decode_u64, DerivedKind, Generation, RootTree, Skiplist};
+use crate::repo::RememberedRead;
 use crate::Repo;
 
 /// Most changesets one batch asks for, bounding both the read-ahead past
@@ -150,7 +151,7 @@ impl ReadAhead {
         if let [_] = batches[..] {
             let (batch, gens) = batches.pop().expect("one batch");
             let read = read_batch(repo.clone(), batch, gens, roots).await;
-            self.apply(read, window);
+            self.apply(repo, read, window);
             return;
         }
         // Each batch on its own task, so that decoding the answers, which
@@ -160,11 +161,8 @@ impl ReadAhead {
             .map(|(batch, gens)| {
                 // In the reader's metadata lane: a land leader's prefetch
                 // stays on its reserved pool (ADR 0067).
-                tokio::spawn(leep_core::lane::inherit(read_batch(
-                    repo.clone(),
-                    batch,
-                    gens,
-                    roots,
+                tokio::spawn(leep_core::lane::inherit(crate::read_stats::inherit(
+                    read_batch(repo.clone(), batch, gens, roots),
                 )))
             })
             .collect();
@@ -172,7 +170,7 @@ impl ReadAhead {
             // A batch whose task failed only loses its read-ahead, like a
             // failed read: its items are read singly.
             if let Ok(read) = task.await {
-                self.apply(read, window * lanes);
+                self.apply(repo, read, window * lanes);
             }
         }
     }
@@ -188,12 +186,22 @@ impl ReadAhead {
         };
         *state = State::Asked(Ahead::default());
         self.waiting += 1;
-        Some(known.or_else(|| repo.cached_generation(id)))
+        let generation = known.or_else(|| repo.cached_generation(id));
+        // Parents this process has already read need no skiplist to be
+        // guessed: on a warm server a whole window is asked in one batch.
+        if let Some(parents) = repo.cached_parents(id) {
+            let below = generation.map_or(0, |g| g.saturating_sub(1));
+            for &p in parents.iter() {
+                let exact = repo.cached_generation(p);
+                self.guess(exact.unwrap_or(below), exact, p);
+            }
+        }
+        Some(generation)
     }
 
     /// Record what [`read_batch`] got, and queue what it names: the parents
     /// of each changeset, and its skiplist's ancestors up to `reach` steps.
-    fn apply(&mut self, read: Read, reach: usize) {
+    fn apply(&mut self, repo: &Repo, read: Read, reach: usize) {
         let Read {
             batch,
             gens,
@@ -202,6 +210,7 @@ impl ReadAhead {
             skips,
         } = read;
         let mut css = css.map(|v| v.into_iter());
+        let mut remember = Vec::with_capacity(batch.len());
         for (i, id) in batch.iter().enumerate() {
             let cs = css.as_mut().and_then(|it| it.next()).flatten();
             let generation = gens[i];
@@ -209,6 +218,14 @@ impl ReadAhead {
                 .as_ref()
                 .and_then(|v| v[i].as_deref())
                 .and_then(|b| decode_hash(b).ok());
+            // Kept for later walks, as `Repo` keeps what it reads singly.
+            remember.push(RememberedRead {
+                id: *id,
+                parents: cs.as_ref().map(|cs| cs.parents.as_slice().into()),
+                generation,
+                root,
+            });
+            let root = root.or_else(|| self.roots.then(|| repo.cached_root(*id)).flatten());
             if let Some(cs) = &cs {
                 let below = generation.map_or(0, |g| g.saturating_sub(1));
                 for &p in &cs.parents {
@@ -226,6 +243,12 @@ impl ReadAhead {
                     if (1usize << k.min(63)) > reach {
                         break;
                     }
+                    remember.push(RememberedRead {
+                        id: e.id,
+                        parents: None,
+                        generation: Some(e.generation),
+                        root: None,
+                    });
                     self.guess(e.generation, Some(e.generation), e.id);
                 }
             }
@@ -238,6 +261,7 @@ impl ReadAhead {
                 };
             }
         }
+        repo.remember_read(remember);
     }
 
     /// Queue `id` at `estimate`; `exact` is its generation when known.
@@ -257,12 +281,23 @@ impl ReadAhead {
 
     /// Generation of `id`, read ahead or else by [`Repo::generation`].
     pub(crate) async fn generation(&self, repo: &Repo, id: ChangesetId) -> Result<u64> {
+        match self.known_generation(repo, id) {
+            Some(g) => Ok(g),
+            None => repo.generation(id).await,
+        }
+    }
+
+    /// Generation of `id` without a read: read ahead, named by a skiplist
+    /// (which `ask` would use without reading it either) or in the
+    /// ancestry cache.
+    pub(crate) fn known_generation(&self, repo: &Repo, id: ChangesetId) -> Option<u64> {
         match self.known.get(&id) {
             Some(State::Asked(Ahead {
                 generation: Some(g),
                 ..
-            })) => Ok(*g),
-            _ => repo.generation(id).await,
+            }))
+            | Some(State::Guessed(Some(g))) => Some(*g),
+            _ => repo.cached_generation(id),
         }
     }
 
@@ -302,28 +337,47 @@ async fn read_batch(
     want_roots: bool,
 ) -> Read {
     let meta = repo.meta();
-    let keys: Vec<Hash> = batch.iter().map(|id| id.0).collect();
-    let unknown: Vec<usize> = (0..batch.len()).filter(|&i| gens[i].is_none()).collect();
-    let gen_keys: Vec<Hash> = unknown.iter().map(|&i| keys[i]).collect();
-    let (css, read, roots, skips) = tokio::join!(
-        meta.get_changesets(&batch),
-        async {
-            if gen_keys.is_empty() {
-                Ok(Vec::new())
-            } else {
-                meta.get_derived_many(Generation::NAME, &gen_keys).await
-            }
-        },
-        async {
-            if want_roots {
-                meta.get_derived_many(RootTree::NAME, &keys).await
-            } else {
-                Ok(Vec::new())
-            }
-        },
-        meta.get_derived_many(Skiplist::NAME, &keys),
-    );
     let n = batch.len();
+    let unknown: Vec<usize> = (0..n).filter(|&i| gens[i].is_none()).collect();
+    // Root trees this process holds are not read again, nor the skiplists
+    // of changesets whose parents it holds: those parents are guessed
+    // without them (see `ReadAhead::ask`).
+    let no_root: Vec<usize> = if want_roots {
+        (0..n)
+            .filter(|&i| repo.cached_root(batch[i]).is_none())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let no_parents: Vec<usize> = (0..n)
+        .filter(|&i| repo.cached_parents(batch[i]).is_none())
+        .collect();
+    let keys_of = |at: &[usize]| -> Vec<Hash> { at.iter().map(|&i| batch[i].0).collect() };
+    let (gen_keys, root_keys, skip_keys) =
+        (keys_of(&unknown), keys_of(&no_root), keys_of(&no_parents));
+    let calls = 1 + [&gen_keys, &root_keys, &skip_keys]
+        .iter()
+        .filter(|k| !k.is_empty())
+        .count() as u64;
+    let many = |kind: &'static str, keys: &[Hash]| {
+        let (meta, keys) = (meta.clone(), keys.to_vec());
+        async move {
+            if keys.is_empty() {
+                Ok(Vec::new())
+            } else {
+                meta.get_derived_many(kind, &keys).await
+            }
+        }
+    };
+    let (css, read, roots, skips) = crate::read_stats::round(calls, async {
+        tokio::join!(
+            meta.get_changesets(&batch),
+            many(Generation::NAME, &gen_keys),
+            many(RootTree::NAME, &root_keys),
+            many(Skiplist::NAME, &skip_keys),
+        )
+    })
+    .await;
     for (&i, v) in unknown
         .iter()
         .zip(slot(read, unknown.len()).unwrap_or_default())
@@ -332,11 +386,23 @@ async fn read_batch(
     }
     Read {
         css: slot(css, n),
-        roots: slot(roots, n),
-        skips: slot(skips, n),
+        roots: want_roots.then(|| spread(roots, &no_root, n)).flatten(),
+        skips: spread(skips, &no_parents, n),
         batch,
         gens,
     }
+}
+
+/// The answer to a read of the keys at positions `at` of an `n`-key batch,
+/// one slot per batch position (`None` where not asked); `None` if the
+/// read failed.
+fn spread<T>(r: Result<Vec<Option<T>>>, at: &[usize], n: usize) -> Option<Vec<Option<T>>> {
+    let got = slot(r, at.len())?;
+    let mut out: Vec<Option<T>> = std::iter::repeat_with(|| None).take(n).collect();
+    for (&i, v) in at.iter().zip(got) {
+        out[i] = v;
+    }
+    Some(out)
 }
 
 /// A batch answer, or `None` if it failed or has the wrong number of slots.

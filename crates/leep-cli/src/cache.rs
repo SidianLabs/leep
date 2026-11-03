@@ -1,11 +1,18 @@
 //! Machine-wide content-addressed blob cache. Keys are content hashes, so it
 //! needs no invalidation and can be shared by every working copy.
+//!
+//! Changesets are kept beside the blobs, under `changesets/`, keyed by id
+//! (ADR 0082): what `GET /v1/changesets/{id}` answers is a function of the
+//! id, so `leep show` of a changeset seen before makes no request for it.
+//! Only display paths read them; nothing takes a cached changeset as proof
+//! that a server has it.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use leep_core::Hash;
+use leep_core::api::ChangesetInfo;
+use leep_core::{ChangesetId, Hash};
 
 use crate::client::Client;
 use crate::error::{CliError, Result};
@@ -73,6 +80,57 @@ impl Cache {
         if path.exists() {
             return Ok(());
         }
+        self.write_atomic(&path, data)
+    }
+
+    fn changeset_path(&self, id: &ChangesetId) -> PathBuf {
+        let hex = id.to_string();
+        self.dir.join("changesets").join(&hex[..2]).join(&hex[2..])
+    }
+
+    /// A changeset `GET /v1/changesets/{id}` answered before. The entry
+    /// must decode and its changeset hash to `id`; anything else is dropped
+    /// and reads as a miss.
+    pub fn get_changeset(&self, id: &ChangesetId) -> Option<ChangesetInfo> {
+        let p = self.changeset_path(id);
+        let data = fs::read(&p).ok()?;
+        match serde_json::from_slice::<ChangesetInfo>(&data) {
+            Ok(info) if info.id == *id && info.changeset.id() == *id => Some(info),
+            _ => {
+                let _ = fs::remove_file(&p);
+                None
+            }
+        }
+    }
+
+    /// Keep `info` for [`Cache::get_changeset`] if its changeset hashes to
+    /// its id and it is a plain answer (no `follow` fields). Best effort: a
+    /// cache that cannot be written only costs a request later.
+    pub fn put_changeset(&self, info: &ChangesetInfo) {
+        if info.changeset.id() != info.id || info.path_at.is_some() || info.renamed.is_some() {
+            return;
+        }
+        let path = self.changeset_path(&info.id);
+        if path.exists() {
+            return;
+        }
+        let Ok(data) = serde_json::to_vec(info) else {
+            return;
+        };
+        let _ = self.write_atomic(&path, &data);
+    }
+
+    /// [`Cache::get_changeset`], asking the server on a miss.
+    pub fn changeset(&self, client: &Client, id: &ChangesetId) -> Result<ChangesetInfo> {
+        if let Some(info) = self.get_changeset(id) {
+            return Ok(info);
+        }
+        let info = client.get_changeset(id)?;
+        self.put_changeset(&info);
+        Ok(info)
+    }
+
+    fn write_atomic(&self, path: &Path, data: &[u8]) -> Result<()> {
         let shard = path.parent().expect("cache path has a parent");
         fs::create_dir_all(shard)?;
         let tmp = shard.join(format!(
@@ -81,7 +139,7 @@ impl Cache {
             TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
         fs::write(&tmp, data)?;
-        fs::rename(&tmp, &path).inspect_err(|_| {
+        fs::rename(&tmp, path).inspect_err(|_| {
             let _ = fs::remove_file(&tmp);
         })?;
         Ok(())
@@ -121,6 +179,46 @@ mod tests {
         let h = Hash::of_blob(b"hello");
         assert!(c.put(&h, b"evil").is_err());
         assert!(c.get(&h).is_none());
+    }
+
+    fn info(message: &str) -> ChangesetInfo {
+        let cs = leep_core::Changeset {
+            parents: Vec::new(),
+            author: "a".into(),
+            timestamp: 0,
+            message: message.into(),
+            changes: Default::default(),
+            extra: Default::default(),
+        };
+        ChangesetInfo {
+            id: cs.id(),
+            changeset: cs,
+            generation: 1,
+            root_tree: Hash::of_blob(b"root"),
+            path_at: None,
+            renamed: None,
+        }
+    }
+
+    #[test]
+    fn changesets_are_kept_by_id_and_checked_on_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = Cache::new(dir.path());
+        let a = info("a");
+        assert!(c.get_changeset(&a.id).is_none());
+        c.put_changeset(&a);
+        assert_eq!(c.get_changeset(&a.id), Some(a.clone()));
+        // An entry whose changeset does not hash to its key is dropped.
+        let b = info("b");
+        fs::create_dir_all(c.changeset_path(&b.id).parent().unwrap()).unwrap();
+        fs::write(c.changeset_path(&b.id), serde_json::to_vec(&a).unwrap()).unwrap();
+        assert!(c.get_changeset(&b.id).is_none());
+        assert!(!c.changeset_path(&b.id).exists());
+        // An answer whose id is not its changeset's is not kept.
+        let mut forged = info("c");
+        forged.id = b.id;
+        c.put_changeset(&forged);
+        assert!(!c.changeset_path(&b.id).exists());
     }
 
     #[test]

@@ -111,7 +111,14 @@ impl Walk {
         want: usize,
     ) -> Result<Self> {
         let mut ahead = ReadAhead::new(roots);
-        ahead.ensure(repo, ids, u64::MAX, want).await;
+        // From the newest start's generation if this process knows them
+        // all, so the first batch can take the window below it.
+        let at = ids
+            .iter()
+            .map(|id| repo.cached_generation(*id))
+            .try_fold(0, |m, g| g.map(|g| m.max(g)))
+            .unwrap_or(u64::MAX);
+        ahead.ensure(repo, ids, at, want).await;
         let (mut seen, mut heap) = (HashSet::new(), BinaryHeap::new());
         for &id in ids {
             if seen.insert(id) {
@@ -148,11 +155,14 @@ impl Walk {
             Some(cs) => cs,
             None => repo.get_changeset(cid).await?,
         };
+        // On the last step the caller expects, parents are only queued, so
+        // a parent whose generation is known needs no read.
         let new: Vec<ChangesetId> = cs
             .parents
             .iter()
             .copied()
             .filter(|p| !self.seen.contains(p))
+            .filter(|p| want > 1 || self.ahead.known_generation(repo, *p).is_none())
             .collect();
         self.ahead.ensure(repo, &new, generation, want).await;
         for &p in &cs.parents {
@@ -536,7 +546,8 @@ impl Repo {
     /// Root trees of `ids` with one batched read, deriving any not stored.
     pub(crate) async fn root_trees(&self, ids: &[ChangesetId]) -> Result<Vec<Hash>> {
         let keys: Vec<Hash> = ids.iter().map(|id| id.0).collect();
-        let rows = match self.meta().get_derived_many(RootTree::NAME, &keys).await {
+        let read = self.meta().get_derived_many(RootTree::NAME, &keys);
+        let rows = match crate::read_stats::round(u64::from(!keys.is_empty()), read).await {
             Ok(rows) if rows.len() == ids.len() => rows,
             _ => vec![None; ids.len()],
         };
@@ -971,6 +982,67 @@ mod read_ahead_tests {
         assert!(
             batches * 20 < reachable,
             "{batches} batched reads for {reachable} changesets"
+        );
+    }
+
+    /// A server that has walked a stretch before knows its parents, root
+    /// trees and generations, and asks a short log's whole window in one
+    /// read; a cold one, and one whose rows the read-ahead misses, answer
+    /// the same.
+    #[tokio::test]
+    async fn warm_walks_read_a_window_at_once_and_answer_the_same() {
+        for seed in 1..=6u64 {
+            let mut rng = Lcg(seed);
+            let (r, _) = probe(false);
+            let n = 40 + rng.below(300);
+            let ids = random_dag(&r, &mut rng, n).await;
+            if seed % 3 == 0 {
+                r.meta().delete_derived_kind("root_tree").await.unwrap();
+                r.meta().delete_derived_kind("skiplist").await.unwrap();
+            }
+            let mut tips = vec![*ids.last().unwrap()];
+            for _ in 0..3 {
+                tips.push(ids[rng.below(ids.len())]);
+            }
+            // A new handle on the same stores: nothing cached.
+            let cold = Repo::new(r.blobs().clone(), r.meta().clone());
+            for round in 0..2 {
+                for &tip in &tips {
+                    for filter in filters() {
+                        for limit in [1, 2, 7, 40, 100, 257, usize::MAX] {
+                            let want = serial_log(&r, tip, limit, &filter).await.unwrap();
+                            let got = cold.log_filtered(tip, None, limit, &filter).await.unwrap();
+                            assert_eq!(got, want, "seed {seed}, round {round}, limit {limit}");
+                        }
+                    }
+                }
+            }
+        }
+        // A linear stretch: cold, a window is read as the skiplists double
+        // it; warm, in one read of the changesets alone.
+        let (r, _) = probe(false);
+        let mut tip = None;
+        for i in 0..400 {
+            let cs = Changeset {
+                parents: tip.into_iter().collect(),
+                author: "ann".into(),
+                timestamp: i,
+                message: format!("c{i}"),
+                changes: BTreeMap::new(),
+                extra: BTreeMap::new(),
+            };
+            tip = Some(r.create_changeset(cs).await.unwrap());
+        }
+        let tip = tip.unwrap();
+        let cold = Repo::new(r.blobs().clone(), r.meta().clone());
+        let (first, cold_reads) = crate::read_stats::measure(cold.log(tip, None, 100)).await;
+        let (again, warm_reads) = crate::read_stats::measure(cold.log(tip, None, 100)).await;
+        assert_eq!(first.unwrap(), again.unwrap());
+        assert!(cold_reads.rounds > 3, "{cold_reads:?}");
+        assert_eq!(
+            (warm_reads.rounds, warm_reads.calls),
+            (1, 1),
+            "{warm_reads:?}"
         );
     }
 

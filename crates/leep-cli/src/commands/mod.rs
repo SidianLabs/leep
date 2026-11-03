@@ -122,6 +122,18 @@ impl Ctx {
     }
 }
 
+/// A revision as a read asks for it (see [`Remote::head`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Head {
+    Id(ChangesetId),
+    /// `sent` is what the server is asked to resolve: `rev` with `@`
+    /// replaced by the working copy's base.
+    Rev {
+        sent: String,
+        rev: String,
+    },
+}
+
 /// What read-only server queries need; works without a working copy.
 pub struct Remote<'a> {
     pub client: &'a Client,
@@ -160,6 +172,56 @@ impl Remote<'_> {
                  a short id needs at least 4 hex digits",
             )),
             Err(e) => Err(e),
+        }
+    }
+
+    /// What to ask the server for in place of resolving `rev` first: the
+    /// id when it is known here, else the revision, which a server since
+    /// ADR 0082 resolves in the same request. `None` is
+    /// [`Remote::resolve_default`]'s default.
+    pub fn head(&self, rev: Option<&str>) -> Result<Head> {
+        let rev = match (rev, self.base) {
+            (Some(r), _) => r,
+            (None, Some(b)) => return Ok(Head::Id(b)),
+            (None, None) => self.target_ref,
+        };
+        let (base, suffix) = leep_core::revision::split(rev);
+        if base == "@" {
+            let id = self
+                .base
+                .ok_or_else(|| CliError::user("working copy has no base changeset yet"))?;
+            if suffix.is_empty() {
+                return Ok(Head::Id(id));
+            }
+            return Ok(Head::Rev {
+                sent: format!("{id}{suffix}"),
+                rev: rev.to_string(),
+            });
+        }
+        if rev.len() == 64 {
+            if let Ok(id) = rev.parse::<ChangesetId>() {
+                return Ok(Head::Id(id));
+            }
+        }
+        Ok(Head::Rev {
+            sent: rev.to_string(),
+            rev: rev.to_string(),
+        })
+    }
+
+    /// `ask` of `head`: of its id, or of the revision itself. If the server
+    /// refuses the revision (400 from a server before ADR 0082, which takes
+    /// only ids, or 404 for a short id or a typo), the revision is resolved
+    /// as [`Remote::resolve`] does, with its hints, and asked again by id.
+    pub fn ask<T>(&self, head: &Head, ask: impl Fn(&str) -> Result<T>) -> Result<T> {
+        match head {
+            Head::Id(id) => ask(&id.to_string()),
+            Head::Rev { sent, rev } => match ask(sent) {
+                Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::User) => {
+                    ask(&self.resolve(rev)?.to_string())
+                }
+                r => r,
+            },
         }
     }
 

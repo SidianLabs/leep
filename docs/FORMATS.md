@@ -973,6 +973,23 @@ One with them used to be 404; it is now 200, 404 (walk past a root, missing
 Nth parent) or 400 (malformed suffix, reflog syntax). No type, field or
 encoding changed. The whole string is tried as a ref name first.
 
+## Revisions in log and changeset paths (additive meaning, ADR 0082)
+
+`GET /v1/log/{id}` and `GET /v1/changesets/{id}` take, besides a full id, a
+revision as `/v1/resolve/{rev}` does, with `/` percent-encoded as `%2F`. A
+64-hex id behaves exactly as before (no existence check is added). Anything
+else used to be 400; it now resolves (200, or 404 for an unknown or
+unwalkable revision, 400 for a malformed suffix). The answer is the body the
+id would get plus a `Leep-Resolved: <id>` response header; a log cursor
+belongs to the query on that id, so later pages are asked for by it. The
+three read endpoints also send `Server-Timing`, which is diagnostic and not
+a contract. No type, field or stored byte changed.
+
+The CLI's machine-wide cache (`$LEEP_CACHE_DIR`, default
+`~/.cache/leep/objects`) gains `changesets/<2 hex>/<62 hex>`: the JSON of a
+`ChangesetInfo` as the server answered it, read only when its changeset
+hashes to the file's id. Older clients ignore the directory.
+
 ## Explicit ref creation on land (additive API field, ADR 0036)
 
 `LandRequest` gains the optional `create` (`true`, `false` or absent; omitted
