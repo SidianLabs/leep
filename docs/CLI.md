@@ -159,11 +159,19 @@ other flags and revision (use the full id the first page started from if a ref
 may move), continue from there. An older server without cursors answers one
 page.
 
+`leep log` prints each changeset's header and the first paragraph of its
+message, marking a cut message with `[...]`, and leaves out `git.*` metadata:
+history imported from git keeps each commit's raw headers there (`gpgsig`
+signatures, encodings), kilobytes per entry. On a repository imported from
+git, `leep log -n 5` printed 328,661 bytes before and prints 1,004 now.
+`leep log -v` prints every key and the whole message, as `leep show` does;
+`leep --json log` is unchanged.
+
 `leep log --oneline` prints one line per changeset, the short id and the
 message's first line. It asks the server for summary entries
 (`fields=summary`: no changed paths, the message's first line, `agent.*`
 metadata), about a quarter of the bytes of full ones on git/git; with
-`--json` it prints them. `leep log` and `leep log --json` are unchanged.
+`--json` it prints them.
 
 `leep log --graph` draws the commit graph left of the entries, with or
 without `--oneline`, as `git log --graph` does: `*` marks each changeset,
@@ -178,6 +186,22 @@ continues. With `--path`, `--follow`, `--author`, `--agent`,
 (exit 2): the changesets that connect the shown ones are left out, and the
 CLI does not rewrite parents as git does. With `--json` it is ignored and
 the raw response is printed.
+
+## Reading one change
+
+`leep diff REV` shows what changeset REV changed: its diff against its first
+parent (a root changeset against the empty tree), the same as
+`leep diff REV^ REV`. `leep show REV` prints the header with a `Parent:` line
+per parent, the signers and the changed paths; `leep show -p REV` adds the
+patch, and with `--json` puts it in a `patch` field beside the changeset.
+
+`leep review status REV` prints one line per changed path, saying what
+satisfied it (`approved by rhea (any reviewer)`, `approved by alice (owner)`,
+`needs no review (auto:docs_only)`) or what it still needs
+(`needs one of: alice, bob`), and ends with `diff: leep diff ID`. `--json`
+keeps the server's rule names (`owner`, `pending`, ...). `leep review approve`
+and `reject` then read the status on the target ref and print
+`now approved for main` or the paths still waiting.
 
 ## Landing onto a new ref
 
@@ -225,12 +249,33 @@ text file, `leep` writes conflict markers into it, labelled by role:
 | `cherry-pick REV`, `revert REV` | `yours` | `ID (cherry-pick)`, `ID (revert)` |
 | `stash apply`, `stash pop` | `working copy` | `stash ID` |
 
-A diff3 base section (`||||||| original`) may sit between them. Only the
-labels are the CLI's: the server's `merged_with_markers` text, which the MCP
-server passes on, still says `ours` and `theirs`, and the `/v1` fields keep
-those names. Detection only looks for a line starting with `<<<<<<< `, so
-files written by older clients with `<<<<<<< ours` still block `commit` and
-`land` until resolved.
+Between the `<<<<<<<` line and `=======` is the first side's text, between
+`=======` and `>>>>>>>` the second's. The server writes diff3 style, with the
+common ancestor in a `||||||| original` section before `=======`; the CLI
+labels a non-empty one `||||||| base` and drops an empty one (both sides
+added text where there was none), which says nothing. The conflict report
+explains the sections in one paragraph. Only the labels are the CLI's: the
+server's `merged_with_markers` text, which the MCP server passes on, still
+says `ours`, `original` and `theirs`, and the `/v1` fields keep those names.
+
+A conflicted file counts as resolved once no line starts with `<<<<<<< `,
+`||||||| ` or `>>>>>>> `, so a half-deleted conflict still blocks `commit`,
+`amend` and `land`, as do files written by older clients with
+`<<<<<<< ours`. A `=======` line alone does not count: Markdown and
+reStructuredText underline headings with it.
+
+## Resolving a conflicted land
+
+When `leep land` exits 5 the working copy is on the ref's head with your
+changes applied and the conflicts marked; resolve them, `leep commit`, and
+`leep land` again. Until a land lands, `.leep/state.json` remembers the
+conflicted land (`resolving`; `leep status` shows it and `leep --json status`
+carries it), and the commit made on that head records the changesets it
+replaces in `leep.rebased_from`: their ids, newest first and joined with
+commas when the land carried a stack. A server can use it to carry review
+verdicts over to the resolution where the reviewed changes are byte for byte
+the same; the ids are only a hint, and the server checks content. Any
+checkout, `sync`, `switch` or `reset --hard` forgets the land.
 
 ## Bisect
 

@@ -71,6 +71,11 @@ pub struct Data {
     pub resolves: usize,
     /// The `{id}` of every `GET /v1/log/{id}`, as asked for.
     pub log_heads: Vec<String>,
+    /// `(changeset, verdict)` of every review posted, by reviewer `mock`.
+    pub reviews: Vec<(ChangesetId, leep_core::review::Verdict)>,
+    /// Write land conflicts diff3 style, with the base between the sides as
+    /// `||||||| original`, as the real server does.
+    pub diff3: bool,
 }
 
 pub type Shared = Arc<Mutex<Data>>;
@@ -128,6 +133,24 @@ impl Data {
             "<<<<<<< ours\n{}=======\n{}>>>>>>> theirs\n",
             self.text(ours),
             self.text(theirs)
+        ))
+    }
+
+    /// [`Data::markers`] with the base section when `diff3` is set.
+    pub fn markers3(
+        &self,
+        base: &Option<FileInfo>,
+        ours: &Option<FileInfo>,
+        theirs: &Option<FileInfo>,
+    ) -> Option<String> {
+        let two = self.markers(ours, theirs)?;
+        if !self.diff3 {
+            return Some(two);
+        }
+        Some(two.replacen(
+            "=======\n",
+            &format!("||||||| original\n{}=======\n", self.text(base)),
+            1,
         ))
     }
 
@@ -219,6 +242,8 @@ impl Mock {
                 "/v1/changesets/{id}/signatures",
                 post(add_signature).get(list_signatures),
             )
+            .route("/v1/changesets/{id}/reviews", post(add_review))
+            .route("/v1/changesets/{id}/review-status", get(review_status))
             .route("/v1/refs", get(list_refs))
             .route("/v1/refs/{*name}", get(get_ref).post(cas_ref))
             .route("/v1/reflog", get(reflog_all))
@@ -398,6 +423,72 @@ async fn create(
     }
     let id = d.insert(cs);
     Ok(Json(CreateChangesetResponse { id }))
+}
+
+/// Records the verdict as reviewer `mock`.
+async fn add_review(
+    State(s): State<Shared>,
+    Path(id): Path<String>,
+    Json(req): Json<AddReviewRequest>,
+) -> Resp<AddReviewResponse> {
+    let id: ChangesetId = id
+        .parse()
+        .map_err(|_| err(StatusCode::BAD_REQUEST, "bad id"))?;
+    let mut d = s.lock().unwrap();
+    if !d.changesets.contains_key(&id) {
+        return Err(err(StatusCode::NOT_FOUND, "no such changeset"));
+    }
+    d.reviews.push((id, req.verdict));
+    Ok(Json(AddReviewResponse {
+        reviewer: "mock".into(),
+        verdict: req.verdict,
+    }))
+}
+
+/// A server without owners: every changed path needs one approval from
+/// anyone; the latest verdict counts.
+async fn review_status(
+    State(s): State<Shared>,
+    Path(id): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Resp<ReviewStatusResponse> {
+    use leep_core::review::Verdict;
+    let id: ChangesetId = id
+        .parse()
+        .map_err(|_| err(StatusCode::BAD_REQUEST, "bad id"))?;
+    let d = s.lock().unwrap();
+    let cs = d
+        .changesets
+        .get(&id)
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "no such changeset"))?;
+    let last = d
+        .reviews
+        .iter()
+        .rev()
+        .find(|(c, _)| *c == id)
+        .map(|(_, v)| *v);
+    let (rule, ok, no) = match last {
+        Some(Verdict::Approve) => ("owner", vec!["mock".to_string()], vec![]),
+        Some(Verdict::Reject) => ("rejected", vec![], vec!["mock".to_string()]),
+        _ => ("pending", vec![], vec![]),
+    };
+    let paths: Vec<PathReview> = cs
+        .changes
+        .keys()
+        .map(|p| PathReview {
+            path: p.clone(),
+            rule: rule.into(),
+            owners: vec![],
+            approved_by: ok.clone(),
+            rejected_by: no.clone(),
+        })
+        .collect();
+    Ok(Json(ReviewStatusResponse {
+        changeset: id,
+        target_ref: q.get("ref").cloned().unwrap_or_else(|| "main".into()),
+        approved: rule == "owner" || paths.is_empty(),
+        paths,
+    }))
 }
 
 /// Records the request; the tests verify the signature themselves.
@@ -1028,7 +1119,7 @@ async fn land(State(s): State<Shared>, Json(r): Json<LandRequest>) -> Resp<LandR
             continue;
         }
         let ours = h.cloned();
-        let merged = d.markers(&ours, &theirs);
+        let merged = d.markers3(&b.cloned(), &ours, &theirs);
         conflicts.push(Conflict {
             path: path.clone(),
             base: b.cloned(),

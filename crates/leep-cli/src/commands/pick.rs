@@ -284,7 +284,11 @@ fn finish(
                     pick.summary,
                     crate::fmt::plural(plan.conflicts.len() + plan.unmerged.len(), "file")
                 );
-                print_conflicts(&plan, other);
+                print_conflicts(
+                    &plan,
+                    other,
+                    &Labels::new("yours", format!("{} ({verb})", short(pick.from))),
+                );
                 outln!(
                     "Resolve them (`leep resolve PATH` once chosen), then `leep commit` to record \
                      the {verb}, or `leep {verb} --abort`."

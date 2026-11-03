@@ -434,14 +434,22 @@ fn limit_malloc_arenas() {
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
 fn limit_malloc_arenas() {}
 
-fn main() -> Result<()> {
+fn main() {
     limit_malloc_arenas();
     let cli = Cli::parse();
-    if let Cmd::Mirror { cmd } = cli.cmd {
-        let code = run_mirror(cmd)?;
-        std::process::exit(code);
+    let result = (|| -> Result<()> {
+        if let Cmd::Mirror { cmd } = cli.cmd {
+            let code = run_mirror(cmd)?;
+            std::process::exit(code);
+        }
+        tokio::runtime::Runtime::new()?.block_on(run(cli.cmd))
+    })();
+    // Printed by hand: returning the error from `main` adds a backtrace
+    // when RUST_BACKTRACE is set, which buries the message.
+    if let Err(e) = result {
+        eprintln!("error: {e:#}");
+        std::process::exit(1);
     }
-    tokio::runtime::Runtime::new()?.block_on(run(cli.cmd))
 }
 
 async fn run(cmd: Cmd) -> Result<()> {

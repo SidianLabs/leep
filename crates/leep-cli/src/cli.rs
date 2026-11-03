@@ -61,7 +61,7 @@ pub enum Command {
     /// Show added, modified, deleted and conflicted files.
     #[command(after_help = help::STATUS)]
     Status,
-    /// Show changes (working copy vs base, or `FROM TO` on the server).
+    /// Show changes (working copy vs base, one changeset, or `FROM TO`).
     #[command(after_help = help::DIFF)]
     Diff(diff::DiffArgs),
     /// Create an author signing key for `leep commit --sign`.

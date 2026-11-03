@@ -690,6 +690,20 @@ struct PgDb {
     url: String,
 }
 
+/// `admin` with only the database name swapped, so user, host, port and
+/// query parameters (a Unix-socket `host=`) carry over.
+fn replace_db(admin: &str, db: &str) -> String {
+    let (base, query) = match admin.split_once('?') {
+        Some((b, q)) => (b, format!("?{q}")),
+        None => (admin, String::new()),
+    };
+    let root = base
+        .rsplit_once('/')
+        .expect("postgres url has no database")
+        .0;
+    format!("{root}/{db}{query}")
+}
+
 impl PgDb {
     async fn create(tag: &str) -> Option<PgDb> {
         let admin = pg_url()?;
@@ -705,8 +719,7 @@ impl PgDb {
             .execute(&mut c)
             .await
             .unwrap();
-        let root = admin.split('?').next().unwrap().rsplit_once('/').unwrap().0;
-        let url = format!("{root}/{name}");
+        let url = replace_db(&admin, &name);
         Some(PgDb { admin, name, url })
     }
 

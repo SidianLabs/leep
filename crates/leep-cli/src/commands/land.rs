@@ -13,11 +13,12 @@ use leep_core::{ChangesetId, FileChange, FileKind, RepoPath};
 
 use super::{print_json, Ctx};
 use crate::client::new_land_id;
+use crate::client::LogQuery;
 use crate::error::{exit, CliError, ErrorKind, Result};
 use crate::fmt::short;
-use crate::markers::{relabel, Labels};
+use crate::markers::{explain, relabel, Labels};
 use crate::materialize::{materialize, write_file};
-use crate::state::PendingLand;
+use crate::state::{PendingLand, ResolvingLand};
 use crate::status::status;
 
 #[derive(Args, Debug)]
@@ -66,6 +67,9 @@ pub fn run(ctx: &mut Ctx, args: &LandArgs) -> Result<i32> {
             if rebased {
                 materialize(ctx, landed, false)?;
             }
+            if ctx.wc.state.resolving.take().is_some() {
+                ctx.wc.save_state()?;
+            }
             if !ctx.json {
                 outln!(
                     "Landed {} on {target_ref}{} ({attempts} attempt{})",
@@ -81,7 +85,14 @@ pub fn run(ctx: &mut Ctx, args: &LandArgs) -> Result<i32> {
             conflicts,
             clean,
         } => {
+            let from = landed_stack(ctx, base, onto);
             let unmerged = rebase_locally(ctx, &target_ref, onto, &conflicts, &clean)?;
+            ctx.wc.state.resolving = Some(ResolvingLand {
+                from,
+                target_ref: target_ref.clone(),
+                onto,
+            });
+            ctx.wc.save_state()?;
             if !ctx.json {
                 outln!(
                     "Cannot land cleanly: {} conflict{} against {} on {target_ref}",
@@ -104,14 +115,85 @@ pub fn run(ctx: &mut Ctx, args: &LandArgs) -> Result<i32> {
                         None => outln!("  C {} ({note})", c.path),
                     }
                 }
+                if conflicts.len() > unmerged.len() {
+                    outln!("{}", explain(&Labels::landed(&target_ref)));
+                }
                 outln!(
                     "Your working copy is now on {} with your changes applied.\n\
-                     Resolve the conflicts (`leep resolve PATH` once chosen), then run `leep commit` and `leep land`.",
-                    short(onto)
+                     Resolve the conflicts (`leep resolve PATH` once chosen), then run `leep commit` and `leep land`.\n\
+                     The commit records that it replaces {} (`leep.rebased_from`).",
+                    short(onto),
+                    resolving_names(ctx)
                 );
             }
             Ok(exit::CONFLICT)
         }
+    }
+}
+
+/// Most changesets a land's stack is followed back through for
+/// `leep.rebased_from`; the server bounds its rebase chains the same way.
+const MAX_STACK: usize = 64;
+
+/// The changesets landing `base` tried to add, newest first: its
+/// first-parent chain down to the generation of its merge base with `onto`.
+/// Best effort, from one merge-base call and one summary log: on any error,
+/// just `base`.
+fn landed_stack(ctx: &Ctx, base: ChangesetId, onto: ChangesetId) -> Vec<ChangesetId> {
+    let q = LogQuery {
+        limit: Some(MAX_STACK as u32 + 1),
+        ..LogQuery::default()
+    };
+    let (Ok(fork), Ok(log)) = (
+        ctx.client.merge_base(&base, &onto),
+        ctx.client.log_summary(&base, &q),
+    ) else {
+        return vec![base];
+    };
+    let by_id: BTreeMap<ChangesetId, _> = log.entries.iter().map(|e| (e.id, e)).collect();
+    let floor = match fork.base {
+        Some(f) => match by_id.get(&f) {
+            Some(e) => e.generation,
+            None => match ctx.cache.changeset(&ctx.client, &f) {
+                Ok(info) => info.generation,
+                Err(_) => return vec![base],
+            },
+        },
+        None => 0,
+    };
+    let mut out = Vec::new();
+    let mut cur = by_id.get(&base);
+    while let Some(e) = cur {
+        if e.generation <= floor || out.len() == MAX_STACK {
+            break;
+        }
+        out.push(e.id);
+        cur = e.parents.first().and_then(|p| by_id.get(p));
+    }
+    if out.is_empty() {
+        out.push(base);
+    }
+    out
+}
+
+/// The changesets a conflicted land replaces, for the report.
+fn resolving_names(ctx: &Ctx) -> String {
+    let from = ctx
+        .wc
+        .state
+        .resolving
+        .as_ref()
+        .map_or(&[][..], |r| &r.from[..]);
+    match from {
+        [one] => short(*one),
+        many => format!(
+            "{} changesets ({})",
+            many.len(),
+            many.iter()
+                .map(|id| short(*id))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
     }
 }
 

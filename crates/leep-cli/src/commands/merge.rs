@@ -163,7 +163,11 @@ pub fn run(ctx: &mut Ctx, args: &MergeArgs) -> Result<i32> {
                     short(other),
                     crate::fmt::plural(plan.conflicts.len() + plan.unmerged.len(), "file")
                 );
-                print_conflicts(&plan, other);
+                print_conflicts(
+                    &plan,
+                    other,
+                    &Labels::new("yours", format!("{} (merging)", short(other))),
+                );
                 outln!(
                     "Resolve them (`leep resolve PATH` once chosen), then `leep commit` to finish the \
                      merge, or `leep merge --abort`."

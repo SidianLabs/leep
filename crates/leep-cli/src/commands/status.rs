@@ -14,7 +14,7 @@ use crate::fmt::{plural, rename_line, short};
 use crate::status::{status, working_renames, Change, Status};
 
 #[derive(Serialize)]
-struct Report {
+struct Report<'a> {
     base: Option<String>,
     target_ref: String,
     changes: Vec<Entry>,
@@ -26,6 +26,10 @@ struct Report {
     /// about, and which of the two it is.
     #[serde(skip_serializing_if = "Option::is_none")]
     picking: Option<Picking>,
+    /// A land that stopped on conflicts and was rebased here: what it tried
+    /// to land, and where. The next `leep land` that lands ends it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resolving: Option<&'a crate::state::ResolvingLand>,
     /// A bisect in progress (`.leep/bisect.json`).
     #[serde(skip_serializing_if = "Option::is_none")]
     bisecting: Option<Bisecting>,
@@ -138,6 +142,7 @@ pub fn run(ctx: &Ctx) -> Result<i32> {
                 from: p.from.to_string(),
                 operation: if p.revert { "revert" } else { "cherry-pick" },
             }),
+            resolving: ctx.wc.state.resolving.as_ref(),
             bisecting: bisect.map(|b| Bisecting {
                 bad: b.bad,
                 good: b.good,
@@ -190,6 +195,22 @@ pub fn run(ctx: &Ctx) -> Result<i32> {
         outln!(
             "{ing} {} (fix the conflicts, then `leep commit`; `leep {what} --abort` cancels)",
             short(p.from)
+        );
+    }
+    if let Some(r) = &ctx.wc.state.resolving {
+        outln!(
+            "resolving the land of {} onto {} ({})",
+            r.from
+                .iter()
+                .map(|id| short(*id))
+                .collect::<Vec<_>>()
+                .join(", "),
+            r.target_ref,
+            if ctx.wc.state.base == Some(r.onto) {
+                "commit the resolution, then `leep land`"
+            } else {
+                "`leep land` to finish"
+            }
         );
     }
     if let Some(b) = &bisect {

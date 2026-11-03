@@ -240,6 +240,9 @@ fn apply(ctx: &mut Ctx, target: Option<&str>, pop: bool) -> Result<i32> {
     for p in &plan.conflicts {
         outln!("  C {p} (markers written)");
     }
+    if !plan.conflicts.is_empty() {
+        outln!("{}", crate::markers::explain(&labels));
+    }
     for p in &plan.unmerged {
         outln!(
             "  C {p} (no text merge: kept the stashed version; `leep cat @ {p}` shows the other side)"

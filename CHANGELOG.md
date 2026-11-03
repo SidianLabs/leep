@@ -34,6 +34,41 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 - **Upgrade.** Migration 8 (`review_requests`) adds two empty tables; it
   may run beside v7 servers, which never read them. Backups copy the
   tables.
+### Snapshot tests keep the Postgres URL's query string
+- **Fixed.** The leep-meta snapshot tests' per-test database URL now swaps only the database name, so a Unix-socket `LEEP_TEST_POSTGRES_URL` (`?host=...&port=...`) works.
+
+### Postgres memory sizing guide
+- **Added.** OPERATIONS.md, "Sizing Postgres memory": what grows per changeset, `shared_buffers` and `effective_cache_size` guidance, how to check the hit ratio, and the slow cold-blame symptom; linked from DEPLOY.md.
+
+### `/v1` compatibility tests
+- **Added.** `leep-core` now has compatibility tests that decode older-shaped `/v1` responses (`LogResponse`, `ChangesetInfo`, `LandResponse`, `LandRequest`) and freeze their field names, so a removed, renamed or non-defaulted field fails CI.
+
+### `leep-git import` refuses a shallow clone with a clear message
+- **Fixed.** Importing a shallow git clone failed with `git: An object with id ... could not be found` and a backtrace. It now says the clone is shallow and to run `git fetch --unshallow`, and `leep-git` prints errors as one `error:` line without a backtrace. Shallow history is refused rather than imported because the boundary commits would become roots with ids a later full import could not reuse.
+### The CLI shows one change, quieter logs, clearer reviews and markers
+- **Added.** `leep diff REV` shows what one changeset changed (against its
+  first parent, like `leep diff REV^ REV`), and `leep show -p REV` adds the
+  patch to `show` (`--json`: a `patch` field). `show` prints `Parent:` lines
+  inside the header instead of bare `parent ID` lines before it.
+- **Changed.** `leep log` leaves out `git.*` metadata (raw headers of commits
+  imported from git) and prints each message's first paragraph, marking a cut
+  with `[...]`; `-v`/`--verbose` prints everything. On an imported repository
+  `leep log -n 5` fell from 328,661 to 1,004 bytes. `--json` is unchanged.
+- **Changed.** `leep review status` says per path what satisfied it or what
+  it still needs (`approved by rhea (any reviewer)`, `needs one of: alice`)
+  instead of the server's rule names, and ends with `diff: leep diff ID`;
+  `review approve` and `reject` then print `now approved for REF` or the
+  paths still waiting. `--json` output is unchanged.
+- **Changed.** Conflict markers drop an empty diff3 base section and label a
+  non-empty one `||||||| base` (was `||||||| original`); conflict reports
+  explain the sections. A file still counts as conflicted while any line
+  starts with `<<<<<<< `, `||||||| ` or `>>>>>>> `, so a half-deleted conflict
+  no longer commits. The server's marker text is unchanged.
+- **Added.** A land that stops on conflicts is remembered in
+  `.leep/state.json` (`resolving`, also in `leep --json status`), and the
+  commit that resolves it records the changesets it replaces in
+  `leep.rebased_from` (comma-joined for a stack), so a server can carry
+  review verdicts over to an identical rebase.
 
 ### Blames of tracked files are kept current as changes land
 - **Added.** Every blame a server answers tracks its file (at most

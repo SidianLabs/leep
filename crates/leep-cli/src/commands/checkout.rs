@@ -238,6 +238,10 @@ fn finish(
     for p in conflicts {
         outln!("  C {p} (markers written)");
     }
+    if !conflicts.is_empty() {
+        let labels = crate::markers::Labels::landed(&ctx.wc.config.target_ref);
+        outln!("{}", crate::markers::explain(&labels));
+    }
     for p in unmerged {
         outln!(
             "  C {p} (no text merge: kept your version; `leep cat {} {p}` shows the other side)",

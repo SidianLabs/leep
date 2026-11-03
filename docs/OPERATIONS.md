@@ -1637,6 +1637,70 @@ and upload latency (`leep_http_request_duration_seconds`, `method="PUT"`,
 anywhere on that file system fails the uploads whose batch saw it; clients
 retry them.
 
+### Sizing Postgres memory
+
+A cold blame or long log walks the metadata of many changesets with
+thousands of dependent reads. While the database fits in memory those reads
+are cheap; once it does not, they can go to disk. History depth sets the
+database size, so size memory from it.
+
+**What grows.** On the synthetic history of
+[PERFORMANCE.md](PERFORMANCE.md#one-million-changesets-of-history), Postgres
+grew about 2.4 KB per changeset before any index was derived (243 MB at
+100,000 changesets, 2.43 GB at 1,000,000), and the warmed indexes (history,
+log filter) added about 1.8 KB more (4.19 GB at 1,000,000). Plan for about
+4.2 KB a changeset once indexes are warm. Real histories differ (merges,
+larger changes, more files), so measure yours rather than trust the ratio.
+Blobs are not in Postgres; they use the blob store or volume.
+
+**What it costs.** A cold blame of a hot file (8,000 to 10,000 changers) on
+a 4-core, 8 GB box with `shared_buffers=1GB`:
+
+| History | Database | Cold blame of a hot file |
+|---|---|---|
+| 200,000 changesets | 0.5 GB, all in `shared_buffers` | 4.6-5.3 s |
+| 1,000,000 changesets | 4.2 GB against 1 GB of buffers | 43-61 s |
+
+Reads through an index (`last-change`, `log` with a path, `diff`, `log` 100)
+stayed in milliseconds at a million changesets; the blame's walk over many
+versions is what falls off. The two runs also differ in depth and in how
+they were made (the 1M run dropped the page cache before each start), so
+the table shows the size of the effect, not a clean per-GB cost.
+
+**Rule of thumb.** Give Postgres enough memory that the database you expect
+to serve, indexes included, fits in `shared_buffers` plus the operating
+system's page cache, and set `effective_cache_size` to roughly that sum.
+The measurements support only the ends: a database that fit in
+`shared_buffers` was fast, and 4.2 GB against 1 GB with a dropped page cache
+was not. They do not show how much less than the whole database is enough.
+When `leep-server` shares the host, leave room for it (1.0-1.8 GB RSS in the
+million-changeset runs, plus `--cache-bytes`).
+
+**Checking.** Compare the database with memory, then look at the hit ratio:
+
+```sql
+SELECT pg_size_pretty(pg_database_size(current_database()));
+SHOW shared_buffers;
+
+-- Buffer hit ratio since statistics were last reset
+SELECT round(100.0 * blks_hit / nullif(blks_hit + blks_read, 0), 2) AS hit_pct
+  FROM pg_stat_database WHERE datname = current_database();
+```
+
+`blks_read` counts reads that missed `shared_buffers`; the page cache may
+still serve them, so a low ratio alone does not prove disk reads. The totals
+include history from before a problem began: read them twice a few minutes
+apart under load and use the difference. `pg_statio_user_tables` gives the
+same counters per table (`heap_blks_*`, `idx_blks_*`).
+
+**Symptom.** Cold blames and long logs many times slower than a repeat of
+the same request, on a database much larger than `shared_buffers`, with a
+hit ratio that drops while they run. A blame cut off by `--request-timeout`
+keeps no progress, so it can time out on every retry (PERFORMANCE.md, "One
+million changesets of history"). Add memory or raise `shared_buffers`
+(Postgres restarts to apply it, and its buffers start empty again), or raise
+`--request-timeout` for a one-off blame.
+
 ## Indexing a large history
 
 After importing a long history (`leep-git import`, a restore without

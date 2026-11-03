@@ -21,6 +21,7 @@ Examples:
 pub const DIFF: &str = "\
 Examples:
   leep diff                             # uncommitted changes
+  leep diff 2a954d8ef7c7                # what one changeset changed (against its first parent)
   leep diff main feature                # two revisions, computed on the server
   leep diff 2a954d8e 30f9056d --no-renames";
 
@@ -35,7 +36,8 @@ Examples:
   leep land                             # onto the working copy's target ref
   leep land --ref release/1.0
   leep land --ref feature/x --create    # the ref does not exist yet
-Exit 5 means conflicts: resolve them, `leep commit`, then `leep land` again.";
+Exit 5 means conflicts: resolve them, `leep commit`, then `leep land` again.
+That commit records the changesets it replaces in `leep.rebased_from`.";
 
 pub const SYNC: &str = "\
 Examples:
@@ -58,7 +60,8 @@ Examples:
 
 pub const LOG: &str = "\
 Examples:
-  leep log -n 5
+  leep log -n 5                         # first paragraph of each message, no git.* headers
+  leep log -v -n 5                      # every metadata key and the whole message
   leep log main --path src/parser.rs
   leep log --follow src/new_name.rs     # across renames
   leep log --oneline --graph -n 50      # with the commit graph
@@ -68,6 +71,7 @@ Examples:
 pub const SHOW: &str = "\
 Examples:
   leep show main
+  leep show -p main                     # with the patch
   leep show 2a954d8ef7c7                # any unique prefix of 4+ hex digits
   leep show @                           # the working copy base
   leep show main~2                      # two first parents back
@@ -115,6 +119,7 @@ the login name, the server's name for the token.";
 pub const REVIEW: &str = "\
 Examples:
   leep review status @                  # who still has to approve (exit 1 if not approved)
+  leep diff 2a954d8ef7c7                # the change under review
   leep review approve 2a954d8ef7c7 -m \"looks good\"
   leep review reject 2a954d8ef7c7 -m \"breaks the parser\"
   leep review request @ -m \"new API field\"   # ask the owners of what is still pending
