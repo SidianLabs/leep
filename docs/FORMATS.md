@@ -1288,7 +1288,7 @@ copy], ...]}` (`rebased` empty for a fast-forward or a no-op, and defaulted
 when absent), or `{"status": "conflicts", "onto", "conflicts", "clean"}`
 with the fields of `LandResponse::Conflicts`, its `clean` blobs stored the
 same way. A merge base other than `expected_base` is 409 `cas_lost`; a
-`--protect-ref` ref is 400 `not_forward`; a land id recorded for another
+`--protect-ref` ref is 422 `not_forward` (400 before ADR 0085); a land id recorded for another
 `onto` is 400 `land_id_reused`. The move is a ref log entry with operation
 `git-mirror`, and a keyed one records `land_id` with `onto` as its
 `land_changeset`, so rebase-onto and lands share a ref's land ids.
@@ -1336,9 +1336,9 @@ client treats an unknown or absent code by its HTTP status.
 
 | Status | `code` | Condition |
 |---|---|---|
-| 400 | `needs_review` | a land or ref move onto a ref whose review policy some changeset does not meet |
-| 400 | `not_signed` | a land or ref move onto a ref that needs every changeset signed by a trusted key |
-| 400 | `not_forward` | a move of a land-policy-protected ref, or of a protected ref (`--protect-ref`), that is not a fast-forward |
+| 422 | `needs_review` | a land or ref move onto a ref whose review policy some changeset does not meet (400 before ADR 0085) |
+| 422 | `not_signed` | a land or ref move onto a ref that needs every changeset signed by a trusted key (400 before ADR 0085) |
+| 422 | `not_forward` | a move of a land-policy-protected ref, or of a protected ref (`--protect-ref`), that is not a fast-forward (400 before ADR 0085) |
 | 400 | `tag_immutable` | a move of a tag, or a land onto one |
 | 400 | `land_id_reused` | a land id the ref already recorded for another changeset (ADR 0057); `land` carries the record |
 | 400 | `invalid_name` | a ref name the validator refuses |
@@ -1366,6 +1366,20 @@ A lost `POST /v1/refs/{name}` swap is unchanged: `409` with `CasRefResponse`
 messages, so clients that match them keep working; the CLI and the MCP server
 go by `code` when it is present and by the markers otherwise. The constants
 are `leep_core::api::error_code`.
+
+**Policy refusals are 422 (ADR 0085).** The three policy codes above were
+answered with `400` and an error text starting `invalid input: `; they are
+now `422 Unprocessable Entity` with the same `code`, the same marker in the
+text and no `invalid input: ` prefix. Clients that go by `code` or the
+markers are unaffected; ADR 0034 clients map any 4xx other than 401, 403,
+404, 408, 409, 413 and 429 to a user error (exit 1), so older CLIs, the MCP
+server and the git mirror treat the `422` exactly as the `400`. Nothing
+persisted changed.
+
+`PathReview` (`GET .../review-status`) later gained `carried_from`: the
+changeset whose reviewers' verdicts counted on that path because the
+judged changeset makes exactly the change it made there (ADR 0085). Omitted
+when unset; older servers never send it and older clients ignore it.
 
 `ErrorResponse` later gained `land` (`LandRefusal`), set only on a 400
 `land_id_reused` and omitted otherwise: `{"land_id": "<hex>", "changeset":

@@ -58,6 +58,12 @@ content. As with signatures, the policy checks the originals the client
 submitted before any server replay; rebased copies carry no review of their
 own. `GET .../reviews` on a copy with none reports the original's reviews with
 `via` (using `rebase_chain`), which is informational only.
+*Amended by [ADR 0085](0085-review-verdicts-carry-across-identical-rebases.md):*
+a review row is still of one id, but the policy also counts verdicts on a
+changeset that the judged one names in `leep.rebased_from` (or the server's
+rebase link names) when it makes exactly the same change to every path that
+needed a reviewer there (same old and new content and kind, old relative to
+each one's own first parent). Rejects carry too; withdrawals do not.
 
 **Decision per path.** For each path a changeset changes (relative to its first
 parent), and on a merge also each path where it keeps the first parent's
@@ -122,7 +128,7 @@ to any text file.
 each `--require-review REF` (repeatable, `LEEP_REQUIRE_REVIEW`
 comma-separated); both need the tokens file. It judges every changeset the land
 would add, including each unlanded stack entry and merged side branches, and
-fails with `Error::Invalid` (400), `changeset X needs review: path P needs
+fails with `Error::Invalid` (400; `Error::Policy`, 422, since ADR 0085), `changeset X needs review: path P needs
 approval from one of [a, b]` (`needs approval from any reviewer` when unowned,
 `rejected by a, b` for a veto). The text starts with the stable marker
 `NEEDS_REVIEW_MARKER` (`needs review`), which the CLI matches to add a hint.
@@ -164,7 +170,8 @@ only on `leep-core`; the types live in `leep_core::api` and `leep_core::review`.
   Their effect starts when the change that edits them lands.
 - Approvals do not follow rebases. After a land replays a stack the copies are
   new ids; reviewers approve what the client submits, and the copies are
-  informational via `via`.
+  informational via `via`. (Since ADR 0085 they carry to a changeset that
+  reproduces the reviewed changes exactly.)
 - A merge-parent path is trusted because its side is judged separately in the
   same land. If the side's changeset is already in the ref's history, it was
   judged when it landed (or predates the policy).
@@ -204,7 +211,8 @@ only on `leep-core`; the types live in `leep_core::api` and `leep_core::review`.
 - A reviews index so listing is not O(principals), and dismissal of approvals
   when a path is touched again.
 - Per-path signing policy alongside ownership (ADR 0010).
-- Approval carried across server rebases when the replayed diff is identical.
+- Approval carried across server rebases when the replayed diff is identical
+  (done, for client re-commits too, in ADR 0085).
 - Gate `leep-git` import by the same policies.
 - SIGHUP reload of the policy file, as for tokens.
 

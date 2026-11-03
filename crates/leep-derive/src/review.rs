@@ -13,12 +13,16 @@
 //! 5. otherwise the path is pending.
 //!
 //! A changeset is approved when no path is pending or rejected.
+//!
+//! Verdicts on another changeset X can carry to this one (ADR 0085), but only
+//! for paths whose change is identical in both: see [`Repo::carried_paths`].
 
 use std::collections::hash_map::Entry;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use globset::{Glob, GlobBuilder, GlobSet, GlobSetBuilder};
 use leep_core::api::FileInfo;
+use leep_core::changeset::EXTRA_REBASED_FROM;
 use leep_core::review::{Review, Verdict, OWNERS_FILE};
 use leep_core::{ChangesetId, Error, FileChange, FileKind, RepoPath, Result};
 
@@ -28,6 +32,11 @@ use crate::Repo;
 
 /// Largest file (per side) the content rules read; bigger files need a human.
 const MAX_AUTO_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Most changesets [`Repo::carry_candidates`] names. Each costs a few reads,
+/// and a client writes the hints, so the walk is bounded however they nest.
+/// The CLI names up to 64 ids (a resolved stack), so the bound matches it.
+pub const MAX_CARRY_CANDIDATES: usize = 64;
 
 /// A rule that approves a path without a human.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -188,6 +197,20 @@ pub struct PathStatus {
     /// Approvers who count for this path: its owners, or anyone when it has none.
     pub approved_by: Vec<String>,
     pub rejected_by: Vec<String>,
+    /// The changeset whose verdicts this path counted besides its own, when
+    /// one of them is in `approved_by` or `rejected_by`.
+    pub carried_from: Option<ChangesetId>,
+}
+
+/// Verdicts on `from` that count for the paths in `paths` of the changeset
+/// being judged, because it makes exactly the change `from` made there.
+#[derive(Clone, Debug)]
+pub struct Carried {
+    pub from: ChangesetId,
+    pub paths: BTreeSet<RepoPath>,
+    /// Reviews of `from`, by reviewers with no review of their own of the
+    /// changeset being judged.
+    pub reviews: Vec<Review>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -238,15 +261,31 @@ impl Repo {
         reviews: &[Review],
         owners: &mut OwnersResolver<'_>,
     ) -> Result<ChangesetReview> {
+        self.review_changeset_carried(id, rules, reviews, &[], owners)
+            .await
+    }
+
+    /// [`Self::review_changeset`], also counting `carried`'s verdicts on
+    /// their paths. The caller found them with [`Self::carried_paths`],
+    /// nearest first: where several carry to a path, a reviewer's verdict
+    /// comes from the first that has one.
+    pub async fn review_changeset_carried(
+        &self,
+        id: ChangesetId,
+        rules: &ReviewRules,
+        reviews: &[Review],
+        carried: &[Carried],
+        owners: &mut OwnersResolver<'_>,
+    ) -> Result<ChangesetReview> {
         let cs = self.get_changeset(id).await?;
-        let by = |v: Verdict| -> BTreeSet<&str> {
+        let by = |reviews: &'_ [Review], v: Verdict| -> BTreeSet<String> {
             reviews
                 .iter()
                 .filter(|r| r.verdict == v)
-                .map(|r| r.reviewer.as_str())
+                .map(|r| r.reviewer.clone())
                 .collect()
         };
-        let (approvals, rejections) = (by(Verdict::Approve), by(Verdict::Reject));
+        let (approvals, rejections) = (by(reviews, Verdict::Approve), by(reviews, Verdict::Reject));
         let mut bases = SideBases::default();
         let dropped = self
             .dropped_side_changes(&cs.parents, id, &mut bases)
@@ -261,13 +300,38 @@ impl Repo {
         let mut paths = Vec::with_capacity(judged.len());
         for (path, change) in judged {
             let owned = owners.owners_of(path).await?;
-            let relevant = |set: &BTreeSet<&str>| -> Vec<String> {
-                set.iter()
-                    .filter(|r| owned.is_empty() || owned.contains(**r))
-                    .map(|r| r.to_string())
-                    .collect()
-            };
-            let (approved_by, rejected_by) = (relevant(&approvals), relevant(&rejections));
+            let counts = |r: &str| owned.is_empty() || owned.contains(r);
+            let mut approved: BTreeSet<String> =
+                approvals.iter().filter(|r| counts(r)).cloned().collect();
+            let mut rejected: BTreeSet<String> =
+                rejections.iter().filter(|r| counts(r)).cloned().collect();
+            // Carried verdicts count only where the change is the one they
+            // were given on, and never for a dropped side change. Callers
+            // leave out reviewers with a review of `id` itself.
+            let mut carried_from = None;
+            let mut decided = BTreeSet::new();
+            for c in carried
+                .iter()
+                .filter(|c| change.is_some() && c.paths.contains(path))
+            {
+                for r in &c.reviews {
+                    if !decided.insert(r.reviewer.as_str()) || !counts(&r.reviewer) {
+                        continue;
+                    }
+                    let set = match r.verdict {
+                        Verdict::Approve => &mut approved,
+                        Verdict::Reject => &mut rejected,
+                        Verdict::Withdrawn => continue,
+                    };
+                    if set.insert(r.reviewer.clone()) {
+                        carried_from.get_or_insert(c.from);
+                    }
+                }
+            }
+            let (approved_by, rejected_by): (Vec<String>, Vec<String>) = (
+                approved.into_iter().collect(),
+                rejected.into_iter().collect(),
+            );
             let rule = if !rejected_by.is_empty() {
                 PathRule::Rejected
             } else if let Some(change) = change {
@@ -297,9 +361,101 @@ impl Repo {
                 owners: owned.into_iter().collect(),
                 approved_by,
                 rejected_by,
+                carried_from,
             });
         }
         Ok(ChangesetReview { id, paths })
+    }
+
+    /// Changesets `id` says it was made from, nearest first: what its
+    /// `leep.rebased_from` extra names (comma-separated ids), the
+    /// server-recorded rebase origin, and theirs in turn, at most
+    /// [`MAX_CARRY_CANDIDATES`]. Only hints: a client writes the extra, so
+    /// nothing here is trusted, and [`Self::carried_paths`] decides by
+    /// content alone. A changeset without the extra has no candidates (the
+    /// server's copies always carry it), which keeps the common case free.
+    pub async fn carry_candidates(&self, id: ChangesetId) -> Result<Vec<ChangesetId>> {
+        let mut out = Vec::new();
+        let mut seen = HashSet::from([id]);
+        let mut queue = VecDeque::from([id]);
+        while let Some(cur) = queue.pop_front() {
+            let cs = match self.get_changeset(cur).await {
+                Ok(cs) => cs,
+                Err(Error::NotFound(_)) => continue,
+                Err(e) => return Err(e),
+            };
+            let Some(hint) = cs.extra.get(EXTRA_REBASED_FROM) else {
+                continue;
+            };
+            let named = hint
+                .split(',')
+                .take(MAX_CARRY_CANDIDATES)
+                .filter_map(|s| s.trim().parse::<ChangesetId>().ok());
+            let origin = self.rebased_origin(cur).await?;
+            for c in origin.into_iter().chain(named) {
+                if out.len() >= MAX_CARRY_CANDIDATES {
+                    return Ok(out);
+                }
+                if seen.insert(c) {
+                    out.push(c);
+                    queue.push_back(c);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// The paths of `from` that needed a reviewer (neither auto-approved nor
+    /// covered by a merge parent) when `id` makes exactly the same change to
+    /// every one of them: the same old content and kind, relative to each
+    /// one's own first parent, and the same new content and kind. Same old
+    /// and new means the reviewed file is byte for byte what was reviewed
+    /// and the base did not move under it. `None` when any of them differs
+    /// or is missing from `id` (so a reviewed path cannot be carried without
+    /// the others it was approved with), or when `from` needed no reviewer.
+    /// Paths only `id` changes are not included; they are judged on their own.
+    pub async fn carried_paths(
+        &self,
+        from: ChangesetId,
+        id: ChangesetId,
+        rules: &ReviewRules,
+        owners: &mut OwnersResolver<'_>,
+    ) -> Result<Option<BTreeSet<RepoPath>>> {
+        let theirs = self.get_changeset(from).await?;
+        let mine = self.get_changeset(id).await?;
+        // With no reviews every path that needs a human is pending.
+        let judged = self.review_changeset(from, rules, &[], owners).await?;
+        let new_key = |c: &FileChange| match c {
+            FileChange::Modify { content, kind, .. } => Some((*content, *kind)),
+            FileChange::Delete => None,
+        };
+        let mut out = BTreeSet::new();
+        for p in judged.paths.iter().filter(|p| p.rule == PathRule::Pending) {
+            // A dropped side change has no change of its own to compare.
+            let (Some(a), Some(b)) = (theirs.changes.get(&p.path), mine.changes.get(&p.path))
+            else {
+                return Ok(None);
+            };
+            if new_key(a) != new_key(b) {
+                return Ok(None);
+            }
+            let old = |parent: Option<ChangesetId>| async move {
+                Ok::<_, Error>(match parent {
+                    Some(parent) => self
+                        .lookup_file(parent, &p.path)
+                        .await?
+                        .map(|f| (f.content, f.kind)),
+                    None => None,
+                })
+            };
+            if old(theirs.parents.first().copied()).await?
+                != old(mine.parents.first().copied()).await?
+            {
+                return Ok(None);
+            }
+            out.insert(p.path.clone());
+        }
+        Ok((!out.is_empty()).then_some(out))
     }
 
     /// Paths where merge `id` keeps its first parent's version although a

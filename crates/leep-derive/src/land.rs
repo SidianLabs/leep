@@ -581,6 +581,7 @@ fn duplicate(e: &Error) -> Error {
         Error::InvalidPath(p, why) => Error::InvalidPath(p.clone(), why),
         Error::InvalidHash(m) => Error::InvalidHash(m.clone()),
         Error::Invalid(m) => Error::Invalid(m.clone()),
+        Error::Policy(m) => Error::Policy(m.clone()),
         Error::Conflict(m) => Error::Conflict(m.clone()),
         Error::LandIdReused { refusal, requested } => Error::LandIdReused {
             refusal: refusal.clone(),
@@ -2001,7 +2002,7 @@ impl Repo {
                 // `expected` is the current value whenever the swap can win.
                 if let Some(old) = expected.filter(|_| protected) {
                     if !self.is_ancestor(old, new).await? {
-                        return Err(Error::Invalid(format!(
+                        return Err(Error::Policy(format!(
                             "cannot move {name:?} from {old} to {new}: it is protected by a \
                              land policy and {NOT_FORWARD_MARKER}; to undo a change, revert \
                              it and land the revert"
@@ -2316,7 +2317,7 @@ impl Repo {
             .as_ref()
             .is_some_and(|p| p.protects(target_ref))
         {
-            return Err(Error::Invalid(format!(
+            return Err(Error::Policy(format!(
                 "cannot rebase {target_ref:?}: it is protected (--protect-ref) and \
                  {NOT_FORWARD_MARKER}; a ref git leads cannot be protected in Leep, so \
                  protect the branch on GitHub instead"

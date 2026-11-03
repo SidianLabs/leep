@@ -1515,6 +1515,39 @@ mod tests {
         assert!(e.to_json()["error"].get("land").is_none());
     }
 
+    /// Policy refusals moved from 400 to 422 (ADR 0085). This client's
+    /// mapping predates that: any other 4xx is a user error, so they still
+    /// exit 1 and `land`'s hint, keyed on code and marker, still applies.
+    #[test]
+    fn a_policy_422_is_a_user_error_with_its_code() {
+        use leep_core::review::NEEDS_REVIEW_MARKER;
+        let c = "c".repeat(64);
+        let req = LandRequest {
+            changeset: c.parse().unwrap(),
+            target_ref: "main".into(),
+            create: None,
+            land_id: None,
+        };
+        for (status, text, code) in [
+            ("422 Unprocessable Entity", "", r#","code":"needs_review""#),
+            (
+                "400 Bad Request",
+                "invalid input: ",
+                r#","code":"needs_review""#,
+            ),
+            ("422 Unprocessable Entity", "", ""),
+        ] {
+            let body = format!(
+                r#"{{"error":"{text}changeset {c} {NEEDS_REVIEW_MARKER}: path a needs approval from any reviewer"{code}}}"#
+            );
+            let (url, _) = recording_stub(vec![reply(status, "", &body)]);
+            let e = Client::new(&url).land(&req).unwrap_err();
+            assert_eq!(e.kind(), ErrorKind::User, "{status}");
+            assert_eq!(e.exit_code(), 1);
+            assert!(e.is_server(error_code::NEEDS_REVIEW, NEEDS_REVIEW_MARKER));
+        }
+    }
+
     fn indexing_503() -> String {
         reply(
             "503 Service Unavailable",

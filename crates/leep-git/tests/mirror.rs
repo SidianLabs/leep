@@ -252,7 +252,7 @@ impl Leep for Local {
         match self.on(self.repo.cas_ref_checked(name, expected, Some(new), &ctx)) {
             Ok(true) => Ok(Cas::Won),
             Ok(false) => Ok(Cas::Lost(self.get_ref(name))),
-            Err(leep_core::Error::Invalid(m)) => Ok(Cas::Refused(m)),
+            Err(leep_core::Error::Invalid(m) | leep_core::Error::Policy(m)) => Ok(Cas::Refused(m)),
             Err(e) => Err(e.into()),
         }
     }
@@ -290,9 +290,11 @@ impl Leep for Local {
                     .map(|c| c.path.as_str().to_string())
                     .collect(),
             )),
-            Err(leep_core::Error::Invalid(m) | leep_core::Error::NotFound(m)) => {
-                Ok(LandOutcome::Refused(m))
-            }
+            Err(
+                leep_core::Error::Invalid(m)
+                | leep_core::Error::Policy(m)
+                | leep_core::Error::NotFound(m),
+            ) => Ok(LandOutcome::Refused(m)),
             Err(e) => Err(e.into()),
         }
     }
@@ -306,7 +308,7 @@ impl Leep for Local {
         match self.on(self.repo.cas_ref_checked(name, Some(expected), None, &ctx)) {
             Ok(true) => Ok(Cas::Won),
             Ok(false) => Ok(Cas::Lost(self.get_ref(name))),
-            Err(leep_core::Error::Invalid(m)) => Ok(Cas::Refused(m)),
+            Err(leep_core::Error::Invalid(m) | leep_core::Error::Policy(m)) => Ok(Cas::Refused(m)),
             Err(e) => Err(e.into()),
         }
     }
@@ -336,9 +338,11 @@ impl Leep for Local {
                     .collect(),
             )),
             Err(leep_core::Error::Conflict(_)) => Ok(ReplayOutcome::StaleBase),
-            Err(leep_core::Error::Invalid(m) | leep_core::Error::NotFound(m)) => {
-                Ok(ReplayOutcome::Refused(m))
-            }
+            Err(
+                leep_core::Error::Invalid(m)
+                | leep_core::Error::Policy(m)
+                | leep_core::Error::NotFound(m),
+            ) => Ok(ReplayOutcome::Refused(m)),
             Err(e) => Err(e.into()),
         }
     }

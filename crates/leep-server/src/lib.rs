@@ -444,6 +444,9 @@ impl IntoResponse for ApiError {
             | Error::InvalidPath(..)
             | Error::InvalidHash(_)
             | Error::LandIdReused { .. } => StatusCode::BAD_REQUEST,
+            // Well-formed but refused by the ref's rules (ADR 0085). Old
+            // clients treat any other 4xx as 400, by `code` and marker.
+            Error::Policy(_) => StatusCode::UNPROCESSABLE_ENTITY,
             Error::NotFound(_) => StatusCode::NOT_FOUND,
             Error::Conflict(_) => StatusCode::CONFLICT,
             Error::Indexing { .. } | Error::Refused { .. } => StatusCode::SERVICE_UNAVAILABLE,

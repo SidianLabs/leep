@@ -21,10 +21,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use leep_core::api::{PathReview, ReviewEntry, ReviewStatusResponse, ReviewsResponse};
-use leep_core::review::{Review, NEEDS_REVIEW_MARKER};
+use leep_core::review::{Review, Verdict, NEEDS_REVIEW_MARKER};
 use leep_core::{ChangesetId, Error, Result};
 use leep_derive::owners::OwnersResolver;
-use leep_derive::review::{AutoRule, ChangesetReview, PathRule, ReviewRules};
+use leep_derive::review::{AutoRule, Carried, ChangesetReview, PathRule, ReviewRules};
 use leep_derive::{LandPolicy, Repo};
 use serde::Deserialize;
 
@@ -158,6 +158,9 @@ impl ReviewService {
         })
     }
 
+    /// Judge `id` with its own reviews and those carried from the nearest
+    /// changeset it names as its origin whose reviewed paths it reproduces
+    /// exactly (ADR 0085).
     async fn judge(
         &self,
         repo: &Repo,
@@ -165,13 +168,52 @@ impl ReviewService {
         owners: &mut OwnersResolver<'_>,
     ) -> Result<ChangesetReview> {
         let reviews = self.reviews_for(repo, id).await?;
-        repo.review_changeset(id, &self.rules, &reviews, owners)
+        let carried = self.carried(repo, id, &reviews, owners).await?;
+        repo.review_changeset_carried(id, &self.rules, &reviews, &carried, owners)
             .await
     }
 
+    /// The verdicts `id` takes from candidate origins, nearest first. A
+    /// reviewer with any review of `id` itself, a withdrawal included, has
+    /// said what they think of `id`, so only reviewers without one carry; a
+    /// withdrawal on an origin carries nothing. Each candidate counts on its
+    /// own, for the paths of its own that `id` reproduces with all the
+    /// others it needed a reviewer for, so a resolved stack carries every
+    /// entry whose reviewed changes it kept exactly.
+    async fn carried(
+        &self,
+        repo: &Repo,
+        id: ChangesetId,
+        own: &[Review],
+        owners: &mut OwnersResolver<'_>,
+    ) -> Result<Vec<Carried>> {
+        let mut out = Vec::new();
+        let mine: HashSet<&str> = own.iter().map(|r| r.reviewer.as_str()).collect();
+        for from in repo.carry_candidates(id).await? {
+            let reviews: Vec<Review> = self
+                .reviews_for(repo, from)
+                .await?
+                .into_iter()
+                .filter(|r| matches!(r.verdict, Verdict::Approve | Verdict::Reject))
+                .filter(|r| !mine.contains(r.reviewer.as_str()))
+                .collect();
+            if reviews.is_empty() {
+                continue;
+            }
+            if let Some(paths) = repo.carried_paths(from, id, &self.rules, owners).await? {
+                out.push(Carried {
+                    from,
+                    paths,
+                    reviews,
+                });
+            }
+        }
+        Ok(out)
+    }
+
     /// The `GET .../review-status` answer: `id` judged against the current
-    /// head of `target_ref`, with the changeset's own reviews only (a rebased
-    /// copy's original is not consulted, as in the land policy).
+    /// head of `target_ref` as the land policy judges it, with its own
+    /// reviews and any carried from an origin it reproduces (ADR 0085).
     pub async fn status(
         &self,
         repo: &Repo,
@@ -195,6 +237,7 @@ impl ReviewService {
                     owners: p.owners,
                     approved_by: p.approved_by,
                     rejected_by: p.rejected_by,
+                    carried_from: p.carried_from,
                 })
                 .collect(),
         })
@@ -251,7 +294,7 @@ impl LandPolicy for RequireReview {
             let review = self.service.judge(repo, *id, &mut owners).await?;
             if let Some(p) = review.first_blocker() {
                 tracing::info!(%id, target_ref, path = %p.path, "land refused: needs review");
-                return Err(Error::Invalid(blocker_text(*id, p)));
+                return Err(Error::Policy(blocker_text(*id, p)));
             }
         }
         Ok(())

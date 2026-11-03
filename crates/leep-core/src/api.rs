@@ -258,14 +258,14 @@ pub struct LandRefusal {
 /// an absent one and go by the HTTP status. Older servers send no code;
 /// clients then fall back to the status and the `*_MARKER` texts.
 pub mod error_code {
-    /// 400: a land onto a ref whose policy needs review that some changeset
-    /// lacks ([`crate::review::NEEDS_REVIEW_MARKER`]).
+    /// 422 (400 before ADR 0085): a land onto a ref whose policy needs
+    /// review that some changeset lacks ([`crate::review::NEEDS_REVIEW_MARKER`]).
     pub const NEEDS_REVIEW: &str = "needs_review";
-    /// 400: a land onto a ref that only accepts changesets signed by a
-    /// trusted key ([`crate::signature::NOT_SIGNED_MARKER`]).
+    /// 422 (400 before ADR 0085): a land onto a ref that only accepts
+    /// changesets signed by a trusted key ([`crate::signature::NOT_SIGNED_MARKER`]).
     pub const NOT_SIGNED: &str = "not_signed";
-    /// 400: a move of a land-policy-protected ref, or of a protected ref
-    /// (`--protect-ref`), that is not a fast-forward
+    /// 422 (400 before ADR 0085): a move of a land-policy-protected ref, or
+    /// of a protected ref (`--protect-ref`), that is not a fast-forward
     /// ([`crate::refname::NOT_FORWARD_MARKER`]).
     pub const NOT_FORWARD: &str = "not_forward";
     /// 400: a tag move, or a land onto a tag. Tags are created and deleted,
@@ -665,6 +665,11 @@ pub struct PathReview {
     pub approved_by: Vec<String>,
     #[serde(default)]
     pub rejected_by: Vec<String>,
+    /// Set when some of `approved_by` or `rejected_by` reviewed this
+    /// changeset's original rather than this changeset: the path's change is
+    /// identical in both, so their verdict carries (ADR 0085).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub carried_from: Option<ChangesetId>,
 }
 
 /// Whether a changeset could land on `target_ref` now, per path.

@@ -436,11 +436,8 @@ async fn require_signatures_end_to_end() {
     let c = api.commit(&[], "a", "1\n").await;
 
     let r = api.land(c, "main").await;
-    assert_eq!(r.status, StatusCode::BAD_REQUEST);
-    assert_eq!(
-        r.error(),
-        format!("invalid input: changeset {c} {NOT_SIGNED_MARKER}")
-    );
+    assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(r.error(), format!("changeset {c} {NOT_SIGNED_MARKER}"));
     assert_eq!(
         r.json::<ErrorResponse>().code.as_deref(),
         Some("not_signed")
@@ -458,7 +455,7 @@ async fn require_signatures_end_to_end() {
         ..Default::default()
     };
     let r = api.post("/v1/refs/main", &cas(c)).await;
-    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
     assert!(r.error().contains(NOT_SIGNED_MARKER));
     assert!(api.repo.meta().get_ref("main").await.unwrap().is_none());
     assert_eq!(
@@ -479,7 +476,10 @@ async fn require_signatures_end_to_end() {
         api.sign(c, &mallory()).await.status,
         StatusCode::BAD_REQUEST
     );
-    assert_eq!(api.land(c, "main").await.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        api.land(c, "main").await.status,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
 
     assert_eq!(api.sign(c, &alice()).await.status, StatusCode::OK);
     let r = api.land(c, "main").await;
@@ -545,7 +545,7 @@ async fn require_signatures_checks_every_stack_entry_and_rebased_copies_report_v
     let s2 = api.commit(&[s1], "c", "3\n").await;
     api.sign(s2, &alice()).await;
     let r = api.land(s2, "main").await;
-    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
     assert!(r
         .error()
         .contains(&format!("changeset {s1} {NOT_SIGNED_MARKER}")));
@@ -605,7 +605,10 @@ async fn a_forged_rebased_from_key_neither_lands_nor_reports_via() {
         .await
         .json::<CreateChangesetResponse>()
         .id;
-    assert_eq!(api.land(id, "main").await.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        api.land(id, "main").await.status,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
     let list = api.signatures(id).await;
     assert!(list.signatures.is_empty() && list.via.is_none());
 }

@@ -68,6 +68,7 @@ change with a regression test.
 | S-21 | Auth | Low | Tokens had no time bound, so a token made for a short-lived agent stayed valid until removed by hand | Fixed 2026-10-21, `expires`, ADR 0007 |
 | S-23 | Review | High | A merge that kept its first parent's version dropped a side parent's change without review; an empty merge with an old first parent could rewind a reviewed ref | Fixed 2026-10-28, ADR 0011 |
 | S-22 | Review | Medium | Every write token was a reviewer, so one agent could approve another's change, or its own on unowned paths | Fixed 2026-10-21, `"review": false`, ADR 0011 |
+| S-24 | Review | Info | Verdicts carried to a re-committed changeset (ADR 0085) must not follow a forged `leep.rebased_from`, a moved base or a dropped path; the clean-replay trust of ADR 0011 remains | Designed in 2026-11-03, ADR 0085 |
 
 ### S-01: merge-parent laundering (High, fixed)
 
@@ -104,6 +105,41 @@ version of a file `main` had fixed.
 or `merge_parent` cover, so an owner must approve. Tests:
 `a_merge_that_drops_a_sides_change_needs_review` (derive) and
 `a_merge_with_an_old_first_parent_cannot_rewind_main_without_review` (server).
+
+### S-24: carried review verdicts (Info, designed in 2026-11-03)
+
+ADR 0085 lets a reviewer's verdict on X count for a changeset Y that names X
+in `leep.rebased_from`, so a resolved land conflict keeps its approval. The
+extra is written by the client, so the risk is a laundered approval: name an
+approved X and land something else. The claim only picks which changesets to
+compare; what decides is content. Every path X needed a reviewer for (not
+auto-approved, not a merge-parent cover; `OWNERS` files always) must be among
+Y's changes with the same old and new content and kind, old taken from each
+one's own first parent, or nothing carries. That rules out a different
+change under a forged hint, a reviewed file whose base moved (Y's change
+would undo or merge with what landed since), and a Y that keeps one reviewed
+file and drops the one it was approved with. Rejects carry the same way, so
+re-committing does not escape a veto; a reviewer's own verdict on Y, a
+withdrawal included, wins over a carried one. Several candidates (a
+resolved stack) are each checked on their own, so combining them carries no
+verdict to a path its own candidate did not reproduce whole. The hint walk is bounded (64
+candidates), ids that do not parse or do not exist are skipped, and a hint
+naming Y itself is ignored. Tests in `crates/leep-server/tests/reviews.rs`:
+`a_forged_hint_to_an_approved_changeset_gains_nothing`,
+`a_base_that_moved_under_a_reviewed_path_stays_pending`,
+`dropping_a_reviewed_path_carries_nothing`,
+`one_changed_byte_in_an_owned_file_stays_pending`,
+`a_reject_carries_and_the_reviewers_own_verdict_wins`,
+`a_withdrawal_carries_nothing_on_either_side`.
+
+*Remaining trust, unchanged.* An identical reviewed file on a moved base can
+behave differently if *other* files changed under it. ADR 0011 already
+accepts more than that for a clean server replay: the land policy judges the
+submitted original, so its approval covers the copy even when the replay
+three-way merged an owned file the original changed, a file content nobody
+reviewed. Carrying requires the reviewed files to be untouched, so it is
+strictly narrower. A policy that reviews the final tree would close both;
+none exists.
 
 ### S-02: checkout writes outside the working copy (High, fixed)
 

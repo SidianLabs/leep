@@ -11,6 +11,7 @@ use bytes::Bytes;
 use ed25519_dalek::{Signer, SigningKey};
 use http_body_util::BodyExt;
 use leep_core::api::*;
+use leep_core::changeset::EXTRA_REBASED_FROM;
 use leep_core::memory::{MemoryBlobStore, MemoryMetaStore};
 use leep_core::review::{Verdict, NEEDS_REVIEW_MARKER};
 use leep_core::signature::{format_public_key, signing_message, NOT_SIGNED_MARKER};
@@ -157,6 +158,17 @@ impl Api {
 
     /// Store a changeset directly: `Some` writes a file, `None` deletes it.
     async fn commit(&self, parents: &[ChangesetId], files: &[(&str, Option<&str>)]) -> ChangesetId {
+        self.commit_from(parents, files, None).await
+    }
+
+    /// [`Self::commit`] with `leep.rebased_from` set to `from`, as a client
+    /// stamps a commit that resolves a land's conflicts.
+    async fn commit_from(
+        &self,
+        parents: &[ChangesetId],
+        files: &[(&str, Option<&str>)],
+        from: Option<&str>,
+    ) -> ChangesetId {
         let mut changes = BTreeMap::new();
         for (path, text) in files {
             let change = match text {
@@ -181,7 +193,9 @@ impl Api {
                 timestamp: 1,
                 message: "m".into(),
                 changes,
-                extra: BTreeMap::new(),
+                extra: from
+                    .map(|f| BTreeMap::from([(EXTRA_REBASED_FROM.to_string(), f.to_string())]))
+                    .unwrap_or_default(),
             })
             .await
             .unwrap()
@@ -267,7 +281,7 @@ impl Api {
 }
 
 fn needs_review(id: ChangesetId, path: &str, why: &str) -> String {
-    format!("invalid input: changeset {id} {NEEDS_REVIEW_MARKER}: path {path} {why}")
+    format!("changeset {id} {NEEDS_REVIEW_MARKER}: path {path} {why}")
 }
 
 fn rules(s: &ReviewStatusResponse) -> Vec<(&str, &str)> {
@@ -497,7 +511,7 @@ async fn owners_are_read_from_the_head_not_the_change() {
         .await;
     api.approve(c, "mallory").await;
     let r = api.land(c, "mallory").await;
-    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(
         r.error(),
         needs_review(c, "a/sub/OWNERS", "needs approval from one of [alice]")
@@ -611,7 +625,10 @@ async fn paths_without_owners_take_any_single_approval() {
     assert_eq!(api.land(c, "alice").await.status, StatusCode::OK);
     // Still no OWNERS file anywhere.
     let d = api.commit(&[c], &[("a", Some("2\n"))]).await;
-    assert_eq!(api.land(d, "alice").await.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        api.land(d, "alice").await.status,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
     api.approve(d, "carol").await;
     assert_eq!(api.land(d, "alice").await.status, StatusCode::OK);
 }
@@ -751,7 +768,10 @@ async fn comment_only_and_docs_changes_land_without_a_review() {
             )],
         )
         .await;
-    assert_eq!(api.land(e, "mallory").await.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        api.land(e, "mallory").await.status,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
     let e2 = api
         .commit(
             &[c],
@@ -763,7 +783,7 @@ async fn comment_only_and_docs_changes_land_without_a_review() {
         .await;
     assert_eq!(
         api.land(e2, "mallory").await.status,
-        StatusCode::BAD_REQUEST
+        StatusCode::UNPROCESSABLE_ENTITY
     );
 }
 
@@ -852,15 +872,17 @@ async fn stacks_need_every_entry_approved_and_rebased_copies_report_via() {
     assert!(rebased);
 
     // The rebased copy has no review of its own; the listing says whose it
-    // borrows. The land policy never accepts a copy on that basis.
+    // borrows. Its status counts them because it makes exactly `s2`'s
+    // change (ADR 0085), not because the server says it is a copy.
     let list = api.reviews(landed).await;
     assert_eq!(list.via, Some(s2));
     assert_eq!(list.reviews.len(), 1);
     assert_eq!(list.reviews[0].reviewer, "alice");
     assert_eq!(api.reviews(s2).await.via, None);
     let copy = api.status(landed).await;
-    assert!(!copy.approved);
-    assert_eq!(copy.paths[0].rule, "pending");
+    assert!(copy.approved);
+    assert_eq!(copy.paths[0].rule, "owner");
+    assert_eq!(copy.paths[0].carried_from, Some(s2));
 }
 
 #[tokio::test]
@@ -932,7 +954,7 @@ async fn a_merge_cannot_launder_an_old_version_back_without_review() {
         .await;
     assert_eq!(rules(&api.status(undo).await), [("auth.rs", "pending")]);
     let r = api.land(undo, "mallory").await;
-    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(
         r.error(),
         needs_review(undo, "auth.rs", "needs approval from one of [alice]")
@@ -956,7 +978,7 @@ async fn a_merge_cannot_launder_an_old_version_back_without_review() {
     );
     assert_eq!(
         api.land(undo, "mallory").await.status,
-        StatusCode::BAD_REQUEST
+        StatusCode::UNPROCESSABLE_ENTITY
     );
     assert_eq!(api.main_ref().await, Some(fix));
 }
@@ -977,7 +999,7 @@ async fn a_merge_with_an_old_first_parent_cannot_rewind_main_without_review() {
     let rewind = api.commit(&[old, fix], &[]).await;
     assert_eq!(rules(&api.status(rewind).await), [("auth.rs", "pending")]);
     let r = api.land(rewind, "mallory").await;
-    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(
         r.error(),
         needs_review(rewind, "auth.rs", "needs approval from one of [alice]")
@@ -993,7 +1015,7 @@ async fn a_merge_with_an_old_first_parent_cannot_rewind_main_without_review() {
             },
         )
         .await;
-    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.error());
+    assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", r.error());
     assert_eq!(api.main_ref().await, Some(fix));
 
     api.approve(rewind, "alice").await;
@@ -1023,7 +1045,7 @@ async fn raw_ref_cas_cannot_rewind_a_protected_ref() {
     // Moving back is refused, by anyone.
     for who in ["mallory", "alice"] {
         let r = api.post("/v1/refs/main", who, &cas(fix, old)).await;
-        assert_eq!(r.status, StatusCode::BAD_REQUEST);
+        assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(
             r.json::<ErrorResponse>().code.as_deref(),
             Some("not_forward")
@@ -1062,7 +1084,7 @@ async fn raw_ref_cas_cannot_skip_review() {
         ..Default::default()
     };
     let r = api.post("/v1/refs/main", "bob", &cas(c)).await;
-    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
     assert!(r.error().contains(NEEDS_REVIEW_MARKER), "{}", r.error());
     assert_eq!(
         r.json::<ErrorResponse>().code.as_deref(),
@@ -1076,7 +1098,7 @@ async fn raw_ref_cas_cannot_skip_review() {
     );
     assert_eq!(
         api.land(c, "bob").await.status,
-        StatusCode::BAD_REQUEST,
+        StatusCode::UNPROCESSABLE_ENTITY,
         "land is gated too"
     );
 
@@ -1114,10 +1136,7 @@ async fn review_and_signature_policies_both_apply() {
 
     // Neither: the signature policy was set first and speaks first.
     let r = api.land(c, "bob").await;
-    assert_eq!(
-        r.error(),
-        format!("invalid input: changeset {c} {NOT_SIGNED_MARKER}")
-    );
+    assert_eq!(r.error(), format!("changeset {c} {NOT_SIGNED_MARKER}"));
 
     // Signed but not reviewed.
     let sig = AddSignatureRequest {
@@ -1143,10 +1162,7 @@ async fn review_and_signature_policies_both_apply() {
     let d = api.commit(&[], &[("b", Some("2\n"))]).await;
     api.approve(d, "alice").await;
     let r = api.land(d, "bob").await;
-    assert_eq!(
-        r.error(),
-        format!("invalid input: changeset {d} {NOT_SIGNED_MARKER}")
-    );
+    assert_eq!(r.error(), format!("changeset {d} {NOT_SIGNED_MARKER}"));
     assert_eq!(api.main_ref().await, None);
 
     api.approve(c, "alice").await;
@@ -1302,7 +1318,7 @@ async fn tokens_without_review_cannot_review_and_their_old_reviews_stop_counting
     assert!(listed.reviews.is_empty(), "{:?}", listed.reviews);
     assert!(!after.status(c).await.approved);
     let r = after.land(c, "agent").await;
-    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
     assert!(r.error().contains(NEEDS_REVIEW_MARKER), "{}", r.error());
     // It can still do everything else a write token does, and a reviewer's
     // approval lets its change land.
@@ -1530,4 +1546,337 @@ async fn rows_written_by_the_old_encoder_still_decode_and_count() {
         (None, None)
     );
     assert!(api.status(c).await.approved);
+}
+
+/// The setting of ADR 0085: `src/a.rs` (owned by alice) and the changelog
+/// change together; main's head then changes only the changelog, so the
+/// server's replay of `x` conflicts there and the client commits a
+/// resolution `y` on the new head, naming `x` as where it came from.
+struct Carry {
+    api: Api,
+    base: ChangesetId,
+    head: ChangesetId,
+    x: ChangesetId,
+}
+
+const A0: &str = "fn a() {}\n";
+const A1: &str = "fn a() { b() }\n";
+
+async fn carry_setup() -> Carry {
+    let api = Api::with(POLICY_AUTO);
+    let base = api
+        .seed_main(&[
+            ("OWNERS", Some("alice\n")),
+            ("src/a.rs", Some(A0)),
+            ("CHANGELOG.md", Some("# log\n")),
+        ])
+        .await;
+    let x = api
+        .commit(
+            &[base],
+            &[
+                ("src/a.rs", Some(A1)),
+                ("CHANGELOG.md", Some("# log\n- x\n")),
+            ],
+        )
+        .await;
+    let other = api
+        .commit(&[base], &[("CHANGELOG.md", Some("# log\n- other\n"))])
+        .await;
+    assert_eq!(api.land(other, "bob").await.status, StatusCode::OK);
+    Carry {
+        head: api.main_ref().await.unwrap(),
+        api,
+        base,
+        x,
+    }
+}
+
+impl Carry {
+    /// `x`'s change of `src/a.rs` made again on the head, with `a` as its
+    /// content and the changelog merged.
+    async fn resolve(&self, a: &str, from: Option<ChangesetId>) -> ChangesetId {
+        let from = from.map(|f| f.to_string());
+        self.api
+            .commit_from(
+                &[self.head],
+                &[
+                    ("src/a.rs", Some(a)),
+                    ("CHANGELOG.md", Some("# log\n- other\n- x\n")),
+                ],
+                from.as_deref(),
+            )
+            .await
+    }
+}
+
+#[tokio::test]
+async fn an_approval_carries_to_a_changelog_only_conflict_resolution() {
+    let c = carry_setup().await;
+    let api = &c.api;
+    api.approve(c.x, "alice").await;
+    let r = api.land(c.x, "bob").await;
+    assert!(
+        matches!(r.json::<LandResponse>(), LandResponse::Conflicts { .. }),
+        "{}",
+        String::from_utf8_lossy(&r.body)
+    );
+
+    // Without the hint nothing names `x`: a fresh changeset, judged alone.
+    let bare = c.resolve(A1, None).await;
+    assert!(!api.status(bare).await.approved);
+
+    let y = c.resolve(A1, Some(c.x)).await;
+    let s = api.status(y).await;
+    assert!(s.approved, "{s:?}");
+    assert_eq!(
+        rules(&s),
+        [("CHANGELOG.md", "auto:docs_only"), ("src/a.rs", "owner")]
+    );
+    assert_eq!(s.paths[1].approved_by, ["alice"]);
+    assert_eq!(s.paths[1].carried_from, Some(c.x));
+    assert_eq!(s.paths[0].carried_from, None);
+    // The JSON names it; a path without one leaves the field out.
+    let raw: serde_json::Value = api
+        .get(&format!("/v1/changesets/{y}/review-status"))
+        .await
+        .json();
+    assert_eq!(raw["paths"][1]["carried_from"], c.x.to_string());
+    assert!(raw["paths"][0].get("carried_from").is_none());
+    assert_eq!(api.land(y, "bob").await.status, StatusCode::OK);
+    assert_eq!(api.main_ref().await, Some(y));
+}
+
+#[tokio::test]
+async fn a_hint_through_an_unreviewed_resolution_still_reaches_the_approval() {
+    // Resolved twice: `y2` names `y1`, which names the approved `x`.
+    let c = carry_setup().await;
+    c.api.approve(c.x, "alice").await;
+    let y1 = c.resolve(A1, Some(c.x)).await;
+    let y2 = c
+        .api
+        .commit_from(&[c.head], &[("src/a.rs", Some(A1))], Some(&y1.to_string()))
+        .await;
+    let s = c.api.status(y2).await;
+    assert!(s.approved, "{s:?}");
+    assert_eq!(s.paths[0].carried_from, Some(c.x));
+}
+
+#[tokio::test]
+async fn one_changed_byte_in_an_owned_file_stays_pending() {
+    let c = carry_setup().await;
+    c.api.approve(c.x, "alice").await;
+    let y = c.resolve("fn a() { c() }\n", Some(c.x)).await;
+    let s = c.api.status(y).await;
+    assert!(!s.approved);
+    assert_eq!(rules(&s)[1], ("src/a.rs", "pending"));
+    assert_eq!(s.paths[1].carried_from, None);
+    let r = c.api.land(y, "bob").await;
+    assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        r.error(),
+        needs_review(y, "src/a.rs", "needs approval from one of [alice]")
+    );
+}
+
+#[tokio::test]
+async fn a_forged_hint_to_an_approved_changeset_gains_nothing() {
+    // `y` names the approved `x` but makes another change, on `x`'s own base:
+    // nothing about the claim is checked, only the content.
+    let c = carry_setup().await;
+    c.api.approve(c.x, "alice").await;
+    let evil = c
+        .api
+        .commit_from(
+            &[c.base],
+            &[
+                ("src/a.rs", Some("fn a() { evil() }\n")),
+                ("CHANGELOG.md", Some("# log\n- x\n")),
+            ],
+            Some(&c.x.to_string()),
+        )
+        .await;
+    let s = c.api.status(evil).await;
+    assert!(!s.approved);
+    assert_eq!(rules(&s)[1], ("src/a.rs", "pending"));
+    // Nor does naming it among junk, itself, or ids that do not exist.
+    let junk = format!(
+        "nope,{},{evil},{}",
+        ChangesetId(Hash::of_blob(b"missing")),
+        c.x
+    );
+    let again = c
+        .api
+        .commit_from(
+            &[c.base],
+            &[("src/a.rs", Some("fn a() { evil() }\n"))],
+            Some(&junk),
+        )
+        .await;
+    assert!(!c.api.status(again).await.approved);
+    let r = c.api.land(again, "bob").await;
+    assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(c.api.main_ref().await, Some(c.head));
+}
+
+#[tokio::test]
+async fn dropping_a_reviewed_path_carries_nothing() {
+    let api = Api::with(POLICY);
+    let base = api
+        .seed_main(&[
+            ("OWNERS", Some("alice\n")),
+            ("a", Some("1\n")),
+            ("b", Some("1\n")),
+        ])
+        .await;
+    // The fix to `a` was approved together with the check in `b`.
+    let x = api
+        .commit(&[base], &[("a", Some("2\n")), ("b", Some("2\n"))])
+        .await;
+    api.approve(x, "alice").await;
+    let y = api
+        .commit_from(&[base], &[("a", Some("2\n"))], Some(&x.to_string()))
+        .await;
+    let s = api.status(y).await;
+    assert!(!s.approved);
+    assert_eq!(rules(&s), [("a", "pending")]);
+    // Adding a path is fine: it is judged on its own.
+    let z = api
+        .commit_from(
+            &[base],
+            &[("a", Some("2\n")), ("b", Some("2\n")), ("c", Some("new\n"))],
+            Some(&x.to_string()),
+        )
+        .await;
+    let s = api.status(z).await;
+    assert_eq!(
+        rules(&s),
+        [("a", "owner"), ("b", "owner"), ("c", "pending")]
+    );
+    assert_eq!(s.paths[2].approved_by, Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn a_base_that_moved_under_a_reviewed_path_stays_pending() {
+    // `x` changed `a` from 1 to 2; main then changed it from 1 to 3. A `y`
+    // ending at 2 on the new head has the same new content, but its change
+    // is 3 -> 2 (it undoes main's): not what alice approved.
+    let api = Api::with(POLICY);
+    let base = api
+        .seed_main(&[("OWNERS", Some("alice\n")), ("a", Some("1\n"))])
+        .await;
+    let x = api.commit(&[base], &[("a", Some("2\n"))]).await;
+    api.approve(x, "alice").await;
+    let m = api.commit(&[base], &[("a", Some("3\n"))]).await;
+    api.approve(m, "alice").await;
+    assert_eq!(api.land(m, "bob").await.status, StatusCode::OK);
+    let y = api
+        .commit_from(&[m], &[("a", Some("2\n"))], Some(&x.to_string()))
+        .await;
+    let s = api.status(y).await;
+    assert!(!s.approved);
+    assert_eq!(rules(&s), [("a", "pending")]);
+}
+
+#[tokio::test]
+async fn a_reject_carries_and_the_reviewers_own_verdict_wins() {
+    let c = carry_setup().await;
+    assert_eq!(
+        c.api.review(c.x, "alice", Verdict::Reject).await.status,
+        StatusCode::OK
+    );
+    let y = c.resolve(A1, Some(c.x)).await;
+    let s = c.api.status(y).await;
+    assert_eq!(rules(&s)[1], ("src/a.rs", "rejected"));
+    assert_eq!(s.paths[1].rejected_by, ["alice"]);
+    assert_eq!(s.paths[1].carried_from, Some(c.x));
+    let r = c.api.land(y, "bob").await;
+    assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(r.error().ends_with("rejected by alice"), "{}", r.error());
+    // Alice looks at `y` itself: her verdict on it replaces the carried one.
+    c.api.approve(y, "alice").await;
+    let s = c.api.status(y).await;
+    assert!(s.approved);
+    assert_eq!(s.paths[1].carried_from, None);
+}
+
+#[tokio::test]
+async fn a_withdrawal_carries_nothing_on_either_side() {
+    let c = carry_setup().await;
+    c.api.approve(c.x, "alice").await;
+    c.api.review(c.x, "alice", Verdict::Withdrawn).await;
+    let y = c.resolve(A1, Some(c.x)).await;
+    assert!(!c.api.status(y).await.approved);
+
+    // An approval of `x` does not outvote alice's withdrawal on `y` itself.
+    c.api.approve(c.x, "alice").await;
+    assert!(c.api.status(y).await.approved);
+    c.api.review(y, "alice", Verdict::Withdrawn).await;
+    let s = c.api.status(y).await;
+    assert!(!s.approved);
+    assert_eq!(rules(&s)[1], ("src/a.rs", "pending"));
+}
+
+#[tokio::test]
+async fn a_policy_refusal_is_422_with_its_code_and_no_invalid_input_prefix() {
+    let api = Api::with(POLICY);
+    let c = api.commit(&[], &[("a", Some("1\n"))]).await;
+    let r = api.land(c, "bob").await;
+    assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
+    let e: ErrorResponse = r.json();
+    assert_eq!(e.code.as_deref(), Some("needs_review"));
+    assert_eq!(
+        e.error,
+        needs_review(c, "a", "needs approval from any reviewer")
+    );
+    // Bad input is still 400, whatever is wrong with it.
+    let bob = Some(token("bob"));
+    for body in [&b"nope"[..], b"{}"] {
+        let r = api
+            .call(Method::POST, "/v1/land", bob.as_deref(), body.to_vec())
+            .await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST);
+        assert_eq!(r.json::<ErrorResponse>().code.as_deref(), Some("invalid"));
+    }
+}
+
+#[tokio::test]
+async fn a_resolved_stack_carries_each_entry_it_kept_exactly() {
+    // The CLI names the stack newest first. `x1` and `x2` were approved one
+    // by one; `y` makes both changes at once on a moved head.
+    let api = Api::with(POLICY);
+    let base = api
+        .seed_main(&[
+            ("OWNERS", Some("alice\n")),
+            ("a", Some("1\n")),
+            ("b", Some("1\n")),
+        ])
+        .await;
+    let x1 = api.commit(&[base], &[("a", Some("2\n"))]).await;
+    let x2 = api.commit(&[x1], &[("b", Some("2\n"))]).await;
+    api.approve(x1, "alice").await;
+    api.approve(x2, "alice").await;
+    let m = api.commit(&[base], &[("c", Some("m\n"))]).await;
+    api.approve(m, "alice").await;
+    assert_eq!(api.land(m, "bob").await.status, StatusCode::OK);
+    let hint = format!("{x2},{x1}");
+    let y = api
+        .commit_from(&[m], &[("a", Some("2\n")), ("b", Some("2\n"))], Some(&hint))
+        .await;
+    let s = api.status(y).await;
+    assert!(s.approved, "{s:?}");
+    assert_eq!(s.paths[0].carried_from, Some(x1));
+    assert_eq!(s.paths[1].carried_from, Some(x2));
+    // An entry whose change the resolution altered carries nothing; the
+    // other still does.
+    let z = api
+        .commit_from(&[m], &[("a", Some("2\n")), ("b", Some("3\n"))], Some(&hint))
+        .await;
+    let s = api.status(z).await;
+    assert_eq!(rules(&s), [("a", "owner"), ("b", "pending")]);
+    assert_eq!(
+        api.land(z, "bob").await.status,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    assert_eq!(api.land(y, "bob").await.status, StatusCode::OK);
 }

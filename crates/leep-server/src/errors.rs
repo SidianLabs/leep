@@ -56,6 +56,12 @@ pub(crate) fn code_of(e: &Error) -> &'static str {
                 error_code::INVALID
             }
         }
+        // Every policy refusal carries one of these markers; a new policy
+        // without one still has a code.
+        Error::Policy(m) if m.contains(NEEDS_REVIEW_MARKER) => error_code::NEEDS_REVIEW,
+        Error::Policy(m) if m.contains(NOT_SIGNED_MARKER) => error_code::NOT_SIGNED,
+        Error::Policy(m) if m.contains(NOT_FORWARD_MARKER) => error_code::NOT_FORWARD,
+        Error::Policy(_) => error_code::INVALID,
         Error::LandIdReused { .. } => error_code::LAND_ID_REUSED,
         Error::InvalidPath(..) | Error::InvalidHash(_) => error_code::INVALID,
         Error::NotFound(m) if m.contains(MISSING_REF_MARKER) => error_code::REF_MISSING,

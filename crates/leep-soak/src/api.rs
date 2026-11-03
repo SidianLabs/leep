@@ -66,7 +66,8 @@ pub enum Landed {
         clean: bool,
     },
     Conflicts,
-    /// A policy refusal (400): the message names what is missing.
+    /// A policy refusal (422, or 400 from an older server): the message names
+    /// what is missing.
     Rejected(String),
 }
 
@@ -424,7 +425,7 @@ impl Api {
                     clean = false;
                     self.pause(Duration::from_millis(100)).await?;
                 }
-                400 => return Ok(Landed::Rejected(r.text())),
+                400 | 422 => return Ok(Landed::Rejected(r.text())),
                 _ => {
                     self.want("land", "/v1/land", r, &[200])?;
                 }

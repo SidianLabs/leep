@@ -2080,7 +2080,7 @@ mod land_policy {
                 .cas_ref_checked("main", Some(b), Some(to), &cas_ctx())
                 .await
             {
-                Err(Error::Invalid(m)) => {
+                Err(Error::Policy(m)) => {
                     assert!(m.contains(leep_core::refname::NOT_FORWARD_MARKER), "{m}")
                 }
                 other => panic!("{other:?}"),
@@ -2271,6 +2271,7 @@ mod land_policy {
 }
 
 mod review {
+    use std::collections::BTreeSet;
     use std::sync::Mutex;
 
     use async_trait::async_trait;
@@ -2957,6 +2958,145 @@ mod review {
         assert!(!PolicySet::new(vec![plain.clone()]).depends_on_head());
         assert!(PolicySet::new(vec![plain, Arc::new(Head)]).depends_on_head());
         assert!(!PolicySet::new(vec![]).applies_to("main"));
+    }
+
+    /// A changeset whose `leep.rebased_from` is `from`.
+    async fn hinted(
+        r: &Repo,
+        parents: &[ChangesetId],
+        files: &[(&str, Option<&str>)],
+        from: &str,
+    ) -> ChangesetId {
+        let mut changes = BTreeMap::new();
+        for (p, c) in files {
+            let ch = match c {
+                Some(t) => modify(r, t.as_bytes()).await,
+                None => FileChange::Delete,
+            };
+            changes.insert(rp(p), ch);
+        }
+        let mut cs = changeset(parents, changes, "hinted");
+        cs.extra
+            .insert(leep_core::changeset::EXTRA_REBASED_FROM.into(), from.into());
+        r.create_changeset(cs).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn carry_candidates_follow_hints_bounded_and_cycle_safe() {
+        let r = repo();
+        let plain = commit(&r, &[], &[("a", Some("1\n"))], "plain").await;
+        assert!(r.carry_candidates(plain).await.unwrap().is_empty());
+        // A chain longer than the bound, each naming the one before, plus
+        // junk and a self-reference at the top.
+        let mut chain = vec![plain];
+        for i in 0..crate::review::MAX_CARRY_CANDIDATES + 4 {
+            let prev = *chain.last().unwrap();
+            let body = format!("{i}\n");
+            let next = hinted(&r, &[], &[("a", Some(&body))], &prev.to_string()).await;
+            chain.push(next);
+        }
+        let top = *chain.last().unwrap();
+        let junk = format!(
+            "x, {top} ,{},{}",
+            ChangesetId(Hash::of_blob(b"gone")),
+            chain[1]
+        );
+        let tip = hinted(&r, &[], &[("a", Some("t\n"))], &junk).await;
+        let got = r.carry_candidates(tip).await.unwrap();
+        assert_eq!(got.len(), crate::review::MAX_CARRY_CANDIDATES);
+        // Nearest first: what `tip` names, in order, then their hints.
+        assert_eq!(
+            got[..3],
+            [top, ChangesetId(Hash::of_blob(b"gone")), chain[1]]
+        );
+        assert!(!got.contains(&tip));
+        assert_eq!(got[3], chain[chain.len() - 2]);
+    }
+
+    #[tokio::test]
+    async fn carried_paths_need_every_reviewed_change_identical() {
+        let r = repo();
+        let docs = ReviewRules::new([AutoRule::DocsOnly], &["**/*.md".into()]).unwrap();
+        let base = commit(
+            &r,
+            &[],
+            &[
+                ("OWNERS", Some("root\n")),
+                ("a.rs", Some("1\n")),
+                ("b.rs", Some("1\n")),
+                ("N.md", Some("n\n")),
+            ],
+            "base",
+        )
+        .await;
+        let x = commit(
+            &r,
+            &[base],
+            &[("a.rs", Some("2\n")), ("N.md", Some("x\n"))],
+            "x",
+        )
+        .await;
+        let moved = commit(
+            &r,
+            &[base],
+            &[("N.md", Some("m\n")), ("b.rs", Some("m\n"))],
+            "m",
+        )
+        .await;
+        let mut o = OwnersResolver::new(&r, Some(moved)).await.unwrap();
+        let carried = |y| {
+            let r = r.clone();
+            let docs = docs.clone();
+            async move {
+                let mut o = OwnersResolver::new(&r, Some(moved)).await.unwrap();
+                r.carried_paths(x, y, &docs, &mut o).await.unwrap()
+            }
+        };
+        // The docs path is auto in `x`, so `y` may change it differently,
+        // and add a path of its own.
+        let y = commit(
+            &r,
+            &[moved],
+            &[
+                ("a.rs", Some("2\n")),
+                ("N.md", Some("m\nx\n")),
+                ("c.rs", Some("c\n")),
+            ],
+            "y",
+        )
+        .await;
+        assert_eq!(carried(y).await, Some(BTreeSet::from([rp("a.rs")])));
+        // One byte, a missing reviewed path, a kind change: nothing.
+        let byte = commit(&r, &[moved], &[("a.rs", Some("3\n"))], "byte").await;
+        assert_eq!(carried(byte).await, None);
+        let dropped = commit(&r, &[moved], &[("N.md", Some("x\n"))], "dropped").await;
+        assert_eq!(carried(dropped).await, None);
+        let mut exec = BTreeMap::new();
+        exec.insert(
+            rp("a.rs"),
+            FileChange::Modify {
+                content: r.blobs().put(Bytes::from_static(b"2\n")).await.unwrap(),
+                kind: FileKind::Executable,
+                size: 2,
+            },
+        );
+        let exec = r
+            .create_changeset(changeset(&[moved], exec, "exec"))
+            .await
+            .unwrap();
+        assert_eq!(carried(exec).await, None);
+        // The same new content on a base where the file moved: nothing.
+        let on_b = commit(&r, &[base], &[("a.rs", Some("5\n"))], "a moved").await;
+        let rebased = commit(&r, &[on_b], &[("a.rs", Some("2\n"))], "rebased").await;
+        assert_eq!(carried(rebased).await, None);
+        // A `x` that needed no reviewer carries nothing.
+        let docs_only = commit(&r, &[base], &[("N.md", Some("d\n"))], "d").await;
+        assert_eq!(
+            r.carried_paths(docs_only, docs_only, &docs, &mut o)
+                .await
+                .unwrap(),
+            None
+        );
     }
 }
 

@@ -49,7 +49,7 @@ pub trait LandPolicy: Send + Sync + 'static {
     /// Called before `land` moves `target_ref`, which is at `head`.
     /// `new_history` lists the changesets the ref would gain that the caller
     /// submitted (never the server-made rebased copies), nearest to the tip
-    /// first. Return an error (normally `Error::Invalid`) to refuse the land.
+    /// first. Return an error (normally `Error::Policy`) to refuse the land.
     async fn check_land(
         &self,
         repo: &Repo,
