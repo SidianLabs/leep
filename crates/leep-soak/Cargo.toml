@@ -23,6 +23,10 @@ path = "src/swarm.rs"
 name = "leep-history-gen"
 path = "src/history_gen.rs"
 
+[[bin]]
+name = "leep-perf-compare"
+path = "src/perf_compare.rs"
+
 [dependencies]
 leep-core.workspace = true
 leep-derive.workspace = true

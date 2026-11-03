@@ -56,6 +56,29 @@ struct Args {
     /// Hashes per missing-blobs request; 0 sends them all in one.
     #[arg(long, default_value_t = 0)]
     missing_chunk: usize,
+    /// Write one JSON row per agent count here as well.
+    #[arg(long)]
+    json: Option<std::path::PathBuf>,
+}
+
+/// One agent count's results, for `--json`.
+#[derive(serde::Serialize)]
+struct Row {
+    servers: usize,
+    agents: usize,
+    lands: u64,
+    lands_per_s: f64,
+    p50_ms: f64,
+    p99_ms: f64,
+    create_p99_ms: f64,
+    retried_409: u64,
+    cas_losses: f64,
+    batch_mean: Option<f64>,
+    stalled_agents: usize,
+    /// `leep_meta_statements_total` per land answered inside the window,
+    /// over all traffic and on the land pool (ADR 0081).
+    statements_per_land: Option<f64>,
+    land_pool_statements_per_land: Option<f64>,
 }
 
 struct Http {
@@ -252,6 +275,18 @@ fn metric(page: &str, name: &str) -> f64 {
         .sum()
 }
 
+/// [`metric`], only samples whose labels contain `label`.
+fn metric_labeled(page: &str, name: &str, label: &str) -> f64 {
+    page.lines()
+        .filter(|l| !l.starts_with('#'))
+        .filter(|l| {
+            l.strip_prefix(name)
+                .is_some_and(|r| r.starts_with('{') && r.contains(label))
+        })
+        .filter_map(|l| l.rsplit(' ').next()?.parse::<f64>().ok())
+        .sum()
+}
+
 /// Every server's metrics page, concatenated so `metric` sums across them.
 async fn scrape(client: &Client, metrics: &[String]) -> String {
     let mut all = String::new();
@@ -371,6 +406,7 @@ async fn main() -> Result<()> {
         "| servers | agents | lands | lands/s | p50 ms | p99 ms | max ms | blob puts/s | put p50/p99 ms | create p50/p99 ms | replayed | 409 retries | CAS losses | attempts>1 | lock wait mean ms | batch mean | lands per server | stalled agents |"
     );
     println!("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|");
+    let mut rows = Vec::new();
     for &n in &args.agents {
         let stop = Arc::new(AtomicBool::new(false));
         let measuring = Arc::new(AtomicBool::new(false));
@@ -446,6 +482,32 @@ async fn main() -> Result<()> {
                 .collect::<Vec<_>>()
                 .join(" / "),
         );
+        let statements = |label: Option<&str>| {
+            let read = |page: &str| match label {
+                Some(l) => metric_labeled(page, "leep_meta_statements_total", l),
+                None => metric(page, "leep_meta_statements_total"),
+            };
+            (metric(&after, "leep_meta_statements_total") > 0.0 && lands > 0)
+                .then(|| (read(&after) - read(&before)) / lands as f64)
+        };
+        rows.push(Row {
+            servers: servers.len(),
+            agents: n,
+            lands,
+            lands_per_s: lands as f64 / elapsed,
+            p50_ms: pct(&t.latencies_us, 0.5),
+            p99_ms: pct(&t.latencies_us, 0.99),
+            create_p99_ms: pct(&t.create_us, 0.99),
+            retried_409: t.retried_409,
+            cas_losses: d("leep_land_cas_losses_total"),
+            batch_mean: (batches > 0.0).then(|| d("leep_land_batch_size_sum") / batches),
+            stalled_agents: stalled,
+            statements_per_land: statements(None),
+            land_pool_statements_per_land: statements(Some("pool=\"land\"")),
+        });
+    }
+    if let Some(p) = &args.json {
+        std::fs::write(p, serde_json::to_vec_pretty(&rows)?)?;
     }
     Ok(())
 }

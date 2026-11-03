@@ -51,6 +51,8 @@ mod blame_tests;
 #[cfg(test)]
 mod bounded_tests;
 #[cfg(test)]
+mod budget_tests;
+#[cfg(test)]
 mod criss_cross_tests;
 #[cfg(test)]
 mod deep_blame_tests;

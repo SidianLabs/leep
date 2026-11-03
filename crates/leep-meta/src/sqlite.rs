@@ -288,6 +288,14 @@ impl Session for SqliteSession<'_> {
 }
 
 impl SqliteMetaStore {
+    /// The pool, with the data call `op` counted in
+    /// `leep_meta_statements_total` (ADR 0081): one query, or one
+    /// transaction, per call of this.
+    fn db_for(&self, op: &'static str) -> &SqlitePool {
+        metrics::counter!("leep_meta_statements_total", "op" => op, "pool" => "data").increment(1);
+        &self.pool
+    }
+
     fn with_pool(pool: SqlitePool, migrations: &[Migration]) -> Self {
         Self {
             pool,
@@ -335,7 +343,7 @@ impl SqliteMetaStore {
             return Ok(Vec::new());
         }
         sqlx::query_scalar("SELECT name FROM store_features ORDER BY name")
-            .fetch_all(&self.pool)
+            .fetch_all(self.db_for("features"))
             .await
             .map_err(storage)
     }
@@ -353,7 +361,7 @@ impl SqliteMetaStore {
         )
         .bind(name)
         .bind(unix_now())
-        .execute(&self.pool)
+        .execute(self.db_for("add_feature"))
         .await
         .map_err(storage)?;
         Ok(())
@@ -365,7 +373,7 @@ impl SqliteMetaStore {
             return Ok(());
         }
         let ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM changeset_dicts ORDER BY id")
-            .fetch_all(&self.pool)
+            .fetch_all(self.db_for("load_dicts"))
             .await
             .map_err(storage)?;
         let mut rows = Vec::new();
@@ -375,7 +383,7 @@ impl SqliteMetaStore {
             }
             let data: Vec<u8> = sqlx::query_scalar("SELECT data FROM changeset_dicts WHERE id = ?")
                 .bind(id)
-                .fetch_one(&self.pool)
+                .fetch_one(self.db_for("load_dicts"))
                 .await
                 .map_err(storage)?;
             rows.push((id, data));
@@ -414,7 +422,7 @@ impl SqliteMetaStore {
     /// One past the largest `rowid` in `derived`; a walk ends there.
     async fn rowid_end(&self) -> Result<u64> {
         let n: Option<i64> = sqlx::query_scalar("SELECT max(rowid) FROM derived")
-            .fetch_one(&self.pool)
+            .fetch_one(self.db_for("rowid_end"))
             .await
             .map_err(storage)?;
         Ok(n.map_or(0, |n| n as u64 + 1))
@@ -446,7 +454,10 @@ impl SqliteMetaStore {
         for k in kinds {
             q = q.bind(*k);
         }
-        let gone = q.fetch_all(&self.pool).await.map_err(storage)?;
+        let gone = q
+            .fetch_all(self.db_for("walk_step"))
+            .await
+            .map_err(storage)?;
         drop::tally(kinds, &mut deleted, gone.into_iter().map(|k| (k, 1)));
         let next = Cursor::Walk {
             at: end,
@@ -482,7 +493,7 @@ impl SqliteMetaStore {
         .bind(name)
         .bind(after)
         .bind(KEY_BATCH)
-        .fetch_all(&self.pool)
+        .fetch_all(self.db_for("keys_step"))
         .await
         .map_err(storage)?;
         deleted[kind] = keys.len() as u64;
@@ -517,7 +528,11 @@ impl MetaStore for SqliteMetaStore {
     async fn put_changeset(&self, cs: &Changeset) -> Result<ChangesetId> {
         let id = cs.id();
         let data = self.encode(cs).await?;
-        let mut conn = self.pool.acquire().await.map_err(storage)?;
+        let mut conn = self
+            .db_for("put_changeset")
+            .acquire()
+            .await
+            .map_err(storage)?;
         self.insert_changeset(&mut conn, &id, &data).await?;
         Ok(id)
     }
@@ -544,7 +559,10 @@ impl MetaStore for SqliteMetaStore {
             for k in chunk {
                 q = q.bind(*k);
             }
-            let rows = q.fetch_all(&self.pool).await.map_err(storage)?;
+            let rows = q
+                .fetch_all(self.db_for("changesets_stored_at"))
+                .await
+                .map_err(storage)?;
             found.extend(rows.iter().map(|r| (r.get(0), r.get(1))));
         }
         crate::stored_at_in_order(ids, found.into_iter())
@@ -553,7 +571,7 @@ impl MetaStore for SqliteMetaStore {
     async fn get_changeset(&self, id: &ChangesetId) -> Result<Option<Changeset>> {
         let row = sqlx::query("SELECT data FROM changesets WHERE id = ?")
             .bind(id.0.as_bytes().as_slice())
-            .fetch_optional(&self.pool)
+            .fetch_optional(self.db_for("get_changeset"))
             .await
             .map_err(storage)?;
         let Some(row) = row else { return Ok(None) };
@@ -579,7 +597,10 @@ impl MetaStore for SqliteMetaStore {
             for k in chunk {
                 q = q.bind(*k);
             }
-            let rows = q.fetch_all(&self.pool).await.map_err(storage)?;
+            let rows = q
+                .fetch_all(self.db_for("get_changesets"))
+                .await
+                .map_err(storage)?;
             found.extend(rows.iter().map(|r| (r.get(0), r.get(1))));
         }
         self.decode_rows(ids, found).await
@@ -596,7 +617,7 @@ impl MetaStore for SqliteMetaStore {
         let rows = sqlx::query("SELECT id FROM changesets WHERE id > ? ORDER BY id LIMIT ?")
             .bind(after)
             .bind(i64::try_from(limit).unwrap_or(i64::MAX))
-            .fetch_all(&self.pool)
+            .fetch_all(self.db_for("list_changesets"))
             .await
             .map_err(storage)?;
         rows.into_iter()
@@ -615,7 +636,7 @@ impl MetaStore for SqliteMetaStore {
                 .bind(prefix.lower().0 .0.to_vec())
                 .bind(prefix.upper().0 .0.to_vec())
                 .bind(i64::try_from(limit).unwrap_or(i64::MAX))
-                .fetch_all(&self.pool)
+                .fetch_all(self.db_for("changesets_with_prefix"))
                 .await
                 .map_err(storage)?;
         rows.into_iter()
@@ -626,7 +647,7 @@ impl MetaStore for SqliteMetaStore {
     async fn get_ref(&self, name: &str) -> Result<Option<ChangesetId>> {
         let row = sqlx::query("SELECT target FROM refs WHERE name = ?")
             .bind(name)
-            .fetch_optional(&self.pool)
+            .fetch_optional(self.db_for("get_ref"))
             .await
             .map_err(storage)?;
         row.map(|r| to_id(&r.get::<Vec<u8>, _>(0))).transpose()
@@ -648,7 +669,11 @@ impl MetaStore for SqliteMetaStore {
         let (land_id, land_changeset) = land_columns(ctx);
         // The ref update is the transaction's first statement, so SQLite takes
         // the write lock up front and never has to upgrade a read lock.
-        let mut tx = self.pool.begin().await.map_err(storage)?;
+        let mut tx = self
+            .db_for("cas_ref_logged")
+            .begin()
+            .await
+            .map_err(storage)?;
         let q = match (&exp, &new) {
             (None, Some(n)) => {
                 sqlx::query("INSERT INTO refs (name, target) VALUES (?, ?) ON CONFLICT DO NOTHING")
@@ -746,7 +771,11 @@ impl MetaStore for SqliteMetaStore {
         let last = steps.last().and_then(|s| s.new).map(|i| i.0 .0.to_vec());
         // The ref update is the transaction's first statement, as in
         // `cas_ref_logged`.
-        let mut tx = self.pool.begin().await.map_err(storage)?;
+        let mut tx = self
+            .db_for("cas_ref_logged_chain")
+            .begin()
+            .await
+            .map_err(storage)?;
         let q = match (&exp, &last) {
             (None, Some(n)) => {
                 sqlx::query("INSERT INTO refs (name, target) VALUES (?, ?) ON CONFLICT DO NOTHING")
@@ -814,7 +843,11 @@ impl MetaStore for SqliteMetaStore {
             for id in chunk {
                 q = q.bind(id.as_bytes());
             }
-            rows.extend(q.fetch_all(&self.pool).await.map_err(storage)?);
+            rows.extend(
+                q.fetch_all(self.db_for("find_lands"))
+                    .await
+                    .map_err(storage)?,
+            );
         }
         lands_in_order(ids, rows)
     }
@@ -836,7 +869,7 @@ impl MetaStore for SqliteMetaStore {
         .bind(before)
         .bind(before)
         .bind(i64::try_from(limit).unwrap_or(i64::MAX))
-        .fetch_all(&self.pool)
+        .fetch_all(self.db_for("ref_log"))
         .await
         .map_err(storage)?;
         rows.into_iter().map(log_entry).collect()
@@ -844,7 +877,7 @@ impl MetaStore for SqliteMetaStore {
 
     async fn list_refs(&self) -> Result<BTreeMap<String, ChangesetId>> {
         let rows = sqlx::query("SELECT name, target FROM refs")
-            .fetch_all(&self.pool)
+            .fetch_all(self.db_for("list_refs"))
             .await
             .map_err(storage)?;
         rows.into_iter()
@@ -856,7 +889,7 @@ impl MetaStore for SqliteMetaStore {
         let row = sqlx::query("SELECT value FROM derived WHERE kind = ? AND key = ?")
             .bind(kind)
             .bind(key.as_bytes().as_slice())
-            .fetch_optional(&self.pool)
+            .fetch_optional(self.db_for("get_derived"))
             .await
             .map_err(storage)?;
         Ok(row.map(|r| Bytes::from(r.get::<Vec<u8>, _>(0))))
@@ -875,7 +908,10 @@ impl MetaStore for SqliteMetaStore {
             for k in chunk {
                 q = q.bind(*k);
             }
-            let rows = q.fetch_all(&self.pool).await.map_err(storage)?;
+            let rows = q
+                .fetch_all(self.db_for("get_derived_many"))
+                .await
+                .map_err(storage)?;
             found.extend(rows.iter().map(|r| (r.get(0), r.get(1))));
         }
         Ok(values_in_order(keys, found.into_iter()))
@@ -896,7 +932,7 @@ impl MetaStore for SqliteMetaStore {
         .bind(kind)
         .bind(after)
         .bind(i64::try_from(limit).unwrap_or(i64::MAX))
-        .fetch_all(&self.pool)
+        .fetch_all(self.db_for("list_derived"))
         .await
         .map_err(storage)?;
         rows.into_iter()
@@ -912,7 +948,7 @@ impl MetaStore for SqliteMetaStore {
     async fn count_derived(&self, kind: &str) -> Result<u64> {
         let n: i64 = sqlx::query_scalar("SELECT count(*) FROM derived WHERE kind = ?")
             .bind(kind)
-            .fetch_one(&self.pool)
+            .fetch_one(self.db_for("count_derived"))
             .await
             .map_err(storage)?;
         Ok(n as u64)
@@ -935,7 +971,10 @@ impl MetaStore for SqliteMetaStore {
                 for k in kinds {
                     q = q.bind(*k);
                 }
-                let rows = q.fetch_one(&self.pool).await.map_err(storage)?;
+                let rows = q
+                    .fetch_one(self.db_for("delete_derived_step"))
+                    .await
+                    .map_err(storage)?;
                 match drop::plan(rows as u64, self.rowid_end().await?) {
                     Some(c) => c,
                     None => return Ok(nothing_left(kinds)),
@@ -962,7 +1001,7 @@ impl MetaStore for SqliteMetaStore {
         .bind(kind)
         .bind(key.as_bytes().as_slice())
         .bind(value.as_ref())
-        .execute(&self.pool)
+        .execute(self.db_for("put_derived"))
         .await
         .map_err(storage)?;
         Ok(())
@@ -975,7 +1014,11 @@ impl MetaStore for SqliteMetaStore {
             return Ok(0);
         }
         let keys: Vec<&[u8]> = unique(ids.iter().map(|i| i.0.as_bytes().as_slice()));
-        let mut tx = self.pool.begin().await.map_err(storage)?;
+        let mut tx = self
+            .db_for("delete_changesets")
+            .begin()
+            .await
+            .map_err(storage)?;
         let mut n = 0;
         for chunk in keys.chunks(BATCH_PARAMS) {
             for kind in kinds {
@@ -1008,7 +1051,11 @@ impl MetaStore for SqliteMetaStore {
             return Ok(0);
         }
         let keys: Vec<&[u8]> = unique(keys.iter().map(|k| k.as_bytes().as_slice()));
-        let mut tx = self.pool.begin().await.map_err(storage)?;
+        let mut tx = self
+            .db_for("delete_derived_keys")
+            .begin()
+            .await
+            .map_err(storage)?;
         let mut n = 0;
         for chunk in keys.chunks(BATCH_PARAMS) {
             for kind in kinds {
@@ -1032,7 +1079,11 @@ impl MetaStore for SqliteMetaStore {
         if rows.is_empty() {
             return Ok(());
         }
-        let mut tx = self.pool.begin().await.map_err(storage)?;
+        let mut tx = self
+            .db_for("put_derived_many")
+            .begin()
+            .await
+            .map_err(storage)?;
         put_rows(&mut tx, rows).await?;
         tx.commit().await.map_err(storage)
     }
@@ -1046,7 +1097,11 @@ impl MetaStore for SqliteMetaStore {
     ) -> Result<ChangesetId> {
         let id = cs.id();
         let data = self.encode(cs).await?;
-        let mut tx = self.pool.begin().await.map_err(storage)?;
+        let mut tx = self
+            .db_for("put_changeset_with_derived")
+            .begin()
+            .await
+            .map_err(storage)?;
         self.insert_changeset(&mut tx, &id, &data).await?;
         put_rows(&mut tx, rows).await?;
         tx.commit().await.map_err(storage)?;
@@ -1066,7 +1121,11 @@ impl MetaStore for SqliteMetaStore {
         for cs in changesets {
             encoded.push((cs.id(), self.encode(cs).await?));
         }
-        let mut tx = self.pool.begin().await.map_err(storage)?;
+        let mut tx = self
+            .db_for("put_changesets_with_derived")
+            .begin()
+            .await
+            .map_err(storage)?;
         for (id, data) in &encoded {
             self.insert_changeset(&mut tx, id, data).await?;
         }
@@ -1076,7 +1135,7 @@ impl MetaStore for SqliteMetaStore {
 
     async fn schema_version(&self) -> Result<Option<u64>> {
         let v: Option<i64> = sqlx::query_scalar("SELECT MAX(version) FROM schema_migrations")
-            .fetch_one(&self.pool)
+            .fetch_one(self.db_for("schema_version"))
             .await
             .map_err(storage)?;
         Ok(Some(v.unwrap_or(0) as u64))

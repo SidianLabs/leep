@@ -28,6 +28,29 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   every server sharing a store. Duplicate packs that older servers left are
   not recorded as retired: reclaim them once with `leep-server repack
   --full` (docs/OPERATIONS.md, "Packs written by land batches").
+### Performance is guarded in CI by operation budgets and a ratio bench
+- **Added.** Operation budgets (ADR 0081): `leep_testkit::budget::Budget`
+  counts what a flow asks of both stores (calls, keys and bytes per method
+  and derived kind, and the most calls in flight at once overall, per lane
+  and per concurrent flow), and `cargo test` checks create, land batch,
+  log, blame, search and upload against exact budgets in
+  `crates/leep-derive/src/budget_tests.rs`. A flow that makes more calls,
+  or more at once, fails, and so does one more than 20% under its budget
+  until the budget is lowered. Either half of #253's first version fails it.
+- **Added.** A `perf` CI job on pull requests runs the merge base's
+  `leep-server` and the change's in turn (A B A B) under a short
+  `leep-land-bench` and a 200-agent `leep-swarm`, and fails on counts
+  (lands not admitted, 409s, stalled agents, CAS losses, discarded
+  pipelined attempts, shed reads, pool connections in use, statements and
+  bytes per land) and on throughput below 0.7x or p99 above 2x; a check
+  whose two base runs disagree is reported inconclusive.
+  `scripts/perf-ratio.sh` runs the same comparison locally, judged by the
+  new `leep-perf-compare`.
+- **Added.** Counter `leep_meta_statements_total{op, pool}`: queries and
+  transactions the Postgres and SQLite metadata stores send, by store
+  method and pool. `leep-land-bench --json`, and statements per land, pool
+  peaks, discarded attempts and server-side shed reads in `leep-swarm`'s
+  report.
 
 ### Lands on a deep history read skiplists a level at a time
 - **Changed.** A land batch reads the skiplist rows its copies are built

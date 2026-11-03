@@ -467,7 +467,7 @@ impl PostgresMetaStore {
                  AND s.attname = 'kind' \
              WHERE c.oid = 'derived'::regclass",
         )
-        .fetch_optional(self.db())
+        .fetch_optional(self.db_for("planner_rows"))
         .await
         .map_err(storage)?;
         let Some((tuples, Some(vals), Some(freqs))) = row else {
@@ -591,9 +591,11 @@ impl Pools {
 }
 
 impl PostgresMetaStore {
-    /// The pool the running task's data calls draw on (ADR 0067, 0073),
-    /// with the connection gauges of that pool brought up to date.
-    fn db(&self) -> &PgPool {
+    /// The pool the running task's data call `op` draws on (ADR 0067,
+    /// 0073), with the connection gauges of that pool brought up to date
+    /// and the call counted in `leep_meta_statements_total` (ADR 0081):
+    /// one query, or one transaction, per call of this.
+    fn db_for(&self, op: &'static str) -> &PgPool {
         let lane = leep_core::lane::current();
         let (name, pool) = match (lane, &self.land_pool, &self.index_pool) {
             (Lane::Land, Some(land), _) => ("land", land),
@@ -606,6 +608,7 @@ impl PostgresMetaStore {
             .set(f64::from(size - idle));
         metrics::gauge!("leep_meta_pool_connections", "pool" => name, "state" => "idle")
             .set(f64::from(idle));
+        metrics::counter!("leep_meta_statements_total", "op" => op, "pool" => name).increment(1);
         pool
     }
 
@@ -659,7 +662,7 @@ impl PostgresMetaStore {
             return Ok(Vec::new());
         }
         sqlx::query_scalar("SELECT name FROM store_features ORDER BY name")
-            .fetch_all(self.db())
+            .fetch_all(self.db_for("features"))
             .await
             .map_err(storage)
     }
@@ -677,7 +680,7 @@ impl PostgresMetaStore {
         )
         .bind(name)
         .bind(unix_now())
-        .execute(self.db())
+        .execute(self.db_for("add_feature"))
         .await
         .map_err(storage)?;
         Ok(())
@@ -689,7 +692,7 @@ impl PostgresMetaStore {
             return Ok(());
         }
         let ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM changeset_dicts ORDER BY id")
-            .fetch_all(self.db())
+            .fetch_all(self.db_for("load_dicts"))
             .await
             .map_err(storage)?;
         let mut rows = Vec::new();
@@ -700,7 +703,7 @@ impl PostgresMetaStore {
             let data: Vec<u8> =
                 sqlx::query_scalar("SELECT data FROM changeset_dicts WHERE id = $1")
                     .bind(id)
-                    .fetch_one(self.db())
+                    .fetch_one(self.db_for("load_dicts"))
                     .await
                     .map_err(storage)?;
             rows.push((id, data));
@@ -753,7 +756,7 @@ impl PostgresMetaStore {
         let n: i64 = sqlx::query_scalar(
             "SELECT pg_relation_size('derived') / current_setting('block_size')::bigint",
         )
-        .fetch_one(self.db())
+        .fetch_one(self.db_for("derived_pages"))
         .await
         .map_err(storage)?;
         Ok(n as u64)
@@ -778,7 +781,7 @@ impl PostgresMetaStore {
         // Block numbers are 32 bits; the last range ends past every block.
         let end = (at + span).min(u64::from(u32::MAX));
         let started = std::time::Instant::now();
-        let mut tx = self.db().begin().await.map_err(storage)?;
+        let mut tx = self.db_for("walk_step").begin().await.map_err(storage)?;
         sqlx::query(NO_INDEX_PATHS)
             .execute(&mut *tx)
             .await
@@ -836,7 +839,7 @@ impl PostgresMetaStore {
         .bind(name)
         .bind(after)
         .bind(KEY_BATCH)
-        .fetch_one(self.db())
+        .fetch_one(self.db_for("keys_step"))
         .await
         .map_err(storage)?;
         deleted[kind] = n as u64;
@@ -884,7 +887,9 @@ impl MetaStore for PostgresMetaStore {
                 .bind(id.0.as_bytes().as_slice())
                 .bind(data)
         };
-        q.execute(self.db()).await.map_err(storage)?;
+        q.execute(self.db_for("put_changeset"))
+            .await
+            .map_err(storage)?;
         Ok(id)
     }
 
@@ -907,7 +912,7 @@ impl MetaStore for PostgresMetaStore {
         )
         .bind(keys)
         .bind(crate::STORED_AT_SCHEMA_VERSION)
-        .fetch_all(self.db())
+        .fetch_all(self.db_for("changesets_stored_at"))
         .await
         .map_err(storage)?;
         crate::stored_at_in_order(ids, rows.iter().map(|r| (r.get(0), r.get(1))))
@@ -916,7 +921,7 @@ impl MetaStore for PostgresMetaStore {
     async fn get_changeset(&self, id: &ChangesetId) -> Result<Option<Changeset>> {
         let row = sqlx::query("SELECT data FROM changesets WHERE id = $1")
             .bind(id.0.as_bytes().as_slice())
-            .fetch_optional(self.db())
+            .fetch_optional(self.db_for("get_changeset"))
             .await
             .map_err(storage)?;
         let Some(row) = row else { return Ok(None) };
@@ -937,7 +942,7 @@ impl MetaStore for PostgresMetaStore {
         let keys: Vec<&[u8]> = unique(ids.iter().map(|i| i.0.as_bytes().as_slice()));
         let rows = sqlx::query("SELECT id, data FROM changesets WHERE id = ANY($1)")
             .bind(keys)
-            .fetch_all(self.db())
+            .fetch_all(self.db_for("get_changesets"))
             .await
             .map_err(storage)?;
         self.decode_rows(ids, rows.iter().map(|r| (r.get(0), r.get(1))).collect())
@@ -955,7 +960,7 @@ impl MetaStore for PostgresMetaStore {
         let rows = sqlx::query("SELECT id FROM changesets WHERE id > $1 ORDER BY id LIMIT $2")
             .bind(after)
             .bind(i64::try_from(limit).unwrap_or(i64::MAX))
-            .fetch_all(self.db())
+            .fetch_all(self.db_for("list_changesets"))
             .await
             .map_err(storage)?;
         rows.into_iter()
@@ -975,7 +980,7 @@ impl MetaStore for PostgresMetaStore {
         .bind(prefix.lower().0 .0.to_vec())
         .bind(prefix.upper().0 .0.to_vec())
         .bind(i64::try_from(limit).unwrap_or(i64::MAX))
-        .fetch_all(self.db())
+        .fetch_all(self.db_for("changesets_with_prefix"))
         .await
         .map_err(storage)?;
         rows.into_iter()
@@ -986,7 +991,7 @@ impl MetaStore for PostgresMetaStore {
     async fn get_ref(&self, name: &str) -> Result<Option<ChangesetId>> {
         let row = sqlx::query("SELECT target FROM refs WHERE name = $1")
             .bind(name)
-            .fetch_optional(self.db())
+            .fetch_optional(self.db_for("get_ref"))
             .await
             .map_err(storage)?;
         row.map(|r| to_id(&r.get::<Vec<u8>, _>(0))).transpose()
@@ -1006,7 +1011,11 @@ impl MetaStore for PostgresMetaStore {
         let exp = expected.map(|i| i.0 .0.to_vec());
         let new = new.map(|i| i.0 .0.to_vec());
         let (land_id, land_changeset) = land_columns(ctx);
-        let mut tx = self.db().begin().await.map_err(storage)?;
+        let mut tx = self
+            .db_for("cas_ref_logged")
+            .begin()
+            .await
+            .map_err(storage)?;
         let q = match (&exp, &new) {
             (None, Some(n)) => sqlx::query(
                 "INSERT INTO refs (name, target) VALUES ($1, $2) ON CONFLICT DO NOTHING",
@@ -1109,7 +1118,11 @@ impl MetaStore for PostgresMetaStore {
         let last = steps.last().and_then(|s| s.new).map(|i| i.0 .0.to_vec());
         // The ref update is the transaction's first statement, as in
         // `cas_ref_logged`.
-        let mut tx = self.db().begin().await.map_err(storage)?;
+        let mut tx = self
+            .db_for("cas_ref_logged_chain")
+            .begin()
+            .await
+            .map_err(storage)?;
         let q = match (&exp, &last) {
             (None, Some(n)) => sqlx::query(
                 "INSERT INTO refs (name, target) VALUES ($1, $2) ON CONFLICT DO NOTHING",
@@ -1181,7 +1194,7 @@ impl MetaStore for PostgresMetaStore {
         )
         .bind(name)
         .bind(&keys)
-        .fetch_all(self.db())
+        .fetch_all(self.db_for("find_lands"))
         .await
         .map_err(storage)?;
         lands_in_order(ids, rows)
@@ -1202,7 +1215,7 @@ impl MetaStore for PostgresMetaStore {
         .bind(name)
         .bind(before)
         .bind(i64::try_from(limit).unwrap_or(i64::MAX))
-        .fetch_all(self.db())
+        .fetch_all(self.db_for("ref_log"))
         .await
         .map_err(storage)?;
         rows.into_iter().map(log_entry).collect()
@@ -1210,7 +1223,7 @@ impl MetaStore for PostgresMetaStore {
 
     async fn list_refs(&self) -> Result<BTreeMap<String, ChangesetId>> {
         let rows = sqlx::query("SELECT name, target FROM refs")
-            .fetch_all(self.db())
+            .fetch_all(self.db_for("list_refs"))
             .await
             .map_err(storage)?;
         rows.into_iter()
@@ -1222,7 +1235,7 @@ impl MetaStore for PostgresMetaStore {
         let row = sqlx::query("SELECT value FROM derived WHERE kind = $1 AND key = $2")
             .bind(kind)
             .bind(key.as_bytes().as_slice())
-            .fetch_optional(self.db())
+            .fetch_optional(self.db_for("get_derived"))
             .await
             .map_err(storage)?;
         Ok(row.map(|r| Bytes::from(r.get::<Vec<u8>, _>(0))))
@@ -1243,7 +1256,7 @@ impl MetaStore for PostgresMetaStore {
         )
         .bind(kind)
         .bind(wanted)
-        .fetch_all(self.db())
+        .fetch_all(self.db_for("get_derived_many"))
         .await
         .map_err(storage)?;
         Ok(values_in_order(
@@ -1285,7 +1298,11 @@ impl MetaStore for PostgresMetaStore {
                 .push_bind(wanted)
                 .push(")");
         }
-        let rows = q.build().fetch_all(self.db()).await.map_err(storage)?;
+        let rows = q
+            .build()
+            .fetch_all(self.db_for("get_derived_kinds"))
+            .await
+            .map_err(storage)?;
         let mut found: Vec<Vec<(Vec<u8>, Vec<u8>)>> = reads.iter().map(|_| Vec::new()).collect();
         for r in rows {
             let i: i32 = r.get(0);
@@ -1323,7 +1340,7 @@ impl MetaStore for PostgresMetaStore {
         .bind(kind)
         .bind(after)
         .bind(i64::try_from(limit).unwrap_or(i64::MAX))
-        .fetch_all(self.db())
+        .fetch_all(self.db_for("list_derived"))
         .await
         .map_err(storage)?;
         rows.into_iter()
@@ -1340,7 +1357,7 @@ impl MetaStore for PostgresMetaStore {
     async fn count_derived(&self, kind: &str) -> Result<u64> {
         let n: i64 = sqlx::query_scalar("SELECT count(*) FROM derived WHERE kind = $1")
             .bind(kind)
-            .fetch_one(self.db())
+            .fetch_one(self.db_for("count_derived"))
             .await
             .map_err(storage)?;
         Ok(n as u64)
@@ -1356,7 +1373,7 @@ impl MetaStore for PostgresMetaStore {
         )
         .bind(kind)
         .bind(EXACT_UP_TO)
-        .fetch_one(self.db())
+        .fetch_one(self.db_for("estimate_derived"))
         .await
         .map_err(storage)?;
         if n < EXACT_UP_TO {
@@ -1391,7 +1408,7 @@ impl MetaStore for PostgresMetaStore {
                 let rows: i64 =
                     sqlx::query_scalar("SELECT count(*) FROM derived WHERE kind = ANY($1)")
                         .bind(kinds)
-                        .fetch_one(self.db())
+                        .fetch_one(self.db_for("delete_derived_step"))
                         .await
                         .map_err(storage)?;
                 match drop::plan(rows as u64, self.derived_pages().await?) {
@@ -1423,7 +1440,7 @@ impl MetaStore for PostgresMetaStore {
         .bind(kind)
         .bind(key.as_bytes().as_slice())
         .bind(value.as_ref())
-        .execute(self.db())
+        .execute(self.db_for("put_derived"))
         .await
         .map_err(storage)?;
         Ok(())
@@ -1435,7 +1452,11 @@ impl MetaStore for PostgresMetaStore {
             return Ok(0);
         }
         let keys: Vec<&[u8]> = unique(ids.iter().map(|i| i.0.as_bytes().as_slice()));
-        let mut tx = self.db().begin().await.map_err(storage)?;
+        let mut tx = self
+            .db_for("delete_changesets")
+            .begin()
+            .await
+            .map_err(storage)?;
         if !kinds.is_empty() {
             sqlx::query("DELETE FROM derived WHERE kind = ANY($1) AND key = ANY($2)")
                 .bind(kinds)
@@ -1462,7 +1483,7 @@ impl MetaStore for PostgresMetaStore {
         let n = sqlx::query("DELETE FROM derived WHERE kind = ANY($1) AND key = ANY($2)")
             .bind(kinds)
             .bind(&keys)
-            .execute(self.db())
+            .execute(self.db_for("delete_derived_keys"))
             .await
             .map_err(storage)?
             .rows_affected();
@@ -1487,7 +1508,7 @@ impl MetaStore for PostgresMetaStore {
         .bind(kinds)
         .bind(keys)
         .bind(values)
-        .execute(self.db())
+        .execute(self.db_for("put_derived_many"))
         .await
         .map_err(storage)?;
         Ok(())
@@ -1527,7 +1548,9 @@ impl MetaStore for PostgresMetaStore {
         if self.has_stored_at {
             q = q.bind(crate::stored_now());
         }
-        q.execute(self.db()).await.map_err(storage)?;
+        q.execute(self.db_for("put_changeset_with_derived"))
+            .await
+            .map_err(storage)?;
         Ok(id)
     }
 
@@ -1574,13 +1597,15 @@ impl MetaStore for PostgresMetaStore {
         if self.has_stored_at {
             q = q.bind(crate::stored_now());
         }
-        q.execute(self.db()).await.map_err(storage)?;
+        q.execute(self.db_for("put_changesets_with_derived"))
+            .await
+            .map_err(storage)?;
         Ok(())
     }
 
     async fn schema_version(&self) -> Result<Option<u64>> {
         let v: Option<i64> = sqlx::query_scalar("SELECT MAX(version) FROM schema_migrations")
-            .fetch_one(self.db())
+            .fetch_one(self.db_for("schema_version"))
             .await
             .map_err(storage)?;
         Ok(Some(v.unwrap_or(0) as u64))
