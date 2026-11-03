@@ -13,7 +13,7 @@ use bytes::Bytes;
 use leep_core::store::{BlobMeta, DerivedRow, RefLogEntry, RefUpdateContext};
 use leep_core::{BlobStore, Changeset, ChangesetId, Error, Hash, MetaStore, Result, TreeNode};
 
-use crate::derived::{DerivedKind, Generation, RootTree};
+use crate::derived::{DerivedKind, Generation, RootTree, SkipPlan};
 use crate::gc::BLOB_CONDEMNED;
 use crate::signatures::REBASED_ORIGIN_KIND;
 use crate::Repo;
@@ -32,6 +32,8 @@ pub(crate) struct Staging {
     memo: Arc<NodeMemo>,
     /// The staging of the batch ahead, until that batch committed.
     parent: Mutex<Option<Arc<Staging>>>,
+    /// The attempt's skiplist read-ahead, handed to every handle on it.
+    skip_plan: Mutex<Option<SkipPlan>>,
 }
 
 /// The decoded tree nodes of one batch attempt, by hash, and the time its
@@ -266,7 +268,17 @@ impl Staging {
         // its own, uncached, before it moves the ref (ADR 0059).
         staged.rescues_on_write = false;
         staged.node_memo = Some(Arc::clone(&self.memo));
+        staged.skip_plan = self
+            .skip_plan
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         staged
+    }
+
+    /// Hand `plan` to the handles made from now on (see [`Staging::repo`]).
+    pub(crate) fn set_skip_plan(&self, plan: SkipPlan) {
+        *self.skip_plan.lock().unwrap_or_else(|e| e.into_inner()) = Some(plan);
     }
 
     /// Time the attempt's replays spent building trees so far.

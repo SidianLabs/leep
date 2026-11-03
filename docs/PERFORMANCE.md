@@ -3960,8 +3960,9 @@ land on the wide store against 2.75 ms on the deep one.
   207 ms on the same tree at depth 1,000). The land-only bench shows why: at
   depth a land's replay costs 3.7 times as much and the land path's ceiling
   falls from about 470 to about 180 lands a second, close enough to the
-  offered rate that queues form. The cause inside replay has not been
-  profiled.
+  offered rate that queues form. The cause was the skiplist: each copy
+  read log2(depth) skiplist rows one after another (see "Skiplists off the
+  land path" below).
 - Blame on a hot file is the one operation that does not scale: about 10,000
   changers spread over a million generations take 43-61 s on this box, more
   than the 25 s request timeout, and a timed-out blame keeps no progress.
@@ -3983,6 +3984,46 @@ land on the wide store against 2.75 ms on the deep one.
 - The writer bypasses the land path, so the generation rate is not a land
   rate, and it writes the history before any index exists, so it does not
   measure the warmer keeping up with a history growing at this depth.
+
+### Skiplists off the land path
+
+ADR 0079. The replay difference above was the copies' skiplists: building
+one reads the lists of the first-parent ancestors 1, 2, 4, ... steps up,
+one after another, and on a deep history the high ones are rows no cache
+holds, a different set for every copy. A land batch now reads them a level
+at a time for all its copies, on a task beside its replays.
+
+**Setup.** This repository's 4-vCPU dev box (Postgres 16 on the same box,
+`shared_buffers=1GB`), release builds of main at #251 and of this change.
+Two stores from `leep-history-gen`, each repacked: 150,000 generations
+("deep") and 1,000 ("wide", the same tree). Each run starts from a copy of
+the store (`createdb --template`, the blob directory copied) and a new
+server pinned to CPUs 0-1 (`--warm-interval 0 --request-timeout 0`), with
+`leep-land-bench --files 2 --agents 16,64 --duration 30` on CPUs 2-3. Two
+runs of each; replay is `leep_land_replay_seconds` over both agent counts.
+
+| | Deep, before | Deep, after | Wide, before | Wide, after |
+|---|---|---|---|---|
+| lands/s, 16 agents | 142.8, 185.5 | 249.1, 249.4 | 256.2, 267.4 | 240.1, 282.9 |
+| lands/s, 64 agents | 214.7, 203.7 | 296.9, 327.3 | 329.6, 299.0 | 294.8, 324.9 |
+| land p99, 16 agents | 370, 93 ms | 60, 57 ms | 52, 55 ms | 66, 48 ms |
+| land p99, 64 agents | 239, 312 ms | 113, 135 ms | 107, 104 ms | 90, 102 ms |
+| replay per land | 2.79, 2.81 ms | 0.56, 0.53 ms | 0.45, 0.48 ms | 0.40, 0.39 ms |
+| skiplist derivation, mean | 1.33 ms | 0.11 ms | 0.06 ms | 0.02 ms |
+
+**What this shows.** At 150,000 deep the skiplist was nearly all of the
+replay's extra cost (1.33 of about 2.3 ms); with the rows read ahead the
+deep store lands as fast as the wide one, and the depth no longer shows in
+the replay. The wide store's differences are run-to-run noise.
+
+**What it doesn't show.** 150,000 deep, not 1,000,000: the old cost grew
+with log2(depth) minus what the cache holds, so the gain at a million is
+expected to be larger, but it was not rerun. One box, two runs per cell;
+Postgres shares the box. These numbers are of the first version, which also
+ran a create's skiplist beside its tree write and started the plan before
+the batch's other reads. In the 1,000-agent mixed swarm, 500,000 deep, that
+version regressed badly (ADR 0079, section 3); both were changed, and the
+swarm is to be rerun.
 
 ## Analysis
 

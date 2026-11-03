@@ -1,7 +1,9 @@
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures_util::future::{BoxFuture, FutureExt, Shared};
 use leep_core::{Changeset, ChangesetId, Error, Hash, Result};
 
 use super::{derive, DerivedKind};
@@ -98,6 +100,134 @@ impl Skiplist {
             }
         }
         Ok(list.into())
+    }
+}
+
+/// Where an entry of a planned copy's skiplist lies: a stored changeset on
+/// the head's first-parent chain, or the `n`th copy stacked on the head.
+#[derive(Clone, Copy)]
+enum Planned {
+    Stored(ChangesetId),
+    Copy(usize),
+}
+
+/// A land batch attempt's read-ahead of skiplist rows (ADR 0079), running
+/// beside its replays; it never fails (a row it misses is read later).
+pub(crate) type SkipPlan = Shared<BoxFuture<'static, ()>>;
+
+/// Skiplist plans that may run at once in a process. A plan makes one
+/// metadata call at a time, in the land lane, beside its leader's calls;
+/// past this many (several refs landing at once), a batch's copies read
+/// their rows as they did before plans.
+pub(crate) const MAX_RUNNING_SKIP_PLANS: usize = 2;
+
+impl Repo {
+    /// Start [`Repo::prefetch_copy_skiplists`] on a task of its own, in
+    /// the caller's lane, so it runs while the batch replays; `None` when
+    /// [`MAX_RUNNING_SKIP_PLANS`] are running already.
+    pub(crate) fn start_copy_skiplists(
+        &self,
+        head: ChangesetId,
+        copies: usize,
+    ) -> Option<SkipPlan> {
+        let Ok(permit) = Arc::clone(&self.skip_plans).try_acquire_owned() else {
+            metrics::counter!("leep_land_skip_plans_total", "outcome" => "skipped").increment(1);
+            return None;
+        };
+        metrics::counter!("leep_land_skip_plans_total", "outcome" => "started").increment(1);
+        let repo = self.clone();
+        let task = tokio::spawn(leep_core::lane::inherit(async move {
+            let started = std::time::Instant::now();
+            repo.prefetch_copy_skiplists(head, copies).await;
+            metrics::histogram!("leep_land_skip_plan_seconds")
+                .record(started.elapsed().as_secs_f64());
+            drop(permit);
+        }));
+        Some(
+            async move {
+                let _ = task.await;
+            }
+            .boxed()
+            .shared(),
+        )
+    }
+
+    /// Read the stored skiplists that up to `copies` changesets stacked one
+    /// on another on `head` will be built from, into `skiplists`, one
+    /// batched read per level (ADR 0079). Copy `i`'s entry `k` comes from
+    /// the list of its entry `k - 1`, which is either an earlier copy (whose
+    /// entries the plan already has) or a stored changeset on the head's
+    /// chain, so level `k` needs only the rows of the stored entries `k - 1`,
+    /// all known once level `k - 1` is. A land batch calls this before it
+    /// replays, so each copy's [`Skiplist::compute`] finds every list in
+    /// memory instead of reading about log2(history) rows one after another.
+    /// The lists are the same; only where their inputs are read from
+    /// changes. A row that cannot be read or decoded is left to `compute`,
+    /// which reads or derives it as before.
+    pub(crate) async fn prefetch_copy_skiplists(&self, head: ChangesetId, copies: usize) {
+        // Each copy's entry `k - 1`, copies `1..=copies` (index 0 unused).
+        let mut level: Vec<Option<Planned>> = (0..=copies)
+            .map(|i| match i {
+                0 => None,
+                1 => Some(Planned::Stored(head)),
+                _ => Some(Planned::Copy(i - 1)),
+            })
+            .collect();
+        // Ends when the lists do; the bound only stops a damaged row from
+        // naming entries forever (`decode` keeps generations descending).
+        for k in 1..=64 {
+            let mut seen = HashSet::new();
+            let stored: Vec<ChangesetId> = level
+                .iter()
+                .filter_map(|e| match e {
+                    Some(Planned::Stored(id)) => Some(*id),
+                    _ => None,
+                })
+                .filter(|id| seen.insert(*id))
+                .collect();
+            if stored.is_empty() {
+                break;
+            }
+            let mut lists: HashMap<ChangesetId, Arc<[SkipEntry]>> =
+                HashMap::with_capacity(stored.len());
+            let mut missing = Vec::new();
+            for id in stored {
+                match self.skiplists.get(&id) {
+                    Some(l) => {
+                        lists.insert(id, l);
+                    }
+                    None => missing.push(id),
+                }
+            }
+            if !missing.is_empty() {
+                let keys: Vec<Hash> = missing.iter().map(|id| id.0).collect();
+                if let Ok(rows) = self.meta().get_derived_many(Skiplist::NAME, &keys).await {
+                    if rows.len() == keys.len() {
+                        for (id, row) in missing.into_iter().zip(rows) {
+                            let Some(list) = row.and_then(|b| Skiplist::decode_of(id, &b).ok())
+                            else {
+                                continue;
+                            };
+                            let list: Arc<[SkipEntry]> = list.into();
+                            self.skiplists.insert(id, list.clone());
+                            lists.insert(id, list);
+                        }
+                    }
+                }
+            }
+            level = level
+                .iter()
+                .map(|e| match *e {
+                    None => None,
+                    // That copy's own entry `k - 1`, from this level.
+                    Some(Planned::Copy(j)) => level[j],
+                    Some(Planned::Stored(id)) => lists
+                        .get(&id)
+                        .and_then(|l| l.get(k - 1))
+                        .map(|e| Planned::Stored(e.id)),
+                })
+                .collect();
+        }
     }
 }
 

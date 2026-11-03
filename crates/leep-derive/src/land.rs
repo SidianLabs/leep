@@ -60,6 +60,14 @@ pub const MAX_BATCH_LIFETIME: Duration = Duration::from_secs(60);
 /// It matches how far back a landed copy is looked for, so a stack the cap
 /// admits is also one whose earlier landing is found.
 pub const MAX_LAND_STACK: usize = LANDED_COPY_SCAN;
+
+/// Copies a batch reads skiplists ahead for (ADR 0079). Each level reads up
+/// to one row per copy, about 800 bytes at a depth of a million, so a plan
+/// keeps at most a few thousand lists, well inside the `SkiplistCache`.
+const MAX_PLANNED_COPIES: usize = 256;
+
+/// Copies planned beyond one per land, for stacks of more than one.
+const PLANNED_COPY_SLACK: usize = 8;
 /// How far into its batch a land's replay may run before that land alone
 /// answers past-deadline (retryable). Half the batch lifetime, so the lands
 /// replayed before it still have time to commit.
@@ -380,6 +388,7 @@ impl RefQueue {
     /// Fold a finished batch's time into the moving average.
     fn record_batch(&mut self, took: Duration) {
         let took = took.as_secs_f64();
+        metrics::histogram!("leep_land_batch_seconds").record(took);
         self.batch_secs = Some(match self.batch_secs {
             Some(avg) => avg + BATCH_TIME_WEIGHT * (took - avg),
             None => took,
@@ -1241,6 +1250,19 @@ impl Repo {
                     origins
                 }
             );
+            // The rows the copies' skiplists are built from, read a level at
+            // a time for the whole batch beside its replays, which wait for
+            // them only to build a copy (ADR 0079). Started after the reads
+            // above, so it never competes with them for the land lane's
+            // connections. A land usually makes one copy; the slack covers a
+            // few longer stacks, and copies past it (or of a batch that found
+            // no plan permit) read what they lack.
+            if let Some(h) = start {
+                let copies = (ids.len() + PLANNED_COPY_SLACK).min(MAX_PLANNED_COPIES);
+                if let Some(plan) = staged.start_copy_skiplists(h, copies) {
+                    staging.set_skip_plan(plan);
+                }
+            }
             // The batch ahead's moves are not in the ref log until it
             // commits; this attempt is kept only if they are.
             if let (Ok(r), Some(a)) = (&mut recorded, &spec) {
@@ -1299,6 +1321,8 @@ impl Repo {
                 writes.sync(start);
             }
             let replaying = Instant::now();
+            #[cfg(test)]
+            let mut recorded_at: Option<usize> = None;
             let mut todo = std::mem::take(&mut lands).into_iter();
             while let Some(mut l) = todo.next() {
                 if attempt == 1 && l.q.reply.is_closed() {
@@ -1317,6 +1341,19 @@ impl Repo {
                     continue;
                 }
                 taken.push(l.q.cs);
+                // Recorded as taken, before any answer, so a test that has
+                // its answers finds the batch.
+                #[cfg(test)]
+                if first_replay {
+                    let mut b = self.land_queues.batches.lock().unwrap();
+                    match recorded_at {
+                        Some(i) => b[i].push(l.q.cs),
+                        None => {
+                            recorded_at = Some(b.len());
+                            b.push(vec![l.q.cs]);
+                        }
+                    }
+                }
                 let repo = staging.repo(&l.q.repo);
                 let fast = self.land_fast_path.then_some(&writes);
                 let step = match recorded_step(&l.q, &recorded, attempt) {
@@ -1413,8 +1450,6 @@ impl Repo {
             if first_replay && !taken.is_empty() {
                 first_replay = false;
                 metrics::histogram!("leep_land_batch_size").record(taken.len() as f64);
-                #[cfg(test)]
-                self.land_queues.batches.lock().unwrap().push(taken);
             }
             staging.retain_stored(&mut origins);
             carried = origins;

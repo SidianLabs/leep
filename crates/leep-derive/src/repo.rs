@@ -164,6 +164,14 @@ pub struct Repo {
     /// the nodes they rewrite in memory instead of reading and decoding
     /// them again. `None` outside a staged batch.
     pub(crate) node_memo: Option<Arc<crate::land_stage::NodeMemo>>,
+    /// The land batch attempt's read-ahead of skiplist rows (ADR 0079),
+    /// which a copy waits for before building its list. `None` outside a
+    /// staged batch.
+    pub(crate) skip_plan: Option<crate::derived::SkipPlan>,
+    /// Permits for running skiplist plans, shared by clones: each holds one
+    /// metadata connection of the land lane at a time beside its leader's,
+    /// so their number is bounded (ADR 0079).
+    pub(crate) skip_plans: Arc<tokio::sync::Semaphore>,
     /// Permits for the metadata reads of a search's directory opens, shared
     /// by every search through this handle and its clones; `None` leaves
     /// them unbounded. See [`Repo::with_search_pool_permits`].
@@ -632,6 +640,10 @@ impl Repo {
             fence_flag: Arc::default(),
             rescues_on_write: true,
             node_memo: None,
+            skip_plan: None,
+            skip_plans: Arc::new(tokio::sync::Semaphore::new(
+                crate::derived::MAX_RUNNING_SKIP_PLANS,
+            )),
             search_pool: None,
             search_flights: Arc::default(),
             blame_flights: Arc::default(),
@@ -1145,6 +1157,15 @@ impl Repo {
                 };
                 if let Some(l) = &pre.parent_skiplist {
                     self.skiplists.insert(p, l.clone());
+                }
+                // A land batch's copy finds the rows its list is built from
+                // in what the batch read ahead (ADR 0079). Waiting holds no
+                // connection.
+                if let Some(plan) = &self.skip_plan {
+                    let waited = std::time::Instant::now();
+                    plan.clone().await;
+                    metrics::histogram!("leep_land_skip_plan_wait_seconds")
+                        .record(waited.elapsed().as_secs_f64());
                 }
                 Skiplist::compute(self, parent, pre.parent_skiplist, true).await?
             }

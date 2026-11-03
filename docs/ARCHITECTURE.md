@@ -644,8 +644,10 @@ adds its `rebased-origin-v1` link and the git importer its commit mapping to
 that write. Building a skiplist needs the lists of the first-parent ancestors
 1, 2, 4, ... steps up, one after another; `Repo` caches the lists it computes
 and those it reads while creating changesets (never rows read by `verify` or
-`repair`, which substitute recomputed rows as they go). Whatever the batched
-round does not supply is read or derived singly, as before.
+`repair`, which substitute recomputed rows as they go). They are computed
+after the tree write, so a create makes one metadata call at a time (ADR
+0067, 0079). Whatever the batched round does not supply is read or derived
+singly, as before.
 
 **Land** (`leep land`, the no-merge-queue path), group committed per ref
 within each server process ([ADR 0032](adr/0032-group-commit-for-lands.md)),
@@ -667,7 +669,10 @@ loop (≤32 attempts):
            (stored rebase links an earlier attempt of the batch read are kept),
     whether their contents exist (one contains_many, kept for the attempt: a
     copy's contents are checked against it, not read back, ADR 0068),
-    and what target's ref log recorded for the lands' land ids
+    and what target's ref log recorded for the lands' land ids;
+    then, on a task beside the replays, the skiplist rows the copies stacked
+    on head will be built from, one batched read per level (ADR 0079; at most
+    two such tasks per process; a copy waits for it before building its list)
   for each land, writing into staging and reading it back (dropped if its caller left before it was reached;
                  after 200 ms of replay the first attempt hands the lands it has not reached
                  back to the queue's front, --land-batch-replay-ms, ADR 0072):
