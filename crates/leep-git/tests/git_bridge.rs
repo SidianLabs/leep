@@ -909,3 +909,61 @@ async fn export_rescues_condemned_changesets_before_mapping_them() {
         "a live changeset needs no rescue"
     );
 }
+
+#[tokio::test]
+async fn import_of_a_shallow_clone_fails_cleanly() {
+    if !have_git() {
+        return;
+    }
+    let full = init();
+    for n in 0..3 {
+        write(full.path(), "a", &format!("{n}\n"));
+        commit(full.path(), &format!("c{n}"));
+    }
+    let shallow = tempfile::tempdir().unwrap();
+    let url = format!("file://{}", full.path().display());
+    git(
+        shallow.path(),
+        &["clone", "-q", "--depth", "1", &url, "clone"],
+    );
+    let clone = shallow.path().join("clone");
+
+    let err = import(&new_repo(), &clone, "HEAD", &ImportOptions::default())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("shallow"), "{err}");
+    assert!(err.contains("git fetch --unshallow"), "{err}");
+
+    let mut c = Command::new(env!("CARGO_BIN_EXE_leep-git"));
+    for (k, _) in std::env::vars() {
+        if k.starts_with("LEEP_") {
+            c.env_remove(k);
+        }
+    }
+    let out = c
+        .env("RUST_BACKTRACE", "1")
+        .args([
+            "import",
+            "--meta",
+            "mem://",
+            "--blobs",
+            "mem://",
+            "--git-dir",
+        ])
+        .arg(&clone)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.starts_with("error: "), "{stderr}");
+    assert!(stderr.contains("git fetch --unshallow"), "{stderr}");
+    assert!(!stderr.contains("backtrace"), "{stderr}");
+
+    // After unshallowing, the whole history imports.
+    git(&clone, &["fetch", "-q", "--unshallow"]);
+    let r = import(&new_repo(), &clone, "HEAD", &ImportOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(r.commits_imported, 3);
+}

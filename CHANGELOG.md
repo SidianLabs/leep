@@ -16,6 +16,9 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 ### `/v1` compatibility tests
 - **Added.** `leep-core` now has compatibility tests that decode older-shaped `/v1` responses (`LogResponse`, `ChangesetInfo`, `LandResponse`, `LandRequest`) and freeze their field names, so a removed, renamed or non-defaulted field fails CI.
 
+### `leep-git import` refuses a shallow clone with a clear message
+- **Fixed.** Importing a shallow git clone failed with `git: An object with id ... could not be found` and a backtrace. It now says the clone is shallow and to run `git fetch --unshallow`, and `leep-git` prints errors as one `error:` line without a backtrace. Shallow history is refused rather than imported because the boundary commits would become roots with ids a later full import could not reuse.
+
 ### Blames of tracked files are kept current as changes land
 - **Added.** Every blame a server answers tracks its file (at most
   `--warm-blame-paths`, `LEEP_WARM_BLAME_PATHS`, default 1,024, each for 30
