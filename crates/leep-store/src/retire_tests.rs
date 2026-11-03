@@ -439,7 +439,7 @@ async fn an_object_store_merge_retires_its_packs_and_the_sweep_deletes_them_late
         .unwrap();
     assert_eq!(r.retired_removed, 4, "{r:?}");
     assert!(
-        bucket.head(&RETIRED_KEY.into()).await.is_err(),
+        restarted.retired_packs().await.unwrap().is_empty(),
         "record emptied"
     );
     let (ids, files) = crate::objpacks::list_packs_dir(&*bucket).await.unwrap();
@@ -448,4 +448,276 @@ async fn an_object_store_merge_retires_its_packs_and_the_sweep_deletes_them_late
     assert_reads(&reader, &objects, "old reader after the sweep").await;
     assert_reads(&ObjectBlobStore::new(bucket.clone()), &objects, "new").await;
     check_blob_store_contract(&restarted).await;
+}
+
+fn loose_batch(tag: &str, n: usize) -> Vec<Bytes> {
+    (0..n)
+        .map(|i| Bytes::from(format!("{tag} loose object {i}\n").repeat(i % 3 + 1)))
+        .collect()
+}
+
+fn full() -> RepackOptions {
+    RepackOptions {
+        threads: 1,
+        ..RepackOptions::default()
+    }
+}
+
+/// A merge can reproduce a retired pack byte for byte: A is published,
+/// A plus newer objects become N (A retired), GC deletes the newer
+/// objects, and a full repack inside A's fence writes exactly A again.
+/// The republished A must not stay retired, or it would hide the only
+/// copy of its objects (N is retired now) and a sweep would delete it.
+#[tokio::test]
+async fn a_merge_that_republishes_a_retired_pack_unretires_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let store = FsBlobStore::new(root);
+    let mut kept = BTreeMap::new();
+    for b in loose_batch("first", 20) {
+        kept.insert(store.put(b.clone()).await.unwrap(), b);
+    }
+    let mut p = store.repack_publish(Vec::new(), full()).await.unwrap();
+    let a = p.report().pack_id.clone().unwrap();
+    p.unlock();
+    p.finish().await.unwrap();
+    let mut newer = Vec::new();
+    for b in loose_batch("second", 20) {
+        newer.push(store.put(b).await.unwrap());
+    }
+    // A and the new loose objects into N; A retired, inside its fence.
+    let mut p = store.repack_publish(Vec::new(), full()).await.unwrap();
+    let n = p.report().pack_id.clone().unwrap();
+    p.unlock();
+    drop(p);
+    assert_ne!(n, a);
+    assert!(store
+        .retired_packs()
+        .unwrap()
+        .iter()
+        .any(|(id, _)| *id == a));
+    for h in &newer {
+        store.delete(h).await.unwrap();
+    }
+    // Only A's objects are live: a full repack writes A's bytes again.
+    let mut p = store.repack_publish(Vec::new(), full()).await.unwrap();
+    assert_eq!(
+        p.report().pack_id.as_deref(),
+        Some(a.as_str()),
+        "{:?}",
+        p.report()
+    );
+    p.unlock();
+    drop(p);
+    let retired: Vec<String> = store
+        .retired_packs()
+        .unwrap()
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(
+        retired,
+        vec![n.clone()],
+        "the republished pack is not retired"
+    );
+    assert_reads(&FsBlobStore::new(root), &kept, "a new process").await;
+    assert_reads(&store, &kept, "this process").await;
+    let r = store.retire_sweep(Duration::ZERO).await.unwrap().unwrap();
+    assert_eq!(r.retired_removed, 1, "{r:?}");
+    assert_eq!(indexes(root).into_keys().collect::<Vec<_>>(), vec![a]);
+    assert_reads(&FsBlobStore::new(root), &kept, "after the sweep").await;
+}
+
+/// The same on an object store, where the republished pack's upload is
+/// skipped (its id is listed already).
+#[tokio::test]
+async fn a_bucket_merge_that_republishes_a_retired_pack_unretires_it() {
+    let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let store = ObjectBlobStore::new(bucket.clone());
+    let mut kept = BTreeMap::new();
+    for b in loose_batch("first", 20) {
+        kept.insert(store.put(b.clone()).await.unwrap(), b);
+    }
+    let p = store.repack_publish(Vec::new(), full()).await.unwrap();
+    let a = p.report().pack_id.clone().unwrap();
+    p.finish().await.unwrap();
+    let mut newer = Vec::new();
+    for b in loose_batch("second", 20) {
+        newer.push(store.put(b).await.unwrap());
+    }
+    let mut p = store.repack_publish(Vec::new(), full()).await.unwrap();
+    let n = p.report().pack_id.clone().unwrap();
+    p.unlock().await;
+    drop(p);
+    assert_ne!(n, a);
+    assert!(store
+        .retired_packs()
+        .await
+        .unwrap()
+        .iter()
+        .any(|(id, _)| *id == a));
+    for h in &newer {
+        store.delete(h).await.unwrap();
+    }
+    let mut p = store.repack_publish(Vec::new(), full()).await.unwrap();
+    assert_eq!(
+        p.report().pack_id.as_deref(),
+        Some(a.as_str()),
+        "{:?}",
+        p.report()
+    );
+    p.unlock().await;
+    drop(p);
+    let retired: Vec<String> = store
+        .retired_packs()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(
+        retired,
+        vec![n.clone()],
+        "the republished pack is not retired"
+    );
+    assert_reads(
+        &ObjectBlobStore::new(bucket.clone()),
+        &kept,
+        "a new process",
+    )
+    .await;
+    let r = store.retire_sweep(Duration::ZERO).await.unwrap().unwrap();
+    assert_eq!(r.retired_removed, 1, "{r:?}");
+    let (ids, _) = crate::objpacks::list_packs_dir(&*bucket).await.unwrap();
+    assert_eq!(ids, vec![a]);
+    assert_reads(
+        &ObjectBlobStore::new(bucket.clone()),
+        &kept,
+        "after the sweep",
+    )
+    .await;
+}
+
+/// A bucket whose `packs/.retired` another writer rewrites between a
+/// repack's read of it and its PUT (one that lost the lease and has not
+/// noticed): the conditional PUT fails, the repack applies its change
+/// again, and neither writer's lines are lost.
+#[derive(Debug)]
+struct Interleaved {
+    inner: InMemory,
+    foreign: std::sync::Mutex<Option<String>>,
+}
+
+impl std::fmt::Display for Interleaved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Interleaved({})", self.inner)
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for Interleaved {
+    async fn put_opts(
+        &self,
+        location: &object_store::path::Path,
+        payload: object_store::PutPayload,
+        opts: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        if location.as_ref() == RETIRED_KEY {
+            let line = self.foreign.lock().unwrap().take();
+            if let Some(line) = line {
+                // The other writer gets in first, unconditionally.
+                let mut body = match self.inner.get(location).await {
+                    Ok(r) => r.bytes().await?.to_vec(),
+                    Err(_) => Vec::new(),
+                };
+                body.extend_from_slice(line.as_bytes());
+                self.inner.put(location, body.into()).await?;
+            }
+        }
+        self.inner.put_opts(location, payload, opts).await
+    }
+    async fn put_multipart_opts(
+        &self,
+        location: &object_store::path::Path,
+        opts: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+    async fn get_opts(
+        &self,
+        location: &object_store::path::Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<
+            'static,
+            object_store::Result<object_store::path::Path>,
+        >,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+        self.inner.delete_stream(locations)
+    }
+    fn list(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+    async fn copy_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        options: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+#[tokio::test]
+async fn a_rewrite_of_the_bucket_record_keeps_an_interleaved_writers_lines() {
+    let foreign_id = "ef".repeat(32);
+    let wrapped = Arc::new(Interleaved {
+        inner: InMemory::new(),
+        foreign: std::sync::Mutex::new(None),
+    });
+    let bucket: Arc<dyn ObjectStore> = wrapped.clone();
+    let store = ObjectBlobStore::new(bucket.clone());
+    land_packs(&store, &tags(0, 4)).await;
+    let land: Vec<String> = store
+        .pack_sizes()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|p| p.id)
+        .collect();
+    *wrapped.foreign.lock().unwrap() = Some(crate::retire::retired_line(&foreign_id, 1));
+    let mut p = store
+        .repack_publish(Vec::new(), planned(land.clone()))
+        .await
+        .unwrap();
+    p.unlock().await;
+    drop(p);
+    assert!(
+        wrapped.foreign.lock().unwrap().is_none(),
+        "the other writer ran"
+    );
+    let retired: Vec<String> = store
+        .retired_packs()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    assert!(retired.contains(&foreign_id), "{retired:?}");
+    for id in &land {
+        assert!(retired.contains(id), "{id} retired: {retired:?}");
+    }
 }

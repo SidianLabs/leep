@@ -523,8 +523,14 @@ async fn a_repack_killed_at_any_step_leaves_a_readable_store() {
             assert_eq!(report.objects, w.live.len() as u64, "{what}");
             assert_eq!(loose_count(&*objects).await, 0, "{what}");
             let (id, _) = index_of(&*objects).await;
+            // An emptied retired record stays, empty (ADR 0080).
+            let mut left = keys(&*objects, "packs").await;
+            if let Ok(r) = objects.get(&Path::from("packs/.retired")).await {
+                assert!(r.bytes().await.unwrap().is_empty(), "{what}");
+                left.retain(|k| k != "packs/.retired");
+            }
             assert_eq!(
-                keys(&*objects, "packs").await,
+                left,
                 vec![
                     "packs/.gen".to_string(),
                     format!("packs/{id}.idx"),

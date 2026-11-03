@@ -905,7 +905,8 @@ impl FsBlobStore {
         // they retire: durably, so no process scanning from now on, this
         // one after a restart included, searches or merges them again.
         let replaced: Vec<String> = replaced.into_iter().filter(|r| *r != id).collect();
-        crate::retire::append_retired(&dir, &replaced, now_secs())?;
+        crate::retire::retire_for(&dir, &replaced, &id, now_secs())?;
+        self.packs.unsupersede(&id);
         step(&opts, RepackStep::Retired)?;
         // Loading the new index holds it beside the old ones; the per-object
         // arrays of this run go first.

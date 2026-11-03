@@ -66,6 +66,25 @@ same lines in `packs/.retired`, rewritten whole. Invariants:
   in whole seconds, so a pack waits one second more than the fence; a clock
   set back delays deletion, one set forward shortens the wait.
 
+- **A published pack is never retired.** A pack id is the hash of its
+  index, so a merge can reproduce a pack byte for byte, and the id it
+  publishes may name a pack retired earlier and still listed (for
+  example A and B merged into N retire A; GC deletes all of B's objects;
+  a full repack inside A's fence writes exactly A again, and retires N).
+  Left retired, A would hide the only copy of its objects and a sweep
+  would delete it. So the repack that publishes a pack takes its id out of
+  the record in the same write that retires the sources (on a filesystem
+  a rewrite by rename instead of an append; in a bucket the same
+  conditional PUT), and out of its process's superseded set.
+- **The bucket record is rewritten conditionally.** A PUT with
+  `If-Match` on the etag read (`If-None-Match` when absent), so a writer
+  that lost the lease between its check and its PUT cannot drop another
+  holder's lines; on a conflict the writer checks the lease (stopping if
+  it lost it) and applies its change to what is there, up to eight times.
+  Backends without conditional updates fall back to a plain PUT, as the
+  lease does. An emptied record is left empty rather than deleted, since a
+  delete cannot be conditional.
+
 `PackSet::supersede` stays as the in-process fast path: the merging process
 stops searching the replaced packs without a scan.
 
@@ -133,6 +152,18 @@ leaves one, for the sweep.
   of their class, or a full repack, folds them in, as before this ADR.
 - An object store listing costs one more small GET (`packs/.retired`); a
   filesystem miss one more `stat`.
+- **Clock skew.** The fence is counted from the retiring writer's clock and
+  checked against the sweeping writer's. Between servers sharing a bucket
+  (or a network filesystem) whose clocks differ, a sweeper ahead of the
+  retirer shortens the fence by the skew. Keep the fence above the request
+  timeout plus the worst expected skew (the default adds a minute); a
+  bucket reader that still hits a deleted pack gets a 404 and lists again
+  (ADR 0040), which finds the replacement.
+- **Land stalls.** The filesystem sweep takes `packs/write.lock`
+  exclusively for its scan of `packs/` (to delete packs without an index
+  safely), now at every background interval (5 s), not only when a repack
+  publishes. Land pack writes wait for that scan, a directory listing of
+  a few dozen entries, and the sweep waits for writes in progress.
 - New metric `leep_repack_retired_removed_total`; `RepackStep::Retired`
   for fault hooks; `RepackReport::retired_removed`; `SweepReport`;
   `TickReport::swept`.

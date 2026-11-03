@@ -20,7 +20,7 @@ use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
 use leep_core::{BlobMeta, Error, Hash, Result};
 use object_store::path::Path;
-use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
+use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutPayload, UpdateVersion};
 
 use crate::pack::{self, IdxEntry, PackIndex};
 use crate::packset::{
@@ -54,33 +54,59 @@ pub(crate) const RETIRED_KEY: &str = "packs/.retired";
 
 /// The bucket's retired record; empty if it has none.
 pub(crate) async fn read_retired(store: &dyn ObjectStore) -> Result<Retired> {
+    Ok(read_retired_versioned(store).await?.0)
+}
+
+/// The record with the version it was read at (`None`: absent), for a
+/// conditional rewrite.
+pub(crate) async fn read_retired_versioned(
+    store: &dyn ObjectStore,
+) -> Result<(Retired, Option<UpdateVersion>)> {
     match store.get(&Path::from(RETIRED_KEY)).await {
-        Ok(r) => match r.bytes().await {
-            Ok(b) => Ok(parse_retired(&b)),
-            Err(e) if not_found(&e) => Ok(Retired::new()),
-            Err(e) => Err(storage_err(e)),
-        },
-        Err(e) if not_found(&e) => Ok(Retired::new()),
+        Ok(r) => {
+            let version = UpdateVersion {
+                e_tag: r.meta.e_tag.clone(),
+                version: r.meta.version.clone(),
+            };
+            match r.bytes().await {
+                Ok(b) => Ok((parse_retired(&b), Some(version))),
+                Err(e) if not_found(&e) => Ok((Retired::new(), None)),
+                Err(e) => Err(storage_err(e)),
+            }
+        }
+        Err(e) if not_found(&e) => Ok((Retired::new(), None)),
         Err(e) => Err(storage_err(e)),
     }
 }
 
-/// Replace the bucket's retired record with `r` (deleting it when empty).
+/// Replace the record with `r` only if it is still at `seen` (absent for
+/// `None`): `Ok(false)` if another writer changed it since. A backend
+/// without conditional updates (the local filesystem one) replaces it
+/// unconditionally, as the lease falls back too. An empty record is
+/// written empty rather than deleted, since a delete cannot be conditional.
 /// Only under the repack lease; the caller announces it with [`bump_gen`].
-pub(crate) async fn write_retired(store: &dyn ObjectStore, r: &Retired) -> Result<()> {
+pub(crate) async fn put_retired(
+    store: &dyn ObjectStore,
+    r: &Retired,
+    seen: Option<UpdateVersion>,
+) -> Result<bool> {
     let key = Path::from(RETIRED_KEY);
-    if r.is_empty() {
-        return match store.delete(&key).await {
-            Ok(()) => Ok(()),
-            Err(e) if not_found(&e) => Ok(()),
-            Err(e) => Err(storage_err(e)),
-        };
+    let body = || PutPayload::from(encode_retired(r).into_bytes());
+    let mode = match seen {
+        Some(v) => PutMode::Update(v),
+        None => PutMode::Create,
+    };
+    match store.put_opts(&key, body(), mode.into()).await {
+        Ok(_) => Ok(true),
+        Err(object_store::Error::Precondition { .. })
+        | Err(object_store::Error::AlreadyExists { .. }) => Ok(false),
+        Err(object_store::Error::NotFound { .. }) => Ok(false),
+        Err(object_store::Error::NotImplemented { .. }) => {
+            store.put(&key, body()).await.map_err(storage_err)?;
+            Ok(true)
+        }
+        Err(e) => Err(storage_err(e)),
     }
-    store
-        .put(&key, PutPayload::from(encode_retired(r).into_bytes()))
-        .await
-        .map_err(storage_err)?;
-    Ok(())
 }
 
 /// What a read of [`GEN_KEY`] saw.
@@ -454,6 +480,12 @@ impl RemotePackSet {
                 current.retired.clone(),
             );
         }
+    }
+
+    /// Search `id` again (see `packset::PackSet::unsupersede`); takes
+    /// effect at the next listing.
+    pub fn unsupersede(&self, id: &str) {
+        self.superseded.lock().unwrap().remove(id);
     }
 
     /// A view that holds every pack published before `since`: one LIST

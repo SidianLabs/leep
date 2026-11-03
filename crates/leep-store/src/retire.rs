@@ -133,6 +133,30 @@ pub(crate) fn append_retired(dir: &Path, ids: &[String], at: i64) -> Result<()> 
     Ok(())
 }
 
+/// Record that the pack `published` holds every live object of `ids`:
+/// retire `ids` at `at` and take `published` out of the record. A merge
+/// can reproduce a pack byte for byte (the id is the index's hash), so
+/// `published` may name a pack retired earlier and still listed; left
+/// retired, it would hide the only copy of what `ids` held, and a sweep
+/// would delete it. An append when `published` is not in the record,
+/// else a rewrite by rename. Only under the repack lock.
+pub(crate) fn retire_for(dir: &Path, ids: &[String], published: &str, at: i64) -> Result<()> {
+    let mut r = read_retired(dir)?;
+    if r.remove(published).is_none() {
+        return append_retired(dir, ids, at);
+    }
+    for id in ids {
+        r.entry(id.clone()).or_insert(at);
+    }
+    if r.is_empty() {
+        remove_if_present(&dir.join(RETIRED))?;
+        return sync_dir(dir);
+    }
+    let tmp = write_durably(dir, "retired", encode_retired(&r).as_bytes())?;
+    std::fs::rename(&tmp, dir.join(RETIRED)).map_err(storage_err)?;
+    sync_dir(dir)
+}
+
 /// Cut off a last line without its newline (an append that died part way),
 /// so the next append does not join it. Whether the file exists.
 fn cut_torn_line(path: &Path) -> Result<bool> {

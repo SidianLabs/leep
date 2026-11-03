@@ -686,6 +686,13 @@ impl PackSet {
         metrics::gauge!("leep_blob_packs").set(searchable as f64);
     }
 
+    /// Search `id` again: a repack of this process published it anew (the
+    /// same bytes as a pack it had superseded). Takes effect at the next
+    /// scan.
+    pub fn unsupersede(&self, id: &str) {
+        self.superseded.lock().unwrap().remove(id);
+    }
+
     /// The view, rescanned first if the tombstones file changed since. One
     /// `stat`, so a caller that must not report a deleted object can afford it.
     pub fn fresh_tombstones(&self) -> Result<Arc<View>> {

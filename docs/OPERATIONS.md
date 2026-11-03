@@ -2144,6 +2144,17 @@ repack or pack write, or are leftovers the next sweep deletes.
 `packs/retired` is the record that keeps retired packs unread; deleting it
 makes them searched and merged again until a repack retires them anew.
 
+**Restoring from a raw copy.** If you restore a filesystem blob store from
+a directory copy of a live store (`rsync`, `cp`, a non-atomic snapshot)
+rather than with `leep-server backup` and `restore`, delete
+`packs/retired` from the copy before starting servers on it. The copy can
+hold a retired pack and the record that hides it but not the pack that
+replaced it (copied before it was published, or the record copied after
+it), and the record would then hide, and a sweep would delete, the only
+copy of those objects. Without the record those packs are searched again
+and the next merge folds them in. The same applies to `packs/.retired` in
+a bucket copied object by object.
+
 ### Packing an object store (`s3://`)
 
 The same command and flags. Differences from a filesystem store:
