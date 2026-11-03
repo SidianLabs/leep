@@ -139,6 +139,26 @@ merges; no judgement of X). Tests:
 `a_reject_on_a_copy_takes_back_the_approval_it_carried`,
 `too_many_reviewed_candidates_carry_nothing_and_the_work_is_bounded`.
 
+*Second follow-up.* Taking back skipped an approval stamped later than the
+reject, and review times are each server's wall clock in seconds: with skewed
+servers or a clock stepped back, approve X at t=100 and reject the copy X2
+at t=98 left X approved, and newest-wins then let a copy naming both carry
+the approval. The posted verdict now takes back regardless of the clocks,
+stamped past the approval it replaces. Taking back also stopped after 16
+candidates, leaving the 17th approval live; it is no longer capped (the
+64-candidate walk bounds it). Tests:
+`a_reject_takes_back_an_approval_stamped_later_by_a_skewed_clock`,
+`a_reject_takes_back_every_approved_copy_it_names`.
+
+*Accepted.* Taking back follows Y's hints: a reject on a copy that names
+nothing, or on an identical copy approved independently, leaves X approved.
+An author can make Y as X's change plus an extra file and name X, so a
+reviewer rejecting Y for the extra file also rejects X; the
+`leep:taken-back-on:<Y>` source row on X shows it. A storage failure part way
+through taking back answers 500 with some candidates written; posting the
+verdict again repairs it. A resolved stack with more than 16 entries
+reviewed by others carries nothing, by design.
+
 *Accepted.* A carried approval re-lands a change identical to one that was
 later reverted: the identical-change rule cannot tell a reverted change from
 one never landed, as landing the approved original itself again could not. The hint walk is bounded (64

@@ -24,7 +24,7 @@ use leep_core::api::{PathReview, ReviewEntry, ReviewStatusResponse, ReviewsRespo
 use leep_core::review::{Review, ReviewSource, Verdict, NEEDS_REVIEW_MARKER};
 use leep_core::{ChangesetId, Error, Result};
 use leep_derive::owners::OwnersResolver;
-use leep_derive::review::{later, AutoRule, Carried, ChangesetReview, PathRule, ReviewRules};
+use leep_derive::review::{AutoRule, Carried, ChangesetReview, PathRule, ReviewRules};
 use leep_derive::{LandPolicy, Repo};
 use serde::Deserialize;
 
@@ -242,6 +242,12 @@ impl ReviewService {
     /// a later copy naming only that candidate would carry the approval the
     /// reviewer just took back on an identical change. Returns the
     /// candidates written.
+    ///
+    /// The verdict being posted is the reviewer's newest word whatever the
+    /// clocks say, so an approval stamped later (skewed servers, a clock
+    /// stepped back) is still taken back, and the row written is stamped no
+    /// earlier than it so the judge never ranks it below. Not capped: every
+    /// approval left would stay live, and the hint walk bounds the work.
     pub async fn take_back(
         &self,
         repo: &Repo,
@@ -253,30 +259,30 @@ impl ReviewService {
             return Ok(Vec::new());
         }
         let mut written = Vec::new();
-        let mut checks = 0;
         for from in repo.carry_candidates(id).await? {
             let theirs = match repo.get_review(from, &review.reviewer).await {
                 Ok(Some(r)) => r,
                 Ok(None) | Err(Error::Encoding(_)) => continue,
                 Err(e) => return Err(e),
             };
-            if theirs.verdict != Verdict::Approve || later(&theirs, review) {
+            if theirs.verdict != Verdict::Approve {
                 continue;
-            }
-            checks += 1;
-            if checks > MAX_CARRY_CHECKS {
-                break;
             }
             if repo.carried_paths(from, id, &self.rules).await?.is_none() {
                 continue;
             }
+            let timestamp = if theirs.timestamp >= review.timestamp {
+                theirs.timestamp + 1
+            } else {
+                review.timestamp
+            };
             repo.put_review_source(
                 from,
                 &review.reviewer,
                 &ReviewSource {
                     via: via.to_string(),
                     source: format!("leep:taken-back-on:{id}"),
-                    timestamp: review.timestamp,
+                    timestamp,
                 },
             )
             .await?;
@@ -289,7 +295,7 @@ impl ReviewService {
                         "{} on {id}, which makes this change",
                         review.verdict.as_str()
                     ),
-                    timestamp: review.timestamp,
+                    timestamp,
                 },
             )
             .await?;

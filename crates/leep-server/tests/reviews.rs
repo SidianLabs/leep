@@ -2055,3 +2055,85 @@ async fn too_many_reviewed_candidates_carry_nothing_and_the_work_is_bounded() {
         .await;
     assert!(api.status(ok).await.approved);
 }
+
+#[tokio::test]
+async fn a_reject_takes_back_an_approval_stamped_later_by_a_skewed_clock() {
+    // The approval on `x` carries a later time than the reject posted on
+    // `x2` (another server's clock ahead, or this one stepped back). The
+    // reject is still alice's newest word: it is taken back, and stamped so
+    // a copy naming both does not rank the approval above it.
+    let c = carry_setup().await;
+    let ahead = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+        + 1_000;
+    put_at(&c.api, c.x, "alice", Verdict::Approve, ahead).await;
+    let x2 = c.resolve(A1, Some(c.x)).await;
+    assert!(c.api.status(x2).await.approved);
+    assert_eq!(
+        c.api.review(x2, "alice", Verdict::Reject).await.status,
+        StatusCode::OK
+    );
+    let on_x = c.api.repo.get_review(c.x, "alice").await.unwrap().unwrap();
+    assert_eq!(on_x.verdict, Verdict::Reject);
+    assert!(on_x.timestamp > ahead, "{on_x:?}");
+    for hint in [
+        c.x.to_string(),
+        format!("{},{x2}", c.x),
+        format!("{x2},{}", c.x),
+    ] {
+        let z = c
+            .api
+            .commit_from(&[c.head], &[("src/a.rs", Some(A1))], Some(&hint))
+            .await;
+        let s = c.api.status(z).await;
+        assert_eq!(rules(&s), [("src/a.rs", "rejected")], "{hint}: {s:?}");
+        assert_eq!(
+            c.api.land(z, "bob").await.status,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_reject_takes_back_every_approved_copy_it_names() {
+    // More approved copies than the carry comparison cap: taking back is
+    // not capped, so none of them is left to carry the approval.
+    let c = carry_setup().await;
+    let mut copies = Vec::new();
+    for i in 0..17 {
+        // A junk id in each hint only makes the copies distinct.
+        let x = c
+            .api
+            .commit_from(
+                &[c.head],
+                &[
+                    ("src/a.rs", Some(A1)),
+                    ("CHANGELOG.md", Some("# log\n- other\n- x\n")),
+                ],
+                Some(&format!("{},junk{i}", c.x)),
+            )
+            .await;
+        c.api.approve(x, "alice").await;
+        copies.push(x);
+    }
+    let hint: Vec<String> = copies.iter().map(ToString::to_string).collect();
+    let y = c
+        .api
+        .commit_from(&[c.head], &[("src/a.rs", Some(A1))], Some(&hint.join(",")))
+        .await;
+    assert_eq!(
+        c.api.review(y, "alice", Verdict::Reject).await.status,
+        StatusCode::OK
+    );
+    for x in &copies {
+        let r = c.api.repo.get_review(*x, "alice").await.unwrap().unwrap();
+        assert_eq!(r.verdict, Verdict::Reject, "{x}");
+    }
+    let z = c
+        .api
+        .commit_from(&[c.head], &[("src/a.rs", Some(A1))], Some(&hint[16]))
+        .await;
+    assert_eq!(rules(&c.api.status(z).await), [("src/a.rs", "rejected")]);
+}

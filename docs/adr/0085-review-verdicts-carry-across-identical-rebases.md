@@ -66,13 +66,35 @@ where that reviewer's approval would carry to Y. Otherwise a later copy that
 names only X, not Y, would carry the approval the reviewer just took back on
 an identical change: candidates are found from hints, never by searching for
 copies. This changes X's own status too, which is the point: its reviewed
-change is the one rejected.
+change is the one rejected. The verdict being posted is the reviewer's newest
+word whatever the clocks say: an approval on X stamped later than it (servers
+with skewed clocks, a clock stepped back) is taken back all the same, and the
+row written on X is stamped one second past that approval when the approval
+is not older, so the judge never ranks the approval above it. Taking back is
+not capped by `MAX_CARRY_CHECKS`: every approval it skipped would stay live.
+Its work is bounded by the 64-candidate walk, and it runs only on an
+authenticated review post.
+
+Limits of taking back, accepted:
+
+- It follows Y's hints only. A reject on a copy with no hint, or on an
+  identical copy that was approved independently and names nothing, leaves
+  X approved; a later copy naming X still carries that approval.
+- An author can make Y as X's change plus an extra file and name X. A
+  reviewer who rejects Y only for the extra file also rejects X. The
+  `leep:taken-back-on:<Y>` source row on X shows where the verdict came
+  from, and the reviewer can approve X again.
+- The rows are written one candidate after another. A storage failure part
+  way answers 500 with some candidates written and others not; posting the
+  same verdict again writes the rest.
 
 **Bounds.** At most 64 candidates are walked (one changeset read each, and
 one `rebased-origin-v1` read for each that has a hint); reviews are read
 once per candidate per status request or land check; at most 16 candidates
 with reviews by others are compared (`MAX_CARRY_CHECKS`), and with a 17th
-nothing carries at all, since stopping early could drop a newer reject. A
+nothing carries at all, since stopping early could drop a newer reject. This
+holds for a resolved stack too: one with more than 16 entries reviewed by
+others carries nothing, by design, and is reviewed again. A
 comparison needs no judgement of X: a path whose new content differs is
 refused before any read unless an auto rule could hold for it, each matching
 path costs two file lookups, and only differing paths read contents for the
