@@ -1862,4 +1862,193 @@ mod tests {
         assert_eq!(v, serde_json::json!({ "entries": [], "next": "d" }));
         assert_eq!(serde_json::from_value::<DiffResponse>(v).unwrap(), diff);
     }
+
+    /// The `/v1` rule (CLAUDE.md): fields are only added, with
+    /// `#[serde(default)]`. These fixtures are shaped like the first
+    /// servers' answers; if one stops decoding, a field was added without
+    /// a default (or renamed or removed).
+    mod compat {
+        use super::*;
+        use serde_json::{json, Value};
+
+        fn id(s: &str) -> String {
+            ChangesetId(Hash::of_blob(s.as_bytes())).to_string()
+        }
+
+        /// A `ChangesetInfo` as the oldest servers sent it: no `path_at`,
+        /// no `renamed`, and a changeset with no `extra`.
+        fn old_info() -> Value {
+            json!({
+                "id": id("c1"),
+                "changeset": {
+                    "parents": [id("c0")],
+                    "author": "dev",
+                    "timestamp": 1_700_000_000,
+                    "message": "m",
+                    "changes": {
+                        "a.txt": { "modify": {
+                            "content": Hash::of_blob(b"x").to_string(),
+                            "kind": "regular", "size": 1 } },
+                        "b.txt": "delete"
+                    }
+                },
+                "generation": 2,
+                "root_tree": Hash::of_blob(b"t").to_string()
+            })
+        }
+
+        fn keys(v: &Value) -> Vec<&str> {
+            v.as_object().unwrap().keys().map(String::as_str).collect()
+        }
+
+        fn assert_has(v: &Value, frozen: &[&str], what: &str) {
+            for k in frozen {
+                assert!(
+                    v.get(*k).is_some(),
+                    "{what} lost frozen /v1 field {k:?}; has {:?}",
+                    keys(v)
+                );
+            }
+        }
+
+        #[test]
+        fn old_changeset_info_and_log_decode() {
+            let info: ChangesetInfo = serde_json::from_value(old_info()).unwrap();
+            assert_eq!(info.generation, 2);
+            assert_eq!(info.changeset.changes.len(), 2);
+            assert!(info.changeset.extra.is_empty());
+            assert!(info.path_at.is_none() && info.renamed.is_none());
+
+            let log: LogResponse =
+                serde_json::from_value(json!({ "entries": [old_info(), old_info()] })).unwrap();
+            assert_eq!(log.entries.len(), 2);
+            assert!(log.next.is_none() && log.answered_at.is_none() && log.behind.is_none());
+            let empty: LogResponse = serde_json::from_value(json!({ "entries": [] })).unwrap();
+            assert!(empty.entries.is_empty());
+        }
+
+        #[test]
+        fn old_land_shapes_decode() {
+            let onto = id("onto");
+            let landed: LandResponse = serde_json::from_value(
+                json!({ "status": "landed", "landed": id("l"), "rebased": true, "attempts": 3 }),
+            )
+            .unwrap();
+            assert!(matches!(landed, LandResponse::Landed { attempts: 3, .. }));
+            // Before `clean` existed a conflict answer had only these.
+            let conflicts: LandResponse = serde_json::from_value(json!({
+                "status": "conflicts", "onto": onto,
+                "conflicts": [{ "path": "a.txt", "base": null, "ours": null, "theirs": null }]
+            }))
+            .unwrap();
+            match conflicts {
+                LandResponse::Conflicts {
+                    conflicts, clean, ..
+                } => {
+                    assert_eq!(conflicts.len(), 1);
+                    assert!(clean.is_empty());
+                    assert!(conflicts[0].merged_with_markers.is_none());
+                }
+                other => panic!("wrong variant: {other:?}"),
+            }
+            let req: LandRequest = serde_json::from_value(json!({ "changeset": id("c") })).unwrap();
+            assert_eq!(req.target_ref, "main");
+        }
+
+        #[test]
+        fn frozen_field_names_survive_serialization() {
+            let mut info: ChangesetInfo = serde_json::from_value(old_info()).unwrap();
+            info.path_at = Some(RepoPath::new("a.txt").unwrap());
+            info.renamed = Some(RenameEntry {
+                from: RepoPath::new("b.txt").unwrap(),
+                to: RepoPath::new("a.txt").unwrap(),
+                similarity: 100,
+                exact: true,
+            });
+            let v = serde_json::to_value(&info).unwrap();
+            assert_has(
+                &v,
+                &[
+                    "id",
+                    "changeset",
+                    "generation",
+                    "root_tree",
+                    "path_at",
+                    "renamed",
+                ],
+                "ChangesetInfo",
+            );
+            assert_has(
+                &v["changeset"],
+                &[
+                    "parents",
+                    "author",
+                    "timestamp",
+                    "message",
+                    "changes",
+                    "extra",
+                ],
+                "Changeset",
+            );
+            assert_has(
+                &v["renamed"],
+                &["from", "to", "similarity", "exact"],
+                "RenameEntry",
+            );
+            assert_has(
+                &v["changeset"]["changes"]["a.txt"]["modify"],
+                &["content", "kind", "size"],
+                "FileChange::Modify",
+            );
+
+            let log = LogResponse {
+                entries: vec![info],
+                next: Some("n".into()),
+                answered_at: Some(ChangesetId(Hash::of_blob(b"a"))),
+                behind: Some(1),
+            };
+            let v = serde_json::to_value(&log).unwrap();
+            assert_has(
+                &v,
+                &["entries", "next", "answered_at", "behind"],
+                "LogResponse",
+            );
+            assert_eq!(serde_json::from_value::<LogResponse>(v).unwrap(), log);
+
+            let landed = serde_json::to_value(LandResponse::Landed {
+                landed: ChangesetId(Hash::of_blob(b"l")),
+                rebased: false,
+                attempts: 1,
+            })
+            .unwrap();
+            assert_has(
+                &landed,
+                &["status", "landed", "rebased", "attempts"],
+                "Landed",
+            );
+            assert_eq!(landed["status"], "landed");
+
+            let conflicts = serde_json::to_value(LandResponse::Conflicts {
+                onto: ChangesetId(Hash::of_blob(b"o")),
+                conflicts: vec![],
+                clean: BTreeMap::new(),
+            })
+            .unwrap();
+            assert_has(
+                &conflicts,
+                &["status", "onto", "conflicts", "clean"],
+                "Conflicts",
+            );
+            assert_eq!(conflicts["status"], "conflicts");
+
+            let req = serde_json::to_value(LandRequest {
+                changeset: ChangesetId(Hash::of_blob(b"c")),
+                target_ref: "main".into(),
+                create: Some(true),
+                land_id: None,
+            })
+            .unwrap();
+            assert_has(&req, &["changeset", "target_ref", "create"], "LandRequest");
+        }
+    }
 }

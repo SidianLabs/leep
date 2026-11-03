@@ -13,6 +13,9 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 ### Postgres memory sizing guide
 - **Added.** OPERATIONS.md, "Sizing Postgres memory": what grows per changeset, `shared_buffers` and `effective_cache_size` guidance, how to check the hit ratio, and the slow cold-blame symptom; linked from DEPLOY.md.
 
+### `/v1` compatibility tests
+- **Added.** `leep-core` now has compatibility tests that decode older-shaped `/v1` responses (`LogResponse`, `ChangesetInfo`, `LandResponse`, `LandRequest`) and freeze their field names, so a removed, renamed or non-defaulted field fails CI.
+
 ### Blames of tracked files are kept current as changes land
 - **Added.** Every blame a server answers tracks its file (at most
   `--warm-blame-paths`, `LEEP_WARM_BLAME_PATHS`, default 1,024, each for 30
