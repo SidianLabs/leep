@@ -87,6 +87,15 @@ impl Target {
         }
     }
 
+    /// Garbage and the packs earlier repacks retired at least `fence` ago
+    /// (ADR 0080); `None` while another repack holds the store.
+    async fn sweep(&self, fence: Duration) -> leep_core::Result<Option<leep_store::SweepReport>> {
+        match self {
+            Target::Fs(s) => s.retire_sweep(fence).await,
+            Target::Object(s) => s.retire_sweep(fence).await,
+        }
+    }
+
     async fn publish(
         &self,
         hints: leep_core::intern::PackHints,
@@ -117,6 +126,17 @@ pub async fn run_repack(meta: &str, blobs: &str, args: RepackArgs) -> anyhow::Re
         );
     }
     let started = Instant::now();
+    // What earlier runs left: temp files, packs without an index, and packs
+    // retired by a repack (or a server's background merge) that stopped
+    // before deleting them. A store held by another repack is refused by
+    // the publish below.
+    let swept = target.sweep(args.fence).await?.unwrap_or_default();
+    if swept.retired_waiting > 0 {
+        tracing::info!(
+            waiting = swept.retired_waiting,
+            "retired packs inside their fence left for a later sweep"
+        );
+    }
     let meta = super::open_meta(meta).await.context("opening meta store")?;
     let repo = Repo::new(target.blob_store(), meta);
     let mode = match &target {
@@ -153,7 +173,9 @@ pub async fn run_repack(meta: &str, blobs: &str, args: RepackArgs) -> anyhow::Re
     tracing::info!(fence = ?args.fence, "published; waiting out the fence before cleanup");
     tokio::time::sleep(args.fence).await;
     let fenced = started.elapsed();
-    let report = published.finish().await?;
+    let mut report = published.finish().await?;
+    report.garbage_removed += swept.garbage_removed;
+    report.retired_removed += swept.retired_removed;
     let total = started.elapsed();
     let timing = Timing {
         walk: walked,
@@ -205,6 +227,7 @@ fn json(r: &RepackReport, full: bool, changesets: u64, t: &Timing) -> serde_json
         "loose_removed": r.loose_removed,
         "loose_kept": r.loose_kept,
         "old_packs_removed": r.old_packs_removed,
+        "retired_removed": r.retired_removed,
         "packs_after": r.packs_after,
         "loose_after": r.loose_after,
         "loose_bytes_after": r.loose_bytes_after,
@@ -284,6 +307,12 @@ fn print_report(r: &RepackReport, full: bool, changesets: u64, t: &Timing) {
         r.loose_removed,
         r.loose_kept
     );
+    if r.retired_removed > 0 {
+        outln!(
+            "packs retired by earlier repacks and deleted past their fence: {}",
+            r.retired_removed
+        );
+    }
     outln!(
         "old packs deleted: {}, packs now: {}",
         r.old_packs_removed,

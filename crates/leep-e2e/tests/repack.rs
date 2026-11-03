@@ -1,8 +1,10 @@
 //! `leep-server repack` with the real binaries (ADR 0029): a history is
 //! packed while a server serves it, and everything a user can ask answers
 //! the same before and after; `verify --full --rehash` is clean; a repack
-//! killed with SIGKILL at several points loses nothing; and a packed store
-//! backs up and restores. Run `cargo build --workspace` first.
+//! killed with SIGKILL at several points loses nothing; a packed store
+//! backs up and restores; and a server killed while its background merges
+//! wait for their fence never merges their packs again (ADR 0080). Run
+//! `cargo build --workspace` first.
 
 mod common;
 
@@ -430,4 +432,149 @@ fn packed_store_backs_up_and_restores() {
     // The restored store packs too.
     repack(&dest, &["--unsafe-no-fence"]);
     verify_clean(&dest, "restored and repacked");
+}
+
+/// Copies of each object across the published packs, leaving out the
+/// retired ones if `searched`.
+fn pack_copies(stores: &Stores, searched: bool) -> std::collections::BTreeMap<String, usize> {
+    let dir = blobs_dir(stores).join("packs");
+    let retired = retired_ids(stores);
+    let mut out = std::collections::BTreeMap::new();
+    for f in pack_files(stores) {
+        let Some(id) = f.strip_suffix(".idx") else {
+            continue;
+        };
+        if searched && retired.iter().any(|r| r == id) {
+            continue;
+        }
+        let idx = leep_store::pack::PackIndex::decode(fs::read(dir.join(&f)).unwrap()).unwrap();
+        for r in 0..idx.len() {
+            *out.entry(idx.hash_at(r).to_hex()).or_default() += 1;
+        }
+    }
+    out
+}
+
+/// The ids `packs/retired` names.
+fn retired_ids(stores: &Stores) -> Vec<String> {
+    fs::read_to_string(blobs_dir(stores).join("packs/retired"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.split_once(' ').map(|(id, _)| id.to_string()))
+        .collect()
+}
+
+fn dir_bytes(dir: &Path) -> u64 {
+    fs::read_dir(dir)
+        .map(|rd| rd.flatten().map(|e| e.metadata().unwrap().len()).sum())
+        .unwrap_or(0)
+}
+
+/// A server SIGKILLed while its background merges wait for their fence,
+/// several times: the merged packs stay retired across restarts, so they
+/// are never searched or merged again, and a server started after the
+/// fence deletes them. Before ADR 0080 each restart merged them again,
+/// and the pack directory grew with every restart.
+#[test]
+fn background_merges_killed_inside_the_fence_do_not_grow_the_pack_dir() {
+    let _g = serial();
+    let tmp = tempfile::tempdir().unwrap();
+    let work = tmp.path();
+    let stores = Stores::sqlite(&work.join("site"));
+    let flags = |fence: &'static str| {
+        [
+            "--land-pack-min-objects",
+            "1",
+            "--background-repack-packs",
+            "2",
+            "--background-repack-interval",
+            "1s",
+            "--background-repack-fence",
+            fence,
+        ]
+    };
+    let port = free_port();
+    let mut server = Server::start_with(port, &stores, work, &flags("1h"));
+    let client = Client::new(&server.url, &work.join("cache"));
+    let wc = work.join("wc");
+    client.ok(work, &["init", wc.to_str().unwrap()]);
+    let packs_dir = blobs_dir(&stores).join("packs");
+    let mut sizes = Vec::new();
+    for round in 0..4 {
+        let retired_before = retired_ids(&stores).len();
+        for i in 0..8 {
+            write(
+                &wc,
+                &format!("src/r{round}/f{i}.txt"),
+                &format!("round {round} file {i}\n"),
+            );
+            client.ok(&wc, &["commit", "-m", &format!("round {round} change {i}")]);
+            client.ok(&wc, &["land"]);
+        }
+        // Wait for a background merge to retire packs, then kill the
+        // server inside the fence.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while retired_ids(&stores).len() <= retired_before {
+            assert!(
+                Instant::now() < deadline,
+                "round {round}: no merge; packs {:?}\n{}",
+                pack_files(&stores),
+                server.log_text()
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        server.kill();
+        let dup: Vec<_> = pack_copies(&stores, true)
+            .into_iter()
+            .filter(|(_, n)| *n > 1)
+            .collect();
+        assert!(dup.is_empty(), "round {round}: searched twice: {dup:?}");
+        sizes.push(dir_bytes(&packs_dir));
+        server = Server::start_with(port, &stores, work, &flags("1h"));
+    }
+    let log = client.json(&wc, &["log", "main", "-n", "1000"]);
+    let files = checkout(&client, work, "co-before");
+    assert_eq!(files.len(), 32);
+    server.kill();
+
+    // After the fence a new server deletes every retired pack.
+    std::thread::sleep(Duration::from_secs(3));
+    let server = Server::start_with(port, &stores, work, &flags("1s"));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !retired_ids(&stores).is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "not swept\n{}",
+            server.log_text()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let copies = pack_copies(&stores, false);
+    assert!(
+        copies.values().all(|&n| n == 1),
+        "one copy of each object: {copies:?}"
+    );
+    let junk: Vec<String> = fs::read_dir(&packs_dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(".tmp-"))
+        .collect();
+    assert!(junk.is_empty(), "{junk:?}");
+    let packs: Vec<String> = pack_files(&stores);
+    let pack_count = packs.iter().filter(|f| f.ends_with(".pack")).count();
+    assert_eq!(
+        pack_count * 2,
+        packs.len(),
+        "every pack has its index: {packs:?}"
+    );
+    let swept = dir_bytes(&packs_dir);
+    assert!(
+        swept <= *sizes.iter().max().unwrap(),
+        "{swept} bytes after the sweep, {sizes:?} before"
+    );
+    assert_eq!(client.json(&wc, &["log", "main", "-n", "1000"]), log);
+    assert_eq!(checkout(&client, work, "co-after"), files);
+    drop(server);
+    verify_clean(&stores, "after restarts and the sweep");
 }

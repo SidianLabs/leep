@@ -24,8 +24,9 @@ use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 
 use crate::pack::{self, IdxEntry, PackIndex};
 use crate::packset::{
-    merge_listing, order_packs, record_miss, DecodedCache, PackLike, ScanReason, Tombstones,
+    hidden, merge_listing, order_packs, record_miss, DecodedCache, PackLike, ScanReason, Tombstones,
 };
+use crate::retire::{encode_retired, parse_retired, Retired};
 use crate::storage_err;
 
 pub(crate) const PACKS_PREFIX: &str = "packs";
@@ -44,6 +45,42 @@ pub(crate) const GEN_WINDOW: Duration = Duration::from_millis(50);
 
 pub(crate) fn gen_key() -> Path {
     Path::from(GEN_KEY)
+}
+
+/// The retired packs record of a bucket (ADR 0080): the filesystem's
+/// `packs/retired` lines, rewritten whole (buckets have no append) only by
+/// a lease holder, and followed by a write of [`GEN_KEY`].
+pub(crate) const RETIRED_KEY: &str = "packs/.retired";
+
+/// The bucket's retired record; empty if it has none.
+pub(crate) async fn read_retired(store: &dyn ObjectStore) -> Result<Retired> {
+    match store.get(&Path::from(RETIRED_KEY)).await {
+        Ok(r) => match r.bytes().await {
+            Ok(b) => Ok(parse_retired(&b)),
+            Err(e) if not_found(&e) => Ok(Retired::new()),
+            Err(e) => Err(storage_err(e)),
+        },
+        Err(e) if not_found(&e) => Ok(Retired::new()),
+        Err(e) => Err(storage_err(e)),
+    }
+}
+
+/// Replace the bucket's retired record with `r` (deleting it when empty).
+/// Only under the repack lease; the caller announces it with [`bump_gen`].
+pub(crate) async fn write_retired(store: &dyn ObjectStore, r: &Retired) -> Result<()> {
+    let key = Path::from(RETIRED_KEY);
+    if r.is_empty() {
+        return match store.delete(&key).await {
+            Ok(()) => Ok(()),
+            Err(e) if not_found(&e) => Ok(()),
+            Err(e) => Err(storage_err(e)),
+        };
+    }
+    store
+        .put(&key, PutPayload::from(encode_retired(r).into_bytes()))
+        .await
+        .map_err(storage_err)?;
+    Ok(())
 }
 
 /// What a read of [`GEN_KEY`] saw.
@@ -141,6 +178,9 @@ pub(crate) struct View {
     /// this process superseded (see `packset::View`).
     pub packs: Vec<(Arc<RemotePack>, HashSet<Hash>)>,
     searchable: usize,
+    /// The packs `packs/.retired` named when this view's listing read it
+    /// (ADR 0080), ordered after the searchable ones.
+    retired: Arc<HashSet<String>>,
     /// When the listing behind this view began.
     started: Instant,
     /// When the latest listing of `packs/` began, this one's or a later
@@ -160,7 +200,7 @@ impl View {
         })
     }
 
-    /// The packs reads search.
+    /// The packs reads search: not superseded here, not retired.
     pub fn searchable(&self) -> &[(Arc<RemotePack>, HashSet<Hash>)] {
         &self.packs[..self.searchable]
     }
@@ -360,16 +400,18 @@ impl RemotePackSet {
         started: Instant,
         packs_started: Instant,
         gen: Gen,
+        retired: Arc<HashSet<String>>,
     ) -> Arc<View> {
         let superseded = {
             let mut s = self.superseded.lock().unwrap();
             s.retain(|id| packs.iter().any(|(p, _)| p.id == *id));
             s.clone()
         };
-        let searchable = order_packs(&mut packs, &superseded);
+        let searchable = order_packs(&mut packs, &hidden(&superseded, &retired));
         let view = Arc::new(View {
             packs,
             searchable,
+            retired,
             started,
             packs_started,
             gen,
@@ -395,6 +437,7 @@ impl RemotePackSet {
             current.started,
             current.packs_started,
             current.gen.clone(),
+            current.retired.clone(),
         );
     }
 
@@ -408,6 +451,7 @@ impl RemotePackSet {
                 current.started,
                 current.packs_started,
                 current.gen.clone(),
+                current.retired.clone(),
             );
         }
     }
@@ -429,6 +473,10 @@ impl RemotePackSet {
             return self.refresh_after(Instant::now(), ScanReason::First).await;
         };
         let gen = self.gen_since(Instant::now()).await?;
+        // After the stamp: a retirement is written before the stamp that
+        // announces it, so a stamp this view records was not followed by a
+        // retirement this read missed.
+        let retired = self.retired_now().await?;
         let packs_started = Instant::now();
         let ids = self.list_packs(reason).await?;
         let new: Vec<String> = ids
@@ -447,7 +495,7 @@ impl RemotePackSet {
             let dead = list_tombstones_of(&*self.store, &p.id).await?;
             packs.push((p, dead));
         }
-        Ok(self.install(packs, current.started, packs_started, gen))
+        Ok(self.install(packs, current.started, packs_started, gen, retired))
     }
 
     /// The view a miss of the current one should search: the periodic full
@@ -533,6 +581,7 @@ impl RemotePackSet {
         // listing of `packs/`, which then holds every pack it announces.
         let mut tombstones = list_tombstones(&*self.store).await?;
         let gen = self.gen_since(Instant::now()).await?;
+        let retired = self.retired_now().await?;
         let ids = self.list_packs(reason).await?;
         let packs = self.open_packs(current.as_deref(), &ids).await?;
         let packs = packs
@@ -542,7 +591,14 @@ impl RemotePackSet {
                 (p, dead)
             })
             .collect();
-        Ok(self.install(packs, started, started, gen))
+        Ok(self.install(packs, started, started, gen, retired))
+    }
+
+    /// The retired record as one GET reads it now.
+    async fn retired_now(&self) -> Result<Arc<HashSet<String>>> {
+        Ok(Arc::new(
+            read_retired(&*self.store).await?.into_keys().collect(),
+        ))
     }
 
     /// The packs published now, without listing tombstones: what a delete
@@ -772,6 +828,7 @@ impl RemotePackSet {
             *slot = Some(Arc::new(View {
                 packs,
                 searchable: v.searchable,
+                retired: v.retired.clone(),
                 started: v.started,
                 packs_started: v.packs_started,
                 gen: v.gen.clone(),

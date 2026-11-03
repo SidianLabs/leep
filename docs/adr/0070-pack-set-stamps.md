@@ -1,5 +1,5 @@
 # 0070. Pack-set stamps make blob-store misses cheap
-Status: Accepted
+Status: Accepted; amended by ADR 0080 (the retired packs record is one of the stamps)
 Date: 2026-11-01
 
 Amends ADR 0040 section 5 (when an object store lists its packs on a miss)

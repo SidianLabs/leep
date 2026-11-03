@@ -140,6 +140,7 @@ measured until the response head is ready, not until the body is streamed.
 | `leep_repack_background_objects_written_total` | counter | none | Objects those merges wrote. Against `leep_pack_write_objects_sum` (objects land packs wrote) it should stay below about 6. |
 | `leep_repack_background_seconds` | histogram | none | Time of each merge: walk, write and publish. |
 | `leep_repack_background_cleanup_seconds` | histogram | none | Time of each cleanup a fence after a merge (deleting the merged packs). |
+| `leep_repack_retired_removed_total` | counter | none | Retired packs deleted by the sweep at server start and at each background interval once their fence passed (ADR 0080). Grows after restarts that left merged packs waiting; the merges' own cleanups are under `leep_repack_background_cleanup_seconds`. |
 | `leep_land_cancelled_total` | counter | none | Lands whose caller went away (timeout, disconnect) while queued, dropped before their batch replayed them. |
 | `leep_land_batch_deadline_total` | counter | none | Lands answered 409 because their batch was still retrying 60 s after its first attempt (`MAX_BATCH_LIFETIME`, ADR 0059) and gave up instead of moving the ref. Clients resend; keyed lands are then answered from their record. Anything but rare means a store so slow, or a ref so contended, that lands do not finish. |
 | `leep_land_answered_from_record_total` | counter | `original` = `present`, `missing` | Keyed lands answered from their land id record instead of landing again (ADR 0057). `missing`: the changeset was no longer stored (garbage collected, ADR 0059) and the record answered without reading it. |
@@ -2000,7 +2001,11 @@ deleted them, and what is left loose (objects uploaded during the repack). It
 also gives the time spent walking, writing, fencing and cleaning up. Only one
 repack runs at a time per store (a second one exits with "another repack is
 running"). Killing it is safe at any point: the store stays readable, and
-the next run deletes the leftovers and finishes.
+the next run (or the next server start) deletes the leftovers. Each run
+begins with a sweep (ADR 0080) that deletes temp files, packs without an
+index, and packs retired by earlier repacks or background merges whose
+fence (this run's `--fence`) has passed; `retired_removed` in the report
+counts those.
 
 ### Packs written by land batches
 
@@ -2031,13 +2036,44 @@ cron `repack` of this section. Merges leave loose objects alone and do not
 walk history: merged packs hold whole frames, and `leep-server repack`
 stores versions as deltas. They run one at a time on a thread at the
 lowest CPU priority. At most 256 merges, or 4 GiB of merged packs, wait for
-their fence at once. Reads in the server stop searching the
-merged packs at once, and the server deletes them a fence later. Each step
-takes the store's repack lock (or lease), so a `leep-server repack` started
-meanwhile may find it taken and exit with "another repack is running"; run
-it again. A background cleanup that finds the lock taken waits for the next
-interval. A server stopped with cleanups pending leaves the merged packs
-published beside the merged one; the next merge or `repack` folds them in.
+their fence at once. A merge records the packs it merged as retired, in
+`packs/retired` (`packs/.retired` in a bucket), right after it publishes
+the merged pack (ADR 0080): from then on no server reads or merges them,
+and they are deleted a fence later, by the merge's cleanup or, if the
+server stopped first, by the sweep every server runs when it starts and at
+every background interval (and `leep-server repack` at its start). The
+sweep also deletes `.tmp-*` files and packs without an index that a killed
+or failed pack write left. Each step takes the store's repack lock (or
+lease), so a `leep-server repack` started meanwhile may find it taken and
+exit with "another repack is running"; run it again. A cleanup or sweep
+that finds the lock taken waits for the next interval.
+
+What operators see: `packs/retired` lists packs waiting out their fence,
+one `<pack id> <unix seconds>` line each; its packs are on disk but not
+read. After a restart the pack directory shrinks once the fence of the
+packs retired before it passes (`--background-repack-fence`, 6 minutes by
+default), and the start-up log line "swept packs left by earlier repacks"
+(level info) counts what was deleted. `leep_repack_retired_removed_total`
+counts retired packs deleted. Restarting a server inside the fence no
+longer makes it merge the same packs again.
+
+**Leftovers from before ADR 0080.** Older servers stopped inside a fence
+left merged packs published beside the pack that replaced them, and each
+restart merged them again, so a long-running store can hold many copies
+of the same objects (one store grew from 1.5 GB to 9.3 GB of packs). Those
+packs were never recorded as retired, so the sweep does not delete them.
+Reclaim the space once after upgrading every server: run
+`leep-server repack --full` (beside running servers; it needs free space
+for the new pack, about the store's live packed size). It merges every pack
+into one, which holds each object once, retires the rest and deletes them
+after its `--fence`. A plain `leep-server repack` cleans temp files and
+packs without an index, but merges only by the geometric rule.
+
+**Upgrade window.** Servers before ADR 0080 ignore `packs/retired`: they
+keep searching retired packs (harmless; every object in them is also in a
+searched pack) and their background merges may merge them again, writing
+the copies this change avoids, while new servers delete them after the
+fence. Upgrade every server sharing a store, then reclaim as above.
 
 On an object store, upgrade every server before land packs are written
 there: a server built before ADR 0068 lists `packs/` on a miss at most
@@ -2104,7 +2140,9 @@ restore"), so restoring a packed store gives a packed store.
 Do not delete anything under `packs/` by hand, and do not delete
 `.repack-*` files in the shard directories: each is a whole object that the
 next repack puts back. `.tmp-*` files under `packs/` belong to a running
-repack, or are leftovers the next repack deletes.
+repack or pack write, or are leftovers the next sweep deletes.
+`packs/retired` is the record that keeps retired packs unread; deleting it
+makes them searched and merged again until a repack retires them anew.
 
 ### Packing an object store (`s3://`)
 
@@ -2124,8 +2162,11 @@ The same command and flags. Differences from a filesystem store:
   in that time exits with "another repack is running ... until unix time
   T". Wait, or, if you are sure no repack is running, delete
   `packs/repack.lease`. Everything else a kill leaves is cleaned by the next
-  runs: a `.pack` with no `.idx` is deleted once it is older than the lease
-  TTL.
+  runs or sweeps: a `.pack` with no `.idx` is deleted once it is older than
+  the lease TTL, and retired packs (`packs/.retired`) once their fence has
+  passed. The background repack reads `packs/.retired` (one GET) at each
+  interval and takes the lease for a sweep only when a retired pack is due;
+  a server start and `leep-server repack` always sweep under the lease.
 - **Incomplete multipart uploads** from a killed repack are invisible but
   billed. Give the bucket a lifecycle rule that aborts incomplete multipart
   uploads after a day (`AbortIncompleteMultipartUpload`, `DaysAfterInitiation:

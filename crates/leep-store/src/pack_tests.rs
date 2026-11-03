@@ -790,6 +790,7 @@ async fn kill_sweep(mode: RepackMode) {
         RepackStep::PackRenamed,
         RepackStep::IndexSynced,
         RepackStep::Published,
+        RepackStep::Retired,
         RepackStep::RemovingLoose(1),
         RepackStep::LooseMovedAside(1),
         RepackStep::LooseMovedAside(5),
@@ -824,6 +825,24 @@ async fn kill_sweep(mode: RepackMode) {
         assert!(seen.lock().unwrap().contains(&kill_at));
         let what = format!("{mode:?} killed at {kill_at:?}");
         check_world(dir.path(), &w, &what).await;
+        // A temp file is deleted on the error path, not left to a sweep.
+        let junk = files_named(dir.path(), |n| n.starts_with(".tmp-"));
+        assert!(junk.is_empty(), "{what}: {junk:?}");
+        // The fence passes: the sweep deletes what the killed run retired
+        // (a pack merged once is never merged again, ADR 0080).
+        let swept = store
+            .retire_sweep(std::time::Duration::ZERO)
+            .await
+            .unwrap()
+            .unwrap();
+        check_world(dir.path(), &w, &format!("{what}, swept")).await;
+        // Retired (the hook sees a step once it is durable) and not yet
+        // deleted by the killed run's own cleanup.
+        let retired_left = matches!(
+            kill_at,
+            RepackStep::Retired | RepackStep::RemovingLoose(_) | RepackStep::LooseMovedAside(_)
+        );
+        assert_eq!(swept.retired_removed > 0, retired_left, "{what}: {swept:?}");
 
         let report = if incremental {
             repack_incremental(&store, w.hints.clone()).await
@@ -840,7 +859,14 @@ async fn kill_sweep(mode: RepackMode) {
         if incremental {
             // The big pack stays, with its tombstones; the small one and
             // everything loose end up in one new pack.
-            assert_eq!(after.len(), 2, "{what}: {report:?}");
+            // A run killed while removing loose copies leaves some loose
+            // beside its pack; packing them again may leave that pack
+            // unmerged by the geometric rule.
+            let loose_left = matches!(kill_at, RepackStep::LooseMovedAside(_));
+            assert!(
+                after.len() == 2 || (loose_left && after.len() == 3),
+                "{what}: {after:?} {report:?}"
+            );
             assert!(after.contains(&big[0]) || after.contains(&big[1]), "{what}");
             let tomb = std::fs::read_to_string(dir.path().join("packs/tombstones")).unwrap();
             for line in tomb.lines() {

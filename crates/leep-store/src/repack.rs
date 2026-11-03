@@ -7,8 +7,12 @@
 //! The two halves are separate calls ([`FsBlobStore::repack_publish`] and
 //! [`PublishedPack::finish`]) so the caller waits out the fence in between.
 //! A run killed anywhere leaves a readable store: before the index rename
-//! nothing is published (the next repack deletes the temp files), and after
+//! nothing is published (the next sweep deletes the temp files), and after
 //! it every object is in the new pack, perhaps also loose or in an old pack.
+//! Right after it the replaced packs are retired durably (ADR 0080,
+//! `retire.rs`), so no process searches or merges them again, and whatever
+//! deletes them after the fence (this run's cleanup, or a sweep) holds the
+//! lock.
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
@@ -58,6 +62,10 @@ pub enum RepackStep {
     IndexSynced,
     /// The index has its final name: the pack is published.
     Published,
+    /// The replaced packs are recorded as retired (ADR 0080): no scan from
+    /// now on searches or plans them, and a sweep deletes them after the
+    /// fence.
+    Retired,
     /// About to move the n-th (from 1) loose copy aside.
     RemovingLoose(u64),
     /// The n-th loose copy is moved aside and about to be deleted.
@@ -178,6 +186,9 @@ pub struct RepackReport {
     /// new pack by GC and uploaded again.
     pub loose_kept: u64,
     pub old_packs_removed: u64,
+    /// Packs earlier repacks retired, deleted by the sweep this run began
+    /// with because their fence had passed (ADR 0080).
+    pub retired_removed: u64,
     pub packs_after: u64,
     pub loose_after: u64,
     pub loose_bytes_after: u64,
@@ -290,6 +301,7 @@ impl PublishedPack {
         }
         sync_dir(&dir)?;
         step(&self.opts, RepackStep::OldPacksRemoved)?;
+        crate::retire::rewrite_retired(&dir)?;
         rewrite_tombstones(&dir)?;
         step(&self.opts, RepackStep::TombstonesRewritten)?;
         self.report.packs_after = store.packs.rescan(ScanReason::Repack)?.packs.len() as u64;
@@ -301,7 +313,7 @@ impl PublishedPack {
 }
 
 /// The repack lock of the store whose `packs/` is `dir`, or `Conflict`.
-fn take_repack_lock(dir: &Path) -> Result<File> {
+pub(crate) fn take_repack_lock(dir: &Path) -> Result<File> {
     std::fs::create_dir_all(dir).map_err(storage_err)?;
     let lock = std::fs::OpenOptions::new()
         .create(true)
@@ -360,7 +372,7 @@ fn aside_path(path: &Path) -> PathBuf {
     path.with_file_name(format!("{ASIDE_PREFIX}{name}"))
 }
 
-fn remove_if_present(path: &Path) -> Result<()> {
+pub(crate) fn remove_if_present(path: &Path) -> Result<()> {
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
@@ -379,7 +391,7 @@ fn put_back(aside: &Path, path: &Path) -> Result<()> {
 
 /// Keep only tombstones of packs that still exist. Under the tombstone lock,
 /// so no concurrent delete's line is lost.
-fn rewrite_tombstones(dir: &Path) -> Result<()> {
+pub(crate) fn rewrite_tombstones(dir: &Path) -> Result<()> {
     let _lock = lock_tombstones(dir)?;
     let path = dir.join(TOMBSTONES);
     let text = match std::fs::read(&path) {
@@ -404,7 +416,7 @@ fn rewrite_tombstones(dir: &Path) -> Result<()> {
     sync_dir(dir)
 }
 
-fn write_durably(dir: &Path, ext: &str, bytes: &[u8]) -> Result<PathBuf> {
+pub(crate) fn write_durably(dir: &Path, ext: &str, bytes: &[u8]) -> Result<PathBuf> {
     let (path, mut f) = create_exclusive(dir, &format!(".{ext}")).map_err(storage_err)?;
     let res = f.write_all(bytes).and_then(|()| f.sync_all());
     if let Err(e) = res {
@@ -670,8 +682,10 @@ impl FsBlobStore {
                         "geometric factor {factor} must be at least 2 and max packs {max_packs} at least 1"
                     )));
                 }
+                // Retired packs are left to the sweep (ADR 0080): their
+                // live objects are in a searched pack already.
                 let sizes: Vec<(String, u64)> = view
-                    .packs
+                    .searchable()
                     .iter()
                     .map(|(p, dead)| (p.id.clone(), live(dead, p)))
                     .collect();
@@ -798,6 +812,9 @@ impl FsBlobStore {
         };
 
         let (tmp_pack, file) = create_exclusive(&dir, ".pack").map_err(storage_err)?;
+        // Deleted on every way out but its rename, so a failed write (a
+        // full disk) leaves nothing behind for a sweep to find.
+        let mut tmp_pack = TempFile(Some(tmp_pack));
         let mut out = BufWriter::with_capacity(1 << 20, file);
         let mut src = FsSource {
             store: self,
@@ -821,7 +838,12 @@ impl FsBlobStore {
             .collect();
 
         if written.records.is_empty() {
-            remove_if_present(&tmp_pack)?;
+            remove_if_present(&tmp_pack.take())?;
+            // Every object of the merged packs was deleted: nothing of
+            // theirs is live, so they retire with no replacement.
+            crate::retire::append_retired(&dir, &replaced, now_secs())?;
+            step(&opts, RepackStep::Retired)?;
+            self.packs.supersede(&replaced);
             return Ok(PublishedPack {
                 store: self.clone(),
                 report,
@@ -841,10 +863,12 @@ impl FsBlobStore {
             Ok(())
         })?;
         let id = hex::encode(id_hasher.finalize().as_bytes());
-        std::fs::rename(&tmp_pack, dir.join(format!("{id}.pack"))).map_err(storage_err)?;
+        std::fs::rename(tmp_pack.path(), dir.join(format!("{id}.pack"))).map_err(storage_err)?;
+        tmp_pack.take();
         sync_dir(&dir)?;
         step(&opts, RepackStep::PackRenamed)?;
         let (tmp_idx, file) = create_exclusive(&dir, ".idx").map_err(storage_err)?;
+        let mut tmp_idx = TempFile(Some(tmp_idx));
         {
             let mut f = BufWriter::with_capacity(1 << 20, file);
             let mut check = blake3::Hasher::new();
@@ -861,7 +885,8 @@ impl FsBlobStore {
             f.sync_all().map_err(storage_err)?;
         }
         step(&opts, RepackStep::IndexSynced)?;
-        std::fs::rename(&tmp_idx, dir.join(format!("{id}.idx"))).map_err(storage_err)?;
+        std::fs::rename(tmp_idx.path(), dir.join(format!("{id}.idx"))).map_err(storage_err)?;
+        tmp_idx.take();
         sync_dir(&dir)?;
         step(&opts, RepackStep::Published)?;
         report.pack_bytes = written.len;
@@ -876,13 +901,17 @@ impl FsBlobStore {
             self.packs.append_tombstones(&lines)?;
             report.late_tombstones = late.len() as u64;
         }
+        // The new pack holds every live object of each replaced pack, so
+        // they retire: durably, so no process scanning from now on, this
+        // one after a restart included, searches or merges them again.
+        let replaced: Vec<String> = replaced.into_iter().filter(|r| *r != id).collect();
+        crate::retire::append_retired(&dir, &replaced, now_secs())?;
+        step(&opts, RepackStep::Retired)?;
         // Loading the new index holds it beside the old ones; the per-object
         // arrays of this run go first.
         drop((written, sources, table, view));
         self.packs.rescan(ScanReason::Repack)?;
-        let replaced: Vec<String> = replaced.into_iter().filter(|r| *r != id).collect();
-        // The new pack holds every live object of each; reads here stop
-        // searching them now rather than after the fence.
+        // The in-process fast path: reads here skip them even before a scan.
         self.packs.supersede(&replaced);
         Ok(PublishedPack {
             store: self.clone(),
@@ -967,11 +996,33 @@ impl FsBlobStore {
     }
 }
 
+/// A temp file deleted when dropped, unless [`take`](Self::take)n first.
+struct TempFile(Option<PathBuf>);
+
+impl TempFile {
+    fn path(&self) -> &Path {
+        self.0.as_deref().expect("temp file already taken")
+    }
+
+    /// Keep the file (it was renamed or removed): the path, for the caller.
+    fn take(&mut self) -> PathBuf {
+        self.0.take().expect("temp file already taken")
+    }
+}
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        if let Some(p) = self.0.take() {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
 /// Delete what a killed repack or pack write left in `packs/`: temp files,
 /// and packs whose index was never published. Only under the repack lock,
 /// and with pack writes held off (`write.lock`), so a pack whose index a
 /// `put_many` is about to publish is not taken for garbage.
-fn remove_unpublished(dir: &Path) -> Result<u64> {
+pub(crate) fn remove_unpublished(dir: &Path) -> Result<u64> {
     let _writes = crate::fs::lock_pack_writes(dir, true)?;
     let ids: HashSet<String> = published_ids(dir)?.into_iter().collect();
     let mut removed = 0;

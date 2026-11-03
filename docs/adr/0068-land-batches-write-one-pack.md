@@ -1,5 +1,5 @@
 # 0068. Land batches write one pack
-Status: Accepted; amended by ADR 0070 (a miss rescans packs only when a stamp changed)
+Status: Accepted; amended by ADR 0070 (a miss rescans packs only when a stamp changed) and ADR 0080 (replaced packs are retired durably and swept after the fence)
 Date: 2026-10-31
 
 ## Context
@@ -175,7 +175,9 @@ finds the lock taken (a `leep-server repack` running) waits for the next
 tick. At most 256 cleanups, and 4 GiB of packs to delete, wait at once,
 which bounds the disk held twice. Cleanups not run when the process stops leave the merged packs on
 disk and published; after a restart they are searched again and merged by
-the next background or command line repack.
+the next background or command line repack. (ADR 0080 replaces this: the
+merged packs are retired durably, never searched or merged again, and a
+sweep at the next start deletes them after the fence.)
 
 ### 6. Warm-up of a batch
 - The batch prefetch asks the store once (`contains_many`) whether the

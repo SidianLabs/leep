@@ -1964,7 +1964,16 @@ async fn run() -> anyhow::Result<()> {
         (Switch::On, None) => {
             tracing::info!("background repack off: the blob store keeps no packs")
         }
-        (Switch::Off, _) => tracing::info!("background repack off (--background-repack off)"),
+        (Switch::Off, store) => {
+            tracing::info!("background repack off (--background-repack off)");
+            // What a killed repack or pack write left is swept anyway.
+            if let Some(store) = store {
+                let fence = background_repack_fence(&args);
+                tokio::spawn(async move {
+                    leep_server::background_repack::sweep_at_start(&store, fence).await
+                });
+            }
+        }
     }
     let coordination = match args.land_coordination {
         Coordination::Off => None,
