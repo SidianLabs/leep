@@ -53,18 +53,38 @@ and reports errors where it always did.
 
 ### 2. Off the replay's path
 The plan runs on a task of its own (in the land lane, ADR 0067), started
-as soon as the attempt knows its head, beside the batch's other prefetches
-and its replays. It is shared through the staging (`Staging::set_skip_plan`,
-handed to every handle the attempt makes), and `store_changeset` waits for
-it only just before it builds a copy's list. A batch of fast-forwards
+once the attempt's own reads (the fence flag, the recorded lands, the
+batch prefetch and the origins) are done, so it never competes with them
+for the land lane's connections, and running beside the batch's replays.
+It is shared through the staging (`Staging::set_skip_plan`, handed to
+every handle the attempt makes from then on), and `store_changeset` waits
+for it only just before it builds a copy's list. A batch of fast-forwards
 never waits for it. A plan never fails; at worst it read rows nobody used.
 
-### 3. A create computes its list beside its tree
-`store_changeset` reads the generations and builds the skiplist
-concurrently with the blob checks and the tree write, instead of after
-them. Their errors keep their order: a check or tree error comes first,
-then a generation error, then a skiplist error. A client create on a deep
-history no longer adds its skiplist reads to its tree write's time.
+A plan makes one metadata call at a time. At most two run at once in a
+process (`MAX_RUNNING_SKIP_PLANS`); a batch that finds both running, with
+several refs landing at once, plans nothing and its copies read their rows
+one after another as before. A copy waits for the whole plan, not only for
+the levels it needs: every copy's list reaches the top level, so waiting
+per level would save nothing.
+
+### 3. A create holds one metadata connection at a time
+`store_changeset` reads the generations and builds the skiplist after the
+blob checks and the tree write, as before, and never beside them: ADR
+0067's rule that a create holds one metadata connection at a time stands.
+A first version of this change ran them concurrently. It gained nothing
+for a land's copies, whose checks are answered from the batch's prefetch
+in memory, and it let a client create make two metadata calls at once (a
+memory-store test on a process with nothing cached saw two in flight). In
+a 1,000-agent mixed swarm on a 500,000-deep store with `--meta-pool-size
+32` that version had a create p99 of 2,661 ms against 101 ms, a land p99
+of 12.3 s against 2.1 s and 13,247 lands not admitted against none, while
+the land-only bench gained as in Consequences. That version also started
+the plan before the attempt's reads, so in a land pool of 4 the plan, the
+leader's reads and the prefetch's own concurrent reads asked for 5-6
+connections at once and slowed every batch; section 2 now starts it after
+them. Which of the two caused the swarm's regression was not separated;
+both are gone.
 
 ## Consequences
 - 150,000 deep, before and after (two runs each, lands a second at 16 and
@@ -79,13 +99,16 @@ history no longer adds its skiplist reads to its tree write's time.
   800 bytes a row at a depth of a million: tens of kilobytes a level, a
   few thousand cached lists at most. A lone land plans 9 copies; rows of
   copies that never come are read for nothing.
-- A create may hold two metadata connections for a moment (a skiplist read
-  beside the tree write's condemnation read), and a batch's plan holds one
-  of the land lane's connections beside the leader's. ADR 0067's reserve
-  (at least 4) already counts prefetch reads.
+- A create still makes one metadata call at a time. A batch's plan holds
+  one land-lane connection beside its leader's once the leader's own reads
+  are done, and at most two plans run in a process. Metrics:
+  `leep_land_skip_plans_total{outcome}`, `leep_land_skip_plan_seconds`,
+  `leep_land_skip_plan_wait_seconds` and `leep_land_batch_seconds`, beside
+  `leep_meta_pool_connections{pool}`.
 - Tests: `copies_skiplists_match_the_definition` compares every stored row
   of linear and merge histories and of a batch's copies with lists walked
   one parent at a time; `a_batch_on_a_deep_history_reads_skiplists_a_level_at_a_time`
-  bounds the reads. Test bookkeeping of a batch's lands now records each
-  land as it is taken, before any answer, so a test holding its answers
-  always finds the batch.
+  bounds the reads; `a_create_makes_one_metadata_call_at_a_time` fails if
+  a create makes two metadata calls at once. Test bookkeeping of a batch's
+  lands now records each land as it is taken, before any answer, so a test
+  holding its answers always finds the batch.

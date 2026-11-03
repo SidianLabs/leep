@@ -4018,8 +4018,12 @@ the replay. The wide store's differences are run-to-run noise.
 
 **What it doesn't show.** 150,000 deep, not 1,000,000: the old cost grew
 with log2(depth) minus what the cache holds, so the gain at a million is
-expected to be larger, but it was not rerun. The swarm with reads was not
-rerun either. One box, two runs per cell; Postgres shares the box.
+expected to be larger, but it was not rerun. One box, two runs per cell;
+Postgres shares the box. These numbers are of the first version, which also
+ran a create's skiplist beside its tree write and started the plan before
+the batch's other reads. In the 1,000-agent mixed swarm, 500,000 deep, that
+version regressed badly (ADR 0079, section 3); both were changed, and the
+swarm is to be rerun.
 
 ## Analysis
 

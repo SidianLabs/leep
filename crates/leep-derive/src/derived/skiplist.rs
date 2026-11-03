@@ -115,19 +115,41 @@ enum Planned {
 /// beside its replays; it never fails (a row it misses is read later).
 pub(crate) type SkipPlan = Shared<BoxFuture<'static, ()>>;
 
+/// Skiplist plans that may run at once in a process. A plan makes one
+/// metadata call at a time, in the land lane, beside its leader's calls;
+/// past this many (several refs landing at once), a batch's copies read
+/// their rows as they did before plans.
+pub(crate) const MAX_RUNNING_SKIP_PLANS: usize = 2;
+
 impl Repo {
     /// Start [`Repo::prefetch_copy_skiplists`] on a task of its own, in
-    /// the caller's lane, so it runs while the batch replays.
-    pub(crate) fn start_copy_skiplists(&self, head: ChangesetId, copies: usize) -> SkipPlan {
+    /// the caller's lane, so it runs while the batch replays; `None` when
+    /// [`MAX_RUNNING_SKIP_PLANS`] are running already.
+    pub(crate) fn start_copy_skiplists(
+        &self,
+        head: ChangesetId,
+        copies: usize,
+    ) -> Option<SkipPlan> {
+        let Ok(permit) = Arc::clone(&self.skip_plans).try_acquire_owned() else {
+            metrics::counter!("leep_land_skip_plans_total", "outcome" => "skipped").increment(1);
+            return None;
+        };
+        metrics::counter!("leep_land_skip_plans_total", "outcome" => "started").increment(1);
         let repo = self.clone();
         let task = tokio::spawn(leep_core::lane::inherit(async move {
+            let started = std::time::Instant::now();
             repo.prefetch_copy_skiplists(head, copies).await;
+            metrics::histogram!("leep_land_skip_plan_seconds")
+                .record(started.elapsed().as_secs_f64());
+            drop(permit);
         }));
-        async move {
-            let _ = task.await;
-        }
-        .boxed()
-        .shared()
+        Some(
+            async move {
+                let _ = task.await;
+            }
+            .boxed()
+            .shared(),
+        )
     }
 
     /// Read the stored skiplists that up to `copies` changesets stacked one

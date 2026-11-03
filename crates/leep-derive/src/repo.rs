@@ -168,6 +168,10 @@ pub struct Repo {
     /// which a copy waits for before building its list. `None` outside a
     /// staged batch.
     pub(crate) skip_plan: Option<crate::derived::SkipPlan>,
+    /// Permits for running skiplist plans, shared by clones: each holds one
+    /// metadata connection of the land lane at a time beside its leader's,
+    /// so their number is bounded (ADR 0079).
+    pub(crate) skip_plans: Arc<tokio::sync::Semaphore>,
     /// Permits for the metadata reads of a search's directory opens, shared
     /// by every search through this handle and its clones; `None` leaves
     /// them unbounded. See [`Repo::with_search_pool_permits`].
@@ -637,6 +641,9 @@ impl Repo {
             rescues_on_write: true,
             node_memo: None,
             skip_plan: None,
+            skip_plans: Arc::new(tokio::sync::Semaphore::new(
+                crate::derived::MAX_RUNNING_SKIP_PLANS,
+            )),
             search_pool: None,
             search_flights: Arc::default(),
             blame_flights: Arc::default(),
@@ -1024,155 +1031,147 @@ impl Repo {
                 return Err(Error::Invalid(format!("unknown parent {p}")));
             }
         }
-        // The skiplist and the generations need only the parents, which
-        // exist: they are read while the blobs are checked and the tree is
-        // written instead of after (ADR 0079), and an error of the checks or
-        // the tree still comes first.
-        let lists = async {
-            let started = std::time::Instant::now();
-            let mut parent_generations = Vec::with_capacity(cs.parents.len());
-            for (p, g) in cs.parents.iter().zip(&pre.parent_generations) {
-                parent_generations.push(match g {
-                    Some(g) => *g,
-                    None => self.generation(*p).await?,
-                });
+        if !client_blobs {
+            // A server-built changeset (a merge, a rebased copy) names
+            // contents of stored changesets, whose sizes their creates
+            // checked against the blobs, and merge results the server
+            // wrote with their sizes. Only their existence is checked, in
+            // durable storage and in one batch: a land batch answers it from
+            // what its prefetch found (ADR 0068) instead of reading every
+            // content of every copy.
+            let hashes: Vec<Hash> = contents.iter().map(|(_, h, _)| *h).collect();
+            let present = self.blobs.contains_many(&hashes).await?;
+            if present.len() != hashes.len() {
+                return Err(Error::Storage(format!(
+                    "contains_many answered {} of {} hashes",
+                    present.len(),
+                    hashes.len()
+                )));
             }
-            derived::record_derivation(Generation::NAME, started);
-            let started = std::time::Instant::now();
-            let skiplist: Arc<[SkipEntry]> = match cs.parents.first() {
-                Some(&p) => {
-                    let parent = SkipEntry {
-                        id: p,
-                        generation: parent_generations[0],
-                    };
-                    if let Some(l) = &pre.parent_skiplist {
-                        self.skiplists.insert(p, l.clone());
-                    }
-                    if let Some(plan) = &self.skip_plan {
-                        plan.clone().await;
-                    }
-                    Skiplist::compute(self, parent, pre.parent_skiplist.clone(), true).await?
+            // The batch answer may come from a pack view a stamp vouched for
+            // (ADR 0070); a content reported missing is looked up exactly
+            // before the changeset is refused.
+            for ((path, content, _), _) in contents.iter().zip(&present).filter(|(_, p)| !**p) {
+                if self.blobs.get_exact(content).await?.is_none() {
+                    return Err(Error::Invalid(format!("missing blob {content} for {path}")));
                 }
-                None => Arc::from([]),
+            }
+        }
+        let client_contents = if client_blobs { &contents[..] } else { &[] };
+        for (i, (path, content, size)) in client_contents.iter().enumerate() {
+            let maybe_condemned = match &pre.condemned {
+                Some(c) => c[i].is_some(),
+                None => true,
             };
-            derived::record_derivation(Skiplist::NAME, started);
-            Ok::<_, Error>((parent_generations, skiplist))
+            if maybe_condemned {
+                self.check_reusable(content, path.as_str()).await?;
+            }
+            // `get` may be served from a cache tier; existence must come from
+            // durable storage, which GC can change from another process.
+            // `get_exact` checks that without a second read where the
+            // backend's read already was of the durable copy, and does not
+            // refuse a content on a stale view of the packs (ADR 0070).
+            match self.blobs.get_exact(content).await? {
+                None => return Err(Error::Invalid(format!("missing blob {content} for {path}"))),
+                Some(b) if b.len() as u64 != *size => {
+                    return Err(Error::Invalid(format!(
+                        "size mismatch for {path}: declared {size}, blob is {}",
+                        b.len()
+                    )))
+                }
+                Some(_) => {}
+            }
+        }
+        let base = match (cs.parents.first(), pre.base_tree) {
+            (Some(p), Some(t)) => {
+                self.note_root(*p, t);
+                t
+            }
+            (Some(p), None) => self.root_tree(*p).await?,
+            (None, _) => TreeNode::empty_hash(),
         };
-        let checked = async {
-            if !client_blobs {
-                // A server-built changeset (a merge, a rebased copy) names
-                // contents of stored changesets, whose sizes their creates
-                // checked against the blobs, and merge results the server
-                // wrote with their sizes. Only their existence is checked, in
-                // durable storage and in one batch: a land batch answers it from
-                // what its prefetch found (ADR 0068) instead of reading every
-                // content of every copy.
-                let hashes: Vec<Hash> = contents.iter().map(|(_, h, _)| *h).collect();
-                let present = self.blobs.contains_many(&hashes).await?;
-                if present.len() != hashes.len() {
-                    return Err(Error::Storage(format!(
-                        "contains_many answered {} of {} hashes",
-                        present.len(),
-                        hashes.len()
-                    )));
-                }
-                // The batch answer may come from a pack view a stamp vouched for
-                // (ADR 0070); a content reported missing is looked up exactly
-                // before the changeset is refused.
-                for ((path, content, _), _) in contents.iter().zip(&present).filter(|(_, p)| !**p) {
-                    if self.blobs.get_exact(content).await?.is_none() {
-                        return Err(Error::Invalid(format!("missing blob {content} for {path}")));
-                    }
-                }
+        // A client's changeset leaves its tree out unless that would make
+        // too long a run of unstored trees (ADR 0069).
+        let mut lazy_depth = match (client_blobs && self.lazy_create, cs.parents.first()) {
+            (false, _) => None,
+            (true, None) => Some(1),
+            (true, Some(p)) => {
+                Some(self.lazy_depth(*p, base).await? + 1).filter(|d| *d <= MAX_LAZY_DEPTH)
             }
-            let client_contents = if client_blobs { &contents[..] } else { &[] };
-            for (i, (path, content, size)) in client_contents.iter().enumerate() {
-                let maybe_condemned = match &pre.condemned {
-                    Some(c) => c[i].is_some(),
-                    None => true,
-                };
-                if maybe_condemned {
-                    self.check_reusable(content, path.as_str()).await?;
-                }
-                // `get` may be served from a cache tier; existence must come from
-                // durable storage, which GC can change from another process.
-                // `get_exact` checks that without a second read where the
-                // backend's read already was of the durable copy, and does not
-                // refuse a content on a stale view of the packs (ADR 0070).
-                match self.blobs.get_exact(content).await? {
-                    None => {
-                        return Err(Error::Invalid(format!("missing blob {content} for {path}")))
-                    }
-                    Some(b) if b.len() as u64 != *size => {
-                        return Err(Error::Invalid(format!(
-                            "size mismatch for {path}: declared {size}, blob is {}",
-                            b.len()
-                        )))
-                    }
-                    Some(_) => {}
-                }
-            }
-            let base = match (cs.parents.first(), pre.base_tree) {
-                (Some(p), Some(t)) => {
-                    self.note_root(*p, t);
-                    t
-                }
-                (Some(p), None) => self.root_tree(*p).await?,
-                (None, _) => TreeNode::empty_hash(),
-            };
-            // A client's changeset leaves its tree out unless that would make
-            // too long a run of unstored trees (ADR 0069).
-            let mut lazy_depth = match (client_blobs && self.lazy_create, cs.parents.first()) {
-                (false, _) => None,
-                (true, None) => Some(1),
-                (true, Some(p)) => {
-                    Some(self.lazy_depth(*p, base).await? + 1).filter(|d| *d <= MAX_LAZY_DEPTH)
-                }
-            };
-            // The changeset makes its blobs reachable, so they must survive a
-            // power loss before it is stored (ADR 0044): `apply_changes` flushes
-            // the tree nodes it writes and every content the changeset names,
-            // which may have been uploaded to another process or before a
-            // restart, after the checks above found them. A lazy create
-            // flushes the contents alone.
-            let mut lazily = false;
-            let tree = match lazy_depth {
-                None => apply_changes(self, base, &cs.changes).await?,
-                Some(_) => {
-                    let built = build_tree(self, Reads::Repo, base, &cs.changes).await?;
-                    // Not exact (ADR 0070): nearly every lazy create misses here.
-                    // A loose root is read directly; one in a pack another
-                    // process published a moment ago has its whole tree below it
-                    // (packs are written whole, roots after their nodes), and
-                    // taking it for unstored only makes this tree lazy over
-                    // stored nodes, which readers derive alike.
-                    if self
-                        .read_tree_stored_with(built.root, false)
-                        .await?
-                        .is_some()
-                    {
-                        // A root that is stored must have its whole tree below
-                        // it, and this one may be left from an interrupted
-                        // write: store the tree after all.
-                        lazy_depth = None;
-                        apply_changes(self, base, &cs.changes).await?
-                    } else {
-                        let named = named_contents(&cs.changes);
-                        if !named.is_empty() {
-                            self.blobs.flush_blobs(&named).await?;
-                        }
-                        lazily = true;
-                        built.root
-                    }
-                }
-            };
-            Ok::<_, Error>((tree, lazy_depth, lazily))
         };
-        let (checked, lists) = tokio::join!(checked, lists);
-        let (tree, lazy_depth, lazily) = checked?;
-        let (parent_generations, skiplist) = lists?;
+        // The changeset makes its blobs reachable, so they must survive a
+        // power loss before it is stored (ADR 0044): `apply_changes` flushes
+        // the tree nodes it writes and every content the changeset names,
+        // which may have been uploaded to another process or before a
+        // restart, after the checks above found them. A lazy create
+        // flushes the contents alone.
+        let mut lazily = false;
+        let tree = match lazy_depth {
+            None => apply_changes(self, base, &cs.changes).await?,
+            Some(_) => {
+                let built = build_tree(self, Reads::Repo, base, &cs.changes).await?;
+                // Not exact (ADR 0070): nearly every lazy create misses here.
+                // A loose root is read directly; one in a pack another
+                // process published a moment ago has its whole tree below it
+                // (packs are written whole, roots after their nodes), and
+                // taking it for unstored only makes this tree lazy over
+                // stored nodes, which readers derive alike.
+                if self
+                    .read_tree_stored_with(built.root, false)
+                    .await?
+                    .is_some()
+                {
+                    // A root that is stored must have its whole tree below
+                    // it, and this one may be left from an interrupted
+                    // write: store the tree after all.
+                    lazy_depth = None;
+                    apply_changes(self, base, &cs.changes).await?
+                } else {
+                    let named = named_contents(&cs.changes);
+                    if !named.is_empty() {
+                        self.blobs.flush_blobs(&named).await?;
+                    }
+                    lazily = true;
+                    built.root
+                }
+            }
+        };
+
+        let started = std::time::Instant::now();
+        let mut parent_generations = Vec::with_capacity(cs.parents.len());
+        for (p, g) in cs.parents.iter().zip(&pre.parent_generations) {
+            parent_generations.push(match g {
+                Some(g) => *g,
+                None => self.generation(*p).await?,
+            });
+        }
         let generation = parent_generations.iter().max().map_or(1, |g| g + 1);
+        derived::record_derivation(Generation::NAME, started);
         let last_merge = Self::write_path_last_merge(&cs, generation, &parent_generations, &pre);
+        let started = std::time::Instant::now();
+        let skiplist: Arc<[SkipEntry]> = match cs.parents.first() {
+            Some(&p) => {
+                let parent = SkipEntry {
+                    id: p,
+                    generation: parent_generations[0],
+                };
+                if let Some(l) = &pre.parent_skiplist {
+                    self.skiplists.insert(p, l.clone());
+                }
+                // A land batch's copy finds the rows its list is built from
+                // in what the batch read ahead (ADR 0079). Waiting holds no
+                // connection.
+                if let Some(plan) = &self.skip_plan {
+                    let waited = std::time::Instant::now();
+                    plan.clone().await;
+                    metrics::histogram!("leep_land_skip_plan_wait_seconds")
+                        .record(waited.elapsed().as_secs_f64());
+                }
+                Skiplist::compute(self, parent, pre.parent_skiplist, true).await?
+            }
+            None => Arc::from([]),
+        };
+        derived::record_derivation(Skiplist::NAME, started);
         let mut rows = vec![
             DerivedRow::new(
                 RootTree::NAME_STR,

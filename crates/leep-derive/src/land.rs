@@ -388,6 +388,7 @@ impl RefQueue {
     /// Fold a finished batch's time into the moving average.
     fn record_batch(&mut self, took: Duration) {
         let took = took.as_secs_f64();
+        metrics::histogram!("leep_land_batch_seconds").record(took);
         self.batch_secs = Some(match self.batch_secs {
             Some(avg) => avg + BATCH_TIME_WEIGHT * (took - avg),
             None => took,
@@ -1226,15 +1227,6 @@ impl Repo {
             });
             let ids: Vec<ChangesetId> = lands.iter().map(|l| l.q.cs).collect();
             let staged = staging.repo(self);
-            // The rows the copies' skiplists are built from, read a level at
-            // a time for the whole batch beside its replays, which wait for
-            // them only to build a copy (ADR 0079). A land usually makes one
-            // copy; the slack covers a few longer stacks, and copies past it
-            // read what the plan lacks.
-            if let Some(h) = start {
-                let copies = (ids.len() + PLANNED_COPY_SLACK).min(MAX_PLANNED_COPIES);
-                staging.set_skip_plan(staged.start_copy_skiplists(h, copies));
-            }
             // Origins read by this attempt's landed-copy scans: the lands
             // of a batch walk the same stretch of history.
             let (fenced, mut recorded, _, mut origins) = tokio::join!(
@@ -1258,6 +1250,19 @@ impl Repo {
                     origins
                 }
             );
+            // The rows the copies' skiplists are built from, read a level at
+            // a time for the whole batch beside its replays, which wait for
+            // them only to build a copy (ADR 0079). Started after the reads
+            // above, so it never competes with them for the land lane's
+            // connections. A land usually makes one copy; the slack covers a
+            // few longer stacks, and copies past it (or of a batch that found
+            // no plan permit) read what they lack.
+            if let Some(h) = start {
+                let copies = (ids.len() + PLANNED_COPY_SLACK).min(MAX_PLANNED_COPIES);
+                if let Some(plan) = staged.start_copy_skiplists(h, copies) {
+                    staging.set_skip_plan(plan);
+                }
+            }
             // The batch ahead's moves are not in the ref log until it
             // commits; this attempt is kept only if they are.
             if let (Ok(r), Some(a)) = (&mut recorded, &spec) {
