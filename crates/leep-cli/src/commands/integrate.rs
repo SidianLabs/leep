@@ -14,6 +14,7 @@ use leep_core::ChangesetId;
 use super::{print_json, Ctx};
 use crate::error::{CliError, Result};
 use crate::fmt::{plural, short};
+use crate::markers::{explain, Labels};
 use crate::materialize::{materialize, remove_file};
 use crate::overlay::Plan;
 use crate::sign::AuthorKey;
@@ -56,9 +57,12 @@ pub fn added_paths(plan: &Plan) -> Vec<String> {
 
 /// List the conflicts a plan wrote. `other` is the changeset whose side was
 /// not kept, so `leep cat` can show it.
-pub fn print_conflicts(plan: &Plan, other: ChangesetId) {
+pub fn print_conflicts(plan: &Plan, other: ChangesetId, labels: &Labels) {
     for p in &plan.conflicts {
         outln!("  C {p} (markers written)");
+    }
+    if !plan.conflicts.is_empty() {
+        outln!("{}", explain(labels));
     }
     for p in &plan.unmerged {
         outln!(

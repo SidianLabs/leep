@@ -140,6 +140,34 @@ pub struct State {
     /// local edits: commands refuse until it is run again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub materializing: Option<ChangesetId>,
+    /// A land that stopped on conflicts and was rebased onto the ref here.
+    /// Cleared by a later land that lands and by any checkout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolving: Option<ResolvingLand>,
+}
+
+/// See [`State::resolving`]. The commit made on `onto` records `from` as
+/// `leep.rebased_from`, so the server can tell which reviewed changesets it
+/// replaces; the server checks content and treats the ids only as a hint.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvingLand {
+    /// The changesets the land tried to add, newest first.
+    pub from: Vec<ChangesetId>,
+    pub target_ref: String,
+    /// The head the conflicts were against: the working copy's base after
+    /// the local rebase.
+    pub onto: ChangesetId,
+}
+
+impl ResolvingLand {
+    /// The `leep.rebased_from` value: the ids joined with commas.
+    pub fn rebased_from(&self) -> String {
+        self.from
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    }
 }
 
 /// See [`State::pending_land`].

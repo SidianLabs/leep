@@ -1423,3 +1423,24 @@ does not know.
 keeps keys it does not know when it rewrites that file. Neither file is sent
 to the server; the author ends up in `Changeset.author` as before, and no
 changeset, tree, hash or API shape changed.
+
+## Resolving a conflicted land (optional client state field, no server change)
+
+When `leep land` answers conflicts and rebases the working copy onto the
+ref's head, `.leep/state.json` gains the optional `resolving`:
+
+| Key | Type | Meaning |
+|---|---|---|
+| `from` | array of changeset ids | What the land tried to add, newest first: the first-parent chain from the landed changeset down to the generation of its merge base with the head, at most 64. |
+| `target_ref` | string | The ref the land was onto. |
+| `onto` | changeset id | The head the conflicts were against, which became the base. |
+
+The next `leep commit` whose base is still `onto` (not a merge or a
+cherry-pick) records `extra["leep.rebased_from"]` = the `from` ids joined
+with commas, the same key a cherry-pick sets to one id. A land that lands
+and any checkout (`checkout`, `sync`, `switch`, `reset --hard`) remove the
+field. It is omitted when absent (`skip_serializing_if`), a state file
+without it loads unchanged (`serde(default)`), and an older CLI ignores it.
+The extra is a forgeable hint: a server that carries review verdicts across
+the rebase compares content and never trusts the ids alone. No changeset,
+tree, hash or API shape changed.
