@@ -382,6 +382,19 @@ only until the versions made from it are replayed. A version that is not
 UTF-8 fails the blame when it is on the blamed file's first-parent line, as
 before, and is not followed from a merge or rename otherwise.
 
+**Long blames** ([ADR 0078](adr/0078-blame-checkpoints-and-detached-blames.md)).
+After every 256 versions replayed, the replay caches the next complete
+version on the blamed changeset's first-parent line as that changer's
+blame (a checkpoint, an ordinary `blame-v2` row), so a later walk stops
+there and the replay starts from it. A blame runs on its own task
+(`blame_flight`), one per (changeset, path, bounded), which requests for
+the same blame join. It finishes and caches its answer after its request is
+dropped, so a client that got 408 and sends the request again joins it or
+reads the answer. The task keeps the request's `blame` permit (the
+middleware puts a `ReadPermit` in the request's extensions), so detached
+work still counts against the class. At most `2 × max(2, cores)` blames run
+detached; past that a blame runs inline and ends with its request.
+
 **Blame walks.** Each first-parent walk asks the path-history index
 where the next change is. The walk
 asks the path-history index where the next change is: the newest changers'
@@ -1477,7 +1490,8 @@ them apart from the method, path and query alone. A full class is refused at onc
 `Retry-After` (the class's recent median request time over its permits,
 1 to 10 s) and `Leep-Refused: read-class`, so lands and cheap reads keep the
 cores on small hosts, and balancers can tell the refusals from failures. As
-with the concurrency guard, the permit rides in the response body. Searches
+with the concurrency guard, the permit rides in the response body; a
+blame's detached task keeps a clone of it until it ends (ADR 0078). Searches
 also share a bound on their metadata reads (`Repo::with_search_pool_permits`,
 `--search-pool-permits`, a quarter of the pool by default): `Opener::open`
 takes a permit inside the call, under the open-ahead permit it may hold, so

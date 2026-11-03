@@ -1548,16 +1548,20 @@ async fn blame(
     State(repo): S,
     Path(id): Path<String>,
     headers: HeaderMap,
+    permit: Option<Extension<read_limits::ReadPermit>>,
     Query(q): Query<PathQuery>,
 ) -> ApiResult<Response> {
     let path = RepoPath::new(q.path)?;
+    // The blame finishes past a timeout (ADR 0078) and keeps the class's
+    // permit until it does.
+    let hold = permit.map(|Extension(p)| Box::new(p) as leep_derive::BlameHold);
     let Answered {
         mut value,
         answered_at,
         behind,
         scanned,
     } = repo
-        .blame_indexed(cid(&id)?, &path, freshness(&headers))
+        .blame_indexed_held(cid(&id)?, &path, freshness(&headers), hold)
         .await?;
     value.answered_at = answered_at;
     value.behind = behind;

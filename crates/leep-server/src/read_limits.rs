@@ -303,8 +303,14 @@ struct Held {
     since: Instant,
     /// The handler answered 2xx; set once the response head is known.
     ok: bool,
-    _permit: OwnedSemaphorePermit,
+    _permit: ReadPermit,
 }
+
+/// A request's read-class permit, also in its extensions: work the request
+/// leaves running past its end (a detached blame, ADR 0078) keeps a clone,
+/// so the class still counts it until it ends.
+#[derive(Clone)]
+pub struct ReadPermit(#[allow(dead_code)] Arc<OwnedSemaphorePermit>);
 
 impl Drop for Held {
     fn drop(&mut self) {
@@ -406,7 +412,11 @@ fn refuse(class: &Class) -> Response {
 /// without a valid token never holds a permit. It applies to every token,
 /// `"unlimited"` ones included: the class protects the server, not a
 /// token's share.
-pub async fn enforce(State(limits): State<Arc<ReadLimits>>, req: Request, next: Next) -> Response {
+pub async fn enforce(
+    State(limits): State<Arc<ReadLimits>>,
+    mut req: Request,
+    next: Next,
+) -> Response {
     let Some(class) = limits.class_of(req.method(), req.uri()).cloned() else {
         return next.run(req).await;
     };
@@ -416,6 +426,8 @@ pub async fn enforce(State(limits): State<Arc<ReadLimits>>, req: Request, next: 
     let name = class.class.name();
     metrics::gauge!("leep_read_class_in_flight", "class" => name).increment(1.0);
     metrics::counter!("leep_read_class_admitted_total", "class" => name).increment(1);
+    let permit = ReadPermit(Arc::new(permit));
+    req.extensions_mut().insert(permit.clone());
     let mut held = Held {
         class,
         since: Instant::now(),

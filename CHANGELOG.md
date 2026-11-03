@@ -13,6 +13,20 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   `--until <generation>`, for measuring Leep at depths a swarm cannot reach
   in reasonable time. Used for "One million changesets of history" in
   docs/PERFORMANCE.md.
+### Long blames finish past the request timeout
+- **Changed.** A blame now runs on its own task, shared by every concurrent
+  request for the same changeset and path. It finishes and caches its
+  answer even after the request that started it times out or is cancelled,
+  so a retry joins it (or reads the answer) instead of starting over and
+  timing out again (ADR 0078). The task keeps the request's `blame` read
+  permit until it ends, so it still counts against `--read-concurrency`. A
+  cancelled or timed-out blame therefore holds its permit until the work
+  is done. New metrics: `leep_blame_detached`, `leep_blame_joined_total`.
+- **Changed.** A long blame caches checkpoints as it replays a file's
+  versions: one ordinary `blame-v2` row per 256 versions, on the blamed
+  changeset's first-parent line. A blame cut short (a restart, or one run
+  inline when every detached slot is taken) resumes above its newest
+  checkpoint. The format is unchanged.
 
 ### Concurrent blob uploads share their file syncs
 - **Changed.** A filesystem store's uploads that arrive together are made

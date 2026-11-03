@@ -11,6 +11,7 @@
 mod ancestry;
 mod batched_reads;
 mod blame;
+mod blame_flight;
 mod blame_follow;
 pub mod changeset_gc;
 pub mod changeset_reach;
@@ -82,6 +83,7 @@ mod rebase_onto_tests;
 #[cfg(test)]
 mod tests;
 
+pub use blame_flight::BlameHold;
 /// The comment lexer, public only so the fuzz harness can check it directly.
 #[doc(hidden)]
 pub use comments::{strip_comments, strip_comments_unchecked};

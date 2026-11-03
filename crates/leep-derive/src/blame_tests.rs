@@ -32,6 +32,14 @@ struct Slow {
     skip_reads: AtomicUsize,
     /// Writes of cached blames.
     blame_puts: AtomicUsize,
+    /// The write of a cached blame with this number (0: none) is stored,
+    /// says so on `stalled`, and never returns.
+    stall_at_blame_put: AtomicUsize,
+    stalled: tokio::sync::Notify,
+    /// While set, every read says so on `entered` and waits for the
+    /// semaphore, which never has permits, to close.
+    gate: std::sync::Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+    entered: tokio::sync::Notify,
 }
 
 impl Slow {
@@ -48,7 +56,22 @@ impl Slow {
         )
     }
 
+    fn close_gate(&self) {
+        *self.gate.lock().unwrap() = Some(Arc::new(tokio::sync::Semaphore::new(0)));
+    }
+
+    fn open_gate(&self) {
+        if let Some(g) = self.gate.lock().unwrap().take() {
+            g.close();
+        }
+    }
+
     async fn read(&self) -> leep_core::Result<()> {
+        let gate = self.gate.lock().unwrap().clone();
+        if let Some(g) = gate {
+            self.entered.notify_one();
+            let _ = g.acquire().await;
+        }
         let n = self.reads.fetch_add(1, Ordering::Relaxed) + 1;
         let us = self.latency_us.load(Ordering::Relaxed);
         if us > 0 {
@@ -123,10 +146,16 @@ impl MetaStore for Slow {
         self.inner.get_derived_many(kind, keys).await
     }
     async fn put_derived(&self, kind: &str, key: &Hash, value: Bytes) -> leep_core::Result<()> {
-        if kind == crate::blame::KIND {
-            self.blame_puts.fetch_add(1, Ordering::Relaxed);
+        if kind != crate::blame::KIND {
+            return self.inner.put_derived(kind, key, value).await;
         }
-        self.inner.put_derived(kind, key, value).await
+        let n = self.blame_puts.fetch_add(1, Ordering::Relaxed) + 1;
+        self.inner.put_derived(kind, key, value).await?;
+        if n == self.stall_at_blame_put.load(Ordering::Relaxed) {
+            self.stalled.notify_one();
+            std::future::pending::<()>().await;
+        }
+        Ok(())
     }
     async fn delete_derived_kind(&self, kind: &str) -> leep_core::Result<u64> {
         self.inner.delete_derived_kind(kind).await
@@ -1007,15 +1036,19 @@ async fn reference_blames(
 /// side branches merged back with a mix of both sides' lines, files created
 /// on a side branch, and octopus merges, blame of every file at many
 /// changesets is the definition's (`reference_blames`), from the reference
-/// walk, from short stretches, and with blames cached at random changesets.
+/// walk, from short stretches, and with blames and checkpoints cached at
+/// random changesets.
 #[tokio::test]
 async fn blame_matches_the_definition_across_merges_and_renames() {
     let names = ["a", "b", "dir/c", "dir/sub/d", "e"];
     for seed in 1..=6u64 {
-        let r = Repo::new(
+        let mut r = Repo::new(
             Arc::new(MemoryBlobStore::new()),
             Arc::new(MemoryMetaStore::new()),
         );
+        // Checkpoints (ADR 0078) every one to three versions, so the cached
+        // rounds below start walks and replays at many of them.
+        r.blame_checkpoint_every = 1 + seed as usize % 3;
         let mut rng = Lcg(seed * 31 + 7);
         let mut tag = 0usize;
         let fresh = |rng: &mut Lcg, tag: &mut usize| -> String {
@@ -1510,4 +1543,230 @@ async fn blame_calls_on_a_swarm_history() {
         .unwrap();
     run("blames at head 2 (40 lands later)", tip, &names).await;
     run("again at head 2", tip, &names).await;
+}
+
+/// A linear history in which every other changeset or so edits `hot`
+/// (replacing, inserting or dropping a line), `versions` versions in all.
+async fn hot_file(r: &Repo, versions: usize, seed: u64) -> ChangesetId {
+    let mut rng = Lcg(seed);
+    let mut lines: Vec<String> = (0..200).map(|i| format!("base {i}\n")).collect();
+    let mut tip = commit(
+        r,
+        &[],
+        &[("hot", Some(&lines.concat())), ("other", Some("0\n"))],
+    )
+    .await;
+    for v in 1..versions {
+        let i = rng.below(lines.len());
+        match rng.below(3) {
+            0 => lines[i] = format!("edit {v}\n"),
+            2 if lines.len() > 100 => {
+                lines.remove(i);
+            }
+            _ => lines.insert(i, format!("add {v}\n")),
+        }
+        if v % 3 == 0 {
+            tip = commit(r, &[tip], &[("other", Some(&format!("{v}\n")))]).await;
+        }
+        tip = commit(r, &[tip], &[("hot", Some(&lines.concat()))]).await;
+    }
+    crate::derived::derive::<crate::derived::HistoryTree>(r, tip)
+        .await
+        .unwrap();
+    tip
+}
+
+fn production_cuts() -> Option<Cuts> {
+    Some(Cuts {
+        head: crate::blame::HEAD_STEPS,
+        min_span: crate::blame::MIN_STRETCH_SPAN,
+        linear_jumps: true,
+    })
+}
+
+/// A long blame leaves checkpoints as it replays (ADR 0078). Cut short, the
+/// next blame, in a new process, walks and replays only the versions above
+/// the newest one and answers the same; uninterrupted, a blame writes about
+/// one checkpoint per spacing of versions.
+#[tokio::test]
+async fn an_interrupted_blame_resumes_from_its_checkpoints() {
+    const VERSIONS: usize = 600;
+    const EVERY: usize = 64;
+    let (mut r, meta) = slow_repo();
+    r.blame_checkpoint_every = EVERY;
+    let tip = hot_file(&r, VERSIONS, 5).await;
+    let path = rp("hot");
+    let (want, _) = r.blame_walk_in(tip, &path, None, false).await.unwrap();
+    let process = || {
+        let mut p = Repo::new(r.blobs().clone(), meta.clone());
+        p.blame_checkpoint_every = EVERY;
+        p
+    };
+    let run = |p: Repo| {
+        let path = path.clone();
+        async move {
+            p.blame_run(
+                tip,
+                &path,
+                production_cuts(),
+                true,
+                crate::blame_follow::FOLLOW_WALKS,
+            )
+            .await
+        }
+    };
+
+    // Cut short at its fourth checkpoint, as by a dropped request.
+    meta.stall_at_blame_put.store(4, Ordering::Relaxed);
+    tokio::select! {
+        _ = run(process()) => panic!("the stalled blame finished"),
+        _ = meta.stalled.notified() => {}
+    }
+    meta.stall_at_blame_put.store(0, Ordering::Relaxed);
+    assert_eq!(meta.blame_puts.load(Ordering::Relaxed), 4);
+    let at_tip = meta
+        .inner
+        .get_derived(crate::blame::KIND, &crate::blame::cache_key(tip, &path))
+        .await
+        .unwrap();
+    assert!(at_tip.is_none(), "the cut blame cached its answer");
+
+    meta.reads.store(0, Ordering::Relaxed);
+    let resumed = run(process()).await.unwrap();
+    let resumed_reads = meta.reads.load(Ordering::Relaxed);
+    assert_eq!(resumed.blame, want);
+    assert!(
+        resumed.replayed <= VERSIONS - 4 * EVERY,
+        "{} versions replayed after 4 checkpoints",
+        resumed.replayed
+    );
+
+    // From nothing: every version, and a checkpoint per spacing.
+    meta.inner
+        .delete_derived_kind(crate::blame::KIND)
+        .await
+        .unwrap();
+    meta.reads.store(0, Ordering::Relaxed);
+    let scratch = run(process()).await.unwrap();
+    let scratch_reads = meta.reads.load(Ordering::Relaxed);
+    assert_eq!(scratch.blame, want);
+    assert_eq!(scratch.replayed, VERSIONS);
+    assert_eq!(scratch.checkpoints, (VERSIONS - 1) / EVERY);
+    assert!(
+        resumed_reads < scratch_reads,
+        "{resumed_reads} reads resumed, {scratch_reads} from nothing"
+    );
+
+    // Uncheckpointed, the same answer and no rows but the blame's own.
+    meta.inner
+        .delete_derived_kind(crate::blame::KIND)
+        .await
+        .unwrap();
+    let puts = meta.blame_puts.load(Ordering::Relaxed);
+    let mut none = process();
+    none.blame_checkpoint_every = 0;
+    let plain = run(none).await.unwrap();
+    assert_eq!((plain.blame, plain.checkpoints), (want, 0));
+    assert_eq!(meta.blame_puts.load(Ordering::Relaxed), puts + 2);
+}
+
+/// Waits up to ten seconds for `cond`.
+async fn until(what: &str, cond: impl Fn() -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !cond() {
+        assert!(std::time::Instant::now() < deadline, "{what}");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// Concurrent requests for one blame share one computation, which goes on
+/// after the request that started it is dropped, keeps that request's hold
+/// to its end, and caches its answer (ADR 0078). With every detached slot
+/// taken, a blame runs inline and ends with its caller.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_blames_share_one_computation_that_outlives_its_callers() {
+    let (r, meta) = slow_repo();
+    let tip = hot_file(&r, 300, 9).await;
+    let path = rp("hot");
+    let (want, _) = r.blame_walk_in(tip, &path, None, false).await.unwrap();
+    let mut server = Repo::new(r.blobs().clone(), meta.clone());
+    server.blame_checkpoint_every = 0;
+    server.blame_flights = Arc::new(crate::blame_flight::BlameFlights::new(1));
+    let puts = meta.blame_puts.load(Ordering::Relaxed);
+
+    meta.close_gate();
+    let hold = Arc::new(());
+    let first = {
+        let (s, p, h) = (server.clone(), path.clone(), hold.clone());
+        tokio::spawn(async move { s.blame_held(tip, &p, Some(Box::new(h))).await })
+    };
+    tokio::time::timeout(Duration::from_secs(10), meta.entered.notified())
+        .await
+        .expect("the blame reads");
+    let joiners: Vec<_> = (0..7)
+        .map(|_| {
+            let (s, p) = (server.clone(), path.clone());
+            tokio::spawn(async move { s.blame(tip, &p).await })
+        })
+        .collect();
+    until("seven requests join", || server.blame_flights.joins() == 7).await;
+    assert_eq!(server.blame_flights.running(), 1);
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+
+    // The one slot is taken: a blame of another file runs inline, and its
+    // caller's going away ends it.
+    let other = rp("other");
+    let inline = {
+        let (s, p) = (server.clone(), other.clone());
+        tokio::spawn(async move { s.blame(tip, &p).await })
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(server.blame_flights.running(), 1);
+    inline.abort();
+    let _ = inline.await;
+
+    meta.open_gate();
+    for j in joiners {
+        assert_eq!(j.await.unwrap().unwrap().lines, want.1);
+    }
+    until("the blame lets its hold go", || {
+        Arc::strong_count(&hold) == 1
+    })
+    .await;
+    until("the flight ends", || server.blame_flights.running() == 0).await;
+    assert_eq!(
+        meta.blame_puts.load(Ordering::Relaxed),
+        puts + 2,
+        "one computation cached its answer"
+    );
+    let stored = |id: ChangesetId, p: RepoPath| {
+        let meta = meta.clone();
+        async move {
+            meta.inner
+                .get_derived(crate::blame::KIND, &crate::blame::cache_key(id, &p))
+                .await
+                .unwrap()
+        }
+    };
+    assert!(stored(tip, path.clone()).await.is_some());
+    assert!(
+        stored(tip, other.clone()).await.is_none(),
+        "the inline blame ended with its caller"
+    );
+
+    // Alone and dropped at once, a detached blame still finishes and
+    // caches its answer.
+    meta.close_gate();
+    let dropped = {
+        let (s, p) = (server.clone(), other.clone());
+        tokio::spawn(async move { s.blame(tip, &p).await })
+    };
+    until("the blame starts", || server.blame_flights.running() == 1).await;
+    dropped.abort();
+    let _ = dropped.await;
+    meta.open_gate();
+    until("the flight ends", || server.blame_flights.running() == 0).await;
+    assert!(stored(tip, other.clone()).await.is_some());
+    assert_eq!(server.blame(tip, &other).await.unwrap().lines.len(), 1);
 }
