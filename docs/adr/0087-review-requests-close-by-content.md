@@ -53,7 +53,9 @@ the land added names X among its carry candidates
    chooses what to compare; content decides, exactly as for a carried
    verdict. A forger who lands X's byte-identical reviewed change has put
    the reviewed content on the ref, so closing is truthful.
-2. **Requester rule.** The land's actor (its token) is R's requester. This
+2. **Requester rule.** The land's actor (its token) is R's requester, and
+   the ref log entry the added changesets were found from (below) names
+   that actor. This
    covers a resolved stack entry whose reviewed file a lower entry also
    changed: its old content is the lower entry's new one, so the content
    rule refuses it (as carrying does), though the requester knows it
@@ -61,11 +63,20 @@ the land added names X among its carry candidates
    this grants nothing they did not have.
 
 **What the land added.** Z ranges over the land's new changesets only: the
-ref log entry of the move to the landed changeset gives the head it moved
-from (one `ref_log` read of the ref's newest 64 entries), and the walk goes
-down the first-parent chain from the landed changeset to that head, at most
-256 steps. Without the entry (more than 64 moves of the ref since), only the
-landed changeset and the server copies directly below it count. Walking
+newest ref log entry that moved the ref to the landed changeset gives the
+head it moved from (one `ref_log` read of the ref's newest 64 entries), and
+the walk goes down the first-parent chain from the landed changeset to that
+head, at most 256 steps. The requester rule applies only when that entry's
+actor is the land's actor. A land can answer `landed` without writing an
+entry: the changeset was already on the ref (or already landed as a copy),
+or the land id was a replay. Then the newest entry naming the landed
+changeset, if any, is someone else's or an earlier one; when it is not the
+actor's, or there is none in reach (more than 64 moves since, or the log
+read failed), Z ranges over the landed changeset and the contiguous server
+copies directly below it (at most 256), which may be other agents' lands,
+and only the content rule and the server-copy row apply to them. So a
+requester who re-lands another agent's forged-hint changeset closes nothing
+by the hint (`a_re_land_by_the_requester_closes_nothing_by_hint`). Walking
 "while each changeset has a hint", as first planned, would not do: the
 server's own copies carry the hint, so on a busy ref the walk would run
 through earlier lands, cost up to 256 hint expansions per land, and apply
@@ -79,7 +90,8 @@ listing it walks the newest 64 first-parent steps of the ref's head,
 expanding the carry candidates of each changeset with a hint until 256
 candidates are collected, and then checks each remaining open request
 against those, oldest changeset first (so `landed_as` is the one that first
-put the change there). The requester rule does not apply at listing: there
+put the change there). One listing walks at most 8 refs; requests on
+further refs wait for their land's close or a narrower listing. The requester rule does not apply at listing: there
 is no actor.
 
 **Auto-only changes.** `carried_paths` returned `None` when nothing was

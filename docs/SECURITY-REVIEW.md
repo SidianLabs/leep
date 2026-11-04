@@ -188,9 +188,16 @@ looking for it. The same rule as for carrying decides: the request closes
 by content only when the named changeset's reviewed change is on the landed
 changeset byte for byte (same old and new content and kind for every path
 that needed a reviewer); otherwise only the request's own requester's land
-closes it, and a requester may withdraw anyway. Only changesets the land
-added count (found from the ref log entry of the move), so the requester
-rule cannot reach a forged changeset another agent landed earlier. A
+closes it, and a requester may withdraw anyway. The requester rule counts
+only changesets the land added: the first-parent chain from the landed
+changeset down to the old head of the newest ref log entry moving the ref
+there, and only when that entry names the land's actor. A land that moved
+nothing (already on the ref, landed as a copy, a replayed land id) writes no
+entry; then, or when the entry is out of reach, the landed changeset and the
+contiguous server copies below it (at most 256) are checked by content and
+copy row only, so a requester re-landing another agent's forged-hint land
+closes nothing by the hint (found in review of the first version:
+`a_re_land_by_the_requester_closes_nothing_by_hint`). A
 listing applies the content rule only. *Accepted:* a request for an
 auto-only change (every path docs, comment-only or whitespace-only) closes
 when a changeset naming it changes the same paths in an auto-approved form,

@@ -1112,7 +1112,9 @@ async fn add_review(
     .into_response())
 }
 
-/// The refs a land policy covers, sorted.
+/// The refs a land policy covers, sorted. A reloadable config knows them
+/// by name; a fixed one (handed a policy object) only answers per ref, so
+/// the ref list is filtered.
 async fn policy_refs(
     repo: &Repo,
     config: &reload::RuntimeConfig,
@@ -1120,6 +1122,9 @@ async fn policy_refs(
     let Some(policy) = config.land_policy.as_ref() else {
         return Ok(Vec::new());
     };
+    if !config.protected_refs().is_empty() {
+        return Ok(config.protected_refs().to_vec());
+    }
     Ok(repo
         .meta()
         .list_refs()

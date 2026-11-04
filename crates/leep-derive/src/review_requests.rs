@@ -41,6 +41,10 @@ const LIST_WALK_LIMIT: usize = 64;
 /// Carry candidates one listing's walk of a ref collects before it stops.
 const LIST_CANDIDATE_LIMIT: usize = 256;
 
+/// Refs one listing walks; requests on others wait for a listing of fewer
+/// refs (or filtered by `ref`) or their land's close.
+const LIST_WALK_REFS: usize = 8;
+
 /// A changeset near a ref's head that names others it was made from.
 struct Hinted {
     id: ChangesetId,
@@ -226,6 +230,9 @@ impl Repo {
                 landed_as = Some(r.changeset);
             } else {
                 if !walks.contains_key(&r.target_ref) {
+                    if walks.len() >= LIST_WALK_REFS {
+                        continue;
+                    }
                     let walk = self.hinted_below(head).await;
                     walks.insert(r.target_ref.clone(), walk);
                 }
@@ -339,14 +346,18 @@ impl Repo {
     /// - Z lands their reviewed change, judged by content alone as a carried
     ///   verdict is ([`Repo::lands_reviewed_change`]), so a forged hint
     ///   closes nothing whose reviewed change did not land; or
-    /// - `actor`, who ran the land, made the request: a requester may
-    ///   withdraw their own request anyway, and this covers a stack entry
-    ///   whose reviewed file a lower entry also changed.
+    /// - `actor`, who ran the land, made the request, and the ref log entry
+    ///   of the move to `landed` names `actor`: a requester may withdraw
+    ///   their own request anyway, and this covers a stack entry whose
+    ///   reviewed file a lower entry also changed.
     ///
-    /// The changesets the land added are found from the ref log entry of
-    /// the move to `landed` (the first-parent chain down to the head it
-    /// moved from); without one, only `landed` and the server copies below
-    /// it count. Returns how many it closed. Callers ignore its errors: the
+    /// The changesets the land added are found from the newest ref log
+    /// entry of the move to `landed` (the first-parent chain down to the
+    /// head it moved from). Without one (a land that moved nothing: already
+    /// on the ref, a replayed land id; or a log out of reach), `landed` and
+    /// the server copies directly below it are checked by content and copy
+    /// row only, since they may be other agents' lands. Returns how many it
+    /// closed. Callers ignore its errors: the
     /// land has happened whatever this does.
     pub async fn close_landed_review_requests(
         &self,
@@ -375,7 +386,12 @@ impl Repo {
         }
         let mut copies = HashMap::new();
         let mut named = Vec::new();
-        for z in self.land_added(target_ref, landed).await? {
+        let (added, logged_by) = self.land_added(target_ref, landed).await?;
+        // The requester rule needs the move to be this actor's own: an
+        // older entry by someone else (a re-land of their changeset) or no
+        // entry at all grants nothing beyond content.
+        let requester_rule = actor.is_some() && logged_by.as_deref() == actor;
+        for z in added {
             if let Some(origin) = self.rebased_origin(z).await? {
                 copies.entry(origin).or_insert(z);
             }
@@ -408,7 +424,7 @@ impl Repo {
                 if !candidates.contains(&r.changeset) {
                     continue;
                 }
-                if actor == Some(r.requester.as_str())
+                if (requester_rule && actor == Some(r.requester.as_str()))
                     || self
                         .lands_reviewed_change(r.changeset, *z, rules)
                         .await
@@ -436,17 +452,26 @@ impl Repo {
     }
 
     /// The changesets a land that moved `target_ref` to `landed` added,
-    /// newest first: `landed`'s first-parent chain down to the head the ref
-    /// log says it moved from, at most [`COPY_WALK_LIMIT`]. Without that
-    /// entry (more than [`LAND_LOG_LOOKBACK`] moves since), `landed` and the
-    /// server copies directly below it, which a replayed land made.
-    async fn land_added(&self, target_ref: &str, landed: ChangesetId) -> Result<Vec<ChangesetId>> {
+    /// newest first, and the actor of the ref log entry they come from:
+    /// `landed`'s first-parent chain down to the head the newest entry
+    /// moving the ref to `landed` says it moved from, at most
+    /// [`COPY_WALK_LIMIT`]. Without such an entry among the newest
+    /// [`LAND_LOG_LOOKBACK`] (the land moved nothing, or the log is out of
+    /// reach), `landed` and the server copies directly below it, with no
+    /// actor.
+    async fn land_added(
+        &self,
+        target_ref: &str,
+        landed: ChangesetId,
+    ) -> Result<(Vec<ChangesetId>, Option<String>)> {
         let log = self
             .meta()
             .ref_log(Some(target_ref), None, LAND_LOG_LOOKBACK)
             .await
             .unwrap_or_default();
-        let from = log.iter().find(|e| e.new == Some(landed)).map(|e| e.old);
+        let entry = log.iter().find(|e| e.new == Some(landed));
+        let from = entry.map(|e| e.old);
+        let logged_by = entry.and_then(|e| e.actor.clone());
         let mut out = Vec::new();
         let mut seen = HashSet::new();
         let mut cur = Some(landed);
@@ -466,7 +491,7 @@ impl Repo {
                 Err(e) => return Err(e),
             };
         }
-        Ok(out)
+        Ok((out, logged_by))
     }
 
     /// The refs among `names` whose first-parent chain holds `id`, in the
@@ -1096,6 +1121,95 @@ mod tests {
         );
         let qa = r.review_request(qa.id).await.unwrap();
         assert_eq!((qa.state, qa.landed_as), (ReviewRequestState::Open, None));
+    }
+
+    /// A land that moves nothing (a re-land of what is already on the ref,
+    /// a replayed land id) writes no ref log entry. Its requester must not
+    /// close their request through another agent's forged-hint land: not by
+    /// that agent's older entry, nor by the no-entry fallback.
+    #[tokio::test]
+    async fn a_re_land_by_the_requester_closes_nothing_by_hint() {
+        let r = repo();
+        let base = commit(&r, None, 1).await;
+        r.meta().cas_ref("main", None, Some(base)).await.unwrap();
+        let x = commit(&r, Some(base), 2).await;
+        let (qa, _) = r
+            .request_review(ask(x, "ada", &["rhea"]), None)
+            .await
+            .unwrap();
+        let m = commit(&r, Some(base), 3).await;
+        r.land_as(m, "main", Some("bo")).await.unwrap();
+        // Bo's forged hint, replayed into a server copy that names it.
+        let mut forged = r
+            .get_changeset(commit(&r, Some(base), 4).await)
+            .await
+            .unwrap();
+        forged
+            .extra
+            .insert(EXTRA_REBASED_FROM.into(), x.to_string());
+        let y = r.create_changeset(forged).await.unwrap();
+        let id = leep_core::store::LandId::from_bytes(&[7; 16]).unwrap();
+        let landed_of = |resp| match resp {
+            leep_core::api::LandResponse::Landed { landed, .. } => landed,
+            other => panic!("{other:?}"),
+        };
+        let copy = landed_of(
+            r.land_keyed(y, "main", Some("bo"), true, Some(id.clone()))
+                .await
+                .unwrap(),
+        );
+        assert_ne!(copy, y);
+        assert!(r.carry_candidates(copy).await.unwrap().contains(&x));
+        let rules = all_auto();
+        let closes = |submitted, landed| {
+            let r = r.clone();
+            let rules = rules.clone();
+            async move {
+                r.close_landed_review_requests("main", submitted, landed, Some("ada"), Some(&rules))
+                    .await
+                    .unwrap()
+            }
+        };
+        // Ada re-lands the copy (already the head) and the original (already
+        // landed as the copy), and replays bo's land id: bo's entry is the
+        // newest naming the copy, so nothing is hers.
+        assert_eq!(
+            landed_of(r.land_as(copy, "main", Some("ada")).await.unwrap()),
+            copy
+        );
+        assert_eq!(closes(copy, copy).await, 0);
+        assert_eq!(
+            landed_of(r.land_as(y, "main", Some("ada")).await.unwrap()),
+            copy
+        );
+        assert_eq!(closes(y, copy).await, 0);
+        let replay = r
+            .land_keyed(y, "main", Some("ada"), true, Some(id))
+            .await
+            .unwrap();
+        assert_eq!(landed_of(replay), copy);
+        assert_eq!(closes(y, copy).await, 0);
+        // With the entry out of reach, the fallback checks the copy by
+        // content only.
+        let a = commit(&r, Some(copy), 5).await;
+        let b = commit(&r, Some(a), 6).await;
+        r.meta().cas_ref("main", Some(copy), Some(a)).await.unwrap();
+        for i in 0..LAND_LOG_LOOKBACK {
+            let (from, to) = if i % 2 == 0 { (a, b) } else { (b, a) };
+            r.meta()
+                .cas_ref("main", Some(from), Some(to))
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            landed_of(r.land_as(copy, "main", Some("ada")).await.unwrap()),
+            copy
+        );
+        assert_eq!(closes(copy, copy).await, 0);
+        assert_eq!(
+            r.review_request(qa.id).await.unwrap().state,
+            ReviewRequestState::Open
+        );
     }
 
     /// Of concurrent creates of one changeset by different tokens exactly
