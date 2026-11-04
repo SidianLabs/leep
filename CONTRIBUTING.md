@@ -21,8 +21,10 @@
 AI agents working on this repo: follow [CLAUDE.md](CLAUDE.md) and the skills
 in `.claude/skills/`.
 
-Notable changes go under `[Unreleased]` in [CHANGELOG.md](CHANGELOG.md)
-in the same PR. Report security problems privately as described in
+Notable changes get a changelog fragment in the same PR:
+`changelog.d/<area>-<desc>.md`, as [changelog.d/README.md](changelog.d/README.md)
+describes. Don't edit [CHANGELOG.md](CHANGELOG.md) directly; fragments are
+moved into it at a release ([ADR 0088](docs/adr/0088-changelog-fragments.md)). Report security problems privately as described in
 [SECURITY.md](SECURITY.md).
 
 Outside contributors sign the [Contributor License Agreement](CLA.md)

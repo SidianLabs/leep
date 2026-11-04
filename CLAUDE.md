@@ -19,7 +19,8 @@ cargo bench -p leep-derive                   # criterion; LEEP_BENCH_LARGE=1 add
 ```
 Windows runs the unit and integration tests; Linux and macOS also run the e2e, soak and crash tests.
 CI runs fmt check, `scripts/check-version.sh` (versions stay below 0.1.0),
-clippy with `-D warnings`, and tests against Postgres 16.
+clippy with `-D warnings`, and tests against Postgres 16 (the tests include
+the changelog fragment check, `scripts/changelog-assemble.sh --check`).
 A change isn't done until all of them pass locally.
 
 End-to-end tests drive the real binaries and need them built first:
@@ -52,6 +53,9 @@ For leaks, slow drift and long-history bugs, run a soak (`docs/OPERATIONS.md`,
   reviews on GitHub. Never merge a pull request on GitHub, and never push to
   GitHub `main` or a `review/*` branch.
 - Squash with `leep reset` on a stale base (see "Working in Leep").
+- Edit `CHANGELOG.md` in a change. Add a fragment,
+  `changelog.d/<area>-<desc>.md`, instead (`changelog.d/README.md`,
+  ADR 0088); only the maintainer runs `scripts/changelog-assemble.sh`.
 - Bump the workspace version, tag a release, or mark a roadmap milestone
   closed. Those are maintainer decisions; see "How versions move" in
   [docs/ROADMAP.md](docs/ROADMAP.md).

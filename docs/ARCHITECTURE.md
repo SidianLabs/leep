@@ -94,6 +94,11 @@ Rules:
 - Every `BlobStore`/`MetaStore` backend must pass
   `leep_core::memory::check_*_contract`, also through a quiet
   `leep-testkit` wrapper.
+- Not a crate rule, but a repository one: a change records its changelog
+  entry as its own file, `changelog.d/<slug>.md`, never by editing
+  `CHANGELOG.md`, which `scripts/changelog-assemble.sh` writes at a release
+  ([ADR 0088](adr/0088-changelog-fragments.md)). Concurrent lands then
+  conflict only where their code does.
 
 ## 4. Data model
 
@@ -1547,7 +1552,8 @@ compared (with more, none carry). `review-status` names the source in
 refs that already hold the changeset), `GET .../reviews` lists verdicts, its
 own then those carried to it with `carried_from` (`via` for a rebased copy
 whose original's reviews do not carry, ADR 0087), and `leep review ...` and the
-`leep_review_status` MCP tool are the clients. A verdict on a changeset
+`leep_review_status` MCP tool are the clients (`leep review status --wait`
+polls `review-status` with backoff; there is no push). A verdict on a changeset
 already on a policy ref is stored and answered with `on_refs`; a reject or
 withdrawal answers the candidates it was also written on in `taken_back`.
 

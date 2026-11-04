@@ -77,9 +77,16 @@ personal names, ticket-only names or tool-generated names.
   plan (see docs/FORMATS.md).
   ```
 - Keep PRs small and single-purpose. Split refactors from behavior changes.
-- Add a line under `[Unreleased]` in `CHANGELOG.md` for any change a user or
-  operator would notice. Never move entries into a version section: that
-  happens only when the maintainer cuts a release.
+- For any change a user or operator would notice, add a changelog
+  fragment, `changelog.d/<area>-<desc>.md` (the review ref's name without
+  `review/`): one `### Title` line, then bullets led by `**Added.**`,
+  `**Changed.**`, `**Fixed.**` and so on (`changelog.d/README.md`,
+  ADR 0088). Never edit `CHANGELOG.md` itself: everyone's entries go at
+  the same place there, so every concurrent land would conflict on it.
+  The maintainer moves fragments in with `scripts/changelog-assemble.sh`
+  at a release. Check yours with `scripts/changelog-assemble.sh --check`
+  (`cargo test` runs the same check). Answering review, edit your
+  fragment rather than adding another.
 - CI (fmt, clippy `-D warnings`, tests) must be green before review.
 - Answer review comments by landing more commits on the review ref. The
   maintainer reviews on GitHub.
