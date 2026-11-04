@@ -986,7 +986,7 @@ fn killed_server_and_gc_lose_nothing_sqlite() {
 
 #[test]
 fn killed_server_and_gc_lose_nothing_postgres() {
-    let Some(db) = PgDb::create() else {
+    let Some(db) = PgDb::create("leep_e2e") else {
         return;
     };
     run_crash_rounds("postgres", Some(db.url.clone()));
@@ -1007,7 +1007,7 @@ fn killed_server_with_a_full_land_queue_loses_nothing_sqlite() {
 
 #[test]
 fn killed_server_with_a_full_land_queue_loses_nothing_postgres() {
-    let Some(db) = PgDb::create() else {
+    let Some(db) = PgDb::create("leep_e2e") else {
         return;
     };
     let refused = run_crash_rounds_with("postgres, full queue", Some(db.url.clone()), FULL_QUEUE);
@@ -1027,7 +1027,7 @@ fn killed_server_with_pipelined_batches_loses_nothing_sqlite() {
 
 #[test]
 fn killed_server_with_pipelined_batches_loses_nothing_postgres() {
-    let Some(db) = PgDb::create() else {
+    let Some(db) = PgDb::create("leep_e2e") else {
         return;
     };
     run_crash_rounds_with("postgres, pipelined", Some(db.url.clone()), PIPELINED);
@@ -1124,7 +1124,7 @@ fn failover_agent(
 /// land.
 #[test]
 fn killed_land_leader_is_replaced_postgres() {
-    let Some(db) = PgDb::create() else {
+    let Some(db) = PgDb::create("leep_e2e") else {
         return;
     };
     let _g = serial();
@@ -1427,7 +1427,7 @@ fn killed_changeset_sweep_keeps_ancestry_sqlite() {
 
 #[test]
 fn killed_changeset_sweep_keeps_ancestry_postgres() {
-    let Some(db) = PgDb::create() else {
+    let Some(db) = PgDb::create("leep_e2e") else {
         return;
     };
     run_sweep_crash("postgres", Some(db.url.clone()));

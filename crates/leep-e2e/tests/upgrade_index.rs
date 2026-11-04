@@ -154,7 +154,7 @@ fn upgrade_index_over_sqlite() {
 #[test]
 fn upgrade_index_over_postgres() {
     let _g = serial();
-    let Some(db) = PgDb::create() else {
+    let Some(db) = PgDb::create("leep_e2e") else {
         return;
     };
     let tmp = tempfile::tempdir().unwrap();
