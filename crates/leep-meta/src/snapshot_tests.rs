@@ -7,8 +7,9 @@ use leep_core::{Hash, LandId, LandKey, MetaStore, RefUpdateContext};
 use sqlx::Connection;
 
 use super::snapshot::*;
-use super::tests::{cs, PgDb};
+use super::tests::cs;
 use super::*;
+use crate::pg_test::TestDb;
 
 fn land_id(i: i64) -> LandId {
     LandId::from_bytes(&[i as u8 + 1; 16]).unwrap()
@@ -685,10 +686,10 @@ async fn compressed_changesets_and_their_dictionary_round_trip() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn postgres_to_sqlite_to_postgres() {
-    let Some(a) = PgDb::create("a").await else {
+    let Some(a) = TestDb::create("leep_test_snap_a") else {
         return;
     };
-    let b = PgDb::create("b").await.unwrap();
+    let b = TestDb::create("leep_test_snap_b").unwrap();
     let src = open_meta_store(&a.url).await.unwrap();
     populate(&*src).await;
     let history = compacted(&a.url, &*src).await;
@@ -751,13 +752,11 @@ async fn postgres_to_sqlite_to_postgres() {
     assert_eq!(stored_features(&b.url).await, features);
 
     drop((src, dest));
-    a.drop_db().await;
-    b.drop_db().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn postgres_snapshot_during_writes_is_one_point_in_time() {
-    let Some(a) = PgDb::create("w").await else {
+    let Some(a) = TestDb::create("leep_test_snap_w") else {
         return;
     };
     let src: Arc<dyn MetaStore> = open_meta_store(&a.url).await.unwrap();
@@ -797,5 +796,4 @@ async fn postgres_snapshot_during_writes_is_one_point_in_time() {
         }
     }
     drop(src);
-    a.drop_db().await;
 }

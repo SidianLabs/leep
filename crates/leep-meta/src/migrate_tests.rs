@@ -29,14 +29,22 @@ use leep_core::{
 };
 use sqlx::Row;
 
-use crate::tests::{pg_url, schema};
+use crate::pg_test::TestSchema;
 use crate::*;
 
 // ---- Backends under test ---------------------------------------------------
 
 enum Db {
-    Sqlite { url: String, dir: PathBuf },
-    Pg { url: String, schema: String },
+    Sqlite {
+        url: String,
+        dir: PathBuf,
+    },
+    // The guard drops the schema with the `Db`, a failing test's included.
+    Pg {
+        url: String,
+        schema: String,
+        _guard: TestSchema,
+    },
 }
 
 enum Arg {
@@ -57,26 +65,12 @@ impl Db {
     }
 
     async fn pg(name: &str) -> Option<Db> {
-        let url = pg_url()?;
-        let db = Db::Pg {
-            url,
-            schema: schema(&format!("mig{name}")),
-        };
-        // Created here: `CREATE SCHEMA IF NOT EXISTS` itself races when
-        // several connections run it at once.
-        db.exec_raw(&[
-            &format!("DROP SCHEMA IF EXISTS {} CASCADE", db.quoted()),
-            &format!("CREATE SCHEMA {}", db.quoted()),
-        ])
-        .await;
-        Some(db)
-    }
-
-    fn quoted(&self) -> String {
-        match self {
-            Db::Pg { schema, .. } => format!("\"{schema}\""),
-            Db::Sqlite { .. } => unreachable!(),
-        }
+        let guard = TestSchema::create(&format!("leep_test_mig{name}"))?;
+        Some(Db::Pg {
+            url: guard.url.clone(),
+            schema: guard.name.clone(),
+            _guard: guard,
+        })
     }
 
     fn kind(&self) -> &'static str {
@@ -99,7 +93,7 @@ impl Db {
             Db::Sqlite { url, .. } => {
                 Arc::new(SqliteMetaStore::connect_with_migrations(url, mode, migs).await?)
             }
-            Db::Pg { url, schema } => Arc::new(
+            Db::Pg { url, schema, .. } => Arc::new(
                 PostgresMetaStore::connect_with_migrations(url, Some(schema), mode, migs).await?,
             ),
         })
@@ -108,7 +102,7 @@ impl Db {
     async fn migrate(&self, migs: &[Migration], dry_run: bool) -> Result<MigrationReport> {
         match self {
             Db::Sqlite { url, .. } => SqliteMetaStore::migrate_with(url, migs, dry_run).await,
-            Db::Pg { url, schema } => {
+            Db::Pg { url, schema, .. } => {
                 PostgresMetaStore::migrate_with(url, Some(schema), migs, dry_run).await
             }
         }
@@ -138,7 +132,7 @@ impl Db {
                 q.execute(&pool).await.unwrap();
                 pool.close().await;
             }
-            Db::Pg { url, schema } => {
+            Db::Pg { url, schema, .. } => {
                 let mut n = 0;
                 let mut numbered = String::new();
                 for c in sql.chars() {
@@ -184,19 +178,7 @@ impl Db {
     /// Statements without parameters.
     async fn exec_raw(&self, sql: &[&str]) {
         for s in sql {
-            match self {
-                Db::Pg { url, .. } if s.contains("SCHEMA") => {
-                    let opts = sqlx::postgres::PgConnectOptions::from_str(url).unwrap();
-                    let pool = sqlx::PgPool::connect_with(opts).await.unwrap();
-                    sqlx::query(sqlx::AssertSqlSafe(*s))
-                        .execute(&pool)
-                        .await
-                        .unwrap();
-                    pool.close().await;
-                }
-                Db::Pg { .. } => self.exec(s, vec![]).await,
-                Db::Sqlite { .. } => self.exec(s, vec![]).await,
-            }
+            self.exec(s, vec![]).await;
         }
     }
 
@@ -217,7 +199,7 @@ impl Db {
                 pool.close().await;
                 rows.into_iter().map(|r| r.get(0)).collect()
             }
-            Db::Pg { url, schema } => {
+            Db::Pg { url, schema, .. } => {
                 let opts = sqlx::postgres::PgConnectOptions::from_str(url).unwrap();
                 let pool = sqlx::PgPool::connect_with(opts).await.unwrap();
                 let rows = sqlx::query(
@@ -249,11 +231,8 @@ impl Db {
             Db::Sqlite { dir, .. } => {
                 std::fs::remove_dir_all(dir).ok();
             }
-            Db::Pg { .. } => {
-                let q = self.quoted();
-                self.exec_raw(&[&format!("DROP SCHEMA IF EXISTS {q} CASCADE")])
-                    .await;
-            }
+            // The guard drops the schema with `self`.
+            Db::Pg { .. } => {}
         }
     }
 }
@@ -763,7 +742,7 @@ async fn upgrade_from_v1_sets_analyze_thresholds() {
         let s = db.open(db.compiled(), SchemaMode::Migrate).await.unwrap();
         verify(&*s, &STAGES[1], &d, LATEST as u64).await;
         drop(s);
-        if let Db::Pg { url, schema } = &db {
+        if let Db::Pg { url, schema, .. } = &db {
             let store = PostgresMetaStore::connect_with_migrations(
                 url,
                 Some(schema),
@@ -863,7 +842,7 @@ async fn upgrade_from_v2_adds_changeset_dicts() {
                 assert!(s.has_dicts && s.codec.newest_id() == 0, "{kind}");
                 crate::compact::run(&s, &opts, &mut |_| {}).await.unwrap()
             }
-            Db::Pg { url, schema } => {
+            Db::Pg { url, schema, .. } => {
                 let s = PostgresMetaStore::connect_with_migrations(
                     url,
                     Some(schema),
@@ -940,7 +919,7 @@ async fn upgrade_from_v3_adds_store_features() {
             let features = |db: &Db| {
                 let (url, schema) = match db {
                     Db::Sqlite { url, .. } => (url.clone(), None),
-                    Db::Pg { url, schema } => (url.clone(), Some(schema.clone())),
+                    Db::Pg { url, schema, .. } => (url.clone(), Some(schema.clone())),
                 };
                 async move {
                     match schema {
@@ -1508,7 +1487,7 @@ async fn migration_blocked_by_a_long_transaction_times_out() {
     let Some(db) = Db::pg("locktimeout").await else {
         return;
     };
-    let Db::Pg { url, schema } = &db else {
+    let Db::Pg { url, schema, .. } = &db else {
         unreachable!()
     };
     let s = db.open(db.compiled(), SchemaMode::Migrate).await.unwrap();

@@ -8,7 +8,7 @@ use leep_core::{Changeset, ChangesetId, FileChange, FileKind, Hash, MetaStore, R
 
 use crate::codec::Codec;
 use crate::compact::{run, CompactOptions, CompactReport, Rows, MIN_TRAINING_ROWS};
-use crate::tests::{pg_store, schema};
+use crate::tests::pg_store;
 use crate::*;
 
 /// A chain of changesets shaped like imported commits: a few paths in a
@@ -276,21 +276,21 @@ async fn sqlite_compaction() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn postgres_compaction() {
-    let Some((a, url)) = pg_store("compact").await else {
+    let Some((a, schema)) = pg_store("compact").await else {
         return;
     };
-    let b = PostgresMetaStore::connect_with_schema(&url, &schema("compact"))
+    let b = PostgresMetaStore::connect_with_schema(&schema.url, &schema.name)
         .await
         .unwrap();
-    let c = PostgresMetaStore::connect_with_schema(&url, &schema("compact"))
+    let c = PostgresMetaStore::connect_with_schema(&schema.url, &schema.name)
         .await
         .unwrap();
     check_compaction(&a, &b, &c).await;
-    let Some((small, _)) = pg_store("compactsmall").await else {
+    let Some((small, _small)) = pg_store("compactsmall").await else {
         return;
     };
     check_small_store_is_left_alone(&small).await;
-    let (contract, _) = pg_store("compactcontract").await.unwrap();
+    let (contract, _contract) = pg_store("compactcontract").await.unwrap();
     check_contract_with_dictionary(&contract).await;
 }
 
