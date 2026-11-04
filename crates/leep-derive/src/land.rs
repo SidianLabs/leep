@@ -936,6 +936,15 @@ impl Repo {
                 "cannot land onto {target_ref:?}: tags are immutable"
             )));
         }
+        // The whole `green/` namespace, policy or not: a known-good ref
+        // nobody promoted would be a forged "known good" (ADR 0091).
+        if leep_core::check::is_green(target_ref) {
+            return Err(Error::Policy(format!(
+                "cannot land on {target_ref:?}: it {} when every required check passes \
+                 (ADR 0091); land on the ref it follows",
+                leep_core::check::PROMOTION_ONLY_MARKER
+            )));
+        }
         let queue = self.land_queues.queue(target_ref);
         let admitted = match self.admit(&queue, cs, target_ref, &ctx, forwarded).await? {
             Ok(admitted) => admitted,
@@ -1982,6 +1991,20 @@ impl Repo {
         new: Option<ChangesetId>,
         ctx: &RefUpdateContext,
     ) -> Result<bool> {
+        // Every `green/` ref is the server's to create and move, policy or
+        // not (ADR 0091). Deleting one the checks policy no longer names is
+        // allowed: that is how a stranded green is cleared.
+        let policy_green = self
+            .land_policy
+            .as_ref()
+            .is_some_and(|p| p.promotion_only(name));
+        if leep_core::check::is_green(name) && (new.is_some() || policy_green) {
+            return Err(Error::Policy(format!(
+                "{name:?} {}: the server moves it when every required check passes \
+                 (ADR 0091); post check results instead",
+                leep_core::check::PROMOTION_ONLY_MARKER
+            )));
+        }
         // Deletes skip the name check so a ref that predates the validator
         // can still be removed.
         if let Some(new) = new {

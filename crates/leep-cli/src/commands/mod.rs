@@ -4,6 +4,7 @@ pub mod amend;
 pub mod bisect;
 pub mod branch;
 pub mod checkout;
+pub mod checks;
 pub mod commit;
 pub mod config;
 pub mod diff;

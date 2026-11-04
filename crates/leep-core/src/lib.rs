@@ -6,6 +6,7 @@
 
 pub mod api;
 pub mod changeset;
+pub mod check;
 pub mod error;
 pub mod fsync;
 pub mod hash;

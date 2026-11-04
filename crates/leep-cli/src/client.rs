@@ -700,6 +700,64 @@ impl Client {
         )
     }
 
+    /// `POST /v1/changesets/{id}/checks` (ADR 0091): the poster is the token.
+    pub fn post_check(
+        &self,
+        id: &ChangesetId,
+        req: &PostCheckRequest,
+    ) -> Result<PostCheckResponse> {
+        self.json(
+            self.http
+                .post(self.url(&format!("/v1/changesets/{id}/checks")))
+                .json(req),
+        )
+    }
+
+    pub fn checks(&self, id: &ChangesetId) -> Result<ChecksResponse> {
+        self.json(
+            self.http
+                .get(self.url(&format!("/v1/changesets/{id}/checks"))),
+        )
+    }
+
+    /// `GET /v1/refs/{name}/checks`: head, known-good ref and red state.
+    pub fn ref_checks(&self, name: &str) -> Result<RefChecksResponse> {
+        self.json(
+            self.http
+                .get(self.url(&format!("/v1/refs/{}/checks", enc(name)))),
+        )
+    }
+
+    /// `GET /v1/refs/{name}/culprits`: the suspects, the lands in the range
+    /// from `good` (default: the known-good ref) to `bad` (default: the head).
+    pub fn culprits(
+        &self,
+        name: &str,
+        bad: Option<&ChangesetId>,
+        good: Option<&ChangesetId>,
+        before: Option<u64>,
+        limit: Option<usize>,
+    ) -> Result<CulpritsResponse> {
+        let mut query = Vec::new();
+        if let Some(b) = before {
+            query.push(("before", b.to_string()));
+        }
+        if let Some(l) = limit {
+            query.push(("limit", l.to_string()));
+        }
+        if let Some(b) = bad {
+            query.push(("bad", b.to_string()));
+        }
+        if let Some(g) = good {
+            query.push(("good", g.to_string()));
+        }
+        self.json(
+            self.http
+                .get(self.url(&format!("/v1/refs/{}/culprits", enc(name))))
+                .query(&query),
+        )
+    }
+
     /// `POST /v1/review-requests` (ADR 0086).
     pub fn request_review(&self, req: &CreateReviewRequest) -> Result<CreateReviewRequestResponse> {
         self.json(self.http.post(self.url("/v1/review-requests")).json(req))

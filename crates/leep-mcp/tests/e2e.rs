@@ -503,6 +503,96 @@ fn review_status_reports_owners_and_blocked_paths() {
 }
 
 #[test]
+fn checks_status_and_culprits_report_green_red_and_suspects() {
+    use leep_cli::client::Client;
+    use leep_core::api::{Outcome, PostCheckRequest};
+    use leep_server::reload::{ConfigHandle, ReloadSources};
+
+    let dir = tempfile::tempdir().unwrap();
+    let tokens = dir.path().join("tokens.json");
+    std::fs::write(
+        &tokens,
+        json!({ "tokens": [
+            { "name": "agent", "role": "write", "review": false, "hash": auth::hash_token("agent-t") },
+            { "name": "ci", "role": "write", "checks": ["test"], "hash": auth::hash_token("ci-t") } ] })
+        .to_string(),
+    )
+    .unwrap();
+    let checks = dir.path().join("checks.json");
+    std::fs::write(&checks, r#"{"refs":{"main":{"required":["test"]}}}"#).unwrap();
+    let handle = ConfigHandle::load(ReloadSources {
+        tokens_file: Some(tokens),
+        checks_policy_file: Some(checks),
+        ..Default::default()
+    })
+    .unwrap();
+    let url = serve(leep_server::router_with_config(
+        common::repo(),
+        leep_server::DEFAULT_MAX_BODY_BYTES,
+        std::time::Duration::from_secs(30),
+        handle,
+    ));
+    let mut c = config(&url);
+    c.token = Some("agent-t".into());
+    let agent = Server::new(c);
+    let mut lands = Vec::new();
+    for i in 0..3 {
+        let r = commit(
+            &agent,
+            json!({ "message": format!("land {i}"), "create_ref": true,
+                    "changes": [{ "path": format!("f{i}"), "content": "x" }] }),
+        );
+        lands.push(data(&r)["landed"].as_str().unwrap().to_string());
+    }
+    let ci = Client::with_token(&url, Some("ci-t"));
+    let post = |id: &str, outcome| {
+        ci.post_check(
+            &id.parse().unwrap(),
+            &PostCheckRequest {
+                check: "test".into(),
+                outcome,
+                url: String::new(),
+                summary: String::new(),
+            },
+        )
+        .unwrap()
+    };
+    assert_eq!(post(&lands[0], Outcome::Pass).promoted.len(), 1);
+    post(&lands[2], Outcome::Fail);
+
+    let st = data(&call(
+        &agent,
+        "leep_checks_status",
+        json!({ "rev": lands[0] }),
+    ));
+    assert_eq!(st["ref"]["green"], json!(lands[0]));
+    assert_eq!(st["ref"]["behind"], 2);
+    assert_eq!(st["ref"]["red"]["check"], "test");
+    assert_eq!(st["checks"]["checks"][0]["by"], "ci");
+    assert_eq!(st["checks"]["green_on"], json!(["main"]));
+    assert!(st["next_step"].as_str().unwrap().contains("suspects"));
+
+    let s = data(&call(&agent, "leep_checks_culprits", json!({})));
+    let got: Vec<&str> = s["suspects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x["changeset"].as_str().unwrap())
+        .collect();
+    assert_eq!(got, [lands[2].as_str(), lands[1].as_str()]);
+    assert_eq!(s["suspects"][0]["actor"], "agent");
+    assert!(s["note"].as_str().unwrap().contains("not a verdict"));
+    let s = data(&call(
+        &agent,
+        "leep_checks_culprits",
+        json!({ "bad": lands[1], "good": lands[0] }),
+    ));
+    assert_eq!(s["suspects"].as_array().unwrap().len(), 1);
+    let r = call(&agent, "leep_checks_culprits", json!({ "nope": 1 }));
+    assert_eq!(r["isError"], true);
+}
+
+#[test]
 fn review_status_needs_an_authenticated_server() {
     let s = Server::new(config(&start_server()));
     data(&commit(

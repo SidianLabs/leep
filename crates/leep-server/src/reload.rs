@@ -20,9 +20,10 @@ use axum::extract::{Request, State};
 use axum::middleware::Next;
 use axum::response::Response;
 use leep_core::MetaStore;
-use leep_derive::{LandPolicy, PolicySet};
+use leep_derive::{LandPolicy, PolicySet, Repo};
 
 use crate::auth::{Auth, AuthChange};
+use crate::checks::{ChecksPolicy, GreenRefs};
 use crate::fingerprint::Canon;
 use crate::limits::{Defaults, Limiter, LimiterChange};
 use crate::protect::ProtectOnly;
@@ -37,6 +38,8 @@ pub struct ReloadSources {
     pub tokens_file: Option<PathBuf>,
     pub signing_keys_file: Option<PathBuf>,
     pub review_policy_file: Option<PathBuf>,
+    /// `--checks-policy-file` (ADR 0091): required checks per ref.
+    pub checks_policy_file: Option<PathBuf>,
     pub limit_defaults: Defaults,
     /// `--require-signatures`.
     pub require_signatures: Vec<String>,
@@ -59,6 +62,9 @@ pub struct RuntimeConfig {
     pub limiter: Option<Arc<Limiter>>,
     pub signing: Option<Arc<SigningKeys>>,
     pub review: Option<Arc<ReviewService>>,
+    /// The checks policy: which refs have a known-good ref and what it
+    /// requires (ADR 0091).
+    pub checks: Option<Arc<ChecksPolicy>>,
     /// Signatures, review and `--protect-ref` composed, so the forward-only
     /// and protected delete rules and `land` all read the same refs.
     pub land_policy: Option<Arc<dyn LandPolicy>>,
@@ -102,6 +108,7 @@ impl RuntimeConfig {
             limiter,
             signing,
             review,
+            checks: None,
             land_policy,
             protected_refs: Vec::new(),
             review_rules: Default::default(),
@@ -167,6 +174,7 @@ impl ReloadSources {
         self.tokens_file.is_some()
             || self.signing_keys_file.is_some()
             || self.review_policy_file.is_some()
+            || self.checks_policy_file.is_some()
     }
 
     /// Read and validate every file and build the config they describe, or
@@ -207,6 +215,14 @@ impl ReloadSources {
             None => None,
         };
 
+        let checks = match &self.checks_policy_file {
+            Some(_) if auth.is_none() => {
+                return Err("--checks-policy-file needs --tokens-file".into())
+            }
+            Some(path) => Some(Arc::new(ChecksPolicy::from_file(path)?)),
+            None => None,
+        };
+
         let mut policies: Vec<Arc<dyn LandPolicy>> = Vec::new();
         if let (Some(keys), false) = (&signing, self.require_signatures.is_empty()) {
             policies.push(Arc::new(RequireSignatures::new(
@@ -222,6 +238,16 @@ impl ReloadSources {
         }
         if !self.protect_refs.is_empty() {
             policies.push(Arc::new(ProtectOnly::new(self.protect_refs.clone())));
+        }
+        // A ref with a known-good ref is protected as a review ref is: were
+        // it rewound past green, green would stay ahead of it for good.
+        let checks_refs: Vec<String> = checks
+            .as_ref()
+            .map(|c| c.refs.keys().cloned().collect())
+            .unwrap_or_default();
+        if let Some(c) = checks.as_ref().filter(|c| !c.refs.is_empty()) {
+            policies.push(Arc::new(ProtectOnly::new(checks_refs.clone())));
+            policies.push(Arc::new(GreenRefs::new(c.green_refs())));
         }
         let land_policy: Option<Arc<dyn LandPolicy>> = match policies.len() {
             0 => None,
@@ -248,6 +274,12 @@ impl ReloadSources {
         if !policy.identical_only_globs.is_empty() {
             canon.set("identical_only_globs", &policy.identical_only_globs);
         }
+        if let Some(c) = &checks {
+            canon.section("checks_policy", c.refs.len());
+            for (name, required) in &c.refs {
+                canon.str(name).set("required", required);
+            }
+        }
         Ok(Loaded {
             config: RuntimeConfig {
                 generation: prev.map_or(1, |p| p.generation + 1),
@@ -256,10 +288,14 @@ impl ReloadSources {
                 limiter: limiter.map(Arc::new),
                 signing,
                 review,
+                checks,
                 land_policy,
                 protected_refs: sorted_union(
-                    &sorted_union(&self.require_signatures, &review_refs),
-                    &self.protect_refs,
+                    &sorted_union(
+                        &sorted_union(&self.require_signatures, &review_refs),
+                        &self.protect_refs,
+                    ),
+                    &checks_refs,
                 ),
                 review_rules: (
                     policy.auto_approve,
@@ -286,6 +322,7 @@ pub struct ReloadReport {
     pub protected_added: Vec<String>,
     pub protected_removed: Vec<String>,
     pub review_rules_changed: bool,
+    pub checks_policy_changed: bool,
 }
 
 fn removed_and_added(old: &[String], new: &[String]) -> (Vec<String>, Vec<String>) {
@@ -317,6 +354,7 @@ impl ReloadReport {
             protected_added,
             protected_removed,
             review_rules_changed: old.review_rules != new.review_rules,
+            checks_policy_changed: old.checks != new.checks,
         }
     }
 
@@ -330,6 +368,7 @@ impl ReloadReport {
             && self.protected_added.is_empty()
             && self.protected_removed.is_empty()
             && !self.review_rules_changed
+            && !self.checks_policy_changed
     }
 
     /// One info line per kind of change. Names only.
@@ -344,6 +383,7 @@ impl ReloadReport {
                 limits_changed = ?t.limits_changed,
                 expiry_changed = ?t.expiry_changed,
                 review_changed = ?t.review_changed,
+                checks_changed = ?t.checks_changed,
                 "tokens changed"
             );
         }
@@ -372,6 +412,9 @@ impl ReloadReport {
         }
         if self.review_rules_changed {
             tracing::info!("review rules changed");
+        }
+        if self.checks_policy_changed {
+            tracing::info!("checks policy changed");
         }
         tracing::info!(
             generation = self.generation,
@@ -536,10 +579,7 @@ pub async fn warn_missing_refs(meta: &dyn MetaStore, config: &RuntimeConfig) {
 /// of killing the server. Only SIGHUP triggers a reload: there is no endpoint
 /// and no file watcher.
 #[cfg(unix)]
-pub fn spawn_sighup_reload(
-    handle: Arc<ConfigHandle>,
-    meta: Arc<dyn MetaStore>,
-) -> std::io::Result<()> {
+pub fn spawn_sighup_reload(handle: Arc<ConfigHandle>, repo: Repo) -> std::io::Result<()> {
     use tokio::signal::unix::{signal, SignalKind};
     let mut hup = signal(SignalKind::hangup())?;
     tokio::spawn(async move {
@@ -553,7 +593,11 @@ pub fn spawn_sighup_reload(
             match tokio::task::spawn_blocking(move || h.reload()).await {
                 Ok(Ok(report)) => {
                     report.log();
-                    warn_missing_refs(meta.as_ref(), &handle.current()).await;
+                    let config = handle.current();
+                    warn_missing_refs(repo.meta().as_ref(), &config).await;
+                    if report.checks_policy_changed {
+                        crate::checks::catch_up(&repo, &config).await;
+                    }
                 }
                 Ok(Err(e)) => tracing::error!(
                     error = %e,
@@ -748,6 +792,69 @@ mod tests {
         assert_eq!(c.protected_refs(), ["main", "release", "stable"]);
         let p = c.land_policy.as_ref().unwrap();
         assert!(p.applies_to("stable") && p.applies_to("main") && p.applies_to("release"));
+    }
+
+    #[test]
+    fn checks_policy_protects_its_refs_and_reloads() {
+        let f = files();
+        let mut s = f.sources.clone();
+        s.checks_policy_file = Some(write(
+            &f.dir,
+            "checks.json",
+            r#"{ "refs": { "dev": { "required": ["test"] } } }"#,
+        ));
+        let h = ConfigHandle::load(s).unwrap();
+        let c = h.current();
+        // The checked ref is forward-only and undeletable, like a review
+        // ref: rewound below green, green would never move again.
+        assert!(c.protected_refs().contains(&"dev".to_string()));
+        let p = c.land_policy.as_ref().unwrap();
+        assert!(p.protects("dev") && !p.promotion_only("dev"));
+        assert!(p.protects("green/dev") && p.promotion_only("green/dev"));
+        assert!(!p.promotion_only("green/main"));
+        assert_eq!(c.checks.as_ref().unwrap().required("dev"), ["test"]);
+        let before = c.fingerprint.clone();
+
+        f.put(
+            "checks.json",
+            r#"{ "refs": { "dev": { "required": ["test", "clippy"] } } }"#,
+        );
+        let r = h.reload().unwrap();
+        assert!(r.checks_policy_changed);
+        assert_ne!(r.fingerprint, before);
+        assert_eq!(
+            h.current().checks.as_ref().unwrap().required("dev"),
+            ["clippy", "test"]
+        );
+
+        for bad in [
+            r#"{ "refs": { "dev": { "required": [] } } }"#,
+            r#"{ "refs": { "dev": { "required": ["Test"] } } }"#,
+            r#"{ "refs": { "dev": { "required": ["test"], "any": true } } }"#,
+            r#"{ "refs": {}, "extra": 1 }"#,
+            r#"{ "refs": { "green/dev": { "required": ["test"] } } }"#,
+            r#"{ "refs": { "tags/v1": { "required": ["test"] } } }"#,
+            r#"{ "refs": { "a..b": { "required": ["test"] } } }"#,
+        ] {
+            f.put("checks.json", bad);
+            assert!(h.reload().is_err(), "{bad}");
+            assert_eq!(h.current().generation, 2, "{bad}");
+        }
+    }
+
+    #[test]
+    fn checks_policy_needs_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = ReloadSources {
+            checks_policy_file: Some(write(
+                &dir,
+                "checks.json",
+                r#"{ "refs": { "main": { "required": ["test"] } } }"#,
+            )),
+            ..Default::default()
+        };
+        let e = ConfigHandle::load(s).err().unwrap();
+        assert!(e.contains("--tokens-file"), "{e}");
     }
 
     #[test]

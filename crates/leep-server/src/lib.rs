@@ -8,6 +8,7 @@
 pub mod auth;
 pub mod background_repack;
 pub mod backup;
+pub mod checks;
 pub mod conn;
 pub mod coord;
 pub mod errors;
@@ -312,6 +313,10 @@ pub fn router_with_read_classes(
             get(get_reviews).post(add_review),
         )
         .route("/v1/changesets/{id}/review-status", get(review_status))
+        .route(
+            "/v1/changesets/{id}/checks",
+            get(checks::list).post(checks::post),
+        )
         .route(
             "/v1/review-requests",
             get(review_requests::list).post(review_requests::create),
@@ -1131,7 +1136,7 @@ async fn policy_refs(
         .list_refs()
         .await?
         .into_keys()
-        .filter(|name| policy.applies_to(name))
+        .filter(|name| policy.applies_to(name) && !policy.promotion_only(name))
         .collect())
 }
 
@@ -1171,13 +1176,42 @@ async fn list_refs(State(repo): S) -> ApiResult<Json<RefsResponse>> {
     Ok(Json(RefsResponse { refs }))
 }
 
-async fn get_ref(State(repo): S, Path(name): Path<String>) -> ApiResult<Json<RefResponse>> {
+/// `GET /v1/refs/{name}`, and `.../checks` and `.../culprits` of a ref
+/// (ADR 0091): ref names may hold `/`, so they share the route. A ref whose
+/// own name ends in one of those suffixes is answered as itself only when
+/// the ref before the suffix does not exist.
+async fn get_ref(
+    State(repo): S,
+    Extension(config): Cfg,
+    Path(name): Path<String>,
+    q: checks::MaybeCulprits,
+) -> ApiResult<Response> {
+    // The suffix wins whenever the ref it names exists, so a ref called
+    // `main/checks` cannot stand in for `main`'s check status.
+    if let Some(base) = name.strip_suffix(CHECKS_SUFFIX) {
+        if repo.meta().get_ref(base).await?.is_some() {
+            return checks::for_ref(&repo, &config, base).await;
+        }
+    }
+    if let Some(base) = name.strip_suffix(CULPRITS_SUFFIX) {
+        if repo.meta().get_ref(base).await?.is_some() {
+            return checks::culprits(&repo, base, q.0).await;
+        }
+    }
     let target = repo.meta().get_ref(&name).await?;
-    Ok(Json(RefResponse { name, target }))
+    if target.is_none() && (name.ends_with(CHECKS_SUFFIX) || name.ends_with(CULPRITS_SUFFIX)) {
+        // Neither the ref nor the one it would be about.
+        return Err(Error::NotFound(format!("ref {name:?}")).into());
+    }
+    Ok(Json(RefResponse { name, target }).into_response())
 }
 
-/// Operations only the server itself may record.
-const RESERVED_OPERATIONS: [&str; 2] = ["land", "import"];
+const CHECKS_SUFFIX: &str = "/checks";
+const CULPRITS_SUFFIX: &str = "/culprits";
+
+/// Operations only the server itself may record: lands, the git import and
+/// promotions of known-good refs (ADR 0091).
+const RESERVED_OPERATIONS: [&str; 3] = ["land", "import", leep_core::check::PROMOTE_OPERATION];
 
 /// The ref log context of a client-driven ref move. The actor is the token's
 /// name; the label and message are the client's, within limits, so entries
@@ -1192,7 +1226,7 @@ fn ref_context(who: Option<&auth::Principal>, req: &CasRefRequest) -> ApiResult<
     if !ok || RESERVED_OPERATIONS.contains(&op) {
         return Err(Error::Invalid(format!(
             "bad operation {op:?}: expected up to 32 of a-z 0-9 - _ . and not {}",
-            RESERVED_OPERATIONS.join(" or ")
+            RESERVED_OPERATIONS.join(", ")
         ))
         .into());
     }
@@ -1730,8 +1764,15 @@ async fn set_git_style(
     }))
 }
 
-async fn merge(State(repo): S, body: Bytes) -> ApiResult<Json<MergeResponse>> {
-    Ok(Json(repo.merge(parse_json(&body)?).await?))
+/// The caller is recorded as the merge's creator (ADR 0086), so it can no
+/// more attest it than a changeset it posted (ADR 0091).
+async fn merge(
+    State(repo): S,
+    auth::MaybePrincipal(who): auth::MaybePrincipal,
+    body: Bytes,
+) -> ApiResult<Json<MergeResponse>> {
+    let actor = who.as_ref().map(|p| p.name.as_str());
+    Ok(Json(repo.merge_by(parse_json(&body)?, actor).await?))
 }
 
 async fn rebase(State(repo): S, body: Bytes) -> ApiResult<Json<RebaseResponse>> {

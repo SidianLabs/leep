@@ -11,6 +11,7 @@ use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use similar::TextDiff;
 
+use super::commit::non_empty;
 use super::{
     as_text, parse_args, short, truncate, ToolError, ToolOutput, ToolResult, DEFAULT_REF,
     MAX_DIFF_FILE_BYTES, MAX_TEXT_BYTES,
@@ -88,6 +89,25 @@ struct ReviewStatusArgs {
     rev: String,
     #[serde(rename = "ref")]
     target_ref: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChecksStatusArgs {
+    rev: Option<String>,
+    #[serde(rename = "ref")]
+    target_ref: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CulpritsArgs {
+    #[serde(rename = "ref")]
+    target_ref: Option<String>,
+    bad: Option<String>,
+    good: Option<String>,
+    limit: Option<usize>,
+    before: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -501,6 +521,58 @@ impl Server {
                 short(&id)
             ));
         }
+        Ok(ToolOutput::json(v))
+    }
+
+    /// Where a ref stands against its required checks (ADR 0091), and with
+    /// `rev` that changeset's own results.
+    pub(super) fn checks_status(&self, args: Value) -> ToolResult {
+        let a: ChecksStatusArgs = parse_args(args)?;
+        let target = non_empty(a.target_ref.as_deref()).unwrap_or(DEFAULT_REF);
+        let status = self.client.ref_checks(target)?;
+        let mut v = json!({ "ref": status });
+        if let Some(rev) = non_empty(a.rev.as_deref()) {
+            let id = self.resolve_rev(Some(rev))?;
+            let checks = self.client.checks(&id)?;
+            v["changeset"] = json!(id.to_string());
+            v["checks"] = serde_json::to_value(&checks).map_err(|e| ToolError(e.to_string()))?;
+        }
+        if let Some(red) = &status.red {
+            v["next_step"] = json!(format!(
+                "{target} is red since {} ({}). leep_checks_culprits lists the suspects, the \
+                 lands in the range; base new work on {target} anyway, and use {} for a tree \
+                 that passed every required check.",
+                short(&red.first_failed),
+                red.check,
+                status.green_ref
+            ));
+        }
+        Ok(ToolOutput::json(v))
+    }
+
+    /// The suspects for a failure on a ref: the lands in the range.
+    pub(super) fn checks_culprits(&self, args: Value) -> ToolResult {
+        let a: CulpritsArgs = parse_args(args)?;
+        let target = non_empty(a.target_ref.as_deref()).unwrap_or(DEFAULT_REF);
+        let bad = non_empty(a.bad.as_deref())
+            .map(|b| self.resolve_rev(Some(b)))
+            .transpose()?;
+        let good = non_empty(a.good.as_deref())
+            .map(|g| self.resolve_rev(Some(g)))
+            .transpose()?;
+        let resp = self.client.culprits(
+            target,
+            bad.as_ref(),
+            good.as_ref(),
+            a.before,
+            Some(a.limit.unwrap_or(50).clamp(1, 500)),
+        )?;
+        let mut v = serde_json::to_value(&resp).map_err(|e| ToolError(e.to_string()))?;
+        v["note"] = json!(
+            "Suspects are the lands in the range, not a verdict: a land that fails only \
+             together with a later one shows the later one too. Compare the failing test's \
+             files with each suspect's paths, and rerun before reverting anything."
+        );
         Ok(ToolOutput::json(v))
     }
 

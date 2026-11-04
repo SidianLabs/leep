@@ -111,6 +111,7 @@ impl Rig {
             tokens_file: Some(write("tokens.json", &s.tokens.unwrap_or_else(base_tokens))),
             signing_keys_file: s.keys.map(|k| write("keys.json", &k)),
             review_policy_file: s.policy.map(|p| write("policy.json", p)),
+            checks_policy_file: None,
             limit_defaults: s.defaults,
             require_signatures: s.require_signatures,
             require_review: vec![],

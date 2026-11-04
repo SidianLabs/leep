@@ -126,12 +126,22 @@ Examples:
   leep review request @ --to rhea       # or name the reviewers
   leep review status @ --wait           # until approved (exit 0), rejected or an hour passes (1)
   leep review inbox                     # requests waiting for you (--mine: the ones you made)";
+pub const CHECKS: &str = "\
+Examples:
+  leep checks post @ test pass --url https://ci.example/run/1   # CI, with a checks token
+  leep checks status main               # results on a changeset, and where it is known good
+  leep checks ref main                  # green/main, how far behind, red? (exit 1 when red)
+  leep checks culprits main             # suspects: the lands above green/main
+  leep checks culprits main --good 2a954d8ef7c7 --bad main~3
+  leep checkout green/main              # the newest tree every required check passed
+A suspect is a land in the range, never a verdict.";
+
 /// Shown under the top-level help; the full contract is docs/CLI.md.
 pub const EXIT_CODES: &str = "\
 Exit codes (ADR 0034):
   0  success
   1  generic failure (bad input, refused operation, authentication);
-     also \"no\" from `search` and `review status`
+     also \"no\" from `search`, `review status` and `checks ref`
   2  usage: the command line does not parse
   3  server or network failure; running the command again may work
   4  not found (revision, ref, branch, tag, file, stash)
@@ -176,7 +186,7 @@ pub const GROUPS: &[(&str, &[&str])] = &[
             "reflog",
         ],
     ),
-    ("Review", &["review", "reviews"]),
+    ("Review", &["review", "reviews", "checks"]),
     ("Admin", &["undo", "keygen", "config"]),
 ];
 

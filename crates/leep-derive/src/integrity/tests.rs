@@ -1266,6 +1266,8 @@ async fn dropping_a_kind_changes_no_answer() {
     let droppable: Vec<&str> = kinds::kinds()
         .iter()
         .filter(|k| kinds::check_droppable(k.name).is_ok())
+        // Check results drop for good (CI posts them again); none here.
+        .filter(|k| k.name != leep_core::check::CHECK_KIND)
         .map(|k| k.name)
         .collect();
     assert!(droppable.len() >= 8, "{droppable:?}");

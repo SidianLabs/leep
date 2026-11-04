@@ -18,6 +18,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use bytes::Bytes;
+use leep_core::check::{Check, CHECK_KIND};
 use leep_core::review::{Review, REVIEW_KIND};
 use leep_core::signature::{Signature, SIGNATURE_KIND};
 use leep_core::{ChangesetId, DerivedRow, Error, Hash, Result};
@@ -361,7 +362,7 @@ pub async fn mark(repo: &Repo, opts: &ReachOptions) -> Result<Reach> {
     Ok(reach)
 }
 
-/// Those of `ids` some signature or review names.
+/// Those of `ids` some signature, review or check result names.
 async fn attested(repo: &Repo, ids: &[ChangesetId]) -> Result<Vec<ChangesetId>> {
     let mut out = Vec::new();
     let mut signers = HashSet::new();
@@ -392,7 +393,27 @@ async fn attested(repo: &Repo, ids: &[ChangesetId]) -> Result<Vec<ChangesetId>> 
             .await?,
         );
     }
+    for k in &check_names(repo).await? {
+        out.extend(
+            having(repo, CHECK_KIND, ids, |id| {
+                crate::checks::storage_key(id, k)
+            })
+            .await?,
+        );
+    }
     Ok(out)
+}
+
+/// Every check name some `check-v1` row holds (ADR 0091): rows are keyed by
+/// a hash of (changeset, name), so the names come from the values.
+pub(crate) async fn check_names(repo: &Repo) -> Result<HashSet<String>> {
+    let mut names = HashSet::new();
+    for (_, v) in all_rows(repo, CHECK_KIND).await? {
+        if let Ok(c) = Check::decode(&v) {
+            names.insert(c.check);
+        }
+    }
+    Ok(names)
 }
 
 /// Those of `ids` the git mirror maps to a commit.
@@ -650,6 +671,50 @@ mod tests {
         assert!(third.unreachable.is_empty(), "{:?}", third.unreachable);
         assert!(third.rows_written > 0);
         check_reach_rows(&r).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_check_result_is_a_root() {
+        let meta = Arc::new(MemoryMetaStore::new());
+        let r = Repo::new(Arc::new(MemoryBlobStore::new()), meta.clone());
+        let base = commit(&r, &[], &[("f", Some("0"))], "base").await;
+        r.meta().cas_ref("main", None, Some(base)).await.unwrap();
+        let checked = commit(&r, &[base], &[("c", Some("1"))], "checked").await;
+        let child = commit(&r, &[checked], &[("d", Some("1"))], "child").await;
+        let plain = commit(&r, &[base], &[("p", Some("1"))], "plain").await;
+        r.put_check(
+            checked,
+            &leep_core::check::Check {
+                check: "test".into(),
+                outcome: leep_core::check::Outcome::Fail,
+                by: "ci".into(),
+                url: String::new(),
+                summary: String::new(),
+                timestamp: 1,
+            },
+        )
+        .await
+        .unwrap();
+        let o = later();
+        let run = mark(&r, &o).await.unwrap();
+        // The attested changeset (ADR 0059 root 4) stays with its check;
+        // its unattested child and an unattested sibling do not.
+        let mut want = vec![child, plain];
+        want.sort_unstable();
+        assert_eq!(run.unreachable, want);
+        assert_eq!(run.unreachable, unreachable_oracle(&r, &o).await);
+        let report = crate::gc_unreachable::report(
+            &r,
+            &crate::gc_unreachable::UnreachableOptions {
+                now: o.now,
+                grace: o.grace,
+                ref_log_retention: Duration::from_secs(u64::MAX / 4),
+                exact_trees: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.attested, 1);
     }
 
     #[tokio::test]

@@ -14,7 +14,7 @@ command's options with examples for the common ones.
 | Work | `init`, `checkout`, `status`, `diff`, `commit`, `amend`, `stash`, `restore`, `resolve`, `reset`, `sync`, `land` |
 | Branches | `branch`, `switch`, `tag`, `merge`, `rebase`, `cherry-pick`, `revert` |
 | History | `log`, `show`, `bisect`, `cat`, `blame`, `last-change`, `search`, `provenance`, `refs`, `reflog` |
-| Review | `review` (`approve`, `reject`, `withdraw`, `status`, `list`, `request`, `inbox`, `cancel`), `reviews` |
+| Review | `review` (`approve`, `reject`, `withdraw`, `status`, `list`, `request`, `inbox`, `cancel`), `reviews`, `checks` (`post`, `status`, `ref`, `culprits`) |
 | Admin | `undo`, `keygen`, `config` |
 
 Global options, accepted by every command and listed only in `leep --help`:
@@ -151,6 +151,29 @@ the server needs an upgrade.
 `leep show` prints `Created-by: NAME` after `Author:` when the server recorded which token
 created the changeset, so a reviewer can tell agents apart even when they
 share an author.
+
+## CI checks
+
+On a server with a checks policy, CI posts check results and the server keeps
+`green/<ref>`, the newest changeset on the ref that passed every required
+check ([ADR 0091](adr/0091-known-good-refs-and-check-attestations.md)).
+Posting needs a token whose `checks` lists the check, and never works on a
+changeset the token created; reading needs any token.
+
+| Command | Effect |
+|---|---|
+| `leep checks post REV CHECK pass\|fail [--url URL] [-m SUMMARY]` | Record a result for `REV` (resolved to an id first: post for the changeset you tested). Prints `Recorded CHECK OUTCOME on ID`, and `green/REF moved to ID` for each known-good ref it promoted. A rerun replaces the earlier result. |
+| `leep checks status [REV]` | The results on `REV` (default `@`): `OUTCOME CHECK by TOKEN TIME URL`, then `known good on REF` for each green ref that holds it. |
+| `leep checks ref [REF]` | Where `REF` (default: the target ref) stands: its head, `green/REF` and how many changesets it is behind, the required checks, and `REF is red since ID (CHECK)` when the head fails. Exit 1 when red. |
+| `leep checks culprits [REF] [--bad REV] [--good REV] [-n N] [--before SEQ]` | The suspects for a failure: the lands in the range above `--good` (default `green/REF`) up to the one that brought `--bad` (default the head), newest first, with ref log `seq`, id, who created it (or landed it), title, agent model and the paths changed. `-n` caps the page (100, at most 500); a full page ends with `(more: add --before SEQ)`. |
+
+A suspect is a land in the range, never a verdict: a land whose test fails
+only together with a later land shows the later one too. Read the paths,
+rerun, then revert. No `green/` ref can be landed on, created, moved or
+undone, and `green/REF` cannot be deleted while the policy names `REF` (exit
+1, `--json` `server_code: "promotion_only"`). Results are taken only for
+changesets some ref holds. `leep checkout
+green/main` gives you its tree. Keep basing new work on the ref itself.
 
 ## Long listings
 
@@ -397,7 +420,7 @@ Decided in [ADR 0034](adr/0034-cli-exit-codes-and-json-errors.md).
 | Code | Meaning |
 |---|---|
 | 0 | Success. |
-| 1 | Generic failure: bad input, a refused operation (dirty working copy, existing tag), authentication. Also "no" from `search` (no match) and `review status` (not approved, and not yet on the ref; with `--wait`, also rejected or out of time). |
+| 1 | Generic failure: bad input, a refused operation (dirty working copy, existing tag), authentication. Also "no" from `search` (no match), `review status` (not approved, and not yet on the ref; with `--wait`, also rejected or out of time) and `checks ref` (the ref is red). |
 | 2 | The command line does not parse. |
 | 3 | The server or the network failed: unreachable, 5xx, a timeout, rate limited after retries. Running the command again may work. |
 | 4 | Not found: a revision, ref, branch, tag, file, stash or log entry. |
