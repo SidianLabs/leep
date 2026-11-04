@@ -405,14 +405,17 @@ impl Repo {
         }
         let mut copies = HashMap::new();
         let mut named = Vec::new();
-        let (added, logged_by) = self.land_added(target_ref, landed).await?;
+        let (added, logged_by, from) = self.land_added(target_ref, landed).await?;
         // The requester rule needs the move to be this actor's own: an
         // older entry by someone else (a re-land of their changeset) or no
         // entry at all grants nothing beyond content.
         let requester_rule = actor.is_some() && logged_by.as_deref() == actor;
-        // The ref's carry rules as of the head the land made: what a
-        // verdict carried by a land there next is judged under (ADR 0092).
-        let mut owners = OwnersResolver::new(self, Some(landed)).await.ok();
+        // The ref's carry rules as the land was judged: the head it moved
+        // from, so a stack that adds `carry identical` (or `carry merged`)
+        // closes requests as its own land carried verdicts (ADR 0092).
+        // Without the log entry, the head the land made.
+        let pre_land = from.unwrap_or(Some(landed));
+        let mut owners = OwnersResolver::new(self, pre_land).await.ok();
         let mut scope = match owners.as_mut() {
             Some(o) => CarryScope::for_ref(self.carry_merges(target_ref), Some(o)),
             // Unreadable: identical changes only, the strictest any
@@ -486,12 +489,17 @@ impl Repo {
     /// [`COPY_WALK_LIMIT`]. Without such an entry among the newest
     /// [`LAND_LOG_LOOKBACK`] (the land moved nothing, or the log is out of
     /// reach), `landed` and the server copies directly below it, with no
-    /// actor.
+    /// actor. Also the head the entry moved from (`Some(None)` for a ref the
+    /// land created), `None` without an entry.
     async fn land_added(
         &self,
         target_ref: &str,
         landed: ChangesetId,
-    ) -> Result<(Vec<ChangesetId>, Option<String>)> {
+    ) -> Result<(
+        Vec<ChangesetId>,
+        Option<String>,
+        Option<Option<ChangesetId>>,
+    )> {
         let log = self
             .meta()
             .ref_log(Some(target_ref), None, LAND_LOG_LOOKBACK)
@@ -519,7 +527,7 @@ impl Repo {
                 Err(e) => return Err(e),
             };
         }
-        Ok((out, logged_by))
+        Ok((out, logged_by, from))
     }
 
     /// The refs among `names` whose first-parent chain holds `id`, in the
@@ -976,6 +984,66 @@ mod tests {
         assert_eq!(
             state(&r, &q).await,
             (ReviewRequestState::Landed, Some(same))
+        );
+
+        // The landed stack itself adds `carry identical` below the rebased
+        // resolution: its land was judged under the head it moved from
+        // (`carry merged`), so the request closes as the verdict carried.
+        let r = repo();
+        let base = files_commit(
+            &r,
+            &[],
+            &[
+                ("src/OWNERS", Some("rhea\ncarry merged\n")),
+                ("src/a.rs", Some(A)),
+            ],
+            "base",
+        )
+        .await;
+        r.meta().cas_ref("main", None, Some(base)).await.unwrap();
+        let x = files_commit(
+            &r,
+            &[base],
+            &[("src/a.rs", Some("top\n\nmid\n\nend\nx\n"))],
+            "x",
+        )
+        .await;
+        let m = files_commit(
+            &r,
+            &[base],
+            &[("src/a.rs", Some("TOP\n\nmid\n\nend\n"))],
+            "m",
+        )
+        .await;
+        landed_by(&r, m, "bo").await;
+        let (q, _) = r
+            .request_review(ask(x, "ada", &["rhea"]), None)
+            .await
+            .unwrap();
+        let tighten = files_commit(
+            &r,
+            &[m],
+            &[("src/OWNERS", Some("rhea\ncarry identical\n"))],
+            "tighten",
+        )
+        .await;
+        let good = naming(
+            &r,
+            tighten,
+            &[("src/a.rs", Some("TOP\n\nmid\n\nend\nx\n"))],
+            &[x],
+        )
+        .await;
+        assert_eq!(landed_by(&r, good, "cy").await, good);
+        assert_eq!(
+            r.close_landed_review_requests("main", good, good, Some("cy"), None)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            state(&r, &q).await,
+            (ReviewRequestState::Landed, Some(good))
         );
     }
 
