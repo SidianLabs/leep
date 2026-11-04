@@ -443,7 +443,17 @@ impl ReviewService {
                 Some(&mut origins),
             )
             .await?;
-        let refused = bad_owners_text(repo, id).await?;
+        let on_refs = {
+            let mut refs = vec![target_ref.to_string()];
+            refs.extend(policy_refs.iter().filter(|r| *r != target_ref).cloned());
+            repo.refs_holding(id, &refs).await?
+        };
+        // A changeset already on a ref has nothing left to refuse.
+        let refused = if on_refs.is_empty() {
+            bad_owners_text(repo, id).await?
+        } else {
+            None
+        };
         // The carry rule of each path, so a reviewer sees where only an
         // identical change keeps their verdict (ADR 0092).
         let mut carry = Vec::with_capacity(review.paths.len());
@@ -457,11 +467,7 @@ impl ReviewService {
             changeset: id,
             target_ref: target_ref.to_string(),
             approved: review.approved() && refused.is_none(),
-            on_refs: {
-                let mut refs = vec![target_ref.to_string()];
-                refs.extend(policy_refs.iter().filter(|r| *r != target_ref).cloned());
-                repo.refs_holding(id, &refs).await?
-            },
+            on_refs,
             paths: review
                 .paths
                 .into_iter()

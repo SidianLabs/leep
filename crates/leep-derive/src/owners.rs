@@ -54,16 +54,17 @@ pub struct OwnersFile {
     pub noparent: bool,
     /// The file's `carry` line; with both, `carry identical`, the stricter.
     pub carry: Option<CarryDirective>,
-    /// Lines that start with the word `carry` but are no directive (a
-    /// misspelling such as `carry identically`), as written after trimming.
-    /// Never owner names: a typo must not silently leave the directory on
-    /// the default rule while naming a principal nobody is.
+    /// Lines whose first word is `carry`, in any ASCII case, that are no
+    /// exact directive (`carry identically`, `Carry identical`), as written
+    /// after trimming. Never owner names: a typo must not silently leave
+    /// the directory on the default rule while naming a principal nobody
+    /// is.
     pub unknown: Vec<String>,
 }
 
 /// Parse the text of one `OWNERS` file. Never fails: a line is a name unless
 /// it is blank, a comment, `noparent`, a `carry` directive or another line
-/// whose first word is `carry` (kept in `unknown`).
+/// whose first word is `carry` in any ASCII case (kept in `unknown`).
 pub fn parse_owners(text: &str) -> OwnersFile {
     let mut f = OwnersFile::default();
     for line in text.trim_start_matches('\u{feff}').lines() {
@@ -75,7 +76,11 @@ pub fn parse_owners(text: &str) -> OwnersFile {
             "carry merged" => {
                 f.carry.get_or_insert(CarryDirective::Merged);
             }
-            line if line.split_whitespace().next() == Some("carry") => {
+            line if line
+                .split_whitespace()
+                .next()
+                .is_some_and(|w| w.eq_ignore_ascii_case("carry")) =>
+            {
                 f.unknown.push(line.to_string());
             }
             name => {
@@ -231,7 +236,9 @@ impl Repo {
                 continue;
             }
             if *size > MAX_OWNERS_BYTES {
-                return Err(Error::Invalid(format!(
+                // Refused like the rest of a land check (422), not as a
+                // malformed request.
+                return Err(Error::Policy(format!(
                     "{path} is {size} bytes; the limit is {MAX_OWNERS_BYTES}"
                 )));
             }
@@ -303,7 +310,10 @@ mod tests {
         }
         // Any other line starting with the word `carry` is no name and no
         // directive: a misspelling the land check refuses.
-        let f = parse_owners("carry\ncarry identically\ncarry  merged\ncarry\tmerged\ncarrying\n");
+        let f = parse_owners(
+            "carry\ncarry identically\ncarry  merged\ncarry\tmerged\ncarrying\n\
+             Carry identical\nCARRY merged\n",
+        );
         assert_eq!(f.carry, None);
         assert_eq!(names(&f), ["carrying"]);
         assert_eq!(
@@ -312,7 +322,9 @@ mod tests {
                 "carry",
                 "carry identically",
                 "carry  merged",
-                "carry\tmerged"
+                "carry\tmerged",
+                "Carry identical",
+                "CARRY merged"
             ]
         );
         for d in [CarryDirective::Identical, CarryDirective::Merged] {

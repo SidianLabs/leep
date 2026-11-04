@@ -2800,7 +2800,7 @@ async fn a_misspelled_carry_line_is_refused_and_status_says_why() {
             &[base],
             &[(
                 "src/OWNERS",
-                Some("bob\ncarry identically  # meant identical\n"),
+                Some("bob\ncarry identically  # meant identical\nCarry identical\n"),
             )],
         )
         .await;
@@ -2813,6 +2813,18 @@ async fn a_misspelled_carry_line_is_refused_and_status_says_why() {
     assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(r.error(), why);
     assert_eq!(api.main_ref().await, Some(base));
+    // A directive in another case is no directive either.
+    let cased = api
+        .commit(&[base], &[("src/OWNERS", Some("bob\nCarry identical\n"))])
+        .await;
+    api.approve(cased, "alice").await;
+    let r = api.land(cased, "bob").await;
+    assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(
+        r.error().contains(r#"src/OWNERS: "Carry identical""#),
+        "{}",
+        r.error()
+    );
     // Fixed, it lands, and the directory is identical-only.
     let fixed = api
         .commit(&[base], &[("src/OWNERS", Some("bob\ncarry identical\n"))])
@@ -2821,4 +2833,35 @@ async fn a_misspelled_carry_line_is_refused_and_status_says_why() {
     let s = api.status(fixed).await;
     assert!(s.approved && s.refused.is_none(), "{s:?}");
     assert_eq!(api.land(fixed, "bob").await.status, StatusCode::OK);
+    // A changeset already on the ref (here put there past the policy) has
+    // nothing left to refuse: status reports it landed, not refused.
+    let head = api.main_ref().await.unwrap();
+    let late = api
+        .commit(&[head], &[("lib/OWNERS", Some("carry identically\n"))])
+        .await;
+    assert!(api
+        .repo
+        .meta()
+        .cas_ref("main", Some(head), Some(late))
+        .await
+        .unwrap());
+    let s = api.status(late).await;
+    assert_eq!(s.on_refs, ["main"]);
+    assert_eq!(s.refused, None, "{s:?}");
+}
+
+/// An oversized `OWNERS` file in a submitted changeset is a policy refusal
+/// (422) like the rest of the land check, not a malformed request (400).
+#[tokio::test]
+async fn an_oversized_owners_file_is_refused_with_422() {
+    let api = Api::with(POLICY);
+    let base = api.seed_main(&[("OWNERS", Some("alice\n"))]).await;
+    let big = "a\n".repeat(600 * 1024);
+    let id = api
+        .commit(&[base], &[("src/OWNERS", Some(big.as_str()))])
+        .await;
+    api.approve(id, "alice").await;
+    let r = api.land(id, "bob").await;
+    assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", r.error());
+    assert!(r.error().contains("the limit is"), "{}", r.error());
 }
