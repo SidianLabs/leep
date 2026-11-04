@@ -12,6 +12,10 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   16 KB per changeset v3 path-history index the largest thing Leep stores;
   it points to the v4 measurements (ADR 0045).
 
+### /v1 compat tests cover later-added optional fields
+
+- **Tests.** The `/v1` compat tests in `leep-core` now cover every optional field added after the original shapes (`land_id`, `created_by`, `carried_from`, and more): old JSON without them still decodes, and their serialized names are frozen.
+
 ### Review verdicts carry across identical rebases; policy refusals are 422
 - **Changed.** A reviewer's approve or reject of a changeset X now counts
   for a changeset Y that names X in `leep.rebased_from` (a hint, followed to

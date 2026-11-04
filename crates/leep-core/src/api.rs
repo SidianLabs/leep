@@ -2164,5 +2164,218 @@ mod tests {
             .unwrap();
             assert_has(&req, &["changeset", "target_ref", "create"], "LandRequest");
         }
+
+        /// For one type: `old` (the shape before `added` existed) still
+        /// decodes, and the same JSON with `added` decodes and serializes
+        /// back under the same names and values. `omitted` is whether the
+        /// old shape reserializes without the added names, which is what
+        /// keeps old clients decoding new servers' answers.
+        fn check_added<T>(what: &str, old: Value, added: &[(&str, Value)], omitted: bool)
+        where
+            T: Serialize + serde::de::DeserializeOwned,
+        {
+            let decoded: T = serde_json::from_value(old.clone())
+                .unwrap_or_else(|e| panic!("old {what} no longer decodes: {e}"));
+            if omitted {
+                let back = serde_json::to_value(&decoded).unwrap();
+                for (k, _) in added {
+                    assert!(back.get(*k).is_none(), "{what} writes unset {k:?}");
+                }
+            }
+            let mut full = old;
+            for (k, v) in added {
+                full[*k] = v.clone();
+            }
+            let decoded: T = serde_json::from_value(full)
+                .unwrap_or_else(|e| panic!("{what} with added fields fails: {e}"));
+            let back = serde_json::to_value(&decoded).unwrap();
+            for (k, v) in added {
+                assert_eq!(back.get(*k), Some(v), "{what} renamed or lost field {k:?}");
+            }
+        }
+
+        fn land_id_json() -> Value {
+            json!("0123456789abcdef0123456789abcdef")
+        }
+
+        #[test]
+        fn fields_added_later_decode_when_absent_and_keep_their_names() {
+            let created_by = json!({ "principal": "alice", "timestamp": 1_700_000_001 });
+            let c = || json!(id("c"));
+
+            check_added::<ChangesetInfo>(
+                "ChangesetInfo",
+                old_info(),
+                &[
+                    ("path_at", json!("a.txt")),
+                    (
+                        "renamed",
+                        json!({ "from": "b.txt", "to": "a.txt", "similarity": 100, "exact": true }),
+                    ),
+                    ("created_by", created_by.clone()),
+                ],
+                true,
+            );
+            check_added::<LandRequest>(
+                "LandRequest",
+                json!({ "changeset": id("c") }),
+                &[("create", json!(false)), ("land_id", land_id_json())],
+                true,
+            );
+            check_added::<RebaseOntoRequest>(
+                "RebaseOntoRequest",
+                json!({ "onto": id("o"), "expected_base": id("b") }),
+                &[("land_id", land_id_json())],
+                true,
+            );
+            check_added::<LandRefusal>(
+                "LandRefusal",
+                json!({ "land_id": land_id_json(), "changeset": id("c") }),
+                &[("landed", c())],
+                true,
+            );
+            check_added::<ErrorResponse>(
+                "ErrorResponse",
+                json!({ "error": "boom" }),
+                &[
+                    (
+                        "indexing",
+                        json!({ "kind": "history-tree-v4", "behind": 3, "retry_after_ms": 500 }),
+                    ),
+                    ("code", json!("land_id_reused")),
+                    ("request_id", json!("r-1")),
+                    (
+                        "land",
+                        json!({ "land_id": land_id_json(), "changeset": id("c") }),
+                    ),
+                ],
+                true,
+            );
+            check_added::<ReadyResponse>(
+                "ReadyResponse",
+                json!({ "status": "ok" }),
+                &[
+                    (
+                        "failed",
+                        json!([{ "store": "meta", "reason": "unavailable" }]),
+                    ),
+                    ("features", json!([FEATURE_LAND_ID])),
+                ],
+                true,
+            );
+            check_added::<WhoAmIResponse>(
+                "WhoAmIResponse",
+                json!({ "name": "alice", "role": "write" }),
+                &[("author", json!("Alice <a@example.com>"))],
+                true,
+            );
+            check_added::<PathReview>(
+                "PathReview",
+                json!({ "path": "a.txt", "rule": "owner", "owners": ["rhea"],
+                        "approved_by": ["rhea"] }),
+                &[("rejected_by", json!(["bob"])), ("carried_from", c())],
+                false,
+            );
+            check_added::<ReviewEntry>(
+                "ReviewEntry",
+                json!({ "reviewer": "rhea", "verdict": "approve", "comment": "ok",
+                        "timestamp": 1_700_000_000 }),
+                &[("source", json!("ci")), ("via", json!("agent-token"))],
+                true,
+            );
+            check_added::<ReviewsResponse>(
+                "ReviewsResponse",
+                json!({ "reviews": [] }),
+                &[("via", c())],
+                false,
+            );
+            check_added::<SignaturesResponse>(
+                "SignaturesResponse",
+                json!({ "signatures": [], "verified": true }),
+                &[("via", c())],
+                false,
+            );
+            check_added::<AddReviewRequest>(
+                "AddReviewRequest",
+                json!({ "verdict": "approve" }),
+                &[
+                    ("comment", json!("fine")),
+                    ("reviewer", json!("rhea")),
+                    ("source", json!("ci")),
+                ],
+                false,
+            );
+            check_added::<CreateReviewRequest>(
+                "CreateReviewRequest",
+                json!({ "changeset": id("c") }),
+                &[
+                    ("target_ref", json!("leep-main")),
+                    ("reviewers", json!(["rhea"])),
+                    ("message", json!("please")),
+                ],
+                false,
+            );
+            check_added::<ReviewRequestEntry>(
+                "ReviewRequestEntry",
+                json!({ "id": 1, "changeset": id("c"), "target_ref": "main",
+                        "requester": "dee", "created": 1_700_000_000, "state": "open" }),
+                &[
+                    ("reviewers", json!(["rhea"])),
+                    ("message", json!("please")),
+                    ("closed", json!(1_700_000_100)),
+                    ("landed_as", c()),
+                    ("created_by", created_by),
+                    ("title", json!("first line")),
+                ],
+                false,
+            );
+            check_added::<ReviewRequestsResponse>(
+                "ReviewRequestsResponse",
+                json!({ "requests": [] }),
+                &[("next", json!(7))],
+                true,
+            );
+            check_added::<CreateReviewRequestResponse>(
+                "CreateReviewRequestResponse",
+                json!({ "request": { "id": 1, "changeset": id("c"), "target_ref": "main",
+                        "requester": "dee", "created": 1_700_000_000, "state": "open" } }),
+                &[("existing", json!(true))],
+                false,
+            );
+            check_added::<CasRefRequest>(
+                "CasRefRequest",
+                json!({ "expected": null, "new": id("c") }),
+                &[("operation", json!("cas")), ("message", json!("why"))],
+                true,
+            );
+            check_added::<LogSummaryEntry>(
+                "LogSummaryEntry",
+                json!({ "id": id("c1"), "parents": [], "author": "dev",
+                        "timestamp": 1, "message_first_line": "m", "files_changed": 1,
+                        "generation": 1, "root_tree": Hash::of_blob(b"t").to_string() }),
+                &[
+                    ("agent", json!({ "agent.model": "m" })),
+                    ("path_at", json!("a.txt")),
+                    (
+                        "renamed",
+                        json!({ "from": "b.txt", "to": "a.txt", "similarity": 90, "exact": false }),
+                    ),
+                ],
+                false,
+            );
+            check_added::<DiffResponse>(
+                "DiffResponse",
+                json!({ "entries": [] }),
+                &[
+                    (
+                        "renames",
+                        json!([{ "from": "b.txt", "to": "a.txt", "similarity": 100, "exact": true }]),
+                    ),
+                    ("renames_truncated", json!(true)),
+                    ("next", json!("n")),
+                ],
+                true,
+            );
+        }
     }
 }
