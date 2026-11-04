@@ -145,8 +145,11 @@ directive, not a name: on the same walk (`noparent`'s file included),
 whether verdicts carry to a
 re-committed change of a path only when it is identical; both lines in one
 file mean `carry identical`. Any other line whose first word is `carry`
-is neither a name nor a directive, and a review-protected land writing one
-is refused (422). Older servers read either line as an owner
+in any case (`Carry identical` included) is neither a name nor a
+directive, and a review-protected land writing one is refused (422). An
+ownerless `noparent` file such as `noparent` + `carry merged` makes its
+directory approvable by anyone, so the parent's owners approving it
+approve an unbounded delegation. Older servers read either line as an owner
 name nobody has (in a file with no other names, nobody can approve the
 directory there), so upgrade servers before writing them.
 

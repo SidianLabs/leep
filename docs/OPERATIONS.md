@@ -1382,7 +1382,9 @@ key: an older server refuses the file at startup and keeps its previous
 config on SIGHUP (`config reload failed`). Upgrade before adding `carry`
 lines to `OWNERS` files too: an older server reads them as an owner name
 nobody has, which is harmless beside real names but leaves a file with no
-other names unapprovable.
+other names unapprovable. In a mixed fleet, an older server still carries
+merged changes (rebased and union) on identical-only paths for the lands
+and status it answers, until it is upgraded too.
 
 Expect more re-approvals there, by design: on a strict ref or an
 identical-only path, any edit of the file that lands while a client

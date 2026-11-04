@@ -35,9 +35,15 @@ to say so.
   its ancestors' rule, never loosen it: its owners need not own the parent
   directory, so they cannot undo what the parent's owners asked for; only
   a `noparent` file, which already cuts the parent's owners off, ends its
-  reach. A file with both lines means `carry identical`.
+  reach. A file with both lines means `carry identical`. An ownerless
+  `noparent` file such as `noparent` + `carry merged` (no names) makes its
+  directory approvable by anyone, since no file covers it with names, so
+  the parent's owners who approve adding it approve an unbounded
+  delegation of that directory.
+  Directory level only; per-file patterns inside `OWNERS` are not offered.
 - **Misspellings are refused, not ignored.** Any other line whose first
-  word is `carry` (`carry identically`, `carry`, `carry  merged`) is
+  word is `carry` in any case (`carry identically`, `carry`,
+  `carry  merged`, `Carry identical`, `CARRY merged`) is
   neither a name nor a directive. Read as a name, a typo would leave the
   directory on the looser default with nothing to show for it. A land onto
   a review-protected ref of a changeset that adds or modifies such an
@@ -46,8 +52,9 @@ to say so.
   or not, and `review-status` answers the same text in a new optional
   `refused`, with `approved` false. In a head that already holds such a
   line (written before this server, or on an unprotected ref) the line
-  is simply ignored.
-  Directory level only; per-file patterns inside `OWNERS` are not offered.
+  is simply ignored, and `review-status` of a changeset already on a ref
+  reports no `refused`. An `OWNERS` file over 1 MiB in a submitted
+  changeset is refused with 422 too.
 - **Review policy file.** `identical_only_globs`: `globset` patterns,
   matched as `docs_globs` are (`*` stays within one path level), for files
   that have no `OWNERS` tree or that the operator wants fixed whatever the
