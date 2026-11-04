@@ -125,3 +125,17 @@ ADR 0085 moved the land-policy refusals (`needs_review`, `not_signed`,
 `user`" covers it, so they stay exit 1, and the land hint, keyed on `code`
 and the marker text, is unchanged. Nothing in the CLI needed to change; a
 stub test pins the mapping (`a_policy_422_is_a_user_error_with_its_code`).
+
+## Note, 2026-11-04: 7 is "nothing yet"
+`review status --wait` ran out of time and was rejected with the same exit
+1, and `review inbox --wait` ran out of time with the exit of an error, so
+a waiting agent could not tell "ask again later" from "someone said no" or
+"my command is wrong". A new code, 7, means a `--wait` ran out of time
+before what it waited for came: nothing yet, not an error and not "no".
+`review status --wait` and `review request --wait` exit 7 on the clock,
+1 on a rejection and 0 on an approval; `review inbox --wait` exits 7 when
+nothing came. Like the predicates, it is an outcome, so `--json` prints
+the command's usual result document, not an error. No error kind maps to
+7. The same change shows a land refused for review (`needs_review`) on
+stderr as guidance, without the HTTP status and request id line; `--json`
+still carries both, and the next commands in `hint`.
