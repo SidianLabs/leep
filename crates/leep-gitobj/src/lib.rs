@@ -457,6 +457,11 @@ pub fn object_id(kind: gix_object::Kind, data: &[u8]) -> Result<ObjectId> {
     gix_object::compute_hash(gix_hash::Kind::Sha1, kind, data).map_err(gerr)
 }
 
+/// Git's empty tree, the tree of a changeset with no files.
+pub fn empty_tree_id() -> ObjectId {
+    ObjectId::empty_tree(gix_hash::Kind::Sha1)
+}
+
 /// The git id of a blob with these bytes.
 pub fn blob_id(data: &[u8]) -> Result<ObjectId> {
     object_id(gix_object::Kind::Blob, data)

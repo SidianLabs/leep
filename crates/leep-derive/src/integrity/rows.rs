@@ -6,6 +6,7 @@ use leep_core::{Changeset, ChangesetId, Error, Hash, MetaStore, Result};
 use crate::derived::{
     self, DerivedKind, Generation, HistoryTree, LastMerge, LogFilterIndex, RootTree, Skiplist,
 };
+use crate::git_map::{GitCommit, GIT_BLOB_KIND, GIT_COMMIT_KIND, GIT_TREE_KIND};
 use crate::search::trigram::BlobRow;
 use crate::Repo;
 
@@ -45,6 +46,8 @@ pub(crate) async fn recompute(
         recompute_with::<HistoryTree>(repo, id, cs).await
     } else if kind == LogFilterIndex::NAME {
         recompute_with::<LogFilterIndex>(repo, id, cs).await
+    } else if kind == GitCommit::NAME {
+        recompute_with::<GitCommit>(repo, id, cs).await
     } else {
         Err(Error::Other(format!("{kind} is not a per-changeset kind")))
     }
@@ -91,6 +94,8 @@ pub(crate) async fn derive_kind(kind: &str, repo: &Repo, id: ChangesetId) -> Res
         derived::derive::<HistoryTree>(repo, id).await
     } else if kind == LogFilterIndex::NAME {
         derived::derive::<LogFilterIndex>(repo, id).await
+    } else if kind == GitCommit::NAME {
+        derived::derive::<GitCommit>(repo, id).await
     } else {
         Err(Error::Other(format!("{kind} is not a per-changeset kind")))
     }
@@ -135,6 +140,8 @@ pub(crate) fn describe(kind: &str, stored: &[u8], expected: &[u8]) -> String {
         } else {
             format!("stored {}, recomputed {}", shape(stored), shape(expected))
         }
+    } else if [GIT_COMMIT_KIND, GIT_TREE_KIND, GIT_BLOB_KIND].contains(&kind) {
+        format!("stored {}, recomputed {}", to_hex(stored), to_hex(expected))
     } else if kind == Skiplist::NAME {
         match (Skiplist::decode(stored), Skiplist::decode(expected)) {
             (Ok(s), Ok(e)) => {

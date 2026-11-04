@@ -2470,6 +2470,7 @@ dependencies = [
  "futures-util",
  "globset",
  "leep-core",
+ "leep-gitobj",
  "leep-testkit",
  "metrics",
  "postcard",
