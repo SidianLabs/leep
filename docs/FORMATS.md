@@ -742,8 +742,8 @@ Nothing persisted changed.
   name), keyed as `review-v1` is, never carried across rebases. It is an
   attestation for verify and repair (checked to decode and to be within
   bounds: name 1 to 64 of `a-z 0-9 - _ .`, `url` at most 2048 bytes without
-  control characters, `summary` at most 4096 bytes; `repair drop` refuses
-  it) and a GC root (ADR 0059 root 4), so it is not in
+  control characters, `summary` at most 4096 bytes; `repair drop` may drop
+  it, since CI can post it again) and a GC root (ADR 0059 root 4), so it is not in
   `PER_CHANGESET_KINDS`.
 - Refs named `green/<ref>` for every ref of the checks policy, moved only by
   the server. Their ref log entries have operation `promote` (now reserved,
@@ -765,11 +765,14 @@ Nothing persisted changed.
   and `GET /v1/refs/{name}/culprits?bad=&good=` (→ `CulpritsResponse {name,
   good?, bad, suspects: [Suspect {changeset, seq, operation, actor?, time,
   land_id?, land_changeset?, created_by?, author, title, agent_model?, paths
-  = [], more_paths = false}], truncated}`). The two ref paths share the
+  = [], more_paths = false}], truncated, next?}`; query `limit` (100, at
+  most 500) and `before` (a page's `next`)). `POST /v1/merge` now records
+  an authenticated caller as the merge's creator (`created-by-v1`, if new). The two ref paths share the
   `/v1/refs/{*name}` route: the suffix meaning wins whenever the ref
   before it exists, and a ref whose own name ends in `/checks` or
   `/culprits` is answered as itself only when it does not.
-- Error code `promotion_only` (422): a land, move or delete of a green ref.
+- Error code `promotion_only` (422): a land, create or move of any
+  `green/` ref, or a delete of one the checks policy names.
 
 ## Index leases and bounded queries (additive, ADR 0058)
 

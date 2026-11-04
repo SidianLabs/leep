@@ -570,11 +570,22 @@ check's token. Residual: a leaked CI token can post a false pass and promote
 untested code to green, the trust CI already has when it reports to a code
 host or deploys; a false fail only paints the ref red and adds noise to the
 suspects. Nothing gates `land`. Results are keyed by changeset id and never
-carried across rebases. Every ref in the checks policy is forward-only;
+carried across rebases. `POST /v1/merge` records its caller as creator too,
+so a token cannot attest a merge of its own change (found in review). The
+whole `green/` namespace is the server's: no write token creates or moves a
+`green/` ref, in the policy or not, so none can plant a "known good" for a
+ref added later. Results are taken only for changesets a ref holds, so they
+cannot pin abandoned work against GC, and `repair drop` may drop them. The
+culprits walk is paged and its seek bounded, and both ref routes share the
+`log_filtered` read permits, so a read token cannot make one request read
+the whole ref log with ancestry checks. Every ref in the checks policy is forward-only;
 otherwise a write token could move it back below green, and green, which
 never rewinds, would stay ahead of it for good. The suspects list is the
 lands in the range, not a verdict: a test planted to fail only once a later
 land arrives frames that later land, so the docs and tools say so. Tests:
 `only_allow_listed_tokens_post_and_never_on_their_own_changes`,
 `green_refuses_land_cas_undo_and_delete_and_main_is_protected`,
+`a_merge_made_by_a_ci_token_is_its_own_and_cannot_be_attested`,
+`an_unlanded_changeset_never_promotes`,
+`a_ref_named_like_a_suffix_never_shadows_the_status`,
 `checks_policy_protects_its_refs_and_reloads`.

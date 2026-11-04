@@ -124,6 +124,8 @@ impl Repo {
         if required.is_empty() {
             return Ok(None);
         }
+        // Read once, outside the retry loop: policy refs only move forward,
+        // so a changeset on this head's first-parent chain stays on it.
         let Some(head) = self.meta().get_ref(target_ref).await? else {
             return Ok(None);
         };

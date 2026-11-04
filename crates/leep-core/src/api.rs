@@ -33,7 +33,7 @@
 //! | POST | `/v1/changesets/{id}/reviews` | [`AddReviewRequest`] | [`AddReviewResponse`] (the reviewer is the token's name, or the body's `reviewer` for a `review_for` token and 403 for any other; 400 without authentication; 404 if the changeset is unknown) |
 //! | GET  | `/v1/changesets/{id}/reviews` | – | [`ReviewsResponse`] |
 //! | GET  | `/v1/changesets/{id}/review-status?ref=main` | – | [`ReviewStatusResponse`] (`ref` defaults to `main`) |
-//! | POST | `/v1/changesets/{id}/checks` | [`PostCheckRequest`] | [`PostCheckResponse`] (records a check result; the poster is the token's name; 403 unless the token's `checks` names the check, or if the token created the changeset; 400 without authentication; 404 if the changeset is unknown; a pass that completes a ref's required checks promotes `green/<ref>`; ADR 0091) |
+//! | POST | `/v1/changesets/{id}/checks` | [`PostCheckRequest`] | [`PostCheckResponse`] (records a check result; the poster is the token's name; 403 unless the token's `checks` names the check, or if the token created the changeset (or the original of a rebased copy); 400 without authentication or when no ref's first-parent chain holds the changeset; 404 if the changeset is unknown; a pass that completes a ref's required checks promotes `green/<ref>`; ADR 0091) |
 //! | GET  | `/v1/changesets/{id}/checks` | – | [`ChecksResponse`] (the newest result of every check the server knows by name, and the green refs that hold the changeset) |
 //! | GET  | `/v1/refs/{name}/checks` | – | [`RefChecksResponse`] (the ref's head, its known-good `green/<name>`, how far green is behind, and whether the head is red; 404 if the ref does not exist; a ref literally named `{name}/checks` is answered as that ref only when `name` does not exist; ADR 0091) |
 //! | GET  | `/v1/refs/{name}/culprits?bad=rev&good=rev&limit=n&before=seq` | – | [`CulpritsResponse`] (suspects: the lands in the range, the ref log entries of `name` above `good` up to the one that brought `bad`, newest first; `limit` defaults to 100, capped at 500, and `before` pages by the previous page's `next`; finding `bad`'s entry reads at most 1024 entries (`truncated`); `good` defaults to `green/<name>` and `bad` to the head; never a verdict: a land whose test fails only together with a later one shows that later one as a suspect too; 400 if `bad` is at or below green (without `good`), `good` is not below `bad`, or `bad` is not on the ref; a ref literally named `{name}/culprits` is answered as that ref only when `name` does not exist; ADR 0091) |
@@ -81,8 +81,8 @@
 //! |---|---|---|
 //! | 400 | `needs_review` | a land onto a ref whose review policy some changeset does not meet |
 //! | 400 | `not_signed` | a land onto a ref that needs every changeset signed by a trusted key |
-//! | 400 | `not_forward` | a move of a land-policy-protected ref, or of a protected ref (`--protect-ref`), that is not a fast-forward |
-//! | 422 | `promotion_only` | a land onto, move or delete of a known-good ref `green/<ref>`, which only the server moves (ADR 0091) |
+//! | 422 | `not_forward` | a move of a land-policy-protected ref, or of a protected ref (`--protect-ref`), that is not a fast-forward |
+//! | 422 | `promotion_only` | a land onto, create or move of any `green/` ref, or a delete of one the checks policy names: only the server moves known-good refs (ADR 0091) |
 //! | 400 | `tag_immutable` | a move of a tag, or a land onto one |
 //! | 400 | `land_id_reused` | a land id the ref already recorded for another changeset (ADR 0057); `land` ([`LandRefusal`]) carries the record |
 //! | 400 | `invalid_name` | a ref name [`crate::refname::validate`] refuses |
@@ -280,8 +280,8 @@ pub mod error_code {
     /// of a protected ref (`--protect-ref`), that is not a fast-forward
     /// ([`crate::refname::NOT_FORWARD_MARKER`]).
     pub const NOT_FORWARD: &str = "not_forward";
-    /// 422: a land, ref move or delete of a known-good ref (`green/<ref>`),
-    /// which only the server moves, by promotion
+    /// 422: a land onto, create or move of any `green/` ref, or a delete of
+    /// one the checks policy names: only the server moves them, by promotion
     /// ([`crate::check::PROMOTION_ONLY_MARKER`], ADR 0091).
     pub const PROMOTION_ONLY: &str = "promotion_only";
     /// 400: a tag move, or a land onto a tag. Tags are created and deleted,

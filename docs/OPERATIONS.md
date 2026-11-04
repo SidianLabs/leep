@@ -713,7 +713,10 @@ only together with a later land shows that later land too, so a planted
 tripwire can frame an innocent land. Match the failing test's files against
 each suspect's paths, rerun on a candidate, then `leep revert` and land.
 `--good REV` looks below green, and `--bad REV` stops at an earlier failure.
-The walk reads at most 4,096 ref moves and says when it stopped.
+The list is paged (`-n`, 100 by default, at most 500; `--before` continues),
+and finding `--bad`'s land reads at most 1,024 ref moves (it says when it
+gave up). Both `leep checks ref` and `culprits` count against the
+`log_filtered` read class.
 
 **Forward-only.** Every ref in the checks policy is protected as a review ref
 is. It only moves forward and cannot be deleted through the API, because a
@@ -723,6 +726,12 @@ never a `rebase-onto` target, so a git-primary mirror ref (`--primary git`)
 cannot have a checks policy. `green/<ref>` itself refuses every land, move,
 `leep undo` and delete with 422 `promotion_only`, and its ref log entries
 (operation `promote`) name the token whose result completed the checks.
+No client can create or move any `green/` ref, in the policy or not.
+
+**Results pin changesets.** A changeset with a check result is a GC root.
+The server takes results only for changesets some ref holds on its
+first-parent chain. To unpin old ones, `leep-server repair drop check-v1`
+drops every result; CI posts new ones as it runs.
 
 **Changing the policy.** Edit the file and SIGHUP. When the policy changed,
 the server walks each ref's head down to green (at most 1,024 changesets)
@@ -736,10 +745,11 @@ metadata store, or rewinds the ref by hand, to a point below green, green
 is off the ref's history: `leep checks ref` shows it `off the head's
 history` and it never moves again. To recover:
 
-1. Remove the ref from the checks policy and SIGHUP. `green/<ref>` is then a
-   plain ref.
-2. Delete it, or CAS it back to a changeset on the ref, with
-   `POST /v1/refs/green/<ref>` (`leep branch -D green/<ref>`).
+1. Remove the ref from the checks policy and SIGHUP. `green/<ref>` may then
+   be deleted.
+2. Delete it with `POST /v1/refs/green/<ref>` (`leep branch -D
+   green/<ref>`). Creating or moving a `green/` ref is refused even outside
+   the policy, so delete it rather than move it.
 3. Put the ref back in the policy and SIGHUP. The catch-up promotes green
    from the stored results.
 

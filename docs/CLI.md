@@ -165,12 +165,14 @@ changeset the token created; reading needs any token.
 | `leep checks post REV CHECK pass\|fail [--url URL] [-m SUMMARY]` | Record a result for `REV` (resolved to an id first: post for the changeset you tested). Prints `Recorded CHECK OUTCOME on ID`, and `green/REF moved to ID` for each known-good ref it promoted. A rerun replaces the earlier result. |
 | `leep checks status [REV]` | The results on `REV` (default `@`): `OUTCOME CHECK by TOKEN TIME URL`, then `known good on REF` for each green ref that holds it. |
 | `leep checks ref [REF]` | Where `REF` (default: the target ref) stands: its head, `green/REF` and how many changesets it is behind, the required checks, and `REF is red since ID (CHECK)` when the head fails. Exit 1 when red. |
-| `leep checks culprits [REF] [--bad REV] [--good REV]` | The suspects for a failure: the lands in the range above `--good` (default `green/REF`) up to the one that brought `--bad` (default the head), newest first, with ref log `seq`, id, who created it (or landed it), title, agent model and the paths changed. |
+| `leep checks culprits [REF] [--bad REV] [--good REV] [-n N] [--before SEQ]` | The suspects for a failure: the lands in the range above `--good` (default `green/REF`) up to the one that brought `--bad` (default the head), newest first, with ref log `seq`, id, who created it (or landed it), title, agent model and the paths changed. `-n` caps the page (100, at most 500); a full page ends with `(more: add --before SEQ)`. |
 
 A suspect is a land in the range, never a verdict: a land whose test fails
 only together with a later land shows the later one too. Read the paths,
-rerun, then revert. `green/REF` cannot be landed on, moved, undone or
-deleted (exit 1, `--json` `server_code: "promotion_only"`). `leep checkout
+rerun, then revert. No `green/` ref can be landed on, created, moved or
+undone, and `green/REF` cannot be deleted while the policy names `REF` (exit
+1, `--json` `server_code: "promotion_only"`). Results are taken only for
+changesets some ref holds. `leep checkout
 green/main` gives you its tree. Keep basing new work on the ref itself.
 
 ## Long listings

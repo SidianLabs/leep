@@ -1611,11 +1611,13 @@ refused. A pass that completes a policy ref's required checks moves
 forward; a lost swap rereads. At startup and on a reload that changed the
 checks policy, `Repo::catch_up_green` walks each ref's first-parent chain
 down to green and promotes as far as the stored results allow. The
-`GreenRefs` policy makes green refs promotion-only (`land` and
-`cas_ref_checked` refuse them with 422 `promotion_only`), and the checked
+`green/` namespace is the server's (`land` and `cas_ref_checked` refuse to
+create or move any `green/` ref with 422 `promotion_only`; deletes only of
+ones no policy names), and the checked
 ref is protected like a review ref, so it cannot be rewound below green.
 Red is derived at read time. `GET /v1/refs/{name}/culprits` walks the ref
-log (at most 4,096 entries) to list the suspects, the lands in the range
+log, a page at a time (`limit`, `before`; at most 1,024 entries read to
+find `bad`'s land), to list the suspects, the lands in the range
 from `good` (default: green) to `bad`. It is never a verdict. Nothing here
 is on the land path.
 
