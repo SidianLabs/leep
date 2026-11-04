@@ -1737,8 +1737,15 @@ async fn merge_base(
     Ok(Json(MergeBaseResponse { base }))
 }
 
-async fn merge(State(repo): S, body: Bytes) -> ApiResult<Json<MergeResponse>> {
-    Ok(Json(repo.merge(parse_json(&body)?).await?))
+/// The caller is recorded as the merge's creator (ADR 0086), so it can no
+/// more attest it than a changeset it posted (ADR 0091).
+async fn merge(
+    State(repo): S,
+    auth::MaybePrincipal(who): auth::MaybePrincipal,
+    body: Bytes,
+) -> ApiResult<Json<MergeResponse>> {
+    let actor = who.as_ref().map(|p| p.name.as_str());
+    Ok(Json(repo.merge_by(parse_json(&body)?, actor).await?))
 }
 
 async fn rebase(State(repo): S, body: Bytes) -> ApiResult<Json<RebaseResponse>> {

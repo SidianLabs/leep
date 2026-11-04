@@ -458,6 +458,18 @@ impl Repo {
     /// Three-way merge of two changesets into a new merge changeset with
     /// parents `[ours, theirs]`, or the list of conflicts.
     pub async fn merge(&self, req: MergeRequest) -> Result<MergeResponse> {
+        self.merge_by(req, None).await
+    }
+
+    /// [`Repo::merge`] for an authenticated caller: the merge is stored with
+    /// a `created-by-v1` row naming `principal`, written only if the merge
+    /// is new, as `POST /v1/changesets` does (ADR 0086). Without it a token
+    /// could make a changeset through a merge and then attest it (ADR 0091).
+    pub async fn merge_by(
+        &self,
+        req: MergeRequest,
+        principal: Option<&str>,
+    ) -> Result<MergeResponse> {
         let [ours, theirs] = req.parents;
         self.rescue_changesets(&[ours, theirs], RescueBy::Create)
             .await?;
@@ -468,16 +480,21 @@ impl Repo {
                 clean: m.changes,
             });
         }
-        let id = self
-            .store_server_changeset(Changeset {
-                parents: vec![ours, theirs],
-                author: req.authorship.author,
-                timestamp: req.authorship.timestamp.unwrap_or_else(now),
-                message: req.message,
-                changes: m.changes,
-                extra: req.extra,
-            })
-            .await?;
+        let cs = Changeset {
+            parents: vec![ours, theirs],
+            author: req.authorship.author,
+            timestamp: req.authorship.timestamp.unwrap_or_else(now),
+            message: req.message,
+            changes: m.changes,
+            extra: req.extra,
+        };
+        let id = match principal {
+            Some(p) => {
+                let if_new = vec![crate::review_requests::created_by_row(cs.id(), p)];
+                self.store_changeset(cs, false, Vec::new(), if_new).await?
+            }
+            None => self.store_server_changeset(cs).await?,
+        };
         Ok(MergeResponse::Merged { id })
     }
 

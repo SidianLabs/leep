@@ -81,16 +81,7 @@ impl Repo {
         let Some(principal) = principal else {
             return self.create_changeset(cs).await;
         };
-        let id = cs.id();
-        let row = CreatedBy {
-            principal: principal.to_string(),
-            timestamp: unix_now(),
-        };
-        let if_new = vec![DerivedRow::new(
-            CREATED_BY_KIND,
-            id.0,
-            Bytes::from(row.encode()),
-        )];
+        let if_new = vec![created_by_row(cs.id(), principal)];
         self.store_changeset(cs, true, Vec::new(), if_new).await
     }
 
@@ -578,6 +569,15 @@ impl Repo {
             })
             .collect())
     }
+}
+
+/// The `created-by-v1` row naming `principal` as `id`'s creator, now.
+pub(crate) fn created_by_row(id: ChangesetId, principal: &str) -> DerivedRow {
+    let row = CreatedBy {
+        principal: principal.to_string(),
+        timestamp: unix_now(),
+    };
+    DerivedRow::new(CREATED_BY_KIND, id.0, Bytes::from(row.encode()))
 }
 
 #[cfg(test)]

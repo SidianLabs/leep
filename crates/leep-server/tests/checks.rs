@@ -574,3 +574,47 @@ async fn a_reload_that_drops_a_required_check_promotes_at_once() {
         .unwrap();
     assert_eq!(log[0].operation, "promote");
 }
+
+#[tokio::test]
+async fn a_merge_made_by_a_ci_token_is_its_own_and_cannot_be_attested() {
+    // S-25: the creator rule must hold for changesets made by POST /v1/merge
+    // too, or a CI token that commits makes X, merges it and attests that.
+    let api = Api::new(true);
+    let h = api.lands(1).await;
+    let x = api.commit("ci-test", &[h[0]], "x", "by ci").await;
+    let req = MergeRequest {
+        parents: [h[1], x],
+        message: "merge".into(),
+        authorship: Authorship {
+            author: "ci".into(),
+            timestamp: Some(1),
+        },
+        extra: BTreeMap::new(),
+    };
+    let m = match api.post("/v1/merge", Some("ci-test"), &req).await.ok() {
+        MergeResponse::Merged { id } => id,
+        other => panic!("{other:?}"),
+    };
+    let info: ChangesetInfo = api.get(&format!("/v1/changesets/{m}")).await.ok();
+    assert_eq!(
+        info.created_by.map(|c| c.principal).as_deref(),
+        Some("ci-test")
+    );
+    let landed = api.land(m).await;
+    assert_eq!(landed, m, "a fast-forward lands the merge itself");
+    api.check("ci-test", landed, "test", Outcome::Pass)
+        .await
+        .refused(StatusCode::FORBIDDEN, error_code::FORBIDDEN);
+    // Another token's merge of the same parents is not ci-test's to claim:
+    // the first creator stays.
+    let again = api
+        .post("/v1/merge", Some("alice"), &req)
+        .await
+        .ok::<MergeResponse>();
+    assert_eq!(again, MergeResponse::Merged { id: m });
+    let info: ChangesetInfo = api.get(&format!("/v1/changesets/{m}")).await.ok();
+    assert_eq!(
+        info.created_by.map(|c| c.principal).as_deref(),
+        Some("ci-test")
+    );
+}
