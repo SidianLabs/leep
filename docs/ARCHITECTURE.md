@@ -1571,7 +1571,8 @@ make a path stricter, and `CarryScope` carries all three, so carrying and
 request closing judge alike; taking back ignores them). `review-status` names the
 source in `carried_from` and how in `carried_rule`, and lists the
 candidates it compared in `origins`, with why one did not carry, and each
-path's effective rule in `carry`. It is a second
+path's effective rule in `carry` (with its source in `carry_source`) and
+the `OWNERS` files naming its owners in `owners_files`. It is a second
 `LandPolicy`: `Repo::with_land_policy` composes policies (all must pass), and
 `check_land` now receives the head so owners and new history agree.
 `GET .../review-status?ref=` shows the per-path state (and `on_refs`, the

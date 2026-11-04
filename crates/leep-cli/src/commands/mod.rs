@@ -22,6 +22,7 @@ pub mod resolve;
 pub mod restore;
 pub mod review;
 pub mod review_request;
+pub mod review_show;
 pub mod search;
 pub mod stash;
 pub mod status;

@@ -768,6 +768,14 @@ impl Client {
         self.json(self.http.get(self.url("/v1/review-requests")).query(query))
     }
 
+    /// `GET /v1/review-requests/{id}`.
+    pub fn review_request(&self, id: u64) -> Result<ReviewRequestEntry> {
+        self.json(
+            self.http
+                .get(self.url(&format!("/v1/review-requests/{id}"))),
+        )
+    }
+
     pub fn withdraw_review_request(&self, id: u64) -> Result<ReviewRequestEntry> {
         self.json(
             self.http

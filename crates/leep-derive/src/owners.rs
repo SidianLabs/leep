@@ -180,6 +180,28 @@ impl<'a> OwnersResolver<'a> {
         Ok(owners)
     }
 
+    /// The `OWNERS` files whose names make up [`Self::owners_of`] for
+    /// `path`, deepest first: those on the walk up to the first `noparent`
+    /// that name an owner. Lets a refusal say which rule matched.
+    pub async fn owners_files_of(&mut self, path: &RepoPath) -> Result<Vec<String>> {
+        let mut files = Vec::new();
+        for dir in ancestor_dirs(path) {
+            if let Some(f) = self.file_in(dir).await? {
+                if !f.owners.is_empty() {
+                    files.push(if dir.is_empty() {
+                        OWNERS_FILE.to_string()
+                    } else {
+                        format!("{dir}/{OWNERS_FILE}")
+                    });
+                }
+                if f.noparent {
+                    break;
+                }
+            }
+        }
+        Ok(files)
+    }
+
     /// The `carry` directive for `path` and the `OWNERS` file that states
     /// it, the strictest on the owners walk (deepest first, up to the first
     /// `noparent` or the root): `carry identical` anywhere on the walk wins,

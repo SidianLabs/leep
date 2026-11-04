@@ -389,22 +389,32 @@ fn the_inbox_hides_what_you_already_answered() {
 #[test]
 fn request_wait_delegates_to_status_wait() {
     let (url, _data) = start(true);
-    let out = leep(&url, &["review", "request", &id(1).to_string(), "--wait=1"]);
-    assert_eq!(out.status.code(), Some(0));
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.starts_with("Requested review of"), "{stdout}");
-    assert!(!stdout.contains("waits for the verdict"), "{stdout}");
-    assert!(stdout.contains(": approved\n"), "{stdout}");
+    let one = id(1).to_string();
+    for args in [
+        vec!["review", "request", one.as_str(), "--wait=1"],
+        vec!["review", "request", one.as_str(), "--wait", "1"],
+        vec!["review", "request", "--wait", "1", one.as_str()],
+        // A bare `--wait` before the revision leaves it the revision.
+        vec!["review", "request", "--wait", one.as_str()],
+    ] {
+        let out = leep(&url, &args);
+        assert_eq!(out.status.code(), Some(0), "{args:?}: {out:?}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("review of"), "{stdout}");
+        assert!(!stdout.contains("waits for the verdict"), "{stdout}");
+        assert!(stdout.contains(": approved\n"), "{stdout}");
+    }
 }
 
 /// `review inbox --wait` answers as soon as something waits (exit 0), and
-/// exits 1 when the time runs out with nothing.
+/// exits 7 (nothing yet, not an error) when the time runs out with nothing.
+/// `--wait SECS` with a space works as `--wait=SECS`.
 #[test]
 fn inbox_wait_returns_once_something_waits_or_times_out() {
     let (url, _data) = start(true);
     let started = std::time::Instant::now();
-    let out = leep(&url, &["review", "inbox", "--wait=1"]);
-    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let out = leep(&url, &["review", "inbox", "--wait", "1"]);
+    assert_eq!(out.status.code(), Some(7), "{out:?}");
     assert!(started.elapsed() >= std::time::Duration::from_secs(1));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("timed out after"), "{stderr}");
@@ -419,4 +429,6 @@ fn inbox_wait_returns_once_something_waits_or_times_out() {
     let out = leep(&url, &["review", "inbox", "--wait=30"]);
     assert_eq!(out.status.code(), Some(0), "{out:?}");
     assert!(String::from_utf8_lossy(&out.stdout).starts_with("#1 open"));
+    let out = leep(&url, &["review", "inbox", "--wait", "30s"]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
 }

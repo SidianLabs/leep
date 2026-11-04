@@ -22,6 +22,10 @@ pub mod exit {
     /// The requested change is already the state (`commit`, `amend` and
     /// `stash push` with nothing to record).
     pub const NOTHING_TO_DO: i32 = 6;
+    /// A `--wait` ran out of time before what it waited for came: nothing
+    /// yet, not an error (`review status --wait`, `review request --wait`,
+    /// `review inbox --wait`). Waiting again later may succeed.
+    pub const NOTHING_YET: i32 = 7;
     /// Killed by SIGINT: shells report 128 + 2. Leep installs no handler.
     pub const INTERRUPTED: i32 = 130;
     /// stdout's reader went away (`leep log | head -1`): shells report
@@ -116,6 +120,10 @@ pub struct CliError {
     /// What the server said about a failed request; boxed so `Result`s
     /// stay small.
     origin: Option<Box<Origin>>,
+    /// For an expected refusal (a land that needs review): what a person
+    /// reads on stderr instead of `message`, with no HTTP status or request
+    /// id. `--json` keeps the full `message` and `request_id`.
+    guidance: Option<Box<str>>,
 }
 
 /// The server-side names of a failed request.
@@ -146,7 +154,19 @@ impl CliError {
             candidates: Vec::new(),
             retry_after_ms: None,
             origin: None,
+            guidance: None,
         }
+    }
+
+    /// Show `text` to a person instead of the message and the request id:
+    /// the refusal is a normal step of a workflow, not a failure to report.
+    pub fn with_guidance(mut self, text: impl Into<String>) -> Self {
+        self.guidance = Some(text.into().into_boxed_str());
+        self
+    }
+
+    pub fn guidance(&self) -> Option<&str> {
+        self.guidance.as_deref()
     }
 
     fn origin_mut(&mut self) -> &mut Origin {
@@ -327,10 +347,18 @@ impl CliError {
     /// Print `leep: message` plus any candidates and hint on stderr, and
     /// with `json` also the [`to_json`](Self::to_json) document on stdout,
     /// where agents read results (ADR 0034). The last line names the request
-    /// id, for a bug report to quote.
+    /// id, for a bug report to quote. An error with guidance prints that and
+    /// the hint instead.
     pub fn report(&self, json: bool) {
         if json {
             outln!("{}", self.to_json());
+        }
+        if let Some(g) = &self.guidance {
+            eprintln!("leep: {g}");
+            if let Some(h) = &self.hint {
+                eprintln!("hint: {h}");
+            }
+            return;
         }
         eprintln!("leep: {}", self.message);
         for c in &self.candidates {

@@ -4,7 +4,9 @@ use std::collections::BTreeMap;
 use std::fs;
 
 use clap::Args;
-use leep_core::api::{error_code, Conflict, LandId, LandRequest, LandResponse, FEATURE_LAND_ID};
+use leep_core::api::{
+    error_code, Conflict, LandId, LandRequest, LandResponse, ReviewStatusResponse, FEATURE_LAND_ID,
+};
 use leep_core::outln;
 use leep_core::refname::MISSING_REF_MARKER;
 use leep_core::review::NEEDS_REVIEW_MARKER;
@@ -51,7 +53,8 @@ pub fn run(ctx: &mut Ctx, args: &LandArgs) -> Result<i32> {
         .target_ref
         .clone()
         .unwrap_or_else(|| ctx.wc.config.target_ref.clone());
-    let (resp, created) = land_creating(ctx, base, &target_ref, args.create)?;
+    let (resp, created) = land_creating(ctx, base, &target_ref, args.create)
+        .map_err(|e| review_guidance(ctx, e, &target_ref))?;
     if created {
         eprintln!("created ref {target_ref}");
     }
@@ -71,10 +74,14 @@ pub fn run(ctx: &mut Ctx, args: &LandArgs) -> Result<i32> {
                 ctx.wc.save_state()?;
             }
             if !ctx.json {
-                outln!(
-                    "{}",
-                    landed_line(landed, base, rebased, &target_ref, attempts)
-                );
+                // The head it was replayed onto, best effort.
+                let onto = (rebased && landed != base)
+                    .then(|| ctx.cache.changeset(&ctx.client, &landed).ok())
+                    .flatten()
+                    .and_then(|info| info.changeset.parents.first().copied());
+                for line in landed_lines(landed, base, rebased, &target_ref, attempts, onto) {
+                    outln!("{line}");
+                }
             }
             Ok(0)
         }
@@ -107,6 +114,16 @@ pub fn run(ctx: &mut Ctx, args: &LandArgs) -> Result<i32> {
                             short(onto),
                             c.path
                         )
+                    } else if c
+                        .merged_with_markers
+                        .as_deref()
+                        .is_some_and(crate::markers::only_insertions)
+                    {
+                        // ADR 0089's union: say so, or the author reads
+                        // both sides to find out keeping both is right.
+                        "markers written; both sides added lines here; keeping both \
+                         (one side's lines first) carries the review"
+                            .to_string()
                     } else {
                         "markers written".to_string()
                     };
@@ -146,29 +163,37 @@ pub fn run(ctx: &mut Ctx, args: &LandArgs) -> Result<i32> {
 }
 
 /// What a successful land says. A server-side rebase gives the copy a new
-/// id; the land policy judged the original, so its reviews count.
-fn landed_line(
+/// id, and a second line says what the rebase did: replayed the change
+/// cleanly onto `onto`, the head it found, so the change is the reviewed
+/// one and the original's reviews count (the land policy judged it).
+fn landed_lines(
     landed: ChangesetId,
     base: ChangesetId,
     rebased: bool,
     target_ref: &str,
     attempts: u32,
-) -> String {
-    format!(
+    onto: Option<ChangesetId>,
+) -> Vec<String> {
+    let mut out = vec![format!(
         "Landed {} on {target_ref}{} ({attempts} attempt{})",
         short(landed),
-        if rebased && landed != base {
-            format!(
-                " (rebased from {}; reviews of the original count)",
-                short(base)
-            )
-        } else if rebased {
-            " (rebased)".to_string()
+        if rebased && landed == base {
+            " (rebased)"
         } else {
-            String::new()
+            ""
         },
         if attempts == 1 { "" } else { "s" },
-    )
+    )];
+    if rebased && landed != base {
+        out.push(format!(
+            "rebased from {} onto {}: your changes are unchanged (a clean rebase by the \
+             server), so reviews of {} count",
+            short(base),
+            onto.map_or_else(|| format!("the head of {target_ref}"), short),
+            short(base)
+        ));
+    }
+    out
 }
 
 /// The changeset a `needs review` refusal names (`changeset <id> needs
@@ -410,18 +435,22 @@ fn hint_policy(e: CliError, target_ref: &str) -> CliError {
     if e.kind() != ErrorKind::User {
         return e;
     }
-    if e.is_server(error_code::NEEDS_REVIEW, NEEDS_REVIEW_MARKER) {
-        return e.map_message(|m| {
-            let (approve, request) = match refused_changeset(&m) {
-                Some(id) => (short(id), short(id)),
-                None => ("<changeset>".to_string(), "@".to_string()),
-            };
-            format!(
-                "{m}\n{target_ref} needs approval from the owners of the paths a changeset changes: \
-                 ask one to run `leep review approve {approve}` (`leep review request {request} --ref {target_ref}` asks them for you); \
-                 `leep review status {approve} --ref {target_ref} --wait` shows what is missing and waits for it."
-            )
-        });
+    if needs_review(&e) {
+        let (approve, request) = match refused_changeset(e.message()) {
+            Some(id) => (short(id), short(id)),
+            None => ("<changeset>".to_string(), "@".to_string()),
+        };
+        let next = format!(
+            "ask one to run `leep review approve {approve}` (`leep review request {request} --ref {target_ref}` asks them for you); \
+             `leep review status {approve} --ref {target_ref} --wait` shows what is missing and waits for it."
+        );
+        return e
+            .map_message(|m| {
+                format!(
+                    "{m}\n{target_ref} needs approval from the owners of the paths a changeset changes: {next}"
+                )
+            })
+            .with_hint(next);
     }
     if e.is_server(error_code::NOT_SIGNED, NOT_SIGNED_MARKER) {
         return e.map_message(|m| format!(
@@ -430,6 +459,82 @@ fn hint_policy(e: CliError, target_ref: &str) -> CliError {
         ));
     }
     e
+}
+
+fn needs_review(e: &CliError) -> bool {
+    e.kind() == ErrorKind::User && e.is_server(error_code::NEEDS_REVIEW, NEEDS_REVIEW_MARKER)
+}
+
+/// A land that needs review is a normal step, not a failure: say which
+/// paths wait for whom and which `OWNERS` files named them, without the
+/// HTTP status and request id (`--json` keeps both). Asks the server for the
+/// refused changeset's review status; without it, the server's own words.
+fn review_guidance(ctx: &Ctx, e: CliError, target_ref: &str) -> CliError {
+    if !needs_review(&e) {
+        return e;
+    }
+    let id = refused_changeset(e.message());
+    let st = id.and_then(|id| ctx.client.review_status(&id, target_ref).ok());
+    let text = needs_review_text(e.message(), id, st.as_ref());
+    e.with_guidance(text)
+}
+
+/// The guidance text of a `needs review` refusal: from the review status
+/// when there is one, every path still waiting with what it needs; else the
+/// server's first line without its `server:` prefix and HTTP status.
+fn needs_review_text(
+    message: &str,
+    id: Option<ChangesetId>,
+    st: Option<&ReviewStatusResponse>,
+) -> String {
+    let waiting: Vec<(&'static str, String, &str)> = st
+        .map(|st| {
+            st.paths
+                .iter()
+                .filter_map(|p| {
+                    let (state, why) = super::review::path_state(p);
+                    (state != "ok").then(|| (state, why, p.path.as_str()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    match (id, st) {
+        (Some(id), Some(st)) if !waiting.is_empty() => {
+            let width = waiting
+                .iter()
+                .map(|w| w.2.chars().count())
+                .max()
+                .unwrap_or(0);
+            let mut out = format!(
+                "{} needs review before it can land on {}:",
+                short(id),
+                st.target_ref
+            );
+            for (state, why, path) in waiting {
+                out.push_str(&format!("\n  {state:<8} {path:<width$}  {why}"));
+            }
+            out
+        }
+        _ => plain_server_text(message.lines().next().unwrap_or(message)).to_string(),
+    }
+}
+
+/// `server: TEXT (422 Unprocessable Entity)` as just `TEXT`.
+fn plain_server_text(m: &str) -> &str {
+    let m = m.strip_prefix("server: ").unwrap_or(m);
+    let Some(i) = m.rfind(" (") else {
+        return m;
+    };
+    let status = &m.as_bytes()[i + 2..];
+    let is_status = m.ends_with(')')
+        && status.len() > 4
+        && status[..3].iter().all(u8::is_ascii_digit)
+        && status[3] == b' ';
+    if is_status {
+        &m[..i]
+    } else {
+        m
+    }
 }
 
 /// Move the working copy to `onto` and re-apply the local changes there:
@@ -655,17 +760,73 @@ mod tests {
             ChangesetId(Hash::of_blob(b"a")),
             ChangesetId(Hash::of_blob(b"b")),
         );
+        let h = ChangesetId(Hash::of_blob(b"h"));
         assert_eq!(
-            landed_line(a, b, true, "main", 1),
-            format!(
-                "Landed {} on main (rebased from {}; reviews of the original count) (1 attempt)",
-                short(a),
-                short(b)
-            )
+            landed_lines(a, b, true, "main", 1, Some(h)),
+            [
+                format!("Landed {} on main (1 attempt)", short(a)),
+                format!(
+                    "rebased from {} onto {}: your changes are unchanged (a clean rebase by \
+                     the server), so reviews of {} count",
+                    short(b),
+                    short(h),
+                    short(b)
+                )
+            ]
         );
+        assert!(landed_lines(a, b, true, "main", 1, None)[1].contains("onto the head of main:"));
         assert_eq!(
-            landed_line(a, a, false, "main", 2),
-            format!("Landed {} on main (2 attempts)", short(a))
+            landed_lines(a, a, false, "main", 2, None),
+            [format!("Landed {} on main (2 attempts)", short(a))]
+        );
+    }
+
+    #[test]
+    fn a_review_refusal_reads_as_guidance_without_http_noise() {
+        let id = ChangesetId(Hash::of_blob(b"refused"));
+        let raw = format!(
+            "server: changeset {id} needs review: path a.rs needs approval from one of [rhea] \
+             (422 Unprocessable Entity)"
+        );
+        // No status from the server: its words, without prefix and status.
+        assert_eq!(
+            needs_review_text(&raw, Some(id), None),
+            format!("changeset {id} needs review: path a.rs needs approval from one of [rhea]")
+        );
+        assert_eq!(plain_server_text("server: x (y)"), "x (y)");
+        assert_eq!(plain_server_text("x (4ü2 z)"), "x (4ü2 z)");
+        assert_eq!(plain_server_text("x (500 Internal)"), "x");
+        let p = |path: &str, rule: &str, files: &[&str]| leep_core::api::PathReview {
+            path: RepoPath::new(path).unwrap(),
+            rule: rule.into(),
+            owners: vec!["rhea".into()],
+            approved_by: vec![],
+            rejected_by: vec![],
+            carried_from: None,
+            carried_rule: None,
+            carry: None,
+            owners_files: files.iter().map(|f| f.to_string()).collect(),
+            carry_source: None,
+        };
+        let st = ReviewStatusResponse {
+            changeset: id,
+            target_ref: "main".into(),
+            approved: false,
+            paths: vec![
+                p("CHANGELOG.md", "auto:docs_only", &[]),
+                p("src/lib.rs", "pending", &["src/OWNERS", "OWNERS"]),
+            ],
+            on_refs: vec![],
+            refused: None,
+            origins: vec![],
+        };
+        assert_eq!(
+            needs_review_text(&raw, Some(id), Some(&st)),
+            format!(
+                "{} needs review before it can land on main:\n  \
+                 PENDING  src/lib.rs  needs one of: rhea (from src/OWNERS, OWNERS)",
+                short(id)
+            )
         );
     }
 

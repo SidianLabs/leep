@@ -253,7 +253,8 @@ fn a_verdict_on_a_landed_changeset_says_it_landed() {
 }
 
 /// `review status --wait` asks until a verdict comes: approved is exit 0,
-/// a rejection stops it at once, and running out of time is exit 1.
+/// a rejection stops it at once (exit 1), and running out of time is exit 7,
+/// nothing yet.
 #[test]
 fn review_status_waits_for_the_verdict() {
     use leep_core::review::Verdict;
@@ -263,9 +264,12 @@ fn review_status_waits_for_the_verdict() {
     let wc = init(&leep, &mock);
     let id = root.to_string();
 
-    // Out of time: exit 1, after printing where it stands.
-    let out = leep.run(wc.path(), &["review", "status", &id, "--wait=1"]);
-    assert_eq!(out.status.code(), Some(1));
+    // Out of time: exit 7, after printing where it stands. `--wait SECS`
+    // takes its value with a space too, before or after the revision.
+    let out = leep.run(wc.path(), &["review", "status", &id, "--wait", "1"]);
+    assert_eq!(out.status.code(), Some(7));
+    let out2 = leep.run(wc.path(), &["review", "status", "--wait", "1", &id]);
+    assert_eq!(out2.status.code(), Some(7));
     assert!(
         text(&out.stdout).contains("not approved"),
         "{}",
@@ -370,11 +374,104 @@ fn conflict_markers_drop_an_empty_base_and_explain_the_sections() {
     let mock = Mock::start();
     mock.data.lock().unwrap().diff3 = true;
     let b = conflict(&leep, &mock, "");
-    assert_eq!(leep.run(b.path(), &["land"]).status.code(), Some(5));
+    let out = leep.run(b.path(), &["land"]);
+    assert_eq!(out.status.code(), Some(5));
     assert_eq!(
         std::fs::read_to_string(b.path().join("a.txt")).unwrap(),
         "<<<<<<< main (landed)\nfrom a\n=======\nfrom b\n>>>>>>> yours\n"
     );
+    // Only insertions on both sides: the report says keeping both is the
+    // union that carries the review (ADR 0089).
+    assert!(
+        text(&out.stdout).contains(
+            "  C a.txt (markers written; both sides added lines here; keeping both \
+             (one side's lines first) carries the review)"
+        ),
+        "{}",
+        text(&out.stdout)
+    );
+}
+
+/// `leep commit` warns about a file holding a whole conflict, as a
+/// resolution that kept its markers would, and commits anyway;
+/// `--allow-markers` silences it. A setext heading is no conflict.
+#[test]
+fn commit_warns_about_leftover_conflict_markers() {
+    let leep = Leep::new();
+    let mock = Mock::start();
+    mock.seed(None, &[("a.txt", "one\n", FileKind::Regular)], &[]);
+    let wc = init(&leep, &mock);
+    std::fs::write(wc.path().join("README.md"), "Title\n=======\n\ntext\n").unwrap();
+    std::fs::write(
+        wc.path().join("c.txt"),
+        "keep\n<<<<<<< yours\nx\n=======\ny\n>>>>>>> main (landed)\n",
+    )
+    .unwrap();
+    let out = leep.run(wc.path(), &["commit", "-m", "x"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let err = text(&out.stderr);
+    assert!(
+        err.contains(
+            "warning: c.txt:2: a `<<<<<<<`, `=======`, `>>>>>>>` conflict looks unresolved"
+        ),
+        "{err}"
+    );
+    assert!(err.contains("--allow-markers"), "{err}");
+    assert!(!err.contains("README.md"), "{err}");
+
+    std::fs::write(wc.path().join("c.txt"), "<<<<<<< a\n=======\n>>>>>>> b\n").unwrap();
+    let out = leep.run(wc.path(), &["commit", "-m", "y", "--allow-markers"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(
+        !text(&out.stderr).contains("warning"),
+        "{}",
+        text(&out.stderr)
+    );
+}
+
+/// `--trailer` and `commit.trailers` in `.leep/config.json` append trailers
+/// to the message, config first.
+#[test]
+fn commit_appends_trailers_from_config_and_flags() {
+    let leep = Leep::new();
+    let mock = Mock::start();
+    mock.seed(None, &[("a.txt", "one\n", FileKind::Regular)], &[]);
+    let wc = init(&leep, &mock);
+    let cfg = wc.path().join(".leep/config.json");
+    let mut v: serde_json::Value = serde_json::from_slice(&std::fs::read(&cfg).unwrap()).unwrap();
+    v["commit"] = serde_json::json!({
+        "trailers": ["Co-Authored-By: Claude <noreply@anthropic.com>"]
+    });
+    std::fs::write(&cfg, serde_json::to_vec(&v).unwrap()).unwrap();
+    std::fs::write(wc.path().join("a.txt"), "two\n").unwrap();
+    leep.ok(
+        wc.path(),
+        &[
+            "commit",
+            "-m",
+            "cli: change a\n\nWhy.",
+            "--trailer",
+            "Refs=#12",
+        ],
+    );
+    let tip = head_of(&leep, wc.path());
+    assert_eq!(
+        mock.data.lock().unwrap().changesets[&tip].message,
+        "cli: change a\n\nWhy.\n\nCo-Authored-By: Claude <noreply@anthropic.com>\nRefs: #12"
+    );
+    std::fs::write(wc.path().join("a.txt"), "three\n").unwrap();
+    let out = leep.run(wc.path(), &["commit", "-m", "x", "--trailer", "bad key=v"]);
+    assert_eq!(out.status.code(), Some(1));
+}
+
+fn head_of(leep: &Leep, wc: &Path) -> ChangesetId {
+    text(&leep.run(wc, &["--json", "status"]).stdout)
+        .parse::<serde_json::Value>()
+        .unwrap()["base"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap()
 }
 
 #[test]
@@ -495,4 +592,141 @@ fn a_checkout_forgets_the_conflicted_land() {
     let state: serde_json::Value =
         serde_json::from_slice(&std::fs::read(b.path().join(".leep/state.json")).unwrap()).unwrap();
     assert!(state.get("resolving").is_none(), "{state}");
+}
+
+/// A land that needs review is a step of the workflow: the person reads
+/// which paths wait for whom and which `OWNERS` file named them, without the
+/// HTTP status or a request id; `--json` keeps both.
+#[test]
+fn a_land_refused_for_review_reads_as_guidance() {
+    let leep = Leep::new();
+    let mock = Mock::start();
+    mock.seed(None, &[("a.txt", "one\n", FileKind::Regular)], &[]);
+    {
+        let mut d = mock.data.lock().unwrap();
+        d.require_review.insert("main".into());
+        d.codes = true;
+        d.review_owners = (
+            vec!["rhea".into()],
+            vec!["src/OWNERS".into(), "OWNERS".into()],
+        );
+    }
+    let wc = init(&leep, &mock);
+    std::fs::write(wc.path().join("a.txt"), "two\n").unwrap();
+    leep.ok(wc.path(), &["commit", "-m", "change"]);
+    let out = leep.run(wc.path(), &["land"]);
+    assert_eq!(out.status.code(), Some(1));
+    let err = text(&out.stderr);
+    assert!(
+        err.contains("needs review before it can land on main:\n  PENDING  a.txt  needs one of: rhea (from src/OWNERS, OWNERS)\n"),
+        "{err}"
+    );
+    assert!(
+        err.contains("hint: ask one to run `leep review approve "),
+        "{err}"
+    );
+    assert!(
+        !err.contains("422") && !err.contains("Unprocessable"),
+        "{err}"
+    );
+    assert!(!err.contains("request id"), "{err}");
+
+    let out = leep.run(wc.path(), &["--json", "land"]);
+    assert_eq!(out.status.code(), Some(1));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let e = &v["error"];
+    assert_eq!(e["server_code"], "needs_review");
+    assert!(
+        e["message"]
+            .as_str()
+            .unwrap()
+            .contains("(422 Unprocessable Entity)"),
+        "{e}"
+    );
+    assert!(e["request_id"].is_string(), "{e}");
+    assert!(
+        e["hint"].as_str().unwrap().contains("leep review request"),
+        "{e}"
+    );
+}
+
+/// `review show` puts a change under review on one page: request, message,
+/// author, per-path status with its stat, and `--diff` for the diff.
+#[test]
+fn review_show_puts_request_status_and_stat_together() {
+    use leep_core::api::{ReviewRequest, ReviewRequestEntry, ReviewRequestState};
+    let leep = Leep::new();
+    let mock = Mock::start();
+    let root = mock.seed(None, &[("a.txt", "one\ntwo\n", FileKind::Regular)], &[]);
+    let wc = init(&leep, &mock);
+    std::fs::write(wc.path().join("a.txt"), "one\nthree\nfour\n").unwrap();
+    leep.ok(wc.path(), &["commit", "-m", "cli: change a\n\nbecause"]);
+    let id = head_of(&leep, wc.path());
+    {
+        let mut d = mock.data.lock().unwrap();
+        d.review_owners = (vec!["rhea".into()], vec!["OWNERS".into()]);
+        d.review_requests.push(ReviewRequestEntry {
+            request: ReviewRequest {
+                id: 3,
+                changeset: id,
+                target_ref: "main".into(),
+                requester: "ada".into(),
+                reviewers: vec!["rhea".into()],
+                message: "please look".into(),
+                created: 0,
+                state: ReviewRequestState::Open,
+                closed: None,
+                landed_as: None,
+            },
+            created_by: None,
+            title: None,
+            approved_by: vec![],
+            rejected_by: vec![],
+            paths: vec![],
+            changed: 0,
+        });
+    }
+    let _ = root;
+    for arg in ["#3", "3", &id.to_string()[..12]] {
+        let out = leep.ok(wc.path(), &["review", "show", arg]);
+        assert!(
+            out.starts_with(&format!("changeset {id}\nAuthor: tester\n")),
+            "{out}"
+        );
+        assert!(
+            out.contains("\n    cli: change a\n\n    because\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("#3 open ") && out.contains("    > please look"),
+            "{out}"
+        );
+        assert!(
+            out.contains("  PENDING  a.txt  +2 -1       needs one of: rhea (from OWNERS)"),
+            "{out}"
+        );
+        assert!(
+            out.contains("1 file changed, 2 insertions(+), 1 deletion(-)"),
+            "{out}"
+        );
+        assert!(!out.contains("+three"), "{out}");
+    }
+    let out = leep.ok(wc.path(), &["review", "show", "#3", "--diff"]);
+    assert!(out.contains("+three\n+four\n"), "{out}");
+    let v: serde_json::Value =
+        serde_json::from_str(&leep.ok(wc.path(), &["--json", "review", "show", "3"])).unwrap();
+    assert_eq!(v["requests"][0]["id"], 3);
+    assert_eq!(
+        v["stat"][0],
+        serde_json::json!({"path": "a.txt", "added": 2, "removed": 1})
+    );
+    assert_eq!(
+        v["status"]["paths"][0]["owners_files"],
+        serde_json::json!(["OWNERS"])
+    );
+    // `#N` that does not exist is not found; plain digits fall back to a revision.
+    assert_eq!(
+        leep.run(wc.path(), &["review", "show", "#9"]).status.code(),
+        Some(4)
+    );
 }

@@ -46,6 +46,13 @@ pub struct CommitArgs {
     /// Sign the changeset with this private key file (from `leep keygen`).
     #[arg(long, env = "LEEP_SIGNING_KEY", value_name = "KEYFILE")]
     pub sign: Option<PathBuf>,
+    /// Append the trailer `KEY: VALUE` to the message (repeatable), after
+    /// those `commit.trailers` in `.leep/config.json` names.
+    #[arg(long = "trailer", value_name = "KEY=VALUE")]
+    pub trailers: Vec<String>,
+    /// Do not warn about files that look like a conflict left unresolved.
+    #[arg(long)]
+    pub allow_markers: bool,
 }
 
 fn author(ctx: &Ctx, args: &CommitArgs) -> Result<String> {
@@ -128,6 +135,15 @@ pub fn run(ctx: &mut Ctx, args: &CommitArgs) -> Result<i32> {
             resolving(ctx, merge.is_none() && pick.is_none()).and_then(|r| r.message.clone())
         })
         .ok_or_else(|| CliError::user("a commit message is required (-m)"))?;
+    let message = with_trailers(&message, &trailers(ctx, args)?);
+    if !args.allow_markers {
+        for (path, line) in leftover_markers(ctx, &st) {
+            eprintln!(
+                "warning: {path}:{line}: a `<<<<<<<`, `=======`, `>>>>>>>` conflict looks \
+                 unresolved; committing it anyway (`--allow-markers` silences this)"
+            );
+        }
+    }
 
     let changes = snapshot::upload_changes(ctx, &st)?;
 
@@ -212,6 +228,105 @@ pub fn run(ctx: &mut Ctx, args: &CommitArgs) -> Result<i32> {
     Ok(0)
 }
 
+/// Largest file the conflict marker check reads.
+const MAX_MARKER_SCAN: u64 = 8 << 20;
+
+/// Files to be committed that hold a whole conflict as the CLI writes one,
+/// with the line of its `<<<<<<< `: likely a resolution that kept its
+/// markers. Symlinks, binary files and very large ones are not read; a
+/// file that cannot be read is skipped (the upload reports it).
+fn leftover_markers(ctx: &Ctx, st: &crate::status::Status) -> Vec<(String, usize)> {
+    use crate::status::Change;
+    let mut out = Vec::new();
+    for e in &st.entries {
+        let Some(now) = &e.now else { continue };
+        if !matches!(e.change, Change::Added | Change::Modified)
+            || now.kind == leep_core::FileKind::Symlink
+            || now.size > MAX_MARKER_SCAN
+        {
+            continue;
+        }
+        let Ok(data) = std::fs::read(ctx.wc.abs(&e.path)) else {
+            continue;
+        };
+        if data.contains(&0) {
+            continue;
+        }
+        if let Some(line) = crate::markers::unresolved(&String::from_utf8_lossy(&data)) {
+            out.push((e.path.clone(), line));
+        }
+    }
+    out
+}
+
+/// The trailers to append: `commit.trailers` from `.leep/config.json`, then
+/// `--trailer`s, as `Key: value` lines.
+fn trailers(ctx: &Ctx, args: &CommitArgs) -> Result<Vec<String>> {
+    let from_config = ctx.wc.config.commit.trailers.iter().map(|t| {
+        parse_trailer(t)
+            .map_err(|why| CliError::user(format!("`commit.trailers` in .leep/config.json: {why}")))
+    });
+    let from_args = args
+        .trailers
+        .iter()
+        .map(|t| parse_trailer(t).map_err(|why| CliError::user(format!("--trailer: {why}"))));
+    from_config.chain(from_args).collect()
+}
+
+/// `Key=value` or `Key: value` as the trailer line `Key: value`. A key is
+/// letters, digits and `-`; the value is one non-empty line.
+pub fn parse_trailer(t: &str) -> std::result::Result<String, String> {
+    let split = t
+        .find([':', '='])
+        .ok_or_else(|| format!("{t:?} is no KEY=VALUE"))?;
+    let (key, value) = (t[..split].trim(), t[split + 1..].trim());
+    if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return Err(format!(
+            "{t:?}: the key must be letters, digits and `-`, like Co-Authored-By"
+        ));
+    }
+    if value.is_empty() || value.contains(['\n', '\r']) {
+        return Err(format!("{t:?}: the value must be one non-empty line"));
+    }
+    Ok(format!("{key}: {value}"))
+}
+
+/// Whether `line` reads as a trailer, `Key: value`.
+fn is_trailer_line(line: &str) -> bool {
+    line.split_once(": ").is_some_and(|(k, v)| {
+        !k.is_empty()
+            && !v.trim().is_empty()
+            && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    })
+}
+
+/// `message` with `trailers` appended, git style: in the message's own
+/// trailer block when its last paragraph is one, else in a new paragraph.
+/// A trailer the message already has is not repeated.
+pub fn with_trailers(message: &str, trailers: &[String]) -> String {
+    let message = message.trim_end();
+    let mut new: Vec<&str> = Vec::new();
+    for t in trailers {
+        let have = message.lines().any(|l| l.trim_end() == t) || new.contains(&t.as_str());
+        if !have {
+            new.push(t);
+        }
+    }
+    if new.is_empty() {
+        return message.to_string();
+    }
+    let last = message.rsplit("\n\n").next().unwrap_or("");
+    let in_block = message.contains("\n\n") && last.lines().all(is_trailer_line);
+    let sep = if message.is_empty() {
+        ""
+    } else if in_block {
+        "\n"
+    } else {
+        "\n\n"
+    };
+    format!("{message}{sep}{}", new.join("\n"))
+}
+
 /// What `leep commit` prints to stdout and to stderr. On a terminal one
 /// line says it all; piped, stdout is the full id alone, for scripts
 /// (`id=$(leep commit -m ...)`), and the summary goes to stderr.
@@ -228,6 +343,47 @@ mod tests {
     use leep_core::Hash;
 
     use super::*;
+
+    #[test]
+    fn trailers_parse_from_either_form_and_refuse_bad_keys() {
+        assert_eq!(
+            parse_trailer("Co-Authored-By=Claude <noreply@anthropic.com>"),
+            Ok("Co-Authored-By: Claude <noreply@anthropic.com>".into())
+        );
+        assert_eq!(parse_trailer("Refs: #12"), Ok("Refs: #12".into()));
+        // The first separator splits: a value may hold either.
+        assert_eq!(parse_trailer("Link=a:b=c"), Ok("Link: a:b=c".into()));
+        for bad in ["novalue", "=x", "Bad Key=x", "K=", "K=a\nb"] {
+            assert!(parse_trailer(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn trailers_join_the_message_s_own_block_and_are_not_repeated() {
+        let co = "Co-Authored-By: Claude <noreply@anthropic.com>".to_string();
+        let refs = "Refs: #12".to_string();
+        assert_eq!(
+            with_trailers("cli: add x\n", std::slice::from_ref(&co)),
+            format!("cli: add x\n\n{co}")
+        );
+        assert_eq!(
+            with_trailers(
+                "cli: add x\n\nwhy\n\nRefs: #12\n",
+                &[co.clone(), refs.clone()]
+            ),
+            format!("cli: add x\n\nwhy\n\nRefs: #12\n{co}")
+        );
+        // A subject that looks like a trailer is no trailer block.
+        assert_eq!(
+            with_trailers("cli: add x", std::slice::from_ref(&refs)),
+            "cli: add x\n\nRefs: #12"
+        );
+        assert_eq!(with_trailers("m", &[]), "m");
+        assert_eq!(
+            with_trailers("m", &[refs.clone(), refs.clone()]),
+            "m\n\nRefs: #12"
+        );
+    }
 
     #[test]
     fn a_terminal_gets_one_line_and_a_pipe_the_full_id() {

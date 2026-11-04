@@ -127,6 +127,53 @@ pub fn relabel(text: &str, labels: &Labels) -> String {
     out
 }
 
+/// The 1-based line of the first conflict `text` still holds whole, as
+/// the CLI writes one: a line starting `<<<<<<< `, later a line that is
+/// exactly `=======`, later one starting `>>>>>>> `. A Markdown or
+/// reStructuredText heading underlined with `=======` alone is no conflict.
+pub fn unresolved(text: &str) -> Option<usize> {
+    let mut start = None;
+    let mut split = false;
+    for (i, line) in text.lines().enumerate() {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if line.starts_with("<<<<<<< ") {
+            start = Some(i + 1);
+            split = false;
+        } else if start.is_some() && line == SPLIT {
+            split = true;
+        } else if split && line.starts_with(">>>>>>> ") {
+            return start;
+        }
+    }
+    None
+}
+
+/// Whether every conflict of the server's diff3 `text` has an empty base
+/// section: both sides only added lines at one place. Keeping both sides
+/// whole, one side's lines first in every region, is then a union (ADR
+/// 0089), which carries the reviewed change's verdicts. `false` without a
+/// conflict or without base sections to tell.
+pub fn only_insertions(text: &str) -> bool {
+    let mut regions = 0;
+    // 0 outside, 1 ours, 2 just after the base line, 3 theirs.
+    let mut state = 0;
+    for line in text.lines() {
+        match state {
+            0 if line == OURS => state = 1,
+            1 if line.starts_with(BASE) => state = 2,
+            1 if line == SPLIT => return false,
+            2 if line == SPLIT => {
+                regions += 1;
+                state = 3;
+            }
+            2 => return false,
+            3 if line == THEIRS => state = 0,
+            _ => {}
+        }
+    }
+    regions > 0 && state == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,6 +227,42 @@ mod tests {
         let custom = "<<<<<<< HEAD\na\n=======\nb\n>>>>>>> other\n";
         assert_eq!(relabel(custom, &Labels::landed("main")), custom);
         assert_eq!(relabel("", &Labels::landed("main")), "");
+    }
+
+    #[test]
+    fn a_whole_conflict_is_unresolved_and_a_setext_heading_is_not() {
+        assert_eq!(
+            unresolved("a\n<<<<<<< yours\nx\n=======\ny\n>>>>>>> main (landed)\n"),
+            Some(2)
+        );
+        assert_eq!(
+            unresolved("<<<<<<< a\r\nx\r\n=======\r\n>>>>>>> b\r\n"),
+            Some(1)
+        );
+        // Markdown headings, and pieces out of order or missing, are not.
+        assert_eq!(unresolved("Title\n=======\n\ntext\n"), None);
+        assert_eq!(unresolved("=======\n<<<<<<< a\n>>>>>>> b\n"), None);
+        assert_eq!(unresolved("<<<<<<< a\nx\n>>>>>>> b\n=======\n"), None);
+        assert_eq!(unresolved("<<<<<<<a\n=======\n>>>>>>> b\n"), None);
+        // The nearest start before the split counts.
+        assert_eq!(
+            unresolved("<<<<<<< a\n<<<<<<< b\n=======\n>>>>>>> c\n"),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn only_insertions_needs_every_base_section_empty() {
+        let both_added = "<<<<<<< ours\nx\n||||||| original\n=======\ny\n>>>>>>> theirs\n";
+        assert!(only_insertions(both_added));
+        assert!(only_insertions(&format!("a\n{both_added}b\n{both_added}")));
+        assert!(!only_insertions(SERVER), "a base line was edited");
+        assert!(!only_insertions(&format!("{both_added}{SERVER}")));
+        // diff2 style: nothing to tell by.
+        assert!(!only_insertions(
+            "<<<<<<< ours\nx\n=======\ny\n>>>>>>> theirs\n"
+        ));
+        assert!(!only_insertions("plain\n"));
     }
 
     #[test]
