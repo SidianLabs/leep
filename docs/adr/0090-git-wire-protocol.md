@@ -139,6 +139,25 @@ The design, phase by phase:
    bridge would be its own ADR.
 7. Garbage collection roots for sealed packs (phase 3).
 8. Deferred: SHA-256, annotated tags, atomic pushes.
+9. **Paths git refuses.** Leep accepts repository path components that git
+   does not: `.git` in any case and in its HFS+ (ignorable code points) and
+   NTFS (`git~1`, trailing dots and spaces, alternate data streams)
+   spellings, a backslash, and Windows device names. The CLI already
+   refuses to write them into a working copy (SECURITY-REVIEW S-02,
+   `leep-cli` `state.rs` `check_repo_path`), but the server stores them.
+   - **Requirement for phases 1 and 2.** `receive-pack` refuses a pushed
+     tree that `git fsck` would flag (`hasDotgit` and its variants, and the
+     other tree-name checks), with an `ng` line naming the path; the fetch
+     side refuses to serve a commit whose tree holds such a path, with a
+     clear error naming it, rather than send a pack clients reject or check
+     out unsafely.
+   - **Known gap, to close in phase 2.** `leep-git export` and the mirror
+     already turn such a changeset into a git tree today (and phase 0's
+     `git-tree-v1` derives an id for it). GitHub rejects that push, and the
+     mirror's ref stalls in a retry loop. Phase 2 makes export and the
+     mirror refuse such a changeset with a clear error (a mirror ref
+     reports it as its state instead of retrying), using the same check as
+     `receive-pack`.
 
 ## Consequences
 - One codec for every git path, so imports, the mirror, `leep-git export`
