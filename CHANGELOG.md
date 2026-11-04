@@ -16,6 +16,9 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 - **Tests.** The `/v1` compat tests in `leep-core` now cover every optional field added after the original shapes (`land_id`, `created_by`, `carried_from`, and more): old JSON without them still decodes, and their serialized names are frozen.
 
+### Postgres test URL helper handles URLs without a path
+- **Fixed.** The snapshot tests' `replace_db` mangled a Postgres URL with no database path and left a `dbname=` query parameter pointing at the old database; it now handles both and has unit tests.
+
 ### Review verdicts carry across identical rebases; policy refusals are 422
 - **Changed.** A reviewer's approve or reject of a changeset X now counts
   for a changeset Y that names X in `leep.rebased_from` (a hint, followed to

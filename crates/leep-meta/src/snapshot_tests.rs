@@ -691,17 +691,95 @@ struct PgDb {
 }
 
 /// `admin` with only the database name swapped, so user, host, port and
-/// query parameters (a Unix-socket `host=`) carry over.
+/// query parameters (a Unix-socket `host=`) carry over. A URL with no path
+/// gets one, and a `dbname=` query parameter (which sqlx lets override the
+/// path) is replaced too so the new name wins.
 fn replace_db(admin: &str, db: &str) -> String {
     let (base, query) = match admin.split_once('?') {
-        Some((b, q)) => (b, format!("?{q}")),
-        None => (admin, String::new()),
+        Some((b, q)) => (b, Some(q)),
+        None => (admin, None),
     };
-    let root = base
-        .rsplit_once('/')
-        .expect("postgres url has no database")
-        .0;
-    format!("{root}/{db}{query}")
+    let after_scheme = base.find("://").map_or(0, |i| i + 3);
+    let authority_end = base[after_scheme..]
+        .find('/')
+        .map_or(base.len(), |i| after_scheme + i);
+    let root = &base[..authority_end];
+    let mut out = format!("{root}/{db}");
+    if let Some(q) = query {
+        let q = q
+            .split('&')
+            .map(|kv| match kv.split_once('=') {
+                Some(("dbname", _)) => format!("dbname={db}"),
+                _ => kv.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join("&");
+        out.push('?');
+        out.push_str(&q);
+    }
+    out
+}
+
+#[test]
+fn replace_db_tcp() {
+    assert_eq!(
+        replace_db("postgres://leep@localhost:55432/postgres", "x"),
+        "postgres://leep@localhost:55432/x"
+    );
+}
+
+#[test]
+fn replace_db_unix_socket_keeps_query() {
+    assert_eq!(
+        replace_db(
+            "postgres://leep@localhost/postgres?host=/home/user/pgsock&port=55432",
+            "x"
+        ),
+        "postgres://leep@localhost/x?host=/home/user/pgsock&port=55432"
+    );
+}
+
+#[test]
+fn replace_db_credentials() {
+    assert_eq!(
+        replace_db("postgresql://me:p%2Fw%40rd@db.example:5432/postgres", "x"),
+        "postgresql://me:p%2Fw%40rd@db.example:5432/x"
+    );
+}
+
+#[test]
+fn replace_db_no_path() {
+    assert_eq!(
+        replace_db("postgres://leep@localhost:55432", "x"),
+        "postgres://leep@localhost:55432/x"
+    );
+    assert_eq!(
+        replace_db("postgres://leep@localhost/", "x"),
+        "postgres://leep@localhost/x"
+    );
+    assert_eq!(
+        replace_db("postgres://leep@localhost?host=/s&port=1", "x"),
+        "postgres://leep@localhost/x?host=/s&port=1"
+    );
+}
+
+#[test]
+fn replace_db_percent_encoded_old_name() {
+    assert_eq!(
+        replace_db("postgres://leep@localhost/my%20db%2Fx", "x"),
+        "postgres://leep@localhost/x"
+    );
+}
+
+#[test]
+fn replace_db_dbname_query() {
+    assert_eq!(
+        replace_db(
+            "postgres://leep@localhost/postgres?dbname=other&port=1",
+            "x"
+        ),
+        "postgres://leep@localhost/x?dbname=x&port=1"
+    );
 }
 
 impl PgDb {
