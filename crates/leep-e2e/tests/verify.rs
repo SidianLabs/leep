@@ -382,7 +382,7 @@ fn verify_and_repair_over_a_populated_sqlite_store() {
 #[test]
 fn verify_and_repair_over_a_populated_postgres_store() {
     let _g = serial();
-    let Some(db) = PgDb::create() else {
+    let Some(db) = PgDb::create("leep_e2e") else {
         return;
     };
     let tmp = tempfile::tempdir().unwrap();

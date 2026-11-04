@@ -275,7 +275,8 @@ async fn run(args: Args) -> Result<bool> {
         std::fs::create_dir_all(&blob_dir)?;
         let meta = match &admin {
             Some(u) => {
-                let db = ops::PgDb::create(u, &format!("{}_{}", std::process::id(), unix)).await?;
+                let db = ops::PgDb::create_in(u, &format!("leep_soak_{unix}"))
+                    .context("creating the soak database")?;
                 let url = db.url.clone();
                 pg = Some(db);
                 url
@@ -355,11 +356,12 @@ async fn run(args: Args) -> Result<bool> {
         clean_exit = Some(how);
     }
     let failed = result.as_ref().map_or(true, |ok| !*ok);
-    if let Some(db) = &pg {
+    if let Some(mut db) = pg {
         if args.keep_data || failed {
+            db.keep();
             eprintln!("kept database {} ({})", db.name, db.url);
         } else {
-            db.drop_db().await?;
+            db.close().context("dropping the soak database")?;
         }
     }
     if !args.keep_data && !failed {

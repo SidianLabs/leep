@@ -16,6 +16,7 @@ use leep_core::{
     BlobStore, Changeset, ChangesetId, Error, FileChange, FileKind, LandId, MetaStore, RepoPath,
 };
 use leep_derive::Repo;
+use leep_meta::pg_test::TestSchema;
 use leep_meta::{PostgresMetaStore, SqliteMetaStore};
 use tower::ServiceExt;
 
@@ -193,11 +194,11 @@ async fn land_ids_on_sqlite() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn land_ids_on_postgres() {
-    let Ok(url) = std::env::var("LEEP_TEST_POSTGRES_URL") else {
-        eprintln!("skipping: LEEP_TEST_POSTGRES_URL not set");
+    let Some(guard) = TestSchema::create("leep_test_land_ids") else {
         return;
     };
-    let schema = format!("leep_test_land_ids_{}", std::process::id());
+    let url = guard.url.clone();
+    let schema = guard.name.clone();
     let meta = PostgresMetaStore::connect_with_schema(&url, &schema)
         .await
         .unwrap();

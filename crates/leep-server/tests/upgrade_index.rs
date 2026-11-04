@@ -17,6 +17,7 @@ use leep_derive::integrity::{
     drop_kinds, plan_upgrade, run_upgrade, IndexStatus, Quiet, UpgradeOptions,
 };
 use leep_derive::Repo;
+use leep_meta::pg_test::TestSchema;
 use leep_meta::{PostgresMetaStore, SqliteMetaStore};
 use leep_testkit::{Fault, FaultPlan, FaultyMetaStore, Op};
 
@@ -202,11 +203,11 @@ async fn upgrade_index_on_sqlite() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn upgrade_index_on_postgres() {
-    let Ok(url) = std::env::var("LEEP_TEST_POSTGRES_URL") else {
-        eprintln!("skipping: LEEP_TEST_POSTGRES_URL not set");
+    let Some(guard) = TestSchema::create("leep_test_upgrade") else {
         return;
     };
-    let schema = format!("leep_test_upgrade_{}", std::process::id());
+    let url = guard.url.clone();
+    let schema = guard.name.clone();
     let meta = Arc::new(
         PostgresMetaStore::connect_with_schema(&url, &schema)
             .await

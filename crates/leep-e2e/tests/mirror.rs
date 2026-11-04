@@ -757,7 +757,7 @@ fn mirror_follows_lands_and_imports_pushes() {
 #[test]
 fn mirror_follows_lands_and_imports_pushes_postgres() {
     let _g = serial();
-    let Some(db) = PgDb::create() else {
+    let Some(db) = PgDb::create("leep_e2e") else {
         return;
     };
     let tmp = tempfile::tempdir().unwrap();

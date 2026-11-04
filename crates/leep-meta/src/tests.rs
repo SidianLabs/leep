@@ -6,6 +6,7 @@ use leep_core::{Changeset, MetaStore, RefUpdateContext};
 
 use super::*;
 use crate::drop::{Cursor, KEY_BATCH};
+use crate::pg_test::{replace_db, TestDb, TestSchema};
 
 pub(crate) fn cs(n: i64) -> Changeset {
     Changeset {
@@ -199,7 +200,7 @@ async fn sqlite_delete_kind_spans_batches() {
 
 #[tokio::test]
 async fn postgres_delete_kind_spans_batches() {
-    let Some((s, _)) = pg_store("batches").await else {
+    let Some((s, _schema)) = pg_store("batches").await else {
         return;
     };
     check_delete_kind_spans_batches(&s).await;
@@ -292,7 +293,7 @@ async fn sqlite_delete_paths() {
 
 #[tokio::test]
 async fn postgres_delete_paths() {
-    let Some((s, _)) = pg_store("delete_paths").await else {
+    let Some((s, _schema)) = pg_store("delete_paths").await else {
         return;
     };
     check_delete_paths(&s).await;
@@ -304,7 +305,7 @@ async fn postgres_delete_paths() {
 /// must stay a scan of the page range.
 #[tokio::test]
 async fn postgres_walk_plan_ignores_stale_estimates() {
-    let Some((s, _)) = pg_store("walk_plan").await else {
+    let Some((s, _schema)) = pg_store("walk_plan").await else {
         return;
     };
     let key = |kind: &str, n: u32| leep_core::Hash::of_blob(format!("{kind}/{n}").as_bytes());
@@ -463,7 +464,7 @@ async fn overlapping_batches_do_not_deadlock() {
     let url = format!("sqlite://{}?mode=rwc", dir.join("meta.db").display());
     check_overlapping_batches_do_not_deadlock(open_meta_store(&url).await.unwrap()).await;
     std::fs::remove_dir_all(&dir).ok();
-    if let Some((s, _)) = pg_store("overlap").await {
+    if let Some((s, _schema)) = pg_store("overlap").await {
         check_overlapping_batches_do_not_deadlock(Arc::new(s)).await;
     }
 }
@@ -518,7 +519,7 @@ async fn sqlite_delete_changesets_is_atomic() {
 
 #[tokio::test]
 async fn postgres_delete_changesets_is_atomic() {
-    let Some((s, _)) = pg_store("delatomic").await else {
+    let Some((s, _schema)) = pg_store("delatomic").await else {
         return;
     };
     sqlx::query(
@@ -552,7 +553,7 @@ async fn sqlite_batched_writes_are_atomic() {
 
 #[tokio::test]
 async fn postgres_batched_writes_are_atomic() {
-    let Some((s, _)) = pg_store("atomic").await else {
+    let Some((s, _schema)) = pg_store("atomic").await else {
         return;
     };
     sqlx::query(
@@ -580,55 +581,14 @@ async fn open_dispatch() {
     assert!(open_meta_store("bogus://x").await.is_err());
 }
 
-pub(crate) fn pg_url() -> Option<String> {
-    let url = std::env::var("LEEP_TEST_POSTGRES_URL").ok();
-    if url.is_none() {
-        eprintln!("skipping: LEEP_TEST_POSTGRES_URL not set");
-    }
-    url
-}
-
-pub(crate) fn schema(name: &str) -> String {
-    format!("leep_test_{name}_{}", std::process::id())
-}
-
-/// A throwaway Postgres database, for tests that open a store by URL alone
-/// (and so in its `public` schema), which must not touch the shared
-/// database's: another build may have migrated it past this one.
-pub(crate) struct PgDb {
-    admin: String,
-    name: String,
-    pub(crate) url: String,
-}
-
-/// `admin` with only the database name swapped, so user, host, port and
-/// query parameters (a Unix-socket `host=`) carry over. A URL with no path
-/// gets one, and a `dbname=` query parameter (which sqlx lets override the
-/// path) is replaced too so the new name wins.
-fn replace_db(admin: &str, db: &str) -> String {
-    let (base, query) = match admin.split_once('?') {
-        Some((b, q)) => (b, Some(q)),
-        None => (admin, None),
-    };
-    let after_scheme = base.find("://").map_or(0, |i| i + 3);
-    let authority_end = base[after_scheme..]
-        .find('/')
-        .map_or(base.len(), |i| after_scheme + i);
-    let root = &base[..authority_end];
-    let mut out = format!("{root}/{db}");
-    if let Some(q) = query {
-        let q = q
-            .split('&')
-            .map(|kv| match kv.split_once('=') {
-                Some(("dbname", _)) => format!("dbname={db}"),
-                _ => kv.to_string(),
-            })
-            .collect::<Vec<_>>()
-            .join("&");
-        out.push('?');
-        out.push_str(&q);
-    }
-    out
+/// A store in a schema of its own, dropped with the guard: bind the guard
+/// to a name (`_schema`, not `_`) so it lives to the end of the test.
+pub(crate) async fn pg_store(name: &str) -> Option<(PostgresMetaStore, TestSchema)> {
+    let schema = TestSchema::create(&format!("leep_test_{name}"))?;
+    let s = PostgresMetaStore::connect_with_schema(&schema.url, &schema.name)
+        .await
+        .unwrap();
+    Some((s, schema))
 }
 
 #[test]
@@ -693,52 +653,97 @@ fn replace_db_dbname_query() {
     );
 }
 
-impl PgDb {
-    pub(crate) async fn create(tag: &str) -> Option<PgDb> {
-        let admin = pg_url()?;
-        let name = format!("leep_test_{tag}_{}", std::process::id());
-        let mut c = <sqlx::PgConnection as sqlx::Connection>::connect(&admin)
+/// Runs `body` as a `#[tokio::test]` would, on a thread of its own, and
+/// returns whether it panicked.
+fn panics_like_a_test<F>(body: F) -> bool
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    std::thread::spawn(move || {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(body)
+    })
+    .join()
+    .is_err()
+}
+
+/// A failing test leaves no schema behind, though its store is still open
+/// and one of its connections idles in a transaction holding a lock on a
+/// table of the schema, which would make a plain `DROP SCHEMA` wait.
+#[test]
+fn postgres_test_schema_is_dropped_when_the_test_panics() {
+    use crate::pg_test::schema_exists;
+    let Some(admin) = crate::pg_test::admin_url() else {
+        return;
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    let panicked = panics_like_a_test(async move {
+        let (s, schema) = pg_store("guard_panic").await.unwrap();
+        tx.send(schema.name.clone()).unwrap();
+        s.put_changeset(&cs(1)).await.unwrap();
+        let mut held = s.pool.begin().await.unwrap();
+        sqlx::query("LOCK TABLE changesets IN ACCESS SHARE MODE")
+            .execute(&mut *held)
             .await
             .unwrap();
-        sqlx::query(sqlx::AssertSqlSafe(format!(
-            "DROP DATABASE IF EXISTS {name} WITH (FORCE)"
-        )))
-        .execute(&mut c)
-        .await
-        .unwrap();
-        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}")))
+        panic!("a failing test");
+    });
+    assert!(panicked);
+    let name = rx.recv().unwrap();
+    assert!(!schema_exists(&admin, &name), "{name} was left behind");
+
+    // And a passing one, whose store outlives the guard.
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (s, schema) = rt.block_on(pg_store("guard_pass")).unwrap();
+    let name = schema.name.clone();
+    assert!(schema_exists(&admin, &name));
+    drop(schema);
+    assert!(!schema_exists(&admin, &name), "{name} was left behind");
+    drop(s);
+}
+
+/// The same for a database: a failing test's is dropped with its store
+/// open, and one kept on purpose stays until it is dropped by hand.
+#[test]
+fn postgres_test_db_is_dropped_when_the_test_panics() {
+    use crate::pg_test::database_exists;
+    let Some(admin) = crate::pg_test::admin_url() else {
+        return;
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    let panicked = panics_like_a_test(async move {
+        let db = TestDb::create("leep_test_guard_panic").unwrap();
+        tx.send(db.name.clone()).unwrap();
+        let m = open_meta_store(&db.url).await.unwrap();
+        m.list_refs().await.unwrap();
+        panic!("a failing test");
+    });
+    assert!(panicked);
+    let name = rx.recv().unwrap();
+    assert!(!database_exists(&admin, &name), "{name} was left behind");
+
+    let mut kept = TestDb::create("leep_test_guard_keep").unwrap();
+    kept.keep();
+    let name = kept.name.clone();
+    drop(kept);
+    assert!(database_exists(&admin, &name));
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        use sqlx::Connection;
+        let mut c = sqlx::PgConnection::connect(&admin).await.unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE {name}")))
             .execute(&mut c)
             .await
             .unwrap();
-        let url = replace_db(&admin, &name);
-        Some(PgDb { admin, name, url })
-    }
-
-    pub(crate) async fn drop_db(self) {
-        let mut c = <sqlx::PgConnection as sqlx::Connection>::connect(&self.admin)
-            .await
-            .unwrap();
-        sqlx::query(sqlx::AssertSqlSafe(format!(
-            "DROP DATABASE IF EXISTS {} WITH (FORCE)",
-            self.name
-        )))
-        .execute(&mut c)
-        .await
-        .unwrap();
-    }
-}
-
-pub(crate) async fn pg_store(name: &str) -> Option<(PostgresMetaStore, String)> {
-    let url = pg_url()?;
-    let s = PostgresMetaStore::connect_with_schema(&url, &schema(name))
-        .await
-        .unwrap();
-    Some((s, url))
+    });
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn postgres_leases() {
-    let Some((s, _)) = pg_store("leases").await else {
+    let Some((s, _schema)) = pg_store("leases").await else {
         return;
     };
     check_lease_contract(&s).await;
@@ -757,7 +762,7 @@ async fn sqlite_leases() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn postgres_review_requests() {
-    let Some((s, _)) = pg_store("review_requests").await else {
+    let Some((s, _schema)) = pg_store("review_requests").await else {
         return;
     };
     assert!(s.supports_review_requests());
@@ -785,28 +790,28 @@ async fn sqlite_review_requests() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn postgres_contract() {
-    let Some((s, url)) = pg_store("contract").await else {
+    let Some((s, schema)) = pg_store("contract").await else {
         return;
     };
     check_meta_store_contract(&s).await;
     // Re-running migrations is a no-op.
-    PostgresMetaStore::connect_with_schema(&url, &schema("contract"))
+    PostgresMetaStore::connect_with_schema(&schema.url, &schema.name)
         .await
         .unwrap();
-    let db = PgDb::create("contract").await.unwrap();
+    let db = TestDb::create("leep_test_contract").unwrap();
     let m = open_meta_store(&db.url).await.unwrap();
     m.list_refs().await.unwrap();
     drop(m);
-    db.drop_db().await;
+    drop(db);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn postgres_cas_race() {
-    let Some((s, _)) = pg_store("race").await else {
+    let Some((s, _schema)) = pg_store("race").await else {
         return;
     };
     check_cas_race(Arc::new(s)).await;
-    let Some((s, _)) = pg_store("lograce").await else {
+    let Some((s, _schema)) = pg_store("lograce").await else {
         return;
     };
     check_ref_log_race(Arc::new(s)).await;
@@ -895,7 +900,7 @@ async fn cancelled_ref_moves_never_split_ref_and_log() {
     let s = SqliteMetaStore::connect(&url).await.unwrap();
     check_cancelled_cas_keeps_ref_and_log_together(Arc::new(s)).await;
     std::fs::remove_dir_all(&dir).ok();
-    if let Some((s, _)) = pg_store("cancel").await {
+    if let Some((s, _schema)) = pg_store("cancel").await {
         check_cancelled_cas_keeps_ref_and_log_together(Arc::new(s)).await;
     }
 }
@@ -913,7 +918,7 @@ async fn quiet_fault_wrapper_passes_contract() {
 /// statistics, and counts a large kind the statistics do not know yet.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn postgres_estimates_large_kinds() {
-    let Some((s, _)) = pg_store("estimate").await else {
+    let Some((s, _schema)) = pg_store("estimate").await else {
         return;
     };
     let fill = |kind: &'static str, n: i64| {
@@ -980,7 +985,7 @@ async fn write_rows_every_way(store: &dyn MetaStore, tag: &str) -> Vec<leep_core
 /// still replaces it (last write wins, as `review-v1` relies on).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn postgres_identical_upserts_keep_row_versions() {
-    let Some((s, _)) = pg_store("upsert").await else {
+    let Some((s, _schema)) = pg_store("upsert").await else {
         return;
     };
     let versions = |keys: Vec<leep_core::Hash>| {
@@ -1073,9 +1078,10 @@ async fn cancel(url: &str, tag: &str) {
 /// so Postgres runs the statement to its end.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn postgres_a_dropped_query_keeps_running_without_a_statement_timeout() {
-    let Some((s, url)) = pg_store("orphan").await else {
+    let Some((s, schema)) = pg_store("orphan").await else {
         return;
     };
+    let url = schema.url.clone();
     let tag = format!("leep-orphan-{}", std::process::id());
     let q = format!("SELECT pg_sleep(20) /* {tag} */");
     let dropped = tokio::time::timeout(
@@ -1092,12 +1098,13 @@ async fn postgres_a_dropped_query_keeps_running_without_a_statement_timeout() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn postgres_statement_timeout_bounds_the_data_pool_only() {
-    let Some(url) = pg_url() else {
+    let Some(sc) = TestSchema::create("leep_test_stmt_timeout") else {
         return;
     };
+    let url = sc.url.clone();
     let s = PostgresMetaStore::connect_with_schema_and_timeout(
         &url,
-        &schema("stmt_timeout"),
+        &sc.name,
         std::time::Duration::from_millis(1500),
     )
     .await
@@ -1143,7 +1150,7 @@ async fn postgres_statement_timeout_bounds_the_data_pool_only() {
     check_meta_store_contract(&s).await;
     PostgresMetaStore::connect_with_schema_and_timeout(
         &url,
-        &schema("stmt_timeout"),
+        &sc.name,
         std::time::Duration::from_millis(1500),
     )
     .await
@@ -1158,10 +1165,11 @@ async fn postgres_land_lane_survives_a_saturated_pool() {
     use leep_core::lane::{scope, Lane};
     use leep_core::RefStep;
     use std::time::Duration;
-    let Some(url) = pg_url() else {
+    let Some(sc) = TestSchema::create("leep_test_land_lane") else {
         return;
     };
-    let s = PostgresMetaStore::connect_with_schema_and_lanes(&url, &schema("land_lane"), 2, 2)
+    let url = sc.url.clone();
+    let s = PostgresMetaStore::connect_with_schema_and_lanes(&url, &sc.name, 2, 2)
         .await
         .unwrap();
     assert_eq!(s.land_pool_size(), 2);
@@ -1217,18 +1225,19 @@ async fn postgres_land_lane_survives_a_saturated_pool() {
 async fn postgres_land_lane_sizes() {
     use leep_core::lane::{scope, Lane};
     use std::time::Duration;
-    let Some(url) = pg_url() else {
+    let Some(sc) = TestSchema::create("leep_test_land_sizes") else {
         return;
     };
+    let url = sc.url.clone();
     assert_eq!(crate::default_land_pool_size(16), 4);
     assert_eq!(crate::default_land_pool_size(32), 4);
     assert_eq!(crate::default_land_pool_size(80), 10);
-    let s = PostgresMetaStore::connect_with_schema(&url, &schema("land_sizes"))
+    let s = PostgresMetaStore::connect_with_schema(&url, &sc.name)
         .await
         .unwrap();
     assert_eq!(s.land_pool_size(), 4);
     drop(s);
-    let s = PostgresMetaStore::connect_with_schema_and_lanes(&url, &schema("land_sizes"), 1, 0)
+    let s = PostgresMetaStore::connect_with_schema_and_lanes(&url, &sc.name, 1, 0)
         .await
         .unwrap();
     assert_eq!(s.land_pool_size(), 0);
@@ -1254,10 +1263,11 @@ async fn postgres_land_lane_sizes() {
 async fn postgres_index_lane_survives_a_saturated_pool() {
     use leep_core::lane::{scope, Lane};
     use std::time::Duration;
-    let Some(url) = pg_url() else {
+    let Some(sc) = TestSchema::create("leep_test_index_lane") else {
         return;
     };
-    let s = PostgresMetaStore::connect_with_schema_and_pools(&url, &schema("index_lane"), 2, 0, 2)
+    let url = sc.url.clone();
+    let s = PostgresMetaStore::connect_with_schema_and_pools(&url, &sc.name, 2, 0, 2)
         .await
         .unwrap();
     assert_eq!(s.index_pool_size(), 2);
@@ -1306,18 +1316,19 @@ async fn postgres_index_lane_survives_a_saturated_pool() {
 async fn postgres_index_lane_sizes() {
     use leep_core::lane::{scope, Lane};
     use std::time::Duration;
-    let Some(url) = pg_url() else {
+    let Some(sc) = TestSchema::create("leep_test_index_sizes") else {
         return;
     };
+    let url = sc.url.clone();
     assert_eq!(crate::default_index_pool_size(16), 4);
     assert_eq!(crate::default_index_pool_size(32), 4);
     assert_eq!(crate::default_index_pool_size(128), 8);
-    let s = PostgresMetaStore::connect_with_schema(&url, &schema("index_sizes"))
+    let s = PostgresMetaStore::connect_with_schema(&url, &sc.name)
         .await
         .unwrap();
     assert_eq!(s.index_pool_size(), 4);
     drop(s);
-    let s = PostgresMetaStore::connect_with_schema_and_pools(&url, &schema("index_sizes"), 1, 4, 0)
+    let s = PostgresMetaStore::connect_with_schema_and_pools(&url, &sc.name, 1, 4, 0)
         .await
         .unwrap();
     assert_eq!(s.index_pool_size(), 0);
@@ -1340,10 +1351,11 @@ async fn postgres_index_lane_sizes() {
 /// pools: one data connection from the open, the rest on first use.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn postgres_warm_floor_opens_with_the_store() {
-    let Some(url) = pg_url() else {
+    let Some(sc) = TestSchema::create("leep_test_floor") else {
         return;
     };
-    let s = PostgresMetaStore::connect_with_schema_and_floor(&url, &schema("floor"), 8, 3)
+    let url = sc.url.clone();
+    let s = PostgresMetaStore::connect_with_schema_and_floor(&url, &sc.name, 8, 3)
         .await
         .unwrap();
     assert_eq!(s.land_pool_size(), 4);
@@ -1356,7 +1368,7 @@ async fn postgres_warm_floor_opens_with_the_store() {
     assert_eq!(s.open_connections()[1..], [3, 1, 1]);
     drop(s);
 
-    let s = PostgresMetaStore::connect_with_schema_and_floor(&url, &schema("floor"), 2, 9)
+    let s = PostgresMetaStore::connect_with_schema_and_floor(&url, &sc.name, 2, 9)
         .await
         .unwrap();
     assert_eq!(
@@ -1367,12 +1379,12 @@ async fn postgres_warm_floor_opens_with_the_store() {
     assert_eq!(s.data_pool_floor(), 2);
     drop(s);
 
-    let s = PostgresMetaStore::connect_with_schema(&url, &schema("floor"))
+    let s = PostgresMetaStore::connect_with_schema(&url, &sc.name)
         .await
         .unwrap();
     assert_eq!(s.open_connections()[1..], [0, 0, 0], "a lazy store");
     assert_eq!(s.data_pool_floor(), 0);
-    let s = PostgresMetaStore::connect_with_schema_and_floor(&url, &schema("floor"), 8, 0)
+    let s = PostgresMetaStore::connect_with_schema_and_floor(&url, &sc.name, 8, 0)
         .await
         .unwrap();
     assert_eq!(s.open_connections()[1..], [0, 0, 0], "a floor of 0 is lazy");

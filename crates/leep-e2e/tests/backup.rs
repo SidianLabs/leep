@@ -632,8 +632,10 @@ fn restore_drill_sqlite() {
 #[test]
 fn restore_drill_postgres() {
     let _g = serial();
-    let Some(src_db) = PgDb::create() else { return };
-    let dest_db = PgDb::create().unwrap();
+    let Some(src_db) = PgDb::create("leep_e2e") else {
+        return;
+    };
+    let dest_db = PgDb::create("leep_e2e").unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let work = tmp.path();
     let src = Stores::with_meta(&work.join("src"), src_db.url.clone());
@@ -646,8 +648,10 @@ fn restore_drill_postgres() {
 #[test]
 fn backups_restore_across_backends() {
     let _g = serial();
-    let Some(pg_src) = PgDb::create() else { return };
-    let pg_dest = PgDb::create().unwrap();
+    let Some(pg_src) = PgDb::create("leep_e2e") else {
+        return;
+    };
+    let pg_dest = PgDb::create("leep_e2e").unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let work = tmp.path();
     let keys = make_keys(work);
@@ -735,13 +739,13 @@ fn backup_and_restore_timing() {
         .unwrap_or(5_000);
     let tmp = tempfile::tempdir().unwrap();
     let work = tmp.path();
-    let pg = PgDb::create();
+    let pg = PgDb::create("leep_e2e");
     let mut variants = vec![(
         "sqlite",
         Stores::sqlite(&work.join("src-sqlite")),
         Stores::sqlite(&work.join("dest-sqlite")),
     )];
-    let pg_dest = pg.as_ref().map(|_| PgDb::create().unwrap());
+    let pg_dest = pg.as_ref().map(|_| PgDb::create("leep_e2e").unwrap());
     if let (Some(db), Some(dest)) = (&pg, &pg_dest) {
         variants.push((
             "postgres",

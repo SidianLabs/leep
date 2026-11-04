@@ -1007,7 +1007,7 @@ pub async fn check_review_request_contract(store: &dyn MetaStore) {
 /// Conformance checks for the lease methods (ADR 0056), for every
 /// `MetaStore` whose `supports_leases` is true: land coordination's scope and
 /// a sharded scope of another kind, and their independence. Sleeps for real
-/// (about a second in all), so the store's clock must be the system's.
+/// (a few tenths of a second), so the store's clock must be the system's.
 pub async fn check_lease_contract(store: &dyn MetaStore) {
     assert!(store.supports_leases());
     let land = LeaseKey::land("lease-contract/a");
@@ -1115,11 +1115,20 @@ async fn check_index_timing(store: &dyn MetaStore) {
 }
 
 /// The rules of one lease, under `key`.
+///
+/// Liveness is asserted only under `timing`, whose bounds no loaded machine
+/// stretches a step past; the lease goes stale under `short`, whose bound a
+/// sleep outlasts. Asserting both under one sub-second bound assumed the
+/// steps between them took less than it, which fails under load.
 async fn check_one_lease_scope(store: &dyn MetaStore, key: &LeaseKey, meta: &str) {
     use std::time::Duration;
     let timing = LeaseTiming {
-        ttl: Duration::from_millis(600),
-        stale_after: Duration::from_millis(300),
+        ttl: Duration::from_secs(120),
+        stale_after: Duration::from_secs(60),
+    };
+    let short = LeaseTiming {
+        stale_after: Duration::from_millis(50),
+        ..timing
     };
     let claim = |key, holder| LeaseClaim {
         key,
@@ -1137,13 +1146,13 @@ async fn check_one_lease_scope(store: &dyn MetaStore, key: &LeaseKey, meta: &str
     assert_eq!(got.address, "http://10.0.0.1:7070");
     assert_eq!(got.protocol, 1);
     assert_eq!(got.meta, meta);
-    assert!(got.is_live());
-    assert!(got.remaining <= timing.stale_after, "{got:?}");
+    // Counted from the claim's own stamp, however long the call took.
+    assert_eq!(got.remaining, timing.stale_after, "{got:?}");
 
     // A live lease of another holder is never taken; its own holder keeps it.
     let other = store.acquire_lease(&claim(a, "h2"), timing).await.unwrap();
     assert_eq!((other.holder.as_str(), other.epoch), ("h1", 1));
-    assert!(other.is_live());
+    assert!(other.is_live(), "{other:?}");
     let again = store.acquire_lease(&claim(a, "h1"), timing).await.unwrap();
     assert_eq!((again.holder.as_str(), again.epoch), ("h1", 1));
     let read = store.lease(a, timing).await.unwrap().unwrap();
@@ -1173,12 +1182,12 @@ async fn check_one_lease_scope(store: &dyn MetaStore, key: &LeaseKey, meta: &str
 
     // Not renewed for longer than `stale_after`, though its ttl has not run
     // out: another holder takes it, at the next epoch.
-    std::thread::sleep(Duration::from_millis(400));
-    let read = store.lease(a, timing).await.unwrap().unwrap();
+    std::thread::sleep(short.stale_after * 2);
+    let read = store.lease(a, short).await.unwrap().unwrap();
     assert!(!read.is_live(), "{read:?}");
-    let taken = store.acquire_lease(&claim(a, "h2"), timing).await.unwrap();
+    let taken = store.acquire_lease(&claim(a, "h2"), short).await.unwrap();
     assert_eq!((taken.holder.as_str(), taken.epoch), ("h2", 2));
-    assert!(taken.is_live());
+    assert_eq!(taken.remaining, short.stale_after, "{taken:?}");
     assert_eq!(
         store
             .renew_leases("h1", &[(a.clone(), 1)], timing)
@@ -1188,7 +1197,8 @@ async fn check_one_lease_scope(store: &dyn MetaStore, key: &LeaseKey, meta: &str
         "the old holder learns it lost the lease"
     );
     assert!(!store.release_lease(a, "h1", 1).await.unwrap());
-    assert!(store.lease(a, timing).await.unwrap().unwrap().is_live());
+    let read = store.lease(a, timing).await.unwrap().unwrap();
+    assert!(read.is_live(), "{read:?}");
 
     // A released lease can be taken at once, and its epoch keeps growing.
     assert!(store.release_lease(a, "h2", 2).await.unwrap());

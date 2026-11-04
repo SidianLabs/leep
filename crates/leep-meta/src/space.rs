@@ -188,7 +188,7 @@ mod tests {
 
     #[tokio::test]
     async fn postgres_reports_sizes_and_vacuums() {
-        let Some(db) = crate::tests::PgDb::create("space").await else {
+        let Some(db) = crate::pg_test::TestDb::create("leep_test_space") else {
             return;
         };
         let url = db.url.clone();
@@ -203,7 +203,6 @@ mod tests {
         assert!(f.database_bytes.unwrap() > 0);
         assert!(f.derived_bytes.unwrap() > 0);
         assert!(vacuum_analyze_derived(&url).await.unwrap());
-        db.drop_db().await;
     }
 }
 

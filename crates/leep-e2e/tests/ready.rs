@@ -55,7 +55,7 @@ fn ready_on_sqlite_without_a_token_even_when_tokens_are_required() {
 #[test]
 fn ready_on_postgres() {
     let _g = serial();
-    let Some(db) = PgDb::create() else {
+    let Some(db) = PgDb::create("leep_e2e") else {
         return;
     };
     let tmp = tempfile::tempdir().unwrap();
