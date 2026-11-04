@@ -205,6 +205,8 @@ impl Server {
             "leep_blame" => self.blame(args),
             "leep_search" => self.search(args),
             "leep_review_status" => self.review_status(args),
+            "leep_checks_status" => self.checks_status(args),
+            "leep_checks_culprits" => self.checks_culprits(args),
             "leep_reflog" => self.reflog(args),
             "leep_resolve" => self.resolve(args),
             "leep_merge_base" => self.merge_base(args),
@@ -398,6 +400,49 @@ pub fn definitions() -> Vec<Value> {
                     "ref": { "type": "string", "description": "Ref whose owners and head to judge against (default `main`)." }
                 },
                 "required": ["rev"],
+                "additionalProperties": false
+            }),
+            true,
+        ),
+        tool(
+            "leep_checks_status",
+            "Check status",
+            "Where a ref (default `main`) stands against the CI checks it requires: its \
+             `head`, its known-good ref `green/<ref>` (the newest changeset on its first-parent \
+             chain that passed every required check; only the server moves it), how many \
+             changesets `behind` green is, and `red` (the oldest failing changeset above green \
+             and the check) when the head fails. With `rev`, also that changeset's own results \
+             (`checks`: check, outcome, by, url) and the refs whose green holds it. Keep basing \
+             work on the ref's head; green is for deploys and for a tree known to build.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "ref": { "type": "string", "description": "Ref to report on (default `main`)." },
+                    "rev": { "type": "string", "description": "Also list this changeset's check results." }
+                },
+                "additionalProperties": false
+            }),
+            true,
+        ),
+        tool(
+            "leep_checks_culprits",
+            "Check failure suspects",
+            "The suspects for a failure on a ref (default `main`): the lands in the range above \
+             `good` (default: `green/<ref>`) up to the one that brought `bad` (default: the \
+             head), newest first, each with `changeset`, `seq`, `actor`, `created_by`, \
+             `agent_model`, `title` and the `paths` it changed. A suspect is not a verdict: a \
+             land whose test fails only together with a later one shows that later one too. \
+             `truncated` means finding `bad`'s land gave up at 1024 ref moves; `next`, when \
+             present, continues the list as `before`.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "ref": { "type": "string", "description": "Ref whose lands to list (default `main`)." },
+                    "bad": { "type": "string", "description": "The failing changeset or rev (default: the ref's head)." },
+                    "good": { "type": "string", "description": "The last changeset known to pass (default: `green/<ref>`)." },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 500, "description": "Max suspects (default 50)." },
+                    "before": { "type": "integer", "description": "The `next` value of the previous page, to continue it." }
+                },
                 "additionalProperties": false
             }),
             true,

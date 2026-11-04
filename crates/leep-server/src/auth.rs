@@ -13,8 +13,9 @@
 //!
 //! An entry may also carry request limits (`rate`, `burst`, `concurrency`,
 //! `max_body`; ADR 0020), see [`crate::limits`], `expires`, an RFC 3339
-//! time after which the token is refused, and `"review": false`, which takes
-//! a write token out of the reviewers (ADR 0011).
+//! time after which the token is refused, `"review": false`, which takes
+//! a write token out of the reviewers (ADR 0011), and `"checks": [...]`, the
+//! check names the token may post results for (ADR 0091; absent means none).
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -82,6 +83,8 @@ pub struct Principal {
     /// Whether the token may post reviews for a principal it names
     /// (`"review_for": true`, ADR 0063).
     pub review_for: bool,
+    /// Check names the token may post results for (ADR 0091), sorted.
+    pub checks: Vec<String>,
 }
 
 /// The request's [`Principal`], or `None` when authentication is off.
@@ -130,6 +133,10 @@ pub struct TokenEntry {
     /// (the git mirror's GitHub approvals, ADR 0063). Absent means no.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_for: Option<bool>,
+    /// Check names the token may post results for (CI; ADR 0091). Absent
+    /// means none: agent tokens must not attest their own changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checks: Option<Vec<String>>,
 }
 
 /// How far ahead `leep_tokens_expiring_soon` looks.
@@ -150,6 +157,7 @@ struct Known {
     expires: Option<jiff::Timestamp>,
     review: bool,
     review_for: bool,
+    checks: Vec<String>,
 }
 
 impl Known {
@@ -189,6 +197,8 @@ pub struct AuthChange {
     pub expiry_changed: Vec<String>,
     /// Gained or lost the right to review, or to review for others.
     pub review_changed: Vec<String>,
+    /// Gained or lost check names it may post results for.
+    pub checks_changed: Vec<String>,
 }
 
 impl AuthChange {
@@ -228,6 +238,7 @@ pub fn generate(name: &str, role: Role) -> Result<(String, TokenEntry), String> 
         expires: None,
         review: None,
         review_for: None,
+        checks: None,
     };
     Ok((token, entry))
 }
@@ -285,6 +296,24 @@ impl Auth {
                 .map(parse_expires)
                 .transpose()
                 .map_err(|e| format!("token {:?}: {e}", t.name))?;
+            let mut checks = t.checks.unwrap_or_default();
+            for c in &checks {
+                leep_core::check::check_name(c).map_err(|e| {
+                    format!(
+                        "token {:?}: {}",
+                        t.name,
+                        e.to_string().trim_start_matches("invalid input: ")
+                    )
+                })?;
+            }
+            checks.sort();
+            checks.dedup();
+            if !checks.is_empty() && t.role != Role::Write {
+                return Err(format!(
+                    "token {:?}: checks needs role write: posting a result is a write",
+                    t.name
+                ));
+            }
             tokens.push(Known {
                 name: t.name,
                 role: t.role,
@@ -294,6 +323,7 @@ impl Auth {
                 expires,
                 review: t.review.unwrap_or(true),
                 review_for: t.review_for.unwrap_or(false),
+                checks,
             });
         }
         Ok(Auth { tokens })
@@ -321,6 +351,20 @@ impl Auth {
             .filter(|k| k.role == Role::Write && k.review)
             .map(|k| k.name.clone())
             .collect()
+    }
+
+    /// Every check name some token may post, sorted: with the checks
+    /// policy's required names, the names a changeset's results are looked
+    /// up by.
+    pub fn check_names(&self) -> Vec<String> {
+        let mut all: Vec<String> = self
+            .tokens
+            .iter()
+            .flat_map(|k| k.checks.iter().cloned())
+            .collect();
+        all.sort();
+        all.dedup();
+        all
     }
 
     /// Which tokens have expired or expire within [`EXPIRY_WARNING`] of
@@ -388,6 +432,13 @@ impl Auth {
         if !speakers.is_empty() {
             c.set("token-review-for", speakers);
         }
+        let checkers: Vec<&&Known> = all.iter().filter(|k| !k.checks.is_empty()).collect();
+        if !checkers.is_empty() {
+            c.section("token-checks", checkers.len());
+            for k in checkers {
+                c.str(&k.name).set("checks", &k.checks);
+            }
+        }
     }
 
     /// What `newer` changes relative to `self`, each list sorted by name.
@@ -416,6 +467,9 @@ impl Auth {
             if o.review != k.review || o.review_for != k.review_for {
                 c.review_changed.push(name.to_string());
             }
+            if o.checks != k.checks {
+                c.checks_changed.push(name.to_string());
+            }
         }
         c.removed = old
             .keys()
@@ -430,6 +484,7 @@ impl Auth {
             &mut c.limits_changed,
             &mut c.expiry_changed,
             &mut c.review_changed,
+            &mut c.checks_changed,
         ] {
             list.sort();
         }
@@ -523,6 +578,7 @@ pub async fn require_token(mut req: Request, next: Next) -> Response {
         author,
         review,
         review_for,
+        checks,
         ..
     } = known;
     let role = *role;
@@ -541,6 +597,7 @@ pub async fn require_token(mut req: Request, next: Next) -> Response {
         author: author.clone(),
         review: *review,
         review_for: *review_for,
+        checks: checks.clone(),
     });
     next.run(req).instrument(span).await
 }
@@ -641,6 +698,32 @@ mod tests {
             r#"{ "tokens": [{ "name": "x", "role": "write", "hash": "HASH", "review": "no" }] }"#
                 .replace("HASH", &hash_token("a"));
         assert!(Auth::parse(&bad).is_err());
+    }
+
+    #[test]
+    fn checks_are_validated_need_write_and_change_the_fingerprint() {
+        let parse = |extra: &str, role: &str| {
+            Auth::parse(&format!(
+                r#"{{ "tokens": [{{ "name": "ci", "role": "{role}", "hash": "{}" {extra} }}] }}"#,
+                hash_token("ci")
+            ))
+        };
+        let plain = parse("", "write").unwrap();
+        let ci = parse(r#", "checks": ["test", "clippy", "test"]"#, "write").unwrap();
+        assert!(plain.lookup("ci").unwrap().checks.is_empty());
+        assert_eq!(ci.lookup("ci").unwrap().checks, ["clippy", "test"]);
+        assert_eq!(ci.check_names(), ["clippy", "test"]);
+        assert_eq!(plain.diff(&ci).checks_changed, ["ci"]);
+        let print = |a: &Auth| {
+            let mut c = crate::fingerprint::Canon::new();
+            a.fingerprint_into(&mut c);
+            c.finish()
+        };
+        assert_ne!(print(&plain), print(&ci));
+        let e = parse(r#", "checks": ["Bad name"]"#, "write").err().unwrap();
+        assert!(e.contains("bad check name"), "{e}");
+        let e = parse(r#", "checks": ["test"]"#, "read").err().unwrap();
+        assert!(e.contains("needs role write"), "{e}");
     }
 
     #[test]

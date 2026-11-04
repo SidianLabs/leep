@@ -249,6 +249,12 @@ struct Args {
     /// at startup and on SIGHUP.
     #[arg(long, env = "LEEP_REVIEW_POLICY_FILE")]
     review_policy_file: Option<std::path::PathBuf>,
+    /// JSON checks policy: per ref, the checks (CI) that must all pass
+    /// before the server moves the ref's known-good `green/<ref>` there
+    /// (ADR 0091). Needs --tokens-file, whose `checks` say which tokens may
+    /// post which results. Read at startup and on SIGHUP.
+    #[arg(long, env = "LEEP_CHECKS_POLICY_FILE")]
+    checks_policy_file: Option<std::path::PathBuf>,
     /// Refuse to land onto this ref unless every changeset it would add is
     /// approved by the owners of the paths it changes. Repeatable; the
     /// environment variable takes a comma-separated list. Needs --tokens-file.
@@ -1849,6 +1855,7 @@ async fn run() -> anyhow::Result<()> {
         tokens_file: args.tokens_file.clone(),
         signing_keys_file: args.signing_keys_file.clone(),
         review_policy_file: args.review_policy_file.clone(),
+        checks_policy_file: args.checks_policy_file.clone(),
         limit_defaults: LimitDefaults {
             rate: args.rate_limit,
             burst: args.rate_burst,
@@ -1913,11 +1920,12 @@ async fn run() -> anyhow::Result<()> {
         .with_blame_tracking(args.warm_blame_paths);
     let read_limits = leep_server::read_limits::ReadLimits::new(&read_concurrency);
     leep_server::reload::warn_missing_refs(repo.meta().as_ref(), &config.current()).await;
+    leep_server::checks::catch_up(&repo, &config.current()).await;
     if args.request_timeout.is_zero() {
         tracing::warn!("request timeout disabled: gc --fence cannot be guaranteed safe");
     }
     #[cfg(unix)]
-    leep_server::reload::spawn_sighup_reload(config.clone(), repo.meta().clone())
+    leep_server::reload::spawn_sighup_reload(config.clone(), repo.clone())
         .context("installing the SIGHUP handler")?;
     leep_server::reload::spawn_token_expiry_gauges(
         config.clone(),
@@ -2323,6 +2331,9 @@ fn log_config(c: &RuntimeConfig) {
     }
     if !c.protected_refs().is_empty() {
         tracing::info!(refs = ?c.protected_refs(), "land policy protects refs");
+    }
+    if let Some(p) = &c.checks {
+        tracing::info!(green = ?p.green_refs(), "known-good refs move on passing checks");
     }
 }
 

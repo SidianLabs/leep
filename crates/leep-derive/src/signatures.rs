@@ -46,6 +46,14 @@ pub trait LandPolicy: Send + Sync + 'static {
         false
     }
 
+    /// Whether only the server moves `target_ref` (a known-good ref,
+    /// ADR 0091): `land` and `cas_ref_checked` then refuse every land,
+    /// create, move and delete with `Error::Policy`, before any other rule.
+    fn promotion_only(&self, target_ref: &str) -> bool {
+        let _ = target_ref;
+        false
+    }
+
     /// Called before `land` moves `target_ref`, which is at `head`.
     /// `new_history` lists the changesets the ref would gain that the caller
     /// submitted (never the server-made rebased copies), nearest to the tip
@@ -81,6 +89,10 @@ impl LandPolicy for PolicySet {
 
     fn protects(&self, target_ref: &str) -> bool {
         self.0.iter().any(|p| p.protects(target_ref))
+    }
+
+    fn promotion_only(&self, target_ref: &str) -> bool {
+        self.0.iter().any(|p| p.promotion_only(target_ref))
     }
 
     async fn check_land(

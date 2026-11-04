@@ -208,6 +208,7 @@ way.
 | `review-v1` | review verdicts, keyed per (changeset, reviewer name) (`Hash::of_object("review", id‖name)`); attestations written by `put_review`, last write wins, listed with one lookup per reviewer (write tokens without `"review": false`) | review listing and the review land policy |
 | `review-source-v1` | which token posted a review for a named principal and the `source` it gave (`ReviewSource { via, source, timestamp }`), keyed as `review-v1` is; written by `put_review_source` beside the review (ADR 0063) | `source` and `via` in review listing, the audit trail |
 | `created-by-v1` | the token that first stored a changeset (`CreatedBy { principal, timestamp }`), keyed by changeset id; written in the changeset's own store write by an authenticated `POST /v1/changesets`, never replaced (ADR 0086) | `created_by` in `GET /v1/changesets/{id}`, `leep show` and review request listings |
+| `check-v1` | the newest result of one CI check on a changeset (`Check { check, outcome, by, url, summary, timestamp }`), keyed per (changeset, check name) (`Hash::of_object("check", id‖name)`); attestations written by `put_check`, last write wins, never carried across rebases, listed with one lookup per known check name (the checks policy's and every token's allow-list) (ADR 0091) | check listing, promotion of `green/<ref>`, red state and catch-up |
 | `last_merge-v1` | generation of the nearest merge on the first-parent chain (0 if none) | lets `merge_base` answer from skiplists when no merge sits above the first-parent common ancestor |
 | `blob-claim-v1` / `blob-condemned-v1` / `blob-rescue-v1` / `blob-doom-v1` | per blob hash, 8-byte big-endian unix seconds (doom adds a state byte); GC bookkeeping, not derived from changesets: claims by uploads and dedup checks, condemnation by `gc condemn`, rescue by uploads of a condemned blob, doom by `gc collect` (ADR 0012) | blob garbage collection and the server's missing-blob checks |
 | `history-tree-v4` | the changeset's history pack (ADR 0045): the nodes of a tree parallel to `root_tree` recording for each path (including deleted ones) the newest changesets that changed it, as written by this changeset's derivation, and the address of its root. A pack is cut into parts of about 16 KB; this value is part 0 and `history-node-v4` rows hold the rest. Nodes are addressed by (writer, part, index) and name changesets through a table per part, so the hundreds of nodes a merge rewrites name its few dozen ids once; nodes of more than 64 entries are stored as content-defined chunks so an edit rewrites one chunk (ADR 0027), and a changed node, chunk or chunk list is stored as a patch on an earlier whole version that names the entries it replaces by position (ADR 0037). Built from the first parent's tree plus the spines of changed paths, and at merges the paths where the second parent's history differs from the merge base's (another parent's from the first's, for octopus or unrelated merges) (ADR 0013) | path log, `last-change` |
@@ -1614,6 +1615,26 @@ in the store write that inserts the changeset
 reviewers see which token made a change even when every agent uses the
 same author. `leep review request|inbox|cancel` are the clients.
 
+**Check results and known-good refs** ([ADR 0091](adr/0091-known-good-refs-and-check-attestations.md)).
+CI posts results to `POST /v1/changesets/{id}/checks` through a token whose
+`checks` allow-list names the check; the poster is the token, and the
+changeset's creator (by `created-by-v1`, through the rebase chain) is
+refused. A pass that completes a policy ref's required checks moves
+`green/<ref>` (`Repo::promote_green`) by `cas_ref_logged` with operation
+`promote`, only to a changeset on the ref's first-parent chain and only
+forward; a lost swap rereads. At startup and on a reload that changed the
+checks policy, `Repo::catch_up_green` walks each ref's first-parent chain
+down to green and promotes as far as the stored results allow. The
+`green/` namespace is the server's (`land` and `cas_ref_checked` refuse to
+create or move any `green/` ref with 422 `promotion_only`; deletes only of
+ones no policy names), and the checked
+ref is protected like a review ref, so it cannot be rewound below green.
+Red is derived at read time. `GET /v1/refs/{name}/culprits` walks the ref
+log, a page at a time (`limit`, `before`; at most 1,024 entries read to
+find `bad`'s land), to list the suspects, the lands in the range
+from `good` (default: green) to `bad`. It is never a verdict. Nothing here
+is on the land path.
+
 **Request path and limits** ([ADR 0020](adr/0020-request-limits.md)). A
 request passes, outermost first, through metrics, tracing, the request timeout,
 the global body cap, the config snapshot, authentication (which names the
@@ -1664,7 +1685,7 @@ parses and accepts only as `off`.
 **Config reload** ([ADR 0024](adr/0024-config-reload.md)). The tokens, their
 limits, the trusted signing keys, the review service and the composed land
 policy form one immutable `RuntimeConfig` (`leep_server::reload`), held in an
-`ArcSwap`. SIGHUP re-reads the tokens, signing keys and review policy files,
+`ArcSwap`. SIGHUP re-reads the tokens, signing keys, review policy and checks policy files,
 validates all of them with the startup checks, and swaps in the new config
 only if every file is good; otherwise the old config stays, an error is logged
 and `leep_config_reload_total{result="error"}` counts it. A middleware pins each

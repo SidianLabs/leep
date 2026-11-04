@@ -2,6 +2,7 @@
 //! (ADR 0025). The table here is the single source for `verify --derived`,
 //! `repair rederive` and `repair drop`, and for the lists in the docs.
 
+use leep_core::check::CHECK_KIND;
 use leep_core::review::{REVIEW_KIND, REVIEW_SOURCE_KIND};
 use leep_core::review_request::CREATED_BY_KIND;
 use leep_core::signature::SIGNATURE_KIND;
@@ -237,6 +238,15 @@ static KINDS: &[KindInfo] = &[
             "review sources are audit records written with the reviews; they are not \
              computed from history, so a dropped row is gone for good",
         ),
+    },
+    KindInfo {
+        name: CHECK_KIND,
+        class: KindClass::Attestation,
+        summary: "the newest result of one check (CI) on a changeset",
+        rederive: Rederive::No("check results are not computed from history; rerun the check"),
+        // CI reproduces a result by running the check again, so dropping
+        // them is how an operator unpins changesets they keep from GC.
+        drop: DropPolicy::Allowed { also: &[] },
     },
     KindInfo {
         name: CREATED_BY_KIND,
@@ -554,7 +564,7 @@ mod tests {
                 matches!(k.class, KindClass::Attestation | KindClass::Bookkeeping);
             assert_eq!(
                 droppable,
-                !attestation_or_state
+                (!attestation_or_state || k.name == CHECK_KIND)
                     && k.name != HISTORY_NODE_KIND
                     && k.name != LOG_FILTER_NAME_KIND
                     // Dropped with `git-commit-v1`, all four together.

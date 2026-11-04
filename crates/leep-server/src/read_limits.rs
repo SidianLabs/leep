@@ -371,6 +371,7 @@ impl ReadLimits {
             &self.blame
         } else if path.starts_with("/v1/last-change/")
             || (path.starts_with("/v1/log/") && log_is_filtered(uri))
+            || is_ref_history_walk(path)
         {
             &self.log_filtered
         } else {
@@ -378,6 +379,14 @@ impl ReadLimits {
         };
         class.as_ref()
     }
+}
+
+/// `GET /v1/refs/{name}/checks` and `.../culprits` (ADR 0091) walk a ref's
+/// first-parent chain and log with ancestry checks: history walks, limited
+/// like a filtered log. A ref whose own name ends so is limited too, which
+/// costs nothing but a permit.
+fn is_ref_history_walk(path: &str) -> bool {
+    path.starts_with("/v1/refs/") && (path.ends_with("/checks") || path.ends_with("/culprits"))
 }
 
 /// Whether a `GET /v1/log` names a path, `author` or `extra`, as the
@@ -598,12 +607,19 @@ mod tests {
             (Method::GET, "/v1/log/x?author=al", "log_filtered"),
             (Method::GET, "/v1/log/x?extra=k%3Dv", "log_filtered"),
             (Method::GET, "/v1/last-change/x?path=a.txt", "log_filtered"),
+            (Method::GET, "/v1/refs/main/checks", "log_filtered"),
+            (
+                Method::GET,
+                "/v1/refs/team/x/culprits?bad=a",
+                "log_filtered",
+            ),
         ] {
             assert_eq!(class(m.clone(), u), Some(want), "{m} {u}");
         }
         for (m, u) in [
             (Method::POST, "/v1/search/main"),
             (Method::GET, "/v1/refs/main"),
+            (Method::GET, "/v1/changesets/abc/checks"),
             (Method::POST, "/v1/land"),
             (Method::GET, "/v1/searchy"),
             (Method::GET, "/v1/log/x"),

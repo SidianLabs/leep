@@ -38,6 +38,7 @@ skill.
 | derived `review-v1` | — | `MetaStore.derived`, key = `Hash::of_object("review", changeset_id ‖ reviewer name utf-8)`, value = postcard `Review { reviewer: String, verdict: Verdict, comment: String, timestamp: i64 }` (`leep_core::review`); `Verdict` is `Approve` (variant 0), `Reject` (variant 1) or `Withdrawn` (variant 2, ADR 0063; a policy reads it as no review) |
 | derived `review-source-v1` | — | `MetaStore.derived`, key as `review-v1` is, value = postcard `ReviewSource { via: String, source: String, timestamp: i64 }` (`leep_core::review`): the token that posted a review and its `source` string (ADR 0063); written before the review it describes, replaced by a later direct post |
 | derived `created-by-v1` | — | `MetaStore.derived`, key = changeset id, value = postcard `CreatedBy { principal: String, timestamp: i64 }` (`leep_core::review_request`): the token that first stored the changeset and when, by the server's clock; written by `POST /v1/changesets` with authentication only in the store write that inserts the changeset, never for one already stored, never replaced (ADR 0086) |
+| derived `check-v1` | — | `MetaStore.derived`, key = `Hash::of_object("check", changeset_id ‖ check name utf-8)`, value = postcard `Check { check: String, outcome: Outcome, by: String, url: String, summary: String, timestamp: i64 }` (`leep_core::check`); `Outcome` is `Pass` (variant 0) or `Fail` (variant 1), append only; the newest result of one check on one changeset, last write wins; `by` is the posting token, never a body field (ADR 0091) |
 | derived `rebased-origin-v1` | — | `MetaStore.derived`, key = rebased copy id, value = 32 raw bytes (id it was rebased from); written by `Repo::rebase` |
 | derived `blob-claim-v1` | — | `MetaStore.derived`, key = blob hash, value = unix seconds as 8-byte big-endian `i64` |
 | derived `blob-condemned-v1` | — | `MetaStore.derived`, key = blob hash, value = condemnation time, unix seconds as 8-byte big-endian `i64`, from the GC host's clock |
@@ -791,6 +792,44 @@ gains `refused`, why a land is refused whatever the reviews (an `OWNERS`
 line starting with `carry` that is no directive), with `approved` false. An identical-only refusal
 fills the existing `OriginStatus.differs` and `reason`
 (`P is identical-only (src/OWNERS)`). Nothing persisted changed.
+
+## Check results and known-good refs (new derived kind and API, ADR 0091)
+
+- The derived kind `check-v1` (table above): one row per (changeset, check
+  name), keyed as `review-v1` is, never carried across rebases. It is an
+  attestation for verify and repair (checked to decode and to be within
+  bounds: name 1 to 64 of `a-z 0-9 - _ .`, `url` at most 2048 bytes without
+  control characters, `summary` at most 4096 bytes; `repair drop` may drop
+  it, since CI can post it again) and a GC root (ADR 0059 root 4), so it is not in
+  `PER_CHANGESET_KINDS`.
+- Refs named `green/<ref>` for every ref of the checks policy, moved only by
+  the server. Their ref log entries have operation `promote` (now reserved,
+  like `land` and `import`), actor the token whose result completed the
+  required checks (none for a catch-up after a policy change), and message
+  the check.
+- Tokens file entries gain optional `"checks": [names]` (write role only).
+  The checks policy file is `{"refs": {"<ref>": {"required": [names]}}}`,
+  strict (`deny_unknown_fields`), and is part of the config fingerprint
+  (section `checks_policy`); a tokens file with `checks` adds a
+  `token-checks` section. Configs without either keep their fingerprint.
+- `POST /v1/changesets/{id}/checks` (`PostCheckRequest {check, outcome:
+  "pass"|"fail", url = "", summary = ""}` → `PostCheckResponse {check,
+  outcome, promoted = [Promotion {ref, green_ref, from?, to}]}`), `GET
+  /v1/changesets/{id}/checks` (→ `ChecksResponse {checks: [CheckEntry
+  {check, outcome, by, url, summary, timestamp}], green_on = []}`), `GET
+  /v1/refs/{name}/checks` (→ `RefChecksResponse {name, head, green_ref,
+  green?, required = [], behind?, red? {first_failed, check, since_seq?}}`)
+  and `GET /v1/refs/{name}/culprits?bad=&good=` (→ `CulpritsResponse {name,
+  good?, bad, suspects: [Suspect {changeset, seq, operation, actor?, time,
+  land_id?, land_changeset?, created_by?, author, title, agent_model?, paths
+  = [], more_paths = false}], truncated, next?}`; query `limit` (100, at
+  most 500) and `before` (a page's `next`)). `POST /v1/merge` now records
+  an authenticated caller as the merge's creator (`created-by-v1`, if new). The two ref paths share the
+  `/v1/refs/{*name}` route: the suffix meaning wins whenever the ref
+  before it exists, and a ref whose own name ends in `/checks` or
+  `/culprits` is answered as itself only when it does not.
+- Error code `promotion_only` (422): a land, create or move of any
+  `green/` ref, or a delete of one the checks policy names.
 
 ## Index leases and bounded queries (additive, ADR 0058)
 
