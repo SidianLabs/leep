@@ -15,14 +15,18 @@
 //!   first in every region.
 //!
 //! Both are pure functions of three blobs, so outcomes are cached by their
-//! hashes.
+//! hashes. Each merge is bounded by [`MAX_CARRY_LINES`], runs on a blocking
+//! thread under a process-wide limit, and is computed once however many
+//! callers ask for it at the same time.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::future::Future;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use diffy::{ConflictStyle, MergeOptions};
 use leep_core::hash::is_object_preimage;
-use leep_core::Hash;
+use leep_core::{Error, Hash, Result};
+use tokio::sync::{OnceCell, Semaphore};
 
 /// How the judged changeset reproduces a reviewed path's change.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -68,55 +72,79 @@ impl Merged {
     }
 }
 
-/// Merge `theirs` (the reviewed new text) and `ours` (the new base's text)
-/// against `base` (the reviewed old text), as the server's rebase does.
-pub(crate) fn merge_outcome(base: &str, ours: &str, theirs: &str) -> Merged {
-    match diffy::merge(base, ours, theirs) {
-        // The blob store refuses these (ADR 0041); the server's rebase
-        // leaves them to the client.
-        Ok(m) if is_object_preimage(m.as_bytes()) => Merged::Neither,
-        Ok(m) => Merged::Clean(Hash::of_blob(m.as_bytes())),
-        Err(_) => match union_of_insertions(base, ours, theirs) {
-            Some([a, b]) => {
-                Merged::Union([Hash::of_blob(a.as_bytes()), Hash::of_blob(b.as_bytes())])
-            }
-            None => Merged::Neither,
-        },
-    }
-}
+/// Most lines any of the three texts may have for a merge to be tried.
+/// diffy's Myers diff costs O((N+M)·D) with no cutoff, so a size bound
+/// alone (2 MiB of one-character lines) allows ~10^12 steps; this keeps the
+/// worst case of each of the merge's two diffs near (2·10^4)² steps,
+/// deterministically. Real source files are far shorter.
+pub const MAX_CARRY_LINES: usize = 10_000;
 
 /// Longest run of one marker character at the start of a line that still
 /// lets the union be computed; longer runs refuse it.
 const MAX_MARKER_RUN: usize = 64;
 
-/// The two results of keeping both sides of every conflict, `ours` first
-/// and `theirs` first, when every conflict region of the merge has an empty
-/// base part (both sides only inserted there). `None` when a region deletes
-/// or edits a base line, when a text does not end in a newline, or when the
-/// merge is clean (that is the rebased case).
-pub(crate) fn union_of_insertions(base: &str, ours: &str, theirs: &str) -> Option<[String; 2]> {
-    let texts = [base, ours, theirs];
-    // An incomplete last line would put a marker on the same line.
-    if texts.iter().any(|t| !t.is_empty() && !t.ends_with('\n')) {
-        return None;
+/// [`Merged`] before hashing.
+#[derive(Debug, PartialEq, Eq)]
+enum Texts {
+    Clean(String),
+    Union([String; 2]),
+    Neither,
+}
+
+/// Merge `theirs` (the reviewed new text) and `ours` (the new base's text)
+/// against `base` (the reviewed old text), as the server's rebase does.
+pub(crate) fn merge_outcome(base: &str, ours: &str, theirs: &str) -> Merged {
+    match merge_texts(base, ours, theirs) {
+        Texts::Clean(m) => Merged::Clean(Hash::of_blob(m.as_bytes())),
+        Texts::Union([a, b]) => {
+            Merged::Union([Hash::of_blob(a.as_bytes()), Hash::of_blob(b.as_bytes())])
+        }
+        Texts::Neither => Merged::Neither,
     }
-    // Markers longer than any run in the texts, so no content line can be
-    // read as one.
+}
+
+/// One diff3 merge, with markers longer than any run of marker characters
+/// in the texts. A clean result is the server's rebase result byte for
+/// byte: diffy's default options differ only in marker length, which shows
+/// only in conflicts. A conflicted one is parsed for the unions.
+fn merge_texts(base: &str, ours: &str, theirs: &str) -> Texts {
+    let texts = [base, ours, theirs];
+    let lines = |t: &str| t.bytes().filter(|&b| b == b'\n').count() + 1;
+    if texts.iter().any(|t| lines(t) > MAX_CARRY_LINES) {
+        return Texts::Neither;
+    }
     let mut run = 0;
     for line in texts.iter().flat_map(|t| t.lines()) {
         for c in ['<', '|', '=', '>'] {
             run = run.max(line.chars().take_while(|&x| x == c).count());
         }
     }
-    if run > MAX_MARKER_RUN {
-        return None;
-    }
-    let len = (run + 1).max(7);
-    let marked = MergeOptions::new()
+    // An incomplete last line would put a marker on the same line.
+    let union_ok = run <= MAX_MARKER_RUN && texts.iter().all(|t| t.is_empty() || t.ends_with('\n'));
+    let len = if union_ok { (run + 1).max(7) } else { 7 };
+    match MergeOptions::new()
         .set_conflict_style(ConflictStyle::Diff3)
         .set_conflict_marker_length(len)
         .merge(base, ours, theirs)
-        .err()?;
+    {
+        // The blob store refuses these (ADR 0041); the server's rebase
+        // leaves them to the client.
+        Ok(m) if is_object_preimage(m.as_bytes()) => Texts::Neither,
+        Ok(m) => Texts::Clean(m),
+        Err(marked) if union_ok => match parse_union(&marked, len) {
+            Some(both) => Texts::Union(both),
+            None => Texts::Neither,
+        },
+        Err(_) => Texts::Neither,
+    }
+}
+
+/// The two results of keeping both sides of every conflict of `marked`,
+/// `ours` first and `theirs` first, when every conflict region has an empty
+/// base part (both sides only inserted there). `None` when a region deletes
+/// or edits a base line. `len` is the marker length, longer than any run in
+/// the texts, so no content line can be read as a marker.
+fn parse_union(marked: &str, len: usize) -> Option<[String; 2]> {
     let marker = |c: char, label: &str| format!("{}{label}\n", c.to_string().repeat(len));
     let (open, mid, sep, close) = (
         marker('<', " ours"),
@@ -167,24 +195,117 @@ pub(crate) fn union_of_insertions(base: &str, ours: &str, theirs: &str) -> Optio
     matches!(at, At::Out).then_some([ours_first, theirs_first])
 }
 
-/// Most merge outcomes kept; the cache starts again when full.
-const CACHE_CAP: usize = 4096;
+/// Outcomes kept per generation: lookups promote from the previous one, and
+/// a full current generation becomes the previous, so hot entries survive.
+const CACHE_GENERATION: usize = 2048;
 
-static CACHE: Mutex<Option<HashMap<[Hash; 3], Merged>>> = Mutex::new(None);
+#[derive(Default)]
+struct Cache {
+    current: HashMap<[Hash; 3], Merged>,
+    previous: HashMap<[Hash; 3], Merged>,
+}
+
+impl Cache {
+    fn insert(&mut self, key: [Hash; 3], m: Merged) {
+        if self.current.len() >= CACHE_GENERATION {
+            self.previous = std::mem::take(&mut self.current);
+        }
+        self.current.insert(key, m);
+    }
+}
+
+static CACHE: Mutex<Option<Cache>> = Mutex::new(None);
 
 /// The cached outcome for (base, ours, theirs) content hashes.
 pub(crate) fn cached(key: [Hash; 3]) -> Option<Merged> {
-    let guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    guard.as_ref().and_then(|m| m.get(&key).copied())
+    let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let cache = guard.get_or_insert_with(Cache::default);
+    if let Some(m) = cache.current.get(&key) {
+        return Some(*m);
+    }
+    let m = cache.previous.remove(&key)?;
+    cache.insert(key, m);
+    Some(m)
 }
 
 pub(crate) fn remember(key: [Hash; 3], outcome: Merged) {
     let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    let map = guard.get_or_insert_with(HashMap::new);
-    if map.len() >= CACHE_CAP {
-        map.clear();
+    guard
+        .get_or_insert_with(Cache::default)
+        .insert(key, outcome);
+}
+
+type Flight = Arc<OnceCell<Merged>>;
+
+/// Merges being computed, so a second ask for the same contents waits for
+/// the first instead of merging again.
+static FLIGHTS: Mutex<Option<HashMap<[Hash; 3], Flight>>> = Mutex::new(None);
+
+/// Merges running at once, on blocking threads shared with other work
+/// (the filesystem blob store): half the cores, at least one.
+fn merge_permits() -> Arc<Semaphore> {
+    static PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    PERMITS
+        .get_or_init(|| {
+            let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+            Arc::new(Semaphore::new((cores / 2).max(1)))
+        })
+        .clone()
+}
+
+/// The outcome for `key` (the base, ours and theirs content hashes):
+/// cached, or being computed by another caller, or computed here from the
+/// texts `read` gives (`None`: a text is missing or not UTF-8, so no text
+/// merge). Each key is merged once per process while cached, on a blocking
+/// thread under [`merge_permits`]. A read error is returned and caches
+/// nothing.
+pub(crate) async fn merged<F, Fut>(key: [Hash; 3], read: F) -> Result<Merged>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<Option<[String; 3]>>>,
+{
+    if let Some(m) = cached(key) {
+        return Ok(m);
     }
-    map.insert(key, outcome);
+    let flight = {
+        let mut guard = FLIGHTS.lock().unwrap_or_else(|e| e.into_inner());
+        guard
+            .get_or_insert_with(HashMap::new)
+            .entry(key)
+            .or_default()
+            .clone()
+    };
+    let out = flight
+        .get_or_try_init(|| async {
+            let Some([base, ours, theirs]) = read().await? else {
+                return Ok(Merged::Neither);
+            };
+            let permit = merge_permits()
+                .acquire_owned()
+                .await
+                .map_err(|e| Error::Other(format!("merge permits: {e}")))?;
+            // The permit moves into the task, so a caller that gives up
+            // does not let another merge start beside this one.
+            let m = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                merge_outcome(&base, &ours, &theirs)
+            })
+            .await
+            .unwrap_or(Merged::Neither);
+            Ok::<_, Error>(m)
+        })
+        .await
+        .copied();
+    if let Ok(m) = out {
+        remember(key, m);
+    }
+    let mut guard = FLIGHTS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(map) = guard.as_mut() {
+        if map.get(&key).is_some_and(|f| Arc::ptr_eq(f, &flight)) {
+            map.remove(&key);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -194,7 +315,10 @@ mod tests {
     const BASE: &str = "fn a() {}\n\nmod tests {\n    fn t0() {}\n}\n";
 
     fn both(base: &str, ours: &str, theirs: &str) -> Option<[String; 2]> {
-        union_of_insertions(base, ours, theirs)
+        match merge_texts(base, ours, theirs) {
+            Texts::Union(u) => Some(u),
+            _ => None,
+        }
     }
 
     #[test]
@@ -262,5 +386,95 @@ mod tests {
     #[test]
     fn a_text_without_a_final_newline_is_no_union() {
         assert_eq!(both("a\nz", "a\nb\nz", "a\nc\nz"), None);
+    }
+
+    #[test]
+    fn a_clean_merge_equals_diffys_default_merge() {
+        let ours = "fn a() { 1 }\n\nmod tests {\n    fn t0() {}\n}\n";
+        let theirs = "fn a() {}\n\nmod tests {\n    fn t0() {}\n    fn t1() {}\n}\n";
+        assert_eq!(
+            merge_texts(BASE, ours, theirs),
+            Texts::Clean(diffy::merge(BASE, ours, theirs).unwrap())
+        );
+        // Long markers in the texts change nothing in a clean result.
+        let marks = "=======\n";
+        let (b, o, t) = (
+            format!("{marks}{BASE}"),
+            format!("{marks}{ours}"),
+            format!("{marks}{theirs}"),
+        );
+        assert_eq!(
+            merge_texts(&b, &o, &t),
+            Texts::Clean(diffy::merge(&b, &o, &t).unwrap())
+        );
+    }
+
+    #[test]
+    fn texts_over_the_line_budget_are_not_merged() {
+        let base = "x\n".repeat(MAX_CARRY_LINES);
+        let ours = format!("top\n{base}");
+        let theirs = format!("{base}end\n");
+        // Each is one line over, though the merge would be clean.
+        assert!(diffy::merge(&base, &ours, &theirs).is_ok());
+        assert_eq!(merge_outcome(&base, &ours, &theirs), Merged::Neither);
+        let base = "x\n".repeat(MAX_CARRY_LINES - 2);
+        let ours = format!("top\n{base}");
+        let theirs = format!("{base}end\n");
+        assert!(matches!(
+            merge_outcome(&base, &ours, &theirs),
+            Merged::Clean(_)
+        ));
+    }
+
+    #[test]
+    fn the_cache_keeps_hot_entries_across_a_generation() {
+        let key = |i: usize| {
+            let h = Hash::of_blob(format!("cache-test-{i}").as_bytes());
+            [h, h, h]
+        };
+        remember(key(0), Merged::Neither);
+        for i in 1..=CACHE_GENERATION * 3 / 2 {
+            remember(key(i), Merged::Neither);
+            // Asked for often: promoted each time it ages out.
+            assert_eq!(cached(key(0)), Some(Merged::Neither), "{i}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_asks_for_one_merge_compute_it_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let reads = Arc::new(AtomicUsize::new(0));
+        let h = Hash::of_blob(b"single-flight-test");
+        let key = [h, Hash::of_blob(b"sf-ours"), Hash::of_blob(b"sf-theirs")];
+        let mut tasks = Vec::new();
+        for _ in 0..16 {
+            let reads = reads.clone();
+            tasks.push(tokio::spawn(async move {
+                merged(key, || async move {
+                    reads.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    Ok(Some([
+                        "a\nb\n".to_string(),
+                        "A\nb\n".to_string(),
+                        "a\nb\nc\n".to_string(),
+                    ]))
+                })
+                .await
+                .unwrap()
+            }));
+        }
+        let want = Merged::Clean(Hash::of_blob(b"A\nb\nc\n"));
+        for t in tasks {
+            assert_eq!(t.await.unwrap(), want);
+        }
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+        // A read error caches nothing; the next ask reads again.
+        let k2 = [Hash::of_blob(b"sf-err"), h, h];
+        let e = merged(k2, || async { Err(Error::Storage("down".into())) }).await;
+        assert!(e.is_err());
+        assert_eq!(cached(k2), None);
+        let m = merged(k2, || async { Ok(None) }).await.unwrap();
+        assert_eq!(m, Merged::Neither);
+        assert_eq!(cached(k2), Some(Merged::Neither));
     }
 }

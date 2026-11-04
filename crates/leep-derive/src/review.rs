@@ -61,6 +61,8 @@ pub enum CarryRefusal {
     /// This reviewed path is missing from the judged changeset or changed
     /// differently there.
     Differs(RepoPath),
+    /// The candidate is not stored (never was, or collected since).
+    Gone,
 }
 
 impl std::fmt::Display for CarryRefusal {
@@ -75,6 +77,7 @@ impl std::fmt::Display for CarryRefusal {
                 "more than {MAX_CARRY_MERGED_PATHS} of its paths moved under it"
             ),
             CarryRefusal::Differs(p) => write!(f, "{p} differs"),
+            CarryRefusal::Gone => write!(f, "it is no longer stored"),
         }
     }
 }
@@ -490,7 +493,8 @@ impl Repo {
     ///   sides inserted lines at one place, and `id` keeps both insertions,
     ///   one side's first in every region. Text files on both sides with
     ///   one kind throughout (no symlinks, no kind change), each at most
-    ///   [`MAX_AUTO_BYTES`], never `OWNERS`, at most
+    ///   [`MAX_AUTO_BYTES`] and [`carry::MAX_CARRY_LINES`] lines, never
+    ///   `OWNERS`, at most
     ///   [`MAX_CARRY_MERGED_PATHS`] per candidate. `merges` is off on refs
     ///   whose lands never merge file contents (`--strict-land-ref`).
     ///
@@ -534,7 +538,13 @@ impl Repo {
         rules: &ReviewRules,
         merges: bool,
     ) -> Result<std::result::Result<BTreeMap<RepoPath, CarryRule>, CarryRefusal>> {
-        let theirs = self.get_changeset(from).await?;
+        // A candidate with reviews may have been collected: it carries
+        // nothing, and the judgement goes on without it.
+        let theirs = match self.get_changeset(from).await {
+            Ok(cs) => cs,
+            Err(Error::NotFound(_)) => return Ok(Err(CarryRefusal::Gone)),
+            Err(e) => return Err(e),
+        };
         // A merge's changes are not all its own (`merge_parent`, dropped
         // side changes); its paths are not compared.
         if theirs.parents.len() > 1 {
@@ -660,7 +670,7 @@ impl Repo {
             FileChange::Modify {
                 content: yn,
                 kind: yk,
-                ..
+                size: ys,
             },
         ) = (x_new, y_new)
         else {
@@ -679,7 +689,12 @@ impl Repo {
         if !one_kind || *xk == FileKind::Symlink {
             return Ok(None);
         }
-        if [xo.size, yo.size, *xs].iter().any(|s| *s > MAX_AUTO_BYTES) {
+        // `y_new` is only hashed, never read, but a bigger result than the
+        // bound could not come from inputs within it anyway; refuse alike.
+        if [xo.size, yo.size, *xs, *ys]
+            .iter()
+            .any(|s| *s > MAX_AUTO_BYTES)
+        {
             return Ok(None);
         }
         // The file did not move: the merge is `from`'s new file, which
@@ -688,34 +703,23 @@ impl Repo {
             return Ok(None);
         }
         let key = [xo.content, yo.content, *xn];
-        let merged = match carry::cached(key) {
-            Some(m) => m,
-            None => {
-                let mut texts = Vec::with_capacity(3);
-                for h in key {
-                    let text = self
-                        .read_content(&h)
-                        .await?
-                        .and_then(|b| String::from_utf8(b.to_vec()).ok());
-                    match text {
-                        Some(t) => texts.push(t),
-                        // Unreadable or binary: no text merge, as for the
-                        // server's rebase.
-                        None => return Ok(None),
-                    }
+        let merged = carry::merged(key, || async move {
+            let mut texts = Vec::with_capacity(3);
+            for h in key {
+                match self
+                    .read_content(&h)
+                    .await?
+                    .and_then(|b| String::from_utf8(b.to_vec()).ok())
+                {
+                    Some(t) => texts.push(t),
+                    // Unreadable or binary: no text merge, as for the
+                    // server's rebase.
+                    None => return Ok(None),
                 }
-                // A large merge is CPU work; keep it off the async workers.
-                let m = tokio::task::spawn_blocking(move || {
-                    carry::merge_outcome(&texts[0], &texts[1], &texts[2])
-                })
-                .await;
-                let Ok(m) = m else {
-                    return Ok(None);
-                };
-                carry::remember(key, m);
-                m
             }
-        };
+            Ok(<[String; 3]>::try_from(texts).ok())
+        })
+        .await?;
         Ok(merged.rule_for(*yn))
     }
 

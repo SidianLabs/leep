@@ -2568,3 +2568,46 @@ async fn a_strict_ref_carries_only_identical_changes() {
     assert_eq!(rules(&s)[1], ("src/a.rs", "pending"));
     assert_eq!(s.origins[0].differs, [RepoPath::new("src/a.rs").unwrap()]);
 }
+
+#[tokio::test]
+async fn a_reviewed_origin_that_is_gone_carries_nothing_and_fails_nothing() {
+    // A review row outlives its changeset (collected, or never stored):
+    // naming it is not an error, status says why, and the land goes on.
+    let m = moved_setup(POLICY_AUTO, F0, FX, FH).await;
+    let gone = m
+        .api
+        .commit(&[m.head], &[("src/a.rs", Some("gone\n"))])
+        .await;
+    put_at(&m.api, gone, "alice", Verdict::Reject, 100).await;
+    // Collected, as the changeset sweep does; its review row stays.
+    m.api
+        .repo
+        .meta()
+        .delete_changesets(&[gone], &[])
+        .await
+        .unwrap();
+    assert!(m
+        .api
+        .repo
+        .get_review(gone, "alice")
+        .await
+        .unwrap()
+        .is_some());
+    let y = m
+        .api
+        .commit_from(
+            &[m.head],
+            &[
+                ("src/a.rs", Some(FR)),
+                ("CHANGELOG.md", Some("# log\n- other\n- x\n")),
+            ],
+            Some(&format!("{gone},{}", m.x)),
+        )
+        .await;
+    let s = m.api.status(y).await;
+    assert!(s.approved, "{s:?}");
+    let o = s.origins.iter().find(|o| o.from == gone).unwrap();
+    assert!(!o.carried);
+    assert_eq!(o.reason.as_deref(), Some("it is no longer stored"));
+    assert_eq!(m.api.land(y, "bob").await.status, StatusCode::OK);
+}

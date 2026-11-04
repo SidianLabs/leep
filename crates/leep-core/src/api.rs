@@ -725,12 +725,15 @@ pub struct OriginStatus {
     pub reviews: Vec<OriginReview>,
     /// Whether they count on at least one path.
     pub carried: bool,
-    /// When not carried: paths of `from` that needed a reviewer and that
-    /// the judged changeset does not reproduce.
+    /// When not carried: the first path of `from` (in path order of the
+    /// check) that needed a reviewer and that the judged changeset does
+    /// not reproduce. Only the first is named, since the check stops there;
+    /// others may differ too. A list so a later server may name more.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub differs: Vec<RepoPath>,
-    /// When not carried for another reason (`from` is a merge, too many
-    /// paths, too many reviewed origins), that reason in words.
+    /// When not carried for another reason (`from` is a merge or no longer
+    /// stored, too many paths, too many reviewed origins), that reason in
+    /// words.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }
