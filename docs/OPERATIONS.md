@@ -2902,6 +2902,7 @@ history's depth.
 | `--request-timeout` | 8s | The server's `--request-timeout`; the GC fence is derived from it (1.5 times it plus 2 s) |
 | `--gc-interval`, `--derive-interval` | duration/3 (60 s to 30 min), duration/8 (30 s to 10 min) | Pause between fenced GCs, and between `derive-search main` warmups; 0 disables |
 | `--backup-interval` | off | Pause between `leep-server backup` runs beside the swarm; each must seal with a clean check. With it, the run ends with a quiet backup that is restored into scratch SQLite and file stores and verified (`--full --rehash`), whatever the source backend (ADR 0026). Violations are reported under `backup` and `restore` |
+| `--min-backups` | 0 | Keep the swarm running past `--duration` until this many backups beside it have sealed, for at most `--max-overrun` (default 2m); for short runs on slow machines |
 | `--chaos`, `--chaos-restarts` | off, 4 | Restart the server, SIGTERM for two in three and SIGKILL for the others |
 | `--rate-limit`, `--rate-burst`, `--max-concurrent` | off | Passed to the server per token. The `leep` agents' tokens are exempt: a checkout is thousands of reads (see Request limits above) |
 | `--cache-mib` | 32 | The server's blob cache. Keep it small: a cache still filling looks like a leak |

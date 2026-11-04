@@ -610,8 +610,22 @@ async fn drive(
     }
 
     // ---- run ----
-    let deadline = args.duration;
-    while sh.now_secs() < deadline.as_secs_f64() && !sh.stopped() {
+    let deadline = args.duration.as_secs_f64();
+    let min_backups = if args.backup_every().is_some() {
+        args.min_backups
+    } else {
+        0
+    };
+    let overrun = deadline + args.max_overrun.as_secs_f64();
+    while !sh.stopped() {
+        let now = sh.now_secs();
+        if now >= deadline && sh.stats.get("backup_runs") >= min_backups {
+            break;
+        }
+        if now >= overrun {
+            eprintln!("--min-backups {min_backups} not reached after {now:.0}s; stopping");
+            break;
+        }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     let run_secs = sh.now_secs();

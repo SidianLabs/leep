@@ -118,6 +118,14 @@ pub struct Args {
     /// restored into scratch SQLite and file stores and verified (ADR 0026).
     #[arg(long, value_parser = dur)]
     pub backup_interval: Option<Duration>,
+    /// Keep the swarm running past --duration until this many backups
+    /// beside it have sealed, for at most --max-overrun: on a slow machine a
+    /// short run may otherwise end before its first one.
+    #[arg(long, default_value_t = 0)]
+    pub min_backups: u64,
+    /// The longest --min-backups may extend the run.
+    #[arg(long, default_value = "2m", value_parser = dur)]
+    pub max_overrun: Duration,
     /// Restart the server during the run: graceful SIGTERM, and now and then
     /// SIGKILL. 5xx and dropped connections inside a restart are attributed.
     #[arg(long)]
