@@ -76,6 +76,9 @@ pub struct Data {
     /// Write land conflicts diff3 style, with the base between the sides as
     /// `||||||| original`, as the real server does.
     pub diff3: bool,
+    /// Answer 500 to every files request, like a server going down between
+    /// two of a command's calls.
+    pub fail_files: bool,
 }
 
 pub type Shared = Arc<Mutex<Data>>;
@@ -823,6 +826,9 @@ async fn files(
         .map_err(|_| err(StatusCode::BAD_REQUEST, "bad id"))?;
     let mut d = s.lock().unwrap();
     record(&mut d, "files", &raw);
+    if d.fail_files {
+        return Err(err(StatusCode::INTERNAL_SERVER_ERROR, "files failed"));
+    }
     let all = d
         .files
         .get(&id)
