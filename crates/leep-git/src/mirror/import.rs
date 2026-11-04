@@ -11,8 +11,8 @@ use leep_core::{ChangesetId, Hash};
 use super::export::Exporter;
 use super::map::Origin;
 use super::Leep;
-use crate::export::changeset_trailer;
 use crate::import::{changeset_for, prepare};
+use leep_gitobj::changeset_trailer;
 
 #[derive(Debug, Default)]
 pub struct Imported {

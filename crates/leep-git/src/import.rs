@@ -7,18 +7,14 @@ use futures_util::stream::{self, StreamExt};
 use gix::bstr::ByteSlice;
 use gix::objs::tree::EntryKind;
 use gix::ObjectId;
-use leep_core::{
-    Changeset, ChangesetId, DerivedRow, Error, FileChange, FileKind, Hash, RefUpdateContext,
-    RepoPath, Result,
-};
+use leep_core::{ChangesetId, DerivedRow, Error, Hash, RefUpdateContext, Result};
 use leep_derive::Repo;
 use tokio::sync::mpsc;
 
-use crate::{
-    gerr, git_key, lookup_leep, tz_token, EXTRA_GIT_AUTHOR_TZ, EXTRA_GIT_COMMIT,
-    EXTRA_GIT_COMMITTER, EXTRA_GIT_COMMITTER_TZ, EXTRA_GIT_ENCODING, EXTRA_GIT_HEADERS,
-    EXTRA_GIT_RAW, GIT_TO_LEEP, LEEP_TO_GIT,
-};
+pub(crate) use leep_gitobj::{changeset_for, Prepared};
+use leep_gitobj::{file_kind, tz_token};
+
+use crate::{gerr, git_key, lookup_leep, GIT_TO_LEEP, LEEP_TO_GIT};
 
 /// Commits decoded and with their blobs uploaded ahead of the changeset
 /// writes. Bounds memory to this many slices of new blobs (below). A commit's blobs
@@ -96,25 +92,6 @@ impl ImportReport {
     }
 }
 
-/// One git commit, decoded and diffed against its first parent.
-pub(crate) struct Prepared {
-    pub(crate) parents: Vec<ObjectId>,
-    author: String,
-    author_tz: String,
-    time: i64,
-    committer: String,
-    committer_time: i64,
-    committer_tz: String,
-    message: String,
-    encoding: Option<String>,
-    headers: Vec<(String, String)>,
-    /// Original bytes of the fields above that are not valid UTF-8.
-    raw: BTreeMap<&'static str, serde_json::Value>,
-    pub(crate) changes: Vec<(String, Option<(FileKind, ObjectId)>)>,
-    /// Paths of the gitlinks this commit adds or changes, which are dropped.
-    pub(crate) submodules: Vec<String>,
-}
-
 type Entry = (EntryKind, ObjectId);
 
 fn read_tree(g: &gix::Repository, id: ObjectId) -> Result<BTreeMap<String, Entry>> {
@@ -129,15 +106,6 @@ fn read_tree(g: &gix::Repository, id: ObjectId) -> Result<BTreeMap<String, Entry
         out.insert(name.to_string(), (e.mode.kind(), e.oid.to_owned()));
     }
     Ok(out)
-}
-
-fn file_kind(k: EntryKind) -> Option<FileKind> {
-    match k {
-        EntryKind::Blob => Some(FileKind::Regular),
-        EntryKind::BlobExecutable => Some(FileKind::Executable),
-        EntryKind::Link => Some(FileKind::Symlink),
-        _ => None,
-    }
 }
 
 fn join(prefix: &str, name: &str) -> String {
@@ -312,62 +280,6 @@ pub(crate) fn prepare(ts: &gix::ThreadSafeRepository, id: ObjectId) -> Result<Pr
         raw,
         changes,
         submodules: subs,
-    })
-}
-
-/// The changeset for git commit `oid`, given its parents' changeset ids and
-/// the stored hash and size of each blob it adds. The importer and the live
-/// mirror both build changesets here, so a commit gets the same id whichever
-/// of them imports it.
-pub(crate) fn changeset_for(
-    oid: ObjectId,
-    p: Prepared,
-    parents: Vec<ChangesetId>,
-    blob: impl Fn(&ObjectId) -> Result<(Hash, u64)>,
-) -> Result<Changeset> {
-    let mut changes = BTreeMap::new();
-    for (path, change) in p.changes {
-        let path = RepoPath::new(path)?;
-        let change = match change {
-            None => FileChange::Delete,
-            Some((kind, b)) => {
-                let (content, size) = blob(&b)?;
-                FileChange::Modify {
-                    content,
-                    kind,
-                    size,
-                }
-            }
-        };
-        changes.insert(path, change);
-    }
-    let mut extra = BTreeMap::from([
-        (EXTRA_GIT_COMMIT.to_string(), oid.to_string()),
-        (
-            EXTRA_GIT_COMMITTER.to_string(),
-            format!("{} {}", p.committer, p.committer_time),
-        ),
-        (EXTRA_GIT_AUTHOR_TZ.to_string(), p.author_tz),
-        (EXTRA_GIT_COMMITTER_TZ.to_string(), p.committer_tz),
-    ]);
-    if let Some(e) = p.encoding {
-        extra.insert(EXTRA_GIT_ENCODING.to_string(), e);
-    }
-    if !p.headers.is_empty() {
-        let json = serde_json::to_string(&p.headers).map_err(gerr)?;
-        extra.insert(EXTRA_GIT_HEADERS.to_string(), json);
-    }
-    if !p.raw.is_empty() {
-        let json = serde_json::to_string(&p.raw).map_err(gerr)?;
-        extra.insert(EXTRA_GIT_RAW.to_string(), json);
-    }
-    Ok(Changeset {
-        parents,
-        author: p.author,
-        timestamp: p.time,
-        message: p.message,
-        changes,
-        extra,
     })
 }
 

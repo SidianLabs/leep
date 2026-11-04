@@ -16,6 +16,7 @@ leep-derive.workspace = true
 leep-store.workspace = true
 leep-meta.workspace = true
 leep-cli.workspace = true
+leep-gitobj.workspace = true
 anyhow.workspace = true
 base64.workspace = true
 bytes.workspace = true

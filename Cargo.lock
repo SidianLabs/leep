@@ -2527,6 +2527,7 @@ dependencies = [
  "leep-cli",
  "leep-core",
  "leep-derive",
+ "leep-gitobj",
  "leep-meta",
  "leep-server",
  "leep-store",
@@ -2536,6 +2537,19 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "leep-gitobj"
+version = "0.0.1"
+dependencies = [
+ "base64 0.23.1",
+ "gix-actor",
+ "gix-date",
+ "gix-hash",
+ "gix-object",
+ "leep-core",
+ "serde_json",
 ]
 
 [[package]]
