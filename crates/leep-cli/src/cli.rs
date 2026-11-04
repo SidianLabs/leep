@@ -7,8 +7,9 @@ use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use crate::cache::Cache;
 use crate::client::Client;
 use crate::commands::{
-    amend, bisect, branch, checkout, commit, config, diff, history, init, keygen, land, merge,
-    pick, rebase, reflog, reset, resolve, restore, review, search, stash, status, Ctx, Remote,
+    amend, bisect, branch, checkout, checks, commit, config, diff, history, init, keygen, land,
+    merge, pick, rebase, reflog, reset, resolve, restore, review, search, stash, status, Ctx,
+    Remote,
 };
 use crate::error::{CliError, ErrorKind, Result};
 use crate::help;
@@ -137,6 +138,10 @@ pub enum Command {
     Review(review::ReviewCmd),
     /// List the reviews a changeset has (same as `review list`).
     Reviews(review::ListArgs),
+    /// Post CI check results, see a ref's known-good `green/<ref>`, and list
+    /// the suspects for a failure.
+    #[command(subcommand, after_help = help::CHECKS)]
+    Checks(checks::ChecksCmd),
 }
 
 /// The command line definition with the help text of [`help`].
@@ -233,6 +238,7 @@ pub fn run(cli: Cli) -> Result<i32> {
             | Command::Undo(_)
             | Command::Review(_)
             | Command::Reviews(_)
+            | Command::Checks(_)
     );
     if read_only && wc.is_err() {
         let token = resolve_token(cli.token.as_deref(), env_token().as_deref(), None);
@@ -312,6 +318,7 @@ fn read_only_cmd(cmd: &Command, r: &Remote) -> Result<i32> {
         Command::Undo(a) => reflog::undo(r, a),
         Command::Review(c) => review::run(r, c),
         Command::Reviews(a) => review::list(r, a),
+        Command::Checks(c) => checks::run(r, c),
         _ => unreachable!("not a read-only command"),
     }
 }
