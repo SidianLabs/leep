@@ -188,15 +188,22 @@ mod tests {
 
     #[tokio::test]
     async fn postgres_reports_sizes_and_vacuums() {
-        let Some(url) = crate::tests::pg_url() else {
+        let Some(db) = crate::tests::PgDb::create("space").await else {
             return;
         };
-        PostgresMetaStore::connect(&url).await.unwrap();
+        let url = db.url.clone();
+        PostgresMetaStore::connect(&url)
+            .await
+            .unwrap()
+            .pool
+            .close()
+            .await;
         let f = storage_facts(&url).await.unwrap();
         assert_eq!(f.backend, Backend::Postgres);
         assert!(f.database_bytes.unwrap() > 0);
         assert!(f.derived_bytes.unwrap() > 0);
         assert!(vacuum_analyze_derived(&url).await.unwrap());
+        db.drop_db().await;
     }
 }
 

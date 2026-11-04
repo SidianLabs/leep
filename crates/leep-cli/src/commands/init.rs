@@ -70,10 +70,18 @@ pub fn run(
         Some(id) => {
             // Files already present before init, which a failed checkout must
             // leave alone even when it rewrote them with the same content.
-            let existed: HashSet<String> = list_files(&ctx, &id)?
-                .into_keys()
-                .filter(|p| fs::symlink_metadata(root.join(p)).is_ok())
-                .collect();
+            let existed: HashSet<String> = match list_files(&ctx, &id) {
+                Ok(files) => files
+                    .into_keys()
+                    .filter(|p| fs::symlink_metadata(root.join(p)).is_ok())
+                    .collect(),
+                // Nothing written yet, but the `.leep` made above would
+                // refuse the retry.
+                Err(e) => {
+                    undo_checkout(&ctx, &root, &HashSet::new());
+                    return Err(e);
+                }
+            };
             let stats = match materialize(&mut ctx, id, false) {
                 Ok(stats) => stats,
                 Err(e) => {

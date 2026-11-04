@@ -348,6 +348,14 @@ pub(crate) async fn wait_for(mut done: impl FnMut() -> bool) {
 
 pub(crate) type Pending = tokio::task::JoinHandle<Result<LandResponse>>;
 
+/// Lift `r`'s replay time limit (shared by its clones), so a batch closes
+/// only at its size bound. Under the default, [`crate::land::MAX_BATCH_REPLAY`]
+/// of wall-clock time, a loaded machine slows the replays of a deep
+/// history past it and splits a batch these tests count on being one.
+pub(crate) fn whole_batches(r: &Repo) {
+    let _ = r.clone().with_land_batch_replay_limit(None);
+}
+
 /// Queue `lands` on `main` in this order behind a held head read, so they
 /// form one batch once `release` opens it. A no-op land of `base` goes first
 /// and holds the leader in its own batch.
@@ -357,6 +365,7 @@ pub(crate) async fn queue_in_order(
     base: ChangesetId,
     lands: &[(ChangesetId, Option<&'static str>)],
 ) -> (Pending, Vec<Pending>) {
+    whole_batches(r);
     // A leader still finishing an earlier land could take the blocker
     // onto that land's head without reading the ref (ADR 0072).
     wait_for(|| r.land_queues.idle("main")).await;
@@ -1266,6 +1275,7 @@ async fn queue_keyed(
     base: ChangesetId,
     lands: &[(ChangesetId, Option<leep_core::LandId>)],
 ) -> (Pending, Vec<Pending>) {
+    whole_batches(r);
     // A leader still finishing an earlier land could take the blocker
     // onto that land's head without reading the ref (ADR 0072).
     wait_for(|| r.land_queues.idle("main")).await;

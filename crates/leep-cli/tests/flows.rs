@@ -1313,6 +1313,24 @@ fn branch_and_tag_need_a_base_or_a_rev() {
     assert!(mock.data.lock().unwrap().refs.is_empty());
 }
 
+/// A server lost after `init` read the head, before it listed the files:
+/// nothing is written, and no `.leep` is left to refuse the retry.
+#[test]
+fn an_init_cut_off_before_its_checkout_can_be_retried() {
+    let mock = Mock::start();
+    let (wc_dir, cache) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    mock.seed(None, &[("a.txt", "a\n", FileKind::Regular)], &[]);
+    mock.data.lock().unwrap().fail_files = true;
+    assert!(init_wc(&mock, wc_dir.path(), cache.path(), &[]).is_err());
+    assert!(
+        !wc_dir.path().join(".leep").exists(),
+        "a failed init must not leave a working copy behind"
+    );
+    mock.data.lock().unwrap().fail_files = false;
+    let ctx = init_wc(&mock, wc_dir.path(), cache.path(), &[]).unwrap();
+    assert_eq!(fs::read_to_string(ctx.wc.abs("a.txt")).unwrap(), "a\n");
+}
+
 #[test]
 fn a_failed_init_leaves_no_working_copy_and_can_be_retried() {
     let mock = Mock::start();

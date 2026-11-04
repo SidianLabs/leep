@@ -39,8 +39,15 @@ fn soak_smoke() {
         "--derive-interval",
         "4s",
         // Backups beside the swarm, and the final backup, restore and verify.
+        // A backup takes seconds on a loaded machine, and one that races the
+        // chaos restart may seal nothing, so the run goes on past its eight
+        // seconds until one has sealed, instead of hoping one fits.
         "--backup-interval",
         "3s",
+        "--min-backups",
+        "1",
+        "--max-overrun",
+        "10m",
         "--check-interval",
         "3s",
         "--sample-interval",
