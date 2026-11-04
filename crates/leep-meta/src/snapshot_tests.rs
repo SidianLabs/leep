@@ -7,7 +7,7 @@ use leep_core::{Hash, LandId, LandKey, MetaStore, RefUpdateContext};
 use sqlx::Connection;
 
 use super::snapshot::*;
-use super::tests::{cs, pg_url};
+use super::tests::{cs, PgDb};
 use super::*;
 
 fn land_id(i: i64) -> LandId {
@@ -680,136 +680,6 @@ async fn compressed_changesets_and_their_dictionary_round_trip() {
     for c in &next {
         let row = &after.iter().find(|r| r.0 == c.id().0 .0).unwrap().1;
         assert!(crate::codec::Codec::uses(row, 1));
-    }
-}
-
-/// A throwaway Postgres database.
-struct PgDb {
-    admin: String,
-    name: String,
-    url: String,
-}
-
-/// `admin` with only the database name swapped, so user, host, port and
-/// query parameters (a Unix-socket `host=`) carry over. A URL with no path
-/// gets one, and a `dbname=` query parameter (which sqlx lets override the
-/// path) is replaced too so the new name wins.
-fn replace_db(admin: &str, db: &str) -> String {
-    let (base, query) = match admin.split_once('?') {
-        Some((b, q)) => (b, Some(q)),
-        None => (admin, None),
-    };
-    let after_scheme = base.find("://").map_or(0, |i| i + 3);
-    let authority_end = base[after_scheme..]
-        .find('/')
-        .map_or(base.len(), |i| after_scheme + i);
-    let root = &base[..authority_end];
-    let mut out = format!("{root}/{db}");
-    if let Some(q) = query {
-        let q = q
-            .split('&')
-            .map(|kv| match kv.split_once('=') {
-                Some(("dbname", _)) => format!("dbname={db}"),
-                _ => kv.to_string(),
-            })
-            .collect::<Vec<_>>()
-            .join("&");
-        out.push('?');
-        out.push_str(&q);
-    }
-    out
-}
-
-#[test]
-fn replace_db_tcp() {
-    assert_eq!(
-        replace_db("postgres://leep@localhost:55432/postgres", "x"),
-        "postgres://leep@localhost:55432/x"
-    );
-}
-
-#[test]
-fn replace_db_unix_socket_keeps_query() {
-    assert_eq!(
-        replace_db(
-            "postgres://leep@localhost/postgres?host=/home/user/pgsock&port=55432",
-            "x"
-        ),
-        "postgres://leep@localhost/x?host=/home/user/pgsock&port=55432"
-    );
-}
-
-#[test]
-fn replace_db_credentials() {
-    assert_eq!(
-        replace_db("postgresql://me:p%2Fw%40rd@db.example:5432/postgres", "x"),
-        "postgresql://me:p%2Fw%40rd@db.example:5432/x"
-    );
-}
-
-#[test]
-fn replace_db_no_path() {
-    assert_eq!(
-        replace_db("postgres://leep@localhost:55432", "x"),
-        "postgres://leep@localhost:55432/x"
-    );
-    assert_eq!(
-        replace_db("postgres://leep@localhost/", "x"),
-        "postgres://leep@localhost/x"
-    );
-    assert_eq!(
-        replace_db("postgres://leep@localhost?host=/s&port=1", "x"),
-        "postgres://leep@localhost/x?host=/s&port=1"
-    );
-}
-
-#[test]
-fn replace_db_percent_encoded_old_name() {
-    assert_eq!(
-        replace_db("postgres://leep@localhost/my%20db%2Fx", "x"),
-        "postgres://leep@localhost/x"
-    );
-}
-
-#[test]
-fn replace_db_dbname_query() {
-    assert_eq!(
-        replace_db(
-            "postgres://leep@localhost/postgres?dbname=other&port=1",
-            "x"
-        ),
-        "postgres://leep@localhost/x?dbname=x&port=1"
-    );
-}
-
-impl PgDb {
-    async fn create(tag: &str) -> Option<PgDb> {
-        let admin = pg_url()?;
-        let name = format!("leep_snap_{tag}_{}", std::process::id());
-        let mut c = sqlx::PgConnection::connect(&admin).await.unwrap();
-        sqlx::query(sqlx::AssertSqlSafe(format!(
-            "DROP DATABASE IF EXISTS {name} WITH (FORCE)"
-        )))
-        .execute(&mut c)
-        .await
-        .unwrap();
-        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}")))
-            .execute(&mut c)
-            .await
-            .unwrap();
-        let url = replace_db(&admin, &name);
-        Some(PgDb { admin, name, url })
-    }
-
-    async fn drop_db(self) {
-        let mut c = sqlx::PgConnection::connect(&self.admin).await.unwrap();
-        sqlx::query(sqlx::AssertSqlSafe(format!(
-            "DROP DATABASE IF EXISTS {} WITH (FORCE)",
-            self.name
-        )))
-        .execute(&mut c)
-        .await
-        .unwrap();
     }
 }
 
