@@ -46,6 +46,8 @@ fn soak_smoke() {
         "3s",
         "--min-backups",
         "1",
+        "--max-overrun",
+        "10m",
         "--check-interval",
         "3s",
         "--sample-interval",
