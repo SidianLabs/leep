@@ -801,6 +801,29 @@ mod tests {
             );
         }
         assert_eq!(green(&r).await, Some(h[2]));
+        // The whole namespace is reserved, policy or not: nobody plants a
+        // known-good ref.
+        refused(r.land(h[3], "green/other").await.unwrap_err());
+        refused(
+            r.cas_ref_checked("green/other", None, Some(h[1]), &c)
+                .await
+                .unwrap_err(),
+        );
+        // One left over from a policy that no longer names it may be
+        // deleted, which is the recovery path.
+        r.meta()
+            .cas_ref("green/old", None, Some(h[1]))
+            .await
+            .unwrap();
+        refused(
+            r.cas_ref_checked("green/old", Some(h[1]), Some(h[2]), &c)
+                .await
+                .unwrap_err(),
+        );
+        assert!(r
+            .cas_ref_checked("green/old", Some(h[1]), None, &c)
+            .await
+            .unwrap());
         // `main` itself is protected: a rewind past green is refused.
         let e = r
             .cas_ref_checked("main", Some(h[3]), Some(h[1]), &c)

@@ -389,6 +389,37 @@ async fn green_refuses_land_cas_undo_and_delete_and_main_is_protected() {
             .refused(unprocessable, error_code::PROMOTION_ONLY);
     }
     assert_eq!(api.green().await, Some(h[2]));
+    // No write token plants a green ref outside the policy either.
+    let land = serde_json::json!({ "changeset": h[3], "target_ref": "green/dev" });
+    api.post("/v1/land", Some("alice"), &land)
+        .await
+        .refused(unprocessable, error_code::PROMOTION_ONLY);
+    let plant = CasRefRequest {
+        expected: None,
+        new: Some(h[3]),
+        operation: None,
+        message: None,
+    };
+    api.post("/v1/refs/green/dev", Some("alice"), &plant)
+        .await
+        .refused(unprocessable, error_code::PROMOTION_ONLY);
+    // A stale one, outside the policy, may be deleted.
+    api.repo
+        .meta()
+        .cas_ref("green/old", None, Some(h[1]))
+        .await
+        .unwrap();
+    let delete = CasRefRequest {
+        expected: Some(h[1]),
+        new: None,
+        operation: None,
+        message: None,
+    };
+    let r: CasRefResponse = api
+        .post("/v1/refs/green/old", Some("alice"), &delete)
+        .await
+        .ok();
+    assert!(r.ok);
     // Nobody records a promotion by hand, on any ref.
     let body = CasRefRequest {
         expected: None,

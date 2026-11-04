@@ -164,6 +164,9 @@ pub async fn catch_up(repo: &Repo, config: &crate::reload::RuntimeConfig) {
     };
     let ctx = RefUpdateContext::new(PROMOTE_OPERATION).message("checks policy loaded");
     for (name, required) in &policy.refs {
+        if let Err(e) = warn_stranded(repo, name).await {
+            tracing::warn!(r#ref = %name, error = %e, "could not check the known-good ref");
+        }
         match repo.catch_up_green(name, required, &ctx).await {
             Ok(Some(p)) => tracing::info!(
                 green = %p.green_ref,
@@ -178,6 +181,28 @@ pub async fn catch_up(repo: &Repo, config: &crate::reload::RuntimeConfig) {
             ),
         }
     }
+}
+
+/// Log an error when `green/<name>` is off `name`'s history (a restore or a
+/// hand edit of the store rewound the ref): green then never moves again
+/// until an operator clears it (OPERATIONS, "CI checks and known-good refs").
+async fn warn_stranded(repo: &Repo, name: &str) -> leep_core::Result<()> {
+    let (Some(head), Some(g)) = (
+        repo.meta().get_ref(name).await?,
+        repo.meta().get_ref(&green_ref(name)).await?,
+    ) else {
+        return Ok(());
+    };
+    if !repo.is_ancestor(g, head).await? {
+        tracing::error!(
+            r#ref = %name,
+            green = %g,
+            head = %head,
+            "known-good ref is off the ref's history and will not move; drop the ref from \
+             the checks policy, SIGHUP, delete the green ref and add the ref back"
+        );
+    }
+    Ok(())
 }
 
 /// Every check name a result can have: the policy's required ones and every

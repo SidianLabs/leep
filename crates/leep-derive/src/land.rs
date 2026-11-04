@@ -936,11 +936,9 @@ impl Repo {
                 "cannot land onto {target_ref:?}: tags are immutable"
             )));
         }
-        if self
-            .land_policy
-            .as_ref()
-            .is_some_and(|p| p.promotion_only(target_ref))
-        {
+        // The whole `green/` namespace, policy or not: a known-good ref
+        // nobody promoted would be a forged "known good" (ADR 0091).
+        if leep_core::check::is_green(target_ref) {
             return Err(Error::Policy(format!(
                 "cannot land on {target_ref:?}: it {} when every required check passes \
                  (ADR 0091); land on the ref it follows",
@@ -1993,11 +1991,14 @@ impl Repo {
         new: Option<ChangesetId>,
         ctx: &RefUpdateContext,
     ) -> Result<bool> {
-        if self
+        // Every `green/` ref is the server's to create and move, policy or
+        // not (ADR 0091). Deleting one the checks policy no longer names is
+        // allowed: that is how a stranded green is cleared.
+        let policy_green = self
             .land_policy
             .as_ref()
-            .is_some_and(|p| p.promotion_only(name))
-        {
+            .is_some_and(|p| p.promotion_only(name));
+        if leep_core::check::is_green(name) && (new.is_some() || policy_green) {
             return Err(Error::Policy(format!(
                 "{name:?} {}: the server moves it when every required check passes \
                  (ADR 0091); post check results instead",
