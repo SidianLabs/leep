@@ -2640,3 +2640,169 @@ fn land_coordination_checks_the_advertise_url_at_startup() {
     let log = run(format!("http://127.0.0.1:{port}"), "https://leep-");
     assert!(log.contains("does not name a whole host"), "{log}");
 }
+
+#[test]
+fn a_fake_ci_loop_promotes_green_and_narrows_suspects_to_a_planted_break() {
+    let _g = serial();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let (alice_t, alice_e) = gen_token("alice", "write");
+    let (ci_t, mut ci_e) = gen_token("ci-test", "write");
+    ci_e["checks"] = serde_json::json!(["test"]);
+    ci_e["review"] = serde_json::json!(false);
+    let tokens = root.join("tokens.json");
+    fs::write(
+        &tokens,
+        serde_json::json!({ "tokens": [alice_e, ci_e] }).to_string(),
+    )
+    .unwrap();
+    let policy = root.join("checks.json");
+    fs::write(
+        &policy,
+        r#"{ "refs": { "main": { "required": ["test"] } } }"#,
+    )
+    .unwrap();
+    let stores = Stores::sqlite(&root.join("data"));
+    let server = Server::start_with(
+        free_port(),
+        &stores,
+        root,
+        &[
+            "--tokens-file",
+            tokens.to_str().unwrap(),
+            "--checks-policy-file",
+            policy.to_str().unwrap(),
+        ],
+    );
+    let client = Client::new(&server.url, &root.join("cache"));
+    let alice = User {
+        client: &client,
+        token: alice_t,
+    };
+    let ci = User {
+        client: &client,
+        token: ci_t,
+    };
+    let head = || -> String {
+        alice.json(root, &["log", "-n", "1", "main"])["entries"][0]["id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+
+    let wc = root.join("wc");
+    alice.ok(root, &["init", wc.to_str().unwrap()]);
+    write(&wc, "src/parser.rs", "fn parse() -> bool { true }\n");
+    alice.ok(&wc, &["commit", "-m", "seed"]);
+    alice.ok(&wc, &["land"]);
+    let mut lands = vec![head()];
+    // Twenty lands; the 13th plants the break among unrelated changes.
+    const PLANTED: usize = 13;
+    for i in 1..=20 {
+        write(&wc, &format!("docs/note{i}.md"), &format!("note {i}\n"));
+        if i == PLANTED {
+            write(&wc, "src/parser.rs", "fn parse() -> bool { false }\n");
+        }
+        alice.ok(&wc, &["commit", "-m", &format!("change {i}")]);
+        alice.ok(&wc, &["land"]);
+        lands.push(head());
+    }
+
+    // The fake CI: "test" passes while the parser still returns true. It
+    // posts for the exact id it tested.
+    let run_ci = |id: &str| -> bool {
+        let src = ci.ok(root, &["cat", id, "src/parser.rs"]);
+        let pass = src.contains("true");
+        let outcome = if pass { "pass" } else { "fail" };
+        ci.ok(
+            root,
+            &[
+                "checks",
+                "post",
+                id,
+                "test",
+                outcome,
+                "--url",
+                "https://ci.example/1",
+            ],
+        );
+        pass
+    };
+    // CI kept up for a while, then fell behind and tested only the head.
+    for id in &lands[..=5] {
+        assert!(run_ci(id));
+    }
+    assert!(!run_ci(&lands[20]));
+    let st = alice.json(root, &["checks", "ref", "main"]);
+    assert_eq!(st["green"], serde_json::json!(lands[5]));
+    assert_eq!(st["red"]["check"], "test");
+    let out = alice.run(root, &["checks", "ref", "main"]);
+    assert_eq!(out.status.code(), Some(1), "red exits 1");
+    assert!(stdout(&out).contains("is red since"), "{}", stdout(&out));
+
+    // The suspects: every land above green.
+    let c = alice.json(root, &["checks", "culprits", "main"]);
+    let suspects: Vec<&str> = c["suspects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["changeset"].as_str().unwrap())
+        .collect();
+    let want: Vec<&str> = lands[6..].iter().rev().map(String::as_str).collect();
+    assert_eq!(suspects, want);
+    assert_eq!(c["truncated"], false);
+    let text = alice.ok(root, &["checks", "culprits", "main"]);
+    assert!(
+        text.contains("Suspects for") && text.contains("not a verdict"),
+        "{text}"
+    );
+    let touching: Vec<&str> = c["suspects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|s| {
+            s["paths"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|p| p == "src/parser.rs")
+        })
+        .map(|s| s["changeset"].as_str().unwrap())
+        .collect();
+    assert_eq!(touching, [lands[PLANTED].as_str()]);
+
+    // A sheriff narrows it: CI runs on the suspects, oldest first, until one
+    // fails. Passes promote green on the way.
+    let mut good = lands[5].clone();
+    let mut bad = None;
+    for id in &lands[6..20] {
+        if run_ci(id) {
+            good = id.clone();
+        } else {
+            bad = Some(id.clone());
+            break;
+        }
+    }
+    let bad = bad.expect("a failing land");
+    assert_eq!(bad, lands[PLANTED]);
+    assert_eq!(
+        alice.json(root, &["checks", "ref", "main"])["green"],
+        serde_json::json!(lands[PLANTED - 1])
+    );
+    let c = alice.json(
+        root,
+        &["checks", "culprits", "main", "--bad", &bad, "--good", &good],
+    );
+    assert_eq!(c["suspects"].as_array().unwrap().len(), 1);
+    assert_eq!(c["suspects"][0]["changeset"], serde_json::json!(bad));
+    assert_eq!(c["suspects"][0]["created_by"], "alice");
+    let st = alice.json(root, &["checks", "status", &bad]);
+    assert_eq!(st["checks"][0]["by"], "ci-test");
+
+    // Only the server moves green; alice may not attest her own changes.
+    let out = alice.run(&wc, &["land", "--ref", "green/main"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(stderr(&out).contains("promotion"), "{}", stderr(&out));
+    let out = alice.run(root, &["checks", "post", &bad, "test", "pass"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+}
