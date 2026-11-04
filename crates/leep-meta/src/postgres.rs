@@ -1675,6 +1675,35 @@ impl MetaStore for PostgresMetaStore {
         Ok(())
     }
 
+    /// The insert waits for a racing insert of the same key to commit or
+    /// roll back, and the select that follows sees the winner.
+    async fn put_derived_if_absent(&self, kind: &str, key: &Hash, value: Bytes) -> Result<Bytes> {
+        let mut tx = self
+            .db_for("put_derived_if_absent")
+            .begin()
+            .await
+            .map_err(storage)?;
+        sqlx::query(
+            "INSERT INTO derived (kind, key, value) VALUES ($1, $2, $3) \
+             ON CONFLICT (kind, key) DO NOTHING",
+        )
+        .bind(kind)
+        .bind(key.as_bytes().as_slice())
+        .bind(value.as_ref())
+        .execute(&mut *tx)
+        .await
+        .map_err(storage)?;
+        let won: Vec<u8> =
+            sqlx::query_scalar("SELECT value FROM derived WHERE kind = $1 AND key = $2")
+                .bind(kind)
+                .bind(key.as_bytes().as_slice())
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(storage)?;
+        tx.commit().await.map_err(storage)?;
+        Ok(Bytes::from(won))
+    }
+
     /// One transaction of two statements, whatever the number of ids.
     async fn delete_changesets(&self, ids: &[ChangesetId], kinds: &[&str]) -> Result<u64> {
         if ids.is_empty() {

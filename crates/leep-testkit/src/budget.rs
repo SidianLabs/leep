@@ -862,6 +862,21 @@ impl MetaStore for Budget {
         Ok(())
     }
 
+    async fn put_derived_if_absent(&self, kind: &str, key: &Hash, value: Bytes) -> Result<Bytes> {
+        let len = n(value.len());
+        let won = self
+            .meta(
+                "meta.put_derived_if_absent",
+                1,
+                len,
+                self.meta.put_derived_if_absent(kind, key, value),
+                |v| n(v.len()),
+            )
+            .await?;
+        self.kind(kind, 1, len);
+        Ok(won)
+    }
+
     async fn put_derived_many(&self, rows: &[DerivedRow]) -> Result<()> {
         self.meta(
             "meta.put_derived_many",
