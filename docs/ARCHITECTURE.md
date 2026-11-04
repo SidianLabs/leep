@@ -1403,7 +1403,7 @@ misses and occupancy as Prometheus metrics (see [OPERATIONS.md](OPERATIONS.md)).
 | Land CAS contention | Bounded retries, then an error | Client retries `land` |
 | Server started on a database from a newer release, or whose applied migration was edited | The store refuses to open (`database schema vN is newer than this server`), before any write | Upgrade the server; never edit an applied migration (ADR 0023) |
 | Server started on a store whose rows use a format feature it does not know (`store_features`) | The store refuses to open, naming the feature, before any read of a row | Upgrade the server (ADR 0055). Servers from before the table cannot check it, so finish a rollout before running `compact-changesets` |
-| A land's follow-up that closes review requests fails, times out or dies with the server | The land already answered and the ref already moved; the follow-up only updates `review_requests` rows, each in one conditional statement, so at worst some requests stay open (ADR 0086) | The next listing closes those whose changeset is on the ref's first-parent chain; a request for a replayed copy stays open until withdrawn |
+| A land's follow-up that closes review requests fails, times out or dies with the server | The land already answered and the ref already moved; the follow-up only updates `review_requests` rows, each in one conditional statement, so at worst some requests stay open (ADR 0086) | The next listing closes those whose changeset is on the ref's first-parent chain, or whose reviewed change a changeset among the ref's newest 64 copies or lands byte for byte (ADR 0087); others stay open until withdrawn |
 | Migration fails or the migrating process dies mid-run | Every pending migration and its `schema_migrations` row run in one transaction: the database stays at the version it started at | Fix the cause and start again; concurrent starters wait on the lock and find the work done |
 | Data damaged at rest (bit rot, a bad restore, a hand-edited table) | Content-addressed objects fail their hash check on read; derived rows without one can answer wrongly and silently (ADR 0021) | `leep-server verify` names every damaged object and row; `repair rederive` rewrites derived rows, and blobs and changesets are restored from backup (OPERATIONS.md, "Verify and repair") |
 | Backup taken while servers and GC run | The metadata snapshot is one instant; blobs are copied after it, and a blob the snapshot needs cannot have been deleted (ADR 0012), so the backup restores. A backup whose check finds a missing blob is sealed as failed, exits 1, and `restore` refuses it | Alert on `leep_backup_last_run_ok` and the last-success age; take another backup (ADR 0026) |
@@ -1543,9 +1543,13 @@ compared (with more, none carry). `review-status` names the source in
 `carried_from`. It is a second
 `LandPolicy`: `Repo::with_land_policy` composes policies (all must pass), and
 `check_land` now receives the head so owners and new history agree.
-`GET .../review-status?ref=` shows the per-path state, `GET .../reviews`
-lists verdicts (with `via` for rebased copies), and `leep review ...` and the
-`leep_review_status` MCP tool are the clients.
+`GET .../review-status?ref=` shows the per-path state (and `on_refs`, the
+refs that already hold the changeset), `GET .../reviews` lists verdicts, its
+own then those carried to it with `carried_from` (`via` for a rebased copy
+whose original's reviews do not carry, ADR 0087), and `leep review ...` and the
+`leep_review_status` MCP tool are the clients. A verdict on a changeset
+already on a policy ref is stored and answered with `on_refs`; a reject or
+withdrawal answers the candidates it was also written on in `taken_back`.
 
 **Review requests and creators** ([ADR 0086](adr/0086-review-requests-and-creators.md)).
 A review request is server state, not an attestation: rows of the
@@ -1558,11 +1562,20 @@ the paths `review-status` still finds pending or rejected on the target ref
 review, the ref must exist, and a requester may have 100 open requests. `GET /v1/review-requests?reviewer=NAME&open=true` is a reviewer's
 inbox. After a land answers `landed`, a spawned task closes the ref's open
 requests that the land satisfied (the landed changeset, its stack by the
-copies' server-written `rebased-origin-v1` rows, never a client's
-`leep.rebased_from`, and anything else now on the head's
-first-parent chain); it never changes the ref and its errors are only
+copies' server-written `rebased-origin-v1` rows, and anything else now on
+the head's first-parent chain). It also closes requests whose changeset a
+changeset the land added (from the ref log entry of the move down to the
+old head) names in `leep.rebased_from`, when that changeset lands the
+reviewed change byte for byte (ADR 0085's content rule, with the policy's
+auto rules) or the land's token made the request
+([ADR 0087](adr/0087-review-requests-close-by-content.md)): the hint picks
+what to compare and content decides, so a forged hint closes nothing whose
+change did not land. It never changes the ref and its errors are only
 logged, so it cannot fail a land. A listing closes what the task missed,
-for requests on the page, by a first-parent check against the ref's head.
+for requests on the page, by a first-parent check against the ref's head
+and the content rule over the newest 64 changesets there. Entries carry
+`approved_by` and `rejected_by`, the reviewers' own verdicts, read in one
+batch per page.
 An authenticated `POST /v1/changesets` writes a `created-by-v1` row only
 in the store write that inserts the changeset
 (`put_changeset_with_derived_if_new`), and `GET /v1/changesets/{id}` answers it as `created_by`, so

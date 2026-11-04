@@ -7,6 +7,8 @@
 //! knows its principals, so it lists a changeset's reviews with one lookup per
 //! principal.
 
+use std::collections::HashMap;
+
 use bytes::Bytes;
 use leep_core::review::{
     check_comment, check_source, Review, ReviewSource, REVIEW_KIND, REVIEW_SOURCE_KIND,
@@ -79,5 +81,34 @@ impl Repo {
             Some(b) => Ok(Some(Review::decode(&b)?)),
             None => Ok(None),
         }
+    }
+
+    /// The stored reviews of each of `ids` by each of `reviewers`, read in
+    /// batched lookups instead of one per pair. Rows that do not decode or
+    /// name another reviewer count as absent; ids with none are left out.
+    pub async fn reviews_by(
+        &self,
+        ids: &[ChangesetId],
+        reviewers: &[String],
+    ) -> Result<HashMap<ChangesetId, Vec<Review>>> {
+        const BATCH: usize = 512;
+        let pairs: Vec<(ChangesetId, &String)> = ids
+            .iter()
+            .flat_map(|id| reviewers.iter().map(move |r| (*id, r)))
+            .collect();
+        let mut out: HashMap<ChangesetId, Vec<Review>> = HashMap::new();
+        for chunk in pairs.chunks(BATCH) {
+            let keys: Vec<Hash> = chunk.iter().map(|(id, r)| storage_key(*id, r)).collect();
+            let rows = self.meta().get_derived_many(REVIEW_KIND, &keys).await?;
+            for ((id, name), row) in chunk.iter().zip(rows) {
+                let Some(review) = row.and_then(|b| Review::decode(&b).ok()) else {
+                    continue;
+                };
+                if &review.reviewer == *name {
+                    out.entry(*id).or_default().push(review);
+                }
+            }
+        }
+        Ok(out)
     }
 }

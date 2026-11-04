@@ -696,6 +696,25 @@ No changeset, tree or hash changed. Added:
   all in one object. Every field a client may omit has a default, and every
   optional answer field is omitted when absent.
 
+Later additions (ADR 0087), all optional with `#[serde(default)]` and
+omitted when empty, so older clients ignore them and older servers never
+send them:
+
+- `ReviewRequestEntry` gains `approved_by` and `rejected_by`: token names
+  whose own current verdict on the requested changeset is an approval or a
+  reject.
+- `ReviewEntry` (`GET .../reviews`) gains `carried_from`: the changeset whose
+  review this is, listed because it carries to the asked one (ADR 0085).
+  `ReviewsResponse::via` is now set only when no review is the changeset's
+  own and none carries.
+- `AddReviewResponse` gains `on_refs` (refs a land policy covers whose
+  first-parent chain already holds the changeset) and `taken_back`
+  (changesets a reject or withdrawal was also written on).
+- `ReviewStatusResponse` gains `on_refs` (the asked ref and the policy refs
+  whose first-parent chain holds the changeset).
+
+Nothing persisted changed.
+
 ## Index leases and bounded queries (additive, ADR 0058)
 
 No table, column or stored encoding changed.

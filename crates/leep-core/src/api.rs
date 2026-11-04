@@ -626,6 +626,16 @@ pub struct AddReviewRequest {
 pub struct AddReviewResponse {
     pub reviewer: String,
     pub verdict: Verdict,
+    /// Refs a land policy covers whose first-parent chain already holds the
+    /// changeset (ADR 0087). The verdict is stored all the same: it still
+    /// counts for copies (a cherry-pick to a release ref) and for changesets
+    /// that name this one, but no longer decides a land of it there.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub on_refs: Vec<String>,
+    /// Changesets this reject or withdrawal was also written on, because the
+    /// same reviewer's approval of them carried to this one (ADR 0085).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub taken_back: Vec<ChangesetId>,
 }
 
 /// A stored review as listed: the review's own fields plus, when a
@@ -641,6 +651,11 @@ pub struct ReviewEntry {
     /// Token name that posted it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub via: Option<String>,
+    /// Set when this is a review of another changeset that carries to this
+    /// one, because this one reproduces its reviewed change exactly
+    /// (ADR 0085, 0087). Such a review counts for landing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub carried_from: Option<ChangesetId>,
 }
 
 impl From<Review> for ReviewEntry {
@@ -649,6 +664,7 @@ impl From<Review> for ReviewEntry {
             review,
             source: None,
             via: None,
+            carried_from: None,
         }
     }
 }
@@ -664,9 +680,11 @@ impl std::ops::Deref for ReviewEntry {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewsResponse {
     pub reviews: Vec<ReviewEntry>,
-    /// Set when the changeset has no review of its own but is a server-made
-    /// rebased copy of this one, whose `reviews` are reported instead.
-    /// Informational: the land policy never accepts a copy on this basis.
+    /// Set when the changeset has no review of its own and none carries to
+    /// it, but it is a server-made rebased copy of this one, whose `reviews`
+    /// are reported instead. They do not count for landing it: the copy does
+    /// not reproduce their reviewed change (one that did would list them
+    /// with `carried_from` instead).
     #[serde(default)]
     pub via: Option<ChangesetId>,
 }
@@ -696,6 +714,11 @@ pub struct ReviewStatusResponse {
     pub target_ref: String,
     pub approved: bool,
     pub paths: Vec<PathReview>,
+    /// `target_ref` and the refs a land policy covers whose first-parent
+    /// chain already holds the changeset (ADR 0087): it has landed there,
+    /// so `approved` no longer decides anything on them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub on_refs: Vec<String>,
 }
 
 /// `POST /v1/review-requests`: ask for a review (ADR 0086).
@@ -734,6 +757,13 @@ pub struct ReviewRequestEntry {
     /// First line of the changeset's message; absent if it is gone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// Reviewers whose own current verdict on the changeset is an approval
+    /// or a reject (ADR 0087): who has answered. Carried verdicts are not
+    /// listed; `review-status` judges those.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub approved_by: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rejected_by: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1638,19 +1668,24 @@ mod tests {
         .unwrap();
         assert_eq!(entry.request.id, 7);
         assert_eq!((&entry.created_by, &entry.title), (&None, &None));
+        assert!(entry.approved_by.is_empty() && entry.rejected_by.is_empty());
         let v = serde_json::to_value(&entry).unwrap();
         assert_eq!(v["requester"], "ada");
         assert!(v.get("request").is_none() && v.get("created_by").is_none());
+        assert!(v.get("approved_by").is_none() && v.get("rejected_by").is_none());
         let with = ReviewRequestEntry {
             created_by: Some(CreatedBy {
                 principal: "ada".into(),
                 timestamp: 4,
             }),
             title: Some("t".into()),
+            approved_by: vec!["rhea".into()],
+            rejected_by: vec!["bo".into()],
             ..entry
         };
         let v = serde_json::to_value(&with).unwrap();
         assert_eq!(v["created_by"]["principal"], "ada");
+        assert_eq!(v["approved_by"][0], "rhea");
         assert_eq!(
             serde_json::from_value::<ReviewRequestEntry>(v).unwrap(),
             with
@@ -1685,9 +1720,31 @@ mod tests {
             serde_json::json!({ "verdict": "shrug" })
         )
         .is_err());
+        assert_eq!(e.carried_from, None);
+        assert!(plain.get("carried_from").is_none());
+        let carried = ReviewEntry {
+            carried_from: Some(ChangesetId(Hash::of_blob(b"x"))),
+            ..e.clone()
+        };
+        let v = serde_json::to_value(&carried).unwrap();
+        assert_eq!(serde_json::from_value::<ReviewEntry>(v).unwrap(), carried);
         let v: ReviewsResponse =
             serde_json::from_value(serde_json::json!({ "reviews": [] })).unwrap();
         assert_eq!(v.via, None);
+        // Before on_refs and taken_back existed.
+        let r: AddReviewResponse = serde_json::from_value(serde_json::json!({
+            "reviewer": "a", "verdict": "approve"
+        }))
+        .unwrap();
+        assert!(r.on_refs.is_empty() && r.taken_back.is_empty());
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v.as_object().unwrap().len(), 2, "empty lists are omitted");
+        let s: ReviewStatusResponse = serde_json::from_value(serde_json::json!({
+            "changeset": ChangesetId(Hash::of_blob(b"x")).to_string(),
+            "target_ref": "main", "approved": false, "paths": []
+        }))
+        .unwrap();
+        assert!(s.on_refs.is_empty());
         let p: PathReview = serde_json::from_value(serde_json::json!({
             "path": "a", "rule": "owner", "owners": [], "approved_by": []
         }))

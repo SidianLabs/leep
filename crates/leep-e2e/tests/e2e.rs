@@ -1256,6 +1256,109 @@ fn server_derive_search(stores: &Stores, rev: &str) -> String {
     stdout(&out)
 }
 
+/// ADR 0087: a reviewed change whose land conflicted only in the changelog
+/// is resolved by a client commit naming it. Landing that commit closes the
+/// request by content (here another token runs the land, so the requester
+/// rule is not what closes it), and the listing says who approved it.
+#[test]
+fn a_request_closes_when_its_resolved_conflict_lands() {
+    let _g = serial();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let mut entries = Vec::new();
+    let mut token = |name: &str| {
+        let (t, e) = gen_token(name, "write");
+        entries.push(e);
+        t
+    };
+    let (alice_t, bob_t, carol_t) = (token("alice"), token("bob"), token("carol"));
+    let tokens = root.join("tokens.json");
+    fs::write(
+        &tokens,
+        serde_json::json!({ "tokens": entries }).to_string(),
+    )
+    .unwrap();
+    let policy = root.join("review.json");
+    fs::write(
+        &policy,
+        r#"{ "refs": ["main"], "auto_approve": ["docs_only"], "docs_globs": ["**/*.md"] }"#,
+    )
+    .unwrap();
+    let stores = Stores::sqlite(&root.join("data"));
+    let server = Server::start_with(
+        free_port(),
+        &stores,
+        root,
+        &[
+            "--tokens-file",
+            tokens.to_str().unwrap(),
+            "--review-policy-file",
+            policy.to_str().unwrap(),
+        ],
+    );
+    let client = Client::new(&server.url, &root.join("cache"));
+    let user = |token: &str| User {
+        client: &client,
+        token: token.to_string(),
+    };
+    let (alice, bob, carol) = (user(&alice_t), user(&bob_t), user(&carol_t));
+
+    let wc_a = root.join("wc-alice");
+    alice.ok(root, &["init", wc_a.to_str().unwrap()]);
+    write(&wc_a, "OWNERS", "bob\n");
+    write(&wc_a, "src/lib.rs", "fn a() {}\n");
+    write(&wc_a, "CHANGELOG.md", "# log\n");
+    alice.ok(&wc_a, &["commit", "-m", "seed"]);
+    bob.ok(root, &["review", "approve", &alice.tip(&wc_a)]);
+    alice.ok(&wc_a, &["land"]);
+    let wc_c = root.join("wc-carol");
+    carol.ok(root, &["init", wc_c.to_str().unwrap()]);
+
+    // Alice's reviewed change, approved by bob.
+    write(&wc_a, "src/lib.rs", "fn a() { 1 }\n");
+    write(&wc_a, "CHANGELOG.md", "# log\n- alice\n");
+    alice.ok(&wc_a, &["commit", "-m", "alice's change"]);
+    let x = alice.tip(&wc_a);
+    alice.ok(&wc_a, &["review", "request", "@"]);
+    bob.ok(root, &["review", "approve", &x]);
+    let mine = alice.json(root, &["review", "inbox", "--mine"]);
+    assert_eq!(mine["requests"][0]["state"], "open");
+    assert_eq!(
+        mine["requests"][0]["approved_by"],
+        serde_json::json!(["bob"])
+    );
+
+    // Carol's changelog line lands first; alice's land conflicts there.
+    write(&wc_c, "CHANGELOG.md", "# log\n- carol\n");
+    carol.ok(&wc_c, &["commit", "-m", "carol's note"]);
+    assert!(carol.ok(&wc_c, &["land"]).contains("Landed"));
+    let out = alice.run(&wc_a, &["land"]);
+    assert_eq!(out.status.code(), Some(5), "{}", stderr(&out));
+    write(&wc_a, "CHANGELOG.md", "# log\n- carol\n- alice\n");
+    alice.ok(&wc_a, &["commit", "-m", "alice's change"]);
+    let z = alice.tip(&wc_a);
+    assert_ne!(z, x);
+    // Carol lands alice's resolution: not the requester, so only the
+    // content rule can close the request.
+    assert!(carol.ok(&wc_a, &["land"]).contains("Landed"));
+    let mut entry = serde_json::Value::Null;
+    for _ in 0..100 {
+        entry = alice.json(root, &["review", "inbox", "--mine", "--all"])["requests"][0].clone();
+        if entry["state"] == "landed" {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert_eq!(entry["state"], "landed", "{entry}");
+    assert_eq!(entry["landed_as"], z.as_str());
+    let inbox = bob.ok(root, &["review", "inbox"]);
+    assert!(inbox.contains("No review requests"), "{inbox}");
+    // A verdict on the landed changeset is kept, and the server says it
+    // is already on main.
+    let r = bob.json(root, &["review", "approve", &z]);
+    assert_eq!(r["on_refs"], serde_json::json!(["main"]), "{r}");
+}
+
 #[test]
 fn code_search_over_the_real_binaries() {
     let _g = serial();

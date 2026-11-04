@@ -21,6 +21,24 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 ### leep-git mirror refuses shallow clones
 - **Fixed.** `leep-git mirror` refuses a shallow git repository in its work directory with the same clear error as `leep-git import`, instead of failing obscurely or pushing incomplete history.
+### Review requests close when their reviewed change lands, and show who answered
+- **Fixed.** A review request stayed `open` after its change landed as a
+  client's conflict resolution. A land now also closes a request when a
+  changeset it added names the requested changeset in `leep.rebased_from`
+  and either lands its reviewed change byte for byte (the content rule
+  verdicts carry by, with the policy's auto rules) or was landed by the
+  request's requester; a request whose change is all auto-approved closes
+  once those paths land in an auto-approved form. A listing applies the
+  content rule to what the land missed. A forged hint still closes nothing
+  whose reviewed change did not land (ADR 0087).
+- **Added.** Review request entries carry `approved_by` and `rejected_by`,
+  the reviewers' own verdicts on the changeset. `GET .../reviews` lists
+  the verdicts carried to a changeset with `carried_from`, instead of "no
+  reviews"; `via` now appears only where the original's reviews do not
+  count. A review post answers `on_refs` (policy refs that already hold
+  the changeset: the verdict is kept but no longer decides a land there)
+  and `taken_back` (where a reject or withdrawal was also written);
+  `review-status` answers `on_refs`. All optional and omitted when empty.
 
 ### Review verdicts carry across identical rebases; policy refusals are 422
 - **Changed.** A reviewer's approve or reject of a changeset X now counts

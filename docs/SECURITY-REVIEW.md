@@ -68,7 +68,7 @@ change with a regression test.
 | S-21 | Auth | Low | Tokens had no time bound, so a token made for a short-lived agent stayed valid until removed by hand | Fixed 2026-10-21, `expires`, ADR 0007 |
 | S-23 | Review | High | A merge that kept its first parent's version dropped a side parent's change without review; an empty merge with an old first parent could rewind a reviewed ref | Fixed 2026-10-28, ADR 0011 |
 | S-22 | Review | Medium | Every write token was a reviewer, so one agent could approve another's change, or its own on unowned paths | Fixed 2026-10-21, `"review": false`, ADR 0011 |
-| S-24 | Review | Info | Verdicts carried to a re-committed changeset (ADR 0085) must not follow a forged `leep.rebased_from`, a moved base or a dropped path; the clean-replay trust of ADR 0011 remains | Designed in 2026-11-03, ADR 0085 |
+| S-24 | Review | Info | Verdicts carried to a re-committed changeset (ADR 0085) must not follow a forged `leep.rebased_from`, a moved base or a dropped path; the clean-replay trust of ADR 0011 remains | Designed in 2026-11-03, ADR 0085; review requests close by the same rule, 2026-11-04, ADR 0087 |
 
 ### S-01: merge-parent laundering (High, fixed)
 
@@ -179,6 +179,35 @@ three-way merged an owned file the original changed, a file content nobody
 reviewed. Carrying requires the reviewed files to be untouched, so it is
 strictly narrower. A policy that reviews the final tree would close both;
 none exists.
+
+*Closing review requests (ADR 0087).* Review requests now also close when a
+changeset a land added names the requested changeset in `leep.rebased_from`.
+The risk is the one ADR 0086 refused the hint for: one agent's land closing
+another agent's request whose change never landed, so the reviewer stops
+looking for it. The same rule as for carrying decides: the request closes
+by content only when the named changeset's reviewed change is on the landed
+changeset byte for byte (same old and new content and kind for every path
+that needed a reviewer); otherwise only the request's own requester's land
+closes it, and a requester may withdraw anyway. The requester rule counts
+only changesets the land added: the first-parent chain from the landed
+changeset down to the old head of the newest ref log entry moving the ref
+there, and only when that entry names the land's actor. A land that moved
+nothing (already on the ref, landed as a copy, a replayed land id) writes no
+entry; then, or when the entry is out of reach, the landed changeset and the
+contiguous server copies below it (at most 256) are checked by content and
+copy row only, so a requester re-landing another agent's forged-hint land
+closes nothing by the hint (found in review of the first version:
+`a_re_land_by_the_requester_closes_nothing_by_hint`). A
+listing applies the content rule only. *Accepted:* a request for an
+auto-only change (every path docs, comment-only or whitespace-only) closes
+when a changeset naming it changes the same paths in an auto-approved form,
+by anyone, since such paths need no reviewer. Tests in
+`crates/leep-derive/src/review_requests.rs`:
+`a_forged_rebased_from_closes_nothing` (the forger's own land with every
+auto rule, a replayed land on top, the requester's later land on top, and a
+listing), `a_resolution_that_changed_a_reviewed_byte_stays_open`,
+`another_agents_land_naming_it_does_not`,
+`the_requesters_own_land_closes_a_stack_entry_the_content_rule_refuses`.
 
 ### S-02: checkout writes outside the working copy (High, fixed)
 

@@ -1093,14 +1093,45 @@ async fn add_review(
     repo.put_review(id, &review).await?;
     // A reject or withdrawal also takes back the approvals by the same
     // reviewer that carried to `id` (ADR 0085).
-    if let Some(service) = config.review.as_ref() {
-        service.take_back(&repo, id, &review, &who.name).await?;
-    }
+    let taken_back = match config.review.as_ref() {
+        Some(service) => service.take_back(&repo, id, &review, &who.name).await?,
+        None => Vec::new(),
+    };
+    // A verdict on a changeset already landed is kept (it counts for its
+    // copies, a cherry-pick to a release ref), but the client is told
+    // (ADR 0087). Only an answer: the verdict is already stored.
+    let on_refs = repo
+        .refs_holding(id, &policy_refs(&repo, &config).await?)
+        .await?;
     Ok(Json(AddReviewResponse {
         reviewer,
         verdict: req.verdict,
+        on_refs,
+        taken_back,
     })
     .into_response())
+}
+
+/// The refs a land policy covers, sorted. A reloadable config knows them
+/// by name; a fixed one (handed a policy object) only answers per ref, so
+/// the ref list is filtered.
+async fn policy_refs(
+    repo: &Repo,
+    config: &reload::RuntimeConfig,
+) -> leep_core::Result<Vec<String>> {
+    let Some(policy) = config.land_policy.as_ref() else {
+        return Ok(Vec::new());
+    };
+    if !config.protected_refs().is_empty() {
+        return Ok(config.protected_refs().to_vec());
+    }
+    Ok(repo
+        .meta()
+        .list_refs()
+        .await?
+        .into_keys()
+        .filter(|name| policy.applies_to(name))
+        .collect())
 }
 
 async fn get_reviews(
@@ -1130,7 +1161,8 @@ async fn review_status(
         .as_ref()
         .ok_or_else(|| Error::Invalid(NEEDS_AUTH.into()))?;
     let target = q.target_ref.unwrap_or_else(|| "main".into());
-    Ok(Json(service.status(&repo, id, &target).await?))
+    let refs = policy_refs(&repo, &config).await?;
+    Ok(Json(service.status(&repo, id, &target, &refs).await?))
 }
 
 async fn list_refs(State(repo): S) -> ApiResult<Json<RefsResponse>> {
@@ -1710,7 +1742,14 @@ async fn land(
         let resp = repo
             .land_keyed(req.changeset, &req.target_ref, actor, create, req.land_id)
             .await?;
-        review_requests::after_land(repo.clone(), req.target_ref, req.changeset, &resp);
+        review_requests::after_land(
+            repo.clone(),
+            &config,
+            req.target_ref,
+            req.changeset,
+            actor,
+            &resp,
+        );
         return Ok(Json(resp).into_response());
     };
     // The client's body byte for byte, so fields this server does not know
@@ -1731,7 +1770,14 @@ async fn land(
             .await?
         {
             Coordinated::Landed(r) => {
-                review_requests::after_land(repo.clone(), req.target_ref, req.changeset, &r);
+                review_requests::after_land(
+                    repo.clone(),
+                    &config,
+                    req.target_ref,
+                    req.changeset,
+                    actor,
+                    &r,
+                );
                 Json(r).into_response()
             }
             Coordinated::Forwarded(relayed) => relayed.into_response(),

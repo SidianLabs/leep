@@ -3067,6 +3067,19 @@ mod review {
         assert_eq!(carried(byte).await, None);
         let dropped = commit(&r, &[moved], &[("N.md", Some("x\n"))], "dropped").await;
         assert_eq!(carried(dropped).await, None);
+        // Every path auto and none reproduced: an empty set, which carries
+        // no verdict but lost nothing reviewed (ADR 0087).
+        let docs_x = commit(&r, &[base], &[("N.md", Some("x\n"))], "docs x").await;
+        assert_eq!(
+            r.carried_paths(docs_x, y, &docs).await.unwrap(),
+            Some(BTreeSet::new())
+        );
+        assert_eq!(
+            r.carried_paths(docs_x, y, &ReviewRules::default())
+                .await
+                .unwrap(),
+            None
+        );
         let mut exec = BTreeMap::new();
         exec.insert(
             rp("a.rs"),

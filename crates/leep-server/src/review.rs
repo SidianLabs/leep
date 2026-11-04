@@ -107,6 +107,16 @@ impl ReviewService {
         ReviewService { rules, reviewers }
     }
 
+    /// The policy's auto rules, for closing review requests by content.
+    pub fn rules(&self) -> &ReviewRules {
+        &self.rules
+    }
+
+    /// The principals whose reviews count.
+    pub fn reviewers(&self) -> &[String] {
+        &self.reviewers
+    }
+
     /// Stored reviews of exactly `id`, one lookup per principal, sorted by
     /// reviewer. A row that does not decode or names another reviewer counts
     /// as absent.
@@ -136,16 +146,38 @@ impl ReviewService {
                     .filter(|s| !s.is_empty()),
                 via: row.map(|s| s.via),
                 review,
+                carried_from: None,
             });
         }
         Ok(out)
     }
 
-    /// The `GET .../reviews` answer. A changeset with none of its own but
-    /// recorded as a server-made rebase of one that has some reports those,
-    /// with `via` naming the original.
+    /// The `GET .../reviews` answer: `id`'s own reviews, then those that
+    /// carry to it (ADR 0085) with `carried_from` naming the changeset
+    /// reviewed, one per reviewer and candidate, as the judge reads them.
+    /// A changeset with neither but recorded as a server-made rebase of one
+    /// that has some reports those, with `via` naming the original: they do
+    /// not count, since the copy does not reproduce their change.
     pub async fn describe(&self, repo: &Repo, id: ChangesetId) -> Result<ReviewsResponse> {
-        let own = self.entries_for(repo, id).await?;
+        let mut own = self.entries_for(repo, id).await?;
+        let mine: Vec<Review> = own.iter().map(|e| e.review.clone()).collect();
+        let carried = self
+            .carried(repo, id, &mine, &mut CarryCache::default())
+            .await?;
+        for c in carried {
+            for review in c.reviews {
+                let row = repo.get_review_source(c.from, &review.reviewer).await?;
+                own.push(ReviewEntry {
+                    source: row
+                        .as_ref()
+                        .map(|s| s.source.clone())
+                        .filter(|s| !s.is_empty()),
+                    via: row.map(|s| s.via),
+                    review,
+                    carried_from: Some(c.from),
+                });
+            }
+        }
         if !own.is_empty() {
             return Ok(ReviewsResponse {
                 reviews: own,
@@ -226,7 +258,12 @@ impl ReviewService {
                 tracing::info!(%id, "review carry: too many reviewed candidates, none carried");
                 return Ok(Vec::new());
             }
-            if let Some(paths) = repo.carried_paths(from, id, &self.rules).await? {
+            // An empty set reproduces nothing a verdict could count on.
+            if let Some(paths) = repo
+                .carried_paths(from, id, &self.rules)
+                .await?
+                .filter(|p| !p.is_empty())
+            {
                 out.push(Carried {
                     from,
                     paths,
@@ -268,7 +305,11 @@ impl ReviewService {
             if theirs.verdict != Verdict::Approve {
                 continue;
             }
-            if repo.carried_paths(from, id, &self.rules).await?.is_none() {
+            if !repo
+                .carried_paths(from, id, &self.rules)
+                .await?
+                .is_some_and(|p| !p.is_empty())
+            {
                 continue;
             }
             let timestamp = if theirs.timestamp >= review.timestamp {
@@ -307,11 +348,14 @@ impl ReviewService {
     /// The `GET .../review-status` answer: `id` judged against the current
     /// head of `target_ref` as the land policy judges it, with its own
     /// reviews and any carried from an origin it reproduces (ADR 0085).
+    /// `on_refs` are the refs to report as already holding `id`, among
+    /// `target_ref` and `policy_refs`.
     pub async fn status(
         &self,
         repo: &Repo,
         id: ChangesetId,
         target_ref: &str,
+        policy_refs: &[String],
     ) -> Result<ReviewStatusResponse> {
         repo.get_changeset(id).await?;
         let head = repo.meta().get_ref(target_ref).await?;
@@ -323,6 +367,11 @@ impl ReviewService {
             changeset: id,
             target_ref: target_ref.to_string(),
             approved: review.approved(),
+            on_refs: {
+                let mut refs = vec![target_ref.to_string()];
+                refs.extend(policy_refs.iter().filter(|r| *r != target_ref).cloned());
+                repo.refs_holding(id, &refs).await?
+            },
             paths: review
                 .paths
                 .into_iter()

@@ -442,8 +442,12 @@ impl Repo {
     /// it. `None` when a path of `from` that needed a reviewer is changed
     /// differently in `id`, or missing from it (so a reviewed path never
     /// carries without the others it was approved with), when `from` is a
-    /// merge or changes more than [`MAX_CARRY_PATHS`] paths, or when nothing
-    /// is reproduced. Paths only `id` changes are judged on their own.
+    /// merge or changes more than [`MAX_CARRY_PATHS`] paths. An empty set
+    /// means every path of `from` is one an auto rule approves there and
+    /// none is reproduced: nothing carries a verdict (callers that carry
+    /// verdicts skip it), but nothing reviewed was lost either, which is
+    /// what closing a review request asks (ADR 0087). Paths only `id`
+    /// changes are judged on their own.
     ///
     /// Cheap by construction: a path whose new content differs is refused
     /// before any read unless an auto rule could hold for it, then each
@@ -517,7 +521,45 @@ impl Repo {
                 return Ok(None);
             }
         }
-        Ok((!out.is_empty()).then_some(out))
+        Ok(Some(out))
+    }
+
+    /// Whether `id` puts the reviewed change of `from` on its ref, the
+    /// content rule a review request for `from` closes by (ADR 0087):
+    /// [`Self::carried_paths`] holds and reproduces at least one path, or
+    /// every path of `from` is one an auto rule approves there and `id`
+    /// changes each of them in a form an auto rule approves in `id`. Like
+    /// carrying, it is decided by content alone, so a forged hint closes
+    /// nothing whose reviewed change did not land.
+    pub async fn lands_reviewed_change(
+        &self,
+        from: ChangesetId,
+        id: ChangesetId,
+        rules: &ReviewRules,
+    ) -> Result<bool> {
+        let paths = match self.carried_paths(from, id, rules).await {
+            Ok(Some(paths)) => paths,
+            Ok(None) | Err(Error::NotFound(_)) => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        if !paths.is_empty() {
+            return Ok(true);
+        }
+        let theirs = self.get_changeset(from).await?;
+        let mine = self.get_changeset(id).await?;
+        if theirs.changes.is_empty() || mine.parents.len() > 1 {
+            return Ok(false);
+        }
+        let parent = mine.parents.first().copied();
+        for p in theirs.changes.keys() {
+            let Some(c) = mine.changes.get(p) else {
+                return Ok(false);
+            };
+            if self.auto_rule(rules, p, parent, c).await?.is_none() {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// Paths where merge `id` keeps its first parent's version although a

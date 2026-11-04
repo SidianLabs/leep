@@ -175,3 +175,12 @@ the server is too old instead of printing a 404.
   can be repaired at read time.
 - **Defaulting reviewers to every reviewer token.** Floods every inbox in a
   large fleet; owners are who the policy asks for anyway.
+
+*Amended by [ADR 0087](0087-review-requests-close-by-content.md):* a
+request also closes when a changeset the land added names its changeset in
+`leep.rebased_from` and either lands its reviewed change byte for byte (the
+content rule of ADR 0085) or was landed by the request's requester; a
+listing applies the content rule too. So "a request whose change was
+squashed or rebased by its author before landing stays open" now holds only
+when the reviewed change itself was altered and someone else landed it.
+Entries gain `approved_by` and `rejected_by`.
