@@ -39,6 +39,7 @@ pub const PER_CHANGESET_KINDS: &[&str] = &[
     "history-tree-v4",
     "log-filter-v1",
     crate::gc::GC_MARK,
+    crate::git_map::GIT_COMMIT_KIND,
 ];
 
 /// Age buckets of unreachable changesets, by upper bound in days.

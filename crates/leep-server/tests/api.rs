@@ -2824,3 +2824,34 @@ async fn internal_errors_do_not_echo_store_errors() {
     assert_eq!(e.request_id.as_deref(), Some("req-500"));
     assert!(!String::from_utf8_lossy(&r.body).contains("storage"));
 }
+
+/// The store's git commit style (ADR 0090) is recorded once: the same style
+/// again is answered, another is 409, an unknown one 400.
+#[tokio::test]
+async fn git_style_is_recorded_once() {
+    use leep_core::api::{GitStyleRequest, GitStyleResponse};
+    let c = Client::new();
+    let r = c.get("/v1/git/style").await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert_eq!(r.json::<GitStyleResponse>().style, None);
+    let set = |s: &str| GitStyleRequest {
+        style: s.to_string(),
+    };
+    let r = c.post("/v1/git/style", &set("plain")).await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert_eq!(r.json::<GitStyleResponse>().style.as_deref(), Some("plain"));
+    assert_eq!(
+        c.post("/v1/git/style", &set("plain")).await.status,
+        StatusCode::OK
+    );
+    assert_eq!(
+        c.post("/v1/git/style", &set("trailer")).await.status,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        c.post("/v1/git/style", &set("fancy")).await.status,
+        StatusCode::BAD_REQUEST
+    );
+    let r = c.get("/v1/git/style").await;
+    assert_eq!(r.json::<GitStyleResponse>().style.as_deref(), Some("plain"));
+}

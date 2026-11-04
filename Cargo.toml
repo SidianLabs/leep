@@ -23,6 +23,7 @@ leep-meta = { path = "crates/leep-meta", version = "0.0.1" }
 leep-derive = { path = "crates/leep-derive", version = "0.0.1" }
 leep-cli = { path = "crates/leep-cli", version = "0.0.1" }
 leep-git = { path = "crates/leep-git", version = "0.0.1" }
+leep-gitobj = { path = "crates/leep-gitobj", version = "0.0.1" }
 leep-server = { path = "crates/leep-server", version = "0.0.1" }
 leep-testkit = { path = "crates/leep-testkit", version = "0.0.1" }
 
@@ -37,6 +38,12 @@ ed25519-dalek = "3"
 getrandom = "0.4"
 futures-util = "0.3"
 globset = "0.4"
+# Git object encoding for leep-gitobj; the versions gix 0.89 (leep-git) uses,
+# so the codec and the bridge serialize with the same code.
+gix-actor = "0.44"
+gix-date = "0.18"
+gix-hash = { version = "0.28", features = ["sha1"] }
+gix-object = { version = "0.66", features = ["sha1"] }
 hex = "0.4"
 # RFC 3339 timestamps (token expiry); no time zone database needed.
 jiff = { version = "0.2", default-features = false, features = ["std"] }

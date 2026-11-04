@@ -13,8 +13,9 @@ mod export;
 mod import;
 pub mod mirror;
 
-pub use export::{export, ExportOptions, ExportReport, CHANGESET_TRAILER};
+pub use export::{export, ExportOptions, ExportReport};
 pub use import::{import, ImportOptions, ImportReport, SUBMODULE_PATHS_KEPT};
+pub use leep_gitobj::CHANGESET_TRAILER;
 
 use leep_core::{ChangesetId, Error, Hash, MetaStore};
 
@@ -22,27 +23,10 @@ use leep_core::{ChangesetId, Error, Hash, MetaStore};
 pub const GIT_TO_LEEP: &str = "git-to-leep-v1";
 /// Derived-data kind: changeset id -> git commit sha.
 pub const LEEP_TO_GIT: &str = "leep-to-git-v1";
-/// `extra` key holding the original commit sha.
-pub const EXTRA_GIT_COMMIT: &str = "git.commit";
-/// `extra` key holding `Name <email> <unix-time>` of the committer.
-pub const EXTRA_GIT_COMMITTER: &str = "git.committer";
-/// `extra` keys holding the `+HHMM` timezone offsets, needed to reproduce the
-/// exact commit bytes.
-pub const EXTRA_GIT_AUTHOR_TZ: &str = "git.author_tz";
-pub const EXTRA_GIT_COMMITTER_TZ: &str = "git.committer_tz";
-/// `extra` key holding the commit's `encoding` header, if any.
-pub const EXTRA_GIT_ENCODING: &str = "git.encoding";
-/// `extra` key holding the remaining commit headers (`gpgsig`, `mergetag`,
-/// ...) in their original order, as a JSON array of `[name, value]` pairs.
-/// Without them signed commits (e.g. every commit made on github.com) would
-/// not round-trip to the same sha.
-pub const EXTRA_GIT_HEADERS: &str = "git.extra_headers";
-/// `extra` key holding the original bytes of the commit fields that are not
-/// valid UTF-8, as a JSON object of base64 strings (`author`, `committer`,
-/// `message`, `encoding`, `headers`). A changeset stores text, so the fields
-/// it holds are lossy for such a commit; this restores them on export. Absent
-/// for the usual UTF-8 commit, so its changeset id does not change.
-pub const EXTRA_GIT_RAW: &str = "git.raw";
+pub use leep_gitobj::{
+    EXTRA_GIT_AUTHOR_TZ, EXTRA_GIT_COMMIT, EXTRA_GIT_COMMITTER, EXTRA_GIT_COMMITTER_TZ,
+    EXTRA_GIT_ENCODING, EXTRA_GIT_HEADERS, EXTRA_GIT_RAW,
+};
 
 /// Largest single object the bridge reads from git. gix caps allocations
 /// at 16 MiB when it opens a repository owned by another user (reduced
@@ -117,54 +101,6 @@ pub(crate) async fn lookup_git(
     gix::ObjectId::try_from(v.as_ref())
         .map(Some)
         .map_err(|_| Error::Encoding("bad leep-to-git value".into()))
-}
-
-/// Parse `Name <email>`; falls back to the whole input as the name.
-pub(crate) fn parse_ident(s: &[u8]) -> (Vec<u8>, Vec<u8>) {
-    match (s.iter().rposition(|&b| b == b'<'), s.ends_with(b">")) {
-        (Some(i), true) => (
-            s[..i].trim_ascii_end().to_vec(),
-            s[i + 1..s.len() - 1].to_vec(),
-        ),
-        _ => (s.to_vec(), Vec::new()),
-    }
-}
-
-/// `-0000` means UTC with an unknown local offset. It is the same instant as
-/// `+0000` but different bytes, so it must survive as its own token.
-pub(crate) const NEGATIVE_ZERO_TZ: &str = "-0000";
-
-/// The `+HHMM` token to store for a signature whose raw `<secs> <tz>` text is
-/// `raw_time`, whose decoded offset is `offset`.
-pub(crate) fn tz_token(raw_time: &str, offset: i32) -> String {
-    match raw_time.rsplit_once(' ') {
-        Some((_, NEGATIVE_ZERO_TZ)) => NEGATIVE_ZERO_TZ.to_string(),
-        _ => format_tz(offset),
-    }
-}
-
-/// `+HHMM` for an offset in seconds.
-pub(crate) fn format_tz(offset: i32) -> String {
-    let sign = if offset < 0 { '-' } else { '+' };
-    let a = offset.unsigned_abs();
-    format!("{sign}{:02}{:02}", a / 3600, a % 3600 / 60)
-}
-
-/// Offset in seconds for `+HHMM`; 0 if malformed.
-pub(crate) fn parse_tz(s: &str) -> i32 {
-    let b = s.as_bytes();
-    if b.len() != 5 || !(b[0] == b'+' || b[0] == b'-') {
-        return 0;
-    }
-    let (Ok(h), Ok(m)) = (s[1..3].parse::<i32>(), s[3..5].parse::<i32>()) else {
-        return 0;
-    };
-    let v = h * 3600 + m * 60;
-    if b[0] == b'-' {
-        -v
-    } else {
-        v
-    }
 }
 
 #[cfg(test)]

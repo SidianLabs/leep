@@ -1050,6 +1050,35 @@ impl MetaStore for SqliteMetaStore {
         Ok(())
     }
 
+    /// SQLite runs one writer at a time, so the select after the insert
+    /// sees whichever insert won.
+    async fn put_derived_if_absent(&self, kind: &str, key: &Hash, value: Bytes) -> Result<Bytes> {
+        let mut tx = self
+            .db_for("put_derived_if_absent")
+            .begin()
+            .await
+            .map_err(storage)?;
+        sqlx::query(
+            "INSERT INTO derived (kind, key, value) VALUES (?, ?, ?) \
+             ON CONFLICT (kind, key) DO NOTHING",
+        )
+        .bind(kind)
+        .bind(key.as_bytes().as_slice())
+        .bind(value.as_ref())
+        .execute(&mut *tx)
+        .await
+        .map_err(storage)?;
+        let won: Vec<u8> =
+            sqlx::query_scalar("SELECT value FROM derived WHERE kind = ? AND key = ?")
+                .bind(kind)
+                .bind(key.as_bytes().as_slice())
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(storage)?;
+        tx.commit().await.map_err(storage)?;
+        Ok(Bytes::from(won))
+    }
+
     /// One transaction: the rows of every listed kind, then the changesets,
     /// one `IN (...)` statement per [`BATCH_PARAMS`] ids each.
     async fn delete_changesets(&self, ids: &[ChangesetId], kinds: &[&str]) -> Result<u64> {

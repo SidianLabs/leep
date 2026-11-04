@@ -327,4 +327,14 @@ impl MetaStore for FaultyMetaStore {
             )
             .await
     }
+
+    async fn put_derived_if_absent(&self, kind: &str, key: &Hash, value: Bytes) -> Result<Bytes> {
+        self.plan
+            .run(
+                Op::PutDerived,
+                self.inner.put_derived_if_absent(kind, key, value),
+                |_, v| v,
+            )
+            .await
+    }
 }

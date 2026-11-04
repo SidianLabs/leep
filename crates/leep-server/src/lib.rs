@@ -337,6 +337,7 @@ pub fn router_with_read_classes(
         .route("/v1/provenance/{id}", get(provenance))
         .route("/v1/search/{*rev}", get(search_rev))
         .route("/v1/merge-base", get(merge_base))
+        .route("/v1/git/style", get(git_style).post(set_git_style))
         .route("/v1/merge", post(merge))
         .route("/v1/rebase", post(rebase))
         .route("/v1/land", post(land));
@@ -1710,6 +1711,23 @@ async fn merge_base(
 ) -> ApiResult<Json<MergeBaseResponse>> {
     let base = repo.merge_base(cid(&q.a)?, cid(&q.b)?).await?;
     Ok(Json(MergeBaseResponse { base }))
+}
+
+async fn git_style(State(repo): S) -> ApiResult<Json<leep_core::api::GitStyleResponse>> {
+    let style = repo.git_style().await?.map(|s| s.encode());
+    Ok(Json(leep_core::api::GitStyleResponse { style }))
+}
+
+async fn set_git_style(
+    State(repo): S,
+    body: Bytes,
+) -> ApiResult<Json<leep_core::api::GitStyleResponse>> {
+    let req: leep_core::api::GitStyleRequest = parse_json(&body)?;
+    let style = leep_gitobj::CommitStyle::decode(&req.style)?;
+    let style = repo.set_git_style(style).await?;
+    Ok(Json(leep_core::api::GitStyleResponse {
+        style: Some(style.encode()),
+    }))
 }
 
 async fn merge(State(repo): S, body: Bytes) -> ApiResult<Json<MergeResponse>> {

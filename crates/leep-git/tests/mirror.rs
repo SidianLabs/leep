@@ -303,6 +303,19 @@ impl Leep for Local {
         Ok(self.on(self.repo.merge_base(a, b))?)
     }
 
+    fn agree_git_style(&self, style: CommitStyle) -> Result<()> {
+        match self.on(self.repo.git_style())? {
+            Some(have) if have != style => {
+                anyhow::bail!(mirror::style_mismatch(&have.encode(), &style.encode()))
+            }
+            Some(_) => Ok(()),
+            None => {
+                self.on(self.repo.set_git_style(style))?;
+                Ok(())
+            }
+        }
+    }
+
     fn delete_ref(&self, name: &str, expected: ChangesetId, message: &str) -> Result<Cas> {
         let ctx = RefUpdateContext::new(mirror::CAS_OPERATION).message(message);
         match self.on(self.repo.cas_ref_checked(name, Some(expected), None, &ctx)) {
@@ -2524,4 +2537,38 @@ fn a_shallow_work_repository_is_refused_with_a_clear_error() {
         !err.contains("imported") && !err.contains("import again"),
         "{err}"
     );
+}
+
+/// The mirror's commits are the ids the store's git maps derive (ADR 0090),
+/// imported commits included.
+#[test]
+fn mirror_commits_are_the_derived_git_ids() {
+    let leep = Local::new();
+    let head = history(&leep);
+    let out = tempfile::tempdir().unwrap();
+    let style = CommitStyle {
+        provenance_trailers: false,
+        changeset_trailer: true,
+    };
+    leep.agree_git_style(style).unwrap();
+    let mut ex = exporter(out.path(), style);
+    let oid = ex.export(&leep, head).unwrap();
+    assert_eq!(leep.on(leep.repo.git_commit_id(head)).unwrap(), oid);
+}
+
+/// A mirror whose flags give another style than the store recorded refuses
+/// to start rather than give changesets second commit ids.
+#[test]
+fn a_mirror_with_another_style_refuses_to_start() {
+    let f = fixture();
+    let leep = Local::new();
+    leep.on(leep.repo.set_git_style(CommitStyle {
+        provenance_trailers: false,
+        changeset_trailer: false,
+    }))
+    .unwrap();
+    let err = mirror::Mirror::open(config(&f, false), &leep)
+        .err()
+        .expect("refused");
+    assert!(err.to_string().contains("second commit id"), "{err}");
 }

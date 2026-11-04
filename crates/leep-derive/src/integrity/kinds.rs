@@ -14,6 +14,7 @@ use crate::derived::{
     HISTORY_NODE_KIND, LOG_FILTER_NAME_KIND,
 };
 use crate::gc::{BLOB_CLAIM, BLOB_CONDEMNED, BLOB_DOOM, BLOB_RESCUE, GC_MARK};
+use crate::git_map::{GIT_BLOB_KIND, GIT_COMMIT_KIND, GIT_OID_KIND, GIT_STYLE_KIND, GIT_TREE_KIND};
 use crate::search::{BLOB_KIND as BLOB_TRIGRAMS, TREE_KIND as TREE_TRIGRAMS};
 use crate::signatures::REBASED_ORIGIN_KIND;
 
@@ -73,6 +74,13 @@ pub struct KindInfo {
 
 const GC_REFUSAL: &str = "garbage collection fence state (ADR 0012), not derived from history; \
     dropping it can let a collect delete a blob a client was just told it may reuse";
+
+const GIT_REDERIVE: &str =
+    "git ids are derived when asked for; `repair drop --kind git-commit-v1` \
+    removes every git map row, and they are recomputed on demand";
+
+const GIT_DROP: &str = "the git maps are dropped together, so a reverse row never outlives the \
+    forward row it mirrors; drop git-commit-v1, which removes all four";
 
 const CS_GC_REFUSAL: &str = "changeset garbage collection fence state (ADR 0059), not derived \
     from history; dropping it can let a collect delete a changeset a writer rescued";
@@ -136,6 +144,36 @@ static KINDS: &[KindInfo] = &[
         drop: DropPolicy::Refused(
             "log-filter-v1 names its authors by these rows; drop log-filter-v1, which removes both",
         ),
+    },
+    KindInfo {
+        name: GIT_BLOB_KIND,
+        class: KindClass::Content,
+        summary: "git id of one blob (ADR 0090)",
+        rederive: Rederive::No(GIT_REDERIVE),
+        drop: DropPolicy::Refused(GIT_DROP),
+    },
+    KindInfo {
+        name: GIT_TREE_KIND,
+        class: KindClass::Content,
+        summary: "git id of one tree node (ADR 0090)",
+        rederive: Rederive::No(GIT_REDERIVE),
+        drop: DropPolicy::Refused(GIT_DROP),
+    },
+    KindInfo {
+        name: GIT_COMMIT_KIND,
+        class: KindClass::PerChangeset,
+        summary: "git commit id of the changeset under the store's commit style (ADR 0090)",
+        rederive: Rederive::No(GIT_REDERIVE),
+        drop: DropPolicy::Allowed {
+            also: &[GIT_TREE_KIND, GIT_BLOB_KIND, GIT_OID_KIND],
+        },
+    },
+    KindInfo {
+        name: GIT_OID_KIND,
+        class: KindClass::Content,
+        summary: "the Leep object a git id names, written beside each git id (ADR 0090)",
+        rederive: Rederive::No(GIT_REDERIVE),
+        drop: DropPolicy::Refused(GIT_DROP),
     },
     KindInfo {
         name: BLOB_TRIGRAMS,
@@ -219,6 +257,17 @@ static KINDS: &[KindInfo] = &[
             "written by rebase to link a server-made copy to its original; it cannot be \
              recomputed from history, and land retries and signature lookups depend on it",
         ),
+    },
+    KindInfo {
+        name: GIT_STYLE_KIND,
+        class: KindClass::Bookkeeping,
+        summary: "the store's git commit style, chosen once (ADR 0090)",
+        rederive: Rederive::No("the commit style is a choice, not derived"),
+        // The way out of a wrong choice: every id derived under the style
+        // goes with it, so none survives under another.
+        drop: DropPolicy::Allowed {
+            also: &[GIT_COMMIT_KIND, GIT_TREE_KIND, GIT_BLOB_KIND, GIT_OID_KIND],
+        },
     },
     KindInfo {
         name: BLOB_CLAIM,
@@ -415,6 +464,10 @@ pub fn dependencies(kind: &str) -> &'static [&'static str] {
         &[Generation::NAME, Skiplist::NAME, LastMerge::NAME]
     } else if kind == TREE_TRIGRAMS {
         &[BLOB_TRIGRAMS]
+    } else if kind == GIT_COMMIT_KIND {
+        &[RootTree::NAME, GIT_TREE_KIND, GIT_BLOB_KIND]
+    } else if kind == GIT_TREE_KIND {
+        &[GIT_BLOB_KIND]
     } else {
         &[]
     }
@@ -504,6 +557,10 @@ mod tests {
                 !attestation_or_state
                     && k.name != HISTORY_NODE_KIND
                     && k.name != LOG_FILTER_NAME_KIND
+                    // Dropped with `git-commit-v1`, all four together.
+                    && ![GIT_BLOB_KIND, GIT_TREE_KIND, GIT_OID_KIND].contains(&k.name)
+                    // The one choice that may be undone, with every id under it.
+                    || k.name == GIT_STYLE_KIND
             );
         }
         assert!(check_droppable("ref_log").is_err());

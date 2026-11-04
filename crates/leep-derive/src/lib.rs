@@ -25,6 +25,7 @@ mod filter_log;
 pub mod gc;
 pub mod gc_lease;
 pub mod gc_unreachable;
+pub mod git_map;
 mod history;
 pub mod indexing;
 pub mod integrity;
@@ -66,6 +67,8 @@ mod derive_walk_tests;
 mod fault_tests;
 #[cfg(test)]
 mod flush_tests;
+#[cfg(test)]
+mod git_map_tests;
 #[cfg(test)]
 mod index_lease_tests;
 #[cfg(test)]

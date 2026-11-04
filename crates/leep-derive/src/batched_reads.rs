@@ -375,6 +375,10 @@ impl MetaStore for BatchedMeta {
         self.inner.put_derived(kind, key, value).await
     }
 
+    async fn put_derived_if_absent(&self, kind: &str, key: &Hash, value: Bytes) -> Result<Bytes> {
+        self.inner.put_derived_if_absent(kind, key, value).await
+    }
+
     async fn put_derived_many(&self, rows: &[DerivedRow]) -> Result<()> {
         self.inner.put_derived_many(rows).await
     }

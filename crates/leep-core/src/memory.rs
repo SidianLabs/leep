@@ -673,6 +673,16 @@ impl MetaStore for MemoryMetaStore {
         Ok(())
     }
 
+    async fn put_derived_if_absent(&self, kind: &str, key: &Hash, value: Bytes) -> Result<Bytes> {
+        Ok(self
+            .derived
+            .lock()
+            .unwrap()
+            .entry((kind.to_string(), *key))
+            .or_insert(value)
+            .clone())
+    }
+
     async fn put_derived_many(&self, rows: &[DerivedRow]) -> Result<()> {
         let mut all = self.derived.lock().unwrap();
         for r in rows {
@@ -1221,6 +1231,34 @@ async fn check_one_lease_scope(store: &dyn MetaStore, key: &LeaseKey, meta: &str
 
 /// Conformance checks every `MetaStore` implementation should pass. Backend
 /// crates call this from their own tests.
+/// `put_derived_if_absent` keeps the first row and gives every caller,
+/// concurrent ones included, the row that won.
+async fn check_put_derived_if_absent(store: &dyn MetaStore) {
+    let key = Hash::of_blob(b"once");
+    let first = store
+        .put_derived_if_absent("once", &key, Bytes::from_static(b"a"))
+        .await
+        .unwrap();
+    assert_eq!(first, &b"a"[..]);
+    let again = store
+        .put_derived_if_absent("once", &key, Bytes::from_static(b"b"))
+        .await
+        .unwrap();
+    assert_eq!(again, &b"a"[..]);
+    assert_eq!(
+        store.get_derived("once", &key).await.unwrap().unwrap(),
+        &b"a"[..]
+    );
+
+    let key = Hash::of_blob(b"once-raced");
+    let racers = (0..16u8).map(|i| store.put_derived_if_absent("once", &key, Bytes::from(vec![i])));
+    let got = futures_util::future::join_all(racers).await;
+    let stored = store.get_derived("once", &key).await.unwrap().unwrap();
+    for g in got {
+        assert_eq!(g.unwrap(), stored, "every racer gets the row that won");
+    }
+}
+
 pub async fn check_meta_store_contract(store: &dyn MetaStore) {
     use crate::{FileChange, FileKind, RepoPath};
 
@@ -1294,6 +1332,7 @@ pub async fn check_meta_store_contract(store: &dyn MetaStore) {
     );
     assert!(store.get_derived("other", &key).await.unwrap().is_none());
 
+    check_put_derived_if_absent(store).await;
     check_list_derived(store).await;
     check_delete_derived_steps(store).await;
     check_batched_reads(store).await;

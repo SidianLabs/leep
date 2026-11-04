@@ -40,6 +40,8 @@
 //! | POST | `/v1/merge` | [`MergeRequest`] | [`MergeResponse`] |
 //! | POST | `/v1/rebase` | [`RebaseRequest`] | [`RebaseResponse`] |
 //! | POST | `/v1/land` | [`LandRequest`] | [`LandResponse`] (`create: false` refuses to create a missing `target_ref` with 404; absent creates it, as before; ADR 0036. `land_id` makes retries idempotent at any age; ADR 0057) |
+//! | GET  | `/v1/git/style` | – | [`GitStyleResponse`] (the store's git commit style, or null if none was recorded; ADR 0090) |
+//! | POST | `/v1/git/style` | [`GitStyleRequest`] | [`GitStyleResponse`] (records the style when none is; the same style again is answered as it is; another is 409, since it is chosen once; an unknown style is 400; needs a write token; ADR 0090) |
 //! | POST | `/v1/refs/{name}/rebase-onto` | [`RebaseOntoRequest`] | [`RebaseOntoResponse`] (replays the ref's first-parent stack above `expected_base` onto `onto` and moves the ref once, ordered with lands; 409 if the merge base of the head and `onto` is not `expected_base`; 400 on a `--protect-ref` ref; needs a write token; ADR 0062) |
 //!
 //! Ref names may contain `/` (e.g. `release/1.0`); `{name}` and `{rev}` match
@@ -1196,6 +1198,19 @@ pub struct ProvenanceResponse {
     /// Changesets scanned.
     pub scanned: u64,
     pub truncated: bool,
+}
+
+/// The store's git commit style (ADR 0090): `plain` or `trailer`, with
+/// `+provenance` when `Leep-Agent-*` trailers are written. It decides the
+/// commit ids of changesets made in Leep, so it is chosen once.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitStyleResponse {
+    pub style: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitStyleRequest {
+    pub style: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2541,5 +2556,21 @@ mod tests {
                 true,
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod git_style_shape {
+    use super::*;
+
+    /// `/v1/git/style` (ADR 0090): field names are part of `/v1`.
+    #[test]
+    fn git_style_json_shape() {
+        let none = serde_json::to_value(GitStyleResponse { style: None }).unwrap();
+        assert_eq!(none, serde_json::json!({"style": null}));
+        let set: GitStyleRequest = serde_json::from_str(r#"{"style":"trailer"}"#).unwrap();
+        assert_eq!(set.style, "trailer");
+        let r: GitStyleResponse = serde_json::from_str(r#"{"style":"plain+provenance"}"#).unwrap();
+        assert_eq!(r.style.as_deref(), Some("plain+provenance"));
     }
 }
