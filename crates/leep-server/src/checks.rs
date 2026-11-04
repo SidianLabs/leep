@@ -154,6 +154,32 @@ impl LandPolicy for GreenRefs {
     }
 }
 
+/// Promote every policy ref's known-good ref as far as the stored results
+/// allow, at startup and after a reload that changed the checks policy: a
+/// dropped required check unblocks green at once. Failures are logged, never
+/// fatal: the next passing result promotes anyway.
+pub async fn catch_up(repo: &Repo, config: &crate::reload::RuntimeConfig) {
+    let Some(policy) = &config.checks else {
+        return;
+    };
+    let ctx = RefUpdateContext::new(PROMOTE_OPERATION).message("checks policy loaded");
+    for (name, required) in &policy.refs {
+        match repo.catch_up_green(name, required, &ctx).await {
+            Ok(Some(p)) => tracing::info!(
+                green = %p.green_ref,
+                to = %p.to,
+                "promoted known-good ref on loading the checks policy"
+            ),
+            Ok(None) => {}
+            Err(e) => tracing::warn!(
+                r#ref = %name,
+                error = %e,
+                "could not bring the known-good ref up to date"
+            ),
+        }
+    }
+}
+
 /// Every check name a result can have: the policy's required ones and every
 /// token's allow-list. Results are looked up by name, one row each.
 fn known_names(config: &crate::reload::RuntimeConfig) -> Vec<String> {

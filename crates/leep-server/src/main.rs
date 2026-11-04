@@ -1920,11 +1920,12 @@ async fn run() -> anyhow::Result<()> {
         .with_blame_tracking(args.warm_blame_paths);
     let read_limits = leep_server::read_limits::ReadLimits::new(&read_concurrency);
     leep_server::reload::warn_missing_refs(repo.meta().as_ref(), &config.current()).await;
+    leep_server::checks::catch_up(&repo, &config.current()).await;
     if args.request_timeout.is_zero() {
         tracing::warn!("request timeout disabled: gc --fence cannot be guaranteed safe");
     }
     #[cfg(unix)]
-    leep_server::reload::spawn_sighup_reload(config.clone(), repo.meta().clone())
+    leep_server::reload::spawn_sighup_reload(config.clone(), repo.clone())
         .context("installing the SIGHUP handler")?;
     leep_server::reload::spawn_token_expiry_gauges(
         config.clone(),

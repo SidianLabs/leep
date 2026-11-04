@@ -20,7 +20,7 @@ use axum::extract::{Request, State};
 use axum::middleware::Next;
 use axum::response::Response;
 use leep_core::MetaStore;
-use leep_derive::{LandPolicy, PolicySet};
+use leep_derive::{LandPolicy, PolicySet, Repo};
 
 use crate::auth::{Auth, AuthChange};
 use crate::checks::{ChecksPolicy, GreenRefs};
@@ -571,10 +571,7 @@ pub async fn warn_missing_refs(meta: &dyn MetaStore, config: &RuntimeConfig) {
 /// of killing the server. Only SIGHUP triggers a reload: there is no endpoint
 /// and no file watcher.
 #[cfg(unix)]
-pub fn spawn_sighup_reload(
-    handle: Arc<ConfigHandle>,
-    meta: Arc<dyn MetaStore>,
-) -> std::io::Result<()> {
+pub fn spawn_sighup_reload(handle: Arc<ConfigHandle>, repo: Repo) -> std::io::Result<()> {
     use tokio::signal::unix::{signal, SignalKind};
     let mut hup = signal(SignalKind::hangup())?;
     tokio::spawn(async move {
@@ -588,7 +585,11 @@ pub fn spawn_sighup_reload(
             match tokio::task::spawn_blocking(move || h.reload()).await {
                 Ok(Ok(report)) => {
                     report.log();
-                    warn_missing_refs(meta.as_ref(), &handle.current()).await;
+                    let config = handle.current();
+                    warn_missing_refs(repo.meta().as_ref(), &config).await;
+                    if report.checks_policy_changed {
+                        crate::checks::catch_up(&repo, &config).await;
+                    }
                 }
                 Ok(Err(e)) => tracing::error!(
                     error = %e,

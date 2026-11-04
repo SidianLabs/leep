@@ -168,6 +168,48 @@ impl Repo {
         )))
     }
 
+    /// Move `green/<target_ref>` to the newest changeset on the ref's
+    /// first-parent chain above green, within [`MAX_RED_WALK`] of the head,
+    /// that has a passing result for every one of `required`. Run when the
+    /// checks policy loads or changes: dropping a flaky required check then
+    /// unblocks green at once instead of at the next pass.
+    pub async fn catch_up_green(
+        &self,
+        target_ref: &str,
+        required: &[String],
+        ctx: &RefUpdateContext,
+    ) -> Result<Option<Promotion>> {
+        if required.is_empty() {
+            return Ok(None);
+        }
+        let Some(head) = self.meta().get_ref(target_ref).await? else {
+            return Ok(None);
+        };
+        let green = self.meta().get_ref(&green_ref(target_ref)).await?;
+        let mut chain = Vec::new();
+        let mut cur = Some(head);
+        while let Some(id) = cur {
+            if Some(id) == green || chain.len() >= MAX_RED_WALK {
+                break;
+            }
+            chain.push(id);
+            cur = self.parents(id).await?.first().copied();
+        }
+        let rows = self.checks_by(&chain, required).await?;
+        let newest = chain.iter().find(|id| {
+            rows.get(id).is_some_and(|r| {
+                required.iter().all(|n| {
+                    r.iter()
+                        .any(|c| &c.check == n && c.outcome == Outcome::Pass)
+                })
+            })
+        });
+        match newest {
+            Some(id) => self.promote_green(target_ref, *id, required, ctx).await,
+            None => Ok(None),
+        }
+    }
+
     /// The refs among `names` whose `green/<ref>` holds `id`, in that order.
     pub async fn green_on(&self, id: ChangesetId, names: &[String]) -> Result<Vec<String>> {
         let mut out = Vec::new();
@@ -829,6 +871,49 @@ mod tests {
             (got, c.truncated),
             (vec![h2[3], h2[2], h2[1], h2[0]], false)
         );
+    }
+
+    #[tokio::test]
+    async fn catch_up_promotes_to_the_newest_fully_passing_changeset() {
+        let r = repo();
+        let h = landed(&r, 5).await;
+        let both = req(&["flaky", "test"]);
+        for id in &h[1..] {
+            post(&r, *id, "test", Outcome::Pass).await;
+        }
+        post(&r, h[1], "flaky", Outcome::Pass).await;
+        post(&r, h[4], "flaky", Outcome::Fail).await;
+        // Under the old policy only h[1] passed everything.
+        let p = r
+            .catch_up_green("main", &both, &ctx())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(p.to, h[1]);
+        assert!(r
+            .catch_up_green("main", &both, &ctx())
+            .await
+            .unwrap()
+            .is_none());
+        // The flaky check is dropped: green moves to the newest pass at once.
+        let p = r
+            .catch_up_green("main", &req(&["test"]), &ctx())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((p.from, p.to), (Some(h[1]), h[5]));
+        // Re-requiring it never rewinds.
+        assert!(r
+            .catch_up_green("main", &both, &ctx())
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(green(&r).await, Some(h[5]));
+        assert!(r
+            .catch_up_green("nope", &both, &ctx())
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]

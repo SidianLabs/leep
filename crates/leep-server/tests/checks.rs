@@ -528,3 +528,49 @@ fn wire_shapes_are_additive() {
     assert_eq!(v["ref"], "main");
     assert_eq!(serde_json::to_value(Outcome::Pass).unwrap(), "pass");
 }
+
+#[tokio::test]
+async fn a_reload_that_drops_a_required_check_promotes_at_once() {
+    let api = Api::new(true);
+    let h = api.lands(3).await;
+    for id in &h[1..] {
+        api.check("ci-test", *id, "test", Outcome::Pass)
+            .await
+            .ok::<PostCheckResponse>();
+    }
+    // lint never passes (flaky), so green never moves.
+    api.check("ci-lint", h[3], "lint", Outcome::Fail)
+        .await
+        .ok::<PostCheckResponse>();
+    assert_eq!(api.green().await, None);
+    let dir = tempfile::tempdir().unwrap();
+    let tokens = dir.path().join("tokens.json");
+    std::fs::write(&tokens, tokens_json()).unwrap();
+    let policy = dir.path().join("checks.json");
+    std::fs::write(&policy, POLICY).unwrap();
+    let handle = ConfigHandle::load(ReloadSources {
+        tokens_file: Some(tokens),
+        checks_policy_file: Some(policy.clone()),
+        ..Default::default()
+    })
+    .unwrap();
+    // At startup nothing has every required pass.
+    leep_server::checks::catch_up(&api.repo, &handle.current()).await;
+    assert_eq!(api.green().await, None);
+    std::fs::write(
+        &policy,
+        r#"{ "refs": { "main": { "required": ["test"] } } }"#,
+    )
+    .unwrap();
+    let report = handle.reload().unwrap();
+    assert!(report.checks_policy_changed);
+    leep_server::checks::catch_up(&api.repo, &handle.current()).await;
+    assert_eq!(api.green().await, Some(h[3]));
+    let log = api
+        .repo
+        .meta()
+        .ref_log(Some("green/main"), None, 10)
+        .await
+        .unwrap();
+    assert_eq!(log[0].operation, "promote");
+}
