@@ -74,9 +74,8 @@ pub(crate) fn refuse_shallow(
 ) -> leep_core::Result<()> {
     if git.is_shallow().map_err(gerr)? {
         return Err(Error::Invalid(format!(
-            "{} is a shallow git clone, so its history is incomplete and cannot \
-             be imported; run `git fetch --unshallow` in it (or clone without \
-             --depth) and import again",
+            "{} is a shallow git clone, so its history is incomplete; run \
+             `git fetch --unshallow` in it (or clone without --depth) and retry",
             git_dir.display()
         )));
     }

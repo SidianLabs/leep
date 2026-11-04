@@ -220,6 +220,10 @@ fn header(info: &ChangesetInfo, d: Detail) -> String {
         }
     }
     out.push_str(&format!("Author: {}\n", info.changeset.author));
+    // Only `GET /v1/changesets/{id}` fills it, so in practice only `show`.
+    if let Some(by) = &info.created_by {
+        out.push_str(&format!("Created-by: {}\n", by.principal));
+    }
     out.push_str(&format!("Date:   {}\n", utc_time(info.changeset.timestamp)));
     for (k, v) in &info.changeset.extra {
         if d.full || !k.starts_with(QUIET_EXTRA_PREFIX) {
@@ -403,9 +407,6 @@ pub fn show(r: &Remote, args: &ShowArgs) -> Result<i32> {
 pub(crate) fn show_text(r: &Remote, info: &ChangesetInfo) -> Result<String> {
     let id = info.id;
     let mut out = header(info, Detail::SHOW);
-    if let Some(by) = &info.created_by {
-        out.push_str(&format!("Created-by: {}\n", by.principal));
-    }
     // Older servers lack the endpoint; a changeset is still worth showing.
     if let Ok(sigs) = r.client.signatures(&id) {
         for line in signature_lines(&sigs) {
@@ -805,6 +806,21 @@ mod tests {
             "{full}"
         );
         assert!(full.contains("git.extra_headers: gpgsig ...\n"), "{full}");
+        // The creator sits with the author, above the message.
+        let created = header(
+            &ChangesetInfo {
+                created_by: Some(leep_core::api::CreatedBy {
+                    principal: "cy".into(),
+                    timestamp: 0,
+                }),
+                ..info.clone()
+            },
+            Detail::SHOW,
+        );
+        assert!(
+            created.contains("\nAuthor: a\nCreated-by: cy\nDate:   "),
+            "{created}"
+        );
         assert!(
             full.contains("    body\n    \n    more body\n") && !full.contains("[...]"),
             "{full}"
