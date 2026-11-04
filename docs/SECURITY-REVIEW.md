@@ -268,7 +268,15 @@ verdict carries; taking back still considers merges everywhere, the safe
 side. An unreadable head while closing requests counts as identical-only.
 Accepted: on such a path any concurrent edit, auto-approved ones included,
 forces re-approval of a pending client resolution, at most as often as the
-editor may land. Tests:
+editor may land. *Found in review:* the first version let the nearest
+`carry` line decide, so a subdirectory's `carry merged` undid a parent's
+`carry identical` though its owners need not own the parent; now
+`carry identical` anywhere on the walk wins. And a misspelled directive
+(`carry identically`) parsed as an owner name, silently leaving the
+directory merged; lines starting with `carry` that are no directive are now
+refused at land (422) and shown in `review-status`. Tests:
+`a_subdirectory_cannot_loosen_an_ancestors_carry_identical`,
+`a_misspelled_carry_line_is_refused_and_status_says_why`,
 `a_change_adding_carry_merged_is_judged_under_the_heads_identical`,
 `a_policy_glob_outranks_carry_merged`,
 `an_identical_only_path_keeps_a_rebased_resolution_pending_and_says_why`,

@@ -3,7 +3,8 @@
   that directory from carrying to a client's rebase or union of a reviewed
   change; only an identical change carries there, in every directory below
   up to a `noparent` file (a subdirectory's `carry merged` cannot undo
-  it). The
+  it). A misspelled `carry` line in an `OWNERS` file is refused at land
+  and shown by `leep review status`, never read as an owner name. The
   review policy file's new `identical_only_globs` does the same per glob.
   Both are read from the target ref's head and can only make a path
   stricter, never undo a strict ref or each other (ADR 0092). Review

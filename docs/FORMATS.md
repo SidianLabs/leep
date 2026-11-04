@@ -144,7 +144,9 @@ directive, not a name: on the same walk (`noparent`'s file included),
 `carry identical` in any file, else the nearest `carry merged`, decides
 whether verdicts carry to a
 re-committed change of a path only when it is identical; both lines in one
-file mean `carry identical`. Older servers read either line as an owner
+file mean `carry identical`. Any other line whose first word is `carry`
+is neither a name nor a directive, and a review-protected land writing one
+is refused (422). Older servers read either line as an owner
 name nobody has (in a file with no other names, nobody can approve the
 directory there), so upgrade servers before writing them.
 
@@ -781,7 +783,9 @@ Nothing persisted changed.
 Later still (ADR 0092), optional and `#[serde(default)]`: `PathReview`
 gains `carry`, the path's effective carry rule on the asked ref,
 `identical` (a strict ref, a policy glob or an `OWNERS` `carry identical`
-line) or `merged`; older servers leave it out. An identical-only refusal
+line) or `merged`; older servers leave it out. `ReviewStatusResponse`
+gains `refused`, why a land is refused whatever the reviews (an `OWNERS`
+line starting with `carry` that is no directive), with `approved` false. An identical-only refusal
 fills the existing `OriginStatus.differs` and `reason`
 (`P is identical-only (src/OWNERS)`). Nothing persisted changed.
 

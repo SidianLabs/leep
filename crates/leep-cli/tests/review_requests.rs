@@ -150,6 +150,7 @@ async fn approved(Path(id): Path<ChangesetId>) -> Json<ReviewStatusResponse> {
         approved: true,
         paths: vec![],
         on_refs: vec![],
+        refused: None,
         origins: vec![],
     })
 }

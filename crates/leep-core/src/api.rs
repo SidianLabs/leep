@@ -770,6 +770,12 @@ pub struct ReviewStatusResponse {
     /// why an approval of the original did not carry.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub origins: Vec<OriginStatus>,
+    /// Why a land of the changeset is refused whatever its reviews say,
+    /// such as an `OWNERS` line that starts with `carry` but is no
+    /// directive (ADR 0092); `approved` is then false. Older servers leave
+    /// it out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refused: Option<String>,
 }
 
 /// `POST /v1/review-requests`: ask for a review (ADR 0086).
@@ -2540,6 +2546,7 @@ mod tests {
                                  "reviews": [{ "reviewer": "rhea", "verdict": "approve" }],
                                  "carried": false, "differs": ["a.txt"] }]),
                     ),
+                    ("refused", json!("src/OWNERS: \"carry identically\"")),
                 ],
                 true,
             );

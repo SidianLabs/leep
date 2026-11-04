@@ -443,6 +443,7 @@ impl ReviewService {
                 Some(&mut origins),
             )
             .await?;
+        let refused = bad_owners_text(repo, id).await?;
         // The carry rule of each path, so a reviewer sees where only an
         // identical change keeps their verdict (ADR 0092).
         let mut carry = Vec::with_capacity(review.paths.len());
@@ -455,7 +456,7 @@ impl ReviewService {
         Ok(ReviewStatusResponse {
             changeset: id,
             target_ref: target_ref.to_string(),
-            approved: review.approved(),
+            approved: review.approved() && refused.is_none(),
             on_refs: {
                 let mut refs = vec![target_ref.to_string()];
                 refs.extend(policy_refs.iter().filter(|r| *r != target_ref).cloned());
@@ -477,8 +478,21 @@ impl ReviewService {
                 })
                 .collect(),
             origins,
+            refused,
         })
     }
+}
+
+/// The refusal for an `OWNERS` line `id` writes that starts with `carry`
+/// but is no directive (ADR 0092): a misspelled `carry identical` must not
+/// land and leave the directory on the looser default unnoticed.
+async fn bad_owners_text(repo: &Repo, id: ChangesetId) -> Result<Option<String>> {
+    Ok(repo.unknown_carry_line(id).await?.map(|line| {
+        format!(
+            "changeset {id} has an OWNERS line that is no directive: {line} \
+             (write `carry identical` or `carry merged`)"
+        )
+    }))
 }
 
 /// `land` onto any of `refs` needs every changeset it adds to be approved.
@@ -529,6 +543,10 @@ impl LandPolicy for RequireReview {
         let mut owners = OwnersResolver::new(repo, head).await?;
         let mut seen = CarryCache::default();
         for id in new_history {
+            if let Some(why) = bad_owners_text(repo, *id).await? {
+                tracing::info!(%id, target_ref, "land refused: bad OWNERS line");
+                return Err(Error::Policy(why));
+            }
             let review = self
                 .service
                 .judge(repo, *id, target_ref, &mut owners, &mut seen, None)

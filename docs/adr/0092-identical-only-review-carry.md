@@ -36,6 +36,17 @@ to say so.
   directory, so they cannot undo what the parent's owners asked for; only
   a `noparent` file, which already cuts the parent's owners off, ends its
   reach. A file with both lines means `carry identical`.
+- **Misspellings are refused, not ignored.** Any other line whose first
+  word is `carry` (`carry identically`, `carry`, `carry  merged`) is
+  neither a name nor a directive. Read as a name, a typo would leave the
+  directory on the looser default with nothing to show for it. A land onto
+  a review-protected ref of a changeset that adds or modifies such an
+  `OWNERS` file is refused with 422, `changeset X has an OWNERS line that
+  is no directive: src/OWNERS: "carry identically" (write ...)`, approved
+  or not, and `review-status` answers the same text in a new optional
+  `refused`, with `approved` false. In a head that already holds such a
+  line (written before this server, or on an unprotected ref) the line
+  is simply ignored.
   Directory level only; per-file patterns inside `OWNERS` are not offered.
 - **Review policy file.** `identical_only_globs`: `globset` patterns,
   matched as `docs_globs` are (`*` stays within one path level), for files
@@ -122,7 +133,8 @@ already chooses which auto rules run.
   `an_identical_only_path_refuses_a_union_but_carries_an_identical_change`,
   `a_policy_glob_outranks_carry_merged`,
   `a_change_adding_carry_merged_is_judged_under_the_heads_identical`,
-  `a_strict_ref_carries_only_identical_changes` (now with the reason text);
+  `a_strict_ref_carries_only_identical_changes` (now with the reason text),
+  `a_misspelled_carry_line_is_refused_and_status_says_why`;
   in `leep-derive`, `owners::tests::carry_directives_are_whole_lines_and_identical_wins`,
   `the_strictest_carry_line_decides_and_noparent_stops_the_walk`,
   `a_subdirectory_cannot_loosen_an_ancestors_carry_identical`,
@@ -130,8 +142,10 @@ already chooses which auto rules run.
   `an_identical_only_path_carries_identical_changes_only`,
   `review_requests::tests::a_request_closes_exactly_when_its_verdict_carries_under_the_carry_line`.
   ADR 0085's, 0087's and 0089's security tests still pass.
-- **Compatibility.** API: `PathReview.carry` only, `#[serde(default)]`,
-  omitted by older servers. Nothing persisted changes. The `OWNERS` text
+- **Compatibility.** API: `PathReview.carry` and
+  `ReviewStatusResponse.refused`, `#[serde(default)]`, omitted by older
+  servers. A line starting with the word `carry` is no longer an owner
+  name. Nothing persisted changes. The `OWNERS` text
   gains two directive lines: a token named exactly `carry identical` or
   `carry merged` can no longer be listed as an owner. An older server reads
   the lines as an owner name nobody has: harmless beside real names (they

@@ -2785,3 +2785,40 @@ async fn a_change_adding_carry_merged_is_judged_under_the_heads_identical() {
     assert!(s.approved, "{s:?}");
     assert_eq!(s.paths[1].carried_rule.as_deref(), Some("rebased"));
 }
+
+/// ADR 0092: an `OWNERS` line that starts with `carry` but is no directive
+/// is neither an owner name nor ignored: a land writing it is refused with
+/// 422 naming the line, even when approved, and status says the same.
+#[tokio::test]
+async fn a_misspelled_carry_line_is_refused_and_status_says_why() {
+    let api = Api::with(POLICY);
+    let base = api
+        .seed_main(&[("OWNERS", Some("alice\n")), ("src/a.rs", Some("a\n"))])
+        .await;
+    let typo = api
+        .commit(
+            &[base],
+            &[(
+                "src/OWNERS",
+                Some("bob\ncarry identically  # meant identical\n"),
+            )],
+        )
+        .await;
+    api.approve(typo, "alice").await;
+    let s = api.status(typo).await;
+    assert!(!s.approved, "{s:?}");
+    let why = s.refused.expect("refused");
+    assert!(why.contains(r#"src/OWNERS: "carry identically""#), "{why}");
+    let r = api.land(typo, "bob").await;
+    assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(r.error(), why);
+    assert_eq!(api.main_ref().await, Some(base));
+    // Fixed, it lands, and the directory is identical-only.
+    let fixed = api
+        .commit(&[base], &[("src/OWNERS", Some("bob\ncarry identical\n"))])
+        .await;
+    api.approve(fixed, "alice").await;
+    let s = api.status(fixed).await;
+    assert!(s.approved && s.refused.is_none(), "{s:?}");
+    assert_eq!(api.land(fixed, "bob").await.status, StatusCode::OK);
+}

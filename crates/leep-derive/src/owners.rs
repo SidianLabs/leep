@@ -20,7 +20,7 @@
 use std::collections::{BTreeSet, HashMap};
 
 use leep_core::review::OWNERS_FILE;
-use leep_core::{ChangesetId, Error, FileKind, Hash, RepoPath, Result};
+use leep_core::{ChangesetId, Error, FileChange, FileKind, Hash, RepoPath, Result};
 
 use crate::Repo;
 
@@ -54,10 +54,16 @@ pub struct OwnersFile {
     pub noparent: bool,
     /// The file's `carry` line; with both, `carry identical`, the stricter.
     pub carry: Option<CarryDirective>,
+    /// Lines that start with the word `carry` but are no directive (a
+    /// misspelling such as `carry identically`), as written after trimming.
+    /// Never owner names: a typo must not silently leave the directory on
+    /// the default rule while naming a principal nobody is.
+    pub unknown: Vec<String>,
 }
 
 /// Parse the text of one `OWNERS` file. Never fails: a line is a name unless
-/// it is blank, a comment, `noparent` or a `carry` directive.
+/// it is blank, a comment, `noparent`, a `carry` directive or another line
+/// whose first word is `carry` (kept in `unknown`).
 pub fn parse_owners(text: &str) -> OwnersFile {
     let mut f = OwnersFile::default();
     for line in text.trim_start_matches('\u{feff}').lines() {
@@ -68,6 +74,9 @@ pub fn parse_owners(text: &str) -> OwnersFile {
             "carry identical" => f.carry = Some(CarryDirective::Identical),
             "carry merged" => {
                 f.carry.get_or_insert(CarryDirective::Merged);
+            }
+            line if line.split_whitespace().next() == Some("carry") => {
+                f.unknown.push(line.to_string());
             }
             name => {
                 f.owners.insert(name.to_string());
@@ -201,6 +210,47 @@ impl<'a> OwnersResolver<'a> {
     }
 }
 
+impl Repo {
+    /// The first `OWNERS` line `id` writes that starts with `carry` but is
+    /// no directive, as `path: "line"`, so a land can refuse it (ADR 0092):
+    /// a misspelled `carry identical` would otherwise leave the directory
+    /// on the looser default unnoticed. Reads only the `OWNERS` files `id`
+    /// adds or modifies (not symlinks), each at most [`MAX_OWNERS_BYTES`].
+    pub async fn unknown_carry_line(&self, id: ChangesetId) -> Result<Option<String>> {
+        let cs = self.get_changeset(id).await?;
+        for (path, change) in &cs.changes {
+            let FileChange::Modify {
+                content,
+                kind,
+                size,
+            } = change
+            else {
+                continue;
+            };
+            if path.file_name() != OWNERS_FILE || *kind == FileKind::Symlink {
+                continue;
+            }
+            if *size > MAX_OWNERS_BYTES {
+                return Err(Error::Invalid(format!(
+                    "{path} is {size} bytes; the limit is {MAX_OWNERS_BYTES}"
+                )));
+            }
+            let data = self
+                .read_content(content)
+                .await?
+                .ok_or_else(|| Error::Storage(format!("blob {content} missing for {path}")))?;
+            if let Some(line) = parse_owners(&String::from_utf8_lossy(&data))
+                .unknown
+                .into_iter()
+                .next()
+            {
+                return Ok(Some(format!("{path}: {line:?}")));
+            }
+        }
+        Ok(None)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -251,10 +301,20 @@ mod tests {
         ] {
             assert_eq!(parse_owners(both).carry, Some(CarryDirective::Identical));
         }
-        // Anything else on the line is an owner name, as before.
-        let f = parse_owners("carry\ncarry identically\ncarry  merged\n");
+        // Any other line starting with the word `carry` is no name and no
+        // directive: a misspelling the land check refuses.
+        let f = parse_owners("carry\ncarry identically\ncarry  merged\ncarry\tmerged\ncarrying\n");
         assert_eq!(f.carry, None);
-        assert_eq!(names(&f), ["carry", "carry  merged", "carry identically"]);
+        assert_eq!(names(&f), ["carrying"]);
+        assert_eq!(
+            f.unknown,
+            [
+                "carry",
+                "carry identically",
+                "carry  merged",
+                "carry\tmerged"
+            ]
+        );
         for d in [CarryDirective::Identical, CarryDirective::Merged] {
             assert_eq!(parse_owners(d.line()).carry, Some(d));
         }

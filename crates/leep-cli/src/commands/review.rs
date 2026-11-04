@@ -315,6 +315,9 @@ pub fn status_lines(resp: &ReviewStatusResponse) -> Vec<String> {
     for o in &resp.origins {
         out.push(origin_line(resp.changeset, o));
     }
+    if let Some(why) = &resp.refused {
+        out.push(format!("refused: {why}"));
+    }
     out.push(format!("diff: leep diff {}", short(resp.changeset)));
     out
 }
@@ -521,6 +524,7 @@ mod tests {
                 path("h.rs", "future_rule", &[], &[], &[]),
             ],
             on_refs: Default::default(),
+            refused: None,
             origins: Default::default(),
         };
         let lines = status_lines(&resp);
@@ -563,6 +567,7 @@ mod tests {
             approved: true,
             paths: vec![],
             on_refs: Default::default(),
+            refused: None,
             origins: Default::default(),
         };
         let lines = status_lines(&resp);
@@ -607,10 +612,18 @@ mod tests {
             approved: false,
             paths: vec![path("a.rs", "pending", &[], &[], &[])],
             on_refs: vec!["release".into()],
+            refused: None,
             origins: vec![],
         };
         // Held by another ref only: still judged for main.
         assert!(status_lines(&resp)[0].ends_with(": not approved"));
+        resp.refused = Some("changeset x has an OWNERS line that is no directive".into());
+        let lines = status_lines(&resp);
+        assert_eq!(
+            lines[lines.len() - 2],
+            "refused: changeset x has an OWNERS line that is no directive"
+        );
+        resp.refused = None;
         assert_eq!(status_exit(&resp), exit::USER);
         resp.on_refs.push("main".into());
         assert!(status_lines(&resp)[0].ends_with(": landed on main"));
@@ -704,6 +717,7 @@ mod tests {
             approved: false,
             paths: vec![a, path("b.rs", "pending", &["rhea"], &[], &[])],
             on_refs: vec![],
+            refused: None,
             origins: vec![
                 origin(x, true, &[], None),
                 origin(x2, false, &["b.rs"], None),
