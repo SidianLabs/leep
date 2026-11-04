@@ -537,10 +537,36 @@ Reviewer names must be tokens that may review. A request closes when its
 change lands. No configuration is needed beyond the tokens file; without
 one the endpoints answer 400.
 
+## CI checks and known-good refs
+
+CI can tell the server which changesets pass, and the server then keeps a
+known-good ref `green/<ref>` for each ref you name (ADR 0091). Give each CI
+job its own write token with a `checks` allow-list of the check names it may
+post, ideally **one token per check name**, so a promotion needs every
+check's token:
+
+```json
+{ "name": "ci-test", "role": "write", "review": false, "checks": ["test"], "hash": "..." }
+```
+
+Agent tokens get no `checks`; a token may also never post a result for a
+changeset it created. Name the required checks per ref in a checks policy
+file, `--checks-policy-file` (`LEEP_CHECKS_POLICY_FILE`):
+
+```json
+{ "refs": { "main": { "required": ["test", "lint"] } } }
+```
+
+Both reload on SIGHUP. Every ref in the policy becomes forward-only and
+undeletable, as a review ref is, so it cannot be a `rebase-onto` target. A
+git-primary mirror ref (`--primary git`) therefore cannot have a checks
+policy. CI setup, the recovery procedure and what to watch are in
+[OPERATIONS.md](OPERATIONS.md#ci-checks-and-known-good-refs).
+
 ## Reloading config
 
-Send SIGHUP to the server to re-read the tokens file, the signing keys file and
-the review policy file without a restart (ADR 0024):
+Send SIGHUP to the server to re-read the tokens file, the signing keys file,
+the review policy file and the checks policy file without a restart (ADR 0024):
 
 ```sh
 pkill -HUP -x leep-server               # a host (every leep-server on it)
@@ -568,6 +594,7 @@ What a reload covers:
 | Per-token limits (`rate`, `burst`, `concurrency`, `max_body`) | `--request-timeout`, the body limits (`--max-body-bytes`, `--max-blob-bytes`, `--max-json-body-bytes`, `--max-inflight-bytes`), and the server-wide limit defaults |
 | Trusted signing keys | `--require-signatures`, `--require-review` and `--protect-ref` refs |
 | Review policy: `refs`, auto-approval rules, docs globs | Which files are configured at all (a server started without `--tokens-file` stays open) |
+| Checks policy: refs and their required checks; tokens' `checks` | |
 
 Write each file atomically (save beside it, then `mv` over it) so a reload never
 reads half a file; a half-written file fails safely, but nothing changes until
@@ -619,6 +646,7 @@ from Windows, as git does with `core.filemode=false`.
 | `LEEP_SIGNING_KEYS_FILE` | none | Trusted author keys file; enables signature submission. |
 | `LEEP_REQUIRE_SIGNATURES` | none | Comma-separated refs that only accept signed lands; needs the keys file. |
 | `LEEP_REVIEW_POLICY_FILE` | none | Review policy JSON (auto-approval rules, refs that require review); needs the tokens file. |
+| `LEEP_CHECKS_POLICY_FILE` | none | Checks policy JSON: per ref, the CI checks that must all pass before the server moves `green/<ref>` (ADR 0091); needs the tokens file, and makes each listed ref forward-only. |
 | `LEEP_REQUIRE_REVIEW` | none | Comma-separated refs that only accept reviewed lands; needs the tokens file. |
 | `LEEP_PROTECT_REFS` | none | Comma-separated refs that only move forward and cannot be deleted; see [Protected refs](#protected-refs). |
 | `LEEP_SERVER` | none | CLI only: server URL. |

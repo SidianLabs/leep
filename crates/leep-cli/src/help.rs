@@ -141,7 +141,7 @@ pub const EXIT_CODES: &str = "\
 Exit codes (ADR 0034):
   0  success
   1  generic failure (bad input, refused operation, authentication);
-     also \"no\" from `search` and `review status`
+     also \"no\" from `search`, `review status` and `checks ref`
   2  usage: the command line does not parse
   3  server or network failure; running the command again may work
   4  not found (revision, ref, branch, tag, file, stash)

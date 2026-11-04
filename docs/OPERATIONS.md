@@ -597,7 +597,8 @@ Watch it with:
 
 - Logs: `SIGHUP: reloading config`, then `INFO` lines per change (`tokens
   changed`, `request limit state updated`, `trusted signing keys changed`,
-  `protected refs changed`, `review rules changed`) listing names and counts,
+  `protected refs changed`, `review rules changed`, `checks policy changed`)
+  listing names and counts,
   then `config reloaded` with the new `generation` and the `fingerprint` (and
   `previous_fingerprint`) of the config now in force; the fingerprint is also
   logged at startup (`config loaded`). On failure a single `ERROR`
@@ -673,6 +674,74 @@ only moves forward and cannot be deleted through the API, and a refused move
 writes no entry. The startup line `land policy protects refs` lists every
 protected ref, whichever flag or file protects it. Moving a protected ref back
 by hand needs the metadata store itself; prefer `leep revert` and a land.
+
+## CI checks and known-good refs
+
+The server keeps `green/<ref>`, the newest changeset on `<ref>`'s
+first-parent chain that passed every required check, for each ref of the
+checks policy (ADR 0091; setup in [DEPLOY.md](DEPLOY.md#ci-checks-and-known-good-refs)).
+Nothing about landing changes: lands never wait for CI, and agents keep
+basing work on the head. Deploys, release cuts and anyone who needs a
+tree that builds read `green/<ref>` (`leep checkout green/main`).
+
+**Setting up CI.** For each required check, make a write token with
+`"checks": ["<name>"]` and `"review": false`, one token per check name, and
+give it only to the CI job that runs that check. After each land, CI tests
+the ref's head and posts the outcome for that exact changeset:
+
+```sh
+head=$(leep --json log -n 1 main | jq -r '.entries[0].id')
+# ... check out $head and run the tests ...
+LEEP_TOKEN=$CI_TEST_TOKEN leep checks post "$head" test pass --url "$RUN_URL"
+```
+
+Post for the id you tested, never for a name like `main`, which may have
+moved meanwhile. Results are keyed by changeset and never carried across
+rebases. A rerun replaces the earlier result. The pass that completes a
+changeset's required checks moves green, and the answer lists it under
+`promoted`. A result for a changeset that never landed on the ref, or is
+off its first-parent chain, or is below green, promotes nothing. CI may
+skip changesets: a pass on a later head promotes past them.
+
+**Reading it.** `leep checks ref main` shows green, how many changesets it is
+behind, and whether the head is red (exit 1). Red means the newest changeset
+above green that has a result for a required check failed one. `leep checks
+culprits main` lists the suspects: the lands in the range above green,
+newest first, with who landed them, who created them and the paths they
+changed. It is a list to look through, not a verdict. A land whose test fails
+only together with a later land shows that later land too, so a planted
+tripwire can frame an innocent land. Match the failing test's files against
+each suspect's paths, rerun on a candidate, then `leep revert` and land.
+`--good REV` looks below green, and `--bad REV` stops at an earlier failure.
+The walk reads at most 4,096 ref moves and says when it stopped.
+
+**Forward-only.** Every ref in the checks policy is protected as a review ref
+is. It only moves forward and cannot be deleted through the API, because a
+ref rewound below green would leave green ahead of it for good: green moves
+only forward and only to changesets on the ref. Such a ref is therefore
+never a `rebase-onto` target, so a git-primary mirror ref (`--primary git`)
+cannot have a checks policy. `green/<ref>` itself refuses every land, move,
+`leep undo` and delete with 422 `promotion_only`, and its ref log entries
+(operation `promote`) name the token whose result completed the checks.
+
+**Changing the policy.** Edit the file and SIGHUP. When the policy changed,
+the server walks each ref's head down to green (at most 1,024 changesets)
+and promotes to the newest changeset that already has every required pass.
+Dropping a flaky required check therefore unblocks green at once (log line
+`promoted known-good ref on loading the checks policy`); the same happens at
+startup.
+
+**Recovering green after a database rollback.** If an admin restores the
+metadata store, or rewinds the ref by hand, to a point below green, green
+is off the ref's history: `leep checks ref` shows it `off the head's
+history` and it never moves again. To recover:
+
+1. Remove the ref from the checks policy and SIGHUP. `green/<ref>` is then a
+   plain ref.
+2. Delete it, or CAS it back to a changeset on the ref, with
+   `POST /v1/refs/green/<ref>` (`leep branch -D green/<ref>`).
+3. Put the ref back in the policy and SIGHUP. The catch-up promotes green
+   from the stored results.
 
 ## Git mirror
 

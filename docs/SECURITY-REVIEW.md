@@ -69,6 +69,7 @@ change with a regression test.
 | S-23 | Review | High | A merge that kept its first parent's version dropped a side parent's change without review; an empty merge with an old first parent could rewind a reviewed ref | Fixed 2026-10-28, ADR 0011 |
 | S-22 | Review | Medium | Every write token was a reviewer, so one agent could approve another's change, or its own on unowned paths | Fixed 2026-10-21, `"review": false`, ADR 0011 |
 | S-24 | Review | Info | Verdicts carried to a re-committed changeset (ADR 0085) must not follow a forged `leep.rebased_from`, a moved base or a dropped path; the clean-replay trust of ADR 0011 remains | Designed in 2026-11-03, ADR 0085; review requests close by the same rule, 2026-11-04, ADR 0087; carrying across the server's own rebase result and unions of insertions, 2026-11-04, ADR 0089 |
+| S-25 | Checks | Medium | CI check results promote `green/<ref>`, so a forged pass promotes untested code, a token could attest its own change, and a rewound ref would strand green | Designed in 2026-11-04: `checks` allow-list per token, creator refused, checked refs forward-only, ADR 0091 |
 
 ### S-01: merge-parent laundering (High, fixed)
 
@@ -553,3 +554,27 @@ it cannot post reviews (403) and its reviews are neither listed nor counted.
 Deployment guidance is to set it on every agent token. Turning it off hides the
 token's existing rows rather than deleting them, so turning it back on restores
 them. Test: `tokens_without_review_cannot_review_and_their_old_reviews_stop_counting`.
+
+### S-25: check attestations and known-good refs (Medium, designed in)
+
+`green/<ref>` (ADR 0091) moves when every required check has a passing
+result, so whoever may post a result decides what deploys read as good.
+Only tokens whose entry lists the check name in `"checks"` may post it
+(403 before any read), and the poster is the token, never a body field; `by`
+is stored and shown, and the promotion's ref log entry names the token. A
+token cannot attest a changeset it created, nor the server's rebased copy of
+one (403, through `created-by-v1` and the rebase chain), so a CI token that
+also commits cannot pass its own change. Agent tokens get no `checks`.
+Deployment guidance is one token per check name, so a promotion needs every
+check's token. Residual: a leaked CI token can post a false pass and promote
+untested code to green, the trust CI already has when it reports to a code
+host or deploys; a false fail only paints the ref red and adds noise to the
+suspects. Nothing gates `land`. Results are keyed by changeset id and never
+carried across rebases. Every ref in the checks policy is forward-only;
+otherwise a write token could move it back below green, and green, which
+never rewinds, would stay ahead of it for good. The suspects list is the
+lands in the range, not a verdict: a test planted to fail only once a later
+land arrives frames that later land, so the docs and tools say so. Tests:
+`only_allow_listed_tokens_post_and_never_on_their_own_changes`,
+`green_refuses_land_cas_undo_and_delete_and_main_is_protected`,
+`checks_policy_protects_its_refs_and_reloads`.
